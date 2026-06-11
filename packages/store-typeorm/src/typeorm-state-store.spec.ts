@@ -46,6 +46,24 @@ const checkpoint = (over: Partial<StepCheckpoint> = {}): StepCheckpoint => ({
 });
 
 describe('TypeOrmStateStore', () => {
+  it('ensureSchema creates the tables on a fresh database (no synchronize)', async () => {
+    const dataSource = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [...ENTITIES],
+      synchronize: false,
+    });
+    await dataSource.initialize();
+    const store = new TypeOrmStateStore(dataSource);
+
+    await store.ensureSchema();
+
+    // Tables now exist: a write/read round-trips without "no such table".
+    await store.createRun(run());
+    expect((await store.getRun('r1'))?.workflow).toBe('checkout');
+    await dataSource.destroy();
+  });
+
   it('persists a run with JSON input and reads it back', async () => {
     const { store, dataSource } = await makeStore();
     await store.createRun(run());

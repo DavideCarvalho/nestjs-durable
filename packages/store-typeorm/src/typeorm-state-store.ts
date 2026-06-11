@@ -8,6 +8,7 @@ import type {
 } from '@dudousxd/nestjs-durable-core';
 import { type DataSource, LessThanOrEqual } from 'typeorm';
 import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './entities';
+import { ensureTypeOrmDurableSchema } from './schema';
 
 /**
  * TypeORM-backed `StateStore`. Postgres-first but works on any TypeORM driver; tested on
@@ -15,6 +16,10 @@ import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './e
  */
 export class TypeOrmStateStore implements StateStore {
   constructor(private readonly dataSource: DataSource) {}
+
+  async ensureSchema(): Promise<void> {
+    await ensureTypeOrmDurableSchema(this.dataSource);
+  }
 
   private runs() {
     return this.dataSource.getRepository(WorkflowRunEntity);

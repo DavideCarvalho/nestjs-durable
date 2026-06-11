@@ -45,6 +45,21 @@ const checkpoint = (over: Partial<StepCheckpoint> = {}): StepCheckpoint => ({
 });
 
 describe('MikroOrmStateStore', () => {
+  it('ensureSchema creates the tables on a fresh database', async () => {
+    const orm = await MikroORM.init({
+      dbName: ':memory:',
+      entities: [...ENTITIES],
+      allowGlobalContext: true,
+    });
+    const store = new MikroOrmStateStore(orm);
+
+    await store.ensureSchema();
+
+    await store.createRun(run());
+    expect((await store.getRun('r1'))?.workflow).toBe('checkout');
+    await orm.close(true);
+  });
+
   it('persists a run with JSON input and reads it back', async () => {
     const { store, orm } = await makeStore();
     await store.createRun(run());

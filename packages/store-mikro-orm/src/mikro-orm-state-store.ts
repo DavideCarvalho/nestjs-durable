@@ -8,6 +8,7 @@ import type {
 } from '@dudousxd/nestjs-durable-core';
 import type { MikroORM } from '@mikro-orm/core';
 import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './entities';
+import { ensureMikroOrmDurableSchema } from './schema';
 
 /**
  * MikroORM-backed `StateStore`. Postgres-first but works on any MikroORM driver; tested on
@@ -15,6 +16,10 @@ import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './e
  */
 export class MikroOrmStateStore implements StateStore {
   constructor(private readonly orm: MikroORM) {}
+
+  async ensureSchema(): Promise<void> {
+    await ensureMikroOrmDurableSchema(this.orm);
+  }
 
   async createRun(run: WorkflowRun): Promise<void> {
     const em = this.orm.em.fork();

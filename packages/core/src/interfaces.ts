@@ -74,6 +74,12 @@ export interface StepError {
 // ---------------------------------------------------------------------------
 
 export interface StateStore {
+  /**
+   * Provision the tables/collections this store needs, idempotently. Called on boot when the
+   * module's `autoSchema` is on. Optional: stores that need no setup (in-memory) omit it.
+   */
+  ensureSchema?(): Promise<void>;
+
   createRun(run: WorkflowRun): Promise<void>;
   updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void>;
   getRun(runId: string): Promise<WorkflowRun | null>;

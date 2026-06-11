@@ -319,3 +319,33 @@ reference adapter** (it is the ORM in use at the author's shop); `store-typeorm`
 `store-prisma` follow as the most widely used; `store-drizzle` after. All implement the same
 `StateStore` contract and are verified against one shared contract test-suite (run per adapter
 against SQLite/Postgres) so behaviour is identical across ORMs.
+
+## Zero-setup by default
+
+The library should *just work* — provision what it needs without the user wiring migrations
+by hand:
+
+- **Auto-schema.** `StateStore` exposes an optional `ensureSchema()`. Adapters implement it
+  (MikroORM `schema.updateSchema`, TypeORM `synchronize`, Prisma via a bundled migration).
+  `DurableModule` runs it on boot when `autoSchema` is on (**default true** in dev; the docs
+  recommend turning it off and shipping the generated migration in production). So the
+  `durable_workflow_runs` / `durable_step_checkpoints` / `durable_signal_waiters` tables appear
+  automatically on first run.
+- **Control-plane UI on by default.** `@dudousxd/nestjs-durable-dashboard` auto-mounts at
+  `/durable` when imported, with a pluggable auth guard — no extra wiring to see runs, the
+  step timeline (local + remote/Python), and to retry/cancel.
+
+## Observability: OpenTelemetry, dashboard, and Telescope
+
+Three complementary surfaces, all fed from the same event log:
+
+- **OpenTelemetry** (`-otel`) — trace per run, span per step, `traceparent` propagated into
+  remote tasks. For your existing Jaeger/Grafana/Datadog.
+- **Built-in dashboard** (`-dashboard`) — the self-contained control plane above.
+- **Telescope integration** (`@dudousxd/nestjs-durable-telescope`) — a watcher that records
+  workflow runs and step events as entries in **`@dudousxd/nestjs-telescope`**, so durable
+  flows show up alongside the app's requests/queries/notifications in the Telescope UI the team
+  already runs. This is the preferred surface in-house; the standalone dashboard stays for
+  users without Telescope. The watcher subscribes to engine events (`run.started`,
+  `step.completed`, `run.suspended`, `run.failed`, …) — so first we add an **engine event
+  emitter** the OTel, dashboard, and Telescope surfaces all consume.

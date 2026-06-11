@@ -18,6 +18,11 @@ export interface DurableModuleOptions {
   transport?: Transport;
   /** Interval (ms) for the durable-timer poller. `0` disables it. Defaults to 1000. */
   timerPollMs?: number;
+  /**
+   * Auto-create the durable tables on boot via `store.ensureSchema()`. Defaults to true. Turn
+   * off in production and call the store adapter's `ensure*DurableSchema()` from a migration.
+   */
+  autoSchema?: boolean;
 }
 
 export interface DurableModuleAsyncOptions {
