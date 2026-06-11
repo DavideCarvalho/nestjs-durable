@@ -1,0 +1,27 @@
+{
+  "name": "@dudousxd/nestjs-durable-example-basic",
+  "version": "0.0.0",
+  "private": true,
+  "description": "End-to-end example: a checkout workflow with local + remote (@DurableStep) steps, durable sleep and a human-approval signal — all in one NestJS process via the event-emitter transport.",
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@dudousxd/nestjs-durable": "workspace:^",
+    "@dudousxd/nestjs-durable-core": "workspace:^",
+    "@dudousxd/nestjs-durable-transport-event-emitter": "workspace:^",
+    "@nestjs/common": "11.1.26",
+    "@nestjs/core": "11.1.26",
+    "@nestjs/event-emitter": "3.1.0",
+    "eventemitter2": "6.4.9",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "11.1.26",
+    "typescript": "5.9.3"
+  }
+}
