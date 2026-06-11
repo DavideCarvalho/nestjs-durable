@@ -107,6 +107,31 @@ body {
   animation: rise 0.32s cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 
+/* react-flow dark surfaces */
+.react-flow {
+  --xy-background-color: transparent;
+  --xy-edge-stroke-default: var(--line);
+  --xy-attribution-background-color: transparent;
+}
+.react-flow__edge-path {
+  stroke-width: 1.5;
+}
+.react-flow__controls {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: none;
+}
+.react-flow__controls-button {
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  fill: var(--muted);
+}
+.react-flow__controls-button:hover {
+  background: #18181b;
+}
+
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;

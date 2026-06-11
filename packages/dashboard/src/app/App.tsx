@@ -6,15 +6,9 @@ import {
   type WorkflowRun,
   durableClient,
 } from '../client/durable-client';
+import { WorkflowGraph } from './WorkflowGraph';
 
 const STATUSES: RunStatus[] = ['running', 'suspended', 'completed', 'failed', 'cancelled'];
-
-const KIND_LABEL: Record<string, string> = {
-  local: 'local',
-  remote: 'remote',
-  sleep: 'sleep',
-  signal: 'signal',
-};
 
 function relTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -141,48 +135,6 @@ function RunsList({
   );
 }
 
-function StepNode({ step, last }: { step: StepCheckpoint; last: boolean }) {
-  const failed = step.status === 'failed';
-  return (
-    <li className="rise relative grid grid-cols-[28px_1fr] gap-3">
-      <div className="flex flex-col items-center">
-        <span
-          className={`mt-1 grid h-7 w-7 place-items-center rounded-full border text-[11px] mono tnum ${
-            failed
-              ? 'border-red-500/40 bg-red-500/10 text-red-300'
-              : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-          }`}
-        >
-          {step.seq}
-        </span>
-        {!last && <span className="my-1 w-px flex-1 bg-[var(--line)]" />}
-      </div>
-      <div className="pb-6">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-medium text-zinc-100">{step.name}</span>
-          <span className="mono rounded border border-[var(--line)] px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-400">
-            {KIND_LABEL[step.kind] ?? step.kind}
-          </span>
-          {step.workerGroup && (
-            <span className="mono text-[11px] text-zinc-500">@{step.workerGroup}</span>
-          )}
-          <Badge status={step.status} />
-        </div>
-        <div className="mono mt-1 flex items-center gap-3 text-[11px] text-zinc-600">
-          <span>{durMs(step.startedAt, step.finishedAt)}</span>
-          {step.attempts > 1 && <span className="text-amber-400/80">×{step.attempts} tries</span>}
-          {step.wakeAt && <span>wakes {new Date(step.wakeAt).toLocaleTimeString()}</span>}
-        </div>
-        {failed && step.error && (
-          <div className="mono mt-2 rounded border border-red-500/20 bg-red-500/5 px-2 py-1 text-[11px] text-red-300">
-            {step.error.message}
-          </div>
-        )}
-      </div>
-    </li>
-  );
-}
-
 function RunDetail({ id }: { id: string }) {
   const qc = useQueryClient();
   const { data } = useQuery({ queryKey: ['run', id], queryFn: () => durableClient.run(id) });
@@ -230,18 +182,16 @@ function RunDetail({ id }: { id: string }) {
           </button>
         </div>
       </div>
-      <div className="min-h-0 flex-1 overflow-auto px-7 py-6">
+      <div className="relative min-h-0 flex-1">
         {timeline.length === 0 ? (
-          <div className="text-sm text-zinc-600">No steps recorded yet.</div>
+          <div className="grid h-full place-items-center text-sm text-zinc-600">
+            No steps recorded yet.
+          </div>
         ) : (
-          <ol>
-            {timeline.map((s, i) => (
-              <StepNode key={s.seq} step={s} last={i === timeline.length - 1} />
-            ))}
-          </ol>
+          <WorkflowGraph run={run} timeline={timeline} fmtDuration={durMs} />
         )}
         {run.error && (
-          <div className="mono mt-2 rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2 text-xs text-red-300">
+          <div className="mono absolute inset-x-6 bottom-6 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300 backdrop-blur">
             {run.error.message}
           </div>
         )}
