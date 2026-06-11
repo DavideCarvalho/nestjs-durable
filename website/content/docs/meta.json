@@ -1,0 +1,17 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "getting-started",
+    "---Concepts---",
+    "concepts",
+    "---Transports---",
+    "transports",
+    "---State stores---",
+    "stores",
+    "---Observability---",
+    "observability",
+    "---Cross-language---",
+    "python"
+  ]
+}

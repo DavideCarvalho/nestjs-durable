@@ -1,0 +1,60 @@
+---
+title: Durability & replay
+description: How checkpoint-and-replay makes a workflow survive crashes — and the one rule it imposes. The workflow body must be deterministic; all side effects live in steps.
+---
+
+Durability comes from **checkpoint + deterministic replay** — the same model DBOS and Temporal
+use. Understanding it is the one thing worth reading before you build.
+
+## The mechanism
+
+Each step records its result in the store at a deterministic position (`seq`). Recovery works by
+**re-running the workflow function from the top** — but a step that already has a checkpoint
+returns its saved result instead of executing again:
+
+```text
+run abc
+  step[0] reserveStock  → execute → checkpoint {seq:0, output}
+  step[1] chargeCard     → execute → checkpoint {seq:1, output}
+  💥 crash
+  --- engine restarts, resumes run abc ---
+  step[0] reserveStock  → checkpoint exists → return saved output (NOT re-run)
+  step[1] chargeCard     → checkpoint exists → return saved output (NOT re-run)
+  step[2] ship           → no checkpoint → execute for real
+```
+
+You write ordinary linear code; the engine guarantees each step runs **exactly once**, logically,
+even across crashes and deploys.
+
+## The one rule: workflows are deterministic
+
+Because the body re-runs on recovery, it must be deterministic. **All non-determinism — network
+calls, queries, `Date.now()`, randomness, IO — must live inside a step.** The workflow body is
+just orchestration: call a step, use its result, decide the next.
+
+```ts
+// ✗ wrong — non-determinism in the workflow body
+async run(ctx, order) {
+  if (Math.random() < 0.1) { /* re-runs differently on replay */ }
+  const now = Date.now(); // different on every replay
+}
+
+// ✓ right — side effects inside steps
+async run(ctx, order) {
+  const quote = await ctx.step('quote', () => this.pricing.fetch(order)); // checkpointed
+  await ctx.step('charge', () => this.billing.charge(quote));
+}
+```
+
+## Consequences
+
+- **Idempotency.** The engine guarantees logical exactly-once, but if the process dies *after* a
+  remote worker ran and *before* its checkpoint was written, the step may physically run twice.
+  Steps receive a stable `stepId` — make handlers idempotent or dedupe on it.
+- **Retries.** Configure per step: `ctx.step(name, fn, { retries: 3, backoff: 'exp' })`. Throw a
+  [`FatalError`](/docs/concepts/workflows-and-steps#fatal-errors) to stop retrying a business
+  failure outright.
+- **Recovery on boot.** On startup the engine resumes every run a previous process left `running`
+  (`engine.recoverIncomplete()`, wired automatically by `DurableModule`).
+- **Versioning.** Changing a workflow with in-flight runs is risky — the logical positions shift.
+  Each run records its `workflowVersion`; pin or migrate old runs deliberately.

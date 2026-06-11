@@ -1,0 +1,87 @@
+---
+title: Workflows & steps
+description: Declaring workflows with @Workflow, local steps with ctx.step, typed remote steps with remoteStep + ctx.call and @DurableStep handlers, retries, fan-out and fatal errors.
+---
+
+## Workflows
+
+A workflow is a provider decorated with `@Workflow`; its `run(ctx, input)` method is the
+deterministic body the engine executes and replays.
+
+```ts
+@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow {
+  constructor(private readonly inventory: InventoryService) {}
+  async run(ctx: WorkflowCtx, order: Order) {
+    /* ... */
+  }
+}
+```
+
+Register it as a normal provider — `DurableModule` discovers it. Start runs with
+`WorkflowService.start(name, input)`.
+
+## Local steps
+
+`ctx.step(name, fn, opts?)` runs a unit of work locally and checkpoints its result.
+
+```ts
+const quote = await ctx.step('quote', () => this.pricing.fetch(order), { retries: 3 });
+```
+
+## Remote steps
+
+Declare a typed remote step with `remoteStep`, then call it with `ctx.call` — the engine
+dispatches it over the [transport](/docs/transports) and checkpoints the result. The handler can
+live in another process or another language.
+
+```ts
+export const chargeCard = remoteStep({
+  name: 'payments.charge-card',
+  input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
+  output: z.object({ chargeId: z.string() }),
+  retries: 3,
+});
+
+// in the workflow:
+const charge = await ctx.call(chargeCard, { orderId: order.id, amountCents: order.total });
+```
+
+A `@DurableStep` provider method handles it in-process (with an in-process transport):
+
+```ts
+@Injectable()
+export class PaymentsWorker {
+  @DurableStep('payments.charge-card')
+  async charge(input: { orderId: string; amountCents: number }) {
+    return { chargeId: await this.stripe.charge(input) };
+  }
+}
+```
+
+## Fan-out (parallel steps)
+
+Run steps concurrently with `Promise.all` — checkpoints stay deterministic because each step's
+position is taken in the synchronous prefix before any `await`:
+
+```ts
+const [a, b] = await Promise.all([
+  ctx.step('a', () => doA()),
+  ctx.step('b', () => doB()),
+]);
+```
+
+## Fatal errors
+
+Any thrown error is retried up to the step's limit. To stop retrying a business failure that a
+retry can't fix, throw `FatalError` — it fails the run immediately:
+
+```ts
+import { FatalError } from '@dudousxd/nestjs-durable-core';
+
+await ctx.step('charge', async () => {
+  const res = await stripe.charge(order);
+  if (res.declined) throw new FatalError('card declined', 'declined');
+  return res;
+});
+```

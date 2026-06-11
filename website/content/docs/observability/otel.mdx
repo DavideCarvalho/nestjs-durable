@@ -1,0 +1,27 @@
+---
+title: OpenTelemetry
+description: One trace per run, one span per step. Bridge the engine's lifecycle events to OpenTelemetry and see workflows in Jaeger, Grafana or Datadog.
+---
+
+`@dudousxd/nestjs-durable-otel` turns workflow runs into OpenTelemetry traces — a root span per
+run, a child span per step — so they show up in the tracing stack you already run.
+
+```bash
+pnpm add @dudousxd/nestjs-durable-otel @opentelemetry/api
+```
+
+```ts
+import { attachDurableOtel } from '@dudousxd/nestjs-durable-otel';
+
+// after the module boots, with the engine in hand:
+const detach = attachDurableOtel(engine); // uses the global tracer provider
+```
+
+Each step span carries `durable.run_id`, `durable.step.seq` and `durable.step.kind`; a failed run
+marks its span with an error status. Step spans are timed from the engine's `durationMs`, so
+latencies are accurate.
+
+It subscribes to the same engine lifecycle events the [dashboard](/docs/observability/dashboard)
+and [Telescope watcher](/docs/observability/telescope) use — three views of one event log. OTel is
+for **debugging in production** (latency, correlation, alerts); the dashboard is for **operating**
+the workflow.

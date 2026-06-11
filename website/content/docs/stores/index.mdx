@@ -1,0 +1,53 @@
+---
+title: Overview
+description: Where durable state lives. Postgres-first via a StateStore interface, with MikroORM and TypeORM adapters, an in-memory store for tests, and auto-schema on boot (opt-out, with a migration helper).
+---
+
+A **state store** persists workflow runs and step checkpoints — the source of truth for both
+durability and the [dashboard](/docs/observability/dashboard). It's a pluggable `StateStore`
+interface, independent of the [transport](/docs/transports).
+
+## Adapters
+
+| Store | Notes |
+| --- | --- |
+| `InMemoryStateStore` (in core) | For tests and local dev. Not durable. |
+| `@dudousxd/nestjs-durable-store-mikro-orm` | MikroORM — the reference adapter. |
+| `@dudousxd/nestjs-durable-store-typeorm` | TypeORM. |
+
+Both ORM adapters are Postgres-first but work on any driver their ORM supports (tested on
+SQLite). Wire one into the module:
+
+```ts
+import { MikroOrmStateStore } from '@dudousxd/nestjs-durable-store-mikro-orm';
+
+DurableModule.forRootAsync({
+  inject: [MikroORM],
+  useFactory: (orm) => ({ store: new MikroOrmStateStore(orm), transport }),
+});
+```
+
+## Auto-schema
+
+By default the module creates its tables on boot (`durable_workflow_runs`,
+`durable_step_checkpoints`, `durable_signal_waiters`) — zero setup in dev. Turn it off in
+production and own the schema via a migration:
+
+```ts
+DurableModule.forRoot({ store, autoSchema: false });
+```
+
+Each adapter exports the exact function to call from your own migration:
+
+```ts
+import { ensureMikroOrmDurableSchema } from '@dudousxd/nestjs-durable-store-mikro-orm';
+// or ensureTypeOrmDurableSchema from the TypeORM adapter
+
+export class AddDurableTables extends Migration {
+  async up() {
+    await ensureMikroOrmDurableSchema(this.getEntityManager().getDriver().getConnection());
+  }
+}
+```
+
+It only ever adds the three durable tables — it never touches yours.

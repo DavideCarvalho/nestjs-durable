@@ -1,0 +1,36 @@
+---
+title: Overview
+description: How remote steps travel to workers. Two tiers — an in-process event-emitter transport for zero-infra single-process handlers, and BullMQ/Redis for cross-process and cross-language steps.
+---
+
+A **transport** is how `ctx.call` reaches a step handler and how the result comes back. It's a
+pluggable interface (`dispatch`, `onResult`, `onHeartbeat`), independent of the
+[state store](/docs/stores) — mix any transport with any store.
+
+## Two tiers
+
+| Transport | Use it for |
+| --- | --- |
+| `EventEmitterTransport` | The zero-infra default: `@DurableStep` handlers run in the **same process**, decoupled from the workflow. No broker. |
+| `BullMQTransport` | True **cross-process** and **cross-language** steps — a separate worker, or a [Python worker](/docs/python) — over Redis. |
+
+## In-process (event-emitter)
+
+Backed by `@nestjs/event-emitter`. Handlers are `@DurableStep` provider methods; the engine
+routes tasks to them via the in-process emitter.
+
+```ts
+DurableModule.forRootAsync({
+  inject: [EventEmitter2],
+  useFactory: (emitter) => ({ store, transport: new EventEmitterTransport(emitter) }),
+});
+```
+
+Great for splitting a workflow across modules in one app, and for tests. When you need the step
+to run elsewhere, swap the transport — the workflow code is unchanged.
+
+## Wire protocol
+
+Every transport carries the same JSON `RemoteTask` (dispatch) and `StepResult` (reply). It's
+documented so any language can implement a worker — see [Python](/docs/python) and
+[BullMQ](/docs/transports/bullmq).

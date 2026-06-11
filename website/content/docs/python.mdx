@@ -1,0 +1,59 @@
+---
+title: Python steps
+description: Run workflow steps in Python. A TypeScript workflow's ctx.call dispatches to a Python worker over BullMQ/Redis, and the result flows back — one workflow, steps split across languages.
+---
+
+A step doesn't have to run in Node. The `durable-worker` Python SDK registers step handlers by
+name and runs them over the same Redis queues the [BullMQ transport](/docs/transports/bullmq) uses
+— so a TypeScript workflow can `ctx.call` a step implemented in Python.
+
+```bash
+pip install "durable-worker[redis]"
+```
+
+## A Python worker
+
+```python
+import asyncio
+from durable_worker import Worker, FatalError
+from durable_worker.redis_runner import run_redis_worker
+
+worker = Worker(group="payments")
+
+@worker.step("payments.charge-card")
+async def charge(data):
+    res = await stripe.charge(data["orderId"], data["amountCents"])
+    return {"chargeId": res.id}
+
+async def main():
+    await run_redis_worker(worker, group="payments")  # consumes the BullMQ queue
+    await asyncio.Event().wait()
+
+asyncio.run(main())
+```
+
+The handler's argument is the step **input** (schema-validated by the engine); its return value is
+the **output**. Raise `FatalError` for a non-retryable failure (e.g. a declined card); any other
+exception is retryable and the engine applies the step's retry policy.
+
+## The wire protocol
+
+The contract is plain JSON, identical across languages. The orchestrator dispatches a **task**:
+
+```jsonc
+{
+  "runId": "wrun_8Kb2", "seq": 1, "name": "payments.charge-card",
+  "stepId": "wrun_8Kb2:1", "group": "payments",
+  "input": { "orderId": "o1", "amountCents": 4200 }, "attempt": 1
+}
+```
+
+The worker replies with a **result**:
+
+```jsonc
+{ "runId": "wrun_8Kb2", "seq": 1, "stepId": "wrun_8Kb2:1",
+  "status": "completed", "output": { "chargeId": "ch_1" } }
+```
+
+`Worker.process_task(task) -> result` is the pure, transport-agnostic core. Because the contract is
+language-neutral, a Go or Rust worker can implement the same thing — Python is just the first SDK.

@@ -1,0 +1,46 @@
+---
+title: BullMQ / Redis
+description: The queue-backed transport for cross-process and cross-language steps. Steps go to a per-group tasks queue; results return on a shared results queue. Run one instance engine-side, one per worker.
+---
+
+`@dudousxd/nestjs-durable-transport-bullmq` carries steps over BullMQ/Redis — the path for steps
+that run in another process or another language (e.g. a [Python worker](/docs/python)).
+
+```bash
+pnpm add @dudousxd/nestjs-durable-transport-bullmq bullmq
+```
+
+## How it works
+
+- `ctx.call` dispatches a task to a **per-group** queue: `<prefix>-tasks-<group>`.
+- A worker for that group consumes it, runs the handler, and adds the result to the shared
+  `<prefix>-results` queue.
+- The engine-side instance consumes results and checkpoints them.
+
+Run **one instance engine-side** (consumes results) and **one per worker process** (registers
+handlers for its group):
+
+```ts title="engine side (your NestJS app)"
+const transport = new BullMQTransport({ connection: { host: 'localhost', port: 6379 } });
+
+DurableModule.forRoot({ store, transport });
+```
+
+```ts title="worker side (a separate process)"
+const transport = new BullMQTransport({
+  connection: { host: 'localhost', port: 6379 },
+  group: 'payments',
+});
+transport.handle('payments.charge-card', async (input) => ({ chargeId: await charge(input) }));
+```
+
+## Options
+
+| Option | Description |
+| --- | --- |
+| `connection` | ioredis connection options (or an `IORedis` instance). |
+| `group` | The worker group this instance serves — required to register `handle()`s. |
+| `prefix` | Namespaces the queues. Defaults to `durable`. |
+
+The payload is the documented `RemoteTask` / `StepResult` JSON, so a non-Node worker on the same
+queues interoperates — that's exactly how the [Python worker](/docs/python) plugs in.

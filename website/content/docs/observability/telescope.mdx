@@ -1,0 +1,26 @@
+---
+title: Telescope
+description: Surface workflow runs and steps inside nestjs-telescope, alongside your app's requests, queries and jobs.
+---
+
+Already running [`@dudousxd/nestjs-telescope`](https://github.com/DavideCarvalho/nestjs-telescope)?
+`@dudousxd/nestjs-durable-telescope` adds a watcher that records workflow runs and steps as
+Telescope entries, so durable flows appear next to your requests, queries and jobs.
+
+```bash
+pnpm add @dudousxd/nestjs-durable-telescope
+```
+
+```ts
+import { TelescopeModule } from '@dudousxd/nestjs-telescope';
+import { DurableTelescopeWatcher } from '@dudousxd/nestjs-durable-telescope';
+
+TelescopeModule.forRoot({
+  watchers: [new DurableTelescopeWatcher()],
+});
+```
+
+The watcher resolves the engine from the (global) durable providers and records one entry per
+lifecycle event (`run.started`, `step.completed`, `run.completed`, `run.failed`, …), tagged
+`workflow:<name>`, `run:<id>`, `kind:<step-kind>`, and `failed` on failures — so you can filter
+and group durable activity in the Telescope UI.

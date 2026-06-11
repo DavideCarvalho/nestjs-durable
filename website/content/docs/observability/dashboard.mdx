@@ -1,0 +1,39 @@
+---
+title: Control plane
+description: The embedded dashboard — a React SPA served by NestJS that lists runs and renders each one as a graph across local and remote steps, with retry and cancel.
+---
+
+`@dudousxd/nestjs-durable-dashboard` mounts a control plane at `/durable`: a bundled React SPA
+plus its JSON API. It reads straight from the [state store](/docs/stores), so it works without an
+OpenTelemetry collector.
+
+```ts
+import { DurableDashboardModule } from '@dudousxd/nestjs-durable-dashboard';
+
+@Module({ imports: [DurableModule.forRoot({ store, transport }), DurableDashboardModule] })
+export class AppModule {}
+```
+
+`DurableModule` is global, so the dashboard resolves the engine and store automatically. Front the
+`/durable` route with your own guard to protect it.
+
+## What it shows
+
+- **Runs** — every run with its status (running / suspended / completed / failed / cancelled),
+  filterable.
+- **Timeline as a graph** — the selected run rendered with `react-flow`: a node pipeline from
+  start through each step to the terminal state, tagged by kind (local / remote / sleep / signal),
+  with worker group and duration. This is the "see the whole flow" view — a workflow whose steps
+  span apps shown as one rail.
+- **Actions** — retry a failed/suspended run, cancel a running one.
+
+## API
+
+The SPA is backed by a small JSON API you can also call directly:
+
+| Method | Route | |
+| --- | --- | --- |
+| `GET` | `/durable/api/runs` | list runs (`?status=`, `?workflow=`) |
+| `GET` | `/durable/api/runs/:id` | run + step timeline |
+| `POST` | `/durable/api/runs/:id/retry` | resume the run |
+| `POST` | `/durable/api/runs/:id/cancel` | cancel the run |

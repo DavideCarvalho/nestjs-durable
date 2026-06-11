@@ -1,0 +1,45 @@
+---
+title: Sleep & signals
+description: Pause a workflow durably — ctx.sleep for time-based waits (minutes to months, no compute) and ctx.waitForSignal for human approvals and webhooks, both surviving restarts.
+---
+
+Real workflows wait — for a delay, or for the outside world. Both kinds of pause are **durable**:
+the run is suspended (no compute consumed) and resumes on its own, even across restarts.
+
+## Durable sleep
+
+`ctx.sleep(duration)` suspends the run until the timer is due. Accepts `'30s'`, `'2h'`,
+`'7 days'`, or milliseconds.
+
+```ts
+await ctx.step('draft', () => generate(topic));
+await ctx.sleep('7 days'); // gather signals for a week — nothing running
+await ctx.step('refine', () => refine(topic));
+```
+
+Under the hood the run becomes `suspended` with a `wakeAt`; a poller (the `TimerPoller`, wired by
+`DurableModule`) resumes runs whose timer has come due. On resume, the steps before the sleep
+replay from their checkpoints.
+
+## Signals (human-in-the-loop)
+
+`ctx.waitForSignal(token)` suspends the run — with no timer — until an external
+`engine.signal(token, payload)` arrives. Perfect for approvals, webhooks, or any third-party
+callback.
+
+```ts
+const decision = await ctx.waitForSignal<{ approved: boolean }>(`approve:${order.id}`);
+if (!decision.approved) return { status: 'rejected' };
+```
+
+Deliver the signal from anywhere — typically a controller — via `WorkflowService.signal`:
+
+```ts
+@Post('orders/:id/approve')
+approve(@Param('id') id: string, @Body() body: { approved: boolean }) {
+  return this.workflows.signal(`approve:${id}`, body); // resumes the run with the payload
+}
+```
+
+The payload is checkpointed like any step result, so the resumed run sees the same decision even
+if it replays again later.
