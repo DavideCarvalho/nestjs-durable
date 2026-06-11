@@ -165,6 +165,21 @@ importers:
         specifier: 5.9.3
         version: 5.9.3
 
+  packages/telescope:
+    devDependencies:
+      '@dudousxd/nestjs-durable-core':
+        specifier: workspace:^
+        version: link:../core
+      '@dudousxd/nestjs-telescope':
+        specifier: 1.7.0
+        version: 1.7.0(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core':
+        specifier: 11.1.26
+        version: 11.1.26(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+
   packages/transport-event-emitter:
     devDependencies:
       '@dudousxd/nestjs-durable-core':
@@ -387,6 +402,15 @@ packages:
 
   '@changesets/write@0.4.0':
     resolution: {integrity: sha512-CdTLvIOPiCNuH71pyDu3rA+Q0n65cmAbXnwWH84rKGiFumFzkmHNT8KHTMEchcxN+Kl8I54xGUhJ7l3E7X396Q==}
+
+  '@dudousxd/nestjs-telescope@1.7.0':
+    resolution: {integrity: sha512-leqJJAjfeLsHYgvgcVTNbA8DWVIHsAgq1WXEf9bDg1xyUvCo5dNXKCCYCM7jbyMos5/be/EoPZ8Z9ue6fTHUUQ==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@nestjs/common': '>=10.0.0'
+      '@nestjs/core': '>=10.0.0'
+      reflect-metadata: '>=0.1.13'
+      rxjs: '>=7.0.0'
 
   '@esbuild/aix-ppc64@0.21.5':
     resolution: {integrity: sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==}
@@ -2679,6 +2703,16 @@ snapshots:
       fs-extra: 7.0.1
       human-id: 4.2.0
       prettier: 2.8.8
+
+  '@dudousxd/nestjs-telescope@1.7.0(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)':
+    dependencies:
+      '@nestjs/common': 11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core': 11.1.26(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      better-sqlite3: 11.10.0
+      reflect-metadata: 0.2.2
+      rxjs: 7.8.2
+      uuid: 11.1.1
+      zod: 3.25.76
 
   '@esbuild/aix-ppc64@0.21.5':
     optional: true
