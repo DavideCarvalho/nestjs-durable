@@ -1,0 +1,164 @@
+import type {
+  RunQuery,
+  SignalWaiter,
+  StateStore,
+  StepCheckpoint,
+  StepError,
+  WorkflowRun,
+} from '@dudousxd/nestjs-durable-core';
+import type { MikroORM } from '@mikro-orm/core';
+import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './entities';
+
+/**
+ * MikroORM-backed `StateStore`. Postgres-first but works on any MikroORM driver; tested on
+ * SQLite. Each operation runs on a forked EntityManager so it owns its unit of work.
+ */
+export class MikroOrmStateStore implements StateStore {
+  constructor(private readonly orm: MikroORM) {}
+
+  async createRun(run: WorkflowRun): Promise<void> {
+    const em = this.orm.em.fork();
+    em.create(WorkflowRunEntity, toRunEntity(run));
+    await em.flush();
+  }
+
+  async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+    const em = this.orm.em.fork();
+    const entity = await em.findOneOrFail(WorkflowRunEntity, { id: runId });
+    Object.assign(entity, toRunEntity({ ...fromRunEntity(entity), ...patch } as WorkflowRun));
+    await em.flush();
+  }
+
+  async getRun(runId: string): Promise<WorkflowRun | null> {
+    const em = this.orm.em.fork();
+    const entity = await em.findOne(WorkflowRunEntity, { id: runId });
+    return entity ? fromRunEntity(entity) : null;
+  }
+
+  async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
+    const em = this.orm.em.fork();
+    const entity = await em.findOne(StepCheckpointEntity, { runId, seq });
+    return entity ? fromCheckpointEntity(entity) : null;
+  }
+
+  async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
+    const em = this.orm.em.fork();
+    await em.upsert(StepCheckpointEntity, toCheckpointEntity(checkpoint));
+    await em.flush();
+  }
+
+  async listIncompleteRuns(): Promise<WorkflowRun[]> {
+    const em = this.orm.em.fork();
+    const rows = await em.find(WorkflowRunEntity, { status: 'running' });
+    return rows.map(fromRunEntity);
+  }
+
+  async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
+    const em = this.orm.em.fork();
+    const rows = await em.find(WorkflowRunEntity, {
+      status: 'suspended',
+      wakeAt: { $ne: null, $lte: nowMs },
+    });
+    return rows.map(fromRunEntity);
+  }
+
+  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+    const em = this.orm.em.fork();
+    const where: Record<string, unknown> = {};
+    if (query.workflow) where.workflow = query.workflow;
+    if (query.status) where.status = query.status;
+    const rows = await em.find(WorkflowRunEntity, where, {
+      limit: query.limit,
+      offset: query.offset,
+      orderBy: { createdAt: 'asc' },
+    });
+    return rows.map(fromRunEntity);
+  }
+
+  async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+    const em = this.orm.em.fork();
+    const rows = await em.find(StepCheckpointEntity, { runId }, { orderBy: { seq: 'asc' } });
+    return rows.map(fromCheckpointEntity);
+  }
+
+  async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
+    const em = this.orm.em.fork();
+    await em.upsert(SignalWaiterEntity, { ...waiter });
+    await em.flush();
+  }
+
+  async takeSignalWaiter(token: string): Promise<SignalWaiter | null> {
+    const em = this.orm.em.fork();
+    const entity = await em.findOne(SignalWaiterEntity, { token });
+    if (!entity) return null;
+    const waiter: SignalWaiter = { token: entity.token, runId: entity.runId, seq: entity.seq };
+    await em.removeAndFlush(entity);
+    return waiter;
+  }
+}
+
+function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
+  const e = new WorkflowRunEntity();
+  e.id = run.id;
+  e.workflow = run.workflow;
+  e.workflowVersion = run.workflowVersion;
+  e.status = run.status;
+  e.input = run.input ?? null;
+  e.output = run.output ?? null;
+  e.error = run.error ?? null;
+  e.wakeAt = run.wakeAt;
+  e.createdAt = run.createdAt;
+  e.updatedAt = run.updatedAt;
+  return e;
+}
+
+function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
+  return {
+    id: e.id,
+    workflow: e.workflow,
+    workflowVersion: e.workflowVersion,
+    status: e.status,
+    input: e.input ?? undefined,
+    output: e.output ?? undefined,
+    error: (e.error ?? undefined) as StepError | undefined,
+    wakeAt: e.wakeAt ?? undefined,
+    createdAt: e.createdAt,
+    updatedAt: e.updatedAt,
+  };
+}
+
+function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
+  const e = new StepCheckpointEntity();
+  e.runId = cp.runId;
+  e.seq = cp.seq;
+  e.name = cp.name;
+  e.kind = cp.kind;
+  e.stepId = cp.stepId;
+  e.status = cp.status;
+  e.output = cp.output ?? null;
+  e.error = cp.error ?? null;
+  e.attempts = cp.attempts;
+  e.workerGroup = cp.workerGroup;
+  e.wakeAt = cp.wakeAt;
+  e.startedAt = cp.startedAt;
+  e.finishedAt = cp.finishedAt;
+  return e;
+}
+
+function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
+  return {
+    runId: e.runId,
+    seq: e.seq,
+    name: e.name,
+    kind: e.kind,
+    stepId: e.stepId,
+    status: e.status,
+    output: e.output ?? undefined,
+    error: (e.error ?? undefined) as StepError | undefined,
+    attempts: e.attempts,
+    workerGroup: e.workerGroup ?? undefined,
+    wakeAt: e.wakeAt ?? undefined,
+    startedAt: e.startedAt,
+    finishedAt: e.finishedAt,
+  };
+}
