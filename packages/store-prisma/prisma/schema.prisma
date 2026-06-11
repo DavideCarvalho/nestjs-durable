@@ -1,0 +1,45 @@
+// Add these three models to your own schema.prisma, then `prisma generate` and pass your
+// PrismaClient to `new PrismaStateStore(prisma)`. The adapter only ever touches these tables.
+
+model DurableWorkflowRun {
+  id              String   @id
+  workflow        String
+  workflowVersion String
+  status          String
+  input           Json?
+  output          Json?
+  error           Json?
+  wakeAt          BigInt?
+  createdAt       DateTime
+  updatedAt       DateTime
+
+  @@index([status, wakeAt])
+  @@map("durable_workflow_runs")
+}
+
+model DurableStepCheckpoint {
+  runId       String
+  seq         Int
+  name        String
+  kind        String
+  stepId      String
+  status      String
+  output      Json?
+  error       Json?
+  attempts    Int
+  workerGroup String?
+  wakeAt      BigInt?
+  startedAt   DateTime
+  finishedAt  DateTime
+
+  @@id([runId, seq])
+  @@map("durable_step_checkpoints")
+}
+
+model DurableSignalWaiter {
+  token String @id
+  runId String
+  seq   Int
+
+  @@map("durable_signal_waiters")
+}

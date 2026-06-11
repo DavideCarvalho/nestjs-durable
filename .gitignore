@@ -9,3 +9,7 @@ coverage/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# prisma adapter generated client + sqlite test db
+packages/store-prisma/generated/
+packages/store-prisma/prisma/*.db

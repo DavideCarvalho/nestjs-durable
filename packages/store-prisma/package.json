@@ -1,0 +1,34 @@
+{
+  "name": "@dudousxd/nestjs-durable-store-prisma",
+  "version": "0.1.0",
+  "description": "Prisma adapter for the nestjs-durable StateStore",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "directory": "packages/store-prisma"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "prisma/schema.prisma"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prisma:generate": "prisma generate --schema prisma/test.prisma"
+  },
+  "peerDependencies": {
+    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "@prisma/client": "^5.0.0 || ^6.0.0 || ^7.0.0"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-durable-core": "workspace:^",
+    "@prisma/client": "6.19.3",
+    "prisma": "6.19.3",
+    "typescript": "5.9.3"
+  }
+}
