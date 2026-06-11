@@ -1,0 +1,32 @@
+{
+  "name": "@dudousxd/nestjs-durable-transport-event-emitter",
+  "version": "0.1.0",
+  "description": "In-process Transport for nestjs-durable backed by @nestjs/event-emitter",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "directory": "packages/transport-event-emitter"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "@nestjs/event-emitter": "^2.0.0 || ^3.0.0"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-durable-core": "workspace:^",
+    "@nestjs/event-emitter": "3.1.0",
+    "eventemitter2": "6.4.9",
+    "typescript": "5.9.3"
+  }
+}
