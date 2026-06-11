@@ -53,15 +53,24 @@ importers:
       '@dudousxd/nestjs-durable-core':
         specifier: workspace:^
         version: link:../core
+      '@dudousxd/nestjs-durable-transport-event-emitter':
+        specifier: workspace:^
+        version: link:../transport-event-emitter
       '@nestjs/common':
         specifier: 11.1.26
         version: 11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2)
       '@nestjs/core':
         specifier: 11.1.26
         version: 11.1.26(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/event-emitter':
+        specifier: 3.1.0
+        version: 3.1.0(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))
       '@nestjs/testing':
         specifier: 11.1.26
         version: 11.1.26(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))
+      eventemitter2:
+        specifier: 6.4.9
+        version: 6.4.9
       reflect-metadata:
         specifier: 0.2.2
         version: 0.2.2
@@ -71,6 +80,9 @@ importers:
       typescript:
         specifier: 5.9.3
         version: 5.9.3
+      zod:
+        specifier: 3.25.76
+        version: 3.25.76
 
   packages/transport-event-emitter:
     devDependencies:

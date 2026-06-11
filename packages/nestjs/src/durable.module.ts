@@ -1,12 +1,14 @@
 import {
+  DURABLE_OPTIONS,
   STATE_STORE,
   type StateStore,
   TRANSPORT,
   type Transport,
   WorkflowEngine,
 } from '@dudousxd/nestjs-durable-core';
-import { type DynamicModule, Module } from '@nestjs/common';
+import { type DynamicModule, type InjectionToken, Module, type Provider } from '@nestjs/common';
 import { DiscoveryModule } from '@nestjs/core';
+import { DurableStepRegistrar } from './durable-step.registrar';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
 
@@ -15,15 +17,41 @@ export interface DurableModuleOptions {
   transport?: Transport;
 }
 
+export interface DurableModuleAsyncOptions {
+  useFactory: (...args: never[]) => DurableModuleOptions | Promise<DurableModuleOptions>;
+  inject?: InjectionToken[];
+}
+
 @Module({})
 export class DurableModule {
   static forRoot(options: DurableModuleOptions): DynamicModule {
+    return DurableModule.build({ provide: DURABLE_OPTIONS, useValue: options });
+  }
+
+  static forRootAsync(options: DurableModuleAsyncOptions): DynamicModule {
+    return DurableModule.build({
+      provide: DURABLE_OPTIONS,
+      useFactory: options.useFactory,
+      inject: options.inject ?? [],
+    });
+  }
+
+  private static build(optionsProvider: Provider): DynamicModule {
     return {
       module: DurableModule,
       imports: [DiscoveryModule],
       providers: [
-        { provide: STATE_STORE, useValue: options.store },
-        { provide: TRANSPORT, useValue: options.transport ?? null },
+        optionsProvider,
+        {
+          provide: STATE_STORE,
+          useFactory: (options: DurableModuleOptions) => options.store,
+          inject: [DURABLE_OPTIONS],
+        },
+        {
+          provide: TRANSPORT,
+          useFactory: (options: DurableModuleOptions) => options.transport ?? null,
+          inject: [DURABLE_OPTIONS],
+        },
         {
           provide: WorkflowEngine,
           useFactory: (store: StateStore, transport: Transport | null) =>
@@ -32,6 +60,7 @@ export class DurableModule {
         },
         WorkflowService,
         WorkflowRegistrar,
+        DurableStepRegistrar,
       ],
       exports: [WorkflowService, WorkflowEngine],
     };

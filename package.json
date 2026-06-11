@@ -14,10 +14,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "turbo run build --filter=!website",
+    "build": "turbo run build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "turbo run typecheck --filter=!website",
+    "typecheck": "turbo run typecheck",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
