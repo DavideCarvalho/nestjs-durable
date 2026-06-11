@@ -113,6 +113,29 @@ export class WorkflowEngine {
     return results;
   }
 
+  /**
+   * Deliver an external signal to the run waiting on `token` and resume it with `payload`.
+   * Returns the run result, or null if no run is waiting for that token.
+   */
+  async signal(token: string, payload: unknown): Promise<RunResult | null> {
+    const waiter = await this.store.takeSignalWaiter(token);
+    if (!waiter) return null;
+    const at = new Date();
+    await this.store.saveCheckpoint({
+      runId: waiter.runId,
+      seq: waiter.seq,
+      name: `signal:${token}`,
+      kind: 'signal',
+      stepId: `${waiter.runId}:${waiter.seq}`,
+      status: 'completed',
+      output: payload,
+      attempts: 1,
+      startedAt: at,
+      finishedAt: at,
+    });
+    return this.resume(waiter.runId);
+  }
+
   private requireWorkflow(name: string): RegisteredWorkflow {
     const registered = this.workflows.get(name);
     if (!registered) throw new Error(`workflow ${name} is not registered`);
@@ -207,6 +230,15 @@ export class WorkflowEngine {
           finishedAt: at,
         });
         throw new WorkflowSuspended(wakeAt);
+      },
+      waitForSignal: async <T>(token: string): Promise<T> => {
+        const current = nextSeq();
+        const existing = await store.getCheckpoint(runId, current);
+        if (existing && existing.status === 'completed') {
+          return existing.output as T;
+        }
+        await store.putSignalWaiter({ token, runId, seq: current });
+        throw new WorkflowSuspended();
       },
     };
   }

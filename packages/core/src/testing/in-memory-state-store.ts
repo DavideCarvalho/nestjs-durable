@@ -1,4 +1,10 @@
-import type { RunQuery, StateStore, StepCheckpoint, WorkflowRun } from '../interfaces';
+import type {
+  RunQuery,
+  SignalWaiter,
+  StateStore,
+  StepCheckpoint,
+  WorkflowRun,
+} from '../interfaces';
 
 /**
  * A non-durable, in-process `StateStore` for tests and local development.
@@ -7,6 +13,7 @@ import type { RunQuery, StateStore, StepCheckpoint, WorkflowRun } from '../inter
 export class InMemoryStateStore implements StateStore {
   private readonly runs = new Map<string, WorkflowRun>();
   private readonly checkpoints = new Map<string, StepCheckpoint>();
+  private readonly signalWaiters = new Map<string, SignalWaiter>();
 
   private key(runId: string, seq: number): string {
     return `${runId}:${seq}`;
@@ -44,6 +51,17 @@ export class InMemoryStateStore implements StateStore {
     return [...this.runs.values()]
       .filter((r) => r.status === 'suspended' && r.wakeAt !== undefined && r.wakeAt <= nowMs)
       .map((r) => ({ ...r }));
+  }
+
+  async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
+    this.signalWaiters.set(waiter.token, { ...waiter });
+  }
+
+  async takeSignalWaiter(token: string): Promise<SignalWaiter | null> {
+    const waiter = this.signalWaiters.get(token);
+    if (!waiter) return null;
+    this.signalWaiters.delete(token);
+    return { ...waiter };
   }
 
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {

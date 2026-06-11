@@ -17,8 +17,9 @@ export class FatalError extends Error {
  * user should throw or catch; the engine uses it to stop execution and persist `wakeAt`.
  */
 export class WorkflowSuspended extends Error {
-  readonly wakeAt: number;
-  constructor(wakeAt: number) {
+  /** Epoch ms to auto-resume (durable sleep), or undefined when waiting on an external signal. */
+  readonly wakeAt?: number;
+  constructor(wakeAt?: number) {
     super('workflow suspended');
     this.name = 'WorkflowSuspended';
     this.wakeAt = wakeAt;

@@ -33,7 +33,7 @@ export interface WorkflowRun {
   updatedAt: Date;
 }
 
-export type StepKind = 'local' | 'remote' | 'sleep';
+export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
 
 /**
  * The recorded result of a single step at a deterministic logical position (`seq`).
@@ -91,6 +91,11 @@ export interface StateStore {
   /** Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume. */
   listDueTimers(nowMs: number): Promise<WorkflowRun[]>;
 
+  /** Record that a run is suspended waiting for an external signal `token`. */
+  putSignalWaiter(waiter: SignalWaiter): Promise<void>;
+  /** Atomically take (and remove) the run waiting on `token`, if any. */
+  takeSignalWaiter(token: string): Promise<SignalWaiter | null>;
+
   // Dashboard queries
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
@@ -101,6 +106,13 @@ export interface RunQuery {
   status?: RunStatus;
   limit?: number;
   offset?: number;
+}
+
+/** Binds an external signal `token` to the suspended run/step position waiting for it. */
+export interface SignalWaiter {
+  token: string;
+  runId: string;
+  seq: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +203,11 @@ export interface WorkflowCtx {
    * across restarts.
    */
   sleep(duration: string | number): Promise<void>;
+  /**
+   * Suspend the run until an external `engine.signal(token, payload)` arrives (e.g. a webhook or
+   * human approval), then resume with the payload. Waits indefinitely — no compute consumed.
+   */
+  waitForSignal<TPayload>(token: string): Promise<TPayload>;
 }
 
 /** Result of executing or resuming a workflow run. */

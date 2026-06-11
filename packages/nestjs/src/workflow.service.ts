@@ -14,4 +14,9 @@ export class WorkflowService {
   resume(runId: string): Promise<RunResult> {
     return this.engine.resume(runId);
   }
+
+  /** Deliver an external signal (e.g. from a webhook) to the run waiting on `token`. */
+  signal(token: string, payload: unknown): Promise<RunResult | null> {
+    return this.engine.signal(token, payload);
+  }
 }
