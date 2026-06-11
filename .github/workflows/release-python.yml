@@ -1,0 +1,42 @@
+name: release-python
+
+# Publishes clients/python (durable-worker) to PyPI via Trusted Publishing (OIDC) — no tokens.
+# Trigger by pushing a tag like `durable-worker-v0.1.0` (Python-specific so it never collides
+# with the JS package releases), or run it manually.
+on:
+  push:
+    tags:
+      - 'durable-worker-v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build sdist + wheel
+        working-directory: clients/python
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: clients/python/dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Must match the "Nome do ambiente" you set in the PyPI publisher (and exist in repo settings).
+    environment: pypi
+    permissions:
+      id-token: write # required for OIDC Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
