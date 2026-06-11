@@ -3,7 +3,7 @@ import { createMDX } from 'fumadocs-mdx/next';
 const withMDX = createMDX();
 
 // GitHub Pages serves project sites under /<repo>, so the Pages workflow sets
-// NEXT_BASE_PATH=/nestjs-notifications. Local dev/build stays at the root.
+// NEXT_BASE_PATH=/nestjs-durable. Local dev/build stays at the root.
 const basePath = process.env.NEXT_BASE_PATH ?? '';
 
 /** @type {import('next').NextConfig} */
