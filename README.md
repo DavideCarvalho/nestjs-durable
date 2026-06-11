@@ -29,8 +29,8 @@ for the full design.
 | --- | --- |
 | `@dudousxd/nestjs-durable-core` | Interfaces, engine, deterministic replay, decorators |
 | `@dudousxd/nestjs-durable` | NestJS module, discovery, `WorkflowCtx`, boot recovery |
-| `@dudousxd/nestjs-durable-transport` | `Transport` interface + `InMemoryTransport` |
-| `@dudousxd/nestjs-durable-transport-bullmq` | Default queue adapter |
+| `@dudousxd/nestjs-durable-transport-event-emitter` | In-process Transport via `@nestjs/event-emitter` (zero-infra default) |
+| `@dudousxd/nestjs-durable-transport-bullmq` | Queue adapter for cross-process / cross-language steps |
 | `@dudousxd/nestjs-durable-store` | `StateStore` interface + `InMemoryStore` |
 | `@dudousxd/nestjs-durable-store-{prisma,typeorm,drizzle,mikro-orm}` | ORM adapters |
 | `@dudousxd/nestjs-durable-otel` | OpenTelemetry instrumentation |

@@ -200,9 +200,13 @@ interface StateStore {
 }
 ```
 
-- **Transport default: `BullMQTransport`** — already the ecosystem favourite, gives DLQ, retry
-  and queue visibility for free. Adapters planned: NATS, RabbitMQ, SQS — each a separate
-  package so the core stays lean. `InMemoryTransport` ships for dev/test.
+- **Transport — two tiers.** In-process default: `EventEmitterTransport`
+  (`@dudousxd/nestjs-durable-transport-event-emitter`), backed by the `@nestjs/event-emitter`
+  the ecosystem already uses — zero extra infrastructure, step handlers run in the same
+  process, fully decoupled from the workflow that calls them. For true cross-process /
+  cross-language steps, swap to `BullMQTransport` (DLQ, retry, queue visibility for free);
+  NATS/RabbitMQ/SQS adapters follow, each a separate package so the core stays lean.
+  `InMemoryTransport` ships in core for dev/test.
 - **StateStore: Postgres-first via ORM adapters** — `store-prisma`, `store-typeorm`,
   `store-drizzle`, `store-mikro-orm`; core couples to none. Each adapter ships migrations
   (`workflow_runs`, `step_checkpoints`, `step_events`). Durable semantics require
