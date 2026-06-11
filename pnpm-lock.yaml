@@ -14,6 +14,12 @@ importers:
       '@changesets/cli':
         specifier: 2.31.0
         version: 2.31.0(@types/node@22.19.20)
+      '@dudousxd/nestjs-durable-core':
+        specifier: workspace:*
+        version: link:packages/core
+      '@dudousxd/nestjs-durable-transport-bullmq':
+        specifier: workspace:*
+        version: link:packages/transport-bullmq
       '@swc/core':
         specifier: 1.15.41
         version: 1.15.41
@@ -35,6 +41,9 @@ importers:
       vitest:
         specifier: 2.1.9
         version: 2.1.9(@types/node@22.19.20)
+      zod:
+        specifier: 3.25.76
+        version: 3.25.76
 
   examples/basic:
     dependencies:

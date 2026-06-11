@@ -29,12 +29,15 @@
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
     "@changesets/cli": "2.31.0",
+    "@dudousxd/nestjs-durable-core": "workspace:*",
+    "@dudousxd/nestjs-durable-transport-bullmq": "workspace:*",
     "@swc/core": "1.15.41",
     "@types/node": "22.19.20",
     "reflect-metadata": "0.2.2",
     "turbo": "2.9.17",
     "typescript": "5.9.3",
     "unplugin-swc": "1.5.9",
-    "vitest": "2.1.9"
+    "vitest": "2.1.9",
+    "zod": "3.25.76"
   }
 }

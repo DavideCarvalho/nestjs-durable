@@ -60,8 +60,29 @@ re-dispatch the same `stepId` — make handlers idempotent or dedupe on `stepId`
 `process_task` is transport-agnostic. A transport adapter consumes tasks from the broker and
 ships results back:
 
-- **Redis / BullMQ** (`pip install durable-worker[redis]`): consume the orchestrator's queue,
-  call `process_task`, publish the result. Matches `@dudousxd/nestjs-durable-transport-bullmq`.
+- **Redis / BullMQ** (`pip install durable-worker[redis]`) — `durable_worker.redis_runner`
+  consumes the same Redis queues `@dudousxd/nestjs-durable-transport-bullmq` dispatches to:
+
+  ```python
+  import asyncio
+  from durable_worker import Worker
+  from durable_worker.redis_runner import run_redis_worker
+
+  worker = Worker(group="payments")
+
+  @worker.step("payments.charge-card")
+  async def charge(data):
+      return {"chargeId": f"ch_{data['amount']}"}
+
+  async def main():
+      await run_redis_worker(worker, group="payments")
+      await asyncio.Event().wait()
+
+  asyncio.run(main())
+  ```
+
+  This is wired end-to-end in [`scripts/py-e2e.sh`](../../scripts/py-e2e.sh): a TypeScript
+  workflow's `ctx.call` runs this Python handler over Redis and gets the result back.
 - Bring your own: anything that can deliver a task dict and accept a result dict.
 
 ## Tests

@@ -64,21 +64,45 @@ class Worker:
         base = {"runId": task["runId"], "seq": task["seq"], "stepId": task["stepId"]}
         handler = self._handlers.get(task["name"])
         if handler is None:
-            return {
-                **base,
-                "status": "failed",
-                "error": {"message": f"no handler for {task['name']}", "retryable": False},
-            }
+            return self._no_handler(base, task["name"])
         try:
             output = handler(task.get("input"))
             if inspect.isawaitable(output):
                 output = asyncio.run(output)
             return {**base, "status": "completed", "output": output}
-        except FatalError as err:
+        except Exception as err:  # noqa: BLE001
+            return self._failure(base, err)
+
+    async def aprocess_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """Async variant — awaits async handlers in the current loop. Use from a transport that
+        already runs inside an event loop (e.g. the BullMQ runner)."""
+
+        base = {"runId": task["runId"], "seq": task["seq"], "stepId": task["stepId"]}
+        handler = self._handlers.get(task["name"])
+        if handler is None:
+            return self._no_handler(base, task["name"])
+        try:
+            output = handler(task.get("input"))
+            if inspect.isawaitable(output):
+                output = await output
+            return {**base, "status": "completed", "output": output}
+        except Exception as err:  # noqa: BLE001
+            return self._failure(base, err)
+
+    @staticmethod
+    def _no_handler(base: Dict[str, Any], name: str) -> Dict[str, Any]:
+        return {
+            **base,
+            "status": "failed",
+            "error": {"message": f"no handler for {name}", "retryable": False},
+        }
+
+    @staticmethod
+    def _failure(base: Dict[str, Any], err: Exception) -> Dict[str, Any]:
+        if isinstance(err, FatalError):
             return {
                 **base,
                 "status": "failed",
                 "error": {"message": str(err), "code": err.code, "retryable": False},
             }
-        except Exception as err:  # noqa: BLE001 - any handler error becomes a retryable failure
-            return {**base, "status": "failed", "error": {"message": str(err)}}
+        return {**base, "status": "failed", "error": {"message": str(err)}}
