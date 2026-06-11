@@ -18,10 +18,57 @@ no single place to read or watch the whole flow. `nestjs-durable` collapses that
 3. **End-to-end visibility.** Because one orchestrator owns the state, it knows about *every*
    step (including the Python ones), so a full-flow trace and dashboard come almost for free.
 
+## Quick look
+
+Define a remote step, write the workflow as plain code, and implement the step as a
+provider method — it runs durably, in-process, with zero extra infrastructure:
+
+```ts
+// 1. Declare the step (typed contract, validated at the boundary)
+export const chargeCard = remoteStep({
+  name: 'payments.charge-card',
+  input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
+  output: z.object({ chargeId: z.string() }),
+  retries: 3,
+});
+
+// 2. The workflow — linear code; every step is checkpointed
+@Workflow({ name: 'checkout', version: '1' })
+class CheckoutWorkflow {
+  @Step() async reserveStock(ctx: WorkflowCtx, order: Order) { /* local step */ }
+
+  async run(ctx: WorkflowCtx, order: Order) {
+    await this.reserveStock(ctx, order);
+    const charge = await ctx.call(chargeCard, { orderId: order.id, amountCents: order.total });
+    return charge.chargeId;
+  }
+}
+
+// 3. The step handler — a provider method, decoupled from the workflow
+@Injectable()
+class PaymentsWorker {
+  @DurableStep('payments.charge-card')
+  async charge(input: { orderId: string; amountCents: number }) {
+    const res = await this.stripe.charge(input.orderId, input.amountCents);
+    return { chargeId: res.id };
+  }
+}
+
+// 4. Wire it up — event-emitter transport = no broker, single process
+DurableModule.forRootAsync({
+  inject: [EventEmitter2],
+  useFactory: (emitter) => ({ store: myStore, transport: new EventEmitterTransport(emitter) }),
+});
+```
+
+If the process crashes mid-`checkout`, it resumes on boot from the last checkpoint —
+`reserveStock` and `chargeCard` are not re-run. Swap the transport for BullMQ/NATS to move
+`PaymentsWorker` into a separate process or a Python worker, with no change to the workflow.
+
 ## Status
 
-Early design + scaffold. See [`docs/plans`](docs/plans/2026-06-11-nestjs-durable-design.md)
-for the full design.
+Working core (engine, NestJS module, event-emitter transport, boot recovery) built with TDD.
+See [`docs/plans`](docs/plans/2026-06-11-nestjs-durable-design.md) for the full design.
 
 ## Packages (planned)
 
