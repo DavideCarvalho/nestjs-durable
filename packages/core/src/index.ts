@@ -1,4 +1,5 @@
 export * from './engine';
+export * from './errors';
 export * from './interfaces';
 export * from './remote-step-factory';
 export * from './tokens';

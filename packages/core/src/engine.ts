@@ -1,3 +1,4 @@
+import { FatalError } from './errors';
 import type {
   RemoteStepDef,
   RunResult,
@@ -150,7 +151,7 @@ export class WorkflowEngine {
             });
             return output;
           } catch (err) {
-            if (attempt >= maxAttempts) throw err;
+            if (err instanceof FatalError || attempt >= maxAttempts) throw err;
           }
         }
       },

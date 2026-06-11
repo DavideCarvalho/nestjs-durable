@@ -1,4 +1,5 @@
 import { WorkflowEngine } from './engine';
+import { FatalError } from './errors';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — deterministic replay', () => {
@@ -80,6 +81,66 @@ describe('WorkflowEngine — deterministic replay', () => {
     expect(result.status).toBe('failed');
     expect(result.error?.message).toBe('nope');
     expect(attempts).toBe(2);
+  });
+
+  it('assigns deterministic checkpoints to steps run in parallel (fan-out)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+
+    const order: string[] = [];
+    engine.register('wf', '1', async (ctx) => {
+      const [a, b, c] = await Promise.all([
+        ctx.step('a', async () => {
+          order.push('a');
+          return 1;
+        }),
+        ctx.step('b', async () => {
+          order.push('b');
+          return 2;
+        }),
+        ctx.step('c', async () => {
+          order.push('c');
+          return 3;
+        }),
+      ]);
+      return a + b + c;
+    });
+
+    const result = await engine.start('wf', {}, 'run1');
+
+    expect(result.status).toBe('completed');
+    expect(result.output).toBe(6);
+    // seq is assigned by call order (the synchronous prefix runs before any await),
+    // so the checkpoints are stable regardless of which step's body settles first.
+    const checkpoints = await store.listCheckpoints('run1');
+    expect(checkpoints.map((cp) => [cp.seq, cp.name])).toEqual([
+      [0, 'a'],
+      [1, 'b'],
+      [2, 'c'],
+    ]);
+  });
+
+  it('does not retry a step that throws a FatalError', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+
+    let attempts = 0;
+    engine.register('wf', '1', async (ctx) =>
+      ctx.step(
+        'boom',
+        async () => {
+          attempts += 1;
+          throw new FatalError('do not retry me');
+        },
+        { retries: 5 },
+      ),
+    );
+
+    const result = await engine.start('wf', {}, 'run1');
+
+    expect(result.status).toBe('failed');
+    expect(result.error?.message).toBe('do not retry me');
+    expect(attempts).toBe(1);
   });
 
   it('recovers runs left running after a crash, replaying completed steps', async () => {
