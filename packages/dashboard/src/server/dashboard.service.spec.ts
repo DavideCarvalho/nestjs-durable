@@ -1,0 +1,62 @@
+import {
+  InMemoryStateStore,
+  type WorkflowCtx,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
+import { DashboardService } from './dashboard.service';
+
+function setup() {
+  const store = new InMemoryStateStore();
+  const engine = new WorkflowEngine({ store });
+  const service = new DashboardService(store, engine);
+  return { store, engine, service };
+}
+
+describe('DashboardService', () => {
+  it('lists runs and returns a run with its step timeline', async () => {
+    const { engine, service } = setup();
+    engine.register('checkout', '1', async (ctx: WorkflowCtx) => {
+      await ctx.step('reserve', async () => 1);
+      await ctx.step('charge', async () => 2);
+      return 'done';
+    });
+    await engine.start('checkout', { orderId: 'o1' }, 'r1');
+
+    const runs = await service.listRuns({});
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.status).toBe('completed');
+
+    const detail = await service.getRunDetail('r1');
+    expect(detail?.run.workflow).toBe('checkout');
+    expect(detail?.timeline.map((s) => s.name)).toEqual(['reserve', 'charge']);
+  });
+
+  it('returns null for an unknown run', async () => {
+    const { service } = setup();
+    expect(await service.getRunDetail('nope')).toBeNull();
+  });
+
+  it('retries a failed run and can cancel a suspended one', async () => {
+    const { engine, service } = setup();
+    let fail = true;
+    engine.register('wf', '1', async (ctx: WorkflowCtx) =>
+      ctx.step('s', async () => {
+        if (fail) {
+          fail = false;
+          throw new Error('boom');
+        }
+        return 'ok';
+      }),
+    );
+    await engine.start('wf', {}, 'r1');
+    expect((await service.getRunDetail('r1'))?.run.status).toBe('failed');
+
+    const retried = await service.retry('r1');
+    expect(retried.status).toBe('completed');
+
+    engine.register('waiter', '1', async (ctx: WorkflowCtx) => ctx.waitForSignal('go'));
+    await engine.start('waiter', {}, 'r2');
+    const cancelled = await service.cancel('r2');
+    expect(cancelled?.status).toBe('cancelled');
+  });
+});

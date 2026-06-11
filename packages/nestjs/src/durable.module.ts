@@ -47,6 +47,7 @@ export class DurableModule {
   private static build(optionsProvider: Provider): DynamicModule {
     return {
       module: DurableModule,
+      global: true,
       imports: [DiscoveryModule],
       providers: [
         optionsProvider,
@@ -71,7 +72,7 @@ export class DurableModule {
         DurableStepRegistrar,
         TimerPoller,
       ],
-      exports: [WorkflowService, WorkflowEngine],
+      exports: [WorkflowService, WorkflowEngine, STATE_STORE, TRANSPORT],
     };
   }
 }
