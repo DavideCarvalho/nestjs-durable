@@ -12,6 +12,8 @@
     "---Observability---",
     "observability",
     "---Cross-language---",
-    "python"
+    "python",
+    "---Tooling---",
+    "cli"
   ]
 }

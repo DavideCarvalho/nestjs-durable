@@ -79,14 +79,16 @@ dashboard, OpenTelemetry, a Telescope watcher, and the Python worker SDK. See
 | `@dudousxd/nestjs-durable-core` | Interfaces, engine, deterministic replay, sleep/signals, events | ✅ |
 | `@dudousxd/nestjs-durable` | NestJS module, `@Workflow`/`@DurableStep`, recovery, timer poller, auto-schema | ✅ |
 | `@dudousxd/nestjs-durable-transport-event-emitter` | In-process Transport (zero-infra default) | ✅ |
+| `@dudousxd/nestjs-durable-transport-bullmq` | BullMQ/Redis Transport for cross-process / Python steps | ✅ |
 | `@dudousxd/nestjs-durable-store-mikro-orm` | MikroORM `StateStore` (reference adapter) | ✅ |
 | `@dudousxd/nestjs-durable-store-typeorm` | TypeORM `StateStore` | ✅ |
+| `@dudousxd/nestjs-durable-store-prisma` | Prisma `StateStore` | ✅ |
 | `@dudousxd/nestjs-durable-dashboard` | Embedded control-plane SPA (runs + timeline + retry/cancel) | ✅ |
 | `@dudousxd/nestjs-durable-otel` | OpenTelemetry — trace per run, span per step | ✅ |
 | `@dudousxd/nestjs-durable-telescope` | `@dudousxd/nestjs-telescope` watcher | ✅ |
+| `@dudousxd/nestjs-durable-cli` | `durable inspect` — runs & timelines in the terminal | ✅ |
 | `durable-worker` (PyPI) | Python worker SDK + wire protocol | ✅ |
-| `@dudousxd/nestjs-durable-transport-bullmq` | Queue Transport for cross-process / Python steps | planned |
-| `@dudousxd/nestjs-durable-store-{prisma,drizzle}` | More ORM adapters | planned |
+| `@dudousxd/nestjs-durable-store-drizzle` | Drizzle ORM adapter | planned |
 | `@dudousxd/nestjs-durable-testing` | Fakes, crash injection, replay assertions | planned |
 
 ## License

@@ -1,0 +1,53 @@
+---
+title: CLI
+description: Inspect workflow runs and their step timelines from the terminal with `durable inspect`.
+---
+
+`@dudousxd/nestjs-durable-cli` gives you `durable inspect` — a quick look at runs and their step
+timelines without opening the [dashboard](/docs/observability/dashboard).
+
+```bash
+pnpm add -D @dudousxd/nestjs-durable-cli
+```
+
+## Point it at your store
+
+The CLI reads from a `durable.config.{mjs,js,cjs}` in your project that exports your already-
+configured store:
+
+```ts title="durable.config.mjs"
+import { MikroOrmStateStore } from '@dudousxd/nestjs-durable-store-mikro-orm';
+import { buildOrm } from './src/orm';
+
+export const store = new MikroOrmStateStore(await buildOrm());
+```
+
+## Use it
+
+```bash
+durable inspect                  # list recent runs
+durable inspect wrun_8Kb2        # show one run's step timeline
+durable inspect --status failed  # filter the list
+```
+
+```text
+RUN        WORKFLOW  STATUS     UPDATED
+wrun_8Kb2  checkout  running    3s ago
+wrun_Qz71  onboarding failed    2m ago
+```
+
+```text
+checkout  [completed]  v1
+wrun_8Kb2
+
+  0  reserveStock          (local)              completed  150ms
+  1  payments.charge-card  (remote @payments)   completed  750ms  ×2
+  2  sleep                 (sleep)              completed  3.0s
+  3  shipping.dispatch     (remote @logistics)  completed  800ms
+```
+
+| Option | Description |
+| --- | --- |
+| `--status <status>` | `running` / `suspended` / `completed` / `failed` / `cancelled` |
+| `--limit <n>` | max runs to list (default 50) |
+| `--config <path>` | path to the config (default: `./durable.config.{mjs,js,cjs}`) |
