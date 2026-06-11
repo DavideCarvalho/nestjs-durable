@@ -1,0 +1,32 @@
+{
+  "name": "@dudousxd/nestjs-durable-otel",
+  "version": "0.1.0",
+  "description": "OpenTelemetry tracing for nestjs-durable — a trace per run, a span per step",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "directory": "packages/otel"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "@opentelemetry/api": "^1.0.0"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-durable-core": "workspace:^",
+    "@opentelemetry/api": "1.9.0",
+    "@opentelemetry/sdk-trace-base": "1.30.1",
+    "typescript": "5.9.3"
+  }
+}

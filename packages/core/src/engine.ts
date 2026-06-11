@@ -233,7 +233,15 @@ export class WorkflowEngine {
               startedAt,
               finishedAt: new Date(),
             });
-            this.emit({ type: 'step.completed', runId, seq: current, name, kind: 'local', output });
+            this.emit({
+              type: 'step.completed',
+              runId,
+              seq: current,
+              name,
+              kind: 'local',
+              output,
+              durationMs: Date.now() - startedAt.getTime(),
+            });
             return output;
           } catch (err) {
             if (err instanceof FatalError || attempt >= maxAttempts) throw err;
@@ -322,7 +330,15 @@ export class WorkflowEngine {
       startedAt,
       finishedAt: new Date(),
     });
-    this.emit({ type: 'step.completed', runId, seq, name: step.name, kind: 'remote', output });
+    this.emit({
+      type: 'step.completed',
+      runId,
+      seq,
+      name: step.name,
+      kind: 'remote',
+      output,
+      durationMs: Date.now() - startedAt.getTime(),
+    });
     return output;
   }
 }

@@ -244,6 +244,8 @@ export interface EngineEvent {
   kind?: StepKind;
   output?: unknown;
   error?: StepError;
+  /** Wall-clock duration of the unit that just finished (step or run), when known. */
+  durationMs?: number;
   at: Date;
 }
 
