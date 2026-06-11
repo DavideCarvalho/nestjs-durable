@@ -223,3 +223,28 @@ export interface RunResult {
   output?: unknown;
   error?: StepError;
 }
+
+export type EngineEventType =
+  | 'run.started'
+  | 'run.completed'
+  | 'run.failed'
+  | 'run.suspended'
+  | 'step.completed';
+
+/**
+ * A lifecycle event emitted by the engine. The observability surfaces (dashboard, OTel, the
+ * Telescope integration) all subscribe to these rather than reaching into the store.
+ */
+export interface EngineEvent {
+  type: EngineEventType;
+  runId: string;
+  workflow?: string;
+  seq?: number;
+  name?: string;
+  kind?: StepKind;
+  output?: unknown;
+  error?: StepError;
+  at: Date;
+}
+
+export type EngineListener = (event: EngineEvent) => void;

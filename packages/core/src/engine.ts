@@ -1,10 +1,13 @@
 import { parseDuration } from './duration';
 import { FatalError, WorkflowSuspended } from './errors';
 import type {
+  EngineEvent,
+  EngineListener,
   RemoteStepDef,
   RunResult,
   StateStore,
   StepError,
+  StepKind,
   StepOptions,
   Transport,
   WorkflowCtx,
@@ -43,6 +46,7 @@ export class WorkflowEngine {
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
+  private readonly listeners = new Set<EngineListener>();
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
@@ -64,6 +68,23 @@ export class WorkflowEngine {
     this.workflows.set(name, { version, fn });
   }
 
+  /** Subscribe to lifecycle events. Returns an unsubscribe function. */
+  subscribe(listener: EngineListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private emit(event: Omit<EngineEvent, 'at'>): void {
+    const full: EngineEvent = { ...event, at: new Date() };
+    for (const listener of this.listeners) {
+      try {
+        listener(full);
+      } catch {
+        // a misbehaving subscriber must never break workflow execution
+      }
+    }
+  }
+
   async start(workflow: string, input: unknown, runId: string): Promise<RunResult> {
     const registered = this.requireWorkflow(workflow);
     const now = new Date();
@@ -77,6 +98,7 @@ export class WorkflowEngine {
       updatedAt: now,
     };
     await this.store.createRun(run);
+    this.emit({ type: 'run.started', runId, workflow });
     return this.execute(run, registered.fn);
   }
 
@@ -147,6 +169,7 @@ export class WorkflowEngine {
     try {
       const output = await fn(ctx, run.input);
       await this.store.updateRun(run.id, { status: 'completed', output, updatedAt: new Date() });
+      this.emit({ type: 'run.completed', runId: run.id, workflow: run.workflow, output });
       return { runId: run.id, status: 'completed', output };
     } catch (err) {
       if (err instanceof WorkflowSuspended) {
@@ -155,6 +178,7 @@ export class WorkflowEngine {
           wakeAt: err.wakeAt,
           updatedAt: new Date(),
         });
+        this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
         return { runId: run.id, status: 'suspended' };
       }
       const error = {
@@ -162,6 +186,7 @@ export class WorkflowEngine {
         stack: err instanceof Error ? err.stack : undefined,
       };
       await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
+      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
       return { runId: run.id, status: 'failed', error };
     }
   }
@@ -198,6 +223,7 @@ export class WorkflowEngine {
               startedAt,
               finishedAt: new Date(),
             });
+            this.emit({ type: 'step.completed', runId, seq: current, name, kind: 'local', output });
             return output;
           } catch (err) {
             if (err instanceof FatalError || attempt >= maxAttempts) throw err;
@@ -286,6 +312,7 @@ export class WorkflowEngine {
       startedAt,
       finishedAt: new Date(),
     });
+    this.emit({ type: 'step.completed', runId, seq, name: step.name, kind: 'remote', output });
     return output;
   }
 }
