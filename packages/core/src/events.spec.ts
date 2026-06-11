@@ -23,6 +23,22 @@ describe('WorkflowEngine — lifecycle events', () => {
     expect(step?.runId).toBe('run1');
   });
 
+  it('cancel marks a run cancelled and emits run.failed', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    const events: EngineEvent[] = [];
+    engine.subscribe((e) => events.push(e));
+
+    engine.register('wf', '1', async (ctx) => ctx.waitForSignal('go'));
+    await engine.start('wf', {}, 'run1'); // suspends on the signal
+
+    const result = await engine.cancel('run1');
+
+    expect(result?.status).toBe('cancelled');
+    expect((await store.getRun('run1'))?.status).toBe('cancelled');
+    expect(events.some((e) => e.type === 'run.failed' && e.runId === 'run1')).toBe(true);
+  });
+
   it('stops delivering after unsubscribe', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });

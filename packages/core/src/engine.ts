@@ -158,6 +158,16 @@ export class WorkflowEngine {
     return this.resume(waiter.runId);
   }
 
+  /** Cancel a run (e.g. from the dashboard). Returns null if the run does not exist. */
+  async cancel(runId: string): Promise<RunResult | null> {
+    const run = await this.store.getRun(runId);
+    if (!run) return null;
+    const error = { message: 'cancelled' };
+    await this.store.updateRun(runId, { status: 'cancelled', error, updatedAt: new Date() });
+    this.emit({ type: 'run.failed', runId, workflow: run.workflow, error });
+    return { runId, status: 'cancelled', error };
+  }
+
   private requireWorkflow(name: string): RegisteredWorkflow {
     const registered = this.workflows.get(name);
     if (!registered) throw new Error(`workflow ${name} is not registered`);
