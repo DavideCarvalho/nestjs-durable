@@ -1,0 +1,72 @@
+import {
+  InMemoryStateStore,
+  type RemoteStepDef,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
+import IORedis from 'ioredis';
+import { z } from 'zod';
+import { BullMQTransport } from './bullmq-transport';
+
+const connection = { host: '127.0.0.1', port: 6379 };
+
+const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
+  name: 'payments.charge-card',
+  group: 'payments',
+  input: z.object({ amount: z.number() }),
+  output: z.object({ chargeId: z.string() }),
+  __remote: true,
+};
+
+let redisUp = false;
+beforeAll(async () => {
+  const probe = new IORedis({ ...connection, maxRetriesPerRequest: 1, lazyConnect: true });
+  try {
+    await probe.connect();
+    await probe.ping();
+    redisUp = true;
+  } catch {
+    redisUp = false;
+  }
+  await probe.quit().catch(() => {});
+});
+
+describe('BullMQTransport (real Redis)', () => {
+  it('dispatches a remote step over Redis and returns the checkpointed result', async (ctx) => {
+    if (!redisUp) ctx.skip();
+    const prefix = `durtest-${Date.now()}`;
+    const transport = new BullMQTransport({ connection, group: 'payments', prefix });
+    transport.handle('payments.charge-card', async (input: { amount: number }) => ({
+      chargeId: `ch_${input.amount}`,
+    }));
+
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    engine.register('checkout', '1', async (c) => {
+      const charge = await c.call(chargeCard, { amount: 7 });
+      return charge.chargeId;
+    });
+
+    const result = await engine.start('checkout', {}, 'run1');
+    expect(result.status).toBe('completed');
+    expect(result.output).toBe('ch_7');
+
+    await transport.close();
+  }, 20_000);
+
+  it('reports a failed result when the worker handler throws', async (ctx) => {
+    if (!redisUp) ctx.skip();
+    const prefix = `durtest-${Date.now()}-f`;
+    const transport = new BullMQTransport({ connection, group: 'payments', prefix });
+    transport.handle('payments.charge-card', async () => {
+      throw new Error('declined');
+    });
+
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    engine.register('checkout', '1', async (c) => c.call(chargeCard, { amount: 1 }));
+
+    const result = await engine.start('checkout', {}, 'run1');
+    expect(result.status).toBe('failed');
+    expect(result.error?.message).toBe('declined');
+
+    await transport.close();
+  }, 20_000);
+});
