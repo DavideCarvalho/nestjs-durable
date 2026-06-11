@@ -1,4 +1,13 @@
-import type { RunResult, StateStore, StepOptions, WorkflowCtx, WorkflowRun } from './interfaces';
+import type {
+  RemoteStepDef,
+  RunResult,
+  StateStore,
+  StepError,
+  StepOptions,
+  Transport,
+  WorkflowCtx,
+  WorkflowRun,
+} from './interfaces';
 
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
@@ -7,21 +16,42 @@ interface RegisteredWorkflow {
   fn: WorkflowFn;
 }
 
+interface PendingRemote {
+  resolve: (output: unknown) => void;
+  reject: (error: Error) => void;
+}
+
 export interface WorkflowEngineDeps {
   store: StateStore;
+  transport?: Transport;
 }
 
 /**
  * The orchestrator. Owns workflow state and replays runs deterministically: each step's
  * result is checkpointed, so on resume a completed step returns its saved output instead of
- * re-executing. Remote-step dispatch over a Transport is layered on top (not yet wired here).
+ * re-executing. Remote steps are dispatched over the Transport; their results checkpoint the
+ * same way local steps do.
  */
 export class WorkflowEngine {
   private readonly store: StateStore;
+  private readonly transport?: Transport;
   private readonly workflows = new Map<string, RegisteredWorkflow>();
+  /** In-flight remote steps awaiting a worker result, keyed by stepId. */
+  private readonly pending = new Map<string, PendingRemote>();
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
+    this.transport = deps.transport;
+    this.transport?.onResult(async (result) => {
+      const waiter = this.pending.get(result.stepId);
+      if (!waiter) return;
+      this.pending.delete(result.stepId);
+      if (result.status === 'completed') {
+        waiter.resolve(result.output);
+      } else {
+        waiter.reject(new RemoteStepError(result.error));
+      }
+    });
   }
 
   register(name: string, version: string, fn: WorkflowFn): void {
@@ -75,12 +105,15 @@ export class WorkflowEngine {
 
   private makeCtx(runId: string): WorkflowCtx {
     let seq = -1;
+    const nextSeq = () => {
+      seq += 1;
+      return seq;
+    };
     const store = this.store;
     return {
       runId,
-      async step<T>(name: string, fn: () => Promise<T>, options?: StepOptions): Promise<T> {
-        seq += 1;
-        const current = seq;
+      step: async <T>(name: string, fn: () => Promise<T>, options?: StepOptions): Promise<T> => {
+        const current = nextSeq();
         const existing = await store.getCheckpoint(runId, current);
         if (existing && existing.status === 'completed') {
           return existing.output as T;
@@ -108,9 +141,64 @@ export class WorkflowEngine {
           }
         }
       },
-      async call() {
-        throw new Error('remote steps require a Transport (not wired in core engine yet)');
-      },
+      call: <TInput, TOutput>(step: RemoteStepDef<TInput, TOutput>, input: TInput) =>
+        this.callRemote(runId, nextSeq(), step, input),
     };
+  }
+
+  private async callRemote<TInput, TOutput>(
+    runId: string,
+    seq: number,
+    step: RemoteStepDef<TInput, TOutput>,
+    input: TInput,
+  ): Promise<TOutput> {
+    const existing = await this.store.getCheckpoint(runId, seq);
+    if (existing && existing.status === 'completed') {
+      return existing.output as TOutput;
+    }
+    if (!this.transport) throw new Error('remote steps require a Transport');
+
+    const validInput = step.input.parse(input);
+    const stepId = `${runId}:${seq}`;
+    const startedAt = new Date();
+
+    const resultPromise = new Promise<unknown>((resolve, reject) => {
+      this.pending.set(stepId, { resolve, reject });
+    });
+    await this.transport.dispatch({
+      runId,
+      seq,
+      name: step.name,
+      stepId,
+      group: step.group,
+      input: validInput,
+      attempt: 1,
+    });
+    const rawOutput = await resultPromise;
+    const output = step.output.parse(rawOutput) as TOutput;
+    await this.store.saveCheckpoint({
+      runId,
+      seq,
+      name: step.name,
+      kind: 'remote',
+      stepId,
+      status: 'completed',
+      output,
+      attempts: 1,
+      workerGroup: step.group,
+      startedAt,
+      finishedAt: new Date(),
+    });
+    return output;
+  }
+}
+
+/** Raised inside the workflow when a remote worker reports a step failure. */
+export class RemoteStepError extends Error {
+  readonly stepError?: StepError;
+  constructor(stepError?: StepError) {
+    super(stepError?.message ?? 'remote step failed');
+    this.name = 'RemoteStepError';
+    this.stepError = stepError;
   }
 }
