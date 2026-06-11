@@ -6,3 +6,6 @@ coverage/
 .DS_Store
 .env
 *.tsbuildinfo
+__pycache__/
+*.pyc
+.pytest_cache/
