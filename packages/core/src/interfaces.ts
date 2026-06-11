@@ -174,8 +174,18 @@ export interface RemoteStepDef<TInput = unknown, TOutput = unknown> extends Step
  */
 export interface WorkflowCtx {
   readonly runId: string;
+  /** Run a local durable step: executed once, then its result is checkpointed and replayed. */
+  step<TOutput>(name: string, fn: () => Promise<TOutput>, options?: StepOptions): Promise<TOutput>;
   /** Dispatch a typed remote step and await its checkpointed result. */
   call<TInput, TOutput>(step: RemoteStepDef<TInput, TOutput>, input: TInput): Promise<TOutput>;
   /** Durable sleep that survives restarts (fase 2). */
   sleep?(duration: string): Promise<void>;
+}
+
+/** Result of executing or resuming a workflow run. */
+export interface RunResult {
+  runId: string;
+  status: RunStatus;
+  output?: unknown;
+  error?: StepError;
 }
