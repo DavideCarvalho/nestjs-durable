@@ -81,6 +81,19 @@ export class WorkflowEngine {
     return this.execute(run, registered.fn);
   }
 
+  /**
+   * Resume every run left incomplete by a crash or deploy. Called on boot. Completed steps
+   * replay from their checkpoints, so only the work that had not finished runs again.
+   */
+  async recoverIncomplete(): Promise<RunResult[]> {
+    const runs = await this.store.listIncompleteRuns();
+    const results: RunResult[] = [];
+    for (const run of runs) {
+      results.push(await this.resume(run.id));
+    }
+    return results;
+  }
+
   private requireWorkflow(name: string): RegisteredWorkflow {
     const registered = this.workflows.get(name);
     if (!registered) throw new Error(`workflow ${name} is not registered`);

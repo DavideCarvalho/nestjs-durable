@@ -81,4 +81,51 @@ describe('WorkflowEngine — deterministic replay', () => {
     expect(result.error?.message).toBe('nope');
     expect(attempts).toBe(2);
   });
+
+  it('recovers runs left running after a crash, replaying completed steps', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+
+    let aRuns = 0;
+    engine.register('wf', '1', async (ctx) => {
+      const a = await ctx.step('a', async () => {
+        aRuns += 1;
+        return 1;
+      });
+      const b = await ctx.step('b', async () => 2);
+      return a + b;
+    });
+
+    // Simulate a crash: a run that started and completed step 'a' but was left 'running'.
+    const now = new Date();
+    await store.createRun({
+      id: 'r1',
+      workflow: 'wf',
+      workflowVersion: '1',
+      status: 'running',
+      input: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+    await store.saveCheckpoint({
+      runId: 'r1',
+      seq: 0,
+      name: 'a',
+      kind: 'local',
+      stepId: 'r1:0',
+      status: 'completed',
+      output: 1,
+      attempts: 1,
+      startedAt: now,
+      finishedAt: now,
+    });
+
+    const recovered = await engine.recoverIncomplete();
+
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]?.status).toBe('completed');
+    expect(recovered[0]?.output).toBe(3);
+    // 'a' was replayed from its checkpoint, not re-executed.
+    expect(aRuns).toBe(0);
+  });
 });
