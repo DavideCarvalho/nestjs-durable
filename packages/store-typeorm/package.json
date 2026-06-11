@@ -1,0 +1,33 @@
+{
+  "name": "@dudousxd/nestjs-durable-store-typeorm",
+  "version": "0.1.0",
+  "description": "TypeORM adapter for the nestjs-durable StateStore",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "directory": "packages/store-typeorm"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "typeorm": "^0.3.0"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-durable-core": "workspace:^",
+    "better-sqlite3": "11.10.0",
+    "reflect-metadata": "0.2.2",
+    "typeorm": "0.3.30",
+    "typescript": "5.9.3"
+  }
+}

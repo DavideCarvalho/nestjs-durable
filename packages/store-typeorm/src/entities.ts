@@ -1,0 +1,91 @@
+import type { RunStatus, StepKind } from '@dudousxd/nestjs-durable-core';
+import { Column, Entity, PrimaryColumn } from 'typeorm';
+
+@Entity({ name: 'durable_workflow_runs' })
+export class WorkflowRunEntity {
+  @PrimaryColumn('text')
+  id!: string;
+
+  @Column('text')
+  workflow!: string;
+
+  @Column('text')
+  workflowVersion!: string;
+
+  @Column('text')
+  status!: RunStatus;
+
+  @Column('simple-json', { nullable: true })
+  input?: unknown;
+
+  @Column('simple-json', { nullable: true })
+  output?: unknown;
+
+  @Column('simple-json', { nullable: true })
+  error?: unknown;
+
+  @Column('integer', { nullable: true })
+  wakeAt?: number | null;
+
+  @Column('integer')
+  createdAt!: number;
+
+  @Column('integer')
+  updatedAt!: number;
+}
+
+@Entity({ name: 'durable_step_checkpoints' })
+export class StepCheckpointEntity {
+  @PrimaryColumn('text')
+  runId!: string;
+
+  @PrimaryColumn('integer')
+  seq!: number;
+
+  @Column('text')
+  name!: string;
+
+  @Column('text')
+  kind!: StepKind;
+
+  @Column('text')
+  stepId!: string;
+
+  @Column('text')
+  status!: 'completed' | 'failed';
+
+  @Column('simple-json', { nullable: true })
+  output?: unknown;
+
+  @Column('simple-json', { nullable: true })
+  error?: unknown;
+
+  @Column('integer')
+  attempts!: number;
+
+  @Column('text', { nullable: true })
+  workerGroup?: string | null;
+
+  @Column('integer', { nullable: true })
+  wakeAt?: number | null;
+
+  @Column('integer')
+  startedAt!: number;
+
+  @Column('integer')
+  finishedAt!: number;
+}
+
+@Entity({ name: 'durable_signal_waiters' })
+export class SignalWaiterEntity {
+  @PrimaryColumn('text')
+  token!: string;
+
+  @Column('text')
+  runId!: string;
+
+  @Column('integer')
+  seq!: number;
+}
+
+export const ENTITIES = [WorkflowRunEntity, StepCheckpointEntity, SignalWaiterEntity] as const;
