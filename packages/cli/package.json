@@ -1,0 +1,32 @@
+{
+  "name": "@dudousxd/nestjs-durable-cli",
+  "version": "0.1.0",
+  "description": "CLI for nestjs-durable — inspect workflow runs and their step timelines from the terminal",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "directory": "packages/cli"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "durable": "dist/bin.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-durable-core": "workspace:^",
+    "typescript": "5.9.3"
+  }
+}
