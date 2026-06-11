@@ -1,7 +1,12 @@
-import type { Heartbeat, RemoteTask, StepResult, Transport } from '@dudousxd/nestjs-durable-core';
+import {
+  type Heartbeat,
+  type RemoteTask,
+  type StepHandler,
+  type StepResult,
+  type Transport,
+  runStepHandler,
+} from '@dudousxd/nestjs-durable-core';
 import { type ConnectionOptions, Queue, Worker } from 'bullmq';
-
-type Handler = (input: unknown) => Promise<unknown>;
 
 export interface BullMQTransportOptions {
   /** ioredis connection options (or an IORedis instance). */
@@ -25,7 +30,7 @@ export class BullMQTransport implements Transport {
   private readonly connection: ConnectionOptions;
   private readonly group?: string;
   private readonly prefix: string;
-  private readonly handlers = new Map<string, Handler>();
+  private readonly handlers = new Map<string, StepHandler>();
   private readonly queues = new Map<string, Queue>();
   private taskWorker?: Worker;
   private resultsWorker?: Worker;
@@ -69,7 +74,7 @@ export class BullMQTransport implements Transport {
   }
 
   /** Register a step handler (worker side). Starts the group's task consumer on first call. */
-  handle(name: string, fn: Handler): void {
+  handle(name: string, fn: StepHandler): void {
     if (!this.group) throw new Error('BullMQTransport needs a `group` to register handlers');
     this.handlers.set(name, fn);
     if (!this.taskWorker) {
@@ -80,26 +85,7 @@ export class BullMQTransport implements Transport {
   }
 
   private async runTask(task: RemoteTask): Promise<void> {
-    const base = { runId: task.runId, seq: task.seq, stepId: task.stepId };
-    const handler = this.handlers.get(task.name);
-    let result: StepResult;
-    if (!handler) {
-      result = {
-        ...base,
-        status: 'failed',
-        error: { message: `no handler for ${task.name}`, retryable: false },
-      };
-    } else {
-      try {
-        result = { ...base, status: 'completed', output: await handler(task.input) };
-      } catch (err) {
-        result = {
-          ...base,
-          status: 'failed',
-          error: { message: err instanceof Error ? err.message : String(err) },
-        };
-      }
-    }
+    const result = await runStepHandler(task, this.handlers.get(task.name));
     await this.queue(this.resultsName()).add('result', result, {
       removeOnComplete: true,
       removeOnFail: true,

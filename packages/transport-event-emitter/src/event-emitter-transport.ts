@@ -1,11 +1,16 @@
-import type { Heartbeat, RemoteTask, StepResult, Transport } from '@dudousxd/nestjs-durable-core';
+import {
+  type Heartbeat,
+  type RemoteTask,
+  type StepHandler,
+  type StepResult,
+  type Transport,
+  runStepHandler,
+} from '@dudousxd/nestjs-durable-core';
 import type { EventEmitter2 } from 'eventemitter2';
 
 export const TASK_EVENT = 'durable.task';
 export const RESULT_EVENT = 'durable.result';
 export const HEARTBEAT_EVENT = 'durable.heartbeat';
-
-type Handler = (input: unknown) => Promise<unknown>;
 
 /**
  * An in-process `Transport` backed by `@nestjs/event-emitter`'s `EventEmitter2`.
@@ -15,7 +20,7 @@ type Handler = (input: unknown) => Promise<unknown>;
  * cross-process or cross-language steps.
  */
 export class EventEmitterTransport implements Transport {
-  private readonly handlers = new Map<string, Handler>();
+  private readonly handlers = new Map<string, StepHandler>();
 
   constructor(private readonly emitter: EventEmitter2) {
     this.emitter.on(TASK_EVENT, (taskInput: RemoteTask) => {
@@ -24,7 +29,7 @@ export class EventEmitterTransport implements Transport {
   }
 
   /** Register a step handler by name (the worker side, in this same process). */
-  handle(name: string, fn: Handler): void {
+  handle(name: string, fn: StepHandler): void {
     this.handlers.set(name, fn);
   }
 
@@ -46,21 +51,7 @@ export class EventEmitterTransport implements Transport {
 
   private async process(task: RemoteTask): Promise<void> {
     const handler = this.handlers.get(task.name);
-    if (!handler) return; // another worker/process may own this step name
-    const base = { runId: task.runId, seq: task.seq, stepId: task.stepId };
-    try {
-      const output = await handler(task.input);
-      this.emitter.emit(RESULT_EVENT, {
-        ...base,
-        status: 'completed',
-        output,
-      } satisfies StepResult);
-    } catch (err) {
-      this.emitter.emit(RESULT_EVENT, {
-        ...base,
-        status: 'failed',
-        error: { message: err instanceof Error ? err.message : String(err) },
-      } satisfies StepResult);
-    }
+    if (!handler) return; // another subscriber may own this step name — stay silent, don't fail it
+    this.emitter.emit(RESULT_EVENT, await runStepHandler(task, handler));
   }
 }

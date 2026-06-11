@@ -13,6 +13,7 @@ import type {
   WorkflowCtx,
   WorkflowRun,
 } from './interfaces';
+import { stepId } from './protocol';
 
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
@@ -148,7 +149,7 @@ export class WorkflowEngine {
       seq: waiter.seq,
       name: `signal:${token}`,
       kind: 'signal',
-      stepId: `${waiter.runId}:${waiter.seq}`,
+      stepId: stepId(waiter.runId, waiter.seq),
       status: 'completed',
       output: payload,
       attempts: 1,
@@ -172,6 +173,41 @@ export class WorkflowEngine {
     const registered = this.workflows.get(name);
     if (!registered) throw new Error(`workflow ${name} is not registered`);
     return registered;
+  }
+
+  /** Checkpoint a finished step and announce it — the two things that must always happen together. */
+  private async completeStep(step: {
+    runId: string;
+    seq: number;
+    name: string;
+    kind: StepKind;
+    output: unknown;
+    attempts: number;
+    startedAt: Date;
+    workerGroup?: string;
+  }): Promise<void> {
+    await this.store.saveCheckpoint({
+      runId: step.runId,
+      seq: step.seq,
+      name: step.name,
+      kind: step.kind,
+      stepId: stepId(step.runId, step.seq),
+      status: 'completed',
+      output: step.output,
+      attempts: step.attempts,
+      workerGroup: step.workerGroup,
+      startedAt: step.startedAt,
+      finishedAt: new Date(),
+    });
+    this.emit({
+      type: 'step.completed',
+      runId: step.runId,
+      seq: step.seq,
+      name: step.name,
+      kind: step.kind,
+      output: step.output,
+      durationMs: Date.now() - step.startedAt.getTime(),
+    });
   }
 
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
@@ -221,26 +257,14 @@ export class WorkflowEngine {
         for (let attempt = 1; ; attempt += 1) {
           try {
             const output = await fn();
-            await store.saveCheckpoint({
+            await this.completeStep({
               runId,
               seq: current,
               name,
               kind: 'local',
-              stepId: `${runId}:${current}`,
-              status: 'completed',
               output,
               attempts: attempt,
               startedAt,
-              finishedAt: new Date(),
-            });
-            this.emit({
-              type: 'step.completed',
-              runId,
-              seq: current,
-              name,
-              kind: 'local',
-              output,
-              durationMs: Date.now() - startedAt.getTime(),
             });
             return output;
           } catch (err) {
@@ -266,7 +290,7 @@ export class WorkflowEngine {
           seq: current,
           name: 'sleep',
           kind: 'sleep',
-          stepId: `${runId}:${current}`,
+          stepId: stepId(runId, current),
           status: 'completed',
           wakeAt,
           attempts: 1,
@@ -300,44 +324,32 @@ export class WorkflowEngine {
     if (!this.transport) throw new Error('remote steps require a Transport');
 
     const validInput = step.input.parse(input);
-    const stepId = `${runId}:${seq}`;
+    const id = stepId(runId, seq);
     const startedAt = new Date();
 
     const resultPromise = new Promise<unknown>((resolve, reject) => {
-      this.pending.set(stepId, { resolve, reject });
+      this.pending.set(id, { resolve, reject });
     });
     await this.transport.dispatch({
       runId,
       seq,
       name: step.name,
-      stepId,
+      stepId: id,
       group: step.group,
       input: validInput,
       attempt: 1,
     });
     const rawOutput = await resultPromise;
     const output = step.output.parse(rawOutput) as TOutput;
-    await this.store.saveCheckpoint({
+    await this.completeStep({
       runId,
       seq,
       name: step.name,
       kind: 'remote',
-      stepId,
-      status: 'completed',
       output,
       attempts: 1,
       workerGroup: step.group,
       startedAt,
-      finishedAt: new Date(),
-    });
-    this.emit({
-      type: 'step.completed',
-      runId,
-      seq,
-      name: step.name,
-      kind: 'remote',
-      output,
-      durationMs: Date.now() - startedAt.getTime(),
     });
     return output;
   }
