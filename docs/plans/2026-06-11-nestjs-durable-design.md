@@ -282,10 +282,40 @@ docs/  website/  scripts/  turbo.json  pnpm-workspace.yaml  tsconfig.base.json  
   `assertStepDispatchedTo('payments')`, `assertRetried(n)`.
 - Worker fake to test remote steps without standing up Python.
 
+## Parity with Vercel Workflow DevKit
+
+Vercel's open-source WDK popularised this pattern in TypeScript around four primitives
+(`Workflow`, `Step`, `Sleep`, `Hook`) plus skew protection and built-in observability. The
+gap analysis below drives what we add; the primitives marked **v1+** are promoted out of
+"fase 2" into the near-term roadmap because they are core to the model, not extras.
+
+| Capability | Vercel WDK | Ours | Plan |
+| --- | --- | --- | --- |
+| Workflow-as-code | `'use workflow'` (compiler directive) | `@Workflow` + `run()` (decorator) | parity, different mechanism |
+| Durable step + retries | `'use step'` | `@Step` / `ctx.step` + retries | parity |
+| Cross-app / cross-language step | isolated routes + Python SDK | `ctx.call(remoteStep)` + Transport + worker | parity (ours is explicit cross-app) |
+| **Sleep** (`sleep('7 days')`) | yes (headline) | — | **v1+** `ctx.sleep(duration)` durable timer surviving restarts |
+| **Hooks / signals** (human-in-the-loop) | `defineHook` + `create()` / `resume(token, data)` | — | **v1+** wait for external event, resume by token |
+| **Fan-out** (`Promise.all` of steps) | yes | seq counter was sequential | **v1+** deterministic seq under parallel calls |
+| **Fatal vs retryable errors** | `FatalError` | `StepError.retryable` (unused) | **v1+** `FatalError` short-circuits retries |
+| Skew protection / versioning | runs pinned to their deploy version | `workflowVersion` recorded | enforce on resume |
+| Observability event log | input/output/sleep/hook/error | step checkpoints (+ `step_events`) | extend log with sleep/hook events |
+| **CLI inspect** (`npx workflow inspect runs`) | yes | — | **v1+** `durable inspect` alongside the dashboard |
+| Durable streams (resumable) | `getWritable()` | — | fase 2 |
+| **Durable AI agents** (`DurableAgent` / AI SDK) | yes (major selling point) | — | fase 2 — `@dudousxd/nestjs-durable-ai` over the AI SDK |
+
 ## Open questions / fase 2
 
 - Schema-first codegen (protobuf/JSON Schema) for strong cross-language types.
-- Sub-workflows / child workflows and fan-out (parallel steps with a join).
-- Signals / external events (wait for a human approval, a webhook).
-- Durable timers / sleep (`ctx.sleep('1d')`) surviving restarts.
+- Sub-workflows / child workflows (a workflow that starts and awaits another).
+- Durable resumable streams (client disconnect/reconnect mid-run) à la Vercel `getWritable()`.
+- Durable AI agents (`DurableAgent` over the Vercel AI SDK): tool calls, resumable runs.
 - Additional worker SDKs (Go, Node-worker).
+
+## Store adapters
+
+Postgres-first, ORM-agnostic via per-ORM adapter packages. **`store-mikro-orm` is the
+reference adapter** (it is the ORM in use at the author's shop); `store-typeorm` and
+`store-prisma` follow as the most widely used; `store-drizzle` after. All implement the same
+`StateStore` contract and are verified against one shared contract test-suite (run per adapter
+against SQLite/Postgres) so behaviour is identical across ORMs.
