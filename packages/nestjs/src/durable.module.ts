@@ -9,12 +9,15 @@ import {
 import { type DynamicModule, type InjectionToken, Module, type Provider } from '@nestjs/common';
 import { DiscoveryModule } from '@nestjs/core';
 import { DurableStepRegistrar } from './durable-step.registrar';
+import { TimerPoller } from './timer-poller';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
 
 export interface DurableModuleOptions {
   store: StateStore;
   transport?: Transport;
+  /** Interval (ms) for the durable-timer poller. `0` disables it. Defaults to 1000. */
+  timerPollMs?: number;
 }
 
 export interface DurableModuleAsyncOptions {
@@ -61,6 +64,7 @@ export class DurableModule {
         WorkflowService,
         WorkflowRegistrar,
         DurableStepRegistrar,
+        TimerPoller,
       ],
       exports: [WorkflowService, WorkflowEngine],
     };

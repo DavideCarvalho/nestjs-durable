@@ -1,0 +1,47 @@
+import { DURABLE_OPTIONS, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  Inject,
+  Injectable,
+  type OnApplicationBootstrap,
+  type OnModuleDestroy,
+} from '@nestjs/common';
+import type { DurableModuleOptions } from './durable.module';
+
+/**
+ * Resumes suspended runs whose durable timer (`ctx.sleep`) is due — once on boot, then on an
+ * interval. Set `timerPollMs` to `0` to disable the interval (e.g. when an external scheduler
+ * drives `WorkflowEngine.resumeDueTimers`).
+ */
+@Injectable()
+export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
+  private timer?: ReturnType<typeof setInterval>;
+  private polling = false;
+
+  constructor(
+    private readonly engine: WorkflowEngine,
+    @Inject(DURABLE_OPTIONS) private readonly options: DurableModuleOptions,
+  ) {}
+
+  async onApplicationBootstrap(): Promise<void> {
+    await this.poll();
+    const intervalMs = this.options.timerPollMs ?? 1_000;
+    if (intervalMs > 0) {
+      this.timer = setInterval(() => void this.poll(), intervalMs);
+      this.timer.unref?.();
+    }
+  }
+
+  onModuleDestroy(): void {
+    if (this.timer) clearInterval(this.timer);
+  }
+
+  private async poll(): Promise<void> {
+    if (this.polling) return; // never overlap two sweeps
+    this.polling = true;
+    try {
+      await this.engine.resumeDueTimers();
+    } finally {
+      this.polling = false;
+    }
+  }
+}
