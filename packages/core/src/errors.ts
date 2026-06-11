@@ -11,3 +11,16 @@ export class FatalError extends Error {
     this.code = code;
   }
 }
+
+/**
+ * Internal control signal thrown to suspend a run (e.g. on a durable sleep). Not an error the
+ * user should throw or catch; the engine uses it to stop execution and persist `wakeAt`.
+ */
+export class WorkflowSuspended extends Error {
+  readonly wakeAt: number;
+  constructor(wakeAt: number) {
+    super('workflow suspended');
+    this.name = 'WorkflowSuspended';
+    this.wakeAt = wakeAt;
+  }
+}

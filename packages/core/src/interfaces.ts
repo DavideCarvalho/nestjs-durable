@@ -11,7 +11,7 @@ import type { z } from 'zod';
 // Runs & checkpoints — the durable state owned by the orchestrator
 // ---------------------------------------------------------------------------
 
-export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus = 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled';
 
 /** One execution of a workflow. The unit of durability and the unit shown in the dashboard. */
 export interface WorkflowRun {
@@ -27,11 +27,13 @@ export interface WorkflowRun {
   output?: unknown;
   /** Structured error, once `failed`. */
   error?: StepError;
+  /** When `suspended` on a durable sleep: epoch ms at which the run becomes due to resume. */
+  wakeAt?: number;
   createdAt: Date;
   updatedAt: Date;
 }
 
-export type StepKind = 'local' | 'remote';
+export type StepKind = 'local' | 'remote' | 'sleep';
 
 /**
  * The recorded result of a single step at a deterministic logical position (`seq`).
@@ -52,6 +54,8 @@ export interface StepCheckpoint {
   attempts: number;
   /** For remote steps: which worker group ran it. */
   workerGroup?: string;
+  /** For sleep steps: epoch ms the sleep elapses at. */
+  wakeAt?: number;
   startedAt: Date;
   finishedAt: Date;
 }
@@ -81,8 +85,11 @@ export interface StateStore {
    */
   saveCheckpoint(checkpoint: StepCheckpoint): Promise<void>;
 
-  /** Used by recovery on boot to find runs to resume. */
+  /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(): Promise<WorkflowRun[]>;
+
+  /** Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume. */
+  listDueTimers(nowMs: number): Promise<WorkflowRun[]>;
 
   // Dashboard queries
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
@@ -178,8 +185,12 @@ export interface WorkflowCtx {
   step<TOutput>(name: string, fn: () => Promise<TOutput>, options?: StepOptions): Promise<TOutput>;
   /** Dispatch a typed remote step and await its checkpointed result. */
   call<TInput, TOutput>(step: RemoteStepDef<TInput, TOutput>, input: TInput): Promise<TOutput>;
-  /** Durable sleep that survives restarts (fase 2). */
-  sleep?(duration: string): Promise<void>;
+  /**
+   * Durable sleep: suspends the run for `duration` (e.g. `'30s'`, `'2h'`, `'7 days'`, or ms as a
+   * number) without consuming resources, resuming automatically once the timer is due — even
+   * across restarts.
+   */
+  sleep(duration: string | number): Promise<void>;
 }
 
 /** Result of executing or resuming a workflow run. */

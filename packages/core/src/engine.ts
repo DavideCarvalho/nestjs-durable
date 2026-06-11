@@ -1,4 +1,5 @@
-import { FatalError } from './errors';
+import { parseDuration } from './duration';
+import { FatalError, WorkflowSuspended } from './errors';
 import type {
   RemoteStepDef,
   RunResult,
@@ -25,6 +26,8 @@ interface PendingRemote {
 export interface WorkflowEngineDeps {
   store: StateStore;
   transport?: Transport;
+  /** Epoch-ms clock; injectable for tests. Defaults to `Date.now`. */
+  clock?: () => number;
 }
 
 /**
@@ -36,6 +39,7 @@ export interface WorkflowEngineDeps {
 export class WorkflowEngine {
   private readonly store: StateStore;
   private readonly transport?: Transport;
+  private readonly clock: () => number;
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
@@ -43,6 +47,7 @@ export class WorkflowEngine {
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
     this.transport = deps.transport;
+    this.clock = deps.clock ?? Date.now;
     this.transport?.onResult(async (result) => {
       const waiter = this.pending.get(result.stepId);
       if (!waiter) return;
@@ -95,6 +100,19 @@ export class WorkflowEngine {
     return results;
   }
 
+  /**
+   * Resume every suspended run whose durable timer is due. Call periodically (a poller) and on
+   * boot. A run still not due re-suspends cheaply without running new work.
+   */
+  async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
+    const runs = await this.store.listDueTimers(nowMs);
+    const results: RunResult[] = [];
+    for (const run of runs) {
+      results.push(await this.resume(run.id));
+    }
+    return results;
+  }
+
   private requireWorkflow(name: string): RegisteredWorkflow {
     const registered = this.workflows.get(name);
     if (!registered) throw new Error(`workflow ${name} is not registered`);
@@ -108,6 +126,14 @@ export class WorkflowEngine {
       await this.store.updateRun(run.id, { status: 'completed', output, updatedAt: new Date() });
       return { runId: run.id, status: 'completed', output };
     } catch (err) {
+      if (err instanceof WorkflowSuspended) {
+        await this.store.updateRun(run.id, {
+          status: 'suspended',
+          wakeAt: err.wakeAt,
+          updatedAt: new Date(),
+        });
+        return { runId: run.id, status: 'suspended' };
+      }
       const error = {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
@@ -157,6 +183,31 @@ export class WorkflowEngine {
       },
       call: <TInput, TOutput>(step: RemoteStepDef<TInput, TOutput>, input: TInput) =>
         this.callRemote(runId, nextSeq(), step, input),
+      sleep: async (duration: string | number): Promise<void> => {
+        const current = nextSeq();
+        const now = this.clock();
+        const existing = await store.getCheckpoint(runId, current);
+        if (existing) {
+          // Timer already recorded: resume if due, otherwise re-suspend cheaply.
+          if (now >= (existing.wakeAt ?? 0)) return;
+          throw new WorkflowSuspended(existing.wakeAt ?? now);
+        }
+        const wakeAt = now + parseDuration(duration);
+        const at = new Date();
+        await store.saveCheckpoint({
+          runId,
+          seq: current,
+          name: 'sleep',
+          kind: 'sleep',
+          stepId: `${runId}:${current}`,
+          status: 'completed',
+          wakeAt,
+          attempts: 1,
+          startedAt: at,
+          finishedAt: at,
+        });
+        throw new WorkflowSuspended(wakeAt);
+      },
     };
   }
 

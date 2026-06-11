@@ -1,3 +1,4 @@
+export * from './duration';
 export * from './engine';
 export * from './errors';
 export * from './interfaces';
