@@ -67,23 +67,27 @@ If the process crashes mid-`checkout`, it resumes on boot from the last checkpoi
 
 ## Status
 
-Working core (engine, NestJS module, event-emitter transport, boot recovery) built with TDD.
-See [`docs/plans`](docs/plans/2026-06-11-nestjs-durable-design.md) for the full design.
+Built with TDD — durable engine (replay, retries, fatal errors, fan-out, sleep, signals,
+recovery), NestJS integration, event-emitter transport, two ORM stores, the control-plane
+dashboard, OpenTelemetry, a Telescope watcher, and the Python worker SDK. See
+[`docs/plans`](docs/plans/2026-06-11-nestjs-durable-design.md) for the full design.
 
-## Packages (planned)
+## Packages
 
-| Package | Role |
-| --- | --- |
-| `@dudousxd/nestjs-durable-core` | Interfaces, engine, deterministic replay, decorators |
-| `@dudousxd/nestjs-durable` | NestJS module, discovery, `WorkflowCtx`, boot recovery |
-| `@dudousxd/nestjs-durable-transport-event-emitter` | In-process Transport via `@nestjs/event-emitter` (zero-infra default) |
-| `@dudousxd/nestjs-durable-transport-bullmq` | Queue adapter for cross-process / cross-language steps |
-| `@dudousxd/nestjs-durable-store` | `StateStore` interface + `InMemoryStore` |
-| `@dudousxd/nestjs-durable-store-{prisma,typeorm,drizzle,mikro-orm}` | ORM adapters |
-| `@dudousxd/nestjs-durable-otel` | OpenTelemetry instrumentation |
-| `@dudousxd/nestjs-durable-dashboard` | Embedded run/timeline UI |
-| `@dudousxd/nestjs-durable-testing` | Fakes, crash injection, replay assertions |
-| `durable-worker` (PyPI) | Remote worker SDK |
+| Package | Role | Status |
+| --- | --- | --- |
+| `@dudousxd/nestjs-durable-core` | Interfaces, engine, deterministic replay, sleep/signals, events | ✅ |
+| `@dudousxd/nestjs-durable` | NestJS module, `@Workflow`/`@DurableStep`, recovery, timer poller, auto-schema | ✅ |
+| `@dudousxd/nestjs-durable-transport-event-emitter` | In-process Transport (zero-infra default) | ✅ |
+| `@dudousxd/nestjs-durable-store-mikro-orm` | MikroORM `StateStore` (reference adapter) | ✅ |
+| `@dudousxd/nestjs-durable-store-typeorm` | TypeORM `StateStore` | ✅ |
+| `@dudousxd/nestjs-durable-dashboard` | Embedded control-plane SPA (runs + timeline + retry/cancel) | ✅ |
+| `@dudousxd/nestjs-durable-otel` | OpenTelemetry — trace per run, span per step | ✅ |
+| `@dudousxd/nestjs-durable-telescope` | `@dudousxd/nestjs-telescope` watcher | ✅ |
+| `durable-worker` (PyPI) | Python worker SDK + wire protocol | ✅ |
+| `@dudousxd/nestjs-durable-transport-bullmq` | Queue Transport for cross-process / Python steps | planned |
+| `@dudousxd/nestjs-durable-store-{prisma,drizzle}` | More ORM adapters | planned |
+| `@dudousxd/nestjs-durable-testing` | Fakes, crash injection, replay assertions | planned |
 
 ## License
 
