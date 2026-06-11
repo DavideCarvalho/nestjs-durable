@@ -1,0 +1,40 @@
+{
+  "name": "nestjs-durable-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Durable cross-app workflows for NestJS",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git"
+  },
+  "packageManager": "pnpm@11.5.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "turbo run build --filter=!website",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "turbo run typecheck --filter=!website",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "pin-versions": "node scripts/pin-versions.mjs",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "turbo run build --filter=!website && changeset publish"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4",
+    "@changesets/cli": "2.31.0",
+    "@swc/core": "1.15.41",
+    "@types/node": "22.19.20",
+    "reflect-metadata": "0.2.2",
+    "turbo": "2.9.17",
+    "typescript": "5.9.3",
+    "unplugin-swc": "1.5.9",
+    "vitest": "2.1.9"
+  }
+}

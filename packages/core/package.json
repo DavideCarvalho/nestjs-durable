@@ -1,0 +1,31 @@
+{
+  "name": "@dudousxd/nestjs-durable-core",
+  "version": "0.1.0",
+  "description": "Durable workflows for NestJS — core interfaces, engine and deterministic replay",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "directory": "packages/core"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "reflect-metadata": "^0.2.0",
+    "zod": "^3.0.0 || ^4.0.0"
+  },
+  "devDependencies": {
+    "reflect-metadata": "0.2.2",
+    "typescript": "5.9.3",
+    "zod": "3.25.76"
+  }
+}
