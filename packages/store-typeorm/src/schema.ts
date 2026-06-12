@@ -10,51 +10,60 @@ import type { DataSource } from 'typeorm';
  * }
  * ```
  *
+ * Dialect-aware (MySQL / MariaDB / Postgres / SQLite): identifiers are quoted per driver, keyed
+ * string columns are `varchar` (MySQL can't key a `text` column), and the index is best-effort.
  * Only ever adds the three durable tables — it never touches your other tables.
  */
 export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promise<void> {
-  const statements = [
-    `CREATE TABLE IF NOT EXISTS durable_workflow_runs (
-      id text PRIMARY KEY,
-      workflow text NOT NULL,
-      "workflowVersion" text NOT NULL,
-      status text NOT NULL,
-      input text,
-      output text,
-      error text,
-      "wakeAt" datetime,
-      "lockedBy" text,
-      "lockedUntil" datetime,
-      "createdAt" datetime NOT NULL,
-      "updatedAt" datetime NOT NULL
+  const q = (id: string) => dataSource.driver.escape(id);
+  const type = String(dataSource.options.type);
+  const isPg = type === 'postgres' || type === 'aurora-postgres';
+  const isMysql = type === 'mysql' || type === 'mariadb' || type === 'aurora-mysql';
+
+  // Keyed/short strings must be varchar on MySQL (a `text` PK/index needs a key length); `text`
+  // for the free-form JSON payloads. Dates use the dialect's native timestamp type.
+  const str = 'varchar(191)';
+  const txt = 'text';
+  const int = isMysql ? 'int' : 'integer';
+  const ts = isPg ? 'timestamptz' : 'datetime';
+
+  const runs = q('durable_workflow_runs');
+  const checkpoints = q('durable_step_checkpoints');
+  const waiters = q('durable_signal_waiters');
+
+  const tables = [
+    `CREATE TABLE IF NOT EXISTS ${runs} (
+      ${q('id')} ${str} PRIMARY KEY,
+      ${q('workflow')} ${str} NOT NULL,
+      ${q('workflowVersion')} ${str} NOT NULL,
+      ${q('status')} ${str} NOT NULL,
+      ${q('input')} ${txt}, ${q('output')} ${txt}, ${q('error')} ${txt},
+      ${q('wakeAt')} ${ts}, ${q('lockedBy')} ${str}, ${q('lockedUntil')} ${ts},
+      ${q('createdAt')} ${ts} NOT NULL, ${q('updatedAt')} ${ts} NOT NULL
     )`,
-    `CREATE TABLE IF NOT EXISTS durable_step_checkpoints (
-      "runId" text NOT NULL,
-      seq integer NOT NULL,
-      name text NOT NULL,
-      kind text NOT NULL,
-      "stepId" text NOT NULL,
-      status text NOT NULL,
-      output text,
-      error text,
-      attempts integer NOT NULL,
-      "workerGroup" text,
-      "wakeAt" datetime,
-      "startedAt" datetime NOT NULL,
-      "finishedAt" datetime NOT NULL,
-      PRIMARY KEY ("runId", seq)
+    `CREATE TABLE IF NOT EXISTS ${checkpoints} (
+      ${q('runId')} ${str} NOT NULL, ${q('seq')} ${int} NOT NULL,
+      ${q('name')} ${str} NOT NULL, ${q('kind')} ${str} NOT NULL, ${q('stepId')} ${str} NOT NULL,
+      ${q('status')} ${str} NOT NULL, ${q('output')} ${txt}, ${q('error')} ${txt},
+      ${q('attempts')} ${int} NOT NULL, ${q('workerGroup')} ${str},
+      ${q('wakeAt')} ${ts}, ${q('startedAt')} ${ts} NOT NULL, ${q('finishedAt')} ${ts} NOT NULL,
+      PRIMARY KEY (${q('runId')}, ${q('seq')})
     )`,
-    `CREATE TABLE IF NOT EXISTS durable_signal_waiters (
-      token text PRIMARY KEY,
-      "runId" text NOT NULL,
-      seq integer NOT NULL
+    `CREATE TABLE IF NOT EXISTS ${waiters} (
+      ${q('token')} ${str} PRIMARY KEY, ${q('runId')} ${str} NOT NULL, ${q('seq')} ${int} NOT NULL
     )`,
-    `CREATE INDEX IF NOT EXISTS durable_runs_status_idx ON durable_workflow_runs (status, "wakeAt")`,
   ];
+
   const runner = dataSource.createQueryRunner();
   try {
-    for (const sql of statements) {
-      await runner.query(sql);
+    for (const sql of tables) await runner.query(sql);
+    // MySQL has no `CREATE INDEX IF NOT EXISTS`; create it best-effort and ignore "already exists".
+    try {
+      await runner.query(
+        `CREATE INDEX ${q('durable_runs_status_idx')} ON ${runs} (${q('status')}, ${q('wakeAt')})`,
+      );
+    } catch {
+      /* index already exists */
     }
   } finally {
     await runner.release();
