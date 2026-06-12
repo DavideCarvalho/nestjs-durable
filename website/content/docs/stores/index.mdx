@@ -15,6 +15,7 @@ interface, independent of the [transport](/docs/transports).
 | `@dudousxd/nestjs-durable-store-mikro-orm` | MikroORM — the reference adapter. |
 | `@dudousxd/nestjs-durable-store-typeorm` | TypeORM. |
 | `@dudousxd/nestjs-durable-store-prisma` | Prisma — add the models from the package's `schema.prisma`, generate, and pass your `PrismaClient`. |
+| `@dudousxd/nestjs-durable-store-drizzle` | Drizzle — SQLite / libSQL (Turso, edge). Pass a drizzle db built with the package's schema. |
 
 The ORM adapters work on any SQL database their ORM supports — **Postgres, MySQL or SQLite**
 (timestamps use native datetime columns, so epoch values never overflow). Wire one into the
