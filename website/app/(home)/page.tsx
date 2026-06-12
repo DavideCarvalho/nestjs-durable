@@ -214,8 +214,8 @@ const FEATURES: readonly Feature[] = [
   },
   {
     icon: Database,
-    title: 'Bring your ORM',
-    body: 'State lives in Postgres through a StateStore interface. Ship with MikroORM and TypeORM adapters (Prisma next), with auto-schema on boot — or call the ensure helper from your own migration.',
+    title: 'Bring your ORM, any SQL DB',
+    body: 'State lives in Postgres, MySQL or SQLite through a StateStore interface. MikroORM, TypeORM, Prisma and Drizzle adapters, with auto-schema on boot — or call the ensure helper from your own migration.',
     accent: 'text-teal-400',
   },
   {

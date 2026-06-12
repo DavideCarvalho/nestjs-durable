@@ -154,7 +154,7 @@ export class PrismaStateStore implements StateStore {
 
 const bigOrNull = (n: number | undefined) => (n == null ? null : BigInt(n));
 const numOrUndef = (n: bigint | null) => (n == null ? undefined : Number(n));
-const jsonOrNull = (v: unknown) => (v ?? null) as never;
+const jsonOrNull = (v: unknown) => v ?? null;
 
 function toRunData(run: WorkflowRun) {
   return {
