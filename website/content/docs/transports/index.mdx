@@ -1,18 +1,24 @@
 ---
 title: Overview
-description: How remote steps travel to workers. Two tiers — an in-process event-emitter transport for zero-infra single-process handlers, and BullMQ/Redis for cross-process and cross-language steps.
+description: How remote steps travel to workers. From an in-process event-emitter for zero-infra single-process handlers, to BullMQ/Redis, SQS, and a broker-less SQL transport for cross-process and cross-language steps.
 ---
 
 A **transport** is how `ctx.call` reaches a step handler and how the result comes back. It's a
 pluggable interface (`dispatch`, `onResult`, `onHeartbeat`), independent of the
 [state store](/docs/stores) — mix any transport with any store.
 
-## Two tiers
+## The transports
 
-| Transport | Use it for |
-| --- | --- |
-| `EventEmitterTransport` | The zero-infra default: `@DurableStep` handlers run in the **same process**, decoupled from the workflow. No broker. |
-| `BullMQTransport` | True **cross-process** and **cross-language** steps — a separate worker, or a [Python worker](/docs/python) — over Redis. |
+| Transport | Crosses a process/language boundary? | Use it for |
+| --- | --- | --- |
+| `EventEmitterTransport` | No (in-process) | The zero-infra default: `@DurableStep` handlers run in the **same process**, decoupled from the workflow. No broker. |
+| [`BullMQTransport`](/docs/transports/bullmq) | Yes (Redis) | True **cross-process** and **cross-language** steps — a separate worker, or a [Python worker](/docs/python) — over Redis. |
+| [`SqsTransport`](/docs/transports/sqs) | Yes (SQS) | The same, on AWS SQS instead of Redis. |
+| [`DbTransport`](/docs/transports/db) | Yes (shared DB) | Broker-less, DBOS-style: steps are **rows** in the database you already run. |
+
+The three boundary-crossing transports all carry the same JSON `RemoteTask` / `StepResult`, so a
+[Python worker](/docs/python) plugs into any of them. The in-process event-emitter is Node-only by
+nature — there's nothing across a boundary to reach.
 
 ## In-process (event-emitter)
 

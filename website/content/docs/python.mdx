@@ -102,6 +102,51 @@ Use `redis://` for plaintext and `rediss://` for TLS. This is the same Redis the
 | `connection` | `redis://localhost:6379` | Redis URL (the broker the engine also uses). |
 | `prefix` | `durable` | Queue-key namespace; must match the engine's `BullMQTransport` prefix. |
 
+## Other transports
+
+The Redis worker above is one of three ways to reach the broker — pick the one matching the engine's
+[transport](/docs/transports). All of them run the *same* handlers (`@worker.step(...)`); only the
+runner that feeds them changes. The connection model is identical: match the engine's **group** and
+queue/table namespace, and you're wired in.
+
+### AWS SQS
+
+For an engine on the [SQS transport](/docs/transports/sqs). Install the extra:
+`pip install "durable-worker[sqs]"`.
+
+```python
+from durable_worker.sqs_runner import run_sqs_worker
+
+run_sqs_worker(worker, group="payments", region="us-east-1")  # blocks; long-polls the tasks queue
+```
+
+Queue names default to `<prefix>-tasks-<group>` and `<prefix>-results` (resolved via `GetQueueUrl`);
+pass `tasks_queue_url` / `results_queue_url` to reuse queues you already own, or `client=` to inject a
+preconfigured boto3 client. SQS has no push model, so this is a **blocking** loop — run it in its own
+process and pass a `threading.Event` as `stop` to shut it down.
+
+### SQL (database)
+
+For an engine on the broker-less [SQL transport](/docs/transports/db) — your Python workers poll the
+same Postgres or MySQL tables, no broker at all. Install the driver extra:
+`pip install "durable-worker[postgres]"` or `"durable-worker[mysql]"`.
+
+```python
+from durable_worker.db_runner import run_db_worker
+
+await run_db_worker(
+    worker,
+    group="pipeline",
+    dialect="postgres",                                   # or "mysql"
+    dsn="postgres://user:pass@localhost:5432/app",
+)
+```
+
+It implements the documented [table + claim contract](/docs/transports/db#the-contract) — claiming
+tasks with `SELECT … FOR UPDATE SKIP LOCKED`, running the handler, writing a result row, deleting the
+task. Because both libraries target that one spec, a Node engine and a Python worker share the same
+two tables (the `prefix` must match). Requires Postgres 9.5+ or MySQL 8+ (SQLite has no `SKIP LOCKED`).
+
 ## The wire protocol
 
 The contract is plain JSON, identical across languages. The orchestrator dispatches a **task**:

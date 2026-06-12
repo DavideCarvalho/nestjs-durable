@@ -26,6 +26,7 @@ interface ResultRow {
   status: string;
   output: string | null;
   error: string | null;
+  started_at: string | number | null;
 }
 
 export interface DbTransportOptions {
@@ -143,6 +144,7 @@ export class DbTransport implements Transport {
         ${this.q('status')} varchar(32) NOT NULL,
         ${this.q('output')} ${txt},
         ${this.q('error')} ${txt},
+        ${this.q('started_at')} bigint,
         ${this.q('claimed_by')} ${str},
         ${this.q('claimed_at')} bigint,
         ${this.q('created_at')} bigint NOT NULL
@@ -250,6 +252,7 @@ export class DbTransport implements Transport {
         status: row.status as StepResult['status'],
         output: row.output == null ? undefined : JSON.parse(row.output),
         error: row.error == null ? undefined : JSON.parse(row.error),
+        startedAt: row.started_at == null ? undefined : Number(row.started_at),
       };
       await handler(result);
       await this.exec.query(
@@ -294,7 +297,7 @@ export class DbTransport implements Transport {
 
   private async insertResult(result: StepResult): Promise<void> {
     const t = this.q(this.resultsTable);
-    const cols = ['step_id', 'run_id', 'seq', 'status', 'output', 'error', 'created_at'];
+    const cols = ['step_id', 'run_id', 'seq', 'status', 'output', 'error', 'started_at', 'created_at'];
     const head = this.isPg
       ? `INSERT INTO ${t} (...) ON CONFLICT (${this.q('step_id')}) DO NOTHING`
       : `INSERT IGNORE INTO ${t} (...)`;
@@ -309,6 +312,7 @@ export class DbTransport implements Transport {
       result.status,
       result.output === undefined ? null : JSON.stringify(result.output),
       result.error === undefined ? null : JSON.stringify(result.error),
+      result.startedAt ?? null,
       this.now(),
     ]);
   }

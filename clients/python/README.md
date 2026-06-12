@@ -83,6 +83,14 @@ ships results back:
 
   This is wired end-to-end in [`scripts/py-e2e.sh`](../../scripts/py-e2e.sh): a TypeScript
   workflow's `ctx.call` runs this Python handler over Redis and gets the result back.
+- **AWS SQS** (`pip install durable-worker[sqs]`) — `durable_worker.sqs_runner.run_sqs_worker`
+  long-polls the same SQS queues the TS `SqsTransport` uses. Blocking loop; pass a
+  `threading.Event` as `stop` to stop it.
+- **SQL / Postgres / MySQL** (`pip install durable-worker[postgres]` or `[mysql]`) —
+  `durable_worker.db_runner.run_db_worker` is broker-less: it claims task **rows** with
+  `SELECT … FOR UPDATE SKIP LOCKED` from the same tables the TS `DbTransport` writes, runs the
+  handler, and writes a result row. Implements the documented table + claim contract, so the two
+  libraries share the schema. Requires Postgres 9.5+ or MySQL 8+.
 - Bring your own: anything that can deliver a task dict and accept a result dict.
 
 ## Tests

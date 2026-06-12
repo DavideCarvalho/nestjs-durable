@@ -1,4 +1,4 @@
 {
   "title": "Transports",
-  "pages": ["index", "bullmq"]
+  "pages": ["index", "bullmq", "sqs", "db"]
 }

@@ -1,0 +1,43 @@
+---
+title: AWS SQS
+description: The queue-backed transport on AWS SQS. Same RemoteTask/StepResult contract as BullMQ — tasks go to a per-group queue, results return on a shared queue — so Node and Python workers interoperate.
+---
+
+`@dudousxd/nestjs-durable-transport-sqs` carries steps over **AWS SQS** — the same role as the
+[BullMQ transport](/docs/transports/bullmq), for teams already on SQS instead of Redis.
+
+```bash
+pnpm add @dudousxd/nestjs-durable-transport-sqs @aws-sdk/client-sqs
+```
+
+## How it works
+
+- `ctx.call` dispatches a task to a **per-group** queue: `<prefix>-tasks-<group>`.
+- A worker for that group long-polls it, runs the handler, and sends the result to the shared
+  `<prefix>-results` queue.
+- The engine-side instance polls results and checkpoints them.
+
+```ts title="engine side"
+new SqsTransport({ client: new SQSClient({ region: 'us-east-1' }) });
+```
+
+```ts title="worker side"
+const transport = new SqsTransport({ client, group: 'payments' });
+transport.handle('payments.charge-card', async (input) => ({ chargeId: await charge(input) }));
+```
+
+By default queues are resolved by name (and optionally auto-created); pass `taskQueueUrl` /
+`resultsQueueUrl` to reuse queues you already own. SQS is at-least-once — a task whose worker crashes
+before deleting it is redelivered after the visibility timeout — so keep handlers **idempotent**.
+
+## Options
+
+| Option | Description |
+| --- | --- |
+| `client` | An `@aws-sdk/client-sqs` `SQSClient`. |
+| `group` | The worker group this instance serves — required to register `handle()`s. |
+| `prefix` | Namespaces the fallback `<prefix>-tasks-*` / `<prefix>-results` names. Default `durable`. |
+| `taskQueueUrl` / `resultsQueueUrl` | Reuse existing queues instead of resolving by name. |
+
+The message body is the documented `RemoteTask` / `StepResult` JSON — identical to BullMQ — so a
+[Python worker](/docs/python#aws-sqs) on the same queues interoperates.
