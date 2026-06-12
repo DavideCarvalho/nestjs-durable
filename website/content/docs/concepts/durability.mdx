@@ -56,5 +56,23 @@ async run(ctx, order) {
   failure outright.
 - **Recovery on boot.** On startup the engine resumes every run a previous process left `running`
   (`engine.recoverIncomplete()`, wired automatically by `DurableModule`).
-- **Versioning.** Changing a workflow with in-flight runs is risky — the logical positions shift.
-  Each run records its `workflowVersion`; pin or migrate old runs deliberately.
+
+## Deploys, versioning & multiple instances
+
+Because the engine is embedded in your app, deploys and replicas need a word.
+
+- **The state survives the deploy.** Checkpoints live in the database, so killing the old instance
+  loses nothing. The new instance recovers `running` runs on boot, and the timer poller resumes due
+  sleeps. Suspended runs (sleep/signal) don't even notice a deploy.
+- **Version-pinned replay (skew protection).** Replay is *positional* — changing a workflow's body
+  (reordering/inserting steps) while runs are in flight would corrupt them. So `@Workflow` carries a
+  `version`, and a run **resumes on the version it started on**. Register the old and new versions
+  side by side during a breaking change: in-flight runs drain on the old version, new runs start on
+  the newest. A run whose version is no longer registered fails loudly rather than corrupting.
+- **One instance per run (recovery lease).** With several replicas, each would try to recover the
+  same `running` runs. The engine takes an atomic, self-expiring **lease** on a run before resuming
+  it (`StateStore.tryLockRun`), so a run is picked up by exactly one instance. Set `leaseMs` above
+  your longest synchronous run.
+- **Graceful shutdown.** On `OnApplicationShutdown` the engine **drains**: it stops picking up new
+  runs and waits for in-flight ones to settle, then releases their leases so the next instance takes
+  over immediately. Enable it with `app.enableShutdownHooks()`.
