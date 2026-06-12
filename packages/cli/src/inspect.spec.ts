@@ -1,5 +1,5 @@
 import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
-import { inspect } from './inspect';
+import { cancelRun, inspect } from './inspect';
 
 async function storeWithRuns() {
   const store = new InMemoryStateStore();
@@ -43,5 +43,21 @@ describe('inspect', () => {
   it('filters by status', async () => {
     const out = await inspect(await storeWithRuns(), { status: 'failed' });
     expect(out).not.toContain('run1');
+  });
+});
+
+describe('cancelRun', () => {
+  it('marks a live run cancelled', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('wait', '1', async (ctx) => ctx.waitForSignal('go'));
+    await engine.start('wait', {}, 'r1'); // suspends
+    expect(await cancelRun(store, 'r1')).toMatch(/cancelled/i);
+    expect((await store.getRun('r1'))?.status).toBe('cancelled');
+  });
+
+  it('is a no-op on an already-completed run', async () => {
+    const store = await storeWithRuns();
+    expect(await cancelRun(store, 'run1')).toMatch(/already completed/i);
   });
 });

@@ -191,6 +191,20 @@ export interface StepOptions {
   backoff?: BackoffStrategy;
   /** Base delay in ms for backoff. */
   backoffMs?: number;
+  /**
+   * Liveness window for a **remote** step (`ctx.call`): if the worker produces no result and no
+   * heartbeat within this many ms, the engine presumes it dead and fails the dispatch with a
+   * `RemoteStepTimeout` (retryable — it re-dispatches per `retries`). Each heartbeat resets the
+   * window. Ignored for local steps. Omit to wait indefinitely.
+   */
+  timeoutMs?: number;
+  /**
+   * Saga compensation: if this step completes but the run later **fails**, the engine runs the
+   * registered `compensate` callbacks in reverse order (undo what was done). Local steps only.
+   * Idempotency note: a step is already deduplicated by its deterministic `stepId` (runId:seq) —
+   * remote workers can use it as the idempotency key, so there's no separate key option.
+   */
+  compensate?: () => Promise<void>;
 }
 
 /**
@@ -225,9 +239,26 @@ export interface WorkflowCtx {
   sleep(duration: string | number): Promise<void>;
   /**
    * Suspend the run until an external `engine.signal(token, payload)` arrives (e.g. a webhook or
-   * human approval), then resume with the payload. Waits indefinitely — no compute consumed.
+   * human approval), then resume with the payload. Waits indefinitely by default — no compute
+   * consumed. Pass `{ timeoutMs }` to bound the wait: if the deadline passes first the call throws
+   * a `SignalTimeoutError` (catch it in the workflow to branch).
    */
-  waitForSignal<TPayload>(token: string): Promise<TPayload>;
+  waitForSignal<TPayload>(token: string, opts?: { timeoutMs?: number }): Promise<TPayload>;
+  /**
+   * An external task with **async completion**: run `dispatch` once (checkpointed — e.g. send to a
+   * queue, kick off a non-durable worker or a foreign service like a Python process), then suspend
+   * with zero compute until `engine.completeTask(runId, name, result)` (or `failTask`) reports back,
+   * and resume with the result. The durable, first-class counterpart of the hand-rolled
+   * "dispatch over SQS → wait for COMPLETE_PHASE → signal" pattern. `name` must be unique per run.
+   */
+  task<TResult>(name: string, dispatch: () => Promise<void>, options?: StepOptions): Promise<TResult>;
+  /**
+   * Run another registered workflow as a **tracked child**: starts it once and suspends — zero
+   * compute — until the child reaches a terminal state, then resumes with the child's output (or
+   * throws a FatalError if the child failed). `childId` defaults to a deterministic id derived from
+   * this run and the call position, so it's stable across replay.
+   */
+  child<TOutput>(workflow: string, input: unknown, childId?: string): Promise<TOutput>;
 }
 
 /** Result of executing or resuming a workflow run. */
@@ -243,7 +274,8 @@ export type EngineEventType =
   | 'run.completed'
   | 'run.failed'
   | 'run.suspended'
-  | 'step.completed';
+  | 'step.completed'
+  | 'step.failed';
 
 /**
  * A lifecycle event emitted by the engine. The observability surfaces (dashboard, OTel, the

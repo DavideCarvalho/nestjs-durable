@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "declaration": true,
+    "outDir": "dist/client",
+    "rootDir": "src/client"
+  },
+  "include": ["src/client/**/*.ts"],
+  "exclude": ["src/client/**/*.spec.ts"]
+}

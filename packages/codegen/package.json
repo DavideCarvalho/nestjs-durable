@@ -1,0 +1,28 @@
+{
+  "name": "@dudousxd/nestjs-durable-codegen",
+  "version": "0.1.0",
+  "description": "@dudousxd/nestjs-codegen extension — emits the durable dashboard API as a typed client",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "directory": "packages/codegen"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@dudousxd/nestjs-codegen": ">=0.2.0"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

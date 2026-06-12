@@ -48,6 +48,22 @@ function runTimeline(run: WorkflowRun, steps: StepCheckpoint[]): string {
   return lines.join('\n');
 }
 
+/**
+ * Soft-cancel a run from the terminal: marks it `cancelled` in the store so a suspended run won't
+ * resume and the recovery/timer poller skips it. An in-flight step on another instance finishes its
+ * current attempt first (cancellation is observed at the next checkpoint), so this is a request, not
+ * a hard kill. Returns a status line.
+ */
+export async function cancelRun(store: StateStore, runId: string): Promise<string> {
+  const run = await store.getRun(runId);
+  if (!run) return `Run ${runId} not found.`;
+  if (run.status === 'completed' || run.status === 'cancelled' || run.status === 'failed') {
+    return `Run ${runId} is already ${run.status}; nothing to cancel.`;
+  }
+  await store.updateRun(runId, { status: 'cancelled', updatedAt: new Date() });
+  return `Run ${runId} marked cancelled.`;
+}
+
 function table(headers: string[], rows: string[][]): string {
   const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
   const fmt = (cells: string[]) => cells.map((c, i) => c.padEnd(widths[i] ?? 0)).join('  ');

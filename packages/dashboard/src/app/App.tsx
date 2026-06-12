@@ -1,11 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import {
+  type RunDetail,
   type RunStatus,
   type StepCheckpoint,
   type WorkflowRun,
   durableClient,
 } from '../client/durable-client';
+import { RetryIcon, XIcon } from './icons';
+import { RunInfoPanel } from './RunInfoPanel';
+import { SpansTimeline } from './SpansTimeline';
+import { StepDetailPanel } from './StepDetailPanel';
 import { WorkflowGraph } from './WorkflowGraph';
 
 const STATUSES: RunStatus[] = ['running', 'suspended', 'completed', 'failed', 'cancelled'];
@@ -137,64 +142,103 @@ function RunsList({
 
 function RunDetail({ id }: { id: string }) {
   const qc = useQueryClient();
-  const { data } = useQuery({ queryKey: ['run', id], queryFn: () => durableClient.run(id) });
+  const { data } = useQuery({
+    queryKey: ['run', id],
+    queryFn: () => durableClient.run(id),
+    // Live-follow an in-flight run; stop polling once it reaches a terminal state.
+    refetchInterval: (q) => {
+      const s = (q.state.data as RunDetail | undefined)?.run.status;
+      return s === 'running' || s === 'suspended' ? 1500 : false;
+    },
+  });
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ['run', id] });
     qc.invalidateQueries({ queryKey: ['runs'] });
   };
   const retry = useMutation({ mutationFn: () => durableClient.retry(id), onSuccess: invalidate });
   const cancel = useMutation({ mutationFn: () => durableClient.cancel(id), onSuccess: invalidate });
+  const [sel, setSel] = useState<number>();
+  const [showRunIO, setShowRunIO] = useState(false);
 
   if (!data) return <div className="p-8 text-sm text-zinc-600">Loading run…</div>;
   const { run, timeline } = data;
   const canRetry = run.status === 'failed' || run.status === 'suspended';
   const canCancel = run.status === 'running' || run.status === 'suspended';
+  const selStep = timeline.find((s) => s.seq === sel);
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-start justify-between gap-4 border-b border-[var(--line)] px-7 py-5">
-        <div>
+        <div className="min-w-0">
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-semibold tracking-tight">{run.workflow}</h2>
             <Badge status={run.status} />
             <span className="mono rounded border border-[var(--line)] px-1.5 py-0.5 text-[10px] text-zinc-500">
               v{run.workflowVersion}
             </span>
+            <span className="mono tnum text-[11px] text-zinc-600">
+              {timeline.length} {timeline.length === 1 ? 'step' : 'steps'}
+            </span>
           </div>
-          <div className="mono mt-1 text-[11px] text-zinc-600">{run.id}</div>
+          <div className="mono mt-1 truncate text-[11px] text-zinc-600">{run.id}</div>
         </div>
         <div className="flex shrink-0 gap-2">
           <button
             type="button"
+            onClick={() => setShowRunIO(true)}
+            className="mono rounded-md border border-[var(--line)] px-2.5 py-1.5 text-xs text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+            title="Run input / output"
+          >
+            {'{ }'}
+          </button>
+          <button
+            type="button"
             disabled={!canRetry || retry.isPending}
             onClick={() => retry.mutate()}
-            className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-emerald-300 transition-colors enabled:hover:bg-emerald-500/20 disabled:opacity-30"
+            className="flex items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-emerald-300 transition-colors enabled:hover:bg-emerald-500/20 disabled:opacity-30"
           >
+            <RetryIcon width={12} height={12} />
             Retry
           </button>
           <button
             type="button"
             disabled={!canCancel || cancel.isPending}
             onClick={() => cancel.mutate()}
-            className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-zinc-300 transition-colors enabled:hover:bg-zinc-800 disabled:opacity-30"
+            className="flex items-center gap-1.5 rounded-md border border-zinc-700 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-zinc-300 transition-colors enabled:hover:bg-zinc-800 disabled:opacity-30"
           >
+            <XIcon width={12} height={12} />
             Cancel
           </button>
         </div>
       </div>
-      <div className="relative min-h-0 flex-1">
-        {timeline.length === 0 ? (
-          <div className="grid h-full place-items-center text-sm text-zinc-600">
-            No steps recorded yet.
+      <div className="relative grid min-h-0 flex-1 grid-rows-[1fr_auto]">
+        <div className="relative min-h-0">
+          {timeline.length === 0 ? (
+            <div className="grid h-full place-items-center text-sm text-zinc-600">
+              No steps recorded yet.
+            </div>
+          ) : (
+            <WorkflowGraph
+              run={run}
+              timeline={timeline}
+              selected={sel}
+              onSelect={setSel}
+              fmtDuration={durMs}
+            />
+          )}
+          {(run.status === 'failed' || run.status === 'cancelled') && run.error && (
+            <div className="mono absolute inset-x-6 bottom-6 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300 backdrop-blur">
+              {run.error.message}
+            </div>
+          )}
+        </div>
+        {timeline.length > 0 && (
+          <div className="h-[clamp(120px,34%,260px)] border-t border-[var(--line)] bg-black/20">
+            <SpansTimeline run={run} timeline={timeline} selected={sel} onSelect={setSel} />
           </div>
-        ) : (
-          <WorkflowGraph run={run} timeline={timeline} fmtDuration={durMs} />
         )}
-        {run.error && (
-          <div className="mono absolute inset-x-6 bottom-6 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300 backdrop-blur">
-            {run.error.message}
-          </div>
-        )}
+        {selStep && <StepDetailPanel step={selStep} run={run} onClose={() => setSel(undefined)} />}
+        {showRunIO && <RunInfoPanel run={run} onClose={() => setShowRunIO(false)} />}
       </div>
     </div>
   );
@@ -203,7 +247,11 @@ function RunDetail({ id }: { id: string }) {
 export function App() {
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
   const [selected, setSelected] = useState<string>();
-  const { data: runs = [] } = useQuery({ queryKey: ['runs'], queryFn: () => durableClient.runs() });
+  const { data: runs = [] } = useQuery({
+    queryKey: ['runs'],
+    queryFn: () => durableClient.runs(),
+    refetchInterval: 3000, // keep the run list live
+  });
 
   const counts = runs.reduce<Record<string, number>>((acc, r) => {
     acc[r.status] = (acc[r.status] ?? 0) + 1;
@@ -222,7 +270,7 @@ export function App() {
           </aside>
           <main className="min-h-0">
             {selected ? (
-              <RunDetail id={selected} />
+              <RunDetail key={selected} id={selected} />
             ) : (
               <div className="grid h-full place-items-center text-center">
                 <div>

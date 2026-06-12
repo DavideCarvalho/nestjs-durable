@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 import type { RunStatus } from '@dudousxd/nestjs-durable-core';
-import { type InspectOptions, inspect } from './inspect';
+import { cancelRun, type InspectOptions, inspect } from './inspect';
 import { loadStore } from './load-config';
 
-const USAGE = `durable — inspect nestjs-durable workflow runs
+const USAGE = `durable — inspect and control nestjs-durable workflow runs
 
 Usage:
   durable inspect                 list recent runs
   durable inspect <runId>         show a run's step timeline
   durable inspect --status failed filter the list by status
+  durable cancel <runId>          soft-cancel a run (marks it cancelled in the store)
 
 Options:
   --status <status>   running | suspended | completed | failed | cancelled
@@ -19,9 +20,10 @@ The config exports a configured store, e.g. \`export const store = new MikroOrmS
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  if (argv[0] !== 'inspect') {
+  const command = argv[0];
+  if (command !== 'inspect' && command !== 'cancel') {
     console.log(USAGE);
-    process.exit(argv[0] ? 1 : 0);
+    process.exit(command ? 1 : 0);
   }
 
   const opts: InspectOptions & { config?: string } = {};
@@ -42,9 +44,20 @@ async function main(): Promise<void> {
       positional.push(arg);
     }
   }
-  opts.runId = positional[0];
 
   const store = await loadStore(opts.config);
+
+  if (command === 'cancel') {
+    const runId = positional[0];
+    if (!runId) {
+      console.error('Usage: durable cancel <runId>');
+      process.exit(1);
+    }
+    console.log(await cancelRun(store, runId));
+    return;
+  }
+
+  opts.runId = positional[0];
   console.log(await inspect(store, opts));
 }
 

@@ -16,6 +16,33 @@ export class FatalError extends Error {
  * Internal control signal thrown to suspend a run (e.g. on a durable sleep). Not an error the
  * user should throw or catch; the engine uses it to stop execution and persist `wakeAt`.
  */
+export class SignalTimeoutError extends Error {
+  readonly token: string;
+  readonly timeoutMs: number;
+  constructor(token: string, timeoutMs: number) {
+    super(`timed out after ${timeoutMs}ms waiting for signal "${token}"`);
+    this.name = 'SignalTimeoutError';
+    this.token = token;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * Thrown when a remote step produces no result and no heartbeat within its `timeoutMs` window —
+ * i.e. the worker is presumed dead. Subject to the step's `retries` (it's retryable), so the engine
+ * re-dispatches before giving up.
+ */
+export class RemoteStepTimeout extends Error {
+  readonly stepId: string;
+  readonly timeoutMs: number;
+  constructor(stepId: string, timeoutMs: number) {
+    super(`remote step ${stepId} produced no result/heartbeat within ${timeoutMs}ms`);
+    this.name = 'RemoteStepTimeout';
+    this.stepId = stepId;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export class WorkflowSuspended extends Error {
   /** Epoch ms to auto-resume (durable sleep), or undefined when waiting on an external signal. */
   readonly wakeAt?: number;

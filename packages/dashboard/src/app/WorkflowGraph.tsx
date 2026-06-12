@@ -9,51 +9,73 @@ import {
   Position,
   ReactFlow,
 } from '@xyflow/react';
-import { useMemo } from 'react';
+import { useCallback, useMemo } from 'react';
 import type { RunStatus, StepCheckpoint, WorkflowRun } from '../client/durable-client';
-
-const KIND_GLYPH: Record<string, string> = {
-  local: '▢',
-  remote: '◇',
-  sleep: '◴',
-  signal: '◈',
-};
+import { BoltIcon, CheckIcon, iconFor, KIND_LABEL, XIcon } from './icons';
 
 type StepData = {
-  seq: number | string;
+  seq: number;
   name: string;
   kind: string;
   status: 'completed' | 'failed';
   workerGroup?: string;
+  attempts: number;
   duration?: string;
+  selected: boolean;
 };
 type EndData = { status: RunStatus; label: string };
 
 function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   const failed = data.status === 'failed';
+  const Icon = iconFor(data.kind);
   return (
     <div
-      className={`w-[190px] rounded-lg border bg-[var(--panel)]/95 px-3 py-2.5 shadow-lg backdrop-blur ${
-        failed ? 'border-red-500/40' : 'border-[var(--line)]'
+      title={KIND_LABEL[data.kind] ?? data.kind}
+      className={`group relative w-[208px] cursor-pointer overflow-hidden rounded-xl border bg-[var(--panel)]/95 shadow-lg backdrop-blur transition-all duration-150 hover:-translate-y-0.5 ${
+        data.selected
+          ? 'border-emerald-400/60 ring-2 ring-emerald-400/30'
+          : failed
+            ? 'border-red-500/40 hover:border-red-400/60'
+            : 'border-[var(--line)] hover:border-zinc-600'
       }`}
     >
+      {/* status rail */}
+      <span
+        className={`absolute inset-y-0 left-0 w-[3px] ${failed ? 'bg-red-400' : 'bg-emerald-400'}`}
+      />
       <Handle type="target" position={Position.Left} className="!border-0 !bg-zinc-600" />
-      <div className="flex items-center gap-2">
-        <span
-          className={`mono grid h-5 w-5 shrink-0 place-items-center rounded text-[10px] ${
-            failed ? 'bg-red-500/15 text-red-300' : 'bg-emerald-500/15 text-emerald-300'
-          }`}
-        >
-          {data.seq}
-        </span>
-        <span className="truncate text-[13px] font-medium text-zinc-100">{data.name}</span>
-      </div>
-      <div className="mono mt-1.5 flex items-center gap-2 text-[10px] text-zinc-500">
-        <span className="rounded border border-[var(--line)] px-1 text-zinc-400">
-          {KIND_GLYPH[data.kind] ?? '·'} {data.kind}
-        </span>
-        {data.workerGroup && <span>@{data.workerGroup}</span>}
-        {data.duration && <span className="ml-auto">{data.duration}</span>}
+      <div className="py-2.5 pl-3.5 pr-3">
+        <div className="flex items-center gap-2">
+          <span
+            className={`grid h-5 w-5 shrink-0 place-items-center rounded ${
+              failed ? 'bg-red-500/15 text-red-300' : 'bg-emerald-500/15 text-emerald-300'
+            }`}
+          >
+            <Icon width={12} height={12} />
+          </span>
+          <span className="truncate text-[13px] font-medium text-zinc-100">{data.name}</span>
+          <span
+            className={`ml-auto grid h-4 w-4 shrink-0 place-items-center rounded-full ${
+              failed ? 'bg-red-500/20 text-red-300' : 'bg-emerald-500/20 text-emerald-300'
+            }`}
+          >
+            {failed ? <XIcon width={9} height={9} /> : <CheckIcon width={9} height={9} />}
+          </span>
+        </div>
+        <div className="mono mt-1.5 flex items-center gap-1.5 text-[10px] text-zinc-500">
+          <span className="rounded border border-[var(--line)] px-1 text-zinc-400">{data.kind}</span>
+          {data.attempts > 1 && (
+            <span className="flex items-center gap-0.5 text-amber-300">
+              <BoltIcon width={9} height={9} />
+              {data.attempts}
+            </span>
+          )}
+          {data.workerGroup && <span className="truncate">@{data.workerGroup}</span>}
+          <span className="tnum ml-auto text-zinc-400">
+            #{data.seq}
+            {data.duration && <span className="text-zinc-600"> · {data.duration}</span>}
+          </span>
+        </div>
       </div>
       <Handle type="source" position={Position.Right} className="!border-0 !bg-zinc-600" />
     </div>
@@ -61,12 +83,13 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
 }
 
 function TerminalNode({ data }: NodeProps<Node<EndData>>) {
+  const live = data.status === 'running' || data.status === 'suspended';
   return (
     <div
-      className={`s-${data.status} flex items-center gap-2 rounded-full border border-current/30 bg-[var(--panel)] px-3 py-1.5`}
+      className={`s-${data.status} flex items-center gap-2 rounded-full border border-current/30 bg-[var(--panel)] px-3.5 py-1.5`}
     >
       <Handle type="target" position={Position.Left} className="!border-0 !bg-zinc-600" />
-      <span className="dot" />
+      <span className={`dot ${live ? 'pulse' : ''}`} />
       <span className="mono text-[11px] uppercase tracking-wider">{data.label}</span>
       <Handle type="source" position={Position.Right} className="!border-0 !bg-zinc-600" />
     </div>
@@ -78,14 +101,18 @@ const nodeTypes = { step: StepCardNode, terminal: TerminalNode };
 export function WorkflowGraph({
   run,
   timeline,
+  selected,
+  onSelect,
   fmtDuration,
 }: {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
+  selected?: number;
+  onSelect: (seq: number) => void;
   fmtDuration: (a: string, b: string) => string;
 }) {
   const { nodes, edges } = useMemo(() => {
-    const gapX = 230;
+    const gapX = 248;
     const y = 0;
     const startNode: Node = {
       id: 'start',
@@ -105,7 +132,9 @@ export function WorkflowGraph({
         kind: s.kind,
         status: s.status,
         workerGroup: s.workerGroup,
+        attempts: s.attempts,
         duration: fmtDuration(s.startedAt, s.finishedAt),
+        selected: selected === s.seq,
       } satisfies StepData,
     }));
     const endNode: Node = {
@@ -124,22 +153,34 @@ export function WorkflowGraph({
       const node = ordered[i];
       if (!from || !node) continue;
       const failed = node.type === 'step' && (node.data as StepData).status === 'failed';
+      const lastLive = live && i === ordered.length - 1;
       edges.push({
         id: `e${i}`,
         source: from.id,
         target: node.id,
-        animated: live && i === ordered.length - 1,
-        style: { stroke: failed ? '#f87171' : 'var(--line)', strokeWidth: 1.5 },
+        animated: lastLive,
+        style: {
+          stroke: failed ? '#f87171' : lastLive ? 'var(--accent)' : 'var(--line)',
+          strokeWidth: lastLive ? 2 : 1.5,
+        },
       });
     }
     return { nodes: ordered, edges };
-  }, [run, timeline, fmtDuration]);
+  }, [run, timeline, fmtDuration, selected]);
+
+  const onNodeClick = useCallback(
+    (_: unknown, node: Node) => {
+      if (node.type === 'step') onSelect((node.data as StepData).seq);
+    },
+    [onSelect],
+  );
 
   return (
     <ReactFlow
       nodes={nodes}
       edges={edges}
       nodeTypes={nodeTypes}
+      onNodeClick={onNodeClick}
       fitView
       fitViewOptions={{ padding: 0.3, maxZoom: 1.1 }}
       proOptions={{ hideAttribution: true }}
