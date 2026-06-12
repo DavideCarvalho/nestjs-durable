@@ -1,6 +1,6 @@
 ---
 title: Overview
-description: Where durable state lives. Postgres-first via a StateStore interface, with MikroORM and TypeORM adapters, an in-memory store for tests, and auto-schema on boot (opt-out, with a migration helper).
+description: Where durable state lives. A StateStore interface with MikroORM, TypeORM and Prisma adapters that run on Postgres, MySQL or SQLite, an in-memory store for tests, and auto-schema on boot (opt-out, with a migration helper).
 ---
 
 A **state store** persists workflow runs and step checkpoints — the source of truth for both
@@ -16,8 +16,9 @@ interface, independent of the [transport](/docs/transports).
 | `@dudousxd/nestjs-durable-store-typeorm` | TypeORM. |
 | `@dudousxd/nestjs-durable-store-prisma` | Prisma — add the models from the package's `schema.prisma`, generate, and pass your `PrismaClient`. |
 
-The ORM adapters are Postgres-first but work on any driver their ORM supports (tested on
-SQLite). Wire one into the module:
+The ORM adapters work on any SQL database their ORM supports — **Postgres, MySQL or SQLite**
+(timestamps use native datetime columns, so epoch values never overflow). Wire one into the
+module:
 
 ```ts
 import { MikroOrmStateStore } from '@dudousxd/nestjs-durable-store-mikro-orm';

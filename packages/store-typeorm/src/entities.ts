@@ -24,14 +24,14 @@ export class WorkflowRunEntity {
   @Column('simple-json', { nullable: true })
   error?: unknown;
 
-  @Column('integer', { nullable: true })
-  wakeAt?: number | null;
+  @Column({ nullable: true })
+  wakeAt?: Date;
 
-  @Column('integer')
-  createdAt!: number;
+  @Column()
+  createdAt!: Date;
 
-  @Column('integer')
-  updatedAt!: number;
+  @Column()
+  updatedAt!: Date;
 }
 
 @Entity({ name: 'durable_step_checkpoints' })
@@ -66,14 +66,14 @@ export class StepCheckpointEntity {
   @Column('text', { nullable: true })
   workerGroup?: string | null;
 
-  @Column('integer', { nullable: true })
-  wakeAt?: number | null;
+  @Column({ nullable: true })
+  wakeAt?: Date;
 
-  @Column('integer')
-  startedAt!: number;
+  @Column()
+  startedAt!: Date;
 
-  @Column('integer')
-  finishedAt!: number;
+  @Column()
+  finishedAt!: Date;
 }
 
 @Entity({ name: 'durable_signal_waiters' })

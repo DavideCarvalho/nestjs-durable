@@ -11,8 +11,8 @@ import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './e
 import { ensureTypeOrmDurableSchema } from './schema';
 
 /**
- * TypeORM-backed `StateStore`. Postgres-first but works on any TypeORM driver; tested on
- * SQLite. Dates are stored as epoch ms to round-trip identically across drivers.
+ * TypeORM-backed `StateStore`. Works on any TypeORM driver — Postgres, MySQL, SQLite (tested);
+ * timestamps use native datetime columns and `wakeAt` is stored as a datetime too.
  */
 export class TypeOrmStateStore implements StateStore {
   constructor(private readonly dataSource: DataSource) {}
@@ -64,7 +64,7 @@ export class TypeOrmStateStore implements StateStore {
   async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
     const rows = await this.runs().findBy({
       status: 'suspended',
-      wakeAt: LessThanOrEqual(nowMs),
+      wakeAt: LessThanOrEqual(new Date(nowMs)),
     });
     return rows.map(fromRunEntity);
   }
@@ -109,9 +109,9 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     input: run.input ?? null,
     output: run.output ?? null,
     error: run.error ?? null,
-    wakeAt: run.wakeAt ?? null,
-    createdAt: run.createdAt.getTime(),
-    updatedAt: run.updatedAt.getTime(),
+    wakeAt: run.wakeAt == null ? undefined : new Date(run.wakeAt),
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
   };
 }
 
@@ -124,9 +124,9 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     input: e.input ?? undefined,
     output: e.output ?? undefined,
     error: (e.error ?? undefined) as StepError | undefined,
-    wakeAt: e.wakeAt ?? undefined,
-    createdAt: new Date(e.createdAt),
-    updatedAt: new Date(e.updatedAt),
+    wakeAt: e.wakeAt == null ? undefined : e.wakeAt.getTime(),
+    createdAt: e.createdAt,
+    updatedAt: e.updatedAt,
   };
 }
 
@@ -142,9 +142,9 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
     error: cp.error ?? null,
     attempts: cp.attempts,
     workerGroup: cp.workerGroup ?? null,
-    wakeAt: cp.wakeAt ?? null,
-    startedAt: cp.startedAt.getTime(),
-    finishedAt: cp.finishedAt.getTime(),
+    wakeAt: cp.wakeAt == null ? undefined : new Date(cp.wakeAt),
+    startedAt: cp.startedAt,
+    finishedAt: cp.finishedAt,
   };
 }
 
@@ -160,8 +160,8 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
     error: (e.error ?? undefined) as StepError | undefined,
     attempts: e.attempts,
     workerGroup: e.workerGroup ?? undefined,
-    wakeAt: e.wakeAt ?? undefined,
-    startedAt: new Date(e.startedAt),
-    finishedAt: new Date(e.finishedAt),
+    wakeAt: e.wakeAt == null ? undefined : e.wakeAt.getTime(),
+    startedAt: e.startedAt,
+    finishedAt: e.finishedAt,
   };
 }

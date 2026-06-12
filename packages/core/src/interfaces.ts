@@ -70,7 +70,7 @@ export interface StepError {
 }
 
 // ---------------------------------------------------------------------------
-// StateStore — where runs and checkpoints live (Postgres-first via ORM adapters)
+// StateStore — where runs and checkpoints live (Postgres / MySQL / SQLite via ORM adapters)
 // ---------------------------------------------------------------------------
 
 export interface StateStore {

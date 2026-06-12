@@ -1,0 +1,33 @@
+{
+  "name": "@dudousxd/nestjs-durable-store-drizzle",
+  "version": "0.1.0",
+  "description": "Drizzle ORM (SQLite/libSQL) adapter for the nestjs-durable StateStore",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "directory": "packages/store-drizzle"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "drizzle-orm": "^0.36.0 || ^0.37.0 || ^0.38.0 || ^0.39.0 || ^0.40.0 || ^0.41.0 || ^0.42.0 || ^0.43.0 || ^0.44.0"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-durable-core": "workspace:^",
+    "@types/better-sqlite3": "7.6.11",
+    "better-sqlite3": "11.10.0",
+    "drizzle-orm": "0.44.7",
+    "typescript": "5.9.3"
+  }
+}

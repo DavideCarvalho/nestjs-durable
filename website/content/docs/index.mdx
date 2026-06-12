@@ -24,8 +24,8 @@ minutes, or use the sidebar to explore the concepts, transports, stores and obse
   changes; only the transport does.
 - **Durable sleep and signals.** Pause for minutes or months with `ctx.sleep` (no compute while
   waiting), or wait on a human approval / webhook with `ctx.waitForSignal`. Both survive restarts.
-- **Bring your ORM.** State lives in Postgres through a `StateStore` interface, with MikroORM and
-  TypeORM adapters and auto-schema on boot.
+- **Bring your ORM, any SQL database.** State lives in Postgres, MySQL or SQLite through a
+  `StateStore` interface, with MikroORM, TypeORM and Prisma adapters and auto-schema on boot.
 - **See the whole flow.** A built-in control plane renders each run as a graph; OpenTelemetry and
   a Telescope watcher give you two more views of the same event log.
 

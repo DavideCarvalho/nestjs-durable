@@ -25,7 +25,7 @@ export class WorkflowRunEntity {
   error?: unknown;
 
   @Property({ nullable: true })
-  wakeAt?: number;
+  wakeAt?: Date;
 
   @Property()
   createdAt!: Date;
@@ -67,7 +67,7 @@ export class StepCheckpointEntity {
   workerGroup?: string;
 
   @Property({ nullable: true })
-  wakeAt?: number;
+  wakeAt?: Date;
 
   @Property()
   startedAt!: Date;

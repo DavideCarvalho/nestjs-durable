@@ -11,8 +11,9 @@ import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './e
 import { ensureMikroOrmDurableSchema } from './schema';
 
 /**
- * MikroORM-backed `StateStore`. Postgres-first but works on any MikroORM driver; tested on
- * SQLite. Each operation runs on a forked EntityManager so it owns its unit of work.
+ * MikroORM-backed `StateStore`. Works on any MikroORM driver — Postgres, MySQL, SQLite (tested);
+ * timestamps and `wakeAt` use native datetime columns. Each operation runs on a forked
+ * EntityManager so it owns its unit of work.
  */
 export class MikroOrmStateStore implements StateStore {
   constructor(private readonly orm: MikroORM) {}
@@ -62,7 +63,7 @@ export class MikroOrmStateStore implements StateStore {
     const em = this.orm.em.fork();
     const rows = await em.find(WorkflowRunEntity, {
       status: 'suspended',
-      wakeAt: { $ne: null, $lte: nowMs },
+      wakeAt: { $ne: null, $lte: new Date(nowMs) },
     });
     return rows.map(fromRunEntity);
   }
@@ -111,7 +112,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   e.input = run.input ?? null;
   e.output = run.output ?? null;
   e.error = run.error ?? null;
-  e.wakeAt = run.wakeAt;
+  e.wakeAt = run.wakeAt == null ? undefined : new Date(run.wakeAt);
   e.createdAt = run.createdAt;
   e.updatedAt = run.updatedAt;
   return e;
@@ -126,7 +127,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     input: e.input ?? undefined,
     output: e.output ?? undefined,
     error: (e.error ?? undefined) as StepError | undefined,
-    wakeAt: e.wakeAt ?? undefined,
+    wakeAt: e.wakeAt?.getTime(),
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
@@ -144,7 +145,7 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
   e.error = cp.error ?? null;
   e.attempts = cp.attempts;
   e.workerGroup = cp.workerGroup;
-  e.wakeAt = cp.wakeAt;
+  e.wakeAt = cp.wakeAt == null ? undefined : new Date(cp.wakeAt);
   e.startedAt = cp.startedAt;
   e.finishedAt = cp.finishedAt;
   return e;
@@ -162,7 +163,7 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
     error: (e.error ?? undefined) as StepError | undefined,
     attempts: e.attempts,
     workerGroup: e.workerGroup ?? undefined,
-    wakeAt: e.wakeAt ?? undefined,
+    wakeAt: e.wakeAt?.getTime(),
     startedAt: e.startedAt,
     finishedAt: e.finishedAt,
   };

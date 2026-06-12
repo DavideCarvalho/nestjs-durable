@@ -22,9 +22,9 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       input text,
       output text,
       error text,
-      "wakeAt" integer,
-      "createdAt" integer NOT NULL,
-      "updatedAt" integer NOT NULL
+      "wakeAt" datetime,
+      "createdAt" datetime NOT NULL,
+      "updatedAt" datetime NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS durable_step_checkpoints (
       "runId" text NOT NULL,
@@ -37,9 +37,9 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       error text,
       attempts integer NOT NULL,
       "workerGroup" text,
-      "wakeAt" integer,
-      "startedAt" integer NOT NULL,
-      "finishedAt" integer NOT NULL,
+      "wakeAt" datetime,
+      "startedAt" datetime NOT NULL,
+      "finishedAt" datetime NOT NULL,
       PRIMARY KEY ("runId", seq)
     )`,
     `CREATE TABLE IF NOT EXISTS durable_signal_waiters (
