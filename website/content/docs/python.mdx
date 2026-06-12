@@ -26,7 +26,11 @@ async def charge(data):
     return {"chargeId": res.id}
 
 async def main():
-    await run_redis_worker(worker, group="payments")  # consumes the BullMQ queue
+    await run_redis_worker(
+        worker,
+        group="payments",
+        connection="redis://localhost:6379",
+    )
     await asyncio.Event().wait()
 
 asyncio.run(main())
@@ -35,6 +39,68 @@ asyncio.run(main())
 The handler's argument is the step **input** (schema-validated by the engine); its return value is
 the **output**. Raise `FatalError` for a non-retryable failure (e.g. a declined card); any other
 exception is retryable and the engine applies the step's retry policy.
+
+## Connecting to the control plane
+
+There is **no direct connection** between a Python worker and your NestJS app — they never open a
+socket to each other, and the worker never talks to the dashboard or the database. Everything goes
+through the **broker** (Redis). The engine and the workers are decoupled producers and consumers on
+two shared queues:
+
+```
+  NestJS engine                     Redis (the broker)                  Python worker
+  ─────────────                     ──────────────────                  ─────────────
+  ctx.call(step) ───dispatch───▶  durable-tasks-<group>  ───consume──▶  @worker.step(name)
+  resume ctx.call ◀──consume────  durable-results        ◀───add──────  return / raise
+```
+
+So "connecting to the control plane" just means pointing the worker at the **same broker** the
+engine's [`BullMQTransport`](/docs/transports/bullmq) uses. Three things have to line up:
+
+| Must match | Engine side (`BullMQTransport`) | Worker side (`run_redis_worker`) | Why |
+| --- | --- | --- | --- |
+| **connection** | `connection: { host, port, … }` | `connection="redis://host:port"` | Same Redis instance — that's the meeting point. |
+| **prefix** | `prefix` (default `durable`) | `prefix` (default `durable`) | Namespaces the queue keys: `<prefix>-tasks-<group>` and `<prefix>-results`. |
+| **group** | the step's `group` | `group="payments"` | The worker only consumes the tasks queue for its own group. |
+
+Match those and a `ctx.call(chargeStep, …)` where `chargeStep.group === "payments"` is delivered to
+this worker. Nothing else to register — there's no handshake or service discovery; the queue name
+*is* the routing.
+
+A few properties that follow from this being queue-based:
+
+- **At-least-once delivery.** A task can be redelivered (a worker crash, a reconnect), so handlers
+  should be **idempotent** — key external side effects on `stepId` (or your own dedupe key). The
+  engine already dedupes a step that *completed*, but a handler can be re-run before its result is
+  recorded.
+- **Workers are stateless and horizontal.** Run as many copies as you want for a group; Redis hands
+  each task to one of them. Scale a slow step by adding workers, not by touching the workflow.
+- **The engine owns correlation.** Every result carries the `stepId` it answers; the engine matches
+  it to the suspended `ctx.call` and resumes the run. The worker never needs the run's state.
+
+### Authentication
+
+The `connection` is a standard Redis URL, so credentials and TLS go in the URL:
+
+```python
+await run_redis_worker(
+    worker,
+    group="payments",
+    connection="rediss://default:my-password@my-redis.example.com:6379",
+)
+```
+
+Use `redis://` for plaintext and `rediss://` for TLS. This is the same Redis the engine connects to
+— if your NestJS app authenticates with a username/password, the worker uses the same ones.
+
+### `run_redis_worker` options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `worker` | — | The `Worker` whose handlers run. |
+| `group` | — | The worker group — selects the `<prefix>-tasks-<group>` queue to consume. |
+| `connection` | `redis://localhost:6379` | Redis URL (the broker the engine also uses). |
+| `prefix` | `durable` | Queue-key namespace; must match the engine's `BullMQTransport` prefix. |
 
 ## The wire protocol
 
@@ -52,8 +118,15 @@ The worker replies with a **result**:
 
 ```jsonc
 { "runId": "wrun_8Kb2", "seq": 1, "stepId": "wrun_8Kb2:1",
-  "status": "completed", "output": { "chargeId": "ch_1" } }
+  "status": "completed", "output": { "chargeId": "ch_1" },
+  "startedAt": 1718900000123 }
 ```
 
-`Worker.process_task(task) -> result` is the pure, transport-agnostic core. Because the contract is
-language-neutral, a Go or Rust worker can implement the same thing — Python is just the first SDK.
+`startedAt` is the epoch-ms moment the worker picked the task up. The engine subtracts it from when
+it dispatched the task to report **[queue-wait](/docs/observability/dashboard)** — how long the step
+sat in the queue before a worker was free — so a Python step's queue time shows up in the dashboard
+just like a Node one. The SDK stamps it for you.
+
+`Worker.process_task(task) -> result` is the pure, transport-agnostic core (no broker needed — ideal
+for unit tests). Because the contract is language-neutral, a Go or Rust worker can implement the same
+thing — Python is just the first SDK.

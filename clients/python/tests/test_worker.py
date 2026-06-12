@@ -30,6 +30,19 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(result["output"], {"chargeId": "ch_o1"})
         self.assertEqual(result["stepId"], "r1:0")
 
+    def test_stamps_started_at_for_queue_wait(self):
+        worker = Worker(group="payments")
+
+        @worker.step("payments.charge-card")
+        def charge(data):
+            return {"chargeId": "ch_1"}
+
+        # The worker reports when it picked the task up (epoch ms) so the engine can compute
+        # queue-wait — same contract as the TypeScript runStepHandler.
+        result = worker.process_task(task())
+        self.assertIsInstance(result["startedAt"], int)
+        self.assertGreater(result["startedAt"], 0)
+
     def test_awaits_async_handlers(self):
         worker = Worker()
 

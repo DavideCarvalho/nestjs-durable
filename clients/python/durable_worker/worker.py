@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from typing import Any, Awaitable, Callable, Dict, Union
 
 Handler = Callable[[Any], Union[Any, Awaitable[Any]]]
@@ -61,7 +62,7 @@ class Worker:
         transport can simply ``result = worker.process_task(task); send(result)``.
         """
 
-        base = {"runId": task["runId"], "seq": task["seq"], "stepId": task["stepId"]}
+        base = self._base(task)
         handler = self._handlers.get(task["name"])
         if handler is None:
             return self._no_handler(base, task["name"])
@@ -77,7 +78,7 @@ class Worker:
         """Async variant — awaits async handlers in the current loop. Use from a transport that
         already runs inside an event loop (e.g. the BullMQ runner)."""
 
-        base = {"runId": task["runId"], "seq": task["seq"], "stepId": task["stepId"]}
+        base = self._base(task)
         handler = self._handlers.get(task["name"])
         if handler is None:
             return self._no_handler(base, task["name"])
@@ -88,6 +89,17 @@ class Worker:
             return {**base, "status": "completed", "output": output}
         except Exception as err:  # noqa: BLE001
             return self._failure(base, err)
+
+    @staticmethod
+    def _base(task: Dict[str, Any]) -> Dict[str, Any]:
+        # Stamp the worker's pickup time so the engine can report queue-wait (startedAt − enqueuedAt),
+        # mirroring the TypeScript ``runStepHandler``. Epoch ms keeps it language-neutral on the wire.
+        return {
+            "runId": task["runId"],
+            "seq": task["seq"],
+            "stepId": task["stepId"],
+            "startedAt": int(time.time() * 1000),
+        }
 
     @staticmethod
     def _no_handler(base: Dict[str, Any], name: str) -> Dict[str, Any]:

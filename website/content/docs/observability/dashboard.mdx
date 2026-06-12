@@ -25,6 +25,10 @@ export class AppModule {}
   start through each step to the terminal state, tagged by kind (local / remote / sleep / signal),
   with worker group and duration. This is the "see the whole flow" view — a workflow whose steps
   span apps shown as one rail.
+- **Step timing** — click a step to inspect it. A remote step shows its **queued** time (how long
+  it sat in the queue before a worker picked it up) next to its processing **duration**, so you can
+  tell a slow handler apart from a backed-up worker pool. Queue-wait is reported by every transport
+  and every language SDK (including the [Python worker](/docs/python)).
 - **Actions** — retry a failed/suspended run, cancel a running one.
 
 ## API
