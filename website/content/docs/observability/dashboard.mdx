@@ -10,12 +10,28 @@ OpenTelemetry collector.
 ```ts
 import { DurableDashboardModule } from '@dudousxd/nestjs-durable-dashboard';
 
-@Module({ imports: [DurableModule.forRoot({ store, transport }), DurableDashboardModule] })
+@Module({
+  imports: [DurableModule.forRoot({ store, transport }), DurableDashboardModule.forRoot()],
+})
 export class AppModule {}
 ```
 
 `DurableModule` is global, so the dashboard resolves the engine and store automatically. Front the
-`/durable` route with your own guard to protect it.
+base route with your own guard to protect it.
+
+### Where it mounts
+
+`forRoot()` defaults to `/durable` (SPA at `/durable`, JSON API at `/durable/api`). Pass `basePath`
+to move it — e.g. under your app's `/api` prefix so the same auth/proxy rules cover the dashboard API:
+
+```ts
+DurableDashboardModule.forRoot({ basePath: '/api/durable' });
+// SPA at /api/durable, API at /api/durable/api
+```
+
+The SPA's asset URLs and its API base are derived from `basePath` at serve time, so the bundle works
+at any mount point. If your app sets a global prefix (`app.setGlobalPrefix('api')`), exclude the base
+route so the path isn't prefixed twice — or fold it in by setting `basePath` to include the prefix.
 
 ## What it shows
 

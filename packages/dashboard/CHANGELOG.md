@@ -1,5 +1,19 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.2.0
+
+### Minor Changes
+
+- Make the dashboard mount path configurable via `DurableDashboardModule.forRoot({ basePath })`.
+  Previously the control plane was hardcoded to `/durable`; now you can mount it anywhere — e.g.
+  `forRoot({ basePath: '/api/durable' })` to bring it under your app's `/api` prefix so its auth/proxy
+  rules cover the dashboard API too. The SPA's asset URLs and API base are derived from `basePath` at
+  serve time, so the bundle works at any mount point.
+
+  **Breaking:** import via `DurableDashboardModule.forRoot()` instead of the bare `DurableDashboardModule`
+  (`forRoot()` with no args keeps the previous `/durable` default). Requires `@nestjs/core` as a peer
+  (for `RouterModule`) — already present in every NestJS app.
+
 ## 0.1.1
 
 ### Patch Changes

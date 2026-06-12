@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-dashboard",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Embedded control plane (runs, step timeline, retry/cancel) for nestjs-durable — bundled React SPA served by NestJS",
   "license": "MIT",
   "author": "Davide Carvalho",
@@ -28,11 +28,13 @@
   },
   "peerDependencies": {
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
-    "@nestjs/common": "^10.0.0 || ^11.0.0"
+    "@nestjs/common": "^10.0.0 || ^11.0.0",
+    "@nestjs/core": "^10.0.0 || ^11.0.0"
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@nestjs/common": "11.1.26",
+    "@nestjs/core": "11.1.26",
     "@tanstack/react-query": "5.62.7",
     "@xyflow/react": "12.3.6",
     "@types/react": "18.3.18",
