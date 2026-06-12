@@ -18,8 +18,19 @@ import { stepId } from './protocol';
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
 interface RegisteredWorkflow {
+  name: string;
   version: string;
   fn: WorkflowFn;
+}
+
+const versionKey = (name: string, version: string): string => `${name}@${version}`;
+
+/** True when version `a` is newer than `b` (numeric when both parse as numbers, else natural sort). */
+function isNewerVersion(a: string, b: string): boolean {
+  const na = Number(a);
+  const nb = Number(b);
+  if (!Number.isNaN(na) && !Number.isNaN(nb)) return na > nb;
+  return a.localeCompare(b, undefined, { numeric: true }) > 0;
 }
 
 interface PendingRemote {
@@ -44,7 +55,10 @@ export class WorkflowEngine {
   private readonly store: StateStore;
   private readonly transport?: Transport;
   private readonly clock: () => number;
+  /** Every registered workflow, keyed by `name@version` — so old versions stay runnable. */
   private readonly workflows = new Map<string, RegisteredWorkflow>();
+  /** The newest registered version per workflow name — used to `start` new runs. */
+  private readonly latest = new Map<string, RegisteredWorkflow>();
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
   private readonly listeners = new Set<EngineListener>();
@@ -65,8 +79,16 @@ export class WorkflowEngine {
     });
   }
 
+  /**
+   * Register a workflow version. Register multiple versions of the same name to keep in-flight
+   * runs working across a breaking change: old runs resume on the version they started on, new
+   * runs start on the newest registered version.
+   */
   register(name: string, version: string, fn: WorkflowFn): void {
-    this.workflows.set(name, { version, fn });
+    const registered: RegisteredWorkflow = { name, version, fn };
+    this.workflows.set(versionKey(name, version), registered);
+    const current = this.latest.get(name);
+    if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
   }
 
   /** Subscribe to lifecycle events. Returns an unsubscribe function. */
@@ -87,7 +109,8 @@ export class WorkflowEngine {
   }
 
   async start(workflow: string, input: unknown, runId: string): Promise<RunResult> {
-    const registered = this.requireWorkflow(workflow);
+    const registered = this.latest.get(workflow);
+    if (!registered) throw new Error(`workflow ${workflow} is not registered`);
     const now = new Date();
     const run: WorkflowRun = {
       id: runId,
@@ -106,7 +129,15 @@ export class WorkflowEngine {
   async resume(runId: string): Promise<RunResult> {
     const run = await this.store.getRun(runId);
     if (!run) throw new Error(`run ${runId} not found`);
-    const registered = this.requireWorkflow(run.workflow);
+    // Pin to the version the run STARTED on — replay is positional, so running a changed
+    // workflow body against old checkpoints would corrupt the run.
+    const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
+    if (!registered) {
+      throw new Error(
+        `workflow ${run.workflow}@${run.workflowVersion} is not registered — keep the prior ` +
+          'version deployed so in-flight runs can drain (skew protection)',
+      );
+    }
     return this.execute(run, registered.fn);
   }
 
@@ -167,12 +198,6 @@ export class WorkflowEngine {
     await this.store.updateRun(runId, { status: 'cancelled', error, updatedAt: new Date() });
     this.emit({ type: 'run.failed', runId, workflow: run.workflow, error });
     return { runId, status: 'cancelled', error };
-  }
-
-  private requireWorkflow(name: string): RegisteredWorkflow {
-    const registered = this.workflows.get(name);
-    if (!registered) throw new Error(`workflow ${name} is not registered`);
-    return registered;
   }
 
   /** Checkpoint a finished step and announce it — the two things that must always happen together. */
