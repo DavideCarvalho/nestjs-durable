@@ -60,6 +60,12 @@ export interface StepCheckpoint {
   workerGroup?: string;
   /** For sleep steps: epoch ms the sleep elapses at. */
   wakeAt?: number;
+  /**
+   * When the step entered the system: for a remote step, when the engine dispatched it to the
+   * transport; for a local step, when it began. Queue-wait time = `startedAt − enqueuedAt`.
+   */
+  enqueuedAt: Date;
+  /** When processing actually began: worker pickup for a remote step, execution start for a local one. */
   startedAt: Date;
   finishedAt: Date;
 }
@@ -161,6 +167,8 @@ export interface StepResult {
   status: 'completed' | 'failed';
   output?: unknown;
   error?: StepError;
+  /** Epoch ms when the worker began processing — lets the engine report queue-wait time. */
+  startedAt?: number;
 }
 
 export interface Heartbeat {
@@ -274,6 +282,7 @@ export type EngineEventType =
   | 'run.completed'
   | 'run.failed'
   | 'run.suspended'
+  | 'step.started'
   | 'step.completed'
   | 'step.failed';
 
@@ -292,6 +301,8 @@ export interface EngineEvent {
   error?: StepError;
   /** Wall-clock duration of the unit that just finished (step or run), when known. */
   durationMs?: number;
+  /** For a remote step: how long it waited in the queue before a worker picked it up. */
+  queueMs?: number;
   at: Date;
 }
 

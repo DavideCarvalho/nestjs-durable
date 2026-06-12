@@ -170,6 +170,7 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
   e.attempts = cp.attempts;
   e.workerGroup = cp.workerGroup;
   e.wakeAt = cp.wakeAt == null ? undefined : new Date(cp.wakeAt);
+  e.enqueuedAt = cp.enqueuedAt;
   e.startedAt = cp.startedAt;
   e.finishedAt = cp.finishedAt;
   return e;
@@ -188,6 +189,7 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
     attempts: e.attempts,
     workerGroup: e.workerGroup ?? undefined,
     wakeAt: e.wakeAt?.getTime(),
+    enqueuedAt: e.enqueuedAt ?? e.startedAt,
     startedAt: e.startedAt,
     finishedAt: e.finishedAt,
   };

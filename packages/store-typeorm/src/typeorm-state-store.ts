@@ -173,6 +173,7 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
     attempts: cp.attempts,
     workerGroup: cp.workerGroup ?? null,
     wakeAt: cp.wakeAt == null ? undefined : new Date(cp.wakeAt),
+    enqueuedAt: cp.enqueuedAt,
     startedAt: cp.startedAt,
     finishedAt: cp.finishedAt,
   };
@@ -191,6 +192,8 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
     attempts: e.attempts,
     workerGroup: e.workerGroup ?? undefined,
     wakeAt: e.wakeAt == null ? undefined : e.wakeAt.getTime(),
+    // Older rows predate enqueuedAt; treat the worker start as enqueue time (queue-wait reads zero).
+    enqueuedAt: e.enqueuedAt ?? e.startedAt,
     startedAt: e.startedAt,
     finishedAt: e.finishedAt,
   };

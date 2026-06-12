@@ -40,6 +40,7 @@ interface CheckpointRow {
   attempts: number;
   workerGroup: string | null;
   wakeAt: bigint | null;
+  enqueuedAt: Date | null;
   startedAt: Date;
   finishedAt: Date;
 }
@@ -239,6 +240,7 @@ function toCheckpointData(cp: StepCheckpoint) {
     attempts: cp.attempts,
     workerGroup: cp.workerGroup ?? null,
     wakeAt: bigOrNull(cp.wakeAt),
+    enqueuedAt: cp.enqueuedAt,
     startedAt: cp.startedAt,
     finishedAt: cp.finishedAt,
   };
@@ -257,6 +259,7 @@ function fromCheckpointRow(row: CheckpointRow): StepCheckpoint {
     attempts: row.attempts,
     workerGroup: row.workerGroup ?? undefined,
     wakeAt: numOrUndef(row.wakeAt),
+    enqueuedAt: row.enqueuedAt ?? row.startedAt,
     startedAt: row.startedAt,
     finishedAt: row.finishedAt,
   };

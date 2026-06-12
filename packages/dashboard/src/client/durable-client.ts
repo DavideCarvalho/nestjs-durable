@@ -25,6 +25,9 @@ export interface StepCheckpoint {
   attempts: number;
   workerGroup?: string;
   wakeAt?: number;
+  /** When the step was dispatched (remote) or began (local). Queue-wait = startedAt − enqueuedAt. */
+  enqueuedAt?: string;
+  /** When processing actually began: worker pickup for a remote step, execution start for a local one. */
   startedAt: string;
   finishedAt: string;
 }

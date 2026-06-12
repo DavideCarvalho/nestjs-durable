@@ -33,8 +33,14 @@ function isNewerVersion(a: string, b: string): boolean {
   return a.localeCompare(b, undefined, { numeric: true }) > 0;
 }
 
+/** What a remote worker hands back: the output plus when it actually began (for queue-wait timing). */
+interface RemoteResolution {
+  output: unknown;
+  startedAt?: number;
+}
+
 interface PendingRemote {
-  resolve: (output: unknown) => void;
+  resolve: (result: RemoteResolution) => void;
   reject: (error: Error) => void;
 }
 
@@ -101,7 +107,7 @@ export class WorkflowEngine {
       if (!waiter) return;
       this.pending.delete(result.stepId);
       if (result.status === 'completed') {
-        waiter.resolve(result.output);
+        waiter.resolve({ output: result.output, startedAt: result.startedAt });
       } else {
         waiter.reject(new RemoteStepError(result.error));
       }
@@ -256,6 +262,7 @@ export class WorkflowEngine {
       status: 'completed',
       output: payload,
       attempts: 1,
+      enqueuedAt: at,
       startedAt: at,
       finishedAt: at,
     });
@@ -303,6 +310,7 @@ export class WorkflowEngine {
     kind: StepKind;
     output: unknown;
     attempts: number;
+    enqueuedAt: Date;
     startedAt: Date;
     workerGroup?: string;
   }): Promise<void> {
@@ -316,6 +324,7 @@ export class WorkflowEngine {
       output: step.output,
       attempts: step.attempts,
       workerGroup: step.workerGroup,
+      enqueuedAt: step.enqueuedAt,
       startedAt: step.startedAt,
       finishedAt: new Date(),
     });
@@ -326,6 +335,7 @@ export class WorkflowEngine {
       name: step.name,
       kind: step.kind,
       output: step.output,
+      queueMs: step.startedAt.getTime() - step.enqueuedAt.getTime(),
       durationMs: Date.now() - step.startedAt.getTime(),
     });
   }
@@ -338,6 +348,7 @@ export class WorkflowEngine {
     kind: StepKind;
     error: StepError;
     attempts: number;
+    enqueuedAt: Date;
     startedAt: Date;
     workerGroup?: string;
   }): Promise<void> {
@@ -351,6 +362,7 @@ export class WorkflowEngine {
       error: step.error,
       attempts: step.attempts,
       workerGroup: step.workerGroup,
+      enqueuedAt: step.enqueuedAt,
       startedAt: step.startedAt,
       finishedAt: new Date(),
     });
@@ -361,6 +373,7 @@ export class WorkflowEngine {
       name: step.name,
       kind: step.kind,
       error: step.error,
+      queueMs: step.startedAt.getTime() - step.enqueuedAt.getTime(),
       durationMs: Date.now() - step.startedAt.getTime(),
     });
   }
@@ -447,7 +460,7 @@ export class WorkflowEngine {
       for (let attempt = 1; ; attempt += 1) {
         try {
           const output = await fn();
-          await this.completeStep({ runId, seq: current, name, kind: 'local', output, attempts: attempt, startedAt });
+          await this.completeStep({ runId, seq: current, name, kind: 'local', output, attempts: attempt, enqueuedAt: startedAt, startedAt });
           if (options?.compensate) compensations.push(options.compensate);
           return output;
         } catch (err) {
@@ -462,6 +475,7 @@ export class WorkflowEngine {
                 stack: err instanceof Error ? err.stack : undefined,
               },
               attempts: attempt,
+              enqueuedAt: startedAt,
               startedAt,
             });
             throw err;
@@ -570,6 +584,7 @@ export class WorkflowEngine {
       status: 'completed',
       wakeAt,
       attempts: 1,
+      enqueuedAt: at,
       startedAt: at,
       finishedAt: at,
     });
@@ -589,7 +604,8 @@ export class WorkflowEngine {
 
     const validInput = step.input.parse(input);
     const id = stepId(runId, seq);
-    const startedAt = new Date();
+    const enqueuedAt = new Date();
+    this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     // Retry policy differs from a LOCAL step on purpose: a local `ctx.step` retries any non-fatal
     // throw (the work is in-process), but a remote step only re-dispatches on a liveness TIMEOUT
     // (presumed-dead worker). A worker that *reported* an error returned a deterministic verdict, so
@@ -598,7 +614,7 @@ export class WorkflowEngine {
     const maxAttempts = step.timeoutMs ? Math.max(1, step.retries ?? 1) : 1;
 
     for (let attempt = 1; ; attempt += 1) {
-      const resultPromise = new Promise<unknown>((resolve, reject) => {
+      const resultPromise = new Promise<RemoteResolution>((resolve, reject) => {
         this.pending.set(id, { resolve, reject });
       });
       await this.transport.dispatch({
@@ -611,10 +627,13 @@ export class WorkflowEngine {
         attempt,
       });
       try {
-        const rawOutput = step.timeoutMs
+        const resolution = step.timeoutMs
           ? await this.awaitWithHeartbeat(id, resultPromise, step.timeoutMs)
           : await resultPromise;
-        const output = step.output.parse(rawOutput) as TOutput;
+        const output = step.output.parse(resolution.output) as TOutput;
+        // The worker reports when it actually picked the task up; fall back to dispatch time if a
+        // transport doesn't carry it (queue-wait then reads as zero rather than going negative).
+        const startedAt = resolution.startedAt ? new Date(resolution.startedAt) : enqueuedAt;
         await this.completeStep({
           runId,
           seq,
@@ -623,6 +642,7 @@ export class WorkflowEngine {
           output,
           attempts: attempt,
           workerGroup: step.group,
+          enqueuedAt,
           startedAt,
         });
         return output;
@@ -641,10 +661,10 @@ export class WorkflowEngine {
    */
   private awaitWithHeartbeat(
     id: string,
-    resultPromise: Promise<unknown>,
+    resultPromise: Promise<RemoteResolution>,
     timeoutMs: number,
-  ): Promise<unknown> {
-    return new Promise<unknown>((resolve, reject) => {
+  ): Promise<RemoteResolution> {
+    return new Promise<RemoteResolution>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout>;
       const cleanup = () => {
         clearTimeout(timer);

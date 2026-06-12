@@ -207,6 +207,7 @@ function toCheckpointRow(cp: StepCheckpoint): CheckpointRow {
     attempts: cp.attempts,
     workerGroup: cp.workerGroup ?? null,
     wakeAt: cp.wakeAt ?? null,
+    enqueuedAt: (cp.enqueuedAt ?? cp.startedAt).getTime(),
     startedAt: cp.startedAt.getTime(),
     finishedAt: cp.finishedAt.getTime(),
   };
@@ -225,6 +226,7 @@ function fromCheckpointRow(row: CheckpointRow): StepCheckpoint {
     attempts: row.attempts,
     workerGroup: row.workerGroup ?? undefined,
     wakeAt: row.wakeAt ?? undefined,
+    enqueuedAt: row.enqueuedAt == null ? new Date(row.startedAt) : new Date(row.enqueuedAt),
     startedAt: new Date(row.startedAt),
     finishedAt: new Date(row.finishedAt),
   };

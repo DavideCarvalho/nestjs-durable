@@ -46,7 +46,8 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ${q('name')} ${str} NOT NULL, ${q('kind')} ${str} NOT NULL, ${q('stepId')} ${str} NOT NULL,
       ${q('status')} ${str} NOT NULL, ${q('output')} ${txt}, ${q('error')} ${txt},
       ${q('attempts')} ${int} NOT NULL, ${q('workerGroup')} ${str},
-      ${q('wakeAt')} ${ts}, ${q('startedAt')} ${ts} NOT NULL, ${q('finishedAt')} ${ts} NOT NULL,
+      ${q('wakeAt')} ${ts}, ${q('enqueuedAt')} ${ts},
+      ${q('startedAt')} ${ts} NOT NULL, ${q('finishedAt')} ${ts} NOT NULL,
       PRIMARY KEY (${q('runId')}, ${q('seq')})
     )`,
     `CREATE TABLE IF NOT EXISTS ${waiters} (

@@ -2,11 +2,14 @@ import { useState } from 'react';
 import type { StepCheckpoint, WorkflowRun } from '../client/durable-client';
 import { BoltIcon, CheckIcon, CopyIcon, iconFor, KIND_LABEL, XIcon } from './icons';
 
-function fmtDur(a: string, b: string): string {
-  const ms = new Date(b).getTime() - new Date(a).getTime();
-  if (ms < 1000) return `${ms}ms`;
+function fmtMs(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(2)}s`;
   return `${(ms / 60_000).toFixed(2)}m`;
+}
+
+function fmtDur(a: string, b: string): string {
+  return fmtMs(new Date(b).getTime() - new Date(a).getTime());
 }
 
 function clock(iso: string): string {
@@ -80,6 +83,11 @@ export function StepDetailPanel({
   const failed = step.status === 'failed';
   const Icon = iconFor(step.kind);
   const sinceStart = fmtDur(run.createdAt, step.startedAt);
+  // Queue-wait: how long the step sat dispatched before a worker picked it up. Only meaningful for
+  // a remote step (a local step has enqueuedAt === startedAt, so this is zero and stays hidden).
+  const queueMs = step.enqueuedAt
+    ? new Date(step.startedAt).getTime() - new Date(step.enqueuedAt).getTime()
+    : 0;
 
   return (
     <aside className="absolute inset-y-0 right-0 z-20 flex w-[380px] max-w-[90%] flex-col border-l border-[var(--line)] bg-[var(--panel)]/95 shadow-2xl backdrop-blur-md rise">
@@ -116,6 +124,9 @@ export function StepDetailPanel({
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-5 py-4">
         <div className="rounded-lg border border-[var(--line)] bg-black/20 px-3.5 py-1">
           <Field k="seq" v={`#${step.seq}`} />
+          {queueMs >= 1 && (
+            <Field k="queued" v={<span className="text-sky-300">{fmtMs(queueMs)}</span>} />
+          )}
           <Field k="duration" v={fmtDur(step.startedAt, step.finishedAt)} />
           <Field
             k="attempts"

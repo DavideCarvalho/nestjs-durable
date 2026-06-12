@@ -31,6 +31,7 @@ model DurableStepCheckpoint {
   attempts    Int
   workerGroup String?
   wakeAt      BigInt?
+  enqueuedAt  DateTime?
   startedAt   DateTime
   finishedAt  DateTime
 

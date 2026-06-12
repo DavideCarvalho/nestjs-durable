@@ -37,6 +37,38 @@ describe('WorkflowEngine — remote steps', () => {
     expect(checkpoints[0]?.name).toBe('payments.charge-card');
   });
 
+  it('records queue/processing timing and announces a remote step as it starts', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    transport.handle('payments.charge-card', async (input: { amount: number }) => ({
+      chargeId: `ch_${input.amount}`,
+    }));
+
+    const engine = new WorkflowEngine({ store, transport });
+    const events: string[] = [];
+    let observedQueueMs: number | undefined;
+    engine.subscribe((e) => {
+      if (e.type === 'step.started' || e.type === 'step.completed') events.push(e.type);
+      if (e.type === 'step.completed') observedQueueMs = e.queueMs;
+    });
+
+    engine.register('checkout', '1', async (ctx) => {
+      const charge = await ctx.call(chargeCard, { amount: 42 });
+      return charge.chargeId;
+    });
+
+    await engine.start('checkout', {}, 'run1');
+
+    // A remote step announces itself as in-flight before it completes.
+    expect(events).toEqual(['step.started', 'step.completed']);
+    expect(observedQueueMs).toBeGreaterThanOrEqual(0);
+
+    const [cp] = await store.listCheckpoints('run1');
+    // The three moments are ordered: dispatched ≤ worker pickup ≤ done.
+    expect(cp?.enqueuedAt.getTime()).toBeLessThanOrEqual(cp!.startedAt.getTime());
+    expect(cp?.startedAt.getTime()).toBeLessThanOrEqual(cp!.finishedAt.getTime());
+  });
+
   it('replays a completed remote step from its checkpoint instead of re-dispatching', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();

@@ -32,6 +32,7 @@ export const stepCheckpoints = sqliteTable(
     attempts: integer('attempts').notNull(),
     workerGroup: text('worker_group'),
     wakeAt: integer('wake_at'),
+    enqueuedAt: integer('enqueued_at'),
     startedAt: integer('started_at').notNull(),
     finishedAt: integer('finished_at').notNull(),
   },

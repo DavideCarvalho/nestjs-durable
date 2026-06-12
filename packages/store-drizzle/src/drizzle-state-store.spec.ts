@@ -17,7 +17,7 @@ CREATE TABLE durable_workflow_runs (
 CREATE TABLE durable_step_checkpoints (
   run_id TEXT NOT NULL, seq INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, step_id TEXT NOT NULL,
   status TEXT NOT NULL, output TEXT, error TEXT, attempts INTEGER NOT NULL, worker_group TEXT, wake_at INTEGER,
-  started_at INTEGER NOT NULL, finished_at INTEGER NOT NULL, PRIMARY KEY (run_id, seq)
+  enqueued_at INTEGER, started_at INTEGER NOT NULL, finished_at INTEGER NOT NULL, PRIMARY KEY (run_id, seq)
 );
 CREATE TABLE durable_signal_waiters (token TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL);
 `;

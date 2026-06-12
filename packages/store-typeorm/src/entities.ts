@@ -75,6 +75,9 @@ export class StepCheckpointEntity {
   @Column({ nullable: true })
   wakeAt?: Date;
 
+  @Column({ nullable: true })
+  enqueuedAt?: Date;
+
   @Column()
   startedAt!: Date;
 

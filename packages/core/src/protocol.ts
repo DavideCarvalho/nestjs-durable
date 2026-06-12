@@ -17,7 +17,9 @@ export async function runStepHandler(
   task: RemoteTask,
   handler: StepHandler | undefined,
 ): Promise<StepResult> {
-  const base = { runId: task.runId, seq: task.seq, stepId: task.stepId };
+  // Stamp the worker's pickup time so the engine can report queue-wait (startedAt − enqueuedAt).
+  // This is the one place every transport funnels through, so timing comes for free everywhere.
+  const base = { runId: task.runId, seq: task.seq, stepId: task.stepId, startedAt: Date.now() };
   if (!handler) {
     return {
       ...base,
