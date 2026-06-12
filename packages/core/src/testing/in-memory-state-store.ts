@@ -53,6 +53,28 @@ export class InMemoryStateStore implements StateStore {
       .map((r) => ({ ...r }));
   }
 
+  async tryLockRun(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    const run = this.runs.get(runId);
+    if (!run) return false;
+    if (run.lockedUntil !== undefined && run.lockedUntil > nowMs) return false;
+    run.lockedBy = owner;
+    run.lockedUntil = leaseUntilMs;
+    return true;
+  }
+
+  async releaseRunLock(runId: string): Promise<void> {
+    const run = this.runs.get(runId);
+    if (run) {
+      run.lockedBy = undefined;
+      run.lockedUntil = undefined;
+    }
+  }
+
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
     this.signalWaiters.set(waiter.token, { ...waiter });
   }

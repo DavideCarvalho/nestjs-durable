@@ -20,6 +20,8 @@ model DurableWorkflowRun {
   output          Json?
   error           Json?
   wakeAt          BigInt?
+  lockedBy        String?
+  lockedUntil     DateTime?
   createdAt       DateTime
   updatedAt       DateTime
 

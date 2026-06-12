@@ -29,6 +29,10 @@ export interface WorkflowRun {
   error?: StepError;
   /** When `suspended` on a durable sleep: epoch ms at which the run becomes due to resume. */
   wakeAt?: number;
+  /** Recovery lease owner (engine instance id) while a run is being resumed. */
+  lockedBy?: string;
+  /** Recovery lease expiry (epoch ms); another instance may take over once it passes. */
+  lockedUntil?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -96,6 +100,16 @@ export interface StateStore {
 
   /** Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume. */
   listDueTimers(nowMs: number): Promise<WorkflowRun[]>;
+
+  /**
+   * Atomically acquire the recovery lease on a run for `owner` until `leaseUntilMs`, but only if
+   * it is currently unlocked or its lease has expired (`<= nowMs`). Returns whether it was
+   * acquired — so concurrent engine instances never recover the same run twice.
+   */
+  tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean>;
+
+  /** Release a run's recovery lease so another instance can pick it up (e.g. once it suspends). */
+  releaseRunLock(runId: string): Promise<void>;
 
   /** Record that a run is suspended waiting for an external signal `token`. */
   putSignalWaiter(waiter: SignalWaiter): Promise<void>;

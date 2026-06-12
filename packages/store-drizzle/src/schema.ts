@@ -12,6 +12,8 @@ export const workflowRuns = sqliteTable('durable_workflow_runs', {
   output: text('output', { mode: 'json' }),
   error: text('error', { mode: 'json' }),
   wakeAt: integer('wake_at'),
+  lockedBy: text('locked_by'),
+  lockedUntil: integer('locked_until'),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
 });

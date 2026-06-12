@@ -43,6 +43,10 @@ export interface WorkflowEngineDeps {
   transport?: Transport;
   /** Epoch-ms clock; injectable for tests. Defaults to `Date.now`. */
   clock?: () => number;
+  /** Unique id for this engine instance, used for recovery leases. Defaults to a random id. */
+  instanceId?: string;
+  /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */
+  leaseMs?: number;
 }
 
 /**
@@ -55,6 +59,8 @@ export class WorkflowEngine {
   private readonly store: StateStore;
   private readonly transport?: Transport;
   private readonly clock: () => number;
+  private readonly instanceId: string;
+  private readonly leaseMs: number;
   /** Every registered workflow, keyed by `name@version` — so old versions stay runnable. */
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
@@ -62,11 +68,16 @@ export class WorkflowEngine {
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
   private readonly listeners = new Set<EngineListener>();
+  /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
+  private readonly inflight = new Set<Promise<RunResult>>();
+  private draining = false;
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
     this.transport = deps.transport;
     this.clock = deps.clock ?? Date.now;
+    this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
+    this.leaseMs = deps.leaseMs ?? 30_000;
     this.transport?.onResult(async (result) => {
       const waiter = this.pending.get(result.stepId);
       if (!waiter) return;
@@ -123,7 +134,7 @@ export class WorkflowEngine {
     };
     await this.store.createRun(run);
     this.emit({ type: 'run.started', runId, workflow });
-    return this.execute(run, registered.fn);
+    return this.track(this.execute(run, registered.fn));
   }
 
   async resume(runId: string): Promise<RunResult> {
@@ -134,11 +145,32 @@ export class WorkflowEngine {
     const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
     if (!registered) {
       throw new Error(
-        `workflow ${run.workflow}@${run.workflowVersion} is not registered — keep the prior ` +
-          'version deployed so in-flight runs can drain (skew protection)',
+        `workflow ${run.workflow}@${run.workflowVersion} is not registered — keep the prior version deployed so in-flight runs can drain (skew protection)`,
       );
     }
-    return this.execute(run, registered.fn);
+    return this.track(this.execute(run, registered.fn));
+  }
+
+  /** Track an in-flight execution so {@link drain} can wait for it. */
+  private track(p: Promise<RunResult>): Promise<RunResult> {
+    this.inflight.add(p);
+    void p.finally(() => this.inflight.delete(p));
+    return p;
+  }
+
+  /**
+   * Graceful shutdown: stop picking up new runs (recovery/timer become no-ops) and wait for
+   * in-flight executions to settle, up to `timeoutMs`. Call from your app's shutdown hook so a
+   * deploy hands off cleanly instead of leaving runs to the lease timeout.
+   */
+  async drain(timeoutMs = 10_000): Promise<void> {
+    this.draining = true;
+    if (this.inflight.size === 0) return;
+    const timer = new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, timeoutMs);
+      (t as { unref?: () => void }).unref?.();
+    });
+    await Promise.race([Promise.allSettled([...this.inflight]), timer]);
   }
 
   /**
@@ -146,12 +178,7 @@ export class WorkflowEngine {
    * replay from their checkpoints, so only the work that had not finished runs again.
    */
   async recoverIncomplete(): Promise<RunResult[]> {
-    const runs = await this.store.listIncompleteRuns();
-    const results: RunResult[] = [];
-    for (const run of runs) {
-      results.push(await this.resume(run.id));
-    }
-    return results;
+    return this.resumeLeased(await this.store.listIncompleteRuns());
   }
 
   /**
@@ -159,10 +186,27 @@ export class WorkflowEngine {
    * boot. A run still not due re-suspends cheaply without running new work.
    */
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
-    const runs = await this.store.listDueTimers(nowMs);
+    return this.resumeLeased(await this.store.listDueTimers(nowMs), nowMs);
+  }
+
+  /**
+   * Resume each run only if this instance can acquire its recovery lease — so when several
+   * replicas recover or poll at once, each run is picked up by exactly one of them.
+   */
+  private async resumeLeased(
+    runs: WorkflowRun[],
+    nowMs: number = this.clock(),
+  ): Promise<RunResult[]> {
+    if (this.draining) return []; // shutting down — don't pick up new runs
     const results: RunResult[] = [];
     for (const run of runs) {
-      results.push(await this.resume(run.id));
+      const acquired = await this.store.tryLockRun(
+        run.id,
+        this.instanceId,
+        nowMs + this.leaseMs,
+        nowMs,
+      );
+      if (acquired) results.push(await this.resume(run.id));
     }
     return results;
   }
@@ -259,6 +303,10 @@ export class WorkflowEngine {
       await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
       this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
       return { runId: run.id, status: 'failed', error };
+    } finally {
+      // Release the recovery lease once the run reaches a terminal/suspended state, so the
+      // next instance (or the timer poller) can pick it up promptly.
+      await this.store.releaseRunLock(run.id);
     }
   }
 

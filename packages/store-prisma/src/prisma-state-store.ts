@@ -22,6 +22,8 @@ interface RunRow {
   output: unknown;
   error: unknown;
   wakeAt: bigint | null;
+  lockedBy: string | null;
+  lockedUntil: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -56,6 +58,7 @@ interface Delegate<Row> {
   findUnique(args: Args): Promise<Row | null>;
   findMany(args?: Args): Promise<Row[]>;
   update(args: Args): Promise<Row>;
+  updateMany(args: Args): Promise<{ count: number }>;
   upsert(args: Args): Promise<Row>;
   delete(args: Args): Promise<Row>;
 }
@@ -115,6 +118,29 @@ export class PrismaStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async tryLockRun(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    const result = await this.db.durableWorkflowRun.updateMany({
+      where: {
+        id: runId,
+        OR: [{ lockedUntil: null }, { lockedUntil: { lte: new Date(nowMs) } }],
+      },
+      data: { lockedBy: owner, lockedUntil: new Date(leaseUntilMs) },
+    });
+    return result.count === 1;
+  }
+
+  async releaseRunLock(runId: string): Promise<void> {
+    await this.db.durableWorkflowRun.update({
+      where: { id: runId },
+      data: { lockedBy: null, lockedUntil: null },
+    });
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
@@ -166,6 +192,8 @@ function toRunData(run: WorkflowRun) {
     output: jsonOrNull(run.output),
     error: jsonOrNull(run.error),
     wakeAt: bigOrNull(run.wakeAt),
+    lockedBy: run.lockedBy ?? null,
+    lockedUntil: run.lockedUntil == null ? null : new Date(run.lockedUntil),
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -191,6 +219,8 @@ function fromRunRow(row: RunRow): WorkflowRun {
     output: row.output ?? undefined,
     error: (row.error ?? undefined) as StepError | undefined,
     wakeAt: numOrUndef(row.wakeAt),
+    lockedBy: row.lockedBy ?? undefined,
+    lockedUntil: row.lockedUntil == null ? undefined : row.lockedUntil.getTime(),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

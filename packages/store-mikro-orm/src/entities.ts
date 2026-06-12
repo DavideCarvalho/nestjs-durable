@@ -27,6 +27,12 @@ export class WorkflowRunEntity {
   @Property({ nullable: true })
   wakeAt?: Date;
 
+  @Property({ nullable: true })
+  lockedBy?: string;
+
+  @Property({ nullable: true })
+  lockedUntil?: Date;
+
   @Property()
   createdAt!: Date;
 

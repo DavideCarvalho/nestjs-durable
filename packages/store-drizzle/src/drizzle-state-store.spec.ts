@@ -11,7 +11,8 @@ import { durableSchema } from './schema';
 const DDL = `
 CREATE TABLE durable_workflow_runs (
   id TEXT PRIMARY KEY, workflow TEXT NOT NULL, workflow_version TEXT NOT NULL, status TEXT NOT NULL,
-  input TEXT, output TEXT, error TEXT, wake_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  input TEXT, output TEXT, error TEXT, wake_at INTEGER, locked_by TEXT, locked_until INTEGER,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE TABLE durable_step_checkpoints (
   run_id TEXT NOT NULL, seq INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, step_id TEXT NOT NULL,
@@ -84,6 +85,17 @@ describe('DrizzleStateStore', () => {
     expect((await store.listIncompleteRuns()).map((r) => r.id)).toEqual(['running1']);
     expect((await store.listDueTimers(10_000)).map((r) => r.id)).toEqual(['suspended1']);
     expect(await store.listDueTimers(1_000)).toHaveLength(0);
+    sqlite.close();
+  });
+
+  it('tryLockRun is atomic and respects lease expiry', async () => {
+    const { store, sqlite } = makeStore();
+    await store.createRun(run({ id: 'r1' }));
+    expect(await store.tryLockRun('r1', 'A', 2_000, 1_000)).toBe(true);
+    expect(await store.tryLockRun('r1', 'B', 3_000, 1_500)).toBe(false);
+    expect(await store.tryLockRun('r1', 'B', 4_000, 2_500)).toBe(true);
+    await store.releaseRunLock('r1');
+    expect(await store.tryLockRun('r1', 'C', 9_000, 2_600)).toBe(true);
     sqlite.close();
   });
 

@@ -68,6 +68,26 @@ export class MikroOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
+  async tryLockRun(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    const em = this.orm.em.fork();
+    const affected = await em.nativeUpdate(
+      WorkflowRunEntity,
+      { id: runId, $or: [{ lockedUntil: null }, { lockedUntil: { $lte: new Date(nowMs) } }] },
+      { lockedBy: owner, lockedUntil: new Date(leaseUntilMs) },
+    );
+    return affected === 1;
+  }
+
+  async releaseRunLock(runId: string): Promise<void> {
+    const em = this.orm.em.fork();
+    await em.nativeUpdate(WorkflowRunEntity, { id: runId }, { lockedBy: null, lockedUntil: null });
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const em = this.orm.em.fork();
     const where: Record<string, unknown> = {};
@@ -113,6 +133,8 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   e.output = run.output ?? null;
   e.error = run.error ?? null;
   e.wakeAt = run.wakeAt == null ? undefined : new Date(run.wakeAt);
+  e.lockedBy = run.lockedBy;
+  e.lockedUntil = run.lockedUntil == null ? undefined : new Date(run.lockedUntil);
   e.createdAt = run.createdAt;
   e.updatedAt = run.updatedAt;
   return e;
@@ -128,6 +150,8 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     output: e.output ?? undefined,
     error: (e.error ?? undefined) as StepError | undefined,
     wakeAt: e.wakeAt?.getTime(),
+    lockedBy: e.lockedBy ?? undefined,
+    lockedUntil: e.lockedUntil?.getTime(),
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

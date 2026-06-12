@@ -27,6 +27,12 @@ export class WorkflowRunEntity {
   @Column({ nullable: true })
   wakeAt?: Date;
 
+  @Column('text', { nullable: true })
+  lockedBy?: string | null;
+
+  @Column({ nullable: true })
+  lockedUntil?: Date;
+
   @Column()
   createdAt!: Date;
 

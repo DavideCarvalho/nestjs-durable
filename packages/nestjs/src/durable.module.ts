@@ -23,6 +23,15 @@ export interface DurableModuleOptions {
    * off in production and call the store adapter's `ensure*DurableSchema()` from a migration.
    */
   autoSchema?: boolean;
+  /**
+   * Multi-instance recovery lease, in ms — how long an instance owns a run it picked up before
+   * another may take over. Defaults to 30000. Set above your longest synchronous run.
+   */
+  leaseMs?: number;
+  /** Unique id for this instance (for leases). Defaults to a random id. */
+  instanceId?: string;
+  /** Max ms to wait for in-flight runs on shutdown before exiting. Defaults to 10000. */
+  shutdownTimeoutMs?: number;
 }
 
 export interface DurableModuleAsyncOptions {
@@ -63,9 +72,18 @@ export class DurableModule {
         },
         {
           provide: WorkflowEngine,
-          useFactory: (store: StateStore, transport: Transport | null) =>
-            new WorkflowEngine({ store, transport: transport ?? undefined }),
-          inject: [STATE_STORE, TRANSPORT],
+          useFactory: (
+            store: StateStore,
+            transport: Transport | null,
+            opts: DurableModuleOptions,
+          ) =>
+            new WorkflowEngine({
+              store,
+              transport: transport ?? undefined,
+              leaseMs: opts.leaseMs,
+              instanceId: opts.instanceId,
+            }),
+          inject: [STATE_STORE, TRANSPORT, DURABLE_OPTIONS],
         },
         WorkflowService,
         WorkflowRegistrar,

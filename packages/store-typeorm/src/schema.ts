@@ -23,6 +23,8 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       output text,
       error text,
       "wakeAt" datetime,
+      "lockedBy" text,
+      "lockedUntil" datetime,
       "createdAt" datetime NOT NULL,
       "updatedAt" datetime NOT NULL
     )`,

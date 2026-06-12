@@ -96,6 +96,17 @@ describe('MikroOrmStateStore', () => {
     await orm.close(true);
   });
 
+  it('tryLockRun is atomic and respects lease expiry', async () => {
+    const { store, orm } = await makeStore();
+    await store.createRun(run({ id: 'r1' }));
+    expect(await store.tryLockRun('r1', 'A', 2_000, 1_000)).toBe(true);
+    expect(await store.tryLockRun('r1', 'B', 3_000, 1_500)).toBe(false);
+    expect(await store.tryLockRun('r1', 'B', 4_000, 2_500)).toBe(true); // lease expired at 2000
+    await store.releaseRunLock('r1');
+    expect(await store.tryLockRun('r1', 'C', 9_000, 2_600)).toBe(true);
+    await orm.close(true);
+  });
+
   it('stores and atomically takes a signal waiter', async () => {
     const { store, orm } = await makeStore();
     await store.putSignalWaiter({ token: 'approve-1', runId: 'r1', seq: 3 });

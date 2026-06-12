@@ -5,7 +5,13 @@ import {
   type WorkflowCtx,
   WorkflowEngine,
 } from '@dudousxd/nestjs-durable-core';
-import { Inject, Injectable, type OnApplicationBootstrap, type OnModuleInit } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  type OnApplicationBootstrap,
+  type OnApplicationShutdown,
+  type OnModuleInit,
+} from '@nestjs/common';
 import { DiscoveryService } from '@nestjs/core';
 import { getWorkflowMeta } from './decorators';
 import type { DurableModuleOptions } from './durable.module';
@@ -15,11 +21,15 @@ interface WorkflowInstance {
 }
 
 /**
- * Ensures the schema (auto-schema) and registers `@Workflow` providers on init, then resumes
- * runs left incomplete by a previous process once the application has booted.
+ * Ensures the schema (auto-schema) and registers `@Workflow` providers on init, resumes runs left
+ * incomplete by a previous process once booted, and drains in-flight runs on shutdown.
+ *
+ * For the shutdown drain to fire, enable Nest's shutdown hooks: `app.enableShutdownHooks()`.
  */
 @Injectable()
-export class WorkflowRegistrar implements OnModuleInit, OnApplicationBootstrap {
+export class WorkflowRegistrar
+  implements OnModuleInit, OnApplicationBootstrap, OnApplicationShutdown
+{
   constructor(
     private readonly discovery: DiscoveryService,
     private readonly engine: WorkflowEngine,
@@ -29,6 +39,11 @@ export class WorkflowRegistrar implements OnModuleInit, OnApplicationBootstrap {
 
   async onApplicationBootstrap(): Promise<void> {
     await this.engine.recoverIncomplete();
+  }
+
+  /** On deploy/shutdown: stop picking up new runs and wait for in-flight ones to settle. */
+  async onApplicationShutdown(): Promise<void> {
+    await this.engine.drain(this.options.shutdownTimeoutMs);
   }
 
   async onModuleInit(): Promise<void> {

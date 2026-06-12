@@ -6,7 +6,7 @@ import type {
   StepError,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
-import { and, asc, eq, isNotNull, lte } from 'drizzle-orm';
+import { and, asc, eq, isNotNull, isNull, lte, or } from 'drizzle-orm';
 import type { BaseSQLiteDatabase } from 'drizzle-orm/sqlite-core';
 import { signalWaiters, stepCheckpoints, workflowRuns } from './schema';
 
@@ -78,6 +78,31 @@ export class DrizzleStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async tryLockRun(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    const result = await this.db
+      .update(workflowRuns)
+      .set({ lockedBy: owner, lockedUntil: leaseUntilMs })
+      .where(
+        and(
+          eq(workflowRuns.id, runId),
+          or(isNull(workflowRuns.lockedUntil), lte(workflowRuns.lockedUntil, nowMs)),
+        ),
+      );
+    return (result as { changes?: number }).changes === 1;
+  }
+
+  async releaseRunLock(runId: string): Promise<void> {
+    await this.db
+      .update(workflowRuns)
+      .set({ lockedBy: null, lockedUntil: null })
+      .where(eq(workflowRuns.id, runId));
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const filters = [
       query.workflow ? eq(workflowRuns.workflow, query.workflow) : undefined,
@@ -135,6 +160,8 @@ function toRunRow(run: WorkflowRun): RunRow {
     output: run.output ?? null,
     error: run.error ?? null,
     wakeAt: run.wakeAt ?? null,
+    lockedBy: run.lockedBy ?? null,
+    lockedUntil: run.lockedUntil ?? null,
     createdAt: run.createdAt.getTime(),
     updatedAt: run.updatedAt.getTime(),
   };
@@ -160,6 +187,8 @@ function fromRunRow(row: RunRow): WorkflowRun {
     output: row.output ?? undefined,
     error: (row.error ?? undefined) as StepError | undefined,
     wakeAt: row.wakeAt ?? undefined,
+    lockedBy: row.lockedBy ?? undefined,
+    lockedUntil: row.lockedUntil ?? undefined,
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };

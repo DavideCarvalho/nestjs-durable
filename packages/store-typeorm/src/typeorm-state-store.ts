@@ -6,7 +6,7 @@ import type {
   StepError,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
-import { type DataSource, LessThanOrEqual } from 'typeorm';
+import { Brackets, type DataSource, IsNull, LessThanOrEqual } from 'typeorm';
 import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './entities';
 import { ensureTypeOrmDurableSchema } from './schema';
 
@@ -69,6 +69,32 @@ export class TypeOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
+  async tryLockRun(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    const result = await this.runs()
+      .createQueryBuilder()
+      .update()
+      .set({ lockedBy: owner, lockedUntil: new Date(leaseUntilMs) })
+      .where({ id: runId })
+      .andWhere(
+        new Brackets((qb) =>
+          qb
+            .where({ lockedUntil: IsNull() })
+            .orWhere({ lockedUntil: LessThanOrEqual(new Date(nowMs)) }),
+        ),
+      )
+      .execute();
+    return result.affected === 1;
+  }
+
+  async releaseRunLock(runId: string): Promise<void> {
+    await this.runs().update({ id: runId }, { lockedBy: null, lockedUntil: () => 'NULL' });
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
@@ -110,6 +136,8 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     output: run.output ?? null,
     error: run.error ?? null,
     wakeAt: run.wakeAt == null ? undefined : new Date(run.wakeAt),
+    lockedBy: run.lockedBy ?? null,
+    lockedUntil: run.lockedUntil == null ? undefined : new Date(run.lockedUntil),
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -125,6 +153,8 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     output: e.output ?? undefined,
     error: (e.error ?? undefined) as StepError | undefined,
     wakeAt: e.wakeAt == null ? undefined : e.wakeAt.getTime(),
+    lockedBy: e.lockedBy ?? undefined,
+    lockedUntil: e.lockedUntil == null ? undefined : e.lockedUntil.getTime(),
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
