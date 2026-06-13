@@ -43,8 +43,31 @@ class StepContext:
             return {"context": {...}}
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        run_id: Optional[str] = None,
+        is_cancelled: Optional[Callable[[str], bool]] = None,
+    ) -> None:
         self.events: List[Dict[str, Any]] = []
+        self._run_id = run_id
+        self._is_cancelled = is_cancelled
+
+    @property
+    def cancelled(self) -> bool:
+        """True once the run has been cancelled (a runner subscribed to the control channel marks
+        it). Check this at safe points in a long handler and return/raise to bail out early."""
+        return bool(
+            self._is_cancelled is not None
+            and self._run_id is not None
+            and self._is_cancelled(self._run_id)
+        )
+
+    def raise_if_cancelled(self) -> None:
+        """Raise :class:`Cancelled` if the run has been cancelled — a one-liner abort for handlers."""
+        if self.cancelled:
+            from .cancellation import Cancelled
+
+            raise Cancelled(self._run_id or "")
 
     def _emit(
         self,
@@ -112,18 +135,23 @@ class Worker:
     def handles(self, name: str) -> bool:
         return name in self._handlers
 
-    def process_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+    def process_task(
+        self,
+        task: Dict[str, Any],
+        is_cancelled: Optional[Callable[[str], bool]] = None,
+    ) -> Dict[str, Any]:
         """Run the handler for ``task`` and return a wire-format result.
 
         Pure and synchronous from the caller's view (async handlers are awaited internally), so a
-        transport can simply ``result = worker.process_task(task); send(result)``.
+        transport can simply ``result = worker.process_task(task); send(result)``. Pass
+        ``is_cancelled`` so the handler's ``ctx.cancelled`` reflects cooperative cancellation.
         """
 
         base = self._base(task)
         handler = self._handlers.get(task["name"])
         if handler is None:
             return self._no_handler(base, task["name"])
-        ctx = StepContext()
+        ctx = StepContext(run_id=task.get("runId"), is_cancelled=is_cancelled)
         try:
             output = self._invoke(handler, task.get("input"), ctx)
             if inspect.isawaitable(output):
@@ -132,7 +160,11 @@ class Worker:
         except Exception as err:  # noqa: BLE001
             return self._failure(base, err, ctx)
 
-    async def aprocess_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+    async def aprocess_task(
+        self,
+        task: Dict[str, Any],
+        is_cancelled: Optional[Callable[[str], bool]] = None,
+    ) -> Dict[str, Any]:
         """Async variant — awaits async handlers in the current loop. Use from a transport that
         already runs inside an event loop (e.g. the BullMQ runner)."""
 
@@ -140,7 +172,7 @@ class Worker:
         handler = self._handlers.get(task["name"])
         if handler is None:
             return self._no_handler(base, task["name"])
-        ctx = StepContext()
+        ctx = StepContext(run_id=task.get("runId"), is_cancelled=is_cancelled)
         try:
             output = self._invoke(handler, task.get("input"), ctx)
             if inspect.isawaitable(output):

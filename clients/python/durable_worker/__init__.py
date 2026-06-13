@@ -5,7 +5,16 @@ The wire protocol (task in, result out) is plain JSON and identical across langu
 same step name implemented here is callable from a TypeScript workflow via ``ctx.call``.
 """
 
+from .cancellation import Cancelled, CancellationRegistry
+from .routing import reply_target
 from .worker import FatalError, StepContext, Worker
 
-__all__ = ["Worker", "FatalError", "StepContext"]
-__version__ = "0.2.0"
+__all__ = [
+    "Worker",
+    "FatalError",
+    "StepContext",
+    "Cancelled",
+    "CancellationRegistry",
+    "reply_target",
+]
+__version__ = "0.3.0"
