@@ -42,8 +42,8 @@ export class DashboardService {
     return this.engine.resume(runId);
   }
 
-  cancel(runId: string): Promise<RunResult | null> {
-    return this.engine.cancel(runId);
+  cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
+    return this.engine.cancel(runId, opts);
   }
 
   /** Resume a run paused at a `ctx.breakpoint` (the "continue" button). */

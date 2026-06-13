@@ -80,7 +80,7 @@ export function nestjsDurableCodegen(options: NestjsDurableCodegenOptions = {}):
       response: `${RUN_DETAIL} | null`,
     }, id),
     route('POST', `${base}/runs/:id/retry`, `${ns}.retry`, { query: null, body: null, response: RUN }, id),
-    route('POST', `${base}/runs/:id/cancel`, `${ns}.cancel`, { query: null, body: null, response: RUN }, id),
+    route('POST', `${base}/runs/:id/cancel`, `${ns}.cancel`, { query: "{ compensate?: 'true' }", body: null, response: RUN }, id),
     route('POST', `${base}/runs/:id/continue`, `${ns}.continue`, { query: null, body: null, response: RUN }, id),
     route(
       'POST',

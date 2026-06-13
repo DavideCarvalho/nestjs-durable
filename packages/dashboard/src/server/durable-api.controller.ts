@@ -41,8 +41,8 @@ export class DurableApiController {
   }
 
   @Post('runs/:id/cancel')
-  async cancel(@Param('id') id: string) {
-    const result = await this.dashboard.cancel(id);
+  async cancel(@Param('id') id: string, @Query('compensate') compensate?: string) {
+    const result = await this.dashboard.cancel(id, { compensate: compensate === 'true' });
     if (!result) throw new NotFoundException(`run ${id} not found`);
     return result;
   }

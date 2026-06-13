@@ -155,6 +155,8 @@ export class WorkflowEngine {
   private readonly cancelListeners = new Set<(runId: string) => void>();
   /** Validators gating `engine.update`, keyed by `<workflow>:<updateName>`. */
   private readonly updateValidators = new Map<string, UpdateValidator>();
+  /** Runs being cancelled WITH saga compensation — see `cancel({ compensate: true })`. */
+  private readonly cancelRequested = new Set<string>();
   /** Flow-control queues for remote steps, keyed by name (see {@link registerQueue}). */
   private readonly queues = new Map<string, QueueController>();
   /** Which queue a dispatched step took a slot from, by stepId — so the result can release it. */
@@ -438,10 +440,28 @@ export class WorkflowEngine {
     void this.signal(`child:${runId}`, completion).catch(() => undefined);
   }
 
-  /** Cancel a run (e.g. from the dashboard). Returns null if the run does not exist. */
-  async cancel(runId: string): Promise<RunResult | null> {
+  /**
+   * Cancel a run (e.g. from the dashboard). Returns null if the run does not exist. Pass
+   * `{ compensate: true }` to undo the saga first: the suspended run is resumed so its completed
+   * steps' compensations run in reverse (visible as `compensate:<step>` events), then it's marked
+   * cancelled. Without it, cancellation is immediate (no undo).
+   */
+  async cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
     const run = await this.store.getRun(runId);
     if (!run) return null;
+    // Compensating cancel: resume the run with a cancellation pending. Replay re-registers the
+    // saga, and at the run's suspension point execute() runs the undo and marks it cancelled.
+    if (opts?.compensate && (run.status === 'suspended' || run.status === 'running')) {
+      this.cancelRequested.add(runId);
+      const result = await this.resume(runId);
+      this.notifyCancelled(runId);
+      if (this.transport?.publishControl) {
+        void this.transport
+          .publishControl({ kind: 'cancel', runId, from: this.instanceId })
+          .catch(() => undefined);
+      }
+      return result;
+    }
     const error = { message: 'cancelled' };
     await this.store.updateRun(runId, { status: 'cancelled', error, updatedAt: new Date() });
     this.emit({ type: 'run.failed', runId, workflow: run.workflow, error });
@@ -561,6 +581,19 @@ export class WorkflowEngine {
       return { runId: run.id, status: 'completed', output };
     } catch (err) {
       if (err instanceof WorkflowSuspended) {
+        // A compensating cancel resumed this run to reach here: the replay re-registered the saga,
+        // so undo the completed steps in reverse and mark it cancelled instead of re-suspending.
+        if (this.cancelRequested.has(run.id)) {
+          this.cancelRequested.delete(run.id);
+          for (let i = compensations.length - 1; i >= 0; i -= 1) {
+            const comp = compensations[i];
+            if (comp) await this.runCompensation(run, comp);
+          }
+          const error = { message: 'cancelled' };
+          await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
+          this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+          return { runId: run.id, status: 'cancelled', error };
+        }
         await this.store.updateRun(run.id, {
           status: 'suspended',
           wakeAt: err.wakeAt,
