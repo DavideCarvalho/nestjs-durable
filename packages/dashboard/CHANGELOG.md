@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.5.1
+
+### Patch Changes
+
+- The `/durable` run view now live-tails over the SSE stream (`streamRun`): it refreshes the instant an event lands instead of waiting for the poll, with the 1.5s poll kept as a fallback. Cross-pod when the server transport has a control plane.
+
 ## 0.5.0
 
 ### Minor Changes

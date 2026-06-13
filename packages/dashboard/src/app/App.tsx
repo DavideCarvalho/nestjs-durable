@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   type RunDetail,
   type RunStatus,
@@ -155,6 +155,17 @@ function RunDetail({ id }: { id: string }) {
     qc.invalidateQueries({ queryKey: ['run', id] });
     qc.invalidateQueries({ queryKey: ['runs'] });
   };
+  // Live-tail over SSE: refresh the moment an event lands instead of waiting for the poll. Only
+  // while the run is in flight; the 1.5s poll above stays as a fallback (e.g. transport with no
+  // control plane, or a dropped stream).
+  const liveStatus = (data as RunDetail | undefined)?.run.status;
+  const isLive = liveStatus === 'running' || liveStatus === 'suspended';
+  useEffect(() => {
+    if (!isLive) return;
+    return durableClient.streamRun(id, () => {
+      qc.invalidateQueries({ queryKey: ['run', id] });
+    });
+  }, [id, isLive, qc]);
   const retry = useMutation({ mutationFn: () => durableClient.retry(id), onSuccess: invalidate });
   const cancel = useMutation({ mutationFn: () => durableClient.cancel(id), onSuccess: invalidate });
   const cont = useMutation({ mutationFn: () => durableClient.continue(id), onSuccess: invalidate });
