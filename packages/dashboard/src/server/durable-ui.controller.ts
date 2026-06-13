@@ -11,8 +11,10 @@ import {
   StreamableFile,
 } from '@nestjs/common';
 
-/** DI token carrying the configured mount base (e.g. `/durable`, `/api/durable`). */
+/** DI token carrying the UI mount base (e.g. `/durable`). */
 export const DASHBOARD_BASE_PATH = Symbol('DASHBOARD_BASE_PATH');
+/** DI token carrying the JSON API base the SPA fetches from (e.g. `/api/durable`). */
+export const DASHBOARD_API_PATH = Symbol('DASHBOARD_API_PATH');
 
 /** The base the SPA bundle was built with (Vite `base`); rewritten to the configured base at serve time. */
 const BUILD_BASE = '/durable';
@@ -41,7 +43,10 @@ const CONTENT_TYPES: Record<string, string> = {
 export class DurableUiController {
   private readonly dir = spaDir();
 
-  constructor(@Inject(DASHBOARD_BASE_PATH) private readonly basePath: string) {}
+  constructor(
+    @Inject(DASHBOARD_BASE_PATH) private readonly basePath: string,
+    @Inject(DASHBOARD_API_PATH) private readonly apiBasePath: string,
+  ) {}
 
   // index.html references hash-named bundles, so it MUST NOT be cached (stale bundle = the
   // classic "stuck loading after a deploy"). The hashed assets below are immutable.
@@ -59,7 +64,8 @@ export class DurableUiController {
       `="${BUILD_BASE}/`,
       `="${this.basePath}/`,
     );
-    const inject = `<script>window.__DURABLE_BASE__='${this.basePath}';</script>`;
+    // __DURABLE_BASE__ = where assets load; __DURABLE_API__ = where the SPA fetches the JSON API.
+    const inject = `<script>window.__DURABLE_BASE__='${this.basePath}';window.__DURABLE_API__='${this.apiBasePath}';</script>`;
     return html.includes('</head>') ? html.replace('</head>', `${inject}</head>`) : inject + html;
   }
 

@@ -2,8 +2,8 @@ import type { RunStatus } from '@dudousxd/nestjs-durable-core';
 import { Controller, Get, NotFoundException, Param, Post, Query } from '@nestjs/common';
 import { DashboardService } from './dashboard.service.js';
 
-/** JSON API consumed by the control-plane SPA. Mounted at `<base>/api` (base from RouterModule). */
-@Controller('api')
+/** JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule). */
+@Controller()
 export class DurableApiController {
   constructor(private readonly dashboard: DashboardService) {}
 

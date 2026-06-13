@@ -1,5 +1,15 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.3.0
+
+### Minor Changes
+
+- Add `apiBasePath` to `DurableDashboardModule.forRoot` so the UI and its JSON API can mount on
+  different paths: serve the SPA at a page-friendly `basePath` (e.g. `/durable`) while the API lives
+  under your app's `/api` prefix (e.g. `apiBasePath: '/api/durable'`) to inherit its auth/proxy. The
+  SPA is told its API base at serve time. Defaults to `<basePath>/api`, so existing mounts are
+  unchanged.
+
 ## 0.2.2
 
 ### Patch Changes

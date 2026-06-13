@@ -42,12 +42,15 @@ export interface RunDetail {
 
 declare global {
   interface Window {
-    /** Mount base (e.g. `/ops/durable`) injected by the UI controller; falls back to `/durable`. */
+    /** UI mount base (e.g. `/durable`) injected by the UI controller; falls back to `/durable`. */
     __DURABLE_BASE__?: string;
+    /** JSON API base (e.g. `/api/durable`) injected by the UI controller; falls back to `<base>/api`. */
+    __DURABLE_API__?: string;
   }
 }
 
 function apiBase(): string {
+  if (typeof window !== 'undefined' && window.__DURABLE_API__) return window.__DURABLE_API__;
   const base = (typeof window !== 'undefined' && window.__DURABLE_BASE__) || '/durable';
   return `${base}/api`;
 }
