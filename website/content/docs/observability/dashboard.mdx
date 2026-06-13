@@ -33,6 +33,27 @@ The SPA's asset URLs and its API base are derived from `basePath` at serve time,
 at any mount point. If your app sets a global prefix (`app.setGlobalPrefix('api')`), exclude the base
 route so the path isn't prefixed twice — or fold it in by setting `basePath` to include the prefix.
 
+### Serving it from an API pod (without processing there)
+
+When you split your app into **API** and **worker** pods, you usually want the dashboard served from
+the API (it handles HTTP) while only the workers process runs. Set `worker: false` on the API
+instance's `DurableModule`:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  worker: process.env.APP_TYPE !== 'API', // workers process; the API only serves the dashboard
+});
+```
+
+With `worker: false` the engine is still fully available — the dashboard can **dispatch retries and
+cancels**, and reads work — but the instance does **not** play the worker role: it won't register
+`@DurableStep` handlers (so it never consumes the task queue), won't recover incomplete runs on boot,
+and won't poll due timers. Leave that to the worker pods. So a **retry clicked in the UI on an API
+pod still works**: the API dispatches the step, a worker picks it up and runs it. Only the processing
+is gated, not the control plane. (Default is `worker: true`, so single-process apps need nothing.)
+
 ## What it shows
 
 - **Runs** — every run with its status (running / suspended / completed / failed / cancelled),
