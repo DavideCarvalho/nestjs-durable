@@ -1,4 +1,5 @@
 import {
+  type EngineEvent,
   type RunQuery,
   type RunResult,
   STATE_STORE,
@@ -8,6 +9,7 @@ import {
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable } from '@nestjs/common';
+import { Observable } from 'rxjs';
 
 export interface RunDetail {
   run: WorkflowRun;
@@ -46,5 +48,19 @@ export class DashboardService {
   /** Resume a run paused at a `ctx.breakpoint` (the "continue" button). */
   continue(runId: string): Promise<RunResult | null> {
     return this.engine.continue(runId);
+  }
+
+  /**
+   * Live stream of a run's lifecycle events for SSE. Backed by `engine.subscribe`, which — when the
+   * transport has a control plane — receives events from EVERY instance, so a dashboard-only pod
+   * tails a run executing on a worker pod. Without a control plane it only sees same-process events.
+   */
+  streamRun(runId: string): Observable<{ data: EngineEvent }> {
+    return new Observable<{ data: EngineEvent }>((subscriber) => {
+      const off = this.engine.subscribe((event) => {
+        if (event.runId === runId) subscriber.next({ data: event });
+      });
+      return () => off();
+    });
   }
 }

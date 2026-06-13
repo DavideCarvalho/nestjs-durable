@@ -1,4 +1,5 @@
 import {
+  type ControlMessage,
   type Heartbeat,
   type RemoteTask,
   type StepHandler,
@@ -7,6 +8,7 @@ import {
   runStepHandler,
 } from '@dudousxd/nestjs-durable-core';
 import { type ConnectionOptions, Queue, Worker } from 'bullmq';
+import { Redis, type RedisOptions } from 'ioredis';
 
 export interface BullMQTransportOptions {
   /** ioredis connection options (or an IORedis instance). */
@@ -34,6 +36,10 @@ export class BullMQTransport implements Transport {
   private readonly queues = new Map<string, Queue>();
   private taskWorker?: Worker;
   private resultsWorker?: Worker;
+  // Control plane runs over Redis pub/sub (not a queue): every instance gets every message, which
+  // is what live-tail + cancellation need. Subscribe needs its own connection (it blocks the client).
+  private controlPub?: Redis;
+  private controlSub?: Redis;
 
   constructor(options: BullMQTransportOptions) {
     this.connection = options.connection;
@@ -102,10 +108,42 @@ export class BullMQTransport implements Transport {
     // Heartbeats are not modelled over BullMQ yet; the queue's own stalled-job recovery applies.
   }
 
+  private controlChannel(): string {
+    return `${this.prefix}-control`;
+  }
+
+  /** A standalone Redis client from the same connection — duplicating a passed-in instance, or
+   *  building one from options (pub/sub can't share BullMQ's worker connections). */
+  private redis(): Redis {
+    const c = this.connection;
+    if (c instanceof Redis) return c.duplicate();
+    return new Redis(c as RedisOptions);
+  }
+
+  async publishControl(msg: ControlMessage): Promise<void> {
+    if (!this.controlPub) this.controlPub = this.redis();
+    await this.controlPub.publish(this.controlChannel(), JSON.stringify(msg));
+  }
+
+  onControl(handler: (msg: ControlMessage) => void): void {
+    if (this.controlSub) return; // one subscription per transport
+    this.controlSub = this.redis();
+    void this.controlSub.subscribe(this.controlChannel());
+    this.controlSub.on('message', (_channel, payload) => {
+      try {
+        handler(JSON.parse(payload) as ControlMessage);
+      } catch {
+        /* ignore malformed control messages */
+      }
+    });
+  }
+
   /** Close all workers and queues so the process can exit. */
   async close(): Promise<void> {
     await this.taskWorker?.close();
     await this.resultsWorker?.close();
     await Promise.all([...this.queues.values()].map((q) => q.close()));
+    this.controlPub?.disconnect();
+    this.controlSub?.disconnect();
   }
 }

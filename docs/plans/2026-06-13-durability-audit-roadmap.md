@@ -16,37 +16,38 @@ cause and are designed below rather than half-built.
 | **Replay test harness** | `assertReplayable(register, history)` replays a recorded run against the current code and fails on divergence — a CI guard that catches non-determinism *before* deploy. |
 | **Tracing** | Failed steps now emit an OTel span (error status), not just completed ones. |
 
-## Next — all gated on one thing: a distributed control/event channel
+## Control plane — SHIPPED (core/dashboard 0.5.0, transports 0.2.0/0.3.0)
 
-The remaining audit items look unrelated but share a root cause: **`EngineEvent`s, heartbeats, and
-cancellation are all in-process today.** In a multi-pod deployment (flip: dashboard on the API pod,
-runs executing on worker pods) the pod that needs the signal isn't the pod that has it. An
-in-process implementation would pass tests and silently do nothing in production — the exact
-half-measure to avoid. The unlock is a small **control channel** on the `Transport` (publish/
-subscribe, e.g. a Redis pub/sub topic the BullMQ transport already has the connection for):
+The remaining audit items shared a root cause: **`EngineEvent`s, heartbeats, and cancellation were
+all in-process.** In a multi-pod deployment (flip: dashboard on the API pod, runs executing on
+worker pods) the pod that needs the signal isn't the pod that has it. The unlock — now built — is a
+**control channel** on the `Transport`: a broadcast pub/sub across every instance, alongside the
+point-to-point `dispatch`/`onResult` queues.
 
 ```ts
 interface Transport {
-  // new:
-  publishControl?(msg: ControlMessage): Promise<void>;     // run.* events, heartbeats, cancel
+  publishControl?(msg: ControlMessage): Promise<void>;
   onControl?(handler: (msg: ControlMessage) => void): void;
 }
 ```
 
-Once that exists, these fall out of it:
+In-process transports (in-memory, event-emitter) broadcast locally; **BullMQ broadcasts over Redis
+pub/sub**. Optional — the engine degrades to local-only events when a transport omits it. Events are
+deduped by originating `instanceId` so a broker echo doesn't double-deliver. Built on it:
 
-- **#7 SSE live-tail** — the dashboard subscribes to `run.*` control messages and streams them over
-  `@Sse('runs/:id/stream')`, replacing polling. (In-process SSE alone is useless cross-pod.)
-- **#11 Cooperative cancellation cross-worker** — `cancel()` publishes a `cancel(runId)` control
-  message; an in-flight Python/TS worker checks it (`ctx.isCancelled()`) and bails, instead of
-  finishing 13min of work that will be discarded. The engine-side discard already shipped (0.4.0).
-- **#4 Worker heartbeats over BullMQ** — `ctx.heartbeat()` publishes a heartbeat control message that
-  resets the liveness window. Today the BullMQ transport explicitly doesn't model heartbeats (it
-  leans on the queue's stalled-job recovery), so `timeoutMs` remote steps have no keep-alive. Lower
-  priority: flip uses the durable-suspend path (no `timeoutMs`), so it's unaffected.
+- ✅ **#7 SSE live-tail** — the engine broadcasts lifecycle events, so a dashboard-only pod sees a
+  run executing on a worker pod. Dashboard exposes `@Sse('runs/:id/stream')` +
+  `durableClient.streamRun(id, onEvent)`, replacing polling.
+- ✅ **#11 Cooperative cancellation cross-worker** — `cancel()` broadcasts the cancel; `engine.onCancel(fn)`
+  lets a worker bridge abort in-flight work instead of finishing it just to discard the result. (The
+  engine-side discard of a late result shipped in 0.4.0.) **Remaining**: wire the Python SDK to
+  subscribe to the cancel channel and check it inside a long handler — the cross-language half.
+- **#4 Worker heartbeats over BullMQ** — now feasible on the same channel (`ctx.heartbeat()` →
+  control message resetting the liveness window). Still nice-to-have: flip uses the durable-suspend
+  path (no `timeoutMs`), so unaffected.
 - **#6 Distributed tracing across workers** — inject `traceparent` into the `RemoteTask` and have the
-  worker (incl. the Python SDK) continue the span, so a remote step shows as a child span in one
-  trace. Needs a dispatch-time hook, naturally part of the same plumbing.
+  worker (incl. the Python SDK) continue the span. Independent of the control plane (a dispatch-time
+  hook); still open.
 
 ## Deferred by design (no current use, real complexity)
 

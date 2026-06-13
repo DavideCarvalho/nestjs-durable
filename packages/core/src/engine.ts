@@ -121,6 +121,8 @@ export class WorkflowEngine {
   /** Per-step "reset the liveness timer" callbacks, called when a heartbeat arrives. */
   private readonly heartbeatResets = new Map<string, () => void>();
   private readonly listeners = new Set<EngineListener>();
+  /** Callbacks notified (on any instance) when a run is cancelled — for cooperative cancellation. */
+  private readonly cancelListeners = new Set<(runId: string) => void>();
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Set<Promise<RunResult>>();
   private draining = false;
@@ -155,6 +157,29 @@ export class WorkflowEngine {
     this.transport?.onHeartbeat(async (beat) => {
       this.heartbeatResets.get(beat.stepId)?.();
     });
+    // Control plane: re-broadcast lifecycle events from OTHER instances to this instance's
+    // subscribers (cross-pod live-tail), and act on cancellations issued elsewhere. A broker may
+    // echo our own publish back — ignore those (we already handled them locally) to avoid duplicates.
+    this.transport?.onControl?.((msg) => {
+      if (msg.from === this.instanceId) return;
+      if (msg.kind === 'event') {
+        // `at` may be a string after JSON transit (Redis) — normalize back to a Date.
+        this.deliver({ ...msg.event, at: new Date(msg.event.at) });
+      } else if (msg.kind === 'cancel') {
+        this.notifyCancelled(msg.runId);
+      }
+    });
+  }
+
+  /** Fire cooperative-cancellation listeners for `runId` (a worker bridge aborts in-flight work). */
+  private notifyCancelled(runId: string): void {
+    for (const fn of this.cancelListeners) {
+      try {
+        fn(runId);
+      } catch {
+        /* a cancel listener must not break the engine */
+      }
+    }
   }
 
   /**
@@ -175,11 +200,36 @@ export class WorkflowEngine {
     return () => this.listeners.delete(listener);
   }
 
+  /**
+   * Be notified when a run is cancelled — on ANY instance, via the transport control plane. A
+   * worker bridge can use this for cooperative cancellation: abort the in-flight work for `runId`
+   * instead of finishing it just to have the result discarded. Returns an unsubscribe function.
+   */
+  onCancel(listener: (runId: string) => void): () => void {
+    this.cancelListeners.add(listener);
+    return () => this.cancelListeners.delete(listener);
+  }
+
+  /** Emit a locally-produced lifecycle event: deliver to subscribers AND broadcast it on the
+   *  control plane so other instances (e.g. a dashboard pod) can live-tail this run. */
   private emit(event: Omit<EngineEvent, 'at'>): void {
     const full: EngineEvent = { ...event, at: new Date() };
+    this.deliver(full);
+    if (this.transport?.publishControl) {
+      void this.transport
+        .publishControl({ kind: 'event', event: full, from: this.instanceId })
+        .catch(() => {
+          // control-plane delivery is best-effort observability; never break execution
+        });
+    }
+  }
+
+  /** Deliver an event to local subscribers only (no re-broadcast) — used for both locally-produced
+   *  events and ones received from the control plane, so an event shows up once on every instance. */
+  private deliver(event: EngineEvent): void {
     for (const listener of this.listeners) {
       try {
-        listener(full);
+        listener(event);
       } catch {
         // a misbehaving subscriber must never break workflow execution
       }
@@ -347,6 +397,15 @@ export class WorkflowEngine {
     const error = { message: 'cancelled' };
     await this.store.updateRun(runId, { status: 'cancelled', error, updatedAt: new Date() });
     this.emit({ type: 'run.failed', runId, workflow: run.workflow, error });
+    // Notify local cancel listeners now (a worker on this pod), and broadcast so the instance/worker
+    // actually running this run learns of it and can abort cooperatively (the store already records
+    // `cancelled`, but a busy worker won't re-read it).
+    this.notifyCancelled(runId);
+    if (this.transport?.publishControl) {
+      void this.transport
+        .publishControl({ kind: 'cancel', runId, from: this.instanceId })
+        .catch(() => undefined);
+    }
     return { runId, status: 'cancelled', error };
   }
 

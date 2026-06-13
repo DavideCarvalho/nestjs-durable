@@ -1,5 +1,5 @@
 import type { RunStatus } from '@dudousxd/nestjs-durable-core';
-import { Controller, Get, NotFoundException, Param, Post, Query } from '@nestjs/common';
+import { Controller, Get, NotFoundException, Param, Post, Query, Sse } from '@nestjs/common';
 import { DashboardService } from './dashboard.service.js';
 
 /** JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule). */
@@ -17,6 +17,13 @@ export class DurableApiController {
     const detail = await this.dashboard.getRunDetail(id);
     if (!detail) throw new NotFoundException(`run ${id} not found`);
     return detail;
+  }
+
+  /** Server-Sent Events stream of a run's live lifecycle events — the dashboard tails it instead
+   *  of polling. Cross-pod when the transport has a control plane (see DashboardService.streamRun). */
+  @Sse('runs/:id/stream')
+  stream(@Param('id') id: string) {
+    return this.dashboard.streamRun(id);
   }
 
   @Post('runs/:id/retry')

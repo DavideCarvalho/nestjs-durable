@@ -69,4 +69,23 @@ describe('BullMQTransport (real Redis)', () => {
 
     await transport.close();
   }, 20_000);
+
+  it('broadcasts control-plane messages over Redis pub/sub', async (ctx) => {
+    if (!redisUp) ctx.skip();
+    const prefix = `durtest-${Date.now()}-c`;
+    const pub = new BullMQTransport({ connection, prefix });
+    const sub = new BullMQTransport({ connection, prefix });
+
+    const got: string[] = [];
+    sub.onControl((msg) => {
+      if (msg.kind === 'cancel') got.push(msg.runId);
+    });
+    await new Promise((r) => setTimeout(r, 200)); // let the subscription establish
+    await pub.publishControl({ kind: 'cancel', runId: 'run-x', from: 'pub' });
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(got).toEqual(['run-x']);
+    await pub.close();
+    await sub.close();
+  }, 20_000);
 });

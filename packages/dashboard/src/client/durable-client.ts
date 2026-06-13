@@ -53,6 +53,24 @@ export interface RunDetail {
   timeline: StepCheckpoint[];
 }
 
+export interface EngineEvent {
+  type:
+    | 'run.started'
+    | 'run.completed'
+    | 'run.failed'
+    | 'run.suspended'
+    | 'step.started'
+    | 'step.completed'
+    | 'step.failed';
+  runId: string;
+  workflow?: string;
+  seq?: number;
+  name?: string;
+  kind?: StepKind;
+  durationMs?: number;
+  at: string;
+}
+
 declare global {
   interface Window {
     /** UI mount base (e.g. `/durable`) injected by the UI controller; falls back to `/durable`. */
@@ -89,5 +107,20 @@ export const durableClient = {
   },
   continue(id: string): Promise<WorkflowRun> {
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/continue`, { method: 'POST' });
+  },
+  /**
+   * Live-tail a run's lifecycle events over SSE (replaces polling). Calls `onEvent` per event;
+   * returns a function to close the stream. Cross-pod when the server transport has a control plane.
+   */
+  streamRun(id: string, onEvent: (event: EngineEvent) => void): () => void {
+    const source = new EventSource(`${apiBase()}/runs/${encodeURIComponent(id)}/stream`);
+    source.onmessage = (msg) => {
+      try {
+        onEvent(JSON.parse(msg.data) as EngineEvent);
+      } catch {
+        /* ignore malformed event */
+      }
+    };
+    return () => source.close();
   },
 };

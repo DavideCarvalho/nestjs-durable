@@ -117,6 +117,10 @@ importers:
         version: 3.25.76
 
   packages/dashboard:
+    dependencies:
+      rxjs:
+        specifier: ^7.0.0
+        version: 7.8.2
     devDependencies:
       '@dudousxd/nestjs-durable-core':
         specifier: workspace:^

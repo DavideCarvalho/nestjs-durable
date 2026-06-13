@@ -1,4 +1,4 @@
-import type { Heartbeat, RemoteTask, StepResult, Transport } from '../interfaces';
+import type { ControlMessage, Heartbeat, RemoteTask, StepResult, Transport } from '../interfaces';
 import { type StepHandler, runStepHandler } from '../protocol';
 
 /**
@@ -8,6 +8,7 @@ import { type StepHandler, runStepHandler } from '../protocol';
 export class InMemoryTransport implements Transport {
   private readonly handlers = new Map<string, StepHandler>();
   private resultHandler?: (result: StepResult) => Promise<void>;
+  private readonly controlHandlers = new Set<(msg: ControlMessage) => void>();
 
   /** Register a fake worker handler for a step name. */
   handle(name: string, fn: StepHandler): void {
@@ -29,5 +30,15 @@ export class InMemoryTransport implements Transport {
 
   onHeartbeat(_handler: (beat: Heartbeat) => Promise<void>): void {
     // In-process handlers run synchronously; there is no liveness to track.
+  }
+
+  // Control plane: broadcast to every registered handler (including the publisher's own — the
+  // engine dedupes by `from`), mirroring how a real broker echoes a publish to all subscribers.
+  async publishControl(msg: ControlMessage): Promise<void> {
+    for (const handler of this.controlHandlers) handler(msg);
+  }
+
+  onControl(handler: (msg: ControlMessage) => void): void {
+    this.controlHandlers.add(handler);
   }
 }

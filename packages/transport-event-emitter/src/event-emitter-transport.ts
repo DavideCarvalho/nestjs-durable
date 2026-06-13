@@ -1,4 +1,5 @@
 import {
+  type ControlMessage,
   type Heartbeat,
   type RemoteTask,
   type StepHandler,
@@ -11,6 +12,7 @@ import type { EventEmitter2 } from 'eventemitter2';
 export const TASK_EVENT = 'durable.task';
 export const RESULT_EVENT = 'durable.result';
 export const HEARTBEAT_EVENT = 'durable.heartbeat';
+export const CONTROL_EVENT = 'durable.control';
 
 /**
  * An in-process `Transport` backed by `@nestjs/event-emitter`'s `EventEmitter2`.
@@ -47,6 +49,14 @@ export class EventEmitterTransport implements Transport {
     this.emitter.on(HEARTBEAT_EVENT, (beat: Heartbeat) => {
       void handler(beat);
     });
+  }
+
+  async publishControl(msg: ControlMessage): Promise<void> {
+    this.emitter.emit(CONTROL_EVENT, msg);
+  }
+
+  onControl(handler: (msg: ControlMessage) => void): void {
+    this.emitter.on(CONTROL_EVENT, (msg: ControlMessage) => handler(msg));
   }
 
   private async process(task: RemoteTask): Promise<void> {
