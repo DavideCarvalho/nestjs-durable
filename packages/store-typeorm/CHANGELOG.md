@@ -1,5 +1,13 @@
 # @dudousxd/nestjs-durable-store-typeorm
 
+## 0.1.5
+
+### Patch Changes
+
+- Hardening from review:
+  - TypeORM auto-schema now reads the live columns (`information_schema` / `PRAGMA`) and adds only the missing ones, instead of ALTER-and-swallow — a real ALTER failure now surfaces rather than being hidden as a presumed "column already exists".
+  - Breakpoint detection keys off the checkpoint's `breakpoint` name (the explicit marker) rather than the incidentally-reused `signal` kind, so `engine.continue` can't be confused by other pending steps.
+
 ## 0.1.4
 
 ### Patch Changes

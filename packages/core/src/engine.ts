@@ -24,6 +24,12 @@ type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 /** Deterministic signal token a breakpoint suspends on — derived from its logical position. */
 const breakpointToken = (runId: string, seq: number): string => `bp:${runId}:${seq}`;
 
+/** A breakpoint checkpoint's `name` is `breakpoint` (or `breakpoint:<label>`). This name — not the
+ *  reused `signal` kind — is the explicit marker the dashboard and `continue()` detect it by. */
+const BREAKPOINT = 'breakpoint';
+const isBreakpoint = (cp: { status: string; name: string }): boolean =>
+  cp.status === 'pending' && cp.name.startsWith(BREAKPOINT);
+
 interface RegisteredWorkflow {
   name: string;
   version: string;
@@ -663,7 +669,7 @@ export class WorkflowEngine {
     await this.store.saveCheckpoint({
       runId,
       seq,
-      name: label ? `breakpoint:${label}` : 'breakpoint',
+      name: label ? `${BREAKPOINT}:${label}` : BREAKPOINT,
       kind: 'signal',
       stepId: stepId(runId, seq),
       status: 'pending',
@@ -681,7 +687,7 @@ export class WorkflowEngine {
    */
   async continue(runId: string): Promise<RunResult | null> {
     const checkpoints = await this.store.listCheckpoints(runId);
-    const bp = checkpoints.find((c) => c.status === 'pending' && c.kind === 'signal');
+    const bp = checkpoints.find(isBreakpoint);
     if (!bp) return null;
     return this.signal(breakpointToken(runId, bp.seq), undefined);
   }

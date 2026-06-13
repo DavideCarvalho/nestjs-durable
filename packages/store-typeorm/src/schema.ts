@@ -19,6 +19,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
   const type = String(dataSource.options.type);
   const isPg = type === 'postgres' || type === 'aurora-postgres';
   const isMysql = type === 'mysql' || type === 'mariadb' || type === 'aurora-mysql';
+  const isSqlite = type === 'sqlite' || type === 'better-sqlite3' || type === 'expo';
 
   // Keyed/short strings must be varchar on MySQL (a `text` PK/index needs a key length); `text`
   // for the free-form JSON payloads. Dates use the dialect's native timestamp type.
@@ -56,30 +57,35 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
   ];
 
   // Additive nullable columns gained across versions (e.g. `input`, `events`, `enqueuedAt`). On a
-  // table that predates them, `CREATE TABLE IF NOT EXISTS` above is a no-op, so back-fill each one
-  // best-effort — making the auto-schema self-healing instead of requiring a manual migration.
-  const addColumns: Array<[string, string, string]> = [
-    [runs, 'input', txt],
-    [runs, 'output', txt],
-    [runs, 'error', txt],
-    [checkpoints, 'input', txt],
-    [checkpoints, 'output', txt],
-    [checkpoints, 'error', txt],
-    [checkpoints, 'events', txt],
-    [checkpoints, 'workerGroup', str],
-    [checkpoints, 'enqueuedAt', ts],
-  ];
+  // table that predates them, `CREATE TABLE IF NOT EXISTS` above is a no-op, so back-fill the ones
+  // that are actually missing — the auto-schema self-heals instead of needing a manual migration.
+  // We check the live columns first (rather than ALTER-and-ignore) so a *real* ALTER failure
+  // surfaces instead of being swallowed as a presumed "column already exists".
+  const additive: Record<string, Array<[string, string]>> = {
+    durable_workflow_runs: [
+      ['input', txt],
+      ['output', txt],
+      ['error', txt],
+    ],
+    durable_step_checkpoints: [
+      ['input', txt],
+      ['output', txt],
+      ['error', txt],
+      ['events', txt],
+      ['workerGroup', str],
+      ['enqueuedAt', ts],
+    ],
+  };
 
   const runner = dataSource.createQueryRunner();
   try {
     for (const sql of tables) await runner.query(sql);
-    // Postgres has `ADD COLUMN IF NOT EXISTS`; MySQL/SQLite don't, so fall back to try/ignore.
-    for (const [table, col, colType] of addColumns) {
-      const ifNotExists = isPg ? 'IF NOT EXISTS ' : '';
-      try {
-        await runner.query(`ALTER TABLE ${table} ADD COLUMN ${ifNotExists}${q(col)} ${colType}`);
-      } catch {
-        /* column already exists */
+    for (const [table, cols] of Object.entries(additive)) {
+      const have = await existingColumns(runner, table, { isSqlite, isMysql });
+      for (const [col, colType] of cols) {
+        if (!have.has(col)) {
+          await runner.query(`ALTER TABLE ${q(table)} ADD COLUMN ${q(col)} ${colType}`);
+        }
       }
     }
     // MySQL has no `CREATE INDEX IF NOT EXISTS`; create it best-effort and ignore "already exists".
@@ -93,4 +99,24 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
   } finally {
     await runner.release();
   }
+}
+
+/** The columns that currently exist on `table`, so the schema can add only the missing ones
+ *  (instead of ALTER-and-swallow, which would also hide a genuine ALTER failure). */
+async function existingColumns(
+  runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+  table: string,
+  d: { isSqlite: boolean; isMysql: boolean },
+): Promise<Set<string>> {
+  if (d.isSqlite) {
+    const rows = (await runner.query(`PRAGMA table_info("${table}")`)) as Array<{ name: string }>;
+    return new Set(rows.map((r) => r.name));
+  }
+  // Postgres + MySQL both expose information_schema; scope to the connection's own schema/db.
+  const scope = d.isMysql ? 'TABLE_SCHEMA = DATABASE()' : 'table_schema = current_schema()';
+  const rows = (await runner.query(
+    `SELECT column_name AS name FROM information_schema.columns WHERE table_name = ? AND ${scope}`,
+    [table],
+  )) as Array<{ name?: string; COLUMN_NAME?: string }>;
+  return new Set(rows.map((r) => (r.name ?? r.COLUMN_NAME) as string));
 }
