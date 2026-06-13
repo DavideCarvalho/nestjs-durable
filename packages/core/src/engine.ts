@@ -26,6 +26,7 @@ import type {
   WorkflowRun,
 } from './interfaces';
 import { stepId } from './protocol';
+import { type QueueConfig, QueueController } from './queue';
 import { createStepLogger } from './step-logger';
 
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
@@ -135,6 +136,10 @@ export class WorkflowEngine {
   private readonly cancelListeners = new Set<(runId: string) => void>();
   /** Validators gating `engine.update`, keyed by `<workflow>:<updateName>`. */
   private readonly updateValidators = new Map<string, UpdateValidator>();
+  /** Flow-control queues for remote steps, keyed by name (see {@link registerQueue}). */
+  private readonly queues = new Map<string, QueueController>();
+  /** Which queue a dispatched step took a slot from, by stepId — so the result can release it. */
+  private readonly stepQueue = new Map<string, string>();
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Set<Promise<RunResult>>();
   private draining = false;
@@ -205,6 +210,15 @@ export class WorkflowEngine {
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
     if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
+  }
+
+  /**
+   * Register a flow-control queue referenced by `ctx.call(step, input, { queue })`. Caps concurrent
+   * in-flight steps and/or the admission rate; blocked calls re-suspend and retry, so the limit is
+   * durable. Per engine instance (see {@link QueueConfig}). Registering the same name replaces it.
+   */
+  registerQueue(config: QueueConfig): void {
+    this.queues.set(config.name, new QueueController(config, this.clock));
   }
 
   /** Subscribe to lifecycle events. Returns an unsubscribe function. */
@@ -793,8 +807,11 @@ export class WorkflowEngine {
       now,
       random,
       uuid,
-      call: <TInput, TOutput>(remote: RemoteStepDef<TInput, TOutput>, input: TInput) =>
-        this.callRemote(runId, nextSeq(), remote, input),
+      call: <TInput, TOutput>(
+        remote: RemoteStepDef<TInput, TOutput>,
+        input: TInput,
+        opts?: { queue?: string },
+      ) => this.callRemote(runId, nextSeq(), remote, input, opts?.queue),
     };
   }
 
@@ -904,6 +921,7 @@ export class WorkflowEngine {
     seq: number,
     step: RemoteStepDef<TInput, TOutput>,
     input: TInput,
+    queue?: string,
   ): Promise<TOutput> {
     const existing = await this.store.getCheckpoint(runId, seq);
     if (existing && existing.name !== step.name) {
@@ -919,8 +937,18 @@ export class WorkflowEngine {
     if (step.timeoutMs) return this.callRemoteInMemory(runId, seq, step, input);
     if (existing?.status === 'pending') throw new WorkflowSuspended(); // dispatched; keep waiting
 
-    const validInput = step.input.parse(input);
     const id = stepId(runId, seq);
+    // Flow control: a queued call that can't be admitted (concurrency/rate) does NOT dispatch — the
+    // run re-suspends with the queue's retry time and the timer poller re-tries admission later, so
+    // the limit is durable. The admitted slot is released when the result lands (completeRemoteResult).
+    const controller = queue ? this.queues.get(queue) : undefined;
+    if (controller) {
+      const admission = controller.tryAdmit();
+      if (!admission.ok) throw new WorkflowSuspended(admission.retryAt);
+      this.stepQueue.set(id, queue as string);
+    }
+
+    const validInput = step.input.parse(input);
     const enqueuedAt = new Date();
     // Persist the pending checkpoint BEFORE dispatching, so a fast result always finds it to complete.
     await this.store.saveCheckpoint({
@@ -958,6 +986,9 @@ export class WorkflowEngine {
   private async completeRemoteResult(result: StepResult): Promise<void> {
     const cp = await this.store.getCheckpoint(result.runId, result.seq);
     if (!cp || cp.status !== 'pending') return;
+    // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Done
+    // before the cancelled-run early-return below, so a cancellation can't leak the slot.
+    this.releaseQueueSlot(cp.stepId);
     // Drop a late result for a run that was cancelled/finished meanwhile — don't complete the step
     // or resume (the run is already terminal). This is the engine side of cooperative cancellation.
     const run = await this.store.getRun(result.runId);
@@ -985,6 +1016,14 @@ export class WorkflowEngine {
       durationMs: finishedAt.getTime() - startedAt.getTime(),
     });
     await this.resume(result.runId);
+  }
+
+  /** Release the flow-control slot a dispatched step held (if any), by its stepId. */
+  private releaseQueueSlot(id: string): void {
+    const queue = this.stepQueue.get(id);
+    if (queue === undefined) return;
+    this.stepQueue.delete(id);
+    this.queues.get(queue)?.release();
   }
 
   /** In-memory await path for a remote step with a liveness `timeoutMs` (re-dispatch on timeout). */

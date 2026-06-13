@@ -331,8 +331,15 @@ export interface WorkflowCtx {
     fn: (log: StepLogger) => Promise<TOutput>,
     options?: StepOptions,
   ): Promise<TOutput>;
-  /** Dispatch a typed remote step and await its checkpointed result. */
-  call<TInput, TOutput>(step: RemoteStepDef<TInput, TOutput>, input: TInput): Promise<TOutput>;
+  /**
+   * Dispatch a typed remote step and await its checkpointed result. Pass `{ queue }` to subject the
+   * dispatch to a registered flow-control queue (concurrency / rate limit) — see `engine.registerQueue`.
+   */
+  call<TInput, TOutput>(
+    step: RemoteStepDef<TInput, TOutput>,
+    input: TInput,
+    opts?: { queue?: string },
+  ): Promise<TOutput>;
   /**
    * Durable sleep: suspends the run for `duration` (e.g. `'30s'`, `'2h'`, `'7 days'`, or ms as a
    * number) without consuming resources, resuming automatically once the timer is due — even

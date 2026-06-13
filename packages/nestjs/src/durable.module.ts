@@ -1,5 +1,6 @@
 import {
   DURABLE_OPTIONS,
+  type QueueConfig,
   type ScheduledWorkflow,
   STATE_STORE,
   type StateStore,
@@ -54,6 +55,11 @@ export interface DurableModuleOptions {
    * callback. Omit to build URLs yourself from the token.
    */
   webhookUrl?: (token: string) => string;
+  /**
+   * Flow-control queues for remote steps, registered on the engine at startup. Reference one from a
+   * workflow with `ctx.call(step, input, { queue: name })` to cap its concurrency / admission rate.
+   */
+  queues?: QueueConfig[];
 }
 
 export interface DurableModuleAsyncOptions {
@@ -98,14 +104,17 @@ export class DurableModule {
             store: StateStore,
             transport: Transport | null,
             opts: DurableModuleOptions,
-          ) =>
-            new WorkflowEngine({
+          ) => {
+            const engine = new WorkflowEngine({
               store,
               transport: transport ?? undefined,
               leaseMs: opts.leaseMs,
               instanceId: opts.instanceId,
               webhookUrl: opts.webhookUrl,
-            }),
+            });
+            for (const queue of opts.queues ?? []) engine.registerQueue(queue);
+            return engine;
+          },
           inject: [STATE_STORE, TRANSPORT, DURABLE_OPTIONS],
         },
         WorkflowService,
