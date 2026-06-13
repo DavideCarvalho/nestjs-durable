@@ -740,6 +740,39 @@ export class WorkflowEngine {
       throw new WorkflowSuspended();
     };
 
+    // Guard an in-place change: a fresh run records a `patch:<id>` marker here and takes the new
+    // branch; a run recorded under the OLD code finds a real step at this position instead, so we
+    // roll the logical position back (the marker is transparent to it) and return false — its replay
+    // reads that old step next and follows the old branch. No position shift → no corruption.
+    const patched = async (id: string): Promise<boolean> => {
+      const marker = `patch:${id}`;
+      const current = nextSeq();
+      const existing = await store.getCheckpoint(runId, current);
+      if (existing) {
+        if (existing.name === marker) return true;
+        if (existing.name.startsWith('patch:')) {
+          throw new NonDeterminismError(runId, current, marker, existing.name);
+        }
+        seq -= 1; // not a marker: an old run's step lives here — give the position back to it
+        return false;
+      }
+      const at = new Date();
+      await store.saveCheckpoint({
+        runId,
+        seq: current,
+        name: marker,
+        kind: 'local',
+        stepId: stepId(runId, current),
+        status: 'completed',
+        output: true,
+        attempts: 1,
+        enqueuedAt: at,
+        startedAt: at,
+        finishedAt: at,
+      });
+      return true;
+    };
+
     // An update point: suspend on a run-scoped `update:<runId>:<name>` token that engine.update
     // delivers to (after its validator passes). Reuses the signal machinery; run-scoped like task/child.
     const onUpdate = <T>(name: string, opts?: { timeoutMs?: number }): Promise<T> =>
@@ -804,6 +837,7 @@ export class WorkflowEngine {
       webhook,
       setEvent,
       onUpdate,
+      patched,
       now,
       random,
       uuid,

@@ -405,6 +405,15 @@ export interface WorkflowCtx {
    */
   onUpdate<TArg>(name: string, opts?: { timeoutMs?: number }): Promise<TArg>;
   /**
+   * Guard an in-place workflow change without a new version. Wrap the changed code in
+   * `if (await ctx.patched('my-change')) { …new… } else { …old… }`: a fresh run records a marker and
+   * takes the new branch (`true`); a run already recorded under the old code keeps the old branch
+   * (`false`), because its history has a real step where the marker would sit. The marker is
+   * position-transparent for old runs (it doesn't shift their recorded steps), so guarding code is
+   * replay-safe. Once every old run has drained, remove the guard (keep the new branch).
+   */
+  patched(id: string): Promise<boolean>;
+  /**
    * Deterministic wall-clock (epoch ms): records the time on the first run and replays the SAME
    * value afterwards. Use this instead of `Date.now()` inside a workflow — a raw `Date.now()` returns
    * a different value on every replay, which silently corrupts a durable run.
