@@ -46,7 +46,8 @@ export class QueueController {
         this.windowStart = now;
         this.windowCount = 0;
       }
-      if (this.windowCount >= rl.limit) return { ok: false, retryAt: this.windowStart + rl.periodMs };
+      if (this.windowCount >= rl.limit)
+        return { ok: false, retryAt: this.windowStart + rl.periodMs };
     }
     if (this.config.concurrency != null && this.inFlight >= this.config.concurrency) {
       return { ok: false, retryAt: now + (this.config.retryMs ?? 1000) };

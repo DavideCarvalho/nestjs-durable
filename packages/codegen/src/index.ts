@@ -28,7 +28,7 @@ function route(
 
 // Wire shapes the durable dashboard API returns (JSON: dates are ISO strings).
 const RUN =
-  "{ id: string; workflow: string; workflowVersion: string; " +
+  '{ id: string; workflow: string; workflowVersion: string; ' +
   "status: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled'; " +
   'input?: unknown; output?: unknown; error?: { message: string; code?: string }; ' +
   'wakeAt?: number; createdAt: string; updatedAt: string }';
@@ -74,14 +74,38 @@ export function nestjsDurableCodegen(options: NestjsDurableCodegenOptions = {}):
       body: null,
       response: `${RUN}[]`,
     }),
-    route('GET', `${base}/runs/:id`, `${ns}.getRun`, {
-      query: null,
-      body: null,
-      response: `${RUN_DETAIL} | null`,
-    }, id),
-    route('POST', `${base}/runs/:id/retry`, `${ns}.retry`, { query: null, body: null, response: RUN }, id),
-    route('POST', `${base}/runs/:id/cancel`, `${ns}.cancel`, { query: "{ compensate?: 'true' }", body: null, response: RUN }, id),
-    route('POST', `${base}/runs/:id/continue`, `${ns}.continue`, { query: null, body: null, response: RUN }, id),
+    route(
+      'GET',
+      `${base}/runs/:id`,
+      `${ns}.getRun`,
+      {
+        query: null,
+        body: null,
+        response: `${RUN_DETAIL} | null`,
+      },
+      id,
+    ),
+    route(
+      'POST',
+      `${base}/runs/:id/retry`,
+      `${ns}.retry`,
+      { query: null, body: null, response: RUN },
+      id,
+    ),
+    route(
+      'POST',
+      `${base}/runs/:id/cancel`,
+      `${ns}.cancel`,
+      { query: "{ compensate?: 'true' }", body: null, response: RUN },
+      id,
+    ),
+    route(
+      'POST',
+      `${base}/runs/:id/continue`,
+      `${ns}.continue`,
+      { query: null, body: null, response: RUN },
+      id,
+    ),
     route(
       'POST',
       `${base}/webhooks/:token`,

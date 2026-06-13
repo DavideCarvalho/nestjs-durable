@@ -1,4 +1,4 @@
-import { DURABLE_OPTIONS, runSchedules, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import { DURABLE_OPTIONS, WorkflowEngine, runSchedules } from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
   Injectable,

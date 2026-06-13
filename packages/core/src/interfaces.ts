@@ -463,9 +463,9 @@ export interface RunResult {
  * non-empty string) to reject — the run is left untouched. Return nothing/void to accept. May be
  * async (e.g. a business-rule check against a DB).
  */
-export type UpdateValidator<TArg = unknown> = (
-  arg: TArg,
-) => void | string | Promise<void | string>;
+// biome-ignore lint/suspicious/noConfusingVoidType: a validator may return nothing (accept), or a
+// reason string (reject) — `void` in the union is the intended "returned nothing" case.
+export type UpdateValidator<TArg = unknown> = (arg: TArg) => void | string | Promise<void | string>;
 
 /** Outcome of `engine.update`: rejected by the validator, or accepted and delivered. */
 export type UpdateResult =

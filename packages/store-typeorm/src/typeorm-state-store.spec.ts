@@ -108,7 +108,9 @@ describe('TypeOrmStateStore', () => {
 
     await store.createRun(run());
     await store.saveCheckpoint(
-      checkpoint({ events: [{ at: 1, level: 'error', message: 'p-3 failed', name: 'p-3', status: 'failed' }] }),
+      checkpoint({
+        events: [{ at: 1, level: 'error', message: 'p-3 failed', name: 'p-3', status: 'failed' }],
+      }),
     );
     expect((await store.getCheckpoint('r1', 0))?.events).toEqual([
       { at: 1, level: 'error', message: 'p-3 failed', name: 'p-3', status: 'failed' },

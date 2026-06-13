@@ -33,9 +33,7 @@ describe('runSchedules', () => {
       runs += 1;
       return 'ran';
     });
-    const schedules = [
-      { key: 'nightly', workflow: 'nightly', cron: '0 0 * * *', timezone: 'UTC' },
-    ];
+    const schedules = [{ key: 'nightly', workflow: 'nightly', cron: '0 0 * * *', timezone: 'UTC' }];
 
     // 2026-01-01T05:00Z — the most recent midnight-UTC fire was 2026-01-01T00:00Z.
     const t1 = Date.UTC(2026, 0, 1, 5, 0, 0);

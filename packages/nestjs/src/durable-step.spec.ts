@@ -58,7 +58,11 @@ describe('@DurableStep end-to-end (event-emitter transport, single process)', ()
     // The remote @DurableStep suspends the run durably; it resumes when the result lands (async).
     await moduleRef.get(WorkflowService).start('checkout', { amount: 42 }, 'run1');
     let result = await store.getRun('run1');
-    for (let i = 0; i < 50 && result?.status !== 'completed' && result?.status !== 'failed'; i += 1) {
+    for (
+      let i = 0;
+      i < 50 && result?.status !== 'completed' && result?.status !== 'failed';
+      i += 1
+    ) {
       await new Promise((r) => setImmediate(r));
       result = await store.getRun('run1');
     }
