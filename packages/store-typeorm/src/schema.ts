@@ -88,13 +88,20 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
         }
       }
     }
-    // MySQL has no `CREATE INDEX IF NOT EXISTS`; create it best-effort and ignore "already exists".
-    try {
-      await runner.query(
-        `CREATE INDEX ${q('durable_runs_status_idx')} ON ${runs} (${q('status')}, ${q('wakeAt')})`,
-      );
-    } catch {
-      /* index already exists */
+    // MySQL has no `CREATE INDEX IF NOT EXISTS`; create each best-effort and ignore "already exists".
+    //  - status/wakeAt: the timer poller (listDueTimers) and recovery (listIncompleteRuns) scans.
+    //  - workflow/status: the dashboard's listRuns filters. (Checkpoints are keyed by the PK prefix
+    //    `(runId, seq)`, so listCheckpoints/getEvent already hit an index — no extra one needed.)
+    const indexes: Array<[string, string]> = [
+      ['durable_runs_status_idx', `${runs} (${q('status')}, ${q('wakeAt')})`],
+      ['durable_runs_workflow_status_idx', `${runs} (${q('workflow')}, ${q('status')})`],
+    ];
+    for (const [name, target] of indexes) {
+      try {
+        await runner.query(`CREATE INDEX ${q(name)} ON ${target}`);
+      } catch {
+        /* index already exists */
+      }
     }
   } finally {
     await runner.release();

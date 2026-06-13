@@ -64,6 +64,25 @@ describe('TypeOrmStateStore', () => {
     await dataSource.destroy();
   });
 
+  it('creates indexes for the timer poller and dashboard queries', async () => {
+    const dataSource = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [...ENTITIES],
+      synchronize: false,
+    });
+    await dataSource.initialize();
+    await new TypeOrmStateStore(dataSource).ensureSchema();
+
+    const indexes = (await dataSource.query(
+      `PRAGMA index_list("durable_workflow_runs")`,
+    )) as Array<{ name: string }>;
+    const names = indexes.map((i) => i.name);
+    expect(names).toContain('durable_runs_status_idx'); // timer poller / recovery
+    expect(names).toContain('durable_runs_workflow_status_idx'); // dashboard listRuns
+    await dataSource.destroy();
+  });
+
   it('self-heals a pre-existing table that predates the events column', async () => {
     const dataSource = new DataSource({
       type: 'better-sqlite3',

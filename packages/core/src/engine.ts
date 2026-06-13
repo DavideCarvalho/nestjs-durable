@@ -93,6 +93,12 @@ function unwrapCompletion<T>(payload: unknown, label: string): T {
   return (c as { value: T } | null)?.value as T;
 }
 
+/** A saga undo registered by a completed step, kept with its step name for visibility on failure. */
+interface Compensation {
+  name: string;
+  fn: () => Promise<void>;
+}
+
 export interface WorkflowEngineDeps {
   store: StateStore;
   transport?: Transport;
@@ -114,6 +120,11 @@ export interface WorkflowEngineDeps {
    * `otelTraceparent` from `@dudousxd/nestjs-durable-otel`, or your own context reader. Omit to send none.
    */
   traceparent?: () => string | undefined;
+  /**
+   * Attempts for each saga compensation when the run fails (a transient undo — e.g. a refund API
+   * hiccup — gets another try). Default 1 (no retry). Compensations must be idempotent.
+   */
+  compensationRetries?: number;
 }
 
 /**
@@ -130,6 +141,7 @@ export class WorkflowEngine {
   private readonly leaseMs: number;
   private readonly webhookUrl?: (token: string) => string;
   private readonly traceparent?: () => string | undefined;
+  private readonly compensationRetries: number;
   /** Every registered workflow, keyed by `name@version` — so old versions stay runnable. */
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
@@ -159,6 +171,7 @@ export class WorkflowEngine {
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
+    this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
     this.transport?.onResult(async (result) => {
       // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
       const waiter = this.pending.get(result.stepId);
@@ -530,7 +543,7 @@ export class WorkflowEngine {
 
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
     // Saga compensations registered by completed steps; run in reverse if the run later fails.
-    const compensations: Array<() => Promise<void>> = [];
+    const compensations: Compensation[] = [];
     const ctx = this.makeCtx(run.id, compensations);
     try {
       const output = await fn(ctx, run.input);
@@ -560,14 +573,14 @@ export class WorkflowEngine {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
       };
-      // Saga: undo completed steps in reverse. A compensation that throws is logged-and-skipped so
-      // one bad undo can't strand the rest. (Compensations are best-effort and should be idempotent.)
+      // Saga: undo completed steps in reverse, each retried up to `compensationRetries`. Outcomes
+      // are emitted as `compensate:<step>` step events so a stranded undo is VISIBLE (not silently
+      // swallowed) in the dashboard/telescope; a failing one is still skipped so it can't mask the
+      // original failure or strand the rest. (Compensations should be idempotent.)
       for (let i = compensations.length - 1; i >= 0; i -= 1) {
-        try {
-          await compensations[i]?.();
-        } catch {
-          // a failing compensation must not mask the original failure
-        }
+        const comp = compensations[i];
+        if (!comp) continue;
+        await this.runCompensation(run, comp);
       }
       await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
       this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
@@ -580,7 +593,43 @@ export class WorkflowEngine {
     }
   }
 
-  private makeCtx(runId: string, compensations: Array<() => Promise<void>>): WorkflowCtx {
+  /**
+   * Run one saga compensation, retried up to `compensationRetries`, emitting a `compensate:<step>`
+   * step event for its outcome so a stranded undo is visible. Never throws — a permanently-failing
+   * compensation is skipped so it can't mask the original failure.
+   */
+  private async runCompensation(run: WorkflowRun, comp: Compensation): Promise<void> {
+    const name = `compensate:${comp.name}`;
+    for (let attempt = 1; attempt <= this.compensationRetries; attempt += 1) {
+      const startedAt = Date.now();
+      try {
+        await comp.fn();
+        this.emit({
+          type: 'step.completed',
+          runId: run.id,
+          workflow: run.workflow,
+          name,
+          kind: 'local',
+          durationMs: Date.now() - startedAt,
+        });
+        return;
+      } catch (err) {
+        if (attempt >= this.compensationRetries) {
+          this.emit({
+            type: 'step.failed',
+            runId: run.id,
+            workflow: run.workflow,
+            name,
+            kind: 'local',
+            error: { message: err instanceof Error ? err.message : String(err) },
+            durationMs: Date.now() - startedAt,
+          });
+        }
+      }
+    }
+  }
+
+  private makeCtx(runId: string, compensations: Compensation[]): WorkflowCtx {
     let seq = -1;
     const nextSeq = () => {
       seq += 1;
@@ -605,7 +654,7 @@ export class WorkflowEngine {
       if (existing && existing.status === 'completed') {
         // Register the compensation on replay too, so a saga undoes ALL completed steps — even
         // those done in an earlier (since-suspended) pass — not just the ones run this pass.
-        if (options?.compensate) compensations.push(options.compensate);
+        if (options?.compensate) compensations.push({ name, fn: options.compensate });
         return existing.output as T;
       }
       const maxAttempts = Math.max(1, options?.retries ?? 1);
@@ -627,7 +676,7 @@ export class WorkflowEngine {
             enqueuedAt: startedAt,
             startedAt,
           });
-          if (options?.compensate) compensations.push(options.compensate);
+          if (options?.compensate) compensations.push({ name, fn: options.compensate });
           return output;
         } catch (err) {
           if (err instanceof FatalError || attempt >= maxAttempts) {

@@ -65,6 +65,8 @@ export interface DurableModuleOptions {
    * the distributed trace. Pass `otelTraceparent` from `@dudousxd/nestjs-durable-otel`.
    */
   traceparent?: () => string | undefined;
+  /** Attempts for each saga compensation when a run fails. Default 1 (no retry). Idempotent undos. */
+  compensationRetries?: number;
 }
 
 export interface DurableModuleAsyncOptions {
@@ -117,6 +119,7 @@ export class DurableModule {
               instanceId: opts.instanceId,
               webhookUrl: opts.webhookUrl,
               traceparent: opts.traceparent,
+              compensationRetries: opts.compensationRetries,
             });
             for (const queue of opts.queues ?? []) engine.registerQueue(queue);
             return engine;
