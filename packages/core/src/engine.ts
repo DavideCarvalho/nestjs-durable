@@ -108,6 +108,12 @@ export interface WorkflowEngineDeps {
    * {@link DurableWebhook.url}. Omit if you build URLs yourself from the token.
    */
   webhookUrl?: (token: string) => string;
+  /**
+   * Provide the current W3C `traceparent` to stamp on each dispatched {@link RemoteTask}, so a
+   * worker (including the Python SDK) continues the distributed trace. Keep core OTel-free: supply
+   * `otelTraceparent` from `@dudousxd/nestjs-durable-otel`, or your own context reader. Omit to send none.
+   */
+  traceparent?: () => string | undefined;
 }
 
 /**
@@ -123,6 +129,7 @@ export class WorkflowEngine {
   private readonly instanceId: string;
   private readonly leaseMs: number;
   private readonly webhookUrl?: (token: string) => string;
+  private readonly traceparent?: () => string | undefined;
   /** Every registered workflow, keyed by `name@version` — so old versions stay runnable. */
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
@@ -151,6 +158,7 @@ export class WorkflowEngine {
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.webhookUrl = deps.webhookUrl;
+    this.traceparent = deps.traceparent;
     this.transport?.onResult(async (result) => {
       // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
       const waiter = this.pending.get(result.stepId);
@@ -1006,6 +1014,7 @@ export class WorkflowEngine {
       stepId: id,
       group: step.group,
       input: validInput,
+      traceparent: this.traceparent?.(),
       attempt: 1,
     });
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
@@ -1090,6 +1099,7 @@ export class WorkflowEngine {
         stepId: id,
         group: step.group,
         input: validInput,
+        traceparent: this.traceparent?.(),
         attempt,
       });
       try {

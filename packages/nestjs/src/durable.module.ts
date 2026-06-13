@@ -60,6 +60,11 @@ export interface DurableModuleOptions {
    * workflow with `ctx.call(step, input, { queue: name })` to cap its concurrency / admission rate.
    */
   queues?: QueueConfig[];
+  /**
+   * Provide the current W3C `traceparent` to stamp on dispatched remote tasks, so workers continue
+   * the distributed trace. Pass `otelTraceparent` from `@dudousxd/nestjs-durable-otel`.
+   */
+  traceparent?: () => string | undefined;
 }
 
 export interface DurableModuleAsyncOptions {
@@ -111,6 +116,7 @@ export class DurableModule {
               leaseMs: opts.leaseMs,
               instanceId: opts.instanceId,
               webhookUrl: opts.webhookUrl,
+              traceparent: opts.traceparent,
             });
             for (const queue of opts.queues ?? []) engine.registerQueue(queue);
             return engine;
