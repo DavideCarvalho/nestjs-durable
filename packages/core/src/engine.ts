@@ -7,6 +7,7 @@ import {
   WorkflowSuspended,
 } from './errors';
 import type {
+  ControlPlane,
   DurableWebhook,
   EngineEvent,
   EngineListener,
@@ -102,6 +103,12 @@ interface Compensation {
 export interface WorkflowEngineDeps {
   store: StateStore;
   transport?: Transport;
+  /**
+   * Cross-instance broadcast pub/sub for lifecycle events + cancellation (see {@link ControlPlane}).
+   * Separate from the task `transport`; omit for a single-instance / local-only setup. A transport
+   * that can also broadcast may be passed here as well.
+   */
+  controlPlane?: ControlPlane;
   /** Epoch-ms clock; injectable for tests. Defaults to `Date.now`. */
   clock?: () => number;
   /** Unique id for this engine instance, used for recovery leases. Defaults to a random id. */
@@ -136,6 +143,7 @@ export interface WorkflowEngineDeps {
 export class WorkflowEngine {
   private readonly store: StateStore;
   private readonly transport?: Transport;
+  private readonly controlPlane?: ControlPlane;
   private readonly clock: () => number;
   private readonly instanceId: string;
   private readonly leaseMs: number;
@@ -168,6 +176,7 @@ export class WorkflowEngine {
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
     this.transport = deps.transport;
+    this.controlPlane = deps.controlPlane;
     this.clock = deps.clock ?? Date.now;
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
     this.leaseMs = deps.leaseMs ?? 30_000;
@@ -201,7 +210,7 @@ export class WorkflowEngine {
     // Control plane: re-broadcast lifecycle events from OTHER instances to this instance's
     // subscribers (cross-pod live-tail), and act on cancellations issued elsewhere. A broker may
     // echo our own publish back — ignore those (we already handled them locally) to avoid duplicates.
-    this.transport?.onControl?.((msg) => {
+    this.controlPlane?.onControl((msg) => {
       if (msg.from === this.instanceId) return;
       if (msg.kind === 'event') {
         // `at` may be a string after JSON transit (Redis) — normalize back to a Date.
@@ -265,8 +274,8 @@ export class WorkflowEngine {
   private emit(event: Omit<EngineEvent, 'at'>): void {
     const full: EngineEvent = { ...event, at: new Date() };
     this.deliver(full);
-    if (this.transport?.publishControl) {
-      void this.transport
+    if (this.controlPlane) {
+      void this.controlPlane
         .publishControl({ kind: 'event', event: full, from: this.instanceId })
         .catch(() => {
           // control-plane delivery is best-effort observability; never break execution
@@ -455,8 +464,8 @@ export class WorkflowEngine {
       this.cancelRequested.add(runId);
       const result = await this.resume(runId);
       this.notifyCancelled(runId);
-      if (this.transport?.publishControl) {
-        void this.transport
+      if (this.controlPlane) {
+        void this.controlPlane
           .publishControl({ kind: 'cancel', runId, from: this.instanceId })
           .catch(() => undefined);
       }
@@ -469,8 +478,8 @@ export class WorkflowEngine {
     // actually running this run learns of it and can abort cooperatively (the store already records
     // `cancelled`, but a busy worker won't re-read it).
     this.notifyCancelled(runId);
-    if (this.transport?.publishControl) {
-      void this.transport
+    if (this.controlPlane) {
+      void this.controlPlane
         .publishControl({ kind: 'cancel', runId, from: this.instanceId })
         .catch(() => undefined);
     }

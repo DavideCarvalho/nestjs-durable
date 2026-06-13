@@ -1,5 +1,6 @@
 import {
   type ControlMessage,
+  type ControlPlane,
   type Heartbeat,
   type RemoteTask,
   type StepHandler,
@@ -28,7 +29,7 @@ export interface BullMQTransportOptions {
  * `handle()`s for its group). The wire payload is the documented `RemoteTask`/`StepResult` JSON,
  * so non-Node workers interoperate.
  */
-export class BullMQTransport implements Transport {
+export class BullMQTransport implements Transport, ControlPlane {
   private readonly connection: ConnectionOptions;
   private readonly group?: string;
   private readonly prefix: string;

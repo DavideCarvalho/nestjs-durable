@@ -229,22 +229,26 @@ export interface Transport {
   onResult(handler: (result: StepResult) => Promise<void>): void;
   /** worker → engine: liveness signal for an in-flight long step. */
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void;
-  /**
-   * Optional **control plane** — a broadcast pub/sub across ALL engine instances (every pod), as
-   * opposed to `dispatch`/`onResult` which are point-to-point work queues. It carries things every
-   * instance may need to see regardless of who's running the run: lifecycle events (so a
-   * dashboard-only pod can live-tail a run executing on a worker pod) and cancellation (so the pod
-   * actually running a run learns it was cancelled elsewhere). In-process transports broadcast
-   * locally; a cross-process transport (BullMQ) fans out over its broker (Redis pub/sub). Omit on
-   * transports that can't broadcast — the engine degrades to local-only events.
-   */
-  publishControl?(msg: ControlMessage): Promise<void>;
-  onControl?(handler: (msg: ControlMessage) => void): void;
 }
 
-/** A message on the {@link Transport} control plane — see `publishControl`/`onControl`. `from` is
- *  the originating engine's `instanceId`, so a broker that echoes a publish back to its own
- *  subscriber (e.g. Redis pub/sub) can be deduped by the originator. */
+/**
+ * The **control plane** — a broadcast pub/sub across ALL engine instances (every pod), separate
+ * from the {@link Transport}'s point-to-point work queues (`dispatch`/`onResult`). It carries what
+ * every instance may need regardless of who runs a given run: lifecycle events (so a dashboard-only
+ * pod can live-tail a run executing on a worker pod) and cancellation (so the pod actually running a
+ * run learns it was cancelled elsewhere). In-process implementations broadcast locally; a
+ * cross-process one (BullMQ) fans out over its broker (Redis pub/sub). Give the engine a
+ * `controlPlane` to enable cross-instance events/cancellation; omit it and the engine is local-only.
+ * A transport that can broadcast may implement this too and be passed as both.
+ */
+export interface ControlPlane {
+  publishControl(msg: ControlMessage): Promise<void>;
+  onControl(handler: (msg: ControlMessage) => void): void;
+}
+
+/** A message on the {@link ControlPlane}. `from` is the originating engine's `instanceId`, so a
+ *  broker that echoes a publish back to its own subscriber (e.g. Redis pub/sub) can be deduped by
+ *  the originator. */
 export type ControlMessage = { from?: string } & (
   | { kind: 'event'; event: EngineEvent }
   | { kind: 'cancel'; runId: string }

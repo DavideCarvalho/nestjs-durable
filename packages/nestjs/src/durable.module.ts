@@ -1,4 +1,5 @@
 import {
+  type ControlPlane,
   DURABLE_OPTIONS,
   type QueueConfig,
   type ScheduledWorkflow,
@@ -15,9 +16,23 @@ import { TimerPoller } from './timer-poller';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
 
+/** True when `x` can act as a control plane (broadcast pub/sub) — e.g. a broadcast-capable transport. */
+function isControlPlane(x: unknown): x is ControlPlane {
+  return (
+    !!x &&
+    typeof (x as ControlPlane).publishControl === 'function' &&
+    typeof (x as ControlPlane).onControl === 'function'
+  );
+}
+
 export interface DurableModuleOptions {
   store: StateStore;
   transport?: Transport;
+  /**
+   * Cross-instance broadcast pub/sub (lifecycle events + cancellation). Defaults to the `transport`
+   * when it can broadcast (event-emitter, BullMQ); set explicitly to use a dedicated control plane.
+   */
+  controlPlane?: ControlPlane;
   /** Interval (ms) for the durable-timer poller. `0` disables it. Defaults to 1000. */
   timerPollMs?: number;
   /**
@@ -115,6 +130,9 @@ export class DurableModule {
             const engine = new WorkflowEngine({
               store,
               transport: transport ?? undefined,
+              // A broadcast-capable transport doubles as the control plane unless one is given.
+              controlPlane:
+                opts.controlPlane ?? (isControlPlane(transport) ? transport : undefined),
               leaseMs: opts.leaseMs,
               instanceId: opts.instanceId,
               webhookUrl: opts.webhookUrl,
