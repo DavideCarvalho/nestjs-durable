@@ -1,5 +1,11 @@
 import { parseDuration } from './duration';
-import { FatalError, RemoteStepTimeout, SignalTimeoutError, WorkflowSuspended } from './errors';
+import {
+  FatalError,
+  NonDeterminismError,
+  RemoteStepTimeout,
+  SignalTimeoutError,
+  WorkflowSuspended,
+} from './errors';
 import type {
   EngineEvent,
   EngineListener,
@@ -23,6 +29,15 @@ type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
 /** Deterministic signal token a breakpoint suspends on — derived from its logical position. */
 const breakpointToken = (runId: string, seq: number): string => `bp:${runId}:${seq}`;
+
+/** Delay in ms before the next retry of a local step, per its `StepOptions` backoff config. */
+function backoffDelay(attempt: number, options?: StepOptions): number {
+  const base = options?.backoffMs ?? 0;
+  if (base <= 0) return 0;
+  const raw = options?.backoff === 'exp' ? base * 2 ** (attempt - 1) : base;
+  const capped = options?.backoffMaxMs ? Math.min(raw, options.backoffMaxMs) : raw;
+  return options?.jitter ? Math.round(capped * (0.5 + Math.random() * 0.5)) : capped;
+}
 
 /** A breakpoint checkpoint's `name` is `breakpoint` (or `breakpoint:<label>`). This name — not the
  *  reused `signal` kind — is the explicit marker the dashboard and `continue()` detect it by. */
@@ -198,6 +213,12 @@ export class WorkflowEngine {
   async resume(runId: string): Promise<RunResult> {
     const run = await this.store.getRun(runId);
     if (!run) throw new Error(`run ${runId} not found`);
+    // A definitively-finished run must not be re-executed (e.g. a worker result landing after the
+    // run was cancelled, or a duplicate resume) — that would replay the body and clobber the
+    // terminal state. `failed` is intentionally NOT terminal here: retry resumes a failed run.
+    if (run.status === 'cancelled' || run.status === 'completed') {
+      return { runId, status: run.status, output: run.output, error: run.error };
+    }
     // Pin to the version the run STARTED on — replay is positional, so running a changed
     // workflow body against old checkpoints would corrupt the run.
     const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
@@ -484,6 +505,9 @@ export class WorkflowEngine {
     ): Promise<T> => {
       const current = nextSeq();
       const existing = await store.getCheckpoint(runId, current);
+      if (existing && existing.name !== name) {
+        throw new NonDeterminismError(runId, current, name, existing.name);
+      }
       if (existing && existing.status === 'completed') {
         // Register the compensation on replay too, so a saga undoes ALL completed steps — even
         // those done in an earlier (since-suspended) pass — not just the ones run this pass.
@@ -529,6 +553,9 @@ export class WorkflowEngine {
             });
             throw err;
           }
+          // Wait out the backoff before the next attempt (no-op when backoffMs is unset).
+          const wait = backoffDelay(attempt, options);
+          if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
         }
       }
     };
@@ -627,6 +654,13 @@ export class WorkflowEngine {
       throw new WorkflowSuspended();
     };
 
+    // Deterministic non-deterministic sources: each is a checkpointed local step, so the value is
+    // captured on the first run and replayed verbatim afterwards (a raw Date.now()/Math.random()
+    // inside a workflow would differ across replays and corrupt the run).
+    const now = () => step('now', async () => this.clock());
+    const random = () => step('random', async () => Math.random());
+    const uuid = () => step('uuid', async () => globalThis.crypto.randomUUID());
+
     return {
       runId,
       step,
@@ -635,6 +669,9 @@ export class WorkflowEngine {
       task,
       child,
       breakpoint,
+      now,
+      random,
+      uuid,
       call: <TInput, TOutput>(remote: RemoteStepDef<TInput, TOutput>, input: TInput) =>
         this.callRemote(runId, nextSeq(), remote, input),
     };
@@ -699,6 +736,9 @@ export class WorkflowEngine {
     input: TInput,
   ): Promise<TOutput> {
     const existing = await this.store.getCheckpoint(runId, seq);
+    if (existing && existing.name !== step.name) {
+      throw new NonDeterminismError(runId, seq, step.name, existing.name);
+    }
     if (existing?.status === 'completed') return existing.output as TOutput;
     if (existing?.status === 'failed') throw new RemoteStepError(existing.error);
     if (!this.transport) throw new Error('remote steps require a Transport');
@@ -748,6 +788,10 @@ export class WorkflowEngine {
   private async completeRemoteResult(result: StepResult): Promise<void> {
     const cp = await this.store.getCheckpoint(result.runId, result.seq);
     if (!cp || cp.status !== 'pending') return;
+    // Drop a late result for a run that was cancelled/finished meanwhile — don't complete the step
+    // or resume (the run is already terminal). This is the engine side of cooperative cancellation.
+    const run = await this.store.getRun(result.runId);
+    if (run && (run.status === 'cancelled' || run.status === 'completed')) return;
     const finishedAt = new Date();
     const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
     await this.store.saveCheckpoint({

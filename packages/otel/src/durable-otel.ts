@@ -45,7 +45,8 @@ export function attachDurableOtel(engine: WorkflowEngine, options: DurableOtelOp
         roots.set(event.runId, span);
         break;
       }
-      case 'step.completed': {
+      case 'step.completed':
+      case 'step.failed': {
         const parent = roots.get(event.runId);
         const ctx = parent ? trace.setSpan(context.active(), parent) : context.active();
         const startTime =
@@ -62,6 +63,9 @@ export function attachDurableOtel(engine: WorkflowEngine, options: DurableOtelOp
           },
           ctx,
         );
+        if (event.type === 'step.failed') {
+          span.setStatus({ code: SpanStatusCode.ERROR, message: event.error?.message });
+        }
         span.end(event.at);
         break;
       }

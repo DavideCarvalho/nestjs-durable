@@ -240,9 +240,14 @@ export type BackoffStrategy = 'fixed' | 'exp';
 export interface StepOptions {
   /** Max attempts before the step (and run) fails. */
   retries?: number;
+  /** How the delay between retries grows: `fixed` (constant) or `exp` (doubles each attempt). */
   backoff?: BackoffStrategy;
-  /** Base delay in ms for backoff. */
+  /** Base delay in ms between retries. Omit (or 0) to retry with no delay. */
   backoffMs?: number;
+  /** Upper bound on the (exponential) backoff delay. */
+  backoffMaxMs?: number;
+  /** Add random jitter (50–100% of the computed delay) to avoid thundering-herd retries. */
+  jitter?: boolean;
   /**
    * Liveness window for a **remote** step (`ctx.call`): if the worker produces no result and no
    * heartbeat within this many ms, the engine presumes it dead and fails the dispatch with a
@@ -331,6 +336,19 @@ export interface WorkflowCtx {
    * `if (cfg.breakAfterExtraction) await ctx.breakpoint('after-extraction')`.
    */
   breakpoint(label?: string): Promise<void>;
+  /**
+   * Deterministic wall-clock (epoch ms): records the time on the first run and replays the SAME
+   * value afterwards. Use this instead of `Date.now()` inside a workflow — a raw `Date.now()` returns
+   * a different value on every replay, which silently corrupts a durable run.
+   */
+  now(): Promise<number>;
+  /**
+   * Deterministic random in `[0, 1)`: recorded once, then replayed. Use instead of `Math.random()`
+   * (same replay-safety reason as {@link now}).
+   */
+  random(): Promise<number>;
+  /** Deterministic UUID v4: recorded once, then replayed. Use instead of `crypto.randomUUID()`. */
+  uuid(): Promise<string>;
 }
 
 /** Result of executing or resuming a workflow run. */
