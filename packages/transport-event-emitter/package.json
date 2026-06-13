@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-transport-event-emitter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "In-process Transport for nestjs-durable backed by @nestjs/event-emitter",
   "license": "MIT",
   "author": "Davide Carvalho",

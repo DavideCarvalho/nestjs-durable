@@ -13,7 +13,12 @@ const task = (over: Partial<RemoteTask> = {}): RemoteTask => ({
   ...over,
 });
 
-const tick = () => new Promise((resolve) => setImmediate(resolve));
+// The transport delivers results on a later tick (so a durable ctx.call suspends first); poll.
+async function waitFor(predicate: () => boolean) {
+  for (let i = 0; i < 50 && !predicate(); i += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
 
 describe('EventEmitterTransport', () => {
   it('routes a dispatched task to a registered handler and delivers the result', async () => {
@@ -28,7 +33,7 @@ describe('EventEmitterTransport', () => {
     });
 
     await transport.dispatch(task());
-    await tick();
+    await waitFor(() => results.length > 0);
 
     expect(results).toHaveLength(1);
     expect(results[0]?.status).toBe('completed');
@@ -48,7 +53,7 @@ describe('EventEmitterTransport', () => {
     });
 
     await transport.dispatch(task());
-    await tick();
+    await waitFor(() => results.length > 0);
 
     expect(results[0]?.status).toBe('failed');
     expect(results[0]?.error?.message).toBe('declined');

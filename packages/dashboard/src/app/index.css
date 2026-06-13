@@ -71,6 +71,10 @@ body {
 .s-cancelled {
   color: #71717a;
 }
+/* A remote step dispatched and awaiting its worker result (in-flight). */
+.s-pending {
+  color: #fbbf24;
+}
 
 .dot {
   width: 7px;

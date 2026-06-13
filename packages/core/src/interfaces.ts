@@ -52,7 +52,11 @@ export interface StepCheckpoint {
   kind: StepKind;
   /** Stable id passed to remote workers so they can dedupe a re-delivered task. */
   stepId: string;
-  status: 'completed' | 'failed';
+  /**
+   * `pending` = a remote step dispatched and awaiting its worker result (the run is durably
+   * suspended, not held in memory); it becomes `completed`/`failed` when the result arrives.
+   */
+  status: 'pending' | 'completed' | 'failed';
   /** What the step was called with — the `ctx.call` args for a remote step (a local step has none). */
   input?: unknown;
   output?: unknown;

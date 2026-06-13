@@ -81,6 +81,7 @@ export function StepDetailPanel({
   onClose: () => void;
 }) {
   const failed = step.status === 'failed';
+  const pending = step.status === 'pending'; // dispatched, awaiting its worker result (in-flight)
   const Icon = iconFor(step.kind);
   const sinceStart = fmtDur(run.createdAt, step.startedAt);
   // Queue-wait: how long the step sat dispatched before a worker picked it up. Only meaningful for
@@ -98,7 +99,9 @@ export function StepDetailPanel({
               className={`grid h-6 w-6 shrink-0 place-items-center rounded-md ${
                 failed
                   ? 'bg-red-500/15 text-red-300'
-                  : 'bg-emerald-500/15 text-emerald-300'
+                  : pending
+                    ? 'bg-amber-500/15 text-amber-300'
+                    : 'bg-emerald-500/15 text-emerald-300'
               }`}
             >
               <Icon width={13} height={13} />
@@ -127,7 +130,10 @@ export function StepDetailPanel({
           {queueMs >= 1 && (
             <Field k="queued" v={<span className="text-sky-300">{fmtMs(queueMs)}</span>} />
           )}
-          <Field k="duration" v={fmtDur(step.startedAt, step.finishedAt)} />
+          <Field
+            k="duration"
+            v={pending ? <span className="text-amber-300">running…</span> : fmtDur(step.startedAt, step.finishedAt)}
+          />
           <Field
             k="attempts"
             v={

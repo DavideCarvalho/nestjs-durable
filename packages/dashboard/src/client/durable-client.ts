@@ -19,7 +19,8 @@ export interface StepCheckpoint {
   seq: number;
   name: string;
   kind: StepKind;
-  status: 'completed' | 'failed';
+  /** `pending` = a remote step dispatched and awaiting its worker result (in-flight). */
+  status: 'pending' | 'completed' | 'failed';
   /** What the step was called with (a remote step's `ctx.call` args). */
   input?: unknown;
   output?: unknown;

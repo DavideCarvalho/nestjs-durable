@@ -12,6 +12,20 @@ const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
   __remote: true,
 };
 
+/**
+ * A durable `ctx.call` SUSPENDS the run, then the worker result resumes it asynchronously (the
+ * InMemoryTransport delivers on `setImmediate`). Drive those deferred results + resumes until the
+ * run reaches a terminal state.
+ */
+async function settle(store: InMemoryStateStore, runId: string) {
+  for (let i = 0; i < 100; i += 1) {
+    await new Promise((r) => setImmediate(r));
+    const run = await store.getRun(runId);
+    if (run && run.status !== 'running' && run.status !== 'suspended') return run;
+  }
+  throw new Error(`run ${runId} did not settle`);
+}
+
 describe('WorkflowEngine — remote steps', () => {
   it('dispatches a remote step over the transport and checkpoints its result', async () => {
     const store = new InMemoryStateStore();
@@ -26,14 +40,18 @@ describe('WorkflowEngine — remote steps', () => {
       return charge.chargeId;
     });
 
-    const result = await engine.start('checkout', {}, 'run1');
+    // The call suspends the run durably; it completes when the worker result lands.
+    const started = await engine.start('checkout', {}, 'run1');
+    expect(started.status).toBe('suspended');
 
-    expect(result.status).toBe('completed');
-    expect(result.output).toBe('ch_42');
+    const run = await settle(store, 'run1');
+    expect(run.status).toBe('completed');
+    expect(run.output).toBe('ch_42');
 
     const checkpoints = await store.listCheckpoints('run1');
     expect(checkpoints).toHaveLength(1);
     expect(checkpoints[0]?.kind).toBe('remote');
+    expect(checkpoints[0]?.status).toBe('completed');
     expect(checkpoints[0]?.name).toBe('payments.charge-card');
   });
 
@@ -58,8 +76,9 @@ describe('WorkflowEngine — remote steps', () => {
     });
 
     await engine.start('checkout', {}, 'run1');
+    await settle(store, 'run1');
 
-    // A remote step announces itself as in-flight before it completes.
+    // A remote step announces itself as in-flight (on dispatch) before it completes (on result).
     expect(events).toEqual(['step.started', 'step.completed']);
     expect(observedQueueMs).toBeGreaterThanOrEqual(0);
 
@@ -95,14 +114,16 @@ describe('WorkflowEngine — remote steps', () => {
       return charge.chargeId;
     });
 
-    const first = await engine.start('checkout', {}, 'run1');
-    expect(first.status).toBe('failed');
+    await engine.start('checkout', {}, 'run1'); // suspends at the call
+    // The result resumes the run; the local `after` step then throws → the run fails.
+    const afterFirst = await settle(store, 'run1');
+    expect(afterFirst.status).toBe('failed');
+    expect(dispatches).toBe(1);
 
+    // Replay from checkpoints: the remote step is already completed, so it must NOT re-dispatch.
     const second = await engine.resume('run1');
     expect(second.status).toBe('completed');
     expect(second.output).toBe('ch_42');
-
-    // The remote step completed on the first attempt; resume must not dispatch it again.
     expect(dispatches).toBe(1);
   });
 });

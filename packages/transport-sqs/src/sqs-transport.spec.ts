@@ -22,6 +22,17 @@ const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
   __remote: true,
 };
 
+/** A durable ctx.call suspends; poll the store until the SQS round-trip resumes it to terminal. */
+async function settle(store: InMemoryStateStore, runId: string, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const run = await store.getRun(runId);
+    if (run && run.status !== 'running' && run.status !== 'suspended') return run;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`run ${runId} did not settle`);
+}
+
 let sqsUp = false;
 beforeAll(async () => {
   const probe = new SQSClient(clientConfig);
@@ -44,13 +55,15 @@ describe('SqsTransport (real ElasticMQ)', () => {
       chargeId: `ch_${input.amount}`,
     }));
 
-    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (c) => {
       const charge = await c.call(chargeCard, { amount: 7 });
       return charge.chargeId;
     });
 
-    const result = await engine.start('checkout', {}, 'run1');
+    await engine.start('checkout', {}, 'run1');
+    const result = await settle(store, 'run1');
     expect(result.status).toBe('completed');
     expect(result.output).toBe('ch_7');
 
@@ -65,10 +78,12 @@ describe('SqsTransport (real ElasticMQ)', () => {
       throw new Error('declined');
     });
 
-    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (c) => c.call(chargeCard, { amount: 1 }));
 
-    const result = await engine.start('checkout', {}, 'run-f');
+    await engine.start('checkout', {}, 'run-f');
+    const result = await settle(store, 'run-f');
     expect(result.status).toBe('failed');
 
     await transport.close();

@@ -16,7 +16,11 @@ export class InMemoryTransport implements Transport {
 
   async dispatch(task: RemoteTask): Promise<void> {
     if (!this.resultHandler) throw new Error('no result handler registered');
-    await this.resultHandler(await runStepHandler(task, this.handlers.get(task.name)));
+    const result = await runStepHandler(task, this.handlers.get(task.name));
+    // Deliver the result ASYNCHRONOUSLY, not inline: a durable `ctx.call` suspends the run right
+    // after dispatch, so the result must land AFTER that unwinds (else the resume re-enters
+    // mid-suspend). Real brokers are async; this mirrors them.
+    setImmediate(() => void this.resultHandler?.(result));
   }
 
   onResult(handler: (result: StepResult) => Promise<void>): void {

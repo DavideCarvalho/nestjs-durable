@@ -52,6 +52,9 @@ export class EventEmitterTransport implements Transport {
   private async process(task: RemoteTask): Promise<void> {
     const handler = this.handlers.get(task.name);
     if (!handler) return; // another subscriber may own this step name — stay silent, don't fail it
-    this.emitter.emit(RESULT_EVENT, await runStepHandler(task, handler));
+    const result = await runStepHandler(task, handler);
+    // Emit the result on a later tick: a durable `ctx.call` suspends the run right after dispatch,
+    // so the result must land AFTER that unwinds (else the resume re-enters mid-suspend).
+    setImmediate(() => this.emitter.emit(RESULT_EVENT, result));
   }
 }

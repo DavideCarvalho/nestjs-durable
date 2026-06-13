@@ -9,6 +9,7 @@ import type {
   StepError,
   StepKind,
   StepOptions,
+  StepResult,
   Transport,
   WorkflowCtx,
   WorkflowRun,
@@ -103,14 +104,20 @@ export class WorkflowEngine {
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.transport?.onResult(async (result) => {
+      // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
       const waiter = this.pending.get(result.stepId);
-      if (!waiter) return;
-      this.pending.delete(result.stepId);
-      if (result.status === 'completed') {
-        waiter.resolve({ output: result.output, startedAt: result.startedAt });
-      } else {
-        waiter.reject(new RemoteStepError(result.error));
+      if (waiter) {
+        this.pending.delete(result.stepId);
+        if (result.status === 'completed') {
+          waiter.resolve({ output: result.output, startedAt: result.startedAt });
+        } else {
+          waiter.reject(new RemoteStepError(result.error));
+        }
+        return;
       }
+      // Durable path: no in-memory waiter (the step suspended the run, possibly on another
+      // instance) → complete the checkpoint and resume the run here.
+      await this.completeRemoteResult(result);
     });
     // A heartbeat for an in-flight long step resets its liveness window (see callRemote).
     this.transport?.onHeartbeat(async (beat) => {
@@ -601,11 +608,87 @@ export class WorkflowEngine {
     input: TInput,
   ): Promise<TOutput> {
     const existing = await this.store.getCheckpoint(runId, seq);
-    if (existing && existing.status === 'completed') {
-      return existing.output as TOutput;
-    }
+    if (existing?.status === 'completed') return existing.output as TOutput;
+    if (existing?.status === 'failed') throw new RemoteStepError(existing.error);
     if (!this.transport) throw new Error('remote steps require a Transport');
+    // A step with a liveness `timeoutMs` keeps the in-memory await + heartbeat path (re-dispatch a
+    // presumed-dead worker). Without one, the call SUSPENDS DURABLY: dispatch, persist a `pending`
+    // checkpoint, and let the result resume the run on whichever instance receives it — so a worker
+    // pod can scale down or crash mid-step without losing the run or re-running completed work.
+    if (step.timeoutMs) return this.callRemoteInMemory(runId, seq, step, input);
+    if (existing?.status === 'pending') throw new WorkflowSuspended(); // dispatched; keep waiting
 
+    const validInput = step.input.parse(input);
+    const id = stepId(runId, seq);
+    const enqueuedAt = new Date();
+    // Persist the pending checkpoint BEFORE dispatching, so a fast result always finds it to complete.
+    await this.store.saveCheckpoint({
+      runId,
+      seq,
+      name: step.name,
+      kind: 'remote',
+      stepId: id,
+      status: 'pending',
+      input: validInput,
+      attempts: 1,
+      workerGroup: step.group,
+      enqueuedAt,
+      startedAt: enqueuedAt, // placeholders until the worker result lands
+      finishedAt: enqueuedAt,
+    });
+    await this.transport.dispatch({
+      runId,
+      seq,
+      name: step.name,
+      stepId: id,
+      group: step.group,
+      input: validInput,
+      attempt: 1,
+    });
+    this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
+    throw new WorkflowSuspended();
+  }
+
+  /**
+   * Complete a durable remote step from its worker result and resume the run — runs on whichever
+   * instance receives the result (the dispatching one may be gone), so the run is crash/scale-safe.
+   * A no-op if the checkpoint isn't `pending` (a duplicate or late delivery).
+   */
+  private async completeRemoteResult(result: StepResult): Promise<void> {
+    const cp = await this.store.getCheckpoint(result.runId, result.seq);
+    if (!cp || cp.status !== 'pending') return;
+    const finishedAt = new Date();
+    const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
+    await this.store.saveCheckpoint({
+      ...cp,
+      status: result.status,
+      output: result.status === 'completed' ? result.output : cp.output,
+      error: result.error,
+      startedAt,
+      finishedAt,
+    });
+    this.emit({
+      type: result.status === 'completed' ? 'step.completed' : 'step.failed',
+      runId: result.runId,
+      seq: result.seq,
+      name: cp.name,
+      kind: cp.kind,
+      output: result.output,
+      error: result.error,
+      queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
+      durationMs: finishedAt.getTime() - startedAt.getTime(),
+    });
+    await this.resume(result.runId);
+  }
+
+  /** In-memory await path for a remote step with a liveness `timeoutMs` (re-dispatch on timeout). */
+  private async callRemoteInMemory<TInput, TOutput>(
+    runId: string,
+    seq: number,
+    step: RemoteStepDef<TInput, TOutput>,
+    input: TInput,
+  ): Promise<TOutput> {
+    if (!this.transport) throw new Error('remote steps require a Transport');
     const validInput = step.input.parse(input);
     const id = stepId(runId, seq);
     const enqueuedAt = new Date();
