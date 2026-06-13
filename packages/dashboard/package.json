@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-dashboard",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Embedded control plane (runs, step timeline, retry/cancel) for nestjs-durable — bundled React SPA served by NestJS",
   "license": "MIT",
   "author": "Davide Carvalho",
@@ -17,13 +17,18 @@
       "types": "./dist/server/index.d.ts",
       "import": "./dist/server/index.js",
       "default": "./dist/server/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/durable-client.d.ts",
+      "import": "./dist/client/durable-client.js",
+      "default": "./dist/client/durable-client.js"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "vite build && tsc -p tsconfig.server.json",
+    "build": "vite build && tsc -p tsconfig.server.json && tsc -p tsconfig.client.json",
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.app.json --noEmit"
   },
   "peerDependencies": {

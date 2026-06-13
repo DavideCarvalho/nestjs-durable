@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.4.1
+
+### Patch Changes
+
+- Fix the `./client` SDK export: the build now rebuilds `dist/client` (it was stale — shipping the pre-0.2.0 `StepCheckpoint` with no `input`/`events`/`pending`) and `package.json` declares the `./client` subpath export so `@dudousxd/nestjs-durable-dashboard/client` resolves with the current types (`StepEvent`, `StepCheckpoint.events`, the `pending` status).
+
 ## 0.4.0
 
 ### Minor Changes
