@@ -38,6 +38,9 @@ export class WorkflowRegistrar
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
+    // Only the worker role recovers runs left incomplete by a crash/deploy. A dashboard-only
+    // instance (`worker: false`) must not pick up and re-run workflows — leave that to the workers.
+    if (this.options.worker === false) return;
     await this.engine.recoverIncomplete();
   }
 

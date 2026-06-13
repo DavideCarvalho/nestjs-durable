@@ -23,6 +23,9 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
+    // Only the worker role drives suspended runs forward. A dashboard-only instance
+    // (`worker: false`) must not resume timers — leave that to the workers.
+    if (this.options.worker === false) return;
     await this.poll();
     const intervalMs = this.options.timerPollMs ?? 1_000;
     if (intervalMs > 0) {

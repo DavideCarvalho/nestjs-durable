@@ -1,7 +1,8 @@
-import { TRANSPORT, type Transport } from '@dudousxd/nestjs-durable-core';
+import { DURABLE_OPTIONS, TRANSPORT, type Transport } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable, type OnModuleInit } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { getDurableStepMeta } from './decorators';
+import type { DurableModuleOptions } from './durable.module';
 
 /** A transport that can run step handlers in-process (e.g. the event-emitter transport). */
 interface LocalTaskHandling {
@@ -23,9 +24,13 @@ export class DurableStepRegistrar implements OnModuleInit {
     private readonly discovery: DiscoveryService,
     private readonly metadataScanner: MetadataScanner,
     @Inject(TRANSPORT) private readonly transport: Transport | null,
+    @Inject(DURABLE_OPTIONS) private readonly options: DurableModuleOptions,
   ) {}
 
   onModuleInit(): void {
+    // A dashboard/dispatch-only instance (`worker: false`) must not consume the queue — receiving
+    // and running step tasks is exactly the worker role we're switching off here.
+    if (this.options.worker === false) return;
     if (!supportsHandle(this.transport)) return;
     const transport = this.transport;
 

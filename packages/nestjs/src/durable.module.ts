@@ -30,6 +30,13 @@ export interface DurableModuleOptions {
   leaseMs?: number;
   /** Unique id for this instance (for leases). Defaults to a random id. */
   instanceId?: string;
+  /**
+   * Whether this instance plays the **worker** role: register `@DurableStep` handlers (consume the
+   * transport), recover incomplete runs on boot, and poll due timers. Defaults to `true`. Set
+   * `false` for a **dashboard/dispatch-only** instance (e.g. an API pod) that mounts the control
+   * plane and reads the store but must not process or recover workflows — leave that to the workers.
+   */
+  worker?: boolean;
   /** Max ms to wait for in-flight runs on shutdown before exiting. Defaults to 10000. */
   shutdownTimeoutMs?: number;
 }
