@@ -51,6 +51,15 @@ export class DashboardService {
   }
 
   /**
+   * Deliver a `ctx.webhook()` callback: turn an inbound POST (token + body) into the signal the
+   * waiting run is parked on. Returns the run result, or `null` if no run waits on that token (a
+   * stale/duplicate callback) — a safe no-op the controller maps to 404.
+   */
+  deliverWebhook(token: string, body: unknown): Promise<RunResult | null> {
+    return this.engine.signal(token, body);
+  }
+
+  /**
    * Live stream of a run's lifecycle events for SSE. Backed by `engine.subscribe`, which — when the
    * transport has a control plane — receives events from EVERY instance, so a dashboard-only pod
    * tails a run executing on a worker pod. Without a control plane it only sees same-process events.

@@ -47,6 +47,13 @@ export interface DurableModuleOptions {
    * optional `cron-parser` peer dependency.
    */
   schedules?: ScheduledWorkflow[];
+  /**
+   * Build the public callback URL for a `ctx.webhook()` token, e.g.
+   * ``(t) => `https://api.example.com/durable/api/webhooks/${t}` ``. Populates `DurableWebhook.url`
+   * so a step can hand the URL to a third party. The dashboard's `POST webhooks/:token` receives the
+   * callback. Omit to build URLs yourself from the token.
+   */
+  webhookUrl?: (token: string) => string;
 }
 
 export interface DurableModuleAsyncOptions {
@@ -97,6 +104,7 @@ export class DurableModule {
               transport: transport ?? undefined,
               leaseMs: opts.leaseMs,
               instanceId: opts.instanceId,
+              webhookUrl: opts.webhookUrl,
             }),
           inject: [STATE_STORE, TRANSPORT, DURABLE_OPTIONS],
         },

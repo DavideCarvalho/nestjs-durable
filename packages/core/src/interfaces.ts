@@ -298,6 +298,24 @@ export interface RemoteStepDef<TInput = unknown, TOutput = unknown> extends Step
 }
 
 /**
+ * A durable webhook handle minted by {@link WorkflowCtx.webhook}. Hand `url` to a third party,
+ * then `await wait()` — the run suspends with zero compute until the external system POSTs the
+ * callback (delivered as `engine.signal(token, body)`), and resumes with the body.
+ */
+export interface DurableWebhook<TPayload = unknown> {
+  /** Deterministic signal token (`wh:<runId>:<seq>`) the callback delivers on — stable across replay. */
+  readonly token: string;
+  /**
+   * Public callback URL for `token`, built by the engine's `webhookUrl` option. Hand this to the
+   * third party. `undefined` when no builder is configured (use {@link DurableWebhook.token} to
+   * build your own).
+   */
+  readonly url?: string;
+  /** Suspend until the callback arrives, then resume with its payload. */
+  wait(): Promise<TPayload>;
+}
+
+/**
  * The context handed to a workflow function. Every interaction with the outside world goes
  * through it so the engine can checkpoint — the workflow body itself stays deterministic.
  */
@@ -355,6 +373,14 @@ export interface WorkflowCtx {
    * `if (cfg.breakAfterExtraction) await ctx.breakpoint('after-extraction')`.
    */
   breakpoint(label?: string): Promise<void>;
+  /**
+   * Mint a durable webhook: returns a handle with a deterministic `token` and (if the engine has a
+   * `webhookUrl` builder) a public `url`. Hand the url to a third party — inside a `ctx.step` — then
+   * `await handle.wait()` to suspend with zero compute until they POST the callback (the dashboard
+   * turns that POST into `engine.signal(token, body)`). The first-class, replay-safe version of
+   * "expose a callback URL and wait for it".
+   */
+  webhook<TPayload>(): DurableWebhook<TPayload>;
   /**
    * Deterministic wall-clock (epoch ms): records the time on the first run and replays the SAME
    * value afterwards. Use this instead of `Date.now()` inside a workflow — a raw `Date.now()` returns

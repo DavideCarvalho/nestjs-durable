@@ -7,6 +7,7 @@ import {
   WorkflowSuspended,
 } from './errors';
 import type {
+  DurableWebhook,
   EngineEvent,
   EngineListener,
   RemoteStepDef,
@@ -98,6 +99,12 @@ export interface WorkflowEngineDeps {
   instanceId?: string;
   /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */
   leaseMs?: number;
+  /**
+   * Build the public callback URL for a `ctx.webhook()` token (e.g.
+   * ``(t) => `https://api.example.com/durable/webhooks/${t}` ``). Populates
+   * {@link DurableWebhook.url}. Omit if you build URLs yourself from the token.
+   */
+  webhookUrl?: (token: string) => string;
 }
 
 /**
@@ -112,6 +119,7 @@ export class WorkflowEngine {
   private readonly clock: () => number;
   private readonly instanceId: string;
   private readonly leaseMs: number;
+  private readonly webhookUrl?: (token: string) => string;
   /** Every registered workflow, keyed by `name@version` — so old versions stay runnable. */
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
@@ -133,6 +141,7 @@ export class WorkflowEngine {
     this.clock = deps.clock ?? Date.now;
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
     this.leaseMs = deps.leaseMs ?? 30_000;
+    this.webhookUrl = deps.webhookUrl;
     this.transport?.onResult(async (result) => {
       // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
       const waiter = this.pending.get(result.stepId);
@@ -713,6 +722,21 @@ export class WorkflowEngine {
       throw new WorkflowSuspended();
     };
 
+    // A durable webhook reserves a logical position NOW to mint a stable token, so the url can be
+    // handed to a third party before `wait()` suspends. `wait()` then parks on that same position
+    // until the callback lands as engine.signal(token, body) — single position, replay-safe.
+    const webhook = <T>(): DurableWebhook<T> => {
+      const current = nextSeq();
+      const token = `wh:${runId}:${current}`;
+      const wait = async (): Promise<T> => {
+        const existing = await store.getCheckpoint(runId, current);
+        if (existing && existing.status === 'completed') return existing.output as T;
+        await store.putSignalWaiter({ token, runId, seq: current });
+        throw new WorkflowSuspended();
+      };
+      return { token, url: this.webhookUrl?.(token), wait };
+    };
+
     // Deterministic non-deterministic sources: each is a checkpointed local step, so the value is
     // captured on the first run and replayed verbatim afterwards (a raw Date.now()/Math.random()
     // inside a workflow would differ across replays and corrupt the run).
@@ -728,6 +752,7 @@ export class WorkflowEngine {
       task,
       child,
       breakpoint,
+      webhook,
       now,
       random,
       uuid,

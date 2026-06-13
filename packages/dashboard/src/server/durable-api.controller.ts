@@ -1,5 +1,14 @@
 import type { RunStatus } from '@dudousxd/nestjs-durable-core';
-import { Controller, Get, NotFoundException, Param, Post, Query, Sse } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  NotFoundException,
+  Param,
+  Post,
+  Query,
+  Sse,
+} from '@nestjs/common';
 import { DashboardService } from './dashboard.service.js';
 
 /** JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule). */
@@ -42,6 +51,19 @@ export class DurableApiController {
   async continue(@Param('id') id: string) {
     const result = await this.dashboard.continue(id);
     if (!result) throw new NotFoundException(`run ${id} is not paused at a breakpoint`);
+    return result;
+  }
+
+  /**
+   * Public callback endpoint for `ctx.webhook()`: a third party POSTs here (the url handed to it),
+   * and the body resumes the waiting run. NOTE: this is reachable by external systems — protect it
+   * by treating the token as a secret (it embeds runId:seq) and/or fronting it with signature
+   * verification in your own middleware.
+   */
+  @Post('webhooks/:token')
+  async webhook(@Param('token') token: string, @Body() body: unknown) {
+    const result = await this.dashboard.deliverWebhook(token, body);
+    if (!result) throw new NotFoundException(`no run is waiting on webhook ${token}`);
     return result;
   }
 }

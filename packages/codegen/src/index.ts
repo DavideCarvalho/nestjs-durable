@@ -81,6 +81,14 @@ export function nestjsDurableCodegen(options: NestjsDurableCodegenOptions = {}):
     }, id),
     route('POST', `${base}/runs/:id/retry`, `${ns}.retry`, { query: null, body: null, response: RUN }, id),
     route('POST', `${base}/runs/:id/cancel`, `${ns}.cancel`, { query: null, body: null, response: RUN }, id),
+    route('POST', `${base}/runs/:id/continue`, `${ns}.continue`, { query: null, body: null, response: RUN }, id),
+    route(
+      'POST',
+      `${base}/webhooks/:token`,
+      `${ns}.deliverWebhook`,
+      { query: null, body: 'unknown', response: RUN },
+      [{ name: 'token', source: 'path' }],
+    ),
   ];
 
   return {

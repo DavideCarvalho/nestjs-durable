@@ -36,6 +36,23 @@ describe('DashboardService', () => {
     expect(await service.getRunDetail('nope')).toBeNull();
   });
 
+  it('delivers a webhook callback to the waiting run, and reports no-op for an unknown token', async () => {
+    const { engine, service } = setup();
+    engine.register('approval', '1', async (ctx: WorkflowCtx) => {
+      const wh = ctx.webhook<{ approved: boolean }>();
+      const payload = await wh.wait();
+      return payload.approved;
+    });
+    await engine.start('approval', {}, 'r1');
+    expect((await service.getRunDetail('r1'))?.run.status).toBe('suspended');
+
+    const delivered = await service.deliverWebhook('wh:r1:0', { approved: true });
+    expect(delivered?.status).toBe('completed');
+    expect((await service.getRunDetail('r1'))?.run.output).toBe(true);
+
+    expect(await service.deliverWebhook('wh:unknown:0', {})).toBeNull();
+  });
+
   it('retries a failed run and can cancel a suspended one', async () => {
     const { engine, service } = setup();
     let fail = true;
