@@ -41,6 +41,10 @@ export class BullMQTransport implements Transport, ControlPlane {
   // is what live-tail + cancellation need. Subscribe needs its own connection (it blocks the client).
   private controlPub?: Redis;
   private controlSub?: Redis;
+  // Heartbeats also ride Redis pub/sub: a worker on the long-step path beats so the engine on
+  // another pod keeps the liveness window open (the in-memory `timeoutMs` path).
+  private heartbeatPub?: Redis;
+  private heartbeatSub?: Redis;
 
   constructor(options: BullMQTransportOptions) {
     this.connection = options.connection;
@@ -105,12 +109,32 @@ export class BullMQTransport implements Transport, ControlPlane {
     });
   }
 
-  onHeartbeat(_handler: (beat: Heartbeat) => Promise<void>): void {
-    // Heartbeats are not modelled over BullMQ yet; the queue's own stalled-job recovery applies.
+  onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
+    if (this.heartbeatSub) return; // one subscription per transport
+    this.heartbeatSub = this.redis();
+    void this.heartbeatSub.subscribe(this.heartbeatChannel());
+    this.heartbeatSub.on('message', (_channel, payload) => {
+      try {
+        void handler(JSON.parse(payload) as Heartbeat);
+      } catch {
+        /* ignore malformed heartbeats */
+      }
+    });
+  }
+
+  /** Worker side: publish a liveness heartbeat for an in-flight long step (resets the engine's
+   *  `timeoutMs` window on whichever pod is awaiting it). */
+  async heartbeat(beat: Heartbeat): Promise<void> {
+    if (!this.heartbeatPub) this.heartbeatPub = this.redis();
+    await this.heartbeatPub.publish(this.heartbeatChannel(), JSON.stringify(beat));
   }
 
   private controlChannel(): string {
     return `${this.prefix}-control`;
+  }
+
+  private heartbeatChannel(): string {
+    return `${this.prefix}-heartbeat`;
   }
 
   /** A standalone Redis client from the same connection — duplicating a passed-in instance, or
@@ -146,5 +170,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     await Promise.all([...this.queues.values()].map((q) => q.close()));
     this.controlPub?.disconnect();
     this.controlSub?.disconnect();
+    this.heartbeatPub?.disconnect();
+    this.heartbeatSub?.disconnect();
   }
 }
