@@ -1,6 +1,7 @@
 import {
   type ControlPlane,
   DURABLE_OPTIONS,
+  type NamedTransport,
   type QueueConfig,
   type ScheduledWorkflow,
   STATE_STORE,
@@ -29,8 +30,14 @@ export interface DurableModuleOptions {
   store: StateStore;
   transport?: Transport;
   /**
-   * Cross-instance broadcast pub/sub (lifecycle events + cancellation). Defaults to the `transport`
-   * when it can broadcast (event-emitter, BullMQ); set explicitly to use a dedicated control plane.
+   * An ordered pool of named transports for failover / multi-broker setups. The engine dispatches on
+   * the first and fails over to the next; a step pins one via `ctx.call(step, input, { transport })`.
+   * Use instead of `transport`.
+   */
+  transports?: NamedTransport[];
+  /**
+   * Cross-instance broadcast pub/sub (lifecycle events + cancellation). Defaults to the (first)
+   * transport when it can broadcast (event-emitter, BullMQ); set explicitly to use a dedicated one.
    */
   controlPlane?: ControlPlane;
   /** Interval (ms) for the durable-timer poller. `0` disables it. Defaults to 1000. */
@@ -127,12 +134,15 @@ export class DurableModule {
             transport: Transport | null,
             opts: DurableModuleOptions,
           ) => {
+            // The control-plane default is the primary task transport (single, or the pool's first)
+            // when it can broadcast.
+            const primary = transport ?? opts.transports?.[0]?.transport;
             const engine = new WorkflowEngine({
               store,
               transport: transport ?? undefined,
-              // A broadcast-capable transport doubles as the control plane unless one is given.
+              transports: opts.transports,
               controlPlane:
-                opts.controlPlane ?? (isControlPlane(transport) ? transport : undefined),
+                opts.controlPlane ?? (isControlPlane(primary) ? primary : undefined),
               leaseMs: opts.leaseMs,
               instanceId: opts.instanceId,
               webhookUrl: opts.webhookUrl,

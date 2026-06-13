@@ -199,6 +199,12 @@ export interface RemoteTask {
   input: unknown;
   /** W3C traceparent so the worker can continue the distributed trace. */
   traceparent?: string;
+  /**
+   * Id of the transport this task was dispatched on (when the engine runs a pool — see
+   * {@link NamedTransport}). A worker that consumes several transports replies via the matching one,
+   * so failover is symmetric without the worker choosing a transport. Absent for a single transport.
+   */
+  transport?: string;
   attempt: number;
 }
 
@@ -220,6 +226,16 @@ export interface Heartbeat {
   seq: number;
   stepId: string;
   group: string;
+}
+
+/**
+ * A transport in an ordered pool, identified by `id`. The engine dispatches on the first by default
+ * and fails over to the next on a dispatch error; a step can pin one via `ctx.call(…, { transport })`.
+ * The chosen `id` is stamped on the {@link RemoteTask} so a worker replies through the matching one.
+ */
+export interface NamedTransport {
+  id: string;
+  transport: Transport;
 }
 
 export interface Transport {
@@ -336,13 +352,15 @@ export interface WorkflowCtx {
     options?: StepOptions,
   ): Promise<TOutput>;
   /**
-   * Dispatch a typed remote step and await its checkpointed result. Pass `{ queue }` to subject the
-   * dispatch to a registered flow-control queue (concurrency / rate limit) — see `engine.registerQueue`.
+   * Dispatch a typed remote step and await its checkpointed result. Options:
+   * - `queue` — subject the dispatch to a registered flow-control queue (concurrency / rate limit).
+   * - `transport` — pin the dispatch to a named transport in the pool (else the pool's first, with
+   *   failover to the rest). See `engine.registerQueue` / the engine's `transports` option.
    */
   call<TInput, TOutput>(
     step: RemoteStepDef<TInput, TOutput>,
     input: TInput,
-    opts?: { queue?: string },
+    opts?: { queue?: string; transport?: string },
   ): Promise<TOutput>;
   /**
    * Durable sleep: suspends the run for `duration` (e.g. `'30s'`, `'2h'`, `'7 days'`, or ms as a

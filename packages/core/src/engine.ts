@@ -11,7 +11,9 @@ import type {
   DurableWebhook,
   EngineEvent,
   EngineListener,
+  NamedTransport,
   RemoteStepDef,
+  RemoteTask,
   RunResult,
   StateStore,
   StepError,
@@ -102,7 +104,14 @@ interface Compensation {
 
 export interface WorkflowEngineDeps {
   store: StateStore;
+  /** A single task transport. Shorthand for a one-entry `transports` pool (id `default`). */
   transport?: Transport;
+  /**
+   * An ordered pool of named transports. The engine dispatches on the first and fails over to the
+   * next on a dispatch error; a step pins one via `ctx.call(step, input, { transport: id })`. Use
+   * this instead of `transport` for failover / multi-broker setups.
+   */
+  transports?: NamedTransport[];
   /**
    * Cross-instance broadcast pub/sub for lifecycle events + cancellation (see {@link ControlPlane}).
    * Separate from the task `transport`; omit for a single-instance / local-only setup. A transport
@@ -142,7 +151,8 @@ export interface WorkflowEngineDeps {
  */
 export class WorkflowEngine {
   private readonly store: StateStore;
-  private readonly transport?: Transport;
+  /** Ordered transport pool; `dispatch` tries them in order (failover). Empty = no remote steps. */
+  private readonly transports: NamedTransport[];
   private readonly controlPlane?: ControlPlane;
   private readonly clock: () => number;
   private readonly instanceId: string;
@@ -175,7 +185,8 @@ export class WorkflowEngine {
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
-    this.transport = deps.transport;
+    this.transports =
+      deps.transports ?? (deps.transport ? [{ id: 'default', transport: deps.transport }] : []);
     this.controlPlane = deps.controlPlane;
     this.clock = deps.clock ?? Date.now;
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
@@ -183,30 +194,34 @@ export class WorkflowEngine {
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
-    this.transport?.onResult(async (result) => {
-      // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
-      const waiter = this.pending.get(result.stepId);
-      if (waiter) {
-        this.pending.delete(result.stepId);
-        if (result.status === 'completed') {
-          waiter.resolve({
-            output: result.output,
-            startedAt: result.startedAt,
-            events: result.events,
-          });
-        } else {
-          waiter.reject(new RemoteStepError(result.error));
+    // Listen for results/heartbeats on EVERY transport in the pool — a result can come back on
+    // whichever one delivered the task (so failover is symmetric).
+    for (const { transport } of this.transports) {
+      transport.onResult(async (result) => {
+        // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
+        const waiter = this.pending.get(result.stepId);
+        if (waiter) {
+          this.pending.delete(result.stepId);
+          if (result.status === 'completed') {
+            waiter.resolve({
+              output: result.output,
+              startedAt: result.startedAt,
+              events: result.events,
+            });
+          } else {
+            waiter.reject(new RemoteStepError(result.error));
+          }
+          return;
         }
-        return;
-      }
-      // Durable path: no in-memory waiter (the step suspended the run, possibly on another
-      // instance) → complete the checkpoint and resume the run here.
-      await this.completeRemoteResult(result);
-    });
-    // A heartbeat for an in-flight long step resets its liveness window (see callRemote).
-    this.transport?.onHeartbeat(async (beat) => {
-      this.heartbeatResets.get(beat.stepId)?.();
-    });
+        // Durable path: no in-memory waiter (the step suspended the run, possibly on another
+        // instance) → complete the checkpoint and resume the run here.
+        await this.completeRemoteResult(result);
+      });
+      // A heartbeat for an in-flight long step resets its liveness window (see callRemote).
+      transport.onHeartbeat(async (beat) => {
+        this.heartbeatResets.get(beat.stepId)?.();
+      });
+    }
     // Control plane: re-broadcast lifecycle events from OTHER instances to this instance's
     // subscribers (cross-pod live-tail), and act on cancellations issued elsewhere. A broker may
     // echo our own publish back — ignore those (we already handled them locally) to avoid duplicates.
@@ -943,8 +958,8 @@ export class WorkflowEngine {
       call: <TInput, TOutput>(
         remote: RemoteStepDef<TInput, TOutput>,
         input: TInput,
-        opts?: { queue?: string },
-      ) => this.callRemote(runId, nextSeq(), remote, input, opts?.queue),
+        opts?: { queue?: string; transport?: string },
+      ) => this.callRemote(runId, nextSeq(), remote, input, opts?.queue, opts?.transport),
     };
   }
 
@@ -1049,12 +1064,42 @@ export class WorkflowEngine {
     return { accepted: true, run: result };
   }
 
+  /** The transport pool ordered for dispatch: a pinned `preferId` first, then the rest (failover). */
+  private orderedTransports(preferId?: string): NamedTransport[] {
+    if (!preferId) return this.transports;
+    const pref = this.transports.filter((t) => t.id === preferId);
+    if (pref.length === 0) throw new Error(`transport "${preferId}" is not registered`);
+    return [...pref, ...this.transports.filter((t) => t.id !== preferId)];
+  }
+
+  /**
+   * Dispatch `task` over the pool: try the preferred (or first) transport, fail over to the next on
+   * a dispatch error, and stamp the task with the id of the transport that accepted it (so a worker
+   * replies on the matching one). Throws if every transport fails.
+   */
+  private async dispatchWithFailover(
+    task: Omit<RemoteTask, 'transport'>,
+    preferId?: string,
+  ): Promise<void> {
+    let lastErr: unknown;
+    for (const { id, transport } of this.orderedTransports(preferId)) {
+      try {
+        await transport.dispatch({ ...task, transport: id });
+        return;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr ?? new Error('no transport accepted the dispatch');
+  }
+
   private async callRemote<TInput, TOutput>(
     runId: string,
     seq: number,
     step: RemoteStepDef<TInput, TOutput>,
     input: TInput,
     queue?: string,
+    transport?: string,
   ): Promise<TOutput> {
     const existing = await this.store.getCheckpoint(runId, seq);
     if (existing && existing.name !== step.name) {
@@ -1062,12 +1107,12 @@ export class WorkflowEngine {
     }
     if (existing?.status === 'completed') return existing.output as TOutput;
     if (existing?.status === 'failed') throw new RemoteStepError(existing.error);
-    if (!this.transport) throw new Error('remote steps require a Transport');
+    if (this.transports.length === 0) throw new Error('remote steps require a Transport');
     // A step with a liveness `timeoutMs` keeps the in-memory await + heartbeat path (re-dispatch a
     // presumed-dead worker). Without one, the call SUSPENDS DURABLY: dispatch, persist a `pending`
     // checkpoint, and let the result resume the run on whichever instance receives it — so a worker
     // pod can scale down or crash mid-step without losing the run or re-running completed work.
-    if (step.timeoutMs) return this.callRemoteInMemory(runId, seq, step, input);
+    if (step.timeoutMs) return this.callRemoteInMemory(runId, seq, step, input, transport);
     if (existing?.status === 'pending') throw new WorkflowSuspended(); // dispatched; keep waiting
 
     const id = stepId(runId, seq);
@@ -1098,16 +1143,19 @@ export class WorkflowEngine {
       startedAt: enqueuedAt, // placeholders until the worker result lands
       finishedAt: enqueuedAt,
     });
-    await this.transport.dispatch({
-      runId,
-      seq,
-      name: step.name,
-      stepId: id,
-      group: step.group,
-      input: validInput,
-      traceparent: this.traceparent?.(),
-      attempt: 1,
-    });
+    await this.dispatchWithFailover(
+      {
+        runId,
+        seq,
+        name: step.name,
+        stepId: id,
+        group: step.group,
+        input: validInput,
+        traceparent: this.traceparent?.(),
+        attempt: 1,
+      },
+      transport,
+    );
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     throw new WorkflowSuspended();
   }
@@ -1166,8 +1214,9 @@ export class WorkflowEngine {
     seq: number,
     step: RemoteStepDef<TInput, TOutput>,
     input: TInput,
+    transport?: string,
   ): Promise<TOutput> {
-    if (!this.transport) throw new Error('remote steps require a Transport');
+    if (this.transports.length === 0) throw new Error('remote steps require a Transport');
     const validInput = step.input.parse(input);
     const id = stepId(runId, seq);
     const enqueuedAt = new Date();
@@ -1183,16 +1232,19 @@ export class WorkflowEngine {
       const resultPromise = new Promise<RemoteResolution>((resolve, reject) => {
         this.pending.set(id, { resolve, reject });
       });
-      await this.transport.dispatch({
-        runId,
-        seq,
-        name: step.name,
-        stepId: id,
-        group: step.group,
-        input: validInput,
-        traceparent: this.traceparent?.(),
-        attempt,
-      });
+      await this.dispatchWithFailover(
+        {
+          runId,
+          seq,
+          name: step.name,
+          stepId: id,
+          group: step.group,
+          input: validInput,
+          traceparent: this.traceparent?.(),
+          attempt,
+        },
+        transport,
+      );
       try {
         const resolution = step.timeoutMs
           ? await this.awaitWithHeartbeat(id, resultPromise, step.timeoutMs)
