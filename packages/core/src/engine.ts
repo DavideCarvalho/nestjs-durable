@@ -1106,7 +1106,6 @@ export class WorkflowEngine {
       throw new NonDeterminismError(runId, seq, step.name, existing.name);
     }
     if (existing?.status === 'completed') return existing.output as TOutput;
-    if (existing?.status === 'failed') throw new RemoteStepError(existing.error);
     if (this.transports.length === 0) throw new Error('remote steps require a Transport');
     // A step with a liveness `timeoutMs` keeps the in-memory await + heartbeat path (re-dispatch a
     // presumed-dead worker). Without one, the call SUSPENDS DURABLY: dispatch, persist a `pending`
@@ -1114,6 +1113,24 @@ export class WorkflowEngine {
     // pod can scale down or crash mid-step without losing the run or re-running completed work.
     if (step.timeoutMs) return this.callRemoteInMemory(runId, seq, step, input, transport);
     if (existing?.status === 'pending') throw new WorkflowSuspended(); // dispatched; keep waiting
+
+    // Durable retry: a failed attempt re-dispatches up to `retries`, spacing attempts by `backoff` —
+    // unless the worker marked the error non-retryable (a deterministic verdict like a declined card).
+    // The retry deadline is stamped on the failed checkpoint as `wakeAt` (clock-space, persisted) the
+    // first time we see it, so it's stable across replays and survives a crash.
+    let attempt = 1;
+    if (existing?.status === 'failed') {
+      const maxAttempts = Math.max(1, step.retries ?? 1);
+      const retryable = existing.error?.retryable !== false;
+      if (!retryable || existing.attempts >= maxAttempts) throw new RemoteStepError(existing.error);
+      if (existing.wakeAt == null) {
+        const wakeAt = this.clock() + backoffDelay(existing.attempts, step);
+        await this.store.saveCheckpoint({ ...existing, wakeAt });
+        throw new WorkflowSuspended(wakeAt);
+      }
+      if (this.clock() < existing.wakeAt) throw new WorkflowSuspended(existing.wakeAt);
+      attempt = existing.attempts + 1;
+    }
 
     const id = stepId(runId, seq);
     // Flow control: a queued call that can't be admitted (concurrency/rate) does NOT dispatch — the
@@ -1137,7 +1154,7 @@ export class WorkflowEngine {
       stepId: id,
       status: 'pending',
       input: validInput,
-      attempts: 1,
+      attempts: attempt,
       workerGroup: step.group,
       enqueuedAt,
       startedAt: enqueuedAt, // placeholders until the worker result lands
@@ -1152,7 +1169,7 @@ export class WorkflowEngine {
         group: step.group,
         input: validInput,
         traceparent: this.traceparent?.(),
-        attempt: 1,
+        attempt,
       },
       transport,
     );

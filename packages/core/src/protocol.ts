@@ -37,10 +37,17 @@ export async function runStepHandler(
     const output = await handler(task.input, createStepLogger(events, Date.now));
     return withEvents({ ...base, status: 'completed', output });
   } catch (err) {
+    // Carry `code`/`retryable` off the thrown error if present, so the engine's durable retry can
+    // honour a worker's "don't retry this" verdict (e.g. a declined card).
+    const e = err as { message?: string; code?: string; retryable?: boolean };
     return withEvents({
       ...base,
       status: 'failed',
-      error: { message: err instanceof Error ? err.message : String(err) },
+      error: {
+        message: err instanceof Error ? err.message : String(err),
+        ...(typeof e?.code === 'string' ? { code: e.code } : {}),
+        ...(typeof e?.retryable === 'boolean' ? { retryable: e.retryable } : {}),
+      },
     });
   }
 }
