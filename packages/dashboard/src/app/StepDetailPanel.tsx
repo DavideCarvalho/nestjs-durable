@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { StepCheckpoint, StepEvent, WorkflowRun } from '../client/durable-client';
-import { BoltIcon, CheckIcon, CopyIcon, iconFor, KIND_LABEL, XIcon } from './icons';
+import { BoltIcon, CheckIcon, CopyIcon, KIND_LABEL, XIcon, iconFor } from './icons';
 
 function fmtMs(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
