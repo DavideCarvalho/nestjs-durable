@@ -1,5 +1,6 @@
 import {
   DURABLE_OPTIONS,
+  type ScheduledWorkflow,
   STATE_STORE,
   type StateStore,
   TRANSPORT,
@@ -39,6 +40,13 @@ export interface DurableModuleOptions {
   worker?: boolean;
   /** Max ms to wait for in-flight runs on shutdown before exiting. Defaults to 10000. */
   shutdownTimeoutMs?: number;
+  /**
+   * Recurring workflows to start on a schedule (fixed interval or cron). The timer poller fires
+   * them each tick on **worker** instances only; `engine.start` is idempotent by the schedule's
+   * time-bucket run id, so racing instances start each window exactly once. Cron schedules need the
+   * optional `cron-parser` peer dependency.
+   */
+  schedules?: ScheduledWorkflow[];
 }
 
 export interface DurableModuleAsyncOptions {

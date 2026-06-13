@@ -1,4 +1,4 @@
-import { DURABLE_OPTIONS, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import { DURABLE_OPTIONS, runSchedules, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
   Injectable,
@@ -8,9 +8,9 @@ import {
 import type { DurableModuleOptions } from './durable.module';
 
 /**
- * Resumes suspended runs whose durable timer (`ctx.sleep`) is due — once on boot, then on an
- * interval. Set `timerPollMs` to `0` to disable the interval (e.g. when an external scheduler
- * drives `WorkflowEngine.resumeDueTimers`).
+ * Resumes suspended runs whose durable timer (`ctx.sleep`) is due, and fires any configured
+ * recurring `schedules` — once on boot, then on an interval. Set `timerPollMs` to `0` to disable
+ * the interval (e.g. when an external scheduler drives `WorkflowEngine.resumeDueTimers`).
  */
 @Injectable()
 export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
@@ -43,6 +43,10 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     this.polling = true;
     try {
       await this.engine.resumeDueTimers();
+      const schedules = this.options.schedules;
+      if (schedules && schedules.length > 0) {
+        await runSchedules(this.engine, schedules, Date.now());
+      }
     } finally {
       this.polling = false;
     }
