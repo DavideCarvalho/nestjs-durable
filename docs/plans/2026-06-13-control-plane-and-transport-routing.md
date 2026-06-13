@@ -82,8 +82,9 @@ payments step → **BullMQ** (durable), a legacy step → **SQS**.
 
 ### Granularities (resolved finest-wins)
 
-1. **Per step** — `remoteStep({ name, group, transport?: string })`. Most explicit.
-2. **Per group** — `group → transport` map on the engine. Natural: a `group` already *is* the
+1. **Per step** — `remoteStep({ name, group, transport?: string | string[] })`. Most explicit. A
+   **list** = ordered preference with failover (below).
+2. **Per group** — `group → transport(s)` map on the engine. Natural: a `group` already *is* the
    worker-pool identity, and a pool lives on one broker.
 3. **Per workflow** — `@Workflow({ transport })` as the default for its steps.
 
@@ -101,6 +102,40 @@ new WorkflowEngine({
 ```
 
 Back-compat: keep accepting `transport` (single) — it becomes `transports.default`.
+
+### Multi-transport failover (an ordered list, not just one)
+
+A step can name an **ordered list** of transports — `transport: ['bullmq', 'sqs', 'http']` — and the
+engine fails over down the list. There are **two distinct failure points**, and they have very
+different safety:
+
+**1. Dispatch-time failover — always safe, do it.**
+If enqueuing on `transports[0]` throws (broker unreachable, connection refused), the task was never
+handed to anyone, so the engine just tries `transports[1]`, etc. Record the **transport that
+actually accepted it** on the checkpoint (so the result handler + recovery know where it lives). Pure
+resilience to one broker being down, zero duplication risk. Optional small backoff between attempts.
+
+**2. Liveness failover — useful, but it's at-least-once, not magic.**
+The task was enqueued on A, but no result/heartbeat arrives within the step's `timeoutMs` (worker
+dead, queue stuck). The engine re-dispatches — and can **escalate to the next transport** instead of
+retrying the same one. The catch:
+- The original message is usually **still on queue A** (SQS can't delete by id; BullMQ can, best-effort),
+  so a worker on A *may* still run it → **two workers can run the same step**.
+- That's tolerable because the engine **already dedupes the result**: `completeRemoteResult` only
+  completes a `pending` checkpoint, so the **first result wins and the second is a no-op** (already
+  shipped). What it can't dedupe is a **non-idempotent side-effect** — but that's the standing
+  at-least-once contract (a normal retry has the same exposure).
+- ⇒ **Liveness failover requires `timeoutMs` set and idempotent steps** (the `stepId` is the natural
+  idempotency key — already passed to workers). Document it as "escalate on presumed-dead worker",
+  not "exactly-once across brokers".
+
+**Optional circuit breaker.** If a transport fails dispatch N times in a row, open its circuit and
+skip straight to the next for a cooldown — avoids hammering a dead broker. Adds a little state; nice
+later, not required for v1.
+
+**Recovery interaction.** The checkpoint must record which transport(s) a pending remote step was
+dispatched to, so `recoverIncomplete` re-dispatches/listens correctly after a crash — it can't assume
+a single global transport anymore.
 
 ### What stays transport-agnostic (the reason this is tractable)
 
@@ -121,8 +156,9 @@ broker). Routing is an **engine-side dispatch** concern; workers stay single-tra
 - Per-step `transport` string vs a typed handle — stringly-typed keys are simplest but unchecked.
 - A step's `timeoutMs` liveness path assumes one transport's heartbeats; fine since a step dispatches
   to exactly one transport.
-- Failure isolation: if one transport's broker is down, only its steps stall (others proceed) — good,
-  but `recoverIncomplete` must not assume a single transport when re-dispatching.
+- Failure isolation: if one transport's broker is down, only its steps stall (others proceed) — and
+  with a transport list they **fail over** (see above). `recoverIncomplete` must not assume a single
+  transport when re-dispatching, and must read the recorded transport from the checkpoint.
 
 ---
 
@@ -141,6 +177,8 @@ broker). Routing is an **engine-side dispatch** concern; workers stay single-tra
 1. **Extract `ControlPlane`** (Part A) — fixes the coupling I introduced in 0.5.0; everything else
    builds on it.
 2. **`PostgresControlPlane`** (`LISTEN/NOTIFY`) — cross-pod without Redis for DB/SQS users.
-3. **Transport registry + routing** (Part B), starting with per-group (the natural unit).
+3. **Transport registry + routing** (Part B), starting with per-group (the natural unit), then the
+   ordered-list **dispatch-time failover** (the safe, high-value half), then **liveness failover**
+   (gated on `timeoutMs` + idempotent steps).
 4. **HTTP transport** — high demand (serverless), with the durability caveat.
 5. **WebSocket control plane** — broadcast without Redis; NAT'd workers later.
