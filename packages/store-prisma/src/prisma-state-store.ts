@@ -35,6 +35,7 @@ interface CheckpointRow {
   kind: string;
   stepId: string;
   status: string;
+  input: unknown;
   output: unknown;
   error: unknown;
   attempts: number;
@@ -235,6 +236,7 @@ function toCheckpointData(cp: StepCheckpoint) {
     kind: cp.kind,
     stepId: cp.stepId,
     status: cp.status,
+    input: jsonOrNull(cp.input),
     output: jsonOrNull(cp.output),
     error: jsonOrNull(cp.error),
     attempts: cp.attempts,
@@ -254,6 +256,7 @@ function fromCheckpointRow(row: CheckpointRow): StepCheckpoint {
     kind: row.kind as StepCheckpoint['kind'],
     stepId: row.stepId,
     status: row.status as StepCheckpoint['status'],
+    input: row.input ?? undefined,
     output: row.output ?? undefined,
     error: (row.error ?? undefined) as StepError | undefined,
     attempts: row.attempts,

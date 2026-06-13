@@ -26,6 +26,7 @@ model DurableStepCheckpoint {
   kind        String
   stepId      String
   status      String
+  input       Json?
   output      Json?
   error       Json?
   attempts    Int

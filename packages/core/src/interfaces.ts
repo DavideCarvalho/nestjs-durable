@@ -53,6 +53,8 @@ export interface StepCheckpoint {
   /** Stable id passed to remote workers so they can dedupe a re-delivered task. */
   stepId: string;
   status: 'completed' | 'failed';
+  /** What the step was called with — the `ctx.call` args for a remote step (a local step has none). */
+  input?: unknown;
   output?: unknown;
   error?: StepError;
   attempts: number;

@@ -154,6 +154,7 @@ export function StepDetailPanel({
           </section>
         )}
 
+        {step.input !== undefined && <Json label="input" value={step.input} />}
         {step.output !== undefined && <Json label="output" value={step.output} />}
       </div>
     </aside>

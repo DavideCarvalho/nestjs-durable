@@ -165,6 +165,7 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
   e.kind = cp.kind;
   e.stepId = cp.stepId;
   e.status = cp.status;
+  e.input = cp.input ?? null;
   e.output = cp.output ?? null;
   e.error = cp.error ?? null;
   e.attempts = cp.attempts;
@@ -184,6 +185,7 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
     kind: e.kind,
     stepId: e.stepId,
     status: e.status,
+    input: e.input ?? undefined,
     output: e.output ?? undefined,
     error: (e.error ?? undefined) as StepError | undefined,
     attempts: e.attempts,

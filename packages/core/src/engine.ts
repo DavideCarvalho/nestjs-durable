@@ -308,6 +308,7 @@ export class WorkflowEngine {
     seq: number;
     name: string;
     kind: StepKind;
+    input?: unknown;
     output: unknown;
     attempts: number;
     enqueuedAt: Date;
@@ -321,6 +322,7 @@ export class WorkflowEngine {
       kind: step.kind,
       stepId: stepId(step.runId, step.seq),
       status: 'completed',
+      input: step.input,
       output: step.output,
       attempts: step.attempts,
       workerGroup: step.workerGroup,
@@ -346,6 +348,7 @@ export class WorkflowEngine {
     seq: number;
     name: string;
     kind: StepKind;
+    input?: unknown;
     error: StepError;
     attempts: number;
     enqueuedAt: Date;
@@ -359,6 +362,7 @@ export class WorkflowEngine {
       kind: step.kind,
       stepId: stepId(step.runId, step.seq),
       status: 'failed',
+      input: step.input,
       error: step.error,
       attempts: step.attempts,
       workerGroup: step.workerGroup,
@@ -639,6 +643,7 @@ export class WorkflowEngine {
           seq,
           name: step.name,
           kind: 'remote',
+          input: validInput,
           output,
           attempts: attempt,
           workerGroup: step.group,

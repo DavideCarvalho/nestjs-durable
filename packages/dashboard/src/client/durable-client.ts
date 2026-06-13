@@ -20,6 +20,8 @@ export interface StepCheckpoint {
   name: string;
   kind: StepKind;
   status: 'completed' | 'failed';
+  /** What the step was called with (a remote step's `ctx.call` args). */
+  input?: unknown;
   output?: unknown;
   error?: { message: string };
   attempts: number;

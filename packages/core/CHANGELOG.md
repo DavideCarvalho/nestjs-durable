@@ -1,5 +1,14 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.1.2
+
+### Patch Changes
+
+- Record a step's **input** on its checkpoint, alongside the output. A remote step's `ctx.call` args
+  are now persisted and surfaced in the dashboard step panel ("Input" + "Output" shown separately,
+  instead of only the output) — so you can see what a step was called with, not just what it returned.
+  Stored as a nullable column across all four store adapters; the in-memory store carries it for free.
+
 ## 0.1.1
 
 ### Patch Changes

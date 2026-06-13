@@ -61,6 +61,9 @@ export class StepCheckpointEntity {
   status!: 'completed' | 'failed';
 
   @Property({ type: 'json', nullable: true })
+  input?: unknown;
+
+  @Property({ type: 'json', nullable: true })
   output?: unknown;
 
   @Property({ type: 'json', nullable: true })

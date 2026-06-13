@@ -61,6 +61,9 @@ export class StepCheckpointEntity {
   status!: 'completed' | 'failed';
 
   @Column('simple-json', { nullable: true })
+  input?: unknown;
+
+  @Column('simple-json', { nullable: true })
   output?: unknown;
 
   @Column('simple-json', { nullable: true })

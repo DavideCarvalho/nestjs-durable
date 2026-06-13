@@ -44,7 +44,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
     `CREATE TABLE IF NOT EXISTS ${checkpoints} (
       ${q('runId')} ${str} NOT NULL, ${q('seq')} ${int} NOT NULL,
       ${q('name')} ${str} NOT NULL, ${q('kind')} ${str} NOT NULL, ${q('stepId')} ${str} NOT NULL,
-      ${q('status')} ${str} NOT NULL, ${q('output')} ${txt}, ${q('error')} ${txt},
+      ${q('status')} ${str} NOT NULL, ${q('input')} ${txt}, ${q('output')} ${txt}, ${q('error')} ${txt},
       ${q('attempts')} ${int} NOT NULL, ${q('workerGroup')} ${str},
       ${q('wakeAt')} ${ts}, ${q('enqueuedAt')} ${ts},
       ${q('startedAt')} ${ts} NOT NULL, ${q('finishedAt')} ${ts} NOT NULL,

@@ -27,6 +27,7 @@ export const stepCheckpoints = sqliteTable(
     kind: text('kind').notNull(),
     stepId: text('step_id').notNull(),
     status: text('status').notNull(),
+    input: text('input', { mode: 'json' }),
     output: text('output', { mode: 'json' }),
     error: text('error', { mode: 'json' }),
     attempts: integer('attempts').notNull(),
