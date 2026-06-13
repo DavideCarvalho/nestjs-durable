@@ -36,6 +36,28 @@ describe('DashboardService', () => {
     expect(await service.getRunDetail('nope')).toBeNull();
   });
 
+  it('reads a published event value and delivers a validated update', async () => {
+    const { engine, service } = setup();
+    engine.register('job', '1', async (ctx: WorkflowCtx) => {
+      await ctx.setEvent('progress', 25);
+      const go = await ctx.onUpdate<{ ok: boolean }>('go');
+      return go.ok ? 'finished' : 'aborted';
+    });
+    engine.registerUpdateValidator('job', 'go', (arg: { ok?: boolean }) => {
+      if (arg?.ok === undefined) throw new Error('ok is required');
+    });
+    await engine.start('job', {}, 'r1');
+
+    expect(await service.getEvent('r1', 'progress')).toBe(25);
+
+    const rejected = await service.update('r1', 'go', {});
+    expect(rejected.accepted).toBe(false);
+
+    const accepted = await service.update('r1', 'go', { ok: true });
+    expect(accepted.accepted).toBe(true);
+    expect((await service.getRunDetail('r1'))?.run.output).toBe('finished');
+  });
+
   it('delivers a webhook callback to the waiting run, and reports no-op for an unknown token', async () => {
     const { engine, service } = setup();
     engine.register('approval', '1', async (ctx: WorkflowCtx) => {

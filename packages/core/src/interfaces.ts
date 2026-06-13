@@ -382,6 +382,22 @@ export interface WorkflowCtx {
    */
   webhook<TPayload>(): DurableWebhook<TPayload>;
   /**
+   * Publish a named, queryable value from inside the run — the latest value for `key` is readable
+   * externally via `engine.getEvent(runId, key)` while the run is still in flight (progress, a
+   * partial result, a status). Checkpointed and replay-safe (overwrites the previous value for the
+   * same key). The read side has no effect on the run — the durable, suspend-model counterpart of a
+   * Temporal query.
+   */
+  setEvent<TValue>(key: string, value: TValue): Promise<void>;
+  /**
+   * Expose a named **update point**: suspend until an external `engine.update(runId, name, arg)`
+   * delivers `arg`, then resume with it. The update is run-scoped (`name` need only be unique within
+   * the run) and gated by any validator registered via `engine.registerUpdateValidator` — a rejected
+   * update never reaches here. Pass `{ timeoutMs }` to bound the wait (throws `SignalTimeoutError`).
+   * The durable counterpart of a Temporal update handler.
+   */
+  onUpdate<TArg>(name: string, opts?: { timeoutMs?: number }): Promise<TArg>;
+  /**
    * Deterministic wall-clock (epoch ms): records the time on the first run and replays the SAME
    * value afterwards. Use this instead of `Date.now()` inside a workflow — a raw `Date.now()` returns
    * a different value on every replay, which silently corrupts a durable run.
@@ -403,6 +419,20 @@ export interface RunResult {
   output?: unknown;
   error?: StepError;
 }
+
+/**
+ * Validates an incoming `engine.update` before it is delivered to the run. Throw (or return a
+ * non-empty string) to reject — the run is left untouched. Return nothing/void to accept. May be
+ * async (e.g. a business-rule check against a DB).
+ */
+export type UpdateValidator<TArg = unknown> = (
+  arg: TArg,
+) => void | string | Promise<void | string>;
+
+/** Outcome of `engine.update`: rejected by the validator, or accepted and delivered. */
+export type UpdateResult =
+  | { accepted: false; reason: string }
+  | { accepted: true; run: RunResult | null };
 
 export type EngineEventType =
   | 'run.started'

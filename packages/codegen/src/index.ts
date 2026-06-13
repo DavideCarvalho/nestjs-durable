@@ -89,6 +89,30 @@ export function nestjsDurableCodegen(options: NestjsDurableCodegenOptions = {}):
       { query: null, body: 'unknown', response: RUN },
       [{ name: 'token', source: 'path' }],
     ),
+    route(
+      'GET',
+      `${base}/runs/:id/events/:key`,
+      `${ns}.getEvent`,
+      { query: null, body: null, response: 'unknown' },
+      [
+        { name: 'id', source: 'path' },
+        { name: 'key', source: 'path' },
+      ],
+    ),
+    route(
+      'POST',
+      `${base}/runs/:id/updates/:name`,
+      `${ns}.update`,
+      {
+        query: null,
+        body: 'unknown',
+        response: `{ accepted: false; reason: string } | { accepted: true; run: ${RUN} | null }`,
+      },
+      [
+        { name: 'id', source: 'path' },
+        { name: 'name', source: 'path' },
+      ],
+    ),
   ];
 
   return {

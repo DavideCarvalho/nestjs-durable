@@ -66,4 +66,16 @@ export class DurableApiController {
     if (!result) throw new NotFoundException(`no run is waiting on webhook ${token}`);
     return result;
   }
+
+  /** Live query: the latest value a run published for `key` via `ctx.setEvent` (no side effect). */
+  @Get('runs/:id/events/:key')
+  event(@Param('id') id: string, @Param('key') key: string) {
+    return this.dashboard.getEvent(id, key);
+  }
+
+  /** Deliver a validated `ctx.onUpdate` to a run; the body is the update argument. */
+  @Post('runs/:id/updates/:name')
+  update(@Param('id') id: string, @Param('name') name: string, @Body() body: unknown) {
+    return this.dashboard.update(id, name, body);
+  }
 }

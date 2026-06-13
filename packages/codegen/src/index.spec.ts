@@ -23,6 +23,8 @@ describe('nestjsDurableCodegen', () => {
         'durable.cancel',
         'durable.continue',
         'durable.deliverWebhook',
+        'durable.getEvent',
+        'durable.update',
       ]),
     );
     const getRun = out.find((r) => r.name === 'durable.getRun');

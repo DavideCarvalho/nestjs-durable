@@ -20,6 +20,8 @@ import type {
   StepOptions,
   StepResult,
   Transport,
+  UpdateResult,
+  UpdateValidator,
   WorkflowCtx,
   WorkflowRun,
 } from './interfaces';
@@ -131,6 +133,8 @@ export class WorkflowEngine {
   private readonly listeners = new Set<EngineListener>();
   /** Callbacks notified (on any instance) when a run is cancelled — for cooperative cancellation. */
   private readonly cancelListeners = new Set<(runId: string) => void>();
+  /** Validators gating `engine.update`, keyed by `<workflow>:<updateName>`. */
+  private readonly updateValidators = new Map<string, UpdateValidator>();
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Set<Promise<RunResult>>();
   private draining = false;
@@ -722,6 +726,37 @@ export class WorkflowEngine {
       throw new WorkflowSuspended();
     };
 
+    // An update point: suspend on a run-scoped `update:<runId>:<name>` token that engine.update
+    // delivers to (after its validator passes). Reuses the signal machinery; run-scoped like task/child.
+    const onUpdate = <T>(name: string, opts?: { timeoutMs?: number }): Promise<T> =>
+      waitForSignal<T>(`update:${runId}:${name}`, opts);
+
+    // A queryable named value: a checkpoint whose `name` is `event:<key>`, so the latest value for a
+    // key is just the highest-seq such checkpoint (read by engine.getEvent). Replay-idempotent.
+    const setEvent = async (key: string, value: unknown): Promise<void> => {
+      const current = nextSeq();
+      const name = `event:${key}`;
+      const existing = await store.getCheckpoint(runId, current);
+      if (existing && existing.name !== name) {
+        throw new NonDeterminismError(runId, current, name, existing.name);
+      }
+      if (existing && existing.status === 'completed') return; // replay: already published
+      const at = new Date();
+      await store.saveCheckpoint({
+        runId,
+        seq: current,
+        name,
+        kind: 'local',
+        stepId: stepId(runId, current),
+        status: 'completed',
+        output: value,
+        attempts: 1,
+        enqueuedAt: at,
+        startedAt: at,
+        finishedAt: at,
+      });
+    };
+
     // A durable webhook reserves a logical position NOW to mint a stable token, so the url can be
     // handed to a third party before `wait()` suspends. `wait()` then parks on that same position
     // until the callback lands as engine.signal(token, body) — single position, replay-safe.
@@ -753,6 +788,8 @@ export class WorkflowEngine {
       child,
       breakpoint,
       webhook,
+      setEvent,
+      onUpdate,
       now,
       random,
       uuid,
@@ -811,6 +848,55 @@ export class WorkflowEngine {
     const bp = checkpoints.find(isBreakpoint);
     if (!bp) return null;
     return this.signal(breakpointToken(runId, bp.seq), undefined);
+  }
+
+  /**
+   * Read the latest value a run published for `key` via {@link WorkflowCtx.setEvent} — a
+   * side-effect-free query of a live (or finished) run's state. Returns `undefined` if the run
+   * never published that key. The suspend-model counterpart of a Temporal query.
+   */
+  async getEvent<TValue = unknown>(runId: string, key: string): Promise<TValue | undefined> {
+    const name = `event:${key}`;
+    const checkpoints = await this.store.listCheckpoints(runId);
+    // listCheckpoints is ordered by seq ascending, so the last match is the most recent value.
+    let latest: TValue | undefined;
+    for (const cp of checkpoints) if (cp.name === name) latest = cp.output as TValue;
+    return latest;
+  }
+
+  /**
+   * Register a validator gating `engine.update(runId, name, …)` for runs of `workflow`. The
+   * validator runs BEFORE the update is delivered, so a rejection leaves the run untouched. One
+   * validator per (workflow, update name); registering again replaces it.
+   */
+  registerUpdateValidator<TArg>(
+    workflow: string,
+    name: string,
+    validate: UpdateValidator<TArg>,
+  ): void {
+    this.updateValidators.set(`${workflow}:${name}`, validate as UpdateValidator);
+  }
+
+  /**
+   * Deliver a validated update to the run waiting at `ctx.onUpdate(name)`. Runs the registered
+   * validator (if any) first: on rejection returns `{ accepted: false, reason }` without disturbing
+   * the run; otherwise delivers `arg` and resumes, returning `{ accepted: true, run }` (`run` is null
+   * if nothing was waiting — a too-early or duplicate update).
+   */
+  async update(runId: string, name: string, arg: unknown): Promise<UpdateResult> {
+    const run = await this.store.getRun(runId);
+    if (!run) return { accepted: false, reason: `run ${runId} not found` };
+    const validate = this.updateValidators.get(`${run.workflow}:${name}`);
+    if (validate) {
+      try {
+        const reason = await validate(arg);
+        if (typeof reason === 'string' && reason.length > 0) return { accepted: false, reason };
+      } catch (err) {
+        return { accepted: false, reason: err instanceof Error ? err.message : String(err) };
+      }
+    }
+    const result = await this.signal(`update:${runId}:${name}`, arg);
+    return { accepted: true, run: result };
   }
 
   private async callRemote<TInput, TOutput>(

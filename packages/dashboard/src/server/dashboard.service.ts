@@ -5,6 +5,7 @@ import {
   STATE_STORE,
   type StateStore,
   type StepCheckpoint,
+  type UpdateResult,
   WorkflowEngine,
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
@@ -57,6 +58,16 @@ export class DashboardService {
    */
   deliverWebhook(token: string, body: unknown): Promise<RunResult | null> {
     return this.engine.signal(token, body);
+  }
+
+  /** Side-effect-free read of a value a run published via `ctx.setEvent` (a live query). */
+  getEvent(runId: string, key: string): Promise<unknown> {
+    return this.engine.getEvent(runId, key);
+  }
+
+  /** Deliver a validated `ctx.onUpdate` to a run; the validator may reject it (see UpdateResult). */
+  update(runId: string, name: string, arg: unknown): Promise<UpdateResult> {
+    return this.engine.update(runId, name, arg);
   }
 
   /**
