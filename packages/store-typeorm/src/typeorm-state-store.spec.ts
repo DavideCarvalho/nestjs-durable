@@ -127,6 +127,17 @@ describe('TypeOrmStateStore', () => {
     await dataSource.destroy();
   });
 
+  it('round-trips recoveryAttempts and the dead status', async () => {
+    const { store, dataSource } = await makeStore();
+    await store.createRun(run({ recoveryAttempts: 3 }));
+    expect((await store.getRun('r1'))?.recoveryAttempts).toBe(3);
+    await store.updateRun('r1', { status: 'dead', recoveryAttempts: 4 });
+    const dead = await store.getRun('r1');
+    expect(dead?.status).toBe('dead');
+    expect(dead?.recoveryAttempts).toBe(4);
+    await dataSource.destroy();
+  });
+
   it('upserts checkpoints and reads them by (runId, seq)', async () => {
     const { store, dataSource } = await makeStore();
     await store.createRun(run());

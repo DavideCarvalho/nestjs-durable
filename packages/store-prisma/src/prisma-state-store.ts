@@ -25,6 +25,7 @@ interface RunRow {
   wakeAt: bigint | null;
   lockedBy: string | null;
   lockedUntil: Date | null;
+  recoveryAttempts: number | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -198,6 +199,7 @@ function toRunData(run: WorkflowRun) {
     wakeAt: bigOrNull(run.wakeAt),
     lockedBy: run.lockedBy ?? null,
     lockedUntil: run.lockedUntil == null ? null : new Date(run.lockedUntil),
+    recoveryAttempts: run.recoveryAttempts ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -209,6 +211,7 @@ function toRunPatch(patch: Partial<WorkflowRun>) {
   if (patch.output !== undefined) data.output = jsonOrNull(patch.output);
   if (patch.error !== undefined) data.error = jsonOrNull(patch.error);
   if (patch.wakeAt !== undefined) data.wakeAt = bigOrNull(patch.wakeAt);
+  if (patch.recoveryAttempts !== undefined) data.recoveryAttempts = patch.recoveryAttempts ?? null;
   if (patch.updatedAt !== undefined) data.updatedAt = patch.updatedAt;
   return data;
 }
@@ -225,6 +228,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     wakeAt: numOrUndef(row.wakeAt),
     lockedBy: row.lockedBy ?? undefined,
     lockedUntil: row.lockedUntil == null ? undefined : row.lockedUntil.getTime(),
+    recoveryAttempts: row.recoveryAttempts ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

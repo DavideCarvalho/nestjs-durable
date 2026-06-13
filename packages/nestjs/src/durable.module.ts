@@ -55,6 +55,11 @@ export interface DurableModuleOptions {
   /** Unique id for this instance (for leases). Defaults to a random id. */
   instanceId?: string;
   /**
+   * Cap recovery attempts before a still-`running` run is moved to the `dead` dead-letter state
+   * (a poison pill that crashes the process every boot). Omit for unlimited.
+   */
+  maxRecoveryAttempts?: number;
+  /**
    * Whether this instance plays the **worker** role: register `@DurableStep` handlers (consume the
    * transport), recover incomplete runs on boot, and poll due timers. Defaults to `true`. Set
    * `false` for a **dashboard/dispatch-only** instance (e.g. an API pod) that mounts the control
@@ -143,6 +148,7 @@ export class DurableModule {
               transports: opts.transports,
               controlPlane: opts.controlPlane ?? (isControlPlane(primary) ? primary : undefined),
               leaseMs: opts.leaseMs,
+              maxRecoveryAttempts: opts.maxRecoveryAttempts,
               instanceId: opts.instanceId,
               webhookUrl: opts.webhookUrl,
               traceparent: opts.traceparent,

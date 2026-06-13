@@ -1,4 +1,4 @@
-export type RunStatus = 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus = 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' | 'dead';
 export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
 
 export interface WorkflowRun {

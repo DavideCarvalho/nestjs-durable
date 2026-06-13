@@ -11,7 +11,14 @@ import type { z } from 'zod';
 // Runs & checkpoints — the durable state owned by the orchestrator
 // ---------------------------------------------------------------------------
 
-export type RunStatus = 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus =
+  | 'running'
+  | 'suspended'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  /** Dead-letter: recovery gave up after `maxRecoveryAttempts` (a poison pill). Terminal; inspect it. */
+  | 'dead';
 
 /** One execution of a workflow. The unit of durability and the unit shown in the dashboard. */
 export interface WorkflowRun {
@@ -33,6 +40,8 @@ export interface WorkflowRun {
   lockedBy?: string;
   /** Recovery lease expiry (epoch ms); another instance may take over once it passes. */
   lockedUntil?: number;
+  /** How many times crash-recovery has picked this run up — caps poison pills (see maxRecoveryAttempts). */
+  recoveryAttempts?: number;
   createdAt: Date;
   updatedAt: Date;
 }

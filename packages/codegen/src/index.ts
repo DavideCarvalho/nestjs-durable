@@ -29,7 +29,7 @@ function route(
 // Wire shapes the durable dashboard API returns (JSON: dates are ISO strings).
 const RUN =
   '{ id: string; workflow: string; workflowVersion: string; ' +
-  "status: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled'; " +
+  "status: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' | 'dead'; " +
   'input?: unknown; output?: unknown; error?: { message: string; code?: string }; ' +
   'wakeAt?: number; createdAt: string; updatedAt: string }';
 const STEP =
@@ -70,7 +70,7 @@ export function nestjsDurableCodegen(options: NestjsDurableCodegenOptions = {}):
 
   const injected: RouteDescriptor[] = [
     route('GET', `${base}/runs`, `${ns}.listRuns`, {
-      query: "{ status?: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' }",
+      query: "{ status?: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' | 'dead' }",
       body: null,
       response: `${RUN}[]`,
     }),

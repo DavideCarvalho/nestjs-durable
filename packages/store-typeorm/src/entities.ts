@@ -33,6 +33,9 @@ export class WorkflowRunEntity {
   @Column({ nullable: true })
   lockedUntil?: Date;
 
+  @Column('integer', { nullable: true })
+  recoveryAttempts?: number;
+
   @Column()
   createdAt!: Date;
 

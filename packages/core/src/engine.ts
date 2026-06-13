@@ -125,6 +125,12 @@ export interface WorkflowEngineDeps {
   /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */
   leaseMs?: number;
   /**
+   * Cap how many times crash-recovery may pick up the same still-`running` run before giving up and
+   * moving it to the `dead` dead-letter state (a poison pill that crashes the process every boot).
+   * Omit for unlimited (the default — recovery always retries).
+   */
+  maxRecoveryAttempts?: number;
+  /**
    * Build the public callback URL for a `ctx.webhook()` token (e.g.
    * ``(t) => `https://api.example.com/durable/webhooks/${t}` ``). Populates
    * {@link DurableWebhook.url}. Omit if you build URLs yourself from the token.
@@ -157,6 +163,7 @@ export class WorkflowEngine {
   private readonly clock: () => number;
   private readonly instanceId: string;
   private readonly leaseMs: number;
+  private readonly maxRecoveryAttempts?: number;
   private readonly webhookUrl?: (token: string) => string;
   private readonly traceparent?: () => string | undefined;
   private readonly compensationRetries: number;
@@ -191,6 +198,7 @@ export class WorkflowEngine {
     this.clock = deps.clock ?? Date.now;
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
     this.leaseMs = deps.leaseMs ?? 30_000;
+    this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
@@ -340,7 +348,7 @@ export class WorkflowEngine {
     // A definitively-finished run must not be re-executed (e.g. a worker result landing after the
     // run was cancelled, or a duplicate resume) — that would replay the body and clobber the
     // terminal state. `failed` is intentionally NOT terminal here: retry resumes a failed run.
-    if (run.status === 'cancelled' || run.status === 'completed') {
+    if (run.status === 'cancelled' || run.status === 'completed' || run.status === 'dead') {
       return { runId, status: run.status, output: run.output, error: run.error };
     }
     // Pin to the version the run STARTED on — replay is positional, so running a changed
@@ -380,8 +388,36 @@ export class WorkflowEngine {
    * Resume every run left incomplete by a crash or deploy. Called on boot. Completed steps
    * replay from their checkpoints, so only the work that had not finished runs again.
    */
-  async recoverIncomplete(): Promise<RunResult[]> {
-    return this.resumeLeased(await this.store.listIncompleteRuns());
+  async recoverIncomplete(nowMs: number = this.clock()): Promise<RunResult[]> {
+    if (this.draining) return [];
+    const results: RunResult[] = [];
+    for (const run of await this.store.listIncompleteRuns()) {
+      const acquired = await this.store.tryLockRun(
+        run.id,
+        this.instanceId,
+        nowMs + this.leaseMs,
+        nowMs,
+      );
+      if (!acquired) continue;
+      const attempts = (run.recoveryAttempts ?? 0) + 1;
+      // Poison-pill guard: a run that keeps crashing the process on recovery is moved to the `dead`
+      // dead-letter state instead of being retried forever (so it's inspectable, not a crash loop).
+      if (this.maxRecoveryAttempts != null && attempts > this.maxRecoveryAttempts) {
+        const error = {
+          message: `run exceeded maxRecoveryAttempts (${this.maxRecoveryAttempts}) — moved to dead-letter`,
+          code: 'max_recovery_attempts',
+        };
+        await this.store.updateRun(run.id, { status: 'dead', error, updatedAt: new Date() });
+        await this.store.releaseRunLock(run.id);
+        this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+        results.push({ runId: run.id, status: 'dead', error });
+        continue;
+      }
+      // Count this attempt BEFORE resuming, so a crash mid-resume still advances the counter.
+      await this.store.updateRun(run.id, { recoveryAttempts: attempts, updatedAt: new Date() });
+      results.push(await this.resume(run.id));
+    }
+    return results;
   }
 
   /**
