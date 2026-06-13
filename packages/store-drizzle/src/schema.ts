@@ -30,6 +30,7 @@ export const stepCheckpoints = sqliteTable(
     input: text('input', { mode: 'json' }),
     output: text('output', { mode: 'json' }),
     error: text('error', { mode: 'json' }),
+    events: text('events', { mode: 'json' }),
     attempts: integer('attempts').notNull(),
     workerGroup: text('worker_group'),
     wakeAt: integer('wake_at'),

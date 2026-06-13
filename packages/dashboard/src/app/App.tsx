@@ -7,7 +7,7 @@ import {
   type WorkflowRun,
   durableClient,
 } from '../client/durable-client';
-import { RetryIcon, XIcon } from './icons';
+import { PlayIcon, RetryIcon, XIcon } from './icons';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
@@ -157,6 +157,7 @@ function RunDetail({ id }: { id: string }) {
   };
   const retry = useMutation({ mutationFn: () => durableClient.retry(id), onSuccess: invalidate });
   const cancel = useMutation({ mutationFn: () => durableClient.cancel(id), onSuccess: invalidate });
+  const cont = useMutation({ mutationFn: () => durableClient.continue(id), onSuccess: invalidate });
   const [sel, setSel] = useState<number>();
   const [showRunIO, setShowRunIO] = useState(false);
 
@@ -164,6 +165,10 @@ function RunDetail({ id }: { id: string }) {
   const { run, timeline } = data;
   const canRetry = run.status === 'failed' || run.status === 'suspended';
   const canCancel = run.status === 'running' || run.status === 'suspended';
+  // Paused at a breakpoint = a pending `signal` checkpoint named `breakpoint:*` (see ctx.breakpoint).
+  const atBreakpoint = timeline.some(
+    (s) => s.status === 'pending' && s.kind === 'signal' && s.name.startsWith('breakpoint'),
+  );
   const selStep = timeline.find((s) => s.seq === sel);
 
   return (
@@ -191,6 +196,17 @@ function RunDetail({ id }: { id: string }) {
           >
             {'{ }'}
           </button>
+          {atBreakpoint && (
+            <button
+              type="button"
+              disabled={cont.isPending}
+              onClick={() => cont.mutate()}
+              className="flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-amber-200 transition-colors enabled:hover:bg-amber-500/25 disabled:opacity-30"
+            >
+              <PlayIcon width={12} height={12} />
+              Continue
+            </button>
+          )}
           <button
             type="button"
             disabled={!canRetry || retry.isPending}

@@ -1,4 +1,5 @@
-import type { RemoteTask, StepResult } from './interfaces';
+import type { RemoteTask, StepEvent, StepLogger, StepResult } from './interfaces';
+import { createStepLogger } from './step-logger';
 
 /** Canonical step id — the stable identity of a step within a run, used for dedupe and
  *  correlation. The format is part of the cross-language wire contract (Python builds the same). */
@@ -6,7 +7,9 @@ export function stepId(runId: string, seq: number): string {
   return `${runId}:${seq}`;
 }
 
-export type StepHandler = (input: unknown) => Promise<unknown> | unknown;
+/** A remote-worker step body. The optional `log` records sub-process outcomes and debug/error
+ *  lines that ride back on the result — the TypeScript twin of the Python SDK's `StepContext`. */
+export type StepHandler = (input: unknown, log: StepLogger) => Promise<unknown> | unknown;
 
 /**
  * Run `handler` for `task` and produce the wire-format {@link StepResult}. Pure (no transport,
@@ -27,13 +30,17 @@ export async function runStepHandler(
       error: { message: `no handler for ${task.name}`, retryable: false },
     };
   }
+  const events: StepEvent[] = [];
+  const withEvents = (result: StepResult): StepResult =>
+    events.length > 0 ? { ...result, events } : result;
   try {
-    return { ...base, status: 'completed', output: await handler(task.input) };
+    const output = await handler(task.input, createStepLogger(events, Date.now));
+    return withEvents({ ...base, status: 'completed', output });
   } catch (err) {
-    return {
+    return withEvents({
       ...base,
       status: 'failed',
       error: { message: err instanceof Error ? err.message : String(err) },
-    };
+    });
   }
 }

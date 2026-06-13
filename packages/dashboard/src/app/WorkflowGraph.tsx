@@ -13,6 +13,7 @@ import { useCallback, useMemo } from 'react';
 import type { RunStatus, StepCheckpoint, WorkflowRun } from '../client/durable-client';
 import { BoltIcon, CheckIcon, iconFor, KIND_LABEL, XIcon } from './icons';
 
+type SubCounts = { ok: number; failed: number; skipped: number };
 type StepData = {
   seq: number;
   name: string;
@@ -21,6 +22,7 @@ type StepData = {
   workerGroup?: string;
   attempts: number;
   duration?: string;
+  subs?: SubCounts;
   selected: boolean;
 };
 type EndData = { status: RunStatus; label: string };
@@ -32,7 +34,11 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   // Literal class strings per state (Tailwind can't see interpolated names): failed → red,
   // in-flight → amber, done → emerald.
   const tone = failed
-    ? { rail: 'bg-red-400', badge: 'bg-red-500/15 text-red-300', pill: 'bg-red-500/20 text-red-300' }
+    ? {
+        rail: 'bg-red-400',
+        badge: 'bg-red-500/15 text-red-300',
+        pill: 'bg-red-500/20 text-red-300',
+      }
     : pending
       ? {
           rail: 'bg-amber-400',
@@ -79,7 +85,9 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
           </span>
         </div>
         <div className="mono mt-1.5 flex items-center gap-1.5 text-[10px] text-zinc-500">
-          <span className="rounded border border-[var(--line)] px-1 text-zinc-400">{data.kind}</span>
+          <span className="rounded border border-[var(--line)] px-1 text-zinc-400">
+            {data.kind}
+          </span>
           {data.attempts > 1 && (
             <span className="flex items-center gap-0.5 text-amber-300">
               <BoltIcon width={9} height={9} />
@@ -92,6 +100,17 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
             {data.duration && <span className="text-zinc-600"> · {data.duration}</span>}
           </span>
         </div>
+        {data.subs && (
+          <div className="mono mt-1.5 flex items-center gap-2 border-t border-[var(--line)] pt-1.5 text-[10px]">
+            {data.subs.ok > 0 && <span className="text-emerald-300">{data.subs.ok} ok</span>}
+            {data.subs.failed > 0 && (
+              <span className="text-red-300">{data.subs.failed} failed</span>
+            )}
+            {data.subs.skipped > 0 && (
+              <span className="text-amber-300">{data.subs.skipped} skipped</span>
+            )}
+          </div>
+        )}
       </div>
       <Handle type="source" position={Position.Right} className="!border-0 !bg-zinc-600" />
     </div>
@@ -113,6 +132,18 @@ function TerminalNode({ data }: NodeProps<Node<EndData>>) {
 }
 
 const nodeTypes = { step: StepCardNode, terminal: TerminalNode };
+
+/** Tally a step's sub-process outcomes (e.g. parallel p-processes) for the at-a-glance node badge.
+ *  Returns undefined when the step emitted no sub-process events. */
+function subCounts(s: StepCheckpoint): SubCounts | undefined {
+  const subs = s.events?.filter((e) => e.status);
+  if (!subs || subs.length === 0) return undefined;
+  return {
+    ok: subs.filter((e) => e.status === 'ok').length,
+    failed: subs.filter((e) => e.status === 'failed').length,
+    skipped: subs.filter((e) => e.status === 'skipped').length,
+  };
+}
 
 export function WorkflowGraph({
   run,
@@ -150,6 +181,7 @@ export function WorkflowGraph({
         workerGroup: s.workerGroup,
         attempts: s.attempts,
         duration: fmtDuration(s.startedAt, s.finishedAt),
+        subs: subCounts(s),
         selected: selected === s.seq,
       } satisfies StepData,
     }));

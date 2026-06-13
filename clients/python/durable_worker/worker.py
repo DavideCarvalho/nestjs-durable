@@ -10,9 +10,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from typing import Any, Awaitable, Callable, Dict, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
-Handler = Callable[[Any], Union[Any, Awaitable[Any]]]
+Handler = Callable[..., Union[Any, Awaitable[Any]]]
 
 
 class FatalError(Exception):
@@ -24,6 +24,63 @@ class FatalError(Exception):
     def __init__(self, message: str, code: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+
+
+class StepContext:
+    """Lets a handler record what happened inside a step — debug/info/warn/error lines and
+    per-sub-process outcomes. The events ride back on the result as ``events`` and the engine
+    checkpoints them, so the dashboard shows them under the step. The TypeScript counterpart is
+    the ``StepLogger`` handed to ``ctx.step`` — same ``StepEvent`` shape, so observability is
+    symmetric regardless of which language ran the step.
+
+    A handler opts in by declaring a second parameter::
+
+        @worker.step("processing")
+        def run(data, ctx):
+            for proc in data["procs"]:
+                ok = run_proc(proc)
+                ctx.sub(proc["name"], "ok" if ok else "failed")
+            return {"context": {...}}
+    """
+
+    def __init__(self) -> None:
+        self.events: List[Dict[str, Any]] = []
+
+    def _emit(
+        self,
+        level: str,
+        message: str,
+        name: Optional[str] = None,
+        status: Optional[str] = None,
+        data: Any = None,
+    ) -> None:
+        event: Dict[str, Any] = {"at": int(time.time() * 1000), "level": level, "message": message}
+        if name is not None:
+            event["name"] = name
+        if status is not None:
+            event["status"] = status
+        if data is not None:
+            event["data"] = data
+        self.events.append(event)
+
+    def debug(self, message: str, data: Any = None) -> None:
+        self._emit("debug", message, data=data)
+
+    def info(self, message: str, data: Any = None) -> None:
+        self._emit("info", message, data=data)
+
+    def warn(self, message: str, data: Any = None) -> None:
+        self._emit("warn", message, data=data)
+
+    def error(self, message: str, data: Any = None) -> None:
+        self._emit("error", message, data=data)
+
+    def sub(
+        self, name: str, status: str, message: Optional[str] = None, data: Any = None
+    ) -> None:
+        """Record a sub-step / sub-process outcome (e.g. one of N parallel p-processes)."""
+        level = "error" if status == "failed" else "warn" if status == "skipped" else "info"
+        self._emit(level, message or name, name=name, status=status, data=data)
 
 
 class Worker:
@@ -66,13 +123,14 @@ class Worker:
         handler = self._handlers.get(task["name"])
         if handler is None:
             return self._no_handler(base, task["name"])
+        ctx = StepContext()
         try:
-            output = handler(task.get("input"))
+            output = self._invoke(handler, task.get("input"), ctx)
             if inspect.isawaitable(output):
                 output = asyncio.run(output)
-            return {**base, "status": "completed", "output": output}
+            return self._completed(base, output, ctx)
         except Exception as err:  # noqa: BLE001
-            return self._failure(base, err)
+            return self._failure(base, err, ctx)
 
     async def aprocess_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         """Async variant — awaits async handlers in the current loop. Use from a transport that
@@ -82,13 +140,22 @@ class Worker:
         handler = self._handlers.get(task["name"])
         if handler is None:
             return self._no_handler(base, task["name"])
+        ctx = StepContext()
         try:
-            output = handler(task.get("input"))
+            output = self._invoke(handler, task.get("input"), ctx)
             if inspect.isawaitable(output):
                 output = await output
-            return {**base, "status": "completed", "output": output}
+            return self._completed(base, output, ctx)
         except Exception as err:  # noqa: BLE001
-            return self._failure(base, err)
+            return self._failure(base, err, ctx)
+
+    @staticmethod
+    def _invoke(handler: Handler, input_: Any, ctx: StepContext) -> Any:
+        """Call ``handler`` with the step input, passing ``ctx`` only if it declares a second
+        parameter — so plain ``def handler(data)`` handlers keep working unchanged."""
+        if _wants_ctx(handler):
+            return handler(input_, ctx)
+        return handler(input_)
 
     @staticmethod
     def _base(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -102,6 +169,10 @@ class Worker:
         }
 
     @staticmethod
+    def _completed(base: Dict[str, Any], output: Any, ctx: StepContext) -> Dict[str, Any]:
+        return _with_events({**base, "status": "completed", "output": output}, ctx)
+
+    @staticmethod
     def _no_handler(base: Dict[str, Any], name: str) -> Dict[str, Any]:
         return {
             **base,
@@ -110,11 +181,32 @@ class Worker:
         }
 
     @staticmethod
-    def _failure(base: Dict[str, Any], err: Exception) -> Dict[str, Any]:
+    def _failure(base: Dict[str, Any], err: Exception, ctx: StepContext) -> Dict[str, Any]:
+        # Keep whatever the handler logged before it threw — a partial p-process run is exactly
+        # the case where the sub-process outcomes matter most.
         if isinstance(err, FatalError):
-            return {
-                **base,
-                "status": "failed",
-                "error": {"message": str(err), "code": err.code, "retryable": False},
-            }
-        return {**base, "status": "failed", "error": {"message": str(err)}}
+            error = {"message": str(err), "code": err.code, "retryable": False}
+        else:
+            error = {"message": str(err)}
+        return _with_events({**base, "status": "failed", "error": error}, ctx)
+
+
+def _wants_ctx(handler: Handler) -> bool:
+    """True if ``handler`` can accept the step context as a second positional argument."""
+    try:
+        params = list(inspect.signature(handler).parameters.values())
+    except (ValueError, TypeError):  # builtins / C functions without a signature
+        return False
+    positional = [
+        p
+        for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    has_var_positional = any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params)
+    return len(positional) >= 2 or has_var_positional
+
+
+def _with_events(result: Dict[str, Any], ctx: StepContext) -> Dict[str, Any]:
+    if ctx.events:
+        result["events"] = ctx.events
+    return result

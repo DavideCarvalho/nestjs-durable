@@ -64,6 +64,8 @@ export interface StepCheckpoint {
   attempts: number;
   /** For remote steps: which worker group ran it. */
   workerGroup?: string;
+  /** Structured events/logs the step emitted (sub-step outcomes, debug/error lines). */
+  events?: StepEvent[];
   /** For sleep steps: epoch ms the sleep elapses at. */
   wakeAt?: number;
   /**
@@ -74,6 +76,40 @@ export interface StepCheckpoint {
   /** When processing actually began: worker pickup for a remote step, execution start for a local one. */
   startedAt: Date;
   finishedAt: Date;
+}
+
+/**
+ * A structured event a step (or its worker) emits while running — a log line and/or a sub-step
+ * outcome. The dashboard renders these under the step, so you can see what happened inside a step
+ * that the workflow treats as one unit (e.g. which of N parallel sub-processes ok/failed/skipped).
+ */
+export interface StepEvent {
+  /** Epoch ms. */
+  at: number;
+  level: 'debug' | 'info' | 'warn' | 'error';
+  message: string;
+  /** For a sub-step/sub-process within the step: its name. */
+  name?: string;
+  /** For a sub-step: its outcome. */
+  status?: 'ok' | 'failed' | 'skipped';
+  /** Optional structured payload. */
+  data?: unknown;
+}
+
+/**
+ * Handed to a local step's body (`ctx.step(name, (log) => …)`) so it can record what happened
+ * inside the step — debug/info/warn/error lines and per-sub-process outcomes. The events are
+ * checkpointed with the step and rendered under it in the dashboard. The remote/cross-language
+ * counterpart is the worker attaching the same `StepEvent[]` to its `StepResult` (see the Python
+ * SDK's `StepContext`), so observability is symmetric regardless of where the step ran.
+ */
+export interface StepLogger {
+  debug(message: string, data?: unknown): void;
+  info(message: string, data?: unknown): void;
+  warn(message: string, data?: unknown): void;
+  error(message: string, data?: unknown): void;
+  /** Record a sub-step / sub-process outcome (e.g. one of N parallel p-processes). */
+  sub(name: string, status: 'ok' | 'failed' | 'skipped', message?: string, data?: unknown): void;
 }
 
 export interface StepError {
@@ -175,6 +211,8 @@ export interface StepResult {
   error?: StepError;
   /** Epoch ms when the worker began processing — lets the engine report queue-wait time. */
   startedAt?: number;
+  /** Structured events the worker emitted while running the step (sub-step outcomes, logs). */
+  events?: StepEvent[];
 }
 
 export interface Heartbeat {
@@ -241,8 +279,16 @@ export interface RemoteStepDef<TInput = unknown, TOutput = unknown> extends Step
  */
 export interface WorkflowCtx {
   readonly runId: string;
-  /** Run a local durable step: executed once, then its result is checkpointed and replayed. */
-  step<TOutput>(name: string, fn: () => Promise<TOutput>, options?: StepOptions): Promise<TOutput>;
+  /**
+   * Run a local durable step: executed once, then its result is checkpointed and replayed. The
+   * body receives a {@link StepLogger} to record debug/error lines and sub-process outcomes — these
+   * are checkpointed with the step and shown under it in the dashboard.
+   */
+  step<TOutput>(
+    name: string,
+    fn: (log: StepLogger) => Promise<TOutput>,
+    options?: StepOptions,
+  ): Promise<TOutput>;
   /** Dispatch a typed remote step and await its checkpointed result. */
   call<TInput, TOutput>(step: RemoteStepDef<TInput, TOutput>, input: TInput): Promise<TOutput>;
   /**
@@ -265,7 +311,11 @@ export interface WorkflowCtx {
    * and resume with the result. The durable, first-class counterpart of the hand-rolled
    * "dispatch over SQS → wait for COMPLETE_PHASE → signal" pattern. `name` must be unique per run.
    */
-  task<TResult>(name: string, dispatch: () => Promise<void>, options?: StepOptions): Promise<TResult>;
+  task<TResult>(
+    name: string,
+    dispatch: () => Promise<void>,
+    options?: StepOptions,
+  ): Promise<TResult>;
   /**
    * Run another registered workflow as a **tracked child**: starts it once and suspends — zero
    * compute — until the child reaches a terminal state, then resumes with the child's output (or
@@ -273,6 +323,14 @@ export interface WorkflowCtx {
    * this run and the call position, so it's stable across replay.
    */
   child<TOutput>(workflow: string, input: unknown, childId?: string): Promise<TOutput>;
+  /**
+   * Pause the run at this point until a human resumes it from the dashboard (or
+   * `engine.continue(runId)`). Records a visible `pending` checkpoint so the breakpoint shows up
+   * in the timeline, then suspends with zero compute — the durable equivalent of a debugger
+   * breakpoint. Gate it on your own config to make breakpoints opt-in per run:
+   * `if (cfg.breakAfterExtraction) await ctx.breakpoint('after-extraction')`.
+   */
+  breakpoint(label?: string): Promise<void>;
 }
 
 /** Result of executing or resuming a workflow run. */

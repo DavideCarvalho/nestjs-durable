@@ -69,6 +69,9 @@ export class StepCheckpointEntity {
   @Property({ type: 'json', nullable: true })
   error?: unknown;
 
+  @Property({ type: 'json', nullable: true })
+  events?: unknown;
+
   @Property()
   attempts!: number;
 

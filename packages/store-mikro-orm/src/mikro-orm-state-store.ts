@@ -4,6 +4,7 @@ import type {
   StateStore,
   StepCheckpoint,
   StepError,
+  StepEvent,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import type { MikroORM } from '@mikro-orm/core';
@@ -168,6 +169,7 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
   e.input = cp.input ?? null;
   e.output = cp.output ?? null;
   e.error = cp.error ?? null;
+  e.events = cp.events ?? null;
   e.attempts = cp.attempts;
   e.workerGroup = cp.workerGroup;
   e.wakeAt = cp.wakeAt == null ? undefined : new Date(cp.wakeAt);
@@ -188,6 +190,7 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
     input: e.input ?? undefined,
     output: e.output ?? undefined,
     error: (e.error ?? undefined) as StepError | undefined,
+    events: (e.events ?? undefined) as StepEvent[] | undefined,
     attempts: e.attempts,
     workerGroup: e.workerGroup ?? undefined,
     wakeAt: e.wakeAt?.getTime(),

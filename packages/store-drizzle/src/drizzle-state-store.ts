@@ -4,6 +4,7 @@ import type {
   StateStore,
   StepCheckpoint,
   StepError,
+  StepEvent,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { and, asc, eq, isNotNull, isNull, lte, or } from 'drizzle-orm';
@@ -205,6 +206,7 @@ function toCheckpointRow(cp: StepCheckpoint): CheckpointRow {
     input: cp.input ?? null,
     output: cp.output ?? null,
     error: cp.error ?? null,
+    events: cp.events ?? null,
     attempts: cp.attempts,
     workerGroup: cp.workerGroup ?? null,
     wakeAt: cp.wakeAt ?? null,
@@ -225,6 +227,7 @@ function fromCheckpointRow(row: CheckpointRow): StepCheckpoint {
     input: row.input ?? undefined,
     output: row.output ?? undefined,
     error: (row.error ?? undefined) as StepError | undefined,
+    events: (row.events ?? undefined) as StepEvent[] | undefined,
     attempts: row.attempts,
     workerGroup: row.workerGroup ?? undefined,
     wakeAt: row.wakeAt ?? undefined,

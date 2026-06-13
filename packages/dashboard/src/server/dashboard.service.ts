@@ -42,4 +42,9 @@ export class DashboardService {
   cancel(runId: string): Promise<RunResult | null> {
     return this.engine.cancel(runId);
   }
+
+  /** Resume a run paused at a `ctx.breakpoint` (the "continue" button). */
+  continue(runId: string): Promise<RunResult | null> {
+    return this.engine.continue(runId);
+  }
 }

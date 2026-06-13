@@ -1,4 +1,9 @@
-import { DURABLE_OPTIONS, TRANSPORT, type Transport } from '@dudousxd/nestjs-durable-core';
+import {
+  DURABLE_OPTIONS,
+  type StepLogger,
+  TRANSPORT,
+  type Transport,
+} from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable, type OnModuleInit } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { getDurableStepMeta } from './decorators';
@@ -6,7 +11,7 @@ import type { DurableModuleOptions } from './durable.module';
 
 /** A transport that can run step handlers in-process (e.g. the event-emitter transport). */
 interface LocalTaskHandling {
-  handle(name: string, fn: (input: unknown) => Promise<unknown>): void;
+  handle(name: string, fn: (input: unknown, log: StepLogger) => Promise<unknown>): void;
 }
 
 function supportsHandle(transport: unknown): transport is LocalTaskHandling {
@@ -43,7 +48,8 @@ export class DurableStepRegistrar implements OnModuleInit {
         if (typeof method !== 'function') continue;
         const meta = getDurableStepMeta(method);
         if (!meta) continue;
-        transport.handle(meta.name, (input) => instance[methodName](input));
+        // Forward the step logger as a second arg; methods that only declare `(input)` ignore it.
+        transport.handle(meta.name, (input, log) => instance[methodName](input, log));
       }
     }
   }

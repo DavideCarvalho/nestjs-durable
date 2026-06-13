@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { StepCheckpoint, WorkflowRun } from '../client/durable-client';
+import type { StepCheckpoint, StepEvent, WorkflowRun } from '../client/durable-client';
 import { BoltIcon, CheckIcon, CopyIcon, iconFor, KIND_LABEL, XIcon } from './icons';
 
 function fmtMs(ms: number): string {
@@ -13,12 +13,92 @@ function fmtDur(a: string, b: string): string {
 }
 
 function clock(iso: string): string {
-  return new Date(iso).toLocaleTimeString(undefined, {
+  return clockMs(new Date(iso).getTime());
+}
+
+function clockMs(at: number): string {
+  return new Date(at).toLocaleTimeString(undefined, {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
     fractionalSecondDigits: 3,
   });
+}
+
+const SUB_TONE: Record<NonNullable<StepEvent['status']>, string> = {
+  ok: 'border-emerald-500/25 bg-emerald-500/10 text-emerald-300',
+  failed: 'border-red-500/25 bg-red-500/10 text-red-300',
+  skipped: 'border-amber-500/25 bg-amber-500/10 text-amber-300',
+};
+
+const LEVEL_TONE: Record<StepEvent['level'], string> = {
+  debug: 'text-zinc-500',
+  info: 'text-zinc-300',
+  warn: 'text-amber-300',
+  error: 'text-red-300',
+};
+
+const SUB_ORDER: Array<NonNullable<StepEvent['status']>> = ['ok', 'failed', 'skipped'];
+
+/** Sub-process outcomes (ok/failed/skipped) and the log lines a step emitted, e.g. one row per
+ *  parallel p-process so you can see which succeeded, failed, or weren't validated. */
+function StepEvents({ events }: { events: StepEvent[] }) {
+  const subs = events.filter((e) => e.status);
+  const logs = events.filter((e) => !e.status);
+  const counts = SUB_ORDER.map(
+    (s) => [s, subs.filter((e) => e.status === s).length] as const,
+  ).filter(([, n]) => n > 0);
+
+  return (
+    <>
+      {subs.length > 0 && (
+        <section className="rise">
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">
+              sub-processes · {subs.length}
+            </span>
+            <span className="mono flex gap-2 text-[10px] uppercase tracking-wider">
+              {counts.map(([s, n]) => (
+                <span key={s} className={SUB_TONE[s].split(' ').pop()}>
+                  {n} {s}
+                </span>
+              ))}
+            </span>
+          </div>
+          <ul className="flex flex-col gap-1">
+            {subs.map((e) => (
+              <li
+                key={`${e.at}-${e.name}`}
+                className={`flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-[11.5px] ${SUB_TONE[e.status as NonNullable<StepEvent['status']>]}`}
+              >
+                <span className="mono truncate text-zinc-200">{e.name}</span>
+                <span className="mono shrink-0 text-[10px] uppercase tracking-wider">
+                  {e.status}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {logs.length > 0 && (
+        <section className="rise">
+          <div className="mono mb-1.5 text-[10px] uppercase tracking-[0.18em] text-zinc-500">
+            logs · {logs.length}
+          </div>
+          <ul className="mono max-h-64 overflow-auto rounded-lg border border-[var(--line)] bg-black/40 p-2.5 text-[11px] leading-relaxed">
+            {logs.map((e) => (
+              <li key={`${e.at}-${e.message}`} className="flex gap-2 py-0.5">
+                <span className="shrink-0 text-zinc-600 tnum">{clockMs(e.at)}</span>
+                <span className={`shrink-0 uppercase ${LEVEL_TONE[e.level]}`}>{e.level}</span>
+                <span className="min-w-0 break-words text-zinc-300">{e.message}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+    </>
+  );
 }
 
 function CopyButton({ value }: { value: string }) {
@@ -132,7 +212,13 @@ export function StepDetailPanel({
           )}
           <Field
             k="duration"
-            v={pending ? <span className="text-amber-300">running…</span> : fmtDur(step.startedAt, step.finishedAt)}
+            v={
+              pending ? (
+                <span className="text-amber-300">running…</span>
+              ) : (
+                fmtDur(step.startedAt, step.finishedAt)
+              )
+            }
           />
           <Field
             k="attempts"
@@ -159,6 +245,8 @@ export function StepDetailPanel({
             </div>
           </section>
         )}
+
+        {step.events && step.events.length > 0 && <StepEvents events={step.events} />}
 
         {step.input !== undefined && <Json label="input" value={step.input} />}
         {step.output !== undefined && <Json label="output" value={step.output} />}

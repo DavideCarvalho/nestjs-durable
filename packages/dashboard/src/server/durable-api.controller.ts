@@ -30,4 +30,11 @@ export class DurableApiController {
     if (!result) throw new NotFoundException(`run ${id} not found`);
     return result;
   }
+
+  @Post('runs/:id/continue')
+  async continue(@Param('id') id: string) {
+    const result = await this.dashboard.continue(id);
+    if (!result) throw new NotFoundException(`run ${id} is not paused at a breakpoint`);
+    return result;
+  }
 }

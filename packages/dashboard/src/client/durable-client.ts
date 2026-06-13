@@ -14,6 +14,17 @@ export interface WorkflowRun {
   updatedAt: string;
 }
 
+export interface StepEvent {
+  at: number;
+  level: 'debug' | 'info' | 'warn' | 'error';
+  message: string;
+  /** For a sub-step/sub-process within the step: its name. */
+  name?: string;
+  /** For a sub-step: its outcome. */
+  status?: 'ok' | 'failed' | 'skipped';
+  data?: unknown;
+}
+
 export interface StepCheckpoint {
   runId: string;
   seq: number;
@@ -25,6 +36,8 @@ export interface StepCheckpoint {
   input?: unknown;
   output?: unknown;
   error?: { message: string };
+  /** Structured events the step (or its worker) emitted — sub-process outcomes + debug/error logs. */
+  events?: StepEvent[];
   attempts: number;
   workerGroup?: string;
   wakeAt?: number;
@@ -73,5 +86,8 @@ export const durableClient = {
   },
   cancel(id: string): Promise<WorkflowRun> {
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+  },
+  continue(id: string): Promise<WorkflowRun> {
+    return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/continue`, { method: 'POST' });
   },
 };

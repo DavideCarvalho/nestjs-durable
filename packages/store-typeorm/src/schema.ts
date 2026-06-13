@@ -44,7 +44,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
     `CREATE TABLE IF NOT EXISTS ${checkpoints} (
       ${q('runId')} ${str} NOT NULL, ${q('seq')} ${int} NOT NULL,
       ${q('name')} ${str} NOT NULL, ${q('kind')} ${str} NOT NULL, ${q('stepId')} ${str} NOT NULL,
-      ${q('status')} ${str} NOT NULL, ${q('input')} ${txt}, ${q('output')} ${txt}, ${q('error')} ${txt},
+      ${q('status')} ${str} NOT NULL, ${q('input')} ${txt}, ${q('output')} ${txt}, ${q('error')} ${txt}, ${q('events')} ${txt},
       ${q('attempts')} ${int} NOT NULL, ${q('workerGroup')} ${str},
       ${q('wakeAt')} ${ts}, ${q('enqueuedAt')} ${ts},
       ${q('startedAt')} ${ts} NOT NULL, ${q('finishedAt')} ${ts} NOT NULL,
@@ -55,9 +55,33 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
     )`,
   ];
 
+  // Additive nullable columns gained across versions (e.g. `input`, `events`, `enqueuedAt`). On a
+  // table that predates them, `CREATE TABLE IF NOT EXISTS` above is a no-op, so back-fill each one
+  // best-effort — making the auto-schema self-healing instead of requiring a manual migration.
+  const addColumns: Array<[string, string, string]> = [
+    [runs, 'input', txt],
+    [runs, 'output', txt],
+    [runs, 'error', txt],
+    [checkpoints, 'input', txt],
+    [checkpoints, 'output', txt],
+    [checkpoints, 'error', txt],
+    [checkpoints, 'events', txt],
+    [checkpoints, 'workerGroup', str],
+    [checkpoints, 'enqueuedAt', ts],
+  ];
+
   const runner = dataSource.createQueryRunner();
   try {
     for (const sql of tables) await runner.query(sql);
+    // Postgres has `ADD COLUMN IF NOT EXISTS`; MySQL/SQLite don't, so fall back to try/ignore.
+    for (const [table, col, colType] of addColumns) {
+      const ifNotExists = isPg ? 'IF NOT EXISTS ' : '';
+      try {
+        await runner.query(`ALTER TABLE ${table} ADD COLUMN ${ifNotExists}${q(col)} ${colType}`);
+      } catch {
+        /* column already exists */
+      }
+    }
     // MySQL has no `CREATE INDEX IF NOT EXISTS`; create it best-effort and ignore "already exists".
     try {
       await runner.query(

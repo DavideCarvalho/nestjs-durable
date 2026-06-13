@@ -4,6 +4,7 @@ import type {
   StateStore,
   StepCheckpoint,
   StepError,
+  StepEvent,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { Brackets, type DataSource, IsNull, LessThanOrEqual } from 'typeorm';
@@ -171,6 +172,7 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
     input: cp.input ?? null,
     output: cp.output ?? null,
     error: cp.error ?? null,
+    events: cp.events ?? null,
     attempts: cp.attempts,
     workerGroup: cp.workerGroup ?? null,
     wakeAt: cp.wakeAt == null ? undefined : new Date(cp.wakeAt),
@@ -191,6 +193,7 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
     input: e.input ?? undefined,
     output: e.output ?? undefined,
     error: (e.error ?? undefined) as StepError | undefined,
+    events: (e.events ?? undefined) as StepEvent[] | undefined,
     attempts: e.attempts,
     workerGroup: e.workerGroup ?? undefined,
     wakeAt: e.wakeAt == null ? undefined : e.wakeAt.getTime(),

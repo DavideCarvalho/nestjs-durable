@@ -64,6 +64,39 @@ describe('TypeOrmStateStore', () => {
     await dataSource.destroy();
   });
 
+  it('self-heals a pre-existing table that predates the events column', async () => {
+    const dataSource = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [...ENTITIES],
+      synchronize: false,
+    });
+    await dataSource.initialize();
+    // Simulate an older deploy: the checkpoints table exists but lacks `events` (and `enqueuedAt`).
+    await dataSource.query(
+      `CREATE TABLE "durable_step_checkpoints" (
+        "runId" varchar(191) NOT NULL, "seq" integer NOT NULL,
+        "name" varchar(191) NOT NULL, "kind" varchar(191) NOT NULL, "stepId" varchar(191) NOT NULL,
+        "status" varchar(191) NOT NULL, "input" text, "output" text, "error" text,
+        "attempts" integer NOT NULL, "workerGroup" varchar(191),
+        "wakeAt" datetime, "startedAt" datetime NOT NULL, "finishedAt" datetime NOT NULL,
+        PRIMARY KEY ("runId", "seq")
+      )`,
+    );
+    const store = new TypeOrmStateStore(dataSource);
+
+    await store.ensureSchema(); // adds the missing `events` + `enqueuedAt` columns
+
+    await store.createRun(run());
+    await store.saveCheckpoint(
+      checkpoint({ events: [{ at: 1, level: 'error', message: 'p-3 failed', name: 'p-3', status: 'failed' }] }),
+    );
+    expect((await store.getCheckpoint('r1', 0))?.events).toEqual([
+      { at: 1, level: 'error', message: 'p-3 failed', name: 'p-3', status: 'failed' },
+    ]);
+    await dataSource.destroy();
+  });
+
   it('persists a run with JSON input and reads it back', async () => {
     const { store, dataSource } = await makeStore();
     await store.createRun(run());

@@ -29,6 +29,7 @@ model DurableStepCheckpoint {
   input       Json?
   output      Json?
   error       Json?
+  events      Json?
   attempts    Int
   workerGroup String?
   wakeAt      BigInt?

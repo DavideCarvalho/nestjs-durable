@@ -7,7 +7,9 @@ import type {
   RunResult,
   StateStore,
   StepError,
+  StepEvent,
   StepKind,
+  StepLogger,
   StepOptions,
   StepResult,
   Transport,
@@ -15,8 +17,12 @@ import type {
   WorkflowRun,
 } from './interfaces';
 import { stepId } from './protocol';
+import { createStepLogger } from './step-logger';
 
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
+
+/** Deterministic signal token a breakpoint suspends on — derived from its logical position. */
+const breakpointToken = (runId: string, seq: number): string => `bp:${runId}:${seq}`;
 
 interface RegisteredWorkflow {
   name: string;
@@ -38,6 +44,7 @@ function isNewerVersion(a: string, b: string): boolean {
 interface RemoteResolution {
   output: unknown;
   startedAt?: number;
+  events?: StepEvent[];
 }
 
 interface PendingRemote {
@@ -109,7 +116,11 @@ export class WorkflowEngine {
       if (waiter) {
         this.pending.delete(result.stepId);
         if (result.status === 'completed') {
-          waiter.resolve({ output: result.output, startedAt: result.startedAt });
+          waiter.resolve({
+            output: result.output,
+            startedAt: result.startedAt,
+            events: result.events,
+          });
         } else {
           waiter.reject(new RemoteStepError(result.error));
         }
@@ -282,7 +293,10 @@ export class WorkflowEngine {
    * null if no run is waiting on the task (e.g. a duplicate/late delivery) — a safe no-op.
    */
   async completeTask(runId: string, name: string, result: unknown): Promise<RunResult | null> {
-    return this.signal(`task:${runId}:${name}`, { ok: true, value: result } satisfies Completion<unknown>);
+    return this.signal(`task:${runId}:${name}`, {
+      ok: true,
+      value: result,
+    } satisfies Completion<unknown>);
   }
 
   /** Report that a `ctx.task` failed — the run resumes and throws a FatalError at the task. */
@@ -317,6 +331,7 @@ export class WorkflowEngine {
     kind: StepKind;
     input?: unknown;
     output: unknown;
+    events?: StepEvent[];
     attempts: number;
     enqueuedAt: Date;
     startedAt: Date;
@@ -331,6 +346,7 @@ export class WorkflowEngine {
       status: 'completed',
       input: step.input,
       output: step.output,
+      events: step.events && step.events.length > 0 ? step.events : undefined,
       attempts: step.attempts,
       workerGroup: step.workerGroup,
       enqueuedAt: step.enqueuedAt,
@@ -357,6 +373,7 @@ export class WorkflowEngine {
     kind: StepKind;
     input?: unknown;
     error: StepError;
+    events?: StepEvent[];
     attempts: number;
     enqueuedAt: Date;
     startedAt: Date;
@@ -371,6 +388,7 @@ export class WorkflowEngine {
       status: 'failed',
       input: step.input,
       error: step.error,
+      events: step.events && step.events.length > 0 ? step.events : undefined,
       attempts: step.attempts,
       workerGroup: step.workerGroup,
       enqueuedAt: step.enqueuedAt,
@@ -455,7 +473,7 @@ export class WorkflowEngine {
 
     const step = async <T>(
       name: string,
-      fn: () => Promise<T>,
+      fn: (log: StepLogger) => Promise<T>,
       options?: StepOptions,
     ): Promise<T> => {
       const current = nextSeq();
@@ -469,9 +487,22 @@ export class WorkflowEngine {
       const maxAttempts = Math.max(1, options?.retries ?? 1);
       const startedAt = new Date();
       for (let attempt = 1; ; attempt += 1) {
+        // Events are scoped per attempt — a retry starts a clean log, so the checkpoint reflects
+        // only the attempt that actually completed (or the final failing one).
+        const events: StepEvent[] = [];
         try {
-          const output = await fn();
-          await this.completeStep({ runId, seq: current, name, kind: 'local', output, attempts: attempt, enqueuedAt: startedAt, startedAt });
+          const output = await fn(createStepLogger(events, this.clock));
+          await this.completeStep({
+            runId,
+            seq: current,
+            name,
+            kind: 'local',
+            output,
+            events,
+            attempts: attempt,
+            enqueuedAt: startedAt,
+            startedAt,
+          });
           if (options?.compensate) compensations.push(options.compensate);
           return output;
         } catch (err) {
@@ -485,6 +516,7 @@ export class WorkflowEngine {
                 message: err instanceof Error ? err.message : String(err),
                 stack: err instanceof Error ? err.stack : undefined,
               },
+              events,
               attempts: attempt,
               enqueuedAt: startedAt,
               startedAt,
@@ -555,6 +587,24 @@ export class WorkflowEngine {
     // Child workflow: start it once, then suspend on a `child:<id>` waiter the child signals on its
     // terminal state (see notifyParent). The start is deferred to a microtask so it runs AFTER this
     // run suspends — a fast child can't reentrantly resume a parent that's still running.
+    // A breakpoint = a visible `pending` checkpoint + a signal waiter the dashboard resumes via
+    // `engine.continue`. Reuses the signal machinery (kind 'signal'), so resume overwrites the
+    // pending checkpoint with a completed one and the run replays past it.
+    const breakpoint = async (label?: string): Promise<void> => {
+      const current = nextSeq();
+      const existing = await store.getCheckpoint(runId, current);
+      if (existing && existing.status === 'completed') return;
+      if (!existing) {
+        await this.recordBreakpoint(runId, current, label);
+        await store.putSignalWaiter({
+          token: breakpointToken(runId, current),
+          runId,
+          seq: current,
+        });
+      }
+      throw new WorkflowSuspended();
+    };
+
     const child = async <T>(workflow: string, input: unknown, childId?: string): Promise<T> => {
       const current = nextSeq();
       const id = childId ?? `${runId}.child.${current}`;
@@ -578,13 +628,19 @@ export class WorkflowEngine {
       waitForSignal,
       task,
       child,
+      breakpoint,
       call: <TInput, TOutput>(remote: RemoteStepDef<TInput, TOutput>, input: TInput) =>
         this.callRemote(runId, nextSeq(), remote, input),
     };
   }
 
   /** Persist a completed timer checkpoint (a durable sleep / signal deadline) at a logical position. */
-  private async recordTimer(runId: string, seq: number, name: string, wakeAt: number): Promise<void> {
+  private async recordTimer(
+    runId: string,
+    seq: number,
+    name: string,
+    wakeAt: number,
+  ): Promise<void> {
     const at = new Date();
     await this.store.saveCheckpoint({
       runId,
@@ -599,6 +655,35 @@ export class WorkflowEngine {
       startedAt: at,
       finishedAt: at,
     });
+  }
+
+  /** Persist a `pending` checkpoint marking a breakpoint, so it's visible (and resumable) in the UI. */
+  private async recordBreakpoint(runId: string, seq: number, label?: string): Promise<void> {
+    const at = new Date();
+    await this.store.saveCheckpoint({
+      runId,
+      seq,
+      name: label ? `breakpoint:${label}` : 'breakpoint',
+      kind: 'signal',
+      stepId: stepId(runId, seq),
+      status: 'pending',
+      attempts: 1,
+      enqueuedAt: at,
+      startedAt: at,
+      finishedAt: at,
+    });
+  }
+
+  /**
+   * Resume a run paused at a {@link WorkflowCtx.breakpoint} (e.g. the dashboard "continue" button).
+   * Finds the run's pending breakpoint checkpoint and signals it. Returns null if the run isn't
+   * paused at a breakpoint.
+   */
+  async continue(runId: string): Promise<RunResult | null> {
+    const checkpoints = await this.store.listCheckpoints(runId);
+    const bp = checkpoints.find((c) => c.status === 'pending' && c.kind === 'signal');
+    if (!bp) return null;
+    return this.signal(breakpointToken(runId, bp.seq), undefined);
   }
 
   private async callRemote<TInput, TOutput>(
@@ -664,6 +749,7 @@ export class WorkflowEngine {
       status: result.status,
       output: result.status === 'completed' ? result.output : cp.output,
       error: result.error,
+      events: result.events ?? cp.events,
       startedAt,
       finishedAt,
     });
@@ -728,6 +814,7 @@ export class WorkflowEngine {
           kind: 'remote',
           input: validInput,
           output,
+          events: resolution.events,
           attempts: attempt,
           workerGroup: step.group,
           enqueuedAt,

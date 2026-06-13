@@ -1,6 +1,6 @@
 import unittest
 
-from durable_worker import FatalError, Worker
+from durable_worker import FatalError, StepContext, Worker
 
 
 def task(name="payments.charge-card", **over):
@@ -80,6 +80,61 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertFalse(result["error"]["retryable"])
         self.assertEqual(result["error"]["code"], "declined")
+
+
+    def test_handler_without_ctx_param_omits_events(self):
+        worker = Worker()
+
+        @worker.step("payments.charge-card")
+        def charge(_data):
+            return {"chargeId": "ch_1"}
+
+        self.assertNotIn("events", worker.process_task(task()))
+
+    def test_ctx_records_sub_process_outcomes_on_the_result(self):
+        worker = Worker()
+
+        @worker.step("payments.charge-card")
+        def charge(_data, ctx: StepContext):
+            ctx.info("planned 3 procs")
+            ctx.sub("proc-a", "ok")
+            ctx.sub("proc-b", "failed", "validation rejected")
+            ctx.sub("proc-c", "skipped")
+            return {"chargeId": "ch_1"}
+
+        result = worker.process_task(task())
+        self.assertEqual(result["status"], "completed")
+        events = result["events"]
+        self.assertEqual(len(events), 4)
+        subs = [e for e in events if "status" in e]
+        self.assertEqual(
+            [(e["name"], e["status"], e["level"]) for e in subs],
+            [("proc-a", "ok", "info"), ("proc-b", "failed", "error"), ("proc-c", "skipped", "warn")],
+        )
+        self.assertTrue(all(isinstance(e["at"], int) for e in events))
+
+    def test_events_logged_before_a_throw_survive_on_failure(self):
+        worker = Worker()
+
+        @worker.step("payments.charge-card")
+        def charge(_data, ctx):
+            ctx.sub("proc-a", "ok")
+            raise RuntimeError("blip")
+
+        result = worker.process_task(task())
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["events"][0]["name"], "proc-a")
+
+    def test_async_handler_receives_ctx(self):
+        worker = Worker()
+
+        @worker.step("payments.charge-card")
+        async def charge(_data, ctx):
+            ctx.debug("async")
+            return {"ok": True}
+
+        result = worker.process_task(task())
+        self.assertEqual(result["events"][0]["message"], "async")
 
 
 if __name__ == "__main__":

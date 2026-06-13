@@ -69,6 +69,9 @@ export class StepCheckpointEntity {
   @Column('simple-json', { nullable: true })
   error?: unknown;
 
+  @Column('simple-json', { nullable: true })
+  events?: unknown;
+
   @Column('integer')
   attempts!: number;
 

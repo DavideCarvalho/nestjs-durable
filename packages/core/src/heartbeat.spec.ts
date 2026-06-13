@@ -1,13 +1,7 @@
 import { z } from 'zod';
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
-import type {
-  Heartbeat,
-  RemoteStepDef,
-  RemoteTask,
-  StepResult,
-  Transport,
-} from './interfaces';
+import type { Heartbeat, RemoteStepDef, RemoteTask, StepResult, Transport } from './interfaces';
 import { remoteStep } from './remote-step-factory';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
@@ -40,9 +34,7 @@ describe('remote-step liveness (heartbeats)', () => {
   it('times out and re-dispatches a presumed-dead worker, then fails', async () => {
     const transport = new ControlTransport();
     const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
-    engine.register('wf', '1', async (ctx) =>
-      ctx.call({ ...echo, timeoutMs: 30, retries: 2 }, {}),
-    );
+    engine.register('wf', '1', async (ctx) => ctx.call({ ...echo, timeoutMs: 30, retries: 2 }, {}));
 
     const res = await engine.start('wf', {}, 'r1'); // never delivered → timeout × 2 → fail
     expect(res.status).toBe('failed');
@@ -62,7 +54,13 @@ describe('remote-step liveness (heartbeats)', () => {
     await sleep(40);
     await transport.heartbeatHandler?.({ runId: 'r2', seq: 0, stepId: id, group: 'g' }); // rearm
     await sleep(30); // 70ms total — past 60ms, but only 30ms since the last beat
-    await transport.resultHandler?.({ runId: 'r2', seq: 0, stepId: id, status: 'completed', output: 'ok' });
+    await transport.resultHandler?.({
+      runId: 'r2',
+      seq: 0,
+      stepId: id,
+      status: 'completed',
+      output: 'ok',
+    });
 
     const res = await runPromise;
     expect(res.status).toBe('completed');

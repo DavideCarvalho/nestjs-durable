@@ -4,6 +4,7 @@ import type {
   StateStore,
   StepCheckpoint,
   StepError,
+  StepEvent,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 
@@ -38,6 +39,7 @@ interface CheckpointRow {
   input: unknown;
   output: unknown;
   error: unknown;
+  events: unknown;
   attempts: number;
   workerGroup: string | null;
   wakeAt: bigint | null;
@@ -239,6 +241,7 @@ function toCheckpointData(cp: StepCheckpoint) {
     input: jsonOrNull(cp.input),
     output: jsonOrNull(cp.output),
     error: jsonOrNull(cp.error),
+    events: jsonOrNull(cp.events),
     attempts: cp.attempts,
     workerGroup: cp.workerGroup ?? null,
     wakeAt: bigOrNull(cp.wakeAt),
@@ -259,6 +262,7 @@ function fromCheckpointRow(row: CheckpointRow): StepCheckpoint {
     input: row.input ?? undefined,
     output: row.output ?? undefined,
     error: (row.error ?? undefined) as StepError | undefined,
+    events: (row.events ?? undefined) as StepEvent[] | undefined,
     attempts: row.attempts,
     workerGroup: row.workerGroup ?? undefined,
     wakeAt: numOrUndef(row.wakeAt),

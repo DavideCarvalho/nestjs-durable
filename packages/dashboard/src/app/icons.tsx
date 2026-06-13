@@ -80,6 +80,13 @@ export function BoltIcon(p: SVGProps<SVGSVGElement>) {
     </svg>
   );
 }
+export function PlayIcon(p: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...p} aria-hidden>
+      <path d="M6 4l14 8-14 8z" />
+    </svg>
+  );
+}
 
 const KIND_ICON: Record<string, (p: SVGProps<SVGSVGElement>) => JSX.Element> = {
   local: CpuIcon,
