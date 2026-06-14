@@ -35,8 +35,116 @@ DurableModule.forRootAsync({
 Great for splitting a workflow across modules in one app, and for tests. When you need the step
 to run elsewhere, swap the transport — the workflow code is unchanged.
 
+## Control plane (separate from the transport)
+
+The transport is **point-to-point**: it carries a `RemoteTask` to one worker and a `StepResult`
+back. But some things every engine instance needs regardless of who runs a given run — a
+dashboard-only pod must live-tail a run executing on a worker pod, and the pod actually running a
+run must learn it was cancelled elsewhere. That cross-instance fan-out is a **second channel**, the
+`ControlPlane`, now modelled separately from `Transport`:
+
+```ts
+export interface ControlPlane {
+  publishControl(msg: ControlMessage): Promise<void>;
+  onControl(handler: (msg: ControlMessage) => void): void;
+}
+```
+
+`ControlMessage` is either a lifecycle `event` (for SSE live-tail across pods) or a `cancel`
+(cooperative cancellation). Each message carries the originating engine's `instanceId` as `from`, so
+a broker that echoes a publish back to its own subscriber (Redis pub/sub) is deduped by the
+originator — an instance ignores its own messages and only re-delivers ones from other instances.
+
+The engine takes `controlPlane` as a **separate dependency** from the task `transport`:
+
+```ts
+const engine = new WorkflowEngine({ store, transport, controlPlane });
+```
+
+Omit it and the engine is **local-only**: events and cancellation reach subscribers on this instance
+but don't fan out to other pods (fine for a single-instance app). Supply one and lifecycle events
+broadcast to every pod (cross-pod live-tail) and a `cancel` reaches the pod running the run.
+
+A **broadcast-capable transport** — `EventEmitterTransport` (in-process) and `BullMQTransport`
+(Redis pub/sub) — implements `ControlPlane` too, so you can pass the same instance as **both** the
+transport and the control plane:
+
+```ts
+const bull = new BullMQTransport(/* … */);
+const engine = new WorkflowEngine({ store, transport: bull, controlPlane: bull });
+```
+
+The NestJS module does this wiring for you. It **auto-wires** the (first) task transport as the
+control plane when it qualifies (`event-emitter`, BullMQ), or accepts an explicit `controlPlane`
+option to use a dedicated channel:
+
+```ts
+// auto-wired: BullMQ transport doubles as the control plane
+DurableModule.forRoot({ store, transport: bullmq });
+
+// explicit: a point-to-point transport (SQS) + a dedicated broadcast control plane
+DurableModule.forRoot({ store, transport: sqs, controlPlane: redisControlPlane });
+```
+
+<Callout type="warn">
+This is a **breaking change** vs the old single-`Transport` design, where a transport was expected to
+do both jobs. Broadcast and point-to-point work are now distinct interfaces. If your transport can do
+both, pass it as both; if it's point-to-point only (SQS, DB), pass a separate `controlPlane` (or omit
+it for a single-instance setup).
+</Callout>
+
+## Multiple transports + failover
+
+The engine can dispatch over an **ordered pool** of named transports instead of a single one. Pass
+`transports: NamedTransport[]` — each entry is `{ id, transport }`:
+
+```ts
+const engine = new WorkflowEngine({
+  store,
+  transports: [
+    { id: 'redis', transport: new BullMQTransport(/* … */) },
+    { id: 'sqs', transport: new SqsTransport(/* … */) },
+  ],
+});
+```
+
+The engine dispatches each remote step on the **first** transport in the pool and **fails over** to
+the next on a dispatch error, trying them in order until one accepts (it throws only if every one
+fails). The single `transport` option is just shorthand for a one-entry pool with id `default`.
+
+A step can **pin** a specific transport by id, overriding the default-first order (the pinned one is
+tried first, then the rest as failover):
+
+```ts
+// in the workflow — force this dispatch onto the SQS transport:
+const result = await ctx.call(heavyStep, input, { transport: 'sqs' });
+```
+
+The id of the transport that actually accepted the dispatch is **stamped on the task** as
+`task.transport`. So a worker that consumes several transports replies on the **matching** one —
+failover is symmetric, and the worker never has to choose a transport itself. The engine binds its
+result/heartbeat handlers on every transport in the pool for the same reason: a result can come back
+on whichever transport delivered the task.
+
+The NestJS module exposes the pool via the `transports` option:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transports: [
+    { id: 'redis', transport: bullmq },
+    { id: 'sqs', transport: sqs },
+  ],
+});
+```
+
+When you give a pool, the control plane defaults to the **first** entry's transport if it can
+broadcast (e.g. `redis` above); set `controlPlane` explicitly to use a different one.
+
 ## Wire protocol
 
 Every transport carries the same JSON `RemoteTask` (dispatch) and `StepResult` (reply). It's
 documented so any language can implement a worker — see [Python](/docs/python) and
-[BullMQ](/docs/transports/bullmq).
+[BullMQ](/docs/transports/bullmq). The `RemoteTask` also carries an optional `transport` (the pool id
+the task was dispatched on, so the worker replies on the matching one) and an optional `traceparent`
+(see [distributed tracing](/docs/observability/otel#distributed-tracing-across-workers)).

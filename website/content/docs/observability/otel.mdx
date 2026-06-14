@@ -25,3 +25,44 @@ It subscribes to the same engine lifecycle events the [dashboard](/docs/observab
 and [Telescope watcher](/docs/observability/telescope) use — three views of one event log. OTel is
 for **debugging in production** (latency, correlation, alerts); the dashboard is for **operating**
 the workflow.
+
+## Distributed tracing across workers
+
+A remote step runs in **another process** — often another language (the [Python SDK](/docs/python)).
+Left alone, that worker would start a fresh, **detached** trace, so the work it does wouldn't show up
+under the run's root span. To keep one trace across the boundary, the engine stamps a W3C
+`traceparent` on each dispatched `RemoteTask`, taken from an optional `traceparent` provider. The
+worker reads it and **continues** the trace instead of starting a new one — the step's span lands as
+a child of the workflow's span, even across processes and languages.
+
+Core stays OTel-free (it never imports `@opentelemetry/api`), so you wire the provider in. Use
+`otelTraceparent` from `@dudousxd/nestjs-durable-otel`, which reads the current active span via the
+globally-registered W3C propagator:
+
+```ts
+import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import { otelTraceparent } from '@dudousxd/nestjs-durable-otel';
+
+const engine = new WorkflowEngine({
+  store,
+  transport,
+  traceparent: () => otelTraceparent(),
+});
+```
+
+With the NestJS module, pass it as the `traceparent` option:
+
+```ts
+import { otelTraceparent } from '@dudousxd/nestjs-durable-otel';
+
+DurableModule.forRoot({
+  store,
+  transport,
+  traceparent: () => otelTraceparent(),
+});
+```
+
+The provider is just `() => string | undefined`, so you can supply your own context reader instead of
+the OTel one. Omit it and no `traceparent` is sent (the worker starts its own trace as before). The
+stamped value travels in the documented `RemoteTask.traceparent` field, so any language SDK that
+honours W3C trace context picks it up automatically.

@@ -1,0 +1,86 @@
+---
+title: Flow control
+description: Durable queues for remote steps — cap concurrency and enforce fixed-window rate limits with engine.registerQueue (or the module's queues option) and ctx.call(step, input, { queue }). A call that can't be admitted re-suspends and the timer poller retries admission, so the limit survives crashes.
+---
+
+Remote steps fan out work to workers, and sometimes you need to *throttle* that fan-out: a third-party API
+allows only N requests per minute, or a downstream service falls over above some concurrency. Flow-control
+queues cap how much work `ctx.call` admits at once — a concurrency limit, a fixed-window rate limit, or both
+— and, crucially, they do it **durably**: a call that can't be admitted doesn't busy-wait or hold the run in
+memory, it re-suspends and is retried by the timer poller, so the limit survives a crash.
+
+## Registering a queue
+
+Register a queue on the engine with `engine.registerQueue`, or declare it on the NestJS module's `queues`
+option (which registers it at startup). A `QueueConfig` has:
+
+- `name` — the queue's name, referenced from `ctx.call(step, input, { queue: name })`.
+- `concurrency` — the maximum number of steps in flight at once for this queue. Omit for unlimited.
+- `rateLimit` — a fixed-window rate limit of `{ limit, periodMs }`: at most `limit` admissions per
+  `periodMs`. Omit for unlimited.
+- `retryMs` — how long (ms) a concurrency-blocked call waits before re-checking for a free slot. Defaults to
+  1000.
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  queues: [
+    // Rate-limit a third-party API to 100 calls/minute:
+    { name: 'shipping-api', rateLimit: { limit: 100, periodMs: 60_000 } },
+    // Cap a heavy downstream to 5 concurrent steps, re-checking every 500ms when full:
+    { name: 'pdf-render', concurrency: 5, retryMs: 500 },
+    // Both at once: at most 10 in flight AND no more than 1000/hour:
+    { name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } },
+  ],
+});
+```
+
+The equivalent imperative form, when you hold the engine directly:
+
+```ts
+engine.registerQueue({ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } });
+```
+
+## Using a queue from a workflow
+
+Subject a remote-step dispatch to a queue by naming it in the call options:
+
+```ts
+export const sendEmail = remoteStep({
+  name: 'notify.email',
+  group: 'notify',
+  input: z.object({ to: z.string().email(), template: z.string() }),
+  output: z.object({ messageId: z.string() }),
+});
+
+// in the workflow — this dispatch is admitted through the `emails` queue:
+const sent = await ctx.call(sendEmail, { to: order.email, template: 'receipt' }, { queue: 'emails' });
+```
+
+## How admission works (and why it's durable)
+
+When a queued call is reached, the engine asks the queue's controller to admit one unit of work. If the
+queue is at its concurrency limit or has exhausted its rate-limit window, admission is **blocked** and the
+controller returns the epoch-ms time at which admission may next succeed (the start of the next rate-limit
+window, or `now + retryMs` for a concurrency block). The engine does **not** dispatch: it re-suspends the run
+with that retry time as its `wakeAt`. The durable-timer poller, which already wakes suspended runs whose
+timers come due, retries admission when the time arrives — and if it's still blocked, the run simply
+re-suspends again.
+
+Because the retry time is persisted on the run and the poller drives it, the limit is durable: a process
+that crashes while runs are parked waiting for a slot loses nothing — the parked runs come back when their
+timers are due. No run is ever held in memory waiting for a slot.
+
+A slot is held from the moment a call is admitted until the step's **result lands** (or the run is
+cancelled), at which point the slot is released and the next blocked run can be admitted on its next poll.
+This ties the concurrency accounting to the real in-flight work, not just to dispatch.
+
+## Scope: per engine instance
+
+Flow-control accounting is **per engine instance** — the DBOS `workerConcurrency` tier. For the common
+single-orchestrator deployment this is exactly what you want, and it's correct without any cross-process
+coordination. If you run several orchestrator replicas, each enforces the limit independently (so a
+`concurrency: 5` queue admits up to 5 *per replica*). A truly global, cross-instance limit would need a
+durable counter in the store — a deliberate follow-up, not built here. Size your limits with your replica
+count in mind, or pin the queued workflow to a single orchestrator instance if you need a hard global cap.

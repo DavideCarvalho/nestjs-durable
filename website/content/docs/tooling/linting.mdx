@@ -1,0 +1,147 @@
+---
+title: Linting for non-determinism
+description: Catch Date.now(), Math.random(), new Date() and crypto.randomUUID() inside a @Workflow run at author time with @dudousxd/nestjs-durable-eslint-plugin — shipped for both ESLint (flat config) and Biome (GritQL plugin).
+---
+
+A durable `run(ctx, input)` is executed *and replayed*: the engine re-runs the workflow body from the
+top on every resume, replaying recorded step results to reach the suspension point. That only stays
+correct if the body is **deterministic** — the same input has to produce the same sequence of step
+calls every time. A bare `Date.now()`, `Math.random()`, `new Date()`, `crypto.randomUUID()` or
+`performance.now()` returns a *different value on every replay*, so the replayed path diverges from
+the recorded one and silently corrupts the run.
+
+The engine already detects this drift at runtime and throws a `NonDeterminismError` — but that's a
+*replay-time* failure, often far from where the offending call lives. The
+`@dudousxd/nestjs-durable-eslint-plugin` package moves the check to **author time**: it flags those
+calls in your editor and CI, before they ever reach a replay. See
+[versioning](/docs/authoring/versioning) for why determinism matters and how the runtime guard works.
+
+```bash
+npm i -D @dudousxd/nestjs-durable-eslint-plugin
+```
+
+## What it flags
+
+Inside a `@Workflow` `run`, these are banned and the fix is the engine's checkpointed equivalent —
+each is recorded once on the first execution and replayed verbatim afterwards:
+
+| Banned source | Why it drifts | Use instead |
+| --- | --- | --- |
+| `Date.now()` | wall clock, different every replay | `await ctx.now()` |
+| `performance.now()` | monotonic clock, different every replay | `await ctx.now()` |
+| `new Date()` (no args) | wraps `Date.now()` | `new Date(await ctx.now())` |
+| `Math.random()` | fresh entropy every replay | `await ctx.random()` |
+| `crypto.randomUUID()` | fresh entropy every replay | `await ctx.uuid()` |
+
+```ts
+// ✗ corrupts the run on replay
+@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow {
+  async run(ctx: WorkflowCtx, order: Order) {
+    const startedAt = Date.now();              // ✗ useNow
+    const idempotencyKey = crypto.randomUUID(); // ✗ useUuid
+    const jitter = Math.random();               // ✗ useRandom
+    const at = new Date();                      // ✗ useNowDate
+    /* ... */
+  }
+}
+
+// ✓ deterministic — recorded once, then replayed
+@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow {
+  async run(ctx: WorkflowCtx, order: Order) {
+    const startedAt = await ctx.now();
+    const idempotencyKey = await ctx.uuid();
+    const jitter = await ctx.random();
+    const at = new Date(await ctx.now());
+    /* ... */
+  }
+}
+```
+
+`crypto.randomUUID()` is matched whether called bare, as `globalThis.crypto.randomUUID()`. The rule
+only fires *inside the workflow body* — calling `Date.now()` elsewhere (a service, a controller, a
+`@DurableStep` handler that runs once and checkpoints its result) is fine, because those aren't
+replayed.
+
+## ESLint (flat config)
+
+The `no-nondeterminism` rule is **AST-scoped**: it walks up from each banned call and only reports it
+when the call sits lexically inside the `run` method of a class decorated with `@Workflow` (whether
+written `@Workflow` or `@Workflow({ ... })`). Code outside a workflow `run` is never touched, so you
+can enable it across your whole `**/*.ts` glob without false positives.
+
+Wire it into your flat config under the plugin namespace:
+
+```js
+// eslint.config.js
+import durable from '@dudousxd/nestjs-durable-eslint-plugin';
+
+export default [
+  {
+    files: ['**/*.ts'],
+    plugins: { '@dudousxd/nestjs-durable': durable },
+    rules: {
+      '@dudousxd/nestjs-durable/no-nondeterminism': 'error',
+    },
+  },
+];
+```
+
+Or spread the shipped preset, which enables the rule at `error` for you:
+
+```js
+// eslint.config.js
+import durable from '@dudousxd/nestjs-durable-eslint-plugin';
+
+export default [
+  durable.configs.recommended,
+];
+```
+
+Each report points at the exact call and names its deterministic replacement, e.g. *"Non-deterministic
+`Date.now()` inside a @Workflow run — use `ctx.now()` (recorded once, then replayed)."*
+
+## Biome (>= 2.0)
+
+For projects on [Biome 2.x](https://biomejs.dev), the same rule ships as a **GritQL plugin** at
+`grit/no-nondeterminism.grit` inside the package. Biome plugins can't yet scope a match by decorator
+or method, so instead of detecting the `@Workflow` `run` from the AST, you point the plugin at your
+**workflow files** via an `overrides` block. The conventional way to make that selectable is a file
+suffix like `*.workflow.ts`:
+
+```jsonc
+// biome.json
+{
+  "$schema": "https://biomejs.dev/schemas/2.0.0/schema.json",
+  "overrides": [
+    {
+      "include": ["**/*.workflow.ts"],
+      "plugins": [
+        "./node_modules/@dudousxd/nestjs-durable-eslint-plugin/grit/no-nondeterminism.grit"
+      ]
+    }
+  ]
+}
+```
+
+The plugin pattern matches `Date.now()`, `performance.now()`, `Math.random()`, `crypto.randomUUID()`,
+`globalThis.crypto.randomUUID()` and `new Date()` and raises a diagnostic on each, with the same
+guidance to switch to `ctx.now()` / `ctx.random()` / `ctx.uuid()`. Because the scope is the *file*
+rather than the *method*, keep one workflow per `*.workflow.ts` file (or another glob you reserve for
+workflow bodies) so the plugin doesn't flag a legitimate `Date.now()` that happens to share the file.
+
+## How it complements `NonDeterminismError`
+
+The lint rule and the runtime guard are two layers of the same defense:
+
+- **Author time (this plugin).** The drift is caught as a red squiggle / a failing CI step, pointing at
+  the exact source line. You fix it before it ships.
+- **Replay time (`NonDeterminismError`).** If a non-deterministic call slips through — say it came from
+  a transitive helper the linter couldn't see — the engine still refuses to corrupt the run and throws
+  `NonDeterminismError` when the replayed path diverges from the recorded one.
+
+The lint rule is the cheaper, earlier signal; the runtime error is the backstop. Together they keep a
+durable run deterministic. For the full picture of how recorded-vs-replayed history is compared, and
+how to evolve a workflow's body safely once it's in production, see
+[versioning](/docs/authoring/versioning).

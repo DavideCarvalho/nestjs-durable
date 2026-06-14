@@ -1,0 +1,4 @@
+{
+  "title": "Authoring",
+  "pages": ["queries-and-updates", "webhooks", "versioning", "scheduling"]
+}

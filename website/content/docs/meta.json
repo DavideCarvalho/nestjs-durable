@@ -5,6 +5,10 @@
     "getting-started",
     "---Concepts---",
     "concepts",
+    "---Authoring---",
+    "authoring",
+    "---Reliability---",
+    "reliability",
     "---Transports---",
     "transports",
     "---State stores---",
@@ -14,6 +18,7 @@
     "---Cross-language---",
     "python",
     "---Tooling---",
+    "tooling",
     "testing",
     "cli"
   ]

@@ -1,0 +1,48 @@
+---
+title: Reliability
+description: How nestjs-durable keeps long-running work correct in the face of transient failures, crashes and overload — step retries, saga compensation, durable flow-control queues and the dead-letter queue.
+---
+
+A durable workflow's whole reason to exist is that the world it talks to is unreliable: APIs time out,
+workers crash mid-step, downstream systems rate-limit you, and the occasional run is a poison pill that
+takes the process down with it. The engine treats each of those as a first-class concern rather than
+something you hand-roll on top, and the building blocks compose: a remote step can retry with backoff,
+register a compensation to undo itself, be admitted through a rate-limited queue, and — if recovery can
+never make it past a crash — land in the dead-letter queue for a human or a handler to deal with.
+
+This section covers the four reliability primitives.
+
+## Retries
+
+Both local steps (`ctx.step`) and remote steps (`ctx.call`) retry on failure, but along different paths.
+A local step retries the in-process function up to `retries`, spacing attempts by a `fixed` or `exp`
+backoff (with optional jitter); throw a `FatalError` to opt a business failure out of retrying entirely.
+A remote step has a **durable** retry path — a failed `ctx.call` re-dispatches by suspending the run on a
+persisted `wakeAt`, so retries survive a crash — plus an in-memory `timeoutMs` + heartbeat liveness path
+for presumed-dead workers. See [Retries & backoff](/docs/reliability/retries).
+
+## Sagas & compensation
+
+When a multi-step run fails partway through, the side effects of the steps that already succeeded are
+still out there. Attach a `compensate` callback to a step and the engine runs the registered undos in
+reverse order when the run fails — the saga pattern, built in. `compensationRetries` retries a transient
+undo, and every compensation surfaces as a `compensate:<step>` event so a stranded undo is visible. You
+can also trigger the saga deliberately with `engine.cancel(runId, { compensate: true })`. See
+[Sagas & compensation](/docs/reliability/sagas).
+
+## Flow control
+
+Remote steps can be subjected to a durable queue that caps concurrency and/or enforces a fixed-window
+rate limit. Register a queue with `engine.registerQueue` (or the module's `queues` option) and reference
+it from a call with `ctx.call(step, input, { queue: 'emails' })`. A call that can't be admitted re-suspends
+with a retry time instead of dispatching, and the timer poller retries admission later — so the limit is
+durable and survives crashes. See [Flow control](/docs/reliability/flow-control).
+
+## Dead-lettering
+
+A run that crashes the process every time recovery picks it up — a poison pill — would otherwise crash-loop
+forever. `maxRecoveryAttempts` caps how many times crash-recovery retries a run before moving it to the
+terminal `dead` status, where it stays inspectable and retriable from the dashboard instead of taking the
+process down. From there `engine.onDead` (or the module's `deadLetterWorkflow` option) routes the dead run
+to a handler that can alert, compensate, or queue it for review. See
+[Dead-letter queue](/docs/reliability/dead-letter).

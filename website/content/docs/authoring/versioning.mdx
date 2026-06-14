@@ -1,0 +1,129 @@
+---
+title: Versioning & determinism
+description: Keeping in-flight runs replay-safe across code changes — workflow versions for breaking changes, the NonDeterminismError guard, the deterministic now/random/uuid sources, and ctx.patched for guarding an in-place change without a new version.
+---
+
+A durable run is replayed: when the engine resumes a suspended run, it re-executes the workflow body
+from the top and feeds each step its recorded checkpoint instead of running it again. For that to be
+correct, the body must take the **same path** it took originally — same steps, in the same order, at
+the same logical positions. The moment a code change shifts those positions, replay reads the wrong
+checkpoint into the wrong step. This page is about changing your workflow code without breaking the
+runs already in flight.
+
+## The non-determinism guard
+
+The engine pairs each replayed step with the checkpoint recorded at that logical position. If the
+*name* at a position no longer matches what was recorded — you inserted a step, removed one, or
+reordered them — the engine throws a `NonDeterminismError` rather than silently corrupting the run.
+
+```ts
+// On replay, a checkpoint recorded as `charge` at this position but now named `refund` is caught:
+// NonDeterminismError(runId, seq, expected: 'refund', recorded: 'charge')
+```
+
+This is a guard, not a fix. It tells you a code change is incompatible with runs that started under
+the old code. The two tools below let you make the change *anyway* — safely.
+
+## Deterministic sources — `now`, `random`, `uuid`
+
+The most common way to break replay is reading a value that changes every time the body runs. A raw
+`Date.now()`, `Math.random()`, or `crypto.randomUUID()` returns a different value on each replay,
+which silently corrupts a durable run — a timestamp captured into a step input one run won't match the
+next. Use the context's deterministic sources instead; each records its value on the first run and
+**replays the same value** afterwards:
+
+```ts
+@Workflow({ name: 'invoice', version: '1' })
+export class InvoiceWorkflow {
+  async run(ctx: WorkflowCtx, order: Order) {
+    const issuedAt = await ctx.now(); // epoch ms — captured once, replayed verbatim
+    const nonce = await ctx.uuid(); // deterministic UUID v4
+    const sampled = (await ctx.random()) < 0.1; // deterministic [0, 1)
+
+    await ctx.step('issue', () => this.issue(order, { issuedAt, nonce, sampled }));
+  }
+}
+```
+
+Each of these is itself a checkpointed step, so the value is captured the first time and returned from
+the checkpoint on every replay. Reach for `Date.now()`/`Math.random()`/`crypto.randomUUID()` only
+*inside* a `ctx.step` body (whose whole result is checkpointed) — never in the deterministic prefix of
+the workflow body.
+
+## Workflow versions — for breaking changes
+
+When a change genuinely alters a workflow's shape — new steps, reordered logic, a different control
+flow — bump the version. Register the new version alongside the old:
+
+```ts
+@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflowV1 {
+  async run(ctx: WorkflowCtx, order: Order) {
+    /* the original body */
+  }
+}
+
+@Workflow({ name: 'checkout', version: '2' })
+export class CheckoutWorkflowV2 {
+  async run(ctx: WorkflowCtx, order: Order) {
+    /* the new body, with the breaking change */
+  }
+}
+```
+
+A run records the **code version it started on** (`workflowVersion` on the run). When the engine
+resumes it, it replays against the *same version it began on* — so in-flight runs drain on the code
+they started under, while new runs start on the latest version. This is skew protection: deploying v2
+never breaks the v1 runs still in the system. Keep the old version registered until every run that
+started under it has reached a terminal state, then remove it.
+
+Versioning is the right tool when the change is structural and you're prepared to keep both bodies
+around. For a small, surgical change, the version split is heavyweight — that's where `ctx.patched`
+comes in.
+
+## Patching in place — `ctx.patched(id)`
+
+`ctx.patched(id)` guards an in-place change **without** a new version. Wrap the changed code in a
+branch on it:
+
+```ts
+@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow {
+  async run(ctx: WorkflowCtx, order: Order) {
+    const quote = await ctx.step('quote', () => this.price(order));
+
+    if (await ctx.patched('add-fraud-check')) {
+      // New behaviour: runs that started AFTER this code shipped take this branch.
+      const risk = await ctx.call(scoreFraud, { orderId: order.id });
+      if (risk.score > 0.9) throw new FatalError('high fraud risk', 'fraud');
+    }
+
+    await ctx.call(chargeCard, { orderId: order.id, amountCents: quote.total });
+  }
+}
+```
+
+How it stays replay-safe:
+
+- A **fresh run** (started after the patch shipped) hits `ctx.patched('add-fraud-check')`, records a
+  `patch:add-fraud-check` marker at that position, and returns `true` — it takes the **new** branch.
+- A run **already recorded under the old code** replays into this position and finds a *real step*
+  there (the step that, in the old code, came next) — not a marker. So `patched` rewinds the logical
+  position, gives it back to that old step, and returns `false` — the run keeps the **old** branch.
+
+The marker is **position-transparent** for old runs: because it rewinds rather than consuming a
+position, it never shifts an in-flight run's recorded checkpoints. New runs get the new path; old runs
+finish on the old path; neither is corrupted. Once every run that started under the old code has
+drained, remove the guard and keep just the new branch — the marker for fully-new runs is harmless and
+the simplification is clean.
+
+`ctx.patched` and workflow versions solve the same problem at different grain: a version is a whole
+second body for a structural change, a patch is a one-line guard for a surgical one. Reach for a patch
+when the change is small enough that maintaining two full bodies would be overkill.
+
+## Tooling
+
+Spotting a raw `Date.now()`, `Math.random()`, or `crypto.randomUUID()` in a workflow body — or an
+unguarded reorder — is exactly the kind of mistake a linter should catch before it ships. The
+companion lint plugin flags non-deterministic calls inside workflow bodies and steers you to the
+deterministic sources and `ctx.patched`. See [Linting](/docs/tooling/linting).
