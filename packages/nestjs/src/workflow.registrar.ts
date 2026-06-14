@@ -4,6 +4,8 @@ import {
   type StateStore,
   type WorkflowCtx,
   WorkflowEngine,
+  type WorkflowRun,
+  workflowName,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
@@ -12,13 +14,15 @@ import {
   type OnApplicationShutdown,
   type OnModuleInit,
 } from '@nestjs/common';
-import { DiscoveryService } from '@nestjs/core';
-import { getWorkflowMeta } from './decorators';
+import { DiscoveryService, MetadataScanner } from '@nestjs/core';
+import { getWorkflowMeta, isDeadLetterHandler } from './decorators';
 import type { DurableModuleOptions } from './durable.module';
 
 interface WorkflowInstance {
   run(ctx: WorkflowCtx, input: unknown): Promise<unknown>;
 }
+
+type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
 /**
  * Ensures the schema (auto-schema) and registers `@Workflow` providers on init, resumes runs left
@@ -32,6 +36,7 @@ export class WorkflowRegistrar
 {
   constructor(
     private readonly discovery: DiscoveryService,
+    private readonly metadataScanner: MetadataScanner,
     private readonly engine: WorkflowEngine,
     @Inject(STATE_STORE) private readonly store: StateStore,
     @Inject(DURABLE_OPTIONS) private readonly options: DurableModuleOptions,
@@ -53,6 +58,11 @@ export class WorkflowRegistrar
     if (this.options.autoSchema !== false) {
       await this.store.ensureSchema?.();
     }
+    // Maps a workflow name to the workflow its dead runs route to. Built from each `@Workflow`'s
+    // inline `@DeadLetter()` method (preferred) or its `deadLetterWorkflow` reference; the
+    // module-level `deadLetterWorkflow` is the fallback applied in the onDead listener below.
+    const deadLetterByWorkflow = new Map<string, string>();
+
     for (const wrapper of this.discovery.getProviders()) {
       const { instance } = wrapper;
       if (!instance || typeof instance !== 'object') continue;
@@ -63,6 +73,61 @@ export class WorkflowRegistrar
         throw new Error(`@Workflow ${meta.name} must define a run(ctx, input) method`);
       }
       this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input));
+
+      const inline = this.findDeadLetterHandler(instance);
+      if (inline && meta.deadLetterWorkflow) {
+        // Two dead-letter targets for one workflow is ambiguous config, not a precedence question —
+        // fail fast at boot rather than silently picking one.
+        throw new Error(
+          `@Workflow ${meta.name} declares both an inline @DeadLetter() method and a deadLetterWorkflow option. Use one: the inline handler, or the reference.`,
+        );
+      }
+      if (inline) {
+        // The inline handler is itself a durable workflow, registered as `<name>.dlq`, so it gets
+        // checkpointing and a dashboard run linked to the dead run via the `dlq:<runId>` id.
+        const dlqName = `${meta.name}.dlq`;
+        this.engine.register(dlqName, meta.version, inline);
+        deadLetterByWorkflow.set(meta.name, dlqName);
+      } else if (meta.deadLetterWorkflow) {
+        deadLetterByWorkflow.set(meta.name, workflowName(meta.deadLetterWorkflow));
+      }
     }
+
+    this.installDeadLetterRouting(deadLetterByWorkflow);
+  }
+
+  /** Returns the instance's `@DeadLetter()` method bound to the instance, or undefined if none. */
+  private findDeadLetterHandler(instance: object): WorkflowFn | undefined {
+    const prototype = Object.getPrototypeOf(instance);
+    for (const methodName of this.metadataScanner.getAllMethodNames(prototype)) {
+      const method = (instance as Record<string, unknown>)[methodName];
+      if (typeof method === 'function' && isDeadLetterHandler(method)) {
+        return (ctx, input) => method.call(instance, ctx, input);
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Installs a single onDead listener that routes a dead run to its workflow's handler (from the
+   * map) or the module-level `deadLetterWorkflow` default. The handler is started idempotently with
+   * a `dlq:<runId>` id, so re-recovery never double-dispatches.
+   */
+  private installDeadLetterRouting(byWorkflow: Map<string, string>): void {
+    const fallback = this.options.deadLetterWorkflow
+      ? workflowName(this.options.deadLetterWorkflow)
+      : undefined;
+    if (byWorkflow.size === 0 && !fallback) return;
+    this.engine.onDead((run: WorkflowRun) => {
+      const target = byWorkflow.get(run.workflow) ?? fallback;
+      if (!target) return;
+      void this.engine
+        .start(
+          target,
+          { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
+          `dlq:${run.id}`,
+        )
+        .catch(() => undefined);
+    });
   }
 }

@@ -1,6 +1,6 @@
 ---
 title: Sagas & compensation
-description: Undo the side effects of a partially-completed run with per-step compensate callbacks that run in reverse on failure, compensationRetries for transient undos, compensate:<step> events, and compensating cancellation via engine.cancel(runId, { compensate: true }).
+description: "Undo the side effects of a partially-completed run with per-step compensate callbacks that run in reverse on failure, compensationRetries for transient undos, compensate:<step> events, and compensating cancellation via engine.cancel(runId, { compensate: true })."
 ---
 
 A durable run often performs several irreversible side effects in sequence — reserve inventory, charge a

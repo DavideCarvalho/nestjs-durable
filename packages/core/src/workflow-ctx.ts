@@ -16,6 +16,7 @@ import type {
 } from './interfaces';
 import { breakpointToken } from './protocol';
 import { createStepLogger } from './step-logger';
+import { type WorkflowRef, workflowName } from './workflow-ref';
 
 /** A saga undo registered by a completed step, kept with its step name for visibility on failure. */
 export interface Compensation {
@@ -215,9 +216,9 @@ export function createWorkflowCtx(
     return unwrapCompletion<T>(await waitForSignal(`task:${runId}:${name}`), `task "${name}"`);
   };
 
-  // Child workflow: start it once, then suspend on a `child:<id>` waiter the child signals on its
-  // terminal state (see engine.notifyParent).
-  const child = async <T>(workflow: string, input: unknown, childId?: string): Promise<T> => {
+  // Child workflow (await result): start it once, then suspend on a `child:<id>` waiter the child
+  // signals on its terminal state (see engine.notifyParent).
+  const child = async <T>(workflow: WorkflowRef, input: unknown, childId?: string): Promise<T> => {
     const current = pos.next();
     const id = childId ?? `${runId}.child.${current}`;
     const existing = await store.getCheckpoint(runId, current);
@@ -225,8 +226,28 @@ export function createWorkflowCtx(
       return unwrapCompletion<T>(existing.output, `child "${id}"`);
     }
     await store.putSignalWaiter({ token: `child:${id}`, runId, seq: current });
-    if (!(await store.getRun(id))) host.startChild(workflow, input, id);
+    if (!(await store.getRun(id))) host.startChild(workflowName(workflow), input, id);
     throw new WorkflowSuspended();
+  };
+
+  // Child workflow (fire-and-forget): dispatch it once and return its id WITHOUT suspending. The
+  // start is checkpointed at this position so replay returns the same id without re-dispatching, and
+  // is idempotent by id, so `child(..., sameId)` later joins the same run rather than starting a new
+  // one (start + join scatter-gather).
+  const startChild = async (
+    workflow: WorkflowRef,
+    input: unknown,
+    childId?: string,
+  ): Promise<string> => {
+    const current = pos.next();
+    const id = childId ?? `${runId}.child.${current}`;
+    const existing = await store.getCheckpoint(runId, current);
+    if (existing && existing.status === 'completed') return existing.output as string;
+    if (!(await store.getRun(id))) host.startChild(workflowName(workflow), input, id);
+    await store.saveCheckpoint(
+      instantCheckpoint({ runId, seq: current, name: `spawn:${id}`, kind: 'local', output: id }),
+    );
+    return id;
   };
 
   // A breakpoint = a visible `pending` checkpoint + a signal waiter the dashboard resumes via
@@ -322,6 +343,7 @@ export function createWorkflowCtx(
     waitForSignal,
     task,
     child,
+    startChild,
     breakpoint,
     webhook,
     setEvent,

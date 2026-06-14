@@ -19,7 +19,8 @@ export class CheckoutWorkflow {
 ```
 
 Register it as a normal provider — `DurableModule` discovers it. Start runs with
-`WorkflowService.start(name, input)`.
+`WorkflowService.start(CheckoutWorkflow, input)` — pass the workflow **class** for a typed input, or a
+**name** string for a cross-runtime workflow.
 
 ## Local steps
 

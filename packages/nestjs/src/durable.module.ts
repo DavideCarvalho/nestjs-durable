@@ -9,6 +9,7 @@ import {
   TRANSPORT,
   type Transport,
   WorkflowEngine,
+  type WorkflowRef,
 } from '@dudousxd/nestjs-durable-core';
 import { type DynamicModule, type InjectionToken, Module, type Provider } from '@nestjs/common';
 import { DiscoveryModule } from '@nestjs/core';
@@ -60,12 +61,15 @@ export interface DurableModuleOptions {
    */
   maxRecoveryAttempts?: number;
   /**
-   * A workflow to route dead-lettered runs to. When a run is moved to `dead` (exceeded
-   * `maxRecoveryAttempts`), this workflow is started with `{ deadRunId, workflow, input, error }`
-   * (idempotent by a `dlq:<runId>` id) — your handler can alert, compensate, or queue for review.
-   * Omit to just leave dead runs parked (inspectable + retriable from the dashboard).
+   * The **default** workflow to route dead-lettered runs to, for workflows that don't declare their
+   * own. When a run is moved to `dead` (exceeded `maxRecoveryAttempts`), the started handler gets a
+   * `DeadLetter` payload `{ deadRunId, workflow, input, error }` (idempotent by a `dlq:<runId>` id) —
+   * it can alert, compensate, or queue for review. Resolution per dead run: the workflow's inline
+   * `@DeadLetter()` method → its `@Workflow({ deadLetterWorkflow })` reference → this default. Omit
+   * everything to just leave dead runs parked (inspectable + retriable from the dashboard). Accepts a
+   * workflow class (refactor-safe) or a name (cross-runtime).
    */
-  deadLetterWorkflow?: string;
+  deadLetterWorkflow?: WorkflowRef;
   /**
    * Whether this instance plays the **worker** role: register `@DurableStep` handlers (consume the
    * transport), recover incomplete runs on boot, and poll due timers. Defaults to `true`. Set
@@ -162,25 +166,8 @@ export class DurableModule {
               compensationRetries: opts.compensationRetries,
             });
             for (const queue of opts.queues ?? []) engine.registerQueue(queue);
-            // Dead-letter routing: when a run is dead-lettered, start the configured DLQ workflow
-            // with the dead run's context (idempotent by a `dlq:<runId>` id).
-            const dlq = opts.deadLetterWorkflow;
-            if (dlq) {
-              engine.onDead((run) => {
-                void engine
-                  .start(
-                    dlq,
-                    {
-                      deadRunId: run.id,
-                      workflow: run.workflow,
-                      input: run.input,
-                      error: run.error,
-                    },
-                    `dlq:${run.id}`,
-                  )
-                  .catch(() => undefined);
-              });
-            }
+            // Dead-letter routing (per-workflow `@DeadLetter()` / `deadLetterWorkflow` + this global
+            // default) is wired by the WorkflowRegistrar, which owns the `@Workflow` metadata.
             return engine;
           },
           inject: [STATE_STORE, TRANSPORT, DURABLE_OPTIONS],
