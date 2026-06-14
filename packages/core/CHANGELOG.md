@@ -1,5 +1,15 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.8.1
+
+### Patch Changes
+
+- 6979d60: fix: list runs newest-first
+
+  `store.listRuns` now orders by `createdAt DESC` (was `ASC`) across every adapter (in-memory,
+  TypeORM, MikroORM, Prisma, Drizzle), so the dashboard shows the most recent run on top instead of
+  buried at the bottom.
+
 ## 0.8.0
 
 ### Minor Changes
