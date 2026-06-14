@@ -142,6 +142,8 @@ export class WorkflowEngine {
   private readonly listeners = new Set<EngineListener>();
   /** Callbacks notified (on any instance) when a run is cancelled — for cooperative cancellation. */
   private readonly cancelListeners = new Set<(runId: string) => void>();
+  /** Notified when a run is dead-lettered (moved to `dead`) — a hook for a DLQ handler. */
+  private readonly deadListeners = new Set<(run: WorkflowRun) => void>();
   /** Validators gating `engine.update`, keyed by `<workflow>:<updateName>`. */
   private readonly updateValidators = new Map<string, UpdateValidator>();
   /** Runs being cancelled WITH saga compensation — see `cancel({ compensate: true })`. */
@@ -253,6 +255,28 @@ export class WorkflowEngine {
   onCancel(listener: (runId: string) => void): () => void {
     this.cancelListeners.add(listener);
     return () => this.cancelListeners.delete(listener);
+  }
+
+  /**
+   * Be notified when a run is **dead-lettered** — moved to `dead` after exceeding
+   * `maxRecoveryAttempts`. The listener receives the dead run (status `dead`, with its error), so a
+   * DLQ handler can do something other than just leaving it parked: alert, push to a real queue, or
+   * start a dead-letter workflow (e.g. `engine.onDead((run) => engine.start('pipeline-dlq', run, ...))`).
+   * Returns an unsubscribe function.
+   */
+  onDead(listener: (run: WorkflowRun) => void): () => void {
+    this.deadListeners.add(listener);
+    return () => this.deadListeners.delete(listener);
+  }
+
+  private notifyDead(run: WorkflowRun): void {
+    for (const fn of this.deadListeners) {
+      try {
+        fn(run);
+      } catch {
+        /* a dead-letter handler must not break recovery */
+      }
+    }
   }
 
   /** Emit a locally-produced lifecycle event: deliver to subscribers AND broadcast it on the
@@ -372,6 +396,7 @@ export class WorkflowEngine {
       await this.store.updateRun(run.id, { status: 'dead', error, updatedAt: new Date() });
       await this.store.releaseRunLock(run.id);
       this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+      this.notifyDead({ ...run, status: 'dead', error, recoveryAttempts: attempts });
       return { runId: run.id, status: 'dead', error };
     }
     // Count BEFORE resuming, so a crash mid-resume still advances the counter.
