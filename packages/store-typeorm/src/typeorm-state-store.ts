@@ -104,7 +104,7 @@ export class TypeOrmStateStore implements StateStore {
       where,
       take: query.limit,
       skip: query.offset,
-      order: { createdAt: 'ASC' },
+      order: { createdAt: 'DESC' }, // newest first — recent runs on top in the dashboard
     });
     return rows.map(fromRunEntity);
   }
