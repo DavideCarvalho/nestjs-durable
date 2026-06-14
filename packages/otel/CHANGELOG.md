@@ -1,5 +1,18 @@
 # @dudousxd/nestjs-durable-otel
 
+## 0.2.0
+
+### Minor Changes
+
+- 6b36ffa: feat: propagate W3C traceparent to workers (distributed tracing)
+
+  The engine now stamps a `traceparent` on every dispatched `RemoteTask` from an optional
+  `traceparent` provider, so a worker (including the Python SDK) can continue the distributed trace
+  instead of starting a detached one. Core stays OTel-free: the otel package exports `otelTraceparent()`
+  (reads the active span via the registered W3C propagator) to wire in —
+  `new WorkflowEngine({ traceparent: () => otelTraceparent() })` — and the NestJS module exposes a
+  `traceparent` option. The wire field already existed; this populates it.
+
 ## 0.1.1
 
 ### Patch Changes

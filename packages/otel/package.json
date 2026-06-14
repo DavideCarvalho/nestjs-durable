@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-otel",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "OpenTelemetry tracing for nestjs-durable — a trace per run, a span per step",
   "license": "MIT",
   "author": "Davide Carvalho",

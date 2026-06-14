@@ -1,5 +1,85 @@
 # @dudousxd/nestjs-durable
 
+## 0.3.0
+
+### Minor Changes
+
+- df6524f: feat: cron + timezone schedules
+
+  `ScheduledWorkflow` now accepts a `cron` expression with an IANA `timezone` (DST-aware) as an
+  alternative to the fixed-interval `everyMs`. The run id is keyed on the most recent fire time, so
+  polling repeatedly within an interval — or racing instances on the same tick — starts each fire
+  exactly once (idempotent). The NestJS module gains a `schedules` option; the timer poller fires them
+  each tick on **worker** instances only. Cron evaluation uses the optional `cron-parser` peer
+  dependency, so the core stays dependency-free for users who don't schedule by cron.
+
+- 3f79533: feat: dead-letter queue — `maxRecoveryAttempts` + `dead` run status
+
+  Crash recovery now counts attempts per run (`WorkflowRun.recoveryAttempts`); once a still-`running`
+  run exceeds the engine/module `maxRecoveryAttempts`, it's moved to the new terminal **`dead`** status
+  instead of being retried forever — so a poison pill that crashes the process every boot becomes an
+  inspectable dead-letter entry, not a crash loop. The new column is persisted by all four store
+  adapters (TypeORM auto-schema self-heals it; Prisma/Drizzle/MikroORM schemas updated), and `dead` is
+  added to the dashboard/codegen status unions. Omit `maxRecoveryAttempts` for the prior unlimited-retry behaviour.
+
+- 9c4a3cf: feat: durable webhooks (`ctx.webhook()`)
+
+  A first-class, replay-safe "expose a callback URL and wait for it" primitive. `ctx.webhook()` mints
+  a deterministic token (`wh:<runId>:<seq>`) and — when the engine has a `webhookUrl` builder — a
+  public `url` to hand a third party inside a step; `await handle.wait()` then suspends with zero
+  compute until the callback arrives. The dashboard exposes `POST webhooks/:token` (turning the inbound
+  POST into `engine.signal`), the NestJS module gains a `webhookUrl` option, and the codegen extension
+  emits the `deliverWebhook` (and the previously-missing `continue`) route into the typed client.
+
+- fc9764c: feat: flow control — durable queues for remote steps
+
+  `engine.registerQueue({ name, concurrency, rateLimit })` (or the NestJS module's `queues` option)
+  caps how much work `ctx.call(step, input, { queue })` admits at once — a concurrency limit and/or a
+  fixed-window rate limit. A call that can't be admitted does **not** dispatch: the run re-suspends
+  with the queue's retry time and the timer poller re-tries admission later, so the limit is durable
+  (survives crashes) without holding the run in memory. Accounting is per engine instance (the DBOS
+  `workerConcurrency` tier); global cross-instance limits remain a follow-up needing a durable counter.
+
+- 7c50198: feat: multiple transports with failover + per-step selection
+
+  The engine now accepts an ordered `transports` pool (`[{ id, transport }]`): it dispatches on the
+  first and **fails over to the next on a dispatch error**, and a step can pin one with
+  `ctx.call(step, input, { transport: 'sqs' })`. The chosen transport id is stamped on the
+  `RemoteTask` (`task.transport`) so a worker that consumes several transports replies on the matching
+  one — failover stays symmetric without the worker ever choosing a transport. Results/heartbeats are
+  consumed from every transport in the pool. `transport` (single) remains as shorthand for a one-entry
+  pool; the NestJS module exposes `transports`. Cross-language note: run one worker/runner per broker
+  and the matching one handles each failover hop and replies on its own broker — no worker change
+  needed; `task.transport` is there for processes that multiplex brokers.
+
+- 9e36ac0: feat: saga compensation retry + visibility, and a dashboard query index
+
+  - **Compensation retry + visibility** — each saga undo is now retried up to `compensationRetries`
+    (engine/module option, default 1) and emits a `compensate:<step>` step event for its outcome, so a
+    stranded undo shows up in the dashboard/telescope instead of being silently swallowed. A
+    permanently-failing compensation is still skipped so it can't mask the original failure.
+  - **TypeORM auto-schema index** — adds `(workflow, status)` alongside the existing `(status, wakeAt)`
+    index, so the dashboard's `listRuns` filter hits an index.
+
+- 6836ace: refactor!: separate the control plane from the Transport
+
+  `publishControl`/`onControl` are no longer part of `Transport`; they form a dedicated `ControlPlane`
+  interface, and the engine takes a separate `controlPlane` dependency. This decouples cross-instance
+  broadcast (lifecycle events + cancellation) from the point-to-point task transport, so you can run a
+  dedicated control plane (e.g. Redis pub/sub) independent of how steps are dispatched. Broadcast-capable
+  transports (event-emitter, BullMQ) implement `ControlPlane` too and can be passed as both; the NestJS
+  module auto-wires the transport as the control plane when it qualifies, or accepts an explicit
+  `controlPlane` option.
+
+- 6b36ffa: feat: propagate W3C traceparent to workers (distributed tracing)
+
+  The engine now stamps a `traceparent` on every dispatched `RemoteTask` from an optional
+  `traceparent` provider, so a worker (including the Python SDK) can continue the distributed trace
+  instead of starting a detached one. Core stays OTel-free: the otel package exports `otelTraceparent()`
+  (reads the active span via the registered W3C propagator) to wire in —
+  `new WorkflowEngine({ traceparent: () => otelTraceparent() })` — and the NestJS module exposes a
+  `traceparent` option. The wire field already existed; this populates it.
+
 ## 0.2.1
 
 ### Patch Changes

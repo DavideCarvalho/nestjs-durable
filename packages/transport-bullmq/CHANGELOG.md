@@ -1,5 +1,27 @@
 # @dudousxd/nestjs-durable-transport-bullmq
 
+## 0.3.0
+
+### Minor Changes
+
+- e736e31: feat: BullMQ heartbeats over Redis pub/sub
+
+  `onHeartbeat` is no longer a no-op: the BullMQ transport now carries worker heartbeats over a
+  dedicated Redis pub/sub channel (`<prefix>-heartbeat`), mirroring the control plane. A worker calls
+  `transport.heartbeat({ runId, seq, stepId, group })` while running a long step, and the engine — on
+  any pod — resets that step's `timeoutMs` liveness window. (Only the in-memory `timeoutMs` path uses
+  heartbeats; the durable-suspend path is unaffected.)
+
+- 6836ace: refactor!: separate the control plane from the Transport
+
+  `publishControl`/`onControl` are no longer part of `Transport`; they form a dedicated `ControlPlane`
+  interface, and the engine takes a separate `controlPlane` dependency. This decouples cross-instance
+  broadcast (lifecycle events + cancellation) from the point-to-point task transport, so you can run a
+  dedicated control plane (e.g. Redis pub/sub) independent of how steps are dispatched. Broadcast-capable
+  transports (event-emitter, BullMQ) implement `ControlPlane` too and can be passed as both; the NestJS
+  module auto-wires the transport as the control plane when it qualifies, or accepts an explicit
+  `controlPlane` option.
+
 ## 0.2.0
 
 ### Minor Changes

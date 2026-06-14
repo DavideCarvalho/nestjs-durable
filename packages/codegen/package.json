@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-codegen",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "@dudousxd/nestjs-codegen extension — emits the durable dashboard API as a typed client",
   "license": "MIT",
   "author": "Davide Carvalho",
