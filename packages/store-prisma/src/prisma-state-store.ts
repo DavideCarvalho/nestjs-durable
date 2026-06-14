@@ -26,6 +26,7 @@ interface RunRow {
   lockedBy: string | null;
   lockedUntil: Date | null;
   recoveryAttempts: number | null;
+  tags: unknown;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -150,6 +151,7 @@ export class PrismaStateStore implements StateStore {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
     if (query.status) where.status = query.status;
+    if (query.tag) where.tags = { array_contains: query.tag };
     const rows = await this.db.durableWorkflowRun.findMany({
       where,
       take: query.limit,
@@ -200,6 +202,7 @@ function toRunData(run: WorkflowRun) {
     lockedBy: run.lockedBy ?? null,
     lockedUntil: run.lockedUntil == null ? null : new Date(run.lockedUntil),
     recoveryAttempts: run.recoveryAttempts ?? null,
+    tags: jsonOrNull(run.tags),
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -229,6 +232,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     lockedBy: row.lockedBy ?? undefined,
     lockedUntil: row.lockedUntil == null ? undefined : row.lockedUntil.getTime(),
     recoveryAttempts: row.recoveryAttempts ?? undefined,
+    tags: (row.tags as string[] | null) ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

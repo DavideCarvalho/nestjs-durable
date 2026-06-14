@@ -43,6 +43,8 @@ export interface WorkflowRun {
   lockedUntil?: number;
   /** How many times crash-recovery has picked this run up — caps poison pills (see maxRecoveryAttempts). */
   recoveryAttempts?: number;
+  /** Searchable labels: the workflow's static `@Workflow({ tags })` merged with the run's start-time tags. */
+  tags?: string[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -182,6 +184,8 @@ export interface StateStore {
 export interface RunQuery {
   workflow?: string;
   status?: RunStatus;
+  /** Only runs carrying this tag (exact match against {@link WorkflowRun.tags}). */
+  tag?: string;
   limit?: number;
   offset?: number;
 }

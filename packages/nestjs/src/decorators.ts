@@ -8,6 +8,8 @@ export interface WorkflowMeta {
   version: string;
   /** The workflow this workflow's dead runs route to (a name or a class). See `WorkflowOptions`. */
   deadLetterWorkflow?: WorkflowRef;
+  /** Static searchable labels stamped on every run of this workflow. See `WorkflowOptions`. */
+  tags?: string[];
 }
 
 export interface WorkflowOptions {
@@ -21,6 +23,11 @@ export interface WorkflowOptions {
    * {@link DeadLetter} payload, idempotent by a `dlq:<runId>` id.
    */
   deadLetterWorkflow?: WorkflowRef;
+  /**
+   * Static labels stamped on **every run** of this workflow (e.g. `tags: ['etl', 'critical']`) and
+   * merged with any per-run tags passed to `start`. Searchable/filterable in the dashboard.
+   */
+  tags?: string[];
 }
 
 /**
@@ -33,6 +40,7 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       name: options.name,
       version: options.version ?? '1',
       deadLetterWorkflow: options.deadLetterWorkflow,
+      tags: options.tags,
     };
     Reflect.defineMetadata(WORKFLOW_METADATA, meta, target);
     // Stamp the registered name so this class can be used as a typed workflow ref (ctx.child,

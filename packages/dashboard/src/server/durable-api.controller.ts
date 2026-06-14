@@ -1,14 +1,5 @@
 import type { RunStatus } from '@dudousxd/nestjs-durable-core';
-import {
-  Body,
-  Controller,
-  Get,
-  NotFoundException,
-  Param,
-  Post,
-  Query,
-  Sse,
-} from '@nestjs/common';
+import { Body, Controller, Get, NotFoundException, Param, Post, Query, Sse } from '@nestjs/common';
 import { DashboardService } from './dashboard.service.js';
 
 /** JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule). */
@@ -17,8 +8,12 @@ export class DurableApiController {
   constructor(private readonly dashboard: DashboardService) {}
 
   @Get('runs')
-  runs(@Query('status') status?: RunStatus, @Query('workflow') workflow?: string) {
-    return this.dashboard.listRuns({ status, workflow });
+  runs(
+    @Query('status') status?: RunStatus,
+    @Query('workflow') workflow?: string,
+    @Query('tag') tag?: string,
+  ) {
+    return this.dashboard.listRuns({ status, workflow, tag });
   }
 
   @Get('runs/:id')

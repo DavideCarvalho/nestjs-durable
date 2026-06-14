@@ -94,6 +94,8 @@ export class MikroOrmStateStore implements StateStore {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
     if (query.status) where.status = query.status;
+    // `tags` is JSON text; match the quoted token so `etl` doesn't match `etl-foo`.
+    if (query.tag) where.tags = { $like: `%"${query.tag}"%` };
     const rows = await em.find(WorkflowRunEntity, where, {
       limit: query.limit,
       offset: query.offset,
@@ -137,6 +139,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   e.lockedBy = run.lockedBy;
   e.lockedUntil = run.lockedUntil == null ? undefined : new Date(run.lockedUntil);
   e.recoveryAttempts = run.recoveryAttempts;
+  e.tags = run.tags ?? null;
   e.createdAt = run.createdAt;
   e.updatedAt = run.updatedAt;
   return e;
@@ -155,6 +158,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     lockedBy: e.lockedBy ?? undefined,
     lockedUntil: e.lockedUntil?.getTime(),
     recoveryAttempts: e.recoveryAttempts ?? undefined,
+    tags: e.tags ?? undefined,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

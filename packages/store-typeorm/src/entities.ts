@@ -36,6 +36,9 @@ export class WorkflowRunEntity {
   @Column('integer', { nullable: true })
   recoveryAttempts?: number;
 
+  @Column('simple-json', { nullable: true })
+  tags?: string[] | null;
+
   @Column()
   createdAt!: Date;
 

@@ -106,10 +106,12 @@ function RunsList({
   runs,
   selected,
   onSelect,
+  onSelectTag,
 }: {
   runs: WorkflowRun[];
   selected?: string;
   onSelect: (id: string) => void;
+  onSelectTag: (tag: string) => void;
 }) {
   if (runs.length === 0) {
     return <div className="p-6 text-sm text-zinc-600">No runs yet.</div>;
@@ -140,6 +142,23 @@ function RunsList({
               <span className="mono truncate text-[11px] text-zinc-600">{r.id}</span>
               <span className="shrink-0 text-[11px] text-zinc-600">{relTime(r.updatedAt)}</span>
             </div>
+            {r.tags && r.tags.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {r.tags.map((t) => (
+                  // biome-ignore lint/a11y/useKeyWithClickEvents: span keeps the row clickable; tag click filters
+                  <span
+                    key={t}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelectTag(t);
+                    }}
+                    className="mono cursor-pointer rounded border border-[var(--line)] bg-zinc-800/40 px-1.5 text-[10px] text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
+                  >
+                    #{t}
+                  </span>
+                ))}
+              </div>
+            )}
           </button>
         </li>
       ))}
@@ -242,6 +261,18 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             </span>
           </div>
           <div className="mono mt-1 truncate text-[11px] text-zinc-600">{run.id}</div>
+          {run.tags && run.tags.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-1">
+              {run.tags.map((t) => (
+                <span
+                  key={t}
+                  className="mono rounded border border-[var(--line)] bg-zinc-800/40 px-1.5 text-[10px] text-zinc-400"
+                >
+                  #{t}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex shrink-0 gap-2">
           <button
@@ -358,10 +389,11 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
 
 export function App() {
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
+  const [tagFilter, setTagFilter] = useState('');
   const [selected, setSelected] = useState<string>();
   const { data: runs = [] } = useQuery({
-    queryKey: ['runs'],
-    queryFn: () => durableClient.runs(),
+    queryKey: ['runs', tagFilter],
+    queryFn: () => durableClient.runs(undefined, tagFilter || undefined),
     refetchInterval: 3000, // keep the run list live
   });
 
@@ -377,8 +409,36 @@ export function App() {
       <div className="relative z-10 flex h-full flex-col">
         <Header counts={counts} filter={filter} onFilter={setFilter} />
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,360px)_1fr]">
-          <aside className="min-h-0 overflow-auto border-r border-[var(--line)]">
-            <RunsList runs={shown} selected={selected} onSelect={setSelected} />
+          <aside className="flex min-h-0 flex-col border-r border-[var(--line)]">
+            <div className="border-b border-[var(--line)] p-2">
+              <div className="flex items-center gap-1.5 rounded-md border border-[var(--line)] px-2">
+                <span className="text-zinc-600">#</span>
+                <input
+                  value={tagFilter}
+                  onChange={(e) => setTagFilter(e.target.value)}
+                  placeholder="filter by tag…"
+                  className="mono w-full bg-transparent py-1.5 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none"
+                />
+                {tagFilter && (
+                  <button
+                    type="button"
+                    onClick={() => setTagFilter('')}
+                    className="text-zinc-600 hover:text-zinc-300"
+                    title="clear tag filter"
+                  >
+                    <XIcon width={12} height={12} />
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto">
+              <RunsList
+                runs={shown}
+                selected={selected}
+                onSelect={setSelected}
+                onSelectTag={setTagFilter}
+              />
+            </div>
           </aside>
           <main className="min-h-0">
             {selected ? (

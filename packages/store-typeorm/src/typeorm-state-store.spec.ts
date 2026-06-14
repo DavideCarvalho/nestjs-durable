@@ -138,6 +138,19 @@ describe('TypeOrmStateStore', () => {
     await dataSource.destroy();
   });
 
+  it('round-trips tags and filters listRuns by an exact tag (no substring match)', async () => {
+    const { store, dataSource } = await makeStore();
+    await store.createRun(run({ id: 'a', tags: ['etl', 'critical'] }));
+    await store.createRun(run({ id: 'b', tags: ['etl-foo'] }));
+    await store.createRun(run({ id: 'c' })); // no tags
+
+    expect((await store.getRun('a'))?.tags).toEqual(['etl', 'critical']);
+    expect((await store.listRuns({ tag: 'etl' })).map((r) => r.id)).toEqual(['a']);
+    expect((await store.listRuns({ tag: 'etl-foo' })).map((r) => r.id)).toEqual(['b']);
+    expect(await store.listRuns({ tag: 'nope' })).toHaveLength(0);
+    await dataSource.destroy();
+  });
+
   it('upserts checkpoints and reads them by (runId, seq)', async () => {
     const { store, dataSource } = await makeStore();
     await store.createRun(run());

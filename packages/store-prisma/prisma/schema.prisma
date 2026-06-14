@@ -13,6 +13,7 @@ model DurableWorkflowRun {
   lockedBy        String?
   lockedUntil     DateTime?
   recoveryAttempts Int?
+  tags            Json?
   createdAt       DateTime
   updatedAt       DateTime
 

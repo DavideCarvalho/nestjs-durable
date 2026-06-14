@@ -7,7 +7,7 @@ import type {
   StepEvent,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
-import { and, asc, desc, eq, isNotNull, isNull, lte, or } from 'drizzle-orm';
+import { and, asc, desc, eq, isNotNull, isNull, like, lte, or } from 'drizzle-orm';
 import type { BaseSQLiteDatabase } from 'drizzle-orm/sqlite-core';
 import { signalWaiters, stepCheckpoints, workflowRuns } from './schema';
 
@@ -108,6 +108,8 @@ export class DrizzleStateStore implements StateStore {
     const filters = [
       query.workflow ? eq(workflowRuns.workflow, query.workflow) : undefined,
       query.status ? eq(workflowRuns.status, query.status) : undefined,
+      // `tags` is JSON text; match the quoted token so `etl` doesn't match `etl-foo`.
+      query.tag ? like(workflowRuns.tags, `%"${query.tag}"%`) : undefined,
     ].filter((f): f is NonNullable<typeof f> => f !== undefined);
     const rows = await this.db
       .select()
@@ -164,6 +166,7 @@ function toRunRow(run: WorkflowRun): RunRow {
     lockedBy: run.lockedBy ?? null,
     lockedUntil: run.lockedUntil ?? null,
     recoveryAttempts: run.recoveryAttempts ?? null,
+    tags: run.tags ?? null,
     createdAt: run.createdAt.getTime(),
     updatedAt: run.updatedAt.getTime(),
   };
@@ -193,6 +196,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     lockedBy: row.lockedBy ?? undefined,
     lockedUntil: row.lockedUntil ?? undefined,
     recoveryAttempts: row.recoveryAttempts ?? undefined,
+    tags: row.tags ?? undefined,
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };
