@@ -1,5 +1,122 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.6.0
+
+### Minor Changes
+
+- 0900830: feat: compensating cancellation — `engine.cancel(runId, { compensate: true })`
+
+  Cancelling a run can now undo its saga first: the suspended run is resumed with a cancellation
+  pending, so replay re-registers the saga and its completed steps' compensations run in reverse
+  (visible as `compensate:<step>` events) before the run is marked cancelled. Plain `cancel()` is
+  unchanged (immediate, no undo). The dashboard's cancel accepts `?compensate=true`
+  (`durableClient.cancel(id, { compensate: true })`), and the codegen client exposes the flag.
+
+- df6524f: feat: cron + timezone schedules
+
+  `ScheduledWorkflow` now accepts a `cron` expression with an IANA `timezone` (DST-aware) as an
+  alternative to the fixed-interval `everyMs`. The run id is keyed on the most recent fire time, so
+  polling repeatedly within an interval — or racing instances on the same tick — starts each fire
+  exactly once (idempotent). The NestJS module gains a `schedules` option; the timer poller fires them
+  each tick on **worker** instances only. Cron evaluation uses the optional `cron-parser` peer
+  dependency, so the core stays dependency-free for users who don't schedule by cron.
+
+- 9f9767e: feat: `ctx.patched(id)` — guard in-place workflow changes
+
+  Migrate a workflow without registering a new version: wrap the changed code in
+  `if (await ctx.patched('my-change')) { …new… } else { …old… }`. A fresh run records a `patch:<id>`
+  marker and takes the new branch; a run already recorded under the old code keeps the old branch,
+  because the marker is **position-transparent** for it (it rolls the logical position back when the
+  recorded history has a real step where the marker would sit) — so guarding code never shifts an
+  in-flight run's checkpoints and can't corrupt replay. Remove the guard once old runs have drained.
+
+- 3f79533: feat: dead-letter queue — `maxRecoveryAttempts` + `dead` run status
+
+  Crash recovery now counts attempts per run (`WorkflowRun.recoveryAttempts`); once a still-`running`
+  run exceeds the engine/module `maxRecoveryAttempts`, it's moved to the new terminal **`dead`** status
+  instead of being retried forever — so a poison pill that crashes the process every boot becomes an
+  inspectable dead-letter entry, not a crash loop. The new column is persisted by all four store
+  adapters (TypeORM auto-schema self-heals it; Prisma/Drizzle/MikroORM schemas updated), and `dead` is
+  added to the dashboard/codegen status unions. Omit `maxRecoveryAttempts` for the prior unlimited-retry behaviour.
+
+- fb8a12b: feat: retry with backoff on the durable remote path
+
+  A durable `ctx.call` (no `timeoutMs`) now re-dispatches a **failed** remote step up to `retries`,
+  spacing attempts by the configured `backoff`/`backoffMs` — the retry deadline is stamped on the
+  failed checkpoint as `wakeAt` (clock-space, persisted), so it's stable across replays and survives a
+  crash. A worker can opt out per-failure by throwing an error with `retryable: false` (now carried
+  through the wire by the step runner, alongside `code`), which the engine treats as a final verdict.
+
+- 9c4a3cf: feat: durable webhooks (`ctx.webhook()`)
+
+  A first-class, replay-safe "expose a callback URL and wait for it" primitive. `ctx.webhook()` mints
+  a deterministic token (`wh:<runId>:<seq>`) and — when the engine has a `webhookUrl` builder — a
+  public `url` to hand a third party inside a step; `await handle.wait()` then suspends with zero
+  compute until the callback arrives. The dashboard exposes `POST webhooks/:token` (turning the inbound
+  POST into `engine.signal`), the NestJS module gains a `webhookUrl` option, and the codegen extension
+  emits the `deliverWebhook` (and the previously-missing `continue`) route into the typed client.
+
+- fc9764c: feat: flow control — durable queues for remote steps
+
+  `engine.registerQueue({ name, concurrency, rateLimit })` (or the NestJS module's `queues` option)
+  caps how much work `ctx.call(step, input, { queue })` admits at once — a concurrency limit and/or a
+  fixed-window rate limit. A call that can't be admitted does **not** dispatch: the run re-suspends
+  with the queue's retry time and the timer poller re-tries admission later, so the limit is durable
+  (survives crashes) without holding the run in memory. Accounting is per engine instance (the DBOS
+  `workerConcurrency` tier); global cross-instance limits remain a follow-up needing a durable counter.
+
+- 7c50198: feat: multiple transports with failover + per-step selection
+
+  The engine now accepts an ordered `transports` pool (`[{ id, transport }]`): it dispatches on the
+  first and **fails over to the next on a dispatch error**, and a step can pin one with
+  `ctx.call(step, input, { transport: 'sqs' })`. The chosen transport id is stamped on the
+  `RemoteTask` (`task.transport`) so a worker that consumes several transports replies on the matching
+  one — failover stays symmetric without the worker ever choosing a transport. Results/heartbeats are
+  consumed from every transport in the pool. `transport` (single) remains as shorthand for a one-entry
+  pool; the NestJS module exposes `transports`. Cross-language note: run one worker/runner per broker
+  and the matching one handles each failover hop and replies on its own broker — no worker change
+  needed; `task.transport` is there for processes that multiplex brokers.
+
+- 9e36ac0: feat: saga compensation retry + visibility, and a dashboard query index
+
+  - **Compensation retry + visibility** — each saga undo is now retried up to `compensationRetries`
+    (engine/module option, default 1) and emits a `compensate:<step>` step event for its outcome, so a
+    stranded undo shows up in the dashboard/telescope instead of being silently swallowed. A
+    permanently-failing compensation is still skipped so it can't mask the original failure.
+  - **TypeORM auto-schema index** — adds `(workflow, status)` alongside the existing `(status, wakeAt)`
+    index, so the dashboard's `listRuns` filter hits an index.
+
+- f915e2c: feat: synchronous queries & validated updates
+
+  Two Temporal-style primitives adapted to the suspend/checkpoint model:
+
+  - **Query** — `ctx.setEvent(key, value)` publishes a named, replay-safe value; `engine.getEvent(runId, key)`
+    reads the latest value of a live (or finished) run with no side effect. Exposed as
+    `GET runs/:id/events/:key`.
+  - **Update** — `ctx.onUpdate(name)` is a run-scoped update point; `engine.update(runId, name, arg)`
+    delivers to it, gated by a validator registered with `engine.registerUpdateValidator(workflow, name, fn)`
+    that can **reject before the run is touched** (`{ accepted: false, reason }`). Exposed as
+    `POST runs/:id/updates/:name`. The codegen extension emits both routes into the typed client.
+
+- 6836ace: refactor!: separate the control plane from the Transport
+
+  `publishControl`/`onControl` are no longer part of `Transport`; they form a dedicated `ControlPlane`
+  interface, and the engine takes a separate `controlPlane` dependency. This decouples cross-instance
+  broadcast (lifecycle events + cancellation) from the point-to-point task transport, so you can run a
+  dedicated control plane (e.g. Redis pub/sub) independent of how steps are dispatched. Broadcast-capable
+  transports (event-emitter, BullMQ) implement `ControlPlane` too and can be passed as both; the NestJS
+  module auto-wires the transport as the control plane when it qualifies, or accepts an explicit
+  `controlPlane` option.
+
+- 6b36ffa: feat: propagate W3C traceparent to workers (distributed tracing)
+
+  The engine now stamps a `traceparent` on every dispatched `RemoteTask` from an optional
+  `traceparent` provider, so a worker (including the Python SDK) can continue the distributed trace
+  instead of starting a detached one. Core stays OTel-free: the otel package exports `otelTraceparent()`
+  (reads the active span via the registered W3C propagator) to wire in —
+  `new WorkflowEngine({ traceparent: () => otelTraceparent() })` — and the NestJS module exposes a
+  `traceparent` option. The wire field already existed; this populates it.
+
 ## 0.5.0
 
 ### Minor Changes

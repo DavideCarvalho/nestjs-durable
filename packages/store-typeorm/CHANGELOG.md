@@ -1,5 +1,29 @@
 # @dudousxd/nestjs-durable-store-typeorm
 
+## 0.2.0
+
+### Minor Changes
+
+- 3f79533: feat: dead-letter queue — `maxRecoveryAttempts` + `dead` run status
+
+  Crash recovery now counts attempts per run (`WorkflowRun.recoveryAttempts`); once a still-`running`
+  run exceeds the engine/module `maxRecoveryAttempts`, it's moved to the new terminal **`dead`** status
+  instead of being retried forever — so a poison pill that crashes the process every boot becomes an
+  inspectable dead-letter entry, not a crash loop. The new column is persisted by all four store
+  adapters (TypeORM auto-schema self-heals it; Prisma/Drizzle/MikroORM schemas updated), and `dead` is
+  added to the dashboard/codegen status unions. Omit `maxRecoveryAttempts` for the prior unlimited-retry behaviour.
+
+### Patch Changes
+
+- 9e36ac0: feat: saga compensation retry + visibility, and a dashboard query index
+
+  - **Compensation retry + visibility** — each saga undo is now retried up to `compensationRetries`
+    (engine/module option, default 1) and emits a `compensate:<step>` step event for its outcome, so a
+    stranded undo shows up in the dashboard/telescope instead of being silently swallowed. A
+    permanently-failing compensation is still skipped so it can't mask the original failure.
+  - **TypeORM auto-schema index** — adds `(workflow, status)` alongside the existing `(status, wakeAt)`
+    index, so the dashboard's `listRuns` filter hits an index.
+
 ## 0.1.5
 
 ### Patch Changes

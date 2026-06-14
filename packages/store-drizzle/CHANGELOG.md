@@ -1,5 +1,18 @@
 # @dudousxd/nestjs-durable-store-drizzle
 
+## 0.2.0
+
+### Minor Changes
+
+- 3f79533: feat: dead-letter queue — `maxRecoveryAttempts` + `dead` run status
+
+  Crash recovery now counts attempts per run (`WorkflowRun.recoveryAttempts`); once a still-`running`
+  run exceeds the engine/module `maxRecoveryAttempts`, it's moved to the new terminal **`dead`** status
+  instead of being retried forever — so a poison pill that crashes the process every boot becomes an
+  inspectable dead-letter entry, not a crash loop. The new column is persisted by all four store
+  adapters (TypeORM auto-schema self-heals it; Prisma/Drizzle/MikroORM schemas updated), and `dead` is
+  added to the dashboard/codegen status unions. Omit `maxRecoveryAttempts` for the prior unlimited-retry behaviour.
+
 ## 0.1.3
 
 ### Patch Changes
