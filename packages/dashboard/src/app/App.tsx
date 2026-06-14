@@ -140,7 +140,7 @@ function RunsList({
   );
 }
 
-function RunDetail({ id }: { id: string }) {
+function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => void }) {
   const qc = useQueryClient();
   const { data } = useQuery({
     queryKey: ['run', id],
@@ -150,6 +150,16 @@ function RunDetail({ id }: { id: string }) {
       const s = (q.state.data as RunDetail | undefined)?.run.status;
       return s === 'running' || s === 'suspended' ? 1500 : false;
     },
+  });
+  // Dead-letter link: a `dead` run may have been routed to a `dlq:<id>` handler workflow. Probe for
+  // it (retry off so a 404 just hides the link) so we never render a dead link.
+  const handlerId =
+    (data as RunDetail | undefined)?.run.status === 'dead' ? `dlq:${id}` : undefined;
+  const { data: dlqHandler } = useQuery({
+    queryKey: ['run', handlerId],
+    queryFn: () => durableClient.run(handlerId as string),
+    enabled: !!handlerId,
+    retry: false,
   });
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ['run', id] });
@@ -177,6 +187,14 @@ function RunDetail({ id }: { id: string }) {
 
   if (!data) return <div className="p-8 text-sm text-zinc-600">Loading run…</div>;
   const { run, timeline } = data;
+  // The two ends of a dead-letter relationship, linked both ways:
+  //  - a `dlq:<id>` run is a handler → link back to the dead run it's handling
+  //  - a `dead` run with an existing `dlq:<id>` handler → link forward to it
+  const dlqLink = run.id.startsWith('dlq:')
+    ? { id: run.id.slice(4), label: `↩ dead-letter handler — open dead run ${run.id.slice(4)}` }
+    : dlqHandler
+      ? { id: `dlq:${run.id}`, label: '⚠ dead-lettered — open its DLQ handler →' }
+      : undefined;
   const canRetry = run.status === 'failed' || run.status === 'suspended';
   const canCancel = run.status === 'running' || run.status === 'suspended';
   // Paused at a breakpoint = a pending `signal` checkpoint named `breakpoint:*` (see ctx.breakpoint).
@@ -200,6 +218,15 @@ function RunDetail({ id }: { id: string }) {
             </span>
           </div>
           <div className="mono mt-1 truncate text-[11px] text-zinc-600">{run.id}</div>
+          {dlqLink && (
+            <button
+              type="button"
+              onClick={() => onOpenRun(dlqLink.id)}
+              className="mono mt-2 inline-flex items-center gap-1.5 rounded-md border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-300 transition-colors hover:bg-rose-500/20"
+            >
+              {dlqLink.label}
+            </button>
+          )}
         </div>
         <div className="flex shrink-0 gap-2">
           <button
@@ -312,7 +339,7 @@ export function App() {
           </aside>
           <main className="min-h-0">
             {selected ? (
-              <RunDetail key={selected} id={selected} />
+              <RunDetail key={selected} id={selected} onOpenRun={setSelected} />
             ) : (
               <div className="grid h-full place-items-center text-center">
                 <div>
