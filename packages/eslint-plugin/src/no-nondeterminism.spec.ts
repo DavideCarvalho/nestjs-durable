@@ -56,4 +56,18 @@ describe('no-nondeterminism', () => {
     // A class method named run WITHOUT the @Workflow decorator is just a method.
     expect(lint('class Plain { run() { return Date.now(); } }')).toHaveLength(0);
   });
+
+  it('does not flag non-determinism inside a ctx.step / ctx.task callback (checkpointed)', () => {
+    // The step body runs once and is checkpointed, so `new Date()` there is replay-safe.
+    expect(
+      lint(workflow("const s = await ctx.step('setup', async () => new Date().toISOString());")),
+    ).toHaveLength(0);
+    expect(
+      lint(workflow("await ctx.task('t', async () => { const r = Math.random(); });")),
+    ).toHaveLength(0);
+    // ...but a banned call in the orchestration body, even alongside steps, is still flagged.
+    expect(
+      lint(workflow("await ctx.step('a', async () => 1); const t = Date.now();")),
+    ).toHaveLength(1);
+  });
 });
