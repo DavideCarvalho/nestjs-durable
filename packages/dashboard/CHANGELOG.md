@@ -1,5 +1,18 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.8.0
+
+### Minor Changes
+
+- 7a8d5b8: feat(dashboard): give dead-letter runs a distinct look
+
+  A dead-letter run is a recovery path, not the happy flow — so it now reads as one instead of
+  looking like a normal run. A `dlq:<id>` handler run shows a rose **DLQ** pill next to its title and
+  a prominent banner ("Dead-letter handler — started because run X was dead-lettered" + open-dead-run
+  button); a `dead` run that was routed to a handler shows the mirror banner ("Dead-lettered — routed
+  to a DLQ handler" + open-handler button). Dead-letter handler runs are also tagged **dlq** in the
+  runs list so they stand out among normal runs. Replaces the old single inline link.
+
 ## 0.7.0
 
 ### Minor Changes
