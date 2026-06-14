@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   type RunResult,
+  type StartOptions,
   type WorkflowClass,
   WorkflowEngine,
   type WorkflowInputOf,
@@ -16,15 +17,22 @@ export class WorkflowService {
    * Start a workflow run. Pass the workflow's **class** (`start(CheckoutWorkflow, input)`) for a typed
    * input + refactor-safety, or a **name** string for a cross-runtime workflow. `runId` defaults to a
    * random id; pass your own to make the start idempotent (a redelivery returns the existing run).
+   * `opts.tags` are merged with the workflow's static `@Workflow({ tags })` onto the run.
    */
   start<C extends WorkflowClass>(
     workflow: C,
     input: WorkflowInputOf<C>,
     runId?: string,
+    opts?: StartOptions,
   ): Promise<RunResult>;
-  start(workflow: string, input: unknown, runId?: string): Promise<RunResult>;
-  start(workflow: string, input: unknown, runId: string = randomUUID()): Promise<RunResult> {
-    return this.engine.start(workflow, input, runId);
+  start(workflow: string, input: unknown, runId?: string, opts?: StartOptions): Promise<RunResult>;
+  start(
+    workflow: string,
+    input: unknown,
+    runId: string = randomUUID(),
+    opts?: StartOptions,
+  ): Promise<RunResult> {
+    return this.engine.start(workflow, input, runId, opts);
   }
 
   resume(runId: string): Promise<RunResult> {

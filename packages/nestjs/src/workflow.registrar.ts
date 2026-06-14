@@ -72,7 +72,9 @@ export class WorkflowRegistrar
       if (typeof workflow.run !== 'function') {
         throw new Error(`@Workflow ${meta.name} must define a run(ctx, input) method`);
       }
-      this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input));
+      this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input), {
+        tags: meta.tags,
+      });
 
       const inline = this.findDeadLetterHandler(instance);
       if (inline && meta.deadLetterWorkflow) {

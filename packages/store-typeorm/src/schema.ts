@@ -40,7 +40,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ${q('status')} ${str} NOT NULL,
       ${q('input')} ${txt}, ${q('output')} ${txt}, ${q('error')} ${txt},
       ${q('wakeAt')} ${ts}, ${q('lockedBy')} ${str}, ${q('lockedUntil')} ${ts},
-      ${q('recoveryAttempts')} ${int},
+      ${q('recoveryAttempts')} ${int}, ${q('tags')} ${txt},
       ${q('createdAt')} ${ts} NOT NULL, ${q('updatedAt')} ${ts} NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS ${checkpoints} (
@@ -68,6 +68,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ['output', txt],
       ['error', txt],
       ['recoveryAttempts', int],
+      ['tags', txt],
     ],
     durable_step_checkpoints: [
       ['input', txt],

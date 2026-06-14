@@ -38,6 +38,18 @@ import {
 
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
+/** Options for {@link WorkflowEngine.start}. */
+export interface StartOptions {
+  /** Run-scoped tags, merged with the workflow's static `@Workflow({ tags })` onto the run. */
+  tags?: string[];
+}
+
+/** Union of a workflow's static tags and a run's start-time tags, de-duplicated, or undefined if none. */
+function mergeTags(staticTags?: string[], runTags?: string[]): string[] | undefined {
+  if (!staticTags?.length && !runTags?.length) return undefined;
+  return [...new Set([...(staticTags ?? []), ...(runTags ?? [])])];
+}
+
 /** A breakpoint checkpoint's `name` is `breakpoint` (or `breakpoint:<label>`). This name — not the
  *  reused `signal` kind — is the explicit marker the dashboard and `continue()` detect it by. */
 const BREAKPOINT = 'breakpoint';
@@ -48,6 +60,8 @@ interface RegisteredWorkflow {
   name: string;
   version: string;
   fn: WorkflowFn;
+  /** Static `@Workflow({ tags })` — merged with per-run tags onto each run at start. */
+  tags?: string[];
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
@@ -231,8 +245,8 @@ export class WorkflowEngine {
    * runs working across a breaking change: old runs resume on the version they started on, new
    * runs start on the newest registered version.
    */
-  register(name: string, version: string, fn: WorkflowFn): void {
-    const registered: RegisteredWorkflow = { name, version, fn };
+  register(name: string, version: string, fn: WorkflowFn, opts?: { tags?: string[] }): void {
+    const registered: RegisteredWorkflow = { name, version, fn, tags: opts?.tags };
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
     if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
@@ -315,9 +329,20 @@ export class WorkflowEngine {
     workflow: C,
     input: WorkflowInputOf<C>,
     runId: string,
+    opts?: StartOptions,
   ): Promise<RunResult>;
-  async start<TInput>(workflow: string, input: TInput, runId: string): Promise<RunResult>;
-  async start(workflow: WorkflowRef, input: unknown, runId: string): Promise<RunResult> {
+  async start<TInput>(
+    workflow: string,
+    input: TInput,
+    runId: string,
+    opts?: StartOptions,
+  ): Promise<RunResult>;
+  async start(
+    workflow: WorkflowRef,
+    input: unknown,
+    runId: string,
+    opts?: StartOptions,
+  ): Promise<RunResult> {
     const name = workflowName(workflow);
     const registered = this.latest.get(name);
     if (!registered) throw new Error(`workflow ${name} is not registered`);
@@ -334,6 +359,7 @@ export class WorkflowEngine {
       workflowVersion: registered.version,
       status: 'running',
       input,
+      tags: mergeTags(registered.tags, opts?.tags),
       createdAt: now,
       updatedAt: now,
     };

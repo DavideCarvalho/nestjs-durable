@@ -7,7 +7,7 @@ import type {
   StepEvent,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
-import { Brackets, type DataSource, IsNull, LessThanOrEqual } from 'typeorm';
+import { Brackets, type DataSource, IsNull, LessThanOrEqual, Like } from 'typeorm';
 import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './entities';
 import { ensureTypeOrmDurableSchema } from './schema';
 
@@ -100,6 +100,8 @@ export class TypeOrmStateStore implements StateStore {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
     if (query.status) where.status = query.status;
+    // `tags` is a JSON-text column; match the quoted token so `etl` doesn't match `etl-foo`.
+    if (query.tag) where.tags = Like(`%"${query.tag}"%`);
     const rows = await this.runs().find({
       where,
       take: query.limit,
@@ -140,6 +142,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     lockedBy: run.lockedBy ?? null,
     lockedUntil: run.lockedUntil == null ? undefined : new Date(run.lockedUntil),
     recoveryAttempts: run.recoveryAttempts,
+    tags: run.tags ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -158,6 +161,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     lockedBy: e.lockedBy ?? undefined,
     lockedUntil: e.lockedUntil == null ? undefined : e.lockedUntil.getTime(),
     recoveryAttempts: e.recoveryAttempts ?? undefined,
+    tags: e.tags ?? undefined,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

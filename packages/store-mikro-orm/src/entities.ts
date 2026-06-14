@@ -36,6 +36,9 @@ export class WorkflowRunEntity {
   @Property({ type: 'integer', nullable: true })
   recoveryAttempts?: number;
 
+  @Property({ type: 'json', nullable: true })
+  tags?: string[] | null;
+
   @Property()
   createdAt!: Date;
 

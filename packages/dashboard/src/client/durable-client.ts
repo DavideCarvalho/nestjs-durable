@@ -11,6 +11,7 @@ export interface WorkflowRun {
   error?: { message: string; code?: string };
   wakeAt?: number;
   recoveryAttempts?: number;
+  tags?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -94,8 +95,12 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const durableClient = {
-  runs(status?: RunStatus): Promise<WorkflowRun[]> {
-    return http<WorkflowRun[]>(status ? `/runs?status=${status}` : '/runs');
+  runs(status?: RunStatus, tag?: string): Promise<WorkflowRun[]> {
+    const q = new URLSearchParams();
+    if (status) q.set('status', status);
+    if (tag) q.set('tag', tag);
+    const qs = q.toString();
+    return http<WorkflowRun[]>(qs ? `/runs?${qs}` : '/runs');
   },
   run(id: string): Promise<RunDetail> {
     return http<RunDetail>(`/runs/${encodeURIComponent(id)}`);

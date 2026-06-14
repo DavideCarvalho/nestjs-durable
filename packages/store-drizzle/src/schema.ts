@@ -15,6 +15,7 @@ export const workflowRuns = sqliteTable('durable_workflow_runs', {
   lockedBy: text('locked_by'),
   lockedUntil: integer('locked_until'),
   recoveryAttempts: integer('recovery_attempts'),
+  tags: text('tags', { mode: 'json' }).$type<string[]>(),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
 });

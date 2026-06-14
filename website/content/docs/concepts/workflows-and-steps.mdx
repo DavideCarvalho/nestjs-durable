@@ -86,3 +86,54 @@ await ctx.step('charge', async () => {
   return res;
 });
 ```
+
+## Steps vs. sub-process events
+
+These look similar in the dashboard but are fundamentally different — the distinction is **durability**:
+
+- A **step** (`ctx.step` / `ctx.call`) is a **durable checkpoint**. The engine records its result, so
+  on a crash, retry, or replay it is **not re-executed** — the saved result is replayed. It's a
+  first-class node in the run graph and the **unit of recovery**. Use a step for any unit that should
+  survive a crash or not be redone.
+
+- A **sub-process event** is a **log annotation emitted _inside_ a step** via the step logger's
+  `log.sub(name, status)` — e.g. one entry per item in a fan-out the step performs internally. It is
+  **not durable on its own**: it's metadata attached to the parent step's checkpoint. If the parent
+  step retries, all of its sub-process events are produced again. Use it for **visibility**, not
+  recovery.
+
+```ts
+// One durable step that internally processes N items and records each outcome for visibility.
+await ctx.step('process-batch', async (log) => {
+  for (const item of batch) {
+    try {
+      await handle(item);
+      log.sub(item.id, 'ok'); // a sub-process event — shown under the step, not a checkpoint
+    } catch (e) {
+      log.sub(item.id, 'failed', String(e));
+    }
+  }
+});
+```
+
+Rule of thumb: if you want each unit to **retry or replay independently**, make it a **step** (or a
+[child workflow](/docs/authoring/child-workflows) when it has its own internal steps you want to see).
+If you only want to **see** what happened inside one durable unit, emit **sub-process events**.
+
+## Tags
+
+Label runs with `tags` to find them later. Static tags on the `@Workflow` apply to every run; per-run
+tags are added at `start`. Both are merged onto the run and are searchable in the dashboard.
+
+```ts
+@Workflow({ name: 'pipeline', version: '1', tags: ['etl', 'critical'] })
+export class PipelineWorkflow {
+  /* ... */
+}
+
+// per-run tags merge with the static ones → run.tags = ['etl', 'critical', 'nightly']
+await this.workflows.start(PipelineWorkflow, input, runId, { tags: ['nightly'] });
+```
+
+The dashboard shows a run's tags in the list and detail, and a tag filter box (clicking a tag filters
+the list). Programmatically, query by tag with `RunQuery.tag` or the dashboard API's `?tag=` param.
