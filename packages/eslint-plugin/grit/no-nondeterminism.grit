@@ -1,0 +1,18 @@
+// Biome (>= 2.0) GritQL plugin: flag non-deterministic sources that corrupt a durable replay.
+// Biome plugins can't yet scope by decorator/method, so target it at your workflow files via
+// biome.json `overrides` (e.g. include "**/*.workflow.ts") and use ctx.now()/ctx.random()/ctx.uuid().
+language js
+
+or {
+  `Date.now()`,
+  `performance.now()`,
+  `Math.random()`,
+  `crypto.randomUUID()`,
+  `globalThis.crypto.randomUUID()`,
+  `new Date()`
+} as $bad where {
+  register_diagnostic(
+    span = $bad,
+    message = "Non-deterministic source inside a durable workflow — it differs across replays and corrupts the run. Use ctx.now() / ctx.random() / ctx.uuid()."
+  )
+}

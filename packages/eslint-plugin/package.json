@@ -1,0 +1,35 @@
+{
+  "name": "@dudousxd/nestjs-durable-eslint-plugin",
+  "version": "0.1.0",
+  "description": "ESLint rule: flag non-deterministic calls (Date.now, Math.random, …) inside a @Workflow run",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "directory": "packages/eslint-plugin"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "grit"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "eslint": ">=8.0.0"
+  },
+  "dependencies": {
+    "@typescript-eslint/utils": "^8.0.0"
+  },
+  "devDependencies": {
+    "@typescript-eslint/parser": "^8.0.0",
+    "@typescript-eslint/utils": "^8.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "5.9.3"
+  }
+}
