@@ -1,5 +1,47 @@
 # @dudousxd/nestjs-durable
 
+## 0.5.0
+
+### Minor Changes
+
+- 2addfd2: feat: per-workflow dead-letter handlers (`@DeadLetter()` + `@Workflow({ deadLetterWorkflow })`)
+
+  Dead-lettering is now per-workflow, not just a single global module option. A dead run's handler is
+  resolved in this order:
+
+  1. an inline **`@DeadLetter()`** method on the workflow class — co-located, shares the class's
+     injected deps, runs as a durable workflow auto-registered as `<name>.dlq`, and receives a typed
+     `DeadLetter<TInput>` payload;
+  2. the workflow's **`@Workflow({ deadLetterWorkflow: 'other-wf' })`** reference to another registered
+     workflow;
+  3. the module-level **`deadLetterWorkflow`** default (unchanged), now a fallback for workflows that
+     declare neither.
+
+  A workflow declaring both an inline `@DeadLetter()` and a `deadLetterWorkflow` reference fails fast at
+  boot (ambiguous config). DLQ routing now lives in the `WorkflowRegistrar` (which owns the `@Workflow`
+  metadata) instead of the module factory. New public exports: the `DeadLetter()` decorator and the
+  `DeadLetter<TInput>` payload type.
+
+- 2addfd2: feat: pass workflow **classes** instead of name strings, and a fire-and-forget `ctx.startChild`
+
+  **Workflow class refs.** Anywhere you named a workflow by string, you can now pass its class for a
+  same-runtime call — refactor-safe and typed — while strings stay for cross-runtime (e.g. a Python
+  workflow):
+
+  - `ctx.child(ShippingWorkflow, input)` — input is type-checked and the result is inferred from the
+    child's `run` (no manual type parameter).
+  - `engine.start(CheckoutWorkflow, input)` / `WorkflowService.start(CheckoutWorkflow, input)`.
+  - `@Workflow({ deadLetterWorkflow: PipelineDlqWorkflow })` and the module-level `deadLetterWorkflow`.
+
+  The `@Workflow` decorator stamps the registered name on the class; `workflowName(ref)` (exported)
+  resolves a `WorkflowRef` (`string | WorkflowClass`) back to its name. New exported types:
+  `WorkflowClass`, `WorkflowRef`, `WorkflowInputOf`, `WorkflowOutputOf`, and `WORKFLOW_NAME_KEY`.
+
+  **`ctx.startChild`.** A fire-and-forget counterpart to `ctx.child`: dispatches a child once
+  (checkpointed, replay-safe) and returns its run id immediately instead of suspending — for side work
+  the parent doesn't wait on, or scatter-gather (start many, then `ctx.child` each by the same id to
+  join; the start is idempotent by id, so each child runs exactly once).
+
 ## 0.4.0
 
 ### Minor Changes
