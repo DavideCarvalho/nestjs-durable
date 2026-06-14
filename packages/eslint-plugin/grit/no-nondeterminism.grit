@@ -1,6 +1,8 @@
 // Biome (>= 2.0) GritQL plugin: flag non-deterministic sources that corrupt a durable replay.
-// Biome plugins can't yet scope by decorator/method, so target it at your workflow files via
-// biome.json `overrides` (e.g. include "**/*.workflow.ts") and use ctx.now()/ctx.random()/ctx.uuid().
+// Biome plugins can't scope by decorator/method, so target it at your workflow files via biome.json
+// `overrides` (include "**/*.workflow.ts"). Calls inside a ctx.step(...) / ctx.task(...) callback are
+// NOT flagged — those bodies run once and are checkpointed, so non-determinism there is replay-safe.
+// In the orchestration body, use ctx.now() / ctx.random() / ctx.uuid() instead.
 language js
 
 or {
@@ -11,8 +13,10 @@ or {
   `globalThis.crypto.randomUUID()`,
   `new Date()`
 } as $bad where {
+  not $bad <: within `$_.step($...)`,
+  not $bad <: within `$_.task($...)`,
   register_diagnostic(
     span = $bad,
-    message = "Non-deterministic source inside a durable workflow — it differs across replays and corrupts the run. Use ctx.now() / ctx.random() / ctx.uuid()."
+    message = "Non-deterministic source in a durable workflow body — it differs across replays and corrupts the run. Use ctx.now() / ctx.random() / ctx.uuid() (or move it inside a ctx.step, which is checkpointed)."
   )
 }

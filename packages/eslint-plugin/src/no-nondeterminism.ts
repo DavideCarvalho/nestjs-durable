@@ -7,10 +7,31 @@ const createRule = ESLintUtils.RuleCreator(
 type MessageId = 'useNow' | 'useRandom' | 'useUuid' | 'useNowDate';
 
 /** True when `node` sits lexically inside the `run` method of a class decorated with `@Workflow`. */
+/** A function/arrow passed as an argument to `ctx.step(...)` / `ctx.task(...)` — its body is run once
+ *  and checkpointed, so non-determinism inside it is fine (only the orchestration body must be pure). */
+function isCheckpointedCallback(fn: TSESTree.Node): boolean {
+  const call = fn.parent;
+  if (call?.type !== 'CallExpression' || !call.arguments.includes(fn as never)) return false;
+  const callee = call.callee;
+  return (
+    callee.type === 'MemberExpression' &&
+    callee.property.type === 'Identifier' &&
+    (callee.property.name === 'step' || callee.property.name === 'task')
+  );
+}
+
 function isInWorkflowRun(node: TSESTree.Node): boolean {
   let cur: TSESTree.Node | undefined = node;
   let runMethod: TSESTree.MethodDefinition | undefined;
   while (cur) {
+    // Crossing a `ctx.step`/`ctx.task` callback boundary before reaching `run` means the call is
+    // inside a checkpointed step — not the deterministic orchestration body — so don't flag it.
+    if (
+      (cur.type === 'ArrowFunctionExpression' || cur.type === 'FunctionExpression') &&
+      isCheckpointedCallback(cur)
+    ) {
+      return false;
+    }
     if (
       cur.type === 'MethodDefinition' &&
       cur.key.type === 'Identifier' &&
