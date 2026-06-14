@@ -126,7 +126,14 @@ function RunsList({
             }`}
           >
             <div className="flex items-center justify-between gap-2">
-              <span className="truncate text-sm font-medium text-zinc-200">{r.workflow}</span>
+              <span className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate text-sm font-medium text-zinc-200">{r.workflow}</span>
+                {r.id.startsWith('dlq:') && (
+                  <span className="mono shrink-0 rounded border border-rose-500/40 bg-rose-500/10 px-1 text-[9px] uppercase tracking-wider text-rose-300">
+                    dlq
+                  </span>
+                )}
+              </span>
               <Badge status={r.status} />
             </div>
             <div className="flex items-center justify-between gap-2">
@@ -187,13 +194,25 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
 
   if (!data) return <div className="p-8 text-sm text-zinc-600">Loading run…</div>;
   const { run, timeline } = data;
-  // The two ends of a dead-letter relationship, linked both ways:
+  // A dead-letter run is a recovery path, not the normal flow — surface it as a banner. The two ends
+  // of the relationship, linked both ways:
   //  - a `dlq:<id>` run is a handler → link back to the dead run it's handling
   //  - a `dead` run with an existing `dlq:<id>` handler → link forward to it
-  const dlqLink = run.id.startsWith('dlq:')
-    ? { id: run.id.slice(4), label: `↩ dead-letter handler — open dead run ${run.id.slice(4)}` }
+  const isDlqHandler = run.id.startsWith('dlq:');
+  const dlqLink = isDlqHandler
+    ? {
+        id: run.id.slice(4),
+        title: 'Dead-letter handler',
+        subtitle: `started because run ${run.id.slice(4)} was dead-lettered`,
+        cta: 'open dead run →',
+      }
     : dlqHandler
-      ? { id: `dlq:${run.id}`, label: '⚠ dead-lettered — open its DLQ handler →' }
+      ? {
+          id: `dlq:${run.id}`,
+          title: 'Dead-lettered',
+          subtitle: 'this run exceeded recovery and was routed to a DLQ handler',
+          cta: 'open DLQ handler →',
+        }
       : undefined;
   const canRetry = run.status === 'failed' || run.status === 'suspended';
   const canCancel = run.status === 'running' || run.status === 'suspended';
@@ -209,6 +228,11 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
         <div className="min-w-0">
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-semibold tracking-tight">{run.workflow}</h2>
+            {isDlqHandler && (
+              <span className="mono rounded border border-rose-500/40 bg-rose-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-rose-300">
+                dlq
+              </span>
+            )}
             <Badge status={run.status} />
             <span className="mono rounded border border-[var(--line)] px-1.5 py-0.5 text-[10px] text-zinc-500">
               v{run.workflowVersion}
@@ -218,15 +242,6 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             </span>
           </div>
           <div className="mono mt-1 truncate text-[11px] text-zinc-600">{run.id}</div>
-          {dlqLink && (
-            <button
-              type="button"
-              onClick={() => onOpenRun(dlqLink.id)}
-              className="mono mt-2 inline-flex items-center gap-1.5 rounded-md border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-300 transition-colors hover:bg-rose-500/20"
-            >
-              {dlqLink.label}
-            </button>
-          )}
         </div>
         <div className="flex shrink-0 gap-2">
           <button
@@ -280,6 +295,27 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           </button>
         </div>
       </div>
+      {dlqLink && (
+        <div className="flex items-center gap-3 border-b border-rose-500/30 bg-rose-500/10 px-7 py-3">
+          <span
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-rose-500/40 bg-rose-500/15 text-sm text-rose-300"
+            aria-hidden
+          >
+            ⚠
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-medium text-rose-200">{dlqLink.title}</div>
+            <div className="mono truncate text-[11px] text-rose-300/70">{dlqLink.subtitle}</div>
+          </div>
+          <button
+            type="button"
+            onClick={() => onOpenRun(dlqLink.id)}
+            className="mono shrink-0 rounded-md border border-rose-500/40 bg-rose-500/15 px-2.5 py-1.5 text-[11px] text-rose-200 transition-colors hover:bg-rose-500/25"
+          >
+            {dlqLink.cta}
+          </button>
+        </div>
+      )}
       <div className="relative grid min-h-0 flex-1 grid-rows-[1fr_auto]">
         <div className="relative min-h-0">
           {timeline.length === 0 ? (
