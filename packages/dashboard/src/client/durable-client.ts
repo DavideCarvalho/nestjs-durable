@@ -10,6 +10,7 @@ export interface WorkflowRun {
   output?: unknown;
   error?: { message: string; code?: string };
   wakeAt?: number;
+  recoveryAttempts?: number;
   createdAt: string;
   updatedAt: string;
 }

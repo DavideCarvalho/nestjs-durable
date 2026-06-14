@@ -31,7 +31,7 @@ const RUN =
   '{ id: string; workflow: string; workflowVersion: string; ' +
   "status: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' | 'dead'; " +
   'input?: unknown; output?: unknown; error?: { message: string; code?: string }; ' +
-  'wakeAt?: number; createdAt: string; updatedAt: string }';
+  'wakeAt?: number; recoveryAttempts?: number; createdAt: string; updatedAt: string }';
 const STEP =
   "{ runId: string; seq: number; name: string; kind: 'local' | 'remote' | 'sleep' | 'signal'; " +
   "status: 'completed' | 'failed'; output?: unknown; error?: { message: string }; attempts: number; " +
