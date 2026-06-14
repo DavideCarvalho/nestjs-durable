@@ -175,3 +175,117 @@ just like a Node one. The SDK stamps it for you.
 `Worker.process_task(task) -> result` is the pure, transport-agnostic core (no broker needed — ideal
 for unit tests). Because the contract is language-neutral, a Go or Rust worker can implement the same
 thing — Python is just the first SDK.
+
+## Cooperative cancellation
+
+When a run is cancelled — `engine.cancel(runId)` on the NestJS side — a step that's already running
+in a worker can't be force-killed from outside the process. Instead the orchestrator **broadcasts** a
+control message and the handler bails out on its own at a safe point. This works *cross-language*: the
+control plane is the same one the TypeScript engine uses, so a Python worker observes `engine.cancel`
+just like a Node one.
+
+The mechanics:
+
+- The orchestrator publishes `{"kind": "cancel", "runId": ...}` on its **control channel**
+  (`<prefix>-control`, the same channel the TS control plane uses).
+- `run_redis_worker` **subscribes** to that channel and feeds a `CancellationRegistry` — a thread-safe
+  set of cancelled run ids. It does this automatically; one is created for you if you don't pass your
+  own.
+- The registry is surfaced to your handler through the step context as **`ctx.cancelled`** (a bool) and
+  **`ctx.raise_if_cancelled()`** (raises `Cancelled`). A long handler checks it at safe points and
+  returns or raises, so it stops doing work whose result is going to be discarded.
+
+Opt in by declaring the second `ctx` parameter on your handler (same context that carries the
+[step events](/docs/observability/dashboard)), then poll it inside the loop:
+
+```python
+from durable_worker import Worker, Cancelled
+
+worker = Worker(group="pipeline")
+
+@worker.step("pipeline.transcode")
+def transcode(data, ctx):
+    out = []
+    for chunk in data["chunks"]:
+        # Bail out before starting more expensive work — the run was cancelled,
+        # so finishing the remaining chunks would just be thrown away.
+        if ctx.cancelled:
+            ctx.warn("cancelled — stopping early", {"done": len(out)})
+            return {"partial": out, "cancelled": True}
+
+        out.append(encode_chunk(chunk))
+    return {"chunks": out}
+```
+
+`ctx.raise_if_cancelled()` is the one-liner equivalent when you'd rather abort than return a partial
+result — it raises `Cancelled` (a subclass of `Exception`), which surfaces as a failed step:
+
+```python
+@worker.step("pipeline.crawl")
+async def crawl(data, ctx):
+    results = []
+    for url in data["urls"]:
+        ctx.raise_if_cancelled()   # raises Cancelled the moment the run is cancelled
+        results.append(await fetch(url))
+    return {"results": results}
+```
+
+`run_redis_worker` passes `registry.is_cancelled` into `process_task` for you, so `ctx.cancelled`
+reflects cancellation automatically. If you want to drive a registry yourself (e.g. you run the worker
+on a transport without pub/sub, or you want to share one registry across runners), construct it and
+pass it in:
+
+```python
+from durable_worker.cancellation import CancellationRegistry
+
+cancellation = CancellationRegistry()
+
+await run_redis_worker(
+    worker,
+    group="pipeline",
+    connection="redis://localhost:6379",
+    cancellation=cancellation,
+)
+```
+
+> Cancellation is **cooperative** by design: a handler that never checks `ctx.cancelled` runs to
+> completion, the engine just discards its result. Sprinkle the check at the natural boundaries of a
+> long handler (between chunks, before an expensive call) so it can let go promptly.
+
+The control-channel subscription is **best-effort** — it needs the `redis` async client for pub/sub.
+If it isn't available the runner logs and continues; steps still run, cancellation just won't be
+observed.
+
+## Multi-broker reply routing
+
+A worker can consume **more than one broker** at once — typically for failover, where the engine
+dispatches the same step over two transports and whichever broker is healthy delivers it. The catch:
+the **result has to go back on the same broker the task arrived on**, otherwise the engine waiting on
+the other transport never sees it. The orchestrator stamps each task with the id of the transport it
+was dispatched on (`task["transport"]`), and `reply_target` does the lookup:
+
+```python
+from durable_worker.routing import reply_target
+
+# One reply target per broker id (e.g. a results queue / publisher per transport).
+targets = {
+    "redis-primary": primary_results,
+    "redis-failover": failover_results,
+}
+
+def on_task(task):
+    result = worker.process_task(task, is_cancelled=registry.is_cancelled)
+    target = reply_target(task, targets)  # picks the broker the task came in on
+    target.send(result)                   # reply where you were told, never pick one yourself
+```
+
+`reply_target(task, targets)` returns the entry keyed by `task["transport"]`. It falls back to the
+lone target when the id is absent (a single transport) or unknown, and returns `None` only when
+`targets` is empty — so the single-broker case keeps working with a one-entry mapping and no special
+casing.
+
+That said, the **simpler pattern is one runner per broker**: start a `run_redis_worker` (or SQS / DB
+runner) for each broker, each consuming and replying on its own transport. Each runner already publishes
+its results on the broker it consumes, so there's nothing to route — no `reply_target` needed. Reach for
+`reply_target` only when a single worker loop genuinely multiplexes several brokers and has to decide,
+per task, where the reply goes.

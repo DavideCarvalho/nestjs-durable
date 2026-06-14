@@ -1,0 +1,123 @@
+---
+title: Scheduling
+description: Recurring workflows with ScheduledWorkflow — fixed intervals via everyMs or DST-aware cron via cron + timezone — fired each tick by the NestJS module's schedules option, started exactly once per window by an idempotent time-bucket run id.
+---
+
+A scheduled workflow is just a normal workflow that the engine **starts on a recurring cadence** for
+you — a nightly report, an hourly sync, a cleanup every five minutes. You describe the cadence with a
+`ScheduledWorkflow`, hand it to the module's `schedules` option, and the engine fires it each tick.
+The interesting part is the exactly-once guarantee: even with several worker instances racing on the
+same tick, each schedule window starts **exactly once**.
+
+## Describing a schedule — `ScheduledWorkflow`
+
+```ts
+interface ScheduledWorkflow {
+  /** Stable key identifying this schedule — part of the deterministic run id. */
+  key: string;
+  workflow: string;
+  input?: unknown;
+  /** Start one run every `everyMs`. Mutually exclusive with `cron`. */
+  everyMs?: number;
+  /** A cron expression evaluated in `timezone`. Mutually exclusive with `everyMs`. */
+  cron?: string;
+  /** IANA timezone the `cron` fires in (e.g. `America/Sao_Paulo`). Defaults to UTC. */
+  timezone?: string;
+}
+```
+
+Every schedule has a stable `key`, the `workflow` to start, and an optional `input`. The cadence is
+either `everyMs` (a fixed interval) **or** `cron` + `timezone` (a calendar expression) — they are
+mutually exclusive.
+
+## Wiring it up — the `schedules` option
+
+Pass your schedules to `DurableModule`. The durable-timer poller fires them each tick on **worker**
+instances:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  schedules: [
+    // Nightly report at 02:00 in São Paulo — DST-aware.
+    {
+      key: 'nightly-report',
+      workflow: 'daily-report',
+      cron: '0 2 * * *',
+      timezone: 'America/Sao_Paulo',
+    },
+    // Sync the cache every five minutes.
+    {
+      key: 'cache-sync',
+      workflow: 'cache-sync',
+      everyMs: 5 * 60 * 1000,
+    },
+  ],
+});
+```
+
+The referenced workflows are ordinary `@Workflow` providers:
+
+```ts
+@Workflow({ name: 'daily-report', version: '1' })
+export class DailyReportWorkflow {
+  constructor(private readonly reports: ReportService) {}
+  async run(ctx: WorkflowCtx) {
+    const rows = await ctx.step('gather', () => this.reports.gatherYesterday());
+    await ctx.step('email', () => this.reports.email(rows));
+    return { rows: rows.length };
+  }
+}
+```
+
+## Fixed intervals — `everyMs`
+
+`everyMs` starts one run every interval. The current window is identified by the time bucket
+`floor(now / everyMs)`, which becomes part of the run id (`sched:<key>:<bucket>`). Every tick inside
+the same window resolves to the same run id, so re-firing the schedule within a window is a no-op.
+
+```ts
+{ key: 'cache-sync', workflow: 'cache-sync', everyMs: 5 * 60 * 1000 } // every 5 minutes
+```
+
+Use a fixed interval when "roughly every N" is what you want and you don't care about wall-clock
+alignment to the calendar.
+
+## Cron — `cron` + `timezone`
+
+For calendar-aligned schedules, use a cron expression evaluated in an IANA `timezone`. The expression
+is the standard 5 fields (`m h dom mon dow`), or 6 with a leading seconds field. Because it is
+evaluated in the named timezone, it is **DST-aware** — `0 2 * * *` in `America/Sao_Paulo` fires at
+02:00 local regardless of daylight-saving shifts, not at a fixed UTC offset.
+
+```ts
+{ key: 'nightly-report', workflow: 'daily-report', cron: '0 2 * * *', timezone: 'America/Sao_Paulo' }
+```
+
+The window for a cron schedule is its most recent fire time at or before now — the deterministic
+"bucket" the run is keyed on (`sched:<key>:<prevFireMs>`). Polling repeatedly between two fires
+resolves to the same bucket, and thus the same run id, so the run for a given fire starts once.
+
+Cron needs the optional peer dependency `cron-parser` — core stays dependency-free, and only users
+who schedule by cron pull it in. Install it where you run the engine:
+
+```bash
+npm i cron-parser
+```
+
+Omitting it and using a `cron` schedule throws a clear error pointing you to install it.
+
+## Exactly-once across instances
+
+The guarantee that makes scheduling safe in a multi-instance deployment is the **idempotent
+time-bucket run id**. Each window — a fixed-interval index, or a cron fire time — maps to a
+deterministic run id, and `engine.start` is idempotent by run id: starting the same id twice is a
+no-op. So when several worker instances tick at the same moment and all try to start the current
+window, they all compute the same run id and only the first actually creates the run. The poller fires
+schedules on worker instances only, so a dashboard-only / dispatch-only instance never starts them.
+
+The mechanism is the same one used everywhere durability needs idempotency — see
+[Workflows & steps](/docs/concepts/workflows-and-steps) for how a deterministic run id underpins
+exactly-once starts in general. The result for scheduling: **each window starts exactly once**, no
+matter how many instances are racing the tick or how often the poller fires.
