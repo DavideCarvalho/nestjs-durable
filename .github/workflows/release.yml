@@ -25,7 +25,8 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # pnpm 11.5 (the pinned packageManager) needs Node >= 22.13; .nvmrc pins it.
+          node-version-file: .nvmrc
           cache: pnpm
           # Writes ~/.npmrc pointing at npm and reading NODE_AUTH_TOKEN, so
           # `changeset publish` authenticates without a committed token.
