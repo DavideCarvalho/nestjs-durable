@@ -88,11 +88,23 @@ export function PlayIcon(p: SVGProps<SVGSVGElement>) {
   );
 }
 
+/** A child-workflow glyph (a branch forking off to a sub-run). */
+export function ChildIcon(p: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...p} aria-hidden>
+      <circle cx="6" cy="5" r="2" />
+      <path d="M6 7v6a4 4 0 004 4h4" />
+      <circle cx="18" cy="17" r="2" />
+    </svg>
+  );
+}
+
 const KIND_ICON: Record<string, (p: SVGProps<SVGSVGElement>) => JSX.Element> = {
   local: CpuIcon,
   remote: GlobeIcon,
   sleep: TimerIcon,
   signal: RadioIcon,
+  child: ChildIcon,
 };
 
 /** The icon for a step kind, always defined (unknown kinds fall back to the local/cpu glyph). */
@@ -105,4 +117,5 @@ export const KIND_LABEL: Record<string, string> = {
   remote: 'Remote worker step',
   sleep: 'Durable timer',
   signal: 'External signal',
+  child: 'Child workflow — click to open its run',
 };

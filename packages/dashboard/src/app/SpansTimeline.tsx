@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import type { StepCheckpoint, WorkflowRun } from '../client/durable-client';
-import { iconFor } from './icons';
+import { childRunIdOf } from './child-link';
+import { ChildIcon, iconFor } from './icons';
 
 function fmtDur(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
@@ -17,11 +18,14 @@ export function SpansTimeline({
   timeline,
   selected,
   onSelect,
+  onOpenRun,
 }: {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
   selected?: number;
   onSelect: (seq: number) => void;
+  /** Navigate to another run — used when a child-workflow row is clicked. */
+  onOpenRun: (id: string) => void;
 }) {
   const { span, rows } = useMemo(() => {
     const starts = timeline.map((s) => new Date(s.startedAt).getTime());
@@ -57,22 +61,30 @@ export function SpansTimeline({
       <div className="min-h-0 flex-1 space-y-1 overflow-auto px-3 pb-3">
         {rows.map(({ step, left, width, ms }) => {
           const failed = step.status === 'failed';
-          const Icon = iconFor(step.kind);
+          const childRunId = childRunIdOf(step);
+          const isChild = !!childRunId;
+          const Icon = isChild ? ChildIcon : iconFor(step.kind);
           const active = selected === step.seq;
           return (
             <button
               type="button"
               key={step.seq}
-              onClick={() => onSelect(step.seq)}
+              onClick={() => (childRunId ? onOpenRun(childRunId) : onSelect(step.seq))}
+              title={isChild ? 'Child workflow — click to open its run' : undefined}
               className={`group grid w-full grid-cols-[150px_1fr] items-center gap-3 rounded-md px-2 py-1 text-left transition-colors ${
                 active ? 'bg-zinc-800/60' : 'hover:bg-zinc-900/60'
               }`}
             >
               <span className="flex items-center gap-1.5 truncate">
-                <span className={failed ? 'text-red-400' : 'text-emerald-400'}>
+                <span
+                  className={
+                    failed ? 'text-red-400' : isChild ? 'text-indigo-300' : 'text-emerald-400'
+                  }
+                >
                   <Icon width={12} height={12} />
                 </span>
                 <span className="truncate text-[12px] text-zinc-300">{step.name}</span>
+                {isChild && <span className="text-indigo-300">↗</span>}
               </span>
               <span className="relative h-5">
                 {/* track */}
