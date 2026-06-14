@@ -9,6 +9,18 @@ function fmtDur(ms: number): string {
   return `${(ms / 60_000).toFixed(2)}m`;
 }
 
+type SubStatus = 'ok' | 'failed' | 'skipped';
+const SUB_BAR: Record<SubStatus, string> = {
+  ok: 'bg-emerald-500/40 ring-1 ring-emerald-500/50',
+  failed: 'bg-red-500/40 ring-1 ring-red-500/50',
+  skipped: 'bg-amber-500/35 ring-1 ring-amber-500/45',
+};
+const SUB_DOT: Record<SubStatus, string> = {
+  ok: 'bg-emerald-400',
+  failed: 'bg-red-400',
+  skipped: 'bg-amber-400',
+};
+
 /**
  * A span waterfall (gantt) for the run: each checkpoint is a bar placed by its start offset and
  * sized by its real duration, so you read at a glance which step took the time. Click to inspect.
@@ -42,11 +54,33 @@ export function SpansTimeline({
       const end = new Date(s.finishedAt).getTime();
       const start = prev;
       prev = end;
+      // Sub-process spans: each sub-process event carries its completion `at`. Render consecutive
+      // bars across the step's own [startedAt, finishedAt] window, so a step that fans out into
+      // sub-processes (e.g. parallel p-processes) reads as a mini-waterfall, not one opaque bar.
+      const stepStart = new Date(s.startedAt).getTime();
+      let subPrev = stepStart;
+      const subRows = (s.events ?? [])
+        .filter((e) => e.status)
+        .sort((a, b) => a.at - b.at)
+        .map((e, i) => {
+          const at = Math.min(Math.max(e.at, stepStart), end);
+          const sStart = subPrev;
+          subPrev = at;
+          return {
+            key: `${e.name ?? 'sub'}-${e.at}-${i}`,
+            name: e.name ?? 'sub-process',
+            status: e.status as SubStatus,
+            left: ((sStart - t0) / span) * 100,
+            width: Math.max(((at - sStart) / span) * 100, 0.8),
+            ms: at - sStart,
+          };
+        });
       return {
         step: s,
         left: ((start - t0) / span) * 100,
         width: Math.max(((end - start) / span) * 100, 0.8),
         ms: end - start,
+        subRows,
       };
     });
     return { span, rows };
@@ -59,54 +93,80 @@ export function SpansTimeline({
         <span className="mono tnum text-[10px] text-zinc-600">total {fmtDur(span)}</span>
       </div>
       <div className="min-h-0 flex-1 space-y-1 overflow-auto px-3 pb-3">
-        {rows.map(({ step, left, width, ms }) => {
+        {rows.map(({ step, left, width, ms, subRows }) => {
           const failed = step.status === 'failed';
           const childRunId = childRunIdOf(step);
           const isChild = !!childRunId;
           const Icon = isChild ? ChildIcon : iconFor(step.kind);
           const active = selected === step.seq;
           return (
-            <button
-              type="button"
-              key={step.seq}
-              onClick={() => (childRunId ? onOpenRun(childRunId) : onSelect(step.seq))}
-              title={isChild ? 'Child workflow — click to open its run' : undefined}
-              className={`group grid w-full grid-cols-[150px_1fr] items-center gap-3 rounded-md px-2 py-1 text-left transition-colors ${
-                active ? 'bg-zinc-800/60' : 'hover:bg-zinc-900/60'
-              }`}
-            >
-              <span className="flex items-center gap-1.5 truncate">
-                <span
-                  className={
-                    failed ? 'text-red-400' : isChild ? 'text-indigo-300' : 'text-emerald-400'
-                  }
-                >
-                  <Icon width={12} height={12} />
+            <div key={step.seq}>
+              <button
+                type="button"
+                onClick={() => (childRunId ? onOpenRun(childRunId) : onSelect(step.seq))}
+                title={isChild ? 'Child workflow — click to open its run' : undefined}
+                className={`group grid w-full grid-cols-[150px_1fr] items-center gap-3 rounded-md px-2 py-1 text-left transition-colors ${
+                  active ? 'bg-zinc-800/60' : 'hover:bg-zinc-900/60'
+                }`}
+              >
+                <span className="flex items-center gap-1.5 truncate">
+                  <span
+                    className={
+                      failed ? 'text-red-400' : isChild ? 'text-indigo-300' : 'text-emerald-400'
+                    }
+                  >
+                    <Icon width={12} height={12} />
+                  </span>
+                  <span className="truncate text-[12px] text-zinc-300">{step.name}</span>
+                  {isChild && <span className="text-indigo-300">↗</span>}
                 </span>
-                <span className="truncate text-[12px] text-zinc-300">{step.name}</span>
-                {isChild && <span className="text-indigo-300">↗</span>}
-              </span>
-              <span className="relative h-5">
-                {/* track */}
-                <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--line-soft)]" />
-                <span
-                  className={`absolute top-1/2 flex h-3.5 -translate-y-1/2 items-center rounded-[3px] ${
-                    failed
-                      ? 'bg-red-500/35 ring-1 ring-red-500/50'
-                      : active
-                        ? 'bg-emerald-400/45 ring-1 ring-emerald-400/60'
-                        : 'bg-emerald-500/30 ring-1 ring-emerald-500/40'
-                  }`}
-                  style={{ left: `${left}%`, width: `${width}%` }}
-                />
-                <span
-                  className="mono tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[10px] text-zinc-500"
-                  style={{ left: `min(${left + width}%, calc(100% - 44px))` }}
-                >
-                  {fmtDur(ms)}
+                <span className="relative h-5">
+                  {/* track */}
+                  <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--line-soft)]" />
+                  <span
+                    className={`absolute top-1/2 flex h-3.5 -translate-y-1/2 items-center rounded-[3px] ${
+                      failed
+                        ? 'bg-red-500/35 ring-1 ring-red-500/50'
+                        : active
+                          ? 'bg-emerald-400/45 ring-1 ring-emerald-400/60'
+                          : 'bg-emerald-500/30 ring-1 ring-emerald-500/40'
+                    }`}
+                    style={{ left: `${left}%`, width: `${width}%` }}
+                  />
+                  <span
+                    className="mono tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[10px] text-zinc-500"
+                    style={{ left: `min(${left + width}%, calc(100% - 44px))` }}
+                  >
+                    {fmtDur(ms)}
+                  </span>
                 </span>
-              </span>
-            </button>
+              </button>
+              {subRows.length > 0 && (
+                <div className="ml-[18px] mt-0.5 mb-1 space-y-0.5 border-l border-[var(--line-soft)] pl-2">
+                  {subRows.map((sub) => (
+                    <div
+                      key={sub.key}
+                      className="grid grid-cols-[130px_1fr] items-center gap-3 px-2"
+                      title={`${sub.name} — ${sub.status}`}
+                    >
+                      <span className="flex items-center gap-1.5 truncate">
+                        <span
+                          className={`h-1.5 w-1.5 shrink-0 rounded-full ${SUB_DOT[sub.status]}`}
+                        />
+                        <span className="truncate text-[10px] text-zinc-400">{sub.name}</span>
+                      </span>
+                      <span className="relative h-3">
+                        <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--line-soft)]" />
+                        <span
+                          className={`absolute top-1/2 h-2 -translate-y-1/2 rounded-[2px] ${SUB_BAR[sub.status]}`}
+                          style={{ left: `${sub.left}%`, width: `${sub.width}%` }}
+                        />
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           );
         })}
       </div>

@@ -90,6 +90,8 @@ export class InMemoryStateStore implements StateStore {
     let runs = [...this.runs.values()];
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
     if (query.status) runs = runs.filter((r) => r.status === query.status);
+    // Newest first (matches the store adapters' `createdAt DESC`) — recent runs on top in the dashboard.
+    runs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
     const offset = query.offset ?? 0;
     const limit = query.limit ?? runs.length;
     return runs.slice(offset, offset + limit).map((r) => ({ ...r }));

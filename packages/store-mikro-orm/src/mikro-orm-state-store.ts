@@ -97,7 +97,7 @@ export class MikroOrmStateStore implements StateStore {
     const rows = await em.find(WorkflowRunEntity, where, {
       limit: query.limit,
       offset: query.offset,
-      orderBy: { createdAt: 'asc' },
+      orderBy: { createdAt: 'desc' }, // newest first — recent runs on top in the dashboard
     });
     return rows.map(fromRunEntity);
   }

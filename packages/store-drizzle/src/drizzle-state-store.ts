@@ -7,7 +7,7 @@ import type {
   StepEvent,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
-import { and, asc, eq, isNotNull, isNull, lte, or } from 'drizzle-orm';
+import { and, asc, desc, eq, isNotNull, isNull, lte, or } from 'drizzle-orm';
 import type { BaseSQLiteDatabase } from 'drizzle-orm/sqlite-core';
 import { signalWaiters, stepCheckpoints, workflowRuns } from './schema';
 
@@ -113,7 +113,7 @@ export class DrizzleStateStore implements StateStore {
       .select()
       .from(workflowRuns)
       .where(filters.length ? and(...filters) : undefined)
-      .orderBy(asc(workflowRuns.createdAt))
+      .orderBy(desc(workflowRuns.createdAt)) // newest first — recent runs on top in the dashboard
       .limit(query.limit ?? -1)
       .offset(query.offset ?? 0);
     return rows.map(fromRunRow);

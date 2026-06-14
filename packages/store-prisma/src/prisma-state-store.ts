@@ -154,7 +154,7 @@ export class PrismaStateStore implements StateStore {
       where,
       take: query.limit,
       skip: query.offset,
-      orderBy: { createdAt: 'asc' },
+      orderBy: { createdAt: 'desc' }, // newest first — recent runs on top in the dashboard
     });
     return rows.map(fromRunRow);
   }
