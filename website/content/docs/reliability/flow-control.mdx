@@ -1,6 +1,6 @@
 ---
 title: Flow control
-description: Durable queues for remote steps — cap concurrency and enforce fixed-window rate limits with engine.registerQueue (or the module's queues option) and ctx.call(step, input, { queue }). A call that can't be admitted re-suspends and the timer poller retries admission, so the limit survives crashes.
+description: "Durable queues for remote steps — cap concurrency and enforce fixed-window rate limits with engine.registerQueue (or the module's queues option) and ctx.call(step, input, { queue }). A call that can't be admitted re-suspends and the timer poller retries admission, so the limit survives crashes."
 ---
 
 Remote steps fan out work to workers, and sometimes you need to *throttle* that fan-out: a third-party API

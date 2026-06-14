@@ -1,6 +1,6 @@
 ---
 title: Dead-letter queue
-description: Cap crash-recovery with maxRecoveryAttempts so a poison-pill run moves to the terminal dead status instead of crash-looping forever, then route dead runs with engine.onDead or the module's deadLetterWorkflow option to alert, compensate, or queue for review.
+description: Cap crash-recovery with maxRecoveryAttempts so a poison-pill run moves to the terminal dead status instead of crash-looping forever, then route dead runs with engine.onDead or a DLQ workflow — an inline @DeadLetter() method, a per-workflow deadLetterWorkflow reference, or the module-level default — to alert, compensate, or queue for review.
 ---
 
 Most failures are transient and recover cleanly. But occasionally a run is a **poison pill**: it crashes the
@@ -45,53 +45,54 @@ engine.onDead((run) => {
 
 `onDead` returns an unsubscribe function. It fires on the instance that dead-letters the run.
 
-## Routing to a DLQ workflow: `deadLetterWorkflow`
+## Routing to a DLQ workflow
 
 The most powerful option is to route dead runs into a *workflow of their own* — a durable handler that gets
-all the reliability machinery (retries, steps, its own observability) to triage the failure. Set the
-module's `deadLetterWorkflow` to the name of a registered workflow. When a run is dead-lettered, the engine
-starts that workflow with `{ deadRunId, workflow, input, error }`, idempotent by a `dlq:<runId>` id so a run
-is never double-handled:
+all the reliability machinery (retries, steps, its own observability) to triage the failure. The handler is
+started with a typed `DeadLetter<TInput>` payload, idempotent by a `dlq:<runId>` id so a run is never
+double-handled:
 
 ```ts
-DurableModule.forRoot({
-  store,
-  transport,
-  maxRecoveryAttempts: 5,
-  deadLetterWorkflow: 'pipeline-dlq',
-});
+import type { DeadLetter } from '@dudousxd/nestjs-durable';
+
+interface DeadLetter<TInput = unknown> {
+  deadRunId: string; // the dead run — inspectable + retriable in the dashboard
+  workflow: string; // the workflow whose run died
+  input: TInput; // the original input it was started with
+  error?: StepError; // the failure that moved it to `dead`
+}
 ```
 
-A full example — the workflow you're protecting plus the DLQ workflow that handles its corpses:
+Dead-lettering is naturally **per-workflow** — a dead `checkout` run wants a different handler than a dead
+`pipeline` run — so the target is resolved per dead run, in this order:
+
+1. an inline **`@DeadLetter()` method** on the workflow class — the co-located default;
+2. the workflow's **`@Workflow({ deadLetterWorkflow })`** reference to another registered workflow;
+3. the module-level **`deadLetterWorkflow`** default, for everything that declares neither.
+
+### Inline `@DeadLetter()` — one file
+
+The simplest case: a method on the workflow class, marked `@DeadLetter()`. It runs as a durable workflow in
+its own right (auto-registered as `<name>.dlq`, with checkpointing and a dashboard run), and it shares the
+class's injected dependencies — so the handler lives right next to the workflow it protects:
 
 ```ts
-// The fragile pipeline: cap its recovery so a poison pill is dead-lettered, not looped forever.
 @Workflow({ name: 'pipeline', version: '3' })
 export class PipelineWorkflow {
-  async run(ctx: WorkflowCtx, input: PipelineInput) {
-    const extracted = await ctx.step('extract', () => this.extract(input));
-    const transformed = await ctx.step('transform', () => this.transform(extracted));
-    return ctx.call(loadStep, transformed);
-  }
-}
-
-// The DLQ workflow: started with the dead run's context when `pipeline` (or any run) dies.
-interface DeadLetter {
-  deadRunId: string;
-  workflow: string;
-  input: unknown;
-  error?: { message: string; code?: string };
-}
-
-@Workflow({ name: 'pipeline-dlq', version: '1' })
-export class PipelineDlqWorkflow {
   constructor(
     private readonly alerts: AlertsService,
     private readonly tickets: TicketService,
   ) {}
 
-  async run(ctx: WorkflowCtx, dl: DeadLetter) {
-    // Alert the team — retried with backoff like any durable step.
+  async run(ctx: WorkflowCtx, input: PipelineInput) {
+    const extracted = await ctx.step('extract', () => this.extract(input));
+    const transformed = await ctx.step('transform', () => this.transform(extracted));
+    return ctx.call(loadStep, transformed);
+  }
+
+  // Runs when a `pipeline` run is dead-lettered. Typed to the workflow's own input, same deps.
+  @DeadLetter()
+  async onDead(ctx: WorkflowCtx, dl: DeadLetter<PipelineInput>) {
     await ctx.step('alert', () =>
       this.alerts.page('durable-dead-letter', {
         runId: dl.deadRunId,
@@ -100,12 +101,11 @@ export class PipelineDlqWorkflow {
       }),
     );
 
-    // Open a tracking ticket with the failed input attached for replay after a fix.
     const ticket = await ctx.step('open-ticket', () =>
       this.tickets.create({
         title: `Dead-lettered run ${dl.deadRunId} (${dl.workflow})`,
         body: dl.error?.message ?? 'unknown error',
-        payload: dl.input,
+        payload: dl.input, // typed PipelineInput, ready to replay after a fix
       }),
     );
 
@@ -114,9 +114,46 @@ export class PipelineDlqWorkflow {
 }
 ```
 
-Register `pipeline-dlq` as a normal provider like any other workflow; the module wires `onDead` to start it
-for you when `deadLetterWorkflow` is set. Because the start is idempotent by `dlq:<runId>`, a run that gets
-dead-lettered (and re-detected) more than once still triggers exactly one DLQ run.
+### `@Workflow({ deadLetterWorkflow })` — a separate workflow
+
+When the DLQ handler is large, reused across workflows, or just deserves its own file, point at another
+registered workflow — by **class** (refactor-safe) or by **name** (for a cross-runtime handler).
+Register it as a normal provider like any other workflow:
+
+```ts
+@Workflow({ name: 'pipeline', version: '3', deadLetterWorkflow: PipelineDlqWorkflow })
+export class PipelineWorkflow {
+  /* ...run... */
+}
+
+@Workflow({ name: 'pipeline-dlq', version: '1' })
+export class PipelineDlqWorkflow {
+  async run(ctx: WorkflowCtx, dl: DeadLetter) {
+    /* same handler body as above */
+  }
+}
+```
+
+### Module-level default
+
+Set the module's `deadLetterWorkflow` to catch every workflow that declares neither of the above — a single
+backstop DLQ for the whole app:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  maxRecoveryAttempts: 5,
+  deadLetterWorkflow: 'global-dlq', // fallback for workflows without their own
+});
+```
+
+A workflow that declares **both** an inline `@DeadLetter()` method and a `deadLetterWorkflow` reference is a
+configuration error — two targets for one workflow is ambiguous, so the module fails fast at boot rather than
+silently picking one. Pick one.
+
+Because every start is idempotent by `dlq:<runId>`, a run that gets dead-lettered (and re-detected) more than
+once still triggers exactly one DLQ run.
 
 The dashboard links the two ends of this relationship: from a `dead` run you can see the DLQ run it spawned,
 and the DLQ run carries the originating `deadRunId` — so you can walk from a poison pill to its handler and

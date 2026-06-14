@@ -29,6 +29,12 @@ import {
   type StepRecord,
   createWorkflowCtx,
 } from './workflow-ctx';
+import {
+  type WorkflowClass,
+  type WorkflowInputOf,
+  type WorkflowRef,
+  workflowName,
+} from './workflow-ref';
 
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
@@ -305,9 +311,16 @@ export class WorkflowEngine {
     }
   }
 
-  async start(workflow: string, input: unknown, runId: string): Promise<RunResult> {
-    const registered = this.latest.get(workflow);
-    if (!registered) throw new Error(`workflow ${workflow} is not registered`);
+  async start<C extends WorkflowClass>(
+    workflow: C,
+    input: WorkflowInputOf<C>,
+    runId: string,
+  ): Promise<RunResult>;
+  async start<TInput>(workflow: string, input: TInput, runId: string): Promise<RunResult>;
+  async start(workflow: WorkflowRef, input: unknown, runId: string): Promise<RunResult> {
+    const name = workflowName(workflow);
+    const registered = this.latest.get(name);
+    if (!registered) throw new Error(`workflow ${name} is not registered`);
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
     const prior = await this.store.getRun(runId);
@@ -317,7 +330,7 @@ export class WorkflowEngine {
     const now = new Date();
     const run: WorkflowRun = {
       id: runId,
-      workflow,
+      workflow: name,
       workflowVersion: registered.version,
       status: 'running',
       input,
@@ -325,7 +338,7 @@ export class WorkflowEngine {
       updatedAt: now,
     };
     await this.store.createRun(run);
-    this.emit({ type: 'run.started', runId, workflow });
+    this.emit({ type: 'run.started', runId, workflow: name });
     return this.track(this.execute(run, registered.fn));
   }
 

@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { WorkflowClass, WorkflowInputOf, WorkflowOutputOf } from './workflow-ref';
 
 /**
  * Core type contracts for nestjs-durable.
@@ -397,12 +398,33 @@ export interface WorkflowCtx {
     options?: StepOptions,
   ): Promise<TResult>;
   /**
-   * Run another registered workflow as a **tracked child**: starts it once and suspends — zero
-   * compute — until the child reaches a terminal state, then resumes with the child's output (or
-   * throws a FatalError if the child failed). `childId` defaults to a deterministic id derived from
-   * this run and the call position, so it's stable across replay.
+   * Run another registered workflow as a **tracked child** and await its result: starts it once and
+   * suspends — zero compute — until the child reaches a terminal state, then resumes with the child's
+   * output (or throws a FatalError if the child failed). `childId` defaults to a deterministic id
+   * derived from this run and the call position, so it's stable across replay.
+   *
+   * Pass the child's **class** (`ctx.child(ShippingWorkflow, input)`) for a typed input + result; pass
+   * a **string** name for a cross-runtime child (e.g. a Python workflow) where there's no class.
    */
+  child<C extends WorkflowClass>(
+    workflow: C,
+    input: WorkflowInputOf<C>,
+    childId?: string,
+  ): Promise<WorkflowOutputOf<C>>;
   child<TOutput>(workflow: string, input: unknown, childId?: string): Promise<TOutput>;
+  /**
+   * Start a child workflow **fire-and-forget**: dispatches it once (checkpointed, replay-safe) and
+   * returns its run id immediately — the parent keeps running instead of suspending. Use it to kick
+   * off side work (an audit log, a notification) you don't need to wait on, or to fan out: collect
+   * the ids, then later `await ctx.child(...)` each with the same id to join (the start is idempotent
+   * by id, so the child runs exactly once). Class or string ref, like {@link child}.
+   */
+  startChild<C extends WorkflowClass>(
+    workflow: C,
+    input: WorkflowInputOf<C>,
+    childId?: string,
+  ): Promise<string>;
+  startChild(workflow: string, input: unknown, childId?: string): Promise<string>;
   /**
    * Pause the run at this point until a human resumes it from the dashboard (or
    * `engine.continue(runId)`). Records a visible `pending` checkpoint so the breakpoint shows up

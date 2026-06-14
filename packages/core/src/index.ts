@@ -7,5 +7,6 @@ export * from './queue';
 export * from './remote-step-factory';
 export * from './scheduler';
 export * from './tokens';
+export * from './workflow-ref';
 export { InMemoryStateStore } from './testing/in-memory-state-store';
 export { InMemoryTransport } from './testing/in-memory-transport';
