@@ -7,6 +7,10 @@ export function stepId(runId: string, seq: number): string {
   return `${runId}:${seq}`;
 }
 
+/** Deterministic signal token a breakpoint suspends on — derived from its logical position. Shared
+ *  so `ctx.breakpoint` (which records it) and `engine.continue` (which signals it) agree. */
+export const breakpointToken = (runId: string, seq: number): string => `bp:${runId}:${seq}`;
+
 /** A remote-worker step body. The optional `log` records sub-process outcomes and debug/error
  *  lines that ride back on the result — the TypeScript twin of the Python SDK's `StepContext`. */
 export type StepHandler = (input: unknown, log: StepLogger) => Promise<unknown> | unknown;

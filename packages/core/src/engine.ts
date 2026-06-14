@@ -1,14 +1,9 @@
-import { parseDuration } from './duration';
-import {
-  FatalError,
-  NonDeterminismError,
-  RemoteStepTimeout,
-  SignalTimeoutError,
-  WorkflowSuspended,
-} from './errors';
+import { backoffDelay } from './backoff';
+import { instantCheckpoint } from './checkpoints';
+import { type Completion } from './completion';
+import { NonDeterminismError, RemoteStepTimeout, WorkflowSuspended } from './errors';
 import type {
   ControlPlane,
-  DurableWebhook,
   EngineEvent,
   EngineListener,
   NamedTransport,
@@ -18,9 +13,6 @@ import type {
   StateStore,
   StepError,
   StepEvent,
-  StepKind,
-  StepLogger,
-  StepOptions,
   StepResult,
   Transport,
   UpdateResult,
@@ -28,23 +20,17 @@ import type {
   WorkflowCtx,
   WorkflowRun,
 } from './interfaces';
-import { stepId } from './protocol';
+import { breakpointToken, stepId } from './protocol';
 import { type QueueConfig, QueueController } from './queue';
-import { createStepLogger } from './step-logger';
+import { TransportPool } from './transport-pool';
+import {
+  type Compensation,
+  type CtxHost,
+  type StepRecord,
+  createWorkflowCtx,
+} from './workflow-ctx';
 
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
-
-/** Deterministic signal token a breakpoint suspends on — derived from its logical position. */
-const breakpointToken = (runId: string, seq: number): string => `bp:${runId}:${seq}`;
-
-/** Delay in ms before the next retry of a local step, per its `StepOptions` backoff config. */
-function backoffDelay(attempt: number, options?: StepOptions): number {
-  const base = options?.backoffMs ?? 0;
-  if (base <= 0) return 0;
-  const raw = options?.backoff === 'exp' ? base * 2 ** (attempt - 1) : base;
-  const capped = options?.backoffMaxMs ? Math.min(raw, options.backoffMaxMs) : raw;
-  return options?.jitter ? Math.round(capped * (0.5 + Math.random() * 0.5)) : capped;
-}
 
 /** A breakpoint checkpoint's `name` is `breakpoint` (or `breakpoint:<label>`). This name — not the
  *  reused `signal` kind — is the explicit marker the dashboard and `continue()` detect it by. */
@@ -78,28 +64,6 @@ interface RemoteResolution {
 interface PendingRemote {
   resolve: (result: RemoteResolution) => void;
   reject: (error: Error) => void;
-}
-
-/**
- * The payload an external `ctx.task` / child run delivers back on its completion signal: either a
- * value or a failure. One typed envelope so `task` and `child` share the same unwrap (instead of
- * sniffing ad-hoc `__error` keys).
- */
-type Completion<T> = { ok: true; value: T } | { ok: false; error: string };
-
-/** Read a `Completion` from a signal payload: return the value, or throw a FatalError if it failed. */
-function unwrapCompletion<T>(payload: unknown, label: string): T {
-  const c = payload as Completion<T> | null;
-  if (c && typeof c === 'object' && 'ok' in c && c.ok === false) {
-    throw new FatalError(`${label} failed: ${c.error}`);
-  }
-  return (c as { value: T } | null)?.value as T;
-}
-
-/** A saga undo registered by a completed step, kept with its step name for visibility on failure. */
-interface Compensation {
-  name: string;
-  fn: () => Promise<void>;
 }
 
 export interface WorkflowEngineDeps {
@@ -157,8 +121,8 @@ export interface WorkflowEngineDeps {
  */
 export class WorkflowEngine {
   private readonly store: StateStore;
-  /** Ordered transport pool; `dispatch` tries them in order (failover). Empty = no remote steps. */
-  private readonly transports: NamedTransport[];
+  /** Ordered transport pool (dispatch + failover). Empty = no remote steps. */
+  private readonly pool: TransportPool;
   private readonly controlPlane?: ControlPlane;
   private readonly clock: () => number;
   private readonly instanceId: string;
@@ -192,8 +156,9 @@ export class WorkflowEngine {
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
-    this.transports =
-      deps.transports ?? (deps.transport ? [{ id: 'default', transport: deps.transport }] : []);
+    this.pool = new TransportPool(
+      deps.transports ?? (deps.transport ? [{ id: 'default', transport: deps.transport }] : []),
+    );
     this.controlPlane = deps.controlPlane;
     this.clock = deps.clock ?? Date.now;
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
@@ -202,10 +167,8 @@ export class WorkflowEngine {
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
-    // Listen for results/heartbeats on EVERY transport in the pool — a result can come back on
-    // whichever one delivered the task (so failover is symmetric).
-    for (const { transport } of this.transports) {
-      transport.onResult(async (result) => {
+    this.pool.bind(
+      async (result) => {
         // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
         const waiter = this.pending.get(result.stepId);
         if (waiter) {
@@ -224,12 +187,12 @@ export class WorkflowEngine {
         // Durable path: no in-memory waiter (the step suspended the run, possibly on another
         // instance) → complete the checkpoint and resume the run here.
         await this.completeRemoteResult(result);
-      });
+      },
       // A heartbeat for an in-flight long step resets its liveness window (see callRemote).
-      transport.onHeartbeat(async (beat) => {
+      async (beat) => {
         this.heartbeatResets.get(beat.stepId)?.();
-      });
-    }
+      },
+    );
     // Control plane: re-broadcast lifecycle events from OTHER instances to this instance's
     // subscribers (cross-pod live-tail), and act on cancellations issued elsewhere. A broker may
     // echo our own publish back — ignore those (we already handled them locally) to avoid duplicates.
@@ -389,35 +352,31 @@ export class WorkflowEngine {
    * replay from their checkpoints, so only the work that had not finished runs again.
    */
   async recoverIncomplete(nowMs: number = this.clock()): Promise<RunResult[]> {
-    if (this.draining) return [];
-    const results: RunResult[] = [];
-    for (const run of await this.store.listIncompleteRuns()) {
-      const acquired = await this.store.tryLockRun(
-        run.id,
-        this.instanceId,
-        nowMs + this.leaseMs,
-        nowMs,
-      );
-      if (!acquired) continue;
-      const attempts = (run.recoveryAttempts ?? 0) + 1;
-      // Poison-pill guard: a run that keeps crashing the process on recovery is moved to the `dead`
-      // dead-letter state instead of being retried forever (so it's inspectable, not a crash loop).
-      if (this.maxRecoveryAttempts != null && attempts > this.maxRecoveryAttempts) {
-        const error = {
-          message: `run exceeded maxRecoveryAttempts (${this.maxRecoveryAttempts}) — moved to dead-letter`,
-          code: 'max_recovery_attempts',
-        };
-        await this.store.updateRun(run.id, { status: 'dead', error, updatedAt: new Date() });
-        await this.store.releaseRunLock(run.id);
-        this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
-        results.push({ runId: run.id, status: 'dead', error });
-        continue;
-      }
-      // Count this attempt BEFORE resuming, so a crash mid-resume still advances the counter.
-      await this.store.updateRun(run.id, { recoveryAttempts: attempts, updatedAt: new Date() });
-      results.push(await this.resume(run.id));
+    return this.resumeLeased(await this.store.listIncompleteRuns(), nowMs, (run) =>
+      this.countRecovery(run),
+    );
+  }
+
+  /**
+   * Per-recovery bookkeeping (called once the lease is held): count the attempt, or — past
+   * `maxRecoveryAttempts` — move a poison pill to the `dead` dead-letter state. Returns a terminal
+   * result to skip the resume, or `undefined` to proceed.
+   */
+  private async countRecovery(run: WorkflowRun): Promise<RunResult | undefined> {
+    const attempts = (run.recoveryAttempts ?? 0) + 1;
+    if (this.maxRecoveryAttempts != null && attempts > this.maxRecoveryAttempts) {
+      const error = {
+        message: `run exceeded maxRecoveryAttempts (${this.maxRecoveryAttempts}) — moved to dead-letter`,
+        code: 'max_recovery_attempts',
+      };
+      await this.store.updateRun(run.id, { status: 'dead', error, updatedAt: new Date() });
+      await this.store.releaseRunLock(run.id);
+      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+      return { runId: run.id, status: 'dead', error };
     }
-    return results;
+    // Count BEFORE resuming, so a crash mid-resume still advances the counter.
+    await this.store.updateRun(run.id, { recoveryAttempts: attempts, updatedAt: new Date() });
+    return undefined;
   }
 
   /**
@@ -435,6 +394,7 @@ export class WorkflowEngine {
   private async resumeLeased(
     runs: WorkflowRun[],
     nowMs: number = this.clock(),
+    onLocked?: (run: WorkflowRun) => Promise<RunResult | undefined>,
   ): Promise<RunResult[]> {
     if (this.draining) return []; // shutting down — don't pick up new runs
     const results: RunResult[] = [];
@@ -445,7 +405,10 @@ export class WorkflowEngine {
         nowMs + this.leaseMs,
         nowMs,
       );
-      if (acquired) results.push(await this.resume(run.id));
+      if (!acquired) continue;
+      // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
+      const settled = onLocked ? await onLocked(run) : undefined;
+      results.push(settled ?? (await this.resume(run.id)));
     }
     return results;
   }
@@ -457,20 +420,15 @@ export class WorkflowEngine {
   async signal(token: string, payload: unknown): Promise<RunResult | null> {
     const waiter = await this.store.takeSignalWaiter(token);
     if (!waiter) return null;
-    const at = new Date();
-    await this.store.saveCheckpoint({
-      runId: waiter.runId,
-      seq: waiter.seq,
-      name: `signal:${token}`,
-      kind: 'signal',
-      stepId: stepId(waiter.runId, waiter.seq),
-      status: 'completed',
-      output: payload,
-      attempts: 1,
-      enqueuedAt: at,
-      startedAt: at,
-      finishedAt: at,
-    });
+    await this.store.saveCheckpoint(
+      instantCheckpoint({
+        runId: waiter.runId,
+        seq: waiter.seq,
+        name: `signal:${token}`,
+        kind: 'signal',
+        output: payload,
+      }),
+    );
     return this.resume(waiter.runId);
   }
 
@@ -538,19 +496,7 @@ export class WorkflowEngine {
   }
 
   /** Checkpoint a finished step and announce it — the two things that must always happen together. */
-  private async completeStep(step: {
-    runId: string;
-    seq: number;
-    name: string;
-    kind: StepKind;
-    input?: unknown;
-    output: unknown;
-    events?: StepEvent[];
-    attempts: number;
-    enqueuedAt: Date;
-    startedAt: Date;
-    workerGroup?: string;
-  }): Promise<void> {
+  private async completeStep(step: StepRecord & { output: unknown }): Promise<void> {
     await this.store.saveCheckpoint({
       runId: step.runId,
       seq: step.seq,
@@ -580,19 +526,7 @@ export class WorkflowEngine {
   }
 
   /** Checkpoint a step that failed terminally, so the failure point is visible (not just the run). */
-  private async failStep(step: {
-    runId: string;
-    seq: number;
-    name: string;
-    kind: StepKind;
-    input?: unknown;
-    error: StepError;
-    events?: StepEvent[];
-    attempts: number;
-    enqueuedAt: Date;
-    startedAt: Date;
-    workerGroup?: string;
-  }): Promise<void> {
+  private async failStep(step: StepRecord & { error: StepError }): Promise<void> {
     await this.store.saveCheckpoint({
       runId: step.runId,
       seq: step.seq,
@@ -624,7 +558,7 @@ export class WorkflowEngine {
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
     // Saga compensations registered by completed steps; run in reverse if the run later fails.
     const compensations: Compensation[] = [];
-    const ctx = this.makeCtx(run.id, compensations);
+    const ctx = createWorkflowCtx(this.ctxHost, run.id, compensations);
     try {
       const output = await fn(ctx, run.input);
       // Clear any error from an earlier failed-then-retried attempt: a completed run is a success
@@ -722,321 +656,23 @@ export class WorkflowEngine {
     }
   }
 
-  private makeCtx(runId: string, compensations: Compensation[]): WorkflowCtx {
-    let seq = -1;
-    const nextSeq = () => {
-      seq += 1;
-      return seq;
-    };
-    const store = this.store;
-
-    // Each ctx primitive is a named closure over `nextSeq` (the per-run logical position counter)
-    // and `compensations` (the saga undo stack). They're defined up front so `task`/`child` can
-    // compose `step`/`waitForSignal` directly — no post-construction mutation, no cast.
-
-    const step = async <T>(
-      name: string,
-      fn: (log: StepLogger) => Promise<T>,
-      options?: StepOptions,
-    ): Promise<T> => {
-      const current = nextSeq();
-      const existing = await store.getCheckpoint(runId, current);
-      if (existing && existing.name !== name) {
-        throw new NonDeterminismError(runId, current, name, existing.name);
-      }
-      if (existing && existing.status === 'completed') {
-        // Register the compensation on replay too, so a saga undoes ALL completed steps — even
-        // those done in an earlier (since-suspended) pass — not just the ones run this pass.
-        if (options?.compensate) compensations.push({ name, fn: options.compensate });
-        return existing.output as T;
-      }
-      const maxAttempts = Math.max(1, options?.retries ?? 1);
-      const startedAt = new Date();
-      for (let attempt = 1; ; attempt += 1) {
-        // Events are scoped per attempt — a retry starts a clean log, so the checkpoint reflects
-        // only the attempt that actually completed (or the final failing one).
-        const events: StepEvent[] = [];
-        try {
-          const output = await fn(createStepLogger(events, this.clock));
-          await this.completeStep({
-            runId,
-            seq: current,
-            name,
-            kind: 'local',
-            output,
-            events,
-            attempts: attempt,
-            enqueuedAt: startedAt,
-            startedAt,
-          });
-          if (options?.compensate) compensations.push({ name, fn: options.compensate });
-          return output;
-        } catch (err) {
-          if (err instanceof FatalError || attempt >= maxAttempts) {
-            await this.failStep({
-              runId,
-              seq: current,
-              name,
-              kind: 'local',
-              error: {
-                message: err instanceof Error ? err.message : String(err),
-                stack: err instanceof Error ? err.stack : undefined,
-              },
-              events,
-              attempts: attempt,
-              enqueuedAt: startedAt,
-              startedAt,
-            });
-            throw err;
-          }
-          // Wait out the backoff before the next attempt (no-op when backoffMs is unset).
-          const wait = backoffDelay(attempt, options);
-          if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-        }
-      }
-    };
-
-    const sleep = async (duration: string | number): Promise<void> => {
-      const current = nextSeq();
-      const now = this.clock();
-      const existing = await store.getCheckpoint(runId, current);
-      if (existing) {
-        // Timer already recorded: resume if due, otherwise re-suspend cheaply.
-        if (now >= (existing.wakeAt ?? 0)) return;
-        throw new WorkflowSuspended(existing.wakeAt ?? now);
-      }
-      const wakeAt = now + parseDuration(duration);
-      await this.recordTimer(runId, current, 'sleep', wakeAt);
-      throw new WorkflowSuspended(wakeAt);
-    };
-
-    // NOTE (determinism): a bounded wait consumes TWO logical positions (deadline + wait), an
-    // unbounded one consumes ONE. So adding or removing `{ timeoutMs }` on an existing
-    // `waitForSignal` shifts the seq of every later step — treat it as a workflow-version change
-    // (register a new @Workflow version) for runs already in flight.
-    const waitForSignal = async <T>(token: string, opts?: { timeoutMs?: number }): Promise<T> => {
-      if (opts?.timeoutMs == null) {
-        const current = nextSeq();
-        const existing = await store.getCheckpoint(runId, current);
-        if (existing && existing.status === 'completed') return existing.output as T;
-        await store.putSignalWaiter({ token, runId, seq: current });
-        throw new WorkflowSuspended();
-      }
-      const timeoutMs = opts.timeoutMs;
-      const deadlineSeq = nextSeq();
-      const waitSeq = nextSeq();
-      // The deadline is recorded durably as a timer checkpoint so replay knows it; the run also gets
-      // a run-level wakeAt (via WorkflowSuspended) so the timer poller resumes it at the deadline.
-      const recorded = await store.getCheckpoint(runId, deadlineSeq);
-      const deadline = recorded?.wakeAt ?? this.clock() + timeoutMs;
-      if (!recorded) await this.recordTimer(runId, deadlineSeq, `timeout:${token}`, deadline);
-
-      const waited = await store.getCheckpoint(runId, waitSeq);
-      if (waited && waited.status === 'completed') return waited.output as T;
-      if (this.clock() >= deadline) {
-        await store.takeSignalWaiter(token).catch(() => undefined);
-        throw new SignalTimeoutError(token, timeoutMs);
-      }
-      await store.putSignalWaiter({ token, runId, seq: waitSeq });
-      throw new WorkflowSuspended(deadline);
-    };
-
-    // An external task = a checkpointed dispatch + a wait for its async-completion `Completion`
-    // (delivered by engine.completeTask/failTask). The whole "fire at a foreign system, suspend,
-    // resume when it reports back" pattern as one call.
-    const task = async <T>(
-      name: string,
-      dispatch: () => Promise<void>,
-      options?: StepOptions,
-    ): Promise<T> => {
-      await step(`task:dispatch:${name}`, dispatch, options);
-      return unwrapCompletion<T>(await waitForSignal(`task:${runId}:${name}`), `task "${name}"`);
-    };
-
-    // Child workflow: start it once, then suspend on a `child:<id>` waiter the child signals on its
-    // terminal state (see notifyParent). The start is deferred to a microtask so it runs AFTER this
-    // run suspends — a fast child can't reentrantly resume a parent that's still running.
-    // A breakpoint = a visible `pending` checkpoint + a signal waiter the dashboard resumes via
-    // `engine.continue`. Reuses the signal machinery (kind 'signal'), so resume overwrites the
-    // pending checkpoint with a completed one and the run replays past it.
-    const breakpoint = async (label?: string): Promise<void> => {
-      const current = nextSeq();
-      const existing = await store.getCheckpoint(runId, current);
-      if (existing && existing.status === 'completed') return;
-      if (!existing) {
-        await this.recordBreakpoint(runId, current, label);
-        await store.putSignalWaiter({
-          token: breakpointToken(runId, current),
-          runId,
-          seq: current,
-        });
-      }
-      throw new WorkflowSuspended();
-    };
-
-    const child = async <T>(workflow: string, input: unknown, childId?: string): Promise<T> => {
-      const current = nextSeq();
-      const id = childId ?? `${runId}.child.${current}`;
-      const existing = await store.getCheckpoint(runId, current);
-      if (existing && existing.status === 'completed') {
-        return unwrapCompletion<T>(existing.output, `child "${id}"`);
-      }
-      await store.putSignalWaiter({ token: `child:${id}`, runId, seq: current });
-      if (!(await store.getRun(id))) {
-        queueMicrotask(() => {
-          void this.start(workflow, input, id).catch(() => undefined);
-        });
-      }
-      throw new WorkflowSuspended();
-    };
-
-    // Guard an in-place change: a fresh run records a `patch:<id>` marker here and takes the new
-    // branch; a run recorded under the OLD code finds a real step at this position instead, so we
-    // roll the logical position back (the marker is transparent to it) and return false — its replay
-    // reads that old step next and follows the old branch. No position shift → no corruption.
-    const patched = async (id: string): Promise<boolean> => {
-      const marker = `patch:${id}`;
-      const current = nextSeq();
-      const existing = await store.getCheckpoint(runId, current);
-      if (existing) {
-        if (existing.name === marker) return true;
-        if (existing.name.startsWith('patch:')) {
-          throw new NonDeterminismError(runId, current, marker, existing.name);
-        }
-        seq -= 1; // not a marker: an old run's step lives here — give the position back to it
-        return false;
-      }
-      const at = new Date();
-      await store.saveCheckpoint({
-        runId,
-        seq: current,
-        name: marker,
-        kind: 'local',
-        stepId: stepId(runId, current),
-        status: 'completed',
-        output: true,
-        attempts: 1,
-        enqueuedAt: at,
-        startedAt: at,
-        finishedAt: at,
-      });
-      return true;
-    };
-
-    // An update point: suspend on a run-scoped `update:<runId>:<name>` token that engine.update
-    // delivers to (after its validator passes). Reuses the signal machinery; run-scoped like task/child.
-    const onUpdate = <T>(name: string, opts?: { timeoutMs?: number }): Promise<T> =>
-      waitForSignal<T>(`update:${runId}:${name}`, opts);
-
-    // A queryable named value: a checkpoint whose `name` is `event:<key>`, so the latest value for a
-    // key is just the highest-seq such checkpoint (read by engine.getEvent). Replay-idempotent.
-    const setEvent = async (key: string, value: unknown): Promise<void> => {
-      const current = nextSeq();
-      const name = `event:${key}`;
-      const existing = await store.getCheckpoint(runId, current);
-      if (existing && existing.name !== name) {
-        throw new NonDeterminismError(runId, current, name, existing.name);
-      }
-      if (existing && existing.status === 'completed') return; // replay: already published
-      const at = new Date();
-      await store.saveCheckpoint({
-        runId,
-        seq: current,
-        name,
-        kind: 'local',
-        stepId: stepId(runId, current),
-        status: 'completed',
-        output: value,
-        attempts: 1,
-        enqueuedAt: at,
-        startedAt: at,
-        finishedAt: at,
-      });
-    };
-
-    // A durable webhook reserves a logical position NOW to mint a stable token, so the url can be
-    // handed to a third party before `wait()` suspends. `wait()` then parks on that same position
-    // until the callback lands as engine.signal(token, body) — single position, replay-safe.
-    const webhook = <T>(): DurableWebhook<T> => {
-      const current = nextSeq();
-      const token = `wh:${runId}:${current}`;
-      const wait = async (): Promise<T> => {
-        const existing = await store.getCheckpoint(runId, current);
-        if (existing && existing.status === 'completed') return existing.output as T;
-        await store.putSignalWaiter({ token, runId, seq: current });
-        throw new WorkflowSuspended();
-      };
-      return { token, url: this.webhookUrl?.(token), wait };
-    };
-
-    // Deterministic non-deterministic sources: each is a checkpointed local step, so the value is
-    // captured on the first run and replayed verbatim afterwards (a raw Date.now()/Math.random()
-    // inside a workflow would differ across replays and corrupt the run).
-    const now = () => step('now', async () => this.clock());
-    const random = () => step('random', async () => Math.random());
-    const uuid = () => step('uuid', async () => globalThis.crypto.randomUUID());
-
+  /** The seam handed to {@link createWorkflowCtx}: the authoring API reaches durability + lifecycle
+   *  (checkpointing, dispatch, child start) through this, so the ctx primitives live in their own
+   *  module and the engine stays the orchestrator. */
+  private get ctxHost(): CtxHost {
     return {
-      runId,
-      step,
-      sleep,
-      waitForSignal,
-      task,
-      child,
-      breakpoint,
-      webhook,
-      setEvent,
-      onUpdate,
-      patched,
-      now,
-      random,
-      uuid,
-      call: <TInput, TOutput>(
-        remote: RemoteStepDef<TInput, TOutput>,
-        input: TInput,
-        opts?: { queue?: string; transport?: string },
-      ) => this.callRemote(runId, nextSeq(), remote, input, opts?.queue, opts?.transport),
+      store: this.store,
+      clock: this.clock,
+      webhookUrl: this.webhookUrl,
+      completeStep: (s) => this.completeStep(s),
+      failStep: (s) => this.failStep(s),
+      callRemote: (runId, seq, step, input, queue, transport) =>
+        this.callRemote(runId, seq, step, input, queue, transport),
+      // Defer so a fast child can't reentrantly resume a still-running parent.
+      startChild: (workflow, input, id) => {
+        queueMicrotask(() => void this.start(workflow, input, id).catch(() => undefined));
+      },
     };
-  }
-
-  /** Persist a completed timer checkpoint (a durable sleep / signal deadline) at a logical position. */
-  private async recordTimer(
-    runId: string,
-    seq: number,
-    name: string,
-    wakeAt: number,
-  ): Promise<void> {
-    const at = new Date();
-    await this.store.saveCheckpoint({
-      runId,
-      seq,
-      name,
-      kind: 'sleep',
-      stepId: stepId(runId, seq),
-      status: 'completed',
-      wakeAt,
-      attempts: 1,
-      enqueuedAt: at,
-      startedAt: at,
-      finishedAt: at,
-    });
-  }
-
-  /** Persist a `pending` checkpoint marking a breakpoint, so it's visible (and resumable) in the UI. */
-  private async recordBreakpoint(runId: string, seq: number, label?: string): Promise<void> {
-    const at = new Date();
-    await this.store.saveCheckpoint({
-      runId,
-      seq,
-      name: label ? `${BREAKPOINT}:${label}` : BREAKPOINT,
-      kind: 'signal',
-      stepId: stepId(runId, seq),
-      status: 'pending',
-      attempts: 1,
-      enqueuedAt: at,
-      startedAt: at,
-      finishedAt: at,
-    });
   }
 
   /**
@@ -1100,35 +736,6 @@ export class WorkflowEngine {
     return { accepted: true, run: result };
   }
 
-  /** The transport pool ordered for dispatch: a pinned `preferId` first, then the rest (failover). */
-  private orderedTransports(preferId?: string): NamedTransport[] {
-    if (!preferId) return this.transports;
-    const pref = this.transports.filter((t) => t.id === preferId);
-    if (pref.length === 0) throw new Error(`transport "${preferId}" is not registered`);
-    return [...pref, ...this.transports.filter((t) => t.id !== preferId)];
-  }
-
-  /**
-   * Dispatch `task` over the pool: try the preferred (or first) transport, fail over to the next on
-   * a dispatch error, and stamp the task with the id of the transport that accepted it (so a worker
-   * replies on the matching one). Throws if every transport fails.
-   */
-  private async dispatchWithFailover(
-    task: Omit<RemoteTask, 'transport'>,
-    preferId?: string,
-  ): Promise<void> {
-    let lastErr: unknown;
-    for (const { id, transport } of this.orderedTransports(preferId)) {
-      try {
-        await transport.dispatch({ ...task, transport: id });
-        return;
-      } catch (err) {
-        lastErr = err;
-      }
-    }
-    throw lastErr ?? new Error('no transport accepted the dispatch');
-  }
-
   private async callRemote<TInput, TOutput>(
     runId: string,
     seq: number,
@@ -1142,7 +749,7 @@ export class WorkflowEngine {
       throw new NonDeterminismError(runId, seq, step.name, existing.name);
     }
     if (existing?.status === 'completed') return existing.output as TOutput;
-    if (this.transports.length === 0) throw new Error('remote steps require a Transport');
+    if (this.pool.size === 0) throw new Error('remote steps require a Transport');
     // A step with a liveness `timeoutMs` keeps the in-memory await + heartbeat path (re-dispatch a
     // presumed-dead worker). Without one, the call SUSPENDS DURABLY: dispatch, persist a `pending`
     // checkpoint, and let the result resume the run on whichever instance receives it — so a worker
@@ -1196,7 +803,7 @@ export class WorkflowEngine {
       startedAt: enqueuedAt, // placeholders until the worker result lands
       finishedAt: enqueuedAt,
     });
-    await this.dispatchWithFailover(
+    await this.pool.dispatch(
       {
         runId,
         seq,
@@ -1269,7 +876,7 @@ export class WorkflowEngine {
     input: TInput,
     transport?: string,
   ): Promise<TOutput> {
-    if (this.transports.length === 0) throw new Error('remote steps require a Transport');
+    if (this.pool.size === 0) throw new Error('remote steps require a Transport');
     const validInput = step.input.parse(input);
     const id = stepId(runId, seq);
     const enqueuedAt = new Date();
@@ -1285,7 +892,7 @@ export class WorkflowEngine {
       const resultPromise = new Promise<RemoteResolution>((resolve, reject) => {
         this.pending.set(id, { resolve, reject });
       });
-      await this.dispatchWithFailover(
+      await this.pool.dispatch(
         {
           runId,
           seq,
