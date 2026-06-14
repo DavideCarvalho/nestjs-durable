@@ -59,4 +59,19 @@ describe('DLQ — maxRecoveryAttempts', () => {
     await engine.recoverIncomplete();
     expect((await store.getRun('r1'))?.status).toBe('suspended'); // ran + suspended, not dead
   });
+
+  it('fires onDead listeners with the dead run (for a DLQ handler)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, maxRecoveryAttempts: 1 });
+    engine.register('poison', '1', async () => {
+      throw new Error('x');
+    });
+    const dead: Array<{ id: string; status: string; code?: string }> = [];
+    engine.onDead((run) => dead.push({ id: run.id, status: run.status, code: run.error?.code }));
+
+    await store.createRun(runningRun({ recoveryAttempts: 1 })); // already at the cap
+    await engine.recoverIncomplete();
+
+    expect(dead).toEqual([{ id: 'r1', status: 'dead', code: 'max_recovery_attempts' }]);
+  });
 });
