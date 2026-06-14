@@ -292,6 +292,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               timeline={timeline}
               selected={sel}
               onSelect={setSel}
+              onOpenRun={onOpenRun}
               fmtDuration={durMs}
             />
           )}
@@ -303,7 +304,13 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
         </div>
         {timeline.length > 0 && (
           <div className="h-[clamp(120px,34%,260px)] border-t border-[var(--line)] bg-black/20">
-            <SpansTimeline run={run} timeline={timeline} selected={sel} onSelect={setSel} />
+            <SpansTimeline
+              run={run}
+              timeline={timeline}
+              selected={sel}
+              onSelect={setSel}
+              onOpenRun={onOpenRun}
+            />
           </div>
         )}
         {selStep && <StepDetailPanel step={selStep} run={run} onClose={() => setSel(undefined)} />}

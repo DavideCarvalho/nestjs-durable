@@ -11,7 +11,8 @@ import {
 } from '@xyflow/react';
 import { useCallback, useMemo } from 'react';
 import type { RunStatus, StepCheckpoint, WorkflowRun } from '../client/durable-client';
-import { BoltIcon, CheckIcon, KIND_LABEL, XIcon, iconFor } from './icons';
+import { childRunIdOf } from './child-link';
+import { BoltIcon, CheckIcon, ChildIcon, KIND_LABEL, XIcon, iconFor } from './icons';
 
 type SubCounts = { ok: number; failed: number; skipped: number };
 type StepData = {
@@ -24,13 +25,16 @@ type StepData = {
   duration?: string;
   subs?: SubCounts;
   selected: boolean;
+  /** When this step ran a child workflow, the child's run id — clicking the node opens it. */
+  childRunId?: string;
 };
 type EndData = { status: RunStatus; label: string };
 
 function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   const failed = data.status === 'failed';
   const pending = data.status === 'pending'; // dispatched, awaiting its worker result (in-flight)
-  const Icon = iconFor(data.kind);
+  const isChild = !!data.childRunId;
+  const Icon = isChild ? ChildIcon : iconFor(data.kind);
   // Literal class strings per state (Tailwind can't see interpolated names): failed → red,
   // in-flight → amber, done → emerald.
   const tone = failed
@@ -52,13 +56,15 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
         };
   return (
     <div
-      title={KIND_LABEL[data.kind] ?? data.kind}
+      title={isChild ? KIND_LABEL.child : (KIND_LABEL[data.kind] ?? data.kind)}
       className={`group relative w-[208px] cursor-pointer overflow-hidden rounded-xl border bg-[var(--panel)]/95 shadow-lg backdrop-blur transition-all duration-150 hover:-translate-y-0.5 ${
         data.selected
           ? 'border-emerald-400/60 ring-2 ring-emerald-400/30'
           : failed
             ? 'border-red-500/40 hover:border-red-400/60'
-            : 'border-[var(--line)] hover:border-zinc-600'
+            : isChild
+              ? 'border-indigo-500/40 hover:border-indigo-400/60'
+              : 'border-[var(--line)] hover:border-zinc-600'
       }`}
     >
       {/* status rail */}
@@ -85,9 +91,15 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
           </span>
         </div>
         <div className="mono mt-1.5 flex items-center gap-1.5 text-[10px] text-zinc-500">
-          <span className="rounded border border-[var(--line)] px-1 text-zinc-400">
-            {data.kind}
-          </span>
+          {isChild ? (
+            <span className="rounded border border-indigo-500/30 bg-indigo-500/10 px-1 text-indigo-300">
+              child ↗
+            </span>
+          ) : (
+            <span className="rounded border border-[var(--line)] px-1 text-zinc-400">
+              {data.kind}
+            </span>
+          )}
           {data.attempts > 1 && (
             <span className="flex items-center gap-0.5 text-amber-300">
               <BoltIcon width={9} height={9} />
@@ -150,12 +162,15 @@ export function WorkflowGraph({
   timeline,
   selected,
   onSelect,
+  onOpenRun,
   fmtDuration,
 }: {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
   selected?: number;
   onSelect: (seq: number) => void;
+  /** Navigate to another run — used when a child-workflow node is clicked. */
+  onOpenRun: (id: string) => void;
   fmtDuration: (a: string, b: string) => string;
 }) {
   const { nodes, edges } = useMemo(() => {
@@ -183,6 +198,7 @@ export function WorkflowGraph({
         duration: fmtDuration(s.startedAt, s.finishedAt),
         subs: subCounts(s),
         selected: selected === s.seq,
+        childRunId: childRunIdOf(s),
       } satisfies StepData,
     }));
     const endNode: Node = {
@@ -218,9 +234,13 @@ export function WorkflowGraph({
 
   const onNodeClick = useCallback(
     (_: unknown, node: Node) => {
-      if (node.type === 'step') onSelect((node.data as StepData).seq);
+      if (node.type !== 'step') return;
+      const data = node.data as StepData;
+      // A child-workflow node drills into the child's run; any other step opens its detail.
+      if (data.childRunId) onOpenRun(data.childRunId);
+      else onSelect(data.seq);
     },
-    [onSelect],
+    [onSelect, onOpenRun],
   );
 
   return (
