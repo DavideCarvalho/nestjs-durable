@@ -25,6 +25,48 @@ describe('runSchedules', () => {
     expect((await store.getRun('sched:beat:2'))?.output).toBe('tick');
   });
 
+  it('fires a cron schedule once per scheduled time (idempotent within the interval)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    let runs = 0;
+    engine.register('nightly', '1', async () => {
+      runs += 1;
+      return 'ran';
+    });
+    const schedules = [{ key: 'nightly', workflow: 'nightly', cron: '0 0 * * *', timezone: 'UTC' }];
+
+    // 2026-01-01T05:00Z — the most recent midnight-UTC fire was 2026-01-01T00:00Z.
+    const t1 = Date.UTC(2026, 0, 1, 5, 0, 0);
+    await runSchedules(engine, schedules, t1);
+    await runSchedules(engine, schedules, t1 + 3_600_000); // same day, before next midnight
+    expect(runs).toBe(1);
+
+    // Next day, just past midnight → a new fire time → fires again.
+    const t2 = Date.UTC(2026, 0, 2, 0, 0, 1);
+    await runSchedules(engine, schedules, t2);
+    expect(runs).toBe(2);
+
+    const fire1 = Date.UTC(2026, 0, 1, 0, 0, 0);
+    const fire2 = Date.UTC(2026, 0, 2, 0, 0, 0);
+    expect((await store.getRun(`sched:nightly:${fire1}`))?.output).toBe('ran');
+    expect((await store.getRun(`sched:nightly:${fire2}`))?.output).toBe('ran');
+  });
+
+  it('computes the cron fire time in the schedule timezone (not UTC)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('sp', '1', async () => 'ok');
+    const schedules = [
+      // Midnight in São Paulo (UTC−3, no DST since 2019) = 03:00Z.
+      { key: 'sp', workflow: 'sp', cron: '0 0 * * *', timezone: 'America/Sao_Paulo' },
+    ];
+
+    // 2026-03-10T04:00Z is 01:00 in São Paulo → the day's fire (03:00Z) already passed.
+    await runSchedules(engine, schedules, Date.UTC(2026, 2, 10, 4, 0, 0));
+    const fire = Date.UTC(2026, 2, 10, 3, 0, 0); // 00:00 America/Sao_Paulo
+    expect(await store.getRun(`sched:sp:${fire}`)).not.toBeNull();
+  });
+
   it('start() is idempotent — re-triggering an existing run id is a no-op', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });

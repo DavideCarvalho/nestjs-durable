@@ -5,6 +5,7 @@ import {
   STATE_STORE,
   type StateStore,
   type StepCheckpoint,
+  type UpdateResult,
   WorkflowEngine,
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
@@ -41,13 +42,32 @@ export class DashboardService {
     return this.engine.resume(runId);
   }
 
-  cancel(runId: string): Promise<RunResult | null> {
-    return this.engine.cancel(runId);
+  cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
+    return this.engine.cancel(runId, opts);
   }
 
   /** Resume a run paused at a `ctx.breakpoint` (the "continue" button). */
   continue(runId: string): Promise<RunResult | null> {
     return this.engine.continue(runId);
+  }
+
+  /**
+   * Deliver a `ctx.webhook()` callback: turn an inbound POST (token + body) into the signal the
+   * waiting run is parked on. Returns the run result, or `null` if no run waits on that token (a
+   * stale/duplicate callback) — a safe no-op the controller maps to 404.
+   */
+  deliverWebhook(token: string, body: unknown): Promise<RunResult | null> {
+    return this.engine.signal(token, body);
+  }
+
+  /** Side-effect-free read of a value a run published via `ctx.setEvent` (a live query). */
+  getEvent(runId: string, key: string): Promise<unknown> {
+    return this.engine.getEvent(runId, key);
+  }
+
+  /** Deliver a validated `ctx.onUpdate` to a run; the validator may reject it (see UpdateResult). */
+  update(runId: string, name: string, arg: unknown): Promise<UpdateResult> {
+    return this.engine.update(runId, name, arg);
   }
 
   /**

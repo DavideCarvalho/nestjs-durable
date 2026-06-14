@@ -71,6 +71,10 @@ body {
 .s-cancelled {
   color: #71717a;
 }
+/* Dead-letter: recovery gave up (poison pill). A starker red than a normal failure. */
+.s-dead {
+  color: #e11d48;
+}
 /* A remote step dispatched and awaiting its worker result (in-flight). */
 .s-pending {
   color: #fbbf24;

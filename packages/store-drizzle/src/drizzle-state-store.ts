@@ -163,6 +163,7 @@ function toRunRow(run: WorkflowRun): RunRow {
     wakeAt: run.wakeAt ?? null,
     lockedBy: run.lockedBy ?? null,
     lockedUntil: run.lockedUntil ?? null,
+    recoveryAttempts: run.recoveryAttempts ?? null,
     createdAt: run.createdAt.getTime(),
     updatedAt: run.updatedAt.getTime(),
   };
@@ -174,6 +175,7 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if (patch.output !== undefined) row.output = patch.output ?? null;
   if (patch.error !== undefined) row.error = patch.error ?? null;
   if (patch.wakeAt !== undefined) row.wakeAt = patch.wakeAt ?? null;
+  if (patch.recoveryAttempts !== undefined) row.recoveryAttempts = patch.recoveryAttempts ?? null;
   if (patch.updatedAt !== undefined) row.updatedAt = patch.updatedAt.getTime();
   return row;
 }
@@ -190,6 +192,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     wakeAt: row.wakeAt ?? undefined,
     lockedBy: row.lockedBy ?? undefined,
     lockedUntil: row.lockedUntil ?? undefined,
+    recoveryAttempts: row.recoveryAttempts ?? undefined,
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };

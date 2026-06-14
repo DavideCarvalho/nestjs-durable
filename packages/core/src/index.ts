@@ -3,6 +3,7 @@ export * from './engine';
 export * from './errors';
 export * from './interfaces';
 export * from './protocol';
+export * from './queue';
 export * from './remote-step-factory';
 export * from './scheduler';
 export * from './tokens';

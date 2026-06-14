@@ -139,6 +139,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     wakeAt: run.wakeAt == null ? undefined : new Date(run.wakeAt),
     lockedBy: run.lockedBy ?? null,
     lockedUntil: run.lockedUntil == null ? undefined : new Date(run.lockedUntil),
+    recoveryAttempts: run.recoveryAttempts,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -156,6 +157,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     wakeAt: e.wakeAt == null ? undefined : e.wakeAt.getTime(),
     lockedBy: e.lockedBy ?? undefined,
     lockedUntil: e.lockedUntil == null ? undefined : e.lockedUntil.getTime(),
+    recoveryAttempts: e.recoveryAttempts ?? undefined,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

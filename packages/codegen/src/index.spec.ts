@@ -21,11 +21,20 @@ describe('nestjsDurableCodegen', () => {
         'durable.getRun',
         'durable.retry',
         'durable.cancel',
+        'durable.continue',
+        'durable.deliverWebhook',
+        'durable.getEvent',
+        'durable.update',
       ]),
     );
     const getRun = out.find((r) => r.name === 'durable.getRun');
     expect(getRun?.path).toBe('/durable/api/runs/:id');
     expect(getRun?.params).toEqual([{ name: 'id', source: 'path' }]);
+
+    const webhook = out.find((r) => r.name === 'durable.deliverWebhook');
+    expect(webhook?.method).toBe('POST');
+    expect(webhook?.path).toBe('/durable/api/webhooks/:token');
+    expect(webhook?.params).toEqual([{ name: 'token', source: 'path' }]);
   });
 
   it('honors basePath and namespace', () => {

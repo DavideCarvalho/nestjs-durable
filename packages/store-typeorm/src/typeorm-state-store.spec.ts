@@ -64,6 +64,25 @@ describe('TypeOrmStateStore', () => {
     await dataSource.destroy();
   });
 
+  it('creates indexes for the timer poller and dashboard queries', async () => {
+    const dataSource = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [...ENTITIES],
+      synchronize: false,
+    });
+    await dataSource.initialize();
+    await new TypeOrmStateStore(dataSource).ensureSchema();
+
+    const indexes = (await dataSource.query(
+      `PRAGMA index_list("durable_workflow_runs")`,
+    )) as Array<{ name: string }>;
+    const names = indexes.map((i) => i.name);
+    expect(names).toContain('durable_runs_status_idx'); // timer poller / recovery
+    expect(names).toContain('durable_runs_workflow_status_idx'); // dashboard listRuns
+    await dataSource.destroy();
+  });
+
   it('self-heals a pre-existing table that predates the events column', async () => {
     const dataSource = new DataSource({
       type: 'better-sqlite3',
@@ -89,7 +108,9 @@ describe('TypeOrmStateStore', () => {
 
     await store.createRun(run());
     await store.saveCheckpoint(
-      checkpoint({ events: [{ at: 1, level: 'error', message: 'p-3 failed', name: 'p-3', status: 'failed' }] }),
+      checkpoint({
+        events: [{ at: 1, level: 'error', message: 'p-3 failed', name: 'p-3', status: 'failed' }],
+      }),
     );
     expect((await store.getCheckpoint('r1', 0))?.events).toEqual([
       { at: 1, level: 'error', message: 'p-3 failed', name: 'p-3', status: 'failed' },
@@ -103,6 +124,17 @@ describe('TypeOrmStateStore', () => {
     const loaded = await store.getRun('r1');
     expect(loaded?.workflow).toBe('checkout');
     expect(loaded?.input).toEqual({ orderId: 'o1' });
+    await dataSource.destroy();
+  });
+
+  it('round-trips recoveryAttempts and the dead status', async () => {
+    const { store, dataSource } = await makeStore();
+    await store.createRun(run({ recoveryAttempts: 3 }));
+    expect((await store.getRun('r1'))?.recoveryAttempts).toBe(3);
+    await store.updateRun('r1', { status: 'dead', recoveryAttempts: 4 });
+    const dead = await store.getRun('r1');
+    expect(dead?.status).toBe('dead');
+    expect(dead?.recoveryAttempts).toBe(4);
     await dataSource.destroy();
   });
 

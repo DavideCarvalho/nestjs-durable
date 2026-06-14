@@ -11,7 +11,7 @@ import {
 } from '@xyflow/react';
 import { useCallback, useMemo } from 'react';
 import type { RunStatus, StepCheckpoint, WorkflowRun } from '../client/durable-client';
-import { BoltIcon, CheckIcon, iconFor, KIND_LABEL, XIcon } from './icons';
+import { BoltIcon, CheckIcon, KIND_LABEL, XIcon, iconFor } from './icons';
 
 type SubCounts = { ok: number; failed: number; skipped: number };
 type StepData = {

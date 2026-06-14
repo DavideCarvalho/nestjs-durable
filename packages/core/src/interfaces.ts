@@ -11,7 +11,14 @@ import type { z } from 'zod';
 // Runs & checkpoints — the durable state owned by the orchestrator
 // ---------------------------------------------------------------------------
 
-export type RunStatus = 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus =
+  | 'running'
+  | 'suspended'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  /** Dead-letter: recovery gave up after `maxRecoveryAttempts` (a poison pill). Terminal; inspect it. */
+  | 'dead';
 
 /** One execution of a workflow. The unit of durability and the unit shown in the dashboard. */
 export interface WorkflowRun {
@@ -33,6 +40,8 @@ export interface WorkflowRun {
   lockedBy?: string;
   /** Recovery lease expiry (epoch ms); another instance may take over once it passes. */
   lockedUntil?: number;
+  /** How many times crash-recovery has picked this run up — caps poison pills (see maxRecoveryAttempts). */
+  recoveryAttempts?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -199,6 +208,12 @@ export interface RemoteTask {
   input: unknown;
   /** W3C traceparent so the worker can continue the distributed trace. */
   traceparent?: string;
+  /**
+   * Id of the transport this task was dispatched on (when the engine runs a pool — see
+   * {@link NamedTransport}). A worker that consumes several transports replies via the matching one,
+   * so failover is symmetric without the worker choosing a transport. Absent for a single transport.
+   */
+  transport?: string;
   attempt: number;
 }
 
@@ -222,6 +237,16 @@ export interface Heartbeat {
   group: string;
 }
 
+/**
+ * A transport in an ordered pool, identified by `id`. The engine dispatches on the first by default
+ * and fails over to the next on a dispatch error; a step can pin one via `ctx.call(…, { transport })`.
+ * The chosen `id` is stamped on the {@link RemoteTask} so a worker replies through the matching one.
+ */
+export interface NamedTransport {
+  id: string;
+  transport: Transport;
+}
+
 export interface Transport {
   /** engine → worker */
   dispatch(task: RemoteTask): Promise<void>;
@@ -229,22 +254,26 @@ export interface Transport {
   onResult(handler: (result: StepResult) => Promise<void>): void;
   /** worker → engine: liveness signal for an in-flight long step. */
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void;
-  /**
-   * Optional **control plane** — a broadcast pub/sub across ALL engine instances (every pod), as
-   * opposed to `dispatch`/`onResult` which are point-to-point work queues. It carries things every
-   * instance may need to see regardless of who's running the run: lifecycle events (so a
-   * dashboard-only pod can live-tail a run executing on a worker pod) and cancellation (so the pod
-   * actually running a run learns it was cancelled elsewhere). In-process transports broadcast
-   * locally; a cross-process transport (BullMQ) fans out over its broker (Redis pub/sub). Omit on
-   * transports that can't broadcast — the engine degrades to local-only events.
-   */
-  publishControl?(msg: ControlMessage): Promise<void>;
-  onControl?(handler: (msg: ControlMessage) => void): void;
 }
 
-/** A message on the {@link Transport} control plane — see `publishControl`/`onControl`. `from` is
- *  the originating engine's `instanceId`, so a broker that echoes a publish back to its own
- *  subscriber (e.g. Redis pub/sub) can be deduped by the originator. */
+/**
+ * The **control plane** — a broadcast pub/sub across ALL engine instances (every pod), separate
+ * from the {@link Transport}'s point-to-point work queues (`dispatch`/`onResult`). It carries what
+ * every instance may need regardless of who runs a given run: lifecycle events (so a dashboard-only
+ * pod can live-tail a run executing on a worker pod) and cancellation (so the pod actually running a
+ * run learns it was cancelled elsewhere). In-process implementations broadcast locally; a
+ * cross-process one (BullMQ) fans out over its broker (Redis pub/sub). Give the engine a
+ * `controlPlane` to enable cross-instance events/cancellation; omit it and the engine is local-only.
+ * A transport that can broadcast may implement this too and be passed as both.
+ */
+export interface ControlPlane {
+  publishControl(msg: ControlMessage): Promise<void>;
+  onControl(handler: (msg: ControlMessage) => void): void;
+}
+
+/** A message on the {@link ControlPlane}. `from` is the originating engine's `instanceId`, so a
+ *  broker that echoes a publish back to its own subscriber (e.g. Redis pub/sub) can be deduped by
+ *  the originator. */
 export type ControlMessage = { from?: string } & (
   | { kind: 'event'; event: EngineEvent }
   | { kind: 'cancel'; runId: string }
@@ -298,6 +327,24 @@ export interface RemoteStepDef<TInput = unknown, TOutput = unknown> extends Step
 }
 
 /**
+ * A durable webhook handle minted by {@link WorkflowCtx.webhook}. Hand `url` to a third party,
+ * then `await wait()` — the run suspends with zero compute until the external system POSTs the
+ * callback (delivered as `engine.signal(token, body)`), and resumes with the body.
+ */
+export interface DurableWebhook<TPayload = unknown> {
+  /** Deterministic signal token (`wh:<runId>:<seq>`) the callback delivers on — stable across replay. */
+  readonly token: string;
+  /**
+   * Public callback URL for `token`, built by the engine's `webhookUrl` option. Hand this to the
+   * third party. `undefined` when no builder is configured (use {@link DurableWebhook.token} to
+   * build your own).
+   */
+  readonly url?: string;
+  /** Suspend until the callback arrives, then resume with its payload. */
+  wait(): Promise<TPayload>;
+}
+
+/**
  * The context handed to a workflow function. Every interaction with the outside world goes
  * through it so the engine can checkpoint — the workflow body itself stays deterministic.
  */
@@ -313,8 +360,17 @@ export interface WorkflowCtx {
     fn: (log: StepLogger) => Promise<TOutput>,
     options?: StepOptions,
   ): Promise<TOutput>;
-  /** Dispatch a typed remote step and await its checkpointed result. */
-  call<TInput, TOutput>(step: RemoteStepDef<TInput, TOutput>, input: TInput): Promise<TOutput>;
+  /**
+   * Dispatch a typed remote step and await its checkpointed result. Options:
+   * - `queue` — subject the dispatch to a registered flow-control queue (concurrency / rate limit).
+   * - `transport` — pin the dispatch to a named transport in the pool (else the pool's first, with
+   *   failover to the rest). See `engine.registerQueue` / the engine's `transports` option.
+   */
+  call<TInput, TOutput>(
+    step: RemoteStepDef<TInput, TOutput>,
+    input: TInput,
+    opts?: { queue?: string; transport?: string },
+  ): Promise<TOutput>;
   /**
    * Durable sleep: suspends the run for `duration` (e.g. `'30s'`, `'2h'`, `'7 days'`, or ms as a
    * number) without consuming resources, resuming automatically once the timer is due — even
@@ -356,6 +412,39 @@ export interface WorkflowCtx {
    */
   breakpoint(label?: string): Promise<void>;
   /**
+   * Mint a durable webhook: returns a handle with a deterministic `token` and (if the engine has a
+   * `webhookUrl` builder) a public `url`. Hand the url to a third party — inside a `ctx.step` — then
+   * `await handle.wait()` to suspend with zero compute until they POST the callback (the dashboard
+   * turns that POST into `engine.signal(token, body)`). The first-class, replay-safe version of
+   * "expose a callback URL and wait for it".
+   */
+  webhook<TPayload>(): DurableWebhook<TPayload>;
+  /**
+   * Publish a named, queryable value from inside the run — the latest value for `key` is readable
+   * externally via `engine.getEvent(runId, key)` while the run is still in flight (progress, a
+   * partial result, a status). Checkpointed and replay-safe (overwrites the previous value for the
+   * same key). The read side has no effect on the run — the durable, suspend-model counterpart of a
+   * Temporal query.
+   */
+  setEvent<TValue>(key: string, value: TValue): Promise<void>;
+  /**
+   * Expose a named **update point**: suspend until an external `engine.update(runId, name, arg)`
+   * delivers `arg`, then resume with it. The update is run-scoped (`name` need only be unique within
+   * the run) and gated by any validator registered via `engine.registerUpdateValidator` — a rejected
+   * update never reaches here. Pass `{ timeoutMs }` to bound the wait (throws `SignalTimeoutError`).
+   * The durable counterpart of a Temporal update handler.
+   */
+  onUpdate<TArg>(name: string, opts?: { timeoutMs?: number }): Promise<TArg>;
+  /**
+   * Guard an in-place workflow change without a new version. Wrap the changed code in
+   * `if (await ctx.patched('my-change')) { …new… } else { …old… }`: a fresh run records a marker and
+   * takes the new branch (`true`); a run already recorded under the old code keeps the old branch
+   * (`false`), because its history has a real step where the marker would sit. The marker is
+   * position-transparent for old runs (it doesn't shift their recorded steps), so guarding code is
+   * replay-safe. Once every old run has drained, remove the guard (keep the new branch).
+   */
+  patched(id: string): Promise<boolean>;
+  /**
    * Deterministic wall-clock (epoch ms): records the time on the first run and replays the SAME
    * value afterwards. Use this instead of `Date.now()` inside a workflow — a raw `Date.now()` returns
    * a different value on every replay, which silently corrupts a durable run.
@@ -377,6 +466,20 @@ export interface RunResult {
   output?: unknown;
   error?: StepError;
 }
+
+/**
+ * Validates an incoming `engine.update` before it is delivered to the run. Throw (or return a
+ * non-empty string) to reject — the run is left untouched. Return nothing/void to accept. May be
+ * async (e.g. a business-rule check against a DB).
+ */
+// biome-ignore lint/suspicious/noConfusingVoidType: a validator may return nothing (accept), or a
+// reason string (reject) — `void` in the union is the intended "returned nothing" case.
+export type UpdateValidator<TArg = unknown> = (arg: TArg) => void | string | Promise<void | string>;
+
+/** Outcome of `engine.update`: rejected by the validator, or accepted and delivered. */
+export type UpdateResult =
+  | { accepted: false; reason: string }
+  | { accepted: true; run: RunResult | null };
 
 export type EngineEventType =
   | 'run.started'

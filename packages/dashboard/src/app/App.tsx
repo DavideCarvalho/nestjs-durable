@@ -7,13 +7,13 @@ import {
   type WorkflowRun,
   durableClient,
 } from '../client/durable-client';
-import { PlayIcon, RetryIcon, XIcon } from './icons';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
 import { WorkflowGraph } from './WorkflowGraph';
+import { PlayIcon, RetryIcon, XIcon } from './icons';
 
-const STATUSES: RunStatus[] = ['running', 'suspended', 'completed', 'failed', 'cancelled'];
+const STATUSES: RunStatus[] = ['running', 'suspended', 'completed', 'failed', 'cancelled', 'dead'];
 
 function relTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -167,7 +167,10 @@ function RunDetail({ id }: { id: string }) {
     });
   }, [id, isLive, qc]);
   const retry = useMutation({ mutationFn: () => durableClient.retry(id), onSuccess: invalidate });
-  const cancel = useMutation({ mutationFn: () => durableClient.cancel(id), onSuccess: invalidate });
+  const cancel = useMutation({
+    mutationFn: (compensate?: boolean) => durableClient.cancel(id, { compensate }),
+    onSuccess: invalidate,
+  });
   const cont = useMutation({ mutationFn: () => durableClient.continue(id), onSuccess: invalidate });
   const [sel, setSel] = useState<number>();
   const [showRunIO, setShowRunIO] = useState(false);
@@ -227,10 +230,22 @@ function RunDetail({ id }: { id: string }) {
             <RetryIcon width={12} height={12} />
             Retry
           </button>
+          {canCancel && (
+            <button
+              type="button"
+              disabled={cancel.isPending}
+              onClick={() => cancel.mutate(true)}
+              title="Cancel and run saga compensations (undo completed steps in reverse)"
+              className="flex items-center gap-1.5 rounded-md border border-amber-600/30 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-amber-300/90 transition-colors enabled:hover:bg-amber-900/20 disabled:opacity-30"
+            >
+              <RetryIcon width={12} height={12} />
+              Cancel + Undo
+            </button>
+          )}
           <button
             type="button"
             disabled={!canCancel || cancel.isPending}
-            onClick={() => cancel.mutate()}
+            onClick={() => cancel.mutate(false)}
             className="flex items-center gap-1.5 rounded-md border border-zinc-700 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-zinc-300 transition-colors enabled:hover:bg-zinc-800 disabled:opacity-30"
           >
             <XIcon width={12} height={12} />

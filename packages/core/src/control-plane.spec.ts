@@ -1,4 +1,5 @@
 import { WorkflowEngine } from './engine';
+import type { ControlMessage, ControlPlane } from './interfaces';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { InMemoryTransport } from './testing/in-memory-transport';
 
@@ -6,9 +7,20 @@ import { InMemoryTransport } from './testing/in-memory-transport';
 // workflow and an API/dashboard pod that only observes).
 function twoInstances() {
   const store = new InMemoryStateStore();
+  // The same broadcast-capable transport doubles as the control plane (passed as both).
   const transport = new InMemoryTransport();
-  const worker = new WorkflowEngine({ store, transport, instanceId: 'worker' });
-  const dashboard = new WorkflowEngine({ store, transport, instanceId: 'dashboard' });
+  const worker = new WorkflowEngine({
+    store,
+    transport,
+    controlPlane: transport,
+    instanceId: 'worker',
+  });
+  const dashboard = new WorkflowEngine({
+    store,
+    transport,
+    controlPlane: transport,
+    instanceId: 'dashboard',
+  });
   return { store, transport, worker, dashboard };
 }
 
@@ -46,13 +58,47 @@ describe('Transport control plane', () => {
     expect(aborted).toEqual(['run1']);
   });
 
-  it('degrades to local-only events when the transport has no control plane', async () => {
+  it('degrades to local-only events when no control plane is given', async () => {
     const store = new InMemoryStateStore();
-    const engine = new WorkflowEngine({ store }); // no transport at all
+    const engine = new WorkflowEngine({ store }); // no transport, no control plane
     const seen: string[] = [];
     engine.subscribe((e) => seen.push(e.type));
     engine.register('wf', '1', async () => 'ok');
     await engine.start('wf', {}, 'run1');
     expect(seen).toEqual(['run.started', 'run.completed']);
+  });
+});
+
+/** A shared in-memory control plane (a stand-in broker) two engines can both attach to. */
+function sharedControlPlane() {
+  const subscribers = new Set<(m: ControlMessage) => void>();
+  return (): ControlPlane => ({
+    async publishControl(m) {
+      for (const s of subscribers) s(m);
+    },
+    onControl(h) {
+      subscribers.add(h);
+    },
+  });
+}
+
+describe('control plane — independent of the task transport', () => {
+  it('broadcasts cancellation cross-instance through a standalone control plane (no transport)', async () => {
+    const make = sharedControlPlane();
+    const store = new InMemoryStateStore();
+    const a = new WorkflowEngine({ store, controlPlane: make(), instanceId: 'a' });
+    const b = new WorkflowEngine({ store, controlPlane: make(), instanceId: 'b' });
+
+    let cancelledOnB: string | undefined;
+    b.onCancel((runId) => {
+      cancelledOnB = runId;
+    });
+
+    a.register('wf', '1', async (ctx) => ctx.waitForSignal('go'));
+    await a.start('wf', {}, 'r1');
+    await a.cancel('r1');
+
+    // The cancel rode the control plane to instance b — neither engine has a transport.
+    expect(cancelledOnB).toBe('r1');
   });
 });

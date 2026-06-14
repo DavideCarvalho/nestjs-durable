@@ -106,6 +106,9 @@ importers:
 
   packages/core:
     devDependencies:
+      cron-parser:
+        specifier: 4.9.0
+        version: 4.9.0
       reflect-metadata:
         specifier: 0.2.2
         version: 0.2.2
@@ -215,6 +218,9 @@ importers:
       '@opentelemetry/api':
         specifier: 1.9.0
         version: 1.9.0
+      '@opentelemetry/core':
+        specifier: 1.30.1
+        version: 1.30.1(@opentelemetry/api@1.9.0)
       '@opentelemetry/sdk-trace-base':
         specifier: 1.30.1
         version: 1.30.1(@opentelemetry/api@1.9.0)

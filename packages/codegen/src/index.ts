@@ -28,10 +28,10 @@ function route(
 
 // Wire shapes the durable dashboard API returns (JSON: dates are ISO strings).
 const RUN =
-  "{ id: string; workflow: string; workflowVersion: string; " +
-  "status: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled'; " +
+  '{ id: string; workflow: string; workflowVersion: string; ' +
+  "status: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' | 'dead'; " +
   'input?: unknown; output?: unknown; error?: { message: string; code?: string }; ' +
-  'wakeAt?: number; createdAt: string; updatedAt: string }';
+  'wakeAt?: number; recoveryAttempts?: number; createdAt: string; updatedAt: string }';
 const STEP =
   "{ runId: string; seq: number; name: string; kind: 'local' | 'remote' | 'sleep' | 'signal'; " +
   "status: 'completed' | 'failed'; output?: unknown; error?: { message: string }; attempts: number; " +
@@ -70,17 +70,73 @@ export function nestjsDurableCodegen(options: NestjsDurableCodegenOptions = {}):
 
   const injected: RouteDescriptor[] = [
     route('GET', `${base}/runs`, `${ns}.listRuns`, {
-      query: "{ status?: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' }",
+      query: "{ status?: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' | 'dead' }",
       body: null,
       response: `${RUN}[]`,
     }),
-    route('GET', `${base}/runs/:id`, `${ns}.getRun`, {
-      query: null,
-      body: null,
-      response: `${RUN_DETAIL} | null`,
-    }, id),
-    route('POST', `${base}/runs/:id/retry`, `${ns}.retry`, { query: null, body: null, response: RUN }, id),
-    route('POST', `${base}/runs/:id/cancel`, `${ns}.cancel`, { query: null, body: null, response: RUN }, id),
+    route(
+      'GET',
+      `${base}/runs/:id`,
+      `${ns}.getRun`,
+      {
+        query: null,
+        body: null,
+        response: `${RUN_DETAIL} | null`,
+      },
+      id,
+    ),
+    route(
+      'POST',
+      `${base}/runs/:id/retry`,
+      `${ns}.retry`,
+      { query: null, body: null, response: RUN },
+      id,
+    ),
+    route(
+      'POST',
+      `${base}/runs/:id/cancel`,
+      `${ns}.cancel`,
+      { query: "{ compensate?: 'true' }", body: null, response: RUN },
+      id,
+    ),
+    route(
+      'POST',
+      `${base}/runs/:id/continue`,
+      `${ns}.continue`,
+      { query: null, body: null, response: RUN },
+      id,
+    ),
+    route(
+      'POST',
+      `${base}/webhooks/:token`,
+      `${ns}.deliverWebhook`,
+      { query: null, body: 'unknown', response: RUN },
+      [{ name: 'token', source: 'path' }],
+    ),
+    route(
+      'GET',
+      `${base}/runs/:id/events/:key`,
+      `${ns}.getEvent`,
+      { query: null, body: null, response: 'unknown' },
+      [
+        { name: 'id', source: 'path' },
+        { name: 'key', source: 'path' },
+      ],
+    ),
+    route(
+      'POST',
+      `${base}/runs/:id/updates/:name`,
+      `${ns}.update`,
+      {
+        query: null,
+        body: 'unknown',
+        response: `{ accepted: false; reason: string } | { accepted: true; run: ${RUN} | null }`,
+      },
+      [
+        { name: 'id', source: 'path' },
+        { name: 'name', source: 'path' },
+      ],
+    ),
   ];
 
   return {

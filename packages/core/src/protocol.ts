@@ -7,6 +7,10 @@ export function stepId(runId: string, seq: number): string {
   return `${runId}:${seq}`;
 }
 
+/** Deterministic signal token a breakpoint suspends on — derived from its logical position. Shared
+ *  so `ctx.breakpoint` (which records it) and `engine.continue` (which signals it) agree. */
+export const breakpointToken = (runId: string, seq: number): string => `bp:${runId}:${seq}`;
+
 /** A remote-worker step body. The optional `log` records sub-process outcomes and debug/error
  *  lines that ride back on the result — the TypeScript twin of the Python SDK's `StepContext`. */
 export type StepHandler = (input: unknown, log: StepLogger) => Promise<unknown> | unknown;
@@ -37,10 +41,17 @@ export async function runStepHandler(
     const output = await handler(task.input, createStepLogger(events, Date.now));
     return withEvents({ ...base, status: 'completed', output });
   } catch (err) {
+    // Carry `code`/`retryable` off the thrown error if present, so the engine's durable retry can
+    // honour a worker's "don't retry this" verdict (e.g. a declined card).
+    const e = err as { message?: string; code?: string; retryable?: boolean };
     return withEvents({
       ...base,
       status: 'failed',
-      error: { message: err instanceof Error ? err.message : String(err) },
+      error: {
+        message: err instanceof Error ? err.message : String(err),
+        ...(typeof e?.code === 'string' ? { code: e.code } : {}),
+        ...(typeof e?.retryable === 'boolean' ? { retryable: e.retryable } : {}),
+      },
     });
   }
 }

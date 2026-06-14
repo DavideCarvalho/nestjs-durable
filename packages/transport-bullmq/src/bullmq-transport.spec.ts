@@ -88,4 +88,23 @@ describe('BullMQTransport (real Redis)', () => {
     await pub.close();
     await sub.close();
   }, 20_000);
+
+  it('delivers worker heartbeats over Redis pub/sub', async (ctx) => {
+    if (!redisUp) ctx.skip();
+    const prefix = `durtest-${Date.now()}-h`;
+    const worker = new BullMQTransport({ connection, prefix });
+    const engineSide = new BullMQTransport({ connection, prefix });
+
+    const beats: string[] = [];
+    engineSide.onHeartbeat(async (b) => {
+      beats.push(b.stepId);
+    });
+    await new Promise((r) => setTimeout(r, 200)); // let the subscription establish
+    await worker.heartbeat({ runId: 'r1', seq: 0, stepId: 'r1:0', group: 'payments' });
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(beats).toEqual(['r1:0']);
+    await worker.close();
+    await engineSide.close();
+  }, 20_000);
 });

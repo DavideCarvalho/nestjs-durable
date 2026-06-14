@@ -12,10 +12,12 @@ model DurableWorkflowRun {
   wakeAt          BigInt?
   lockedBy        String?
   lockedUntil     DateTime?
+  recoveryAttempts Int?
   createdAt       DateTime
   updatedAt       DateTime
 
   @@index([status, wakeAt])
+  @@index([workflow, status])
   @@map("durable_workflow_runs")
 }
 

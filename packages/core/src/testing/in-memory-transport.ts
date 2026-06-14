@@ -1,11 +1,20 @@
-import type { ControlMessage, Heartbeat, RemoteTask, StepResult, Transport } from '../interfaces';
+import type {
+  ControlMessage,
+  ControlPlane,
+  Heartbeat,
+  RemoteTask,
+  StepResult,
+  Transport,
+} from '../interfaces';
 import { type StepHandler, runStepHandler } from '../protocol';
 
 /**
- * An in-process `Transport` for tests and local development: registered handlers stand in
- * for remote workers, so a whole cross-app workflow runs in a single process.
+ * An in-process `Transport` (and `ControlPlane`) for tests and local development: registered
+ * handlers stand in for remote workers, so a whole cross-app workflow runs in a single process,
+ * and control messages broadcast locally. Pass the same instance as both `transport` and
+ * `controlPlane`.
  */
-export class InMemoryTransport implements Transport {
+export class InMemoryTransport implements Transport, ControlPlane {
   private readonly handlers = new Map<string, StepHandler>();
   private resultHandler?: (result: StepResult) => Promise<void>;
   private readonly controlHandlers = new Set<(msg: ControlMessage) => void>();

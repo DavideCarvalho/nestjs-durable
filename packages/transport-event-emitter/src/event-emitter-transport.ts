@@ -1,5 +1,6 @@
 import {
   type ControlMessage,
+  type ControlPlane,
   type Heartbeat,
   type RemoteTask,
   type StepHandler,
@@ -21,7 +22,7 @@ export const CONTROL_EVENT = 'durable.control';
  * workflow that calls them. Swap to a queue-backed transport (BullMQ/NATS) for true
  * cross-process or cross-language steps.
  */
-export class EventEmitterTransport implements Transport {
+export class EventEmitterTransport implements Transport, ControlPlane {
   private readonly handlers = new Map<string, StepHandler>();
 
   constructor(private readonly emitter: EventEmitter2) {

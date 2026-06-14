@@ -1,4 +1,4 @@
-export type RunStatus = 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus = 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' | 'dead';
 export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
 
 export interface WorkflowRun {
@@ -10,6 +10,7 @@ export interface WorkflowRun {
   output?: unknown;
   error?: { message: string; code?: string };
   wakeAt?: number;
+  recoveryAttempts?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -102,8 +103,9 @@ export const durableClient = {
   retry(id: string): Promise<WorkflowRun> {
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
   },
-  cancel(id: string): Promise<WorkflowRun> {
-    return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+  cancel(id: string, opts?: { compensate?: boolean }): Promise<WorkflowRun> {
+    const qs = opts?.compensate ? '?compensate=true' : '';
+    return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/cancel${qs}`, { method: 'POST' });
   },
   continue(id: string): Promise<WorkflowRun> {
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/continue`, { method: 'POST' });
