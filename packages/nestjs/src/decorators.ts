@@ -17,6 +17,8 @@ export interface WorkflowMeta {
   tags?: string[];
   /** Per-key serialization (a durable mutex). See `WorkflowOptions`. */
   singleton?: SingletonConfig;
+  /** Max wall-clock lifetime before a run is cancelled (e.g. `'2h'`). See `WorkflowOptions`. */
+  executionTimeout?: string | number;
 }
 
 export interface WorkflowOptions {
@@ -42,6 +44,12 @@ export interface WorkflowOptions {
    * 1) raises the concurrency.
    */
   singleton?: SingletonConfig;
+  /**
+   * Max wall-clock lifetime for a run of this workflow (e.g. `'2h'`, `'7 days'`, or ms). A run that
+   * outlives it is moved to `cancelled` (`execution_timeout`) by the timer poller — a backstop for
+   * runs that get stuck or loop forever. Omit for no limit.
+   */
+  executionTimeout?: string | number;
 }
 
 /**
@@ -56,6 +64,7 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       deadLetterWorkflow: options.deadLetterWorkflow,
       tags: options.tags,
       singleton: options.singleton,
+      executionTimeout: options.executionTimeout,
     };
     Reflect.defineMetadata(WORKFLOW_METADATA, meta, target);
     // Stamp the registered name so this class can be used as a typed workflow ref (ctx.child,

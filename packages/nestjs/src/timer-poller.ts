@@ -43,6 +43,7 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     this.polling = true;
     try {
       await this.engine.resumeDueTimers();
+      await this.engine.sweepTimeouts();
       const schedules = this.options.schedules;
       if (schedules && schedules.length > 0) {
         await runSchedules(this.engine, schedules, Date.now());
