@@ -6,6 +6,8 @@ import {
   type StepHandler,
   type StepResult,
   type Transport,
+  type WorkflowDecision,
+  type WorkflowTask,
   runStepHandler,
 } from '@dudousxd/nestjs-durable-core';
 import { type ConnectionOptions, Queue, Worker } from 'bullmq';
@@ -37,6 +39,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly queues = new Map<string, Queue>();
   private taskWorker?: Worker;
   private resultsWorker?: Worker;
+  private decisionsWorker?: Worker;
   // Control plane runs over Redis pub/sub (not a queue): every instance gets every message, which
   // is what live-tail + cancellation need. Subscribe needs its own connection (it blocks the client).
   private controlPub?: Redis;
@@ -82,6 +85,29 @@ export class BullMQTransport implements Transport, ControlPlane {
       removeOnComplete: true,
       removeOnFail: true,
     });
+  }
+
+  private decisionsName(): string {
+    return `${this.prefix}-decisions`;
+  }
+
+  /** engine → workflow worker: a WorkflowTask on the group's task queue (same queue a Python workflow
+   *  worker consumes via `<prefix>-tasks-<group>`). The decision comes back on `<prefix>-decisions`. */
+  async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
+    await this.queue(this.tasksName(task.group)).add('workflow', task, {
+      removeOnComplete: true,
+      removeOnFail: true,
+    });
+  }
+
+  /** workflow worker → engine: consume replayed decisions. Starts the consumer on first call. */
+  onDecision(handler: (decision: WorkflowDecision) => Promise<void>): void {
+    if (this.decisionsWorker) return;
+    this.decisionsWorker = new Worker(
+      this.decisionsName(),
+      (job) => handler(job.data as WorkflowDecision),
+      { connection: this.workerConnection() },
+    );
   }
 
   /** Register a step handler (worker side). Starts the group's task consumer on first call. */
@@ -167,6 +193,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   async close(): Promise<void> {
     await this.taskWorker?.close();
     await this.resultsWorker?.close();
+    await this.decisionsWorker?.close();
     await Promise.all([...this.queues.values()].map((q) => q.close()));
     this.controlPub?.disconnect();
     this.controlSub?.disconnect();

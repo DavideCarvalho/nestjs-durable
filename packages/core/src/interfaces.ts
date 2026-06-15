@@ -430,6 +430,12 @@ export interface Transport {
    *  Optional — an in-process transport has nothing to close. Called on `onApplicationShutdown`
    *  after the engine drains, so a deploy hands off instead of leaving the broker to time out. */
   close?(): Promise<void>;
+  /** engine → workflow worker: dispatch a {@link WorkflowTask} (the polyglot-workflow path). Optional
+   *  — only transports that carry workflow tasks (BullMQ) implement it; the {@link RemoteWorkflowExecutor}
+   *  uses it + {@link onDecision} to advance a remote workflow over the broker. */
+  dispatchWorkflowTask?(task: WorkflowTask): Promise<void>;
+  /** workflow worker → engine: a replayed turn's {@link WorkflowDecision}. Pair with dispatchWorkflowTask. */
+  onDecision?(handler: (decision: WorkflowDecision) => Promise<void>): void;
 }
 
 /**
