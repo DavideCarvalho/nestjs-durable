@@ -183,6 +183,20 @@ describe('TypeOrmStateStore', () => {
     await dataSource.destroy();
   });
 
+  it('transaction commits the checkpoint atomically and returns the work result', async () => {
+    const { store, dataSource } = await makeStore();
+    await store.createRun(run());
+    const result = await store.transaction!(async (tx) => {
+      await tx.saveCheckpoint(checkpoint({ seq: 7, name: 'tx-step', output: { paid: true } }));
+      return 'ok';
+    });
+    expect(result).toBe('ok');
+    const cp = await store.getCheckpoint('r1', 7);
+    expect(cp?.name).toBe('tx-step');
+    expect(cp?.output).toEqual({ paid: true });
+    await dataSource.destroy();
+  });
+
   it('lists incomplete runs and due timers', async () => {
     const { store, dataSource } = await makeStore();
     await store.createRun(run({ id: 'running1', status: 'running' }));

@@ -66,6 +66,22 @@ export class TypeOrmStateStore implements StateStore {
     await this.checkpoints().save(toCheckpointEntity(checkpoint));
   }
 
+  async transaction<T>(
+    work: (tx: {
+      raw: unknown;
+      saveCheckpoint: (cp: StepCheckpoint) => Promise<void>;
+    }) => Promise<T>,
+  ): Promise<T> {
+    return this.dataSource.transaction(async (em) =>
+      work({
+        raw: em,
+        saveCheckpoint: async (cp) => {
+          await em.getRepository(StepCheckpointEntity).save(toCheckpointEntity(cp));
+        },
+      }),
+    );
+  }
+
   async listIncompleteRuns(): Promise<WorkflowRun[]> {
     const rows = await this.runs().findBy({ status: 'running' });
     return rows.map(fromRunEntity);

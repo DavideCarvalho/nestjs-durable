@@ -78,11 +78,16 @@ interface Delegate<Row> {
   delete(args: Args): Promise<Row>;
 }
 
-export interface DurablePrismaClient {
+export interface DurablePrismaTx {
   durableWorkflowRun: Delegate<RunRow>;
   durableStepCheckpoint: Delegate<CheckpointRow>;
   durableSignalWaiter: Delegate<WaiterRow>;
   durableBufferedSignal: Delegate<BufferedSignalRow>;
+}
+
+export interface DurablePrismaClient extends DurablePrismaTx {
+  /** Prisma's interactive-transaction form: runs `fn` with a tx-scoped client and commits on resolve. */
+  $transaction<T>(fn: (tx: DurablePrismaTx) => Promise<T>): Promise<T>;
 }
 
 /**
@@ -120,6 +125,27 @@ export class PrismaStateStore implements StateStore {
       create: data,
       update: data,
     });
+  }
+
+  async transaction<T>(
+    work: (tx: {
+      raw: unknown;
+      saveCheckpoint: (cp: StepCheckpoint) => Promise<void>;
+    }) => Promise<T>,
+  ): Promise<T> {
+    return this.db.$transaction(async (tx) =>
+      work({
+        raw: tx,
+        saveCheckpoint: async (cp) => {
+          const data = toCheckpointData(cp);
+          await tx.durableStepCheckpoint.upsert({
+            where: { runId_seq: { runId: cp.runId, seq: cp.seq } },
+            create: data,
+            update: data,
+          });
+        },
+      }),
+    );
   }
 
   async listIncompleteRuns(): Promise<WorkflowRun[]> {

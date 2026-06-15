@@ -58,6 +58,29 @@ export class DrizzleStateStore implements StateStore {
       .onConflictDoUpdate({ target: [stepCheckpoints.runId, stepCheckpoints.seq], set: row });
   }
 
+  async transaction<T>(
+    work: (tx: {
+      raw: unknown;
+      saveCheckpoint: (cp: StepCheckpoint) => Promise<void>;
+    }) => Promise<T>,
+  ): Promise<T> {
+    return this.db.transaction(async (tx) =>
+      work({
+        raw: tx,
+        saveCheckpoint: async (cp) => {
+          const row = toCheckpointRow(cp);
+          await tx
+            .insert(stepCheckpoints)
+            .values(row)
+            .onConflictDoUpdate({
+              target: [stepCheckpoints.runId, stepCheckpoints.seq],
+              set: row,
+            });
+        },
+      }),
+    );
+  }
+
   async listIncompleteRuns(): Promise<WorkflowRun[]> {
     const rows = await this.db
       .select()

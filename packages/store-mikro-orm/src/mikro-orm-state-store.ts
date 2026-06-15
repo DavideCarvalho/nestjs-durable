@@ -60,6 +60,22 @@ export class MikroOrmStateStore implements StateStore {
     await em.flush();
   }
 
+  async transaction<T>(
+    work: (tx: {
+      raw: unknown;
+      saveCheckpoint: (cp: StepCheckpoint) => Promise<void>;
+    }) => Promise<T>,
+  ): Promise<T> {
+    return this.orm.em.fork().transactional(async (em) =>
+      work({
+        raw: em,
+        saveCheckpoint: async (cp) => {
+          await em.upsert(StepCheckpointEntity, toCheckpointEntity(cp));
+        },
+      }),
+    );
+  }
+
   async listIncompleteRuns(): Promise<WorkflowRun[]> {
     const em = this.orm.em.fork();
     const rows = await em.find(WorkflowRunEntity, { status: 'running' });
