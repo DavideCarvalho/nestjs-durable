@@ -28,14 +28,19 @@ import type {
   StepError,
   StepEvent,
   StepInterceptor,
+  StepKind,
   StepInvocation,
   StepResult,
   Transport,
   UpdateResult,
   UpdateValidator,
+  WorkflowCommand,
   WorkflowCtx,
+  WorkflowDecision,
+  WorkflowExecutor,
   WorkflowRun,
 } from './interfaces';
+import type { HistoryEvent } from './interfaces';
 import { breakpointToken, stepId } from './protocol';
 import { type QueueConfig, QueueController } from './queue';
 import { TransportPool } from './transport-pool';
@@ -110,6 +115,9 @@ interface RegisteredWorkflow {
   onEvent?: string[];
   /** Coalesce `onEvent` triggers: debounce (fire once it's quiet) or batch (fire on size/window). */
   eventBatch?: EventBatchConfig;
+  /** Set for a workflow authored in another SDK (e.g. Python): the engine advances it by dispatching
+   *  workflow tasks to `executor` instead of running `fn` in-process. See {@link WorkflowExecutor}. */
+  remote?: { group: string; executor: WorkflowExecutor };
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
@@ -398,6 +406,43 @@ export class WorkflowEngine {
       subscribers.add(name);
       this.eventTriggers.set(event, subscribers);
     }
+  }
+
+  /**
+   * Register a workflow whose body runs in another SDK (e.g. Python). The engine owns the run exactly
+   * as for a TS workflow — it persists checkpoints, recovers, runs timers — but advances it by handing
+   * the run's history to `executor` (which dispatches a {@link WorkflowTask} to the worker) and applying
+   * the {@link WorkflowDecision} the worker's replay returns. The worker never touches the store.
+   */
+  registerRemote(
+    name: string,
+    version: string,
+    opts: {
+      group: string;
+      executor: WorkflowExecutor;
+      tags?: string[];
+      singleton?: SingletonConfig;
+      executionTimeout?: string | number;
+      validateInput?: (input: unknown) => void | Promise<void>;
+    },
+  ): void {
+    const registered: RegisteredWorkflow = {
+      name,
+      version,
+      // A remote workflow has no in-process body; execute() branches on `remote` before this is read.
+      fn: () => {
+        throw new Error(`workflow ${name} is remote — it has no in-process body`);
+      },
+      tags: opts.tags,
+      singleton: opts.singleton,
+      executionTimeoutMs:
+        opts.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
+      validateInput: opts.validateInput,
+      remote: { group: opts.group, executor: opts.executor },
+    };
+    this.workflows.set(versionKey(name, version), registered);
+    const current = this.latest.get(name);
+    if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
   }
 
   /**
@@ -1128,10 +1173,196 @@ export class WorkflowEngine {
     );
     renew.unref?.();
     try {
+      // A remote (e.g. Python) workflow is advanced by dispatching workflow tasks, not by running an
+      // in-process body — but everything around it (lease, recovery, timers, the resume that lands us
+      // here on a step result) is identical, so it branches here under the same lease.
+      if (registered?.remote) return await this.runRemoteExecution(run, registered);
       return await this.runExecution(run, fn, registered);
     } finally {
       clearInterval(renew);
     }
+  }
+
+  /**
+   * Advance a remote (cross-SDK) workflow one turn: hand its history to the executor (which dispatches
+   * a workflow task to the worker and awaits its replay) and apply the decision. Mirrors
+   * {@link runExecution}'s settle/suspend; the lease is held by {@link execute}. The result that lands
+   * us back here (a remote step finished, a timer fired) goes through `resume` like any TS workflow.
+   */
+  private async runRemoteExecution(
+    run: WorkflowRun,
+    registered: RegisteredWorkflow,
+  ): Promise<RunResult> {
+    const remote = registered.remote as NonNullable<RegisteredWorkflow['remote']>;
+    if (run.status === 'pending') {
+      await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
+      run.status = 'running';
+      this.emit({ type: 'run.started', runId: run.id, workflow: run.workflow });
+    }
+    if (registered.singleton && !(await this.admitSingleton(run, registered.singleton))) {
+      const wakeAt = this.clock() + SINGLETON_RETRY_MS;
+      await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
+      this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
+      await this.store.releaseRunLock(run.id);
+      return { runId: run.id, status: 'suspended' };
+    }
+
+    const history = await this.remoteHistory(run.id);
+    let decision: WorkflowDecision;
+    try {
+      decision = await remote.executor.advance(run, history);
+    } catch (err) {
+      const error = {
+        message: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      };
+      await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
+      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+      return { runId: run.id, status: 'failed', error };
+    }
+
+    if (decision.status === 'completed') {
+      await this.store.updateRun(run.id, {
+        status: 'completed',
+        output: decision.output,
+        error: undefined,
+        updatedAt: new Date(),
+      });
+      this.emit({
+        type: 'run.completed',
+        runId: run.id,
+        workflow: run.workflow,
+        output: decision.output,
+      });
+      void this.notifyParent(run.id, { ok: true, value: decision.output });
+      return { runId: run.id, status: 'completed', output: decision.output };
+    }
+    if (decision.status === 'failed') {
+      const error = decision.error ?? { message: 'workflow failed' };
+      await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
+      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+      void this.notifyParent(run.id, { ok: false, error: error.message });
+      return { runId: run.id, status: 'failed', error };
+    }
+
+    // continue: persist any local steps the replay ran, dispatch the blocking ops, then suspend. When
+    // those resolve (a result lands, a timer fires) `resume` brings us back for the next turn.
+    const wakeAt = await this.applyCommands(run, decision.commands);
+    await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
+    this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
+    return { runId: run.id, status: 'suspended' };
+  }
+
+  /** The run's resolved durable ops as replay inputs: completed/failed steps + elapsed timers. */
+  private async remoteHistory(runId: string): Promise<HistoryEvent[]> {
+    const checkpoints = await this.store.listCheckpoints(runId);
+    const kindOf: Record<StepKind, HistoryEvent['kind']> = {
+      remote: 'call',
+      local: 'step',
+      sleep: 'timer',
+      signal: 'signal',
+    };
+    const events: HistoryEvent[] = [];
+    for (const cp of checkpoints) {
+      if (cp.status === 'completed' || cp.status === 'failed') {
+        events.push({
+          seq: cp.seq,
+          kind: kindOf[cp.kind] ?? 'step',
+          name: cp.name,
+          output: cp.status === 'completed' ? cp.output : undefined,
+          error: cp.status === 'failed' ? cp.error : undefined,
+        });
+      } else if (cp.kind === 'sleep' && cp.wakeAt != null && cp.wakeAt <= this.clock()) {
+        // a still-`pending` sleep whose deadline has passed reads as a resolved timer on replay.
+        events.push({ seq: cp.seq, kind: 'timer', name: cp.name });
+      }
+    }
+    return events.sort((a, b) => a.seq - b.seq);
+  }
+
+  /** Apply a turn's commands: persist recorded local steps, dispatch remote calls, schedule timers.
+   *  Returns the earliest timer deadline to suspend on (or undefined — suspended on a result). */
+  private async applyCommands(run: WorkflowRun, commands: WorkflowCommand[]): Promise<number | undefined> {
+    let wakeAt: number | undefined;
+    for (const cmd of commands) {
+      const at = new Date();
+      const id = stepId(run.id, cmd.seq);
+      if (cmd.kind === 'recordStep') {
+        await this.store.saveCheckpoint({
+          runId: run.id,
+          seq: cmd.seq,
+          name: cmd.name,
+          kind: 'local',
+          stepId: id,
+          status: cmd.error ? 'failed' : 'completed',
+          output: cmd.output,
+          error: cmd.error,
+          attempts: 1,
+          enqueuedAt: at,
+          startedAt: at,
+          finishedAt: at,
+        });
+        this.emit({
+          type: cmd.error ? 'step.failed' : 'step.completed',
+          runId: run.id,
+          seq: cmd.seq,
+          name: cmd.name,
+          kind: 'local',
+          output: cmd.output,
+          error: cmd.error,
+        });
+      } else if (cmd.kind === 'call') {
+        await this.store.saveCheckpoint({
+          runId: run.id,
+          seq: cmd.seq,
+          name: cmd.name,
+          kind: 'remote',
+          stepId: id,
+          status: 'pending',
+          input: cmd.input,
+          attempts: 1,
+          workerGroup: cmd.group,
+          enqueuedAt: at,
+          startedAt: at,
+          finishedAt: at,
+        });
+        await this.pool.dispatch(
+          {
+            runId: run.id,
+            seq: cmd.seq,
+            name: cmd.name,
+            stepId: id,
+            group: cmd.group,
+            input: cmd.input,
+            traceparent: this.traceparent?.(),
+            attempt: 1,
+          },
+          undefined,
+        );
+        this.emit({ type: 'step.started', runId: run.id, seq: cmd.seq, name: cmd.name, kind: 'remote' });
+      } else if (cmd.kind === 'sleep') {
+        const deadline = this.clock() + cmd.ms;
+        await this.store.saveCheckpoint({
+          runId: run.id,
+          seq: cmd.seq,
+          name: `sleep:${cmd.seq}`,
+          kind: 'sleep',
+          stepId: id,
+          status: 'pending',
+          attempts: 1,
+          wakeAt: deadline,
+          enqueuedAt: at,
+          startedAt: at,
+          finishedAt: at,
+        });
+        wakeAt = wakeAt == null ? deadline : Math.min(wakeAt, deadline);
+      } else {
+        // waitSignal / startChild need the engine's signal/child resolution wired into the remote
+        // path — a follow-up. Fail loudly rather than hang so the gap is obvious.
+        throw new Error(`remote workflow command '${cmd.kind}' is not supported yet`);
+      }
+    }
+    return wakeAt;
   }
 
   /** The run body, lease held + renewed by {@link execute}. */
