@@ -17,7 +17,8 @@ export class WorkflowService {
    * Start a workflow run. Pass the workflow's **class** (`start(CheckoutWorkflow, input)`) for a typed
    * input + refactor-safety, or a **name** string for a cross-runtime workflow. `runId` defaults to a
    * random id; pass your own to make the start idempotent (a redelivery returns the existing run).
-   * `opts.tags` are merged with the workflow's static `@Workflow({ tags })` onto the run.
+   * `opts.tags` are merged with the workflow's static `@Workflow({ tags })`; `opts.searchAttributes`
+   * stamp typed, queryable run data (e.g. `{ amount: 200, tier: 'pro' }`).
    */
   start<C extends WorkflowClass>(
     workflow: C,

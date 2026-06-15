@@ -1,11 +1,12 @@
-import type {
-  RunQuery,
-  SignalWaiter,
-  StateStore,
-  StepCheckpoint,
-  StepError,
-  StepEvent,
-  WorkflowRun,
+import {
+  type RunQuery,
+  type SignalWaiter,
+  type StateStore,
+  type StepCheckpoint,
+  type StepError,
+  type StepEvent,
+  type WorkflowRun,
+  applyAttributeQuery,
 } from '@dudousxd/nestjs-durable-core';
 import { Brackets, type DataSource, IsNull, LessThanOrEqual, Like } from 'typeorm';
 import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './entities';
@@ -102,12 +103,14 @@ export class TypeOrmStateStore implements StateStore {
     if (query.status) where.status = query.status;
     // `tags` is a JSON-text column; match the quoted token so `etl` doesn't match `etl-foo`.
     if (query.tag) where.tags = Like(`%"${query.tag}"%`);
-    const rows = await this.runs().find({
-      where,
-      take: query.limit,
-      skip: query.offset,
-      order: { createdAt: 'DESC' }, // newest first — recent runs on top in the dashboard
-    });
+    // Typed/range attribute predicates aren't expressible in portable SQL, so fetch the coarse rows
+    // (newest first) and filter + paginate them in-process. Without attributes, the DB paginates.
+    const order = { createdAt: 'DESC' as const }; // newest first — recent runs on top in the dashboard
+    if (query.attributes?.length) {
+      const rows = await this.runs().find({ where, order });
+      return applyAttributeQuery(rows.map(fromRunEntity), query);
+    }
+    const rows = await this.runs().find({ where, take: query.limit, skip: query.offset, order });
     return rows.map(fromRunEntity);
   }
 
@@ -148,6 +151,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     lockedUntil: run.lockedUntil == null ? undefined : new Date(run.lockedUntil),
     recoveryAttempts: run.recoveryAttempts,
     tags: run.tags ?? null,
+    searchAttributes: run.searchAttributes ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -167,6 +171,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     lockedUntil: e.lockedUntil == null ? undefined : e.lockedUntil.getTime(),
     recoveryAttempts: e.recoveryAttempts ?? undefined,
     tags: e.tags ?? undefined,
+    searchAttributes: e.searchAttributes ?? undefined,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

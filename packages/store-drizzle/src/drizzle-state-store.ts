@@ -1,11 +1,12 @@
-import type {
-  RunQuery,
-  SignalWaiter,
-  StateStore,
-  StepCheckpoint,
-  StepError,
-  StepEvent,
-  WorkflowRun,
+import {
+  type RunQuery,
+  type SignalWaiter,
+  type StateStore,
+  type StepCheckpoint,
+  type StepError,
+  type StepEvent,
+  type WorkflowRun,
+  applyAttributeQuery,
 } from '@dudousxd/nestjs-durable-core';
 import { and, asc, desc, eq, isNotNull, isNull, like, lte, or } from 'drizzle-orm';
 import type { BaseSQLiteDatabase } from 'drizzle-orm/sqlite-core';
@@ -111,13 +112,17 @@ export class DrizzleStateStore implements StateStore {
       // `tags` is JSON text; match the quoted token so `etl` doesn't match `etl-foo`.
       query.tag ? like(workflowRuns.tags, `%"${query.tag}"%`) : undefined,
     ].filter((f): f is NonNullable<typeof f> => f !== undefined);
-    const rows = await this.db
+    const base = this.db
       .select()
       .from(workflowRuns)
       .where(filters.length ? and(...filters) : undefined)
-      .orderBy(desc(workflowRuns.createdAt)) // newest first — recent runs on top in the dashboard
-      .limit(query.limit ?? -1)
-      .offset(query.offset ?? 0);
+      .orderBy(desc(workflowRuns.createdAt)); // newest first — recent runs on top in the dashboard
+    // Typed/range attribute predicates aren't portable SQL — fetch coarse rows, filter + paginate
+    // in-process. Without attributes, the DB paginates.
+    if (query.attributes?.length) {
+      return applyAttributeQuery((await base).map(fromRunRow), query);
+    }
+    const rows = await base.limit(query.limit ?? -1).offset(query.offset ?? 0);
     return rows.map(fromRunRow);
   }
 
@@ -175,6 +180,7 @@ function toRunRow(run: WorkflowRun): RunRow {
     lockedUntil: run.lockedUntil ?? null,
     recoveryAttempts: run.recoveryAttempts ?? null,
     tags: run.tags ?? null,
+    searchAttributes: run.searchAttributes ?? null,
     createdAt: run.createdAt.getTime(),
     updatedAt: run.updatedAt.getTime(),
   };
@@ -205,6 +211,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     lockedUntil: row.lockedUntil ?? undefined,
     recoveryAttempts: row.recoveryAttempts ?? undefined,
     tags: row.tags ?? undefined,
+    searchAttributes: row.searchAttributes ?? undefined,
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };

@@ -1,11 +1,12 @@
-import type {
-  RunQuery,
-  SignalWaiter,
-  StateStore,
-  StepCheckpoint,
-  StepError,
-  StepEvent,
-  WorkflowRun,
+import {
+  type RunQuery,
+  type SignalWaiter,
+  type StateStore,
+  type StepCheckpoint,
+  type StepError,
+  type StepEvent,
+  type WorkflowRun,
+  applyAttributeQuery,
 } from '@dudousxd/nestjs-durable-core';
 import type { MikroORM } from '@mikro-orm/core';
 import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './entities';
@@ -96,10 +97,17 @@ export class MikroOrmStateStore implements StateStore {
     if (query.status) where.status = query.status;
     // `tags` is JSON text; match the quoted token so `etl` doesn't match `etl-foo`.
     if (query.tag) where.tags = { $like: `%"${query.tag}"%` };
+    const orderBy = { createdAt: 'desc' as const }; // newest first — recent runs on top in the dashboard
+    // Typed/range attribute predicates aren't portable SQL — fetch coarse rows, filter + paginate
+    // in-process. Without attributes, the DB paginates.
+    if (query.attributes?.length) {
+      const rows = await em.find(WorkflowRunEntity, where, { orderBy });
+      return applyAttributeQuery(rows.map(fromRunEntity), query);
+    }
     const rows = await em.find(WorkflowRunEntity, where, {
       limit: query.limit,
       offset: query.offset,
-      orderBy: { createdAt: 'desc' }, // newest first — recent runs on top in the dashboard
+      orderBy,
     });
     return rows.map(fromRunEntity);
   }
@@ -146,6 +154,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   e.lockedUntil = run.lockedUntil == null ? undefined : new Date(run.lockedUntil);
   e.recoveryAttempts = run.recoveryAttempts;
   e.tags = run.tags ?? null;
+  e.searchAttributes = run.searchAttributes ?? null;
   e.createdAt = run.createdAt;
   e.updatedAt = run.updatedAt;
   return e;
@@ -165,6 +174,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     lockedUntil: e.lockedUntil?.getTime(),
     recoveryAttempts: e.recoveryAttempts ?? undefined,
     tags: e.tags ?? undefined,
+    searchAttributes: e.searchAttributes ?? undefined,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

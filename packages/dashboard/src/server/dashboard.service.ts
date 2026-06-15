@@ -65,7 +65,7 @@ export class DashboardService {
    */
   async bulk(
     action: 'retry' | 'cancel',
-    filter: Pick<RunQuery, 'status' | 'tag' | 'workflow'>,
+    filter: Pick<RunQuery, 'status' | 'tag' | 'workflow' | 'attributes'>,
     opts?: { compensate?: boolean },
   ): Promise<{ matched: number; applied: number }> {
     const runs = await this.store.listRuns({ ...filter, limit: 500 });

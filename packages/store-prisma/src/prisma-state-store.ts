@@ -1,11 +1,12 @@
-import type {
-  RunQuery,
-  SignalWaiter,
-  StateStore,
-  StepCheckpoint,
-  StepError,
-  StepEvent,
-  WorkflowRun,
+import {
+  type RunQuery,
+  type SignalWaiter,
+  type StateStore,
+  type StepCheckpoint,
+  type StepError,
+  type StepEvent,
+  type WorkflowRun,
+  applyAttributeQuery,
 } from '@dudousxd/nestjs-durable-core';
 
 /* The Prisma client is generated per-schema, so the adapter can't import a concrete one. Instead
@@ -27,6 +28,7 @@ interface RunRow {
   lockedUntil: Date | null;
   recoveryAttempts: number | null;
   tags: unknown;
+  searchAttributes: unknown;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -152,11 +154,18 @@ export class PrismaStateStore implements StateStore {
     if (query.workflow) where.workflow = query.workflow;
     if (query.status) where.status = query.status;
     if (query.tag) where.tags = { array_contains: query.tag };
+    const orderBy = { createdAt: 'desc' as const }; // newest first — recent runs on top in the dashboard
+    // Typed/range attribute predicates aren't portable SQL — fetch coarse rows, filter + paginate
+    // in-process. Without attributes, the DB paginates.
+    if (query.attributes?.length) {
+      const rows = await this.db.durableWorkflowRun.findMany({ where, orderBy });
+      return applyAttributeQuery(rows.map(fromRunRow), query);
+    }
     const rows = await this.db.durableWorkflowRun.findMany({
       where,
       take: query.limit,
       skip: query.offset,
-      orderBy: { createdAt: 'desc' }, // newest first — recent runs on top in the dashboard
+      orderBy,
     });
     return rows.map(fromRunRow);
   }
@@ -210,6 +219,7 @@ function toRunData(run: WorkflowRun) {
     lockedUntil: run.lockedUntil == null ? null : new Date(run.lockedUntil),
     recoveryAttempts: run.recoveryAttempts ?? null,
     tags: jsonOrNull(run.tags),
+    searchAttributes: jsonOrNull(run.searchAttributes),
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -240,6 +250,8 @@ function fromRunRow(row: RunRow): WorkflowRun {
     lockedUntil: row.lockedUntil == null ? undefined : row.lockedUntil.getTime(),
     recoveryAttempts: row.recoveryAttempts ?? undefined,
     tags: (row.tags as string[] | null) ?? undefined,
+    searchAttributes:
+      (row.searchAttributes as Record<string, string | number | boolean> | null) ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

@@ -45,6 +45,8 @@ export interface WorkflowRun {
   recoveryAttempts?: number;
   /** Searchable labels: the workflow's static `@Workflow({ tags })` merged with the run's start-time tags. */
   tags?: string[];
+  /** Typed, queryable run data (e.g. `{ amount: 200, tier: 'pro' }`) — see {@link RunQuery.attributes}. */
+  searchAttributes?: SearchAttributes;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -183,11 +185,29 @@ export interface StateStore {
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
 }
 
+/** Typed, queryable per-run data — exact values for `eq`/`ne`, numbers/strings for range ops. */
+export type SearchAttributes = Record<string, string | number | boolean>;
+
+export type AttributeOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte';
+
+/** One predicate over a run's {@link SearchAttributes}; a {@link RunQuery} ANDs them all. */
+export interface AttributeFilter {
+  key: string;
+  op: AttributeOp;
+  value: string | number | boolean;
+}
+
 export interface RunQuery {
   workflow?: string;
   status?: RunStatus;
   /** Only runs carrying this tag (exact match against {@link WorkflowRun.tags}). */
   tag?: string;
+  /**
+   * Typed/range predicates over {@link WorkflowRun.searchAttributes}, ANDed together (e.g. `amount`
+   * >= 200 and `tier` = 'pro'). Applied in-process after the coarse filters, so pair with
+   * `workflow`/`status`/`tag` to bound the scan on large stores.
+   */
+  attributes?: AttributeFilter[];
   limit?: number;
   offset?: number;
 }

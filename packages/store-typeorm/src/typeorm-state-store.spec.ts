@@ -151,6 +151,25 @@ describe('TypeOrmStateStore', () => {
     await dataSource.destroy();
   });
 
+  it('round-trips searchAttributes and filters listRuns by typed/range queries', async () => {
+    const { store, dataSource } = await makeStore();
+    await store.createRun(run({ id: 'a', searchAttributes: { amount: 30, tier: 'free' } }));
+    await store.createRun(run({ id: 'b', searchAttributes: { amount: 200, tier: 'pro' } }));
+    await store.createRun(run({ id: 'c', searchAttributes: { amount: 500, tier: 'pro' } }));
+
+    expect((await store.getRun('b'))?.searchAttributes).toEqual({ amount: 200, tier: 'pro' });
+    const big = await store.listRuns({ attributes: [{ key: 'amount', op: 'gte', value: 200 }] });
+    expect(big.map((r) => r.id).sort()).toEqual(['b', 'c']);
+    const proSmall = await store.listRuns({
+      attributes: [
+        { key: 'tier', op: 'eq', value: 'pro' },
+        { key: 'amount', op: 'lt', value: 300 },
+      ],
+    });
+    expect(proSmall.map((r) => r.id)).toEqual(['b']);
+    await dataSource.destroy();
+  });
+
   it('upserts checkpoints and reads them by (runId, seq)', async () => {
     const { store, dataSource } = await makeStore();
     await store.createRun(run());

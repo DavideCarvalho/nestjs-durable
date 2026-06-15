@@ -10,6 +10,7 @@ import {
   Query,
   Sse,
 } from '@nestjs/common';
+import { parseAttrFilters } from './attr-filter.js';
 import { DashboardService } from './dashboard.service.js';
 
 /** JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule). */
@@ -22,8 +23,9 @@ export class DurableApiController {
     @Query('status') status?: RunStatus,
     @Query('workflow') workflow?: string,
     @Query('tag') tag?: string,
+    @Query('attr') attr?: string | string[],
   ) {
-    return this.dashboard.listRuns({ status, workflow, tag });
+    return this.dashboard.listRuns({ status, workflow, tag, attributes: parseAttrFilters(attr) });
   }
 
   /** Prometheus-text metrics (runs/steps by outcome, per-workflow counts) for a scrape. */
@@ -59,11 +61,12 @@ export class DurableApiController {
     @Query('status') status?: RunStatus,
     @Query('tag') tag?: string,
     @Query('workflow') workflow?: string,
+    @Query('attr') attr?: string | string[],
     @Query('compensate') compensate?: string,
   ) {
     return this.dashboard.bulk(
       action === 'cancel' ? 'cancel' : 'retry',
-      { status, tag, workflow },
+      { status, tag, workflow, attributes: parseAttrFilters(attr) },
       { compensate: compensate === 'true' },
     );
   }
