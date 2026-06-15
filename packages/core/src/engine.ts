@@ -420,6 +420,11 @@ export class WorkflowEngine {
     return this.track(this.execute(run, registered.fn));
   }
 
+  /** Read a run's current persisted state (or null if unknown). A thin pass-through to the store. */
+  getRun(runId: string): Promise<WorkflowRun | null> {
+    return this.store.getRun(runId);
+  }
+
   async resume(runId: string): Promise<RunResult> {
     const run = await this.store.getRun(runId);
     if (!run) throw new Error(`run ${runId} not found`);

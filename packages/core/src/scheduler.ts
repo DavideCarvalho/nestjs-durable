@@ -15,6 +15,14 @@ export interface ScheduledWorkflow {
   cron?: string;
   /** IANA timezone the `cron` fires in (e.g. `America/Sao_Paulo`). Defaults to UTC. */
   timezone?: string;
+  /** Temporarily stop firing this schedule (kept registered). Defaults to false. */
+  paused?: boolean;
+  /**
+   * What to do when the previous window's run hasn't finished yet (fixed-interval schedules only):
+   * `'allow'` (default) starts the new window anyway; `'skip'` skips it while the prior run is still
+   * `running`/`suspended`, so a slow run can't pile up overlapping executions.
+   */
+  overlap?: 'allow' | 'skip';
 }
 
 /** Deterministic run id for a fixed-interval schedule's current time window. */
@@ -64,12 +72,22 @@ function scheduleRunIdAt(s: ScheduledWorkflow, nowMs: number): string {
  * current windows.
  */
 export async function runSchedules(
-  engine: Pick<WorkflowEngine, 'start'>,
+  engine: Pick<WorkflowEngine, 'start' | 'getRun'>,
   schedules: readonly ScheduledWorkflow[],
   nowMs: number,
 ): Promise<string[]> {
   const ids: string[] = [];
   for (const s of schedules) {
+    if (s.paused) continue;
+    // overlap:'skip' (fixed-interval): don't start this window while the previous window's run is
+    // still in-flight, so a slow run can't pile up. Interval-only — cron windows aren't adjacent ids.
+    if (s.overlap === 'skip' && s.everyMs) {
+      const prevBucket = Math.floor(nowMs / s.everyMs) - 1;
+      if (prevBucket >= 0) {
+        const prev = await engine.getRun(`sched:${s.key}:${prevBucket}`);
+        if (prev && (prev.status === 'running' || prev.status === 'suspended')) continue;
+      }
+    }
     const runId = scheduleRunIdAt(s, nowMs);
     await engine.start(s.workflow, s.input, runId);
     ids.push(runId);
