@@ -31,9 +31,11 @@ describe('DashboardService', () => {
     expect((await store.getRun('f1'))?.status).toBe('failed');
     expect((await store.getRun('f2'))?.status).toBe('failed');
 
-    // Retry only the `failed` runs tagged `etl` → f1 resumes (attempt 3 succeeds), f2 untouched.
+    // Retry only the `failed` runs tagged `etl` → f1 is re-enqueued (pending), f2 untouched.
     const res = await service.bulk('retry', { status: 'failed', tag: 'etl' });
     expect(res).toEqual({ matched: 1, applied: 1 });
+    await engine.runPending(); // a worker picks up the re-enqueued run (attempt 3 succeeds)
+    await engine.waitForRun('f1');
     expect((await store.getRun('f1'))?.status).toBe('completed');
     expect((await store.getRun('f2'))?.status).toBe('failed');
   });
@@ -119,8 +121,11 @@ describe('DashboardService', () => {
     await engine.waitForRun('r1');
     expect((await service.getRunDetail('r1'))?.run.status).toBe('failed');
 
+    // retry re-enqueues (non-blocking); a worker then re-runs it to completion.
     const retried = await service.retry('r1');
-    expect(retried.status).toBe('completed');
+    expect(retried?.status).toBe('pending');
+    await engine.runPending();
+    expect((await engine.waitForRun('r1')).status).toBe('completed');
 
     engine.register('waiter', '1', async (ctx: WorkflowCtx) => ctx.waitForSignal('go'));
     await engine.start('waiter', {}, 'r2');

@@ -50,8 +50,10 @@ export class DashboardService {
   }
 
   /** Re-run a failed/incomplete run; completed steps replay from their checkpoints. */
-  retry(runId: string): Promise<RunResult> {
-    return this.engine.resume(runId);
+  retry(runId: string): Promise<RunResult | null> {
+    // Re-enqueue (dispatch model) instead of resuming inline, so the request can't hang on workflow
+    // execution — a worker picks the run up and replays it.
+    return this.engine.requeue(runId);
   }
 
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
@@ -72,7 +74,7 @@ export class DashboardService {
     let applied = 0;
     for (const r of runs) {
       try {
-        if (action === 'retry') await this.engine.resume(r.id);
+        if (action === 'retry') await this.engine.requeue(r.id);
         else await this.engine.cancel(r.id, opts);
         applied += 1;
       } catch {

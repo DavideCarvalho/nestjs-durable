@@ -178,6 +178,13 @@ export interface StateStore {
   /** Release a run's recovery lease so another instance can pick it up (e.g. once it suspends). */
   releaseRunLock(runId: string): Promise<void>;
 
+  /**
+   * Extend a run's lease to `leaseUntilMs`, but ONLY if `owner` still holds it — so a live worker
+   * heartbeating its long run keeps the lease, while a dead worker's lease still expires and gets
+   * reclaimed. Returns false if the lease was lost (taken over or released).
+   */
+  renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean>;
+
   /** Record that a run is suspended waiting for an external signal `token`. */
   putSignalWaiter(waiter: SignalWaiter): Promise<void>;
   /** Atomically take (and remove) the run waiting on `token`, if any. */

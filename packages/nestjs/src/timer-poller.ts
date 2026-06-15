@@ -43,8 +43,10 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     this.polling = true;
     try {
       // Pick up runs enqueued elsewhere (an API pod's `start`, or another worker) still `pending`,
-      // then resume due timers and sweep execution timeouts.
+      // reclaim runs orphaned by a crashed worker (lease expired — a live worker renews its lease so
+      // only dead ones are reclaimed), then resume due timers and sweep execution timeouts.
       await this.engine.runPending();
+      await this.engine.recoverIncomplete();
       await this.engine.resumeDueTimers();
       await this.engine.sweepTimeouts();
       const schedules = this.options.schedules;

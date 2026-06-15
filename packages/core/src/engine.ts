@@ -623,6 +623,22 @@ export class WorkflowEngine {
   }
 
   /**
+   * Re-enqueue a run for a worker to (re-)execute — the dispatch-model **retry**. Sets it back to
+   * `pending`, clears any stale lease, and dispatches; a worker resumes it (replaying its checkpoints,
+   * re-attempting the failed step). Returns the enqueued state immediately — never runs the body
+   * inline — or null if the run is unknown. The dashboard "retry" goes through here so it can't block
+   * the HTTP request on workflow execution.
+   */
+  async requeue(runId: string): Promise<RunResult | null> {
+    const run = await this.store.getRun(runId);
+    if (!run) return null;
+    await this.store.releaseRunLock(runId);
+    await this.store.updateRun(runId, { status: 'pending', updatedAt: new Date() });
+    await this.runDispatcher.dispatch(runId);
+    return { runId, status: 'pending' };
+  }
+
+  /**
    * Pick up and execute every `pending` run — the poll-based side of dispatch for a worker pod with
    * no broker. Runs enqueued by other pods (or by a caller using a no-op dispatcher) sit `pending`
    * in the store until polled; leasing ensures exactly one pod runs each. Call periodically alongside
@@ -799,18 +815,24 @@ export class WorkflowEngine {
   async cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
     const run = await this.store.getRun(runId);
     if (!run) return null;
-    // Compensating cancel: resume the run with a cancellation pending. Replay re-registers the
-    // saga, and at the run's suspension point execute() runs the undo and marks it cancelled.
+    // Compensating cancel: resume the run with a cancellation pending — replay re-registers the saga,
+    // and at the suspension point execute() runs the undo and marks it cancelled. Run that resume in
+    // the BACKGROUND so the caller (e.g. an HTTP request) never blocks on replaying the workflow +
+    // compensations. `execute` holds the run's lease, so this can't double-run one a live worker owns
+    // (its lease acquire fails and it no-ops); the broadcast tells that worker to abort cooperatively.
     if (opts?.compensate && (run.status === 'suspended' || run.status === 'running')) {
       this.cancelRequested.add(runId);
-      const result = await this.resume(runId);
-      this.notifyCancelled(runId);
       if (this.controlPlane) {
         void this.controlPlane
           .publishControl({ kind: 'cancel', runId, from: this.instanceId })
           .catch(() => undefined);
       }
-      return result;
+      queueMicrotask(() => {
+        void this.resume(runId)
+          .then(() => this.notifyCancelled(runId))
+          .catch(() => undefined);
+      });
+      return { runId, status: run.status };
     }
     const error = { message: 'cancelled' };
     await this.store.updateRun(runId, { status: 'cancelled', error, updatedAt: new Date() });
@@ -904,6 +926,41 @@ export class WorkflowEngine {
 
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
     const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
+    // Hold the lease for the WHOLE execution — whatever path got us here (leased sweep, a signal, a
+    // remote result, a dashboard action). The leased sweeps already own it; the event-driven paths
+    // don't, so acquire it here. If another instance owns it, don't double-run. While we run, renew
+    // the lease periodically so a long run keeps it (a crashed worker's lease still expires and is
+    // reclaimed by periodic recovery).
+    const lockNow = this.clock();
+    if (run.lockedBy !== this.instanceId || (run.lockedUntil ?? 0) <= lockNow) {
+      if (
+        !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
+      ) {
+        return { runId: run.id, status: run.status };
+      }
+    }
+    const renew = setInterval(
+      () => {
+        void this.store
+          .renewRunLock(run.id, this.instanceId, this.clock() + this.leaseMs)
+          .catch(() => undefined);
+      },
+      Math.max(50, Math.floor(this.leaseMs / 2)),
+    );
+    renew.unref?.();
+    try {
+      return await this.runExecution(run, fn, registered);
+    } finally {
+      clearInterval(renew);
+    }
+  }
+
+  /** The run body, lease held + renewed by {@link execute}. */
+  private async runExecution(
+    run: WorkflowRun,
+    fn: WorkflowFn,
+    registered: RegisteredWorkflow | undefined,
+  ): Promise<RunResult> {
     // First execution of an enqueued run: mark it running and announce the start, BEFORE the singleton
     // gate — `admitSingleton` only counts `running`/`suspended` runs, so a still-`pending` run could
     // never be admitted. A resumed run is already past `pending`, so this fires exactly once.

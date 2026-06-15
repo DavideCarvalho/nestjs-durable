@@ -158,6 +158,14 @@ export class PrismaStateStore implements StateStore {
     });
   }
 
+  async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
+    const result = await this.db.durableWorkflowRun.updateMany({
+      where: { id: runId, lockedBy: owner },
+      data: { lockedUntil: new Date(leaseUntilMs) },
+    });
+    return result.count === 1;
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;

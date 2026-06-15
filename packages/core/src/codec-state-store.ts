@@ -83,6 +83,9 @@ export class CodecStateStore implements StateStore {
   releaseRunLock(runId: string): Promise<void> {
     return this.inner.releaseRunLock(runId);
   }
+  renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
+    return this.inner.renewRunLock(runId, owner, leaseUntilMs);
+  }
   putSignalWaiter(waiter: SignalWaiter): Promise<void> {
     return this.inner.putSignalWaiter(waiter);
   }
