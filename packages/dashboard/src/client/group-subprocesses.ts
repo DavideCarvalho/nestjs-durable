@@ -61,14 +61,21 @@ export function groupSubProcesses(events: StepEvent[]): {
   }
 
   const subs = [...byId.values()].map((sub) => {
-    const stamps = [...sub.phases, ...sub.logs, ...(sub.terminal ? [sub.terminal] : [])].map(
-      (e) => e.at,
-    );
-    const startedAt = stamps.length ? Math.min(...stamps) : undefined;
+    const nonTerminal = [...sub.phases, ...sub.logs];
+    const stamps = [...nonTerminal, ...(sub.terminal ? [sub.terminal] : [])].map((e) => e.at);
+    // reduce, not Math.min(...spread): a noisy sub can have tens of thousands of log events,
+    // which would overflow the call-stack argument limit.
+    const startedAt = stamps.length
+      ? stamps.reduce((a, b) => (b < a ? b : a), Number.POSITIVE_INFINITY)
+      : undefined;
     const fromData = durationFromData(sub.terminal?.data);
+    // Duration is known only when there's a non-terminal stamp to measure from; a terminal-only
+    // sub (e.g. legacy `sub(name, status)` with no phases/logs) has an UNKNOWN duration, not 0.
     const durationMs =
       fromData ??
-      (sub.terminal && startedAt !== undefined ? sub.terminal.at - startedAt : undefined);
+      (sub.terminal && startedAt !== undefined && nonTerminal.length > 0
+        ? sub.terminal.at - startedAt
+        : undefined);
     return { ...sub, startedAt, durationMs };
   });
 

@@ -54,7 +54,8 @@ function LogLine({ e }: { e: StepEvent }) {
 /** One sub-process: a clickable row (name · duration · status) that expands to its phase timeline,
  *  error, and owned log lines. Mirrors flip's per-process expand in `pipeline-runs`. */
 function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?: boolean }) {
-  const expandable = sub.phases.length > 0 || sub.logs.length > 0 || sub.status === 'failed';
+  const hasMessage = sub.terminal?.message !== undefined && sub.terminal.message !== sub.name;
+  const expandable = sub.phases.length > 0 || sub.logs.length > 0 || hasMessage;
   const [open, setOpen] = useState(sub.status === 'failed'); // surface failures without a click
   const tone = sub.status
     ? SUB_TONE[sub.status]
@@ -107,15 +108,21 @@ function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?:
               ))}
             </ul>
           )}
-          {sub.status === 'failed' && sub.terminal?.message && (
-            <div className="mono mb-2 rounded border border-red-500/25 bg-red-500/10 p-2 text-[11px] text-red-200">
+          {sub.terminal?.message && sub.terminal.message !== sub.name && (
+            <div
+              className={`mono mb-2 rounded border p-2 text-[11px] ${
+                sub.status === 'failed'
+                  ? 'border-red-500/25 bg-red-500/10 text-red-200'
+                  : 'border-[var(--line)] bg-black/20 text-zinc-300'
+              }`}
+            >
               {sub.terminal.message}
             </div>
           )}
           {sub.logs.length > 0 && (
             <div className="mono flex flex-col gap-0.5 text-[11px]">
-              {sub.logs.map((e) => (
-                <LogLine key={`${e.at}-${e.message}`} e={e} />
+              {sub.logs.map((e, i) => (
+                <LogLine key={`${e.at}-${i}`} e={e} />
               ))}
             </div>
           )}
@@ -159,7 +166,7 @@ function StepEvents({ events }: { events: StepEvent[] }) {
                 return acc;
               }, {}),
             )
-              .sort(([a], [b]) => (a === '—' ? 1 : b === '—' ? -1 : 0))
+              .sort(([a], [b]) => (a === '—' ? 1 : b === '—' ? -1 : a.localeCompare(b)))
               .map(([group, groupSubs]) => (
                 <div key={group} className="mb-2">
                   <div className="mono mb-1 text-[10px] uppercase tracking-wider text-zinc-500">
@@ -188,8 +195,8 @@ function StepEvents({ events }: { events: StepEvent[] }) {
             logs · {stepLogs.length}
           </div>
           <div className="mono max-h-64 overflow-auto rounded-lg border border-[var(--line)] bg-black/40 p-2.5 text-[11px] leading-relaxed">
-            {stepLogs.map((e) => (
-              <LogLine key={`${e.at}-${e.message}`} e={e} />
+            {stepLogs.map((e, i) => (
+              <LogLine key={`${e.at}-${i}`} e={e} />
             ))}
           </div>
         </section>

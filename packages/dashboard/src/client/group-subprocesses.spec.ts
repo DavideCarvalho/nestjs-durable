@@ -15,6 +15,7 @@ describe('groupSubProcesses', () => {
     expect(subs).toHaveLength(1);
     expect(subs[0]).toMatchObject({ id: 'ProcessKpi', name: 'ProcessKpi', status: 'ok' });
     expect(subs[0]?.phases).toEqual([]);
+    expect(subs[0]?.durationMs).toBeUndefined();
   });
 
   it('distinct subIds with the same name do NOT collapse', () => {
