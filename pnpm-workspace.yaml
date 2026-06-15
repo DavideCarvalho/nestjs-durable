@@ -12,3 +12,5 @@ allowBuilds:
   msgpackr-extract: false
   prisma: true
   sharp: true
+minimumReleaseAgeExclude:
+  - '@dudousxd/nestjs-telescope@1.8.0'
