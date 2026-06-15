@@ -67,6 +67,29 @@ export interface RunDetail {
   children?: string[];
 }
 
+/** A run's status as shown to a human. The engine stores one generic `suspended` for any durably
+ *  parked run, but WHY it's parked reads very differently, so we refine it for display only. */
+export type RunDisplayStatus = RunStatus | 'sleeping' | 'awaiting';
+
+/**
+ * Refine a run's stored status for display. The engine keeps `suspended` for every durably-parked
+ * run (it's what drives recovery/timers/queries — we never change that), but to a human a run whose
+ * remote step is being executed by a worker right now is `running`, a durable sleep is `sleeping`,
+ * and a wait on a signal is `awaiting`. Pass `timeline` (the detail view has it) for full precision;
+ * without it (the run list) a non-timer suspend reads as `running` — open and in progress — rather
+ * than the catch-all `suspended`.
+ */
+export function runDisplayStatus(
+  run: WorkflowRun,
+  timeline?: StepCheckpoint[],
+): RunDisplayStatus {
+  if (run.status !== 'suspended') return run.status;
+  if (timeline?.some((s) => s.status === 'pending')) return 'running'; // a remote step is in flight
+  if (run.wakeAt != null) return 'sleeping'; // parked on a durable timer
+  if (timeline) return 'awaiting'; // timeline known, nothing pending, no timer → waiting on a signal
+  return 'running'; // list view (no timeline): show open runs as in-progress, not the generic suspended
+}
+
 export interface EngineEvent {
   type:
     | 'run.started'

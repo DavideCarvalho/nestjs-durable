@@ -10,7 +10,12 @@ import {
   ReactFlow,
 } from '@xyflow/react';
 import { useCallback, useMemo } from 'react';
-import type { RunStatus, StepCheckpoint, WorkflowRun } from '../client/durable-client';
+import {
+  type RunDisplayStatus,
+  type StepCheckpoint,
+  type WorkflowRun,
+  runDisplayStatus,
+} from '../client/durable-client';
 import { childRunIdOf } from './child-link';
 import { BoltIcon, CheckIcon, ChildIcon, KIND_LABEL, XIcon, iconFor } from './icons';
 
@@ -28,7 +33,7 @@ type StepData = {
   /** When this step ran a child workflow, the child's run id — clicking the node opens it. */
   childRunId?: string;
 };
-type EndData = { status: RunStatus; label: string };
+type EndData = { status: RunDisplayStatus; label: string };
 
 function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   const failed = data.status === 'failed';
@@ -130,7 +135,9 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
 }
 
 function TerminalNode({ data }: NodeProps<Node<EndData>>) {
-  const live = data.status === 'running' || data.status === 'suspended';
+  // Open (non-terminal) states pulse. `suspended` no longer reaches here — runDisplayStatus refines
+  // it to running / awaiting (both open → pulse) or sleeping (parked on a timer → static).
+  const live = data.status === 'running' || data.status === 'awaiting';
   return (
     <div
       className={`s-${data.status} flex items-center gap-2 rounded-full border border-current/30 bg-[var(--panel)] px-3.5 py-1.5`}
@@ -206,7 +213,10 @@ export function WorkflowGraph({
       type: 'terminal',
       position: { x: (timeline.length + 1) * gapX, y },
       draggable: false,
-      data: { status: run.status, label: run.status } satisfies EndData,
+      data: (() => {
+        const shown = runDisplayStatus(run, timeline);
+        return { status: shown, label: shown } satisfies EndData;
+      })(),
     };
 
     const ordered = [startNode, ...stepNodes, endNode];

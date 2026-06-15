@@ -2,10 +2,12 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 import {
   type RunDetail,
+  type RunDisplayStatus,
   type RunStatus,
   type StepCheckpoint,
   type WorkflowRun,
   durableClient,
+  runDisplayStatus,
 } from '../client/durable-client';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
@@ -41,12 +43,12 @@ function durMs(a: string, b: string): string {
   return `${(ms / 60_000).toFixed(1)}m`;
 }
 
-function StatusDot({ status }: { status: RunStatus | StepCheckpoint['status'] }) {
-  const live = status === 'running';
+function StatusDot({ status }: { status: RunDisplayStatus | StepCheckpoint['status'] }) {
+  const live = status === 'running' || status === 'awaiting';
   return <span className={`dot s-${status} ${live ? 'pulse' : ''}`} aria-hidden />;
 }
 
-function Badge({ status }: { status: RunStatus | StepCheckpoint['status'] }) {
+function Badge({ status }: { status: RunDisplayStatus | StepCheckpoint['status'] }) {
   return (
     <span
       className={`s-${status} inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider`}
@@ -144,7 +146,7 @@ function RunsList({
                   </span>
                 )}
               </span>
-              <Badge status={r.status} />
+              <Badge status={runDisplayStatus(r)} />
             </div>
             <div className="flex items-center justify-between gap-2">
               <span className="mono truncate text-[11px] text-zinc-600">{r.id}</span>
@@ -299,7 +301,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
                 dlq
               </span>
             )}
-            <Badge status={run.status} />
+            <Badge status={runDisplayStatus(run, timeline)} />
             <span className="mono rounded border border-[var(--line)] px-1.5 py-0.5 text-[10px] text-zinc-500">
               v{run.workflowVersion}
             </span>

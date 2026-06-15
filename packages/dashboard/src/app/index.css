@@ -62,6 +62,16 @@ body {
 .s-suspended {
   color: #fbbf24;
 }
+/* Display-only refinements of `suspended` (see runDisplayStatus): a run actively running a remote
+   step renders as `s-running`; these cover the genuinely-parked reasons. */
+.s-sleeping {
+  /* Parked on a durable timer — a calm indigo, distinct from the active blue of `running`. */
+  color: #818cf8;
+}
+.s-awaiting {
+  /* Waiting on an external signal — amber, like the suspended state it refines. */
+  color: #fbbf24;
+}
 .s-completed {
   color: #34d399;
 }
