@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-store-prisma",
-  "version": "1.0.0",
+  "version": "0.4.0",
   "description": "Prisma adapter for the nestjs-durable StateStore",
   "license": "MIT",
   "author": "Davide Carvalho",
@@ -22,7 +22,7 @@
     "prisma:generate": "prisma generate --schema prisma/test.prisma"
   },
   "peerDependencies": {
-    "@dudousxd/nestjs-durable-core": ">=1.0.0",
+    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
     "@prisma/client": "^5.0.0 || ^6.0.0 || ^7.0.0"
   },
   "devDependencies": {
