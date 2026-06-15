@@ -28,8 +28,8 @@ import type {
   StepError,
   StepEvent,
   StepInterceptor,
-  StepKind,
   StepInvocation,
+  StepKind,
   StepResult,
   Transport,
   UpdateResult,
@@ -1311,10 +1311,26 @@ export class WorkflowEngine {
     const events: HistoryEvent[] = [];
     for (const cp of checkpoints) {
       if (cp.status === 'completed' || cp.status === 'failed') {
+        // A child run resolves THROUGH the signal machinery (a `child:<id>` waiter notified on the
+        // child's terminal state), so its checkpoint is kind `signal` with a `signal:child:` name and
+        // a Completion payload. Surface it as a `child` event with the value/error unwrapped.
+        if (cp.kind === 'signal' && cp.name.startsWith('signal:child:')) {
+          const completion = cp.output as Completion<unknown> | undefined;
+          events.push({
+            seq: cp.seq,
+            kind: 'child',
+            output: completion?.ok ? completion.value : undefined,
+            error:
+              completion && completion.ok === false ? { message: completion.error } : undefined,
+          });
+          continue;
+        }
         events.push({
           seq: cp.seq,
           kind: kindOf[cp.kind] ?? 'step',
-          name: cp.name,
+          // A signal checkpoint's name is the internal `signal:<token>`, not the workflow-level signal
+          // name the replay used — omit it so the replay matches on seq + kind (its determinism anchor).
+          name: cp.kind === 'signal' ? undefined : cp.name,
           output: cp.status === 'completed' ? cp.output : undefined,
           error: cp.status === 'failed' ? cp.error : undefined,
         });
@@ -1328,7 +1344,10 @@ export class WorkflowEngine {
 
   /** Apply a turn's commands: persist recorded local steps, dispatch remote calls, schedule timers.
    *  Returns the earliest timer deadline to suspend on (or undefined — suspended on a result). */
-  private async applyCommands(run: WorkflowRun, commands: WorkflowCommand[]): Promise<number | undefined> {
+  private async applyCommands(
+    run: WorkflowRun,
+    commands: WorkflowCommand[],
+  ): Promise<number | undefined> {
     let wakeAt: number | undefined;
     for (const cmd of commands) {
       const at = new Date();
@@ -1385,7 +1404,13 @@ export class WorkflowEngine {
           },
           undefined,
         );
-        this.emit({ type: 'step.started', runId: run.id, seq: cmd.seq, name: cmd.name, kind: 'remote' });
+        this.emit({
+          type: 'step.started',
+          runId: run.id,
+          seq: cmd.seq,
+          name: cmd.name,
+          kind: 'remote',
+        });
       } else if (cmd.kind === 'sleep') {
         const deadline = this.clock() + cmd.ms;
         await this.store.saveCheckpoint({
@@ -1402,10 +1427,48 @@ export class WorkflowEngine {
           finishedAt: at,
         });
         wakeAt = wakeAt == null ? deadline : Math.min(wakeAt, deadline);
+      } else if (cmd.kind === 'waitSignal') {
+        // Park on a signal: register a waiter at this seq so engine.signal(token) lands the resolving
+        // `signal` checkpoint here and resumes the run. The token is the signal name, so an external
+        // engine.signal(name, payload) delivers it. If the signal was already delivered (buffered
+        // before the workflow reached this point — e.g. signalWithStart), resolve it now and re-drive
+        // on a macrotask, AFTER this turn suspends and frees the run lock (a re-entrant resume bails).
+        const buffered = await this.store.takeBufferedSignal(cmd.signal);
+        if (buffered) {
+          await this.store.saveCheckpoint(
+            instantCheckpoint({
+              runId: run.id,
+              seq: cmd.seq,
+              name: `signal:${cmd.signal}`,
+              kind: 'signal',
+              output: buffered.payload,
+            }),
+          );
+          setTimeout(() => void this.resume(run.id).catch(() => undefined), 0);
+        } else {
+          await this.store.putSignalWaiter({ token: cmd.signal, runId: run.id, seq: cmd.seq });
+        }
+      } else if (cmd.kind === 'startChild') {
+        // Start a child run and await it (the worker's ctx.start_child suspends until the child's
+        // result is in history). Mirror the in-process `ctx.child`: register a `child:<id>` waiter at
+        // this seq — the child notifies it on its terminal state (engine.notifyParent) — then start the
+        // child once, deferred so a fast child can't reentrantly resume this still-suspending parent,
+        // and id-idempotent so replay/recovery never double-starts it.
+        const childId = `${run.id}.child.${cmd.seq}`;
+        await this.store.putSignalWaiter({
+          token: `child:${childId}`,
+          runId: run.id,
+          seq: cmd.seq,
+        });
+        if (!(await this.store.getRun(childId))) {
+          queueMicrotask(
+            () => void this.start(cmd.workflow, cmd.input, childId).catch(() => undefined),
+          );
+        }
       } else {
-        // waitSignal / startChild need the engine's signal/child resolution wired into the remote
-        // path — a follow-up. Fail loudly rather than hang so the gap is obvious.
-        throw new Error(`remote workflow command '${cmd.kind}' is not supported yet`);
+        throw new Error(
+          `remote workflow command '${(cmd as { kind: string }).kind}' is not supported yet`,
+        );
       }
     }
     return wakeAt;

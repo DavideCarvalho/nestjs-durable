@@ -47,6 +47,50 @@ function pipelineExecutor(opts: { withSleep?: boolean } = {}): WorkflowExecutor 
   };
 }
 
+/** Stand-in for a Python workflow that waits on a signal: `ctx.wait_signal("approval")` then returns. */
+function approvalExecutor(): WorkflowExecutor {
+  return {
+    async advance(run: WorkflowRun, history: HistoryEvent[]): Promise<WorkflowDecision> {
+      const bySeq = new Map(history.map((e) => [e.seq, e]));
+      const base = { taskId: 'task', runId: run.id } as const;
+      if (!bySeq.has(0)) {
+        return {
+          ...base,
+          status: 'continue',
+          commands: [{ kind: 'waitSignal', seq: 0, signal: 'approval' }],
+        };
+      }
+      return {
+        ...base,
+        status: 'completed',
+        commands: [],
+        output: { approved: bySeq.get(0)?.output },
+      };
+    },
+  };
+}
+
+/** Stand-in for a Python workflow that starts a child and awaits it: `ctx.start_child("child", 21)`. */
+function parentExecutor(): WorkflowExecutor {
+  return {
+    async advance(run: WorkflowRun, history: HistoryEvent[]): Promise<WorkflowDecision> {
+      const bySeq = new Map(history.map((e) => [e.seq, e]));
+      const base = { taskId: 'task', runId: run.id } as const;
+      if (!bySeq.has(0)) {
+        return {
+          ...base,
+          status: 'continue',
+          commands: [{ kind: 'startChild', seq: 0, workflow: 'child', input: 21 }],
+        };
+      }
+      const ev = bySeq.get(0);
+      if (ev?.error)
+        return { ...base, status: 'completed', commands: [], output: { caught: ev.error.message } };
+      return { ...base, status: 'completed', commands: [], output: { fromChild: ev?.output } };
+    },
+  };
+}
+
 describe('WorkflowEngine — remote (polyglot) workflows', () => {
   it('drives a remote workflow end-to-end: local step + remote call → completed', async () => {
     const store = new InMemoryStateStore();
@@ -128,5 +172,75 @@ describe('WorkflowEngine — remote (polyglot) workflows', () => {
     const run = await settle(store, 'run3');
     expect(run.status).toBe('failed');
     expect(run.error?.message).toBe('workflow blew up');
+  });
+
+  it('suspends a remote workflow on ctx.wait_signal and resumes it when the signal arrives', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
+    engine.registerRemote('approval', '1', { group: 'py-workflows', executor: approvalExecutor() });
+
+    const started = await startRun(engine, 'approval', {}, 'sig1');
+    expect(started.status).toBe('suspended'); // parked on the signal waiter, nothing resolved yet
+    expect((await store.listCheckpoints('sig1')).find((c) => c.seq === 0)).toBeUndefined();
+
+    // an external signal (engine.signal uses the signal NAME as the token) resolves the wait.
+    await engine.signal('approval', { by: 'davi' });
+    const run = await settle(store, 'sig1');
+    expect(run.status).toBe('completed');
+    expect(run.output).toEqual({ approved: { by: 'davi' } });
+  });
+
+  it('starts a child run from a remote workflow and resumes the parent with the child output', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
+    engine.registerRemote('child', '1', {
+      group: 'py-workflows',
+      executor: {
+        async advance(run: WorkflowRun): Promise<WorkflowDecision> {
+          return {
+            taskId: 't',
+            runId: run.id,
+            status: 'completed',
+            commands: [],
+            output: { doubled: (run.input as number) * 2 },
+          };
+        },
+      },
+    });
+    engine.registerRemote('parent', '1', { group: 'py-workflows', executor: parentExecutor() });
+
+    await startRun(engine, 'parent', {}, 'par1');
+    const run = await settle(store, 'par1');
+    expect(run.status).toBe('completed');
+    expect(run.output).toEqual({ fromChild: { doubled: 42 } });
+
+    // the child ran as its own run under the deterministic id `${parent}.child.${seq}`.
+    const child = await store.getRun('par1.child.0');
+    expect(child?.status).toBe('completed');
+  });
+
+  it('propagates a failed child to the parent as a catchable error', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
+    engine.registerRemote('child', '1', {
+      group: 'py-workflows',
+      executor: {
+        async advance(run: WorkflowRun): Promise<WorkflowDecision> {
+          return {
+            taskId: 't',
+            runId: run.id,
+            status: 'failed',
+            commands: [],
+            error: { message: 'child boom' },
+          };
+        },
+      },
+    });
+    engine.registerRemote('parent', '1', { group: 'py-workflows', executor: parentExecutor() });
+
+    await startRun(engine, 'parent', {}, 'par2');
+    const run = await settle(store, 'par2');
+    expect(run.status).toBe('completed');
+    expect(run.output).toEqual({ caught: 'child boom' }); // the child error surfaced in replay history
   });
 });
