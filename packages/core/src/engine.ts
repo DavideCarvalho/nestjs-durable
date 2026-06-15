@@ -2,6 +2,7 @@ import { backoffDelay } from './backoff';
 import { instantCheckpoint } from './checkpoints';
 import { type Completion } from './completion';
 import { parseDuration } from './duration';
+import { Entities, type EntityConfig } from './entities';
 import {
   ContinueAsNew,
   FatalError,
@@ -10,6 +11,7 @@ import {
   SignalTimeoutError,
   WorkflowSuspended,
 } from './errors';
+import { EventAccumulators, type EventBatchConfig } from './event-accumulators';
 import { eventMatchOf, eventMatches, eventPrefix } from './events';
 import type {
   ControlPlane,
@@ -108,22 +110,6 @@ interface RegisteredWorkflow {
   onEvent?: string[];
   /** Coalesce `onEvent` triggers: debounce (fire once it's quiet) or batch (fire on size/window). */
   eventBatch?: EventBatchConfig;
-}
-
-/** How `onEvent` triggers are coalesced into fewer runs (see `@Workflow({ debounce | batch })`). */
-export type EventBatchConfig =
-  | { mode: 'debounce'; windowMs: number }
-  | { mode: 'batch'; maxSize: number; windowMs: number };
-
-/** One operation on a durable entity: mutate `state` in place and/or return a result. */
-export type EntityHandler<S = unknown> = (state: S, arg: unknown) => unknown | Promise<unknown>;
-
-/** A durable keyed entity (a virtual object): per-key serialized handlers over durable state. */
-export interface EntityConfig<S = unknown> {
-  /** Build the initial state for a fresh key. */
-  initialState: () => S;
-  /** Operation handlers, keyed by op name. Each runs serially per key, exactly once. */
-  handlers: Record<string, EntityHandler<S>>;
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
@@ -234,8 +220,10 @@ export class WorkflowEngine {
   private readonly latest = new Map<string, RegisteredWorkflow>();
   /** Event name → workflow names started when that event is published (see `onEvent`). */
   private readonly eventTriggers = new Map<string, Set<string>>();
-  /** Registered durable entities, keyed by entity name (see `registerEntity`). */
-  private readonly entities = new Map<string, EntityConfig>();
+  /** Durable-entity subsystem (registers the `__entity` runner; see `registerEntity`). */
+  private readonly entities: Entities;
+  /** Event debounce/batch accumulators (register the `__evt_*` runners; see `accumulators.route`). */
+  private readonly accumulators: EventAccumulators;
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
   /** Per-step "reset the liveness timer" callbacks, called when a heartbeat arrives. */
@@ -328,138 +316,27 @@ export class WorkflowEngine {
         }
       }
     });
-    this.registerEventAccumulators();
-    this.registerEntityRunner();
-  }
-
-  /**
-   * Built-in workflows that coalesce `onEvent` triggers (see `@Workflow({ debounce | batch })`). Each
-   * is a long-lived per-target accumulator fed by `signalWithStart`; it collects payloads then starts
-   * the target once, and `continueAsNew`s to re-arm for the next burst. Signal buffering keeps the
-   * re-arm race-free (an event arriving between firing and re-parking is buffered, not lost).
-   */
-  private registerEventAccumulators(): void {
-    const tokenFor = (target: string): string => `__evtacc__:${target}`;
-    this.register('__evt_debounce', '1', async (ctx, input) => {
-      const { target, windowMs } = input as { target: string; windowMs: number };
-      const token = tokenFor(target);
-      let last = await ctx.waitForSignal(token); // park for the first event of a burst
-      for (;;) {
-        try {
-          last = await ctx.waitForSignal(token, { timeoutMs: windowMs }); // extend on each event
-        } catch (e) {
-          if (e instanceof SignalTimeoutError) break; // quiet for `windowMs` → fire
-          throw e; // WorkflowSuspended / ContinueAsNew etc. must propagate
-        }
-      }
-      await ctx.startChild(target, last);
-      return ctx.continueAsNew(input); // re-arm
-    });
-    this.register('__evt_batch', '1', async (ctx, input) => {
-      const { target, maxSize, windowMs } = input as {
-        target: string;
-        maxSize: number;
-        windowMs: number;
-      };
-      const token = tokenFor(target);
-      const events: unknown[] = [await ctx.waitForSignal(token)]; // park for the first
-      const deadline = (await ctx.now()) + windowMs;
-      while (events.length < maxSize) {
-        const remaining = deadline - (await ctx.now());
-        if (remaining <= 0) break;
-        try {
-          events.push(await ctx.waitForSignal(token, { timeoutMs: remaining }));
-        } catch (e) {
-          if (e instanceof SignalTimeoutError) break; // window elapsed → fire what we have
-          throw e; // WorkflowSuspended / ContinueAsNew etc. must propagate
-        }
-      }
-      await ctx.startChild(target, { events });
-      return ctx.continueAsNew(input); // re-arm
-    });
+    this.accumulators = new EventAccumulators(this);
+    this.entities = new Entities(this);
   }
 
   /**
    * Register a **durable entity** (a virtual object): a keyed actor whose `handlers` run **serialized
    * per key** over **durable state**, exactly once. Drive it with `signalEntity` (fire) /
-   * `ctx.callEntity` (call + await result) and read its state with `getEntityState`. Each key is one
-   * long-lived run (`entity:<name>:<key>`) that processes ops in order.
+   * `ctx.callEntity` (call + await result) and read its state with `getEntityState`. See {@link Entities}.
    */
   registerEntity<S>(name: string, config: EntityConfig<S>): void {
-    this.entities.set(name, config as EntityConfig);
+    this.entities.register(name, config);
   }
 
   /** Send an operation to an entity (fire-and-forget). Ordered + exactly-once per key. */
-  async signalEntity(name: string, key: string, op: string, arg?: unknown): Promise<void> {
-    await this.dispatchEntityOp(name, key, op, arg);
+  signalEntity(name: string, key: string, op: string, arg?: unknown): Promise<void> {
+    return this.entities.signal(name, key, op, arg);
   }
 
   /** Read an entity's current durable state (published after each op), or undefined if it has none yet. */
   getEntityState<S = unknown>(name: string, key: string): Promise<S | undefined> {
-    return this.getEvent<S>(`entity:${name}:${key}`, 'state');
-  }
-
-  /** Deliver an op to an entity's runner, starting it on first contact. `reply` (a signal token) gets
-   *  the handler's result, for `ctx.callEntity`. */
-  private dispatchEntityOp(
-    name: string,
-    key: string,
-    op: string,
-    arg: unknown,
-    reply?: string,
-  ): Promise<{ runId: string }> {
-    const runId = `entity:${name}:${key}`;
-    return this.signalWithStart('__entity', { name, key }, runId, {
-      token: runId,
-      payload: { op, arg, reply },
-    });
-  }
-
-  /** The built-in entity runner: one long-lived run per key that processes ops serially over state. */
-  private registerEntityRunner(): void {
-    this.register('__entity', '1', async (ctx, input) => {
-      const { name, key } = input as { name: string; key: string };
-      const config = this.entities.get(name);
-      if (!config) throw new FatalError(`entity "${name}" is not registered`);
-      const token = `entity:${name}:${key}`;
-      let state = config.initialState();
-      for (let i = 0; ; i += 1) {
-        const msg = (await ctx.waitForSignal(token)) as {
-          op: string;
-          arg: unknown;
-          reply?: string;
-        };
-        // Run the handler and snapshot the (possibly mutated) state in ONE checkpoint, so replay
-        // restores the state from the checkpoint instead of re-running the handler.
-        const out = await ctx.step(`op:${i}`, async () => {
-          const handler = config.handlers[msg.op];
-          if (!handler) throw new FatalError(`entity "${name}" has no handler for op "${msg.op}"`);
-          const result = await handler(state, msg.arg);
-          return { result, state };
-        });
-        state = out.state; // carry state forward (and restore it from the checkpoint on replay)
-        await ctx.setEvent('state', state); // publish for getEntityState
-        if (msg.reply) {
-          await ctx.step(`reply:${i}`, async () => {
-            await this.signal((msg as { reply: string }).reply, out.result);
-          });
-        }
-      }
-    });
-  }
-
-  /** Route an `onEvent` payload into its target's debounce/batch accumulator. */
-  private routeBatchedEvent(
-    target: string,
-    batch: EventBatchConfig,
-    payload: unknown,
-  ): Promise<{ runId: string }> {
-    const accId = `__evtacc__:${target}`;
-    const [accWorkflow, input] =
-      batch.mode === 'debounce'
-        ? (['__evt_debounce', { target, windowMs: batch.windowMs }] as const)
-        : (['__evt_batch', { target, maxSize: batch.maxSize, windowMs: batch.windowMs }] as const);
-    return this.signalWithStart(accWorkflow, input, accId, { token: accId, payload });
+    return this.entities.getState<S>(name, key);
   }
 
   /**
@@ -989,7 +866,7 @@ export class WorkflowEngine {
           if (batch) {
             // Coalesce: route the event into a per-workflow accumulator (one long-lived run that
             // debounces/batches and then starts the target with the collected payload(s)).
-            await this.routeBatchedEvent(workflow, batch, payload);
+            await this.accumulators.route(workflow, batch, payload);
           } else {
             await this.start(workflow, payload, `evt:${eventId}:${workflow}`);
           }
@@ -1130,6 +1007,17 @@ export class WorkflowEngine {
     parentRunId: string,
     opts?: { compensate?: boolean },
   ): Promise<void> {
+    for (const id of await this.getRunChildren(parentRunId)) {
+      await this.cancel(id, opts).catch(() => undefined);
+    }
+  }
+
+  /**
+   * The ids of the runs a run spawned — both awaited (`ctx.child`, found via its live `child:<id>`
+   * waiter) and fire-and-forget (`ctx.startChild`, found via its `spawn:<id>` checkpoint). The
+   * canonical parent→children edge, used for both cancellation cascades and the dashboard run-tree.
+   */
+  async getRunChildren(parentRunId: string): Promise<string[]> {
     const childIds = new Set<string>();
     for (const w of await this.store.listSignalWaiters('child:')) {
       if (w.runId === parentRunId) childIds.add(w.token.slice('child:'.length));
@@ -1137,7 +1025,7 @@ export class WorkflowEngine {
     for (const cp of await this.store.listCheckpoints(parentRunId)) {
       if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') childIds.add(cp.output);
     }
-    for (const id of childIds) await this.cancel(id, opts).catch(() => undefined);
+    return [...childIds];
   }
 
   /** Checkpoint a finished step and announce it — the two things that must always happen together. */
@@ -1405,7 +1293,7 @@ export class WorkflowEngine {
       },
       signalEntity: (name, key, op, arg, reply) => {
         queueMicrotask(
-          () => void this.dispatchEntityOp(name, key, op, arg, reply).catch(() => undefined),
+          () => void this.entities.dispatch(name, key, op, arg, reply).catch(() => undefined),
         );
       },
       interceptStep: (invocation, body) => this.interceptStep(invocation, body),
