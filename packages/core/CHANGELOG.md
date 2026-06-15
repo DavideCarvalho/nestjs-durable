@@ -1,5 +1,20 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.20.0
+
+### Minor Changes
+
+- dcc97fd: Make in-flight local steps visible. A local `ctx.step` now announces its body has started — emitting a `step.started` lifecycle event and (by default) persisting a `running` checkpoint — so a long-running step shows up in the dashboard the moment it begins, not only once it completes. Previously a local step was checkpointed only on completion, so an in-progress step was invisible.
+
+  - New checkpoint status `'running'` for a local step whose body is executing in-process. It's a placeholder overwritten by `completed`/`failed`, and never short-circuits replay (only `completed` does), so a crash mid-body simply re-runs the step.
+  - New engine option `trackStepStart` (default `true`). The `step.started` event always fires (the live SSE view sees the start regardless); the flag gates only the extra `running` checkpoint write. Set it to `false` on hot paths with many short local steps to halve their checkpoint writes — at the cost of reload-survivable in-flight visibility.
+
+- 63b0d09: Extensible sub-process model: `StepEvent` gains optional `subId` (run identity), `group`, and `phase`
+  fields, and `StepLogger` gains `subEvent()` for emitting per-sub-process phase transitions and a
+  terminal outcome. The dashboard renders each sub-process as an expandable lifecycle row (phases,
+  duration, status, error, owned logs) grouped by run identity. The existing `sub(name, status)` is
+  unchanged.
+
 ## 0.19.0
 
 ### Minor Changes
