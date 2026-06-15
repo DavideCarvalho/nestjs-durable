@@ -24,3 +24,50 @@ The watcher resolves the engine from the (global) durable providers and records 
 lifecycle event (`run.started`, `step.completed`, `run.completed`, `run.failed`, …), tagged
 `workflow:<name>`, `run:<id>`, `kind:<step-kind>`, and `failed` on failures — so you can filter
 and group durable activity in the Telescope UI.
+
+## Workflows dashboard
+
+The watcher gives you per-event entries; the **extension** adds a dedicated health view on top of
+them. `durableTelescopeExtension()` registers a `durable` entry type — labeled **Workflows** in the
+nav — and a `durable.workflows` dashboard, so durable flows get their own at-a-glance page inside
+Telescope instead of only living in the entry stream. Register it under `extensions` (this requires
+a [`@dudousxd/nestjs-telescope`](https://github.com/DavideCarvalho/nestjs-telescope) version that
+supports the `extensions` option):
+
+```ts
+import { TelescopeModule } from '@dudousxd/nestjs-telescope';
+import { durableTelescopeExtension } from '@dudousxd/nestjs-durable-telescope';
+
+TelescopeModule.forRoot({
+  extensions: [durableTelescopeExtension({ runHref: '/durable/runs/{runId}' })],
+});
+```
+
+The extension **bundles the `DurableTelescopeWatcher`**, so you still get the per-event entries
+described above — don't also pass the watcher under `watchers` when you use the extension. It adds
+the `durable` entry type, the `durable.workflows` dashboard, and three data providers.
+
+`runHref` is an optional URL template (default `'/durable/runs/{runId}'`) used to deep-link a failed
+run out to the [durable dashboard](/docs/observability/dashboard); `{runId}` is substituted per row.
+
+The dashboard shows:
+
+- **Success rate (%)** and **Failed in window** — headline rollups over recent history.
+- **Current-state gauges** — **Dead now** / **Suspended now** / **Running now** / **Pending now**.
+- **Top failing workflows** — a bar of the workflows producing the most failures.
+- **Recent failed runs** — a table whose **Run** column deep-links each run via `runHref`.
+
+### Data sources
+
+The two kinds of panel read from two different places:
+
+- **Rollups** (success rate, failed count, top failing workflows) are computed from the `durable`
+  entries Telescope already captured — so they're the **recent-history** view, bounded by Telescope's
+  prune window.
+- **Current-state gauges** (dead / suspended / running / pending **now**) are read **live** from the
+  durable store via `listRuns`, so they're exact and **not** limited by the prune window.
+
+Telescope is the health and visibility view, and deep-links out: **per-run actions** (retry, cancel)
+and the **workflow graph** stay in the [durable dashboard](/docs/observability/dashboard). For the
+extensions mechanism itself, see Telescope's `concepts/extensions` page in the
+[`@dudousxd/nestjs-telescope`](https://github.com/DavideCarvalho/nestjs-telescope) docs.
