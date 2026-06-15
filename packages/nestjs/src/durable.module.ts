@@ -164,6 +164,10 @@ export class DurableModule {
               webhookUrl: opts.webhookUrl,
               traceparent: opts.traceparent,
               compensationRetries: opts.compensationRetries,
+              // A non-worker (API/dashboard) instance must not run workflows: enqueue-only, leaving
+              // each `pending` run in the store for a worker's `runPending` poll. Workers use the
+              // default in-process dispatcher (execute locally).
+              runDispatcher: opts.worker === false ? { dispatch: () => {} } : undefined,
             });
             for (const queue of opts.queues ?? []) engine.registerQueue(queue);
             // Dead-letter routing (per-workflow `@DeadLetter()` / `deadLetterWorkflow` + this global

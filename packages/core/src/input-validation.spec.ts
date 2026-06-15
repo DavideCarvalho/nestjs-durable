@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('validateInput at start', () => {
@@ -17,7 +18,7 @@ describe('validateInput at start', () => {
     await expect(engine.start('checkout', { orderId: 123 }, 'bad')).rejects.toThrow(/orderId/);
     expect(await store.getRun('bad')).toBeNull(); // no run created
 
-    const ok = await engine.start('checkout', { orderId: 'o1' }, 'good');
+    const ok = await startRun(engine, 'checkout', { orderId: 'o1' }, 'good');
     expect(ok.status).toBe('completed');
   });
 });

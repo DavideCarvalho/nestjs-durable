@@ -39,11 +39,15 @@ describe('event triggers (@Workflow onEvent + @OnEvent decorator)', () => {
       },
     );
     expect(touched).toBe(2); // welcome (option) + audit (decorator)
+    // Triggered runs are enqueued; wait for them to execute before reading their output.
+    await svc.waitForRun('evt:u1:welcome');
+    await svc.waitForRun('evt:u1:audit');
     expect((await store.getRun('evt:u1:welcome'))?.output).toBe('welcome a@b.com');
     expect((await store.getRun('evt:u1:audit'))?.output).toBe('new');
 
     // The decorator's second event also triggers audit (and not welcome).
     await svc.publishEvent('user.deleted', { kind: 'gone' }, { id: 'd1' });
+    await svc.waitForRun('evt:d1:audit');
     expect((await store.getRun('evt:d1:audit'))?.output).toBe('gone');
     expect(await store.getRun('evt:d1:welcome')).toBeNull();
   });

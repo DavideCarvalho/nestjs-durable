@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('ctx.setEvent / engine.getEvent — live query of a running run', () => {
@@ -15,7 +16,7 @@ describe('ctx.setEvent / engine.getEvent — live query of a running run', () =>
       return 'done';
     });
 
-    await engine.start('job', {}, 'r1'); // runs until the signal wait, then suspends
+    await startRun(engine, 'job', {}, 'r1'); // runs until the signal wait, then suspends
 
     expect(await engine.getEvent('r1', 'progress')).toBe(50);
     expect(await engine.getEvent('r1', 'missing')).toBeUndefined();

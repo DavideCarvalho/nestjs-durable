@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { WorkflowEngine } from './engine';
 import type { Heartbeat, RemoteStepDef, RemoteTask, StepResult, Transport } from './interfaces';
 import { remoteStep } from './remote-step-factory';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -36,7 +37,7 @@ describe('remote-step liveness (heartbeats)', () => {
     const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
     engine.register('wf', '1', async (ctx) => ctx.call({ ...echo, timeoutMs: 30, retries: 2 }, {}));
 
-    const res = await engine.start('wf', {}, 'r1'); // never delivered → timeout × 2 → fail
+    const res = await startRun(engine, 'wf', {}, 'r1'); // never delivered → timeout × 2 → fail
     expect(res.status).toBe('failed');
     expect(res.error?.message).toMatch(/no result\/heartbeat/);
     expect(transport.dispatched.length).toBe(2); // initial + 1 retry
@@ -47,7 +48,8 @@ describe('remote-step liveness (heartbeats)', () => {
     const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
     engine.register('wf2', '1', async (ctx) => ctx.call({ ...echo, timeoutMs: 60 }, {}));
 
-    const runPromise = engine.start('wf2', {}, 'r2');
+    await engine.start('wf2', {}, 'r2');
+    const runPromise = engine.waitForRun('r2');
     await sleep(0); // let the dispatch happen
     const id = transport.dispatched[0]?.stepId as string;
 

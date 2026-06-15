@@ -14,11 +14,13 @@ export class WorkflowService {
   constructor(private readonly engine: WorkflowEngine) {}
 
   /**
-   * Start a workflow run. Pass the workflow's **class** (`start(CheckoutWorkflow, input)`) for a typed
-   * input + refactor-safety, or a **name** string for a cross-runtime workflow. `runId` defaults to a
-   * random id; pass your own to make the start idempotent (a redelivery returns the existing run).
-   * `opts.tags` are merged with the workflow's static `@Workflow({ tags })`; `opts.searchAttributes`
-   * stamp typed, queryable run data (e.g. `{ amount: 200, tier: 'pro' }`).
+   * Enqueue a workflow run — it creates the run (`pending`) and returns `{ runId, status: 'pending' }`
+   * immediately; a worker executes the body (so the caller never blocks on workflow logic). Use
+   * {@link waitForRun} when you need the outcome. Pass the workflow's **class**
+   * (`start(CheckoutWorkflow, input)`) for a typed input + refactor-safety, or a **name** string for a
+   * cross-runtime workflow. `runId` defaults to a random id; pass your own to make the start idempotent
+   * (a redelivery returns the existing run). `opts.tags` are merged with the workflow's static
+   * `@Workflow({ tags })`; `opts.searchAttributes` stamp typed, queryable run data.
    */
   start<C extends WorkflowClass>(
     workflow: C,
@@ -38,6 +40,15 @@ export class WorkflowService {
 
   resume(runId: string): Promise<RunResult> {
     return this.engine.resume(runId);
+  }
+
+  /**
+   * Resolve once a run settles — terminal (completed/failed/cancelled/dead) or suspended. `start`
+   * only enqueues (a worker runs the body), so pair them when a request needs the outcome:
+   * `const { runId } = await svc.start(...); const result = await svc.waitForRun(runId)`.
+   */
+  waitForRun(runId: string, opts?: { timeoutMs?: number }): Promise<RunResult> {
+    return this.engine.waitForRun(runId, opts);
   }
 
   /** Deliver an external signal (e.g. from a webhook) to the run waiting on `token`. */

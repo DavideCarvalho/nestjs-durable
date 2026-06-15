@@ -1,4 +1,5 @@
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — step events (observability)', () => {
@@ -18,7 +19,7 @@ describe('WorkflowEngine — step events (observability)', () => {
       return 'ok';
     });
 
-    await engine.start('wf', {}, 'run1');
+    await startRun(engine, 'wf', {}, 'run1');
 
     const cp = await store.getCheckpoint('run1', 0);
     expect(cp?.events).toHaveLength(5);
@@ -43,7 +44,7 @@ describe('WorkflowEngine — step events (observability)', () => {
       return 'ok';
     });
 
-    await engine.start('wf', {}, 'run1');
+    await startRun(engine, 'wf', {}, 'run1');
 
     const cp = await store.getCheckpoint('run1', 0);
     expect(cp?.status).toBe('failed');
@@ -61,7 +62,7 @@ describe('WorkflowEngine — step events (observability)', () => {
       return 'ok';
     });
 
-    await engine.start('wf', {}, 'run1');
+    await startRun(engine, 'wf', {}, 'run1');
 
     expect((await store.getCheckpoint('run1', 0))?.events).toBeUndefined();
   });

@@ -13,6 +13,7 @@ describe('attachDurableMetrics', () => {
       return 'done';
     });
     await engine.start('wf', {}, 'run1');
+    await engine.waitForRun('run1');
 
     const snap = metrics.snapshot();
     expect(snap.runs.started).toBe(1);
@@ -35,6 +36,7 @@ describe('attachDurableMetrics', () => {
       }),
     );
     await engine.start('boom', {}, 'run2');
+    await engine.waitForRun('run2');
     const snap = metrics.snapshot();
     expect(snap.runs.failed).toBe(1);
     expect(snap.steps.failed).toBe(1);

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('events (waitForEvent / publishEvent)', () => {
@@ -14,8 +15,8 @@ describe('events (waitForEvent / publishEvent)', () => {
       return `paid ${p.amount}`;
     });
 
-    await engine.start('order', { orderId: 'o1' }, 'r1');
-    await engine.start('order', { orderId: 'o2' }, 'r2');
+    await startRun(engine, 'order', { orderId: 'o1' }, 'r1');
+    await startRun(engine, 'order', { orderId: 'o2' }, 'r2');
     expect((await store.getRun('r1'))?.status).toBe('suspended');
 
     const delivered = await engine.publishEvent('payment.settled', { orderId: 'o1', amount: 99 });
@@ -34,8 +35,8 @@ describe('events (waitForEvent / publishEvent)', () => {
       const p = await ctx.waitForEvent<{ v: number }>('tick');
       return p.v;
     });
-    await engine.start('listener', {}, 'a');
-    await engine.start('listener', {}, 'b');
+    await startRun(engine, 'listener', {}, 'a');
+    await startRun(engine, 'listener', {}, 'b');
 
     const n = await engine.publishEvent('tick', { v: 7 });
     expect(n).toBe(2);

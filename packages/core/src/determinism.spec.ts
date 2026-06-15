@@ -1,5 +1,6 @@
 import { WorkflowEngine } from './engine';
 import { NonDeterminismError } from './errors';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — determinism', () => {
@@ -13,7 +14,7 @@ describe('WorkflowEngine — determinism', () => {
       await ctx.waitForSignal('go');
       await ctx.step('b', async () => 2);
     });
-    await v1.start('wf', {}, 'run1'); // suspends after "a"
+    await startRun(v1, 'wf', {}, 'run1'); // suspends after "a"
 
     // Code changed under the in-flight run (step renamed a→A at seq 0) WITHOUT a new version.
     const v2 = new WorkflowEngine({ store });
@@ -49,7 +50,7 @@ describe('WorkflowEngine — determinism', () => {
       return snapshot;
     });
 
-    await engine.start('wf', {}, 'run1');
+    await startRun(engine, 'wf', {}, 'run1');
     clockValue = 9999; // clock + a fresh Math.random/uuid would differ on replay
     const done = await engine.signal('go', null);
 

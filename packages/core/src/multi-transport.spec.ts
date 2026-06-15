@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { WorkflowEngine } from './engine';
 import type { RemoteTask, StepResult, Transport } from './interfaces';
 import { remoteStep } from './remote-step-factory';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 const ping = remoteStep({
@@ -50,7 +51,7 @@ describe('multiple transports — failover + per-step selection', () => {
     });
     engine.register('wf', '1', async (ctx) => ctx.call(ping, {}));
 
-    await engine.start('wf', {}, 'r1');
+    await startRun(engine, 'wf', {}, 'r1');
 
     expect(a.dispatched).toHaveLength(0);
     expect(b.dispatched).toHaveLength(1);
@@ -70,7 +71,7 @@ describe('multiple transports — failover + per-step selection', () => {
     });
     engine.register('wf', '1', async (ctx) => ctx.call(ping, {}, { transport: 'b' }));
 
-    await engine.start('wf', {}, 'r1');
+    await startRun(engine, 'wf', {}, 'r1');
 
     expect(a.dispatched).toHaveLength(0);
     expect(b.dispatched).toHaveLength(1);
@@ -93,7 +94,7 @@ describe('multiple transports — failover + per-step selection', () => {
       return r.pong;
     });
 
-    await engine.start('wf', {}, 'r1');
+    await startRun(engine, 'wf', {}, 'r1');
     await b.complete(b.dispatched[0]!);
     await new Promise((r) => setImmediate(r));
 

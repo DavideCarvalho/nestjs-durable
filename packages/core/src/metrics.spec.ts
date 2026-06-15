@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
 import { collectMetrics } from './metrics';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('collectMetrics', () => {
@@ -16,8 +17,8 @@ describe('collectMetrics', () => {
       throw new Error('boom');
     });
 
-    await engine.start('ok', {}, 'r1');
-    await engine.start('bad', {}, 'r2');
+    await startRun(engine, 'ok', {}, 'r1');
+    await startRun(engine, 'bad', {}, 'r2');
 
     const s = metrics.snapshot();
     expect(s.runs.started).toBe(2);

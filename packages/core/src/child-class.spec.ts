@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { WORKFLOW_NAME_KEY } from './workflow-ref';
 
@@ -29,7 +30,7 @@ describe('class-ref forms of child / startChild / start', () => {
     named(Greet, 'greet');
     engine.register('greet', '1', async (_ctx, input) => `hi ${(input as { name: string }).name}`);
 
-    const res = await engine.start(Greet, { name: 'davi' }, 'g1');
+    const res = await startRun(engine, Greet, { name: 'davi' }, 'g1');
     expect(res.output).toBe('hi davi');
   });
 
@@ -48,7 +49,7 @@ describe('class-ref forms of child / startChild / start', () => {
       return r.doubled;
     });
 
-    const first = await engine.start('parent', {}, 'p1');
+    const first = await startRun(engine, 'parent', {}, 'p1');
     expect(first.status).toBe('suspended');
     await poll(async () => (await store.getRun('p1'))?.status === 'completed');
     expect((await store.getRun('p1'))?.output).toBe(42);
@@ -70,7 +71,7 @@ describe('class-ref forms of child / startChild / start', () => {
       return 'parent-done';
     });
 
-    const res = await engine.start('parent', {}, 'p1');
+    const res = await startRun(engine, 'parent', {}, 'p1');
     expect(res.status).toBe('completed'); // parent finished without waiting on the child
     expect(res.output).toBe('parent-done');
     expect(childIdSeen).toBe('p1.child.0'); // deterministic default child id
@@ -93,7 +94,7 @@ describe('class-ref forms of child / startChild / start', () => {
       return out;
     });
 
-    await engine.start('parent', {}, 'p1');
+    await startRun(engine, 'parent', {}, 'p1');
     await poll(async () => (await store.getRun('p1'))?.status === 'completed');
     expect((await store.getRun('p1'))?.output).toBe('work-result');
     expect(runs).toBe(1); // started once, not double-dispatched

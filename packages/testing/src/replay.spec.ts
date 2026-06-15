@@ -7,7 +7,8 @@ async function recordHistory(register: (e: WorkflowEngine) => void): Promise<Run
   const store = new InMemoryStateStore();
   const engine = new WorkflowEngine({ store });
   register(engine);
-  await engine.start('wf', {}, 'run1'); // suspends mid-way
+  await engine.start('wf', {}, 'run1');
+  await engine.waitForRun('run1'); // execute (dispatch model) until it suspends mid-way
   const run = await store.getRun('run1');
   if (!run) throw new Error('no run');
   return { run, checkpoints: await store.listCheckpoints('run1') };
