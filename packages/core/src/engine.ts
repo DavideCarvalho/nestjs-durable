@@ -90,6 +90,8 @@ interface RegisteredWorkflow {
   executionTimeoutMs?: number;
   /** Validate the input at start; throw to reject before a run is created. Validator-agnostic. */
   validateInput?: (input: unknown) => void | Promise<void>;
+  /** Event names that start a fresh run of this workflow when published. See `publishEvent`. */
+  onEvent?: string[];
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
@@ -189,6 +191,8 @@ export class WorkflowEngine {
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
   private readonly latest = new Map<string, RegisteredWorkflow>();
+  /** Event name → workflow names started when that event is published (see `onEvent`). */
+  private readonly eventTriggers = new Map<string, Set<string>>();
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
   /** Per-step "reset the liveness timer" callbacks, called when a heartbeat arrives. */
@@ -288,6 +292,7 @@ export class WorkflowEngine {
       singleton?: SingletonConfig;
       executionTimeout?: string | number;
       validateInput?: (input: unknown) => void | Promise<void>;
+      onEvent?: string[];
     },
   ): void {
     const registered: RegisteredWorkflow = {
@@ -299,10 +304,16 @@ export class WorkflowEngine {
       executionTimeoutMs:
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts?.validateInput,
+      onEvent: opts?.onEvent,
     };
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
     if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
+    for (const event of opts?.onEvent ?? []) {
+      const subscribers = this.eventTriggers.get(event) ?? new Set<string>();
+      subscribers.add(name);
+      this.eventTriggers.set(event, subscribers);
+    }
   }
 
   /**
@@ -572,20 +583,37 @@ export class WorkflowEngine {
    * Returns the run result, or null if no run is waiting for that token.
    */
   /**
-   * Publish a named event to every run waiting on it via `ctx.waitForEvent(name, { match })` whose
-   * match the payload satisfies. Name-based pub/sub (fan-out), vs `signal`'s point-to-point token.
-   * Returns how many runs it resumed.
+   * Publish a named event. It does two things, and returns how many runs it touched (the sum):
+   *  1. **Resumes** every in-flight run waiting on it via `ctx.waitForEvent(name, { match })` whose
+   *     match the payload satisfies (fan-out, vs `signal`'s point-to-point token).
+   *  2. **Starts** a fresh run of every workflow registered with `onEvent: [name]`, passing the
+   *     payload as input. Idempotent by `evt:<id>:<workflow>` — pass `opts.id` to dedupe redeliveries
+   *     of the same logical event (default: a fresh uuid, so each publish triggers once).
    */
-  async publishEvent(name: string, payload: unknown): Promise<number> {
+  async publishEvent(name: string, payload: unknown, opts?: { id?: string }): Promise<number> {
+    let touched = 0;
     const waiters = await this.store.listSignalWaiters(eventPrefix(name));
-    let delivered = 0;
     for (const w of waiters) {
       if (eventMatches(payload, eventMatchOf(w.token))) {
         await this.signal(w.token, payload);
-        delivered += 1;
+        touched += 1;
       }
     }
-    return delivered;
+    const subscribers = this.eventTriggers.get(name);
+    if (subscribers?.size) {
+      const eventId = opts?.id ?? globalThis.crypto.randomUUID();
+      for (const workflow of subscribers) {
+        // A subscriber that rejects the payload (validateInput) must not block the others or the
+        // waiters — its run simply never starts, mirroring fire-and-forget dead-letter routing.
+        try {
+          await this.start(workflow, payload, `evt:${eventId}:${workflow}`);
+          touched += 1;
+        } catch {
+          // skip this subscriber
+        }
+      }
+    }
+    return touched;
   }
 
   async signal(token: string, payload: unknown): Promise<RunResult | null> {

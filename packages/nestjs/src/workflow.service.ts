@@ -45,10 +45,12 @@ export class WorkflowService {
   }
 
   /**
-   * Publish a named event to every run waiting on it via `ctx.waitForEvent(name, { match })` whose
-   * match the payload satisfies (name-based pub/sub fan-out). Returns how many runs it resumed.
+   * Publish a named event. Resumes runs waiting on it via `ctx.waitForEvent(name, { match })` and
+   * starts a fresh run of every workflow subscribed via `@Workflow({ onEvent })` / `@OnEvent` (the
+   * payload becomes its input). Pass `opts.id` to dedupe redeliveries. Returns how many runs it
+   * touched (resumed + started).
    */
-  publishEvent(name: string, payload: unknown): Promise<number> {
-    return this.engine.publishEvent(name, payload);
+  publishEvent(name: string, payload: unknown, opts?: { id?: string }): Promise<number> {
+    return this.engine.publishEvent(name, payload, opts);
   }
 }

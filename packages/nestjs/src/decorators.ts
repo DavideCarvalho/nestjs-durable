@@ -25,6 +25,8 @@ export interface WorkflowMeta {
   ) => object;
   /** Custom input validator (throws on invalid). See `WorkflowOptions`. */
   validateInput?: (input: unknown) => void | Promise<void>;
+  /** Event names that start a fresh run of this workflow. See `WorkflowOptions`. */
+  onEvent?: string[];
 }
 
 export interface WorkflowOptions {
@@ -70,6 +72,13 @@ export interface WorkflowOptions {
    * `inputSchema`. Takes precedence over `inputSchema` if both are set.
    */
   validateInput?: (input: unknown) => void | Promise<void>;
+  /**
+   * Start a fresh run of this workflow whenever any of these events is published via
+   * `publishEvent(name, payload)` — the payload becomes the run's input. e.g.
+   * `onEvent: ['user.registered', 'user.invited']`. The same subscription can also be declared with
+   * the `@OnEvent(...)` class decorator; the two are merged.
+   */
+  onEvent?: string[];
 }
 
 /**
@@ -87,6 +96,7 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       executionTimeout: options.executionTimeout,
       inputSchema: options.inputSchema,
       validateInput: options.validateInput,
+      onEvent: options.onEvent,
     };
     Reflect.defineMetadata(WORKFLOW_METADATA, meta, target);
     // Stamp the registered name so this class can be used as a typed workflow ref (ctx.child,
@@ -164,4 +174,26 @@ export function DeadLetter(): MethodDecorator {
 // biome-ignore lint/complexity/noBannedTypes: reflect-metadata reads from the method function
 export function isDeadLetterHandler(method: Function): boolean {
   return Reflect.getMetadata(DEAD_LETTER_METADATA, method) === true;
+}
+
+export const ON_EVENT_METADATA = Symbol('nestjs-durable:on-event');
+
+/**
+ * Subscribe a `@Workflow` class to one or more events: when any of them is published via
+ * `publishEvent(name, payload)`, a fresh run of the workflow starts with the payload as input.
+ * Equivalent to `@Workflow({ onEvent })` — use whichever reads better; multiple `@OnEvent(...)`
+ * decorators and the option are all merged.
+ */
+export function OnEvent(...events: string[]): ClassDecorator {
+  return (target) => {
+    const existing = (Reflect.getMetadata(ON_EVENT_METADATA, target) as string[] | undefined) ?? [];
+    Reflect.defineMetadata(ON_EVENT_METADATA, [...existing, ...events], target);
+  };
+}
+
+/** All events a workflow class subscribes to — the union of `@Workflow({ onEvent })` and `@OnEvent`. */
+export function getOnEvents(meta: WorkflowMeta, target: object): string[] {
+  const fromDecorator =
+    (Reflect.getMetadata(ON_EVENT_METADATA, target) as string[] | undefined) ?? [];
+  return [...new Set([...(meta.onEvent ?? []), ...fromDecorator])];
 }
