@@ -1,6 +1,7 @@
 import { backoffDelay } from './backoff';
 import { instantCheckpoint } from './checkpoints';
 import { type Completion } from './completion';
+import { parseDuration } from './duration';
 import { ContinueAsNew, NonDeterminismError, RemoteStepTimeout, WorkflowSuspended } from './errors';
 import type {
   ControlPlane,
@@ -84,6 +85,8 @@ interface RegisteredWorkflow {
   tags?: string[];
   /** Per-key serialization (a durable mutex). See {@link SingletonConfig}. */
   singleton?: SingletonConfig;
+  /** Max wall-clock lifetime (ms) before a run is cancelled by `sweepTimeouts`. */
+  executionTimeoutMs?: number;
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
@@ -277,7 +280,7 @@ export class WorkflowEngine {
     name: string,
     version: string,
     fn: WorkflowFn,
-    opts?: { tags?: string[]; singleton?: SingletonConfig },
+    opts?: { tags?: string[]; singleton?: SingletonConfig; executionTimeout?: string | number },
   ): void {
     const registered: RegisteredWorkflow = {
       name,
@@ -285,6 +288,8 @@ export class WorkflowEngine {
       fn,
       tags: opts?.tags,
       singleton: opts?.singleton,
+      executionTimeoutMs:
+        opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
     };
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
@@ -455,6 +460,28 @@ export class WorkflowEngine {
       (t as { unref?: () => void }).unref?.();
     });
     await Promise.race([Promise.allSettled([...this.inflight]), timer]);
+  }
+
+  /**
+   * Cancel in-flight runs that have outlived their workflow's `executionTimeout`. Call it from the
+   * timer poller alongside {@link resumeDueTimers}. A timed-out run is moved to `cancelled` with an
+   * `execution_timeout` error (terminal, so a late step result can't resurrect it).
+   */
+  async sweepTimeouts(now: number = this.clock()): Promise<void> {
+    for (const reg of new Set(this.latest.values())) {
+      if (reg.executionTimeoutMs == null) continue;
+      const deadline = now - reg.executionTimeoutMs;
+      const inflight = [
+        ...(await this.store.listRuns({ workflow: reg.name, status: 'running' })),
+        ...(await this.store.listRuns({ workflow: reg.name, status: 'suspended' })),
+      ];
+      for (const run of inflight) {
+        if (run.createdAt.getTime() > deadline) continue;
+        const error = { message: 'execution timeout', code: 'execution_timeout' };
+        await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
+        this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+      }
+    }
   }
 
   /**
