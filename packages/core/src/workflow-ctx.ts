@@ -67,6 +67,8 @@ export interface CtxHost {
   ): Promise<TOutput>;
   /** Start a child run once, deferred so it can't reentrantly resume a still-running parent. */
   startChild(workflow: string, input: unknown, id: string): void;
+  /** Deliver an op to a durable entity (deferred), optionally with a `reply` token for the result. */
+  signalEntity?(name: string, key: string, op: string, arg: unknown, reply?: string): void;
   /** Run a local step body through the registered step interceptors (identity if none). */
   interceptStep?<T>(invocation: StepInvocation, body: () => Promise<T>): Promise<T>;
 }
@@ -374,6 +376,40 @@ export function createWorkflowCtx(
     return id;
   };
 
+  // Call a durable entity op and await its result: register a reply waiter at this position, dispatch
+  // the op with the reply token, and suspend until the entity signals the result back (checkpointed,
+  // so replay returns it without re-dispatching).
+  const callEntity = async <R>(
+    name: string,
+    key: string,
+    op: string,
+    arg?: unknown,
+  ): Promise<R> => {
+    const current = pos.next();
+    const existing = await store.getCheckpoint(runId, current);
+    if (existing && existing.status === 'completed') return existing.output as R;
+    const reply = `entityreply:${runId}:${current}`;
+    await store.putSignalWaiter({ token: reply, runId, seq: current });
+    host.signalEntity?.(name, key, op, arg, reply);
+    throw new WorkflowSuspended();
+  };
+
+  // Send a durable entity op without awaiting a result — dispatched once (checkpointed, replay-safe).
+  const signalEntity = async (
+    name: string,
+    key: string,
+    op: string,
+    arg?: unknown,
+  ): Promise<void> => {
+    const current = pos.next();
+    const existing = await store.getCheckpoint(runId, current);
+    if (existing && existing.status === 'completed') return;
+    host.signalEntity?.(name, key, op, arg);
+    await store.saveCheckpoint(
+      instantCheckpoint({ runId, seq: current, name: `entitysig:${name}:${key}`, kind: 'local' }),
+    );
+  };
+
   // A breakpoint = a visible `pending` checkpoint + a signal waiter the dashboard resumes via
   // `engine.continue`. Reuses the signal machinery, so resume overwrites the pending checkpoint
   // with a completed one and the run replays past it.
@@ -464,6 +500,8 @@ export function createWorkflowCtx(
     runId,
     step,
     transaction,
+    callEntity,
+    signalEntity,
     sleep,
     sleepUntil,
     continueAsNew,

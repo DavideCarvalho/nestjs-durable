@@ -18,6 +18,7 @@ import {
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { getOnEvents, getWorkflowMeta, isDeadLetterHandler } from './decorators';
 import type { DurableModuleOptions } from './durable.module';
+import { entityConfigFor, getEntityMeta } from './entity';
 import { classValidatorInput } from './input-validation';
 import { type DurableStepInterceptor, isStepInterceptor } from './step-interceptor';
 
@@ -72,6 +73,11 @@ export class WorkflowRegistrar
       if (isStepInterceptor(instance.constructor)) {
         const interceptor = instance as DurableStepInterceptor;
         this.engine.use((invocation, next) => interceptor.intercept(invocation, next));
+      }
+      const entityMeta = getEntityMeta(instance.constructor);
+      if (entityMeta) {
+        this.engine.registerEntity(entityMeta.name, entityConfigFor(instance.constructor));
+        continue; // an @Entity is not a @Workflow
       }
       const meta = getWorkflowMeta(instance.constructor);
       if (!meta) continue;

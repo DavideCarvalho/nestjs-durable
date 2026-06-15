@@ -449,6 +449,18 @@ export interface WorkflowCtx {
    */
   transaction<TOutput>(name: string, fn: (tx: unknown) => Promise<TOutput>): Promise<TOutput>;
   /**
+   * Call a durable **entity** op and await its result — the entity (`engine.registerEntity`) runs the
+   * op serialized per `key` over durable state. e.g. `await ctx.callEntity('cart', userId, 'add', item)`.
+   */
+  callEntity<TResult = unknown>(
+    name: string,
+    key: string,
+    op: string,
+    arg?: unknown,
+  ): Promise<TResult>;
+  /** Send a durable entity op without awaiting a result (fire-and-forget, dispatched once). */
+  signalEntity(name: string, key: string, op: string, arg?: unknown): Promise<void>;
+  /**
    * Dispatch a typed remote step and await its checkpointed result. Options:
    * - `queue` — subject the dispatch to a registered flow-control queue (concurrency / rate limit).
    * - `transport` — pin the dispatch to a named transport in the pool (else the pool's first, with
