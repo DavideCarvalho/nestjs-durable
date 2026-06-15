@@ -14,6 +14,7 @@ import {
 import { type DynamicModule, type InjectionToken, Module, type Provider } from '@nestjs/common';
 import { DiscoveryModule } from '@nestjs/core';
 import { DurableStepRegistrar } from './durable-step.registrar';
+import { EntityService } from './entity';
 import { TimerPoller } from './timer-poller';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
@@ -177,11 +178,12 @@ export class DurableModule {
           inject: [STATE_STORE, TRANSPORT, DURABLE_OPTIONS],
         },
         WorkflowService,
+        EntityService,
         WorkflowRegistrar,
         DurableStepRegistrar,
         TimerPoller,
       ],
-      exports: [WorkflowService, WorkflowEngine, STATE_STORE, TRANSPORT],
+      exports: [WorkflowService, EntityService, WorkflowEngine, STATE_STORE, TRANSPORT],
     };
   }
 }

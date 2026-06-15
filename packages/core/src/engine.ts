@@ -4,6 +4,7 @@ import { type Completion } from './completion';
 import { parseDuration } from './duration';
 import {
   ContinueAsNew,
+  FatalError,
   NonDeterminismError,
   RemoteStepTimeout,
   SignalTimeoutError,
@@ -114,6 +115,17 @@ export type EventBatchConfig =
   | { mode: 'debounce'; windowMs: number }
   | { mode: 'batch'; maxSize: number; windowMs: number };
 
+/** One operation on a durable entity: mutate `state` in place and/or return a result. */
+export type EntityHandler<S = unknown> = (state: S, arg: unknown) => unknown | Promise<unknown>;
+
+/** A durable keyed entity (a virtual object): per-key serialized handlers over durable state. */
+export interface EntityConfig<S = unknown> {
+  /** Build the initial state for a fresh key. */
+  initialState: () => S;
+  /** Operation handlers, keyed by op name. Each runs serially per key, exactly once. */
+  handlers: Record<string, EntityHandler<S>>;
+}
+
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
 
 /** The id for the next continuation of a run: `r` → `r~1` → `r~2` … (stable, traceable lineage). */
@@ -222,6 +234,8 @@ export class WorkflowEngine {
   private readonly latest = new Map<string, RegisteredWorkflow>();
   /** Event name → workflow names started when that event is published (see `onEvent`). */
   private readonly eventTriggers = new Map<string, Set<string>>();
+  /** Registered durable entities, keyed by entity name (see `registerEntity`). */
+  private readonly entities = new Map<string, EntityConfig>();
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
   /** Per-step "reset the liveness timer" callbacks, called when a heartbeat arrives. */
@@ -315,6 +329,7 @@ export class WorkflowEngine {
       }
     });
     this.registerEventAccumulators();
+    this.registerEntityRunner();
   }
 
   /**
@@ -361,6 +376,75 @@ export class WorkflowEngine {
       }
       await ctx.startChild(target, { events });
       return ctx.continueAsNew(input); // re-arm
+    });
+  }
+
+  /**
+   * Register a **durable entity** (a virtual object): a keyed actor whose `handlers` run **serialized
+   * per key** over **durable state**, exactly once. Drive it with `signalEntity` (fire) /
+   * `ctx.callEntity` (call + await result) and read its state with `getEntityState`. Each key is one
+   * long-lived run (`entity:<name>:<key>`) that processes ops in order.
+   */
+  registerEntity<S>(name: string, config: EntityConfig<S>): void {
+    this.entities.set(name, config as EntityConfig);
+  }
+
+  /** Send an operation to an entity (fire-and-forget). Ordered + exactly-once per key. */
+  async signalEntity(name: string, key: string, op: string, arg?: unknown): Promise<void> {
+    await this.dispatchEntityOp(name, key, op, arg);
+  }
+
+  /** Read an entity's current durable state (published after each op), or undefined if it has none yet. */
+  getEntityState<S = unknown>(name: string, key: string): Promise<S | undefined> {
+    return this.getEvent<S>(`entity:${name}:${key}`, 'state');
+  }
+
+  /** Deliver an op to an entity's runner, starting it on first contact. `reply` (a signal token) gets
+   *  the handler's result, for `ctx.callEntity`. */
+  private dispatchEntityOp(
+    name: string,
+    key: string,
+    op: string,
+    arg: unknown,
+    reply?: string,
+  ): Promise<{ runId: string }> {
+    const runId = `entity:${name}:${key}`;
+    return this.signalWithStart('__entity', { name, key }, runId, {
+      token: runId,
+      payload: { op, arg, reply },
+    });
+  }
+
+  /** The built-in entity runner: one long-lived run per key that processes ops serially over state. */
+  private registerEntityRunner(): void {
+    this.register('__entity', '1', async (ctx, input) => {
+      const { name, key } = input as { name: string; key: string };
+      const config = this.entities.get(name);
+      if (!config) throw new FatalError(`entity "${name}" is not registered`);
+      const token = `entity:${name}:${key}`;
+      let state = config.initialState();
+      for (let i = 0; ; i += 1) {
+        const msg = (await ctx.waitForSignal(token)) as {
+          op: string;
+          arg: unknown;
+          reply?: string;
+        };
+        // Run the handler and snapshot the (possibly mutated) state in ONE checkpoint, so replay
+        // restores the state from the checkpoint instead of re-running the handler.
+        const out = await ctx.step(`op:${i}`, async () => {
+          const handler = config.handlers[msg.op];
+          if (!handler) throw new FatalError(`entity "${name}" has no handler for op "${msg.op}"`);
+          const result = await handler(state, msg.arg);
+          return { result, state };
+        });
+        state = out.state; // carry state forward (and restore it from the checkpoint on replay)
+        await ctx.setEvent('state', state); // publish for getEntityState
+        if (msg.reply) {
+          await ctx.step(`reply:${i}`, async () => {
+            await this.signal((msg as { reply: string }).reply, out.result);
+          });
+        }
+      }
     });
   }
 
@@ -1301,6 +1385,11 @@ export class WorkflowEngine {
       // Defer so a fast child can't reentrantly resume a still-running parent.
       startChild: (workflow, input, id) => {
         queueMicrotask(() => void this.start(workflow, input, id).catch(() => undefined));
+      },
+      signalEntity: (name, key, op, arg, reply) => {
+        queueMicrotask(
+          () => void this.dispatchEntityOp(name, key, op, arg, reply).catch(() => undefined),
+        );
       },
       interceptStep: (invocation, body) => this.interceptStep(invocation, body),
     };
