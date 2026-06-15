@@ -852,6 +852,23 @@ export class WorkflowEngine {
   }
 
   /**
+   * **Fix-and-replay**: re-run a run (typically a `dead`/`failed` one) with a corrected `input`, as a
+   * fresh run with clean history. It's a NEW run — `newRunId` defaults to `<runId>~retry~<uuid>` — so
+   * the original stays inspectable. Returns the new run's id, or null if `runId` is unknown.
+   */
+  async retryWithInput(
+    runId: string,
+    input: unknown,
+    newRunId?: string,
+  ): Promise<{ runId: string } | null> {
+    const run = await this.store.getRun(runId);
+    if (!run) return null;
+    const id = newRunId ?? `${runId}~retry~${globalThis.crypto.randomUUID().slice(0, 8)}`;
+    await this.start(run.workflow, input, id, { tags: run.tags });
+    return { runId: id };
+  }
+
+  /**
    * Pick up and execute every `pending` run — the poll-based side of dispatch for a worker pod with
    * no broker. Runs enqueued by other pods (or by a caller using a no-op dispatcher) sit `pending`
    * in the store until polled; leasing ensures exactly one pod runs each. Call periodically alongside

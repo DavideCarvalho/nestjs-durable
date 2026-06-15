@@ -54,6 +54,12 @@ export class DurableApiController {
     return this.dashboard.retry(id);
   }
 
+  /** Fix-and-replay: re-run a dead/failed run with a corrected input (a fresh linked run). */
+  @Post('runs/:id/retry-with-input')
+  retryWithInput(@Param('id') id: string, @Body() body: { input: unknown }) {
+    return this.dashboard.retryWithInput(id, body?.input);
+  }
+
   /** Bulk retry/cancel every run matching a filter (status / tag / workflow). */
   @Post('bulk/:action')
   bulk(

@@ -61,6 +61,8 @@ export interface StepCheckpoint {
 export interface RunDetail {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
+  /** Ids of runs this run spawned (ctx.child / ctx.startChild) — the parent→children tree. */
+  children?: string[];
 }
 
 export interface EngineEvent {
@@ -117,6 +119,14 @@ export const durableClient = {
   },
   retry(id: string): Promise<WorkflowRun> {
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+  },
+  /** Fix-and-replay: re-run a dead/failed run with a corrected input. Returns the new run's id. */
+  retryWithInput(id: string, input: unknown): Promise<{ runId: string }> {
+    return http<{ runId: string }>(`/runs/${encodeURIComponent(id)}/retry-with-input`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input }),
+    });
   },
   /** Bulk retry/cancel every run matching a filter. Returns how many matched + were acted on. */
   bulk(
