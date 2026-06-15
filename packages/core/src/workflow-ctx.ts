@@ -16,6 +16,7 @@ import type {
   StateStore,
   StepError,
   StepEvent,
+  StepInvocation,
   StepKind,
   StepLogger,
   StepOptions,
@@ -66,6 +67,8 @@ export interface CtxHost {
   ): Promise<TOutput>;
   /** Start a child run once, deferred so it can't reentrantly resume a still-running parent. */
   startChild(workflow: string, input: unknown, id: string): void;
+  /** Run a local step body through the registered step interceptors (identity if none). */
+  interceptStep?<T>(invocation: StepInvocation, body: () => Promise<T>): Promise<T>;
 }
 
 /** The per-run logical position counter. `rewind()` gives a position back (see `ctx.patched`). */
@@ -90,6 +93,7 @@ export function createWorkflowCtx(
   host: CtxHost,
   runId: string,
   compensations: Compensation[],
+  workflow = '',
 ): WorkflowCtx {
   const { store } = host;
   const pos = new Position();
@@ -117,7 +121,17 @@ export function createWorkflowCtx(
       // only the attempt that actually completed (or the final failing one).
       const events: StepEvent[] = [];
       try {
-        const output = await fn(createStepLogger(events, host.clock));
+        const invocation: StepInvocation = {
+          runId,
+          workflow,
+          stepName: name,
+          seq: current,
+          attempt,
+        };
+        const body = () => fn(createStepLogger(events, host.clock));
+        const output = host.interceptStep
+          ? await host.interceptStep(invocation, body)
+          : await body();
         await host.completeStep({
           runId,
           seq: current,

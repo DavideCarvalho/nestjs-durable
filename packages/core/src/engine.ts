@@ -15,6 +15,8 @@ import type {
   StateStore,
   StepError,
   StepEvent,
+  StepInterceptor,
+  StepInvocation,
   StepResult,
   Transport,
   UpdateResult,
@@ -198,6 +200,8 @@ export class WorkflowEngine {
   /** Per-step "reset the liveness timer" callbacks, called when a heartbeat arrives. */
   private readonly heartbeatResets = new Map<string, () => void>();
   private readonly listeners = new Set<EngineListener>();
+  /** Step interceptors (onion middleware around real local-step execution), first = outermost. */
+  private readonly interceptors: StepInterceptor[] = [];
   /** Callbacks notified (on any instance) when a run is cancelled — for cooperative cancellation. */
   private readonly cancelListeners = new Set<(runId: string) => void>();
   /** Notified when a run is dead-lettered (moved to `dead`) — a hook for a DLQ handler. */
@@ -329,6 +333,30 @@ export class WorkflowEngine {
   subscribe(listener: EngineListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Register a {@link StepInterceptor} — onion middleware run around the real execution of every
+   * local `ctx.step` (timing, logging, tracing, error enrichment, context propagation). First
+   * registered is outermost; interceptors fire only when a step executes, never on replay. Returns
+   * an unsubscribe function.
+   */
+  use(interceptor: StepInterceptor): () => void {
+    this.interceptors.push(interceptor);
+    return () => {
+      const i = this.interceptors.indexOf(interceptor);
+      if (i >= 0) this.interceptors.splice(i, 1);
+    };
+  }
+
+  /** Fold the registered interceptors around a local step body (identity when there are none). */
+  private interceptStep<T>(invocation: StepInvocation, body: () => Promise<T>): Promise<T> {
+    if (this.interceptors.length === 0) return body();
+    const chain = this.interceptors.reduceRight<() => Promise<unknown>>(
+      (next, interceptor) => () => interceptor(invocation, next),
+      body as () => Promise<unknown>,
+    );
+    return chain() as Promise<T>;
   }
 
   /**
@@ -782,7 +810,7 @@ export class WorkflowEngine {
     }
     // Saga compensations registered by completed steps; run in reverse if the run later fails.
     const compensations: Compensation[] = [];
-    const ctx = createWorkflowCtx(this.ctxHost, run.id, compensations);
+    const ctx = createWorkflowCtx(this.ctxHost, run.id, compensations, run.workflow);
     try {
       const output = await fn(ctx, run.input);
       // Clear any error from an earlier failed-then-retried attempt: a completed run is a success
@@ -914,6 +942,7 @@ export class WorkflowEngine {
       startChild: (workflow, input, id) => {
         queueMicrotask(() => void this.start(workflow, input, id).catch(() => undefined));
       },
+      interceptStep: (invocation, body) => this.interceptStep(invocation, body),
     };
   }
 
