@@ -192,6 +192,15 @@ export interface StateStore {
   /** List waiters whose `token` starts with `prefix` — used to fan out an event to its subscribers. */
   listSignalWaiters(prefix: string): Promise<SignalWaiter[]>;
 
+  /**
+   * Buffer a signal whose waiter hasn't arrived yet, so the next `waitForSignal(token)` consumes it
+   * instead of it being lost (FIFO per token). Makes signals reliable regardless of timing and
+   * powers `signalWithStart`.
+   */
+  bufferSignal(token: string, payload: unknown): Promise<void>;
+  /** Take the oldest buffered signal for `token` (FIFO), or null if none is buffered. */
+  takeBufferedSignal(token: string): Promise<{ payload: unknown } | null>;
+
   // Dashboard queries
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
@@ -328,6 +337,8 @@ export interface ControlPlane {
 export type ControlMessage = { from?: string } & (
   | { kind: 'event'; event: EngineEvent }
   | { kind: 'cancel'; runId: string }
+  // A run was just enqueued — nudge worker instances to pick it up now instead of on the next poll.
+  | { kind: 'enqueued'; runId: string }
 );
 
 // ---------------------------------------------------------------------------

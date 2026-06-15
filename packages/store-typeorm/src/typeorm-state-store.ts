@@ -9,7 +9,12 @@ import {
   applyAttributeQuery,
 } from '@dudousxd/nestjs-durable-core';
 import { Brackets, type DataSource, IsNull, LessThanOrEqual, Like } from 'typeorm';
-import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './entities';
+import {
+  BufferedSignalEntity,
+  SignalWaiterEntity,
+  StepCheckpointEntity,
+  WorkflowRunEntity,
+} from './entities';
 import { ensureTypeOrmDurableSchema } from './schema';
 
 /**
@@ -31,6 +36,9 @@ export class TypeOrmStateStore implements StateStore {
   }
   private waiters() {
     return this.dataSource.getRepository(SignalWaiterEntity);
+  }
+  private buffered() {
+    return this.dataSource.getRepository(BufferedSignalEntity);
   }
 
   async createRun(run: WorkflowRun): Promise<void> {
@@ -153,6 +161,17 @@ export class TypeOrmStateStore implements StateStore {
     const waiter: SignalWaiter = { token: e.token, runId: e.runId, seq: e.seq };
     await this.waiters().delete({ token });
     return waiter;
+  }
+
+  async bufferSignal(token: string, payload: unknown): Promise<void> {
+    await this.buffered().save({ token, payload: payload ?? null });
+  }
+
+  async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
+    const e = await this.buffered().findOne({ where: { token }, order: { id: 'ASC' } });
+    if (!e) return null;
+    await this.buffered().delete({ id: e.id });
+    return { payload: e.payload ?? undefined };
   }
 }
 

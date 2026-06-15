@@ -31,6 +31,17 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
   const runs = q('durable_workflow_runs');
   const checkpoints = q('durable_step_checkpoints');
   const waiters = q('durable_signal_waiters');
+  const buffered = q('durable_buffered_signals');
+
+  // Auto-increment PK syntax differs per dialect: SQLite wants `INTEGER PRIMARY KEY AUTOINCREMENT`,
+  // MySQL `BIGINT AUTO_INCREMENT PRIMARY KEY`, Postgres `BIGSERIAL PRIMARY KEY`.
+  const bufferedId = isSqlite
+    ? `${q('id')} integer PRIMARY KEY AUTOINCREMENT`
+    : isMysql
+      ? `${q('id')} bigint NOT NULL AUTO_INCREMENT PRIMARY KEY`
+      : isPg
+        ? `${q('id')} bigserial PRIMARY KEY`
+        : `${q('id')} bigint NOT NULL AUTO_INCREMENT PRIMARY KEY`;
 
   const tables = [
     `CREATE TABLE IF NOT EXISTS ${runs} (
@@ -54,6 +65,9 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
     )`,
     `CREATE TABLE IF NOT EXISTS ${waiters} (
       ${q('token')} ${str} PRIMARY KEY, ${q('runId')} ${str} NOT NULL, ${q('seq')} ${int} NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS ${buffered} (
+      ${bufferedId}, ${q('token')} ${str} NOT NULL, ${q('payload')} ${txt}
     )`,
   ];
 
@@ -99,6 +113,8 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
     const indexes: Array<[string, string]> = [
       ['durable_runs_status_idx', `${runs} (${q('status')}, ${q('wakeAt')})`],
       ['durable_runs_workflow_status_idx', `${runs} (${q('workflow')}, ${q('status')})`],
+      // buffered signals are taken FIFO per token (smallest id) — index the token for the scan.
+      ['durable_buffered_signals_token_idx', `${buffered} (${q('token')})`],
     ];
     for (const [name, target] of indexes) {
       try {

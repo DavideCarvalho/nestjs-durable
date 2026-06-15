@@ -33,9 +33,25 @@ export class DashboardService {
     this.metricsCollector = collectMetrics(this.engine);
   }
 
-  /** Prometheus-text metrics (runs/steps by outcome, per-workflow counts) for a `/metrics` scrape. */
-  metrics(): string {
-    return this.metricsCollector.prometheus();
+  /**
+   * Prometheus-text metrics for a `/metrics` scrape: the event-counters (runs/steps by outcome,
+   * per-workflow counts) plus live **backlog gauges** queried at scrape time — `durable_pending_runs`
+   * (the dispatch backlog: the key health signal of the dispatch model) and `durable_dead_runs` (DLQ
+   * size). Capped per status so the scrape can't load an unbounded result set.
+   */
+  async metrics(): Promise<string> {
+    const cap = 10_000;
+    const [pending, dead] = await Promise.all([
+      this.store.listRuns({ status: 'pending', limit: cap }),
+      this.store.listRuns({ status: 'dead', limit: cap }),
+    ]);
+    const gauges = [
+      '# TYPE durable_pending_runs gauge',
+      `durable_pending_runs ${pending.length}`,
+      '# TYPE durable_dead_runs gauge',
+      `durable_dead_runs ${dead.length}`,
+    ].join('\n');
+    return `${this.metricsCollector.prometheus()}${gauges}\n`;
   }
 
   listRuns(query: RunQuery): Promise<WorkflowRun[]> {

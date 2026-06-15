@@ -95,6 +95,13 @@ export class CodecStateStore implements StateStore {
   listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
     return this.inner.listSignalWaiters(prefix);
   }
+  bufferSignal(token: string, payload: unknown): Promise<void> {
+    return this.inner.bufferSignal(token, this.enc(payload));
+  }
+  async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
+    const buffered = await this.inner.takeBufferedSignal(token);
+    return buffered && { payload: this.dec(buffered.payload) };
+  }
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return (await this.inner.listRuns(query)).map((r) => this.decRun(r));
   }

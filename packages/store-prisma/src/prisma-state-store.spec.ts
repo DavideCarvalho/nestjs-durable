@@ -134,7 +134,8 @@ describe('PrismaStateStore', () => {
         return a + 5;
       });
     });
-    expect((await engine.start('wf', { x: 1 }, 'run1')).status).toBe('failed');
+    await engine.start('wf', { x: 1 }, 'run1');
+    expect((await engine.waitForRun('run1')).status).toBe('failed');
     const resumed = await engine.resume('run1');
     expect(resumed.status).toBe('completed');
     expect(resumed.output).toBe(15);

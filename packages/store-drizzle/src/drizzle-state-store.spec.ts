@@ -21,6 +21,7 @@ CREATE TABLE durable_step_checkpoints (
   enqueued_at INTEGER, started_at INTEGER NOT NULL, finished_at INTEGER NOT NULL, PRIMARY KEY (run_id, seq)
 );
 CREATE TABLE durable_signal_waiters (token TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL);
+CREATE TABLE durable_buffered_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL, payload TEXT);
 `;
 
 function makeStore() {

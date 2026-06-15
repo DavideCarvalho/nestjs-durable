@@ -52,4 +52,10 @@ export const signalWaiters = sqliteTable('durable_signal_waiters', {
   seq: integer('seq').notNull(),
 });
 
-export const durableSchema = { workflowRuns, stepCheckpoints, signalWaiters };
+export const bufferedSignals = sqliteTable('durable_buffered_signals', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  token: text('token').notNull(),
+  payload: text('payload', { mode: 'json' }),
+});
+
+export const durableSchema = { workflowRuns, stepCheckpoints, signalWaiters, bufferedSignals };

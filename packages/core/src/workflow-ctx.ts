@@ -204,11 +204,31 @@ export function createWorkflowCtx(
   // NOTE (determinism): a bounded wait consumes TWO logical positions (deadline + wait), an
   // unbounded one consumes ONE. So adding or removing `{ timeoutMs }` on an existing `waitForSignal`
   // shifts the seq of every later step — treat it as a workflow-version change for in-flight runs.
+  // Consume a buffered signal (one delivered before this run was waiting), recording it as the
+  // signal checkpoint at `seq` so it resumes immediately instead of suspending. Replay-safe: the
+  // checkpoint makes the consumption deterministic.
+  const consumeBuffered = async <T>(token: string, seq: number): Promise<{ value: T } | null> => {
+    const buffered = await store.takeBufferedSignal(token);
+    if (!buffered) return null;
+    await store.saveCheckpoint(
+      instantCheckpoint({
+        runId,
+        seq,
+        name: `signal:${token}`,
+        kind: 'signal',
+        output: buffered.payload,
+      }),
+    );
+    return { value: buffered.payload as T };
+  };
+
   const waitForSignal = async <T>(token: string, opts?: { timeoutMs?: number }): Promise<T> => {
     if (opts?.timeoutMs == null) {
       const current = pos.next();
       const existing = await store.getCheckpoint(runId, current);
       if (existing && existing.status === 'completed') return existing.output as T;
+      const buffered = await consumeBuffered<T>(token, current);
+      if (buffered) return buffered.value;
       await store.putSignalWaiter({ token, runId, seq: current });
       throw new WorkflowSuspended();
     }
@@ -232,6 +252,8 @@ export function createWorkflowCtx(
     }
     const waited = await store.getCheckpoint(runId, waitSeq);
     if (waited && waited.status === 'completed') return waited.output as T;
+    const buffered = await consumeBuffered<T>(token, waitSeq);
+    if (buffered) return buffered.value;
     if (host.clock() >= deadline) {
       await store.takeSignalWaiter(token).catch(() => undefined);
       throw new SignalTimeoutError(token, timeoutMs);

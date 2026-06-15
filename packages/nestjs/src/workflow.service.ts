@@ -57,6 +57,35 @@ export class WorkflowService {
   }
 
   /**
+   * Ensure a run exists for `runId`, then deliver a signal to it — race-free (the signal is buffered
+   * until the run reaches its `waitForSignal`). The durable-entity / accumulator pattern: one
+   * long-lived run per key fed events by many calls. See {@link WorkflowEngine.signalWithStart}.
+   */
+  signalWithStart<C extends WorkflowClass>(
+    workflow: C,
+    input: WorkflowInputOf<C>,
+    runId: string,
+    signal: { token: string; payload?: unknown },
+    opts?: StartOptions,
+  ): Promise<{ runId: string }>;
+  signalWithStart(
+    workflow: string,
+    input: unknown,
+    runId: string,
+    signal: { token: string; payload?: unknown },
+    opts?: StartOptions,
+  ): Promise<{ runId: string }>;
+  signalWithStart(
+    workflow: string,
+    input: unknown,
+    runId: string,
+    signal: { token: string; payload?: unknown },
+    opts?: StartOptions,
+  ): Promise<{ runId: string }> {
+    return this.engine.signalWithStart(workflow, input, runId, signal, opts);
+  }
+
+  /**
    * Publish a named event. Resumes runs waiting on it via `ctx.waitForEvent(name, { match })` and
    * starts a fresh run of every workflow subscribed via `@Workflow({ onEvent })` / `@OnEvent` (the
    * payload becomes its input). Pass `opts.id` to dedupe redeliveries. Returns how many runs it

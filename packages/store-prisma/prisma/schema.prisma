@@ -52,3 +52,12 @@ model DurableSignalWaiter {
 
   @@map("durable_signal_waiters")
 }
+
+model DurableBufferedSignal {
+  id      BigInt @id @default(autoincrement())
+  token   String
+  payload Json?
+
+  @@index([token])
+  @@map("durable_buffered_signals")
+}

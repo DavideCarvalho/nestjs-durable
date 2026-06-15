@@ -10,7 +10,7 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { and, asc, desc, eq, isNotNull, isNull, like, lte, or } from 'drizzle-orm';
 import type { BaseSQLiteDatabase } from 'drizzle-orm/sqlite-core';
-import { signalWaiters, stepCheckpoints, workflowRuns } from './schema';
+import { bufferedSignals, signalWaiters, stepCheckpoints, workflowRuns } from './schema';
 
 type RunRow = typeof workflowRuns.$inferSelect;
 type CheckpointRow = typeof stepCheckpoints.$inferSelect;
@@ -181,6 +181,23 @@ export class DrizzleStateStore implements StateStore {
       .from(signalWaiters)
       .where(like(signalWaiters.token, `${prefix}%`));
     return rows.map((r) => ({ token: r.token, runId: r.runId, seq: r.seq }));
+  }
+
+  async bufferSignal(token: string, payload: unknown): Promise<void> {
+    await this.db.insert(bufferedSignals).values({ token, payload: payload ?? null });
+  }
+
+  async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
+    const rows = await this.db
+      .select()
+      .from(bufferedSignals)
+      .where(eq(bufferedSignals.token, token))
+      .orderBy(asc(bufferedSignals.id))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return null;
+    await this.db.delete(bufferedSignals).where(eq(bufferedSignals.id, row.id));
+    return { payload: row.payload ?? undefined };
   }
 }
 

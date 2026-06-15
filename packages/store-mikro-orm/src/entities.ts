@@ -112,4 +112,21 @@ export class SignalWaiterEntity {
   seq!: number;
 }
 
-export const ENTITIES = [WorkflowRunEntity, StepCheckpointEntity, SignalWaiterEntity] as const;
+@Entity({ tableName: 'durable_buffered_signals' })
+export class BufferedSignalEntity {
+  @PrimaryKey({ autoincrement: true })
+  id!: number;
+
+  @Property({ index: true })
+  token!: string;
+
+  @Property({ type: 'json', nullable: true })
+  payload?: unknown;
+}
+
+export const ENTITIES = [
+  WorkflowRunEntity,
+  StepCheckpointEntity,
+  SignalWaiterEntity,
+  BufferedSignalEntity,
+] as const;

@@ -9,7 +9,12 @@ import {
   applyAttributeQuery,
 } from '@dudousxd/nestjs-durable-core';
 import type { MikroORM } from '@mikro-orm/core';
-import { SignalWaiterEntity, StepCheckpointEntity, WorkflowRunEntity } from './entities';
+import {
+  BufferedSignalEntity,
+  SignalWaiterEntity,
+  StepCheckpointEntity,
+  WorkflowRunEntity,
+} from './entities';
 import { ensureMikroOrmDurableSchema } from './schema';
 
 /**
@@ -157,6 +162,24 @@ export class MikroOrmStateStore implements StateStore {
     const em = this.orm.em.fork();
     const rows = await em.find(SignalWaiterEntity, { token: { $like: `${prefix}%` } });
     return rows.map((e) => ({ token: e.token, runId: e.runId, seq: e.seq }));
+  }
+
+  async bufferSignal(token: string, payload: unknown): Promise<void> {
+    const em = this.orm.em.fork();
+    const e = new BufferedSignalEntity();
+    e.token = token;
+    e.payload = payload ?? null;
+    em.persist(e);
+    await em.flush();
+  }
+
+  async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
+    const em = this.orm.em.fork();
+    const entity = await em.findOne(BufferedSignalEntity, { token }, { orderBy: { id: 'asc' } });
+    if (!entity) return null;
+    const payload = entity.payload ?? undefined;
+    await em.removeAndFlush(entity);
+    return { payload };
   }
 }
 

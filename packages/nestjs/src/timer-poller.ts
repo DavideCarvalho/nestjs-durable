@@ -16,6 +16,7 @@ import type { DurableModuleOptions } from './durable.module';
 export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private polling = false;
+  private unsubscribeEnqueued?: () => void;
 
   constructor(
     private readonly engine: WorkflowEngine,
@@ -26,6 +27,9 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     // Only the worker role drives suspended runs forward. A dashboard-only instance
     // (`worker: false`) must not resume timers — leave that to the workers.
     if (this.options.worker === false) return;
+    // Low-latency dispatch: when a run is enqueued elsewhere (e.g. an API pod), pick it up at once
+    // over the control plane instead of waiting for the next poll tick. Leasing dedups across workers.
+    this.unsubscribeEnqueued = this.engine.onEnqueued((runId) => void this.engine.runOne(runId));
     await this.poll();
     const intervalMs = this.options.timerPollMs ?? 1_000;
     if (intervalMs > 0) {
@@ -36,6 +40,7 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
 
   onModuleDestroy(): void {
     if (this.timer) clearInterval(this.timer);
+    this.unsubscribeEnqueued?.();
   }
 
   private async poll(): Promise<void> {
