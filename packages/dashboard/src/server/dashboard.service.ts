@@ -66,17 +66,11 @@ export class DashboardService {
   async getRunDetail(runId: string): Promise<RunDetail | null> {
     const run = await this.store.getRun(runId);
     if (!run) return null;
-    const timeline = await this.store.listCheckpoints(runId);
-    // Children spawned by this run — fire-and-forget (`spawn:<id>` checkpoints) and awaited (live
-    // `child:<id>` waiters) — so the dashboard can render the parent→children tree.
-    const children = new Set<string>();
-    for (const cp of timeline) {
-      if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') children.add(cp.output);
-    }
-    for (const w of await this.store.listSignalWaiters('child:')) {
-      if (w.runId === runId) children.add(w.token.slice('child:'.length));
-    }
-    return { run, timeline, children: [...children] };
+    const [timeline, children] = await Promise.all([
+      this.store.listCheckpoints(runId),
+      this.engine.getRunChildren(runId), // canonical parent→children edge (shared with cancel cascade)
+    ]);
+    return { run, timeline, children };
   }
 
   /** Fix-and-replay a dead/failed run with a corrected input — a fresh linked run. Returns its id. */
