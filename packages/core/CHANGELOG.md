@@ -1,5 +1,30 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.19.0
+
+### Minor Changes
+
+- ed4a429: Add the polyglot-workflow protocol types: `WorkflowTask`, `HistoryEvent`, `WorkflowCommand`,
+  `WorkflowDecision`, and the `WorkflowExecutor` interface. These define the coordinator-driven contract
+  by which a workflow authored in another SDK (e.g. the Python `durable-worker`) is advanced by the
+  engine one turn at a time — the engine stays the sole owner of the durable state and applies the
+  decisions a remote worker's replay produces. Types only in this release (no behaviour change); the
+  engine-side remote executor lands next. See docs/plans/2026-06-15-polyglot-workflows-protocol.md.
+- 38f1cc6: Drive remote (cross-SDK) workflows: `engine.registerRemote(name, version, { group, executor })`. The
+  engine advances such a run by handing its history to the `WorkflowExecutor` (which dispatches a
+  `WorkflowTask` to a worker — e.g. the Python `durable-worker`) and applying the returned
+  `WorkflowDecision`: it persists recorded local steps, dispatches `call` commands as remote steps, and
+  schedules `sleep` timers, then settles or suspends the run. Everything around it — lease, recovery,
+  timers, the resume on a step result — is the same machinery as an in-process workflow, so the worker
+  never touches the store. `waitSignal`/`startChild` commands are a follow-up (they fail loudly for now).
+- 419facb: Carry remote workflows over the transport: `Transport.dispatchWorkflowTask` / `onDecision` (optional),
+  implemented by `BullMQTransport` (dispatch a WorkflowTask on `<prefix>-tasks-<group>`, consume decisions
+  on `<prefix>-decisions` — the queues the Python `durable-worker`'s `run_redis_workflow_worker` serves).
+  New `RemoteWorkflowExecutor` implements `WorkflowExecutor` over a transport (correlates each turn's
+  decision by `taskId`), so `engine.registerRemote(name, version, { group, executor })` drives a workflow
+  authored in another SDK over Redis/BullMQ. Verified end-to-end live: a Python `WorkflowWorker` replays
+  and the TS engine drives it across real Redis.
+
 ## 0.18.0
 
 ### Minor Changes
