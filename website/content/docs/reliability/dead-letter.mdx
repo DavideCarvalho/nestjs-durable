@@ -10,8 +10,12 @@ loop forever, taking the whole instance down with it each time. The dead-letter 
 
 ## Capping recovery: `maxRecoveryAttempts`
 
-Every time crash-recovery picks up a still-`running` run, the engine increments that run's
-`recoveryAttempts` *before* resuming it (so a crash mid-resume still advances the counter). Set
+Crash-recovery is **self-healing and periodic**: while a run executes its worker renews a recovery lease,
+so a crashed worker's lease expires and recovery (`engine.recoverIncomplete()`, called every tick by the
+`TimerPoller`) reclaims the orphaned run within ~`leaseMs` — on any instance, not just on the next boot.
+That's what makes a genuine poison pill visible: it gets picked up again and again. Every time
+crash-recovery picks up a still-`running` run, the engine increments that run's `recoveryAttempts`
+*before* resuming it (so a crash mid-resume still advances the counter). Set
 `maxRecoveryAttempts` — an engine/module option — and once a run exceeds it, instead of resuming yet again
 the engine moves the run to the terminal **`dead`** status with a `max_recovery_attempts` error, releases its
 lease, and stops touching it:

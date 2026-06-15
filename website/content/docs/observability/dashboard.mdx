@@ -56,8 +56,11 @@ is gated, not the control plane. (Default is `worker: true`, so single-process a
 
 ## What it shows
 
-- **Runs** — every run with its status (running / suspended / completed / failed / cancelled /
-  **dead**), filterable. The status filter is a row of chips, including a **`dead`** chip for the
+- **Runs** — every run with its status (**pending** / running / suspended / completed / failed /
+  cancelled / **dead**), filterable. **`pending`** is a run that's been created and enqueued but not
+  yet picked up by a worker — you'll see it briefly on every run, and persistently on an API pod
+  (`worker: false`) whose runs execute on separate worker pods. The status filter is a row of chips,
+  including a **`dead`** chip for the
   [dead-letter](/docs/concepts/durability) state; a dead run carries a distinct badge so a poison
   pill is easy to spot.
 - **Timeline as a graph** — the selected run rendered with `react-flow`: a node pipeline from
@@ -72,6 +75,10 @@ is gated, not the control plane. (Default is `worker: true`, so single-process a
   polling, so a running workflow updates in place.
 - **Actions** — retry a failed/suspended/dead run, cancel a running one, **cancel + undo** (cancel
   with saga compensation), and **continue** a run paused at a [breakpoint](/docs/concepts/workflows-and-steps).
+  These are **non-blocking**: retry **re-enqueues** the run (`engine.requeue(runId)` → `pending` +
+  dispatch) and cancel + undo runs the saga compensation **in the background** — neither replays the
+  workflow inline in the HTTP request, so the dashboard action returns immediately and a worker does the
+  work. (Previously an inline replay could hang the request.)
 
 ### Live-tail over SSE
 
@@ -99,9 +106,10 @@ instance (single-process apps).
 
 The run actions include both a plain **Cancel** and a **Cancel + Undo**. Plain cancel is immediate —
 the run is marked `cancelled` and a late worker result is dropped. **Cancel + Undo** instead asks the
-engine to **compensate the saga**: the suspended run is resumed so its completed steps' `compensate`
-callbacks run in reverse order (each visible as a `compensate:<step>` step event in the timeline),
-then the run is marked cancelled. The UI sends this as `cancel` with `?compensate=true`:
+engine to **compensate the saga** — in the **background**, not in the HTTP request: the run is resumed
+on a worker so its completed steps' `compensate` callbacks run in reverse order (each visible as a
+`compensate:<step>` step event in the timeline), then the run is marked cancelled. The HTTP action
+returns immediately. The UI sends this as `cancel` with `?compensate=true`:
 
 ```ts
 await durableClient.cancel(runId);                      // immediate, no undo
@@ -163,7 +171,7 @@ await durableClient.retry(detail.run.id);
 | `GET` | `/durable/api/runs` | list runs (`?status=`, `?workflow=`) |
 | `GET` | `/durable/api/runs/:id` | run + step timeline |
 | `GET` (SSE) | `/durable/api/runs/:id/stream` | live-tail the run's lifecycle events |
-| `POST` | `/durable/api/runs/:id/retry` | resume the run |
+| `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |
 | `POST` | `/durable/api/runs/:id/cancel` | cancel the run (`?compensate=true` to undo the saga first) |
 | `POST` | `/durable/api/runs/:id/continue` | resume a run paused at a breakpoint |
 | `POST` | `/durable/api/webhooks/:token` | deliver a `ctx.webhook()` callback (body resumes the run) |
