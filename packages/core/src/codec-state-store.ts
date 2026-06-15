@@ -1,0 +1,95 @@
+import type { RunQuery, SignalWaiter, StateStore, StepCheckpoint, WorkflowRun } from './interfaces';
+
+/**
+ * Transforms a payload value as it crosses the store boundary — e.g. encrypt-at-rest, compress, or
+ * redact PII. `decode` must be the exact inverse of `encode`. Both are synchronous (use a local
+ * cipher / codec); wrap an async KMS yourself if you need one.
+ */
+export interface PayloadCodec {
+  encode(value: unknown): unknown;
+  decode(value: unknown): unknown;
+}
+
+/**
+ * A `StateStore` decorator that runs run/step **payloads** (input + output) through a
+ * {@link PayloadCodec} — encoded on write, decoded on read — so they're never stored in the clear.
+ * Adapter-agnostic: wrap any store. Searchable metadata (id, status, workflow, tags, timestamps) and
+ * the structured `error` are left untouched so the dashboard, queries, and recovery still work.
+ *
+ * ```ts
+ * const store = new CodecStateStore(new TypeOrmStateStore(ds), aesCodec);
+ * ```
+ */
+export class CodecStateStore implements StateStore {
+  constructor(
+    private readonly inner: StateStore,
+    private readonly codec: PayloadCodec,
+  ) {}
+
+  private enc(v: unknown): unknown {
+    return v === undefined ? undefined : this.codec.encode(v);
+  }
+  private dec(v: unknown): unknown {
+    return v === undefined ? undefined : this.codec.decode(v);
+  }
+
+  private encRun(run: WorkflowRun): WorkflowRun {
+    return { ...run, input: this.enc(run.input), output: this.enc(run.output) };
+  }
+  private decRun<T extends WorkflowRun | null>(run: T): T {
+    return (run && { ...run, input: this.dec(run.input), output: this.dec(run.output) }) as T;
+  }
+  private encCp(cp: StepCheckpoint): StepCheckpoint {
+    return { ...cp, input: this.enc(cp.input), output: this.enc(cp.output) };
+  }
+  private decCp<T extends StepCheckpoint | null>(cp: T): T {
+    return (cp && { ...cp, input: this.dec(cp.input), output: this.dec(cp.output) }) as T;
+  }
+
+  ensureSchema(): Promise<void> {
+    return this.inner.ensureSchema?.() ?? Promise.resolve();
+  }
+
+  createRun(run: WorkflowRun): Promise<void> {
+    return this.inner.createRun(this.encRun(run));
+  }
+  updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+    const next = { ...patch };
+    if ('input' in patch) next.input = this.enc(patch.input);
+    if ('output' in patch) next.output = this.enc(patch.output);
+    return this.inner.updateRun(runId, next);
+  }
+  async getRun(runId: string): Promise<WorkflowRun | null> {
+    return this.decRun(await this.inner.getRun(runId));
+  }
+  async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
+    return this.decCp(await this.inner.getCheckpoint(runId, seq));
+  }
+  saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
+    return this.inner.saveCheckpoint(this.encCp(checkpoint));
+  }
+  async listIncompleteRuns(): Promise<WorkflowRun[]> {
+    return (await this.inner.listIncompleteRuns()).map((r) => this.decRun(r));
+  }
+  async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
+    return (await this.inner.listDueTimers(nowMs)).map((r) => this.decRun(r));
+  }
+  tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean> {
+    return this.inner.tryLockRun(runId, owner, leaseUntilMs, nowMs);
+  }
+  releaseRunLock(runId: string): Promise<void> {
+    return this.inner.releaseRunLock(runId);
+  }
+  putSignalWaiter(waiter: SignalWaiter): Promise<void> {
+    return this.inner.putSignalWaiter(waiter);
+  }
+  takeSignalWaiter(token: string): Promise<SignalWaiter | null> {
+    return this.inner.takeSignalWaiter(token);
+  }
+  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+    return (await this.inner.listRuns(query)).map((r) => this.decRun(r));
+  }
+  async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+    return (await this.inner.listCheckpoints(runId)).map((c) => this.decCp(c));
+  }
+}
