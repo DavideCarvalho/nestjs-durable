@@ -1,4 +1,9 @@
-import { type StepError, WORKFLOW_NAME_KEY, type WorkflowRef } from '@dudousxd/nestjs-durable-core';
+import {
+  type SingletonConfig,
+  type StepError,
+  WORKFLOW_NAME_KEY,
+  type WorkflowRef,
+} from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
 
 export const WORKFLOW_METADATA = Symbol('nestjs-durable:workflow');
@@ -10,6 +15,8 @@ export interface WorkflowMeta {
   deadLetterWorkflow?: WorkflowRef;
   /** Static searchable labels stamped on every run of this workflow. See `WorkflowOptions`. */
   tags?: string[];
+  /** Per-key serialization (a durable mutex). See `WorkflowOptions`. */
+  singleton?: SingletonConfig;
 }
 
 export interface WorkflowOptions {
@@ -28,6 +35,13 @@ export interface WorkflowOptions {
    * merged with any per-run tags passed to `start`. Searchable/filterable in the dashboard.
    */
   tags?: string[];
+  /**
+   * Serialize runs of this workflow that share a key — a durable FIFO mutex. e.g.
+   * `singleton: { key: (input) => `base:${input.baseId}` }` runs at most one pipeline per base at a
+   * time; same-key runs queue (suspended) and admit in creation order as slots free. `limit` (default
+   * 1) raises the concurrency.
+   */
+  singleton?: SingletonConfig;
 }
 
 /**
@@ -41,6 +55,7 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       version: options.version ?? '1',
       deadLetterWorkflow: options.deadLetterWorkflow,
       tags: options.tags,
+      singleton: options.singleton,
     };
     Reflect.defineMetadata(WORKFLOW_METADATA, meta, target);
     // Stamp the registered name so this class can be used as a typed workflow ref (ctx.child,
