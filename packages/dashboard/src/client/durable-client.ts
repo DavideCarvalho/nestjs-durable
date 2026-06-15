@@ -32,6 +32,8 @@ export interface StepEvent {
   name?: string;
   /** For a sub-step: its outcome. */
   status?: 'ok' | 'failed' | 'skipped';
+  /** For a log line emitted inside a sub-process: that sub-process's name, so logs group under it. */
+  process?: string;
   data?: unknown;
 }
 
@@ -73,13 +75,16 @@ export interface EngineEvent {
     | 'run.suspended'
     | 'step.started'
     | 'step.completed'
-    | 'step.failed';
+    | 'step.failed'
+    | 'step.progress';
   runId: string;
   workflow?: string;
   seq?: number;
   name?: string;
   kind?: StepKind;
   durationMs?: number;
+  /** The live step event carried by a `step.progress` (a running step's just-emitted log/sub-process). */
+  event?: StepEvent;
   at: string;
 }
 

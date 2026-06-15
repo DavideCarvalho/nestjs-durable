@@ -40,6 +40,21 @@ const LEVEL_TONE: Record<StepEvent['level'], string> = {
 
 const SUB_ORDER: Array<NonNullable<StepEvent['status']>> = ['ok', 'failed', 'skipped'];
 
+/** Collapse a step's log lines into consecutive runs sharing the same owning sub-process (`process`),
+ *  preserving chronological order. A fan-out step's trail then reads grouped per p-process; logs with
+ *  no `process` (step-level lines, or a worker that doesn't tag) stay in their own ungrouped run. */
+function groupLogsByProcess(
+  logs: StepEvent[],
+): Array<{ process?: string; logs: StepEvent[] }> {
+  const groups: Array<{ process?: string; logs: StepEvent[] }> = [];
+  for (const log of logs) {
+    const last = groups[groups.length - 1];
+    if (last && last.process === log.process) last.logs.push(log);
+    else groups.push({ process: log.process, logs: [log] });
+  }
+  return groups;
+}
+
 /** Sub-process outcomes (ok/failed/skipped) and the log lines a step emitted, e.g. one row per
  *  parallel p-process so you can see which succeeded, failed, or weren't validated. */
 function StepEvents({ events }: { events: StepEvent[] }) {
@@ -86,15 +101,26 @@ function StepEvents({ events }: { events: StepEvent[] }) {
           <div className="mono mb-1.5 text-[10px] uppercase tracking-[0.18em] text-zinc-500">
             logs · {logs.length}
           </div>
-          <ul className="mono max-h-64 overflow-auto rounded-lg border border-[var(--line)] bg-black/40 p-2.5 text-[11px] leading-relaxed">
-            {logs.map((e) => (
-              <li key={`${e.at}-${e.message}`} className="flex gap-2 py-0.5">
-                <span className="shrink-0 text-zinc-600 tnum">{clockMs(e.at)}</span>
-                <span className={`shrink-0 uppercase ${LEVEL_TONE[e.level]}`}>{e.level}</span>
-                <span className="min-w-0 break-words text-zinc-300">{e.message}</span>
-              </li>
+          <div className="mono max-h-64 overflow-auto rounded-lg border border-[var(--line)] bg-black/40 p-2.5 text-[11px] leading-relaxed">
+            {groupLogsByProcess(logs).map((group, gi) => (
+              <ul key={`${group.process ?? 'step'}-${gi}`} className={gi > 0 ? 'mt-2' : ''}>
+                {/* Logs a worker tagged with their owning sub-process group under it, so a fan-out
+                    step (e.g. `all` → many p-processes) reads as a per-process trail, not one blur. */}
+                {group.process && (
+                  <li className="sticky top-0 -mx-2.5 mb-0.5 bg-black/40 px-2.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-500 backdrop-blur">
+                    {group.process}
+                  </li>
+                )}
+                {group.logs.map((e) => (
+                  <li key={`${e.at}-${e.message}`} className="flex gap-2 py-0.5">
+                    <span className="shrink-0 text-zinc-600 tnum">{clockMs(e.at)}</span>
+                    <span className={`shrink-0 uppercase ${LEVEL_TONE[e.level]}`}>{e.level}</span>
+                    <span className="min-w-0 break-words text-zinc-300">{e.message}</span>
+                  </li>
+                ))}
+              </ul>
             ))}
-          </ul>
+          </div>
         </section>
       )}
     </>

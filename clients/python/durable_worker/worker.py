@@ -47,10 +47,26 @@ class StepContext:
         self,
         run_id: Optional[str] = None,
         is_cancelled: Optional[Callable[[str], bool]] = None,
+        seq: Optional[int] = None,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.events: List[Dict[str, Any]] = []
         self._run_id = run_id
         self._is_cancelled = is_cancelled
+        # Step seq + a sink for live progress: when a transport supplies ``on_event``, every event is
+        # ALSO handed to it as it happens (e.g. published on the control plane as a ``step.progress``),
+        # so a dashboard tails a long step line-by-line instead of waiting for the final result.
+        self._seq = seq
+        self._on_event = on_event
+        # The sub-process a handler is currently inside (set via ``process``), stamped onto log lines
+        # so the dashboard groups a fan-out step's trail per sub-process.
+        self._process: Optional[str] = None
+
+    def process(self, name: Optional[str]) -> None:
+        """Mark the sub-process whose work is now running; subsequent log lines are tagged with it
+        (until changed or cleared with ``None``). A no-op for ``sub()`` outcome rows, which name
+        themselves. Lets a fan-out handler attribute its log trail to each sub-process."""
+        self._process = name
 
     @property
     def cancelled(self) -> bool:
@@ -82,9 +98,19 @@ class StepContext:
             event["name"] = name
         if status is not None:
             event["status"] = status
+        # Tag a log line (no outcome status) with the sub-process it was emitted inside, if any.
+        elif self._process is not None:
+            event["process"] = self._process
         if data is not None:
             event["data"] = data
         self.events.append(event)
+        # Live progress: hand the event to the transport's sink so it streams now (best-effort — a
+        # broken sink must never fail the handler; the event is already captured for the result).
+        if self._on_event is not None:
+            try:
+                self._on_event(event)
+            except Exception:  # noqa: BLE001 — live-tail is best-effort observability
+                pass
 
     def debug(self, message: str, data: Any = None) -> None:
         self._emit("debug", message, data=data)
@@ -139,19 +165,21 @@ class Worker:
         self,
         task: Dict[str, Any],
         is_cancelled: Optional[Callable[[str], bool]] = None,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Run the handler for ``task`` and return a wire-format result.
 
         Pure and synchronous from the caller's view (async handlers are awaited internally), so a
         transport can simply ``result = worker.process_task(task); send(result)``. Pass
-        ``is_cancelled`` so the handler's ``ctx.cancelled`` reflects cooperative cancellation.
+        ``is_cancelled`` so the handler's ``ctx.cancelled`` reflects cooperative cancellation, and
+        ``on_event`` to receive each step event live (for ``step.progress`` streaming).
         """
 
         base = self._base(task)
         handler = self._handlers.get(task["name"])
         if handler is None:
             return self._no_handler(base, task["name"])
-        ctx = StepContext(run_id=task.get("runId"), is_cancelled=is_cancelled)
+        ctx = self._ctx(task, is_cancelled, on_event)
         try:
             output = self._invoke(handler, task.get("input"), ctx)
             if inspect.isawaitable(output):
@@ -164,6 +192,7 @@ class Worker:
         self,
         task: Dict[str, Any],
         is_cancelled: Optional[Callable[[str], bool]] = None,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Async variant — awaits async handlers in the current loop. Use from a transport that
         already runs inside an event loop (e.g. the BullMQ runner)."""
@@ -172,7 +201,7 @@ class Worker:
         handler = self._handlers.get(task["name"])
         if handler is None:
             return self._no_handler(base, task["name"])
-        ctx = StepContext(run_id=task.get("runId"), is_cancelled=is_cancelled)
+        ctx = self._ctx(task, is_cancelled, on_event)
         try:
             output = self._invoke(handler, task.get("input"), ctx)
             if inspect.isawaitable(output):
@@ -180,6 +209,19 @@ class Worker:
             return self._completed(base, output, ctx)
         except Exception as err:  # noqa: BLE001
             return self._failure(base, err, ctx)
+
+    @staticmethod
+    def _ctx(
+        task: Dict[str, Any],
+        is_cancelled: Optional[Callable[[str], bool]],
+        on_event: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> StepContext:
+        return StepContext(
+            run_id=task.get("runId"),
+            is_cancelled=is_cancelled,
+            seq=task.get("seq"),
+            on_event=on_event,
+        )
 
     @staticmethod
     def _invoke(handler: Handler, input_: Any, ctx: StepContext) -> Any:

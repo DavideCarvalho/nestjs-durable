@@ -206,7 +206,28 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   const isLive = liveStatus === 'running' || liveStatus === 'suspended';
   useEffect(() => {
     if (!isLive) return;
-    return durableClient.streamRun(id, () => {
+    return durableClient.streamRun(id, (event) => {
+      // `step.progress` carries a single live event from a still-running step — merge it straight
+      // into the cached step's `events` so a long step's trail streams in line-by-line. Invalidating
+      // per event would mean a store refetch per log line (hundreds for a fan-out step) AND would
+      // show nothing until the step completes, since the store only gets `events` at completion.
+      if (event.type === 'step.progress' && event.event && event.seq != null) {
+        const seq = event.seq;
+        const live = event.event;
+        qc.setQueryData(['run', id], (prev: RunDetail | undefined) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            timeline: prev.timeline.map((step) =>
+              step.seq === seq
+                ? { ...step, events: [...(step.events ?? []), live] }
+                : step,
+            ),
+          };
+        });
+        return;
+      }
+      // Lifecycle events (step started/completed, run settled) change authoritative state — refetch.
       qc.invalidateQueries({ queryKey: ['run', id] });
     });
   }, [id, isLive, qc]);
@@ -413,7 +434,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           </button>
         </div>
       )}
-      <div className="relative grid min-h-0 flex-1 grid-rows-[1fr_auto]">
+      <div className="relative grid min-h-0 flex-1 grid-rows-[1fr_clamp(120px,34%,260px)]">
         <div className="relative min-h-0">
           {timeline.length === 0 ? (
             <div className="grid h-full place-items-center text-sm text-zinc-600">
@@ -436,7 +457,10 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           )}
         </div>
         {timeline.length > 0 && (
-          <div className="h-[clamp(120px,34%,260px)] border-t border-[var(--line)] bg-black/20">
+          // The spans height lives in the GRID TRACK above (`clamp(...)`), not here — an `auto` track
+          // sizes to the tall span content's min-content and collapses the `1fr` WorkflowGraph row to
+          // 0. With the track clamped, this wrapper just fills it and clips; SpansTimeline scrolls.
+          <div className="min-h-0 overflow-hidden border-t border-[var(--line)] bg-black/20">
             <SpansTimeline
               run={run}
               timeline={timeline}

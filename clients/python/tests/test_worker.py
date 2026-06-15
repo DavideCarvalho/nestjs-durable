@@ -136,6 +136,48 @@ class WorkerTest(unittest.TestCase):
         result = worker.process_task(task())
         self.assertEqual(result["events"][0]["message"], "async")
 
+    def test_logs_are_tagged_with_the_current_process(self):
+        worker = Worker()
+
+        @worker.step("payments.charge-card")
+        def charge(_data, ctx: StepContext):
+            ctx.process("proc-a")
+            ctx.info("inside a")
+            ctx.sub("proc-a", "ok")
+            ctx.process("proc-b")
+            ctx.debug("inside b")
+            ctx.process(None)
+            ctx.info("step-level")
+            return {"ok": True}
+
+        # process() itself emits nothing, so the events are: [info a, sub a, debug b, info step-level]
+        events = worker.process_task(task())["events"]
+        # log lines carry the sub-process that was running when they fired...
+        self.assertEqual(events[0]["process"], "proc-a")
+        self.assertEqual(events[2]["process"], "proc-b")
+        # ...the sub-process OUTCOME row names itself (no `process` tag)...
+        self.assertNotIn("process", events[1])
+        self.assertEqual(events[1]["status"], "ok")
+        # ...and a log after process(None) is untagged (step-level).
+        self.assertNotIn("process", events[3])
+
+    def test_on_event_streams_each_event_as_it_is_emitted(self):
+        worker = Worker()
+        live = []
+
+        @worker.step("payments.charge-card")
+        def charge(_data, ctx: StepContext):
+            ctx.info("first")
+            # the live sink saw the event the instant it was emitted, before the step returned
+            self.assertEqual([e["message"] for e in live], ["first"])
+            ctx.sub("proc-a", "ok")
+            return {"ok": True}
+
+        result = worker.process_task(task(), on_event=live.append)
+        self.assertEqual([e["message"] for e in live], ["first", "proc-a"])
+        # the same events still ride back on the result (live-tail doesn't replace the final record)
+        self.assertEqual(len(result["events"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

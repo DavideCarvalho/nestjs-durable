@@ -108,6 +108,10 @@ export interface StepEvent {
   name?: string;
   /** For a sub-step: its outcome. */
   status?: 'ok' | 'failed' | 'skipped';
+  /** For a log line emitted *inside* a sub-process: that owning sub-process's name, so the dashboard
+   *  can group a step's log trail under each sub-process (e.g. one p-process of a fan-out) instead of
+   *  one flat list. Set on logs (no `status`); a worker stamps it from the sub-process it's running. */
+  process?: string;
   /** Optional structured payload. */
   data?: unknown;
 }
@@ -633,7 +637,11 @@ export type EngineEventType =
   | 'run.suspended'
   | 'step.started'
   | 'step.completed'
-  | 'step.failed';
+  | 'step.failed'
+  // A single step event (log line / sub-process outcome) emitted WHILE a step is still running, so
+  // observers tail a long step's progress live instead of waiting for `step.completed` to deliver
+  // the whole `events` array at once. Carries `event`; never persisted (live-tail only).
+  | 'step.progress';
 
 /**
  * A lifecycle event emitted by the engine. The observability surfaces (dashboard, OTel, the
@@ -652,6 +660,9 @@ export interface EngineEvent {
   durationMs?: number;
   /** For a remote step: how long it waited in the queue before a worker picked it up. */
   queueMs?: number;
+  /** The live step event carried by a `step.progress` (the single log line / sub-process outcome a
+   *  running step just emitted). Absent on lifecycle events. */
+  event?: StepEvent;
   at: Date;
 }
 
