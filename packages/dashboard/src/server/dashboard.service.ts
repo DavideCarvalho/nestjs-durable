@@ -18,6 +18,8 @@ export interface RunDetail {
   run: WorkflowRun;
   /** Steps in execution order — the end-to-end timeline (local + remote). */
   timeline: StepCheckpoint[];
+  /** Ids of runs this run spawned (ctx.child / ctx.startChild) — the parent→children tree. */
+  children: string[];
 }
 
 /** Read-model and actions backing the control-plane UI. */
@@ -41,13 +43,16 @@ export class DashboardService {
    */
   async metrics(): Promise<string> {
     const cap = 10_000;
-    const [pending, dead] = await Promise.all([
+    const [pending, running, dead] = await Promise.all([
       this.store.listRuns({ status: 'pending', limit: cap }),
+      this.store.listRuns({ status: 'running', limit: cap }),
       this.store.listRuns({ status: 'dead', limit: cap }),
     ]);
     const gauges = [
       '# TYPE durable_pending_runs gauge',
       `durable_pending_runs ${pending.length}`,
+      '# TYPE durable_running_runs gauge',
+      `durable_running_runs ${running.length}`,
       '# TYPE durable_dead_runs gauge',
       `durable_dead_runs ${dead.length}`,
     ].join('\n');
@@ -62,7 +67,21 @@ export class DashboardService {
     const run = await this.store.getRun(runId);
     if (!run) return null;
     const timeline = await this.store.listCheckpoints(runId);
-    return { run, timeline };
+    // Children spawned by this run — fire-and-forget (`spawn:<id>` checkpoints) and awaited (live
+    // `child:<id>` waiters) — so the dashboard can render the parent→children tree.
+    const children = new Set<string>();
+    for (const cp of timeline) {
+      if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') children.add(cp.output);
+    }
+    for (const w of await this.store.listSignalWaiters('child:')) {
+      if (w.runId === runId) children.add(w.token.slice('child:'.length));
+    }
+    return { run, timeline, children: [...children] };
+  }
+
+  /** Fix-and-replay a dead/failed run with a corrected input — a fresh linked run. Returns its id. */
+  retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null> {
+    return this.engine.retryWithInput(runId, input);
   }
 
   /** Re-run a failed/incomplete run; completed steps replay from their checkpoints. */

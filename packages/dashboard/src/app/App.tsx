@@ -216,6 +216,24 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     onSuccess: invalidate,
   });
   const cont = useMutation({ mutationFn: () => durableClient.continue(id), onSuccess: invalidate });
+  // Fix-and-replay: edit the input as JSON, then re-run as a fresh linked run.
+  const fixReplay = useMutation({
+    mutationFn: (input: unknown) => durableClient.retryWithInput(id, input),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ['runs'] });
+      onOpenRun(r.runId);
+    },
+  });
+  const onFixReplay = () => {
+    const current = JSON.stringify((data as RunDetail | undefined)?.run.input ?? {}, null, 2);
+    const edited = window.prompt('Fix the input, then replay as a fresh run:', current);
+    if (edited == null) return;
+    try {
+      fixReplay.mutate(JSON.parse(edited));
+    } catch {
+      window.alert('Invalid JSON');
+    }
+  };
   const [sel, setSel] = useState<number>();
   const [showRunIO, setShowRunIO] = useState(false);
 
@@ -294,6 +312,21 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               ))}
             </div>
           )}
+          {(data as RunDetail | undefined)?.children?.length ? (
+            <div className="mt-1.5 flex flex-wrap items-center gap-1">
+              <span className="text-[10px] text-zinc-600">children:</span>
+              {(data as RunDetail).children?.map((cid) => (
+                // biome-ignore lint/a11y/useKeyWithClickEvents: span keeps the row layout; click navigates
+                <span
+                  key={cid}
+                  onClick={() => onOpenRun(cid)}
+                  className="mono cursor-pointer rounded border border-[var(--line)] bg-zinc-800/40 px-1.5 text-[10px] text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
+                >
+                  {cid}
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
         <div className="flex shrink-0 gap-2">
           <button
@@ -324,6 +357,18 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             <RetryIcon width={12} height={12} />
             Retry
           </button>
+          {(run.status === 'dead' || run.status === 'failed') && (
+            <button
+              type="button"
+              disabled={fixReplay.isPending}
+              onClick={onFixReplay}
+              title="Edit the input and re-run as a fresh linked run"
+              className="flex items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-indigo-300 transition-colors enabled:hover:bg-indigo-500/20 disabled:opacity-30"
+            >
+              <RetryIcon width={12} height={12} />
+              Fix &amp; replay
+            </button>
+          )}
           {canCancel && (
             <button
               type="button"
