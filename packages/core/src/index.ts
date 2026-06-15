@@ -6,6 +6,7 @@ export * from './protocol';
 export * from './queue';
 export * from './remote-step-factory';
 export * from './codec-state-store';
+export * from './metrics';
 export * from './scheduler';
 export * from './tokens';
 export * from './workflow-ref';

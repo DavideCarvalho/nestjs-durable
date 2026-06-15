@@ -1,5 +1,15 @@
 import type { RunStatus } from '@dudousxd/nestjs-durable-core';
-import { Body, Controller, Get, NotFoundException, Param, Post, Query, Sse } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Header,
+  NotFoundException,
+  Param,
+  Post,
+  Query,
+  Sse,
+} from '@nestjs/common';
 import { DashboardService } from './dashboard.service.js';
 
 /** JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule). */
@@ -14,6 +24,13 @@ export class DurableApiController {
     @Query('tag') tag?: string,
   ) {
     return this.dashboard.listRuns({ status, workflow, tag });
+  }
+
+  /** Prometheus-text metrics (runs/steps by outcome, per-workflow counts) for a scrape. */
+  @Get('metrics')
+  @Header('Content-Type', 'text/plain; version=0.0.4')
+  metrics() {
+    return this.dashboard.metrics();
   }
 
   @Get('runs/:id')

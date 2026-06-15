@@ -1,5 +1,6 @@
 import {
   type EngineEvent,
+  type MetricsCollector,
   type RunQuery,
   type RunResult,
   STATE_STORE,
@@ -8,6 +9,7 @@ import {
   type UpdateResult,
   WorkflowEngine,
   type WorkflowRun,
+  collectMetrics,
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable } from '@nestjs/common';
 import { Observable } from 'rxjs';
@@ -21,10 +23,20 @@ export interface RunDetail {
 /** Read-model and actions backing the control-plane UI. */
 @Injectable()
 export class DashboardService {
+  /** Prometheus counters accumulated from engine events since boot (per process). */
+  private readonly metricsCollector: MetricsCollector;
+
   constructor(
     @Inject(STATE_STORE) private readonly store: StateStore,
     private readonly engine: WorkflowEngine,
-  ) {}
+  ) {
+    this.metricsCollector = collectMetrics(this.engine);
+  }
+
+  /** Prometheus-text metrics (runs/steps by outcome, per-workflow counts) for a `/metrics` scrape. */
+  metrics(): string {
+    return this.metricsCollector.prometheus();
+  }
 
   listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return this.store.listRuns(query);
