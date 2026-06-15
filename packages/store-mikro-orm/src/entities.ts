@@ -67,7 +67,7 @@ export class StepCheckpointEntity {
   stepId!: string;
 
   @Property()
-  status!: 'pending' | 'completed' | 'failed';
+  status!: 'pending' | 'running' | 'completed' | 'failed';
 
   @Property({ type: 'json', nullable: true })
   input?: unknown;

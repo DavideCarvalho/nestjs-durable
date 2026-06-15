@@ -42,8 +42,11 @@ export interface StepCheckpoint {
   seq: number;
   name: string;
   kind: StepKind;
-  /** `pending` = a remote step dispatched and awaiting its worker result (in-flight). */
-  status: 'pending' | 'completed' | 'failed';
+  /**
+   * `pending` = a remote step dispatched and awaiting its worker result (in-flight).
+   * `running` = a local step whose body is executing right now (in-flight).
+   */
+  status: 'pending' | 'running' | 'completed' | 'failed';
   /** What the step was called with (a remote step's `ctx.call` args). */
   input?: unknown;
   output?: unknown;
@@ -84,7 +87,8 @@ export function runDisplayStatus(
   timeline?: StepCheckpoint[],
 ): RunDisplayStatus {
   if (run.status !== 'suspended') return run.status;
-  if (timeline?.some((s) => s.status === 'pending')) return 'running'; // a remote step is in flight
+  // a remote step is in flight (`pending`) or a local step body is executing (`running`)
+  if (timeline?.some((s) => s.status === 'pending' || s.status === 'running')) return 'running';
   if (run.wakeAt != null) return 'sleeping'; // parked on a durable timer
   if (timeline) return 'awaiting'; // timeline known, nothing pending, no timer → waiting on a signal
   return 'running'; // list view (no timeline): show open runs as in-progress, not the generic suspended
