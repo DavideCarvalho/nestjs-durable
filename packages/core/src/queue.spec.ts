@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { WorkflowEngine } from './engine';
 import type { RemoteTask, StepResult, Transport } from './interfaces';
 import { remoteStep } from './remote-step-factory';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { InMemoryTransport } from './testing/in-memory-transport';
 
@@ -58,9 +59,9 @@ describe('flow control — durable queues', () => {
       return 'done';
     });
 
-    await engine.start('caller', {}, 'a');
-    await engine.start('caller', {}, 'b');
-    const c = await engine.start('caller', {}, 'c');
+    await startRun(engine, 'caller', {}, 'a');
+    await startRun(engine, 'caller', {}, 'b');
+    const c = await startRun(engine, 'caller', {}, 'c');
 
     // a and b are admitted within the window; c exceeds the limit → suspended, not dispatched.
     expect(c.status).toBe('suspended');
@@ -86,8 +87,8 @@ describe('flow control — durable queues', () => {
       return 'done';
     });
 
-    await engine.start('caller', {}, 'a'); // admitted → in-flight (1/1)
-    await engine.start('caller', {}, 'b'); // blocked (1 >= 1) → suspended
+    await startRun(engine, 'caller', {}, 'a'); // admitted → in-flight (1/1)
+    await startRun(engine, 'caller', {}, 'b'); // blocked (1 >= 1) → suspended
     expect(transport.dispatched).toHaveLength(1);
     expect((await store.getRun('b'))?.status).toBe('suspended');
 

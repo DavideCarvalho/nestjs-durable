@@ -1,4 +1,5 @@
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — workflow versioning (skew protection)', () => {
@@ -8,7 +9,7 @@ describe('WorkflowEngine — workflow versioning (skew protection)', () => {
     engine.register('wf', '1', async () => 'v1');
     engine.register('wf', '2', async () => 'v2');
 
-    const result = await engine.start('wf', {}, 'run1');
+    const result = await startRun(engine, 'wf', {}, 'run1');
     expect(result.output).toBe('v2');
     expect((await store.getRun('run1'))?.workflowVersion).toBe('2');
   });

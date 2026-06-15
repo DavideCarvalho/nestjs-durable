@@ -27,7 +27,8 @@ async function settle(store: InMemoryStateStore, runId: string, timeoutMs = 20_0
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const run = await store.getRun(runId);
-    if (run && run.status !== 'running' && run.status !== 'suspended') return run;
+    if (run && run.status !== 'pending' && run.status !== 'running' && run.status !== 'suspended')
+      return run;
     await new Promise((r) => setTimeout(r, 25));
   }
   throw new Error(`run ${runId} did not settle`);

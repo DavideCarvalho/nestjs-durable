@@ -1,3 +1,4 @@
+import { startRun } from './test-helpers';
 import { WorkflowEngine } from './engine';
 import { FatalError } from './errors';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
@@ -25,7 +26,7 @@ describe('WorkflowEngine — deterministic replay', () => {
       return b;
     });
 
-    const first = await engine.start('wf', {}, 'run1');
+    const first = await startRun(engine, 'wf', {}, 'run1');
     expect(first.status).toBe('failed');
 
     const second = await engine.resume('run1');
@@ -53,7 +54,7 @@ describe('WorkflowEngine — deterministic replay', () => {
       ),
     );
 
-    const result = await engine.start('wf', {}, 'run1');
+    const result = await startRun(engine, 'wf', {}, 'run1');
 
     expect(result.status).toBe('completed');
     expect(result.output).toBe('ok');
@@ -76,7 +77,7 @@ describe('WorkflowEngine — deterministic replay', () => {
       ),
     );
 
-    const result = await engine.start('wf', {}, 'run1');
+    const result = await startRun(engine, 'wf', {}, 'run1');
 
     expect(result.status).toBe('failed');
     expect(result.error?.message).toBe('nope');
@@ -106,7 +107,7 @@ describe('WorkflowEngine — deterministic replay', () => {
       return a + b + c;
     });
 
-    const result = await engine.start('wf', {}, 'run1');
+    const result = await startRun(engine, 'wf', {}, 'run1');
 
     expect(result.status).toBe('completed');
     expect(result.output).toBe(6);
@@ -136,7 +137,7 @@ describe('WorkflowEngine — deterministic replay', () => {
       ),
     );
 
-    const result = await engine.start('wf', {}, 'run1');
+    const result = await startRun(engine, 'wf', {}, 'run1');
 
     expect(result.status).toBe('failed');
     expect(result.error?.message).toBe('do not retry me');

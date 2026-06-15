@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { WorkflowEngine } from './engine';
 import type { RemoteTask, StepResult, Transport } from './interfaces';
 import { remoteStep } from './remote-step-factory';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 const ping = remoteStep({
@@ -33,7 +34,7 @@ describe('distributed tracing — traceparent propagation to workers', () => {
       return 'x';
     });
 
-    await engine.start('wf', {}, 'r1');
+    await startRun(engine, 'wf', {}, 'r1');
 
     expect(dispatched).toHaveLength(1);
     expect(dispatched[0]?.traceparent).toBe(
@@ -57,7 +58,7 @@ describe('distributed tracing — traceparent propagation to workers', () => {
       return 'x';
     });
 
-    await engine.start('wf', {}, 'r1');
+    await startRun(engine, 'wf', {}, 'r1');
     expect(dispatched[0]?.traceparent).toBeUndefined();
   });
 });

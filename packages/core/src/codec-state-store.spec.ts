@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { CodecStateStore, type PayloadCodec } from './codec-state-store';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 // A reversible codec that wraps the value so we can prove it was applied at rest.
@@ -43,7 +44,7 @@ describe('CodecStateStore', () => {
       return a;
     });
 
-    const res = await engine.start('wf', { n: 21 }, 'r2');
+    const res = await startRun(engine, 'wf', { n: 21 }, 'r2');
     expect(res.status).toBe('completed');
     expect(res.output).toEqual({ doubled: 42 });
     // The checkpoint's output is encoded in the underlying store.

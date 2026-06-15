@@ -23,6 +23,7 @@ describe('attachDurableOtel', () => {
       return 'ok';
     });
     await engine.start('checkout', {}, 'run1');
+    await engine.waitForRun('run1');
 
     const spans = exporter.getFinishedSpans();
     const run = spans.find((s) => s.name === 'workflow checkout');
@@ -45,6 +46,7 @@ describe('attachDurableOtel', () => {
       }),
     );
     await engine.start('wf', {}, 'run1');
+    await engine.waitForRun('run1');
 
     const run = exporter.getFinishedSpans().find((s) => s.name === 'workflow wf');
     expect(run?.status.code).toBe(2); // SpanStatusCode.ERROR

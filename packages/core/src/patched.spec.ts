@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('ctx.patched — in-place workflow migration', () => {
@@ -14,7 +15,7 @@ describe('ctx.patched — in-place workflow migration', () => {
       await ctx.waitForSignal('done');
       return 'old';
     });
-    await oldEngine.start('checkout', {}, 'old-run');
+    await startRun(oldEngine, 'checkout', {}, 'old-run');
     expect((await store.getRun('old-run'))?.status).toBe('suspended');
 
     // NEW deploy (same version, new engine instance on the same store): a fraud check guarded by a
@@ -40,7 +41,7 @@ describe('ctx.patched — in-place workflow migration', () => {
     ]);
 
     // A brand-new run takes the patched branch and records the marker.
-    await engine.start('checkout', {}, 'new-run');
+    await startRun(engine, 'checkout', {}, 'new-run');
     expect((await store.listCheckpoints('new-run')).map((c) => c.name)).toEqual([
       'patch:add-fraud-check',
       'fraud',

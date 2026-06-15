@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('engine.update — validated request/response to a running run', () => {
@@ -14,7 +15,7 @@ describe('engine.update — validated request/response to a running run', () => 
       if (!arg?.by) throw new Error('approver is required');
     });
 
-    await engine.start('order', {}, 'r1'); // suspends on the update point
+    await startRun(engine, 'order', {}, 'r1'); // suspends on the update point
 
     const bad = await engine.update('r1', 'approve', { approved: true });
     expect(bad.accepted).toBe(false);
@@ -31,7 +32,7 @@ describe('engine.update — validated request/response to a running run', () => 
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     engine.register('wf', '1', async (ctx) => ctx.onUpdate<number>('bump'));
-    await engine.start('wf', {}, 'r1');
+    await startRun(engine, 'wf', {}, 'r1');
 
     const res = await engine.update('r1', 'bump', 42);
     expect(res.accepted).toBe(true);

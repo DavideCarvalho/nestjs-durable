@@ -1,5 +1,6 @@
 import { WorkflowEngine } from './engine';
 import type { ControlMessage, ControlPlane } from './interfaces';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { InMemoryTransport } from './testing/in-memory-transport';
 
@@ -37,7 +38,7 @@ describe('Transport control plane', () => {
       await ctx.step('a', async () => 1);
       return 'ok';
     });
-    await worker.start('wf', {}, 'run1');
+    await startRun(worker, 'wf', {}, 'run1');
 
     // The dashboard pod, which never executed anything, still sees the run's events.
     expect(onDashboard).toEqual(['run.started', 'step.completed', 'run.completed']);
@@ -51,7 +52,7 @@ describe('Transport control plane', () => {
     worker.onCancel((runId) => aborted.push(runId));
 
     worker.register('wf', '1', async (ctx) => ctx.waitForSignal('go'));
-    await worker.start('wf', {}, 'run1'); // suspends, "work" notionally in flight on the worker
+    await startRun(worker, 'wf', {}, 'run1'); // suspends, "work" notionally in flight on the worker
 
     // Cancel issued from the dashboard pod reaches the worker pod's cancel listener.
     await dashboard.cancel('run1');
@@ -64,7 +65,7 @@ describe('Transport control plane', () => {
     const seen: string[] = [];
     engine.subscribe((e) => seen.push(e.type));
     engine.register('wf', '1', async () => 'ok');
-    await engine.start('wf', {}, 'run1');
+    await startRun(engine, 'wf', {}, 'run1');
     expect(seen).toEqual(['run.started', 'run.completed']);
   });
 });
@@ -95,7 +96,7 @@ describe('control plane — independent of the task transport', () => {
     });
 
     a.register('wf', '1', async (ctx) => ctx.waitForSignal('go'));
-    await a.start('wf', {}, 'r1');
+    await startRun(a, 'wf', {}, 'r1');
     await a.cancel('r1');
 
     // The cancel rode the control plane to instance b — neither engine has a transport.

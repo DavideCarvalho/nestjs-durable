@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { WorkflowEngine } from './engine';
 import type { RemoteStepDef } from './interfaces';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { InMemoryTransport } from './testing/in-memory-transport';
 
@@ -41,7 +42,7 @@ describe('WorkflowEngine — remote steps', () => {
     });
 
     // The call suspends the run durably; it completes when the worker result lands.
-    const started = await engine.start('checkout', {}, 'run1');
+    const started = await startRun(engine, 'checkout', {}, 'run1');
     expect(started.status).toBe('suspended');
 
     const run = await settle(store, 'run1');
@@ -75,7 +76,7 @@ describe('WorkflowEngine — remote steps', () => {
       return charge.chargeId;
     });
 
-    await engine.start('checkout', {}, 'run1');
+    await startRun(engine, 'checkout', {}, 'run1');
     await settle(store, 'run1');
 
     // A remote step announces itself as in-flight (on dispatch) before it completes (on result).
@@ -114,7 +115,7 @@ describe('WorkflowEngine — remote steps', () => {
       return charge.chargeId;
     });
 
-    await engine.start('checkout', {}, 'run1'); // suspends at the call
+    await startRun(engine, 'checkout', {}, 'run1'); // suspends at the call
     // The result resumes the run; the local `after` step then throws → the run fails.
     const afterFirst = await settle(store, 'run1');
     expect(afterFirst.status).toBe('failed');

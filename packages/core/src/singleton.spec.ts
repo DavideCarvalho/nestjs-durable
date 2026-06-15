@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('singleton (serialize runs by key)', () => {
@@ -21,12 +22,18 @@ describe('singleton (serialize runs by key)', () => {
       { singleton: { key: (input) => (input as { key: string }).key } },
     );
 
-    await engine.start('job', { id: 'A', key: 'k' }, 'a');
-    await engine.start('job', { id: 'B', key: 'k' }, 'b'); // same key → gated
+    await startRun(engine, 'job', { id: 'A', key: 'k' }, 'a');
+    await startRun(engine, 'job', { id: 'B', key: 'k' }, 'b'); // same key → gated
+    // Admission runs on the gate's retry timer: A (oldest for key 'k') admits, enters, then holds the
+    // slot on its signal wait; B re-checks but the slot is taken, so it stays suspended.
+    now += 1000;
+    await engine.resumeDueTimers(now);
     expect(ran).toEqual(['A']);
     expect((await store.getRun('b'))?.status).toBe('suspended');
 
-    await engine.start('job', { id: 'C', key: 'other' }, 'c'); // different key → runs immediately
+    await startRun(engine, 'job', { id: 'C', key: 'other' }, 'c'); // different key → runs immediately
+    now += 1000;
+    await engine.resumeDueTimers(now);
     expect(ran).toEqual(['A', 'C']);
 
     await engine.signal('go:A', undefined); // A completes → frees the slot

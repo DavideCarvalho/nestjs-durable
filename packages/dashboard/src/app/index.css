@@ -75,9 +75,10 @@ body {
 .s-dead {
   color: #e11d48;
 }
-/* A remote step dispatched and awaiting its worker result (in-flight). */
+/* Queued: a run enqueued by `start` awaiting a worker, or a remote step dispatched and awaiting its
+   worker result (in-flight). A calmer slate than the amber of a durably-suspended run. */
 .s-pending {
-  color: #fbbf24;
+  color: #94a3b8;
 }
 
 .dot {

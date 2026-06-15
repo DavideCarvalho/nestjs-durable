@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('step interceptors (engine.use)', () => {
@@ -17,7 +18,7 @@ describe('step interceptors (engine.use)', () => {
       const name = await ctx.step('upper', async () => (input as { n: string }).n.toUpperCase());
       return `hi ${name}`;
     });
-    const res = await engine.start('greet', { n: 'ada' }, 'r1');
+    const res = await startRun(engine, 'greet', { n: 'ada' }, 'r1');
 
     expect(res.output).toBe('hi ADA');
     expect(seen).toContainEqual({ workflow: 'greet', step: 'upper', attempt: 1, result: 'ADA' });
@@ -40,7 +41,7 @@ describe('step interceptors (engine.use)', () => {
       return r;
     });
     engine.register('w', '1', async (ctx) => ctx.step('s', async () => 1));
-    await engine.start('w', {}, 'r1');
+    await startRun(engine, 'w', {}, 'r1');
 
     expect(order).toEqual(['A:before', 'B:before', 'B:after', 'A:after']);
   });
@@ -60,7 +61,7 @@ describe('step interceptors (engine.use)', () => {
       return 'done';
     });
 
-    await engine.start('w', {}, 'r1');
+    await startRun(engine, 'w', {}, 'r1');
     expect(fired).toEqual(['a']); // suspended at the signal; 'b' not reached yet
 
     await engine.signal('go', undefined);
@@ -78,10 +79,10 @@ describe('step interceptors (engine.use)', () => {
     });
     engine.register('w', '1', async (ctx) => ctx.step('s', async () => 1));
 
-    await engine.start('w', {}, 'r1');
+    await startRun(engine, 'w', {}, 'r1');
     expect(count).toBe(1);
     off();
-    await engine.start('w', {}, 'r2');
+    await startRun(engine, 'w', {}, 'r2');
     expect(count).toBe(1); // unsubscribed — not called again
   });
 });

@@ -1,4 +1,5 @@
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — retry backoff', () => {
@@ -27,7 +28,7 @@ describe('WorkflowEngine — retry backoff', () => {
       );
     });
 
-    const result = await engine.start('wf', {}, 'run1');
+    const result = await startRun(engine, 'wf', {}, 'run1');
     vi.unstubAllGlobals();
 
     expect(result.status).toBe('completed');
@@ -58,7 +59,7 @@ describe('WorkflowEngine — retry backoff', () => {
         { retries: 2 },
       );
     });
-    await engine.start('wf', {}, 'run1');
+    await startRun(engine, 'wf', {}, 'run1');
     vi.unstubAllGlobals();
 
     expect(attempts).toBe(2);

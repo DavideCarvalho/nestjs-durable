@@ -24,6 +24,7 @@ describe('DurableTelescopeWatcher', () => {
       return 'ok';
     });
     await engine.start('checkout', {}, 'run1');
+    await engine.waitForRun('run1');
 
     const events = records.map((r) => (r.content as { event: string }).event);
     expect(events).toEqual(['run.started', 'step.completed', 'run.completed']);
@@ -43,6 +44,7 @@ describe('DurableTelescopeWatcher', () => {
       }),
     );
     await engine.start('wf', {}, 'run1');
+    await engine.waitForRun('run1');
 
     const failed = records.find((r) => (r.content as { event: string }).event === 'run.failed');
     expect(failed?.tags).toContain('failed');

@@ -1,4 +1,5 @@
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — signals (human-in-the-loop)', () => {
@@ -18,7 +19,7 @@ describe('WorkflowEngine — signals (human-in-the-loop)', () => {
       return decision.approved;
     });
 
-    const started = await engine.start('approval', {}, 'run1');
+    const started = await startRun(engine, 'approval', {}, 'run1');
     expect(started.status).toBe('suspended');
     expect(order).toEqual(['request']);
 

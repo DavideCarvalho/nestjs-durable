@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — ctx.sleepUntil (absolute wake time)', () => {
@@ -16,7 +17,7 @@ describe('WorkflowEngine — ctx.sleepUntil (absolute wake time)', () => {
       return 'done';
     });
 
-    expect((await engine.start('wf', {}, 'r1')).status).toBe('suspended');
+    expect((await startRun(engine, 'wf', {}, 'r1')).status).toBe('suspended');
     expect(order).toEqual(['before']);
 
     now = 10_000; // before the wake time → still suspended

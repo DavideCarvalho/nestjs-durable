@@ -1,7 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
-import { runSchedules } from './scheduler';
+import { runSchedules, type ScheduledWorkflow } from './scheduler';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
+
+/** Fire schedules, then await each started window's run to settle (start now only enqueues). */
+async function fireAndSettle(
+  engine: WorkflowEngine,
+  schedules: readonly ScheduledWorkflow[],
+  nowMs: number,
+): Promise<string[]> {
+  const ids = await runSchedules(engine, schedules, nowMs);
+  for (const id of ids) await engine.waitForRun(id);
+  return ids;
+}
 
 describe('runSchedules', () => {
   it('fires each time window exactly once (idempotent by bucket)', async () => {
@@ -14,11 +26,11 @@ describe('runSchedules', () => {
     });
     const schedules = [{ key: 'beat', workflow: 'beat', everyMs: 1000 }];
 
-    await runSchedules(engine, schedules, 1000); // bucket 1
-    await runSchedules(engine, schedules, 1500); // same bucket → no duplicate
+    await fireAndSettle(engine, schedules, 1000); // bucket 1
+    await fireAndSettle(engine, schedules, 1500); // same bucket → no duplicate
     expect(runs).toBe(1);
 
-    await runSchedules(engine, schedules, 2000); // bucket 2 → fires again
+    await fireAndSettle(engine, schedules, 2000); // bucket 2 → fires again
     expect(runs).toBe(2);
 
     expect((await store.getRun('sched:beat:1'))?.output).toBe('tick');
@@ -30,7 +42,7 @@ describe('runSchedules', () => {
     const engine = new WorkflowEngine({ store });
     let runs = 0;
     engine.register('beat', '1', async () => void (runs += 1));
-    await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000, paused: true }], 1000);
+    await fireAndSettle(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000, paused: true }], 1000);
     expect(runs).toBe(0);
   });
 
@@ -44,13 +56,13 @@ describe('runSchedules', () => {
     });
     const sched = [{ key: 's', workflow: 'slow', everyMs: 1000, overlap: 'skip' as const }];
 
-    await runSchedules(engine, sched, 1000); // bucket 1 → starts, suspends on signal
+    await fireAndSettle(engine, sched, 1000); // bucket 1 → starts, suspends on signal
     expect(started).toBe(1);
-    await runSchedules(engine, sched, 2000); // bucket 2 → prev (bucket 1) still in-flight → skip
+    await fireAndSettle(engine, sched, 2000); // bucket 2 → prev (bucket 1) still in-flight → skip
     expect(started).toBe(1);
 
     await engine.signal('go', undefined); // bucket 1 completes
-    await runSchedules(engine, sched, 3000); // bucket 3 → prev (bucket 2) never ran → starts
+    await fireAndSettle(engine, sched, 3000); // bucket 3 → prev (bucket 2) never ran → starts
     expect(started).toBe(2);
   });
 
@@ -66,13 +78,13 @@ describe('runSchedules', () => {
 
     // 2026-01-01T05:00Z — the most recent midnight-UTC fire was 2026-01-01T00:00Z.
     const t1 = Date.UTC(2026, 0, 1, 5, 0, 0);
-    await runSchedules(engine, schedules, t1);
-    await runSchedules(engine, schedules, t1 + 3_600_000); // same day, before next midnight
+    await fireAndSettle(engine, schedules, t1);
+    await fireAndSettle(engine, schedules, t1 + 3_600_000); // same day, before next midnight
     expect(runs).toBe(1);
 
     // Next day, just past midnight → a new fire time → fires again.
     const t2 = Date.UTC(2026, 0, 2, 0, 0, 1);
-    await runSchedules(engine, schedules, t2);
+    await fireAndSettle(engine, schedules, t2);
     expect(runs).toBe(2);
 
     const fire1 = Date.UTC(2026, 0, 1, 0, 0, 0);
@@ -91,7 +103,7 @@ describe('runSchedules', () => {
     ];
 
     // 2026-03-10T04:00Z is 01:00 in São Paulo → the day's fire (03:00Z) already passed.
-    await runSchedules(engine, schedules, Date.UTC(2026, 2, 10, 4, 0, 0));
+    await fireAndSettle(engine, schedules, Date.UTC(2026, 2, 10, 4, 0, 0));
     const fire = Date.UTC(2026, 2, 10, 3, 0, 0); // 00:00 America/Sao_Paulo
     expect(await store.getRun(`sched:sp:${fire}`)).not.toBeNull();
   });
@@ -104,8 +116,8 @@ describe('runSchedules', () => {
       runs += 1;
       return runs;
     });
-    const a = await engine.start('once', {}, 'fixed-id');
-    const b = await engine.start('once', {}, 'fixed-id'); // redelivered trigger
+    const a = await startRun(engine, 'once', {}, 'fixed-id');
+    const b = await startRun(engine, 'once', {}, 'fixed-id'); // redelivered trigger
     expect(runs).toBe(1);
     expect(b.status).toBe('completed');
     expect(a.output).toBe(b.output);
