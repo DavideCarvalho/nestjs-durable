@@ -24,7 +24,7 @@ type StepData = {
   seq: number;
   name: string;
   kind: string;
-  status: 'pending' | 'completed' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'failed';
   workerGroup?: string;
   attempts: number;
   duration?: string;
@@ -37,7 +37,8 @@ type EndData = { status: RunDisplayStatus; label: string };
 
 function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   const failed = data.status === 'failed';
-  const pending = data.status === 'pending'; // dispatched, awaiting its worker result (in-flight)
+  // in-flight: a remote step awaiting its worker (`pending`) or a local step body executing (`running`)
+  const pending = data.status === 'pending' || data.status === 'running';
   const isChild = !!data.childRunId;
   const Icon = isChild ? ChildIcon : iconFor(data.kind);
   // Literal class strings per state (Tailwind can't see interpolated names): failed → red,

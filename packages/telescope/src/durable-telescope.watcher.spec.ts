@@ -27,7 +27,7 @@ describe('DurableTelescopeWatcher', () => {
     await engine.waitForRun('run1');
 
     const events = records.map((r) => (r.content as { event: string }).event);
-    expect(events).toEqual(['run.started', 'step.completed', 'run.completed']);
+    expect(events).toEqual(['run.started', 'step.started', 'step.completed', 'run.completed']);
     expect(records.every((r) => r.type === 'durable')).toBe(true);
     expect(records[0]?.tags).toContain('workflow:checkout');
     expect(records[0]?.tags).toContain('run:run1');

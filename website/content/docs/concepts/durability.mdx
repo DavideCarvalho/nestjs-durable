@@ -9,19 +9,24 @@ use. Understanding it is the one thing worth reading before you build.
 ## The mechanism
 
 Each step records its result in the store at a deterministic position (`seq`). Recovery works by
-**re-running the workflow function from the top** — but a step that already has a checkpoint
-returns its saved result instead of executing again:
+**re-running the workflow function from the top** — but a step that already has a **`completed`**
+checkpoint returns its saved result instead of executing again:
 
 ```text
 run abc
-  step[0] reserveStock  → execute → checkpoint {seq:0, output}
-  step[1] chargeCard     → execute → checkpoint {seq:1, output}
+  step[0] reserveStock  → execute → checkpoint {seq:0, completed, output}
+  step[1] chargeCard     → execute → checkpoint {seq:1, completed, output}
   💥 crash
   --- engine restarts, resumes run abc ---
-  step[0] reserveStock  → checkpoint exists → return saved output (NOT re-run)
-  step[1] chargeCard     → checkpoint exists → return saved output (NOT re-run)
+  step[0] reserveStock  → completed checkpoint → return saved output (NOT re-run)
+  step[1] chargeCard     → completed checkpoint → return saved output (NOT re-run)
   step[2] ship           → no checkpoint → execute for real
 ```
+
+Only a **`completed`** checkpoint short-circuits replay. A non-terminal checkpoint —
+a remote step's `pending` (dispatched, awaiting its worker) or a local step's in-flight `running`
+(see [`trackStepStart`](/docs/concepts/workflows-and-steps)) — does **not**: the step is re-awaited
+(remote) or re-run (local). So a crash mid-step is safe — there's no half-finished result to honour.
 
 You write ordinary linear code; the engine guarantees each step runs **exactly once**, logically,
 even across crashes and deploys.

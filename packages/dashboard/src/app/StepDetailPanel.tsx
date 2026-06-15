@@ -265,7 +265,8 @@ export function StepDetailPanel({
   onClose: () => void;
 }) {
   const failed = step.status === 'failed';
-  const pending = step.status === 'pending'; // dispatched, awaiting its worker result (in-flight)
+  // in-flight: a remote step awaiting its worker (`pending`) or a local step body executing (`running`)
+  const pending = step.status === 'pending' || step.status === 'running';
   const Icon = iconFor(step.kind);
   const sinceStart = fmtDur(run.createdAt, step.startedAt);
   // Queue-wait: how long the step sat dispatched before a worker picked it up. Only meaningful for

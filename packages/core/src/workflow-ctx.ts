@@ -55,6 +55,8 @@ export interface CtxHost {
   readonly store: StateStore;
   clock(): number;
   webhookUrl?: (token: string) => string;
+  /** Mark a local step's body as started — emits `step.started` and (optionally) a `running` checkpoint. */
+  startStep(step: StepRecord): Promise<void>;
   completeStep(step: StepRecord & { output: unknown }): Promise<void>;
   failStep(step: StepRecord & { error: StepError }): Promise<void>;
   callRemote<TInput, TOutput>(
@@ -118,6 +120,18 @@ export function createWorkflowCtx(
     }
     const maxAttempts = Math.max(1, options?.retries ?? 1);
     const startedAt = new Date();
+    // Announce the body has begun (and, when enabled, checkpoint it `running`) so the step is
+    // visible in flight — not only once it settles. Skipped on replay: a completed step returns
+    // above before reaching here, so this fires once, when the body actually first runs.
+    await host.startStep({
+      runId,
+      seq: current,
+      name,
+      kind: 'local',
+      attempts: 1,
+      enqueuedAt: startedAt,
+      startedAt,
+    });
     for (let attempt = 1; ; attempt += 1) {
       // Events are scoped per attempt — a retry starts a clean log, so the checkpoint reflects
       // only the attempt that actually completed (or the final failing one).

@@ -40,10 +40,11 @@ describe('Transport control plane', () => {
     });
     await startRun(worker, 'wf', {}, 'run1');
 
-    // The dashboard pod, which never executed anything, still sees the run's events.
-    expect(onDashboard).toEqual(['run.started', 'step.completed', 'run.completed']);
+    // The dashboard pod, which never executed anything, still sees the run's events —
+    // including the local step's `step.started` (emitted when its body begins).
+    expect(onDashboard).toEqual(['run.started', 'step.started', 'step.completed', 'run.completed']);
     // And the worker delivered each event exactly once (no echo duplicate from its own publish).
-    expect(onWorker).toEqual(['run.started', 'step.completed', 'run.completed']);
+    expect(onWorker).toEqual(['run.started', 'step.started', 'step.completed', 'run.completed']);
   });
 
   it('delivers cancellation to the instance running the work (cooperative cancel)', async () => {
