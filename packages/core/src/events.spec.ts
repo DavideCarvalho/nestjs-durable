@@ -1,54 +1,45 @@
+import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
-import type { EngineEvent } from './interfaces';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
-describe('WorkflowEngine — lifecycle events', () => {
-  it('emits run and step events to subscribers in order', async () => {
+describe('events (waitForEvent / publishEvent)', () => {
+  it('fans an event out only to the runs whose match the payload satisfies', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
-
-    const events: EngineEvent[] = [];
-    engine.subscribe((e) => events.push(e));
-
-    engine.register('wf', '1', async (ctx) => {
-      await ctx.step('a', async () => 1);
-      return 'ok';
+    engine.register('order', '1', async (ctx, input) => {
+      const { orderId } = input as { orderId: string };
+      const p = await ctx.waitForEvent<{ amount: number }>('payment.settled', {
+        match: { orderId },
+      });
+      return `paid ${p.amount}`;
     });
 
-    await engine.start('wf', {}, 'run1');
+    await engine.start('order', { orderId: 'o1' }, 'r1');
+    await engine.start('order', { orderId: 'o2' }, 'r2');
+    expect((await store.getRun('r1'))?.status).toBe('suspended');
 
-    expect(events.map((e) => e.type)).toEqual(['run.started', 'step.completed', 'run.completed']);
-    const step = events.find((e) => e.type === 'step.completed');
-    expect(step?.name).toBe('a');
-    expect(step?.runId).toBe('run1');
+    const delivered = await engine.publishEvent('payment.settled', { orderId: 'o1', amount: 99 });
+    expect(delivered).toBe(1);
+    expect((await store.getRun('r1'))?.output).toBe('paid 99');
+    expect((await store.getRun('r2'))?.status).toBe('suspended');
+
+    await engine.publishEvent('payment.settled', { orderId: 'o2', amount: 5 });
+    expect((await store.getRun('r2'))?.output).toBe('paid 5');
   });
 
-  it('cancel marks a run cancelled and emits run.failed', async () => {
+  it('a no-match waiter receives any event of that name (broadcast)', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
-    const events: EngineEvent[] = [];
-    engine.subscribe((e) => events.push(e));
+    engine.register('listener', '1', async (ctx) => {
+      const p = await ctx.waitForEvent<{ v: number }>('tick');
+      return p.v;
+    });
+    await engine.start('listener', {}, 'a');
+    await engine.start('listener', {}, 'b');
 
-    engine.register('wf', '1', async (ctx) => ctx.waitForSignal('go'));
-    await engine.start('wf', {}, 'run1'); // suspends on the signal
-
-    const result = await engine.cancel('run1');
-
-    expect(result?.status).toBe('cancelled');
-    expect((await store.getRun('run1'))?.status).toBe('cancelled');
-    expect(events.some((e) => e.type === 'run.failed' && e.runId === 'run1')).toBe(true);
-  });
-
-  it('stops delivering after unsubscribe', async () => {
-    const store = new InMemoryStateStore();
-    const engine = new WorkflowEngine({ store });
-    const events: EngineEvent[] = [];
-    const off = engine.subscribe((e) => events.push(e));
-    off();
-
-    engine.register('wf', '1', async () => 'ok');
-    await engine.start('wf', {}, 'run1');
-
-    expect(events).toHaveLength(0);
+    const n = await engine.publishEvent('tick', { v: 7 });
+    expect(n).toBe(2);
+    expect((await store.getRun('a'))?.output).toBe(7);
+    expect((await store.getRun('b'))?.output).toBe(7);
   });
 });

@@ -124,6 +124,12 @@ export class MikroOrmStateStore implements StateStore {
     await em.removeAndFlush(entity);
     return waiter;
   }
+
+  async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
+    const em = this.orm.em.fork();
+    const rows = await em.find(SignalWaiterEntity, { token: { $like: `${prefix}%` } });
+    return rows.map((e) => ({ token: e.token, runId: e.runId, seq: e.seq }));
+  }
 }
 
 function toRunEntity(run: WorkflowRun): WorkflowRunEntity {

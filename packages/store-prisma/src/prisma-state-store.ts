@@ -183,6 +183,13 @@ export class PrismaStateStore implements StateStore {
     await this.db.durableSignalWaiter.delete({ where: { token } });
     return { token: row.token, runId: row.runId, seq: row.seq };
   }
+
+  async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
+    const rows = await this.db.durableSignalWaiter.findMany({
+      where: { token: { startsWith: prefix } },
+    });
+    return rows.map((r) => ({ token: r.token, runId: r.runId, seq: r.seq }));
+  }
 }
 
 const bigOrNull = (n: number | undefined) => (n == null ? null : BigInt(n));

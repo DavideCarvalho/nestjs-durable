@@ -86,6 +86,9 @@ export class CodecStateStore implements StateStore {
   takeSignalWaiter(token: string): Promise<SignalWaiter | null> {
     return this.inner.takeSignalWaiter(token);
   }
+  listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
+    return this.inner.listSignalWaiters(prefix);
+  }
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return (await this.inner.listRuns(query)).map((r) => this.decRun(r));
   }

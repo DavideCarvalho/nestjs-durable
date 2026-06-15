@@ -43,4 +43,12 @@ export class WorkflowService {
   signal(token: string, payload: unknown): Promise<RunResult | null> {
     return this.engine.signal(token, payload);
   }
+
+  /**
+   * Publish a named event to every run waiting on it via `ctx.waitForEvent(name, { match })` whose
+   * match the payload satisfies (name-based pub/sub fan-out). Returns how many runs it resumed.
+   */
+  publishEvent(name: string, payload: unknown): Promise<number> {
+    return this.engine.publishEvent(name, payload);
+  }
 }
