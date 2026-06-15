@@ -28,11 +28,17 @@ export interface StepEvent {
   at: number;
   level: 'debug' | 'info' | 'warn' | 'error';
   message: string;
+  /** Stable run identity for a sub-process; distinct invocations of the same `name` get distinct ids. */
+  subId?: string;
   /** For a sub-step/sub-process within the step: its name. */
   name?: string;
-  /** For a sub-step: its outcome. */
+  /** Open, consumer-defined grouping label for a sub-process (e.g. a handler/lane). */
+  group?: string;
+  /** For a sub-step: its terminal outcome. */
   status?: 'ok' | 'failed' | 'skipped';
-  /** For a log line emitted inside a sub-process: that sub-process's name, so logs group under it. */
+  /** Open, consumer-defined intermediate phase label for a sub-process transition (no `status`). */
+  phase?: string;
+  /** @deprecated owning sub-process **name** for a log line — superseded by `subId`. */
   process?: string;
   data?: unknown;
 }
