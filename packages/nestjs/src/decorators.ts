@@ -19,6 +19,12 @@ export interface WorkflowMeta {
   singleton?: SingletonConfig;
   /** Max wall-clock lifetime before a run is cancelled (e.g. `'2h'`). See `WorkflowOptions`. */
   executionTimeout?: string | number;
+  /** class-validator DTO validated at start. See `WorkflowOptions`. */
+  inputSchema?: new (
+    ...args: any[]
+  ) => object;
+  /** Custom input validator (throws on invalid). See `WorkflowOptions`. */
+  validateInput?: (input: unknown) => void | Promise<void>;
 }
 
 export interface WorkflowOptions {
@@ -50,6 +56,20 @@ export interface WorkflowOptions {
    * runs that get stuck or loop forever. Omit for no limit.
    */
   executionTimeout?: string | number;
+  /**
+   * Validate the workflow input at `start` against a **class-validator DTO** (the same
+   * `plainToInstance` + `validate` NestJS runs in controllers) — invalid input is rejected before any
+   * run is created. Needs the optional peers `class-validator` + `class-transformer`.
+   * `@Workflow({ inputSchema: CheckoutInput })`.
+   */
+  inputSchema?: new (
+    ...args: any[]
+  ) => object;
+  /**
+   * Custom input validator (throws on invalid) — an escape hatch for zod/yup/etc. instead of
+   * `inputSchema`. Takes precedence over `inputSchema` if both are set.
+   */
+  validateInput?: (input: unknown) => void | Promise<void>;
 }
 
 /**
@@ -65,6 +85,8 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       tags: options.tags,
       singleton: options.singleton,
       executionTimeout: options.executionTimeout,
+      inputSchema: options.inputSchema,
+      validateInput: options.validateInput,
     };
     Reflect.defineMetadata(WORKFLOW_METADATA, meta, target);
     // Stamp the registered name so this class can be used as a typed workflow ref (ctx.child,
