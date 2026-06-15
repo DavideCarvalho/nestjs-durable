@@ -44,6 +44,26 @@ export interface StartOptions {
   tags?: string[];
 }
 
+/**
+ * Serialize runs of a workflow that share a key — a durable, FIFO mutex (e.g. one pipeline per base).
+ * Excess runs are admitted in creation order, `limit` at a time; the rest wait (suspended) and retry
+ * admission on a timer until a slot frees. Race-free on a consistent store (admission order is the
+ * same `(createdAt, id)` view for every instance).
+ */
+export interface SingletonConfig {
+  /** Derive the serialization key from the workflow input. */
+  key: (input: unknown) => string;
+  /** Max concurrent runs sharing the key. Default 1 (a mutex). */
+  limit?: number;
+}
+
+/** How long a gated (waiting-for-admission) singleton run sleeps before re-checking for a free slot. */
+const SINGLETON_RETRY_MS = 1000;
+
+/** The tag a singleton run carries, so the admission gate can find others sharing its key. */
+const singletonTag = (cfg: SingletonConfig, input: unknown): string =>
+  `singleton:${cfg.key(input)}`;
+
 /** Union of a workflow's static tags and a run's start-time tags, de-duplicated, or undefined if none. */
 function mergeTags(staticTags?: string[], runTags?: string[]): string[] | undefined {
   if (!staticTags?.length && !runTags?.length) return undefined;
@@ -62,6 +82,8 @@ interface RegisteredWorkflow {
   fn: WorkflowFn;
   /** Static `@Workflow({ tags })` — merged with per-run tags onto each run at start. */
   tags?: string[];
+  /** Per-key serialization (a durable mutex). See {@link SingletonConfig}. */
+  singleton?: SingletonConfig;
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
@@ -251,8 +273,19 @@ export class WorkflowEngine {
    * runs working across a breaking change: old runs resume on the version they started on, new
    * runs start on the newest registered version.
    */
-  register(name: string, version: string, fn: WorkflowFn, opts?: { tags?: string[] }): void {
-    const registered: RegisteredWorkflow = { name, version, fn, tags: opts?.tags };
+  register(
+    name: string,
+    version: string,
+    fn: WorkflowFn,
+    opts?: { tags?: string[]; singleton?: SingletonConfig },
+  ): void {
+    const registered: RegisteredWorkflow = {
+      name,
+      version,
+      fn,
+      tags: opts?.tags,
+      singleton: opts?.singleton,
+    };
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
     if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
@@ -359,13 +392,21 @@ export class WorkflowEngine {
       return { runId, status: prior.status, output: prior.output, error: prior.error };
     }
     const now = new Date();
+    // A singleton workflow stamps a `singleton:<key>` tag so the admission gate (in execute) can find
+    // the other in-flight runs sharing the key via a tag+status query.
+    const tags = mergeTags(
+      registered.tags,
+      registered.singleton
+        ? [...(opts?.tags ?? []), singletonTag(registered.singleton, input)]
+        : opts?.tags,
+    );
     const run: WorkflowRun = {
       id: runId,
       workflow: name,
       workflowVersion: registered.version,
       status: 'running',
       input,
-      tags: mergeTags(registered.tags, opts?.tags),
+      tags,
       createdAt: now,
       updatedAt: now,
     };
@@ -625,7 +666,32 @@ export class WorkflowEngine {
     });
   }
 
+  /**
+   * Whether `run` may run now under its singleton key: it's among the `limit` oldest in-flight runs
+   * (running or suspended) sharing the key, by `(createdAt, id)` order. A consistent store gives every
+   * instance the same ordering, so admission is race-free + FIFO.
+   */
+  private async admitSingleton(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
+    const tag = singletonTag(cfg, run.input);
+    const inflight = [
+      ...(await this.store.listRuns({ tag, workflow: run.workflow, status: 'running' })),
+      ...(await this.store.listRuns({ tag, workflow: run.workflow, status: 'suspended' })),
+    ].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+    const idx = inflight.findIndex((r) => r.id === run.id);
+    return idx >= 0 && idx < (cfg.limit ?? 1);
+  }
+
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
+    // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
+    // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
+    const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
+    if (registered?.singleton && !(await this.admitSingleton(run, registered.singleton))) {
+      const wakeAt = this.clock() + SINGLETON_RETRY_MS;
+      await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
+      this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
+      await this.store.releaseRunLock(run.id);
+      return { runId: run.id, status: 'suspended' };
+    }
     // Saga compensations registered by completed steps; run in reverse if the run later fails.
     const compensations: Compensation[] = [];
     const ctx = createWorkflowCtx(this.ctxHost, run.id, compensations);

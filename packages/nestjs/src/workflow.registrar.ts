@@ -74,6 +74,7 @@ export class WorkflowRegistrar
       }
       this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input), {
         tags: meta.tags,
+        singleton: meta.singleton,
       });
 
       const inline = this.findDeadLetterHandler(instance);
