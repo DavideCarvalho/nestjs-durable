@@ -47,6 +47,7 @@ describe('recovery lease', () => {
     await store.createRun(runningRun('r1'));
 
     await Promise.all([a.recoverIncomplete(), b.recoverIncomplete()]);
+    await a.waitForRun('r1'); // exactly one instance re-enqueued it; a worker runs it once
 
     expect(bodyRuns).toBe(1);
     expect((await store.getRun('r1'))?.status).toBe('completed');

@@ -567,9 +567,32 @@ export class WorkflowEngine {
    * replay from their checkpoints, so only the work that had not finished runs again.
    */
   async recoverIncomplete(nowMs: number = this.clock()): Promise<RunResult[]> {
-    return this.resumeLeased(await this.store.listIncompleteRuns(), nowMs, (run) =>
-      this.countRecovery(run),
-    );
+    if (this.draining) return [];
+    const results: RunResult[] = [];
+    for (const run of await this.store.listIncompleteRuns()) {
+      // A live worker renews its lease, so an acquirable lease means the run is genuinely orphaned
+      // (its worker crashed). Skip the ones still owned.
+      const acquired = await this.store.tryLockRun(
+        run.id,
+        this.instanceId,
+        nowMs + this.leaseMs,
+        nowMs,
+      );
+      if (!acquired) continue;
+      // Count the attempt / dead-letter a poison pill past maxRecoveryAttempts.
+      const settled = await this.countRecovery(run);
+      if (settled) {
+        results.push(settled);
+        continue;
+      }
+      // Re-enqueue rather than resume inline: recovery must NOT block (boot, or a poll tick) on a
+      // long workflow step. A dispatcher/worker re-runs it, replaying its checkpoints.
+      await this.store.releaseRunLock(run.id);
+      await this.store.updateRun(run.id, { status: 'pending', updatedAt: new Date() });
+      await this.runDispatcher.dispatch(run.id);
+      results.push({ runId: run.id, status: 'pending' });
+    }
+    return results;
   }
 
   /**
