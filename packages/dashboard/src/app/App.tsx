@@ -9,6 +9,7 @@ import {
   durableClient,
   runDisplayStatus,
 } from '../client/durable-client';
+import { mergeLiveEvents } from '../client/merge-live-events';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
@@ -180,7 +181,12 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   const qc = useQueryClient();
   const { data } = useQuery({
     queryKey: ['run', id],
-    queryFn: () => durableClient.run(id),
+    // Merge over the cache instead of replacing it: the store only persists a step's `events` at
+    // completion, so a refetch returns a still-running step empty — replacing would wipe the trail
+    // the live stream appended (sub-processes flicker). Read prev AFTER the fetch so events that
+    // streamed in during the request are kept too.
+    queryFn: async () =>
+      mergeLiveEvents(qc.getQueryData<RunDetail>(['run', id]), await durableClient.run(id)),
     // Live-follow an in-flight run; stop polling once it reaches a terminal state.
     refetchInterval: (q) => {
       const s = (q.state.data as RunDetail | undefined)?.run.status;
