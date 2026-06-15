@@ -8,11 +8,47 @@ and ships results out.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 Handler = Callable[..., Union[Any, Awaitable[Any]]]
+
+# The step a handler is currently running, bound for the duration of the call (in the loop for an
+# async handler, in the executor thread for a blocking one). Lets code DEEP inside a handler — that
+# never received `ctx` — record events via the module-level helpers below, without threading the
+# context through every call. Outside a step it's None and the helpers are no-ops.
+_current_step: "contextvars.ContextVar[Optional[StepContext]]" = contextvars.ContextVar(
+    "durable_current_step", default=None
+)
+
+
+def current_step() -> "Optional[StepContext]":
+    """The :class:`StepContext` of the step running on this task/thread, or None outside a step."""
+    return _current_step.get()
+
+
+def log(level: str, message: str, data: Any = None) -> None:
+    """Record a log line on the current step (level: debug/info/warn/error). No-op outside a step."""
+    ctx = _current_step.get()
+    if ctx is not None:
+        getattr(ctx, level, ctx.info)(message, data)
+
+
+def sub(name: str, status: str, message: Optional[str] = None, data: Any = None) -> None:
+    """Record a sub-process outcome (ok/failed/skipped) on the current step. No-op outside a step."""
+    ctx = _current_step.get()
+    if ctx is not None:
+        ctx.sub(name, status, message, data)
+
+
+def set_process(name: Optional[str]) -> None:
+    """Tag the current step's subsequent log lines with sub-process ``name`` (None clears). No-op
+    outside a step — so the same business code runs on a non-durable path untouched."""
+    ctx = _current_step.get()
+    if ctx is not None:
+        ctx.process(name)
 
 
 class FatalError(Exception):
@@ -148,18 +184,67 @@ class Worker:
     def __init__(self, group: str = "default") -> None:
         self.group = group
         self._handlers: Dict[str, Handler] = {}
+        self._blocking: Dict[str, bool] = {}
 
-    def step(self, name: str) -> Callable[[Handler], Handler]:
-        """Decorator registering ``fn`` as the handler for step ``name``."""
+    def step(self, name: str, *, blocking: bool = False) -> Callable[[Handler], Handler]:
+        """Decorator registering ``fn`` as the handler for step ``name``.
+
+        Set ``blocking=True`` for a synchronous handler that does CPU/DB work: the worker runs it in
+        a thread so the event loop stays free to renew the broker's job lock (otherwise a long step
+        looks stalled and gets redelivered). The step context is bound inside that thread too, so the
+        module-level :func:`log`/:func:`sub`/:func:`set_process` work from anywhere in the call.
+        """
 
         def register(fn: Handler) -> Handler:
             self._handlers[name] = fn
+            self._blocking[name] = blocking
             return fn
 
         return register
 
     def handles(self, name: str) -> bool:
         return name in self._handlers
+
+    def run(self, *, redis: str = "redis://localhost:6379", prefix: str = "durable") -> None:
+        """Run this worker against the Redis/BullMQ transport until the process is signalled, then
+        close gracefully. Owns the whole long-running bootstrap a worker process needs — the event
+        loop, SIGTERM/SIGINT handling, and the broker connection — so the entrypoint is one call::
+
+            worker = Worker(group="processing")
+
+            @worker.step("processing", blocking=True)
+            def handle(data, ctx): ...
+
+            worker.run(redis=redis_url_from_env())
+
+        Blocks until a shutdown signal closes the worker (which finishes the active job and releases
+        its lock). For finer control (your own loop/signals), use :func:`run_redis_worker` directly.
+        """
+        import signal as _signal
+
+        from .redis_runner import run_redis_worker
+
+        async def _main() -> None:
+            bull_worker = await run_redis_worker(
+                self, group=self.group, connection=redis, prefix=prefix
+            )
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            async def _graceful() -> None:
+                try:
+                    await bull_worker.close()
+                finally:
+                    stop.set()
+
+            for sig in (_signal.SIGTERM, _signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, lambda: asyncio.ensure_future(_graceful()))
+                except (NotImplementedError, RuntimeError):
+                    pass  # no signal support here (e.g. not the main thread) — rely on redelivery
+            await stop.wait()
+
+        asyncio.run(_main())
 
     def process_task(
         self,
@@ -181,7 +266,7 @@ class Worker:
             return self._no_handler(base, task["name"])
         ctx = self._ctx(task, is_cancelled, on_event)
         try:
-            output = self._invoke(handler, task.get("input"), ctx)
+            output = _run_bound(handler, task.get("input"), ctx)
             if inspect.isawaitable(output):
                 output = asyncio.run(output)
             return self._completed(base, output, ctx)
@@ -195,7 +280,8 @@ class Worker:
         on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Async variant — awaits async handlers in the current loop. Use from a transport that
-        already runs inside an event loop (e.g. the BullMQ runner)."""
+        already runs inside an event loop (e.g. the BullMQ runner). A handler registered
+        ``blocking=True`` runs in a thread so the loop stays free to renew the job lock."""
 
         base = self._base(task)
         handler = self._handlers.get(task["name"])
@@ -203,9 +289,21 @@ class Worker:
             return self._no_handler(base, task["name"])
         ctx = self._ctx(task, is_cancelled, on_event)
         try:
-            output = self._invoke(handler, task.get("input"), ctx)
-            if inspect.isawaitable(output):
-                output = await output
+            if self._blocking.get(task["name"]):
+                loop = asyncio.get_running_loop()
+                output = await loop.run_in_executor(
+                    None, _run_bound, handler, task.get("input"), ctx
+                )
+            else:
+                output = _run_bound(handler, task.get("input"), ctx)
+                if inspect.isawaitable(output):
+                    # The context var was reset by _run_bound after the sync part returned the
+                    # coroutine; re-bind it for the duration of the await so deep `log()` calls work.
+                    token = _current_step.set(ctx)
+                    try:
+                        output = await output
+                    finally:
+                        _current_step.reset(token)
             return self._completed(base, output, ctx)
         except Exception as err:  # noqa: BLE001
             return self._failure(base, err, ctx)
@@ -222,14 +320,6 @@ class Worker:
             seq=task.get("seq"),
             on_event=on_event,
         )
-
-    @staticmethod
-    def _invoke(handler: Handler, input_: Any, ctx: StepContext) -> Any:
-        """Call ``handler`` with the step input, passing ``ctx`` only if it declares a second
-        parameter — so plain ``def handler(data)`` handlers keep working unchanged."""
-        if _wants_ctx(handler):
-            return handler(input_, ctx)
-        return handler(input_)
 
     @staticmethod
     def _base(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -263,6 +353,18 @@ class Worker:
         else:
             error = {"message": str(err)}
         return _with_events({**base, "status": "failed", "error": error}, ctx)
+
+
+def _run_bound(handler: Handler, input_: Any, ctx: "StepContext") -> Any:
+    """Call ``handler`` with ``ctx`` bound as the current step for the duration of the call, so the
+    module-level :func:`log`/:func:`sub`/:func:`set_process` reach it from deep in the call tree.
+    Passes ``ctx`` as a second arg only if the handler declares one (plain ``def h(data)`` still
+    works). Also the target run in the executor thread for a ``blocking=True`` handler."""
+    token = _current_step.set(ctx)
+    try:
+        return handler(input_, ctx) if _wants_ctx(handler) else handler(input_)
+    finally:
+        _current_step.reset(token)
 
 
 def _wants_ctx(handler: Handler) -> bool:

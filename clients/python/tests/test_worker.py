@@ -1,6 +1,15 @@
+import asyncio
 import unittest
 
-from durable_worker import FatalError, StepContext, Worker
+from durable_worker import (
+    FatalError,
+    StepContext,
+    Worker,
+    current_step,
+    log,
+    set_process,
+    sub,
+)
 
 
 def task(name="payments.charge-card", **over):
@@ -177,6 +186,55 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual([e["message"] for e in live], ["first", "proc-a"])
         # the same events still ride back on the result (live-tail doesn't replace the final record)
         self.assertEqual(len(result["events"]), 2)
+
+
+    def test_module_level_helpers_reach_the_current_step(self):
+        worker = Worker()
+
+        def deep_business_logic():
+            # No `ctx` in scope here — the context-local helpers find it.
+            set_process("proc-a")
+            log("debug", "querying")
+            sub("proc-a", "ok")
+
+        @worker.step("payments.charge-card")
+        def charge(_data):  # note: no ctx param — handler doesn't even take it
+            deep_business_logic()
+            return {"ok": True}
+
+        events = worker.process_task(task())["events"]
+        self.assertEqual(events[0]["message"], "querying")
+        self.assertEqual(events[0]["process"], "proc-a")
+        self.assertEqual(events[1]["name"], "proc-a")
+        self.assertEqual(events[1]["status"], "ok")
+
+    def test_module_level_helpers_are_noops_outside_a_step(self):
+        # Same business code on a non-durable path must not blow up.
+        self.assertIsNone(current_step())
+        log("info", "no step here")
+        sub("x", "ok")
+        set_process("x")
+
+    def test_blocking_handler_runs_in_a_thread_with_the_step_bound(self):
+        import threading
+
+        worker = Worker()
+        ran_on = {}
+
+        @worker.step("payments.charge-card", blocking=True)
+        def charge(_data):
+            ran_on["thread"] = threading.current_thread().name
+            log("info", "from the worker thread")
+            return {"ok": True}
+
+        async def drive():
+            return await worker.aprocess_task(task())
+
+        loop_thread = threading.current_thread().name
+        result = asyncio.run(drive())
+        self.assertEqual(result["events"][0]["message"], "from the worker thread")
+        # it really ran off the event-loop thread (so the lock keeps renewing)
+        self.assertNotEqual(ran_on["thread"], loop_thread)
 
 
 if __name__ == "__main__":

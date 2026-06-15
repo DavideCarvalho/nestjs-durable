@@ -26,6 +26,20 @@ from .worker import Worker
 _INSTANCE_ID = f"py-{socket.gethostname()}-{os.getpid()}"
 
 
+def redis_url_from_env(prefix: str = "REDIS") -> str:
+    """Build a ``redis://`` URL from ``{prefix}_HOST/_PORT/_USERNAME/_PASSWORD`` env vars. The
+    credentials are URL-encoded — a generated password often contains ``@ : /`` which would corrupt
+    the netloc if left raw. Defaults to ``localhost:6379`` with no auth. Handy for ``Worker.run``."""
+    from urllib.parse import quote
+
+    host = os.getenv(f"{prefix}_HOST", "localhost")
+    port = os.getenv(f"{prefix}_PORT", "6379")
+    user = os.getenv(f"{prefix}_USERNAME") or ""
+    password = os.getenv(f"{prefix}_PASSWORD") or ""
+    auth = f"{quote(user, safe='')}:{quote(password, safe='')}@" if (user or password) else ""
+    return f"redis://{auth}{host}:{port}"
+
+
 def _names(prefix: str, group: str) -> tuple[str, str]:
     # Must match the TS BullMQTransport: '<prefix>-tasks-<group>' and '<prefix>-results'.
     return f"{prefix}-tasks-{group}", f"{prefix}-results"

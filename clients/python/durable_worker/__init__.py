@@ -6,8 +6,17 @@ same step name implemented here is callable from a TypeScript workflow via ``ctx
 """
 
 from .cancellation import Cancelled, CancellationRegistry
+from .redis_runner import redis_url_from_env, run_redis_worker
 from .routing import reply_target
-from .worker import FatalError, StepContext, Worker
+from .worker import (
+    FatalError,
+    StepContext,
+    Worker,
+    current_step,
+    log,
+    set_process,
+    sub,
+)
 
 __all__ = [
     "Worker",
@@ -16,5 +25,13 @@ __all__ = [
     "Cancelled",
     "CancellationRegistry",
     "reply_target",
+    # Context-local step access — record events from anywhere inside a handler without threading ctx.
+    "current_step",
+    "log",
+    "sub",
+    "set_process",
+    # Transport bootstrap helpers.
+    "run_redis_worker",
+    "redis_url_from_env",
 ]
-__version__ = "0.3.0"
+__version__ = "0.4.0"
