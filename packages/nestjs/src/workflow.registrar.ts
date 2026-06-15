@@ -15,7 +15,7 @@ import {
   type OnModuleInit,
 } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
-import { getWorkflowMeta, isDeadLetterHandler } from './decorators';
+import { getOnEvents, getWorkflowMeta, isDeadLetterHandler } from './decorators';
 import type { DurableModuleOptions } from './durable.module';
 import { classValidatorInput } from './input-validation';
 
@@ -83,6 +83,7 @@ export class WorkflowRegistrar
         singleton: meta.singleton,
         executionTimeout: meta.executionTimeout,
         validateInput,
+        onEvent: getOnEvents(meta, instance.constructor),
       });
 
       const inline = this.findDeadLetterHandler(instance);
