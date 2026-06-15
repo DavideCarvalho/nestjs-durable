@@ -108,6 +108,19 @@ export const durableClient = {
   retry(id: string): Promise<WorkflowRun> {
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
   },
+  /** Bulk retry/cancel every run matching a filter. Returns how many matched + were acted on. */
+  bulk(
+    action: 'retry' | 'cancel',
+    filter: { status?: RunStatus; tag?: string },
+  ): Promise<{ matched: number; applied: number }> {
+    const q = new URLSearchParams();
+    if (filter.status) q.set('status', filter.status);
+    if (filter.tag) q.set('tag', filter.tag);
+    const qs = q.toString();
+    return http<{ matched: number; applied: number }>(`/bulk/${action}${qs ? `?${qs}` : ''}`, {
+      method: 'POST',
+    });
+  },
   cancel(id: string, opts?: { compensate?: boolean }): Promise<WorkflowRun> {
     const qs = opts?.compensate ? '?compensate=true' : '';
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/cancel${qs}`, { method: 'POST' });

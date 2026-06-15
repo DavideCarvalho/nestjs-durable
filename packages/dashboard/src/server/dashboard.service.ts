@@ -46,6 +46,30 @@ export class DashboardService {
     return this.engine.cancel(runId, opts);
   }
 
+  /**
+   * Apply `retry` or `cancel` to every run matching a filter (status / tag / workflow) — e.g. "retry
+   * every `dead` run tagged `type:mel`". Capped at 500 runs per call; runs that can't be acted on
+   * (already terminal) are skipped. Returns how many matched and how many the action applied to.
+   */
+  async bulk(
+    action: 'retry' | 'cancel',
+    filter: Pick<RunQuery, 'status' | 'tag' | 'workflow'>,
+    opts?: { compensate?: boolean },
+  ): Promise<{ matched: number; applied: number }> {
+    const runs = await this.store.listRuns({ ...filter, limit: 500 });
+    let applied = 0;
+    for (const r of runs) {
+      try {
+        if (action === 'retry') await this.engine.resume(r.id);
+        else await this.engine.cancel(r.id, opts);
+        applied += 1;
+      } catch {
+        // Skip a run that can't take the action (e.g. already terminal) — keep going.
+      }
+    }
+    return { matched: runs.length, applied };
+  }
+
   /** Resume a run paused at a `ctx.breakpoint` (the "continue" button). */
   continue(runId: string): Promise<RunResult | null> {
     return this.engine.continue(runId);

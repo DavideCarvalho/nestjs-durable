@@ -13,6 +13,29 @@ function setup() {
 }
 
 describe('DashboardService', () => {
+  it('bulk-retries every failed run matching a tag', async () => {
+    const { engine, store, service } = setup();
+    let attempts = 0;
+    engine.register('flaky', '1', async (ctx: WorkflowCtx) => {
+      await ctx.step('s', async () => {
+        attempts += 1;
+        if (attempts <= 2) throw new Error('boom'); // first two runs fail
+        return 'ok';
+      });
+      return 'done';
+    });
+    await engine.start('flaky', {}, 'f1', { tags: ['etl'] });
+    await engine.start('flaky', {}, 'f2', { tags: ['other'] });
+    expect((await store.getRun('f1'))?.status).toBe('failed');
+    expect((await store.getRun('f2'))?.status).toBe('failed');
+
+    // Retry only the `failed` runs tagged `etl` → f1 resumes (attempt 3 succeeds), f2 untouched.
+    const res = await service.bulk('retry', { status: 'failed', tag: 'etl' });
+    expect(res).toEqual({ matched: 1, applied: 1 });
+    expect((await store.getRun('f1'))?.status).toBe('completed');
+    expect((await store.getRun('f2'))?.status).toBe('failed');
+  });
+
   it('lists runs and returns a run with its step timeline', async () => {
     const { engine, service } = setup();
     engine.register('checkout', '1', async (ctx: WorkflowCtx) => {
