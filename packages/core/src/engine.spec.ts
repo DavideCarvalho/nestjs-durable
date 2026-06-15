@@ -1,6 +1,6 @@
-import { startRun } from './test-helpers';
 import { WorkflowEngine } from './engine';
 import { FatalError } from './errors';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — deterministic replay', () => {
@@ -183,10 +183,12 @@ describe('WorkflowEngine — deterministic replay', () => {
     });
 
     const recovered = await engine.recoverIncomplete();
-
     expect(recovered).toHaveLength(1);
-    expect(recovered[0]?.status).toBe('completed');
-    expect(recovered[0]?.output).toBe(3);
+    expect(recovered[0]?.status).toBe('pending'); // re-enqueued, not resumed inline
+
+    const result = await engine.waitForRun('r1'); // a worker replays + finishes it
+    expect(result.status).toBe('completed');
+    expect(result.output).toBe(3);
     // 'a' was replayed from its checkpoint, not re-executed.
     expect(aRuns).toBe(0);
   });

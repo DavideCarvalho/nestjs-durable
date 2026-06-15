@@ -26,6 +26,7 @@ describe('DLQ — maxRecoveryAttempts', () => {
     await store.createRun(runningRun());
 
     await engine.recoverIncomplete();
+    await engine.waitForRun('r1'); // re-enqueued → a worker runs it, then suspends on the signal
 
     expect(ran).toBe(1); // under the cap → it ran
     expect((await store.getRun('r1'))?.recoveryAttempts).toBe(1);
@@ -57,7 +58,8 @@ describe('DLQ — maxRecoveryAttempts', () => {
     await store.createRun(runningRun({ workflow: 'wf', recoveryAttempts: 999 }));
 
     await engine.recoverIncomplete();
-    expect((await store.getRun('r1'))?.status).toBe('suspended'); // ran + suspended, not dead
+    await engine.waitForRun('r1'); // re-enqueued → ran + suspended, not dead
+    expect((await store.getRun('r1'))?.status).toBe('suspended');
   });
 
   it('fires onDead listeners with the dead run (for a DLQ handler)', async () => {
