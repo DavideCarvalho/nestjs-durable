@@ -88,6 +88,8 @@ interface RegisteredWorkflow {
   singleton?: SingletonConfig;
   /** Max wall-clock lifetime (ms) before a run is cancelled by `sweepTimeouts`. */
   executionTimeoutMs?: number;
+  /** Validate the input at start; throw to reject before a run is created. Validator-agnostic. */
+  validateInput?: (input: unknown) => void | Promise<void>;
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
@@ -281,7 +283,12 @@ export class WorkflowEngine {
     name: string,
     version: string,
     fn: WorkflowFn,
-    opts?: { tags?: string[]; singleton?: SingletonConfig; executionTimeout?: string | number },
+    opts?: {
+      tags?: string[];
+      singleton?: SingletonConfig;
+      executionTimeout?: string | number;
+      validateInput?: (input: unknown) => void | Promise<void>;
+    },
   ): void {
     const registered: RegisteredWorkflow = {
       name,
@@ -291,6 +298,7 @@ export class WorkflowEngine {
       singleton: opts?.singleton,
       executionTimeoutMs:
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
+      validateInput: opts?.validateInput,
     };
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
@@ -391,6 +399,8 @@ export class WorkflowEngine {
     const name = workflowName(workflow);
     const registered = this.latest.get(name);
     if (!registered) throw new Error(`workflow ${name} is not registered`);
+    // Validate the input up front — a bad payload is rejected before any run is created.
+    await registered.validateInput?.(input);
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
     const prior = await this.store.getRun(runId);

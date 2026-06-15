@@ -23,7 +23,17 @@
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
     "@nestjs/common": "^10.0.0 || ^11.0.0",
     "@nestjs/core": "^10.0.0 || ^11.0.0",
+    "class-transformer": "^0.5.0",
+    "class-validator": "^0.14.0",
     "reflect-metadata": "^0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "class-transformer": {
+      "optional": true
+    },
+    "class-validator": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
@@ -32,6 +42,8 @@
     "@nestjs/core": "11.1.26",
     "@nestjs/event-emitter": "3.1.0",
     "@nestjs/testing": "11.1.26",
+    "class-transformer": "0.5.1",
+    "class-validator": "0.14.2",
     "eventemitter2": "6.4.9",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",

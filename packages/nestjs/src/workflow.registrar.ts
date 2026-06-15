@@ -17,6 +17,7 @@ import {
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { getWorkflowMeta, isDeadLetterHandler } from './decorators';
 import type { DurableModuleOptions } from './durable.module';
+import { classValidatorInput } from './input-validation';
 
 interface WorkflowInstance {
   run(ctx: WorkflowCtx, input: unknown): Promise<unknown>;
@@ -72,10 +73,16 @@ export class WorkflowRegistrar
       if (typeof workflow.run !== 'function') {
         throw new Error(`@Workflow ${meta.name} must define a run(ctx, input) method`);
       }
+      // Input validation: a custom `validateInput` wins; otherwise build one from the class-validator
+      // `inputSchema` DTO (lazy — class-validator is only required if a workflow uses inputSchema).
+      const validateInput =
+        meta.validateInput ??
+        (meta.inputSchema ? classValidatorInput(meta.inputSchema) : undefined);
       this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input), {
         tags: meta.tags,
         singleton: meta.singleton,
         executionTimeout: meta.executionTimeout,
+        validateInput,
       });
 
       const inline = this.findDeadLetterHandler(instance);
