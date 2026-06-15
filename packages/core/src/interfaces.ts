@@ -383,6 +383,19 @@ export interface WorkflowCtx {
    */
   sleep(duration: string | number): Promise<void>;
   /**
+   * Durable sleep until an **absolute** time (a `Date` or epoch ms) — like {@link sleep} but for a
+   * fixed deadline (e.g. "resume at midnight"). Resumes automatically once the time passes, across
+   * restarts. The recorded wake time is fixed on the first run, so it's replay-stable.
+   */
+  sleepUntil(when: Date | number): Promise<void>;
+  /**
+   * End this run and **continue as a fresh execution** of the same workflow with `input` and a clean
+   * history — for long-running / looping workflows that would otherwise accumulate unbounded
+   * checkpoints (and slow replays). The next run gets id `<runId>~N`. Terminal: it always throws, so
+   * code after it never runs. Carry forward whatever state the next iteration needs in `input`.
+   */
+  continueAsNew(input?: unknown): Promise<never>;
+  /**
    * Suspend the run until an external `engine.signal(token, payload)` arrives (e.g. a webhook or
    * human approval), then resume with the payload. Waits indefinitely by default — no compute
    * consumed. Pass `{ timeoutMs }` to bound the wait: if the deadline passes first the call throws

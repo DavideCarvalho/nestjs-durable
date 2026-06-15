@@ -74,3 +74,15 @@ export class WorkflowSuspended extends Error {
     this.wakeAt = wakeAt;
   }
 }
+
+/**
+ * Thrown by `ctx.continueAsNew(input)` to end the current run and hand off to a fresh execution of
+ * the same workflow with a clean history — for long-running / looping workflows that would otherwise
+ * accumulate unbounded checkpoints. The engine completes this run and starts the next one.
+ */
+export class ContinueAsNew extends Error {
+  constructor(readonly input: unknown) {
+    super('workflow continued as new');
+    this.name = 'ContinueAsNew';
+  }
+}

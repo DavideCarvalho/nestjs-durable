@@ -2,7 +2,13 @@ import { backoffDelay } from './backoff';
 import { instantCheckpoint } from './checkpoints';
 import { unwrapCompletion } from './completion';
 import { parseDuration } from './duration';
-import { FatalError, NonDeterminismError, SignalTimeoutError, WorkflowSuspended } from './errors';
+import {
+  ContinueAsNew,
+  FatalError,
+  NonDeterminismError,
+  SignalTimeoutError,
+  WorkflowSuspended,
+} from './errors';
 import type {
   DurableWebhook,
   RemoteStepDef,
@@ -149,7 +155,10 @@ export function createWorkflowCtx(
     }
   };
 
-  const sleep = async (duration: string | number): Promise<void> => {
+  // Shared by sleep / sleepUntil: record a durable timer at this position and suspend until `wakeAt`
+  // (epoch ms). The wakeAt is computed by the caller — but only used on the first run; on replay the
+  // recorded checkpoint's wakeAt wins, so a clock change can't shift an already-scheduled timer.
+  const suspendUntil = async (wakeAt: () => number): Promise<void> => {
     const current = pos.next();
     const now = host.clock();
     const existing = await store.getCheckpoint(runId, current);
@@ -158,11 +167,23 @@ export function createWorkflowCtx(
       if (now >= (existing.wakeAt ?? 0)) return;
       throw new WorkflowSuspended(existing.wakeAt ?? now);
     }
-    const wakeAt = now + parseDuration(duration);
+    const at = wakeAt();
     await store.saveCheckpoint(
-      instantCheckpoint({ runId, seq: current, name: 'sleep', kind: 'sleep', wakeAt }),
+      instantCheckpoint({ runId, seq: current, name: 'sleep', kind: 'sleep', wakeAt: at }),
     );
-    throw new WorkflowSuspended(wakeAt);
+    throw new WorkflowSuspended(at);
+  };
+
+  const sleep = (duration: string | number): Promise<void> =>
+    suspendUntil(() => host.clock() + parseDuration(duration));
+
+  const sleepUntil = (when: Date | number): Promise<void> =>
+    suspendUntil(() => (typeof when === 'number' ? when : when.getTime()));
+
+  // End this run and hand off to a fresh execution (clean history) with the new input. Terminal —
+  // it always throws, so any code after it in the workflow is unreachable.
+  const continueAsNew = (input?: unknown): Promise<never> => {
+    throw new ContinueAsNew(input);
   };
 
   // NOTE (determinism): a bounded wait consumes TWO logical positions (deadline + wait), an
@@ -340,6 +361,8 @@ export function createWorkflowCtx(
     runId,
     step,
     sleep,
+    sleepUntil,
+    continueAsNew,
     waitForSignal,
     task,
     child,

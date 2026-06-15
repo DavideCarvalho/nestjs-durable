@@ -1,7 +1,7 @@
 import { backoffDelay } from './backoff';
 import { instantCheckpoint } from './checkpoints';
 import { type Completion } from './completion';
-import { NonDeterminismError, RemoteStepTimeout, WorkflowSuspended } from './errors';
+import { ContinueAsNew, NonDeterminismError, RemoteStepTimeout, WorkflowSuspended } from './errors';
 import type {
   ControlPlane,
   EngineEvent,
@@ -65,6 +65,12 @@ interface RegisteredWorkflow {
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
+
+/** The id for the next continuation of a run: `r` → `r~1` → `r~2` … (stable, traceable lineage). */
+function nextContinuationId(runId: string): string {
+  const m = runId.match(/^(.*)~(\d+)$/);
+  return m ? `${m[1]}~${Number(m[2]) + 1}` : `${runId}~1`;
+}
 
 /** True when version `a` is newer than `b` (numeric when both parse as numbers, else natural sort). */
 function isNewerVersion(a: string, b: string): boolean {
@@ -638,6 +644,24 @@ export class WorkflowEngine {
       void this.notifyParent(run.id, { ok: true, value: output });
       return { runId: run.id, status: 'completed', output };
     } catch (err) {
+      if (err instanceof ContinueAsNew) {
+        // Hand off to a fresh execution with a clean history: complete this run, then start the next
+        // (`<id>~N`) with the new input. Deferred + idempotent by the continuation id, so a crash
+        // mid-handoff re-derives the same next run instead of forking.
+        await this.store.updateRun(run.id, {
+          status: 'completed',
+          output: undefined,
+          error: undefined,
+          updatedAt: new Date(),
+        });
+        this.emit({ type: 'run.completed', runId: run.id, workflow: run.workflow });
+        void this.notifyParent(run.id, { ok: true, value: undefined });
+        const nextId = nextContinuationId(run.id);
+        queueMicrotask(
+          () => void this.start(run.workflow, err.input, nextId).catch(() => undefined),
+        );
+        return { runId: run.id, status: 'completed' };
+      }
       if (err instanceof WorkflowSuspended) {
         // A compensating cancel resumed this run to reach here: the replay re-registered the saga,
         // so undo the completed steps in reverse and mark it cancelled instead of re-suspending.
