@@ -227,9 +227,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           return {
             ...prev,
             timeline: prev.timeline.map((step) =>
-              step.seq === seq
-                ? { ...step, events: [...(step.events ?? []), live] }
-                : step,
+              step.seq === seq ? { ...step, events: [...(step.events ?? []), live] } : step,
             ),
           };
         });
@@ -265,6 +263,19 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   };
   const [sel, setSel] = useState<number>();
   const [showRunIO, setShowRunIO] = useState(false);
+  const [expandedChildren, setExpandedChildren] = useState<Set<string>>(new Set());
+
+  function toggleChild(childId: string) {
+    setExpandedChildren((prev) => {
+      const next = new Set(prev);
+      if (next.has(childId)) {
+        next.delete(childId);
+      } else {
+        next.add(childId);
+      }
+      return next;
+    });
+  }
 
   if (!data) return <div className="p-8 text-sm text-zinc-600">Loading run…</div>;
   const { run, timeline } = data;
@@ -475,6 +486,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               selected={sel}
               onSelect={setSel}
               onOpenRun={onOpenRun}
+              expanded={expandedChildren}
+              onToggleChild={toggleChild}
             />
           </div>
         )}
