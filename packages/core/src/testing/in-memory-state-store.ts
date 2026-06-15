@@ -5,6 +5,7 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces';
+import { matchesAttributes } from '../search-attributes';
 
 /**
  * A non-durable, in-process `StateStore` for tests and local development.
@@ -97,6 +98,8 @@ export class InMemoryStateStore implements StateStore {
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
     if (query.status) runs = runs.filter((r) => r.status === query.status);
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));
+    if (query.attributes?.length)
+      runs = runs.filter((r) => matchesAttributes(r.searchAttributes, query.attributes));
     // Newest first (matches the store adapters' `createdAt DESC`) — recent runs on top in the dashboard.
     runs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
     const offset = query.offset ?? 0;

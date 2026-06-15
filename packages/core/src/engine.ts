@@ -12,6 +12,7 @@ import type {
   RemoteStepDef,
   RemoteTask,
   RunResult,
+  SearchAttributes,
   StateStore,
   StepError,
   StepEvent,
@@ -46,6 +47,8 @@ type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 export interface StartOptions {
   /** Run-scoped tags, merged with the workflow's static `@Workflow({ tags })` onto the run. */
   tags?: string[];
+  /** Typed, queryable run data stamped on the run (e.g. `{ amount: 200, tier: 'pro' }`). */
+  searchAttributes?: SearchAttributes;
 }
 
 /**
@@ -462,6 +465,7 @@ export class WorkflowEngine {
       status: 'running',
       input,
       tags,
+      searchAttributes: opts?.searchAttributes,
       createdAt: now,
       updatedAt: now,
     };

@@ -9,6 +9,7 @@ export * from './codec-state-store';
 export * from './events';
 export * from './metrics';
 export * from './scheduler';
+export * from './search-attributes';
 export * from './tokens';
 export * from './workflow-ref';
 export { InMemoryStateStore } from './testing/in-memory-state-store';

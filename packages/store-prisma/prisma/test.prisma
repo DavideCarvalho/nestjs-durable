@@ -24,6 +24,7 @@ model DurableWorkflowRun {
   lockedUntil     DateTime?
   recoveryAttempts Int?
   tags            Json?
+  searchAttributes Json?
   createdAt       DateTime
   updatedAt       DateTime
 

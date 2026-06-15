@@ -12,6 +12,7 @@ export interface WorkflowRun {
   wakeAt?: number;
   recoveryAttempts?: number;
   tags?: string[];
+  searchAttributes?: Record<string, string | number | boolean>;
   createdAt: string;
   updatedAt: string;
 }
@@ -95,10 +96,12 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const durableClient = {
-  runs(status?: RunStatus, tag?: string): Promise<WorkflowRun[]> {
+  runs(status?: RunStatus, tag?: string, attr?: string[]): Promise<WorkflowRun[]> {
     const q = new URLSearchParams();
     if (status) q.set('status', status);
     if (tag) q.set('tag', tag);
+    // Each `attr` is a `key:op:value` predicate; repeated params are ANDed server-side.
+    for (const a of attr ?? []) q.append('attr', a);
     const qs = q.toString();
     return http<WorkflowRun[]>(qs ? `/runs?${qs}` : '/runs');
   },
@@ -111,11 +114,12 @@ export const durableClient = {
   /** Bulk retry/cancel every run matching a filter. Returns how many matched + were acted on. */
   bulk(
     action: 'retry' | 'cancel',
-    filter: { status?: RunStatus; tag?: string },
+    filter: { status?: RunStatus; tag?: string; attr?: string[] },
   ): Promise<{ matched: number; applied: number }> {
     const q = new URLSearchParams();
     if (filter.status) q.set('status', filter.status);
     if (filter.tag) q.set('tag', filter.tag);
+    for (const a of filter.attr ?? []) q.append('attr', a);
     const qs = q.toString();
     return http<{ matched: number; applied: number }>(`/bulk/${action}${qs ? `?${qs}` : ''}`, {
       method: 'POST',

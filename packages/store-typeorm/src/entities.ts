@@ -39,6 +39,9 @@ export class WorkflowRunEntity {
   @Column('simple-json', { nullable: true })
   tags?: string[] | null;
 
+  @Column('simple-json', { nullable: true })
+  searchAttributes?: Record<string, string | number | boolean> | null;
+
   @Column()
   createdAt!: Date;
 

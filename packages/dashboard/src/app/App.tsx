@@ -273,6 +273,19 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               ))}
             </div>
           )}
+          {run.searchAttributes && Object.keys(run.searchAttributes).length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-1">
+              {Object.entries(run.searchAttributes).map(([k, v]) => (
+                <span
+                  key={k}
+                  className="mono rounded border border-indigo-500/30 bg-indigo-500/10 px-1.5 text-[10px] text-indigo-300"
+                  title="search attribute"
+                >
+                  {k}={String(v)}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex shrink-0 gap-2">
           <button
@@ -390,11 +403,22 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
 export function App() {
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
   const [tagFilter, setTagFilter] = useState('');
+  const [attrFilter, setAttrFilter] = useState('');
   const [selected, setSelected] = useState<string>();
   const qc = useQueryClient();
+  // Comma-separated `key:op:value` predicates (e.g. `amount:gte:200, tier:eq:pro`), ANDed server-side.
+  const attrPredicates = attrFilter
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
   const { data: runs = [] } = useQuery({
-    queryKey: ['runs', tagFilter],
-    queryFn: () => durableClient.runs(undefined, tagFilter || undefined),
+    queryKey: ['runs', tagFilter, attrPredicates.join('|')],
+    queryFn: () =>
+      durableClient.runs(
+        undefined,
+        tagFilter || undefined,
+        attrPredicates.length ? attrPredicates : undefined,
+      ),
     refetchInterval: 3000, // keep the run list live
   });
   const bulk = useMutation({
@@ -402,6 +426,7 @@ export function App() {
       durableClient.bulk(action, {
         status: filter !== 'all' ? filter : undefined,
         tag: tagFilter || undefined,
+        attr: attrPredicates.length ? attrPredicates : undefined,
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['runs'] }),
   });
@@ -439,11 +464,32 @@ export function App() {
                   </button>
                 )}
               </div>
+              <div className="mt-1.5 flex items-center gap-1.5 rounded-md border border-[var(--line)] px-2">
+                <span className="text-zinc-600">⛃</span>
+                <input
+                  value={attrFilter}
+                  onChange={(e) => setAttrFilter(e.target.value)}
+                  placeholder="attrs e.g. amount:gte:200, tier:eq:pro"
+                  title="Typed search attributes: comma-separated key:op:value (ops eq ne gt gte lt lte)"
+                  className="mono w-full bg-transparent py-1.5 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none"
+                />
+                {attrFilter && (
+                  <button
+                    type="button"
+                    onClick={() => setAttrFilter('')}
+                    className="text-zinc-600 hover:text-zinc-300"
+                    title="clear attribute filter"
+                  >
+                    <XIcon width={12} height={12} />
+                  </button>
+                )}
+              </div>
             </div>
-            {(filter !== 'all' || tagFilter) && shown.length > 0 && (
+            {(filter !== 'all' || tagFilter || attrPredicates.length > 0) && shown.length > 0 && (
               <div className="flex items-center gap-2 border-b border-[var(--line)] px-3 py-1.5">
                 <span className="mono text-[10px] text-zinc-500">
                   {shown.length} {filter !== 'all' ? filter : ''} {tagFilter && `#${tagFilter}`}
+                  {attrPredicates.length > 0 && ` ⛃${attrPredicates.length}`}
                 </span>
                 <button
                   type="button"
