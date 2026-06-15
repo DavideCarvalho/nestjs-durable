@@ -30,6 +30,20 @@ Register it as a normal provider — `DurableModule` discovers it. Start runs wi
 const quote = await ctx.step('quote', () => this.pricing.fetch(order), { retries: 3 });
 ```
 
+### In-flight visibility
+
+When a local step's body begins, the engine emits a `step.started` lifecycle event and (by default)
+writes a `running` checkpoint, so a long step shows up in the [dashboard](/docs/observability/dashboard)
+the moment it starts — not only once it finishes. The `running` checkpoint is a placeholder
+overwritten by the step's `completed`/`failed` result; it never short-circuits
+[replay](/docs/concepts/durability) (only a `completed` checkpoint does), so a crash mid-body simply
+re-runs the step.
+
+Toggle this with the engine's `trackStepStart` option (default `true`). The `step.started` event
+fires either way — the live event stream always sees the start; the flag only gates the extra
+checkpoint write. Set it to `false` on hot paths with many short local steps to halve their
+checkpoint writes, at the cost of reload-survivable in-flight visibility.
+
 ## Remote steps
 
 Declare a typed remote step with `remoteStep`, then call it with `ctx.call` — the engine

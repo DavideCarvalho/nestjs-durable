@@ -66,7 +66,11 @@ is gated, not the control plane. (Default is `worker: true`, so single-process a
 - **Timeline as a graph** — the selected run rendered with `react-flow`: a node pipeline from
   start through each step to the terminal state, tagged by kind (local / remote / sleep / signal),
   with worker group and duration. This is the "see the whole flow" view — a workflow whose steps
-  span apps shown as one rail.
+  span apps shown as one rail. **In-flight steps show up here while they run**, not only on
+  completion: a remote step in flight reads as `pending` and a local step's executing body as
+  `running` (both rendered as an in-flight node). Local in-flight visibility is on by default —
+  it's the engine's [`trackStepStart`](/docs/concepts/workflows-and-steps) option — so a long
+  `ctx.step` is visible the moment it begins.
 - **Step timing** — click a step to inspect it. A remote step shows its **queued** time (how long
   it sat in the queue before a worker picked it up) next to its processing **duration**, so you can
   tell a slow handler apart from a backed-up worker pool. Queue-wait is reported by every transport

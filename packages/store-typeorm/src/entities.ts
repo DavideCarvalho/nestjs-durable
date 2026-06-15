@@ -67,7 +67,7 @@ export class StepCheckpointEntity {
   stepId!: string;
 
   @Column('text')
-  status!: 'pending' | 'completed' | 'failed';
+  status!: 'pending' | 'running' | 'completed' | 'failed';
 
   @Column('simple-json', { nullable: true })
   input?: unknown;

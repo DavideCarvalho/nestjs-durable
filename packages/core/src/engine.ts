@@ -194,6 +194,15 @@ export interface WorkflowEngineDeps {
    */
   compensationRetries?: number;
   /**
+   * Persist a `running` checkpoint when a local step's body begins, so an in-flight step shows up
+   * in the dashboard (and a fresh page load / REST query) the moment it starts — not only once it
+   * completes. The `step.started` lifecycle event is emitted either way (the live SSE view always
+   * sees the start); this flag only controls the extra checkpoint write. Default `true`. Set
+   * `false` on hot paths with many short local steps to halve their checkpoint writes — you keep
+   * the live event but lose reload-survivable in-flight visibility.
+   */
+  trackStepStart?: boolean;
+  /**
    * Where a freshly-`start`ed run executes (see {@link RunDispatcher}). Defaults to in-process: the
    * run executes on this instance asynchronously (a microtask), so `start` returns without blocking.
    * Pass a no-op dispatcher on a caller that must NOT run workflows (e.g. an API/dashboard pod), and
@@ -220,6 +229,8 @@ export class WorkflowEngine {
   private readonly webhookUrl?: (token: string) => string;
   private readonly traceparent?: () => string | undefined;
   private readonly compensationRetries: number;
+  /** Persist a `running` checkpoint at the start of a local step body (see {@link WorkflowEngineDeps.trackStepStart}). */
+  private readonly trackStepStart: boolean;
   /** Where a freshly-started run executes — in-process by default (see {@link RunDispatcher}). */
   private readonly runDispatcher: RunDispatcher;
   /** Every registered workflow, keyed by `name@version` — so old versions stay runnable. */
@@ -270,6 +281,7 @@ export class WorkflowEngine {
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
+    this.trackStepStart = deps.trackStepStart ?? true;
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
     // A failed pickup is swallowed here (the run stays `pending` for a `runPending` poll to retry);
     // run failures themselves are handled inside `execute` and surfaced as the run's `failed` state.
@@ -1073,6 +1085,40 @@ export class WorkflowEngine {
     return [...childIds];
   }
 
+  /**
+   * Announce a local step's body has begun and (when `trackStepStart`) checkpoint it as `running`,
+   * so it's visible in flight rather than appearing only on completion. The checkpoint is a
+   * placeholder overwritten by {@link completeStep}/{@link failStep}; it never short-circuits replay
+   * (only `completed` does), so a crash mid-body just re-runs the step. The `step.started` event
+   * fires regardless — the live SSE view sees the start even with persistence off.
+   */
+  private async startStep(step: StepRecord): Promise<void> {
+    if (this.trackStepStart) {
+      await this.store.saveCheckpoint({
+        runId: step.runId,
+        seq: step.seq,
+        name: step.name,
+        kind: step.kind,
+        stepId: stepId(step.runId, step.seq),
+        status: 'running',
+        input: step.input,
+        events: step.events && step.events.length > 0 ? step.events : undefined,
+        attempts: step.attempts,
+        workerGroup: step.workerGroup,
+        enqueuedAt: step.enqueuedAt,
+        startedAt: step.startedAt,
+        finishedAt: step.startedAt, // placeholder until the body settles
+      });
+    }
+    this.emit({
+      type: 'step.started',
+      runId: step.runId,
+      seq: step.seq,
+      name: step.name,
+      kind: step.kind,
+    });
+  }
+
   /** Checkpoint a finished step and announce it — the two things that must always happen together. */
   private async completeStep(step: StepRecord & { output: unknown }): Promise<void> {
     await this.store.saveCheckpoint({
@@ -1514,6 +1560,7 @@ export class WorkflowEngine {
       store: this.store,
       clock: this.clock,
       webhookUrl: this.webhookUrl,
+      startStep: (s) => this.startStep(s),
       completeStep: (s) => this.completeStep(s),
       failStep: (s) => this.failStep(s),
       callRemote: (runId, seq, step, input, queue, transport) =>
