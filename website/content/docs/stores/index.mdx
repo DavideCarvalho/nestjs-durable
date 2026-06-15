@@ -7,6 +7,13 @@ A **state store** persists workflow runs and step checkpoints — the source of 
 durability and the [dashboard](/docs/observability/dashboard). It's a pluggable `StateStore`
 interface, independent of the [transport](/docs/transports).
 
+<Callout>
+  Writing a **custom store?** The interface includes `renewRunLock(runId, owner, leaseUntilMs)` (for
+  [lease renewal](/docs/concepts/durability#deploys-versioning--multiple-instances) while a run executes)
+  and `listPendingRuns(limit)` (so workers can poll for [`pending`](/docs/concepts/durability#the-execution-model-start-enqueues-a-worker-runs-the-body)
+  runs to dispatch). All bundled adapters implement both.
+</Callout>
+
 ## Adapters
 
 | Store | Notes |

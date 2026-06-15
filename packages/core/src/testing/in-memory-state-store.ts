@@ -84,6 +84,13 @@ export class InMemoryStateStore implements StateStore {
     }
   }
 
+  async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
+    const run = this.runs.get(runId);
+    if (!run || run.lockedBy !== owner) return false;
+    run.lockedUntil = leaseUntilMs;
+    return true;
+  }
+
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
     this.signalWaiters.set(waiter.token, { ...waiter });
   }

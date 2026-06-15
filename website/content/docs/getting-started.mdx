@@ -122,21 +122,31 @@ export class AppModule {}
 
 ## 6. Start a run
 
-Inject `WorkflowService` and start the workflow. It runs the local + remote steps, then suspends
-on the approval signal; a webhook resumes it:
+Inject `WorkflowService` and start the workflow. `start` **enqueues** the run and returns
+immediately with `{ runId, status: 'pending' }` — the HTTP handler never blocks on workflow logic.
+A worker executes the body (by default, the same instance, on a microtask), runs the local + remote
+steps, then suspends on the approval signal; a webhook resumes it:
 
 ```ts
 constructor(private readonly workflows: WorkflowService) {}
 
 async checkout(order: Order) {
-  const run = await this.workflows.start('checkout', order); // → { status: 'suspended', ... }
-  return run.runId;
+  const { runId } = await this.workflows.start('checkout', order); // → { status: 'pending' }
+  return runId; // respond now; the worker runs the workflow
 }
 
 // later, from your approval webhook:
 async approve(orderId: string) {
   await this.workflows.signal(`approve:${orderId}`, { approved: true }); // → completes & ships
 }
+```
+
+Need the outcome inline? `await this.workflows.waitForRun(runId)` resolves once the run **settles**
+— a terminal state (completed/failed/cancelled/dead) or `suspended`:
+
+```ts
+const { runId } = await this.workflows.start('checkout', order);
+const result = await this.workflows.waitForRun(runId); // resolves when the run settles
 ```
 
 That's it — a durable workflow whose remote step runs in-process, that pauses for human approval

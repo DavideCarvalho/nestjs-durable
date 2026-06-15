@@ -115,6 +115,14 @@ export class DrizzleStateStore implements StateStore {
       .where(eq(workflowRuns.id, runId));
   }
 
+  async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
+    const result = await this.db
+      .update(workflowRuns)
+      .set({ lockedUntil: leaseUntilMs })
+      .where(and(eq(workflowRuns.id, runId), eq(workflowRuns.lockedBy, owner)));
+    return (result as { changes?: number }).changes === 1;
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const filters = [
       query.workflow ? eq(workflowRuns.workflow, query.workflow) : undefined,

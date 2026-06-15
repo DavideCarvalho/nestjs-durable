@@ -100,6 +100,16 @@ export class MikroOrmStateStore implements StateStore {
     await em.nativeUpdate(WorkflowRunEntity, { id: runId }, { lockedBy: null, lockedUntil: null });
   }
 
+  async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
+    const em = this.orm.em.fork();
+    const affected = await em.nativeUpdate(
+      WorkflowRunEntity,
+      { id: runId, lockedBy: owner },
+      { lockedUntil: new Date(leaseUntilMs) },
+    );
+    return affected === 1;
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const em = this.orm.em.fork();
     const where: Record<string, unknown> = {};

@@ -26,6 +26,48 @@ run abc
 You write ordinary linear code; the engine guarantees each step runs **exactly once**, logically,
 even across crashes and deploys.
 
+## The execution model: start enqueues, a worker runs the body
+
+`start` does **not** run the workflow inline. `engine.start(workflow, input, runId?, opts?)` (and
+`WorkflowService.start(...)`) **creates the run as `'pending'` and returns immediately** with
+`{ runId, status: 'pending' }`. The caller — an HTTP handler, say — never blocks on workflow logic;
+the body is dispatched to a worker.
+
+```text
+start('checkout', order)        → run created, status: 'pending', returns { runId } now
+  (a worker picks the run up)   → status: 'running', body executes
+  ctx.waitForSignal('approve')  → status: 'suspended'
+  signal('approve')             → resumes → completes
+```
+
+- **`'pending'`** is a new run status: created and enqueued, not yet picked up by a worker.
+- **Where a run executes is a `RunDispatcher`.** The default is **in-process** — the run executes on
+  the same instance, asynchronously on a microtask — so a single-process app still runs workflows with
+  zero setup; it just doesn't block the caller. The worker/API split below is opt-in for scaling.
+- **Await the outcome with `waitForRun`** when you need it inline: `engine.waitForRun(runId)` resolves
+  once the run **settles** — a terminal state (completed/failed/cancelled/dead) **or** `suspended`.
+
+  ```ts
+  const { runId } = await engine.start('checkout', order);
+  const result = await engine.waitForRun(runId); // resolves when the run settles
+  ```
+
+### Execution & workers: API pods enqueue, worker pods run
+
+For scale you can split an app into **API** pods (handle HTTP, the dashboard) and **worker** pods
+(execute workflows) sharing only the database:
+
+- An instance with **`worker: false`** (e.g. an API or dashboard pod) gets a **no-op dispatcher**: its
+  `start` only **enqueues**, leaving the run `pending` for a worker to pick up. It offloads workflow
+  execution to the worker pods over the database alone.
+- **Worker instances poll `engine.runPending()`** each tick (the NestJS `TimerPoller` does this
+  automatically) to lease and run pending runs. The worker-side primitives are `engine.runOne(runId)`
+  (lease + resume one run) and `engine.runPending()` (lease + run all pending runs); a broker-backed
+  dispatcher can enqueue run ids for a worker pool that calls `runOne`.
+
+The default (no explicit worker config) is `worker: true` and the in-process dispatcher — so single-
+process apps need none of this. Runs simply execute on the same instance, just asynchronously.
+
 ## The one rule: workflows are deterministic
 
 Because the body re-runs on recovery, it must be deterministic. **All non-determinism — network
@@ -54,16 +96,21 @@ async run(ctx, order) {
 - **Retries.** Configure per step: `ctx.step(name, fn, { retries: 3, backoff: 'exp' })`. Throw a
   [`FatalError`](/docs/concepts/workflows-and-steps#fatal-errors) to stop retrying a business
   failure outright.
-- **Recovery on boot.** On startup the engine resumes every run a previous process left `running`
-  (`engine.recoverIncomplete()`, wired automatically by `DurableModule`).
+- **Self-healing recovery.** The engine resumes every run a previous process left `running`
+  (`engine.recoverIncomplete()`, wired automatically by `DurableModule`). This runs both on boot
+  **and periodically** — the NestJS `TimerPoller` calls it every tick — so a run orphaned by a crashed
+  worker is reclaimed within ~`leaseMs`, not only on the next deploy. While a run executes, its worker
+  **renews the recovery lease** (every `leaseMs/2`), so a live worker keeps a long-running run while a
+  crashed worker's lease still expires and another instance takes over.
 
 ## Deploys, versioning & multiple instances
 
 Because the engine is embedded in your app, deploys and replicas need a word.
 
 - **The state survives the deploy.** Checkpoints live in the database, so killing the old instance
-  loses nothing. The new instance recovers `running` runs on boot, and the timer poller resumes due
-  sleeps. Suspended runs (sleep/signal) don't even notice a deploy.
+  loses nothing. The new instance recovers `running` runs on boot — and any other instance reclaims
+  orphaned runs within ~`leaseMs` via periodic recovery — while the timer poller resumes due sleeps.
+  Suspended and `pending` runs don't even notice a deploy; a worker picks them up afterward.
 - **Version-pinned replay (skew protection).** Replay is *positional* — changing a workflow's body
   (reordering/inserting steps) while runs are in flight would corrupt them. So `@Workflow` carries a
   `version`, and a run **resumes on the version it started on**. Register the old and new versions
@@ -71,8 +118,11 @@ Because the engine is embedded in your app, deploys and replicas need a word.
   the newest. A run whose version is no longer registered fails loudly rather than corrupting.
 - **One instance per run (recovery lease).** With several replicas, each would try to recover the
   same `running` runs. The engine takes an atomic, self-expiring **lease** on a run before resuming
-  it (`StateStore.tryLockRun`), so a run is picked up by exactly one instance. Set `leaseMs` above
-  your longest synchronous run.
+  it (`StateStore.tryLockRun`), so a run is picked up by exactly one instance, and **renews** the lease
+  while it runs (`StateStore.renewRunLock`) so a long-running run isn't reclaimed out from under a live
+  worker. A crashed worker stops renewing, so its lease expires and another instance recovers the run.
+  Set `leaseMs` above how long a single resume step runs (no longer your whole synchronous run, since
+  the lease is renewed).
 - **Graceful shutdown.** On `OnApplicationShutdown` the engine **drains**: it stops picking up new
   runs and waits for in-flight ones to settle, then releases their leases so the next instance takes
   over immediately. Enable it with `app.enableShutdownHooks()`.

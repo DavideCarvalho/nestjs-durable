@@ -106,6 +106,16 @@ export class TypeOrmStateStore implements StateStore {
     await this.runs().update({ id: runId }, { lockedBy: null, lockedUntil: () => 'NULL' });
   }
 
+  async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
+    const result = await this.runs()
+      .createQueryBuilder()
+      .update()
+      .set({ lockedUntil: new Date(leaseUntilMs) })
+      .where({ id: runId, lockedBy: owner })
+      .execute();
+    return result.affected === 1;
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;

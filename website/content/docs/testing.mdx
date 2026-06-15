@@ -21,7 +21,8 @@ t.engine.register('checkout', '1', async (ctx) => {
   return ctx.step('ship', () => ship());
 });
 
-await t.engine.start('checkout', order, 'run1');
+const { runId } = await t.engine.start('checkout', order, 'run1'); // enqueues → { status: 'pending' }
+await t.engine.waitForRun(runId);                                  // resolves when the run settles
 await assertRunStatus(t.store, 'run1', 'completed');
 ```
 
@@ -36,8 +37,9 @@ t.engine.register('digest', '1', async (ctx) => {
   await ctx.step('send', () => send());
 });
 
-const run = await t.engine.start('digest', {}, 'run1'); // { status: 'suspended' }
-await t.tick(7 * 24 * 60 * 60 * 1000);                   // the sleep is due → completes
+const { runId } = await t.engine.start('digest', {}, 'run1'); // enqueues → { status: 'pending' }
+await t.engine.waitForRun(runId);                             // settles on the durable sleep → suspended
+await t.tick(7 * 24 * 60 * 60 * 1000);                        // the sleep is due → completes
 await assertRunStatus(t.store, 'run1', 'completed');
 ```
 
@@ -51,7 +53,8 @@ import { failOnce, assertStepAttempts } from '@dudousxd/nestjs-durable-testing';
 t.engine.register('wf', '1', async (ctx) =>
   ctx.step('charge', failOnce({ ok: true }), { retries: 3 }),
 );
-await t.engine.start('wf', {}, 'run1');
+const { runId } = await t.engine.start('wf', {}, 'run1');
+await t.engine.waitForRun(runId);
 await assertStepAttempts(t.store, 'run1', 'charge', 2); // failed once, then succeeded
 ```
 

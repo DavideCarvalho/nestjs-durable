@@ -27,8 +27,11 @@ describe('engine.cancel({ compensate: true }) — undo on cancellation', () => {
     await startRun(engine, 'saga', {}, 'r1');
     expect((await store.getRun('r1'))?.status).toBe('suspended');
 
-    const res = await engine.cancel('r1', { compensate: true });
-    expect(res?.status).toBe('cancelled');
+    // Compensate-cancel returns immediately (non-blocking) and runs the undo in the background.
+    await engine.cancel('r1', { compensate: true });
+    for (let i = 0; i < 100 && (await store.getRun('r1'))?.status !== 'cancelled'; i += 1) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
     expect(undone).toEqual(['pack', 'reserve']); // reverse order
     expect((await store.getRun('r1'))?.status).toBe('cancelled');
   });
