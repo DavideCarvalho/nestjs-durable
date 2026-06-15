@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-transport-bullmq",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "description": "BullMQ (Redis) Transport for nestjs-durable — cross-process and cross-language steps",
   "license": "MIT",
   "author": "Davide Carvalho",
@@ -20,7 +20,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
-    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "@dudousxd/nestjs-durable-core": ">=1.0.0",
     "bullmq": "^5.0.0",
     "ioredis": "^5.0.0"
   },
