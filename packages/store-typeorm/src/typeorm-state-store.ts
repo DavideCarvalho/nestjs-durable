@@ -120,6 +120,11 @@ export class TypeOrmStateStore implements StateStore {
     await this.waiters().save({ ...waiter });
   }
 
+  async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
+    const rows = await this.waiters().find({ where: { token: Like(`${prefix}%`) } });
+    return rows.map((e) => ({ token: e.token, runId: e.runId, seq: e.seq }));
+  }
+
   async takeSignalWaiter(token: string): Promise<SignalWaiter | null> {
     const e = await this.waiters().findOneBy({ token });
     if (!e) return null;

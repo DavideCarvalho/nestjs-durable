@@ -9,6 +9,7 @@ import {
   SignalTimeoutError,
   WorkflowSuspended,
 } from './errors';
+import { eventToken } from './events';
 import type {
   DurableWebhook,
   RemoteStepDef,
@@ -225,6 +226,48 @@ export function createWorkflowCtx(
     throw new WorkflowSuspended(deadline);
   };
 
+  // Wait for a named event delivered by engine.publishEvent(name, payload). Like waitForSignal, but
+  // name-based pub/sub with optional `match` filtering — the token embeds name + match (see events.ts),
+  // so a publish fans out to the runs whose match the payload satisfies.
+  const waitForEvent = async <T>(
+    name: string,
+    opts?: { match?: Record<string, unknown>; timeoutMs?: number },
+  ): Promise<T> => {
+    if (opts?.timeoutMs == null) {
+      const current = pos.next();
+      const token = eventToken(name, opts?.match, runId, current);
+      const existing = await store.getCheckpoint(runId, current);
+      if (existing && existing.status === 'completed') return existing.output as T;
+      await store.putSignalWaiter({ token, runId, seq: current });
+      throw new WorkflowSuspended();
+    }
+    const timeoutMs = opts.timeoutMs;
+    const deadlineSeq = pos.next();
+    const waitSeq = pos.next();
+    const token = eventToken(name, opts.match, runId, waitSeq);
+    const recorded = await store.getCheckpoint(runId, deadlineSeq);
+    const deadline = recorded?.wakeAt ?? host.clock() + timeoutMs;
+    if (!recorded) {
+      await store.saveCheckpoint(
+        instantCheckpoint({
+          runId,
+          seq: deadlineSeq,
+          name: `timeout:event:${name}`,
+          kind: 'sleep',
+          wakeAt: deadline,
+        }),
+      );
+    }
+    const waited = await store.getCheckpoint(runId, waitSeq);
+    if (waited && waited.status === 'completed') return waited.output as T;
+    if (host.clock() >= deadline) {
+      await store.takeSignalWaiter(token).catch(() => undefined);
+      throw new SignalTimeoutError(`event:${name}`, timeoutMs);
+    }
+    await store.putSignalWaiter({ token, runId, seq: waitSeq });
+    throw new WorkflowSuspended(deadline);
+  };
+
   // An external task = a checkpointed dispatch + a wait for its async-completion `Completion`
   // (delivered by engine.completeTask/failTask). The whole "fire at a foreign system, suspend,
   // resume when it reports back" pattern as one call.
@@ -364,6 +407,7 @@ export function createWorkflowCtx(
     sleepUntil,
     continueAsNew,
     waitForSignal,
+    waitForEvent,
     task,
     child,
     startChild,

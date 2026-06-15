@@ -86,6 +86,12 @@ export class InMemoryStateStore implements StateStore {
     return { ...waiter };
   }
 
+  async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
+    return [...this.signalWaiters.values()]
+      .filter((w) => w.token.startsWith(prefix))
+      .map((w) => ({ ...w }));
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     let runs = [...this.runs.values()];
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);

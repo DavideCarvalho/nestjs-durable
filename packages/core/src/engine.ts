@@ -3,6 +3,7 @@ import { instantCheckpoint } from './checkpoints';
 import { type Completion } from './completion';
 import { parseDuration } from './duration';
 import { ContinueAsNew, NonDeterminismError, RemoteStepTimeout, WorkflowSuspended } from './errors';
+import { eventMatchOf, eventMatches, eventPrefix } from './events';
 import type {
   ControlPlane,
   EngineEvent,
@@ -560,6 +561,23 @@ export class WorkflowEngine {
    * Deliver an external signal to the run waiting on `token` and resume it with `payload`.
    * Returns the run result, or null if no run is waiting for that token.
    */
+  /**
+   * Publish a named event to every run waiting on it via `ctx.waitForEvent(name, { match })` whose
+   * match the payload satisfies. Name-based pub/sub (fan-out), vs `signal`'s point-to-point token.
+   * Returns how many runs it resumed.
+   */
+  async publishEvent(name: string, payload: unknown): Promise<number> {
+    const waiters = await this.store.listSignalWaiters(eventPrefix(name));
+    let delivered = 0;
+    for (const w of waiters) {
+      if (eventMatches(payload, eventMatchOf(w.token))) {
+        await this.signal(w.token, payload);
+        delivered += 1;
+      }
+    }
+    return delivered;
+  }
+
   async signal(token: string, payload: unknown): Promise<RunResult | null> {
     const waiter = await this.store.takeSignalWaiter(token);
     if (!waiter) return null;

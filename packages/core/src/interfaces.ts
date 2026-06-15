@@ -175,6 +175,8 @@ export interface StateStore {
   putSignalWaiter(waiter: SignalWaiter): Promise<void>;
   /** Atomically take (and remove) the run waiting on `token`, if any. */
   takeSignalWaiter(token: string): Promise<SignalWaiter | null>;
+  /** List waiters whose `token` starts with `prefix` — used to fan out an event to its subscribers. */
+  listSignalWaiters(prefix: string): Promise<SignalWaiter[]>;
 
   // Dashboard queries
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
@@ -402,6 +404,17 @@ export interface WorkflowCtx {
    * a `SignalTimeoutError` (catch it in the workflow to branch).
    */
   waitForSignal<TPayload>(token: string, opts?: { timeoutMs?: number }): Promise<TPayload>;
+  /**
+   * Wait for a named **event** published via `engine.publishEvent(name, payload)`, then resume with
+   * the payload. Unlike a signal (point-to-point by token), events are name-based pub/sub: pass an
+   * optional `match` (a subset of the payload that must deep-equal) so a publish fans out only to the
+   * runs it concerns — e.g. `ctx.waitForEvent('payment.settled', { match: { orderId } })`. `timeoutMs`
+   * bounds the wait (throws `SignalTimeoutError`). No compute consumed while waiting.
+   */
+  waitForEvent<TPayload>(
+    name: string,
+    opts?: { match?: Record<string, unknown>; timeoutMs?: number },
+  ): Promise<TPayload>;
   /**
    * An external task with **async completion**: run `dispatch` once (checkpointed — e.g. send to a
    * queue, kick off a non-durable worker or a foreign service like a Python process), then suspend
