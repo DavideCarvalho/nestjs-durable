@@ -1,5 +1,26 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.11.0
+
+### Minor Changes
+
+- c3398be: feat: executionTimeout — cap a run's wall-clock lifetime
+
+  `@Workflow({ executionTimeout: '2h' })` (or ms) moves a run to `cancelled` (`execution_timeout`) once
+  it outlives the budget — a backstop for runs that get stuck or loop forever. Enforced by a new
+  `engine.sweepTimeouts(now)` the timer poller calls each tick (over the existing workflow+status query;
+  no new schema). The terminal `cancelled` state means a late step result can't resurrect it.
+
+- 8b87a16: feat(scheduler): pause + overlap policy
+
+  `ScheduledWorkflow` gains two controls:
+
+  - **`paused`** — temporarily stop firing a schedule (kept registered).
+  - **`overlap: 'skip'`** (fixed-interval) — skip a window while the previous window's run is still
+    `running`/`suspended`, so a slow run can't pile up overlapping executions (default `'allow'`).
+
+  Also adds a public `engine.getRun(runId)` pass-through.
+
 ## 0.10.0
 
 ### Minor Changes
