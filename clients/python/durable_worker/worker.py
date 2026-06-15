@@ -11,7 +11,9 @@ import asyncio
 import contextvars
 import inspect
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+import uuid
+from types import TracebackType
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Type, Union
 
 Handler = Callable[..., Union[Any, Awaitable[Any]]]
 
@@ -49,6 +51,44 @@ def set_process(name: Optional[str]) -> None:
     ctx = _current_step.get()
     if ctx is not None:
         ctx.process(name)
+
+
+def sub_event(
+    *,
+    id: str,
+    name: str,
+    group: Optional[str] = None,
+    phase: Optional[str] = None,
+    status: Optional[str] = None,
+    message: Optional[str] = None,
+    data: Any = None,
+) -> None:
+    """Record a sub-process event on the current step (see :meth:`StepContext.sub_event`). No-op outside a step."""
+    ctx = _current_step.get()
+    if ctx is not None:
+        ctx.sub_event(
+            id=id, name=name, group=group, phase=phase, status=status, message=message, data=data
+        )
+
+
+def sub_process(
+    name: str, *, group: Optional[str] = None, id: Optional[str] = None
+) -> "_SubProcess":
+    """Ergonomic sub-process lifecycle as a context manager::
+
+        with sub_process("ProcessKpi", group="AF_FLEET") as sp:
+            sp.phase("validating")
+            if not valid:
+                sp.skip("; ".join(errors))
+                return
+            sp.phase("processing")
+            ...  # work; logs emitted here are tagged to this sub-process's run id
+
+    On a clean exit it records a terminal ``ok`` with the measured ``durationMs``; on an exception it
+    records ``failed`` (with the exception message) and re-raises. ``sp.skip(reason)`` records a
+    terminal ``skipped``. The run id is generated automatically. Outside a durable step (no current
+    step) every emission is a no-op, so the same business code runs unchanged on a non-durable path."""
+    return _SubProcess(name, group=group, id=id)
 
 
 class FatalError(Exception):
@@ -97,6 +137,9 @@ class StepContext:
         # The sub-process a handler is currently inside (set via ``process``), stamped onto log lines
         # so the dashboard groups a fan-out step's trail per sub-process.
         self._process: Optional[str] = None
+        # The run identity of the sub-process a handler is currently inside (set by ``sub_process``),
+        # stamped onto log lines so the dashboard groups a fan-out step's trail by run id (not just name).
+        self._sub_id: Optional[str] = None
 
     def process(self, name: Optional[str]) -> None:
         """Mark the sub-process whose work is now running; subsequent log lines are tagged with it
@@ -128,14 +171,26 @@ class StepContext:
         name: Optional[str] = None,
         status: Optional[str] = None,
         data: Any = None,
+        sub_id: Optional[str] = None,
+        group: Optional[str] = None,
+        phase: Optional[str] = None,
     ) -> None:
         event: Dict[str, Any] = {"at": int(time.time() * 1000), "level": level, "message": message}
         if name is not None:
             event["name"] = name
         if status is not None:
             event["status"] = status
-        # Tag a log line (no outcome status) with the sub-process it was emitted inside, if any.
-        elif self._process is not None:
+        if phase is not None:
+            event["phase"] = phase
+        if group is not None:
+            event["group"] = group
+        # Explicit run id (a sub_event) always wins; otherwise tag a LOG line (no status, no phase)
+        # with the sub-process it was emitted inside, by run id and/or name, if any.
+        is_log = status is None and phase is None
+        resolved_sub_id = sub_id if sub_id is not None else (self._sub_id if is_log else None)
+        if resolved_sub_id is not None:
+            event["subId"] = resolved_sub_id
+        if is_log and self._process is not None:
             event["process"] = self._process
         if data is not None:
             event["data"] = data
@@ -166,6 +221,110 @@ class StepContext:
         """Record a sub-step / sub-process outcome (e.g. one of N parallel p-processes)."""
         level = "error" if status == "failed" else "warn" if status == "skipped" else "info"
         self._emit(level, message or name, name=name, status=status, data=data)
+
+    def sub_event(
+        self,
+        *,
+        id: str,
+        name: str,
+        group: Optional[str] = None,
+        phase: Optional[str] = None,
+        status: Optional[str] = None,
+        message: Optional[str] = None,
+        data: Any = None,
+    ) -> None:
+        """Record a sub-process event. Pass ``phase`` for an intermediate transition (no terminal
+        status), or ``status`` for the terminal outcome. ``id`` is the run identity (distinct per
+        invocation); ``group`` is an open grouping label. The TS counterpart is ``StepLogger.subEvent``."""
+        level = "error" if status == "failed" else "warn" if status == "skipped" else "info"
+        self._emit(
+            level,
+            message or phase or name,
+            name=name,
+            status=status,
+            data=data,
+            sub_id=id,
+            group=group,
+            phase=phase,
+        )
+
+
+class _SubProcess:
+    """The handle yielded by :func:`sub_process`. See that function for usage."""
+
+    def __init__(self, name: str, *, group: Optional[str] = None, id: Optional[str] = None) -> None:
+        self._name = name
+        self._group = group
+        self._id = id if id is not None else uuid.uuid4().hex
+        self._ctx: Optional[StepContext] = None
+        self._start = 0.0
+        self._terminal = False
+        self._prev_process: Optional[str] = None
+        self._prev_sub_id: Optional[str] = None
+
+    def __enter__(self) -> "_SubProcess":
+        self._ctx = _current_step.get()
+        self._start = time.monotonic()
+        if self._ctx is not None:
+            self._prev_process = self._ctx._process
+            self._prev_sub_id = self._ctx._sub_id
+            self._ctx._process = self._name
+            self._ctx._sub_id = self._id
+        return self
+
+    def phase(self, phase: str, data: Any = None) -> "_SubProcess":
+        """Record an intermediate transition (a consumer-defined phase label)."""
+        if self._ctx is not None and not self._terminal:
+            self._ctx.sub_event(
+                id=self._id, name=self._name, group=self._group, phase=phase, data=data
+            )
+        return self
+
+    def skip(self, reason: Optional[str] = None, data: Any = None) -> None:
+        """Record a terminal ``skipped`` outcome (e.g. validation failed)."""
+        self._emit_terminal("skipped", reason, data)
+
+    def fail(self, reason: Optional[str] = None, data: Any = None) -> None:
+        """Record a terminal ``failed`` outcome explicitly (the context manager also does this on an
+        exception)."""
+        self._emit_terminal("failed", reason, data)
+
+    def _with_duration(self, data: Any) -> Dict[str, Any]:
+        ms = int((time.monotonic() - self._start) * 1000)
+        if isinstance(data, dict):
+            return data if "durationMs" in data else {**data, "durationMs": ms}
+        return {"durationMs": ms}
+
+    def _emit_terminal(self, status: str, message: Optional[str], data: Any) -> None:
+        if self._ctx is None or self._terminal:
+            return
+        self._terminal = True
+        self._ctx.sub_event(
+            id=self._id,
+            name=self._name,
+            group=self._group,
+            status=status,
+            message=message,
+            data=self._with_duration(data),
+        )
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        if self._ctx is not None:
+            try:
+                if not self._terminal:
+                    if exc_type is not None:
+                        self._emit_terminal("failed", str(exc) if exc is not None else None, None)
+                    else:
+                        self._emit_terminal("ok", None, None)
+            finally:
+                self._ctx._process = self._prev_process
+                self._ctx._sub_id = self._prev_sub_id
+        return False  # never suppress exceptions
 
 
 class Worker:
