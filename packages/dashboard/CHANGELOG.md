@@ -1,5 +1,23 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.11.0
+
+### Minor Changes
+
+- c776428: feat(dashboard): bulk retry/cancel by filter
+
+  Act on many runs at once: when a status or tag filter is active, the run list shows **retry all** /
+  **cancel all** buttons that apply to every matching run (e.g. "retry every `dead` run tagged
+  `type:mel`"). Backed by a new `POST bulk/:action?status=&tag=&workflow=` endpoint + `DashboardService.bulk()`
+  (capped at 500, terminal runs skipped, returns matched/applied counts).
+
+- 12c91ff: feat: Prometheus metrics
+
+  `collectMetrics(engine)` subscribes to the engine's lifecycle events and accumulates dependency-free
+  counters — runs + steps by outcome, per-workflow run counts, step-duration sum/count. Call
+  `.prometheus()` for the text exposition or `.snapshot()` for raw numbers. The dashboard wires it
+  automatically and serves it at `GET <apiBasePath>/metrics` for a scrape.
+
 ## 0.10.0
 
 ### Minor Changes

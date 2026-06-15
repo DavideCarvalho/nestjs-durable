@@ -1,5 +1,41 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.10.0
+
+### Minor Changes
+
+- 12c91ff: feat: Prometheus metrics
+
+  `collectMetrics(engine)` subscribes to the engine's lifecycle events and accumulates dependency-free
+  counters — runs + steps by outcome, per-workflow run counts, step-duration sum/count. Call
+  `.prometheus()` for the text exposition or `.snapshot()` for raw numbers. The dashboard wires it
+  automatically and serves it at `GET <apiBasePath>/metrics` for a scrape.
+
+- 4fb5f90: feat: CodecStateStore — encrypt / compress / redact payloads at rest
+
+  A `StateStore` decorator that runs run/step **payloads** (input + output) through a `PayloadCodec`
+  (encode on write, decode on read), so they're never stored in the clear — for at-rest encryption,
+  compression, or PII redaction. Adapter-agnostic (`new CodecStateStore(innerStore, codec)`).
+  Searchable metadata (id, status, workflow, tags, timestamps) and the structured `error` are left
+  untouched so the dashboard, queries, and recovery keep working.
+
+- bc4539d: feat: singleton — serialize runs by key (durable FIFO mutex)
+
+  `@Workflow({ singleton: { key: (input) => `base:${input.baseId}` } })` runs at most one run per key
+  at a time (e.g. one pipeline per base). Same-key runs queue — suspended, admitted in creation order
+  as slots free — instead of running concurrently. `limit` (default 1) raises the concurrency. Race-free
+  and FIFO on a consistent store: admission is the same `(createdAt, id)` view for every engine instance,
+  implemented over the existing tag+status query (no new schema). Also exposed as
+  `engine.register(name, version, fn, { singleton })`.
+
+- b72c20f: feat: ctx.sleepUntil + ctx.continueAsNew
+
+  - **`ctx.sleepUntil(date | epochMs)`** — durable sleep to an absolute deadline (e.g. "resume at
+    midnight"), the absolute-time counterpart of `ctx.sleep(duration)`. Replay-stable.
+  - **`ctx.continueAsNew(input?)`** — end the current run and hand off to a fresh execution of the same
+    workflow with a clean history, for long-running / looping workflows that would otherwise accumulate
+    unbounded checkpoints. The next run gets id `<runId>~N`; the handoff is idempotent by that id.
+
 ## 0.9.0
 
 ### Minor Changes
