@@ -35,6 +35,22 @@ export class DurableApiController {
     return this.dashboard.retry(id);
   }
 
+  /** Bulk retry/cancel every run matching a filter (status / tag / workflow). */
+  @Post('bulk/:action')
+  bulk(
+    @Param('action') action: 'retry' | 'cancel',
+    @Query('status') status?: RunStatus,
+    @Query('tag') tag?: string,
+    @Query('workflow') workflow?: string,
+    @Query('compensate') compensate?: string,
+  ) {
+    return this.dashboard.bulk(
+      action === 'cancel' ? 'cancel' : 'retry',
+      { status, tag, workflow },
+      { compensate: compensate === 'true' },
+    );
+  }
+
   @Post('runs/:id/cancel')
   async cancel(@Param('id') id: string, @Query('compensate') compensate?: string) {
     const result = await this.dashboard.cancel(id, { compensate: compensate === 'true' });

@@ -391,10 +391,19 @@ export function App() {
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
   const [tagFilter, setTagFilter] = useState('');
   const [selected, setSelected] = useState<string>();
+  const qc = useQueryClient();
   const { data: runs = [] } = useQuery({
     queryKey: ['runs', tagFilter],
     queryFn: () => durableClient.runs(undefined, tagFilter || undefined),
     refetchInterval: 3000, // keep the run list live
+  });
+  const bulk = useMutation({
+    mutationFn: (action: 'retry' | 'cancel') =>
+      durableClient.bulk(action, {
+        status: filter !== 'all' ? filter : undefined,
+        tag: tagFilter || undefined,
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['runs'] }),
   });
 
   const counts = runs.reduce<Record<string, number>>((acc, r) => {
@@ -431,6 +440,29 @@ export function App() {
                 )}
               </div>
             </div>
+            {(filter !== 'all' || tagFilter) && shown.length > 0 && (
+              <div className="flex items-center gap-2 border-b border-[var(--line)] px-3 py-1.5">
+                <span className="mono text-[10px] text-zinc-500">
+                  {shown.length} {filter !== 'all' ? filter : ''} {tagFilter && `#${tagFilter}`}
+                </span>
+                <button
+                  type="button"
+                  disabled={bulk.isPending}
+                  onClick={() => bulk.mutate('retry')}
+                  className="mono ml-auto rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-300 transition-colors hover:bg-emerald-500/20 disabled:opacity-40"
+                >
+                  retry all
+                </button>
+                <button
+                  type="button"
+                  disabled={bulk.isPending}
+                  onClick={() => bulk.mutate('cancel')}
+                  className="mono rounded border border-rose-500/30 bg-rose-500/10 px-1.5 py-0.5 text-[10px] text-rose-300 transition-colors hover:bg-rose-500/20 disabled:opacity-40"
+                >
+                  cancel all
+                </button>
+              </div>
+            )}
             <div className="min-h-0 flex-1 overflow-auto">
               <RunsList
                 runs={shown}
