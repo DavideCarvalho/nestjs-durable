@@ -53,9 +53,16 @@ export class WorkflowRegistrar
     await this.engine.recoverIncomplete();
   }
 
-  /** On deploy/shutdown: stop picking up new runs and wait for in-flight ones to settle. */
+  /** On deploy/shutdown: stop picking up new runs and wait for in-flight ones to settle, then close
+   *  the transport(s) so the broker workers stop consuming and connections are released. Closing
+   *  AFTER the drain keeps the transport alive while in-flight runs dispatch/await their remote steps. */
   async onApplicationShutdown(): Promise<void> {
     await this.engine.drain(this.options.shutdownTimeoutMs);
+    const transports = [
+      this.options.transport,
+      ...(this.options.transports ?? []).map((t) => t.transport),
+    ];
+    await Promise.allSettled(transports.map((t) => t?.close?.()));
   }
 
   async onModuleInit(): Promise<void> {

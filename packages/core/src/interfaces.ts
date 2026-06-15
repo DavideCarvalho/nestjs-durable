@@ -335,6 +335,10 @@ export interface Transport {
   onResult(handler: (result: StepResult) => Promise<void>): void;
   /** worker → engine: liveness signal for an in-flight long step. */
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void;
+  /** Release the transport's resources (broker workers, queues, connections) for a clean shutdown.
+   *  Optional — an in-process transport has nothing to close. Called on `onApplicationShutdown`
+   *  after the engine drains, so a deploy hands off instead of leaving the broker to time out. */
+  close?(): Promise<void>;
 }
 
 /**
