@@ -109,15 +109,26 @@ export interface StepEvent {
   at: number;
   level: 'debug' | 'info' | 'warn' | 'error';
   message: string;
+  /** Stable run identity for a sub-process. Distinct invocations of the same `name` carry distinct
+   *  ids, so their phases and log trails never collapse into one. Absent on events emitted by the
+   *  legacy `sub()` path, which keys by `name` instead. */
+  subId?: string;
   /** For a sub-step/sub-process within the step: its name. */
   name?: string;
-  /** For a sub-step: its outcome. */
+  /** Open, consumer-defined grouping label for a sub-process (e.g. a handler/lane). The dashboard
+   *  groups rows by it. The library never interprets it. */
+  group?: string;
+  /** For a sub-step: its terminal outcome (closed enum — drives colour + aggregation). */
   status?: 'ok' | 'failed' | 'skipped';
+  /** Open, consumer-defined intermediate phase label for a sub-process transition. Carries no
+   *  terminal `status`; the library timestamps and orders it but never interprets it. */
+  phase?: string;
   /** For a log line emitted *inside* a sub-process: that owning sub-process's name, so the dashboard
-   *  can group a step's log trail under each sub-process (e.g. one p-process of a fan-out) instead of
-   *  one flat list. Set on logs (no `status`); a worker stamps it from the sub-process it's running. */
+   *  can group a step's log trail under each sub-process instead of one flat list. Set on logs (no
+   *  `status`); a worker stamps it from the sub-process it's running.
+   *  @deprecated Superseded by `subId` for run-distinct grouping; kept so existing workers/runs render. */
   process?: string;
-  /** Optional structured payload. */
+  /** Optional structured payload. `data.durationMs` (number) overrides the derived duration. */
   data?: unknown;
 }
 
@@ -135,6 +146,19 @@ export interface StepLogger {
   error(message: string, data?: unknown): void;
   /** Record a sub-step / sub-process outcome (e.g. one of N parallel p-processes). */
   sub(name: string, status: 'ok' | 'failed' | 'skipped', message?: string, data?: unknown): void;
+  /** Record a sub-process event. Typically pass `phase` for an intermediate transition (carrying no
+   *  terminal status), or `status` for the terminal outcome — the type permits either; the engine
+   *  interprets which is set. `id` is the run identity (distinct per invocation); `group` is an
+   *  open grouping label. */
+  subEvent(e: {
+    id: string;
+    name: string;
+    group?: string;
+    phase?: string;
+    status?: 'ok' | 'failed' | 'skipped';
+    message?: string;
+    data?: unknown;
+  }): void;
 }
 
 export interface StepError {
