@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { StepCheckpoint, StepEvent, WorkflowRun } from '../client/durable-client';
+import { type SubProcess, groupSubProcesses } from '../client/group-subprocesses';
 import { BoltIcon, CheckIcon, CopyIcon, KIND_LABEL, XIcon, iconFor } from './icons';
 
 function fmtMs(ms: number): string {
@@ -40,29 +41,98 @@ const LEVEL_TONE: Record<StepEvent['level'], string> = {
 
 const SUB_ORDER: Array<NonNullable<StepEvent['status']>> = ['ok', 'failed', 'skipped'];
 
-/** Collapse a step's log lines into consecutive runs sharing the same owning sub-process (`process`),
- *  preserving chronological order. A fan-out step's trail then reads grouped per p-process; logs with
- *  no `process` (step-level lines, or a worker that doesn't tag) stay in their own ungrouped run. */
-function groupLogsByProcess(
-  logs: StepEvent[],
-): Array<{ process?: string; logs: StepEvent[] }> {
-  const groups: Array<{ process?: string; logs: StepEvent[] }> = [];
-  for (const log of logs) {
-    const last = groups[groups.length - 1];
-    if (last && last.process === log.process) last.logs.push(log);
-    else groups.push({ process: log.process, logs: [log] });
-  }
-  return groups;
+function LogLine({ e }: { e: StepEvent }) {
+  return (
+    <div className="flex gap-2 py-0.5">
+      <span className="shrink-0 text-zinc-600 tnum">{clockMs(e.at)}</span>
+      <span className={`shrink-0 uppercase ${LEVEL_TONE[e.level]}`}>{e.level}</span>
+      <span className="min-w-0 break-words text-zinc-300">{e.message}</span>
+    </div>
+  );
 }
 
-/** Sub-process outcomes (ok/failed/skipped) and the log lines a step emitted, e.g. one row per
- *  parallel p-process so you can see which succeeded, failed, or weren't validated. */
+/** One sub-process: a clickable row (name · duration · status) that expands to its phase timeline,
+ *  error, and owned log lines. Mirrors flip's per-process expand in `pipeline-runs`. */
+function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?: boolean }) {
+  const expandable = sub.phases.length > 0 || sub.logs.length > 0 || sub.status === 'failed';
+  const [open, setOpen] = useState(sub.status === 'failed'); // surface failures without a click
+  const tone = sub.status
+    ? SUB_TONE[sub.status]
+    : 'border-amber-500/25 bg-amber-500/10 text-amber-300';
+
+  return (
+    <li className={`rounded-md border ${tone}`}>
+      <button
+        type="button"
+        disabled={!expandable}
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-[11.5px] disabled:cursor-default"
+        aria-expanded={expandable ? open : undefined}
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          {expandable && (
+            <span
+              className={`text-[9px] text-zinc-500 transition-transform duration-150 ${open ? '' : '-rotate-90'}`}
+            >
+              ▼
+            </span>
+          )}
+          <span className="mono truncate text-zinc-200">{sub.name}</span>
+          {showGroup && sub.group && (
+            <span className="mono shrink-0 text-[10px] uppercase tracking-wider text-zinc-500">
+              {sub.group}
+            </span>
+          )}
+        </span>
+        <span className="mono flex shrink-0 items-center gap-2 text-[10px] uppercase tracking-wider">
+          {sub.durationMs !== undefined && (
+            <span className="tnum text-zinc-400">{fmtMs(sub.durationMs)}</span>
+          )}
+          <span>{sub.status ?? 'running'}</span>
+        </span>
+      </button>
+
+      {open && (
+        <div className="border-t border-[var(--line)]/60 px-2.5 py-2">
+          {sub.phases.length > 0 && (
+            <ul className="mono mb-2 flex flex-col gap-0.5 text-[10.5px]">
+              {sub.phases.map((p, i) => (
+                <li key={`${p.at}-${p.phase}-${i}`} className="flex gap-2">
+                  <span className="shrink-0 text-zinc-600 tnum">{clockMs(p.at)}</span>
+                  <span className="text-zinc-400">{p.phase}</span>
+                  {sub.startedAt !== undefined && (
+                    <span className="text-zinc-600 tnum">+{fmtMs(p.at - sub.startedAt)}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {sub.status === 'failed' && sub.terminal?.message && (
+            <div className="mono mb-2 rounded border border-red-500/25 bg-red-500/10 p-2 text-[11px] text-red-200">
+              {sub.terminal.message}
+            </div>
+          )}
+          {sub.logs.length > 0 && (
+            <div className="mono flex flex-col gap-0.5 text-[11px]">
+              {sub.logs.map((e) => (
+                <LogLine key={`${e.at}-${e.message}`} e={e} />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </li>
+  );
+}
+
+/** Sub-process outcomes + the step's log lines. Each sub-process is an expandable row showing its
+ *  lifecycle (phases), duration, terminal status, error, and owned logs. */
 function StepEvents({ events }: { events: StepEvent[] }) {
-  const subs = events.filter((e) => e.status);
-  const logs = events.filter((e) => !e.status);
+  const { subs, stepLogs } = groupSubProcesses(events);
   const counts = SUB_ORDER.map(
-    (s) => [s, subs.filter((e) => e.status === s).length] as const,
+    (s) => [s, subs.filter((sub) => sub.status === s).length] as const,
   ).filter(([, n]) => n > 0);
+  const grouped = subs.some((s) => s.group);
 
   return (
     <>
@@ -80,45 +150,46 @@ function StepEvents({ events }: { events: StepEvent[] }) {
               ))}
             </span>
           </div>
-          <ul className="flex flex-col gap-1">
-            {subs.map((e) => (
-              <li
-                key={`${e.at}-${e.name}`}
-                className={`flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-[11.5px] ${SUB_TONE[e.status as NonNullable<StepEvent['status']>]}`}
-              >
-                <span className="mono truncate text-zinc-200">{e.name}</span>
-                <span className="mono shrink-0 text-[10px] uppercase tracking-wider">
-                  {e.status}
-                </span>
-              </li>
-            ))}
-          </ul>
+          {grouped ? (
+            Object.entries(
+              subs.reduce<Record<string, SubProcess[]>>((acc, sub) => {
+                const key = sub.group ?? '—';
+                if (acc[key] === undefined) acc[key] = [];
+                acc[key].push(sub);
+                return acc;
+              }, {}),
+            )
+              .sort(([a], [b]) => (a === '—' ? 1 : b === '—' ? -1 : 0))
+              .map(([group, groupSubs]) => (
+                <div key={group} className="mb-2">
+                  <div className="mono mb-1 text-[10px] uppercase tracking-wider text-zinc-500">
+                    {group}
+                  </div>
+                  <ul className="flex flex-col gap-1">
+                    {groupSubs.map((sub) => (
+                      <SubProcessRow key={sub.id} sub={sub} showGroup={false} />
+                    ))}
+                  </ul>
+                </div>
+              ))
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {subs.map((sub) => (
+                <SubProcessRow key={sub.id} sub={sub} />
+              ))}
+            </ul>
+          )}
         </section>
       )}
 
-      {logs.length > 0 && (
+      {stepLogs.length > 0 && (
         <section className="rise">
           <div className="mono mb-1.5 text-[10px] uppercase tracking-[0.18em] text-zinc-500">
-            logs · {logs.length}
+            logs · {stepLogs.length}
           </div>
           <div className="mono max-h-64 overflow-auto rounded-lg border border-[var(--line)] bg-black/40 p-2.5 text-[11px] leading-relaxed">
-            {groupLogsByProcess(logs).map((group, gi) => (
-              <ul key={`${group.process ?? 'step'}-${gi}`} className={gi > 0 ? 'mt-2' : ''}>
-                {/* Logs a worker tagged with their owning sub-process group under it, so a fan-out
-                    step (e.g. `all` → many p-processes) reads as a per-process trail, not one blur. */}
-                {group.process && (
-                  <li className="sticky top-0 -mx-2.5 mb-0.5 bg-black/40 px-2.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-500 backdrop-blur">
-                    {group.process}
-                  </li>
-                )}
-                {group.logs.map((e) => (
-                  <li key={`${e.at}-${e.message}`} className="flex gap-2 py-0.5">
-                    <span className="shrink-0 text-zinc-600 tnum">{clockMs(e.at)}</span>
-                    <span className={`shrink-0 uppercase ${LEVEL_TONE[e.level]}`}>{e.level}</span>
-                    <span className="min-w-0 break-words text-zinc-300">{e.message}</span>
-                  </li>
-                ))}
-              </ul>
+            {stepLogs.map((e) => (
+              <LogLine key={`${e.at}-${e.message}`} e={e} />
             ))}
           </div>
         </section>
