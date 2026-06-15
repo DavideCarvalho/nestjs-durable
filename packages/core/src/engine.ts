@@ -2,7 +2,13 @@ import { backoffDelay } from './backoff';
 import { instantCheckpoint } from './checkpoints';
 import { type Completion } from './completion';
 import { parseDuration } from './duration';
-import { ContinueAsNew, NonDeterminismError, RemoteStepTimeout, WorkflowSuspended } from './errors';
+import {
+  ContinueAsNew,
+  NonDeterminismError,
+  RemoteStepTimeout,
+  SignalTimeoutError,
+  WorkflowSuspended,
+} from './errors';
 import { eventMatchOf, eventMatches, eventPrefix } from './events';
 import type {
   ControlPlane,
@@ -99,7 +105,14 @@ interface RegisteredWorkflow {
   validateInput?: (input: unknown) => void | Promise<void>;
   /** Event names that start a fresh run of this workflow when published. See `publishEvent`. */
   onEvent?: string[];
+  /** Coalesce `onEvent` triggers: debounce (fire once it's quiet) or batch (fire on size/window). */
+  eventBatch?: EventBatchConfig;
 }
+
+/** How `onEvent` triggers are coalesced into fewer runs (see `@Workflow({ debounce | batch })`). */
+export type EventBatchConfig =
+  | { mode: 'debounce'; windowMs: number }
+  | { mode: 'batch'; maxSize: number; windowMs: number };
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
 
@@ -301,6 +314,68 @@ export class WorkflowEngine {
         }
       }
     });
+    this.registerEventAccumulators();
+  }
+
+  /**
+   * Built-in workflows that coalesce `onEvent` triggers (see `@Workflow({ debounce | batch })`). Each
+   * is a long-lived per-target accumulator fed by `signalWithStart`; it collects payloads then starts
+   * the target once, and `continueAsNew`s to re-arm for the next burst. Signal buffering keeps the
+   * re-arm race-free (an event arriving between firing and re-parking is buffered, not lost).
+   */
+  private registerEventAccumulators(): void {
+    const tokenFor = (target: string): string => `__evtacc__:${target}`;
+    this.register('__evt_debounce', '1', async (ctx, input) => {
+      const { target, windowMs } = input as { target: string; windowMs: number };
+      const token = tokenFor(target);
+      let last = await ctx.waitForSignal(token); // park for the first event of a burst
+      for (;;) {
+        try {
+          last = await ctx.waitForSignal(token, { timeoutMs: windowMs }); // extend on each event
+        } catch (e) {
+          if (e instanceof SignalTimeoutError) break; // quiet for `windowMs` → fire
+          throw e; // WorkflowSuspended / ContinueAsNew etc. must propagate
+        }
+      }
+      await ctx.startChild(target, last);
+      return ctx.continueAsNew(input); // re-arm
+    });
+    this.register('__evt_batch', '1', async (ctx, input) => {
+      const { target, maxSize, windowMs } = input as {
+        target: string;
+        maxSize: number;
+        windowMs: number;
+      };
+      const token = tokenFor(target);
+      const events: unknown[] = [await ctx.waitForSignal(token)]; // park for the first
+      const deadline = (await ctx.now()) + windowMs;
+      while (events.length < maxSize) {
+        const remaining = deadline - (await ctx.now());
+        if (remaining <= 0) break;
+        try {
+          events.push(await ctx.waitForSignal(token, { timeoutMs: remaining }));
+        } catch (e) {
+          if (e instanceof SignalTimeoutError) break; // window elapsed → fire what we have
+          throw e; // WorkflowSuspended / ContinueAsNew etc. must propagate
+        }
+      }
+      await ctx.startChild(target, { events });
+      return ctx.continueAsNew(input); // re-arm
+    });
+  }
+
+  /** Route an `onEvent` payload into its target's debounce/batch accumulator. */
+  private routeBatchedEvent(
+    target: string,
+    batch: EventBatchConfig,
+    payload: unknown,
+  ): Promise<{ runId: string }> {
+    const accId = `__evtacc__:${target}`;
+    const [accWorkflow, input] =
+      batch.mode === 'debounce'
+        ? (['__evt_debounce', { target, windowMs: batch.windowMs }] as const)
+        : (['__evt_batch', { target, maxSize: batch.maxSize, windowMs: batch.windowMs }] as const);
+    return this.signalWithStart(accWorkflow, input, accId, { token: accId, payload });
   }
 
   /**
@@ -339,6 +414,7 @@ export class WorkflowEngine {
       executionTimeout?: string | number;
       validateInput?: (input: unknown) => void | Promise<void>;
       onEvent?: string[];
+      eventBatch?: EventBatchConfig;
     },
   ): void {
     const registered: RegisteredWorkflow = {
@@ -351,6 +427,7 @@ export class WorkflowEngine {
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts?.validateInput,
       onEvent: opts?.onEvent,
+      eventBatch: opts?.eventBatch,
     };
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
@@ -807,7 +884,14 @@ export class WorkflowEngine {
         // A subscriber that rejects the payload (validateInput) must not block the others or the
         // waiters — its run simply never starts, mirroring fire-and-forget dead-letter routing.
         try {
-          await this.start(workflow, payload, `evt:${eventId}:${workflow}`);
+          const batch = this.latest.get(workflow)?.eventBatch;
+          if (batch) {
+            // Coalesce: route the event into a per-workflow accumulator (one long-lived run that
+            // debounces/batches and then starts the target with the collected payload(s)).
+            await this.routeBatchedEvent(workflow, batch, payload);
+          } else {
+            await this.start(workflow, payload, `evt:${eventId}:${workflow}`);
+          }
           touched += 1;
         } catch {
           // skip this subscriber

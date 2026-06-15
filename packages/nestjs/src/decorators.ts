@@ -27,6 +27,10 @@ export interface WorkflowMeta {
   validateInput?: (input: unknown) => void | Promise<void>;
   /** Event names that start a fresh run of this workflow. See `WorkflowOptions`. */
   onEvent?: string[];
+  /** Debounce `onEvent` triggers — fire once it's quiet for this long. See `WorkflowOptions`. */
+  debounce?: string | number;
+  /** Batch `onEvent` triggers — fire on size or window. See `WorkflowOptions`. */
+  batch?: { maxSize: number; within: string | number };
 }
 
 export interface WorkflowOptions {
@@ -79,6 +83,17 @@ export interface WorkflowOptions {
    * the `@OnEvent(...)` class decorator; the two are merged.
    */
   onEvent?: string[];
+  /**
+   * Coalesce `onEvent` triggers by **debouncing** — start one run only once events have been quiet
+   * for this long (resets on each event), with the LAST payload. e.g. `debounce: '30s'`.
+   */
+  debounce?: string | number;
+  /**
+   * Coalesce `onEvent` triggers by **batching** — start one run with all payloads (`{ events: [...] }`)
+   * once `maxSize` is reached or `within` elapses from the first event. e.g.
+   * `batch: { maxSize: 100, within: '10s' }`.
+   */
+  batch?: { maxSize: number; within: string | number };
 }
 
 /**
@@ -97,6 +112,8 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       inputSchema: options.inputSchema,
       validateInput: options.validateInput,
       onEvent: options.onEvent,
+      debounce: options.debounce,
+      batch: options.batch,
     };
     Reflect.defineMetadata(WORKFLOW_METADATA, meta, target);
     // Stamp the registered name so this class can be used as a typed workflow ref (ctx.child,

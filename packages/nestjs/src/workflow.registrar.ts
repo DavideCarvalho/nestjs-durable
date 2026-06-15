@@ -5,6 +5,7 @@ import {
   type WorkflowCtx,
   WorkflowEngine,
   type WorkflowRun,
+  parseDuration,
   workflowName,
 } from '@dudousxd/nestjs-durable-core';
 import {
@@ -83,12 +84,22 @@ export class WorkflowRegistrar
       const validateInput =
         meta.validateInput ??
         (meta.inputSchema ? classValidatorInput(meta.inputSchema) : undefined);
+      const eventBatch = meta.debounce
+        ? ({ mode: 'debounce', windowMs: parseDuration(meta.debounce) } as const)
+        : meta.batch
+          ? ({
+              mode: 'batch',
+              maxSize: meta.batch.maxSize,
+              windowMs: parseDuration(meta.batch.within),
+            } as const)
+          : undefined;
       this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input), {
         tags: meta.tags,
         singleton: meta.singleton,
         executionTimeout: meta.executionTimeout,
         validateInput,
         onEvent: getOnEvents(meta, instance.constructor),
+        eventBatch,
       });
 
       const inline = this.findDeadLetterHandler(instance);
