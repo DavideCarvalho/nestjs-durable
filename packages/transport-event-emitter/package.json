@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-transport-event-emitter",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "description": "In-process Transport for nestjs-durable backed by @nestjs/event-emitter",
   "license": "MIT",
   "author": "Davide Carvalho",
@@ -20,7 +20,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
-    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "@dudousxd/nestjs-durable-core": ">=1.0.0",
     "@nestjs/event-emitter": "^2.0.0 || ^3.0.0"
   },
   "devDependencies": {

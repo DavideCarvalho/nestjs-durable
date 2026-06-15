@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-testing",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Testing utilities for nestjs-durable — a test engine harness, crash/flaky-step injection, and replay assertions",
   "license": "MIT",
   "author": "Davide Carvalho",
@@ -20,7 +20,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
-    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0"
+    "@dudousxd/nestjs-durable-core": ">=1.0.0"
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
