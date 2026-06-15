@@ -65,6 +65,12 @@ If the process crashes mid-`checkout`, it resumes on boot from the last checkpoi
 `reserveStock` and `chargeCard` are not re-run. Swap the transport for BullMQ/NATS to move
 `PaymentsWorker` into a separate process or a Python worker, with no change to the workflow.
 
+The split goes both ways. A remote worker can **implement a step** the NestJS workflow calls
+(above), or **author the whole workflow** itself and call back into NestJS — the engine stays the
+single owner of durable state either way. Register a remote workflow with
+`engine.registerRemote(name, version, { group, executor })` and write the flow in the other language
+(see the [Python SDK](clients/python/README.md#authoring-workflows-in-python-coordinator-driven)).
+
 ## Status
 
 Built with TDD — durable engine (replay, retries, fatal errors, fan-out, sleep, signals,
@@ -87,7 +93,7 @@ dashboard, OpenTelemetry, a Telescope watcher, and the Python worker SDK. See
 | `@dudousxd/nestjs-durable-telescope` | `@dudousxd/nestjs-telescope` watcher | ✅ |
 | `@dudousxd/nestjs-durable-cli` | `durable inspect` — runs & timelines in the terminal | ✅ |
 | `@dudousxd/nestjs-durable-testing` | Test harness, crash injection, replay assertions | ✅ |
-| `durable-worker` (PyPI) | Python worker SDK + wire protocol | ✅ |
+| `durable-worker` (PyPI) | Python SDK + wire protocol — implement steps **and** author workflows | ✅ |
 
 ## License
 

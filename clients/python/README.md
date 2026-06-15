@@ -23,6 +23,59 @@ return value is the step **output**. Raise `FatalError` for a non-retryable fail
 declined card); any other exception is treated as retryable and the engine applies the step's
 retry policy.
 
+## Authoring workflows in Python (coordinator-driven)
+
+The inverse of the above: instead of Python *implementing a step* a TypeScript workflow calls,
+Python can *author the whole workflow* and call back into NestJS. The NestJS engine stays the sole
+owner of durable state, recovery and timers — it advances a run one **turn** at a time by sending
+this worker the run's history; the worker **replays** the workflow function locally and returns the
+commands it produced (call / record-step / sleep …), which the engine persists and dispatches. The
+worker never touches a store, so it stays a pure function of the task (Temporal-style coordinator).
+
+```python
+from durable_worker import WorkflowWorker, redis_url_from_env
+
+workflows = WorkflowWorker(group="py-workflows")
+
+@workflows.workflow("pipeline")
+def pipeline(ctx, base_id):
+    key  = ctx.step("setup", lambda: f"/{base_id}/data.csv")      # local step: runs once, recorded
+    rows = ctx.call("ingestion", {"key": key}, group="pipeline")  # remote step: dispatched + awaited
+    ctx.sleep(60_000)                                             # durable timer
+    return {"rows": rows}
+
+workflows.run(redis=redis_url_from_env())   # owns the loop, SIGTERM graceful close, Redis connection
+```
+
+The `WorkflowContext` ops are **deterministic** — same code + same history ⇒ same seqs ⇒ same
+decisions:
+
+| Op | Meaning |
+| --- | --- |
+| `ctx.step(name, body)` | Run a **local** step body once; its result is recorded, so `now`/`uuid`/a write happen exactly once and replay returns the captured value. |
+| `ctx.call(name, input, group=...)` | Dispatch a **remote** step to a worker `group` (any language) and await its result. |
+| `ctx.sleep(ms)` | Durable timer — the run suspends and the engine resumes it when the timer fires. |
+| `ctx.wait_signal(name)` | Block until a signal is delivered to the run; returns its payload. *(engine support pending)* |
+| `ctx.start_child(workflow, input)` | Start a child run and await its output. *(engine support pending)* |
+
+A step/call that fails raises `StepFailed` in the workflow — catch it to compensate (just like an
+awaited rejection), or let it propagate to fail the run. Changing the workflow's op sequence under a
+run already in flight raises `NondeterminismError` rather than silently diverging.
+
+On the NestJS side, register the remote workflow so the engine drives this worker's group:
+
+```ts
+engine.registerRemote('pipeline', '1', {
+  group: 'py-workflows',
+  executor: new RemoteWorkflowExecutor(transport),
+});
+```
+
+`call` / `step` / `sleep` are wired end-to-end; `wait_signal` / `start_child` emit commands the
+engine does not execute yet. `WorkflowWorker.process_task(task) -> decision` is the pure, broker-free
+core (fully tested). The workflow-task/decision wire is specified in
+[`docs/plans/2026-06-15-polyglot-workflows-protocol.md`](../../docs/plans/2026-06-15-polyglot-workflows-protocol.md).
+
 ## Wire protocol
 
 The contract between the orchestrator and a worker is plain JSON — language-agnostic, so a Go or
