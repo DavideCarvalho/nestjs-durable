@@ -161,20 +161,56 @@ old callers). A log emitted while a sub is "current" is stamped with that `subId
 
 ## Consumer wiring (flip — separate PRs, after lib release)
 
+Two flip changes, sequenced after the lib release. Beyond emitting the lifecycle, flip **restructures
+the processing phase** so the durable decomposition matches its natural hierarchy.
+
+### Workflow restructuring: each `handle_*` is its own step
+
+Today, for `type: "all"`, `planPProcesses` returns a single `{ proc: "all" }` body, so the workflow
+makes **one** `ctx.call(processingStep, { proc: "all" })` and the Python `run_proc("all")` fans out to
+*every* handler (`handle_af_fleet_dependent_processes`, `handle_mel_*`, …) and *every* p-process
+inside that **one** step. That's why all 94 subs land in one event list, collapse by name, and the
+double-dispatch piles up.
+
+Target: **one durable step per handler** (`handle_*`), each running its own p-processes as
+sub-processes. So the `"all"` plan expands to one body per handler group, and the workflow `ctx.call`s
+each. Benefits:
+
+- Durable retry/resume per handler — a failure in `mel` resumes at `mel`, not re-running `af_fleet`.
+- Handlers never collapse into each other — each is a distinct step in the timeline + graph.
+- **A handler that ran twice is two distinct steps** (two seqs), not a merged blob — directly what we
+  want ("as vezes que rodaram não podem ficar agrupadas").
+- Within a handler-step, its p-processes are subs identified by **run id**, so a proc run more than
+  once shows as distinct sub rows, not one row with piled-up logs.
+
+Because the handler boundary is now the **step**, flip does **not** need the lib's `group` field for
+the handler dimension — the step is the group. `group` stays in the lib as a generic optional for the
+fan-out-within-one-step case; flip uses the step boundary instead.
+
+Open implementation questions (resolve during planning, needs `flip-python-db` reading):
+- How `"all"` decomposes into per-handler bodies (enumerate the `*_dep_procs` groups in the dictionary
+  vs. a new per-handler plan), and whether handlers have ordering/dependencies that the sequential
+  `ctx.call` loop must preserve.
+- Whether `run_proc` already supports running a single handler group per call (the v1 typed path sends
+  `*_dep_procs` groups individually, so likely yes) or needs a per-handler entry point.
+
+### Emitter
+
 - **`flip-python-db`** — `app/common/durable_proc_events.py` gains an `emit_subphase(id, phase, …)`
-  (and the run-id `set_current_process`) mirroring `subEvent`. The worker emits flip's lifecycle as
-  phases (`"triggered"`, `"validating"`, `"processing"`, …), closes with `sub`/terminal, and stamps a
-  per-invocation run id + the handler as `group`. Flip's vocabulary lives in flip.
-- **`flip-nestjs`** — bump `@dudousxd/nestjs-durable-*` to the released version. No code change beyond
-  the version bump (the dashboard is bundled by the lib).
+  (and a run-id form of `set_current_process`) mirroring `subEvent`. The worker emits flip's lifecycle
+  as phases (`"triggered"`, `"validating"`, `"processing"`, …), closes with the terminal outcome, and
+  stamps a per-invocation **run id** per p-process. Flip's vocabulary lives in flip.
+- **`flip-nestjs`** — the workflow restructuring above (`pipeline.workflow.ts`, `planPProcesses`) plus
+  a bump of `@dudousxd/nestjs-durable-*` to the released version (the dashboard is bundled by the lib).
 
 ## Out of scope (tracked separately)
 
-- **Double-dispatch bug.** Some flip handlers execute their procs twice (`handle_af_fleet` expected 5
-  / completed 10 = 200%, `mel` 14→28, `metadata` 1→2). That's a real upstream flip bug
-  (plan/dispatch, or the v1 SQS + v2 durable paths both running), independent of this lib feature.
-  Run identity makes the dashboard **display** the repeats correctly (distinct rows) instead of
-  collapsing them; it does not stop the double execution. Separate investigation.
+- **Double-dispatch root cause.** Some flip handlers *execute* their procs twice (`handle_af_fleet`
+  expected 5 / completed 10 = 200%, `mel` 14→28, `metadata` 1→2). Why they fire twice (plan/dispatch,
+  or the v1 SQS + v2 durable paths both running, or recovery) is a real upstream flip bug, separate
+  from this work. Run identity + handler-as-step make the dashboard **display** the repeats correctly
+  (distinct steps / sub rows, not merged); they do not stop the double execution. Separate
+  investigation.
 
 ## Compatibility & risk
 
