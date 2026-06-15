@@ -23,6 +23,8 @@ from .worker import (
     log,
     set_process,
     sub,
+    sub_event,
+    sub_process,
 )
 
 __all__ = [
@@ -36,6 +38,8 @@ __all__ = [
     "current_step",
     "log",
     "sub",
+    "sub_event",
+    "sub_process",
     "set_process",
     # Transport bootstrap helpers.
     "run_redis_worker",
@@ -47,4 +51,4 @@ __all__ = [
     "NondeterminismError",
     "StepFailed",
 ]
-__version__ = "0.5.0"
+__version__ = "0.6.0"

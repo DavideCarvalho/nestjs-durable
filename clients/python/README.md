@@ -55,8 +55,8 @@ decisions:
 | `ctx.step(name, body)` | Run a **local** step body once; its result is recorded, so `now`/`uuid`/a write happen exactly once and replay returns the captured value. |
 | `ctx.call(name, input, group=...)` | Dispatch a **remote** step to a worker `group` (any language) and await its result. |
 | `ctx.sleep(ms)` | Durable timer — the run suspends and the engine resumes it when the timer fires. |
-| `ctx.wait_signal(name)` | Block until a signal is delivered to the run; returns its payload. *(engine support pending)* |
-| `ctx.start_child(workflow, input)` | Start a child run and await its output. *(engine support pending)* |
+| `ctx.wait_signal(name)` | Block until a signal `name` is delivered to the run (via `engine.signal`); returns its payload. |
+| `ctx.start_child(workflow, input)` | Start a child run and await its output (a failed child raises `StepFailed`). |
 
 A step/call that fails raises `StepFailed` in the workflow — catch it to compensate (just like an
 awaited rejection), or let it propagate to fail the run. Changing the workflow's op sequence under a
@@ -71,9 +71,9 @@ engine.registerRemote('pipeline', '1', {
 });
 ```
 
-`call` / `step` / `sleep` are wired end-to-end; `wait_signal` / `start_child` emit commands the
-engine does not execute yet. `WorkflowWorker.process_task(task) -> decision` is the pure, broker-free
-core (fully tested). The workflow-task/decision wire is specified in
+All five ops are wired end-to-end — the engine executes the commands they emit (local step, remote
+dispatch, durable timer, signal waiter, child run). `WorkflowWorker.process_task(task) -> decision`
+is the pure, broker-free core (fully tested). The workflow-task/decision wire is specified in
 [`docs/plans/2026-06-15-polyglot-workflows-protocol.md`](../../docs/plans/2026-06-15-polyglot-workflows-protocol.md).
 
 ## Wire protocol

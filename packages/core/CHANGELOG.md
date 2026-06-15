@@ -1,5 +1,34 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.21.0
+
+### Minor Changes
+
+- 7f7598b: feat(engine): execute remote workflow `waitSignal` and `startChild` commands
+
+  The coordinator-driven (polyglot) engine now drives the last two workflow commands a remote worker
+  can emit. `ctx.wait_signal(name)` registers a signal waiter (resolved by `engine.signal(name, …)`,
+  with a buffered-before-wait signal re-driven safely after the turn suspends), and
+  `ctx.start_child(workflow, input)` starts a child run under a deterministic id and awaits it via the
+  existing parent-notify rendezvous — a failed child surfaces as a catchable `StepFailed` in the
+  parent's replay. Previously both threw "not supported yet". `call` / `recordStep` / `sleep` are
+  unchanged.
+
+## 0.20.0
+
+### Minor Changes
+
+- dcc97fd: Make in-flight local steps visible. A local `ctx.step` now announces its body has started — emitting a `step.started` lifecycle event and (by default) persisting a `running` checkpoint — so a long-running step shows up in the dashboard the moment it begins, not only once it completes. Previously a local step was checkpointed only on completion, so an in-progress step was invisible.
+
+  - New checkpoint status `'running'` for a local step whose body is executing in-process. It's a placeholder overwritten by `completed`/`failed`, and never short-circuits replay (only `completed` does), so a crash mid-body simply re-runs the step.
+  - New engine option `trackStepStart` (default `true`). The `step.started` event always fires (the live SSE view sees the start regardless); the flag gates only the extra `running` checkpoint write. Set it to `false` on hot paths with many short local steps to halve their checkpoint writes — at the cost of reload-survivable in-flight visibility.
+
+- 63b0d09: Extensible sub-process model: `StepEvent` gains optional `subId` (run identity), `group`, and `phase`
+  fields, and `StepLogger` gains `subEvent()` for emitting per-sub-process phase transitions and a
+  terminal outcome. The dashboard renders each sub-process as an expandable lifecycle row (phases,
+  duration, status, error, owned logs) grouped by run identity. The existing `sub(name, status)` is
+  unchanged.
+
 ## 0.19.0
 
 ### Minor Changes

@@ -14,83 +14,43 @@
 
 ## ⚠️ Coordination & sequencing (read first)
 
-- **Phase A edits `clients/python/durable_worker/` in THIS lib repo, which a concurrent session is actively developing** (the "polyglot workflow protocol + Python replay runtime" work, `ed4a429`…`69db236`). Before starting Phase A: re-read the current `worker.py`/`__init__.py` (they may have moved since this plan was written at SDK `__version__ = "0.5.0"`), and coordinate so the two efforts don't stomp each other. Do Phase A on its own branch.
-- **Dependency order:** A (Python SDK, lib release) → C-bump depends on the TS+Python release; **B depends on A being released** (flip-python-db installs the SDK). **C-split (handler-as-step) is INDEPDENDENT** of the lib release — it only restructures flip-nestjs + relies on Python's existing `file_type_proc_map`, so it can ship first and stand alone.
+- **Component A (Python SDK `sub_process`/`sub_event`) is DONE and on `main`** (`clients/python/durable_worker`), pending a PyPI release (tag `durable-worker-v0.6.0`). The TS dashboard feature is also released. So the remaining work is: cut the Python release (A2), then B (flip-python-db) and C (flip-nestjs).
+- **Dependency order:** A is done → **B depends on A being released to PyPI** (flip-python-db installs `durable_worker>=0.6.0`). **C-split (handler-as-step) is INDEPENDENT** of the lib release — it only restructures flip-nestjs + relies on Python's existing `file_type_proc_map`, so it can ship first and stand alone.
 - **The double-dispatch bug is OUT OF SCOPE** (af_fleet/mel/metadata running 2×). Run identity + handler-as-step make it *display* correctly (distinct steps/rows); they don't stop the double execution. Separate investigation.
 
 ---
 
-## Component A — Python SDK: `sub_event` + run-identity/group/phase
+## Component A — Python SDK: `sub_event` + `sub_process` context manager ✅ DONE (on `main`, unreleased)
 
-The TS `StepLogger.subEvent({ id, name, group?, phase?, status?, message?, data? })` emits a `StepEvent` with `subId`/`group`/`phase` keys. The Python SDK must emit the **same camelCase keys** so the dashboard reads them identically. Today (`clients/python/durable_worker/worker.py`, v0.5.0): `StepContext._emit(level, message, *, name=None, status=None, process=None, data=None)` builds the event dict and appends to `self.events`; `StepContext.sub(name, status, message, data)` calls `_emit(...)`; module-level `sub`/`log`/`set_process` delegate to the context-local current step.
-
-**Files:**
-- Modify: `clients/python/durable_worker/worker.py` (`StepContext._emit`, add `StepContext.sub_event`, module-level `sub_event`)
-- Modify: `clients/python/durable_worker/__init__.py` (export `sub_event`)
-- Test: `clients/python/tests/test_worker.py`
-- Changeset: `.changeset/python-sub-event.md`
-
-### Task A1: Extend `_emit` to carry `subId`/`group`/`phase`
-
-- [ ] **Step 1: Re-read current `worker.py`** (it may have changed since v0.5.0). Confirm `_emit`'s current signature and the event-dict construction around line 124-142. Confirm `self.events` is the list serialized into the step result.
-
-- [ ] **Step 2: Write the failing test** — add to `clients/python/tests/test_worker.py` (follow the file's existing style: construct a `StepContext`, call methods, assert on `ctx.events`):
+**Implemented and merged to `main`** (`clients/python/durable_worker`). Davi asked for an ergonomic API, so beyond the flat primitive there's a context manager. Shipped surface:
 
 ```python
-def test_sub_event_emits_run_identity_group_and_phase():
-    ctx = StepContext()  # match however existing tests construct it; see other tests in this file
-    ctx.sub_event(id="r1", name="ProcessKpi", group="AF_FLEET", phase="processing")
-    ctx.sub_event(id="r1", name="ProcessKpi", group="AF_FLEET", status="ok", data={"durationMs": 42})
-    assert ctx.events[0]["subId"] == "r1"
-    assert ctx.events[0]["name"] == "ProcessKpi"
-    assert ctx.events[0]["group"] == "AF_FLEET"
-    assert ctx.events[0]["phase"] == "processing"
-    assert "status" not in ctx.events[0]
-    assert ctx.events[1]["subId"] == "r1"
-    assert ctx.events[1]["status"] == "ok"
-    assert ctx.events[1]["data"] == {"durationMs": 42}
-    assert "phase" not in ctx.events[1]
+from durable_worker import sub_process, sub_event
+
+# Ergonomic (recommended): context manager — auto run-id, auto durationMs, ok on clean exit /
+# failed on exception (re-raised) / skip(), logs inside auto-tagged to this sub's run id. No-op
+# outside a durable step, so the same business code runs unchanged on a non-durable path.
+with sub_process("ProcessKpi", group="AF_FLEET") as sp:
+    sp.phase("validating")
+    if not valid:
+        sp.skip("; ".join(errors)); return
+    sp.phase("processing")
+    ...  # work; durable_worker.log(...) here is tagged with this run id
+# clean exit -> terminal "ok" + measured durationMs
+
+# Flat primitive (mirrors TS StepLogger.subEvent 1:1) — when you manage the id yourself:
+sub_event(id="r1", name="ProcessKpi", group="AF_FLEET", phase="processing")
+sub_event(id="r1", name="ProcessKpi", group="AF_FLEET", status="ok", data={"durationMs": 42})
 ```
 
-- [ ] **Step 3: Run it, see it fail** — `cd clients/python && python -m pytest tests/test_worker.py -k sub_event -q` (or the repo's configured runner — check `clients/python/pyproject.toml` for the test command). Expected: FAIL — `StepContext` has no `sub_event`.
+Under the hood: `StepContext._emit` extended with `sub_id`/`group`/`phase` (emitting camelCase `subId`/`group`/`phase`); `StepContext.sub_event` + module-level `sub_event`; `_SubProcess` context manager (`__enter__`/`__exit__` with `try/finally` state restore, monotonic duration, `.phase()`/`.skip()`/`.fail()`); log lines auto-stamp `subId` from the current sub. Existing `sub()`/`log()`/`set_process()` unchanged — a legacy `sub("x","ok")` still emits no `subId`. Tests in `clients/python/tests/test_sub_process.py` (9). The dashboard already consumes `subId`/`group`/`phase` (TS feature shipped).
 
-- [ ] **Step 4: Implement.** In `worker.py`:
-  - Extend `_emit` to accept `sub_id=None`, `group=None`, `phase=None` and add them to the event dict only when not `None`, using the camelCase keys `subId`/`group`/`phase` (mirror how `name`/`status`/`process` are conditionally added).
-  - Add `StepContext.sub_event`:
-```python
-    def sub_event(
-        self,
-        *,
-        id: str,
-        name: str,
-        group: Optional[str] = None,
-        phase: Optional[str] = None,
-        status: Optional[str] = None,
-        message: Optional[str] = None,
-        data: Any = None,
-    ) -> None:
-        level = "error" if status == "failed" else "warn" if status == "skipped" else "info"
-        self._emit(
-            level,
-            message or phase or name,
-            name=name,
-            status=status,
-            data=data,
-            sub_id=id,
-            group=group,
-            phase=phase,
-        )
-```
-  - Add a module-level `sub_event(**kwargs)` that delegates to the current step's context (mirror the existing module-level `sub`).
+### Task A2: Release the Python SDK to PyPI (tag-triggered — NOT changesets)
 
-- [ ] **Step 5: Run the test, see it pass.** Same command as Step 3 without `-k` filter to run the file.
+The Python SDK releases via `.github/workflows/release-python.yml`, triggered by pushing a tag `durable-worker-v*` (or manual `workflow_dispatch`) → builds + publishes to PyPI via OIDC Trusted Publishing.
 
-- [ ] **Step 6: Export + commit.** Add `sub_event` to `worker.py`'s imports in `__init__.py` and to `__all__`. Run the SDK's full test suite + any typecheck/lint it has (`pyproject.toml`). Commit `worker.py`, `__init__.py`, the test (explicit paths).
-
-### Task A2: Changeset + release
-
-- [ ] **Step 1:** Add a changeset for the Python SDK package (find its package name/path — the Python SDK may version via `__version__` + a JS changeset wrapper or its own scheme; check how prior SDK releases were cut, e.g. `git log -- clients/python`). Follow the repo's established Python-release mechanism rather than inventing one.
-- [ ] **Step 2:** Push on a branch, open PR (do not publish by hand — CI/changesets release on merge, per repo convention). Coordinate the merge with the concurrent Python work.
+- [ ] **Step 1:** Bump the version in BOTH `clients/python/pyproject.toml` (`version`) and `clients/python/durable_worker/__init__.py` (`__version__`) from `0.5.0` → `0.6.0` (minor — additive feature). Commit to `main`.
+- [ ] **Step 2:** Push the tag `durable-worker-v0.6.0` to trigger the publish workflow (ASK first — this is the deliberate "publish" action). Confirm the workflow succeeds and `0.6.0` is on PyPI.
 
 ---
 
@@ -106,23 +66,24 @@ def test_sub_event_emits_run_identity_group_and_phase():
 - Modify: `app/common/durable_proc_events.py` (extend the sink shim + `EventSink` Protocol to expose `sub_event` and a run-id-aware `set_current_process`)
 - Test: `tests/test_observable.py` / a new `tests/test_durable_proc_events.py`
 
-### Task B1: Extend the durable sink shim to forward `sub_event` + run-id tagging
+Component A's context manager makes this much thinner than originally drafted — `PProcess.run()` wraps its body in `with sub_process(...)`, which handles run-id, duration, terminal status (incl. exception→failed), and log tagging automatically. The custom `emit_subprocess`/`emit_subphase` shim is largely unnecessary now.
 
-`app/common/durable_proc_events.py` currently exposes `emit_subprocess`, `emit_log`, `set_current_process(name)` over a context-local `EventSink`. Add:
-- [ ] `emit_subphase(id, name, phase, *, group=None, data=None)` and an `emit_subprocess` variant that takes `id`/`group` (or add params to the existing one), forwarding to the sink's `sub_event`.
-- [ ] Update the `EventSink` Protocol to include `sub_event(**kwargs)`.
-- [ ] `set_current_process` should tag subsequent logs with the run id (the dashboard groups logs by `subId`); thread the `process_run_id` through, not just the name. Verify what the SDK's log-tagging hook keys on after Component A (it may key logs by `subId` now) and align.
-- [ ] Tests: a fake sink capturing calls; assert `emit_subphase`/terminal forward the right `id`/`group`/`phase`/`status`. No-op when no sink installed (outside a durable run) — keep the existing "cheap no-op" guard.
+### Task B1: Re-point the durable sink shim at the SDK's `sub_process`/`sub_event`
 
-### Task B2: Emit phases + terminal from `PProcess.run()`
+`app/common/durable_proc_events.py` currently wraps a context-local `EventSink` with `emit_subprocess`/`emit_log`/`set_current_process`. Simplify:
+- [ ] Re-export (or thinly wrap) `sub_process` and `sub_event` from `durable_worker` so p-process code imports one place. The SDK functions are already no-ops outside a durable step, so the existing "cheap no-op on the v1 SQS path" property is preserved for free — you can drop the custom contextvar sink if nothing else needs it (verify no other caller depends on the old `EventSink`/`set_sink` API first).
+- [ ] Keep `emit_log` (maps to `durable_worker.log`) if p-process step code still emits free log lines.
+- [ ] Tests: assert `sub_process`/`sub_event` are no-ops with no current step (v1 path) and forward correctly under a fake step context.
 
-- [ ] At each lifecycle point in `PProcess.run()` that already sends the v1 SQS message, ALSO emit the durable phase via the sink: `triggered` → `validating` → (`not_valid` terminal `skipped` | `processing` → `completed` terminal `ok`) | `error` terminal `failed`. Use `process_run_id` as `id`, class name as `name`, `handler_name` as `group`, and keep the existing `{"durationMs": …}` on the terminal.
-- [ ] Replace the current name-only `set_current_process(self.__class__.__name__)` with the run-id-aware call so logs tag to this run.
-- [ ] Tests (`tests/test_observable.py` style — mock the sink, drive a fake PProcess through validate→process→complete and through the failure path; assert the sub_event sequence has the right phases, run id, group, and terminal status). Cover: success path, validation-failure (`skipped`), exception (`failed`).
+### Task B2: Wrap `PProcess.run()` in `with sub_process(...)`
+
+- [ ] Replace the manual durable emissions in `PProcess.run()` with a single `with sub_process(self.__class__.__name__, group=handler_name, id=process_run_id) as sp:` around the run body. Pass the EXISTING `process_run_id` as `id` (so durable + v1 SQS share one run identity) and `handler_name` as `group`. Inside: `sp.phase("validating")`; on validation failure `sp.skip("; ".join(validation_errors)); return`; then `sp.phase("processing")`; the clean exit auto-emits `ok` (+ durationMs); an exception auto-emits `failed` and re-raises. Drop the now-redundant `set_current_process(...)`/`emit_subprocess(...)` calls (the CM tags logs + emits the terminal). Keep the v1 SQS lifecycle sends as-is (unchanged — they feed the v1 dashboard).
+- [ ] Confirm duration parity: the CM measures monotonic enter→exit; if you must keep the existing `elapsed_ms()` number on the terminal, pass it via `sp.skip(..., data={"durationMs": elapsed_ms()})` / `sp.fail(..., data={...})` (the CM preserves a caller-supplied `durationMs`).
+- [ ] Tests (`tests/test_observable.py` style — drive a fake PProcess under a fake durable step; assert the emitted events are: phase `validating`, phase `processing`, terminal `ok`, all sharing `subId == process_run_id` and `group == handler_name`; plus the validation-failure→`skipped` and exception→`failed` paths).
 
 ### Task B3: Bump the `durable_worker` SDK dependency
 
-- [ ] Bump `flip-python-db`'s `durable_worker` dependency to the version released in Component A (check `pyproject.toml`/lock). Run the durable worker tests.
+- [ ] Bump `flip-python-db`'s `durable_worker` dependency to `>=0.6.0` (the Component A release). Run the durable worker tests.
 
 ---
 
