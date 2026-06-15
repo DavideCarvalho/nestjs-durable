@@ -1,4 +1,5 @@
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — breakpoints', () => {
@@ -14,7 +15,7 @@ describe('WorkflowEngine — breakpoints', () => {
       return 'done';
     });
 
-    const started = await engine.start('wf', {}, 'run1');
+    const started = await startRun(engine, 'wf', {}, 'run1');
     expect(started.status).toBe('suspended');
     expect(order).toEqual(['before']);
 
@@ -38,7 +39,7 @@ describe('WorkflowEngine — breakpoints', () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     engine.register('wf', '1', async () => 'ok');
-    await engine.start('wf', {}, 'run1');
+    await startRun(engine, 'wf', {}, 'run1');
     expect(await engine.continue('run1')).toBeNull();
   });
 });

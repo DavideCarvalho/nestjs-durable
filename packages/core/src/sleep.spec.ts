@@ -1,4 +1,5 @@
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — durable sleep', () => {
@@ -19,7 +20,7 @@ describe('WorkflowEngine — durable sleep', () => {
       return 'done';
     });
 
-    const started = await engine.start('wf', {}, 'run1');
+    const started = await startRun(engine, 'wf', {}, 'run1');
     expect(started.status).toBe('suspended');
     expect(order).toEqual(['before']);
 

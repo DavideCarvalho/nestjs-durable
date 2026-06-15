@@ -119,6 +119,15 @@ export class PrismaStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+    const rows = await this.db.durableWorkflowRun.findMany({
+      where: { status: 'pending' },
+      orderBy: { createdAt: 'asc' }, // FIFO dispatch
+      take: limit,
+    });
+    return rows.map(fromRunRow);
+  }
+
   async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
     const rows = await this.db.durableWorkflowRun.findMany({
       where: { status: 'suspended', wakeAt: { not: null, lte: BigInt(nowMs) } },

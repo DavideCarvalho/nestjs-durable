@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type { EngineEvent } from './interfaces';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('saga compensation — retry + visibility', () => {
@@ -26,7 +27,7 @@ describe('saga compensation — retry + visibility', () => {
       return 'done';
     });
 
-    const result = await engine.start('saga', {}, 'r1');
+    const result = await startRun(engine, 'saga', {}, 'r1');
     expect(result.status).toBe('failed');
     expect(undoAttempts).toBe(2); // first attempt threw, retry succeeded
     expect(seen).toEqual([{ type: 'step.completed', name: 'compensate:reserve' }]);
@@ -52,7 +53,7 @@ describe('saga compensation — retry + visibility', () => {
       return 'done';
     });
 
-    const result = await engine.start('saga', {}, 'r1');
+    const result = await startRun(engine, 'saga', {}, 'r1');
     expect(result.status).toBe('failed');
     expect(result.error?.message).toBe('declined'); // original failure preserved, not masked
     expect(failures).toEqual(['compensate:reserve']);

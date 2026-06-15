@@ -10,6 +10,7 @@ async function storeWithRuns() {
     return 'ok';
   });
   await engine.start('checkout', {}, 'run1');
+  await engine.waitForRun('run1');
   return store;
 }
 
@@ -52,6 +53,7 @@ describe('cancelRun', () => {
     const engine = new WorkflowEngine({ store });
     engine.register('wait', '1', async (ctx) => ctx.waitForSignal('go'));
     await engine.start('wait', {}, 'r1'); // suspends
+    await engine.waitForRun('r1');
     expect(await cancelRun(store, 'r1')).toMatch(/cancelled/i);
     expect((await store.getRun('r1'))?.status).toBe('cancelled');
   });

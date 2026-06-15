@@ -13,6 +13,8 @@ import type { WorkflowClass, WorkflowInputOf, WorkflowOutputOf } from './workflo
 // ---------------------------------------------------------------------------
 
 export type RunStatus =
+  /** Created + enqueued by `start`, not yet picked up — a worker will lease and execute it. */
+  | 'pending'
   | 'running'
   | 'suspended'
   | 'completed'
@@ -160,6 +162,9 @@ export interface StateStore {
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(): Promise<WorkflowRun[]>;
 
+  /** The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. */
+  listPendingRuns(limit: number): Promise<WorkflowRun[]>;
+
   /** Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume. */
   listDueTimers(nowMs: number): Promise<WorkflowRun[]>;
 
@@ -272,6 +277,18 @@ export interface Heartbeat {
 export interface NamedTransport {
   id: string;
   transport: Transport;
+}
+
+/**
+ * Decides where a freshly-`start`ed run executes. `start` creates the run as `pending` and hands its
+ * id here instead of running the body inline — so the API/caller never blocks on workflow execution.
+ * The default in-process dispatcher runs it on this instance (a microtask); a broker-backed one
+ * enqueues the id for a worker pool to consume (`engine.runOne(runId)`); a no-op one leaves it
+ * `pending` in the store for a worker's `runPending` poll to pick up (DB-only, caller-doesn't-execute).
+ */
+export interface RunDispatcher {
+  // biome-ignore lint/suspicious/noConfusingVoidType: dispatch may be fire-and-forget (void) or async.
+  dispatch(runId: string): void | Promise<void>;
 }
 
 export interface Transport {

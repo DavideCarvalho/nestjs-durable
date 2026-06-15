@@ -1,8 +1,25 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('singleton (serialize runs by key)', () => {
+  it('admits an uncontended singleton run immediately and emits run.started', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    const started: string[] = [];
+    engine.subscribe((e) => {
+      if (e.type === 'run.started') started.push(e.runId);
+    });
+    engine.register('job', '1', async () => 'done', { singleton: { key: () => 'k' } });
+
+    // No timer drives: a lone singleton run must run straight to completion, not get force-suspended
+    // on admission, and it must still announce run.started.
+    const r = await startRun(engine, 'job', {}, 'solo');
+    expect(r.status).toBe('completed');
+    expect(started).toEqual(['solo']);
+  });
+
   it('runs one at a time per key; the next admits when the first completes', async () => {
     const store = new InMemoryStateStore();
     let now = 1000;
@@ -21,18 +38,21 @@ describe('singleton (serialize runs by key)', () => {
       { singleton: { key: (input) => (input as { key: string }).key } },
     );
 
-    await engine.start('job', { id: 'A', key: 'k' }, 'a');
-    await engine.start('job', { id: 'B', key: 'k' }, 'b'); // same key → gated
+    // A admits immediately (the slot is free), enters, then holds the slot on its signal wait.
+    await startRun(engine, 'job', { id: 'A', key: 'k' }, 'a');
+    // B shares the key → the slot is taken, so it gates (suspended) on the retry timer.
+    await startRun(engine, 'job', { id: 'B', key: 'k' }, 'b');
     expect(ran).toEqual(['A']);
     expect((await store.getRun('b'))?.status).toBe('suspended');
 
-    await engine.start('job', { id: 'C', key: 'other' }, 'c'); // different key → runs immediately
+    // Different key → its own slot, runs immediately.
+    await startRun(engine, 'job', { id: 'C', key: 'other' }, 'c');
     expect(ran).toEqual(['A', 'C']);
 
     await engine.signal('go:A', undefined); // A completes → frees the slot
     expect((await store.getRun('a'))?.status).toBe('completed');
 
-    now += 60_000; // B's gate retries on its timer → admits + runs
+    now += 60_000; // B's gate retries on its timer → the slot is now free → admits + runs
     await engine.resumeDueTimers(now);
     expect(ran).toEqual(['A', 'C', 'B']);
   });

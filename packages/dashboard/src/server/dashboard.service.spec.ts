@@ -26,6 +26,8 @@ describe('DashboardService', () => {
     });
     await engine.start('flaky', {}, 'f1', { tags: ['etl'] });
     await engine.start('flaky', {}, 'f2', { tags: ['other'] });
+    await engine.waitForRun('f1');
+    await engine.waitForRun('f2');
     expect((await store.getRun('f1'))?.status).toBe('failed');
     expect((await store.getRun('f2'))?.status).toBe('failed');
 
@@ -44,6 +46,7 @@ describe('DashboardService', () => {
       return 'done';
     });
     await engine.start('checkout', { orderId: 'o1' }, 'r1');
+    await engine.waitForRun('r1');
 
     const runs = await service.listRuns({});
     expect(runs).toHaveLength(1);
@@ -70,6 +73,7 @@ describe('DashboardService', () => {
       if (arg?.ok === undefined) throw new Error('ok is required');
     });
     await engine.start('job', {}, 'r1');
+    await engine.waitForRun('r1');
 
     expect(await service.getEvent('r1', 'progress')).toBe(25);
 
@@ -89,6 +93,7 @@ describe('DashboardService', () => {
       return payload.approved;
     });
     await engine.start('approval', {}, 'r1');
+    await engine.waitForRun('r1');
     expect((await service.getRunDetail('r1'))?.run.status).toBe('suspended');
 
     const delivered = await service.deliverWebhook('wh:r1:0', { approved: true });
@@ -111,6 +116,7 @@ describe('DashboardService', () => {
       }),
     );
     await engine.start('wf', {}, 'r1');
+    await engine.waitForRun('r1');
     expect((await service.getRunDetail('r1'))?.run.status).toBe('failed');
 
     const retried = await service.retry('r1');
@@ -118,6 +124,7 @@ describe('DashboardService', () => {
 
     engine.register('waiter', '1', async (ctx: WorkflowCtx) => ctx.waitForSignal('go'));
     await engine.start('waiter', {}, 'r2');
+    await engine.waitForRun('r2');
     const cancelled = await service.cancel('r2');
     expect(cancelled?.status).toBe('cancelled');
   });

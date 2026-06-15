@@ -23,7 +23,8 @@ describe('checkout workflow (end-to-end)', () => {
     const workflows = moduleRef.get(WorkflowService);
 
     // reserveStock (local) → charge-card (remote, @DurableStep, suspends) → waits for approval
-    const started = await workflows.start('checkout', { id: 'o1', total: 4200 }, 'run1');
+    await workflows.start('checkout', { id: 'o1', total: 4200 }, 'run1');
+    const started = await workflows.waitForRun('run1');
     expect(started.status).toBe('suspended');
 
     // Once charge-card resolves, the run waits for approval; approving it ships the order.
@@ -40,6 +41,7 @@ describe('checkout workflow (end-to-end)', () => {
     const workflows = moduleRef.get(WorkflowService);
 
     await workflows.start('checkout', { id: 'o2', total: 999 }, 'run2');
+    await workflows.waitForRun('run2');
     const done = await signalWhenReady(workflows, 'approve:o2', { approved: false });
 
     expect(done?.status).toBe('completed');

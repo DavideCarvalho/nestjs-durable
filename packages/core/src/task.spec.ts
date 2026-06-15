@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('ctx.task (async completion)', () => {
@@ -13,7 +14,7 @@ describe('ctx.task (async completion)', () => {
       return charge.chargeId;
     });
 
-    const first = await engine.start('checkout', {}, 'run1');
+    const first = await startRun(engine, 'checkout', {}, 'run1');
     expect(dispatched).toBe(1);
     expect(first.status).toBe('suspended');
 
@@ -28,7 +29,7 @@ describe('ctx.task (async completion)', () => {
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
     engine.register('wf', '1', async (ctx) => ctx.task('t', async () => {}));
 
-    await engine.start('wf', {}, 'run2');
+    await startRun(engine, 'wf', {}, 'run2');
     const res = await engine.failTask('run2', 't', 'declined');
     expect(res?.status).toBe('failed');
     expect(res?.error?.message).toContain('declined');
@@ -45,7 +46,7 @@ describe('ctx.task (async completion)', () => {
         return 'ok';
       }),
     );
-    const failed = await engine.start('flaky', {}, 'run3');
+    const failed = await startRun(engine, 'flaky', {}, 'run3');
     expect(failed.status).toBe('failed');
     expect((await store.getRun('run3'))?.error?.message).toContain('transient');
 

@@ -2,7 +2,9 @@ import {
   InMemoryStateStore,
   InMemoryTransport,
   type RunResult,
+  type StartOptions,
   WorkflowEngine,
+  type WorkflowRef,
 } from '@dudousxd/nestjs-durable-core';
 
 /** A clock you control, for testing durable sleeps without real time. */
@@ -24,6 +26,16 @@ export interface TestEngine {
   clock: MutableClock;
   /** Advance the clock by `ms` and resume any durable sleeps now due. */
   tick(ms: number): Promise<RunResult[]>;
+  /**
+   * Enqueue a run and wait for it to settle (terminal or suspended). `engine.start` only enqueues
+   * now (dispatch model), so use this when a test needs the outcome synchronously.
+   */
+  run(
+    workflow: WorkflowRef,
+    input: unknown,
+    runId: string,
+    opts?: StartOptions,
+  ): Promise<RunResult>;
 }
 
 /**
@@ -43,6 +55,12 @@ export function createTestEngine(): TestEngine {
     async tick(ms: number): Promise<RunResult[]> {
       clock.advance(ms);
       return engine.resumeDueTimers(clock.now());
+    },
+    async run(workflow, input, runId, opts): Promise<RunResult> {
+      // `start` is overloaded per ref kind; a `WorkflowRef` union fits neither overload directly, so
+      // resolve to the string overload (the engine accepts a class or name at runtime).
+      await engine.start(workflow as string, input, runId, opts);
+      return engine.waitForRun(runId);
     },
   };
 }

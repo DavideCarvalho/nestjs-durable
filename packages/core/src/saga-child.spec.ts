@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 async function poll(fn: () => Promise<boolean>, timeoutMs = 1000): Promise<void> {
@@ -23,7 +24,7 @@ describe('saga compensation', () => {
       });
     });
 
-    const res = await engine.start('saga', {}, 'r1');
+    const res = await startRun(engine, 'saga', {}, 'r1');
     expect(res.status).toBe('failed');
     expect(undone).toEqual(['b', 'a']); // reverse, only the completed steps
   });
@@ -35,7 +36,7 @@ describe('saga compensation', () => {
       await ctx.step('a', async () => 'A', { compensate: async () => void undone.push('a') });
       return 'done';
     });
-    const res = await engine.start('ok', {}, 'r2');
+    const res = await startRun(engine, 'ok', {}, 'r2');
     expect(res.status).toBe('completed');
     expect(undone).toEqual([]);
   });
@@ -51,7 +52,7 @@ describe('ctx.child (child workflows)', () => {
       return r.doubled;
     });
 
-    const first = await engine.start('parent', {}, 'p1');
+    const first = await startRun(engine, 'parent', {}, 'p1');
     expect(first.status).toBe('suspended');
 
     await poll(async () => (await store.getRun('p1'))?.status === 'completed');
@@ -66,7 +67,7 @@ describe('ctx.child (child workflows)', () => {
     });
     engine.register('parent2', '1', async (ctx) => ctx.child('badchild', {}));
 
-    await engine.start('parent2', {}, 'p2');
+    await startRun(engine, 'parent2', {}, 'p2');
     await poll(async () => (await store.getRun('p2'))?.status === 'failed');
     expect((await store.getRun('p2'))?.error?.message).toContain('child boom');
   });

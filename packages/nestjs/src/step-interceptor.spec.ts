@@ -47,7 +47,9 @@ describe('@StepInterceptor (DI-injected step middleware)', () => {
     }).compile();
     await mod.init();
 
-    const res = await mod.get(WorkflowService).start('calc', {}, 'r1');
+    const svc = mod.get(WorkflowService);
+    await svc.start('calc', {}, 'r1');
+    const res = await svc.waitForRun('r1');
     expect(res.output).toBe(42);
     expect(log).toContain('calc.double=42');
   });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('ctx.webhook', () => {
@@ -20,7 +21,7 @@ describe('ctx.webhook', () => {
       return payload.ok;
     });
 
-    const first = await engine.start('wf', {}, 'r1');
+    const first = await startRun(engine, 'wf', {}, 'r1');
     expect(first.status).toBe('suspended');
     expect(issuedUrl).toBe('https://app.test/api/durable/webhooks/wh:r1:0');
 
@@ -41,7 +42,7 @@ describe('ctx.webhook', () => {
       token = wh.token;
       await wh.wait();
     });
-    await engine.start('wf', {}, 'r2');
+    await startRun(engine, 'wf', {}, 'r2');
     expect(url).toBeUndefined();
     expect(token).toBe('wh:r2:0');
   });

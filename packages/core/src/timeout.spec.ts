@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
 import { SignalTimeoutError } from './errors';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('waitForSignal timeout', () => {
@@ -22,7 +23,7 @@ describe('waitForSignal timeout', () => {
       }
     });
 
-    const first = await engine.start('approve', {}, 'r1');
+    const first = await startRun(engine, 'approve', {}, 'r1');
     expect(first.status).toBe('suspended');
 
     now = 7000; // past the 6000ms deadline
@@ -42,7 +43,7 @@ describe('waitForSignal timeout', () => {
       ctx.waitForSignal<{ ok: boolean }>('go', { timeoutMs: 5000 }),
     );
 
-    await engine.start('approve', {}, 'r2');
+    await startRun(engine, 'approve', {}, 'r2');
     now = 2000; // before the deadline
     const resumed = await engine.signal('go', { ok: true });
     expect(resumed?.status).toBe('completed');

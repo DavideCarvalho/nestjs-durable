@@ -21,7 +21,8 @@ describe('DurableModule', () => {
     await moduleRef.init();
 
     const service = moduleRef.get(WorkflowService);
-    const result = await service.start('greet', { name: 'davi' }, 'run1');
+    await service.start('greet', { name: 'davi' }, 'run1');
+    const result = await service.waitForRun('run1');
 
     expect(result.status).toBe('completed');
     expect(result.output).toBe('hello davi');

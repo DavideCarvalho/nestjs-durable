@@ -32,7 +32,7 @@ describe('@Workflow inputSchema (class-validator)', () => {
     await expect(svc.start('checkout', { orderId: 'o1', total: 'oops' }, 'bad')).rejects.toThrow();
     expect(await store.getRun('bad')).toBeNull();
 
-    const ok = await svc.start('checkout', { orderId: 'o1', total: 5 }, 'good');
-    expect(ok.status).toBe('completed');
+    await svc.start('checkout', { orderId: 'o1', total: 5 }, 'good');
+    expect((await svc.waitForRun('good')).status).toBe('completed');
   });
 });

@@ -14,7 +14,7 @@ describe('createTestEngine', () => {
       await ctx.step('a', async () => 1);
       return 'ok';
     });
-    const result = await t.engine.start('wf', {}, 'run1');
+    const result = await t.run('wf', {}, 'run1');
 
     expect(result.status).toBe('completed');
     await assertRunStatus(t.store, 'run1', 'completed');
@@ -31,7 +31,7 @@ describe('createTestEngine', () => {
       await ctx.step('after', async () => order.push('after'));
     });
 
-    const started = await t.engine.start('wf', {}, 'run1');
+    const started = await t.run('wf', {}, 'run1');
     expect(started.status).toBe('suspended');
 
     await t.tick(4_000); // not due
@@ -50,7 +50,7 @@ describe('crash/flaky injection', () => {
       ctx.step('flaky', failOnce('done'), { retries: 2 }),
     );
 
-    const result = await t.engine.start('wf', {}, 'run1');
+    const result = await t.run('wf', {}, 'run1');
     expect(result.status).toBe('completed');
     await assertStepAttempts(t.store, 'run1', 'flaky', 2);
   });
@@ -60,7 +60,7 @@ describe('assertions fail loudly', () => {
   it('throws a clear error on a wrong status', async () => {
     const t = createTestEngine();
     t.engine.register('wf', '1', async () => 'ok');
-    await t.engine.start('wf', {}, 'run1');
+    await t.run('wf', {}, 'run1');
     await expect(assertRunStatus(t.store, 'run1', 'failed')).rejects.toThrow(/completed/);
   });
 });

@@ -13,7 +13,15 @@ import { StepDetailPanel } from './StepDetailPanel';
 import { WorkflowGraph } from './WorkflowGraph';
 import { PlayIcon, RetryIcon, XIcon } from './icons';
 
-const STATUSES: RunStatus[] = ['running', 'suspended', 'completed', 'failed', 'cancelled', 'dead'];
+const STATUSES: RunStatus[] = [
+  'pending',
+  'running',
+  'suspended',
+  'completed',
+  'failed',
+  'cancelled',
+  'dead',
+];
 
 function relTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();

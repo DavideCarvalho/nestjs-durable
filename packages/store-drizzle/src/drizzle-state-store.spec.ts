@@ -89,6 +89,17 @@ describe('DrizzleStateStore', () => {
     sqlite.close();
   });
 
+  it('lists pending runs oldest-first (FIFO), capped at the limit', async () => {
+    const { store, sqlite } = makeStore();
+    await store.createRun(run({ id: 'p2', status: 'pending', createdAt: new Date(2000) }));
+    await store.createRun(run({ id: 'p1', status: 'pending', createdAt: new Date(1000) }));
+    await store.createRun(run({ id: 'p3', status: 'pending', createdAt: new Date(3000) }));
+    await store.createRun(run({ id: 'running1', status: 'running' }));
+    expect((await store.listPendingRuns(10)).map((r) => r.id)).toEqual(['p1', 'p2', 'p3']);
+    expect((await store.listPendingRuns(2)).map((r) => r.id)).toEqual(['p1', 'p2']);
+    sqlite.close();
+  });
+
   it('tryLockRun is atomic and respects lease expiry', async () => {
     const { store, sqlite } = makeStore();
     await store.createRun(run({ id: 'r1' }));
@@ -126,7 +137,8 @@ describe('DrizzleStateStore', () => {
         return a + 5;
       });
     });
-    expect((await engine.start('wf', { x: 1 }, 'run1')).status).toBe('failed');
+    await engine.start('wf', { x: 1 }, 'run1');
+    expect((await engine.waitForRun('run1')).status).toBe('failed');
     const resumed = await engine.resume('run1');
     expect(resumed.status).toBe('completed');
     expect(resumed.output).toBe(15);

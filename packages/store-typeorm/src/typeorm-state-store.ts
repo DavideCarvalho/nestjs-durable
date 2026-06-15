@@ -63,6 +63,15 @@ export class TypeOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
+  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+    const rows = await this.runs().find({
+      where: { status: 'pending' },
+      order: { createdAt: 'ASC' }, // FIFO dispatch
+      take: limit,
+    });
+    return rows.map(fromRunEntity);
+  }
+
   async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
     const rows = await this.runs().findBy({
       status: 'suspended',

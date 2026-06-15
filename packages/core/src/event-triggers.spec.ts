@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('event triggers (onEvent starts a workflow)', () => {
@@ -20,6 +21,7 @@ describe('event triggers (onEvent starts a workflow)', () => {
     );
     expect(affected).toBe(1);
 
+    await engine.waitForRun('evt:u1:send-welcome');
     const run = await store.getRun('evt:u1:send-welcome');
     expect(run?.status).toBe('completed');
     expect(run?.output).toBe('welcome a@b.com');
@@ -33,6 +35,7 @@ describe('event triggers (onEvent starts a workflow)', () => {
     });
 
     await engine.publishEvent('user.deleted', { kind: 'gone' }, { id: 'd1' });
+    await engine.waitForRun('evt:d1:audit');
     expect((await store.getRun('evt:d1:audit'))?.output).toBe('gone');
   });
 
@@ -53,6 +56,7 @@ describe('event triggers (onEvent starts a workflow)', () => {
     );
 
     await engine.publishEvent('ping', {}, { id: 'p1' });
+    await engine.waitForRun('evt:p1:count');
     await engine.publishEvent('ping', {}, { id: 'p1' });
     expect(starts).toBe(1);
     expect((await store.listRuns({ workflow: 'count' })).length).toBe(1);
@@ -69,12 +73,13 @@ describe('event triggers (onEvent starts a workflow)', () => {
       onEvent: ['thing.happened'],
     });
 
-    await engine.start('waiter', {}, 'w1');
+    await startRun(engine, 'waiter', {}, 'w1');
     expect((await store.getRun('w1'))?.status).toBe('suspended');
 
     const affected = await engine.publishEvent('thing.happened', { v: 3 }, { id: 'e1' });
     expect(affected).toBe(2); // 1 waiter resumed + 1 trigger started
     expect((await store.getRun('w1'))?.output).toBe(3);
+    await engine.waitForRun('evt:e1:trigger');
     expect((await store.getRun('evt:e1:trigger'))?.output).toBe(30);
   });
 });

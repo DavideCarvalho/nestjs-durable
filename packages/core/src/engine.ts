@@ -11,7 +11,9 @@ import type {
   NamedTransport,
   RemoteStepDef,
   RemoteTask,
+  RunDispatcher,
   RunResult,
+  RunStatus,
   SearchAttributes,
   StateStore,
   StepError,
@@ -172,6 +174,13 @@ export interface WorkflowEngineDeps {
    * hiccup — gets another try). Default 1 (no retry). Compensations must be idempotent.
    */
   compensationRetries?: number;
+  /**
+   * Where a freshly-`start`ed run executes (see {@link RunDispatcher}). Defaults to in-process: the
+   * run executes on this instance asynchronously (a microtask), so `start` returns without blocking.
+   * Pass a no-op dispatcher on a caller that must NOT run workflows (e.g. an API/dashboard pod), and
+   * run `runPending` on a worker pod to pick those up; or a broker-backed one for a worker pool.
+   */
+  runDispatcher?: RunDispatcher;
 }
 
 /**
@@ -192,6 +201,8 @@ export class WorkflowEngine {
   private readonly webhookUrl?: (token: string) => string;
   private readonly traceparent?: () => string | undefined;
   private readonly compensationRetries: number;
+  /** Where a freshly-started run executes — in-process by default (see {@link RunDispatcher}). */
+  private readonly runDispatcher: RunDispatcher;
   /** Every registered workflow, keyed by `name@version` — so old versions stay runnable. */
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
@@ -234,6 +245,12 @@ export class WorkflowEngine {
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
+    // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
+    // A failed pickup is swallowed here (the run stays `pending` for a `runPending` poll to retry);
+    // run failures themselves are handled inside `execute` and surfaced as the run's `failed` state.
+    this.runDispatcher = deps.runDispatcher ?? {
+      dispatch: (runId) => queueMicrotask(() => void this.runOne(runId).catch(() => {})),
+    };
     this.pool.bind(
       async (result) => {
         // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
@@ -462,7 +479,7 @@ export class WorkflowEngine {
       id: runId,
       workflow: name,
       workflowVersion: registered.version,
-      status: 'running',
+      status: 'pending',
       input,
       tags,
       searchAttributes: opts?.searchAttributes,
@@ -470,8 +487,10 @@ export class WorkflowEngine {
       updatedAt: now,
     };
     await this.store.createRun(run);
-    this.emit({ type: 'run.started', runId, workflow: name });
-    return this.track(this.execute(run, registered.fn));
+    // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
+    // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
+    await this.runDispatcher.dispatch(runId);
+    return { runId, status: 'pending' };
   }
 
   /** Read a run's current persisted state (or null if unknown). A thin pass-through to the store. */
@@ -582,6 +601,88 @@ export class WorkflowEngine {
    */
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
     return this.resumeLeased(await this.store.listDueTimers(nowMs), nowMs);
+  }
+
+  /**
+   * Lease and execute one run by id — the worker side of dispatch. Acquires the recovery lease (so
+   * exactly one instance runs it), then resumes the body. Returns the result, or null if another
+   * instance holds the lease or the engine is draining. The default in-process dispatcher calls this;
+   * a broker-backed worker calls it per consumed run id.
+   */
+  async runOne(runId: string): Promise<RunResult | null> {
+    if (this.draining) return null;
+    const nowMs = this.clock();
+    const acquired = await this.store.tryLockRun(
+      runId,
+      this.instanceId,
+      nowMs + this.leaseMs,
+      nowMs,
+    );
+    if (!acquired) return null;
+    return this.resume(runId);
+  }
+
+  /**
+   * Pick up and execute every `pending` run — the poll-based side of dispatch for a worker pod with
+   * no broker. Runs enqueued by other pods (or by a caller using a no-op dispatcher) sit `pending`
+   * in the store until polled; leasing ensures exactly one pod runs each. Call periodically alongside
+   * {@link resumeDueTimers}.
+   */
+  async runPending(nowMs: number = this.clock()): Promise<RunResult[]> {
+    // Oldest-first (FIFO), capped per call so a backlog drains over several polls without one sweep
+    // fetching unboundedly. A run not picked up this tick is picked up the next.
+    return this.resumeLeased(await this.store.listPendingRuns(100), nowMs);
+  }
+
+  /**
+   * Resolve once `runId` reaches a settled state — terminal (completed/failed/cancelled/dead) or
+   * suspended (handed off to a timer/signal/event). The async counterpart to dispatch: pair it with
+   * `start` when a call site needs the outcome — `await start(...); const r = await waitForRun(id)`.
+   */
+  waitForRun(runId: string, opts?: { timeoutMs?: number }): Promise<RunResult> {
+    const isSettled = (s: RunStatus): boolean => s !== 'pending' && s !== 'running';
+    const toResult = (run: WorkflowRun): RunResult => ({
+      runId,
+      status: run.status,
+      output: run.output,
+      error: run.error,
+    });
+    return new Promise<RunResult>((resolve, reject) => {
+      let done = false;
+      let off: () => void = () => {};
+      const timer =
+        opts?.timeoutMs != null
+          ? setTimeout(() => {
+              if (done) return;
+              done = true;
+              off();
+              reject(new Error(`waitForRun(${runId}) timed out after ${opts.timeoutMs}ms`));
+            }, opts.timeoutMs)
+          : undefined;
+      const finish = (run: WorkflowRun): void => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        off();
+        resolve(toResult(run));
+      };
+      const check = (): void => {
+        void this.store.getRun(runId).then((run) => {
+          if (run && isSettled(run.status)) finish(run);
+        });
+      };
+      // React only to this run's settling events (not its every step event), and subscribe BEFORE the
+      // initial read so a run that settles in between isn't missed.
+      off = this.subscribe((ev) => {
+        if (
+          ev.runId === runId &&
+          (ev.type === 'run.completed' || ev.type === 'run.failed' || ev.type === 'run.suspended')
+        ) {
+          check();
+        }
+      });
+      check();
+    });
   }
 
   /**
@@ -802,9 +903,17 @@ export class WorkflowEngine {
   }
 
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
+    const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
+    // First execution of an enqueued run: mark it running and announce the start, BEFORE the singleton
+    // gate — `admitSingleton` only counts `running`/`suspended` runs, so a still-`pending` run could
+    // never be admitted. A resumed run is already past `pending`, so this fires exactly once.
+    if (run.status === 'pending') {
+      await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
+      run.status = 'running';
+      this.emit({ type: 'run.started', runId: run.id, workflow: run.workflow });
+    }
     // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
-    const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
     if (registered?.singleton && !(await this.admitSingleton(run, registered.singleton))) {
       const wakeAt = this.clock() + SINGLETON_RETRY_MS;
       await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });

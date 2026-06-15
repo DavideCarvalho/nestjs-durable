@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('engine.cancel({ compensate: true }) — undo on cancellation', () => {
@@ -23,7 +24,7 @@ describe('engine.cancel({ compensate: true }) — undo on cancellation', () => {
       return 'done';
     });
 
-    await engine.start('saga', {}, 'r1');
+    await startRun(engine, 'saga', {}, 'r1');
     expect((await store.getRun('r1'))?.status).toBe('suspended');
 
     const res = await engine.cancel('r1', { compensate: true });
@@ -45,7 +46,7 @@ describe('engine.cancel({ compensate: true }) — undo on cancellation', () => {
       await ctx.waitForSignal('ship');
       return 'done';
     });
-    await engine.start('saga', {}, 'r1');
+    await startRun(engine, 'saga', {}, 'r1');
 
     const res = await engine.cancel('r1');
     expect(res?.status).toBe('cancelled');
