@@ -68,6 +68,20 @@ export class CodecStateStore implements StateStore {
   saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     return this.inner.saveCheckpoint(this.encCp(checkpoint));
   }
+  transaction<T>(
+    work: (tx: {
+      raw: unknown;
+      saveCheckpoint: (cp: StepCheckpoint) => Promise<void>;
+    }) => Promise<T>,
+  ): Promise<T> {
+    if (!this.inner.transaction) {
+      throw new Error('the wrapped store does not support transactions');
+    }
+    // Encode the checkpoint inside the tx, so payloads stay encoded at rest like the normal path.
+    return this.inner.transaction((tx) =>
+      work({ raw: tx.raw, saveCheckpoint: (cp) => tx.saveCheckpoint(this.encCp(cp)) }),
+    );
+  }
   async listIncompleteRuns(): Promise<WorkflowRun[]> {
     return (await this.inner.listIncompleteRuns()).map((r) => this.decRun(r));
   }

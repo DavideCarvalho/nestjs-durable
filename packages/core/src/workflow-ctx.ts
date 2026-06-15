@@ -170,6 +170,30 @@ export function createWorkflowCtx(
     }
   };
 
+  // Exactly-once DB step: run the body and write the step checkpoint in ONE store transaction, so the
+  // business write commits atomically with the "done" marker (a plain step checkpoints AFTER the body,
+  // so a crash in between re-runs it). Replay returns the recorded output without re-running.
+  const transaction = async <T>(name: string, fn: (tx: unknown) => Promise<T>): Promise<T> => {
+    if (!store.transaction) {
+      throw new Error(
+        'ctx.transaction needs a store that supports transactions (the SQL adapters do). Use ctx.step for non-transactional work.',
+      );
+    }
+    const current = pos.next();
+    const existing = await store.getCheckpoint(runId, current);
+    if (existing && existing.name !== name) {
+      throw new NonDeterminismError(runId, current, name, existing.name);
+    }
+    if (existing && existing.status === 'completed') return existing.output as T;
+    return store.transaction(async (tx) => {
+      const output = await fn(tx.raw);
+      await tx.saveCheckpoint(
+        instantCheckpoint({ runId, seq: current, name, kind: 'local', output }),
+      );
+      return output;
+    });
+  };
+
   // Shared by sleep / sleepUntil: record a durable timer at this position and suspend until `wakeAt`
   // (epoch ms). The wakeAt is computed by the caller — but only used on the first run; on replay the
   // recorded checkpoint's wakeAt wins, so a clock change can't shift an already-scheduled timer.
@@ -439,6 +463,7 @@ export function createWorkflowCtx(
   return {
     runId,
     step,
+    transaction,
     sleep,
     sleepUntil,
     continueAsNew,

@@ -201,6 +201,14 @@ export interface StateStore {
   /** Take the oldest buffered signal for `token` (FIFO), or null if none is buffered. */
   takeBufferedSignal(token: string): Promise<{ payload: unknown } | null>;
 
+  /**
+   * Run `work` in a SINGLE store transaction — giving it the store-native transaction handle (`raw`)
+   * for the caller's own DB writes plus a `saveCheckpoint` that commits IN THE SAME transaction, so a
+   * business write and the step's "done" checkpoint are atomic (exactly-once). Optional — only the SQL
+   * adapters implement it; `ctx.transaction` errors on a store without it.
+   */
+  transaction?<T>(work: (tx: StoreTransaction) => Promise<T>): Promise<T>;
+
   // Dashboard queries
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
@@ -231,6 +239,15 @@ export interface RunQuery {
   attributes?: AttributeFilter[];
   limit?: number;
   offset?: number;
+}
+
+/** The transaction handle `StateStore.transaction` hands to its work callback. */
+export interface StoreTransaction {
+  /** The store-native transaction handle (TypeORM `EntityManager`, Prisma tx client, MikroORM `EntityManager`,
+   *  Drizzle tx) — do your business DB writes on THIS so they commit atomically with the checkpoint. */
+  readonly raw: unknown;
+  /** Persist the step checkpoint inside this transaction. */
+  saveCheckpoint(checkpoint: StepCheckpoint): Promise<void>;
 }
 
 /** Binds an external signal `token` to the suspended run/step position waiting for it. */
@@ -422,6 +439,15 @@ export interface WorkflowCtx {
     fn: (log: StepLogger) => Promise<TOutput>,
     options?: StepOptions,
   ): Promise<TOutput>;
+  /**
+   * **Exactly-once** durable step for DB work: runs `fn` and writes the step's checkpoint in ONE
+   * store transaction, so the business write and the "done" marker commit atomically — a crash can
+   * never leave the write done-but-not-checkpointed (which a plain `ctx.step` would re-run). `fn`
+   * receives the store-native transaction handle (`tx` — a TypeORM/MikroORM `EntityManager`, a Prisma
+   * tx client, or a Drizzle tx); do your writes on it. Needs a SQL store that supports transactions
+   * (the bundled SQL adapters do); throws otherwise.
+   */
+  transaction<TOutput>(name: string, fn: (tx: unknown) => Promise<TOutput>): Promise<TOutput>;
   /**
    * Dispatch a typed remote step and await its checkpointed result. Options:
    * - `queue` — subject the dispatch to a registered flow-control queue (concurrency / rate limit).

@@ -108,6 +108,17 @@ export class InMemoryStateStore implements StateStore {
       .map((w) => ({ ...w }));
   }
 
+  // No real DB transaction (there's no DB) — run the work and save the checkpoint. Exactly-once
+  // across a crash needs a SQL store; this keeps `ctx.transaction` usable in tests / local dev.
+  async transaction<T>(
+    work: (tx: {
+      raw: unknown;
+      saveCheckpoint: (cp: StepCheckpoint) => Promise<void>;
+    }) => Promise<T>,
+  ): Promise<T> {
+    return work({ raw: this, saveCheckpoint: (cp) => this.saveCheckpoint(cp) });
+  }
+
   private readonly bufferedSignals = new Map<string, unknown[]>();
   async bufferSignal(token: string, payload: unknown): Promise<void> {
     const queue = this.bufferedSignals.get(token) ?? [];
