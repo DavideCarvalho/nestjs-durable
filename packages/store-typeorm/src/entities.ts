@@ -1,5 +1,5 @@
 import type { RunStatus, StepKind } from '@dudousxd/nestjs-durable-core';
-import { Column, Entity, PrimaryColumn } from 'typeorm';
+import { Column, Entity, PrimaryColumn, PrimaryGeneratedColumn } from 'typeorm';
 
 @Entity({ name: 'durable_workflow_runs' })
 export class WorkflowRunEntity {
@@ -112,4 +112,23 @@ export class SignalWaiterEntity {
   seq!: number;
 }
 
-export const ENTITIES = [WorkflowRunEntity, StepCheckpointEntity, SignalWaiterEntity] as const;
+@Entity({ name: 'durable_buffered_signals' })
+export class BufferedSignalEntity {
+  // Auto-increment PK for FIFO ordering. Left as TypeORM's default increment type so it maps to the
+  // driver-native auto-increment column (INTEGER on SQLite, BIGINT/SERIAL on MySQL/Postgres).
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column('text')
+  token!: string;
+
+  @Column('simple-json', { nullable: true })
+  payload?: unknown;
+}
+
+export const ENTITIES = [
+  WorkflowRunEntity,
+  StepCheckpointEntity,
+  SignalWaiterEntity,
+  BufferedSignalEntity,
+] as const;

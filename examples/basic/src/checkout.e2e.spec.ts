@@ -3,17 +3,23 @@ import { Test } from '@nestjs/testing';
 import { AppModule } from './app.module';
 
 /**
- * The remote `charge-card` step now suspends the run durably and resumes when its result lands
- * (asynchronously). So the run reaches the approval wait a few ticks AFTER `start` returns — retry
- * the approval signal until the waiter exists.
+ * Signals are buffered, so the approval can be delivered even before the run reaches the approval
+ * wait (the remote `charge-card` step suspends first and resumes asynchronously). Signal once, then
+ * poll the run until it settles terminally.
  */
-async function signalWhenReady(workflows: WorkflowService, token: string, payload: unknown) {
-  for (let i = 0; i < 100; i += 1) {
-    const result = await workflows.signal(token, payload);
-    if (result) return result;
-    await new Promise((r) => setImmediate(r));
+async function signalAndSettle(
+  workflows: WorkflowService,
+  runId: string,
+  token: string,
+  payload: unknown,
+) {
+  await workflows.signal(token, payload); // buffered if the run isn't waiting yet — delivered on arrival
+  for (let i = 0; i < 500; i += 1) {
+    const r = await workflows.waitForRun(runId);
+    if (r.status !== 'suspended') return r;
+    await new Promise((res) => setImmediate(res));
   }
-  throw new Error(`no run ever waited on ${token}`);
+  throw new Error(`run ${runId} did not settle`);
 }
 
 describe('checkout workflow (end-to-end)', () => {
@@ -28,7 +34,7 @@ describe('checkout workflow (end-to-end)', () => {
     expect(started.status).toBe('suspended');
 
     // Once charge-card resolves, the run waits for approval; approving it ships the order.
-    const done = await signalWhenReady(workflows, 'approve:o1', { approved: true });
+    const done = await signalAndSettle(workflows, 'run1', 'approve:o1', { approved: true });
     expect(done?.status).toBe('completed');
     expect(done?.output).toEqual({ status: 'shipped', chargeId: 'ch_o1_4200' });
 
@@ -42,7 +48,7 @@ describe('checkout workflow (end-to-end)', () => {
 
     await workflows.start('checkout', { id: 'o2', total: 999 }, 'run2');
     await workflows.waitForRun('run2');
-    const done = await signalWhenReady(workflows, 'approve:o2', { approved: false });
+    const done = await signalAndSettle(workflows, 'run2', 'approve:o2', { approved: false });
 
     expect(done?.status).toBe('completed');
     expect(done?.output).toMatchObject({ status: 'rejected' });

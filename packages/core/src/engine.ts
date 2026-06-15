@@ -218,6 +218,8 @@ export class WorkflowEngine {
   private readonly interceptors: StepInterceptor[] = [];
   /** Callbacks notified (on any instance) when a run is cancelled — for cooperative cancellation. */
   private readonly cancelListeners = new Set<(runId: string) => void>();
+  /** Callbacks notified when a run is enqueued elsewhere — for low-latency cross-pod dispatch. */
+  private readonly enqueuedListeners = new Set<(runId: string) => void>();
   /** Notified when a run is dead-lettered (moved to `dead`) — a hook for a DLQ handler. */
   private readonly deadListeners = new Set<(run: WorkflowRun) => void>();
   /** Validators gating `engine.update`, keyed by `<workflow>:<updateName>`. */
@@ -287,8 +289,28 @@ export class WorkflowEngine {
         this.deliver({ ...msg.event, at: new Date(msg.event.at) });
       } else if (msg.kind === 'cancel') {
         this.notifyCancelled(msg.runId);
+      } else if (msg.kind === 'enqueued') {
+        // A run was enqueued on another instance — let worker subscribers pick it up immediately
+        // instead of waiting for the next poll. (Self-broadcasts are already filtered above.)
+        for (const fn of this.enqueuedListeners) {
+          try {
+            fn(msg.runId);
+          } catch {
+            /* an enqueue listener must not break the engine */
+          }
+        }
       }
     });
+  }
+
+  /**
+   * Be notified when a run is enqueued on ANOTHER instance (via the control plane), so a worker can
+   * pick it up at once — e.g. `engine.onEnqueued((runId) => engine.runOne(runId))`. Returns an
+   * unsubscribe function. Only wire this on instances that should execute runs (workers).
+   */
+  onEnqueued(listener: (runId: string) => void): () => void {
+    this.enqueuedListeners.add(listener);
+    return () => this.enqueuedListeners.delete(listener);
   }
 
   /** Fire cooperative-cancellation listeners for `runId` (a worker bridge aborts in-flight work). */
@@ -490,6 +512,13 @@ export class WorkflowEngine {
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
     await this.runDispatcher.dispatch(runId);
+    // Nudge worker instances to pick it up now instead of on their next poll (no-op without a control
+    // plane; self-receipt is filtered, so it only helps OTHER pods — e.g. an API pod's enqueue).
+    if (this.controlPlane) {
+      void this.controlPlane
+        .publishControl({ kind: 'enqueued', runId, from: this.instanceId })
+        .catch(() => undefined);
+    }
     return { runId, status: 'pending' };
   }
 
@@ -790,7 +819,12 @@ export class WorkflowEngine {
 
   async signal(token: string, payload: unknown): Promise<RunResult | null> {
     const waiter = await this.store.takeSignalWaiter(token);
-    if (!waiter) return null;
+    if (!waiter) {
+      // No one is waiting yet — buffer it so the next `waitForSignal(token)` consumes it instead of
+      // dropping it (reliable signals; the basis of `signalWithStart`).
+      await this.store.bufferSignal(token, payload);
+      return null;
+    }
     await this.store.saveCheckpoint(
       instantCheckpoint({
         runId: waiter.runId,
@@ -801,6 +835,28 @@ export class WorkflowEngine {
       }),
     );
     return this.resume(waiter.runId);
+  }
+
+  /**
+   * Ensure a run exists for `runId`, then deliver a signal to it — atomically race-free thanks to
+   * signal buffering: if the run is new (or busy / not yet waiting), the signal is buffered and
+   * consumed when it reaches `waitForSignal(token)`. The canonical **durable-entity / accumulator**
+   * pattern: one long-lived run per key (the `runId`) that loops on `waitForSignal`, fed events by
+   * many `signalWithStart` calls. `start` is idempotent by `runId`, so concurrent callers converge on
+   * one run. (Use a per-run `token`, e.g. derived from `runId`, so the signal targets this entity.)
+   */
+  async signalWithStart(
+    workflow: WorkflowRef,
+    input: unknown,
+    runId: string,
+    signal: { token: string; payload?: unknown },
+    opts?: StartOptions,
+  ): Promise<{ runId: string }> {
+    // `start` is overloaded per ref kind (class | string); a `WorkflowRef` union fits neither
+    // overload, so resolve to the string overload (the engine handles both at runtime).
+    await this.start(workflow as string, input, runId, opts); // idempotent: no-op if run exists
+    await this.signal(signal.token, signal.payload);
+    return { runId };
   }
 
   /**
@@ -838,6 +894,11 @@ export class WorkflowEngine {
   async cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
     const run = await this.store.getRun(runId);
     if (!run) return null;
+    // Already finished — nothing to cancel (and don't clobber a completed/dead run). This also stops
+    // the child cascade below from looping on already-cancelled runs.
+    if (run.status === 'completed' || run.status === 'cancelled' || run.status === 'dead') {
+      return { runId, status: run.status, output: run.output, error: run.error };
+    }
     // Compensating cancel: resume the run with a cancellation pending — replay re-registers the saga,
     // and at the suspension point execute() runs the undo and marks it cancelled. Run that resume in
     // the BACKGROUND so the caller (e.g. an HTTP request) never blocks on replaying the workflow +
@@ -855,11 +916,13 @@ export class WorkflowEngine {
           .then(() => this.notifyCancelled(runId))
           .catch(() => undefined);
       });
+      await this.cancelChildren(runId, opts);
       return { runId, status: run.status };
     }
     const error = { message: 'cancelled' };
     await this.store.updateRun(runId, { status: 'cancelled', error, updatedAt: new Date() });
     this.emit({ type: 'run.failed', runId, workflow: run.workflow, error });
+    await this.cancelChildren(runId, opts);
     // Notify local cancel listeners now (a worker on this pod), and broadcast so the instance/worker
     // actually running this run learns of it and can abort cooperatively (the store already records
     // `cancelled`, but a busy worker won't re-read it).
@@ -870,6 +933,26 @@ export class WorkflowEngine {
         .catch(() => undefined);
     }
     return { runId, status: 'cancelled', error };
+  }
+
+  /**
+   * Cascade cancellation to a run's children — both awaited (`ctx.child`, found via its live
+   * `child:<id>` waiter) and fire-and-forget (`ctx.startChild`, found via its `spawn:<id>`
+   * checkpoint). Recursive, so a whole subtree is cancelled; the terminal guard in `cancel` stops it
+   * at finished / already-cancelled runs (no loops, no re-cancel).
+   */
+  private async cancelChildren(
+    parentRunId: string,
+    opts?: { compensate?: boolean },
+  ): Promise<void> {
+    const childIds = new Set<string>();
+    for (const w of await this.store.listSignalWaiters('child:')) {
+      if (w.runId === parentRunId) childIds.add(w.token.slice('child:'.length));
+    }
+    for (const cp of await this.store.listCheckpoints(parentRunId)) {
+      if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') childIds.add(cp.output);
+    }
+    for (const id of childIds) await this.cancel(id, opts).catch(() => undefined);
   }
 
   /** Checkpoint a finished step and announce it — the two things that must always happen together. */

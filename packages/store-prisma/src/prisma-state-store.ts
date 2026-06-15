@@ -58,12 +58,19 @@ interface WaiterRow {
   seq: number;
 }
 
+interface BufferedSignalRow {
+  id: bigint;
+  token: string;
+  payload: unknown;
+}
+
 // Prisma's per-model query args are generated generics; left as `any` at this single boundary.
 type Args = any;
 
 interface Delegate<Row> {
   create(args: Args): Promise<Row>;
   findUnique(args: Args): Promise<Row | null>;
+  findFirst(args?: Args): Promise<Row | null>;
   findMany(args?: Args): Promise<Row[]>;
   update(args: Args): Promise<Row>;
   updateMany(args: Args): Promise<{ count: number }>;
@@ -75,6 +82,7 @@ export interface DurablePrismaClient {
   durableWorkflowRun: Delegate<RunRow>;
   durableStepCheckpoint: Delegate<CheckpointRow>;
   durableSignalWaiter: Delegate<WaiterRow>;
+  durableBufferedSignal: Delegate<BufferedSignalRow>;
 }
 
 /**
@@ -215,6 +223,20 @@ export class PrismaStateStore implements StateStore {
       where: { token: { startsWith: prefix } },
     });
     return rows.map((r) => ({ token: r.token, runId: r.runId, seq: r.seq }));
+  }
+
+  async bufferSignal(token: string, payload: unknown): Promise<void> {
+    await this.db.durableBufferedSignal.create({ data: { token, payload: jsonOrNull(payload) } });
+  }
+
+  async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
+    const row = await this.db.durableBufferedSignal.findFirst({
+      where: { token },
+      orderBy: { id: 'asc' },
+    });
+    if (!row) return null;
+    await this.db.durableBufferedSignal.delete({ where: { id: row.id } });
+    return { payload: row.payload ?? undefined };
   }
 }
 

@@ -108,6 +108,20 @@ export class InMemoryStateStore implements StateStore {
       .map((w) => ({ ...w }));
   }
 
+  private readonly bufferedSignals = new Map<string, unknown[]>();
+  async bufferSignal(token: string, payload: unknown): Promise<void> {
+    const queue = this.bufferedSignals.get(token) ?? [];
+    queue.push(payload);
+    this.bufferedSignals.set(token, queue);
+  }
+  async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
+    const queue = this.bufferedSignals.get(token);
+    if (!queue || queue.length === 0) return null;
+    const payload = queue.shift();
+    if (queue.length === 0) this.bufferedSignals.delete(token);
+    return { payload };
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     let runs = [...this.runs.values()];
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
