@@ -25,6 +25,35 @@ describe('runSchedules', () => {
     expect((await store.getRun('sched:beat:2'))?.output).toBe('tick');
   });
 
+  it('skips a paused schedule', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    let runs = 0;
+    engine.register('beat', '1', async () => void (runs += 1));
+    await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000, paused: true }], 1000);
+    expect(runs).toBe(0);
+  });
+
+  it('overlap:"skip" does not start a window while the previous run is still in-flight', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    let started = 0;
+    engine.register('slow', '1', async (ctx) => {
+      await ctx.step('enter', async () => void (started += 1)); // once-only (checkpointed)
+      await ctx.waitForSignal('go'); // stays in-flight (suspended)
+    });
+    const sched = [{ key: 's', workflow: 'slow', everyMs: 1000, overlap: 'skip' as const }];
+
+    await runSchedules(engine, sched, 1000); // bucket 1 → starts, suspends on signal
+    expect(started).toBe(1);
+    await runSchedules(engine, sched, 2000); // bucket 2 → prev (bucket 1) still in-flight → skip
+    expect(started).toBe(1);
+
+    await engine.signal('go', undefined); // bucket 1 completes
+    await runSchedules(engine, sched, 3000); // bucket 3 → prev (bucket 2) never ran → starts
+    expect(started).toBe(2);
+  });
+
   it('fires a cron schedule once per scheduled time (idempotent within the interval)', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
