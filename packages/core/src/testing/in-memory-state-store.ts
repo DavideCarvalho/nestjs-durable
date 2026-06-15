@@ -48,6 +48,14 @@ export class InMemoryStateStore implements StateStore {
     return [...this.runs.values()].filter((r) => r.status === 'running').map((r) => ({ ...r }));
   }
 
+  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+    return [...this.runs.values()]
+      .filter((r) => r.status === 'pending')
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id))
+      .slice(0, limit)
+      .map((r) => ({ ...r }));
+  }
+
   async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
     return [...this.runs.values()]
       .filter((r) => r.status === 'suspended' && r.wakeAt !== undefined && r.wakeAt <= nowMs)

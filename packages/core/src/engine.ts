@@ -629,7 +629,9 @@ export class WorkflowEngine {
    * {@link resumeDueTimers}.
    */
   async runPending(nowMs: number = this.clock()): Promise<RunResult[]> {
-    return this.resumeLeased(await this.store.listRuns({ status: 'pending', limit: 100 }), nowMs);
+    // Oldest-first (FIFO), capped per call so a backlog drains over several polls without one sweep
+    // fetching unboundedly. A run not picked up this tick is picked up the next.
+    return this.resumeLeased(await this.store.listPendingRuns(100), nowMs);
   }
 
   /**
@@ -669,9 +671,15 @@ export class WorkflowEngine {
           if (run && isSettled(run.status)) finish(run);
         });
       };
-      // Subscribe BEFORE the initial read so a run that settles in between isn't missed.
+      // React only to this run's settling events (not its every step event), and subscribe BEFORE the
+      // initial read so a run that settles in between isn't missed.
       off = this.subscribe((ev) => {
-        if (ev.runId === runId) check();
+        if (
+          ev.runId === runId &&
+          (ev.type === 'run.completed' || ev.type === 'run.failed' || ev.type === 'run.suspended')
+        ) {
+          check();
+        }
       });
       check();
     });
@@ -895,22 +903,23 @@ export class WorkflowEngine {
   }
 
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
+    const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
+    // First execution of an enqueued run: mark it running and announce the start, BEFORE the singleton
+    // gate — `admitSingleton` only counts `running`/`suspended` runs, so a still-`pending` run could
+    // never be admitted. A resumed run is already past `pending`, so this fires exactly once.
+    if (run.status === 'pending') {
+      await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
+      run.status = 'running';
+      this.emit({ type: 'run.started', runId: run.id, workflow: run.workflow });
+    }
     // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
-    const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
     if (registered?.singleton && !(await this.admitSingleton(run, registered.singleton))) {
       const wakeAt = this.clock() + SINGLETON_RETRY_MS;
       await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
       this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
       await this.store.releaseRunLock(run.id);
       return { runId: run.id, status: 'suspended' };
-    }
-    // First execution of an enqueued run: mark it running and announce the start (a resumed run is
-    // already past `pending`, so this fires exactly once, when the body actually begins).
-    if (run.status === 'pending') {
-      await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
-      run.status = 'running';
-      this.emit({ type: 'run.started', runId: run.id, workflow: run.workflow });
     }
     // Saga compensations registered by completed steps; run in reverse if the run later fails.
     const compensations: Compensation[] = [];

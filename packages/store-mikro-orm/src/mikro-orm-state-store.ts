@@ -61,6 +61,16 @@ export class MikroOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
+  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+    const em = this.orm.em.fork();
+    const rows = await em.find(
+      WorkflowRunEntity,
+      { status: 'pending' },
+      { orderBy: { createdAt: 'asc' }, limit }, // FIFO dispatch
+    );
+    return rows.map(fromRunEntity);
+  }
+
   async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
     const em = this.orm.em.fork();
     const rows = await em.find(WorkflowRunEntity, {

@@ -162,6 +162,9 @@ export interface StateStore {
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(): Promise<WorkflowRun[]>;
 
+  /** The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. */
+  listPendingRuns(limit: number): Promise<WorkflowRun[]>;
+
   /** Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume. */
   listDueTimers(nowMs: number): Promise<WorkflowRun[]>;
 

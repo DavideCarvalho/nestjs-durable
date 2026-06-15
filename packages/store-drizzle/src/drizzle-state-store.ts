@@ -66,6 +66,16 @@ export class DrizzleStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+    const rows = await this.db
+      .select()
+      .from(workflowRuns)
+      .where(eq(workflowRuns.status, 'pending'))
+      .orderBy(asc(workflowRuns.createdAt)) // FIFO dispatch
+      .limit(limit);
+    return rows.map(fromRunRow);
+  }
+
   async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
     const rows = await this.db
       .select()

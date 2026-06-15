@@ -71,6 +71,9 @@ export class CodecStateStore implements StateStore {
   async listIncompleteRuns(): Promise<WorkflowRun[]> {
     return (await this.inner.listIncompleteRuns()).map((r) => this.decRun(r));
   }
+  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+    return (await this.inner.listPendingRuns(limit)).map((r) => this.decRun(r));
+  }
   async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
     return (await this.inner.listDueTimers(nowMs)).map((r) => this.decRun(r));
   }
