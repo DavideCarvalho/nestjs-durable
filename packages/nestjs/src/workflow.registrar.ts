@@ -18,6 +18,7 @@ import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { getOnEvents, getWorkflowMeta, isDeadLetterHandler } from './decorators';
 import type { DurableModuleOptions } from './durable.module';
 import { classValidatorInput } from './input-validation';
+import { type DurableStepInterceptor, isStepInterceptor } from './step-interceptor';
 
 interface WorkflowInstance {
   run(ctx: WorkflowCtx, input: unknown): Promise<unknown>;
@@ -67,6 +68,10 @@ export class WorkflowRegistrar
     for (const wrapper of this.discovery.getProviders()) {
       const { instance } = wrapper;
       if (!instance || typeof instance !== 'object') continue;
+      if (isStepInterceptor(instance.constructor)) {
+        const interceptor = instance as DurableStepInterceptor;
+        this.engine.use((invocation, next) => interceptor.intercept(invocation, next));
+      }
       const meta = getWorkflowMeta(instance.constructor);
       if (!meta) continue;
       const workflow = instance as WorkflowInstance;

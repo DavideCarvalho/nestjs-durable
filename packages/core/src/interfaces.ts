@@ -563,3 +563,27 @@ export interface EngineEvent {
 }
 
 export type EngineListener = (event: EngineEvent) => void;
+
+/** What a {@link StepInterceptor} is told about the local step it is wrapping. */
+export interface StepInvocation {
+  readonly runId: string;
+  readonly workflow: string;
+  /** The step name passed to `ctx.step(name, ...)` (also `'now'`/`'random'`/`'uuid'` internals). */
+  readonly stepName: string;
+  /** The step's logical position within the run. */
+  readonly seq: number;
+  /** 1-based attempt number — increments across `ctx.step` retries. */
+  readonly attempt: number;
+}
+
+/**
+ * Wraps the **real execution** of a local `ctx.step` (Template/Nest-style onion middleware). Call
+ * `next()` to run the step body (or the next interceptor) and return — or transform — its result;
+ * throw to fail the step. First-registered runs outermost. Interceptors fire only when a step
+ * actually executes, NOT on replay (a replayed step returns its recorded output without running),
+ * so they see true execution timing. Register with `engine.use`.
+ */
+export type StepInterceptor = (
+  invocation: StepInvocation,
+  next: () => Promise<unknown>,
+) => Promise<unknown>;
