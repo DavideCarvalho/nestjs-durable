@@ -23,5 +23,17 @@ export function createStepLogger(events: StepEvent[], now: () => number): StepLo
         status,
         ...(data === undefined ? {} : { data }),
       }),
+    subEvent: (e) =>
+      events.push({
+        at: now(),
+        level: e.status === 'failed' ? 'error' : e.status === 'skipped' ? 'warn' : 'info',
+        message: e.message ?? e.phase ?? e.name,
+        subId: e.id,
+        name: e.name,
+        ...(e.group === undefined ? {} : { group: e.group }),
+        ...(e.phase === undefined ? {} : { phase: e.phase }),
+        ...(e.status === undefined ? {} : { status: e.status }),
+        ...(e.data === undefined ? {} : { data: e.data }),
+      }),
   };
 }
