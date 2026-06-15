@@ -45,6 +45,33 @@ def _names(prefix: str, group: str) -> tuple[str, str]:
     return f"{prefix}-tasks-{group}", f"{prefix}-results"
 
 
+async def run_redis_workflow_worker(
+    workflow_worker: Any,
+    *,
+    group: str,
+    connection: str = "redis://localhost:6379",
+    prefix: str = "durable",
+) -> Any:
+    """Start a BullMQ worker that REPLAYS workflow tasks. Consumes the group's task queue (each job is
+    a WorkflowTask) and publishes the resulting WorkflowDecision on ``<prefix>-decisions`` — the queues
+    the engine's remote workflow executor dispatches over. Returns the bullmq Worker (``await
+    worker.close()`` to stop). Replay is sync + pure, so this is a thin transport shell over
+    ``workflow_worker.process_task``."""
+    from bullmq import Queue as BullQueue
+    from bullmq import Worker as BullWorker
+
+    tasks_name = f"{prefix}-tasks-{group}"
+    decisions = BullQueue(f"{prefix}-decisions", {"connection": connection})
+
+    async def process(job: Any, _token: str) -> None:
+        decision = workflow_worker.process_task(job.data)
+        await decisions.add(
+            "decision", decision, {"removeOnComplete": True, "removeOnFail": True}
+        )
+
+    return BullWorker(tasks_name, process, {"connection": connection})
+
+
 def _control_channel(prefix: str) -> str:
     # Mirrors BullMQTransport.controlChannel(): '<prefix>-control'.
     return f"{prefix}-control"

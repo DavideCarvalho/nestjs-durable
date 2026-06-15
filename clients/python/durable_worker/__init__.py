@@ -8,6 +8,13 @@ same step name implemented here is callable from a TypeScript workflow via ``ctx
 from .cancellation import Cancelled, CancellationRegistry
 from .redis_runner import redis_url_from_env, run_redis_worker
 from .routing import reply_target
+from .workflow import (
+    NondeterminismError,
+    StepFailed,
+    WorkflowContext,
+    WorkflowError,
+    WorkflowWorker,
+)
 from .worker import (
     FatalError,
     StepContext,
@@ -33,5 +40,11 @@ __all__ = [
     # Transport bootstrap helpers.
     "run_redis_worker",
     "redis_url_from_env",
+    # Author durable workflows in Python (coordinator-driven — the engine owns the durable state).
+    "WorkflowWorker",
+    "WorkflowContext",
+    "WorkflowError",
+    "NondeterminismError",
+    "StepFailed",
 ]
-__version__ = "0.4.0"
+__version__ = "0.5.0"

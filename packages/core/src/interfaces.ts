@@ -57,7 +57,9 @@ export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
 
 /**
  * The recorded result of a single step at a deterministic logical position (`seq`).
- * On replay, a present checkpoint means the step is NOT re-executed — its `output` is returned.
+ * On replay, a `completed` checkpoint means the step is NOT re-executed — its `output` is
+ * returned. A non-terminal checkpoint (`pending`/`running`) does not short-circuit: the step is
+ * re-awaited (remote) or re-run (local).
  */
 export interface StepCheckpoint {
   runId: string;
@@ -71,8 +73,11 @@ export interface StepCheckpoint {
   /**
    * `pending` = a remote step dispatched and awaiting its worker result (the run is durably
    * suspended, not held in memory); it becomes `completed`/`failed` when the result arrives.
+   * `running` = a local step whose body is executing in-process right now (see `trackStepStart`);
+   * it's overwritten by `completed`/`failed` when the body settles, and on a crash mid-body it
+   * simply re-runs on replay (only `completed` short-circuits).
    */
-  status: 'pending' | 'completed' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'failed';
   /** What the step was called with — the `ctx.call` args for a remote step (a local step has none). */
   input?: unknown;
   output?: unknown;
@@ -304,6 +309,92 @@ export interface Heartbeat {
   seq: number;
   stepId: string;
   group: string;
+}
+
+// ---------------------------------------------------------------------------
+// Polyglot workflows — the workflow-task / commands protocol
+//
+// A workflow authored in a non-TS SDK (e.g. Python) runs coordinator-driven: the engine stays the
+// sole owner of the durable state + recovery/timers and advances the run one TURN at a time by
+// dispatching a {@link WorkflowTask} (the run's history) to a workflow worker, which REPLAYS the
+// function locally and returns a {@link WorkflowDecision} (the commands it produced). The engine
+// applies the decision (persist checkpoints, dispatch steps, schedule timers, settle the run). The
+// worker never touches the store. See docs/plans/2026-06-15-polyglot-workflows-protocol.md.
+// ---------------------------------------------------------------------------
+
+/** engine → workflow worker: advance this run one turn by replaying the function against `history`. */
+export interface WorkflowTask {
+  /** Dedupe id for this turn (a re-delivered task must be idempotent). */
+  taskId: string;
+  runId: string;
+  /** Registered workflow name + the version the run started on — replay must use that version. */
+  workflow: string;
+  workflowVersion: string;
+  input: unknown;
+  /** Completed durable ops so far, ordered by seq — what the worker replays its results from. */
+  history: HistoryEvent[];
+  /** Signals delivered to the run but not yet consumed, so `wait_signal` resolves on replay. */
+  pendingSignals?: Array<{ seq: number; signal: string; payload: unknown }>;
+  group: string;
+  /** Id of the transport this task was dispatched on (pool failover) — see {@link NamedTransport}. */
+  transport?: string;
+  traceparent?: string;
+  attempt: number;
+}
+
+/** One resolved durable op in a run's history — a superset of a completed {@link StepCheckpoint}. */
+export interface HistoryEvent {
+  seq: number;
+  kind: 'step' | 'call' | 'timer' | 'signal' | 'child';
+  name?: string;
+  /** Resolved value: a step/call output, a child run's output, a signal payload. */
+  output?: unknown;
+  /** Set when the op resolved to a failure (e.g. a failed remote step the workflow may catch). */
+  error?: StepError;
+}
+
+/** A decision the workflow function produced at a `seq` that was not yet in history. */
+export type WorkflowCommand =
+  /** `ctx.call(remoteStep, input)` — dispatch a remote step and await it. */
+  | { kind: 'call'; seq: number; name: string; group: string; input: unknown }
+  /** `ctx.step(name, body)` — a LOCAL step the worker already ran this turn; the engine persists its
+   *  result so replay returns it instead of re-running (durability for side-effectful work). */
+  | { kind: 'recordStep'; seq: number; name: string; output?: unknown; error?: StepError }
+  /** `ctx.sleep(ms)` — a durable timer of `ms` duration. The engine computes the absolute deadline
+   *  (now + ms) when it applies the command, so the worker never reads the clock (determinism). */
+  | { kind: 'sleep'; seq: number; ms: number }
+  /** `ctx.wait_signal(name)` — block until a signal `name` is delivered to the run. */
+  | { kind: 'waitSignal'; seq: number; signal: string }
+  /** `ctx.start_child(workflow, input)` — start a child run with its own lifecycle. */
+  | { kind: 'startChild'; seq: number; workflow: string; input: unknown };
+
+/** workflow worker → engine: the result of replaying one turn of a remote workflow. */
+export interface WorkflowDecision {
+  taskId: string;
+  runId: string;
+  /** `continue` = produced `commands` and is blocked on an await; otherwise the run settles. */
+  status: 'continue' | 'completed' | 'failed';
+  /** New durable ops the replay produced this turn (status === 'continue'), ordered by seq. */
+  commands: WorkflowCommand[];
+  /** Final workflow output (status === 'completed'). */
+  output?: unknown;
+  /** Terminal error (status === 'failed'). */
+  error?: StepError;
+}
+
+/**
+ * Advances a workflow run one turn. The engine has one per workflow: the default {@link InProcess}
+ * one runs a registered TS function with the in-process replay machinery; a remote one dispatches a
+ * {@link WorkflowTask} to a worker (Python) and awaits its {@link WorkflowDecision}. Either way the
+ * engine applies the returned decision — so recovery, timers, singleton and dead-letter stay engine
+ * concerns, identical for in-process and remote workflows.
+ */
+export interface WorkflowExecutor {
+  advance(
+    run: WorkflowRun,
+    history: HistoryEvent[],
+    pendingSignals?: WorkflowTask['pendingSignals'],
+  ): Promise<WorkflowDecision>;
 }
 
 /**
