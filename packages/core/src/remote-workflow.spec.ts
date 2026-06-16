@@ -174,6 +174,76 @@ describe('WorkflowEngine — remote (polyglot) workflows', () => {
     expect(run.error?.message).toBe('workflow blew up');
   });
 
+  it('records local steps that ran on the SAME turn the workflow completes (single-turn inline body)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
+    // A workflow whose entire body is inline ctx.step()s and never suspends — it returns `completed`
+    // on the first turn WITH the recordStep commands, never passing through a `continue`/suspend turn.
+    engine.registerRemote('inline', '1', {
+      group: 'py-workflows',
+      executor: {
+        async advance(run: WorkflowRun): Promise<WorkflowDecision> {
+          return {
+            taskId: 't',
+            runId: run.id,
+            status: 'completed',
+            commands: [
+              { kind: 'recordStep', seq: 0, name: 'handle_a', output: { a: 1 } },
+              { kind: 'recordStep', seq: 1, name: 'handle_b', output: { b: 2 } },
+            ],
+            output: { done: true },
+          };
+        },
+      },
+    });
+
+    await startRun(engine, 'inline', {}, 'inline1');
+    const run = await settle(store, 'inline1');
+    expect(run.status).toBe('completed');
+
+    // The steps the completing turn ran must be persisted (not silently dropped) so they're visible.
+    const cps = await store.listCheckpoints('inline1');
+    const a = cps.find((c) => c.seq === 0);
+    const b = cps.find((c) => c.seq === 1);
+    expect(a?.name).toBe('handle_a');
+    expect(a?.kind).toBe('local');
+    expect(a?.status).toBe('completed');
+    expect(b?.name).toBe('handle_b');
+    expect(b?.status).toBe('completed');
+    expect(b?.output).toEqual({ b: 2 });
+  });
+
+  it('records steps from a turn that ends in failure — including the failed step', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
+    engine.registerRemote('partial', '1', {
+      group: 'py-workflows',
+      executor: {
+        async advance(run: WorkflowRun): Promise<WorkflowDecision> {
+          return {
+            taskId: 't',
+            runId: run.id,
+            status: 'failed',
+            commands: [
+              { kind: 'recordStep', seq: 0, name: 'handle_ok', output: { ok: true } },
+              { kind: 'recordStep', seq: 1, name: 'handle_bad', error: { message: 'boom' } },
+            ],
+            error: { message: 'boom' },
+          };
+        },
+      },
+    });
+
+    await startRun(engine, 'partial', {}, 'partial1');
+    const run = await settle(store, 'partial1');
+    expect(run.status).toBe('failed');
+
+    const cps = await store.listCheckpoints('partial1');
+    expect(cps.find((c) => c.seq === 0)?.status).toBe('completed');
+    expect(cps.find((c) => c.seq === 1)?.status).toBe('failed');
+    expect(cps.find((c) => c.seq === 1)?.error?.message).toBe('boom');
+  });
+
   it('suspends a remote workflow on ctx.wait_signal and resumes it when the signal arrives', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
