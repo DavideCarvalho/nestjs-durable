@@ -62,21 +62,37 @@ export function durableTimeseriesProvider(): DataProvider {
   };
 }
 
-/** Source C: recent failed + dead runs as table rows (newest first). */
+/**
+ * Source C: recent failed + dead runs as table rows (newest first), time-bounded.
+ * Only failures updated within `query.windowMs` (default 24h) are returned, so a
+ * healthy system shows an EMPTY table instead of surfacing days-old failures as if
+ * they were a live incident. `windowMs: 0` disables the window (return all). Each
+ * row carries a compact `updatedAt` stamp so recency is visible in the table.
+ */
 export function durableRecentFailuresProvider(): DataProvider {
   return {
     name: 'durable.recentFailures',
     async resolve(query, ctx: ExtensionContext) {
       const store = ctx.moduleRef.get(STATE_STORE, { strict: false }) as StateStore;
       const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
+      const windowMs = query?.windowMs === undefined ? 24 * 60 * 60 * 1000 : Number(query.windowMs);
+      const cutoff = windowMs > 0 ? Date.now() - windowMs : 0;
       const [failed, dead] = await Promise.all([
         store.listRuns({ status: 'failed', limit }),
         store.listRuns({ status: 'dead', limit }),
       ]);
       const rows = [...failed, ...dead]
+        .filter((r) => +new Date(r.updatedAt) >= cutoff)
         .sort((a, b) => +new Date(b.updatedAt) - +new Date(a.updatedAt))
         .slice(0, limit)
-        .map((r) => ({ workflow: r.workflow, runId: r.id, error: r.error?.message ?? '' }));
+        .map((r) => ({
+          // Compact UTC stamp ("YYYY-MM-DD HH:mm Z"); the generic table renderer
+          // prints column values as-is, so we format here.
+          updatedAt: `${new Date(r.updatedAt).toISOString().replace('T', ' ').slice(0, 16)}Z`,
+          workflow: r.workflow,
+          runId: r.id,
+          error: r.error?.message ?? '',
+        }));
       return { rows };
     },
   };

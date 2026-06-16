@@ -8,7 +8,9 @@ import {
 import { durableDashboard } from './durable-dashboard.spec-data';
 
 /** The first-class Telescope extension for nestjs-durable: watcher + Workflows dashboard. */
-export function durableTelescopeExtension(opts: { runHref?: string } = {}) {
+export function durableTelescopeExtension(
+  opts: { runHref?: string; recentFailuresWindowMs?: number } = {},
+) {
   return defineTelescopeExtension({
     name: 'durable',
     watchers: () => [new DurableTelescopeWatcher()],

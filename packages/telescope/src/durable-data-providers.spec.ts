@@ -35,7 +35,7 @@ describe('durableStateProvider', () => {
 });
 
 describe('durableRecentFailuresProvider', () => {
-  it('returns failed+dead runs as rows, newest first', async () => {
+  it('returns failed+dead rows newest-first with an updatedAt stamp (windowMs:0 = all)', async () => {
     const provider = durableRecentFailuresProvider();
     const store = {
       listRuns: async ({ status }: { status?: string }) =>
@@ -45,8 +45,34 @@ describe('durableRecentFailuresProvider', () => {
             ? [{ id: 'd1', workflow: 'ship', error: { message: 'dead' }, updatedAt: new Date(2000) }]
             : [],
     };
-    const result = (await provider.resolve(undefined, ctxWith(store))) as { rows: Array<Record<string, unknown>> };
-    expect(result.rows[0]).toEqual({ workflow: 'ship', runId: 'd1', error: 'dead' });
-    expect(result.rows[1]).toEqual({ workflow: 'checkout', runId: 'f1', error: 'boom' });
+    const result = (await provider.resolve({ windowMs: 0 }, ctxWith(store))) as {
+      rows: Array<Record<string, unknown>>;
+    };
+    expect(result.rows[0]).toEqual({
+      updatedAt: '1970-01-01 00:00Z',
+      workflow: 'ship',
+      runId: 'd1',
+      error: 'dead',
+    });
+    expect(result.rows[1]?.runId).toBe('f1');
+  });
+
+  it('filters out failures older than the window (default 24h)', async () => {
+    const provider = durableRecentFailuresProvider();
+    const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    const recent = new Date(Date.now() - 1 * 60 * 60 * 1000);
+    const store = {
+      listRuns: async ({ status }: { status?: string }) =>
+        status === 'failed'
+          ? [
+              { id: 'old', workflow: 'a', error: { message: 'x' }, updatedAt: old },
+              { id: 'new', workflow: 'b', error: { message: 'y' }, updatedAt: recent },
+            ]
+          : [],
+    };
+    const result = (await provider.resolve(undefined, ctxWith(store))) as {
+      rows: Array<Record<string, unknown>>;
+    };
+    expect(result.rows.map((r) => r.runId)).toEqual(['new']);
   });
 });
