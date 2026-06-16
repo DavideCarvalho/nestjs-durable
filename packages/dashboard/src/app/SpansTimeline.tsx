@@ -1,9 +1,31 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQueries, useQuery } from '@tanstack/react-query';
 import { useMemo, useState } from 'react';
 import type { StepCheckpoint, WorkflowRun } from '../client/durable-client';
 import { durableClient } from '../client/durable-client';
 import { childRunIdOf } from './child-link';
 import { ChildIcon, iconFor } from './icons';
+
+/** Fetch the workflow name of each child-ref step in a timeline, so a child row reads the child's
+ *  real workflow name instead of the raw `signal:child:<id>` / `spawn:<id>` checkpoint name. */
+function useChildWorkflowNames(timeline: StepCheckpoint[]): Record<string, string> {
+  const ids = useMemo(() => {
+    const set = new Set<string>();
+    for (const step of timeline) {
+      const childId = childRunIdOf(step);
+      if (childId !== undefined) set.add(childId);
+    }
+    return [...set].sort();
+  }, [timeline]);
+  const results = useQueries({
+    queries: ids.map((id) => ({ queryKey: ['run', id], queryFn: () => durableClient.run(id) })),
+  });
+  const map: Record<string, string> = {};
+  ids.forEach((id, index) => {
+    const workflow = results[index]?.data?.run.workflow;
+    if (workflow) map[id] = workflow;
+  });
+  return map;
+}
 
 function fmtDur(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
@@ -49,18 +71,12 @@ export function RunSpans({
     const live = run.status === 'running' || run.status === 'suspended';
     const tEnd = Math.max(...ends, live ? Date.now() : t0 + 1);
     const span = Math.max(tEnd - t0, 1);
-    // In a durable workflow the time lives in the WAIT between checkpoints (a step itself — a
-    // dispatch, a received signal — is ~0ms). So each bar spans from the previous checkpoint to
-    // this one: that's the wall-clock spent reaching it (e.g. dispatch→signal = the phase wait).
-    let prev = t0;
+    // Each bar spans the step's own execution window [startedAt, finishedAt] — a true gantt, so a
+    // bar's width is the step's real duration (matches per-step/handler timing) and the waits between
+    // steps read as gaps. Sub-process bars are placed within that same window.
     const rows = timeline.map((s) => {
-      const end = new Date(s.finishedAt).getTime();
-      const start = prev;
-      prev = end;
-      // Sub-process spans: each sub-process event carries its completion `at`. Render consecutive
-      // bars across the step's own [startedAt, finishedAt] window, so a step that fans out into
-      // sub-processes (e.g. parallel p-processes) reads as a mini-waterfall, not one opaque bar.
       const stepStart = new Date(s.startedAt).getTime();
+      const end = new Date(s.finishedAt).getTime();
       let subPrev = stepStart;
       const subRows = (s.events ?? [])
         .filter((e) => e.status)
@@ -80,9 +96,9 @@ export function RunSpans({
         });
       return {
         step: s,
-        left: ((start - t0) / span) * 100,
-        width: Math.max(((end - start) / span) * 100, 0.8),
-        ms: end - start,
+        left: ((stepStart - t0) / span) * 100,
+        width: Math.max(((end - stepStart) / span) * 100, 0.8),
+        ms: end - stepStart,
         subRows,
       };
     });
@@ -101,6 +117,7 @@ export function RunSpans({
       }
       return next;
     });
+  const childNames = useChildWorkflowNames(timeline);
 
   return (
     <>
@@ -173,7 +190,11 @@ export function RunSpans({
                 >
                   <Icon width={12} height={12} />
                 </span>
-                <span className="truncate text-[12px] text-zinc-300">{step.name}</span>
+                <span className="truncate text-[12px] text-zinc-300">
+                  {childRunId !== undefined
+                    ? (childNames[childRunId] ?? 'child workflow')
+                    : step.name}
+                </span>
                 {isChild && childRunId !== undefined && (
                   <button
                     type="button"
