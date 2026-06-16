@@ -30,8 +30,11 @@ type StepData = {
   duration?: string;
   subs?: SubCounts;
   selected: boolean;
-  /** When this step ran a child workflow, the child's run id — clicking the node opens it. */
+  /** When this step ran a child workflow, the child's run id. Clicking the node opens its detail
+   *  like any other step; only the `child ↗` badge navigates to the child run. */
   childRunId?: string;
+  /** Navigate to the child run — invoked only by the `child ↗` badge, not a node-body click. */
+  onOpenRun?: (id: string) => void;
 };
 type EndData = { status: RunDisplayStatus; label: string };
 
@@ -98,9 +101,19 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
         </div>
         <div className="mono mt-1.5 flex items-center gap-1.5 text-[10px] text-zinc-500">
           {isChild ? (
-            <span className="rounded border border-indigo-500/30 bg-indigo-500/10 px-1 text-indigo-300">
+            <button
+              type="button"
+              onClick={(e) => {
+                // Don't let it bubble to the node-body click (which opens the detail); the badge is
+                // the dedicated "go to the child run" affordance.
+                e.stopPropagation();
+                if (data.childRunId) data.onOpenRun?.(data.childRunId);
+              }}
+              title="Open the child run"
+              className="rounded border border-indigo-500/30 bg-indigo-500/10 px-1 text-indigo-300 transition-colors hover:border-indigo-400/60 hover:bg-indigo-500/20 hover:text-indigo-200"
+            >
               child ↗
-            </span>
+            </button>
           ) : (
             <span className="rounded border border-[var(--line)] px-1 text-zinc-400">
               {data.kind}
@@ -207,6 +220,7 @@ export function WorkflowGraph({
         subs: subCounts(s),
         selected: selected === s.seq,
         childRunId: childRunIdOf(s),
+        onOpenRun,
       } satisfies StepData,
     }));
     const endNode: Node = {
@@ -241,17 +255,16 @@ export function WorkflowGraph({
       });
     }
     return { nodes: ordered, edges };
-  }, [run, timeline, fmtDuration, selected]);
+  }, [run, timeline, fmtDuration, selected, onOpenRun]);
 
   const onNodeClick = useCallback(
     (_: unknown, node: Node) => {
       if (node.type !== 'step') return;
-      const data = node.data as StepData;
-      // A child-workflow node drills into the child's run; any other step opens its detail.
-      if (data.childRunId) onOpenRun(data.childRunId);
-      else onSelect(data.seq);
+      // Every step — child workflows included — opens its detail on click. Navigating to a child's
+      // run is the `child ↗` badge's job (so you can inspect a child step without leaving the run).
+      onSelect((node.data as StepData).seq);
     },
-    [onSelect, onOpenRun],
+    [onSelect],
   );
 
   return (

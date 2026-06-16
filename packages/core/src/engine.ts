@@ -1077,9 +1077,16 @@ export class WorkflowEngine {
   }
 
   /**
-   * The ids of the runs a run spawned — both awaited (`ctx.child`, found via its live `child:<id>`
-   * waiter) and fire-and-forget (`ctx.startChild`, found via its `spawn:<id>` checkpoint). The
-   * canonical parent→children edge, used for both cancellation cascades and the dashboard run-tree.
+   * The ids of the runs a run spawned — both awaited (`ctx.child`) and fire-and-forget
+   * (`ctx.startChild`, found via its `spawn:<id>` checkpoint). The canonical parent→children edge,
+   * used for both cancellation cascades and the dashboard run-tree.
+   *
+   * An awaited child is discovered two ways, because the live `child:<id>` waiter only exists WHILE
+   * the parent is suspended on it: the waiter resolves and is consumed the moment the child settles,
+   * so a completed parent (or a completed awaited child) would otherwise drop out of the tree. The
+   * `signal:child:<id>` checkpoint (the placeholder written when the parent first awaits the child,
+   * overwritten as completed/failed when it settles) persists across completion, so we read both and
+   * dedupe — the edge stays stable for a finished run, not just a live one.
    */
   async getRunChildren(parentRunId: string): Promise<string[]> {
     const childIds = new Set<string>();
@@ -1087,6 +1094,7 @@ export class WorkflowEngine {
       if (w.runId === parentRunId) childIds.add(w.token.slice('child:'.length));
     }
     for (const cp of await this.store.listCheckpoints(parentRunId)) {
+      if (cp.name.startsWith('signal:child:')) childIds.add(cp.name.slice('signal:child:'.length));
       if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') childIds.add(cp.output);
     }
     return [...childIds];
