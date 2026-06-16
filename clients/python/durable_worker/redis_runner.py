@@ -129,7 +129,12 @@ async def run_redis_workflow_worker(
     decisions = BullQueue(f"{prefix}-decisions", {"connection": connection})
 
     async def process(job: Any, _token: str) -> None:
-        decision = workflow_worker.process_task(job.data)
+        # Replay OFF the event loop. `process_task` is fully synchronous and a real workflow turn can
+        # run for minutes (e.g. a body of inline ctx.step DB calls). Running it inline would block the
+        # loop that drives (a) this worker's liveness heartbeat — so it'd read as "0 live workers" mid-
+        # run — and (b) BullMQ's job-lock renewal — so the lock would lapse, the job stall, and BullMQ
+        # REDELIVER it (the workflow runs twice). `to_thread` keeps the loop free for both.
+        decision = await asyncio.to_thread(workflow_worker.process_task, job.data)
         await decisions.add(
             "decision", decision, {"removeOnComplete": True, "removeOnFail": True}
         )
