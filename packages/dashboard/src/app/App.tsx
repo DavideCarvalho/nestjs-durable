@@ -105,11 +105,54 @@ function Header({
         {chip('all', 'all', total)}
         {STATUSES.map((s) => chip(s, s, counts[s] ?? 0))}
       </div>
-      <div className="ml-auto flex items-center gap-2 text-xs text-zinc-500">
+      <WorkersHealth />
+      <div className="flex items-center gap-2 text-xs text-zinc-500">
         <span className="dot s-completed pulse" aria-hidden />
         live
       </div>
     </header>
+  );
+}
+
+/**
+ * Per-group worker health, one chip per group: the live-worker count, turning RED when work is
+ * queued but no worker is alive to drain it (`depth > 0 && liveWorkers === 0` — the "alive but not
+ * consuming" failure). Polls `/workers`; renders nothing when the transport can't report health.
+ */
+function WorkersHealth() {
+  const { data } = useQuery({
+    queryKey: ['workers'],
+    queryFn: () => durableClient.workers(),
+    refetchInterval: 10_000,
+  });
+  if (!data || data.length === 0) return null;
+  return (
+    <div className="ml-auto flex flex-wrap items-center gap-1.5">
+      {data.map((g) => {
+        const live = g.liveWorkers.length;
+        const starved = g.depth > 0 && live === 0;
+        return (
+          <span
+            key={g.group}
+            title={`${g.group}: ${live} live worker(s), ${g.depth} queued${starved ? ' — NO worker consuming' : ''}`}
+            className={`mono flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] ${
+              starved
+                ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
+                : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
+            }`}
+          >
+            <span
+              className={`dot ${starved ? 's-failed' : live > 0 ? 's-completed' : ''}`}
+              aria-hidden
+            />
+            {g.group}
+            <span className="tnum text-zinc-500">
+              {live}w{g.depth > 0 ? ` ${g.depth}q` : ''}
+            </span>
+          </span>
+        );
+      })}
+    </div>
   );
 }
 

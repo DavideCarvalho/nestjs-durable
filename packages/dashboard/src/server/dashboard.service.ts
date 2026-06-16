@@ -1,5 +1,6 @@
 import {
   type EngineEvent,
+  type GroupHealth,
   type MetricsCollector,
   type RunQuery,
   type RunResult,
@@ -55,12 +56,31 @@ export class DashboardService {
       `durable_running_runs ${running.length}`,
       '# TYPE durable_dead_runs gauge',
       `durable_dead_runs ${dead.length}`,
-    ].join('\n');
-    return `${this.metricsCollector.prometheus()}${gauges}\n`;
+    ];
+    // Per-group worker health: backlog vs. live workers. `depth>0 && live==0` is the alert (work
+    // piling up with no consumer) — expressible as a Prometheus rule on these two series.
+    const health = await this.engine.workerHealth();
+    if (health.length > 0) {
+      gauges.push('# TYPE durable_group_queue_depth gauge');
+      for (const h of health) {
+        gauges.push(`durable_group_queue_depth{group="${h.group}"} ${h.depth}`);
+      }
+      gauges.push('# TYPE durable_group_live_workers gauge');
+      for (const h of health) {
+        gauges.push(`durable_group_live_workers{group="${h.group}"} ${h.liveWorkers.length}`);
+      }
+    }
+    return `${this.metricsCollector.prometheus()}${gauges.join('\n')}\n`;
   }
 
   listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return this.store.listRuns(query);
+  }
+
+  /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. The
+   *  alert state a row turns red on is `depth > 0 && liveWorkers.length === 0`. */
+  workerHealth(): Promise<GroupHealth[]> {
+    return this.engine.workerHealth();
   }
 
   async getRunDetail(runId: string): Promise<RunDetail | null> {

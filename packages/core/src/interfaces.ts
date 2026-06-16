@@ -487,6 +487,36 @@ export interface Transport {
   dispatchWorkflowTask?(task: WorkflowTask): Promise<void>;
   /** workflow worker → engine: a replayed turn's {@link WorkflowDecision}. Pair with dispatchWorkflowTask. */
   onDecision?(handler: (decision: WorkflowDecision) => Promise<void>): void;
+  /** Worker-health for a group: queue backlog + live worker heartbeats. Optional — only broker
+   *  transports (BullMQ) that can introspect the task queue and the worker-heartbeat keys implement
+   *  it. The engine aggregates this across its groups in {@link WorkflowEngine.workerHealth}. */
+  groupHealth?(group: string): Promise<GroupHealth>;
+  /** Distinct groups that currently have a live worker heartbeat — discovered from the heartbeat
+   *  keyspace, so a group with workers but no engine-side registration (e.g. a local-step group)
+   *  still surfaces. Pairs with {@link groupHealth}. */
+  listWorkerGroups?(): Promise<string[]>;
+}
+
+/** One worker's liveness record — a TTL'd heartbeat a worker refreshes while it's consuming. Its
+ *  ABSENCE (the key expired) is the signal: a worker that died or stalled stops refreshing. */
+export interface WorkerHeartbeat {
+  /** The worker group this instance serves (e.g. `pipeline`, `processing-workflows`). */
+  group: string;
+  /** Stable per-process id (host + pid), so N replicas of a group each show as a distinct worker. */
+  instanceId: string;
+  /** Epoch ms of the worker's most recent heartbeat. */
+  lastBeatAt: number;
+}
+
+/** Per-group worker-health snapshot: how much work is queued vs. how many workers are alive to do it.
+ *  The actionable alert state is `depth > 0 && liveWorkers.length === 0` — work piling up with no
+ *  consumer (exactly the failure where a worker is "alive but not consuming"). */
+export interface GroupHealth {
+  group: string;
+  /** Outstanding jobs in the group's task queue (waiting + active + delayed + prioritized). */
+  depth: number;
+  /** Workers with a non-expired heartbeat for this group. */
+  liveWorkers: WorkerHeartbeat[];
 }
 
 /**

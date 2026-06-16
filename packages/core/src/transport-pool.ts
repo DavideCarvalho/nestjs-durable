@@ -1,4 +1,4 @@
-import type { Heartbeat, NamedTransport, RemoteTask, StepResult } from './interfaces';
+import type { GroupHealth, Heartbeat, NamedTransport, RemoteTask, StepResult } from './interfaces';
 
 /**
  * An ordered pool of named transports. The engine dispatches on the first and fails over to the
@@ -40,6 +40,33 @@ export class TransportPool {
       }
     }
     throw lastErr ?? new Error('no transport accepted the dispatch');
+  }
+
+  /** Worker-health for `group`, merged across every transport that can report it (a group's queue
+   *  and its workers may live on any pinned transport). Undefined when no transport implements
+   *  `groupHealth` (e.g. a pure in-process transport — nothing to introspect). */
+  async groupHealth(group: string): Promise<GroupHealth | undefined> {
+    const reports: GroupHealth[] = [];
+    for (const { transport } of this.transports) {
+      if (transport.groupHealth) reports.push(await transport.groupHealth(group));
+    }
+    if (reports.length === 0) return undefined;
+    return {
+      group,
+      depth: reports.reduce((sum, r) => sum + r.depth, 0),
+      liveWorkers: reports.flatMap((r) => r.liveWorkers),
+    };
+  }
+
+  /** Distinct worker groups with a live heartbeat, merged across every transport that can report it. */
+  async listWorkerGroups(): Promise<string[]> {
+    const groups = new Set<string>();
+    for (const { transport } of this.transports) {
+      if (transport.listWorkerGroups) {
+        for (const g of await transport.listWorkerGroups()) groups.add(g);
+      }
+    }
+    return [...groups];
   }
 
   /** Pinned `preferId` first, then the rest (failover order). */

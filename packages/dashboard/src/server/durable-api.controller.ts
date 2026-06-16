@@ -35,6 +35,12 @@ export class DurableApiController {
     return this.dashboard.metrics();
   }
 
+  /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. */
+  @Get('workers')
+  workers() {
+    return this.dashboard.workerHealth();
+  }
+
   @Get('runs/:id')
   async run(@Param('id') id: string) {
     const detail = await this.dashboard.getRunDetail(id);

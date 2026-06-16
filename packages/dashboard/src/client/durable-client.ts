@@ -88,10 +88,7 @@ export type RunDisplayStatus = RunStatus | 'sleeping' | 'awaiting';
  * without it (the run list) a non-timer suspend reads as `running` — open and in progress — rather
  * than the catch-all `suspended`.
  */
-export function runDisplayStatus(
-  run: WorkflowRun,
-  timeline?: StepCheckpoint[],
-): RunDisplayStatus {
+export function runDisplayStatus(run: WorkflowRun, timeline?: StepCheckpoint[]): RunDisplayStatus {
   if (run.status !== 'suspended') return run.status;
   // a remote step is in flight (`pending`) or a local step body is executing (`running`)
   if (timeline?.some((s) => s.status === 'pending' || s.status === 'running')) return 'running';
@@ -119,6 +116,21 @@ export interface EngineEvent {
   /** The live step event carried by a `step.progress` (a running step's just-emitted log/sub-process). */
   event?: StepEvent;
   at: string;
+}
+
+/** One worker's liveness record (mirror of the engine's `WorkerHeartbeat`). */
+export interface WorkerHeartbeat {
+  group: string;
+  instanceId: string;
+  lastBeatAt: number;
+}
+
+/** Per-group worker health for the Workers panel: backlog vs. live workers. The alert state a row
+ *  turns red on is `depth > 0 && liveWorkers.length === 0` (work piling up with no consumer). */
+export interface GroupHealth {
+  group: string;
+  depth: number;
+  liveWorkers: WorkerHeartbeat[];
 }
 
 declare global {
@@ -154,6 +166,10 @@ export const durableClient = {
   },
   run(id: string): Promise<RunDetail> {
     return http<RunDetail>(`/runs/${encodeURIComponent(id)}`);
+  },
+  /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. */
+  workers(): Promise<GroupHealth[]> {
+    return http<GroupHealth[]>('/workers');
   },
   retry(id: string): Promise<WorkflowRun> {
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
