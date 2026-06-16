@@ -16,6 +16,31 @@ import { StepDetailPanel } from './StepDetailPanel';
 import { WorkflowGraph } from './WorkflowGraph';
 import { PlayIcon, RetryIcon, XIcon } from './icons';
 
+/** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
+ *  flowing into the next), in currentColor so it inherits the emerald accent. Replaces the bare `◆`. */
+function LogoMark({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      role="img"
+      aria-label="durable"
+    >
+      <title>durable</title>
+      <path d="M12 2.5 21.5 12 12 21.5 2.5 12z" opacity={0.35} />
+      <circle cx="6.4" cy="12" r="1.7" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none" />
+      <circle cx="17.6" cy="12" r="1.7" fill="currentColor" stroke="none" />
+      <path d="M8.1 12h2.2M13.7 12h2.2" />
+    </svg>
+  );
+}
+
 const STATUSES: RunStatus[] = [
   'pending',
   'running',
@@ -90,9 +115,7 @@ function Header({
     <header className="z-10 flex items-center gap-4 border-b border-[var(--line)] px-5 py-3">
       <div className="flex items-center gap-2.5">
         <div className="grid h-7 w-7 place-items-center rounded-md border border-emerald-500/30 bg-emerald-500/10">
-          <span className="text-emerald-400" aria-hidden>
-            ◆
-          </span>
+          <LogoMark className="h-4 w-4 text-emerald-400" />
         </div>
         <div className="leading-none">
           <div className="text-sm font-semibold tracking-tight">durable</div>
@@ -725,10 +748,8 @@ export function App() {
               <RunDetail key={selected} id={selected} onOpenRun={setSelected} />
             ) : (
               <div className="grid h-full place-items-center text-center">
-                <div>
-                  <div className="text-4xl text-zinc-800" aria-hidden>
-                    ◆
-                  </div>
+                <div className="flex flex-col items-center">
+                  <LogoMark className="h-10 w-10 text-zinc-800" />
                   <p className="mt-3 text-sm text-zinc-600">Select a run to see its timeline.</p>
                 </div>
               </div>

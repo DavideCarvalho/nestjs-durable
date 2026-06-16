@@ -1,13 +1,14 @@
 import { useQueries, useQuery } from '@tanstack/react-query';
 import { useMemo, useState } from 'react';
-import type { StepCheckpoint, WorkflowRun } from '../client/durable-client';
+import type { RunDetail, StepCheckpoint, WorkflowRun } from '../client/durable-client';
 import { durableClient } from '../client/durable-client';
 import { childRunIdOf } from './child-link';
+import { groupSubProcesses } from '../client/group-subprocesses';
 import { ChildIcon, iconFor } from './icons';
 
-/** Fetch the workflow name of each child-ref step in a timeline, so a child row reads the child's
- *  real workflow name instead of the raw `signal:child:<id>` / `spawn:<id>` checkpoint name. */
-function useChildWorkflowNames(timeline: StepCheckpoint[]): Record<string, string> {
+/** Fetch the RunDetail of each child-ref step in a timeline, so a row can read the child's real
+ *  workflow name (instead of the raw `signal:child:<id>` checkpoint) and its full run duration. */
+function useChildRuns(timeline: StepCheckpoint[]): Record<string, RunDetail> {
   const ids = useMemo(() => {
     const set = new Set<string>();
     for (const step of timeline) {
@@ -19,12 +20,38 @@ function useChildWorkflowNames(timeline: StepCheckpoint[]): Record<string, strin
   const results = useQueries({
     queries: ids.map((id) => ({ queryKey: ['run', id], queryFn: () => durableClient.run(id) })),
   });
-  const map: Record<string, string> = {};
+  const map: Record<string, RunDetail> = {};
   ids.forEach((id, index) => {
-    const workflow = results[index]?.data?.run.workflow;
-    if (workflow) map[id] = workflow;
+    const detail = results[index]?.data;
+    if (detail) map[id] = detail;
   });
   return map;
+}
+
+/**
+ * The wall-clock window [start, end] a step's bar should cover — matching what the rest of the UI
+ * reports: a child-ref step → the child run's own window (full duration, not the instant signal
+ * checkpoint); a fan-out step → its sub-process span (min start → max end); else the step's own
+ * [startedAt, finishedAt].
+ */
+function barWindow(
+  step: StepCheckpoint,
+  childRun: RunDetail | undefined,
+  liveNow: number,
+): [number, number] {
+  if (childRun) {
+    const created = new Date(childRun.run.createdAt).getTime();
+    const open = childRun.run.status === 'running' || childRun.run.status === 'suspended';
+    const end = open ? liveNow : new Date(childRun.run.updatedAt).getTime();
+    return [created, Math.max(end, created)];
+  }
+  const { subs } = groupSubProcesses(step.events ?? []);
+  const starts = subs.map((s) => s.startedAt).filter((n): n is number => n !== undefined);
+  const ends = subs
+    .map((s) => s.terminal?.at ?? s.startedAt)
+    .filter((n): n is number => n !== undefined);
+  if (starts.length > 0 && ends.length > 0) return [Math.min(...starts), Math.max(...ends)];
+  return [new Date(step.startedAt).getTime(), new Date(step.finishedAt).getTime()];
 }
 
 function fmtDur(ms: number): string {
@@ -64,46 +91,48 @@ export function RunSpans({
   expanded: Set<string>;
   onToggleChild: (childRunId: string) => void;
 }) {
+  const childRuns = useChildRuns(timeline);
   const { span, rows } = useMemo(() => {
-    const starts = timeline.map((s) => new Date(s.startedAt).getTime());
-    const ends = timeline.map((s) => new Date(s.finishedAt).getTime());
-    const t0 = Math.min(new Date(run.createdAt).getTime(), ...starts);
     const live = run.status === 'running' || run.status === 'suspended';
-    const tEnd = Math.max(...ends, live ? Date.now() : t0 + 1);
+    const liveNow = Date.now();
+    // Each step's bar window — child run window for a child-ref, sub-process span for a fan-out step,
+    // else the step's own window (see barWindow) — so durations match the rest of the UI.
+    const prepared = timeline.map((s) => {
+      const childId = childRunIdOf(s);
+      const childRun = childId !== undefined ? childRuns[childId] : undefined;
+      const [barStart, barEnd] = barWindow(s, childRun, liveNow);
+      return { step: s, childId, childRun, barStart, barEnd };
+    });
+    const t0 = Math.min(new Date(run.createdAt).getTime(), ...prepared.map((p) => p.barStart));
+    const tEnd = Math.max(...prepared.map((p) => p.barEnd), live ? liveNow : t0 + 1);
     const span = Math.max(tEnd - t0, 1);
-    // Each bar spans the step's own execution window [startedAt, finishedAt] — a true gantt, so a
-    // bar's width is the step's real duration (matches per-step/handler timing) and the waits between
-    // steps read as gaps. Sub-process bars are placed within that same window.
-    const rows = timeline.map((s) => {
-      const stepStart = new Date(s.startedAt).getTime();
-      const end = new Date(s.finishedAt).getTime();
-      let subPrev = stepStart;
-      const subRows = (s.events ?? [])
-        .filter((e) => e.status)
-        .sort((a, b) => a.at - b.at)
-        .map((e, i) => {
-          const at = Math.min(Math.max(e.at, stepStart), end);
-          const sStart = subPrev;
-          subPrev = at;
-          return {
-            key: `${e.name ?? 'sub'}-${e.at}-${i}`,
-            name: e.name ?? 'sub-process',
-            status: e.status as SubStatus,
-            left: ((sStart - t0) / span) * 100,
-            width: Math.max(((at - sStart) / span) * 100, 0.8),
-            ms: at - sStart,
-          };
-        });
+    const rows = prepared.map(({ step: s, childId, childRun, barStart, barEnd }) => {
+      // Each sub-process gets a bar at its own [startedAt, terminal.at] window with its real duration.
+      const { subs } = groupSubProcesses(s.events ?? []);
+      const subRows = subs.map((sub) => {
+        const start = sub.startedAt ?? barStart;
+        const end = sub.terminal?.at ?? start;
+        return {
+          key: sub.id,
+          name: sub.name,
+          status: (sub.status ?? 'ok') as SubStatus,
+          left: ((start - t0) / span) * 100,
+          width: Math.max(((end - start) / span) * 100, 0.8),
+          ms: sub.durationMs ?? Math.max(end - start, 0),
+        };
+      });
       return {
         step: s,
-        left: ((stepStart - t0) / span) * 100,
-        width: Math.max(((end - stepStart) / span) * 100, 0.8),
-        ms: end - stepStart,
+        childId,
+        childRun,
+        left: ((barStart - t0) / span) * 100,
+        width: Math.max(((barEnd - barStart) / span) * 100, 0.8),
+        ms: barEnd - barStart,
         subRows,
       };
     });
     return { span, rows };
-  }, [run, timeline]);
+  }, [run, timeline, childRuns]);
 
   // Per-step collapse of the sub-process waterfall (a fan-out step can have dozens of p-process rows).
   const [collapsedSubs, setCollapsedSubs] = useState<Set<number>>(new Set());
@@ -117,7 +146,6 @@ export function RunSpans({
       }
       return next;
     });
-  const childNames = useChildWorkflowNames(timeline);
 
   return (
     <>
@@ -192,7 +220,7 @@ export function RunSpans({
                 </span>
                 <span className="truncate text-[12px] text-zinc-300">
                   {childRunId !== undefined
-                    ? (childNames[childRunId] ?? 'child workflow')
+                    ? (childRuns[childRunId]?.run.workflow ?? 'child workflow')
                     : step.name}
                 </span>
                 {isChild && childRunId !== undefined && (
@@ -214,7 +242,7 @@ export function RunSpans({
                 {/* track */}
                 <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--line-soft)]" />
                 <span
-                  className={`absolute top-1/2 flex h-3.5 -translate-y-1/2 items-center rounded-[3px] ${
+                  className={`absolute top-1/2 flex h-3.5 -translate-y-1/2 items-center rounded-[3px] transition-all duration-500 ease-out ${
                     failed
                       ? 'bg-red-500/35 ring-1 ring-red-500/50'
                       : active
@@ -248,9 +276,15 @@ export function RunSpans({
                     <span className="relative h-3">
                       <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--line-soft)]" />
                       <span
-                        className={`absolute top-1/2 h-2 -translate-y-1/2 rounded-[2px] ${SUB_BAR[sub.status]}`}
+                        className={`absolute top-1/2 h-2 -translate-y-1/2 rounded-[2px] transition-all duration-500 ease-out ${SUB_BAR[sub.status]}`}
                         style={{ left: `${sub.left}%`, width: `${sub.width}%` }}
                       />
+                      <span
+                        className="mono tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[9px] text-zinc-600"
+                        style={{ left: `min(${sub.left + sub.width}%, calc(100% - 38px))` }}
+                      >
+                        {fmtDur(sub.ms)}
+                      </span>
                     </span>
                   </div>
                 ))}
