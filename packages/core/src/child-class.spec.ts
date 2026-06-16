@@ -99,4 +99,39 @@ describe('class-ref forms of child / startChild / start', () => {
     expect((await store.getRun('p1'))?.output).toBe('work-result');
     expect(runs).toBe(1); // started once, not double-dispatched
   });
+
+  it('shows the awaited child as a running placeholder while it runs (live in the parent)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    // A child that parks on a signal — stays running until we let it finish.
+    engine.register('slowchild', '1', async (ctx) => {
+      await ctx.waitForSignal('go');
+      return { done: true };
+    });
+    engine.register('par', '1', async (ctx) => {
+      await ctx.child('slowchild', {}, 'par.child.0');
+      return 'ok';
+    });
+
+    await startRun(engine, 'par', {}, 'par');
+    // While the child runs, the parent carries a `running` signal:child placeholder (a live child node).
+    await poll(async () =>
+      (await store.listCheckpoints('par')).some(
+        (c) => c.name === 'signal:child:par.child.0' && c.status === 'running',
+      ),
+    );
+    const placeholder = (await store.listCheckpoints('par')).find(
+      (c) => c.name === 'signal:child:par.child.0',
+    );
+    expect(placeholder?.status).toBe('running');
+    expect(placeholder?.kind).toBe('signal');
+
+    // Let the child finish — the placeholder is overwritten as completed and the parent resumes.
+    await engine.signal('go', undefined);
+    await poll(async () => (await store.getRun('par'))?.status === 'completed');
+    const resolved = (await store.listCheckpoints('par')).find(
+      (c) => c.name === 'signal:child:par.child.0',
+    );
+    expect(resolved?.status).toBe('completed');
+  });
 });
