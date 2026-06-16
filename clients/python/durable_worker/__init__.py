@@ -21,6 +21,7 @@ from .worker import (
     Worker,
     current_step,
     log,
+    run_workers,
     set_process,
     sub,
     sub_event,
@@ -44,6 +45,7 @@ __all__ = [
     # Transport bootstrap helpers.
     "run_redis_worker",
     "redis_url_from_env",
+    "run_workers",
     # Author durable workflows in Python (coordinator-driven — the engine owns the durable state).
     "WorkflowWorker",
     "WorkflowContext",

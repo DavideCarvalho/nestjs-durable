@@ -514,6 +514,70 @@ class Worker:
         return _with_events({**base, "status": "failed", "error": error}, ctx)
 
 
+def run_workers(
+    workers: "Any",
+    *,
+    redis: str = "redis://localhost:6379",
+    prefix: str = "durable",
+) -> None:
+    """Run multiple step/workflow workers in a single process — one asyncio event loop, one
+    Redis connection pool, clean shutdown on SIGTERM/SIGINT.
+
+    Pass an iterable of :class:`Worker` and/or :class:`.WorkflowWorker` instances.  Each
+    :class:`Worker` is connected via :func:`~durable_worker.redis_runner.run_redis_worker`;
+    each :class:`.WorkflowWorker` via
+    :func:`~durable_worker.redis_runner.run_redis_workflow_worker`.  When the process receives
+    SIGTERM or SIGINT every handle is closed gracefully (finishing the active job and releasing
+    its lock) before the loop exits::
+
+        step_worker    = Worker(group="processing")
+        wf_worker      = WorkflowWorker(group="py-workflows")
+
+        @step_worker.step("processing.crunch", blocking=True)
+        def crunch(data): ...
+
+        @wf_worker.workflow("pipeline")
+        def pipeline(ctx, input): ...
+
+        run_workers([step_worker, wf_worker], redis=redis_url_from_env())
+
+    Blocks until a shutdown signal closes all workers.  For finer control use
+    :func:`~durable_worker.redis_runner.run_redis_worker` /
+    :func:`~durable_worker.redis_runner.run_redis_workflow_worker` directly.
+    """
+    import signal as _signal
+
+    from .redis_runner import run_redis_workflow_worker, run_redis_worker
+    from .workflow import WorkflowWorker
+
+    async def _main() -> None:
+        handles = []
+        for worker in workers:
+            if isinstance(worker, WorkflowWorker):
+                handle = await run_redis_workflow_worker(
+                    worker, group=worker.group, connection=redis, prefix=prefix
+                )
+            else:
+                handle = await run_redis_worker(
+                    worker, group=worker.group, connection=redis, prefix=prefix
+                )
+            handles.append(handle)
+
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        for sig in (_signal.SIGTERM, _signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, lambda: stop.set())
+            except (NotImplementedError, RuntimeError):
+                pass  # no signal support (e.g. not the main thread) — rely on redelivery
+
+        await stop.wait()
+        await asyncio.gather(*[h.close() for h in handles], return_exceptions=True)
+
+    asyncio.run(_main())
+
+
 def _run_bound(handler: Handler, input_: Any, ctx: "StepContext") -> Any:
     """Call ``handler`` with ``ctx`` bound as the current step for the duration of the call, so the
     module-level :func:`log`/:func:`sub`/:func:`set_process` reach it from deep in the call tree.
