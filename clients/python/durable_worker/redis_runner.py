@@ -127,20 +127,49 @@ async def run_redis_workflow_worker(
 
     tasks_name = f"{prefix}-tasks-{group}"
     decisions = BullQueue(f"{prefix}-decisions", {"connection": connection})
+    step_events = BullQueue(f"{prefix}-step-events", {"connection": connection})
+    publish_step = _step_event_publisher(step_events)
 
     async def process(job: Any, _token: str) -> None:
         # Replay OFF the event loop. `process_task` is fully synchronous and a real workflow turn can
         # run for minutes (e.g. a body of inline ctx.step DB calls). Running it inline would block the
         # loop that drives (a) this worker's liveness heartbeat — so it'd read as "0 live workers" mid-
         # run — and (b) BullMQ's job-lock renewal — so the lock would lapse, the job stall, and BullMQ
-        # REDELIVER it (the workflow runs twice). `to_thread` keeps the loop free for both.
-        decision = await asyncio.to_thread(workflow_worker.process_task, job.data)
+        # REDELIVER it (the workflow runs twice). `to_thread` keeps the loop free for both — and for
+        # streaming each step's lifecycle (`publish_step`) so steps show up live, not all at turn-end.
+        decision = await asyncio.to_thread(
+            workflow_worker.process_task, job.data, publish_step
+        )
         await decisions.add(
             "decision", decision, {"removeOnComplete": True, "removeOnFail": True}
         )
 
     await _start_heartbeat(connection, prefix, group)
     return BullWorker(tasks_name, process, {"connection": connection})
+
+
+def _step_event_publisher(step_events: Any) -> Callable[[Dict[str, Any]], None]:
+    """Build a thread-safe `publish(step_event)` that enqueues each local step's lifecycle onto the
+    `<prefix>-step-events` queue from the running loop. `process_task` runs in a worker THREAD (via
+    `to_thread`), and the BullMQ queue client is bound to the event loop, so we hop back onto the loop
+    via `call_soon_threadsafe`. Best-effort: streaming a step event must never fail the replay."""
+    loop = asyncio.get_running_loop()
+
+    def publish(step_event: Dict[str, Any]) -> None:
+        async def _send() -> None:
+            try:
+                await step_events.add(
+                    "stepEvent", step_event, {"removeOnComplete": True, "removeOnFail": True}
+                )
+            except Exception:  # noqa: BLE001 — live step lifecycle is best-effort observability
+                pass
+
+        try:
+            loop.call_soon_threadsafe(lambda: loop.create_task(_send()))
+        except RuntimeError:
+            pass  # loop is closing/closed — drop the live event (the final decision still carries it)
+
+    return publish
 
 
 def _control_channel(prefix: str) -> str:

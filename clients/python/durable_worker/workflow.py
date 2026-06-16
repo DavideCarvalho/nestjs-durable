@@ -23,6 +23,7 @@ non-determinism happen once). See docs/plans/2026-06-15-polyglot-workflows-proto
 from __future__ import annotations
 
 import inspect
+import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional
 
@@ -68,6 +69,7 @@ class WorkflowContext:
         run_id: Optional[str],
         history: List[Dict[str, Any]],
         pending_signals: Optional[List[Dict[str, Any]]] = None,
+        on_step: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.run_id = run_id
         self._history: Dict[int, Dict[str, Any]] = {e["seq"]: e for e in history}
@@ -76,6 +78,18 @@ class WorkflowContext:
         }
         self._seq = 0
         self.commands: List[Dict[str, Any]] = []
+        # Optional sink that streams each local step's lifecycle (running → completed/failed) to the
+        # engine AS IT HAPPENS, so a long inline turn's steps show up live instead of all at the end.
+        self._on_step = on_step
+
+    def _emit_step(self, event: Dict[str, Any]) -> None:
+        """Best-effort: stream a step lifecycle event. A broken sink must never fail the workflow."""
+        if self._on_step is None:
+            return
+        try:
+            self._on_step(event)
+        except Exception:  # noqa: BLE001 — live-tail is best-effort observability
+            pass
 
     # -- internals -----------------------------------------------------------
     def _next(self) -> int:
@@ -111,19 +125,81 @@ class WorkflowContext:
 
     def step(self, name: str, body: Callable[[], Any]) -> Any:
         """Run a LOCAL step once and record its result, so side effects / non-determinism
-        (``now``/``uuid``/a write) happen exactly once and replay returns the captured value."""
+        (``now``/``uuid``/a write) happen exactly once and replay returns the captured value.
+
+        While the body runs it is the *current step*, so ``sub_process``/``sub_event``/``log`` inside
+        a handler are captured as the step's ``events`` (the dashboard shows each handler's p-processes
+        under it). The step's real wall-clock window is recorded too (a true duration, not 0ms), and
+        its lifecycle (running → completed/failed) is streamed live via ``_emit_step``."""
+        from .worker import StepContext, _current_step  # lazy: avoid an import cycle with worker.py
+
         seq = self._next()
         found, output = self._replay(seq, "step", name)
         if found:
             return output
+
+        started_ms = int(time.time() * 1000)
+        self._emit_step(
+            {"runId": self.run_id, "seq": seq, "name": name, "phase": "running", "startedAt": started_ms}
+        )
+        step_ctx = StepContext(run_id=self.run_id, seq=seq)
+        token = _current_step.set(step_ctx)
         try:
             result = body()
         except Exception as err:  # noqa: BLE001 — recorded as a failed step, then re-raised
-            self.commands.append(
-                {"kind": "recordStep", "seq": seq, "name": name, "error": _to_error(err)}
+            error = _to_error(err)
+            finished_ms = int(time.time() * 1000)
+            cmd: Dict[str, Any] = {
+                "kind": "recordStep",
+                "seq": seq,
+                "name": name,
+                "error": error,
+                "startedAt": started_ms,
+                "finishedAt": finished_ms,
+            }
+            if step_ctx.events:
+                cmd["events"] = step_ctx.events
+            self.commands.append(cmd)
+            self._emit_step(
+                {
+                    "runId": self.run_id,
+                    "seq": seq,
+                    "name": name,
+                    "phase": "failed",
+                    "startedAt": started_ms,
+                    "finishedAt": finished_ms,
+                    "error": error,
+                    "events": step_ctx.events,
+                }
             )
-            raise StepFailed(_to_error(err)) from err
-        self.commands.append({"kind": "recordStep", "seq": seq, "name": name, "output": result})
+            raise StepFailed(error) from err
+        finally:
+            _current_step.reset(token)
+
+        finished_ms = int(time.time() * 1000)
+        cmd = {
+            "kind": "recordStep",
+            "seq": seq,
+            "name": name,
+            "output": result,
+            "startedAt": started_ms,
+            "finishedAt": finished_ms,
+        }
+        if step_ctx.events:
+            cmd["events"] = step_ctx.events
+        self.commands.append(cmd)
+        self._emit_step(
+            {
+                "runId": self.run_id,
+                "seq": seq,
+                "name": name,
+                "phase": "completed",
+                "startedAt": started_ms,
+                "finishedAt": finished_ms,
+                "output": result,
+                "events": step_ctx.events,
+            }
+        )
         return result
 
     def sleep(self, ms: int) -> None:
@@ -227,8 +303,13 @@ class WorkflowWorker:
 
         asyncio.run(_main())
 
-    def process_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Replay one turn of ``task``'s workflow and return the wire-format decision."""
+    def process_task(
+        self,
+        task: Dict[str, Any],
+        on_step: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """Replay one turn of ``task``'s workflow and return the wire-format decision. ``on_step``, when
+        given, streams each local step's lifecycle (running → completed/failed) to the engine live."""
         base = {"taskId": task.get("taskId"), "runId": task.get("runId")}
         fn = self._workflows.get(task.get("workflow"))
         if fn is None:
@@ -242,7 +323,10 @@ class WorkflowWorker:
                 },
             }
         ctx = WorkflowContext(
-            task.get("runId"), task.get("history", []), task.get("pendingSignals")
+            task.get("runId"),
+            task.get("history", []),
+            task.get("pendingSignals"),
+            on_step=on_step,
         )
         try:
             output = _invoke_workflow(fn, ctx, task.get("input"))

@@ -213,6 +213,83 @@ describe('WorkflowEngine — remote (polyglot) workflows', () => {
     expect(b?.output).toEqual({ b: 2 });
   });
 
+  it('persists a streamed step lifecycle live: running → completed with real timing + sub-process events', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    // Constructing the engine wires transport.onStepEvent → the engine's checkpoint persistence.
+    new WorkflowEngine({ store, transport });
+
+    await transport.dispatchStepEvent({
+      runId: 'r1',
+      seq: 0,
+      name: 'handle_x',
+      phase: 'running',
+      startedAt: 1000,
+    });
+    const running = (await store.listCheckpoints('r1')).find((c) => c.seq === 0);
+    expect(running?.status).toBe('running');
+    expect(running?.kind).toBe('local');
+
+    await transport.dispatchStepEvent({
+      runId: 'r1',
+      seq: 0,
+      name: 'handle_x',
+      phase: 'completed',
+      startedAt: 1000,
+      finishedAt: 1500,
+      output: { ok: true },
+      events: [{ at: 1200, level: 'info', message: 'proc-1', name: 'proc-1', status: 'ok' }],
+    });
+    const done = (await store.listCheckpoints('r1')).find((c) => c.seq === 0);
+    expect(done?.status).toBe('completed');
+    expect(done?.output).toEqual({ ok: true });
+    expect(done).toBeDefined();
+    if (done) {
+      expect(+new Date(done.finishedAt) - +new Date(done.startedAt)).toBe(500); // a real duration, not 0ms
+      expect(done.events?.some((e) => e.name === 'proc-1' && e.status === 'ok')).toBe(true);
+    }
+  });
+
+  it('applies a recordStep with its real timing + events (turn-end persist matches the live one)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
+    engine.registerRemote('inline', '1', {
+      group: 'py-workflows',
+      executor: {
+        async advance(run: WorkflowRun): Promise<WorkflowDecision> {
+          return {
+            taskId: 't',
+            runId: run.id,
+            status: 'completed',
+            commands: [
+              {
+                kind: 'recordStep',
+                seq: 0,
+                name: 'handle_x',
+                output: { ok: true },
+                startedAt: 2000,
+                finishedAt: 2750,
+                events: [
+                  { at: 2100, level: 'info', message: 'proc-1', name: 'proc-1', status: 'ok' },
+                ],
+              },
+            ],
+            output: { done: true },
+          };
+        },
+      },
+    });
+
+    await startRun(engine, 'inline', {}, 'timed1');
+    await settle(store, 'timed1');
+    const cp = (await store.listCheckpoints('timed1')).find((c) => c.seq === 0);
+    expect(cp).toBeDefined();
+    if (cp) {
+      expect(+new Date(cp.finishedAt) - +new Date(cp.startedAt)).toBe(750);
+      expect(cp.events?.some((e) => e.name === 'proc-1')).toBe(true);
+    }
+  });
+
   it('records steps from a turn that ends in failure — including the failed step', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });

@@ -42,7 +42,7 @@ class _BlockingWorkflowWorker:
     def __init__(self):
         self.done = False
 
-    def process_task(self, data):
+    def process_task(self, data, on_step=None):
         time.sleep(0.2)
         self.done = True
         return {"runId": data.get("runId"), "status": "completed", "commands": [], "output": {}}

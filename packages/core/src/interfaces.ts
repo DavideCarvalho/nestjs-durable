@@ -409,8 +409,20 @@ export type WorkflowCommand =
   /** `ctx.call(remoteStep, input)` — dispatch a remote step and await it. */
   | { kind: 'call'; seq: number; name: string; group: string; input: unknown }
   /** `ctx.step(name, body)` — a LOCAL step the worker already ran this turn; the engine persists its
-   *  result so replay returns it instead of re-running (durability for side-effectful work). */
-  | { kind: 'recordStep'; seq: number; name: string; output?: unknown; error?: StepError }
+   *  result so replay returns it instead of re-running (durability for side-effectful work).
+   *  `startedAt`/`finishedAt` (epoch ms) carry the step's real wall-clock window so the dashboard
+   *  shows a true duration instead of 0ms, and `events` carry the sub-process/log trail the step
+   *  emitted (so each handler's p-processes show under it). All optional for back-compat. */
+  | {
+      kind: 'recordStep';
+      seq: number;
+      name: string;
+      output?: unknown;
+      error?: StepError;
+      startedAt?: number;
+      finishedAt?: number;
+      events?: StepEvent[];
+    }
   /** `ctx.sleep(ms)` — a durable timer of `ms` duration. The engine computes the absolute deadline
    *  (now + ms) when it applies the command, so the worker never reads the clock (determinism). */
   | { kind: 'sleep'; seq: number; ms: number }
@@ -431,6 +443,30 @@ export interface WorkflowDecision {
   output?: unknown;
   /** Terminal error (status === 'failed'). */
   error?: StepError;
+}
+
+/**
+ * workflow worker → engine: a LOCAL step's lifecycle, streamed AS IT HAPPENS (not batched into the
+ * turn's final {@link WorkflowDecision}). A Python `@workflow` runs its `ctx.step`s inline over one
+ * turn that can last minutes; without this the engine learns of the steps only when the turn ends,
+ * so the dashboard shows nothing mid-run. The worker emits `running` when a step's body starts and
+ * `completed`/`failed` when it settles; the engine checkpoints each immediately, so a step appears
+ * in-flight and then resolves live. The turn's final `recordStep` command re-persists the same
+ * checkpoint idempotently (replay history), so this is purely additive observability.
+ */
+export interface WorkflowStepEvent {
+  runId: string;
+  seq: number;
+  name: string;
+  phase: 'running' | 'completed' | 'failed';
+  /** Epoch ms the step body began (all phases) and settled (`completed`/`failed`). */
+  startedAt: number;
+  finishedAt?: number;
+  /** The replayed result / failure for the settled phases. */
+  output?: unknown;
+  error?: StepError;
+  /** Sub-process + log trail the step emitted so far (the handler's p-processes). */
+  events?: StepEvent[];
 }
 
 /**
@@ -487,6 +523,12 @@ export interface Transport {
   dispatchWorkflowTask?(task: WorkflowTask): Promise<void>;
   /** workflow worker → engine: a replayed turn's {@link WorkflowDecision}. Pair with dispatchWorkflowTask. */
   onDecision?(handler: (decision: WorkflowDecision) => Promise<void>): void;
+  /** workflow worker → engine: a LOCAL step's {@link WorkflowStepEvent}, streamed mid-turn so the
+   *  engine can checkpoint it live. Point-to-point (a single engine instance consumes each event and
+   *  persists it once — no cross-pod duplicate writes). Optional; only broker transports carry it. */
+  dispatchStepEvent?(event: WorkflowStepEvent): Promise<void>;
+  /** engine ← workflow worker: consume streamed {@link WorkflowStepEvent}s. Pair with dispatchStepEvent. */
+  onStepEvent?(handler: (event: WorkflowStepEvent) => Promise<void>): void;
   /** Worker-health for a group: queue backlog + live worker heartbeats. Optional — only broker
    *  transports (BullMQ) that can introspect the task queue and the worker-heartbeat keys implement
    *  it. The engine aggregates this across its groups in {@link WorkflowEngine.workerHealth}. */

@@ -5,6 +5,7 @@ import type {
   RemoteTask,
   StepResult,
   Transport,
+  WorkflowStepEvent,
 } from '../interfaces';
 import { type StepHandler, runStepHandler } from '../protocol';
 
@@ -17,6 +18,7 @@ import { type StepHandler, runStepHandler } from '../protocol';
 export class InMemoryTransport implements Transport, ControlPlane {
   private readonly handlers = new Map<string, StepHandler>();
   private resultHandler?: (result: StepResult) => Promise<void>;
+  private stepEventHandler?: (event: WorkflowStepEvent) => Promise<void>;
   private readonly controlHandlers = new Set<(msg: ControlMessage) => void>();
 
   /** Register a fake worker handler for a step name. */
@@ -39,6 +41,15 @@ export class InMemoryTransport implements Transport, ControlPlane {
 
   onHeartbeat(_handler: (beat: Heartbeat) => Promise<void>): void {
     // In-process handlers run synchronously; there is no liveness to track.
+  }
+
+  /** Workflow step lifecycle: deliver to the engine's handler (async, mirroring a real broker). */
+  async dispatchStepEvent(event: WorkflowStepEvent): Promise<void> {
+    await this.stepEventHandler?.(event);
+  }
+
+  onStepEvent(handler: (event: WorkflowStepEvent) => Promise<void>): void {
+    this.stepEventHandler = handler;
   }
 
   // Control plane: broadcast to every registered handler (including the publisher's own — the
