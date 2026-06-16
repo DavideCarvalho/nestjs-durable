@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import type { StepCheckpoint, WorkflowRun } from '../client/durable-client';
 import { durableClient } from '../client/durable-client';
 import { childRunIdOf } from './child-link';
@@ -89,6 +89,19 @@ function RunSpans({
     return { span, rows };
   }, [run, timeline]);
 
+  // Per-step collapse of the sub-process waterfall (a fan-out step can have dozens of p-process rows).
+  const [collapsedSubs, setCollapsedSubs] = useState<Set<number>>(new Set());
+  const toggleSubs = (seq: number) =>
+    setCollapsedSubs((prev) => {
+      const next = new Set(prev);
+      if (next.has(seq)) {
+        next.delete(seq);
+      } else {
+        next.add(seq);
+      }
+      return next;
+    });
+
   return (
     <>
       {rows.map(({ step, left, width, ms, subRows }) => {
@@ -98,6 +111,8 @@ function RunSpans({
         const Icon = isChild ? ChildIcon : iconFor(step.kind);
         const active = selected === step.seq;
         const isExpanded = isChild && childRunId !== undefined && expanded.has(childRunId);
+        const hasSubs = subRows.length > 0 && !isChild;
+        const subsCollapsed = collapsedSubs.has(step.seq);
         return (
           <div key={step.seq}>
             <button
@@ -122,6 +137,28 @@ function RunSpans({
                     <span
                       className="inline-block transition-transform"
                       style={{ transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)' }}
+                    >
+                      ▸
+                    </span>
+                  </button>
+                )}
+                {hasSubs && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleSubs(step.seq);
+                    }}
+                    className="shrink-0 text-zinc-500 transition-colors hover:text-zinc-300"
+                    title={
+                      subsCollapsed
+                        ? `Show ${subRows.length} sub-process(es)`
+                        : 'Hide sub-processes'
+                    }
+                  >
+                    <span
+                      className="inline-block transition-transform"
+                      style={{ transform: subsCollapsed ? 'rotate(0deg)' : 'rotate(90deg)' }}
                     >
                       ▸
                     </span>
@@ -158,7 +195,7 @@ function RunSpans({
                 </span>
               </span>
             </button>
-            {subRows.length > 0 && (
+            {subRows.length > 0 && !subsCollapsed && (
               <div className="ml-[18px] mt-0.5 mb-1 space-y-0.5 border-l border-[var(--line-soft)] pl-2">
                 {subRows.map((sub) => (
                   <div

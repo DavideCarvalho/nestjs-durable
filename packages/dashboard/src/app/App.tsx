@@ -307,6 +307,21 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   const [sel, setSel] = useState<number>();
   const [showRunIO, setShowRunIO] = useState(false);
   const [expandedChildren, setExpandedChildren] = useState<Set<string>>(new Set());
+  // User-resizable height (px) of the spans panel; drag the divider above it. Clamped so neither the
+  // graph nor the spans can be squeezed to nothing.
+  const [spanHeight, setSpanHeight] = useState(240);
+  function onResizeSpans(e: React.PointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const move = (ev: PointerEvent) =>
+      setSpanHeight((h) => Math.max(120, Math.min(720, h - ev.movementY)));
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
 
   function toggleChild(childId: string) {
     setExpandedChildren((prev) => {
@@ -496,7 +511,10 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           </button>
         </div>
       )}
-      <div className="relative grid min-h-0 flex-1 grid-rows-[1fr_clamp(120px,34%,260px)]">
+      <div
+        className="relative grid min-h-0 flex-1"
+        style={{ gridTemplateRows: timeline.length > 0 ? `1fr ${spanHeight}px` : '1fr' }}
+      >
         <div className="relative min-h-0">
           {timeline.length === 0 ? (
             <div className="grid h-full place-items-center text-sm text-zinc-600">
@@ -522,7 +540,13 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           // The spans height lives in the GRID TRACK above (`clamp(...)`), not here — an `auto` track
           // sizes to the tall span content's min-content and collapses the `1fr` WorkflowGraph row to
           // 0. With the track clamped, this wrapper just fills it and clips; SpansTimeline scrolls.
-          <div className="min-h-0 overflow-hidden border-t border-[var(--line)] bg-black/20">
+          <div className="relative min-h-0 overflow-hidden border-t border-[var(--line)] bg-black/20">
+            {/* Drag the top edge to resize the spans panel. */}
+            <div
+              onPointerDown={onResizeSpans}
+              className="absolute inset-x-0 top-0 z-10 h-1.5 -translate-y-1/2 cursor-row-resize hover:bg-emerald-500/40"
+              title="Drag to resize"
+            />
             <SpansTimeline
               run={run}
               timeline={timeline}
