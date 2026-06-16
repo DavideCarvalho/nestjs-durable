@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import socket
+import time
 from typing import Any, Callable, Dict, Optional
 
 from .cancellation import CancellationRegistry
@@ -24,6 +25,68 @@ from .worker import Worker
 # DIFFER from the engine instanceIds (so a dashboard engine doesn't treat our progress events as its
 # own echo and drop them) — host + pid is plenty and avoids importing a uuid/random dependency.
 _INSTANCE_ID = f"py-{socket.gethostname()}-{os.getpid()}"
+
+# Worker liveness heartbeat. The worker stamps a TTL'd key every INTERVAL seconds; if the worker
+# dies or its loop stalls, the key expires after TTL and the *absence* is the alert signal a monitor
+# watches for. TTL is comfortably larger than the interval so a single slow refresh doesn't flap.
+_HEARTBEAT_INTERVAL_SECONDS = 10
+_HEARTBEAT_TTL_SECONDS = 35
+
+
+def _heartbeat_key(prefix: str, group: str) -> str:
+    """Per-(group, instance) liveness key. Mirrors the queue-name convention ('<prefix>-...') so the
+    whole durable keyspace shares one prefix. A monitor can scan '<prefix>-worker-heartbeat:<group>:*'."""
+    return f"{prefix}-worker-heartbeat:{group}:{_INSTANCE_ID}"
+
+
+async def _verify_connection(connection: str) -> None:
+    """Fail FAST if Redis is unreachable. bullmq's Worker connects lazily and swallows the resulting
+    ConnectionError inside a background task ("Task exception was never retrieved"), so a misconfigured
+    connection (wrong host, missing auth) leaves a process that is alive but consumes nothing — silent.
+    PING up front so the failure propagates out of run()/run_workers and the process exits non-zero,
+    letting a supervisor respawn it into a visible crash-loop instead of a silent dead worker."""
+    try:
+        import redis.asyncio as aioredis  # lazy: same client bullmq uses under the hood
+    except ImportError:
+        return  # no redis client present — bullmq import would have failed first; nothing to verify
+    client = aioredis.from_url(connection)
+    try:
+        await client.ping()
+    except Exception as err:  # noqa: BLE001 — re-raised with a clearer, actionable message
+        raise ConnectionError(
+            f"durable-worker could not reach Redis (ping failed: {err}). Refusing to start a worker "
+            "that would consume nothing. Check the REDIS_* connection settings."
+        ) from err
+    finally:
+        closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if closer:
+            try:
+                await closer()
+            except Exception:  # noqa: BLE001 — teardown of the probe connection is best-effort
+                pass
+
+
+async def _start_heartbeat(connection: str, prefix: str, group: str) -> None:
+    """Spawn a background task that refreshes the worker's TTL'd heartbeat key. Best-effort: a failed
+    refresh is swallowed (the key then expires and the gap is itself the signal) and the whole thing
+    is a no-op when redis isn't available. The SET round-trips to Redis, so the heartbeat doubles as
+    an ongoing connectivity probe — if Redis drops, the key stops refreshing and expires."""
+    try:
+        import redis.asyncio as aioredis  # lazy: only needed when a transport is actually running
+    except ImportError:
+        return
+    client = aioredis.from_url(connection)
+    key = _heartbeat_key(prefix, group)
+
+    async def beat() -> None:
+        while True:
+            try:
+                await client.set(key, str(time.time()), ex=_HEARTBEAT_TTL_SECONDS)
+            except Exception:  # noqa: BLE001 — never let a heartbeat hiccup kill the worker
+                pass
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+
+    asyncio.create_task(beat())
 
 
 def redis_url_from_env(prefix: str = "REDIS") -> str:
@@ -60,6 +123,8 @@ async def run_redis_workflow_worker(
     from bullmq import Queue as BullQueue
     from bullmq import Worker as BullWorker
 
+    await _verify_connection(connection)
+
     tasks_name = f"{prefix}-tasks-{group}"
     decisions = BullQueue(f"{prefix}-decisions", {"connection": connection})
 
@@ -69,6 +134,7 @@ async def run_redis_workflow_worker(
             "decision", decision, {"removeOnComplete": True, "removeOnFail": True}
         )
 
+    await _start_heartbeat(connection, prefix, group)
     return BullWorker(tasks_name, process, {"connection": connection})
 
 
@@ -115,11 +181,14 @@ async def run_redis_worker(
     from bullmq import Queue as BullQueue  # imported lazily so the SDK works without bullmq
     from bullmq import Worker as BullWorker
 
+    await _verify_connection(connection)
+
     tasks_name, results_name = _names(prefix, group)
     results = BullQueue(results_name, {"connection": connection})
     registry = cancellation or CancellationRegistry()
     await _subscribe_control(connection, prefix, registry)
     publish_progress = await _progress_publisher(connection, prefix)
+    await _start_heartbeat(connection, prefix, group)
 
     async def process(job: Any, _token: str) -> None:
         on_event = _make_on_event(job.data, publish_progress) if publish_progress else None
