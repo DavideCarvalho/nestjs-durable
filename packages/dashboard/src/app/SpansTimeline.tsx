@@ -27,7 +27,7 @@ export function RunSpans({
   run,
   timeline,
   depth,
-  selected,
+  selectedKey,
   onSelect,
   onOpenRun,
   expanded,
@@ -36,8 +36,8 @@ export function RunSpans({
   run: WorkflowRun;
   timeline: StepCheckpoint[];
   depth: number;
-  selected?: number;
-  onSelect: (seq: number) => void;
+  selectedKey?: string;
+  onSelect: (step: StepCheckpoint, run: WorkflowRun) => void;
   onOpenRun: (id: string) => void;
   expanded: Set<string>;
   onToggleChild: (childRunId: string) => void;
@@ -109,7 +109,7 @@ export function RunSpans({
         const childRunId = childRunIdOf(step);
         const isChild = !!childRunId;
         const Icon = isChild ? ChildIcon : iconFor(step.kind);
-        const active = selected === step.seq;
+        const active = selectedKey === `${step.runId}#${step.seq}`;
         const isExpanded = isChild && childRunId !== undefined && expanded.has(childRunId);
         const hasSubs = subRows.length > 0 && !isChild;
         const subsCollapsed = collapsedSubs.has(step.seq);
@@ -117,7 +117,7 @@ export function RunSpans({
           <div key={step.seq}>
             <button
               type="button"
-              onClick={() => onSelect(step.seq)}
+              onClick={() => onSelect(step, run)}
               title={
                 isChild ? 'Child workflow — click for its detail (↗ opens its run)' : undefined
               }
@@ -240,7 +240,7 @@ export function RunSpans({
                 <ChildSpans
                   id={childRunId}
                   depth={depth + 1}
-                  selected={selected}
+                  selectedKey={selectedKey}
                   onSelect={onSelect}
                   onOpenRun={onOpenRun}
                   expanded={expanded}
@@ -258,7 +258,7 @@ export function RunSpans({
 function ChildSpans({
   id,
   depth,
-  selected,
+  selectedKey,
   onSelect,
   onOpenRun,
   expanded,
@@ -266,8 +266,8 @@ function ChildSpans({
 }: {
   id: string;
   depth: number;
-  selected?: number;
-  onSelect: (seq: number) => void;
+  selectedKey?: string;
+  onSelect: (step: StepCheckpoint, run: WorkflowRun) => void;
   onOpenRun: (id: string) => void;
   expanded: Set<string>;
   onToggleChild: (childRunId: string) => void;
@@ -297,7 +297,7 @@ function ChildSpans({
         run={data.run}
         timeline={data.timeline}
         depth={depth}
-        selected={selected}
+        selectedKey={selectedKey}
         onSelect={onSelect}
         onOpenRun={onOpenRun}
         expanded={expanded}
@@ -314,7 +314,7 @@ function ChildSpans({
 export function SpansTimeline({
   run,
   timeline,
-  selected,
+  selectedKey,
   onSelect,
   onOpenRun,
   expanded,
@@ -322,9 +322,11 @@ export function SpansTimeline({
 }: {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
-  selected?: number;
-  onSelect: (seq: number) => void;
-  /** Navigate to another run — used when a child-workflow row is clicked. */
+  /** `${runId}#${seq}` of the selected step. */
+  selectedKey?: string;
+  /** Open a step's detail — the step + the run it belongs to. */
+  onSelect: (step: StepCheckpoint, run: WorkflowRun) => void;
+  /** Navigate to another run — used when a child-workflow row's ↗ is clicked. */
   onOpenRun: (id: string) => void;
   /** Set of child run ids currently expanded inline. */
   expanded?: Set<string>;
@@ -355,7 +357,7 @@ export function SpansTimeline({
           run={run}
           timeline={timeline}
           depth={0}
-          selected={selected}
+          selectedKey={selectedKey}
           onSelect={onSelect}
           onOpenRun={onOpenRun}
           expanded={resolvedExpanded}

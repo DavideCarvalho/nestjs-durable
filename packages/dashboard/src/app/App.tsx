@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   type RunDetail,
   type RunDisplayStatus,
@@ -304,7 +304,9 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       window.alert('Invalid JSON');
     }
   };
-  const [sel, setSel] = useState<number>();
+  // The selected step + the run it belongs to (a nested child step belongs to its child run, not the
+  // root) — so the detail panel renders any lane's step, not just the root timeline's.
+  const [selStep, setSelStep] = useState<{ step: StepCheckpoint; run: WorkflowRun }>();
   const [showRunIO, setShowRunIO] = useState(false);
   const [expandedChildren, setExpandedChildren] = useState<Set<string>>(new Set());
   // User-resizable height (px) of the spans panel; drag the divider above it. Clamped so neither the
@@ -363,7 +365,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   const atBreakpoint = timeline.some(
     (s) => s.status === 'pending' && s.kind === 'signal' && s.name.startsWith('breakpoint'),
   );
-  const selStep = timeline.find((s) => s.seq === sel);
+  // Stable key identifying the selected step across lanes (root + nested children).
+  const selKey = selStep ? `${selStep.step.runId}#${selStep.step.seq}` : undefined;
 
   return (
     <div className="flex h-full flex-col">
@@ -524,8 +527,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             <WorkflowGraph
               run={run}
               timeline={timeline}
-              selected={sel}
-              onSelect={setSel}
+              selectedKey={selKey}
+              onSelect={(step, stepRun) => setSelStep({ step, run: stepRun })}
               onOpenRun={onOpenRun}
               fmtDuration={durMs}
               expanded={expandedChildren}
@@ -552,8 +555,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             <SpansTimeline
               run={run}
               timeline={timeline}
-              selected={sel}
-              onSelect={setSel}
+              selectedKey={selKey}
+              onSelect={(step, stepRun) => setSelStep({ step, run: stepRun })}
               onOpenRun={onOpenRun}
               expanded={expandedChildren}
               onToggleChild={toggleChild}
@@ -562,9 +565,9 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
         )}
         {selStep && (
           <StepDetailPanel
-            step={selStep}
-            run={run}
-            onClose={() => setSel(undefined)}
+            step={selStep.step}
+            run={selStep.run}
+            onClose={() => setSelStep(undefined)}
             onOpenRun={onOpenRun}
           />
         )}
@@ -574,11 +577,36 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   );
 }
 
+/** The open run id encoded in the URL hash (`#/run/<id>`) — so a run is deep-linkable / shareable. */
+function runIdFromHash(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const match = window.location.hash.match(/^#\/run\/(.+)$/);
+  return match ? decodeURIComponent(match[1]) : undefined;
+}
+
 export function App() {
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
   const [tagFilter, setTagFilter] = useState('');
   const [attrFilter, setAttrFilter] = useState('');
-  const [selected, setSelected] = useState<string>();
+  // The open run lives in the URL hash so it survives reload and can be shared/linked.
+  const [selected, setSelectedState] = useState<string | undefined>(() => runIdFromHash());
+  const setSelected = useCallback((id?: string) => {
+    setSelectedState(id);
+    if (typeof window === 'undefined') return;
+    const hash = id ? `#/run/${encodeURIComponent(id)}` : '';
+    const url = hash || window.location.pathname + window.location.search;
+    if (window.location.hash !== hash) window.history.pushState(null, '', url);
+  }, []);
+  // Follow back/forward and external hash edits.
+  useEffect(() => {
+    const sync = () => setSelectedState(runIdFromHash());
+    window.addEventListener('hashchange', sync);
+    window.addEventListener('popstate', sync);
+    return () => {
+      window.removeEventListener('hashchange', sync);
+      window.removeEventListener('popstate', sync);
+    };
+  }, []);
   const qc = useQueryClient();
   // Comma-separated `key:op:value` predicates (e.g. `amount:gte:200, tier:eq:pro`), ANDed server-side.
   const attrPredicates = attrFilter

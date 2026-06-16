@@ -76,6 +76,10 @@ type StepData = {
   onToggleChild?: (id: string) => void;
   /** Lane depth: 0 = root run, 1 = a child's flow, 2 = a grandchild's, … (tints nested nodes). */
   depth?: number;
+  /** The underlying checkpoint + the run it belongs to (its own lane's run), so a node-body click
+   *  can open the right detail even for a nested child step. */
+  step?: StepCheckpoint;
+  laneRun?: WorkflowRun;
 };
 type EndData = { status: RunDisplayStatus; label: string };
 
@@ -240,7 +244,7 @@ function subCounts(s: StepCheckpoint): SubCounts | undefined {
 export function WorkflowGraph({
   run,
   timeline,
-  selected,
+  selectedKey,
   onSelect,
   onOpenRun,
   fmtDuration,
@@ -249,8 +253,10 @@ export function WorkflowGraph({
 }: {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
-  selected?: number;
-  onSelect: (seq: number) => void;
+  /** `${runId}#${seq}` of the selected step (a nested child step lives in its own run). */
+  selectedKey?: string;
+  /** Open a step's detail — the step + the run it belongs to (root or a nested child run). */
+  onSelect: (step: StepCheckpoint, run: WorkflowRun) => void;
   /** Navigate to another run — used by a child-workflow node's `child ↗` badge. */
   onOpenRun: (id: string) => void;
   fmtDuration: (a: string, b: string) => string;
@@ -293,6 +299,7 @@ export function WorkflowGraph({
       depth: number,
       startX: number,
       prefix: string,
+      laneRun: WorkflowRun,
     ): { firstId?: string; connectorId?: string; nextX: number } {
       let cursorX = startX;
       let firstId: string | undefined;
@@ -316,12 +323,14 @@ export function WorkflowGraph({
             attempts: s.attempts,
             duration: fmtDuration(s.startedAt, s.finishedAt),
             subs: subCounts(s),
-            selected: depth === 0 && selected === s.seq,
+            selected: selectedKey === `${s.runId}#${s.seq}`,
             childRunId: childId,
             onOpenRun,
             childExpanded,
             onToggleChild,
             depth,
+            step: s,
+            laneRun,
           } satisfies StepData,
         });
         if (firstId === undefined) firstId = id;
@@ -329,7 +338,7 @@ export function WorkflowGraph({
 
         const detail = childId !== undefined && childExpanded ? childData[childId] : undefined;
         if (detail) {
-          const sub = layout(detail.timeline, depth + 1, cursorX + gapX, `${childId}:`);
+          const sub = layout(detail.timeline, depth + 1, cursorX + gapX, `${childId}:`, detail.run);
           if (sub.firstId !== undefined) edges.push(branchEdge(id, sub.firstId));
           if (isAwaitedChild(s.name) && sub.connectorId !== undefined) {
             // Awaited: the parent flow passes through the child and resumes after it.
@@ -356,7 +365,7 @@ export function WorkflowGraph({
       draggable: false,
       data: { status: 'running', label: run.workflow } satisfies EndData,
     });
-    const root = layout(timeline, 0, gap0, '');
+    const root = layout(timeline, 0, gap0, '', run);
     if (root.firstId !== undefined) {
       edges.push({ id: 'start->first', source: 'start', target: root.firstId });
     }
@@ -383,11 +392,9 @@ export function WorkflowGraph({
     (_: unknown, node: Node) => {
       if (node.type !== 'step') return;
       const data = node.data as StepData;
-      // Only root-lane steps open the detail panel (it's keyed by the root run's seq). A nested
-      // child step's detail lives in its own run — reach it via the child's `↗` badge. Every step's
-      // own expand chevron still works at any depth (it's a node-data callback, not this handler).
-      if (data.depth && data.depth > 0) return;
-      onSelect(data.seq);
+      // Open the detail for the clicked step — root or a nested child step (it carries its own
+      // lane's run, so the panel renders the right run's timing/IO).
+      if (data.step && data.laneRun) onSelect(data.step, data.laneRun);
     },
     [onSelect],
   );
