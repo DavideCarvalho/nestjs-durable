@@ -15,20 +15,74 @@ export function durableDashboard(
     id: 'durable.workflows',
     label: 'Workflows',
     panels: [
-      { kind: 'stat', title: 'Success rate', data: { provider: 'durable.timeseries', query: { metric: 'successRate' } }, format: 'percent', accent: 'text-emerald-400' },
-      { kind: 'stat', title: 'Failed (window)', data: { provider: 'durable.timeseries', query: { metric: 'failed' } }, accent: 'text-red-400' },
-      { kind: 'stat', title: 'Dead now', data: { provider: 'durable.state', query: { status: 'dead' } }, accent: 'text-red-400' },
-      { kind: 'stat', title: 'Suspended now', data: { provider: 'durable.state', query: { status: 'suspended' } } },
-      { kind: 'stat', title: 'Running now', data: { provider: 'durable.state', query: { status: 'running' } } },
-      { kind: 'stat', title: 'Pending now', data: { provider: 'durable.state', query: { status: 'pending' } } },
-      { kind: 'topN', title: 'Top failing workflows', data: { provider: 'durable.timeseries', query: { metric: 'topFailures' } }, limit: 10 },
-      { kind: 'table', title: 'Recent failed runs (last 24h)', data: { provider: 'durable.recentFailures', query: { windowMs } },
+      {
+        kind: 'stat',
+        title: 'Success rate',
+        data: { provider: 'durable.timeseries', query: { metric: 'successRate' } },
+        format: 'percent',
+        accent: 'text-emerald-400',
+      },
+      {
+        kind: 'stat',
+        title: 'Failed (window)',
+        data: { provider: 'durable.timeseries', query: { metric: 'failed' } },
+        accent: 'text-red-400',
+      },
+      {
+        kind: 'stat',
+        title: 'Dead now',
+        data: { provider: 'durable.state', query: { status: 'dead' } },
+        accent: 'text-red-400',
+      },
+      {
+        kind: 'stat',
+        title: 'Suspended now',
+        data: { provider: 'durable.state', query: { status: 'suspended' } },
+      },
+      {
+        kind: 'stat',
+        title: 'Running now',
+        data: { provider: 'durable.state', query: { status: 'running' } },
+      },
+      {
+        kind: 'stat',
+        title: 'Pending now',
+        data: { provider: 'durable.state', query: { status: 'pending' } },
+      },
+      {
+        kind: 'stat',
+        title: 'Starved groups',
+        data: { provider: 'durable.workerHealth', query: { metric: 'starvedCount' } },
+        accent: 'text-red-400',
+      },
+      {
+        kind: 'topN',
+        title: 'Top failing workflows',
+        data: { provider: 'durable.timeseries', query: { metric: 'topFailures' } },
+        limit: 10,
+      },
+      {
+        kind: 'table',
+        title: 'Worker groups (backlog vs. live workers)',
+        data: { provider: 'durable.workerHealth', query: {} },
+        columns: [
+          { key: 'group', label: 'Group' },
+          { key: 'queued', label: 'Queued' },
+          { key: 'liveWorkers', label: 'Live workers' },
+          { key: 'status', label: 'Status' },
+        ],
+      },
+      {
+        kind: 'table',
+        title: 'Recent failed runs (last 24h)',
+        data: { provider: 'durable.recentFailures', query: { windowMs } },
         columns: [
           { key: 'updatedAt', label: 'Updated' },
           { key: 'workflow', label: 'Workflow' },
           { key: 'runId', label: 'Run', link: { href: runHref } },
           { key: 'error', label: 'Error' },
-        ] },
+        ],
+      },
     ],
   };
 }

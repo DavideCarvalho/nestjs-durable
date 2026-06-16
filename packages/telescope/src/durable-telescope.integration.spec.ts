@@ -1,13 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { InMemoryStateStore, STATE_STORE, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { ExtensionRegistry } from '@dudousxd/nestjs-telescope';
 import type { ExtensionContext } from '@dudousxd/nestjs-telescope';
-import { InMemoryStateStore, WorkflowEngine, STATE_STORE } from '@dudousxd/nestjs-durable-core';
+import { describe, expect, it } from 'vitest';
 import { durableTelescopeExtension } from './durable-telescope.extension';
 
 function ctxResolving(map: Map<unknown, unknown>): ExtensionContext {
   return {
     config: {} as ExtensionContext['config'],
-    moduleRef: { get: (token: unknown) => map.get(token) } as unknown as ExtensionContext['moduleRef'],
+    moduleRef: {
+      get: (token: unknown) => map.get(token),
+    } as unknown as ExtensionContext['moduleRef'],
   };
 }
 
@@ -47,7 +49,12 @@ describe('durable extension integrates with the real Telescope ExtensionRegistry
     const registry = new ExtensionRegistry([durableTelescopeExtension()], ctx);
     const dash = registry.dashboards().find((d) => d.id === 'durable.workflows');
     expect(dash).toBeDefined();
-    const providerNames = new Set(['durable.state', 'durable.timeseries', 'durable.recentFailures']);
+    const providerNames = new Set([
+      'durable.state',
+      'durable.timeseries',
+      'durable.recentFailures',
+      'durable.workerHealth',
+    ]);
     for (const panel of dash!.panels) {
       expect(providerNames.has(panel.data.provider)).toBe(true);
     }
