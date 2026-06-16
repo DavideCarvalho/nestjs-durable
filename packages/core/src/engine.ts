@@ -1268,6 +1268,13 @@ export class WorkflowEngine {
     }
 
     if (decision.status === 'completed') {
+      // Persist the local steps THIS turn ran before marking the run done. A workflow that runs
+      // straight to completion in a single turn (every step inline, never suspending — e.g. a Python
+      // @workflow whose body is a sequence of ctx.step calls) emits ALL its recordStep commands on
+      // this terminal turn; without applying them the run shows `completed` with zero recorded steps.
+      // Only this turn's NEW steps are present (prior turns' steps replay as `found`, emitting no
+      // command), so there's no duplication.
+      await this.applyCommands(run, decision.commands);
       await this.store.updateRun(run.id, {
         status: 'completed',
         output: decision.output,
@@ -1284,6 +1291,9 @@ export class WorkflowEngine {
       return { runId: run.id, status: 'completed', output: decision.output };
     }
     if (decision.status === 'failed') {
+      // Same as completed: persist the steps this turn ran — including the failed one (the worker
+      // records a failed-step command before raising) — so the dashboard shows WHERE it failed.
+      await this.applyCommands(run, decision.commands);
       const error = decision.error ?? { message: 'workflow failed' };
       await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
       this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
