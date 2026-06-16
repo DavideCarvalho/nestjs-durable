@@ -1,7 +1,7 @@
+import { STATE_STORE, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import type { RunStatus, StateStore } from '@dudousxd/nestjs-durable-core';
 import type { DataProvider, ExtensionContext } from '@dudousxd/nestjs-telescope';
 import { TELESCOPE_STORAGE } from '@dudousxd/nestjs-telescope';
-import { STATE_STORE } from '@dudousxd/nestjs-durable-core';
-import type { RunStatus, StateStore } from '@dudousxd/nestjs-durable-core';
 
 const STATE_CAP = 10_000;
 
@@ -29,7 +29,9 @@ export function durableTimeseriesProvider(): DataProvider {
     async resolve(query, ctx: ExtensionContext) {
       // TELESCOPE_STORAGE.get(query) → { data: Entry[]; nextCursor }. Entry = { content, createdAt, ... }.
       const storage = ctx.moduleRef.get(TELESCOPE_STORAGE, { strict: false }) as {
-        get(q: { type?: string; limit?: number }): Promise<{ data: Array<{ content?: unknown; createdAt?: Date }> }>;
+        get(q: { type?: string; limit?: number }): Promise<{
+          data: Array<{ content?: unknown; createdAt?: Date }>;
+        }>;
       };
       const limit = Math.min(5_000, Math.max(100, Number(query?.limit ?? 2_000)));
       const page = await storage.get({ type: 'durable', limit });
@@ -92,6 +94,38 @@ export function durableRecentFailuresProvider(): DataProvider {
           workflow: r.workflow,
           runId: r.id,
           error: r.error?.message ?? '',
+        }));
+      return { rows };
+    },
+  };
+}
+
+/**
+ * Source D: per-group worker health from the engine (`WorkflowEngine.workerHealth()` — queue depth
+ * vs. live worker heartbeats). `query.metric: 'starvedCount'` returns the number of groups with work
+ * queued and zero live workers (the "alive but not consuming" alert state) as a stat; otherwise a
+ * table, starved groups sorted first. Empty when the transport can't report health (in-process).
+ */
+export function durableWorkerHealthProvider(): DataProvider {
+  return {
+    name: 'durable.workerHealth',
+    async resolve(query, ctx: ExtensionContext) {
+      const engine = ctx.moduleRef.get(WorkflowEngine, { strict: false }) as WorkflowEngine;
+      const health = await engine.workerHealth();
+      const isStarved = (g: { depth: number; liveWorkers: unknown[] }) =>
+        g.depth > 0 && g.liveWorkers.length === 0;
+      if ((query?.metric as string) === 'starvedCount') {
+        return { value: health.filter(isStarved).length };
+      }
+      const rows = health
+        .slice()
+        // Starved groups first, then deepest backlog — the rows that need attention rise to the top.
+        .sort((a, b) => Number(isStarved(b)) - Number(isStarved(a)) || b.depth - a.depth)
+        .map((g) => ({
+          group: g.group,
+          queued: g.depth,
+          liveWorkers: g.liveWorkers.length,
+          status: isStarved(g) ? 'STARVED' : 'ok',
         }));
       return { rows };
     },

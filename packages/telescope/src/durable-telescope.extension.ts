@@ -1,11 +1,12 @@
 import { defineTelescopeExtension } from '@dudousxd/nestjs-telescope';
-import { DurableTelescopeWatcher } from './durable-telescope.watcher';
+import { durableDashboard } from './durable-dashboard.spec-data';
 import {
   durableRecentFailuresProvider,
   durableStateProvider,
   durableTimeseriesProvider,
+  durableWorkerHealthProvider,
 } from './durable-data-providers';
-import { durableDashboard } from './durable-dashboard.spec-data';
+import { DurableTelescopeWatcher } from './durable-telescope.watcher';
 
 /** The first-class Telescope extension for nestjs-durable: watcher + Workflows dashboard. */
 export function durableTelescopeExtension(
@@ -20,6 +21,7 @@ export function durableTelescopeExtension(
       durableStateProvider(),
       durableTimeseriesProvider(),
       durableRecentFailuresProvider(),
+      durableWorkerHealthProvider(),
     ],
   });
 }
