@@ -9,6 +9,7 @@ import {
   durableClient,
   runDisplayStatus,
 } from '../client/durable-client';
+import { mergeLiveEvents } from '../client/merge-live-events';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
@@ -180,7 +181,12 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   const qc = useQueryClient();
   const { data } = useQuery({
     queryKey: ['run', id],
-    queryFn: () => durableClient.run(id),
+    // Merge over the cache instead of replacing it: the store only persists a step's `events` at
+    // completion, so a refetch returns a still-running step empty — replacing would wipe the trail
+    // the live stream appended (sub-processes flicker). Read prev AFTER the fetch so events that
+    // streamed in during the request are kept too.
+    queryFn: async () =>
+      mergeLiveEvents(qc.getQueryData<RunDetail>(['run', id]), await durableClient.run(id)),
     // Live-follow an in-flight run; stop polling once it reaches a terminal state.
     refetchInterval: (q) => {
       const s = (q.state.data as RunDetail | undefined)?.run.status;
@@ -221,9 +227,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           return {
             ...prev,
             timeline: prev.timeline.map((step) =>
-              step.seq === seq
-                ? { ...step, events: [...(step.events ?? []), live] }
-                : step,
+              step.seq === seq ? { ...step, events: [...(step.events ?? []), live] } : step,
             ),
           };
         });
@@ -259,6 +263,19 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   };
   const [sel, setSel] = useState<number>();
   const [showRunIO, setShowRunIO] = useState(false);
+  const [expandedChildren, setExpandedChildren] = useState<Set<string>>(new Set());
+
+  function toggleChild(childId: string) {
+    setExpandedChildren((prev) => {
+      const next = new Set(prev);
+      if (next.has(childId)) {
+        next.delete(childId);
+      } else {
+        next.add(childId);
+      }
+      return next;
+    });
+  }
 
   if (!data) return <div className="p-8 text-sm text-zinc-600">Loading run…</div>;
   const { run, timeline } = data;
@@ -469,6 +486,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               selected={sel}
               onSelect={setSel}
               onOpenRun={onOpenRun}
+              expanded={expandedChildren}
+              onToggleChild={toggleChild}
             />
           </div>
         )}

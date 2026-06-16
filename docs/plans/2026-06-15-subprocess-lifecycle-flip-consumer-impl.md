@@ -14,9 +14,10 @@
 
 ## ⚠️ Coordination & sequencing (read first)
 
-- **Component A (Python SDK `sub_process`/`sub_event`) is DONE and on `main`** (`clients/python/durable_worker`), pending a PyPI release (tag `durable-worker-v0.6.0`). The TS dashboard feature is also released. So the remaining work is: cut the Python release (A2), then B (flip-python-db) and C (flip-nestjs).
-- **Dependency order:** A is done → **B depends on A being released to PyPI** (flip-python-db installs `durable_worker>=0.6.0`). **C-split (handler-as-step) is INDEPENDENT** of the lib release — it only restructures flip-nestjs + relies on Python's existing `file_type_proc_map`, so it can ship first and stand alone.
-- **The double-dispatch bug is OUT OF SCOPE** (af_fleet/mel/metadata running 2×). Run identity + handler-as-step make it *display* correctly (distinct steps/rows); they don't stop the double execution. Separate investigation.
+- **Component A (Python SDK `sub_process`/`sub_event`) is DONE + RELEASED** — `durable-worker 0.6.0` on PyPI. The TS dashboard feature is also released. Remaining: B (flip-python-db authors the `processing` workflow) and C (flip-nestjs registers + triggers it).
+- **Architecture corrected:** the handler-as-step orchestration lives in **flip-python-db** (a Python-authored `@workflow("processing")`), NOT in flip-nestjs's `planPProcesses` (the original draft was wrong — see the Architecture section). flip-nestjs only `startChild`s the workflow.
+- **Dependency order:** A released → **B** (flip-python-db `@workflow("processing")` + `PProcess.run` uses `sub_process`; needs `durable_worker>=0.6.0`) → **C** (flip-nestjs `registerRemote` + `ctx.startChild`, drop the per-proc loop; needs B's workflow worker deployed + a lib bump). B and C are coupled (the group name + the trigger), so land them together.
+- **The double-dispatch bug is OUT OF SCOPE** (af_fleet/mel/metadata running 2×). Handler-as-step + run identity make it *display* correctly (distinct steps/rows); they don't stop the double execution. Separate investigation.
 
 ---
 
@@ -45,92 +46,108 @@ sub_event(id="r1", name="ProcessKpi", group="AF_FLEET", status="ok", data={"dura
 
 Under the hood: `StepContext._emit` extended with `sub_id`/`group`/`phase` (emitting camelCase `subId`/`group`/`phase`); `StepContext.sub_event` + module-level `sub_event`; `_SubProcess` context manager (`__enter__`/`__exit__` with `try/finally` state restore, monotonic duration, `.phase()`/`.skip()`/`.fail()`); log lines auto-stamp `subId` from the current sub. Existing `sub()`/`log()`/`set_process()` unchanged — a legacy `sub("x","ok")` still emits no `subId`. Tests in `clients/python/tests/test_sub_process.py` (9). The dashboard already consumes `subId`/`group`/`phase` (TS feature shipped).
 
-### Task A2: Release the Python SDK to PyPI (tag-triggered — NOT changesets)
+### Task A2: Release the Python SDK to PyPI ✅ DONE — `durable-worker 0.6.0` on PyPI
 
-The Python SDK releases via `.github/workflows/release-python.yml`, triggered by pushing a tag `durable-worker-v*` (or manual `workflow_dispatch`) → builds + publishes to PyPI via OIDC Trusted Publishing.
-
-- [ ] **Step 1:** Bump the version in BOTH `clients/python/pyproject.toml` (`version`) and `clients/python/durable_worker/__init__.py` (`__version__`) from `0.5.0` → `0.6.0` (minor — additive feature). Commit to `main`.
-- [ ] **Step 2:** Push the tag `durable-worker-v0.6.0` to trigger the publish workflow (ASK first — this is the deliberate "publish" action). Confirm the workflow succeeds and `0.6.0` is on PyPI.
+Released via `.github/workflows/release-python.yml` (tag-triggered — NOT changesets; changesets only does the npm packages). Bumped `0.5.0 → 0.6.0` in `pyproject.toml` + `__init__.py`, pushed tag `durable-worker-v0.6.0` → workflow published (verified `200 OK` upload + the package live at https://pypi.org/project/durable-worker/0.6.0/). flip-python-db can now depend on `durable_worker>=0.6.0`.
 
 ---
 
-## Component B — flip-python-db: emit run-id + group + phases
+## Architecture (corrected): processing is a Python-authored workflow
 
-`PProcess.run()` (`app/common/interface/p_process.py`) already: mints `process_run_id = str(uuid.uuid4())` (line ~20), receives `handler_name`, emits v1 SQS lifecycle (TRIGGERED/VALIDATING/PROCESSING/NOT_VALID/COMPLETED/ERROR), and already calls the durable sink `set_current_process(name)` (line ~40) + `emit_subprocess(name, status, msg, {"durationMs": …})` (lines ~102/143/170). The durable worker imports these as `from durable_worker import set_process as set_current_process, sub as emit_subprocess` (`app/durable_processing_worker.py` lines 10-12).
+> The earlier draft put the handler-as-step split in flip-nestjs's `planPProcesses`. **That was wrong** — it relocates orchestration into flip-nestjs. The orchestration ("which handlers, what order") belongs to **flip-python-db**; flip-nestjs is the orchestrator of the *pipeline* and only **triggers** the proc. The polyglot workflow protocol (`docs/plans/2026-06-15-polyglot-workflows-protocol.md`, now implemented: `engine.registerRemote`, `RemoteWorkflowExecutor`, `ctx.startChild`, Python `WorkflowWorker`/`WorkflowContext`/`ctx.step`) lets flip-python-db **author a workflow**. So:
 
-**Goal:** route the EXISTING `process_run_id` + `handler_name` + phase transitions into the durable sink via the new `sub_event` API, so the dashboard groups by run id and shows the lifecycle. **Requires Component A released and installed** (bump the `durable_worker` dependency in `flip-python-db`).
+```
+flip-nestjs  pipeline.workflow.ts (orchestrator)
+   │  processing phase → ctx.startChild("processing", { type, baseId, taskId, context })
+   ▼
+flip-python-db  @workflow("processing")  (run on a Python WorkflowWorker, registered remote)
+   │  for each handler in order:  ctx.step("handle_af_fleet", () => handle_af_fleet_dependent_processes(...))
+   ▼                              ── each handle_* is a STEP (distinct in /durable) ──
+   p-processes inside a handler step:  with sub_process(name, group=handler_name): sp.phase(...) ...
+```
 
-**Files:**
-- Modify: `app/durable_processing_worker.py` (import `sub_event`)
-- Modify: `app/common/interface/p_process.py` (emit phases + terminal via `sub_event`, keyed by `process_run_id`, grouped by `handler_name`)
-- Modify: `app/common/durable_proc_events.py` (extend the sink shim + `EventSink` Protocol to expose `sub_event` and a run-id-aware `set_current_process`)
-- Test: `tests/test_observable.py` / a new `tests/test_durable_proc_events.py`
-
-Component A's context manager makes this much thinner than originally drafted — `PProcess.run()` wraps its body in `with sub_process(...)`, which handles run-id, duration, terminal status (incl. exception→failed), and log tagging automatically. The custom `emit_subprocess`/`emit_subphase` shim is largely unnecessary now.
-
-### Task B1: Re-point the durable sink shim at the SDK's `sub_process`/`sub_event`
-
-`app/common/durable_proc_events.py` currently wraps a context-local `EventSink` with `emit_subprocess`/`emit_log`/`set_current_process`. Simplify:
-- [ ] Re-export (or thinly wrap) `sub_process` and `sub_event` from `durable_worker` so p-process code imports one place. The SDK functions are already no-ops outside a durable step, so the existing "cheap no-op on the v1 SQS path" property is preserved for free — you can drop the custom contextvar sink if nothing else needs it (verify no other caller depends on the old `EventSink`/`set_sink` API first).
-- [ ] Keep `emit_log` (maps to `durable_worker.log`) if p-process step code still emits free log lines.
-- [ ] Tests: assert `sub_process`/`sub_event` are no-ops with no current step (v1 path) and forward correctly under a fake step context.
-
-### Task B2: Wrap `PProcess.run()` in `with sub_process(...)`
-
-- [ ] Replace the manual durable emissions in `PProcess.run()` with a single `with sub_process(self.__class__.__name__, group=handler_name, id=process_run_id) as sp:` around the run body. Pass the EXISTING `process_run_id` as `id` (so durable + v1 SQS share one run identity) and `handler_name` as `group`. Inside: `sp.phase("validating")`; on validation failure `sp.skip("; ".join(validation_errors)); return`; then `sp.phase("processing")`; the clean exit auto-emits `ok` (+ durationMs); an exception auto-emits `failed` and re-raises. Drop the now-redundant `set_current_process(...)`/`emit_subprocess(...)` calls (the CM tags logs + emits the terminal). Keep the v1 SQS lifecycle sends as-is (unchanged — they feed the v1 dashboard).
-- [ ] Confirm duration parity: the CM measures monotonic enter→exit; if you must keep the existing `elapsed_ms()` number on the terminal, pass it via `sp.skip(..., data={"durationMs": elapsed_ms()})` / `sp.fail(..., data={...})` (the CM preserves a caller-supplied `durationMs`).
-- [ ] Tests (`tests/test_observable.py` style — drive a fake PProcess under a fake durable step; assert the emitted events are: phase `validating`, phase `processing`, terminal `ok`, all sharing `subId == process_run_id` and `group == handler_name`; plus the validation-failure→`skipped` and exception→`failed` paths).
-
-### Task B3: Bump the `durable_worker` SDK dependency
-
-- [ ] Bump `flip-python-db`'s `durable_worker` dependency to `>=0.6.0` (the Component A release). Run the durable worker tests.
+- For `type:"all"` the Python `processing` workflow runs **one `ctx.step` per `handle_*`** (af → mel → metadata → mvr → sched_mx → subwo → util) → the run shows N handler steps. The order lives in the Python workflow (replacing `handle_all_processes`'s sequencing).
+- Inside each handler step, every p-process uses the shipped `with sub_process(...)` (run-id + phases + duration + log tagging).
+- flip-nestjs stops the per-proc `ctx.call(processingStep)` loop; it just `startChild`s the Python workflow. `planPProcesses`/`processingStep` stay only for the **v1 SQS** path.
 
 ---
 
-## Component C — flip-nestjs: handler-as-step + lib bump
+## Component B — flip-python-db: author the `processing` workflow
 
-### Task C1: Split `planPProcesses` so `"all"` enqueues one step per handler
-
-This is INDEPENDENT of the lib release — Python's `file_type_proc_map` already supports each `*_dep_procs` proc individually; we stop sending `proc:"all"` (which runs all 7 handlers in one step) and send the 7 handler procs instead, so the workflow's existing `for (const body of plan) await ctx.call(processingStep, body)` loop creates one durable step per handler.
+**Requires `durable_worker>=0.6.0` (Component A — released).**
 
 **Files:**
-- Modify: `src/defense/us/service/readers/file/readers/file-upload.service.ts` (`planPProcesses`, the `processDictionary`)
-- Test: a new spec for `planPProcesses` (vitest)
+- Create: a workflow-worker entrypoint (e.g. `app/durable_processing_workflow_worker.py`) — a `WorkflowWorker(group="<py-workflows>")` registering `@workflow("processing")`, bootstrapped with `workflows.run(redis=redis_url_from_env())`. Deploy it as its own process (k8s), separate from the existing step worker.
+- Modify: `app/p_processes/process_handlers.py` — the leaf `handle_*` stay as the step bodies; the **ordering** logic from `handle_all_processes` moves into the workflow (or `handle_all_processes` is reused as a single step only for non-durable callers — decide at execution).
+- Modify: `app/common/interface/p_process.py` — `PProcess.run()` wraps its body in `with sub_process(...)`.
+- Test: `clients/python` patterns + `tests/test_*` (pytest).
 
-- [ ] **Step 1: Write the failing test.** Create a focused unit test for `planPProcesses` (instantiate the service with stubbed deps, or extract the `processDictionary` mapping to a pure exported function and test that). Assert that `type="all"` yields one body per handler proc (the 7 `*_dep_procs` + metadata), each `{ proc: "<handler proc>", base_id, task_id, context }`, and that a single-type upload (e.g. `"mel"`) still yields exactly `[{ proc: "mel_dep_procs", … }]`.
+### Task B1: `@workflow("processing")` — handlers as steps
 
-  > IMPORTANT — confirm the exact handler proc list with flip-python-db's `file_type_proc_map` (`app/p_process_queue_listener.py`): `subwo_dep_procs`, `util_dep_procs`, `af_dep_procs`, `mvr_dep_procs`, `mel_dep_procs`, `mx_dep_procs`, and the metadata/stats procs that `handle_all_processes` runs (`metadata_generation`? confirm — `handle_all_processes` runs af/mel/metadata/mvr/sched_mx/subwo/util). The `"all"` expansion must enumerate exactly the procs `handle_all_processes` would have run, in the same order, so behavior is preserved.
+- [ ] Author `@workflows.workflow("processing")` `def processing(ctx, data)`: read `type`/`base_id`/`task_id`/`context` from `data`; resolve the ordered handler list (for `"all"` → the 7 `handle_*` in `handle_all_processes`'s order; for a single type → the one handler). For each handler, `ctx.step(f"handle_{name}", lambda h=handler: h(eng, base_id, task_id))`. Return the merged context (what `processingStep` returned before — `{context}` for the COMPLETE_PHASE merge).
 
-- [ ] **Step 2:** Run it, see it fail.
-- [ ] **Step 3: Implement.** Change the `processDictionary` `all` entry from `["all"]` to the ordered list of the per-handler procs that `handle_all_processes` runs. Keep every other type unchanged. Keep `pribuy_model` as `["pri_buy_allocation"]`.
-- [ ] **Step 4:** Run the test, see it pass. Run `pnpm build && pnpm test` for the touched area.
-- [ ] **Step 5: Verify ordering & cancellation semantics.** The workflow loop is sequential (`for … await ctx.call`), preserving handler order. Confirm no inter-handler data dependency exists that `handle_all_processes` relied on beyond ordering (read `handle_all_processes`); document the finding in the PR. Durable cancel replaces the Python `_check_cancel_requested` between handlers — confirm a cancel between steps still halts the run.
-- [ ] **Step 6: Commit.**
+  > IMPORTANT — determinism: `ctx.step` bodies run on the worker and are checkpointed; put ALL the DB/p-process work inside the `ctx.step` body (never in the workflow function's top-level replay path). The handler order must be deterministic across replays (a static list keyed by `type`).
+  > IMPORTANT — confirm the exact ordered handler set from `handle_all_processes` (af/mel/metadata/mvr/sched_mx/subwo/util) and how `eng` (the DB engine) is obtained inside a workflow worker (the step body needs it — thread it via the worker, not the workflow input).
 
-> Note: with handler-as-step, each handler is a distinct durable step, so a handler that double-dispatches shows as two steps (not a merged blob) — and `_emit_handler_expected_count` (Python) still fires per handler. The per-handler `processingStep` output `{context}` continues to merge in the workflow loop unchanged.
+- [ ] Tests: drive `WorkflowWorker.process_task` (pure, transport-free) with a fake history; assert that `type:"all"` emits one `recordStep`/`call` per handler in order, and that a single type emits one. (Mirror `clients/python/tests/test_workflow.py`.)
 
-### Task C2: Bump `@dudousxd/nestjs-durable-*`
+### Task B2: `PProcess.run()` uses `with sub_process(...)`
 
-- [ ] Bump the durable lib deps to the released version (the one from the lib feature + Component A). Run `pnpm build → codegen → typecheck` per flip-nestjs's build order. Commit.
+- [ ] Wrap the run body in `with sub_process(self.__class__.__name__, group=handler_name, id=process_run_id) as sp:` (reuse the EXISTING `process_run_id` + `handler_name`). Inside: `sp.phase("validating")`; validation failure → `sp.skip("; ".join(errors)); return`; `sp.phase("processing")`; clean exit auto-emits `ok`+durationMs; exception auto-emits `failed`+re-raises. Drop the manual `set_current_process`/`emit_subprocess` calls. Keep the v1 SQS lifecycle sends unchanged (they feed the v1 dashboard, still on for now).
+- [ ] To keep the existing `elapsed_ms()` duration, pass it via `sp.skip(..., data={"durationMs": elapsed_ms()})` (the CM preserves a caller-supplied `durationMs`).
+- [ ] Tests (`tests/test_observable.py` style under a fake durable step): assert events = phase `validating`, phase `processing`, terminal `ok`, all sharing `subId == process_run_id`, `group == handler_name`; plus validation-failure→`skipped` and exception→`failed`.
+
+### Task B3: Run + deploy the workflow worker
+
+- [ ] Add the process entrypoint + k8s deployment for the `processing` workflow worker (group must match `engine.registerRemote` in Component C). Bump `durable_worker>=0.6.0`.
+
+---
+
+## Component C — flip-nestjs: register the remote workflow + trigger it
+
+### Task C1: Register `processing` as a remote workflow
+
+- [ ] In the durable module setup, `engine.registerRemote("processing", <version>, { group: "<py-workflows>", executor: new RemoteWorkflowExecutor(transport) })` so the engine dispatches the `processing` workflow to the Python workflow-worker group. (Match the group to Component B's `WorkflowWorker(group=...)`.)
+
+### Task C2: Trigger from the pipeline workflow; drop the per-proc loop
+
+- [ ] In `src/durable/pipeline.workflow.ts`, replace the processing-phase loop:
+  ```ts
+  const plan = this.fileUpload.planPProcesses(type, baseId, taskId, this.processingContext(config));
+  for (const body of plan) { const { context } = await ctx.call(processingStep, body); contexts.push(context); }
+  ```
+  with a single child-workflow trigger:
+  ```ts
+  const { context } = await ctx.startChild("processing", {
+    type, baseId, taskId, ...this.processingContext(config),
+  });
+  ```
+  (confirm `startChild`'s return shape — it awaits the child run's output; adapt the COMPLETE_PHASE merge `recordProcessingContext` to consume it). The handler steps now live in the child `processing` run (linked parent→child in `/durable`).
+- [ ] `planPProcesses` + `processingStep` remain ONLY for the v1 SQS path (`startPProcesses`). Don't delete them.
+- [ ] Verify cancellation: cancelling the parent pipeline run cancels the child (engine-owned); confirm in `/durable`.
+- [ ] Bump `@dudousxd/nestjs-durable-*` to the released versions; `pnpm build → codegen → typecheck:inertia`.
+
+> **Open decision (resolve at execution):** the child-run model means `/durable` shows processing as a linked child run (its own id) with N handler steps — vs. the current single pipeline run. Confirm that's the desired dashboard shape, or whether the pipeline workflow itself should move to Python (then it's one run). Default: child run via `startChild` (smallest change, keeps the TS pipeline as orchestrator).
 
 ---
 
 ## Self-Review
 
 **Spec coverage** (against the design `2026-06-15-extensible-subprocess-lifecycle.md`):
-- Run identity per p-process → reuse existing `process_run_id` as `sub_event.id` (B2). ✓
-- Open `group` = handler → `handler_name` as `group` (B2); but note handler-as-step (C1) makes the step itself the handler boundary, so `group` is belt-and-suspenders. ✓
-- Open phases (triggered/validating/processing) + terminal closed status → B2 emits them; A provides the API. ✓
-- Discrete live events → each phase is its own `sub_event`, streamed via the step's event channel (dashboard already merges `step.progress`). ✓
-- Handler-as-step restructuring → C1. ✓
-- Python SDK mirrors TS `subEvent` → A. ✓
+- Run identity per p-process → reuse existing `process_run_id` as the `sub_process` id (B2). ✓
+- Open `group` = handler → `handler_name` (B2); the handler-step (B1) is also the handler boundary. ✓
+- Open phases (validating/processing) + terminal closed status → `sub_process.phase()` + auto-terminal (B2); the SDK provides it (A, shipped). ✓
+- Discrete live events → phases stream via the step event channel (dashboard merges `step.progress`). ✓
+- `handle_*` as a step + ordering owned by flip-python-db → the Python `@workflow("processing")` (B1). ✓
+- Python SDK ergonomic `sub_process` + flat `sub_event` → A (released 0.6.0). ✓
 - Double-dispatch out of scope → stated. ✓
 
-**Placeholder scan:** Phase A's exact test-runner command and the Python-release mechanism are intentionally "confirm from `pyproject.toml`/prior releases" because the SDK is actively changing under a concurrent session and its release tooling must be read fresh at execution — this is a deliberate re-verify instruction, not a vague TODO. The `"all"` proc list (C1) is pinned to flip-python-db's `file_type_proc_map` + `handle_all_processes` order — confirm the exact set at execution.
+**Placeholder scan:** Two items are deliberate re-verify-at-execution notes, not vague TODOs: (1) the exact ordered `handle_*` set from `handle_all_processes`, and (2) how `eng`/`startChild` return shapes wire up — both must be read fresh against the live flip-python-db / engine code. No "TBD" left.
 
-**Type/name consistency:** `sub_event(id, name, group?, phase?, status?, message?, data?)` (Python A) mirrors the TS `subEvent` signature exactly; emitted JSON keys `subId`/`group`/`phase`/`name`/`status` match the dashboard's `StepEvent`. `process_run_id` (Python) → `subId` (event) → `SubProcess.id` (dashboard). `handler_name` → `group`.
+**Type/name consistency:** `sub_process(name, *, group?, id?)` + `sub_event(id, name, group?, phase?, status?, ...)` (Python A, shipped) emit camelCase `subId`/`group`/`phase`/`name`/`status` matching the dashboard `StepEvent`. `process_run_id` → `subId` → `SubProcess.id`. `handler_name` → `group`. The Python `@workflow("processing")` group name MUST match `engine.registerRemote("processing", …, { group })` (C1) and the `WorkflowWorker(group=…)` (B).
 
 **Open items to resolve at execution (not blockers, but verify):**
-1. Phase A: current shape of `worker.py` after the concurrent session's changes; the SDK release mechanism.
-2. B1: what the SDK's log-tagging hook keys on post-A (name vs subId) — align `set_current_process`.
-3. C1: the exact ordered proc list `handle_all_processes` runs, to preserve behavior.
+1. The exact ordered `handle_*` set + how the DB `eng` reaches a `ctx.step` body inside the workflow worker.
+2. `ctx.startChild` return shape (child output) → adapt the COMPLETE_PHASE context merge in `pipeline.workflow.ts`.
+3. The child-run dashboard shape decision (processing as a linked child run vs moving the whole pipeline to Python) — see the open decision under Component C.
+4. Cancellation cascade parent→child run in `/durable`.

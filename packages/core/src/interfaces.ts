@@ -159,6 +159,33 @@ export interface StepLogger {
     message?: string;
     data?: unknown;
   }): void;
+  /**
+   * Ergonomic sub-process lifecycle: run `body`, timing it, and record a terminal `ok` with the
+   * measured `durationMs` on success — or `failed` (with the error message) if it throws, then
+   * re-throw. `sp.phase(label)` records an intermediate transition; `sp.skip(reason)` a terminal
+   * `skipped`. Logs emitted inside `body` are tagged to this sub-process so the dashboard groups
+   * them under it. Returns whatever `body` returns. The TS twin of the Python SDK's `sub_process`.
+   *
+   * ```ts
+   * const rows = await log.subProcess('fetch-data', async () => readEverything());
+   * await log.subProcess('export-file', () => upload(rows));
+   * ```
+   */
+  subProcess<T>(
+    name: string,
+    body: (sp: SubProcessHandle) => Promise<T> | T,
+    opts?: { group?: string; id?: string },
+  ): Promise<T>;
+}
+
+/** The handle a {@link StepLogger.subProcess} body receives to mark phases / a non-`ok` outcome. */
+export interface SubProcessHandle {
+  /** Record an intermediate phase transition (a consumer-defined label, no terminal status). */
+  phase(phase: string, data?: unknown): SubProcessHandle;
+  /** Record a terminal `skipped` outcome (e.g. nothing to do / validation failed). */
+  skip(reason?: string, data?: unknown): void;
+  /** Record a terminal `failed` outcome explicitly (the wrapper also does this if the body throws). */
+  fail(reason?: string, data?: unknown): void;
 }
 
 export interface StepError {
