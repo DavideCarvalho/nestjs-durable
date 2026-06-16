@@ -367,6 +367,22 @@ export function createWorkflowCtx(
     }
     await store.putSignalWaiter({ token: `child:${id}`, runId, seq: current });
     if (!(await store.getRun(id))) host.startChild(workflowName(workflow), input, id);
+    // Make the awaited child visible in the parent's timeline WHILE it runs: a `running` placeholder
+    // at this seq with the same `signal:child:<id>` name the signal resolution later overwrites as
+    // `completed`. So the dashboard shows the child node (and can inline-expand it) live, instead of
+    // it appearing only when it finishes. Written once (skipped on replay, where `existing` is set);
+    // `running` is ignored by replay history, so it never short-circuits determinism.
+    if (!existing) {
+      await store.saveCheckpoint(
+        instantCheckpoint({
+          runId,
+          seq: current,
+          name: `signal:child:${id}`,
+          kind: 'signal',
+          status: 'running',
+        }),
+      );
+    }
     throw new WorkflowSuspended();
   };
 
