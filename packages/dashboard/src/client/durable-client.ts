@@ -219,3 +219,8 @@ export const durableClient = {
     return () => source.close();
   },
 };
+
+// Re-export the canonical sub-process grouper so external consumers (e.g. flip's embedded
+// pipeline-runs view) reconstruct sub-processes from a step's events the exact same way the
+// dashboard does — by run identity (`subId`/`name`), treating `phase` events as a sub's lifecycle.
+export { type SubProcess, groupSubProcesses } from './group-subprocesses';
