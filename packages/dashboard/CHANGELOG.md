@@ -1,5 +1,13 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.18.0
+
+### Minor Changes
+
+- 95cc4c1: Dashboard: child workflows can now be expanded inline in the spans view — a child step nests the
+  child run's spans beneath it (recursively), so you can drill into child workflows without leaving
+  the parent run. The "open ↗" affordance still opens the child's full run view.
+
 ## 0.17.1
 
 ### Patch Changes
