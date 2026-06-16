@@ -5,6 +5,7 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { DataSource } from 'typeorm';
 import { ENTITIES } from './entities';
+import { JSON_BLOB_COLUMNS, buildWidenStatements, jsonBlobColumnType } from './schema';
 import { TypeOrmStateStore } from './typeorm-state-store';
 
 async function makeStore() {
@@ -253,5 +254,52 @@ describe('TypeOrmStateStore', () => {
     expect(resumed.output).toBe(15);
     expect(aRuns).toBe(1);
     await dataSource.destroy();
+  });
+});
+
+describe('MySQL longtext schema (DDL generation)', () => {
+  const quote = (id: string) => `\`${id}\``;
+
+  it('uses longtext (not text) for JSON-blob columns on MySQL', () => {
+    expect(jsonBlobColumnType(true)).toBe('longtext');
+  });
+
+  it('uses plain text for the JSON-blob columns on Postgres/SQLite', () => {
+    expect(jsonBlobColumnType(false)).toBe('text');
+  });
+
+  it('lists the big JSON blobs (events/output/input/error) but not keyed varchar columns', () => {
+    expect(JSON_BLOB_COLUMNS.durable_step_checkpoints).toEqual(
+      expect.arrayContaining(['input', 'output', 'error', 'events']),
+    );
+    expect(JSON_BLOB_COLUMNS.durable_workflow_runs).toEqual(
+      expect.arrayContaining(['input', 'output', 'error']),
+    );
+    // Keyed/short string columns (MySQL can't index longtext) must NOT be widened.
+    const all = [
+      ...JSON_BLOB_COLUMNS.durable_step_checkpoints,
+      ...JSON_BLOB_COLUMNS.durable_workflow_runs,
+    ];
+    for (const keyed of ['runId', 'seq', 'name', 'kind', 'stepId', 'status', 'id', 'workflow']) {
+      expect(all).not.toContain(keyed);
+    }
+  });
+
+  it('emits idempotent MODIFY ... longtext widen statements for existing MySQL tables', () => {
+    const stmts = buildWidenStatements(true, quote);
+    // Every JSON-blob column on both tables gets a MODIFY-to-longtext.
+    expect(stmts).toContain('ALTER TABLE `durable_step_checkpoints` MODIFY COLUMN `events` longtext');
+    expect(stmts).toContain('ALTER TABLE `durable_step_checkpoints` MODIFY COLUMN `output` longtext');
+    expect(stmts).toContain('ALTER TABLE `durable_workflow_runs` MODIFY COLUMN `input` longtext');
+    expect(stmts).toContain('ALTER TABLE `durable_workflow_runs` MODIFY COLUMN `error` longtext');
+    expect(stmts.every((s) => s.includes('longtext'))).toBe(true);
+    expect(stmts).toHaveLength(
+      JSON_BLOB_COLUMNS.durable_step_checkpoints.length +
+        JSON_BLOB_COLUMNS.durable_workflow_runs.length,
+    );
+  });
+
+  it('emits no widen statements on non-MySQL dialects (text is already unbounded)', () => {
+    expect(buildWidenStatements(false, quote)).toEqual([]);
   });
 });

@@ -1,5 +1,32 @@
 import type { DataSource } from 'typeorm';
 
+/** The JSON-blob columns per table (keyed by table name) that hold free-form payloads and so must
+ *  be the unbounded text type — `longtext` on MySQL, `text` elsewhere. */
+export const JSON_BLOB_COLUMNS: Record<string, string[]> = {
+  durable_workflow_runs: ['input', 'output', 'error', 'tags', 'searchAttributes'],
+  durable_step_checkpoints: ['input', 'output', 'error', 'events'],
+};
+
+/** The SQL type for free-form JSON-blob columns. MySQL `text` caps at 64KB and silently truncates,
+ *  so use `longtext` (4GB) there; Postgres/SQLite `text` is already unbounded. */
+export function jsonBlobColumnType(isMysql: boolean): 'longtext' | 'text' {
+  return isMysql ? 'longtext' : 'text';
+}
+
+/** Idempotent `MODIFY COLUMN ... longtext` statements that widen pre-existing MySQL `text` JSON-blob
+ *  columns. Returns `[]` on non-MySQL dialects (their `text` is already unbounded — nothing to do).
+ *  `quote` quotes an identifier per the active driver. */
+export function buildWidenStatements(isMysql: boolean, quote: (id: string) => string): string[] {
+  if (!isMysql) return [];
+  const out: string[] = [];
+  for (const [table, cols] of Object.entries(JSON_BLOB_COLUMNS)) {
+    for (const col of cols) {
+      out.push(`ALTER TABLE ${quote(table)} MODIFY COLUMN ${quote(col)} longtext`);
+    }
+  }
+  return out;
+}
+
 /**
  * Idempotently create the durable tables. Safe to run on every boot (auto-schema) and the
  * exact function to call from your own TypeORM migration when you disable auto-schema:
@@ -24,7 +51,11 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
   // Keyed/short strings must be varchar on MySQL (a `text` PK/index needs a key length); `text`
   // for the free-form JSON payloads. Dates use the dialect's native timestamp type.
   const str = 'varchar(191)';
-  const txt = 'text';
+  // Free-form JSON payloads (`input`/`output`/`error`/`events`/`tags`/`searchAttributes`). MySQL's
+  // `text` caps at 64KB and *silently truncates* — a large fan-out step's `events` then fails to
+  // parse on read ("Unterminated string in JSON"). Use `longtext` (4GB) on MySQL; Postgres `text`
+  // is already unbounded and SQLite `text` has no length limit.
+  const txt = jsonBlobColumnType(isMysql);
   const int = isMysql ? 'int' : 'integer';
   const ts = isPg ? 'timestamptz' : 'datetime';
 
@@ -104,6 +135,17 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
         if (!have.has(col)) {
           await runner.query(`ALTER TABLE ${q(table)} ADD COLUMN ${q(col)} ${colType}`);
         }
+      }
+    }
+    // Widen pre-existing MySQL `text` JSON-blob columns to `longtext`. A table created before this
+    // fix has these as `text` (64KB) and silently truncates large `events`/`output` payloads. MODIFY
+    // to `longtext` is idempotent (no-op if already longtext), so it's safe to run on every boot.
+    // MySQL-only: Postgres/SQLite `text` is already unbounded, so there's nothing to widen.
+    for (const sql of buildWidenStatements(isMysql, q)) {
+      try {
+        await runner.query(sql);
+      } catch {
+        /* column already longtext, or table/column not present on this deploy */
       }
     }
     // MySQL has no `CREATE INDEX IF NOT EXISTS`; create each best-effort and ignore "already exists".
