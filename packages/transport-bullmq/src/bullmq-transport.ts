@@ -10,6 +10,7 @@ import {
   type Transport,
   type WorkerHeartbeat,
   type WorkflowDecision,
+  type WorkflowStepEvent,
   type WorkflowTask,
   runStepHandler,
 } from '@dudousxd/nestjs-durable-core';
@@ -52,6 +53,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   private taskWorker?: Worker;
   private resultsWorker?: Worker;
   private decisionsWorker?: Worker;
+  private stepEventsWorker?: Worker;
   // Control plane runs over Redis pub/sub (not a queue): every instance gets every message, which
   // is what live-tail + cancellation need. Subscribe needs its own connection (it blocks the client).
   private controlPub?: Redis;
@@ -124,6 +126,29 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.decisionsWorker = new Worker(
       this.decisionsName(),
       (job) => handler(job.data as WorkflowDecision),
+      { connection: this.workerConnection() },
+    );
+  }
+
+  private stepEventsName(): string {
+    return `${this.prefix}-step-events`;
+  }
+
+  /** workflow worker → engine: stream a local step's lifecycle. Point-to-point on its own queue, so a
+   *  single engine instance consumes each event and checkpoints it once (no cross-pod duplicate writes). */
+  async dispatchStepEvent(event: WorkflowStepEvent): Promise<void> {
+    await this.queue(this.stepEventsName()).add('stepEvent', event, {
+      removeOnComplete: true,
+      removeOnFail: true,
+    });
+  }
+
+  /** engine ← workflow worker: consume streamed step lifecycle events. Starts the consumer on first call. */
+  onStepEvent(handler: (event: WorkflowStepEvent) => Promise<void>): void {
+    if (this.stepEventsWorker) return;
+    this.stepEventsWorker = new Worker(
+      this.stepEventsName(),
+      (job) => handler(job.data as WorkflowStepEvent),
       { connection: this.workerConnection() },
     );
   }
@@ -297,6 +322,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     await this.taskWorker?.close();
     await this.resultsWorker?.close();
     await this.decisionsWorker?.close();
+    await this.stepEventsWorker?.close();
     await Promise.all([...this.queues.values()].map((q) => q.close()));
     this.controlPub?.disconnect();
     this.controlSub?.disconnect();

@@ -1,4 +1,11 @@
-import type { GroupHealth, Heartbeat, NamedTransport, RemoteTask, StepResult } from './interfaces';
+import type {
+  GroupHealth,
+  Heartbeat,
+  NamedTransport,
+  RemoteTask,
+  StepResult,
+  WorkflowStepEvent,
+} from './interfaces';
 
 /**
  * An ordered pool of named transports. The engine dispatches on the first and fails over to the
@@ -12,15 +19,20 @@ export class TransportPool {
     return this.transports.length;
   }
 
-  /** Register the engine's result/heartbeat handlers on EVERY transport — a result can come back on
-   *  whichever one delivered the task, so failover stays symmetric. */
+  /** Register the engine's result/heartbeat/step-event handlers on EVERY transport — a result can come
+   *  back on whichever one delivered the task, so failover stays symmetric. `onStepEvent` is wired only
+   *  on transports that carry streamed workflow step lifecycle (BullMQ); others simply skip it. */
   bind(
     onResult: (result: StepResult) => Promise<void>,
     onHeartbeat: (beat: Heartbeat) => Promise<void>,
+    onStepEvent?: (event: WorkflowStepEvent) => Promise<void>,
   ): void {
     for (const { transport } of this.transports) {
       transport.onResult(onResult);
       transport.onHeartbeat(onHeartbeat);
+      if (onStepEvent && transport.onStepEvent) {
+        transport.onStepEvent(onStepEvent);
+      }
     }
   }
 

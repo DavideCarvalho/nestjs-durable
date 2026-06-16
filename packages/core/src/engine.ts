@@ -40,6 +40,7 @@ import type {
   WorkflowDecision,
   WorkflowExecutor,
   WorkflowRun,
+  WorkflowStepEvent,
 } from './interfaces';
 import type { HistoryEvent } from './interfaces';
 import { breakpointToken, stepId } from './protocol';
@@ -313,6 +314,11 @@ export class WorkflowEngine {
       // A heartbeat for an in-flight long step resets its liveness window (see callRemote).
       async (beat) => {
         this.heartbeatResets.get(beat.stepId)?.();
+      },
+      // A remote workflow worker streams each local step's lifecycle (running → completed/failed) so
+      // it's checkpointed live, not all-at-once when the long turn ends.
+      async (event) => {
+        await this.persistStepEvent(event);
       },
     );
     // Control plane: re-broadcast lifecycle events from OTHER instances to this instance's
@@ -1114,6 +1120,68 @@ export class WorkflowEngine {
   }
 
   /**
+   * Persist a streamed local-step lifecycle event from a remote workflow worker (see
+   * {@link WorkflowStepEvent}). A Python `@workflow` runs its `ctx.step`s inline over one turn that
+   * can last minutes; the worker streams each step's start/finish so the engine checkpoints it LIVE —
+   * a step shows `running` the moment its body begins, then resolves to `completed`/`failed` with its
+   * real wall-clock window and sub-process events — instead of every step appearing at once when the
+   * turn ends. The turn's final `recordStep` command re-persists the same (runId, seq) checkpoint
+   * idempotently, so this is purely additive observability and never changes the run's outcome.
+   */
+  private async persistStepEvent(event: WorkflowStepEvent): Promise<void> {
+    const startedAt = new Date(event.startedAt);
+    const events = event.events && event.events.length > 0 ? event.events : undefined;
+    if (event.phase === 'running') {
+      await this.store.saveCheckpoint({
+        runId: event.runId,
+        seq: event.seq,
+        name: event.name,
+        kind: 'local',
+        stepId: stepId(event.runId, event.seq),
+        status: 'running',
+        events,
+        attempts: 1,
+        enqueuedAt: startedAt,
+        startedAt,
+        finishedAt: startedAt, // placeholder until the step settles
+      });
+      this.emit({
+        type: 'step.started',
+        runId: event.runId,
+        seq: event.seq,
+        name: event.name,
+        kind: 'local',
+      });
+      return;
+    }
+    const failed = event.phase === 'failed';
+    await this.store.saveCheckpoint({
+      runId: event.runId,
+      seq: event.seq,
+      name: event.name,
+      kind: 'local',
+      stepId: stepId(event.runId, event.seq),
+      status: failed ? 'failed' : 'completed',
+      output: failed ? undefined : event.output,
+      error: failed ? event.error : undefined,
+      events,
+      attempts: 1,
+      enqueuedAt: startedAt,
+      startedAt,
+      finishedAt: event.finishedAt != null ? new Date(event.finishedAt) : new Date(),
+    });
+    this.emit({
+      type: failed ? 'step.failed' : 'step.completed',
+      runId: event.runId,
+      seq: event.seq,
+      name: event.name,
+      kind: 'local',
+      output: failed ? undefined : event.output,
+      error: failed ? event.error : undefined,
+    });
+  }
+
+  /**
    * Announce a local step's body has begun and (when `trackStepStart`) checkpoint it as `running`,
    * so it's visible in flight rather than appearing only on completion. The checkpoint is a
    * placeholder overwritten by {@link completeStep}/{@link failStep}; it never short-circuits replay
@@ -1391,6 +1459,11 @@ export class WorkflowEngine {
       const at = new Date();
       const id = stepId(run.id, cmd.seq);
       if (cmd.kind === 'recordStep') {
+        // Prefer the step's real wall-clock window + sub-process events (carried by the command, and
+        // already streamed live via persistStepEvent) so the checkpoint shows a true duration and its
+        // p-process trail — not a 0ms placeholder. Fall back to apply-time for older workers.
+        const startedAt = cmd.startedAt != null ? new Date(cmd.startedAt) : at;
+        const finishedAt = cmd.finishedAt != null ? new Date(cmd.finishedAt) : at;
         await this.store.saveCheckpoint({
           runId: run.id,
           seq: cmd.seq,
@@ -1400,10 +1473,11 @@ export class WorkflowEngine {
           status: cmd.error ? 'failed' : 'completed',
           output: cmd.output,
           error: cmd.error,
+          events: cmd.events && cmd.events.length > 0 ? cmd.events : undefined,
           attempts: 1,
-          enqueuedAt: at,
-          startedAt: at,
-          finishedAt: at,
+          enqueuedAt: startedAt,
+          startedAt,
+          finishedAt,
         });
         this.emit({
           type: cmd.error ? 'step.failed' : 'step.completed',
