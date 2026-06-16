@@ -340,10 +340,14 @@ class Worker:
             return {"chargeId": res.id}
     """
 
-    def __init__(self, group: str = "default") -> None:
+    def __init__(self, group: str = "default", *, auto_register: bool = True) -> None:
         self.group = group
         self._handlers: Dict[str, Handler] = {}
         self._blocking: Dict[str, bool] = {}
+        # Auto-register into the module-level registry so :func:`run_all` can discover this worker
+        # without the consumer listing it. Opt out with ``auto_register=False`` (one-off/test workers).
+        if auto_register:
+            register_worker(self)
 
     def step(self, name: str, *, blocking: bool = False) -> Callable[[Handler], Handler]:
         """Decorator registering ``fn`` as the handler for step ``name``.
@@ -512,6 +516,45 @@ class Worker:
         else:
             error = {"message": str(err)}
         return _with_events({**base, "status": "failed", "error": error}, ctx)
+
+
+# Module-level auto-registry. Every Worker/WorkflowWorker built with ``auto_register=True`` (the
+# default) appends itself here, so :func:`run_all` can run every worker the process imported without
+# the consumer listing them — the celery-``autodiscover`` style "magic" form.
+_REGISTERED_WORKERS: list = []
+
+
+def register_worker(worker: "Any") -> None:
+    """Add ``worker`` to the auto-registry (idempotent on identity)."""
+    if not any(existing is worker for existing in _REGISTERED_WORKERS):
+        _REGISTERED_WORKERS.append(worker)
+
+
+def registered_workers() -> list:
+    """Return a shallow copy of the registered workers (callers can't mutate the registry)."""
+    return list(_REGISTERED_WORKERS)
+
+
+def clear_registered_workers() -> None:
+    """Empty the auto-registry (for tests / re-init)."""
+    _REGISTERED_WORKERS.clear()
+
+
+def run_all(*, redis: str = "redis://localhost:6379", prefix: str = "durable") -> None:
+    """Run **every** auto-registered worker in one process via :func:`run_workers`.
+
+    The celery-``autodiscover`` style "magic" form: the consumer imports the modules that construct
+    its :class:`Worker` / :class:`.WorkflowWorker` instances (so they auto-register), then calls
+    ``run_all()`` — no list. The explicit :func:`run_workers` stays as the non-magic alternative.
+
+    With no registered workers this returns early (nothing to run) rather than blocking forever on
+    an empty stop-wait.
+    """
+    workers = registered_workers()
+    if not workers:
+        print("durable_worker.run_all: no workers registered — nothing to run.")
+        return
+    run_workers(workers, redis=redis, prefix=prefix)
 
 
 def run_workers(

@@ -166,9 +166,16 @@ class WorkflowWorker:
     """Registers workflow functions by name and turns a workflow task into a decision. Pure and
     transport-free (``process_task`` is a function of the task), so it's testable without a broker."""
 
-    def __init__(self, group: str = "workflows") -> None:
+    def __init__(self, group: str = "workflows", *, auto_register: bool = True) -> None:
         self.group = group
         self._workflows: Dict[str, WorkflowFn] = {}
+        # Auto-register into the module-level registry so :func:`~durable_worker.worker.run_all` can
+        # discover this worker. Opt out with ``auto_register=False``. Importing from ``.worker`` here
+        # is safe: ``worker.py`` imports ``workflow.py`` only inside functions, so there's no cycle.
+        if auto_register:
+            from .worker import register_worker
+
+            register_worker(self)
 
     def workflow(self, name: str) -> Callable[[WorkflowFn], WorkflowFn]:
         """Decorator registering ``fn`` as the workflow ``name``. ``fn(ctx, input)`` (or ``fn(ctx)``)."""
