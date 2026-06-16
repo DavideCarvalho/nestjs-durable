@@ -528,6 +528,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               onSelect={setSel}
               onOpenRun={onOpenRun}
               fmtDuration={durMs}
+              expanded={expandedChildren}
+              onToggleChild={toggleChild}
             />
           )}
           {(run.status === 'failed' || run.status === 'cancelled') && run.error && (
@@ -558,7 +560,14 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             />
           </div>
         )}
-        {selStep && <StepDetailPanel step={selStep} run={run} onClose={() => setSel(undefined)} />}
+        {selStep && (
+          <StepDetailPanel
+            step={selStep}
+            run={run}
+            onClose={() => setSel(undefined)}
+            onOpenRun={onOpenRun}
+          />
+        )}
         {showRunIO && <RunInfoPanel run={run} onClose={() => setShowRunIO(false)} />}
       </div>
     </div>
