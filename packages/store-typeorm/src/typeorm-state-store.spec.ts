@@ -288,8 +288,12 @@ describe('MySQL longtext schema (DDL generation)', () => {
   it('emits idempotent MODIFY ... longtext widen statements for existing MySQL tables', () => {
     const stmts = buildWidenStatements(true, quote);
     // Every JSON-blob column on both tables gets a MODIFY-to-longtext.
-    expect(stmts).toContain('ALTER TABLE `durable_step_checkpoints` MODIFY COLUMN `events` longtext');
-    expect(stmts).toContain('ALTER TABLE `durable_step_checkpoints` MODIFY COLUMN `output` longtext');
+    expect(stmts).toContain(
+      'ALTER TABLE `durable_step_checkpoints` MODIFY COLUMN `events` longtext',
+    );
+    expect(stmts).toContain(
+      'ALTER TABLE `durable_step_checkpoints` MODIFY COLUMN `output` longtext',
+    );
     expect(stmts).toContain('ALTER TABLE `durable_workflow_runs` MODIFY COLUMN `input` longtext');
     expect(stmts).toContain('ALTER TABLE `durable_workflow_runs` MODIFY COLUMN `error` longtext');
     expect(stmts.every((s) => s.includes('longtext'))).toBe(true);
@@ -301,5 +305,60 @@ describe('MySQL longtext schema (DDL generation)', () => {
 
   it('emits no widen statements on non-MySQL dialects (text is already unbounded)', () => {
     expect(buildWidenStatements(false, quote)).toEqual([]);
+  });
+});
+
+describe('tolerant read of corrupt/truncated JSON columns', () => {
+  it('degrades a truncated checkpoint `events`/`output` blob to undefined instead of throwing', async () => {
+    const { store, dataSource } = await makeStore();
+    await store.createRun(run());
+    await store.saveCheckpoint(checkpoint({ events: [{ type: 'log', message: 'hi' }] }));
+
+    // Simulate the old MySQL `text` 64KB truncation: overwrite the stored JSON text with an
+    // unterminated string ("Unterminated string in JSON") directly via SQL, bypassing the store.
+    await dataSource.query(
+      'UPDATE durable_step_checkpoints SET events = ?, output = ? WHERE runId = ? AND seq = ?',
+      ['[{"type":"log","message":"hi', '{"ok":tru', 'r1', 0],
+    );
+
+    // The read must not throw — the bad fields degrade to undefined, the rest of the row survives.
+    let cp: StepCheckpoint | null = null;
+    await expect(
+      (async () => {
+        cp = await store.getCheckpoint('r1', 0);
+      })(),
+    ).resolves.not.toThrow();
+    expect(cp).not.toBeNull();
+    expect(cp?.events).toBeUndefined();
+    expect(cp?.output).toBeUndefined();
+    // Untouched columns are intact.
+    expect(cp?.name).toBe('reserve');
+    expect(cp?.status).toBe('completed');
+
+    // listCheckpoints (the run-detail fan-out read) is equally tolerant.
+    const list = await store.listCheckpoints('r1');
+    expect(list).toHaveLength(1);
+    expect(list[0]?.events).toBeUndefined();
+
+    await dataSource.destroy();
+  });
+
+  it('degrades a truncated run `output` blob to undefined and still returns the run', async () => {
+    const { store, dataSource } = await makeStore();
+    await store.createRun(run({ output: { total: 42 } }));
+
+    await dataSource.query('UPDATE durable_workflow_runs SET output = ? WHERE id = ?', [
+      '{"total":4',
+      'r1',
+    ]);
+
+    const got = await store.getRun('r1');
+    expect(got).not.toBeNull();
+    expect(got?.output).toBeUndefined();
+    expect(got?.workflow).toBe('checkout');
+    // A valid sibling JSON column still parses normally.
+    expect(got?.input).toEqual({ orderId: 'o1' });
+
+    await dataSource.destroy();
   });
 });

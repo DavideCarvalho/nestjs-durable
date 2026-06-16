@@ -141,19 +141,24 @@ export class TypeOrmStateStore implements StateStore {
   }
 
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    const where: Record<string, unknown> = {};
-    if (query.workflow) where.workflow = query.workflow;
-    if (query.status) where.status = query.status;
+    // `tags` carries a custom JSON transformer, and TypeORM applies a column transformer's `to()` to
+    // FindOperator values too — so a `Like('%"etl"%')` in a plain `where` would be JSON-stringified
+    // and corrupt the LIKE pattern. Use the query builder with a raw parameter to bypass that.
+    const qb = this.runs().createQueryBuilder('r');
+    if (query.workflow) qb.andWhere('r.workflow = :workflow', { workflow: query.workflow });
+    if (query.status) qb.andWhere('r.status = :status', { status: query.status });
     // `tags` is a JSON-text column; match the quoted token so `etl` doesn't match `etl-foo`.
-    if (query.tag) where.tags = Like(`%"${query.tag}"%`);
+    if (query.tag) qb.andWhere('r.tags LIKE :tagPattern', { tagPattern: `%"${query.tag}"%` });
     // Typed/range attribute predicates aren't expressible in portable SQL, so fetch the coarse rows
     // (newest first) and filter + paginate them in-process. Without attributes, the DB paginates.
-    const order = { createdAt: 'DESC' as const }; // newest first — recent runs on top in the dashboard
+    qb.orderBy('r.createdAt', 'DESC'); // newest first — recent runs on top in the dashboard
     if (query.attributes?.length) {
-      const rows = await this.runs().find({ where, order });
+      const rows = await qb.getMany();
       return applyAttributeQuery(rows.map(fromRunEntity), query);
     }
-    const rows = await this.runs().find({ where, take: query.limit, skip: query.offset, order });
+    if (query.limit != null) qb.take(query.limit);
+    if (query.offset != null) qb.skip(query.offset);
+    const rows = await qb.getMany();
     return rows.map(fromRunEntity);
   }
 
