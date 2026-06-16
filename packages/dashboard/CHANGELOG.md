@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.20.0
+
+### Minor Changes
+
+- 16419df: `/durable` spans panel UX: the spans panel is now **user-resizable** (drag the divider above it; clamped so neither the graph nor the spans collapse to nothing), and each step's **sub-process waterfall is collapsible** (a chevron per fan-out step hides/shows its p-process rows — handy when a step fans out into dozens).
+
 ## 0.19.0
 
 ### Minor Changes
