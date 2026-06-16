@@ -1,6 +1,10 @@
+import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
+import { durableClient } from '../client/durable-client';
 import type { StepCheckpoint, StepEvent, WorkflowRun } from '../client/durable-client';
 import { type SubProcess, groupSubProcesses } from '../client/group-subprocesses';
+import { RunSpans } from './SpansTimeline';
+import { childRunIdOf } from './child-link';
 import { BoltIcon, CheckIcon, CopyIcon, KIND_LABEL, XIcon, iconFor } from './icons';
 
 function fmtMs(ms: number): string {
@@ -255,15 +259,65 @@ function Field({ k, v, mono = true }: { k: string; v: React.ReactNode; mono?: bo
   );
 }
 
+/** The child run's span waterfall, fetched and rendered inline inside the step-detail panel — so a
+ *  child-workflow step (click its node → this panel) drills into the child without leaving the run.
+ *  A running child with no recorded step yet shows a placeholder rather than an empty box. */
+function ChildRunInline({
+  id,
+  onOpenRun,
+}: {
+  id: string;
+  onOpenRun?: (id: string) => void;
+}) {
+  const { data } = useQuery({ queryKey: ['run', id], queryFn: () => durableClient.run(id) });
+  // Local expand state for grandchildren expanded within this nested waterfall.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggle = (childId: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(childId)) next.delete(childId);
+      else next.add(childId);
+      return next;
+    });
+  if (!data) {
+    return <div className="mono px-2 py-2 text-[10px] text-zinc-600">loading child run…</div>;
+  }
+  if (data.timeline.length === 0) {
+    return (
+      <div className="mono px-2 py-2 text-[10px] text-zinc-600">
+        no steps recorded yet — child {data.run.status}
+      </div>
+    );
+  }
+  return (
+    <div className="mt-2 max-h-80 space-y-1 overflow-auto rounded-md border border-[var(--line)] bg-black/20 p-1.5">
+      <RunSpans
+        run={data.run}
+        timeline={data.timeline}
+        depth={0}
+        onSelect={() => {}}
+        onOpenRun={onOpenRun ?? (() => {})}
+        expanded={expanded}
+        onToggleChild={toggle}
+      />
+    </div>
+  );
+}
+
 export function StepDetailPanel({
   step,
   run,
   onClose,
+  onOpenRun,
 }: {
   step: StepCheckpoint;
   run: WorkflowRun;
   onClose: () => void;
+  /** Navigate to another run — enables the child-run "open ↗" link in the detail. */
+  onOpenRun?: (id: string) => void;
 }) {
+  const childRunId = childRunIdOf(step);
+  const [childOpen, setChildOpen] = useState(false);
   const failed = step.status === 'failed';
   // in-flight: a remote step awaiting its worker (`pending`) or a local step body executing (`running`)
   const pending = step.status === 'pending' || step.status === 'running';
@@ -352,6 +406,40 @@ export function StepDetailPanel({
         )}
 
         {step.events && step.events.length > 0 && <StepEvents events={step.events} />}
+
+        {childRunId && (
+          <section className="rise">
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">
+                child run
+              </span>
+              {onOpenRun && (
+                <button
+                  type="button"
+                  onClick={() => onOpenRun(childRunId)}
+                  className="mono rounded border border-[var(--line)] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-500 transition-colors hover:text-zinc-200"
+                >
+                  open ↗
+                </button>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => setChildOpen((v) => !v)}
+              className="flex w-full items-center gap-2 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2.5 py-1.5 text-left transition-colors hover:bg-indigo-500/20"
+              title={childOpen ? 'Collapse child run' : 'Expand child run inline'}
+            >
+              <span
+                className="inline-block text-[9px] text-indigo-300 transition-transform"
+                style={{ transform: childOpen ? 'rotate(90deg)' : 'rotate(0deg)' }}
+              >
+                ▸
+              </span>
+              <span className="mono truncate text-[11px] text-indigo-300">{childRunId}</span>
+            </button>
+            {childOpen && <ChildRunInline id={childRunId} onOpenRun={onOpenRun} />}
+          </section>
+        )}
 
         {step.input !== undefined && <Json label="input" value={step.input} />}
         {step.output !== undefined && <Json label="output" value={step.output} />}

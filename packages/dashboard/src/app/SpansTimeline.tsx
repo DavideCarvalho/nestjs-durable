@@ -23,7 +23,7 @@ const SUB_DOT: Record<SubStatus, string> = {
   skipped: 'bg-amber-400',
 };
 
-function RunSpans({
+export function RunSpans({
   run,
   timeline,
   depth,
