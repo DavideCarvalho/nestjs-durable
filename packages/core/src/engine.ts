@@ -17,6 +17,7 @@ import type {
   ControlPlane,
   EngineEvent,
   EngineListener,
+  GroupHealth,
   NamedTransport,
   RemoteStepDef,
   RemoteTask,
@@ -1083,6 +1084,33 @@ export class WorkflowEngine {
       if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') childIds.add(cp.output);
     }
     return [...childIds];
+  }
+
+  /** The worker groups this engine dispatches to: every registered remote workflow's group, plus any
+   *  `extra` the caller declares. Local-step groups (a group consumed by in-process `@DurableStep`
+   *  workers, e.g. `pipeline`) aren't derivable from registrations — pass them via `extra` so a group
+   *  with backlog and ZERO workers is still reported (the alert case has no heartbeat to discover). */
+  knownGroups(extra: string[] = []): string[] {
+    const groups = new Set<string>(extra);
+    for (const def of this.workflows.values()) {
+      if (def.remote?.group) groups.add(def.remote.group);
+    }
+    return [...groups];
+  }
+
+  /** Per-group worker health (queue backlog + live worker heartbeats). Covers {@link knownGroups}
+   *  (so a registered group with backlog and ZERO workers still reports — the alert case) UNION the
+   *  groups discovered from live heartbeats (so a local-step group like `pipeline`, not derivable
+   *  from registrations, shows once its workers beat). Empty when no transport can introspect health
+   *  (only the BullMQ transport implements `groupHealth`). */
+  async workerHealth(extra: string[] = []): Promise<GroupHealth[]> {
+    const groups = new Set([...this.knownGroups(extra), ...(await this.pool.listWorkerGroups())]);
+    const out: GroupHealth[] = [];
+    for (const group of groups) {
+      const health = await this.pool.groupHealth(group);
+      if (health) out.push(health);
+    }
+    return out;
   }
 
   /**
