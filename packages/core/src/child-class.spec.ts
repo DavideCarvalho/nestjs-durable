@@ -134,4 +134,28 @@ describe('class-ref forms of child / startChild / start', () => {
     );
     expect(resolved?.status).toBe('completed');
   });
+
+  it('keeps an awaited child in getRunChildren after it (and the parent) completes', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('slowchild', '1', async (ctx) => {
+      await ctx.waitForSignal('go');
+      return { done: true };
+    });
+    engine.register('par', '1', async (ctx) => {
+      await ctx.child('slowchild', {}, 'par.child.0');
+      return 'ok';
+    });
+
+    await startRun(engine, 'par', {}, 'par');
+    // While suspended on the live `child:` waiter, the edge is present.
+    await poll(async () => (await engine.getRunChildren('par')).includes('par.child.0'));
+
+    // Let the child finish — the live waiter is consumed, but the persisted `signal:child:`
+    // checkpoint keeps the edge, so a completed parent still lists its child (regression: the
+    // processing child used to vanish from the run view the moment it finished).
+    await engine.signal('go', undefined);
+    await poll(async () => (await store.getRun('par'))?.status === 'completed');
+    expect(await engine.getRunChildren('par')).toContain('par.child.0');
+  });
 });

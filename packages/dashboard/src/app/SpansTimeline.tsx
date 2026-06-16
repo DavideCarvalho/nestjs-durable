@@ -117,8 +117,10 @@ function RunSpans({
           <div key={step.seq}>
             <button
               type="button"
-              onClick={() => (childRunId ? onOpenRun(childRunId) : onSelect(step.seq))}
-              title={isChild ? 'Child workflow — click to open its run' : undefined}
+              onClick={() => onSelect(step.seq)}
+              title={
+                isChild ? 'Child workflow — click for its detail (↗ opens its run)' : undefined
+              }
               className={`group grid w-full grid-cols-[150px_1fr] items-center gap-3 rounded-md px-2 py-1 text-left transition-colors ${
                 active ? 'bg-zinc-800/60' : 'hover:bg-zinc-900/60'
               }`}
@@ -172,7 +174,20 @@ function RunSpans({
                   <Icon width={12} height={12} />
                 </span>
                 <span className="truncate text-[12px] text-zinc-300">{step.name}</span>
-                {isChild && <span className="text-indigo-300">↗</span>}
+                {isChild && childRunId !== undefined && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      // Navigate to the child run — the row body click opens this step's detail.
+                      e.stopPropagation();
+                      onOpenRun(childRunId);
+                    }}
+                    title="Open the child run"
+                    className="shrink-0 text-indigo-300 transition-colors hover:text-indigo-100"
+                  >
+                    ↗
+                  </button>
+                )}
               </span>
               <span className="relative h-5">
                 {/* track */}
