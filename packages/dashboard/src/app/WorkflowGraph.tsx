@@ -266,7 +266,17 @@ export function WorkflowGraph({
   onToggleChild?: (id: string) => void;
 }) {
   const resolvedExpanded = expanded ?? EMPTY_EXPANDED;
-  const childData = useExpandedChildDetails(resolvedExpanded);
+  // Fetch every expanded child (to lay out its sub-flow) plus every root-level child (so even a
+  // collapsed child node reads the child's real workflow name, not the raw `signal:child:<id>`).
+  const childIdsToFetch = useMemo(() => {
+    const ids = new Set(resolvedExpanded);
+    for (const step of timeline) {
+      const childId = childRunIdOf(step);
+      if (childId !== undefined) ids.add(childId);
+    }
+    return ids;
+  }, [resolvedExpanded, timeline]);
+  const childData = useExpandedChildDetails(childIdsToFetch);
 
   // Built inline (not memoized): it reads `childData`, a fresh object each render, and the graph is
   // small enough that recomputing is cheap; ReactFlow reconciles nodes/edges by id.
@@ -309,6 +319,9 @@ export function WorkflowGraph({
         const id = `${prefix}s${s.seq}`;
         const childId = childRunIdOf(s);
         const childExpanded = childId !== undefined && resolvedExpanded.has(childId);
+        // Child nodes read the child's real workflow name, not the raw `signal:child:<id>` checkpoint.
+        const displayName =
+          childId !== undefined ? (childData[childId]?.run.workflow ?? 'child workflow') : s.name;
         nodes.push({
           id,
           type: 'step',
@@ -316,7 +329,7 @@ export function WorkflowGraph({
           position: { x: cursorX, y: depth * laneY },
           data: {
             seq: s.seq,
-            name: s.name,
+            name: displayName,
             kind: s.kind,
             status: s.status,
             workerGroup: s.workerGroup,
