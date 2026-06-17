@@ -204,6 +204,17 @@ export interface WorkflowEngineDeps {
    */
   context?: () => Record<string, unknown> | undefined;
   /**
+   * Re-hydrate the originating context around a LOCAL step body, so a `@DurableStep` reader sees the
+   * tenant / user / correlation ids that were live when the run was started — even on a path the
+   * engine drives outside the originating request scope (a resume after crash/scale-down, a timer).
+   * Given the carrier produced by {@link context} (may be empty/undefined) and the step body `fn`, it
+   * runs `fn` with that context ambiently established (e.g. inside `@dudousxd/nestjs-context`'s ALS)
+   * and returns its result. Keep core dependency-free: supply this from the nestjs wiring (which owns
+   * nestjs-context) or your own ALS bridge. The handler signature is unchanged — re-hydration is
+   * ambient. Default: passthrough (`(_, fn) => fn()`), so behavior is byte-identical when unset.
+   */
+  rehydrate?: <T>(carrier: Record<string, unknown> | undefined, fn: () => T) => T;
+  /**
    * Attempts for each saga compensation when the run fails (a transient undo — e.g. a refund API
    * hiccup — gets another try). Default 1 (no retry). Compensations must be idempotent.
    */
@@ -244,6 +255,8 @@ export class WorkflowEngine {
   private readonly webhookUrl?: (token: string) => string;
   private readonly traceparent?: () => string | undefined;
   private readonly context?: () => Record<string, unknown> | undefined;
+  /** Establish the originating context ambiently around a local step body (see {@link WorkflowEngineDeps.rehydrate}). Default passthrough. */
+  private readonly rehydrate: <T>(carrier: Record<string, unknown> | undefined, fn: () => T) => T;
   private readonly compensationRetries: number;
   /** Persist a `running` checkpoint at the start of a local step body (see {@link WorkflowEngineDeps.trackStepStart}). */
   private readonly trackStepStart: boolean;
@@ -297,6 +310,8 @@ export class WorkflowEngine {
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.context = deps.context;
+    // Default passthrough: with no bridge supplied, a local step body runs exactly as before.
+    this.rehydrate = deps.rehydrate ?? ((_carrier, fn) => fn());
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
     this.trackStepStart = deps.trackStepStart ?? true;
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
@@ -508,14 +523,24 @@ export class WorkflowEngine {
     };
   }
 
-  /** Fold the registered interceptors around a local step body (identity when there are none). */
+  /**
+   * Fold the registered interceptors around a local step body (identity when there are none), then
+   * run the whole thing inside the re-hydrated originating context. The carrier is read at execution
+   * time from {@link context} — the SAME reader stamped on dispatched remote tasks — so a local step
+   * sees the live tenant / user / trace ids ambiently (via the {@link rehydrate} bridge). Default
+   * `rehydrate` is a passthrough, so this is byte-identical to a bare body call when unwired.
+   */
   private interceptStep<T>(invocation: StepInvocation, body: () => Promise<T>): Promise<T> {
-    if (this.interceptors.length === 0) return body();
-    const chain = this.interceptors.reduceRight<() => Promise<unknown>>(
-      (next, interceptor) => () => interceptor(invocation, next),
-      body as () => Promise<unknown>,
-    );
-    return chain() as Promise<T>;
+    const carrier = this.context?.();
+    const run = (): Promise<T> => {
+      if (this.interceptors.length === 0) return body();
+      const chain = this.interceptors.reduceRight<() => Promise<unknown>>(
+        (next, interceptor) => () => interceptor(invocation, next),
+        body as () => Promise<unknown>,
+      );
+      return chain() as Promise<T>;
+    };
+    return this.rehydrate(carrier, run);
   }
 
   /**
