@@ -3,7 +3,66 @@ import type { RunStatus, StateStore } from '@dudousxd/nestjs-durable-core';
 import type { DataProvider, ExtensionContext } from '@dudousxd/nestjs-telescope';
 import { TELESCOPE_STORAGE } from '@dudousxd/nestjs-telescope';
 
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+
+/** Compute the p-th percentile of a SORTED array. */
+function percentile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
+  return sorted[Math.max(0, idx)] ?? 0;
+}
+
+type StorageEntry = { content?: unknown; createdAt?: Date };
+
+/** Fetch the durable entry page from TELESCOPE_STORAGE. */
+async function fetchEntries(ctx: ExtensionContext): Promise<StorageEntry[]> {
+  const storage = ctx.moduleRef.get(TELESCOPE_STORAGE, { strict: false }) as {
+    get(q: { type?: string; limit?: number }): Promise<{ data: StorageEntry[] }>;
+  };
+  const page = await storage.get({ type: 'durable', limit: 5_000 });
+  return page.data;
+}
+
+/**
+ * Split entries into current/previous equal-length windows.
+ *  current:  (now - windowMs, now]
+ *  previous: (now - 2*windowMs, now - windowMs]
+ */
+function splitWindows(
+  entries: StorageEntry[],
+  windowMs: number,
+  now: number,
+): { current: StorageEntry[]; previous: StorageEntry[] } {
+  const start = now - windowMs;
+  const prevStart = start - windowMs;
+  return {
+    current: entries.filter((e) => {
+      const t = e.createdAt ? +new Date(e.createdAt) : 0;
+      return t > start && t <= now;
+    }),
+    previous: entries.filter((e) => {
+      const t = e.createdAt ? +new Date(e.createdAt) : 0;
+      return t > prevStart && t <= start;
+    }),
+  };
+}
+
+/** Compute success rate (completed / total) for a list of entries, returns 1 when no data. */
+function successRateOf(entries: StorageEntry[]): number {
+  let completed = 0;
+  let failed = 0;
+  for (const e of entries) {
+    const c = (e.content ?? {}) as { event?: string };
+    if (c.event === 'run.completed') completed += 1;
+    else if (c.event === 'run.failed') failed += 1;
+  }
+  const total = completed + failed;
+  return total === 0 ? 1 : completed / total;
+}
+
 const STATE_CAP = 10_000;
+
+// ─── Existing providers ───────────────────────────────────────────────────────
 
 /** Source C: current-state gauge from the durable store. query.status selects which (default 'dead'). */
 export function durableStateProvider(): DataProvider {
@@ -131,3 +190,234 @@ export function durableWorkerHealthProvider(): DataProvider {
     },
   };
 }
+
+// ─── New golden-signals providers ────────────────────────────────────────────
+
+/**
+ * Duration percentiles (p50/p95/p99) + a histogram of ~8 buckets.
+ * Durations are read from `content.durationMs` on `run.completed`/`run.failed`; when absent,
+ * computed by pairing a `run.started` and its corresponding `run.completed`/`run.failed` entry
+ * by `runId` using their `createdAt` timestamps.
+ *
+ * With `query.metric === 'p50'|'p95'|'p99'` returns `{ value }` for use as a stat panel.
+ */
+export function durableDurationProvider(): DataProvider {
+  return {
+    name: 'durable.duration',
+    async resolve(query, ctx: ExtensionContext) {
+      const entries = await fetchEntries(ctx);
+
+      // Index run.started entries by runId for the pairing fallback.
+      const startedAt = new Map<string, number>();
+      for (const e of entries) {
+        const c = (e.content ?? {}) as { event?: string; runId?: string };
+        if (c.event === 'run.started' && c.runId && e.createdAt) {
+          startedAt.set(c.runId, +new Date(e.createdAt));
+        }
+      }
+
+      const durs: number[] = [];
+      for (const e of entries) {
+        const c = (e.content ?? {}) as { event?: string; runId?: string; durationMs?: number };
+        if (c.event === 'run.completed' || c.event === 'run.failed') {
+          if (typeof c.durationMs === 'number') {
+            durs.push(c.durationMs);
+          } else if (c.runId) {
+            const start = startedAt.get(c.runId);
+            const end = e.createdAt ? +new Date(e.createdAt) : undefined;
+            if (start !== undefined && end !== undefined && end >= start) {
+              durs.push(end - start);
+            }
+          }
+        }
+      }
+      durs.sort((a, b) => a - b);
+
+      const p50 = percentile(durs, 50);
+      const p95 = percentile(durs, 95);
+      const p99 = percentile(durs, 99);
+
+      // Stat shortcut: return a single value for use in stat panels.
+      const metric = (query as Record<string, unknown>)?.metric as string | undefined;
+      if (metric === 'p50') return { value: p50 };
+      if (metric === 'p95') return { value: p95 };
+      if (metric === 'p99') return { value: p99 };
+
+      // Build ~8 equal-width buckets between 0 and max.
+      const max = durs.at(-1) ?? 0;
+      const bucketCount = 8;
+      const size = Math.max(1, Math.ceil((max + 1) / bucketCount));
+      const buckets = Array.from({ length: bucketCount }, (_, i) => ({
+        label: `${Math.round((i * size) / 100) / 10}s`,
+        count: 0,
+      }));
+      for (const d of durs) {
+        const bi = Math.min(bucketCount - 1, Math.floor(d / size));
+        const bucket = buckets[bi];
+        if (bucket) bucket.count += 1;
+      }
+
+      return { buckets, p50, p95, p99 };
+    },
+  };
+}
+
+/**
+ * Buckets `run.completed` (-> done) and `run.failed` (-> failed) entries by `createdAt` into
+ * N=`query.buckets ?? 24` equal-width time buckets.  Returns `{ rows: Array<{ label; done; failed }> }`.
+ */
+export function durableRunsOverTimeProvider(): DataProvider {
+  return {
+    name: 'durable.runsOverTime',
+    async resolve(query, ctx: ExtensionContext) {
+      const entries = await fetchEntries(ctx);
+      const n = Number((query as Record<string, unknown>)?.buckets ?? 24);
+      const now = Date.now();
+
+      // Determine the time window from the oldest entry or default to 24h.
+      let minT = now;
+      for (const e of entries) {
+        if (e.createdAt) {
+          const t = +new Date(e.createdAt);
+          if (t < minT) minT = t;
+        }
+      }
+      const span = Math.max(now - minT, 1);
+      const bucketSize = span / n;
+
+      const rows: Array<{ label: string; done: number; failed: number }> = Array.from(
+        { length: n },
+        (_, i) => {
+          const bucketStart = new Date(minT + i * bucketSize);
+          const label = bucketStart.toISOString().slice(11, 16); // "HH:mm"
+          return { label, done: 0, failed: 0 };
+        },
+      );
+
+      for (const e of entries) {
+        const c = (e.content ?? {}) as { event?: string };
+        if (c.event !== 'run.completed' && c.event !== 'run.failed') continue;
+        const t = e.createdAt ? +new Date(e.createdAt) : 0;
+        const idx = Math.min(n - 1, Math.floor((t - minT) / bucketSize));
+        const row = rows[idx];
+        if (row) {
+          if (c.event === 'run.completed') row.done += 1;
+          else row.failed += 1;
+        }
+      }
+
+      return { rows };
+    },
+  };
+}
+
+/**
+ * Success rate over the last `query.windowMs` (default 24h), with a `delta` vs. the previous
+ * equal-length window and a `spark` array of per-sub-bucket success rates.
+ */
+export function durableSuccessRateProvider(): DataProvider {
+  return {
+    name: 'durable.successRate',
+    async resolve(query, ctx: ExtensionContext) {
+      const entries = await fetchEntries(ctx);
+      const windowMs = Number((query as Record<string, unknown>)?.windowMs ?? 24 * 60 * 60 * 1000);
+      const now = Date.now();
+      const { current, previous } = splitWindows(entries, windowMs, now);
+
+      const value = successRateOf(current);
+      const prevRate = successRateOf(previous);
+      const delta = previous.length > 0 ? value - prevRate : undefined;
+
+      // Spark: split the current window into 8 sub-buckets.
+      const sparkBuckets = 8;
+      const bucketSize = windowMs / sparkBuckets;
+      const sparkStart = now - windowMs;
+      const spark = Array.from({ length: sparkBuckets }, (_, i) => {
+        const bStart = sparkStart + i * bucketSize;
+        const bEnd = bStart + bucketSize;
+        const bEntries = current.filter((e) => {
+          const t = e.createdAt ? +new Date(e.createdAt) : 0;
+          return t > bStart && t <= bEnd;
+        });
+        return successRateOf(bEntries);
+      });
+
+      return { value, delta, spark };
+    },
+  };
+}
+
+/**
+ * Completed runs per hour over the last `query.windowMs` (default 24h), with a `delta` vs. the
+ * previous equal-length window and a `spark` array of per-sub-bucket throughput values.
+ */
+export function durableThroughputProvider(): DataProvider {
+  return {
+    name: 'durable.throughput',
+    async resolve(query, ctx: ExtensionContext) {
+      const entries = await fetchEntries(ctx);
+      const windowMs = Number((query as Record<string, unknown>)?.windowMs ?? 24 * 60 * 60 * 1000);
+      const now = Date.now();
+      const { current, previous } = splitWindows(entries, windowMs, now);
+
+      const countCompleted = (es: StorageEntry[]) =>
+        es.filter((e) => ((e.content ?? {}) as { event?: string }).event === 'run.completed')
+          .length;
+
+      const windowHours = windowMs / (60 * 60 * 1000);
+      const value = countCompleted(current) / windowHours;
+      const prevValue = countCompleted(previous) / windowHours;
+      const delta = previous.length > 0 ? value - prevValue : undefined;
+
+      // Spark: 8 sub-buckets of current window.
+      const sparkBuckets = 8;
+      const bucketSize = windowMs / sparkBuckets;
+      const bucketHours = bucketSize / (60 * 60 * 1000);
+      const sparkStart = now - windowMs;
+      const spark = Array.from({ length: sparkBuckets }, (_, i) => {
+        const bStart = sparkStart + i * bucketSize;
+        const bEnd = bStart + bucketSize;
+        const bEntries = current.filter((e) => {
+          const t = e.createdAt ? +new Date(e.createdAt) : 0;
+          return t > bStart && t <= bEnd;
+        });
+        return countCompleted(bEntries) / bucketHours;
+      });
+
+      return { value, delta, spark };
+    },
+  };
+}
+
+/** Color palette for the state breakdown pie segments. */
+const STATE_BREAKDOWN_PALETTE = ['#34d399', '#fbbf24', '#f87171', '#38bdf8', '#a78bfa'];
+const STATE_BREAKDOWN_STATUSES: RunStatus[] = ['running', 'pending', 'completed', 'failed', 'dead'];
+
+/**
+ * Counts from `STATE_STORE.listRuns({ status })` for each of the 5 statuses and returns pie
+ * segments with the standard palette: `{ segments: Array<{ label, value, color }> }`.
+ */
+export function durableStateBreakdownProvider(): DataProvider {
+  return {
+    name: 'durable.stateBreakdown',
+    async resolve(_query, ctx: ExtensionContext) {
+      const store = ctx.moduleRef.get(STATE_STORE, { strict: false }) as StateStore;
+      const counts = await Promise.all(
+        STATE_BREAKDOWN_STATUSES.map((status) =>
+          store.listRuns({ status, limit: STATE_CAP }).then((runs) => runs.length),
+        ),
+      );
+      const segments = STATE_BREAKDOWN_STATUSES.map((label, i) => ({
+        label,
+        value: counts[i],
+        color: STATE_BREAKDOWN_PALETTE[i],
+      }));
+      return { segments };
+    },
+  };
+}
+
+// NOTE: durableRetryHotspotsProvider is NOT implemented.
+// StateStore only exposes `listCheckpoints(runId: string)` (per-run lookup), with no cross-run
+// query by step `attempts`. There is no API to enumerate all step checkpoints across runs without
+// first listing every run — which would be O(N*M) and impractical. Task 13 should omit that panel.
