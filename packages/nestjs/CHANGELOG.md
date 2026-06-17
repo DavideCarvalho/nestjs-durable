@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.14.0
+
+### Minor Changes
+
+- e00d037: Optional opaque context carrier dispatched alongside `traceparent`: `WorkflowEngine`/`DurableModule` gain a `context?: () => Record<string, unknown>` option, injected into `RemoteTask` at all dispatch sites and surfaced in the Python SDK (`StepContext.context` / `current_context()`).
+
 ## 0.13.0
 
 ### Minor Changes
