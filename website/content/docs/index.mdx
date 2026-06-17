@@ -1,62 +1,149 @@
 ---
-title: Documentation
+title: Introduction
 description: Durable workflows for NestJS — write a workflow as plain code; every step is checkpointed, so it survives crashes and deploys. Steps can run across apps and languages, with a built-in control plane.
 ---
 
-Welcome to the **nestjs-durable** documentation.
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Steps, Step } from 'fumadocs-ui/components/steps';
 
-`@dudousxd/nestjs-durable` brings durable execution to NestJS. You write a workflow as ordinary
-async code — call a step, use its result, call the next — and the engine records every step's
-output. If the process crashes or you deploy mid-run, it resumes from the last checkpoint instead
-of starting over. Steps can run locally in NestJS or on a remote worker (even a Python one), but
-it stays one workflow, with one source of truth and one timeline.
+**`@dudousxd/nestjs-durable`** brings durable execution to NestJS. You write a workflow as ordinary async code — call a step, use its result, call the next — and the engine records every step's output. If the process crashes or you deploy mid-run, the workflow resumes from the last checkpoint instead of starting over. Steps can run locally in NestJS or on a remote worker (even a Python one), but it stays **one workflow**, with **one source of truth**, and **one end-to-end timeline**.
 
-Head to the [Getting Started](/docs/getting-started) guide to run your first workflow in a few
-minutes, or use the sidebar to explore the concepts, transports, stores and observability.
+<Callout type="info" title="The one rule">
+The engine recovers a run by **replaying** the workflow function from the top. Completed steps return their saved result instead of executing again, so your `run` body must be deterministic — no `Date.now()`, `Math.random()`, or direct I/O outside a step. See [Durability & replay](/docs/concepts).
+</Callout>
 
-## What you get
+## The problem it solves
 
-- **Crash-proof by replay.** Each step is checkpointed. On a crash or deploy the workflow re-runs
-  from the top, but completed steps replay their saved result — so they run exactly once and only
-  unfinished work executes.
-- **Steps across apps and languages.** A typed remote step is dispatched over a pluggable
-  transport — to another process or a Python worker on the same queue. The workflow code never
-  changes; only the transport does.
-- **Durable sleep and signals.** Pause for minutes or months with `ctx.sleep` (no compute while
-  waiting), or wait on a human approval / webhook with `ctx.waitForSignal`. Both survive restarts.
-- **Bring your ORM, any SQL database.** State lives in Postgres, MySQL or SQLite through a
-  `StateStore` interface, with MikroORM, TypeORM and Prisma adapters and auto-schema on boot.
-- **See the whole flow.** A built-in control plane renders each run as a graph; OpenTelemetry and
-  a Telescope watcher give you two more views of the same event log.
+Today multi-service flows are scattered: a queue here, a queue there, a piece in Python, and no single place to read or watch the whole thing. When a process dies halfway through, you are left reconstructing which steps already ran. `nestjs-durable` collapses that into three guarantees:
 
-## The shape of it
+- **The flow becomes code, in one place.** Read the workflow function and you understand the whole sequence — even when steps execute in different apps or languages.
+- **Durability by replay.** A crash or deploy never re-runs completed work. Each step is checkpointed; on recovery, finished steps replay their saved result and only unfinished work executes.
+- **End-to-end visibility.** Because one orchestrator owns the state, it knows about *every* step — including the remote ones — so a full-flow trace, dashboard, and Telescope view come almost for free.
 
-```ts
+## Quickstart
+
+The minimal loop — install, register the module, write a workflow, start a run — with zero infrastructure: the in-process event-emitter transport and an in-memory store. Swap those for BullMQ and an ORM store when you go to production. For the full walkthrough, see [Getting Started](/docs/getting-started).
+
+<Steps>
+<Step>
+
+Install the core packages, the zero-infra transport, and its peers:
+
+```bash
+pnpm add @dudousxd/nestjs-durable @dudousxd/nestjs-durable-core @dudousxd/nestjs-durable-transport-event-emitter @nestjs/event-emitter zod
+```
+
+</Step>
+<Step>
+
+Write a workflow as plain async code. Every `ctx.step` is checkpointed; `ctx.waitForSignal` suspends the run until a signal arrives:
+
+```ts title="checkout.workflow.ts"
+import { Workflow } from '@dudousxd/nestjs-durable';
+import type { WorkflowCtx } from '@dudousxd/nestjs-durable-core';
+
 @Workflow({ name: 'checkout', version: '1' })
 export class CheckoutWorkflow {
-  async run(ctx: WorkflowCtx, order: Order) {
-    await ctx.step('reserveStock', () => this.inventory.reserve(order));
-    const charge = await ctx.call(chargeCard, { orderId: order.id, amountCents: order.total });
+  async run(ctx: WorkflowCtx, order: { id: string; total: number }) {
+    await ctx.step('reserveStock', async () => ({ reserved: true }));
     const approval = await ctx.waitForSignal<{ approved: boolean }>(`approve:${order.id}`);
-    if (!approval.approved) return { status: 'rejected', chargeId: charge.chargeId };
-    await ctx.step('ship', () => this.carrier.dispatch(order));
-    return { status: 'shipped', chargeId: charge.chargeId };
+    if (!approval.approved) return { status: 'rejected' };
+    await ctx.step('ship', async () => ({ shipped: true }));
+    return { status: 'shipped' };
   }
 }
 ```
 
-If the process dies after `chargeCard`, the run resumes on boot and `reserveStock` + `chargeCard`
-are **not** re-run — their results come straight from the checkpoints.
+</Step>
+<Step>
 
-## Packages
+Register the module with the event-emitter transport and an in-memory store, then provide the workflow:
 
-| Package | Role |
-| --- | --- |
-| `@dudousxd/nestjs-durable-core` | Engine, replay, sleep/signals, `remoteStep`, interfaces |
-| `@dudousxd/nestjs-durable` | NestJS module, `@Workflow`/`@DurableStep`, recovery, auto-schema |
-| `@dudousxd/nestjs-durable-transport-event-emitter` | In-process transport (zero-infra default) |
-| `@dudousxd/nestjs-durable-transport-bullmq` | BullMQ/Redis transport for cross-process steps |
-| `@dudousxd/nestjs-durable-store-mikro-orm` · `-store-typeorm` | ORM state stores |
-| `@dudousxd/nestjs-durable-dashboard` | Embedded control-plane SPA |
-| `@dudousxd/nestjs-durable-otel` · `-telescope` | OpenTelemetry & Telescope integrations |
-| `durable-worker` (PyPI) | Python worker SDK |
+```ts title="app.module.ts"
+import { DurableModule } from '@dudousxd/nestjs-durable';
+import { InMemoryStateStore } from '@dudousxd/nestjs-durable-core';
+import { EventEmitterTransport } from '@dudousxd/nestjs-durable-transport-event-emitter';
+import { Module } from '@nestjs/common';
+import { EventEmitter2, EventEmitterModule } from '@nestjs/event-emitter';
+import { CheckoutWorkflow } from './checkout.workflow';
+
+@Module({
+  imports: [
+    EventEmitterModule.forRoot(),
+    DurableModule.forRootAsync({
+      inject: [EventEmitter2],
+      useFactory: (emitter: EventEmitter2) => ({
+        store: new InMemoryStateStore(),
+        transport: new EventEmitterTransport(emitter),
+      }),
+    }),
+  ],
+  providers: [CheckoutWorkflow],
+})
+export class AppModule {}
+```
+
+</Step>
+<Step>
+
+Start a run and resume it later. `start` **enqueues** the run and returns immediately — the HTTP handler never blocks on workflow logic:
+
+```ts
+constructor(private readonly workflows: WorkflowService) {}
+
+async checkout(order: { id: string; total: number }) {
+  const { runId } = await this.workflows.start('checkout', order); // → { status: 'pending' }
+  return runId; // respond now; a worker runs the workflow body
+}
+
+// later, from your approval webhook — this completes & ships the run:
+async approve(orderId: string) {
+  await this.workflows.signal(`approve:${orderId}`, { approved: true });
+}
+```
+
+Need the outcome inline instead? `await this.workflows.waitForRun(runId)` resolves once the run settles.
+
+</Step>
+</Steps>
+
+## Steps across apps and languages
+
+A step does not have to run in NestJS. Declare a **remote step** with a typed, validated contract and call it with `ctx.call` — the engine dispatches it over a pluggable transport to wherever its handler lives:
+
+```ts title="checkout.steps.ts"
+import { remoteStep } from '@dudousxd/nestjs-durable-core';
+import { z } from 'zod';
+
+export const chargeCard = remoteStep({
+  name: 'payments.charge-card',
+  input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
+  output: z.object({ chargeId: z.string() }),
+  retries: 3,
+});
+```
+
+The handler is just a provider method decorated with `@DurableStep`, decoupled from the workflow. With the event-emitter transport it runs in the same process; swap the transport for BullMQ to move it to a separate process — or implement it in a [Python worker](/docs/python) — without changing the workflow code.
+
+The split goes both ways: a remote worker can implement a step the NestJS workflow calls, *or* author the whole workflow itself and call back into NestJS. Either way, the engine stays the single owner of durable state.
+
+## What you get
+
+- **Crash-proof by replay.** Each step is checkpointed and runs exactly once; only unfinished work executes after a restart.
+- **Durable sleep and signals.** Pause for minutes or months with `ctx.sleep` (no compute while waiting), or wait on a human approval or webhook with `ctx.waitForSignal`. Both survive restarts.
+- **Bring your ORM, any SQL database.** State lives in Postgres, MySQL, or SQLite through a `StateStore` interface, with MikroORM, TypeORM, Prisma, and Drizzle adapters and auto-schema on boot.
+- **See the whole flow.** A built-in control plane renders each run as a graph; OpenTelemetry and a Telescope watcher give you two more views of the same event log.
+
+## Where to go next
+
+<Cards>
+  <Card title="Getting Started" href="/docs/getting-started" description="Install, write a workflow, register the module, and start your first run — step by step." />
+  <Card title="Concepts" href="/docs/concepts" description="Durability, deterministic replay, and the mental model behind the engine." />
+  <Card title="Authoring" href="/docs/authoring" description="Workflows, steps, ctx.step / ctx.call, sleep, and signals in depth." />
+  <Card title="Reliability" href="/docs/reliability" description="Retries, fatal errors, recovery, and exactly-once execution." />
+  <Card title="Transports" href="/docs/transports" description="The event-emitter default and BullMQ for cross-process or Python steps." />
+  <Card title="State stores" href="/docs/stores" description="Persist runs to Postgres, MySQL, or SQLite with your ORM of choice." />
+  <Card title="Observability" href="/docs/observability" description="The control-plane dashboard, OpenTelemetry traces, and the Telescope watcher." />
+  <Card title="Python" href="/docs/python" description="Implement steps and author workflows from a Python worker." />
+  <Card title="Tooling" href="/docs/tooling" description="The CLI, the test harness, and developer ergonomics." />
+</Cards>
