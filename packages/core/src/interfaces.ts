@@ -334,6 +334,13 @@ export interface RemoteTask {
   /** W3C traceparent so the worker can continue the distributed trace. */
   traceparent?: string;
   /**
+   * Opaque context carrier (tenant / user / correlation ids) the worker re-exposes to the step
+   * handler, for cross-process propagation alongside the {@link traceparent}. The engine treats it
+   * as a pass-through object and never inspects its shape — the producer (e.g. `@dudousxd/nestjs-context`)
+   * owns the keys. Absent when no `context` provider is configured.
+   */
+  context?: Record<string, unknown>;
+  /**
    * Id of the transport this task was dispatched on (when the engine runs a pool — see
    * {@link NamedTransport}). A worker that consumes several transports replies via the matching one,
    * so failover is symmetric without the worker choosing a transport. Absent for a single transport.

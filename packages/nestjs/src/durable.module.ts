@@ -104,6 +104,17 @@ export interface DurableModuleOptions {
    * the distributed trace. Pass `otelTraceparent` from `@dudousxd/nestjs-durable-otel`.
    */
   traceparent?: () => string | undefined;
+  /**
+   * Provide an opaque context carrier (tenant / user / correlation ids) to stamp on dispatched remote
+   * tasks, so workers re-expose it to the step handler alongside the `traceparent`. Pass a reader from
+   * `@dudousxd/nestjs-context` or your own request-scoped source. The engine never inspects its shape.
+   *
+   * Re-evaluated at each (re)dispatch — including a retry or a crash/scale-down resume that the engine
+   * drives OUTSIDE the originating request scope, where this reader may return empty or stale values.
+   * Treat the carrier as best-effort correlation/propagation metadata only — do NOT treat it as an
+   * authorization boundary.
+   */
+  context?: () => Record<string, unknown> | undefined;
   /** Attempts for each saga compensation when a run fails. Default 1 (no retry). Idempotent undos. */
   compensationRetries?: number;
 }
@@ -164,6 +175,7 @@ export class DurableModule {
               instanceId: opts.instanceId,
               webhookUrl: opts.webhookUrl,
               traceparent: opts.traceparent,
+              context: opts.context,
               compensationRetries: opts.compensationRetries,
               // A non-worker (API/dashboard) instance must not run workflows: enqueue-only, leaving
               // each `pending` run in the store for a worker's `runPending` poll. Workers use the
