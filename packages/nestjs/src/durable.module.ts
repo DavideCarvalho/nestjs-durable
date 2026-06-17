@@ -12,12 +12,79 @@ import {
   type WorkflowRef,
 } from '@dudousxd/nestjs-durable-core';
 import { type DynamicModule, type InjectionToken, Module, type Provider } from '@nestjs/common';
-import { DiscoveryModule } from '@nestjs/core';
+import { DiscoveryModule, ModuleRef } from '@nestjs/core';
+import type { ContextAccessor } from './context-accessor';
 import { DurableStepRegistrar } from './durable-step.registrar';
 import { EntityService } from './entity';
 import { TimerPoller } from './timer-poller';
+import { CONTEXT_ACCESSOR } from './tokens';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
+
+/**
+ * Locate the context accessor non-strictly: an accessor provided by ANY module (a global
+ * `ContextModule` from `@dudousxd/nestjs-context`, or the app root) is found via {@link ModuleRef},
+ * because DurableModule is `global` and its engine factory can't see another module's local
+ * providers directly. Returns undefined when the optional peer isn't installed/bound.
+ */
+function resolveAccessor(moduleRef: ModuleRef): ContextAccessor | undefined {
+  try {
+    return moduleRef.get<ContextAccessor>(CONTEXT_ACCESSOR, { strict: false });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Build an opaque context carrier from a {@link ContextAccessor} — the auto-feed default for the
+ * engine's `context` option when `@dudousxd/nestjs-context` is present and the app passed no own
+ * reader. Drops fields the accessor doesn't populate, so an empty/anonymous request yields `{}`.
+ */
+function carrierFromAccessor(accessor: ContextAccessor): Record<string, unknown> | undefined {
+  const carrier: Record<string, unknown> = {};
+  const traceId = accessor.traceId();
+  if (traceId !== undefined) carrier.traceId = traceId;
+  const tenantId = accessor.tenantId();
+  if (tenantId !== undefined) carrier.tenantId = tenantId;
+  const userRef = accessor.userRef();
+  if (userRef !== undefined) carrier.userRef = userRef;
+  return carrier;
+}
+
+/**
+ * The slice of `@dudousxd/nestjs-context`'s module-level `Context` singleton we use to re-hydrate the
+ * originating context around a local step body. Structural — we never import the package's types (it
+ * is an OPTIONAL peer); the guarded dynamic import below captures whatever the installed package
+ * exports as `Context`.
+ */
+interface ContextRuntime {
+  /** Re-hydrate a context from an opaque carrier and run `fn` inside its ALS scope. */
+  deserialize<T>(carrier: Record<string, unknown>, fn: () => T): T;
+}
+
+function isContextRuntime(x: unknown): x is ContextRuntime {
+  return !!x && typeof (x as ContextRuntime).deserialize === 'function';
+}
+
+/**
+ * Resolve `@dudousxd/nestjs-context`'s runtime `Context` singleton via a GUARDED dynamic import — used
+ * to build the engine's `rehydrate` bridge. The runtime `Context` (its `deserialize`/ALS `run`) is a
+ * module-level singleton, NOT a DI provider behind {@link CONTEXT_ACCESSOR}, so it can't be resolved
+ * through ModuleRef — we import it directly. We do NOT add a hard/static import (the peer is optional):
+ * a failure (peer not installed) returns undefined and the engine falls back to passthrough re-hydration.
+ */
+async function resolveContextRuntime(): Promise<ContextRuntime | undefined> {
+  try {
+    // Indirect the specifier through a variable so the compiler does not try to STATICALLY resolve
+    // the optional peer (it may be uninstalled). This stays a runtime guarded import — a missing
+    // module rejects and is caught below.
+    const specifier = '@dudousxd/nestjs-context';
+    const mod = (await import(specifier)) as { Context?: unknown };
+    return isContextRuntime(mod.Context) ? mod.Context : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** True when `x` can act as a control plane (broadcast pub/sub) — e.g. a broadcast-capable transport. */
 function isControlPlane(x: unknown): x is ControlPlane {
@@ -106,8 +173,14 @@ export interface DurableModuleOptions {
   traceparent?: () => string | undefined;
   /**
    * Provide an opaque context carrier (tenant / user / correlation ids) to stamp on dispatched remote
-   * tasks, so workers re-expose it to the step handler alongside the `traceparent`. Pass a reader from
-   * `@dudousxd/nestjs-context` or your own request-scoped source. The engine never inspects its shape.
+   * tasks, so workers re-expose it to the step handler alongside the `traceparent`. The engine never
+   * inspects its shape.
+   *
+   * **Auto-feed**: if you omit this AND `@dudousxd/nestjs-context` is installed (its accessor is bound
+   * to the shared `CONTEXT_ACCESSOR` token), DurableModule defaults this to a reader that builds
+   * `{ traceId, tenantId, userRef }` from the accessor — so a workflow dispatched within a request
+   * automatically carries the originating context across process boundaries. Pass your own reader to
+   * override the auto-feed; with neither, the carrier is omitted (unchanged behavior).
    *
    * Re-evaluated at each (re)dispatch — including a retry or a crash/scale-down resume that the engine
    * drives OUTSIDE the originating request scope, where this reader may return empty or stale values.
@@ -157,14 +230,36 @@ export class DurableModule {
         },
         {
           provide: WorkflowEngine,
-          useFactory: (
+          useFactory: async (
             store: StateStore,
             transport: Transport | null,
             opts: DurableModuleOptions,
+            // The accessor from `@dudousxd/nestjs-context` is resolved at construction via ModuleRef
+            // (shared CONTEXT_ACCESSOR symbol — no hard import). Absent → unchanged behavior.
+            moduleRef: ModuleRef,
           ) => {
             // The control-plane default is the primary task transport (single, or the pool's first)
             // when it can broadcast.
             const primary = transport ?? opts.transports?.[0]?.transport;
+            // Auto-feed the carrier from nestjs-context when an accessor is present AND the app didn't
+            // pass its own `context` reader. The app's own reader always wins; with no accessor the
+            // carrier stays `undefined` (unchanged behavior — `traceparent` etc. still work).
+            const accessor = resolveAccessor(moduleRef);
+            const context =
+              opts.context ?? (accessor ? () => carrierFromAccessor(accessor) : undefined);
+            // Consume side: when nestjs-context is present (an accessor is bound), re-hydrate the
+            // originating context AROUND each local step body, so a `@DurableStep` reader sees the
+            // tenant/user/trace ids ambiently via nestjs-context's ALS — no consumer wrapping needed.
+            // The runtime `Context` is a module-level singleton (not the accessor token), resolved
+            // ONCE here via a guarded dynamic import (optional peer — failure leaves the default
+            // passthrough). Best-effort: an empty/undefined carrier just runs the handler normally.
+            const runtime = accessor ? await resolveContextRuntime() : undefined;
+            const rehydrate =
+              runtime &&
+              (<T>(carrier: Record<string, unknown> | undefined, fn: () => T): T =>
+                carrier && Object.keys(carrier).length > 0
+                  ? runtime.deserialize(carrier, fn)
+                  : fn());
             const engine = new WorkflowEngine({
               store,
               transport: transport ?? undefined,
@@ -175,7 +270,8 @@ export class DurableModule {
               instanceId: opts.instanceId,
               webhookUrl: opts.webhookUrl,
               traceparent: opts.traceparent,
-              context: opts.context,
+              context,
+              rehydrate: rehydrate || undefined,
               compensationRetries: opts.compensationRetries,
               // A non-worker (API/dashboard) instance must not run workflows: enqueue-only, leaving
               // each `pending` run in the store for a worker's `runPending` poll. Workers use the
@@ -187,7 +283,7 @@ export class DurableModule {
             // default) is wired by the WorkflowRegistrar, which owns the `@Workflow` metadata.
             return engine;
           },
-          inject: [STATE_STORE, TRANSPORT, DURABLE_OPTIONS],
+          inject: [STATE_STORE, TRANSPORT, DURABLE_OPTIONS, ModuleRef],
         },
         WorkflowService,
         EntityService,
