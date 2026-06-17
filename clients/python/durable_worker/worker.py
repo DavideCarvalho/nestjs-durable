@@ -31,6 +31,15 @@ def current_step() -> "Optional[StepContext]":
     return _current_step.get()
 
 
+def current_context() -> "Optional[Dict[str, Any]]":
+    """The opaque context carrier (tenant / user / correlation ids) the engine stamped on the task
+    running on this task/thread, or None outside a step / when the dispatcher sent none. Mirrors the
+    engine's ``context`` provider — the keys are owned by the producer (e.g. ``@dudousxd/nestjs-context``),
+    so the worker just re-exposes the dict without inspecting it."""
+    ctx = _current_step.get()
+    return ctx.context if ctx is not None else None
+
+
 def log(level: str, message: str, data: Any = None) -> None:
     """Record a log line on the current step (level: debug/info/warn/error). No-op outside a step."""
     ctx = _current_step.get()
@@ -125,10 +134,15 @@ class StepContext:
         is_cancelled: Optional[Callable[[str], bool]] = None,
         seq: Optional[int] = None,
         on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.events: List[Dict[str, Any]] = []
         self._run_id = run_id
         self._is_cancelled = is_cancelled
+        # Opaque context carrier (tenant / user / correlation ids) the engine stamped on the task,
+        # re-exposed verbatim to the handler (and via the module-level :func:`current_context`). The
+        # producer owns the shape; the worker never inspects it. None when the dispatcher sent none.
+        self.context = context
         # Step seq + a sink for live progress: when a transport supplies ``on_event``, every event is
         # ALSO handed to it as it happens (e.g. published on the control plane as a ``step.progress``),
         # so a dashboard tails a long step line-by-line instead of waiting for the final result.
@@ -482,6 +496,7 @@ class Worker:
             is_cancelled=is_cancelled,
             seq=task.get("seq"),
             on_event=on_event,
+            context=task.get("context"),
         )
 
     @staticmethod

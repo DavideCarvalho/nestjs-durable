@@ -5,6 +5,7 @@ from durable_worker import (
     FatalError,
     StepContext,
     Worker,
+    current_context,
     current_step,
     log,
     set_process,
@@ -235,6 +236,44 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(result["events"][0]["message"], "from the worker thread")
         # it really ran off the event-loop thread (so the lock keeps renewing)
         self.assertNotEqual(ran_on["thread"], loop_thread)
+
+
+class ContextCarrierTest(unittest.TestCase):
+    """The opaque context carrier (tenant / user / correlation ids) the engine stamps on a task is
+    re-exposed to the handler — mirrors the TS engine's ``context`` option / ``RemoteTask.context``."""
+
+    def test_exposes_context_to_the_handler(self):
+        worker = Worker(group="payments")
+        seen = {}
+
+        @worker.step("payments.charge-card")
+        def charge(data, ctx):
+            seen["ctx"] = ctx.context
+            seen["current"] = current_context()
+            return {"ok": True}
+
+        carrier = {"tenantId": "t1", "userRef": {"type": "User", "id": 1}}
+        result = worker.process_task(task(context=carrier))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(seen["ctx"], carrier)
+        self.assertEqual(seen["current"], carrier)
+
+    def test_context_is_none_when_absent(self):
+        worker = Worker(group="payments")
+        seen = {}
+
+        @worker.step("payments.charge-card")
+        def charge(data, ctx):
+            seen["ctx"] = ctx.context
+            return {"ok": True}
+
+        # A task without a `context` field (existing dispatchers) behaves identically.
+        result = worker.process_task(task())
+        self.assertEqual(result["status"], "completed")
+        self.assertIsNone(seen["ctx"])
+
+    def test_current_context_is_none_outside_a_step(self):
+        self.assertIsNone(current_context())
 
 
 if __name__ == "__main__":

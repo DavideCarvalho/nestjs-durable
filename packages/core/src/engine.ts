@@ -191,6 +191,19 @@ export interface WorkflowEngineDeps {
    */
   traceparent?: () => string | undefined;
   /**
+   * Provide an opaque context carrier (tenant / user / correlation ids) to attach to each dispatched
+   * {@link RemoteTask} as its `context`, so a worker (including the Python SDK) re-exposes it to the
+   * step handler — cross-process propagation alongside the {@link traceparent}. Keep core dependency-free:
+   * supply this from `@dudousxd/nestjs-context` or your own request-scoped reader. The engine never
+   * inspects the returned object's shape. Omit to send none.
+   *
+   * Re-evaluated at each (re)dispatch — including a retry or a resume that the engine drives AFTER a
+   * crash/scale-down, which runs OUTSIDE the originating request scope. On such a path this provider
+   * may return empty or stale values (the request-scoped tenant/user is gone). Treat the carrier as
+   * best-effort correlation/propagation metadata only — do NOT treat it as an authorization boundary.
+   */
+  context?: () => Record<string, unknown> | undefined;
+  /**
    * Attempts for each saga compensation when the run fails (a transient undo — e.g. a refund API
    * hiccup — gets another try). Default 1 (no retry). Compensations must be idempotent.
    */
@@ -230,6 +243,7 @@ export class WorkflowEngine {
   private readonly maxRecoveryAttempts?: number;
   private readonly webhookUrl?: (token: string) => string;
   private readonly traceparent?: () => string | undefined;
+  private readonly context?: () => Record<string, unknown> | undefined;
   private readonly compensationRetries: number;
   /** Persist a `running` checkpoint at the start of a local step body (see {@link WorkflowEngineDeps.trackStepStart}). */
   private readonly trackStepStart: boolean;
@@ -282,6 +296,7 @@ export class WorkflowEngine {
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
+    this.context = deps.context;
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
     this.trackStepStart = deps.trackStepStart ?? true;
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
@@ -1520,6 +1535,7 @@ export class WorkflowEngine {
             group: cmd.group,
             input: cmd.input,
             traceparent: this.traceparent?.(),
+            context: this.context?.(),
             attempt: 1,
           },
           undefined,
@@ -1898,6 +1914,7 @@ export class WorkflowEngine {
         group: step.group,
         input: validInput,
         traceparent: this.traceparent?.(),
+        context: this.context?.(),
         attempt,
       },
       transport,
@@ -1987,6 +2004,7 @@ export class WorkflowEngine {
           group: step.group,
           input: validInput,
           traceparent: this.traceparent?.(),
+          context: this.context?.(),
           attempt,
         },
         transport,

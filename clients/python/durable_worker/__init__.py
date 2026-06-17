@@ -20,6 +20,7 @@ from .worker import (
     StepContext,
     Worker,
     clear_registered_workers,
+    current_context,
     current_step,
     log,
     register_worker,
@@ -41,6 +42,7 @@ __all__ = [
     "reply_target",
     # Context-local step access — record events from anywhere inside a handler without threading ctx.
     "current_step",
+    "current_context",
     "log",
     "sub",
     "sub_event",
