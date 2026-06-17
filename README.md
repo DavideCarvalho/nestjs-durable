@@ -1,3 +1,16 @@
+<p align="center">
+  <a href="https://davidecarvalho.github.io/aviary/docs/durable">
+    <img src="./.github/banner.svg" alt="@dudousxd/nestjs-durable — an Aviary library. Call sign: Albatross.">
+  </a>
+</p>
+
+<p align="center">
+  <b><a href="https://davidecarvalho.github.io/aviary/docs/durable">📖 Read the documentation</a></b>
+  &nbsp;·&nbsp; part of the <a href="https://davidecarvalho.github.io/aviary/"><b>Aviary</b></a> ecosystem for NestJS
+</p>
+
+---
+
 # nestjs-durable
 
 Durable workflows for NestJS, with steps that can run across apps and languages.
