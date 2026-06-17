@@ -14,6 +14,7 @@ import type {
   DurableWebhook,
   RemoteStepDef,
   StateStore,
+  StepCheckpoint,
   StepError,
   StepEvent,
   StepInvocation,
@@ -53,6 +54,15 @@ export interface StepRecord {
  */
 export interface CtxHost {
   readonly store: StateStore;
+  /**
+   * Per-execution checkpoint snapshot, loaded ONCE at execution start (the completed prefix this
+   * replay walks). Lets each primitive read the prefix from memory instead of a per-call DB SELECT
+   * (the O(N²) replay-reads fix). A seq ABSENT from the map is NOT cached — the primitive falls back
+   * to the live store, so the checkpoint this resume is waking on (signal/timer/child, written after
+   * the snapshot) is always read fresh. New checkpoints written during this execution are inserted
+   * into the map so any later same-execution read sees them. Undefined ⇒ always hit the store.
+   */
+  readonly replay?: Map<number, StepCheckpoint>;
   clock(): number;
   webhookUrl?: (token: string) => string;
   /** Mark a local step's body as started — emits `step.started` and (optionally) a `running` checkpoint. */
@@ -99,8 +109,25 @@ export function createWorkflowCtx(
   compensations: Compensation[],
   workflow = '',
 ): WorkflowCtx {
-  const { store } = host;
+  const { store, replay } = host;
   const pos = new Position();
+
+  // Read the checkpoint at `seq`: from the per-execution snapshot when present (no DB round-trip),
+  // otherwise from the live store. Absence in the snapshot means "written after the snapshot" (the
+  // signal/timer/child this resume wakes on, or nothing yet) — those MUST hit the store. Identical
+  // behaviour to a raw `store.getCheckpoint`, just memoized for the completed prefix.
+  const readCheckpoint = (seq: number): Promise<StepCheckpoint | null> | StepCheckpoint => {
+    const hit = replay?.get(seq);
+    if (hit !== undefined) return hit;
+    return store.getCheckpoint(runId, seq);
+  };
+
+  // Persist a checkpoint AND reflect it in the snapshot, so a later same-execution read of this seq
+  // (e.g. a re-read within the same call) sees it instead of falling back to the store.
+  const writeCheckpoint = async (cp: StepCheckpoint): Promise<void> => {
+    await store.saveCheckpoint(cp);
+    replay?.set(cp.seq, cp);
+  };
 
   const step = async <T>(
     name: string,
@@ -108,7 +135,7 @@ export function createWorkflowCtx(
     options?: StepOptions,
   ): Promise<T> => {
     const current = pos.next();
-    const existing = await store.getCheckpoint(runId, current);
+    const existing = await readCheckpoint(current);
     if (existing && existing.name !== name) {
       throw new NonDeterminismError(runId, current, name, existing.name);
     }
@@ -196,16 +223,17 @@ export function createWorkflowCtx(
       );
     }
     const current = pos.next();
-    const existing = await store.getCheckpoint(runId, current);
+    const existing = await readCheckpoint(current);
     if (existing && existing.name !== name) {
       throw new NonDeterminismError(runId, current, name, existing.name);
     }
     if (existing && existing.status === 'completed') return existing.output as T;
     return store.transaction(async (tx) => {
       const output = await fn(tx.raw);
-      await tx.saveCheckpoint(
-        instantCheckpoint({ runId, seq: current, name, kind: 'local', output }),
-      );
+      const cp = instantCheckpoint({ runId, seq: current, name, kind: 'local', output });
+      await tx.saveCheckpoint(cp);
+      // Reflect the committed checkpoint in the snapshot, keeping the writeback invariant uniform.
+      replay?.set(current, cp);
       return output;
     });
   };
@@ -216,14 +244,14 @@ export function createWorkflowCtx(
   const suspendUntil = async (wakeAt: () => number): Promise<void> => {
     const current = pos.next();
     const now = host.clock();
-    const existing = await store.getCheckpoint(runId, current);
+    const existing = await readCheckpoint(current);
     if (existing) {
       // Timer already recorded: resume if due, otherwise re-suspend cheaply.
       if (now >= (existing.wakeAt ?? 0)) return;
       throw new WorkflowSuspended(existing.wakeAt ?? now);
     }
     const at = wakeAt();
-    await store.saveCheckpoint(
+    await writeCheckpoint(
       instantCheckpoint({ runId, seq: current, name: 'sleep', kind: 'sleep', wakeAt: at }),
     );
     throw new WorkflowSuspended(at);
@@ -250,7 +278,7 @@ export function createWorkflowCtx(
   const consumeBuffered = async <T>(token: string, seq: number): Promise<{ value: T } | null> => {
     const buffered = await store.takeBufferedSignal(token);
     if (!buffered) return null;
-    await store.saveCheckpoint(
+    await writeCheckpoint(
       instantCheckpoint({
         runId,
         seq,
@@ -265,7 +293,7 @@ export function createWorkflowCtx(
   const waitForSignal = async <T>(token: string, opts?: { timeoutMs?: number }): Promise<T> => {
     if (opts?.timeoutMs == null) {
       const current = pos.next();
-      const existing = await store.getCheckpoint(runId, current);
+      const existing = await readCheckpoint(current);
       if (existing && existing.status === 'completed') return existing.output as T;
       const buffered = await consumeBuffered<T>(token, current);
       if (buffered) return buffered.value;
@@ -277,10 +305,10 @@ export function createWorkflowCtx(
     const waitSeq = pos.next();
     // The deadline is recorded durably as a timer checkpoint so replay knows it; the run also gets a
     // run-level wakeAt (via WorkflowSuspended) so the timer poller resumes it at the deadline.
-    const recorded = await store.getCheckpoint(runId, deadlineSeq);
+    const recorded = await readCheckpoint(deadlineSeq);
     const deadline = recorded?.wakeAt ?? host.clock() + timeoutMs;
     if (!recorded) {
-      await store.saveCheckpoint(
+      await writeCheckpoint(
         instantCheckpoint({
           runId,
           seq: deadlineSeq,
@@ -290,7 +318,7 @@ export function createWorkflowCtx(
         }),
       );
     }
-    const waited = await store.getCheckpoint(runId, waitSeq);
+    const waited = await readCheckpoint(waitSeq);
     if (waited && waited.status === 'completed') return waited.output as T;
     const buffered = await consumeBuffered<T>(token, waitSeq);
     if (buffered) return buffered.value;
@@ -312,7 +340,7 @@ export function createWorkflowCtx(
     if (opts?.timeoutMs == null) {
       const current = pos.next();
       const token = eventToken(name, opts?.match, runId, current);
-      const existing = await store.getCheckpoint(runId, current);
+      const existing = await readCheckpoint(current);
       if (existing && existing.status === 'completed') return existing.output as T;
       await store.putSignalWaiter({ token, runId, seq: current });
       throw new WorkflowSuspended();
@@ -321,10 +349,10 @@ export function createWorkflowCtx(
     const deadlineSeq = pos.next();
     const waitSeq = pos.next();
     const token = eventToken(name, opts.match, runId, waitSeq);
-    const recorded = await store.getCheckpoint(runId, deadlineSeq);
+    const recorded = await readCheckpoint(deadlineSeq);
     const deadline = recorded?.wakeAt ?? host.clock() + timeoutMs;
     if (!recorded) {
-      await store.saveCheckpoint(
+      await writeCheckpoint(
         instantCheckpoint({
           runId,
           seq: deadlineSeq,
@@ -334,7 +362,7 @@ export function createWorkflowCtx(
         }),
       );
     }
-    const waited = await store.getCheckpoint(runId, waitSeq);
+    const waited = await readCheckpoint(waitSeq);
     if (waited && waited.status === 'completed') return waited.output as T;
     if (host.clock() >= deadline) {
       await store.takeSignalWaiter(token).catch(() => undefined);
@@ -361,7 +389,7 @@ export function createWorkflowCtx(
   const child = async <T>(workflow: WorkflowRef, input: unknown, childId?: string): Promise<T> => {
     const current = pos.next();
     const id = childId ?? `${runId}.child.${current}`;
-    const existing = await store.getCheckpoint(runId, current);
+    const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') {
       return unwrapCompletion<T>(existing.output, `child "${id}"`);
     }
@@ -373,7 +401,7 @@ export function createWorkflowCtx(
     // it appearing only when it finishes. Written once (skipped on replay, where `existing` is set);
     // `running` is ignored by replay history, so it never short-circuits determinism.
     if (!existing) {
-      await store.saveCheckpoint(
+      await writeCheckpoint(
         instantCheckpoint({
           runId,
           seq: current,
@@ -397,10 +425,10 @@ export function createWorkflowCtx(
   ): Promise<string> => {
     const current = pos.next();
     const id = childId ?? `${runId}.child.${current}`;
-    const existing = await store.getCheckpoint(runId, current);
+    const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') return existing.output as string;
     if (!(await store.getRun(id))) host.startChild(workflowName(workflow), input, id);
-    await store.saveCheckpoint(
+    await writeCheckpoint(
       instantCheckpoint({ runId, seq: current, name: `spawn:${id}`, kind: 'local', output: id }),
     );
     return id;
@@ -416,7 +444,7 @@ export function createWorkflowCtx(
     arg?: unknown,
   ): Promise<R> => {
     const current = pos.next();
-    const existing = await store.getCheckpoint(runId, current);
+    const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') return existing.output as R;
     const reply = `entityreply:${runId}:${current}`;
     await store.putSignalWaiter({ token: reply, runId, seq: current });
@@ -432,10 +460,10 @@ export function createWorkflowCtx(
     arg?: unknown,
   ): Promise<void> => {
     const current = pos.next();
-    const existing = await store.getCheckpoint(runId, current);
+    const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') return;
     host.signalEntity?.(name, key, op, arg);
-    await store.saveCheckpoint(
+    await writeCheckpoint(
       instantCheckpoint({ runId, seq: current, name: `entitysig:${name}:${key}`, kind: 'local' }),
     );
   };
@@ -445,10 +473,10 @@ export function createWorkflowCtx(
   // with a completed one and the run replays past it.
   const breakpoint = async (label?: string): Promise<void> => {
     const current = pos.next();
-    const existing = await store.getCheckpoint(runId, current);
+    const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') return;
     if (!existing) {
-      await store.saveCheckpoint(
+      await writeCheckpoint(
         instantCheckpoint({
           runId,
           seq: current,
@@ -469,7 +497,7 @@ export function createWorkflowCtx(
   const patched = async (id: string): Promise<boolean> => {
     const marker = `patch:${id}`;
     const current = pos.next();
-    const existing = await store.getCheckpoint(runId, current);
+    const existing = await readCheckpoint(current);
     if (existing) {
       if (existing.name === marker) return true;
       if (existing.name.startsWith('patch:')) {
@@ -478,7 +506,7 @@ export function createWorkflowCtx(
       pos.rewind(); // not a marker: an old run's step lives here — give the position back to it
       return false;
     }
-    await store.saveCheckpoint(
+    await writeCheckpoint(
       instantCheckpoint({ runId, seq: current, name: marker, kind: 'local', output: true }),
     );
     return true;
@@ -494,12 +522,12 @@ export function createWorkflowCtx(
   const setEvent = async (key: string, value: unknown): Promise<void> => {
     const current = pos.next();
     const name = `event:${key}`;
-    const existing = await store.getCheckpoint(runId, current);
+    const existing = await readCheckpoint(current);
     if (existing && existing.name !== name) {
       throw new NonDeterminismError(runId, current, name, existing.name);
     }
     if (existing && existing.status === 'completed') return; // replay: already published
-    await store.saveCheckpoint(
+    await writeCheckpoint(
       instantCheckpoint({ runId, seq: current, name, kind: 'local', output: value }),
     );
   };
@@ -511,7 +539,7 @@ export function createWorkflowCtx(
     const current = pos.next();
     const token = `wh:${runId}:${current}`;
     const wait = async (): Promise<T> => {
-      const existing = await store.getCheckpoint(runId, current);
+      const existing = await readCheckpoint(current);
       if (existing && existing.status === 'completed') return existing.output as T;
       await store.putSignalWaiter({ token, runId, seq: current });
       throw new WorkflowSuspended();

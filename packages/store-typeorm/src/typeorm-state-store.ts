@@ -9,6 +9,7 @@ import {
   applyAttributeQuery,
 } from '@dudousxd/nestjs-durable-core';
 import { Brackets, type DataSource, IsNull, LessThanOrEqual, Like } from 'typeorm';
+import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import {
   BufferedSignalEntity,
   SignalWaiterEntity,
@@ -46,10 +47,32 @@ export class TypeOrmStateStore implements StateStore {
   }
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
-    const existing = await this.runs().findOneBy({ id: runId });
-    if (!existing) throw new Error(`run ${runId} not found`);
-    const merged = { ...fromRunEntity(existing), ...patch } as WorkflowRun;
-    await this.runs().save(toRunEntity(merged));
+    // Single UPDATE (no pre-SELECT + save round-trips): map only the patched fields. The query
+    // builder still applies the entities' JSON column transformers to the `set` values (as in
+    // listRuns/tryLockRun). Preserve the not-found throw any caller may rely on.
+    const update: Record<string, unknown> = {};
+    if ('workflow' in patch) update.workflow = patch.workflow;
+    if ('workflowVersion' in patch) update.workflowVersion = patch.workflowVersion;
+    if ('status' in patch) update.status = patch.status;
+    if ('input' in patch) update.input = patch.input ?? null;
+    if ('output' in patch) update.output = patch.output ?? null;
+    if ('error' in patch) update.error = patch.error ?? null;
+    if ('wakeAt' in patch) update.wakeAt = patch.wakeAt == null ? null : new Date(patch.wakeAt);
+    if ('lockedBy' in patch) update.lockedBy = patch.lockedBy ?? null;
+    if ('lockedUntil' in patch)
+      update.lockedUntil = patch.lockedUntil == null ? null : new Date(patch.lockedUntil);
+    if ('recoveryAttempts' in patch) update.recoveryAttempts = patch.recoveryAttempts;
+    if ('tags' in patch) update.tags = patch.tags ?? null;
+    if ('searchAttributes' in patch) update.searchAttributes = patch.searchAttributes ?? null;
+    if ('createdAt' in patch) update.createdAt = patch.createdAt;
+    if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;
+    const result = await this.runs()
+      .createQueryBuilder()
+      .update()
+      .set(update)
+      .where({ id: runId })
+      .execute();
+    if (!result.affected) throw new Error(`run ${runId} not found`);
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
@@ -63,7 +86,10 @@ export class TypeOrmStateStore implements StateStore {
   }
 
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
-    await this.checkpoints().save(toCheckpointEntity(checkpoint));
+    // upsert = INSERT ... ON CONFLICT DO UPDATE on the (runId, seq) key — drops the pre-SELECT that
+    // `.save()` does on each write. JSON column transformers still apply for upsert.
+    const entity = toCheckpointEntity(checkpoint) as QueryDeepPartialEntity<StepCheckpointEntity>;
+    await this.checkpoints().upsert(entity, ['runId', 'seq']);
   }
 
   async transaction<T>(

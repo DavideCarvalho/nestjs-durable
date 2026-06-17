@@ -26,6 +26,7 @@ import type {
   RunStatus,
   SearchAttributes,
   StateStore,
+  StepCheckpoint,
   StepError,
   StepEvent,
   StepInterceptor,
@@ -1660,7 +1661,15 @@ export class WorkflowEngine {
     }
     // Saga compensations registered by completed steps; run in reverse if the run later fails.
     const compensations: Compensation[] = [];
-    const ctx = createWorkflowCtx(this.ctxHost, run.id, compensations, run.workflow);
+    // Load this run's checkpoints ONCE and key them by seq, so replaying the completed prefix reads
+    // from memory instead of one `getCheckpoint` SELECT per primitive (the O(N²) replay-reads fix).
+    // Read once at execution start: a checkpoint written AFTER this snapshot (the signal/timer/child
+    // this resume wakes on, or one written later in this same execution) is absent from the map, and
+    // the ctx falls back to the live store for any absent seq — so replay semantics are unchanged.
+    const snapshot = await this.store.listCheckpoints(run.id);
+    const replay = new Map<number, StepCheckpoint>();
+    for (const cp of snapshot) replay.set(cp.seq, cp);
+    const ctx = createWorkflowCtx(this.ctxHostFor(replay), run.id, compensations, run.workflow);
     try {
       const output = await fn(ctx, run.input);
       // Clear any error from an earlier failed-then-retried attempt: a completed run is a success
@@ -1779,16 +1788,17 @@ export class WorkflowEngine {
   /** The seam handed to {@link createWorkflowCtx}: the authoring API reaches durability + lifecycle
    *  (checkpointing, dispatch, child start) through this, so the ctx primitives live in their own
    *  module and the engine stays the orchestrator. */
-  private get ctxHost(): CtxHost {
+  private ctxHostFor(replay?: Map<number, StepCheckpoint>): CtxHost {
     return {
       store: this.store,
+      replay,
       clock: this.clock,
       webhookUrl: this.webhookUrl,
       startStep: (s) => this.startStep(s),
       completeStep: (s) => this.completeStep(s),
       failStep: (s) => this.failStep(s),
       callRemote: (runId, seq, step, input, queue, transport) =>
-        this.callRemote(runId, seq, step, input, queue, transport),
+        this.callRemote(runId, seq, step, input, queue, transport, replay),
       // Defer so a fast child can't reentrantly resume a still-running parent.
       startChild: (workflow, input, id) => {
         queueMicrotask(() => void this.start(workflow, input, id).catch(() => undefined));
@@ -1870,8 +1880,11 @@ export class WorkflowEngine {
     input: TInput,
     queue?: string,
     transport?: string,
+    replay?: Map<number, StepCheckpoint>,
   ): Promise<TOutput> {
-    const existing = await this.store.getCheckpoint(runId, seq);
+    // Read the prefix from the per-execution snapshot (avoids the O(N²) replay SELECTs); a seq absent
+    // from the snapshot — not yet dispatched, or written after the snapshot — falls back to the store.
+    const existing = replay?.get(seq) ?? (await this.store.getCheckpoint(runId, seq));
     if (existing && existing.name !== step.name) {
       throw new NonDeterminismError(runId, seq, step.name, existing.name);
     }
