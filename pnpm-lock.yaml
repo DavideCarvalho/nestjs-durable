@@ -191,6 +191,10 @@ importers:
         version: 5.9.3
 
   packages/nestjs:
+    dependencies:
+      '@dudousxd/nestjs-context':
+        specifier: '>=0.1.0 <1.0.0'
+        version: 0.1.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)
     devDependencies:
       '@dudousxd/nestjs-durable-core':
         specifier: workspace:^
@@ -814,6 +818,14 @@ packages:
         optional: true
       tsx:
         optional: true
+
+  '@dudousxd/nestjs-context@0.1.0':
+    resolution: {integrity: sha512-uTGdHrB0n76KHdE59aIujuOMSe0wfFkiC4kTsSVXbplgQVWhwZG+zfA6dBgowWeDSpVaTeWbkEv0SU5HFY191g==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@nestjs/common': '>=10.0.0'
+      '@nestjs/core': '>=10.0.0'
+      reflect-metadata: '>=0.1.13'
 
   '@dudousxd/nestjs-telescope@1.8.0':
     resolution: {integrity: sha512-7Lt8EOrr0W/lGt2gYtglVi73ICB1UDZffucJDhG6evBUEYybxTvodlDnahPGawJKgjg6TtmSk7DHcfZf41Y/gA==}
@@ -6277,6 +6289,12 @@ snapshots:
       typescript: 5.9.3
     optionalDependencies:
       '@nestjs/common': 11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+
+  '@dudousxd/nestjs-context@0.1.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)':
+    dependencies:
+      '@nestjs/common': 11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core': 11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      reflect-metadata: 0.2.2
 
   '@dudousxd/nestjs-telescope@1.8.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)':
     dependencies:
