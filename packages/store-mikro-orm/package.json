@@ -21,7 +21,8 @@
   },
   "peerDependencies": {
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
-    "@mikro-orm/core": "^7.0.0"
+    "@mikro-orm/core": "^7.0.0",
+    "@mikro-orm/decorators": "^7.0.0"
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
