@@ -54,7 +54,7 @@ export class StepCheckpointEntity {
   @PrimaryKey({ type: 'string' })
   runId!: string;
 
-  @PrimaryKey({ type: 'number' })
+  @PrimaryKey({ type: 'integer' })
   seq!: number;
 
   @Property({ type: 'string' })
@@ -81,7 +81,7 @@ export class StepCheckpointEntity {
   @Property({ type: 'json', nullable: true })
   events?: unknown;
 
-  @Property({ type: 'number' })
+  @Property({ type: 'integer' })
   attempts!: number;
 
   @Property({ type: 'string', nullable: true })
@@ -130,13 +130,13 @@ export class SignalWaiterEntity {
   @Property({ type: 'string' })
   runId!: string;
 
-  @Property({ type: 'number' })
+  @Property({ type: 'integer' })
   seq!: number;
 }
 
 @Entity({ tableName: 'durable_buffered_signals' })
 export class BufferedSignalEntity {
-  @PrimaryKey({ autoincrement: true, type: 'number' })
+  @PrimaryKey({ autoincrement: true, type: 'integer' })
   id!: number;
 
   @Property({ index: true, type: 'string' })
