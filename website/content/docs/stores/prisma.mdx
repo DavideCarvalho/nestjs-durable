@@ -1,0 +1,126 @@
+---
+title: Prisma
+description: The Prisma StateStore adapter. Add the durable models to your schema.prisma, prisma generate, and pass your PrismaClient to PrismaStateStore. Schema is owned by Prisma Migrate — there is no auto-schema.
+---
+
+`@dudousxd/nestjs-durable-store-prisma` persists runs and step checkpoints through **Prisma**. Prisma
+generates a client per schema, so the adapter can't ship a concrete client — instead you add its
+models to *your* `schema.prisma`, generate, and hand the adapter your `PrismaClient`.
+
+```bash
+pnpm add @dudousxd/nestjs-durable-store-prisma
+```
+
+## 1. Add the durable models
+
+Copy the durable models from the package's `prisma/schema.prisma` into your own schema. They map to
+the `durable_*` tables and only ever reference each other:
+
+```prisma title="schema.prisma"
+model DurableWorkflowRun {
+  id              String   @id
+  workflow        String
+  workflowVersion String
+  status          String
+  input           Json?
+  output          Json?
+  error           Json?
+  wakeAt          BigInt?
+  lockedBy        String?
+  lockedUntil     DateTime?
+  recoveryAttempts Int?
+  tags            Json?
+  searchAttributes Json?
+  createdAt       DateTime
+  updatedAt       DateTime
+  attributes      DurableRunAttribute[]
+
+  @@index([status, wakeAt])
+  @@index([workflow, status])
+  @@map("durable_workflow_runs")
+}
+
+model DurableRunAttribute {
+  runId    String
+  key      String
+  strValue String?
+  numValue Float?
+  run      DurableWorkflowRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@id([runId, key])
+  @@index([key, numValue])
+  @@index([key, strValue])
+  @@map("durable_run_attributes")
+}
+
+model DurableStepCheckpoint {
+  runId       String
+  seq         Int
+  name        String
+  kind        String
+  stepId      String
+  status      String
+  input       Json?
+  output      Json?
+  error       Json?
+  events      Json?
+  attempts    Int
+  workerGroup String?
+  wakeAt      BigInt?
+  enqueuedAt  DateTime?
+  startedAt   DateTime
+  finishedAt  DateTime
+
+  @@id([runId, seq])
+  @@map("durable_step_checkpoints")
+}
+
+model DurableSignalWaiter {
+  token String @id
+  runId String
+  seq   Int
+
+  @@map("durable_signal_waiters")
+}
+
+model DurableBufferedSignal {
+  id      BigInt @id @default(autoincrement())
+  token   String
+  payload Json?
+
+  @@index([token])
+  @@map("durable_buffered_signals")
+}
+```
+
+The `DurableRunAttribute` side-table is what lets search-attribute filters push down into SQL
+(an `EXISTS` on `(runId, key)`) instead of scanning every run.
+
+## 2. Generate and wire the store
+
+```bash
+npx prisma generate
+npx prisma migrate dev --name add-durable-tables
+```
+
+`PrismaStateStore` takes your `PrismaClient` (or a Nest `PrismaService` that extends it):
+
+```ts title="app.module.ts"
+import { PrismaStateStore } from '@dudousxd/nestjs-durable-store-prisma';
+import { PrismaService } from './prisma.service';
+
+DurableModule.forRootAsync({
+  inject: [PrismaService],
+  useFactory: (prisma: PrismaService) => ({
+    store: new PrismaStateStore(prisma),
+    transport,
+  }),
+});
+```
+
+## Schema is owned by Prisma Migrate
+
+Unlike the MikroORM and TypeORM adapters, this one has **no auto-schema** — Prisma already owns your
+schema and migration history. The `autoSchema` option is a no-op here; the tables exist because
+`prisma migrate` created them from the models above. Treat the models as the source of truth and
+evolve them through Prisma like any other.

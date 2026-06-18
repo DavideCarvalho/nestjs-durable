@@ -1,4 +1,4 @@
 {
   "title": "State stores",
-  "pages": ["index"]
+  "pages": ["index", "mikro-orm", "typeorm", "prisma", "drizzle"]
 }

@@ -1,0 +1,77 @@
+---
+title: MikroORM
+description: The reference StateStore adapter. Register the durable entities with your MikroORM config, pass the ORM to MikroOrmStateStore, and run on Postgres, MySQL or SQLite — with auto-schema on boot or an ensure* helper for your own migration.
+---
+
+`@dudousxd/nestjs-durable-store-mikro-orm` is the **reference adapter** — the one every other store
+is checked against. It persists runs and step checkpoints through MikroORM, on any driver MikroORM
+supports (**Postgres, MySQL, SQLite**), using native datetime columns so `wakeAt` and timestamps
+never overflow.
+
+```bash
+pnpm add @dudousxd/nestjs-durable-store-mikro-orm
+```
+
+It declares `@mikro-orm/core` as a peer — it rides the `MikroORM` instance you already configure.
+
+## 1. Register the durable entities
+
+The adapter reads and writes through MikroORM repositories, so the durable entities must be part of
+your ORM's entity set. The package exports them as `ENTITIES`:
+
+```ts title="mikro-orm.config.ts"
+import { ENTITIES as DURABLE_ENTITIES } from '@dudousxd/nestjs-durable-store-mikro-orm';
+
+export default defineConfig({
+  // …your driver, dbName, etc.
+  entities: [...DURABLE_ENTITIES, /* your own entities */],
+});
+```
+
+`ENTITIES` is `[WorkflowRunEntity, StepCheckpointEntity, RunAttributeEntity, SignalWaiterEntity, BufferedSignalEntity]` —
+the five tables the engine owns (`durable_*`). They never reference your entities.
+
+## 2. Wire the store into the module
+
+`MikroOrmStateStore` takes the `MikroORM` instance. Inject it and build the store in the factory:
+
+```ts title="app.module.ts"
+import { MikroORM } from '@mikro-orm/core';
+import { MikroOrmStateStore } from '@dudousxd/nestjs-durable-store-mikro-orm';
+
+DurableModule.forRootAsync({
+  inject: [MikroORM],
+  useFactory: (orm: MikroORM) => ({
+    store: new MikroOrmStateStore(orm),
+    transport, // any transport — the store is independent of it
+  }),
+});
+```
+
+Each store operation runs on a forked `EntityManager`, so it owns its own unit of work and won't
+interfere with request-scoped EMs.
+
+## Schema: auto on boot, or your own migration
+
+By default the module calls `store.ensureSchema()` on boot, which runs MikroORM's
+`schema.updateSchema({ safe: true })` — additive only, it never drops a column. Zero setup in dev.
+
+In production, turn it off and own the schema from a migration. The package exports
+`ensureMikroOrmDurableSchema(orm)` so your migration applies the exact same additive update:
+
+```ts
+import { ensureMikroOrmDurableSchema } from '@dudousxd/nestjs-durable-store-mikro-orm';
+
+export class AddDurableTables extends Migration {
+  async up() {
+    await ensureMikroOrmDurableSchema(this.getEntityManager().getOrm());
+  }
+}
+```
+
+```ts title="disable auto-schema in production"
+DurableModule.forRoot({ store, transport, autoSchema: false });
+```
+
+It only ever adds `durable_workflow_runs`, `durable_step_checkpoints`, `durable_run_attributes`,
+`durable_signal_waiters` and `durable_buffered_signals` — your tables are untouched.
