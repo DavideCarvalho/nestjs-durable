@@ -1,18 +1,18 @@
 import type { RunStatus, StepKind } from '@dudousxd/nestjs-durable-core';
-import { Entity, PrimaryKey, Property } from '@mikro-orm/core';
+import { Entity, PrimaryKey, Property } from '@mikro-orm/decorators/legacy';
 
 @Entity({ tableName: 'durable_workflow_runs' })
 export class WorkflowRunEntity {
-  @PrimaryKey()
+  @PrimaryKey({ type: 'string' })
   id!: string;
 
-  @Property()
+  @Property({ type: 'string' })
   workflow!: string;
 
-  @Property()
+  @Property({ type: 'string' })
   workflowVersion!: string;
 
-  @Property()
+  @Property({ type: 'string' })
   status!: RunStatus;
 
   @Property({ type: 'json', nullable: true })
@@ -24,13 +24,13 @@ export class WorkflowRunEntity {
   @Property({ type: 'json', nullable: true })
   error?: unknown;
 
-  @Property({ nullable: true })
+  @Property({ type: 'Date', nullable: true })
   wakeAt?: Date;
 
-  @Property({ nullable: true })
+  @Property({ type: 'string', nullable: true })
   lockedBy?: string;
 
-  @Property({ nullable: true })
+  @Property({ type: 'Date', nullable: true })
   lockedUntil?: Date;
 
   @Property({ type: 'integer', nullable: true })
@@ -42,31 +42,31 @@ export class WorkflowRunEntity {
   @Property({ type: 'json', nullable: true })
   searchAttributes?: Record<string, string | number | boolean> | null;
 
-  @Property()
+  @Property({ type: 'Date' })
   createdAt!: Date;
 
-  @Property()
+  @Property({ type: 'Date' })
   updatedAt!: Date;
 }
 
 @Entity({ tableName: 'durable_step_checkpoints' })
 export class StepCheckpointEntity {
-  @PrimaryKey()
+  @PrimaryKey({ type: 'string' })
   runId!: string;
 
-  @PrimaryKey()
+  @PrimaryKey({ type: 'integer' })
   seq!: number;
 
-  @Property()
+  @Property({ type: 'string' })
   name!: string;
 
-  @Property()
+  @Property({ type: 'string' })
   kind!: StepKind;
 
-  @Property()
+  @Property({ type: 'string' })
   stepId!: string;
 
-  @Property()
+  @Property({ type: 'string' })
   status!: 'pending' | 'running' | 'completed' | 'failed';
 
   @Property({ type: 'json', nullable: true })
@@ -81,22 +81,22 @@ export class StepCheckpointEntity {
   @Property({ type: 'json', nullable: true })
   events?: unknown;
 
-  @Property()
+  @Property({ type: 'integer' })
   attempts!: number;
 
-  @Property({ nullable: true })
+  @Property({ type: 'string', nullable: true })
   workerGroup?: string;
 
-  @Property({ nullable: true })
+  @Property({ type: 'Date', nullable: true })
   wakeAt?: Date;
 
-  @Property({ nullable: true })
+  @Property({ type: 'Date', nullable: true })
   enqueuedAt?: Date;
 
-  @Property()
+  @Property({ type: 'Date' })
   startedAt!: Date;
 
-  @Property()
+  @Property({ type: 'Date' })
   finishedAt!: Date;
 }
 
@@ -108,10 +108,10 @@ export class StepCheckpointEntity {
  */
 @Entity({ tableName: 'durable_run_attributes' })
 export class RunAttributeEntity {
-  @PrimaryKey()
+  @PrimaryKey({ type: 'string' })
   runId!: string;
 
-  @PrimaryKey()
+  @PrimaryKey({ type: 'string' })
   key!: string;
 
   @Property({ type: 'string', nullable: true })
@@ -124,22 +124,22 @@ export class RunAttributeEntity {
 
 @Entity({ tableName: 'durable_signal_waiters' })
 export class SignalWaiterEntity {
-  @PrimaryKey()
+  @PrimaryKey({ type: 'string' })
   token!: string;
 
-  @Property()
+  @Property({ type: 'string' })
   runId!: string;
 
-  @Property()
+  @Property({ type: 'integer' })
   seq!: number;
 }
 
 @Entity({ tableName: 'durable_buffered_signals' })
 export class BufferedSignalEntity {
-  @PrimaryKey({ autoincrement: true })
+  @PrimaryKey({ autoincrement: true, type: 'integer' })
   id!: number;
 
-  @Property({ index: true })
+  @Property({ index: true, type: 'string' })
   token!: string;
 
   @Property({ type: 'json', nullable: true })
