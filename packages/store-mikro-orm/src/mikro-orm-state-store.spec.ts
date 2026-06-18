@@ -4,7 +4,7 @@ import {
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { runStateStoreContract } from '@dudousxd/nestjs-durable-testing';
-import { MikroORM } from '@mikro-orm/better-sqlite';
+import { MikroORM } from '@mikro-orm/sqlite';
 import { makeMikroOrmStoreFactory } from './conformance';
 import { ENTITIES } from './entities';
 import { MikroOrmStateStore } from './mikro-orm-state-store';
@@ -12,7 +12,7 @@ import { MikroOrmStateStore } from './mikro-orm-state-store';
 // The SHARED cross-store behavioral contract, run here against SQLite (default `pnpm test`). The same
 // contract runs against real Postgres/MySQL in `mikro-orm-state-store.db.spec.ts` under `pnpm test:db`.
 runStateStoreContract(
-  'MikroORM (better-sqlite)',
+  'MikroORM (sqlite)',
   makeMikroOrmStoreFactory((options) => MikroORM.init(options), { dbName: ':memory:' }),
 );
 
@@ -22,7 +22,7 @@ async function makeStore() {
     entities: [...ENTITIES],
     allowGlobalContext: true,
   });
-  await orm.schema.createSchema();
+  await orm.schema.create();
   return { store: new MikroOrmStateStore(orm), orm };
 }
 
@@ -157,7 +157,7 @@ describe('MikroOrmStateStore', () => {
       debug: true,
       logger: (msg: string) => sqls.push(msg),
     });
-    await orm.schema.createSchema();
+    await orm.schema.create();
     const store = new MikroOrmStateStore(orm);
     await store.createRun(run({ id: 'a', searchAttributes: { amount: 30 } }));
     await store.createRun(run({ id: 'b', searchAttributes: { amount: 200 } }));
