@@ -267,7 +267,7 @@ function ChildRunInline({
   onOpenRun,
 }: {
   id: string;
-  onOpenRun?: (id: string) => void;
+  onOpenRun?: ((id: string) => void) | undefined;
 }) {
   const { data } = useQuery({ queryKey: ['run', id], queryFn: () => durableClient.run(id) });
   // Local expand state for grandchildren expanded within this nested waterfall.
@@ -314,7 +314,7 @@ export function StepDetailPanel({
   run: WorkflowRun;
   onClose: () => void;
   /** Navigate to another run — enables the child-run "open ↗" link in the detail. */
-  onOpenRun?: (id: string) => void;
+  onOpenRun?: ((id: string) => void) | undefined;
 }) {
   const childRunId = childRunIdOf(step);
   const [childOpen, setChildOpen] = useState(false);

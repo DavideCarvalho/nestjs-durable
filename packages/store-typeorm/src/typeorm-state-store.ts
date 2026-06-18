@@ -1,4 +1,5 @@
 import {
+  type AttributeFilter,
   type RunQuery,
   type SignalWaiter,
   type StateStore,
@@ -6,12 +7,24 @@ import {
   type StepError,
   type StepEvent,
   type WorkflowRun,
-  applyAttributeQuery,
+  attributeColumnFor,
+  attributeOperand,
+  normalizeAttributeRows,
+  sqlComparator,
 } from '@dudousxd/nestjs-durable-core';
-import { Brackets, type DataSource, IsNull, LessThanOrEqual, Like } from 'typeorm';
+import {
+  Brackets,
+  type DataSource,
+  type EntityManager,
+  IsNull,
+  LessThanOrEqual,
+  Like,
+  type SelectQueryBuilder,
+} from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import {
   BufferedSignalEntity,
+  RunAttributeEntity,
   SignalWaiterEntity,
   StepCheckpointEntity,
   WorkflowRunEntity,
@@ -41,9 +54,26 @@ export class TypeOrmStateStore implements StateStore {
   private buffered() {
     return this.dataSource.getRepository(BufferedSignalEntity);
   }
+  private attributes() {
+    return this.dataSource.getRepository(RunAttributeEntity);
+  }
+
+  /** Rewrite a run's normalized attribute rows: delete the old set, insert the current one. Mirrors
+   *  the in-memory store's reindex so the side-table always reflects the run's live searchAttributes. */
+  private async reindexAttributes(
+    runId: string,
+    attributes: WorkflowRun['searchAttributes'],
+    em?: EntityManager,
+  ): Promise<void> {
+    const repo = em ? em.getRepository(RunAttributeEntity) : this.attributes();
+    await repo.delete({ runId });
+    const rows = normalizeAttributeRows(runId, attributes);
+    if (rows.length) await repo.insert(rows);
+  }
 
   async createRun(run: WorkflowRun): Promise<void> {
     await this.runs().save(toRunEntity(run));
+    await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
@@ -73,6 +103,8 @@ export class TypeOrmStateStore implements StateStore {
       .where({ id: runId })
       .execute();
     if (!result.affected) throw new Error(`run ${runId} not found`);
+    // Keep the side-table in step with the run's attributes whenever they're patched.
+    if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
@@ -173,19 +205,57 @@ export class TypeOrmStateStore implements StateStore {
     const qb = this.runs().createQueryBuilder('r');
     if (query.workflow) qb.andWhere('r.workflow = :workflow', { workflow: query.workflow });
     if (query.status) qb.andWhere('r.status = :status', { status: query.status });
-    // `tags` is a JSON-text column; match the quoted token so `etl` doesn't match `etl-foo`.
+    if (query.statuses)
+      qb.andWhere(
+        query.statuses.length ? 'r.status IN (:...statuses)' : '1 = 0',
+        query.statuses.length ? { statuses: query.statuses } : {},
+      );
+    // `tags` is a JSON-text column; match the quoted token so `etl` doesn't match `etl-foo`. NOTE: a
+    // leading-wildcard LIKE on JSON text is NOT index-friendly (no B-tree index can serve `%"x"%`), so
+    // tag-filtered scans (e.g. singleton admission) are sequential over `durable_runs_workflow_status_idx`'s
+    // result set. The `statuses`/`workflow` predicates above bound that scan; if tag scans ever dominate,
+    // promote tags to a normalized join table or a JSON/GIN index — a schema change, intentionally not done here.
     if (query.tag) qb.andWhere('r.tags LIKE :tagPattern', { tagPattern: `%"${query.tag}"%` });
-    // Typed/range attribute predicates aren't expressible in portable SQL, so fetch the coarse rows
-    // (newest first) and filter + paginate them in-process. Without attributes, the DB paginates.
-    qb.orderBy('r.createdAt', 'DESC'); // newest first — recent runs on top in the dashboard
+    // Typed/range attribute predicates push DOWN into SQL: each filter becomes an EXISTS against the
+    // normalized `durable_run_attributes` side-table (indexed on (key, numValue)/(key, strValue)), so
+    // the DB does the filtering AND the LIMIT/OFFSET — no full scan + in-process filter. ANDed: a run
+    // must satisfy every filter, so one EXISTS per filter.
     if (query.attributes?.length) {
-      const rows = await qb.getMany();
-      return applyAttributeQuery(rows.map(fromRunEntity), query);
+      query.attributes.forEach((f, i) => this.applyAttributeExists(qb, f, i));
     }
+    qb.orderBy('r.createdAt', 'DESC'); // newest first — recent runs on top in the dashboard
     if (query.limit != null) qb.take(query.limit);
     if (query.offset != null) qb.skip(query.offset);
     const rows = await qb.getMany();
     return rows.map(fromRunEntity);
+  }
+
+  /** Add one attribute predicate to `qb` as an EXISTS subquery on the side-table. `i` namespaces the
+   *  bind params so multiple ANDed filters don't collide. */
+  private applyAttributeExists(
+    qb: SelectQueryBuilder<WorkflowRunEntity>,
+    f: AttributeFilter,
+    i: number,
+  ): void {
+    const col = attributeColumnFor(f); // 'numValue' | 'strValue'
+    const cmp = sqlComparator(f.op);
+    const keyParam = `attrKey${i}`;
+    const valParam = `attrVal${i}`;
+    // `<>` (ne) must also exclude rows where the attribute is absent: the missing-key-never-matches
+    // contract (see core matchesAttributes). EXISTS already requires the key row to be present, and a
+    // row only exists when the value is non-null, so EXISTS(... <> ...) gives exactly ne-with-present.
+    const a = `a${i}`;
+    const sql = `EXISTS (SELECT 1 FROM durable_run_attributes ${a} WHERE ${a}."runId" = r.id AND ${a}."key" = :${keyParam} AND ${a}."${col}" ${cmp} :${valParam})`;
+    qb.andWhere(sql.replace(/"/g, this.idQuote()), {
+      [keyParam]: f.key,
+      [valParam]: attributeOperand(f),
+    });
+  }
+
+  /** The identifier quote char for the active driver (MySQL backtick, others double-quote). */
+  private idQuote(): string {
+    const type = String(this.dataSource.options.type);
+    return type === 'mysql' || type === 'mariadb' || type === 'aurora-mysql' ? '`' : '"';
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
@@ -231,10 +301,10 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     input: run.input ?? null,
     output: run.output ?? null,
     error: run.error ?? null,
-    wakeAt: run.wakeAt == null ? undefined : new Date(run.wakeAt),
+    ...(run.wakeAt == null ? {} : { wakeAt: new Date(run.wakeAt) }),
     lockedBy: run.lockedBy ?? null,
-    lockedUntil: run.lockedUntil == null ? undefined : new Date(run.lockedUntil),
-    recoveryAttempts: run.recoveryAttempts,
+    ...(run.lockedUntil == null ? {} : { lockedUntil: new Date(run.lockedUntil) }),
+    ...(run.recoveryAttempts === undefined ? {} : { recoveryAttempts: run.recoveryAttempts }),
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
     createdAt: run.createdAt,
@@ -276,7 +346,7 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
     events: cp.events ?? null,
     attempts: cp.attempts,
     workerGroup: cp.workerGroup ?? null,
-    wakeAt: cp.wakeAt == null ? undefined : new Date(cp.wakeAt),
+    ...(cp.wakeAt == null ? {} : { wakeAt: new Date(cp.wakeAt) }),
     enqueuedAt: cp.enqueuedAt,
     startedAt: cp.startedAt,
     finishedAt: cp.finishedAt,

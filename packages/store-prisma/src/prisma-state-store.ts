@@ -1,4 +1,5 @@
 import {
+  type AttributeFilter,
   type RunQuery,
   type SignalWaiter,
   type StateStore,
@@ -6,7 +7,9 @@ import {
   type StepError,
   type StepEvent,
   type WorkflowRun,
-  applyAttributeQuery,
+  attributeColumnFor,
+  attributeOperand,
+  normalizeAttributeRows,
 } from '@dudousxd/nestjs-durable-core';
 
 /* The Prisma client is generated per-schema, so the adapter can't import a concrete one. Instead
@@ -58,6 +61,13 @@ interface WaiterRow {
   seq: number;
 }
 
+interface RunAttributeRow {
+  runId: string;
+  key: string;
+  strValue: string | null;
+  numValue: number | null;
+}
+
 interface BufferedSignalRow {
   id: bigint;
   token: string;
@@ -69,6 +79,7 @@ type Args = any;
 
 interface Delegate<Row> {
   create(args: Args): Promise<Row>;
+  createMany(args: Args): Promise<{ count: number }>;
   findUnique(args: Args): Promise<Row | null>;
   findFirst(args?: Args): Promise<Row | null>;
   findMany(args?: Args): Promise<Row[]>;
@@ -76,11 +87,13 @@ interface Delegate<Row> {
   updateMany(args: Args): Promise<{ count: number }>;
   upsert(args: Args): Promise<Row>;
   delete(args: Args): Promise<Row>;
+  deleteMany(args?: Args): Promise<{ count: number }>;
 }
 
 export interface DurablePrismaTx {
   durableWorkflowRun: Delegate<RunRow>;
   durableStepCheckpoint: Delegate<CheckpointRow>;
+  durableRunAttribute: Delegate<RunAttributeRow>;
   durableSignalWaiter: Delegate<WaiterRow>;
   durableBufferedSignal: Delegate<BufferedSignalRow>;
 }
@@ -100,10 +113,24 @@ export class PrismaStateStore implements StateStore {
 
   async createRun(run: WorkflowRun): Promise<void> {
     await this.db.durableWorkflowRun.create({ data: toRunData(run) });
+    await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
     await this.db.durableWorkflowRun.update({ where: { id: runId }, data: toRunPatch(patch) });
+    // Keep the side-table in step with the run's attributes whenever they're patched.
+    if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
+  }
+
+  /** Rewrite a run's normalized attribute rows: delete the old set, insert the current one. Mirrors
+   *  the in-memory store's reindex so the side-table always reflects the run's live searchAttributes. */
+  private async reindexAttributes(
+    runId: string,
+    attributes: WorkflowRun['searchAttributes'],
+  ): Promise<void> {
+    await this.db.durableRunAttribute.deleteMany({ where: { runId } });
+    const rows = normalizeAttributeRows(runId, attributes);
+    if (rows.length) await this.db.durableRunAttribute.createMany({ data: rows });
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
@@ -203,15 +230,24 @@ export class PrismaStateStore implements StateStore {
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
-    if (query.status) where.status = query.status;
-    if (query.tag) where.tags = { array_contains: query.tag };
-    const orderBy = { createdAt: 'desc' as const }; // newest first — recent runs on top in the dashboard
-    // Typed/range attribute predicates aren't portable SQL — fetch coarse rows, filter + paginate
-    // in-process. Without attributes, the DB paginates.
-    if (query.attributes?.length) {
-      const rows = await this.db.durableWorkflowRun.findMany({ where, orderBy });
-      return applyAttributeQuery(rows.map(fromRunRow), query);
+    // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store). Combined with the
+    // single-value `status` via AND when both are present, so the narrower set wins.
+    if (query.status && query.statuses) {
+      where.AND = [{ status: query.status }, { status: { in: query.statuses } }];
+    } else if (query.status) {
+      where.status = query.status;
+    } else if (query.statuses) {
+      where.status = { in: query.statuses };
     }
+    if (query.tag) where.tags = { array_contains: query.tag };
+    // Typed/range attribute predicates push DOWN into SQL: each filter becomes a relation `some`
+    // (EXISTS) on the normalized `durable_run_attributes` side-table, so the DB filters AND paginates
+    // — no full scan + in-process filter. ANDed: a run must match every filter, so one `some` each.
+    if (query.attributes?.length) {
+      const existing = (where.AND as unknown[] | undefined) ?? [];
+      where.AND = [...existing, ...query.attributes.map((f) => attributeSome(f))];
+    }
+    const orderBy = { createdAt: 'desc' as const }; // newest first — recent runs on top in the dashboard
     const rows = await this.db.durableWorkflowRun.findMany({
       where,
       take: query.limit,
@@ -266,6 +302,20 @@ export class PrismaStateStore implements StateStore {
   }
 }
 
+/**
+ * One attribute predicate as a Prisma relation `some` filter on the side-table — compiles to an
+ * EXISTS, so the predicate runs in SQL. `<>` (ne) maps to `{ not }`, which under `some` also excludes
+ * runs where the attribute is absent (the missing-key-never-matches contract): `some` already
+ * requires a matching row to exist. Numeric operands compare `numValue`, everything else `strValue`.
+ */
+function attributeSome(f: AttributeFilter): { attributes: { some: Record<string, unknown> } } {
+  const col = attributeColumnFor(f); // 'numValue' | 'strValue'
+  const operand = attributeOperand(f);
+  const condition =
+    f.op === 'eq' ? operand : f.op === 'ne' ? { not: operand } : { [f.op]: operand }; // gt/gte/lt/lte map 1:1 to Prisma operators
+  return { attributes: { some: { key: f.key, [col]: condition } } };
+}
+
 const bigOrNull = (n: number | undefined) => (n == null ? null : BigInt(n));
 const numOrUndef = (n: bigint | null) => (n == null ? undefined : Number(n));
 const jsonOrNull = (v: unknown) => v ?? null;
@@ -297,6 +347,7 @@ function toRunPatch(patch: Partial<WorkflowRun>) {
   if (patch.error !== undefined) data.error = jsonOrNull(patch.error);
   if (patch.wakeAt !== undefined) data.wakeAt = bigOrNull(patch.wakeAt);
   if (patch.recoveryAttempts !== undefined) data.recoveryAttempts = patch.recoveryAttempts ?? null;
+  if ('searchAttributes' in patch) data.searchAttributes = jsonOrNull(patch.searchAttributes);
   if (patch.updatedAt !== undefined) data.updatedAt = patch.updatedAt;
   return data;
 }

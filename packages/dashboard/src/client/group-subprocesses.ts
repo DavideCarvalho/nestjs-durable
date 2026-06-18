@@ -4,18 +4,18 @@ import type { StepEvent } from './durable-client';
 export interface SubProcess {
   id: string;
   name: string;
-  group?: string;
+  group?: string | undefined;
   /** Intermediate transitions (events carrying a `phase`), in arrival order. */
   phases: StepEvent[];
   /** Log lines owned by this sub-process (no `phase`, no `status`), in arrival order. */
   logs: StepEvent[];
   /** The terminal event (carries a `status`), if the sub has finished. */
-  terminal?: StepEvent;
-  status?: 'ok' | 'failed' | 'skipped';
+  terminal?: StepEvent | undefined;
+  status?: 'ok' | 'failed' | 'skipped' | undefined;
   /** Earliest `at` across this sub's events. */
-  startedAt?: number;
+  startedAt?: number | undefined;
   /** `data.durationMs` when provided, else `terminal.at − startedAt`. */
-  durationMs?: number;
+  durationMs?: number | undefined;
 }
 
 function durationFromData(data: unknown): number | undefined {

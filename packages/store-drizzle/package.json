@@ -9,14 +9,14 @@
     "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/store-drizzle"
   },
-  "type": "commonjs",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsup",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
@@ -25,9 +25,24 @@
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
+    "@dudousxd/nestjs-durable-testing": "workspace:^",
     "@types/better-sqlite3": "7.6.11",
     "better-sqlite3": "11.10.0",
     "drizzle-orm": "0.44.7",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "tsup": "8.3.5"
+  },
+  "module": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
   }
 }

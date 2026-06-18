@@ -1,4 +1,8 @@
 {
+  // TODO(dual): intentionally left CJS-only. ESLint plugins are conventionally CommonJS for broad
+  // ESLint-version compatibility (legacy `.eslintrc` configs require CJS). This package is loaded by
+  // ESLint's own resolver as a plugin, not `import`ed in app code, so dual/ESM adds compat risk for
+  // no benefit. Stays on the known-good `tsc` CJS build.
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "module": "CommonJS",

@@ -25,11 +25,18 @@ export function attachDurableOtel(engine: WorkflowEngine, options: DurableOtelOp
     options.tracer ?? (options.provider ?? trace).getTracer('@dudousxd/nestjs-durable', '0.1.0');
   const roots = new Map<string, Span>();
 
-  const endRoot = (event: EngineEvent, status?: { error?: boolean; message?: string }) => {
+  const endRoot = (
+    event: EngineEvent,
+    status?: { error?: boolean | undefined; message?: string | undefined },
+  ) => {
     const span = roots.get(event.runId);
     if (!span) return;
     if (status?.error) {
-      span.setStatus({ code: SpanStatusCode.ERROR, message: status.message });
+      span.setStatus(
+        status.message !== undefined
+          ? { code: SpanStatusCode.ERROR, message: status.message }
+          : { code: SpanStatusCode.ERROR },
+      );
     }
     span.end(event.at);
     roots.delete(event.runId);
@@ -64,7 +71,12 @@ export function attachDurableOtel(engine: WorkflowEngine, options: DurableOtelOp
           ctx,
         );
         if (event.type === 'step.failed') {
-          span.setStatus({ code: SpanStatusCode.ERROR, message: event.error?.message });
+          const message = event.error?.message;
+          span.setStatus(
+            message !== undefined
+              ? { code: SpanStatusCode.ERROR, message }
+              : { code: SpanStatusCode.ERROR },
+          );
         }
         span.end(event.at);
         break;

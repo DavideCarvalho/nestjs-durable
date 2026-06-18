@@ -61,8 +61,12 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
 
   const runs = q('durable_workflow_runs');
   const checkpoints = q('durable_step_checkpoints');
+  const runAttributes = q('durable_run_attributes');
   const waiters = q('durable_signal_waiters');
   const buffered = q('durable_buffered_signals');
+  // Numeric side-table column for attribute range scans. `double precision` on Postgres, `double` on
+  // MySQL, `real` on SQLite (all hold JS numbers without precision loss for the typical attribute).
+  const num = isPg ? 'double precision' : isMysql ? 'double' : 'real';
 
   // Auto-increment PK syntax differs per dialect: SQLite wants `INTEGER PRIMARY KEY AUTOINCREMENT`,
   // MySQL `BIGINT AUTO_INCREMENT PRIMARY KEY`, Postgres `BIGSERIAL PRIMARY KEY`.
@@ -93,6 +97,13 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ${q('wakeAt')} ${ts}, ${q('enqueuedAt')} ${ts},
       ${q('startedAt')} ${ts} NOT NULL, ${q('finishedAt')} ${ts} NOT NULL,
       PRIMARY KEY (${q('runId')}, ${q('seq')})
+    )`,
+    // Normalized search-attribute side-table: one row per (run, key) so attribute predicates push
+    // DOWN into SQL via an EXISTS join (indexed below). `key` is keyed → must be varchar on MySQL.
+    `CREATE TABLE IF NOT EXISTS ${runAttributes} (
+      ${q('runId')} ${str} NOT NULL, ${q('key')} ${str} NOT NULL,
+      ${q('strValue')} ${str}, ${q('numValue')} ${num},
+      PRIMARY KEY (${q('runId')}, ${q('key')})
     )`,
     `CREATE TABLE IF NOT EXISTS ${waiters} (
       ${q('token')} ${str} PRIMARY KEY, ${q('runId')} ${str} NOT NULL, ${q('seq')} ${int} NOT NULL
@@ -157,6 +168,10 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ['durable_runs_workflow_status_idx', `${runs} (${q('workflow')}, ${q('status')})`],
       // buffered signals are taken FIFO per token (smallest id) — index the token for the scan.
       ['durable_buffered_signals_token_idx', `${buffered} (${q('token')})`],
+      // Search-attribute pushdown: equality + range predicates probe by (key, value). Two composite
+      // indexes — one per typed column — so a numeric range or a string equality is an index scan.
+      ['durable_run_attributes_num_idx', `${runAttributes} (${q('key')}, ${q('numValue')})`],
+      ['durable_run_attributes_str_idx', `${runAttributes} (${q('key')}, ${q('strValue')})`],
     ];
     for (const [name, target] of indexes) {
       try {
@@ -182,9 +197,12 @@ async function existingColumns(
     return new Set(rows.map((r) => r.name));
   }
   // Postgres + MySQL both expose information_schema; scope to the connection's own schema/db.
+  // Bind-param placeholder differs: Postgres uses `$1`, MySQL uses `?` (TypeORM only rewrites `?`
+  // inside the query builder, not for these raw `runner.query` calls), so pick per dialect.
   const scope = d.isMysql ? 'TABLE_SCHEMA = DATABASE()' : 'table_schema = current_schema()';
+  const placeholder = d.isMysql ? '?' : '$1';
   const rows = (await runner.query(
-    `SELECT column_name AS name FROM information_schema.columns WHERE table_name = ? AND ${scope}`,
+    `SELECT column_name AS name FROM information_schema.columns WHERE table_name = ${placeholder} AND ${scope}`,
     [table],
   )) as Array<{ name?: string; COLUMN_NAME?: string }>;
   return new Set(rows.map((r) => (r.name ?? r.COLUMN_NAME) as string));

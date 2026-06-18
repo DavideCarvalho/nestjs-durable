@@ -4,20 +4,53 @@ import {
   type RemoteStepDef,
   WorkflowEngine,
 } from '@dudousxd/nestjs-durable-core';
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { DataSource } from 'typeorm';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { DbTransport } from './db-transport';
 import { typeOrmExecutor } from './executors';
 
-// SKIP LOCKED needs MySQL 8+. flip runs one on :3306; skip when it isn't up.
-const dbConfig = {
-  type: 'mysql' as const,
-  host: process.env.MYSQL_HOST ?? '127.0.0.1',
-  port: Number(process.env.MYSQL_PORT ?? 3306),
-  username: process.env.MYSQL_USER ?? 'root',
-  password: process.env.MYSQL_PASSWORD ?? 'password',
-  database: process.env.MYSQL_DB ?? 'flip',
-};
+/**
+ * Real-engine matrix for the SQL transport: a Postgres container spun up via testcontainers, so the
+ * DBOS-style row-as-queue round-trip — which needs real `FOR UPDATE SKIP LOCKED` (unavailable on
+ * SQLite) — and the failed-result path run against an actual engine instead of self-skipping. Run
+ * with `pnpm test:db`.
+ *
+ * Postgres (not MySQL) to reuse the stores' container image; the transport's DDL + claim SQL are
+ * dialect-aware (the executor reports `postgres`, so quoting is double-quotes and placeholders are
+ * `$n`). Skips cleanly when Docker is unavailable or `SKIP_TESTCONTAINERS` is set.
+ */
+
+const CONTAINER_TIMEOUT = 180_000;
+const skipped = !!process.env.SKIP_TESTCONTAINERS;
+
+let pg: StartedPostgreSqlContainer | undefined;
+let pgError: unknown;
+let ds: DataSource | undefined;
+
+beforeAll(async () => {
+  if (skipped) return;
+  try {
+    pg = await new PostgreSqlContainer('postgres:16-alpine').start();
+    ds = new DataSource({
+      type: 'postgres',
+      host: pg.getHost(),
+      port: pg.getPort(),
+      username: pg.getUsername(),
+      password: pg.getPassword(),
+      database: pg.getDatabase(),
+    });
+    await ds.initialize();
+  } catch (err) {
+    pgError = err;
+  }
+}, CONTAINER_TIMEOUT);
+
+afterAll(async () => {
+  if (ds?.isInitialized) await ds.destroy();
+  await pg?.stop();
+});
 
 const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
   name: 'payments.charge-card',
@@ -39,31 +72,31 @@ async function settle(store: InMemoryStateStore, runId: string, timeoutMs = 20_0
   throw new Error(`run ${runId} did not settle`);
 }
 
-let ds: DataSource;
-let dbUp = false;
-beforeAll(async () => {
-  ds = new DataSource(dbConfig);
-  try {
-    await ds.initialize();
-    dbUp = true;
-  } catch {
-    dbUp = false;
-  }
-});
-afterAll(async () => {
-  if (ds?.isInitialized) await ds.destroy();
-});
-
 async function dropTables(prefix: string) {
-  await ds.query(`DROP TABLE IF EXISTS \`${prefix}_transport_tasks\``);
-  await ds.query(`DROP TABLE IF EXISTS \`${prefix}_transport_results\``);
+  if (!ds) return;
+  await ds.query(`DROP TABLE IF EXISTS "${prefix}_transport_tasks"`);
+  await ds.query(`DROP TABLE IF EXISTS "${prefix}_transport_results"`);
 }
 
-describe('DbTransport (real MySQL)', () => {
+/** Resolve the live DataSource or self-skip the case when Docker isn't available. */
+function liveDataSource(ctx: { skip: () => void }): DataSource {
+  if (skipped || pgError || !ds?.isInitialized) {
+    ctx.skip();
+    throw new Error('unreachable'); // ctx.skip() aborts; keeps the type non-undefined
+  }
+  return ds;
+}
+
+describe('DbTransport (real Postgres) [testcontainers]', () => {
   it('dispatches a remote step through the DB and returns the checkpointed result', async (ctx) => {
-    if (!dbUp) ctx.skip();
+    const ds = liveDataSource(ctx);
     const prefix = `durtest${Date.now()}`;
-    const transport = new DbTransport({ executor: typeOrmExecutor(ds), group: 'payments', prefix, pollMs: 50 });
+    const transport = new DbTransport({
+      executor: typeOrmExecutor(ds),
+      group: 'payments',
+      prefix,
+      pollMs: 50,
+    });
     transport.handle('payments.charge-card', async (input: { amount: number }) => ({
       chargeId: `ch_${input.amount}`,
     }));
@@ -85,9 +118,14 @@ describe('DbTransport (real MySQL)', () => {
   }, 30_000);
 
   it('reports a failed result when the worker handler throws', async (ctx) => {
-    if (!dbUp) ctx.skip();
+    const ds = liveDataSource(ctx);
     const prefix = `durtestf${Date.now()}`;
-    const transport = new DbTransport({ executor: typeOrmExecutor(ds), group: 'payments', prefix, pollMs: 50 });
+    const transport = new DbTransport({
+      executor: typeOrmExecutor(ds),
+      group: 'payments',
+      prefix,
+      pollMs: 50,
+    });
     transport.handle('payments.charge-card', async () => {
       throw new Error('declined');
     });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
-import { runSchedules, type ScheduledWorkflow } from './scheduler';
+import { type ScheduledWorkflow, runSchedules } from './scheduler';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
@@ -42,7 +42,11 @@ describe('runSchedules', () => {
     const engine = new WorkflowEngine({ store });
     let runs = 0;
     engine.register('beat', '1', async () => void (runs += 1));
-    await fireAndSettle(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000, paused: true }], 1000);
+    await fireAndSettle(
+      engine,
+      [{ key: 'b', workflow: 'beat', everyMs: 1000, paused: true }],
+      1000,
+    );
     expect(runs).toBe(0);
   });
 
@@ -121,5 +125,147 @@ describe('runSchedules', () => {
     expect(runs).toBe(1);
     expect(b.status).toBe('completed');
     expect(a.output).toBe(b.output);
+  });
+});
+
+describe('runSchedules — jitter', () => {
+  it('delays the dispatch by up to the jitter bound before firing (never exceeds it)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('beat', '1', async () => 'tick');
+
+    const sleeps: number[] = [];
+    const ids = await runSchedules(
+      engine,
+      [{ key: 'b', workflow: 'beat', everyMs: 1000, jitter: 500 }],
+      1000,
+      {
+        random: () => 0.5, // deterministic: half of the bound
+        sleep: async (ms) => void sleeps.push(ms),
+      },
+    );
+
+    expect(sleeps).toEqual([250]); // 0.5 * 500, applied before start
+    expect(ids).toEqual(['sched:b:1']);
+    await engine.waitForRun('sched:b:1');
+    expect((await store.getRun('sched:b:1'))?.output).toBe('tick');
+  });
+
+  it('keeps the jittered delay within [0, jitter) for any random value', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('beat', '1', async () => 'tick');
+    for (const rnd of [0, 0.1, 0.9, 0.999999]) {
+      const sleeps: number[] = [];
+      await runSchedules(
+        engine,
+        [{ key: 'b', workflow: 'beat', everyMs: 1000, jitter: 300 }],
+        1000,
+        {
+          random: () => rnd,
+          sleep: async (ms) => void sleeps.push(ms),
+        },
+      );
+      expect(sleeps[0]).toBeGreaterThanOrEqual(0);
+      expect(sleeps[0]).toBeLessThan(300);
+    }
+  });
+
+  it('does not sleep when jitter is absent (default behavior preserved)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('beat', '1', async () => 'tick');
+    const sleeps: number[] = [];
+    await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000 }], 1000, {
+      random: () => 0.5,
+      sleep: async (ms) => void sleeps.push(ms),
+    });
+    expect(sleeps).toEqual([]);
+  });
+});
+
+describe('runSchedules — backfill', () => {
+  it('enqueues windows missed while the scheduler was down, up to maxCatchup', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    let runs = 0;
+    engine.register('beat', '1', async () => {
+      runs += 1;
+      return 'tick';
+    });
+    // Scheduler was down; now it's bucket 10. Backfill the 3 prior windows + the current one.
+    const ids = await runSchedules(
+      engine,
+      [{ key: 'b', workflow: 'beat', everyMs: 1000, backfill: { maxCatchup: 3 } }],
+      10_000,
+    );
+    for (const id of ids) await engine.waitForRun(id);
+
+    expect(ids.sort()).toEqual(['sched:b:10', 'sched:b:7', 'sched:b:8', 'sched:b:9'].sort());
+    expect(runs).toBe(4); // 3 backfilled + current
+  });
+
+  it('idempotent buckets prevent duplicates when backfill overlaps already-run windows', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    let runs = 0;
+    engine.register('beat', '1', async () => {
+      runs += 1;
+      return 'tick';
+    });
+    const sched = [{ key: 'b', workflow: 'beat', everyMs: 1000, backfill: { maxCatchup: 5 } }];
+
+    await fireAndSettle(engine, sched, 8000); // backfills 3..8 (6 runs)
+    expect(runs).toBe(6);
+
+    // Next tick a window later — backfill range overlaps the already-run buckets → no duplicates.
+    const ids = await fireAndSettle(engine, sched, 9000); // would cover 4..9; only 9 is new
+    expect(ids).toContain('sched:b:9');
+    expect(runs).toBe(7); // only the one genuinely-new window ran
+  });
+
+  it('caps backfilled windows at maxCatchup (does not flood from a long outage)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    let runs = 0;
+    engine.register('beat', '1', async () => {
+      runs += 1;
+    });
+    // Huge gap, but maxCatchup:2 → only current + 2 prior windows.
+    const ids = await fireAndSettle(
+      engine,
+      [{ key: 'b', workflow: 'beat', everyMs: 1000, backfill: { maxCatchup: 2 } }],
+      1_000_000,
+    );
+    expect(ids).toHaveLength(3);
+    expect(runs).toBe(3);
+  });
+
+  it('backfills a cron schedule by walking prior fire times, capped by maxCatchup', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    let runs = 0;
+    engine.register('nightly', '1', async () => {
+      runs += 1;
+    });
+    // Daily at midnight UTC, evaluated at 2026-01-10T05:00Z. Backfill 2 prior days + current.
+    const ids = await fireAndSettle(
+      engine,
+      [
+        {
+          key: 'n',
+          workflow: 'nightly',
+          cron: '0 0 * * *',
+          timezone: 'UTC',
+          backfill: { maxCatchup: 2 },
+        },
+      ],
+      Date.UTC(2026, 0, 10, 5, 0, 0),
+    );
+    expect(runs).toBe(3);
+    const today = Date.UTC(2026, 0, 10, 0, 0, 0);
+    const yest = Date.UTC(2026, 0, 9, 0, 0, 0);
+    const before = Date.UTC(2026, 0, 8, 0, 0, 0);
+    expect(ids.sort()).toEqual([`sched:n:${today}`, `sched:n:${yest}`, `sched:n:${before}`].sort());
   });
 });

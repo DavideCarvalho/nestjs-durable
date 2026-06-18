@@ -40,11 +40,11 @@ export interface StepRecord {
   name: string;
   kind: StepKind;
   input?: unknown;
-  events?: StepEvent[];
+  events?: StepEvent[] | undefined;
   attempts: number;
   enqueuedAt: Date;
   startedAt: Date;
-  workerGroup?: string;
+  workerGroup?: string | undefined;
 }
 
 /**
@@ -62,9 +62,9 @@ export interface CtxHost {
    * the snapshot) is always read fresh. New checkpoints written during this execution are inserted
    * into the map so any later same-execution read sees them. Undefined ⇒ always hit the store.
    */
-  readonly replay?: Map<number, StepCheckpoint>;
+  readonly replay?: Map<number, StepCheckpoint> | undefined;
   clock(): number;
-  webhookUrl?: (token: string) => string;
+  webhookUrl?: ((token: string) => string) | undefined;
   /** Mark a local step's body as started — emits `step.started` and (optionally) a `running` checkpoint. */
   startStep(step: StepRecord): Promise<void>;
   completeStep(step: StepRecord & { output: unknown }): Promise<void>;
@@ -76,6 +76,7 @@ export interface CtxHost {
     input: TInput,
     queue?: string,
     transport?: string,
+    admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
   ): Promise<TOutput>;
   /** Start a child run once, deferred so it can't reentrantly resume a still-running parent. */
   startChild(workflow: string, input: unknown, id: string): void;
@@ -577,6 +578,9 @@ export function createWorkflowCtx(
     random,
     uuid,
     call: (remote, input, opts) =>
-      host.callRemote(runId, pos.next(), remote, input, opts?.queue, opts?.transport),
+      host.callRemote(runId, pos.next(), remote, input, opts?.queue, opts?.transport, {
+        priority: opts?.priority,
+        fairnessKey: opts?.fairnessKey,
+      }),
   };
 }

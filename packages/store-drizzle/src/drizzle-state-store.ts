@@ -1,4 +1,5 @@
 import {
+  type AttributeFilter,
   type RunQuery,
   type SignalWaiter,
   type StateStore,
@@ -6,11 +7,33 @@ import {
   type StepError,
   type StepEvent,
   type WorkflowRun,
-  applyAttributeQuery,
+  attributeColumnFor,
+  attributeOperand,
+  normalizeAttributeRows,
+  sqlComparator,
 } from '@dudousxd/nestjs-durable-core';
-import { and, asc, desc, eq, isNotNull, isNull, like, lte, or } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  exists,
+  inArray,
+  isNotNull,
+  isNull,
+  like,
+  lte,
+  or,
+  sql,
+} from 'drizzle-orm';
 import type { BaseSQLiteDatabase } from 'drizzle-orm/sqlite-core';
-import { bufferedSignals, signalWaiters, stepCheckpoints, workflowRuns } from './schema';
+import {
+  bufferedSignals,
+  runAttributes,
+  signalWaiters,
+  stepCheckpoints,
+  workflowRuns,
+} from './schema';
 
 type RunRow = typeof workflowRuns.$inferSelect;
 type CheckpointRow = typeof stepCheckpoints.$inferSelect;
@@ -26,10 +49,27 @@ export class DrizzleStateStore implements StateStore {
 
   async createRun(run: WorkflowRun): Promise<void> {
     await this.db.insert(workflowRuns).values(toRunRow(run));
+    await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
-    await this.db.update(workflowRuns).set(toRunPatch(patch)).where(eq(workflowRuns.id, runId));
+    const row = toRunPatch(patch);
+    // Drizzle throws on `.set({})`; skip the UPDATE when no mapped column actually changed.
+    if (Object.keys(row).length)
+      await this.db.update(workflowRuns).set(row).where(eq(workflowRuns.id, runId));
+    // Keep the side-table in step with the run's attributes whenever they're patched.
+    if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
+  }
+
+  /** Rewrite a run's normalized attribute rows: delete the old set, insert the current one. Mirrors
+   *  the in-memory store's reindex so the side-table always reflects the run's live searchAttributes. */
+  private async reindexAttributes(
+    runId: string,
+    attributes: WorkflowRun['searchAttributes'],
+  ): Promise<void> {
+    await this.db.delete(runAttributes).where(eq(runAttributes.runId, runId));
+    const rows = normalizeAttributeRows(runId, attributes);
+    if (rows.length) await this.db.insert(runAttributes).values(rows);
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
@@ -150,21 +190,49 @@ export class DrizzleStateStore implements StateStore {
     const filters = [
       query.workflow ? eq(workflowRuns.workflow, query.workflow) : undefined,
       query.status ? eq(workflowRuns.status, query.status) : undefined,
+      // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store).
+      query.statuses
+        ? query.statuses.length
+          ? inArray(workflowRuns.status, query.statuses)
+          : sql`1 = 0`
+        : undefined,
       // `tags` is JSON text; match the quoted token so `etl` doesn't match `etl-foo`.
       query.tag ? like(workflowRuns.tags, `%"${query.tag}"%`) : undefined,
+      // Typed/range attribute predicates push DOWN into SQL: each filter becomes an EXISTS against
+      // the normalized `durable_run_attributes` side-table, so the DB filters AND paginates — no
+      // full scan + in-process filter. ANDed: a run must satisfy every filter (one EXISTS per filter).
+      ...(query.attributes?.map((f) => this.attributeExists(f)) ?? []),
     ].filter((f): f is NonNullable<typeof f> => f !== undefined);
-    const base = this.db
+    const rows = await this.db
       .select()
       .from(workflowRuns)
       .where(filters.length ? and(...filters) : undefined)
-      .orderBy(desc(workflowRuns.createdAt)); // newest first — recent runs on top in the dashboard
-    // Typed/range attribute predicates aren't portable SQL — fetch coarse rows, filter + paginate
-    // in-process. Without attributes, the DB paginates.
-    if (query.attributes?.length) {
-      return applyAttributeQuery((await base).map(fromRunRow), query);
-    }
-    const rows = await base.limit(query.limit ?? -1).offset(query.offset ?? 0);
+      .orderBy(desc(workflowRuns.createdAt)) // newest first — recent runs on top in the dashboard
+      .limit(query.limit ?? -1)
+      .offset(query.offset ?? 0);
     return rows.map(fromRunRow);
+  }
+
+  /** One attribute predicate as an EXISTS subquery on the side-table, correlated to the outer run.
+   *  `<>` (ne) also excludes runs where the attribute is absent (the missing-key-never-matches
+   *  contract): EXISTS already requires the key row to be present, so EXISTS(... <> ...) is exactly
+   *  ne-with-present. Numeric operands compare `num_value`, everything else `str_value`. */
+  private attributeExists(f: AttributeFilter) {
+    const col =
+      attributeColumnFor(f) === 'numValue' ? runAttributes.numValue : runAttributes.strValue;
+    const cmp = sqlComparator(f.op);
+    return exists(
+      this.db
+        .select({ one: sql`1` })
+        .from(runAttributes)
+        .where(
+          and(
+            eq(runAttributes.runId, workflowRuns.id),
+            eq(runAttributes.key, f.key),
+            sql`${col} ${sql.raw(cmp)} ${attributeOperand(f)}`,
+          ),
+        ),
+    );
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
@@ -251,6 +319,7 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if (patch.error !== undefined) row.error = patch.error ?? null;
   if (patch.wakeAt !== undefined) row.wakeAt = patch.wakeAt ?? null;
   if (patch.recoveryAttempts !== undefined) row.recoveryAttempts = patch.recoveryAttempts ?? null;
+  if ('searchAttributes' in patch) row.searchAttributes = patch.searchAttributes ?? null;
   if (patch.updatedAt !== undefined) row.updatedAt = patch.updatedAt.getTime();
   return row;
 }

@@ -1,4 +1,4 @@
-import { integer, primaryKey, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import { integer, primaryKey, real, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 
 // SQLite / libSQL schema for the durable tables. Timestamps and `wakeAt` are epoch-ms integers
 // (SQLite has no native date type). Import these tables and pass them with your drizzle db.
@@ -46,6 +46,21 @@ export const stepCheckpoints = sqliteTable(
   (t) => [primaryKey({ columns: [t.runId, t.seq] })],
 );
 
+// Normalized search-attribute side-table: one row per (run, key), so range/equality attribute
+// predicates push DOWN into SQL via an EXISTS join instead of a coarse scan + in-process filter.
+// Maintained on every createRun/updateRun. Numbers land in `numValue`, strings/booleans in
+// `strValue` (booleans as "true"/"false"); see core `normalizeAttributeRows`.
+export const runAttributes = sqliteTable(
+  'durable_run_attributes',
+  {
+    runId: text('run_id').notNull(),
+    key: text('key').notNull(),
+    strValue: text('str_value'),
+    numValue: real('num_value'),
+  },
+  (t) => [primaryKey({ columns: [t.runId, t.key] })],
+);
+
 export const signalWaiters = sqliteTable('durable_signal_waiters', {
   token: text('token').primaryKey(),
   runId: text('run_id').notNull(),
@@ -58,4 +73,10 @@ export const bufferedSignals = sqliteTable('durable_buffered_signals', {
   payload: text('payload', { mode: 'json' }),
 });
 
-export const durableSchema = { workflowRuns, stepCheckpoints, signalWaiters, bufferedSignals };
+export const durableSchema = {
+  workflowRuns,
+  stepCheckpoints,
+  runAttributes,
+  signalWaiters,
+  bufferedSignals,
+};

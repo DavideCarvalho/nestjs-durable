@@ -7,11 +7,11 @@ import type {
 
 export interface InspectOptions {
   /** Show one run's step timeline instead of the runs list. */
-  runId?: string;
+  runId?: string | undefined;
   /** Filter the runs list by status. */
-  status?: RunStatus;
+  status?: RunStatus | undefined;
   /** Max runs to list. Defaults to 50. */
-  limit?: number;
+  limit?: number | undefined;
 }
 
 /** Render the runs list, or a single run's timeline, as plain text for the terminal. */

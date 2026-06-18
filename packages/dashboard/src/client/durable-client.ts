@@ -185,7 +185,11 @@ export const durableClient = {
   /** Bulk retry/cancel every run matching a filter. Returns how many matched + were acted on. */
   bulk(
     action: 'retry' | 'cancel',
-    filter: { status?: RunStatus; tag?: string; attr?: string[] },
+    filter: {
+      status?: RunStatus | undefined;
+      tag?: string | undefined;
+      attr?: string[] | undefined;
+    },
   ): Promise<{ matched: number; applied: number }> {
     const q = new URLSearchParams();
     if (filter.status) q.set('status', filter.status);

@@ -9,6 +9,7 @@ import {
   NonDeterminismError,
   RemoteStepTimeout,
   SignalTimeoutError,
+  SingletonQueueFullError,
   WorkflowSuspended,
 } from './errors';
 import { EventAccumulators, type EventBatchConfig } from './event-accumulators';
@@ -22,6 +23,7 @@ import type {
   RemoteStepDef,
   RemoteTask,
   RunDispatcher,
+  RunQuery,
   RunResult,
   RunStatus,
   SearchAttributes,
@@ -65,9 +67,9 @@ type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 /** Options for {@link WorkflowEngine.start}. */
 export interface StartOptions {
   /** Run-scoped tags, merged with the workflow's static `@Workflow({ tags })` onto the run. */
-  tags?: string[];
+  tags?: string[] | undefined;
   /** Typed, queryable run data stamped on the run (e.g. `{ amount: 200, tier: 'pro' }`). */
-  searchAttributes?: SearchAttributes;
+  searchAttributes?: SearchAttributes | undefined;
 }
 
 /**
@@ -81,10 +83,28 @@ export interface SingletonConfig {
   key: (input: unknown) => string;
   /** Max concurrent runs sharing the key. Default 1 (a mutex). */
   limit?: number;
+  /**
+   * Max GATED (waiting-for-admission) runs allowed to queue behind the `limit` in-flight ones. When
+   * set, `start` rejects with {@link SingletonQueueFullError} once in-flight + gated reaches
+   * `limit + maxQueueDepth` — back-pressure against an unbounded same-key backlog. Omit for the
+   * default unbounded queue. Counts `pending`/`running`/`suspended` runs sharing the key.
+   */
+  maxQueueDepth?: number;
 }
 
 /** How long a gated (waiting-for-admission) singleton run sleeps before re-checking for a free slot. */
 const SINGLETON_RETRY_MS = 1000;
+/**
+ * Max jitter (ms, each direction) added to {@link SINGLETON_RETRY_MS} so a queue of N gated runs doesn't
+ * all wake on the same tick and re-scan the store in lockstep (a thundering herd). Each waiter draws an
+ * independent offset in `[-SINGLETON_RETRY_JITTER_MS, +SINGLETON_RETRY_JITTER_MS]`, spreading the
+ * admission re-checks across a ~500ms window. Smaller than the base so wakeups stay roughly FIFO-ordered.
+ */
+const SINGLETON_RETRY_JITTER_MS = 250;
+
+/** Next wake time for a gated singleton run: the base retry delay jittered to avoid a wakeup stampede. */
+const singletonRetryWakeAt = (nowMs: number): number =>
+  nowMs + SINGLETON_RETRY_MS + Math.floor((Math.random() * 2 - 1) * SINGLETON_RETRY_JITTER_MS);
 
 /** The tag a singleton run carries, so the admission gate can find others sharing its key. */
 const singletonTag = (cfg: SingletonConfig, input: unknown): string =>
@@ -107,17 +127,17 @@ interface RegisteredWorkflow {
   version: string;
   fn: WorkflowFn;
   /** Static `@Workflow({ tags })` — merged with per-run tags onto each run at start. */
-  tags?: string[];
+  tags?: string[] | undefined;
   /** Per-key serialization (a durable mutex). See {@link SingletonConfig}. */
-  singleton?: SingletonConfig;
+  singleton?: SingletonConfig | undefined;
   /** Max wall-clock lifetime (ms) before a run is cancelled by `sweepTimeouts`. */
-  executionTimeoutMs?: number;
+  executionTimeoutMs?: number | undefined;
   /** Validate the input at start; throw to reject before a run is created. Validator-agnostic. */
-  validateInput?: (input: unknown) => void | Promise<void>;
+  validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
   /** Event names that start a fresh run of this workflow when published. See `publishEvent`. */
-  onEvent?: string[];
+  onEvent?: string[] | undefined;
   /** Coalesce `onEvent` triggers: debounce (fire once it's quiet) or batch (fire on size/window). */
-  eventBatch?: EventBatchConfig;
+  eventBatch?: EventBatchConfig | undefined;
   /** Set for a workflow authored in another SDK (e.g. Python): the engine advances it by dispatching
    *  workflow tasks to `executor` instead of running `fn` in-process. See {@link WorkflowExecutor}. */
   remote?: { group: string; executor: WorkflowExecutor };
@@ -142,8 +162,8 @@ function isNewerVersion(a: string, b: string): boolean {
 /** What a remote worker hands back: the output plus when it actually began (for queue-wait timing). */
 interface RemoteResolution {
   output: unknown;
-  startedAt?: number;
-  events?: StepEvent[];
+  startedAt?: number | undefined;
+  events?: StepEvent[] | undefined;
 }
 
 interface PendingRemote {
@@ -154,43 +174,43 @@ interface PendingRemote {
 export interface WorkflowEngineDeps {
   store: StateStore;
   /** A single task transport. Shorthand for a one-entry `transports` pool (id `default`). */
-  transport?: Transport;
+  transport?: Transport | undefined;
   /**
    * An ordered pool of named transports. The engine dispatches on the first and fails over to the
    * next on a dispatch error; a step pins one via `ctx.call(step, input, { transport: id })`. Use
    * this instead of `transport` for failover / multi-broker setups.
    */
-  transports?: NamedTransport[];
+  transports?: NamedTransport[] | undefined;
   /**
    * Cross-instance broadcast pub/sub for lifecycle events + cancellation (see {@link ControlPlane}).
    * Separate from the task `transport`; omit for a single-instance / local-only setup. A transport
    * that can also broadcast may be passed here as well.
    */
-  controlPlane?: ControlPlane;
+  controlPlane?: ControlPlane | undefined;
   /** Epoch-ms clock; injectable for tests. Defaults to `Date.now`. */
-  clock?: () => number;
+  clock?: (() => number) | undefined;
   /** Unique id for this engine instance, used for recovery leases. Defaults to a random id. */
-  instanceId?: string;
+  instanceId?: string | undefined;
   /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */
-  leaseMs?: number;
+  leaseMs?: number | undefined;
   /**
    * Cap how many times crash-recovery may pick up the same still-`running` run before giving up and
    * moving it to the `dead` dead-letter state (a poison pill that crashes the process every boot).
    * Omit for unlimited (the default — recovery always retries).
    */
-  maxRecoveryAttempts?: number;
+  maxRecoveryAttempts?: number | undefined;
   /**
    * Build the public callback URL for a `ctx.webhook()` token (e.g.
    * ``(t) => `https://api.example.com/durable/webhooks/${t}` ``). Populates
    * {@link DurableWebhook.url}. Omit if you build URLs yourself from the token.
    */
-  webhookUrl?: (token: string) => string;
+  webhookUrl?: ((token: string) => string) | undefined;
   /**
    * Provide the current W3C `traceparent` to stamp on each dispatched {@link RemoteTask}, so a
    * worker (including the Python SDK) continues the distributed trace. Keep core OTel-free: supply
    * `otelTraceparent` from `@dudousxd/nestjs-durable-otel`, or your own context reader. Omit to send none.
    */
-  traceparent?: () => string | undefined;
+  traceparent?: (() => string | undefined) | undefined;
   /**
    * Provide an opaque context carrier (tenant / user / correlation ids) to attach to each dispatched
    * {@link RemoteTask} as its `context`, so a worker (including the Python SDK) re-exposes it to the
@@ -203,7 +223,7 @@ export interface WorkflowEngineDeps {
    * may return empty or stale values (the request-scoped tenant/user is gone). Treat the carrier as
    * best-effort correlation/propagation metadata only — do NOT treat it as an authorization boundary.
    */
-  context?: () => Record<string, unknown> | undefined;
+  context?: (() => Record<string, unknown> | undefined) | undefined;
   /**
    * Re-hydrate the originating context around a LOCAL step body, so a `@DurableStep` reader sees the
    * tenant / user / correlation ids that were live when the run was started — even on a path the
@@ -214,12 +234,12 @@ export interface WorkflowEngineDeps {
    * nestjs-context) or your own ALS bridge. The handler signature is unchanged — re-hydration is
    * ambient. Default: passthrough (`(_, fn) => fn()`), so behavior is byte-identical when unset.
    */
-  rehydrate?: <T>(carrier: Record<string, unknown> | undefined, fn: () => T) => T;
+  rehydrate?: (<T>(carrier: Record<string, unknown> | undefined, fn: () => T) => T) | undefined;
   /**
    * Attempts for each saga compensation when the run fails (a transient undo — e.g. a refund API
    * hiccup — gets another try). Default 1 (no retry). Compensations must be idempotent.
    */
-  compensationRetries?: number;
+  compensationRetries?: number | undefined;
   /**
    * Persist a `running` checkpoint when a local step's body begins, so an in-flight step shows up
    * in the dashboard (and a fresh page load / REST query) the moment it starts — not only once it
@@ -228,14 +248,14 @@ export interface WorkflowEngineDeps {
    * `false` on hot paths with many short local steps to halve their checkpoint writes — you keep
    * the live event but lose reload-survivable in-flight visibility.
    */
-  trackStepStart?: boolean;
+  trackStepStart?: boolean | undefined;
   /**
    * Where a freshly-`start`ed run executes (see {@link RunDispatcher}). Defaults to in-process: the
    * run executes on this instance asynchronously (a microtask), so `start` returns without blocking.
    * Pass a no-op dispatcher on a caller that must NOT run workflows (e.g. an API/dashboard pod), and
    * run `runPending` on a worker pod to pick those up; or a broker-backed one for a worker pool.
    */
-  runDispatcher?: RunDispatcher;
+  runDispatcher?: RunDispatcher | undefined;
 }
 
 /**
@@ -248,14 +268,14 @@ export class WorkflowEngine {
   private readonly store: StateStore;
   /** Ordered transport pool (dispatch + failover). Empty = no remote steps. */
   private readonly pool: TransportPool;
-  private readonly controlPlane?: ControlPlane;
+  private readonly controlPlane?: ControlPlane | undefined;
   private readonly clock: () => number;
   private readonly instanceId: string;
   private readonly leaseMs: number;
-  private readonly maxRecoveryAttempts?: number;
-  private readonly webhookUrl?: (token: string) => string;
-  private readonly traceparent?: () => string | undefined;
-  private readonly context?: () => Record<string, unknown> | undefined;
+  private readonly maxRecoveryAttempts?: number | undefined;
+  private readonly webhookUrl?: ((token: string) => string) | undefined;
+  private readonly traceparent?: (() => string | undefined) | undefined;
+  private readonly context?: (() => Record<string, unknown> | undefined) | undefined;
   /** Establish the originating context ambiently around a local step body (see {@link WorkflowEngineDeps.rehydrate}). Default passthrough. */
   private readonly rehydrate: <T>(carrier: Record<string, unknown> | undefined, fn: () => T) => T;
   private readonly compensationRetries: number;
@@ -428,12 +448,12 @@ export class WorkflowEngine {
     version: string,
     fn: WorkflowFn,
     opts?: {
-      tags?: string[];
-      singleton?: SingletonConfig;
-      executionTimeout?: string | number;
-      validateInput?: (input: unknown) => void | Promise<void>;
-      onEvent?: string[];
-      eventBatch?: EventBatchConfig;
+      tags?: string[] | undefined;
+      singleton?: SingletonConfig | undefined;
+      executionTimeout?: string | number | undefined;
+      validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+      onEvent?: string[] | undefined;
+      eventBatch?: EventBatchConfig | undefined;
     },
   ): void {
     const registered: RegisteredWorkflow = {
@@ -640,6 +660,23 @@ export class WorkflowEngine {
         ? [...(opts?.tags ?? []), singletonTag(registered.singleton, input)]
         : opts?.tags,
     );
+    // Singleton back-pressure: if a max queue depth is configured, refuse to admit a run that would
+    // grow the same-key backlog past `limit + maxQueueDepth`. Count in-flight + gated runs sharing
+    // the key (pending/running/suspended) in one scan, then reject before creating the run.
+    const maxQueueDepth = registered.singleton?.maxQueueDepth;
+    if (registered.singleton && maxQueueDepth != null) {
+      const cfg = registered.singleton;
+      const key = cfg.key(input);
+      const cap = (cfg.limit ?? 1) + maxQueueDepth;
+      const queued = await this.store.listRuns({
+        tag: singletonTag(cfg, input),
+        workflow: name,
+        statuses: ['pending', 'running', 'suspended'],
+      });
+      if (queued.length >= cap) {
+        throw new SingletonQueueFullError(name, key, maxQueueDepth);
+      }
+    }
     const run: WorkflowRun = {
       id: runId,
       workflow: name,
@@ -1099,7 +1136,31 @@ export class WorkflowEngine {
         .publishControl({ kind: 'cancel', runId, from: this.instanceId })
         .catch(() => undefined);
     }
+    // A cancelled singleton run frees its slot — wake the next gated waiter now (notify-on-release).
+    void this.wakeNextSingletons(run).catch(() => undefined);
     return { runId, status: 'cancelled', error };
+  }
+
+  /**
+   * Bulk-cancel every run matching a filter — e.g. cancel all `order` runs tagged `vip`, or every run
+   * whose `tier` search attribute is `free`. The filter is a {@link RunQuery} (workflow / status / tag
+   * / search-attribute predicates), so it reuses the same matching the dashboard list uses. Each match
+   * is run through {@link cancel}, so the same plumbing applies per run: child cascade, the optional
+   * saga `compensate`, local cancel listeners, and the control-plane broadcast that tells the owning
+   * worker to abort. Returns one {@link RunResult} per matched run (already-finished matches report
+   * their terminal status — `cancel` is a no-op on them, never clobbering a completed/dead run).
+   */
+  async cancelWhere(
+    filter: Omit<RunQuery, 'limit' | 'offset'>,
+    opts?: { compensate?: boolean },
+  ): Promise<RunResult[]> {
+    const runs = await this.store.listRuns(filter);
+    const results: RunResult[] = [];
+    for (const run of runs) {
+      const r = await this.cancel(run.id, opts);
+      if (r) results.push(r);
+    }
+    return results;
   }
 
   /**
@@ -1331,12 +1392,53 @@ export class WorkflowEngine {
    */
   private async admitSingleton(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
     const tag = singletonTag(cfg, run.input);
-    const inflight = [
-      ...(await this.store.listRuns({ tag, workflow: run.workflow, status: 'running' })),
-      ...(await this.store.listRuns({ tag, workflow: run.workflow, status: 'suspended' })),
-    ].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+    // ONE store scan for both in-flight statuses (`status IN ('running','suspended')`) instead of two
+    // — the row set is identical to the old running-list + suspended-list concatenation, and the total
+    // `(createdAt, id)` sort below makes admission order independent of the store's row order, so the
+    // FIFO + race-free-across-instances contract (the SingletonConfig doc above) is preserved exactly.
+    const inflight = (
+      await this.store.listRuns({
+        tag,
+        workflow: run.workflow,
+        statuses: ['running', 'suspended'],
+      })
+    ).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
     const idx = inflight.findIndex((r) => r.id === run.id);
     return idx >= 0 && idx < (cfg.limit ?? 1);
+  }
+
+  /**
+   * Notify-on-release: a singleton run just settled (freeing a slot), so wake the gated waiters that
+   * can now be admitted — immediately, instead of letting them sleep until their ~1s retry timer.
+   * Dispatches up to `limit` of the oldest gated (`suspended` + same singleton tag) waiters by
+   * `(createdAt, id)`; each re-checks admission in `runExecution` and runs only if it actually wins a
+   * slot, so this never breaks the FIFO + race-free guarantees (the durable timer remains the
+   * cross-instance / crash fallback — this just removes the poll latency on the happy path).
+   */
+  private async wakeNextSingletons(settled: WorkflowRun): Promise<void> {
+    const registered =
+      this.workflows.get(versionKey(settled.workflow, settled.workflowVersion)) ??
+      this.latest.get(settled.workflow);
+    const cfg = registered?.singleton;
+    if (!cfg) return;
+    const tag = settled.tags?.find((t) => t.startsWith('singleton:'));
+    if (!tag) return;
+    const gated = (
+      await this.store.listRuns({ tag, workflow: settled.workflow, statuses: ['suspended'] })
+    ).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+    // Wake the oldest `limit` candidates — the freed slot(s) go to the front of the FIFO queue.
+    for (const next of gated.slice(0, cfg.limit ?? 1)) {
+      // Clear the durable retry timer as we hand the run to the dispatcher: the run is now being
+      // actively woken, so the timer poller (resumeDueTimers) must NOT also pick it up — that would
+      // double-dispatch the same run. (Leasing still guards the rare cross-instance overlap.) Only
+      // clear it for runs that actually carry a retry wakeAt, and dispatch after the clear commits.
+      if (next.wakeAt != null) {
+        await this.store
+          .updateRun(next.id, { wakeAt: undefined, updatedAt: new Date() })
+          .catch(() => undefined);
+      }
+      this.runDispatcher.dispatch(next.id);
+    }
   }
 
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
@@ -1367,8 +1469,22 @@ export class WorkflowEngine {
       // A remote (e.g. Python) workflow is advanced by dispatching workflow tasks, not by running an
       // in-process body — but everything around it (lease, recovery, timers, the resume that lands us
       // here on a step result) is identical, so it branches here under the same lease.
-      if (registered?.remote) return await this.runRemoteExecution(run, registered);
-      return await this.runExecution(run, fn, registered);
+      const result = registered?.remote
+        ? await this.runRemoteExecution(run, registered)
+        : await this.runExecution(run, fn, registered);
+      // Notify-on-release: a singleton run that just reached a terminal state freed a slot — wake the
+      // next gated waiter(s) now instead of waiting for the ~1s retry timer. Fire-and-forget so it
+      // never blocks the settling run; the durable timer is still the cross-instance/crash fallback.
+      if (
+        registered?.singleton &&
+        (result.status === 'completed' ||
+          result.status === 'failed' ||
+          result.status === 'cancelled' ||
+          result.status === 'dead')
+      ) {
+        void this.wakeNextSingletons(run).catch(() => undefined);
+      }
+      return result;
     } finally {
       clearInterval(renew);
     }
@@ -1391,7 +1507,7 @@ export class WorkflowEngine {
       this.emit({ type: 'run.started', runId: run.id, workflow: run.workflow });
     }
     if (registered.singleton && !(await this.admitSingleton(run, registered.singleton))) {
-      const wakeAt = this.clock() + SINGLETON_RETRY_MS;
+      const wakeAt = singletonRetryWakeAt(this.clock());
       await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
       this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
       await this.store.releaseRunLock(run.id);
@@ -1653,7 +1769,7 @@ export class WorkflowEngine {
     // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
     if (registered?.singleton && !(await this.admitSingleton(run, registered.singleton))) {
-      const wakeAt = this.clock() + SINGLETON_RETRY_MS;
+      const wakeAt = singletonRetryWakeAt(this.clock());
       await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
       this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
       await this.store.releaseRunLock(run.id);
@@ -1797,8 +1913,8 @@ export class WorkflowEngine {
       startStep: (s) => this.startStep(s),
       completeStep: (s) => this.completeStep(s),
       failStep: (s) => this.failStep(s),
-      callRemote: (runId, seq, step, input, queue, transport) =>
-        this.callRemote(runId, seq, step, input, queue, transport, replay),
+      callRemote: (runId, seq, step, input, queue, transport, admission) =>
+        this.callRemote(runId, seq, step, input, queue, transport, replay, admission),
       // Defer so a fast child can't reentrantly resume a still-running parent.
       startChild: (workflow, input, id) => {
         queueMicrotask(() => void this.start(workflow, input, id).catch(() => undefined));
@@ -1881,6 +1997,7 @@ export class WorkflowEngine {
     queue?: string,
     transport?: string,
     replay?: Map<number, StepCheckpoint>,
+    admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
   ): Promise<TOutput> {
     // Read the prefix from the per-execution snapshot (avoids the O(N²) replay SELECTs); a seq absent
     // from the snapshot — not yet dispatched, or written after the snapshot — falls back to the store.
@@ -1921,8 +2038,16 @@ export class WorkflowEngine {
     // the limit is durable. The admitted slot is released when the result lands (completeRemoteResult).
     const controller = queue ? this.queues.get(queue) : undefined;
     if (controller) {
-      const admission = controller.tryAdmit();
-      if (!admission.ok) throw new WorkflowSuspended(admission.retryAt);
+      // Admission carries the per-call priority + fairness key (default the runId so each run is its
+      // own fairness bucket), and the stepId as a STABLE waiter id so the controller tracks one
+      // waiter across this call's durable retries. Ordering lives entirely in the controller — this
+      // is the dispatch/admission layer, not the positional replay path.
+      const decision = controller.tryAdmit({
+        priority: admission?.priority,
+        key: admission?.fairnessKey ?? runId,
+        waiterId: id,
+      });
+      if (!decision.ok) throw new WorkflowSuspended(decision.retryAt);
       this.stepQueue.set(id, queue as string);
     }
 
@@ -2122,7 +2247,7 @@ export class WorkflowEngine {
 
 /** Raised inside the workflow when a remote worker reports a step failure. */
 export class RemoteStepError extends Error {
-  readonly stepError?: StepError;
+  readonly stepError?: StepError | undefined;
   constructor(stepError?: StepError) {
     super(stepError?.message ?? 'remote step failed');
     this.name = 'RemoteStepError';
