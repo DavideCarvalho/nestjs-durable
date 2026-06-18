@@ -95,7 +95,9 @@ describe('multiple transports — failover + per-step selection', () => {
     });
 
     await startRun(engine, 'wf', {}, 'r1');
-    await b.complete(b.dispatched[0]!);
+    const [task] = b.dispatched;
+    if (!task) throw new Error('expected a task dispatched on transport b');
+    await b.complete(task);
     await new Promise((r) => setImmediate(r));
 
     const run = await store.getRun('r1');

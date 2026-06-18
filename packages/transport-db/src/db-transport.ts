@@ -166,7 +166,17 @@ export class DbTransport implements Transport {
     const ignore = this.isPg
       ? `INSERT INTO ${t} (...) ON CONFLICT (${this.q('step_id')}) DO NOTHING`
       : `INSERT IGNORE INTO ${t} (...)`;
-    const cols = ['step_id', 'run_id', 'seq', 'name', 'grp', 'input', 'attempt', 'status', 'created_at'];
+    const cols = [
+      'step_id',
+      'run_id',
+      'seq',
+      'name',
+      'grp',
+      'input',
+      'attempt',
+      'status',
+      'created_at',
+    ];
     const sql = ignore.replace(
       '(...)',
       `(${cols.map((c) => this.q(c)).join(', ')}) VALUES (${cols.map((_, i) => this.ph(i + 1)).join(', ')})`,
@@ -216,11 +226,9 @@ export class DbTransport implements Transport {
 
   /** Claim a batch of tasks (FOR UPDATE SKIP LOCKED), then run each outside the lock. */
   private async drainTasks(group: string): Promise<number> {
-    const claimed = await this.claim<TaskRow>(
-      this.tasksTable,
-      `${this.q('grp')} = ${this.ph(1)}`,
-      [group],
-    );
+    const claimed = await this.claim<TaskRow>(this.tasksTable, `${this.q('grp')} = ${this.ph(1)}`, [
+      group,
+    ]);
     for (const row of claimed) {
       const task: RemoteTask = {
         runId: row.run_id,
@@ -297,7 +305,16 @@ export class DbTransport implements Transport {
 
   private async insertResult(result: StepResult): Promise<void> {
     const t = this.q(this.resultsTable);
-    const cols = ['step_id', 'run_id', 'seq', 'status', 'output', 'error', 'started_at', 'created_at'];
+    const cols = [
+      'step_id',
+      'run_id',
+      'seq',
+      'status',
+      'output',
+      'error',
+      'started_at',
+      'created_at',
+    ];
     const head = this.isPg
       ? `INSERT INTO ${t} (...) ON CONFLICT (${this.q('step_id')}) DO NOTHING`
       : `INSERT IGNORE INTO ${t} (...)`;

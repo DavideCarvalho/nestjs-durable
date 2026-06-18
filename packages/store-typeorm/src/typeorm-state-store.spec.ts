@@ -307,7 +307,8 @@ describe('TypeOrmStateStore', () => {
   it('transaction commits the checkpoint atomically and returns the work result', async () => {
     const { store, dataSource } = await makeStore();
     await store.createRun(run());
-    const result = await store.transaction!(async (tx) => {
+    if (!store.transaction) throw new Error('store does not support transactions');
+    const result = await store.transaction(async (tx) => {
       await tx.saveCheckpoint(checkpoint({ seq: 7, name: 'tx-step', output: { paid: true } }));
       return 'ok';
     });

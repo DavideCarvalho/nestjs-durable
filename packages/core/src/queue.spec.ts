@@ -175,7 +175,9 @@ describe('flow control — durable queues', () => {
     expect((await store.getRun('b'))?.status).toBe('suspended');
 
     // Complete a → frees the slot.
-    await transport.complete(transport.dispatched[0]!);
+    const [firstTask] = transport.dispatched;
+    if (!firstTask) throw new Error('expected a dispatched task');
+    await transport.complete(firstTask);
     await new Promise((r) => setImmediate(r));
     expect((await store.getRun('a'))?.status).toBe('completed');
 
@@ -183,7 +185,9 @@ describe('flow control — durable queues', () => {
     nowMs += 1000;
     await engine.resumeDueTimers(nowMs);
     expect(transport.dispatched).toHaveLength(2);
-    await transport.complete(transport.dispatched[1]!);
+    const secondTask = transport.dispatched[1];
+    if (!secondTask) throw new Error('expected a second dispatched task');
+    await transport.complete(secondTask);
     await new Promise((r) => setImmediate(r));
     expect((await store.getRun('b'))?.status).toBe('completed');
   });

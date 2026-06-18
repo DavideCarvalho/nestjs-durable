@@ -41,7 +41,9 @@ describe('runSchedules', () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     let runs = 0;
-    engine.register('beat', '1', async () => void (runs += 1));
+    engine.register('beat', '1', async () => {
+      runs += 1;
+    });
     await fireAndSettle(
       engine,
       [{ key: 'b', workflow: 'beat', everyMs: 1000, paused: true }],
@@ -55,7 +57,9 @@ describe('runSchedules', () => {
     const engine = new WorkflowEngine({ store });
     let started = 0;
     engine.register('slow', '1', async (ctx) => {
-      await ctx.step('enter', async () => void (started += 1)); // once-only (checkpointed)
+      await ctx.step('enter', async () => {
+        started += 1; // once-only (checkpointed)
+      });
       await ctx.waitForSignal('go'); // stays in-flight (suspended)
     });
     const sched = [{ key: 's', workflow: 'slow', everyMs: 1000, overlap: 'skip' as const }];

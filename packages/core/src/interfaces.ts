@@ -517,7 +517,6 @@ export interface NamedTransport {
  * `pending` in the store for a worker's `runPending` poll to pick up (DB-only, caller-doesn't-execute).
  */
 export interface RunDispatcher {
-  // biome-ignore lint/suspicious/noConfusingVoidType: dispatch may be fire-and-forget (void) or async.
   dispatch(runId: string): void | Promise<void>;
 }
 
@@ -865,9 +864,11 @@ export interface RunResult {
  * non-empty string) to reject — the run is left untouched. Return nothing/void to accept. May be
  * async (e.g. a business-rule check against a DB).
  */
-// biome-ignore lint/suspicious/noConfusingVoidType: a validator may return nothing (accept), or a
-// reason string (reject) — `void` in the union is the intended "returned nothing" case.
-export type UpdateValidator<TArg = unknown> = (arg: TArg) => void | string | Promise<void | string>;
+// A validator may return nothing (accept) or a reason string (reject); `void` is the intended
+// "returned nothing" case, sync or async.
+export type UpdateValidator<TArg = unknown> =
+  // biome-ignore lint/suspicious/noConfusingVoidType: `void` here means "returned nothing" (accept).
+  (arg: TArg) => void | string | Promise<void | string>;
 
 /** Outcome of `engine.update`: rejected by the validator, or accepted and delivered. */
 export type UpdateResult =

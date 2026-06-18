@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import type { RunStatus } from '@dudousxd/nestjs-durable-core';
-import { cancelRun, type InspectOptions, inspect } from './inspect';
+import { type InspectOptions, cancelRun, inspect } from './inspect';
 import { loadStore } from './load-config';
 
 const USAGE = `durable — inspect and control nestjs-durable workflow runs

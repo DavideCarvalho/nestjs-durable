@@ -84,12 +84,14 @@ describe('WorkflowEngine — remote steps', () => {
     expect(observedQueueMs).toBeGreaterThanOrEqual(0);
 
     const [cp] = await store.listCheckpoints('run1');
+    expect(cp).toBeDefined();
+    if (!cp) throw new Error('no checkpoint was recorded');
     // The three moments are ordered: dispatched ≤ worker pickup ≤ done.
-    expect(cp?.enqueuedAt.getTime()).toBeLessThanOrEqual(cp!.startedAt.getTime());
-    expect(cp?.startedAt.getTime()).toBeLessThanOrEqual(cp!.finishedAt.getTime());
+    expect(cp.enqueuedAt.getTime()).toBeLessThanOrEqual(cp.startedAt.getTime());
+    expect(cp.startedAt.getTime()).toBeLessThanOrEqual(cp.finishedAt.getTime());
     // The checkpoint records what the step was called with, alongside what it returned.
-    expect(cp?.input).toEqual({ amount: 42 });
-    expect(cp?.output).toEqual({ chargeId: 'ch_42' });
+    expect(cp.input).toEqual({ amount: 42 });
+    expect(cp.output).toEqual({ chargeId: 'ch_42' });
   });
 
   it('replays a completed remote step from its checkpoint instead of re-dispatching', async () => {

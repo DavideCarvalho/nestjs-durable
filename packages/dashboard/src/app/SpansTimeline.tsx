@@ -2,8 +2,8 @@ import { useQueries, useQuery } from '@tanstack/react-query';
 import { useMemo, useState } from 'react';
 import type { RunDetail, StepCheckpoint, WorkflowRun } from '../client/durable-client';
 import { durableClient } from '../client/durable-client';
-import { childRunIdOf } from './child-link';
 import { groupSubProcesses } from '../client/group-subprocesses';
+import { childRunIdOf } from './child-link';
 import { ChildIcon, iconFor } from './icons';
 
 /** Fetch the RunDetail of each child-ref step in a timeline, so a row can read the child's real

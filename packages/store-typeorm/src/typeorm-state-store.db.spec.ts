@@ -4,10 +4,7 @@ import {
   runStateStoreContract,
 } from '@dudousxd/nestjs-durable-testing';
 import { MySqlContainer, type StartedMySqlContainer } from '@testcontainers/mysql';
-import {
-  PostgreSqlContainer,
-  type StartedPostgreSqlContainer,
-} from '@testcontainers/postgresql';
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import type { DataSourceOptions } from 'typeorm';
 import { afterAll, beforeAll, describe } from 'vitest';
 import { makeTypeOrmStoreFactory } from './conformance';

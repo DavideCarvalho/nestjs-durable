@@ -1,6 +1,6 @@
 import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { InMemoryStateStore } from '@dudousxd/nestjs-durable-core';
-import { assertReplayable, type RunHistory } from './replay';
+import { type RunHistory, assertReplayable } from './replay';
 
 // Capture a real run's history the way a CI fixture would.
 async function recordHistory(register: (e: WorkflowEngine) => void): Promise<RunHistory> {

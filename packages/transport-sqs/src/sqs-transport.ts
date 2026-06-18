@@ -4,9 +4,9 @@ import {
   DeleteMessageCommand,
   GetQueueUrlCommand,
   ReceiveMessageCommand,
-  SendMessageCommand,
   SQSClient,
   type SQSClientConfig,
+  SendMessageCommand,
 } from '@aws-sdk/client-sqs';
 import {
   type Heartbeat,

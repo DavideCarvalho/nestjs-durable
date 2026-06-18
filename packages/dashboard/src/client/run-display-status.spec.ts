@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  type StepCheckpoint,
-  type WorkflowRun,
-  runDisplayStatus,
-} from './durable-client';
+import { type StepCheckpoint, type WorkflowRun, runDisplayStatus } from './durable-client';
 
 function run(over: Partial<WorkflowRun> = {}): WorkflowRun {
   return {
@@ -52,9 +48,7 @@ describe('runDisplayStatus', () => {
   });
 
   it('an in-flight step wins over a timer (more active state)', () => {
-    expect(runDisplayStatus(run({ wakeAt: 9_999 }), [step({ status: 'pending' })])).toBe(
-      'running',
-    );
+    expect(runDisplayStatus(run({ wakeAt: 9_999 }), [step({ status: 'pending' })])).toBe('running');
   });
 
   it('without a timeline (list view), a non-timer suspend reads as running, a timer as sleeping', () => {
