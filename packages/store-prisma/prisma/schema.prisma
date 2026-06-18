@@ -1,4 +1,4 @@
-// Add these three models to your own schema.prisma, then `prisma generate` and pass your
+// Add these models to your own schema.prisma, then `prisma generate` and pass your
 // PrismaClient to `new PrismaStateStore(prisma)`. The adapter only ever touches these tables.
 
 model DurableWorkflowRun {
@@ -18,9 +18,29 @@ model DurableWorkflowRun {
   createdAt       DateTime
   updatedAt       DateTime
 
+  attributes      DurableRunAttribute[]
+
   @@index([status, wakeAt])
   @@index([workflow, status])
   @@map("durable_workflow_runs")
+}
+
+// Normalized search-attribute side-table: one row per (run, key), so range/equality predicates push
+// DOWN into SQL via a relation (`some`) filter — EXISTS on this table — instead of a coarse scan +
+// in-process filter. Maintained on every createRun/updateRun. Numbers land in `numValue`, strings/
+// booleans in `strValue` (booleans as "true"/"false"); see core normalizeAttributeRows.
+model DurableRunAttribute {
+  runId    String
+  key      String
+  strValue String?
+  numValue Float?
+
+  run      DurableWorkflowRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@id([runId, key])
+  @@index([key, numValue])
+  @@index([key, strValue])
+  @@map("durable_run_attributes")
 }
 
 model DurableStepCheckpoint {

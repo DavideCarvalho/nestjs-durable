@@ -4,11 +4,32 @@
  * business errors that retrying cannot fix (e.g. a declined card, invalid input).
  */
 export class FatalError extends Error {
-  readonly code?: string;
+  readonly code?: string | undefined;
   constructor(message: string, code?: string) {
     super(message);
     this.name = 'FatalError';
     this.code = code;
+  }
+}
+
+/**
+ * Thrown by `start` when a singleton workflow's wait queue is full: the count of in-flight + gated
+ * runs sharing the key already equals `limit + maxQueueDepth`, so admitting another would let the
+ * same-key backlog grow unbounded. Back-pressure — the caller should retry later or shed load. Only
+ * raised when {@link SingletonConfig.maxQueueDepth} is set (omit it for the old unbounded behavior).
+ */
+export class SingletonQueueFullError extends Error {
+  readonly workflow: string;
+  readonly key: string;
+  readonly maxQueueDepth: number;
+  constructor(workflow: string, key: string, maxQueueDepth: number) {
+    super(
+      `singleton queue for ${workflow} key "${key}" is full (maxQueueDepth=${maxQueueDepth}); retry later`,
+    );
+    this.name = 'SingletonQueueFullError';
+    this.workflow = workflow;
+    this.key = key;
+    this.maxQueueDepth = maxQueueDepth;
   }
 }
 
@@ -67,7 +88,7 @@ export class NonDeterminismError extends Error {
 
 export class WorkflowSuspended extends Error {
   /** Epoch ms to auto-resume (durable sleep), or undefined when waiting on an external signal. */
-  readonly wakeAt?: number;
+  readonly wakeAt?: number | undefined;
   constructor(wakeAt?: number) {
     super('workflow suspended');
     this.name = 'WorkflowSuspended';

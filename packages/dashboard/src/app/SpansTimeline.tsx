@@ -85,7 +85,7 @@ export function RunSpans({
   run: WorkflowRun;
   timeline: StepCheckpoint[];
   depth: number;
-  selectedKey?: string;
+  selectedKey?: string | undefined;
   onSelect: (step: StepCheckpoint, run: WorkflowRun) => void;
   onOpenRun: (id: string) => void;
   expanded: Set<string>;
@@ -321,7 +321,7 @@ function ChildSpans({
 }: {
   id: string;
   depth: number;
-  selectedKey?: string;
+  selectedKey?: string | undefined;
   onSelect: (step: StepCheckpoint, run: WorkflowRun) => void;
   onOpenRun: (id: string) => void;
   expanded: Set<string>;
@@ -378,15 +378,15 @@ export function SpansTimeline({
   run: WorkflowRun;
   timeline: StepCheckpoint[];
   /** `${runId}#${seq}` of the selected step. */
-  selectedKey?: string;
+  selectedKey?: string | undefined;
   /** Open a step's detail — the step + the run it belongs to. */
   onSelect: (step: StepCheckpoint, run: WorkflowRun) => void;
   /** Navigate to another run — used when a child-workflow row's ↗ is clicked. */
   onOpenRun: (id: string) => void;
   /** Set of child run ids currently expanded inline. */
-  expanded?: Set<string>;
+  expanded?: Set<string> | undefined;
   /** Toggle inline expansion of a child run. */
-  onToggleChild?: (id: string) => void;
+  onToggleChild?: ((id: string) => void) | undefined;
 }) {
   // Compute span total for the top-level run header.
   const span = useMemo(() => {

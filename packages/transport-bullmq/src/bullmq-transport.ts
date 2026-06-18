@@ -46,7 +46,7 @@ export interface BullMQTransportOptions {
  */
 export class BullMQTransport implements Transport, ControlPlane {
   private readonly connection: ConnectionOptions;
-  private readonly group?: string;
+  private readonly group?: string | undefined;
   private readonly prefix: string;
   private readonly handlers = new Map<string, StepHandler>();
   private readonly queues = new Map<string, Queue>();

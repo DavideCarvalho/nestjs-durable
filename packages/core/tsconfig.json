@@ -1,8 +1,13 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "module": "CommonJS",
-    "moduleResolution": "Node",
+    // tsup (esbuild) performs the actual dual ESM+CJS emit; tsc here is type-checking only
+    // (`--noEmit`). `Bundler` resolution lets the source keep extensionless relative imports
+    // (e.g. `./engine`) while still type-checking under the strict base config — the bundler
+    // resolves them at build time. `import.meta.url` (scheduler's cron-parser require shim) needs
+    // an ESM module target.
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "outDir": "dist",
     "rootDir": "src"
   },

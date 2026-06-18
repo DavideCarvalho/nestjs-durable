@@ -52,7 +52,13 @@ describe('singleton (serialize runs by key)', () => {
     await engine.signal('go:A', undefined); // A completes → frees the slot
     expect((await store.getRun('a'))?.status).toBe('completed');
 
-    now += 60_000; // B's gate retries on its timer → the slot is now free → admits + runs
+    // Notify-on-release: completing A wakes the next gated waiter (B) IMMEDIATELY — no timer tick
+    // needed. Poll until B's `enter` runs (the wake is dispatched asynchronously).
+    for (let i = 0; i < 100 && !ran.includes('B'); i++) await new Promise((r) => setTimeout(r, 2));
+    expect(ran).toEqual(['A', 'C', 'B']);
+
+    // And the durable retry timer is a harmless no-op now (B already woken; its wakeAt was cleared).
+    now += 60_000;
     await engine.resumeDueTimers(now);
     expect(ran).toEqual(['A', 'C', 'B']);
   });

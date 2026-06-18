@@ -3,9 +3,18 @@ import {
   WorkflowEngine,
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
+import { runStateStoreContract } from '@dudousxd/nestjs-durable-testing';
 import { MikroORM } from '@mikro-orm/better-sqlite';
+import { makeMikroOrmStoreFactory } from './conformance';
 import { ENTITIES } from './entities';
 import { MikroOrmStateStore } from './mikro-orm-state-store';
+
+// The SHARED cross-store behavioral contract, run here against SQLite (default `pnpm test`). The same
+// contract runs against real Postgres/MySQL in `mikro-orm-state-store.db.spec.ts` under `pnpm test:db`.
+runStateStoreContract(
+  'MikroORM (better-sqlite)',
+  makeMikroOrmStoreFactory((options) => MikroORM.init(options), { dbName: ':memory:' }),
+);
 
 async function makeStore() {
   const orm = await MikroORM.init({
@@ -112,6 +121,87 @@ describe('MikroOrmStateStore', () => {
     await store.putSignalWaiter({ token: 'approve-1', runId: 'r1', seq: 3 });
     expect((await store.takeSignalWaiter('approve-1'))?.seq).toBe(3);
     expect(await store.takeSignalWaiter('approve-1')).toBeNull();
+    await orm.close(true);
+  });
+
+  it('round-trips searchAttributes and answers equality + range queries (pushdown)', async () => {
+    const { store, orm } = await makeStore();
+    await store.createRun(run({ id: 'a', searchAttributes: { amount: 30, tier: 'free' } }));
+    await store.createRun(run({ id: 'b', searchAttributes: { amount: 200, tier: 'pro' } }));
+    await store.createRun(run({ id: 'c', searchAttributes: { amount: 500, tier: 'pro' } }));
+
+    expect((await store.getRun('b'))?.searchAttributes).toEqual({ amount: 200, tier: 'pro' });
+    const big = await store.listRuns({ attributes: [{ key: 'amount', op: 'gte', value: 200 }] });
+    expect(big.map((r) => r.id).sort()).toEqual(['b', 'c']);
+    const proSmall = await store.listRuns({
+      attributes: [
+        { key: 'tier', op: 'eq', value: 'pro' },
+        { key: 'amount', op: 'lt', value: 300 },
+      ],
+    });
+    expect(proSmall.map((r) => r.id)).toEqual(['b']);
+    // `ne` excludes the matching value AND absent keys (missing-key-never-matches contract).
+    const notFree = await store.listRuns({
+      attributes: [{ key: 'tier', op: 'ne', value: 'free' }],
+    });
+    expect(notFree.map((r) => r.id).sort()).toEqual(['b', 'c']);
+    await orm.close(true);
+  });
+
+  it('pushes attribute predicates DOWN into SQL via EXISTS on the side-table', async () => {
+    const sqls: string[] = [];
+    const orm = await MikroORM.init({
+      dbName: ':memory:',
+      entities: [...ENTITIES],
+      allowGlobalContext: true,
+      debug: true,
+      logger: (msg: string) => sqls.push(msg),
+    });
+    await orm.schema.createSchema();
+    const store = new MikroOrmStateStore(orm);
+    await store.createRun(run({ id: 'a', searchAttributes: { amount: 30 } }));
+    await store.createRun(run({ id: 'b', searchAttributes: { amount: 200 } }));
+
+    sqls.length = 0;
+    const res = await store.listRuns({
+      attributes: [{ key: 'amount', op: 'gte', value: 100 }],
+      limit: 10,
+    });
+    expect(res.map((r) => r.id)).toEqual(['b']);
+    const select = sqls.find((s) => /select/i.test(s) && /durable_workflow_runs/i.test(s));
+    expect(select).toBeDefined();
+    expect(select).toMatch(/exists/i); // predicate pushed into SQL, not filtered in-process
+    expect(select).toMatch(/durable_run_attributes/i);
+    expect(select).toMatch(/limit/i); // pagination pushed to the DB
+    await orm.close(true);
+  });
+
+  it('maintains the side-table on create and re-indexes on update', async () => {
+    const { store, orm } = await makeStore();
+    await store.createRun(run({ id: 'a', searchAttributes: { tier: 'free', amount: 10 } }));
+    const created = await orm.em
+      .fork()
+      .getConnection()
+      .execute(
+        `SELECT "key", "str_value" AS "strValue", "num_value" AS "numValue" FROM "durable_run_attributes" WHERE "run_id" = 'a' ORDER BY "key"`,
+      );
+    expect(created).toEqual([
+      { key: 'amount', strValue: null, numValue: 10 },
+      { key: 'tier', strValue: 'free', numValue: null },
+    ]);
+
+    await store.updateRun('a', { searchAttributes: { tier: 'pro' } });
+    expect(
+      (await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'pro' }] })).map(
+        (r) => r.id,
+      ),
+    ).toEqual(['a']);
+    expect(
+      await store.listRuns({ attributes: [{ key: 'amount', op: 'eq', value: 10 }] }),
+    ).toHaveLength(0);
+    expect(
+      await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'free' }] }),
+    ).toHaveLength(0);
     await orm.close(true);
   });
 

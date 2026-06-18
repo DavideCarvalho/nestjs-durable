@@ -9,14 +9,27 @@
     "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/core"
   },
-  "type": "commonjs",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsup",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
@@ -32,6 +45,7 @@
   "devDependencies": {
     "cron-parser": "4.9.0",
     "reflect-metadata": "0.2.2",
+    "tsup": "8.3.5",
     "typescript": "5.9.3",
     "zod": "3.25.76"
   }

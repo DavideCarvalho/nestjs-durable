@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { WorkflowEngine } from './engine';
 import type { RemoteTask, StepResult, Transport } from './interfaces';
+import { QueueController } from './queue';
 import { remoteStep } from './remote-step-factory';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
@@ -45,6 +46,87 @@ class ManualTransport implements Transport {
     });
   }
 }
+
+describe('QueueController — admission gate', () => {
+  it('is plain FIFO when no priority/key is given (backward compatible)', () => {
+    const now = 0;
+    const q = new QueueController({ name: 'q', concurrency: 1 }, () => now);
+    // First admit takes the only slot.
+    expect(q.tryAdmit().ok).toBe(true);
+    // Second is blocked until the retry window.
+    const blocked = q.tryAdmit();
+    expect(blocked.ok).toBe(false);
+    if (!blocked.ok) expect(blocked.retryAt).toBe(now + 1000);
+    // Releasing frees the slot; the next admit succeeds.
+    q.release();
+    expect(q.tryAdmit().ok).toBe(true);
+  });
+
+  it('respects the fixed-window rate limit regardless of priority', () => {
+    let now = 1000;
+    const q = new QueueController(
+      { name: 'q', rateLimit: { limit: 2, periodMs: 1000 } },
+      () => now,
+    );
+    expect(q.tryAdmit({ priority: 10 }).ok).toBe(true);
+    expect(q.tryAdmit({ priority: 10 }).ok).toBe(true);
+    const blocked = q.tryAdmit({ priority: 99 }); // even max priority can't beat the window
+    expect(blocked.ok).toBe(false);
+    if (!blocked.ok) expect(blocked.retryAt).toBe(2000);
+    now = 2000; // window reset
+    expect(q.tryAdmit({ priority: 1 }).ok).toBe(true);
+  });
+
+  it('admits higher-priority waiters before lower-priority ones when a slot is contended', () => {
+    let now = 0;
+    const q = new QueueController({ name: 'q', concurrency: 1 }, () => now);
+    expect(q.tryAdmit({ key: 'a', priority: 1 }).ok).toBe(true); // takes the slot
+    // Two waiters register while the slot is busy: low then high priority.
+    const low = q.tryAdmit({ key: 'b', priority: 1, waiterId: 'low' });
+    const high = q.tryAdmit({ key: 'c', priority: 5, waiterId: 'high' });
+    expect(low.ok).toBe(false);
+    expect(high.ok).toBe(false);
+    q.release(); // one slot frees
+    now += 1000;
+    // High priority wins the freed slot; low priority still waits.
+    expect(q.tryAdmit({ key: 'c', priority: 5, waiterId: 'high' }).ok).toBe(true);
+    expect(q.tryAdmit({ key: 'b', priority: 1, waiterId: 'low' }).ok).toBe(false);
+  });
+
+  it('round-robins across keys so one key cannot monopolize the budget (fairness)', () => {
+    let now = 0;
+    const q = new QueueController({ name: 'q', concurrency: 1, fairness: 'key' }, () => now);
+    expect(q.tryAdmit({ key: 'noisy', waiterId: 'n1' }).ok).toBe(true); // slot taken by noisy
+    // While busy: noisy enqueues two more, quiet enqueues one. Fairness must not let noisy take
+    // both freed slots before quiet gets one.
+    q.tryAdmit({ key: 'noisy', waiterId: 'n2' });
+    q.tryAdmit({ key: 'noisy', waiterId: 'n3' });
+    q.tryAdmit({ key: 'quiet', waiterId: 'q1' });
+    q.release();
+    now += 1000;
+    // The freed slot goes to the under-served key (quiet), not the next noisy item.
+    expect(q.tryAdmit({ key: 'noisy', waiterId: 'n2' }).ok).toBe(false);
+    expect(q.tryAdmit({ key: 'quiet', waiterId: 'q1' }).ok).toBe(true);
+    // After quiet is served, the next slot goes back to noisy.
+    q.release();
+    now += 1000;
+    expect(q.tryAdmit({ key: 'noisy', waiterId: 'n2' }).ok).toBe(true);
+  });
+
+  it('priority takes precedence over fairness, fairness breaks ties within a priority', () => {
+    let now = 0;
+    const q = new QueueController({ name: 'q', concurrency: 1, fairness: 'key' }, () => now);
+    expect(q.tryAdmit({ key: 'x', waiterId: 'x0' }).ok).toBe(true);
+    // Same priority across two keys, plus one higher-priority item on the noisy key.
+    q.tryAdmit({ key: 'noisy', priority: 1, waiterId: 'n1' });
+    q.tryAdmit({ key: 'quiet', priority: 1, waiterId: 'q1' });
+    q.tryAdmit({ key: 'noisy', priority: 9, waiterId: 'n2' });
+    q.release();
+    now += 1000;
+    // Highest priority wins regardless of key.
+    expect(q.tryAdmit({ key: 'noisy', priority: 9, waiterId: 'n2' }).ok).toBe(true);
+  });
+});
 
 describe('flow control — durable queues', () => {
   it('rate-limits admissions per queue and resumes blocked calls when the window resets', async () => {
@@ -104,5 +186,40 @@ describe('flow control — durable queues', () => {
     await transport.complete(transport.dispatched[1]!);
     await new Promise((r) => setImmediate(r));
     expect((await store.getRun('b'))?.status).toBe('completed');
+  });
+
+  it('admits a higher-priority queued call before a lower-priority one when a slot frees', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new ManualTransport();
+    let nowMs = 1000;
+    const engine = new WorkflowEngine({ store, transport, clock: () => nowMs });
+    engine.registerQueue({ name: 'pq', concurrency: 1 });
+    engine.register('lo', '1', async (ctx) => {
+      await ctx.call(ping, {}, { queue: 'pq', priority: 1 });
+      return 'done';
+    });
+    engine.register('hi', '1', async (ctx) => {
+      await ctx.call(ping, {}, { queue: 'pq', priority: 9 });
+      return 'done';
+    });
+
+    // Take the only slot with a first low-priority run.
+    await startRun(engine, 'lo', {}, 'first');
+    expect(transport.dispatched).toHaveLength(1);
+    // Two contenders register as blocked: low then high priority.
+    await startRun(engine, 'lo', {}, 'low');
+    await startRun(engine, 'hi', {}, 'high');
+    expect((await store.getRun('low'))?.status).toBe('suspended');
+    expect((await store.getRun('high'))?.status).toBe('suspended');
+
+    // Free the slot; on resume the HIGH priority run is admitted before the low one.
+    const [firstTask] = transport.dispatched;
+    if (firstTask) await transport.complete(firstTask);
+    await new Promise((r) => setImmediate(r));
+    nowMs += 1000;
+    await engine.resumeDueTimers(nowMs);
+    // Exactly one new dispatch, and it belongs to the high-priority run.
+    expect(transport.dispatched).toHaveLength(2);
+    expect(transport.dispatched[1]?.runId).toBe('high');
   });
 });

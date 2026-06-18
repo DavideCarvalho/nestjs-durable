@@ -3,10 +3,30 @@ import {
   WorkflowEngine,
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
+import { runStateStoreContract } from '@dudousxd/nestjs-durable-testing';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { DrizzleStateStore } from './drizzle-state-store';
 import { durableSchema } from './schema';
+
+// The SHARED cross-store behavioral contract, run against SQLite. NOTE: this Drizzle adapter is
+// SQLite/libSQL-only by design — `./schema` stores timestamps as epoch-ms INTEGER columns and uses
+// SQLite-specific `onConflictDoUpdate`, so it has no Postgres/MySQL `.db.spec.ts`. For PG/MySQL use
+// the TypeORM, MikroORM or Prisma adapters (which DO run in the `pnpm test:db` matrix).
+runStateStoreContract('Drizzle (better-sqlite3, SQLite-only)', async () => {
+  const sqlite = new Database(':memory:');
+  sqlite.exec(DDL);
+  const db = drizzle(sqlite, { schema: durableSchema });
+  return {
+    store: new DrizzleStateStore(db),
+    // better-sqlite3 is synchronous: its `transaction()` rejects an async callback, so the contract's
+    // transaction case is skipped here (it runs for every other store). libSQL (async) would support it.
+    supportsAsyncTransaction: false,
+    cleanup: async () => {
+      sqlite.close();
+    },
+  };
+});
 
 const DDL = `
 CREATE TABLE durable_workflow_runs (
@@ -20,6 +40,11 @@ CREATE TABLE durable_step_checkpoints (
   status TEXT NOT NULL, input TEXT, output TEXT, error TEXT, events TEXT, attempts INTEGER NOT NULL, worker_group TEXT, wake_at INTEGER,
   enqueued_at INTEGER, started_at INTEGER NOT NULL, finished_at INTEGER NOT NULL, PRIMARY KEY (run_id, seq)
 );
+CREATE TABLE durable_run_attributes (
+  run_id TEXT NOT NULL, key TEXT NOT NULL, str_value TEXT, num_value REAL, PRIMARY KEY (run_id, key)
+);
+CREATE INDEX durable_run_attributes_num_idx ON durable_run_attributes (key, num_value);
+CREATE INDEX durable_run_attributes_str_idx ON durable_run_attributes (key, str_value);
 CREATE TABLE durable_signal_waiters (token TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL);
 CREATE TABLE durable_buffered_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL, payload TEXT);
 `;
@@ -117,6 +142,86 @@ describe('DrizzleStateStore', () => {
     await store.putSignalWaiter({ token: 'approve-1', runId: 'r1', seq: 3 });
     expect((await store.takeSignalWaiter('approve-1'))?.seq).toBe(3);
     expect(await store.takeSignalWaiter('approve-1')).toBeNull();
+    sqlite.close();
+  });
+
+  it('round-trips searchAttributes and answers equality + range queries', async () => {
+    const { store, sqlite } = makeStore();
+    await store.createRun(run({ id: 'a', searchAttributes: { amount: 30, tier: 'free' } }));
+    await store.createRun(run({ id: 'b', searchAttributes: { amount: 200, tier: 'pro' } }));
+    await store.createRun(run({ id: 'c', searchAttributes: { amount: 500, tier: 'pro' } }));
+
+    expect((await store.getRun('b'))?.searchAttributes).toEqual({ amount: 200, tier: 'pro' });
+    const big = await store.listRuns({ attributes: [{ key: 'amount', op: 'gte', value: 200 }] });
+    expect(big.map((r) => r.id).sort()).toEqual(['b', 'c']);
+    const proSmall = await store.listRuns({
+      attributes: [
+        { key: 'tier', op: 'eq', value: 'pro' },
+        { key: 'amount', op: 'lt', value: 300 },
+      ],
+    });
+    expect(proSmall.map((r) => r.id)).toEqual(['b']);
+    // `ne` excludes the matching value AND absent keys (missing-key-never-matches contract).
+    const notFree = await store.listRuns({
+      attributes: [{ key: 'tier', op: 'ne', value: 'free' }],
+    });
+    expect(notFree.map((r) => r.id).sort()).toEqual(['b', 'c']);
+    sqlite.close();
+  });
+
+  it('pushes attribute predicates DOWN into SQL via EXISTS on the side-table (no full scan)', async () => {
+    const { store, sqlite } = makeStore();
+    await store.createRun(run({ id: 'a', searchAttributes: { amount: 30 } }));
+    await store.createRun(run({ id: 'b', searchAttributes: { amount: 200 } }));
+
+    // Capture the SQL better-sqlite3 actually executes for the query.
+    const sqls: string[] = [];
+    sqlite.function('__noop', () => 0); // ensure db is usable
+    const orig = sqlite.prepare.bind(sqlite);
+    (sqlite as unknown as { prepare: typeof orig }).prepare = (s: string) => {
+      sqls.push(s);
+      return orig(s);
+    };
+
+    const res = await store.listRuns({
+      attributes: [{ key: 'amount', op: 'gte', value: 100 }],
+      limit: 10,
+    });
+    expect(res.map((r) => r.id)).toEqual(['b']);
+    const select = sqls.find((s) => /select/i.test(s) && /durable_workflow_runs/i.test(s));
+    expect(select).toBeDefined();
+    expect(select).toMatch(/exists/i); // predicate pushed into SQL, not filtered in-process
+    expect(select).toMatch(/durable_run_attributes/i);
+    expect(select).toMatch(/limit/i); // pagination pushed to the DB, not done in-process
+    sqlite.close();
+  });
+
+  it('maintains the side-table on create and re-indexes on update', async () => {
+    const { store, sqlite } = makeStore();
+    await store.createRun(run({ id: 'a', searchAttributes: { tier: 'free', amount: 10 } }));
+    const rowsAfterCreate = sqlite
+      .prepare(
+        `SELECT key, str_value AS strValue, num_value AS numValue FROM durable_run_attributes WHERE run_id = 'a' ORDER BY key`,
+      )
+      .all();
+    expect(rowsAfterCreate).toEqual([
+      { key: 'amount', strValue: null, numValue: 10 },
+      { key: 'tier', strValue: 'free', numValue: null },
+    ]);
+
+    await store.updateRun('a', { searchAttributes: { tier: 'pro' } });
+    expect(
+      (await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'pro' }] })).map(
+        (r) => r.id,
+      ),
+    ).toEqual(['a']);
+    // Old rows gone after reindex.
+    expect(
+      await store.listRuns({ attributes: [{ key: 'amount', op: 'eq', value: 10 }] }),
+    ).toHaveLength(0);
+    expect(
+      await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'free' }] }),
+    ).toHaveLength(0);
     sqlite.close();
   });
 

@@ -186,8 +186,8 @@ function RunsList({
   onSelectTag,
 }: {
   runs: WorkflowRun[];
-  selected?: string;
-  onSelect: (id: string) => void;
+  selected?: string | undefined;
+  onSelect: (id?: string) => void;
   onSelectTag: (tag: string) => void;
 }) {
   if (runs.length === 0) {
@@ -305,7 +305,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   }, [id, isLive, qc]);
   const retry = useMutation({ mutationFn: () => durableClient.retry(id), onSuccess: invalidate });
   const cancel = useMutation({
-    mutationFn: (compensate?: boolean) => durableClient.cancel(id, { compensate }),
+    mutationFn: (compensate?: boolean) =>
+      durableClient.cancel(id, compensate !== undefined ? { compensate } : {}),
     onSuccess: invalidate,
   });
   const cont = useMutation({ mutationFn: () => durableClient.continue(id), onSuccess: invalidate });

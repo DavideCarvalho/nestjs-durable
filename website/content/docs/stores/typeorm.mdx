@@ -1,0 +1,72 @@
+---
+title: TypeORM
+description: The TypeORM StateStore adapter. Register the durable entities on your DataSource, pass it to TypeOrmStateStore, and run on Postgres, MySQL/MariaDB or SQLite — with auto-schema on boot or an ensureTypeOrmDurableSchema helper for your own migration.
+---
+
+`@dudousxd/nestjs-durable-store-typeorm` persists runs and step checkpoints through **TypeORM**, on
+any dialect it supports — **Postgres, MySQL/MariaDB, SQLite**. It declares `typeorm` as a peer and
+rides the `DataSource` you already configure.
+
+```bash
+pnpm add @dudousxd/nestjs-durable-store-typeorm
+```
+
+## 1. Register the durable entities
+
+The adapter uses `dataSource.getRepository(...)` for each durable table, so its entities must be
+registered on your `DataSource`. The package exports them as `ENTITIES`:
+
+```ts title="data-source.ts"
+import { DataSource } from 'typeorm';
+import { ENTITIES as DURABLE_ENTITIES } from '@dudousxd/nestjs-durable-store-typeorm';
+
+export const dataSource = new DataSource({
+  type: 'postgres',
+  // …host, database, etc.
+  entities: [...DURABLE_ENTITIES, /* your own entities */],
+});
+```
+
+`ENTITIES` is the five `durable_*` entities the engine owns — `WorkflowRunEntity`,
+`StepCheckpointEntity`, `RunAttributeEntity`, `SignalWaiterEntity`, `BufferedSignalEntity`.
+
+## 2. Wire the store into the module
+
+`TypeOrmStateStore` takes the `DataSource`:
+
+```ts title="app.module.ts"
+import { DataSource } from 'typeorm';
+import { TypeOrmStateStore } from '@dudousxd/nestjs-durable-store-typeorm';
+
+DurableModule.forRootAsync({
+  inject: [DataSource],
+  useFactory: (ds: DataSource) => ({
+    store: new TypeOrmStateStore(ds),
+    transport,
+  }),
+});
+```
+
+## Schema: auto on boot, or your own migration
+
+With auto-schema on (the default), the module calls `store.ensureSchema()`, which runs the
+dialect-aware `ensureTypeOrmDurableSchema(dataSource)` — additive, never destructive. It quotes
+identifiers per driver, uses `varchar(191)` for keyed columns (MySQL can't index a `text` column)
+and `longtext` for the free-form JSON payloads on MySQL (its `text` caps at 64 KB and would
+silently truncate a large fan-out step's `events`).
+
+To own the schema yourself, disable it and call the helper from a migration:
+
+```ts
+import { ensureTypeOrmDurableSchema } from '@dudousxd/nestjs-durable-store-typeorm';
+
+export class AddDurableTables implements MigrationInterface {
+  async up(q: QueryRunner) {
+    await ensureTypeOrmDurableSchema(q.connection);
+  }
+}
+```
+
+```ts title="disable auto-schema in production"
+DurableModule.forRoot({ store, transport, autoSchema: false });
+```

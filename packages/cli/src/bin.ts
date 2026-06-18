@@ -26,7 +26,7 @@ async function main(): Promise<void> {
     process.exit(command ? 1 : 0);
   }
 
-  const opts: InspectOptions & { config?: string } = {};
+  const opts: InspectOptions & { config?: string | undefined } = {};
   const positional: string[] = [];
   for (let i = 1; i < argv.length; i += 1) {
     const arg = argv[i];

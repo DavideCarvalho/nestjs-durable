@@ -46,3 +46,75 @@ export function applyAttributeQuery(rows: WorkflowRun[], query: RunQuery): Workf
   const limit = query.limit ?? filtered.length;
   return filtered.slice(offset, offset + limit);
 }
+
+/**
+ * One normalized row of the `durable_run_attributes` side-table: a single (key → value) pair of a
+ * run's search attributes, split into typed columns so SQL can index/range-scan it. Exactly one of
+ * `strValue`/`numValue` is set per row (booleans normalize to a string `"true"`/`"false"` so `eq`/`ne`
+ * still match). NULL for the column that doesn't apply, which keeps `(key, numValue)` /
+ * `(key, strValue)` indexes selective.
+ */
+export interface RunAttributeRow {
+  runId: string;
+  key: string;
+  strValue: string | null;
+  numValue: number | null;
+}
+
+/**
+ * Explode a run's search attributes into normalized side-table rows (one per key). Used by SQL stores
+ * to maintain `durable_run_attributes` on every create/update and by the in-memory store's index, so
+ * attribute predicates can be pushed DOWN into a join/EXISTS instead of scanned in-process. Numbers go
+ * to `numValue`; strings to `strValue`; booleans to `strValue` as `"true"`/`"false"` (matching how the
+ * in-process `compare` treats `eq`/`ne` on booleans). Returns `[]` for a run with no attributes.
+ */
+export function normalizeAttributeRows(
+  runId: string,
+  attributes: SearchAttributes | undefined,
+): RunAttributeRow[] {
+  if (!attributes) return [];
+  const out: RunAttributeRow[] = [];
+  for (const [key, value] of Object.entries(attributes)) {
+    if (typeof value === 'number') {
+      out.push({ runId, key, strValue: null, numValue: value });
+    } else if (typeof value === 'boolean') {
+      out.push({ runId, key, strValue: value ? 'true' : 'false', numValue: null });
+    } else {
+      out.push({ runId, key, strValue: value, numValue: null });
+    }
+  }
+  return out;
+}
+
+/** SQL comparison operator for an {@link AttributeOp} (used to build pushdown predicates). */
+export function sqlComparator(op: AttributeOp): string {
+  switch (op) {
+    case 'eq':
+      return '=';
+    case 'ne':
+      return '<>';
+    case 'gt':
+      return '>';
+    case 'gte':
+      return '>=';
+    case 'lt':
+      return '<';
+    case 'lte':
+      return '<=';
+  }
+}
+
+/**
+ * Which side-table column an attribute filter compares against: numeric operands (and range ops on
+ * numbers) hit `numValue`; everything else hits `strValue` (booleans are stored as `"true"`/`"false"`).
+ * Keeping this in core means every SQL adapter pushes predicates down identically.
+ */
+export function attributeColumnFor(filter: AttributeFilter): 'numValue' | 'strValue' {
+  return typeof filter.value === 'number' ? 'numValue' : 'strValue';
+}
+
+/** The literal a side-table predicate compares against (booleans → `"true"`/`"false"` strings). */
+export function attributeOperand(filter: AttributeFilter): string | number {
+  if (typeof filter.value === 'boolean') return filter.value ? 'true' : 'false';
+  return filter.value;
+}

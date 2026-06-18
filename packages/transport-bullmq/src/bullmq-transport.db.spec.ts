@@ -3,11 +3,40 @@ import {
   type RemoteStepDef,
   WorkflowEngine,
 } from '@dudousxd/nestjs-durable-core';
-import IORedis from 'ioredis';
+import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { BullMQTransport } from './bullmq-transport';
 
-const connection = { host: '127.0.0.1', port: 6379 };
+/**
+ * Real-broker matrix for the BullMQ transport: a Redis instance spun up via testcontainers, so the
+ * remote-step round-trip, the failed-result path, and the control-plane / heartbeat pub/sub are
+ * exercised against an actual Redis instead of self-skipping. Run with `pnpm test:db`.
+ *
+ * Skips cleanly (each case logs once and passes) when Docker is unavailable or `SKIP_TESTCONTAINERS`
+ * is set — never fails the suite for a missing daemon. One container shared across the cases.
+ */
+
+const CONTAINER_TIMEOUT = 180_000;
+const skipped = !!process.env.SKIP_TESTCONTAINERS;
+
+let redis: StartedRedisContainer | undefined;
+let redisError: unknown;
+let connection: { host: string; port: number } | undefined;
+
+beforeAll(async () => {
+  if (skipped) return;
+  try {
+    redis = await new RedisContainer('redis:7-alpine').start();
+    connection = { host: redis.getHost(), port: redis.getFirstMappedPort() };
+  } catch (err) {
+    redisError = err;
+  }
+}, CONTAINER_TIMEOUT);
+
+afterAll(async () => {
+  await redis?.stop();
+});
 
 const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
   name: 'payments.charge-card',
@@ -17,61 +46,77 @@ const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
   __remote: true,
 };
 
-let redisUp = false;
-beforeAll(async () => {
-  const probe = new IORedis({ ...connection, maxRetriesPerRequest: 1, lazyConnect: true });
-  try {
-    await probe.connect();
-    await probe.ping();
-    redisUp = true;
-  } catch {
-    redisUp = false;
+/** A durable ctx.call suspends; poll the store until the Redis round-trip resumes it to terminal. */
+async function settle(store: InMemoryStateStore, runId: string, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const run = await store.getRun(runId);
+    if (run && run.status !== 'pending' && run.status !== 'running' && run.status !== 'suspended')
+      return run;
+    await new Promise((r) => setTimeout(r, 25));
   }
-  await probe.quit().catch(() => {});
-});
+  throw new Error(`run ${runId} did not settle`);
+}
 
-describe('BullMQTransport (real Redis)', () => {
+/** Resolve the live connection or self-skip the case when Docker isn't available. */
+function liveConnection(ctx: { skip: () => void }): { host: string; port: number } {
+  if (skipped) {
+    ctx.skip();
+    throw new Error('unreachable'); // ctx.skip() aborts; keeps the type non-undefined
+  }
+  if (redisError || !connection) {
+    ctx.skip();
+    throw new Error('unreachable');
+  }
+  return connection;
+}
+
+describe('BullMQTransport (real Redis) [testcontainers]', () => {
   it('dispatches a remote step over Redis and returns the checkpointed result', async (ctx) => {
-    if (!redisUp) ctx.skip();
+    const connection = liveConnection(ctx);
     const prefix = `durtest-${Date.now()}`;
     const transport = new BullMQTransport({ connection, group: 'payments', prefix });
     transport.handle('payments.charge-card', async (input: { amount: number }) => ({
       chargeId: `ch_${input.amount}`,
     }));
 
-    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (c) => {
       const charge = await c.call(chargeCard, { amount: 7 });
       return charge.chargeId;
     });
 
-    const result = await engine.start('checkout', {}, 'run1');
+    await engine.start('checkout', {}, 'run1');
+    const result = await settle(store, 'run1');
     expect(result.status).toBe('completed');
     expect(result.output).toBe('ch_7');
 
     await transport.close();
-  }, 20_000);
+  }, 30_000);
 
   it('reports a failed result when the worker handler throws', async (ctx) => {
-    if (!redisUp) ctx.skip();
+    const connection = liveConnection(ctx);
     const prefix = `durtest-${Date.now()}-f`;
     const transport = new BullMQTransport({ connection, group: 'payments', prefix });
     transport.handle('payments.charge-card', async () => {
       throw new Error('declined');
     });
 
-    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (c) => c.call(chargeCard, { amount: 1 }));
 
-    const result = await engine.start('checkout', {}, 'run1');
+    await engine.start('checkout', {}, 'run1');
+    const result = await settle(store, 'run1');
     expect(result.status).toBe('failed');
     expect(result.error?.message).toBe('declined');
 
     await transport.close();
-  }, 20_000);
+  }, 30_000);
 
   it('broadcasts control-plane messages over Redis pub/sub', async (ctx) => {
-    if (!redisUp) ctx.skip();
+    const connection = liveConnection(ctx);
     const prefix = `durtest-${Date.now()}-c`;
     const pub = new BullMQTransport({ connection, prefix });
     const sub = new BullMQTransport({ connection, prefix });
@@ -90,7 +135,7 @@ describe('BullMQTransport (real Redis)', () => {
   }, 20_000);
 
   it('delivers worker heartbeats over Redis pub/sub', async (ctx) => {
-    if (!redisUp) ctx.skip();
+    const connection = liveConnection(ctx);
     const prefix = `durtest-${Date.now()}-h`;
     const worker = new BullMQTransport({ connection, prefix });
     const engineSide = new BullMQTransport({ connection, prefix });

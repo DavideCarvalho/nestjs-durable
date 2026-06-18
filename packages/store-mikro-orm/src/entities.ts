@@ -100,6 +100,28 @@ export class StepCheckpointEntity {
   finishedAt!: Date;
 }
 
+/**
+ * Normalized side-table for search attributes: one row per (run, key), so range/equality predicates
+ * push DOWN into SQL (an EXISTS join indexed on `(key, numValue)` / `(key, strValue)`) instead of a
+ * coarse scan + in-process filter. Maintained on every createRun/updateRun. Numbers land in
+ * `numValue`, strings/booleans in `strValue` (booleans as "true"/"false"); see normalizeAttributeRows.
+ */
+@Entity({ tableName: 'durable_run_attributes' })
+export class RunAttributeEntity {
+  @PrimaryKey()
+  runId!: string;
+
+  @PrimaryKey()
+  key!: string;
+
+  @Property({ type: 'string', nullable: true })
+  strValue?: string | null;
+
+  // `float`/`double` is portable across SQLite/MySQL/Postgres for numeric range scans.
+  @Property({ type: 'float', nullable: true })
+  numValue?: number | null;
+}
+
 @Entity({ tableName: 'durable_signal_waiters' })
 export class SignalWaiterEntity {
   @PrimaryKey()
@@ -127,6 +149,7 @@ export class BufferedSignalEntity {
 export const ENTITIES = [
   WorkflowRunEntity,
   StepCheckpointEntity,
+  RunAttributeEntity,
   SignalWaiterEntity,
   BufferedSignalEntity,
 ] as const;

@@ -28,8 +28,24 @@ model DurableWorkflowRun {
   createdAt       DateTime
   updatedAt       DateTime
 
+  attributes      DurableRunAttribute[]
+
   @@index([status, wakeAt])
   @@map("durable_workflow_runs")
+}
+
+model DurableRunAttribute {
+  runId    String
+  key      String
+  strValue String?
+  numValue Float?
+
+  run      DurableWorkflowRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@id([runId, key])
+  @@index([key, numValue])
+  @@index([key, strValue])
+  @@map("durable_run_attributes")
 }
 
 model DurableStepCheckpoint {
@@ -63,7 +79,11 @@ model DurableSignalWaiter {
 }
 
 model DurableBufferedSignal {
-  id      BigInt @id @default(autoincrement())
+  // The shipped prisma/schema.prisma uses `BigInt` (→ BIGSERIAL / AUTO_INCREMENT on Postgres/MySQL,
+  // which auto-generate). SQLite only auto-increments an `INTEGER PRIMARY KEY`, never `BIGINT`, so
+  // this TEST-ONLY schema uses `Int` so the buffered-signal id is generated under SQLite. The adapter
+  // reads the id back generically (delete-by-id), so the narrower type is transparent to it.
+  id      Int    @id @default(autoincrement())
   token   String
   payload Json?
 

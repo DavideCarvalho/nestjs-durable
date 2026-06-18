@@ -36,19 +36,19 @@ export interface WorkflowRun {
   /** Serialized workflow output, once `completed`. */
   output?: unknown;
   /** Structured error, once `failed`. */
-  error?: StepError;
+  error?: StepError | undefined;
   /** When `suspended` on a durable sleep: epoch ms at which the run becomes due to resume. */
-  wakeAt?: number;
+  wakeAt?: number | undefined;
   /** Recovery lease owner (engine instance id) while a run is being resumed. */
-  lockedBy?: string;
+  lockedBy?: string | undefined;
   /** Recovery lease expiry (epoch ms); another instance may take over once it passes. */
-  lockedUntil?: number;
+  lockedUntil?: number | undefined;
   /** How many times crash-recovery has picked this run up — caps poison pills (see maxRecoveryAttempts). */
-  recoveryAttempts?: number;
+  recoveryAttempts?: number | undefined;
   /** Searchable labels: the workflow's static `@Workflow({ tags })` merged with the run's start-time tags. */
-  tags?: string[];
+  tags?: string[] | undefined;
   /** Typed, queryable run data (e.g. `{ amount: 200, tier: 'pro' }`) — see {@link RunQuery.attributes}. */
-  searchAttributes?: SearchAttributes;
+  searchAttributes?: SearchAttributes | undefined;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -81,14 +81,14 @@ export interface StepCheckpoint {
   /** What the step was called with — the `ctx.call` args for a remote step (a local step has none). */
   input?: unknown;
   output?: unknown;
-  error?: StepError;
+  error?: StepError | undefined;
   attempts: number;
   /** For remote steps: which worker group ran it. */
-  workerGroup?: string;
+  workerGroup?: string | undefined;
   /** Structured events/logs the step emitted (sub-step outcomes, debug/error lines). */
-  events?: StepEvent[];
+  events?: StepEvent[] | undefined;
   /** For sleep steps: epoch ms the sleep elapses at. */
-  wakeAt?: number;
+  wakeAt?: number | undefined;
   /**
    * When the step entered the system: for a remote step, when the engine dispatched it to the
    * transport; for a local step, when it began. Queue-wait time = `startedAt − enqueuedAt`.
@@ -153,10 +153,10 @@ export interface StepLogger {
   subEvent(e: {
     id: string;
     name: string;
-    group?: string;
-    phase?: string;
-    status?: 'ok' | 'failed' | 'skipped';
-    message?: string;
+    group?: string | undefined;
+    phase?: string | undefined;
+    status?: 'ok' | 'failed' | 'skipped' | undefined;
+    message?: string | undefined;
     data?: unknown;
   }): void;
   /**
@@ -191,10 +191,10 @@ export interface SubProcessHandle {
 export interface StepError {
   message: string;
   /** Optional machine-readable code, e.g. `declined`, `timeout`. */
-  code?: string;
+  code?: string | undefined;
   /** Whether the engine should treat this as retryable. */
-  retryable?: boolean;
-  stack?: string;
+  retryable?: boolean | undefined;
+  stack?: string | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -287,18 +287,26 @@ export interface AttributeFilter {
 }
 
 export interface RunQuery {
-  workflow?: string;
-  status?: RunStatus;
+  workflow?: string | undefined;
+  status?: RunStatus | undefined;
+  /**
+   * Match any of these statuses (a `status IN (...)` filter). ORed together, and ANDed with the other
+   * predicates. Use this instead of issuing one {@link listRuns} call per status — e.g. the singleton
+   * admission gate counts `running` + `suspended` in-flight runs in a single scan. If both `status` and
+   * `statuses` are set, both must hold (the single `status` further narrows the set). Empty array =
+   * matches nothing.
+   */
+  statuses?: RunStatus[] | undefined;
   /** Only runs carrying this tag (exact match against {@link WorkflowRun.tags}). */
-  tag?: string;
+  tag?: string | undefined;
   /**
    * Typed/range predicates over {@link WorkflowRun.searchAttributes}, ANDed together (e.g. `amount`
    * >= 200 and `tier` = 'pro'). Applied in-process after the coarse filters, so pair with
    * `workflow`/`status`/`tag` to bound the scan on large stores.
    */
-  attributes?: AttributeFilter[];
-  limit?: number;
-  offset?: number;
+  attributes?: AttributeFilter[] | undefined;
+  limit?: number | undefined;
+  offset?: number | undefined;
 }
 
 /** The transaction handle `StateStore.transaction` hands to its work callback. */
@@ -332,20 +340,20 @@ export interface RemoteTask {
   group: string;
   input: unknown;
   /** W3C traceparent so the worker can continue the distributed trace. */
-  traceparent?: string;
+  traceparent?: string | undefined;
   /**
    * Opaque context carrier (tenant / user / correlation ids) the worker re-exposes to the step
    * handler, for cross-process propagation alongside the {@link traceparent}. The engine treats it
    * as a pass-through object and never inspects its shape — the producer (e.g. `@dudousxd/nestjs-context`)
    * owns the keys. Absent when no `context` provider is configured.
    */
-  context?: Record<string, unknown>;
+  context?: Record<string, unknown> | undefined;
   /**
    * Id of the transport this task was dispatched on (when the engine runs a pool — see
    * {@link NamedTransport}). A worker that consumes several transports replies via the matching one,
    * so failover is symmetric without the worker choosing a transport. Absent for a single transport.
    */
-  transport?: string;
+  transport?: string | undefined;
   attempt: number;
 }
 
@@ -355,11 +363,11 @@ export interface StepResult {
   stepId: string;
   status: 'completed' | 'failed';
   output?: unknown;
-  error?: StepError;
+  error?: StepError | undefined;
   /** Epoch ms when the worker began processing — lets the engine report queue-wait time. */
-  startedAt?: number;
+  startedAt?: number | undefined;
   /** Structured events the worker emitted while running the step (sub-step outcomes, logs). */
-  events?: StepEvent[];
+  events?: StepEvent[] | undefined;
 }
 
 export interface Heartbeat {
@@ -404,11 +412,11 @@ export interface WorkflowTask {
 export interface HistoryEvent {
   seq: number;
   kind: 'step' | 'call' | 'timer' | 'signal' | 'child';
-  name?: string;
+  name?: string | undefined;
   /** Resolved value: a step/call output, a child run's output, a signal payload. */
   output?: unknown;
   /** Set when the op resolved to a failure (e.g. a failed remote step the workflow may catch). */
-  error?: StepError;
+  error?: StepError | undefined;
 }
 
 /** A decision the workflow function produced at a `seq` that was not yet in history. */
@@ -653,7 +661,7 @@ export interface DurableWebhook<TPayload = unknown> {
    * third party. `undefined` when no builder is configured (use {@link DurableWebhook.token} to
    * build your own).
    */
-  readonly url?: string;
+  readonly url?: string | undefined;
   /** Suspend until the callback arrives, then resume with its payload. */
   wait(): Promise<TPayload>;
 }
@@ -698,13 +706,18 @@ export interface WorkflowCtx {
   /**
    * Dispatch a typed remote step and await its checkpointed result. Options:
    * - `queue` — subject the dispatch to a registered flow-control queue (concurrency / rate limit).
+   * - `priority` — admission priority within that queue; higher is admitted first when a slot is
+   *   contended (default 0). No effect without a `queue`.
+   * - `fairnessKey` — the fairness bucket for a queue with `fairness: 'key'` (e.g. a tenant id);
+   *   the queue round-robins across distinct keys so one key can't monopolize the budget. Defaults
+   *   to the run id when omitted. No effect without a `queue`.
    * - `transport` — pin the dispatch to a named transport in the pool (else the pool's first, with
    *   failover to the rest). See `engine.registerQueue` / the engine's `transports` option.
    */
   call<TInput, TOutput>(
     step: RemoteStepDef<TInput, TOutput>,
     input: TInput,
-    opts?: { queue?: string; transport?: string },
+    opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
   ): Promise<TOutput>;
   /**
    * Durable sleep: suspends the run for `duration` (e.g. `'30s'`, `'2h'`, `'7 days'`, or ms as a
@@ -844,7 +857,7 @@ export interface RunResult {
   runId: string;
   status: RunStatus;
   output?: unknown;
-  error?: StepError;
+  error?: StepError | undefined;
 }
 
 /**
@@ -881,19 +894,19 @@ export type EngineEventType =
 export interface EngineEvent {
   type: EngineEventType;
   runId: string;
-  workflow?: string;
-  seq?: number;
-  name?: string;
-  kind?: StepKind;
+  workflow?: string | undefined;
+  seq?: number | undefined;
+  name?: string | undefined;
+  kind?: StepKind | undefined;
   output?: unknown;
-  error?: StepError;
+  error?: StepError | undefined;
   /** Wall-clock duration of the unit that just finished (step or run), when known. */
-  durationMs?: number;
+  durationMs?: number | undefined;
   /** For a remote step: how long it waited in the queue before a worker picked it up. */
-  queueMs?: number;
+  queueMs?: number | undefined;
   /** The live step event carried by a `step.progress` (the single log line / sub-process outcome a
    *  running step just emitted). Absent on lifecycle events. */
-  event?: StepEvent;
+  event?: StepEvent | undefined;
   at: Date;
 }
 

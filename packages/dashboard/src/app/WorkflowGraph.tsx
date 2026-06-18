@@ -60,22 +60,22 @@ type StepData = {
   name: string;
   kind: string;
   status: 'pending' | 'running' | 'completed' | 'failed';
-  workerGroup?: string;
+  workerGroup?: string | undefined;
   attempts: number;
-  duration?: string;
-  subs?: SubCounts;
+  duration?: string | undefined;
+  subs?: SubCounts | undefined;
   selected: boolean;
   /** When this step ran a child workflow, the child's run id. Clicking the node opens its detail
    *  like any other step; only the `child ↗` badge navigates to the child run. */
-  childRunId?: string;
+  childRunId?: string | undefined;
   /** Navigate to the child run — invoked only by the `child ↗` badge, not a node-body click. */
-  onOpenRun?: (id: string) => void;
+  onOpenRun?: ((id: string) => void) | undefined;
   /** Whether this child node's sub-flow is currently expanded inline (drives the chevron). */
-  childExpanded?: boolean;
+  childExpanded?: boolean | undefined;
   /** Toggle inline expansion of this child node's sub-flow in the graph. */
-  onToggleChild?: (id: string) => void;
+  onToggleChild?: ((id: string) => void) | undefined;
   /** Lane depth: 0 = root run, 1 = a child's flow, 2 = a grandchild's, … (tints nested nodes). */
-  depth?: number;
+  depth?: number | undefined;
   /** The underlying checkpoint + the run it belongs to (its own lane's run), so a node-body click
    *  can open the right detail even for a nested child step. */
   step?: StepCheckpoint;
@@ -254,16 +254,16 @@ export function WorkflowGraph({
   run: WorkflowRun;
   timeline: StepCheckpoint[];
   /** `${runId}#${seq}` of the selected step (a nested child step lives in its own run). */
-  selectedKey?: string;
+  selectedKey?: string | undefined;
   /** Open a step's detail — the step + the run it belongs to (root or a nested child run). */
   onSelect: (step: StepCheckpoint, run: WorkflowRun) => void;
   /** Navigate to another run — used by a child-workflow node's `child ↗` badge. */
   onOpenRun: (id: string) => void;
   fmtDuration: (a: string, b: string) => string;
   /** Child run ids whose sub-flow is expanded inline in the graph. */
-  expanded?: Set<string>;
+  expanded?: Set<string> | undefined;
   /** Toggle inline expansion of a child node's sub-flow. */
-  onToggleChild?: (id: string) => void;
+  onToggleChild?: ((id: string) => void) | undefined;
 }) {
   const resolvedExpanded = expanded ?? EMPTY_EXPANDED;
   // Fetch every expanded child (to lay out its sub-flow) plus every root-level child (so even a
@@ -310,7 +310,7 @@ export function WorkflowGraph({
       startX: number,
       prefix: string,
       laneRun: WorkflowRun,
-    ): { firstId?: string; connectorId?: string; nextX: number } {
+    ): { firstId?: string | undefined; connectorId?: string | undefined; nextX: number } {
       let cursorX = startX;
       let firstId: string | undefined;
       let connectorId: string | undefined;

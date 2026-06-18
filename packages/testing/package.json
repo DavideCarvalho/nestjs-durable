@@ -9,21 +9,38 @@
     "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/testing"
   },
-  "type": "commonjs",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsup",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
-    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0"
+    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "vitest": ">=1.0.0 <4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vitest": "2.1.9",
+    "tsup": "8.3.5"
+  },
+  "module": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
   }
 }

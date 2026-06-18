@@ -11,6 +11,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@dudousxd/nestjs-durable-core': pkg('core'),
+      '@dudousxd/nestjs-durable-testing': pkg('testing'),
       '@dudousxd/nestjs-durable-transport-event-emitter': pkg('transport-event-emitter'),
       '@dudousxd/nestjs-durable': pkg('nestjs'),
     },
@@ -30,6 +31,9 @@ export default defineConfig({
     environment: 'node',
     setupFiles: ['./vitest.setup.ts'],
     include: ['packages/*/src/**/*.{test,spec}.ts', 'examples/*/src/**/*.{test,spec}.ts'],
+    // `*.db.spec.ts` boot real Postgres/MySQL via testcontainers — run them only via `pnpm test:db`
+    // (vitest.db.config.ts), never in the default sqlite/in-memory `pnpm test`.
+    exclude: ['**/node_modules/**', '**/dist/**', '**/*.db.spec.ts'],
     coverage: {
       provider: 'v8',
       include: ['packages/*/src/**/*.ts'],

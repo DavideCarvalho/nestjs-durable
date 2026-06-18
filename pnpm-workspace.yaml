@@ -8,11 +8,15 @@ allowBuilds:
   '@prisma/engines': true
   '@swc/core': true
   better-sqlite3: true
+  cpu-features: false
   esbuild: true
   msgpackr-extract: false
   prisma: true
+  protobufjs: false
   sharp: true
+  ssh2: false
 minimumReleaseAgeExclude:
-  - '@dudousxd/nestjs-telescope@1.8.0'
-  - '@dudousxd/nestjs-telescope@1.10.0'
-  - '@dudousxd/nestjs-context@0.1.0'
+  # First-party packages: the minimum-release-age policy guards against recently-published
+  # THIRD-party (potentially compromised) deps — our own scope is exempt. Patterns match
+  # package NAMES (globs), not name@version.
+  - '@dudousxd/*'

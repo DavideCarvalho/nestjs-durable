@@ -12,23 +12,59 @@ pnpm add @dudousxd/nestjs-durable-transport-sqs @aws-sdk/client-sqs
 
 ## How it works
 
-- `ctx.call` dispatches a task to a **per-group** queue: `<prefix>-tasks-<group>`.
-- A worker for that group long-polls it, runs the handler, and sends the result to the shared
-  `<prefix>-results` queue.
-- The engine-side instance polls results and checkpoints them.
+Say a checkout workflow calls the `payments.charge-card` remote step. Its group is the name's first
+segment — **`payments`** — so it runs on a worker in the `payments` group:
+
+```ts title="the step + the call"
+// chargeCard = remoteStep({ name: 'payments.charge-card', … })  → group "payments"
+const { chargeId } = await ctx.call(chargeCard, { orderId, amountCents });
+```
+
+With the default `durable` prefix, that one call moves three messages across two queues:
+
+1. **Dispatch** → the engine sends the `RemoteTask` JSON to the group's tasks queue,
+   **`durable-tasks-payments`** (`<prefix>-tasks-<group>`). One queue per group, so a `payments`
+   worker never sees `emails` tasks.
+2. **Run** → a worker in the `payments` group long-polls `durable-tasks-payments`, runs its
+   `payments.charge-card` handler, then sends the `StepResult` JSON to the shared results queue,
+   **`durable-results`** (`<prefix>-results`) — every group replies on the same one.
+3. **Resume** → the engine long-polls `durable-results`, matches the result to the suspended
+   `ctx.call` by `stepId`, checkpoints it, and the workflow continues.
+
+```text
+ engine ──RemoteTask──▶ durable-tasks-payments ──poll──▶ payments worker
+   ▲                                                          │
+   └────────── poll ────── durable-results ◀──StepResult──────┘
+```
 
 ```ts title="engine side"
-new SqsTransport({ client: new SQSClient({ region: 'us-east-1' }) });
+// resolves durable-tasks-<group> + durable-results by name (auto-creates them if autoCreate)
+new SqsTransport({ client: new SQSClient({ region: 'us-east-1' }), autoCreate: true });
 ```
 
-```ts title="worker side"
+```ts title="worker side — the payments group"
 const transport = new SqsTransport({ client, group: 'payments' });
-transport.handle('payments.charge-card', async (input) => ({ chargeId: await charge(input) }));
+transport.handle('payments.charge-card', async ({ orderId, amountCents }) => ({
+  chargeId: await charge(orderId, amountCents),
+}));
 ```
 
-By default queues are resolved by name (and optionally auto-created); pass `taskQueueUrl` /
-`resultsQueueUrl` to reuse queues you already own. SQS is at-least-once — a task whose worker crashes
-before deleting it is redelivered after the visibility timeout — so keep handlers **idempotent**.
+Add a second group and you get a second tasks queue automatically — a `notifications` worker
+(`group: 'notifications'`) polls **`durable-tasks-notifications`** and replies on the same
+`durable-results`. Reusing queues you already provisioned? Skip name resolution by passing their
+URLs directly:
+
+```ts
+new SqsTransport({
+  client,
+  group: 'payments',
+  taskQueueUrl: () => 'https://sqs.us-east-1.amazonaws.com/1234567890/orders-charge-card',
+  resultsQueueUrl: 'https://sqs.us-east-1.amazonaws.com/1234567890/orders-results',
+});
+```
+
+SQS is at-least-once — a task whose worker crashes before deleting it is redelivered after the
+visibility timeout — so keep handlers **idempotent**.
 
 ## Options
 
@@ -37,7 +73,8 @@ before deleting it is redelivered after the visibility timeout — so keep handl
 | `client` | An `@aws-sdk/client-sqs` `SQSClient`. |
 | `group` | The worker group this instance serves — required to register `handle()`s. |
 | `prefix` | Namespaces the fallback `<prefix>-tasks-*` / `<prefix>-results` names. Default `durable`. |
-| `taskQueueUrl` / `resultsQueueUrl` | Reuse existing queues instead of resolving by name. |
+| `autoCreate` | Create the by-name queues (`durable-tasks-<group>`, `durable-results`) if missing. Ignored for queues you supply via `taskQueueUrl` / `resultsQueueUrl` — those must already exist. |
+| `taskQueueUrl` / `resultsQueueUrl` | Reuse existing queues instead of resolving by name (a literal URL or a resolver). |
 
 The message body is the documented `RemoteTask` / `StepResult` JSON — identical to BullMQ — so a
 [Python worker](/docs/python#aws-sqs) on the same queues interoperates.

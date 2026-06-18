@@ -67,7 +67,7 @@ export interface DbTransportOptions {
  */
 export class DbTransport implements Transport {
   private readonly exec: SqlExecutor;
-  private readonly group?: string;
+  private readonly group?: string | undefined;
   private readonly tasksTable: string;
   private readonly resultsTable: string;
   private readonly pollMs: number;

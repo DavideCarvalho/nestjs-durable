@@ -9,14 +9,14 @@
     "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/telescope"
   },
-  "type": "commonjs",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsup",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
@@ -30,6 +30,20 @@
     "@dudousxd/nestjs-telescope": "1.10.0",
     "@nestjs/core": "11.1.26",
     "@opentelemetry/api": "1.9.0",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "tsup": "8.3.5"
+  },
+  "module": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
   }
 }

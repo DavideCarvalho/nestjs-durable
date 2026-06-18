@@ -3,10 +3,19 @@ import {
   WorkflowEngine,
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
-import { DataSource } from 'typeorm';
+import { runStateStoreContract } from '@dudousxd/nestjs-durable-testing';
+import { DataSource, type Logger } from 'typeorm';
+import { makeTypeOrmStoreFactory } from './conformance';
 import { ENTITIES } from './entities';
 import { JSON_BLOB_COLUMNS, buildWidenStatements, jsonBlobColumnType } from './schema';
 import { TypeOrmStateStore } from './typeorm-state-store';
+
+// The SHARED cross-store behavioral contract, run here against SQLite (default `pnpm test`). The same
+// contract runs against real Postgres/MySQL in `typeorm-state-store.db.spec.ts` under `pnpm test:db`.
+runStateStoreContract(
+  'TypeORM (better-sqlite3)',
+  makeTypeOrmStoreFactory({ type: 'better-sqlite3', database: ':memory:' }),
+);
 
 async function makeStore() {
   const dataSource = new DataSource({
@@ -152,6 +161,26 @@ describe('TypeOrmStateStore', () => {
     await dataSource.destroy();
   });
 
+  it('filters listRuns by a status set (status IN ...) for singleton admission', async () => {
+    const { store, dataSource } = await makeStore();
+    await store.createRun(run({ id: 'a', status: 'running' }));
+    await store.createRun(run({ id: 'b', status: 'suspended' }));
+    await store.createRun(run({ id: 'c', status: 'completed' }));
+    await store.createRun(run({ id: 'd', status: 'pending' }));
+
+    const inflight = await store.listRuns({ statuses: ['running', 'suspended'] });
+    expect(inflight.map((r) => r.id).sort()).toEqual(['a', 'b']);
+    // Single + set are ANDed (the narrower set wins).
+    expect(
+      (await store.listRuns({ status: 'running', statuses: ['running', 'suspended'] })).map(
+        (r) => r.id,
+      ),
+    ).toEqual(['a']);
+    // Empty set matches nothing.
+    expect(await store.listRuns({ statuses: [] })).toHaveLength(0);
+    await dataSource.destroy();
+  });
+
   it('round-trips searchAttributes and filters listRuns by typed/range queries', async () => {
     const { store, dataSource } = await makeStore();
     await store.createRun(run({ id: 'a', searchAttributes: { amount: 30, tier: 'free' } }));
@@ -168,6 +197,97 @@ describe('TypeOrmStateStore', () => {
       ],
     });
     expect(proSmall.map((r) => r.id)).toEqual(['b']);
+    // `ne` excludes the matching value AND absent keys (missing-key-never-matches contract).
+    const notFree = await store.listRuns({
+      attributes: [{ key: 'tier', op: 'ne', value: 'free' }],
+    });
+    expect(notFree.map((r) => r.id).sort()).toEqual(['b', 'c']);
+    await dataSource.destroy();
+  });
+
+  it('pushes attribute predicates DOWN into SQL via EXISTS on the side-table (no full scan)', async () => {
+    // A logging DataSource so we can capture the exact SELECT TypeORM runs for the query.
+    const sqls: string[] = [];
+    const dataSource = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [...ENTITIES],
+      synchronize: true,
+      logging: ['query'],
+      logger: {
+        logQuery: (q: string) => {
+          sqls.push(q);
+        },
+        logQueryError: () => undefined,
+        logQuerySlow: () => undefined,
+        logSchemaBuild: () => undefined,
+        logMigration: () => undefined,
+        log: () => undefined,
+      } satisfies Logger,
+    });
+    await dataSource.initialize();
+    const store = new TypeOrmStateStore(dataSource);
+    await store.createRun(run({ id: 'a', searchAttributes: { amount: 30 } }));
+    await store.createRun(run({ id: 'b', searchAttributes: { amount: 200 } }));
+
+    sqls.length = 0;
+    const res = await store.listRuns({
+      attributes: [{ key: 'amount', op: 'gte', value: 100 }],
+      limit: 10,
+    });
+
+    expect(res.map((r) => r.id)).toEqual(['b']);
+    const select = sqls.find((s) => /SELECT/i.test(s) && /durable_workflow_runs/i.test(s));
+    expect(select).toBeDefined();
+    expect(select).toMatch(/EXISTS/i); // predicate pushed into SQL, not filtered in-process
+    expect(select).toMatch(/durable_run_attributes/i);
+    expect(select).toMatch(/LIMIT/i); // pagination pushed to the DB, not done in-process
+    await dataSource.destroy();
+  });
+
+  it('maintains the side-table on create and re-indexes on update', async () => {
+    const { store, dataSource } = await makeStore();
+    await store.createRun(run({ id: 'a', searchAttributes: { tier: 'free', amount: 10 } }));
+
+    const rowsAfterCreate = (await dataSource.query(
+      `SELECT "key", "strValue", "numValue" FROM "durable_run_attributes" WHERE "runId" = 'a' ORDER BY "key"`,
+    )) as Array<{ key: string; strValue: string | null; numValue: number | null }>;
+    expect(rowsAfterCreate).toEqual([
+      { key: 'amount', strValue: null, numValue: 10 },
+      { key: 'tier', strValue: 'free', numValue: null },
+    ]);
+
+    // Update attributes → old rows gone, new rows present (and the query reflects the change).
+    await store.updateRun('a', { searchAttributes: { tier: 'pro' } });
+    expect(
+      (await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'pro' }] })).map(
+        (r) => r.id,
+      ),
+    ).toEqual(['a']);
+    expect(
+      await store.listRuns({ attributes: [{ key: 'amount', op: 'eq', value: 10 }] }),
+    ).toHaveLength(0);
+    expect(
+      await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'free' }] }),
+    ).toHaveLength(0);
+    await dataSource.destroy();
+  });
+
+  it('ensureSchema creates the side-table and its (key,value) indexes', async () => {
+    const dataSource = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [...ENTITIES],
+      synchronize: false,
+    });
+    await dataSource.initialize();
+    await new TypeOrmStateStore(dataSource).ensureSchema();
+    const indexes = (await dataSource.query(
+      `PRAGMA index_list("durable_run_attributes")`,
+    )) as Array<{ name: string }>;
+    const names = indexes.map((i) => i.name);
+    expect(names).toContain('durable_run_attributes_num_idx');
+    expect(names).toContain('durable_run_attributes_str_idx');
     await dataSource.destroy();
   });
 

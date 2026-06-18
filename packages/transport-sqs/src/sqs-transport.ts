@@ -81,14 +81,14 @@ export interface SqsTransportOptions {
 export class SqsTransport implements Transport {
   private readonly client: SQSClient;
   private readonly ownsClient: boolean;
-  private readonly group?: string;
+  private readonly group?: string | undefined;
   private readonly prefix: string;
   private readonly autoCreate: boolean;
-  private readonly marker?: string;
+  private readonly marker?: string | undefined;
   private readonly waitTimeSeconds: number;
   private readonly visibilityTimeoutSec: number;
-  private readonly taskQueueUrlResolver?: QueueUrlResolver;
-  private readonly resultsQueueUrlOption?: string | (() => string | Promise<string>);
+  private readonly taskQueueUrlResolver?: QueueUrlResolver | undefined;
+  private readonly resultsQueueUrlOption?: string | (() => string | Promise<string>) | undefined;
 
   private readonly handlers = new Map<string, StepHandler>();
   private readonly urlCache = new Map<string, string>();
@@ -240,7 +240,7 @@ export class SqsTransport implements Transport {
     }
   }
 
-  private shouldSkip(msg: { MessageAttributes?: Record<string, unknown> }): boolean {
+  private shouldSkip(msg: { MessageAttributes?: Record<string, unknown> | undefined }): boolean {
     return !!this.marker && !msg.MessageAttributes?.[this.marker];
   }
 

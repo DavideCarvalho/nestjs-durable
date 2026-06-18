@@ -1,0 +1,60 @@
+---
+title: Drizzle
+description: The Drizzle StateStore adapter for SQLite / libSQL (Turso, edge). Build your drizzle db with the package's schema and pass it to DrizzleStateStore. Schema is owned by drizzle-kit — no auto-schema.
+---
+
+`@dudousxd/nestjs-durable-store-drizzle` persists runs and step checkpoints through **Drizzle** on
+**SQLite / libSQL** — including [Turso](https://turso.tech) and edge runtimes. Timestamps and
+`wakeAt` are stored as epoch-ms integers (SQLite has no native date type).
+
+```bash
+pnpm add @dudousxd/nestjs-durable-store-drizzle
+```
+
+It declares `drizzle-orm` as a peer and rides the drizzle db you build.
+
+## 1. Build your db with the durable schema
+
+The package exports the durable tables and a `durableSchema` bundle of all of them. Include it in
+the schema you pass to `drizzle(...)` so the adapter's queries resolve:
+
+```ts title="db.ts"
+import { drizzle } from 'drizzle-orm/libsql';
+import { createClient } from '@libsql/client';
+import { durableSchema } from '@dudousxd/nestjs-durable-store-drizzle';
+
+const client = createClient({ url: process.env.DATABASE_URL! }); // file: or Turso libsql://
+export const db = drizzle(client, { schema: { ...durableSchema, /* your own tables */ } });
+```
+
+`durableSchema` is `{ workflowRuns, stepCheckpoints, runAttributes, signalWaiters, bufferedSignals }`
+(all mapped to the `durable_*` tables). You can also import any of those tables individually — e.g.
+to reference them in a `drizzle-kit` migration.
+
+## 2. Wire the store into the module
+
+`DrizzleStateStore` takes the drizzle db:
+
+```ts title="app.module.ts"
+import { DrizzleStateStore } from '@dudousxd/nestjs-durable-store-drizzle';
+import { db } from './db';
+
+DurableModule.forRoot({
+  store: new DrizzleStateStore(db),
+  transport,
+});
+```
+
+## Schema is owned by drizzle-kit
+
+Like the Prisma adapter, this one has **no auto-schema** — `drizzle-kit` owns your migrations. The
+`autoSchema` option is a no-op here. Generate and apply the durable tables alongside your own:
+
+```bash
+npx drizzle-kit generate
+npx drizzle-kit migrate
+```
+
+Point your `drizzle.config.ts` at a schema file that re-exports `durableSchema` (or the individual
+tables) so the generated SQL includes `durable_workflow_runs`, `durable_step_checkpoints`,
+`durable_run_attributes`, `durable_signal_waiters` and `durable_buffered_signals`.

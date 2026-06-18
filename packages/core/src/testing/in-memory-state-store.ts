@@ -5,7 +5,8 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces';
-import { matchesAttributes } from '../search-attributes';
+import type { AttributeFilter } from '../interfaces';
+import { type RunAttributeRow, normalizeAttributeRows } from '../search-attributes';
 
 /**
  * A non-durable, in-process `StateStore` for tests and local development.
@@ -16,18 +17,44 @@ export class InMemoryStateStore implements StateStore {
   private readonly checkpoints = new Map<string, StepCheckpoint>();
   private readonly signalWaiters = new Map<string, SignalWaiter>();
 
+  /**
+   * Normalized search-attribute side-table, the in-memory analog of the SQL stores'
+   * `durable_run_attributes`: `key -> (runId -> row)`. Maintained on every create/update so an
+   * attribute query can be pushed DOWN to a key-indexed candidate set instead of scanning every run
+   * and comparing in-process. Mirrors {@link normalizeAttributeRows} so behavior matches the SQL path.
+   */
+  private readonly attributeIndex = new Map<string, Map<string, RunAttributeRow>>();
+  /** Test/observability hook: how many candidate runs the last attribute query's index produced. */
+  lastAttributeCandidates = 0;
+
   private key(runId: string, seq: number): string {
     return `${runId}:${seq}`;
   }
 
+  /** Drop then re-add a run's normalized attribute rows so the index tracks its current attributes. */
+  private reindexAttributes(runId: string, attributes: WorkflowRun['searchAttributes']): void {
+    for (const byRun of this.attributeIndex.values()) byRun.delete(runId);
+    for (const row of normalizeAttributeRows(runId, attributes)) {
+      let byRun = this.attributeIndex.get(row.key);
+      if (!byRun) {
+        byRun = new Map();
+        this.attributeIndex.set(row.key, byRun);
+      }
+      byRun.set(runId, row);
+    }
+  }
+
   async createRun(run: WorkflowRun): Promise<void> {
     this.runs.set(run.id, { ...run });
+    this.reindexAttributes(run.id, run.searchAttributes);
   }
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
     const existing = this.runs.get(runId);
     if (!existing) throw new Error(`run ${runId} not found`);
-    this.runs.set(runId, { ...existing, ...patch });
+    const next = { ...existing, ...patch };
+    this.runs.set(runId, next);
+    if ('searchAttributes' in patch) this.reindexAttributes(runId, next.searchAttributes);
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
@@ -133,13 +160,70 @@ export class InMemoryStateStore implements StateStore {
     return { payload };
   }
 
+  /**
+   * Candidate run ids satisfying ONE attribute predicate, served from {@link attributeIndex} — the
+   * pushdown step. Numeric predicates scan only `numValue` rows under the key; string/boolean ones
+   * scan `strValue` rows. This is the in-memory analog of the SQL EXISTS on `durable_run_attributes`.
+   */
+  private candidatesForFilter(f: AttributeFilter): Set<string> {
+    const byRun = this.attributeIndex.get(f.key);
+    const out = new Set<string>();
+    if (!byRun) return out;
+    const numeric = typeof f.value === 'number';
+    const operand = typeof f.value === 'boolean' ? (f.value ? 'true' : 'false') : f.value;
+    for (const row of byRun.values()) {
+      const actual = numeric ? row.numValue : row.strValue;
+      if (actual == null) continue;
+      let ok = false;
+      switch (f.op) {
+        case 'eq':
+          ok = actual === operand;
+          break;
+        case 'ne':
+          ok = actual !== operand;
+          break;
+        case 'gt':
+          ok = actual > operand;
+          break;
+        case 'gte':
+          ok = actual >= operand;
+          break;
+        case 'lt':
+          ok = actual < operand;
+          break;
+        case 'lte':
+          ok = actual <= operand;
+          break;
+      }
+      if (ok) out.add(row.runId);
+    }
+    return out;
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     let runs = [...this.runs.values()];
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
     if (query.status) runs = runs.filter((r) => r.status === query.status);
+    if (query.statuses) runs = runs.filter((r) => query.statuses?.includes(r.status));
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));
-    if (query.attributes?.length)
-      runs = runs.filter((r) => matchesAttributes(r.searchAttributes, query.attributes));
+    if (query.attributes?.length) {
+      // Pushdown: intersect per-predicate candidate sets from the key-indexed side-table, so we only
+      // ever materialize the runs that already satisfy EVERY attribute filter (no full per-run scan).
+      let candidates: Set<string> | null = null;
+      for (const f of query.attributes) {
+        const next = this.candidatesForFilter(f);
+        if (candidates == null) {
+          candidates = next;
+        } else {
+          const prev: Set<string> = candidates;
+          candidates = new Set([...prev].filter((id) => next.has(id)));
+        }
+        if (candidates.size === 0) break;
+      }
+      const ids = candidates ?? new Set<string>();
+      this.lastAttributeCandidates = ids.size;
+      runs = runs.filter((r) => ids.has(r.id));
+    }
     // Newest first (matches the store adapters' `createdAt DESC`) — recent runs on top in the dashboard.
     runs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
     const offset = query.offset ?? 0;

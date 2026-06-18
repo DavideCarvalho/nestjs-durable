@@ -12,25 +12,27 @@ export interface WorkflowMeta {
   name: string;
   version: string;
   /** The workflow this workflow's dead runs route to (a name or a class). See `WorkflowOptions`. */
-  deadLetterWorkflow?: WorkflowRef;
+  deadLetterWorkflow?: WorkflowRef | undefined;
   /** Static searchable labels stamped on every run of this workflow. See `WorkflowOptions`. */
-  tags?: string[];
+  tags?: string[] | undefined;
   /** Per-key serialization (a durable mutex). See `WorkflowOptions`. */
-  singleton?: SingletonConfig;
+  singleton?: SingletonConfig | undefined;
   /** Max wall-clock lifetime before a run is cancelled (e.g. `'2h'`). See `WorkflowOptions`. */
-  executionTimeout?: string | number;
+  executionTimeout?: string | number | undefined;
   /** class-validator DTO validated at start. See `WorkflowOptions`. */
-  inputSchema?: new (
-    ...args: any[]
-  ) => object;
+  inputSchema?:
+    | (new (
+        ...args: any[]
+      ) => object)
+    | undefined;
   /** Custom input validator (throws on invalid). See `WorkflowOptions`. */
-  validateInput?: (input: unknown) => void | Promise<void>;
+  validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
   /** Event names that start a fresh run of this workflow. See `WorkflowOptions`. */
-  onEvent?: string[];
+  onEvent?: string[] | undefined;
   /** Debounce `onEvent` triggers — fire once it's quiet for this long. See `WorkflowOptions`. */
-  debounce?: string | number;
+  debounce?: string | number | undefined;
   /** Batch `onEvent` triggers — fire on size or window. See `WorkflowOptions`. */
-  batch?: { maxSize: number; within: string | number };
+  batch?: { maxSize: number; within: string | number } | undefined;
 }
 
 export interface WorkflowOptions {

@@ -1,4 +1,8 @@
 {
+  // TODO(dual): intentionally left CJS-only. This is a CLI (a `durable` bin executable + a tiny
+  // programmatic API), not a library consumers `import` in app code — it's run via `npx durable`.
+  // Dual-publishing a bin adds multi-entry build complexity and shebang/resolution risk for no
+  // consumer benefit, so it stays on the known-good `tsc` CJS build.
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "module": "CommonJS",

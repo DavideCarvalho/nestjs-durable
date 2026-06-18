@@ -81,7 +81,12 @@ export class DurableTelescopeWatcher implements Watcher {
         root?.end();
         this.roots.delete(event.runId);
       } else if (event.type === 'run.failed') {
-        root?.setStatus({ code: SpanStatusCode.ERROR, message: event.error?.message });
+        const message = event.error?.message;
+        root?.setStatus(
+          message !== undefined
+            ? { code: SpanStatusCode.ERROR, message }
+            : { code: SpanStatusCode.ERROR },
+        );
         root?.end();
         this.roots.delete(event.runId);
       }
