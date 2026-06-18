@@ -256,9 +256,10 @@ export class MikroOrmStateStore implements StateStore {
    *  the active naming strategy (underscore vs camelCase) rather than guessing. The run PK column is
    *  reused for BOTH the outer correlation and the side-table FK (they share the same fieldName). */
   private attributeColumns(em: EntityManager): AttributeColumns {
-    const meta = em.getMetadata().get(RunAttributeEntity.name);
-    const field = (prop: string) => meta.properties[prop]?.fieldNames?.[0] ?? prop;
-    const runMeta = em.getMetadata().get(WorkflowRunEntity.name);
+    const meta = em.getMetadata().get(RunAttributeEntity);
+    const field = (prop: string) =>
+      meta.props.find((p) => p.name === prop)?.fieldNames?.[0] ?? prop;
+    const runMeta = em.getMetadata().get(WorkflowRunEntity);
     const runPk = runMeta.properties.id?.fieldNames?.[0] ?? 'id';
     return {
       table: meta.tableName,
@@ -272,7 +273,7 @@ export class MikroOrmStateStore implements StateStore {
 
   /** Resolve the `tags` column name from metadata (per the active naming strategy), for the raw LIKE. */
   private tagsColumn(em: EntityManager): string {
-    const runMeta = em.getMetadata().get(WorkflowRunEntity.name);
+    const runMeta = em.getMetadata().get(WorkflowRunEntity);
     return runMeta.properties.tags?.fieldNames?.[0] ?? 'tags';
   }
 
@@ -336,7 +337,7 @@ export class MikroOrmStateStore implements StateStore {
     const entity = await em.findOne(SignalWaiterEntity, { token });
     if (!entity) return null;
     const waiter: SignalWaiter = { token: entity.token, runId: entity.runId, seq: entity.seq };
-    await em.removeAndFlush(entity);
+    await em.remove(entity).flush();
     return waiter;
   }
 
@@ -360,7 +361,7 @@ export class MikroOrmStateStore implements StateStore {
     const entity = await em.findOne(BufferedSignalEntity, { token }, { orderBy: { id: 'asc' } });
     if (!entity) return null;
     const payload = entity.payload ?? undefined;
-    await em.removeAndFlush(entity);
+    await em.remove(entity).flush();
     return { payload };
   }
 }

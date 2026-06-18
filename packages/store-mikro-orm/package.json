@@ -26,15 +26,16 @@
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@dudousxd/nestjs-durable-testing": "workspace:^",
-    "@mikro-orm/sqlite": "7.1.4",
     "@mikro-orm/core": "7.1.4",
+    "@mikro-orm/decorators": "7.1.4",
     "@mikro-orm/mysql": "7.1.4",
     "@mikro-orm/postgresql": "7.1.4",
+    "@mikro-orm/sqlite": "7.1.4",
     "@testcontainers/mysql": "10.18.0",
     "@testcontainers/postgresql": "10.18.0",
     "reflect-metadata": "0.2.2",
-    "typescript": "5.9.3",
-    "tsup": "8.3.5"
+    "tsup": "8.3.5",
+    "typescript": "5.9.3"
   },
   "module": "./dist/index.js",
   "exports": {

@@ -1,5 +1,5 @@
 import type { RunStatus, StepKind } from '@dudousxd/nestjs-durable-core';
-import { Entity, PrimaryKey, Property } from '@mikro-orm/core';
+import { Entity, PrimaryKey, Property } from '@mikro-orm/decorators/legacy';
 
 @Entity({ tableName: 'durable_workflow_runs' })
 export class WorkflowRunEntity {

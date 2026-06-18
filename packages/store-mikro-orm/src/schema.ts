@@ -12,5 +12,5 @@ import type { MikroORM } from '@mikro-orm/core';
  * ```
  */
 export async function ensureMikroOrmDurableSchema(orm: MikroORM): Promise<void> {
-  await orm.schema.updateSchema({ safe: true });
+  await orm.schema.update({ safe: true });
 }

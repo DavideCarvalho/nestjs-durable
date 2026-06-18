@@ -301,6 +301,9 @@ importers:
       '@mikro-orm/core':
         specifier: 7.1.4
         version: 7.1.4
+      '@mikro-orm/decorators':
+        specifier: 7.1.4
+        version: 7.1.4(@mikro-orm/core@7.1.4)(reflect-metadata@0.2.2)
       '@mikro-orm/mysql':
         specifier: 7.1.4
         version: 7.1.4(@mikro-orm/core@7.1.4)(@types/node@22.19.20)
@@ -1696,6 +1699,16 @@ packages:
       dataloader: 2.2.3
     peerDependenciesMeta:
       dataloader:
+        optional: true
+
+  '@mikro-orm/decorators@7.1.4':
+    resolution: {integrity: sha512-3OSFkdgi39c/kFJ89/ylDZ27n5WV3uJgqrAMNVjrAxQs9xByt6mzoTBsWuU/EdNqw3yBLR43FNwTNPc1lWQ7lA==}
+    engines: {node: '>= 22.17.0'}
+    peerDependencies:
+      '@mikro-orm/core': 7.1.4
+      reflect-metadata: ^0.1.0 || ^0.2.0
+    peerDependenciesMeta:
+      reflect-metadata:
         optional: true
 
   '@mikro-orm/mysql@7.1.4':
@@ -7480,6 +7493,12 @@ snapshots:
       - supports-color
 
   '@mikro-orm/core@7.1.4': {}
+
+  '@mikro-orm/decorators@7.1.4(@mikro-orm/core@7.1.4)(reflect-metadata@0.2.2)':
+    dependencies:
+      '@mikro-orm/core': 7.1.4
+    optionalDependencies:
+      reflect-metadata: 0.2.2
 
   '@mikro-orm/mysql@7.1.4(@mikro-orm/core@7.1.4)(@types/node@22.19.20)':
     dependencies:
