@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-transport-sqs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Amazon SQS Transport for nestjs-durable — dispatch remote steps over existing SQS queues (ElasticMQ-compatible)",
   "license": "MIT",
   "author": "Davide Carvalho",

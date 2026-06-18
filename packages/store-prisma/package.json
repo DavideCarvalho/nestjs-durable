@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-store-prisma",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Prisma adapter for the nestjs-durable StateStore",
   "license": "MIT",
   "author": "Davide Carvalho",
