@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-eslint-plugin",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "ESLint rule: flag non-deterministic calls (Date.now, Math.random, …) inside a @Workflow run",
   "license": "MIT",
   "author": "Davide Carvalho",
