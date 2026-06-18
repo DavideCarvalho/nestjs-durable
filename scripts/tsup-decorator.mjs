@@ -28,7 +28,10 @@ const swcDecoratorPlugin = {
         },
         module: { type: 'es6' },
       });
-      return { contents: `${code}\n//# sourceMappingURL=data:application/json;base64,${Buffer.from(map ?? '{}').toString('base64')}`, loader: 'js' };
+      return {
+        contents: `${code}\n//# sourceMappingURL=data:application/json;base64,${Buffer.from(map ?? '{}').toString('base64')}`,
+        loader: 'js',
+      };
     });
   },
 };

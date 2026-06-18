@@ -167,18 +167,23 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
 
     // ---- checkpoints ------------------------------------------------------------------------
 
-    t('upserts checkpoints, reads them by (runId, seq), and lists them ordered by seq', async () => {
-      await store.createRun(run());
-      await store.saveCheckpoint(checkpoint());
-      await store.saveCheckpoint(checkpoint({ seq: 1, name: 'charge', output: { chargeId: 'ch_1' } }));
-      // Re-save seq 0 with a new output — upsert, not a duplicate row.
-      await store.saveCheckpoint(checkpoint({ output: { ok: true, again: true } }));
+    t(
+      'upserts checkpoints, reads them by (runId, seq), and lists them ordered by seq',
+      async () => {
+        await store.createRun(run());
+        await store.saveCheckpoint(checkpoint());
+        await store.saveCheckpoint(
+          checkpoint({ seq: 1, name: 'charge', output: { chargeId: 'ch_1' } }),
+        );
+        // Re-save seq 0 with a new output — upsert, not a duplicate row.
+        await store.saveCheckpoint(checkpoint({ output: { ok: true, again: true } }));
 
-      expect((await store.getCheckpoint('r1', 0))?.output).toEqual({ ok: true, again: true });
-      expect((await store.getCheckpoint('r1', 1))?.name).toBe('charge');
-      const list = await store.listCheckpoints('r1');
-      expect(list.map((c) => c.seq)).toEqual([0, 1]);
-    });
+        expect((await store.getCheckpoint('r1', 0))?.output).toEqual({ ok: true, again: true });
+        expect((await store.getCheckpoint('r1', 1))?.name).toBe('charge');
+        const list = await store.listCheckpoints('r1');
+        expect(list.map((c) => c.seq)).toEqual([0, 1]);
+      },
+    );
 
     t('round-trips checkpoint events and reads back a missing checkpoint as null', async () => {
       await store.createRun(run());
@@ -265,9 +270,9 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       await store.createRun(run({ id: 'c', status: 'completed' }));
       await store.createRun(run({ id: 'd', status: 'pending' }));
 
-      expect((await store.listRuns({ statuses: ['running', 'suspended'] })).map((r) => r.id).sort()).toEqual(
-        ['a', 'b'],
-      );
+      expect(
+        (await store.listRuns({ statuses: ['running', 'suspended'] })).map((r) => r.id).sort(),
+      ).toEqual(['a', 'b']);
       // Single + set are ANDed (the narrower set wins).
       expect(
         (await store.listRuns({ status: 'running', statuses: ['running', 'suspended'] })).map(
@@ -364,28 +369,31 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       }
     });
 
-    t('re-indexes the search-attribute side-table on update (old values stop matching)', async () => {
-      await store.createRun(run({ id: 'a', searchAttributes: { tier: 'free', amount: 10 } }));
-      expect(
-        (await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'free' }] })).map(
-          (r) => r.id,
-        ),
-      ).toEqual(['a']);
+    t(
+      're-indexes the search-attribute side-table on update (old values stop matching)',
+      async () => {
+        await store.createRun(run({ id: 'a', searchAttributes: { tier: 'free', amount: 10 } }));
+        expect(
+          (await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'free' }] })).map(
+            (r) => r.id,
+          ),
+        ).toEqual(['a']);
 
-      await store.updateRun('a', { searchAttributes: { tier: 'pro' } });
-      expect(
-        (await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'pro' }] })).map(
-          (r) => r.id,
-        ),
-      ).toEqual(['a']);
-      // Old key/value pairs are gone.
-      expect(
-        await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'free' }] }),
-      ).toHaveLength(0);
-      expect(
-        await store.listRuns({ attributes: [{ key: 'amount', op: 'eq', value: 10 }] }),
-      ).toHaveLength(0);
-    });
+        await store.updateRun('a', { searchAttributes: { tier: 'pro' } });
+        expect(
+          (await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'pro' }] })).map(
+            (r) => r.id,
+          ),
+        ).toEqual(['a']);
+        // Old key/value pairs are gone.
+        expect(
+          await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'free' }] }),
+        ).toHaveLength(0);
+        expect(
+          await store.listRuns({ attributes: [{ key: 'amount', op: 'eq', value: 10 }] }),
+        ).toHaveLength(0);
+      },
+    );
 
     t('combines an attribute predicate with a coarse status filter and paginates', async () => {
       await store.createRun(run({ id: 'a', status: 'running', searchAttributes: { amount: 300 } }));
@@ -447,31 +455,34 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
 
     // ---- engine end-to-end durability -------------------------------------------------------
 
-    t('runs the engine end-to-end durably, resuming without re-running completed steps', async () => {
-      const engine = new WorkflowEngine({ store });
-      let aRuns = 0;
-      let failOnce = true;
-      engine.register('wf', '1', async (ctx) => {
-        const a = await ctx.step('a', async () => {
-          aRuns += 1;
-          return 10;
+    t(
+      'runs the engine end-to-end durably, resuming without re-running completed steps',
+      async () => {
+        const engine = new WorkflowEngine({ store });
+        let aRuns = 0;
+        let failOnce = true;
+        engine.register('wf', '1', async (ctx) => {
+          const a = await ctx.step('a', async () => {
+            aRuns += 1;
+            return 10;
+          });
+          const b = await ctx.step('b', async () => {
+            if (failOnce) {
+              failOnce = false;
+              throw new Error('boom');
+            }
+            return a + 5;
+          });
+          return b;
         });
-        const b = await ctx.step('b', async () => {
-          if (failOnce) {
-            failOnce = false;
-            throw new Error('boom');
-          }
-          return a + 5;
-        });
-        return b;
-      });
-      await engine.start('wf', { x: 1 }, 'run1');
-      expect((await engine.waitForRun('run1')).status).toBe('failed');
-      const resumed = await engine.resume('run1');
-      expect(resumed.status).toBe('completed');
-      expect(resumed.output).toBe(15);
-      // Step `a` checkpointed `completed` the first turn, so replay returns it instead of re-running.
-      expect(aRuns).toBe(1);
-    });
+        await engine.start('wf', { x: 1 }, 'run1');
+        expect((await engine.waitForRun('run1')).status).toBe('failed');
+        const resumed = await engine.resume('run1');
+        expect(resumed.status).toBe('completed');
+        expect(resumed.output).toBe(15);
+        // Step `a` checkpointed `completed` the first turn, so replay returns it instead of re-running.
+        expect(aRuns).toBe(1);
+      },
+    );
   });
 }

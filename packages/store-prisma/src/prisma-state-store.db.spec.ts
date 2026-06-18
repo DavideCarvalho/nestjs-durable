@@ -33,7 +33,7 @@ const pkgRoot = resolve(__dirname, '..');
 
 let pg: StartedPostgreSqlContainer | undefined;
 let setupError: unknown;
-// biome-ignore lint/suspicious/noExplicitAny: client is generated at test time, so untyped here.
+// The Prisma client is generated at test time, so it is untyped here.
 let sharedPrisma: any;
 
 function runPrisma(args: string[], env: Record<string, string>): void {

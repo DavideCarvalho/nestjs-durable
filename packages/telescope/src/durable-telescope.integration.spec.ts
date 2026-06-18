@@ -40,7 +40,8 @@ describe('durable extension integrates with the real Telescope ExtensionRegistry
 
     const provider = registry.findProvider('durable.state');
     expect(provider).toBeDefined();
-    const result = (await provider!.resolve({ status: 'dead' }, ctx)) as { value: number };
+    if (!provider) throw new Error('durable.state provider not found');
+    const result = (await provider.resolve({ status: 'dead' }, ctx)) as { value: number };
     expect(result.value).toBe(0);
   });
 
@@ -49,13 +50,14 @@ describe('durable extension integrates with the real Telescope ExtensionRegistry
     const registry = new ExtensionRegistry([durableTelescopeExtension()], ctx);
     const dash = registry.dashboards().find((d) => d.id === 'durable.workflows');
     expect(dash).toBeDefined();
+    if (!dash) throw new Error('durable.workflows dashboard not found');
     const providerNames = new Set([
       'durable.state',
       'durable.timeseries',
       'durable.recentFailures',
       'durable.workerHealth',
     ]);
-    for (const panel of dash!.panels) {
+    for (const panel of dash.panels) {
       expect(providerNames.has(panel.data.provider)).toBe(true);
     }
   });

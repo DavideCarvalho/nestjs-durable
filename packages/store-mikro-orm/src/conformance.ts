@@ -45,6 +45,9 @@ async function truncateAll(orm: MikroORM): Promise<void> {
   const platform = String(em.getPlatform().constructor.name).toLowerCase();
   const ch = platform.includes('mysql') || platform.includes('mariadb') ? '`' : '"';
   for (const t of TABLES) {
-    await em.getConnection().execute(`DELETE FROM ${ch}${t}${ch}`).catch(() => undefined);
+    await em
+      .getConnection()
+      .execute(`DELETE FROM ${ch}${t}${ch}`)
+      .catch(() => undefined);
   }
 }

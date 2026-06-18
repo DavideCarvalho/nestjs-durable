@@ -34,7 +34,12 @@ export function collectMetrics(engine: Subscribable): MetricsCollector {
   };
   const wf = (name?: string) => {
     const k = name ?? 'unknown';
-    return (m.byWorkflow[k] ??= { started: 0, completed: 0, failed: 0 });
+    let entry = m.byWorkflow[k];
+    if (!entry) {
+      entry = { started: 0, completed: 0, failed: 0 };
+      m.byWorkflow[k] = entry;
+    }
+    return entry;
   };
 
   const stop = engine.subscribe((e) => {

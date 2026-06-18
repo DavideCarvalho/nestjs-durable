@@ -20,11 +20,7 @@ export interface WorkflowMeta {
   /** Max wall-clock lifetime before a run is cancelled (e.g. `'2h'`). See `WorkflowOptions`. */
   executionTimeout?: string | number | undefined;
   /** class-validator DTO validated at start. See `WorkflowOptions`. */
-  inputSchema?:
-    | (new (
-        ...args: any[]
-      ) => object)
-    | undefined;
+  inputSchema?: (new (...args: any[]) => object) | undefined;
   /** Custom input validator (throws on invalid). See `WorkflowOptions`. */
   validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
   /** Event names that start a fresh run of this workflow. See `WorkflowOptions`. */

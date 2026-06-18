@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useState } from 'react';
 import {
-  type RunDetail,
+  type RunDetail as RunDetailData,
   type RunDisplayStatus,
   type RunStatus,
   type StepCheckpoint,
@@ -252,17 +252,17 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     // the live stream appended (sub-processes flicker). Read prev AFTER the fetch so events that
     // streamed in during the request are kept too.
     queryFn: async () =>
-      mergeLiveEvents(qc.getQueryData<RunDetail>(['run', id]), await durableClient.run(id)),
+      mergeLiveEvents(qc.getQueryData<RunDetailData>(['run', id]), await durableClient.run(id)),
     // Live-follow an in-flight run; stop polling once it reaches a terminal state.
     refetchInterval: (q) => {
-      const s = (q.state.data as RunDetail | undefined)?.run.status;
+      const s = (q.state.data as RunDetailData | undefined)?.run.status;
       return s === 'running' || s === 'suspended' ? 1500 : false;
     },
   });
   // Dead-letter link: a `dead` run may have been routed to a `dlq:<id>` handler workflow. Probe for
   // it (retry off so a 404 just hides the link) so we never render a dead link.
   const handlerId =
-    (data as RunDetail | undefined)?.run.status === 'dead' ? `dlq:${id}` : undefined;
+    (data as RunDetailData | undefined)?.run.status === 'dead' ? `dlq:${id}` : undefined;
   const { data: dlqHandler } = useQuery({
     queryKey: ['run', handlerId],
     queryFn: () => durableClient.run(handlerId as string),
@@ -276,7 +276,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   // Live-tail over SSE: refresh the moment an event lands instead of waiting for the poll. Only
   // while the run is in flight; the 1.5s poll above stays as a fallback (e.g. transport with no
   // control plane, or a dropped stream).
-  const liveStatus = (data as RunDetail | undefined)?.run.status;
+  const liveStatus = (data as RunDetailData | undefined)?.run.status;
   const isLive = liveStatus === 'running' || liveStatus === 'suspended';
   useEffect(() => {
     if (!isLive) return;
@@ -288,7 +288,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       if (event.type === 'step.progress' && event.event && event.seq != null) {
         const seq = event.seq;
         const live = event.event;
-        qc.setQueryData(['run', id], (prev: RunDetail | undefined) => {
+        qc.setQueryData(['run', id], (prev: RunDetailData | undefined) => {
           if (!prev) return prev;
           return {
             ...prev,
@@ -319,7 +319,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     },
   });
   const onFixReplay = () => {
-    const current = JSON.stringify((data as RunDetail | undefined)?.run.input ?? {}, null, 2);
+    const current = JSON.stringify((data as RunDetailData | undefined)?.run.input ?? {}, null, 2);
     const edited = window.prompt('Fix the input, then replay as a fresh run:', current);
     if (edited == null) return;
     try {
@@ -437,10 +437,10 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               ))}
             </div>
           )}
-          {(data as RunDetail | undefined)?.children?.length ? (
+          {(data as RunDetailData | undefined)?.children?.length ? (
             <div className="mt-1.5 flex flex-wrap items-center gap-1">
               <span className="text-[10px] text-zinc-600">children:</span>
-              {(data as RunDetail).children?.map((cid) => (
+              {(data as RunDetailData).children?.map((cid) => (
                 // biome-ignore lint/a11y/useKeyWithClickEvents: span keeps the row layout; click navigates
                 <span
                   key={cid}
@@ -605,7 +605,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
 function runIdFromHash(): string | undefined {
   if (typeof window === 'undefined') return undefined;
   const match = window.location.hash.match(/^#\/run\/(.+)$/);
-  return match ? decodeURIComponent(match[1]) : undefined;
+  const id = match?.[1];
+  return id ? decodeURIComponent(id) : undefined;
 }
 
 export function App() {

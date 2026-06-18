@@ -6,10 +6,7 @@ import {
 import { MikroORM as MySqlMikroORM } from '@mikro-orm/mysql';
 import { MikroORM as PostgresMikroORM } from '@mikro-orm/postgresql';
 import { MySqlContainer, type StartedMySqlContainer } from '@testcontainers/mysql';
-import {
-  PostgreSqlContainer,
-  type StartedPostgreSqlContainer,
-} from '@testcontainers/postgresql';
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { afterAll, beforeAll, describe } from 'vitest';
 import { makeMikroOrmStoreFactory } from './conformance';
 

@@ -43,25 +43,25 @@ describe('mergeLiveEvents', () => {
     const prev = detail([step({ status: 'running', events: [ev(1), ev(2)] })]);
     const fresh = detail([step({ status: 'running', events: [] })]); // store has none until completion
     const merged = mergeLiveEvents(prev, fresh);
-    expect(merged.timeline[0].events).toEqual([ev(1), ev(2)]); // not wiped → no flicker
+    expect(merged.timeline[0]?.events).toEqual([ev(1), ev(2)]); // not wiped → no flicker
   });
 
   it('uses the authoritative fetched events once the step has completed', () => {
     const prev = detail([step({ status: 'running', events: [ev(1), ev(2)] })]);
     const fresh = detail([step({ status: 'completed', events: [ev(1), ev(2), ev(3)] })]);
-    expect(mergeLiveEvents(prev, fresh).timeline[0].events).toEqual([ev(1), ev(2), ev(3)]);
+    expect(mergeLiveEvents(prev, fresh).timeline[0]?.events).toEqual([ev(1), ev(2), ev(3)]);
   });
 
   it('does not resurrect streamed events onto a completed step the store reports as empty', () => {
     const prev = detail([step({ status: 'running', events: [ev(1)] })]);
     const fresh = detail([step({ status: 'completed', events: [] })]); // genuinely emitted nothing
-    expect(mergeLiveEvents(prev, fresh).timeline[0].events).toEqual([]);
+    expect(mergeLiveEvents(prev, fresh).timeline[0]?.events).toEqual([]);
   });
 
   it('lets a fetch that already carries events win over the cache', () => {
     const prev = detail([step({ status: 'running', events: [ev(1)] })]);
     const fresh = detail([step({ status: 'running', events: [ev(9)] })]);
-    expect(mergeLiveEvents(prev, fresh).timeline[0].events).toEqual([ev(9)]);
+    expect(mergeLiveEvents(prev, fresh).timeline[0]?.events).toEqual([ev(9)]);
   });
 
   it('matches steps by seq, not position', () => {
