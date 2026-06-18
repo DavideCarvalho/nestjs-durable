@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-store-mikro-orm
 
+## 0.9.1
+
+### Patch Changes
+
+- b7267da: perf: `getEvent` and `getRunChildren` use targeted store queries instead of fetching and JS-filtering every checkpoint for a run. Adds two **optional** `StateStore` methods (`getLatestCheckpointByName`, `listCheckpointsByNamePrefix`) implemented by all first-party adapters; the engine falls back to the previous `listCheckpoints` scan when a custom store omits them, so this is non-breaking. Cuts per-call rows fetched from O(N) to O(1)/O(k).
+
 ## 0.9.0
 
 ### Minor Changes
