@@ -272,6 +272,30 @@ export interface StateStore {
   // Dashboard queries
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
+
+  /**
+   * The LATEST checkpoint for `runId` whose `name` equals `name` exactly (highest `seq` wins), or
+   * `undefined` if none. A targeted read that avoids fetching + deserializing every checkpoint just to
+   * keep one match — the store does the filter (`WHERE name = … ORDER BY seq DESC LIMIT 1`). Preserves
+   * the "last in seq order wins" semantics the engine relies on for `getEvent` (a re-published key
+   * overwrites the prior value at a higher seq, so the highest-seq match is the current value).
+   *
+   * Optional: a store that omits it still works — the engine falls back to {@link listCheckpoints}
+   * plus an in-JS filter that produces the identical result.
+   */
+  getLatestCheckpointByName?(runId: string, name: string): Promise<StepCheckpoint | undefined>;
+
+  /**
+   * All checkpoints for `runId` whose `name` starts with ANY of `prefixes`, ordered by `seq` ascending
+   * (same order as {@link listCheckpoints}). A targeted read that avoids scanning every checkpoint just
+   * to keep the prefix matches — the store does the filter (`WHERE name LIKE 'prefix%' …`). Used by the
+   * run-tree to find a parent's child edges (`signal:child:` / `spawn:` checkpoints) without loading the
+   * whole history. An empty `prefixes` array matches nothing.
+   *
+   * Optional: a store that omits it still works — the engine falls back to {@link listCheckpoints}
+   * plus an in-JS prefix scan that produces the identical result.
+   */
+  listCheckpointsByNamePrefix?(runId: string, prefixes: string[]): Promise<StepCheckpoint[]>;
 }
 
 /** Typed, queryable per-run data — exact values for `eq`/`ne`, numbers/strings for range ops. */

@@ -263,6 +263,23 @@ export class TypeOrmStateStore implements StateStore {
     return rows.map(fromCheckpointEntity);
   }
 
+  async getLatestCheckpointByName(
+    runId: string,
+    name: string,
+  ): Promise<StepCheckpoint | undefined> {
+    const e = await this.checkpoints().findOne({ where: { runId, name }, order: { seq: 'DESC' } });
+    return e ? fromCheckpointEntity(e) : undefined;
+  }
+
+  async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {
+    if (prefixes.length === 0) return [];
+    const rows = await this.checkpoints().find({
+      where: prefixes.map((p) => ({ runId, name: Like(`${p}%`) })),
+      order: { seq: 'ASC' },
+    });
+    return rows.map(fromCheckpointEntity);
+  }
+
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
     await this.waiters().save({ ...waiter });
   }

@@ -244,6 +244,34 @@ export class DrizzleStateStore implements StateStore {
     return rows.map(fromCheckpointRow);
   }
 
+  async getLatestCheckpointByName(
+    runId: string,
+    name: string,
+  ): Promise<StepCheckpoint | undefined> {
+    const rows = await this.db
+      .select()
+      .from(stepCheckpoints)
+      .where(and(eq(stepCheckpoints.runId, runId), eq(stepCheckpoints.name, name)))
+      .orderBy(desc(stepCheckpoints.seq))
+      .limit(1);
+    return rows[0] ? fromCheckpointRow(rows[0]) : undefined;
+  }
+
+  async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {
+    if (prefixes.length === 0) return [];
+    const rows = await this.db
+      .select()
+      .from(stepCheckpoints)
+      .where(
+        and(
+          eq(stepCheckpoints.runId, runId),
+          or(...prefixes.map((p) => like(stepCheckpoints.name, `${p}%`))),
+        ),
+      )
+      .orderBy(asc(stepCheckpoints.seq));
+    return rows.map(fromCheckpointRow);
+  }
+
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
     await this.db
       .insert(signalWaiters)

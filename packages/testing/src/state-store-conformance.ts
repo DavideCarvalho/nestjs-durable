@@ -185,6 +185,59 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    t(
+      'getLatestCheckpointByName returns the highest-seq match (and undefined for none)',
+      async () => {
+        await store.createRun(run());
+        await store.saveCheckpoint(
+          checkpoint({ seq: 0, name: 'event:progress', output: { pct: 10 } }),
+        );
+        await store.saveCheckpoint(checkpoint({ seq: 1, name: 'charge', output: { id: 'c1' } }));
+        await store.saveCheckpoint(
+          checkpoint({ seq: 2, name: 'event:progress', output: { pct: 50 } }),
+        );
+        await store.saveCheckpoint(
+          checkpoint({ seq: 3, name: 'event:progress', output: { pct: 90 } }),
+        );
+
+        // Optional on the interface (the engine has a fallback), but a conformant store MUST provide
+        // it — assert presence, then exercise the fast path.
+        const getLatestCheckpointByName = store.getLatestCheckpointByName;
+        expect(getLatestCheckpointByName).toBeDefined();
+        if (!getLatestCheckpointByName) return;
+
+        const latest = await getLatestCheckpointByName.call(store, 'r1', 'event:progress');
+        expect(latest?.seq).toBe(3);
+        expect(latest?.output).toEqual({ pct: 90 });
+        expect(await getLatestCheckpointByName.call(store, 'r1', 'event:missing')).toBeUndefined();
+      },
+    );
+
+    t(
+      'listCheckpointsByNamePrefix returns prefix matches ordered by seq (empty => none)',
+      async () => {
+        await store.createRun(run());
+        await store.saveCheckpoint(checkpoint({ seq: 0, name: 'reserve' }));
+        await store.saveCheckpoint(checkpoint({ seq: 1, name: 'spawn:0', output: 'child-a' }));
+        await store.saveCheckpoint(checkpoint({ seq: 2, name: 'signal:child:c2' }));
+        await store.saveCheckpoint(checkpoint({ seq: 3, name: 'event:progress' }));
+        await store.saveCheckpoint(checkpoint({ seq: 4, name: 'spawn:1', output: 'child-b' }));
+
+        // Optional on the interface (the engine has a fallback), but a conformant store MUST provide
+        // it — assert presence, then exercise the fast path.
+        const listCheckpointsByNamePrefix = store.listCheckpointsByNamePrefix;
+        expect(listCheckpointsByNamePrefix).toBeDefined();
+        if (!listCheckpointsByNamePrefix) return;
+
+        const matches = await listCheckpointsByNamePrefix.call(store, 'r1', [
+          'signal:child:',
+          'spawn:',
+        ]);
+        expect(matches.map((c) => c.name)).toEqual(['spawn:0', 'signal:child:c2', 'spawn:1']);
+        expect(await listCheckpointsByNamePrefix.call(store, 'r1', [])).toEqual([]);
+      },
+    );
+
     t('round-trips checkpoint events and reads back a missing checkpoint as null', async () => {
       await store.createRun(run());
       await store.saveCheckpoint(

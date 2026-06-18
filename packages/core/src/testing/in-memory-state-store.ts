@@ -26,6 +26,13 @@ export class InMemoryStateStore implements StateStore {
   private readonly attributeIndex = new Map<string, Map<string, RunAttributeRow>>();
   /** Test/observability hook: how many candidate runs the last attribute query's index produced. */
   lastAttributeCandidates = 0;
+  /**
+   * Test/observability hook: how many checkpoint rows the LAST checkpoint read materialized (the rows
+   * actually returned to the caller). `listCheckpoints` returns all rows for the run; the targeted
+   * {@link getLatestCheckpointByName} / {@link listCheckpointsByNamePrefix} return only the matches —
+   * so this lets the benchmark contrast "fetch N, scan in JS" against "fetch the k that match".
+   */
+  lastCheckpointRowsRead = 0;
 
   private key(runId: string, seq: number): string {
     return `${runId}:${seq}`;
@@ -232,9 +239,33 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
-    return [...this.checkpoints.values()]
+    const rows = [...this.checkpoints.values()]
       .filter((cp) => cp.runId === runId)
       .sort((a, b) => a.seq - b.seq)
       .map((cp) => ({ ...cp }));
+    this.lastCheckpointRowsRead = rows.length;
+    return rows;
+  }
+
+  async getLatestCheckpointByName(
+    runId: string,
+    name: string,
+  ): Promise<StepCheckpoint | undefined> {
+    let latest: StepCheckpoint | undefined;
+    for (const cp of this.checkpoints.values()) {
+      if (cp.runId !== runId || cp.name !== name) continue;
+      if (!latest || cp.seq > latest.seq) latest = cp;
+    }
+    this.lastCheckpointRowsRead = latest ? 1 : 0;
+    return latest ? { ...latest } : undefined;
+  }
+
+  async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {
+    const rows = [...this.checkpoints.values()]
+      .filter((cp) => cp.runId === runId && prefixes.some((p) => cp.name.startsWith(p)))
+      .sort((a, b) => a.seq - b.seq)
+      .map((cp) => ({ ...cp }));
+    this.lastCheckpointRowsRead = rows.length;
+    return rows;
   }
 }

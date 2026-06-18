@@ -122,4 +122,26 @@ export class CodecStateStore implements StateStore {
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
     return (await this.inner.listCheckpoints(runId)).map((c) => this.decCp(c));
   }
+  async getLatestCheckpointByName(
+    runId: string,
+    name: string,
+  ): Promise<StepCheckpoint | undefined> {
+    // Forward the targeted read when the inner store implements it; otherwise fall back to the
+    // (always-present) listCheckpoints scan so wrapping a legacy custom store keeps working.
+    if (this.inner.getLatestCheckpointByName) {
+      const cp = await this.inner.getLatestCheckpointByName(runId, name);
+      return cp ? this.decCp(cp) : undefined;
+    }
+    let latest: StepCheckpoint | undefined;
+    for (const cp of await this.inner.listCheckpoints(runId)) if (cp.name === name) latest = cp;
+    return latest ? this.decCp(latest) : undefined;
+  }
+  async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {
+    const matches = this.inner.listCheckpointsByNamePrefix
+      ? await this.inner.listCheckpointsByNamePrefix(runId, prefixes)
+      : (await this.inner.listCheckpoints(runId)).filter((cp) =>
+          prefixes.some((p) => cp.name.startsWith(p)),
+        );
+    return matches.map((c) => this.decCp(c));
+  }
 }

@@ -301,6 +301,30 @@ export class MikroOrmStateStore implements StateStore {
     return rows.map(fromCheckpointEntity);
   }
 
+  async getLatestCheckpointByName(
+    runId: string,
+    name: string,
+  ): Promise<StepCheckpoint | undefined> {
+    const em = this.orm.em.fork();
+    const entity = await em.findOne(
+      StepCheckpointEntity,
+      { runId, name },
+      { orderBy: { seq: 'desc' } },
+    );
+    return entity ? fromCheckpointEntity(entity) : undefined;
+  }
+
+  async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {
+    if (prefixes.length === 0) return [];
+    const em = this.orm.em.fork();
+    const rows = await em.find(
+      StepCheckpointEntity,
+      { runId, $or: prefixes.map((p) => ({ name: { $like: `${p}%` } })) },
+      { orderBy: { seq: 'asc' } },
+    );
+    return rows.map(fromCheckpointEntity);
+  }
+
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
     const em = this.orm.em.fork();
     await em.upsert(SignalWaiterEntity, { ...waiter });

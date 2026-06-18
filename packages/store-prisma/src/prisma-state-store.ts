@@ -265,6 +265,26 @@ export class PrismaStateStore implements StateStore {
     return rows.map(fromCheckpointRow);
   }
 
+  async getLatestCheckpointByName(
+    runId: string,
+    name: string,
+  ): Promise<StepCheckpoint | undefined> {
+    const row = await this.db.durableStepCheckpoint.findFirst({
+      where: { runId, name },
+      orderBy: { seq: 'desc' },
+    });
+    return row ? fromCheckpointRow(row) : undefined;
+  }
+
+  async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {
+    if (prefixes.length === 0) return [];
+    const rows = await this.db.durableStepCheckpoint.findMany({
+      where: { runId, OR: prefixes.map((p) => ({ name: { startsWith: p } })) },
+      orderBy: { seq: 'asc' },
+    });
+    return rows.map(fromCheckpointRow);
+  }
+
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
     await this.db.durableSignalWaiter.upsert({
       where: { token: waiter.token },

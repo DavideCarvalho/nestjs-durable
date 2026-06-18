@@ -1195,7 +1195,15 @@ export class WorkflowEngine {
     for (const w of await this.store.listSignalWaiters('child:')) {
       if (w.runId === parentRunId) childIds.add(w.token.slice('child:'.length));
     }
-    for (const cp of await this.store.listCheckpoints(parentRunId)) {
+    // Targeted read: only the `signal:child:` / `spawn:` checkpoints, not the whole history. Falls
+    // back to a full listCheckpoints + in-JS prefix scan for a custom store that omits the method.
+    const prefixes = ['signal:child:', 'spawn:'];
+    const childCheckpoints = this.store.listCheckpointsByNamePrefix
+      ? await this.store.listCheckpointsByNamePrefix(parentRunId, prefixes)
+      : (await this.store.listCheckpoints(parentRunId)).filter((cp) =>
+          prefixes.some((p) => cp.name.startsWith(p)),
+        );
+    for (const cp of childCheckpoints) {
       if (cp.name.startsWith('signal:child:')) childIds.add(cp.name.slice('signal:child:'.length));
       if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') childIds.add(cp.output);
     }
@@ -1947,10 +1955,17 @@ export class WorkflowEngine {
    */
   async getEvent<TValue = unknown>(runId: string, key: string): Promise<TValue | undefined> {
     const name = `event:${key}`;
-    const checkpoints = await this.store.listCheckpoints(runId);
+    // Targeted read: the highest-seq checkpoint for this name is the most recent value (a re-published
+    // key overwrites at a higher seq), matching the old "last in seq order wins" scan. Falls back to a
+    // full listCheckpoints scan (last match in seq-ascending order wins) for a store that omits it.
+    if (this.store.getLatestCheckpointByName) {
+      const latest = await this.store.getLatestCheckpointByName(runId, name);
+      return latest?.output as TValue | undefined;
+    }
     // listCheckpoints is ordered by seq ascending, so the last match is the most recent value.
     let latest: TValue | undefined;
-    for (const cp of checkpoints) if (cp.name === name) latest = cp.output as TValue;
+    for (const cp of await this.store.listCheckpoints(runId))
+      if (cp.name === name) latest = cp.output as TValue;
     return latest;
   }
 
