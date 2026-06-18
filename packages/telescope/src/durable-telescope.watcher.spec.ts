@@ -49,4 +49,40 @@ describe('DurableTelescopeWatcher', () => {
     const failed = records.find((r) => (r.content as { event: string }).event === 'run.failed');
     expect(failed?.tags).toContain('failed');
   });
+
+  it('records durationMs from run.completed events', () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const records: RecordInput[] = [];
+
+    // Intercept the listener that the watcher registers so we can drive it with a synthetic event.
+    let capturedListener:
+      | ((
+          event: Parameters<typeof engine.subscribe>[0] extends (e: infer E) => unknown ? E : never,
+        ) => void)
+      | undefined;
+    const origSubscribe = engine.subscribe.bind(engine);
+    engine.subscribe = (listener) => {
+      capturedListener = listener as typeof capturedListener;
+      return origSubscribe(listener);
+    };
+
+    new DurableTelescopeWatcher().register(fakeCtx(engine, records));
+    expect(capturedListener).toBeDefined();
+
+    // Drive the listener with a synthetic run.completed that carries durationMs.
+    // (capturedListener is asserted defined above; ?. satisfies the linter.)
+    capturedListener?.({
+      type: 'run.completed',
+      runId: 'r1',
+      workflow: 'W',
+      durationMs: 1234,
+      at: new Date(),
+    });
+
+    const completed = records.find(
+      (r) => (r.content as { event: string }).event === 'run.completed',
+    );
+    expect(completed).toBeDefined();
+    expect((completed?.content as { durationMs?: number }).durationMs).toBe(1234);
+  });
 });

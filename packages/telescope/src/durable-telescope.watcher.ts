@@ -38,6 +38,7 @@ export class DurableTelescopeWatcher implements Watcher {
             kind: event.kind,
             output: event.output,
             error: event.error,
+            durationMs: event.durationMs,
           },
           tags: this.tags(event),
         });
