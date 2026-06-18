@@ -605,7 +605,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
 function runIdFromHash(): string | undefined {
   if (typeof window === 'undefined') return undefined;
   const match = window.location.hash.match(/^#\/run\/(.+)$/);
-  return match ? decodeURIComponent(match[1]) : undefined;
+  const id = match?.[1];
+  return id ? decodeURIComponent(id) : undefined;
 }
 
 export function App() {
