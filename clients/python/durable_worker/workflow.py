@@ -27,6 +27,8 @@ import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional
 
+from .cancellation import Cancelled
+
 
 class WorkflowError(Exception):
     """Base for workflow-runtime errors."""
@@ -70,6 +72,7 @@ class WorkflowContext:
         history: List[Dict[str, Any]],
         pending_signals: Optional[List[Dict[str, Any]]] = None,
         on_step: Optional[Callable[[Dict[str, Any]], None]] = None,
+        is_cancelled: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.run_id = run_id
         self._history: Dict[int, Dict[str, Any]] = {e["seq"]: e for e in history}
@@ -81,6 +84,9 @@ class WorkflowContext:
         # Optional sink that streams each local step's lifecycle (running → completed/failed) to the
         # engine AS IT HAPPENS, so a long inline turn's steps show up live instead of all at the end.
         self._on_step = on_step
+        # Cooperative cancellation source (the runner subscribes to the control channel and feeds it).
+        # The replay bails at the next op boundary when this reports the run cancelled — see `_next`.
+        self._is_cancelled = is_cancelled
 
     def _emit_step(self, event: Dict[str, Any]) -> None:
         """Best-effort: stream a step lifecycle event. A broken sink must never fail the workflow."""
@@ -92,7 +98,22 @@ class WorkflowContext:
             pass
 
     # -- internals -----------------------------------------------------------
+    def _raise_if_cancelled(self) -> None:
+        """Abort the turn at the next op boundary when the run has been cancelled (control-channel
+        broadcast → registry). Gives AUTOMATIC between-step cancellation: a workflow body stops
+        between ops with no ``if ctx.cancelled`` checks in user code. Mid-step cancellation (inside one
+        long ``ctx.step`` body) stays cooperative — check ``current_step().cancelled`` there."""
+        if (
+            self._is_cancelled is not None
+            and self.run_id is not None
+            and self._is_cancelled(self.run_id)
+        ):
+            raise Cancelled(self.run_id)
+
     def _next(self) -> int:
+        # Every durable op (step/call/sleep/wait_signal/start_child) takes its seq from here, so this is
+        # the single choke point where between-op cancellation is enforced for the whole workflow API.
+        self._raise_if_cancelled()
         seq = self._seq
         self._seq += 1
         return seq
@@ -142,7 +163,9 @@ class WorkflowContext:
         self._emit_step(
             {"runId": self.run_id, "seq": seq, "name": name, "phase": "running", "startedAt": started_ms}
         )
-        step_ctx = StepContext(run_id=self.run_id, seq=seq)
+        step_ctx = StepContext(
+            run_id=self.run_id, seq=seq, is_cancelled=self._is_cancelled
+        )
         token = _current_step.set(step_ctx)
         try:
             result = body()
@@ -307,9 +330,12 @@ class WorkflowWorker:
         self,
         task: Dict[str, Any],
         on_step: Optional[Callable[[Dict[str, Any]], None]] = None,
+        is_cancelled: Optional[Callable[[str], bool]] = None,
     ) -> Dict[str, Any]:
         """Replay one turn of ``task``'s workflow and return the wire-format decision. ``on_step``, when
-        given, streams each local step's lifecycle (running → completed/failed) to the engine live."""
+        given, streams each local step's lifecycle (running → completed/failed) to the engine live.
+        ``is_cancelled`` lets the replay bail at an op boundary when the run was cancelled (returns a
+        ``cancelled`` decision) and feeds ``ctx.cancelled`` for cooperative mid-step checks."""
         base = {"taskId": task.get("taskId"), "runId": task.get("runId")}
         fn = self._workflows.get(task.get("workflow"))
         if fn is None:
@@ -327,12 +353,18 @@ class WorkflowWorker:
             task.get("history", []),
             task.get("pendingSignals"),
             on_step=on_step,
+            is_cancelled=is_cancelled,
         )
         try:
             output = _invoke_workflow(fn, ctx, task.get("input"))
             return {**base, "status": "completed", "commands": ctx.commands, "output": output}
         except _Suspend:
             return {**base, "status": "continue", "commands": ctx.commands}
+        except Cancelled:
+            # Cancelled at an op boundary (run cancelled mid-turn). Bail without clobbering: the engine
+            # already set status=cancelled. Return the steps that DID run this turn so it can record
+            # partial progress / where the run stopped.
+            return {**base, "status": "cancelled", "commands": ctx.commands}
         except StepFailed as err:
             return {**base, "status": "failed", "commands": ctx.commands, "error": err.error}
         except Exception as err:  # noqa: BLE001

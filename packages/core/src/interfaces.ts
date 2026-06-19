@@ -474,8 +474,9 @@ export type WorkflowCommand =
 export interface WorkflowDecision {
   taskId: string;
   runId: string;
-  /** `continue` = produced `commands` and is blocked on an await; otherwise the run settles. */
-  status: 'continue' | 'completed' | 'failed';
+  /** `continue` = produced `commands` and is blocked on an await; otherwise the run settles.
+   *  `cancelled` = the worker bailed at an op boundary because the run was cancelled mid-turn. */
+  status: 'continue' | 'completed' | 'failed' | 'cancelled';
   /** New durable ops the replay produced this turn (status === 'continue'), ordered by seq. */
   commands: WorkflowCommand[];
   /** Final workflow output (status === 'completed'). */

@@ -321,6 +321,48 @@ describe('WorkflowEngine — remote (polyglot) workflows', () => {
     expect(cps.find((c) => c.seq === 1)?.error?.message).toBe('boom');
   });
 
+  it('leaves a cancelled remote-workflow turn cancelled — records partial steps, no clobber to failed/suspended', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
+    // The run is cancelled WHILE this turn replays (control broadcast → the worker bails at the next op
+    // boundary). We simulate that by cancelling inside `advance` — `cancel` sets status=cancelled — then
+    // returning a `cancelled` decision WITH the recordStep for the step that ran before the cancel.
+    engine.registerRemote('cancellable', '1', {
+      group: 'py-workflows',
+      executor: {
+        async advance(run: WorkflowRun): Promise<WorkflowDecision> {
+          await engine.cancel(run.id);
+          return {
+            taskId: 't',
+            runId: run.id,
+            status: 'cancelled',
+            commands: [{ kind: 'recordStep', seq: 0, name: 'handle_a', output: { a: 1 } }],
+          };
+        },
+      },
+    });
+
+    await startRun(engine, 'cancellable', {}, 'cancel1');
+    // `waitForRun` resolves on `cancel`'s lifecycle emit, which fires mid-turn (inside `advance`) —
+    // before the turn's result is applied. Wait for the turn to finish applying (the partial step
+    // lands, then the status is reasserted) before asserting, so this also catches the regression
+    // where the `cancelled` decision falls through and clobbers the run to `suspended`.
+    let cps = await store.listCheckpoints('cancel1');
+    for (let i = 0; i < 100 && !cps.find((c) => c.seq === 0); i += 1) {
+      await new Promise((r) => setImmediate(r));
+      cps = await store.listCheckpoints('cancel1');
+    }
+    for (let i = 0; i < 5; i += 1) await new Promise((r) => setImmediate(r)); // let the status write settle
+
+    const run = await store.getRun('cancel1');
+    expect(run?.status).toBe('cancelled'); // NOT clobbered to failed, NOT resurrected to suspended
+
+    // the step that ran before the cancel is still recorded (partial progress preserved)
+    cps = await store.listCheckpoints('cancel1');
+    expect(cps.find((c) => c.seq === 0)?.name).toBe('handle_a');
+    expect(cps.find((c) => c.seq === 0)?.status).toBe('completed');
+  });
+
   it('suspends a remote workflow on ctx.wait_signal and resumes it when the signal arrives', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });

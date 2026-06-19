@@ -1,6 +1,11 @@
 import unittest
 
-from durable_worker import CancellationRegistry, Cancelled, Worker
+from durable_worker import (
+    CancellationRegistry,
+    Worker,
+    WorkflowWorker,
+    current_step,
+)
 
 
 def task(name="long.job", **over):
@@ -62,6 +67,68 @@ class StepContextCancellationTest(unittest.TestCase):
 
         result = worker.process_task(task())
         self.assertEqual(result["output"], False)
+
+
+class WorkflowCancellationTest(unittest.TestCase):
+    """The workflow replay path (ctx.step/ctx.call) honours cancellation: auto-abort at op
+    boundaries (no `if` in user code) + cooperative `current_step().cancelled` inside a step."""
+
+    @staticmethod
+    def _task(**over):
+        base = {"taskId": "t1", "runId": "r1", "workflow": "wf", "history": [], "input": {}}
+        base.update(over)
+        return base
+
+    def test_auto_raises_at_the_next_op_boundary_when_cancelled(self):
+        reg = CancellationRegistry()
+        wf = WorkflowWorker(auto_register=False)
+        ran = []
+
+        @wf.workflow("wf")
+        def body(ctx, _input):
+            ctx.step("a", lambda: ran.append("a"))
+            reg.cancel("r1")  # cancel fires mid-turn, after step a
+            ctx.step("b", lambda: ran.append("b"))  # boundary → aborts, b never runs
+            return "done"
+
+        decision = wf.process_task(self._task(), is_cancelled=reg.is_cancelled)
+
+        self.assertEqual(decision["status"], "cancelled")
+        self.assertEqual(ran, ["a"])  # step b never executed
+        # the step that DID run this turn is recorded (partial progress preserved)
+        self.assertTrue(any(c.get("name") == "a" for c in decision["commands"]))
+        self.assertFalse(any(c.get("name") == "b" for c in decision["commands"]))
+
+    def test_cooperative_ctx_cancelled_inside_a_step(self):
+        reg = CancellationRegistry()
+        wf = WorkflowWorker(auto_register=False)
+        seen = {}
+
+        @wf.workflow("wf")
+        def body(ctx, _input):
+            def step_body():
+                seen["before"] = current_step().cancelled
+                reg.cancel("r1")
+                seen["after"] = current_step().cancelled
+
+            ctx.step("a", step_body)
+            return "ok"
+
+        wf.process_task(self._task(), is_cancelled=reg.is_cancelled)
+        self.assertEqual(seen, {"before": False, "after": True})
+
+    def test_runs_to_completion_without_a_cancel_source(self):
+        wf = WorkflowWorker(auto_register=False)
+
+        @wf.workflow("wf")
+        def body(ctx, _input):
+            ctx.step("a", lambda: 1)
+            ctx.step("b", lambda: 2)
+            return "done"
+
+        decision = wf.process_task(self._task())
+        self.assertEqual(decision["status"], "completed")
+        self.assertEqual(decision["output"], "done")
 
 
 if __name__ == "__main__":

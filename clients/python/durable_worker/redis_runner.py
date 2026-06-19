@@ -114,12 +114,17 @@ async def run_redis_workflow_worker(
     group: str,
     connection: str = "redis://localhost:6379",
     prefix: str = "durable",
+    cancellation: Optional[CancellationRegistry] = None,
 ) -> Any:
     """Start a BullMQ worker that REPLAYS workflow tasks. Consumes the group's task queue (each job is
     a WorkflowTask) and publishes the resulting WorkflowDecision on ``<prefix>-decisions`` — the queues
     the engine's remote workflow executor dispatches over. Returns the bullmq Worker (``await
     worker.close()`` to stop). Replay is sync + pure, so this is a thin transport shell over
-    ``workflow_worker.process_task``."""
+    ``workflow_worker.process_task``.
+
+    Subscribes to the control channel and feeds a :class:`CancellationRegistry` (created if none is
+    given), so a cancelled run's replay bails at the next op boundary — automatic between-step
+    cancellation — and handlers see ``ctx.cancelled`` for cooperative mid-step aborts."""
     from bullmq import Queue as BullQueue
     from bullmq import Worker as BullWorker
 
@@ -129,6 +134,8 @@ async def run_redis_workflow_worker(
     decisions = BullQueue(f"{prefix}-decisions", {"connection": connection})
     step_events = BullQueue(f"{prefix}-step-events", {"connection": connection})
     publish_step = _step_event_publisher(step_events)
+    registry = cancellation or CancellationRegistry()
+    await _subscribe_control(connection, prefix, registry)
 
     async def process(job: Any, _token: str) -> None:
         # Replay OFF the event loop. `process_task` is fully synchronous and a real workflow turn can
@@ -138,7 +145,7 @@ async def run_redis_workflow_worker(
         # REDELIVER it (the workflow runs twice). `to_thread` keeps the loop free for both — and for
         # streaming each step's lifecycle (`publish_step`) so steps show up live, not all at turn-end.
         decision = await asyncio.to_thread(
-            workflow_worker.process_task, job.data, publish_step
+            workflow_worker.process_task, job.data, publish_step, registry.is_cancelled
         )
         await decisions.add(
             "decision", decision, {"removeOnComplete": True, "removeOnFail": True}
@@ -281,15 +288,24 @@ async def _subscribe_control(
     connection: str, prefix: str, registry: CancellationRegistry
 ) -> None:
     """Best-effort: subscribe to the control channel and feed cancellations into ``registry``.
-    No-op (logged) if redis pub/sub isn't available — cancellation just won't be observed."""
+    No-op (logged) if redis pub/sub isn't available OR the connection/subscribe fails — cancellation
+    just won't be observed; it must never block the worker from starting."""
     try:
         import redis.asyncio as aioredis  # lazy: only needed for cooperative cancellation
     except ImportError:
         return
 
-    client = aioredis.from_url(connection)
-    pubsub = client.pubsub()
-    await pubsub.subscribe(_control_channel(prefix))
+    try:
+        client = aioredis.from_url(connection)
+        pubsub = client.pubsub()
+        await pubsub.subscribe(_control_channel(prefix))
+    except Exception as exc:  # noqa: BLE001 — best-effort: a control-channel failure must not break startup
+        print(
+            f"durable-worker: control-channel subscribe failed ({exc!r}); "
+            "cooperative cancellation won't be observed",
+            flush=True,
+        )
+        return
 
     async def listen() -> None:
         async for message in pubsub.listen():

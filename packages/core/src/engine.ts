@@ -1570,6 +1570,17 @@ export class WorkflowEngine {
       return { runId: run.id, status: 'failed', error };
     }
 
+    if (decision.status === 'cancelled') {
+      // The worker bailed at an op boundary because the run was cancelled mid-turn — `cancel` already
+      // set status=cancelled, cascaded to children and emitted the lifecycle event. Persist the steps
+      // that DID run this turn (partial progress / where it stopped) and reassert `cancelled`
+      // (idempotent with `cancel`'s write; preserves the existing error). The point is to NOT resurrect
+      // the run to `suspended` or flip it to `failed` — both of which a normal turn result would do.
+      await this.applyCommands(run, decision.commands);
+      await this.store.updateRun(run.id, { status: 'cancelled', updatedAt: new Date() });
+      return { runId: run.id, status: 'cancelled' };
+    }
+
     // continue: persist any local steps the replay ran, dispatch the blocking ops, then suspend. When
     // those resolve (a result lands, a timer fires) `resume` brings us back for the next turn.
     const wakeAt = await this.applyCommands(run, decision.commands);
