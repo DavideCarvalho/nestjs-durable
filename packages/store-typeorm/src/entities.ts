@@ -80,6 +80,7 @@ export class WorkflowRunEntity {
   recoveryAttempts?: number;
   tags?: string[] | null;
   searchAttributes?: Record<string, string | number | boolean> | null;
+  priority?: number | null;
   createdAt!: Date;
   updatedAt!: Date;
 }
@@ -185,6 +186,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
         name: col('searchAttributes'),
         transformer: jsonColumnTransformer('runs.searchAttributes'),
       },
+      priority: { type: 'integer', nullable: true, name: col('priority') },
       createdAt: { type: Date, name: col('createdAt') },
       updatedAt: { type: Date, name: col('updatedAt') },
     },

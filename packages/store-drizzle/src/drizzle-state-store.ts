@@ -335,6 +335,7 @@ function toRunRow(run: WorkflowRun): RunRow {
     recoveryAttempts: run.recoveryAttempts ?? null,
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
+    priority: run.priority ?? null,
     createdAt: run.createdAt.getTime(),
     updatedAt: run.updatedAt.getTime(),
   };
@@ -348,6 +349,7 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if (patch.wakeAt !== undefined) row.wakeAt = patch.wakeAt ?? null;
   if (patch.recoveryAttempts !== undefined) row.recoveryAttempts = patch.recoveryAttempts ?? null;
   if ('searchAttributes' in patch) row.searchAttributes = patch.searchAttributes ?? null;
+  if (patch.priority !== undefined) row.priority = patch.priority ?? null;
   if (patch.updatedAt !== undefined) row.updatedAt = patch.updatedAt.getTime();
   return row;
 }
@@ -367,6 +369,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     recoveryAttempts: row.recoveryAttempts ?? undefined,
     tags: row.tags ?? undefined,
     searchAttributes: row.searchAttributes ?? undefined,
+    priority: row.priority ?? undefined,
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };

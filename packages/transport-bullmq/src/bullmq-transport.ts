@@ -24,6 +24,26 @@ import { Redis, type RedisOptions } from 'ioredis';
 const WORKER_HEARTBEAT_INTERVAL_MS = 10_000;
 const WORKER_HEARTBEAT_TTL_SECONDS = 35;
 
+// BullMQ priority is the INVERSE of the durable engine's: BullMQ runs the LOWEST number first
+// (1..2_097_151), while the engine's admission `priority` is "higher wins". We translate so one
+// convention ("higher = more urgent") holds end-to-end. `BASELINE - p` keeps relative order (a
+// higher `p` yields a lower — more urgent — BullMQ number), clamped into BullMQ's valid range.
+// Centred on the range midpoint so callers have headroom both above and below the default.
+const BROKER_PRIORITY_MAX = 2_097_151;
+const BROKER_PRIORITY_BASELINE = 1_048_576;
+
+/**
+ * Map the engine's per-call `priority` (higher = more urgent, default/absent = unprioritised) onto a
+ * BullMQ job `priority` (lower = more urgent). Returns `undefined` for an absent priority so the
+ * default FIFO path is untouched. Note BullMQ treats jobs WITHOUT a priority as highest, so to make
+ * priority meaningful on a queue, set it on the jobs you want ordered relative to one another.
+ */
+export function toBrokerPriority(priority?: number): number | undefined {
+  if (priority == null) return undefined;
+  const mapped = Math.round(BROKER_PRIORITY_BASELINE - priority);
+  return Math.min(BROKER_PRIORITY_MAX, Math.max(1, mapped));
+}
+
 export interface BullMQTransportOptions {
   /** ioredis connection options (or an IORedis instance). */
   connection: ConnectionOptions;
@@ -94,17 +114,33 @@ export class BullMQTransport implements Transport, ControlPlane {
   private queue(name: string): Queue {
     let queue = this.queues.get(name);
     if (!queue) {
-      queue = new Queue(name, { connection: this.connection });
+      queue = this.createQueue(name);
       this.queues.set(name, queue);
     }
     return queue;
   }
 
-  async dispatch(task: RemoteTask): Promise<void> {
-    await this.queue(this.tasksName(task.group)).add('task', task, {
+  /** Construct the BullMQ queue for `name`. Overridable seam so tests can capture `.add()` calls. */
+  protected createQueue(name: string): Queue {
+    return new Queue(name, { connection: this.connection });
+  }
+
+  /** Job options shared by step/workflow dispatch — adds a translated `priority` only when set. */
+  private jobOptions(priority?: number): {
+    removeOnComplete: true;
+    removeOnFail: true;
+    priority?: number;
+  } {
+    const brokerPriority = toBrokerPriority(priority);
+    return {
       removeOnComplete: true,
       removeOnFail: true,
-    });
+      ...(brokerPriority != null ? { priority: brokerPriority } : {}),
+    };
+  }
+
+  async dispatch(task: RemoteTask): Promise<void> {
+    await this.queue(this.tasksName(task.group)).add('task', task, this.jobOptions(task.priority));
   }
 
   private decisionsName(): string {
@@ -114,10 +150,11 @@ export class BullMQTransport implements Transport, ControlPlane {
   /** engine → workflow worker: a WorkflowTask on the group's task queue (same queue a Python workflow
    *  worker consumes via `<prefix>-tasks-<group>`). The decision comes back on `<prefix>-decisions`. */
   async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
-    await this.queue(this.tasksName(task.group)).add('workflow', task, {
-      removeOnComplete: true,
-      removeOnFail: true,
-    });
+    await this.queue(this.tasksName(task.group)).add(
+      'workflow',
+      task,
+      this.jobOptions(task.priority),
+    );
   }
 
   /** workflow worker → engine: consume replayed decisions. Starts the consumer on first call. */

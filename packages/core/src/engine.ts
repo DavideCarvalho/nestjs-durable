@@ -70,6 +70,11 @@ export interface StartOptions {
   tags?: string[] | undefined;
   /** Typed, queryable run data stamped on the run (e.g. `{ amount: 200, tier: 'pro' }`). */
   searchAttributes?: SearchAttributes | undefined;
+  /**
+   * Dispatch priority for a remote run — stamped on the run and carried onto every {@link WorkflowTask}
+   * the engine dispatches to advance it. Higher wins; absent = unprioritised. See {@link WorkflowRun.priority}.
+   */
+  priority?: number | undefined;
 }
 
 /**
@@ -685,6 +690,7 @@ export class WorkflowEngine {
       input,
       tags,
       searchAttributes: opts?.searchAttributes,
+      priority: opts?.priority,
       createdAt: now,
       updatedAt: now,
     };
@@ -1935,8 +1941,10 @@ export class WorkflowEngine {
       callRemote: (runId, seq, step, input, queue, transport, admission) =>
         this.callRemote(runId, seq, step, input, queue, transport, replay, admission),
       // Defer so a fast child can't reentrantly resume a still-running parent.
-      startChild: (workflow, input, id) => {
-        queueMicrotask(() => void this.start(workflow, input, id).catch(() => undefined));
+      startChild: (workflow, input, id, priority) => {
+        queueMicrotask(
+          () => void this.start(workflow, input, id, { priority }).catch(() => undefined),
+        );
       },
       signalEntity: (name, key, op, arg, reply) => {
         queueMicrotask(
@@ -2104,6 +2112,7 @@ export class WorkflowEngine {
         input: validInput,
         traceparent: this.traceparent?.(),
         context: this.context?.(),
+        priority: admission?.priority,
         attempt,
       },
       transport,
