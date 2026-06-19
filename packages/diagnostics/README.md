@@ -25,7 +25,27 @@ import { DurableDiagnosticsModule } from '@dudousxd/nestjs-durable-diagnostics';
 export class AppModule {}
 ```
 
-React anywhere with the diagnostics decorator:
+React anywhere by subscribing to the channel — needs nothing beyond diagnostics:
+
+```ts
+import { Injectable, type OnModuleInit } from '@nestjs/common';
+import { getChannel, type DiagnosticEvent } from '@dudousxd/nestjs-diagnostics';
+import type { EngineEvent } from '@dudousxd/nestjs-durable-core';
+
+@Injectable()
+export class WorkflowAlerts implements OnModuleInit {
+  onModuleInit() {
+    getChannel('durable', 'run.failed').subscribe((msg) => {
+      const event = (msg as DiagnosticEvent).payload as EngineEvent;
+      // page on repeated failures, write an audit row, ...
+    });
+  }
+}
+```
+
+Or, with a diagnostics version that ships the `/nestjs` subpath (the `@OnDiagnostic`
+decorator), the same reaction is one annotation — the typed `ChannelRegistry` augmentation
+this package contributes infers the `EngineEvent` payload for you:
 
 ```ts
 import { Injectable } from '@nestjs/common';
