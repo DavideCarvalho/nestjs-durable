@@ -171,6 +171,12 @@ interface PendingRemote {
   reject: (error: Error) => void;
 }
 
+/** A terminal/suspended transition handed to {@link WorkflowEngine.settleRun}. */
+type RunOutcome =
+  | { kind: 'completed'; output: unknown }
+  | { kind: 'failed'; error: StepError }
+  | { kind: 'suspended'; wakeAt?: number | undefined };
+
 export interface WorkflowEngineDeps {
   store: StateStore;
   /** A single task transport. Shorthand for a one-entry `transports` pool (id `default`). */
@@ -1508,6 +1514,48 @@ export class WorkflowEngine {
    * {@link runExecution}'s settle/suspend; the lease is held by {@link execute}. The result that lands
    * us back here (a remote step finished, a timer fired) goes through `resume` like any TS workflow.
    */
+  /**
+   * Apply a terminal/suspended transition once: persist the new run status, emit the matching
+   * lifecycle event, and (on completion/failure) wake a waiting parent. Both the TS and remote
+   * executors funnel their completed/failed/suspended outcomes through here so a status update can
+   * never drift from its event or `notifyParent` call. Does NOT touch the run lock — each executor
+   * keeps its own lease handling (the TS executor's `finally`, the remote path's caller).
+   */
+  private async settleRun(run: WorkflowRun, outcome: RunOutcome): Promise<RunResult> {
+    const updatedAt = new Date();
+    if (outcome.kind === 'completed') {
+      // Clear any error from an earlier failed-then-retried attempt — a completed run is a success.
+      await this.store.updateRun(run.id, {
+        status: 'completed',
+        output: outcome.output,
+        error: undefined,
+        updatedAt,
+      });
+      this.emit({
+        type: 'run.completed',
+        runId: run.id,
+        workflow: run.workflow,
+        output: outcome.output,
+      });
+      void this.notifyParent(run.id, { ok: true, value: outcome.output });
+      return { runId: run.id, status: 'completed', output: outcome.output };
+    }
+    if (outcome.kind === 'failed') {
+      await this.store.updateRun(run.id, { status: 'failed', error: outcome.error, updatedAt });
+      this.emit({
+        type: 'run.failed',
+        runId: run.id,
+        workflow: run.workflow,
+        error: outcome.error,
+      });
+      void this.notifyParent(run.id, { ok: false, error: outcome.error.message });
+      return { runId: run.id, status: 'failed', error: outcome.error };
+    }
+    await this.store.updateRun(run.id, { status: 'suspended', wakeAt: outcome.wakeAt, updatedAt });
+    this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
+    return { runId: run.id, status: 'suspended' };
+  }
+
   private async runRemoteExecution(
     run: WorkflowRun,
     registered: RegisteredWorkflow,
@@ -1548,38 +1596,22 @@ export class WorkflowEngine {
       // Only this turn's NEW steps are present (prior turns' steps replay as `found`, emitting no
       // command), so there's no duplication.
       await this.applyCommands(run, decision.commands);
-      await this.store.updateRun(run.id, {
-        status: 'completed',
-        output: decision.output,
-        error: undefined,
-        updatedAt: new Date(),
-      });
-      this.emit({
-        type: 'run.completed',
-        runId: run.id,
-        workflow: run.workflow,
-        output: decision.output,
-      });
-      void this.notifyParent(run.id, { ok: true, value: decision.output });
-      return { runId: run.id, status: 'completed', output: decision.output };
+      return this.settleRun(run, { kind: 'completed', output: decision.output });
     }
     if (decision.status === 'failed') {
       // Same as completed: persist the steps this turn ran — including the failed one (the worker
       // records a failed-step command before raising) — so the dashboard shows WHERE it failed.
       await this.applyCommands(run, decision.commands);
-      const error = decision.error ?? { message: 'workflow failed' };
-      await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
-      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
-      void this.notifyParent(run.id, { ok: false, error: error.message });
-      return { runId: run.id, status: 'failed', error };
+      return this.settleRun(run, {
+        kind: 'failed',
+        error: decision.error ?? { message: 'workflow failed' },
+      });
     }
 
     // continue: persist any local steps the replay ran, dispatch the blocking ops, then suspend. When
     // those resolve (a result lands, a timer fires) `resume` brings us back for the next turn.
     const wakeAt = await this.applyCommands(run, decision.commands);
-    await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
-    this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
-    return { runId: run.id, status: 'suspended' };
+    return this.settleRun(run, { kind: 'suspended', wakeAt });
   }
 
   /** The run's resolved durable ops as replay inputs: completed/failed steps + elapsed timers. */
@@ -1803,18 +1835,7 @@ export class WorkflowEngine {
     const ctx = createWorkflowCtx(this.ctxHostFor(replay), run.id, compensations, run.workflow);
     try {
       const output = await fn(ctx, run.input);
-      // Clear any error from an earlier failed-then-retried attempt: a completed run is a success
-      // and must not carry a stale error (otherwise dashboards show a green run with a red error).
-      await this.store.updateRun(run.id, {
-        status: 'completed',
-        output,
-        error: undefined,
-        updatedAt: new Date(),
-      });
-      this.emit({ type: 'run.completed', runId: run.id, workflow: run.workflow, output });
-      // Wake a parent waiting on this run as a child (no-op when there's no parent).
-      void this.notifyParent(run.id, { ok: true, value: output });
-      return { runId: run.id, status: 'completed', output };
+      return this.settleRun(run, { kind: 'completed', output });
     } catch (err) {
       if (err instanceof ContinueAsNew) {
         // Hand off to a fresh execution with a clean history: complete this run, then start the next
@@ -1848,13 +1869,7 @@ export class WorkflowEngine {
           this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
           return { runId: run.id, status: 'cancelled', error };
         }
-        await this.store.updateRun(run.id, {
-          status: 'suspended',
-          wakeAt: err.wakeAt,
-          updatedAt: new Date(),
-        });
-        this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
-        return { runId: run.id, status: 'suspended' };
+        return this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
       }
       const error = {
         message: err instanceof Error ? err.message : String(err),
@@ -1869,10 +1884,7 @@ export class WorkflowEngine {
         if (!comp) continue;
         await this.runCompensation(run, comp);
       }
-      await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
-      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
-      void this.notifyParent(run.id, { ok: false, error: error.message });
-      return { runId: run.id, status: 'failed', error };
+      return this.settleRun(run, { kind: 'failed', error });
     } finally {
       // Release the recovery lease once the run reaches a terminal/suspended state, so the
       // next instance (or the timer poller) can pick it up promptly.
