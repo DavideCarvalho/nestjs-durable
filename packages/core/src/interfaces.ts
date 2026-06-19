@@ -212,6 +212,15 @@ export interface StateStore {
   updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void>;
   getRun(runId: string): Promise<WorkflowRun | null>;
 
+  /**
+   * Hard-delete a run and all of its rows — the run plus its checkpoints, signal waiters, and
+   * normalized search-attribute rows. Unlike a cancelled run (which stays as terminal history), a
+   * deleted run is GONE: it no longer appears in {@link getRun} or {@link listRuns}. This removes
+   * exactly the one run — the engine's {@link WorkflowEngine.deleteRun} handles the child cascade.
+   * No-op if the run doesn't exist. (Token-keyed buffered signals are transient and left alone.)
+   */
+  deleteRun(runId: string): Promise<void>;
+
   getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null>;
   /**
    * Persist a checkpoint and advance the run atomically. Durable semantics depend on this

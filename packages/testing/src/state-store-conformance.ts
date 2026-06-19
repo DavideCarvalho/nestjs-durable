@@ -165,6 +165,29 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(dead?.recoveryAttempts).toBe(4);
     });
 
+    t('deleteRun removes the run and all its rows (checkpoints, waiters, attributes)', async () => {
+      await store.createRun(run({ searchAttributes: { tier: 'pro' } }));
+      await store.saveCheckpoint(checkpoint());
+      await store.putSignalWaiter({ token: 'approve-r1', runId: 'r1', seq: 0 });
+
+      await store.deleteRun('r1');
+
+      // The run and every child row are gone — not merely marked terminal.
+      expect(await store.getRun('r1')).toBeNull();
+      expect(await store.listCheckpoints('r1')).toEqual([]);
+      expect(await store.listSignalWaiters('approve-')).toEqual([]);
+      // The normalized attribute side-table no longer matches it.
+      expect(
+        await store.listRuns({
+          attributes: [{ key: 'tier', op: 'eq', value: 'pro' }],
+        }),
+      ).toEqual([]);
+    });
+
+    t('deleteRun is a no-op for a missing run', async () => {
+      await expect(store.deleteRun('nope')).resolves.toBeUndefined();
+    });
+
     t(
       'updateRun maps every patchable field — clears error and patches tags/lockedBy/input/timers',
       async () => {

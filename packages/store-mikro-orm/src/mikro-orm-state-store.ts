@@ -96,6 +96,16 @@ export class MikroOrmStateStore implements StateStore {
     return entity ? fromRunEntity(entity) : null;
   }
 
+  async deleteRun(runId: string): Promise<void> {
+    const em = this.orm.em.fork();
+    // Children first, then the run row — checkpoints, signal waiters, and the normalized
+    // attribute side-table, so nothing dangles after the run is gone.
+    await em.nativeDelete(StepCheckpointEntity, { runId });
+    await em.nativeDelete(SignalWaiterEntity, { runId });
+    await em.nativeDelete(RunAttributeEntity, { runId });
+    await em.nativeDelete(WorkflowRunEntity, { id: runId });
+  }
+
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
     const em = this.orm.em.fork();
     const entity = await em.findOne(StepCheckpointEntity, { runId, seq });
