@@ -1,5 +1,5 @@
 import { backoffDelay } from './backoff';
-import { instantCheckpoint } from './checkpoints';
+import { instantCheckpoint, stepCheckpoint } from './checkpoints';
 import { type Completion } from './completion';
 import { parseDuration } from './duration';
 import { Entities, type EntityConfig } from './entities';
@@ -1248,21 +1248,21 @@ export class WorkflowEngine {
    */
   private async persistStepEvent(event: WorkflowStepEvent): Promise<void> {
     const startedAt = new Date(event.startedAt);
-    const events = event.events && event.events.length > 0 ? event.events : undefined;
     if (event.phase === 'running') {
-      await this.store.saveCheckpoint({
-        runId: event.runId,
-        seq: event.seq,
-        name: event.name,
-        kind: 'local',
-        stepId: stepId(event.runId, event.seq),
-        status: 'running',
-        events,
-        attempts: 1,
-        enqueuedAt: startedAt,
-        startedAt,
-        finishedAt: startedAt, // placeholder until the step settles
-      });
+      await this.store.saveCheckpoint(
+        stepCheckpoint({
+          runId: event.runId,
+          seq: event.seq,
+          name: event.name,
+          kind: 'local',
+          status: 'running',
+          events: event.events,
+          attempts: 1,
+          enqueuedAt: startedAt,
+          startedAt,
+          finishedAt: startedAt, // placeholder until the step settles
+        }),
+      );
       this.emit({
         type: 'step.started',
         runId: event.runId,
@@ -1273,21 +1273,22 @@ export class WorkflowEngine {
       return;
     }
     const failed = event.phase === 'failed';
-    await this.store.saveCheckpoint({
-      runId: event.runId,
-      seq: event.seq,
-      name: event.name,
-      kind: 'local',
-      stepId: stepId(event.runId, event.seq),
-      status: failed ? 'failed' : 'completed',
-      output: failed ? undefined : event.output,
-      error: failed ? event.error : undefined,
-      events,
-      attempts: 1,
-      enqueuedAt: startedAt,
-      startedAt,
-      finishedAt: event.finishedAt != null ? new Date(event.finishedAt) : new Date(),
-    });
+    await this.store.saveCheckpoint(
+      stepCheckpoint({
+        runId: event.runId,
+        seq: event.seq,
+        name: event.name,
+        kind: 'local',
+        status: failed ? 'failed' : 'completed',
+        output: failed ? undefined : event.output,
+        error: failed ? event.error : undefined,
+        events: event.events,
+        attempts: 1,
+        enqueuedAt: startedAt,
+        startedAt,
+        finishedAt: event.finishedAt != null ? new Date(event.finishedAt) : new Date(),
+      }),
+    );
     this.emit({
       type: failed ? 'step.failed' : 'step.completed',
       runId: event.runId,
@@ -1308,21 +1309,22 @@ export class WorkflowEngine {
    */
   private async startStep(step: StepRecord): Promise<void> {
     if (this.trackStepStart) {
-      await this.store.saveCheckpoint({
-        runId: step.runId,
-        seq: step.seq,
-        name: step.name,
-        kind: step.kind,
-        stepId: stepId(step.runId, step.seq),
-        status: 'running',
-        input: step.input,
-        events: step.events && step.events.length > 0 ? step.events : undefined,
-        attempts: step.attempts,
-        workerGroup: step.workerGroup,
-        enqueuedAt: step.enqueuedAt,
-        startedAt: step.startedAt,
-        finishedAt: step.startedAt, // placeholder until the body settles
-      });
+      await this.store.saveCheckpoint(
+        stepCheckpoint({
+          runId: step.runId,
+          seq: step.seq,
+          name: step.name,
+          kind: step.kind,
+          status: 'running',
+          input: step.input,
+          events: step.events,
+          attempts: step.attempts,
+          workerGroup: step.workerGroup,
+          enqueuedAt: step.enqueuedAt,
+          startedAt: step.startedAt,
+          finishedAt: step.startedAt, // placeholder until the body settles
+        }),
+      );
     }
     this.emit({
       type: 'step.started',
@@ -1335,22 +1337,23 @@ export class WorkflowEngine {
 
   /** Checkpoint a finished step and announce it — the two things that must always happen together. */
   private async completeStep(step: StepRecord & { output: unknown }): Promise<void> {
-    await this.store.saveCheckpoint({
-      runId: step.runId,
-      seq: step.seq,
-      name: step.name,
-      kind: step.kind,
-      stepId: stepId(step.runId, step.seq),
-      status: 'completed',
-      input: step.input,
-      output: step.output,
-      events: step.events && step.events.length > 0 ? step.events : undefined,
-      attempts: step.attempts,
-      workerGroup: step.workerGroup,
-      enqueuedAt: step.enqueuedAt,
-      startedAt: step.startedAt,
-      finishedAt: new Date(),
-    });
+    await this.store.saveCheckpoint(
+      stepCheckpoint({
+        runId: step.runId,
+        seq: step.seq,
+        name: step.name,
+        kind: step.kind,
+        status: 'completed',
+        input: step.input,
+        output: step.output,
+        events: step.events,
+        attempts: step.attempts,
+        workerGroup: step.workerGroup,
+        enqueuedAt: step.enqueuedAt,
+        startedAt: step.startedAt,
+        finishedAt: new Date(),
+      }),
+    );
     this.emit({
       type: 'step.completed',
       runId: step.runId,
@@ -1365,22 +1368,23 @@ export class WorkflowEngine {
 
   /** Checkpoint a step that failed terminally, so the failure point is visible (not just the run). */
   private async failStep(step: StepRecord & { error: StepError }): Promise<void> {
-    await this.store.saveCheckpoint({
-      runId: step.runId,
-      seq: step.seq,
-      name: step.name,
-      kind: step.kind,
-      stepId: stepId(step.runId, step.seq),
-      status: 'failed',
-      input: step.input,
-      error: step.error,
-      events: step.events && step.events.length > 0 ? step.events : undefined,
-      attempts: step.attempts,
-      workerGroup: step.workerGroup,
-      enqueuedAt: step.enqueuedAt,
-      startedAt: step.startedAt,
-      finishedAt: new Date(),
-    });
+    await this.store.saveCheckpoint(
+      stepCheckpoint({
+        runId: step.runId,
+        seq: step.seq,
+        name: step.name,
+        kind: step.kind,
+        status: 'failed',
+        input: step.input,
+        error: step.error,
+        events: step.events,
+        attempts: step.attempts,
+        workerGroup: step.workerGroup,
+        enqueuedAt: step.enqueuedAt,
+        startedAt: step.startedAt,
+        finishedAt: new Date(),
+      }),
+    );
     this.emit({
       type: 'step.failed',
       runId: step.runId,
@@ -1637,21 +1641,22 @@ export class WorkflowEngine {
         // p-process trail — not a 0ms placeholder. Fall back to apply-time for older workers.
         const startedAt = cmd.startedAt != null ? new Date(cmd.startedAt) : at;
         const finishedAt = cmd.finishedAt != null ? new Date(cmd.finishedAt) : at;
-        await this.store.saveCheckpoint({
-          runId: run.id,
-          seq: cmd.seq,
-          name: cmd.name,
-          kind: 'local',
-          stepId: id,
-          status: cmd.error ? 'failed' : 'completed',
-          output: cmd.output,
-          error: cmd.error,
-          events: cmd.events && cmd.events.length > 0 ? cmd.events : undefined,
-          attempts: 1,
-          enqueuedAt: startedAt,
-          startedAt,
-          finishedAt,
-        });
+        await this.store.saveCheckpoint(
+          stepCheckpoint({
+            runId: run.id,
+            seq: cmd.seq,
+            name: cmd.name,
+            kind: 'local',
+            status: cmd.error ? 'failed' : 'completed',
+            output: cmd.output,
+            error: cmd.error,
+            events: cmd.events,
+            attempts: 1,
+            enqueuedAt: startedAt,
+            startedAt,
+            finishedAt,
+          }),
+        );
         this.emit({
           type: cmd.error ? 'step.failed' : 'step.completed',
           runId: run.id,
@@ -1662,20 +1667,21 @@ export class WorkflowEngine {
           error: cmd.error,
         });
       } else if (cmd.kind === 'call') {
-        await this.store.saveCheckpoint({
-          runId: run.id,
-          seq: cmd.seq,
-          name: cmd.name,
-          kind: 'remote',
-          stepId: id,
-          status: 'pending',
-          input: cmd.input,
-          attempts: 1,
-          workerGroup: cmd.group,
-          enqueuedAt: at,
-          startedAt: at,
-          finishedAt: at,
-        });
+        await this.store.saveCheckpoint(
+          stepCheckpoint({
+            runId: run.id,
+            seq: cmd.seq,
+            name: cmd.name,
+            kind: 'remote',
+            status: 'pending',
+            input: cmd.input,
+            attempts: 1,
+            workerGroup: cmd.group,
+            enqueuedAt: at,
+            startedAt: at,
+            finishedAt: at,
+          }),
+        );
         await this.pool.dispatch(
           {
             runId: run.id,
@@ -1699,19 +1705,20 @@ export class WorkflowEngine {
         });
       } else if (cmd.kind === 'sleep') {
         const deadline = this.clock() + cmd.ms;
-        await this.store.saveCheckpoint({
-          runId: run.id,
-          seq: cmd.seq,
-          name: `sleep:${cmd.seq}`,
-          kind: 'sleep',
-          stepId: id,
-          status: 'pending',
-          attempts: 1,
-          wakeAt: deadline,
-          enqueuedAt: at,
-          startedAt: at,
-          finishedAt: at,
-        });
+        await this.store.saveCheckpoint(
+          stepCheckpoint({
+            runId: run.id,
+            seq: cmd.seq,
+            name: `sleep:${cmd.seq}`,
+            kind: 'sleep',
+            status: 'pending',
+            attempts: 1,
+            wakeAt: deadline,
+            enqueuedAt: at,
+            startedAt: at,
+            finishedAt: at,
+          }),
+        );
         wakeAt = wakeAt == null ? deadline : Math.min(wakeAt, deadline);
       } else if (cmd.kind === 'waitSignal') {
         // Park on a signal: register a waiter at this seq so engine.signal(token) lands the resolving
