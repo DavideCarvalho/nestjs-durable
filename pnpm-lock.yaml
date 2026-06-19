@@ -256,6 +256,9 @@ importers:
         specifier: '>=0.1.0 <1.0.0'
         version: 0.1.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)
     devDependencies:
+      '@dudousxd/nestjs-diagnostics':
+        specifier: ^0.5.0
+        version: 0.5.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)
       '@dudousxd/nestjs-durable-core':
         specifier: workspace:^
         version: link:../core
@@ -986,6 +989,21 @@ packages:
   '@dudousxd/nestjs-diagnostics@0.3.0':
     resolution: {integrity: sha512-KntsdxhcllCqfLd95lEFDHJ9xDTeoQflSmZtOreJO5WKLD80pupoBgCxUov5X8MbrF1CybIbbEtwzNAJgXd5SQ==}
     engines: {node: '>=20'}
+
+  '@dudousxd/nestjs-diagnostics@0.5.0':
+    resolution: {integrity: sha512-qQqAtaOSHKbpi0InJYpf145lkE3AJgKbV2G1dmPeJK5XkztQac00RyfOA2b3TjA7jUbA07L6WlzygxEtToWDDA==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@nestjs/common': ^10 || ^11
+      '@nestjs/core': ^10 || ^11
+      reflect-metadata: ^0.2
+    peerDependenciesMeta:
+      '@nestjs/common':
+        optional: true
+      '@nestjs/core':
+        optional: true
+      reflect-metadata:
+        optional: true
 
   '@dudousxd/nestjs-telescope@1.10.0':
     resolution: {integrity: sha512-i9NwPYF+CmA1Yg+8FvZXjXKBBFEx0HO7Vw39Qxd2DKoy8TQBAr5ohMXml3qq4SeiFvx4DuDmkL8r4veHKK+MMQ==}
@@ -7019,6 +7037,12 @@ snapshots:
       reflect-metadata: 0.2.2
 
   '@dudousxd/nestjs-diagnostics@0.3.0': {}
+
+  '@dudousxd/nestjs-diagnostics@0.5.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)':
+    optionalDependencies:
+      '@nestjs/common': 11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core': 11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      reflect-metadata: 0.2.2
 
   '@dudousxd/nestjs-telescope@1.10.0(@dudousxd/nestjs-context@0.1.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2))(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)':
     dependencies:
