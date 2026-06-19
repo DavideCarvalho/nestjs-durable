@@ -104,12 +104,12 @@ describe('TypeOrmStateStore', () => {
     // Simulate an older deploy: the checkpoints table exists but lacks `events` (and `enqueuedAt`).
     await dataSource.query(
       `CREATE TABLE "durable_step_checkpoints" (
-        "runId" varchar(191) NOT NULL, "seq" integer NOT NULL,
-        "name" varchar(191) NOT NULL, "kind" varchar(191) NOT NULL, "stepId" varchar(191) NOT NULL,
+        "run_id" varchar(191) NOT NULL, "seq" integer NOT NULL,
+        "name" varchar(191) NOT NULL, "kind" varchar(191) NOT NULL, "step_id" varchar(191) NOT NULL,
         "status" varchar(191) NOT NULL, "input" text, "output" text, "error" text,
-        "attempts" integer NOT NULL, "workerGroup" varchar(191),
-        "wakeAt" datetime, "startedAt" datetime NOT NULL, "finishedAt" datetime NOT NULL,
-        PRIMARY KEY ("runId", "seq")
+        "attempts" integer NOT NULL, "worker_group" varchar(191),
+        "wake_at" datetime, "started_at" datetime NOT NULL, "finished_at" datetime NOT NULL,
+        PRIMARY KEY ("run_id", "seq")
       )`,
     );
     const store = new TypeOrmStateStore(dataSource);
@@ -250,11 +250,11 @@ describe('TypeOrmStateStore', () => {
     await store.createRun(run({ id: 'a', searchAttributes: { tier: 'free', amount: 10 } }));
 
     const rowsAfterCreate = (await dataSource.query(
-      `SELECT "key", "strValue", "numValue" FROM "durable_run_attributes" WHERE "runId" = 'a' ORDER BY "key"`,
-    )) as Array<{ key: string; strValue: string | null; numValue: number | null }>;
+      `SELECT "key", "str_value", "num_value" FROM "durable_run_attributes" WHERE "run_id" = 'a' ORDER BY "key"`,
+    )) as Array<{ key: string; str_value: string | null; num_value: number | null }>;
     expect(rowsAfterCreate).toEqual([
-      { key: 'amount', strValue: null, numValue: 10 },
-      { key: 'tier', strValue: 'free', numValue: null },
+      { key: 'amount', str_value: null, num_value: 10 },
+      { key: 'tier', str_value: 'free', num_value: null },
     ]);
 
     // Update attributes → old rows gone, new rows present (and the query reflects the change).
@@ -380,6 +380,10 @@ describe('TypeOrmStateStore', () => {
 
 describe('MySQL longtext schema (DDL generation)', () => {
   const quote = (id: string) => `\`${id}\``;
+  // Canonical snake_case resolver (matches the default `durableEntities`); the JSON-blob columns
+  // exercised here are single-word and so unchanged, but pass a real resolver for the new signature.
+  const snake = (_table: string, property: string) =>
+    property.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 
   it('uses longtext (not text) for JSON-blob columns on MySQL', () => {
     expect(jsonBlobColumnType(true)).toBe('longtext');
@@ -407,7 +411,7 @@ describe('MySQL longtext schema (DDL generation)', () => {
   });
 
   it('emits idempotent MODIFY ... longtext widen statements for existing MySQL tables', () => {
-    const stmts = buildWidenStatements(true, quote);
+    const stmts = buildWidenStatements(true, quote, snake);
     // Every JSON-blob column on both tables gets a MODIFY-to-longtext.
     expect(stmts).toContain(
       'ALTER TABLE `durable_step_checkpoints` MODIFY COLUMN `events` longtext',
@@ -425,7 +429,7 @@ describe('MySQL longtext schema (DDL generation)', () => {
   });
 
   it('emits no widen statements on non-MySQL dialects (text is already unbounded)', () => {
-    expect(buildWidenStatements(false, quote)).toEqual([]);
+    expect(buildWidenStatements(false, quote, snake)).toEqual([]);
   });
 });
 
@@ -438,7 +442,7 @@ describe('tolerant read of corrupt/truncated JSON columns', () => {
     // Simulate the old MySQL `text` 64KB truncation: overwrite the stored JSON text with an
     // unterminated string ("Unterminated string in JSON") directly via SQL, bypassing the store.
     await dataSource.query(
-      'UPDATE durable_step_checkpoints SET events = ?, output = ? WHERE runId = ? AND seq = ?',
+      'UPDATE durable_step_checkpoints SET events = ?, output = ? WHERE run_id = ? AND seq = ?',
       ['[{"type":"log","message":"hi', '{"ok":tru', 'r1', 0],
     );
 

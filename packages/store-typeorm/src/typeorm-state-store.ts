@@ -29,7 +29,7 @@ import {
   StepCheckpointEntity,
   WorkflowRunEntity,
 } from './entities';
-import { ensureTypeOrmDurableSchema } from './schema';
+import { durableColumnResolver, ensureTypeOrmDurableSchema } from './schema';
 
 /**
  * TypeORM-backed `StateStore`. Works on any TypeORM driver — Postgres, MySQL, SQLite (tested);
@@ -237,16 +237,27 @@ export class TypeOrmStateStore implements StateStore {
     f: AttributeFilter,
     i: number,
   ): void {
-    const col = attributeColumnFor(f); // 'numValue' | 'strValue'
+    const valueProperty = attributeColumnFor(f); // 'numValue' | 'strValue' (entity property)
     const cmp = sqlComparator(f.op);
     const keyParam = `attrKey${i}`;
     const valParam = `attrVal${i}`;
+    // Resolve the PHYSICAL column names from the entity metadata so this raw subquery tracks the
+    // configured naming (canonical snake_case by default) instead of hardcoding camelCase — which
+    // would break the EXISTS pushdown the moment the table is snake_case.
+    const resolve = durableColumnResolver(this.dataSource);
+    const q = this.idQuote();
+    const wrap = (name: string) => `${q}${name}${q}`;
+    const runIdCol = wrap(resolve('durable_run_attributes', 'runId'));
+    const keyCol = wrap(resolve('durable_run_attributes', 'key'));
+    const valueCol = wrap(resolve('durable_run_attributes', valueProperty));
+    const runPkCol = wrap(resolve('durable_workflow_runs', 'id'));
+    const table = wrap('durable_run_attributes');
     // `<>` (ne) must also exclude rows where the attribute is absent: the missing-key-never-matches
     // contract (see core matchesAttributes). EXISTS already requires the key row to be present, and a
     // row only exists when the value is non-null, so EXISTS(... <> ...) gives exactly ne-with-present.
     const a = `a${i}`;
-    const sql = `EXISTS (SELECT 1 FROM durable_run_attributes ${a} WHERE ${a}."runId" = r.id AND ${a}."key" = :${keyParam} AND ${a}."${col}" ${cmp} :${valParam})`;
-    qb.andWhere(sql.replace(/"/g, this.idQuote()), {
+    const sql = `EXISTS (SELECT 1 FROM ${table} ${a} WHERE ${a}.${runIdCol} = r.${runPkCol} AND ${a}.${keyCol} = :${keyParam} AND ${a}.${valueCol} ${cmp} :${valParam})`;
+    qb.andWhere(sql, {
       [keyParam]: f.key,
       [valParam]: attributeOperand(f),
     });
