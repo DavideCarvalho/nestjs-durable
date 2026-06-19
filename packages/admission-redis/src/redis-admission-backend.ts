@@ -44,7 +44,7 @@ local now=tonumber(ARGV[1]); local instanceId=ARGV[2]; local concurrency=tonumbe
 local rateLimit=tonumber(ARGV[4]); local ratePeriodMs=tonumber(ARGV[5]); local waiterId=ARGV[6]
 local priority=tonumber(ARGV[7]); local retryAt=tonumber(ARGV[8]); local hasOrdering=tonumber(ARGV[9])
 local fairnessOn=tonumber(ARGV[10]); local fairKey=ARGV[11]; local instPrefix=ARGV[12]
-local waiterTtl=tonumber(ARGV[13]); local instTtl=tonumber(ARGV[14])
+local waiterTtl=tonumber(ARGV[13]); local instTtl=tonumber(ARGV[14]); local lifo=tonumber(ARGV[15])
 
 -- refresh own liveness atomically so this pod can never reclaim its own fresh slot
 redis.call('SET', instPrefix..instanceId, '1', 'PX', instTtl)
@@ -96,9 +96,13 @@ if hasOrdering==1 then
       local k=string.sub(meta, sep+1)
       local served=0
       if fairnessOn==1 and k~='' then served=tonumber(redis.call('HGET', KEYS[5], k) or '0') end
-      if bestId==nil or served<bestServed or (served==bestServed and seq<bestSeq) then
-        bestId=wid; bestServed=served; bestSeq=seq
+      local better=false
+      if bestId==nil then better=true
+      elseif served<bestServed then better=true
+      elseif served==bestServed then
+        if lifo==1 then better=(seq>bestSeq) else better=(seq<bestSeq) end
       end
+      if better then bestId=wid; bestServed=served; bestSeq=seq end
     end
   end
   if bestId~=waiterId then return {0, retryAt} end
@@ -175,8 +179,9 @@ export class RedisAdmissionBackend implements AdmissionBackend {
     const now = this.clock();
     const rate = config.rateLimit;
     const fairnessOn = config.fairness === 'key' ? 1 : 0;
+    const lifo = config.order === 'lifo' ? 1 : 0;
     const fairKey = fairnessOn === 1 ? (item.key ?? '') : '';
-    const hasOrdering = item.priority != null || fairnessOn === 1 ? 1 : 0;
+    const hasOrdering = item.priority != null || fairnessOn === 1 || lifo === 1 ? 1 : 0;
     const rateKey = rate
       ? this.key(queue, 'rate', Math.floor(now / rate.periodMs))
       : this.key(queue, 'rate', 0);
@@ -203,6 +208,7 @@ export class RedisAdmissionBackend implements AdmissionBackend {
       this.instPrefix(),
       this.waiterTtlMs,
       this.instanceTtlMs,
+      lifo,
     );
     return admitted === 1 ? { ok: true } : { ok: false, retryAt };
   }

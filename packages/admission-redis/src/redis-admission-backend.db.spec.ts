@@ -131,6 +131,20 @@ describe('RedisAdmissionBackend — global flow control', () => {
     expect((await backend.tryAdmit('q', { waiterId: 'first', priority: 5 })).ok).toBe(true);
   });
 
+  maybe('admits the most-recent arrival first within equal priority when order is LIFO', async () => {
+    const backend = makeBackend();
+    backend.register({ name: 'q', concurrency: 1, order: 'lifo' });
+
+    expect((await backend.tryAdmit('q', { waiterId: 'holder' })).ok).toBe(true);
+    expect((await backend.tryAdmit('q', { waiterId: 'first', priority: 5 })).ok).toBe(false);
+    expect((await backend.tryAdmit('q', { waiterId: 'second', priority: 5 })).ok).toBe(false);
+
+    await backend.release('q', 'holder');
+    // LIFO: the later arrival wins; the earlier one keeps waiting.
+    expect((await backend.tryAdmit('q', { waiterId: 'first', priority: 5 })).ok).toBe(false);
+    expect((await backend.tryAdmit('q', { waiterId: 'second', priority: 5 })).ok).toBe(true);
+  });
+
   maybe('round-robins a contended slot across fairness keys (no key monopolizes)', async () => {
     const backend = makeBackend();
     backend.register({ name: 'q', concurrency: 1, fairness: 'key' });

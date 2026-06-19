@@ -93,6 +93,20 @@ describe('QueueController — admission gate', () => {
     expect(q.tryAdmit({ key: 'b', priority: 1, waiterId: 'low' }).ok).toBe(false);
   });
 
+  it('admits the most-recent arrival first within equal priority when order is LIFO', () => {
+    let now = 0;
+    const q = new QueueController({ name: 'q', concurrency: 1, order: 'lifo' }, () => now);
+    expect(q.tryAdmit({ waiterId: 'holder' }).ok).toBe(true); // takes the slot
+    // first then second register while the slot is busy, same (default) priority.
+    expect(q.tryAdmit({ waiterId: 'first' }).ok).toBe(false);
+    expect(q.tryAdmit({ waiterId: 'second' }).ok).toBe(false);
+    q.release();
+    now += 1000;
+    // LIFO: the later arrival (second) wins the freed slot, not the earlier one.
+    expect(q.tryAdmit({ waiterId: 'first' }).ok).toBe(false);
+    expect(q.tryAdmit({ waiterId: 'second' }).ok).toBe(true);
+  });
+
   it('round-robins across keys so one key cannot monopolize the budget (fairness)', () => {
     let now = 0;
     const q = new QueueController({ name: 'q', concurrency: 1, fairness: 'key' }, () => now);
