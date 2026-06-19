@@ -32,6 +32,7 @@
     "reflect-metadata": { "optional": true }
   },
   "devDependencies": {
+    "@dudousxd/nestjs-durable": "workspace:^",
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@dudousxd/nestjs-diagnostics": "^0.3.0",
     "@nestjs/common": "11.1.26",

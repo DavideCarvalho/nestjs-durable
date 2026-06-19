@@ -188,6 +188,9 @@ importers:
       '@dudousxd/nestjs-diagnostics':
         specifier: ^0.3.0
         version: 0.3.0
+      '@dudousxd/nestjs-durable':
+        specifier: workspace:^
+        version: link:../nestjs
       '@dudousxd/nestjs-durable-core':
         specifier: workspace:^
         version: link:../core
