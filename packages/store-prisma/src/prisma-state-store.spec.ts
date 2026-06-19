@@ -32,6 +32,14 @@ async function prismaContractSetup(): Promise<boolean> {
         // Query logging lets the per-store pushdown test below capture the executed SQL.
         sharedPrisma = new PrismaClient({ log: [{ emit: 'event', level: 'query' }] });
         await sharedPrisma.$connect();
+        // SQLite reliability: under the engine's end-to-end write bursts (createRun → saveCheckpoint
+        // → updateRun → resume), the default rollback-journal mode does an fsync-heavy journal
+        // create/delete per write and takes a coarse file lock, so a query occasionally exceeds
+        // Prisma's socket timeout (flaky P1008 / 5s test-timeout / P2025-on-race). WAL makes writes
+        // fast and non-blocking for readers; busy_timeout makes a briefly-locked write wait-and-retry
+        // instead of erroring. Both are idempotent and DB/connection-scoped.
+        await sharedPrisma.$queryRawUnsafe('PRAGMA journal_mode = WAL;');
+        await sharedPrisma.$queryRawUnsafe('PRAGMA busy_timeout = 4000;');
         return true;
       } catch {
         return false;
