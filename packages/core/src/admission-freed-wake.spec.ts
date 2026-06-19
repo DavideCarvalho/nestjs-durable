@@ -24,6 +24,9 @@ class GatedBackend implements AdmissionBackend {
   private blocked = true;
   private freed?: (queue: string) => void;
   register(_config: QueueConfig): void {}
+  handles(_queue: string): boolean {
+    return true;
+  }
   async tryAdmit(_queue: string, _item: AdmissionItem): Promise<Admission> {
     return this.blocked ? { ok: false, retryAt: Number.MAX_SAFE_INTEGER } : { ok: true };
   }

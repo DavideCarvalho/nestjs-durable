@@ -40,11 +40,12 @@ export interface RedisAdmissionOptions {
 //        4 wexpire(zset waiterId→expiry)   5 keyserved(hash key→tick)          6 rate(string)
 //        7 seq(string)                     8 servedSeq(string)
 const ACQUIRE_LUA = `
-local now=tonumber(ARGV[1]); local instanceId=ARGV[2]; local concurrency=tonumber(ARGV[3])
-local rateLimit=tonumber(ARGV[4]); local ratePeriodMs=tonumber(ARGV[5]); local waiterId=ARGV[6]
-local priority=tonumber(ARGV[7]); local retryAt=tonumber(ARGV[8]); local hasOrdering=tonumber(ARGV[9])
-local fairnessOn=tonumber(ARGV[10]); local fairKey=ARGV[11]; local instPrefix=ARGV[12]
-local waiterTtl=tonumber(ARGV[13]); local instTtl=tonumber(ARGV[14]); local lifo=tonumber(ARGV[15])
+local p=cjson.decode(ARGV[1])
+local now=p.now; local instanceId=p.instanceId; local concurrency=p.concurrency
+local rateLimit=p.rateLimit; local ratePeriodMs=p.ratePeriodMs; local waiterId=p.waiterId
+local priority=p.priority; local retryAt=p.retryAt; local hasOrdering=p.hasOrdering
+local fairnessOn=p.fairnessOn; local fairKey=p.fairKey; local instPrefix=p.instPrefix
+local waiterTtl=p.waiterTtl; local instTtl=p.instTtl; local lifo=p.lifo
 
 -- refresh own liveness atomically so this pod can never reclaim its own fresh slot
 redis.call('SET', instPrefix..instanceId, '1', 'PX', instTtl)
@@ -118,9 +119,39 @@ if rateLimit>0 then redis.call('INCR', KEYS[6]); redis.call('PEXPIRE', KEYS[6], 
 return {1, 0}
 `;
 
+/** The single JSON-encoded ARGV the Lua acquire decodes — named fields, no positional coupling. */
+interface AcquireParams {
+  now: number;
+  instanceId: string;
+  concurrency: number;
+  rateLimit: number;
+  ratePeriodMs: number;
+  waiterId: string;
+  priority: number;
+  retryAt: number;
+  hasOrdering: 0 | 1;
+  fairnessOn: 0 | 1;
+  fairKey: string;
+  instPrefix: string;
+  waiterTtl: number;
+  instTtl: number;
+  lifo: 0 | 1;
+}
+
 // ioredis custom commands are defined dynamically, so the method isn't on the static type — the one
-// localized cast the `defineCommand` typing story requires.
-type AcquireFn = (...args: Array<string | number>) => Promise<[number, number]>;
+// localized cast the `defineCommand` typing story requires. The 8 keys stay positional (Redis needs
+// them declared); everything else rides in one JSON `params` arg.
+type AcquireFn = (
+  slots: string,
+  waiters: string,
+  wmeta: string,
+  wexpire: string,
+  keyserved: string,
+  rate: string,
+  seq: string,
+  servedseq: string,
+  params: string,
+) => Promise<[number, number]>;
 type RedisWithAcquire = Redis & { admissionAcquire: AcquireFn };
 
 /**
@@ -173,6 +204,10 @@ export class RedisAdmissionBackend implements AdmissionBackend {
     this.configs.set(config.name, config);
   }
 
+  handles(queue: string): boolean {
+    return this.configs.has(queue);
+  }
+
   async tryAdmit(queue: string, item: AdmissionItem): Promise<Admission> {
     const config = this.configs.get(queue);
     if (!config) return { ok: true }; // unregistered queue → ungated
@@ -181,10 +216,30 @@ export class RedisAdmissionBackend implements AdmissionBackend {
     const fairnessOn = config.fairness === 'key' ? 1 : 0;
     const lifo = config.order === 'lifo' ? 1 : 0;
     const fairKey = fairnessOn === 1 ? (item.key ?? '') : '';
-    const hasOrdering = item.priority != null || fairnessOn === 1 || lifo === 1 ? 1 : 0;
+    // Order-track every call that carries a stable waiterId (the engine always does), so even a plain
+    // concurrency queue admits blocked waiters by arrival FIFO — identical to the in-process backend.
+    const hasOrdering =
+      item.waiterId != null || item.priority != null || fairnessOn === 1 || lifo === 1 ? 1 : 0;
     const rateKey = rate
       ? this.key(queue, 'rate', Math.floor(now / rate.periodMs))
       : this.key(queue, 'rate', 0);
+    const params: AcquireParams = {
+      now,
+      instanceId: this.instanceId,
+      concurrency: config.concurrency ?? 0,
+      rateLimit: rate?.limit ?? 0,
+      ratePeriodMs: rate?.periodMs ?? 0,
+      waiterId: item.waiterId ?? `anon:${now}`,
+      priority: item.priority ?? 0,
+      retryAt: now + this.retryMs,
+      hasOrdering,
+      fairnessOn,
+      fairKey,
+      instPrefix: this.instPrefix(),
+      waiterTtl: this.waiterTtlMs,
+      instTtl: this.instanceTtlMs,
+      lifo,
+    };
     const [admitted, retryAt] = await this.redis.admissionAcquire(
       this.key(queue, 'slots'),
       this.key(queue, 'waiters'),
@@ -194,21 +249,7 @@ export class RedisAdmissionBackend implements AdmissionBackend {
       rateKey,
       this.key(queue, 'seq'),
       this.key(queue, 'servedseq'),
-      now,
-      this.instanceId,
-      config.concurrency ?? 0,
-      rate?.limit ?? 0,
-      rate?.periodMs ?? 0,
-      item.waiterId ?? `anon:${now}`,
-      item.priority ?? 0,
-      now + this.retryMs,
-      hasOrdering,
-      fairnessOn,
-      fairKey,
-      this.instPrefix(),
-      this.waiterTtlMs,
-      this.instanceTtlMs,
-      lifo,
+      JSON.stringify(params),
     );
     return admitted === 1 ? { ok: true } : { ok: false, retryAt };
   }

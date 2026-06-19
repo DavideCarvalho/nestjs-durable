@@ -23,6 +23,9 @@ class RecordingBackend implements AdmissionBackend {
   register(config: QueueConfig): void {
     this.registered.push(config.name);
   }
+  handles(queue: string): boolean {
+    return this.registered.includes(queue);
+  }
   async tryAdmit(queue: string, item: AdmissionItem): Promise<Admission> {
     this.admits.push({ queue, item });
     return { ok: true };

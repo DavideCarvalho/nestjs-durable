@@ -324,8 +324,6 @@ export class WorkflowEngine {
   private readonly cancelRequested = new Set<string>();
   /** Flow-control admission backend for remote steps (see {@link registerQueue}). */
   private readonly admission: AdmissionBackend;
-  /** Names of registered flow-control queues — only these gate + track a slot. */
-  private readonly registeredQueues = new Set<string>();
   /** Runs on THIS instance blocked on admission, by queue — woken early on a freed-slot signal. */
   private readonly queueWaiters = new Map<string, Set<string>>();
   /** Which queue a dispatched step took a slot from, by stepId — so the result can release it. */
@@ -541,7 +539,6 @@ export class WorkflowEngine {
    * durable. Per engine instance (see {@link QueueConfig}). Registering the same name replaces it.
    */
   registerQueue(config: QueueConfig): void {
-    this.registeredQueues.add(config.name);
     this.admission.register(config);
   }
 
@@ -2086,7 +2083,7 @@ export class WorkflowEngine {
     // Flow control: a queued call that can't be admitted (concurrency/rate) does NOT dispatch — the
     // run re-suspends with the queue's retry time and the timer poller re-tries admission later, so
     // the limit is durable. The admitted slot is released when the result lands (completeRemoteResult).
-    if (queue && this.registeredQueues.has(queue)) {
+    if (queue && this.admission.handles(queue)) {
       // Admission carries the per-call priority + fairness key (default the runId so each run is its
       // own fairness bucket), and the stepId as a STABLE waiter id so the backend tracks one waiter
       // across this call's durable retries. Ordering lives in the backend (in-process by default, or
@@ -2098,9 +2095,9 @@ export class WorkflowEngine {
       });
       if (!decision.ok) {
         // Remember this run as blocked on `queue` so a freed-slot signal can wake it early.
-        let waiters = this.queueWaiters.get(queue);
-        if (!waiters) this.queueWaiters.set(queue, (waiters = new Set()));
+        const waiters = this.queueWaiters.get(queue) ?? new Set<string>();
         waiters.add(runId);
+        this.queueWaiters.set(queue, waiters);
         throw new WorkflowSuspended(decision.retryAt);
       }
       this.queueWaiters.get(queue)?.delete(runId);

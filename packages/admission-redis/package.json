@@ -25,6 +25,7 @@
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
+    "@dudousxd/nestjs-durable-testing": "workspace:^",
     "@testcontainers/redis": "10.18.0",
     "ioredis": "5.4.2",
     "typescript": "5.9.3",

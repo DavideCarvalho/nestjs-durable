@@ -16,6 +16,8 @@ import { type Admission, type AdmissionItem, type QueueConfig, QueueController }
 export interface AdmissionBackend {
   /** Register (or replace) a queue's config. Called from `engine.registerQueue`. */
   register(config: QueueConfig): void;
+  /** Whether `queue` is registered (gated). The engine only tracks/releases a slot for a gated queue. */
+  handles(queue: string): boolean;
   /** May a call on `queue` take a slot now? On `ok`, the caller holds a slot until {@link release}. */
   tryAdmit(queue: string, item: AdmissionItem): Promise<Admission>;
   /**
@@ -44,6 +46,10 @@ export class InMemoryAdmissionBackend implements AdmissionBackend {
 
   register(config: QueueConfig): void {
     this.controllers.set(config.name, new QueueController(config, this.clock));
+  }
+
+  handles(queue: string): boolean {
+    return this.controllers.has(queue);
   }
 
   async tryAdmit(queue: string, item: AdmissionItem): Promise<Admission> {

@@ -90,6 +90,9 @@ importers:
       '@dudousxd/nestjs-durable-core':
         specifier: workspace:^
         version: link:../core
+      '@dudousxd/nestjs-durable-testing':
+        specifier: workspace:^
+        version: link:../testing
       '@testcontainers/redis':
         specifier: 10.18.0
         version: 10.18.0

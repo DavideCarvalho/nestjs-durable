@@ -114,15 +114,10 @@ export class BullMQTransport implements Transport, ControlPlane {
   private queue(name: string): Queue {
     let queue = this.queues.get(name);
     if (!queue) {
-      queue = this.createQueue(name);
+      queue = new Queue(name, { connection: this.connection });
       this.queues.set(name, queue);
     }
     return queue;
-  }
-
-  /** Construct the BullMQ queue for `name`. Overridable seam so tests can capture `.add()` calls. */
-  protected createQueue(name: string): Queue {
-    return new Queue(name, { connection: this.connection });
   }
 
   /** Job options shared by step/workflow dispatch — adds a translated `priority` only when set. */
