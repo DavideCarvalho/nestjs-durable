@@ -1,3 +1,4 @@
+export * from './admission';
 export * from './duration';
 export * from './engine';
 export * from './entities';

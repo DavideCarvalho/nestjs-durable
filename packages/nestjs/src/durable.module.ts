@@ -1,4 +1,5 @@
 import {
+  type AdmissionBackend,
   type ControlPlane,
   DURABLE_OPTIONS,
   type NamedTransport,
@@ -167,6 +168,12 @@ export interface DurableModuleOptions {
    */
   queues?: QueueConfig[];
   /**
+   * Admission backend for the flow-control `queues`. Defaults to in-process (per-instance) caps. Pass
+   * a `RedisAdmissionBackend` (from `@dudousxd/nestjs-durable-admission-redis`) to make concurrency /
+   * rate-limit / priority ordering GLOBAL across every engine replica.
+   */
+  admission?: AdmissionBackend;
+  /**
    * Provide the current W3C `traceparent` to stamp on dispatched remote tasks, so workers continue
    * the distributed trace. Pass `otelTraceparent` from `@dudousxd/nestjs-durable-otel`.
    */
@@ -266,6 +273,7 @@ export class DurableModule {
               transports: opts.transports,
               controlPlane: opts.controlPlane ?? (isControlPlane(primary) ? primary : undefined),
               leaseMs: opts.leaseMs,
+              admission: opts.admission,
               maxRecoveryAttempts: opts.maxRecoveryAttempts,
               instanceId: opts.instanceId,
               webhookUrl: opts.webhookUrl,
