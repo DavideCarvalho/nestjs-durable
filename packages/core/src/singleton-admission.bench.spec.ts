@@ -152,6 +152,9 @@ describe('singleton admission — query-count benchmark (temporary)', () => {
     store.listRunsCalls = 0;
     const r = await startRun(engine, 'job', {}, 'solo');
     expect(r.status).toBe('completed');
+    // The notify-on-release scan is fire-and-forget (`void wakeNextSingletons`), so flush the
+    // microtask/macrotask queue before counting — otherwise the assertion can race the scan.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     // Admission still issues exactly ONE listRuns (was two before the single-scan optimization).
     // The terminal-state notify-on-release adds ONE scan (find the next gated waiter) — a one-shot
     // cost per completion that REPLACES the old per-~1s-tick re-poll for every gated waiter.
