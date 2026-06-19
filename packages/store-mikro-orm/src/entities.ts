@@ -1,102 +1,68 @@
 import type { RunStatus, StepKind } from '@dudousxd/nestjs-durable-core';
-import { Entity, PrimaryKey, Property } from '@mikro-orm/decorators/legacy';
+import { EntitySchema } from '@mikro-orm/core';
 
-@Entity({ tableName: 'durable_workflow_runs' })
+/**
+ * How property names map to physical column names. The durable tables are adapter-agnostic: a run
+ * written by one store adapter must be readable by another, so every adapter has to agree on the
+ * physical column names. The default is `'snake_case'` (the canonical, matched by the TypeORM,
+ * Prisma and Drizzle adapters). `'preserve'` keeps the camelCase property name verbatim (what the
+ * old TypeORM/Prisma adapters produced before they were pinned). A function lets you supply any
+ * custom mapping.
+ *
+ * The choice is pinned EXPLICITLY onto the entity schema rather than left to the host ORM's naming
+ * strategy — depending on the host strategy is what silently diverged the adapters and broke a store
+ * swap against an existing table.
+ */
+export type DurableColumnNaming = 'snake_case' | 'preserve' | ((property: string) => string);
+
+function snakeCase(property: string): string {
+  return property.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+}
+
+function columnNamer(naming: DurableColumnNaming): (property: string) => string {
+  if (naming === 'snake_case') return snakeCase;
+  if (naming === 'preserve') return (property) => property;
+  return naming;
+}
+
+// Plain classes (no decorators): the schema/column mapping lives on the EntitySchema built by
+// `durableEntities`, so the same class can be registered under different column names. The store
+// still references these classes for `em.create`/`getMetadata`.
+
 export class WorkflowRunEntity {
-  @PrimaryKey({ type: 'string' })
   id!: string;
-
-  @Property({ type: 'string' })
   workflow!: string;
-
-  @Property({ type: 'string' })
   workflowVersion!: string;
-
-  @Property({ type: 'string' })
   status!: RunStatus;
-
-  @Property({ type: 'json', nullable: true })
   input?: unknown;
-
-  @Property({ type: 'json', nullable: true })
   output?: unknown;
-
-  @Property({ type: 'json', nullable: true })
   error?: unknown;
-
-  @Property({ type: 'Date', nullable: true })
   wakeAt?: Date;
-
-  @Property({ type: 'string', nullable: true })
   lockedBy?: string;
-
-  @Property({ type: 'Date', nullable: true })
   lockedUntil?: Date;
-
-  @Property({ type: 'integer', nullable: true })
   recoveryAttempts?: number;
-
-  @Property({ type: 'json', nullable: true })
   tags?: string[] | null;
-
-  @Property({ type: 'json', nullable: true })
   searchAttributes?: Record<string, string | number | boolean> | null;
-
-  @Property({ type: 'Date' })
   createdAt!: Date;
-
-  @Property({ type: 'Date' })
   updatedAt!: Date;
 }
 
-@Entity({ tableName: 'durable_step_checkpoints' })
 export class StepCheckpointEntity {
-  @PrimaryKey({ type: 'string' })
   runId!: string;
-
-  @PrimaryKey({ type: 'integer' })
   seq!: number;
-
-  @Property({ type: 'string' })
   name!: string;
-
-  @Property({ type: 'string' })
   kind!: StepKind;
-
-  @Property({ type: 'string' })
   stepId!: string;
-
-  @Property({ type: 'string' })
   status!: 'pending' | 'running' | 'completed' | 'failed';
-
-  @Property({ type: 'json', nullable: true })
   input?: unknown;
-
-  @Property({ type: 'json', nullable: true })
   output?: unknown;
-
-  @Property({ type: 'json', nullable: true })
   error?: unknown;
-
-  @Property({ type: 'json', nullable: true })
   events?: unknown;
-
-  @Property({ type: 'integer' })
   attempts!: number;
-
-  @Property({ type: 'string', nullable: true })
   workerGroup?: string;
-
-  @Property({ type: 'Date', nullable: true })
   wakeAt?: Date;
-
-  @Property({ type: 'Date', nullable: true })
   enqueuedAt?: Date;
-
-  @Property({ type: 'Date' })
   startedAt!: Date;
-
-  @Property({ type: 'Date' })
   finishedAt!: Date;
 }
 
@@ -106,50 +72,115 @@ export class StepCheckpointEntity {
  * coarse scan + in-process filter. Maintained on every createRun/updateRun. Numbers land in
  * `numValue`, strings/booleans in `strValue` (booleans as "true"/"false"); see normalizeAttributeRows.
  */
-@Entity({ tableName: 'durable_run_attributes' })
 export class RunAttributeEntity {
-  @PrimaryKey({ type: 'string' })
   runId!: string;
-
-  @PrimaryKey({ type: 'string' })
   key!: string;
-
-  @Property({ type: 'string', nullable: true })
   strValue?: string | null;
-
-  // `float`/`double` is portable across SQLite/MySQL/Postgres for numeric range scans.
-  @Property({ type: 'float', nullable: true })
   numValue?: number | null;
 }
 
-@Entity({ tableName: 'durable_signal_waiters' })
 export class SignalWaiterEntity {
-  @PrimaryKey({ type: 'string' })
   token!: string;
-
-  @Property({ type: 'string' })
   runId!: string;
-
-  @Property({ type: 'integer' })
   seq!: number;
 }
 
-@Entity({ tableName: 'durable_buffered_signals' })
 export class BufferedSignalEntity {
-  @PrimaryKey({ autoincrement: true, type: 'integer' })
   id!: number;
-
-  @Property({ index: true, type: 'string' })
   token!: string;
-
-  @Property({ type: 'json', nullable: true })
   payload?: unknown;
 }
 
-export const ENTITIES = [
-  WorkflowRunEntity,
-  StepCheckpointEntity,
-  RunAttributeEntity,
-  SignalWaiterEntity,
-  BufferedSignalEntity,
-] as const;
+/**
+ * Build the durable MikroORM entity schemas with column names pinned per `naming` (default
+ * `'snake_case'`). Register the result in your MikroORM config / `MikroOrmModule.forFeature`.
+ *
+ * ```ts
+ * entities: durableEntities({ naming: 'snake_case' })
+ * ```
+ */
+export function durableEntities(options: { naming?: DurableColumnNaming } = {}): EntitySchema[] {
+  const col = columnNamer(options.naming ?? 'snake_case');
+
+  const workflowRuns = new EntitySchema<WorkflowRunEntity>({
+    class: WorkflowRunEntity,
+    tableName: 'durable_workflow_runs',
+    properties: {
+      id: { type: 'string', primary: true, fieldName: col('id') },
+      workflow: { type: 'string', fieldName: col('workflow') },
+      workflowVersion: { type: 'string', fieldName: col('workflowVersion') },
+      status: { type: 'string', fieldName: col('status') },
+      input: { type: 'json', nullable: true, fieldName: col('input') },
+      output: { type: 'json', nullable: true, fieldName: col('output') },
+      error: { type: 'json', nullable: true, fieldName: col('error') },
+      wakeAt: { type: 'Date', nullable: true, fieldName: col('wakeAt') },
+      lockedBy: { type: 'string', nullable: true, fieldName: col('lockedBy') },
+      lockedUntil: { type: 'Date', nullable: true, fieldName: col('lockedUntil') },
+      recoveryAttempts: { type: 'integer', nullable: true, fieldName: col('recoveryAttempts') },
+      tags: { type: 'json', nullable: true, fieldName: col('tags') },
+      searchAttributes: { type: 'json', nullable: true, fieldName: col('searchAttributes') },
+      createdAt: { type: 'Date', fieldName: col('createdAt') },
+      updatedAt: { type: 'Date', fieldName: col('updatedAt') },
+    },
+  });
+
+  const stepCheckpoints = new EntitySchema<StepCheckpointEntity>({
+    class: StepCheckpointEntity,
+    tableName: 'durable_step_checkpoints',
+    properties: {
+      runId: { type: 'string', primary: true, fieldName: col('runId') },
+      seq: { type: 'integer', primary: true, fieldName: col('seq') },
+      name: { type: 'string', fieldName: col('name') },
+      kind: { type: 'string', fieldName: col('kind') },
+      stepId: { type: 'string', fieldName: col('stepId') },
+      status: { type: 'string', fieldName: col('status') },
+      input: { type: 'json', nullable: true, fieldName: col('input') },
+      output: { type: 'json', nullable: true, fieldName: col('output') },
+      error: { type: 'json', nullable: true, fieldName: col('error') },
+      events: { type: 'json', nullable: true, fieldName: col('events') },
+      attempts: { type: 'integer', fieldName: col('attempts') },
+      workerGroup: { type: 'string', nullable: true, fieldName: col('workerGroup') },
+      wakeAt: { type: 'Date', nullable: true, fieldName: col('wakeAt') },
+      enqueuedAt: { type: 'Date', nullable: true, fieldName: col('enqueuedAt') },
+      startedAt: { type: 'Date', fieldName: col('startedAt') },
+      finishedAt: { type: 'Date', fieldName: col('finishedAt') },
+    },
+  });
+
+  const runAttributes = new EntitySchema<RunAttributeEntity>({
+    class: RunAttributeEntity,
+    tableName: 'durable_run_attributes',
+    properties: {
+      runId: { type: 'string', primary: true, fieldName: col('runId') },
+      key: { type: 'string', primary: true, fieldName: col('key') },
+      strValue: { type: 'string', nullable: true, fieldName: col('strValue') },
+      // `float`/`double` is portable across SQLite/MySQL/Postgres for numeric range scans.
+      numValue: { type: 'float', nullable: true, fieldName: col('numValue') },
+    },
+  });
+
+  const signalWaiters = new EntitySchema<SignalWaiterEntity>({
+    class: SignalWaiterEntity,
+    tableName: 'durable_signal_waiters',
+    properties: {
+      token: { type: 'string', primary: true, fieldName: col('token') },
+      runId: { type: 'string', fieldName: col('runId') },
+      seq: { type: 'integer', fieldName: col('seq') },
+    },
+  });
+
+  const bufferedSignals = new EntitySchema<BufferedSignalEntity>({
+    class: BufferedSignalEntity,
+    tableName: 'durable_buffered_signals',
+    properties: {
+      id: { type: 'integer', primary: true, autoincrement: true, fieldName: col('id') },
+      token: { type: 'string', index: true, fieldName: col('token') },
+      payload: { type: 'json', nullable: true, fieldName: col('payload') },
+    },
+  });
+
+  return [workflowRuns, stepCheckpoints, runAttributes, signalWaiters, bufferedSignals];
+}
+
+/** Durable entity schemas with the canonical `'snake_case'` column names. */
+export const ENTITIES = durableEntities();
