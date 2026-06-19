@@ -9,7 +9,6 @@ import {
   NonDeterminismError,
   RemoteStepTimeout,
   SignalTimeoutError,
-  SingletonQueueFullError,
   WorkflowSuspended,
 } from './errors';
 import { EventAccumulators, type EventBatchConfig } from './event-accumulators';
@@ -48,6 +47,7 @@ import type {
 import type { HistoryEvent } from './interfaces';
 import { breakpointToken, stepId } from './protocol';
 import { type QueueConfig, QueueController } from './queue';
+import { SingletonGate } from './singleton-gate';
 import { TransportPool } from './transport-pool';
 import {
   type Compensation,
@@ -91,24 +91,6 @@ export interface SingletonConfig {
    */
   maxQueueDepth?: number;
 }
-
-/** How long a gated (waiting-for-admission) singleton run sleeps before re-checking for a free slot. */
-const SINGLETON_RETRY_MS = 1000;
-/**
- * Max jitter (ms, each direction) added to {@link SINGLETON_RETRY_MS} so a queue of N gated runs doesn't
- * all wake on the same tick and re-scan the store in lockstep (a thundering herd). Each waiter draws an
- * independent offset in `[-SINGLETON_RETRY_JITTER_MS, +SINGLETON_RETRY_JITTER_MS]`, spreading the
- * admission re-checks across a ~500ms window. Smaller than the base so wakeups stay roughly FIFO-ordered.
- */
-const SINGLETON_RETRY_JITTER_MS = 250;
-
-/** Next wake time for a gated singleton run: the base retry delay jittered to avoid a wakeup stampede. */
-const singletonRetryWakeAt = (nowMs: number): number =>
-  nowMs + SINGLETON_RETRY_MS + Math.floor((Math.random() * 2 - 1) * SINGLETON_RETRY_JITTER_MS);
-
-/** The tag a singleton run carries, so the admission gate can find others sharing its key. */
-const singletonTag = (cfg: SingletonConfig, input: unknown): string =>
-  `singleton:${cfg.key(input)}`;
 
 /** Union of a workflow's static tags and a run's start-time tags, de-duplicated, or undefined if none. */
 function mergeTags(staticTags?: string[], runTags?: string[]): string[] | undefined {
@@ -289,6 +271,9 @@ export class WorkflowEngine {
   private readonly trackStepStart: boolean;
   /** Where a freshly-started run executes — in-process by default (see {@link RunDispatcher}). */
   private readonly runDispatcher: RunDispatcher;
+
+  /** Per-key serialization for singleton workflows (admission, back-pressure, notify-on-release). */
+  private readonly singletons: SingletonGate;
   /** Every registered workflow, keyed by `name@version` — so old versions stay runnable. */
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
@@ -347,6 +332,18 @@ export class WorkflowEngine {
     this.runDispatcher = deps.runDispatcher ?? {
       dispatch: (runId) => queueMicrotask(() => void this.runOne(runId).catch(() => {})),
     };
+    this.singletons = new SingletonGate({
+      store: this.store,
+      clock: this.clock,
+      dispatch: (runId) => {
+        this.runDispatcher.dispatch(runId);
+      },
+      configFor: (run) =>
+        (
+          this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+          this.latest.get(run.workflow)
+        )?.singleton,
+    });
     this.pool.bind(
       async (result) => {
         // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
@@ -663,25 +660,13 @@ export class WorkflowEngine {
     const tags = mergeTags(
       registered.tags,
       registered.singleton
-        ? [...(opts?.tags ?? []), singletonTag(registered.singleton, input)]
+        ? [...(opts?.tags ?? []), this.singletons.tag(registered.singleton, input)]
         : opts?.tags,
     );
-    // Singleton back-pressure: if a max queue depth is configured, refuse to admit a run that would
-    // grow the same-key backlog past `limit + maxQueueDepth`. Count in-flight + gated runs sharing
-    // the key (pending/running/suspended) in one scan, then reject before creating the run.
-    const maxQueueDepth = registered.singleton?.maxQueueDepth;
-    if (registered.singleton && maxQueueDepth != null) {
-      const cfg = registered.singleton;
-      const key = cfg.key(input);
-      const cap = (cfg.limit ?? 1) + maxQueueDepth;
-      const queued = await this.store.listRuns({
-        tag: singletonTag(cfg, input),
-        workflow: name,
-        statuses: ['pending', 'running', 'suspended'],
-      });
-      if (queued.length >= cap) {
-        throw new SingletonQueueFullError(name, key, maxQueueDepth);
-      }
+    // Singleton back-pressure: reject a start that would grow the same-key backlog past
+    // `limit + maxQueueDepth` (no-op when no maxQueueDepth is configured).
+    if (registered.singleton) {
+      await this.singletons.assertCapacity(name, registered.singleton, input);
     }
     const run: WorkflowRun = {
       id: runId,
@@ -1143,7 +1128,7 @@ export class WorkflowEngine {
         .catch(() => undefined);
     }
     // A cancelled singleton run frees its slot — wake the next gated waiter now (notify-on-release).
-    void this.wakeNextSingletons(run).catch(() => undefined);
+    void this.singletons.wakeNext(run).catch(() => undefined);
     return { runId, status: 'cancelled', error };
   }
 
@@ -1403,62 +1388,6 @@ export class WorkflowEngine {
     });
   }
 
-  /**
-   * Whether `run` may run now under its singleton key: it's among the `limit` oldest in-flight runs
-   * (running or suspended) sharing the key, by `(createdAt, id)` order. A consistent store gives every
-   * instance the same ordering, so admission is race-free + FIFO.
-   */
-  private async admitSingleton(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
-    const tag = singletonTag(cfg, run.input);
-    // ONE store scan for both in-flight statuses (`status IN ('running','suspended')`) instead of two
-    // — the row set is identical to the old running-list + suspended-list concatenation, and the total
-    // `(createdAt, id)` sort below makes admission order independent of the store's row order, so the
-    // FIFO + race-free-across-instances contract (the SingletonConfig doc above) is preserved exactly.
-    const inflight = (
-      await this.store.listRuns({
-        tag,
-        workflow: run.workflow,
-        statuses: ['running', 'suspended'],
-      })
-    ).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
-    const idx = inflight.findIndex((r) => r.id === run.id);
-    return idx >= 0 && idx < (cfg.limit ?? 1);
-  }
-
-  /**
-   * Notify-on-release: a singleton run just settled (freeing a slot), so wake the gated waiters that
-   * can now be admitted — immediately, instead of letting them sleep until their ~1s retry timer.
-   * Dispatches up to `limit` of the oldest gated (`suspended` + same singleton tag) waiters by
-   * `(createdAt, id)`; each re-checks admission in `runExecution` and runs only if it actually wins a
-   * slot, so this never breaks the FIFO + race-free guarantees (the durable timer remains the
-   * cross-instance / crash fallback — this just removes the poll latency on the happy path).
-   */
-  private async wakeNextSingletons(settled: WorkflowRun): Promise<void> {
-    const registered =
-      this.workflows.get(versionKey(settled.workflow, settled.workflowVersion)) ??
-      this.latest.get(settled.workflow);
-    const cfg = registered?.singleton;
-    if (!cfg) return;
-    const tag = settled.tags?.find((t) => t.startsWith('singleton:'));
-    if (!tag) return;
-    const gated = (
-      await this.store.listRuns({ tag, workflow: settled.workflow, statuses: ['suspended'] })
-    ).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
-    // Wake the oldest `limit` candidates — the freed slot(s) go to the front of the FIFO queue.
-    for (const next of gated.slice(0, cfg.limit ?? 1)) {
-      // Clear the durable retry timer as we hand the run to the dispatcher: the run is now being
-      // actively woken, so the timer poller (resumeDueTimers) must NOT also pick it up — that would
-      // double-dispatch the same run. (Leasing still guards the rare cross-instance overlap.) Only
-      // clear it for runs that actually carry a retry wakeAt, and dispatch after the clear commits.
-      if (next.wakeAt != null) {
-        await this.store
-          .updateRun(next.id, { wakeAt: undefined, updatedAt: new Date() })
-          .catch(() => undefined);
-      }
-      this.runDispatcher.dispatch(next.id);
-    }
-  }
-
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
     const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
     // Hold the lease for the WHOLE execution — whatever path got us here (leased sweep, a signal, a
@@ -1500,7 +1429,7 @@ export class WorkflowEngine {
           result.status === 'cancelled' ||
           result.status === 'dead')
       ) {
-        void this.wakeNextSingletons(run).catch(() => undefined);
+        void this.singletons.wakeNext(run).catch(() => undefined);
       }
       return result;
     } finally {
@@ -1566,8 +1495,8 @@ export class WorkflowEngine {
       run.status = 'running';
       this.emit({ type: 'run.started', runId: run.id, workflow: run.workflow });
     }
-    if (registered.singleton && !(await this.admitSingleton(run, registered.singleton))) {
-      const wakeAt = singletonRetryWakeAt(this.clock());
+    if (registered.singleton && !(await this.singletons.admit(run, registered.singleton))) {
+      const wakeAt = this.singletons.retryWakeAt();
       await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
       this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
       await this.store.releaseRunLock(run.id);
@@ -1806,7 +1735,7 @@ export class WorkflowEngine {
     registered: RegisteredWorkflow | undefined,
   ): Promise<RunResult> {
     // First execution of an enqueued run: mark it running and announce the start, BEFORE the singleton
-    // gate — `admitSingleton` only counts `running`/`suspended` runs, so a still-`pending` run could
+    // gate — `singletons.admit` only counts `running`/`suspended` runs, so a still-`pending` run could
     // never be admitted. A resumed run is already past `pending`, so this fires exactly once.
     if (run.status === 'pending') {
       await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
@@ -1815,8 +1744,8 @@ export class WorkflowEngine {
     }
     // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
-    if (registered?.singleton && !(await this.admitSingleton(run, registered.singleton))) {
-      const wakeAt = singletonRetryWakeAt(this.clock());
+    if (registered?.singleton && !(await this.singletons.admit(run, registered.singleton))) {
+      const wakeAt = this.singletons.retryWakeAt();
       await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
       this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
       await this.store.releaseRunLock(run.id);
