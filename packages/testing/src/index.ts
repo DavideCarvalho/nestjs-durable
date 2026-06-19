@@ -1,3 +1,4 @@
+export * from './admission-backend-conformance';
 export * from './assertions';
 export * from './durable-columns';
 export * from './harness';

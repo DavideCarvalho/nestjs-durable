@@ -4,9 +4,10 @@ import {
   WorkflowEngine,
 } from '@dudousxd/nestjs-durable-core';
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
+import { Queue } from 'bullmq';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { BullMQTransport } from './bullmq-transport';
+import { BullMQTransport, toBrokerPriority } from './bullmq-transport';
 
 /**
  * Real-broker matrix for the BullMQ transport: a Redis instance spun up via testcontainers, so the
@@ -151,5 +152,30 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
     expect(beats).toEqual(['r1:0']);
     await worker.close();
     await engineSide.close();
+  }, 20_000);
+
+  it('forwards a task priority onto the enqueued BullMQ job', async (ctx) => {
+    const connection = liveConnection(ctx);
+    const prefix = `durtest-${Date.now()}-p`;
+    const transport = new BullMQTransport({ connection, prefix });
+    await transport.dispatch({
+      runId: 'r1',
+      seq: 0,
+      name: 'payments.charge-card',
+      stepId: 'r1:0',
+      group: 'payments',
+      input: { amount: 1 },
+      attempt: 1,
+      priority: 9,
+    });
+
+    // Read the job back from the group's task queue and check its translated priority.
+    const queue = new Queue(`${prefix}-tasks-payments`, { connection });
+    const jobs = await queue.getJobs(['prioritized', 'wait']);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.opts.priority).toBe(toBrokerPriority(9));
+
+    await queue.close();
+    await transport.close();
   }, 20_000);
 });

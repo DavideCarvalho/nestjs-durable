@@ -94,6 +94,7 @@ export class TypeOrmStateStore implements StateStore {
     if ('recoveryAttempts' in patch) update.recoveryAttempts = patch.recoveryAttempts;
     if ('tags' in patch) update.tags = patch.tags ?? null;
     if ('searchAttributes' in patch) update.searchAttributes = patch.searchAttributes ?? null;
+    if ('priority' in patch) update.priority = patch.priority ?? null;
     if ('createdAt' in patch) update.createdAt = patch.createdAt;
     if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;
     const result = await this.runs()
@@ -343,6 +344,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     ...(run.recoveryAttempts === undefined ? {} : { recoveryAttempts: run.recoveryAttempts }),
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
+    priority: run.priority ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -363,6 +365,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     recoveryAttempts: e.recoveryAttempts ?? undefined,
     tags: e.tags ?? undefined,
     searchAttributes: e.searchAttributes ?? undefined,
+    priority: e.priority ?? undefined,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

@@ -32,6 +32,7 @@ interface RunRow {
   recoveryAttempts: number | null;
   tags: unknown;
   searchAttributes: unknown;
+  priority: number | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -363,6 +364,7 @@ function toRunData(run: WorkflowRun) {
     recoveryAttempts: run.recoveryAttempts ?? null,
     tags: jsonOrNull(run.tags),
     searchAttributes: jsonOrNull(run.searchAttributes),
+    priority: run.priority ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -388,6 +390,7 @@ function toRunPatch(patch: Partial<WorkflowRun>) {
   if ('recoveryAttempts' in patch) data.recoveryAttempts = patch.recoveryAttempts ?? null;
   if ('tags' in patch) data.tags = jsonOrNull(patch.tags);
   if ('searchAttributes' in patch) data.searchAttributes = jsonOrNull(patch.searchAttributes);
+  if ('priority' in patch) data.priority = patch.priority ?? null;
   if (patch.createdAt != null) data.createdAt = patch.createdAt;
   if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;
   return data;
@@ -409,6 +412,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     tags: (row.tags as string[] | null) ?? undefined,
     searchAttributes:
       (row.searchAttributes as Record<string, string | number | boolean> | null) ?? undefined,
+    priority: row.priority ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

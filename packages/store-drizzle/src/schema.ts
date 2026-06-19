@@ -19,6 +19,7 @@ export const workflowRuns = sqliteTable('durable_workflow_runs', {
   searchAttributes: text('search_attributes', { mode: 'json' }).$type<
     Record<string, string | number | boolean>
   >(),
+  priority: integer('priority'),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
 });

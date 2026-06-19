@@ -165,6 +165,13 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(dead?.recoveryAttempts).toBe(4);
     });
 
+    t('round-trips a run dispatch priority', async () => {
+      await store.createRun(run({ id: 'withprio', priority: 7 }));
+      await store.createRun(run({ id: 'noprio' }));
+      expect((await store.getRun('withprio'))?.priority).toBe(7);
+      expect((await store.getRun('noprio'))?.priority).toBeUndefined();
+    });
+
     t('deleteRun removes the run and all its rows (checkpoints, waiters, attributes)', async () => {
       await store.createRun(run({ searchAttributes: { tier: 'pro' } }));
       await store.saveCheckpoint(checkpoint());

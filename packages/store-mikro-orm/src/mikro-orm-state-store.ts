@@ -391,6 +391,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   if (run.recoveryAttempts !== undefined) e.recoveryAttempts = run.recoveryAttempts;
   e.tags = run.tags ?? null;
   e.searchAttributes = run.searchAttributes ?? null;
+  e.priority = run.priority ?? null;
   e.createdAt = run.createdAt;
   e.updatedAt = run.updatedAt;
   return e;
@@ -411,6 +412,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     recoveryAttempts: e.recoveryAttempts ?? undefined,
     tags: e.tags ?? undefined,
     searchAttributes: e.searchAttributes ?? undefined,
+    priority: e.priority ?? undefined,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
