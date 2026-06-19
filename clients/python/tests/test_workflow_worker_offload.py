@@ -42,7 +42,7 @@ class _BlockingWorkflowWorker:
     def __init__(self):
         self.done = False
 
-    def process_task(self, data, on_step=None):
+    def process_task(self, data, on_step=None, is_cancelled=None):
         time.sleep(0.2)
         self.done = True
         return {"runId": data.get("runId"), "status": "completed", "commands": [], "output": {}}
@@ -57,7 +57,9 @@ class WorkflowWorkerOffloadTest(unittest.IsolatedAsyncioTestCase):
         wf = _BlockingWorkflowWorker()
         with patch("bullmq.Queue", _FakeQueue), patch("bullmq.Worker", _FakeWorker), patch(
             "durable_worker.redis_runner._verify_connection", _noop
-        ), patch("durable_worker.redis_runner._start_heartbeat", _noop):
+        ), patch("durable_worker.redis_runner._start_heartbeat", _noop), patch(
+            "durable_worker.redis_runner._subscribe_control", _noop
+        ):
             worker = await run_redis_workflow_worker(
                 wf, group="g", connection="redis://localhost:6379", prefix="durable"
             )
