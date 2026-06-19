@@ -183,6 +183,33 @@ importers:
         specifier: 5.4.21
         version: 5.4.21(@types/node@25.9.2)(lightningcss@1.32.0)
 
+  packages/diagnostics:
+    devDependencies:
+      '@dudousxd/nestjs-diagnostics':
+        specifier: ^0.3.0
+        version: 0.3.0
+      '@dudousxd/nestjs-durable-core':
+        specifier: workspace:^
+        version: link:../core
+      '@nestjs/common':
+        specifier: 11.1.26
+        version: 11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core':
+        specifier: 11.1.26
+        version: 11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/testing':
+        specifier: 11.1.26
+        version: 11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))
+      reflect-metadata:
+        specifier: 0.2.2
+        version: 0.2.2
+      tsup:
+        specifier: 8.3.5
+        version: 8.3.5(@swc/core@1.15.41)(jiti@2.7.0)(postcss@8.5.15)(typescript@5.9.3)(yaml@2.9.0)
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+
   packages/eslint-plugin:
     dependencies:
       '@typescript-eslint/utils':
@@ -931,6 +958,10 @@ packages:
       '@nestjs/common': '>=10.0.0'
       '@nestjs/core': '>=10.0.0'
       reflect-metadata: '>=0.1.13'
+
+  '@dudousxd/nestjs-diagnostics@0.3.0':
+    resolution: {integrity: sha512-KntsdxhcllCqfLd95lEFDHJ9xDTeoQflSmZtOreJO5WKLD80pupoBgCxUov5X8MbrF1CybIbbEtwzNAJgXd5SQ==}
+    engines: {node: '>=20'}
 
   '@dudousxd/nestjs-telescope@1.10.0':
     resolution: {integrity: sha512-i9NwPYF+CmA1Yg+8FvZXjXKBBFEx0HO7Vw39Qxd2DKoy8TQBAr5ohMXml3qq4SeiFvx4DuDmkL8r4veHKK+MMQ==}
@@ -6966,6 +6997,8 @@ snapshots:
       '@nestjs/common': 11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
       '@nestjs/core': 11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
       reflect-metadata: 0.2.2
+
+  '@dudousxd/nestjs-diagnostics@0.3.0': {}
 
   '@dudousxd/nestjs-telescope@1.10.0(@dudousxd/nestjs-context@0.1.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2))(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)':
     dependencies:
