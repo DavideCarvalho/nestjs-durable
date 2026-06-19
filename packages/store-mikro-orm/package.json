@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-store-mikro-orm",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "MikroORM adapter for the nestjs-durable StateStore (reference ORM adapter)",
   "license": "MIT",
   "author": "Davide Carvalho",
