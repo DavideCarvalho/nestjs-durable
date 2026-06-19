@@ -361,14 +361,27 @@ function toRunData(run: WorkflowRun) {
 }
 
 function toRunPatch(patch: Partial<WorkflowRun>) {
+  // Map EVERY patchable field, using presence (`'x' in patch`) semantics for the nullable ones so a
+  // patch can CLEAR a column (e.g. `{ error: undefined }` on completion sets it to NULL — matching
+  // the TypeORM / MikroORM / in-memory stores). The two non-null Date fields use a defined-guard
+  // since they are never cleared. Previously only 7 fields were mapped, so `updateRun({ tags })` /
+  // `{ lockedBy }` / clearing `error` silently no-opped on this adapter.
   const data: Record<string, unknown> = {};
-  if (patch.status !== undefined) data.status = patch.status;
-  if (patch.output !== undefined) data.output = jsonOrNull(patch.output);
-  if (patch.error !== undefined) data.error = jsonOrNull(patch.error);
-  if (patch.wakeAt !== undefined) data.wakeAt = bigOrNull(patch.wakeAt);
-  if (patch.recoveryAttempts !== undefined) data.recoveryAttempts = patch.recoveryAttempts ?? null;
+  if ('workflow' in patch) data.workflow = patch.workflow;
+  if ('workflowVersion' in patch) data.workflowVersion = patch.workflowVersion;
+  if ('status' in patch) data.status = patch.status;
+  if ('input' in patch) data.input = jsonOrNull(patch.input);
+  if ('output' in patch) data.output = jsonOrNull(patch.output);
+  if ('error' in patch) data.error = jsonOrNull(patch.error);
+  if ('wakeAt' in patch) data.wakeAt = bigOrNull(patch.wakeAt);
+  if ('lockedBy' in patch) data.lockedBy = patch.lockedBy ?? null;
+  if ('lockedUntil' in patch)
+    data.lockedUntil = patch.lockedUntil == null ? null : new Date(patch.lockedUntil);
+  if ('recoveryAttempts' in patch) data.recoveryAttempts = patch.recoveryAttempts ?? null;
+  if ('tags' in patch) data.tags = jsonOrNull(patch.tags);
   if ('searchAttributes' in patch) data.searchAttributes = jsonOrNull(patch.searchAttributes);
-  if (patch.updatedAt !== undefined) data.updatedAt = patch.updatedAt;
+  if (patch.createdAt != null) data.createdAt = patch.createdAt;
+  if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;
   return data;
 }
 

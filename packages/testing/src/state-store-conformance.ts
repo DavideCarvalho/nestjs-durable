@@ -165,6 +165,37 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(dead?.recoveryAttempts).toBe(4);
     });
 
+    t(
+      'updateRun maps every patchable field — clears error and patches tags/lockedBy/input/timers',
+      async () => {
+        // Guards against per-adapter patch-whitelist drift: a store that maps only a subset of fields
+        // (or ignores `undefined` instead of clearing) would silently no-op these and fail here.
+        await store.createRun(
+          run({ status: 'failed', error: { message: 'boom' }, tags: ['old'], lockedBy: 'owner-1' }),
+        );
+        await store.updateRun('r1', {
+          status: 'completed',
+          output: { ok: true },
+          error: undefined, // completion CLEARS the prior error
+          input: { orderId: 'o2' },
+          tags: ['x', 'y'],
+          lockedBy: 'owner-2',
+          wakeAt: 123_456,
+          lockedUntil: 222_222,
+          updatedAt: at,
+        });
+        const r = await store.getRun('r1');
+        expect(r?.status).toBe('completed');
+        expect(r?.output).toEqual({ ok: true });
+        expect(r?.error).toBeUndefined();
+        expect(r?.input).toEqual({ orderId: 'o2' });
+        expect(r?.tags).toEqual(['x', 'y']);
+        expect(r?.lockedBy).toBe('owner-2');
+        expect(r?.wakeAt).toBe(123_456);
+        expect(r?.lockedUntil).toBe(222_222);
+      },
+    );
+
     // ---- checkpoints ------------------------------------------------------------------------
 
     t(

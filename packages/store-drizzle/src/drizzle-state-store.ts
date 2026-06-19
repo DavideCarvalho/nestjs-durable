@@ -341,14 +341,26 @@ function toRunRow(run: WorkflowRun): RunRow {
 }
 
 function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunRow> {
+  // Map EVERY patchable field, using presence (`'x' in patch`) semantics for the nullable ones so a
+  // patch can CLEAR a column (e.g. `{ error: undefined }` on completion sets it to NULL — matching
+  // the TypeORM / MikroORM / in-memory stores). The two non-null Date fields use a defined-guard
+  // since they are never cleared. Previously only 7 fields were mapped, so `updateRun({ tags })` /
+  // `{ lockedBy }` / clearing `error` silently no-opped on this adapter.
   const row: Partial<RunRow> = {};
-  if (patch.status !== undefined) row.status = patch.status;
-  if (patch.output !== undefined) row.output = patch.output ?? null;
-  if (patch.error !== undefined) row.error = patch.error ?? null;
-  if (patch.wakeAt !== undefined) row.wakeAt = patch.wakeAt ?? null;
-  if (patch.recoveryAttempts !== undefined) row.recoveryAttempts = patch.recoveryAttempts ?? null;
+  if ('workflow' in patch) row.workflow = patch.workflow;
+  if ('workflowVersion' in patch) row.workflowVersion = patch.workflowVersion;
+  if ('status' in patch) row.status = patch.status;
+  if ('input' in patch) row.input = patch.input ?? null;
+  if ('output' in patch) row.output = patch.output ?? null;
+  if ('error' in patch) row.error = patch.error ?? null;
+  if ('wakeAt' in patch) row.wakeAt = patch.wakeAt ?? null;
+  if ('lockedBy' in patch) row.lockedBy = patch.lockedBy ?? null;
+  if ('lockedUntil' in patch) row.lockedUntil = patch.lockedUntil ?? null;
+  if ('recoveryAttempts' in patch) row.recoveryAttempts = patch.recoveryAttempts ?? null;
+  if ('tags' in patch) row.tags = patch.tags ?? null;
   if ('searchAttributes' in patch) row.searchAttributes = patch.searchAttributes ?? null;
-  if (patch.updatedAt !== undefined) row.updatedAt = patch.updatedAt.getTime();
+  if (patch.createdAt != null) row.createdAt = patch.createdAt.getTime();
+  if (patch.updatedAt != null) row.updatedAt = patch.updatedAt.getTime();
   return row;
 }
 
