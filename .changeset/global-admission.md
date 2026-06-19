@@ -11,10 +11,16 @@ The remote-step flow-control gate (`ctx.call(step, input, { queue })`) is now dr
 
 - **core** — new `AdmissionBackend` interface; the default `InMemoryAdmissionBackend` preserves the
   existing per-instance behaviour. Inject a custom backend via `new WorkflowEngine({ admission })`.
-  The admit/release path is now async so a backend can do an atomic round-trip.
+  The admit/release path is async, and an optional `onFreed` capability lets a freed slot wake this
+  instance's blocked runs early instead of waiting for their retry tick.
 - **@dudousxd/nestjs-durable-admission-redis** (new) — `RedisAdmissionBackend` makes `concurrency`,
-  `rateLimit`, and priority ordering GLOBAL across engine replicas (so `concurrency: 5` means 5
-  in-flight across the whole fleet, not 5 per pod). Concurrency is a leased sorted set (a crashed
-  holder's slot auto-expires), the rate limit a fixed-window counter, and blocked callers register in
-  a priority-ordered waiter set — all enforced by one atomic Lua script.
+  `rateLimit`, priority **and** `fairness: 'key'` ordering GLOBAL across engine replicas, enforced by
+  one atomic Lua script:
+  - **Concurrency** via slot→instance ownership: a slot is reclaimed only when its owner's liveness
+    heartbeat lapses, so a live pod holds it for the full step duration (no time-lease false purge)
+    while a crashed pod's slots free within `instanceTtlMs`.
+  - **Rate limit** via a fixed-window counter.
+  - **Ordering** by priority desc → fairness round-robin by `key` → arrival FIFO, with abandoned
+    waiters pruned so a cancelled run can't deadlock the rest as a phantom best-waiter.
+  - **Early wake** by publishing a freed-slot signal on `release` that the engine subscribes to.
 - **nestjs** — `DurableModule.forRoot({ admission })` forwards the backend to the engine.

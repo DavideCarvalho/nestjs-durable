@@ -24,6 +24,12 @@ export interface AdmissionBackend {
    * counter ignores it.
    */
   release(queue: string, slotId: string): Promise<void>;
+  /**
+   * Optional: subscribe to "a slot just freed on `queue`" events (e.g. a fleet-wide pub/sub). The
+   * engine uses it to wake its admission-blocked runs early instead of waiting for their retry tick.
+   * A backend without it falls back to retry-tick polling. Fired best-effort across the fleet.
+   */
+  onFreed?(handler: (queue: string) => void): void;
 }
 
 /**

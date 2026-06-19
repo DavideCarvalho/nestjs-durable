@@ -326,6 +326,8 @@ export class WorkflowEngine {
   private readonly admission: AdmissionBackend;
   /** Names of registered flow-control queues — only these gate + track a slot. */
   private readonly registeredQueues = new Set<string>();
+  /** Runs on THIS instance blocked on admission, by queue — woken early on a freed-slot signal. */
+  private readonly queueWaiters = new Map<string, Set<string>>();
   /** Which queue a dispatched step took a slot from, by stepId — so the result can release it. */
   private readonly stepQueue = new Map<string, string>();
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
@@ -340,6 +342,9 @@ export class WorkflowEngine {
     this.controlPlane = deps.controlPlane;
     this.clock = deps.clock ?? Date.now;
     this.admission = deps.admission ?? new InMemoryAdmissionBackend(this.clock);
+    // Wake this instance's admission-blocked runs the moment a slot frees anywhere in the fleet,
+    // instead of waiting for their retry tick. Best-effort (the retry tick remains the guarantee).
+    this.admission.onFreed?.((queue) => this.wakeQueueWaiters(queue));
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
@@ -2091,7 +2096,14 @@ export class WorkflowEngine {
         key: admission?.fairnessKey ?? runId,
         waiterId: id,
       });
-      if (!decision.ok) throw new WorkflowSuspended(decision.retryAt);
+      if (!decision.ok) {
+        // Remember this run as blocked on `queue` so a freed-slot signal can wake it early.
+        let waiters = this.queueWaiters.get(queue);
+        if (!waiters) this.queueWaiters.set(queue, (waiters = new Set()));
+        waiters.add(runId);
+        throw new WorkflowSuspended(decision.retryAt);
+      }
+      this.queueWaiters.get(queue)?.delete(runId);
       this.stepQueue.set(id, queue);
     }
 
@@ -2140,8 +2152,10 @@ export class WorkflowEngine {
     const cp = await this.store.getCheckpoint(result.runId, result.seq);
     if (!cp || cp.status !== 'pending') return;
     // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Done
-    // before the cancelled-run early-return below, so a cancellation can't leak the slot.
-    await this.releaseQueueSlot(cp.stepId);
+    // before the cancelled-run early-return below, so a cancellation can't leak the slot. Released
+    // fire-and-forget: the slot/notify is best-effort (a global backend self-heals via lease), and
+    // not awaiting keeps it off the result-processing critical path (no ordering shift).
+    void this.releaseQueueSlot(cp.stepId).catch(() => undefined);
     // Drop a late result for a run that was cancelled/finished meanwhile — don't complete the step
     // or resume (the run is already terminal). This is the engine side of cooperative cancellation.
     const run = await this.store.getRun(result.runId);
@@ -2169,6 +2183,19 @@ export class WorkflowEngine {
       durationMs: finishedAt.getTime() - startedAt.getTime(),
     });
     await this.resume(result.runId);
+  }
+
+  /**
+   * A slot freed on `queue` (a fleet-wide signal): resume this instance's runs blocked on it so they
+   * re-contend now instead of at their retry tick. Snapshot-and-clear — a run still blocked after the
+   * retry re-registers itself, and one that's gone (cancelled/admitted) is dropped. Best-effort.
+   */
+  private wakeQueueWaiters(queue: string): void {
+    const waiters = this.queueWaiters.get(queue);
+    if (!waiters || waiters.size === 0) return;
+    const runIds = [...waiters];
+    waiters.clear();
+    for (const runId of runIds) void this.resume(runId).catch(() => undefined);
   }
 
   /** Release the flow-control slot a dispatched step held (if any), by its stepId. */
