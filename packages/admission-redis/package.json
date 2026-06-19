@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-admission-redis",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Redis-backed global admission gate for nestjs-durable — fleet-wide concurrency, rate limit, and priority ordering",
   "license": "MIT",
   "author": "Davide Carvalho",
