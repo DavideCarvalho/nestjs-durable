@@ -1155,6 +1155,28 @@ export class WorkflowEngine {
   }
 
   /**
+   * Hard-delete a run and its entire subtree. Unlike {@link cancel} (which marks a run `cancelled`
+   * but keeps it as history), delete REMOVES the run and all its rows (checkpoints, signal waiters,
+   * search-attribute rows) — it vanishes from {@link getRun} and {@link listRuns}. Use it to purge a
+   * finished run whose data is being deleted (e.g. a pipeline run whose result rows are cleared).
+   *
+   * Cascades depth-first via {@link getRunChildren} so children are gone before the parent (no
+   * orphaned child runs). Prefer {@link cancel} first for a live run — deleting one mid-flight orphans
+   * its worker (its next checkpoint write fails). Returns the number of runs deleted (0 if absent).
+   */
+  async deleteRun(runId: string): Promise<number> {
+    const run = await this.store.getRun(runId);
+    if (!run) return 0;
+    // Collect children BEFORE deleting this run's checkpoints (getRunChildren reads them).
+    let deleted = 0;
+    for (const childId of await this.getRunChildren(runId)) {
+      deleted += await this.deleteRun(childId);
+    }
+    await this.store.deleteRun(runId);
+    return deleted + 1;
+  }
+
+  /**
    * Cascade cancellation to a run's children — both awaited (`ctx.child`, found via its live
    * `child:<id>` waiter) and fire-and-forget (`ctx.startChild`, found via its `spawn:<id>`
    * checkpoint). Recursive, so a whole subtree is cancelled; the terminal guard in `cancel` stops it

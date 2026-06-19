@@ -138,6 +138,14 @@ export class PrismaStateStore implements StateStore {
     return row ? fromRunRow(row) : null;
   }
 
+  async deleteRun(runId: string): Promise<void> {
+    // Child rows first, then the run — checkpoints, signal waiters, attribute rows.
+    await this.db.durableStepCheckpoint.deleteMany({ where: { runId } });
+    await this.db.durableSignalWaiter.deleteMany({ where: { runId } });
+    await this.db.durableRunAttribute.deleteMany({ where: { runId } });
+    await this.db.durableWorkflowRun.deleteMany({ where: { id: runId } });
+  }
+
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
     const row = await this.db.durableStepCheckpoint.findUnique({
       where: { runId_seq: { runId, seq } },

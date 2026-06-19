@@ -112,6 +112,14 @@ export class TypeOrmStateStore implements StateStore {
     return e ? fromRunEntity(e) : null;
   }
 
+  async deleteRun(runId: string): Promise<void> {
+    // Child rows first, then the run — checkpoints, signal waiters, attribute rows.
+    await this.checkpoints().delete({ runId });
+    await this.waiters().delete({ runId });
+    await this.attributes().delete({ runId });
+    await this.runs().delete({ id: runId });
+  }
+
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
     const e = await this.checkpoints().findOneBy({ runId, seq });
     return e ? fromCheckpointEntity(e) : null;
