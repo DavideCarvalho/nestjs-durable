@@ -1,5 +1,13 @@
 # @dudousxd/nestjs-durable-store-drizzle
 
+## 0.8.2
+
+### Patch Changes
+
+- 6f4e59e: Fix: map every patchable field in the Prisma and Drizzle `updateRun` implementations (previously a subset of fields could be silently dropped on partial updates).
+
+  Internal engine refactors (behavior-preserving): extract `SingletonGate` to concentrate the singleton feature, funnel run settle/suspend transitions through a single `settleRun()`, and extract a `stepCheckpoint()` factory deduping 8 hand-built literals.
+
 ## 0.8.1
 
 ### Patch Changes
