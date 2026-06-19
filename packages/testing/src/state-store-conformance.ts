@@ -172,6 +172,60 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect((await store.getRun('noprio'))?.priority).toBeUndefined();
     });
 
+    t('deleteRun removes the run and all its rows (checkpoints, waiters, attributes)', async () => {
+      await store.createRun(run({ searchAttributes: { tier: 'pro' } }));
+      await store.saveCheckpoint(checkpoint());
+      await store.putSignalWaiter({ token: 'approve-r1', runId: 'r1', seq: 0 });
+
+      await store.deleteRun('r1');
+
+      // The run and every child row are gone — not merely marked terminal.
+      expect(await store.getRun('r1')).toBeNull();
+      expect(await store.listCheckpoints('r1')).toEqual([]);
+      expect(await store.listSignalWaiters('approve-')).toEqual([]);
+      // The normalized attribute side-table no longer matches it.
+      expect(
+        await store.listRuns({
+          attributes: [{ key: 'tier', op: 'eq', value: 'pro' }],
+        }),
+      ).toEqual([]);
+    });
+
+    t('deleteRun is a no-op for a missing run', async () => {
+      await expect(store.deleteRun('nope')).resolves.toBeUndefined();
+    });
+
+    t(
+      'updateRun maps every patchable field — clears error and patches tags/lockedBy/input/timers',
+      async () => {
+        // Guards against per-adapter patch-whitelist drift: a store that maps only a subset of fields
+        // (or ignores `undefined` instead of clearing) would silently no-op these and fail here.
+        await store.createRun(
+          run({ status: 'failed', error: { message: 'boom' }, tags: ['old'], lockedBy: 'owner-1' }),
+        );
+        await store.updateRun('r1', {
+          status: 'completed',
+          output: { ok: true },
+          error: undefined, // completion CLEARS the prior error
+          input: { orderId: 'o2' },
+          tags: ['x', 'y'],
+          lockedBy: 'owner-2',
+          wakeAt: 123_456,
+          lockedUntil: 222_222,
+          updatedAt: at,
+        });
+        const r = await store.getRun('r1');
+        expect(r?.status).toBe('completed');
+        expect(r?.output).toEqual({ ok: true });
+        expect(r?.error).toBeUndefined();
+        expect(r?.input).toEqual({ orderId: 'o2' });
+        expect(r?.tags).toEqual(['x', 'y']);
+        expect(r?.lockedBy).toBe('owner-2');
+        expect(r?.wakeAt).toBe(123_456);
+        expect(r?.lockedUntil).toBe(222_222);
+      },
+    );
+
     // ---- checkpoints ------------------------------------------------------------------------
 
     t(
