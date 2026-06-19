@@ -1,5 +1,5 @@
-import { type EngineEvent, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { emit } from '@dudousxd/nestjs-diagnostics';
+import { type EngineEvent, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 
 /**
  * Re-emit every engine lifecycle event onto the Aviary diagnostics bus as `aviary:durable:<type>`

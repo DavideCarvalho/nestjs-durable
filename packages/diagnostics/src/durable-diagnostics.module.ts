@@ -1,3 +1,4 @@
+import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import {
   type DynamicModule,
   Global,
@@ -7,7 +8,6 @@ import {
   type OnApplicationShutdown,
 } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
-import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { attachDurableDiagnostics } from './attach-durable-diagnostics';
 
 /** Resolves the already-constructed engine from the container on bootstrap and attaches the

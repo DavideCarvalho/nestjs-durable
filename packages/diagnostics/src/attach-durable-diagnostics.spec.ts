@@ -1,5 +1,5 @@
-import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { type DiagnosticEvent, getChannel, resetRegistry } from '@dudousxd/nestjs-diagnostics';
+import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { afterEach, describe, expect, it } from 'vitest';
 import { attachDurableDiagnostics } from './attach-durable-diagnostics';
 
