@@ -2,11 +2,21 @@ import type { MikroORM } from '@mikro-orm/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ensureMikroOrmDurableSchema } from './schema';
 
-/** Minimal ORM double: a fixed update-schema SQL string + a connection whose `execute` we control. */
-function makeOrm(sql: string, execute: (statement: string) => Promise<void>): MikroORM {
+/** Minimal ORM double: a fixed update-schema SQL string + a connection whose `execute` we control.
+ * Platform defaults to a non-MySQL name so collation alignment is a no-op unless a test opts in. */
+function makeOrm(
+  sql: string,
+  execute: (statement: string, params?: unknown[]) => Promise<unknown>,
+  opts: { platform?: string; collate?: string } = {},
+): MikroORM {
+  const platform = opts.platform ?? 'SqlitePlatform';
   return {
     schema: { getUpdateSchemaSQL: async () => sql },
-    em: { getConnection: () => ({ execute }) },
+    em: {
+      getConnection: () => ({ execute }),
+      getPlatform: () => ({ constructor: { name: platform } }),
+    },
+    config: { get: (key: string) => (key === 'collate' ? opts.collate : undefined) },
   } as unknown as MikroORM;
 }
 
@@ -58,5 +68,80 @@ describe('ensureMikroOrmDurableSchema resilience', () => {
 
     expect(ran).toHaveLength(1);
     expect(ran[0]).toContain('durable_signal_waiters');
+  });
+});
+
+describe('ensureMikroOrmDurableSchema collation alignment', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('converts durable tables whose collation differs from the configured collate (mysql)', async () => {
+    const converts: string[] = [];
+    const execute = vi.fn(async (statement: string) => {
+      if (/information_schema/i.test(statement)) {
+        return [{ collation: 'utf8mb4_0900_ai_ci' }];
+      }
+      converts.push(statement);
+      return undefined;
+    });
+
+    await ensureMikroOrmDurableSchema(
+      makeOrm('', execute, { platform: 'MySqlPlatform', collate: 'utf8mb4_unicode_ci' }),
+    );
+
+    // One CONVERT per durable table, deriving the charset from the collation prefix.
+    expect(converts).toHaveLength(5);
+    expect(
+      converts.every((s) => /convert to character set utf8mb4 collate utf8mb4_unicode_ci/i.test(s)),
+    ).toBe(true);
+    expect(converts.some((s) => s.includes('durable_workflow_runs'))).toBe(true);
+  });
+
+  it('skips tables already at the configured collation', async () => {
+    const converts: string[] = [];
+    const execute = vi.fn(async (statement: string) => {
+      if (/information_schema/i.test(statement)) {
+        return [{ collation: 'utf8mb4_unicode_ci' }];
+      }
+      converts.push(statement);
+      return undefined;
+    });
+
+    await ensureMikroOrmDurableSchema(
+      makeOrm('', execute, { platform: 'MySqlPlatform', collate: 'utf8mb4_unicode_ci' }),
+    );
+
+    expect(converts).toHaveLength(0);
+  });
+
+  it('is a no-op on non-mysql platforms', async () => {
+    const execute = vi.fn(async () => undefined);
+    await ensureMikroOrmDurableSchema(
+      makeOrm('', execute, { platform: 'PostgreSqlPlatform', collate: 'whatever' }),
+    );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op when no collate is configured', async () => {
+    const execute = vi.fn(async () => undefined);
+    await ensureMikroOrmDurableSchema(makeOrm('', execute, { platform: 'MySqlPlatform' }));
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('warns and continues when a CONVERT fails (non-fatal)', async () => {
+    const execute = vi.fn(async (statement: string) => {
+      if (/information_schema/i.test(statement)) {
+        return [{ collation: 'utf8mb4_0900_ai_ci' }];
+      }
+      throw new Error('lock wait timeout exceeded');
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(
+      ensureMikroOrmDurableSchema(
+        makeOrm('', execute, { platform: 'MySqlPlatform', collate: 'utf8mb4_unicode_ci' }),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(warn).toHaveBeenCalled();
   });
 });

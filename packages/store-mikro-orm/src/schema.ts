@@ -61,9 +61,6 @@ export async function ensureMikroOrmDurableSchema(orm: MikroORM): Promise<void> 
       const table = targetTable(statement);
       return table !== undefined && DURABLE_TABLE_NAMES.has(table);
     });
-  if (ours.length === 0) {
-    return;
-  }
   const connection = orm.em.getConnection();
   for (const statement of ours) {
     try {
@@ -81,6 +78,64 @@ export async function ensureMikroOrmDurableSchema(orm: MikroORM): Promise<void> 
       const message = err instanceof Error ? err.message : String(err);
       console.warn(
         `[nestjs-durable-store-mikro-orm] skipped a non-structural durable-schema statement that failed; the column is left as-is (functional) — repair the data out of band to converge its type. Statement: ${statement} — ${message}`,
+      );
+    }
+  }
+
+  // Converge collation last, once the tables exist (whether just created above or pre-existing).
+  await alignDurableCollation(orm);
+}
+
+/** A MySQL identifier we are willing to interpolate into DDL (charset / collation names). */
+function isSafeSqlIdentifier(value: string): boolean {
+  return /^[A-Za-z0-9_]+$/.test(value);
+}
+
+/**
+ * Align each durable table's collation to the ORM's configured `collate` (MySQL/MariaDB only).
+ *
+ * MikroORM's auto-schema (`getUpdateSchemaSQL`) creates tables with the server's DEFAULT collation —
+ * on MySQL 8.4 that's `utf8mb4_0900_ai_ci` — and ignores the `collate` config option. When the host
+ * app pins a different collation on its own tables (commonly `utf8mb4_unicode_ci` via migrations), a
+ * JOIN between a durable table and an app table throws "Illegal mix of collations". We converge it
+ * here: read the configured collation and `CONVERT` only the durable tables whose collation differs.
+ *
+ * Idempotent (matching tables are skipped), non-fatal (a CONVERT failure is warned, never crashes
+ * boot), and a no-op when no `collate` is configured or the platform isn't MySQL/MariaDB.
+ */
+async function alignDurableCollation(orm: MikroORM): Promise<void> {
+  const platform = String(orm.em.getPlatform().constructor.name).toLowerCase();
+  if (!platform.includes('mysql') && !platform.includes('maria')) {
+    return;
+  }
+  const collate = orm.config.get('collate');
+  if (typeof collate !== 'string' || !isSafeSqlIdentifier(collate)) {
+    return;
+  }
+  // utf8mb4_unicode_ci → utf8mb4. CONVERT TO needs the charset that owns the collation.
+  const charset = collate.split('_')[0];
+  if (!charset || !isSafeSqlIdentifier(charset)) {
+    return;
+  }
+  const connection = orm.em.getConnection();
+  for (const table of DURABLE_TABLE_NAMES) {
+    try {
+      const rows = (await connection.execute(
+        'select table_collation as collation from information_schema.tables where table_schema = database() and table_name = ? limit 1',
+        [table],
+      )) as Array<{ collation?: string | null }>;
+      const current = rows[0]?.collation;
+      // Table absent (nothing to align) or already at the target collation — skip.
+      if (current == null || current === collate) {
+        continue;
+      }
+      await connection.execute(
+        `alter table \`${table}\` convert to character set ${charset} collate ${collate}`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[nestjs-durable-store-mikro-orm] could not align collation for \`${table}\` to ${collate} (left as-is): ${message}`,
       );
     }
   }
