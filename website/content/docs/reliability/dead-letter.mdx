@@ -41,10 +41,22 @@ can do something active: page an on-call engineer, push to a real message queue,
 handles it.
 
 ```ts
-engine.onDead((run) => {
-  logger.error(`run ${run.id} (${run.workflow}) dead-lettered: ${run.error?.message}`);
-  void pager.alert('durable-poison-pill', { runId: run.id, workflow: run.workflow });
-});
+@Injectable()
+export class DeadLetterAlerts implements OnModuleInit {
+  private readonly logger = new Logger(DeadLetterAlerts.name);
+
+  constructor(
+    private readonly engine: WorkflowEngine,
+    private readonly pager: PagerService,
+  ) {}
+
+  onModuleInit() {
+    this.engine.onDead((run) => {
+      this.logger.error(`run ${run.id} (${run.workflow}) dead-lettered: ${run.error?.message}`);
+      void this.pager.alert('durable-poison-pill', { runId: run.id, workflow: run.workflow });
+    });
+  }
+}
 ```
 
 `onDead` returns an unsubscribe function. It fires on the instance that dead-letters the run.
