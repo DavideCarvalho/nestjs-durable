@@ -210,12 +210,12 @@ export interface DurableModuleAsyncOptions {
 @Module({})
 export class DurableModule {
   static forRoot(options: DurableModuleOptions): DynamicModule {
-    return DurableModule.build({ provide: DURABLE_OPTIONS, useValue: options });
+    return DurableModule.build({ provide: DURABLE_OPTIONS_CANONICAL, useValue: options });
   }
 
   static forRootAsync(options: DurableModuleAsyncOptions): DynamicModule {
     return DurableModule.build({
-      provide: DURABLE_OPTIONS,
+      provide: DURABLE_OPTIONS_CANONICAL,
       useFactory: options.useFactory,
       inject: options.inject ?? [],
     });
@@ -229,18 +229,19 @@ export class DurableModule {
       providers: [
         optionsProvider,
         {
-          provide: STATE_STORE,
+          provide: STATE_STORE_CANONICAL,
           useFactory: (options: DurableModuleOptions) => options.store,
-          inject: [DURABLE_OPTIONS],
+          inject: [DURABLE_OPTIONS_CANONICAL],
         },
         {
-          provide: TRANSPORT,
+          provide: TRANSPORT_CANONICAL,
           useFactory: (options: DurableModuleOptions) => options.transport ?? null,
-          inject: [DURABLE_OPTIONS],
+          inject: [DURABLE_OPTIONS_CANONICAL],
         },
-        { provide: STATE_STORE_CANONICAL, useExisting: STATE_STORE },
-        { provide: TRANSPORT_CANONICAL, useExisting: TRANSPORT },
-        { provide: DURABLE_OPTIONS_CANONICAL, useExisting: DURABLE_OPTIONS },
+        // Legacy back-compat aliases (deprecated tokens still resolve to the same instances):
+        { provide: STATE_STORE, useExisting: STATE_STORE_CANONICAL },
+        { provide: TRANSPORT, useExisting: TRANSPORT_CANONICAL },
+        { provide: DURABLE_OPTIONS, useExisting: DURABLE_OPTIONS_CANONICAL },
         {
           provide: WorkflowEngine,
           useFactory: async (
@@ -297,7 +298,12 @@ export class DurableModule {
             // default) is wired by the WorkflowRegistrar, which owns the `@Workflow` metadata.
             return engine;
           },
-          inject: [STATE_STORE, TRANSPORT, DURABLE_OPTIONS, ModuleRef],
+          inject: [
+            STATE_STORE_CANONICAL,
+            TRANSPORT_CANONICAL,
+            DURABLE_OPTIONS_CANONICAL,
+            ModuleRef,
+          ],
         },
         WorkflowService,
         EntityService,

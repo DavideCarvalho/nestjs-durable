@@ -1,6 +1,6 @@
 import {
-  DURABLE_OPTIONS,
-  STATE_STORE,
+  DURABLE_OPTIONS_CANONICAL,
+  STATE_STORE_CANONICAL,
   type StateStore,
   type WorkflowCtx,
   WorkflowEngine,
@@ -42,8 +42,8 @@ export class WorkflowRegistrar
     private readonly discovery: DiscoveryService,
     private readonly metadataScanner: MetadataScanner,
     private readonly engine: WorkflowEngine,
-    @Inject(STATE_STORE) private readonly store: StateStore,
-    @Inject(DURABLE_OPTIONS) private readonly options: DurableModuleOptions,
+    @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore,
+    @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {

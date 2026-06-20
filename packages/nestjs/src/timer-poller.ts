@@ -1,4 +1,8 @@
-import { DURABLE_OPTIONS, WorkflowEngine, runSchedules } from '@dudousxd/nestjs-durable-core';
+import {
+  DURABLE_OPTIONS_CANONICAL,
+  WorkflowEngine,
+  runSchedules,
+} from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
   Injectable,
@@ -20,7 +24,7 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
 
   constructor(
     private readonly engine: WorkflowEngine,
-    @Inject(DURABLE_OPTIONS) private readonly options: DurableModuleOptions,
+    @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
