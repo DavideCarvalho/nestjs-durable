@@ -2,12 +2,15 @@ import {
   type AdmissionBackend,
   type ControlPlane,
   DURABLE_OPTIONS,
+  DURABLE_OPTIONS_CANONICAL,
   type NamedTransport,
   type QueueConfig,
   STATE_STORE,
+  STATE_STORE_CANONICAL,
   type ScheduledWorkflow,
   type StateStore,
   TRANSPORT,
+  TRANSPORT_CANONICAL,
   type Transport,
   WorkflowEngine,
   type WorkflowRef,
@@ -235,6 +238,9 @@ export class DurableModule {
           useFactory: (options: DurableModuleOptions) => options.transport ?? null,
           inject: [DURABLE_OPTIONS],
         },
+        { provide: STATE_STORE_CANONICAL, useExisting: STATE_STORE },
+        { provide: TRANSPORT_CANONICAL, useExisting: TRANSPORT },
+        { provide: DURABLE_OPTIONS_CANONICAL, useExisting: DURABLE_OPTIONS },
         {
           provide: WorkflowEngine,
           useFactory: async (
@@ -299,7 +305,16 @@ export class DurableModule {
         DurableStepRegistrar,
         TimerPoller,
       ],
-      exports: [WorkflowService, EntityService, WorkflowEngine, STATE_STORE, TRANSPORT],
+      exports: [
+        WorkflowService,
+        EntityService,
+        WorkflowEngine,
+        STATE_STORE,
+        STATE_STORE_CANONICAL,
+        TRANSPORT,
+        TRANSPORT_CANONICAL,
+        DURABLE_OPTIONS_CANONICAL,
+      ],
     };
   }
 }

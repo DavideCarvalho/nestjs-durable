@@ -16,3 +16,15 @@
 export const STATE_STORE = Symbol.for('nestjs-durable:STATE_STORE');
 export const TRANSPORT = Symbol.for('nestjs-durable:TRANSPORT');
 export const DURABLE_OPTIONS = Symbol.for('nestjs-durable:DURABLE_OPTIONS');
+
+/**
+ * Canonical, cross-lib-discoverable aliases of the durable DI tokens, following the ecosystem
+ * capability naming `@dudousxd/nestjs-durable:<name>` (identical to `capability('durable', <name>)`).
+ * `DurableModule` binds these alongside the legacy tokens (dual-bind), so an external library can
+ * resolve durable's store/transport/options by the canonical name without importing durable
+ * internals. Bare `Symbol.for` (same cross-copy-stability rationale as the legacy tokens above)
+ * keeps `core` free of any `@dudousxd/nestjs-diagnostics` runtime dependency.
+ */
+export const STATE_STORE_CANONICAL = Symbol.for('@dudousxd/nestjs-durable:state-store');
+export const TRANSPORT_CANONICAL = Symbol.for('@dudousxd/nestjs-durable:transport');
+export const DURABLE_OPTIONS_CANONICAL = Symbol.for('@dudousxd/nestjs-durable:options');
