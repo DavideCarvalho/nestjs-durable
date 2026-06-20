@@ -29,6 +29,9 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // Generate the store-prisma SQLite test client once (pre-workers) so it never goes stale against
+    // the current schema. See vitest.globalsetup.ts.
+    globalSetup: ['./vitest.globalsetup.ts'],
     setupFiles: ['./vitest.setup.ts'],
     include: ['packages/*/src/**/*.{test,spec}.ts', 'examples/*/src/**/*.{test,spec}.ts'],
     // `*.db.spec.ts` boot real Postgres/MySQL via testcontainers — run them only via `pnpm test:db`
