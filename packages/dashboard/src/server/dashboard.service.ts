@@ -4,7 +4,7 @@ import {
   type MetricsCollector,
   type RunQuery,
   type RunResult,
-  STATE_STORE,
+  STATE_STORE_CANONICAL,
   type StateStore,
   type StepCheckpoint,
   type UpdateResult,
@@ -30,7 +30,7 @@ export class DashboardService {
   private readonly metricsCollector: MetricsCollector;
 
   constructor(
-    @Inject(STATE_STORE) private readonly store: StateStore,
+    @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore,
     private readonly engine: WorkflowEngine,
   ) {
     this.metricsCollector = collectMetrics(this.engine);

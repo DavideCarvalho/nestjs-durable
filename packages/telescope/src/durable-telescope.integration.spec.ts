@@ -1,4 +1,8 @@
-import { InMemoryStateStore, STATE_STORE, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  STATE_STORE_CANONICAL,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
 import { ExtensionRegistry } from '@dudousxd/nestjs-telescope';
 import type { ExtensionContext } from '@dudousxd/nestjs-telescope';
 import { describe, expect, it } from 'vitest';
@@ -19,7 +23,7 @@ describe('durable extension integrates with the real Telescope ExtensionRegistry
     const engine = new WorkflowEngine({ store });
     const ctx = ctxResolving(
       new Map<unknown, unknown>([
-        [STATE_STORE, store],
+        [STATE_STORE_CANONICAL, store],
         [WorkflowEngine, engine],
       ]),
     );
@@ -35,7 +39,7 @@ describe('durable extension integrates with the real Telescope ExtensionRegistry
 
   it('resolves durable.state against a real (empty) store to 0', async () => {
     const store = new InMemoryStateStore();
-    const ctx = ctxResolving(new Map<unknown, unknown>([[STATE_STORE, store]]));
+    const ctx = ctxResolving(new Map<unknown, unknown>([[STATE_STORE_CANONICAL, store]]));
     const registry = new ExtensionRegistry([durableTelescopeExtension()], ctx);
 
     const provider = registry.findProvider('durable.state');

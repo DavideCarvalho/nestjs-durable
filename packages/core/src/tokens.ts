@@ -13,8 +13,20 @@
  * them to one. Mirrors the `CONTEXT_ACCESSOR` token in `@dudousxd/nestjs-durable`'s `tokens.ts`.
  */
 
+/**
+ * @deprecated Use {@link STATE_STORE_CANONICAL} (`@dudousxd/nestjs-durable:state-store`). The legacy
+ * token stays bound as a back-compat alias and still resolves; it will be removed in a future major.
+ */
 export const STATE_STORE = Symbol.for('nestjs-durable:STATE_STORE');
+/**
+ * @deprecated Use {@link TRANSPORT_CANONICAL} (`@dudousxd/nestjs-durable:transport`). The legacy
+ * token stays bound as a back-compat alias and still resolves; it will be removed in a future major.
+ */
 export const TRANSPORT = Symbol.for('nestjs-durable:TRANSPORT');
+/**
+ * @deprecated Use {@link DURABLE_OPTIONS_CANONICAL} (`@dudousxd/nestjs-durable:options`). The legacy
+ * token stays bound as a back-compat alias and still resolves; it will be removed in a future major.
+ */
 export const DURABLE_OPTIONS = Symbol.for('nestjs-durable:DURABLE_OPTIONS');
 
 /**

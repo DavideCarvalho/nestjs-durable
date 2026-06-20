@@ -1,7 +1,7 @@
 import {
-  DURABLE_OPTIONS,
+  DURABLE_OPTIONS_CANONICAL,
   type StepLogger,
-  TRANSPORT,
+  TRANSPORT_CANONICAL,
   type Transport,
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable, type OnModuleInit } from '@nestjs/common';
@@ -40,8 +40,8 @@ export class DurableStepRegistrar implements OnModuleInit {
   constructor(
     private readonly discovery: DiscoveryService,
     private readonly metadataScanner: MetadataScanner,
-    @Inject(TRANSPORT) private readonly transport: Transport | null,
-    @Inject(DURABLE_OPTIONS) private readonly options: DurableModuleOptions,
+    @Inject(TRANSPORT_CANONICAL) private readonly transport: Transport | null,
+    @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
   ) {}
 
   onModuleInit(): void {

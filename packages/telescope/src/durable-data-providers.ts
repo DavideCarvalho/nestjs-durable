@@ -1,4 +1,4 @@
-import { STATE_STORE, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import { STATE_STORE_CANONICAL, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import type { RunStatus, StateStore } from '@dudousxd/nestjs-durable-core';
 import type { DataProvider, ExtensionContext } from '@dudousxd/nestjs-telescope';
 import { TELESCOPE_STORAGE } from '@dudousxd/nestjs-telescope';
@@ -69,7 +69,7 @@ export function durableStateProvider(): DataProvider {
   return {
     name: 'durable.state',
     async resolve(query, ctx: ExtensionContext) {
-      const store = ctx.moduleRef.get(STATE_STORE, { strict: false }) as StateStore;
+      const store = ctx.moduleRef.get(STATE_STORE_CANONICAL, { strict: false }) as StateStore;
       const status = (query?.status as RunStatus) ?? 'dead';
       const runs = await store.listRuns({ status, limit: STATE_CAP });
       return { value: runs.length };
@@ -134,7 +134,7 @@ export function durableRecentFailuresProvider(): DataProvider {
   return {
     name: 'durable.recentFailures',
     async resolve(query, ctx: ExtensionContext) {
-      const store = ctx.moduleRef.get(STATE_STORE, { strict: false }) as StateStore;
+      const store = ctx.moduleRef.get(STATE_STORE_CANONICAL, { strict: false }) as StateStore;
       const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
       const windowMs = query?.windowMs === undefined ? 24 * 60 * 60 * 1000 : Number(query.windowMs);
       const cutoff = windowMs > 0 ? Date.now() - windowMs : 0;
@@ -401,7 +401,7 @@ export function durableStateBreakdownProvider(): DataProvider {
   return {
     name: 'durable.stateBreakdown',
     async resolve(_query, ctx: ExtensionContext) {
-      const store = ctx.moduleRef.get(STATE_STORE, { strict: false }) as StateStore;
+      const store = ctx.moduleRef.get(STATE_STORE_CANONICAL, { strict: false }) as StateStore;
       const counts = await Promise.all(
         STATE_BREAKDOWN_STATUSES.map((status) =>
           store.listRuns({ status, limit: STATE_CAP }).then((runs) => runs.length),
