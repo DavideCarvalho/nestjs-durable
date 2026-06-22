@@ -97,6 +97,13 @@ export interface StepCheckpoint {
   /** For sleep steps: epoch ms the sleep elapses at. */
   wakeAt?: number | undefined;
   /**
+   * Set on the running placeholder checkpoints of the children dispatched by one `ctx.all` call —
+   * a shared tag (`all:<firstSeq>`) grouping the N siblings so the dashboard can render them as one
+   * parallel fan-out. Optional and additive: absent on every non-`all` checkpoint. Mirrors the
+   * Python SDK's `parallelGroup`.
+   */
+  parallelGroup?: string | undefined;
+  /**
    * When the step entered the system: for a remote step, when the engine dispatched it to the
    * transport; for a local step, when it began. Queue-wait time = `startedAt − enqueuedAt`.
    */
@@ -873,6 +880,28 @@ export interface WorkflowCtx {
     input: unknown,
     options?: string | ChildCallOptions,
   ): Promise<string>;
+  /**
+   * Run N children of the SAME workflow **in parallel** and wait for ALL of them: dispatches one
+   * child per entry in `inputs` (concurrently, each with its own durable lifecycle), suspends — zero
+   * compute — until every child reaches a terminal state, then resumes with their outputs in **input
+   * order**. Child ids are group-scoped and stable (`<runId>.all.<firstSeq>.<i>`), and the running
+   * placeholders share a `parallelGroup` tag so the dashboard renders the fan-out as one group.
+   *
+   * `mode` (default `waitAll`): `waitAll` waits for all then throws an aggregate {@link GatherError}
+   * if any failed; `failFast` throws as soon as a failed child is seen (siblings are not cancelled in
+   * v1 — their eventual results are ignored). Empty `inputs` returns `[]` with no side effects. The
+   * wait-all / fan-out counterpart to {@link child}; parity with the Python SDK's `gather_children`.
+   */
+  all<C extends WorkflowClass>(
+    workflow: C,
+    inputs: WorkflowInputOf<C>[],
+    opts?: { mode?: 'waitAll' | 'failFast' },
+  ): Promise<WorkflowOutputOf<C>[]>;
+  all<TOutput = unknown>(
+    workflow: string,
+    inputs: unknown[],
+    opts?: { mode?: 'waitAll' | 'failFast' },
+  ): Promise<TOutput[]>;
   /**
    * Pause the run at this point until a human resumes it from the dashboard (or
    * `engine.continue(runId)`). Records a visible `pending` checkpoint so the breakpoint shows up

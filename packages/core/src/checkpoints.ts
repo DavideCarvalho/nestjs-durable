@@ -65,6 +65,7 @@ export function instantCheckpoint(p: {
   status?: StepCheckpoint['status'];
   output?: unknown;
   wakeAt?: number;
+  parallelGroup?: string;
 }): StepCheckpoint {
   const at = new Date();
   return {
@@ -76,6 +77,7 @@ export function instantCheckpoint(p: {
     status: p.status ?? 'completed',
     output: p.output,
     wakeAt: p.wakeAt,
+    parallelGroup: p.parallelGroup,
     attempts: 1,
     enqueuedAt: at,
     startedAt: at,
