@@ -25,7 +25,9 @@ function commonPrefix(names: string[]): string {
 /** A concise summary of a fan: a name-derived label like `handle ×7` (NOT the group prefix). */
 function fanLabel(steps: StepCheckpoint[]): string {
   const prefix = commonPrefix(steps.map((s) => s.name));
-  return `${prefix || 'parallel'} ×${steps.length}`;
+  // A single-character shared prefix (e.g. `a`/`b` → ``, but `fA`/`fB` → `f`) reads as noise, not a
+  // meaningful label — fall back to `parallel` unless the shared prefix is at least two chars.
+  return `${prefix.length >= 2 ? prefix : 'parallel'} ×${steps.length}`;
 }
 
 /**

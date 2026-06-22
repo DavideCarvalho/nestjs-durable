@@ -109,4 +109,26 @@ describe('groupParallelSpans', () => {
     ]);
     expect(nodes.map((n) => n.kind)).toEqual(['single', 'fan', 'single', 'fan', 'single']);
   });
+
+  it('returns [] for an empty timeline', () => {
+    expect(groupParallelSpans([])).toEqual([]);
+  });
+
+  it('handles a fan as the very last node (no trailing single)', () => {
+    const nodes = groupParallelSpans([
+      cp({ seq: 0, name: 'setup' }),
+      cp({ seq: 1, name: 'handle_a', parallelGroup: 'g' }),
+      cp({ seq: 2, name: 'handle_b', parallelGroup: 'g' }),
+    ]);
+    expect(nodes.map((n) => n.kind)).toEqual(['single', 'fan']);
+    expect(nodes[1]).toMatchObject({ kind: 'fan', label: 'handle ×2' });
+  });
+
+  it('falls back to "parallel" when the shared name prefix is a single char', () => {
+    const nodes = groupParallelSpans([
+      cp({ seq: 0, name: 'fA', parallelGroup: 'g' }),
+      cp({ seq: 1, name: 'fB', parallelGroup: 'g' }),
+    ]);
+    expect(nodes[0]).toMatchObject({ kind: 'fan', label: 'parallel ×2' });
+  });
 });
