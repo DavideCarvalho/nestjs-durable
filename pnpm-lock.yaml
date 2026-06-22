@@ -583,6 +583,12 @@ importers:
       '@dudousxd/nestjs-durable-core':
         specifier: workspace:^
         version: link:../core
+      bullmq:
+        specifier: 5.34.10
+        version: 5.34.10
+      ioredis:
+        specifier: 5.4.2
+        version: 5.4.2
       tsup:
         specifier: 8.3.5
         version: 8.3.5(@swc/core@1.15.41)(jiti@2.7.0)(postcss@8.5.15)(typescript@5.9.3)(yaml@2.9.0)
