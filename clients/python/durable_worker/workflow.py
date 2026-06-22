@@ -18,6 +18,10 @@ Each `ctx.*` op is keyed by a deterministic seq. On replay an op already in hist
 recorded result; the first UNRESOLVED blocking op (call/sleep/wait_signal/start_child) suspends the
 turn, emitting its command. Local steps run inline and record their result (so side effects /
 non-determinism happen once). See docs/plans/2026-06-15-polyglot-workflows-protocol.md.
+
+``ctx.gather([(name, body), ...])`` runs N local steps CONCURRENTLY (threads) and waits for all;
+``ctx.gather_children(workflow, [inputs])`` does the same with child workflows. Both default to
+``wait_all`` (raise an aggregate ``GatherFailed`` if any item fails) with an opt-in ``fail_fast``.
 """
 
 from __future__ import annotations

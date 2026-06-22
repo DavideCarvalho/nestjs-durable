@@ -174,5 +174,52 @@ class GatherChildrenTest(unittest.TestCase):
         self.assertEqual(ctx.commands, [])
 
 
+from durable_worker.workflow import WorkflowWorker  # noqa: E402
+
+
+class GatherProcessTaskTest(unittest.TestCase):
+    def test_wait_all_failure_becomes_a_failed_decision_with_aggregate(self):
+        ww = WorkflowWorker(group="t", auto_register=False)
+
+        @ww.workflow("wf")
+        def wf(ctx, _input):
+            return ctx.gather([("ok", lambda: 1), ("bad", lambda: (_ for _ in ()).throw(ValueError("x")))])
+
+        decision = ww.process_task({"taskId": "t1", "runId": "r1", "workflow": "wf",
+                                    "history": [], "input": None})
+        self.assertEqual(decision["status"], "failed")
+        self.assertEqual(decision["error"]["errors"][0]["name"], "bad")
+        # The two step commands were still recorded on the failed decision.
+        recorded = [c["name"] for c in decision["commands"] if c["kind"] == "recordStep"]
+        self.assertEqual(recorded, ["ok", "bad"])
+
+    def test_success_replays_deterministically(self):
+        ww = WorkflowWorker(group="t", auto_register=False)
+        calls = {"n": 0}
+
+        @ww.workflow("wf")
+        def wf(ctx, _input):
+            def body_a():
+                calls["n"] += 1
+                return "a"
+            return ctx.gather([("a", body_a), ("b", lambda: "b")])
+
+        first = ww.process_task({"taskId": "t1", "runId": "r1", "workflow": "wf",
+                                 "history": [], "input": None})
+        self.assertEqual(first["status"], "completed")
+        self.assertEqual(first["output"], ["a", "b"])
+        # Replay from the recorded history must NOT re-run body_a.
+        history = [
+            {"seq": c["seq"], "kind": "step", "name": c["name"], "output": c.get("output")}
+            for c in first["commands"] if c["kind"] == "recordStep"
+        ]
+        before = calls["n"]
+        second = ww.process_task({"taskId": "t1", "runId": "r1", "workflow": "wf",
+                                  "history": history, "input": None})
+        self.assertEqual(second["status"], "completed")
+        self.assertEqual(second["output"], ["a", "b"])
+        self.assertEqual(calls["n"], before)  # no re-run on replay
+
+
 if __name__ == "__main__":
     unittest.main()
