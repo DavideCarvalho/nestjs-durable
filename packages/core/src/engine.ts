@@ -1668,6 +1668,10 @@ export class WorkflowEngine {
             enqueuedAt: startedAt,
             startedAt,
             finishedAt,
+            // Carry the worker's `parallelGroup` (a Python `ctx.gather` tags every step in the fan with
+            // the same group) onto the checkpoint, so the dashboard can render the steps as one parallel
+            // group instead of a sequential list. Additive: undefined for ordinary sequential steps.
+            parallelGroup: cmd.parallelGroup,
           }),
         );
         this.emit({

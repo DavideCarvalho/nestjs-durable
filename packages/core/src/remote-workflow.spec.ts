@@ -213,6 +213,57 @@ describe('WorkflowEngine — remote (polyglot) workflows', () => {
     expect(b?.output).toEqual({ b: 2 });
   });
 
+  it('persists the parallelGroup tag a worker stamps on gathered (fan-out) steps', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
+    // A Python `ctx.gather([...])` runs its step bodies in parallel and tags every recordStep in the
+    // fan with the SAME `parallelGroup`, so the dashboard can render them as one group. The engine must
+    // carry that tag from the command onto the checkpoint (and leave ordinary steps untagged).
+    engine.registerRemote('fan', '1', {
+      group: 'py-workflows',
+      executor: {
+        async advance(run: WorkflowRun): Promise<WorkflowDecision> {
+          return {
+            taskId: 't',
+            runId: run.id,
+            status: 'completed',
+            commands: [
+              { kind: 'recordStep', seq: 0, name: 'setup', output: { ok: true } },
+              {
+                kind: 'recordStep',
+                seq: 1,
+                name: 'handle_a',
+                output: { a: 1 },
+                parallelGroup: 'gather:1',
+              },
+              {
+                kind: 'recordStep',
+                seq: 2,
+                name: 'handle_b',
+                output: { b: 2 },
+                parallelGroup: 'gather:1',
+              },
+            ],
+            output: { done: true },
+          };
+        },
+      },
+    });
+
+    await startRun(engine, 'fan', {}, 'fan1');
+    const run = await settle(store, 'fan1');
+    expect(run.status).toBe('completed');
+
+    const cps = await store.listCheckpoints('fan1');
+    const setup = cps.find((c) => c.seq === 0);
+    const a = cps.find((c) => c.seq === 1);
+    const b = cps.find((c) => c.seq === 2);
+    // The two gathered steps share the group; the sequential setup step is untagged.
+    expect(setup?.parallelGroup).toBeUndefined();
+    expect(a?.parallelGroup).toBe('gather:1');
+    expect(b?.parallelGroup).toBe('gather:1');
+  });
+
   it('persists a streamed step lifecycle live: running → completed with real timing + sub-process events', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();

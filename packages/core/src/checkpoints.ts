@@ -30,6 +30,7 @@ export function stepCheckpoint(p: {
   events?: StepEvent[] | undefined;
   workerGroup?: string | undefined;
   wakeAt?: number | undefined;
+  parallelGroup?: string | undefined;
 }): StepCheckpoint {
   return {
     runId: p.runId,
@@ -45,6 +46,7 @@ export function stepCheckpoint(p: {
     attempts: p.attempts,
     workerGroup: p.workerGroup,
     wakeAt: p.wakeAt,
+    parallelGroup: p.parallelGroup,
     enqueuedAt: p.enqueuedAt,
     startedAt: p.startedAt,
     finishedAt: p.finishedAt,

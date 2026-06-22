@@ -497,6 +497,9 @@ export type WorkflowCommand =
       startedAt?: number;
       finishedAt?: number;
       events?: StepEvent[];
+      /** A worker's `ctx.gather([...])` tags every step in the parallel fan with the same group, so the
+       *  engine carries it onto the checkpoint and the dashboard renders the fan as one group. */
+      parallelGroup?: string;
     }
   /** `ctx.sleep(ms)` — a durable timer of `ms` duration. The engine computes the absolute deadline
    *  (now + ms) when it applies the command, so the worker never reads the clock (determinism). */
