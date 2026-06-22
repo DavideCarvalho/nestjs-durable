@@ -1,6 +1,11 @@
-import type { HistoryEvent, WorkflowTask } from '@dudousxd/nestjs-durable-core';
+import type { HistoryEvent, RemoteStepDef, WorkflowTask } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it } from 'vitest';
 import { WorkflowWorker } from './workflow-worker';
+
+/** A minimal typed remote step def for driving `ctx.call` in these tests (only name/group are read). */
+function remote(name: string, group = 'g'): RemoteStepDef {
+  return { name, group, input: {} as never, output: {} as never, __remote: true };
+}
 
 function task(over: Partial<WorkflowTask> = {}): WorkflowTask {
   return {
@@ -30,7 +35,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('maps a Suspend to continue with the commands', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.call('ingest', null, { group: 'g' });
+      await ctx.call(remote('ingest'), null);
     });
     const d = await wf.processTask(task());
     expect(d.status).toBe('continue');
@@ -55,7 +60,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
       try {
-        await ctx.call('risky', null, { group: 'g' });
+        await ctx.call(remote('risky'), null);
         return { ok: true };
       } catch {
         return { ok: false, compensated: true };
@@ -72,7 +77,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('maps an uncaught failure to failed', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.call('risky', null, { group: 'g' });
+      await ctx.call(remote('risky'), null);
     });
     const history: HistoryEvent[] = [
       { seq: 0, kind: 'call', name: 'risky', error: { message: 'boom' } },
@@ -101,7 +106,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('detects nondeterminism and fails loudly', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.call('a', null, { group: 'g' });
+      await ctx.call(remote('a'), null);
     });
     const history: HistoryEvent[] = [{ seq: 0, kind: 'timer' }];
     const d = await wf.processTask(task({ history }));
@@ -115,7 +120,7 @@ describe('WorkflowWorker end-to-end across turns', () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx, input: { base: string }) => {
       const a = await ctx.step('s', () => 1);
-      const r = await ctx.call('ingest', { a, base: input.base }, { group: 'g' });
+      const r = await ctx.call(remote('ingest'), { a, base: input.base });
       return { a, r };
     });
 

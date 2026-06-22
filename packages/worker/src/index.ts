@@ -4,6 +4,7 @@ export {
   NondeterminismError,
   StepFailed,
   Suspend,
+  UnsupportedOnThinWorker,
   WorkflowError,
   toError,
 } from './errors';

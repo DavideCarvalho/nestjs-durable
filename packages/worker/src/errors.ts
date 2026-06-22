@@ -86,6 +86,26 @@ export class Cancelled extends Error {
   }
 }
 
+/**
+ * A `WorkflowCtx` op was invoked on the thin worker that the remote wire protocol can't express
+ * (it needs engine/store/transport features — transactions, entities, events, async tasks,
+ * absolute timers, fire-and-forget children, breakpoints, webhooks, updates, patch markers). The
+ * thin worker conforms to the full {@link WorkflowCtx} surface for portability, but these members
+ * fail loudly instead of silently mis-behaving — run such a workflow in-process on the engine, or
+ * rewrite it against a wire-expressible op. Mirrors the engine's "needs a real store" guards.
+ */
+export class UnsupportedOnThinWorker extends WorkflowError {
+  readonly op: string;
+
+  constructor(op: string) {
+    super(
+      `ctx.${op}() is not supported on the thin worker — run this workflow in-process on the engine, or use a wire-expressible op.`,
+    );
+    this.name = 'UnsupportedOnThinWorker';
+    this.op = op;
+  }
+}
+
 /** Convert an arbitrary thrown value into the wire `StepError` shape. Mirrors Python `_to_error`. */
 export function toError(err: unknown): StepError {
   if (err instanceof Error) {

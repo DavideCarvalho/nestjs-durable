@@ -1,10 +1,22 @@
 import type {
+  ChildCallOptions,
+  DurableWebhook,
   HistoryEvent,
+  RemoteStepDef,
   StepError,
   StepEvent,
+  StepLogger,
+  StepOptions,
+  SubProcessHandle,
+  WorkflowClass,
   WorkflowCommand,
+  WorkflowCtx,
+  WorkflowInputOf,
+  WorkflowOutputOf,
+  WorkflowRef,
   WorkflowStepEvent,
 } from '@dudousxd/nestjs-durable-core';
+import { parseDuration, workflowName } from '@dudousxd/nestjs-durable-core';
 import {
   Cancelled,
   GatherError,
@@ -12,6 +24,7 @@ import {
   NondeterminismError,
   StepFailed,
   Suspend,
+  UnsupportedOnThinWorker,
   toError,
 } from './errors';
 
@@ -20,19 +33,12 @@ import {
 export type GatherMode = 'waitAll' | 'failFast';
 
 /**
- * Minimal events sink handed to a `ctx.step` body so it can record sub-events (logs + sub-process
- * outcomes), captured onto the step's `recordStep` command. The TS twin of the Python SDK's
- * `StepContext.events`. Kept deliberately small — the full `StepLogger`/`subProcess` surface lives
- * in the engine; the thin worker only needs the recording sink.
+ * Events sink handed to a `ctx.step` body so it can record sub-events (logs + sub-process outcomes),
+ * captured onto the step's `recordStep` command. The TS twin of the Python SDK's `StepContext.events`.
+ * It is the engine's full {@link StepLogger} so a `@Workflow` body written against `WorkflowCtx.step`
+ * (whose `fn` receives a `StepLogger`) runs unchanged on the thin worker.
  */
-export interface StepLog {
-  debug(message: string, data?: unknown): void;
-  info(message: string, data?: unknown): void;
-  warn(message: string, data?: unknown): void;
-  error(message: string, data?: unknown): void;
-  /** Record a sub-step / sub-process outcome (e.g. one of N parallel p-processes). */
-  sub(name: string, status: 'ok' | 'failed' | 'skipped', message?: string, data?: unknown): void;
-}
+export type StepLog = StepLogger;
 
 const LEVEL_FOR_STATUS = {
   ok: 'info',
@@ -40,8 +46,8 @@ const LEVEL_FOR_STATUS = {
   skipped: 'warn',
 } as const;
 
-/** The body a `ctx.step` runs. Receives a {@link StepLog} sink; sync or async. */
-export type StepBody<T> = (log: StepLog) => Promise<T> | T;
+/** The body a `ctx.step` runs. Receives a {@link StepLogger} sink; sync or async. */
+export type StepBody<T> = (log: StepLogger) => Promise<T> | T;
 
 /** Options for constructing a {@link WorkflowContext}. */
 export interface WorkflowContextOptions {
@@ -64,10 +70,27 @@ export interface WorkflowContextOptions {
  * The replay context handed to a workflow function. Its ops are deterministic: same code + same
  * history ⇒ same seqs ⇒ same decisions. A faithful port of the Python `durable_worker` `WorkflowContext`:
  * history in → commands out, suspend by throwing {@link Suspend}.
+ *
+ * It `implements` the engine's {@link WorkflowCtx}, so a NestJS `@Workflow` body typed against
+ * `WorkflowCtx` runs UNCHANGED on the thin worker. The API splits in two:
+ *
+ * - **Supported** (wire-expressible) — {@link step}, {@link call}, {@link sleep},
+ *   {@link waitForSignal}, {@link child}, {@link all}, {@link now}/{@link random}/{@link uuid}: each
+ *   maps to a {@link WorkflowCommand} (`call`/`recordStep`/`sleep`/`waitSignal`/`startChild`) the
+ *   engine applies durably.
+ * - **Unsupported** — `transaction`, `callEntity`, `signalEntity`, `continueAsNew`, `sleepUntil`,
+ *   `waitForEvent`, `task`, `startChild` (fire-and-forget), `breakpoint`, `webhook`, `setEvent`,
+ *   `onUpdate`, `patched`: they need engine/store/transport features the remote wire can't express,
+ *   so each throws {@link UnsupportedOnThinWorker} (run such a workflow in-process on the engine).
+ *
+ * {@link gather} is a worker-only extension (Python `gather` parity) beyond `WorkflowCtx`.
  */
-export class WorkflowContext {
+export class WorkflowContext implements WorkflowCtx {
   /** New durable ops this turn produced, ordered by seq. */
   readonly commands: WorkflowCommand[] = [];
+
+  /** The run this turn replays. Always set by the worker (`task.runId`); `WorkflowCtx` requires it. */
+  readonly runId: string;
 
   private readonly history: Map<number, HistoryEvent>;
   private readonly signalsBySeq: Map<number, { seq: number; signal: string; payload: unknown }>;
@@ -75,11 +98,8 @@ export class WorkflowContext {
   private readonly isCancelled: ((runId: string) => boolean) | undefined;
   private seq = 0;
 
-  constructor(
-    readonly runId: string | undefined,
-    history: HistoryEvent[],
-    opts: WorkflowContextOptions = {},
-  ) {
+  constructor(runId: string, history: HistoryEvent[], opts: WorkflowContextOptions = {}) {
+    this.runId = runId;
     this.history = new Map(history.map((e) => [e.seq, e]));
     this.signalsBySeq = new Map((opts.pendingSignals ?? []).map((s) => [s.seq, s]));
     this.onStep = opts.onStep;
@@ -103,11 +123,7 @@ export class WorkflowContext {
    * cancellation with no `if (ctx.cancelled)` checks in user code. Mirrors Python `_raise_if_cancelled`.
    */
   private raiseIfCancelled(): void {
-    if (
-      this.isCancelled !== undefined &&
-      this.runId !== undefined &&
-      this.isCancelled(this.runId)
-    ) {
+    if (this.isCancelled?.(this.runId)) {
       throw new Cancelled(this.runId);
     }
   }
@@ -161,29 +177,45 @@ export class WorkflowContext {
     }
   }
 
-  // -- the workflow API ----------------------------------------------------
+  // -- the workflow API (supported) ----------------------------------------
 
-  /** Dispatch a remote step (any-language worker in `group`) and await its result. Mirrors Python `call`. */
-  async call<T = unknown>(name: string, input: unknown, opts: { group: string }): Promise<T> {
+  /**
+   * Dispatch a typed remote step (any-language worker in its `group`) and await its result. The
+   * engine's `ctx.call` takes a {@link RemoteStepDef} (not a name): we read its `name`/`group` and
+   * emit the wire `call` command. `opts` (`queue`/`priority`/`fairnessKey`/`transport`) are
+   * engine-side ADMISSION concerns — accepted for `WorkflowCtx` conformance, but the remote wire
+   * has no place for them, so they don't change the worker's emitted command. Mirrors Python `call`.
+   */
+  async call<TInput, TOutput>(
+    step: RemoteStepDef<TInput, TOutput>,
+    input: TInput,
+    _opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
+  ): Promise<TOutput> {
     const seq = this.next();
-    const { found, output } = this.replay(seq, 'call', name);
-    if (found) return output as T;
-    this.commands.push({ kind: 'call', seq, name, group: opts.group, input });
+    const { found, output } = this.replay(seq, 'call', step.name);
+    if (found) return output as TOutput;
+    this.commands.push({ kind: 'call', seq, name: step.name, group: step.group, input });
     throw new Suspend();
   }
 
   /**
    * Run a LOCAL step once and record its result, so side effects / non-determinism happen exactly
-   * once and replay returns the captured value. Mirrors Python `step`.
+   * once and replay returns the captured value. The body receives a {@link StepLogger}. `options`
+   * (retries/backoff/compensate) are engine-side concerns the thin worker doesn't apply — accepted
+   * for `WorkflowCtx` conformance, ignored on the wire. Mirrors Python `step`.
    */
-  async step<T = unknown>(name: string, body: StepBody<T>): Promise<T> {
+  async step<TOutput>(
+    name: string,
+    fn: (log: StepLogger) => Promise<TOutput> | TOutput,
+    _options?: StepOptions,
+  ): Promise<TOutput> {
     const seq = this.next();
     const { found, output } = this.replay(seq, 'step', name);
-    if (found) return output as T;
+    if (found) return output as TOutput;
 
-    const { output: result, error } = await this.runStepBody(seq, name, body);
+    const { output: result, error } = await this.runStepBody(seq, name, fn);
     if (error !== undefined) throw new StepFailed(error);
-    return result as T;
+    return result as TOutput;
   }
 
   /**
@@ -201,7 +233,7 @@ export class WorkflowContext {
     const events: StepEvent[] = [];
     const log = makeStepLog(events);
     const startedAt = Date.now();
-    const runId = this.runId ?? '';
+    const runId = this.runId;
     this.emitStep({ runId, seq, name, phase: 'running', startedAt, parallelGroup });
 
     try {
@@ -252,32 +284,65 @@ export class WorkflowContext {
     }
   }
 
-  /** Durably sleep `ms`; the run suspends and the engine resumes it when the timer fires. Mirrors Python `sleep`. */
-  async sleep(ms: number): Promise<void> {
+  /**
+   * Durable sleep: suspends the run for `duration` (e.g. `'30s'`, `'2h'`, or ms as a number); the
+   * engine resumes it when the timer fires. The duration is parsed to ms HERE (`parseDuration`) and
+   * the engine computes the absolute deadline when it applies the `sleep` command. Mirrors Python
+   * `sleep` and matches `WorkflowCtx.sleep`.
+   */
+  async sleep(duration: string | number): Promise<void> {
     const seq = this.next();
     const { found } = this.replay(seq, 'timer');
     if (found) return;
-    this.commands.push({ kind: 'sleep', seq, ms });
+    this.commands.push({ kind: 'sleep', seq, ms: parseDuration(duration) });
     throw new Suspend();
   }
 
-  /** Block until a signal `name` is delivered to this run; returns its payload. Mirrors Python `wait_signal`. */
-  async waitSignal<T = unknown>(name: string): Promise<T> {
+  /**
+   * Suspend until an external signal `token` is delivered to this run, then resume with its payload.
+   * `opts.timeoutMs` is accepted for `WorkflowCtx` conformance but the wire `waitSignal` command has
+   * NO timeout field — it is best-effort/ignored remotely (NOT silently turned into extra seqs, so
+   * determinism is preserved: a bounded and unbounded wait consume the SAME single seq here). Mirrors
+   * Python `wait_signal`; renamed from the old `waitSignal` to match `WorkflowCtx.waitForSignal`.
+   */
+  async waitForSignal<TPayload>(token: string, _opts?: { timeoutMs?: number }): Promise<TPayload> {
     const seq = this.next();
-    const { found, output } = this.replay(seq, 'signal', name);
-    if (found) return output as T;
+    const { found, output } = this.replay(seq, 'signal', token);
+    if (found) return output as TPayload;
     const sig = this.signalsBySeq.get(seq);
-    if (sig !== undefined) return sig.payload as T;
-    this.commands.push({ kind: 'waitSignal', seq, signal: name });
+    if (sig !== undefined) return sig.payload as TPayload;
+    this.commands.push({ kind: 'waitSignal', seq, signal: token });
     throw new Suspend();
   }
 
-  /** Start a child run and await its output (its own durable lifecycle). Mirrors Python `start_child`. */
-  async startChild<T = unknown>(workflow: string, input: unknown): Promise<T> {
+  /**
+   * Run another registered workflow as a tracked child and await its result (its own durable
+   * lifecycle): emit a `startChild` command and suspend; on resume, replay returns the recorded
+   * output. Accepts a workflow ref — a class (resolved to its registered name via {@link workflowName})
+   * or a name string. This is the AWAIT-a-child op; the wire `startChild` command IS this await-setup.
+   * Mirrors Python `start_child` and matches `WorkflowCtx.child`. (`options` — childId/priority — are
+   * engine-side and don't reach the wire command yet.)
+   */
+  child<C extends WorkflowClass>(
+    workflow: C,
+    input: WorkflowInputOf<C>,
+    options?: string | ChildCallOptions,
+  ): Promise<WorkflowOutputOf<C>>;
+  child<TOutput>(
+    workflow: string,
+    input: unknown,
+    options?: string | ChildCallOptions,
+  ): Promise<TOutput>;
+  async child(
+    workflow: WorkflowRef,
+    input: unknown,
+    _options?: string | ChildCallOptions,
+  ): Promise<unknown> {
+    const name = workflowName(workflow);
     const seq = this.next();
-    const { found, output } = this.replay(seq, 'child', workflow);
-    if (found) return output as T;
-    this.commands.push({ kind: 'startChild', seq, workflow, input });
+    const { found, output } = this.replay(seq, 'child', name);
+    if (found) return output;
+    this.commands.push({ kind: 'startChild', seq, workflow: name, input });
     throw new Suspend();
   }
 
@@ -350,13 +415,25 @@ export class WorkflowContext {
    *
    * `waitAll` (default): aggregate failures into {@link GatherError}. `failFast`: raise as soon as a
    * failed child is seen on a resume (siblings are not force-cancelled in v1). Empty inputs → `[]`.
-   * Mirrors Python `gather_children`.
+   * Accepts a workflow ref (class or name); resolved to its registered name via {@link workflowName}.
+   * Mirrors Python `gather_children` and matches `WorkflowCtx.all`.
    */
-  async all(
+  all<C extends WorkflowClass>(
+    workflow: C,
+    inputs: WorkflowInputOf<C>[],
+    opts?: { mode?: GatherMode },
+  ): Promise<WorkflowOutputOf<C>[]>;
+  all<TOutput = unknown>(
     workflow: string,
+    inputs: unknown[],
+    opts?: { mode?: GatherMode },
+  ): Promise<TOutput[]>;
+  async all(
+    workflow: WorkflowRef,
     inputs: unknown[],
     opts: { mode?: GatherMode } = {},
   ): Promise<unknown[]> {
+    const name = workflowName(workflow);
     const entries = inputs.map((input, index) => ({
       index,
       seq: this.next(),
@@ -366,12 +443,12 @@ export class WorkflowContext {
     const first = entries[0];
     if (first === undefined) return [];
     const group = `gather:${first.seq}`;
-    for (const e of entries) e.history = this.replayEntry(e.seq, 'child', workflow);
+    for (const e of entries) e.history = this.replayEntry(e.seq, 'child', name);
 
     if ((opts.mode ?? 'waitAll') === 'failFast') {
       for (const e of entries) {
         if (e.history?.error != null) {
-          throw new GatherError([{ index: e.index, workflow, error: e.history.error }]);
+          throw new GatherError([{ index: e.index, workflow: name, error: e.history.error }]);
         }
       }
     }
@@ -382,7 +459,7 @@ export class WorkflowContext {
         this.commands.push({
           kind: 'startChild',
           seq: e.seq,
-          workflow,
+          workflow: name,
           input: e.input,
           parallelGroup: group,
         });
@@ -395,7 +472,7 @@ export class WorkflowContext {
     const outputs = entries.map((e) => {
       const ev = e.history as HistoryEvent;
       if (ev.error != null) {
-        failures.push({ index: e.index, workflow, error: ev.error });
+        failures.push({ index: e.index, workflow: name, error: ev.error });
         return undefined;
       }
       return ev.output;
@@ -403,21 +480,213 @@ export class WorkflowContext {
     if (failures.length > 0) throw new GatherError(failures);
     return outputs;
   }
+
+  // -- deterministic sources (recorded once, replayed) ---------------------
+
+  /**
+   * Deterministic wall-clock (epoch ms): recorded as a `now` step on the first run and replayed
+   * verbatim. Implemented as a recorded {@link step} exactly like the engine's ctx. Matches
+   * `WorkflowCtx.now`.
+   */
+  now(): Promise<number> {
+    return this.step('now', async () => Date.now());
+  }
+
+  /**
+   * Deterministic random in `[0, 1)`: recorded as a `random` step once, then replayed. Implemented
+   * as a recorded {@link step} like the engine's ctx. Matches `WorkflowCtx.random`.
+   */
+  random(): Promise<number> {
+    return this.step('random', async () => Math.random());
+  }
+
+  /** Deterministic UUID v4: recorded as a `uuid` step once, then replayed. Matches `WorkflowCtx.uuid`. */
+  uuid(): Promise<string> {
+    return this.step('uuid', async () => globalThis.crypto.randomUUID());
+  }
+
+  // -- unsupported on the thin worker --------------------------------------
+  //
+  // These `WorkflowCtx` members exist so the class is assignable to `WorkflowCtx` (a `@Workflow`
+  // body still type-checks), but they need engine/store/transport features the remote wire protocol
+  // can't express. Each throws {@link UnsupportedOnThinWorker} — run such a workflow in-process on
+  // the engine, or rewrite it against a wire-expressible op.
+
+  /** UNSUPPORTED: needs a transactional store (exactly-once DB write + checkpoint in one tx). */
+  async transaction<TOutput>(
+    _name: string,
+    _fn: (tx: unknown) => Promise<TOutput>,
+  ): Promise<TOutput> {
+    throw new UnsupportedOnThinWorker('transaction');
+  }
+
+  /** UNSUPPORTED: durable entities run on the engine over durable state, not on the worker. */
+  async callEntity<TResult = unknown>(
+    _name: string,
+    _key: string,
+    _op: string,
+    _arg?: unknown,
+  ): Promise<TResult> {
+    throw new UnsupportedOnThinWorker('callEntity');
+  }
+
+  /** UNSUPPORTED: see {@link callEntity}. */
+  async signalEntity(_name: string, _key: string, _op: string, _arg?: unknown): Promise<void> {
+    throw new UnsupportedOnThinWorker('signalEntity');
+  }
+
+  /** UNSUPPORTED: continue-as-new is an engine lifecycle op (resets history, mints `<runId>~N`). */
+  async continueAsNew(_input?: unknown): Promise<never> {
+    throw new UnsupportedOnThinWorker('continueAsNew');
+  }
+
+  /** UNSUPPORTED: absolute-deadline timers aren't expressible on the `sleep` (ms-duration) wire op. */
+  async sleepUntil(_when: Date | number): Promise<void> {
+    throw new UnsupportedOnThinWorker('sleepUntil');
+  }
+
+  /** UNSUPPORTED: named event pub/sub (`engine.publishEvent`) is an engine/store feature. */
+  async waitForEvent<TPayload>(
+    _name: string,
+    _opts?: { match?: Record<string, unknown>; timeoutMs?: number },
+  ): Promise<TPayload> {
+    throw new UnsupportedOnThinWorker('waitForEvent');
+  }
+
+  /** UNSUPPORTED: async-completion tasks (`engine.completeTask`/`failTask`) are engine-driven. */
+  async task<TResult>(
+    _name: string,
+    _dispatch: () => Promise<void>,
+    _options?: StepOptions,
+  ): Promise<TResult> {
+    throw new UnsupportedOnThinWorker('task');
+  }
+
+  /**
+   * UNSUPPORTED: fire-and-forget child. The remote wire's `startChild` command is the AWAIT-a-child
+   * setup the engine resolves (see {@link child}); a non-suspending fire-forget that returns the
+   * child run id immediately isn't expressible remotely yet.
+   */
+  startChild<C extends WorkflowClass>(
+    workflow: C,
+    input: WorkflowInputOf<C>,
+    options?: string | ChildCallOptions,
+  ): Promise<string>;
+  startChild(
+    workflow: string,
+    input: unknown,
+    options?: string | ChildCallOptions,
+  ): Promise<string>;
+  async startChild(
+    _workflow: WorkflowRef,
+    _input: unknown,
+    _options?: string | ChildCallOptions,
+  ): Promise<string> {
+    throw new UnsupportedOnThinWorker('startChild');
+  }
+
+  /** UNSUPPORTED: a breakpoint records a visible `pending` checkpoint the engine resumes. */
+  async breakpoint(_label?: string): Promise<void> {
+    throw new UnsupportedOnThinWorker('breakpoint');
+  }
+
+  /** UNSUPPORTED: minting a durable webhook needs the engine's `webhookUrl` builder + signal store. */
+  webhook<TPayload>(): DurableWebhook<TPayload> {
+    throw new UnsupportedOnThinWorker('webhook');
+  }
+
+  /** UNSUPPORTED: a queryable named value is read externally via `engine.getEvent` (store-backed). */
+  async setEvent<TValue>(_key: string, _value: TValue): Promise<void> {
+    throw new UnsupportedOnThinWorker('setEvent');
+  }
+
+  /** UNSUPPORTED: update points are delivered + validated by the engine (`engine.update`). */
+  async onUpdate<TArg>(_name: string, _opts?: { timeoutMs?: number }): Promise<TArg> {
+    throw new UnsupportedOnThinWorker('onUpdate');
+  }
+
+  /** UNSUPPORTED: patch markers need engine-side position rewind against the live checkpoint store. */
+  async patched(_id: string): Promise<boolean> {
+    throw new UnsupportedOnThinWorker('patched');
+  }
 }
 
-/** Build the minimal recording {@link StepLog} that appends each event to `events`. Shared with the
- *  {@link StepWorker} so a remote step handler records sub-events the same way an inline `ctx.step` does. */
-export function makeStepLog(events: StepEvent[]): StepLog {
-  const logLine = (level: StepEvent['level'], message: string, data?: unknown) => {
+/** Attach the elapsed `durationMs` (from `start`) to `data`, unless the caller already set one. */
+function withDuration(start: number, data?: unknown): Record<string, unknown> {
+  if (data && typeof data === 'object' && 'durationMs' in data) {
+    return data as Record<string, unknown>;
+  }
+  const base = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
+  return { ...base, durationMs: Date.now() - start };
+}
+
+/**
+ * Build the full recording {@link StepLogger} that appends each event to `events`. Shared with the
+ * {@link StepWorker} so a remote step handler records sub-events the same way an inline `ctx.step`
+ * does. Returns the engine's full `StepLogger` surface (`subEvent`/`subProcess` included) so a
+ * `@Workflow` body's step closures run unchanged on the thin worker — the TypeScript twin of the
+ * engine's `createStepLogger`.
+ */
+export function makeStepLog(events: StepEvent[]): StepLogger {
+  // The sub-process a `subProcess(...)` body is currently inside; logs emitted while inside get
+  // tagged with its id, so the dashboard groups that log trail under the sub-process.
+  let currentSub: { id: string } | undefined;
+  const push = (level: StepEvent['level'], message: string, data?: unknown) => {
     const e: StepEvent = { at: Date.now(), level, message };
+    if (currentSub) e.subId = currentSub.id;
     if (data !== undefined) e.data = data;
     events.push(e);
   };
+  const subEvent: StepLogger['subEvent'] = (e) => {
+    const ev: StepEvent = {
+      at: Date.now(),
+      level: e.status === 'failed' ? 'error' : e.status === 'skipped' ? 'warn' : 'info',
+      message: e.message ?? e.phase ?? e.name,
+      subId: e.id,
+      name: e.name,
+    };
+    if (e.group !== undefined) ev.group = e.group;
+    if (e.phase !== undefined) ev.phase = e.phase;
+    if (e.status !== undefined) ev.status = e.status;
+    if (e.data !== undefined) ev.data = e.data;
+    events.push(ev);
+  };
+  const subProcess: StepLogger['subProcess'] = async (name, body, opts) => {
+    const id = opts?.id ?? globalThis.crypto.randomUUID();
+    const group = opts?.group;
+    const start = Date.now();
+    const prevSub = currentSub;
+    currentSub = { id };
+    let terminal = false;
+    const emit = (status: 'ok' | 'failed' | 'skipped', message?: string, data?: unknown) => {
+      if (terminal) return;
+      terminal = true;
+      subEvent({ id, name, group, status, message, data: withDuration(start, data) });
+    };
+    const handle: SubProcessHandle = {
+      phase: (phase, data) => {
+        if (!terminal) subEvent({ id, name, group, phase, data });
+        return handle;
+      },
+      skip: (reason, data) => emit('skipped', reason, data),
+      fail: (reason, data) => emit('failed', reason, data),
+    };
+    try {
+      const result = await body(handle);
+      emit('ok'); // no-op if the body already called skip()/fail()
+      return result;
+    } catch (err) {
+      emit('failed', err instanceof Error ? err.message : String(err));
+      throw err;
+    } finally {
+      currentSub = prevSub;
+    }
+  };
   return {
-    debug: (m, d) => logLine('debug', m, d),
-    info: (m, d) => logLine('info', m, d),
-    warn: (m, d) => logLine('warn', m, d),
-    error: (m, d) => logLine('error', m, d),
+    debug: (m, d) => push('debug', m, d),
+    info: (m, d) => push('info', m, d),
+    warn: (m, d) => push('warn', m, d),
+    error: (m, d) => push('error', m, d),
     sub: (name, status, message, data) => {
       const e: StepEvent = {
         at: Date.now(),
@@ -429,5 +698,7 @@ export function makeStepLog(events: StepEvent[]): StepLog {
       if (data !== undefined) e.data = data;
       events.push(e);
     },
+    subEvent,
+    subProcess,
   };
 }
