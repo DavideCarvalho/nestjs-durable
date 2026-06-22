@@ -59,6 +59,12 @@ export interface StepCheckpoint {
   error?: { message: string };
   /** Structured events the step (or its worker) emitted — sub-process outcomes + debug/error logs. */
   events?: StepEvent[];
+  /**
+   * Shared tag across the N siblings of one `ctx.gather`/`ctx.all` fan-out (e.g. `gather:1` /
+   * `all:1`). The prefix is cosmetic; every sibling of ONE fan shares the same exact string, so the
+   * dashboard groups by exact string to render them as same-level siblings. Absent for non-fan steps.
+   */
+  parallelGroup?: string;
   attempts: number;
   workerGroup?: string;
   wakeAt?: number;
