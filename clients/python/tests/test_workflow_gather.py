@@ -84,6 +84,14 @@ class GatherStepsTest(unittest.TestCase):
         self.assertEqual(len(steps), 1)
         self.assertEqual(steps[0]["output"], 42)
 
+    def test_wrong_name_in_history_raises_nondeterminism_error(self):
+        # seq 0 has name "WRONG" but replay reaches name "a" — must raise NondeterminismError.
+        from durable_worker.workflow import NondeterminismError
+        history = [{"seq": 0, "kind": "step", "name": "WRONG", "output": 1}]
+        ctx = self._ctx(history)
+        with self.assertRaises(NondeterminismError):
+            ctx.gather([("a", lambda: 1)])
+
     def test_fail_fast_signals_cooperative_cancel_to_siblings(self):
         from durable_worker.worker import current_step
         import threading
@@ -172,6 +180,14 @@ class GatherChildrenTest(unittest.TestCase):
         ctx = self._ctx()
         self.assertEqual(ctx.gather_children("handle", []), [])
         self.assertEqual(ctx.commands, [])
+
+    def test_wrong_kind_in_history_raises_nondeterminism_error(self):
+        # seq 0 has kind "step" but replay expects kind "child" — must raise NondeterminismError.
+        from durable_worker.workflow import NondeterminismError
+        history = [{"seq": 0, "kind": "step", "name": "handle", "output": 1}]
+        ctx = self._ctx(history)
+        with self.assertRaises(NondeterminismError):
+            ctx.gather_children("handle", [{"p": "A"}])
 
 
 from durable_worker.workflow import WorkflowWorker  # noqa: E402

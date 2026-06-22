@@ -151,6 +151,22 @@ class WorkflowContext:
             raise StepFailed(ev["error"])
         return True, ev.get("output")
 
+    def _replay_entry(
+        self, seq: int, kind: str, name: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Like :meth:`_replay`, but returns the raw history entry (or ``None`` if absent) instead of
+        unwrapping output/raising on a recorded failure — so gather can aggregate failures itself.
+        Still enforces the ``kind``/``name`` nondeterminism guard every other op gets."""
+        ev = self._history.get(seq)
+        if ev is None:
+            return None
+        if ev.get("kind") != kind or (name is not None and ev.get("name") not in (None, name)):
+            raise NondeterminismError(
+                f"history at seq {seq} is {ev.get('kind')}/{ev.get('name')!r}, "
+                f"but replay reached {kind}/{name!r}"
+            )
+        return ev
+
     # -- the workflow API ----------------------------------------------------
     def call(self, name: str, input: Any = None, *, group: str) -> Any:
         """Dispatch a remote step (any-language worker in ``group``) and await its result."""
@@ -273,14 +289,14 @@ class WorkflowContext:
         group = f"gather:{entries[0][0]}"
 
         # Replay: inline steps all record in ONE turn, so either ALL or NONE of the seqs are present.
-        if all(self._history.get(seq) is not None for seq, _, _ in entries):
+        if all(self._replay_entry(seq, "step", name) is not None for seq, name, _ in entries):
             outputs: List[Any] = []
             failures: List[Dict[str, Any]] = []
             for seq, name, _ in entries:
-                ev = self._history[seq]
+                ev = self._replay_entry(seq, "step", name)
                 if ev.get("error") is not None:
                     failures.append({"name": name, "error": ev["error"]})
-                    outputs.append(None)
+                    outputs.append(None)  # unreachable: GatherFailed is raised before returning
                 else:
                     outputs.append(ev.get("output"))
             if failures:
@@ -416,7 +432,7 @@ class WorkflowContext:
         if not seqs:
             return []
         group = f"gather:{seqs[0]}"
-        histories = [self._history.get(seq) for seq in seqs]
+        histories = [self._replay_entry(seq, "child", workflow) for seq in seqs]
 
         # fail_fast: bail the moment any resolved child is a failure.
         if mode == "fail_fast":
