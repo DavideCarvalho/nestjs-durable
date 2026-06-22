@@ -112,5 +112,67 @@ class GatherStepsTest(unittest.TestCase):
         self.assertTrue(sibling_saw_cancel.is_set())
 
 
+from durable_worker.workflow import _Suspend  # noqa: E402
+
+
+class GatherChildrenTest(unittest.TestCase):
+    def _ctx(self, history=None):
+        return WorkflowContext("run1", history or [])
+
+    def test_first_turn_dispatches_all_children_then_suspends(self):
+        ctx = self._ctx()
+        with self.assertRaises(_Suspend):
+            ctx.gather_children("handle", [{"p": "MEL"}, {"p": "MVR"}, {"p": "UTIL"}])
+        spawns = [c for c in ctx.commands if c["kind"] == "startChild"]
+        self.assertEqual([c["seq"] for c in spawns], [0, 1, 2])
+        self.assertEqual([c["workflow"] for c in spawns], ["handle", "handle", "handle"])
+        self.assertEqual([c["input"]["p"] for c in spawns], ["MEL", "MVR", "UTIL"])
+        self.assertEqual(len({c["parallelGroup"] for c in spawns}), 1)
+
+    def test_suspends_while_any_child_outstanding(self):
+        # seq 0 done, seq 1 still running (absent from history) → re-dispatch missing + suspend.
+        history = [{"seq": 0, "kind": "child", "name": "handle", "output": {"r": 1}}]
+        ctx = self._ctx(history)
+        with self.assertRaises(_Suspend):
+            ctx.gather_children("handle", [{"p": "A"}, {"p": "B"}])
+        spawns = [c for c in ctx.commands if c["kind"] == "startChild"]
+        self.assertEqual([c["seq"] for c in spawns], [1])  # only the outstanding one re-emitted
+
+    def test_returns_all_outputs_in_order_when_all_resolved(self):
+        history = [
+            {"seq": 0, "kind": "child", "name": "handle", "output": {"r": 1}},
+            {"seq": 1, "kind": "child", "name": "handle", "output": {"r": 2}},
+        ]
+        ctx = self._ctx(history)
+        out = ctx.gather_children("handle", [{"p": "A"}, {"p": "B"}])
+        self.assertEqual(out, [{"r": 1}, {"r": 2}])
+        self.assertEqual(ctx.commands, [])
+
+    def test_wait_all_aggregates_child_failures(self):
+        history = [
+            {"seq": 0, "kind": "child", "name": "handle", "output": {"r": 1}},
+            {"seq": 1, "kind": "child", "name": "handle", "error": {"message": "child boom"}},
+        ]
+        ctx = self._ctx(history)
+        with self.assertRaises(_GF) as cm:
+            ctx.gather_children("handle", [{"p": "A"}, {"p": "B"}])
+        self.assertEqual(len(cm.exception.errors), 1)
+        self.assertEqual(cm.exception.errors[0]["error"]["message"], "child boom")
+
+    def test_fail_fast_raises_on_first_failed_child_seen(self):
+        history = [
+            {"seq": 0, "kind": "child", "name": "handle", "error": {"message": "boom"}},
+        ]
+        ctx = self._ctx(history)
+        # seq 1 still outstanding, but fail_fast raises immediately on the failed seq 0.
+        with self.assertRaises(_GF):
+            ctx.gather_children("handle", [{"p": "A"}, {"p": "B"}], mode="fail_fast")
+
+    def test_empty_inputs_returns_empty(self):
+        ctx = self._ctx()
+        self.assertEqual(ctx.gather_children("handle", []), [])
+        self.assertEqual(ctx.commands, [])
+
+
 if __name__ == "__main__":
     unittest.main()

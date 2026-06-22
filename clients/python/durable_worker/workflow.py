@@ -388,6 +388,61 @@ class WorkflowContext:
         )
         raise _Suspend()
 
+    def gather_children(
+        self,
+        workflow: str,
+        inputs: "List[Any]",
+        mode: str = "wait_all",
+    ) -> "List[Any]":
+        """Dispatch N child workflows CONCURRENTLY and wait for ALL their outputs.
+
+        Reserves a contiguous seq block; on the first turn it emits a ``startChild`` command for every
+        input (so all children dispatch and run in parallel on the worker pool), then suspends. On each
+        child completion the parent resumes; once ALL children have resolved it returns their outputs
+        in input order (``wait_all``), or raises :class:`GatherFailed` if any failed.
+
+        ``fail_fast`` raises as soon as a failed child is seen on a resume; sibling child runs are NOT
+        force-cancelled in v1 (their eventual results are ignored by the failed run).
+
+        Re-emitting ``startChild`` for an already-dispatched-but-incomplete child is intentional and
+        idempotent on the engine (a child has no history entry until it settles) — same contract as
+        the single ``start_child``.
+        """
+        seqs = [self._next() for _ in inputs]
+        if not seqs:
+            return []
+        group = f"gather:{seqs[0]}"
+        histories = [self._history.get(seq) for seq in seqs]
+
+        # fail_fast: bail the moment any resolved child is a failure.
+        if mode == "fail_fast":
+            for seq, ev in zip(seqs, histories):
+                if ev is not None and ev.get("error") is not None:
+                    raise GatherFailed([{"name": workflow, "error": ev["error"]}])
+
+        pending = False
+        for seq, inp, ev in zip(seqs, inputs, histories):
+            if ev is None:
+                self.commands.append(
+                    {"kind": "startChild", "seq": seq, "workflow": workflow,
+                     "input": inp, "parallelGroup": group}
+                )
+                pending = True
+        if pending:
+            raise _Suspend()
+
+        outputs: List[Any] = []
+        failures: List[Dict[str, Any]] = []
+        for ev in histories:
+            if ev.get("error") is not None:
+                failures.append({"name": workflow, "error": ev["error"]})
+                outputs.append(None)
+            else:
+                outputs.append(ev.get("output"))
+        if failures:
+            raise GatherFailed(failures)
+        return outputs
+
 
 WorkflowFn = Callable[..., Any]
 
