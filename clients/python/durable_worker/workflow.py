@@ -49,6 +49,20 @@ class StepFailed(Exception):
         super().__init__(self.error.get("message", "step failed"))
 
 
+class GatherFailed(StepFailed):
+    """One or more items in a ``ctx.gather`` / ``ctx.gather_children`` failed. Carries the per-item
+    errors and presents an aggregate ``.error`` so ``process_task`` records the gather as a failed
+    decision. Subclasses :class:`StepFailed` so it is catchable in workflow code like any awaited
+    failure."""
+
+    def __init__(self, errors: List[Dict[str, Any]]) -> None:
+        self.errors: List[Dict[str, Any]] = errors
+        names = ", ".join(str(e.get("name")) for e in errors)
+        super().__init__(
+            {"message": f"gather: {len(errors)} item(s) failed: {names}", "errors": errors}
+        )
+
+
 class _Suspend(Exception):
     """Internal: stop the replay at the first unresolved blocking op."""
 
