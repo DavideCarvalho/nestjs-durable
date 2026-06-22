@@ -203,6 +203,12 @@ export class WorkflowContext implements WorkflowCtx {
    * once and replay returns the captured value. The body receives a {@link StepLogger}. `options`
    * (retries/backoff/compensate) are engine-side concerns the thin worker doesn't apply — accepted
    * for `WorkflowCtx` conformance, ignored on the wire. Mirrors Python `step`.
+   *
+   * **WARNING — silently ignored options:** `options.retries`, `options.backoff`, and
+   * `options.compensate` are **silently ignored** on the thin worker: no retry loop runs and no
+   * saga compensation is registered. A portable workflow body that depends on retry behaviour or
+   * compensation MUST run in-process on the engine instead of on the thin worker, otherwise those
+   * guarantees are simply absent with no error raised.
    */
   async step<TOutput>(
     name: string,
@@ -300,12 +306,22 @@ export class WorkflowContext implements WorkflowCtx {
 
   /**
    * Suspend until an external signal `token` is delivered to this run, then resume with its payload.
-   * `opts.timeoutMs` is accepted for `WorkflowCtx` conformance but the wire `waitSignal` command has
-   * NO timeout field — it is best-effort/ignored remotely (NOT silently turned into extra seqs, so
-   * determinism is preserved: a bounded and unbounded wait consume the SAME single seq here). Mirrors
-   * Python `wait_signal`; renamed from the old `waitSignal` to match `WorkflowCtx.waitForSignal`.
+   * Mirrors Python `wait_signal`; renamed from the old `waitSignal` to match `WorkflowCtx.waitForSignal`.
+   *
+   * **Unbounded** (`waitForSignal(token)` / no `timeoutMs`) works correctly on the thin worker:
+   * it consumes exactly ONE seq and emits a `waitSignal` command.
+   *
+   * **Bounded** (`opts.timeoutMs` set) throws {@link UnsupportedOnThinWorker} for two reasons:
+   * (a) The thin worker owns no timers — it cannot honour a deadline remotely.
+   * (b) The engine's bounded path consumes TWO seqs (a deadline seq + a wait seq), whereas the
+   *     worker's unbounded path consumes ONE. Silently proceeding would break seq parity when a
+   *     workflow is checkpointed on one runtime and resumed on the other, causing silent history
+   *     mis-alignment. Run such a workflow in-process on the engine instead.
    */
-  async waitForSignal<TPayload>(token: string, _opts?: { timeoutMs?: number }): Promise<TPayload> {
+  async waitForSignal<TPayload>(token: string, opts?: { timeoutMs?: number }): Promise<TPayload> {
+    if (opts?.timeoutMs != null) {
+      return Promise.reject(new UnsupportedOnThinWorker('waitForSignal with timeoutMs'));
+    }
     const seq = this.next();
     const { found, output } = this.replay(seq, 'signal', token);
     if (found) return output as TPayload;

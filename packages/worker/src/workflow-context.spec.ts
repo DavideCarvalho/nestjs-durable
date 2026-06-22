@@ -151,12 +151,24 @@ describe('WorkflowContext.waitForSignal', () => {
     expect(ctx.commands).toEqual([{ kind: 'waitSignal', seq: 0, signal: 'approve' }]);
   });
 
-  it('honours the timeoutMs option best-effort without changing the emitted command or seq', async () => {
+  it('throws UnsupportedOnThinWorker and consumes no seq when timeoutMs is set', async () => {
     const ctx = new WorkflowContext('r1', []);
     await expect(ctx.waitForSignal('approve', { timeoutMs: 5_000 })).rejects.toBeInstanceOf(
-      Suspend,
+      UnsupportedOnThinWorker,
     );
-    // The wire waitSignal has no timeout — the option is accepted but not expressed remotely.
+    // No seq consumed, no command emitted — the bounded path is rejected before next() is called.
+    expect(ctx.commands).toEqual([]);
+  });
+
+  it('seq is unchanged after bounded throw — next op lands at seq 0', async () => {
+    const ctx = new WorkflowContext('r1', []);
+    try {
+      await ctx.waitForSignal('approve', { timeoutMs: 1 });
+    } catch (e) {
+      if (!(e instanceof UnsupportedOnThinWorker)) throw e;
+    }
+    // Unbounded waitForSignal is now the first real op — it must land at seq 0.
+    await expect(ctx.waitForSignal('approve')).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([{ kind: 'waitSignal', seq: 0, signal: 'approve' }]);
   });
 
