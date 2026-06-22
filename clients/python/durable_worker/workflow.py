@@ -23,6 +23,7 @@ non-determinism happen once). See docs/plans/2026-06-15-polyglot-workflows-proto
 from __future__ import annotations
 
 import inspect
+import threading
 import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional
@@ -238,6 +239,122 @@ class WorkflowContext:
             }
         )
         return result
+
+    def gather(
+        self,
+        items: "List[tuple]",
+        mode: str = "wait_all",
+    ) -> "List[Any]":
+        """Run N LOCAL step bodies CONCURRENTLY (each in its own thread) and wait for all.
+
+        ``items`` is a list of ``(name, body)`` where ``body`` is a zero-arg callable returning the
+        step's result. Reserves a contiguous seq block in list order (the determinism anchor), runs
+        every body in a thread, then records each outcome as a ``recordStep`` command in seq order.
+
+        ``mode``:
+          ``"wait_all"`` (default) — wait for every item to settle, record all, raise
+              :class:`GatherFailed` if any failed.
+          ``"fail_fast"`` — on the first failure, set a gather-local cancel flag the still-running
+              siblings observe via ``current_step().cancelled`` (cooperative; no thread kill), then
+              raise once all threads have joined.
+
+        Returns results in input order. Deterministic: on replay (all seqs already in history) it
+        reconstructs the result/raise from history WITHOUT invoking any body.
+        """
+        from .worker import StepContext, _current_step  # lazy: avoid import cycle with worker.py
+
+        entries = [(self._next(), name, body) for name, body in items]
+        if not entries:
+            return []
+        group = f"gather:{entries[0][0]}"
+
+        # Replay: inline steps all record in ONE turn, so either ALL or NONE of the seqs are present.
+        if all(self._history.get(seq) is not None for seq, _, _ in entries):
+            outputs: List[Any] = []
+            failures: List[Dict[str, Any]] = []
+            for seq, name, _ in entries:
+                ev = self._history[seq]
+                if ev.get("error") is not None:
+                    failures.append({"name": name, "error": ev["error"]})
+                    outputs.append(None)
+                else:
+                    outputs.append(ev.get("output"))
+            if failures:
+                raise GatherFailed(failures)
+            return outputs
+
+        cancel = threading.Event()
+        run_cancel = self._is_cancelled
+        run_id = self.run_id
+
+        def combined_cancel(rid: str) -> bool:
+            return cancel.is_set() or bool(run_cancel is not None and run_cancel(rid))
+
+        started = int(time.time() * 1000)
+        for seq, name, _ in entries:
+            self._emit_step(
+                {"runId": run_id, "seq": seq, "name": name, "phase": "running",
+                 "startedAt": started, "parallelGroup": group}
+            )
+
+        results: Dict[int, Dict[str, Any]] = {}
+
+        def run_one(seq: int, body: Callable[[], Any]) -> None:
+            step_ctx = StepContext(run_id=run_id, seq=seq, is_cancelled=combined_cancel)
+            token = _current_step.set(step_ctx)
+            try:
+                output = body()
+                results[seq] = {"output": output, "events": step_ctx.events}
+            except Exception as err:  # noqa: BLE001 — recorded per item; aggregated after join
+                results[seq] = {"error": _to_error(err), "events": step_ctx.events}
+                if mode == "fail_fast":
+                    cancel.set()
+            finally:
+                _current_step.reset(token)
+
+        threads = [
+            threading.Thread(target=run_one, args=(seq, body), name=f"gather-{seq}")
+            for seq, _, body in entries
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        finished = int(time.time() * 1000)
+        outputs = []
+        failures = []
+        for seq, name, _ in entries:
+            r = results.get(seq, {"error": {"message": "gather item did not run"}, "events": []})
+            cmd: Dict[str, Any] = {
+                "kind": "recordStep", "seq": seq, "name": name,
+                "startedAt": started, "finishedAt": finished, "parallelGroup": group,
+            }
+            if "error" in r:
+                cmd["error"] = r["error"]
+                failures.append({"name": name, "error": r["error"]})
+                outputs.append(None)
+            else:
+                cmd["output"] = r["output"]
+                outputs.append(r["output"])
+            if r.get("events"):
+                cmd["events"] = r["events"]
+            self.commands.append(cmd)
+            phase = "failed" if "error" in r else "completed"
+            event = {
+                "runId": run_id, "seq": seq, "name": name, "phase": phase,
+                "startedAt": started, "finishedAt": finished, "parallelGroup": group,
+                "events": r.get("events", []),
+            }
+            if "error" in r:
+                event["error"] = r["error"]
+            else:
+                event["output"] = r["output"]
+            self._emit_step(event)
+
+        if failures:
+            raise GatherFailed(failures)
+        return outputs
 
     def sleep(self, ms: int) -> None:
         """Durably sleep ``ms``; the run suspends and the engine resumes it when the timer fires."""

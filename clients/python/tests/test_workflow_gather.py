@@ -18,5 +18,99 @@ class GatherFailedTest(unittest.TestCase):
         self.assertIn("handle_MVR", gf.error["message"])
 
 
+from durable_worker.workflow import WorkflowContext, GatherFailed as _GF  # noqa: E402
+
+
+class GatherStepsTest(unittest.TestCase):
+    def _ctx(self, history=None, is_cancelled=None):
+        return WorkflowContext("run1", history or [], is_cancelled=is_cancelled)
+
+    def test_runs_all_and_returns_results_in_input_order(self):
+        ctx = self._ctx()
+        out = ctx.gather([
+            ("a", lambda: 1),
+            ("b", lambda: 2),
+            ("c", lambda: 3),
+        ])
+        self.assertEqual(out, [1, 2, 3])
+        # Reserves seqs 0,1,2 in list order and records one step command each.
+        steps = [c for c in ctx.commands if c["kind"] == "recordStep"]
+        self.assertEqual([c["seq"] for c in steps], [0, 1, 2])
+        self.assertEqual([c["name"] for c in steps], ["a", "b", "c"])
+        # All share one parallelGroup marker.
+        groups = {c["parallelGroup"] for c in steps}
+        self.assertEqual(len(groups), 1)
+
+    def test_replay_does_not_rerun_bodies(self):
+        history = [
+            {"seq": 0, "kind": "step", "name": "a", "output": 1},
+            {"seq": 1, "kind": "step", "name": "b", "output": 2},
+        ]
+        ctx = self._ctx(history)
+
+        def boom():
+            raise AssertionError("body must not run on replay")
+
+        out = ctx.gather([("a", boom), ("b", boom)])
+        self.assertEqual(out, [1, 2])
+        self.assertEqual(ctx.commands, [])  # nothing re-recorded
+
+    def test_wait_all_aggregates_failures_and_records_every_outcome(self):
+        ctx = self._ctx()
+
+        def fail():
+            raise ValueError("boom")
+
+        with self.assertRaises(_GF) as cm:
+            ctx.gather([("ok", lambda: 1), ("bad", fail), ("ok2", lambda: 2)])
+        names = [e["name"] for e in cm.exception.errors]
+        self.assertEqual(names, ["bad"])
+        # wait_all still records all three step commands (ok, bad, ok2).
+        recorded = [c["name"] for c in ctx.commands if c["kind"] == "recordStep"]
+        self.assertEqual(recorded, ["ok", "bad", "ok2"])
+        bad = next(c for c in ctx.commands if c["name"] == "bad")
+        self.assertIn("error", bad)
+
+    def test_empty_items_returns_empty(self):
+        ctx = self._ctx()
+        self.assertEqual(ctx.gather([]), [])
+        self.assertEqual(ctx.commands, [])
+
+    def test_single_item_behaves_like_one_step(self):
+        ctx = self._ctx()
+        out = ctx.gather([("only", lambda: 42)])
+        self.assertEqual(out, [42])
+        steps = [c for c in ctx.commands if c["kind"] == "recordStep"]
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["output"], 42)
+
+    def test_fail_fast_signals_cooperative_cancel_to_siblings(self):
+        from durable_worker.worker import current_step
+        import threading
+
+        ctx = self._ctx()
+        sibling_saw_cancel = threading.Event()
+        first_failed = threading.Event()
+
+        def fail():
+            first_failed.set()
+            raise ValueError("boom")
+
+        def sibling():
+            # Wait until the failing item has failed, then observe cooperative cancel.
+            first_failed.wait(timeout=2)
+            step = current_step()
+            for _ in range(200):
+                if step is not None and step.cancelled:
+                    sibling_saw_cancel.set()
+                    return "cancelled"
+                threading.Event().wait(0.005)
+            return "ran-to-completion"
+
+        with self.assertRaises(_GF):
+            ctx.gather([("bad", fail), ("sib", sibling)], mode="fail_fast")
+        self.assertTrue(sibling_saw_cancel.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()
