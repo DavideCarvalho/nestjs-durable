@@ -14,6 +14,7 @@ export default defineConfig({
       '@dudousxd/nestjs-durable-testing': pkg('testing'),
       '@dudousxd/nestjs-durable-transport-event-emitter': pkg('transport-event-emitter'),
       '@dudousxd/nestjs-durable': pkg('nestjs'),
+      '@dudousxd/durable-worker': pkg('worker'),
     },
   },
   plugins: [
