@@ -1,3 +1,4 @@
+import { RemoteWorkflowTimeout } from './errors';
 import type {
   HistoryEvent,
   Transport,
@@ -67,7 +68,10 @@ export class RemoteWorkflowExecutor implements WorkflowExecutor {
       if (this.opts.timeoutMs) {
         const timer = setTimeout(() => {
           this.pending.delete(taskId);
-          reject(new Error(`workflow task ${taskId} timed out after ${this.opts.timeoutMs}ms`));
+          // A RECOVERABLE timeout, not a run failure: the decision may merely have been dropped while
+          // the work completed. The engine catches this distinct type and re-drives via recovery
+          // instead of failing the run. See RemoteWorkflowTimeout for the (opt-in) hazard note.
+          reject(new RemoteWorkflowTimeout(taskId, this.opts.timeoutMs));
         }, this.opts.timeoutMs);
         (timer as { unref?: () => void }).unref?.();
       }

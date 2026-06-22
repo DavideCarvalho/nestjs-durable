@@ -34,6 +34,38 @@ Available liveness signals (a design choice for the user):
 
 **Decision needed from the user:** which liveness signal, and the silence window (self-heal latency vs. tolerance for long single steps). This is why it isn't shipped blind.
 
+#### SHIPPED — safe, opt-in, default-OFF half (2026-06-22)
+
+The *recoverable-timeout* mechanism is now in the engine, gated entirely on the executor's existing
+`timeoutMs` (caller-configured; absent = prior unbounded await, unchanged → existing users see zero
+behavior change):
+
+- New `RemoteWorkflowTimeout extends Error` (`packages/core/src/errors.ts`) carrying `taskId` + `timeoutMs`.
+- `RemoteWorkflowExecutor.advance` (`remote-workflow-executor.ts`) now rejects the timeout with
+  `RemoteWorkflowTimeout` instead of a generic `Error`.
+- `runRemoteExecution`'s catch (`engine.ts`) distinguishes it: on `RemoteWorkflowTimeout` it RELEASES
+  the run lease (`releaseRunLock`, idempotent) and returns the run's current status WITHOUT marking it
+  failed — so the run stays `running`/`suspended` and `recoverIncomplete` re-acquires the now-free lease
+  and re-drives it (deterministic replay → same `completed` decision → settle → notify parent). Any
+  OTHER error still fails the run (unchanged). `execute`'s `finally` clears the renew interval once the
+  call returns, so the released lease genuinely stays free (a renew tick racing the release is a no-op
+  because `renewRunLock` requires `lockedBy === owner`).
+- Tests: `packages/core/src/remote-workflow-timeout.spec.ts` (stuck-without-timeout bug, timeout→
+  recovery→completed, parent notified, non-timeout error still fails).
+
+**KNOWN LIMITATION (the still-open hazard):** a fixed timeout that fires while a worker is LEGITIMATELY
+still executing a not-yet-checkpointed step re-drives and re-runs that in-flight step → **duplicate side
+effects**. So this opt-in timeout is only safe when set GENEROUSLY (> the longest legitimate single
+turn). It does NOT distinguish "slow but alive" from "dead."
+
+#### NEXT STEP (follow-up, NOT yet implemented) — the liveness-rearmed deadline
+
+The robust fix is to make the deadline **liveness-based** rather than fixed: rearm it on any per-run
+liveness signal the worker emits while alive (see the three signals above), so only a *genuinely dead*
+worker ever crosses the silence window and re-drives. That removes the duplicate-side-effect hazard and
+lets the window be tightened for faster self-heal. This is the open work; the shipped opt-in timeout is
+the conservative interim.
+
 ### Part A (Python) — safe interim hardening (low-risk)
 
 Pass an explicit, generous `lockDuration` (and matching stalled settings) to the workflow `BullWorker` (`redis_runner.py:155`) so a transient loop pause is less likely to lapse the lock and trigger a stall/redelivery in the first place. Reduces trigger frequency; does not by itself fix the permanent-hang structural gap (Part B does).
