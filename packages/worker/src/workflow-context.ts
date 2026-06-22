@@ -1,10 +1,23 @@
 import type {
   HistoryEvent,
+  StepError,
   StepEvent,
   WorkflowCommand,
   WorkflowStepEvent,
 } from '@dudousxd/nestjs-durable-core';
-import { Cancelled, NondeterminismError, StepFailed, Suspend, toError } from './errors';
+import {
+  Cancelled,
+  GatherError,
+  type GatherFailure,
+  NondeterminismError,
+  StepFailed,
+  Suspend,
+  toError,
+} from './errors';
+
+/** Mode for the parallel ops: `waitAll` records/awaits every item then aggregates failures;
+ *  `failFast` surfaces the first failure as soon as it is seen. Mirrors Python `wait_all`/`fail_fast`. */
+export type GatherMode = 'waitAll' | 'failFast';
 
 /**
  * Minimal events sink handed to a `ctx.step` body so it can record sub-events (logs + sub-process
@@ -168,10 +181,28 @@ export class WorkflowContext {
     const { found, output } = this.replay(seq, 'step', name);
     if (found) return output as T;
 
+    const { output: result, error } = await this.runStepBody(seq, name, body);
+    if (error !== undefined) throw new StepFailed(error);
+    return result as T;
+  }
+
+  /**
+   * Run one local step body, record its `recordStep` command (with `parallelGroup` when set) and
+   * stream its lifecycle. Returns `{output}` on success or `{error}` on failure WITHOUT throwing, so
+   * {@link step} and {@link gather} can decide how to surface it. The single place a local step's
+   * side effects + recording happen exactly once.
+   */
+  private async runStepBody(
+    seq: number,
+    name: string,
+    body: StepBody<unknown>,
+    parallelGroup?: string,
+  ): Promise<{ output?: unknown; error?: StepError; events: StepEvent[] }> {
     const events: StepEvent[] = [];
     const log = makeStepLog(events);
     const startedAt = Date.now();
-    this.emitStep({ runId: this.runId ?? '', seq, name, phase: 'running', startedAt });
+    const runId = this.runId ?? '';
+    this.emitStep({ runId, seq, name, phase: 'running', startedAt, parallelGroup });
 
     try {
       const result = await body(log);
@@ -185,9 +216,10 @@ export class WorkflowContext {
         finishedAt,
       };
       if (events.length > 0) cmd.events = events;
+      if (parallelGroup !== undefined) cmd.parallelGroup = parallelGroup;
       this.commands.push(cmd);
       this.emitStep({
-        runId: this.runId ?? '',
+        runId,
         seq,
         name,
         phase: 'completed',
@@ -195,16 +227,18 @@ export class WorkflowContext {
         finishedAt,
         output: result,
         events,
+        parallelGroup,
       });
-      return result;
+      return { output: result, events };
     } catch (err) {
       const error = toError(err);
       const finishedAt = Date.now();
       const cmd: WorkflowCommand = { kind: 'recordStep', seq, name, error, startedAt, finishedAt };
       if (events.length > 0) cmd.events = events;
+      if (parallelGroup !== undefined) cmd.parallelGroup = parallelGroup;
       this.commands.push(cmd);
       this.emitStep({
-        runId: this.runId ?? '',
+        runId,
         seq,
         name,
         phase: 'failed',
@@ -212,8 +246,9 @@ export class WorkflowContext {
         finishedAt,
         error,
         events,
+        parallelGroup,
       });
-      throw new StepFailed(error);
+      return { error, events };
     }
   }
 
@@ -245,10 +280,134 @@ export class WorkflowContext {
     this.commands.push({ kind: 'startChild', seq, workflow, input });
     throw new Suspend();
   }
+
+  /**
+   * Run N LOCAL step bodies CONCURRENTLY and wait for all (Node: `Promise` over the bodies, no
+   * threads). Reserves a contiguous seq block in list order BEFORE running any body — the determinism
+   * anchor, identical to a sequence of `step` calls, so replay reaches the same seqs regardless of
+   * which body settles first. Records each outcome as a `recordStep` command in seq order, every one
+   * tagged with the same `parallelGroup` (`gather:<firstSeq>`).
+   *
+   * `waitAll` (default): await all, record all, throw {@link GatherError} if any failed.
+   * `failFast`: still records every started body's outcome, then throws {@link GatherError} carrying
+   *   the failures. Returns results in input order. Deterministic: on replay (all seqs already in
+   *   history) it reconstructs the result/raise from history WITHOUT invoking any body. Mirrors
+   *   Python `gather`.
+   */
+  async gather(
+    items: Array<[name: string, body: StepBody<unknown>]>,
+    opts: { mode?: GatherMode } = {},
+  ): Promise<unknown[]> {
+    // Reserve the contiguous seq block synchronously, in list order, before any await. This is the
+    // determinism anchor: seqs are assigned by position, never by completion order.
+    const entries = items.map(([name, body], index) => ({ index, seq: this.next(), name, body }));
+    const first = entries[0];
+    if (first === undefined) return [];
+    const group = `gather:${first.seq}`;
+
+    // Replay: inline steps all record in ONE turn, so either ALL or NONE of the seqs are present.
+    const replayed = entries.map((e) => this.replayEntry(e.seq, 'step', e.name));
+    if (replayed.every((ev) => ev !== null)) {
+      const failures: GatherFailure[] = [];
+      const outputs = entries.map((e, i) => {
+        const ev = replayed[i] as HistoryEvent;
+        if (ev.error != null) {
+          failures.push({ index: e.index, name: e.name, error: ev.error });
+          return undefined;
+        }
+        return ev.output;
+      });
+      if (failures.length > 0) throw new GatherError(failures);
+      return outputs;
+    }
+
+    // failFast and waitAll both record every started body's outcome (a JS Promise can't be killed
+    // mid-flight); both raise once any item failed — the mode only governs intent for parity.
+    const results = await Promise.all(
+      entries.map((e) => this.runStepBody(e.seq, e.name, e.body, group)),
+    );
+
+    const failures: GatherFailure[] = [];
+    const outputs = entries.map((e, i) => {
+      const r = results[i];
+      if (r?.error !== undefined) {
+        failures.push({ index: e.index, name: e.name, error: r.error });
+        return undefined;
+      }
+      return r?.output;
+    });
+    if (failures.length > 0) throw new GatherError(failures);
+    return outputs;
+  }
+
+  /**
+   * Dispatch N child workflows CONCURRENTLY and wait for ALL their outputs (gather_children parity).
+   * Reserves a contiguous seq block in input order; on the first turn emits a `startChild` command
+   * for every input (each tagged `parallelGroup` = `gather:<firstSeq>`) in ONE turn, then suspends.
+   * On each child completion the parent resumes; a resume re-emits ONLY the still-outstanding children
+   * (idempotent on the engine — a child has no history entry until it settles). Once ALL children have
+   * resolved it returns their outputs in input order.
+   *
+   * `waitAll` (default): aggregate failures into {@link GatherError}. `failFast`: raise as soon as a
+   * failed child is seen on a resume (siblings are not force-cancelled in v1). Empty inputs → `[]`.
+   * Mirrors Python `gather_children`.
+   */
+  async all(
+    workflow: string,
+    inputs: unknown[],
+    opts: { mode?: GatherMode } = {},
+  ): Promise<unknown[]> {
+    const entries = inputs.map((input, index) => ({
+      index,
+      seq: this.next(),
+      input,
+      history: undefined as HistoryEvent | null | undefined,
+    }));
+    const first = entries[0];
+    if (first === undefined) return [];
+    const group = `gather:${first.seq}`;
+    for (const e of entries) e.history = this.replayEntry(e.seq, 'child', workflow);
+
+    if ((opts.mode ?? 'waitAll') === 'failFast') {
+      for (const e of entries) {
+        if (e.history?.error != null) {
+          throw new GatherError([{ index: e.index, workflow, error: e.history.error }]);
+        }
+      }
+    }
+
+    let pending = false;
+    for (const e of entries) {
+      if (e.history == null) {
+        this.commands.push({
+          kind: 'startChild',
+          seq: e.seq,
+          workflow,
+          input: e.input,
+          parallelGroup: group,
+        });
+        pending = true;
+      }
+    }
+    if (pending) throw new Suspend();
+
+    const failures: GatherFailure[] = [];
+    const outputs = entries.map((e) => {
+      const ev = e.history as HistoryEvent;
+      if (ev.error != null) {
+        failures.push({ index: e.index, workflow, error: ev.error });
+        return undefined;
+      }
+      return ev.output;
+    });
+    if (failures.length > 0) throw new GatherError(failures);
+    return outputs;
+  }
 }
 
-/** Build the minimal recording {@link StepLog} that appends each event to `events`. */
-function makeStepLog(events: StepEvent[]): StepLog {
+/** Build the minimal recording {@link StepLog} that appends each event to `events`. Shared with the
+ *  {@link StepWorker} so a remote step handler records sub-events the same way an inline `ctx.step` does. */
+export function makeStepLog(events: StepEvent[]): StepLog {
   const logLine = (level: StepEvent['level'], message: string, data?: unknown) => {
     const e: StepEvent = { at: Date.now(), level, message };
     if (data !== undefined) e.data = data;

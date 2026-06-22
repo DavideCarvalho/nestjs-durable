@@ -506,8 +506,16 @@ export type WorkflowCommand =
   | { kind: 'sleep'; seq: number; ms: number }
   /** `ctx.wait_signal(name)` — block until a signal `name` is delivered to the run. */
   | { kind: 'waitSignal'; seq: number; signal: string }
-  /** `ctx.start_child(workflow, input)` — start a child run with its own lifecycle. */
-  | { kind: 'startChild'; seq: number; workflow: string; input: unknown };
+  /** `ctx.start_child(workflow, input)` — start a child run with its own lifecycle. A worker's
+   *  `ctx.all([...])` fan-out tags every dispatched child with the same `parallelGroup` so the
+   *  dashboard can render the fan as one group (parity with the gathered `recordStep` tag). */
+  | {
+      kind: 'startChild';
+      seq: number;
+      workflow: string;
+      input: unknown;
+      parallelGroup?: string;
+    };
 
 /** workflow worker → engine: the result of replaying one turn of a remote workflow. */
 export interface WorkflowDecision {
@@ -546,6 +554,9 @@ export interface WorkflowStepEvent {
   error?: StepError;
   /** Sub-process + log trail the step emitted so far (the handler's p-processes). */
   events?: StepEvent[];
+  /** A worker's `ctx.gather([...])` fan tags every step's lifecycle with the same group so the
+   *  dashboard renders the live fan-out as one group (parity with the `recordStep` tag). */
+  parallelGroup?: string | undefined;
 }
 
 /**

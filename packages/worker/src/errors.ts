@@ -31,6 +31,34 @@ export class StepFailed extends Error {
   }
 }
 
+/** One failed item in a {@link GatherError}: its input position, the step `name` (gather) or child
+ *  `workflow` (all), and the recorded error. Both keys are present so a caller can read whichever
+ *  fits the op — mirrors the engine's `GatherError.failures` (index/id/error) and Python's per-item
+ *  failure dicts. */
+export interface GatherFailure {
+  index: number;
+  name?: string;
+  workflow?: string;
+  error: StepError;
+}
+
+/**
+ * One or more items in a `ctx.gather` / `ctx.all` fan-out failed. Carries the per-item
+ * {@link GatherFailure}s and presents an aggregate `.error` so `processTask` records the gather as a
+ * failed decision. Subclasses {@link StepFailed} so it is catchable in workflow code exactly like any
+ * awaited failure. Mirrors the Python `GatherFailed` and the engine's `GatherError`.
+ */
+export class GatherError extends StepFailed {
+  readonly failures: GatherFailure[];
+
+  constructor(failures: GatherFailure[]) {
+    const labels = failures.map((f) => f.name ?? f.workflow ?? `#${f.index}`).join(', ');
+    super({ message: `gather: ${failures.length} item(s) failed: ${labels}` });
+    this.name = 'GatherError';
+    this.failures = failures;
+  }
+}
+
 /**
  * Internal: stop the replay at the first unresolved blocking op. Ends a turn. Mirrors the Python
  * `_Suspend`. Never surfaces to workflow code — `WorkflowWorker.processTask` translates it to a
