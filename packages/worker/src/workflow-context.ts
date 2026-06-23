@@ -3,6 +3,7 @@ import type {
   DurableWebhook,
   HistoryEvent,
   RemoteStepDef,
+  SearchAttributes,
   StepError,
   StepEvent,
   StepLogger,
@@ -534,6 +535,12 @@ export class WorkflowContext implements WorkflowCtx {
     _fn: (tx: unknown) => Promise<TOutput>,
   ): Promise<TOutput> {
     return this.unsupported('transaction');
+  }
+
+  /** UNSUPPORTED: searchAttributes live on the engine-owned run record; a thin worker has no store.
+   *  Run such a workflow in-process on the engine, where `ctx.upsertSearchAttributes` is durable. */
+  async upsertSearchAttributes(_attrs: SearchAttributes): Promise<void> {
+    return this.unsupported('upsertSearchAttributes');
   }
 
   /** UNSUPPORTED: durable entities run on the engine over durable state, not on the worker. */
