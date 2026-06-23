@@ -47,6 +47,7 @@ const STATUSES: RunStatus[] = [
   'suspended',
   'completed',
   'failed',
+  'cancelling',
   'cancelled',
   'dead',
 ];
@@ -70,7 +71,7 @@ function durMs(a: string, b: string): string {
 }
 
 function StatusDot({ status }: { status: RunDisplayStatus | StepCheckpoint['status'] }) {
-  const live = status === 'running' || status === 'awaiting';
+  const live = status === 'running' || status === 'awaiting' || status === 'cancelling';
   return <span className={`dot s-${status} ${live ? 'pulse' : ''}`} aria-hidden />;
 }
 

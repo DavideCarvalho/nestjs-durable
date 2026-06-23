@@ -16,6 +16,7 @@ import {
   Brackets,
   type DataSource,
   type EntityManager,
+  In,
   IsNull,
   LessThanOrEqual,
   Like,
@@ -150,7 +151,7 @@ export class TypeOrmStateStore implements StateStore {
   }
 
   async listIncompleteRuns(): Promise<WorkflowRun[]> {
-    const rows = await this.runs().findBy({ status: 'running' });
+    const rows = await this.runs().findBy({ status: In(['running', 'cancelling']) });
     return rows.map(fromRunEntity);
   }
 

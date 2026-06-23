@@ -78,6 +78,11 @@ body {
 .s-failed {
   color: #f87171;
 }
+/* Compensating cancel in progress: a transient, in-flight amber — distinct from the grey terminal
+   `cancelled` it flips to once the rollback completes. */
+.s-cancelling {
+  color: #f59e0b;
+}
 .s-cancelled {
   color: #71717a;
 }

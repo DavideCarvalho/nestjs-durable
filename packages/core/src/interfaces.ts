@@ -17,6 +17,14 @@ export type RunStatus =
   | 'pending'
   | 'running'
   | 'suspended'
+  /**
+   * Compensating cancel in progress: `cancel(runId, { compensate: true })` has been requested and the
+   * saga undo is running in the background. NON-TERMINAL — the run is still in-flight (counted by the
+   * admission gate, re-driven by recovery if the engine crashes mid-compensation), and flips to
+   * `cancelled` once compensation completes. A non-compensating cancel skips this and goes straight to
+   * `cancelled`.
+   */
+  | 'cancelling'
   | 'completed'
   | 'failed'
   | 'cancelled'

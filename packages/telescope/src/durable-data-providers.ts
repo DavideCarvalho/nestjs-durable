@@ -390,11 +390,18 @@ export function durableThroughputProvider(): DataProvider {
 }
 
 /** Color palette for the state breakdown pie segments. */
-const STATE_BREAKDOWN_PALETTE = ['#34d399', '#fbbf24', '#f87171', '#38bdf8', '#a78bfa'];
-const STATE_BREAKDOWN_STATUSES: RunStatus[] = ['running', 'pending', 'completed', 'failed', 'dead'];
+const STATE_BREAKDOWN_PALETTE = ['#34d399', '#fbbf24', '#f59e0b', '#f87171', '#38bdf8', '#a78bfa'];
+const STATE_BREAKDOWN_STATUSES: RunStatus[] = [
+  'running',
+  'pending',
+  'cancelling',
+  'completed',
+  'failed',
+  'dead',
+];
 
 /**
- * Counts from `STATE_STORE.listRuns({ status })` for each of the 5 statuses and returns pie
+ * Counts from `STATE_STORE.listRuns({ status })` for each of the statuses and returns pie
  * segments with the standard palette: `{ segments: Array<{ label, value, color }> }`.
  */
 export function durableStateBreakdownProvider(): DataProvider {

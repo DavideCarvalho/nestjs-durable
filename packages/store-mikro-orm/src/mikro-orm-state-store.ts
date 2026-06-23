@@ -136,7 +136,7 @@ export class MikroOrmStateStore implements StateStore {
 
   async listIncompleteRuns(): Promise<WorkflowRun[]> {
     const em = this.orm.em.fork();
-    const rows = await em.find(WorkflowRunEntity, { status: 'running' });
+    const rows = await em.find(WorkflowRunEntity, { status: { $in: ['running', 'cancelling'] } });
     return rows.map(fromRunEntity);
   }
 

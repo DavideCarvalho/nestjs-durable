@@ -4,6 +4,7 @@ export type RunStatus =
   | 'suspended'
   | 'completed'
   | 'failed'
+  | 'cancelling'
   | 'cancelled'
   | 'dead';
 export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
