@@ -32,6 +32,14 @@ _INSTANCE_ID = f"py-{socket.gethostname()}-{os.getpid()}"
 _HEARTBEAT_INTERVAL_SECONDS = 10
 _HEARTBEAT_TTL_SECONDS = 35
 
+# Per-RUN liveness heartbeat emitted WHILE a workflow turn is replaying. The TS engine, while it
+# awaits a remote `advance`, re-arms its `remoteAdvanceSilenceMs` deadline on each run-scoped beat and
+# re-drives the run if the worker goes silent. So a slow-but-alive replay must beat every few seconds
+# to prove it's still working and avoid being wrongly re-driven. Distinct from the per-WORKER TTL key
+# above: this rides the engine's pub/sub `<prefix>-heartbeat` channel, beats faster, and is keyed by
+# runId (no stepId), so the engine resets the run's liveness deadline.
+_BEAT_INTERVAL_SECONDS = 5
+
 
 def _heartbeat_key(prefix: str, group: str) -> str:
     """Per-(group, instance) liveness key. Mirrors the queue-name convention ('<prefix>-...') so the
@@ -89,6 +97,37 @@ async def _start_heartbeat(connection: str, prefix: str, group: str) -> None:
     asyncio.create_task(beat())
 
 
+def _run_heartbeat_channel(prefix: str) -> str:
+    """Pub/sub channel for run-scoped liveness beats. MUST match the channel the TS engine's transport
+    subscribes to: '<prefix>-heartbeat'."""
+    return f"{prefix}-heartbeat"
+
+
+def _run_heartbeat_client(connection: str) -> Optional[Any]:
+    """Lazily build the aioredis client used to PUBLISH run-scoped beats. One client per worker (not
+    per turn). Returns None when redis isn't importable — then per-run beating is simply off (a no-op),
+    exactly like ``_start_heartbeat`` when the dependency is missing."""
+    try:
+        import redis.asyncio as aioredis  # lazy: only needed when a transport is actually running
+    except ImportError:
+        return None
+    return aioredis.from_url(connection)
+
+
+async def _beat_run(client: Any, channel: str, run_id: Any, group: str) -> None:
+    """Publish a run-scoped liveness beat immediately, then every ``_BEAT_INTERVAL_SECONDS`` while the
+    turn runs. The payload OMITS ``stepId`` so the engine keys the liveness reset by ``runId``. Cadence
+    and best-effort error handling mirror ``_start_heartbeat``: a failed publish is swallowed so a
+    redis hiccup never breaks the in-flight turn. The caller cancels this task when the turn settles."""
+    payload = json.dumps({"runId": run_id, "seq": 0, "group": group})
+    while True:
+        try:
+            await client.publish(channel, payload)
+        except Exception:  # noqa: BLE001 — never let a heartbeat hiccup break the running turn
+            pass
+        await asyncio.sleep(_BEAT_INTERVAL_SECONDS)
+
+
 def redis_url_from_env(prefix: str = "REDIS") -> str:
     """Build a ``redis://`` URL from ``{prefix}_HOST/_PORT/_USERNAME/_PASSWORD`` env vars. The
     credentials are URL-encoded — a generated password often contains ``@ : /`` which would corrupt
@@ -137,19 +176,43 @@ async def run_redis_workflow_worker(
     registry = cancellation or CancellationRegistry()
     await _subscribe_control(connection, prefix, registry)
 
-    async def process(job: Any, _token: str) -> None:
+    # One publisher client per worker (not per turn). The per-turn beat task just borrows it.
+    beat_client = _run_heartbeat_client(connection)
+    beat_channel = _run_heartbeat_channel(prefix)
+
+    async def process(job: Any, _token: str) -> Any:
         # Replay OFF the event loop. `process_task` is fully synchronous and a real workflow turn can
         # run for minutes (e.g. a body of inline ctx.step DB calls). Running it inline would block the
         # loop that drives (a) this worker's liveness heartbeat — so it'd read as "0 live workers" mid-
         # run — and (b) BullMQ's job-lock renewal — so the lock would lapse, the job stall, and BullMQ
         # REDELIVER it (the workflow runs twice). `to_thread` keeps the loop free for both — and for
         # streaming each step's lifecycle (`publish_step`) so steps show up live, not all at turn-end.
-        decision = await asyncio.to_thread(
-            workflow_worker.process_task, job.data, publish_step, registry.is_cancelled
+        #
+        # While the replay runs the loop is free, so emit a run-scoped liveness beat every few seconds:
+        # the engine re-arms its `remoteAdvanceSilenceMs` deadline on each beat and won't wrongly
+        # re-drive a slow-but-alive run. Cancel the beat the instant the turn settles (try/finally).
+        beat_task = (
+            asyncio.create_task(
+                _beat_run(beat_client, beat_channel, job.data.get("runId"), group)
+            )
+            if beat_client is not None
+            else None
         )
+        try:
+            decision = await asyncio.to_thread(
+                workflow_worker.process_task, job.data, publish_step, registry.is_cancelled
+            )
+        finally:
+            if beat_task is not None:
+                beat_task.cancel()
+                try:
+                    await beat_task
+                except asyncio.CancelledError:
+                    pass
         await decisions.add(
             "decision", decision, {"removeOnComplete": True, "removeOnFail": True}
         )
+        return decision
 
     await _start_heartbeat(connection, prefix, group)
     return BullWorker(tasks_name, process, {"connection": connection})

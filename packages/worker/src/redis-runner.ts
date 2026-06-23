@@ -5,6 +5,8 @@ import {
   type DurableWorkerRuntime,
   controlChannel,
   decisionsName,
+  heartbeatChannel,
+  isWorkflowTask,
   resultsName,
   stepEventsName,
   tasksName,
@@ -17,6 +19,47 @@ import {
 // `BullMQTransport.startWorkerHeartbeat`, so a mixed-language group reports all workers under one scan.
 const WORKER_HEARTBEAT_INTERVAL_MS = 10_000;
 const WORKER_HEARTBEAT_TTL_SECONDS = 35;
+
+// Run-scoped liveness heartbeat: while a workflow worker replays a TURN it publishes a beat keyed by
+// `runId` (no stepId) on the `<prefix>-heartbeat` channel, so the engine — when configured with
+// `remoteAdvanceSilenceMs` — rearms the run's `advance` deadline and never re-drives a worker that's
+// alive-but-slow. The engine keys the liveness reset by `runId` when `stepId` is absent.
+const RUN_HEARTBEAT_INTERVAL_MS = 5_000;
+
+/** The minimal publish surface a run-scoped heartbeat needs — any ioredis client satisfies it. */
+interface HeartbeatPublisher {
+  publish(channel: string, payload: string): unknown;
+}
+
+/**
+ * Start a run-scoped liveness heartbeat for `runId`: publish one beat immediately, then every
+ * {@link RUN_HEARTBEAT_INTERVAL_MS} ms, on the `<prefix>-heartbeat` channel as
+ * `{ runId, seq: 0, group }` (no `stepId` — the engine keys a run-scoped reset by `runId`). Returns
+ * a stop function that clears the interval. Best-effort: a failed/throwing publish is swallowed and
+ * never propagates (exactly like the worker-TTL heartbeat). With no client it's a no-op.
+ */
+export function startRunHeartbeat(
+  client: HeartbeatPublisher | undefined,
+  prefix: string,
+  group: string,
+  runId: string,
+): () => void {
+  if (!client) return () => {};
+  const channel = heartbeatChannel(prefix);
+  const payload = JSON.stringify({ runId, seq: 0, group });
+  const beat = (): void => {
+    try {
+      // `.publish` may return a promise (ioredis) — swallow a rejection too, never fail the turn.
+      void Promise.resolve(client.publish(channel, payload)).catch(() => {});
+    } catch {
+      /* a synchronous throw must never break or fail the turn */
+    }
+  };
+  beat(); // fire immediately so a just-started turn is visible without waiting a full interval
+  const timer = setInterval(beat, RUN_HEARTBEAT_INTERVAL_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
 
 // A workflow turn can run for minutes (a body of inline `ctx.step` DB calls). Node is single-threaded:
 // while `handleTask` is awaited the event loop stays free (the step bodies await), but BullMQ renews
@@ -70,6 +113,7 @@ export interface RunnerDeps {
   ) => {
     duplicate(): RedisSubClient;
     set(key: string, value: string, mode: string, ttl: number): Promise<unknown>;
+    publish(channel: string, payload: string): Promise<unknown>;
     subscribe(channel: string): Promise<unknown>;
     on(event: 'message', listener: (channel: string, payload: string) => void): unknown;
     disconnect(): void;
@@ -152,16 +196,26 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   };
 
   const processJob = async (job: { data: unknown }): Promise<void> => {
-    // `handleTask` is async; awaiting it keeps the event loop free (step bodies await), so the job
-    // lock can renew and the worker's heartbeat keeps stamping — no stall, no redeliver.
-    const out = await runtime.handleTask(
-      job.data as Parameters<DurableWorkerRuntime['handleTask']>[0],
-      { onStep, isCancelled },
-    );
-    if (out.kind === 'decision') {
-      await decisions.add('decision', out.decision, jobOpts);
-    } else {
-      await results.add('result', out.result, jobOpts);
+    const task = job.data as Parameters<DurableWorkerRuntime['handleTask']>[0];
+    // While replaying a WORKFLOW turn, beat run-scoped liveness so the engine's heartbeat-rearmed
+    // `advance` deadline never re-drives a worker that's alive-but-slow. Only workflow tasks carry a
+    // run the engine awaits an `advance` for; a remote-step task is not beaten (harmless either way).
+    const stopBeat =
+      isWorkflowTask(task) && heartbeatClient
+        ? startRunHeartbeat(heartbeatClient, prefix, group, task.runId)
+        : () => {};
+    try {
+      // `handleTask` is async; awaiting it keeps the event loop free (step bodies await), so the job
+      // lock can renew and the worker's heartbeat keeps stamping — no stall, no redeliver.
+      const out = await runtime.handleTask(task, { onStep, isCancelled });
+      if (out.kind === 'decision') {
+        await decisions.add('decision', out.decision, jobOpts);
+      } else {
+        await results.add('result', out.result, jobOpts);
+      }
+    } finally {
+      // Stop the run-scoped beat the moment the turn settles (success OR failure).
+      stopBeat();
     }
   };
 

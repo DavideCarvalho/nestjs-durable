@@ -45,6 +45,12 @@ export function controlChannel(prefix: string): string {
   return `${prefix}-control`;
 }
 
+/** `<prefix>-heartbeat` — the Redis pub/sub channel carrying liveness beats (per-step AND run-scoped).
+ *  MUST byte-match `BullMQTransport.heartbeatChannel` so the engine's transport receives our beats. */
+export function heartbeatChannel(prefix: string): string {
+  return `${prefix}-heartbeat`;
+}
+
 /** `<prefix>-worker-heartbeat:<group>:<instanceId>` — the TTL'd worker-liveness key. The ':' here is
  *  fine: it's a Redis KEY, not a BullMQ queue name. Matches `BullMQTransport.workerHeartbeatKey`. */
 export function workerHeartbeatKey(prefix: string, group: string, instanceId: string): string {

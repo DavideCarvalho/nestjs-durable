@@ -427,7 +427,13 @@ export interface StepResult {
 export interface Heartbeat {
   runId: string;
   seq: number;
-  stepId: string;
+  /**
+   * The in-flight step this beat keeps alive. ABSENT for a RUN-scoped (workflow-turn) heartbeat: a
+   * worker replaying a long workflow turn beats for its `runId` so the engine rearms the run's
+   * `advance` deadline (see `WorkflowEngineDeps.remoteAdvanceSilenceMs`). The engine then keys the
+   * liveness reset by `runId` instead of `stepId`.
+   */
+  stepId?: string | undefined;
   group: string;
 }
 

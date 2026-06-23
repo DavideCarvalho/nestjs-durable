@@ -201,6 +201,18 @@ export interface WorkflowEngineDeps {
    */
   maxRecoveryAttempts?: number | undefined;
   /**
+   * Opt-in liveness deadline (ms) for a remote workflow `advance`. If the worker neither returns a
+   * decision NOR sends a run-scoped {@link Heartbeat} within this window, the engine presumes it dead:
+   * it rejects the advance with {@link RemoteWorkflowTimeout}, releases the lease, and lets recovery
+   * re-drive (replaying completed steps from history). Each beat REARMS the window, so a worker still
+   * legitimately replaying a long turn (it keeps beating) is never re-driven — closing the duplicate-
+   * side-effect hazard a fixed {@link RemoteWorkflowExecutor} `timeoutMs` cannot avoid. Omit (default)
+   * for the prior unbounded await — byte-identical behavior when unset. If a `RemoteWorkflowExecutor` is
+   * ALSO constructed with its own `timeoutMs`, the shorter of the two deadlines wins; prefer setting only
+   * one (this rearmed window for heartbeat-aware workers, or the fixed `timeoutMs` otherwise).
+   */
+  remoteAdvanceSilenceMs?: number | undefined;
+  /**
    * Build the public callback URL for a `ctx.webhook()` token (e.g.
    * ``(t) => `https://api.example.com/durable/webhooks/${t}` ``). Populates
    * {@link DurableWebhook.url}. Omit if you build URLs yourself from the token.
@@ -274,6 +286,7 @@ export class WorkflowEngine {
   private readonly instanceId: string;
   private readonly leaseMs: number;
   private readonly maxRecoveryAttempts?: number | undefined;
+  private readonly remoteAdvanceSilenceMs?: number | undefined;
   private readonly webhookUrl?: ((token: string) => string) | undefined;
   private readonly traceparent?: (() => string | undefined) | undefined;
   private readonly context?: (() => Record<string, unknown> | undefined) | undefined;
@@ -299,7 +312,9 @@ export class WorkflowEngine {
   private readonly accumulators: EventAccumulators;
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
-  /** Per-step "reset the liveness timer" callbacks, called when a heartbeat arrives. */
+  /** "Reset the liveness timer" callbacks keyed by the beat's target — a stepId (in-flight remote step)
+   *  or a runId (in-flight remote workflow turn) — invoked when a matching heartbeat arrives. The two id
+   *  shapes don't collide in practice: a stepId is `${runId}:${seq}`, a run key is the bare runId. */
   private readonly heartbeatResets = new Map<string, () => void>();
   private readonly listeners = new Set<EngineListener>();
   /** Step interceptors (onion middleware around real local-step execution), first = outermost. */
@@ -338,6 +353,7 @@ export class WorkflowEngine {
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
+    this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.context = deps.context;
@@ -384,9 +400,11 @@ export class WorkflowEngine {
         // instance) → complete the checkpoint and resume the run here.
         await this.completeRemoteResult(result);
       },
-      // A heartbeat for an in-flight long step resets its liveness window (see callRemote).
+      // A heartbeat resets the liveness window for whatever it targets: an in-flight long STEP (keyed
+      // by stepId, see callRemote) or — when stepId is absent — the in-flight workflow TURN (keyed by
+      // runId, see runRemoteExecution's heartbeat-rearmed advance).
       async (beat) => {
-        this.heartbeatResets.get(beat.stepId)?.();
+        this.heartbeatResets.get(beat.stepId ?? beat.runId)?.();
       },
       // A remote workflow worker streams each local step's lifecycle (running → completed/failed) so
       // it's checkpointed live, not all-at-once when the long turn ends.
@@ -1550,7 +1568,25 @@ export class WorkflowEngine {
     const history = await this.remoteHistory(run.id);
     let decision: WorkflowDecision;
     try {
-      decision = await remote.executor.advance(run, history);
+      // When `remoteAdvanceSilenceMs` is configured, wrap the advance in a heartbeat-rearmed deadline
+      // keyed by `run.id`: a worker replaying this turn beats (a run-scoped Heartbeat) to keep it alive,
+      // and only a genuinely-silent worker trips RemoteWorkflowTimeout → recovery re-drive. Unset = the
+      // prior unbounded await. INVARIANT: `advance()` is created and passed to awaitWithLivenessDeadline
+      // SYNCHRONOUSLY (no await between), so the `heartbeatResets` entry is registered before the event
+      // loop can deliver any beat — an early beat is never lost. If the executor ALSO carries its own
+      // `timeoutMs`, the shorter of the two deadlines wins (both raise the same RemoteWorkflowTimeout,
+      // handled identically by the catch below).
+      const silenceMs = this.remoteAdvanceSilenceMs;
+      const advance = remote.executor.advance(run, history);
+      decision =
+        silenceMs != null
+          ? await this.awaitWithLivenessDeadline(
+              run.id,
+              advance,
+              silenceMs,
+              () => new RemoteWorkflowTimeout(run.id, silenceMs),
+            )
+          : await advance;
     } catch (err) {
       // A RemoteWorkflowTimeout is NOT a failure: the advance only timed out (the decision was likely
       // dropped, while the work may have actually completed). Failing the run here would be wrong — and
@@ -1560,11 +1596,11 @@ export class WorkflowEngine {
       // `completed` decision → settles → notifies the parent. Opt-in: only reachable when the executor
       // was constructed with a `timeoutMs` (absent = prior unbounded await, unchanged).
       //
-      // KNOWN HAZARD (follow-up): if the timeout fires while a worker is LEGITIMATELY still executing a
-      // not-yet-checkpointed step, the re-drive re-runs that step → DUPLICATE side effects. So this
-      // timeout is only safe when set GENEROUSLY (> the longest legitimate single turn). The robust fix
-      // — a liveness/heartbeat-rearmed deadline so only a genuinely-dead worker re-drives — is the
-      // documented next step (Track A diagnosis doc, "Part B"); NOT implemented here.
+      // FIXED-TIMEOUT HAZARD: a bare RemoteWorkflowExecutor `timeoutMs` that fires while a worker is
+      // LEGITIMATELY still executing a not-yet-checkpointed step re-drives → DUPLICATE side effects, so
+      // that knob is only safe set GENEROUSLY (> the longest legitimate single turn). The robust fix is
+      // the heartbeat-rearmed deadline above (`remoteAdvanceSilenceMs`): the worker beats while it works,
+      // so only a genuinely-silent (dead) worker trips the timeout — no re-drive of a live turn.
       //
       // Lease lifecycle: `execute` clears its renew interval in its `finally` once this returns, so the
       // lease (released just below) stays free. `releaseRunLock` is idempotent, and `renewRunLock` is a
@@ -2272,16 +2308,19 @@ export class WorkflowEngine {
   }
 
   /**
-   * Await a remote result, but reject with `RemoteStepTimeout` if neither the result nor a heartbeat
-   * arrives within `timeoutMs`. Each heartbeat (delivered via `transport.onHeartbeat`) rearms the
-   * window, so a worker that keeps beating stays alive past `timeoutMs`.
+   * Await `resultPromise`, but reject with `onTimeout()` if neither it settles nor a heartbeat for `id`
+   * arrives within `timeoutMs`. Each heartbeat (delivered via `transport.onHeartbeat`, looked up in
+   * `heartbeatResets` by `id`) REARMS the window, so a worker that keeps beating stays alive past
+   * `timeoutMs`. Shared by the remote-STEP liveness (keyed by stepId) and the remote-WORKFLOW advance
+   * liveness (keyed by runId); the caller supplies the timeout error and any extra cleanup via `onTimeout`.
    */
-  private awaitWithHeartbeat(
+  private awaitWithLivenessDeadline<T>(
     id: string,
-    resultPromise: Promise<RemoteResolution>,
+    resultPromise: Promise<T>,
     timeoutMs: number,
-  ): Promise<RemoteResolution> {
-    return new Promise<RemoteResolution>((resolve, reject) => {
+    onTimeout: () => Error,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout>;
       const cleanup = () => {
         clearTimeout(timer);
@@ -2290,8 +2329,7 @@ export class WorkflowEngine {
       const arm = () => {
         timer = setTimeout(() => {
           cleanup();
-          this.pending.delete(id);
-          reject(new RemoteStepTimeout(id, timeoutMs));
+          reject(onTimeout());
         }, timeoutMs);
         (timer as { unref?: () => void }).unref?.();
       };
@@ -2310,6 +2348,19 @@ export class WorkflowEngine {
           reject(err);
         },
       );
+    });
+  }
+
+  /** Remote-STEP liveness: await a worker result, timing out (with the step's pending-map cleanup) to
+   *  `RemoteStepTimeout` if it neither lands nor beats within `timeoutMs`. See {@link awaitWithLivenessDeadline}. */
+  private awaitWithHeartbeat(
+    id: string,
+    resultPromise: Promise<RemoteResolution>,
+    timeoutMs: number,
+  ): Promise<RemoteResolution> {
+    return this.awaitWithLivenessDeadline(id, resultPromise, timeoutMs, () => {
+      this.pending.delete(id);
+      return new RemoteStepTimeout(id, timeoutMs);
     });
   }
 }

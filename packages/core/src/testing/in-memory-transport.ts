@@ -18,6 +18,7 @@ import { type StepHandler, runStepHandler } from '../protocol';
 export class InMemoryTransport implements Transport, ControlPlane {
   private readonly handlers = new Map<string, StepHandler>();
   private resultHandler?: (result: StepResult) => Promise<void>;
+  private heartbeatHandler?: (beat: Heartbeat) => Promise<void>;
   private stepEventHandler?: (event: WorkflowStepEvent) => Promise<void>;
   private readonly controlHandlers = new Set<(msg: ControlMessage) => void>();
 
@@ -39,8 +40,15 @@ export class InMemoryTransport implements Transport, ControlPlane {
     this.resultHandler = handler;
   }
 
-  onHeartbeat(_handler: (beat: Heartbeat) => Promise<void>): void {
-    // In-process handlers run synchronously; there is no liveness to track.
+  onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
+    // In-process step handlers run synchronously (no step liveness to track), but a test can drive a
+    // RUN-scoped beat via `emitHeartbeat` to exercise the engine's heartbeat-rearmed advance deadline.
+    this.heartbeatHandler = handler;
+  }
+
+  /** Test hook: deliver a liveness heartbeat to the engine, as a real broker would on its channel. */
+  async emitHeartbeat(beat: Heartbeat): Promise<void> {
+    await this.heartbeatHandler?.(beat);
   }
 
   /** Workflow step lifecycle: deliver to the engine's handler (async, mirroring a real broker). */
