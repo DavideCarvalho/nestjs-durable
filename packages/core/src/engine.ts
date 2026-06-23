@@ -826,9 +826,17 @@ export class WorkflowEngine {
       // Re-enqueue rather than resume inline: recovery must NOT block (boot, or a poll tick) on a
       // long workflow step. A dispatcher/worker re-runs it, replaying its checkpoints.
       await this.store.releaseRunLock(run.id);
-      await this.store.updateRun(run.id, { status: 'pending', updatedAt: new Date() });
+      // A `cancelling` run keeps its status (resetting to `pending` would lose the persisted cancel
+      // intent and resurrect the run): the re-driven turn re-derives it from the status and finishes
+      // the cancel. Every other run re-enqueues as `pending` for a clean (re)start.
+      if (run.status !== 'cancelling') {
+        await this.store.updateRun(run.id, { status: 'pending', updatedAt: new Date() });
+      }
       await this.runDispatcher.dispatch(run.id);
-      results.push({ runId: run.id, status: 'pending' });
+      results.push({
+        runId: run.id,
+        status: run.status === 'cancelling' ? 'cancelling' : 'pending',
+      });
     }
     return results;
   }
@@ -1132,6 +1140,12 @@ export class WorkflowEngine {
     if (run.status === 'completed' || run.status === 'cancelled' || run.status === 'dead') {
       return { runId, status: run.status, output: run.output, error: run.error };
     }
+    // Already compensating (status persisted as `cancelling`): idempotent — don't re-queue the resume,
+    // and crucially don't fall through to the instant-cancel path below (which would mark `cancelled`
+    // and SKIP the in-flight saga undo). A repeat cancel just echoes the in-progress status.
+    if (run.status === 'cancelling') {
+      return { runId, status: 'cancelling' };
+    }
     // Compensating cancel: resume the run with a cancellation pending — replay re-registers the saga,
     // and at the suspension point execute() runs the undo and marks it cancelled. Run that resume in
     // the BACKGROUND so the caller (e.g. an HTTP request) never blocks on replaying the workflow +
@@ -1139,6 +1153,13 @@ export class WorkflowEngine {
     // (its lease acquire fails and it no-ops); the broadcast tells that worker to abort cooperatively.
     if (opts?.compensate && (run.status === 'suspended' || run.status === 'running')) {
       this.cancelRequested.add(runId);
+      // Persist `cancelling` so the dashboard/API show "compensation in progress" instead of a
+      // misleading `running`/`suspended` while the background undo runs. NON-TERMINAL: the admission
+      // gate still counts it and recovery re-drives it on crash (runExecution re-derives the cancel
+      // intent from this status), so the cancel is durable; it flips to `cancelled` when the resumed
+      // replay finishes compensating.
+      await this.store.updateRun(runId, { status: 'cancelling', updatedAt: new Date() });
+      run.status = 'cancelling';
       if (this.controlPlane) {
         void this.controlPlane
           .publishControl({ kind: 'cancel', runId, from: this.instanceId })
@@ -1150,7 +1171,7 @@ export class WorkflowEngine {
           .catch(() => undefined);
       });
       await this.cancelChildren(runId, opts);
-      return { runId, status: run.status };
+      return { runId, status: 'cancelling' };
     }
     const error = { message: 'cancelled' };
     await this.store.updateRun(runId, { status: 'cancelled', error, updatedAt: new Date() });
@@ -1551,6 +1572,23 @@ export class WorkflowEngine {
     run: WorkflowRun,
     registered: RegisteredWorkflow,
   ): Promise<RunResult> {
+    // Compensating cancel in flight for a remote workflow: its steps execute in the worker, so there
+    // are no TS-side compensations to replay here — finalize to cancelled. Re-broadcast so a live worker
+    // mid-turn aborts cooperatively; on recovery (the broadcast was lost to a crash) this still settles
+    // the run deterministically instead of resurrecting it by re-advancing.
+    if (run.status === 'cancelling') {
+      const error = { message: 'cancelled' };
+      await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
+      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+      this.notifyCancelled(run.id);
+      if (this.controlPlane) {
+        void this.controlPlane
+          .publishControl({ kind: 'cancel', runId: run.id, from: this.instanceId })
+          .catch(() => undefined);
+      }
+      await this.store.releaseRunLock(run.id);
+      return { runId: run.id, status: 'cancelled', error };
+    }
     const remote = registered.remote as NonNullable<RegisteredWorkflow['remote']>;
     if (run.status === 'pending') {
       await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
@@ -1852,6 +1890,11 @@ export class WorkflowEngine {
     fn: WorkflowFn,
     registered: RegisteredWorkflow | undefined,
   ): Promise<RunResult> {
+    // A run persisted as `cancelling` is a compensating cancel in flight — possibly re-driven by
+    // recovery after a crash that lost the in-memory cancel flag. Re-derive the intent from the status
+    // so the replay below reaches the WorkflowSuspended + cancelRequested branch and compensates →
+    // cancelled (this is what makes a compensating cancel durable across a crash).
+    if (run.status === 'cancelling') this.cancelRequested.add(run.id);
     // First execution of an enqueued run: mark it running and announce the start, BEFORE the singleton
     // gate — `singletons.admit` only counts `running`/`suspended` runs, so a still-`pending` run could
     // never be admitted. A resumed run is already past `pending`, so this fires exactly once.
@@ -1862,7 +1905,13 @@ export class WorkflowEngine {
     }
     // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
-    if (registered?.singleton && !(await this.singletons.admit(run, registered.singleton))) {
+    // A `cancelling` run skips the gate — it is tearing down, not competing for a slot, and suspending
+    // it here would clobber the `cancelling` status.
+    if (
+      run.status !== 'cancelling' &&
+      registered?.singleton &&
+      !(await this.singletons.admit(run, registered.singleton))
+    ) {
       const wakeAt = this.singletons.retryWakeAt();
       await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
       this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });

@@ -271,12 +271,13 @@ describe('durableThroughputProvider', () => {
 // ─── durable.stateBreakdown ───────────────────────────────────────────────────
 
 describe('durableStateBreakdownProvider', () => {
-  it('returns segments for all 5 statuses with color palette', async () => {
+  it('returns segments for all statuses with color palette', async () => {
     const store = {
       listRuns: async ({ status }: { status?: string }) => {
         const counts: Record<string, number> = {
           running: 3,
           pending: 1,
+          cancelling: 1,
           completed: 20,
           failed: 2,
           dead: 0,
@@ -289,10 +290,13 @@ describe('durableStateBreakdownProvider', () => {
     const out = (await durableStateBreakdownProvider().resolve({}, ctxWith(store))) as {
       segments: Array<{ label: string; value: number; color?: string }>;
     };
-    expect(out.segments.length).toBe(5);
+    expect(out.segments.length).toBe(6);
     const labels = out.segments.map((s) => s.label);
     expect(labels).toContain('running');
+    expect(labels).toContain('cancelling');
     expect(labels).toContain('completed');
+    const cancellingSegment = out.segments.find((s) => s.label === 'cancelling');
+    expect(cancellingSegment?.value).toBe(1);
     const runningSegment = out.segments.find((s) => s.label === 'running');
     expect(runningSegment?.value).toBe(3);
     const completedSegment = out.segments.find((s) => s.label === 'completed');

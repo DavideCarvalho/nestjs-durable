@@ -46,9 +46,10 @@ describe('non-blocking control actions (retry / compensate-cancel)', () => {
     const suspended = await startRun(engine, 'w', {}, 'r1');
     expect(suspended.status).toBe('suspended');
 
-    // Returns without awaiting the replay+undo (caller never blocks); status is still in-flight.
+    // Returns without awaiting the replay+undo (caller never blocks); the run is now `cancelling` —
+    // the in-flight, non-terminal marker shown while the background saga undo runs.
     const c = await engine.cancel('r1', { compensate: true });
-    expect(c?.status).toBe('suspended');
+    expect(c?.status).toBe('cancelling');
     expect(undone).toEqual([]); // not done synchronously
 
     // The background resume runs the compensation and settles the run cancelled.

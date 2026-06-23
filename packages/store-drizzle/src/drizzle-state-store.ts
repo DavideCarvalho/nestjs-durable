@@ -133,7 +133,7 @@ export class DrizzleStateStore implements StateStore {
     const rows = await this.db
       .select()
       .from(workflowRuns)
-      .where(eq(workflowRuns.status, 'running'));
+      .where(inArray(workflowRuns.status, ['running', 'cancelling']));
     return rows.map(fromRunRow);
   }
 

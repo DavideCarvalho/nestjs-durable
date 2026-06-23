@@ -53,7 +53,7 @@ export class SingletonGate {
     const queued = await this.deps.store.listRuns({
       tag: this.tag(cfg, input),
       workflow,
-      statuses: ['pending', 'running', 'suspended'],
+      statuses: ['pending', 'running', 'suspended', 'cancelling'],
     });
     if (queued.length >= cap) {
       throw new SingletonQueueFullError(workflow, cfg.key(input), cfg.maxQueueDepth);
@@ -72,7 +72,7 @@ export class SingletonGate {
       await this.deps.store.listRuns({
         tag: this.tag(cfg, run.input),
         workflow: run.workflow,
-        statuses: ['running', 'suspended'],
+        statuses: ['running', 'suspended', 'cancelling'],
       })
     ).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
     const idx = inflight.findIndex((r) => r.id === run.id);

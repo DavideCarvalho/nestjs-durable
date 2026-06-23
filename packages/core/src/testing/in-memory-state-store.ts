@@ -91,7 +91,9 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async listIncompleteRuns(): Promise<WorkflowRun[]> {
-    return [...this.runs.values()].filter((r) => r.status === 'running').map((r) => ({ ...r }));
+    return [...this.runs.values()]
+      .filter((r) => r.status === 'running' || r.status === 'cancelling')
+      .map((r) => ({ ...r }));
   }
 
   async listPendingRuns(limit: number): Promise<WorkflowRun[]> {

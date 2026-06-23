@@ -185,7 +185,9 @@ export class PrismaStateStore implements StateStore {
   }
 
   async listIncompleteRuns(): Promise<WorkflowRun[]> {
-    const rows = await this.db.durableWorkflowRun.findMany({ where: { status: 'running' } });
+    const rows = await this.db.durableWorkflowRun.findMany({
+      where: { status: { in: ['running', 'cancelling'] } },
+    });
     return rows.map(fromRunRow);
   }
 
