@@ -65,6 +65,37 @@ export class RemoteStepTimeout extends Error {
 }
 
 /**
+ * Thrown by a remote {@link WorkflowExecutor} (e.g. {@link RemoteWorkflowExecutor}) when an `advance`
+ * does not produce its decision within the configured `timeoutMs` — i.e. the worker is presumed gone
+ * (the decision was dropped by a stall/redelivery or an instance restart spanning the in-memory waiter
+ * map). Crucially this is NOT a run failure: the work may have actually completed and only the decision
+ * was lost. The engine treats it as RECOVERABLE — it releases the run lease and leaves the run
+ * `running` so `recoverIncomplete` re-drives it deterministically (replaying completed steps from
+ * history). Distinct from a real executor error, which still fails the run.
+ *
+ * OPT-IN: only thrown when the executor was constructed with a `timeoutMs`. Absent a timeout, the
+ * engine awaits the decision with its prior (unbounded) behavior — so existing users see no change.
+ *
+ * Known hazard: a timeout that fires while a worker is LEGITIMATELY still executing a not-yet-
+ * checkpointed step will re-drive and re-run that in-flight step → DUPLICATE side effects. Therefore
+ * the timeout is only safe when set GENEROUSLY (longer than the longest legitimate single turn). The
+ * robust fix — a liveness/heartbeat-rearmed deadline so only a genuinely-dead worker re-drives — is the
+ * documented follow-up (see the Track A diagnosis doc, "Part B").
+ */
+export class RemoteWorkflowTimeout extends Error {
+  readonly taskId: string;
+  readonly timeoutMs: number;
+  constructor(taskId: string, timeoutMs: number) {
+    super(
+      `remote workflow task ${taskId} produced no decision within ${timeoutMs}ms — presumed dropped; re-driving via recovery`,
+    );
+    this.name = 'RemoteWorkflowTimeout';
+    this.taskId = taskId;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
  * Thrown on resume when the workflow code no longer matches the recorded history: the step at a
  * logical position has a different name/kind than the checkpoint saved there. This means the
  * workflow definition changed (a step was added/removed/reordered) under an in-flight run without a
