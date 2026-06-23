@@ -99,6 +99,37 @@ describe('RunStatus cancelling — compensating cancel is visible + durable', ()
     expect(undone2).toEqual(['reserve']); // compensation ran on the recovering instance
   });
 
+  it('a `cancelling` run whose replay COMPLETES (no suspension point) still settles cancelled', async () => {
+    // Finding-1 guard: compensation lived only in the WorkflowSuspended branch, so a cancel on a run
+    // that returns before suspending would silently settle `completed` and lose the cancel. The body
+    // here has no suspension — on replay it runs straight to `return`, exercising the completed path.
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    const undone: string[] = [];
+    engine.register('quick', '1', async (ctx) => {
+      await ctx.step('reserve', async () => 'r', {
+        compensate: async () => {
+          undone.push('reserve');
+        },
+      });
+      return 'done';
+    });
+    await startRun(engine, 'quick', {}, 'r1');
+    expect((await store.getRun('r1'))?.status).toBe('completed'); // reserve checkpointed
+
+    // A compensating cancel landed while in-flight (status `cancelling`); on the re-driven turn the
+    // replay completes rather than suspending — it must STILL compensate + settle cancelled.
+    await store.updateRun('r1', {
+      status: 'cancelling',
+      lockedBy: undefined,
+      lockedUntil: undefined,
+    });
+    await engine.recoverIncomplete();
+
+    expect(await waitForStatus(store, 'r1', 'cancelled')).toBe('cancelled');
+    expect(undone).toEqual(['reserve']); // undo ran even though the body returns on replay
+  });
+
   it('compensating cancel of a REMOTE workflow goes `cancelling` → `cancelled`', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();

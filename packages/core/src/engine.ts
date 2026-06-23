@@ -942,7 +942,10 @@ export class WorkflowEngine {
    * `start` when a call site needs the outcome — `await start(...); const r = await waitForRun(id)`.
    */
   waitForRun(runId: string, opts?: { timeoutMs?: number }): Promise<RunResult> {
-    const isSettled = (s: RunStatus): boolean => s !== 'pending' && s !== 'running';
+    // `cancelling` is NON-terminal (the saga undo is still running), so a `waitForRun` after a
+    // compensating cancel keeps waiting until the run reaches the terminal `cancelled`.
+    const isSettled = (s: RunStatus): boolean =>
+      s !== 'pending' && s !== 'running' && s !== 'cancelling';
     const toResult = (run: WorkflowRun): RunResult => ({
       runId,
       status: run.status,
@@ -1884,6 +1887,27 @@ export class WorkflowEngine {
     return wakeAt;
   }
 
+  /**
+   * Undo the registered saga compensations in reverse and settle the run `cancelled`. Shared by EVERY
+   * exit path of a run with a compensating cancel in flight — whether the resumed replay returned,
+   * suspended, hit continue-as-new, or threw — so a cancel is never lost just because the body didn't
+   * stop at a suspension point. Clears the in-memory cancel flag.
+   */
+  private async compensateAndCancel(
+    run: WorkflowRun,
+    compensations: Compensation[],
+  ): Promise<RunResult> {
+    this.cancelRequested.delete(run.id);
+    for (let i = compensations.length - 1; i >= 0; i -= 1) {
+      const comp = compensations[i];
+      if (comp) await this.runCompensation(run, comp);
+    }
+    const error = { message: 'cancelled' };
+    await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
+    this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+    return { runId: run.id, status: 'cancelled', error };
+  }
+
   /** The run body, lease held + renewed by {@link execute}. */
   private async runExecution(
     run: WorkflowRun,
@@ -1931,9 +1955,15 @@ export class WorkflowEngine {
     const ctx = createWorkflowCtx(this.ctxHostFor(replay), run.id, compensations, run.workflow);
     try {
       const output = await fn(ctx, run.input);
+      // A compensating cancel may have been requested while this turn ran (or re-derived from a
+      // `cancelling` status on recovery): undo + settle cancelled rather than completing, so the cancel
+      // is never lost when the body returns without first hitting a suspension point.
+      if (this.cancelRequested.has(run.id)) return this.compensateAndCancel(run, compensations);
       return this.settleRun(run, { kind: 'completed', output });
     } catch (err) {
       if (err instanceof ContinueAsNew) {
+        // A cancel in flight wins over continue-as-new: undo + cancel instead of spawning the next run.
+        if (this.cancelRequested.has(run.id)) return this.compensateAndCancel(run, compensations);
         // Hand off to a fresh execution with a clean history: complete this run, then start the next
         // (`<id>~N`) with the new input. Deferred + idempotent by the continuation id, so a crash
         // mid-handoff re-derives the same next run instead of forking.
@@ -1952,21 +1982,13 @@ export class WorkflowEngine {
         return { runId: run.id, status: 'completed' };
       }
       if (err instanceof WorkflowSuspended) {
-        // A compensating cancel resumed this run to reach here: the replay re-registered the saga,
-        // so undo the completed steps in reverse and mark it cancelled instead of re-suspending.
-        if (this.cancelRequested.has(run.id)) {
-          this.cancelRequested.delete(run.id);
-          for (let i = compensations.length - 1; i >= 0; i -= 1) {
-            const comp = compensations[i];
-            if (comp) await this.runCompensation(run, comp);
-          }
-          const error = { message: 'cancelled' };
-          await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
-          this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
-          return { runId: run.id, status: 'cancelled', error };
-        }
+        // A compensating cancel resumed this run to reach here: undo + cancel instead of re-suspending.
+        if (this.cancelRequested.has(run.id)) return this.compensateAndCancel(run, compensations);
         return this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
       }
+      // A cancel in flight that surfaced as a thrown error still settles cancelled (not failed) — the
+      // saga undo runs either way; this just keeps the terminal status faithful to the cancel request.
+      if (this.cancelRequested.has(run.id)) return this.compensateAndCancel(run, compensations);
       const error = {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
