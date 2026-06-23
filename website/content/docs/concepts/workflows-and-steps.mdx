@@ -3,6 +3,8 @@ title: Workflows & steps
 description: Declaring workflows with @Workflow, local steps with ctx.step, typed remote steps with remoteStep + ctx.call and @DurableStep handlers, retries, fan-out and fatal errors.
 ---
 
+import { Callout } from 'fumadocs-ui/components/callout';
+
 ## Workflows
 
 A workflow is a provider decorated with `@Workflow`; its `run(ctx, input)` method is the
@@ -151,3 +153,87 @@ await this.workflows.start(PipelineWorkflow, input, runId, { tags: ['nightly'] }
 
 The dashboard shows a run's tags in the list and detail, and a tag filter box (clicking a tag filters
 the list). Programmatically, query by tag with `RunQuery.tag` or the dashboard API's `?tag=` param.
+
+## Search attributes
+
+Tags are flat labels — good for "is this run `critical`?" but not for "which runs have `amount >= 200`?".
+**Search attributes** are the typed, queryable counterpart: a `Record<string, string | number | boolean>`
+stamped on the run that you can filter on with equality **and range** predicates (`eq`, `ne`, `gt`,
+`gte`, `lt`, `lte`). They're stored in their own indexed table, so a filter like "all `pro`-tier runs over
+$200" is a pushed-down scan, not a full-table walk.
+
+Stamp them when you start a run, via `StartOptions.searchAttributes`:
+
+```ts title="checkout.controller.ts"
+@Controller('checkout')
+export class CheckoutController {
+  constructor(private readonly workflows: WorkflowService) {}
+
+  @Post()
+  async checkout(@Body() order: Order) {
+    return this.workflows.start(CheckoutWorkflow, order, order.id, {
+      searchAttributes: { amount: order.total, tier: order.customer.tier },
+    });
+  }
+}
+```
+
+Then filter on them through a `RunQuery` — the `attributes` predicates are ANDed together (and ANDed
+with `workflow`/`status`/`tag`, which you should set to bound the scan on a large store):
+
+```ts title="reports.service.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { STATE_STORE, type StateStore } from '@dudousxd/nestjs-durable-core';
+
+@Injectable()
+export class ReportsService {
+  constructor(@Inject(STATE_STORE) private readonly store: StateStore) {}
+
+  /** All completed checkouts for pro-tier customers worth at least $200. */
+  bigProCheckouts() {
+    return this.store.listRuns({
+      workflow: 'checkout',
+      status: 'completed',
+      attributes: [
+        { key: 'tier', op: 'eq', value: 'pro' },
+        { key: 'amount', op: 'gte', value: 200 },
+      ],
+    });
+  }
+}
+```
+
+### Setting search attributes from inside the workflow
+
+You often don't know the value to tag a run with until the workflow is already running — the chosen
+shipping carrier, the risk score a step computed, the tier you resolved from a remote call. Use
+`ctx.upsertSearchAttributes(attrs)` to set them from **inside the workflow body**, with no need to
+inject the store:
+
+```ts title="checkout.workflow.ts"
+@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow {
+  async run(ctx: WorkflowCtx, order: Order) {
+    const risk = await ctx.call(scoreRisk, order);
+    // Tag this run so the fraud team can query `risk >= 0.8` from the dashboard.
+    await ctx.upsertSearchAttributes({ risk, tier: order.customer.tier });
+
+    if (risk >= 0.8) {
+      await ctx.call(holdForReview, order.id);
+    }
+    /* ... */
+  }
+}
+```
+
+The merge is **shallow** — keys you pass overwrite, keys you don't are kept — so you can call it more
+than once to layer attributes on as the run progresses (e.g. stamp `amount` at start, add `risk`
+mid-run). It's **durable and exactly-once**: like `ctx.transaction`, the write is recorded at its
+position on the first run and **skipped on replay**, so it does one write rather than one per turn.
+
+<Callout type="warn">
+  `ctx.upsertSearchAttributes` runs against the engine-owned run record, so it's only available when
+  the workflow executes **in-process on the engine** (the usual NestJS setup). On a thin
+  [durable-worker](/docs/python) — which has no store — it throws `UnsupportedOnThinWorker`; set those
+  attributes from the engine side (at `start`, or from a workflow that runs on the engine) instead.
+</Callout>

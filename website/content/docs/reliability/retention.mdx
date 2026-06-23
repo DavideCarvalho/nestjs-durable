@@ -1,0 +1,91 @@
+---
+title: Retention & pruning
+description: "Bound durable run history with the module's retention option — a worker-only poller that hard-prunes terminal (completed/failed/cancelled/dead) runs by age and/or count per status group, in batches, so durable_workflow_runs stays small and the timer poller's per-tick scans stay cheap. Omit it to keep all history."
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Every run a workflow ever executes leaves a row in `durable_workflow_runs` (plus child rows for its
+checkpoints and attributes). A `completed` or `failed` run is *terminal* — it will never change again —
+but by default it stays in the table forever. On a busy system that table only grows, and because the
+timer poller scans run status **every tick** to find due timers and orphaned runs, an unbounded history
+makes every poll linearly slower.
+
+Retention bounds that history. Configure the module's `retention` option and a worker-only
+**`RetentionPoller`** hard-deletes terminal runs that fall outside your policies, on its own interval, in
+batches — cascading to each run's child rows exactly like an explicit delete. Omit `retention` entirely
+and nothing changes: all history is kept (the default).
+
+<Callout type="info">
+  Only **terminal** runs are ever pruned — `completed`, `failed`, `cancelled`, and `dead`. A live run
+  (`pending`/`running`/`suspended`) is never touched, so retention can't race the engine and delete work
+  in flight.
+</Callout>
+
+## Configuring retention
+
+`retention` takes one or more **policies**, each scoped to a set of terminal statuses, swept together on
+a shared interval:
+
+```ts title="app.module.ts"
+DurableModule.forRoot({
+  store,
+  transport,
+  retention: {
+    sweepIntervalMs: 60_000, // how often to prune; default 60_000. 0 = once on boot only.
+    batchSize: 1_000, // max runs hard-deleted per batch (per policy); default 1_000.
+    policies: [
+      // Keep successful + cancelled runs for 14 days, and at most 200 of them:
+      { statuses: ['completed', 'cancelled'], maxAgeMs: 14 * 24 * 3600_000, maxCount: 200 },
+      // Keep failures longer — 90 days — so they stay around for debugging:
+      { statuses: ['failed'], maxAgeMs: 90 * 24 * 3600_000 },
+    ],
+  },
+});
+```
+
+A `RetentionPolicy` is `{ statuses, maxAgeMs?, maxCount? }`:
+
+- `statuses` — which terminal statuses this rule governs. Each must be terminal, and **status sets must
+  be disjoint across policies** (a status can appear in only one policy, so "most-recent N" is
+  unambiguous). A terminal status not named by any policy is never pruned.
+- `maxAgeMs` — prune runs whose terminal timestamp (`updatedAt`) is older than `now - maxAgeMs`.
+- `maxCount` — keep only the `maxCount` most-recent (by `updatedAt`) runs in the status set; prune the
+  rest.
+
+Set **one or both** bounds (a policy with neither is rejected at boot). When both are set the
+most-restrictive wins: a run is kept only if it's within `maxCount` **and** newer than `maxAgeMs`, and
+pruned the moment it violates either.
+
+The top-level `retention` knobs apply across all policies:
+
+- `sweepIntervalMs` — how often to run the prune sweep. Defaults to `60_000` (separate from the ~1s timer
+  poll). Set `0` to prune once on boot and never again.
+- `batchSize` — the maximum number of runs hard-deleted per batch. Each policy is swept in `batchSize`
+  chunks, looping until a batch comes back short, so a large backlog drains over several batches without a
+  single unbounded delete. Defaults to `1_000`.
+
+## What runs the prune (and where)
+
+The `RetentionPoller` is **worker-only**: an instance configured with `worker: false` (an API or
+dashboard pod — see [Running a dashboard](/docs/observability/dashboard)) never prunes, so deletion only
+happens where work is processed. Sweeps never overlap on an instance — a sweep already in flight when the
+next interval fires is skipped.
+
+<Callout type="warn">
+  Pruning needs a store adapter that implements the optional `pruneTerminalRuns` capability. The
+  [MikroORM](/docs/stores/mikro-orm) adapter does. If you configure `retention` on a store that doesn't,
+  the poller logs a warning at boot and disables itself rather than failing — your runs simply aren't
+  pruned.
+</Callout>
+
+## Validation at boot
+
+A misconfigured policy fails fast on startup rather than silently misbehaving. The poller rejects a
+config where any policy:
+
+- lists **no** statuses, or sets **neither** `maxAgeMs` nor `maxCount`;
+- names a **non-terminal** status (only `completed`, `failed`, `cancelled`, `dead` can be pruned);
+- shares a status with **another** policy (status sets must be disjoint).
+
+Fix the policy and the boot completes — there's no partial-prune state to recover from.

@@ -18,7 +18,7 @@ The building blocks compose: a remote step can retry with backoff,
 register a compensation to undo itself, be admitted through a rate-limited queue, and — if recovery can
 never make it past a crash — land in the dead-letter queue for a human or a handler to deal with.
 
-This section covers the four reliability primitives.
+This section covers the reliability primitives, plus how to keep run history bounded as the system runs.
 
 ## Retries
 
@@ -54,3 +54,11 @@ terminal `dead` status, where it stays inspectable and retriable from the dashbo
 process down. From there `engine.onDead` (or the module's `deadLetterWorkflow` option) routes the dead run
 to a handler that can alert, compensate, or queue it for review. See
 [Dead-letter queue](/docs/reliability/dead-letter).
+
+## Retention & pruning
+
+Terminal runs (`completed`/`failed`/`cancelled`/`dead`) stay in `durable_workflow_runs` forever by
+default — and an unbounded history makes the timer poller's per-tick status scans linearly slower. The
+module's `retention` option starts a worker-only poller that hard-prunes terminal runs by age and/or
+count, per status group, in batches — so you can keep failures for 90 days, successes for two weeks, and
+let the table stay small. See [Retention & pruning](/docs/reliability/retention).

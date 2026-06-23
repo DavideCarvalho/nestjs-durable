@@ -3,6 +3,8 @@ title: MikroORM
 description: The reference StateStore adapter. Register the durable entities with your MikroORM config, pass the ORM to MikroOrmStateStore, and run on Postgres, MySQL or SQLite — with auto-schema on boot or an ensure* helper for your own migration.
 ---
 
+import { Callout } from 'fumadocs-ui/components/callout';
+
 `@dudousxd/nestjs-durable-store-mikro-orm` is the **reference adapter** — the one every other store
 is checked against. It persists runs and step checkpoints through MikroORM, on any driver MikroORM
 supports (**Postgres, MySQL, SQLite**), using native datetime columns so `wakeAt` and timestamps
@@ -75,3 +77,26 @@ DurableModule.forRoot({ store, transport, autoSchema: false });
 
 It only ever adds `durable_workflow_runs`, `durable_step_checkpoints`, `durable_run_attributes`,
 `durable_signal_waiters` and `durable_buffered_signals` — your tables are untouched.
+
+## Indexes
+
+The durable entities ship with the indexes the engine's hot paths need, so polling and search-attribute
+queries stay fast as the tables grow instead of degrading into full scans:
+
+- `durable_workflow_runs (status, wakeAt)` — serves the timer poller's per-tick **due-timer** scan
+  (`status = 'suspended' AND wakeAt <= now`) and, via its `status` prefix, the pending/incomplete status
+  lookups.
+- `durable_workflow_runs (workflow, status)` — serves the per-workflow timeout sweep.
+- `durable_run_attributes (key, numValue)` and `(key, strValue)` — serve the
+  [search-attribute](/docs/concepts/workflows-and-steps#search-attributes) equality/range predicates,
+  which push down onto these columns.
+
+These match the Prisma adapter's indexes exactly, so swapping stores keeps the same query plan.
+
+<Callout type="info">
+  These indexes are part of the durable schema, so they're applied for you the same two ways the tables
+  are: automatically by `ensureSchema()` on boot, or by `ensureMikroOrmDurableSchema(orm)` from your own
+  migration. On Postgres and SQLite, MikroORM emits an index on an existing table as a standalone
+  `create index ... on ...` statement; the adapter recognizes that form and applies it, so an **existing**
+  durable schema that predates these indexes picks them up on the next `ensureSchema()` / migration run.
+</Callout>
