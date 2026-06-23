@@ -4,7 +4,6 @@ import {
   type RunningWorker,
   runRedisWorker as defaultRunRedisWorker,
 } from '@dudousxd/durable-worker';
-import type { StepLogger, WorkflowCtx } from '@dudousxd/nestjs-durable-core';
 import {
   type DynamicModule,
   Inject,
@@ -17,7 +16,7 @@ import {
   type Provider,
 } from '@nestjs/common';
 import { DiscoveryModule, DiscoveryService, MetadataScanner } from '@nestjs/core';
-import { getDurableStepMeta, getWorkflowMeta } from './decorators';
+import { scanSteps, scanWorkflows } from './discovery-helpers';
 
 /**
  * Options for a **store-less thin worker** process: where to consume (`connection`/`prefix`) and
@@ -59,10 +58,6 @@ export const DURABLE_WORKER_RUNNERS = Symbol('nestjs-durable:worker-runners');
 /** The signature of `runRedisWorker` — injected behind {@link RUN_REDIS_WORKER}. */
 export type RunRedisWorkerFn = (opts: RunRedisWorkerOptions) => Promise<RunningWorker>;
 
-interface WorkflowInstance {
-  run(ctx: WorkflowCtx, input: unknown): Promise<unknown>;
-}
-
 /**
  * Discovers every provider carrying `@Workflow` metadata and registers its `run(ctx, input)` on the
  * thin {@link DurableWorkerRuntime}. Mirrors the engine-side `WorkflowRegistrar`, but registers on
@@ -77,17 +72,9 @@ export class ThinWorkflowRegistrar implements OnModuleInit {
   ) {}
 
   onModuleInit(): void {
-    for (const wrapper of this.discovery.getProviders()) {
-      const { instance } = wrapper;
-      if (!instance || typeof instance !== 'object') continue;
-      const meta = getWorkflowMeta(instance.constructor);
-      if (!meta) continue;
-      const workflow = instance as WorkflowInstance;
-      if (typeof workflow.run !== 'function') {
-        throw new Error(`@Workflow ${meta.name} must define a run(ctx, input) method`);
-      }
-      this.runtime.registerWorkflow(meta.name, (ctx, input) => workflow.run(ctx, input));
-    }
+    scanWorkflows(this.discovery, (meta, instance) =>
+      this.runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input)),
+    );
   }
 }
 
@@ -105,21 +92,9 @@ export class ThinStepRegistrar implements OnModuleInit {
   ) {}
 
   onModuleInit(): void {
-    for (const wrapper of this.discovery.getProviders()) {
-      const { instance } = wrapper;
-      if (!instance || typeof instance !== 'object') continue;
-      const prototype = Object.getPrototypeOf(instance);
-      for (const methodName of this.metadataScanner.getAllMethodNames(prototype)) {
-        const method = (instance as Record<string, unknown>)[methodName];
-        if (typeof method !== 'function') continue;
-        const meta = getDurableStepMeta(method);
-        if (!meta) continue;
-        const handler = method as (input: unknown, log: StepLogger) => unknown;
-        this.runtime.registerStep(meta.name, (input: unknown, log: StepLogger) =>
-          handler.call(instance, input, log),
-        );
-      }
-    }
+    scanSteps(this.discovery, this.metadataScanner, (meta, handler) =>
+      this.runtime.registerStep(meta.name, handler),
+    );
   }
 }
 
