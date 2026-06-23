@@ -1553,10 +1553,10 @@ export class WorkflowEngine {
       // A RemoteWorkflowTimeout is NOT a failure: the advance only timed out (the decision was likely
       // dropped, while the work may have actually completed). Failing the run here would be wrong — and
       // would notify the parent of a false failure. Instead RELEASE the lease and leave the run in its
-      // current (running/suspended) state so `recoverIncomplete` re-acquires the now-free lease and
-      // re-drives it; the re-driven turn replays completed steps from history and, if the work was done,
-      // returns the same `completed` decision → settles → notifies the parent. Opt-in: only reachable
-      // when the executor was constructed with a `timeoutMs` (absent = prior unbounded await, unchanged).
+      // current `running` state so `recoverIncomplete` re-acquires the now-free lease and re-drives it;
+      // the re-driven turn replays completed steps from history and, if the work was done, returns the same
+      // `completed` decision → settles → notifies the parent. Opt-in: only reachable when the executor
+      // was constructed with a `timeoutMs` (absent = prior unbounded await, unchanged).
       //
       // KNOWN HAZARD (follow-up): if the timeout fires while a worker is LEGITIMATELY still executing a
       // not-yet-checkpointed step, the re-drive re-runs that step → DUPLICATE side effects. So this
@@ -1569,12 +1569,14 @@ export class WorkflowEngine {
       // no-op once `lockedBy` is cleared, so a renew tick racing the release cannot re-acquire it.
       if (err instanceof RemoteWorkflowTimeout) {
         await this.store.releaseRunLock(run.id);
-        return { runId: run.id, status: run.status };
+        // The suspended path returned early above; run is always `running` here — left for recovery to re-drive.
+        return { runId: run.id, status: 'running' as const };
       }
       const error = {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
       };
+      // terminal failure: lease expires naturally — no recovery re-drive will race it
       await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
       this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
       return { runId: run.id, status: 'failed', error };

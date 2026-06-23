@@ -84,8 +84,8 @@ export class RemoteStepTimeout extends Error {
  */
 export class RemoteWorkflowTimeout extends Error {
   readonly taskId: string;
-  readonly timeoutMs: number | undefined;
-  constructor(taskId: string, timeoutMs?: number) {
+  readonly timeoutMs: number;
+  constructor(taskId: string, timeoutMs: number) {
     super(
       `remote workflow task ${taskId} produced no decision within ${timeoutMs}ms — presumed dropped; re-driving via recovery`,
     );
