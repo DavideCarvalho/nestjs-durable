@@ -17,8 +17,8 @@ describe('validateRetention', () => {
     expect(() =>
       validateRetention({
         policies: [
-          { statuses: ['completed', 'cancelled'], maxAgeMs: 1000, maxCount: 10 },
-          { statuses: ['failed'], maxAgeMs: 2000 },
+          { statuses: ['completed', 'cancelled'], maxAge: 1000, maxCount: 10 },
+          { statuses: ['failed'], maxAge: 2000 },
         ],
       }),
     ).not.toThrow();
@@ -26,7 +26,7 @@ describe('validateRetention', () => {
 
   it('rejects a non-terminal status', () => {
     expect(() =>
-      validateRetention({ policies: [{ statuses: ['running'], maxAgeMs: 1 } as RetentionPolicy] }),
+      validateRetention({ policies: [{ statuses: ['running'], maxAge: 1 } as RetentionPolicy] }),
     ).toThrow(/not terminal/);
   });
 
@@ -34,7 +34,7 @@ describe('validateRetention', () => {
     expect(() =>
       validateRetention({
         policies: [
-          { statuses: ['completed'], maxAgeMs: 1 },
+          { statuses: ['completed'], maxAge: 1 },
           { statuses: ['completed'], maxCount: 1 },
         ],
       }),
@@ -44,7 +44,19 @@ describe('validateRetention', () => {
   it('rejects a policy with no bound', () => {
     expect(() =>
       validateRetention({ policies: [{ statuses: ['completed'] } as RetentionPolicy] }),
-    ).toThrow(/maxAgeMs and\/or maxCount/);
+    ).toThrow(/maxAge and\/or maxCount/);
+  });
+
+  it('rejects an unparseable maxAge duration string (fail fast)', () => {
+    expect(() =>
+      validateRetention({ policies: [{ statuses: ['completed'], maxAge: '1 month' }] }),
+    ).toThrow(/duration/);
+  });
+
+  it('accepts an ms-style maxAge string', () => {
+    expect(() =>
+      validateRetention({ policies: [{ statuses: ['completed'], maxAge: '30d' }] }),
+    ).not.toThrow();
   });
 });
 
@@ -52,9 +64,9 @@ describe('RetentionPoller', () => {
   afterEach(() => vi.restoreAllMocks());
 
   const onePolicy: DurableRetentionOptions = {
-    sweepIntervalMs: 0, // run once on boot, no interval
+    sweepInterval: 0, // run once on boot, no interval
     batchSize: 2,
-    policies: [{ statuses: ['completed'], maxAgeMs: 1000 }],
+    policies: [{ statuses: ['completed'], maxAge: 1000 }],
   };
 
   it('drains a policy in batches until a short batch comes back', async () => {
@@ -100,7 +112,7 @@ describe('RetentionPoller', () => {
     const poller = makePoller(
       fakeStore(async () => 0),
       {
-        policies: [{ statuses: ['running'], maxAgeMs: 1 } as RetentionPolicy],
+        policies: [{ statuses: ['running'], maxAge: 1 } as RetentionPolicy],
       },
     );
 

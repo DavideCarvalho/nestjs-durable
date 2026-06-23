@@ -352,17 +352,18 @@ export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
 /**
  * One retention rule for hard-pruning terminal run history. Within `statuses` (terminal only), a run
  * is KEPT only if it satisfies EVERY bound you set, and pruned the moment it violates any:
- *  - `maxAgeMs` — prune runs whose `updatedAt` (≈ the time they reached terminal) is older than
- *    `now - maxAgeMs`.
+ *  - `maxAge` — prune runs whose `updatedAt` (≈ the time they reached terminal) is older than
+ *    `now - maxAge`. A number is milliseconds; a string is an `ms`-style duration parsed by
+ *    {@link parseDuration} (`'7d'`, `'2w'`, `'90m'` — note `'m'` is MINUTES; use `'30d'` for a month).
  *  - `maxCount` — keep only the `maxCount` most-recent (by `updatedAt`) runs in the status set; prune
  *    everything past that.
  *
  * Set one or both (both = the most-restrictive wins: capped at `maxCount` rows AND nothing older than
- * `maxAgeMs`). Statuses not named by any policy are never pruned.
+ * `maxAge`). Statuses not named by any policy are never pruned.
  */
 export interface RetentionPolicy {
   statuses: RunStatus[];
-  maxAgeMs?: number;
+  maxAge?: number | string;
   maxCount?: number;
 }
 

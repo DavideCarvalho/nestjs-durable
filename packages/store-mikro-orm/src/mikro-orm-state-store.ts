@@ -11,6 +11,7 @@ import {
   attributeColumnFor,
   attributeOperand,
   normalizeAttributeRows,
+  parseDuration,
   sqlComparator,
 } from '@dudousxd/nestjs-durable-core';
 import type { EntityManager, MikroORM } from '@mikro-orm/core';
@@ -114,8 +115,8 @@ export class MikroOrmStateStore implements StateStore {
     // Collect ids that violate EITHER bound (most-restrictive keep): too old, or past the count cap.
     const ids = new Set<string>();
 
-    if (policy.maxAgeMs != null) {
-      const cutoff = new Date(nowMs - policy.maxAgeMs);
+    if (policy.maxAge != null) {
+      const cutoff = new Date(nowMs - parseDuration(policy.maxAge));
       const rows = await em.find(
         WorkflowRunEntity,
         { status, updatedAt: { $lt: cutoff } },

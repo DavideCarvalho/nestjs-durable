@@ -107,11 +107,11 @@ function isControlPlane(x: unknown): x is ControlPlane {
  *
  * ```ts
  * retention: {
- *   sweepIntervalMs: 60_000,
+ *   sweepInterval: '1m',
  *   batchSize: 1_000,
  *   policies: [
- *     { statuses: ['completed', 'cancelled'], maxAgeMs: 14 * 24 * 3600_000, maxCount: 200 },
- *     { statuses: ['failed'], maxAgeMs: 90 * 24 * 3600_000 }, // keep failures longer for debugging
+ *     { statuses: ['completed', 'cancelled'], maxAge: '14d', maxCount: 200 },
+ *     { statuses: ['failed'], maxAge: '90d' }, // keep failures longer for debugging
  *   ],
  * }
  * ```
@@ -119,8 +119,11 @@ function isControlPlane(x: unknown): x is ControlPlane {
 export interface DurableRetentionOptions {
   /** The retention rules, one per (disjoint) status group. */
   policies: RetentionPolicy[];
-  /** How often to run the prune sweep (ms). `0` runs it once on boot only. Defaults to 60000. */
-  sweepIntervalMs?: number;
+  /**
+   * How often to run the prune sweep. A number is milliseconds; a string is an `ms`-style duration
+   * (`'1m'`, `'5m'` — `'m'` is minutes). `0` runs it once on boot only. Defaults to 60000 (1 minute).
+   */
+  sweepInterval?: number | string;
   /** Max runs hard-deleted per batch (per policy, looped until drained). Defaults to 1000. */
   batchSize?: number;
 }
