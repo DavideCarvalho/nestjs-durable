@@ -9,6 +9,7 @@ from .cancellation import Cancelled, CancellationRegistry
 from .redis_runner import redis_url_from_env, run_redis_worker
 from .routing import reply_target
 from .workflow import (
+    GatherFailed,
     NondeterminismError,
     StepFailed,
     WorkflowContext,
@@ -63,5 +64,6 @@ __all__ = [
     "WorkflowError",
     "NondeterminismError",
     "StepFailed",
+    "GatherFailed",
 ]
-__version__ = "0.10.0"
+__version__ = "0.11.0"

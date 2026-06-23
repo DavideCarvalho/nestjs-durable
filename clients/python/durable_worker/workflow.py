@@ -18,11 +18,16 @@ Each `ctx.*` op is keyed by a deterministic seq. On replay an op already in hist
 recorded result; the first UNRESOLVED blocking op (call/sleep/wait_signal/start_child) suspends the
 turn, emitting its command. Local steps run inline and record their result (so side effects /
 non-determinism happen once). See docs/plans/2026-06-15-polyglot-workflows-protocol.md.
+
+``ctx.gather([(name, body), ...])`` runs N local steps CONCURRENTLY (threads) and waits for all;
+``ctx.gather_children(workflow, [inputs])`` does the same with child workflows. Both default to
+``wait_all`` (raise an aggregate ``GatherFailed`` if any item fails) with an opt-in ``fail_fast``.
 """
 
 from __future__ import annotations
 
 import inspect
+import threading
 import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional
@@ -47,6 +52,20 @@ class StepFailed(Exception):
     def __init__(self, error: Optional[Dict[str, Any]]) -> None:
         self.error: Dict[str, Any] = error or {"message": "step failed"}
         super().__init__(self.error.get("message", "step failed"))
+
+
+class GatherFailed(StepFailed):
+    """One or more items in a ``ctx.gather`` / ``ctx.gather_children`` failed. Carries the per-item
+    errors and presents an aggregate ``.error`` so ``process_task`` records the gather as a failed
+    decision. Subclasses :class:`StepFailed` so it is catchable in workflow code like any awaited
+    failure."""
+
+    def __init__(self, errors: List[Dict[str, Any]]) -> None:
+        self.errors: List[Dict[str, Any]] = errors
+        names = ", ".join(str(e.get("name")) for e in errors)
+        super().__init__(
+            {"message": f"gather: {len(errors)} item(s) failed: {names}", "errors": errors}
+        )
 
 
 class _Suspend(Exception):
@@ -120,17 +139,47 @@ class WorkflowContext:
 
     def _replay(self, seq: int, kind: str, name: Optional[str] = None):
         """(found, output) for a resolved op in history; raises on mismatch or recorded failure."""
-        ev = self._history.get(seq)
+        ev = self._replay_entry(seq, kind, name)
         if ev is None:
             return False, None
+        if ev.get("error") is not None:
+            raise StepFailed(ev["error"])
+        return True, ev.get("output")
+
+    def _aggregate(
+        self, histories: "List[Optional[Dict[str, Any]]]", label_fn: "Callable[[Dict[str, Any]], str]"
+    ) -> "List[Any]":
+        """Collect outputs from a list of history entries, raising GatherFailed if any failed.
+
+        ``label_fn`` maps a non-None entry to the string placed in the failure dict's ``"name"`` key,
+        matching the exact shape each call-site produced before this helper was introduced."""
+        outputs: List[Any] = []
+        failures: List[Dict[str, Any]] = []
+        for ev in histories:
+            if ev is not None and ev.get("error") is not None:
+                failures.append({"name": label_fn(ev), "error": ev["error"]})
+                outputs.append(None)
+            else:
+                outputs.append(ev.get("output") if ev else None)
+        if failures:
+            raise GatherFailed(failures)
+        return outputs
+
+    def _replay_entry(
+        self, seq: int, kind: str, name: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Like :meth:`_replay`, but returns the raw history entry (or ``None`` if absent) instead of
+        unwrapping output/raising on a recorded failure — so gather can aggregate failures itself.
+        Still enforces the ``kind``/``name`` nondeterminism guard every other op gets."""
+        ev = self._history.get(seq)
+        if ev is None:
+            return None
         if ev.get("kind") != kind or (name is not None and ev.get("name") not in (None, name)):
             raise NondeterminismError(
                 f"history at seq {seq} is {ev.get('kind')}/{ev.get('name')!r}, "
                 f"but replay reached {kind}/{name!r}"
             )
-        if ev.get("error") is not None:
-            raise StepFailed(ev["error"])
-        return True, ev.get("output")
+        return ev
 
     # -- the workflow API ----------------------------------------------------
     def call(self, name: str, input: Any = None, *, group: str) -> Any:
@@ -225,6 +274,112 @@ class WorkflowContext:
         )
         return result
 
+    def gather(
+        self,
+        items: "List[tuple]",
+        mode: str = "wait_all",
+    ) -> "List[Any]":
+        """Run N LOCAL step bodies CONCURRENTLY (each in its own thread) and wait for all.
+
+        ``items`` is a list of ``(name, body)`` where ``body`` is a zero-arg callable returning the
+        step's result. Reserves a contiguous seq block in list order (the determinism anchor), runs
+        every body in a thread, then records each outcome as a ``recordStep`` command in seq order.
+
+        ``mode``:
+          ``"wait_all"`` (default) — wait for every item to settle, record all, raise
+              :class:`GatherFailed` if any failed.
+          ``"fail_fast"`` — on the first failure, set a gather-local cancel flag the still-running
+              siblings observe via ``current_step().cancelled`` (cooperative; no thread kill), then
+              raise once all threads have joined.
+
+        Returns results in input order. Deterministic: on replay (all seqs already in history) it
+        reconstructs the result/raise from history WITHOUT invoking any body.
+        """
+        from .worker import StepContext, _current_step  # lazy: avoid import cycle with worker.py
+
+        entries = [(self._next(), name, body) for name, body in items]
+        if not entries:
+            return []
+        group = f"gather:{entries[0][0]}"
+
+        # Replay: inline steps all record in ONE turn, so either ALL or NONE of the seqs are present.
+        if all(self._replay_entry(seq, "step", name) is not None for seq, name, _ in entries):
+            replay_entries = [self._replay_entry(seq, "step", name) for seq, name, _ in entries]
+            return self._aggregate(replay_entries, lambda ev: ev["name"])
+
+        cancel = threading.Event()
+        run_cancel = self._is_cancelled
+        run_id = self.run_id
+
+        def combined_cancel(rid: str) -> bool:
+            return cancel.is_set() or bool(run_cancel is not None and run_cancel(rid))
+
+        started = int(time.time() * 1000)
+        for seq, name, _ in entries:
+            self._emit_step(
+                {"runId": run_id, "seq": seq, "name": name, "phase": "running",
+                 "startedAt": started, "parallelGroup": group}
+            )
+
+        results: Dict[int, Dict[str, Any]] = {}
+
+        def run_one(seq: int, body: Callable[[], Any]) -> None:
+            step_ctx = StepContext(run_id=run_id, seq=seq, is_cancelled=combined_cancel)
+            token = _current_step.set(step_ctx)
+            try:
+                output = body()
+                results[seq] = {"output": output, "events": step_ctx.events}
+            except Exception as err:  # noqa: BLE001 — recorded per item; aggregated after join
+                results[seq] = {"error": _to_error(err), "events": step_ctx.events}
+                if mode == "fail_fast":
+                    cancel.set()
+            finally:
+                _current_step.reset(token)
+
+        threads = [
+            threading.Thread(target=run_one, args=(seq, body), name=f"gather-{seq}")
+            for seq, _, body in entries
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        finished = int(time.time() * 1000)
+        outputs = []
+        failures = []
+        for seq, name, _ in entries:
+            r = results.get(seq, {"error": {"message": "gather item did not run"}, "events": []})
+            cmd: Dict[str, Any] = {
+                "kind": "recordStep", "seq": seq, "name": name,
+                "startedAt": started, "finishedAt": finished, "parallelGroup": group,
+            }
+            if "error" in r:
+                cmd["error"] = r["error"]
+                failures.append({"name": name, "error": r["error"]})
+                outputs.append(None)
+            else:
+                cmd["output"] = r["output"]
+                outputs.append(r["output"])
+            if r.get("events"):
+                cmd["events"] = r["events"]
+            self.commands.append(cmd)
+            phase = "failed" if "error" in r else "completed"
+            event = {
+                "runId": run_id, "seq": seq, "name": name, "phase": phase,
+                "startedAt": started, "finishedAt": finished, "parallelGroup": group,
+                "events": r.get("events", []),
+            }
+            if "error" in r:
+                event["error"] = r["error"]
+            else:
+                event["output"] = r["output"]
+            self._emit_step(event)
+
+        if failures:
+            raise GatherFailed(failures)
+        return outputs
+
     def sleep(self, ms: int) -> None:
         """Durably sleep ``ms``; the run suspends and the engine resumes it when the timer fires."""
         seq = self._next()
@@ -256,6 +411,51 @@ class WorkflowContext:
             {"kind": "startChild", "seq": seq, "workflow": workflow, "input": input}
         )
         raise _Suspend()
+
+    def gather_children(
+        self,
+        workflow: str,
+        inputs: "List[Any]",
+        mode: str = "wait_all",
+    ) -> "List[Any]":
+        """Dispatch N child workflows CONCURRENTLY and wait for ALL their outputs.
+
+        Reserves a contiguous seq block; on the first turn it emits a ``startChild`` command for every
+        input (so all children dispatch and run in parallel on the worker pool), then suspends. On each
+        child completion the parent resumes; once ALL children have resolved it returns their outputs
+        in input order (``wait_all``), or raises :class:`GatherFailed` if any failed.
+
+        ``fail_fast`` raises as soon as a failed child is seen on a resume; sibling child runs are NOT
+        force-cancelled in v1 (their eventual results are ignored by the failed run).
+
+        Re-emitting ``startChild`` for an already-dispatched-but-incomplete child is intentional and
+        idempotent on the engine (a child has no history entry until it settles) — same contract as
+        the single ``start_child``.
+        """
+        seqs = [self._next() for _ in inputs]
+        if not seqs:
+            return []
+        group = f"gather:{seqs[0]}"
+        histories = [self._replay_entry(seq, "child", workflow) for seq in seqs]
+
+        # fail_fast: bail the moment any resolved child is a failure.
+        if mode == "fail_fast":
+            for seq, ev in zip(seqs, histories):
+                if ev is not None and ev.get("error") is not None:
+                    raise GatherFailed([{"name": workflow, "error": ev["error"]}])
+
+        pending = False
+        for seq, inp, ev in zip(seqs, inputs, histories):
+            if ev is None:
+                self.commands.append(
+                    {"kind": "startChild", "seq": seq, "workflow": workflow,
+                     "input": inp, "parallelGroup": group}
+                )
+                pending = True
+        if pending:
+            raise _Suspend()
+
+        return self._aggregate(histories, lambda _ev: workflow)
 
 
 WorkflowFn = Callable[..., Any]

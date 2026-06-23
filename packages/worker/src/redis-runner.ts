@@ -1,0 +1,219 @@
+import { hostname } from 'node:os';
+import type { WorkflowStepEvent } from '@dudousxd/nestjs-durable-core';
+import {
+  DEFAULT_PREFIX,
+  type DurableWorkerRuntime,
+  controlChannel,
+  decisionsName,
+  resultsName,
+  stepEventsName,
+  tasksName,
+  workerHeartbeatKey,
+} from './runner-core';
+
+// Worker liveness heartbeat: a worker stamps a TTL'd key while it's consuming; the key expiring is
+// the "this worker is gone/stalled" signal a monitor watches. TTL comfortably exceeds the interval
+// so one slow refresh doesn't flap. Mirrors the Python SDK's `_start_heartbeat` and the TS
+// `BullMQTransport.startWorkerHeartbeat`, so a mixed-language group reports all workers under one scan.
+const WORKER_HEARTBEAT_INTERVAL_MS = 10_000;
+const WORKER_HEARTBEAT_TTL_SECONDS = 35;
+
+// A workflow turn can run for minutes (a body of inline `ctx.step` DB calls). Node is single-threaded:
+// while `handleTask` is awaited the event loop stays free (the step bodies await), but BullMQ renews
+// a job's lock on a timer driven by that same loop. Give the Worker a generous `lockDuration` so a
+// long turn never lapses its lock mid-run — which would let BullMQ presume the job dead, REDELIVER it,
+// and run the workflow twice. This is the lesson from Track A (the transport-side stall+redeliver).
+const DEFAULT_LOCK_DURATION_MS = 5 * 60_000;
+
+/** ioredis `ConnectionOptions` (or an IORedis instance), the same shape `BullMQTransport` accepts. */
+// We avoid a static import of ioredis/bullmq types so this file type-checks without those optional
+// peers installed; `unknown` is widened at the boundary and the lazy import provides the real ctor.
+export type RedisConnection = unknown;
+
+export interface RunRedisWorkerOptions {
+  /** The pure routing core: holds the registered workflows + steps. */
+  runtime: DurableWorkerRuntime;
+  /** The worker group this instance serves — selects the `<prefix>-tasks-<group>` queue to consume. */
+  group: string;
+  /** ioredis connection options (or an IORedis instance), as `BullMQTransport` takes. */
+  connection: RedisConnection;
+  /** Key prefix namespacing the durable queues. Defaults to `durable` (matches the transport). */
+  prefix?: string;
+  /** Stable id for this worker process in heartbeats/control. Defaults to `ts-<hostname>-<pid>`. */
+  instanceId?: string;
+  /** Override the Worker's job-lock duration (ms). Defaults to 5 min — see {@link DEFAULT_LOCK_DURATION_MS}. */
+  lockDuration?: number;
+  /**
+   * Injection seam for tests: supply fake `Worker`/`Queue`/`Redis` ctors instead of lazily importing
+   * the real `bullmq`/`ioredis`. Production omits this and the runner imports the real peers.
+   */
+  deps?: RunnerDeps;
+}
+
+/** The bullmq/ioredis surface the runner uses — narrow enough that a test can fake it. */
+export interface RunnerDeps {
+  Worker: new (
+    name: string,
+    processor: (job: { data: unknown }) => Promise<unknown>,
+    opts: Record<string, unknown>,
+  ) => { close(): Promise<void> };
+  Queue: new (
+    name: string,
+    opts: Record<string, unknown>,
+  ) => {
+    add(name: string, data: unknown, opts?: Record<string, unknown>): Promise<unknown>;
+    close(): Promise<void>;
+  };
+  /** Optional: the pub/sub + heartbeat client ctor. Omit and control/heartbeat are simply off. */
+  Redis?: new (
+    connection: RedisConnection,
+  ) => {
+    duplicate(): RedisSubClient;
+    set(key: string, value: string, mode: string, ttl: number): Promise<unknown>;
+    subscribe(channel: string): Promise<unknown>;
+    on(event: 'message', listener: (channel: string, payload: string) => void): unknown;
+    disconnect(): void;
+  };
+}
+
+interface RedisSubClient {
+  subscribe(channel: string): Promise<unknown>;
+  on(event: 'message', listener: (channel: string, payload: string) => void): unknown;
+  disconnect(): void;
+}
+
+/** A running worker handle. `await close()` to drain and stop. */
+export interface RunningWorker {
+  close(): Promise<void>;
+}
+
+/** Lazily import `bullmq` + `ioredis` (optional peers). Mirrors how the transport imports them. */
+async function loadDeps(): Promise<RunnerDeps> {
+  const bullmq = (await import('bullmq')) as unknown as RunnerDeps;
+  const deps: RunnerDeps = { Worker: bullmq.Worker, Queue: bullmq.Queue };
+  try {
+    const ioredis = (await import('ioredis')) as unknown as { Redis: RunnerDeps['Redis'] };
+    // omit when absent so control-channel cancellation + heartbeat are simply off
+    if (ioredis.Redis) deps.Redis = ioredis.Redis;
+  } catch {
+    /* no ioredis present — leave deps.Redis unset */
+  }
+  return deps;
+}
+
+/** BullMQ Workers require `maxRetriesPerRequest: null`; preserve a passed-in instance as-is. */
+function workerConnection(connection: RedisConnection): RedisConnection {
+  if (
+    connection &&
+    typeof connection === 'object' &&
+    !('options' in (connection as Record<string, unknown>))
+  ) {
+    return { ...(connection as Record<string, unknown>), maxRetriesPerRequest: null };
+  }
+  return connection;
+}
+
+/**
+ * Start a BullMQ worker that consumes `<prefix>-tasks-<group>` and drives the {@link DurableWorkerRuntime}.
+ *
+ * The queue carries BOTH workflow tasks and remote step tasks (the engine adds them to the same
+ * per-group queue): each job is handed to `runtime.handleTask`, which routes by shape and returns
+ * either a {@link import('@dudousxd/nestjs-durable-core').WorkflowDecision} — published on
+ * `<prefix>-decisions` — or a {@link import('@dudousxd/nestjs-durable-core').StepResult} — published
+ * on `<prefix>-results`. A thin Node port of the Python `run_redis_workflow_worker` / `run_redis_worker`,
+ * collapsed into one runner because the TS `handleTask` discriminates the two task kinds itself.
+ *
+ * It also (best-effort): subscribes to `<prefix>-control` and feeds cancellation into the replay's
+ * `isCancelled`; streams each local step's lifecycle onto `<prefix>-step-events`; and stamps a TTL'd
+ * worker-liveness heartbeat key. None of these can block the worker from starting or processing.
+ *
+ * `await close()` on the returned handle to drain + stop the worker, queues, and pub/sub.
+ */
+export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<RunningWorker> {
+  const prefix = options.prefix ?? DEFAULT_PREFIX;
+  const instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
+  const lockDuration = options.lockDuration ?? DEFAULT_LOCK_DURATION_MS;
+  const deps = options.deps ?? (await loadDeps());
+  const { runtime, group, connection } = options;
+
+  const queueOpts = { connection };
+  const decisions = new deps.Queue(decisionsName(prefix), queueOpts);
+  const results = new deps.Queue(resultsName(prefix), queueOpts);
+  const stepEvents = new deps.Queue(stepEventsName(prefix), queueOpts);
+  const jobOpts = { removeOnComplete: true, removeOnFail: true };
+
+  // Cooperative cancellation: a Set of cancelled runIds fed by the control channel.
+  const cancelled = new Set<string>();
+  const isCancelled = (runId: string): boolean => cancelled.has(runId);
+
+  // Best-effort step-event streaming: publish each local step's lifecycle live (never fail the turn).
+  const onStep = (event: WorkflowStepEvent): void => {
+    void stepEvents.add('stepEvent', event, jobOpts).catch(() => {});
+  };
+
+  const processJob = async (job: { data: unknown }): Promise<void> => {
+    // `handleTask` is async; awaiting it keeps the event loop free (step bodies await), so the job
+    // lock can renew and the worker's heartbeat keeps stamping — no stall, no redeliver.
+    const out = await runtime.handleTask(
+      job.data as Parameters<DurableWorkerRuntime['handleTask']>[0],
+      { onStep, isCancelled },
+    );
+    if (out.kind === 'decision') {
+      await decisions.add('decision', out.decision, jobOpts);
+    } else {
+      await results.add('result', out.result, jobOpts);
+    }
+  };
+
+  const worker = new deps.Worker(tasksName(prefix, group), processJob, {
+    connection: workerConnection(connection),
+    lockDuration,
+  });
+
+  // --- best-effort pub/sub control channel + worker-liveness heartbeat (mirror the Python SDK) ---
+  let controlSub: RedisSubClient | undefined;
+  let heartbeatClient: InstanceType<NonNullable<RunnerDeps['Redis']>> | undefined;
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+  if (deps.Redis) {
+    try {
+      const base = new deps.Redis(connection);
+      // Subscribe blocks the client, so use a dedicated (duplicated) connection for it.
+      controlSub = base.duplicate();
+      void controlSub.subscribe(controlChannel(prefix));
+      controlSub.on('message', (_channel, payload) => {
+        try {
+          const msg = JSON.parse(payload) as { kind?: string; runId?: string };
+          if (msg.kind === 'cancel' && typeof msg.runId === 'string') cancelled.add(msg.runId);
+        } catch {
+          /* ignore malformed control messages */
+        }
+      });
+
+      heartbeatClient = base;
+      const key = workerHeartbeatKey(prefix, group, instanceId);
+      const beat = () => {
+        void heartbeatClient
+          ?.set(key, String(Date.now()), 'EX', WORKER_HEARTBEAT_TTL_SECONDS)
+          .catch(() => {});
+      };
+      beat(); // fire immediately so a fresh worker is visible without waiting a full interval
+      heartbeatTimer = setInterval(beat, WORKER_HEARTBEAT_INTERVAL_MS);
+      heartbeatTimer.unref?.();
+    } catch {
+      // control channel + heartbeat are best-effort: a failure here must never break startup.
+      controlSub = undefined;
+      heartbeatClient = undefined;
+    }
+  }
+
+  return {
+    async close(): Promise<void> {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      await worker.close();
+      await Promise.all([decisions.close(), results.close(), stepEvents.close()]);
+      controlSub?.disconnect();
+      heartbeatClient?.disconnect();
+    },
+  };
+}

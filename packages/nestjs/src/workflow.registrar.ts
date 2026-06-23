@@ -16,15 +16,12 @@ import {
   type OnModuleInit,
 } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
-import { getOnEvents, getWorkflowMeta, isDeadLetterHandler } from './decorators';
+import { getOnEvents, isDeadLetterHandler } from './decorators';
+import { scanWorkflows } from './discovery-helpers';
 import type { DurableModuleOptions } from './durable.module';
 import { entityConfigFor, getEntityMeta } from './entity';
 import { classValidatorInput } from './input-validation';
 import { type DurableStepInterceptor, isStepInterceptor } from './step-interceptor';
-
-interface WorkflowInstance {
-  run(ctx: WorkflowCtx, input: unknown): Promise<unknown>;
-}
 
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
@@ -74,6 +71,7 @@ export class WorkflowRegistrar
     // module-level `deadLetterWorkflow` is the fallback applied in the onDead listener below.
     const deadLetterByWorkflow = new Map<string, string>();
 
+    // Pre-pass: wire interceptors and register @Entity providers (engine-only concerns).
     for (const wrapper of this.discovery.getProviders()) {
       const { instance } = wrapper;
       if (!instance || typeof instance !== 'object') continue;
@@ -84,14 +82,11 @@ export class WorkflowRegistrar
       const entityMeta = getEntityMeta(instance.constructor);
       if (entityMeta) {
         this.engine.registerEntity(entityMeta.name, entityConfigFor(instance.constructor));
-        continue; // an @Entity is not a @Workflow
       }
-      const meta = getWorkflowMeta(instance.constructor);
-      if (!meta) continue;
-      const workflow = instance as WorkflowInstance;
-      if (typeof workflow.run !== 'function') {
-        throw new Error(`@Workflow ${meta.name} must define a run(ctx, input) method`);
-      }
+    }
+
+    // Workflow registration pass — shared scan, engine-specific registration callback.
+    scanWorkflows(this.discovery, (meta, workflow) => {
       // Input validation: a custom `validateInput` wins; otherwise build one from the class-validator
       // `inputSchema` DTO (lazy — class-validator is only required if a workflow uses inputSchema).
       const validateInput =
@@ -106,16 +101,18 @@ export class WorkflowRegistrar
               windowMs: parseDuration(meta.batch.within),
             } as const)
           : undefined;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const workflowCtor: object = (workflow as any).constructor as object;
       this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input), {
         tags: meta.tags,
         singleton: meta.singleton,
         executionTimeout: meta.executionTimeout,
         validateInput,
-        onEvent: getOnEvents(meta, instance.constructor),
+        onEvent: getOnEvents(meta, workflowCtor),
         eventBatch,
       });
 
-      const inline = this.findDeadLetterHandler(instance);
+      const inline = this.findDeadLetterHandler(workflow as unknown as object);
       if (inline && meta.deadLetterWorkflow) {
         // Two dead-letter targets for one workflow is ambiguous config, not a precedence question —
         // fail fast at boot rather than silently picking one.
@@ -132,7 +129,7 @@ export class WorkflowRegistrar
       } else if (meta.deadLetterWorkflow) {
         deadLetterByWorkflow.set(meta.name, workflowName(meta.deadLetterWorkflow));
       }
-    }
+    });
 
     this.installDeadLetterRouting(deadLetterByWorkflow);
   }

@@ -1,5 +1,6 @@
 export * from './context-accessor';
 export * from './decorators';
+export * from './durable-worker.module';
 export * from './durable.module';
 export * from './entity';
 export * from './step-interceptor';

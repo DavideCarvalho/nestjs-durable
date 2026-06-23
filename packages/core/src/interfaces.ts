@@ -97,6 +97,13 @@ export interface StepCheckpoint {
   /** For sleep steps: epoch ms the sleep elapses at. */
   wakeAt?: number | undefined;
   /**
+   * Set on the running placeholder checkpoints of the children dispatched by one `ctx.all` call —
+   * a shared tag (`all:<firstSeq>`) grouping the N siblings so the dashboard can render them as one
+   * parallel fan-out. Optional and additive: absent on every non-`all` checkpoint. Mirrors the
+   * Python SDK's `parallelGroup`.
+   */
+  parallelGroup?: string | undefined;
+  /**
    * When the step entered the system: for a remote step, when the engine dispatched it to the
    * transport; for a local step, when it began. Queue-wait time = `startedAt − enqueuedAt`.
    */
@@ -490,14 +497,25 @@ export type WorkflowCommand =
       startedAt?: number;
       finishedAt?: number;
       events?: StepEvent[];
+      /** A worker's `ctx.gather([...])` tags every step in the parallel fan with the same group, so the
+       *  engine carries it onto the checkpoint and the dashboard renders the fan as one group. */
+      parallelGroup?: string;
     }
   /** `ctx.sleep(ms)` — a durable timer of `ms` duration. The engine computes the absolute deadline
    *  (now + ms) when it applies the command, so the worker never reads the clock (determinism). */
   | { kind: 'sleep'; seq: number; ms: number }
   /** `ctx.wait_signal(name)` — block until a signal `name` is delivered to the run. */
   | { kind: 'waitSignal'; seq: number; signal: string }
-  /** `ctx.start_child(workflow, input)` — start a child run with its own lifecycle. */
-  | { kind: 'startChild'; seq: number; workflow: string; input: unknown };
+  /** `ctx.start_child(workflow, input)` — start a child run with its own lifecycle. A worker's
+   *  `ctx.all([...])` fan-out tags every dispatched child with the same `parallelGroup` so the
+   *  dashboard can render the fan as one group (parity with the gathered `recordStep` tag). */
+  | {
+      kind: 'startChild';
+      seq: number;
+      workflow: string;
+      input: unknown;
+      parallelGroup?: string;
+    };
 
 /** workflow worker → engine: the result of replaying one turn of a remote workflow. */
 export interface WorkflowDecision {
@@ -536,6 +554,9 @@ export interface WorkflowStepEvent {
   error?: StepError;
   /** Sub-process + log trail the step emitted so far (the handler's p-processes). */
   events?: StepEvent[];
+  /** A worker's `ctx.gather([...])` fan tags every step's lifecycle with the same group so the
+   *  dashboard renders the live fan-out as one group (parity with the `recordStep` tag). */
+  parallelGroup?: string | undefined;
 }
 
 /**
@@ -873,6 +894,28 @@ export interface WorkflowCtx {
     input: unknown,
     options?: string | ChildCallOptions,
   ): Promise<string>;
+  /**
+   * Run N children of the SAME workflow **in parallel** and wait for ALL of them: dispatches one
+   * child per entry in `inputs` (concurrently, each with its own durable lifecycle), suspends — zero
+   * compute — until every child reaches a terminal state, then resumes with their outputs in **input
+   * order**. Child ids are group-scoped and stable (`<runId>.all.<firstSeq>.<i>`), and the running
+   * placeholders share a `parallelGroup` tag so the dashboard renders the fan-out as one group.
+   *
+   * `mode` (default `waitAll`): `waitAll` waits for all then throws an aggregate {@link GatherError}
+   * if any failed; `failFast` throws as soon as a failed child is seen (siblings are not cancelled in
+   * v1 — their eventual results are ignored). Empty `inputs` returns `[]` with no side effects. The
+   * wait-all / fan-out counterpart to {@link child}; parity with the Python SDK's `gather_children`.
+   */
+  all<C extends WorkflowClass>(
+    workflow: C,
+    inputs: WorkflowInputOf<C>[],
+    opts?: { mode?: 'waitAll' | 'failFast' },
+  ): Promise<WorkflowOutputOf<C>[]>;
+  all<TOutput = unknown>(
+    workflow: string,
+    inputs: unknown[],
+    opts?: { mode?: 'waitAll' | 'failFast' },
+  ): Promise<TOutput[]>;
   /**
    * Pause the run at this point until a human resumes it from the dashboard (or
    * `engine.continue(runId)`). Records a visible `pending` checkpoint so the breakpoint shows up

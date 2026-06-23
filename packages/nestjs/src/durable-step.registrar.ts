@@ -6,12 +6,12 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable, type OnModuleInit } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
-import { getDurableStepMeta } from './decorators';
+import { scanSteps } from './discovery-helpers';
 import type { DurableModuleOptions } from './durable.module';
 
 /** A transport that can run step handlers in-process (e.g. the event-emitter transport). */
 interface LocalTaskHandling {
-  handle(name: string, fn: (input: unknown, log: StepLogger) => Promise<unknown>): void;
+  handle(name: string, fn: (input: unknown, log: StepLogger) => Promise<unknown> | unknown): void;
 }
 
 function supportsHandle(transport: unknown): transport is LocalTaskHandling {
@@ -51,18 +51,9 @@ export class DurableStepRegistrar implements OnModuleInit {
     if (!supportsHandle(this.transport)) return;
     const transport = this.transport;
 
-    for (const wrapper of this.discovery.getProviders()) {
-      const { instance } = wrapper;
-      if (!instance || typeof instance !== 'object') continue;
-      const prototype = Object.getPrototypeOf(instance);
-      for (const methodName of this.metadataScanner.getAllMethodNames(prototype)) {
-        const method = instance[methodName];
-        if (typeof method !== 'function') continue;
-        const meta = getDurableStepMeta(method);
-        if (!meta) continue;
-        // Forward the step logger as a second arg; methods that only declare `(input)` ignore it.
-        transport.handle(meta.name, (input, log) => instance[methodName](input, log));
-      }
-    }
+    // Forward the step logger as a second arg; methods that only declare `(input)` ignore it.
+    scanSteps(this.discovery, this.metadataScanner, (meta, handler) =>
+      transport.handle(meta.name, handler),
+    );
   }
 }

@@ -259,6 +259,9 @@ importers:
         specifier: '>=0.1.0 <1.0.0'
         version: 0.1.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)
     devDependencies:
+      '@dudousxd/durable-worker':
+        specifier: workspace:*
+        version: link:../worker
       '@dudousxd/nestjs-diagnostics':
         specifier: ^0.5.0
         version: 0.5.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)
@@ -577,6 +580,27 @@ importers:
       zod:
         specifier: 3.25.76
         version: 3.25.76
+
+  packages/worker:
+    devDependencies:
+      '@dudousxd/nestjs-durable-core':
+        specifier: workspace:^
+        version: link:../core
+      bullmq:
+        specifier: 5.34.10
+        version: 5.34.10
+      ioredis:
+        specifier: 5.4.2
+        version: 5.4.2
+      tsup:
+        specifier: 8.3.5
+        version: 8.3.5(@swc/core@1.15.41)(jiti@2.7.0)(postcss@8.5.15)(typescript@5.9.3)(yaml@2.9.0)
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: 2.1.9
+        version: 2.1.9(@types/node@25.9.2)(lightningcss@1.32.0)
 
   website:
     dependencies:
