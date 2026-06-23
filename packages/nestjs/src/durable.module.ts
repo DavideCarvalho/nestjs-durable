@@ -5,6 +5,7 @@ import {
   DURABLE_OPTIONS_CANONICAL,
   type NamedTransport,
   type QueueConfig,
+  type RetentionPolicy,
   STATE_STORE,
   STATE_STORE_CANONICAL,
   type ScheduledWorkflow,
@@ -20,6 +21,7 @@ import { DiscoveryModule, ModuleRef } from '@nestjs/core';
 import type { ContextAccessor } from './context-accessor';
 import { DurableStepRegistrar } from './durable-step.registrar';
 import { EntityService } from './entity';
+import { RetentionPoller } from './retention-poller';
 import { TimerPoller } from './timer-poller';
 import { CONTEXT_ACCESSOR } from './tokens';
 import { WorkflowRegistrar } from './workflow.registrar';
@@ -99,6 +101,30 @@ function isControlPlane(x: unknown): x is ControlPlane {
   );
 }
 
+/**
+ * Retention config for the {@link RetentionPoller}. One or more {@link RetentionPolicy policies}
+ * (status sets must be disjoint — validated at boot), swept together on a shared interval.
+ *
+ * ```ts
+ * retention: {
+ *   sweepIntervalMs: 60_000,
+ *   batchSize: 1_000,
+ *   policies: [
+ *     { statuses: ['completed', 'cancelled'], maxAgeMs: 14 * 24 * 3600_000, maxCount: 200 },
+ *     { statuses: ['failed'], maxAgeMs: 90 * 24 * 3600_000 }, // keep failures longer for debugging
+ *   ],
+ * }
+ * ```
+ */
+export interface DurableRetentionOptions {
+  /** The retention rules, one per (disjoint) status group. */
+  policies: RetentionPolicy[];
+  /** How often to run the prune sweep (ms). `0` runs it once on boot only. Defaults to 60000. */
+  sweepIntervalMs?: number;
+  /** Max runs hard-deleted per batch (per policy, looped until drained). Defaults to 1000. */
+  batchSize?: number;
+}
+
 export interface DurableModuleOptions {
   store: StateStore;
   transport?: Transport;
@@ -166,6 +192,14 @@ export interface DurableModuleOptions {
    * optional `cron-parser` peer dependency.
    */
   schedules?: ScheduledWorkflow[];
+  /**
+   * Hard-prune terminal run history on an interval so `durable_workflow_runs` (and its child tables)
+   * stays bounded — without it, completed/failed/cancelled runs accumulate forever and the timer
+   * poller's per-tick status scans get linearly slower. Worker instances only. Omit to keep all
+   * history (the default). Requires a store adapter that implements `pruneTerminalRuns` (the
+   * MikroORM adapter does); other adapters no-op with a warning. See {@link DurableRetentionOptions}.
+   */
+  retention?: DurableRetentionOptions;
   /**
    * Build the public callback URL for a `ctx.webhook()` token, e.g.
    * ``(t) => `https://api.example.com/durable/api/webhooks/${t}` ``. Populates `DurableWebhook.url`
@@ -319,6 +353,7 @@ export class DurableModule {
         WorkflowRegistrar,
         DurableStepRegistrar,
         TimerPoller,
+        RetentionPoller,
       ],
       exports: [
         WorkflowService,

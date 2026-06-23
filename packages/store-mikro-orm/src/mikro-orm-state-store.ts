@@ -1,5 +1,6 @@
 import {
   type AttributeFilter,
+  type RetentionPolicy,
   type RunQuery,
   type SignalWaiter,
   type StateStore,
@@ -104,6 +105,54 @@ export class MikroOrmStateStore implements StateStore {
     await em.nativeDelete(SignalWaiterEntity, { runId });
     await em.nativeDelete(RunAttributeEntity, { runId });
     await em.nativeDelete(WorkflowRunEntity, { id: runId });
+  }
+
+  async pruneTerminalRuns(policy: RetentionPolicy, nowMs: number, limit: number): Promise<number> {
+    if (policy.statuses.length === 0 || limit <= 0) return 0;
+    const em = this.orm.em.fork();
+    const status = { $in: policy.statuses };
+    // Collect ids that violate EITHER bound (most-restrictive keep): too old, or past the count cap.
+    const ids = new Set<string>();
+
+    if (policy.maxAgeMs != null) {
+      const cutoff = new Date(nowMs - policy.maxAgeMs);
+      const rows = await em.find(
+        WorkflowRunEntity,
+        { status, updatedAt: { $lt: cutoff } },
+        { fields: ['id'], orderBy: { updatedAt: 'asc' }, limit }, // oldest first
+      );
+      for (const r of rows) ids.add(r.id);
+    }
+
+    if (policy.maxCount != null && ids.size < limit) {
+      // Everything beyond the newest `maxCount` rows in the status set — skip the kept window via offset.
+      const rows = await em.find(
+        WorkflowRunEntity,
+        { status },
+        {
+          fields: ['id'],
+          orderBy: { updatedAt: 'desc', id: 'desc' },
+          limit,
+          offset: policy.maxCount,
+        },
+      );
+      for (const r of rows) {
+        ids.add(r.id);
+        if (ids.size >= limit) break;
+      }
+    }
+
+    if (ids.size === 0) return 0;
+    const idList = [...ids].slice(0, limit);
+    const runId = { $in: idList };
+    // Cascade children then runs (mirrors deleteRun) in one transaction so a pruned run never dangles.
+    await em.transactional(async (tem) => {
+      await tem.nativeDelete(StepCheckpointEntity, { runId });
+      await tem.nativeDelete(SignalWaiterEntity, { runId });
+      await tem.nativeDelete(RunAttributeEntity, { runId });
+      await tem.nativeDelete(WorkflowRunEntity, { id: runId });
+    });
+    return idList.length;
   }
 
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {

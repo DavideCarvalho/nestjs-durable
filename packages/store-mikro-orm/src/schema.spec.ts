@@ -69,6 +69,34 @@ describe('ensureMikroOrmDurableSchema resilience', () => {
     expect(ran).toHaveLength(1);
     expect(ran[0]).toContain('durable_signal_waiters');
   });
+
+  it('applies a standalone `create index ... on durable_*` (postgres/sqlite index form)', async () => {
+    // Adding an index to an existing table emits `create index` on Postgres/SQLite (vs `alter table
+    // add index` on MySQL). Both must reach our durable tables; an index on a non-durable table must not.
+    const sql = [
+      'create index `durable_workflow_runs_status_wake_at_idx` on `durable_workflow_runs` (`status`, `wake_at`)',
+      'create index `some_app_idx` on `some_app_table` (`col`)',
+    ].join(';\n');
+    const ran: string[] = [];
+    const execute = vi.fn(async (statement: string) => {
+      ran.push(statement);
+    });
+
+    await ensureMikroOrmDurableSchema(makeOrm(sql, execute));
+
+    expect(ran).toHaveLength(1);
+    expect(ran[0]).toContain('durable_workflow_runs_status_wake_at_idx');
+  });
+
+  it('rethrows when a required `create index` on a durable table fails', async () => {
+    const sql =
+      'create index `durable_workflow_runs_workflow_status_idx` on `durable_workflow_runs` (`workflow`, `status`)';
+    const execute = async () => {
+      throw new Error('idx boom');
+    };
+
+    await expect(ensureMikroOrmDurableSchema(makeOrm(sql, execute))).rejects.toThrow('idx boom');
+  });
 });
 
 describe('ensureMikroOrmDurableSchema collation alignment', () => {

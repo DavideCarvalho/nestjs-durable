@@ -236,3 +236,115 @@ describe('MikroOrmStateStore', () => {
     await orm.close(true);
   });
 });
+
+describe('MikroOrmStateStore.pruneTerminalRuns', () => {
+  const day = 24 * 60 * 60 * 1000;
+  const now = at.getTime();
+  // Seed a terminal run whose updatedAt is `ageDays` in the past.
+  const seed = async (
+    store: MikroOrmStateStore,
+    id: string,
+    status: WorkflowRun['status'],
+    ageDays: number,
+  ) => {
+    const ts = new Date(now - ageDays * day);
+    await store.createRun(run({ id, status, createdAt: ts, updatedAt: ts }));
+  };
+  const remainingIds = async (orm: MikroORM): Promise<string[]> => {
+    const store = new MikroOrmStateStore(orm);
+    const rows = await store.listRuns({});
+    return rows.map((r) => r.id).sort();
+  };
+
+  it('prunes runs older than maxAgeMs (oldest), keeps the recent ones', async () => {
+    const { store, orm } = await makeStore();
+    await seed(store, 'old', 'completed', 30);
+    await seed(store, 'fresh', 'completed', 1);
+
+    const deleted = await store.pruneTerminalRuns(
+      { statuses: ['completed'], maxAgeMs: 7 * day },
+      now,
+      100,
+    );
+
+    expect(deleted).toBe(1);
+    expect(await remainingIds(orm)).toEqual(['fresh']);
+    await orm.close(true);
+  });
+
+  it('prunes runs beyond maxCount most-recent (by updatedAt)', async () => {
+    const { store, orm } = await makeStore();
+    await seed(store, 'r3', 'completed', 3);
+    await seed(store, 'r1', 'completed', 1);
+    await seed(store, 'r2', 'completed', 2);
+
+    const deleted = await store.pruneTerminalRuns(
+      { statuses: ['completed'], maxCount: 2 },
+      now,
+      100,
+    );
+
+    expect(deleted).toBe(1);
+    expect(await remainingIds(orm)).toEqual(['r1', 'r2']); // newest two kept
+    await orm.close(true);
+  });
+
+  it('composes maxAgeMs AND maxCount most-restrictively (prune if either bound is violated)', async () => {
+    const { store, orm } = await makeStore();
+    // Two within 7d but maxCount=1 -> one pruned by count; one older than 7d -> pruned by age.
+    await seed(store, 'old', 'completed', 30);
+    await seed(store, 'mid', 'completed', 3);
+    await seed(store, 'new', 'completed', 1);
+
+    const deleted = await store.pruneTerminalRuns(
+      { statuses: ['completed'], maxAgeMs: 7 * day, maxCount: 1 },
+      now,
+      100,
+    );
+
+    expect(deleted).toBe(2); // 'old' (age) + 'mid' (count)
+    expect(await remainingIds(orm)).toEqual(['new']);
+    await orm.close(true);
+  });
+
+  it('only touches the policy statuses and cascades child rows', async () => {
+    const { store, orm } = await makeStore();
+    await seed(store, 'done', 'completed', 30);
+    await store.saveCheckpoint(checkpoint({ runId: 'done' }));
+    await seed(store, 'boom', 'failed', 30); // not in policy statuses
+    await seed(store, 'live', 'running', 30); // non-terminal, never eligible anyway
+
+    const deleted = await store.pruneTerminalRuns(
+      { statuses: ['completed'], maxAgeMs: 7 * day },
+      now,
+      100,
+    );
+
+    expect(deleted).toBe(1);
+    expect(await remainingIds(orm)).toEqual(['boom', 'live']);
+    expect(await store.listCheckpoints('done')).toHaveLength(0); // cascade
+    await orm.close(true);
+  });
+
+  it('returns the batch size when more remain (caller loops to drain)', async () => {
+    const { store, orm } = await makeStore();
+    await seed(store, 'a', 'completed', 30);
+    await seed(store, 'b', 'completed', 29);
+    await seed(store, 'c', 'completed', 28);
+
+    const first = await store.pruneTerminalRuns(
+      { statuses: ['completed'], maxAgeMs: 7 * day },
+      now,
+      2,
+    );
+    expect(first).toBe(2); // hit the limit -> backlog remains
+    const second = await store.pruneTerminalRuns(
+      { statuses: ['completed'], maxAgeMs: 7 * day },
+      now,
+      2,
+    );
+    expect(second).toBe(1);
+    expect(await remainingIds(orm)).toEqual([]);
+    await orm.close(true);
+  });
+});

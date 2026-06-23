@@ -106,6 +106,14 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const workflowRuns = new EntitySchema<WorkflowRunEntity>({
     class: WorkflowRunEntity,
     tableName: 'durable_workflow_runs',
+    // Indexes mirror the Prisma adapter so a store swap keeps the same plan. The poller hits these
+    // every tick: `(status, wakeAt)` serves both the due-timer scan (status='suspended' AND wakeAt<=now)
+    // and, via its `status` prefix, the pending/incomplete status lookups; `(workflow, status)` serves
+    // the per-workflow timeout sweep. Without them every poll is a full scan of a table that only grows.
+    indexes: [
+      { name: 'durable_workflow_runs_status_wake_at_idx', properties: ['status', 'wakeAt'] },
+      { name: 'durable_workflow_runs_workflow_status_idx', properties: ['workflow', 'status'] },
+    ],
     properties: {
       id: { type: 'string', primary: true, fieldName: col('id') },
       workflow: { type: 'string', fieldName: col('workflow') },
@@ -152,6 +160,12 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const runAttributes = new EntitySchema<RunAttributeEntity>({
     class: RunAttributeEntity,
     tableName: 'durable_run_attributes',
+    // The search-attribute EXISTS join (see the class docstring) pushes equality/range predicates down
+    // onto `(key, numValue)` / `(key, strValue)`; mirror the Prisma adapter so those scans stay indexed.
+    indexes: [
+      { name: 'durable_run_attributes_key_num_idx', properties: ['key', 'numValue'] },
+      { name: 'durable_run_attributes_key_str_idx', properties: ['key', 'strValue'] },
+    ],
     properties: {
       runId: { type: 'string', primary: true, fieldName: col('runId') },
       key: { type: 'string', primary: true, fieldName: col('key') },
