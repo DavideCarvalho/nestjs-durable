@@ -1653,6 +1653,16 @@ export class WorkflowEngine {
 
     // continue: persist any local steps the replay ran, dispatch the blocking ops, then suspend. When
     // those resolve (a result lands, a timer fires) `resume` brings us back for the next turn.
+    //
+    // Guard: re-read the run BEFORE writing `suspended` — a parent-cancel cascade may have written
+    // `cancelled` to the store WHILE the executor was replaying this turn (the advance() awaited above
+    // runs outside the store transaction). Overwriting `cancelled` → `suspended` would let recovery
+    // re-drive the run forever. If the store already shows a terminal/cancelled state, bail without
+    // touching it — identical to the guard in `completeRemoteResult` for remote step results.
+    const fresh = await this.store.getRun(run.id);
+    if (fresh && (fresh.status === 'cancelled' || fresh.status === 'completed' || fresh.status === 'dead')) {
+      return { runId: run.id, status: fresh.status, output: fresh.output, error: fresh.error };
+    }
     const wakeAt = await this.applyCommands(run, decision.commands);
     return this.settleRun(run, { kind: 'suspended', wakeAt });
   }
