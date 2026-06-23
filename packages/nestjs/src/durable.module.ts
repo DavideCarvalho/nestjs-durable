@@ -133,6 +133,14 @@ export interface DurableModuleOptions {
    */
   maxRecoveryAttempts?: number;
   /**
+   * Opt-in liveness deadline (ms) for a remote (polyglot) workflow `advance`. If the worker neither
+   * returns a decision nor sends a run-scoped heartbeat within this window, the engine presumes it dead
+   * and lets recovery re-drive; each heartbeat rearms the window so a slow-but-alive worker is never
+   * re-driven. Pair with a worker SDK that emits run-scoped heartbeats (`@dudousxd/durable-worker` ≥ the
+   * release that ships them, and the Python `durable-worker`). Omit for the prior unbounded await.
+   */
+  remoteAdvanceSilenceMs?: number;
+  /**
    * The **default** workflow to route dead-lettered runs to, for workflows that don't declare their
    * own. When a run is moved to `dead` (exceeded `maxRecoveryAttempts`), the started handler gets a
    * `DeadLetter` payload `{ deadRunId, workflow, input, error }` (idempotent by a `dlq:<runId>` id) —
@@ -282,6 +290,7 @@ export class DurableModule {
               leaseMs: opts.leaseMs,
               admission: opts.admission,
               maxRecoveryAttempts: opts.maxRecoveryAttempts,
+              remoteAdvanceSilenceMs: opts.remoteAdvanceSilenceMs,
               instanceId: opts.instanceId,
               webhookUrl: opts.webhookUrl,
               traceparent: opts.traceparent,

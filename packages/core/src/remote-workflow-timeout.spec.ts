@@ -173,3 +173,121 @@ describe('WorkflowEngine — remote advance timeout → recovery re-drive (opt-i
     expect(run?.error?.message).toBe('executor exploded');
   });
 });
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Poll on a REAL clock (the rearm uses real `setTimeout`), returning the run once `pred` holds. */
+async function pollReal(
+  store: InMemoryStateStore,
+  runId: string,
+  pred: (run: WorkflowRun | null) => boolean,
+  { ticks = 60, delayMs = 10 }: { ticks?: number; delayMs?: number } = {},
+) {
+  for (let i = 0; i < ticks; i += 1) {
+    const run = (await store.getRun(runId)) ?? null;
+    if (pred(run)) return run;
+    await sleep(delayMs);
+  }
+  return (await store.getRun(runId)) ?? null;
+}
+
+describe('WorkflowEngine — remoteAdvanceSilenceMs (heartbeat-rearmed advance deadline)', () => {
+  it('a silent worker (never beats) trips RemoteWorkflowTimeout → released lease → recovery re-drives', async () => {
+    const store = new InMemoryStateStore();
+    // Engine owns the deadline (no executor `timeoutMs`): the advance itself never resolves, modelling a
+    // dropped decision from a dead worker. With no heartbeats, the 30ms window lapses → re-drive.
+    const engine = new WorkflowEngine({
+      store,
+      transport: new InMemoryTransport(),
+      remoteAdvanceSilenceMs: 30,
+    });
+    let calls = 0;
+    engine.registerRemote('silent', '1', {
+      group: 'py-workflows',
+      executor: {
+        advance(run: WorkflowRun): Promise<WorkflowDecision> {
+          calls += 1;
+          if (calls === 1) return new Promise<WorkflowDecision>(() => {}); // never resolves
+          return Promise.resolve({
+            taskId: 't',
+            runId: run.id,
+            status: 'completed',
+            commands: [],
+            output: { ok: true },
+          });
+        },
+      },
+    });
+
+    await engine.start('silent', {}, 's1');
+    // The window lapses with no beat: run stays running (NOT failed) with its lease RELEASED.
+    const afterTimeout = await pollReal(
+      store,
+      's1',
+      (r) => r?.lockedUntil === undefined && r?.status === 'running',
+    );
+    expect(afterTimeout?.status).toBe('running');
+    expect(afterTimeout?.lockedUntil).toBeUndefined();
+
+    await engine.recoverIncomplete();
+    const done = await pollReal(store, 's1', (r) => r?.status === 'completed');
+    expect(done?.status).toBe('completed');
+    expect(done?.output).toEqual({ ok: true });
+    expect(calls).toBe(2);
+  });
+
+  it('heartbeats REARM the window: a worker that keeps beating is never re-driven (no dup side effects)', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    const engine = new WorkflowEngine({ store, transport, remoteAdvanceSilenceMs: 40 });
+    let calls = 0;
+    engine.registerRemote('beating', '1', {
+      group: 'py-workflows',
+      executor: {
+        advance(run: WorkflowRun): Promise<WorkflowDecision> {
+          calls += 1;
+          if (calls === 1) return new Promise<WorkflowDecision>(() => {}); // long turn: never settles itself
+          return Promise.resolve({
+            taskId: 't',
+            runId: run.id,
+            status: 'completed',
+            commands: [],
+            output: { ok: true },
+          });
+        },
+      },
+    });
+
+    await engine.start('beating', {}, 'b1');
+    // Wait until advance is in flight (the engine has armed the run's deadline).
+    await pollReal(store, 'b1', (r) => r?.status === 'running' && calls === 1, {
+      ticks: 20,
+      delayMs: 5,
+    });
+
+    // Beat every 15ms for ~90ms — comfortably past the 40ms window. Each beat rearms it.
+    for (let i = 0; i < 6; i += 1) {
+      await transport.emitHeartbeat({ runId: 'b1', seq: 0, group: 'py-workflows' });
+      await sleep(15);
+    }
+    // Still the SAME in-flight turn: lease HELD (not released), no re-drive — beats kept it alive past 40ms.
+    const stillAlive = await store.getRun('b1');
+    expect(stillAlive?.status).toBe('running');
+    expect(stillAlive?.lockedUntil).not.toBeUndefined();
+    expect(calls).toBe(1);
+
+    // Stop beating: the now-unrearmed window lapses → RemoteWorkflowTimeout → lease released.
+    const timedOut = await pollReal(
+      store,
+      'b1',
+      (r) => r?.lockedUntil === undefined && r?.status === 'running',
+    );
+    expect(timedOut?.lockedUntil).toBeUndefined();
+
+    // And recovery still re-drives it to completion.
+    await engine.recoverIncomplete();
+    const done = await pollReal(store, 'b1', (r) => r?.status === 'completed');
+    expect(done?.status).toBe('completed');
+    expect(calls).toBe(2);
+  });
+});
