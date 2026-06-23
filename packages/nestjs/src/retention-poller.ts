@@ -3,6 +3,7 @@ import {
   STATE_STORE_CANONICAL,
   type StateStore,
   TERMINAL_RUN_STATUSES,
+  parseDuration,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
@@ -29,9 +30,11 @@ export function validateRetention(retention: DurableRetentionOptions): void {
     if (policy.statuses.length === 0) {
       throw new Error('durable retention: each policy must list at least one status');
     }
-    if (policy.maxAgeMs == null && policy.maxCount == null) {
-      throw new Error('durable retention: each policy must set maxAgeMs and/or maxCount');
+    if (policy.maxAge == null && policy.maxCount == null) {
+      throw new Error('durable retention: each policy must set maxAge and/or maxCount');
     }
+    // Fail fast on a typo'd duration string ('7days', '1 month') at boot rather than silently never pruning.
+    if (policy.maxAge != null) parseDuration(policy.maxAge);
     for (const status of policy.statuses) {
       if (!TERMINAL_RUN_STATUSES.includes(status)) {
         throw new Error(
@@ -81,7 +84,10 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
       return;
     }
     await this.sweep();
-    const intervalMs = retention.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
+    const intervalMs =
+      retention.sweepInterval != null
+        ? parseDuration(retention.sweepInterval)
+        : DEFAULT_SWEEP_INTERVAL_MS;
     if (intervalMs > 0) {
       this.timer = setInterval(() => void this.sweep(), intervalMs);
       this.timer.unref?.();

@@ -256,18 +256,34 @@ describe('MikroOrmStateStore.pruneTerminalRuns', () => {
     return rows.map((r) => r.id).sort();
   };
 
-  it('prunes runs older than maxAgeMs (oldest), keeps the recent ones', async () => {
+  it('prunes runs older than maxAge (oldest), keeps the recent ones', async () => {
     const { store, orm } = await makeStore();
     await seed(store, 'old', 'completed', 30);
     await seed(store, 'fresh', 'completed', 1);
 
     const deleted = await store.pruneTerminalRuns(
-      { statuses: ['completed'], maxAgeMs: 7 * day },
+      { statuses: ['completed'], maxAge: 7 * day },
       now,
       100,
     );
 
     expect(deleted).toBe(1);
+    expect(await remainingIds(orm)).toEqual(['fresh']);
+    await orm.close(true);
+  });
+
+  it('accepts an ms-style duration string for maxAge', async () => {
+    const { store, orm } = await makeStore();
+    await seed(store, 'old', 'completed', 30);
+    await seed(store, 'fresh', 'completed', 1);
+
+    const deleted = await store.pruneTerminalRuns(
+      { statuses: ['completed'], maxAge: '7d' },
+      now,
+      100,
+    );
+
+    expect(deleted).toBe(1); // '7d' parsed to ms -> 'old' (30d) pruned, 'fresh' (1d) kept
     expect(await remainingIds(orm)).toEqual(['fresh']);
     await orm.close(true);
   });
@@ -289,7 +305,7 @@ describe('MikroOrmStateStore.pruneTerminalRuns', () => {
     await orm.close(true);
   });
 
-  it('composes maxAgeMs AND maxCount most-restrictively (prune if either bound is violated)', async () => {
+  it('composes maxAge AND maxCount most-restrictively (prune if either bound is violated)', async () => {
     const { store, orm } = await makeStore();
     // Two within 7d but maxCount=1 -> one pruned by count; one older than 7d -> pruned by age.
     await seed(store, 'old', 'completed', 30);
@@ -297,7 +313,7 @@ describe('MikroOrmStateStore.pruneTerminalRuns', () => {
     await seed(store, 'new', 'completed', 1);
 
     const deleted = await store.pruneTerminalRuns(
-      { statuses: ['completed'], maxAgeMs: 7 * day, maxCount: 1 },
+      { statuses: ['completed'], maxAge: 7 * day, maxCount: 1 },
       now,
       100,
     );
@@ -315,7 +331,7 @@ describe('MikroOrmStateStore.pruneTerminalRuns', () => {
     await seed(store, 'live', 'running', 30); // non-terminal, never eligible anyway
 
     const deleted = await store.pruneTerminalRuns(
-      { statuses: ['completed'], maxAgeMs: 7 * day },
+      { statuses: ['completed'], maxAge: 7 * day },
       now,
       100,
     );
@@ -333,13 +349,13 @@ describe('MikroOrmStateStore.pruneTerminalRuns', () => {
     await seed(store, 'c', 'completed', 28);
 
     const first = await store.pruneTerminalRuns(
-      { statuses: ['completed'], maxAgeMs: 7 * day },
+      { statuses: ['completed'], maxAge: 7 * day },
       now,
       2,
     );
     expect(first).toBe(2); // hit the limit -> backlog remains
     const second = await store.pruneTerminalRuns(
-      { statuses: ['completed'], maxAgeMs: 7 * day },
+      { statuses: ['completed'], maxAge: 7 * day },
       now,
       2,
     );
