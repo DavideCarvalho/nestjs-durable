@@ -12,10 +12,16 @@ const DURABLE_TABLE_NAMES = new Set([
   'durable_buffered_signals',
 ]);
 
-/** The table a `create table` / `alter table` statement targets, lower-cased; undefined otherwise. */
+/**
+ * The table a DDL statement targets, lower-cased; undefined otherwise. Recognizes `create table` /
+ * `alter table` (the table name follows immediately) and standalone `create [unique] index ... on
+ * <table>` (the table follows `on`). MikroORM adds an index to an EXISTING table as `alter table ...
+ * add index` on MySQL but as a standalone `create index ... on ...` on Postgres/SQLite — without the
+ * second form those index statements would be dropped by the durable-table filter and never applied.
+ */
 function targetTable(statement: string): string | undefined {
   const match = statement.match(
-    /^(?:create|alter)\s+table\s+(?:if\s+not\s+exists\s+)?[`"']?([\w$]+)[`"']?/i,
+    /^(?:create\s+(?:unique\s+)?index\s+.+?\s+on\s+|(?:create|alter)\s+table\s+(?:if\s+not\s+exists\s+)?)[`"']?([\w$]+)[`"']?/i,
   );
   return match?.[1]?.toLowerCase();
 }
@@ -28,7 +34,7 @@ function targetTable(statement: string): string | undefined {
  * cast to `json` because it was truncated under an older `text` column — must NOT crash boot.
  */
 function isRequiredStructure(statement: string): boolean {
-  return /\b(?:create\s+table|add\s+(?:column|index|constraint|key|unique|fulltext))\b/i.test(
+  return /\b(?:create\s+table|create\s+(?:unique\s+)?index|add\s+(?:column|index|constraint|key|unique|fulltext))\b/i.test(
     statement,
   );
 }

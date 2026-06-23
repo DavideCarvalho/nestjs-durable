@@ -243,6 +243,16 @@ export interface StateStore {
    */
   deleteRun(runId: string): Promise<void>;
 
+  /**
+   * Hard-delete up to `limit` terminal runs that fall OUTSIDE `policy` (oldest / over the count cap
+   * first), cascading to their child rows exactly like {@link deleteRun}. Returns how many runs were
+   * deleted — call again while it returns `limit` to drain a large backlog in bounded batches.
+   *
+   * Optional: only adapters that implement a bulk prune provide it; the retention poller no-ops with a
+   * warning when the configured store omits it. See {@link RetentionPolicy} for the keep/prune rule.
+   */
+  pruneTerminalRuns?(policy: RetentionPolicy, nowMs: number, limit: number): Promise<number>;
+
   getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null>;
   /**
    * Persist a checkpoint and advance the run atomically. Durable semantics depend on this
@@ -327,6 +337,33 @@ export interface StateStore {
    * plus an in-JS prefix scan that produces the identical result.
    */
   listCheckpointsByNamePrefix?(runId: string, prefixes: string[]): Promise<StepCheckpoint[]>;
+}
+
+/** The terminal run statuses — a run in one of these is finished and will never change on its own.
+ *  Only these are eligible for retention pruning (a {@link RetentionPolicy} targeting a non-terminal
+ *  status would race the engine and delete live work). */
+export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
+  'completed',
+  'failed',
+  'cancelled',
+  'dead',
+];
+
+/**
+ * One retention rule for hard-pruning terminal run history. Within `statuses` (terminal only), a run
+ * is KEPT only if it satisfies EVERY bound you set, and pruned the moment it violates any:
+ *  - `maxAgeMs` — prune runs whose `updatedAt` (≈ the time they reached terminal) is older than
+ *    `now - maxAgeMs`.
+ *  - `maxCount` — keep only the `maxCount` most-recent (by `updatedAt`) runs in the status set; prune
+ *    everything past that.
+ *
+ * Set one or both (both = the most-restrictive wins: capped at `maxCount` rows AND nothing older than
+ * `maxAgeMs`). Statuses not named by any policy are never pruned.
+ */
+export interface RetentionPolicy {
+  statuses: RunStatus[];
+  maxAgeMs?: number;
+  maxCount?: number;
 }
 
 /** Typed, queryable per-run data — exact values for `eq`/`ne`, numbers/strings for range ops. */
