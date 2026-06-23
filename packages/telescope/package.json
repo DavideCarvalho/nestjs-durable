@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-telescope",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Telescope watcher for nestjs-durable — workflow runs and steps as Telescope entries",
   "license": "MIT",
   "author": "Davide Carvalho",
