@@ -1,6 +1,6 @@
 import type { HistoryEvent } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it } from 'vitest';
-import { GatherError, NondeterminismError, Suspend } from './errors';
+import { GatherReplayError, NondeterminismError, Suspend } from './errors';
 import { WorkflowContext } from './workflow-context';
 
 describe('WorkflowContext.gather', () => {
@@ -58,7 +58,7 @@ describe('WorkflowContext.gather', () => {
     expect(ctx.commands).toHaveLength(0);
   });
 
-  it('aggregates failures into a GatherError (waitAll)', async () => {
+  it('aggregates failures into a GatherReplayError (waitAll)', async () => {
     const ctx = new WorkflowContext('r1', []);
     const err = await ctx
       .gather([
@@ -71,7 +71,7 @@ describe('WorkflowContext.gather', () => {
         ],
       ])
       .catch((e) => e);
-    expect(err).toBeInstanceOf(GatherError);
+    expect(err).toBeInstanceOf(GatherReplayError);
     expect(err.failures).toHaveLength(1);
     expect(err.failures[0].name).toBe('boom');
     expect(err.failures[0].index).toBe(1);
@@ -79,7 +79,7 @@ describe('WorkflowContext.gather', () => {
     expect(ctx.commands).toHaveLength(2);
   });
 
-  it('replay re-raises GatherError when a recorded item failed', async () => {
+  it('replay re-raises GatherReplayError when a recorded item failed', async () => {
     const history: HistoryEvent[] = [
       { seq: 0, kind: 'step', name: 'a', output: 1 },
       { seq: 1, kind: 'step', name: 'b', error: { message: 'boom' } },
@@ -91,11 +91,11 @@ describe('WorkflowContext.gather', () => {
         ['b', () => 2],
       ])
       .catch((e) => e);
-    expect(err).toBeInstanceOf(GatherError);
+    expect(err).toBeInstanceOf(GatherReplayError);
     expect(err.failures[0].name).toBe('b');
   });
 
-  it('failFast throws a GatherError when an item fails', async () => {
+  it('failFast throws a GatherReplayError when an item fails', async () => {
     const ctx = new WorkflowContext('r1', []);
     const err = await ctx
       .gather(
@@ -111,7 +111,7 @@ describe('WorkflowContext.gather', () => {
         { mode: 'failFast' },
       )
       .catch((e) => e);
-    expect(err).toBeInstanceOf(GatherError);
+    expect(err).toBeInstanceOf(GatherReplayError);
   });
 
   it('empty items returns []', async () => {
@@ -203,14 +203,14 @@ describe('WorkflowContext.all', () => {
     expect(ctx.commands).toHaveLength(0);
   });
 
-  it('waitAll aggregates child failures into GatherError', async () => {
+  it('waitAll aggregates child failures into GatherReplayError', async () => {
     const history: HistoryEvent[] = [
       { seq: 0, kind: 'child', name: 'child', output: 'a' },
       { seq: 1, kind: 'child', name: 'child', error: { message: 'boom' } },
     ];
     const ctx = new WorkflowContext('r1', history);
     const err = await ctx.all('child', [{ x: 1 }, { x: 2 }]).catch((e) => e);
-    expect(err).toBeInstanceOf(GatherError);
+    expect(err).toBeInstanceOf(GatherReplayError);
     expect(err.failures[0].workflow).toBe('child');
     expect(err.failures[0].index).toBe(1);
   });
@@ -221,7 +221,7 @@ describe('WorkflowContext.all', () => {
     ];
     const ctx = new WorkflowContext('r1', history);
     const err = await ctx.all('child', [{ x: 1 }, { x: 2 }], { mode: 'failFast' }).catch((e) => e);
-    expect(err).toBeInstanceOf(GatherError);
+    expect(err).toBeInstanceOf(GatherReplayError);
   });
 
   it('empty inputs returns []', async () => {

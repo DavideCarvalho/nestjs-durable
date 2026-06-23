@@ -111,7 +111,9 @@ describe('WorkflowWorker.processTask decision mapping', () => {
     const history: HistoryEvent[] = [{ seq: 0, kind: 'timer' }];
     const d = await wf.processTask(task({ history }));
     expect(d.status).toBe('failed');
-    expect(d.error?.message).toContain('history at seq 0');
+    expect(d.error?.message).toContain('non-determinism');
+    expect(d.error?.message).toContain('#0');
+    expect(d.error?.message).toContain('timer');
   });
 });
 

@@ -13,6 +13,7 @@ export * from './codec-state-store';
 export * from './events';
 export * from './metrics';
 export * from './scheduler';
+export { createStepLogger } from './step-logger';
 export * from './search-attributes';
 export * from './tokens';
 export * from './workflow-ref';

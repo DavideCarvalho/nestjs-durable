@@ -1,6 +1,6 @@
 export {
   Cancelled,
-  GatherError,
+  GatherReplayError,
   NondeterminismError,
   StepFailed,
   Suspend,

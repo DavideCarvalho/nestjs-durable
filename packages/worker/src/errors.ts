@@ -7,11 +7,26 @@ export class WorkflowError extends Error {}
  * The history doesn't match what the replay produced at a seq — the workflow code changed under a
  * run that is already in flight. The run fails loudly rather than silently diverging. Mirrors the
  * Python `NondeterminismError`.
+ *
+ * Carries the same structured fields as the engine's `NonDeterminismError` (`runId`, `seq`,
+ * `expected`, `actual`) so the determinism contract reads identically across the in-process engine
+ * and the thin worker; the human-readable `.message` is derived from those fields.
  */
 export class NondeterminismError extends WorkflowError {
-  constructor(message: string) {
-    super(message);
+  readonly runId: string;
+  readonly seq: number;
+  readonly expected: string;
+  readonly actual: string;
+  constructor(runId: string, seq: number, expected: string, actual: string) {
+    super(
+      `non-determinism at ${runId}#${seq}: code expects ${expected} but history recorded ` +
+        `${actual}. The workflow changed under an in-flight run — register a new @Workflow version.`,
+    );
     this.name = 'NondeterminismError';
+    this.runId = runId;
+    this.seq = seq;
+    this.expected = expected;
+    this.actual = actual;
   }
 }
 
@@ -31,7 +46,7 @@ export class StepFailed extends Error {
   }
 }
 
-/** One failed item in a {@link GatherError}: its input position, the step `name` (gather) or child
+/** One failed item in a {@link GatherReplayError}: its input position, the step `name` (gather) or child
  *  `workflow` (all), and the recorded error. Both keys are present so a caller can read whichever
  *  fits the op — mirrors the engine's `GatherError.failures` (index/id/error) and Python's per-item
  *  failure dicts. */
@@ -48,13 +63,13 @@ export interface GatherFailure {
  * failed decision. Subclasses {@link StepFailed} so it is catchable in workflow code exactly like any
  * awaited failure. Mirrors the Python `GatherFailed` and the engine's `GatherError`.
  */
-export class GatherError extends StepFailed {
+export class GatherReplayError extends StepFailed {
   readonly failures: GatherFailure[];
 
   constructor(failures: GatherFailure[]) {
     const labels = failures.map((f) => f.name ?? f.workflow ?? `#${f.index}`).join(', ');
     super({ message: `gather: ${failures.length} item(s) failed: ${labels}` });
-    this.name = 'GatherError';
+    this.name = 'GatherReplayError';
     this.failures = failures;
   }
 }

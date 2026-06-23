@@ -1,6 +1,7 @@
 import type { RemoteTask, StepEvent, StepResult } from '@dudousxd/nestjs-durable-core';
+import { createStepLogger } from '@dudousxd/nestjs-durable-core';
 import { toError } from './errors';
-import { type StepLog, makeStepLog } from './workflow-context';
+import type { StepLog } from './workflow-context';
 
 /**
  * A registered step handler. Receives the task's `input` and a {@link StepLog} sink (so it can record
@@ -48,7 +49,7 @@ export class StepWorker {
     }
 
     const events: StepEvent[] = [];
-    const log = makeStepLog(events);
+    const log = createStepLogger(events, () => Date.now());
     try {
       const output = await handler(task.input, log);
       const result: StepResult = { ...base, status: 'completed', output };
