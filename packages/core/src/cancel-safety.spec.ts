@@ -1,5 +1,5 @@
-import type { HistoryEvent, WorkflowDecision, WorkflowRun } from './interfaces';
 import { WorkflowEngine } from './engine';
+import type { HistoryEvent, WorkflowDecision, WorkflowRun } from './interfaces';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('WorkflowEngine — cancelled runs are not resurrected', () => {
@@ -48,7 +48,11 @@ describe('WorkflowEngine — cancelled runs are not resurrected', () => {
       executor: {
         async advance(run: WorkflowRun, _history: HistoryEvent[]): Promise<WorkflowDecision> {
           // Simulate parent cancel cascade writing `cancelled` to the store while advance() awaits.
-          await store.updateRun(run.id, { status: 'cancelled', error: { message: 'cancelled' }, updatedAt: new Date() });
+          await store.updateRun(run.id, {
+            status: 'cancelled',
+            error: { message: 'cancelled' },
+            updatedAt: new Date(),
+          });
           // Worker still returns `continue` — the bug was that this overwrote `cancelled` → `suspended`.
           return { taskId: 't', runId: run.id, status: 'continue', commands: [] };
         },
