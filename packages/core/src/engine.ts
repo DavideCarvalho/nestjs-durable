@@ -1293,6 +1293,7 @@ export class WorkflowEngine {
           enqueuedAt: startedAt,
           startedAt,
           finishedAt: startedAt, // placeholder until the step settles
+          parallelGroup: event.parallelGroup,
         }),
       );
       this.emit({
@@ -1319,6 +1320,7 @@ export class WorkflowEngine {
         enqueuedAt: startedAt,
         startedAt,
         finishedAt: event.finishedAt != null ? new Date(event.finishedAt) : new Date(),
+        parallelGroup: event.parallelGroup,
       }),
     );
     this.emit({

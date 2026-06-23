@@ -139,17 +139,31 @@ class WorkflowContext:
 
     def _replay(self, seq: int, kind: str, name: Optional[str] = None):
         """(found, output) for a resolved op in history; raises on mismatch or recorded failure."""
-        ev = self._history.get(seq)
+        ev = self._replay_entry(seq, kind, name)
         if ev is None:
             return False, None
-        if ev.get("kind") != kind or (name is not None and ev.get("name") not in (None, name)):
-            raise NondeterminismError(
-                f"history at seq {seq} is {ev.get('kind')}/{ev.get('name')!r}, "
-                f"but replay reached {kind}/{name!r}"
-            )
         if ev.get("error") is not None:
             raise StepFailed(ev["error"])
         return True, ev.get("output")
+
+    def _aggregate(
+        self, histories: "List[Optional[Dict[str, Any]]]", label_fn: "Callable[[Dict[str, Any]], str]"
+    ) -> "List[Any]":
+        """Collect outputs from a list of history entries, raising GatherFailed if any failed.
+
+        ``label_fn`` maps a non-None entry to the string placed in the failure dict's ``"name"`` key,
+        matching the exact shape each call-site produced before this helper was introduced."""
+        outputs: List[Any] = []
+        failures: List[Dict[str, Any]] = []
+        for ev in histories:
+            if ev is not None and ev.get("error") is not None:
+                failures.append({"name": label_fn(ev), "error": ev["error"]})
+                outputs.append(None)
+            else:
+                outputs.append(ev.get("output") if ev else None)
+        if failures:
+            raise GatherFailed(failures)
+        return outputs
 
     def _replay_entry(
         self, seq: int, kind: str, name: Optional[str] = None
@@ -290,18 +304,8 @@ class WorkflowContext:
 
         # Replay: inline steps all record in ONE turn, so either ALL or NONE of the seqs are present.
         if all(self._replay_entry(seq, "step", name) is not None for seq, name, _ in entries):
-            outputs: List[Any] = []
-            failures: List[Dict[str, Any]] = []
-            for seq, name, _ in entries:
-                ev = self._replay_entry(seq, "step", name)
-                if ev.get("error") is not None:
-                    failures.append({"name": name, "error": ev["error"]})
-                    outputs.append(None)  # unreachable: GatherFailed is raised before returning
-                else:
-                    outputs.append(ev.get("output"))
-            if failures:
-                raise GatherFailed(failures)
-            return outputs
+            replay_entries = [self._replay_entry(seq, "step", name) for seq, name, _ in entries]
+            return self._aggregate(replay_entries, lambda ev: ev["name"])
 
         cancel = threading.Event()
         run_cancel = self._is_cancelled
@@ -451,17 +455,7 @@ class WorkflowContext:
         if pending:
             raise _Suspend()
 
-        outputs: List[Any] = []
-        failures: List[Dict[str, Any]] = []
-        for ev in histories:
-            if ev.get("error") is not None:
-                failures.append({"name": workflow, "error": ev["error"]})
-                outputs.append(None)
-            else:
-                outputs.append(ev.get("output"))
-        if failures:
-            raise GatherFailed(failures)
-        return outputs
+        return self._aggregate(histories, lambda _ev: workflow)
 
 
 WorkflowFn = Callable[..., Any]
