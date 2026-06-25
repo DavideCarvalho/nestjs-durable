@@ -21,6 +21,20 @@ from typing import Any, Callable, Dict, Optional
 from .cancellation import CancellationRegistry
 from .worker import Worker
 
+# asyncio keeps only a WEAK reference to a task, so a fire-and-forget task created without retaining
+# its handle can be garbage-collected mid-flight — which surfaces as "Task was destroyed but it is
+# pending!" and silently kills the long-lived background loops (heartbeat, control-channel listener).
+# Retaining the handle here for the lifetime of the worker process is the documented fix; the
+# done-callback drops it so the set doesn't grow unbounded. See the asyncio.create_task docs.
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn_retained(coro: Any) -> "asyncio.Task[Any]":
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
 # Stable-ish id for the `from` field of control messages this worker publishes. It only has to
 # DIFFER from the engine instanceIds (so a dashboard engine doesn't treat our progress events as its
 # own echo and drop them) — host + pid is plenty and avoids importing a uuid/random dependency.
@@ -94,7 +108,7 @@ async def _start_heartbeat(connection: str, prefix: str, group: str) -> None:
                 pass
             await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
 
-    asyncio.create_task(beat())
+    _spawn_retained(beat())
 
 
 def _run_heartbeat_channel(prefix: str) -> str:
@@ -379,4 +393,4 @@ async def _subscribe_control(
             except (ValueError, TypeError):
                 pass  # ignore malformed control messages
 
-    asyncio.create_task(listen())
+    _spawn_retained(listen())
