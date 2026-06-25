@@ -111,7 +111,7 @@ async charge(input: { orderId: string; amountCents: number }) {
   const res = await this.stripe.charge(input);
   if (res.declined) {
     // a deterministic verdict — don't make the engine retry it
-    throw new DurableStepError({ message: 'card declined', code: 'declined', retryable: false });
+    throw Object.assign(new Error('card declined'), { code: 'declined', retryable: false });
   }
   return { chargeId: res.id };
 }
