@@ -39,6 +39,9 @@ export const stepCheckpoints = sqliteTable(
     events: text('events', { mode: 'json' }),
     attempts: integer('attempts').notNull(),
     workerGroup: text('worker_group'),
+    // A ctx.gather/ctx.all fan tags every sibling step with the same group so the dashboard renders
+    // them as one parallel group; the core engine sets it (incl. from a remote worker's recordStep).
+    parallelGroup: text('parallel_group'),
     wakeAt: integer('wake_at'),
     enqueuedAt: integer('enqueued_at'),
     startedAt: integer('started_at').notNull(),

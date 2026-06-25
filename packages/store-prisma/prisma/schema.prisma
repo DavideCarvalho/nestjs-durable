@@ -57,6 +57,7 @@ model DurableStepCheckpoint {
   events      Json?
   attempts    Int
   workerGroup String?  @map("worker_group")
+  parallelGroup String? @map("parallel_group")
   wakeAt      BigInt?  @map("wake_at")
   enqueuedAt  DateTime? @map("enqueued_at")
   startedAt   DateTime @map("started_at")

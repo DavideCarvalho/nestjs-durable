@@ -50,6 +50,7 @@ interface CheckpointRow {
   events: unknown;
   attempts: number;
   workerGroup: string | null;
+  parallelGroup: string | null;
   wakeAt: bigint | null;
   enqueuedAt: Date | null;
   startedAt: Date;
@@ -434,6 +435,7 @@ function toCheckpointData(cp: StepCheckpoint) {
     events: jsonOrNull(cp.events),
     attempts: cp.attempts,
     workerGroup: cp.workerGroup ?? null,
+    parallelGroup: cp.parallelGroup ?? null,
     wakeAt: bigOrNull(cp.wakeAt),
     enqueuedAt: cp.enqueuedAt,
     startedAt: cp.startedAt,
@@ -455,6 +457,7 @@ function fromCheckpointRow(row: CheckpointRow): StepCheckpoint {
     events: (row.events ?? undefined) as StepEvent[] | undefined,
     attempts: row.attempts,
     workerGroup: row.workerGroup ?? undefined,
+    parallelGroup: row.parallelGroup ?? undefined,
     wakeAt: numOrUndef(row.wakeAt),
     enqueuedAt: row.enqueuedAt ?? row.startedAt,
     startedAt: row.startedAt,

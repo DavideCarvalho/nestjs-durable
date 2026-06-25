@@ -98,6 +98,7 @@ export class StepCheckpointEntity {
   events?: unknown;
   attempts!: number;
   workerGroup?: string | null;
+  parallelGroup?: string | null;
   wakeAt?: Date;
   enqueuedAt?: Date;
   startedAt!: Date;
@@ -229,6 +230,9 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       },
       attempts: { type: 'integer', name: col('attempts') },
       workerGroup: { type: 'text', nullable: true, name: col('workerGroup') },
+      // A ctx.gather/ctx.all fan tags every sibling step with the same group so the dashboard renders
+      // them as one parallel group; the core engine sets it (incl. from a remote worker's recordStep).
+      parallelGroup: { type: 'text', nullable: true, name: col('parallelGroup') },
       wakeAt: { type: Date, nullable: true, name: col('wakeAt') },
       enqueuedAt: { type: Date, nullable: true, name: col('enqueuedAt') },
       startedAt: { type: Date, name: col('startedAt') },
