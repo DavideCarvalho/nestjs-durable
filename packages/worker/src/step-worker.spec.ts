@@ -70,6 +70,37 @@ describe('StepWorker.processTask', () => {
     expect(r.events?.[1].status).toBe('ok');
   });
 
+  it('propagates a non-retryable verdict off a thrown error', async () => {
+    const w = new StepWorker();
+    w.register('do', () => {
+      throw Object.assign(new Error('declined'), { retryable: false });
+    });
+    const r = await w.processTask(task());
+    expect(r.status).toBe('failed');
+    expect(r.error?.message).toBe('declined');
+    expect(r.error?.retryable).toBe(false);
+  });
+
+  it('propagates an explicit retryable verdict off a thrown error', async () => {
+    const w = new StepWorker();
+    w.register('do', () => {
+      throw Object.assign(new Error('try again'), { retryable: true });
+    });
+    const r = await w.processTask(task());
+    expect(r.status).toBe('failed');
+    expect(r.error?.retryable).toBe(true);
+  });
+
+  it('leaves retryable unset for a plain thrown error (engine default retries)', async () => {
+    const w = new StepWorker();
+    w.register('do', () => {
+      throw new Error('oops');
+    });
+    const r = await w.processTask(task());
+    expect(r.status).toBe('failed');
+    expect(r.error?.retryable).toBeUndefined();
+  });
+
   it('keeps events the handler logged before it threw', async () => {
     const w = new StepWorker();
     w.register('do', (_input, log) => {

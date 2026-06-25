@@ -127,6 +127,10 @@ export function toError(err: unknown): StepError {
     const out: StepError = { message: err.message || err.name };
     const code = (err as { code?: unknown }).code;
     if (typeof code === 'string' && code) out.code = code;
+    // Carry the handler's `retryable` verdict so the engine's durable retry honours a worker's
+    // "don't retry this" (e.g. a declined card) — mirrors `runStepHandler` in core's protocol.ts.
+    const retryable = (err as { retryable?: unknown }).retryable;
+    if (typeof retryable === 'boolean') out.retryable = retryable;
     if (err.stack) out.stack = err.stack;
     return out;
   }
