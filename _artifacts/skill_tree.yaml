@@ -1,0 +1,30 @@
+# Skill tree for nestjs-durable. Flat structure (no router): 5 core skills, all shipped inside the
+# single primary client-facing package @dudousxd/nestjs-durable (packages/nestjs).
+structure: flat
+router: false
+skills:
+  - name: durable-setup
+    package: "@dudousxd/nestjs-durable"
+    package_dir: packages/nestjs
+    path: packages/nestjs/skills/durable-setup/SKILL.md
+    type: core
+  - name: durable-workflows
+    package: "@dudousxd/nestjs-durable"
+    package_dir: packages/nestjs
+    path: packages/nestjs/skills/durable-workflows/SKILL.md
+    type: core
+  - name: durable-determinism
+    package: "@dudousxd/nestjs-durable"
+    package_dir: packages/nestjs
+    path: packages/nestjs/skills/durable-determinism/SKILL.md
+    type: core
+  - name: durable-signals-and-timers
+    package: "@dudousxd/nestjs-durable"
+    package_dir: packages/nestjs
+    path: packages/nestjs/skills/durable-signals-and-timers/SKILL.md
+    type: core
+  - name: durable-testing
+    package: "@dudousxd/nestjs-durable"
+    package_dir: packages/nestjs
+    path: packages/nestjs/skills/durable-testing/SKILL.md
+    type: core

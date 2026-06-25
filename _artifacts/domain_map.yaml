@@ -1,0 +1,76 @@
+# Domain map for nestjs-durable — produced autonomously (no maintainer interview).
+# One domain map for the whole library; skills scope to the primary client-facing package.
+library: "@dudousxd/nestjs-durable"
+version: 0.22.0
+repo: https://github.com/DavideCarvalho/nestjs-durable
+one_liner: >
+  Durable cross-app workflows for NestJS — checkpoint + deterministic replay, local & remote
+  (polyglot) steps, one orchestrator owning all state.
+
+# The package a consumer actually imports. The monorepo has ~21 packages; the rest are
+# adapters (stores/transports), observability, codegen/cli, or the Python worker SDK.
+primary_packages:
+  - name: "@dudousxd/nestjs-durable"   # packages/nestjs — THE module a NestJS app imports
+    role: "NestJS module, @Workflow/@DurableStep/@Entity decorators, WorkflowService, discovery, recovery"
+    entry_exports:
+      - DurableModule            # forRoot / forRootAsync
+      - DurableWorkerModule      # store-less thin BullMQ worker process
+      - WorkflowService          # start / waitForRun / signal / signalWithStart / publishEvent
+      - EntityService            # signal / getState for durable entities
+      - Workflow                 # @Workflow({ name, version, ... }) class decorator
+      - DurableStep              # @DurableStep('name') method decorator (remote-step handler)
+      - DeadLetter               # @DeadLetter() inline DLQ handler method
+      - OnEvent                  # @OnEvent(...) class decorator (event-triggered start)
+      - Entity / On              # @Entity / @On durable entity
+      - StepInterceptor          # @StepInterceptor() local-step interceptor
+  # Companion peers a consumer always installs alongside (not given their own skill folders):
+  companion_peers:
+    - "@dudousxd/nestjs-durable-core"  # remoteStep, WorkflowCtx, FatalError, InMemoryStateStore
+    - "@dudousxd/nestjs-durable-transport-event-emitter"  # zero-infra default transport
+    - "@dudousxd/nestjs-durable-testing"  # createTestEngine, assertions, failOnce
+
+core_concepts:
+  determinism:
+    rule: "The workflow run(ctx, input) body must be deterministic; ALL side effects live in steps."
+    replay: "Recovery re-runs the body from the top; only a `completed` checkpoint short-circuits."
+    deterministic_sources: [ctx.now, ctx.random, ctx.uuid]  # checkpointed wrappers
+    versioning: "@Workflow({ version }) — a run resumes on the version it started on; register old+new during a breaking change."
+  steps:
+    local: "ctx.step(name, fn, opts?) — runs locally, checkpointed; opts: retries, backoff, backoffMs, jitter, compensate."
+    remote: "remoteStep({ name, input: zod, output: zod, retries }) + ctx.call(step, input, opts?); handled by @DurableStep('name')."
+    fatal: "throw FatalError(message, code) from @dudousxd/nestjs-durable-core to stop retrying."
+    fanout: "Promise.all([ctx.step(...), ctx.step(...)]) — positions taken in the sync prefix."
+  control_flow:
+    signals: "ctx.waitForSignal(token, { timeoutMs? }); deliver via WorkflowService.signal(token, payload)."
+    events: "ctx.waitForEvent(name, { match?, timeoutMs? }); publish via WorkflowService.publishEvent(name, payload)."
+    timers: "ctx.sleep(duration) / ctx.sleepUntil(date) — durable, survive restarts (timer poller resumes)."
+    webhooks: "const wh = ctx.webhook(); hand wh.url to a third party; await wh.wait()."
+    children: "ctx.child / ctx.startChild / ctx.all (wait-all fan-out of child workflows)."
+    triggers: "@Workflow({ onEvent }) / @OnEvent(...) start a fresh run when an event is published."
+  execution_model:
+    start: "WorkflowService.start ENQUEUES (status 'pending') and returns immediately; a worker runs the body."
+    wait: "WorkflowService.waitForRun(runId) resolves once the run settles (terminal or suspended)."
+    worker_api_split: "worker:false instance = enqueue-only (no-op dispatcher, no recovery); worker:true (default) runs+recovers."
+  reliability:
+    recovery: "Self-healing: engine.recoverIncomplete wired automatically; runs on boot AND periodically (leaseMs)."
+    dead_letter: "Exceeded maxRecoveryAttempts -> 'dead'; routed via @DeadLetter() -> @Workflow({ deadLetterWorkflow }) -> module default."
+    saga: "ctx.step(name, fn, { compensate }) — undo callbacks run in reverse on later run failure."
+    singleton: "@Workflow({ singleton: { key, limit } }) — durable FIFO mutex per key."
+    retention: "DurableModule({ retention }) — prune terminal history (MikroORM store supports pruneTerminalRuns)."
+
+transports:
+  - event-emitter  # in-process, zero-infra default (EventEmitterTransport)
+  - bullmq         # Redis, cross-process / Python steps
+  - sqs
+  - db
+stores: [mikro-orm, typeorm, prisma, drizzle]
+
+# What an interactive maintainer interview (skipped — fully autonomous) would have answered:
+gaps:
+  - "Priority ranking of skills could not be confirmed with a maintainer; inferred from README + docs ordering."
+  - "AI-agent-specific failure modes were mined from docs (determinism rule, version skew, start-vs-waitForRun) — not from real agent-failure telemetry."
+  - "`gh search issues` returned no accessible results, so real-world failure modes / FAQ pain points are not incorporated."
+  - "README 'Quick look' shows a `@Step()` method decorator that does NOT exist in source — local steps are `ctx.step(...)`. Skills use the grounded ctx.step form; the README example appears aspirational/stale."
+  - "Stores, transports (bullmq/sqs/db), otel, telescope, dashboard, codegen, cli, admission-redis, and the Python worker SDK are public but NOT given skill folders (out of the focused 1-3 client-facing scope)."
+  - "@dudousxd/nestjs-durable-testing is a separate public package; its helpers are taught inside the nestjs package's testing skill rather than getting their own skills folder."
+  - "Production defaults a maintainer would know (typical leaseMs, retention windows, recommended transport per scale) are documented generically, not tuned per real deployment."
