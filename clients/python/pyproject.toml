@@ -1,6 +1,6 @@
 [project]
 name = "durable-worker"
-version = "0.12.0"
+version = "0.12.1"
 description = "Python worker SDK for nestjs-durable — run durable workflow steps in Python."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -24,7 +24,13 @@ Repository = "https://github.com/DavideCarvalho/nestjs-durable"
 Issues = "https://github.com/DavideCarvalho/nestjs-durable/issues"
 
 [project.optional-dependencies]
-redis = ["bullmq>=2.0"]
+# bullmq 2.18+ hard-pin the vulnerable msgpack==1.1.2 (GHSA-6v7p-g79w-8964,
+# use-after-free in the Unpacker, fixed in 1.2.1). bullmq 2.17.0 keeps a loose
+# `msgpack<2,>=1.0.0`, so capping bullmq <2.18 and requiring msgpack>=1.2.1 lets
+# pip resolve cleanly to the patched msgpack. We only use the stable
+# Queue/Worker/.add API, which is unchanged across 2.17.x. Lift the cap once
+# bullmq relaxes its exact msgpack pin upstream.
+redis = ["bullmq>=2.0,<2.18", "msgpack>=1.2.1"]
 sqs = ["boto3>=1.26"]
 postgres = ["asyncpg>=0.27"]
 mysql = ["aiomysql>=0.2"]
