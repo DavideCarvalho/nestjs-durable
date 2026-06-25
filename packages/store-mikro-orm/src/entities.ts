@@ -61,6 +61,7 @@ export class StepCheckpointEntity {
   events?: unknown;
   attempts!: number;
   workerGroup?: string;
+  parallelGroup?: string;
   wakeAt?: Date;
   enqueuedAt?: Date;
   startedAt!: Date;
@@ -150,6 +151,11 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       events: { type: 'json', nullable: true, fieldName: col('events') },
       attempts: { type: 'integer', fieldName: col('attempts') },
       workerGroup: { type: 'string', nullable: true, fieldName: col('workerGroup') },
+      // A ctx.gather/ctx.all fan tags every sibling step with the same group string so the dashboard
+      // renders them as one "ran in parallel" group. The core engine sets it (incl. from a remote
+      // worker's recordStep), but it was never persisted here — so the fan always rendered as N
+      // sequential singles. Nullable: only fan-out steps carry it.
+      parallelGroup: { type: 'string', nullable: true, fieldName: col('parallelGroup') },
       wakeAt: { type: 'Date', nullable: true, fieldName: col('wakeAt') },
       enqueuedAt: { type: 'Date', nullable: true, fieldName: col('enqueuedAt') },
       startedAt: { type: 'Date', fieldName: col('startedAt') },

@@ -482,6 +482,7 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
   e.events = cp.events ?? null;
   e.attempts = cp.attempts;
   if (cp.workerGroup !== undefined) e.workerGroup = cp.workerGroup;
+  if (cp.parallelGroup !== undefined) e.parallelGroup = cp.parallelGroup;
   if (cp.wakeAt != null) e.wakeAt = new Date(cp.wakeAt);
   e.enqueuedAt = cp.enqueuedAt;
   e.startedAt = cp.startedAt;
@@ -503,6 +504,7 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
     events: (e.events ?? undefined) as StepEvent[] | undefined,
     attempts: e.attempts,
     workerGroup: e.workerGroup ?? undefined,
+    parallelGroup: e.parallelGroup ?? undefined,
     wakeAt: e.wakeAt?.getTime(),
     enqueuedAt: e.enqueuedAt ?? e.startedAt,
     startedAt: e.startedAt,
