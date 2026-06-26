@@ -1,0 +1,5 @@
+---
+"@dudousxd/nestjs-durable-core": minor
+---
+
+Remote child runs inherit their parent's remote group/executor. When a workflow registered via `registerRemote(...)` spawns a child (a `ctx.start_child` / `gather_children`-style fan-out) of a name the host never registered, the engine now resolves that unregistered child against its nearest registered REMOTE ancestor and drives it as a remote run on the same group, reusing the SAME executor instance — so spawning an unregistered child of a remote workflow no longer requires a redundant `registerRemote(childName, ...)` call just to declare routing. An explicit `registerRemote` for the child still takes precedence (inheritance only kicks in for an unregistered child), and a genuinely unregistered run with no remote ancestor still raises the existing skew-protection "not registered" error. Resolution is recomputed per resume (never memoized into the registry, so synthesized children never leak into `latest`/`knownGroups`/`sweepTimeouts`) and only runs for unregistered runs, so registered workflows are unaffected.

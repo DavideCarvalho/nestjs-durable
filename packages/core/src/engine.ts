@@ -127,9 +127,16 @@ interface RegisteredWorkflow {
   onEvent?: string[] | undefined;
   /** Coalesce `onEvent` triggers: debounce (fire once it's quiet) or batch (fire on size/window). */
   eventBatch?: EventBatchConfig | undefined;
-  /** Set for a workflow authored in another SDK (e.g. Python): the engine advances it by dispatching
-   *  workflow tasks to `executor` instead of running `fn` in-process. See {@link WorkflowExecutor}. */
+  /** Set for a workflow advanced by DISPATCH instead of an inline `fn`: a cross-SDK (e.g. Python)
+   *  body via {@link WorkflowEngine.registerRemote}, OR a group-served TS body via
+   *  `register(..., { group, executor })`. The engine hands the run's history to `executor` (which
+   *  dispatches a workflow task to `group`) rather than running `fn` in-process. See
+   *  {@link WorkflowExecutor}. */
   remote?: { group: string; executor: WorkflowExecutor };
+  /** True when `fn` is a real in-process body (`register`), false/absent for a body-less remote whose
+   *  `fn` is the throwing stub (`registerRemote` / a synthesized remote child). Gates
+   *  {@link WorkflowEngine.workflowBody} so an in-app worker only ever gets a runnable body. */
+  hasBody?: boolean | undefined;
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
@@ -482,6 +489,16 @@ export class WorkflowEngine {
    * Register a workflow version. Register multiple versions of the same name to keep in-flight
    * runs working across a breaking change: old runs resume on the version they started on, new
    * runs start on the newest registered version.
+   *
+   * GROUP-SERVED (uniform dispatch, opt-in): pass `{ group, executor }` to have the engine DISPATCH
+   * this workflow's turns to a worker `group` (via `executor.advance`) instead of running `fn`
+   * inline — exactly as {@link registerRemote} does for a cross-SDK (e.g. Python) body, EXCEPT the
+   * body is a TS `fn` the engine retains so an IN-APP worker on `group` can fetch it by name
+   * ({@link workflowBody}) and run it. This is "one app, both roles": the same process owns the
+   * engine AND consumes its own group. Recovery, timers, singleton, cancel and dead-lettering stay
+   * engine concerns, identical to a remote run. OMIT `group`/`executor` (the default) to keep the
+   * inline fast path — `fn` runs in-process and the run pays zero dispatch round-trips. The first
+   * step toward routing every run through a group with no local/remote flag (Phase 3).
    */
   register(
     name: string,
@@ -494,8 +511,22 @@ export class WorkflowEngine {
       validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
       onEvent?: string[] | undefined;
       eventBatch?: EventBatchConfig | undefined;
+      /** Worker group to DISPATCH this workflow's turns to (uniform dispatch). Requires `executor`.
+       *  Omit for the default inline fast path. See the method doc. */
+      group?: string | undefined;
+      /** Advances a turn by dispatching a {@link WorkflowTask} to `group`. Requires `group`. For an
+       *  in-app worker, pair a transport-backed {@link RemoteWorkflowExecutor} (group consumed by a
+       *  worker that calls {@link workflowBody}) so the retained `fn` runs through the transport hop. */
+      executor?: WorkflowExecutor | undefined;
     },
   ): void {
+    // Group-served is all-or-nothing: a `group` with no `executor` (or vice-versa) is a wiring bug —
+    // fail loudly at registration rather than silently falling back to the inline path at dispatch.
+    if ((opts?.group == null) !== (opts?.executor == null)) {
+      throw new Error(
+        `workflow ${name}@${version}: register({ group, executor }) needs BOTH group and executor (or neither)`,
+      );
+    }
     const registered: RegisteredWorkflow = {
       name,
       version,
@@ -507,7 +538,15 @@ export class WorkflowEngine {
       validateInput: opts?.validateInput,
       onEvent: opts?.onEvent,
       eventBatch: opts?.eventBatch,
+      // A real, retained in-process body — so `workflowBody` can hand it to an in-app worker, and so
+      // it is NOT confused with the throwing stub `registerRemote` installs for a body-less remote.
+      hasBody: true,
     };
+    // When group-served, route DISPATCH through the executor (the same `remote` branch a Python
+    // workflow takes); `fn` above stays usable for the in-app worker. Omitted = inline fast path.
+    if (opts?.group != null && opts?.executor != null) {
+      registered.remote = { group: opts.group, executor: opts.executor };
+    }
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
     if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
@@ -516,6 +555,18 @@ export class WorkflowEngine {
       subscribers.add(name);
       this.eventTriggers.set(event, subscribers);
     }
+  }
+
+  /**
+   * The retained in-process body for `name@version`, for an IN-APP worker that consumes this engine's
+   * own group to SERVE a group-served `register(..., { group, executor })` workflow (uniform dispatch):
+   * the worker fetches the body by name when it picks up the dispatched {@link WorkflowTask}, replays
+   * it, and returns the {@link WorkflowDecision}. `undefined` for an unregistered name or a body-less
+   * remote (a `registerRemote` / synthesized child carries only a throwing stub, never handed out).
+   */
+  workflowBody(name: string, version: string): WorkflowFn | undefined {
+    const reg = this.workflows.get(versionKey(name, version));
+    return reg?.hasBody ? reg.fn : undefined;
   }
 
   /**
@@ -681,7 +732,16 @@ export class WorkflowEngine {
     opts?: StartOptions,
   ): Promise<RunResult> {
     const name = workflowName(workflow);
-    const registered = this.latest.get(name);
+    let registered = this.latest.get(name);
+    if (!registered) {
+      // An unregistered run inherits remote routing from its spawning ancestor (see
+      // {@link findInheritedRegistration}): the child of a remote workflow can be started without a
+      // redundant `registerRemote` for its name. The child run doesn't exist yet, but its parent
+      // already wrote the `child:<runId>` waiter BEFORE calling start (the remote `startChild` command
+      // and `ctx.child`/`ctx.all` all put the waiter first), so the ancestor is discoverable now.
+      const ancestor = await this.findRemoteAncestor(runId);
+      if (ancestor) registered = this.synthesizeRemoteChild(name, ancestor.version, ancestor);
+    }
     if (!registered) throw new Error(`workflow ${name} is not registered`);
     // Validate the input up front — a bad payload is rejected before any run is created.
     await registered.validateInput?.(input);
@@ -746,14 +806,108 @@ export class WorkflowEngine {
       return { runId, status: run.status, output: run.output, error: run.error };
     }
     // Pin to the version the run STARTED on — replay is positional, so running a changed
-    // workflow body against old checkpoints would corrupt the run.
-    const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
+    // workflow body against old checkpoints would corrupt the run. The direct lookup is synchronous
+    // (`??` short-circuits): a registered run never awaits here, so its resume timing is unchanged —
+    // only an UNREGISTERED run pays the inheritance walk (see {@link findInheritedRegistration}).
+    const registered =
+      this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+      (await this.findInheritedRegistration(run));
     if (!registered) {
       throw new Error(
         `workflow ${run.workflow}@${run.workflowVersion} is not registered — keep the prior version deployed so in-flight runs can drain (skew protection)`,
       );
     }
     return this.track(this.execute(run, registered.fn));
+  }
+
+  /**
+   * The registration for an UNREGISTERED run, INHERITED from its nearest REMOTE ancestor — or
+   * `undefined` if it has none (the skew-protection error case in {@link resume}). Callers check the
+   * flat registry FIRST (so an explicit `registerRemote(name, …)` ALWAYS wins, and a registered run
+   * never reaches here); this resolves only the new case: a child spawned by a remote workflow (e.g. a
+   * Python `gather_children` / `start_child` fan-out) of a name the host never `registerRemote`-ed. It
+   * is driven as a remote run on the ancestor's group + the SAME executor instance, so the host needs
+   * no redundant registration per child name.
+   *
+   * RECOMPUTED per resume rather than memoized into `this.workflows`: a synthesized child is not a real
+   * registration and must not leak into `latest`, `knownGroups`, or `sweepTimeouts` (which iterate the
+   * registry); recomputing also stays correct if the ancestor's remote registration is re-pointed at a
+   * new executor across a deploy. Only unregistered runs pay it, so registered workflows pay nothing.
+   */
+  private async findInheritedRegistration(
+    run: WorkflowRun,
+  ): Promise<RegisteredWorkflow | undefined> {
+    const ancestor = await this.findRemoteAncestor(run.id);
+    if (!ancestor) return undefined;
+    return this.synthesizeRemoteChild(run.workflow, run.workflowVersion, ancestor);
+  }
+
+  /**
+   * A throwaway {@link RegisteredWorkflow} that routes `name@version` as a remote run on the ancestor's
+   * group via the ancestor's SAME executor instance. The executor is group-scoped (it dispatches a
+   * {@link WorkflowTask} carrying `run.workflow`, and the worker picks the body by name), so reusing it
+   * is correct AND required — a second executor on the same group would race the worker for results.
+   * Only `remote` is inherited; the child gets none of the ancestor's singleton/timeout/validator, so
+   * its identity stays its own.
+   */
+  private synthesizeRemoteChild(
+    name: string,
+    version: string,
+    ancestor: RegisteredWorkflow,
+  ): RegisteredWorkflow {
+    // `ancestor` always carries `remote` (findRemoteAncestor / start only pass a remote registration);
+    // the guard narrows the optional type without an unsafe cast and documents the invariant.
+    const remote = ancestor.remote;
+    if (!remote) throw new Error(`workflow ${ancestor.name} is not a remote workflow`);
+    return {
+      name,
+      version,
+      fn: () => {
+        throw new Error(`workflow ${name} is remote — it has no in-process body`);
+      },
+      remote,
+    };
+  }
+
+  /**
+   * Walk the parent chain of `childRunId` to the nearest ancestor registered as REMOTE, returning its
+   * registration (or `undefined` if there is none). The parent of an awaited child is found via its
+   * live `child:<childId>` signal waiter — present for as long as the parent is suspended awaiting the
+   * child, i.e. throughout the child's executable lifetime (start, every resume, crash recovery, cancel
+   * cascade), which is exactly when we resolve. A registered-but-LOCAL parent stops the walk (an
+   * unregistered child of a TS workflow is a genuine misconfiguration → skew error); only an
+   * unregistered parent keeps walking, so a child of an inherited child still reaches the remote root.
+   * `visited` guards against a pathological cyclic id graph.
+   */
+  private async findRemoteAncestor(
+    childRunId: string,
+    visited = new Set<string>(),
+  ): Promise<RegisteredWorkflow | undefined> {
+    if (visited.has(childRunId)) return undefined;
+    visited.add(childRunId);
+    const parentRunId = await this.findParentRunId(childRunId);
+    if (!parentRunId) return undefined;
+    const parent = await this.store.getRun(parentRunId);
+    if (!parent) return undefined;
+    const parentReg = this.workflows.get(versionKey(parent.workflow, parent.workflowVersion));
+    if (parentReg?.remote) return parentReg;
+    if (parentReg) return undefined;
+    return this.findRemoteAncestor(parent.id, visited);
+  }
+
+  /**
+   * The run that spawned `childRunId`, via its live `child:<childRunId>` signal waiter — every awaited
+   * child (`ctx.child`, `ctx.all`, a remote `start_child`) suspends its parent on exactly this waiter,
+   * and the waiter is written BEFORE the child is started. Only reached for an UNREGISTERED child, so
+   * registered runs never pay the scan; returns `undefined` once the parent has settled the child (the
+   * waiter is consumed), but by then the child is terminal and no longer resolved.
+   */
+  private async findParentRunId(childRunId: string): Promise<string | undefined> {
+    const token = `child:${childRunId}`;
+    for (const waiter of await this.store.listSignalWaiters('child:')) {
+      if (waiter.token === token) return waiter.runId;
+    }
+    return undefined;
   }
 
   /** Track an in-flight execution so {@link drain} can wait for it. */
@@ -1475,7 +1629,11 @@ export class WorkflowEngine {
   }
 
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
-    const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
+    // Synchronous fast path (`??` short-circuits) for registered runs — no extra await, so execution
+    // timing for the common case is unchanged; only an unregistered (inherited-remote) run awaits.
+    const registered =
+      this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+      (await this.findInheritedRegistration(run));
     // Hold the lease for the WHOLE execution — whatever path got us here (leased sweep, a signal, a
     // remote result, a dashboard action). The leased sweeps already own it; the event-driven paths
     // don't, so acquire it here. If another instance owns it, don't double-run. While we run, renew
