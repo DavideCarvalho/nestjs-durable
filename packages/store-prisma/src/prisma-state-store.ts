@@ -225,7 +225,14 @@ export class PrismaStateStore implements StateStore {
   }
 
   async releaseRunLock(runId: string): Promise<void> {
-    await this.db.durableWorkflowRun.update({
+    // Idempotent by design: releasing the lease on a run that no longer exists is a no-op, not an
+    // error. The engine calls this best-effort in a `finally` AFTER the run has settled, so it can
+    // race a concurrent purge/teardown — Prisma's `update({ where: { id } })` would throw P2025
+    // ("No record was found for an update") on that race and, since the call is fire-and-forget on
+    // the engine's terminal path, surface as an unhandled rejection. `updateMany` matches a 0-row
+    // WHERE to an empty result (no throw), mirroring the in-memory store's `if (run)` guard and the
+    // set-where semantics of every sibling adapter (TypeORM/MikroORM/Drizzle).
+    await this.db.durableWorkflowRun.updateMany({
       where: { id: runId },
       data: { lockedBy: null, lockedUntil: null },
     });
