@@ -27,7 +27,7 @@
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@dudousxd/nestjs-durable-testing": "workspace:^",
     "@types/better-sqlite3": "7.6.11",
-    "better-sqlite3": "11.10.0",
+    "better-sqlite3": "12.10.0",
     "drizzle-orm": "0.44.7",
     "typescript": "5.9.3",
     "tsup": "8.3.5"
