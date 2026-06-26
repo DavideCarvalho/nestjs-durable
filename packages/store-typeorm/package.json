@@ -28,7 +28,7 @@
     "@dudousxd/nestjs-durable-testing": "workspace:^",
     "@testcontainers/mysql": "10.18.0",
     "@testcontainers/postgresql": "10.18.0",
-    "better-sqlite3": "11.10.0",
+    "better-sqlite3": "12.10.0",
     "mysql2": "3.11.5",
     "pg": "8.13.1",
     "reflect-metadata": "0.2.2",
