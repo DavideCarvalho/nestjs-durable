@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable",
-  "version": "0.22.1",
+  "version": "0.23.0",
   "description": "Durable workflows for NestJS — module, decorators, discovery and boot recovery",
   "license": "MIT",
   "author": "Davide Carvalho",
