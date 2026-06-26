@@ -6,12 +6,22 @@ import { MikroOrmStateStore } from './mikro-orm-state-store';
 
 const now = new Date('2026-06-26T00:00:00.000Z');
 const run = (over: Partial<WorkflowRun>): WorkflowRun => ({
-  id: 'x', workflow: 'w', workflowVersion: '1', status: 'pending',
-  input: {}, createdAt: now, updatedAt: now, ...over,
+  id: 'x',
+  workflow: 'w',
+  workflowVersion: '1',
+  status: 'pending',
+  input: {},
+  createdAt: now,
+  updatedAt: now,
+  ...over,
 });
 
 async function makeStore() {
-  const orm = await MikroORM.init({ dbName: ':memory:', entities: [...ENTITIES], allowGlobalContext: true });
+  const orm = await MikroORM.init({
+    dbName: ':memory:',
+    entities: [...ENTITIES],
+    allowGlobalContext: true,
+  });
   await orm.schema.create();
   return { store: new MikroOrmStateStore(orm), orm };
 }
@@ -34,7 +44,9 @@ describe('MikroOrmStateStore namespace', () => {
     const { store, orm } = await makeStore();
     await store.createRun(run({ id: 'r', status: 'running', namespace: 'alpha' }));
     await store.createRun(run({ id: 's', status: 'running', namespace: 'beta' }));
-    await store.createRun(run({ id: 't', status: 'suspended', namespace: 'alpha', wakeAt: now.getTime() - 1 }));
+    await store.createRun(
+      run({ id: 't', status: 'suspended', namespace: 'alpha', wakeAt: now.getTime() - 1 }),
+    );
 
     expect((await store.listIncompleteRuns('alpha')).map((r) => r.id)).toEqual(['r']);
     expect((await store.listDueTimers(now.getTime(), 'alpha')).map((r) => r.id)).toEqual(['t']);

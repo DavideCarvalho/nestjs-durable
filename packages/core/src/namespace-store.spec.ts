@@ -20,10 +20,18 @@ describe('InMemoryStateStore namespace filtering', () => {
     await store.createRun({ ...base, id: 'r', status: 'running', namespace: 'alpha' });
     await store.createRun({ ...base, id: 's', status: 'running', namespace: 'beta' });
     await store.createRun({
-      ...base, id: 't', status: 'suspended', namespace: 'alpha', wakeAt: now.getTime() - 1,
+      ...base,
+      id: 't',
+      status: 'suspended',
+      namespace: 'alpha',
+      wakeAt: now.getTime() - 1,
     });
     await store.createRun({
-      ...base, id: 'u', status: 'suspended', namespace: 'beta', wakeAt: now.getTime() - 1,
+      ...base,
+      id: 'u',
+      status: 'suspended',
+      namespace: 'beta',
+      wakeAt: now.getTime() - 1,
     });
 
     expect((await store.listIncompleteRuns('alpha')).map((r) => r.id)).toEqual(['r']);

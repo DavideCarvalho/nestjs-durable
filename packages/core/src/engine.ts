@@ -952,8 +952,16 @@ export class WorkflowEngine {
       if (reg.executionTimeoutMs == null) continue;
       const deadline = now - reg.executionTimeoutMs;
       const inflight = [
-        ...(await this.store.listRuns({ workflow: reg.name, status: 'running', namespace: this.namespace })),
-        ...(await this.store.listRuns({ workflow: reg.name, status: 'suspended', namespace: this.namespace })),
+        ...(await this.store.listRuns({
+          workflow: reg.name,
+          status: 'running',
+          namespace: this.namespace,
+        })),
+        ...(await this.store.listRuns({
+          workflow: reg.name,
+          status: 'suspended',
+          namespace: this.namespace,
+        })),
       ];
       for (const run of inflight) {
         if (run.createdAt.getTime() > deadline) continue;

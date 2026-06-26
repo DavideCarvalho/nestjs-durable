@@ -105,7 +105,9 @@ export class InMemoryStateStore implements StateStore {
 
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     return [...this.runs.values()]
-      .filter((r) => r.status === 'pending' && (namespace === undefined || r.namespace === namespace))
+      .filter(
+        (r) => r.status === 'pending' && (namespace === undefined || r.namespace === namespace),
+      )
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id))
       .slice(0, limit)
       .map((r) => ({ ...r }));

@@ -31,12 +31,24 @@ describe('engine namespace partitioning', () => {
     const store = new InMemoryStateStore();
     const now = new Date();
     await store.createRun({
-      id: 'mine', workflow: 'w', workflowVersion: '1', status: 'pending',
-      input: {}, namespace: 'alpha', createdAt: now, updatedAt: now,
+      id: 'mine',
+      workflow: 'w',
+      workflowVersion: '1',
+      status: 'pending',
+      input: {},
+      namespace: 'alpha',
+      createdAt: now,
+      updatedAt: now,
     });
     await store.createRun({
-      id: 'theirs', workflow: 'w', workflowVersion: '1', status: 'pending',
-      input: {}, namespace: 'beta', createdAt: now, updatedAt: now,
+      id: 'theirs',
+      workflow: 'w',
+      workflowVersion: '1',
+      status: 'pending',
+      input: {},
+      namespace: 'beta',
+      createdAt: now,
+      updatedAt: now,
     });
 
     const ran: string[] = [];
