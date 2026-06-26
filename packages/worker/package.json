@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/durable-worker",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Thin, store-free Node durable worker — replays @Workflow bodies (history → commands) symmetric with the Python durable-worker",
   "license": "MIT",
   "author": "Davide Carvalho",

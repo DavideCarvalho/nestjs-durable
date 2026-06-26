@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.22.1
+
+### Patch Changes
+
+- 5d2add9: Ship TanStack Intent agent skills (SKILL.md) inside the package.
+
 ## 0.22.0
 
 ### Minor Changes
