@@ -58,6 +58,13 @@ export interface WorkflowRun {
   /** Typed, queryable run data (e.g. `{ amount: 200, tier: 'pro' }`) — see {@link RunQuery.attributes}. */
   searchAttributes?: SearchAttributes | undefined;
   /**
+   * The worker-pool partition this run belongs to. Stamped at creation from the creating engine's
+   * `namespace` (default `'default'`). A worker only picks up / recovers / resumes-timers-for /
+   * times-out runs in its own namespace. `undefined` on a run created before this field existed; the
+   * store persists it as `'default'`. Read paths (dashboard, `getRun`) are NOT namespace-scoped.
+   */
+  namespace?: string | undefined;
+  /**
    * Dispatch priority for a REMOTE run (one advanced by a {@link WorkflowExecutor} over a broker):
    * carried onto each {@link WorkflowTask} so an urgent child workflow can jump ahead of enqueued
    * lower-priority ones at the worker. Higher wins; absent = unprioritised. Best-effort ordering, not
@@ -261,13 +268,13 @@ export interface StateStore {
   saveCheckpoint(checkpoint: StepCheckpoint): Promise<void>;
 
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
-  listIncompleteRuns(): Promise<WorkflowRun[]>;
+  listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
 
   /** The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. */
-  listPendingRuns(limit: number): Promise<WorkflowRun[]>;
+  listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]>;
 
   /** Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume. */
-  listDueTimers(nowMs: number): Promise<WorkflowRun[]>;
+  listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]>;
 
   /**
    * Atomically acquire the recovery lease on a run for `owner` until `leaseUntilMs`, but only if
@@ -398,6 +405,8 @@ export interface RunQuery {
    * `workflow`/`status`/`tag` to bound the scan on large stores.
    */
   attributes?: AttributeFilter[] | undefined;
+  /** Restrict to runs in this namespace (exact match), ANDed with the other predicates. */
+  namespace?: string | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
 }
