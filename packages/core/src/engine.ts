@@ -1270,7 +1270,10 @@ export class WorkflowEngine {
         output: payload,
       }),
     );
-    return this.resume(waiter.runId);
+    return this.resume(waiter.runId).catch((err) => {
+      if (err instanceof NamespaceMismatch) return null;
+      throw err;
+    });
   }
 
   /**
@@ -2503,7 +2506,10 @@ export class WorkflowEngine {
       queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
       durationMs: finishedAt.getTime() - startedAt.getTime(),
     });
-    await this.resume(result.runId);
+    await this.resume(result.runId).catch((err) => {
+      if (err instanceof NamespaceMismatch) return null;
+      throw err;
+    });
   }
 
   /**
