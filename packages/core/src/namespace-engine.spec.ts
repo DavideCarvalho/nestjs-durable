@@ -12,8 +12,9 @@ describe('engine namespace partitioning', () => {
     });
     engine.register('w', '1', async () => 'ok');
 
-    const { runId } = await engine.start('w', {});
-    expect((await store.getRun(runId))?.namespace).toBe('alpha');
+    const { runId } = await engine.start('w', {}, 'run-stamp-1');
+    expect(runId).toBe('run-stamp-1');
+    expect((await store.getRun('run-stamp-1'))?.namespace).toBe('alpha');
   });
 
   it('defaults to "default" when no namespace is configured', async () => {
@@ -21,8 +22,9 @@ describe('engine namespace partitioning', () => {
     const engine = new WorkflowEngine({ store, runDispatcher: { dispatch: () => {} } });
     engine.register('w', '1', async () => 'ok');
 
-    const { runId } = await engine.start('w', {});
-    expect((await store.getRun(runId))?.namespace).toBe('default');
+    const { runId } = await engine.start('w', {}, 'run-default-1');
+    expect(runId).toBe('run-default-1');
+    expect((await store.getRun('run-default-1'))?.namespace).toBe('default');
   });
 
   it('a worker only picks up pending runs in its own namespace', async () => {
