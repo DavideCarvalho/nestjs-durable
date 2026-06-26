@@ -283,6 +283,9 @@ importers:
       '@nestjs/testing':
         specifier: 11.1.26
         version: 11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))
+      '@tanstack/intent':
+        specifier: ^0.3.2
+        version: 0.3.2
       class-transformer:
         specifier: 0.5.1
         version: 0.5.1
@@ -2931,6 +2934,10 @@ packages:
   '@tailwindcss/postcss@4.3.0':
     resolution: {integrity: sha512-Jm05Tjx+9yCLGv5qw1c+84Psds8MnyrEQYCB+FFk2lgGiUjlRqdxke4mVTuYrj2xnVZqKim2Apr5ySuQRYAw/w==}
 
+  '@tanstack/intent@0.3.2':
+    resolution: {integrity: sha512-Apyfkf0O8QqHQJjy/cB1QW2GpYTOyjf98nFAaYtzjBc0V5YzJoy0wnmZSLvwBJxE8/Hhy0Bsa+EPt/fdeJyXkw==}
+    hasBin: true
+
   '@tanstack/query-core@5.62.7':
     resolution: {integrity: sha512-fgpfmwatsrUal6V+8EC2cxZIQVl9xvL7qYa03gsdsCy985UTUlS4N+/3hCzwR0PclYDqisca2AqR1BVgJGpUDA==}
 
@@ -4649,6 +4656,9 @@ packages:
     engines: {node: '>=6'}
     hasBin: true
 
+  jsonc-parser@3.3.1:
+    resolution: {integrity: sha512-HUgH65KyejrUFPvHFPbqOY0rsFip3Bo5wb4ngvdi1EpCYWUQDC5V+Y7mZws+DLkr4M//zQJoanu1SP+87Dv1oQ==}
+
   jsonfile@4.0.0:
     resolution: {integrity: sha512-m6F1R3z8jjlf2imQHS2Qez5sjKWQzbuuhuJ/FKYFRZvPE3PuHcSMVZzfsLhGVOkfd20obL5SWEBew5ShlquNxg==}
 
@@ -5884,6 +5894,9 @@ packages:
 
   std-env@3.10.0:
     resolution: {integrity: sha512-5GS12FdOZNliM5mAOxFRg7Ir0pWz8MdpYm6AY6VPkGpbA7ZzmbzNcBJQ0GPvvyWgcY7QAhCgf9Uy89I03faLkg==}
+
+  std-env@4.1.0:
+    resolution: {integrity: sha512-Rq7ybcX2RuC55r9oaPVEW7/xu3tj8u4GeBYHBWCychFtzMIr86A7e3PPEBPT37sHStKX3+TiX/Fr/ACmJLVlLQ==}
 
   streamx@2.28.0:
     resolution: {integrity: sha512-1Yowhzjf0ivGMrTIkY9hav5TxobO9qIVqUE41fiCGMGgc3CLlf4MY+9AHmZqBWgDTue0fY9zWjYFVyf6Diuobw==}
@@ -8587,6 +8600,14 @@ snapshots:
       postcss: 8.5.15
       tailwindcss: 4.3.0
 
+  '@tanstack/intent@0.3.2':
+    dependencies:
+      cac: 6.7.14
+      jsonc-parser: 3.3.1
+      semver: 7.8.4
+      std-env: 4.1.0
+      yaml: 2.9.0
+
   '@tanstack/query-core@5.62.7': {}
 
   '@tanstack/react-query@5.62.7(react@18.3.1)':
@@ -10404,6 +10425,8 @@ snapshots:
 
   json5@2.2.3: {}
 
+  jsonc-parser@3.3.1: {}
+
   jsonfile@4.0.0:
     optionalDependencies:
       graceful-fs: 4.2.11
@@ -11947,6 +11970,8 @@ snapshots:
   standard-as-callback@2.1.0: {}
 
   std-env@3.10.0: {}
+
+  std-env@4.1.0: {}
 
   streamx@2.28.0:
     dependencies:
