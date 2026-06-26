@@ -188,7 +188,7 @@ export class MikroOrmStateStore implements StateStore {
     const em = this.orm.em.fork();
     const rows = await em.find(WorkflowRunEntity, {
       status: { $in: ['running', 'cancelling'] },
-      ...(namespace ? { namespace } : {}),
+      ...(namespace !== undefined ? { namespace } : {}),
     });
     return rows.map(fromRunEntity);
   }
@@ -197,7 +197,7 @@ export class MikroOrmStateStore implements StateStore {
     const em = this.orm.em.fork();
     const rows = await em.find(
       WorkflowRunEntity,
-      { status: 'pending', ...(namespace ? { namespace } : {}) },
+      { status: 'pending', ...(namespace !== undefined ? { namespace } : {}) },
       { orderBy: { createdAt: 'asc' }, limit }, // FIFO dispatch
     );
     return rows.map(fromRunEntity);
@@ -208,7 +208,7 @@ export class MikroOrmStateStore implements StateStore {
     const rows = await em.find(WorkflowRunEntity, {
       status: 'suspended',
       wakeAt: { $ne: null, $lte: new Date(nowMs) },
-      ...(namespace ? { namespace } : {}),
+      ...(namespace !== undefined ? { namespace } : {}),
     });
     return rows.map(fromRunEntity);
   }

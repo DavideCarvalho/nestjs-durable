@@ -115,7 +115,10 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     indexes: [
       { name: 'durable_workflow_runs_status_wake_at_idx', properties: ['status', 'wakeAt'] },
       { name: 'durable_workflow_runs_workflow_status_idx', properties: ['workflow', 'status'] },
-      { name: 'durable_workflow_runs_namespace_status_idx', properties: ['namespace', 'status'] },
+      {
+        name: 'durable_workflow_runs_namespace_status_idx',
+        properties: ['namespace', 'status', 'createdAt'],
+      },
     ],
     properties: {
       id: { type: 'string', primary: true, fieldName: col('id') },
