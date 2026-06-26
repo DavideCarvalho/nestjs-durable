@@ -199,6 +199,13 @@ export interface WorkflowEngineDeps {
   admission?: AdmissionBackend | undefined;
   /** Unique id for this engine instance, used for recovery leases. Defaults to a random id. */
   instanceId?: string | undefined;
+  /**
+   * Worker-pool partition for this engine. Stamped on every run it creates; the poll paths
+   * (`runPending`/`recoverIncomplete`/`resumeDueTimers`/`sweepTimeouts`) only act on runs in this
+   * namespace. Default `'default'` — byte-identical to a single-pool deployment. Set distinct values
+   * to safely share ONE state store across non-interchangeable pools (e.g. local dev vs a cluster).
+   */
+  namespace?: string | undefined;
   /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */
   leaseMs?: number | undefined;
   /**
@@ -278,6 +285,13 @@ export interface WorkflowEngineDeps {
   runDispatcher?: RunDispatcher | undefined;
 }
 
+/** Thrown by {@link WorkflowEngine.resume} when the run belongs to a different namespace. */
+class NamespaceMismatch extends Error {
+  constructor() {
+    super('namespace-mismatch');
+  }
+}
+
 /**
  * The orchestrator. Owns workflow state and replays runs deterministically: each step's
  * result is checkpointed, so on resume a completed step returns its saved output instead of
@@ -291,6 +305,7 @@ export class WorkflowEngine {
   private readonly controlPlane?: ControlPlane | undefined;
   private readonly clock: () => number;
   private readonly instanceId: string;
+  private readonly namespace: string;
   private readonly leaseMs: number;
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly remoteAdvanceSilenceMs?: number | undefined;
@@ -358,6 +373,7 @@ export class WorkflowEngine {
     // instead of waiting for their retry tick. Best-effort (the retry tick remains the guarantee).
     this.admission.onFreed?.((queue) => this.wakeQueueWaiters(queue));
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
+    this.namespace = deps.namespace ?? 'default';
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
@@ -770,6 +786,7 @@ export class WorkflowEngine {
       workflow: name,
       workflowVersion: registered.version,
       status: 'pending',
+      namespace: this.namespace,
       input,
       tags,
       searchAttributes: opts?.searchAttributes,
@@ -804,6 +821,14 @@ export class WorkflowEngine {
     // terminal state. `failed` is intentionally NOT terminal here: retry resumes a failed run.
     if (run.status === 'cancelled' || run.status === 'completed' || run.status === 'dead') {
       return { runId, status: run.status, output: run.output, error: run.error };
+    }
+    // Namespace guard: release the lock and bail when this run belongs to a different worker pool.
+    // Piggybacked on the existing store.getRun above — no extra async step on the happy path.
+    // An undefined namespace (a store adapter that doesn't persist the field yet) is treated as
+    // "belongs to everyone" for back-compat: don't skip it.
+    if (run.namespace !== undefined && run.namespace !== this.namespace) {
+      await this.store.releaseRunLock(runId);
+      throw new NamespaceMismatch();
     }
     // Pin to the version the run STARTED on — replay is positional, so running a changed
     // workflow body against old checkpoints would corrupt the run. The direct lookup is synchronous
@@ -942,8 +967,16 @@ export class WorkflowEngine {
       if (reg.executionTimeoutMs == null) continue;
       const deadline = now - reg.executionTimeoutMs;
       const inflight = [
-        ...(await this.store.listRuns({ workflow: reg.name, status: 'running' })),
-        ...(await this.store.listRuns({ workflow: reg.name, status: 'suspended' })),
+        ...(await this.store.listRuns({
+          workflow: reg.name,
+          status: 'running',
+          namespace: this.namespace,
+        })),
+        ...(await this.store.listRuns({
+          workflow: reg.name,
+          status: 'suspended',
+          namespace: this.namespace,
+        })),
       ];
       for (const run of inflight) {
         if (run.createdAt.getTime() > deadline) continue;
@@ -961,7 +994,7 @@ export class WorkflowEngine {
   async recoverIncomplete(nowMs: number = this.clock()): Promise<RunResult[]> {
     if (this.draining) return [];
     const results: RunResult[] = [];
-    for (const run of await this.store.listIncompleteRuns()) {
+    for (const run of await this.store.listIncompleteRuns(this.namespace)) {
       // A live worker renews its lease, so an acquirable lease means the run is genuinely orphaned
       // (its worker crashed). Skip the ones still owned.
       const acquired = await this.store.tryLockRun(
@@ -1023,7 +1056,7 @@ export class WorkflowEngine {
    * boot. A run still not due re-suspends cheaply without running new work.
    */
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
-    return this.resumeLeased(await this.store.listDueTimers(nowMs), nowMs);
+    return this.resumeLeased(await this.store.listDueTimers(nowMs, this.namespace), nowMs);
   }
 
   /**
@@ -1042,7 +1075,12 @@ export class WorkflowEngine {
       nowMs,
     );
     if (!acquired) return null;
-    return this.resume(runId);
+    // resume() checks the namespace and throws NamespaceMismatch when it doesn't match — no extra
+    // await before the call, so the microtask ordering (critical for cancel-safety) is unchanged.
+    return this.resume(runId).catch((err) => {
+      if (err instanceof NamespaceMismatch) return null;
+      throw err;
+    });
   }
 
   /**
@@ -1087,7 +1125,7 @@ export class WorkflowEngine {
   async runPending(nowMs: number = this.clock()): Promise<RunResult[]> {
     // Oldest-first (FIFO), capped per call so a backlog drains over several polls without one sweep
     // fetching unboundedly. A run not picked up this tick is picked up the next.
-    return this.resumeLeased(await this.store.listPendingRuns(100), nowMs);
+    return this.resumeLeased(await this.store.listPendingRuns(100, this.namespace), nowMs);
   }
 
   /**
@@ -1232,7 +1270,10 @@ export class WorkflowEngine {
         output: payload,
       }),
     );
-    return this.resume(waiter.runId);
+    return this.resume(waiter.runId).catch((err) => {
+      if (err instanceof NamespaceMismatch) return null;
+      throw err;
+    });
   }
 
   /**
@@ -2465,7 +2506,10 @@ export class WorkflowEngine {
       queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
       durationMs: finishedAt.getTime() - startedAt.getTime(),
     });
-    await this.resume(result.runId);
+    await this.resume(result.runId).catch((err) => {
+      if (err instanceof NamespaceMismatch) return null;
+      throw err;
+    });
   }
 
   /**

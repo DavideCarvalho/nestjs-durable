@@ -184,27 +184,31 @@ export class MikroOrmStateStore implements StateStore {
     );
   }
 
-  async listIncompleteRuns(): Promise<WorkflowRun[]> {
+  async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
     const em = this.orm.em.fork();
-    const rows = await em.find(WorkflowRunEntity, { status: { $in: ['running', 'cancelling'] } });
+    const rows = await em.find(WorkflowRunEntity, {
+      status: { $in: ['running', 'cancelling'] },
+      ...(namespace !== undefined ? { namespace } : {}),
+    });
     return rows.map(fromRunEntity);
   }
 
-  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+  async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const em = this.orm.em.fork();
     const rows = await em.find(
       WorkflowRunEntity,
-      { status: 'pending' },
+      { status: 'pending', ...(namespace !== undefined ? { namespace } : {}) },
       { orderBy: { createdAt: 'asc' }, limit }, // FIFO dispatch
     );
     return rows.map(fromRunEntity);
   }
 
-  async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
+  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
     const em = this.orm.em.fork();
     const rows = await em.find(WorkflowRunEntity, {
       status: 'suspended',
       wakeAt: { $ne: null, $lte: new Date(nowMs) },
+      ...(namespace !== undefined ? { namespace } : {}),
     });
     return rows.map(fromRunEntity);
   }
@@ -243,6 +247,7 @@ export class MikroOrmStateStore implements StateStore {
     const em = this.orm.em.fork();
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
+    if (query.namespace !== undefined) where.namespace = query.namespace;
     // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store). When both the
     // single `status` and `statuses` are set, AND them so the narrower set wins.
     if (query.status && query.statuses) {
@@ -442,6 +447,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   e.tags = run.tags ?? null;
   e.searchAttributes = run.searchAttributes ?? null;
   e.priority = run.priority ?? null;
+  e.namespace = run.namespace ?? 'default';
   e.createdAt = run.createdAt;
   e.updatedAt = run.updatedAt;
   return e;
@@ -463,6 +469,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     tags: e.tags ?? undefined,
     searchAttributes: e.searchAttributes ?? undefined,
     priority: e.priority ?? undefined,
+    namespace: e.namespace,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

@@ -151,6 +151,12 @@ export interface DurableModuleOptions {
    */
   autoSchema?: boolean;
   /**
+   * Worker-pool partition for this instance (forwarded to the engine). Default `'default'`. Set a
+   * distinct value to share ONE state store across non-interchangeable pools — e.g. a developer's
+   * local instance vs the deployed cluster. See `WorkflowEngineDeps.namespace`.
+   */
+  namespace?: string;
+  /**
    * Multi-instance recovery lease, in ms — how long an instance owns a run it picked up before
    * another may take over. Defaults to 30000. Set above your longest synchronous run.
    */
@@ -339,6 +345,7 @@ export class DurableModule {
               maxRecoveryAttempts: opts.maxRecoveryAttempts,
               remoteAdvanceSilenceMs: opts.remoteAdvanceSilenceMs,
               instanceId: opts.instanceId,
+              namespace: opts.namespace,
               webhookUrl: opts.webhookUrl,
               traceparent: opts.traceparent,
               context,
