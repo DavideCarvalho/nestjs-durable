@@ -285,6 +285,13 @@ export interface WorkflowEngineDeps {
   runDispatcher?: RunDispatcher | undefined;
 }
 
+/** Thrown by {@link WorkflowEngine.resume} when the run belongs to a different namespace. */
+class NamespaceMismatch extends Error {
+  constructor() {
+    super('namespace-mismatch');
+  }
+}
+
 /**
  * The orchestrator. Owns workflow state and replays runs deterministically: each step's
  * result is checkpointed, so on resume a completed step returns its saved output instead of
@@ -815,6 +822,14 @@ export class WorkflowEngine {
     if (run.status === 'cancelled' || run.status === 'completed' || run.status === 'dead') {
       return { runId, status: run.status, output: run.output, error: run.error };
     }
+    // Namespace guard: release the lock and bail when this run belongs to a different worker pool.
+    // Piggybacked on the existing store.getRun above — no extra async step on the happy path.
+    // An undefined namespace (a store adapter that doesn't persist the field yet) is treated as
+    // "belongs to everyone" for back-compat: don't skip it.
+    if (run.namespace !== undefined && run.namespace !== this.namespace) {
+      await this.store.releaseRunLock(runId);
+      throw new NamespaceMismatch();
+    }
     // Pin to the version the run STARTED on — replay is positional, so running a changed
     // workflow body against old checkpoints would corrupt the run. The direct lookup is synchronous
     // (`??` short-circuits): a registered run never awaits here, so its resume timing is unchanged —
@@ -1060,7 +1075,12 @@ export class WorkflowEngine {
       nowMs,
     );
     if (!acquired) return null;
-    return this.resume(runId);
+    // resume() checks the namespace and throws NamespaceMismatch when it doesn't match — no extra
+    // await before the call, so the microtask ordering (critical for cancel-safety) is unchanged.
+    return this.resume(runId).catch((err) => {
+      if (err instanceof NamespaceMismatch) return null;
+      throw err;
+    });
   }
 
   /**
