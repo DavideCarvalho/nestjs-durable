@@ -149,7 +149,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ${cpCol('runId')} ${str} NOT NULL, ${cpCol('seq')} ${int} NOT NULL,
       ${cpCol('name')} ${str} NOT NULL, ${cpCol('kind')} ${str} NOT NULL, ${cpCol('stepId')} ${str} NOT NULL,
       ${cpCol('status')} ${str} NOT NULL, ${cpCol('input')} ${txt}, ${cpCol('output')} ${txt}, ${cpCol('error')} ${txt}, ${cpCol('events')} ${txt},
-      ${cpCol('attempts')} ${int} NOT NULL, ${cpCol('workerGroup')} ${str},
+      ${cpCol('attempts')} ${int} NOT NULL, ${cpCol('workerGroup')} ${str}, ${cpCol('parallelGroup')} ${str},
       ${cpCol('wakeAt')} ${ts}, ${cpCol('enqueuedAt')} ${ts},
       ${cpCol('startedAt')} ${ts} NOT NULL, ${cpCol('finishedAt')} ${ts} NOT NULL,
       PRIMARY KEY (${cpCol('runId')}, ${cpCol('seq')})
@@ -192,6 +192,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ['error', txt],
       ['events', txt],
       ['workerGroup', str],
+      ['parallelGroup', str],
       ['enqueuedAt', ts],
     ],
   };
