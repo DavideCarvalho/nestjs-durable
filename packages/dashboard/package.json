@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-dashboard",
-  "version": "0.23.0",
+  "version": "0.23.1",
   "description": "Embedded control plane (runs, step timeline, retry/cancel) for nestjs-durable — bundled React SPA served by NestJS",
   "license": "MIT",
   "author": "Davide Carvalho",
