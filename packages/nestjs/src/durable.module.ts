@@ -21,6 +21,7 @@ import { DiscoveryModule, ModuleRef } from '@nestjs/core';
 import type { ContextAccessor } from './context-accessor';
 import { DurableStepRegistrar } from './durable-step.registrar';
 import { EntityService } from './entity';
+import { type DurableInAppWorkerOptions, inAppWorkerProviders } from './in-app-worker';
 import { RetentionPoller } from './retention-poller';
 import { TimerPoller } from './timer-poller';
 import { CONTEXT_ACCESSOR } from './tokens';
@@ -245,6 +246,15 @@ export interface DurableModuleOptions {
   context?: () => Record<string, unknown> | undefined;
   /** Attempts for each saga compensation when a run fails. Default 1 (no retry). Idempotent undos. */
   compensationRetries?: number;
+  /**
+   * Opt into an **in-app worker** (uniform dispatch): the same process runs the engine AND serves its
+   * own discovered `@Workflow`/`@DurableStep` on one default `group`. Each `@Workflow` is registered
+   * GROUP-SERVED — its turns are dispatched to `group` over the transport and replayed by a co-located
+   * worker consumer — instead of run inline. Requires a workflow-task transport (BullMQ). Omit (the
+   * default) to keep every `@Workflow` on the inline fast path with zero dispatch round-trips. See
+   * {@link DurableInAppWorkerOptions}.
+   */
+  inAppWorker?: DurableInAppWorkerOptions;
 }
 
 export interface DurableModuleAsyncOptions {
@@ -357,6 +367,9 @@ export class DurableModule {
         DurableStepRegistrar,
         TimerPoller,
         RetentionPoller,
+        // In-app worker (uniform dispatch, opt-in): inert when `inAppWorker` is unset — the binding
+        // resolves to null and the bootstrap no-ops, so a plain DurableModule is unchanged.
+        ...inAppWorkerProviders(),
       ],
       exports: [
         WorkflowService,

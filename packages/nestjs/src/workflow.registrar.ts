@@ -20,6 +20,7 @@ import { getOnEvents, isDeadLetterHandler } from './decorators';
 import { scanWorkflows } from './discovery-helpers';
 import type { DurableModuleOptions } from './durable.module';
 import { entityConfigFor, getEntityMeta } from './entity';
+import { IN_APP_WORKER_BINDING, type InAppWorkerBinding } from './in-app-worker';
 import { classValidatorInput } from './input-validation';
 import { type DurableStepInterceptor, isStepInterceptor } from './step-interceptor';
 
@@ -41,6 +42,8 @@ export class WorkflowRegistrar
     private readonly engine: WorkflowEngine,
     @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
+    // Group-served binding when the app opted into an in-app worker (uniform dispatch); null = inline.
+    @Inject(IN_APP_WORKER_BINDING) private readonly inAppWorker: InAppWorkerBinding | null,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -110,6 +113,12 @@ export class WorkflowRegistrar
         validateInput,
         onEvent: getOnEvents(meta, workflowCtor),
         eventBatch,
+        // Uniform dispatch (opt-in): when an in-app worker is configured, register the body GROUP-SERVED
+        // so the engine dispatches its turns to the app's own group instead of running it inline; the
+        // co-located worker consumer replays the same body. Absent → the inline fast path (unchanged).
+        ...(this.inAppWorker
+          ? { group: this.inAppWorker.group, executor: this.inAppWorker.executor }
+          : {}),
       });
 
       const inline = this.findDeadLetterHandler(workflow as unknown as object);
