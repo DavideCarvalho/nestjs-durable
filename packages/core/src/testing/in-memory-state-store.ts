@@ -52,7 +52,10 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async createRun(run: WorkflowRun): Promise<void> {
-    this.runs.set(run.id, { ...run });
+    // Normalize undefined namespace to 'default', matching the SQL stores' column DEFAULT 'default'
+    // (interfaces.ts: "the store persists it as 'default'"). This ensures legacy runs (created without
+    // a namespace, e.g. in tests that bypass the engine) are reachable via a namespace='default' filter.
+    this.runs.set(run.id, { ...run, namespace: run.namespace ?? 'default' });
     this.reindexAttributes(run.id, run.searchAttributes);
   }
 
