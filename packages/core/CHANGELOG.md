@@ -1,5 +1,12 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.39.0
+
+### Minor Changes
+
+- e6e2fb2: Remote child runs inherit their parent's remote group/executor. When a workflow registered via `registerRemote(...)` spawns a child (a `ctx.start_child` / `gather_children`-style fan-out) of a name the host never registered, the engine now resolves that unregistered child against its nearest registered REMOTE ancestor and drives it as a remote run on the same group, reusing the SAME executor instance — so spawning an unregistered child of a remote workflow no longer requires a redundant `registerRemote(childName, ...)` call just to declare routing. An explicit `registerRemote` for the child still takes precedence (inheritance only kicks in for an unregistered child), and a genuinely unregistered run with no remote ancestor still raises the existing skew-protection "not registered" error. Resolution is recomputed per resume (never memoized into the registry, so synthesized children never leak into `latest`/`knownGroups`/`sweepTimeouts`) and only runs for unregistered runs, so registered workflows are unaffected.
+- 7f7faa2: Local workflows can opt into being served via a worker group (uniform dispatch, Phase 2). `register(name, version, fn, { group, executor })` now accepts an optional `group` + `executor`: when both are given, the engine DISPATCHES that workflow's turns to the group via `executor.advance` — the same path a cross-SDK (Python) `registerRemote` body takes — instead of running `fn` inline, while RETAINING `fn` so an in-app worker on that group can fetch it by name (`engine.workflowBody(name, version)`) and replay it. This makes "one app, both roles" possible: the same process owns the engine AND consumes its own group, with recovery, durable timers, singleton admission, cancel-cascade and dead-lettering staying engine concerns identical to a remote run (a group-served local registration carries `remote`, so Phase 1's child-inherits-group resolution and `knownGroups` already cover it). It is strictly opt-in and additive: omitting `group`/`executor` keeps the inline fast path with zero dispatch round-trips and no behavior change, and passing only one of the pair throws at registration. This is the first step toward routing every run through a group with no local/remote flag (Phase 3 wires the default group + in-app worker into the NestJS module and flips the default).
+
 ## 0.38.0
 
 ### Minor Changes
