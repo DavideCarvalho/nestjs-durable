@@ -19,6 +19,7 @@ import {
   durableClient,
   runDisplayStatus,
 } from '../client/durable-client';
+import { groupParallelSpans } from '../client/group-parallel-spans';
 import { childRunIdOf } from './child-link';
 import { BoltIcon, CheckIcon, ChildIcon, KIND_LABEL, XIcon, iconFor } from './icons';
 
@@ -283,6 +284,9 @@ export function WorkflowGraph({
   const { nodes, edges } = (() => {
     const gapX = 248;
     const laneY = 150;
+    // Vertical pitch between members of a parallel fan stacked in one column (card height + breathing
+    // room). Parallel siblings sit at the same x, one below the other — they ran concurrently.
+    const FAN_ROW = 96;
     const nodes: Node[] = [];
     const edges: Edge[] = [];
     const live = run.status === 'running' || run.status === 'suspended';
@@ -301,73 +305,118 @@ export function WorkflowGraph({
       style: { stroke: '#818cf8', strokeWidth: 1.5, strokeDasharray: '4 3' },
     });
 
-    // Lay out a run's timeline on lane `depth`, starting at `startX`. Returns the flow's first node
-    // id, its exit connector (the node the next main step links from — a child's exit when an awaited
-    // child rejoined), and the x just past the flow, so the caller can place/rejoin after it.
+    // A connector is a node the *next* step links from, plus whether its source failed (so the edge
+    // tints red). A sequential step exposes one; a parallel fan exposes one per member (fan-in).
+    type FlowConnector = { id: string; failed: boolean };
+
+    // Place one step node at (x, y). When its child is expanded, lay that child's sub-flow out as
+    // lanes below/right (recursing into `layout`). Returns the node id, the connector(s) the next
+    // step links from (this node, or — for an awaited child — the child flow's exits), and the x/y
+    // extents the node (plus any expanded sub-flow) consumed, so the caller can place what follows.
+    function placeStep(
+      s: StepCheckpoint,
+      x: number,
+      y: number,
+      depth: number,
+      prefix: string,
+      laneRun: WorkflowRun,
+    ): { id: string; exits: FlowConnector[]; nextX: number; bottomY: number } {
+      const id = `${prefix}s${s.seq}`;
+      const childId = childRunIdOf(s);
+      const childExpanded = childId !== undefined && resolvedExpanded.has(childId);
+      // Child nodes read the child's real workflow name, not the raw `signal:child:<id>` checkpoint.
+      const displayName =
+        childId !== undefined ? (childData[childId]?.run.workflow ?? 'child workflow') : s.name;
+      const failed = s.status === 'failed';
+      nodes.push({
+        id,
+        type: 'step',
+        draggable: false,
+        position: { x, y },
+        data: {
+          seq: s.seq,
+          name: displayName,
+          kind: s.kind,
+          status: s.status,
+          workerGroup: s.workerGroup,
+          attempts: s.attempts,
+          duration: fmtDuration(s.startedAt, s.finishedAt),
+          subs: subCounts(s),
+          selected: selectedKey === `${s.runId}#${s.seq}`,
+          childRunId: childId,
+          onOpenRun,
+          childExpanded,
+          onToggleChild,
+          depth,
+          step: s,
+          laneRun,
+        } satisfies StepData,
+      });
+
+      const detail = childId !== undefined && childExpanded ? childData[childId] : undefined;
+      if (detail) {
+        const sub = layout(
+          detail.timeline,
+          depth + 1,
+          x + gapX,
+          y + laneY,
+          `${childId}:`,
+          detail.run,
+        );
+        for (const firstId of sub.firstIds) edges.push(branchEdge(id, firstId));
+        // Awaited (`signal:child:`): the parent flow passes through the child and resumes from its
+        // exits. Fire-and-forget (`spawn:`): the child runs below; the parent continues from here.
+        const exits =
+          isAwaitedChild(s.name) && sub.connectors.length > 0 ? sub.connectors : [{ id, failed }];
+        return {
+          id,
+          exits,
+          nextX: Math.max(x + gapX, sub.nextX),
+          bottomY: Math.max(y, sub.bottomY),
+        };
+      }
+      return { id, exits: [{ id, failed }], nextX: x + gapX, bottomY: y };
+    }
+
+    // Lay out a run's timeline starting at (startX, baseY) on lane `depth`. Consecutive steps sharing
+    // a `parallelGroup` (a `ctx.gather`/`ctx.all` fan, e.g. processing's 7 handlers) are STACKED
+    // VERTICALLY in one column — they ran concurrently, so they read as siblings rather than a
+    // misleading parent→child chain. Sequential steps flow left-to-right as before. Returns the
+    // first node id(s) (so the caller can link in — a fan-opening run has several), the exit
+    // connectors (so the next step / `end` can link from), and the x/y extents consumed.
     function layout(
       tl: StepCheckpoint[],
       depth: number,
       startX: number,
+      baseY: number,
       prefix: string,
       laneRun: WorkflowRun,
-    ): { firstId?: string | undefined; connectorId?: string | undefined; nextX: number } {
+    ): { firstIds: string[]; connectors: FlowConnector[]; nextX: number; bottomY: number } {
       let cursorX = startX;
-      let firstId: string | undefined;
-      let connectorId: string | undefined;
-      let prevFailed = false;
-      for (const s of tl) {
-        const id = `${prefix}s${s.seq}`;
-        const childId = childRunIdOf(s);
-        const childExpanded = childId !== undefined && resolvedExpanded.has(childId);
-        // Child nodes read the child's real workflow name, not the raw `signal:child:<id>` checkpoint.
-        const displayName =
-          childId !== undefined ? (childData[childId]?.run.workflow ?? 'child workflow') : s.name;
-        nodes.push({
-          id,
-          type: 'step',
-          draggable: false,
-          position: { x: cursorX, y: depth * laneY },
-          data: {
-            seq: s.seq,
-            name: displayName,
-            kind: s.kind,
-            status: s.status,
-            workerGroup: s.workerGroup,
-            attempts: s.attempts,
-            duration: fmtDuration(s.startedAt, s.finishedAt),
-            subs: subCounts(s),
-            selected: selectedKey === `${s.runId}#${s.seq}`,
-            childRunId: childId,
-            onOpenRun,
-            childExpanded,
-            onToggleChild,
-            depth,
-            step: s,
-            laneRun,
-          } satisfies StepData,
-        });
-        if (firstId === undefined) firstId = id;
-        if (connectorId !== undefined) edges.push(mainEdge(connectorId, id, prevFailed));
-
-        const detail = childId !== undefined && childExpanded ? childData[childId] : undefined;
-        if (detail) {
-          const sub = layout(detail.timeline, depth + 1, cursorX + gapX, `${childId}:`, detail.run);
-          if (sub.firstId !== undefined) edges.push(branchEdge(id, sub.firstId));
-          if (isAwaitedChild(s.name) && sub.connectorId !== undefined) {
-            // Awaited: the parent flow passes through the child and resumes after it.
-            connectorId = sub.connectorId;
-          } else {
-            // Fire-and-forget: the child runs in parallel below; the parent continues from here.
-            connectorId = id;
-          }
-          cursorX = Math.max(cursorX + gapX, sub.nextX);
-        } else {
-          connectorId = id;
-          cursorX += gapX;
+      const firstIds: string[] = [];
+      let connectors: FlowConnector[] = [];
+      let bottomY = baseY;
+      for (const node of groupParallelSpans(tl)) {
+        const members = node.kind === 'single' ? [node.step] : node.steps;
+        const isFirstGroup = firstIds.length === 0;
+        const exits: FlowConnector[] = [];
+        let memberY = baseY;
+        let groupNextX = cursorX;
+        for (const s of members) {
+          const placed = placeStep(s, cursorX, memberY, depth, prefix, laneRun);
+          if (isFirstGroup) firstIds.push(placed.id);
+          // Fan-out / sequential link: every prior exit connects into this member's entry node.
+          for (const from of connectors) edges.push(mainEdge(from.id, placed.id, from.failed));
+          exits.push(...placed.exits);
+          groupNextX = Math.max(groupNextX, placed.nextX);
+          memberY = placed.bottomY + FAN_ROW;
         }
-        prevFailed = s.status === 'failed';
+        connectors = exits;
+        cursorX = groupNextX;
+        // `memberY` overshot one FAN_ROW past the last member — the real bottom is one step back.
+        bottomY = Math.max(bottomY, memberY - FAN_ROW);
       }
-      return { firstId, connectorId, nextX: cursorX };
+      return { firstIds, connectors, nextX: cursorX, bottomY };
     }
 
     const gap0 = 248;
@@ -378,9 +427,10 @@ export function WorkflowGraph({
       draggable: false,
       data: { status: 'running', label: run.workflow } satisfies EndData,
     });
-    const root = layout(timeline, 0, gap0, '', run);
-    if (root.firstId !== undefined) {
-      edges.push({ id: 'start->first', source: 'start', target: root.firstId });
+    const root = layout(timeline, 0, gap0, 0, '', run);
+    // `start` fans out to every first node (a run that opens with a parallel fan has several).
+    for (const firstId of root.firstIds) {
+      edges.push({ id: `start->${firstId}`, source: 'start', target: firstId });
     }
     const shown = runDisplayStatus(run, timeline);
     nodes.push({
@@ -390,13 +440,18 @@ export function WorkflowGraph({
       draggable: false,
       data: { status: shown, label: shown } satisfies EndData,
     });
-    edges.push({
-      id: 'exit->end',
-      source: root.connectorId ?? 'start',
-      target: 'end',
-      animated: live,
-      style: { stroke: live ? 'var(--accent)' : 'var(--line)', strokeWidth: live ? 2 : 1.5 },
-    });
+    // Every exit connector converges on `end` (a run that ENDS in a parallel fan has several).
+    const exitConnectors: FlowConnector[] =
+      root.connectors.length > 0 ? root.connectors : [{ id: 'start', failed: false }];
+    for (const exit of exitConnectors) {
+      edges.push({
+        id: `${exit.id}->end`,
+        source: exit.id,
+        target: 'end',
+        animated: live,
+        style: { stroke: live ? 'var(--accent)' : 'var(--line)', strokeWidth: live ? 2 : 1.5 },
+      });
+    }
 
     return { nodes, edges };
   })();
