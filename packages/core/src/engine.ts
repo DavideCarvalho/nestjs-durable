@@ -127,9 +127,16 @@ interface RegisteredWorkflow {
   onEvent?: string[] | undefined;
   /** Coalesce `onEvent` triggers: debounce (fire once it's quiet) or batch (fire on size/window). */
   eventBatch?: EventBatchConfig | undefined;
-  /** Set for a workflow authored in another SDK (e.g. Python): the engine advances it by dispatching
-   *  workflow tasks to `executor` instead of running `fn` in-process. See {@link WorkflowExecutor}. */
+  /** Set for a workflow advanced by DISPATCH instead of an inline `fn`: a cross-SDK (e.g. Python)
+   *  body via {@link WorkflowEngine.registerRemote}, OR a group-served TS body via
+   *  `register(..., { group, executor })`. The engine hands the run's history to `executor` (which
+   *  dispatches a workflow task to `group`) rather than running `fn` in-process. See
+   *  {@link WorkflowExecutor}. */
   remote?: { group: string; executor: WorkflowExecutor };
+  /** True when `fn` is a real in-process body (`register`), false/absent for a body-less remote whose
+   *  `fn` is the throwing stub (`registerRemote` / a synthesized remote child). Gates
+   *  {@link WorkflowEngine.workflowBody} so an in-app worker only ever gets a runnable body. */
+  hasBody?: boolean | undefined;
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
@@ -482,6 +489,16 @@ export class WorkflowEngine {
    * Register a workflow version. Register multiple versions of the same name to keep in-flight
    * runs working across a breaking change: old runs resume on the version they started on, new
    * runs start on the newest registered version.
+   *
+   * GROUP-SERVED (uniform dispatch, opt-in): pass `{ group, executor }` to have the engine DISPATCH
+   * this workflow's turns to a worker `group` (via `executor.advance`) instead of running `fn`
+   * inline — exactly as {@link registerRemote} does for a cross-SDK (e.g. Python) body, EXCEPT the
+   * body is a TS `fn` the engine retains so an IN-APP worker on `group` can fetch it by name
+   * ({@link workflowBody}) and run it. This is "one app, both roles": the same process owns the
+   * engine AND consumes its own group. Recovery, timers, singleton, cancel and dead-lettering stay
+   * engine concerns, identical to a remote run. OMIT `group`/`executor` (the default) to keep the
+   * inline fast path — `fn` runs in-process and the run pays zero dispatch round-trips. The first
+   * step toward routing every run through a group with no local/remote flag (Phase 3).
    */
   register(
     name: string,
@@ -494,8 +511,22 @@ export class WorkflowEngine {
       validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
       onEvent?: string[] | undefined;
       eventBatch?: EventBatchConfig | undefined;
+      /** Worker group to DISPATCH this workflow's turns to (uniform dispatch). Requires `executor`.
+       *  Omit for the default inline fast path. See the method doc. */
+      group?: string | undefined;
+      /** Advances a turn by dispatching a {@link WorkflowTask} to `group`. Requires `group`. For an
+       *  in-app worker, pair a transport-backed {@link RemoteWorkflowExecutor} (group consumed by a
+       *  worker that calls {@link workflowBody}) so the retained `fn` runs through the transport hop. */
+      executor?: WorkflowExecutor | undefined;
     },
   ): void {
+    // Group-served is all-or-nothing: a `group` with no `executor` (or vice-versa) is a wiring bug —
+    // fail loudly at registration rather than silently falling back to the inline path at dispatch.
+    if ((opts?.group == null) !== (opts?.executor == null)) {
+      throw new Error(
+        `workflow ${name}@${version}: register({ group, executor }) needs BOTH group and executor (or neither)`,
+      );
+    }
     const registered: RegisteredWorkflow = {
       name,
       version,
@@ -507,7 +538,15 @@ export class WorkflowEngine {
       validateInput: opts?.validateInput,
       onEvent: opts?.onEvent,
       eventBatch: opts?.eventBatch,
+      // A real, retained in-process body — so `workflowBody` can hand it to an in-app worker, and so
+      // it is NOT confused with the throwing stub `registerRemote` installs for a body-less remote.
+      hasBody: true,
     };
+    // When group-served, route DISPATCH through the executor (the same `remote` branch a Python
+    // workflow takes); `fn` above stays usable for the in-app worker. Omitted = inline fast path.
+    if (opts?.group != null && opts?.executor != null) {
+      registered.remote = { group: opts.group, executor: opts.executor };
+    }
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
     if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
@@ -516,6 +555,18 @@ export class WorkflowEngine {
       subscribers.add(name);
       this.eventTriggers.set(event, subscribers);
     }
+  }
+
+  /**
+   * The retained in-process body for `name@version`, for an IN-APP worker that consumes this engine's
+   * own group to SERVE a group-served `register(..., { group, executor })` workflow (uniform dispatch):
+   * the worker fetches the body by name when it picks up the dispatched {@link WorkflowTask}, replays
+   * it, and returns the {@link WorkflowDecision}. `undefined` for an unregistered name or a body-less
+   * remote (a `registerRemote` / synthesized child carries only a throwing stub, never handed out).
+   */
+  workflowBody(name: string, version: string): WorkflowFn | undefined {
+    const reg = this.workflows.get(versionKey(name, version));
+    return reg?.hasBody ? reg.fn : undefined;
   }
 
   /**
