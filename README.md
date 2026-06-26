@@ -48,10 +48,8 @@ export const chargeCard = remoteStep({
 // 2. The workflow — linear code; every step is checkpointed
 @Workflow({ name: 'checkout', version: '1' })
 class CheckoutWorkflow {
-  @Step() async reserveStock(ctx: WorkflowCtx, order: Order) { /* local step */ }
-
   async run(ctx: WorkflowCtx, order: Order) {
-    await this.reserveStock(ctx, order);
+    await ctx.step('reserve-stock', async () => { /* local step */ });
     const charge = await ctx.call(chargeCard, { orderId: order.id, amountCents: order.total });
     return charge.chargeId;
   }
