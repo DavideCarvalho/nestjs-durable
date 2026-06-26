@@ -44,6 +44,7 @@ export class WorkflowRunEntity {
   tags?: string[] | null;
   searchAttributes?: Record<string, string | number | boolean> | null;
   priority?: number | null;
+  namespace!: string;
   createdAt!: Date;
   updatedAt!: Date;
 }
@@ -114,6 +115,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     indexes: [
       { name: 'durable_workflow_runs_status_wake_at_idx', properties: ['status', 'wakeAt'] },
       { name: 'durable_workflow_runs_workflow_status_idx', properties: ['workflow', 'status'] },
+      { name: 'durable_workflow_runs_namespace_status_idx', properties: ['namespace', 'status'] },
     ],
     properties: {
       id: { type: 'string', primary: true, fieldName: col('id') },
@@ -130,6 +132,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       tags: { type: 'json', nullable: true, fieldName: col('tags') },
       searchAttributes: { type: 'json', nullable: true, fieldName: col('searchAttributes') },
       priority: { type: 'integer', nullable: true, fieldName: col('priority') },
+      namespace: { type: 'string', default: 'default', fieldName: col('namespace') },
       createdAt: { type: 'Date', fieldName: col('createdAt') },
       updatedAt: { type: 'Date', fieldName: col('updatedAt') },
     },
