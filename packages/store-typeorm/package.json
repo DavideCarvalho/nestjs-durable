@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-store-typeorm",
-  "version": "0.12.2",
+  "version": "0.12.3",
   "description": "TypeORM adapter for the nestjs-durable StateStore",
   "license": "MIT",
   "author": "Davide Carvalho",
