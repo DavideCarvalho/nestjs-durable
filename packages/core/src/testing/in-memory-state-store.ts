@@ -90,23 +90,33 @@ export class InMemoryStateStore implements StateStore {
     this.checkpoints.set(this.key(checkpoint.runId, checkpoint.seq), { ...checkpoint });
   }
 
-  async listIncompleteRuns(): Promise<WorkflowRun[]> {
+  async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
     return [...this.runs.values()]
-      .filter((r) => r.status === 'running' || r.status === 'cancelling')
+      .filter(
+        (r) =>
+          (r.status === 'running' || r.status === 'cancelling') &&
+          (namespace === undefined || r.namespace === namespace),
+      )
       .map((r) => ({ ...r }));
   }
 
-  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+  async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     return [...this.runs.values()]
-      .filter((r) => r.status === 'pending')
+      .filter((r) => r.status === 'pending' && (namespace === undefined || r.namespace === namespace))
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id))
       .slice(0, limit)
       .map((r) => ({ ...r }));
   }
 
-  async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
+  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
     return [...this.runs.values()]
-      .filter((r) => r.status === 'suspended' && r.wakeAt !== undefined && r.wakeAt <= nowMs)
+      .filter(
+        (r) =>
+          r.status === 'suspended' &&
+          r.wakeAt !== undefined &&
+          r.wakeAt <= nowMs &&
+          (namespace === undefined || r.namespace === namespace),
+      )
       .map((r) => ({ ...r }));
   }
 
@@ -227,6 +237,7 @@ export class InMemoryStateStore implements StateStore {
     if (query.status) runs = runs.filter((r) => r.status === query.status);
     if (query.statuses) runs = runs.filter((r) => query.statuses?.includes(r.status));
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));
+    if (query.namespace) runs = runs.filter((r) => r.namespace === query.namespace);
     if (query.attributes?.length) {
       // Pushdown: intersect per-predicate candidate sets from the key-indexed side-table, so we only
       // ever materialize the runs that already satisfy EVERY attribute filter (no full per-run scan).
