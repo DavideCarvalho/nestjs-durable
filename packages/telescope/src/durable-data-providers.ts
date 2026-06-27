@@ -60,6 +60,41 @@ function successRateOf(entries: StorageEntry[]): number {
   return total === 0 ? 1 : completed / total;
 }
 
+/** Run-level lifecycle events — each can legitimately occur at most once per runId. */
+const RUN_LIFECYCLE_EVENTS = new Set([
+  'run.started',
+  'run.completed',
+  'run.failed',
+  'run.suspended',
+]);
+
+/**
+ * Deduplicate run-level lifecycle entries by `${event}:${runId}`, keeping the FIRST occurrence.
+ *
+ * The durable engine emits each run lifecycle event on every pod (1 worker + N api pods) and the
+ * watcher records on each, so a single `run.completed` for a given runId is captured multiple times
+ * with identical content but distinct entry ids / createdAt (±ms) — inflating completed/failed
+ * counts. A given runId can legitimately have at most ONE `run.started` and ONE terminal
+ * `run.completed`/`run.failed`/`run.suspended`, so collapsing by `${event}:${runId}` is provably
+ * safe. Step events and any entry without a run-level event + runId pass through untouched — a step
+ * can legitimately repeat across attempts, and the watcher's step content carries no stepId/attempt
+ * to key on.
+ */
+function dedupeRunEvents(entries: StorageEntry[]): StorageEntry[] {
+  const seen = new Set<string>();
+  const out: StorageEntry[] = [];
+  for (const e of entries) {
+    const c = (e.content ?? {}) as { event?: string; runId?: string };
+    if (c.event && c.runId && RUN_LIFECYCLE_EVENTS.has(c.event)) {
+      const key = `${c.event}:${c.runId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    out.push(e);
+  }
+  return out;
+}
+
 const STATE_CAP = 10_000;
 
 // ─── Existing providers ───────────────────────────────────────────────────────
@@ -98,7 +133,8 @@ export function durableTimeseriesProvider(): DataProvider {
       let completed = 0;
       let failed = 0;
       const failByWorkflow = new Map<string, number>();
-      for (const e of page.data) {
+      // Dedup triplicated lifecycle events (one event recorded on every pod) before counting.
+      for (const e of dedupeRunEvents(page.data)) {
         const c = (e.content ?? {}) as { event?: string; workflow?: string };
         if (c.event === 'run.completed') completed += 1;
         else if (c.event === 'run.failed') {
@@ -205,7 +241,8 @@ export function durableDurationProvider(): DataProvider {
   return {
     name: 'durable.duration',
     async resolve(query, ctx: ExtensionContext) {
-      const entries = await fetchEntries(ctx);
+      // Dedup triplicated lifecycle events so paired durations aren't double-counted.
+      const entries = dedupeRunEvents(await fetchEntries(ctx));
 
       // Index run.started entries by runId for the pairing fallback.
       const startedAt = new Map<string, number>();
@@ -270,7 +307,7 @@ export function durableRunsOverTimeProvider(): DataProvider {
   return {
     name: 'durable.runsOverTime',
     async resolve(query, ctx: ExtensionContext) {
-      const entries = await fetchEntries(ctx);
+      const entries = dedupeRunEvents(await fetchEntries(ctx));
       const n = Number((query as Record<string, unknown>)?.buckets ?? 24);
       const now = Date.now();
 
@@ -319,7 +356,7 @@ export function durableSuccessRateProvider(): DataProvider {
   return {
     name: 'durable.successRate',
     async resolve(query, ctx: ExtensionContext) {
-      const entries = await fetchEntries(ctx);
+      const entries = dedupeRunEvents(await fetchEntries(ctx));
       const windowMs = Number((query as Record<string, unknown>)?.windowMs ?? 24 * 60 * 60 * 1000);
       const now = Date.now();
       const { current, previous } = splitWindows(entries, windowMs, now);
@@ -355,7 +392,7 @@ export function durableThroughputProvider(): DataProvider {
   return {
     name: 'durable.throughput',
     async resolve(query, ctx: ExtensionContext) {
-      const entries = await fetchEntries(ctx);
+      const entries = dedupeRunEvents(await fetchEntries(ctx));
       const windowMs = Number((query as Record<string, unknown>)?.windowMs ?? 24 * 60 * 60 * 1000);
       const now = Date.now();
       const { current, previous } = splitWindows(entries, windowMs, now);
@@ -389,8 +426,9 @@ export function durableThroughputProvider(): DataProvider {
   };
 }
 
-/** Color palette for the state breakdown pie segments. */
-const STATE_BREAKDOWN_PALETTE = ['#34d399', '#fbbf24', '#f59e0b', '#f87171', '#38bdf8', '#a78bfa'];
+// Palette aligned index-for-index with STATE_BREAKDOWN_STATUSES so each status reads with the
+// semantically-correct color: running=cyan, pending=amber, cancelling=orange, completed=green,
+// failed=red, dead=purple.
 const STATE_BREAKDOWN_STATUSES: RunStatus[] = [
   'running',
   'pending',
@@ -398,6 +436,15 @@ const STATE_BREAKDOWN_STATUSES: RunStatus[] = [
   'completed',
   'failed',
   'dead',
+];
+/** Color palette for the state breakdown pie segments (aligned to STATE_BREAKDOWN_STATUSES). */
+const STATE_BREAKDOWN_PALETTE = [
+  '#38bdf8', // running   → cyan/blue
+  '#fbbf24', // pending   → amber
+  '#f59e0b', // cancelling → orange
+  '#34d399', // completed → green
+  '#f87171', // failed    → red
+  '#a78bfa', // dead      → purple
 ];
 
 /**
