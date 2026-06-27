@@ -306,4 +306,55 @@ describe('durableStateBreakdownProvider', () => {
       expect(typeof s.color).toBe('string');
     }
   });
+
+  it('maps completed to green and failed to red (semantically-correct palette)', async () => {
+    const store = {
+      listRuns: async ({ status }: { status?: string }) =>
+        Array.from(
+          { length: status === 'completed' ? 5 : status === 'failed' ? 2 : 0 },
+          () => ({}),
+        ),
+    };
+    const out = (await durableStateBreakdownProvider().resolve({}, ctxWith(store))) as {
+      segments: Array<{ label: string; value: number; color?: string }>;
+    };
+    expect(out.segments.find((s) => s.label === 'completed')?.color).toBe('#34d399');
+    expect(out.segments.find((s) => s.label === 'failed')?.color).toBe('#f87171');
+    expect(out.segments.find((s) => s.label === 'running')?.color).toBe('#38bdf8');
+  });
+});
+
+// ─── triplication dedup ───────────────────────────────────────────────────────
+
+describe('run-level event deduplication', () => {
+  // The durable engine emits each run lifecycle event on every pod (1 worker + 2 api pods), so the
+  // watcher records the same run.completed 3× with identical content but distinct createdAt (±ms).
+  const tripledEntries = [
+    ...Array.from({ length: 3 }, (_, i) => ({
+      content: { event: 'run.completed', runId: 'r1', output: 42, workflow: 'checkout' },
+      createdAt: new Date(Date.now() - i),
+    })),
+    {
+      content: { event: 'run.failed', runId: 'r2', workflow: 'ship' },
+      createdAt: new Date(Date.now()),
+    },
+  ];
+
+  it('throughput counts 3 identical run.completed for the same runId as 1', async () => {
+    const out = (await durableThroughputProvider().resolve(
+      { windowMs: 60 * 60 * 1000 },
+      ctxWithEntries(tripledEntries),
+    )) as { value: number };
+    // 1 completed in a 1h window = 1/hr (not 3/hr).
+    expect(out.value).toBeCloseTo(1, 5);
+  });
+
+  it('successRate treats the triplicated completed + one failed as 1 + 1', async () => {
+    const out = (await durableSuccessRateProvider().resolve(
+      { windowMs: 60 * 60 * 1000 },
+      ctxWithEntries(tripledEntries),
+    )) as { value: number };
+    // 1 completed / (1 completed + 1 failed) = 0.5, not 3/4 = 0.75.
+    expect(out.value).toBeCloseTo(0.5, 5);
+  });
 });
