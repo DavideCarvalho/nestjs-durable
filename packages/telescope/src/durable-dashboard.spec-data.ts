@@ -77,7 +77,10 @@ export function durableDashboard(
           },
           {
             kind: 'table',
-            title: 'Starved worker groups',
+            // Lists ALL worker groups (starved ones sorted first); the Status column
+            // flags STARVED (queued > 0 with zero live workers) vs ok. Titling it
+            // "Starved worker groups" read as if every listed group were starved.
+            title: 'Worker health',
             data: { provider: 'durable.workerHealth' },
             columns: [
               { key: 'group', label: 'Group' },
