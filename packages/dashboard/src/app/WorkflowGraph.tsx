@@ -1,4 +1,4 @@
-import { useQueries } from '@tanstack/react-query';
+import { useQueries, useQueryClient } from '@tanstack/react-query';
 import {
   Background,
   BackgroundVariant,
@@ -33,14 +33,41 @@ function isAwaitedChild(name: string): boolean {
 }
 
 /**
- * Fetch the RunDetail of every expanded child, keyed by run id, so the layout can weave each child's
- * flow in as a lane. We fetch exactly the ids in `expanded` (no reachability walk needed: a child is
- * only toggle-able once its node is visible, i.e. its ancestors are already expanded). The returned
- * map is stable across renders unless the expansion set or a query's loaded state changes — so the
- * downstream layout memo doesn't recompute on every render.
+ * Fetch the RunDetail of every VISIBLE child, keyed by run id, so the layout can weave each expanded
+ * child's flow in as a lane AND read a collapsed child's lone inner step.
+ *
+ * Starting from `seed` (the expanded children + the root-level children), we transitively pull in one
+ * level under every child whose detail is already cached — i.e. the children of every visible child —
+ * because a child node may itself be a single-step wrapper (a `ctx.gather_children` handler) that we
+ * want to render AS its lone step, which needs the child's own detail loaded. The reachable set is
+ * recomputed each render off the live react-query cache (`getQueryData`), so it grows by one level
+ * each time a detail settles and then stabilises once the bounded reachable tree is fully loaded
+ * (same `['run', id]` keys → react-query dedupes → no new fetch → no further re-render). The returned
+ * map is a plain projection of the settled queries.
  */
-function useExpandedChildDetails(expanded: Set<string>): Record<string, RunDetail> {
-  const ids = useMemo(() => [...expanded].sort(), [expanded]);
+function useReachableChildDetails(seed: Set<string>): Record<string, RunDetail> {
+  const queryClient = useQueryClient();
+  // BFS over the already-cached details to expand `seed` by the children one level under every loaded
+  // child. Recomputed each render (cheap; the tree is small): when a parent's detail lands, the next
+  // render discovers its children and adds them to the fetch list.
+  const ids: string[] = (() => {
+    const all = new Set(seed);
+    const queue = [...seed];
+    while (queue.length > 0) {
+      const id = queue.shift();
+      if (id === undefined) continue;
+      const cached = queryClient.getQueryData<RunDetail>(['run', id]);
+      if (cached === undefined) continue;
+      for (const step of cached.timeline) {
+        const childId = childRunIdOf(step);
+        if (childId !== undefined && !all.has(childId)) {
+          all.add(childId);
+          queue.push(childId);
+        }
+      }
+    }
+    return [...all].sort();
+  })();
   const results = useQueries({
     queries: ids.map((id) => ({ queryKey: ['run', id], queryFn: () => durableClient.run(id) })),
   });
@@ -73,6 +100,10 @@ type StepData = {
   onOpenRun?: ((id: string) => void) | undefined;
   /** Whether this child node's sub-flow is currently expanded inline (drives the chevron). */
   childExpanded?: boolean | undefined;
+  /** This node is a single-step child wrapper rendered AS its lone inner step (e.g. a
+   *  `gather_children` handler): it shows the inner step's name/kind/status, hides the inline-expand
+   *  chevron (nothing further to expand), and reads as a plain step — but keeps `child ↗`. */
+  collapsed?: boolean | undefined;
   /** Toggle inline expansion of this child node's sub-flow in the graph. */
   onToggleChild?: ((id: string) => void) | undefined;
   /** Lane depth: 0 = root run, 1 = a child's flow, 2 = a grandchild's, … (tints nested nodes). */
@@ -89,7 +120,11 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   // in-flight: a remote step awaiting its worker (`pending`) or a local step body executing (`running`)
   const pending = data.status === 'pending' || data.status === 'running';
   const isChild = !!data.childRunId;
-  const Icon = isChild ? ChildIcon : iconFor(data.kind);
+  // A collapsed single-step wrapper still carries `childRunId` (for `child ↗`) but reads as a plain
+  // step: it uses its inner step's own icon/label/border and hides the child-workflow chrome.
+  const collapsed = !!data.collapsed;
+  const showChildChrome = isChild && !collapsed;
+  const Icon = showChildChrome ? ChildIcon : iconFor(data.kind);
   // Literal class strings per state (Tailwind can't see interpolated names): failed → red,
   // in-flight → amber, done → emerald.
   const tone = failed
@@ -111,13 +146,13 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
         };
   return (
     <div
-      title={isChild ? KIND_LABEL.child : (KIND_LABEL[data.kind] ?? data.kind)}
+      title={showChildChrome ? KIND_LABEL.child : (KIND_LABEL[data.kind] ?? data.kind)}
       className={`group relative w-[208px] cursor-pointer overflow-hidden rounded-xl border bg-[var(--panel)]/95 shadow-lg backdrop-blur transition-all duration-150 hover:-translate-y-0.5 ${
         data.selected
           ? 'border-emerald-400/60 ring-2 ring-emerald-400/30'
           : failed
             ? 'border-red-500/40 hover:border-red-400/60'
-            : isChild
+            : showChildChrome
               ? 'border-indigo-500/40 hover:border-indigo-400/60'
               : 'border-[var(--line)] hover:border-zinc-600'
       }`}
@@ -148,23 +183,26 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
         <div className="mono mt-1.5 flex items-center gap-1.5 text-[10px] text-zinc-500">
           {isChild ? (
             <span className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={(e) => {
-                  // Expand/collapse the child's flow inline as a lane below; don't open the detail.
-                  e.stopPropagation();
-                  if (data.childRunId) data.onToggleChild?.(data.childRunId);
-                }}
-                title={data.childExpanded ? 'Collapse child flow' : 'Expand child flow inline'}
-                className="grid h-4 w-4 place-items-center rounded border border-indigo-500/30 bg-indigo-500/10 text-indigo-300 transition-colors hover:border-indigo-400/60 hover:bg-indigo-500/20 hover:text-indigo-200"
-              >
-                <span
-                  className="inline-block text-[9px] transition-transform"
-                  style={{ transform: data.childExpanded ? 'rotate(90deg)' : 'rotate(0deg)' }}
+              {/* A collapsed single-step wrapper has nothing further to expand — no chevron. */}
+              {!collapsed && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    // Expand/collapse the child's flow inline as a lane below; don't open the detail.
+                    e.stopPropagation();
+                    if (data.childRunId) data.onToggleChild?.(data.childRunId);
+                  }}
+                  title={data.childExpanded ? 'Collapse child flow' : 'Expand child flow inline'}
+                  className="grid h-4 w-4 place-items-center rounded border border-indigo-500/30 bg-indigo-500/10 text-indigo-300 transition-colors hover:border-indigo-400/60 hover:bg-indigo-500/20 hover:text-indigo-200"
                 >
-                  ▸
-                </span>
-              </button>
+                  <span
+                    className="inline-block text-[9px] transition-transform"
+                    style={{ transform: data.childExpanded ? 'rotate(90deg)' : 'rotate(0deg)' }}
+                  >
+                    ▸
+                  </span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={(e) => {
@@ -267,9 +305,11 @@ export function WorkflowGraph({
   onToggleChild?: ((id: string) => void) | undefined;
 }) {
   const resolvedExpanded = expanded ?? EMPTY_EXPANDED;
-  // Fetch every expanded child (to lay out its sub-flow) plus every root-level child (so even a
-  // collapsed child node reads the child's real workflow name, not the raw `signal:child:<id>`).
-  const childIdsToFetch = useMemo(() => {
+  // Seed: every expanded child (to lay out its sub-flow) plus every root-level child (so even a
+  // collapsed child node reads the child's real workflow name / lone inner step). The hook below
+  // transitively pulls in one level under each of these too, so a child nested inside an expanded
+  // lane also gets its own detail (and thus single-step collapse) without the user expanding it.
+  const seedChildIds = useMemo(() => {
     const ids = new Set(resolvedExpanded);
     for (const step of timeline) {
       const childId = childRunIdOf(step);
@@ -277,7 +317,7 @@ export function WorkflowGraph({
     }
     return ids;
   }, [resolvedExpanded, timeline]);
-  const childData = useExpandedChildDetails(childIdsToFetch);
+  const childData = useReachableChildDetails(seedChildIds);
 
   // Built inline (not memoized): it reads `childData`, a fresh object each render, and the graph is
   // small enough that recomputing is cheap; ReactFlow reconciles nodes/edges by id.
@@ -323,37 +363,56 @@ export function WorkflowGraph({
     ): { id: string; exits: FlowConnector[]; nextX: number; bottomY: number } {
       const id = `${prefix}s${s.seq}`;
       const childId = childRunIdOf(s);
-      const childExpanded = childId !== undefined && resolvedExpanded.has(childId);
-      // Child nodes read the child's real workflow name, not the raw `signal:child:<id>` checkpoint.
-      const displayName =
-        childId !== undefined ? (childData[childId]?.run.workflow ?? 'child workflow') : s.name;
-      const failed = s.status === 'failed';
+      const childDetail = childId !== undefined ? childData[childId] : undefined;
+      // A child run that is a single-step wrapper (e.g. a `ctx.gather_children` handler whose body is
+      // one `handle_<LABEL>` step) collapses to that lone inner step: this node renders AS the step —
+      // its name/kind/status/duration/subs come from the inner step, one level, no nested sub-flow and
+      // no inline-expand chevron. We KEEP `childId` so `child ↗` still opens the child run.
+      const loneChild =
+        childDetail !== undefined && childDetail.timeline.length === 1 && childDetail.timeline[0]
+          ? { step: childDetail.timeline[0], run: childDetail.run }
+          : undefined;
+      const collapsed = loneChild !== undefined;
+      // A collapsed wrapper is never laid out as a sub-flow; only a non-collapsed child can expand.
+      const childExpanded = !collapsed && childId !== undefined && resolvedExpanded.has(childId);
+      // The step this node actually represents (its inner step when collapsed) and the run that step
+      // belongs to — so a node-body click opens the right detail and selection keys off the real step.
+      const bodyStep = loneChild ? loneChild.step : s;
+      const bodyRun = loneChild ? loneChild.run : laneRun;
+      // Non-collapsed child nodes read the child's real workflow name, not the raw `signal:child:<id>`.
+      const displayName = loneChild
+        ? loneChild.step.name
+        : childId !== undefined
+          ? (childDetail?.run.workflow ?? 'child workflow')
+          : s.name;
+      const failed = bodyStep.status === 'failed';
       nodes.push({
         id,
         type: 'step',
         draggable: false,
         position: { x, y },
         data: {
-          seq: s.seq,
+          seq: bodyStep.seq,
           name: displayName,
-          kind: s.kind,
-          status: s.status,
-          workerGroup: s.workerGroup,
-          attempts: s.attempts,
-          duration: fmtDuration(s.startedAt, s.finishedAt),
-          subs: subCounts(s),
-          selected: selectedKey === `${s.runId}#${s.seq}`,
+          kind: bodyStep.kind,
+          status: bodyStep.status,
+          workerGroup: bodyStep.workerGroup,
+          attempts: bodyStep.attempts,
+          duration: fmtDuration(bodyStep.startedAt, bodyStep.finishedAt),
+          subs: subCounts(bodyStep),
+          selected: selectedKey === `${bodyStep.runId}#${bodyStep.seq}`,
           childRunId: childId,
           onOpenRun,
           childExpanded,
           onToggleChild,
+          collapsed,
           depth,
-          step: s,
-          laneRun,
+          step: bodyStep,
+          laneRun: bodyRun,
         } satisfies StepData,
       });
 
-      const detail = childId !== undefined && childExpanded ? childData[childId] : undefined;
+      const detail = childExpanded ? childDetail : undefined;
       if (detail) {
         const sub = layout(
           detail.timeline,
