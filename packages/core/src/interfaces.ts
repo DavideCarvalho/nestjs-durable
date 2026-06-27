@@ -551,8 +551,18 @@ export interface HistoryEvent {
 
 /** A decision the workflow function produced at a `seq` that was not yet in history. */
 export type WorkflowCommand =
-  /** `ctx.call(remoteStep, input)` — dispatch a remote step and await it. */
-  | { kind: 'call'; seq: number; name: string; group: string; input: unknown }
+  /** `ctx.call(remoteStep, input)` — dispatch a remote step and await it. A worker's
+   *  `ctx.gather_calls([...])` fan-out tags every dispatched call with the same `parallelGroup` so the
+   *  dashboard renders the remote steps as one parallel fan (parity with the gathered `recordStep` /
+   *  `startChild` tags). Undefined for a lone sequential `ctx.call`. */
+  | {
+      kind: 'call';
+      seq: number;
+      name: string;
+      group: string;
+      input: unknown;
+      parallelGroup?: string;
+    }
   /** `ctx.step(name, body)` — a LOCAL step the worker already ran this turn; the engine persists its
    *  result so replay returns it instead of re-running (durability for side-effectful work).
    *  `startedAt`/`finishedAt` (epoch ms) carry the step's real wall-clock window so the dashboard

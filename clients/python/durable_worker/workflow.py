@@ -20,8 +20,10 @@ turn, emitting its command. Local steps run inline and record their result (so s
 non-determinism happen once). See docs/plans/2026-06-15-polyglot-workflows-protocol.md.
 
 ``ctx.gather([(name, body), ...])`` runs N local steps CONCURRENTLY (threads) and waits for all;
-``ctx.gather_children(workflow, [inputs])`` does the same with child workflows. Both default to
-``wait_all`` (raise an aggregate ``GatherFailed`` if any item fails) with an opt-in ``fail_fast``.
+``ctx.gather_children(workflow, [inputs])`` does the same with child workflows; and
+``ctx.gather_calls([{name, input, group}, ...])`` dispatches N REMOTE steps in parallel (one run, a
+flat parallel fan — no child runs). All default to ``wait_all`` (raise an aggregate ``GatherFailed``
+if any item fails) with an opt-in ``fail_fast``.
 """
 
 from __future__ import annotations
@@ -457,8 +459,68 @@ class WorkflowContext:
 
         return self._aggregate(histories, lambda _ev: workflow)
 
+    def gather_calls(
+        self,
+        calls: "List[Any]",
+        mode: str = "wait_all",
+    ) -> "List[Any]":
+        """Dispatch N REMOTE steps CONCURRENTLY and wait for ALL their results.
+
+        ``calls`` is a list of ``{"name": str, "input": Any, "group": str}`` dicts (3-tuples
+        ``(name, input, group)`` are accepted too). Reserves a contiguous seq block; on the first turn
+        it emits a ``call`` command for every entry — all stamped with the SAME ``parallelGroup`` — so
+        every remote step dispatches and runs in parallel on the worker pool, then suspends. Each result
+        is checkpointed independently and resumes the run; once ALL calls have resolved it returns their
+        outputs in input order (``wait_all``), or raises :class:`GatherFailed` if any failed.
+
+        ``fail_fast`` raises as soon as a failed call is seen on a resume; sibling in-flight steps are
+        NOT force-cancelled (their eventual results are ignored by the failed run).
+
+        Re-emitting a ``call`` for an already-dispatched-but-pending step is intentional and idempotent
+        on the engine (a step has no terminal history entry until it settles, and the engine skips a
+        re-dispatch when a checkpoint for that seq already exists) — same contract as ``start_child`` /
+        ``gather_children``.
+        """
+        normalized = [_normalize_call(c) for c in calls]
+        seqs = [self._next() for _ in normalized]
+        if not seqs:
+            return []
+        group_tag = f"gather:{seqs[0]}"
+        histories = [
+            self._replay_entry(seq, "call", name)
+            for seq, (name, _input, _group) in zip(seqs, normalized)
+        ]
+
+        # fail_fast: bail the moment any resolved call is a failure.
+        if mode == "fail_fast":
+            for seq, ev in zip(seqs, histories):
+                if ev is not None and ev.get("error") is not None:
+                    return self._aggregate([ev], lambda e: e.get("name"))
+
+        pending = False
+        for seq, (name, input_, call_group), ev in zip(seqs, normalized, histories):
+            if ev is None:
+                self.commands.append(
+                    {"kind": "call", "seq": seq, "name": name, "group": call_group,
+                     "input": input_, "parallelGroup": group_tag}
+                )
+                pending = True
+        if pending:
+            raise _Suspend()
+
+        return self._aggregate(histories, lambda ev: ev.get("name"))
+
 
 WorkflowFn = Callable[..., Any]
+
+
+def _normalize_call(call: Any) -> "tuple":
+    """Coerce a ``gather_calls`` entry into ``(name, input, group)``. Accepts the ``{"name","input",
+    "group"}`` dict form and the 3-tuple ``(name, input, group)`` shorthand."""
+    if isinstance(call, dict):
+        return call["name"], call.get("input"), call["group"]
+    name, input_, group = call
+    return name, input_, group
 
 
 class WorkflowWorker:

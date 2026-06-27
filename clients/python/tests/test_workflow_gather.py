@@ -190,6 +190,99 @@ class GatherChildrenTest(unittest.TestCase):
             ctx.gather_children("handle", [{"p": "A"}])
 
 
+class GatherCallsTest(unittest.TestCase):
+    def _ctx(self, history=None):
+        return WorkflowContext("run1", history or [])
+
+    def test_first_turn_dispatches_all_calls_then_suspends(self):
+        ctx = self._ctx()
+        with self.assertRaises(_Suspend):
+            ctx.gather_calls([
+                {"name": "ingest", "input": {"k": "a"}, "group": "ext"},
+                {"name": "ingest", "input": {"k": "b"}, "group": "ext"},
+                {"name": "ingest", "input": {"k": "c"}, "group": "ext"},
+            ])
+        calls = [c for c in ctx.commands if c["kind"] == "call"]
+        self.assertEqual([c["seq"] for c in calls], [0, 1, 2])
+        self.assertEqual([c["name"] for c in calls], ["ingest", "ingest", "ingest"])
+        self.assertEqual([c["input"]["k"] for c in calls], ["a", "b", "c"])
+        self.assertEqual([c["group"] for c in calls], ["ext", "ext", "ext"])
+        # All share one parallelGroup marker.
+        self.assertEqual(len({c["parallelGroup"] for c in calls}), 1)
+
+    def test_accepts_3_tuple_shorthand(self):
+        ctx = self._ctx()
+        with self.assertRaises(_Suspend):
+            ctx.gather_calls([("ingest", {"k": "a"}, "ext"), ("ingest", {"k": "b"}, "ext")])
+        calls = [c for c in ctx.commands if c["kind"] == "call"]
+        self.assertEqual([c["input"]["k"] for c in calls], ["a", "b"])
+        self.assertEqual([c["group"] for c in calls], ["ext", "ext"])
+
+    def test_suspends_while_any_call_outstanding_reemits_only_missing(self):
+        # seq 0 done, seq 1 still in flight (absent from history) → re-emit ONLY the outstanding call.
+        history = [{"seq": 0, "kind": "call", "name": "ingest", "output": {"r": 1}}]
+        ctx = self._ctx(history)
+        with self.assertRaises(_Suspend):
+            ctx.gather_calls([
+                {"name": "ingest", "input": {"k": "a"}, "group": "ext"},
+                {"name": "ingest", "input": {"k": "b"}, "group": "ext"},
+            ])
+        calls = [c for c in ctx.commands if c["kind"] == "call"]
+        self.assertEqual([c["seq"] for c in calls], [1])  # only the outstanding one re-emitted (idempotent)
+
+    def test_returns_all_outputs_in_input_order_when_all_resolved(self):
+        history = [
+            {"seq": 0, "kind": "call", "name": "ingest", "output": {"r": 1}},
+            {"seq": 1, "kind": "call", "name": "ingest", "output": {"r": 2}},
+        ]
+        ctx = self._ctx(history)
+        out = ctx.gather_calls([
+            {"name": "ingest", "input": {"k": "a"}, "group": "ext"},
+            {"name": "ingest", "input": {"k": "b"}, "group": "ext"},
+        ])
+        self.assertEqual(out, [{"r": 1}, {"r": 2}])
+        self.assertEqual(ctx.commands, [])
+
+    def test_wait_all_aggregates_call_failures(self):
+        history = [
+            {"seq": 0, "kind": "call", "name": "ingest", "output": {"r": 1}},
+            {"seq": 1, "kind": "call", "name": "ingest", "error": {"message": "call boom"}},
+        ]
+        ctx = self._ctx(history)
+        with self.assertRaises(_GF) as cm:
+            ctx.gather_calls([
+                {"name": "ingest", "input": {"k": "a"}, "group": "ext"},
+                {"name": "ingest", "input": {"k": "b"}, "group": "ext"},
+            ])
+        self.assertEqual(len(cm.exception.errors), 1)
+        self.assertEqual(cm.exception.errors[0]["error"]["message"], "call boom")
+
+    def test_fail_fast_raises_on_first_failed_call_seen(self):
+        history = [
+            {"seq": 0, "kind": "call", "name": "ingest", "error": {"message": "boom"}},
+        ]
+        ctx = self._ctx(history)
+        # seq 1 still outstanding, but fail_fast raises immediately on the failed seq 0.
+        with self.assertRaises(_GF):
+            ctx.gather_calls([
+                {"name": "ingest", "input": {"k": "a"}, "group": "ext"},
+                {"name": "ingest", "input": {"k": "b"}, "group": "ext"},
+            ], mode="fail_fast")
+
+    def test_empty_calls_returns_empty(self):
+        ctx = self._ctx()
+        self.assertEqual(ctx.gather_calls([]), [])
+        self.assertEqual(ctx.commands, [])
+
+    def test_wrong_kind_in_history_raises_nondeterminism_error(self):
+        # seq 0 has kind "step" but replay expects kind "call" — must raise NondeterminismError.
+        from durable_worker.workflow import NondeterminismError
+        history = [{"seq": 0, "kind": "step", "name": "ingest", "output": 1}]
+        ctx = self._ctx(history)
+        with self.assertRaises(NondeterminismError):
+            ctx.gather_calls([{"name": "ingest", "input": {"k": "a"}, "group": "ext"}])
+
+
 from durable_worker.workflow import WorkflowWorker  # noqa: E402
 
 
@@ -208,6 +301,61 @@ class GatherProcessTaskTest(unittest.TestCase):
         # The two step commands were still recorded on the failed decision.
         recorded = [c["name"] for c in decision["commands"] if c["kind"] == "recordStep"]
         self.assertEqual(recorded, ["ok", "bad"])
+
+    def test_gather_calls_first_turn_is_a_continue_with_call_commands(self):
+        ww = WorkflowWorker(group="t", auto_register=False)
+
+        @ww.workflow("wf")
+        def wf(ctx, _input):
+            return ctx.gather_calls([
+                {"name": "ingest", "input": {"k": "a"}, "group": "ext"},
+                {"name": "ingest", "input": {"k": "b"}, "group": "ext"},
+            ])
+
+        decision = ww.process_task({"taskId": "t1", "runId": "r1", "workflow": "wf",
+                                    "history": [], "input": None})
+        self.assertEqual(decision["status"], "continue")
+        calls = [c for c in decision["commands"] if c["kind"] == "call"]
+        self.assertEqual([c["seq"] for c in calls], [0, 1])
+        self.assertEqual(len({c["parallelGroup"] for c in calls}), 1)
+
+    def test_gather_calls_resolves_in_order_from_history(self):
+        ww = WorkflowWorker(group="t", auto_register=False)
+
+        @ww.workflow("wf")
+        def wf(ctx, _input):
+            return ctx.gather_calls([
+                {"name": "ingest", "input": {"k": "a"}, "group": "ext"},
+                {"name": "ingest", "input": {"k": "b"}, "group": "ext"},
+            ])
+
+        history = [
+            {"seq": 0, "kind": "call", "name": "ingest", "output": {"r": 1}},
+            {"seq": 1, "kind": "call", "name": "ingest", "output": {"r": 2}},
+        ]
+        decision = ww.process_task({"taskId": "t1", "runId": "r1", "workflow": "wf",
+                                    "history": history, "input": None})
+        self.assertEqual(decision["status"], "completed")
+        self.assertEqual(decision["output"], [{"r": 1}, {"r": 2}])
+
+    def test_gather_calls_failure_becomes_a_failed_decision_with_aggregate(self):
+        ww = WorkflowWorker(group="t", auto_register=False)
+
+        @ww.workflow("wf")
+        def wf(ctx, _input):
+            return ctx.gather_calls([
+                {"name": "ingest", "input": {"k": "a"}, "group": "ext"},
+                {"name": "ingest", "input": {"k": "b"}, "group": "ext"},
+            ])
+
+        history = [
+            {"seq": 0, "kind": "call", "name": "ingest", "output": {"r": 1}},
+            {"seq": 1, "kind": "call", "name": "ingest", "error": {"message": "boom"}},
+        ]
+        decision = ww.process_task({"taskId": "t1", "runId": "r1", "workflow": "wf",
+                                    "history": history, "input": None})
+        self.assertEqual(decision["status"], "failed")
+        self.assertEqual(decision["error"]["errors"][0]["error"]["message"], "boom")
 
     def test_success_replays_deterministically(self):
         ww = WorkflowWorker(group="t", auto_register=False)
