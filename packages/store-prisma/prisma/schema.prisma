@@ -68,9 +68,13 @@ model DurableStepCheckpoint {
 }
 
 model DurableSignalWaiter {
-  token String @id
-  runId String @map("run_id")
-  seq   Int
+  token         String  @id
+  runId         String  @map("run_id")
+  seq           Int
+  // A ctx.gather_children/ctx.all child fan-out threads its group onto each awaited child's waiter so
+  // the resolving `signal:child:` checkpoint carries it and the dashboard renders the fan as one
+  // parallel group. Nullable: only fan-out child waiters carry it.
+  parallelGroup String? @map("parallel_group")
 
   @@map("durable_signal_waiters")
 }

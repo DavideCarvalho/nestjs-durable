@@ -302,18 +302,33 @@ export class TypeOrmStateStore implements StateStore {
   }
 
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
-    await this.waiters().save({ ...waiter });
+    await this.waiters().save({
+      token: waiter.token,
+      runId: waiter.runId,
+      seq: waiter.seq,
+      parallelGroup: waiter.parallelGroup ?? null,
+    });
   }
 
   async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
     const rows = await this.waiters().find({ where: { token: Like(`${prefix}%`) } });
-    return rows.map((e) => ({ token: e.token, runId: e.runId, seq: e.seq }));
+    return rows.map((e) => ({
+      token: e.token,
+      runId: e.runId,
+      seq: e.seq,
+      parallelGroup: e.parallelGroup ?? undefined,
+    }));
   }
 
   async takeSignalWaiter(token: string): Promise<SignalWaiter | null> {
     const e = await this.waiters().findOneBy({ token });
     if (!e) return null;
-    const waiter: SignalWaiter = { token: e.token, runId: e.runId, seq: e.seq };
+    const waiter: SignalWaiter = {
+      token: e.token,
+      runId: e.runId,
+      seq: e.seq,
+      parallelGroup: e.parallelGroup ?? undefined,
+    };
     await this.waiters().delete({ token });
     return waiter;
   }

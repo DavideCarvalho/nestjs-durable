@@ -69,6 +69,10 @@ export const signalWaiters = sqliteTable('durable_signal_waiters', {
   token: text('token').primaryKey(),
   runId: text('run_id').notNull(),
   seq: integer('seq').notNull(),
+  // A ctx.gather_children/ctx.all child fan-out tags every awaited child with the same group; the
+  // engine threads it onto the waiter so the resolving `signal:child:` checkpoint carries it and the
+  // dashboard renders the fan as one parallel group. Nullable: only fan-out child waiters carry it.
+  parallelGroup: text('parallel_group'),
 });
 
 export const bufferedSignals = sqliteTable('durable_buffered_signals', {

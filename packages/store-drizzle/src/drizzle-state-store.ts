@@ -283,10 +283,15 @@ export class DrizzleStateStore implements StateStore {
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
     await this.db
       .insert(signalWaiters)
-      .values(waiter)
+      .values({
+        token: waiter.token,
+        runId: waiter.runId,
+        seq: waiter.seq,
+        parallelGroup: waiter.parallelGroup ?? null,
+      })
       .onConflictDoUpdate({
         target: signalWaiters.token,
-        set: { runId: waiter.runId, seq: waiter.seq },
+        set: { runId: waiter.runId, seq: waiter.seq, parallelGroup: waiter.parallelGroup ?? null },
       });
   }
 
@@ -299,7 +304,12 @@ export class DrizzleStateStore implements StateStore {
     const row = rows[0];
     if (!row) return null;
     await this.db.delete(signalWaiters).where(eq(signalWaiters.token, token));
-    return { token: row.token, runId: row.runId, seq: row.seq };
+    return {
+      token: row.token,
+      runId: row.runId,
+      seq: row.seq,
+      parallelGroup: row.parallelGroup ?? undefined,
+    };
   }
 
   async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
@@ -307,7 +317,12 @@ export class DrizzleStateStore implements StateStore {
       .select()
       .from(signalWaiters)
       .where(like(signalWaiters.token, `${prefix}%`));
-    return rows.map((r) => ({ token: r.token, runId: r.runId, seq: r.seq }));
+    return rows.map((r) => ({
+      token: r.token,
+      runId: r.runId,
+      seq: r.seq,
+      parallelGroup: r.parallelGroup ?? undefined,
+    }));
   }
 
   async bufferSignal(token: string, payload: unknown): Promise<void> {

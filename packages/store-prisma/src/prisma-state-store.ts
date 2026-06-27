@@ -61,6 +61,7 @@ interface WaiterRow {
   token: string;
   runId: string;
   seq: number;
+  parallelGroup: string | null;
 }
 
 interface RunAttributeRow {
@@ -307,8 +308,17 @@ export class PrismaStateStore implements StateStore {
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
     await this.db.durableSignalWaiter.upsert({
       where: { token: waiter.token },
-      create: { ...waiter },
-      update: { runId: waiter.runId, seq: waiter.seq },
+      create: {
+        token: waiter.token,
+        runId: waiter.runId,
+        seq: waiter.seq,
+        parallelGroup: waiter.parallelGroup ?? null,
+      },
+      update: {
+        runId: waiter.runId,
+        seq: waiter.seq,
+        parallelGroup: waiter.parallelGroup ?? null,
+      },
     });
   }
 
@@ -316,14 +326,24 @@ export class PrismaStateStore implements StateStore {
     const row = await this.db.durableSignalWaiter.findUnique({ where: { token } });
     if (!row) return null;
     await this.db.durableSignalWaiter.delete({ where: { token } });
-    return { token: row.token, runId: row.runId, seq: row.seq };
+    return {
+      token: row.token,
+      runId: row.runId,
+      seq: row.seq,
+      parallelGroup: row.parallelGroup ?? undefined,
+    };
   }
 
   async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
     const rows = await this.db.durableSignalWaiter.findMany({
       where: { token: { startsWith: prefix } },
     });
-    return rows.map((r) => ({ token: r.token, runId: r.runId, seq: r.seq }));
+    return rows.map((r) => ({
+      token: r.token,
+      runId: r.runId,
+      seq: r.seq,
+      parallelGroup: r.parallelGroup ?? undefined,
+    }));
   }
 
   async bufferSignal(token: string, payload: unknown): Promise<void> {

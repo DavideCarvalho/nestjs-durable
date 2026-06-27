@@ -78,9 +78,10 @@ model DurableStepCheckpoint {
 }
 
 model DurableSignalWaiter {
-  token String @id
-  runId String @map("run_id")
-  seq   Int
+  token         String  @id
+  runId         String  @map("run_id")
+  seq           Int
+  parallelGroup String? @map("parallel_group")
 
   @@map("durable_signal_waiters")
 }

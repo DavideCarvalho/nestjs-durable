@@ -162,7 +162,8 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       PRIMARY KEY (${attrCol('runId')}, ${attrCol('key')})
     )`,
     `CREATE TABLE IF NOT EXISTS ${waiters} (
-      ${waiterCol('token')} ${str} PRIMARY KEY, ${waiterCol('runId')} ${str} NOT NULL, ${waiterCol('seq')} ${int} NOT NULL
+      ${waiterCol('token')} ${str} PRIMARY KEY, ${waiterCol('runId')} ${str} NOT NULL, ${waiterCol('seq')} ${int} NOT NULL,
+      ${waiterCol('parallelGroup')} ${str}
     )`,
     `CREATE TABLE IF NOT EXISTS ${buffered} (
       ${bufferedId}, ${bufCol('token')} ${str} NOT NULL, ${bufCol('payload')} ${txt}
@@ -195,6 +196,9 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ['parallelGroup', str],
       ['enqueuedAt', ts],
     ],
+    // Back-fill the child-await fan group onto signal-waiter tables that predate it (a remote
+    // `gather_children` fan-out threads its group here so the resolved `signal:child:` checkpoint carries it).
+    durable_signal_waiters: [['parallelGroup', str]],
   };
 
   const runner = dataSource.createQueryRunner();
