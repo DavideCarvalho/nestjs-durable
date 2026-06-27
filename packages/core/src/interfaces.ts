@@ -425,6 +425,15 @@ export interface SignalWaiter {
   token: string;
   runId: string;
   seq: number;
+  /**
+   * The parallel-fan group this waiter belongs to, carried from the awaiting command so the resolving
+   * `signal:<token>` checkpoint (notably `signal:child:<id>` for an awaited child run) can be tagged
+   * with it. A worker's `ctx.gather_children`/`ctx.all` fan-out stamps every `startChild` with the same
+   * group; without threading it through the waiter, the child-await checkpoint comes out untagged and the
+   * dashboard renders the fan as a sequential chain instead of one parallel group. Undefined for an
+   * ordinary (non-fan) signal/child await.
+   */
+  parallelGroup?: string | undefined;
 }
 
 // ---------------------------------------------------------------------------

@@ -1268,6 +1268,11 @@ export class WorkflowEngine {
         name: `signal:${token}`,
         kind: 'signal',
         output: payload,
+        // Carry the awaiting command's fan group (set when a `ctx.gather_children`/`ctx.all` fan-out
+        // registered this waiter) onto the resolving `signal:child:<id>` checkpoint, so the dashboard
+        // groups the child fan-out vertically instead of rendering it as a sequential chain. Undefined
+        // for an ordinary (non-fan) signal/child await.
+        parallelGroup: waiter.parallelGroup,
       }),
     );
     return this.resume(waiter.runId).catch((err) => {
@@ -2084,6 +2089,11 @@ export class WorkflowEngine {
           token: `child:${childId}`,
           runId: run.id,
           seq: cmd.seq,
+          // A `ctx.gather_children`/`ctx.all` fan-out stamps every `startChild` in the fan with the same
+          // group. Thread it onto the waiter so the child's terminal `signal:child:<id>` checkpoint
+          // (written by engine.signal when the child notifies the parent) carries the group and the
+          // dashboard renders the fan as one parallel group. Undefined for a lone (non-fan) child.
+          parallelGroup: cmd.parallelGroup,
         });
         if (!(await this.store.getRun(childId))) {
           queueMicrotask(
