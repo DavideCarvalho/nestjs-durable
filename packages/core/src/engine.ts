@@ -2004,6 +2004,14 @@ export class WorkflowEngine {
           error: cmd.error,
         });
       } else if (cmd.kind === 'call') {
+        // Idempotency (load-bearing for `ctx.gather_calls`): a fan-out re-emits its still-pending
+        // `call` commands on every PARTIAL resume (a sibling settled, but not all). Without this guard
+        // each re-emit would re-persist + re-dispatch an already-in-flight (or already-completed) step,
+        // double-dispatching the worker and resetting attempts. So if a checkpoint for (run.id, seq)
+        // already exists — pending OR terminal — skip the save + dispatch entirely; its result lands
+        // independently via completeRemoteResult (keyed by seq, so concurrent calls never clobber).
+        // Mirrors the `startChild` `getRun(childId)` guard below.
+        if (await this.store.getCheckpoint(run.id, cmd.seq)) continue;
         await this.store.saveCheckpoint(
           stepCheckpoint({
             runId: run.id,
@@ -2017,6 +2025,10 @@ export class WorkflowEngine {
             enqueuedAt: at,
             startedAt: at,
             finishedAt: at,
+            // A `ctx.gather_calls([...])` fan-out stamps every dispatched `call` in the fan with the
+            // same group, so the dashboard renders the remote steps as one parallel fan (parity with
+            // the gathered `recordStep`/`startChild` tags). Undefined for a lone sequential `ctx.call`.
+            parallelGroup: cmd.parallelGroup,
           }),
         );
         await this.pool.dispatch(
