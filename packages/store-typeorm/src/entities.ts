@@ -122,6 +122,7 @@ export class SignalWaiterEntity {
   token!: string;
   runId!: string;
   seq!: number;
+  parallelGroup?: string | null;
 }
 
 export class BufferedSignalEntity {
@@ -261,6 +262,10 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       token: { type: 'text', primary: true, name: col('token') },
       runId: { type: 'text', name: col('runId') },
       seq: { type: 'integer', name: col('seq') },
+      // A ctx.gather_children/ctx.all child fan-out tags every awaited child with the same group; the
+      // engine threads it onto the waiter so the resolving `signal:child:` checkpoint carries it and the
+      // dashboard renders the fan as one parallel group. Nullable: only fan-out child waiters carry it.
+      parallelGroup: { type: 'text', nullable: true, name: col('parallelGroup') },
     },
   });
 

@@ -393,7 +393,12 @@ export class MikroOrmStateStore implements StateStore {
 
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
     const em = this.orm.em.fork();
-    await em.upsert(SignalWaiterEntity, { ...waiter });
+    await em.upsert(SignalWaiterEntity, {
+      token: waiter.token,
+      runId: waiter.runId,
+      seq: waiter.seq,
+      parallelGroup: waiter.parallelGroup ?? null,
+    });
     await em.flush();
   }
 
@@ -401,7 +406,12 @@ export class MikroOrmStateStore implements StateStore {
     const em = this.orm.em.fork();
     const entity = await em.findOne(SignalWaiterEntity, { token });
     if (!entity) return null;
-    const waiter: SignalWaiter = { token: entity.token, runId: entity.runId, seq: entity.seq };
+    const waiter: SignalWaiter = {
+      token: entity.token,
+      runId: entity.runId,
+      seq: entity.seq,
+      parallelGroup: entity.parallelGroup ?? undefined,
+    };
     await em.remove(entity).flush();
     return waiter;
   }
@@ -409,7 +419,12 @@ export class MikroOrmStateStore implements StateStore {
   async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
     const em = this.orm.em.fork();
     const rows = await em.find(SignalWaiterEntity, { token: { $like: `${prefix}%` } });
-    return rows.map((e) => ({ token: e.token, runId: e.runId, seq: e.seq }));
+    return rows.map((e) => ({
+      token: e.token,
+      runId: e.runId,
+      seq: e.seq,
+      parallelGroup: e.parallelGroup ?? undefined,
+    }));
   }
 
   async bufferSignal(token: string, payload: unknown): Promise<void> {

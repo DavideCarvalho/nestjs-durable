@@ -474,7 +474,11 @@ export function createWorkflowCtx(
       pending = true;
       const seq = positions[i] as number;
       const childId = id(i);
-      await store.putSignalWaiter({ token: `child:${childId}`, runId, seq });
+      // Carry the fan `group` onto the waiter too: the child's terminal `signal:child:` checkpoint is
+      // (re)written by engine.signal when the child notifies the parent, OVERWRITING the running
+      // placeholder below at the same seq — so without this the resolved checkpoint would lose the
+      // group and the dashboard would render the resolved fan as a sequential chain.
+      await store.putSignalWaiter({ token: `child:${childId}`, runId, seq, parallelGroup: group });
       if (!(await store.getRun(childId))) host.startChild(name, inputs[i], childId);
       if (!cp) {
         await writeCheckpoint(

@@ -67,7 +67,7 @@ export function instantCheckpoint(p: {
   status?: StepCheckpoint['status'];
   output?: unknown;
   wakeAt?: number;
-  parallelGroup?: string;
+  parallelGroup?: string | undefined;
 }): StepCheckpoint {
   const at = new Date();
   return {
