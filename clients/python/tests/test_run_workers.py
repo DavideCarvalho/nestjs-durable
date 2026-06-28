@@ -25,9 +25,12 @@ class _FakeHandle:
 
 
 def _make_fake_runner(handle, calls, kind):
-    """Return an async fake runner that appends (kind, worker, group) to *calls*."""
+    """Return an async fake runner that appends (kind, worker, group) to *calls*.
 
-    async def runner(worker, *, group, connection, prefix):
+    Accepts ``**_`` so it tolerates the extra keyword args run_workers forwards to the real runners
+    (e.g. ``concurrency`` to the step runner) without each addition breaking the dispatch tests."""
+
+    async def runner(worker, *, group, connection, prefix, **_):
         calls.append((kind, worker, group))
         return handle
 

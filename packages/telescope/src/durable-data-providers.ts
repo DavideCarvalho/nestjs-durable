@@ -1,5 +1,5 @@
 import { STATE_STORE_CANONICAL, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
-import type { RunStatus, StateStore } from '@dudousxd/nestjs-durable-core';
+import type { RunStatus, StateStore, WorkerStatus } from '@dudousxd/nestjs-durable-core';
 import type { DataProvider, ExtensionContext } from '@dudousxd/nestjs-telescope';
 import { TELESCOPE_STORAGE } from '@dudousxd/nestjs-telescope';
 
@@ -222,6 +222,88 @@ export function durableWorkerHealthProvider(): DataProvider {
           liveWorkers: g.liveWorkers.length,
           status: isStarved(g) ? 'STARVED' : 'ok',
         }));
+      return { rows };
+    },
+  };
+}
+
+/** Compact "Nm ago" relative stamp for an epoch-ms instant (worker last-adjust recency). */
+function relAgo(atMs: number): string {
+  const s = Math.max(0, Math.round((Date.now() - atMs) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+/** Render a worker's last limit change as "shrink 8→5 2m ago", or '—' when it never moved. */
+function fmtLastAdjust(a: WorkerStatus['lastAdjust']): string {
+  if (!a) return '—';
+  return `${a.reason} ${a.from}→${a.to} ${relAgo(a.at)}`;
+}
+
+/** Round a 0..100(+) percent to a whole number for table display, or '—' when unmeasured. */
+function fmtPct(n: number | undefined): number | string {
+  return typeof n === 'number' ? Math.round(n) : '—';
+}
+
+/** Round a rate/latency to a whole number for table display, or '—' when unmeasured. */
+function fmtNum(n: number | undefined): number | string {
+  return typeof n === 'number' ? Math.round(n) : '—';
+}
+
+/**
+ * Source D (per-worker): flatten `WorkflowEngine.workerHealth()` to ONE row per live worker, exposing
+ * the live {@link WorkerStatus} each heartbeat now carries (mode/limit/min-max, in-flight saturation,
+ * RAM%/CPU%, throughput, p95, last adjust). A worker from an older SDK with no `status` still renders
+ * — its measured fields fall back to '—', so a mixed fleet stays visible. Rows sort backlog-bearing
+ * groups first, then by group, then instanceId. Empty when the transport can't report health.
+ */
+export function durableWorkerStatusProvider(): DataProvider {
+  return {
+    name: 'durable.workerStatus',
+    async resolve(_query, ctx: ExtensionContext) {
+      const engine = ctx.moduleRef.get(WorkflowEngine, { strict: false }) as WorkflowEngine;
+      const health = await engine.workerHealth();
+      const rows = health
+        .slice()
+        // Groups with a backlog first (the workers worth scrutinising), then by group name.
+        .sort((a, b) => Number(b.depth > 0) - Number(a.depth > 0) || a.group.localeCompare(b.group))
+        .flatMap((group) =>
+          group.liveWorkers
+            .slice()
+            .sort((a, b) => a.instanceId.localeCompare(b.instanceId))
+            .map((worker) => {
+              const status = worker.status;
+              const concurrency = status?.concurrency;
+              const mode = concurrency?.mode ?? '—';
+              const limit = concurrency?.limit ?? '—';
+              const inFlight = status?.inFlight ?? '—';
+              const minMax =
+                concurrency?.mode === 'adaptive'
+                  ? `${concurrency.min ?? 1}–${concurrency.max ?? 32}`
+                  : '—';
+              const saturation =
+                concurrency && status ? `${status.inFlight}/${concurrency.limit}` : '—';
+              return {
+                group: group.group,
+                instanceId: worker.instanceId,
+                mode,
+                limit,
+                minMax,
+                inFlight,
+                saturation,
+                queued: group.depth,
+                rssPct: fmtPct(status?.rssPct),
+                cpuPct: fmtPct(status?.cpuPct),
+                throughputPerMin: fmtNum(status?.throughputPerMin),
+                p95Ms: fmtNum(status?.p95Ms),
+                lastAdjust: fmtLastAdjust(status?.lastAdjust),
+              };
+            }),
+        );
       return { rows };
     },
   };

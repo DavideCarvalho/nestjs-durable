@@ -1,4 +1,5 @@
 import {
+  type ConcurrencyOption,
   DurableWorkerRuntime,
   type RunRedisWorkerOptions,
   type RunningWorker,
@@ -37,10 +38,14 @@ export interface DurableWorkerModuleOptions {
    * How many tasks each group's consumer runs concurrently (BullMQ Worker concurrency). Defaults to 1.
    * Applies to every group unless overridden per-group by {@link concurrencyByGroup}. Raise it so a
    * fanned-out batch (e.g. the N remote steps of a `gather`) runs in parallel instead of serially.
+   *
+   * Pass `'adaptive'` (or `{ mode:'adaptive', ... }`) to let each consumer self-tune its concurrency
+   * (latency gradient + RAM brake + backpressure) and publish a live status on its heartbeat.
    */
-  concurrency?: number;
-  /** Per-group concurrency override, keyed by group name. Falls back to {@link concurrency} (then 1). */
-  concurrencyByGroup?: Record<string, number>;
+  concurrency?: ConcurrencyOption;
+  /** Per-group concurrency override, keyed by group name. Falls back to {@link concurrency} (then 1).
+   *  Each value may itself be `'adaptive'` / `{ mode:'adaptive', ... }`. */
+  concurrencyByGroup?: Record<string, ConcurrencyOption>;
 }
 
 export interface DurableWorkerModuleAsyncOptions {

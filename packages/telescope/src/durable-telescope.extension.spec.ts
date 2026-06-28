@@ -28,6 +28,7 @@ describe('durableTelescopeExtension', () => {
       'durable.throughput',
       'durable.timeseries',
       'durable.workerHealth',
+      'durable.workerStatus',
     ]);
   });
 });

@@ -8,6 +8,7 @@ import {
   durableStateProvider,
   durableSuccessRateProvider,
   durableThroughputProvider,
+  durableWorkerStatusProvider,
 } from './durable-data-providers.js';
 
 // Minimal fake store: only listRuns is exercised.
@@ -356,5 +357,92 @@ describe('run-level event deduplication', () => {
     )) as { value: number };
     // 1 completed / (1 completed + 1 failed) = 0.5, not 3/4 = 0.75.
     expect(out.value).toBeCloseTo(0.5, 5);
+  });
+});
+
+describe('durableWorkerStatusProvider', () => {
+  function ctxWithHealth(health: unknown[]): ExtensionContext {
+    const engine = { workerHealth: async () => health };
+    return {
+      config: {} as ExtensionContext['config'],
+      moduleRef: { get: () => engine } as unknown as ExtensionContext['moduleRef'],
+    };
+  }
+
+  it('flattens one row per live worker and renders adaptive vs. fixed status', async () => {
+    const now = Date.now();
+    const health = [
+      {
+        group: 'pipeline',
+        depth: 7,
+        liveWorkers: [
+          {
+            group: 'pipeline',
+            instanceId: 'host-b:2',
+            lastBeatAt: now,
+            status: {
+              concurrency: { mode: 'adaptive', limit: 5, min: 1, max: 16 },
+              inFlight: 4,
+              rssPct: 62.4,
+              cpuPct: 30.6,
+              throughputPerMin: 120.7,
+              p95Ms: 880.2,
+              lastAdjust: { at: now - 120_000, from: 8, to: 5, reason: 'shrink' },
+            },
+          },
+          // Same group, older SDK worker with no status → graceful '—' fields.
+          { group: 'pipeline', instanceId: 'host-a:1', lastBeatAt: now },
+        ],
+      },
+    ];
+    const out = (await durableWorkerStatusProvider().resolve(undefined, ctxWithHealth(health))) as {
+      rows: Array<Record<string, unknown>>;
+    };
+
+    expect(out.rows).toHaveLength(2);
+    // instanceId-sorted within the group: host-a:1 before host-b:2.
+    expect(out.rows[0]).toMatchObject({
+      group: 'pipeline',
+      instanceId: 'host-a:1',
+      mode: '—',
+      limit: '—',
+      inFlight: '—',
+      saturation: '—',
+      queued: 7,
+      rssPct: '—',
+      lastAdjust: '—',
+    });
+    expect(out.rows[1]).toMatchObject({
+      group: 'pipeline',
+      instanceId: 'host-b:2',
+      mode: 'adaptive',
+      limit: 5,
+      minMax: '1–16',
+      saturation: '4/5',
+      queued: 7,
+      rssPct: 62,
+      cpuPct: 31,
+      throughputPerMin: 121,
+      p95Ms: 880,
+    });
+    expect(out.rows[1].lastAdjust).toMatch(/^shrink 8→5 .*ago$/);
+  });
+
+  it('sorts groups with a backlog ahead of idle groups', async () => {
+    const now = Date.now();
+    const worker = (group: string) => ({
+      group,
+      instanceId: `${group}:1`,
+      lastBeatAt: now,
+      status: { concurrency: { mode: 'fixed', limit: 2 }, inFlight: 0 },
+    });
+    const health = [
+      { group: 'idle', depth: 0, liveWorkers: [worker('idle')] },
+      { group: 'busy', depth: 9, liveWorkers: [worker('busy')] },
+    ];
+    const out = (await durableWorkerStatusProvider().resolve(undefined, ctxWithHealth(health))) as {
+      rows: Array<{ group: string }>;
+    };
+    expect(out.rows.map((r) => r.group)).toEqual(['busy', 'idle']);
   });
 });

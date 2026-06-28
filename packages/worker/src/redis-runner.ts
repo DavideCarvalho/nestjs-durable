@@ -1,5 +1,6 @@
 import { hostname } from 'node:os';
 import type { WorkflowStepEvent } from '@dudousxd/nestjs-durable-core';
+import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency';
 import {
   DEFAULT_PREFIX,
   type DurableWorkerRuntime,
@@ -90,8 +91,13 @@ export interface RunRedisWorkerOptions {
    * How many tasks this worker runs concurrently from its group's queue (BullMQ Worker concurrency).
    * Defaults to 1. Raise it so a fanned-out batch (e.g. the N remote steps of a `gather`) runs in
    * parallel instead of serially. Per process; total parallelism is `concurrency × replicas`.
+   *
+   * Pass `'adaptive'` (or `{ mode:'adaptive', min, max, start, ramCeilingPct, cpuCeilingPct, tickMs }`)
+   * to let an {@link AdaptiveController} self-tune the limit from a latency gradient, a RAM hard brake
+   * and an error/stall backpressure signal. A live status snapshot rides the worker heartbeat in both
+   * modes (fixed workers report inFlight/RSS/throughput/p95 too).
    */
-  concurrency?: number;
+  concurrency?: ConcurrencyOption;
   /**
    * Injection seam for tests: supply fake `Worker`/`Queue`/`Redis` ctors instead of lazily importing
    * the real `bullmq`/`ioredis`. Production omits this and the runner imports the real peers.
@@ -105,7 +111,11 @@ export interface RunnerDeps {
     name: string,
     processor: (job: { data: unknown }) => Promise<unknown>,
     opts: Record<string, unknown>,
-  ) => { close(): Promise<void> };
+  ) => {
+    close(): Promise<void>;
+    /** BullMQ exposes a settable `concurrency` — the adaptive controller writes it on each adjust. */
+    concurrency?: number;
+  };
   Queue: new (
     name: string,
     opts: Record<string, unknown>,
@@ -201,6 +211,19 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
     void stepEvents.add('stepEvent', event, jobOpts).catch(() => {});
   };
 
+  // The concurrency controller: tracks inFlight + a rolling window of completions, snapshots a live
+  // status for the heartbeat, and (adaptive mode) re-tunes the live limit. `apply` writes the BullMQ
+  // Worker's settable `concurrency`; the Worker is created below with the controller's initial limit.
+  // A holder lets `apply` reference the Worker before it's constructed (controller never calls back
+  // before `start()`), keeping `worker` a `const`.
+  const workerRef: { current?: InstanceType<RunnerDeps['Worker']> } = {};
+  const controller = new AdaptiveController({
+    ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
+    apply: (limit) => {
+      if (workerRef.current) workerRef.current.concurrency = limit;
+    },
+  });
+
   const processJob = async (job: { data: unknown }): Promise<void> => {
     const task = job.data as Parameters<DurableWorkerRuntime['handleTask']>[0];
     // While replaying a WORKFLOW turn, beat run-scoped liveness so the engine's heartbeat-rearmed
@@ -210,6 +233,9 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       isWorkflowTask(task) && heartbeatClient
         ? startRunHeartbeat(heartbeatClient, prefix, group, task.runId)
         : () => {};
+    const startedAt = Date.now();
+    controller.onStart();
+    let ok = false;
     try {
       // `handleTask` is async; awaiting it keeps the event loop free (step bodies await), so the job
       // lock can renew and the worker's heartbeat keeps stamping — no stall, no redeliver.
@@ -219,7 +245,9 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       } else {
         await results.add('result', out.result, jobOpts);
       }
+      ok = true;
     } finally {
+      controller.onSettle(Date.now() - startedAt, ok);
       // Stop the run-scoped beat the moment the turn settles (success OR failure).
       stopBeat();
     }
@@ -228,8 +256,11 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   const worker = new deps.Worker(tasksName(prefix, group), processJob, {
     connection: workerConnection(connection),
     lockDuration,
-    ...(options.concurrency != null ? { concurrency: options.concurrency } : {}),
+    concurrency: controller.initialLimit,
   });
+  workerRef.current = worker;
+  // Run the control loop (a no-op-on-limit timer for a fixed worker, an AIMD loop for an adaptive one).
+  controller.start();
 
   // --- best-effort pub/sub control channel + worker-liveness heartbeat (mirror the Python SDK) ---
   let controlSub: RedisSubClient | undefined;
@@ -254,9 +285,10 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       heartbeatClient = base;
       const key = workerHeartbeatKey(prefix, group, instanceId);
       const beat = () => {
-        void heartbeatClient
-          ?.set(key, String(Date.now()), 'EX', WORKER_HEARTBEAT_TTL_SECONDS)
-          .catch(() => {});
+        // The heartbeat value is now `{ts,status}` JSON (was a bare ms timestamp) — readers accept
+        // both. The status is the controller's live snapshot, refreshed cheaply on every beat.
+        const value = JSON.stringify({ ts: Date.now(), status: controller.snapshot() });
+        void heartbeatClient?.set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS).catch(() => {});
       };
       beat(); // fire immediately so a fresh worker is visible without waiting a full interval
       heartbeatTimer = setInterval(beat, WORKER_HEARTBEAT_INTERVAL_MS);
@@ -271,6 +303,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   return {
     async close(): Promise<void> {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
+      controller.stop();
       await worker.close();
       await Promise.all([decisions.close(), results.close(), stepEvents.close()]);
       controlSub?.disconnect();

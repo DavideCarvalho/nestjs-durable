@@ -18,6 +18,7 @@ import socket
 import time
 from typing import Any, Callable, Dict, Optional
 
+from .adaptive import AdaptiveController, resolve_concurrency
 from .cancellation import CancellationRegistry
 from .worker import Worker
 
@@ -88,11 +89,29 @@ async def _verify_connection(connection: str) -> None:
                 pass
 
 
-async def _start_heartbeat(connection: str, prefix: str, group: str) -> None:
+def _heartbeat_value(controller: Optional[AdaptiveController]) -> str:
+    """The heartbeat key's value: JSON ``{"ts": <epochMs>, "status": <WorkerStatus>}``.
+
+    ``ts`` is epoch MILLISECONDS (not seconds — readers normalize seconds→ms only as a legacy
+    fallback). ``status`` is the controller's live snapshot when one is wired (it always is for step
+    workers, omitted for the workflow worker). Readers accept both this JSON form and the legacy bare
+    number, so emitting JSON stays backward-compatible."""
+    payload: Dict[str, Any] = {"ts": int(time.time() * 1000)}
+    if controller is not None:
+        payload["status"] = controller.snapshot()
+    return json.dumps(payload)
+
+
+async def _start_heartbeat(
+    connection: str, prefix: str, group: str, controller: Optional[AdaptiveController] = None
+) -> None:
     """Spawn a background task that refreshes the worker's TTL'd heartbeat key. Best-effort: a failed
     refresh is swallowed (the key then expires and the gap is itself the signal) and the whole thing
     is a no-op when redis isn't available. The SET round-trips to Redis, so the heartbeat doubles as
-    an ongoing connectivity probe — if Redis drops, the key stops refreshing and expires."""
+    an ongoing connectivity probe — if Redis drops, the key stops refreshing and expires.
+
+    When a ``controller`` is supplied the value carries the live ``WorkerStatus`` snapshot, refreshed
+    on every beat (cheap — we're already beating)."""
     try:
         import redis.asyncio as aioredis  # lazy: only needed when a transport is actually running
     except ImportError:
@@ -103,7 +122,7 @@ async def _start_heartbeat(connection: str, prefix: str, group: str) -> None:
     async def beat() -> None:
         while True:
             try:
-                await client.set(key, str(time.time()), ex=_HEARTBEAT_TTL_SECONDS)
+                await client.set(key, _heartbeat_value(controller), ex=_HEARTBEAT_TTL_SECONDS)
             except Exception:  # noqa: BLE001 — never let a heartbeat hiccup kill the worker
                 pass
             await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
@@ -288,13 +307,18 @@ async def run_redis_worker(
     connection: str = "redis://localhost:6379",
     prefix: str = "durable",
     cancellation: Optional[CancellationRegistry] = None,
-    concurrency: int = 1,
+    concurrency: "int | str | dict" = 1,
 ) -> Any:
     """Start a BullMQ worker that runs ``worker``'s handlers. Returns the bullmq Worker.
 
     The returned worker runs in the background; ``await worker.close()`` to stop it. When a
     :class:`CancellationRegistry` is given (one is created otherwise), the runner subscribes to the
     control channel and feeds it, so handlers see ``ctx.cancelled``.
+
+    ``concurrency`` accepts an ``int`` (fixed), ``'adaptive'`` (self-tuning with defaults), or a
+    config ``dict`` (``min``/``max``/``start``/``ramCeilingPct``/``cpuCeilingPct``/``tickMs``). An
+    :class:`AdaptiveController` tracks ``inFlight`` / latency / RSS / CPU for BOTH modes (so the
+    heartbeat carries a live ``WorkerStatus``); in adaptive mode it also tunes the live limit.
     """
 
     from bullmq import Queue as BullQueue  # imported lazily so the SDK works without bullmq
@@ -307,19 +331,38 @@ async def run_redis_worker(
     registry = cancellation or CancellationRegistry()
     await _subscribe_control(connection, prefix, registry)
     publish_progress = await _progress_publisher(connection, prefix)
-    await _start_heartbeat(connection, prefix, group)
+
+    controller = AdaptiveController(resolve_concurrency(concurrency))
 
     async def process(job: Any, _token: str) -> None:
         on_event = _make_on_event(job.data, publish_progress) if publish_progress else None
-        result = await worker.aprocess_task(
-            job.data, is_cancelled=registry.is_cancelled, on_event=on_event
-        )
+        # Bracket the handler with the controller's in-flight / settle hooks so adaptive control and
+        # the status snapshot see live load. ``time.monotonic`` (not wall) for an immune-to-clock-skew
+        # duration; ``ok`` reflects the wire result's status, so a failed step counts toward errorRate.
+        controller.on_start()
+        started = time.monotonic()
+        ok = False
+        try:
+            result = await worker.aprocess_task(
+                job.data, is_cancelled=registry.is_cancelled, on_event=on_event
+            )
+            ok = result.get("status") == "completed"
+        finally:
+            controller.on_settle((time.monotonic() - started) * 1000.0, ok)
         await results.add("result", result, {"removeOnComplete": True, "removeOnFail": True})
 
-    worker_opts: Dict[str, Any] = {"connection": connection}
-    if concurrency != 1:
-        worker_opts["concurrency"] = concurrency
-    return BullWorker(tasks_name, process, worker_opts)
+    # Seed BullMQ with the controller's starting limit (fixed N or the adaptive start).
+    worker_opts: Dict[str, Any] = {"connection": connection, "concurrency": controller.limit}
+    bull_worker = BullWorker(tasks_name, process, worker_opts)
+
+    # The bullmq python port re-reads ``opts['concurrency']`` each scheduling pass, so mutating it
+    # applies the controller's decision live (see adaptive.py module docstring).
+    def apply_concurrency(new_limit: int) -> None:
+        bull_worker.opts["concurrency"] = new_limit
+
+    await _start_heartbeat(connection, prefix, group, controller)
+    controller.start(apply_cb=apply_concurrency)
+    return bull_worker
 
 
 async def _progress_publisher(

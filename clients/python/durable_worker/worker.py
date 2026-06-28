@@ -355,12 +355,22 @@ class Worker:
     """
 
     def __init__(
-        self, group: str = "default", *, concurrency: int = 1, auto_register: bool = True
+        self,
+        group: str = "default",
+        *,
+        concurrency: "int | str | dict" = 1,
+        auto_register: bool = True,
     ) -> None:
         self.group = group
         # How many tasks this worker runs concurrently from its group's queue (BullMQ Worker
         # concurrency). Default 1 (serial). Raise it so a fanned-out batch (e.g. the N remote steps of
         # a ``gather_calls``) runs in parallel. Per process; total parallelism is concurrency × replicas.
+        #
+        # Beyond a fixed ``int`` this accepts ``'adaptive'`` (the worker self-tunes its limit from a
+        # gradient of observed latency, with a cgroup-aware RAM brake) or a config ``dict``
+        # (``min``/``max``/``start``/``ramCeilingPct``/``cpuCeilingPct``/``tickMs``). It is passed
+        # through verbatim to ``run_redis_worker``, which resolves it; either way the worker publishes
+        # a live status (inFlight / RSS / throughput / p95) on its heartbeat. (Default 1 = fixed.)
         self.concurrency = concurrency
         self._handlers: Dict[str, Handler] = {}
         self._blocking: Dict[str, bool] = {}

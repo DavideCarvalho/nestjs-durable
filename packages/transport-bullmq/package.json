@@ -20,11 +20,13 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
+    "@dudousxd/durable-worker": ">=0.1.0 <1.0.0",
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
     "bullmq": "^5.0.0",
     "ioredis": "^5.0.0"
   },
   "devDependencies": {
+    "@dudousxd/durable-worker": "workspace:^",
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@testcontainers/redis": "10.18.0",
     "bullmq": "5.34.10",

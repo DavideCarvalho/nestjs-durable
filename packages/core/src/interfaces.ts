@@ -708,6 +708,61 @@ export interface Transport {
   listWorkerGroups?(): Promise<string[]>;
 }
 
+/** How a worker decides its concurrency, carried in {@link WorkerStatus} so a dashboard can tell a
+ *  fixed knob from a self-regulating one (and, for the latter, where the controller currently sits). */
+export interface WorkerConcurrencyStatus {
+  /** `fixed` = the configured `concurrency` number, never moves. `adaptive` = the controller tunes it. */
+  mode: 'fixed' | 'adaptive';
+  /** The concurrency ceiling in effect right now (fixed: the configured value; adaptive: the live limit). */
+  limit: number;
+  /** Adaptive only — the floor the controller won't go below. */
+  min?: number;
+  /** Adaptive only — the ceiling the controller won't exceed. */
+  max?: number;
+}
+
+/** The adaptive controller's most recent limit change — the "why did it move" a dashboard shows so an
+ *  auto-tuner isn't a black box. Absent until the controller first adjusts (or for a fixed worker). */
+export interface WorkerAdjust {
+  /** Epoch ms of the adjustment. */
+  at: number;
+  /** Limit before this change. */
+  from: number;
+  /** Limit after this change. */
+  to: number;
+  /** Why it moved: `ram_ceiling` (hard brake), `backpressure` (errors/stall), `grow` (had headroom),
+   *  `shrink` (latency gradient showed queuing), `cpu_ceiling`. */
+  reason: 'ram_ceiling' | 'cpu_ceiling' | 'backpressure' | 'grow' | 'shrink';
+}
+
+/** A live snapshot of a worker's execution state, carried in the worker-liveness heartbeat (so it
+ *  rides the existing TTL'd key — no extra round-trip) and surfaced per worker in the dashboard. Every
+ *  field beyond {@link concurrency}/{@link inFlight} is best-effort: a field a runtime can't measure is
+ *  simply omitted. The shape is shared by the TS and Python SDKs so a mixed-language group reports
+ *  uniformly. */
+export interface WorkerStatus {
+  /** Which SDK is running this worker — `node` (TS) or `python`. */
+  runtime?: 'node' | 'python';
+  /** The worker's concurrency knob and its live ceiling. */
+  concurrency: WorkerConcurrencyStatus;
+  /** Tasks executing right now (0..limit). With `limit`, this is the saturation a dashboard charts. */
+  inFlight: number;
+  /** Resident set size in bytes, if the runtime can read it. */
+  rssBytes?: number;
+  /** The process memory ceiling in bytes (cgroup `memory.max`, else host total), if known. */
+  rssLimitBytes?: number;
+  /** RSS as a percent of {@link rssLimitBytes} (0..100) — what the adaptive RAM brake watches. */
+  rssPct?: number;
+  /** Process CPU utilisation percent over the last control tick (0..100×cores), if measured. */
+  cpuPct?: number;
+  /** Completed tasks per minute over the recent window — the controller's throughput signal. */
+  throughputPerMin?: number;
+  /** p95 of recent task durations in ms — the latency a dashboard charts against the limit. */
+  p95Ms?: number;
+  /** The adaptive controller's last limit change (absent for a fixed worker or before the first move). */
+  lastAdjust?: WorkerAdjust;
+}
+
 /** One worker's liveness record — a TTL'd heartbeat a worker refreshes while it's consuming. Its
  *  ABSENCE (the key expired) is the signal: a worker that died or stalled stops refreshing. */
 export interface WorkerHeartbeat {
@@ -717,6 +772,9 @@ export interface WorkerHeartbeat {
   instanceId: string;
   /** Epoch ms of the worker's most recent heartbeat. */
   lastBeatAt: number;
+  /** The worker's live execution snapshot, when its heartbeat carries one (newer SDKs stamp a JSON
+   *  value; an older SDK's bare-timestamp heartbeat leaves this undefined). */
+  status?: WorkerStatus;
 }
 
 /** Per-group worker-health snapshot: how much work is queued vs. how many workers are alive to do it.

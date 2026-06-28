@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useState } from 'react';
 import {
+  type GroupHealth,
   type RunDetail as RunDetailData,
   type RunDisplayStatus,
   type RunStatus,
@@ -138,10 +139,98 @@ function Header({
   );
 }
 
+/** Compact "Nm ago" relative stamp for an epoch-ms instant. */
+function relAgoMs(atMs: number): string {
+  const s = Math.max(0, Math.round((Date.now() - atMs) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+/**
+ * Per-worker rows for an expanded group: each live worker's concurrency mode + live limit, in-flight
+ * saturation, RAM%, throughput, and the adaptive controller's last move. A worker from an older SDK
+ * with no `status` still lists (its measured cells read "—"), so a mixed fleet stays visible.
+ */
+function WorkerRows({ workers }: { workers: GroupHealth['liveWorkers'] }) {
+  return (
+    <div className="flex flex-col divide-y divide-[var(--line-soft)]">
+      {workers.map((w) => {
+        const s = w.status;
+        const c = s?.concurrency;
+        const sat = s && c ? `${s.inFlight}/${c.limit}` : '—';
+        const saturated = !!(s && c && c.limit > 0 && s.inFlight >= c.limit * 0.8);
+        return (
+          <div key={w.instanceId} className="flex flex-col gap-1 px-2.5 py-2">
+            <div className="flex items-center justify-between gap-3">
+              <span className="mono truncate text-[10px] text-zinc-400">{w.instanceId}</span>
+              {c ? (
+                <span
+                  className={`mono shrink-0 rounded border px-1 text-[9px] uppercase tracking-wider ${
+                    c.mode === 'adaptive'
+                      ? 'border-sky-500/40 bg-sky-500/10 text-sky-300'
+                      : 'border-zinc-600/50 bg-zinc-800/60 text-zinc-400'
+                  }`}
+                >
+                  {c.mode === 'adaptive' ? `adaptive ${c.min ?? 1}–${c.max ?? 32}` : 'fixed'}
+                </span>
+              ) : (
+                <span className="mono shrink-0 text-[9px] text-zinc-600">no status</span>
+              )}
+            </div>
+            {s && c && (
+              <div className="mono flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-zinc-500">
+                <span className={saturated ? 'text-amber-300' : 'text-zinc-400'}>
+                  in-flight <span className="tnum">{sat}</span>
+                </span>
+                {typeof s.rssPct === 'number' && (
+                  <span className={s.rssPct >= 85 ? 'text-rose-300' : ''}>
+                    ram <span className="tnum">{Math.round(s.rssPct)}%</span>
+                  </span>
+                )}
+                {typeof s.cpuPct === 'number' && (
+                  <span>
+                    cpu <span className="tnum">{Math.round(s.cpuPct)}%</span>
+                  </span>
+                )}
+                {typeof s.throughputPerMin === 'number' && (
+                  <span>
+                    <span className="tnum">{Math.round(s.throughputPerMin)}</span>/min
+                  </span>
+                )}
+                {typeof s.p95Ms === 'number' && (
+                  <span>
+                    p95 <span className="tnum">{Math.round(s.p95Ms)}ms</span>
+                  </span>
+                )}
+              </div>
+            )}
+            {s?.lastAdjust && (
+              <div className="mono text-[10px] text-zinc-500">
+                {s.lastAdjust.reason}{' '}
+                <span className="tnum text-zinc-400">
+                  {s.lastAdjust.from}→{s.lastAdjust.to}
+                </span>{' '}
+                {relAgoMs(s.lastAdjust.at)}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /**
  * Per-group worker health, one chip per group: the live-worker count, turning RED when work is
  * queued but no worker is alive to drain it (`depth > 0 && liveWorkers === 0` — the "alive but not
- * consuming" failure). Polls `/workers`; renders nothing when the transport can't report health.
+ * consuming" failure). Clicking a chip with live workers expands a per-worker popover showing each
+ * worker's adaptive/fixed limit, in-flight saturation, RAM%, throughput and last adjust (from the
+ * status the heartbeat now carries). Polls `/workers`; renders nothing when the transport can't
+ * report health.
  */
 function WorkersHealth() {
   const { data } = useQuery({
@@ -149,31 +238,50 @@ function WorkersHealth() {
     queryFn: () => durableClient.workers(),
     refetchInterval: 10_000,
   });
+  const [expanded, setExpanded] = useState<string | undefined>(undefined);
   if (!data || data.length === 0) return null;
   return (
     <div className="ml-auto flex flex-wrap items-center gap-1.5">
       {data.map((g) => {
         const live = g.liveWorkers.length;
         const starved = g.depth > 0 && live === 0;
+        const open = expanded === g.group;
         return (
-          <span
-            key={g.group}
-            title={`${g.group}: ${live} live worker(s), ${g.depth} queued${starved ? ' — NO worker consuming' : ''}`}
-            className={`mono flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] ${
-              starved
-                ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
-                : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
-            }`}
-          >
-            <span
-              className={`dot ${starved ? 's-failed' : live > 0 ? 's-completed' : ''}`}
-              aria-hidden
-            />
-            {g.group}
-            <span className="tnum text-zinc-500">
-              {live}w{g.depth > 0 ? ` ${g.depth}q` : ''}
-            </span>
-          </span>
+          <div key={g.group} className="relative">
+            <button
+              type="button"
+              disabled={live === 0}
+              onClick={() => setExpanded(open ? undefined : g.group)}
+              title={`${g.group}: ${live} live worker(s), ${g.depth} queued${starved ? ' — NO worker consuming' : live > 0 ? ' — click for per-worker status' : ''}`}
+              className={`mono flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] ${
+                starved
+                  ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
+                  : open
+                    ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
+                    : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
+              } ${live > 0 ? 'cursor-pointer hover:border-zinc-500' : 'cursor-default'}`}
+            >
+              <span
+                className={`dot ${starved ? 's-failed' : live > 0 ? 's-completed' : ''}`}
+                aria-hidden
+              />
+              {g.group}
+              <span className="tnum text-zinc-500">
+                {live}w{g.depth > 0 ? ` ${g.depth}q` : ''}
+              </span>
+            </button>
+            {open && live > 0 && (
+              <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
+                <div className="mono flex items-center justify-between border-b border-[var(--line)] px-2.5 py-1.5 text-[10px] text-zinc-500">
+                  <span className="text-zinc-300">{g.group}</span>
+                  <span className="tnum">
+                    {live} worker(s) · {g.depth} queued
+                  </span>
+                </div>
+                <WorkerRows workers={g.liveWorkers} />
+              </div>
+            )}
+          </div>
         );
       })}
     </div>

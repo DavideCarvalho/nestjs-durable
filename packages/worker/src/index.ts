@@ -1,3 +1,15 @@
+export type {
+  AdaptiveConcurrencyOptions,
+  AdaptiveConfig,
+  AdaptiveControllerOptions,
+  ConcurrencyOption,
+  ResolvedConcurrency,
+} from './adaptive-concurrency';
+export {
+  AdaptiveController,
+  readMemoryLimitBytes,
+  resolveConcurrency,
+} from './adaptive-concurrency';
 export {
   Cancelled,
   GatherReplayError,

@@ -1,4 +1,5 @@
 import { hostname } from 'node:os';
+import { AdaptiveController, type ConcurrencyOption } from '@dudousxd/durable-worker';
 import {
   type ControlMessage,
   type ControlPlane,
@@ -9,6 +10,7 @@ import {
   type StepResult,
   type Transport,
   type WorkerHeartbeat,
+  type WorkerStatus,
   type WorkflowDecision,
   type WorkflowStepEvent,
   type WorkflowTask,
@@ -44,6 +46,45 @@ export function toBrokerPriority(priority?: number): number | undefined {
   return Math.min(BROKER_PRIORITY_MAX, Math.max(1, mapped));
 }
 
+// Epoch values below this threshold are seconds (Python's `time.time()`), at/above are milliseconds
+// (the TS SDKs). Normalise to ms. ~1e12 ms ≈ year 2001; ~1e12 s is year 33658 — unambiguous.
+const EPOCH_MS_THRESHOLD = 1e12;
+
+/**
+ * Parse a worker-heartbeat key value into `{ lastBeatAt, status? }`, accepting BOTH forms:
+ *   - the new `{"ts":<epoch>,"status":<WorkerStatus>}` JSON (newer SDKs),
+ *   - an older bare timestamp string (this SDK's ms / the Python SDK's seconds).
+ * A bare number or a `ts` below {@link EPOCH_MS_THRESHOLD} is treated as seconds and scaled to ms.
+ * Robust to a missing/garbled value (→ `lastBeatAt: 0`, no `status`).
+ */
+export function parseHeartbeatValue(raw: string | null): {
+  lastBeatAt: number;
+  status?: WorkerStatus;
+} {
+  if (raw == null) return { lastBeatAt: 0 };
+  const trimmed = raw.trim();
+  if (trimmed === '') return { lastBeatAt: 0 };
+
+  const toMs = (n: number): number =>
+    Number.isFinite(n) ? (n < EPOCH_MS_THRESHOLD ? n * 1000 : n) : 0;
+
+  // Old bare-number form (no JSON braces): a plain ms/seconds timestamp.
+  if (!trimmed.startsWith('{')) return { lastBeatAt: toMs(Number(trimmed)) };
+
+  try {
+    const parsed = JSON.parse(trimmed) as { ts?: unknown; status?: unknown };
+    const ts = typeof parsed.ts === 'number' ? toMs(parsed.ts) : 0;
+    const status =
+      parsed.status && typeof parsed.status === 'object'
+        ? (parsed.status as WorkerStatus)
+        : undefined;
+    return status !== undefined ? { lastBeatAt: ts, status } : { lastBeatAt: ts };
+  } catch {
+    // Malformed JSON — fall back to a numeric read so a partially-written value still yields a beat.
+    return { lastBeatAt: toMs(Number(trimmed)) };
+  }
+}
+
 export interface BullMQTransportOptions {
   /** ioredis connection options (or an IORedis instance). */
   connection: ConnectionOptions;
@@ -58,8 +99,12 @@ export interface BullMQTransportOptions {
    * concurrency). Defaults to 1 (one task at a time). Raise it so a fanned-out batch (e.g. the N
    * remote steps of a `gather`) executes in parallel instead of serially. Per worker process; total
    * parallelism is `concurrency × replicas`.
+   *
+   * Pass `'adaptive'` (or `{ mode:'adaptive', ... }`) to let an {@link AdaptiveController} self-tune
+   * the limit (latency gradient + RAM brake + backpressure). The worker's live status rides its
+   * heartbeat in both modes — see {@link BullMQTransport.groupHealth} → {@link WorkerHeartbeat.status}.
    */
-  concurrency?: number;
+  concurrency?: ConcurrencyOption;
 }
 
 /**
@@ -92,7 +137,11 @@ export class BullMQTransport implements Transport, ControlPlane {
   // Worker liveness (distinct from the long-step `heartbeat()` pub/sub above): a TTL'd key refreshed
   // on a timer while this instance is acting as a worker, + a client for reading peers' keys.
   private readonly instanceId: string;
-  private readonly concurrency?: number;
+  private readonly concurrency: ConcurrencyOption | undefined;
+  // The shared concurrency controller, created when this instance becomes a worker (`handle()`), or
+  // lazily in fixed mode for the heartbeat status if a beat fires without one. Tracks inFlight + a
+  // completion window, snapshots the heartbeat status, and (adaptive) re-tunes `taskWorker.concurrency`.
+  private workerController?: AdaptiveController;
   private workerHeartbeatTimer?: ReturnType<typeof setInterval>;
   private workerHeartbeatRedis?: Redis;
 
@@ -102,6 +151,21 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.prefix = options.prefix ?? 'durable';
     this.instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
     this.concurrency = options.concurrency;
+  }
+
+  /** The shared controller, lazily created. In `handle()` it's created with the configured
+   *  `concurrency`; if a heartbeat beats before any handler registered, this seeds a minimal
+   *  fixed-mode controller so the status payload is never empty. Idempotent. */
+  private controller(): AdaptiveController {
+    if (!this.workerController) {
+      this.workerController = new AdaptiveController({
+        ...(this.concurrency !== undefined ? { concurrency: this.concurrency } : {}),
+        apply: (limit) => {
+          if (this.taskWorker) this.taskWorker.concurrency = limit;
+        },
+      });
+    }
+    return this.workerController;
   }
 
   // BullMQ queue names must not contain ':' (its Redis key separator), so use '-'.
@@ -199,10 +263,13 @@ export class BullMQTransport implements Transport, ControlPlane {
     if (!this.group) throw new Error('BullMQTransport needs a `group` to register handlers');
     this.handlers.set(name, fn);
     if (!this.taskWorker) {
+      const controller = this.controller();
       this.taskWorker = new Worker(this.tasksName(this.group), (job) => this.runTask(job.data), {
         connection: this.workerConnection(),
-        ...(this.concurrency != null ? { concurrency: this.concurrency } : {}),
+        concurrency: controller.initialLimit,
       });
+      // Run the control loop (fixed: tracks status only; adaptive: also re-tunes `taskWorker.concurrency`).
+      controller.start();
       // This instance is now a worker for `group` — start stamping its liveness heartbeat.
       this.startWorkerHeartbeat(this.group);
     }
@@ -226,8 +293,11 @@ export class BullMQTransport implements Transport, ControlPlane {
     if (this.workerHeartbeatTimer) return;
     const client = this.workerRedis();
     const key = this.workerHeartbeatKey(group, this.instanceId);
+    const controller = this.controller();
     const beat = () => {
-      void client.set(key, String(Date.now()), 'EX', WORKER_HEARTBEAT_TTL_SECONDS).catch(() => {});
+      // Value is now `{ts,status}` JSON (was a bare ms timestamp); `listLiveWorkers` reads both forms.
+      const value = JSON.stringify({ ts: Date.now(), status: controller.snapshot() });
+      void client.set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS).catch(() => {});
     };
     beat();
     this.workerHeartbeatTimer = setInterval(beat, WORKER_HEARTBEAT_INTERVAL_MS);
@@ -268,8 +338,9 @@ export class BullMQTransport implements Transport, ControlPlane {
   }
 
   /** Live workers for `group`: SCAN the heartbeat keys (never KEYS — it blocks Redis) and read each.
-   *  A returned key is live by definition (the TTL hasn't expired). Tolerates both this SDK's
-   *  millisecond stamp and the Python SDK's seconds stamp when reporting `lastBeatAt`. */
+   *  A returned key is live by definition (the TTL hasn't expired). Tolerates BOTH heartbeat value
+   *  forms: the new `{ts,status}` JSON (newer SDKs — populates `status` + `lastBeatAt`) and an older
+   *  bare timestamp (this SDK's ms / the Python SDK's seconds — `lastBeatAt` only, `status` undefined). */
   private async listLiveWorkers(group: string): Promise<WorkerHeartbeat[]> {
     const client = this.workerRedis();
     const match = this.workerHeartbeatKey(group, '*');
@@ -281,21 +352,35 @@ export class BullMQTransport implements Transport, ControlPlane {
       cursor = next;
       for (const key of keys) {
         const raw = await client.get(key);
-        const n = raw == null ? Number.NaN : Number(raw);
-        // Python stamps epoch SECONDS, this SDK stamps MILLISECONDS — normalize to ms.
-        const lastBeatAt = Number.isNaN(n) ? 0 : n < 1e12 ? n * 1000 : n;
-        workers.push({ group, instanceId: key.slice(prefix.length), lastBeatAt });
+        const parsed = parseHeartbeatValue(raw);
+        workers.push({
+          group,
+          instanceId: key.slice(prefix.length),
+          lastBeatAt: parsed.lastBeatAt,
+          ...(parsed.status !== undefined ? { status: parsed.status } : {}),
+        });
       }
     } while (cursor !== '0');
     return workers;
   }
 
   private async runTask(task: RemoteTask): Promise<void> {
-    const result = await runStepHandler(task, this.handlers.get(task.name));
-    await this.queue(this.resultsName()).add('result', result, {
-      removeOnComplete: true,
-      removeOnFail: true,
-    });
+    // Track the task in the controller (inFlight + duration/ok window) so the heartbeat status and the
+    // adaptive loop see it. A handler that throws (failed result) still counts as a settled completion.
+    const controller = this.controller();
+    const startedAt = Date.now();
+    controller.onStart();
+    let ok = false;
+    try {
+      const result = await runStepHandler(task, this.handlers.get(task.name));
+      ok = result.status === 'completed';
+      await this.queue(this.resultsName()).add('result', result, {
+        removeOnComplete: true,
+        removeOnFail: true,
+      });
+    } finally {
+      controller.onSettle(Date.now() - startedAt, ok);
+    }
   }
 
   onResult(handler: (result: StepResult) => Promise<void>): void {
@@ -361,6 +446,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   /** Close all workers and queues so the process can exit. */
   async close(): Promise<void> {
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
+    this.workerController?.stop();
     await this.taskWorker?.close();
     await this.resultsWorker?.close();
     await this.decisionsWorker?.close();

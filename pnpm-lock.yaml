@@ -493,6 +493,9 @@ importers:
 
   packages/transport-bullmq:
     devDependencies:
+      '@dudousxd/durable-worker':
+        specifier: workspace:^
+        version: link:../worker
       '@dudousxd/nestjs-durable-core':
         specifier: workspace:^
         version: link:../core

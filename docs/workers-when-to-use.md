@@ -82,6 +82,50 @@ DurableWorkerModule.forRoot({ connection, groups, concurrencyByGroup: { 'foo-han
 Total parallelism = `concurrency × worker replicas`. So you scale either by raising `concurrency`
 on one process or by running more step-worker replicas (or both).
 
+### Adaptive concurrency — let the worker tune itself
+
+A fixed number is a guess: too low wastes the pool, too high stampedes RAM or a downstream DB. Pass
+`'adaptive'` (or an object to override the defaults) instead of a number and the worker self-regulates:
+
+```python
+# Python
+steps = Worker(group="...-handlers", concurrency="adaptive")
+# or: concurrency={"min": 1, "max": 16, "ramCeilingPct": 85}
+```
+
+```ts
+// any TS surface
+new BullMQTransport({ connection, group, concurrency: 'adaptive' });
+await runRedisWorker({ runtime, group, connection, concurrency: { mode: 'adaptive', min: 1, max: 16 } });
+DurableWorkerModule.forRoot({ connection, groups, concurrencyByGroup: { 'foo-handlers': 'adaptive' } });
+```
+
+How it decides (same on both SDKs), every `tickMs` (default 2s):
+- **Latency gradient (the main signal).** Compares recent p50 against the best (no-queuing) latency
+  it's seen. Gradient near 1 = no queuing → **grow by 1**, but *only while saturated* (in-flight near
+  the limit), since raising a ceiling nobody hits does nothing. Gradient dropping = latency inflating
+  = queuing → **shrink** proportionally. Latency is bottleneck-agnostic — it catches a slow DB, CPU
+  saturation, or lock contention without naming which.
+- **RAM ceiling (hard brake).** Reads RSS against the cgroup `memory.max` (falls back to host total).
+  Past `ramCeilingPct` (default 85%) it multiplicatively cuts the limit and refuses to grow — OOM is
+  fatal and sudden, so it's a brake, not a gradient input.
+- **Backpressure.** A burst of errors or a stall (in-flight > 0 but nothing completing) shrinks the
+  limit. `cpuCeilingPct` is an optional extra cap (off by default — the latency gradient already
+  subsumes CPU for I/O-bound work).
+
+Bounds are `[min, max]` (defaults 1 and 32); it starts at `start` (default `min`). Adaptive is
+**per process** — it protects *that pod*. A shared dependency (one RDS behind many pods) still needs a
+global cap (`registerQueue`, below), and pod-count scaling is KEDA's job (watch the queue depth).
+
+### Seeing what the workers are doing (Telescope)
+
+Both adaptive and fixed workers publish a live **status** on their heartbeat — current concurrency /
+adaptive limit, in-flight vs limit, queue depth, RAM %, CPU %, throughput, p95 latency, and (adaptive)
+the last limit change with its reason. The durable **Telescope** dashboard renders this in a "Workers"
+panel (one row per live worker), and the embedded dashboard's worker chips expand to the same
+per-worker breakdown. For an adaptive worker this is how you *trust* the auto-tuner: you can watch the
+limit move and see **why** it last backed off (`ram_ceiling` / `backpressure` / `shrink`).
+
 ### Capping vs increasing — two different knobs
 - **To go faster (parallelise the fan):** raise the **worker `concurrency`** (consumer side, above).
 - **To go slower (protect a dependency):** use the engine's durable **admission queue** —

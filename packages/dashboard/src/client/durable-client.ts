@@ -125,11 +125,47 @@ export interface EngineEvent {
   at: string;
 }
 
+/** How a worker decides its concurrency (mirror of core `WorkerConcurrencyStatus`). */
+export interface WorkerConcurrencyStatus {
+  mode: 'fixed' | 'adaptive';
+  /** The concurrency ceiling in effect now (fixed: configured; adaptive: the live limit). */
+  limit: number;
+  /** Adaptive only — the floor the controller won't go below. */
+  min?: number;
+  /** Adaptive only — the ceiling the controller won't exceed. */
+  max?: number;
+}
+
+/** The adaptive controller's most recent limit change (mirror of core `WorkerAdjust`). */
+export interface WorkerAdjust {
+  at: number;
+  from: number;
+  to: number;
+  reason: 'ram_ceiling' | 'cpu_ceiling' | 'backpressure' | 'grow' | 'shrink';
+}
+
+/** A live snapshot of a worker's execution state riding the heartbeat (mirror of core
+ *  `WorkerStatus`). Every field beyond concurrency/inFlight is best-effort and may be omitted. */
+export interface WorkerStatus {
+  runtime?: 'node' | 'python';
+  concurrency: WorkerConcurrencyStatus;
+  inFlight: number;
+  rssBytes?: number;
+  rssLimitBytes?: number;
+  rssPct?: number;
+  cpuPct?: number;
+  throughputPerMin?: number;
+  p95Ms?: number;
+  lastAdjust?: WorkerAdjust;
+}
+
 /** One worker's liveness record (mirror of the engine's `WorkerHeartbeat`). */
 export interface WorkerHeartbeat {
   group: string;
   instanceId: string;
   lastBeatAt: number;
+  /** Live execution snapshot, when the heartbeat carries one (older SDKs leave it undefined). */
+  status?: WorkerStatus;
 }
 
 /** Per-group worker health for the Workers panel: backlog vs. live workers. The alert state a row

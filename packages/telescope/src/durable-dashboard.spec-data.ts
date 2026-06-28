@@ -92,6 +92,36 @@ export function durableDashboard(
         ],
       },
       {
+        title: 'Workers',
+        cols: 2,
+        panels: [
+          {
+            kind: 'table',
+            // One row per LIVE worker (flattened from each group's heartbeats), exposing the live
+            // WorkerStatus the heartbeat carries: fixed vs. adaptive limit, in-flight saturation,
+            // RAM%/CPU%, throughput, p95, and why the adaptive controller last moved. A worker from
+            // an older SDK with no status still lists, with '—' in the measured columns. The
+            // adaptive min–max range rides the In-flight column's row value (`minMax` key) for those
+            // that want it; the visible columns stay readable.
+            title: 'Workers',
+            data: { provider: 'durable.workerStatus' },
+            columns: [
+              { key: 'group', label: 'Group' },
+              { key: 'instanceId', label: 'Worker' },
+              { key: 'mode', label: 'Mode' },
+              { key: 'limit', label: 'Limit' },
+              { key: 'saturation', label: 'In-flight' },
+              { key: 'queued', label: 'Queued' },
+              { key: 'rssPct', label: 'RAM %' },
+              { key: 'cpuPct', label: 'CPU %' },
+              { key: 'throughputPerMin', label: 'Thrpt/min' },
+              { key: 'p95Ms', label: 'p95 ms' },
+              { key: 'lastAdjust', label: 'Last adjust' },
+            ],
+          },
+        ],
+      },
+      {
         title: 'Trends',
         cols: 3,
         panels: [

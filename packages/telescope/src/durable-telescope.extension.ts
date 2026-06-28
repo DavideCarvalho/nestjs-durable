@@ -10,6 +10,7 @@ import {
   durableThroughputProvider,
   durableTimeseriesProvider,
   durableWorkerHealthProvider,
+  durableWorkerStatusProvider,
 } from './durable-data-providers';
 import { DurableTelescopeWatcher } from './durable-telescope.watcher';
 
@@ -27,6 +28,7 @@ export function durableTelescopeExtension(
       durableTimeseriesProvider(),
       durableRecentFailuresProvider(),
       durableWorkerHealthProvider(),
+      durableWorkerStatusProvider(),
       durableDurationProvider(),
       durableRunsOverTimeProvider(),
       durableSuccessRateProvider(),

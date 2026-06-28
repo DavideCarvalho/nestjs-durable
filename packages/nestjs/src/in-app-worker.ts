@@ -1,4 +1,5 @@
 import {
+  type ConcurrencyOption,
   DurableWorkerRuntime,
   type RunningWorker,
   runRedisWorker as defaultRunRedisWorker,
@@ -44,8 +45,11 @@ export interface DurableInAppWorkerOptions {
    * How many tasks the co-located worker runs concurrently from its group's queue (BullMQ Worker
    * concurrency). Defaults to 1. Raise it so a fanned-out batch (e.g. the N remote steps of a
    * `gather`) runs in parallel. Per process; total parallelism is `concurrency × replicas`.
+   *
+   * Pass `'adaptive'` (or `{ mode:'adaptive', ... }`) to let the worker self-tune its concurrency
+   * (latency gradient + RAM brake + backpressure) and publish a live status on its heartbeat.
    */
-  concurrency?: number;
+  concurrency?: ConcurrencyOption;
 }
 
 /** The resolved {@link DurableInAppWorkerOptions} or `null` when the app didn't opt in. */
