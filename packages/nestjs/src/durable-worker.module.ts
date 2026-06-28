@@ -33,6 +33,14 @@ export interface DurableWorkerModuleOptions {
   prefix?: string;
   /** Stable id for this worker process in heartbeats/control. Defaults to a per-host/pid id. */
   instanceId?: string;
+  /**
+   * How many tasks each group's consumer runs concurrently (BullMQ Worker concurrency). Defaults to 1.
+   * Applies to every group unless overridden per-group by {@link concurrencyByGroup}. Raise it so a
+   * fanned-out batch (e.g. the N remote steps of a `gather`) runs in parallel instead of serially.
+   */
+  concurrency?: number;
+  /** Per-group concurrency override, keyed by group name. Falls back to {@link concurrency} (then 1). */
+  concurrencyByGroup?: Record<string, number>;
 }
 
 export interface DurableWorkerModuleAsyncOptions {
@@ -125,6 +133,9 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
         connection: this.options.connection,
         ...(this.options.prefix !== undefined ? { prefix: this.options.prefix } : {}),
         ...(this.options.instanceId !== undefined ? { instanceId: this.options.instanceId } : {}),
+        ...((this.options.concurrencyByGroup?.[group] ?? this.options.concurrency) !== undefined
+          ? { concurrency: this.options.concurrencyByGroup?.[group] ?? this.options.concurrency }
+          : {}),
       });
       this.runners.push(handle);
       this.runnersSink.push(handle);

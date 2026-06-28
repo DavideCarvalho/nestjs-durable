@@ -354,8 +354,14 @@ class Worker:
             return {"chargeId": res.id}
     """
 
-    def __init__(self, group: str = "default", *, auto_register: bool = True) -> None:
+    def __init__(
+        self, group: str = "default", *, concurrency: int = 1, auto_register: bool = True
+    ) -> None:
         self.group = group
+        # How many tasks this worker runs concurrently from its group's queue (BullMQ Worker
+        # concurrency). Default 1 (serial). Raise it so a fanned-out batch (e.g. the N remote steps of
+        # a ``gather_calls``) runs in parallel. Per process; total parallelism is concurrency × replicas.
+        self.concurrency = concurrency
         self._handlers: Dict[str, Handler] = {}
         self._blocking: Dict[str, bool] = {}
         # Auto-register into the module-level registry so :func:`run_all` can discover this worker
@@ -403,7 +409,11 @@ class Worker:
 
         async def _main() -> None:
             bull_worker = await run_redis_worker(
-                self, group=self.group, connection=redis, prefix=prefix
+                self,
+                group=self.group,
+                connection=redis,
+                prefix=prefix,
+                concurrency=self.concurrency,
             )
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()
@@ -617,7 +627,11 @@ def run_workers(
                 )
             else:
                 handle = await run_redis_worker(
-                    worker, group=worker.group, connection=redis, prefix=prefix
+                    worker,
+                    group=worker.group,
+                    connection=redis,
+                    prefix=prefix,
+                    concurrency=worker.concurrency,
                 )
             handles.append(handle)
 

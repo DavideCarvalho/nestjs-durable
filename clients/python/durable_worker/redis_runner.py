@@ -288,6 +288,7 @@ async def run_redis_worker(
     connection: str = "redis://localhost:6379",
     prefix: str = "durable",
     cancellation: Optional[CancellationRegistry] = None,
+    concurrency: int = 1,
 ) -> Any:
     """Start a BullMQ worker that runs ``worker``'s handlers. Returns the bullmq Worker.
 
@@ -315,7 +316,10 @@ async def run_redis_worker(
         )
         await results.add("result", result, {"removeOnComplete": True, "removeOnFail": True})
 
-    return BullWorker(tasks_name, process, {"connection": connection})
+    worker_opts: Dict[str, Any] = {"connection": connection}
+    if concurrency != 1:
+        worker_opts["concurrency"] = concurrency
+    return BullWorker(tasks_name, process, worker_opts)
 
 
 async def _progress_publisher(

@@ -87,6 +87,12 @@ export interface RunRedisWorkerOptions {
   /** Override the Worker's job-lock duration (ms). Defaults to 5 min — see {@link DEFAULT_LOCK_DURATION_MS}. */
   lockDuration?: number;
   /**
+   * How many tasks this worker runs concurrently from its group's queue (BullMQ Worker concurrency).
+   * Defaults to 1. Raise it so a fanned-out batch (e.g. the N remote steps of a `gather`) runs in
+   * parallel instead of serially. Per process; total parallelism is `concurrency × replicas`.
+   */
+  concurrency?: number;
+  /**
    * Injection seam for tests: supply fake `Worker`/`Queue`/`Redis` ctors instead of lazily importing
    * the real `bullmq`/`ioredis`. Production omits this and the runner imports the real peers.
    */
@@ -222,6 +228,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   const worker = new deps.Worker(tasksName(prefix, group), processJob, {
     connection: workerConnection(connection),
     lockDuration,
+    ...(options.concurrency != null ? { concurrency: options.concurrency } : {}),
   });
 
   // --- best-effort pub/sub control channel + worker-liveness heartbeat (mirror the Python SDK) ---

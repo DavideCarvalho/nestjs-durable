@@ -53,6 +53,13 @@ export interface BullMQTransportOptions {
   prefix?: string;
   /** Stable id for this worker process in heartbeats. Defaults to `ts-<hostname>-<pid>`. */
   instanceId?: string;
+  /**
+   * How many tasks this instance runs concurrently from its group's queue (the BullMQ Worker
+   * concurrency). Defaults to 1 (one task at a time). Raise it so a fanned-out batch (e.g. the N
+   * remote steps of a `gather`) executes in parallel instead of serially. Per worker process; total
+   * parallelism is `concurrency × replicas`.
+   */
+  concurrency?: number;
 }
 
 /**
@@ -85,6 +92,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   // Worker liveness (distinct from the long-step `heartbeat()` pub/sub above): a TTL'd key refreshed
   // on a timer while this instance is acting as a worker, + a client for reading peers' keys.
   private readonly instanceId: string;
+  private readonly concurrency?: number;
   private workerHeartbeatTimer?: ReturnType<typeof setInterval>;
   private workerHeartbeatRedis?: Redis;
 
@@ -93,6 +101,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.group = options.group;
     this.prefix = options.prefix ?? 'durable';
     this.instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
+    this.concurrency = options.concurrency;
   }
 
   // BullMQ queue names must not contain ':' (its Redis key separator), so use '-'.
@@ -192,6 +201,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     if (!this.taskWorker) {
       this.taskWorker = new Worker(this.tasksName(this.group), (job) => this.runTask(job.data), {
         connection: this.workerConnection(),
+        ...(this.concurrency != null ? { concurrency: this.concurrency } : {}),
       });
       // This instance is now a worker for `group` — start stamping its liveness heartbeat.
       this.startWorkerHeartbeat(this.group);

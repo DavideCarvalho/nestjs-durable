@@ -40,6 +40,12 @@ export interface DurableInAppWorkerOptions {
   prefix?: string;
   /** Stable id for this worker process in heartbeats/control. Defaults to a per-host/pid id. */
   instanceId?: string;
+  /**
+   * How many tasks the co-located worker runs concurrently from its group's queue (BullMQ Worker
+   * concurrency). Defaults to 1. Raise it so a fanned-out batch (e.g. the N remote steps of a
+   * `gather`) runs in parallel. Per process; total parallelism is `concurrency × replicas`.
+   */
+  concurrency?: number;
 }
 
 /** The resolved {@link DurableInAppWorkerOptions} or `null` when the app didn't opt in. */
@@ -129,6 +135,7 @@ export class InAppWorkerBootstrap
       connection: this.options.connection,
       ...(this.options.prefix !== undefined ? { prefix: this.options.prefix } : {}),
       ...(this.options.instanceId !== undefined ? { instanceId: this.options.instanceId } : {}),
+      ...(this.options.concurrency !== undefined ? { concurrency: this.options.concurrency } : {}),
     });
     this.runners.push(handle);
     this.runnersSink.push(handle);
