@@ -45,6 +45,14 @@ export type StepBody<T> = (log: StepLogger) => Promise<T> | T;
 
 /** Options for constructing a {@link WorkflowContext}. */
 export interface WorkflowContextOptions {
+  /**
+   * The group of the WORKFLOW this context replays (the worker's own group). When a `ctx.call` step
+   * carries no explicit group, the emitted `call` command inherits THIS group, so the step lands on
+   * the same `<prefix>-tasks-<group>` queue as the workflow — the "one group, one worker" model. The
+   * runner ({@link import('./workflow-worker').WorkflowWorker}) threads its own `group` in here.
+   * Absent → the legacy dot-prefix fallback on the step def is used (see {@link WorkflowContext.call}).
+   */
+  workflowGroup?: string | undefined;
   /** Signals delivered to the run but not yet consumed, so `waitSignal` resolves on replay. */
   pendingSignals?: Array<{ seq: number; signal: string; payload: unknown }> | undefined;
   /**
@@ -90,6 +98,7 @@ export class WorkflowContext implements WorkflowCtx {
   private readonly signalsBySeq: Map<number, { seq: number; signal: string; payload: unknown }>;
   private readonly onStep: ((event: WorkflowStepEvent) => void) | undefined;
   private readonly isCancelled: ((runId: string) => boolean) | undefined;
+  private readonly workflowGroup: string | undefined;
   private seq = 0;
 
   constructor(runId: string, history: HistoryEvent[], opts: WorkflowContextOptions = {}) {
@@ -98,6 +107,7 @@ export class WorkflowContext implements WorkflowCtx {
     this.signalsBySeq = new Map((opts.pendingSignals ?? []).map((s) => [s.seq, s]));
     this.onStep = opts.onStep;
     this.isCancelled = opts.isCancelled;
+    this.workflowGroup = opts.workflowGroup;
   }
 
   // -- internals -----------------------------------------------------------
@@ -161,6 +171,24 @@ export class WorkflowContext implements WorkflowCtx {
     return ev;
   }
 
+  /**
+   * Resolve the `group` a `ctx.call` command should carry, mirroring the Python SDK's RULE:
+   * **explicit group on the call wins; else the workflow's own group; else the legacy dot-prefix
+   * fallback** (the `<name-before-first-dot>` `remoteStep()` bakes in when no group is given).
+   *
+   * Because core's `remoteStep()` eagerly bakes the dot-prefix into `RemoteStepDef.group` (the field
+   * is never absent), "explicit" is inferred here: a group that DIFFERS from the name's dot-prefix
+   * was set deliberately and wins. A group that equals the dot-prefix is treated as the implicit
+   * default, so it yields to the workflow group when one is available — which is exactly what lets a
+   * workflow + its steps collapse onto ONE group. With no workflow group (a bare `WorkflowContext`),
+   * the dot-prefix on the def is the final fallback, preserving the pre-unification behaviour.
+   */
+  private resolveCallGroup(step: RemoteStepDef): string {
+    const dotPrefixDefault = step.name.split('.')[0] ?? step.name;
+    const explicitGroup = step.group !== dotPrefixDefault ? step.group : undefined;
+    return explicitGroup ?? this.workflowGroup ?? step.group;
+  }
+
   private guard(ev: HistoryEvent, seq: number, kind: HistoryEvent['kind'], name?: string): void {
     const nameMismatch = name !== undefined && ev.name != null && ev.name !== name;
     if (ev.kind !== kind || nameMismatch) {
@@ -181,6 +209,9 @@ export class WorkflowContext implements WorkflowCtx {
    * emit the wire `call` command. `opts` (`queue`/`priority`/`fairnessKey`/`transport`) are
    * engine-side ADMISSION concerns — accepted for `WorkflowCtx` conformance, but the remote wire
    * has no place for them, so they don't change the worker's emitted command. Mirrors Python `call`.
+   *
+   * The command's `group` defaults to the WORKFLOW's group when the step set none explicitly — see
+   * {@link resolveCallGroup} — so a workflow and its steps collapse onto one group / one worker.
    */
   async call<TInput, TOutput>(
     step: RemoteStepDef<TInput, TOutput>,
@@ -190,7 +221,8 @@ export class WorkflowContext implements WorkflowCtx {
     const seq = this.next();
     const { found, output } = this.replay(seq, 'call', step.name);
     if (found) return output as TOutput;
-    this.commands.push({ kind: 'call', seq, name: step.name, group: step.group, input });
+    const group = this.resolveCallGroup(step);
+    this.commands.push({ kind: 'call', seq, name: step.name, group, input });
     throw new Suspend();
   }
 

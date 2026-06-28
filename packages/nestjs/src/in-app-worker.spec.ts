@@ -11,7 +11,7 @@ import type {
 import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { DurableStep, Workflow } from './decorators';
+import { Step, Workflow } from './decorators';
 import { DurableModule } from './durable.module';
 import {
   IN_APP_RUN_REDIS_WORKER,
@@ -39,7 +39,7 @@ class GreetWorkflow {
 
 @Injectable()
 class Emails {
-  @DurableStep('emails.send')
+  @Step('emails.send')
   async send(input: { to: string }) {
     return { sent: input.to };
   }

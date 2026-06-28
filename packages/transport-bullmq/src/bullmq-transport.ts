@@ -379,7 +379,10 @@ export class BullMQTransport implements Transport, ControlPlane {
         removeOnFail: true,
       });
     } finally {
-      controller.onSettle(Date.now() - startedAt, ok);
+      // The engine-side task worker runs STEP handlers only (`runStepHandler`), so every settlement
+      // is a step — it feeds the adaptive measurement window. Workflow turns are replayed by the SDK
+      // worker (`redis-runner`), never here.
+      controller.onSettle(Date.now() - startedAt, ok, 'step');
     }
   }
 

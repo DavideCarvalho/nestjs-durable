@@ -187,7 +187,7 @@ export interface DurableModuleOptions {
    */
   deadLetterWorkflow?: WorkflowRef;
   /**
-   * Whether this instance plays the **worker** role: register `@DurableStep` handlers (consume the
+   * Whether this instance plays the **worker** role: register `@Step` handlers (consume the
    * transport), recover incomplete runs on boot, and poll due timers. Defaults to `true`. Set
    * `false` for a **dashboard/dispatch-only** instance (e.g. an API pod) that mounts the control
    * plane and reads the store but must not process or recover workflows — leave that to the workers.
@@ -254,7 +254,7 @@ export interface DurableModuleOptions {
   compensationRetries?: number;
   /**
    * Opt into an **in-app worker** (uniform dispatch): the same process runs the engine AND serves its
-   * own discovered `@Workflow`/`@DurableStep` on one default `group`. Each `@Workflow` is registered
+   * own discovered `@Workflow`/`@Step` on one default `group`. Each `@Workflow` is registered
    * GROUP-SERVED — its turns are dispatched to `group` over the transport and replayed by a co-located
    * worker consumer — instead of run inline. Requires a workflow-task transport (BullMQ). Omit (the
    * default) to keep every `@Workflow` on the inline fast path with zero dispatch round-trips. See
@@ -323,7 +323,7 @@ export class DurableModule {
             const context =
               opts.context ?? (accessor ? () => carrierFromAccessor(accessor) : undefined);
             // Consume side: when nestjs-context is present (an accessor is bound), re-hydrate the
-            // originating context AROUND each local step body, so a `@DurableStep` reader sees the
+            // originating context AROUND each local step body, so a `@Step` reader sees the
             // tenant/user/trace ids ambiently via nestjs-context's ALS — no consumer wrapping needed.
             // The runtime `Context` is a module-level singleton (not the accessor token), resolved
             // ONCE here via a guarded dynamic import (optional peer — failure leaves the default

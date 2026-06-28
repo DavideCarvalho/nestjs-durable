@@ -25,7 +25,7 @@ import type { RunRedisWorkerFn } from './durable-worker.module';
 
 /**
  * Opt-in config for an **in-app worker**: the same NestJS process runs the engine AND serves its own
- * discovered `@Workflow`/`@DurableStep` on one default `group`. The engine registers each `@Workflow`
+ * discovered `@Workflow`/`@Step` on one default `group`. The engine registers each `@Workflow`
  * GROUP-SERVED (its turns are dispatched to `group` over the transport via a {@link RemoteWorkflowExecutor}
  * instead of run inline), and a co-located {@link DurableWorkerRuntime} consumes `group` and replays the
  * very same TS bodies. This is the uniform-dispatch "one app, both roles" shape — every turn pays a
@@ -99,7 +99,7 @@ function inAppWorkerBinding(
 }
 
 /**
- * The consumer half of the in-app worker: on init it registers every discovered `@Workflow`/`@DurableStep`
+ * The consumer half of the in-app worker: on init it registers every discovered `@Workflow`/`@Step`
  * on a {@link DurableWorkerRuntime} (the SAME bodies the engine registered group-served), and on bootstrap
  * it starts one `runRedisWorker` consumer on the configured group, closing it on shutdown. A no-op when
  * the app didn't opt in. Mirrors the thin {@link import('./durable-worker.module').DurableWorkerModule},

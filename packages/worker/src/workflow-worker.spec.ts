@@ -7,6 +7,13 @@ function remote(name: string, group = 'g'): RemoteStepDef {
   return { name, group, input: {} as never, output: {} as never, __remote: true };
 }
 
+/** A step with NO explicit group: `remoteStep()` bakes `group = <name-before-first-dot>`, so the
+ *  group equals the dot-prefix default and yields to the workflow's group at call-build time. */
+function remoteNoGroup(name: string): RemoteStepDef {
+  const dotPrefix = name.split('.')[0] ?? name;
+  return remote(name, dotPrefix);
+}
+
 function task(over: Partial<WorkflowTask> = {}): WorkflowTask {
   return {
     taskId: 't0',
@@ -114,6 +121,42 @@ describe('WorkflowWorker.processTask decision mapping', () => {
     expect(d.error?.message).toContain('non-determinism');
     expect(d.error?.message).toContain('#0');
     expect(d.error?.message).toContain('timer');
+  });
+});
+
+describe('WorkflowWorker threads its group into ctx.call defaulting', () => {
+  it("a no-explicit-group call inherits the worker's group", async () => {
+    const wf = new WorkflowWorker('processing');
+    wf.register('wf', async (ctx) => {
+      await ctx.call(remoteNoGroup('ingest'), null);
+    });
+    const d = await wf.processTask(task());
+    const call = d.commands[0];
+    expect(call.kind).toBe('call');
+    if (call.kind === 'call') {
+      expect(call.name).toBe('ingest');
+      expect(call.group).toBe('processing'); // the workflow's own group, not the dot-prefix
+    }
+  });
+
+  it('an explicit group on the step still wins over the worker group', async () => {
+    const wf = new WorkflowWorker('processing');
+    wf.register('wf', async (ctx) => {
+      await ctx.call(remote('ingest', 'data'), null); // explicit 'data' ≠ dot-prefix 'ingest'
+    });
+    const d = await wf.processTask(task());
+    const call = d.commands[0];
+    if (call.kind === 'call') expect(call.group).toBe('data');
+  });
+
+  it("the default worker group ('workflows') is what a bare worker defaults a call to", async () => {
+    const wf = new WorkflowWorker(); // group defaults to 'workflows'
+    wf.register('wf', async (ctx) => {
+      await ctx.call(remoteNoGroup('ingest'), null);
+    });
+    const d = await wf.processTask(task());
+    const call = d.commands[0];
+    if (call.kind === 'call') expect(call.group).toBe('workflows');
   });
 });
 

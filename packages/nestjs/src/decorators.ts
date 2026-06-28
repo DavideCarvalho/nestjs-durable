@@ -139,13 +139,19 @@ export interface DurableStepMeta {
  * (e.g. the event-emitter transport) routes dispatched tasks to it. The method's single
  * argument is the step input; its return value is the step output.
  */
-export function DurableStep(name: string): MethodDecorator {
+export function Step(name: string): MethodDecorator {
   return (_target, _propertyKey, descriptor: PropertyDescriptor) => {
     const meta: DurableStepMeta = { name };
     Reflect.defineMetadata(DURABLE_STEP_METADATA, meta, descriptor.value as object);
     return descriptor;
   };
 }
+
+/**
+ * @deprecated Use `@Step` instead. `@DurableStep` is a back-compat alias of {@link Step} and
+ * writes the same `DURABLE_STEP_METADATA`, so discovery/registrars treat them identically.
+ */
+export const DurableStep = Step;
 
 // biome-ignore lint/complexity/noBannedTypes: reflect-metadata reads from the method function
 export function getDurableStepMeta(method: Function): DurableStepMeta | undefined {

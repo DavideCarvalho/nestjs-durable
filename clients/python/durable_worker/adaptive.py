@@ -257,9 +257,18 @@ class AdaptiveController:
         """A task has started — one more in flight."""
         self.in_flight += 1
 
-    def on_settle(self, duration_ms: float, ok: bool) -> None:
-        """A task has settled — record its duration and outcome, decrement in flight."""
+    def on_settle(self, duration_ms: float, ok: bool, kind: str = "step") -> None:
+        """A task has settled — decrement in flight and (for STEP tasks only) record its duration.
+
+        ``kind`` is ``'step'`` or ``'workflow'``. A unified worker shares ONE concurrency pool for
+        workflow turns and step tasks (correct — turns SUSPEND, they don't block), so ``inFlight``
+        counts BOTH. But the latency/throughput/p95 measurement window must reflect only STEP
+        completions: a 5ms workflow turn next to a 2s step would corrupt the gradient that tunes the
+        limit. So a ``'workflow'`` settle decrements in-flight and returns without touching the window
+        or the per-tick completion count. (Defaults to ``'step'`` for callers that don't tag.)"""
         self.in_flight = max(0, self.in_flight - 1)
+        if kind != "step":
+            return
         self._window.append((time.monotonic(), float(duration_ms), bool(ok)))
         self._completions_this_tick += 1
 

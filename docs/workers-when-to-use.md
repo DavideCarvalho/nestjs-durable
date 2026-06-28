@@ -1,24 +1,48 @@
 # Workers, fan-out & concurrency — when to use what
 
-This guide explains the two kinds of worker, the three ways to fan work out, and how to control
-parallelism. The recurring source of confusion ("why two workers/groups?", "why did my parallel
-fan run serially?") is answered here.
+This guide explains the worker model, the three ways to fan work out, and how to control parallelism.
 
-## The two worker types
+## One worker, one group (the default)
 
-A durable run is two different kinds of task, on two different queues:
+A durable run has two kinds of task — a **workflow turn** (replay the body to a *decision*: dispatch
+these steps / start these children / suspend — short, orchestration-only) and a **step call** (run the
+actual handler — the heavy DB/CPU/IO work). Both ride the **same queue** `<prefix>-tasks-<group>`
+(distinguished by the BullMQ job name), and **one worker** consumes both and routes each internally.
+So a workflow and its steps live on **one group, one worker**:
 
-| Task | Queue | Consumer | What it does |
-|------|-------|----------|--------------|
-| **Workflow turn** | `<prefix>-tasks-<workflowGroup>` | **WorkflowWorker** (TS) / `WorkflowWorker` (py) | Replays the workflow body to a *decision* (dispatch these steps / start these children / suspend). Short, orchestration-only. |
-| **Step call** | `<prefix>-tasks-<stepGroup>` | **step `Worker`** (`@DurableStep` / `worker.step`) | Runs the actual handler (the heavy DB/CPU/IO work) and returns a result. |
+```python
+# Python — one Worker holds the workflow AND its steps
+worker = Worker(group="processing", concurrency="adaptive")
 
-They are **separate consumers on separate groups** because they are different task types. A single
-consumer on one queue can't tell a workflow turn from a step call, so each needs its own group.
+@worker.workflow("processing")
+def processing(ctx, data): ...        # ctx.gather_calls([...]) — no group needed; inherits "processing"
 
-> If you use **remote steps** (`ctx.call` / `ctx.gather_calls`), you MUST run a step worker on the
-> step group — otherwise the dispatched calls sit in the queue with nobody to run them and the run
-> never progresses.
+@worker.step("handler")
+def handler(data): ...
+
+worker.run(redis=...)
+```
+
+```ts
+// NestJS — @Workflow + @Step discovered onto one in-app worker (one group)
+@Workflow({ name: "processing" }) class Processing { run(ctx, input) { ... } }
+class Handlers { @Step("handler") handle(input) { ... } }
+
+// Engine that delegates a remote (e.g. Python) workflow — one line:
+engine.remote("processing", { group: "processing" });
+```
+
+A step with **no explicit group inherits its workflow's group**, which is what collapses everything
+onto one group. (`@Step` is the NestJS step decorator; `@DurableStep` is a deprecated alias.)
+
+> **Splitting is opt-in (advanced).** Put a step on a *different* group than its workflow (explicit
+> `group`) and run a separate worker there to scale step execution independently of orchestration
+> (e.g. a KEDA-autoscaled step pool). You give up the one-group simplicity for independent scaling.
+> The Python `WorkflowWorker` (a workflow-only worker) still exists for this split.
+
+> If you use **remote steps** (`ctx.call` / `ctx.gather_calls`), a worker must consume the step's
+> group — by default that's the workflow's own group (handled by the unified worker above); only when
+> you split does it become a separate group you must staff.
 
 ## Three ways to fan work out
 
@@ -40,13 +64,14 @@ parent's remote group, so the **same workflow worker** consumes them — **one g
 - ❌ Creates a nested `child` run per handler (extra runs in the tree / dashboard). Good when each
   unit is genuinely its own *workflow* (has its own steps/children).
 
-### 3. `ctx.gather_calls` — N remote steps, flat, needs a step group
-Fans into N **remote steps** dispatched to a **step group**, recorded **flat** on the parent run
-(same `parallelGroup`). Requires a step `Worker` on that group (the **second worker**).
+### 3. `ctx.gather_calls` — N remote steps, flat
+Fans into N **remote steps** recorded **flat** on the parent run (same `parallelGroup`). The steps
+inherit the workflow's group by default, so the **same unified worker** runs them — no second group
+needed (unless you opt into the split for independent scaling).
 
 - ✅ Flat (no child-run wrappers), independently checkpointed per handler, runs on a **scalable
   worker pool**, can run **in parallel** (see concurrency below).
-- ❌ Needs the second group/worker. Best when handlers are leaf work (a function), not sub-workflows.
+- ❌ Best when handlers are leaf work (a function), not sub-workflows.
 
 **Rule of thumb:** leaf handlers you want flat + parallel → `gather_calls`. Each unit is its own
 workflow → `gather_children`. Cheap sequential work → `ctx.step`.
@@ -134,7 +159,10 @@ limit move and see **why** it last backed off (`ram_ceiling` / `backpressure` / 
   *limiting* (e.g. "≤5 concurrent calls to a rate-limited API"), not for speeding a fan up.
 
 ## TL;DR
-- Two workers/groups exist because **workflow turns** and **step calls** are different task types.
-- `gather_calls` dispatches in parallel but executes at the **step worker's `concurrency`** — set it
-  (default 1) or your parallel fan runs serially.
+- **One worker, one group** by default: it consumes both workflow turns and step calls (same queue,
+  job-name discriminated) and routes each. Steps with no explicit group inherit the workflow's group.
+- Splitting workflow vs step onto separate groups/workers is **opt-in**, for scaling step execution
+  independently of orchestration.
+- `gather_calls` dispatches in parallel but executes at the worker's `concurrency` — set it (default 1,
+  or `'adaptive'`) or your parallel fan runs serially. Adaptive measures **step** latency only.
 - `concurrency` (faster) and `registerQueue` admission (slower/cap) are opposite knobs.

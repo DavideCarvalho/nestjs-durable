@@ -230,12 +230,24 @@ export class AdaptiveController {
     this.inFlightCount += 1;
   }
 
-  /** A task settled — record its duration + ok/err into the window and drop in-flight. */
-  onSettle(durationMs: number, ok: boolean): void {
+  /**
+   * A task settled. ALWAYS drops in-flight and counts toward stall liveness (`completionsThisTick`),
+   * so the saturation gate, the heartbeat `inFlight`, and the "alive-but-busy" signal see every task.
+   *
+   * `kind` gates the MEASUREMENT window: only `'step'` completions push a duration into the rolling
+   * window that feeds the latency gradient / throughput / p95 / error rate. A workflow TURN
+   * (`kind: 'workflow'`) is NOT measured — a 5ms suspend sitting next to a 2s step would corrupt the
+   * gradient — but it still counts as in-flight + forward progress. This is the single concurrency
+   * pool measuring steps only. Mirror the Python unified runner: tag the kind when routing.
+   */
+  onSettle(durationMs: number, ok: boolean, kind: 'workflow' | 'step'): void {
     this.inFlightCount = Math.max(0, this.inFlightCount - 1);
+    // Forward progress for stall detection counts BOTH kinds — a worker churning workflow turns is
+    // not stalled even when no step settles this tick.
+    this.completionsThisTick += 1;
+    if (kind !== 'step') return;
     this.window.push({ durationMs, ok, at: this.now() });
     if (this.window.length > WINDOW_SIZE) this.window.shift();
-    this.completionsThisTick += 1;
   }
 
   /**

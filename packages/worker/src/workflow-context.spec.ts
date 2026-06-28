@@ -123,6 +123,43 @@ describe('WorkflowContext.call', () => {
   });
 });
 
+describe('WorkflowContext.call group defaulting', () => {
+  /** A step with NO explicit group: `remoteStep()` would bake `group = <name-before-first-dot>`, so
+   *  `group` equals the dot-prefix default and counts as "not explicit". */
+  const charge = {
+    name: 'charge',
+    group: 'charge', // == dot-prefix of 'charge' → implicit default
+    input: {} as never,
+    output: {} as never,
+    __remote: true,
+  } as const satisfies RemoteStepDef<{ amount: number }, { ok: boolean }>;
+
+  it("a no-explicit-group step inherits the workflow's group", async () => {
+    const ctx = new WorkflowContext('r1', [], { workflowGroup: 'processing' });
+    await expect(ctx.call(charge, { amount: 1 })).rejects.toBeInstanceOf(Suspend);
+    expect(ctx.commands).toEqual([
+      { kind: 'call', seq: 0, name: 'charge', group: 'processing', input: { amount: 1 } },
+    ]);
+  });
+
+  it('an explicit group wins over the workflow group', async () => {
+    // `ingest` has group 'data' (≠ dot-prefix 'ingest') → set deliberately, so it wins.
+    const ctx = new WorkflowContext('r1', [], { workflowGroup: 'processing' });
+    await expect(ctx.call(ingest, { a: 1 })).rejects.toBeInstanceOf(Suspend);
+    expect(ctx.commands).toEqual([
+      { kind: 'call', seq: 0, name: 'ingest', group: 'data', input: { a: 1 } },
+    ]);
+  });
+
+  it('falls back to the dot-prefix when no workflow group is available', async () => {
+    const ctx = new WorkflowContext('r1', []); // no workflowGroup
+    await expect(ctx.call(charge, { amount: 1 })).rejects.toBeInstanceOf(Suspend);
+    expect(ctx.commands).toEqual([
+      { kind: 'call', seq: 0, name: 'charge', group: 'charge', input: { amount: 1 } },
+    ]);
+  });
+});
+
 describe('WorkflowContext.sleep', () => {
   it('parses a duration string to ms and pushes a sleep command, then suspends', async () => {
     const ctx = new WorkflowContext('r1', []);

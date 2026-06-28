@@ -17,11 +17,12 @@ function makeController(opts: {
   return { controller, applied };
 }
 
-/** Fill the completion window with `n` settled tasks each `durationMs`, `okRatio` fraction succeeding. */
+/** Fill the completion window with `n` settled STEP tasks each `durationMs`, `okRatio` fraction
+ *  succeeding. Steps (not workflow turns) are what the measurement window is allowed to see. */
 function fill(c: AdaptiveController, n: number, durationMs: number, okRatio = 1): void {
   for (let i = 0; i < n; i++) {
     c.onStart();
-    c.onSettle(durationMs, i / n < okRatio);
+    c.onSettle(durationMs, i / n < okRatio, 'step');
   }
 }
 
@@ -71,8 +72,8 @@ describe('AdaptiveController.snapshot — the WorkerStatus contract', () => {
     expect(before.p95Ms).toBeUndefined();
     expect(before.throughputPerMin).toBeUndefined();
 
-    controller.onSettle(100, true);
-    controller.onSettle(100, true);
+    controller.onSettle(100, true, 'step');
+    controller.onSettle(100, true, 'step');
     const after = controller.snapshot();
     expect(after.inFlight).toBe(0);
     expect(after.p95Ms).toBe(100);
@@ -120,7 +121,7 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
       concurrency: { mode: 'adaptive', min: 1, max: 10, start: 8 },
     });
     controller.onStart();
-    controller.onSettle(10, true); // one fast sample seeds rttLong≈10
+    controller.onSettle(10, true, 'step'); // one fast sample seeds rttLong≈10
     fill(controller, 19, 100); // p50≈100 → gradient≈0.1 < 0.7 → shrink
     controller.tick();
     expect(controller.limit).toBeLessThan(8);
@@ -148,6 +149,46 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
     controller.tick();
     expect(controller.limit).toBe(4);
     expect(controller.snapshot().lastAdjust?.reason).toBe('backpressure');
+  });
+
+  it('workflow-turn settlements do NOT enter the measurement window or move the limit', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 10, start: 4 },
+    });
+    // A burst of WORKFLOW turns: wildly varying (gradient-corrupting) durations, all settled.
+    for (const d of [5, 2000, 3, 1500, 7, 1800, 4]) {
+      controller.onStart();
+      controller.onSettle(d, true, 'workflow');
+    }
+    // None of those reached the window → no throughput/p95 measured, and a tick can't grow/shrink.
+    const snap = controller.snapshot();
+    expect(snap.p95Ms).toBeUndefined();
+    expect(snap.throughputPerMin).toBeUndefined();
+    expect(snap.inFlight).toBe(0); // every turn still decremented in-flight
+    controller.tick();
+    expect(controller.limit).toBe(4);
+    expect(applied).toEqual([]);
+
+    // STEP settlements DO populate the window — proving the gate is kind-based, not a no-op.
+    fill(controller, 10, 100);
+    const afterSteps = controller.snapshot();
+    expect(afterSteps.p95Ms).toBe(100);
+    expect(afterSteps.throughputPerMin).toBeGreaterThan(0);
+  });
+
+  it('a workflow burst keeps the worker off the stall path (turns are forward progress)', () => {
+    const { controller } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 10, start: 4 },
+    });
+    // In-flight step work that never settles, but workflow turns keep completing each tick.
+    controller.onStart();
+    for (let tick = 0; tick < 3; tick++) {
+      controller.onStart();
+      controller.onSettle(5, true, 'workflow');
+      controller.tick();
+    }
+    // completionsThisTick saw the turns → not stalled → no backpressure shrink from the stall path.
+    expect(controller.snapshot().lastAdjust?.reason).not.toBe('backpressure');
   });
 
   it('never adjusts in fixed mode, but still tracks the window', () => {

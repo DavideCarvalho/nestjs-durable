@@ -49,6 +49,7 @@ import type {
 import type { HistoryEvent } from './interfaces';
 import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
+import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { SingletonGate } from './singleton-gate';
 import { TransportPool } from './transport-pool';
 import {
@@ -620,6 +621,37 @@ export class WorkflowEngine {
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
     if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
+  }
+
+  /**
+   * The convenience form of {@link registerRemote}: register a workflow whose body runs on a worker
+   * `group` (e.g. the Python `durable-worker`, or a separate TS worker), without hand-building a
+   * {@link RemoteWorkflowExecutor}. It wires the standard broker executor — a `RemoteWorkflowExecutor`
+   * over the engine's own transport, dispatching to `opts.group` — for you, so you write
+   * `engine.remote('processing', { group: 'processing' })` instead of
+   * `engine.registerRemote('processing', '1', { group: 'processing', executor: new RemoteWorkflowExecutor(transport, 'processing') })`.
+   *
+   * Defaults the version to `'1'`. All the other {@link registerRemote} options
+   * (`tags` / `singleton` / `executionTimeout` / `validateInput`) pass straight through. Reach for the
+   * low-level {@link registerRemote} when you need a custom {@link WorkflowExecutor} (a different
+   * transport, a fixed `timeoutMs`, a polyglot stub) — `remote()` is the standard wiring on the rails.
+   */
+  remote(
+    name: string,
+    opts: {
+      /** Worker group this workflow's turns are dispatched to (also the executor's target group). */
+      group: string;
+      /** Workflow version. Defaults to `'1'`. */
+      version?: string;
+      tags?: string[];
+      singleton?: SingletonConfig;
+      executionTimeout?: string | number;
+      validateInput?: (input: unknown) => void | Promise<void>;
+    },
+  ): void {
+    const { group, version, ...rest } = opts;
+    const executor = new RemoteWorkflowExecutor(this.pool.primary, group);
+    this.registerRemote(name, version ?? '1', { group, executor, ...rest });
   }
 
   /**

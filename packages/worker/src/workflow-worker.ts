@@ -58,6 +58,9 @@ export class WorkflowWorker {
     }
 
     const ctx = new WorkflowContext(task.runId, task.history, {
+      // A no-explicit-group `ctx.call` step inherits THIS worker's group, so the step lands on the
+      // same `<prefix>-tasks-<group>` queue as the workflow (the "one group, one worker" model).
+      workflowGroup: this.group,
       pendingSignals: task.pendingSignals,
       onStep: opts.onStep,
       isCancelled: opts.isCancelled,

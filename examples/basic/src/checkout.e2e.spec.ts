@@ -28,7 +28,7 @@ describe('checkout workflow (end-to-end)', () => {
     await moduleRef.init();
     const workflows = moduleRef.get(WorkflowService);
 
-    // reserveStock (local) → charge-card (remote, @DurableStep, suspends) → waits for approval
+    // reserveStock (local) → charge-card (remote, @Step, suspends) → waits for approval
     await workflows.start('checkout', { id: 'o1', total: 4200 }, 'run1');
     const started = await workflows.waitForRun('run1');
     expect(started.status).toBe('suspended');

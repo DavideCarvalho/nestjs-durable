@@ -247,7 +247,9 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       }
       ok = true;
     } finally {
-      controller.onSettle(Date.now() - startedAt, ok);
+      // One pool, two task kinds. Only step completions feed the adaptive measurement window; a
+      // workflow turn's duration would corrupt the latency gradient (it suspends, it doesn't block).
+      controller.onSettle(Date.now() - startedAt, ok, isWorkflowTask(task) ? 'workflow' : 'step');
       // Stop the run-scoped beat the moment the turn settles (success OR failure).
       stopBeat();
     }

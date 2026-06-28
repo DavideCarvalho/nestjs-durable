@@ -8,7 +8,7 @@ import { Injectable } from '@nestjs/common';
 import { EventEmitter2, EventEmitterModule } from '@nestjs/event-emitter';
 import { Test } from '@nestjs/testing';
 import { z } from 'zod';
-import { DurableStep } from './decorators';
+import { Step } from './decorators';
 import { Workflow } from './decorators';
 import { DurableModule } from './durable.module';
 import { WorkflowService } from './workflow.service';
@@ -23,7 +23,7 @@ const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
 
 @Injectable()
 class PaymentsWorker {
-  @DurableStep('payments.charge-card')
+  @Step('payments.charge-card')
   async charge(input: { amount: number }) {
     return { chargeId: `ch_${input.amount}` };
   }
@@ -37,8 +37,8 @@ class CheckoutWorkflow {
   }
 }
 
-describe('@DurableStep end-to-end (event-emitter transport, single process)', () => {
-  it('runs a workflow whose remote step is handled by a @DurableStep provider', async () => {
+describe('@Step end-to-end (event-emitter transport, single process)', () => {
+  it('runs a workflow whose remote step is handled by a @Step provider', async () => {
     const store = new InMemoryStateStore();
     const moduleRef = await Test.createTestingModule({
       imports: [
@@ -55,7 +55,7 @@ describe('@DurableStep end-to-end (event-emitter transport, single process)', ()
     }).compile();
     await moduleRef.init();
 
-    // The remote @DurableStep suspends the run durably; it resumes when the result lands (async).
+    // The remote @Step suspends the run durably; it resumes when the result lands (async).
     await moduleRef.get(WorkflowService).start('checkout', { amount: 42 }, 'run1');
     let result = await store.getRun('run1');
     for (

@@ -19,14 +19,14 @@ function supportsHandle(transport: unknown): transport is LocalTaskHandling {
 }
 
 /**
- * Discovers `@DurableStep` methods and registers them as step handlers on the configured
+ * Discovers `@Step` methods and registers them as step handlers on the configured
  * transport, when that transport runs handlers in-process. With a queue/remote transport the
  * handlers live in the worker process instead, so there is nothing to wire here.
  *
  * **Context re-hydration (consume side) is the consumer's responsibility.** DurableModule's
  * produce side auto-feeds an opaque carrier (`{ traceId, tenantId, userRef }`) from
  * `@dudousxd/nestjs-context` onto each dispatched `RemoteTask.context` (see DurableModule). A worker
- * that wants its `@DurableStep` reads to SEE the originating context must re-establish it from
+ * that wants its `@Step` reads to SEE the originating context must re-establish it from
  * `task.context`. We do NOT do this here because: (a) re-hydration needs nestjs-context's module-level
  * `Context.deserialize(carrier, fn)` at runtime, and it is an OPTIONAL peer we must not hard-import;
  * and (b) the in-process `StepHandler` contract is `(input, log)` — the engine never surfaces

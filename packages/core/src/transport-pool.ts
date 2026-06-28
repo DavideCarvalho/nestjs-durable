@@ -4,6 +4,7 @@ import type {
   NamedTransport,
   RemoteTask,
   StepResult,
+  Transport,
   WorkflowStepEvent,
 } from './interfaces';
 
@@ -17,6 +18,22 @@ export class TransportPool {
 
   get size(): number {
     return this.transports.length;
+  }
+
+  /**
+   * The primary (first) transport — the one `dispatch` prefers when no `preferId` is pinned. A
+   * {@link RemoteWorkflowExecutor} built by `engine.remote()` rides it (it needs a single
+   * `dispatchWorkflowTask`/`onDecision` Transport, not the whole failover pool). Throws if the pool
+   * is empty — there is nothing to dispatch a remote workflow over.
+   */
+  get primary(): Transport {
+    const first = this.transports[0];
+    if (!first) {
+      throw new Error(
+        'no transport configured — engine.remote() needs a transport (or transports)',
+      );
+    }
+    return first.transport;
   }
 
   /** Register the engine's result/heartbeat/step-event handlers on EVERY transport — a result can come

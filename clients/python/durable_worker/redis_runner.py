@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, Optional
 from .adaptive import AdaptiveController, resolve_concurrency
 from .cancellation import CancellationRegistry
 from .worker import Worker
+from .workflow import is_workflow_task
 
 # asyncio keeps only a WEAK reference to a task, so a fire-and-forget task created without retaining
 # its handle can be garbage-collected mid-flight — which surfaces as "Task was destroyed but it is
@@ -319,7 +320,12 @@ async def run_redis_worker(
     config ``dict`` (``min``/``max``/``start``/``ramCeilingPct``/``cpuCeilingPct``/``tickMs``). An
     :class:`AdaptiveController` tracks ``inFlight`` / latency / RSS / CPU for BOTH modes (so the
     heartbeat carries a live ``WorkerStatus``); in adaptive mode it also tunes the live limit.
-    """
+
+    UNIFIED: when ``worker`` also holds workflows (``@worker.workflow``), this one runner routes per
+    job off the single ``<prefix>-tasks-<group>`` queue — a WORKFLOW task (``is_workflow_task``) is
+    replayed and its decision added to ``<prefix>-decisions``; a STEP task runs its handler and the
+    result is added to ``<prefix>-results``. The shared concurrency pool counts both in-flight, but the
+    adaptive controller measures only STEP completions (``on_settle(..., kind=...)``)."""
 
     from bullmq import Queue as BullQueue  # imported lazily so the SDK works without bullmq
     from bullmq import Worker as BullWorker
@@ -334,22 +340,75 @@ async def run_redis_worker(
 
     controller = AdaptiveController(resolve_concurrency(concurrency))
 
-    async def process(job: Any, _token: str) -> None:
+    # Workflow infrastructure — built ONLY when the worker also holds workflows, so a pure step worker
+    # keeps exactly its old footprint (no decisions/step-events queue, no run-beat client).
+    has_workflows = getattr(worker, "has_workflows", False)
+    if has_workflows:
+        decisions = BullQueue(f"{prefix}-decisions", {"connection": connection})
+        step_events = BullQueue(f"{prefix}-step-events", {"connection": connection})
+        publish_step = _step_event_publisher(step_events)
+        beat_client = _run_heartbeat_client(connection)
+        beat_channel = _run_heartbeat_channel(prefix)
+
+    async def process_workflow(job: Any) -> Any:
+        # Mirror run_redis_workflow_worker.process: replay OFF the loop (a turn can run minutes and would
+        # block the heartbeat + BullMQ lock renewal → redelivery), beating a run-scoped liveness signal
+        # so the engine doesn't wrongly re-drive a slow-but-alive run. Cancel the beat once it settles.
+        beat_task = (
+            asyncio.create_task(
+                _beat_run(beat_client, beat_channel, job.data.get("runId"), group)
+            )
+            if beat_client is not None
+            else None
+        )
+        try:
+            decision = await asyncio.to_thread(
+                worker.process_workflow_task, job.data, publish_step, registry.is_cancelled
+            )
+        finally:
+            if beat_task is not None:
+                beat_task.cancel()
+                try:
+                    await beat_task
+                except asyncio.CancelledError:
+                    pass
+        await decisions.add(
+            "decision", decision, {"removeOnComplete": True, "removeOnFail": True}
+        )
+        return decision
+
+    async def process_step(job: Any) -> Any:
         on_event = _make_on_event(job.data, publish_progress) if publish_progress else None
-        # Bracket the handler with the controller's in-flight / settle hooks so adaptive control and
-        # the status snapshot see live load. ``time.monotonic`` (not wall) for an immune-to-clock-skew
-        # duration; ``ok`` reflects the wire result's status, so a failed step counts toward errorRate.
+        result = await worker.aprocess_task(
+            job.data, is_cancelled=registry.is_cancelled, on_event=on_event
+        )
+        await results.add("result", result, {"removeOnComplete": True, "removeOnFail": True})
+        return result
+
+    async def process(job: Any, _token: str) -> Any:
+        # Route per job: a workflow turn vs a step task. Both share the concurrency pool, so the
+        # in-flight / settle bracket wraps EITHER — but the controller's measurement window only takes
+        # step completions (``kind``), so a fast suspending turn can't corrupt the latency gradient.
+        # ``time.monotonic`` (not wall) for a clock-skew-immune duration; ``ok`` reflects the wire
+        # status so a failed step counts toward errorRate.
+        is_workflow = has_workflows and is_workflow_task(job.data)
         controller.on_start()
         started = time.monotonic()
         ok = False
         try:
-            result = await worker.aprocess_task(
-                job.data, is_cancelled=registry.is_cancelled, on_event=on_event
-            )
-            ok = result.get("status") == "completed"
+            if is_workflow:
+                outcome = await process_workflow(job)
+                ok = outcome.get("status") != "failed"
+            else:
+                outcome = await process_step(job)
+                ok = outcome.get("status") == "completed"
+            return outcome
         finally:
-            controller.on_settle((time.monotonic() - started) * 1000.0, ok)
-        await results.add("result", result, {"removeOnComplete": True, "removeOnFail": True})
+            controller.on_settle(
+                (time.monotonic() - started) * 1000.0,
+                ok,
+                kind="workflow" if is_workflow else "step",
+            )
 
     # Seed BullMQ with the controller's starting limit (fixed N or the adaptive start).
     worker_opts: Dict[str, Any] = {"connection": connection, "concurrency": controller.limit}

@@ -1,4 +1,4 @@
-import { DurableStep } from '@dudousxd/nestjs-durable';
+import { Step } from '@dudousxd/nestjs-durable';
 import { Injectable } from '@nestjs/common';
 
 /**
@@ -7,7 +7,7 @@ import { Injectable } from '@nestjs/common';
  */
 @Injectable()
 export class PaymentsWorker {
-  @DurableStep('payments.charge-card')
+  @Step('payments.charge-card')
   async charge(input: { orderId: string; amountCents: number }): Promise<{ chargeId: string }> {
     // await stripe.charge(...)
     return { chargeId: `ch_${input.orderId}_${input.amountCents}` };

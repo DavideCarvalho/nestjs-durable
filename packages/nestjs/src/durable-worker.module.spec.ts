@@ -8,7 +8,7 @@ import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { z } from 'zod';
-import { DurableStep, Workflow } from './decorators';
+import { Step, Workflow } from './decorators';
 import {
   DURABLE_WORKER_RUNNERS,
   DurableWorkerModule,
@@ -34,7 +34,7 @@ class CheckoutWorkflow {
 
 @Injectable()
 class PaymentsWorker {
-  @DurableStep('payments.charge')
+  @Step('payments.charge')
   async charge(input: { amount: number }) {
     return { chargeId: `ch_${input.amount}` };
   }
@@ -67,7 +67,7 @@ function fakeRunner(): FakeRunner {
 }
 
 describe('DurableWorkerModule', () => {
-  it('registers @Workflow + @DurableStep on a store-less DurableWorkerRuntime', async () => {
+  it('registers @Workflow + @Step on a store-less DurableWorkerRuntime', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
       imports: [DurableWorkerModule.forRoot({ connection: 'redis://x', groups: ['payments'] })],
@@ -107,7 +107,7 @@ describe('DurableWorkerModule', () => {
       expect(out.decision.status).toBe('continue');
     }
 
-    // Drive the remote step task → it runs the @DurableStep handler and returns a result.
+    // Drive the remote step task → it runs the @Step handler and returns a result.
     const stepOut = await runtime.handleTask({
       runId: 'run1',
       seq: 1,

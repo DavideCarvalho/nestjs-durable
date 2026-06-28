@@ -342,16 +342,29 @@ class _SubProcess:
 
 
 class Worker:
-    """Registers step handlers by name and turns a dispatched task into a result.
+    """A unified durable worker: registers step handlers AND workflows by name on ONE group, and
+    turns a dispatched task into a result (step) or a decision (workflow).
 
-    Example::
+    Workflow turns and step tasks ride the SAME queue ``<prefix>-tasks-<group>`` (distinguished on the
+    wire by job shape — see :func:`~durable_worker.workflow.is_workflow_task`), so one ``Worker`` on
+    one group runs both — no separate ``WorkflowWorker`` / second group required::
 
-        worker = Worker(group="payments")
+        worker = Worker("processing", concurrency="adaptive")
 
-        @worker.step("payments.charge-card")
-        async def charge(data):
-            res = await stripe.charge(data["orderId"], data["amountCents"])
-            return {"chargeId": res.id}
+        @worker.workflow("processing")
+        def pipeline(ctx, base_id):
+            key = ctx.step("setup", lambda: f"/{base_id}/data.csv")
+            rows = ctx.call("ingest", {"key": key})   # no group → inherits "processing"
+            return {"rows": rows}
+
+        @worker.step("ingest", blocking=True)
+        def ingest(data, ctx): ...
+
+        worker.run()                 # or run_workers([worker])
+
+    A pure step-only worker (no ``@worker.workflow``) behaves exactly as before. The advanced split —
+    a workflow worker and a step worker on DIFFERENT groups — is still available via the deprecated
+    :class:`~durable_worker.workflow.WorkflowWorker` + ``run_workers([wf, steps])``.
     """
 
     def __init__(
@@ -374,6 +387,9 @@ class Worker:
         self.concurrency = concurrency
         self._handlers: Dict[str, Handler] = {}
         self._blocking: Dict[str, bool] = {}
+        # Workflows this worker also holds (unified worker). Empty for a pure step worker. Keyed by
+        # workflow name; the runner routes a workflow task here and a step task to ``_handlers``.
+        self._workflows: Dict[str, Handler] = {}
         # Auto-register into the module-level registry so :func:`run_all` can discover this worker
         # without the consumer listing it. Opt out with ``auto_register=False`` (one-off/test workers).
         if auto_register:
@@ -397,6 +413,43 @@ class Worker:
 
     def handles(self, name: str) -> bool:
         return name in self._handlers
+
+    def workflow(self, name: str) -> Callable[[Handler], Handler]:
+        """Decorator registering ``fn`` as the workflow ``name`` on THIS worker (unified worker).
+
+        ``fn(ctx, input)`` (or ``fn(ctx)``) — same authoring surface as
+        :meth:`WorkflowWorker.workflow`. The worker's runner replays a workflow turn for this name and
+        runs ``@worker.step`` handlers for step tasks, both off the one ``<prefix>-tasks-<group>`` queue."""
+
+        def register(fn: Handler) -> Handler:
+            self._workflows[name] = fn
+            return fn
+
+        return register
+
+    def handles_workflow(self, name: str) -> bool:
+        return name in self._workflows
+
+    @property
+    def has_workflows(self) -> bool:
+        """True once any ``@worker.workflow`` is registered — the runner then routes workflow tasks
+        through the replay path instead of treating every job as a step."""
+        return bool(self._workflows)
+
+    def process_workflow_task(
+        self,
+        task: Dict[str, Any],
+        on_step: Optional[Callable[[Dict[str, Any]], None]] = None,
+        is_cancelled: Optional[Callable[[str], bool]] = None,
+    ) -> Dict[str, Any]:
+        """Replay one turn of a workflow task and return its wire-format decision. The worker's own
+        :attr:`group` is threaded into the :class:`~durable_worker.workflow.WorkflowContext`, so a step
+        ``call`` with no explicit group inherits this worker's group (one group → one worker)."""
+        from .workflow import process_workflow_task  # lazy: avoid an import cycle with workflow.py
+
+        return process_workflow_task(
+            self._workflows, task, on_step=on_step, is_cancelled=is_cancelled, group=self.group
+        )
 
     def run(self, *, redis: str = "redis://localhost:6379", prefix: str = "durable") -> None:
         """Run this worker against the Redis/BullMQ transport until the process is signalled, then

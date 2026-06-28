@@ -33,13 +33,13 @@ export function scanWorkflows(
 }
 
 /**
- * Walks every provider method that carries `@DurableStep` metadata and invokes
+ * Walks every provider method that carries `@Step` metadata and invokes
  * `register(meta, boundHandler)`.
  *
  * Guards applied (same as both registrars):
  *   - null / non-object provider instances are skipped
  *   - non-function methods are skipped
- *   - methods without `@DurableStep` metadata are skipped
+ *   - methods without `@Step` metadata are skipped
  *
  * The handler passed to `register` is already bound to its instance.
  */

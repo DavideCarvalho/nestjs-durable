@@ -94,8 +94,14 @@ class WorkflowContext:
         pending_signals: Optional[List[Dict[str, Any]]] = None,
         on_step: Optional[Callable[[Dict[str, Any]], None]] = None,
         is_cancelled: Optional[Callable[[str], bool]] = None,
+        group: Optional[str] = None,
     ) -> None:
         self.run_id = run_id
+        # The workflow's OWN group — the queue this worker consumes. A step ``call`` with no explicit
+        # group defaults to this, so steps land on the SAME queue as the workflow (one group → one
+        # worker). The runtime threads it in via :func:`process_workflow_task`; None when unknown (a
+        # bare ``WorkflowContext`` built in a test), in which case ``call`` requires an explicit group.
+        self._group = group
         self._history: Dict[int, Dict[str, Any]] = {e["seq"]: e for e in history}
         self._signals_by_seq: Dict[int, Dict[str, Any]] = {
             s["seq"]: s for s in (pending_signals or [])
@@ -184,16 +190,32 @@ class WorkflowContext:
         return ev
 
     # -- the workflow API ----------------------------------------------------
-    def call(self, name: str, input: Any = None, *, group: str) -> Any:
-        """Dispatch a remote step (any-language worker in ``group``) and await its result."""
+    def call(self, name: str, input: Any = None, *, group: Optional[str] = None) -> Any:
+        """Dispatch a remote step (any-language worker in ``group``) and await its result.
+
+        ``group`` is OPTIONAL: an explicit group on the call wins; otherwise the step inherits the
+        workflow's OWN group (so a workflow and its steps share one queue / one worker). It is a
+        :class:`WorkflowError` only when neither is available (a bare context with no group)."""
         seq = self._next()
         found, output = self._replay(seq, "call", name)
         if found:
             return output
         self.commands.append(
-            {"kind": "call", "seq": seq, "name": name, "group": group, "input": input}
+            {"kind": "call", "seq": seq, "name": name, "group": self._resolve_group(group, name),
+             "input": input}
         )
         raise _Suspend()
+
+    def _resolve_group(self, group: Optional[str], name: str) -> str:
+        """Explicit call group wins; else the workflow's own group. The single defaulting choke point
+        shared by ``call`` and ``gather_calls`` (must match the TS SDK's rule)."""
+        resolved = group if group is not None else self._group
+        if resolved is None:
+            raise WorkflowError(
+                f"call {name!r} has no group and the workflow has no group to inherit; "
+                "pass group= on the call or construct the worker with a group"
+            )
+        return resolved
 
     def step(self, name: str, body: Callable[[], Any]) -> Any:
         """Run a LOCAL step once and record its result, so side effects / non-determinism
@@ -501,7 +523,8 @@ class WorkflowContext:
         for seq, (name, input_, call_group), ev in zip(seqs, normalized, histories):
             if ev is None:
                 self.commands.append(
-                    {"kind": "call", "seq": seq, "name": name, "group": call_group,
+                    {"kind": "call", "seq": seq, "name": name,
+                     "group": self._resolve_group(call_group, name),
                      "input": input_, "parallelGroup": group_tag}
                 )
                 pending = True
@@ -514,18 +537,86 @@ class WorkflowContext:
 WorkflowFn = Callable[..., Any]
 
 
+def is_workflow_task(task: Dict[str, Any]) -> bool:
+    """True when ``task`` is a WORKFLOW turn (vs a step task). Mirrors the TS ``isWorkflowTask``
+    (``runner-core.ts``): a workflow task carries a string ``workflow`` name AND a ``history`` list.
+    The unified runner routes on this to send turns through the workflow replay and steps through the
+    step handler — both ride the SAME ``<prefix>-tasks-<group>`` queue."""
+    return isinstance(task.get("workflow"), str) and isinstance(task.get("history"), list)
+
+
+def process_workflow_task(
+    workflows: Dict[str, WorkflowFn],
+    task: Dict[str, Any],
+    on_step: Optional[Callable[[Dict[str, Any]], None]] = None,
+    is_cancelled: Optional[Callable[[str], bool]] = None,
+    group: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Replay one turn of ``task``'s workflow against ``workflows`` and return the wire decision.
+
+    The shared core behind both :meth:`WorkflowWorker.process_task` and the unified
+    :class:`~durable_worker.worker.Worker`'s workflow path. ``group`` is the worker's own group,
+    threaded into the :class:`WorkflowContext` so a step ``call`` with no explicit group inherits it.
+    """
+    base = {"taskId": task.get("taskId"), "runId": task.get("runId")}
+    fn = workflows.get(task.get("workflow"))
+    if fn is None:
+        return {
+            **base,
+            "status": "failed",
+            "commands": [],
+            "error": {
+                "message": f"no workflow registered for {task.get('workflow')!r}",
+                "code": "no_workflow",
+            },
+        }
+    ctx = WorkflowContext(
+        task.get("runId"),
+        task.get("history", []),
+        task.get("pendingSignals"),
+        on_step=on_step,
+        is_cancelled=is_cancelled,
+        group=group,
+    )
+    try:
+        output = _invoke_workflow(fn, ctx, task.get("input"))
+        return {**base, "status": "completed", "commands": ctx.commands, "output": output}
+    except _Suspend:
+        return {**base, "status": "continue", "commands": ctx.commands}
+    except Cancelled:
+        # Cancelled at an op boundary (run cancelled mid-turn). Bail without clobbering: the engine
+        # already set status=cancelled. Return the steps that DID run this turn so it can record
+        # partial progress / where the run stopped.
+        return {**base, "status": "cancelled", "commands": ctx.commands}
+    except StepFailed as err:
+        return {**base, "status": "failed", "commands": ctx.commands, "error": err.error}
+    except Exception as err:  # noqa: BLE001
+        return {**base, "status": "failed", "commands": ctx.commands, "error": _to_error(err)}
+
+
 def _normalize_call(call: Any) -> "tuple":
-    """Coerce a ``gather_calls`` entry into ``(name, input, group)``. Accepts the ``{"name","input",
-    "group"}`` dict form and the 3-tuple ``(name, input, group)`` shorthand."""
+    """Coerce a ``gather_calls`` entry into ``(name, input, group_or_None)``. Accepts the
+    ``{"name","input","group"}`` dict form and the ``(name, input, group)`` tuple — in both, ``group``
+    is OPTIONAL (omit it to inherit the workflow's group). The 2-tuple ``(name, input)`` is accepted
+    too as the no-group shorthand."""
     if isinstance(call, dict):
-        return call["name"], call.get("input"), call["group"]
+        return call["name"], call.get("input"), call.get("group")
+    if len(call) == 2:
+        name, input_ = call
+        return name, input_, None
     name, input_, group = call
     return name, input_, group
 
 
 class WorkflowWorker:
     """Registers workflow functions by name and turns a workflow task into a decision. Pure and
-    transport-free (``process_task`` is a function of the task), so it's testable without a broker."""
+    transport-free (``process_task`` is a function of the task), so it's testable without a broker.
+
+    .. deprecated::
+        Prefer the unified :class:`~durable_worker.worker.Worker`, which holds workflows AND steps on
+        ONE group (``@worker.workflow(name)`` + ``@worker.step(name)``, then ``worker.run()``).
+        ``WorkflowWorker`` stays as a working alias for the advanced split — running the workflow and
+        step workers on SEPARATE groups via ``run_workers([wf_worker, step_worker])``."""
 
     def __init__(self, group: str = "workflows", *, auto_register: bool = True) -> None:
         self.group = group
@@ -598,39 +689,9 @@ class WorkflowWorker:
         given, streams each local step's lifecycle (running → completed/failed) to the engine live.
         ``is_cancelled`` lets the replay bail at an op boundary when the run was cancelled (returns a
         ``cancelled`` decision) and feeds ``ctx.cancelled`` for cooperative mid-step checks."""
-        base = {"taskId": task.get("taskId"), "runId": task.get("runId")}
-        fn = self._workflows.get(task.get("workflow"))
-        if fn is None:
-            return {
-                **base,
-                "status": "failed",
-                "commands": [],
-                "error": {
-                    "message": f"no workflow registered for {task.get('workflow')!r}",
-                    "code": "no_workflow",
-                },
-            }
-        ctx = WorkflowContext(
-            task.get("runId"),
-            task.get("history", []),
-            task.get("pendingSignals"),
-            on_step=on_step,
-            is_cancelled=is_cancelled,
+        return process_workflow_task(
+            self._workflows, task, on_step=on_step, is_cancelled=is_cancelled, group=self.group
         )
-        try:
-            output = _invoke_workflow(fn, ctx, task.get("input"))
-            return {**base, "status": "completed", "commands": ctx.commands, "output": output}
-        except _Suspend:
-            return {**base, "status": "continue", "commands": ctx.commands}
-        except Cancelled:
-            # Cancelled at an op boundary (run cancelled mid-turn). Bail without clobbering: the engine
-            # already set status=cancelled. Return the steps that DID run this turn so it can record
-            # partial progress / where the run stopped.
-            return {**base, "status": "cancelled", "commands": ctx.commands}
-        except StepFailed as err:
-            return {**base, "status": "failed", "commands": ctx.commands, "error": err.error}
-        except Exception as err:  # noqa: BLE001
-            return {**base, "status": "failed", "commands": ctx.commands, "error": _to_error(err)}
 
 
 def _invoke_workflow(fn: WorkflowFn, ctx: WorkflowContext, input_: Any) -> Any:

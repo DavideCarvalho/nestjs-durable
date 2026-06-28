@@ -22,7 +22,7 @@ import { scanSteps, scanWorkflows } from './discovery-helpers';
 /**
  * Options for a **store-less thin worker** process: where to consume (`connection`/`prefix`) and
  * which worker `groups` this process serves. There is deliberately NO `store`, `transport`, engine,
- * dashboard, recovery, or timer config — a thin worker only registers `@Workflow`/`@DurableStep`
+ * dashboard, recovery, or timer config — a thin worker only registers `@Workflow`/`@Step`
  * handlers and runs the BullMQ consumer (see {@link DurableWorkerModule}).
  */
 export interface DurableWorkerModuleOptions {
@@ -92,7 +92,7 @@ export class ThinWorkflowRegistrar implements OnModuleInit {
 }
 
 /**
- * Discovers every `@DurableStep` method and registers it as a step handler on the thin
+ * Discovers every `@Step` method and registers it as a step handler on the thin
  * {@link DurableWorkerRuntime}. Mirrors the engine-side `DurableStepRegistrar`, but always registers
  * on the runtime (a thin worker IS the consumer — there is no in-process-vs-queue branch).
  */
@@ -154,7 +154,7 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
 
 /**
  * A NestJS dynamic module that turns an app into a **PURE durable worker**: it discovers
- * `@Workflow`/`@DurableStep` providers, registers them on the thin {@link DurableWorkerRuntime}, and
+ * `@Workflow`/`@Step` providers, registers them on the thin {@link DurableWorkerRuntime}, and
  * runs one BullMQ consumer per group via `runRedisWorker`. It is **control-plane-less** — it binds
  * NO `WorkflowEngine`, NO store/ORM, NO dashboard, NO timer poller, NO recovery, and NO run dispatch.
  * Use it for a worker pod that only executes work an engine elsewhere coordinates.
