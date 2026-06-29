@@ -40,6 +40,7 @@ export class WorkflowRunEntity {
   wakeAt?: Date;
   lockedBy?: string;
   lockedUntil?: Date;
+  awaitingDecisionTaskId?: string;
   recoveryAttempts?: number;
   tags?: string[] | null;
   searchAttributes?: Record<string, string | number | boolean> | null;
@@ -132,6 +133,13 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       wakeAt: { type: 'Date', nullable: true, fieldName: col('wakeAt') },
       lockedBy: { type: 'string', nullable: true, fieldName: col('lockedBy') },
       lockedUntil: { type: 'Date', nullable: true, fieldName: col('lockedUntil') },
+      // REMOTE turn the engine suspended on awaiting a decision; matched by completeRemoteDecision so
+      // only the currently-awaited turn's decision is applied. Nullable: cleared when a decision lands.
+      awaitingDecisionTaskId: {
+        type: 'string',
+        nullable: true,
+        fieldName: col('awaitingDecisionTaskId'),
+      },
       recoveryAttempts: { type: 'integer', nullable: true, fieldName: col('recoveryAttempts') },
       tags: { type: 'json', nullable: true, fieldName: col('tags') },
       searchAttributes: { type: 'json', nullable: true, fieldName: col('searchAttributes') },

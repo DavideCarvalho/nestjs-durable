@@ -5,6 +5,7 @@ import type {
   RemoteTask,
   StepResult,
   Transport,
+  WorkflowDecision,
   WorkflowStepEvent,
 } from './interfaces';
 
@@ -43,12 +44,19 @@ export class TransportPool {
     onResult: (result: StepResult) => Promise<void>,
     onHeartbeat: (beat: Heartbeat) => Promise<void>,
     onStepEvent?: (event: WorkflowStepEvent) => Promise<void>,
+    onDecision?: (decision: WorkflowDecision) => Promise<void>,
   ): void {
     for (const { transport } of this.transports) {
       transport.onResult(onResult);
       transport.onHeartbeat(onHeartbeat);
       if (onStepEvent && transport.onStepEvent) {
         transport.onStepEvent(onStepEvent);
+      }
+      // A workflow-turn decision can come back on whichever transport carried the task — and on
+      // whichever ENGINE INSTANCE consumes it (point-to-point), which may NOT be the dispatcher. The
+      // engine applies it durably by run id, so binding it here (like onResult) is multi-instance safe.
+      if (onDecision && transport.onDecision) {
+        transport.onDecision(onDecision);
       }
     }
   }

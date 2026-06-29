@@ -92,6 +92,8 @@ export class TypeOrmStateStore implements StateStore {
     if ('lockedBy' in patch) update.lockedBy = patch.lockedBy ?? null;
     if ('lockedUntil' in patch)
       update.lockedUntil = patch.lockedUntil == null ? null : new Date(patch.lockedUntil);
+    if ('awaitingDecisionTaskId' in patch)
+      update.awaitingDecisionTaskId = patch.awaitingDecisionTaskId ?? null;
     if ('recoveryAttempts' in patch) update.recoveryAttempts = patch.recoveryAttempts;
     if ('tags' in patch) update.tags = patch.tags ?? null;
     if ('searchAttributes' in patch) update.searchAttributes = patch.searchAttributes ?? null;
@@ -357,6 +359,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     ...(run.wakeAt == null ? {} : { wakeAt: new Date(run.wakeAt) }),
     lockedBy: run.lockedBy ?? null,
     ...(run.lockedUntil == null ? {} : { lockedUntil: new Date(run.lockedUntil) }),
+    awaitingDecisionTaskId: run.awaitingDecisionTaskId ?? null,
     ...(run.recoveryAttempts === undefined ? {} : { recoveryAttempts: run.recoveryAttempts }),
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
@@ -378,6 +381,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     wakeAt: e.wakeAt == null ? undefined : e.wakeAt.getTime(),
     lockedBy: e.lockedBy ?? undefined,
     lockedUntil: e.lockedUntil == null ? undefined : e.lockedUntil.getTime(),
+    awaitingDecisionTaskId: e.awaitingDecisionTaskId ?? undefined,
     recoveryAttempts: e.recoveryAttempts ?? undefined,
     tags: e.tags ?? undefined,
     searchAttributes: e.searchAttributes ?? undefined,

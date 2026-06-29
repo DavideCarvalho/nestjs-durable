@@ -141,6 +141,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ${runsCol('status')} ${str} NOT NULL,
       ${runsCol('input')} ${txt}, ${runsCol('output')} ${txt}, ${runsCol('error')} ${txt},
       ${runsCol('wakeAt')} ${ts}, ${runsCol('lockedBy')} ${str}, ${runsCol('lockedUntil')} ${ts},
+      ${runsCol('awaitingDecisionTaskId')} ${str},
       ${runsCol('recoveryAttempts')} ${int}, ${runsCol('tags')} ${txt}, ${runsCol('searchAttributes')} ${txt},
       ${runsCol('priority')} ${int},
       ${runsCol('createdAt')} ${ts} NOT NULL, ${runsCol('updatedAt')} ${ts} NOT NULL
@@ -182,6 +183,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ['input', txt],
       ['output', txt],
       ['error', txt],
+      ['awaitingDecisionTaskId', str],
       ['recoveryAttempts', int],
       ['tags', txt],
       ['searchAttributes', txt],

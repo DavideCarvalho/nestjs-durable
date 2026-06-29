@@ -1,8 +1,6 @@
-import { RemoteWorkflowTimeout } from './errors';
 import type {
   HistoryEvent,
   Transport,
-  WorkflowDecision,
   WorkflowExecutor,
   WorkflowRun,
   WorkflowTask,
@@ -12,44 +10,44 @@ let taskCounter = 0;
 
 /**
  * A {@link WorkflowExecutor} backed by a {@link Transport}: it advances a remote workflow by
- * dispatching a {@link WorkflowTask} over the broker and awaiting the matching {@link WorkflowDecision}
- * (correlated by `taskId`). Pass one to `engine.registerRemote(name, version, { group, executor })` so
- * a workflow authored in another SDK (e.g. the Python `durable-worker`) is driven over Redis/BullMQ.
+ * DISPATCHING a {@link WorkflowTask} over the broker and returning the dispatched `taskId` WITHOUT
+ * awaiting the decision. Pass one to `engine.registerRemote(name, version, { group, executor })` so a
+ * workflow authored in another SDK (e.g. the Python `durable-worker`) is driven over Redis/BullMQ.
  *
- * Recovery-safe: if the engine crashes awaiting a decision, the re-drive dispatches a fresh task with
- * the same history — the worker's replay is deterministic, so it returns the same decision; a late
- * decision for the old `taskId` simply finds no waiter and is dropped.
+ * Multi-instance safe by construction: the executor holds NO in-memory state correlating a dispatched
+ * turn to its decision. The engine suspends the run recording the dispatched `taskId`, and the
+ * worker's {@link import('./interfaces').WorkflowDecision} is delivered over the transport's
+ * `onDecision` and applied DURABLY (by run id) on whatever engine instance consumes it — even if that
+ * is not the instance that dispatched the turn. A point-to-point broker can therefore hand the
+ * decision to any instance without it being dropped (the bug this design fixes).
+ *
+ * Recovery-safe: if the engine crashes (or a decision is genuinely lost because the worker died), the
+ * suspended turn's heartbeat-rearmed window (`remoteAdvanceSilenceMs`) lapses and the timer poller
+ * re-dispatches a fresh task with the same history — the worker's replay is deterministic, so it
+ * returns the same decision; a late decision for the old `taskId` no longer matches the run's
+ * currently-awaited turn and is dropped.
  */
 export class RemoteWorkflowExecutor implements WorkflowExecutor {
-  private readonly pending = new Map<string, (decision: WorkflowDecision) => void>();
-  private subscribed = false;
-
   constructor(
     private readonly transport: Transport,
     private readonly group: string,
-    private readonly opts: { timeoutMs?: number } = {},
+    // Accepted for source compatibility; liveness now lives on the engine's suspended-turn window
+    // (`remoteAdvanceSilenceMs`) + recovery re-drive, not an in-memory per-turn timeout.
+    _opts: { timeoutMs?: number } = {},
   ) {}
 
-  private ensureSubscribed(): void {
-    if (this.subscribed) return;
-    if (!this.transport.onDecision) {
-      throw new Error('transport does not support workflow decisions (onDecision)');
-    }
-    this.subscribed = true;
-    this.transport.onDecision(async (decision) => {
-      const resolve = this.pending.get(decision.taskId);
-      if (resolve) {
-        this.pending.delete(decision.taskId);
-        resolve(decision);
-      }
-    });
-  }
-
-  async advance(run: WorkflowRun, history: HistoryEvent[]): Promise<WorkflowDecision> {
+  /**
+   * Dispatch one workflow turn and return its `taskId`. Does NOT await the decision — the engine
+   * suspends the run on the returned `taskId` and applies the decision durably via `onDecision`.
+   */
+  async dispatch(
+    run: WorkflowRun,
+    history: HistoryEvent[],
+    pendingSignals?: WorkflowTask['pendingSignals'],
+  ): Promise<{ taskId: string }> {
     if (!this.transport.dispatchWorkflowTask) {
       throw new Error('transport does not support workflow tasks (dispatchWorkflowTask)');
     }
-    this.ensureSubscribed();
     taskCounter += 1;
     const taskId = `${run.id}:wf:${taskCounter}`;
     const task: WorkflowTask = {
@@ -59,25 +57,12 @@ export class RemoteWorkflowExecutor implements WorkflowExecutor {
       workflowVersion: run.workflowVersion,
       input: run.input,
       history,
+      ...(pendingSignals ? { pendingSignals } : {}),
       group: this.group,
       priority: run.priority,
       attempt: 1,
     };
-    const decision = new Promise<WorkflowDecision>((resolve, reject) => {
-      this.pending.set(taskId, resolve);
-      const { timeoutMs } = this.opts;
-      if (timeoutMs) {
-        const timer = setTimeout(() => {
-          this.pending.delete(taskId);
-          // A RECOVERABLE timeout, not a run failure: the decision may merely have been dropped while
-          // the work completed. The engine catches this distinct type and re-drives via recovery
-          // instead of failing the run. See RemoteWorkflowTimeout for the (opt-in) hazard note.
-          reject(new RemoteWorkflowTimeout(taskId, timeoutMs));
-        }, timeoutMs);
-        (timer as { unref?: () => void }).unref?.();
-      }
-    });
     await this.transport.dispatchWorkflowTask(task);
-    return decision;
+    return { taskId };
   }
 }

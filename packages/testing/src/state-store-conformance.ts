@@ -223,6 +223,15 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(r?.lockedBy).toBe('owner-2');
         expect(r?.wakeAt).toBe(123_456);
         expect(r?.lockedUntil).toBe(222_222);
+
+        // The multi-instance REMOTE-decision marker must round-trip AND clear: the engine sets it
+        // when it suspends on an awaited turn and clears it (`undefined`) when the decision lands. An
+        // adapter that drops it on read, or ignores `undefined` instead of writing NULL, would silently
+        // break completeRemoteDecision (it reads back the stale/absent marker and discards the decision).
+        await store.updateRun('r1', { awaitingDecisionTaskId: 'turn-7' });
+        expect((await store.getRun('r1'))?.awaitingDecisionTaskId).toBe('turn-7');
+        await store.updateRun('r1', { awaitingDecisionTaskId: undefined });
+        expect((await store.getRun('r1'))?.awaitingDecisionTaskId).toBeUndefined();
       },
     );
 

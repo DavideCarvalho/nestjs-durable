@@ -458,6 +458,10 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   if (run.wakeAt != null) e.wakeAt = new Date(run.wakeAt);
   if (run.lockedBy !== undefined) e.lockedBy = run.lockedBy;
   if (run.lockedUntil != null) e.lockedUntil = new Date(run.lockedUntil);
+  // Mirror lockedBy: leave the fresh entity's own-`undefined` field untouched when the patch clears
+  // the marker, so Object.assign(entity, e) writes NULL (the engine clears it when a decision lands).
+  if (run.awaitingDecisionTaskId !== undefined)
+    e.awaitingDecisionTaskId = run.awaitingDecisionTaskId;
   if (run.recoveryAttempts !== undefined) e.recoveryAttempts = run.recoveryAttempts;
   e.tags = run.tags ?? null;
   e.searchAttributes = run.searchAttributes ?? null;
@@ -480,6 +484,7 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     wakeAt: e.wakeAt?.getTime(),
     lockedBy: e.lockedBy ?? undefined,
     lockedUntil: e.lockedUntil?.getTime(),
+    awaitingDecisionTaskId: e.awaitingDecisionTaskId ?? undefined,
     recoveryAttempts: e.recoveryAttempts ?? undefined,
     tags: e.tags ?? undefined,
     searchAttributes: e.searchAttributes ?? undefined,

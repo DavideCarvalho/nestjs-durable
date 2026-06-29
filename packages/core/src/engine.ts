@@ -426,14 +426,27 @@ export class WorkflowEngine {
       },
       // A heartbeat resets the liveness window for whatever it targets: an in-flight long STEP (keyed
       // by stepId, see callRemote) or — when stepId is absent — the in-flight workflow TURN (keyed by
-      // runId, see runRemoteExecution's heartbeat-rearmed advance).
+      // runId). For an INLINE-advance turn the reset is an in-memory callback; for a DISPATCH-suspend
+      // turn there is no in-memory waiter, so a run-scoped beat rearms the suspended turn's durable
+      // re-drive deadline (`wakeAt`) instead, keeping a live worker's turn from being re-dispatched.
       async (beat) => {
-        this.heartbeatResets.get(beat.stepId ?? beat.runId)?.();
+        const reset = this.heartbeatResets.get(beat.stepId ?? beat.runId);
+        if (reset) {
+          reset();
+          return;
+        }
+        if (beat.stepId === undefined) await this.rearmDecisionDeadline(beat.runId);
       },
       // A remote workflow worker streams each local step's lifecycle (running → completed/failed) so
       // it's checkpointed live, not all-at-once when the long turn ends.
       async (event) => {
         await this.persistStepEvent(event);
+      },
+      // A workflow-turn DECISION delivered over the broker — applied durably (by run id) on whatever
+      // instance consumes it, NOT correlated to an in-memory promise on the dispatcher. This is the
+      // multi-instance fix: a point-to-point broker may hand the decision to a non-dispatching instance.
+      async (decision) => {
+        await this.completeRemoteDecision(decision);
       },
     );
     // Control plane: re-broadcast lifecycle events from OTHER instances to this instance's
@@ -1168,8 +1181,17 @@ export class WorkflowEngine {
   waitForRun(runId: string, opts?: { timeoutMs?: number }): Promise<RunResult> {
     // `cancelling` is NON-terminal (the saga undo is still running), so a `waitForRun` after a
     // compensating cancel keeps waiting until the run reaches the terminal `cancelled`.
-    const isSettled = (s: RunStatus): boolean =>
-      s !== 'pending' && s !== 'running' && s !== 'cancelling';
+    //
+    // A run in the DISPATCH-AND-SUSPEND liveness state — `suspended` while still awaiting a dispatched
+    // workflow TURN's decision (`awaitingDecisionTaskId` set) — is mid-turn, NOT settled: that
+    // `suspended` is the engine's re-drive marker, not a body-emitted sleep/signal suspend. Resolving on
+    // it would hand back a half-applied turn (e.g. a sleep whose `wakeAt` the decision hasn't written
+    // yet). Wait until the decision lands and clears the marker (a real suspend) or the run goes terminal.
+    const isSettled = (run: WorkflowRun): boolean =>
+      run.status !== 'pending' &&
+      run.status !== 'running' &&
+      run.status !== 'cancelling' &&
+      !(run.status === 'suspended' && run.awaitingDecisionTaskId !== undefined);
     const toResult = (run: WorkflowRun): RunResult => ({
       runId,
       status: run.status,
@@ -1197,7 +1219,7 @@ export class WorkflowEngine {
       };
       const check = (): void => {
         void this.store.getRun(runId).then((run) => {
-          if (run && isSettled(run.status)) finish(run);
+          if (run && isSettled(run)) finish(run);
         });
       };
       // React only to this run's settling events (not its every step event), and subscribe BEFORE the
@@ -1843,6 +1865,48 @@ export class WorkflowEngine {
     }
 
     const history = await this.remoteHistory(run.id);
+
+    // DISPATCH-AND-SUSPEND (broker-backed executors): dispatch the turn and SUSPEND, recording the
+    // dispatched `taskId` on the run. The decision arrives later over the transport's `onDecision` and
+    // is applied durably by `completeRemoteDecision` on WHATEVER instance consumes it — never via an
+    // in-memory promise the dispatcher alone holds (the multi-instance bug). Liveness is the suspended
+    // turn's heartbeat-rearmed window (`remoteAdvanceSilenceMs` → `wakeAt`): if no decision/heartbeat
+    // lands before it lapses, the timer poller re-drives by re-dispatching a fresh turn.
+    if (remote.executor.dispatch) {
+      const { taskId } = await remote.executor.dispatch(run, history);
+      const silenceMs = this.remoteAdvanceSilenceMs;
+      const wakeAt = silenceMs != null ? this.clock() + silenceMs : undefined;
+      // Guard: a parent-cancel cascade may have written `cancelled`/terminal while we were dispatching
+      // (the dispatch awaited above runs outside the store transaction). Don't resurrect it to suspended.
+      const fresh = await this.store.getRun(run.id);
+      if (
+        fresh &&
+        (fresh.status === 'cancelled' || fresh.status === 'completed' || fresh.status === 'dead')
+      ) {
+        await this.store.releaseRunLock(run.id);
+        return { runId: run.id, status: fresh.status, output: fresh.output, error: fresh.error };
+      }
+      await this.store.updateRun(run.id, {
+        status: 'suspended',
+        awaitingDecisionTaskId: taskId,
+        wakeAt,
+        updatedAt: new Date(),
+      });
+      this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
+      // Release the lease so the decision (on ANY instance) — or, if genuinely lost, the timer re-drive
+      // — can pick the run up. `completeRemoteDecision` re-acquires it to apply the matching decision.
+      await this.store.releaseRunLock(run.id);
+      return { runId: run.id, status: 'suspended' };
+    }
+
+    // INLINE advance (in-process group-served executors): the decision is produced in-process, so await
+    // it under the lease. Single-instance by nature; the dispatch path above is the multi-instance one.
+    const advanceExecutor = remote.executor.advance;
+    if (!advanceExecutor) {
+      throw new Error(
+        `workflow ${run.workflow}@${run.workflowVersion}: executor implements neither advance nor dispatch`,
+      );
+    }
     let decision: WorkflowDecision;
     try {
       // When `remoteAdvanceSilenceMs` is configured, wrap the advance in a heartbeat-rearmed deadline
@@ -1854,7 +1918,7 @@ export class WorkflowEngine {
       // `timeoutMs`, the shorter of the two deadlines wins (both raise the same RemoteWorkflowTimeout,
       // handled identically by the catch below).
       const silenceMs = this.remoteAdvanceSilenceMs;
-      const advance = remote.executor.advance(run, history);
+      const advance = advanceExecutor.call(remote.executor, run, history);
       decision =
         silenceMs != null
           ? await this.awaitWithLivenessDeadline(
@@ -1897,6 +1961,17 @@ export class WorkflowEngine {
       return { runId: run.id, status: 'failed', error };
     }
 
+    return this.applyDecision(run, decision);
+  }
+
+  /**
+   * Apply a remote workflow turn's {@link WorkflowDecision}: persist the local steps it ran, then
+   * settle (completed/failed/cancelled) or dispatch its blocking ops and suspend (continue). Shared by
+   * the INLINE-advance path ({@link runRemoteExecution}, under the held lease) and the durable
+   * DISPATCH path ({@link completeRemoteDecision}, which holds the lease itself). Idempotent transitions
+   * — the caller has already ensured this is the decision for the currently-awaited turn.
+   */
+  private async applyDecision(run: WorkflowRun, decision: WorkflowDecision): Promise<RunResult> {
     if (decision.status === 'completed') {
       // Persist the local steps THIS turn ran before marking the run done. A workflow that runs
       // straight to completion in a single turn (every step inline, never suspending — e.g. a Python
@@ -2564,6 +2639,76 @@ export class WorkflowEngine {
       if (err instanceof NamespaceMismatch) return null;
       throw err;
     });
+  }
+
+  /**
+   * Apply a remote workflow-turn {@link WorkflowDecision} durably — runs on WHATEVER instance receives
+   * it over the broker (the dispatching one may be gone, or a point-to-point broker handed it to a
+   * non-dispatcher). The durable, multi-instance-safe twin of {@link completeRemoteResult} for the
+   * workflow TURN: look the run up by `decision.runId`, verify the decision matches the run's
+   * CURRENTLY-awaited turn (`awaitingDecisionTaskId`) — so a stale / duplicate / foreign / re-driven
+   * decision is dropped (applied AT MOST ONCE) — lease it, clear the marker, and apply the decision.
+   */
+  private async completeRemoteDecision(decision: WorkflowDecision): Promise<void> {
+    // Cheap pre-checks before contending for the lease: only the run currently awaiting THIS taskId
+    // (and not already terminal) is a candidate. A re-driven turn has a different taskId, so a late
+    // decision for the prior turn is dropped here.
+    const run = await this.store.getRun(decision.runId);
+    if (!run || run.awaitingDecisionTaskId !== decision.taskId) return;
+    if (run.status === 'cancelled' || run.status === 'completed' || run.status === 'dead') return;
+    if (run.namespace !== undefined && run.namespace !== this.namespace) return;
+    const nowMs = this.clock();
+    // Lease so exactly one instance applies it — serialized with a concurrent timer re-drive of the
+    // same run. If the lease is held (a re-drive in flight), drop: the re-driven turn produces a fresh
+    // decision. The common single-decision path is uncontended, so this acquires immediately.
+    if (
+      !(await this.store.tryLockRun(decision.runId, this.instanceId, nowMs + this.leaseMs, nowMs))
+    ) {
+      return;
+    }
+    const renew = setInterval(
+      () => {
+        void this.store
+          .renewRunLock(decision.runId, this.instanceId, this.clock() + this.leaseMs)
+          .catch(() => undefined);
+      },
+      Math.max(50, Math.floor(this.leaseMs / 2)),
+    );
+    renew.unref?.();
+    try {
+      // Re-read under the lease and re-check the marker — it may have changed (a re-drive applied
+      // first, or another decision raced in) between the unlocked pre-check and acquiring the lease.
+      const fresh = await this.store.getRun(decision.runId);
+      if (!fresh || fresh.awaitingDecisionTaskId !== decision.taskId) return;
+      if (fresh.status === 'cancelled' || fresh.status === 'completed' || fresh.status === 'dead') {
+        return;
+      }
+      // Clear the awaited-turn marker and the re-drive deadline: this turn is now being applied exactly
+      // once. `applyDecision` resets `wakeAt` itself when it suspends on the turn's blocking ops.
+      await this.store.updateRun(decision.runId, {
+        awaitingDecisionTaskId: undefined,
+        wakeAt: undefined,
+        updatedAt: new Date(),
+      });
+      fresh.awaitingDecisionTaskId = undefined;
+      await this.applyDecision(fresh, decision);
+    } finally {
+      clearInterval(renew);
+      await this.store.releaseRunLock(decision.runId);
+    }
+  }
+
+  /**
+   * A run-scoped heartbeat for a run suspended awaiting a workflow-turn decision (the dispatch path):
+   * push its durable re-drive deadline (`wakeAt`) forward so a still-working worker's turn is not
+   * re-dispatched. The durable counterpart of an inline turn's in-memory `heartbeatResets` rearm.
+   */
+  private async rearmDecisionDeadline(runId: string): Promise<void> {
+    const silenceMs = this.remoteAdvanceSilenceMs;
+    if (silenceMs == null) return;
+    const run = await this.store.getRun(runId);
+    if (!run || run.status !== 'suspended' || run.awaitingDecisionTaskId === undefined) return;
+    await this.store.updateRun(runId, { wakeAt: this.clock() + silenceMs, updatedAt: new Date() });
   }
 
   /**

@@ -29,6 +29,7 @@ interface RunRow {
   wakeAt: bigint | null;
   lockedBy: string | null;
   lockedUntil: Date | null;
+  awaitingDecisionTaskId: string | null;
   recoveryAttempts: number | null;
   tags: unknown;
   searchAttributes: unknown;
@@ -391,6 +392,7 @@ function toRunData(run: WorkflowRun) {
     wakeAt: bigOrNull(run.wakeAt),
     lockedBy: run.lockedBy ?? null,
     lockedUntil: run.lockedUntil == null ? null : new Date(run.lockedUntil),
+    awaitingDecisionTaskId: run.awaitingDecisionTaskId ?? null,
     recoveryAttempts: run.recoveryAttempts ?? null,
     tags: jsonOrNull(run.tags),
     searchAttributes: jsonOrNull(run.searchAttributes),
@@ -417,6 +419,8 @@ function toRunPatch(patch: Partial<WorkflowRun>) {
   if ('lockedBy' in patch) data.lockedBy = patch.lockedBy ?? null;
   if ('lockedUntil' in patch)
     data.lockedUntil = patch.lockedUntil == null ? null : new Date(patch.lockedUntil);
+  if ('awaitingDecisionTaskId' in patch)
+    data.awaitingDecisionTaskId = patch.awaitingDecisionTaskId ?? null;
   if ('recoveryAttempts' in patch) data.recoveryAttempts = patch.recoveryAttempts ?? null;
   if ('tags' in patch) data.tags = jsonOrNull(patch.tags);
   if ('searchAttributes' in patch) data.searchAttributes = jsonOrNull(patch.searchAttributes);
@@ -438,6 +442,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     wakeAt: numOrUndef(row.wakeAt),
     lockedBy: row.lockedBy ?? undefined,
     lockedUntil: row.lockedUntil == null ? undefined : row.lockedUntil.getTime(),
+    awaitingDecisionTaskId: row.awaitingDecisionTaskId ?? undefined,
     recoveryAttempts: row.recoveryAttempts ?? undefined,
     tags: (row.tags as string[] | null) ?? undefined,
     searchAttributes:

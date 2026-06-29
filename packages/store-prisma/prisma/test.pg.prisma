@@ -26,6 +26,7 @@ model DurableWorkflowRun {
   wakeAt          BigInt?  @map("wake_at")
   lockedBy        String?  @map("locked_by")
   lockedUntil     DateTime? @map("locked_until")
+  awaitingDecisionTaskId String? @map("awaiting_decision_task_id")
   recoveryAttempts Int?    @map("recovery_attempts")
   tags            Json?
   searchAttributes Json?   @map("search_attributes")

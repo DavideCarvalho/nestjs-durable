@@ -28,7 +28,6 @@ function runWith(priority?: number): WorkflowRun {
 describe('RemoteWorkflowExecutor carries the run priority onto the dispatched WorkflowTask', () => {
   it('stamps run.priority onto the WorkflowTask', async () => {
     let dispatched: WorkflowTask | undefined;
-    let decide: ((d: WorkflowDecision) => Promise<void>) | undefined;
     const transport: Transport = {
       dispatch: async () => {},
       onResult: () => {},
@@ -36,27 +35,14 @@ describe('RemoteWorkflowExecutor carries the run priority onto the dispatched Wo
       dispatchWorkflowTask: async (t) => {
         dispatched = t;
       },
-      onDecision: (h) => {
-        decide = h;
-      },
     };
     const exec = new RemoteWorkflowExecutor(transport, 'processing-workflows');
-    const p = exec.advance(runWith(5), []);
-    await new Promise((r) => setImmediate(r));
+    await exec.dispatch(runWith(5), []);
     expect(dispatched?.priority).toBe(5);
-    await decide?.({
-      taskId: dispatched?.taskId ?? '',
-      runId: 'r1',
-      status: 'completed',
-      commands: [],
-      output: {},
-    });
-    await p;
   });
 
   it('omits priority on the WorkflowTask when the run has none', async () => {
     let dispatched: WorkflowTask | undefined;
-    let decide: ((d: WorkflowDecision) => Promise<void>) | undefined;
     const transport: Transport = {
       dispatch: async () => {},
       onResult: () => {},
@@ -64,22 +50,10 @@ describe('RemoteWorkflowExecutor carries the run priority onto the dispatched Wo
       dispatchWorkflowTask: async (t) => {
         dispatched = t;
       },
-      onDecision: (h) => {
-        decide = h;
-      },
     };
     const exec = new RemoteWorkflowExecutor(transport, 'processing-workflows');
-    const p = exec.advance(runWith(), []);
-    await new Promise((r) => setImmediate(r));
+    await exec.dispatch(runWith(), []);
     expect(dispatched?.priority).toBeUndefined();
-    await decide?.({
-      taskId: dispatched?.taskId ?? '',
-      runId: 'r1',
-      status: 'completed',
-      commands: [],
-      output: {},
-    });
-    await p;
   });
 });
 

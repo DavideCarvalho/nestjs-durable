@@ -71,6 +71,16 @@ export interface WorkflowRun {
    * durable state required for correctness — a transport without priority support ignores it.
    */
   priority?: number | undefined;
+  /**
+   * REMOTE workflow turn awaiting a decision: the `taskId` of the turn the engine dispatched to a
+   * workflow worker and then SUSPENDED on. Set by the dispatch-and-suspend path; matched by
+   * {@link WorkflowEngine.completeRemoteDecision} so ONLY the decision for the currently-awaited turn
+   * is applied (a stale/duplicate/foreign decision is dropped), then cleared the moment it is applied.
+   * This is what makes a workflow-turn decision multi-instance safe: any engine instance that receives
+   * the decision looks the run up by `decision.runId` and applies it durably, instead of resolving an
+   * in-memory promise that only the dispatching instance held. Absent on non-remote / not-awaiting runs.
+   */
+  awaitingDecisionTaskId?: string | undefined;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -647,11 +657,31 @@ export interface WorkflowStepEvent {
  * concerns, identical for in-process and remote workflows.
  */
 export interface WorkflowExecutor {
-  advance(
+  /**
+   * INLINE replay: advance the turn and RETURN its decision (the in-process executor runs the
+   * registered TS function synchronously). The engine awaits this under the run's lease. Provide this
+   * OR {@link dispatch} — exactly one. An executor with only `advance` is single-instance by nature
+   * (the decision is produced in-process, not delivered over a broker).
+   */
+  advance?(
     run: WorkflowRun,
     history: HistoryEvent[],
     pendingSignals?: WorkflowTask['pendingSignals'],
   ): Promise<WorkflowDecision>;
+  /**
+   * DISPATCH-AND-SUSPEND (broker-backed, multi-instance safe): dispatch the turn to a worker and
+   * return the dispatched `taskId` WITHOUT awaiting the decision. The engine then suspends the run,
+   * recording the `taskId` on it; the worker's {@link WorkflowDecision} comes back over the
+   * transport's {@link Transport.onDecision} and is applied DURABLY by whatever engine instance
+   * receives it ({@link WorkflowEngine.completeRemoteDecision} looks the run up by `decision.runId`).
+   * No in-memory await, so the decision is never lost to a point-to-point broker handing it to a
+   * non-dispatching instance. Provide this OR {@link advance} — exactly one.
+   */
+  dispatch?(
+    run: WorkflowRun,
+    history: HistoryEvent[],
+    pendingSignals?: WorkflowTask['pendingSignals'],
+  ): Promise<{ taskId: string }>;
 }
 
 /**

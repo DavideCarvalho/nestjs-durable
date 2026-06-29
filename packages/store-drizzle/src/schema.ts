@@ -14,6 +14,9 @@ export const workflowRuns = sqliteTable('durable_workflow_runs', {
   wakeAt: integer('wake_at'),
   lockedBy: text('locked_by'),
   lockedUntil: integer('locked_until'),
+  // REMOTE turn the engine suspended on awaiting a decision; matched by completeRemoteDecision so
+  // only the currently-awaited turn's decision is applied. Nullable: cleared when a decision lands.
+  awaitingDecisionTaskId: text('awaiting_decision_task_id'),
   recoveryAttempts: integer('recovery_attempts'),
   tags: text('tags', { mode: 'json' }).$type<string[]>(),
   searchAttributes: text('search_attributes', { mode: 'json' }).$type<

@@ -355,6 +355,7 @@ function toRunRow(run: WorkflowRun): RunRow {
     wakeAt: run.wakeAt ?? null,
     lockedBy: run.lockedBy ?? null,
     lockedUntil: run.lockedUntil ?? null,
+    awaitingDecisionTaskId: run.awaitingDecisionTaskId ?? null,
     recoveryAttempts: run.recoveryAttempts ?? null,
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
@@ -380,6 +381,8 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if ('wakeAt' in patch) row.wakeAt = patch.wakeAt ?? null;
   if ('lockedBy' in patch) row.lockedBy = patch.lockedBy ?? null;
   if ('lockedUntil' in patch) row.lockedUntil = patch.lockedUntil ?? null;
+  if ('awaitingDecisionTaskId' in patch)
+    row.awaitingDecisionTaskId = patch.awaitingDecisionTaskId ?? null;
   if ('recoveryAttempts' in patch) row.recoveryAttempts = patch.recoveryAttempts ?? null;
   if ('tags' in patch) row.tags = patch.tags ?? null;
   if ('searchAttributes' in patch) row.searchAttributes = patch.searchAttributes ?? null;
@@ -401,6 +404,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     wakeAt: row.wakeAt ?? undefined,
     lockedBy: row.lockedBy ?? undefined,
     lockedUntil: row.lockedUntil ?? undefined,
+    awaitingDecisionTaskId: row.awaitingDecisionTaskId ?? undefined,
     recoveryAttempts: row.recoveryAttempts ?? undefined,
     tags: row.tags ?? undefined,
     searchAttributes: row.searchAttributes ?? undefined,
