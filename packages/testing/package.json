@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-testing",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Testing utilities for nestjs-durable — a test engine harness, crash/flaky-step injection, and replay assertions",
   "license": "MIT",
   "author": "Davide Carvalho",
