@@ -6,19 +6,18 @@ import type {
   WorkflowTask,
 } from './interfaces';
 
-let taskCounter = 0;
-
 /**
  * A {@link WorkflowExecutor} backed by a {@link Transport}: it advances a remote workflow by
- * DISPATCHING a {@link WorkflowTask} over the broker and returning the dispatched `taskId` WITHOUT
+ * DISPATCHING a {@link WorkflowTask} over the broker under the ENGINE-SUPPLIED `taskId`, WITHOUT
  * awaiting the decision. Pass one to `engine.registerRemote(name, version, { group, executor })` so a
  * workflow authored in another SDK (e.g. the Python `durable-worker`) is driven over Redis/BullMQ.
  *
  * Multi-instance safe by construction: the executor holds NO in-memory state correlating a dispatched
- * turn to its decision. The engine suspends the run recording the dispatched `taskId`, and the
- * worker's {@link import('./interfaces').WorkflowDecision} is delivered over the transport's
- * `onDecision` and applied DURABLY (by run id) on whatever engine instance consumes it — even if that
- * is not the instance that dispatched the turn. A point-to-point broker can therefore hand the
+ * turn to its decision. The engine records the `taskId` on the run as the awaited marker AND releases
+ * the run's lease BEFORE calling `dispatch`, so the worker's {@link import('./interfaces').WorkflowDecision},
+ * delivered over the transport's `onDecision` and applied DURABLY (by run id) on whatever engine
+ * instance consumes it — even one that did not dispatch the turn — can never arrive ahead of its marker
+ * or contend with a still-held lease and be dropped. A point-to-point broker can therefore hand the
  * decision to any instance without it being dropped (the bug this design fixes).
  *
  * Recovery-safe: if the engine crashes (or a decision is genuinely lost because the worker died), the
@@ -37,19 +36,18 @@ export class RemoteWorkflowExecutor implements WorkflowExecutor {
   ) {}
 
   /**
-   * Dispatch one workflow turn and return its `taskId`. Does NOT await the decision — the engine
-   * suspends the run on the returned `taskId` and applies the decision durably via `onDecision`.
+   * Enqueue one workflow turn under the engine-supplied `taskId`. Does NOT await the decision — the
+   * engine has already suspended the run on `taskId` and applies the decision durably via `onDecision`.
    */
   async dispatch(
     run: WorkflowRun,
     history: HistoryEvent[],
+    taskId: string,
     pendingSignals?: WorkflowTask['pendingSignals'],
-  ): Promise<{ taskId: string }> {
+  ): Promise<void> {
     if (!this.transport.dispatchWorkflowTask) {
       throw new Error('transport does not support workflow tasks (dispatchWorkflowTask)');
     }
-    taskCounter += 1;
-    const taskId = `${run.id}:wf:${taskCounter}`;
     const task: WorkflowTask = {
       taskId,
       runId: run.id,
@@ -63,6 +61,5 @@ export class RemoteWorkflowExecutor implements WorkflowExecutor {
       attempt: 1,
     };
     await this.transport.dispatchWorkflowTask(task);
-    return { taskId };
   }
 }

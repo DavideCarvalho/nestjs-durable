@@ -1866,26 +1866,24 @@ export class WorkflowEngine {
 
     const history = await this.remoteHistory(run.id);
 
-    // DISPATCH-AND-SUSPEND (broker-backed executors): dispatch the turn and SUSPEND, recording the
-    // dispatched `taskId` on the run. The decision arrives later over the transport's `onDecision` and
-    // is applied durably by `completeRemoteDecision` on WHATEVER instance consumes it — never via an
-    // in-memory promise the dispatcher alone holds (the multi-instance bug). Liveness is the suspended
-    // turn's heartbeat-rearmed window (`remoteAdvanceSilenceMs` → `wakeAt`): if no decision/heartbeat
-    // lands before it lapses, the timer poller re-drives by re-dispatching a fresh turn.
+    // DISPATCH-AND-SUSPEND (broker-backed executors): SUSPEND-then-ENQUEUE. The engine generates the
+    // turn's `taskId`, records it on the run as the awaited marker, and RELEASES the lease — all BEFORE
+    // enqueuing the turn — so a fast worker's decision (delivered over `onDecision`, applied durably by
+    // `completeRemoteDecision` on WHATEVER instance consumes it) can NEVER arrive ahead of its marker,
+    // nor contend with a still-held lease, and be dropped. (The original dispatch-then-mark order lost a
+    // sub-millisecond cached-replay decision that round-tripped the in-cluster broker before the marker
+    // write to the remote store committed — the multi-instance decision-drop's deeper race.) Liveness is
+    // the suspended turn's heartbeat-rearmed window (`remoteAdvanceSilenceMs` → `wakeAt`): if no
+    // decision/heartbeat lands before it lapses (including a dispatch that throws below), the timer
+    // poller re-drives by re-marking + re-enqueuing a fresh turn.
     if (remote.executor.dispatch) {
-      const { taskId } = await remote.executor.dispatch(run, history);
+      const taskId = `${run.id}:wf:${globalThis.crypto.randomUUID().slice(0, 8)}`;
       const silenceMs = this.remoteAdvanceSilenceMs;
       const wakeAt = silenceMs != null ? this.clock() + silenceMs : undefined;
-      // Guard: a parent-cancel cascade may have written `cancelled`/terminal while we were dispatching
-      // (the dispatch awaited above runs outside the store transaction). Don't resurrect it to suspended.
-      const fresh = await this.store.getRun(run.id);
-      if (
-        fresh &&
-        (fresh.status === 'cancelled' || fresh.status === 'completed' || fresh.status === 'dead')
-      ) {
-        await this.store.releaseRunLock(run.id);
-        return { runId: run.id, status: fresh.status, output: fresh.output, error: fresh.error };
-      }
+      // MARK FIRST: record the awaited turn before it is enqueued. No resurrection risk — unlike the old
+      // mark-AFTER-dispatch order, nothing rewrites `status` past this point, so a parent-cancel that
+      // writes a terminal status during the enqueue below simply wins (its decision is later dropped by
+      // `completeRemoteDecision`'s terminal-status check).
       await this.store.updateRun(run.id, {
         status: 'suspended',
         awaitingDecisionTaskId: taskId,
@@ -1893,9 +1891,13 @@ export class WorkflowEngine {
         updatedAt: new Date(),
       });
       this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
-      // Release the lease so the decision (on ANY instance) — or, if genuinely lost, the timer re-drive
-      // — can pick the run up. `completeRemoteDecision` re-acquires it to apply the matching decision.
+      // RELEASE BEFORE ENQUEUE: the decision must be able to BOTH match the marker AND acquire the lease
+      // the instant it arrives — even a few ms after the enqueue. Holding the lease through the enqueue
+      // would drop a fast decision at lock contention. Idempotent vs. `execute`'s own finally release.
       await this.store.releaseRunLock(run.id);
+      // THEN enqueue. A failed/lost dispatch leaves the run suspended-awaiting with `wakeAt` set, so the
+      // timer poller re-drives it — no lost run.
+      await remote.executor.dispatch(run, history, taskId);
       return { runId: run.id, status: 'suspended' };
     }
 

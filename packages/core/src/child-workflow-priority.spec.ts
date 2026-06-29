@@ -37,7 +37,7 @@ describe('RemoteWorkflowExecutor carries the run priority onto the dispatched Wo
       },
     };
     const exec = new RemoteWorkflowExecutor(transport, 'processing-workflows');
-    await exec.dispatch(runWith(5), []);
+    await exec.dispatch(runWith(5), [], 'cr1:wf:p5');
     expect(dispatched?.priority).toBe(5);
   });
 
@@ -52,7 +52,7 @@ describe('RemoteWorkflowExecutor carries the run priority onto the dispatched Wo
       },
     };
     const exec = new RemoteWorkflowExecutor(transport, 'processing-workflows');
-    await exec.dispatch(runWith(), []);
+    await exec.dispatch(runWith(), [], 'cr1:wf:np');
     expect(dispatched?.priority).toBeUndefined();
   });
 });

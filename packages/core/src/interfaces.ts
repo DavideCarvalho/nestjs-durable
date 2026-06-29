@@ -669,19 +669,22 @@ export interface WorkflowExecutor {
     pendingSignals?: WorkflowTask['pendingSignals'],
   ): Promise<WorkflowDecision>;
   /**
-   * DISPATCH-AND-SUSPEND (broker-backed, multi-instance safe): dispatch the turn to a worker and
-   * return the dispatched `taskId` WITHOUT awaiting the decision. The engine then suspends the run,
-   * recording the `taskId` on it; the worker's {@link WorkflowDecision} comes back over the
-   * transport's {@link Transport.onDecision} and is applied DURABLY by whatever engine instance
-   * receives it ({@link WorkflowEngine.completeRemoteDecision} looks the run up by `decision.runId`).
-   * No in-memory await, so the decision is never lost to a point-to-point broker handing it to a
-   * non-dispatching instance. Provide this OR {@link advance} — exactly one.
+   * DISPATCH-AND-SUSPEND (broker-backed, multi-instance safe): enqueue the turn to a worker under the
+   * ENGINE-SUPPLIED `taskId`, WITHOUT awaiting the decision. The engine generates `taskId`, records it
+   * on the run as the awaited marker, AND releases the run's lease — all BEFORE calling this — so the
+   * worker's {@link WorkflowDecision} (delivered over {@link Transport.onDecision} and applied DURABLY
+   * by {@link WorkflowEngine.completeRemoteDecision}, which looks the run up by `decision.runId`) can
+   * never arrive ahead of its marker or contend with a still-held lease and be dropped. This method
+   * therefore ONLY enqueues — it owns no taskId generation and returns nothing. No in-memory await, so
+   * the decision is never lost to a point-to-point broker handing it to a non-dispatching instance.
+   * Provide this OR {@link advance} — exactly one.
    */
   dispatch?(
     run: WorkflowRun,
     history: HistoryEvent[],
+    taskId: string,
     pendingSignals?: WorkflowTask['pendingSignals'],
-  ): Promise<{ taskId: string }>;
+  ): Promise<void>;
 }
 
 /**
