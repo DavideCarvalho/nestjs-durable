@@ -57,6 +57,19 @@ _HEARTBEAT_TTL_SECONDS = 35
 _BEAT_INTERVAL_SECONDS = 5
 
 
+def _effective_prefix(prefix: str, namespace: "str | None") -> str:
+    """Fold a logical deployment ``namespace`` into ``prefix``, segmenting every queue/stream/key so the
+    same Redis can host multiple isolated deployments without crosstalk.
+
+    CROSS-SDK CONTRACT — this MUST stay byte-identical to the TypeScript ``BullMQTransport``'s
+    ``#effectivePrefix()`` (and to any namespaced engine that dispatches to us): an unset or
+    ``"default"`` namespace yields the bare prefix (so the un-namespaced scheme is unchanged — deployed
+    workers keep consuming the same names); any other value appends ``-<namespace>``. A single direct
+    ``prefix`` concatenation anywhere would land the worker on a different queue than the engine, so ALL
+    name builders route through this."""
+    return f"{prefix}-{namespace}" if namespace and namespace != "default" else prefix
+
+
 def _heartbeat_key(prefix: str, group: str) -> str:
     """Per-(group, instance) liveness key. Mirrors the queue-name convention ('<prefix>-...') so the
     whole durable keyspace shares one prefix. A monitor can scan '<prefix>-worker-heartbeat:<group>:*'."""
@@ -188,6 +201,7 @@ async def run_redis_workflow_worker(
     connection: str = "redis://localhost:6379",
     prefix: str = "durable",
     cancellation: Optional[CancellationRegistry] = None,
+    namespace: str = "default",
 ) -> Any:
     """Start a BullMQ worker that REPLAYS workflow tasks. Consumes the group's task queue (each job is
     a WorkflowTask) and publishes the resulting WorkflowDecision on ``<prefix>-decisions`` — the queues
@@ -203,16 +217,20 @@ async def run_redis_workflow_worker(
 
     await _verify_connection(connection)
 
-    tasks_name = f"{prefix}-tasks-{group}"
-    decisions = BullQueue(f"{prefix}-decisions", {"connection": connection})
-    step_events = BullQueue(f"{prefix}-step-events", {"connection": connection})
+    # Fold the namespace into the prefix ONCE, then thread the effective prefix everywhere a name is
+    # built — so the worker shares one namespaced keyspace with a namespaced engine (cross-SDK contract).
+    effective_prefix = _effective_prefix(prefix, namespace)
+
+    tasks_name = f"{effective_prefix}-tasks-{group}"
+    decisions = BullQueue(f"{effective_prefix}-decisions", {"connection": connection})
+    step_events = BullQueue(f"{effective_prefix}-step-events", {"connection": connection})
     publish_step = _step_event_publisher(step_events)
     registry = cancellation or CancellationRegistry()
-    await _subscribe_control(connection, prefix, registry)
+    await _subscribe_control(connection, effective_prefix, registry)
 
     # One publisher client per worker (not per turn). The per-turn beat task just borrows it.
     beat_client = _run_heartbeat_client(connection)
-    beat_channel = _run_heartbeat_channel(prefix)
+    beat_channel = _run_heartbeat_channel(effective_prefix)
 
     async def process(job: Any, _token: str) -> Any:
         # Replay OFF the event loop. `process_task` is fully synchronous and a real workflow turn can
@@ -248,7 +266,7 @@ async def run_redis_workflow_worker(
         )
         return decision
 
-    await _start_heartbeat(connection, prefix, group)
+    await _start_heartbeat(connection, effective_prefix, group)
     return BullWorker(tasks_name, process, {"connection": connection})
 
 
@@ -309,6 +327,7 @@ async def run_redis_worker(
     prefix: str = "durable",
     cancellation: Optional[CancellationRegistry] = None,
     concurrency: "int | str | dict" = 1,
+    namespace: str = "default",
 ) -> Any:
     """Start a BullMQ worker that runs ``worker``'s handlers. Returns the bullmq Worker.
 
@@ -332,11 +351,15 @@ async def run_redis_worker(
 
     await _verify_connection(connection)
 
-    tasks_name, results_name = _names(prefix, group)
+    # Fold the namespace into the prefix ONCE, then thread the effective prefix everywhere a name is
+    # built — so the worker shares one namespaced keyspace with a namespaced engine (cross-SDK contract).
+    effective_prefix = _effective_prefix(prefix, namespace)
+
+    tasks_name, results_name = _names(effective_prefix, group)
     results = BullQueue(results_name, {"connection": connection})
     registry = cancellation or CancellationRegistry()
-    await _subscribe_control(connection, prefix, registry)
-    publish_progress = await _progress_publisher(connection, prefix)
+    await _subscribe_control(connection, effective_prefix, registry)
+    publish_progress = await _progress_publisher(connection, effective_prefix)
 
     controller = AdaptiveController(resolve_concurrency(concurrency))
 
@@ -344,11 +367,11 @@ async def run_redis_worker(
     # keeps exactly its old footprint (no decisions/step-events queue, no run-beat client).
     has_workflows = getattr(worker, "has_workflows", False)
     if has_workflows:
-        decisions = BullQueue(f"{prefix}-decisions", {"connection": connection})
-        step_events = BullQueue(f"{prefix}-step-events", {"connection": connection})
+        decisions = BullQueue(f"{effective_prefix}-decisions", {"connection": connection})
+        step_events = BullQueue(f"{effective_prefix}-step-events", {"connection": connection})
         publish_step = _step_event_publisher(step_events)
         beat_client = _run_heartbeat_client(connection)
-        beat_channel = _run_heartbeat_channel(prefix)
+        beat_channel = _run_heartbeat_channel(effective_prefix)
 
     async def process_workflow(job: Any) -> Any:
         # Mirror run_redis_workflow_worker.process: replay OFF the loop (a turn can run minutes and would
@@ -419,7 +442,7 @@ async def run_redis_worker(
     def apply_concurrency(new_limit: int) -> None:
         bull_worker.opts["concurrency"] = new_limit
 
-    await _start_heartbeat(connection, prefix, group, controller)
+    await _start_heartbeat(connection, effective_prefix, group, controller)
     controller.start(apply_cb=apply_concurrency)
     return bull_worker
 

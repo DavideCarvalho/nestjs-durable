@@ -618,8 +618,18 @@ class WorkflowWorker:
         ``WorkflowWorker`` stays as a working alias for the advanced split — running the workflow and
         step workers on SEPARATE groups via ``run_workers([wf_worker, step_worker])``."""
 
-    def __init__(self, group: str = "workflows", *, auto_register: bool = True) -> None:
+    def __init__(
+        self,
+        group: str = "workflows",
+        *,
+        namespace: str = "default",
+        auto_register: bool = True,
+    ) -> None:
         self.group = group
+        # Logical deployment namespace, segmenting every queue/stream/key this worker touches (see
+        # :class:`~durable_worker.worker.Worker` and ``_effective_prefix`` for the cross-SDK rule).
+        # ``"default"`` keeps names byte-identical to the un-namespaced scheme.
+        self.namespace = namespace
         self._workflows: Dict[str, WorkflowFn] = {}
         # Auto-register into the module-level registry so :func:`~durable_worker.worker.run_all` can
         # discover this worker. Opt out with ``auto_register=False``. Importing from ``.worker`` here
@@ -659,7 +669,7 @@ class WorkflowWorker:
 
         async def _main() -> None:
             bull_worker = await run_redis_workflow_worker(
-                self, group=self.group, connection=redis, prefix=prefix
+                self, group=self.group, connection=redis, prefix=prefix, namespace=self.namespace
             )
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()

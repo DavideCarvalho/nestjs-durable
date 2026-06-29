@@ -67,37 +67,41 @@ class RunAllTest(unittest.TestCase):
 
         seen = {}
 
-        def fake_run_workers(workers, *, redis, prefix):
+        def fake_run_workers(workers, *, redis, prefix, namespace="default"):
             seen["workers"] = list(workers)
             seen["redis"] = redis
             seen["prefix"] = prefix
+            seen["namespace"] = namespace
 
         with patch("durable_worker.worker.run_workers", side_effect=fake_run_workers):
-            run_all(redis="redis://example:6379", prefix="myprefix")
+            run_all(redis="redis://example:6379", prefix="myprefix", namespace="dev-alice")
 
         self.assertEqual(seen["workers"], [step_worker, wf_worker])
         self.assertEqual(seen["redis"], "redis://example:6379")
         self.assertEqual(seen["prefix"], "myprefix")
+        self.assertEqual(seen["namespace"], "dev-alice")
 
     def test_run_all_passes_default_redis_and_prefix(self):
         Worker(group="a")
         seen = {}
 
-        def fake_run_workers(workers, *, redis, prefix):
+        def fake_run_workers(workers, *, redis, prefix, namespace="default"):
             seen["redis"] = redis
             seen["prefix"] = prefix
+            seen["namespace"] = namespace
 
         with patch("durable_worker.worker.run_workers", side_effect=fake_run_workers):
             run_all()
 
         self.assertEqual(seen["redis"], "redis://localhost:6379")
         self.assertEqual(seen["prefix"], "durable")
+        self.assertEqual(seen["namespace"], "default")
 
     def test_run_all_with_empty_registry_does_not_call_run_workers(self):
         """No registered workers → run_all early-returns; run_workers is never called (no hang)."""
         called = {"n": 0}
 
-        def fake_run_workers(workers, *, redis, prefix):
+        def fake_run_workers(workers, *, redis, prefix, namespace="default"):
             called["n"] += 1
 
         with patch("durable_worker.worker.run_workers", side_effect=fake_run_workers):

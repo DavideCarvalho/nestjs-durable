@@ -372,9 +372,16 @@ class Worker:
         group: str = "default",
         *,
         concurrency: "int | str | dict" = 1,
+        namespace: str = "default",
         auto_register: bool = True,
     ) -> None:
         self.group = group
+        # Logical deployment namespace, segmenting every queue/stream/key this worker touches so the
+        # same Redis can host multiple isolated deployments (e.g. per-developer ``dev-alice``) without
+        # crosstalk. ``"default"`` (or unset) keeps names BYTE-IDENTICAL to the un-namespaced scheme, so
+        # an already-deployed worker is unaffected. Any other value MUST match the namespace of the
+        # engine that dispatches to it — see ``_effective_prefix`` for the cross-SDK naming rule.
+        self.namespace = namespace
         # How many tasks this worker runs concurrently from its group's queue (BullMQ Worker
         # concurrency). Default 1 (serial). Raise it so a fanned-out batch (e.g. the N remote steps of
         # a ``gather_calls``) runs in parallel. Per process; total parallelism is concurrency × replicas.
@@ -477,6 +484,7 @@ class Worker:
                 connection=redis,
                 prefix=prefix,
                 concurrency=self.concurrency,
+                namespace=self.namespace,
             )
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()
@@ -628,7 +636,12 @@ def clear_registered_workers() -> None:
     _REGISTERED_WORKERS.clear()
 
 
-def run_all(*, redis: str = "redis://localhost:6379", prefix: str = "durable") -> None:
+def run_all(
+    *,
+    redis: str = "redis://localhost:6379",
+    prefix: str = "durable",
+    namespace: str = "default",
+) -> None:
     """Run **every** auto-registered worker in one process via :func:`run_workers`.
 
     The celery-``autodiscover`` style "magic" form: the consumer imports the modules that construct
@@ -642,7 +655,7 @@ def run_all(*, redis: str = "redis://localhost:6379", prefix: str = "durable") -
     if not workers:
         print("durable_worker.run_all: no workers registered — nothing to run.")
         return
-    run_workers(workers, redis=redis, prefix=prefix)
+    run_workers(workers, redis=redis, prefix=prefix, namespace=namespace)
 
 
 def run_workers(
@@ -650,6 +663,7 @@ def run_workers(
     *,
     redis: str = "redis://localhost:6379",
     prefix: str = "durable",
+    namespace: str = "default",
 ) -> None:
     """Run multiple step/workflow workers in a single process — one asyncio event loop, one
     Redis connection pool, clean shutdown on SIGTERM/SIGINT.
@@ -684,9 +698,20 @@ def run_workers(
     async def _main() -> None:
         handles = []
         for worker in workers:
+            # Explicit-wins: a worker constructed with its OWN non-default namespace keeps it; otherwise
+            # the namespace passed to ``run_workers`` applies (mirrors the TS engine pushing its
+            # namespace onto a transport that wasn't given one explicitly).
+            worker_namespace = getattr(worker, "namespace", "default")
+            effective_namespace = (
+                worker_namespace if worker_namespace != "default" else namespace
+            )
             if isinstance(worker, WorkflowWorker):
                 handle = await run_redis_workflow_worker(
-                    worker, group=worker.group, connection=redis, prefix=prefix
+                    worker,
+                    group=worker.group,
+                    connection=redis,
+                    prefix=prefix,
+                    namespace=effective_namespace,
                 )
             else:
                 handle = await run_redis_worker(
@@ -695,6 +720,7 @@ def run_workers(
                     connection=redis,
                     prefix=prefix,
                     concurrency=worker.concurrency,
+                    namespace=effective_namespace,
                 )
             handles.append(handle)
 

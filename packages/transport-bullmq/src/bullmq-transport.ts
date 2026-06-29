@@ -92,6 +92,14 @@ export interface BullMQTransportOptions {
   group?: string;
   /** Key prefix namespacing the durable queues. Defaults to `durable`. */
   prefix?: string;
+  /**
+   * Logical deployment namespace, segmenting every queue/stream/key so the same Redis can host
+   * multiple isolated deployments (e.g. per-developer `dev-alice`) without crosstalk. Unset or
+   * `"default"` keeps names BYTE-IDENTICAL to the un-namespaced scheme (production is unchanged); any
+   * other value inserts a `-<namespace>` segment after the prefix — see the cross-SDK naming rule on
+   * {@link BullMQTransport}. Passing it here is EXPLICIT and wins over a later {@link useNamespace}.
+   */
+  namespace?: string;
   /** Stable id for this worker process in heartbeats. Defaults to `ts-<hostname>-<pid>`. */
   instanceId?: string;
   /**
@@ -120,6 +128,11 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly connection: ConnectionOptions;
   private readonly group?: string | undefined;
   private readonly prefix: string;
+  // Logical deployment namespace folded into every name via `#effectivePrefix()`. Mutable so an
+  // engine can push its namespace onto a transport via `useNamespace()` — but only when one wasn't
+  // passed EXPLICITLY at construction (tracked by `#explicitNamespace`), which always wins.
+  #namespace: string | undefined;
+  readonly #explicitNamespace: boolean;
   private readonly handlers = new Map<string, StepHandler>();
   private readonly queues = new Map<string, Queue>();
   private taskWorker?: Worker;
@@ -149,8 +162,32 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.connection = options.connection;
     this.group = options.group;
     this.prefix = options.prefix ?? 'durable';
+    this.#namespace = options.namespace;
+    this.#explicitNamespace = options.namespace !== undefined;
     this.instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
     this.concurrency = options.concurrency;
+  }
+
+  /**
+   * Adopt `namespace` (the engine's, typically), segmenting every queue/stream/key — but ONLY if a
+   * namespace wasn't passed explicitly to the constructor (an explicit one always wins). Idempotent.
+   * Satisfies the optional `Transport.useNamespace` hook the engine calls when wiring a transport.
+   */
+  useNamespace(namespace: string): void {
+    if (this.#explicitNamespace) return;
+    this.#namespace = namespace;
+  }
+
+  /**
+   * The prefix every name is built from, folding in the namespace per the cross-SDK rule: a set,
+   * non-`"default"` namespace appends `-<namespace>`; otherwise the bare prefix (so the un-namespaced
+   * and `"default"` schemes are byte-identical — production names never change). Keep ALL name
+   * builders routed through this; a single direct `this.prefix` would split an engine from its workers.
+   */
+  #effectivePrefix(): string {
+    return this.#namespace && this.#namespace !== 'default'
+      ? `${this.prefix}-${this.#namespace}`
+      : this.prefix;
   }
 
   /** The shared controller, lazily created. In `handle()` it's created with the configured
@@ -170,10 +207,10 @@ export class BullMQTransport implements Transport, ControlPlane {
 
   // BullMQ queue names must not contain ':' (its Redis key separator), so use '-'.
   private tasksName(group: string): string {
-    return `${this.prefix}-tasks-${group}`;
+    return `${this.#effectivePrefix()}-tasks-${group}`;
   }
   private resultsName(): string {
-    return `${this.prefix}-results`;
+    return `${this.#effectivePrefix()}-results`;
   }
 
   /** Workers require `maxRetriesPerRequest: null`; preserve a passed-in IORedis instance as-is. */
@@ -212,7 +249,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   }
 
   private decisionsName(): string {
-    return `${this.prefix}-decisions`;
+    return `${this.#effectivePrefix()}-decisions`;
   }
 
   /** engine → workflow worker: a WorkflowTask on the group's task queue (same queue a Python workflow
@@ -236,7 +273,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   }
 
   private stepEventsName(): string {
-    return `${this.prefix}-step-events`;
+    return `${this.#effectivePrefix()}-step-events`;
   }
 
   /** workflow worker → engine: stream a local step's lifecycle. Point-to-point on its own queue, so a
@@ -276,7 +313,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   }
 
   private workerHeartbeatKey(group: string, instanceId: string): string {
-    return `${this.prefix}-worker-heartbeat:${group}:${instanceId}`;
+    return `${this.#effectivePrefix()}-worker-heartbeat:${group}:${instanceId}`;
   }
 
   /** Lazily-created standalone client for the worker-heartbeat keys (writes + scans), reused so a
@@ -310,7 +347,7 @@ export class BullMQTransport implements Transport, ControlPlane {
    *  so the group is the segment between the fixed prefix and the next `:`. */
   async listWorkerGroups(): Promise<string[]> {
     const client = this.workerRedis();
-    const prefix = `${this.prefix}-worker-heartbeat:`;
+    const prefix = `${this.#effectivePrefix()}-worker-heartbeat:`;
     const groups = new Set<string>();
     let cursor = '0';
     do {
@@ -413,11 +450,11 @@ export class BullMQTransport implements Transport, ControlPlane {
   }
 
   private controlChannel(): string {
-    return `${this.prefix}-control`;
+    return `${this.#effectivePrefix()}-control`;
   }
 
   private heartbeatChannel(): string {
-    return `${this.prefix}-heartbeat`;
+    return `${this.#effectivePrefix()}-heartbeat`;
   }
 
   /** A standalone Redis client from the same connection — duplicating a passed-in instance, or
