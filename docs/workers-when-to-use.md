@@ -166,3 +166,6 @@ limit move and see **why** it last backed off (`ram_ceiling` / `backpressure` / 
 - `gather_calls` dispatches in parallel but executes at the worker's `concurrency` — set it (default 1,
   or `'adaptive'`) or your parallel fan runs serially. Adaptive measures **step** latency only.
 - `concurrency` (faster) and `registerQueue` admission (slower/cap) are opposite knobs.
+
+**See also:** [namespaces.md](./namespaces.md) — partitioning a shared store so multiple engines (e.g.
+a dev cluster + a developer's laptop on the same DB) don't recover each other's runs.
