@@ -1,14 +1,16 @@
 import { hostname } from 'node:os';
-import type { WorkflowStepEvent } from '@dudousxd/nestjs-durable-core';
+import type { StartRunMessage, WorkflowStepEvent } from '@dudousxd/nestjs-durable-core';
 import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency';
 import {
   DEFAULT_PREFIX,
   type DurableWorkerRuntime,
   controlChannel,
   decisionsName,
+  effectivePrefixOf,
   heartbeatChannel,
   isWorkflowTask,
   resultsName,
+  startRunName,
   stepEventsName,
   tasksName,
   workerHeartbeatKey,
@@ -312,4 +314,75 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       heartbeatClient?.disconnect();
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// P4.3 — startRun: tenant worker → control plane (DB-less run dispatch)
+// ---------------------------------------------------------------------------
+
+/** The minimal BullMQ Queue surface `startRun` needs — narrow enough for a test fake. */
+export interface StartRunDeps {
+  Queue: new (
+    name: string,
+    opts: Record<string, unknown>,
+  ) => {
+    add(name: string, data: unknown, opts?: Record<string, unknown>): Promise<unknown>;
+    close(): Promise<void>;
+  };
+}
+
+export interface StartRunOptions {
+  /** Tenant (namespace) that owns the run — stamped as {@link StartRunMessage.tenant}. */
+  tenant: string;
+  /** Registered workflow name. */
+  workflow: string;
+  /** Workflow input payload (any JSON-serialisable value). */
+  input: StartRunMessage['input'];
+  /** Optional caller-supplied run id (idempotency key). Engine generates one if absent. */
+  runId?: string | undefined;
+  /** Tags merged into the run at creation. */
+  tags?: string[] | undefined;
+  /** Queue key prefix. Defaults to `'durable'` (matches `BullMQTransport` default). */
+  prefix?: string | undefined;
+  /**
+   * Logical deployment namespace, folded into `prefix` by the cross-SDK rule
+   * (`effectivePrefixOf`). Omit or `'default'` keeps names byte-identical to the bare scheme.
+   */
+  namespace?: string | undefined;
+  /** Injection seam for tests: supply a fake Queue ctor instead of importing bullmq. */
+  deps?: StartRunDeps | undefined;
+}
+
+/** Lazily import bullmq's Queue (optional peer). */
+async function loadStartRunDeps(): Promise<StartRunDeps> {
+  const { Queue } = (await import('bullmq')) as { Queue: StartRunDeps['Queue'] };
+  return { Queue };
+}
+
+/**
+ * Publish a {@link StartRunMessage} onto `<effectivePrefix>-start-run`, requesting the control
+ * plane to start a new run. This is the **DB-less tenant-worker path** (P4): a worker that has no
+ * direct access to the orchestrator's DB dispatches here; the control plane's `onStartRun`
+ * consumer turns the message into a durable run.
+ *
+ * One-shot: opens a Queue, adds the job, then closes the Queue. For high-frequency callers,
+ * prefer holding a `BullMQTransport` and calling `transport.dispatchStartRun` directly.
+ */
+export async function startRun(connection: RedisConnection, opts: StartRunOptions): Promise<void> {
+  const effectivePrefix = effectivePrefixOf(opts.prefix ?? DEFAULT_PREFIX, opts.namespace);
+  const queueName = startRunName(effectivePrefix);
+  const { Queue } = opts.deps ?? (await loadStartRunDeps());
+  const queue = new Queue(queueName, { connection });
+  const msg: StartRunMessage = {
+    tenant: opts.tenant,
+    workflow: opts.workflow,
+    input: opts.input,
+  };
+  if (opts.runId !== undefined) msg.runId = opts.runId;
+  if (opts.tags !== undefined) msg.tags = opts.tags;
+  try {
+    await queue.add('startRun', msg, { removeOnComplete: true, removeOnFail: true });
+  } finally {
+    await queue.close();
+  }
 }

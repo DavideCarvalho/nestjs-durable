@@ -374,6 +374,8 @@ class Worker:
         concurrency: "int | str | dict" = 1,
         namespace: str = "default",
         auto_register: bool = True,
+        redis: str = "redis://localhost:6379",
+        prefix: str = "durable",
     ) -> None:
         self.group = group
         # Logical deployment namespace, segmenting every queue/stream/key this worker touches so the
@@ -392,6 +394,11 @@ class Worker:
         # through verbatim to ``run_redis_worker``, which resolves it; either way the worker publishes
         # a live status (inFlight / RSS / throughput / p95) on its heartbeat. (Default 1 = fixed.)
         self.concurrency = concurrency
+        # Redis URL and queue prefix used by :meth:`start_run` to publish start-run requests onto
+        # ``<effectivePrefix>-start-run``. These default to the same values ``run()`` uses, so a
+        # worker constructed with explicit values carries them into start_run automatically.
+        self._redis = redis
+        self._prefix = prefix
         self._handlers: Dict[str, Handler] = {}
         self._blocking: Dict[str, bool] = {}
         # Workflows this worker also holds (unified worker). Empty for a pure step worker. Keyed by
@@ -503,6 +510,58 @@ class Worker:
             await stop.wait()
 
         asyncio.run(_main())
+
+    async def start_run(
+        self,
+        workflow: str,
+        input: Any,
+        *,
+        run_id: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+    ) -> None:
+        """Publish a start-run request onto ``<effectivePrefix>-start-run`` (P4 hosted control
+        plane).
+
+        A DB-less tenant worker that has no direct access to the orchestrator's database calls this
+        to request a new run.  The control plane's ``onStartRun`` consumer turns the message into a
+        durable run.  The message is a ``StartRunMessage``::
+
+            {
+                "tenant": self.namespace,
+                "workflow": workflow,
+                "input": input,
+                "runId": run_id,   # omitted when None
+                "tags":  tags,     # omitted when None
+            }
+
+        ``workflow`` must be the registered name the control-plane engine knows.  ``input`` is any
+        JSON-serialisable value.  ``run_id`` is an optional idempotency key; the engine generates
+        one when absent.
+
+        Requires the ``bullmq`` extra (``pip install durable-worker[redis]``).  One-shot: opens a
+        Queue, adds the job, and closes the Queue.  For high-frequency callers, consider holding a
+        long-lived Queue directly.
+        """
+        from bullmq import Queue as BullQueue  # lazy: only needed when publishing
+
+        from .redis_runner import _effective_prefix
+
+        effective_prefix = _effective_prefix(self._prefix, self.namespace)
+        queue_name = f"{effective_prefix}-start-run"
+        msg: Dict[str, Any] = {
+            "tenant": self.namespace,
+            "workflow": workflow,
+            "input": input,
+        }
+        if run_id is not None:
+            msg["runId"] = run_id
+        if tags is not None:
+            msg["tags"] = tags
+        queue = BullQueue(queue_name, {"connection": self._redis})
+        try:
+            await queue.add("startRun", msg, {"removeOnComplete": True, "removeOnFail": True})
+        finally:
+            await queue.close()
 
     def process_task(
         self,

@@ -450,6 +450,26 @@ export interface SignalWaiter {
 // Transport — how a remote task travels to a worker and the result returns
 // ---------------------------------------------------------------------------
 
+/**
+ * A DB-less tenant worker → control plane request to start a run. Published by a worker that has
+ * no direct DB access (the hosted-control-plane tenant model) onto the
+ * `<effectivePrefix>-start-run` queue; the control plane consumes it and turns it into a durable
+ * run (P4 of the tenants plan).
+ *
+ * The `tenant` identifies the namespace that owns the run (maps to the engine's `namespace`); it
+ * is separate from the wire-level key prefix so a single transport can serve multiple tenants.
+ */
+export interface StartRunMessage {
+  tenant: string;
+  /** Registered workflow name. */
+  workflow: string;
+  input: unknown;
+  /** Optional caller-supplied run id (idempotency key). The engine generates one if absent. */
+  runId?: string | undefined;
+  /** Tags to stamp on the run (merged with the workflow's static @Workflow tags). */
+  tags?: string[] | undefined;
+}
+
 /** A unit of work dispatched to a remote worker. This is the documented wire payload. */
 export interface RemoteTask {
   runId: string;
@@ -746,6 +766,18 @@ export interface Transport {
    *  keyspace, so a group with workers but no engine-side registration (e.g. a local-step group)
    *  still surfaces. Pairs with {@link groupHealth}. */
   listWorkerGroups?(): Promise<string[]>;
+  /**
+   * DB-less tenant worker → control plane: publish a {@link StartRunMessage} requesting a new run.
+   * Optional — only transports that carry the hosted-control-plane protocol (P4) implement this.
+   * The message is enqueued on `<effectivePrefix>-start-run`; the control plane's
+   * `onStartRun` consumer turns it into a durable run.
+   */
+  dispatchStartRun?(msg: StartRunMessage): Promise<void>;
+  /**
+   * control plane ← tenant worker: consume {@link StartRunMessage}s and start runs. Pair with
+   * {@link dispatchStartRun}. Optional — only control-plane-side transports implement this.
+   */
+  onStartRun?(handler: (msg: StartRunMessage) => Promise<void>): void;
 }
 
 /** How a worker decides its concurrency, carried in {@link WorkerStatus} so a dashboard can tell a

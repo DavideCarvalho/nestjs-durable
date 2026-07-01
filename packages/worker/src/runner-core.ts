@@ -20,6 +20,22 @@ export const DEFAULT_PREFIX = 'durable';
 // queue names must not contain ':' (its Redis key separator), so the queues use '-'. A unit test
 // asserts these against the transport's conventions.
 
+/**
+ * Fold a logical deployment `namespace` into `prefix`, per the cross-SDK rule (MUST match
+ * `BullMQTransport.#effectivePrefix` and Python's `_effective_prefix`): an unset or `"default"`
+ * namespace yields the bare prefix (un-namespaced scheme unchanged — production names stable);
+ * any other value appends `-<namespace>` so isolated deployments share one Redis without crosstalk.
+ */
+export function effectivePrefixOf(prefix: string, namespace?: string): string {
+  return namespace && namespace !== 'default' ? `${prefix}-${namespace}` : prefix;
+}
+
+/** `<prefix>-start-run` — the queue a tenant worker publishes start-run requests onto (P4).
+ *  MUST byte-match `BullMQTransport.#startRunName` and the Python SDK's start-run channel. */
+export function startRunName(prefix: string): string {
+  return `${prefix}-start-run`;
+}
+
 /** `<prefix>-tasks-<group>` — the per-group tasks queue the engine dispatches WorkflowTask/RemoteTask on. */
 export function tasksName(prefix: string, group: string): string {
   return `${prefix}-tasks-${group}`;

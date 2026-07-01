@@ -6,6 +6,7 @@ import {
   type GroupHealth,
   type Heartbeat,
   type RemoteTask,
+  type StartRunMessage,
   type StepHandler,
   type StepResult,
   type Transport,
@@ -139,6 +140,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   private resultsWorker?: Worker;
   private decisionsWorker?: Worker;
   private stepEventsWorker?: Worker;
+  private startRunWorker?: Worker;
   // Control plane runs over Redis pub/sub (not a queue): every instance gets every message, which
   // is what live-tail + cancellation need. Subscribe needs its own connection (it blocks the client).
   private controlPub?: Redis;
@@ -188,6 +190,11 @@ export class BullMQTransport implements Transport, ControlPlane {
     return this.#namespace && this.#namespace !== 'default'
       ? `${this.prefix}-${this.#namespace}`
       : this.prefix;
+  }
+
+  /** `<effectivePrefix>-start-run` — the queue for tenant worker → control plane start-run requests. */
+  #startRunName(): string {
+    return `${this.#effectivePrefix()}-start-run`;
   }
 
   /** The shared controller, lazily created. In `handle()` it's created with the configured
@@ -483,6 +490,25 @@ export class BullMQTransport implements Transport, ControlPlane {
     });
   }
 
+  /** Tenant worker → control plane: enqueue a start-run request on `<effectivePrefix>-start-run`. */
+  async dispatchStartRun(msg: StartRunMessage): Promise<void> {
+    await this.queue(this.#startRunName()).add('startRun', msg, {
+      removeOnComplete: true,
+      removeOnFail: true,
+    });
+  }
+
+  /** Control plane: consume start-run requests and turn them into durable runs. Starts the consumer
+   *  on first call (idempotent — a second call is a no-op). */
+  onStartRun(handler: (msg: StartRunMessage) => Promise<void>): void {
+    if (this.startRunWorker) return;
+    this.startRunWorker = new Worker(
+      this.#startRunName(),
+      (job) => handler(job.data as StartRunMessage),
+      { connection: this.workerConnection() },
+    );
+  }
+
   /** Close all workers and queues so the process can exit. */
   async close(): Promise<void> {
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
@@ -491,6 +517,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     await this.resultsWorker?.close();
     await this.decisionsWorker?.close();
     await this.stepEventsWorker?.close();
+    await this.startRunWorker?.close();
     await Promise.all([...this.queues.values()].map((q) => q.close()));
     this.controlPub?.disconnect();
     this.controlSub?.disconnect();

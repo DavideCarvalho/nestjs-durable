@@ -26,16 +26,20 @@ export type {
   RunRedisWorkerOptions,
   RunnerDeps,
   RunningWorker,
+  StartRunDeps,
+  StartRunOptions,
 } from './redis-runner';
-export { runRedisWorker } from './redis-runner';
+export { runRedisWorker, startRun } from './redis-runner';
 export type { HandleTaskOptions, HandledTask } from './runner-core';
 export {
   DEFAULT_PREFIX,
   DurableWorkerRuntime,
   controlChannel,
   decisionsName,
+  effectivePrefixOf,
   isWorkflowTask,
   resultsName,
+  startRunName,
   stepEventsName,
   tasksName,
   workerHeartbeatKey,
