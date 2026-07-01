@@ -468,6 +468,8 @@ export interface StartRunMessage {
   runId?: string | undefined;
   /** Tags to stamp on the run (merged with the workflow's static @Workflow tags). */
   tags?: string[] | undefined;
+  /** Typed, queryable run data to stamp on the run (same as {@link StartOptions.searchAttributes}). */
+  searchAttributes?: SearchAttributes | undefined;
 }
 
 /** A unit of work dispatched to a remote worker. This is the documented wire payload. */

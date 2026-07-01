@@ -491,6 +491,7 @@ export class WorkflowEngine {
         {
           namespace: message.tenant,
           tags: message.tags,
+          searchAttributes: message.searchAttributes,
         },
       );
     });

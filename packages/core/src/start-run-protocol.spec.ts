@@ -63,6 +63,24 @@ describe('WorkflowEngine — start-run protocol', () => {
     expect(created?.tags).toContain('batch:nightly');
   });
 
+  it('stamps searchAttributes from a start-run message onto the created run', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new StartRunTransport();
+    const engine = new WorkflowEngine({ store, transport, namespace: 'control-plane' });
+    engine.register('processing', '1', async (_ctx, input) => input);
+
+    await transport.deliver({
+      tenant: 'acme',
+      workflow: 'processing',
+      input: { n: 1 },
+      runId: 'run-sa-1',
+      searchAttributes: { tier: 'pro', amount: 200 },
+    });
+
+    const created = await store.getRun('run-sa-1');
+    expect(created?.searchAttributes).toEqual({ tier: 'pro', amount: 200 });
+  });
+
   it('the default start path still stamps the engine namespace', async () => {
     const store = new InMemoryStateStore();
     const transport = new StartRunTransport();
