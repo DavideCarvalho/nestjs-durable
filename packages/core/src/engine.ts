@@ -51,6 +51,7 @@ import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { SingletonGate } from './singleton-gate';
+import { tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
 import {
   type Compensation,
@@ -322,7 +323,7 @@ export class WorkflowEngine {
   private readonly controlPlane?: ControlPlane | undefined;
   private readonly clock: () => number;
   private readonly instanceId: string;
-  private readonly namespace: string;
+  private readonly namespace: string | undefined;
   private readonly leaseMs: number;
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly remoteAdvanceSilenceMs?: number | undefined;
@@ -392,11 +393,15 @@ export class WorkflowEngine {
     // instead of waiting for their retry tick. Best-effort (the retry tick remains the guarantee).
     this.admission.onFreed?.((queue) => this.wakeQueueWaiters(queue));
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
-    this.namespace = deps.namespace ?? 'default';
+    this.namespace = deps.namespace;
     // Propagate the engine's namespace to its transport(s) so the SAME namespace that partitions the
     // store also partitions the transport's queues/keys — set once on the engine, applied everywhere.
     // Runs for ALL namespaces (the transport makes "default" a no-op); an empty pool is a no-op too.
-    this.pool.useNamespace(this.namespace);
+    // An operator (namespace: undefined) drives every namespace itself, so its transport(s) stay on
+    // their constructor prefix (bare/shared) instead of being pinned to one namespace.
+    if (this.namespace !== undefined) {
+      this.pool.useNamespace(this.namespace);
+    }
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
@@ -922,8 +927,14 @@ export class WorkflowEngine {
     // Namespace guard: release the lock and bail when this run belongs to a different worker pool.
     // Piggybacked on the existing store.getRun above — no extra async step on the happy path.
     // An undefined namespace (a store adapter that doesn't persist the field yet) is treated as
-    // "belongs to everyone" for back-compat: don't skip it.
-    if (run.namespace !== undefined && run.namespace !== this.namespace) {
+    // "belongs to everyone" for back-compat: don't skip it. Likewise, this ENGINE having an
+    // undefined namespace means it's an operator control plane — it belongs to every namespace too,
+    // so the guard never applies to it.
+    if (
+      this.namespace !== undefined &&
+      run.namespace !== undefined &&
+      run.namespace !== this.namespace
+    ) {
       await this.store.releaseRunLock(runId);
       throw new NamespaceMismatch();
     }
@@ -1006,8 +1017,9 @@ export class WorkflowEngine {
   ): Promise<RegisteredWorkflow | undefined> {
     if (!this.remoteByConvention) return undefined;
     const liveGroups = await this.pool.listWorkerGroups();
-    if (!liveGroups.includes(run.workflow)) return undefined;
-    const executor = new RemoteWorkflowExecutor(this.pool.primary, run.workflow);
+    const group = tenantGroup(run.workflow, run.namespace);
+    if (!liveGroups.includes(group)) return undefined;
+    const executor = new RemoteWorkflowExecutor(this.pool.primary, group);
     return {
       name: run.workflow,
       version: run.workflowVersion,
@@ -1015,7 +1027,7 @@ export class WorkflowEngine {
         throw new Error(`remote workflow ${run.workflow} has no local body`);
       },
       hasBody: false,
-      remote: { group: run.workflow, executor },
+      remote: { group, executor },
     };
   }
 
@@ -2739,7 +2751,13 @@ export class WorkflowEngine {
     const run = await this.store.getRun(decision.runId);
     if (!run || run.awaitingDecisionTaskId !== decision.taskId) return;
     if (run.status === 'cancelled' || run.status === 'completed' || run.status === 'dead') return;
-    if (run.namespace !== undefined && run.namespace !== this.namespace) return;
+    if (
+      this.namespace !== undefined &&
+      run.namespace !== undefined &&
+      run.namespace !== this.namespace
+    ) {
+      return;
+    }
     const nowMs = this.clock();
     // Lease so exactly one instance applies it — serialized with a concurrent timer re-drive of the
     // same run. If the lease is held (a re-drive in flight), drop: the re-driven turn produces a fresh

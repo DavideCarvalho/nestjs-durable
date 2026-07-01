@@ -25,10 +25,10 @@ describe('engine → transport namespace propagation', () => {
     expect(transport.namespaces).toEqual(['dev-alice']);
   });
 
-  it('propagates "default" too (the transport itself makes default a no-op)', () => {
+  it('does not propagate a namespace when none is configured (an operator control plane leaves its transport(s) on their own bare/shared prefix)', () => {
     const transport = new SpyTransport();
     new WorkflowEngine({ store: new InMemoryStateStore(), transport });
-    expect(transport.namespaces).toEqual(['default']);
+    expect(transport.namespaces).toEqual([]);
   });
 
   it('propagates the namespace to every transport in a pool', () => {
