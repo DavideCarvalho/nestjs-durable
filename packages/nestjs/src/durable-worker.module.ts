@@ -5,7 +5,7 @@ import {
   type RunningWorker,
   runRedisWorker as defaultRunRedisWorker,
 } from '@dudousxd/durable-worker';
-import { tenantGroup } from '@dudousxd/nestjs-durable-core';
+import { WorkflowEngine, tenantGroup } from '@dudousxd/nestjs-durable-core';
 import {
   type DynamicModule,
   Inject,
@@ -19,6 +19,8 @@ import {
 } from '@nestjs/common';
 import { DiscoveryModule, DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
+import { DurableStartClient } from './durable-start-client';
+import { WorkflowService } from './workflow.service';
 
 /**
  * Options for a **store-less thin worker** process: where to consume (`connection`/`prefix`) and
@@ -198,8 +200,14 @@ export class DurableWorkerModule {
         ThinWorkflowRegistrar,
         ThinStepRegistrar,
         ThinWorkerBootstrap,
+        {
+          provide: WorkflowEngine,
+          useFactory: (options: DurableWorkerModuleOptions) => new DurableStartClient(options),
+          inject: [DURABLE_WORKER_OPTIONS],
+        },
+        WorkflowService,
       ],
-      exports: [DurableWorkerRuntime],
+      exports: [DurableWorkerRuntime, WorkflowEngine, WorkflowService],
     };
   }
 }

@@ -1,5 +1,6 @@
 export * from './context-accessor';
 export * from './decorators';
+export { DurableStartClient } from './durable-start-client';
 export * from './durable-worker.module';
 export * from './durable.module';
 export * from './entity';

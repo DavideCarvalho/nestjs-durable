@@ -9,11 +9,13 @@ import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { z } from 'zod';
 import { Step, Workflow } from './decorators';
+import { DurableStartClient } from './durable-start-client';
 import {
   DURABLE_WORKER_RUNNERS,
   DurableWorkerModule,
   RUN_REDIS_WORKER,
 } from './durable-worker.module';
+import { WorkflowService } from './workflow.service';
 
 const charge: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
   name: 'payments.charge',
@@ -133,7 +135,7 @@ describe('DurableWorkerModule', () => {
     await moduleRef.close();
   });
 
-  it('does NOT create an engine / store / dashboard provider (control-plane-less)', async () => {
+  it('does NOT create a store / dashboard provider (control-plane-less)', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
       imports: [DurableWorkerModule.forRoot({ connection: 'redis://x', groups: ['g'] })],
@@ -144,10 +146,32 @@ describe('DurableWorkerModule', () => {
       .compile();
     await moduleRef.init();
 
-    // The whole point: no WorkflowEngine is bound. `get` (non-strict) must not resolve one.
-    expect(() => moduleRef.get(WorkflowEngine, { strict: false })).toThrow();
+    // The module IS control-plane-less: the WorkflowEngine token resolves to the store-less
+    // DurableStartClient facade (see the dedicated test below), never a full store-backed engine.
+    expect(moduleRef.get(WorkflowEngine, { strict: false })).toBeInstanceOf(DurableStartClient);
 
     await moduleRef.close();
+  });
+
+  it('provides a store-less start facade under the WorkflowEngine token', async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableWorkerModule.forRoot({
+          connection: 'redis://x',
+          groups: ['pipeline'],
+          tenant: 'davi-local',
+        }),
+      ],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(async () => ({ close: async () => {} }))
+      .compile();
+
+    const engine = moduleRef.get(WorkflowEngine);
+    expect(engine).toBeInstanceOf(DurableStartClient);
+
+    const service = moduleRef.get(WorkflowService);
+    expect(service).toBeInstanceOf(WorkflowService);
   });
 
   it('starts one runner per group on bootstrap and closes them on shutdown', async () => {
