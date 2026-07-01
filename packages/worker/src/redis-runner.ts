@@ -1,5 +1,9 @@
 import { hostname } from 'node:os';
-import type { StartRunMessage, WorkflowStepEvent } from '@dudousxd/nestjs-durable-core';
+import {
+  type StartRunMessage,
+  type WorkflowStepEvent,
+  tenantGroup,
+} from '@dudousxd/nestjs-durable-core';
 import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency';
 import {
   DEFAULT_PREFIX,
@@ -79,12 +83,22 @@ export type RedisConnection = unknown;
 export interface RunRedisWorkerOptions {
   /** The pure routing core: holds the registered workflows + steps. */
   runtime: DurableWorkerRuntime;
-  /** The worker group this instance serves — selects the `<prefix>-tasks-<group>` queue to consume. */
+  /** The base worker group this instance serves (before any tenant suffix — see {@link tenant}). */
   group: string;
   /** ioredis connection options (or an IORedis instance), as `BullMQTransport` takes. */
   connection: RedisConnection;
   /** Key prefix namespacing the durable queues. Defaults to `durable` (matches the transport). */
   prefix?: string;
+  /**
+   * The tenant this worker instance serves — DISTINCT from {@link prefix} (the transport prefix
+   * stays whatever it is, typically shared with the control plane). Only the worker GROUP it
+   * registers/heartbeats under is derived via `tenantGroup(group, tenant)`
+   * (`@dudousxd/nestjs-durable-core`): `undefined`, `''`, or `'default'` yields the bare
+   * {@link group} (production byte-identical — a single-tenant deployment never sees a suffix);
+   * any other tenant yields `<group>@<tenant>`, so an operator control plane's
+   * `listWorkerGroups()`/`resolveRemoteByConvention` can route that tenant's runs to this worker.
+   */
+  tenant?: string;
   /** Stable id for this worker process in heartbeats/control. Defaults to `ts-<hostname>-<pid>`. */
   instanceId?: string;
   /** Override the Worker's job-lock duration (ms). Defaults to 5 min — see {@link DEFAULT_LOCK_DURATION_MS}. */
@@ -197,6 +211,10 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   const lockDuration = options.lockDuration ?? DEFAULT_LOCK_DURATION_MS;
   const deps = options.deps ?? (await loadDeps());
   const { runtime, group, connection } = options;
+  // The GROUP this instance actually registers/heartbeats under: tenant-suffixed for a real
+  // tenant, byte-identical to `group` for undefined/''/'default'. The transport `prefix` above is
+  // untouched by `tenant` — only the group name carries it (see `RunRedisWorkerOptions.tenant`).
+  const effectiveGroup = tenantGroup(group, options.tenant);
 
   const queueOpts = { connection };
   const decisions = new deps.Queue(decisionsName(prefix), queueOpts);
@@ -233,7 +251,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
     // run the engine awaits an `advance` for; a remote-step task is not beaten (harmless either way).
     const stopBeat =
       isWorkflowTask(task) && heartbeatClient
-        ? startRunHeartbeat(heartbeatClient, prefix, group, task.runId)
+        ? startRunHeartbeat(heartbeatClient, prefix, effectiveGroup, task.runId)
         : () => {};
     const startedAt = Date.now();
     controller.onStart();
@@ -257,7 +275,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
     }
   };
 
-  const worker = new deps.Worker(tasksName(prefix, group), processJob, {
+  const worker = new deps.Worker(tasksName(prefix, effectiveGroup), processJob, {
     connection: workerConnection(connection),
     lockDuration,
     concurrency: controller.initialLimit,
@@ -287,7 +305,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       });
 
       heartbeatClient = base;
-      const key = workerHeartbeatKey(prefix, group, instanceId);
+      const key = workerHeartbeatKey(prefix, effectiveGroup, instanceId);
       const beat = () => {
         // The heartbeat value is now `{ts,status}` JSON (was a bare ms timestamp) — readers accept
         // both. The status is the controller's live snapshot, refreshed cheaply on every beat.
@@ -338,7 +356,15 @@ export interface StartRunOptions {
   workflow: string;
   /** Workflow input payload (any JSON-serialisable value). */
   input: StartRunMessage['input'];
-  /** Optional caller-supplied run id (idempotency key). Engine generates one if absent. */
+  /**
+   * Optional caller-supplied run id (idempotency key) — passed through onto {@link StartRunMessage}
+   * VERBATIM, exactly as given. `startRun` never mints a fresh id in its place: this call sits at
+   * the head of a retryable, at-least-once BullMQ path (queue add → consumer → engine), so
+   * substituting a uuid here (e.g. per delivery) would make a REDELIVERED `startRun` create a
+   * second run instead of being deduplicated against the first. If `runId` is omitted, the control
+   * plane's `onStartRun` consumer mints one itself, and a redelivery of THAT specific call is not
+   * idempotent — callers that need idempotent redelivery must always supply their own `runId`.
+   */
   runId?: string | undefined;
   /** Tags merged into the run at creation. */
   tags?: string[] | undefined;

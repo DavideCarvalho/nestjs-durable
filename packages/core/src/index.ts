@@ -15,6 +15,7 @@ export * from './metrics';
 export * from './scheduler';
 export { createStepLogger } from './step-logger';
 export * from './search-attributes';
+export * from './tenant-group';
 export * from './tokens';
 export * from './workflow-ref';
 export { InMemoryStateStore } from './testing/in-memory-state-store';
