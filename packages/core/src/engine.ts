@@ -78,6 +78,12 @@ export interface StartOptions {
    * the engine dispatches to advance it. Higher wins; absent = unprioritised. See {@link WorkflowRun.priority}.
    */
   priority?: number | undefined;
+  /**
+   * Override the namespace stamped on the run. Defaults to the engine's own `namespace`. Set by the
+   * control plane when it starts a run on behalf of a tenant (a {@link StartRunMessage}'s `tenant`
+   * maps here), so one DB-less-tenant-facing engine can create runs across many namespaces.
+   */
+  namespace?: string | undefined;
 }
 
 /**
@@ -466,6 +472,21 @@ export class WorkflowEngine {
         await this.completeRemoteDecision(decision);
       },
     );
+    // Control-plane start-run: a DB-less tenant worker publishes a StartRunMessage and this
+    // (control-plane) engine turns it into a durable run stamped with the tenant's namespace. Guarded
+    // by the transport's `onStartRun` capability (like the other optional transport hooks) — a pool
+    // whose transport can't carry the channel simply never registers, so a worker-only engine no-ops.
+    this.pool.onStartRun(async (message) => {
+      await this.start(
+        message.workflow,
+        message.input,
+        message.runId ?? globalThis.crypto.randomUUID(),
+        {
+          namespace: message.tenant,
+          tags: message.tags,
+        },
+      );
+    });
     // Control plane: re-broadcast lifecycle events from OTHER instances to this instance's
     // subscribers (cross-pod live-tail), and act on cancellations issued elsewhere. A broker may
     // echo our own publish back — ignore those (we already handled them locally) to avoid duplicates.
@@ -862,7 +883,7 @@ export class WorkflowEngine {
       workflow: name,
       workflowVersion: registered.version,
       status: 'pending',
-      namespace: this.namespace,
+      namespace: opts?.namespace ?? this.namespace,
       input,
       tags,
       searchAttributes: opts?.searchAttributes,

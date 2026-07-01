@@ -3,6 +3,7 @@ import type {
   Heartbeat,
   NamedTransport,
   RemoteTask,
+  StartRunMessage,
   StepResult,
   Transport,
   WorkflowDecision,
@@ -93,6 +94,17 @@ export class TransportPool {
       depth: reports.reduce((sum, r) => sum + r.depth, 0),
       liveWorkers: reports.flatMap((r) => r.liveWorkers),
     };
+  }
+
+  /**
+   * Register a control-plane `start-run` consumer on every transport that carries the channel. Only
+   * control-plane-side transports implement {@link Transport.onStartRun}; a transport without it is
+   * skipped, so a plain worker/in-process pool is a no-op. Mirrors {@link bind}'s per-transport wiring.
+   */
+  onStartRun(handler: (msg: StartRunMessage) => Promise<void>): void {
+    for (const { transport } of this.transports) {
+      transport.onStartRun?.(handler);
+    }
   }
 
   /** Distinct worker groups with a live heartbeat, merged across every transport that can report it. */
