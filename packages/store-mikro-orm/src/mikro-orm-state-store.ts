@@ -301,6 +301,9 @@ export class MikroOrmStateStore implements StateStore {
     //    filters AND paginates — no full scan + in-process filter (ANDed: one EXISTS per filter).
     // Use a QueryBuilder with a fixed root alias `r` so the raw correlations are stable across drivers.
     if (query.tag || query.attributes?.length) {
+      // MikroORM global filters do not auto-apply to createQueryBuilder, so enforce the scope here
+      // explicitly. Mirrors the filter cond's semantics: undefined = no restriction (operator view).
+      if (this.scopeNamespace !== undefined) where.namespace = this.scopeNamespace;
       const quote = this.idQuote(em);
       const cols = this.attributeColumns(em);
       const qb = (em as SqlEm)

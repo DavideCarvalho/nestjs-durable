@@ -85,4 +85,26 @@ describe('MikroOrmStateStore tenant scope', () => {
 
     await orm.close(true);
   });
+
+  it('a scoped store does not see another namespace run via tag search', async () => {
+    const orm = await makeOrm();
+    const operator = new MikroOrmStateStore(orm);
+    await operator.createRun(run({ id: 'r-b', namespace: 'b', tags: ['etl'] }));
+    const scopedToA = new MikroOrmStateStore(orm, { scope: { namespace: 'a' } });
+    const result = await scopedToA.listRuns({ tag: 'etl' });
+    expect(result).toHaveLength(0);
+    await orm.close(true);
+  });
+
+  it('a scoped store does not see another namespace run via attribute search', async () => {
+    const orm = await makeOrm();
+    const operator = new MikroOrmStateStore(orm);
+    await operator.createRun(run({ id: 'r-b', namespace: 'b', searchAttributes: { env: 'prod' } }));
+    const scopedToA = new MikroOrmStateStore(orm, { scope: { namespace: 'a' } });
+    const result = await scopedToA.listRuns({
+      attributes: [{ key: 'env', op: 'eq', value: 'prod' }],
+    });
+    expect(result).toHaveLength(0);
+    await orm.close(true);
+  });
 });
