@@ -856,6 +856,11 @@ export class WorkflowEngine {
         workflow: name,
         workflowVersion: '1',
         status: 'pending',
+        // Stamp the namespace the REAL run will carry (:893) so convention routing resolves the same
+        // tenant-suffixed group the run will dispatch to — an operator starting a tenant's run via the
+        // `onStartRun` wire (opts.namespace = tenant) must find the live `<workflow>@<tenant>` group,
+        // not the bare group. Without this the start-run entry path can't reach a suffixed-only worker.
+        namespace: opts?.namespace ?? this.namespace,
         input,
         createdAt: new Date(),
         updatedAt: new Date(),

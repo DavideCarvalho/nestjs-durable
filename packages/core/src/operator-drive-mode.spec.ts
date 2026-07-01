@@ -214,6 +214,45 @@ describe('operator drive mode', () => {
     expect(settled?.output).toEqual({ ok: true });
   });
 
+  it('start() via the onStartRun wire resolves the tenant-suffixed group: opts.namespace is stamped on the convention pre-check', async () => {
+    const store = new InMemoryStateStore();
+    // ONLY the tenant-suffixed group is live — the bare `processing` group is NOT. This is the
+    // discriminating case: an operator starting a t1 run (opts.namespace: 't1') must resolve
+    // `processing@t1`. Before the pre-check stamped the namespace it computed the BARE group, missed
+    // it here, and threw "not registered" — orphaning the start-run wire path for a suffixed-only worker.
+    const transport = new RecordingTransport(['processing@t1']);
+    const operator = new WorkflowEngine({
+      store,
+      transport,
+      namespace: undefined,
+      remoteByConvention: true,
+      runDispatcher: { dispatch: () => {} }, // no-op: inspect the created row, don't drive it further
+    });
+
+    const started = await operator.start('processing', { hello: 'world' }, 'wire-t1', {
+      namespace: 't1',
+    });
+    expect(started.status).toBe('pending');
+    const run = await store.getRun('wire-t1');
+    expect(run?.namespace).toBe('t1');
+    expect(run?.status).toBe('pending');
+  });
+
+  it('start() of a tenant workflow with NO live group still throws (unchanged failure mode)', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new RecordingTransport([]); // nothing live
+    const operator = new WorkflowEngine({
+      store,
+      transport,
+      namespace: undefined,
+      remoteByConvention: true,
+      runDispatcher: { dispatch: () => {} },
+    });
+    await expect(
+      operator.start('processing', {}, 'wire-none', { namespace: 't1' }),
+    ).rejects.toThrow('not registered');
+  });
+
   it('regression: a scoped engine (namespace: "default") still rejects and drops a t1 run exactly as before', async () => {
     const store = new InMemoryStateStore();
     const created = nowDate();
