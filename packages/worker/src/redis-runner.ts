@@ -1,5 +1,6 @@
 import { hostname } from 'node:os';
 import {
+  type SearchAttributes,
   type StartRunMessage,
   type WorkflowStepEvent,
   tenantGroup,
@@ -368,6 +369,8 @@ export interface StartRunOptions {
   runId?: string | undefined;
   /** Tags merged into the run at creation. */
   tags?: string[] | undefined;
+  /** Typed, queryable run data merged into the run at creation. */
+  searchAttributes?: SearchAttributes | undefined;
   /** Queue key prefix. Defaults to `'durable'` (matches `BullMQTransport` default). */
   prefix?: string | undefined;
   /**
@@ -410,6 +413,7 @@ export async function startRun(connection: RedisConnection, opts: StartRunOption
   };
   if (opts.runId !== undefined) msg.runId = opts.runId;
   if (opts.tags !== undefined) msg.tags = opts.tags;
+  if (opts.searchAttributes !== undefined) msg.searchAttributes = opts.searchAttributes;
   try {
     await queue.add('startRun', msg, { removeOnComplete: true, removeOnFail: true });
   } finally {

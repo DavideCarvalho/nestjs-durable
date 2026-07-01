@@ -114,4 +114,20 @@ describe('startRun — wire payload', () => {
     await startRun({}, { tenant: 'acme', workflow: 'invoice', input, deps });
     expect((captures[0]?.data as Record<string, unknown>).input).toEqual(input);
   });
+
+  it('forwards searchAttributes onto the start-run message', async () => {
+    const { deps, captures } = makeFakeDeps();
+    await startRun(
+      {},
+      {
+        tenant: 'acme',
+        workflow: 'demo',
+        input: { n: 1 },
+        runId: 'r1',
+        searchAttributes: { tier: 'pro' },
+        deps,
+      },
+    );
+    expect(captures[0]?.data).toMatchObject({ searchAttributes: { tier: 'pro' } });
+  });
 });
