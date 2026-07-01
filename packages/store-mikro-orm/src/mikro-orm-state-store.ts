@@ -51,27 +51,61 @@ import {
 } from './entities';
 import { ensureMikroOrmDurableSchema } from './schema';
 
+/** Options for scoping a `MikroOrmStateStore` to a single tenant namespace. */
+export interface MikroOrmStateStoreOptions {
+  /**
+   * When set, every forked `EntityManager` activates the `namespace` global filter with this value,
+   * so reads are confined to the given tenant's rows. Omit (or pass `undefined`) for the operator
+   * (control-plane) view that sees all namespaces.
+   */
+  scope?: {
+    namespace?: string;
+  };
+}
+
 /**
  * MikroORM-backed `StateStore`. Works on any MikroORM driver — Postgres, MySQL, SQLite (tested);
  * timestamps and `wakeAt` use native datetime columns. Each operation runs on a forked
  * EntityManager so it owns its unit of work.
+ *
+ * Pass `opts.scope.namespace` to confine all reads to a single tenant namespace. Omit for the
+ * unscoped operator view (control plane — all namespaces visible).
  */
 export class MikroOrmStateStore implements StateStore {
-  constructor(private readonly orm: MikroORM) {}
+  private readonly scopeNamespace: string | undefined;
+
+  constructor(
+    private readonly orm: MikroORM,
+    opts?: MikroOrmStateStoreOptions,
+  ) {
+    this.scopeNamespace = opts?.scope?.namespace;
+  }
+
+  /**
+   * Create a forked EntityManager and activate the `namespace` global filter with the store's
+   * scope (if any). All read operations go through this so the tenant boundary is applied
+   * uniformly. Write operations (nativeDelete, nativeUpdate, upsert, insertMany) bypass global
+   * filters in MikroORM and are unaffected.
+   */
+  private fork() {
+    const em = this.orm.em.fork();
+    em.setFilterParams('namespace', { namespace: this.scopeNamespace });
+    return em;
+  }
 
   async ensureSchema(): Promise<void> {
     await ensureMikroOrmDurableSchema(this.orm);
   }
 
   async createRun(run: WorkflowRun): Promise<void> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     em.create(WorkflowRunEntity, toRunEntity(run));
     await em.flush();
     await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const entity = await em.findOneOrFail(WorkflowRunEntity, { id: runId });
     Object.assign(entity, toRunEntity({ ...fromRunEntity(entity), ...patch } as WorkflowRun));
     await em.flush();
@@ -86,20 +120,20 @@ export class MikroOrmStateStore implements StateStore {
     attributes: WorkflowRun['searchAttributes'],
     forked?: EntityManager,
   ): Promise<void> {
-    const em = forked ?? this.orm.em.fork();
+    const em = forked ?? this.fork();
     await em.nativeDelete(RunAttributeEntity, { runId });
     const rows = normalizeAttributeRows(runId, attributes);
     if (rows.length) await em.insertMany(RunAttributeEntity, rows);
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const entity = await em.findOne(WorkflowRunEntity, { id: runId });
     return entity ? fromRunEntity(entity) : null;
   }
 
   async deleteRun(runId: string): Promise<void> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     // Children first, then the run row — checkpoints, signal waiters, and the normalized
     // attribute side-table, so nothing dangles after the run is gone.
     await em.nativeDelete(StepCheckpointEntity, { runId });
@@ -110,7 +144,7 @@ export class MikroOrmStateStore implements StateStore {
 
   async pruneTerminalRuns(policy: RetentionPolicy, nowMs: number, limit: number): Promise<number> {
     if (policy.statuses.length === 0 || limit <= 0) return 0;
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const status = { $in: policy.statuses };
     // Collect ids that violate EITHER bound (most-restrictive keep): too old, or past the count cap.
     const ids = new Set<string>();
@@ -157,13 +191,13 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const entity = await em.findOne(StepCheckpointEntity, { runId, seq });
     return entity ? fromCheckpointEntity(entity) : null;
   }
 
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     await em.upsert(StepCheckpointEntity, toCheckpointEntity(checkpoint));
     await em.flush();
   }
@@ -174,7 +208,7 @@ export class MikroOrmStateStore implements StateStore {
       saveCheckpoint: (cp: StepCheckpoint) => Promise<void>;
     }) => Promise<T>,
   ): Promise<T> {
-    return this.orm.em.fork().transactional(async (em) =>
+    return this.fork().transactional(async (em) =>
       work({
         raw: em,
         saveCheckpoint: async (cp) => {
@@ -185,7 +219,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const rows = await em.find(WorkflowRunEntity, {
       status: { $in: ['running', 'cancelling'] },
       ...(namespace !== undefined ? { namespace } : {}),
@@ -194,7 +228,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const rows = await em.find(
       WorkflowRunEntity,
       { status: 'pending', ...(namespace !== undefined ? { namespace } : {}) },
@@ -204,7 +238,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const rows = await em.find(WorkflowRunEntity, {
       status: 'suspended',
       wakeAt: { $ne: null, $lte: new Date(nowMs) },
@@ -219,7 +253,7 @@ export class MikroOrmStateStore implements StateStore {
     leaseUntilMs: number,
     nowMs: number,
   ): Promise<boolean> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const affected = await em.nativeUpdate(
       WorkflowRunEntity,
       { id: runId, $or: [{ lockedUntil: null }, { lockedUntil: { $lte: new Date(nowMs) } }] },
@@ -229,12 +263,12 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async releaseRunLock(runId: string): Promise<void> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     await em.nativeUpdate(WorkflowRunEntity, { id: runId }, { lockedBy: null, lockedUntil: null });
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const affected = await em.nativeUpdate(
       WorkflowRunEntity,
       { id: runId, lockedBy: owner },
@@ -244,7 +278,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
     if (query.namespace !== undefined) where.namespace = query.namespace;
@@ -362,7 +396,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const rows = await em.find(StepCheckpointEntity, { runId }, { orderBy: { seq: 'asc' } });
     return rows.map(fromCheckpointEntity);
   }
@@ -371,7 +405,7 @@ export class MikroOrmStateStore implements StateStore {
     runId: string,
     name: string,
   ): Promise<StepCheckpoint | undefined> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const entity = await em.findOne(
       StepCheckpointEntity,
       { runId, name },
@@ -382,7 +416,7 @@ export class MikroOrmStateStore implements StateStore {
 
   async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {
     if (prefixes.length === 0) return [];
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const rows = await em.find(
       StepCheckpointEntity,
       { runId, $or: prefixes.map((p) => ({ name: { $like: `${p}%` } })) },
@@ -392,7 +426,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     await em.upsert(SignalWaiterEntity, {
       token: waiter.token,
       runId: waiter.runId,
@@ -403,7 +437,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async takeSignalWaiter(token: string): Promise<SignalWaiter | null> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const entity = await em.findOne(SignalWaiterEntity, { token });
     if (!entity) return null;
     const waiter: SignalWaiter = {
@@ -417,7 +451,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const rows = await em.find(SignalWaiterEntity, { token: { $like: `${prefix}%` } });
     return rows.map((e) => ({
       token: e.token,
@@ -428,7 +462,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async bufferSignal(token: string, payload: unknown): Promise<void> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const e = new BufferedSignalEntity();
     e.token = token;
     e.payload = payload ?? null;
@@ -437,7 +471,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
-    const em = this.orm.em.fork();
+    const em = this.fork();
     const entity = await em.findOne(BufferedSignalEntity, { token }, { orderBy: { id: 'asc' } });
     if (!entity) return null;
     const payload = entity.payload ?? undefined;

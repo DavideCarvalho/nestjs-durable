@@ -104,12 +104,32 @@ export class BufferedSignalEntity {
  * entities: durableEntities({ naming: 'snake_case' })
  * ```
  */
+/**
+ * MikroORM global filter condition for the `namespace` read boundary. Returns `{}` (no restriction)
+ * when `namespace` is undefined — the operator (control plane) sees all tenants. Returns a
+ * `{ namespace }` equality predicate otherwise, confining the query to that tenant's rows.
+ */
+function namespaceFilterCond(args: { namespace?: string }): { namespace?: string } {
+  if (args.namespace === undefined) return {};
+  return { namespace: args.namespace };
+}
+
 export function durableEntities(options: { naming?: DurableColumnNaming } = {}): EntitySchema[] {
   const col = columnNamer(options.naming ?? 'snake_case');
 
   const workflowRuns = new EntitySchema<WorkflowRunEntity>({
     class: WorkflowRunEntity,
     tableName: 'durable_workflow_runs',
+    // Global filter: confines every read to the tenant's namespace when the store is scoped.
+    // The `cond` returns `{}` (no-op) when the `namespace` arg is `undefined`, so an unscoped
+    // (operator / control-plane) store sees all rows unchanged — existing behaviour is preserved.
+    filters: {
+      namespace: {
+        name: 'namespace',
+        cond: namespaceFilterCond,
+        default: true,
+      },
+    },
     // Indexes mirror the Prisma adapter so a store swap keeps the same plan. The poller hits these
     // every tick: `(status, wakeAt)` serves both the due-timer scan (status='suspended' AND wakeAt<=now)
     // and, via its `status` prefix, the pending/incomplete status lookups; `(workflow, status)` serves
