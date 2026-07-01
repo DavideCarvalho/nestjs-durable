@@ -210,8 +210,11 @@ export interface WorkflowEngineDeps {
   /**
    * Worker-pool partition for this engine. Stamped on every run it creates; the poll paths
    * (`runPending`/`recoverIncomplete`/`resumeDueTimers`/`sweepTimeouts`) only act on runs in this
-   * namespace. Default `'default'` — byte-identical to a single-pool deployment. Set distinct values
-   * to safely share ONE state store across non-interchangeable pools (e.g. local dev vs a cluster).
+   * namespace. Set distinct values to safely share ONE state store across non-interchangeable pools
+   * (e.g. local dev vs a cluster). **Omit it to make this engine an OPERATOR** — an unset namespace
+   * drives/recovers/resumes runs of EVERY namespace (the poll filters no-op, the resume/decision
+   * guards fall through) and leaves the transport on its bare prefix. This is the hosted control
+   * plane: "ver tudo = ausência de namespace".
    */
   namespace?: string | undefined;
   /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */
@@ -394,11 +397,10 @@ export class WorkflowEngine {
     this.admission.onFreed?.((queue) => this.wakeQueueWaiters(queue));
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
     this.namespace = deps.namespace;
-    // Propagate the engine's namespace to its transport(s) so the SAME namespace that partitions the
-    // store also partitions the transport's queues/keys — set once on the engine, applied everywhere.
-    // Runs for ALL namespaces (the transport makes "default" a no-op); an empty pool is a no-op too.
-    // An operator (namespace: undefined) drives every namespace itself, so its transport(s) stay on
-    // their constructor prefix (bare/shared) instead of being pinned to one namespace.
+    // Propagate a SCOPED engine's namespace to its transport(s) so the same namespace that partitions
+    // the store also partitions the transport's queues/keys — set once, applied everywhere. An OPERATOR
+    // (namespace: undefined) drives every namespace itself, so its transport(s) stay on their
+    // constructor prefix (bare/shared) instead of being pinned to one namespace.
     if (this.namespace !== undefined) {
       this.pool.useNamespace(this.namespace);
     }
