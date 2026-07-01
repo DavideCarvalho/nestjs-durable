@@ -71,12 +71,19 @@ describe('DurableStartClient', () => {
     expect((sink[0].data as { tenant: string }).tenant).toBe('default');
   });
 
-  it('throws on cancel and deleteRun (no store on a tenant)', async () => {
+  it('throws a clear tenant error for every store/driver op WorkflowService delegates', async () => {
     const client = new DurableStartClient(
       { connection: 'redis://x', groups: ['pipeline'], tenant: 'davi-local' },
       { Queue: makeFakeQueue([]) },
     );
     await expect(client.cancel('r1')).rejects.toThrow(/tenant/i);
     await expect(client.deleteRun('r1')).rejects.toThrow(/tenant/i);
+    await expect(client.resume('r1')).rejects.toThrow(/tenant/i);
+    await expect(client.waitForRun('r1')).rejects.toThrow(/tenant/i);
+    await expect(client.signal('tok', { x: 1 })).rejects.toThrow(/tenant/i);
+    await expect(client.signalWithStart('demo', { n: 1 }, 'r1', { token: 'tok' })).rejects.toThrow(
+      /tenant/i,
+    );
+    await expect(client.publishEvent('evt', { x: 1 })).rejects.toThrow(/tenant/i);
   });
 });

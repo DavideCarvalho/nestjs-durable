@@ -168,7 +168,11 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
  * A NestJS dynamic module that turns an app into a **PURE durable worker**: it discovers
  * `@Workflow`/`@Step` providers, registers them on the thin {@link DurableWorkerRuntime}, and
  * runs one BullMQ consumer per group via `runRedisWorker`. It is **control-plane-less** — it binds
- * NO `WorkflowEngine`, NO store/ORM, NO dashboard, NO timer poller, NO recovery, and NO run dispatch.
+ * NO store/ORM, NO dashboard, NO timer poller, NO recovery, and drives NO runs. The one thing it
+ * DOES bind under the `WorkflowEngine` token is a store-less {@link DurableStartClient} facade, so a
+ * tenant calls `engine.start(...)` UNCHANGED and it transparently dispatches a start-run to the
+ * control plane instead of touching a DB. `cancel`/`deleteRun`/`resume`/… on that facade throw a
+ * clear tenant error (the operator owns those).
  * Use it for a worker pod that only executes work an engine elsewhere coordinates.
  *
  * Contrast with `DurableModule` (`worker: true`), which is a full control plane WITH a store: this

@@ -62,18 +62,52 @@ export class DurableStartClient {
   }
 
   cancel(_runId: string): Promise<void> {
-    return Promise.reject(
-      new Error(
-        'cancel() is not available on a tenant worker (no store). Cancel from the control plane.',
-      ),
-    );
+    return tenantUnsupported('cancel');
   }
 
   deleteRun(_runId: string): Promise<void> {
-    return Promise.reject(
-      new Error(
-        'deleteRun() is not available on a tenant worker (no store). Delete from the control plane.',
-      ),
-    );
+    return tenantUnsupported('deleteRun');
   }
+
+  // — everything below rejects: a tenant worker holds no store/driver, only the start channel. —
+
+  // The remaining WorkflowEngine surface WorkflowService delegates to (resume/waitForRun/signal/
+  // signalWithStart/publishEvent) all need the store or driver a tenant does not have. A tenant only
+  // ever calls `start`; these exist so a mistaken call fails with a CLEAR, named tenant error instead
+  // of a cryptic `this.engine.X is not a function` — the facade is honest about what it cannot do.
+  // Params mirror the WorkflowEngine surface being faced; every method rejects without reading them.
+  resume(_runId: string): Promise<void> {
+    return tenantUnsupported('resume');
+  }
+
+  waitForRun(_runId: string, _opts?: { timeoutMs?: number }): Promise<void> {
+    return tenantUnsupported('waitForRun');
+  }
+
+  signal(_token: string, _payload: unknown): Promise<void> {
+    return tenantUnsupported('signal');
+  }
+
+  signalWithStart(
+    _workflow: string,
+    _input: unknown,
+    _runId: string,
+    _signal: { token: string; payload?: unknown },
+    _opts?: StartOptions,
+  ): Promise<void> {
+    return tenantUnsupported('signalWithStart');
+  }
+
+  publishEvent(_name: string, _payload: unknown, _opts?: { id?: string }): Promise<void> {
+    return tenantUnsupported('publishEvent');
+  }
+}
+
+/** Reject with a clear, named tenant error for an operation that needs a store/driver. */
+function tenantUnsupported(method: string): Promise<void> {
+  return Promise.reject(
+    new Error(
+      `${method}() is not available on a tenant worker (no store). Use the control plane for it.`,
+    ),
+  );
 }
