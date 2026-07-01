@@ -373,6 +373,7 @@ class Worker:
         *,
         concurrency: "int | str | dict" = 1,
         namespace: str = "default",
+        tenant: "str | None" = None,
         auto_register: bool = True,
         redis: str = "redis://localhost:6379",
         prefix: str = "durable",
@@ -384,6 +385,16 @@ class Worker:
         # an already-deployed worker is unaffected. Any other value MUST match the namespace of the
         # engine that dispatches to it — see ``_effective_prefix`` for the cross-SDK naming rule.
         self.namespace = namespace
+        # The tenant this worker instance serves — DISTINCT from ``namespace``: a pure Python
+        # tenant worker connects to a SHARED control-plane transport (its ``namespace``/prefix
+        # stays whatever the operator control plane uses) and declares its tenant identity as a
+        # DATA label, not by segmenting its wire. ``None`` (the default) keeps this worker
+        # byte-identical to before this attribute existed — ``start_run`` falls back to
+        # ``self.namespace`` and group registration/heartbeat stay on the bare group. A real tenant
+        # (1) is stamped verbatim as ``StartRunMessage.tenant`` and (2) suffixes the GROUP this
+        # worker registers/heartbeats under (and therefore the task queue it consumes) via
+        # ``_tenant_group`` — see ``run_redis_worker``'s ``tenant`` option.
+        self.tenant = tenant
         # How many tasks this worker runs concurrently from its group's queue (BullMQ Worker
         # concurrency). Default 1 (serial). Raise it so a fanned-out batch (e.g. the N remote steps of
         # a ``gather_calls``) runs in parallel. Per process; total parallelism is concurrency × replicas.
@@ -492,6 +503,7 @@ class Worker:
                 prefix=prefix,
                 concurrency=self.concurrency,
                 namespace=self.namespace,
+                tenant=self.tenant,
             )
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()
@@ -527,16 +539,29 @@ class Worker:
         durable run.  The message is a ``StartRunMessage``::
 
             {
-                "tenant": self.namespace,
+                "tenant": self.tenant or self.namespace,
                 "workflow": workflow,
                 "input": input,
                 "runId": run_id,   # omitted when None
                 "tags":  tags,     # omitted when None
             }
 
+        ``tenant`` is DECOUPLED from the wire: the queue name is still built from
+        ``self.namespace`` (``_effective_prefix`` — the SHARED transport prefix), while the
+        ``tenant`` field is ``self.tenant`` when set, falling back to ``self.namespace`` when not
+        (back-compat — a worker built before ``tenant`` existed behaves byte-identically).  This
+        lets a tenant worker on a shared control-plane transport declare a tenant distinct from
+        the namespace that segments its queues.
+
         ``workflow`` must be the registered name the control-plane engine knows.  ``input`` is any
-        JSON-serialisable value.  ``run_id`` is an optional idempotency key; the engine generates
-        one when absent.
+        JSON-serialisable value.  ``run_id`` is the caller's idempotency key and is passed through
+        onto the ``StartRunMessage`` VERBATIM — never replaced with a freshly minted uuid.  This
+        call sits at the head of a retryable, at-least-once path (queue add → consumer → engine),
+        so substituting a uuid here (e.g. per delivery) would make a REDELIVERED ``start_run``
+        create a second run instead of being deduplicated against the first.  When ``run_id`` is
+        omitted the control plane's ``onStartRun`` consumer mints one itself, and a redelivery of
+        THAT specific call is not idempotent — callers that need idempotent redelivery must always
+        supply their own ``run_id``.
 
         Requires the ``bullmq`` extra (``pip install durable-worker[redis]``).  One-shot: opens a
         Queue, adds the job, and closes the Queue.  For high-frequency callers, consider holding a
@@ -549,7 +574,7 @@ class Worker:
         effective_prefix = _effective_prefix(self._prefix, self.namespace)
         queue_name = f"{effective_prefix}-start-run"
         msg: Dict[str, Any] = {
-            "tenant": self.namespace,
+            "tenant": self.tenant or self.namespace,
             "workflow": workflow,
             "input": input,
         }
@@ -780,6 +805,7 @@ def run_workers(
                     prefix=prefix,
                     concurrency=worker.concurrency,
                     namespace=effective_namespace,
+                    tenant=getattr(worker, "tenant", None),
                 )
             handles.append(handle)
 

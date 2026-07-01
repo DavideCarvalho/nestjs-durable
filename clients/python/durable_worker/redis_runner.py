@@ -70,6 +70,22 @@ def _effective_prefix(prefix: str, namespace: "str | None") -> str:
     return f"{prefix}-{namespace}" if namespace and namespace != "default" else prefix
 
 
+def _tenant_group(base_group: str, tenant: "str | None") -> str:
+    """The worker group a tenant's run dispatches to / a tenant worker registers under.
+
+    CROSS-SDK CONTRACT — this MUST stay byte-identical to the TypeScript ``tenantGroup``
+    (``packages/core/src/tenant-group.ts``): a ``tenant`` of ``None``, ``""``, or ``"default"``
+    yields the bare ``base_group`` (production byte-identical — a single-tenant deployment never
+    sees a suffix); any other tenant yields ``"<base_group>@<tenant>"``, so an operator control
+    plane's ``listWorkerGroups()``/remote-by-convention resolution can route that tenant's runs to
+    this worker.
+
+    DISTINCT from :func:`_effective_prefix`: the prefix is the shared TRANSPORT a tenant worker
+    connects to (untouched by tenant); this is the GROUP identity within that shared transport —
+    it decides which ``<prefix>-tasks-<group>`` queue the worker actually consumes."""
+    return f"{base_group}@{tenant}" if tenant is not None and tenant != "" and tenant != "default" else base_group
+
+
 def _heartbeat_key(prefix: str, group: str) -> str:
     """Per-(group, instance) liveness key. Mirrors the queue-name convention ('<prefix>-...') so the
     whole durable keyspace shares one prefix. A monitor can scan '<prefix>-worker-heartbeat:<group>:*'."""
@@ -328,6 +344,7 @@ async def run_redis_worker(
     cancellation: Optional[CancellationRegistry] = None,
     concurrency: "int | str | dict" = 1,
     namespace: str = "default",
+    tenant: "str | None" = None,
 ) -> Any:
     """Start a BullMQ worker that runs ``worker``'s handlers. Returns the bullmq Worker.
 
@@ -339,6 +356,15 @@ async def run_redis_worker(
     config ``dict`` (``min``/``max``/``start``/``ramCeilingPct``/``cpuCeilingPct``/``tickMs``). An
     :class:`AdaptiveController` tracks ``inFlight`` / latency / RSS / CPU for BOTH modes (so the
     heartbeat carries a live ``WorkerStatus``); in adaptive mode it also tunes the live limit.
+
+    ``tenant`` is the tenant this instance serves — DISTINCT from ``namespace``/``prefix`` (the
+    transport prefix stays whatever it is, typically shared with the control plane). Only the
+    worker GROUP it registers/heartbeats under (and therefore consumes tasks from) is derived via
+    ``_tenant_group(group, tenant)``: ``None``/``''``/``'default'`` yields the bare ``group``
+    (production byte-identical — a single-tenant deployment never sees a suffix); any other tenant
+    yields ``<group>@<tenant>``, so an operator control plane's ``listWorkerGroups()`` can route
+    that tenant's runs to this worker. Mirrors the TypeScript ``runRedisWorker``'s ``tenant`` option
+    byte-identically (``@dudousxd/nestjs-durable-core``'s ``tenantGroup``).
 
     UNIFIED: when ``worker`` also holds workflows (``@worker.workflow``), this one runner routes per
     job off the single ``<prefix>-tasks-<group>`` queue — a WORKFLOW task (``is_workflow_task``) is
@@ -354,8 +380,12 @@ async def run_redis_worker(
     # Fold the namespace into the prefix ONCE, then thread the effective prefix everywhere a name is
     # built — so the worker shares one namespaced keyspace with a namespaced engine (cross-SDK contract).
     effective_prefix = _effective_prefix(prefix, namespace)
+    # The GROUP this instance actually registers/heartbeats under: tenant-suffixed for a real
+    # tenant, byte-identical to `group` for None/''/'default'. `effective_prefix` above is
+    # untouched by `tenant` — only the group name (and therefore the task queue it selects) carries it.
+    effective_group = _tenant_group(group, tenant)
 
-    tasks_name, results_name = _names(effective_prefix, group)
+    tasks_name, results_name = _names(effective_prefix, effective_group)
     results = BullQueue(results_name, {"connection": connection})
     registry = cancellation or CancellationRegistry()
     await _subscribe_control(connection, effective_prefix, registry)
@@ -379,7 +409,7 @@ async def run_redis_worker(
         # so the engine doesn't wrongly re-drive a slow-but-alive run. Cancel the beat once it settles.
         beat_task = (
             asyncio.create_task(
-                _beat_run(beat_client, beat_channel, job.data.get("runId"), group)
+                _beat_run(beat_client, beat_channel, job.data.get("runId"), effective_group)
             )
             if beat_client is not None
             else None
@@ -442,7 +472,7 @@ async def run_redis_worker(
     def apply_concurrency(new_limit: int) -> None:
         bull_worker.opts["concurrency"] = new_limit
 
-    await _start_heartbeat(connection, effective_prefix, group, controller)
+    await _start_heartbeat(connection, effective_prefix, effective_group, controller)
     controller.start(apply_cb=apply_concurrency)
     return bull_worker
 
