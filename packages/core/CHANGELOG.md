@@ -1,5 +1,47 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.46.0
+
+### Minor Changes
+
+- 48b7616: Add operator drive mode: a `WorkflowEngine` constructed with `namespace: undefined` is an
+  operator control plane — it drives/recovers/resumes runs of EVERY namespace instead of just
+  its own (`runPending`, `recoverIncomplete`, `resumeDueTimers`, `resume`, and
+  `completeRemoteDecision` all bypass the namespace guard), and its transport(s) are left on
+  their own bare/shared prefix (no `useNamespace` call). `resolveRemoteByConvention` now routes
+  a tenant's run to a tenant-suffixed worker group via the new `tenantGroup(baseGroup, tenant)`
+  helper: `undefined`/`''`/`'default'` stay bare (`<workflow>`), any other tenant becomes
+  `<workflow>@<tenant>`. A namespace-scoped engine (`namespace: 'x'`) behaves exactly as before.
+
+  `retryWithInput` and dead-letter routing now inherit the original run's `namespace`, so on an
+  operator a tenant's retry/dead-letter run stays that tenant's (routed to its worker group) instead
+  of falling back to the bare `'default'` group.
+
+  **Behavior change — read before upgrading a shared store.** Omitting `namespace` used to mean the
+  `'default'` partition; it now means OPERATOR (drives every namespace). A single-pool deployment is
+  byte-identical (the only namespace is `'default'`, and runs are still persisted as `'default'`). But
+  if you share ONE state store across multiple pools, EVERY pool must set its own `namespace` — a pool
+  that omits it will now drive all the other pools' runs. (Correctly-configured shared stores already
+  set distinct namespaces, so they are unaffected.)
+
+- ecce3ca: Add `StartRunMessage` interface and `dispatchStartRun`/`onStartRun` optional methods to the `Transport` interface (P4 — start-run over the protocol). A DB-less tenant worker publishes a `StartRunMessage` onto `<effectivePrefix>-start-run`; the control plane consumes it and turns it into a durable run.
+
+  Wire the control-plane consumer end to end: `WorkflowEngine.start` accepts `opts.namespace` and stamps `namespace: opts?.namespace ?? this.namespace` on the created run, and the engine constructor registers `transport.onStartRun` (guarded by the transport capability) to turn each incoming `StartRunMessage` into `start(workflow, input, runId, { namespace: tenant, tags })` — so a start-run for `{ tenant: 't1', ... }` creates a run stamped `namespace: 't1'`.
+
+- b7c63a5: `runRedisWorker` accepts a new `tenant` option, DISTINCT from `prefix` (the transport prefix is
+  untouched — typically shared with the operator control plane). Only the worker GROUP it
+  registers/heartbeats under is derived via `tenantGroup(group, tenant)`
+  (`@dudousxd/nestjs-durable-core`): `undefined`, `''`, or `'default'` stays byte-identical to the
+  bare `group` (production unchanged); any other tenant becomes `<group>@<tenant>`, so an
+  operator's `listWorkerGroups()`/`resolveRemoteByConvention` can route that tenant's runs to this
+  worker instance. `tenantGroup` is now also re-exported from `@dudousxd/nestjs-durable-core`'s
+  package root (it was previously only an internal module).
+- 1e9155a: Add `remoteByConvention` engine option: when enabled, an unregistered workflow is
+  automatically routed to the live worker group of the same name — no `engine.remote()`
+  registration boilerplate needed. The worker announcing its group IS the registration.
+  Default `false`; existing behavior is unchanged. Requires a transport that implements
+  `listWorkerGroups` (e.g. BullMQ).
+
 ## 0.45.0
 
 ### Minor Changes
