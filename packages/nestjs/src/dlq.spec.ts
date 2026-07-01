@@ -138,6 +138,39 @@ describe('dead-letter routing', () => {
     expect((await store.getRun('dlq:r6'))?.output).toBe('handled');
   });
 
+  it("stamps the dead run's namespace on the DLQ handler run (operator routes it to the tenant)", async () => {
+    // A dead run belonging to tenant 't1' — its dead-letter handler must inherit 't1' so an operator
+    // dispatches it to the tenant's worker group, not the bare group.
+    const store = new InMemoryStateStore();
+    await store.createRun({
+      id: 'r-ns',
+      workflow: 'poison',
+      workflowVersion: '1',
+      status: 'running',
+      input: { taskId: 't-1' },
+      namespace: 't1',
+      recoveryAttempts: 1,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          store,
+          timerPollMs: 0,
+          maxRecoveryAttempts: 1,
+          deadLetterWorkflow: 'pipeline-dlq',
+        }),
+      ],
+      providers: [PoisonWorkflow, DlqWorkflow],
+    }).compile();
+    await moduleRef.init();
+    await new Promise((r) => setImmediate(r));
+
+    expect((await store.getRun('r-ns'))?.status).toBe('dead');
+    expect((await store.getRun('dlq:r-ns'))?.namespace).toBe('t1');
+  });
+
   it('rejects a workflow that declares both @DeadLetter() and deadLetterWorkflow', async () => {
     @Workflow({ name: 'poison-both', version: '1', deadLetterWorkflow: 'pipeline-dlq' })
     class PoisonBothWorkflow {

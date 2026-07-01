@@ -1256,7 +1256,10 @@ export class WorkflowEngine {
     const run = await this.store.getRun(runId);
     if (!run) return null;
     const id = newRunId ?? `${runId}~retry~${globalThis.crypto.randomUUID().slice(0, 8)}`;
-    await this.start(run.workflow, input, id, { tags: run.tags });
+    // Inherit the original run's namespace so a retry of a tenant's run stays that tenant's — on an
+    // operator (this.namespace === undefined) an unstamped retry would fall to 'default' and route to
+    // the bare worker group, orphaning it if only the tenant-suffixed worker is live.
+    await this.start(run.workflow, input, id, { tags: run.tags, namespace: run.namespace });
     return { runId: id };
   }
 

@@ -25,4 +25,23 @@ describe('retryWithInput (fix-and-replay)', () => {
     // The original is untouched.
     expect((await store.getRun('r1'))?.status).toBe('failed');
   });
+
+  it("inherits the original run's namespace so a tenant's retry stays that tenant's", async () => {
+    const store = new InMemoryStateStore();
+    // An operator engine (no namespace): a retry MUST carry the failed run's tenant, or it would fall
+    // to 'default' and route to the bare worker group instead of the tenant's.
+    const engine = new WorkflowEngine({ store });
+    engine.register('w', '1', async (_ctx, input) => {
+      const { ok } = input as { ok: boolean };
+      if (!ok) throw new Error('bad input');
+      return 'shipped';
+    });
+
+    await engine.start('w', { ok: false }, 'r1', { namespace: 't1' });
+    expect((await engine.waitForRun('r1')).status).toBe('failed');
+
+    const retried = await engine.retryWithInput('r1', { ok: true });
+    await engine.waitForRun(retried?.runId as string);
+    expect((await store.getRun(retried?.runId as string))?.namespace).toBe('t1');
+  });
 });

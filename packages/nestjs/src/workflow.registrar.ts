@@ -177,6 +177,9 @@ export class WorkflowRegistrar
           target,
           { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
           `dlq:${run.id}`,
+          // Route the dead-letter handler to the dead run's OWN tenant so an operator dispatches it to
+          // that tenant's worker group (`target@<tenant>`), not the bare group.
+          { namespace: run.namespace },
         )
         .catch(() => undefined);
     });
