@@ -1,0 +1,51 @@
+name: Release Snapshot (beta)
+
+# Cuts a THROWAWAY prerelease of every package with a pending changeset, published to npm under the
+# `beta` dist-tag as `0.0.0-beta-<timestamp>`. It does NOT consume the changesets, bump source
+# versions, or tag git — so the eventual real release (the "Version Packages" PR) is untouched and
+# still produces clean semver. Use it to test unreleased work locally before the final release:
+#   pnpm add @dudousxd/nestjs-durable-core@beta   (or pin the exact 0.0.0-beta-<ts> version)
+# Run it manually from the Actions tab (workflow_dispatch).
+on:
+  workflow_dispatch:
+
+concurrency: release-snapshot-${{ github.ref }}
+
+jobs:
+  snapshot:
+    name: Publish beta snapshot to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance (OIDC), harmless if unused
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Stamp every pending-changeset package (and any out-of-range dependent) to `0.0.0-beta-<datetime>`
+      # in the runner only — never committed. Build, then publish those versions under the `beta`
+      # dist-tag (so `@latest` is untouched) with no git tag.
+      - name: Version as beta snapshot
+        run: pnpm changeset version --snapshot beta
+
+      - name: Build all packages
+        run: pnpm build
+
+      - name: Publish beta snapshot
+        run: pnpm changeset publish --tag beta --no-git-tag
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true

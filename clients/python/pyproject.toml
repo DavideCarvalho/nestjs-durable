@@ -1,6 +1,6 @@
 [project]
 name = "durable-worker"
-version = "0.19.0"
+version = "0.19.0b0"
 description = "Python worker SDK for nestjs-durable — run durable workflow steps in Python."
 readme = "README.md"
 requires-python = ">=3.9"

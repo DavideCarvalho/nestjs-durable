@@ -66,4 +66,4 @@ __all__ = [
     "StepFailed",
     "GatherFailed",
 ]
-__version__ = "0.19.0"
+__version__ = "0.19.0b0"
