@@ -82,6 +82,16 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   /**
+   * Derive a store confined to a single tenant `scope.namespace`, sharing this store's ORM (no new
+   * connection). Turns the operator (unscoped) store into a tenant-boundary view at wiring time —
+   * used by the NestJS module's `scopeReads` option, which receives a pre-built store and can't
+   * reconstruct it. Pass `{ namespace: undefined }` for the unscoped operator view.
+   */
+  withScope(scope: { namespace?: string }): MikroOrmStateStore {
+    return new MikroOrmStateStore(this.orm, { scope });
+  }
+
+  /**
    * Create a forked EntityManager and activate the `namespace` global filter with the store's
    * scope (if any). All read operations go through this so the tenant boundary is applied
    * uniformly. Write operations (nativeDelete, nativeUpdate, upsert, insertMany) bypass global

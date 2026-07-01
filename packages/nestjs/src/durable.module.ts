@@ -102,6 +102,34 @@ function isControlPlane(x: unknown): x is ControlPlane {
   );
 }
 
+/** A store that can derive a tenant-namespace-scoped view of itself (the MikroORM adapter). */
+interface ScopeableStore {
+  /** Derive a store confined to `scope.namespace`, sharing the same backing connection. */
+  withScope(scope: { namespace?: string }): StateStore;
+}
+
+/**
+ * True when `store` can produce a namespace-scoped view of itself. Structural check (same idiom as
+ * {@link isControlPlane}) so the store-agnostic module never imports a concrete adapter — the
+ * pre-built `store` is only re-scoped when it actually carries the capability.
+ */
+function isScopeableStore(store: StateStore): store is StateStore & ScopeableStore {
+  return typeof (store as StateStore & Partial<ScopeableStore>).withScope === 'function';
+}
+
+/**
+ * Apply opt-in tenant read scoping to a pre-built store. The module receives `store` already
+ * instantiated (it is store-agnostic — no MikroORM import), so it cannot reconstruct it; instead it
+ * asks the store for a scoped view via the optional {@link ScopeableStore.withScope} capability. When
+ * `scopeReads` is off, `namespace` is unset, or the store can't scope itself, the original store is
+ * returned unchanged (the operator view) — the caller can always pass an already-scoped store.
+ */
+function scopedStore(options: DurableModuleOptions): StateStore {
+  if (options.scopeReads !== true || options.namespace === undefined) return options.store;
+  if (!isScopeableStore(options.store)) return options.store;
+  return options.store.withScope({ namespace: options.namespace });
+}
+
 /**
  * Retention config for the {@link RetentionPoller}. One or more {@link RetentionPolicy policies}
  * (status sets must be disjoint — validated at boot), swept together on a shared interval.
@@ -253,6 +281,22 @@ export interface DurableModuleOptions {
   /** Attempts for each saga compensation when a run fails. Default 1 (no retry). Idempotent undos. */
   compensationRetries?: number;
   /**
+   * Route an **unregistered** workflow whose name matches a live worker group to that group over the
+   * primary transport — no per-workflow `engine.remote()` registration needed. Default `false`. Set
+   * `true` on a control plane that dispatches to convention-named polyglot workers (see
+   * `WorkflowEngineDeps.remoteByConvention`).
+   */
+  remoteByConvention?: boolean;
+  /**
+   * Opt into tenant read scoping: when `true` AND {@link namespace} is set, the module confines the
+   * store's reads to that namespace (a tenant-boundary view) instead of the operator view that sees
+   * all namespaces. Default `false` — the control plane (e.g. flip's `/ctrl` operator screens) stays
+   * unscoped. Requires a store that exposes the `withScope` capability (the MikroORM adapter does);
+   * a pre-built store without it is used as-is (construct it already-scoped instead). See
+   * {@link DurableModuleOptions.store}.
+   */
+  scopeReads?: boolean;
+  /**
    * Opt into an **in-app worker** (uniform dispatch): the same process runs the engine AND serves its
    * own discovered `@Workflow`/`@Step` on one default `group`. Each `@Workflow` is registered
    * GROUP-SERVED — its turns are dispatched to `group` over the transport and replayed by a co-located
@@ -291,7 +335,7 @@ export class DurableModule {
         optionsProvider,
         {
           provide: STATE_STORE_CANONICAL,
-          useFactory: (options: DurableModuleOptions) => options.store,
+          useFactory: (options: DurableModuleOptions) => scopedStore(options),
           inject: [DURABLE_OPTIONS_CANONICAL],
         },
         {
@@ -346,6 +390,7 @@ export class DurableModule {
               remoteAdvanceSilenceMs: opts.remoteAdvanceSilenceMs,
               instanceId: opts.instanceId,
               namespace: opts.namespace,
+              remoteByConvention: opts.remoteByConvention,
               webhookUrl: opts.webhookUrl,
               traceparent: opts.traceparent,
               context,
@@ -389,5 +434,32 @@ export class DurableModule {
         DURABLE_OPTIONS_CANONICAL,
       ],
     };
+  }
+}
+
+/**
+ * The **control-plane** packaging of {@link DurableModule}: an intention-revealing alias that always
+ * forces `worker: false`. A control-plane instance mounts the engine, the dashboard, and the store
+ * (dispatch + read only) but never processes or recovers workflows — each started run stays `pending`
+ * for a worker to pick up. Pair it with tenant workers packaged via `DurableWorkerModule` (which run
+ * `@Step` handlers over the transport, hold no engine/store, and can `startRun` back over the
+ * protocol). Use `DurableModule` directly when one instance should be BOTH dispatcher and worker.
+ *
+ * Any `worker` passed in options is ignored — this factory hard-sets `worker: false`.
+ */
+@Module({})
+export class DurableControlPlaneModule {
+  static forRoot(options: DurableModuleOptions): DynamicModule {
+    return DurableModule.forRoot({ ...options, worker: false });
+  }
+
+  static forRootAsync(options: DurableModuleAsyncOptions): DynamicModule {
+    return DurableModule.forRootAsync({
+      ...options,
+      useFactory: async (...args: never[]) => ({
+        ...(await options.useFactory(...args)),
+        worker: false,
+      }),
+    });
   }
 }

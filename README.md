@@ -89,6 +89,23 @@ recovery), NestJS integration, event-emitter transport, two ORM stores, the cont
 dashboard, OpenTelemetry, a Telescope watcher, and the Python worker SDK. See
 [`docs/plans`](docs/plans/2026-06-11-nestjs-durable-design.md) for the full design.
 
+## Control plane vs worker
+
+Split the roles when you want a shared, DB-owning dispatcher fronting many independent workers:
+
+- **`DurableControlPlaneModule`** (`{ worker: false }`) — mounts the engine, the dashboard, and the
+  store, and dispatches runs, but never processes or recovers workflows: each started run stays
+  `pending` for a worker to claim. This is the instance that owns the database and the operator view.
+  It can start runs on behalf of a tenant over the transport (`transport.onStartRun` → a run stamped
+  with the tenant's `namespace`), and route unregistered workflows to a live group of the same name
+  with `remoteByConvention: true`.
+- **`DurableWorkerModule`** — a **tenant worker**: it registers `@Step`/`@Workflow` handlers and
+  consumes the transport, holding no engine or store. It can start runs back through the control plane
+  and, unless it opts into `scopeReads`, never reads another tenant's rows.
+
+Use `DurableModule` directly when a single instance should be **both** dispatcher and worker (the
+zero-infra default).
+
 ## Packages
 
 | Package | Role | Status |
