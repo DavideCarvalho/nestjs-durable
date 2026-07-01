@@ -308,7 +308,9 @@ export interface DurableModuleOptions {
 }
 
 export interface DurableModuleAsyncOptions {
-  useFactory: (...args: object[]) => DurableModuleOptions | Promise<DurableModuleOptions>;
+  // `never[]` (not `object[]`) is intentional: a contravariant bottom-type rest param is what lets a
+  // consumer supply a factory with concrete injected args, e.g. `(config: ConfigService) => …`.
+  useFactory: (...args: never[]) => DurableModuleOptions | Promise<DurableModuleOptions>;
   inject?: InjectionToken[];
 }
 

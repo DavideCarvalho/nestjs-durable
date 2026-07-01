@@ -355,7 +355,11 @@ export interface StartRunOptions {
 
 /** Lazily import bullmq's Queue (optional peer). */
 async function loadStartRunDeps(): Promise<StartRunDeps> {
-  const { Queue } = (await import('bullmq')) as { Queue: StartRunDeps['Queue'] };
+  // bullmq's module type doesn't structurally overlap the narrow ctor we need, so go via
+  // `unknown` — the same idiom the sibling `loadRunnerDeps` uses for this optional-peer import.
+  const { Queue } = (await import('bullmq')) as unknown as {
+    Queue: StartRunDeps['Queue'];
+  };
   return { Queue };
 }
 
