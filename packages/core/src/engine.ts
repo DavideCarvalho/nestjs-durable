@@ -284,6 +284,16 @@ export interface WorkflowEngineDeps {
    * run `runPending` on a worker pod to pick those up; or a broker-backed one for a worker pool.
    */
   runDispatcher?: RunDispatcher | undefined;
+  /**
+   * When `true`, the engine routes an unregistered workflow to the live worker group of the SAME
+   * name: if the transport reports a live heartbeat for group `"processing"` and no local
+   * `register`/`registerRemote` exists for that name, a `start`/`resume` for it is dispatched to
+   * that group over the primary transport — no `engine.remote()` boilerplate needed. Default `false`
+   * (opt-in; existing behavior is unchanged). Requires a transport that implements
+   * `listWorkerGroups` (e.g. BullMQ); when the transport has none, or the group is not live, the
+   * existing "not registered" error is still thrown.
+   */
+  remoteByConvention?: boolean | undefined;
 }
 
 /** Thrown by {@link WorkflowEngine.resume} when the run belongs to a different namespace. */
@@ -361,6 +371,8 @@ export class WorkflowEngine {
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Set<Promise<RunResult>>();
   private draining = false;
+  /** When true, route an unregistered workflow to the live worker group of the same name. */
+  private readonly remoteByConvention: boolean;
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
@@ -395,6 +407,7 @@ export class WorkflowEngine {
     this.runDispatcher = deps.runDispatcher ?? {
       dispatch: (runId) => queueMicrotask(() => void this.runOne(runId).catch(() => {})),
     };
+    this.remoteByConvention = deps.remoteByConvention ?? false;
     this.singletons = new SingletonGate({
       store: this.store,
       clock: this.clock,
@@ -807,6 +820,20 @@ export class WorkflowEngine {
       const ancestor = await this.findRemoteAncestor(runId);
       if (ancestor) registered = this.synthesizeRemoteChild(name, ancestor.version, ancestor);
     }
+    if (!registered) {
+      // Convention routing: if the transport reports a live group of the same name, synthesize a
+      // remote registration on the fly. Version '1' is the convention default (same as engine.remote()).
+      const conventionRun: WorkflowRun = {
+        id: runId,
+        workflow: name,
+        workflowVersion: '1',
+        status: 'pending',
+        input,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      registered = await this.resolveRemoteByConvention(conventionRun);
+    }
     if (!registered) throw new Error(`workflow ${name} is not registered`);
     // Validate the input up front — a bad payload is rejected before any run is created.
     await registered.validateInput?.(input);
@@ -885,7 +912,8 @@ export class WorkflowEngine {
     // only an UNREGISTERED run pays the inheritance walk (see {@link findInheritedRegistration}).
     const registered =
       this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
-      (await this.findInheritedRegistration(run));
+      (await this.findInheritedRegistration(run)) ??
+      (await this.resolveRemoteByConvention(run));
     if (!registered) {
       throw new Error(
         `workflow ${run.workflow}@${run.workflowVersion} is not registered — keep the prior version deployed so in-flight runs can drain (skew protection)`,
@@ -940,6 +968,33 @@ export class WorkflowEngine {
         throw new Error(`workflow ${name} is remote — it has no in-process body`);
       },
       remote,
+    };
+  }
+
+  /**
+   * When `remoteByConvention` is enabled, attempt to route an unregistered workflow to the live
+   * worker group of the same name: if the transport reports a live heartbeat for group
+   * `run.workflow`, synthesize a throwaway {@link RegisteredWorkflow} that dispatches to that group
+   * over the primary transport. Returns `undefined` when the flag is off or the group is not live.
+   *
+   * Recomputed per call (never memoized into `this.workflows`) so it stays correct if group
+   * liveness changes between calls, exactly as {@link synthesizeRemoteChild} does.
+   */
+  private async resolveRemoteByConvention(
+    run: WorkflowRun,
+  ): Promise<RegisteredWorkflow | undefined> {
+    if (!this.remoteByConvention) return undefined;
+    const liveGroups = await this.pool.listWorkerGroups();
+    if (!liveGroups.includes(run.workflow)) return undefined;
+    const executor = new RemoteWorkflowExecutor(this.pool.primary, run.workflow);
+    return {
+      name: run.workflow,
+      version: run.workflowVersion,
+      fn: () => {
+        throw new Error(`remote workflow ${run.workflow} has no local body`);
+      },
+      hasBody: false,
+      remote: { group: run.workflow, executor },
     };
   }
 
@@ -1737,7 +1792,8 @@ export class WorkflowEngine {
     // timing for the common case is unchanged; only an unregistered (inherited-remote) run awaits.
     const registered =
       this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
-      (await this.findInheritedRegistration(run));
+      (await this.findInheritedRegistration(run)) ??
+      (await this.resolveRemoteByConvention(run));
     // Hold the lease for the WHOLE execution — whatever path got us here (leased sweep, a signal, a
     // remote result, a dashboard action). The leased sweeps already own it; the event-driven paths
     // don't, so acquire it here. If another instance owns it, don't double-run. While we run, renew
