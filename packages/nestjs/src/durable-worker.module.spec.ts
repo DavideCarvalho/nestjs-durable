@@ -40,6 +40,13 @@ class PaymentsWorker {
   }
 }
 
+@Workflow({ name: 'w', version: '1' })
+class WWorkflow {
+  async run(_ctx: WorkflowCtx, input: unknown) {
+    return input;
+  }
+}
+
 /** A captured `runRedisWorker` call + the fake handle it returned, so the spec can assert start/close. */
 interface FakeRunner {
   calls: RunRedisWorkerOptions[];
@@ -194,6 +201,44 @@ describe('DurableWorkerModule', () => {
     expect(runner.calls[0]?.connection).toBe('redis://y');
     const runners = moduleRef.get<RunningWorker[]>(DURABLE_WORKER_RUNNERS);
     expect(runners).toHaveLength(1);
+
+    await moduleRef.close();
+  });
+
+  it('with a tenant, serves a discovered workflow under its tenant-suffixed group (w@t1)', async () => {
+    const runner = fakeRunner();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableWorkerModule.forRoot({ connection: 'redis://x', groups: ['w'], tenant: 't1' }),
+      ],
+      providers: [WWorkflow],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.runRedisWorker)
+      .compile();
+    await moduleRef.init();
+
+    const runtime = moduleRef.get(DurableWorkerRuntime);
+    expect(runtime.workflows.handles('w')).toBe(true);
+    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls[0]?.group).toBe('w@t1');
+
+    await moduleRef.close();
+  });
+
+  it('with no tenant, serves the discovered workflow under the bare group (w)', async () => {
+    const runner = fakeRunner();
+    const moduleRef = await Test.createTestingModule({
+      imports: [DurableWorkerModule.forRoot({ connection: 'redis://x', groups: ['w'] })],
+      providers: [WWorkflow],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.runRedisWorker)
+      .compile();
+    await moduleRef.init();
+
+    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls[0]?.group).toBe('w');
 
     await moduleRef.close();
   });

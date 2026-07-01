@@ -47,9 +47,13 @@ export class WorkflowRegistrar
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    // Only the worker role recovers runs left incomplete by a crash/deploy. A dashboard-only
-    // instance (`worker: false`) must not pick up and re-run workflows — leave that to the workers.
-    if (this.options.worker === false) return;
+    // Recover runs left incomplete by a crash/deploy when this instance's `drive` axis is on —
+    // defaults to the worker role (back-compat), but a `DurableControlPlaneModule` (`worker:false,
+    // drive:true`) also recovers, re-enqueuing each for remote dispatch. A plain dashboard-only
+    // instance (`worker:false`, drive unset) must not pick up and re-run workflows — leave that to
+    // the workers.
+    const drive = this.options.drive ?? this.options.worker !== false;
+    if (!drive) return;
     await this.engine.recoverIncomplete();
   }
 

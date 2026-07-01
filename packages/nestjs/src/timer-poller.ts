@@ -28,9 +28,12 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    // Only the worker role drives suspended runs forward. A dashboard-only instance
-    // (`worker: false`) must not resume timers — leave that to the workers.
-    if (this.options.worker === false) return;
+    // Drive suspended runs forward when this instance's `drive` axis is on — defaults to the
+    // worker role (back-compat), but a `DurableControlPlaneModule` (`worker:false, drive:true`)
+    // also drives: it dispatches remotely instead of executing locally. A plain dashboard-only
+    // instance (`worker:false`, drive unset) must not resume timers — leave that to the workers.
+    const drive = this.options.drive ?? this.options.worker !== false;
+    if (!drive) return;
     // Low-latency dispatch: when a run is enqueued elsewhere (e.g. an API pod), pick it up at once
     // over the control plane instead of waiting for the next poll tick. Leasing dedups across workers.
     this.unsubscribeEnqueued = this.engine.onEnqueued((runId) => void this.engine.runOne(runId));

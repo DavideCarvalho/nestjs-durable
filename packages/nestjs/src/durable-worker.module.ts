@@ -5,6 +5,7 @@ import {
   type RunningWorker,
   runRedisWorker as defaultRunRedisWorker,
 } from '@dudousxd/durable-worker';
+import { tenantGroup } from '@dudousxd/nestjs-durable-core';
 import {
   type DynamicModule,
   Inject,
@@ -30,6 +31,15 @@ export interface DurableWorkerModuleOptions {
   connection: string | Record<string, unknown>;
   /** The worker groups this process serves — one BullMQ consumer is started per group. */
   groups: string[];
+  /**
+   * The tenant this worker process serves. Each of {@link groups} is suffixed via
+   * `tenantGroup(group, tenant)` (`@dudousxd/nestjs-durable-core`) before the consumer starts, so
+   * `undefined`, `''`, or `'default'` stays byte-identical to the bare group (production
+   * unchanged), and any other tenant serves `<group>@<tenant>` — matching the group name an
+   * OPERATOR control plane's `remoteByConvention` routes that tenant's runs to
+   * (`tenantGroup(run.workflow, run.namespace)` on the engine side).
+   */
+  tenant?: string;
   /** Key prefix namespacing the durable queues. Defaults to `durable` (matches the transport). */
   prefix?: string;
   /** Stable id for this worker process in heartbeats/control. Defaults to a per-host/pid id. */
@@ -134,7 +144,7 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
     for (const group of this.options.groups) {
       const handle = await this.runRedisWorker({
         runtime: this.runtime,
-        group,
+        group: tenantGroup(group, this.options.tenant),
         connection: this.options.connection,
         ...(this.options.prefix !== undefined ? { prefix: this.options.prefix } : {}),
         ...(this.options.instanceId !== undefined ? { instanceId: this.options.instanceId } : {}),

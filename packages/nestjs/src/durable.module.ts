@@ -179,9 +179,12 @@ export interface DurableModuleOptions {
    */
   autoSchema?: boolean;
   /**
-   * Worker-pool partition for this instance (forwarded to the engine). Default `'default'`. Set a
-   * distinct value to share ONE state store across non-interchangeable pools — e.g. a developer's
-   * local instance vs the deployed cluster. See `WorkflowEngineDeps.namespace`.
+   * Worker-pool partition for this instance (forwarded to the engine). The poll paths
+   * (`runPending`/`recoverIncomplete`/`resumeDueTimers`/`sweepTimeouts`) only act on runs in this
+   * namespace. Set distinct values to safely share ONE state store across non-interchangeable
+   * pools — e.g. a developer's local instance vs the deployed cluster. **Omit it to make this
+   * instance an OPERATOR** — an unset namespace drives/recovers/resumes runs of EVERY namespace and
+   * leaves the transport on its bare prefix. See `WorkflowEngineDeps.namespace`.
    */
   namespace?: string;
   /**
@@ -221,6 +224,18 @@ export interface DurableModuleOptions {
    * plane and reads the store but must not process or recover workflows — leave that to the workers.
    */
   worker?: boolean;
+  /**
+   * Internal axis, orthogonal to {@link worker}: whether this instance DRIVES runs — polls
+   * pending, recovers crashed (`recoverIncomplete`), resumes due timers, sweeps timeouts — even
+   * when it does not itself execute `@Workflow`/`@Step` bodies. Defaults to `worker !== false`
+   * (back-compat: `worker:true` drives, and a plain `worker:false` API/dashboard pod does not).
+   * `DurableControlPlaneModule` sets this `true` alongside `worker:false`: an OPERATOR control
+   * plane that drives every run but dispatches each one to a remote tenant worker group (see
+   * {@link remoteByConvention}) instead of running it in-process. Most apps never set this
+   * directly — use `DurableModule` (a worker) or `DurableControlPlaneModule` (a driving,
+   * non-executing control plane) instead.
+   */
+  drive?: boolean;
   /** Max ms to wait for in-flight runs on shutdown before exiting. Defaults to 10000. */
   shutdownTimeoutMs?: number;
   /**
@@ -398,10 +413,14 @@ export class DurableModule {
               context,
               rehydrate: rehydrate || undefined,
               compensationRetries: opts.compensationRetries,
-              // A non-worker (API/dashboard) instance must not run workflows: enqueue-only, leaving
-              // each `pending` run in the store for a worker's `runPending` poll. Workers use the
-              // default in-process dispatcher (execute locally).
-              runDispatcher: opts.worker === false ? { dispatch: () => {} } : undefined,
+              // A non-worker, non-driving (plain API/dashboard) instance must not run workflows:
+              // enqueue-only, leaving each `pending` run in the store for a DRIVING instance's poll.
+              // Workers AND driving control planes (`drive:true` — see `DurableControlPlaneModule`)
+              // get the engine's default in-process dispatcher: for a worker that executes the body
+              // locally, and for a driving-only control plane that has no local registration, the
+              // SAME default dispatcher routes it out remotely via `remoteByConvention` instead.
+              runDispatcher:
+                opts.worker === false && opts.drive !== true ? { dispatch: () => {} } : undefined,
             });
             for (const queue of opts.queues ?? []) engine.registerQueue(queue);
             // Dead-letter routing (per-workflow `@DeadLetter()` / `deadLetterWorkflow` + this global
@@ -441,18 +460,23 @@ export class DurableModule {
 
 /**
  * The **control-plane** packaging of {@link DurableModule}: an intention-revealing alias that always
- * forces `worker: false`. A control-plane instance mounts the engine, the dashboard, and the store
- * (dispatch + read only) but never processes or recovers workflows — each started run stays `pending`
- * for a worker to pick up. Pair it with tenant workers packaged via `DurableWorkerModule` (which run
- * `@Step` handlers over the transport, hold no engine/store, and can `startRun` back over the
- * protocol). Use `DurableModule` directly when one instance should be BOTH dispatcher and worker.
+ * forces `worker: false, drive: true`. A control-plane instance mounts the engine, the dashboard, and
+ * the store, and DRIVES every run — polls pending, recovers crashed, resumes due timers, sweeps
+ * timeouts — but never itself executes a `@Workflow`/`@Step` body: pair it with
+ * `remoteByConvention: true` (or per-workflow `engine.remote()`) so each driven run dispatches to a
+ * remote tenant worker group instead of running in-process. A started run no longer sits orphaned
+ * `pending` forever waiting for a worker's own poll — this instance drives it itself.
  *
- * Any `worker` passed in options is ignored — this factory hard-sets `worker: false`.
+ * Pair it with tenant workers packaged via `DurableWorkerModule` (which run `@Step`/`@Workflow`
+ * handlers over the transport, hold no engine/store, and can `startRun` back over the protocol). Use
+ * `DurableModule` directly when one instance should be BOTH dispatcher and worker.
+ *
+ * Any `worker`/`drive` passed in options is ignored — this factory hard-sets `worker: false, drive: true`.
  */
 @Module({})
 export class DurableControlPlaneModule {
   static forRoot(options: DurableModuleOptions): DynamicModule {
-    return DurableModule.forRoot({ ...options, worker: false });
+    return DurableModule.forRoot({ ...options, worker: false, drive: true });
   }
 
   static forRootAsync(options: DurableModuleAsyncOptions): DynamicModule {
@@ -461,6 +485,7 @@ export class DurableControlPlaneModule {
       useFactory: async (...args: Parameters<DurableModuleAsyncOptions['useFactory']>) => ({
         ...(await options.useFactory(...args)),
         worker: false,
+        drive: true,
       }),
     });
   }
