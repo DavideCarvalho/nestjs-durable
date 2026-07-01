@@ -308,7 +308,7 @@ export interface DurableModuleOptions {
 }
 
 export interface DurableModuleAsyncOptions {
-  useFactory: (...args: never[]) => DurableModuleOptions | Promise<DurableModuleOptions>;
+  useFactory: (...args: object[]) => DurableModuleOptions | Promise<DurableModuleOptions>;
   inject?: InjectionToken[];
 }
 
@@ -456,7 +456,7 @@ export class DurableControlPlaneModule {
   static forRootAsync(options: DurableModuleAsyncOptions): DynamicModule {
     return DurableModule.forRootAsync({
       ...options,
-      useFactory: async (...args: never[]) => ({
+      useFactory: async (...args: Parameters<DurableModuleAsyncOptions['useFactory']>) => ({
         ...(await options.useFactory(...args)),
         worker: false,
       }),
