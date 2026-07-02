@@ -70,8 +70,10 @@ class StepContextCancellationTest(unittest.TestCase):
 
 
 class WorkflowCancellationTest(unittest.TestCase):
-    """The workflow replay path (ctx.step/ctx.call) honours cancellation: auto-abort at op
-    boundaries (no `if` in user code) + cooperative `current_step().cancelled` inside a step."""
+    """The workflow replay path (ctx._local_step/ctx.step) honours cancellation: auto-abort at op
+    boundaries (no `if` in user code) + cooperative `current_step().cancelled` inside a step.
+    Exercises the shared internal `_local_step` engine directly (white-box) — the same one `ctx.now()`
+    /`ctx.uuid()` build on — since the public step surface is now the dispatched form only."""
 
     @staticmethod
     def _task(**over):
@@ -86,9 +88,9 @@ class WorkflowCancellationTest(unittest.TestCase):
 
         @wf.workflow("wf")
         def body(ctx, _input):
-            ctx.step("a", lambda: ran.append("a"))
+            ctx._local_step("a", lambda: ran.append("a"))
             reg.cancel("r1")  # cancel fires mid-turn, after step a
-            ctx.step("b", lambda: ran.append("b"))  # boundary → aborts, b never runs
+            ctx._local_step("b", lambda: ran.append("b"))  # boundary → aborts, b never runs
             return "done"
 
         decision = wf.process_task(self._task(), is_cancelled=reg.is_cancelled)
@@ -111,7 +113,7 @@ class WorkflowCancellationTest(unittest.TestCase):
                 reg.cancel("r1")
                 seen["after"] = current_step().cancelled
 
-            ctx.step("a", step_body)
+            ctx._local_step("a", step_body)
             return "ok"
 
         wf.process_task(self._task(), is_cancelled=reg.is_cancelled)
@@ -122,8 +124,8 @@ class WorkflowCancellationTest(unittest.TestCase):
 
         @wf.workflow("wf")
         def body(ctx, _input):
-            ctx.step("a", lambda: 1)
-            ctx.step("b", lambda: 2)
+            ctx._local_step("a", lambda: 1)
+            ctx._local_step("b", lambda: 2)
             return "done"
 
         decision = wf.process_task(self._task())

@@ -354,8 +354,7 @@ class Worker:
 
         @worker.workflow("pipeline")
         def pipeline(ctx, base_id):
-            key = ctx.step("setup", lambda: f"/{base_id}/data.csv")
-            rows = ctx.call("ingest", {"key": key})
+            rows = ctx.step("ingest", {"key": f"/{base_id}/data.csv"})
             return {"rows": rows}
 
         @worker.step("ingest", blocking=True)
@@ -431,8 +430,25 @@ class Worker:
         if auto_register:
             register_worker(self)
 
-    def step(self, name: str, *, blocking: bool = False) -> Callable[[Handler], Handler]:
+    def step(
+        self, name: Optional[str] = None, *, blocking: bool = False
+    ) -> Callable[[Handler], Handler]:
         """Decorator registering ``fn`` as the handler for step ``name``.
+
+        ``name`` is OPTIONAL — omit it and the routing name derives from the function itself
+        (``fn.__qualname__``, i.e. ``Class.method`` for a function defined in a class body, the bare
+        function name otherwise), symmetric with the TypeScript ``@Step()`` decorator's default. This
+        worker registers plain functions by name (not class instances via DI), so a "method" here is
+        only a namespace for the derived name — no ``self`` — a real instance-bound handler is out of
+        scope for this registry. Pass an explicit string to override (stable across refactors /
+        cross-runtime contracts) — the Python mirror of ``@Step('custom:name')``::
+
+            class ExtractionService:
+                @worker.step()                    # name = "ExtractionService.run_page"
+                def run_page(data, ctx=None): ...
+
+            @worker.step("payments.charge-card")  # explicit override
+            def charge(data): ...
 
         Set ``blocking=True`` for a synchronous handler that does CPU/DB work: the worker runs it in
         a thread so the event loop stays free to renew the broker's job lock (otherwise a long step
@@ -441,8 +457,9 @@ class Worker:
         """
 
         def register(fn: Handler) -> Handler:
-            self._handlers[name] = fn
-            self._blocking[name] = blocking
+            resolved_name = name if name is not None else _derive_step_name(fn)
+            self._handlers[resolved_name] = fn
+            self._blocking[resolved_name] = blocking
             return fn
 
         return register
@@ -489,9 +506,9 @@ class Worker:
     ) -> Dict[str, Any]:
         """Replay one turn of a workflow task and return its wire-format decision. The worker's own
         :attr:`partition` is threaded into the :class:`~durable_worker.workflow.WorkflowContext` (as
-        its ``group``), so a step ``call`` with no explicit group inherits it. ``partition`` defaults
-        to ``None`` (Task 8), unlike the old ``group`` default of ``"default"`` — fall back to
-        ``"default"`` here so a bare ``ctx.call()`` with no partition set keeps resolving a group to
+        its ``group``), so a dispatched ``ctx.step`` with no explicit group inherits it. ``partition``
+        defaults to ``None`` (Task 8), unlike the old ``group`` default of ``"default"`` — fall back to
+        ``"default"`` here so a bare ``ctx.step()`` with no partition set keeps resolving a group to
         inherit instead of raising (byte-identical to pre-Task-8 behavior; ``workflow.py``'s
         call-group inheritance is untouched by this task)."""
         from .workflow import process_workflow_task  # lazy: avoid an import cycle with workflow.py
@@ -849,6 +866,26 @@ def run_workers(
         await asyncio.gather(*[h.close() for h in handles], return_exceptions=True)
 
     asyncio.run(_main())
+
+
+def _derive_step_name(fn: Handler) -> str:
+    """``@worker.step()``'s bare-decorator default: ``Class.method`` for a method defined in a class
+    body, the bare function name otherwise — symmetric with the TypeScript ``@Step()`` decorator's
+    ``target.constructor.name + '.' + propertyKey`` default.
+
+    ``fn.__qualname__`` already encodes lexical nesting (e.g. ``"Outer.method"`` for a normal class
+    method, or ``"Outer.method.<locals>.helper"`` for a closure), but a class defined INSIDE a
+    function (as any test necessarily does) pushes an extra ``"<locals>"`` segment in front of the
+    class name too (``"test_fn.<locals>.Cls.method"``), so we can't just take the qualname verbatim
+    or blindly grab the last two dotted segments. Instead: look at the segment immediately before the
+    function's own name — if it's a real class (not ``"<locals>"``, i.e. not another function's
+    scope), use ``ThatSegment.method``; otherwise there's no enclosing class, so fall back to the
+    function's own bare name (``fn.__name__``, not the qualname, so a closure nested in a plain
+    function doesn't leak its enclosing function's name)."""
+    parts = fn.__qualname__.split(".")
+    if len(parts) >= 2 and parts[-2] != "<locals>":
+        return f"{parts[-2]}.{parts[-1]}"
+    return fn.__name__
 
 
 def _run_bound(handler: Handler, input_: Any, ctx: "StepContext") -> Any:

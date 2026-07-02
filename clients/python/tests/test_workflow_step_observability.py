@@ -1,8 +1,14 @@
-"""WorkflowContext.step observability: live lifecycle, real timing, and captured sub-processes.
+"""WorkflowContext._local_step observability: live lifecycle, real timing, and captured
+sub-processes.
 
-A Python @workflow runs its ctx.steps inline; each step must stream running → completed (so it shows
-up live, not all at turn-end), record a real wall-clock window (not 0ms), and capture the
-sub_process/log trail a handler emits (so each handler's p-processes show under it).
+The redesign collapsed the public step surface to ONE dispatched `ctx.step`; the general-purpose
+inline "run this arbitrary closure as a local step" primitive that USED TO be `ctx.step(name, body)`
+is no longer public — it now only backs `ctx.now()`/`ctx.uuid()` (see `_local_step`). This test
+exercises that shared internal engine directly (white-box) to keep covering its observability
+contract: each local step must stream running → completed (so it shows up live, not all at
+turn-end), record a real wall-clock window (not 0ms), and capture the sub_process/log trail a
+handler emits (so each handler's p-processes show under it) — the exact same machinery `now`/`uuid`
+rely on.
 """
 
 import unittest
@@ -21,7 +27,7 @@ class WorkflowStepObservabilityTest(unittest.TestCase):
                 log("info", "did a thing")
                 return {"ok": True}
 
-            return ctx.step("handle_x", handler)
+            return ctx._local_step("handle_x", handler)
 
         events = []
         decision = worker.process_task(

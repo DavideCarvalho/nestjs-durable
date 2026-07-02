@@ -9,21 +9,22 @@ and dispatches. The runtime never touches a store.
 
     @workflows.workflow("pipeline")
     def pipeline(ctx, base_id):
-        key = ctx.step("setup", lambda: f"/{base_id}/data.csv")     # local step: run once, replayed
-        rows = ctx.call("ingestion", {"key": key}, group="pipeline")  # remote step: dispatched + awaited
-        ctx.sleep(60_000)                                             # durable timer
-        return {"rows": rows}
+        started_at = ctx.now()                                        # replay-stable capture
+        rows = ctx.step("ingestion", {"key": f"/{base_id}/data.csv"}, group="pipeline")  # dispatched
+        ctx.sleep(60_000)                                               # durable timer
+        return {"rows": rows, "startedAt": started_at}
 
 Each `ctx.*` op is keyed by a deterministic seq. On replay an op already in history returns its
-recorded result; the first UNRESOLVED blocking op (call/sleep/wait_signal/start_child) suspends the
-turn, emitting its command. Local steps run inline and record their result (so side effects /
-non-determinism happen once). See docs/plans/2026-06-15-polyglot-workflows-protocol.md.
+recorded result; the first UNRESOLVED blocking op (step/sleep/wait_signal/start_child) suspends the
+turn, emitting its command. `ctx.now()`/`ctx.uuid()` run inline and record their result (so a
+timestamp/id capture happens once and replays the same value). See
+docs/plans/2026-06-15-polyglot-workflows-protocol.md.
 
 ``ctx.gather([(name, body), ...])`` runs N local steps CONCURRENTLY (threads) and waits for all;
 ``ctx.gather_children(workflow, [inputs])`` does the same with child workflows; and
-``ctx.gather_calls([{name, input, group}, ...])`` dispatches N REMOTE steps in parallel (one run, a
-flat parallel fan — no child runs). All default to ``wait_all`` (raise an aggregate ``GatherFailed``
-if any item fails) with an opt-in ``fail_fast``.
+``ctx.gather_calls([{name, input, group}, ...])`` dispatches N steps in parallel (one run, a flat
+parallel fan — no child runs). All default to ``wait_all`` (raise an aggregate ``GatherFailed`` if
+any item fails) with an opt-in ``fail_fast``.
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ import inspect
 import threading
 import time
 import traceback
+import uuid as _uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from .cancellation import Cancelled
@@ -190,8 +193,14 @@ class WorkflowContext:
         return ev
 
     # -- the workflow API ----------------------------------------------------
-    def call(self, name: str, input: Any = None, *, group: Optional[str] = None) -> Any:
-        """Dispatch a remote step (routed by its handler ``name``) and await its result.
+    def step(self, name: str, input: Any = None, *, group: Optional[str] = None) -> Any:
+        """Dispatch a step (routed by its handler ``name``) and await its result. ALWAYS durable,
+        ALWAYS engine-scheduled — this is the single step primitive (renamed from ``ctx.call``; the
+        wire it emits is byte-identical to what ``ctx.call`` emitted). Python has no natural
+        method-reference to a handler defined in another process/language, so it dispatches by
+        ``name`` — the string form of the TypeScript ``ctx.step(handlerRef | name, input)``. A
+        Python handler registers under a name derived the same way (see :meth:`Worker.step`'s
+        ``Class.method`` default), so the two ends agree without a shared symbol.
 
         ROUTING (route-by-name): the step is served by whichever worker registered a handler for
         ``name``; the decision's ``group`` field is that step's isolation PARTITION, not a base queue.
@@ -207,6 +216,22 @@ class WorkflowContext:
              "input": input}
         )
         raise _Suspend()
+
+    def now(self) -> str:
+        """A replay-stable UTC ISO-8601 timestamp: captured once (on the turn that reaches this op)
+        and replayed thereafter — mirrors the TypeScript ``ctx.now()``. Forcing a `new Date()`-style
+        capture through a dispatched ``@step`` would be a pointless round-trip for a trivial
+        non-deterministic value, so this reuses the same local-step/``recordStep`` machinery
+        (:meth:`_local_step`) that used to be reachable as a general-purpose inline ``ctx.step``."""
+        seq = self._seq  # the seq _local_step's own _next() is about to allocate — see _local_step.
+        return self._local_step(f"now#{seq}", lambda: datetime.now(timezone.utc).isoformat())
+
+    def uuid(self) -> str:
+        """A replay-stable id: captured once and replayed thereafter — mirrors the TypeScript
+        ``ctx.uuid()``. See :meth:`now` for why this reuses :meth:`_local_step` instead of being its
+        own bespoke recording path."""
+        seq = self._seq
+        return self._local_step(f"uuid#{seq}", lambda: str(_uuid.uuid4()))
 
     def _resolve_group(self, group: Optional[str], name: str) -> str:
         """Resolve the ``group`` field a ``call``/``gather_calls`` decision carries — the step's
@@ -230,12 +255,16 @@ class WorkflowContext:
             )
         return resolved
 
-    def step(self, name: str, body: Callable[[], Any]) -> Any:
-        """Run a LOCAL step once and record its result, so side effects / non-determinism
-        (``now``/``uuid``/a write) happen exactly once and replay returns the captured value.
+    def _local_step(self, name: str, body: Callable[[], Any]) -> Any:
+        """Run a LOCAL step once and record its result, so a captured value happens exactly once and
+        replay returns it. INTERNAL — the general-purpose inline ``ctx.step(name, body)`` this used to
+        back is gone (the redesign collapsed the step surface to ONE dispatched ``ctx.step``); this
+        machinery now only backs :meth:`now`/:meth:`uuid`, which call it with a synthetic
+        ``now#<seq>``/``uuid#<seq>`` name. Kept as one shared engine (not inlined into ``now``/``uuid``)
+        so both keep the exact same replay/observability/cancellation behavior a local step always had.
 
         While the body runs it is the *current step*, so ``sub_process``/``sub_event``/``log`` inside
-        a handler are captured as the step's ``events`` (the dashboard shows each handler's p-processes
+        it are captured as the step's ``events`` (the dashboard shows each handler's p-processes
         under it). The step's real wall-clock window is recorded too (a true duration, not 0ms), and
         its lifecycle (running → completed/failed) is streamed live via ``_emit_step``."""
         from .worker import StepContext, _current_step  # lazy: avoid an import cycle with worker.py

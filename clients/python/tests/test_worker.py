@@ -276,5 +276,47 @@ class ContextCarrierTest(unittest.TestCase):
         self.assertIsNone(current_context())
 
 
+class StepDecoratorNameDerivationTest(unittest.TestCase):
+    """`@worker.step()` (bare, no name) derives the routing name from the function itself —
+    ``Class.method`` for a method defined in a class body, symmetric with the TypeScript ``@Step()``
+    decorator's default. An explicit string still overrides, unchanged."""
+
+    def test_bare_decorator_on_a_class_method_derives_class_dot_method(self):
+        worker = Worker(auto_register=False)
+
+        # A method defined in a class body — used here purely as a namespace for `__qualname__`
+        # (this worker registers plain functions by name, not class instances/DI), matching how the
+        # TypeScript `@Step()` derives `Class.method` from the method it decorates.
+        class ExtractionService:
+            @worker.step()
+            def run_page(data, ctx=None):
+                return {"page": data["page"]}
+
+        self.assertTrue(worker.handles("ExtractionService.run_page"))
+        result = worker.process_task(task(name="ExtractionService.run_page", input={"page": 1}))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["output"], {"page": 1})
+
+    def test_bare_decorator_on_a_plain_function_derives_the_function_name(self):
+        worker = Worker(auto_register=False)
+
+        @worker.step()
+        def crunch(data):
+            return data
+
+        self.assertTrue(worker.handles("crunch"))
+
+    def test_explicit_name_still_overrides(self):
+        worker = Worker(auto_register=False)
+
+        class ExtractionService:
+            @worker.step("extraction:page")
+            def run_page(data, ctx=None):
+                return data
+
+        self.assertTrue(worker.handles("extraction:page"))
+        self.assertFalse(worker.handles("ExtractionService.run_page"))
+
+
 if __name__ == "__main__":
     unittest.main()

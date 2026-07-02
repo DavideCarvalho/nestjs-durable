@@ -280,7 +280,7 @@ class CallDecisionCarriesPartitionTest(unittest.TestCase):
 
         @worker.workflow("pipeline")
         def pipeline(ctx):
-            return ctx.call("extraction:page", {"p": 1})
+            return ctx.step("extraction:page", {"p": 1})
 
         cmd = self._first_call_command(worker, "pipeline")
         # The decision carries the PARTITION, not anything derived from the step name.
@@ -297,7 +297,7 @@ class CallDecisionCarriesPartitionTest(unittest.TestCase):
 
         @worker.workflow("pipeline")
         def pipeline(ctx):
-            return ctx.call("payments.charge-card", {"p": 1})
+            return ctx.step("payments.charge-card", {"p": 1})
 
         cmd = self._first_call_command(worker, "pipeline")
         # No partition → a bare-equivalent floor value. CRITICALLY not the old dot-prefix derivation
@@ -313,7 +313,7 @@ class CallDecisionCarriesPartitionTest(unittest.TestCase):
 
         @worker.workflow("pipeline")
         def pipeline(ctx):
-            return ctx.call("x", {"p": 1}, group="other")
+            return ctx.step("x", {"p": 1}, group="other")
 
         cmd = self._first_call_command(worker, "pipeline")
         self.assertEqual(cmd["group"], "other")

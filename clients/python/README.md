@@ -39,10 +39,10 @@ workflows = WorkflowWorker(group="py-workflows")
 
 @workflows.workflow("pipeline")
 def pipeline(ctx, base_id):
-    key  = ctx.step("setup", lambda: f"/{base_id}/data.csv")      # local step: runs once, recorded
-    rows = ctx.call("ingestion", {"key": key}, group="pipeline")  # remote step: dispatched + awaited
-    ctx.sleep(60_000)                                             # durable timer
-    return {"rows": rows}
+    started_at = ctx.now()                                          # replay-stable capture
+    rows = ctx.step("ingestion", {"key": f"/{base_id}/data.csv"}, group="pipeline")  # dispatched
+    ctx.sleep(60_000)                                                 # durable timer
+    return {"rows": rows, "startedAt": started_at}
 
 workflows.run(redis=redis_url_from_env())   # owns the loop, SIGTERM graceful close, Redis connection
 ```
@@ -52,13 +52,14 @@ decisions:
 
 | Op | Meaning |
 | --- | --- |
-| `ctx.step(name, body)` | Run a **local** step body once; its result is recorded, so `now`/`uuid`/a write happen exactly once and replay returns the captured value. |
-| `ctx.call(name, input, group=...)` | Dispatch a **remote** step to a worker `group` (any language) and await its result. |
+| `ctx.step(name, input, group=...)` | Dispatch a step (routed by handler `name`, any language) and await its result. ALWAYS durable, ALWAYS engine-scheduled — one step primitive, no local/remote placement choice. |
+| `ctx.now()` | A replay-stable UTC ISO-8601 timestamp — captured once, replayed thereafter (instead of forcing a trivial capture through a dispatched step). |
+| `ctx.uuid()` | A replay-stable id — captured once, replayed thereafter. |
 | `ctx.sleep(ms)` | Durable timer — the run suspends and the engine resumes it when the timer fires. |
 | `ctx.wait_signal(name)` | Block until a signal `name` is delivered to the run (via `engine.signal`); returns its payload. |
 | `ctx.start_child(workflow, input)` | Start a child run and await its output (a failed child raises `StepFailed`). |
 
-A step/call that fails raises `StepFailed` in the workflow — catch it to compensate (just like an
+A step that fails raises `StepFailed` in the workflow — catch it to compensate (just like an
 awaited rejection), or let it propagate to fail the run. Changing the workflow's op sequence under a
 run already in flight raises `NondeterminismError` rather than silently diverging.
 
@@ -71,9 +72,10 @@ engine.registerRemote('pipeline', '1', {
 });
 ```
 
-All five ops are wired end-to-end — the engine executes the commands they emit (local step, remote
-dispatch, durable timer, signal waiter, child run). `WorkflowWorker.process_task(task) -> decision`
-is the pure, broker-free core (fully tested). The workflow-task/decision wire is specified in
+These ops are wired end-to-end — the engine executes the commands they emit (dispatched step,
+replay-stable capture, durable timer, signal waiter, child run). `WorkflowWorker.process_task(task)
+-> decision` is the pure, broker-free core (fully tested). The workflow-task/decision wire is
+specified in
 [`docs/plans/2026-06-15-polyglot-workflows-protocol.md`](../../docs/plans/2026-06-15-polyglot-workflows-protocol.md).
 
 ## Wire protocol
