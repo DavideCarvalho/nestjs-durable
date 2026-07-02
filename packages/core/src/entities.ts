@@ -1,5 +1,5 @@
 import { FatalError } from './errors';
-import type { WorkflowCtx } from './interfaces';
+import type { InternalWorkflowCtx } from './workflow-ctx';
 
 /** One operation on a durable entity: mutate `state` in place and/or return a result. */
 export type EntityHandler<S = unknown> = (state: S, arg: unknown) => unknown | Promise<unknown>;
@@ -17,7 +17,7 @@ export interface EntityHost {
   register(
     name: string,
     version: string,
-    fn: (ctx: WorkflowCtx, input: unknown) => Promise<unknown>,
+    fn: (ctx: InternalWorkflowCtx, input: unknown) => Promise<unknown>,
   ): void;
   signalWithStart(
     workflow: string,
@@ -74,7 +74,7 @@ export class Entities {
   }
 
   /** The built-in runner: one long-lived run per key, processing ops serially over state. */
-  private async run(ctx: WorkflowCtx, input: unknown): Promise<unknown> {
+  private async run(ctx: InternalWorkflowCtx, input: unknown): Promise<unknown> {
     const { name, key } = input as { name: string; key: string };
     const config = this.configs.get(name);
     if (!config) throw new FatalError(`entity "${name}" is not registered`);
@@ -83,8 +83,10 @@ export class Entities {
     for (let i = 0; ; i += 1) {
       const msg = (await ctx.waitForSignal(token)) as { op: string; arg: unknown; reply?: string };
       // Run the handler and snapshot the (possibly mutated) state in ONE checkpoint, so replay
-      // restores the state from the checkpoint instead of re-running the handler.
-      const out = await ctx.step(`op:${i}`, async () => {
+      // restores the state from the checkpoint instead of re-running the handler. `ctx.step` is now
+      // ALWAYS dispatched (see WorkflowCtx.step) — this in-process capture uses the internal
+      // `localStep` primitive instead (same checkpointed-once-then-replayed semantics).
+      const out = await ctx.localStep(`op:${i}`, async () => {
         const handler = config.handlers[msg.op];
         if (!handler) throw new FatalError(`entity "${name}" has no handler for op "${msg.op}"`);
         const result = await handler(state, msg.arg);
@@ -93,7 +95,7 @@ export class Entities {
       state = out.state; // carry state forward (and restore it from the checkpoint on replay)
       await ctx.setEvent('state', state); // publish for getState
       if (msg.reply) {
-        await ctx.step(`reply:${i}`, async () => {
+        await ctx.localStep(`reply:${i}`, async () => {
           await this.host.signal((msg as { reply: string }).reply, out.result);
         });
       }

@@ -21,7 +21,6 @@ import type {
   EngineListener,
   GroupHealth,
   NamedTransport,
-  RemoteStepDef,
   RemoteTask,
   RunDispatcher,
   RunQuery,
@@ -30,6 +29,7 @@ import type {
   SearchAttributes,
   StateStore,
   StepCheckpoint,
+  StepDef,
   StepError,
   StepEvent,
   StepInterceptor,
@@ -56,6 +56,7 @@ import { TransportPool } from './transport-pool';
 import {
   type Compensation,
   type CtxHost,
+  type InternalWorkflowCtx,
   type StepRecord,
   createWorkflowCtx,
 } from './workflow-ctx';
@@ -66,7 +67,11 @@ import {
   workflowName,
 } from './workflow-ref';
 
-type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
+// The engine ALWAYS runs a body with the InternalWorkflowCtx `createWorkflowCtx` produces (it carries
+// the internal `localStep` the entity runner + capture helpers need). Public authors type their body
+// with the narrower `WorkflowCtx`; contravariance keeps those assignable to this param, so the internal
+// type never leaks into the public authoring surface while `EntityHost.register` still lines up.
+type WorkflowFn = (ctx: InternalWorkflowCtx, input: unknown) => Promise<unknown>;
 
 /** Options for {@link WorkflowEngine.start}. */
 export interface StartOptions {
@@ -2281,14 +2286,14 @@ export class WorkflowEngine {
             attempts: 1,
             // `cmd.group` is the routing declaration the worker's replay emitted (cross-SDK, or a
             // group-served TS body) — treated as an isolation partition on top of the step's own
-            // name, mirroring the RemoteStepDef formula below (identical expression everywhere).
+            // name, mirroring the StepDef formula below (identical expression everywhere).
             workerGroup: tenantGroup(sanitizeQueueToken(cmd.name), cmd.group),
             enqueuedAt: at,
             startedAt: at,
             finishedAt: at,
             // A `ctx.gather_calls([...])` fan-out stamps every dispatched `call` in the fan with the
-            // same group, so the dashboard renders the remote steps as one parallel fan (parity with
-            // the gathered `recordStep`/`startChild` tags). Undefined for a lone sequential `ctx.remote`.
+            // same group, so the dashboard renders the dispatched steps as one parallel fan (parity
+            // with the gathered `recordStep`/`startChild` tags). Undefined for a lone sequential `ctx.step`.
             parallelGroup: cmd.parallelGroup,
           }),
         );
@@ -2670,7 +2675,7 @@ export class WorkflowEngine {
   private async callRemote<TInput, TOutput>(
     runId: string,
     seq: number,
-    step: RemoteStepDef<TInput, TOutput>,
+    step: StepDef<TInput, TOutput>,
     input: TInput,
     queue?: string,
     transport?: string,
@@ -2735,7 +2740,9 @@ export class WorkflowEngine {
       this.stepQueue.set(id, queue);
     }
 
-    const validInput = step.input.parse(input);
+    // A bare `@Step()` (no `input`/`output` schemas attached) skips validation — schemas are opt-in
+    // runtime checks at the dispatch boundary, not a requirement of every step (see `StepDef`).
+    const validInput = step.input ? step.input.parse(input) : input;
     const enqueuedAt = new Date();
     // Persist the pending checkpoint BEFORE dispatching, so a fast result always finds it to complete.
     await this.store.saveCheckpoint({
@@ -2917,20 +2924,22 @@ export class WorkflowEngine {
   private async callRemoteInMemory<TInput, TOutput>(
     runId: string,
     seq: number,
-    step: RemoteStepDef<TInput, TOutput>,
+    step: StepDef<TInput, TOutput>,
     input: TInput,
     transport?: string,
   ): Promise<TOutput> {
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
-    const validInput = step.input.parse(input);
+    // A bare `@Step()` (no `input`/`output` schemas attached) skips validation.
+    const validInput = step.input ? step.input.parse(input) : input;
     const id = stepId(runId, seq);
     const enqueuedAt = new Date();
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
-    // Retry policy differs from a LOCAL step on purpose: a local `ctx.step` retries any non-fatal
-    // throw (the work is in-process), but a remote step only re-dispatches on a liveness TIMEOUT
-    // (presumed-dead worker). A worker that *reported* an error returned a deterministic verdict, so
-    // we surface it to the workflow instead of hammering the worker. Timeout retries need a window
-    // to detect death, so they're gated on `timeoutMs` being set.
+    // Retry policy differs from an in-process step on purpose: the internal in-process primitives
+    // (`ctx.task`'s dispatch, `ctx.now`/`ctx.uuid`) retry any non-fatal throw (the work is in-process),
+    // but a dispatched `ctx.step` only re-dispatches on a liveness TIMEOUT (presumed-dead worker). A
+    // worker that *reported* an error returned a deterministic verdict, so we surface it to the
+    // workflow instead of hammering the worker. Timeout retries need a window to detect death, so
+    // they're gated on `timeoutMs` being set.
     const maxAttempts = step.timeoutMs ? Math.max(1, step.retries ?? 1) : 1;
 
     for (let attempt = 1; ; attempt += 1) {
@@ -2955,7 +2964,9 @@ export class WorkflowEngine {
         const resolution = step.timeoutMs
           ? await this.awaitWithHeartbeat(id, resultPromise, step.timeoutMs)
           : await resultPromise;
-        const output = step.output.parse(resolution.output) as TOutput;
+        const output = step.output
+          ? (step.output.parse(resolution.output) as TOutput)
+          : (resolution.output as TOutput);
         // The worker reports when it actually picked the task up; fall back to dispatch time if a
         // transport doesn't carry it (queue-wait then reads as zero rather than going negative).
         const startedAt = resolution.startedAt ? new Date(resolution.startedAt) : enqueuedAt;

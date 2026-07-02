@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { StepRef } from './step-name-symbol';
 import type { WorkflowClass, WorkflowInputOf, WorkflowOutputOf } from './workflow-ref';
 
 /**
@@ -110,7 +111,7 @@ export interface StepCheckpoint {
    * simply re-runs on replay (only `completed` short-circuits).
    */
   status: 'pending' | 'running' | 'completed' | 'failed';
-  /** What the step was called with — the `ctx.remote` args for a remote step (a local step has none). */
+  /** What the step was called with — the `ctx.step` (dispatched) args for a remote step (a local step has none). */
   input?: unknown;
   output?: unknown;
   error?: StepError | undefined;
@@ -540,7 +541,7 @@ export interface RemoteTask {
   /**
    * Admission priority carried through to the broker (BullMQ job `priority`) so a transport that
    * supports priority ordering lets an urgent task jump ahead of already-enqueued lower-priority
-   * ones at the worker. Mirrors the per-call `priority` from `ctx.remote(..., { priority })`. Higher
+   * ones at the worker. Mirrors the per-call `priority` from `ctx.step(..., { priority })`. Higher
    * wins; absent means default/unprioritised. Transports without priority support ignore it.
    */
   priority?: number | undefined;
@@ -623,10 +624,10 @@ export interface HistoryEvent {
 
 /** A decision the workflow function produced at a `seq` that was not yet in history. */
 export type WorkflowCommand =
-  /** `ctx.remote(remoteStep, input)` — dispatch a remote step and await it. A worker's
-   *  `ctx.gather_calls([...])` fan-out tags every dispatched call with the same `parallelGroup` so the
-   *  dashboard renders the remote steps as one parallel fan (parity with the gathered `recordStep` /
-   *  `startChild` tags). Undefined for a lone sequential `ctx.remote`. */
+  /** `ctx.step(handlerOrName, input)` — dispatch a step (by typed handler reference or by name) and
+   *  await it. A worker's `ctx.gather_calls([...])` fan-out tags every dispatched call with the same
+   *  `parallelGroup` so the dashboard renders the dispatched steps as one parallel fan (parity with
+   *  the gathered `recordStep` / `startChild` tags). Undefined for a lone sequential `ctx.step`. */
   | {
       kind: 'call';
       seq: number;
@@ -994,19 +995,22 @@ export interface StepOptions {
 }
 
 /**
- * A typed handle to a step that runs on a remote worker. The `name` string is the contract:
- * the worker registers a handler under the same name, and routing is BY that name — a worker
- * subscribes per registered handler name, not a hand-declared group.
+ * The structural carrier a dispatched `ctx.step` call resolves to and hands the engine: `name` is
+ * the routing contract (the worker registers a handler under the same name, and routing is BY that
+ * name — a worker subscribes per registered handler name, not a hand-declared group). There is no
+ * public factory for this anymore — a `ctx.step(ref, input)` call builds one internally from the
+ * `@Step`-stamped name (see {@link StepRef}/`stepNameOf`); a `ctx.step(name, input)` call builds one
+ * from the literal string. `input`/`output` are optional runtime zod schemas an authoring layer MAY
+ * attach (e.g. `@Step({ input, output })`) for validation at the dispatch boundary — a bare `@Step()`
+ * carries neither, and the engine skips validation when they're absent.
  */
-export interface RemoteStepDef<TInput = unknown, TOutput = unknown> extends StepOptions {
+export interface StepDef<TInput = unknown, TOutput = unknown> extends StepOptions {
   name: string;
   /** Optional isolation partition; routing is by `name`. Suffixes the routing token as
    *  `<name>@<partition>` (via {@link tenantGroup}) — omit to route by the bare (sanitized) `name`. */
   partition?: string | undefined;
-  input: z.ZodType<TInput>;
-  output: z.ZodType<TOutput>;
-  /** Branding so `ctx.remote` can infer types. */
-  readonly __remote: true;
+  input?: z.ZodType<TInput> | undefined;
+  output?: z.ZodType<TOutput> | undefined;
 }
 
 /**
@@ -1027,6 +1031,22 @@ export interface DurableWebhook<TPayload = unknown> {
   wait(): Promise<TPayload>;
 }
 
+/** Options for a dispatched {@link WorkflowCtx.step} call. */
+export interface StepDispatchOpts {
+  /** Subject the dispatch to a registered flow-control queue (concurrency / rate limit). */
+  queue?: string;
+  /** Admission priority within `queue`; higher is admitted first when a slot is contended
+   *  (default 0). No effect without a `queue`. */
+  priority?: number;
+  /** The fairness bucket for a queue with `fairness: 'key'` (e.g. a tenant id) — the queue
+   *  round-robins across distinct keys so one key can't monopolize the budget. Defaults to the run
+   *  id when omitted. No effect without a `queue`. */
+  fairnessKey?: string;
+  /** Pin the dispatch to a named transport in the pool (else the pool's first, with failover to the
+   *  rest). See `engine.registerQueue` / the engine's `transports` option. */
+  transport?: string;
+}
+
 /**
  * The context handed to a workflow function. Every interaction with the outside world goes
  * through it so the engine can checkpoint — the workflow body itself stays deterministic.
@@ -1034,15 +1054,29 @@ export interface DurableWebhook<TPayload = unknown> {
 export interface WorkflowCtx {
   readonly runId: string;
   /**
-   * Run a local durable step: executed once, then its result is checkpointed and replayed. The
-   * body receives a {@link StepLogger} to record debug/error lines and sub-process outcomes — these
-   * are checkpointed with the step and shown under it in the dashboard.
+   * Run a durable step — always dispatched, always engine-scheduled: the ONE step primitive (no
+   * local/remote placement choice). Pass the step's method **reference** (a `@Step`-decorated
+   * method, typed by its own signature — refactor-safe, autocompleted):
+   *
+   * ```ts
+   * const r = await ctx.step(this.extraction.runExtractionPage, { page, key });
+   * ```
+   *
+   * or its **name** for a cross-runtime handler (no JS reference to import, e.g. a Python `@step`):
+   *
+   * ```ts
+   * const out = await ctx.step<ProcResult>('processing:proc', input);
+   * ```
+   *
+   * Both forms dispatch identically — a step runs on whatever worker serves that name and the run
+   * suspends (zero compute) until the result lands, then resumes with it (durable, replay-safe).
    */
-  step<TOutput>(
-    name: string,
-    fn: (log: StepLogger) => Promise<TOutput>,
-    options?: StepOptions,
+  step<TInput, TOutput>(
+    handler: StepRef<TInput, TOutput>,
+    input: TInput,
+    opts?: StepDispatchOpts,
   ): Promise<TOutput>;
+  step<TOutput = unknown>(name: string, input: unknown, opts?: StepDispatchOpts): Promise<TOutput>;
   /**
    * **Exactly-once** durable step for DB work: runs `fn` and writes the step's checkpoint in ONE
    * store transaction, so the business write and the "done" marker commit atomically — a crash can
@@ -1064,22 +1098,6 @@ export interface WorkflowCtx {
   ): Promise<TResult>;
   /** Send a durable entity op without awaiting a result (fire-and-forget, dispatched once). */
   signalEntity(name: string, key: string, op: string, arg?: unknown): Promise<void>;
-  /**
-   * Dispatch a typed remote step and await its checkpointed result. Options:
-   * - `queue` — subject the dispatch to a registered flow-control queue (concurrency / rate limit).
-   * - `priority` — admission priority within that queue; higher is admitted first when a slot is
-   *   contended (default 0). No effect without a `queue`.
-   * - `fairnessKey` — the fairness bucket for a queue with `fairness: 'key'` (e.g. a tenant id);
-   *   the queue round-robins across distinct keys so one key can't monopolize the budget. Defaults
-   *   to the run id when omitted. No effect without a `queue`.
-   * - `transport` — pin the dispatch to a named transport in the pool (else the pool's first, with
-   *   failover to the rest). See `engine.registerQueue` / the engine's `transports` option.
-   */
-  remote<TInput, TOutput>(
-    step: RemoteStepDef<TInput, TOutput>,
-    input: TInput,
-    opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
-  ): Promise<TOutput>;
   /**
    * Durable sleep: suspends the run for `duration` (e.g. `'30s'`, `'2h'`, `'7 days'`, or ms as a
    * number) without consuming resources, resuming automatically once the timer is due — even
@@ -1229,18 +1247,25 @@ export interface WorkflowCtx {
    */
   patched(id: string): Promise<boolean>;
   /**
-   * Deterministic wall-clock (epoch ms): records the time on the first run and replays the SAME
-   * value afterwards. Use this instead of `Date.now()` inside a workflow — a raw `Date.now()` returns
-   * a different value on every replay, which silently corrupts a durable run.
+   * Deterministic wall-clock, epoch **milliseconds** (like `Date.now()`): records the time on the
+   * first run and replays the SAME value afterwards. Use this instead of `Date.now()`/`new Date()`
+   * inside a workflow — a raw clock read returns a different value on every replay, which silently
+   * corrupts a durable run. Returns a number so it composes in arithmetic (deadlines, elapsed);
+   * for an ISO string do `new Date(await ctx.now()).toISOString()`. Every step is dispatched now
+   * (see {@link step}), so a trivial timestamp capture gets this lightweight deterministic helper
+   * instead of a full `@Step` + worker round-trip.
    */
   now(): Promise<number>;
   /**
-   * Deterministic random in `[0, 1)`: recorded once, then replayed. Use instead of `Math.random()`
-   * (same replay-safety reason as {@link now}).
+   * **Deterministic capture.** Run `fn` once, checkpoint its result, and on replay return the SAME
+   * value WITHOUT re-running `fn` — the durable way to bring a non-deterministic value into a workflow
+   * where you control the generator: `ctx.sideEffect(() => uuidv7())`, `() => ulid()`,
+   * `() => Math.random()`, a config/env read. Prefer a {@link step} for real work with side effects
+   * (a DB write, an API call): `fn` here runs only once and MUST be effectively pure (it produces a
+   * value; it is not re-executed on replay), like Temporal's `sideEffect`. For a plain timestamp use
+   * {@link now}.
    */
-  random(): Promise<number>;
-  /** Deterministic UUID v4: recorded once, then replayed. Use instead of `crypto.randomUUID()`. */
-  uuid(): Promise<string>;
+  sideEffect<TValue>(fn: () => TValue | Promise<TValue>): Promise<TValue>;
   /**
    * Merge `attrs` into THIS run's {@link WorkflowRun.searchAttributes} — the indexed metadata the
    * dashboard and {@link RunQuery} filter on. Shallow merge: keys you don't pass are kept. Durable +

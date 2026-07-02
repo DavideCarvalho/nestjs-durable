@@ -14,9 +14,9 @@ import { sanitizeQueueToken, tenantGroup } from './tenant-group';
  * workflow authored in another SDK (e.g. the Python `durable-worker`) is driven over Redis/BullMQ.
  *
  * Routes by NAME, not a hand-declared group: the dispatched task's routing token is
- * `tenantGroup(sanitizeQueueToken(name), partition)` — the same formula {@link RemoteStepDef} uses —
- * so `partition` is an optional isolation suffix, not a separate identity. Omit it to route by the
- * bare (sanitized) `name`.
+ * `tenantGroup(sanitizeQueueToken(name), partition)` — the same formula a {@link import('./interfaces').StepDef}
+ * uses — so `partition` is an optional isolation suffix, not a separate identity. Omit it to route by
+ * the bare (sanitized) `name`.
  *
  * Multi-instance safe by construction: the executor holds NO in-memory state correlating a dispatched
  * turn to its decision. The engine records the `taskId` on the run as the awaited marker AND releases

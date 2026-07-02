@@ -14,10 +14,11 @@ import { eventToken } from './events';
 import type {
   ChildCallOptions,
   DurableWebhook,
-  RemoteStepDef,
   SearchAttributes,
   StateStore,
   StepCheckpoint,
+  StepDef,
+  StepDispatchOpts,
   StepError,
   StepEvent,
   StepInvocation,
@@ -27,6 +28,7 @@ import type {
   WorkflowCtx,
 } from './interfaces';
 import { breakpointToken } from './protocol';
+import { type StepRef, stepNameOf } from './step-name-symbol';
 import { createStepLogger } from './step-logger';
 import { type WorkflowRef, workflowName } from './workflow-ref';
 
@@ -80,7 +82,7 @@ export interface CtxHost {
   callRemote<TInput, TOutput>(
     runId: string,
     seq: number,
-    step: RemoteStepDef<TInput, TOutput>,
+    step: StepDef<TInput, TOutput>,
     input: TInput,
     queue?: string,
     transport?: string,
@@ -109,6 +111,21 @@ class Position {
 }
 
 /**
+ * {@link WorkflowCtx} plus the internal in-process local-step primitive — used ONLY by the library's
+ * own built-in workflows (the durable-entity runner) that need a checkpointed, in-process step the
+ * public `ctx.step` (always-dispatched, no in-process placement) no longer provides. Every
+ * `createWorkflowCtx` result actually carries `localStep` at runtime; this type just names the wider
+ * shape for the internal consumers that need it, without widening the public {@link WorkflowCtx}.
+ */
+export interface InternalWorkflowCtx extends WorkflowCtx {
+  localStep<TOutput>(
+    name: string,
+    fn: (log: StepLogger) => Promise<TOutput>,
+    options?: StepOptions,
+  ): Promise<TOutput>;
+}
+
+/**
  * Build the {@link WorkflowCtx} handed to a workflow body. Every primitive is a closure over the
  * position counter (the per-run logical position) and the saga `compensations` stack, so `task`/
  * `child` compose `step`/`waitForSignal` directly. All durability goes through {@link CtxHost}, so
@@ -119,7 +136,7 @@ export function createWorkflowCtx(
   runId: string,
   compensations: Compensation[],
   workflow = '',
-): WorkflowCtx {
+): InternalWorkflowCtx {
   const { store, replay } = host;
   const pos = new Position();
 
@@ -140,7 +157,11 @@ export function createWorkflowCtx(
     replay?.set(cp.seq, cp);
   };
 
-  const step = async <T>(
+  // The in-process local-step runner: checkpointed, replayed, retried. No longer publicly exposed as
+  // `ctx.step` (that name is now the ALWAYS-dispatched form below) — this backs the library's own
+  // internal primitives that need a checkpointed in-process body: `ctx.task`'s dispatch step and the
+  // deterministic capture helpers `ctx.now`/`ctx.random`/`ctx.uuid`.
+  const localStep = async <T>(
     name: string,
     fn: (log: StepLogger) => Promise<T>,
     options?: StepOptions,
@@ -391,7 +412,7 @@ export function createWorkflowCtx(
     dispatch: () => Promise<void>,
     options?: StepOptions,
   ): Promise<T> => {
-    await step(`task:dispatch:${name}`, dispatch, options);
+    await localStep(`task:dispatch:${name}`, dispatch, options);
     return unwrapCompletion<T>(await waitForSignal(`task:${runId}:${name}`), `task "${name}"`);
   };
 
@@ -646,12 +667,16 @@ export function createWorkflowCtx(
     return { token, url: host.webhookUrl?.(token), wait };
   };
 
-  // Deterministic non-deterministic sources: each is a checkpointed local step, so the value is
-  // captured on the first run and replayed verbatim (a raw Date.now()/Math.random() inside a
-  // workflow would differ across replays and corrupt the run).
-  const now = () => step('now', async () => host.clock());
-  const random = () => step('random', async () => Math.random());
-  const uuid = () => step('uuid', async () => globalThis.crypto.randomUUID());
+  // Deterministic capture: run `fn` once, checkpoint its output, and replay the SAME value verbatim
+  // afterwards (fn is NOT re-run on replay). The general primitive for any non-deterministic value the
+  // author controls the generator for — `ctx.sideEffect(() => uuidv7())`, `() => Math.random()`, a
+  // config/env read. A raw `Date.now()`/`Math.random()` in a workflow body differs across replays and
+  // corrupts the run; this captures it deterministically.
+  const sideEffect = <T>(fn: () => T | Promise<T>): Promise<T> =>
+    localStep('sideEffect', async () => fn());
+  // `now` is the one ubiquitous convenience (a single obvious implementation, epoch ms like
+  // `Date.now()`); everything else uses `sideEffect` so the author picks the generator.
+  const now = () => localStep('now', async () => host.clock());
 
   // Merge into this run's searchAttributes exactly once: a checkpoint at this position marks it done,
   // so a replay SKIPS the write (mirrors `transaction` / the instant primitives) instead of re-merging
@@ -677,20 +702,33 @@ export function createWorkflowCtx(
     );
   };
 
-  // Dispatch a typed remote step and await its checkpointed result.
-  const remote = <TInput, TOutput>(
-    step: RemoteStepDef<TInput, TOutput>,
+  // ONE durable step primitive: always dispatched, always engine-scheduled — no local/remote
+  // placement choice for the workflow author (see `WorkflowCtx.step`). Resolve the routing name off
+  // a `@Step`-stamped handler reference, or take it literally for the cross-runtime string form; the
+  // reference itself is NEVER invoked here — only its stamped name is read (the serving worker
+  // re-resolves the real handler from DI), so an unbound `this` on `handlerOrName` is irrelevant.
+  function step<TInput, TOutput>(
+    handlerOrName: StepRef<TInput, TOutput> | string,
     input: TInput,
-    opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
-  ): Promise<TOutput> =>
-    host.callRemote(runId, pos.next(), step, input, opts?.queue, opts?.transport, {
+    opts?: StepDispatchOpts,
+  ): Promise<TOutput> {
+    const name = typeof handlerOrName === 'string' ? handlerOrName : stepNameOf(handlerOrName);
+    if (name === undefined) {
+      throw new Error(
+        'ctx.step: handler is not a @Step reference (no stamped step name) — pass a @Step-decorated method or a step name string',
+      );
+    }
+    const def: StepDef<TInput, TOutput> = { name };
+    return host.callRemote(runId, pos.next(), def, input, opts?.queue, opts?.transport, {
       priority: opts?.priority,
       fairnessKey: opts?.fairnessKey,
     });
+  }
 
   return {
     runId,
     step,
+    localStep,
     upsertSearchAttributes,
     transaction,
     callEntity,
@@ -710,8 +748,6 @@ export function createWorkflowCtx(
     onUpdate,
     patched,
     now,
-    random,
-    uuid,
-    remote,
+    sideEffect,
   };
 }
