@@ -98,7 +98,7 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (c) => {
-      const charge = await c.call(chargeCard, { amount: 7 });
+      const charge = await c.remote(chargeCard, { amount: 7 });
       return charge.chargeId;
     });
 
@@ -120,7 +120,7 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
 
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport });
-    engine.register('checkout', '1', async (c) => c.call(chargeCard, { amount: 1 }));
+    engine.register('checkout', '1', async (c) => c.remote(chargeCard, { amount: 1 }));
 
     await engine.start('checkout', {}, 'run1');
     const result = await settle(store, 'run1');
