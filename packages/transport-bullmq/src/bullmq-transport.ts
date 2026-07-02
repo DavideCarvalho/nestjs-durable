@@ -101,13 +101,6 @@ export interface BullMQTransportOptions {
    * (sanitized) handler name, with no suffix.
    */
   partition?: string;
-  /**
-   * @deprecated Use `partition` instead. `group` is a back-compat alias of
-   * {@link BullMQTransportOptions.partition}: passing it now suffixes every per-handler queue exactly
-   * like `partition` would — it is no longer read as the literal (single, shared) queue name. Removed
-   * in a future major.
-   */
-  group?: string;
   /** Key prefix namespacing the durable queues. Defaults to `durable`. */
   prefix?: string;
   /**
@@ -197,7 +190,7 @@ export class BullMQTransport implements Transport, ControlPlane {
 
   constructor(options: BullMQTransportOptions) {
     this.connection = options.connection;
-    this.partition = options.partition ?? options.group;
+    this.partition = options.partition;
     this.prefix = options.prefix ?? 'durable';
     this.#namespace = options.namespace;
     this.#explicitNamespace = options.namespace !== undefined;

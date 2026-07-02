@@ -235,13 +235,6 @@ describe('BullMQTransport — per-handler task consumers (Task 4: dispatch + con
     expect(() => transport.handle('a', async () => ({}))).not.toThrow();
     await transport.close();
   });
-
-  it('a deprecated `group` constructor option is honoured as the partition suffix', async () => {
-    const transport = new BullMQTransport({ connection, group: 'legacy-partition' });
-    transport.handle('a', async () => ({}));
-    await transport.close();
-    expect(captured.workerNames).toContain('durable-tasks-a@legacy-partition');
-  });
 });
 
 describe('BullMQTransport.useNamespace precedence', () => {
@@ -250,7 +243,7 @@ describe('BullMQTransport.useNamespace precedence', () => {
   });
 
   it('useNamespace sets the namespace when none was given at construction', async () => {
-    const transport = new BullMQTransport({ connection, group: 'payments' });
+    const transport = new BullMQTransport({ connection, partition: 'payments' });
     transport.useNamespace('dev-carol');
     await transport.dispatch({
       runId: 'r1',
@@ -268,7 +261,7 @@ describe('BullMQTransport.useNamespace precedence', () => {
   it('an EXPLICIT constructor namespace wins over a later useNamespace', async () => {
     const transport = new BullMQTransport({
       connection,
-      group: 'payments',
+      partition: 'payments',
       namespace: 'dev-explicit',
     });
     transport.useNamespace('dev-override'); // ignored — constructor was explicit
@@ -287,7 +280,11 @@ describe('BullMQTransport.useNamespace precedence', () => {
   });
 
   it('an explicit "default" constructor namespace still wins (useNamespace cannot override it)', async () => {
-    const transport = new BullMQTransport({ connection, group: 'payments', namespace: 'default' });
+    const transport = new BullMQTransport({
+      connection,
+      partition: 'payments',
+      namespace: 'default',
+    });
     transport.useNamespace('dev-override');
     await transport.dispatch({
       runId: 'r1',
@@ -304,7 +301,7 @@ describe('BullMQTransport.useNamespace precedence', () => {
   });
 
   it('useNamespace is idempotent (re-applying the same namespace is a no-op)', async () => {
-    const transport = new BullMQTransport({ connection, group: 'payments' });
+    const transport = new BullMQTransport({ connection, partition: 'payments' });
     transport.useNamespace('dev-dan');
     transport.useNamespace('dev-dan');
     await transport.dispatch({
