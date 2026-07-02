@@ -54,11 +54,17 @@ afterAll(async () => {
 
 const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
   name: 'payments.charge-card',
-  group: 'payments',
   input: z.object({ amount: z.number() }),
   output: z.object({ chargeId: z.string() }),
   __remote: true,
 };
+
+// DbTransport isn't routed by handler name — `dispatch()` writes the engine's already-computed
+// routing token (`tenantGroup(sanitizeQueueToken(step.name), step.partition)`, bare-name here since
+// `chargeCard` carries no `partition`) straight into the `grp` column, and `handle()` polls WHERE
+// grp = this `group` verbatim. So the transport's `group` must equal the step's bare sanitized name
+// for dispatch and consume to land on the same rows.
+const workerGroup = 'payments.charge-card';
 
 /** A durable ctx.call suspends; poll the store until the DB round-trip resumes it to a terminal state. */
 async function settle(store: InMemoryStateStore, runId: string, timeoutMs = 20_000) {
@@ -93,7 +99,7 @@ describe('DbTransport (real Postgres) [testcontainers]', () => {
     const prefix = `durtest${Date.now()}`;
     const transport = new DbTransport({
       executor: typeOrmExecutor(ds),
-      group: 'payments',
+      group: workerGroup,
       prefix,
       pollMs: 50,
     });
@@ -122,7 +128,7 @@ describe('DbTransport (real Postgres) [testcontainers]', () => {
     const prefix = `durtestf${Date.now()}`;
     const transport = new DbTransport({
       executor: typeOrmExecutor(ds),
-      group: 'payments',
+      group: workerGroup,
       prefix,
       pollMs: 50,
     });

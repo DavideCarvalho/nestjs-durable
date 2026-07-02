@@ -45,7 +45,6 @@ afterAll(async () => {
 
 const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
   name: 'payments.charge-card',
-  group: 'payments',
   input: z.object({ amount: z.number() }),
   output: z.object({ chargeId: z.string() }),
   __remote: true,
@@ -91,7 +90,7 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
   it('dispatches a remote step over Redis and returns the checkpointed result', async (ctx) => {
     const connection = liveConnection(ctx);
     const prefix = `durtest-${Date.now()}`;
-    const transport = new BullMQTransport({ connection, group: 'payments', prefix });
+    const transport = new BullMQTransport({ connection, prefix });
     transport.handle('payments.charge-card', async (input: { amount: number }) => ({
       chargeId: `ch_${input.amount}`,
     }));
@@ -114,7 +113,7 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
   it('reports a failed result when the worker handler throws', async (ctx) => {
     const connection = liveConnection(ctx);
     const prefix = `durtest-${Date.now()}-f`;
-    const transport = new BullMQTransport({ connection, group: 'payments', prefix });
+    const transport = new BullMQTransport({ connection, prefix });
     transport.handle('payments.charge-card', async () => {
       throw new Error('declined');
     });

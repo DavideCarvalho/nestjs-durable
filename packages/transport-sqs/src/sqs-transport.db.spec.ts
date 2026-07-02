@@ -62,13 +62,23 @@ afterAll(async () => {
   await container?.stop();
 });
 
+// Hyphenated (not dotted) name: `dispatch()` builds the SQS queue name straight from
+// `sanitizeQueueToken(step.name)` (colons only — a `.` is legal for BullMQ but real SQS/ElasticMQ
+// queue names allow only alphanumerics, hyphens, and underscores), so a dotted name like
+// `payments.charge-card` (fine for the BullMQ/DB conformance specs) would 400 on `CreateQueueCommand`.
 const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
-  name: 'payments.charge-card',
-  group: 'payments',
+  name: 'payments-charge-card',
   input: z.object({ amount: z.number() }),
   output: z.object({ chargeId: z.string() }),
   __remote: true,
 };
+
+// SqsTransport isn't routed by handler name — `dispatch()` resolves the queue URL from the engine's
+// already-computed routing token (`tenantGroup(sanitizeQueueToken(step.name), step.partition)`,
+// bare-name here since `chargeCard` carries no `partition`), and `handle()` polls the queue for this
+// literal `group` verbatim. So the transport's `group` must equal the step's bare sanitized name for
+// dispatch and consume to land on the same queue.
+const workerGroup = 'payments-charge-card';
 
 /** A durable ctx.call suspends; poll the store until the SQS round-trip resumes it to terminal. */
 async function settle(store: InMemoryStateStore, runId: string, timeoutMs = 20_000) {
@@ -97,11 +107,11 @@ describe('SqsTransport (real ElasticMQ) [testcontainers]', () => {
     const prefix = `durtest-${Date.now()}`;
     const transport = new SqsTransport({
       clientConfig,
-      group: 'payments',
+      group: workerGroup,
       prefix,
       autoCreate: true,
     });
-    transport.handle('payments.charge-card', async (input: { amount: number }) => ({
+    transport.handle('payments-charge-card', async (input: { amount: number }) => ({
       chargeId: `ch_${input.amount}`,
     }));
 
@@ -125,11 +135,11 @@ describe('SqsTransport (real ElasticMQ) [testcontainers]', () => {
     const prefix = `durtest-${Date.now()}-f`;
     const transport = new SqsTransport({
       clientConfig,
-      group: 'payments',
+      group: workerGroup,
       prefix,
       autoCreate: true,
     });
-    transport.handle('payments.charge-card', async () => {
+    transport.handle('payments-charge-card', async () => {
       throw new Error('declined');
     });
 
