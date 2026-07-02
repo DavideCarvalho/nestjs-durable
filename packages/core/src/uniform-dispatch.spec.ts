@@ -388,7 +388,7 @@ describe('uniform dispatch — a local @Workflow served via its own group', () =
     const executor = inProcessExecutor(engine);
 
     engine.register('plain', '1', async (ctx, input) => {
-      const out = await ctx.step('inline', async () => (input as number) + 1);
+      const out = await ctx.localStep('inline', async () => (input as number) + 1);
       return out;
     });
 

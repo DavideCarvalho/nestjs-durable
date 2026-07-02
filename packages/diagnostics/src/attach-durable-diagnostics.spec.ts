@@ -45,7 +45,7 @@ describe('attachDurableDiagnostics', () => {
     cleanups.push(step.off);
 
     engine.register('checkout', '1', async (ctx) => {
-      await ctx.step('charge', async () => 1);
+      await ctx.localStep('charge', async () => 1);
       return 'ok';
     });
     await engine.start('checkout', {}, 'run2');
@@ -94,7 +94,7 @@ describe('attachDurableDiagnostics', () => {
     cleanups.push(attachDurableDiagnostics(engine)); // attached, but nobody subscribes a channel
 
     engine.register('checkout', '1', async (ctx) => {
-      await ctx.step('charge', async () => 1);
+      await ctx.localStep('charge', async () => 1);
       return 'ok';
     });
     await engine.start('checkout', {}, 'run5');

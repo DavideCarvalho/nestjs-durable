@@ -248,11 +248,11 @@ describe('PrismaStateStore', () => {
     let aRuns = 0;
     let failOnce = true;
     engine.register('wf', '1', async (c) => {
-      const a = await c.step('a', async () => {
+      const a = await c.localStep('a', async () => {
         aRuns += 1;
         return 10;
       });
-      return c.step('b', async () => {
+      return c.localStep('b', async () => {
         if (failOnce) {
           failOnce = false;
           throw new Error('boom');

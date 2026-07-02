@@ -5,8 +5,8 @@ async function storeWithRuns() {
   const store = new InMemoryStateStore();
   const engine = new WorkflowEngine({ store });
   engine.register('checkout', '1', async (ctx) => {
-    await ctx.step('reserveStock', async () => 1);
-    await ctx.step('ship', async () => 2);
+    await ctx.localStep('reserveStock', async () => 1);
+    await ctx.localStep('ship', async () => 2);
     return 'ok';
   });
   await engine.start('checkout', {}, 'run1');

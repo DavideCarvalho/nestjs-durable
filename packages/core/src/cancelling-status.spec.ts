@@ -19,7 +19,7 @@ async function waitForStatus(
 // A saga workflow that completes one compensable step, then suspends on a signal mid-saga.
 function registerSaga(engine: WorkflowEngine, undone: string[], compGate?: Promise<void>) {
   engine.register('saga', '1', async (ctx) => {
-    await ctx.step('reserve', async () => 'r', {
+    await ctx.localStep('reserve', async () => 'r', {
       compensate: async () => {
         if (compGate) await compGate;
         undone.push('reserve');
@@ -107,7 +107,7 @@ describe('RunStatus cancelling — compensating cancel is visible + durable', ()
     const engine = new WorkflowEngine({ store });
     const undone: string[] = [];
     engine.register('quick', '1', async (ctx) => {
-      await ctx.step('reserve', async () => 'r', {
+      await ctx.localStep('reserve', async () => 'r', {
         compensate: async () => {
           undone.push('reserve');
         },

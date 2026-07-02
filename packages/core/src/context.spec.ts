@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { z } from 'zod';
 import { WorkflowEngine } from './engine';
 import type {
   HistoryEvent,
@@ -10,25 +9,10 @@ import type {
   WorkflowExecutor,
   WorkflowRun,
 } from './interfaces';
-import { remoteStep } from './remote-step-factory';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
-const ping = remoteStep({
-  name: 'ext.ping',
-  partition: 'ext',
-  input: z.object({}),
-  output: z.object({ pong: z.boolean() }),
-});
-
-/** Same step, but with a liveness `timeoutMs` — routes through the in-memory heartbeat path. */
-const pingWithTimeout = remoteStep({
-  name: 'ext.ping',
-  partition: 'ext',
-  input: z.object({}),
-  output: z.object({ pong: z.boolean() }),
-  timeoutMs: 1_000,
-});
+const PING_STEP_NAME = 'ext.ping';
 
 /** A recording transport that captures every dispatched task and immediately delivers a completed
  *  result for it — so both the durable suspend path and the in-memory heartbeat path settle. */
@@ -99,7 +83,7 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
       context: () => ({ tenantId: 't1', userRef: { type: 'User', id: 1 } }),
     });
     engine.register('wf', '1', async (ctx) => {
-      await ctx.remote(ping, {});
+      await ctx.step(PING_STEP_NAME, {});
       return 'x';
     });
 
@@ -128,7 +112,7 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
       traceparent: () => '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
     });
     engine.register('wf', '1', async (ctx) => {
-      await ctx.remote(ping, {});
+      await ctx.step(PING_STEP_NAME, {});
       return 'x';
     });
 
@@ -160,7 +144,13 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
     expect(dispatched[0]?.context).toEqual({ tenantId: 't2', userRef: { type: 'User', id: 2 } });
   });
 
-  it('attaches context on the in-memory heartbeat path (remote step with `timeoutMs`, engine.ts ~2002)', async () => {
+  // NOTE (single ctx.step surface sweep, see docs/superpowers/plans/2026-07-02-durable-single-step.md):
+  // this test exercised the in-memory `timeoutMs` heartbeat dispatch site (`callRemoteInMemory`) via
+  // `RemoteStepDef.timeoutMs`. The new `ctx.step(name, input, opts?)` has no way to set `timeoutMs`
+  // per call (`StepDispatchOpts` = queue/priority/fairnessKey/transport only — see heartbeat.spec.ts
+  // for the full writeup), so that dispatch site is currently unreachable from any authoring surface.
+  // Skipped rather than deleted — the engine code (`callRemoteInMemory`) is still live, just orphaned.
+  it.skip('attaches context on the in-memory heartbeat path (remote step with `timeoutMs`, engine.ts ~2002) — orphaned: no authoring surface sets timeoutMs anymore', async () => {
     const store = new InMemoryStateStore();
     const dispatched: RemoteTask[] = [];
     const engine = new WorkflowEngine({
@@ -171,7 +161,7 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
     // A `timeoutMs` step is awaited in-memory (callRemoteInMemory) with a heartbeat window, not via
     // the durable suspend path — a third, distinct dispatch site.
     engine.register('wf', '1', async (ctx) => {
-      await ctx.remote(pingWithTimeout, {});
+      await ctx.step(PING_STEP_NAME, {});
       return 'x';
     });
 

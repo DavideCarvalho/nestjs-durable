@@ -1,12 +1,7 @@
 import { SQSClient } from '@aws-sdk/client-sqs';
-import {
-  InMemoryStateStore,
-  type RemoteStepDef,
-  WorkflowEngine,
-} from '@dudousxd/nestjs-durable-core';
+import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { GenericContainer, type StartedTestContainer, Wait } from 'testcontainers';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { z } from 'zod';
 import { SqsTransport } from './sqs-transport';
 
 /**
@@ -66,16 +61,11 @@ afterAll(async () => {
 // `sanitizeQueueToken(step.name)` (colons only — a `.` is legal for BullMQ but real SQS/ElasticMQ
 // queue names allow only alphanumerics, hyphens, and underscores), so a dotted name like
 // `payments.charge-card` (fine for the BullMQ/DB conformance specs) would 400 on `CreateQueueCommand`.
-const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
-  name: 'payments-charge-card',
-  input: z.object({ amount: z.number() }),
-  output: z.object({ chargeId: z.string() }),
-  __remote: true,
-};
+const CHARGE_CARD_STEP_NAME = 'payments-charge-card';
 
 // SqsTransport isn't routed by handler name — `dispatch()` resolves the queue URL from the engine's
 // already-computed routing token (`tenantGroup(sanitizeQueueToken(step.name), step.partition)`,
-// bare-name here since `chargeCard` carries no `partition`), and `handle()` polls the queue for this
+// bare-name here since `ctx.step` never sets a `partition`), and `handle()` polls the queue for this
 // literal `group` verbatim. So the transport's `group` must equal the step's bare sanitized name for
 // dispatch and consume to land on the same queue.
 const workerGroup = 'payments-charge-card';
@@ -111,14 +101,14 @@ describe('SqsTransport (real ElasticMQ) [testcontainers]', () => {
       prefix,
       autoCreate: true,
     });
-    transport.handle('payments-charge-card', async (input: { amount: number }) => ({
+    transport.handle(CHARGE_CARD_STEP_NAME, async (input: { amount: number }) => ({
       chargeId: `ch_${input.amount}`,
     }));
 
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (c) => {
-      const charge = await c.remote(chargeCard, { amount: 7 });
+      const charge = await c.step<{ chargeId: string }>(CHARGE_CARD_STEP_NAME, { amount: 7 });
       return charge.chargeId;
     });
 
@@ -139,13 +129,13 @@ describe('SqsTransport (real ElasticMQ) [testcontainers]', () => {
       prefix,
       autoCreate: true,
     });
-    transport.handle('payments-charge-card', async () => {
+    transport.handle(CHARGE_CARD_STEP_NAME, async () => {
       throw new Error('declined');
     });
 
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport });
-    engine.register('checkout', '1', async (c) => c.remote(chargeCard, { amount: 1 }));
+    engine.register('checkout', '1', async (c) => c.step(CHARGE_CARD_STEP_NAME, { amount: 1 }));
 
     await engine.start('checkout', {}, 'run-f');
     const result = await settle(store, 'run-f');

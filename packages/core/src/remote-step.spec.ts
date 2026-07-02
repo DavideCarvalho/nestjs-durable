@@ -1,16 +1,9 @@
-import { z } from 'zod';
 import { WorkflowEngine } from './engine';
-import type { RemoteStepDef } from './interfaces';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { InMemoryTransport } from './testing/in-memory-transport';
 
-const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
-  name: 'payments.charge-card',
-  input: z.object({ amount: z.number() }),
-  output: z.object({ chargeId: z.string() }),
-  __remote: true,
-};
+const CHARGE_CARD_STEP_NAME = 'payments.charge-card';
 
 /**
  * A durable `ctx.call` SUSPENDS the run, then the worker result resumes it asynchronously (the
@@ -30,13 +23,13 @@ describe('WorkflowEngine — remote steps', () => {
   it('dispatches a remote step over the transport and checkpoints its result', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    transport.handle('payments.charge-card', async (input: { amount: number }) => ({
+    transport.handle(CHARGE_CARD_STEP_NAME, async (input: { amount: number }) => ({
       chargeId: `ch_${input.amount}`,
     }));
 
     const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (ctx) => {
-      const charge = await ctx.remote(chargeCard, { amount: 42 });
+      const charge = await ctx.step<{ chargeId: string }>(CHARGE_CARD_STEP_NAME, { amount: 42 });
       return charge.chargeId;
     });
 
@@ -58,7 +51,7 @@ describe('WorkflowEngine — remote steps', () => {
   it('records queue/processing timing and announces a remote step as it starts', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    transport.handle('payments.charge-card', async (input: { amount: number }) => ({
+    transport.handle(CHARGE_CARD_STEP_NAME, async (input: { amount: number }) => ({
       chargeId: `ch_${input.amount}`,
     }));
 
@@ -71,7 +64,7 @@ describe('WorkflowEngine — remote steps', () => {
     });
 
     engine.register('checkout', '1', async (ctx) => {
-      const charge = await ctx.remote(chargeCard, { amount: 42 });
+      const charge = await ctx.step<{ chargeId: string }>(CHARGE_CARD_STEP_NAME, { amount: 42 });
       return charge.chargeId;
     });
 
@@ -97,7 +90,7 @@ describe('WorkflowEngine — remote steps', () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
     let dispatches = 0;
-    transport.handle('payments.charge-card', async (input: { amount: number }) => {
+    transport.handle(CHARGE_CARD_STEP_NAME, async (input: { amount: number }) => {
       dispatches += 1;
       return { chargeId: `ch_${input.amount}` };
     });
@@ -105,8 +98,8 @@ describe('WorkflowEngine — remote steps', () => {
     const engine = new WorkflowEngine({ store, transport });
     let failLocalOnce = true;
     engine.register('checkout', '1', async (ctx) => {
-      const charge = await ctx.remote(chargeCard, { amount: 42 });
-      await ctx.step('after', async () => {
+      const charge = await ctx.step<{ chargeId: string }>(CHARGE_CARD_STEP_NAME, { amount: 42 });
+      await ctx.localStep('after', async () => {
         if (failLocalOnce) {
           failLocalOnce = false;
           throw new Error('boom');

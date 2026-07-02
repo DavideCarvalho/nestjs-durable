@@ -1,16 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { z } from 'zod';
-import { remoteStep } from './remote-step-factory';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import type { CtxHost } from './workflow-ctx';
 import { createWorkflowCtx } from './workflow-ctx';
 
-const ping = remoteStep({
-  name: 'ext.ping',
-  partition: 'ext',
-  input: z.object({}),
-  output: z.object({ pong: z.boolean() }),
-});
+const PING_STEP_NAME = 'ext.ping';
 
 /** A recorded `host.callRemote` invocation, captured by {@link fakeHost}. */
 interface RecordedDispatch {
@@ -42,15 +35,20 @@ function fakeHost(dispatched: RecordedDispatch[]): CtxHost {
   };
 }
 
-describe('WorkflowCtx.remote', () => {
-  it('ctx.remote dispatches exactly one call through host.callRemote', async () => {
+describe('WorkflowCtx.step (dispatched)', () => {
+  it('ctx.step(name, input) dispatches exactly one call through host.callRemote', async () => {
     const dispatched: RecordedDispatch[] = [];
     const ctx = createWorkflowCtx(fakeHost(dispatched), 'run-1', []);
 
-    const output = await ctx.remote(ping, {});
+    const output = await ctx.step<{ pong: boolean }>(PING_STEP_NAME, {});
 
     expect(output).toEqual({ pong: true });
     expect(dispatched).toHaveLength(1);
-    expect(dispatched[0]).toMatchObject({ runId: 'run-1', seq: 0, step: ping, input: {} });
+    expect(dispatched[0]).toMatchObject({
+      runId: 'run-1',
+      seq: 0,
+      step: { name: PING_STEP_NAME },
+      input: {},
+    });
   });
 });

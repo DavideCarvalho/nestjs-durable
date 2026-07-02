@@ -1,17 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { z } from 'zod';
 import { WorkflowEngine } from './engine';
 import type { RemoteTask, StepResult, Transport } from './interfaces';
-import { remoteStep } from './remote-step-factory';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
-const ping = remoteStep({
-  name: 'ext.ping',
-  partition: 'ext',
-  input: z.object({}),
-  output: z.object({ pong: z.boolean() }),
-});
+const PING_STEP_NAME = 'ext.ping';
 
 /** A capturing transport whose dispatch can be made to fail, and whose result handler is exposed. */
 class FakeTransport implements Transport {
@@ -49,7 +42,7 @@ describe('multiple transports — failover + per-step selection', () => {
         { id: 'b', transport: b },
       ],
     });
-    engine.register('wf', '1', async (ctx) => ctx.remote(ping, {}));
+    engine.register('wf', '1', async (ctx) => ctx.step(PING_STEP_NAME, {}));
 
     await startRun(engine, 'wf', {}, 'r1');
 
@@ -69,7 +62,7 @@ describe('multiple transports — failover + per-step selection', () => {
         { id: 'b', transport: b },
       ],
     });
-    engine.register('wf', '1', async (ctx) => ctx.remote(ping, {}, { transport: 'b' }));
+    engine.register('wf', '1', async (ctx) => ctx.step(PING_STEP_NAME, {}, { transport: 'b' }));
 
     await startRun(engine, 'wf', {}, 'r1');
 
@@ -90,7 +83,7 @@ describe('multiple transports — failover + per-step selection', () => {
       ],
     });
     engine.register('wf', '1', async (ctx) => {
-      const r = await ctx.remote(ping, {}, { transport: 'b' });
+      const r = await ctx.step<{ pong: boolean }>(PING_STEP_NAME, {}, { transport: 'b' });
       return r.pong;
     });
 

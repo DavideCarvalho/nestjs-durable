@@ -1,19 +1,12 @@
-import { z } from 'zod';
 import { WorkflowEngine } from './engine';
-import type { RemoteStepDef } from './interfaces';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { InMemoryTransport } from './testing/in-memory-transport';
 
-const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
-  name: 'billing.charge-card',
-  input: z.object({ amount: z.number() }),
-  output: z.object({ chargeId: z.string() }),
-  __remote: true,
-};
+const CHARGE_CARD_STEP_NAME = 'billing.charge-card';
 
 /**
  * This spec LOCKS the existing stateless-replay-per-turn execution model (`engine.ts:2467-2472`):
- * the engine re-invokes the WHOLE workflow body on every turn; a completed `ctx.step`/`ctx.remote`
+ * the engine re-invokes the WHOLE workflow body on every turn; a completed `ctx.localStep`/`ctx.step`
  * closure is never re-run — its checkpointed output is returned instead. It is a regression lock,
  * not new behavior — a failure here means the execution-model assumption changed, not that this
  * test is wrong.
@@ -23,24 +16,24 @@ describe('replay recovery — stateless-replay-per-turn execution model', () => 
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
 
-    // Module-level side-effect counter: proves each `ctx.step` closure runs EXACTLY once across
+    // Module-level side-effect counter: proves each local step closure runs EXACTLY once across
     // however many turns the workflow body is re-invoked.
     let stepRuns = 0;
     let remoteDispatches = 0;
 
-    transport.handle('billing.charge-card', async (input: { amount: number }) => {
+    transport.handle(CHARGE_CARD_STEP_NAME, async (input: { amount: number }) => {
       remoteDispatches += 1;
       return { chargeId: `ch_${input.amount}` };
     });
 
     function registerCheckout(engine: WorkflowEngine) {
       engine.register('checkout', '1', async (ctx) => {
-        const a = await ctx.step('a', async () => {
+        const a = await ctx.localStep('a', async () => {
           stepRuns += 1;
           return 10;
         });
-        const charge = await ctx.remote(chargeCard, { amount: a });
-        const b = await ctx.step('b', async () => {
+        const charge = await ctx.step<{ chargeId: string }>(CHARGE_CARD_STEP_NAME, { amount: a });
+        const b = await ctx.localStep('b', async () => {
           stepRuns += 1;
           return charge.chargeId;
         });
@@ -61,7 +54,7 @@ describe('replay recovery — stateless-replay-per-turn execution model', () => 
     await engine1.start('checkout', {}, 'run1');
     const turn1 = await engine1.runOne('run1');
 
-    // Turn 1: the local step 'a' runs its closure once, then `ctx.remote` dispatches and the run
+    // Turn 1: the local step 'a' runs its closure once, then `ctx.step` dispatches and the run
     // suspends durably (a remote call never blocks the turn waiting for its result).
     expect(turn1?.status).toBe('suspended');
     expect(stepRuns).toBe(1);

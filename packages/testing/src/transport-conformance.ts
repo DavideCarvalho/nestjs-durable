@@ -1,10 +1,4 @@
-import {
-  InMemoryStateStore,
-  type RemoteStepDef,
-  type Transport,
-  WorkflowEngine,
-} from '@dudousxd/nestjs-durable-core';
-import { z } from 'zod';
+import { InMemoryStateStore, type Transport, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 
 /** A transport that can register worker handlers (every shipped transport does). */
 export type HandleableTransport = Transport & {
@@ -12,12 +6,7 @@ export type HandleableTransport = Transport & {
   close?(): Promise<void>;
 };
 
-const echo: RemoteStepDef<{ n: number }, { doubled: number }> = {
-  name: 'conformance.echo',
-  input: z.object({ n: z.number() }),
-  output: z.object({ doubled: z.number() }),
-  __remote: true,
-};
+const ECHO_STEP_NAME = 'conformance.echo';
 
 /**
  * A durable `ctx.call` suspends the run; the worker result resumes it asynchronously (on whatever
@@ -52,11 +41,15 @@ export async function assertTransportConformance(
     // which resumes the run. (Two engines on one transport would fight over the result stream.)
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport });
-    engine.register('conf-ok', '1', async (ctx) => (await ctx.remote(echo, { n: 21 })).doubled);
-    engine.register('conf-fail', '1', async (ctx) => ctx.remote(echo, { n: 1 }));
+    engine.register(
+      'conf-ok',
+      '1',
+      async (ctx) => (await ctx.step<{ doubled: number }>(ECHO_STEP_NAME, { n: 21 })).doubled,
+    );
+    engine.register('conf-fail', '1', async (ctx) => ctx.step(ECHO_STEP_NAME, { n: 1 }));
 
     // success: the worker doubles the input
-    transport.handle('conformance.echo', async (input) => ({
+    transport.handle(ECHO_STEP_NAME, async (input) => ({
       doubled: (input as { n: number }).n * 2,
     }));
     await engine.start('conf-ok', {}, `${idPrefix}-ok`);
@@ -66,7 +59,7 @@ export async function assertTransportConformance(
     }
 
     // failure: a throwing handler surfaces as a failed run (re-register the same step to throw)
-    transport.handle('conformance.echo', async () => {
+    transport.handle(ECHO_STEP_NAME, async () => {
       throw new Error('handler boom');
     });
     await engine.start('conf-fail', {}, `${idPrefix}-fail`);

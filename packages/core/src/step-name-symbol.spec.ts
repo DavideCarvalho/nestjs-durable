@@ -1,5 +1,5 @@
-import { DURABLE_STEP_NAME, stepNameOf } from './step-name-symbol';
 import { describe, expect, it } from 'vitest';
+import { DURABLE_STEP_NAME, stepNameOf } from './step-name-symbol';
 
 describe('step name stamp', () => {
   it('reads a stamped name off a function ref', () => {

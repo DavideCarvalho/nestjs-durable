@@ -1,13 +1,8 @@
 import 'reflect-metadata';
-import {
-  InMemoryStateStore,
-  type RemoteStepDef,
-  WorkflowEngine,
-} from '@dudousxd/nestjs-durable-core';
+import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { DataSource } from 'typeorm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { z } from 'zod';
 import { DbTransport } from './db-transport';
 import { typeOrmExecutor } from './executors';
 
@@ -52,16 +47,11 @@ afterAll(async () => {
   await pg?.stop();
 });
 
-const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
-  name: 'payments.charge-card',
-  input: z.object({ amount: z.number() }),
-  output: z.object({ chargeId: z.string() }),
-  __remote: true,
-};
+const CHARGE_CARD_STEP_NAME = 'payments.charge-card';
 
 // DbTransport isn't routed by handler name — `dispatch()` writes the engine's already-computed
 // routing token (`tenantGroup(sanitizeQueueToken(step.name), step.partition)`, bare-name here since
-// `chargeCard` carries no `partition`) straight into the `grp` column, and `handle()` polls WHERE
+// `ctx.step` never sets a `partition`) straight into the `grp` column, and `handle()` polls WHERE
 // grp = this `group` verbatim. So the transport's `group` must equal the step's bare sanitized name
 // for dispatch and consume to land on the same rows.
 const workerGroup = 'payments.charge-card';
@@ -103,14 +93,14 @@ describe('DbTransport (real Postgres) [testcontainers]', () => {
       prefix,
       pollMs: 50,
     });
-    transport.handle('payments.charge-card', async (input: { amount: number }) => ({
+    transport.handle(CHARGE_CARD_STEP_NAME, async (input: { amount: number }) => ({
       chargeId: `ch_${input.amount}`,
     }));
 
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (c) => {
-      const charge = await c.remote(chargeCard, { amount: 7 });
+      const charge = await c.step<{ chargeId: string }>(CHARGE_CARD_STEP_NAME, { amount: 7 });
       return charge.chargeId;
     });
 
@@ -132,13 +122,13 @@ describe('DbTransport (real Postgres) [testcontainers]', () => {
       prefix,
       pollMs: 50,
     });
-    transport.handle('payments.charge-card', async () => {
+    transport.handle(CHARGE_CARD_STEP_NAME, async () => {
       throw new Error('declined');
     });
 
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport });
-    engine.register('checkout', '1', async (c) => c.remote(chargeCard, { amount: 1 }));
+    engine.register('checkout', '1', async (c) => c.step(CHARGE_CARD_STEP_NAME, { amount: 1 }));
 
     await engine.start('checkout', {}, `run-${prefix}`);
     const result = await settle(store, `run-${prefix}`);

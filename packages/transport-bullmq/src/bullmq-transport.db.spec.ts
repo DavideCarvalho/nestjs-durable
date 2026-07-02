@@ -1,7 +1,6 @@
 import {
   type EngineEvent,
   InMemoryStateStore,
-  type RemoteStepDef,
   type RunReply,
   type RunRequest,
   type TenantEvent,
@@ -10,7 +9,6 @@ import {
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
 import { Queue } from 'bullmq';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { z } from 'zod';
 import { BullMQTransport, toBrokerPriority } from './bullmq-transport';
 
 /**
@@ -43,12 +41,7 @@ afterAll(async () => {
   await redis?.stop();
 });
 
-const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
-  name: 'payments.charge-card',
-  input: z.object({ amount: z.number() }),
-  output: z.object({ chargeId: z.string() }),
-  __remote: true,
-};
+const CHARGE_CARD_STEP_NAME = 'payments.charge-card';
 
 /** A durable ctx.call suspends; poll the store until the Redis round-trip resumes it to terminal. */
 async function settle(store: InMemoryStateStore, runId: string, timeoutMs = 15_000) {
@@ -91,14 +84,14 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
     const connection = liveConnection(ctx);
     const prefix = `durtest-${Date.now()}`;
     const transport = new BullMQTransport({ connection, prefix });
-    transport.handle('payments.charge-card', async (input: { amount: number }) => ({
+    transport.handle(CHARGE_CARD_STEP_NAME, async (input: { amount: number }) => ({
       chargeId: `ch_${input.amount}`,
     }));
 
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (c) => {
-      const charge = await c.remote(chargeCard, { amount: 7 });
+      const charge = await c.step<{ chargeId: string }>(CHARGE_CARD_STEP_NAME, { amount: 7 });
       return charge.chargeId;
     });
 
@@ -114,13 +107,13 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
     const connection = liveConnection(ctx);
     const prefix = `durtest-${Date.now()}-f`;
     const transport = new BullMQTransport({ connection, prefix });
-    transport.handle('payments.charge-card', async () => {
+    transport.handle(CHARGE_CARD_STEP_NAME, async () => {
       throw new Error('declined');
     });
 
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport });
-    engine.register('checkout', '1', async (c) => c.remote(chargeCard, { amount: 1 }));
+    engine.register('checkout', '1', async (c) => c.step(CHARGE_CARD_STEP_NAME, { amount: 1 }));
 
     await engine.start('checkout', {}, 'run1');
     const result = await settle(store, 'run1');
@@ -175,7 +168,7 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
     await transport.dispatch({
       runId: 'r1',
       seq: 0,
-      name: 'payments.charge-card',
+      name: CHARGE_CARD_STEP_NAME,
       stepId: 'r1:0',
       group: 'payments',
       input: { amount: 1 },

@@ -7,8 +7,11 @@ const createRule = ESLintUtils.RuleCreator(
 type MessageId = 'useNow' | 'useRandom' | 'useUuid' | 'useNowDate';
 
 /** True when `node` sits lexically inside the `run` method of a class decorated with `@Workflow`. */
-/** A function/arrow passed as an argument to `ctx.step(...)` / `ctx.task(...)` — its body is run once
- *  and checkpointed, so non-determinism inside it is fine (only the orchestration body must be pure). */
+/** A function/arrow passed as an argument to `ctx.sideEffect(...)` / `ctx.task(...)` — its body is run
+ *  once and checkpointed, so non-determinism inside it is fine (only the orchestration body must be
+ *  pure). `ctx.step` is deliberately NOT in this list: the single always-dispatched step surface no
+ *  longer takes an inline closure (it dispatches by handler reference/name), so it never wraps a
+ *  checkpointed body a raw `Date.now()`/`Math.random()` could safely live inside. */
 function isCheckpointedCallback(fn: TSESTree.Node): boolean {
   const call = fn.parent;
   if (call?.type !== 'CallExpression' || !call.arguments.includes(fn as never)) return false;
@@ -16,7 +19,7 @@ function isCheckpointedCallback(fn: TSESTree.Node): boolean {
   return (
     callee.type === 'MemberExpression' &&
     callee.property.type === 'Identifier' &&
-    (callee.property.name === 'step' || callee.property.name === 'task')
+    (callee.property.name === 'sideEffect' || callee.property.name === 'task')
   );
 }
 
@@ -75,13 +78,15 @@ export const noNondeterminism = createRule<[], MessageId>({
     type: 'problem',
     docs: {
       description:
-        'Disallow non-deterministic sources (Date.now, Math.random, new Date, crypto.randomUUID) inside a @Workflow run — they differ across replays and silently corrupt a durable run. Use ctx.now()/ctx.random()/ctx.uuid().',
+        'Disallow non-deterministic sources (Date.now, Math.random, new Date, crypto.randomUUID) inside a @Workflow run — they differ across replays and silently corrupt a durable run. Use ctx.now() for a timestamp, ctx.sideEffect(fn) for anything else (uuid/random/config).',
     },
     messages: {
       useNow:
         'Non-deterministic `{{call}}` inside a @Workflow run — use `ctx.now()` (recorded once, then replayed).',
-      useRandom: 'Non-deterministic `Math.random()` inside a @Workflow run — use `ctx.random()`.',
-      useUuid: 'Non-deterministic `crypto.randomUUID()` inside a @Workflow run — use `ctx.uuid()`.',
+      useRandom:
+        'Non-deterministic `Math.random()` inside a @Workflow run — use `ctx.sideEffect(() => Math.random())`.',
+      useUuid:
+        'Non-deterministic `crypto.randomUUID()` inside a @Workflow run — use `ctx.sideEffect(() => crypto.randomUUID())`.',
       useNowDate:
         'Non-deterministic `new Date()` inside a @Workflow run — use `new Date(await ctx.now())`.',
     },

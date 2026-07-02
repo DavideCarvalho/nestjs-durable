@@ -28,8 +28,8 @@ import type {
   WorkflowCtx,
 } from './interfaces';
 import { breakpointToken } from './protocol';
-import { type StepRef, stepNameOf } from './step-name-symbol';
 import { createStepLogger } from './step-logger';
+import { type StepRef, stepNameOf } from './step-name-symbol';
 import { type WorkflowRef, workflowName } from './workflow-ref';
 
 /** Normalize the `ctx.child`/`ctx.startChild` 3rd arg: a bare string is shorthand for `{ childId }`. */

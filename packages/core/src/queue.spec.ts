@@ -1,19 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { z } from 'zod';
 import { WorkflowEngine } from './engine';
 import type { RemoteTask, StepResult, Transport } from './interfaces';
 import { QueueController } from './queue';
-import { remoteStep } from './remote-step-factory';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { InMemoryTransport } from './testing/in-memory-transport';
 
-const ping = remoteStep({
-  name: 'ext.ping',
-  partition: 'ext',
-  input: z.object({}),
-  output: z.object({ pong: z.boolean() }),
-});
+const PING_STEP_NAME = 'ext.ping';
 
 /** Drive the InMemoryTransport's deferred results until `runId` reaches a terminal state. */
 async function settle(store: InMemoryStateStore, runId: string) {
@@ -146,12 +139,12 @@ describe('flow control — durable queues', () => {
   it('rate-limits admissions per queue and resumes blocked calls when the window resets', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    transport.handle('ext.ping', async () => ({ pong: true }));
+    transport.handle(PING_STEP_NAME, async () => ({ pong: true }));
     let nowMs = 1000;
     const engine = new WorkflowEngine({ store, transport, clock: () => nowMs });
     engine.registerQueue({ name: 'api', rateLimit: { limit: 2, periodMs: 1000 } });
     engine.register('caller', '1', async (ctx) => {
-      await ctx.remote(ping, {}, { queue: 'api' });
+      await ctx.step(PING_STEP_NAME, {}, { queue: 'api' });
       return 'done';
     });
 
@@ -179,7 +172,7 @@ describe('flow control — durable queues', () => {
     const engine = new WorkflowEngine({ store, transport, clock: () => nowMs });
     engine.registerQueue({ name: 'db', concurrency: 1 });
     engine.register('caller', '1', async (ctx) => {
-      await ctx.remote(ping, {}, { queue: 'db' });
+      await ctx.step(PING_STEP_NAME, {}, { queue: 'db' });
       return 'done';
     });
 
@@ -213,11 +206,11 @@ describe('flow control — durable queues', () => {
     const engine = new WorkflowEngine({ store, transport, clock: () => nowMs });
     engine.registerQueue({ name: 'pq', concurrency: 1 });
     engine.register('lo', '1', async (ctx) => {
-      await ctx.remote(ping, {}, { queue: 'pq', priority: 1 });
+      await ctx.step(PING_STEP_NAME, {}, { queue: 'pq', priority: 1 });
       return 'done';
     });
     engine.register('hi', '1', async (ctx) => {
-      await ctx.remote(ping, {}, { queue: 'pq', priority: 9 });
+      await ctx.step(PING_STEP_NAME, {}, { queue: 'pq', priority: 9 });
       return 'done';
     });
 

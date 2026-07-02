@@ -1,18 +1,11 @@
-import { z } from 'zod';
 import type { AdmissionBackend } from './admission';
 import { WorkflowEngine } from './engine';
-import type { RemoteStepDef } from './interfaces';
 import type { Admission, AdmissionItem, QueueConfig } from './queue';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { InMemoryTransport } from './testing/in-memory-transport';
 
-const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
-  name: 'payments.charge-card',
-  input: z.object({ amount: z.number() }),
-  output: z.object({ chargeId: z.string() }),
-  __remote: true,
-};
+const CHARGE_CARD_STEP_NAME = 'payments.charge-card';
 
 /**
  * Backend that blocks admission until `open()` is called, and exposes the `onFreed` callback the
@@ -48,7 +41,7 @@ describe('engine wakes admission-blocked runs on a freed-slot signal', () => {
   it('resumes a queued run immediately when onFreed fires (no timer poll)', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    transport.handle('payments.charge-card', async (i: { amount: number }) => ({
+    transport.handle(CHARGE_CARD_STEP_NAME, async (i: { amount: number }) => ({
       chargeId: `ch_${i.amount}`,
     }));
     const backend = new GatedBackend();
@@ -57,7 +50,11 @@ describe('engine wakes admission-blocked runs on a freed-slot signal', () => {
     const engine = new WorkflowEngine({ store, transport, admission: backend });
     engine.registerQueue({ name: 'charges', concurrency: 1 });
     engine.register('checkout', '1', async (ctx) => {
-      const c = await ctx.remote(chargeCard, { amount: 7 }, { queue: 'charges' });
+      const c = await ctx.step<{ chargeId: string }>(
+        CHARGE_CARD_STEP_NAME,
+        { amount: 7 },
+        { queue: 'charges' },
+      );
       return c.chargeId;
     });
 

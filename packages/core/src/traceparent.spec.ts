@@ -1,17 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { z } from 'zod';
 import { WorkflowEngine } from './engine';
 import type { RemoteTask, StepResult, Transport } from './interfaces';
-import { remoteStep } from './remote-step-factory';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
-const ping = remoteStep({
-  name: 'ext.ping',
-  partition: 'ext',
-  input: z.object({}),
-  output: z.object({ pong: z.boolean() }),
-});
+const PING_STEP_NAME = 'ext.ping';
 
 describe('distributed tracing — traceparent propagation to workers', () => {
   it('injects the configured traceparent into dispatched remote tasks', async () => {
@@ -30,7 +23,7 @@ describe('distributed tracing — traceparent propagation to workers', () => {
       traceparent: () => '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
     });
     engine.register('wf', '1', async (ctx) => {
-      await ctx.remote(ping, {});
+      await ctx.step(PING_STEP_NAME, {});
       return 'x';
     });
 
@@ -54,7 +47,7 @@ describe('distributed tracing — traceparent propagation to workers', () => {
     };
     const engine = new WorkflowEngine({ store, transport });
     engine.register('wf', '1', async (ctx) => {
-      await ctx.remote(ping, {});
+      await ctx.step(PING_STEP_NAME, {});
       return 'x';
     });
 

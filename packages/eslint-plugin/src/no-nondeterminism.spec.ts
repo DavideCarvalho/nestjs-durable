@@ -32,16 +32,23 @@ describe('no-nondeterminism', () => {
   });
 
   it('flags Math.random(), new Date(), and crypto.randomUUID()', () => {
-    expect(lint(workflow('const r = Math.random();'))[0]?.message).toContain('ctx.random()');
+    expect(lint(workflow('const r = Math.random();'))[0]?.message).toContain(
+      'ctx.sideEffect(() => Math.random())',
+    );
     expect(lint(workflow('const d = new Date();'))[0]?.message).toContain(
       'new Date(await ctx.now())',
     );
-    expect(lint(workflow('const id = crypto.randomUUID();'))[0]?.message).toContain('ctx.uuid()');
+    expect(lint(workflow('const id = crypto.randomUUID();'))[0]?.message).toContain(
+      'ctx.sideEffect(() => crypto.randomUUID())',
+    );
     expect(lint(workflow('const id = globalThis.crypto.randomUUID();'))).toHaveLength(1);
   });
 
   it('allows the ctx escape hatches', () => {
     expect(lint(workflow('const t = await ctx.now(); const d = new Date(t);'))).toHaveLength(0);
+    expect(
+      lint(workflow('const id = await ctx.sideEffect(() => crypto.randomUUID());')),
+    ).toHaveLength(0);
   });
 
   it('does not flag the same calls outside a @Workflow run', () => {
@@ -57,17 +64,21 @@ describe('no-nondeterminism', () => {
     expect(lint('class Plain { run() { return Date.now(); } }')).toHaveLength(0);
   });
 
-  it('does not flag non-determinism inside a ctx.step / ctx.task callback (checkpointed)', () => {
-    // The step body runs once and is checkpointed, so `new Date()` there is replay-safe.
+  it('does not flag non-determinism inside a ctx.sideEffect / ctx.task callback (checkpointed)', () => {
+    // The sideEffect body runs once and is checkpointed, so `new Date()` there is replay-safe.
     expect(
-      lint(workflow("const s = await ctx.step('setup', async () => new Date().toISOString());")),
+      lint(workflow('const s = await ctx.sideEffect(() => new Date().toISOString());')),
     ).toHaveLength(0);
     expect(
       lint(workflow("await ctx.task('t', async () => { const r = Math.random(); });")),
     ).toHaveLength(0);
     // ...but a banned call in the orchestration body, even alongside steps, is still flagged.
-    expect(
-      lint(workflow("await ctx.step('a', async () => 1); const t = Date.now();")),
-    ).toHaveLength(1);
+    expect(lint(workflow('await ctx.sideEffect(() => 1); const t = Date.now();'))).toHaveLength(1);
+  });
+
+  it('still flags non-determinism passed directly as a ctx.step() argument (no closure to shelter it)', () => {
+    // ctx.step is always-dispatched (handler ref/name + input) — it never wraps a checkpointed
+    // closure, so a banned call anywhere in the orchestration body around it is still flagged.
+    expect(lint(workflow("await ctx.step('setup', { at: Date.now() });"))).toHaveLength(1);
   });
 });
