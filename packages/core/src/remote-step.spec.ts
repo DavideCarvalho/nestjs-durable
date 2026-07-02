@@ -36,7 +36,7 @@ describe('WorkflowEngine — remote steps', () => {
 
     const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (ctx) => {
-      const charge = await ctx.call(chargeCard, { amount: 42 });
+      const charge = await ctx.remote(chargeCard, { amount: 42 });
       return charge.chargeId;
     });
 
@@ -71,7 +71,7 @@ describe('WorkflowEngine — remote steps', () => {
     });
 
     engine.register('checkout', '1', async (ctx) => {
-      const charge = await ctx.call(chargeCard, { amount: 42 });
+      const charge = await ctx.remote(chargeCard, { amount: 42 });
       return charge.chargeId;
     });
 
@@ -105,7 +105,7 @@ describe('WorkflowEngine — remote steps', () => {
     const engine = new WorkflowEngine({ store, transport });
     let failLocalOnce = true;
     engine.register('checkout', '1', async (ctx) => {
-      const charge = await ctx.call(chargeCard, { amount: 42 });
+      const charge = await ctx.remote(chargeCard, { amount: 42 });
       await ctx.step('after', async () => {
         if (failLocalOnce) {
           failLocalOnce = false;

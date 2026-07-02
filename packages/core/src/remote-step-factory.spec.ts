@@ -29,17 +29,15 @@ describe('remoteStep', () => {
     expect(step.partition).toBe('t');
   });
 
-  it('deprecated: maps a legacy `group` to `partition` and warns once', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  it('rejects a `group` key at the type level (alias removed)', () => {
     const step = remoteStep({
       name: 'x',
+      // @ts-expect-error `group` was removed; use `partition` instead
       group: 'g',
       input: z.object({}),
       output: z.object({}),
     });
 
-    expect(step.partition).toBe('g');
-    expect(warn).toHaveBeenCalledOnce();
-    warn.mockRestore();
+    expect(step.partition).toBeUndefined();
   });
 });

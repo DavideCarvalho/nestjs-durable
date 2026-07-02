@@ -40,7 +40,7 @@ describe('remote-step priority reaches the dispatched task', () => {
 
     const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (ctx) => {
-      const charge = await ctx.call(chargeCard, { amount: 42 }, { priority: 7 });
+      const charge = await ctx.remote(chargeCard, { amount: 42 }, { priority: 7 });
       return charge.chargeId;
     });
 
@@ -60,7 +60,7 @@ describe('remote-step priority reaches the dispatched task', () => {
 
     const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (ctx) => {
-      const charge = await ctx.call(chargeCard, { amount: 1 });
+      const charge = await ctx.remote(chargeCard, { amount: 1 });
       return charge.chargeId;
     });
 

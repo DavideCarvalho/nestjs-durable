@@ -110,7 +110,7 @@ export interface StepCheckpoint {
    * simply re-runs on replay (only `completed` short-circuits).
    */
   status: 'pending' | 'running' | 'completed' | 'failed';
-  /** What the step was called with — the `ctx.call` args for a remote step (a local step has none). */
+  /** What the step was called with — the `ctx.remote` args for a remote step (a local step has none). */
   input?: unknown;
   output?: unknown;
   error?: StepError | undefined;
@@ -540,7 +540,7 @@ export interface RemoteTask {
   /**
    * Admission priority carried through to the broker (BullMQ job `priority`) so a transport that
    * supports priority ordering lets an urgent task jump ahead of already-enqueued lower-priority
-   * ones at the worker. Mirrors the per-call `priority` from `ctx.call(..., { priority })`. Higher
+   * ones at the worker. Mirrors the per-call `priority` from `ctx.remote(..., { priority })`. Higher
    * wins; absent means default/unprioritised. Transports without priority support ignore it.
    */
   priority?: number | undefined;
@@ -623,10 +623,10 @@ export interface HistoryEvent {
 
 /** A decision the workflow function produced at a `seq` that was not yet in history. */
 export type WorkflowCommand =
-  /** `ctx.call(remoteStep, input)` — dispatch a remote step and await it. A worker's
+  /** `ctx.remote(remoteStep, input)` — dispatch a remote step and await it. A worker's
    *  `ctx.gather_calls([...])` fan-out tags every dispatched call with the same `parallelGroup` so the
    *  dashboard renders the remote steps as one parallel fan (parity with the gathered `recordStep` /
-   *  `startChild` tags). Undefined for a lone sequential `ctx.call`. */
+   *  `startChild` tags). Undefined for a lone sequential `ctx.remote`. */
   | {
       kind: 'call';
       seq: number;
@@ -751,7 +751,7 @@ export interface WorkflowExecutor {
 
 /**
  * A transport in an ordered pool, identified by `id`. The engine dispatches on the first by default
- * and fails over to the next on a dispatch error; a step can pin one via `ctx.call(…, { transport })`.
+ * and fails over to the next on a dispatch error; a step can pin one via `ctx.remote(…, { transport })`.
  * The chosen `id` is stamped on the {@link RemoteTask} so a worker replies through the matching one.
  */
 export interface NamedTransport {
@@ -978,7 +978,7 @@ export interface StepOptions {
   /** Add random jitter (50–100% of the computed delay) to avoid thundering-herd retries. */
   jitter?: boolean;
   /**
-   * Liveness window for a **remote** step (`ctx.call`): if the worker produces no result and no
+   * Liveness window for a **remote** step (`ctx.remote`): if the worker produces no result and no
    * heartbeat within this many ms, the engine presumes it dead and fails the dispatch with a
    * `RemoteStepTimeout` (retryable — it re-dispatches per `retries`). Each heartbeat resets the
    * window. Ignored for local steps. Omit to wait indefinitely.
@@ -1005,7 +1005,7 @@ export interface RemoteStepDef<TInput = unknown, TOutput = unknown> extends Step
   partition?: string | undefined;
   input: z.ZodType<TInput>;
   output: z.ZodType<TOutput>;
-  /** Branding so `ctx.remote` (and its deprecated alias `ctx.call`) can infer types. */
+  /** Branding so `ctx.remote` can infer types. */
   readonly __remote: true;
 }
 
@@ -1076,15 +1076,6 @@ export interface WorkflowCtx {
    *   failover to the rest). See `engine.registerQueue` / the engine's `transports` option.
    */
   remote<TInput, TOutput>(
-    step: RemoteStepDef<TInput, TOutput>,
-    input: TInput,
-    opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
-  ): Promise<TOutput>;
-  /**
-   * @deprecated Use `ctx.remote` instead. `call` is a back-compat alias of {@link WorkflowCtx.remote}
-   * and dispatches identically. Removed in a future major.
-   */
-  call<TInput, TOutput>(
     step: RemoteStepDef<TInput, TOutput>,
     input: TInput,
     opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },

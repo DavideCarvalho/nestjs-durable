@@ -77,7 +77,6 @@ describe('operator drive mode', () => {
       store,
       transport,
       namespace: undefined,
-      remoteByConvention: true,
     });
 
     await operator.runPending();
@@ -117,7 +116,6 @@ describe('operator drive mode', () => {
       store,
       transport,
       namespace: undefined,
-      remoteByConvention: true,
       runDispatcher: { dispatch: () => {} }, // no-op: inspect the re-enqueued row, don't re-execute it
     });
 
@@ -160,7 +158,6 @@ describe('operator drive mode', () => {
       store,
       transport,
       namespace: undefined,
-      remoteByConvention: true,
     });
 
     await operator.resumeDueTimers();
@@ -187,7 +184,6 @@ describe('operator drive mode', () => {
       store,
       transport,
       namespace: undefined,
-      remoteByConvention: true,
     });
 
     // resume() must NOT throw NamespaceMismatch for a run outside any single namespace — an
@@ -225,7 +221,6 @@ describe('operator drive mode', () => {
       store,
       transport,
       namespace: undefined,
-      remoteByConvention: true,
       runDispatcher: { dispatch: () => {} }, // no-op: inspect the created row, don't drive it further
     });
 
@@ -245,7 +240,6 @@ describe('operator drive mode', () => {
       store,
       transport,
       namespace: undefined,
-      remoteByConvention: true,
       runDispatcher: { dispatch: () => {} },
     });
     await expect(
@@ -294,7 +288,6 @@ describe('operator drive mode', () => {
       store,
       transport,
       namespace: 'default',
-      remoteByConvention: true,
     });
 
     // resume() of a foreign-namespace run still throws NamespaceMismatch, exactly as today.

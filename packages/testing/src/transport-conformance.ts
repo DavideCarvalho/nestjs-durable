@@ -52,8 +52,8 @@ export async function assertTransportConformance(
     // which resumes the run. (Two engines on one transport would fight over the result stream.)
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport });
-    engine.register('conf-ok', '1', async (ctx) => (await ctx.call(echo, { n: 21 })).doubled);
-    engine.register('conf-fail', '1', async (ctx) => ctx.call(echo, { n: 1 }));
+    engine.register('conf-ok', '1', async (ctx) => (await ctx.remote(echo, { n: 21 })).doubled);
+    engine.register('conf-fail', '1', async (ctx) => ctx.remote(echo, { n: 1 }));
 
     // success: the worker doubles the input
     transport.handle('conformance.echo', async (input) => ({

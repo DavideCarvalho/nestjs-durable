@@ -8,7 +8,7 @@ import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 const ping = remoteStep({
   name: 'ext.ping',
-  group: 'ext',
+  partition: 'ext',
   input: z.object({}),
   output: z.object({ pong: z.boolean() }),
 });
@@ -49,7 +49,7 @@ describe('multiple transports — failover + per-step selection', () => {
         { id: 'b', transport: b },
       ],
     });
-    engine.register('wf', '1', async (ctx) => ctx.call(ping, {}));
+    engine.register('wf', '1', async (ctx) => ctx.remote(ping, {}));
 
     await startRun(engine, 'wf', {}, 'r1');
 
@@ -69,7 +69,7 @@ describe('multiple transports — failover + per-step selection', () => {
         { id: 'b', transport: b },
       ],
     });
-    engine.register('wf', '1', async (ctx) => ctx.call(ping, {}, { transport: 'b' }));
+    engine.register('wf', '1', async (ctx) => ctx.remote(ping, {}, { transport: 'b' }));
 
     await startRun(engine, 'wf', {}, 'r1');
 
@@ -90,7 +90,7 @@ describe('multiple transports — failover + per-step selection', () => {
       ],
     });
     engine.register('wf', '1', async (ctx) => {
-      const r = await ctx.call(ping, {}, { transport: 'b' });
+      const r = await ctx.remote(ping, {}, { transport: 'b' });
       return r.pong;
     });
 

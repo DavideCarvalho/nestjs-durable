@@ -677,8 +677,7 @@ export function createWorkflowCtx(
     );
   };
 
-  // Dispatch a typed remote step and await its checkpointed result. `call` is a deprecated alias
-  // bound to this SAME closure — both keys below reference it, so there is exactly one dispatch path.
+  // Dispatch a typed remote step and await its checkpointed result.
   const remote = <TInput, TOutput>(
     step: RemoteStepDef<TInput, TOutput>,
     input: TInput,
@@ -714,6 +713,5 @@ export function createWorkflowCtx(
     random,
     uuid,
     remote,
-    call: remote,
   };
 }

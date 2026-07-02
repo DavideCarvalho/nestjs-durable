@@ -15,7 +15,7 @@ async function settle(store: InMemoryStateStore, runId: string) {
 
 /** A hand-scripted stand-in for the Python `WorkflowWorker.process_task` — it produces the same
  *  decisions the replay of this pipeline would, from the history the engine feeds it:
- *    ctx.step("setup")  ·  ctx.call("ingestion")  ·  ctx.sleep  ·  return { rows }
+ *    ctx.step("setup")  ·  ctx.remote("ingestion")  ·  ctx.sleep  ·  return { rows }
  *  (the Python replay runtime itself is unit-tested separately; here we exercise the ENGINE's drive
  *  + apply of the protocol.) */
 function pipelineExecutor(opts: { withSleep?: boolean } = {}): WorkflowExecutor {

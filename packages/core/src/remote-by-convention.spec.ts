@@ -72,15 +72,14 @@ class EmptyGroupsTransport implements Transport {
   onDecision(_handler: (decision: WorkflowDecision) => Promise<void>): void {}
 }
 
-describe('WorkflowEngine — remoteByConvention routing', () => {
-  it('routes an unregistered workflow to the live group of the same name', async () => {
+describe('WorkflowEngine — convention-by-default routing', () => {
+  it('routes an unregistered workflow to the live group of the same name, with NO flag', async () => {
     const store = new InMemoryStateStore();
     const transport = new ConventionTransport();
     const engine = new WorkflowEngine({
       store,
       transport,
       namespace: 'default',
-      remoteByConvention: true,
     });
 
     // 'processing' is never registered locally — convention routing must discover and route it.
@@ -93,25 +92,10 @@ describe('WorkflowEngine — remoteByConvention routing', () => {
     expect(transport.dispatchedGroups).toEqual(['processing']);
   });
 
-  it('default (remoteByConvention: false) throws "not registered" for an unregistered workflow', async () => {
-    const store = new InMemoryStateStore();
-    const transport = new ConventionTransport();
-    // No remoteByConvention flag → defaults to false.
-    const engine = new WorkflowEngine({ store, transport });
-
-    await expect(engine.start('processing', { hello: 'world' }, 'conv2')).rejects.toThrow(
-      'not registered',
-    );
-  });
-
-  it('throws "not registered" when remoteByConvention is true but the group is not live', async () => {
+  it('throws "not registered" when the group is not live, with NO flag', async () => {
     const store = new InMemoryStateStore();
     const transport = new EmptyGroupsTransport();
-    const engine = new WorkflowEngine({
-      store,
-      transport,
-      remoteByConvention: true,
-    });
+    const engine = new WorkflowEngine({ store, transport });
 
     await expect(engine.start('processing', { hello: 'world' }, 'conv3')).rejects.toThrow(
       'not registered',
@@ -121,11 +105,7 @@ describe('WorkflowEngine — remoteByConvention routing', () => {
   it('an explicit engine.remote() registration takes precedence over convention routing', async () => {
     const store = new InMemoryStateStore();
     const transport = new ConventionTransport();
-    const engine = new WorkflowEngine({
-      store,
-      transport,
-      remoteByConvention: true,
-    });
+    const engine = new WorkflowEngine({ store, transport });
 
     // Explicit registration routes to a DIFFERENT group ('explicit-group'), not the workflow name.
     engine.remote('processing', { group: 'explicit-group' });

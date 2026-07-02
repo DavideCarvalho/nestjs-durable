@@ -57,7 +57,7 @@ describe('engine wakes admission-blocked runs on a freed-slot signal', () => {
     const engine = new WorkflowEngine({ store, transport, admission: backend });
     engine.registerQueue({ name: 'charges', concurrency: 1 });
     engine.register('checkout', '1', async (ctx) => {
-      const c = await ctx.call(chargeCard, { amount: 7 }, { queue: 'charges' });
+      const c = await ctx.remote(chargeCard, { amount: 7 }, { queue: 'charges' });
       return c.chargeId;
     });
 

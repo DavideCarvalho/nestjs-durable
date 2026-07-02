@@ -7,7 +7,7 @@ import { createWorkflowCtx } from './workflow-ctx';
 
 const ping = remoteStep({
   name: 'ext.ping',
-  group: 'ext',
+  partition: 'ext',
   input: z.object({}),
   output: z.object({ pong: z.boolean() }),
 });
@@ -42,23 +42,12 @@ function fakeHost(dispatched: RecordedDispatch[]): CtxHost {
   };
 }
 
-describe('WorkflowCtx.remote / ctx.call alias', () => {
+describe('WorkflowCtx.remote', () => {
   it('ctx.remote dispatches exactly one call through host.callRemote', async () => {
     const dispatched: RecordedDispatch[] = [];
     const ctx = createWorkflowCtx(fakeHost(dispatched), 'run-1', []);
 
     const output = await ctx.remote(ping, {});
-
-    expect(output).toEqual({ pong: true });
-    expect(dispatched).toHaveLength(1);
-    expect(dispatched[0]).toMatchObject({ runId: 'run-1', seq: 0, step: ping, input: {} });
-  });
-
-  it('ctx.call is an identical back-compat alias for ctx.remote', async () => {
-    const dispatched: RecordedDispatch[] = [];
-    const ctx = createWorkflowCtx(fakeHost(dispatched), 'run-1', []);
-
-    const output = await ctx.call(ping, {});
 
     expect(output).toEqual({ pong: true });
     expect(dispatched).toHaveLength(1);

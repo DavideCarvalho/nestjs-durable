@@ -8,7 +8,7 @@ import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 const ping = remoteStep({
   name: 'ext.ping',
-  group: 'ext',
+  partition: 'ext',
   input: z.object({}),
   output: z.object({ pong: z.boolean() }),
 });
@@ -30,7 +30,7 @@ describe('distributed tracing — traceparent propagation to workers', () => {
       traceparent: () => '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
     });
     engine.register('wf', '1', async (ctx) => {
-      await ctx.call(ping, {});
+      await ctx.remote(ping, {});
       return 'x';
     });
 
@@ -54,7 +54,7 @@ describe('distributed tracing — traceparent propagation to workers', () => {
     };
     const engine = new WorkflowEngine({ store, transport });
     engine.register('wf', '1', async (ctx) => {
-      await ctx.call(ping, {});
+      await ctx.remote(ping, {});
       return 'x';
     });
 

@@ -16,7 +16,7 @@ import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 const ping = remoteStep({
   name: 'ext.ping',
-  group: 'ext',
+  partition: 'ext',
   input: z.object({}),
   output: z.object({ pong: z.boolean() }),
 });
@@ -24,7 +24,7 @@ const ping = remoteStep({
 /** Same step, but with a liveness `timeoutMs` — routes through the in-memory heartbeat path. */
 const pingWithTimeout = remoteStep({
   name: 'ext.ping',
-  group: 'ext',
+  partition: 'ext',
   input: z.object({}),
   output: z.object({ pong: z.boolean() }),
   timeoutMs: 1_000,
@@ -99,7 +99,7 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
       context: () => ({ tenantId: 't1', userRef: { type: 'User', id: 1 } }),
     });
     engine.register('wf', '1', async (ctx) => {
-      await ctx.call(ping, {});
+      await ctx.remote(ping, {});
       return 'x';
     });
 
@@ -128,7 +128,7 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
       traceparent: () => '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
     });
     engine.register('wf', '1', async (ctx) => {
-      await ctx.call(ping, {});
+      await ctx.remote(ping, {});
       return 'x';
     });
 
@@ -171,7 +171,7 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
     // A `timeoutMs` step is awaited in-memory (callRemoteInMemory) with a heartbeat window, not via
     // the durable suspend path — a third, distinct dispatch site.
     engine.register('wf', '1', async (ctx) => {
-      await ctx.call(pingWithTimeout, {});
+      await ctx.remote(pingWithTimeout, {});
       return 'x';
     });
 

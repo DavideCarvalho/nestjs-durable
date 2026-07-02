@@ -42,7 +42,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('maps a Suspend to continue with the commands', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.call(remote('ingest'), null);
+      await ctx.remote(remote('ingest'), null);
     });
     const d = await wf.processTask(task());
     expect(d.status).toBe('continue');
@@ -67,7 +67,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
       try {
-        await ctx.call(remote('risky'), null);
+        await ctx.remote(remote('risky'), null);
         return { ok: true };
       } catch {
         return { ok: false, compensated: true };
@@ -84,7 +84,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('maps an uncaught failure to failed', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.call(remote('risky'), null);
+      await ctx.remote(remote('risky'), null);
     });
     const history: HistoryEvent[] = [
       { seq: 0, kind: 'call', name: 'risky', error: { message: 'boom' } },
@@ -113,7 +113,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('detects nondeterminism and fails loudly', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.call(remote('a'), null);
+      await ctx.remote(remote('a'), null);
     });
     const history: HistoryEvent[] = [{ seq: 0, kind: 'timer' }];
     const d = await wf.processTask(task({ history }));
@@ -142,7 +142,7 @@ describe('WorkflowWorker threads its group into ctx.call partition defaulting', 
   it("a no-explicit-partition call inherits the worker's group as its partition", async () => {
     const wf = new WorkflowWorker('processing');
     wf.register('wf', async (ctx) => {
-      await ctx.call(remote('ingest'), null);
+      await ctx.remote(remote('ingest'), null);
     });
     const d = await wf.processTask(task());
     const call = d.commands[0];
@@ -156,7 +156,7 @@ describe('WorkflowWorker threads its group into ctx.call partition defaulting', 
   it('an explicit partition on the step still wins over the worker group', async () => {
     const wf = new WorkflowWorker('processing');
     wf.register('wf', async (ctx) => {
-      await ctx.call(remote('ingest', 'data'), null); // explicit partition
+      await ctx.remote(remote('ingest', 'data'), null); // explicit partition
     });
     const d = await wf.processTask(task());
     const call = d.commands[0];
@@ -166,7 +166,7 @@ describe('WorkflowWorker threads its group into ctx.call partition defaulting', 
   it("the default worker group ('workflows') is what a bare worker defaults a call to", async () => {
     const wf = new WorkflowWorker(); // group defaults to 'workflows'
     wf.register('wf', async (ctx) => {
-      await ctx.call(remote('ingest'), null);
+      await ctx.remote(remote('ingest'), null);
     });
     const d = await wf.processTask(task());
     const call = d.commands[0];
@@ -179,7 +179,7 @@ describe('WorkflowWorker end-to-end across turns', () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx, input: { base: string }) => {
       const a = await ctx.step('s', () => 1);
-      const r = await ctx.call(remote('ingest'), { a, base: input.base });
+      const r = await ctx.remote(remote('ingest'), { a, base: input.base });
       return { a, r };
     });
 

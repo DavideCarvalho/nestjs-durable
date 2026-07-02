@@ -26,7 +26,7 @@ class ControlTransport implements Transport {
 
 const echo: RemoteStepDef<unknown, unknown> = remoteStep({
   name: 'job',
-  group: 'g',
+  partition: 'g',
   input: z.any(),
   output: z.any(),
 });
@@ -35,7 +35,9 @@ describe('remote-step liveness (heartbeats)', () => {
   it('times out and re-dispatches a presumed-dead worker, then fails', async () => {
     const transport = new ControlTransport();
     const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
-    engine.register('wf', '1', async (ctx) => ctx.call({ ...echo, timeoutMs: 30, retries: 2 }, {}));
+    engine.register('wf', '1', async (ctx) =>
+      ctx.remote({ ...echo, timeoutMs: 30, retries: 2 }, {}),
+    );
 
     const res = await startRun(engine, 'wf', {}, 'r1'); // never delivered → timeout × 2 → fail
     expect(res.status).toBe('failed');
@@ -46,7 +48,7 @@ describe('remote-step liveness (heartbeats)', () => {
   it('a heartbeat rearms the window so a beating worker survives past timeoutMs', async () => {
     const transport = new ControlTransport();
     const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
-    engine.register('wf2', '1', async (ctx) => ctx.call({ ...echo, timeoutMs: 60 }, {}));
+    engine.register('wf2', '1', async (ctx) => ctx.remote({ ...echo, timeoutMs: 60 }, {}));
 
     await engine.start('wf2', {}, 'r2');
     const runPromise = engine.waitForRun('r2');

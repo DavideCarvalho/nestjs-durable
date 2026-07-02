@@ -33,7 +33,7 @@ const remoteAdd: RemoteStepDef<{ a: number }, { sum: number }> = {
  *  `WorkflowContext` `implements WorkflowCtx`, so the very same function runs on both runtimes. */
 async function body(ctx: WorkflowCtx, input: { x: number }): Promise<{ a: number; r: number }> {
   const a = await ctx.step('s', async () => input.x * 2);
-  const { sum } = await ctx.call(remoteAdd, { a });
+  const { sum } = await ctx.remote(remoteAdd, { a });
   return { a, r: sum };
 }
 

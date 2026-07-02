@@ -98,7 +98,7 @@ describe('WorkflowContext.step', () => {
 describe('WorkflowContext.call', () => {
   it('accepts a RemoteStepDef and emits a call command with its name/partition, then suspends', async () => {
     const ctx = new WorkflowContext('r1', []);
-    await expect(ctx.call(ingest, { a: 1 })).rejects.toBeInstanceOf(Suspend);
+    await expect(ctx.remote(ingest, { a: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
       { kind: 'call', seq: 0, name: 'ingest', group: 'data', input: { a: 1 } },
     ]);
@@ -107,7 +107,7 @@ describe('WorkflowContext.call', () => {
   it('accepts engine-side admission opts in the signature without changing the command', async () => {
     const ctx = new WorkflowContext('r1', []);
     await expect(
-      ctx.call(ingest, { a: 1 }, { queue: 'q', priority: 5, fairnessKey: 'k', transport: 't' }),
+      ctx.remote(ingest, { a: 1 }, { queue: 'q', priority: 5, fairnessKey: 'k', transport: 't' }),
     ).rejects.toBeInstanceOf(Suspend);
     // opts are engine admission concerns — the worker's emitted command is unchanged.
     expect(ctx.commands).toEqual([
@@ -118,7 +118,7 @@ describe('WorkflowContext.call', () => {
   it('replay-returns the recorded result on the next turn', async () => {
     const history: HistoryEvent[] = [{ seq: 0, kind: 'call', name: 'ingest', output: { rows: 9 } }];
     const ctx = new WorkflowContext('r1', history);
-    expect(await ctx.call(ingest, { a: 1 })).toEqual({ rows: 9 });
+    expect(await ctx.remote(ingest, { a: 1 })).toEqual({ rows: 9 });
     expect(ctx.commands).toHaveLength(0);
   });
 });
@@ -135,7 +135,7 @@ describe('WorkflowContext.call partition defaulting (Cross-SDK decision protocol
 
   it("a no-explicit-partition step inherits the workflow's partition", async () => {
     const ctx = new WorkflowContext('r1', [], { workflowPartition: 'processing' });
-    await expect(ctx.call(charge, { amount: 1 })).rejects.toBeInstanceOf(Suspend);
+    await expect(ctx.remote(charge, { amount: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
       { kind: 'call', seq: 0, name: 'charge', group: 'processing', input: { amount: 1 } },
     ]);
@@ -144,7 +144,7 @@ describe('WorkflowContext.call partition defaulting (Cross-SDK decision protocol
   it('an explicit partition on the step wins over the workflow partition', async () => {
     // `ingest` carries an explicit partition 'data' → wins over the workflow's 'processing'.
     const ctx = new WorkflowContext('r1', [], { workflowPartition: 'processing' });
-    await expect(ctx.call(ingest, { a: 1 })).rejects.toBeInstanceOf(Suspend);
+    await expect(ctx.remote(ingest, { a: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
       { kind: 'call', seq: 0, name: 'ingest', group: 'data', input: { a: 1 } },
     ]);
@@ -152,7 +152,7 @@ describe('WorkflowContext.call partition defaulting (Cross-SDK decision protocol
 
   it('falls back to no partition (empty group) when neither the step nor the workflow set one', async () => {
     const ctx = new WorkflowContext('r1', []); // no workflowPartition
-    await expect(ctx.call(charge, { amount: 1 })).rejects.toBeInstanceOf(Suspend);
+    await expect(ctx.remote(charge, { amount: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
       { kind: 'call', seq: 0, name: 'charge', group: '', input: { amount: 1 } },
     ]);
@@ -356,13 +356,13 @@ describe('WorkflowContext determinism', () => {
   it('raises NondeterminismError on a kind mismatch at a seq', async () => {
     const history: HistoryEvent[] = [{ seq: 0, kind: 'timer' }];
     const ctx = new WorkflowContext('r1', history);
-    await expect(ctx.call(ingest, { a: 1 })).rejects.toBeInstanceOf(NondeterminismError);
+    await expect(ctx.remote(ingest, { a: 1 })).rejects.toBeInstanceOf(NondeterminismError);
   });
 
   it('raises NondeterminismError on a name mismatch at a seq', async () => {
     const history: HistoryEvent[] = [{ seq: 0, kind: 'call', name: 'other', output: 1 }];
     const ctx = new WorkflowContext('r1', history);
-    await expect(ctx.call(ingest, { a: 1 })).rejects.toBeInstanceOf(NondeterminismError);
+    await expect(ctx.remote(ingest, { a: 1 })).rejects.toBeInstanceOf(NondeterminismError);
   });
 });
 

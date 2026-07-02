@@ -187,7 +187,7 @@ export interface WorkflowEngineDeps {
   transport?: Transport | undefined;
   /**
    * An ordered pool of named transports. The engine dispatches on the first and fails over to the
-   * next on a dispatch error; a step pins one via `ctx.call(step, input, { transport: id })`. Use
+   * next on a dispatch error; a step pins one via `ctx.remote(step, input, { transport: id })`. Use
    * this instead of `transport` for failover / multi-broker setups.
    */
   transports?: NamedTransport[] | undefined;
@@ -200,7 +200,7 @@ export interface WorkflowEngineDeps {
   /** Epoch-ms clock; injectable for tests. Defaults to `Date.now`. */
   clock?: (() => number) | undefined;
   /**
-   * Flow-control admission backend for `ctx.call(step, input, { queue })`. Defaults to an in-process
+   * Flow-control admission backend for `ctx.remote(step, input, { queue })`. Defaults to an in-process
    * {@link InMemoryAdmissionBackend} (per-instance caps). Inject a store/Redis-backed backend to make
    * concurrency / rate-limit / ordering GLOBAL across engine replicas.
    */
@@ -294,16 +294,6 @@ export interface WorkflowEngineDeps {
    * run `runPending` on a worker pod to pick those up; or a broker-backed one for a worker pool.
    */
   runDispatcher?: RunDispatcher | undefined;
-  /**
-   * When `true`, the engine routes an unregistered workflow to the live worker group of the SAME
-   * name: if the transport reports a live heartbeat for group `"processing"` and no local
-   * `register`/`registerRemote` exists for that name, a `start`/`resume` for it is dispatched to
-   * that group over the primary transport — no `engine.remote()` boilerplate needed. Default `false`
-   * (opt-in; existing behavior is unchanged). Requires a transport that implements
-   * `listWorkerGroups` (e.g. BullMQ); when the transport has none, or the group is not live, the
-   * existing "not registered" error is still thrown.
-   */
-  remoteByConvention?: boolean | undefined;
 }
 
 /** Thrown by {@link WorkflowEngine.resume} when the run belongs to a different namespace. */
@@ -381,8 +371,6 @@ export class WorkflowEngine {
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Set<Promise<RunResult>>();
   private draining = false;
-  /** When true, route an unregistered workflow to the live worker group of the same name. */
-  private readonly remoteByConvention: boolean;
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
@@ -420,7 +408,6 @@ export class WorkflowEngine {
     this.runDispatcher = deps.runDispatcher ?? {
       dispatch: (runId) => queueMicrotask(() => void this.runOne(runId).catch(() => {})),
     };
-    this.remoteByConvention = deps.remoteByConvention ?? false;
     this.singletons = new SingletonGate({
       store: this.store,
       clock: this.clock,
@@ -714,7 +701,7 @@ export class WorkflowEngine {
   }
 
   /**
-   * Register a flow-control queue referenced by `ctx.call(step, input, { queue })`. Caps concurrent
+   * Register a flow-control queue referenced by `ctx.remote(step, input, { queue })`. Caps concurrent
    * in-flight steps and/or the admission rate; blocked calls re-suspend and retry, so the limit is
    * durable. Per engine instance (see {@link QueueConfig}). Registering the same name replaces it.
    */
@@ -1012,10 +999,11 @@ export class WorkflowEngine {
   }
 
   /**
-   * When `remoteByConvention` is enabled, attempt to route an unregistered workflow to the live
-   * worker group of the same name: if the transport reports a live heartbeat for group
-   * `run.workflow`, synthesize a throwaway {@link RegisteredWorkflow} that dispatches to that group
-   * over the primary transport. Returns `undefined` when the flag is off or the group is not live.
+   * Attempt to route an unregistered workflow to the live worker group of the same name: if the
+   * transport reports a live heartbeat for group `run.workflow`, synthesize a throwaway
+   * {@link RegisteredWorkflow} that dispatches to that group over the primary transport. Returns
+   * `undefined` when the group is not live. Always attempted — there is no opt-in flag; an explicit
+   * `register`/`registerRemote` still takes precedence (this only runs when nothing is registered).
    *
    * Recomputed per call (never memoized into `this.workflows`) so it stays correct if group
    * liveness changes between calls, exactly as {@link synthesizeRemoteChild} does.
@@ -1023,7 +1011,6 @@ export class WorkflowEngine {
   private async resolveRemoteByConvention(
     run: WorkflowRun,
   ): Promise<RegisteredWorkflow | undefined> {
-    if (!this.remoteByConvention) return undefined;
     const liveGroups = await this.pool.listWorkerGroups();
     // Workers register/heartbeat their liveGroups under the SANITIZED token (`sanitizeQueueToken`),
     // so the membership check must sanitize too — else a `:`-named workflow's live worker is under
@@ -2301,7 +2288,7 @@ export class WorkflowEngine {
             finishedAt: at,
             // A `ctx.gather_calls([...])` fan-out stamps every dispatched `call` in the fan with the
             // same group, so the dashboard renders the remote steps as one parallel fan (parity with
-            // the gathered `recordStep`/`startChild` tags). Undefined for a lone sequential `ctx.call`.
+            // the gathered `recordStep`/`startChild` tags). Undefined for a lone sequential `ctx.remote`.
             parallelGroup: cmd.parallelGroup,
           }),
         );

@@ -11,8 +11,8 @@ import { BullMQTransport } from './bullmq-transport';
 
 /**
  * P4C.5 — the cross-package composition the whole "hosted control plane" increment (P4) exists
- * for: an OPERATOR (`namespace: undefined`, `remoteByConvention: true`) drives a TENANT's run over
- * a SHARED BullMQ prefix, routing purely by the tenant-suffixed group `tenantGroup(workflow, tenant)`
+ * for: an OPERATOR (`namespace: undefined`, convention dispatch — always on) drives a TENANT's run
+ * over a SHARED BullMQ prefix, routing purely by the tenant-suffixed group `tenantGroup(workflow, tenant)`
  * (`w@t1`) — never by a per-tenant queue prefix. Every surface here is real (a real
  * `BullMQTransport` on the operator side, a real `runRedisWorker` on the tenant side, real Redis),
  * unlike `operator-drive-mode.spec.ts` / `control-plane-drive.spec.ts` (core/nestjs), which prove
@@ -123,7 +123,6 @@ describe('operator ↔ tenant e2e (real Redis) [testcontainers]', () => {
       store,
       transport: operatorTransport,
       namespace: undefined,
-      remoteByConvention: true,
     });
 
     try {

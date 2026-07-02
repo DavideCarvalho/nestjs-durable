@@ -23,13 +23,13 @@ describe('durable remote step — retry with backoff', () => {
     const engine = new WorkflowEngine({ store, transport, clock: () => nowMs });
     const flaky = remoteStep({
       name: 'ext.flaky',
-      group: 'ext',
+      partition: 'ext',
       input: z.object({}),
       output: z.object({ ok: z.boolean() }),
       retries: 3,
       backoffMs: 100,
     });
-    engine.register('wf', '1', async (ctx) => (await ctx.call(flaky, {})).ok);
+    engine.register('wf', '1', async (ctx) => (await ctx.remote(flaky, {})).ok);
 
     await engine.start('wf', {}, 'r1');
     await flush(); // attempt 1 fails → checkpoint failed, run suspended awaiting the backoff
@@ -63,12 +63,12 @@ describe('durable remote step — retry with backoff', () => {
     const engine = new WorkflowEngine({ store, transport });
     const declined = remoteStep({
       name: 'ext.declined',
-      group: 'ext',
+      partition: 'ext',
       input: z.object({}),
       output: z.object({ ok: z.boolean() }),
       retries: 5,
     });
-    engine.register('wf', '1', async (ctx) => ctx.call(declined, {}));
+    engine.register('wf', '1', async (ctx) => ctx.remote(declined, {}));
 
     await engine.start('wf', {}, 'r1');
     await flush();
