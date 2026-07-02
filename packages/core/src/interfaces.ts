@@ -489,7 +489,7 @@ export interface RunRequest {
 export type RunRequestKind =
   | { kind: 'getRunDetail'; runId: string }
   | { kind: 'listRuns'; query: RunQuery }
-  | { kind: 'cancel'; runId: string }
+  | { kind: 'cancel'; runId: string; opts?: { compensate?: boolean } }
   | { kind: 'retry'; runId: string }
   | { kind: 'continue'; runId: string }
   | { kind: 'retryWithInput'; runId: string; input: unknown };

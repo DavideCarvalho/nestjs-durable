@@ -133,6 +133,18 @@ describe('RunRequestResponder', () => {
     expect(tx.replies[0]?.result).toMatchObject({ ok: false, error: { code: 'cross-tenant' } });
   });
 
+  it('passes cancel opts to the gateway', async () => {
+    const gw = fakeGateway();
+    const tx = fakeTransport();
+    new RunRequestResponder(tx, gw).start();
+    await tx.deliver({
+      requestId: 'q6',
+      tenant: 'acme',
+      body: { kind: 'cancel', runId: 'r1', opts: { compensate: true } },
+    });
+    expect(gw.cancel).toHaveBeenCalledWith('r1', { compensate: true });
+  });
+
   it('serialises a thrown verb error into an error reply', async () => {
     const gw = fakeGateway({
       getRunDetail: vi.fn(

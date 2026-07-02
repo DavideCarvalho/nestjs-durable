@@ -18,7 +18,7 @@ export interface RunDetail {
 export interface RunGateway {
   getRunDetail(runId: string): Promise<RunDetail | null>;
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
-  cancel(runId: string): Promise<RunResult | null>;
+  cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null>;
   retry(runId: string): Promise<RunResult | null>;
   continue(runId: string): Promise<RunResult | null>;
   retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null>;

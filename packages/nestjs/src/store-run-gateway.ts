@@ -38,8 +38,8 @@ export class StoreRunGateway implements RunGateway {
     return this.store.listRuns(query);
   }
 
-  cancel(runId: string): Promise<RunResult | null> {
-    return this.engine.cancel(runId);
+  cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
+    return this.engine.cancel(runId, opts);
   }
 
   /** Re-enqueue (dispatch model) instead of resuming inline — a worker picks the run up and replays it. */

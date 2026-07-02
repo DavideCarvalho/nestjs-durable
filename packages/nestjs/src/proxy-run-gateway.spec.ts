@@ -74,6 +74,16 @@ describe('ProxyRunGateway', () => {
     tx.emitReply({ requestId, result: { ok: true, data: { should: 'be-ignored' } } });
   });
 
+  it('cancel carries compensate opts across the wire', async () => {
+    const tx = fakeTransport();
+    const gw = new ProxyRunGateway(tx, 'acme', 5000);
+    void gw.cancel('r1', { compensate: true });
+    expect(tx.requests[0]).toMatchObject({
+      tenant: 'acme',
+      body: { kind: 'cancel', runId: 'r1', opts: { compensate: true } },
+    });
+  });
+
   it("routes only this run's tenant events to subscribe", () => {
     const tx = fakeTransport();
     const gw = new ProxyRunGateway(tx, 'acme', 5000);

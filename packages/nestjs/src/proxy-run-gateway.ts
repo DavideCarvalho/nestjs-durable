@@ -85,8 +85,10 @@ export class ProxyRunGateway implements RunGateway {
     return this.request<WorkflowRun[]>({ kind: 'listRuns', query });
   }
 
-  cancel(runId: string): Promise<RunResult | null> {
-    return this.request<RunResult | null>({ kind: 'cancel', runId });
+  cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
+    return this.request<RunResult | null>(
+      opts === undefined ? { kind: 'cancel', runId } : { kind: 'cancel', runId, opts },
+    );
   }
 
   retry(runId: string): Promise<RunResult | null> {

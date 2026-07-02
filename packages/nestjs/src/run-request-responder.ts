@@ -75,7 +75,7 @@ export class RunRequestResponder {
   ): Promise<unknown> {
     switch (body.kind) {
       case 'cancel':
-        return this.gateway.cancel(body.runId);
+        return this.gateway.cancel(body.runId, body.opts);
       case 'retry':
         return this.gateway.retry(body.runId);
       case 'continue':
