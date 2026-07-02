@@ -1,24 +1,12 @@
-import {
-  InMemoryStateStore,
-  type RemoteStepDef,
-  type WorkflowCtx,
-} from '@dudousxd/nestjs-durable-core';
+import { InMemoryStateStore, type WorkflowCtx } from '@dudousxd/nestjs-durable-core';
 import { EventEmitterTransport } from '@dudousxd/nestjs-durable-transport-event-emitter';
 import { Injectable } from '@nestjs/common';
 import { EventEmitter2, EventEmitterModule } from '@nestjs/event-emitter';
 import { Test } from '@nestjs/testing';
-import { z } from 'zod';
 import { Step } from './decorators';
 import { Workflow } from './decorators';
 import { DurableModule } from './durable.module';
 import { WorkflowService } from './workflow.service';
-
-const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
-  name: 'payments.charge-card',
-  input: z.object({ amount: z.number() }),
-  output: z.object({ chargeId: z.string() }),
-  __remote: true,
-};
 
 @Injectable()
 class PaymentsWorker {
@@ -30,8 +18,12 @@ class PaymentsWorker {
 
 @Workflow({ name: 'checkout', version: '1' })
 class CheckoutWorkflow {
+  constructor(private readonly payments: PaymentsWorker) {}
+
   async run(ctx: WorkflowCtx, order: { amount: number }) {
-    const charge = await ctx.remote(chargeCard, { amount: order.amount });
+    // Method-reference dispatch: the name routed to is the one `@Step('payments.charge-card')`
+    // stamped on `charge`, read via `stepNameOf` — not the string literal here.
+    const charge = await ctx.step(this.payments.charge, { amount: order.amount });
     return charge.chargeId;
   }
 }

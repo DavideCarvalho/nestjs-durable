@@ -32,8 +32,8 @@ class TimingInterceptor implements DurableStepInterceptor {
 
 @Workflow({ name: 'calc', version: '1' })
 class CalcWorkflow {
-  async run(ctx: { step: (n: string, f: () => Promise<unknown>) => Promise<number> }) {
-    return ctx.step('double', async () => 21 * 2);
+  async run(ctx: { sideEffect: (f: () => Promise<unknown>) => Promise<number> }) {
+    return ctx.sideEffect(async () => 21 * 2);
   }
 }
 
@@ -53,6 +53,9 @@ describe('@StepInterceptor (DI-injected step middleware)', () => {
     await svc.start('calc', {}, 'r1');
     const res = await svc.waitForRun('r1');
     expect(res.output).toBe(42);
-    expect(log).toContain('calc.double=42');
+    // The local step primitive backing `ctx.sideEffect` is always recorded under the fixed name
+    // 'sideEffect' (the redesign dropped custom local-step names — see the plan's Task 1/2); the
+    // interceptor still fires around it exactly as it did for the old inline `ctx.step('double', …)`.
+    expect(log).toContain('calc.sideEffect=42');
   });
 });

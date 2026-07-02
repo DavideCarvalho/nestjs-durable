@@ -40,7 +40,7 @@ import {
 @Workflow({ name: 'greet', version: '1' })
 class GreetWorkflow {
   async run(ctx: WorkflowCtx, name: string) {
-    return ctx.step('compose', () => `hello ${name}`);
+    return ctx.sideEffect(() => `hello ${name}`);
   }
 }
 
@@ -55,14 +55,14 @@ class Emails {
 @Workflow({ name: 'alpha', version: '1' })
 class AlphaWorkflow {
   async run(ctx: WorkflowCtx, input: unknown) {
-    return ctx.step('alpha.step', () => input);
+    return ctx.sideEffect(() => input);
   }
 }
 
 @Workflow({ name: 'beta', version: '1' })
 class BetaWorkflow {
   async run(ctx: WorkflowCtx, input: unknown) {
-    return ctx.step('beta.step', () => input);
+    return ctx.sideEffect(() => input);
   }
 }
 
@@ -151,7 +151,7 @@ describe('DurableModule co-located worker (store + connection)', () => {
     expect(runtime.workflows.handles('greet')).toBe(true);
     expect(runtime.steps.handles('emails.send')).toBe(true);
     // Bug guard: the runtime's workflow partition MUST equal this app's `partition` (NOT
-    // `WorkflowWorker`'s `'workflows'` default) — else an implicit-partition `ctx.remote` emits a
+    // `WorkflowWorker`'s `'workflows'` default) — else a dispatched `ctx.step` emits a
     // `<step>@workflows` decision token that no co-located consumer subscribes to, and the step
     // dead-ends forever.
     expect(runtime.workflows.group).toBe('tenantA');

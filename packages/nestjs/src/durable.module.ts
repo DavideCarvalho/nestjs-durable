@@ -200,7 +200,7 @@ export interface DurableModuleOptions {
   transport?: Transport;
   /**
    * An ordered pool of named transports for failover / multi-broker setups. The engine dispatches on
-   * the first and fails over to the next; a step pins one via `ctx.remote(step, input, { transport })`.
+   * the first and fails over to the next; a step pins one via `ctx.step(handler, input, { transport })`.
    * Use instead of `transport`.
    */
   transports?: NamedTransport[];
@@ -295,7 +295,7 @@ export interface DurableModuleOptions {
   webhookUrl?: (token: string) => string;
   /**
    * Flow-control queues for remote steps, registered on the engine at startup. Reference one from a
-   * workflow with `ctx.remote(step, input, { queue: name })` to cap its concurrency / admission rate.
+   * workflow with `ctx.step(handler, input, { queue: name })` to cap its concurrency / admission rate.
    * Operator only.
    */
   queues?: QueueConfig[];

@@ -35,7 +35,7 @@ let observed: { traceId?: string; tenantId?: string; userRef?: UserRef } | undef
 @Workflow({ name: 'wf', version: '1' })
 class Wf {
   async run(ctx: WorkflowCtx) {
-    return ctx.step('peek', async () => {
+    return ctx.sideEffect(async () => {
       observed = {
         traceId: Context.traceId(),
         tenantId: Context.tenantId(),

@@ -25,8 +25,12 @@ describe('StoreRunGateway', () => {
   it('retry re-enqueues a failed run (the semantic bulk-retry-by-tag relies on), and a worker completes it', async () => {
     const { engine, store, gateway } = setup();
     let attempts = 0;
-    engine.register('flaky', '1', async (ctx: WorkflowCtx) => {
-      await ctx.step('s', async () => {
+    // No `: WorkflowCtx` annotation — `register`'s callback is contextually typed as the richer,
+    // unexported `InternalWorkflowCtx` (WorkflowCtx + `localStep`), so `ctx.localStep(name, fn, opts)`
+    // (the retries/compensate-capable LOCAL step primitive, replacing the old public inline
+    // `ctx.step(name, fn, opts)`) is available here without needing to import that type by name.
+    engine.register('flaky', '1', async (ctx) => {
+      await ctx.localStep('s', async () => {
         attempts += 1;
         if (attempts <= 2) throw new Error('boom'); // first two runs fail
         return 'ok';
@@ -52,9 +56,9 @@ describe('StoreRunGateway', () => {
 
   it('lists runs and returns a run with its step timeline', async () => {
     const { engine, gateway } = setup();
-    engine.register('checkout', '1', async (ctx: WorkflowCtx) => {
-      await ctx.step('reserve', async () => 1);
-      await ctx.step('charge', async () => 2);
+    engine.register('checkout', '1', async (ctx) => {
+      await ctx.localStep('reserve', async () => 1);
+      await ctx.localStep('charge', async () => 2);
       return 'done';
     });
     await engine.start('checkout', { orderId: 'o1' }, 'r1');
@@ -77,8 +81,8 @@ describe('StoreRunGateway', () => {
   it('retries a failed run and can cancel a suspended one', async () => {
     const { engine, gateway } = setup();
     let fail = true;
-    engine.register('wf', '1', async (ctx: WorkflowCtx) =>
-      ctx.step('s', async () => {
+    engine.register('wf', '1', async (ctx) =>
+      ctx.localStep('s', async () => {
         if (fail) {
           fail = false;
           throw new Error('boom');
@@ -106,13 +110,13 @@ describe('StoreRunGateway', () => {
   it('cancel({ compensate: true }) reaches engine.cancel, undoing completed steps before settling cancelled', async () => {
     const { engine, store, gateway } = setup();
     const undone: string[] = [];
-    engine.register('saga', '1', async (ctx: WorkflowCtx) => {
-      await ctx.step('reserve', async () => 'r', {
+    engine.register('saga', '1', async (ctx) => {
+      await ctx.localStep('reserve', async () => 'r', {
         compensate: async () => {
           undone.push('reserve');
         },
       });
-      await ctx.step('pack', async () => 'p', {
+      await ctx.localStep('pack', async () => 'p', {
         compensate: async () => {
           undone.push('pack');
         },

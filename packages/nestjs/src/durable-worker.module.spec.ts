@@ -3,38 +3,34 @@ import {
   type RunRedisWorkerOptions,
   type RunningWorker,
 } from '@dudousxd/durable-worker';
-import type { RemoteStepDef, WorkflowCtx, WorkflowTask } from '@dudousxd/nestjs-durable-core';
+import type { WorkflowCtx, WorkflowTask } from '@dudousxd/nestjs-durable-core';
 import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { z } from 'zod';
 import { Step, Workflow } from './decorators';
 import { DurableStartClient } from './durable-start-client';
 import { DURABLE_WORKER_RUNNERS, RUN_REDIS_WORKER } from './durable-worker.module';
 import { DurableModule } from './durable.module';
 import { WorkflowService } from './workflow.service';
 
-const charge: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
-  name: 'payments.charge',
-  input: z.object({ amount: z.number() }),
-  output: z.object({ chargeId: z.string() }),
-  __remote: true,
-};
-
-@Workflow({ name: 'checkout', version: '1' })
-class CheckoutWorkflow {
-  async run(ctx: WorkflowCtx, order: { amount: number }) {
-    const doubled = await ctx.step('double', () => order.amount * 2);
-    const c = await ctx.remote(charge, { amount: doubled });
-    return { doubled, chargeId: c.chargeId };
-  }
-}
-
 @Injectable()
 class PaymentsWorker {
   @Step('payments.charge')
   async charge(input: { amount: number }) {
     return { chargeId: `ch_${input.amount}` };
+  }
+}
+
+@Workflow({ name: 'checkout', version: '1' })
+class CheckoutWorkflow {
+  constructor(private readonly payments: PaymentsWorker) {}
+
+  async run(ctx: WorkflowCtx, order: { amount: number }) {
+    const doubled = await ctx.sideEffect(() => order.amount * 2);
+    // Method-reference dispatch — routes to whatever name `@Step('payments.charge')` stamped on
+    // `charge`, not a hand-declared def.
+    const c = await ctx.step(this.payments.charge, { amount: doubled });
+    return { doubled, chargeId: c.chargeId };
   }
 }
 
@@ -118,7 +114,9 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
     expect(out.kind).toBe('decision');
     if (out.kind === 'decision') {
       const cmds = out.decision.commands;
-      expect(cmds[0]).toMatchObject({ kind: 'recordStep', seq: 0, name: 'double', output: 42 });
+      // The local step primitive backing `ctx.sideEffect` always records under the fixed name
+      // 'sideEffect' (custom local-step names were dropped with the old inline `ctx.step(name, fn)`).
+      expect(cmds[0]).toMatchObject({ kind: 'recordStep', seq: 0, name: 'sideEffect', output: 42 });
       expect(cmds[1]).toMatchObject({
         kind: 'call',
         seq: 1,
@@ -151,7 +149,7 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
       imports: [DurableModule.forRoot({ connection: 'redis://x' })],
-      providers: [CheckoutWorkflow],
+      providers: [CheckoutWorkflow, PaymentsWorker],
     })
       .overrideProvider(RUN_REDIS_WORKER)
       .useValue(runner.runRedisWorker)
@@ -232,7 +230,7 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
           useFactory: () => ({ connection: 'redis://y' }),
         }),
       ],
-      providers: [CheckoutWorkflow],
+      providers: [CheckoutWorkflow, PaymentsWorker],
     })
       .overrideProvider(RUN_REDIS_WORKER)
       .useValue(runner.runRedisWorker)

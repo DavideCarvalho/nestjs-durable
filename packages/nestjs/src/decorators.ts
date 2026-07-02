@@ -1,10 +1,12 @@
 import {
+  DURABLE_STEP_NAME,
   type SingletonConfig,
   type StepError,
   WORKFLOW_NAME_KEY,
   type WorkflowRef,
 } from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
+import type { z } from 'zod';
 
 export const WORKFLOW_METADATA = Symbol('nestjs-durable:workflow');
 
@@ -131,18 +133,60 @@ export function getWorkflowMeta(target: Function): WorkflowMeta | undefined {
 export const DURABLE_STEP_METADATA = Symbol('nestjs-durable:step-handler');
 
 export interface DurableStepMeta {
+  /** The resolved routing name — derived (`Class.method`) or explicit, always present. */
   name: string;
+  /** Opt-in runtime input schema, validated when the handler is served (see `scanSteps`). Absent on
+   *  a bare `@Step()` — compile-time types from the method signature only, no runtime check. */
+  input?: z.ZodType | undefined;
+  /** Opt-in runtime output schema, validated before the handler's result is handed back. */
+  output?: z.ZodType | undefined;
+}
+
+/** `@Step({ name?, input?, output? })` — the object call form. See {@link Step}. */
+export interface StepOptions {
+  /** Explicit routing name, overriding the derived `Class.method`. */
+  name?: string;
+  /** Runtime input schema, validated at the serve boundary (opt-in — a bare `@Step()` skips it). */
+  input?: z.ZodType;
+  /** Runtime output schema, validated before the result is returned (opt-in). */
+  output?: z.ZodType;
 }
 
 /**
- * Marks a provider method as the handler for a remote step `name`. An in-process transport
- * (e.g. the event-emitter transport) routes dispatched tasks to it. The method's single
- * argument is the step input; its return value is the step output.
+ * Marks a provider method as a durable step handler. An in-process transport (e.g. the
+ * event-emitter transport) or a co-located/thin worker runtime routes a dispatched task to it BY
+ * NAME — `ctx.step(this.svc.method, input)` reads that same name off the method reference (stamped
+ * via the shared, cross-package `DURABLE_STEP_NAME` symbol from `@dudousxd/nestjs-durable-core`), so
+ * there's no separately-declared def linking a call site to this handler. The method's single
+ * argument is the step input (plus an optional `StepLogger` second arg); its return value is the
+ * step output.
+ *
+ * Three call forms:
+ * - `@Step()` — bare: the routing name is DERIVED from the method as `` `${ClassName}.${method}` ``
+ *   (e.g. `ExtractionService.runExtractionPage`) — refactor-safe, no magic string.
+ * - `@Step('custom:name')` — explicit name override (stable across refactors, or a cross-runtime
+ *   contract with a non-JS worker that has no `@Step` of its own).
+ * - `@Step({ name?, input?, output? })` — optional name override plus opt-in RUNTIME zod schemas.
+ *   `input` validates before the method runs; `output` validates its return value before it's handed
+ *   back (see `scanSteps`). A bare `@Step()` carries neither and skips validation — compile-time
+ *   types from the method signature are the only check.
  */
-export function Step(name: string): MethodDecorator {
-  return (_target, _propertyKey, descriptor: PropertyDescriptor) => {
-    const meta: DurableStepMeta = { name };
+export function Step(nameOrOptions?: string | StepOptions): MethodDecorator {
+  return (target, propertyKey, descriptor: PropertyDescriptor) => {
+    const options =
+      typeof nameOrOptions === 'string' ? { name: nameOrOptions } : (nameOrOptions ?? {});
+    const derivedName = options.name ?? `${target.constructor.name}.${String(propertyKey)}`;
+    const meta: DurableStepMeta = {
+      name: derivedName,
+      input: options.input,
+      output: options.output,
+    };
     Reflect.defineMetadata(DURABLE_STEP_METADATA, meta, descriptor.value as object);
+    // Stamp the SAME resolved name core's `ctx.step` reads off a method reference (`stepNameOf`) —
+    // the cross-package contract letting `ctx.step(this.svc.method, input)` route without a
+    // separately-declared def. `DURABLE_STEP_NAME` is core's `Symbol.for`-keyed constant, so a
+    // duplicate copy of core still reads back the same key (see `step-name-symbol.ts`).
+    (descriptor.value as { [DURABLE_STEP_NAME]?: string })[DURABLE_STEP_NAME] = derivedName;
     return descriptor;
   };
 }

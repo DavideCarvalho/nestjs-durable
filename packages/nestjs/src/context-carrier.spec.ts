@@ -4,28 +4,23 @@ import {
   type StepResult,
   type Transport,
   type WorkflowCtx,
-  remoteStep,
 } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { describe, expect, it } from 'vitest';
-import { z } from 'zod';
 import type { ContextAccessor, UserRef } from './context-accessor';
 import { Workflow } from './decorators';
 import { DurableModule, type DurableModuleOptions } from './durable.module';
 import { CONTEXT_ACCESSOR } from './tokens';
 import { WorkflowService } from './workflow.service';
 
-/** A remote step the workflow dispatches — the carrier rides on its dispatched task. */
-const ping = remoteStep({
-  name: 'ext.ping',
-  input: z.object({}),
-  output: z.object({ pong: z.boolean() }),
-});
-
 @Workflow({ name: 'wf', version: '1' })
 class Wf {
   async run(ctx: WorkflowCtx) {
-    await ctx.remote(ping, {});
+    // Dispatched by name — 'ext.ping' has no local `@Step` provider in this spec; the
+    // `recordingTransport` below auto-completes any dispatched task, standing in for the external
+    // worker. The carrier this spec exercises rides on the dispatched task regardless of how the
+    // step was named (reference vs string).
+    await ctx.step('ext.ping', {});
     return 'x';
   }
 }

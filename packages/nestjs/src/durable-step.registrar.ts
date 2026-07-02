@@ -20,9 +20,10 @@ function supportsHandle(transport: unknown): transport is LocalTaskHandling {
 }
 
 /**
- * Discovers `@Step` methods and registers them as step handlers on the configured
- * transport, when that transport runs handlers in-process. With a queue/remote transport the
- * handlers live in the worker process instead, so there is nothing to wire here.
+ * Discovers `@Step` methods and registers them — under their RESOLVED name (derived `Class.method`
+ * for a bare `@Step()`, or the explicit override) — as step handlers on the configured transport,
+ * when that transport runs handlers in-process. With a queue/remote transport the handlers live in
+ * the worker process instead, so there is nothing to wire here.
  *
  * **Context re-hydration (consume side) is the consumer's responsibility.** DurableModule's
  * produce side auto-feeds an opaque carrier (`{ traceId, tenantId, userRef }`) from

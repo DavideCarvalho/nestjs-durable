@@ -11,7 +11,7 @@ import { WorkflowService } from './workflow.service';
 @Workflow({ name: 'greet', version: '1' })
 class GreetWorkflow {
   async run(ctx: WorkflowCtx, input: { name: string }) {
-    return ctx.step('hello', async () => `hello ${input.name}`);
+    return ctx.sideEffect(async () => `hello ${input.name}`);
   }
 }
 

@@ -11,7 +11,7 @@ import { DurableModule } from './durable.module';
 class SleeperWorkflow {
   async run(ctx: WorkflowCtx) {
     await ctx.sleep('1h');
-    return ctx.step('after', async () => 'awake');
+    return ctx.sideEffect(async () => 'awake');
   }
 }
 

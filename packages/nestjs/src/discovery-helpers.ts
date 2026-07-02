@@ -41,12 +41,20 @@ export function scanWorkflows(
  *   - non-function methods are skipped
  *   - methods without `@Step` metadata are skipped
  *
- * The handler passed to `register` is already bound to its instance.
+ * The handler passed to `register` is already bound to its instance, and is the ONE place a `@Step`
+ * method actually runs with real input/output in this package — every registrar
+ * (`DurableStepRegistrar`, `InAppWorkerBootstrap`, `ThinStepRegistrar`) funnels through here — so
+ * this is where `@Step`'s optional `input`/`output` zod schemas are enforced: `input` validates
+ * before the method runs, `output` validates its return value before it's handed back. A bare
+ * `@Step()` (no schemas attached) skips both checks — `meta.input`/`meta.output` are `undefined`.
  */
 export function scanSteps(
   discovery: DiscoveryService,
   scanner: MetadataScanner,
-  register: (meta: DurableStepMeta, handler: (input: unknown, log: StepLogger) => unknown) => void,
+  register: (
+    meta: DurableStepMeta,
+    handler: (input: unknown, log: StepLogger) => Promise<unknown>,
+  ) => void,
 ): void {
   for (const wrapper of discovery.getProviders()) {
     const { instance } = wrapper;
@@ -57,8 +65,12 @@ export function scanSteps(
       if (typeof method !== 'function') continue;
       const meta = getDurableStepMeta(method);
       if (!meta) continue;
-      const handler = (input: unknown, log: StepLogger) =>
-        (method as (input: unknown, log: StepLogger) => unknown).call(instance, input, log);
+      const boundMethod = method as (input: unknown, log: StepLogger) => unknown;
+      const handler = async (input: unknown, log: StepLogger): Promise<unknown> => {
+        const validInput = meta.input ? meta.input.parse(input) : input;
+        const output = await boundMethod.call(instance, validInput, log);
+        return meta.output ? meta.output.parse(output) : output;
+      };
       register(meta, handler);
     }
   }
