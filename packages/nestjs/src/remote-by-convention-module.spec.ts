@@ -27,12 +27,14 @@ class ConventionTransport implements Transport {
   readonly dispatchedGroups: string[] = [];
   private decisionHandler?: (decision: WorkflowDecision) => Promise<void>;
 
+  constructor(private readonly liveGroups: string[] = ['processing']) {}
+
   async dispatch(): Promise<void> {}
   onResult(_handler: (result: StepResult) => Promise<void>): void {}
   onHeartbeat(_handler: (beat: Heartbeat) => Promise<void>): void {}
 
   async listWorkerGroups(): Promise<string[]> {
-    return ['processing'];
+    return this.liveGroups;
   }
 
   async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
@@ -69,6 +71,27 @@ describe('DurableModule — remoteByConvention option', () => {
 
     expect(run?.status).toBe('completed');
     expect(transport.dispatchedGroups).toEqual(['processing']);
+
+    await moduleRef.close();
+  });
+
+  it('recognizes a `:`-named workflow via its SANITIZED live group (membership check must sanitize)', async () => {
+    // Bug guard: workers register/heartbeat their live group under the sanitized token, so the
+    // convention membership check must sanitize `run.workflow` too — else `orders:fulfill` computes
+    // `orders:fulfill`, misses the live `orders-fulfill`, and the run is never seen as remotely served.
+    const store = new InMemoryStateStore();
+    const transport = new ConventionTransport(['orders-fulfill']);
+    const moduleRef = await Test.createTestingModule({
+      imports: [DurableModule.forRoot({ store, transport, remoteByConvention: true })],
+    }).compile();
+    await moduleRef.init();
+
+    const engine = moduleRef.get(WorkflowEngine, { strict: false });
+    await engine.start('orders:fulfill', { hello: 'world' }, 'conv-mod-colon');
+    const run = await settle(store, 'conv-mod-colon');
+
+    expect(run?.status).toBe('completed');
+    expect(transport.dispatchedGroups).toEqual(['orders-fulfill']);
 
     await moduleRef.close();
   });

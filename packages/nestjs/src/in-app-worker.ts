@@ -182,7 +182,19 @@ export function inAppWorkerProviders(): Provider[] {
         options.inAppWorker ?? null,
       inject: [DURABLE_OPTIONS_CANONICAL],
     },
-    { provide: IN_APP_WORKER_RUNTIME, useFactory: () => new DurableWorkerRuntime() },
+    {
+      provide: IN_APP_WORKER_RUNTIME,
+      // The runtime's `WorkflowWorker` uses its `group` ctor param as the WORKFLOW's
+      // `workflowPartition` for any `ctx.remote` call that omits an explicit `partition` (see
+      // `workflow-context.ts`'s `resolveCallGroup`) — that fallback MUST equal this app's own
+      // {@link DurableInAppWorkerOptions.partition}, or an implicit-partition remote step's decision
+      // carries a mismatched token and the engine dispatches it to a queue nothing here subscribes
+      // to. Explicit `''` (never `undefined`) so it does NOT fall through to `WorkflowWorker`'s
+      // unrelated `'workflows'` default parameter.
+      useFactory: (options: DurableInAppWorkerOptions | null) =>
+        new DurableWorkerRuntime({ workflowGroup: options?.partition ?? '' }),
+      inject: [IN_APP_WORKER_OPTIONS],
+    },
     { provide: IN_APP_RUN_REDIS_WORKER, useValue: defaultRunRedisWorker },
     { provide: IN_APP_WORKER_RUNNERS, useValue: [] as RunningWorker[] },
     InAppWorkerBootstrap,

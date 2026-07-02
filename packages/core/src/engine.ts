@@ -1025,7 +1025,10 @@ export class WorkflowEngine {
   ): Promise<RegisteredWorkflow | undefined> {
     if (!this.remoteByConvention) return undefined;
     const liveGroups = await this.pool.listWorkerGroups();
-    const group = tenantGroup(run.workflow, run.namespace);
+    // Workers register/heartbeat their liveGroups under the SANITIZED token (`sanitizeQueueToken`),
+    // so the membership check must sanitize too — else a `:`-named workflow's live worker is under
+    // `orders-fulfill` while this computes `orders:fulfill` and never matches.
+    const group = tenantGroup(sanitizeQueueToken(run.workflow), run.namespace);
     if (!liveGroups.includes(group)) return undefined;
     // Feed the workflow NAME + namespace-as-partition through, rather than the pre-combined
     // `group` string above — the executor computes the identical token itself (name+partition is

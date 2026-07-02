@@ -152,6 +152,11 @@ describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
     const runtime = moduleRef.get<DurableWorkerRuntime>(IN_APP_WORKER_RUNTIME);
     expect(runtime.workflows.handles('greet')).toBe(true);
     expect(runtime.steps.handles('emails.send')).toBe(true);
+    // Bug guard: the runtime's workflow partition MUST equal this app's `partition` (NOT
+    // `WorkflowWorker`'s `'workflows'` default) — else an implicit-partition `ctx.remote` emits a
+    // `<step>@workflows` decision token that no co-located consumer subscribes to, and the step
+    // dead-ends forever.
+    expect(runtime.workflows.group).toBe('tenantA');
     expect(runner.calls).toEqual([
       { connection: 'redis://x', prefix: 'durable', instanceId: 'w1', partition: 'tenantA' },
     ]);
