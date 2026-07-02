@@ -1,6 +1,6 @@
 ---
 title: Workflows & steps
-description: Declaring workflows with @Workflow, local steps with ctx.step, typed remote steps with remoteStep + ctx.call and @DurableStep handlers, retries, fan-out and fatal errors.
+description: Declaring workflows with @Workflow, local steps with ctx.step, typed remote steps with remoteStep + ctx.remote and @DurableStep handlers, retries, fan-out and fatal errors.
 ---
 
 ## Workflows
@@ -46,7 +46,7 @@ checkpoint writes, at the cost of reload-survivable in-flight visibility.
 
 ## Remote steps
 
-Declare a typed remote step with `remoteStep`, then call it with `ctx.call` — the engine
+Declare a typed remote step with `remoteStep`, then call it with `ctx.remote` — the engine
 dispatches it over the [transport](/docs/transports) and checkpoints the result. The handler can
 live in another process or another language.
 
@@ -59,7 +59,7 @@ export const chargeCard = remoteStep({
 });
 
 // in the workflow:
-const charge = await ctx.call(chargeCard, { orderId: order.id, amountCents: order.total });
+const charge = await ctx.remote(chargeCard, { orderId: order.id, amountCents: order.total });
 ```
 
 A `@DurableStep` provider method handles it in-process (with an in-process transport):
@@ -105,7 +105,7 @@ await ctx.step('charge', async () => {
 
 These look similar in the dashboard but are fundamentally different — the distinction is **durability**:
 
-- A **step** (`ctx.step` / `ctx.call`) is a **durable checkpoint**. The engine records its result, so
+- A **step** (`ctx.step` / `ctx.remote`) is a **durable checkpoint**. The engine records its result, so
   on a crash, retry, or replay it is **not re-executed** — the saved result is replayed. It's a
   first-class node in the run graph and the **unit of recovery**. Use a step for any unit that should
   survive a crash or not be redone.

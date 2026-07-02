@@ -1,11 +1,11 @@
 ---
 title: Python steps
-description: Run workflow steps in Python. A TypeScript workflow's ctx.call dispatches to a Python worker over BullMQ/Redis, and the result flows back — one workflow, steps split across languages.
+description: Run workflow steps in Python. A TypeScript workflow's ctx.remote dispatches to a Python worker over BullMQ/Redis, and the result flows back — one workflow, steps split across languages.
 ---
 
 A step doesn't have to run in Node. The `durable-worker` Python SDK registers step handlers by
 name and runs them over the same Redis queues the [BullMQ transport](/docs/transports/bullmq) uses
-— so a TypeScript workflow can `ctx.call` a step implemented in Python.
+— so a TypeScript workflow can `ctx.remote` a step implemented in Python.
 
 ```bash
 pip install "durable-worker[redis]"
@@ -18,7 +18,7 @@ import asyncio
 from durable_worker import Worker, FatalError
 from durable_worker.redis_runner import run_redis_worker
 
-worker = Worker(group="payments")
+worker = Worker()
 
 @worker.step("payments.charge-card")
 async def charge(data):
@@ -28,7 +28,6 @@ async def charge(data):
 async def main():
     await run_redis_worker(
         worker,
-        group="payments",
         connection="redis://localhost:6379",
     )
     await asyncio.Event().wait()
@@ -45,27 +44,33 @@ exception is retryable and the engine applies the step's retry policy.
 There is **no direct connection** between a Python worker and your NestJS app — they never open a
 socket to each other, and the worker never talks to the dashboard or the database. Everything goes
 through the **broker** (Redis). The engine and the workers are decoupled producers and consumers on
-two shared queues:
+per-step-name queues:
 
 ```
-  NestJS engine                     Redis (the broker)                  Python worker
-  ─────────────                     ──────────────────                  ─────────────
-  ctx.call(step) ───dispatch───▶  durable-tasks-<group>  ───consume──▶  @worker.step(name)
-  resume ctx.call ◀──consume────  durable-results        ◀───add──────  return / raise
+  NestJS engine                              Redis (the broker)                    Python worker
+  ─────────────                              ──────────────────                    ─────────────
+  ctx.remote(step) ───dispatch───▶  durable-tasks-<name>[@<partition>]  ───consume──▶  @worker.step(name)
+  resume ctx.remote ◀──consume────  durable-results                     ◀───add──────  return / raise
 ```
 
 So "connecting to the control plane" just means pointing the worker at the **same broker** the
-engine's [`BullMQTransport`](/docs/transports/bullmq) uses. Three things have to line up:
+engine's [`BullMQTransport`](/docs/transports/bullmq) uses, and registering a handler under the exact
+same step **name**. Two things have to line up:
 
 | Must match | Engine side (`BullMQTransport`) | Worker side (`run_redis_worker`) | Why |
 | --- | --- | --- | --- |
 | **connection** | `connection: { host, port, … }` | `connection="redis://host:port"` | Same Redis instance — that's the meeting point. |
-| **prefix** | `prefix` (default `durable`) | `prefix` (default `durable`) | Namespaces the queue keys: `<prefix>-tasks-<group>` and `<prefix>-results`. |
-| **group** | the step's `group` | `group="payments"` | The worker only consumes the tasks queue for its own group. |
+| **prefix** | `prefix` (default `durable`) | `prefix` (default `durable`) | Namespaces the queue keys: `<prefix>-tasks-<name>` and `<prefix>-results`. |
 
-Match those and a `ctx.call(chargeStep, …)` where `chargeStep.group === "payments"` is delivered to
-this worker. Nothing else to register — there's no handshake or service discovery; the queue name
-*is* the routing.
+Each registered step **name** gets its own queue — there's no separate group to declare or match.
+Sharing one broker across multiple isolated deployments (e.g. a dev cluster and a developer's
+laptop)? Set the same `partition` on both sides — `remoteStep({ ..., partition })` engine-side,
+`Worker(partition=...)` (or `run_redis_worker(worker, partition=...)`) worker-side — and every queue
+name is suffixed `<name>@<partition>` so the two deployments never cross-consume.
+
+Match those and a `ctx.remote(chargeStep, …)` is delivered to whichever worker registered
+`chargeStep.name`. Nothing else to register — there's no handshake or service discovery; the queue
+name *is* the routing.
 
 A few properties that follow from this being queue-based:
 
@@ -73,10 +78,10 @@ A few properties that follow from this being queue-based:
   should be **idempotent** — key external side effects on `stepId` (or your own dedupe key). The
   engine already dedupes a step that *completed*, but a handler can be re-run before its result is
   recorded.
-- **Workers are stateless and horizontal.** Run as many copies as you want for a group; Redis hands
-  each task to one of them. Scale a slow step by adding workers, not by touching the workflow.
+- **Workers are stateless and horizontal.** Run as many copies as you want for a given step; Redis
+  hands each task to one of them. Scale a slow step by adding workers, not by touching the workflow.
 - **The engine owns correlation.** Every result carries the `stepId` it answers; the engine matches
-  it to the suspended `ctx.call` and resumes the run. The worker never needs the run's state.
+  it to the suspended `ctx.remote` and resumes the run. The worker never needs the run's state.
 
 ### Authentication
 
@@ -85,7 +90,6 @@ The `connection` is a standard Redis URL, so credentials and TLS go in the URL:
 ```python
 await run_redis_worker(
     worker,
-    group="payments",
     connection="rediss://default:my-password@my-redis.example.com:6379",
 )
 ```
@@ -98,7 +102,7 @@ Use `redis://` for plaintext and `rediss://` for TLS. This is the same Redis the
 | Option | Default | Description |
 | --- | --- | --- |
 | `worker` | — | The `Worker` whose handlers run. |
-| `group` | — | The worker group — selects the `<prefix>-tasks-<group>` queue to consume. |
+| `partition` | `None` | Optional isolation suffix — appends `@<partition>` to every one of this worker's per-name queues. |
 | `connection` | `redis://localhost:6379` | Redis URL (the broker the engine also uses). |
 | `prefix` | `durable` | Queue-key namespace; must match the engine's `BullMQTransport` prefix. |
 
@@ -106,8 +110,8 @@ Use `redis://` for plaintext and `rediss://` for TLS. This is the same Redis the
 
 The Redis worker above is one of three ways to reach the broker — pick the one matching the engine's
 [transport](/docs/transports). All of them run the *same* handlers (`@worker.step(...)`); only the
-runner that feeds them changes. The connection model is identical: match the engine's **group** and
-queue/table namespace, and you're wired in.
+runner that feeds them changes. SQS and the SQL transport still route by a single declared `group`
+(below); the connection model otherwise matches the engine's **prefix** and queue/table namespace.
 
 ### AWS SQS
 
@@ -201,7 +205,7 @@ Opt in by declaring the second `ctx` parameter on your handler (same context tha
 ```python
 from durable_worker import Worker, Cancelled
 
-worker = Worker(group="pipeline")
+worker = Worker()
 
 @worker.step("pipeline.transcode")
 def transcode(data, ctx):
@@ -242,7 +246,6 @@ cancellation = CancellationRegistry()
 
 await run_redis_worker(
     worker,
-    group="pipeline",
     connection="redis://localhost:6379",
     cancellation=cancellation,
 )

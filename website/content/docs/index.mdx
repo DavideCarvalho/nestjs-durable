@@ -109,7 +109,7 @@ Need the outcome inline instead? `await this.workflows.waitForRun(runId)` resolv
 
 ## Steps across apps and languages
 
-A step does not have to run in NestJS. Declare a **remote step** with a typed, validated contract and call it with `ctx.call` — the engine dispatches it over a pluggable transport to wherever its handler lives:
+A step does not have to run in NestJS. Declare a **remote step** with a typed, validated contract and call it with `ctx.remote` — the engine dispatches it over a pluggable transport to wherever its handler lives:
 
 ```ts title="checkout.steps.ts"
 import { remoteStep } from '@dudousxd/nestjs-durable-core';
@@ -139,7 +139,7 @@ The split goes both ways: a remote worker can implement a step the NestJS workfl
 <Cards>
   <Card title="Getting Started" href="/docs/getting-started" description="Install, write a workflow, register the module, and start your first run — step by step." />
   <Card title="Concepts" href="/docs/concepts" description="Durability, deterministic replay, and the mental model behind the engine." />
-  <Card title="Authoring" href="/docs/authoring" description="Workflows, steps, ctx.step / ctx.call, sleep, and signals in depth." />
+  <Card title="Authoring" href="/docs/authoring" description="Workflows, steps, ctx.step / ctx.remote, sleep, and signals in depth." />
   <Card title="Reliability" href="/docs/reliability" description="Retries, fatal errors, recovery, and exactly-once execution." />
   <Card title="Transports" href="/docs/transports" description="The event-emitter default and BullMQ for cross-process or Python steps." />
   <Card title="State stores" href="/docs/stores" description="Persist runs to Postgres, MySQL, or SQLite with your ORM of choice." />

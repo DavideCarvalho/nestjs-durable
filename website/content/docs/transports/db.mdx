@@ -4,7 +4,7 @@ description: A broker-less, DBOS-style transport — remote steps are rows in th
 ---
 
 The SQL transport needs **no broker**. A remote step is a **row** in the same database your durable
-store already uses: `ctx.call` inserts a task row, a worker claims it with
+store already uses: `ctx.remote` inserts a task row, a worker claims it with
 `SELECT … FOR UPDATE SKIP LOCKED`, runs the handler, writes a result row, and the engine polls that
 row to resume the run. The database you already operate *is* the queue.
 
@@ -17,9 +17,12 @@ new DbTransport({ executor: mikroOrmExecutor(em) });           // rides your app
 ```
 
 ```ts title="worker side"
-const transport = new DbTransport({ executor: typeOrmExecutor(ds), group: 'pipeline' });
+const transport = new DbTransport({ executor: typeOrmExecutor(ds), group: 'pipeline.extract' });
 transport.handle('pipeline.extract', async (input) => extract(input));
 ```
+
+`group` is the queue token this instance polls — set it to the exact (optionally
+`@<partition>`-suffixed) step name it serves; each `DbTransport` instance polls one queue.
 
 Trade-off vs a real broker: throughput is bounded by polling + row contention — great for
 workflow/pipeline scale (modest rate, long steps), not for high-fanout firehoses. Requires
@@ -85,7 +88,7 @@ A worker claims a batch atomically, runs each task outside the lock, then record
 3. **Record** — insert the result row (idempotent: `ON CONFLICT DO NOTHING` / `INSERT IGNORE`) and
    `DELETE` the task row.
 
-The engine side mirrors it on the results table: claim → deliver to the suspended `ctx.call` →
+The engine side mirrors it on the results table: claim → deliver to the suspended `ctx.remote` →
 `DELETE`. Delivery is at-least-once (a crash between insert-result and delete-task can re-run a
 handler), so **handlers should be idempotent**, keyed on `step_id`.
 

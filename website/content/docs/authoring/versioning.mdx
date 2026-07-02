@@ -94,11 +94,11 @@ export class CheckoutWorkflow {
 
     if (await ctx.patched('add-fraud-check')) {
       // New behaviour: runs that started AFTER this code shipped take this branch.
-      const risk = await ctx.call(scoreFraud, { orderId: order.id });
+      const risk = await ctx.remote(scoreFraud, { orderId: order.id });
       if (risk.score > 0.9) throw new FatalError('high fraud risk', 'fraud');
     }
 
-    await ctx.call(chargeCard, { orderId: order.id, amountCents: quote.total });
+    await ctx.remote(chargeCard, { orderId: order.id, amountCents: quote.total });
   }
 }
 ```

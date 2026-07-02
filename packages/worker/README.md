@@ -4,7 +4,7 @@ A **control-plane-less** durable worker for Node — the Node analog of the Pyth
 
 ## Why
 
-A `@dudousxd/nestjs-durable` `DurableModule` with `worker: true` is a **full engine instance** (store + recovery + in-process execution). Running several of those means several control planes contending on one store. This package is the missing **thin** worker: the single engine stays the sole owner of all durable state, and N thin workers — Python *and* Node — just execute and report back.
+A `@dudousxd/nestjs-durable` `DurableModule` with `store` set is a **full engine instance** (store + recovery + in-process execution). Running several of those means several control planes contending on one store. This package is the missing **thin** worker: the single engine stays the sole owner of all durable state, and N thin workers — Python *and* Node — just execute and report back.
 
 ```
    ┌─ Control plane (1) ─┐     BullMQ/Redis      thin workers (N)
@@ -16,13 +16,13 @@ A `@dudousxd/nestjs-durable` `DurableModule` with `worker: true` is a **full eng
 ## Use it from NestJS (recommended)
 
 ```ts
-import { DurableWorkerModule } from '@dudousxd/nestjs-durable';
+import { DurableModule } from '@dudousxd/nestjs-durable';
 
 @Module({
   imports: [
-    DurableWorkerModule.forRoot({
+    DurableModule.forRoot({
       connection: process.env.REDIS_URL!,
-      groups: ['processing'], // the worker groups this process serves
+      partition: 'processing', // optional isolation suffix for this worker's queues
     }),
   ],
   providers: [MyWorkflow, MyStepHandlers],
@@ -30,7 +30,7 @@ import { DurableWorkerModule } from '@dudousxd/nestjs-durable';
 export class WorkerAppModule {}
 ```
 
-`DurableWorkerModule` discovers your `@Workflow` classes and `@DurableStep` methods and runs them on the thin worker — **no `WorkflowEngine` or store is bound**. The same `@Workflow` you run in-process on the engine runs unchanged here (its body is typed against `WorkflowCtx`, which this package's `WorkflowContext` implements).
+`DurableModule` discovers your `@Workflow` classes and `@Step` methods and runs them on the thin worker — **no `WorkflowEngine` or store is bound** (the role is inferred: `connection` with no `store` is a thin worker). The same `@Workflow` you run in-process on the engine runs unchanged here (its body is typed against `WorkflowCtx`, which this package's `WorkflowContext` implements).
 
 ## Use it standalone (plain Node)
 
@@ -44,11 +44,11 @@ runtime.registerStep('ingest', async (input, log) => {
 });
 runtime.registerWorkflow('pipeline', async (ctx, input) => {
   const key = await ctx.step('setup', async () => `/${input}/data.csv`);
-  const rows = await ctx.call(ingestStep, { key });
+  const rows = await ctx.remote(ingestStep, { key });
   return { rows };
 });
 
-const worker = await runRedisWorker({ runtime, group: 'pipeline', connection: process.env.REDIS_URL! });
+const worker = await runRedisWorker({ runtime, connection: process.env.REDIS_URL! });
 // ... on shutdown:
 await worker.close();
 ```

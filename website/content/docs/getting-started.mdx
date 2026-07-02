@@ -41,7 +41,7 @@ yarn add @dudousxd/nestjs-durable @dudousxd/nestjs-durable-core @dudousxd/nestjs
 
 ## 2. Define a remote step (optional)
 
-A step can run locally (`ctx.step`) or on a worker (`ctx.call`). Declare remote steps with a
+A step can run locally (`ctx.step`) or on a worker (`ctx.remote`). Declare remote steps with a
 typed contract:
 
 ```ts title="checkout.steps.ts"
@@ -67,7 +67,7 @@ import { chargeCard } from './checkout.steps';
 export class CheckoutWorkflow {
   async run(ctx: WorkflowCtx, order: { id: string; total: number }) {
     await ctx.step('reserveStock', async () => ({ reserved: true }));
-    const charge = await ctx.call(chargeCard, { orderId: order.id, amountCents: order.total });
+    const charge = await ctx.remote(chargeCard, { orderId: order.id, amountCents: order.total });
     const approval = await ctx.waitForSignal<{ approved: boolean }>(`approve:${order.id}`);
     if (!approval.approved) return { status: 'rejected', chargeId: charge.chargeId };
     await ctx.step('ship', async () => ({ shipped: true }));

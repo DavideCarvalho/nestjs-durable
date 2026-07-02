@@ -35,31 +35,31 @@ route so the path isn't prefixed twice — or fold it in by setting `basePath` t
 
 ### Serving it from an API pod (without processing there)
 
-When you split your app into **API** and **worker** pods, you usually want the dashboard served from
-the API (it handles HTTP) while only the workers process runs. Set `worker: false` on the API
+When you split your app into **API** and **driving** pods, you usually want the dashboard served from
+the API (it handles HTTP) while only the driving pods process runs. Set `drive: false` on the API
 instance's `DurableModule`:
 
 ```ts
 DurableModule.forRoot({
   store,
   transport,
-  worker: process.env.APP_TYPE !== 'API', // workers process; the API only serves the dashboard
+  drive: process.env.APP_TYPE === 'API' ? false : true, // driving pods process; the API only serves the dashboard
 });
 ```
 
-With `worker: false` the engine is still fully available — the dashboard can **dispatch retries and
-cancels**, and reads work — but the instance does **not** play the worker role: it won't register
-`@DurableStep` handlers (so it never consumes the task queue), won't recover incomplete runs on boot,
-and won't poll due timers. Leave that to the worker pods. So a **retry clicked in the UI on an API
-pod still works**: the API dispatches the step, a worker picks it up and runs it. Only the processing
-is gated, not the control plane. (Default is `worker: true`, so single-process apps need nothing.)
+With `drive: false` the engine is still fully available — the dashboard can **dispatch retries and
+cancels**, and reads work — but the instance does **not** drive: it won't register `@DurableStep`
+handlers (so it never consumes the task queue), won't recover incomplete runs on boot, and won't poll
+due timers. Leave that to the driving pods. So a **retry clicked in the UI on an API pod still
+works**: the API dispatches the step, a driving pod picks it up and runs it. Only the processing is
+gated, not the control plane. (Default is `drive: true`, so single-process apps need nothing.)
 
 ## What it shows
 
 - **Runs** — every run with its status (**pending** / running / suspended / completed / failed /
   cancelled / **dead**), filterable. **`pending`** is a run that's been created and enqueued but not
   yet picked up by a worker — you'll see it briefly on every run, and persistently on an API pod
-  (`worker: false`) whose runs execute on separate worker pods. The status filter is a row of chips,
+  (`drive: false`) whose runs execute on separate driving pods. The status filter is a row of chips,
   including a **`dead`** chip for the
   [dead-letter](/docs/concepts/durability) state; a dead run carries a distinct badge so a poison
   pill is easy to spot.

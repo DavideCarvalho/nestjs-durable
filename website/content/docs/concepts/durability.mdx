@@ -57,20 +57,20 @@ start('checkout', order)        → run created, status: 'pending', returns { ru
   const result = await engine.waitForRun(runId); // resolves when the run settles
   ```
 
-### Execution & workers: API pods enqueue, worker pods run
+### Execution & workers: API pods enqueue, driving pods run
 
-For scale you can split an app into **API** pods (handle HTTP, the dashboard) and **worker** pods
+For scale you can split an app into **API** pods (handle HTTP, the dashboard) and **driving** pods
 (execute workflows) sharing only the database:
 
-- An instance with **`worker: false`** (e.g. an API or dashboard pod) gets a **no-op dispatcher**: its
-  `start` only **enqueues**, leaving the run `pending` for a worker to pick up. It offloads workflow
-  execution to the worker pods over the database alone.
-- **Worker instances poll `engine.runPending()`** each tick (the NestJS `TimerPoller` does this
-  automatically) to lease and run pending runs. The worker-side primitives are `engine.runOne(runId)`
+- An instance with **`drive: false`** (e.g. an API or dashboard pod) gets a **no-op dispatcher**: its
+  `start` only **enqueues**, leaving the run `pending` for a driving instance to pick up. It offloads
+  workflow execution to the driving pods over the database alone.
+- **Driving instances poll `engine.runPending()`** each tick (the NestJS `TimerPoller` does this
+  automatically) to lease and run pending runs. The driving-side primitives are `engine.runOne(runId)`
   (lease + resume one run) and `engine.runPending()` (lease + run all pending runs); a broker-backed
-  dispatcher can enqueue run ids for a worker pool that calls `runOne`.
+  dispatcher can enqueue run ids for a driving pool that calls `runOne`.
 
-The default (no explicit worker config) is `worker: true` and the in-process dispatcher — so single-
+The default (no explicit `drive` option) is `drive: true` and the in-process dispatcher — so single-
 process apps need none of this. Runs simply execute on the same instance, just asynchronously.
 
 ## The one rule: workflows are deterministic

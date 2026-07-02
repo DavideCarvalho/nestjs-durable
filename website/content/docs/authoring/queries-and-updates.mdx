@@ -37,7 +37,7 @@ export class VideoEncodeWorkflow {
     const segments = await ctx.step('probe', () => this.encoder.probe(job.src));
 
     for (let i = 0; i < segments.length; i++) {
-      await ctx.call(encodeSegment, { jobId: job.id, segment: segments[i] });
+      await ctx.remote(encodeSegment, { jobId: job.id, segment: segments[i] });
       // Publish progress after each segment — readers see the latest snapshot.
       await ctx.setEvent('progress', {
         phase: 'encoding',

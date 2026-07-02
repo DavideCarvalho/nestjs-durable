@@ -3,8 +3,8 @@ name: durable-workflows
 description: >
   Author durable workflows with @dudousxd/nestjs-durable — @Workflow({ name, version }) classes with a
   run(ctx, input) body, local ctx.step(name, fn, opts) checkpoints, typed remote steps via remoteStep
-  + ctx.call handled by @DurableStep('name'), step retries/backoff, FatalError to stop retrying,
-  Promise.all fan-out, saga compensate undo callbacks, and run tags. Covers step vs ctx.call vs
+  + ctx.remote handled by @DurableStep('name'), step retries/backoff, FatalError to stop retrying,
+  Promise.all fan-out, saga compensate undo callbacks, and run tags. Covers step vs ctx.remote vs
   sub-process log.sub annotations and constructor dependency injection inside a workflow class.
 license: MIT
 metadata:
@@ -18,7 +18,7 @@ metadata:
 
 A workflow is a provider decorated with `@Workflow`; its `run(ctx, input)` method is the
 deterministic body the engine executes and replays. Work happens in **steps** — local
-(`ctx.step`) or remote (`ctx.call`) — each a durable checkpoint.
+(`ctx.step`) or remote (`ctx.remote`) — each a durable checkpoint.
 
 ## Setup
 
@@ -46,7 +46,7 @@ export class CheckoutWorkflow {
     // Local step: runs in-process, checkpointed, retried up to `retries`.
     await ctx.step('reserveStock', () => this.inventory.reserve(order.id), { retries: 3 });
     // Remote step: dispatched over the transport, may run in another process/language.
-    const charge = await ctx.call(chargeCard, { orderId: order.id, amountCents: order.total });
+    const charge = await ctx.remote(chargeCard, { orderId: order.id, amountCents: order.total });
     return { chargeId: charge.chargeId };
   }
 }
@@ -69,7 +69,7 @@ Register all three as providers (see the durable-setup skill).
 
 - `ctx.step(name, fn, opts?)` runs `fn` **here** and checkpoints its return value. Use for local IO
   (DB writes, calling a service the app owns).
-- `ctx.call(remoteStep, input, opts?)` dispatches over the transport to a handler registered under
+- `ctx.remote(remoteStep, input, opts?)` dispatches over the transport to a handler registered under
   the same `name` (a `@DurableStep` method, another process, or a Python worker). Inputs/outputs are
   validated against the `remoteStep` zod schemas at the boundary.
 
@@ -114,7 +114,7 @@ await ctx.step('reserve', () => this.inventory.reserve(id), {
 
 ### Steps vs sub-process events
 
-A `ctx.step` / `ctx.call` is a durable, independently-replayed checkpoint. For pure visibility
+A `ctx.step` / `ctx.remote` is a durable, independently-replayed checkpoint. For pure visibility
 *inside* one step, emit sub-process events on the step logger — they are annotations, not
 checkpoints, and re-run if the step retries:
 
@@ -145,13 +145,13 @@ async run(ctx, order) {
 }
 ```
 
-Only `ctx.step`/`ctx.call`/`ctx.transaction` results are checkpointed; raw work in the body re-runs
+Only `ctx.step`/`ctx.remote`/`ctx.transaction` results are checkpointed; raw work in the body re-runs
 on replay. Source: website/content/docs/concepts/durability.mdx.
 
 ### 2. Mismatching the remoteStep `name` and the @DurableStep handler
 
 ```ts
-// ✗ Wrong — handler name ≠ the remoteStep name, so ctx.call(chargeCard) finds no handler
+// ✗ Wrong — handler name ≠ the remoteStep name, so ctx.remote(chargeCard) finds no handler
 export const chargeCard = remoteStep({ name: 'payments.charge-card', /* ... */ });
 @DurableStep('payments.charge')                 // typo / mismatch
 async charge(input) { /* ... */ }
@@ -161,7 +161,7 @@ async charge(input) { /* ... */ }
 async charge(input) { /* ... */ }
 ```
 
-The `name` string is the routing contract between `remoteStep`/`ctx.call` and the handler.
+The `name` string is the routing contract between `remoteStep`/`ctx.remote` and the handler.
 Source: packages/core/src/remote-step-factory.ts, packages/nestjs/src/decorators.ts (`DurableStep`).
 
 ### 3. Throwing a plain Error when you meant to stop retrying

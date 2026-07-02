@@ -3,7 +3,7 @@ title: Overview
 description: How remote steps travel to workers. From an in-process event-emitter for zero-infra single-process handlers, to BullMQ/Redis, SQS, and a broker-less SQL transport for cross-process and cross-language steps.
 ---
 
-A **transport** is how `ctx.call` reaches a step handler and how the result comes back. It's a
+A **transport** is how `ctx.remote` reaches a step handler and how the result comes back. It's a
 pluggable interface (`dispatch`, `onResult`, `onHeartbeat`), independent of the
 [state store](/docs/stores) — mix any transport with any store.
 
@@ -117,7 +117,7 @@ tried first, then the rest as failover):
 
 ```ts
 // in the workflow — force this dispatch onto the SQS transport:
-const result = await ctx.call(heavyStep, input, { transport: 'sqs' });
+const result = await ctx.remote(heavyStep, input, { transport: 'sqs' });
 ```
 
 The id of the transport that actually accepted the dispatch is **stamped on the task** as

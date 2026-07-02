@@ -1,14 +1,14 @@
 # durable-worker (Python)
 
 Run [`nestjs-durable`](../../README.md) workflow steps in Python. A TypeScript workflow calls a
-remote step with `ctx.call(chargeCard, input)`; the orchestrator dispatches it over the
+remote step with `ctx.remote(chargeCard, input)`; the orchestrator dispatches it over the
 transport; a Python worker registered for the same step **name** runs it and returns the result.
 One workflow, steps split across languages.
 
 ```python
 from durable_worker import Worker, FatalError
 
-worker = Worker(group="payments")
+worker = Worker()
 
 @worker.step("payments.charge-card")
 async def charge(data):
@@ -121,21 +121,21 @@ ships results back:
   from durable_worker import Worker
   from durable_worker.redis_runner import run_redis_worker
 
-  worker = Worker(group="payments")
+  worker = Worker()
 
   @worker.step("payments.charge-card")
   async def charge(data):
       return {"chargeId": f"ch_{data['amount']}"}
 
   async def main():
-      await run_redis_worker(worker, group="payments")
+      await run_redis_worker(worker)
       await asyncio.Event().wait()
 
   asyncio.run(main())
   ```
 
   This is wired end-to-end in [`scripts/py-e2e.sh`](../../scripts/py-e2e.sh): a TypeScript
-  workflow's `ctx.call` runs this Python handler over Redis and gets the result back.
+  workflow's `ctx.remote` runs this Python handler over Redis and gets the result back.
 - **AWS SQS** (`pip install durable-worker[sqs]`) — `durable_worker.sqs_runner.run_sqs_worker`
   long-polls the same SQS queues the TS `SqsTransport` uses. Blocking loop; pass a
   `threading.Event` as `stop` to stop it.

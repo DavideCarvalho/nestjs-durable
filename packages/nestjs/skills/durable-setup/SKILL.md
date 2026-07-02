@@ -4,8 +4,9 @@ description: >
   Set up @dudousxd/nestjs-durable in a NestJS app — DurableModule.forRootAsync with a StateStore
   + Transport, register @Workflow / @DurableStep providers, and start runs with WorkflowService.
   Covers the zero-infra EventEmitterTransport + InMemoryStateStore default, start() enqueues vs
-  waitForRun() settles, autoSchema, worker:false API/worker split, DurableWorkerModule thin worker,
-  forRoot vs forRootAsync, app.enableShutdownHooks for graceful drain.
+  waitForRun() settles, autoSchema, drive:false dashboard/API-only replicas, DurableModule as a
+  thin worker (connection only, no store), forRoot vs forRootAsync, app.enableShutdownHooks for
+  graceful drain.
 license: MIT
 metadata:
   type: core
@@ -116,28 +117,34 @@ DurableModule.forRootAsync({
 
 ### Split API pods from worker pods
 
-For scale, run dispatch-only pods (`worker: false`) and worker pods (default `worker: true`) that
-share only the database. An API pod's `start` only enqueues; worker pods poll and run the body.
+`DurableModule.forRoot` is the ONE module; the role is inferred from which of `store`/`connection`
+you pass — nothing else to configure. For scale, run dispatch-only pods and driving pods that share
+only the database. An API pod's `start` only enqueues; driving pods poll and run the body.
 
 ```ts
-// API / dashboard pod: enqueue-only, never executes or recovers workflows
-DurableModule.forRoot({ store, transport, worker: false });
+// API / dashboard pod: enqueue-only, mounts the store but never processes or recovers workflows
+DurableModule.forRoot({ store, transport, drive: false });
 
-// Worker pod (default): runs the body, recovers orphaned runs, polls timers
-DurableModule.forRoot({ store, transport /* worker: true is the default */ });
+// Driving pod (default): runs the body, recovers orphaned runs, polls timers
+DurableModule.forRoot({ store, transport /* drive: true is the default */ });
 ```
 
-A store-less **thin worker** (BullMQ consumer only, no engine/store) uses `DurableWorkerModule`:
+A store-less **thin worker** (no engine/store — just registered handlers over a connection) passes
+`connection` with no `store`:
 
 ```ts
-import { DurableWorkerModule } from '@dudousxd/nestjs-durable';
+import { DurableModule } from '@dudousxd/nestjs-durable';
 
 @Module({
-  imports: [DurableWorkerModule.forRoot({ connection: 'redis://localhost:6379', groups: ['payments'] })],
-  providers: [PaymentsWorker], // @DurableStep handlers for the 'payments' group
+  imports: [DurableModule.forRoot({ connection: 'redis://localhost:6379', partition: 'payments' })],
+  providers: [PaymentsWorker], // @DurableStep handlers this worker serves
 })
 export class WorkerAppModule {}
 ```
+
+`partition` is an optional isolation suffix on this worker's queues — omit it for a single-tenant
+deployment. An operator with no local body for a workflow dispatches to a live worker of the same
+name automatically; there's no `groups`/`remoteByConvention` flag to opt into.
 
 ## Common mistakes
 

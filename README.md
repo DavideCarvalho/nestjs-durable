@@ -50,7 +50,7 @@ export const chargeCard = remoteStep({
 class CheckoutWorkflow {
   async run(ctx: WorkflowCtx, order: Order) {
     await ctx.step('reserve-stock', async () => { /* local step */ });
-    const charge = await ctx.call(chargeCard, { orderId: order.id, amountCents: order.total });
+    const charge = await ctx.remote(chargeCard, { orderId: order.id, amountCents: order.total });
     return charge.chargeId;
   }
 }
@@ -89,22 +89,24 @@ recovery), NestJS integration, event-emitter transport, two ORM stores, the cont
 dashboard, OpenTelemetry, a Telescope watcher, and the Python worker SDK. See
 [`docs/plans`](docs/plans/2026-06-11-nestjs-durable-design.md) for the full design.
 
-## Control plane vs worker
+## Operator vs worker
 
-Split the roles when you want a shared, DB-owning dispatcher fronting many independent workers:
+One `DurableModule.forRoot(options)` — the role is **inferred** from which of `store` / `connection`
+you pass:
 
-- **`DurableControlPlaneModule`** (`{ worker: false }`) — mounts the engine, the dashboard, and the
-  store, and dispatches runs, but never processes or recovers workflows: each started run stays
-  `pending` for a worker to claim. This is the instance that owns the database and the operator view.
-  It can start runs on behalf of a tenant over the transport (`transport.onStartRun` → a run stamped
-  with the tenant's `namespace`), and route unregistered workflows to a live group of the same name
-  with `remoteByConvention: true`.
-- **`DurableWorkerModule`** — a **tenant worker**: it registers `@Step`/`@Workflow` handlers and
-  consumes the transport, holding no engine or store. It can start runs back through the control plane
-  and, unless it opts into `scopeReads`, never reads another tenant's rows.
+- **`{ store, transport }`** — an **operator**: mounts the engine, the dashboard, and the store, and
+  drives runs (polls pending, recovers crashed, resumes timers). Pass `drive: false` for a
+  read-only/dashboard replica (e.g. an API pod) that mounts the store but never processes or recovers
+  workflows — leave that to another driving instance.
+- **`{ connection }`** (no `store`) — a **thin worker**: no engine or store; it registers
+  `@Step`/`@Workflow` handlers and consumes the transport directly.
+- **`{ store, transport, connection }`** — an operator that also runs a co-located worker: every
+  `@Workflow` dispatches over the transport instead of running inline, and a co-located consumer
+  replays the same bodies.
 
-Use `DurableModule` directly when a single instance should be **both** dispatcher and worker (the
-zero-infra default).
+An operator with no local body for a workflow automatically dispatches to a live worker of the same
+name — that convention dispatch is the default, nothing to opt into. Use `partition` to isolate
+multiple worker pools sharing one store/broker.
 
 ## Packages
 

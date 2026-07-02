@@ -2,20 +2,21 @@
 
 This guide explains the worker model, the three ways to fan work out, and how to control parallelism.
 
-## One worker, one group (the default)
+## One worker, every name its own queue (the default)
 
 A durable run has two kinds of task — a **workflow turn** (replay the body to a *decision*: dispatch
 these steps / start these children / suspend — short, orchestration-only) and a **step call** (run the
-actual handler — the heavy DB/CPU/IO work). Both ride the **same queue** `<prefix>-tasks-<group>`
-(distinguished by the BullMQ job name), and **one worker** consumes both and routes each internally.
-So a workflow and its steps live on **one group, one worker**:
+actual handler — the heavy DB/CPU/IO work). Each registered name — a workflow or a step — gets its
+**own queue** (distinguished by job shape, not a hand-declared group), and **one worker** can hold many
+names at once, consuming and routing each internally. So a workflow and its steps live on **one
+worker**, with no routing to configure:
 
 ```python
 # Python — one Worker holds the workflow AND its steps
-worker = Worker(group="processing", concurrency="adaptive")
+worker = Worker(concurrency="adaptive")
 
 @worker.workflow("processing")
-def processing(ctx, data): ...        # ctx.gather_calls([...]) — no group needed; inherits "processing"
+def processing(ctx, data): ...        # ctx.gather_calls([...]) — no partition needed; inherits this worker's
 
 @worker.step("handler")
 def handler(data): ...
@@ -24,7 +25,8 @@ worker.run(redis=...)
 ```
 
 ```ts
-// NestJS — @Workflow + @Step discovered onto one in-app worker (one group)
+// NestJS — @Workflow + @Step discovered onto the same DurableModule (a thin worker, or an operator's
+// co-located worker) and routed by NAME automatically.
 @Workflow({ name: "processing" }) class Processing { run(ctx, input) { ... } }
 class Handlers { @Step("handler") handle(input) { ... } }
 
@@ -32,17 +34,20 @@ class Handlers { @Step("handler") handle(input) { ... } }
 engine.remote("processing", { group: "processing" });
 ```
 
-A step with **no explicit group inherits its workflow's group**, which is what collapses everything
-onto one group. (`@Step` is the NestJS step decorator; `@DurableStep` is a deprecated alias.)
+A step with **no explicit partition inherits its workflow's partition** (an isolation suffix, not a
+routing key), which is what collapses everything onto one worker by default. An operator with no local
+body for a workflow dispatches to a live worker of the same name automatically — convention dispatch
+is the default, not a flag you set. (`@Step` is the NestJS step decorator; `@DurableStep` is a
+deprecated alias.)
 
-> **Splitting is opt-in (advanced).** Put a step on a *different* group than its workflow (explicit
-> `group`) and run a separate worker there to scale step execution independently of orchestration
-> (e.g. a KEDA-autoscaled step pool). You give up the one-group simplicity for independent scaling.
-> The Python `WorkflowWorker` (a workflow-only worker) still exists for this split.
+> **Splitting is opt-in (advanced).** Give a step a *different* `partition` than its workflow and run a
+> separate worker there to scale step execution independently of orchestration (e.g. a
+> KEDA-autoscaled step pool). You give up the one-worker simplicity for independent scaling. The Python
+> `WorkflowWorker` (a workflow-only worker, still constructed with `group=`) exists for this split.
 
-> If you use **remote steps** (`ctx.call` / `ctx.gather_calls`), a worker must consume the step's
-> group — by default that's the workflow's own group (handled by the unified worker above); only when
-> you split does it become a separate group you must staff.
+> If you use **remote steps** (`ctx.remote` / `ctx.gather_calls`), a worker must consume the step's
+> name — by default that's the same worker as the workflow (handled by the unified worker above); only
+> when you split does it become a separate queue you must staff.
 
 ## Three ways to fan work out
 
@@ -87,21 +92,19 @@ Raise it with the `concurrency` knob (same name on every SDK):
 
 ```python
 # Python
-steps = Worker(group="...-handlers", concurrency=7)   # run up to 7 handlers at once
+steps = Worker(concurrency=7)   # run up to 7 handlers at once (step-only: no @steps.workflow)
 run_workers([workflows, steps], redis=redis_url)
 ```
 
 ```ts
 // Node SDK (@dudousxd/durable-worker)
-await runRedisWorker({ runtime, group, connection, concurrency: 7 });
+await runRedisWorker({ runtime, connection, concurrency: 7 });
 
 // BullMQTransport (engine-side / default NestJS worker role)
-new BullMQTransport({ connection, group, concurrency: 7 });
+new BullMQTransport({ connection, concurrency: 7 });
 
-// NestJS in-app worker
-DurableWorkerModule.forRoot({ connection, groups, concurrency: 7 });
-// or per-group:
-DurableWorkerModule.forRoot({ connection, groups, concurrencyByGroup: { 'foo-handlers': 7 } });
+// NestJS thin/co-located worker
+DurableModule.forRoot({ connection, concurrency: 7 });
 ```
 
 Total parallelism = `concurrency × worker replicas`. So you scale either by raising `concurrency`
@@ -114,15 +117,15 @@ A fixed number is a guess: too low wastes the pool, too high stampedes RAM or a 
 
 ```python
 # Python
-steps = Worker(group="...-handlers", concurrency="adaptive")
+steps = Worker(concurrency="adaptive")
 # or: concurrency={"min": 1, "max": 16, "ramCeilingPct": 85}
 ```
 
 ```ts
 // any TS surface
-new BullMQTransport({ connection, group, concurrency: 'adaptive' });
-await runRedisWorker({ runtime, group, connection, concurrency: { mode: 'adaptive', min: 1, max: 16 } });
-DurableWorkerModule.forRoot({ connection, groups, concurrencyByGroup: { 'foo-handlers': 'adaptive' } });
+new BullMQTransport({ connection, concurrency: 'adaptive' });
+await runRedisWorker({ runtime, connection, concurrency: { mode: 'adaptive', min: 1, max: 16 } });
+DurableModule.forRoot({ connection, concurrency: 'adaptive' });
 ```
 
 How it decides (same on both SDKs), every `tickMs` (default 2s):
@@ -154,14 +157,15 @@ limit move and see **why** it last backed off (`ram_ceiling` / `backpressure` / 
 ### Capping vs increasing — two different knobs
 - **To go faster (parallelise the fan):** raise the **worker `concurrency`** (consumer side, above).
 - **To go slower (protect a dependency):** use the engine's durable **admission queue** —
-  `engine.registerQueue({ name, limit, rateLimit })` + `ctx.call(step, { queue })` — which caps how
-  many steps of a logical "channel" are in flight at once (durable, survives crashes). That's for
-  *limiting* (e.g. "≤5 concurrent calls to a rate-limited API"), not for speeding a fan up.
+  `engine.registerQueue({ name, limit, rateLimit })` + `ctx.remote(step, input, { queue })` — which
+  caps how many steps of a logical "channel" are in flight at once (durable, survives crashes). That's
+  for *limiting* (e.g. "≤5 concurrent calls to a rate-limited API"), not for speeding a fan up.
 
 ## TL;DR
-- **One worker, one group** by default: it consumes both workflow turns and step calls (same queue,
-  job-name discriminated) and routes each. Steps with no explicit group inherit the workflow's group.
-- Splitting workflow vs step onto separate groups/workers is **opt-in**, for scaling step execution
+- **One worker, every name its own queue** by default: a worker consumes both workflow turns and step
+  calls for every name it registers (job-shape discriminated) and routes each. Steps with no explicit
+  `partition` inherit the workflow's partition.
+- Splitting workflow vs step onto separate workers is **opt-in**, for scaling step execution
   independently of orchestration.
 - `gather_calls` dispatches in parallel but executes at the worker's `concurrency` — set it (default 1,
   or `'adaptive'`) or your parallel fan runs serially. Adaptive measures **step** latency only.

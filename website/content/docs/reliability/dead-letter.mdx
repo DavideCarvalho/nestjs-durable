@@ -103,7 +103,7 @@ export class PipelineWorkflow {
   async run(ctx: WorkflowCtx, input: PipelineInput) {
     const extracted = await ctx.step('extract', () => this.extract(input));
     const transformed = await ctx.step('transform', () => this.transform(extracted));
-    return ctx.call(loadStep, transformed);
+    return ctx.remote(loadStep, transformed);
   }
 
   // Runs when a `pipeline` run is dead-lettered. Typed to the workflow's own input, same deps.

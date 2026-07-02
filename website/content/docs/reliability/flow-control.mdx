@@ -1,11 +1,11 @@
 ---
 title: Flow control
-description: "Durable queues for remote steps — cap concurrency and enforce fixed-window rate limits with engine.registerQueue (or the module's queues option) and ctx.call(step, input, { queue }). A call that can't be admitted re-suspends and the timer poller retries admission, so the limit survives crashes."
+description: "Durable queues for remote steps — cap concurrency and enforce fixed-window rate limits with engine.registerQueue (or the module's queues option) and ctx.remote(step, input, { queue }). A call that can't be admitted re-suspends and the timer poller retries admission, so the limit survives crashes."
 ---
 
 Remote steps fan out work to workers, and sometimes you need to *throttle* that fan-out: a third-party API
 allows only N requests per minute, or a downstream service falls over above some concurrency. Flow-control
-queues cap how much work `ctx.call` admits at once — a concurrency limit, a fixed-window rate limit, or both
+queues cap how much work `ctx.remote` admits at once — a concurrency limit, a fixed-window rate limit, or both
 — and, crucially, they do it **durably**: a call that can't be admitted doesn't busy-wait or hold the run in
 memory, it re-suspends and is retried by the timer poller, so the limit survives a crash.
 
@@ -14,7 +14,7 @@ memory, it re-suspends and is retried by the timer poller, so the limit survives
 Register a queue on the engine with `engine.registerQueue`, or declare it on the NestJS module's `queues`
 option (which registers it at startup). A `QueueConfig` has:
 
-- `name` — the queue's name, referenced from `ctx.call(step, input, { queue: name })`.
+- `name` — the queue's name, referenced from `ctx.remote(step, input, { queue: name })`.
 - `concurrency` — the maximum number of steps in flight at once for this queue. Omit for unlimited.
 - `rateLimit` — a fixed-window rate limit of `{ limit, periodMs }`: at most `limit` admissions per
   `periodMs`. Omit for unlimited.
@@ -49,13 +49,12 @@ Subject a remote-step dispatch to a queue by naming it in the call options:
 ```ts
 export const sendEmail = remoteStep({
   name: 'notify.email',
-  group: 'notify',
   input: z.object({ to: z.string().email(), template: z.string() }),
   output: z.object({ messageId: z.string() }),
 });
 
 // in the workflow — this dispatch is admitted through the `emails` queue:
-const sent = await ctx.call(sendEmail, { to: order.email, template: 'receipt' }, { queue: 'emails' });
+const sent = await ctx.remote(sendEmail, { to: order.email, template: 'receipt' }, { queue: 'emails' });
 ```
 
 ## How admission works (and why it's durable)

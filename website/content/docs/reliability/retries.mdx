@@ -58,7 +58,7 @@ structured error. Use `FatalError` for deterministic business verdicts; let ordi
 
 ## Remote-step retries
 
-A remote step declared with `remoteStep` and invoked with `ctx.call` runs on a worker — possibly in another
+A remote step declared with `remoteStep` and invoked with `ctx.remote` runs on a worker — possibly in another
 process or another language. There are **two distinct paths** for handling its failures, chosen by whether
 the step sets `timeoutMs`.
 
@@ -73,7 +73,6 @@ re-running completed work.
 ```ts
 export const chargeCard = remoteStep({
   name: 'payments.charge-card',
-  group: 'payments',
   input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
   output: z.object({ chargeId: z.string() }),
   retries: 4,
@@ -84,7 +83,7 @@ export const chargeCard = remoteStep({
 });
 
 // in the workflow:
-const charge = await ctx.call(chargeCard, { orderId: order.id, amountCents: order.total });
+const charge = await ctx.remote(chargeCard, { orderId: order.id, amountCents: order.total });
 ```
 
 When a worker reports a **failed** result for a durable step, the engine consults `retries`. If the attempt
@@ -131,7 +130,6 @@ rearms the window, so a long but healthy step that keeps beating stays alive wel
 ```ts
 export const renderVideo = remoteStep({
   name: 'media.render',
-  group: 'render',
   input: z.object({ assetId: z.string() }),
   output: z.object({ url: z.string() }),
   timeoutMs: 60_000, // presume the worker dead after 60s of silence (no result, no heartbeat)
