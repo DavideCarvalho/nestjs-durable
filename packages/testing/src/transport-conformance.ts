@@ -14,7 +14,6 @@ export type HandleableTransport = Transport & {
 
 const echo: RemoteStepDef<{ n: number }, { doubled: number }> = {
   name: 'conformance.echo',
-  group: 'conformance',
   input: z.object({ n: z.number() }),
   output: z.object({ doubled: z.number() }),
   __remote: true,
