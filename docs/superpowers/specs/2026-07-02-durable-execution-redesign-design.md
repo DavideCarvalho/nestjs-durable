@@ -72,6 +72,15 @@ The durable guarantee comes **entirely from the event log**, never from
 in-process memory. This is made explicit as the model, resolving a tension in
 the routing design.
 
+**This is already how the engine works today** — grounding confirms it
+(`packages/core/src/engine.ts:2467-2472`: each turn loads the checkpoint set,
+constructs a fresh ctx, and re-invokes the full workflow body; suspension is a
+thrown `WorkflowSuspended` caught at `:2504`, not a paused stack; positional
+determinism via a per-ctx counter). So this section **documents and locks** the
+existing behavior with a confirming replay test — it is not a code change. It is
+stated here because the routing decision below depends on it (stateless workers
+are only safe because a turn never relies on in-memory continuation).
+
 - **The log is truth.** Every `ctx.step` / `ctx.remote` / timer / signal result
   is checkpointed to the store. Nothing else is durable.
 - **Each turn is stateless.** A worker picks up a workflow-turn, **replays the
@@ -115,16 +124,31 @@ one group therefore collide — a Python worker pops a JS `pipeline` turn and fa
 
 - Each registered `@Workflow` and each remote `@Step` gets its own logical queue,
   derived from its name (e.g. workflow `pipeline` → its turn queue; remote step
-  `extraction:page` → its step queue).
+  `extraction:page` → its step queue). **Workflow turns route by workflow name**
+  (which the operator already computes — `remoteByConvention` dispatches to
+  `tenantGroup(run.workflow, run.namespace)` at `engine.ts:1028`, so the queue is
+  already the workflow name). **Remote steps route by step name**, which
+  *eliminates `RemoteStepDef.group`*: the `@Step(name)` handler and the
+  `ctx.remote(def)` caller meet at the queue named `def.name`, no separately
+  declared group.
 - A worker subscribes to **exactly the queues for the handlers it registered.**
   In NestJS this is derived by scanning the discovered `@Workflow`/`@Step`
   providers (the worker object is already implicit inside the lib — the app never
-  writes `new Worker`). In Python the `Worker(workflows=[…], activities=[…])`
-  object stays (no DI to scan) but derives its subscriptions from the passed
-  lists instead of a `task_queue` argument.
-- A worker never pops a job it can't handle, because it is not subscribed to that
-  handler's queue. flip (registers `pipeline` + `extraction:page`) and Python
-  (registers `processing`) can coexist with **no group** and never collide.
+  writes `new Worker`; today it's `DurableWorkerModuleOptions.groups: string[]`
+  that drives the per-group loop at `durable-worker.module.ts:170`). In Python the
+  decorator-based `Worker` (`@worker.step`/`@worker.workflow`, populating
+  `self._handlers`/`self._workflows` at `worker.py:433/451`) derives its
+  subscriptions from those registries instead of the single positional `group`.
+- **Replicas share, distinct handlers separate.** Three flip replicas all
+  registering `pipeline` subscribe to the *same* `pipeline` queue → BullMQ
+  load-balances turns across them naturally, and a dead replica orphans nothing.
+  Two *different* handlers get two queues → no cross-consumption. flip (registers
+  `pipeline` + `extraction:page`) and Python (registers `processing`) coexist with
+  **no group** and never collide.
+- **Cost, bounded:** one BullMQ `Worker` per *distinct registered handler* means N
+  blocking Redis connections where N = distinct handlers in that process (not
+  replicas). flip is ~2-4; acceptable. If a process ever registers dozens of
+  handlers this grows — noted as a future optimization, not solved here.
 
 **`group` → `partition` (optional).** The pool-of-interchangeable-workers meaning
 of `group` dissolves into per-handler routing. What remains is *deliberate*
@@ -181,27 +205,51 @@ not need partitioning.
 - The group-keyed `tasksName` is kept during the deprecation window so a mixed
   fleet (one repo migrated, one not) still interoperates on a shared partition.
 
-### Python (`durable-worker`)
+### Python (`durable-worker`, `clients/python/`)
 
-- `Worker(client, workflows=[…], activities=[…], partition=None)` — drop the
-  `task_queue` argument; derive subscriptions from the registered lists; keep
-  `partition` for isolation. `task_queue` accepted as a deprecated alias mapping
-  to `partition`.
+The Python API is **decorator-based** (`@worker.step` / `@worker.workflow`
+populating `self._handlers` / `self._workflows`), with a single positional
+`group: str` as the subscription axis. There is no `task_queue` symbol. So:
+
+- `Worker(partition=None, …)` — the positional `group` becomes `partition`
+  (optional, isolation only); `group` kept as a deprecated keyword alias mapping to
+  `partition`.
+- **Derive subscriptions from the registries** (`self._handlers` keys +
+  `self._workflows` keys) instead of the single `group`. The change point is
+  `run_redis_worker` (`redis_runner.py:386-388,468`), which today reads only
+  `self.group` to build one queue — it must start one consumer per registered
+  handler/workflow name, `partition`-suffixed.
+- **Interop-critical:** the queue string (`redis_runner.py:210`,
+  `f"{prefix}-tasks-{group}"`) is a pinned cross-SDK contract with the JS
+  transport. The new handler-keyed format must be changed **identically** on both
+  sides (same release) or interop breaks.
 
 ## Migration
 
-Breaking-shaped, delivered non-breaking via a one-minor deprecation window:
+Two axes, deliberately separated:
 
-1. **Minor N (this work):** ship `ctx.remote`, `partition`, handler-based routing,
-   and per-handler queues. Keep every old name as a `@deprecated` alias that maps
-   through: `ctx.call`→`remote`, `RemoteStepDef.group`/`remoteStep({group})`→
-   `partition`, `DurableWorkerModule` `groups`/`tenant`→partition-derived,
-   Python `task_queue`→`partition`. Old and new queue names both live so a
-   partially-migrated fleet interoperates. Emit one-time deprecation warnings.
-2. **Consumers migrate independently** (flip, squid, Python) on their own
-   schedule within the window — no lockstep, which is the whole point of aliases
-   given the tenant work just paid the lockstep cost.
-3. **Next major:** remove the aliases and the group-keyed queues.
+**Source compatibility → deprecation aliases (per-repo, independent).** Keep every
+old *name* as a `@deprecated` alias that maps through, so each repo's source
+migrates on its own schedule and old code still compiles:
+- `ctx.call` → `ctx.remote` (`export`-style alias, mirrors `DurableStep = Step`).
+- `RemoteStepDef.group` / `remoteStep({ group })` → `partition` (accepted, mapped,
+  one-time warn).
+- `DurableWorkerModule` `groups` → optional/derived; `tenant` → `partition` (alias).
+- Python `group` keyword → `partition` (alias).
+Removed in the next major. This is the house pattern (`decorators.ts:150`,
+`tokens.ts:16`).
+
+**Wire format → atomic cutover (fleet deploys together).** The queue-naming change
+(group-keyed → handler-keyed) is **not** dual-run. The durable fleet — operator +
+every runtime worker (flip API/worker, squid, Python) — already must deploy
+together for a routing change (the tenant-group rename established this: "deploy
+together or the renamed group starves"). Re-using that invariant, the handler-keyed
+queues replace the group queues in one release across JS and Python simultaneously.
+Rationale for *not* keeping dual queues: dual-delivery is error-prone, the fleet
+never runs mixed-wire in practice, and the source aliases already cover the only
+thing that benefits from staggering (per-repo code migration). This is called out
+explicitly so the release is sequenced as a coordinated durable-fleet deploy, not a
+rolling one.
 
 ## Testing
 
@@ -209,10 +257,11 @@ Breaking-shaped, delivered non-breaking via a one-minor deprecation window:
   identical frontier after a simulated mid-run restart, closures run exactly
   once); `remote` and deprecated `call` produce identical dispatch; `partition`
   suffixes the queue and omission yields the bare queue.
-- **Transport:** a worker subscribed to handler A does **not** consume a job for
-  handler B on a shared partition (the collision this fixes); partitioned worker
-  only consumes its `<handler>@<partition>` queue; group-keyed alias queue still
-  interoperates during the window.
+- **Transport:** dispatch keys the queue by handler name (mirror
+  `bullmq-namespace.spec.ts` / `start-run.spec.ts` offline-mock assertions with the
+  new per-handler names); a worker subscribed to handler A does **not** consume a
+  job for handler B (the collision this fixes); a partitioned worker only consumes
+  its `<handler>@<partition>` queue.
 - **NestJS:** `DurableWorkerModule.forRoot({})` with no `groups` subscribes to
   exactly the discovered handlers; a two-runtime fixture (JS workflow + a stub
   "other-runtime" handler) sharing a partition never cross-consumes.
