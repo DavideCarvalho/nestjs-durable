@@ -5,6 +5,8 @@ export * from './durable-worker.module';
 export * from './durable.module';
 export * from './entity';
 export * from './in-app-worker';
+export * from './run-request-responder';
 export * from './step-interceptor';
+export * from './store-run-gateway';
 export * from './tokens';
 export * from './workflow.service';

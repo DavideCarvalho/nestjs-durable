@@ -1127,7 +1127,7 @@ export class WorkflowEngine {
         if (run.createdAt.getTime() > deadline) continue;
         const error = { message: 'execution timeout', code: 'execution_timeout' };
         await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
-        this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+        this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, namespace: run.namespace, error });
       }
     }
   }
@@ -1187,7 +1187,7 @@ export class WorkflowEngine {
       };
       await this.store.updateRun(run.id, { status: 'dead', error, updatedAt: new Date() });
       await this.store.releaseRunLock(run.id);
-      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, namespace: run.namespace, error });
       this.notifyDead({ ...run, status: 'dead', error, recoveryAttempts: attempts });
       return { runId: run.id, status: 'dead', error };
     }
@@ -1535,7 +1535,7 @@ export class WorkflowEngine {
     }
     const error = { message: 'cancelled' };
     await this.store.updateRun(runId, { status: 'cancelled', error, updatedAt: new Date() });
-    this.emit({ type: 'run.failed', runId, workflow: run.workflow, error });
+    this.emit({ type: 'run.failed', runId, workflow: run.workflow, namespace: run.namespace, error });
     await this.cancelChildren(runId, opts);
     // Notify local cancel listeners now (a worker on this pod), and broadcast so the instance/worker
     // actually running this run learns of it and can abort cooperatively (the store already records
@@ -1912,6 +1912,7 @@ export class WorkflowEngine {
         type: 'run.completed',
         runId: run.id,
         workflow: run.workflow,
+        namespace: run.namespace,
         output: outcome.output,
       });
       void this.notifyParent(run.id, { ok: true, value: outcome.output });
@@ -1923,13 +1924,14 @@ export class WorkflowEngine {
         type: 'run.failed',
         runId: run.id,
         workflow: run.workflow,
+        namespace: run.namespace,
         error: outcome.error,
       });
       void this.notifyParent(run.id, { ok: false, error: outcome.error.message });
       return { runId: run.id, status: 'failed', error: outcome.error };
     }
     await this.store.updateRun(run.id, { status: 'suspended', wakeAt: outcome.wakeAt, updatedAt });
-    this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
+    this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow, namespace: run.namespace });
     return { runId: run.id, status: 'suspended' };
   }
 
@@ -1944,7 +1946,7 @@ export class WorkflowEngine {
     if (run.status === 'cancelling') {
       const error = { message: 'cancelled' };
       await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
-      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, namespace: run.namespace, error });
       this.notifyCancelled(run.id);
       if (this.controlPlane) {
         void this.controlPlane
@@ -1958,12 +1960,12 @@ export class WorkflowEngine {
     if (run.status === 'pending') {
       await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
       run.status = 'running';
-      this.emit({ type: 'run.started', runId: run.id, workflow: run.workflow });
+      this.emit({ type: 'run.started', runId: run.id, workflow: run.workflow, namespace: run.namespace });
     }
     if (registered.singleton && !(await this.singletons.admit(run, registered.singleton))) {
       const wakeAt = this.singletons.retryWakeAt();
       await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
-      this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
+      this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow, namespace: run.namespace });
       await this.store.releaseRunLock(run.id);
       return { runId: run.id, status: 'suspended' };
     }
@@ -1994,7 +1996,7 @@ export class WorkflowEngine {
         wakeAt,
         updatedAt: new Date(),
       });
-      this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
+      this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow, namespace: run.namespace });
       // RELEASE BEFORE ENQUEUE: the decision must be able to BOTH match the marker AND acquire the lease
       // the instant it arrives — even a few ms after the enqueue. Holding the lease through the enqueue
       // would drop a fast decision at lock contention. Idempotent vs. `execute`'s own finally release.
@@ -2063,7 +2065,7 @@ export class WorkflowEngine {
       };
       // terminal failure: lease expires naturally — no recovery re-drive will race it
       await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
-      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+      this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, namespace: run.namespace, error });
       return { runId: run.id, status: 'failed', error };
     }
 
@@ -2351,7 +2353,7 @@ export class WorkflowEngine {
     }
     const error = { message: 'cancelled' };
     await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
-    this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, error });
+    this.emit({ type: 'run.failed', runId: run.id, workflow: run.workflow, namespace: run.namespace, error });
     return { runId: run.id, status: 'cancelled', error };
   }
 
@@ -2372,7 +2374,7 @@ export class WorkflowEngine {
     if (run.status === 'pending') {
       await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
       run.status = 'running';
-      this.emit({ type: 'run.started', runId: run.id, workflow: run.workflow });
+      this.emit({ type: 'run.started', runId: run.id, workflow: run.workflow, namespace: run.namespace });
     }
     // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
@@ -2385,7 +2387,7 @@ export class WorkflowEngine {
     ) {
       const wakeAt = this.singletons.retryWakeAt();
       await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
-      this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow });
+      this.emit({ type: 'run.suspended', runId: run.id, workflow: run.workflow, namespace: run.namespace });
       await this.store.releaseRunLock(run.id);
       return { runId: run.id, status: 'suspended' };
     }
@@ -2420,7 +2422,7 @@ export class WorkflowEngine {
           error: undefined,
           updatedAt: new Date(),
         });
-        this.emit({ type: 'run.completed', runId: run.id, workflow: run.workflow });
+        this.emit({ type: 'run.completed', runId: run.id, workflow: run.workflow, namespace: run.namespace });
         void this.notifyParent(run.id, { ok: true, value: undefined });
         const nextId = nextContinuationId(run.id);
         queueMicrotask(

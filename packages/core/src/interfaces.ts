@@ -1295,6 +1295,10 @@ export interface EngineEvent {
   type: EngineEventType;
   runId: string;
   workflow?: string | undefined;
+  /** The run's worker-pool partition (see {@link WorkflowRun.namespace}), stamped on the `run.*`
+   *  lifecycle events (where the emitting call site already has the run in hand) so a tenant-event
+   *  re-publisher can scope without a per-event store read. Absent on `step.*` events. */
+  namespace?: string | undefined;
   seq?: number | undefined;
   name?: string | undefined;
   kind?: StepKind | undefined;

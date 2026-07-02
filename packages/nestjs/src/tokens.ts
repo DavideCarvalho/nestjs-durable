@@ -10,3 +10,12 @@
  * byte-identical with nestjs-context's export.
  */
 export const CONTEXT_ACCESSOR = Symbol.for('@dudousxd/nestjs-context:accessor');
+
+/**
+ * Injection token for the bound `RunGateway` — the read/control surface a consumer (a controller,
+ * or the `RunRequestResponder`) uses instead of reaching for `WorkflowEngine`/`StateStore`
+ * directly. `DurableModule` binds it to `StoreRunGateway` on worker/drive (operator) instances.
+ * `Symbol.for` so re-resolving this module (e.g. across a dynamic-module boundary) still hits the
+ * same registration.
+ */
+export const RUN_GATEWAY = Symbol.for('nestjs-durable:run-gateway');

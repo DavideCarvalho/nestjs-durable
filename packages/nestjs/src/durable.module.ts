@@ -3,28 +3,42 @@ import {
   type ControlPlane,
   DURABLE_OPTIONS,
   DURABLE_OPTIONS_CANONICAL,
+  type EngineEvent,
   type NamedTransport,
   type QueueConfig,
   type RetentionPolicy,
+  type RunGateway,
   STATE_STORE,
   STATE_STORE_CANONICAL,
   type ScheduledWorkflow,
   type StateStore,
+  type TenantEvent,
   TRANSPORT,
   TRANSPORT_CANONICAL,
   type Transport,
   WorkflowEngine,
   type WorkflowRef,
 } from '@dudousxd/nestjs-durable-core';
-import { type DynamicModule, type InjectionToken, Module, type Provider } from '@nestjs/common';
+import {
+  type DynamicModule,
+  Inject,
+  Injectable,
+  type InjectionToken,
+  Module,
+  type OnApplicationBootstrap,
+  type OnModuleDestroy,
+  type Provider,
+} from '@nestjs/common';
 import { DiscoveryModule, ModuleRef } from '@nestjs/core';
 import type { ContextAccessor } from './context-accessor';
 import { DurableStepRegistrar } from './durable-step.registrar';
 import { EntityService } from './entity';
 import { type DurableInAppWorkerOptions, inAppWorkerProviders } from './in-app-worker';
 import { RetentionPoller } from './retention-poller';
+import { type RunRequestTransport, RunRequestResponder } from './run-request-responder';
+import { StoreRunGateway } from './store-run-gateway';
 import { TimerPoller } from './timer-poller';
-import { CONTEXT_ACCESSOR } from './tokens';
+import { CONTEXT_ACCESSOR, RUN_GATEWAY } from './tokens';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
 
@@ -329,6 +343,84 @@ export interface DurableModuleAsyncOptions {
   inject?: InjectionToken[];
 }
 
+/**
+ * Boot-time wiring for the tenant run gateway's OPERATOR side, gated the same way as
+ * {@link TimerPoller} (the `drive` axis — worker instances drive by default; a plain
+ * `worker:false` dashboard/API pod does not). Two independent capabilities, each wired only when
+ * the transport carries it:
+ *
+ * 1. **`RunRequestResponder`** — answers a tenant's {@link RunRequest} against the bound
+ *    {@link RUN_GATEWAY}, tenant-scoped. Wired when the transport implements both
+ *    `onRunRequest`/`publishRunReply` (only broker transports carry the protocol).
+ * 2. **Tenant-event re-publisher** — mirrors every engine lifecycle event onto its run's
+ *    per-tenant channel via `publishTenantEvent`, so a store-less tenant worker can live-tail its
+ *    OWN runs. The run's namespace is read straight off `event.namespace` (stamped by `engine.ts`
+ *    `emit()` on every `run.*` lifecycle event, where the run is already in hand — see
+ *    `EngineEvent.namespace`); a `step.*` event doesn't carry it, so those fall back to ONE
+ *    `store.getRun` per unseen run id, cached for the rest of the run (namespace is immutable for
+ *    a run's lifetime) — never a per-event read. Bare/default-namespace runs (no real tenant) are
+ *    skipped to avoid noise on an unpartitioned operator.
+ */
+@Injectable()
+class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
+  private unsubscribe?: () => void;
+  private readonly runNamespaces = new Map<string, string | undefined>();
+
+  constructor(
+    private readonly engine: WorkflowEngine,
+    @Inject(TRANSPORT_CANONICAL) private readonly transport: Transport | null,
+    @Inject(RUN_GATEWAY) private readonly gateway: RunGateway,
+    @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore,
+    @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
+  ) {}
+
+  onApplicationBootstrap(): void {
+    const drive = this.options.drive ?? this.options.worker !== false;
+    if (!drive || !this.transport) return;
+
+    const { onRunRequest, publishRunReply, publishTenantEvent } = this.transport;
+    if (typeof onRunRequest === 'function' && typeof publishRunReply === 'function') {
+      const runRequestTransport: RunRequestTransport = { onRunRequest, publishRunReply };
+      new RunRequestResponder(runRequestTransport, this.gateway).start();
+    }
+
+    if (typeof publishTenantEvent === 'function') {
+      const publish = publishTenantEvent.bind(this.transport);
+      this.unsubscribe = this.engine.subscribe((event) => {
+        void this.republish(event, publish);
+      });
+    }
+  }
+
+  onModuleDestroy(): void {
+    this.unsubscribe?.();
+  }
+
+  private async republish(
+    event: EngineEvent,
+    publish: (evt: TenantEvent) => Promise<void>,
+  ): Promise<void> {
+    const namespace = await this.namespaceFor(event);
+    // Skip bare/default runs — no real tenant to re-publish to, and it would just be noise on an
+    // unpartitioned operator.
+    if (!namespace || namespace === 'default') return;
+    await publish({ tenant: namespace, event }).catch(() => undefined);
+  }
+
+  /** `event.namespace` when the emit call site stamped it (every `run.*` lifecycle event); for a
+   *  `step.*` event, one `store.getRun` per unseen run id, memoized for the run's lifetime. */
+  private async namespaceFor(event: EngineEvent): Promise<string | undefined> {
+    if (event.namespace !== undefined) {
+      this.runNamespaces.set(event.runId, event.namespace);
+      return event.namespace;
+    }
+    if (this.runNamespaces.has(event.runId)) return this.runNamespaces.get(event.runId);
+    const run = await this.store.getRun(event.runId);
+    this.runNamespaces.set(event.runId, run?.namespace);
+    return run?.namespace;
+  }
+}
+
 @Module({})
 export class DurableModule {
   static forRoot(options: DurableModuleOptions): DynamicModule {
@@ -440,6 +532,12 @@ export class DurableModule {
         DurableStepRegistrar,
         TimerPoller,
         RetentionPoller,
+        // Tenant run gateway (operator side): the store-backed `RunGateway` a consumer (a thin
+        // controller, or the responder below) binds to instead of reaching for the engine/store
+        // directly, plus the boot-time wiring that starts the request responder and the
+        // tenant-event re-publisher when the transport carries the protocol.
+        { provide: RUN_GATEWAY, useClass: StoreRunGateway },
+        RunGatewayBootstrap,
         // In-app worker (uniform dispatch, opt-in): inert when `inAppWorker` is unset — the binding
         // resolves to null and the bootstrap no-ops, so a plain DurableModule is unchanged.
         ...inAppWorkerProviders(),
@@ -453,6 +551,7 @@ export class DurableModule {
         TRANSPORT,
         TRANSPORT_CANONICAL,
         DURABLE_OPTIONS_CANONICAL,
+        RUN_GATEWAY,
       ],
     };
   }
