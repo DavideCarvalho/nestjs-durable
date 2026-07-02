@@ -87,13 +87,6 @@ export interface RunRedisWorkerOptions {
    *  the runner starts one BullMQ `Worker` per name in `runtime.registeredNames()` (workflows ∪
    *  steps), not a single hand-declared group queue. */
   runtime: DurableWorkerRuntime;
-  /**
-   * @deprecated No longer the subscription axis. Subscription is derived from
-   * `runtime.registeredNames()` (one queue per registered handler name) instead of a single
-   * hand-declared group. Accepted for back-compat and ignored for routing; a one-time deprecation
-   * warning is logged when set.
-   */
-  group?: string;
   /** ioredis connection options (or an IORedis instance), as `BullMQTransport` takes. */
   connection: RedisConnection;
   /** Key prefix namespacing the durable queues. Defaults to `durable` (matches the transport). */
@@ -108,9 +101,6 @@ export interface RunRedisWorkerOptions {
    * `listWorkerGroups()`/`resolveRemoteByConvention` can route that tenant's runs to this worker.
    */
   partition?: string;
-  /** @deprecated Use {@link partition} instead — a back-compat alias mapped onto it (only used when
-   *  `partition` itself is unset). */
-  tenant?: string;
   /** Stable id for this worker process in heartbeats/control. Defaults to `ts-<hostname>-<pid>`. */
   instanceId?: string;
   /** Override the Worker's job-lock duration (ms). Defaults to 5 min — see {@link DEFAULT_LOCK_DURATION_MS}. */
@@ -226,15 +216,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   const instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
   const lockDuration = options.lockDuration ?? DEFAULT_LOCK_DURATION_MS;
   const deps = options.deps ?? (await loadDeps());
-  const { runtime, connection } = options;
-  const partition = options.partition ?? options.tenant;
-  if (options.group !== undefined) {
-    console.warn(
-      'runRedisWorker({ group }) is deprecated: subscription is now derived from ' +
-        '`runtime.registeredNames()` (one queue per registered workflow/step name). `group` is ' +
-        'accepted for back-compat and ignored for routing — use `partition` for isolation instead.',
-    );
-  }
+  const { runtime, connection, partition } = options;
   // One queue TOKEN per distinct registered name (workflows ∪ steps, deduped): the token IS the
   // routing address the engine dispatches that name's tasks on — `tenantGroup(sanitizeQueueToken(
   // name), partition)` — byte-identical to the expression the engine + transport use (Task 2/4).

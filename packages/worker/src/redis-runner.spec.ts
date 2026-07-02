@@ -169,22 +169,6 @@ describe('runRedisWorker wiring (faked bullmq, no Redis)', () => {
     await fake.run('app-tasks-wf', { data: workflowTask() });
     expect(fake.added.some((a) => a.queue === 'app-decisions')).toBe(true);
   });
-
-  it('a legacy `group` is accepted, ignored for routing, and logs a deprecation warning', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const fake = makeFakeDeps();
-    const runtime = new DurableWorkerRuntime();
-    runtime.registerWorkflow('wf', async () => 1);
-    await runRedisWorker({
-      runtime,
-      connection: {},
-      group: 'ignored-legacy-group',
-      deps: fake.deps,
-    });
-    expect(fake.workerQueueNames).toEqual(['durable-tasks-wf']);
-    expect(warn).toHaveBeenCalledTimes(1);
-    warn.mockRestore();
-  });
 });
 
 describe('runRedisWorker — run-scoped liveness heartbeat during a workflow turn', () => {

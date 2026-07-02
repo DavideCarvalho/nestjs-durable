@@ -9,8 +9,8 @@ import { DurableWorkerRuntime } from './runner-core';
  * TOKEN it registers/heartbeats under gets partition-suffixed (`tenantGroup(sanitizeQueueToken(
  * name), partition)`), so an operator control plane's `listWorkerGroups()` sees
  * `<workflow>@<partition>` for a real partition, and the bare `<workflow>` for
- * `undefined`/`'default'` — production byte-identical. `tenant` is a deprecated alias for
- * `partition`; `group` no longer affects routing at all (subscription is derived from the
+ * `undefined`/`'default'` — production byte-identical. `group`/`tenant` are no longer accepted
+ * options at all — `partition` is the only isolation axis (subscription is derived from the
  * runtime's registered names).
  *
  * These tests reuse the fake-bullmq/fake-ioredis pattern from `redis-runner.spec.ts` and the
@@ -99,14 +99,6 @@ describe('runRedisWorker — partition-suffixed per-name queue', () => {
     const runtime = new DurableWorkerRuntime();
     runtime.registerWorkflow('processing', async () => 1);
     await runRedisWorker({ runtime, partition: 'davi-local', connection: {}, deps: fake.deps });
-    expect(fake.workerQueueNames()).toEqual(['durable-tasks-processing@davi-local']);
-  });
-
-  it('`tenant` is a deprecated alias for `partition` (routes identically)', async () => {
-    const fake = makeFakeDeps();
-    const runtime = new DurableWorkerRuntime();
-    runtime.registerWorkflow('processing', async () => 1);
-    await runRedisWorker({ runtime, tenant: 'davi-local', connection: {}, deps: fake.deps });
     expect(fake.workerQueueNames()).toEqual(['durable-tasks-processing@davi-local']);
   });
 

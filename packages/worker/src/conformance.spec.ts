@@ -23,7 +23,6 @@ import { DurableWorkerRuntime } from './runner-core';
 
 const remoteAdd: RemoteStepDef<{ a: number }, { sum: number }> = {
   name: 'math.add-ten',
-  group: 'math',
   input: z.object({ a: z.number() }),
   output: z.object({ sum: z.number() }),
   __remote: true,
