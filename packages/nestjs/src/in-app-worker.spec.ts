@@ -8,7 +8,12 @@ import type {
   WorkflowDecision,
   WorkflowTask,
 } from '@dudousxd/nestjs-durable-core';
-import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  WorkflowEngine,
+  sanitizeQueueToken,
+  tenantGroup,
+} from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { Step, Workflow } from './decorators';
@@ -22,12 +27,14 @@ import {
 // ---------------------------------------------------------------------------
 // In-app worker (uniform dispatch, opt-in) — NestJS wiring.
 //
-// `DurableModule.forRoot({ ..., inAppWorker: { group, connection } })` turns one app into engine +
-// worker: every discovered `@Workflow` is registered GROUP-SERVED (its turns dispatched to `group`)
-// and a co-located `DurableWorkerRuntime` consumes `group` (via `runRedisWorker`) to replay the SAME
-// bodies. These specs assert the WIRING (registration + consumer start) with a fake `runRedisWorker`
-// and a workflow-task transport double — no Redis. The full dispatch→replay loop is proven at the
-// core/worker level (packages/worker/in-app-worker.spec) over the real executor + worker.
+// `DurableModule.forRoot({ ..., inAppWorker: { partition?, connection } })` turns one app into engine
+// + worker: every discovered `@Workflow` is registered GROUP-SERVED — its turns dispatched, PER
+// WORKFLOW NAME, to `tenantGroup(sanitizeQueueToken(name), partition)` — and a co-located
+// `DurableWorkerRuntime` subscribes one queue per discovered name (via `runRedisWorker`, Task 5) to
+// replay the SAME bodies. These specs assert the WIRING (registration + consumer start + PER-WORKFLOW
+// routing token) with a fake `runRedisWorker` and a workflow-task transport double — no Redis. The
+// full dispatch→replay loop is proven at the core/worker level (packages/worker/in-app-worker.spec)
+// over the real executor + worker.
 // ---------------------------------------------------------------------------
 
 @Workflow({ name: 'greet', version: '1' })
@@ -42,6 +49,20 @@ class Emails {
   @Step('emails.send')
   async send(input: { to: string }) {
     return { sent: input.to };
+  }
+}
+
+@Workflow({ name: 'alpha', version: '1' })
+class AlphaWorkflow {
+  async run(ctx: WorkflowCtx, input: unknown) {
+    return ctx.step('alpha.step', () => input);
+  }
+}
+
+@Workflow({ name: 'beta', version: '1' })
+class BetaWorkflow {
+  async run(ctx: WorkflowCtx, input: unknown) {
+    return ctx.step('beta.step', () => input);
   }
 }
 
@@ -65,7 +86,7 @@ class InProcessOnlyTransport implements Transport {
 }
 
 interface FakeRunner {
-  calls: Array<{ group: string; connection: unknown; prefix?: string; instanceId?: string }>;
+  calls: Array<{ connection: unknown; prefix?: string; instanceId?: string; partition?: string }>;
   handles: Array<{ closed: boolean }>;
   runRedisWorker: RunRedisWorkerFn;
 }
@@ -78,10 +99,10 @@ function fakeRunner(): FakeRunner {
     handles,
     runRedisWorker: async (opts) => {
       calls.push({
-        group: opts.group,
         connection: opts.connection,
-        prefix: opts.prefix,
-        instanceId: opts.instanceId,
+        ...(opts.prefix !== undefined ? { prefix: opts.prefix } : {}),
+        ...(opts.instanceId !== undefined ? { instanceId: opts.instanceId } : {}),
+        ...(opts.partition !== undefined ? { partition: opts.partition } : {}),
       });
       const handle = { closed: false };
       handles.push(handle);
@@ -95,7 +116,7 @@ function fakeRunner(): FakeRunner {
 }
 
 describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
-  it('registers @Workflow group-served and starts a co-located consumer on the group', async () => {
+  it('registers @Workflow group-served (per-name token) and starts a co-located consumer', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
       imports: [
@@ -104,7 +125,7 @@ describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
           transport: new WorkflowTaskTransport(),
           autoSchema: false,
           inAppWorker: {
-            group: 'app',
+            partition: 'tenantA',
             connection: 'redis://x',
             prefix: 'durable',
             instanceId: 'w1',
@@ -119,19 +140,20 @@ describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
     moduleRef.enableShutdownHooks();
     await moduleRef.init();
 
-    // ENGINE half: the workflow is group-served — the engine dispatches its turns to `app`, and the
-    // retained TS body is reachable by name for the consumer.
+    // ENGINE half: the workflow is group-served — the engine dispatches its turns to its OWN
+    // name-derived token, and the retained TS body is reachable by name for the consumer.
     const engine = moduleRef.get(WorkflowEngine);
-    expect(engine.knownGroups()).toEqual(['app']);
+    expect(engine.knownGroups()).toEqual([tenantGroup(sanitizeQueueToken('greet'), 'tenantA')]);
     expect(engine.workflowBody('greet', '1')).toBeTypeOf('function');
 
     // CONSUMER half: the same body + step are registered on the co-located runtime, and one consumer
-    // started on the group with the configured connection/prefix/instanceId.
+    // started with the configured partition/connection/prefix/instanceId (subscription itself is
+    // derived from `runtime.registeredNames()` inside `runRedisWorker`, one queue per name).
     const runtime = moduleRef.get<DurableWorkerRuntime>(IN_APP_WORKER_RUNTIME);
     expect(runtime.workflows.handles('greet')).toBe(true);
     expect(runtime.steps.handles('emails.send')).toBe(true);
     expect(runner.calls).toEqual([
-      { group: 'app', connection: 'redis://x', prefix: 'durable', instanceId: 'w1' },
+      { connection: 'redis://x', prefix: 'durable', instanceId: 'w1', partition: 'tenantA' },
     ]);
 
     await moduleRef.close();
@@ -174,7 +196,7 @@ describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
             store: new InMemoryStateStore(),
             transport: new InProcessOnlyTransport(),
             autoSchema: false,
-            inAppWorker: { group: 'app', connection: 'redis://x' },
+            inAppWorker: { connection: 'redis://x' },
           }),
         ],
         providers: [GreetWorkflow],
@@ -183,5 +205,39 @@ describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
         .useValue(runner.runRedisWorker)
         .compile(),
     ).rejects.toThrow(/transport that carries workflow tasks/);
+  });
+
+  it('registers each @Workflow group-served under ITS OWN name-derived token, not one shared group', async () => {
+    // The bug this locks in: a single static executor bound to every discovered `@Workflow` would
+    // register alpha AND beta group-served under the SAME fixed token, while the co-located worker
+    // (Task 5) subscribes one queue PER REGISTERED NAME — so a turn under the wrong token is never
+    // consumed. The fix: a PER-WORKFLOW `RemoteWorkflowExecutor`, keyed by that workflow's own name,
+    // so each registers under `tenantGroup(sanitizeQueueToken(name), partition)`. `knownGroups()`
+    // surfaces exactly those registered group-served tokens (see the single-workflow test above).
+    const runner = fakeRunner();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          store: new InMemoryStateStore(),
+          transport: new WorkflowTaskTransport(),
+          autoSchema: false,
+          inAppWorker: { partition: 'tenantA', connection: 'redis://x' },
+        }),
+      ],
+      providers: [AlphaWorkflow, BetaWorkflow],
+    })
+      .overrideProvider(IN_APP_RUN_REDIS_WORKER)
+      .useValue(runner.runRedisWorker)
+      .compile();
+    await moduleRef.init();
+
+    const engine = moduleRef.get(WorkflowEngine);
+    const alphaToken = tenantGroup(sanitizeQueueToken('alpha'), 'tenantA');
+    const betaToken = tenantGroup(sanitizeQueueToken('beta'), 'tenantA');
+    // Both workflows registered, EACH under its own name-derived token — not collapsed onto one.
+    expect(engine.knownGroups().sort()).toEqual([alphaToken, betaToken].sort());
+    expect(alphaToken).not.toBe(betaToken);
+
+    await moduleRef.close();
   });
 });

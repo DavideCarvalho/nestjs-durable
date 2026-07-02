@@ -1,11 +1,14 @@
 import {
   DURABLE_OPTIONS_CANONICAL,
+  RemoteWorkflowExecutor,
   STATE_STORE_CANONICAL,
   type StateStore,
   type WorkflowCtx,
   WorkflowEngine,
   type WorkflowRun,
   parseDuration,
+  sanitizeQueueToken,
+  tenantGroup,
   workflowName,
 } from '@dudousxd/nestjs-durable-core';
 import {
@@ -118,10 +121,23 @@ export class WorkflowRegistrar
         onEvent: getOnEvents(meta, workflowCtor),
         eventBatch,
         // Uniform dispatch (opt-in): when an in-app worker is configured, register the body GROUP-SERVED
-        // so the engine dispatches its turns to the app's own group instead of running it inline; the
-        // co-located worker consumer replays the same body. Absent → the inline fast path (unchanged).
+        // so the engine dispatches its turns over the transport instead of running it inline; the
+        // co-located worker consumer (Task 5: one queue PER REGISTERED NAME) replays the same body.
+        // The routing token — and the executor that dispatches under it — MUST be keyed by THIS
+        // workflow's own name (`tenantGroup(sanitizeQueueToken(meta.name), partition)`), not a single
+        // group shared across every discovered `@Workflow`: a fixed shared token would dispatch every
+        // workflow's turns to one queue while the co-located worker subscribes one queue per name,
+        // so a turn dispatched under the wrong token would never be consumed. Absent → the inline fast
+        // path (unchanged).
         ...(this.inAppWorker
-          ? { group: this.inAppWorker.group, executor: this.inAppWorker.executor }
+          ? {
+              group: tenantGroup(sanitizeQueueToken(meta.name), this.inAppWorker.partition),
+              executor: new RemoteWorkflowExecutor(
+                this.inAppWorker.transport,
+                meta.name,
+                this.inAppWorker.partition,
+              ),
+            }
           : {}),
       });
 

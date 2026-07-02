@@ -326,10 +326,11 @@ export interface DurableModuleOptions {
   scopeReads?: boolean;
   /**
    * Opt into an **in-app worker** (uniform dispatch): the same process runs the engine AND serves its
-   * own discovered `@Workflow`/`@Step` on one default `group`. Each `@Workflow` is registered
-   * GROUP-SERVED — its turns are dispatched to `group` over the transport and replayed by a co-located
-   * worker consumer — instead of run inline. Requires a workflow-task transport (BullMQ). Omit (the
-   * default) to keep every `@Workflow` on the inline fast path with zero dispatch round-trips. See
+   * own discovered `@Workflow`/`@Step`. Each `@Workflow` is registered GROUP-SERVED — its turns are
+   * dispatched, PER WORKFLOW NAME, to `tenantGroup(sanitizeQueueToken(name), partition)` over the
+   * transport and replayed by a co-located worker consumer that subscribes one queue per discovered
+   * name — instead of run inline. Requires a workflow-task transport (BullMQ). Omit (the default) to
+   * keep every `@Workflow` on the inline fast path with zero dispatch round-trips. See
    * {@link DurableInAppWorkerOptions}.
    */
   inAppWorker?: DurableInAppWorkerOptions;
