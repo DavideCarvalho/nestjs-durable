@@ -3,6 +3,7 @@ import {
   type SearchAttributes,
   type StartRunMessage,
   type WorkflowStepEvent,
+  sanitizeQueueToken,
   tenantGroup,
 } from '@dudousxd/nestjs-durable-core';
 import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency';
@@ -82,32 +83,43 @@ const DEFAULT_LOCK_DURATION_MS = 5 * 60_000;
 export type RedisConnection = unknown;
 
 export interface RunRedisWorkerOptions {
-  /** The pure routing core: holds the registered workflows + steps. */
+  /** The pure routing core: holds the registered workflows + steps — ALSO the subscription surface:
+   *  the runner starts one BullMQ `Worker` per name in `runtime.registeredNames()` (workflows ∪
+   *  steps), not a single hand-declared group queue. */
   runtime: DurableWorkerRuntime;
-  /** The base worker group this instance serves (before any tenant suffix — see {@link tenant}). */
-  group: string;
+  /**
+   * @deprecated No longer the subscription axis. Subscription is derived from
+   * `runtime.registeredNames()` (one queue per registered handler name) instead of a single
+   * hand-declared group. Accepted for back-compat and ignored for routing; a one-time deprecation
+   * warning is logged when set.
+   */
+  group?: string;
   /** ioredis connection options (or an IORedis instance), as `BullMQTransport` takes. */
   connection: RedisConnection;
   /** Key prefix namespacing the durable queues. Defaults to `durable` (matches the transport). */
   prefix?: string;
   /**
-   * The tenant this worker instance serves — DISTINCT from {@link prefix} (the transport prefix
-   * stays whatever it is, typically shared with the control plane). Only the worker GROUP it
-   * registers/heartbeats under is derived via `tenantGroup(group, tenant)`
-   * (`@dudousxd/nestjs-durable-core`): `undefined`, `''`, or `'default'` yields the bare
-   * {@link group} (production byte-identical — a single-tenant deployment never sees a suffix);
-   * any other tenant yields `<group>@<tenant>`, so an operator control plane's
+   * The isolation partition this worker instance serves — DISTINCT from {@link prefix} (the
+   * transport prefix stays whatever it is, typically shared with the control plane). Each
+   * per-handler queue token is derived via `tenantGroup(sanitizeQueueToken(name), partition)`
+   * (`@dudousxd/nestjs-durable-core`): `undefined`, `''`, or `'default'` yields the bare sanitized
+   * `name` (production byte-identical — a single-tenant deployment never sees a suffix); any other
+   * partition yields `<name>@<partition>`, so an operator control plane's
    * `listWorkerGroups()`/`resolveRemoteByConvention` can route that tenant's runs to this worker.
    */
+  partition?: string;
+  /** @deprecated Use {@link partition} instead — a back-compat alias mapped onto it (only used when
+   *  `partition` itself is unset). */
   tenant?: string;
   /** Stable id for this worker process in heartbeats/control. Defaults to `ts-<hostname>-<pid>`. */
   instanceId?: string;
   /** Override the Worker's job-lock duration (ms). Defaults to 5 min — see {@link DEFAULT_LOCK_DURATION_MS}. */
   lockDuration?: number;
   /**
-   * How many tasks this worker runs concurrently from its group's queue (BullMQ Worker concurrency).
-   * Defaults to 1. Raise it so a fanned-out batch (e.g. the N remote steps of a `gather`) runs in
-   * parallel instead of serially. Per process; total parallelism is `concurrency × replicas`.
+   * How many tasks this worker runs concurrently PER SUBSCRIBED QUEUE (BullMQ Worker concurrency —
+   * the same limit is applied to every per-name `Worker` this runner starts). Defaults to 1. Raise
+   * it so a fanned-out batch (e.g. the N remote steps of a `gather`) runs in parallel instead of
+   * serially. Per process; total parallelism is `concurrency × distinct names × replicas`.
    *
    * Pass `'adaptive'` (or `{ mode:'adaptive', min, max, start, ramCeilingPct, cpuCeilingPct, tickMs }`)
    * to let an {@link AdaptiveController} self-tune the limit from a latency gradient, a RAM hard brake
@@ -191,31 +203,44 @@ function workerConnection(connection: RedisConnection): RedisConnection {
 }
 
 /**
- * Start a BullMQ worker that consumes `<prefix>-tasks-<group>` and drives the {@link DurableWorkerRuntime}.
+ * Start one BullMQ `Worker` per name in `runtime.registeredNames()` (workflows ∪ steps, deduped),
+ * each consuming `<prefix>-tasks-<sanitized-name>[@<partition>]`, and drive the
+ * {@link DurableWorkerRuntime} for every job across all of them.
  *
- * The queue carries BOTH workflow tasks and remote step tasks (the engine adds them to the same
- * per-group queue): each job is handed to `runtime.handleTask`, which routes by shape and returns
- * either a {@link import('@dudousxd/nestjs-durable-core').WorkflowDecision} — published on
- * `<prefix>-decisions` — or a {@link import('@dudousxd/nestjs-durable-core').StepResult} — published
- * on `<prefix>-results`. A thin Node port of the Python `run_redis_workflow_worker` / `run_redis_worker`,
- * collapsed into one runner because the TS `handleTask` discriminates the two task kinds itself.
+ * Each queue carries BOTH workflow tasks and remote step tasks dispatched at that name (the engine
+ * adds them to the same per-name queue): every job is handed to `runtime.handleTask`, which routes
+ * by shape and returns either a {@link import('@dudousxd/nestjs-durable-core').WorkflowDecision} —
+ * published on `<prefix>-decisions` — or a {@link import('@dudousxd/nestjs-durable-core').StepResult}
+ * — published on `<prefix>-results`. A thin Node port of the Python `run_redis_worker`, collapsed
+ * into one runner because the TS `handleTask` discriminates the two task kinds itself.
  *
  * It also (best-effort): subscribes to `<prefix>-control` and feeds cancellation into the replay's
  * `isCancelled`; streams each local step's lifecycle onto `<prefix>-step-events`; and stamps a TTL'd
- * worker-liveness heartbeat key. None of these can block the worker from starting or processing.
+ * worker-liveness heartbeat key PER subscribed name. None of these can block the worker from
+ * starting or processing.
  *
- * `await close()` on the returned handle to drain + stop the worker, queues, and pub/sub.
+ * `await close()` on the returned handle to drain + stop every worker, the queues, and pub/sub.
  */
 export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<RunningWorker> {
   const prefix = options.prefix ?? DEFAULT_PREFIX;
   const instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
   const lockDuration = options.lockDuration ?? DEFAULT_LOCK_DURATION_MS;
   const deps = options.deps ?? (await loadDeps());
-  const { runtime, group, connection } = options;
-  // The GROUP this instance actually registers/heartbeats under: tenant-suffixed for a real
-  // tenant, byte-identical to `group` for undefined/''/'default'. The transport `prefix` above is
-  // untouched by `tenant` — only the group name carries it (see `RunRedisWorkerOptions.tenant`).
-  const effectiveGroup = tenantGroup(group, options.tenant);
+  const { runtime, connection } = options;
+  const partition = options.partition ?? options.tenant;
+  if (options.group !== undefined) {
+    console.warn(
+      'runRedisWorker({ group }) is deprecated: subscription is now derived from ' +
+        '`runtime.registeredNames()` (one queue per registered workflow/step name). `group` is ' +
+        'accepted for back-compat and ignored for routing — use `partition` for isolation instead.',
+    );
+  }
+  // One queue TOKEN per distinct registered name (workflows ∪ steps, deduped): the token IS the
+  // routing address the engine dispatches that name's tasks on — `tenantGroup(sanitizeQueueToken(
+  // name), partition)` — byte-identical to the expression the engine + transport use (Task 2/4).
+  const { workflows, steps } = runtime.registeredNames();
+  const names = [...new Set([...workflows, ...steps])];
+  const queueTokens = names.map((name) => tenantGroup(sanitizeQueueToken(name), partition));
 
   const queueOpts = { connection };
   const decisions = new deps.Queue(decisionsName(prefix), queueOpts);
@@ -233,15 +258,15 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   };
 
   // The concurrency controller: tracks inFlight + a rolling window of completions, snapshots a live
-  // status for the heartbeat, and (adaptive mode) re-tunes the live limit. `apply` writes the BullMQ
-  // Worker's settable `concurrency`; the Worker is created below with the controller's initial limit.
-  // A holder lets `apply` reference the Worker before it's constructed (controller never calls back
-  // before `start()`), keeping `worker` a `const`.
-  const workerRef: { current?: InstanceType<RunnerDeps['Worker']> } = {};
+  // status for the heartbeat, and (adaptive mode) re-tunes the live limit. `apply` writes the SAME
+  // settable `concurrency` on EVERY per-name Worker this runner starts; they're created below with
+  // the controller's initial limit. A holder lets `apply` reference the Workers before they're
+  // constructed (controller never calls back before `start()`), keeping `workers` a `const`.
+  const workersRef: { current: Array<InstanceType<RunnerDeps['Worker']>> } = { current: [] };
   const controller = new AdaptiveController({
     ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
     apply: (limit) => {
-      if (workerRef.current) workerRef.current.concurrency = limit;
+      for (const w of workersRef.current) w.concurrency = limit;
     },
   });
 
@@ -250,9 +275,11 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
     // While replaying a WORKFLOW turn, beat run-scoped liveness so the engine's heartbeat-rearmed
     // `advance` deadline never re-drives a worker that's alive-but-slow. Only workflow tasks carry a
     // run the engine awaits an `advance` for; a remote-step task is not beaten (harmless either way).
+    // `task.group` is the FINAL routing token the engine already stamped at dispatch (Task 2) — the
+    // exact queue this job arrived on — so it's used verbatim rather than recomputed here.
     const stopBeat =
       isWorkflowTask(task) && heartbeatClient
-        ? startRunHeartbeat(heartbeatClient, prefix, effectiveGroup, task.runId)
+        ? startRunHeartbeat(heartbeatClient, prefix, task.group, task.runId)
         : () => {};
     const startedAt = Date.now();
     controller.onStart();
@@ -276,12 +303,14 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
     }
   };
 
-  const worker = new deps.Worker(tasksName(prefix, effectiveGroup), processJob, {
-    connection: workerConnection(connection),
-    lockDuration,
-    concurrency: controller.initialLimit,
-  });
-  workerRef.current = worker;
+  workersRef.current = queueTokens.map(
+    (token) =>
+      new deps.Worker(tasksName(prefix, token), processJob, {
+        connection: workerConnection(connection),
+        lockDuration,
+        concurrency: controller.initialLimit,
+      }),
+  );
   // Run the control loop (a no-op-on-limit timer for a fixed worker, an AIMD loop for an adaptive one).
   controller.start();
 
@@ -306,12 +335,16 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       });
 
       heartbeatClient = base;
-      const key = workerHeartbeatKey(prefix, effectiveGroup, instanceId);
+      // One TTL'd key PER subscribed name/partition token, so `listWorkerGroups()` reports liveness
+      // per queue rather than one blended signal for a process that may serve several handlers.
+      const keys = queueTokens.map((token) => workerHeartbeatKey(prefix, token, instanceId));
       const beat = () => {
         // The heartbeat value is now `{ts,status}` JSON (was a bare ms timestamp) — readers accept
         // both. The status is the controller's live snapshot, refreshed cheaply on every beat.
         const value = JSON.stringify({ ts: Date.now(), status: controller.snapshot() });
-        void heartbeatClient?.set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS).catch(() => {});
+        for (const key of keys) {
+          void heartbeatClient?.set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS).catch(() => {});
+        }
       };
       beat(); // fire immediately so a fresh worker is visible without waiting a full interval
       heartbeatTimer = setInterval(beat, WORKER_HEARTBEAT_INTERVAL_MS);
@@ -327,7 +360,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
     async close(): Promise<void> {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       controller.stop();
-      await worker.close();
+      await Promise.all(workersRef.current.map((w) => w.close()));
       await Promise.all([decisions.close(), results.close(), stepEvents.close()]);
       controlSub?.disconnect();
       heartbeatClient?.disconnect();

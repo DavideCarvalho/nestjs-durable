@@ -36,6 +36,11 @@ export class WorkflowWorker {
     return this.workflows.has(name);
   }
 
+  /** Every registered workflow name — the subscription surface the runner subscribes one queue per. */
+  get names(): string[] {
+    return [...this.workflows.keys()];
+  }
+
   /**
    * Replay one turn of `task`'s workflow and return the wire-format decision. `onStep`, when given,
    * streams each local step's lifecycle (running → completed/failed) to the engine live;
@@ -58,9 +63,9 @@ export class WorkflowWorker {
     }
 
     const ctx = new WorkflowContext(task.runId, task.history, {
-      // A no-explicit-group `ctx.call` step inherits THIS worker's group, so the step lands on the
-      // same `<prefix>-tasks-<group>` queue as the workflow (the "one group, one worker" model).
-      workflowGroup: this.group,
+      // A no-explicit-partition `ctx.call`/`ctx.remote` step inherits THIS worker's group as its
+      // partition — continuity with the pre-redesign "one group, one worker" default.
+      workflowPartition: this.group,
       pendingSignals: task.pendingSignals,
       onStep: opts.onStep,
       isCancelled: opts.isCancelled,

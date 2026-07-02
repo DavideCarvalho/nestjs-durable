@@ -46,13 +46,13 @@ export type StepBody<T> = (log: StepLogger) => Promise<T> | T;
 /** Options for constructing a {@link WorkflowContext}. */
 export interface WorkflowContextOptions {
   /**
-   * The group of the WORKFLOW this context replays (the worker's own group). When a `ctx.call` step
-   * carries no explicit group, the emitted `call` command inherits THIS group, so the step lands on
-   * the same `<prefix>-tasks-<group>` queue as the workflow — the "one group, one worker" model. The
-   * runner ({@link import('./workflow-worker').WorkflowWorker}) threads its own `group` in here.
-   * Absent → the legacy dot-prefix fallback on the step def is used (see {@link WorkflowContext.call}).
+   * The isolation partition of the WORKFLOW this context replays (the worker's own partition, if
+   * any). When a `ctx.call`/`ctx.remote` step carries no explicit `partition`, the emitted `call`
+   * decision inherits THIS partition — see {@link WorkflowContext.call}. The runner
+   * ({@link import('./workflow-worker').WorkflowWorker}) threads its own partition in here.
+   * Absent → the step's decision carries no partition (routes on the bare sanitized name).
    */
-  workflowGroup?: string | undefined;
+  workflowPartition?: string | undefined;
   /** Signals delivered to the run but not yet consumed, so `waitSignal` resolves on replay. */
   pendingSignals?: Array<{ seq: number; signal: string; payload: unknown }> | undefined;
   /**
@@ -98,7 +98,7 @@ export class WorkflowContext implements WorkflowCtx {
   private readonly signalsBySeq: Map<number, { seq: number; signal: string; payload: unknown }>;
   private readonly onStep: ((event: WorkflowStepEvent) => void) | undefined;
   private readonly isCancelled: ((runId: string) => boolean) | undefined;
-  private readonly workflowGroup: string | undefined;
+  private readonly workflowPartition: string | undefined;
   private seq = 0;
 
   constructor(runId: string, history: HistoryEvent[], opts: WorkflowContextOptions = {}) {
@@ -107,7 +107,7 @@ export class WorkflowContext implements WorkflowCtx {
     this.signalsBySeq = new Map((opts.pendingSignals ?? []).map((s) => [s.seq, s]));
     this.onStep = opts.onStep;
     this.isCancelled = opts.isCancelled;
-    this.workflowGroup = opts.workflowGroup;
+    this.workflowPartition = opts.workflowPartition;
   }
 
   // -- internals -----------------------------------------------------------
@@ -172,21 +172,18 @@ export class WorkflowContext implements WorkflowCtx {
   }
 
   /**
-   * Resolve the `group` a `ctx.call` command should carry, mirroring the Python SDK's RULE:
-   * **explicit group on the call wins; else the workflow's own group; else the legacy dot-prefix
-   * fallback** (the `<name-before-first-dot>` `remoteStep()` bakes in when no group is given).
-   *
-   * Because core's `remoteStep()` eagerly bakes the dot-prefix into `RemoteStepDef.group` (the field
-   * is never absent), "explicit" is inferred here: a group that DIFFERS from the name's dot-prefix
-   * was set deliberately and wins. A group that equals the dot-prefix is treated as the implicit
-   * default, so it yields to the workflow group when one is available — which is exactly what lets a
-   * workflow + its steps collapse onto ONE group. With no workflow group (a bare `WorkflowContext`),
-   * the dot-prefix on the def is the final fallback, preserving the pre-unification behaviour.
+   * Resolve the `group` field a `call` decision carries. This is the TRANSITIONAL wire carrier
+   * during the deprecation window (Cross-SDK decision protocol): a `call` decision emitted by a
+   * replaying worker carries the step's PARTITION ONLY — never a full queue token — because the
+   * engine composes the final routing token itself via
+   * `tenantGroup(sanitizeQueueToken(cmd.name), cmd.group)`. So the rule is simply: an explicit
+   * `step.partition` wins; else the WORKFLOW's own partition ({@link workflowPartition}); else `''`
+   * (no partition at all — `tenantGroup` treats `''` identically to `undefined`, i.e. a bare token).
+   * The `''` floor exists only because the wire's `group` field is a required `string`. Mirrors the
+   * Python SDK's parity rule (Task 8).
    */
   private resolveCallGroup(step: RemoteStepDef): string {
-    const dotPrefixDefault = step.name.split('.')[0] ?? step.name;
-    const explicitGroup = step.group !== dotPrefixDefault ? step.group : undefined;
-    return explicitGroup ?? this.workflowGroup ?? step.group;
+    return step.partition ?? this.workflowPartition ?? '';
   }
 
   private guard(ev: HistoryEvent, seq: number, kind: HistoryEvent['kind'], name?: string): void {
@@ -204,16 +201,18 @@ export class WorkflowContext implements WorkflowCtx {
   // -- the workflow API (supported) ----------------------------------------
 
   /**
-   * Dispatch a typed remote step (any-language worker in its `group`) and await its result. The
-   * engine's `ctx.call` takes a {@link RemoteStepDef} (not a name): we read its `name`/`group` and
-   * emit the wire `call` command. `opts` (`queue`/`priority`/`fairnessKey`/`transport`) are
-   * engine-side ADMISSION concerns — accepted for `WorkflowCtx` conformance, but the remote wire
-   * has no place for them, so they don't change the worker's emitted command. Mirrors Python `call`.
+   * Dispatch a typed remote step (routed by its handler `name`, optionally partitioned) and await
+   * its result. The engine's `ctx.remote` (primary name; `ctx.call` is a deprecated back-compat
+   * alias — see {@link call}) takes a {@link RemoteStepDef} (not a bare name): we read its
+   * `name`/`partition` and emit the wire `call` decision. `opts`
+   * (`queue`/`priority`/`fairnessKey`/`transport`) are engine-side ADMISSION concerns — accepted for
+   * `WorkflowCtx` conformance, but the remote wire has no place for them, so they don't change the
+   * worker's emitted command. Mirrors Python `call`/core's `ctx.remote` (Task 1).
    *
-   * The command's `group` defaults to the WORKFLOW's group when the step set none explicitly — see
-   * {@link resolveCallGroup} — so a workflow and its steps collapse onto one group / one worker.
+   * The decision's `group` field carries the step's PARTITION when the step set none explicitly —
+   * see {@link resolveCallGroup} — falling back to the WORKFLOW's own partition.
    */
-  async call<TInput, TOutput>(
+  async remote<TInput, TOutput>(
     step: RemoteStepDef<TInput, TOutput>,
     input: TInput,
     _opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
@@ -224,6 +223,18 @@ export class WorkflowContext implements WorkflowCtx {
     const group = this.resolveCallGroup(step);
     this.commands.push({ kind: 'call', seq, name: step.name, group, input });
     throw new Suspend();
+  }
+
+  /**
+   * @deprecated Use {@link remote} instead. `call` is a back-compat alias — same replay machinery,
+   * same emitted `call` decision. Removed in a future major.
+   */
+  call<TInput, TOutput>(
+    step: RemoteStepDef<TInput, TOutput>,
+    input: TInput,
+    opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
+  ): Promise<TOutput> {
+    return this.remote(step, input, opts);
   }
 
   /**

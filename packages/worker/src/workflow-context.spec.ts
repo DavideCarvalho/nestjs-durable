@@ -11,12 +11,12 @@ import { WorkflowContext } from './workflow-context';
 
 /**
  * A typed remote step def used to drive `ctx.call` (the engine's `call` takes a def, not a name).
- * The `input`/`output` zod schemas don't matter for the worker — it only reads `name`/`group` —
+ * The `input`/`output` zod schemas don't matter for the worker — it only reads `name`/`partition` —
  * so we stub them rather than pull zod into the worker's test deps.
  */
 const ingest = {
   name: 'ingest',
-  group: 'data',
+  partition: 'data',
   input: {} as never,
   output: {} as never,
   __remote: true,
@@ -96,7 +96,7 @@ describe('WorkflowContext.step', () => {
 });
 
 describe('WorkflowContext.call', () => {
-  it('accepts a RemoteStepDef and emits a call command with its name/group, then suspends', async () => {
+  it('accepts a RemoteStepDef and emits a call command with its name/partition, then suspends', async () => {
     const ctx = new WorkflowContext('r1', []);
     await expect(ctx.call(ingest, { a: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
@@ -123,39 +123,38 @@ describe('WorkflowContext.call', () => {
   });
 });
 
-describe('WorkflowContext.call group defaulting', () => {
-  /** A step with NO explicit group: `remoteStep()` would bake `group = <name-before-first-dot>`, so
-   *  `group` equals the dot-prefix default and counts as "not explicit". */
+describe('WorkflowContext.call partition defaulting (Cross-SDK decision protocol)', () => {
+  /** A step with NO explicit partition: the emitted decision's `group` should fall back to the
+   *  workflow's own partition (or `''` when there is none — see `resolveCallGroup`). */
   const charge = {
     name: 'charge',
-    group: 'charge', // == dot-prefix of 'charge' → implicit default
     input: {} as never,
     output: {} as never,
     __remote: true,
   } as const satisfies RemoteStepDef<{ amount: number }, { ok: boolean }>;
 
-  it("a no-explicit-group step inherits the workflow's group", async () => {
-    const ctx = new WorkflowContext('r1', [], { workflowGroup: 'processing' });
+  it("a no-explicit-partition step inherits the workflow's partition", async () => {
+    const ctx = new WorkflowContext('r1', [], { workflowPartition: 'processing' });
     await expect(ctx.call(charge, { amount: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
       { kind: 'call', seq: 0, name: 'charge', group: 'processing', input: { amount: 1 } },
     ]);
   });
 
-  it('an explicit group wins over the workflow group', async () => {
-    // `ingest` has group 'data' (≠ dot-prefix 'ingest') → set deliberately, so it wins.
-    const ctx = new WorkflowContext('r1', [], { workflowGroup: 'processing' });
+  it('an explicit partition on the step wins over the workflow partition', async () => {
+    // `ingest` carries an explicit partition 'data' → wins over the workflow's 'processing'.
+    const ctx = new WorkflowContext('r1', [], { workflowPartition: 'processing' });
     await expect(ctx.call(ingest, { a: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
       { kind: 'call', seq: 0, name: 'ingest', group: 'data', input: { a: 1 } },
     ]);
   });
 
-  it('falls back to the dot-prefix when no workflow group is available', async () => {
-    const ctx = new WorkflowContext('r1', []); // no workflowGroup
+  it('falls back to no partition (empty group) when neither the step nor the workflow set one', async () => {
+    const ctx = new WorkflowContext('r1', []); // no workflowPartition
     await expect(ctx.call(charge, { amount: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
-      { kind: 'call', seq: 0, name: 'charge', group: 'charge', input: { amount: 1 } },
+      { kind: 'call', seq: 0, name: 'charge', group: '', input: { amount: 1 } },
     ]);
   });
 });

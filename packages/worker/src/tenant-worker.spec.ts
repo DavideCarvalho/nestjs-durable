@@ -5,10 +5,13 @@ import { runRedisWorker, startRun } from './redis-runner';
 import { DurableWorkerRuntime } from './runner-core';
 
 /**
- * P4C.2 — a worker's `tenant` is DISTINCT from its transport prefix: only the worker GROUP it
- * registers/heartbeats under gets tenant-suffixed (`tenantGroup(baseGroup, tenant)`), so an
- * operator control plane's `listWorkerGroups()` sees `<workflow>@<tenant>` for a real tenant,
- * and the bare `<workflow>` for `undefined`/`'default'` — production byte-identical.
+ * P4C.2 — a worker's `partition` is DISTINCT from its transport prefix: only the per-name queue
+ * TOKEN it registers/heartbeats under gets partition-suffixed (`tenantGroup(sanitizeQueueToken(
+ * name), partition)`), so an operator control plane's `listWorkerGroups()` sees
+ * `<workflow>@<partition>` for a real partition, and the bare `<workflow>` for
+ * `undefined`/`'default'` — production byte-identical. `tenant` is a deprecated alias for
+ * `partition`; `group` no longer affects routing at all (subscription is derived from the
+ * runtime's registered names).
  *
  * These tests reuse the fake-bullmq/fake-ioredis pattern from `redis-runner.spec.ts` and the
  * `startRun` wire-payload pattern from `start-run-client.spec.ts` rather than inventing new fakes.
@@ -21,18 +24,20 @@ interface CapturedSet {
 
 function makeFakeDeps(): {
   deps: RunnerDeps;
-  workerQueueName: () => string | undefined;
+  workerQueueNames: () => string[];
   publishedHeartbeats: () => Array<{ channel: string; payload: string }>;
   sets: () => CapturedSet[];
-  run: (job: { data: unknown }) => Promise<unknown> | undefined;
+  run: (queueName: string, job: { data: unknown }) => Promise<unknown> | undefined;
 } {
   const published: Array<{ channel: string; payload: string }> = [];
   const sets: CapturedSet[] = [];
-  let processor: ((job: { data: unknown }) => Promise<unknown>) | undefined;
-  let workerQueueName: string | undefined;
+  const workers: Array<{
+    name: string;
+    processor: (job: { data: unknown }) => Promise<unknown>;
+  }> = [];
 
   // Mirrors `redis-runner.spec.ts`'s FakeRedis, plus recording `set()` calls so a test can assert
-  // the exact worker-heartbeat KEY (which is where the tenant-suffixed group must show up).
+  // the exact worker-heartbeat KEY (which is where the partition-suffixed token must show up).
   class FakeRedis {
     duplicate() {
       return { subscribe: async () => {}, on: () => {}, disconnect: () => {} };
@@ -51,8 +56,7 @@ function makeFakeDeps(): {
   const deps: RunnerDeps = {
     Worker: class {
       constructor(name: string, proc: (job: { data: unknown }) => Promise<unknown>) {
-        workerQueueName = name;
-        processor = proc;
+        workers.push({ name, processor: proc });
       }
       async close() {}
     },
@@ -66,10 +70,11 @@ function makeFakeDeps(): {
 
   return {
     deps,
-    workerQueueName: () => workerQueueName,
+    workerQueueNames: () => workers.map((w) => w.name),
     publishedHeartbeats: () => published.filter((p) => p.channel === 'durable-heartbeat'),
     sets: () => sets,
-    run: (job: { data: unknown }) => processor?.(job),
+    run: (queueName: string, job: { data: unknown }) =>
+      workers.find((w) => w.name === queueName)?.processor(job),
   };
 }
 
@@ -88,27 +93,30 @@ function workflowTask(over: Partial<WorkflowTask> = {}): WorkflowTask {
   };
 }
 
-describe('runRedisWorker — tenant-suffixed worker group', () => {
-  it('consumes the tenant-suffixed tasks queue when a real tenant is configured', async () => {
+describe('runRedisWorker — partition-suffixed per-name queue', () => {
+  it('consumes the partition-suffixed tasks queue when a real partition is configured', async () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();
-    await runRedisWorker({
-      runtime,
-      group: 'processing',
-      tenant: 'davi-local',
-      connection: {},
-      deps: fake.deps,
-    });
-    expect(fake.workerQueueName()).toBe('durable-tasks-processing@davi-local');
+    runtime.registerWorkflow('processing', async () => 1);
+    await runRedisWorker({ runtime, partition: 'davi-local', connection: {}, deps: fake.deps });
+    expect(fake.workerQueueNames()).toEqual(['durable-tasks-processing@davi-local']);
   });
 
-  it('heartbeats the tenant-suffixed group key when a real tenant is configured', async () => {
+  it('`tenant` is a deprecated alias for `partition` (routes identically)', async () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('processing', async () => 1);
+    await runRedisWorker({ runtime, tenant: 'davi-local', connection: {}, deps: fake.deps });
+    expect(fake.workerQueueNames()).toEqual(['durable-tasks-processing@davi-local']);
+  });
+
+  it('heartbeats the partition-suffixed token key when a real partition is configured', async () => {
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('processing', async () => 1);
     await runRedisWorker({
       runtime,
-      group: 'processing',
-      tenant: 'davi-local',
+      partition: 'davi-local',
       connection: {},
       instanceId: 'ts-test-1',
       deps: fake.deps,
@@ -117,57 +125,46 @@ describe('runRedisWorker — tenant-suffixed worker group', () => {
     expect(beat?.key).toBe('durable-worker-heartbeat:processing@davi-local:ts-test-1');
   });
 
-  it('registers the BARE group when no tenant is configured (production byte-identical)', async () => {
+  it('registers the BARE token when no partition is configured (production byte-identical)', async () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();
-    await runRedisWorker({ runtime, group: 'processing', connection: {}, deps: fake.deps });
-    expect(fake.workerQueueName()).toBe('durable-tasks-processing');
+    runtime.registerWorkflow('processing', async () => 1);
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
+    expect(fake.workerQueueNames()).toEqual(['durable-tasks-processing']);
   });
 
-  it('registers the BARE group when tenant is "default" (byte-identical to unset)', async () => {
+  it('registers the BARE token when partition is "default" (byte-identical to unset)', async () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();
-    await runRedisWorker({
-      runtime,
-      group: 'processing',
-      tenant: 'default',
-      connection: {},
-      deps: fake.deps,
-    });
-    expect(fake.workerQueueName()).toBe('durable-tasks-processing');
+    runtime.registerWorkflow('processing', async () => 1);
+    await runRedisWorker({ runtime, partition: 'default', connection: {}, deps: fake.deps });
+    expect(fake.workerQueueNames()).toEqual(['durable-tasks-processing']);
   });
 
-  it('registers the BARE group for an empty-string tenant', async () => {
+  it('registers the BARE token for an empty-string partition', async () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();
-    await runRedisWorker({
-      runtime,
-      group: 'processing',
-      tenant: '',
-      connection: {},
-      deps: fake.deps,
-    });
-    expect(fake.workerQueueName()).toBe('durable-tasks-processing');
+    runtime.registerWorkflow('processing', async () => 1);
+    await runRedisWorker({ runtime, partition: '', connection: {}, deps: fake.deps });
+    expect(fake.workerQueueNames()).toEqual(['durable-tasks-processing']);
   });
 });
 
-describe('runRedisWorker — run-scoped heartbeat carries the tenant-suffixed group', () => {
+describe("runRedisWorker — run-scoped heartbeat carries the dispatched task's own routing token", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it('publishes the run-scoped beat with the tenant-suffixed group', async () => {
+  it('publishes the run-scoped beat with the (already partition-suffixed) task group', async () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();
     runtime.registerWorkflow('processing', async () => ({ done: true }));
-    await runRedisWorker({
-      runtime,
-      group: 'processing',
-      tenant: 'davi-local',
-      connection: {},
-      deps: fake.deps,
-    });
+    await runRedisWorker({ runtime, partition: 'davi-local', connection: {}, deps: fake.deps });
 
-    await fake.run({ data: workflowTask() });
+    // The dispatching engine (Task 2) already stamps the FINAL routing token onto the task itself —
+    // the runner threads that verbatim into the run-scoped beat, not a value it recomputes.
+    await fake.run('durable-tasks-processing@davi-local', {
+      data: workflowTask({ group: 'processing@davi-local' }),
+    });
 
     const beats = fake.publishedHeartbeats();
     expect(beats.length).toBeGreaterThanOrEqual(1);

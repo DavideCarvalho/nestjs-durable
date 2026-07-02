@@ -131,6 +131,15 @@ export class DurableWorkerRuntime {
   }
 
   /**
+   * Every workflow + step name registered on this runtime — the subscription surface a shell (e.g.
+   * {@link import('./redis-runner').runRedisWorker}) starts one consumer per (deduped across the
+   * union), instead of a single hand-declared group queue.
+   */
+  registeredNames(): { workflows: string[]; steps: string[] } {
+    return { workflows: this.workflows.names, steps: this.steps.names };
+  }
+
+  /**
    * Route one inbound task to the right worker and return its typed output. A {@link WorkflowTask}
    * replays a turn → `{ kind: 'decision' }`; a {@link RemoteTask} runs a step → `{ kind: 'result' }`.
    * Never throws on an unknown name: the underlying worker returns a `failed` decision/result (so a

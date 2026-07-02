@@ -2,16 +2,16 @@ import type { HistoryEvent, RemoteStepDef, WorkflowTask } from '@dudousxd/nestjs
 import { describe, expect, it } from 'vitest';
 import { WorkflowWorker } from './workflow-worker';
 
-/** A minimal typed remote step def for driving `ctx.call` in these tests (only name/group are read). */
-function remote(name: string, group = 'g'): RemoteStepDef {
-  return { name, group, input: {} as never, output: {} as never, __remote: true };
-}
-
-/** A step with NO explicit group: `remoteStep()` bakes `group = <name-before-first-dot>`, so the
- *  group equals the dot-prefix default and yields to the workflow's group at call-build time. */
-function remoteNoGroup(name: string): RemoteStepDef {
-  const dotPrefix = name.split('.')[0] ?? name;
-  return remote(name, dotPrefix);
+/** A minimal typed remote step def for driving `ctx.call` in these tests (only name/partition are
+ *  read). `partition` omitted → no explicit partition (falls back to the workflow's own). */
+function remote(name: string, partition?: string): RemoteStepDef {
+  return {
+    name,
+    ...(partition !== undefined ? { partition } : {}),
+    input: {} as never,
+    output: {} as never,
+    __remote: true,
+  };
 }
 
 function task(over: Partial<WorkflowTask> = {}): WorkflowTask {
@@ -124,25 +124,39 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   });
 });
 
-describe('WorkflowWorker threads its group into ctx.call defaulting', () => {
-  it("a no-explicit-group call inherits the worker's group", async () => {
+describe('WorkflowWorker.names', () => {
+  it('returns every registered workflow name', () => {
+    const wf = new WorkflowWorker();
+    wf.register('a', async () => 1);
+    wf.register('b', async () => 2);
+    expect(wf.names).toEqual(['a', 'b']);
+  });
+
+  it('returns an empty array when nothing is registered', () => {
+    const wf = new WorkflowWorker();
+    expect(wf.names).toEqual([]);
+  });
+});
+
+describe('WorkflowWorker threads its group into ctx.call partition defaulting', () => {
+  it("a no-explicit-partition call inherits the worker's group as its partition", async () => {
     const wf = new WorkflowWorker('processing');
     wf.register('wf', async (ctx) => {
-      await ctx.call(remoteNoGroup('ingest'), null);
+      await ctx.call(remote('ingest'), null);
     });
     const d = await wf.processTask(task());
     const call = d.commands[0];
     expect(call.kind).toBe('call');
     if (call.kind === 'call') {
       expect(call.name).toBe('ingest');
-      expect(call.group).toBe('processing'); // the workflow's own group, not the dot-prefix
+      expect(call.group).toBe('processing'); // the workflow's own group, threaded as partition
     }
   });
 
-  it('an explicit group on the step still wins over the worker group', async () => {
+  it('an explicit partition on the step still wins over the worker group', async () => {
     const wf = new WorkflowWorker('processing');
     wf.register('wf', async (ctx) => {
-      await ctx.call(remote('ingest', 'data'), null); // explicit 'data' ≠ dot-prefix 'ingest'
+      await ctx.call(remote('ingest', 'data'), null); // explicit partition
     });
     const d = await wf.processTask(task());
     const call = d.commands[0];
@@ -152,7 +166,7 @@ describe('WorkflowWorker threads its group into ctx.call defaulting', () => {
   it("the default worker group ('workflows') is what a bare worker defaults a call to", async () => {
     const wf = new WorkflowWorker(); // group defaults to 'workflows'
     wf.register('wf', async (ctx) => {
-      await ctx.call(remoteNoGroup('ingest'), null);
+      await ctx.call(remote('ingest'), null);
     });
     const d = await wf.processTask(task());
     const call = d.commands[0];

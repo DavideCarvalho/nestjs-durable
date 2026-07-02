@@ -15,6 +15,20 @@ function task(over: Partial<RemoteTask> = {}): RemoteTask {
   };
 }
 
+describe('StepWorker.names', () => {
+  it('returns every registered step name', () => {
+    const w = new StepWorker();
+    w.register('a', () => 1);
+    w.register('b', () => 2);
+    expect(w.names).toEqual(['a', 'b']);
+  });
+
+  it('returns an empty array when nothing is registered', () => {
+    const w = new StepWorker();
+    expect(w.names).toEqual([]);
+  });
+});
+
 describe('StepWorker.processTask', () => {
   it('maps a completed handler to a completed StepResult with output + startedAt', async () => {
     const w = new StepWorker();

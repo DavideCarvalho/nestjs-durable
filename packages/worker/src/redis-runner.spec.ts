@@ -3,14 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type RunnerDeps, runRedisWorker } from './redis-runner';
 import { DurableWorkerRuntime } from './runner-core';
 
-// A minimal fake bullmq surface: a Worker that captures its processor + a Queue that records `add`s,
-// so we can drive a job through the runner and assert it lands on the right queue — no Redis.
+// A minimal fake bullmq surface: EVERY `new Worker(...)` call is captured (the runner now starts
+// one per registered name), plus a Queue that records `add`s — so a test can drive a job through
+// the runner (routed to the fake Worker subscribed on the matching queue name) and assert what
+// landed where — no Redis.
 function makeFakeDeps(opts: { withRedis?: boolean } = {}) {
   const added: Array<{ queue: string; name: string; data: unknown }> = [];
   const published: Array<{ channel: string; payload: string }> = [];
-  let processor: ((job: { data: unknown }) => Promise<unknown>) | undefined;
-  let workerQueueName: string | undefined;
-  let workerOpts: Record<string, unknown> | undefined;
+  const workers: Array<{
+    name: string;
+    opts: Record<string, unknown>;
+    processor: (job: { data: unknown }) => Promise<unknown>;
+  }> = [];
 
   // A fake ioredis client recording `publish` (run/step heartbeats) — `set`/`subscribe`/`duplicate`
   // are stubs so the runner's best-effort control + worker-TTL setup runs without a real broker.
@@ -34,9 +38,7 @@ function makeFakeDeps(opts: { withRedis?: boolean } = {}) {
         proc: (job: { data: unknown }) => Promise<unknown>,
         wopts: Record<string, unknown>,
       ) {
-        workerQueueName = name;
-        workerOpts = wopts;
-        processor = proc;
+        workers.push({ name, opts: wopts, processor: proc });
       }
       async close() {}
     },
@@ -54,13 +56,17 @@ function makeFakeDeps(opts: { withRedis?: boolean } = {}) {
     deps,
     added,
     published,
-    run: (job: { data: unknown }) => processor?.(job),
-    get workerQueueName() {
-      return workerQueueName;
+    workers,
+    /** The queue names every started fake Worker subscribed on (one per registered name). */
+    get workerQueueNames(): string[] {
+      return workers.map((w) => w.name);
     },
-    get workerOpts() {
-      return workerOpts;
-    },
+    /** Options a specific queue's Worker was constructed with. */
+    workerOptsFor: (queueName: string) => workers.find((w) => w.name === queueName)?.opts,
+    /** Drive `job` through the fake Worker subscribed on `queueName` — mirrors BullMQ's per-queue
+     *  delivery (a job only ever reaches the Worker consuming ITS queue). */
+    run: (queueName: string, job: { data: unknown }) =>
+      workers.find((w) => w.name === queueName)?.processor(job),
   };
 }
 
@@ -93,21 +99,47 @@ function remoteTask(over: Partial<RemoteTask> = {}): RemoteTask {
 }
 
 describe('runRedisWorker wiring (faked bullmq, no Redis)', () => {
-  it('consumes the group tasks queue with a generous lockDuration', async () => {
+  it('subscribes one queue per registered name, NOT a single hand-declared group queue', async () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();
-    await runRedisWorker({ runtime, group: 'pipeline', connection: {}, deps: fake.deps });
-    expect(fake.workerQueueName).toBe('durable-tasks-pipeline');
-    expect(fake.workerOpts?.lockDuration).toBeGreaterThanOrEqual(60_000);
+    runtime.registerWorkflow('pipeline', async () => 1);
+    runtime.registerStep<number, number>('extraction:page', (n) => n);
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
+    expect(fake.workerQueueNames.sort()).toEqual([
+      'durable-tasks-extraction-page', // ':' sanitized to '-' (BullMQ forbids ':')
+      'durable-tasks-pipeline',
+    ]);
+    for (const name of fake.workerQueueNames) {
+      expect(fake.workerOptsFor(name)?.lockDuration).toBeGreaterThanOrEqual(60_000);
+    }
+  });
+
+  it('suffixes every subscribed queue with `partition` when set', async () => {
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('pipeline', async () => 1);
+    runtime.registerStep<number, number>('extraction:page', (n) => n);
+    await runRedisWorker({ runtime, connection: {}, partition: 'davi-local', deps: fake.deps });
+    expect(fake.workerQueueNames.sort()).toEqual([
+      'durable-tasks-extraction-page@davi-local',
+      'durable-tasks-pipeline@davi-local',
+    ]);
+  });
+
+  it('starts no Worker at all when nothing is registered', async () => {
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
+    expect(fake.workerQueueNames).toEqual([]);
   });
 
   it('routes a workflow job through handleTask and publishes the decision on <prefix>-decisions', async () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();
     runtime.registerWorkflow('wf', async () => ({ done: true }));
-    await runRedisWorker({ runtime, group: 'wf', connection: {}, deps: fake.deps });
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
 
-    await fake.run({ data: workflowTask() });
+    await fake.run('durable-tasks-wf', { data: workflowTask() });
 
     const decision = fake.added.find((a) => a.queue === 'durable-decisions');
     expect(decision).toBeDefined();
@@ -118,9 +150,9 @@ describe('runRedisWorker wiring (faked bullmq, no Redis)', () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();
     runtime.registerStep<number, number>('charge', (n) => n + 1);
-    await runRedisWorker({ runtime, group: 'steps', connection: {}, deps: fake.deps });
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
 
-    await fake.run({ data: remoteTask() });
+    await fake.run('durable-tasks-charge', { data: remoteTask() });
 
     const result = fake.added.find((a) => a.queue === 'durable-results');
     expect(result).toBeDefined();
@@ -131,11 +163,27 @@ describe('runRedisWorker wiring (faked bullmq, no Redis)', () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();
     runtime.registerWorkflow('wf', async () => 1);
-    await runRedisWorker({ runtime, group: 'g', connection: {}, prefix: 'app', deps: fake.deps });
-    expect(fake.workerQueueName).toBe('app-tasks-g');
+    await runRedisWorker({ runtime, connection: {}, prefix: 'app', deps: fake.deps });
+    expect(fake.workerQueueNames).toEqual(['app-tasks-wf']);
 
-    await fake.run({ data: workflowTask() });
+    await fake.run('app-tasks-wf', { data: workflowTask() });
     expect(fake.added.some((a) => a.queue === 'app-decisions')).toBe(true);
+  });
+
+  it('a legacy `group` is accepted, ignored for routing, and logs a deprecation warning', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('wf', async () => 1);
+    await runRedisWorker({
+      runtime,
+      connection: {},
+      group: 'ignored-legacy-group',
+      deps: fake.deps,
+    });
+    expect(fake.workerQueueNames).toEqual(['durable-tasks-wf']);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
   });
 });
 
@@ -160,9 +208,11 @@ describe('runRedisWorker — run-scoped liveness heartbeat during a workflow tur
       await g.gated;
       return { done: true };
     });
-    await runRedisWorker({ runtime, group: 'wf', connection: {}, deps: fake.deps });
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
 
-    const turn = fake.run({ data: workflowTask({ runId: 'run-42', group: 'wf' }) });
+    const turn = fake.run('durable-tasks-wf', {
+      data: workflowTask({ runId: 'run-42', group: 'wf' }),
+    });
 
     // Immediate beat while the turn is still blocked.
     const beats = () => fake.published.filter((p) => p.channel === 'durable-heartbeat');
@@ -192,9 +242,9 @@ describe('runRedisWorker — run-scoped liveness heartbeat during a workflow tur
     const fake = makeFakeDeps({ withRedis: true });
     const runtime = new DurableWorkerRuntime();
     runtime.registerStep<number, number>('charge', (n) => n + 1);
-    await runRedisWorker({ runtime, group: 'steps', connection: {}, deps: fake.deps });
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
 
-    await fake.run({ data: remoteTask() });
+    await fake.run('durable-tasks-charge', { data: remoteTask() });
 
     expect(fake.published.filter((p) => p.channel === 'durable-heartbeat')).toHaveLength(0);
   });

@@ -31,6 +31,11 @@ export class StepWorker {
     return this.handlers.has(name);
   }
 
+  /** Every registered step name — the subscription surface the runner subscribes one queue per. */
+  get names(): string[] {
+    return [...this.handlers.keys()];
+  }
+
   /**
    * Run the handler for `task` and return a wire-format {@link StepResult}. Captures the handler's
    * emitted events + the worker's pickup time (`startedAt`, epoch ms, so the engine can report

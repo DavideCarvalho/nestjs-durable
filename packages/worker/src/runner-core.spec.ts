@@ -90,6 +90,20 @@ describe('isWorkflowTask discriminator', () => {
   });
 });
 
+describe('DurableWorkerRuntime.registeredNames', () => {
+  it('returns every registered workflow + step name, independently', () => {
+    const rt = new DurableWorkerRuntime();
+    rt.registerWorkflow('pipeline', async () => 1);
+    rt.registerStep('extraction:page', () => 1);
+    expect(rt.registeredNames()).toEqual({ workflows: ['pipeline'], steps: ['extraction:page'] });
+  });
+
+  it('returns empty arrays for a fresh runtime', () => {
+    const rt = new DurableWorkerRuntime();
+    expect(rt.registeredNames()).toEqual({ workflows: [], steps: [] });
+  });
+});
+
 describe('DurableWorkerRuntime.handleTask routing', () => {
   it('routes a workflow task to the WorkflowWorker and returns a decision', async () => {
     const rt = new DurableWorkerRuntime();
