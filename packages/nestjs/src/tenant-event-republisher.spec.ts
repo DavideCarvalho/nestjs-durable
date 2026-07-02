@@ -66,7 +66,7 @@ describe('TenantEventRepublisher', () => {
     expect(store.getRun).toHaveBeenCalledTimes(1);
   });
 
-  it('never caches a bare/default-namespace run, so its slot is never occupied in the first place', async () => {
+  it('memoizes a bare/default-namespace run too — one store.getRun total across its step events', async () => {
     const store = fakeStore('default');
     const { publish, published } = fakePublish();
     const republisher = new TenantEventRepublisher(store, publish);
@@ -74,10 +74,36 @@ describe('TenantEventRepublisher', () => {
     await republisher.handle(stepEvent('step.started', 'r3'));
     await republisher.handle(stepEvent('step.progress', 'r3'));
 
-    // No cache slot was ever consumed for the bare run, so every event re-resolves via the store.
-    expect(store.getRun).toHaveBeenCalledTimes(2);
-    // And a bare/default namespace is never re-published — it's operator noise, not a tenant's run.
+    // The resolved "not a tenant" fact is cached (sentinel), so the second event is a cache hit —
+    // this is the fix: default runs no longer pay one store read per event.
+    expect(store.getRun).toHaveBeenCalledTimes(1);
+    // And a bare/default namespace is still never re-published — it's operator noise, not a tenant's run.
     expect(published).toHaveLength(0);
+  });
+
+  it('on an always-on control plane also driving default runs: step.started, step.progress, step.progress for the same run costs exactly one store.getRun', async () => {
+    const store = fakeStore('default');
+    const { publish, published } = fakePublish();
+    const republisher = new TenantEventRepublisher(store, publish);
+
+    await republisher.handle(stepEvent('step.started', 'r5'));
+    await republisher.handle(stepEvent('step.progress', 'r5'));
+    await republisher.handle(stepEvent('step.progress', 'r5'));
+
+    expect(store.getRun).toHaveBeenCalledTimes(1);
+    expect(published).toHaveLength(0);
+  });
+
+  it('still evicts a default run cache entry on its terminal event, forcing a fresh store.getRun afterward', async () => {
+    const store = fakeStore('default');
+    const { publish } = fakePublish();
+    const republisher = new TenantEventRepublisher(store, publish);
+
+    await republisher.handle(stepEvent('step.started', 'r6')); // cache miss -> getRun #1, sentinel cached
+    await republisher.handle(stepEvent('run.completed', 'r6')); // cache hit, then evicted (terminal)
+    await republisher.handle(stepEvent('step.progress', 'r6')); // cache miss again -> getRun #2
+
+    expect(store.getRun).toHaveBeenCalledTimes(2);
   });
 
   it('still resolves and caches a genuine tenant namespace stamped directly on the event (run.* path)', async () => {

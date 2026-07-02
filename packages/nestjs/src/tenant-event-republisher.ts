@@ -21,14 +21,16 @@ function isTerminalRunEvent(event: EngineEvent): boolean {
  *
  * The run's namespace is read straight off `event.namespace` (stamped by `engine.ts`'s `emit()` on
  * every `run.*` lifecycle event, where the run is already in hand); a `step.*` event doesn't carry
- * it, so those fall back to one `store.getRun` per unseen run id. Only a GENUINE tenant namespace is
- * memoized in `runNamespaces` — a bare/`default` run (the operator's own unpartitioned runs) never
- * consumes a cache slot, and a run's entry is deleted the moment its terminal event is handled. On
- * an always-on control plane driving every run of every tenant for the process lifetime, this bounds
- * the cache to in-flight tenant runs instead of growing by one entry per run id ever seen.
+ * it, so those fall back to `store.getRun`. EVERY run's resolved namespace is memoized in
+ * `runNamespaces` — including a bare/`default` run — so the store is read at most ONCE per run id
+ * regardless of how many `step.*` events that run emits; a `null` cache entry means "resolved, not
+ * a tenant" (distinct from "not yet resolved", i.e. absent from the map). A run's entry is deleted
+ * the moment its terminal event is handled, so the cache stays bounded to in-flight runs (tenant and
+ * default alike) — the same order of magnitude it was already paying for tenant runs alone, in
+ * exchange for turning a per-event store read into a per-run one.
  */
 export class TenantEventRepublisher {
-  private readonly runNamespaces = new Map<string, string>();
+  private readonly runNamespaces = new Map<string, string | null>();
 
   constructor(
     private readonly store: RunLookupStore,
@@ -47,16 +49,18 @@ export class TenantEventRepublisher {
   }
 
   private async namespaceFor(event: EngineEvent): Promise<string | undefined> {
+    if (this.runNamespaces.has(event.runId)) {
+      const cached = this.runNamespaces.get(event.runId);
+      return cached === null ? undefined : cached;
+    }
     if (event.namespace !== undefined) {
-      if (event.namespace !== 'default') this.runNamespaces.set(event.runId, event.namespace);
+      this.runNamespaces.set(event.runId, event.namespace === 'default' ? null : event.namespace);
       return event.namespace;
     }
-    const cached = this.runNamespaces.get(event.runId);
-    if (cached !== undefined) return cached;
     const run = await this.store.getRun(event.runId);
-    if (run?.namespace !== undefined && run.namespace !== 'default') {
-      this.runNamespaces.set(event.runId, run.namespace);
-    }
-    return run?.namespace;
+    const tenantNamespace =
+      run?.namespace !== undefined && run.namespace !== 'default' ? run.namespace : null;
+    this.runNamespaces.set(event.runId, tenantNamespace);
+    return tenantNamespace === null ? undefined : tenantNamespace;
   }
 }
