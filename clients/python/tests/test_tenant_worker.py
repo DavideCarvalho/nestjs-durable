@@ -18,13 +18,12 @@ Two distinct concerns share this file:
        - ``tenant_group(base, partition)`` is the byte-identical Python mirror of the TypeScript
          ``tenantGroup``: ``None``/``''``/``'default'`` -> the bare ``base``; any other partition ->
          ``"<base>@<partition>"``.
-       - ``Worker(tenant=...)`` is the deprecated ROUTING alias — it maps to ``partition`` so a
-         worker built the old way still subscribes to ``<handler>@<tenant>`` queues.
-       - ``Worker(group=...)`` is deprecated and IGNORED for routing (the base is the handler name).
+       - ``Worker(tenant=...)``/``Worker(group=...)`` were the Phase-1 deprecated ROUTING aliases;
+         Phase 2 (this file) DELETES them entirely — passing either now raises ``TypeError``.
+         ``partition`` is the only isolation kwarg.
 """
 
 import unittest
-import warnings
 from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 
@@ -68,34 +67,21 @@ class TenantGroupTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Deprecated constructor aliases: tenant= -> partition (routing); group= ignored
+# Deleted constructor kwargs (Phase 2): tenant=/group= no longer exist — partition only
 # ---------------------------------------------------------------------------
 
 
-class WorkerDeprecatedAliasTest(unittest.TestCase):
-    def test_tenant_kwarg_maps_to_partition_and_warns(self):
-        # tenant= is the RENAMED suffix axis — it must set partition (the routing suffix).
-        with self.assertWarns(DeprecationWarning):
-            worker = Worker(tenant="davi-local", auto_register=False)
-        self.assertEqual(worker.partition, "davi-local")
-        # ...and Worker.tenant still reflects it for StartRunMessage stamping.
-        self.assertEqual(worker.tenant, "davi-local")
+class WorkerDeletedAliasKwargTest(unittest.TestCase):
+    def test_tenant_kwarg_is_a_type_error(self):
+        with self.assertRaises(TypeError):
+            Worker(tenant="davi-local", auto_register=False)
 
-    def test_explicit_partition_wins_over_tenant_alias(self):
-        with self.assertWarns(DeprecationWarning):
-            worker = Worker(partition="explicit", tenant="ignored", auto_register=False)
-        self.assertEqual(worker.partition, "explicit")
-
-    def test_group_kwarg_is_ignored_for_routing_and_warns(self):
-        # group= is the ELIMINATED base axis — accepted, warned, but NEVER a routing suffix.
-        with self.assertWarns(DeprecationWarning):
-            worker = Worker(group="processing", auto_register=False)
-        self.assertIsNone(worker.partition)
+    def test_group_kwarg_is_a_type_error(self):
+        with self.assertRaises(TypeError):
+            Worker(group="processing", auto_register=False)
 
     def test_partition_is_silent(self):
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            worker = Worker(partition="processing", auto_register=False)
+        worker = Worker(partition="processing", auto_register=False)
         self.assertEqual(worker.partition, "processing")
         # Partition doubles as the tenant label when no separate tenant is given.
         self.assertEqual(worker.tenant, "processing")
@@ -251,45 +237,6 @@ class RunRedisWorkerPerNameQueueTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("durable-tasks-crunch", _RecordingWorker.created_names)
 
-    async def test_tenant_alias_still_routes_to_partition_suffixed_queue(self):
-        # REGRESSION GUARD: flip's Python worker runs `Worker(tenant=DURABLE_TENANT)` with NO explicit
-        # partition and must keep subscribing to `<handler>@<tenant>` queues — else the operator
-        # dispatching to e.g. `crunch@davi-local` never reaches it. `tenant=` maps to `partition`.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            worker = Worker(tenant="davi-local", auto_register=False)
-
-        @worker.step("crunch")
-        def crunch(_data):
-            return None
-
-        with _RunnerNamePatches():
-            await run_redis_worker(
-                worker, partition=worker.partition, connection="redis://localhost:6379"
-            )
-
-        self.assertIn("durable-tasks-crunch@davi-local", _RecordingWorker.created_names)
-
-    async def test_group_alias_does_not_suffix_the_queue(self):
-        # `group=` is the ELIMINATED base axis: it must NOT contribute a suffix or a base. The queue
-        # stays the bare handler-name queue.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            worker = Worker(group="processing", auto_register=False)
-
-        @worker.step("crunch")
-        def crunch(_data):
-            return None
-
-        with _RunnerNamePatches():
-            await run_redis_worker(
-                worker, partition=worker.partition, connection="redis://localhost:6379"
-            )
-
-        self.assertIn("durable-tasks-crunch", _RecordingWorker.created_names)
-        self.assertNotIn("durable-tasks-crunch@processing", _RecordingWorker.created_names)
-        self.assertNotIn("durable-tasks-processing", _RecordingWorker.created_names)
-
     async def test_no_registered_names_raises(self):
         worker = Worker(auto_register=False)
 
@@ -404,8 +351,8 @@ def _patch_queue(capture: _Capture):
 class StartRunTenantDecoupledFromWireTest(unittest.IsolatedAsyncioTestCase):
     async def test_tenant_field_is_the_declared_tenant_not_the_namespace(self):
         capture = _Capture()
-        # namespace stays "default" (bare, shared wire); tenant is a distinct data label.
-        worker = Worker(namespace="default", tenant="davi-local", auto_register=False)
+        # namespace stays "default" (bare, shared wire); partition sources the tenant data label.
+        worker = Worker(namespace="default", partition="davi-local", auto_register=False)
         with _patch_queue(capture):
             await worker.start_run("checkout", {"qty": 1})
         data = capture.added[0]["data"]
@@ -422,7 +369,7 @@ class StartRunTenantDecoupledFromWireTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_id_passes_through_verbatim_no_fresh_uuid_minted(self):
         capture = _Capture()
-        worker = Worker(tenant="davi-local", auto_register=False)
+        worker = Worker(partition="davi-local", auto_register=False)
         with _patch_queue(capture):
             await worker.start_run("wf", {}, run_id="caller-supplied-run-id")
         self.assertEqual(capture.added[0]["data"]["runId"], "caller-supplied-run-id")

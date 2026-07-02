@@ -12,7 +12,6 @@ import contextvars
 import inspect
 import time
 import uuid
-import warnings
 from types import TracebackType
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Type, Union
 
@@ -371,18 +370,13 @@ class Worker:
     Task 8 (two axes collapse to ``partition``): the OLD Python model had TWO routing axes — ``group``
     (the base queue, e.g. ``processing``) and ``tenant`` (the isolation suffix ``@davi-local``, via
     ``_tenant_group``). The redesign ELIMINATES the base (it is now the registered handler/workflow
-    name) and RENAMES the surviving suffix, so:
+    name) and RENAMES the surviving suffix, so ``partition`` is the WIRE-level isolation suffix
+    applied to every one of THIS worker's per-name queues (``None`` = no suffix) — it is the old
+    ``tenant`` suffix under its new name. ``Worker.tenant`` stays populated (from ``partition``) so
+    ``start_run`` keeps stamping ``StartRunMessage.tenant``.
 
-    - ``partition`` is the WIRE-level isolation suffix applied to every one of THIS worker's per-name
-      queues (``None`` = no suffix) — it is the old ``tenant`` suffix under its new name.
-    - ``tenant=`` is a deprecated keyword alias that maps to ``partition`` FOR ROUTING (a
-      ``warnings.warn`` fires; if ``partition`` wasn't given explicitly, ``partition = tenant``). This
-      keeps ``Worker(tenant='davi-local')`` — as flip's Python worker constructs it — subscribing to
-      ``<handler>@davi-local`` queues. ``Worker.tenant`` stays populated (from ``partition``) so
-      ``start_run`` keeps stamping ``StartRunMessage.tenant``.
-    - ``group=`` is deprecated and IGNORED for routing (the base is now the handler name): it is
-      accepted with a ``warnings.warn`` and otherwise discarded — it never contributes a queue base
-      or suffix.
+    The Phase-1 deprecated ``tenant=``/``group=`` keyword aliases are GONE (removed in Phase 2,
+    not just discouraged) — ``partition`` is the only isolation kwarg the constructor accepts.
     """
 
     def __init__(
@@ -391,37 +385,10 @@ class Worker:
         *,
         concurrency: "int | str | dict" = 1,
         namespace: str = "default",
-        tenant: "str | None" = None,
         auto_register: bool = True,
         redis: str = "redis://localhost:6379",
         prefix: str = "durable",
-        group: "str | None" = None,
     ) -> None:
-        if group is not None:
-            # The old BASE axis. Routing is per registered handler/workflow name now, so a declared
-            # base no longer means anything — accept it for back-compat, warn, and IGNORE it (do NOT
-            # map it to partition; that would wrongly suffix every queue with `@<group>`).
-            warnings.warn(
-                "Worker(group=...) is deprecated and IGNORED for routing; the queue base is now the "
-                "registered handler/workflow name, not a shared group. Use Worker(partition=...) for "
-                "the isolation suffix. Removed in a future major.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        if tenant is not None:
-            # The old SUFFIX axis, renamed to `partition`. Keep `tenant=` as a routing alias so
-            # `Worker(tenant='davi-local')` still subscribes to `<handler>@davi-local` — flip's Python
-            # worker constructs it this way and an operator dispatching to `processing@davi-local`
-            # must still reach it. Explicit `partition=` wins if both are given.
-            warnings.warn(
-                "Worker(tenant=...) is deprecated; use Worker(partition=...) instead. tenant is a "
-                "back-compat alias of partition for ROUTING (the isolation suffix). Removed in a "
-                "future major.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if partition is None:
-                partition = tenant
         # The wire-level isolation suffix applied to every one of this worker's per-name queues (see
         # the class docstring's Task 8 note). None keeps every queue bare (byte-identical to a
         # deployment that never adopted partitions).
@@ -434,10 +401,9 @@ class Worker:
         self.namespace = namespace
         # The tenant this worker instance serves — the DATA label stamped verbatim on
         # ``StartRunMessage.tenant`` (falling back to ``self.namespace`` when unset) by
-        # :meth:`start_run`. Post-Task-8 the isolation identity is ``partition`` (the queue suffix),
-        # so the tenant label REFLECTS it: whether it arrived as ``partition=`` or via the deprecated
-        # ``tenant=`` alias, ``self.partition`` is the single source of truth. ``None`` (no partition)
-        # keeps ``start_run`` falling back to ``self.namespace`` — byte-identical to before.
+        # :meth:`start_run`. The isolation identity is ``partition`` (the queue suffix), so the
+        # tenant label is sourced from it — ``self.partition`` is the single source of truth.
+        # ``None`` (no partition) keeps ``start_run`` falling back to ``self.namespace``.
         self.tenant = self.partition
         # How many tasks this worker runs concurrently across its per-name queues (BullMQ Worker
         # concurrency, shared by every underlying per-name Worker). Default 1 (serial). Raise it so a

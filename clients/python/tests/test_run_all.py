@@ -27,7 +27,7 @@ class RunAllTest(unittest.TestCase):
         clear_registered_workers()
 
     def test_constructing_workers_auto_registers_them(self):
-        step_worker = Worker(group="a")
+        step_worker = Worker()
         wf_worker = WorkflowWorker(group="b")
 
         workers = registered_workers()
@@ -37,7 +37,7 @@ class RunAllTest(unittest.TestCase):
         self.assertEqual(len(workers), 2)
 
     def test_auto_register_false_skips_the_registry(self):
-        opted_out_step = Worker(group="a", auto_register=False)
+        opted_out_step = Worker(auto_register=False)
         opted_out_wf = WorkflowWorker(group="b", auto_register=False)
 
         workers = registered_workers()
@@ -47,7 +47,7 @@ class RunAllTest(unittest.TestCase):
         self.assertEqual(workers, [])
 
     def test_register_worker_is_idempotent_on_identity(self):
-        step_worker = Worker(group="a")  # already registered once on construction
+        step_worker = Worker()  # already registered once on construction
 
         register_worker(step_worker)
         register_worker(step_worker)
@@ -55,14 +55,14 @@ class RunAllTest(unittest.TestCase):
         self.assertEqual(registered_workers().count(step_worker), 1)
 
     def test_registered_workers_returns_a_copy(self):
-        Worker(group="a")
+        Worker()
         snapshot = registered_workers()
         snapshot.clear()  # mutating the copy must not touch the registry
 
         self.assertEqual(len(registered_workers()), 1)
 
     def test_run_all_runs_exactly_the_registered_workers(self):
-        step_worker = Worker(group="a")
+        step_worker = Worker()
         wf_worker = WorkflowWorker(group="b")
 
         seen = {}
@@ -82,7 +82,7 @@ class RunAllTest(unittest.TestCase):
         self.assertEqual(seen["namespace"], "dev-alice")
 
     def test_run_all_passes_default_redis_and_prefix(self):
-        Worker(group="a")
+        Worker()
         seen = {}
 
         def fake_run_workers(workers, *, redis, prefix, namespace="default"):

@@ -107,7 +107,7 @@ class FakeBackend(_Backend):
 
 class RunLoopTest(unittest.TestCase):
     def test_claims_runs_and_completes_a_task(self):
-        worker = Worker(group="payments")
+        worker = Worker()
 
         @worker.step("payments.charge-card")
         async def charge(data):

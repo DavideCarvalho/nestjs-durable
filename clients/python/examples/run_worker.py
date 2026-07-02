@@ -12,7 +12,7 @@ import sys
 from durable_worker import Worker
 from durable_worker.redis_runner import run_redis_worker
 
-worker = Worker(group="payments")
+worker = Worker()
 
 
 @worker.step("payments.charge-card")
@@ -22,8 +22,8 @@ async def charge(data):
 
 async def main():
     prefix = sys.argv[1] if len(sys.argv) > 1 else "durable"
-    await run_redis_worker(worker, group="payments", prefix=prefix)
-    print(f"[python worker] consuming {prefix}-tasks-payments", flush=True)
+    await run_redis_worker(worker, prefix=prefix)
+    print(f"[python worker] consuming {prefix}-tasks-payments.charge-card", flush=True)
     await asyncio.Event().wait()  # run until killed
 
 

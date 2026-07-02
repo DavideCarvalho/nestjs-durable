@@ -49,7 +49,7 @@ class SqsRunnerTest(unittest.TestCase):
         self.assertEqual(_queue_names("durable", "payments"), ("durable-tasks-payments", "durable-results"))
 
     def test_handle_message_is_the_pure_core(self):
-        worker = Worker(group="payments")
+        worker = Worker()
 
         @worker.step("payments.charge-card")
         def charge(data):
@@ -60,7 +60,7 @@ class SqsRunnerTest(unittest.TestCase):
         self.assertEqual(result["output"], {"chargeId": "ch_o1"})
 
     def test_processes_a_task_and_sends_the_result(self):
-        worker = Worker(group="payments")
+        worker = Worker()
 
         @worker.step("payments.charge-card")
         def charge(data):

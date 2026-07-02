@@ -29,7 +29,7 @@ def task(name="payments.charge-card", **over):
 
 class WorkerTest(unittest.TestCase):
     def test_runs_a_registered_sync_handler(self):
-        worker = Worker(group="payments")
+        worker = Worker()
 
         @worker.step("payments.charge-card")
         def charge(data):
@@ -41,7 +41,7 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(result["stepId"], "r1:0")
 
     def test_stamps_started_at_for_queue_wait(self):
-        worker = Worker(group="payments")
+        worker = Worker()
 
         @worker.step("payments.charge-card")
         def charge(data):
@@ -243,7 +243,7 @@ class ContextCarrierTest(unittest.TestCase):
     re-exposed to the handler — mirrors the TS engine's ``context`` option / ``RemoteTask.context``."""
 
     def test_exposes_context_to_the_handler(self):
-        worker = Worker(group="payments")
+        worker = Worker()
         seen = {}
 
         @worker.step("payments.charge-card")
@@ -259,7 +259,7 @@ class ContextCarrierTest(unittest.TestCase):
         self.assertEqual(seen["current"], carrier)
 
     def test_context_is_none_when_absent(self):
-        worker = Worker(group="payments")
+        worker = Worker()
         seen = {}
 
         @worker.step("payments.charge-card")
