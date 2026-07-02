@@ -374,7 +374,14 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
 
     const { onRunRequest, publishRunReply, publishTenantEvent } = this.transport;
     if (typeof onRunRequest === 'function' && typeof publishRunReply === 'function') {
-      const runRequestTransport: RunRequestTransport = { onRunRequest, publishRunReply };
+      // Bind to the transport: these are real methods that touch the transport's private fields
+      // (e.g. BullMQTransport's `this.#runRequestName()`), so they must keep their receiver — passing
+      // them destructured/unbound makes `this` the literal below and throws "Receiver must be an
+      // instance of class" on first use. (Mirrors the `publishTenantEvent.bind` just below.)
+      const runRequestTransport: RunRequestTransport = {
+        onRunRequest: onRunRequest.bind(this.transport),
+        publishRunReply: publishRunReply.bind(this.transport),
+      };
       new RunRequestResponder(runRequestTransport, this.gateway).start();
     }
 
