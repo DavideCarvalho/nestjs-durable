@@ -13,6 +13,9 @@ export default defineConfig({
       '@dudousxd/nestjs-durable-core': pkg('core'),
       '@dudousxd/nestjs-durable-testing': pkg('testing'),
       '@dudousxd/nestjs-durable-transport-event-emitter': pkg('transport-event-emitter'),
+      '@dudousxd/nestjs-durable-dashboard': fileURLToPath(
+        new URL('./packages/dashboard/src/server/index.ts', import.meta.url),
+      ),
       '@dudousxd/nestjs-durable': pkg('nestjs'),
       '@dudousxd/durable-worker': pkg('worker'),
     },

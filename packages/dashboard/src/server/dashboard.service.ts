@@ -44,25 +44,24 @@ export class DashboardService {
     @Optional() @Inject(STATE_STORE_CANONICAL) private readonly store?: StateStore,
     @Optional() private readonly engine?: WorkflowEngine,
   ) {
-    this.metricsCollector = this.engine ? collectMetrics(this.engine) : undefined;
+    // Only the control plane (which has the canonical store) has a FULL engine to accumulate from;
+    // on a tenant `this.engine` is a store-less start client with no `subscribe`, so guard on store.
+    this.metricsCollector = this.store && this.engine ? collectMetrics(this.engine) : undefined;
   }
 
-  private requireEngine(): WorkflowEngine {
-    if (!this.engine) {
+  /**
+   * The operator-only ops need the FULL engine + canonical store, which only the control plane has.
+   * On a tenant the `WorkflowEngine` token is a store-less start client that implements none of these
+   * methods, so presence of the canonical store is the reliable discriminator — gate on it (never
+   * on engine presence, which is truthy on a tenant too).
+   */
+  private controlPlane(): { store: StateStore; engine: WorkflowEngine } {
+    if (!this.store || !this.engine) {
       throw new Error(
-        'This durable dashboard operation requires the control plane (no engine on a tenant deployment).',
+        'This durable dashboard operation requires the control plane (not available on a tenant deployment).',
       );
     }
-    return this.engine;
-  }
-
-  private requireStore(): StateStore {
-    if (!this.store) {
-      throw new Error(
-        'This durable dashboard operation requires the control plane (no store on a tenant deployment).',
-      );
-    }
-    return this.store;
+    return { store: this.store, engine: this.engine };
   }
 
   /**
@@ -72,8 +71,7 @@ export class DashboardService {
    * size). Capped per status so the scrape can't load an unbounded result set. Control-plane-only.
    */
   async metrics(): Promise<string> {
-    const store = this.requireStore();
-    const engine = this.requireEngine();
+    const { store, engine } = this.controlPlane();
     const cap = 10_000;
     const [pending, running, dead] = await Promise.all([
       store.listRuns({ status: 'pending', limit: cap }),
@@ -111,7 +109,7 @@ export class DashboardService {
   /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. The
    *  alert state a row turns red on is `depth > 0 && liveWorkers.length === 0`. Control-plane-only. */
   async workerHealth(): Promise<GroupHealth[]> {
-    return this.requireEngine().workerHealth();
+    return this.controlPlane().engine.workerHealth();
   }
 
   getRunDetail(runId: string): Promise<RunDetail | null> {
@@ -167,17 +165,17 @@ export class DashboardService {
    * stale/duplicate callback) — a safe no-op the controller maps to 404. Control-plane-only.
    */
   async deliverWebhook(token: string, body: unknown): Promise<RunResult | null> {
-    return this.requireEngine().signal(token, body);
+    return this.controlPlane().engine.signal(token, body);
   }
 
   /** Side-effect-free read of a value a run published via `ctx.setEvent` (a live query). Control-plane-only. */
   async getEvent(runId: string, key: string): Promise<unknown> {
-    return this.requireEngine().getEvent(runId, key);
+    return this.controlPlane().engine.getEvent(runId, key);
   }
 
   /** Deliver a validated `ctx.onUpdate` to a run; the validator may reject it (see UpdateResult). Control-plane-only. */
   async update(runId: string, name: string, arg: unknown): Promise<UpdateResult> {
-    return this.requireEngine().update(runId, name, arg);
+    return this.controlPlane().engine.update(runId, name, arg);
   }
 
   /**

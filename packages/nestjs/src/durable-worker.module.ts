@@ -219,6 +219,7 @@ export class DurableWorkerModule {
   private static build(optionsProvider: Provider): DynamicModule {
     return {
       module: DurableWorkerModule,
+      global: true,
       imports: [DiscoveryModule],
       providers: [
         optionsProvider,
