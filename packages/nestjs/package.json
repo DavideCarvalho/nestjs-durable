@@ -47,7 +47,9 @@
   "devDependencies": {
     "@dudousxd/durable-worker": "workspace:*",
     "@dudousxd/nestjs-durable-core": "workspace:^",
+    "@dudousxd/nestjs-durable-transport-bullmq": "workspace:*",
     "@dudousxd/nestjs-durable-transport-event-emitter": "workspace:^",
+    "@testcontainers/redis": "10.18.0",
     "@nestjs/common": "11.1.26",
     "@nestjs/core": "11.1.26",
     "@nestjs/event-emitter": "3.1.0",
