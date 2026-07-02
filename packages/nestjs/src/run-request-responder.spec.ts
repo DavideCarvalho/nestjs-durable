@@ -9,7 +9,7 @@ import type {
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it, vi } from 'vitest';
-import { type RunRequestTransport, RunRequestResponder } from './run-request-responder';
+import { RunRequestResponder, type RunRequestTransport } from './run-request-responder';
 
 function fakeRun(id: string, namespace: string): WorkflowRun {
   return {
@@ -34,7 +34,9 @@ function fakeGateway(overrides: Partial<RunGateway> = {}): RunGateway {
       }),
     ),
     listRuns: vi.fn(
-      async (query: RunQuery): Promise<WorkflowRun[]> => [fakeRun('x', query.namespace ?? 'default')],
+      async (query: RunQuery): Promise<WorkflowRun[]> => [
+        fakeRun('x', query.namespace ?? 'default'),
+      ],
     ),
     cancel: vi.fn(async (): Promise<RunResult | null> => null),
     retry: vi.fn(async (): Promise<RunResult | null> => null),
@@ -71,7 +73,11 @@ describe('RunRequestResponder', () => {
     const gw = fakeGateway();
     const tx = fakeTransport();
     new RunRequestResponder(tx, gw).start();
-    await tx.deliver({ requestId: 'q1', tenant: 'acme', body: { kind: 'getRunDetail', runId: 'r1' } });
+    await tx.deliver({
+      requestId: 'q1',
+      tenant: 'acme',
+      body: { kind: 'getRunDetail', runId: 'r1' },
+    });
     expect(tx.replies[0]).toMatchObject({ requestId: 'q1', result: { ok: true } });
   });
 
@@ -87,7 +93,11 @@ describe('RunRequestResponder', () => {
     });
     const tx = fakeTransport();
     new RunRequestResponder(tx, gw).start();
-    await tx.deliver({ requestId: 'q2', tenant: 'acme', body: { kind: 'getRunDetail', runId: 'r1' } });
+    await tx.deliver({
+      requestId: 'q2',
+      tenant: 'acme',
+      body: { kind: 'getRunDetail', runId: 'r1' },
+    });
     expect(tx.replies[0]).toMatchObject({
       requestId: 'q2',
       result: { ok: false, error: { code: 'cross-tenant' } },
@@ -98,7 +108,11 @@ describe('RunRequestResponder', () => {
     const gw = fakeGateway();
     const tx = fakeTransport();
     new RunRequestResponder(tx, gw).start();
-    await tx.deliver({ requestId: 'q3', tenant: 'acme', body: { kind: 'listRuns', query: { namespace: 'beta' } } });
+    await tx.deliver({
+      requestId: 'q3',
+      tenant: 'acme',
+      body: { kind: 'listRuns', query: { namespace: 'beta' } },
+    });
     expect(gw.listRuns).toHaveBeenCalledWith({ namespace: 'acme' });
   });
 
@@ -135,6 +149,9 @@ describe('RunRequestResponder', () => {
     const tx = fakeTransport();
     new RunRequestResponder(tx, gw).start();
     await tx.deliver({ requestId: 'q5', tenant: 'acme', body: { kind: 'cancel', runId: 'r1' } });
-    expect(tx.replies[0]?.result).toMatchObject({ ok: false, error: { message: 'already terminal' } });
+    expect(tx.replies[0]?.result).toMatchObject({
+      ok: false,
+      error: { message: 'already terminal' },
+    });
   });
 });

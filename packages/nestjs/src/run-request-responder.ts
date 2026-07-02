@@ -48,7 +48,10 @@ export class RunRequestResponder {
     if (detail && detail.run.namespace !== msg.tenant) {
       return {
         requestId: msg.requestId,
-        result: { ok: false, error: { message: 'run belongs to another tenant', code: 'cross-tenant' } },
+        result: {
+          ok: false,
+          error: { message: 'run belongs to another tenant', code: 'cross-tenant' },
+        },
       };
     }
 
