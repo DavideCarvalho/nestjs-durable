@@ -1,6 +1,10 @@
 import {
+  type EngineEvent,
   InMemoryStateStore,
   type RemoteStepDef,
+  type RunReply,
+  type RunRequest,
+  type TenantEvent,
   WorkflowEngine,
 } from '@dudousxd/nestjs-durable-core';
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
@@ -57,6 +61,17 @@ async function settle(store: InMemoryStateStore, runId: string, timeoutMs = 15_0
     await new Promise((r) => setTimeout(r, 25));
   }
   throw new Error(`run ${runId} did not settle`);
+}
+
+/** Poll `predicate` until it's true, mirroring `settle()`'s loop shape for non-store round-trips
+ *  (e.g. a queue-delivered message landing in a locally-collected array). */
+async function waitUntil(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error('condition was never met');
 }
 
 /** Resolve the live connection or self-skip the case when Docker isn't available. */
@@ -177,5 +192,77 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
 
     await queue.close();
     await transport.close();
+  }, 20_000);
+
+  it('round-trips a RunRequest over the request queue', async (ctx) => {
+    const connection = liveConnection(ctx);
+    const prefix = `durtest-${Date.now()}-rr`;
+    const dispatcher = new BullMQTransport({ connection, prefix });
+    const controlPlane = new BullMQTransport({ connection, prefix });
+
+    const seen: RunRequest[] = [];
+    controlPlane.onRunRequest(async (msg) => {
+      seen.push(msg);
+    });
+
+    await dispatcher.dispatchRunRequest({
+      requestId: 'q1',
+      tenant: 'acme',
+      body: { kind: 'cancel', runId: 'r1' },
+    });
+
+    await waitUntil(() => seen.length === 1);
+    expect(seen[0]).toMatchObject({
+      requestId: 'q1',
+      tenant: 'acme',
+      body: { kind: 'cancel', runId: 'r1' },
+    });
+
+    await dispatcher.close();
+    await controlPlane.close();
+  }, 20_000);
+
+  it('fans a RunReply to onRunReply subscribers over Redis pub/sub', async (ctx) => {
+    const connection = liveConnection(ctx);
+    const prefix = `durtest-${Date.now()}-rp`;
+    const controlPlane = new BullMQTransport({ connection, prefix });
+    const tenantWorker = new BullMQTransport({ connection, prefix });
+
+    const seen: RunReply[] = [];
+    tenantWorker.onRunReply((reply) => seen.push(reply));
+    await new Promise((r) => setTimeout(r, 200)); // let the subscription establish
+
+    await controlPlane.publishRunReply({ requestId: 'q1', result: { ok: true, data: null } });
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.requestId).toBe('q1');
+
+    await controlPlane.close();
+    await tenantWorker.close();
+  }, 20_000);
+
+  it("delivers a TenantEvent only to that tenant's channel", async (ctx) => {
+    const connection = liveConnection(ctx);
+    const prefix = `durtest-${Date.now()}-te`;
+    const controlPlane = new BullMQTransport({ connection, prefix });
+    const tenantWorker = new BullMQTransport({ connection, prefix });
+
+    const makeEvent = (runId: string): EngineEvent => ({ type: 'run.completed', runId });
+
+    const acme: TenantEvent[] = [];
+    const off = tenantWorker.onTenantEvent('acme', (evt) => acme.push(evt));
+    await new Promise((r) => setTimeout(r, 200)); // let the subscription establish
+
+    await controlPlane.publishTenantEvent({ tenant: 'beta', event: makeEvent('run-x') });
+    await controlPlane.publishTenantEvent({ tenant: 'acme', event: makeEvent('run-1') });
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(acme).toHaveLength(1); // NOT the beta event
+    expect(acme[0]?.event.runId).toBe('run-1');
+
+    off();
+    await controlPlane.close();
+    await tenantWorker.close();
   }, 20_000);
 });

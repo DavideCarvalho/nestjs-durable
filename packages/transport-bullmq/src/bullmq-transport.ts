@@ -6,9 +6,12 @@ import {
   type GroupHealth,
   type Heartbeat,
   type RemoteTask,
+  type RunReply,
+  type RunRequest,
   type StartRunMessage,
   type StepHandler,
   type StepResult,
+  type TenantEvent,
   type Transport,
   type WorkerHeartbeat,
   type WorkerStatus,
@@ -141,6 +144,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   private decisionsWorker?: Worker;
   private stepEventsWorker?: Worker;
   private startRunWorker?: Worker;
+  private runRequestWorker?: Worker;
   // Control plane runs over Redis pub/sub (not a queue): every instance gets every message, which
   // is what live-tail + cancellation need. Subscribe needs its own connection (it blocks the client).
   private controlPub?: Redis;
@@ -149,6 +153,16 @@ export class BullMQTransport implements Transport, ControlPlane {
   // another pod keeps the liveness window open (the in-memory `timeoutMs` path).
   private heartbeatPub?: Redis;
   private heartbeatSub?: Redis;
+  // RunReply is shared pub/sub (every tenant worker subscribes and filters by `requestId`), same
+  // shape as control/heartbeat above.
+  private runReplyPub?: Redis;
+  private runReplySub?: Redis;
+  // TenantEvent is PER-TENANT pub/sub: unlike control/heartbeat/runReply (one subscription for the
+  // whole transport), `onTenantEvent` can be called for several tenants — or several times for the
+  // same tenant — each getting its own dedicated subscriber connection so it can unsubscribe/close
+  // independently via the returned unsubscribe fn. `close()` tears down whatever's left.
+  private tenantEventPub?: Redis;
+  private readonly tenantEventSubs = new Set<Redis>();
   // Worker liveness (distinct from the long-step `heartbeat()` pub/sub above): a TTL'd key refreshed
   // on a timer while this instance is acting as a worker, + a client for reading peers' keys.
   private readonly instanceId: string;
@@ -195,6 +209,12 @@ export class BullMQTransport implements Transport, ControlPlane {
   /** `<effectivePrefix>-start-run` — the queue for tenant worker → control plane start-run requests. */
   #startRunName(): string {
     return `${this.#effectivePrefix()}-start-run`;
+  }
+
+  /** `<effectivePrefix>-run-request` — the queue for tenant worker → control plane read/control
+   *  requests ({@link RunRequest}). */
+  #runRequestName(): string {
+    return `${this.#effectivePrefix()}-run-request`;
   }
 
   /** The shared controller, lazily created. In `handle()` it's created with the configured
@@ -464,6 +484,18 @@ export class BullMQTransport implements Transport, ControlPlane {
     return `${this.#effectivePrefix()}-heartbeat`;
   }
 
+  /** `<effectivePrefix>-run-reply` — shared channel for {@link RunReply}s; every tenant worker
+   *  subscribes and filters by `requestId` client-side. */
+  private runReplyChannel(): string {
+    return `${this.#effectivePrefix()}-run-reply`;
+  }
+
+  /** `<effectivePrefix>-tenant-events-<tenant>` — per-tenant channel for re-published
+   *  {@link TenantEvent}s, so a store-less tenant worker live-tails only ITS OWN runs. */
+  private tenantEventChannel(tenant: string): string {
+    return `${this.#effectivePrefix()}-tenant-events-${tenant}`;
+  }
+
   /** A standalone Redis client from the same connection — duplicating a passed-in instance, or
    *  building one from options (pub/sub can't share BullMQ's worker connections). */
   private redis(): Redis {
@@ -509,6 +541,74 @@ export class BullMQTransport implements Transport, ControlPlane {
     );
   }
 
+  /** Tenant worker → control plane: enqueue a read/control request on `<effectivePrefix>-run-request`. */
+  async dispatchRunRequest(msg: RunRequest): Promise<void> {
+    await this.queue(this.#runRequestName()).add('runRequest', msg, {
+      removeOnComplete: true,
+      removeOnFail: true,
+    });
+  }
+
+  /** Control plane: consume run requests. Starts the consumer on first call (idempotent — a second
+   *  call is a no-op). */
+  onRunRequest(handler: (msg: RunRequest) => Promise<void>): void {
+    if (this.runRequestWorker) return;
+    this.runRequestWorker = new Worker(
+      this.#runRequestName(),
+      (job) => handler(job.data as RunRequest),
+      { connection: this.workerConnection() },
+    );
+  }
+
+  /** Control plane → tenant worker: publish a correlated {@link RunReply} on the shared reply channel. */
+  async publishRunReply(reply: RunReply): Promise<void> {
+    if (!this.runReplyPub) this.runReplyPub = this.redis();
+    await this.runReplyPub.publish(this.runReplyChannel(), JSON.stringify(reply));
+  }
+
+  /** Tenant worker ← control plane: consume {@link RunReply}s (filter by `requestId` client-side). */
+  onRunReply(handler: (reply: RunReply) => void): void {
+    if (this.runReplySub) return; // one subscription per transport
+    this.runReplySub = this.redis();
+    void this.runReplySub.subscribe(this.runReplyChannel());
+    this.runReplySub.on('message', (_channel, payload) => {
+      try {
+        handler(JSON.parse(payload) as RunReply);
+      } catch {
+        /* ignore malformed run replies */
+      }
+    });
+  }
+
+  /** Control plane → tenant worker: re-publish a lifecycle {@link TenantEvent} on the run's
+   *  per-tenant channel. */
+  async publishTenantEvent(evt: TenantEvent): Promise<void> {
+    if (!this.tenantEventPub) this.tenantEventPub = this.redis();
+    await this.tenantEventPub.publish(this.tenantEventChannel(evt.tenant), JSON.stringify(evt));
+  }
+
+  /** Tenant worker ← control plane: subscribe to THIS tenant's event channel, on its own connection
+   *  (unlike control/heartbeat/runReply, several tenants — or several callers for the same tenant —
+   *  may subscribe independently). Returns an unsubscribe fn that unsubscribes and disconnects. */
+  onTenantEvent(tenant: string, handler: (evt: TenantEvent) => void): () => void {
+    const channel = this.tenantEventChannel(tenant);
+    const sub = this.redis();
+    this.tenantEventSubs.add(sub);
+    void sub.subscribe(channel);
+    sub.on('message', (_channel, payload) => {
+      try {
+        handler(JSON.parse(payload) as TenantEvent);
+      } catch {
+        /* ignore malformed tenant events */
+      }
+    });
+    return () => {
+      this.tenantEventSubs.delete(sub);
+      void sub.unsubscribe(channel);
+      sub.disconnect();
+    };
+  }
+
   /** Close all workers and queues so the process can exit. */
   async close(): Promise<void> {
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
@@ -518,11 +618,17 @@ export class BullMQTransport implements Transport, ControlPlane {
     await this.decisionsWorker?.close();
     await this.stepEventsWorker?.close();
     await this.startRunWorker?.close();
+    await this.runRequestWorker?.close();
     await Promise.all([...this.queues.values()].map((q) => q.close()));
     this.controlPub?.disconnect();
     this.controlSub?.disconnect();
     this.heartbeatPub?.disconnect();
     this.heartbeatSub?.disconnect();
+    this.runReplyPub?.disconnect();
+    this.runReplySub?.disconnect();
+    this.tenantEventPub?.disconnect();
+    for (const sub of this.tenantEventSubs) sub.disconnect();
+    this.tenantEventSubs.clear();
     this.workerHeartbeatRedis?.disconnect();
   }
 }
