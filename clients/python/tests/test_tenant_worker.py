@@ -299,6 +299,80 @@ class RunRedisWorkerPerNameQueueTest(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Cross-SDK decision contract (Task 7): a `call` decision carries the PARTITION,
+# never a derived base group or a dot-prefix of the step name.
+# ---------------------------------------------------------------------------
+
+
+class CallDecisionCarriesPartitionTest(unittest.TestCase):
+    """The JS engine composes a remote step's dispatch queue as
+    ``tenant_group(sanitize_queue_token(cmd.name), cmd.group)`` — it treats the decision's ``group``
+    field as the isolation PARTITION on top of the step name. So a replaying Python worker must emit
+    the step's partition there (the worker's own partition for a bare call, or an explicit one),
+    NEVER a base group or a ``name.split('.')[0]`` dot-prefix — a base group leaked here would be
+    read as a partition suffix and route the step to a queue no worker consumes (it never runs).
+
+    Mirrors the JS ``WorkflowContext.resolveCallGroup`` (``step.partition ?? workflowPartition ?? ''``).
+    """
+
+    @staticmethod
+    def _first_call_command(worker, workflow_name):
+        task = {
+            "taskId": "t0",
+            "runId": "r1",
+            "workflow": workflow_name,
+            "input": None,
+            "history": [],
+            "pendingSignals": [],
+        }
+        decision = worker.process_workflow_task(task)
+        return next(c for c in decision["commands"] if c["kind"] == "call")
+
+    def test_bare_call_inherits_the_worker_partition(self):
+        worker = Worker(partition="davi-local", auto_register=False)
+
+        @worker.workflow("pipeline")
+        def pipeline(ctx):
+            return ctx.call("extraction:page", {"p": 1})
+
+        cmd = self._first_call_command(worker, "pipeline")
+        # The decision carries the PARTITION, not anything derived from the step name.
+        self.assertEqual(cmd["group"], "davi-local")
+        # Round-trip: the JS engine's composition lands on the exact queue the Task 8 worker subscribes
+        # to (`durable-tasks-extraction-page@davi-local`).
+        self.assertEqual(
+            _tenant_group(sanitize_queue_token(cmd["name"]), cmd["group"]),
+            "extraction-page@davi-local",
+        )
+
+    def test_unpartitioned_bare_call_is_bare_never_dot_prefix(self):
+        worker = Worker(auto_register=False)
+
+        @worker.workflow("pipeline")
+        def pipeline(ctx):
+            return ctx.call("payments.charge-card", {"p": 1})
+
+        cmd = self._first_call_command(worker, "pipeline")
+        # No partition → a bare-equivalent floor value. CRITICALLY not the old dot-prefix derivation
+        # ("payments"), which would wrongly be read as a partition suffix by the engine.
+        self.assertNotEqual(cmd["group"], "payments")
+        self.assertEqual(
+            _tenant_group(sanitize_queue_token(cmd["name"]), cmd["group"]),
+            "payments.charge-card",
+        )
+
+    def test_explicit_call_partition_wins(self):
+        worker = Worker(partition="davi-local", auto_register=False)
+
+        @worker.workflow("pipeline")
+        def pipeline(ctx):
+            return ctx.call("x", {"p": 1}, group="other")
+
+        cmd = self._first_call_command(worker, "pipeline")
+        self.assertEqual(cmd["group"], "other")
+
+
+# ---------------------------------------------------------------------------
 # start_run — tenant decoupled from the wire prefix; run_id passes through verbatim
 # ---------------------------------------------------------------------------
 

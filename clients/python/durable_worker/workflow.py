@@ -191,11 +191,13 @@ class WorkflowContext:
 
     # -- the workflow API ----------------------------------------------------
     def call(self, name: str, input: Any = None, *, group: Optional[str] = None) -> Any:
-        """Dispatch a remote step (any-language worker in ``group``) and await its result.
+        """Dispatch a remote step (routed by its handler ``name``) and await its result.
 
-        ``group`` is OPTIONAL: an explicit group on the call wins; otherwise the step inherits the
-        workflow's OWN group (so a workflow and its steps share one queue / one worker). It is a
-        :class:`WorkflowError` only when neither is available (a bare context with no group)."""
+        ROUTING (route-by-name): the step is served by whichever worker registered a handler for
+        ``name``; the decision's ``group`` field is that step's isolation PARTITION, not a base queue.
+        ``group`` here is OPTIONAL — an explicit partition on the call wins; otherwise the step
+        inherits the WORKFLOW's own partition (the worker's ``partition``), so a workflow and its
+        steps share the same isolation suffix. See :meth:`_resolve_group` for the cross-SDK contract."""
         seq = self._next()
         found, output = self._replay(seq, "call", name)
         if found:
@@ -207,13 +209,24 @@ class WorkflowContext:
         raise _Suspend()
 
     def _resolve_group(self, group: Optional[str], name: str) -> str:
-        """Explicit call group wins; else the workflow's own group. The single defaulting choke point
-        shared by ``call`` and ``gather_calls`` (must match the TS SDK's rule)."""
+        """Resolve the ``group`` field a ``call``/``gather_calls`` decision carries — the step's
+        isolation PARTITION, NOT a base queue name.
+
+        CROSS-SDK CONTRACT: the engine composes the dispatch queue as
+        ``tenant_group(sanitize_queue_token(name), <this>)`` (route-by-name — the base is the step
+        ``name``, this field is only the suffix). So it must be the partition (or a bare-equivalent
+        floor), NEVER a derived base group or a ``name.split('.')[0]`` dot-prefix — a base group here
+        would be read as a partition suffix and route the step to a queue no worker consumes. Mirrors
+        the TypeScript ``WorkflowContext.resolveCallGroup`` (``step.partition ?? workflowPartition ??
+        ''``): an explicit call partition wins; else the workflow's own partition (the worker's
+        ``partition``, threaded in as ``self._group``). The unified :class:`~durable_worker.worker.Worker`
+        floors that to ``"default"`` (a bare-equivalent — ``_tenant_group`` treats it identically to a
+        bare token), so this only raises for a bare :class:`WorkflowContext` built with no group at all."""
         resolved = group if group is not None else self._group
         if resolved is None:
             raise WorkflowError(
-                f"call {name!r} has no group and the workflow has no group to inherit; "
-                "pass group= on the call or construct the worker with a group"
+                f"call {name!r} has no partition and the workflow has none to inherit; "
+                "pass group= on the call or construct the worker with a partition"
             )
         return resolved
 
