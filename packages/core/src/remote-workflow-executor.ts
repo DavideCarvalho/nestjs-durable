@@ -5,12 +5,18 @@ import type {
   WorkflowRun,
   WorkflowTask,
 } from './interfaces';
+import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 
 /**
  * A {@link WorkflowExecutor} backed by a {@link Transport}: it advances a remote workflow by
  * DISPATCHING a {@link WorkflowTask} over the broker under the ENGINE-SUPPLIED `taskId`, WITHOUT
  * awaiting the decision. Pass one to `engine.registerRemote(name, version, { group, executor })` so a
  * workflow authored in another SDK (e.g. the Python `durable-worker`) is driven over Redis/BullMQ.
+ *
+ * Routes by NAME, not a hand-declared group: the dispatched task's routing token is
+ * `tenantGroup(sanitizeQueueToken(name), partition)` — the same formula {@link RemoteStepDef} uses —
+ * so `partition` is an optional isolation suffix, not a separate identity. Omit it to route by the
+ * bare (sanitized) `name`.
  *
  * Multi-instance safe by construction: the executor holds NO in-memory state correlating a dispatched
  * turn to its decision. The engine records the `taskId` on the run as the awaited marker AND releases
@@ -29,7 +35,8 @@ import type {
 export class RemoteWorkflowExecutor implements WorkflowExecutor {
   constructor(
     private readonly transport: Transport,
-    private readonly group: string,
+    private readonly name: string,
+    private readonly partition?: string | undefined,
     // Accepted for source compatibility; liveness now lives on the engine's suspended-turn window
     // (`remoteAdvanceSilenceMs`) + recovery re-drive, not an in-memory per-turn timeout.
     _opts: { timeoutMs?: number } = {},
@@ -56,7 +63,7 @@ export class RemoteWorkflowExecutor implements WorkflowExecutor {
       input: run.input,
       history,
       ...(pendingSignals ? { pendingSignals } : {}),
-      group: this.group,
+      group: tenantGroup(sanitizeQueueToken(this.name), this.partition),
       priority: run.priority,
       attempt: 1,
     };

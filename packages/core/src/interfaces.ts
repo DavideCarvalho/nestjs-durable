@@ -995,15 +995,17 @@ export interface StepOptions {
 
 /**
  * A typed handle to a step that runs on a remote worker. The `name` string is the contract:
- * the worker registers a handler under the same name. `input`/`output` validate at the boundary.
+ * the worker registers a handler under the same name, and routing is BY that name — a worker
+ * subscribes per registered handler name, not a hand-declared group.
  */
 export interface RemoteStepDef<TInput = unknown, TOutput = unknown> extends StepOptions {
   name: string;
-  /** Worker group expected to handle this step. */
-  group: string;
+  /** Optional isolation partition; routing is by `name`. Suffixes the routing token as
+   *  `<name>@<partition>` (via {@link tenantGroup}) — omit to route by the bare (sanitized) `name`. */
+  partition?: string | undefined;
   input: z.ZodType<TInput>;
   output: z.ZodType<TOutput>;
-  /** Branding so `ctx.call` can infer types. */
+  /** Branding so `ctx.remote` (and its deprecated alias `ctx.call`) can infer types. */
   readonly __remote: true;
 }
 

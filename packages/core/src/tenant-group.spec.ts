@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { tenantGroup } from './tenant-group';
+import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 
 describe('tenantGroup', () => {
   it('returns the bare group for an undefined tenant', () => {
@@ -16,5 +16,15 @@ describe('tenantGroup', () => {
 
   it('suffixes the group with the tenant for any other tenant', () => {
     expect(tenantGroup('processing', 'davi-local')).toBe('processing@davi-local');
+  });
+});
+
+describe('sanitizeQueueToken', () => {
+  it('replaces every colon with a hyphen (BullMQ forbids ":" in queue names)', () => {
+    expect(sanitizeQueueToken('extraction:page')).toBe('extraction-page');
+  });
+
+  it('leaves "." as-is (legal in a BullMQ queue name)', () => {
+    expect(sanitizeQueueToken('payments.charge')).toBe('payments.charge');
   });
 });

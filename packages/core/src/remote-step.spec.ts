@@ -7,7 +7,6 @@ import { InMemoryTransport } from './testing/in-memory-transport';
 
 const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
   name: 'payments.charge-card',
-  group: 'payments',
   input: z.object({ amount: z.number() }),
   output: z.object({ chargeId: z.string() }),
   __remote: true,

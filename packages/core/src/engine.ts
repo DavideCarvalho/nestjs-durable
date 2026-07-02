@@ -51,7 +51,7 @@ import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { SingletonGate } from './singleton-gate';
-import { tenantGroup } from './tenant-group';
+import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
 import {
   type Compensation,
@@ -1027,7 +1027,10 @@ export class WorkflowEngine {
     const liveGroups = await this.pool.listWorkerGroups();
     const group = tenantGroup(run.workflow, run.namespace);
     if (!liveGroups.includes(group)) return undefined;
-    const executor = new RemoteWorkflowExecutor(this.pool.primary, group);
+    // Feed the workflow NAME + namespace-as-partition through, rather than the pre-combined
+    // `group` string above — the executor computes the identical token itself (name+partition is
+    // the new routing primitive; `group` here still exists only for the liveGroups membership check).
+    const executor = new RemoteWorkflowExecutor(this.pool.primary, run.workflow, run.namespace);
     return {
       name: run.workflow,
       version: run.workflowVersion,
@@ -2286,7 +2289,10 @@ export class WorkflowEngine {
             status: 'pending',
             input: cmd.input,
             attempts: 1,
-            workerGroup: cmd.group,
+            // `cmd.group` is the routing declaration the worker's replay emitted (cross-SDK, or a
+            // group-served TS body) — treated as an isolation partition on top of the step's own
+            // name, mirroring the RemoteStepDef formula below (identical expression everywhere).
+            workerGroup: tenantGroup(sanitizeQueueToken(cmd.name), cmd.group),
             enqueuedAt: at,
             startedAt: at,
             finishedAt: at,
@@ -2302,7 +2308,7 @@ export class WorkflowEngine {
             seq: cmd.seq,
             name: cmd.name,
             stepId: id,
-            group: cmd.group,
+            group: tenantGroup(sanitizeQueueToken(cmd.name), cmd.group),
             input: cmd.input,
             traceparent: this.traceparent?.(),
             context: this.context?.(),
@@ -2751,7 +2757,7 @@ export class WorkflowEngine {
       status: 'pending',
       input: validInput,
       attempts: attempt,
-      workerGroup: step.group,
+      workerGroup: tenantGroup(sanitizeQueueToken(step.name), step.partition),
       enqueuedAt,
       startedAt: enqueuedAt, // placeholders until the worker result lands
       finishedAt: enqueuedAt,
@@ -2762,7 +2768,7 @@ export class WorkflowEngine {
         seq,
         name: step.name,
         stepId: id,
-        group: step.group,
+        group: tenantGroup(sanitizeQueueToken(step.name), step.partition),
         input: validInput,
         traceparent: this.traceparent?.(),
         context: this.context?.(),
@@ -2947,7 +2953,7 @@ export class WorkflowEngine {
           seq,
           name: step.name,
           stepId: id,
-          group: step.group,
+          group: tenantGroup(sanitizeQueueToken(step.name), step.partition),
           input: validInput,
           traceparent: this.traceparent?.(),
           context: this.context?.(),
@@ -2972,7 +2978,7 @@ export class WorkflowEngine {
           output,
           events: resolution.events,
           attempts: attempt,
-          workerGroup: step.group,
+          workerGroup: tenantGroup(sanitizeQueueToken(step.name), step.partition),
           enqueuedAt,
           startedAt,
         });

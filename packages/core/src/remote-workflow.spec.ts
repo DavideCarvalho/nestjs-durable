@@ -115,7 +115,10 @@ describe('WorkflowEngine — remote (polyglot) workflows', () => {
     expect(setup?.output).toBe('/b1/data.csv');
     expect(call?.kind).toBe('remote');
     expect(call?.status).toBe('completed');
-    expect(call?.workerGroup).toBe('pipeline');
+    // The routing token is now name-based: tenantGroup(sanitizeQueueToken(cmd.name), cmd.group) —
+    // the decision's own `group` ('pipeline') is treated as an isolation partition on the call's
+    // step name ('ingestion'), not the bare routing group it was pre-redesign.
+    expect(call?.workerGroup).toBe('ingestion@pipeline');
   });
 
   it('suspends a remote workflow on ctx.sleep and resumes it when the timer fires', async () => {
