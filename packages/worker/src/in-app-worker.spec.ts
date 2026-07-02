@@ -130,7 +130,7 @@ describe('in-app worker — engine + worker in one app, own group, real executor
     const app = inAppApp('app');
     let bodyRuns = 0;
     app.serve('greet', '1', async (ctx, input) => {
-      const greeting = await ctx.step('compose', () => {
+      const greeting = await ctx.sideEffect(() => {
         bodyRuns += 1;
         return `hello ${input as string}`;
       });
@@ -159,7 +159,7 @@ describe('in-app worker — engine + worker in one app, own group, real executor
     const app = inAppApp('app', () => now);
     let stepRuns = 0;
     app.serve('delayed', '1', async (ctx) => {
-      const before = await ctx.step('before', () => {
+      const before = await ctx.sideEffect(() => {
         stepRuns += 1;
         return 'a';
       });
@@ -187,11 +187,11 @@ describe('in-app worker — engine + worker in one app, own group, real executor
     const app = inAppApp('app');
     let firstRuns = 0;
     app.serve('resumable', '1', async (ctx) => {
-      const first = await ctx.step('first', () => {
+      const first = await ctx.sideEffect(() => {
         firstRuns += 1;
         return 1;
       });
-      const second = await ctx.step('second', () => 2);
+      const second = await ctx.sideEffect(() => 2);
       return { first, second };
     });
 
@@ -209,7 +209,7 @@ describe('in-app worker — engine + worker in one app, own group, real executor
     await app.store.saveCheckpoint({
       runId: 'r1',
       seq: 0,
-      name: 'first',
+      name: 'sideEffect',
       kind: 'local',
       stepId: 'r1:0',
       status: 'completed',
@@ -233,7 +233,7 @@ describe('in-app worker — engine + worker in one app, own group, real executor
     let now = 3_000_000;
     const app = inAppApp('app', () => now);
     app.serve('longsleep', '1', async (ctx) => {
-      await ctx.step('mark', () => 'started');
+      await ctx.sideEffect(() => 'started');
       await ctx.sleep('10s');
       return 'never';
     });

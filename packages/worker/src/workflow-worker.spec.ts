@@ -1,18 +1,6 @@
-import type { HistoryEvent, RemoteStepDef, WorkflowTask } from '@dudousxd/nestjs-durable-core';
+import type { HistoryEvent, WorkflowTask } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it } from 'vitest';
 import { WorkflowWorker } from './workflow-worker';
-
-/** A minimal typed remote step def for driving `ctx.call` in these tests (only name/partition are
- *  read). `partition` omitted → no explicit partition (falls back to the workflow's own). */
-function remote(name: string, partition?: string): RemoteStepDef {
-  return {
-    name,
-    ...(partition !== undefined ? { partition } : {}),
-    input: {} as never,
-    output: {} as never,
-    __remote: true,
-  };
-}
 
 function task(over: Partial<WorkflowTask> = {}): WorkflowTask {
   return {
@@ -42,7 +30,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('maps a Suspend to continue with the commands', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.remote(remote('ingest'), null);
+      await ctx.step('ingest', null);
     });
     const d = await wf.processTask(task());
     expect(d.status).toBe('continue');
@@ -52,7 +40,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('maps a StepFailed to failed with the error', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.step('boom', () => {
+      await ctx.sideEffect(() => {
         throw new Error('kaboom');
       });
     });
@@ -67,7 +55,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
       try {
-        await ctx.remote(remote('risky'), null);
+        await ctx.step('risky', null);
         return { ok: true };
       } catch {
         return { ok: false, compensated: true };
@@ -84,7 +72,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('maps an uncaught failure to failed', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.remote(remote('risky'), null);
+      await ctx.step('risky', null);
     });
     const history: HistoryEvent[] = [
       { seq: 0, kind: 'call', name: 'risky', error: { message: 'boom' } },
@@ -97,7 +85,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('maps a cancellation at an op boundary to cancelled', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.step('s', () => 1);
+      await ctx.sideEffect(() => 1);
     });
     const d = await wf.processTask(task(), { isCancelled: (id) => id === 'r1' });
     expect(d.status).toBe('cancelled');
@@ -113,7 +101,7 @@ describe('WorkflowWorker.processTask decision mapping', () => {
   it('detects nondeterminism and fails loudly', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx) => {
-      await ctx.remote(remote('a'), null);
+      await ctx.step('a', null);
     });
     const history: HistoryEvent[] = [{ seq: 0, kind: 'timer' }];
     const d = await wf.processTask(task({ history }));
@@ -138,11 +126,13 @@ describe('WorkflowWorker.names', () => {
   });
 });
 
-describe('WorkflowWorker threads its group into ctx.call partition defaulting', () => {
-  it("a no-explicit-partition call inherits the worker's group as its partition", async () => {
+describe('WorkflowWorker threads its group into ctx.step partition defaulting', () => {
+  // The dispatched `ctx.step` surface carries no per-call partition (dropped with `RemoteStepDef`) —
+  // the emitted decision's `group` is ALWAYS the worker's own group, threaded as the workflow partition.
+  it("a step inherits the worker's group as its partition", async () => {
     const wf = new WorkflowWorker('processing');
     wf.register('wf', async (ctx) => {
-      await ctx.remote(remote('ingest'), null);
+      await ctx.step('ingest', null);
     });
     const d = await wf.processTask(task());
     const call = d.commands[0];
@@ -153,20 +143,10 @@ describe('WorkflowWorker threads its group into ctx.call partition defaulting', 
     }
   });
 
-  it('an explicit partition on the step still wins over the worker group', async () => {
-    const wf = new WorkflowWorker('processing');
-    wf.register('wf', async (ctx) => {
-      await ctx.remote(remote('ingest', 'data'), null); // explicit partition
-    });
-    const d = await wf.processTask(task());
-    const call = d.commands[0];
-    if (call.kind === 'call') expect(call.group).toBe('data');
-  });
-
   it("the default worker group ('workflows') is what a bare worker defaults a call to", async () => {
     const wf = new WorkflowWorker(); // group defaults to 'workflows'
     wf.register('wf', async (ctx) => {
-      await ctx.remote(remote('ingest'), null);
+      await ctx.step('ingest', null);
     });
     const d = await wf.processTask(task());
     const call = d.commands[0];
@@ -175,11 +155,11 @@ describe('WorkflowWorker threads its group into ctx.call partition defaulting', 
 });
 
 describe('WorkflowWorker end-to-end across turns', () => {
-  it('runs a local step then a remote call to completion', async () => {
+  it('runs a local step then a dispatched step to completion', async () => {
     const wf = new WorkflowWorker();
     wf.register('wf', async (ctx, input: { base: string }) => {
-      const a = await ctx.step('s', () => 1);
-      const r = await ctx.remote(remote('ingest'), { a, base: input.base });
+      const a = await ctx.sideEffect(() => 1);
+      const r = await ctx.step<{ rows: number }>('ingest', { a, base: input.base });
       return { a, r };
     });
 
@@ -199,7 +179,7 @@ describe('WorkflowWorker end-to-end across turns', () => {
 
     // Turn 2: history has the step result + the call result → completes.
     const history: HistoryEvent[] = [
-      { seq: 0, kind: 'step', name: 's', output: 1 },
+      { seq: 0, kind: 'step', name: 'sideEffect', output: 1 },
       { seq: 1, kind: 'call', name: 'ingest', output: { rows: 42 } },
     ];
     const d2 = await wf.processTask(task({ input: { base: 'b1' }, history }));

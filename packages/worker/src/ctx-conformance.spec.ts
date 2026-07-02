@@ -119,13 +119,13 @@ describe('ctx runtime conformance — one WorkflowCtx contract, inline + replay 
   });
 
   it('inline and replay allocate identical seqs and record identical local-step shapes', async () => {
-    // One body, both runtimes. Only ops BOTH runtimes support (step + a sleep suspend point), so the
-    // comparison is apples-to-apples.
+    // One body, both runtimes. Only ops BOTH runtimes support (sideEffect + a sleep suspend point),
+    // so the comparison is apples-to-apples.
     const body = async (ctx: WorkflowCtx): Promise<unknown> => {
-      const a = await ctx.step('alpha', () => 1);
-      const b = await ctx.step('beta', () => a + 1);
+      const a = await ctx.sideEffect(() => 1);
+      const b = await ctx.sideEffect(() => a + 1);
       await ctx.sleep(5);
-      const c = await ctx.step('gamma', () => b + 1);
+      const c = await ctx.sideEffect(() => b + 1);
       return { a, b, c };
     };
 
@@ -179,13 +179,14 @@ describe('ctx runtime conformance — one WorkflowCtx contract, inline + replay 
     expect(turn2.output).toEqual({ a: 1, b: 2, c: 3 });
     const replayShape = [...localStepShape(turn1.commands), ...localStepShape(turn2.commands)];
 
-    // The determinism contract: both runtimes assigned seq 0/1 to alpha/beta, seq 2 to the sleep, and
-    // seq 3 to gamma (so the replay shape is seqs 0,1,3), with identical names + outputs. A mismatch
-    // here is exactly the silent history mis-alignment a cross-runtime resume would suffer.
+    // The determinism contract: both runtimes assigned seq 0/1 to the first two sideEffects, seq 2 to
+    // the sleep, and seq 3 to the third sideEffect (so the replay shape is seqs 0,1,3), with identical
+    // names + outputs. A mismatch here is exactly the silent history mis-alignment a cross-runtime
+    // resume would suffer.
     expect(replayShape).toEqual([
-      { seq: 0, name: 'alpha', output: 1 },
-      { seq: 1, name: 'beta', output: 2 },
-      { seq: 3, name: 'gamma', output: 3 },
+      { seq: 0, name: 'sideEffect', output: 1 },
+      { seq: 1, name: 'sideEffect', output: 2 },
+      { seq: 3, name: 'sideEffect', output: 3 },
     ]);
     expect(replayShape).toEqual(inlineShape);
 
@@ -202,9 +203,9 @@ describe('ctx runtime conformance — one WorkflowCtx contract, inline + replay 
     // + a wait — which the replay runtime refuses outright rather than silently shifting every later
     // seq; that refusal is asserted in workflow-context.spec. Here we pin the unbounded arithmetic.)
     const worker = new WorkflowWorker('app').register('waiter', async (ctx: WorkflowCtx) => {
-      await ctx.step('before', () => 'b');
+      await ctx.sideEffect(() => 'b');
       const payload = await ctx.waitForSignal<string>('go');
-      const after = await ctx.step('after', () => payload.toUpperCase());
+      const after = await ctx.sideEffect(() => payload.toUpperCase());
       return after;
     });
 
@@ -220,7 +221,7 @@ describe('ctx runtime conformance — one WorkflowCtx contract, inline + replay 
     });
     expect(turn1.status).toBe('continue');
     // before@0, then the wait@1 — one seq, so `after` will be seq 2.
-    expect(localStepShape(turn1.commands)).toEqual([{ seq: 0, name: 'before', output: 'b' }]);
+    expect(localStepShape(turn1.commands)).toEqual([{ seq: 0, name: 'sideEffect', output: 'b' }]);
     expect(turn1.commands.find((cmd) => cmd.kind === 'waitSignal')?.seq).toBe(1);
 
     const turn2 = await worker.processTask({
@@ -230,7 +231,7 @@ describe('ctx runtime conformance — one WorkflowCtx contract, inline + replay 
       workflowVersion: '1',
       input: null,
       history: [
-        { seq: 0, kind: 'step', name: 'before', output: 'b' },
+        { seq: 0, kind: 'step', name: 'sideEffect', output: 'b' },
         { seq: 1, kind: 'signal', output: 'go!' },
       ],
       group: 'app',
@@ -238,6 +239,6 @@ describe('ctx runtime conformance — one WorkflowCtx contract, inline + replay 
     });
     expect(turn2.status).toBe('completed');
     expect(turn2.output).toBe('GO!');
-    expect(localStepShape(turn2.commands)).toEqual([{ seq: 2, name: 'after', output: 'GO!' }]);
+    expect(localStepShape(turn2.commands)).toEqual([{ seq: 2, name: 'sideEffect', output: 'GO!' }]);
   });
 });

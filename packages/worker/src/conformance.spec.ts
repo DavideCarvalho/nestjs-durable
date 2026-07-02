@@ -1,38 +1,32 @@
 import {
   InMemoryStateStore,
   InMemoryTransport,
-  type RemoteStepDef,
   type WorkflowCommand,
   type WorkflowCtx,
   WorkflowEngine,
   type WorkflowTask,
 } from '@dudousxd/nestjs-durable-core';
-import { z } from 'zod';
 import { DurableWorkerRuntime } from './runner-core';
 
 /**
  * Conformance: ONE workflow body, run BOTH ways — in-process on a real `WorkflowEngine` (with an
  * `InMemoryStateStore` + `InMemoryTransport`) and turn-by-turn on the thin {@link DurableWorkerRuntime}
  * — must produce the SAME observable behavior: the same final output and the same ordered
- * `(seq, name, kind)` sequence of recorded steps / remote calls.
+ * `(seq, name, kind)` sequence of recorded steps / dispatched calls.
  *
- * The body uses both primitives the protocol must agree on: a LOCAL `ctx.step` (recorded on the
- * `recordStep` command / a `local` checkpoint) and a remote `ctx.call` (a `call` command / a `remote`
- * checkpoint). The remote step handler is byte-identical on both sides.
+ * The body uses both primitives the protocol must agree on: a LOCAL `ctx.sideEffect` (recorded on the
+ * `recordStep` command / a `local` checkpoint) and a dispatched `ctx.step` (a `call` command / a
+ * `remote` checkpoint). The remote step handler is byte-identical on both sides.
  */
 
-const remoteAdd: RemoteStepDef<{ a: number }, { sum: number }> = {
-  name: 'math.add-ten',
-  input: z.object({ a: z.number() }),
-  output: z.object({ sum: z.number() }),
-  __remote: true,
-};
+/** The routing name of the dispatched step both runtimes call by string (cross-runtime form). */
+const ADD_TEN_STEP = 'math.add-ten';
 
 /** The single workflow body under test. Typed against the engine's `WorkflowCtx`; the thin
  *  `WorkflowContext` `implements WorkflowCtx`, so the very same function runs on both runtimes. */
 async function body(ctx: WorkflowCtx, input: { x: number }): Promise<{ a: number; r: number }> {
-  const a = await ctx.step('s', async () => input.x * 2);
-  const { sum } = await ctx.remote(remoteAdd, { a });
+  const a = await ctx.sideEffect(() => input.x * 2);
+  const { sum } = await ctx.step<{ sum: number }>(ADD_TEN_STEP, { a });
   return { a, r: sum };
 }
 
@@ -57,7 +51,7 @@ async function settle(store: InMemoryStateStore, runId: string) {
 async function runOnEngine(input: { x: number }): Promise<{ output: unknown; trace: Trace }> {
   const store = new InMemoryStateStore();
   const transport = new InMemoryTransport();
-  transport.handle(remoteAdd.name, async (i: { a: number }) => addTen(i));
+  transport.handle(ADD_TEN_STEP, async (i: { a: number }) => addTen(i));
 
   const engine = new WorkflowEngine({ store, transport });
   engine.register('conf', '1', (ctx, i) => body(ctx, i as { x: number }));
@@ -82,7 +76,7 @@ async function runOnEngine(input: { x: number }): Promise<{ output: unknown; tra
 async function runOnThinWorker(input: { x: number }): Promise<{ output: unknown; trace: Trace }> {
   const runtime = new DurableWorkerRuntime();
   runtime.registerWorkflow('conf', (ctx, i) => body(ctx, i as { x: number }));
-  runtime.registerStep(remoteAdd.name, async (i) => addTen(i as { a: number }));
+  runtime.registerStep(ADD_TEN_STEP, async (i) => addTen(i as { a: number }));
 
   // History accumulates the resolved ops the engine WOULD persist between turns: a local `recordStep`
   // becomes a `step` history event; a remote `call` becomes a `call` event resolved by running the
@@ -168,7 +162,7 @@ describe('conformance — a @Workflow body runs identically on the engine and th
     const thin = await runOnThinWorker(input);
 
     const expected: Trace = [
-      { seq: 0, name: 's', kind: 'local' },
+      { seq: 0, name: 'sideEffect', kind: 'local' },
       { seq: 1, name: 'math.add-ten', kind: 'remote' },
     ];
     expect(engine.trace).toEqual(expected);

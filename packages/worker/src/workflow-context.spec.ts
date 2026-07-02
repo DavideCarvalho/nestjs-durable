@@ -1,4 +1,5 @@
-import type { HistoryEvent, RemoteStepDef, WorkflowCtx } from '@dudousxd/nestjs-durable-core';
+import type { HistoryEvent, StepRef, WorkflowCtx } from '@dudousxd/nestjs-durable-core';
+import { DURABLE_STEP_NAME } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it } from 'vitest';
 import {
   Cancelled,
@@ -9,24 +10,11 @@ import {
 } from './errors';
 import { WorkflowContext } from './workflow-context';
 
-/**
- * A typed remote step def used to drive `ctx.call` (the engine's `call` takes a def, not a name).
- * The `input`/`output` zod schemas don't matter for the worker — it only reads `name`/`partition` —
- * so we stub them rather than pull zod into the worker's test deps.
- */
-const ingest = {
-  name: 'ingest',
-  partition: 'data',
-  input: {} as never,
-  output: {} as never,
-  __remote: true,
-} as const satisfies RemoteStepDef<{ a: number }, { rows: number }>;
-
-describe('WorkflowContext.step', () => {
+describe('WorkflowContext.localStep', () => {
   it('runs the body once and records a recordStep command with the output', async () => {
     const ctx = new WorkflowContext('r1', []);
     let runs = 0;
-    const out = await ctx.step('count', async () => {
+    const out = await ctx.localStep('count', async () => {
       runs += 1;
       return runs;
     });
@@ -47,7 +35,7 @@ describe('WorkflowContext.step', () => {
   it('replays the recorded value WITHOUT re-running the body', async () => {
     const history: HistoryEvent[] = [{ seq: 0, kind: 'step', name: 'count', output: 42 }];
     const ctx = new WorkflowContext('r1', history);
-    const out = await ctx.step('count', async () => {
+    const out = await ctx.localStep('count', async () => {
       throw new Error('body must not run on replay');
     });
     expect(out).toBe(42);
@@ -57,7 +45,7 @@ describe('WorkflowContext.step', () => {
   it('records a failed recordStep and throws StepFailed when the body throws', async () => {
     const ctx = new WorkflowContext('r1', []);
     await expect(
-      ctx.step('boom', async () => {
+      ctx.localStep('boom', async () => {
         throw new Error('kaboom');
       }),
     ).rejects.toBeInstanceOf(StepFailed);
@@ -75,12 +63,12 @@ describe('WorkflowContext.step', () => {
       { seq: 0, kind: 'step', name: 'boom', error: { message: 'boom' } },
     ];
     const ctx = new WorkflowContext('r1', history);
-    await expect(ctx.step('boom', async () => 1)).rejects.toThrow('boom');
+    await expect(ctx.localStep('boom', async () => 1)).rejects.toThrow('boom');
   });
 
   it('captures step body events on the recordStep command', async () => {
     const ctx = new WorkflowContext('r1', []);
-    await ctx.step('s', async (log) => {
+    await ctx.localStep('s', async (log) => {
       log.info('hello');
       log.sub('proc-a', 'ok');
     });
@@ -95,19 +83,41 @@ describe('WorkflowContext.step', () => {
   });
 });
 
-describe('WorkflowContext.call', () => {
-  it('accepts a RemoteStepDef and emits a call command with its name/partition, then suspends', async () => {
-    const ctx = new WorkflowContext('r1', []);
-    await expect(ctx.remote(ingest, { a: 1 })).rejects.toBeInstanceOf(Suspend);
+describe('WorkflowContext.step (dispatched)', () => {
+  it('accepts a name string and emits a call command, then suspends', async () => {
+    const ctx = new WorkflowContext('r1', [], { workflowPartition: 'data' });
+    await expect(ctx.step('ingest', { a: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
       { kind: 'call', seq: 0, name: 'ingest', group: 'data', input: { a: 1 } },
     ]);
   });
 
-  it('accepts engine-side admission opts in the signature without changing the command', async () => {
+  it('accepts a @Step-stamped handler reference, resolving its name via the stamp', async () => {
+    function runPage(_i: { page: number }): Promise<{ nextPage: null }> {
+      return Promise.resolve({ nextPage: null });
+    }
+    (runPage as StepRef<{ page: number }, { nextPage: null }>)[DURABLE_STEP_NAME] =
+      'Extraction.runPage';
     const ctx = new WorkflowContext('r1', []);
+    await expect(ctx.step(runPage, { page: 1 })).rejects.toBeInstanceOf(Suspend);
+    expect(ctx.commands).toEqual([
+      { kind: 'call', seq: 0, name: 'Extraction.runPage', group: '', input: { page: 1 } },
+    ]);
+  });
+
+  it('throws a clear error when a passed ref carries no @Step stamp', async () => {
+    const ctx = new WorkflowContext('r1', []);
+    function unstamped(_i: unknown) {
+      return 1;
+    }
+    await expect(ctx.step(unstamped, {})).rejects.toThrow(/not a @Step|no step name/i);
+    expect(ctx.commands).toHaveLength(0);
+  });
+
+  it('accepts engine-side admission opts in the signature without changing the command', async () => {
+    const ctx = new WorkflowContext('r1', [], { workflowPartition: 'data' });
     await expect(
-      ctx.remote(ingest, { a: 1 }, { queue: 'q', priority: 5, fairnessKey: 'k', transport: 't' }),
+      ctx.step('ingest', { a: 1 }, { queue: 'q', priority: 5, fairnessKey: 'k', transport: 't' }),
     ).rejects.toBeInstanceOf(Suspend);
     // opts are engine admission concerns — the worker's emitted command is unchanged.
     expect(ctx.commands).toEqual([
@@ -118,41 +128,26 @@ describe('WorkflowContext.call', () => {
   it('replay-returns the recorded result on the next turn', async () => {
     const history: HistoryEvent[] = [{ seq: 0, kind: 'call', name: 'ingest', output: { rows: 9 } }];
     const ctx = new WorkflowContext('r1', history);
-    expect(await ctx.remote(ingest, { a: 1 })).toEqual({ rows: 9 });
+    expect(await ctx.step('ingest', { a: 1 })).toEqual({ rows: 9 });
     expect(ctx.commands).toHaveLength(0);
   });
 });
 
-describe('WorkflowContext.call partition defaulting (Cross-SDK decision protocol)', () => {
-  /** A step with NO explicit partition: the emitted decision's `group` should fall back to the
-   *  workflow's own partition (or `''` when there is none — see `resolveCallGroup`). */
-  const charge = {
-    name: 'charge',
-    input: {} as never,
-    output: {} as never,
-    __remote: true,
-  } as const satisfies RemoteStepDef<{ amount: number }, { ok: boolean }>;
-
-  it("a no-explicit-partition step inherits the workflow's partition", async () => {
+describe('WorkflowContext.step partition defaulting (Cross-SDK decision protocol)', () => {
+  // The dispatched `ctx.step` surface carries no per-call partition (that capability lived on the
+  // removed `RemoteStepDef.partition`) — the emitted decision's `group` is ALWAYS the WORKFLOW's own
+  // partition (or `''` when there is none — see `resolveCallGroup`).
+  it("a step inherits the workflow's partition", async () => {
     const ctx = new WorkflowContext('r1', [], { workflowPartition: 'processing' });
-    await expect(ctx.remote(charge, { amount: 1 })).rejects.toBeInstanceOf(Suspend);
+    await expect(ctx.step('charge', { amount: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
       { kind: 'call', seq: 0, name: 'charge', group: 'processing', input: { amount: 1 } },
     ]);
   });
 
-  it('an explicit partition on the step wins over the workflow partition', async () => {
-    // `ingest` carries an explicit partition 'data' → wins over the workflow's 'processing'.
-    const ctx = new WorkflowContext('r1', [], { workflowPartition: 'processing' });
-    await expect(ctx.remote(ingest, { a: 1 })).rejects.toBeInstanceOf(Suspend);
-    expect(ctx.commands).toEqual([
-      { kind: 'call', seq: 0, name: 'ingest', group: 'data', input: { a: 1 } },
-    ]);
-  });
-
-  it('falls back to no partition (empty group) when neither the step nor the workflow set one', async () => {
+  it('falls back to no partition (empty group) when the workflow set none', async () => {
     const ctx = new WorkflowContext('r1', []); // no workflowPartition
-    await expect(ctx.remote(charge, { amount: 1 })).rejects.toBeInstanceOf(Suspend);
+    await expect(ctx.step('charge', { amount: 1 })).rejects.toBeInstanceOf(Suspend);
     expect(ctx.commands).toEqual([
       { kind: 'call', seq: 0, name: 'charge', group: '', input: { amount: 1 } },
     ]);
@@ -243,7 +238,7 @@ describe('WorkflowContext.child', () => {
   });
 });
 
-describe('WorkflowContext deterministic sources (now/random/uuid)', () => {
+describe('WorkflowContext deterministic sources (now/sideEffect)', () => {
   it('now() records a step and replays the captured value', async () => {
     const ctx = new WorkflowContext('r1', []);
     const t = await ctx.now();
@@ -261,27 +256,31 @@ describe('WorkflowContext deterministic sources (now/random/uuid)', () => {
     expect(replay.commands).toHaveLength(0);
   });
 
-  it('random() records a step in [0,1) and replays it', async () => {
+  it('sideEffect(fn) runs fn once, records it, and replays the captured value WITHOUT re-running fn', async () => {
     const ctx = new WorkflowContext('r1', []);
-    const r = await ctx.random();
-    expect(r).toBeGreaterThanOrEqual(0);
-    expect(r).toBeLessThan(1);
+    let runs = 0;
+    const id = await ctx.sideEffect(() => {
+      runs += 1;
+      return `id-${runs}`;
+    });
+    expect(id).toBe('id-1');
+    expect(runs).toBe(1);
     const cmd = ctx.commands[0];
-    if (cmd.kind === 'recordStep') expect(cmd.name).toBe('random');
+    expect(cmd.kind).toBe('recordStep');
+    if (cmd.kind === 'recordStep') {
+      expect(cmd.name).toBe('sideEffect');
+      expect(cmd.output).toBe(id);
+    }
 
-    const replay = new WorkflowContext('r1', [{ seq: 0, kind: 'step', name: 'random', output: r }]);
-    expect(await replay.random()).toBe(r);
-  });
-
-  it('uuid() records a step and replays the same id', async () => {
-    const ctx = new WorkflowContext('r1', []);
-    const id = await ctx.uuid();
-    expect(typeof id).toBe('string');
-    const cmd = ctx.commands[0];
-    if (cmd.kind === 'recordStep') expect(cmd.name).toBe('uuid');
-
-    const replay = new WorkflowContext('r1', [{ seq: 0, kind: 'step', name: 'uuid', output: id }]);
-    expect(await replay.uuid()).toBe(id);
+    const replay = new WorkflowContext('r1', [
+      { seq: 0, kind: 'step', name: 'sideEffect', output: id },
+    ]);
+    expect(
+      await replay.sideEffect(() => {
+        throw new Error('fn must not run on replay');
+      }),
+    ).toBe(id);
+    expect(replay.commands).toHaveLength(0);
   });
 });
 
@@ -356,20 +355,20 @@ describe('WorkflowContext determinism', () => {
   it('raises NondeterminismError on a kind mismatch at a seq', async () => {
     const history: HistoryEvent[] = [{ seq: 0, kind: 'timer' }];
     const ctx = new WorkflowContext('r1', history);
-    await expect(ctx.remote(ingest, { a: 1 })).rejects.toBeInstanceOf(NondeterminismError);
+    await expect(ctx.step('ingest', { a: 1 })).rejects.toBeInstanceOf(NondeterminismError);
   });
 
   it('raises NondeterminismError on a name mismatch at a seq', async () => {
     const history: HistoryEvent[] = [{ seq: 0, kind: 'call', name: 'other', output: 1 }];
     const ctx = new WorkflowContext('r1', history);
-    await expect(ctx.remote(ingest, { a: 1 })).rejects.toBeInstanceOf(NondeterminismError);
+    await expect(ctx.step('ingest', { a: 1 })).rejects.toBeInstanceOf(NondeterminismError);
   });
 });
 
 describe('WorkflowContext cancellation', () => {
   it('throws Cancelled at the op boundary when the run is cancelled', async () => {
     const ctx = new WorkflowContext('r1', [], { isCancelled: (id) => id === 'r1' });
-    await expect(ctx.step('s', async () => 1)).rejects.toBeInstanceOf(Cancelled);
+    await expect(ctx.sideEffect(async () => 1)).rejects.toBeInstanceOf(Cancelled);
   });
 });
 

@@ -2,12 +2,13 @@ import type {
   ChildCallOptions,
   DurableWebhook,
   HistoryEvent,
-  RemoteStepDef,
   SearchAttributes,
+  StepDispatchOpts,
   StepError,
   StepEvent,
   StepLogger,
   StepOptions,
+  StepRef,
   WorkflowClass,
   WorkflowCommand,
   WorkflowCtx,
@@ -16,7 +17,12 @@ import type {
   WorkflowRef,
   WorkflowStepEvent,
 } from '@dudousxd/nestjs-durable-core';
-import { createStepLogger, parseDuration, workflowName } from '@dudousxd/nestjs-durable-core';
+import {
+  createStepLogger,
+  parseDuration,
+  stepNameOf,
+  workflowName,
+} from '@dudousxd/nestjs-durable-core';
 import {
   Cancelled,
   type GatherFailure,
@@ -47,8 +53,8 @@ export type StepBody<T> = (log: StepLogger) => Promise<T> | T;
 export interface WorkflowContextOptions {
   /**
    * The isolation partition of the WORKFLOW this context replays (the worker's own partition, if
-   * any). When a `ctx.call`/`ctx.remote` step carries no explicit `partition`, the emitted `call`
-   * decision inherits THIS partition — see {@link WorkflowContext.call}. The runner
+   * any). A dispatched `ctx.step` call carries no per-call partition of its own — the emitted `call`
+   * decision's `group` always inherits THIS partition — see {@link WorkflowContext.step}. The runner
    * ({@link import('./workflow-worker').WorkflowWorker}) threads its own partition in here.
    * Absent → the step's decision carries no partition (routes on the bare sanitized name).
    */
@@ -76,10 +82,11 @@ export interface WorkflowContextOptions {
  * It `implements` the engine's {@link WorkflowCtx}, so a NestJS `@Workflow` body typed against
  * `WorkflowCtx` runs UNCHANGED on the thin worker. The API splits in two:
  *
- * - **Supported** (wire-expressible) — {@link step}, {@link call}, {@link sleep},
- *   {@link waitForSignal}, {@link child}, {@link all}, {@link now}/{@link random}/{@link uuid}: each
- *   maps to a {@link WorkflowCommand} (`call`/`recordStep`/`sleep`/`waitSignal`/`startChild`) the
- *   engine applies durably.
+ * - **Supported** (wire-expressible) — {@link step} (always dispatched — no local placement),
+ *   {@link sleep}, {@link waitForSignal}, {@link child}, {@link all}, {@link now}/{@link sideEffect}
+ *   (deterministic capture, backed by the internal {@link localStep} primitive): each maps to a
+ *   {@link WorkflowCommand} (`call`/`recordStep`/`sleep`/`waitSignal`/`startChild`) the engine applies
+ *   durably.
  * - **Unsupported** — `transaction`, `callEntity`, `signalEntity`, `continueAsNew`, `sleepUntil`,
  *   `waitForEvent`, `task`, `startChild` (fire-and-forget), `breakpoint`, `webhook`, `setEvent`,
  *   `onUpdate`, `patched`: they need engine/store/transport features the remote wire can't express,
@@ -172,18 +179,17 @@ export class WorkflowContext implements WorkflowCtx {
   }
 
   /**
-   * Resolve the `group` field a `call` decision carries. This is the TRANSITIONAL wire carrier
-   * during the deprecation window (Cross-SDK decision protocol): a `call` decision emitted by a
-   * replaying worker carries the step's PARTITION ONLY — never a full queue token — because the
-   * engine composes the final routing token itself via
-   * `tenantGroup(sanitizeQueueToken(cmd.name), cmd.group)`. So the rule is simply: an explicit
-   * `step.partition` wins; else the WORKFLOW's own partition ({@link workflowPartition}); else `''`
-   * (no partition at all — `tenantGroup` treats `''` identically to `undefined`, i.e. a bare token).
-   * The `''` floor exists only because the wire's `group` field is a required `string`. Mirrors the
-   * Python SDK's parity rule (Task 8).
+   * Resolve the `group` field a `call` decision carries: a `call` decision emitted by a replaying
+   * worker carries the WORKFLOW's own partition ONLY — never a full queue token — because the engine
+   * composes the final routing token itself via `tenantGroup(sanitizeQueueToken(cmd.name), cmd.group)`.
+   * The single-step `ctx.step` surface has no per-call partition override (that capability lived on
+   * the old `RemoteStepDef.partition`, removed with it); the rule is simply: the WORKFLOW's own
+   * partition ({@link workflowPartition}), else `''` (no partition at all — `tenantGroup` treats `''`
+   * identically to `undefined`, i.e. a bare token). The `''` floor exists only because the wire's
+   * `group` field is a required `string`. Mirrors the Python SDK's parity rule (Task 8).
    */
-  private resolveCallGroup(step: RemoteStepDef): string {
-    return step.partition ?? this.workflowPartition ?? '';
+  private resolveCallGroup(): string {
+    return this.workflowPartition ?? '';
   }
 
   private guard(ev: HistoryEvent, seq: number, kind: HistoryEvent['kind'], name?: string): void {
@@ -201,47 +207,59 @@ export class WorkflowContext implements WorkflowCtx {
   // -- the workflow API (supported) ----------------------------------------
 
   /**
-   * Dispatch a typed remote step (routed by its handler `name`, optionally partitioned) and await
-   * its result. The engine's `ctx.remote` (primary name; `ctx.call` is a deprecated back-compat
-   * alias — see {@link call}) takes a {@link RemoteStepDef} (not a bare name): we read its
-   * `name`/`partition` and emit the wire `call` decision. `opts`
-   * (`queue`/`priority`/`fairnessKey`/`transport`) are engine-side ADMISSION concerns — accepted for
-   * `WorkflowCtx` conformance, but the remote wire has no place for them, so they don't change the
-   * worker's emitted command. Mirrors Python `call`/core's `ctx.remote` (Task 1).
+   * ONE durable step primitive: always dispatched, always engine-scheduled — no local/remote
+   * placement choice for the workflow author (see `WorkflowCtx.step`). Resolve the routing name off
+   * a `@Step`-stamped handler reference (via {@link stepNameOf}), or take it literally for the
+   * cross-runtime string form; the reference itself is NEVER invoked here — only its stamped name is
+   * read (the serving worker re-resolves the real handler from DI), so an unbound `this` on `handler`
+   * is irrelevant. Emits the SAME `call` decision + `Suspend` a pre-rename `ctx.remote` did — the wire
+   * is unchanged (Task 1/2). `opts` (`queue`/`priority`/`fairnessKey`/`transport`) are engine-side
+   * ADMISSION concerns — accepted for `WorkflowCtx` conformance, but the remote wire has no place for
+   * them, so they don't change the worker's emitted command.
    *
-   * The decision's `group` field carries the step's PARTITION when the step set none explicitly —
-   * see {@link resolveCallGroup} — falling back to the WORKFLOW's own partition.
+   * The decision's `group` field carries the WORKFLOW's own partition (or `''`) — see
+   * {@link resolveCallGroup}; there is no per-call partition override in this surface.
    */
-  async remote<TInput, TOutput>(
-    step: RemoteStepDef<TInput, TOutput>,
+  async step<TInput, TOutput>(
+    handler: StepRef<TInput, TOutput>,
     input: TInput,
-    _opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
-  ): Promise<TOutput> {
+    opts?: StepDispatchOpts,
+  ): Promise<TOutput>;
+  async step<TOutput = unknown>(
+    name: string,
+    input: unknown,
+    opts?: StepDispatchOpts,
+  ): Promise<TOutput>;
+  async step(
+    handlerOrName: StepRef | string,
+    input: unknown,
+    _opts?: StepDispatchOpts,
+  ): Promise<unknown> {
+    const name = typeof handlerOrName === 'string' ? handlerOrName : stepNameOf(handlerOrName);
+    if (name === undefined) {
+      throw new Error(
+        'ctx.step: handler is not a @Step reference (no stamped step name) — pass a @Step-decorated method or a step name string',
+      );
+    }
     const seq = this.next();
-    const { found, output } = this.replay(seq, 'call', step.name);
-    if (found) return output as TOutput;
-    const group = this.resolveCallGroup(step);
-    this.commands.push({ kind: 'call', seq, name: step.name, group, input });
+    const { found, output } = this.replay(seq, 'call', name);
+    if (found) return output;
+    const group = this.resolveCallGroup();
+    this.commands.push({ kind: 'call', seq, name, group, input });
     throw new Suspend();
   }
 
   /**
-   * @deprecated Use {@link remote} instead. `call` is a back-compat alias — same replay machinery,
-   * same emitted `call` decision. Removed in a future major.
-   */
-  call<TInput, TOutput>(
-    step: RemoteStepDef<TInput, TOutput>,
-    input: TInput,
-    opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
-  ): Promise<TOutput> {
-    return this.remote(step, input, opts);
-  }
-
-  /**
-   * Run a LOCAL step once and record its result, so side effects / non-determinism happen exactly
-   * once and replay returns the captured value. The body receives a {@link StepLogger}. `options`
-   * (retries/backoff/compensate) are engine-side concerns the thin worker doesn't apply — accepted
-   * for `WorkflowCtx` conformance, ignored on the wire. Mirrors Python `step`.
+   * The internal checkpointed LOCAL-step primitive backing {@link sideEffect}/{@link now}/
+   * {@link gather}: run `fn` once and record its result, so side effects / non-determinism happen
+   * exactly once and replay returns the captured value. The body receives a {@link StepLogger}.
+   * `options` (retries/backoff/compensate) are engine-side concerns the thin worker doesn't apply —
+   * accepted for parity with core's `InternalWorkflowCtx.localStep`, ignored on the wire.
+   *
+   * Not part of the public {@link WorkflowCtx} surface (the public single step is always dispatched —
+   * see {@link step}), but present at runtime for the SAME reason core's `createWorkflowCtx` result
+   * carries it: the two runtimes' ctx objects must expose the SAME member set (see
+   * `ctx-conformance.spec.ts`).
    *
    * **WARNING — silently ignored options:** `options.retries`, `options.backoff`, and
    * `options.compensate` are **silently ignored** on the thin worker: no retry loop runs and no
@@ -249,7 +267,7 @@ export class WorkflowContext implements WorkflowCtx {
    * compensation MUST run in-process on the engine instead of on the thin worker, otherwise those
    * guarantees are simply absent with no error raised.
    */
-  async step<TOutput>(
+  async localStep<TOutput>(
     name: string,
     fn: (log: StepLogger) => Promise<TOutput> | TOutput,
     _options?: StepOptions,
@@ -539,25 +557,24 @@ export class WorkflowContext implements WorkflowCtx {
   // -- deterministic sources (recorded once, replayed) ---------------------
 
   /**
-   * Deterministic wall-clock (epoch ms): recorded as a `now` step on the first run and replayed
-   * verbatim. Implemented as a recorded {@link step} exactly like the engine's ctx. Matches
-   * `WorkflowCtx.now`.
+   * Deterministic wall-clock, epoch **milliseconds**: recorded as a `now` local step on the first run
+   * and replayed verbatim afterwards. Implemented as a recorded {@link localStep} exactly like the
+   * engine's ctx. Matches `WorkflowCtx.now`.
    */
   now(): Promise<number> {
-    return this.step('now', async () => Date.now());
+    return this.localStep('now', async () => Date.now());
   }
 
   /**
-   * Deterministic random in `[0, 1)`: recorded as a `random` step once, then replayed. Implemented
-   * as a recorded {@link step} like the engine's ctx. Matches `WorkflowCtx.random`.
+   * **Deterministic capture.** Run `fn` once, checkpoint its result, and on replay return the SAME
+   * value WITHOUT re-running `fn` — the durable way to bring a non-deterministic value into a
+   * workflow where the author controls the generator (`uuidv7`/`ulid`/`Math.random`/a config read).
+   * Recorded as a `sideEffect` local step, exactly like the engine's ctx. Matches
+   * `WorkflowCtx.sideEffect`. There is no baked `uuid`/`random` helper — see {@link now} for the one
+   * ubiquitous convenience.
    */
-  random(): Promise<number> {
-    return this.step('random', async () => Math.random());
-  }
-
-  /** Deterministic UUID v4: recorded as a `uuid` step once, then replayed. Matches `WorkflowCtx.uuid`. */
-  uuid(): Promise<string> {
-    return this.step('uuid', async () => globalThis.crypto.randomUUID());
+  sideEffect<TValue>(fn: () => TValue | Promise<TValue>): Promise<TValue> {
+    return this.localStep('sideEffect', async () => fn());
   }
 
   // -- unsupported on the thin worker --------------------------------------

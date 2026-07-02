@@ -132,7 +132,7 @@ describe('DurableWorkerRuntime.handleTask routing', () => {
   it('forwards isCancelled to the workflow worker (cancelled decision, no crash)', async () => {
     const rt = new DurableWorkerRuntime();
     rt.registerWorkflow('wf', async (ctx) => {
-      await ctx.step('s', () => 1);
+      await ctx.sideEffect(() => 1);
     });
     const out = await rt.handleTask(workflowTask(), { isCancelled: (id) => id === 'r1' });
     expect(out.kind).toBe('decision');
@@ -142,7 +142,7 @@ describe('DurableWorkerRuntime.handleTask routing', () => {
   it('forwards onStep so the shell can stream local step lifecycle', async () => {
     const rt = new DurableWorkerRuntime();
     rt.registerWorkflow('wf', async (ctx) => {
-      await ctx.step('s', () => 1);
+      await ctx.sideEffect(() => 1);
       return 'done';
     });
     const phases: string[] = [];
