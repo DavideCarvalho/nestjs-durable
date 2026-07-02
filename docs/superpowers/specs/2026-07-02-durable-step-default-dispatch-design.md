@@ -59,16 +59,23 @@ which is expected (you can't import a Python function into TS). Steps on **other
 same way — `ctx.step(this.otherWorkflow.someStep, input)` reads that method's stamped name and
 dispatches, so a workflow can call another workflow's steps by reference.
 
-### Deterministic captures are helpers, not steps
+### Deterministic captures: `ctx.sideEffect(fn)` + `ctx.now()`
 
-Because every step is dispatched, forcing a `new Date()` through a `@Step` + Redis round-trip is
-overkill. Trivial non-deterministic captures get first-class deterministic helpers on the context,
-recorded in history and replayed:
+Because every step is dispatched, forcing a `new Date()` / `uuidv7()` through a `@Step` + Redis
+round-trip is overkill. Non-deterministic captures get a general in-process primitive:
 
-- `ctx.now()` — a replay-stable timestamp.
-- `ctx.uuid()` — a replay-stable id.
+- **`ctx.sideEffect(fn)`** — run `fn` once, checkpoint its result, and on replay return the SAME
+  value WITHOUT re-running `fn` (Temporal's `sideEffect`). The author controls the generator:
+  `ctx.sideEffect(() => uuidv7())`, `() => ulid()`, `() => Math.random()`, a config/env read. `fn`
+  must be effectively pure (produces a value; not re-run on replay) — real side effects (a DB write,
+  an API call) are a `ctx.step`.
+- **`ctx.now()`** — epoch **ms** (like `Date.now()`), the one ubiquitous convenience (single obvious
+  implementation), kept so a timestamp doesn't need a `sideEffect` closure. For an ISO string:
+  `new Date(await ctx.now()).toISOString()`.
 
-So `@Step` is reserved for real work; ids/timestamps use the helpers.
+No baked `ctx.uuid()`/`ctx.random()` — the algorithm is exactly what the author should choose, so those
+are `ctx.sideEffect(() => …)`. So `@Step` is reserved for real dispatched work; captures use
+`sideEffect`/`now`.
 
 ### What survives as in-process (by necessity, not as a placement choice)
 

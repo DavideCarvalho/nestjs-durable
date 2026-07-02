@@ -10,6 +10,14 @@
 
 ## Global Constraints
 
+- **DECISION UPDATE (supersedes `now`/`uuid` wording below).** The deterministic-capture surface is
+  **`ctx.sideEffect(fn)`** (general: run `fn` once, checkpoint, replay the value; author picks the
+  generator — `uuidv7`/`ulid`/`random`/config) **+ `ctx.now(): Promise<number>`** (epoch ms, the one
+  convenience). There is **NO** baked `ctx.uuid()`/`ctx.random()`. Wherever a task below says
+  "`now`/`uuid`", read "`sideEffect` + `now`". Task 1 (core) already shipped this (`c4617c1`); Task 6
+  (Python, `9678b14`) shipped `.now/.uuid` and needs a follow-up to `.side_effect` + `.now`, drop
+  `.uuid`.
+
 - **Wire is frozen.** No change to the decision/history protocol: `ctx.step` emits the SAME `{ kind:'call', seq, name, group, input }` + `throw new Suspend()` as today's `ctx.remote`; `ctx.now`/`ctx.uuid`/`transaction` produce `recordStep`. Any task that touches the wire is out of scope — flag it, don't do it.
 - **No deprecation aliases.** Remove `ctx.remote`, `remoteStep`, `RemoteStepDef`, inline `ctx.step(name, closure)` outright (breaking 0.x cut, consistent with Phase 2).
 - **Fresh-dist typecheck rule (load-bearing).** `tsc` typechecks against built dep dist. After changing a package that others depend on, `pnpm --filter <pkg> build` BEFORE typechecking/downstream tasks, or renamed-symbol breaks stay masked. Order: core → worker → nestjs/transport/store/dashboard.
