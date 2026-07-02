@@ -73,7 +73,7 @@ class WorkflowCancellationTest(unittest.TestCase):
     """The workflow replay path (ctx._local_step/ctx.step) honours cancellation: auto-abort at op
     boundaries (no `if` in user code) + cooperative `current_step().cancelled` inside a step.
     Exercises the shared internal `_local_step` engine directly (white-box) — the same one `ctx.now()`
-    /`ctx.uuid()` build on — since the public step surface is now the dispatched form only."""
+    /`ctx.side_effect(fn)` build on — since the public step surface is now the dispatched form only."""
 
     @staticmethod
     def _task(**over):

@@ -44,9 +44,9 @@ class WorkflowReplayTest(unittest.TestCase):
         self.assertEqual(d1["commands"][0]["name"], "now#0")
         self.assertEqual(d1["commands"][1]["name"], "ingestion")
         self.assertEqual(d1["commands"][1]["input"], {"key": "/b1/data.csv"})
-        # engine persists: the now() capture + (later) the dispatched step's result.
+        # engine persists: the now() capture (epoch ms) + (later) the dispatched step's result.
         history += [
-            {"seq": 0, "kind": "step", "name": "now#0", "output": "2026-01-01T00:00:00+00:00"},
+            {"seq": 0, "kind": "step", "name": "now#0", "output": 1735689600000},
             {"seq": 1, "kind": "call", "name": "ingestion", "output": 42},
         ]
 
@@ -60,7 +60,7 @@ class WorkflowReplayTest(unittest.TestCase):
         # Turn 3: everything resolved → the workflow completes.
         d3 = drive(wf, t, history)
         self.assertEqual(d3["status"], "completed")
-        self.assertEqual(d3["output"], {"rows": 42, "startedAt": "2026-01-01T00:00:00+00:00"})
+        self.assertEqual(d3["output"], {"rows": 42, "startedAt": 1735689600000})
         self.assertEqual(d3["commands"], [])
 
     def test_a_failed_dispatched_step_is_catchable_in_workflow_code(self):
@@ -156,6 +156,22 @@ class WorkflowReplayTest(unittest.TestCase):
         ctx = WorkflowContext("r1", [], group="g")
         self.assertFalse(hasattr(ctx, "call"))
 
+    def test_now_returns_epoch_milliseconds(self):
+        """`ctx.now()` mirrors JS `Date.now()` — an epoch-**millisecond** integer, not an ISO string."""
+        wf = WorkflowWorker()
+
+        @wf.workflow("wf")
+        def flow(ctx, _input):
+            ctx.now()
+            ctx.step("x", group="g")  # block so we can inspect the recorded capture
+
+        d1 = wf.process_task(task())
+        recorded = d1["commands"][0]
+        self.assertEqual(recorded["name"], "now#0")
+        self.assertIsInstance(recorded["output"], int)
+        # A sane epoch-ms magnitude (> year 2001 in ms), never seconds and never a string.
+        self.assertGreater(recorded["output"], 1_000_000_000_000)
+
     def test_now_records_once_then_replays_the_captured_value(self):
         wf = WorkflowWorker()
 
@@ -179,46 +195,87 @@ class WorkflowReplayTest(unittest.TestCase):
         self.assertEqual(d2["status"], "completed")
         self.assertEqual(d2["output"], {"first": recorded_ts})
 
-    def test_uuid_records_once_then_replays_the_captured_value(self):
+    def test_side_effect_records_once_then_replays_the_captured_value(self):
+        """`ctx.side_effect(fn)` — the general capture primitive: run `fn` once, checkpoint under the
+        constant `sideEffect` name, replay the same value without re-running `fn`."""
         wf = WorkflowWorker()
+        runs = {"n": 0}
 
         @wf.workflow("wf")
         def flow(ctx, _input):
-            first = ctx.uuid()
+            def gen():
+                runs["n"] += 1
+                return f"id-{runs['n']}"
+
+            first = ctx.side_effect(gen)
             ctx.step("x", group="g")  # block so we get two turns
             return {"first": first}
 
         d1 = wf.process_task(task())
         self.assertEqual(d1["status"], "continue")
         self.assertEqual([c["kind"] for c in d1["commands"]], ["recordStep", "call"])
-        recorded_uuid = d1["commands"][0]["output"]
-        self.assertEqual(d1["commands"][0]["name"], "uuid#0")
-        self.assertTrue(recorded_uuid)  # non-empty
+        recorded_id = d1["commands"][0]["output"]
+        self.assertEqual(d1["commands"][0]["name"], "sideEffect")
+        self.assertEqual(recorded_id, "id-1")
+        self.assertEqual(runs["n"], 1)  # fn ran exactly once
 
         history = [
-            {"seq": 0, "kind": "step", "name": "uuid#0", "output": recorded_uuid},
+            {"seq": 0, "kind": "step", "name": "sideEffect", "output": recorded_id},
             {"seq": 1, "kind": "call", "name": "x", "output": None},
         ]
         d2 = wf.process_task(task(history=history))
         self.assertEqual(d2["status"], "completed")
-        self.assertEqual(d2["output"], {"first": recorded_uuid})
+        self.assertEqual(d2["output"], {"first": recorded_id})
+        self.assertEqual(runs["n"], 1)  # NOT re-run on replay
 
-    def test_now_and_uuid_do_not_recompute_on_replay(self):
-        """The captured value is whatever history says — even if it couldn't possibly have been
-        produced by the real clock/uuid generator — proving replay never re-invokes the body."""
+    def test_side_effect_supports_an_async_callable(self):
         wf = WorkflowWorker()
 
         @wf.workflow("wf")
         def flow(ctx, _input):
-            return {"now": ctx.now(), "uuid": ctx.uuid()}
+            async def gen():
+                return "async-value"
+
+            captured = ctx.side_effect(gen)
+            ctx.step("x", group="g")
+            return {"captured": captured}
+
+        d1 = wf.process_task(task())
+        self.assertEqual(d1["commands"][0]["name"], "sideEffect")
+        self.assertEqual(d1["commands"][0]["output"], "async-value")
+
+    def test_multiple_side_effects_are_distinct_history_entries(self):
+        """Both records share the constant `sideEffect` name but sit at distinct seqs, so replay
+        keys them by seq and never collides."""
+        wf = WorkflowWorker()
+
+        @wf.workflow("wf")
+        def flow(ctx, _input):
+            a = ctx.side_effect(lambda: "a")
+            b = ctx.side_effect(lambda: "b")
+            ctx.step("x", group="g")
+            return {"a": a, "b": b}
+
+        d1 = wf.process_task(task())
+        names = [(c["seq"], c["name"], c.get("output")) for c in d1["commands"] if c["kind"] == "recordStep"]
+        self.assertEqual(names, [(0, "sideEffect", "a"), (1, "sideEffect", "b")])
+
+    def test_now_and_side_effect_do_not_recompute_on_replay(self):
+        """The captured value is whatever history says — even if it couldn't possibly have been
+        produced by the real clock/generator — proving replay never re-invokes the body."""
+        wf = WorkflowWorker()
+
+        @wf.workflow("wf")
+        def flow(ctx, _input):
+            return {"now": ctx.now(), "id": ctx.side_effect(lambda: "recomputed")}
 
         history = [
-            {"seq": 0, "kind": "step", "name": "now#0", "output": "not-a-real-timestamp"},
-            {"seq": 1, "kind": "step", "name": "uuid#1", "output": "not-a-real-uuid"},
+            {"seq": 0, "kind": "step", "name": "now#0", "output": -1},
+            {"seq": 1, "kind": "step", "name": "sideEffect", "output": "from-history"},
         ]
         d = wf.process_task(task(history=history))
         self.assertEqual(d["status"], "completed")
-        self.assertEqual(d["output"], {"now": "not-a-real-timestamp", "uuid": "not-a-real-uuid"})
+        self.assertEqual(d["output"], {"now": -1, "id": "from-history"})
 
 
 if __name__ == "__main__":

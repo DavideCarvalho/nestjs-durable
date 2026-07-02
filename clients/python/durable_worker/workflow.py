@@ -16,8 +16,8 @@ and dispatches. The runtime never touches a store.
 
 Each `ctx.*` op is keyed by a deterministic seq. On replay an op already in history returns its
 recorded result; the first UNRESOLVED blocking op (step/sleep/wait_signal/start_child) suspends the
-turn, emitting its command. `ctx.now()`/`ctx.uuid()` run inline and record their result (so a
-timestamp/id capture happens once and replays the same value). See
+turn, emitting its command. `ctx.now()` and `ctx.side_effect(fn)` run inline and record their result
+(so a timestamp / any non-deterministic capture happens once and replays the same value). See
 docs/plans/2026-06-15-polyglot-workflows-protocol.md.
 
 ``ctx.gather([(name, body), ...])`` runs N local steps CONCURRENTLY (threads) and waits for all;
@@ -29,12 +29,11 @@ any item fails) with an opt-in ``fail_fast``.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import threading
 import time
 import traceback
-import uuid as _uuid
-from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from .cancellation import Cancelled
@@ -217,21 +216,35 @@ class WorkflowContext:
         )
         raise _Suspend()
 
-    def now(self) -> str:
-        """A replay-stable UTC ISO-8601 timestamp: captured once (on the turn that reaches this op)
-        and replayed thereafter — mirrors the TypeScript ``ctx.now()``. Forcing a `new Date()`-style
-        capture through a dispatched ``@step`` would be a pointless round-trip for a trivial
-        non-deterministic value, so this reuses the same local-step/``recordStep`` machinery
-        (:meth:`_local_step`) that used to be reachable as a general-purpose inline ``ctx.step``."""
+    def now(self) -> int:
+        """A replay-stable wall-clock timestamp in epoch **milliseconds** (a number, like JS
+        ``Date.now()``): captured once (on the turn that reaches this op) and replayed thereafter —
+        mirrors the TypeScript ``ctx.now(): number``. Forcing a clock read through a dispatched
+        ``@step`` would be a pointless round-trip for a trivial non-deterministic value, so this
+        reuses the same local-step/``recordStep`` machinery (:meth:`_local_step`) that backs
+        :meth:`side_effect`."""
         seq = self._seq  # the seq _local_step's own _next() is about to allocate — see _local_step.
-        return self._local_step(f"now#{seq}", lambda: datetime.now(timezone.utc).isoformat())
+        return self._local_step(f"now#{seq}", lambda: int(time.time() * 1000))
 
-    def uuid(self) -> str:
-        """A replay-stable id: captured once and replayed thereafter — mirrors the TypeScript
-        ``ctx.uuid()``. See :meth:`now` for why this reuses :meth:`_local_step` instead of being its
-        own bespoke recording path."""
-        seq = self._seq
-        return self._local_step(f"uuid#{seq}", lambda: str(_uuid.uuid4()))
+    def side_effect(self, fn: Callable[[], Any]) -> Any:
+        """The general deterministic-capture primitive (Temporal's ``sideEffect``): run ``fn`` ONCE,
+        checkpoint its result, and on replay return the SAME recorded value WITHOUT re-running ``fn``.
+
+        Use it to pull any non-deterministic value into the durable history — an id
+        (``ctx.side_effect(lambda: str(uuid7()))``), a random draw, an env read — so the workflow
+        stays deterministic across replays. ``fn`` is a 0-arg callable, sync or async (an awaitable
+        return value is driven to completion before it is recorded). Records under a constant step
+        name (``'sideEffect'``); each call still gets its own seq, so multiple side effects in one
+        workflow are distinct history entries. Reuses the same inline local-step/``recordStep``
+        machinery :meth:`now` uses — the wire it emits is the same local checkpoint kind."""
+
+        def body() -> Any:
+            result = fn()
+            if inspect.isawaitable(result):
+                result = asyncio.run(result)
+            return result
+
+        return self._local_step("sideEffect", body)
 
     def _resolve_group(self, group: Optional[str], name: str) -> str:
         """Resolve the ``group`` field a ``call``/``gather_calls`` decision carries — the step's
@@ -259,9 +272,9 @@ class WorkflowContext:
         """Run a LOCAL step once and record its result, so a captured value happens exactly once and
         replay returns it. INTERNAL — the general-purpose inline ``ctx.step(name, body)`` this used to
         back is gone (the redesign collapsed the step surface to ONE dispatched ``ctx.step``); this
-        machinery now only backs :meth:`now`/:meth:`uuid`, which call it with a synthetic
-        ``now#<seq>``/``uuid#<seq>`` name. Kept as one shared engine (not inlined into ``now``/``uuid``)
-        so both keep the exact same replay/observability/cancellation behavior a local step always had.
+        machinery now backs :meth:`now` (synthetic ``now#<seq>`` name) and :meth:`side_effect`
+        (constant ``sideEffect`` name). Kept as one shared engine (not inlined into either) so both
+        keep the exact same replay/observability/cancellation behavior a local step always had.
 
         While the body runs it is the *current step*, so ``sub_process``/``sub_event``/``log`` inside
         it are captured as the step's ``events`` (the dashboard shows each handler's p-processes
@@ -704,7 +717,6 @@ class WorkflowWorker:
 
             workflows.run(redis=redis_url_from_env())
         """
-        import asyncio
         import signal as _signal
 
         from .redis_runner import run_redis_workflow_worker

@@ -3,7 +3,7 @@ sub-processes.
 
 The redesign collapsed the public step surface to ONE dispatched `ctx.step`; the general-purpose
 inline "run this arbitrary closure as a local step" primitive that USED TO be `ctx.step(name, body)`
-is no longer public — it now only backs `ctx.now()`/`ctx.uuid()` (see `_local_step`). This test
+is no longer public — it now only backs `ctx.now()`/`ctx.side_effect(fn)` (see `_local_step`). This test
 exercises that shared internal engine directly (white-box) to keep covering its observability
 contract: each local step must stream running → completed (so it shows up live, not all at
 turn-end), record a real wall-clock window (not 0ms), and capture the sub_process/log trail a

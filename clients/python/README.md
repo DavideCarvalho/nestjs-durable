@@ -53,8 +53,8 @@ decisions:
 | Op | Meaning |
 | --- | --- |
 | `ctx.step(name, input, group=...)` | Dispatch a step (routed by handler `name`, any language) and await its result. ALWAYS durable, ALWAYS engine-scheduled — one step primitive, no local/remote placement choice. |
-| `ctx.now()` | A replay-stable UTC ISO-8601 timestamp — captured once, replayed thereafter (instead of forcing a trivial capture through a dispatched step). |
-| `ctx.uuid()` | A replay-stable id — captured once, replayed thereafter. |
+| `ctx.now()` | A replay-stable wall-clock timestamp in epoch **milliseconds** (a number, like JS `Date.now()`) — captured once, replayed thereafter (instead of forcing a trivial capture through a dispatched step). |
+| `ctx.side_effect(fn)` | The general deterministic-capture primitive (Temporal's `sideEffect`): run `fn` once, checkpoint its result, and replay the same value without re-running `fn`. Use for ids/random/env reads, e.g. `ctx.side_effect(lambda: str(uuid7()))`. |
 | `ctx.sleep(ms)` | Durable timer — the run suspends and the engine resumes it when the timer fires. |
 | `ctx.wait_signal(name)` | Block until a signal `name` is delivered to the run (via `engine.signal`); returns its payload. |
 | `ctx.start_child(workflow, input)` | Start a child run and await its output (a failed child raises `StepFailed`). |
