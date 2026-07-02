@@ -8,5 +8,6 @@ export * from './in-app-worker';
 export * from './run-request-responder';
 export * from './step-interceptor';
 export * from './store-run-gateway';
+export * from './tenant-event-republisher';
 export * from './tokens';
 export * from './workflow.service';

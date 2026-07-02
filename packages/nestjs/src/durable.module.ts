@@ -3,7 +3,6 @@ import {
   type ControlPlane,
   DURABLE_OPTIONS,
   DURABLE_OPTIONS_CANONICAL,
-  type EngineEvent,
   type NamedTransport,
   type QueueConfig,
   type RetentionPolicy,
@@ -12,7 +11,6 @@ import {
   STATE_STORE_CANONICAL,
   type ScheduledWorkflow,
   type StateStore,
-  type TenantEvent,
   TRANSPORT,
   TRANSPORT_CANONICAL,
   type Transport,
@@ -35,8 +33,9 @@ import { DurableStepRegistrar } from './durable-step.registrar';
 import { EntityService } from './entity';
 import { type DurableInAppWorkerOptions, inAppWorkerProviders } from './in-app-worker';
 import { RetentionPoller } from './retention-poller';
-import { type RunRequestTransport, RunRequestResponder } from './run-request-responder';
+import { RunRequestResponder, type RunRequestTransport } from './run-request-responder';
 import { StoreRunGateway } from './store-run-gateway';
+import { TenantEventRepublisher } from './tenant-event-republisher';
 import { TimerPoller } from './timer-poller';
 import { CONTEXT_ACCESSOR, RUN_GATEWAY } from './tokens';
 import { WorkflowRegistrar } from './workflow.registrar';
@@ -352,19 +351,14 @@ export interface DurableModuleAsyncOptions {
  * 1. **`RunRequestResponder`** — answers a tenant's {@link RunRequest} against the bound
  *    {@link RUN_GATEWAY}, tenant-scoped. Wired when the transport implements both
  *    `onRunRequest`/`publishRunReply` (only broker transports carry the protocol).
- * 2. **Tenant-event re-publisher** — mirrors every engine lifecycle event onto its run's
- *    per-tenant channel via `publishTenantEvent`, so a store-less tenant worker can live-tail its
- *    OWN runs. The run's namespace is read straight off `event.namespace` (stamped by `engine.ts`
- *    `emit()` on every `run.*` lifecycle event, where the run is already in hand — see
- *    `EngineEvent.namespace`); a `step.*` event doesn't carry it, so those fall back to ONE
- *    `store.getRun` per unseen run id, cached for the rest of the run (namespace is immutable for
- *    a run's lifetime) — never a per-event read. Bare/default-namespace runs (no real tenant) are
- *    skipped to avoid noise on an unpartitioned operator.
+ * 2. **Tenant-event re-publisher** ({@link TenantEventRepublisher}) — mirrors every engine
+ *    lifecycle event onto its run's per-tenant channel via `publishTenantEvent`, so a store-less
+ *    tenant worker can live-tail its OWN runs. See that class for the namespace-resolution and
+ *    cache-eviction details.
  */
 @Injectable()
 class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
   private unsubscribe?: () => void;
-  private readonly runNamespaces = new Map<string, string | undefined>();
 
   constructor(
     private readonly engine: WorkflowEngine,
@@ -385,39 +379,18 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
     }
 
     if (typeof publishTenantEvent === 'function') {
-      const publish = publishTenantEvent.bind(this.transport);
+      const republisher = new TenantEventRepublisher(
+        this.store,
+        publishTenantEvent.bind(this.transport),
+      );
       this.unsubscribe = this.engine.subscribe((event) => {
-        void this.republish(event, publish);
+        void republisher.handle(event);
       });
     }
   }
 
   onModuleDestroy(): void {
     this.unsubscribe?.();
-  }
-
-  private async republish(
-    event: EngineEvent,
-    publish: (evt: TenantEvent) => Promise<void>,
-  ): Promise<void> {
-    const namespace = await this.namespaceFor(event);
-    // Skip bare/default runs — no real tenant to re-publish to, and it would just be noise on an
-    // unpartitioned operator.
-    if (!namespace || namespace === 'default') return;
-    await publish({ tenant: namespace, event }).catch(() => undefined);
-  }
-
-  /** `event.namespace` when the emit call site stamped it (every `run.*` lifecycle event); for a
-   *  `step.*` event, one `store.getRun` per unseen run id, memoized for the run's lifetime. */
-  private async namespaceFor(event: EngineEvent): Promise<string | undefined> {
-    if (event.namespace !== undefined) {
-      this.runNamespaces.set(event.runId, event.namespace);
-      return event.namespace;
-    }
-    if (this.runNamespaces.has(event.runId)) return this.runNamespaces.get(event.runId);
-    const run = await this.store.getRun(event.runId);
-    this.runNamespaces.set(event.runId, run?.namespace);
-    return run?.namespace;
   }
 }
 
