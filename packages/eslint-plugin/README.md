@@ -2,7 +2,7 @@
 
 Lint for non-deterministic sources inside a durable `@Workflow` — `Date.now()`, `Math.random()`,
 `new Date()`, `crypto.randomUUID()`, `performance.now()`. These differ on every replay and silently
-corrupt a durable run; use the checkpointed `ctx.now()` / `ctx.random()` / `ctx.uuid()` instead.
+corrupt a durable run; use the checkpointed `ctx.now()` / `ctx.sideEffect(() => ...)` instead.
 
 Ships the rule for **both** ecosystems.
 
@@ -41,6 +41,6 @@ Biome plugins can't yet scope by decorator/method, so target the plugin at your 
 }
 ```
 
-> The deterministic escape hatches `ctx.now()` / `ctx.random()` / `ctx.uuid()` already exist in
+> The deterministic escape hatches `ctx.now()` / `ctx.sideEffect(fn)` already exist in
 > `@dudousxd/nestjs-durable-core`; this rule pushes you to them at author time instead of finding the
 > drift at replay (`NonDeterminismError`).

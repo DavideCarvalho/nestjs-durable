@@ -45,21 +45,24 @@ deprecated alias.)
 > KEDA-autoscaled step pool). You give up the one-worker simplicity for independent scaling. The Python
 > `WorkflowWorker` (a workflow-only worker, still constructed with `group=`) exists for this split.
 
-> If you use **remote steps** (`ctx.remote` / `ctx.gather_calls`), a worker must consume the step's
-> name — by default that's the same worker as the workflow (handled by the unified worker above); only
-> when you split does it become a separate queue you must staff.
+> A dispatched step (`ctx.step` / `ctx.gather_calls`) needs a worker consuming its name — by default
+> that's the same worker as the workflow (handled by the unified worker above); only when you split
+> does it become a separate queue you must staff.
 
 ## Three ways to fan work out
 
-Say a workflow needs to run N handlers. Pick by the trade-off you want:
+Say a workflow needs to run N handlers. `ctx.step` is the ONE durable step primitive — always
+dispatched, always engine-scheduled — so there is no local/remote choice per call any more. What's
+still a real choice is HOW you drive N of them. Pick by the trade-off you want:
 
-### 1. `ctx.step` (local) — simplest, in-turn, serial
-The handler runs **inside the workflow turn**, in the workflow worker's process. One worker, one
-group, no step group needed. Recorded as a `local` step.
+### 1. A loop of `ctx.step` calls — simplest, sequential
+`for (const item of items) await ctx.step(this.svc.handle, item)` dispatches and awaits ONE step at
+a time — the next isn't dispatched until the previous settles. Each call is its own dispatched step
+(retried/checkpointed independently), just not fanned into a `parallelGroup`.
 
-- ✅ Simplest; no second worker.
-- ❌ Runs **inside replay** → serial, and a re-drive re-runs the whole turn from the last
-  checkpoint (no per-handler isolation). Use for cheap, deterministic, sequential work.
+- ✅ Simplest; no gather bookkeeping.
+- ❌ Total latency ≈ the *sum* of the handlers (no overlap). Use when items are naturally sequential
+  or you don't need the parallelism.
 
 ### 2. `ctx.gather_children` — N child runs, 1 group
 Fans into N **child workflow runs**, each a real durable run. Unregistered children inherit the
@@ -69,10 +72,11 @@ parent's remote group, so the **same workflow worker** consumes them — **one g
 - ❌ Creates a nested `child` run per handler (extra runs in the tree / dashboard). Good when each
   unit is genuinely its own *workflow* (has its own steps/children).
 
-### 3. `ctx.gather_calls` — N remote steps, flat
-Fans into N **remote steps** recorded **flat** on the parent run (same `parallelGroup`). The steps
-inherit the workflow's group by default, so the **same unified worker** runs them — no second group
-needed (unless you opt into the split for independent scaling).
+### 3. `ctx.gather_calls` — N dispatched steps, flat, in parallel
+Fans into N `ctx.step` dispatches recorded **flat** on the parent run (same `parallelGroup`) — all
+emitted in the same turn instead of one-at-a-time. The steps inherit the workflow's group by
+default, so the **same unified worker** runs them — no second group needed (unless you opt into the
+split for independent scaling).
 
 - ✅ Flat (no child-run wrappers), independently checkpointed per handler, runs on a **scalable
   worker pool**, can run **in parallel** (see concurrency below).
@@ -157,7 +161,7 @@ limit move and see **why** it last backed off (`ram_ceiling` / `backpressure` / 
 ### Capping vs increasing — two different knobs
 - **To go faster (parallelise the fan):** raise the **worker `concurrency`** (consumer side, above).
 - **To go slower (protect a dependency):** use the engine's durable **admission queue** —
-  `engine.registerQueue({ name, limit, rateLimit })` + `ctx.remote(step, input, { queue })` — which
+  `engine.registerQueue({ name, limit, rateLimit })` + `ctx.step(step, input, { queue })` — which
   caps how many steps of a logical "channel" are in flight at once (durable, survives crashes). That's
   for *limiting* (e.g. "≤5 concurrent calls to a rate-limited API"), not for speeding a fan up.
 

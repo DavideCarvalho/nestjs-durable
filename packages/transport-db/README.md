@@ -1,11 +1,11 @@
 # @dudousxd/nestjs-durable-transport-db
 
 A **database-backed `Transport`** for [nestjs-durable](https://github.com/DavideCarvalho/nestjs-durable) —
-DBOS-style. Remote steps (`ctx.remote`) travel as **rows in the database you already use for durable
+DBOS-style. Dispatched steps (`ctx.step`) travel as **rows in the database you already use for durable
 state**, not through a broker. Dispatch inserts a task row; a worker claims it with
 `SELECT … FOR UPDATE SKIP LOCKED`, runs it, and writes a result row the engine polls.
 
-**Why:** it's the "`ctx.remote` with zero new infrastructure" option. No Redis, no SQS, no new queue —
+**Why:** it's the "`ctx.step` with zero new infrastructure" option. No Redis, no SQS, no new queue —
 the DB is the queue. The right fit when you can't (or won't) add a broker.
 
 **Trade-off:** throughput is bounded by polling + row contention. Excellent for workflow/pipeline
@@ -63,7 +63,7 @@ import { MyStateStore } from './store';
 export class AppModule {}
 ```
 
-Workers register handlers with the `@DurableStep('name')` decorator (from `@dudousxd/nestjs-durable`)
+Workers register handlers with the `@Step('name')` decorator (from `@dudousxd/nestjs-durable`)
 — the registrar wires them onto the transport's `group`. On shutdown, call `transport.close()` to
 stop the pollers (wire it to `OnModuleDestroy`).
 

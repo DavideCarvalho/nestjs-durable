@@ -43,8 +43,8 @@ runtime.registerStep('ingest', async (input, log) => {
   return await ingest(input);
 });
 runtime.registerWorkflow('pipeline', async (ctx, input) => {
-  const key = await ctx.step('setup', async () => `/${input}/data.csv`);
-  const rows = await ctx.remote(ingestStep, { key });
+  const key = await ctx.sideEffect(() => `/${input}/data.csv`);
+  const rows = await ctx.step('ingest', { key });
   return { rows };
 });
 
@@ -57,7 +57,7 @@ await worker.close();
 
 `WorkflowContext implements WorkflowCtx`, so workflow bodies are portable between the engine and the thin worker. The **wire-expressible** ops are fully supported:
 
-`step` · `call` · `sleep` · `waitForSignal` (unbounded) · `child` · `all` · `now` / `random` / `uuid` — plus a `gather(items)` extension for parallel local steps (parity with the Python worker).
+`step` (the one dispatched-step primitive — always durable, always engine-scheduled) · `sleep` · `waitForSignal` (unbounded) · `child` · `all` · `now` / `sideEffect` — plus a `gather(items)` extension for parallel local step bodies (parity with the Python worker).
 
 Ops that need engine/store features the remote wire protocol can't express **throw `UnsupportedOnThinWorker`** (run those workflows in-process on the engine): `transaction`, `callEntity`, `signalEntity`, `continueAsNew`, `sleepUntil`, `waitForEvent`, `task`, fire-and-forget `startChild`, `breakpoint`, `webhook`, `setEvent`, `onUpdate`, `patched`, and bounded `waitForSignal({ timeoutMs })` (the worker owns no timers, and a bounded wait would break seq-parity with the engine).
 

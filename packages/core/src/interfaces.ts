@@ -752,7 +752,7 @@ export interface WorkflowExecutor {
 
 /**
  * A transport in an ordered pool, identified by `id`. The engine dispatches on the first by default
- * and fails over to the next on a dispatch error; a step can pin one via `ctx.remote(…, { transport })`.
+ * and fails over to the next on a dispatch error; a step can pin one via `ctx.step(…, { transport })`.
  * The chosen `id` is stamped on the {@link RemoteTask} so a worker replies through the matching one.
  */
 export interface NamedTransport {
@@ -979,10 +979,10 @@ export interface StepOptions {
   /** Add random jitter (50–100% of the computed delay) to avoid thundering-herd retries. */
   jitter?: boolean;
   /**
-   * Liveness window for a **remote** step (`ctx.remote`): if the worker produces no result and no
+   * Liveness window for a dispatched step (`ctx.step`): if the worker produces no result and no
    * heartbeat within this many ms, the engine presumes it dead and fails the dispatch with a
    * `RemoteStepTimeout` (retryable — it re-dispatches per `retries`). Each heartbeat resets the
-   * window. Ignored for local steps. Omit to wait indefinitely.
+   * window. Omit to wait indefinitely.
    */
   timeoutMs?: number;
   /**

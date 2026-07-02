@@ -2,7 +2,7 @@
   "name": "@dudousxd/nestjs-durable-example-basic",
   "version": "0.0.0",
   "private": true,
-  "description": "End-to-end example: a checkout workflow with local + remote (@DurableStep) steps, durable sleep and a human-approval signal — all in one NestJS process via the event-emitter transport.",
+  "description": "End-to-end example: a checkout workflow dispatching @Step handlers via ctx.step, durable sleep and a human-approval signal — all in one NestJS process via the event-emitter transport.",
   "license": "MIT",
   "type": "commonjs",
   "scripts": {

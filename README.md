@@ -33,54 +33,62 @@ no single place to read or watch the whole flow. `nestjs-durable` collapses that
 
 ## Quick look
 
-Define a remote step, write the workflow as plain code, and implement the step as a
-provider method — it runs durably, in-process, with zero extra infrastructure:
+There is **one durable step primitive**: `ctx.step`. Write the workflow as plain code, implement
+each step as a `@Step`-decorated provider method, and call it by **reference** — the engine
+checkpoints it, retries it per its policy, and runs it durably whether it's served in this same
+process (zero extra infrastructure) or by a separate/Python worker over a broker:
 
 ```ts
-// 1. Declare the step (typed contract, validated at the boundary)
-export const chargeCard = remoteStep({
-  name: 'payments.charge-card',
-  input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
-  output: z.object({ chargeId: z.string() }),
-  retries: 3,
-});
-
-// 2. The workflow — linear code; every step is checkpointed
-@Workflow({ name: 'checkout', version: '1' })
-class CheckoutWorkflow {
-  async run(ctx: WorkflowCtx, order: Order) {
-    await ctx.step('reserve-stock', async () => { /* local step */ });
-    const charge = await ctx.remote(chargeCard, { orderId: order.id, amountCents: order.total });
-    return charge.chargeId;
-  }
-}
-
-// 3. The step handler — a provider method, decoupled from the workflow
+// 1. The step handler — a provider method, decoupled from the workflow. `@Step` derives the
+//    routing name from the method (or take an explicit name for a stable cross-runtime contract);
+//    optional zod schemas validate at the dispatch boundary.
 @Injectable()
 class PaymentsWorker {
-  @DurableStep('payments.charge-card')
+  @Step({ name: 'payments.charge-card', retries: 3 })
   async charge(input: { orderId: string; amountCents: number }) {
     const res = await this.stripe.charge(input.orderId, input.amountCents);
     return { chargeId: res.id };
   }
 }
 
-// 4. Wire it up — event-emitter transport = no broker, single process
+// 2. The workflow — linear code; every step is checkpointed
+@Workflow({ name: 'checkout', version: '1' })
+class CheckoutWorkflow {
+  constructor(private readonly payments: PaymentsWorker) {}
+
+  async run(ctx: WorkflowCtx, order: Order) {
+    // Method-reference form (JS): name + types are inferred from the `@Step`-stamped method.
+    const charge = await ctx.step(this.payments.charge, {
+      orderId: order.id,
+      amountCents: order.total,
+    });
+    return charge.chargeId;
+  }
+}
+
+// 3. Wire it up — event-emitter transport = no broker, single process
 DurableModule.forRootAsync({
   inject: [EventEmitter2],
   useFactory: (emitter) => ({ store: myStore, transport: new EventEmitterTransport(emitter) }),
 });
 ```
 
-If the process crashes mid-`checkout`, it resumes on boot from the last checkpoint —
-`reserveStock` and `chargeCard` are not re-run. Swap the transport for BullMQ/NATS to move
-`PaymentsWorker` into a separate process or a Python worker, with no change to the workflow.
+If the process crashes mid-`checkout`, it resumes on boot from the last checkpoint — `charge` is
+not re-run. Swap the transport for BullMQ/NATS to move `PaymentsWorker` into a separate process or
+a Python worker, with no change to the workflow — from the workflow's point of view every `ctx.step`
+call looks identical regardless of where it's served.
+
+Crossing a *language* boundary works the same way, just called by **string** instead of reference
+(there's no JS symbol to import for a Python `@Step`): `ctx.step<ProcResult>('processing:proc', input)`.
+Non-deterministic captures (an id, a timestamp) don't need a full dispatched step — use
+`ctx.sideEffect(() => uuidv7())` or the built-in `ctx.now()` (epoch ms).
 
 The split goes both ways. A remote worker can **implement a step** the NestJS workflow calls
 (above), or **author the whole workflow** itself and call back into NestJS — the engine stays the
-single owner of durable state either way. Register a remote workflow with
-`engine.registerRemote(name, version, { group, executor })` and write the flow in the other language
-(see the [Python SDK](clients/python/README.md#authoring-workflows-in-python-coordinator-driven)).
+single owner of durable state either way. Crossing a *workflow* boundary (not just a step) is
+`ctx.child`; register a remote workflow with `engine.registerRemote(name, version, { group, executor })`
+and write the flow in the other language (see the
+[Python SDK](clients/python/README.md#authoring-workflows-in-python-coordinator-driven)).
 
 ## Status
 
@@ -113,7 +121,7 @@ multiple worker pools sharing one store/broker.
 | Package | Role | Status |
 | --- | --- | --- |
 | `@dudousxd/nestjs-durable-core` | Interfaces, engine, deterministic replay, sleep/signals, events | ✅ |
-| `@dudousxd/nestjs-durable` | NestJS module, `@Workflow`/`@DurableStep`, recovery, timer poller, auto-schema | ✅ |
+| `@dudousxd/nestjs-durable` | NestJS module, `@Workflow`/`@Step`, recovery, timer poller, auto-schema | ✅ |
 | `@dudousxd/nestjs-durable-transport-event-emitter` | In-process Transport (zero-infra default) | ✅ |
 | `@dudousxd/nestjs-durable-transport-bullmq` | BullMQ/Redis Transport for cross-process / Python steps | ✅ |
 | `@dudousxd/nestjs-durable-store-mikro-orm` · `-store-typeorm` · `-store-prisma` | `StateStore` on Postgres / MySQL / SQLite | ✅ |

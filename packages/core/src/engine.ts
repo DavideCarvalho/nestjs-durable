@@ -192,7 +192,7 @@ export interface WorkflowEngineDeps {
   transport?: Transport | undefined;
   /**
    * An ordered pool of named transports. The engine dispatches on the first and fails over to the
-   * next on a dispatch error; a step pins one via `ctx.remote(step, input, { transport: id })`. Use
+   * next on a dispatch error; a step pins one via `ctx.step(step, input, { transport: id })`. Use
    * this instead of `transport` for failover / multi-broker setups.
    */
   transports?: NamedTransport[] | undefined;
@@ -205,7 +205,7 @@ export interface WorkflowEngineDeps {
   /** Epoch-ms clock; injectable for tests. Defaults to `Date.now`. */
   clock?: (() => number) | undefined;
   /**
-   * Flow-control admission backend for `ctx.remote(step, input, { queue })`. Defaults to an in-process
+   * Flow-control admission backend for `ctx.step(step, input, { queue })`. Defaults to an in-process
    * {@link InMemoryAdmissionBackend} (per-instance caps). Inject a store/Redis-backed backend to make
    * concurrency / rate-limit / ordering GLOBAL across engine replicas.
    */
@@ -706,7 +706,7 @@ export class WorkflowEngine {
   }
 
   /**
-   * Register a flow-control queue referenced by `ctx.remote(step, input, { queue })`. Caps concurrent
+   * Register a flow-control queue referenced by `ctx.step(step, input, { queue })`. Caps concurrent
    * in-flight steps and/or the admission rate; blocked calls re-suspend and retry, so the limit is
    * durable. Per engine instance (see {@link QueueConfig}). Registering the same name replaces it.
    */
@@ -2935,7 +2935,7 @@ export class WorkflowEngine {
     const enqueuedAt = new Date();
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     // Retry policy differs from an in-process step on purpose: the internal in-process primitives
-    // (`ctx.task`'s dispatch, `ctx.now`/`ctx.uuid`) retry any non-fatal throw (the work is in-process),
+    // (`ctx.task`'s dispatch, `ctx.now`/`ctx.sideEffect`) retry any non-fatal throw (the work is in-process),
     // but a dispatched `ctx.step` only re-dispatches on a liveness TIMEOUT (presumed-dead worker). A
     // worker that *reported* an error returned a deterministic verdict, so we surface it to the
     // workflow instead of hammering the worker. Timeout retries need a window to detect death, so

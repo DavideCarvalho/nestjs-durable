@@ -63,7 +63,7 @@ export class WorkflowWorker {
     }
 
     const ctx = new WorkflowContext(task.runId, task.history, {
-      // A no-explicit-partition `ctx.call`/`ctx.remote` step inherits THIS worker's group as its
+      // A no-explicit-partition `ctx.step` call inherits THIS worker's group as its
       // partition — continuity with the pre-redesign "one group, one worker" default.
       workflowPartition: this.group,
       pendingSignals: task.pendingSignals,

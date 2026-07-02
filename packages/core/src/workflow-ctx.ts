@@ -186,7 +186,7 @@ export function createWorkflowCtx(
   // The in-process local-step runner: checkpointed, replayed, retried. No longer publicly exposed as
   // `ctx.step` (that name is now the ALWAYS-dispatched form below) — this backs the library's own
   // internal primitives that need a checkpointed in-process body: `ctx.task`'s dispatch step and the
-  // deterministic capture helpers `ctx.now`/`ctx.random`/`ctx.uuid`.
+  // deterministic capture helpers `ctx.now`/`ctx.sideEffect`.
   const localStep = async <T>(
     name: string,
     fn: (log: StepLogger) => Promise<T>,
