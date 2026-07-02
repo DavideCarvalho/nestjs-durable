@@ -5,6 +5,15 @@ import {
   type RunningWorker,
   runRedisWorker as defaultRunRedisWorker,
 } from '@dudousxd/durable-worker';
+import type {
+  EngineEvent,
+  RunDetail,
+  RunGateway,
+  RunQuery,
+  RunResult,
+  Transport,
+  WorkflowRun,
+} from '@dudousxd/nestjs-durable-core';
 import { WorkflowEngine, tenantGroup } from '@dudousxd/nestjs-durable-core';
 import {
   type DynamicModule,
@@ -20,6 +29,8 @@ import {
 import { DiscoveryModule, DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
 import { DurableStartClient } from './durable-start-client';
+import { ProxyRunGateway } from './proxy-run-gateway';
+import { RUN_GATEWAY } from './tokens';
 import { WorkflowService } from './workflow.service';
 
 /**
@@ -58,6 +69,19 @@ export interface DurableWorkerModuleOptions {
   /** Per-group concurrency override, keyed by group name. Falls back to {@link concurrency} (then 1).
    *  Each value may itself be `'adaptive'` / `{ mode:'adaptive', ... }`. */
   concurrencyByGroup?: Record<string, ConcurrencyOption>;
+  /**
+   * A persistent transport (reply/tenant-event subscriber) this tenant worker uses to bind
+   * `RUN_GATEWAY` to a {@link ProxyRunGateway}, so a controller can `getRunDetail`/`listRuns`/
+   * `cancel`/`retry`/`continue`/`retryWithInput`/`subscribe` against ITS OWN runs without a DB.
+   * Deliberately optional and app-supplied (not `connection`-derived) — the generic nestjs package
+   * stays free of any transport dependency; a tenant that wants `RunGateway` passes e.g.
+   * `new BullMQTransport({ connection, group })` from `@dudousxd/nestjs-durable-transport-bullmq`.
+   * Absent means `RUN_GATEWAY` resolves to a gateway whose every method rejects with a clear error.
+   */
+  transport?: Transport;
+  /** Timeout for a `RunGateway` round-trip over {@link transport} before it rejects. Defaults to
+   *  10_000ms inside `ProxyRunGateway`. */
+  runGatewayTimeoutMs?: number;
 }
 
 export interface DurableWorkerModuleAsyncOptions {
@@ -209,9 +233,67 @@ export class DurableWorkerModule {
           useFactory: (options: DurableWorkerModuleOptions) => new DurableStartClient(options),
           inject: [DURABLE_WORKER_OPTIONS],
         },
+        {
+          provide: RUN_GATEWAY,
+          useFactory: (options: DurableWorkerModuleOptions): RunGateway =>
+            options.transport
+              ? new ProxyRunGateway(
+                  options.transport,
+                  options.tenant ?? 'default',
+                  options.runGatewayTimeoutMs,
+                )
+              : unavailableRunGateway(),
+          inject: [DURABLE_WORKER_OPTIONS],
+        },
         WorkflowService,
       ],
-      exports: [DurableWorkerRuntime, WorkflowEngine, WorkflowService],
+      exports: [DurableWorkerRuntime, WorkflowEngine, WorkflowService, RUN_GATEWAY],
     };
   }
+}
+
+/** Reject with a clear, named tenant error for a `RunGateway` call made without a `transport`. The
+ *  call site pins `T` from its own declared return type (e.g. `Promise<RunDetail | null>`); this
+ *  helper only ever rejects, so it never actually produces a `T` value. */
+function tenantGatewayUnavailable<T>(method: string): Promise<T> {
+  return Promise.reject(
+    new Error(
+      `RunGateway.${method}() is not available — pass \`transport\` in DurableWorkerModuleOptions to use RunGateway.`,
+    ),
+  );
+}
+
+/**
+ * The no-transport fallback bound to {@link RUN_GATEWAY} when `DurableWorkerModuleOptions.transport`
+ * is absent — mirrors `DurableStartClient`'s tenant-error idiom (`tenantUnsupported`): every method
+ * rejects with a clear, named error instead of a cryptic `this.gateway.X is not a function`.
+ * `subscribe` is synchronous on the `RunGateway` port, so it throws synchronously (same message)
+ * rather than returning a rejected promise.
+ */
+function unavailableRunGateway(): RunGateway {
+  return {
+    getRunDetail(_runId: string): Promise<RunDetail | null> {
+      return tenantGatewayUnavailable<RunDetail | null>('getRunDetail');
+    },
+    listRuns(_query: RunQuery): Promise<WorkflowRun[]> {
+      return tenantGatewayUnavailable<WorkflowRun[]>('listRuns');
+    },
+    cancel(_runId: string): Promise<RunResult | null> {
+      return tenantGatewayUnavailable<RunResult | null>('cancel');
+    },
+    retry(_runId: string): Promise<RunResult | null> {
+      return tenantGatewayUnavailable<RunResult | null>('retry');
+    },
+    continue(_runId: string): Promise<RunResult | null> {
+      return tenantGatewayUnavailable<RunResult | null>('continue');
+    },
+    retryWithInput(_runId: string, _input: unknown): Promise<{ runId: string } | null> {
+      return tenantGatewayUnavailable<{ runId: string } | null>('retryWithInput');
+    },
+    subscribe(_runId: string, _onEvent: (event: EngineEvent) => void): () => void {
+      throw new Error(
+        'RunGateway.subscribe() is not available — pass `transport` in DurableWorkerModuleOptions to use RunGateway.',
+      );
+    },
+  };
 }
