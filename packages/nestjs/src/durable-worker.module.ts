@@ -14,7 +14,7 @@ import type {
   Transport,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
-import { WorkflowEngine, tenantGroup } from '@dudousxd/nestjs-durable-core';
+import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import {
   type DynamicModule,
   Inject,
@@ -35,39 +35,59 @@ import { WorkflowService } from './workflow.service';
 
 /**
  * Options for a **store-less thin worker** process: where to consume (`connection`/`prefix`) and
- * which worker `groups` this process serves. There is deliberately NO `store`, `transport`, engine,
+ * which `partition` this process serves. There is deliberately NO `store`, `transport`, engine,
  * dashboard, recovery, or timer config — a thin worker only registers `@Workflow`/`@Step`
  * handlers and runs the BullMQ consumer (see {@link DurableWorkerModule}).
+ *
+ * Subscription is no longer a hand-declared axis: the module discovers every `@Workflow`/`@Step`
+ * provider, registers it on the thin `DurableWorkerRuntime`, and starts ONE `runRedisWorker` call
+ * that subscribes one queue PER REGISTERED NAME (`DurableWorkerRuntime.registeredNames()`,
+ * `@dudousxd/durable-worker`) — not one consumer per hand-declared group.
  */
 export interface DurableWorkerModuleOptions {
   /** ioredis connection (string or options), as `runRedisWorker` / `BullMQTransport` accept. */
   connection: string | Record<string, unknown>;
-  /** The worker groups this process serves — one BullMQ consumer is started per group. */
-  groups: string[];
   /**
-   * The tenant this worker process serves. Each of {@link groups} is suffixed via
-   * `tenantGroup(group, tenant)` (`@dudousxd/nestjs-durable-core`) before the consumer starts, so
-   * `undefined`, `''`, or `'default'` stays byte-identical to the bare group (production
-   * unchanged), and any other tenant serves `<group>@<tenant>` — matching the group name an
-   * OPERATOR control plane's `remoteByConvention` routes that tenant's runs to
+   * @deprecated No longer the subscription axis. Subscription is derived from every discovered
+   * `@Workflow`/`@Step` handler (one queue per registered name) instead of a hand-declared group
+   * list. Accepted for source back-compat and ignored.
+   */
+  groups?: string[];
+  /**
+   * The isolation partition this worker process serves. Each registered handler's queue token is
+   * suffixed via `tenantGroup(sanitizeQueueToken(name), partition)` (`@dudousxd/nestjs-durable-core`),
+   * so `undefined`, `''`, or `'default'` stays byte-identical to the bare (sanitized) name
+   * (production unchanged), and any other partition serves `<name>@<partition>` — matching the
+   * queue name an OPERATOR control plane's `remoteByConvention` routes that tenant's runs to
    * (`tenantGroup(run.workflow, run.namespace)` on the engine side).
    */
+  partition?: string;
+  /** @deprecated Use {@link partition} instead — a back-compat alias mapped onto it (only used when
+   *  `partition` itself is unset). */
   tenant?: string;
   /** Key prefix namespacing the durable queues. Defaults to `durable` (matches the transport). */
   prefix?: string;
   /** Stable id for this worker process in heartbeats/control. Defaults to a per-host/pid id. */
   instanceId?: string;
   /**
-   * How many tasks each group's consumer runs concurrently (BullMQ Worker concurrency). Defaults to 1.
-   * Applies to every group unless overridden per-group by {@link concurrencyByGroup}. Raise it so a
-   * fanned-out batch (e.g. the N remote steps of a `gather`) runs in parallel instead of serially.
+   * How many tasks this worker runs concurrently PER SUBSCRIBED QUEUE (BullMQ Worker concurrency —
+   * the same limit is applied to every per-name queue the single `runRedisWorker` call starts).
+   * Defaults to 1. Raise it so a fanned-out batch (e.g. the N remote steps of a `gather`) runs in
+   * parallel instead of serially.
    *
-   * Pass `'adaptive'` (or `{ mode:'adaptive', ... }`) to let each consumer self-tune its concurrency
+   * Pass `'adaptive'` (or `{ mode:'adaptive', ... }`) to let the consumer self-tune its concurrency
    * (latency gradient + RAM brake + backpressure) and publish a live status on its heartbeat.
    */
   concurrency?: ConcurrencyOption;
-  /** Per-group concurrency override, keyed by group name. Falls back to {@link concurrency} (then 1).
-   *  Each value may itself be `'adaptive'` / `{ mode:'adaptive', ... }`. */
+  /**
+   * Per-handler concurrency override, keyed by workflow/step NAME. Falls back to {@link concurrency}
+   * (then 1). NOT YET WIRED THROUGH: `runRedisWorker` (`@dudousxd/durable-worker`) currently applies
+   * one {@link concurrency} limit uniformly across every per-name queue it subscribes to from a
+   * single call — reserved here for when per-name concurrency lands there.
+   */
+  concurrencyByHandler?: Record<string, ConcurrencyOption>;
+  /** @deprecated Use {@link concurrencyByHandler} (keyed by handler name, not group). Never wired
+   *  through — there is no more per-group loop to key by. Accepted for source back-compat only. */
   concurrencyByGroup?: Record<string, ConcurrencyOption>;
   /**
    * A persistent transport (reply/tenant-event subscriber) this tenant worker uses to bind
@@ -101,7 +121,8 @@ export const DURABLE_WORKER_OPTIONS = Symbol('nestjs-durable:worker-options');
  */
 export const RUN_REDIS_WORKER = Symbol('nestjs-durable:run-redis-worker');
 
-/** The list of started {@link RunningWorker} handles (one per group), closed on shutdown. */
+/** The list of started {@link RunningWorker} handles (the single handle `ThinWorkerBootstrap`
+ *  starts), closed on shutdown. */
 export const DURABLE_WORKER_RUNNERS = Symbol('nestjs-durable:worker-runners');
 
 /** The signature of `runRedisWorker` — injected behind {@link RUN_REDIS_WORKER}. */
@@ -148,10 +169,12 @@ export class ThinStepRegistrar implements OnModuleInit {
 }
 
 /**
- * Starts one BullMQ consumer per configured group on bootstrap (after both registrars have run, so
- * every handler is registered before any task is consumed) and closes them on shutdown. The only
- * runtime side effect of a thin worker: register handlers, run the consumer. No engine, no store,
- * no recovery, no timers, no dispatch.
+ * Starts ONE `runRedisWorker` call on bootstrap — after both registrars have run, so every handler
+ * is registered before any task is consumed — and closes it on shutdown. The runner (`@dudousxd/
+ * durable-worker`) derives its subscription from `runtime.registeredNames()` (one queue per
+ * registered `@Workflow`/`@Step` name), not a hand-declared group list. The only runtime side effect
+ * of a thin worker: register handlers, run the consumer. No engine, no store, no recovery, no
+ * timers, no dispatch.
  *
  * For the shutdown close to fire, enable Nest's shutdown hooks: `app.enableShutdownHooks()`.
  */
@@ -167,20 +190,20 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    for (const group of this.options.groups) {
-      const handle = await this.runRedisWorker({
-        runtime: this.runtime,
-        group: tenantGroup(group, this.options.tenant),
-        connection: this.options.connection,
-        ...(this.options.prefix !== undefined ? { prefix: this.options.prefix } : {}),
-        ...(this.options.instanceId !== undefined ? { instanceId: this.options.instanceId } : {}),
-        ...((this.options.concurrencyByGroup?.[group] ?? this.options.concurrency) !== undefined
-          ? { concurrency: this.options.concurrencyByGroup?.[group] ?? this.options.concurrency }
-          : {}),
-      });
-      this.runners.push(handle);
-      this.runnersSink.push(handle);
-    }
+    // ONE call: the runner (Task 5) subscribes one queue per name registered on `this.runtime` —
+    // populated by `ThinWorkflowRegistrar`/`ThinStepRegistrar`'s `onModuleInit`, which Nest's
+    // lifecycle guarantees run (across the whole app) before any `onApplicationBootstrap` hook.
+    const partition = this.options.partition ?? this.options.tenant;
+    const handle = await this.runRedisWorker({
+      runtime: this.runtime,
+      ...(partition !== undefined ? { partition } : {}),
+      connection: this.options.connection,
+      ...(this.options.prefix !== undefined ? { prefix: this.options.prefix } : {}),
+      ...(this.options.instanceId !== undefined ? { instanceId: this.options.instanceId } : {}),
+      ...(this.options.concurrency !== undefined ? { concurrency: this.options.concurrency } : {}),
+    });
+    this.runners.push(handle);
+    this.runnersSink.push(handle);
   }
 
   async onApplicationShutdown(): Promise<void> {
@@ -190,8 +213,10 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
 
 /**
  * A NestJS dynamic module that turns an app into a **PURE durable worker**: it discovers
- * `@Workflow`/`@Step` providers, registers them on the thin {@link DurableWorkerRuntime}, and
- * runs one BullMQ consumer per group via `runRedisWorker`. It is **control-plane-less** — it binds
+ * `@Workflow`/`@Step` providers, registers them on the thin {@link DurableWorkerRuntime}, and starts
+ * ONE `runRedisWorker` call that subscribes one BullMQ consumer PER REGISTERED NAME — handler
+ * discovery IS the subscription surface, not a hand-declared `groups` list. It is
+ * **control-plane-less** — it binds
  * NO store/ORM, NO dashboard, NO timer poller, NO recovery, and drives NO runs. The one thing it
  * DOES bind under the `WorkflowEngine` token is a store-less {@link DurableStartClient} facade, so a
  * tenant calls `engine.start(...)` UNCHANGED and it transparently dispatches a start-run to the
@@ -223,7 +248,21 @@ export class DurableWorkerModule {
       imports: [DiscoveryModule],
       providers: [
         optionsProvider,
-        { provide: DurableWorkerRuntime, useFactory: () => new DurableWorkerRuntime() },
+        {
+          provide: DurableWorkerRuntime,
+          // The runtime's `WorkflowWorker` falls back to its own `group` ctor param as the
+          // WORKFLOW's `workflowPartition` for any `ctx.remote` call that omits an explicit
+          // `partition` (see `workflow-context.ts`'s `resolveCallGroup`) — that fallback MUST equal
+          // this module's own {@link DurableWorkerModuleOptions.partition}, or an implicit-partition
+          // remote step's decision carries a mismatched token and the engine dispatches it to a
+          // queue nothing here subscribes to. Explicit `''` (never `undefined`) so it does NOT fall
+          // through to `WorkflowWorker`'s unrelated `'workflows'` default parameter.
+          useFactory: (options: DurableWorkerModuleOptions) =>
+            new DurableWorkerRuntime({
+              workflowGroup: options.partition ?? options.tenant ?? '',
+            }),
+          inject: [DURABLE_WORKER_OPTIONS],
+        },
         { provide: RUN_REDIS_WORKER, useValue: defaultRunRedisWorker },
         { provide: DURABLE_WORKER_RUNNERS, useValue: [] as RunningWorker[] },
         ThinWorkflowRegistrar,
@@ -240,7 +279,7 @@ export class DurableWorkerModule {
             options.transport
               ? new ProxyRunGateway(
                   options.transport,
-                  options.tenant ?? 'default',
+                  options.partition ?? options.tenant ?? 'default',
                   options.runGatewayTimeoutMs,
                 )
               : unavailableRunGateway(),
