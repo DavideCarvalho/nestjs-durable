@@ -19,6 +19,8 @@ import {
   type WorkflowStepEvent,
   type WorkflowTask,
   runStepHandler,
+  sanitizeQueueToken,
+  tenantGroup,
 } from '@dudousxd/nestjs-durable-core';
 import { type ConnectionOptions, Queue, Worker } from 'bullmq';
 import { Redis, type RedisOptions } from 'ioredis';
@@ -92,7 +94,19 @@ export function parseHeartbeatValue(raw: string | null): {
 export interface BullMQTransportOptions {
   /** ioredis connection options (or an IORedis instance). */
   connection: ConnectionOptions;
-  /** The worker group this instance serves, required to register `handle()` consumers. */
+  /**
+   * Logical isolation partition suffixing every per-handler tasks queue this instance subscribes to
+   * (via {@link tenantGroup}) — e.g. so several isolated worker pools can share one Redis without a
+   * `handle()`d name colliding across pools. Optional: unset routes each handler to the bare
+   * (sanitized) handler name, with no suffix.
+   */
+  partition?: string;
+  /**
+   * @deprecated Use `partition` instead. `group` is a back-compat alias of
+   * {@link BullMQTransportOptions.partition}: passing it now suffixes every per-handler queue exactly
+   * like `partition` would — it is no longer read as the literal (single, shared) queue name. Removed
+   * in a future major.
+   */
   group?: string;
   /** Key prefix namespacing the durable queues. Defaults to `durable`. */
   prefix?: string;
@@ -122,15 +136,17 @@ export interface BullMQTransportOptions {
 /**
  * A queue-backed `Transport` over BullMQ/Redis — the path for true cross-process and
  * cross-language steps (e.g. a Python worker on the same queues). Steps are dispatched to a
- * per-group tasks queue; results come back on a shared results queue.
+ * queue named after their routing token (handler name, optionally partition-suffixed — see
+ * {@link tenantGroup}); results come back on a shared results queue.
  *
- * Run one instance engine-side (consumes results) and one per worker process (registers
- * `handle()`s for its group). The wire payload is the documented `RemoteTask`/`StepResult` JSON,
- * so non-Node workers interoperate.
+ * Run one instance engine-side (consumes results) and one per worker process, registering a
+ * `handle()` per handler name — each gets its OWN dedicated tasks queue/`Worker`, so a routing
+ * token only one handler answers to never collides with another handler's queue. The wire payload
+ * is the documented `RemoteTask`/`StepResult` JSON, so non-Node workers interoperate.
  */
 export class BullMQTransport implements Transport, ControlPlane {
   private readonly connection: ConnectionOptions;
-  private readonly group?: string | undefined;
+  private readonly partition: string | undefined;
   private readonly prefix: string;
   // Logical deployment namespace folded into every name via `#effectivePrefix()`. Mutable so an
   // engine can push its namespace onto a transport via `useNamespace()` — but only when one wasn't
@@ -139,7 +155,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   readonly #explicitNamespace: boolean;
   private readonly handlers = new Map<string, StepHandler>();
   private readonly queues = new Map<string, Queue>();
-  private taskWorker?: Worker;
+  // One BullMQ `Worker` per registered handler name (see `handle()`) — never a single shared queue.
+  private readonly taskWorkers = new Map<string, Worker>();
   private resultsWorker?: Worker;
   private decisionsWorker?: Worker;
   private stepEventsWorker?: Worker;
@@ -169,14 +186,18 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly concurrency: ConcurrencyOption | undefined;
   // The shared concurrency controller, created when this instance becomes a worker (`handle()`), or
   // lazily in fixed mode for the heartbeat status if a beat fires without one. Tracks inFlight + a
-  // completion window, snapshots the heartbeat status, and (adaptive) re-tunes `taskWorker.concurrency`.
+  // completion window across ALL per-handler task workers, snapshots the heartbeat status, and
+  // (adaptive) re-tunes every entry in `taskWorkers`' concurrency.
   private workerController?: AdaptiveController;
   private workerHeartbeatTimer?: ReturnType<typeof setInterval>;
   private workerHeartbeatRedis?: Redis;
+  // Per-handler heartbeat tokens beaten on the single shared `workerHeartbeatTimer` — one entry per
+  // `handle()`d name (its `tenantGroup(sanitizeQueueToken(name), partition)` queue token).
+  private readonly heartbeatTokens = new Set<string>();
 
   constructor(options: BullMQTransportOptions) {
     this.connection = options.connection;
-    this.group = options.group;
+    this.partition = options.partition ?? options.group;
     this.prefix = options.prefix ?? 'durable';
     this.#namespace = options.namespace;
     this.#explicitNamespace = options.namespace !== undefined;
@@ -225,16 +246,18 @@ export class BullMQTransport implements Transport, ControlPlane {
       this.workerController = new AdaptiveController({
         ...(this.concurrency !== undefined ? { concurrency: this.concurrency } : {}),
         apply: (limit) => {
-          if (this.taskWorker) this.taskWorker.concurrency = limit;
+          for (const worker of this.taskWorkers.values()) worker.concurrency = limit;
         },
       });
     }
     return this.workerController;
   }
 
-  // BullMQ queue names must not contain ':' (its Redis key separator), so use '-'.
-  private tasksName(group: string): string {
-    return `${this.#effectivePrefix()}-tasks-${group}`;
+  // BullMQ queue names must not contain ':' (its Redis key separator), so use '-'. `routingToken` is
+  // already the FINAL token (a `sanitizeQueueToken`d handler name, optionally `tenantGroup`-suffixed
+  // with a partition) — callers compute it, this just folds in the effective prefix.
+  private tasksName(routingToken: string): string {
+    return `${this.#effectivePrefix()}-tasks-${routingToken}`;
   }
   private resultsName(): string {
     return `${this.#effectivePrefix()}-results`;
@@ -271,6 +294,8 @@ export class BullMQTransport implements Transport, ControlPlane {
     };
   }
 
+  /** `task.group` already carries the FINAL routing token (`tenantGroup(sanitizeQueueToken(name),
+   *  partition)`), computed upstream by the engine — this targets that handler's dedicated queue. */
   async dispatch(task: RemoteTask): Promise<void> {
     await this.queue(this.tasksName(task.group)).add('task', task, this.jobOptions(task.priority));
   }
@@ -279,8 +304,9 @@ export class BullMQTransport implements Transport, ControlPlane {
     return `${this.#effectivePrefix()}-decisions`;
   }
 
-  /** engine → workflow worker: a WorkflowTask on the group's task queue (same queue a Python workflow
-   *  worker consumes via `<prefix>-tasks-<group>`). The decision comes back on `<prefix>-decisions`. */
+  /** engine → workflow worker: a WorkflowTask on the workflow's dedicated task queue (same queue a
+   *  Python workflow worker consumes via `<prefix>-tasks-<routing-token>`). The decision comes back
+   *  on `<prefix>-decisions`. */
   async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
     await this.queue(this.tasksName(task.group)).add(
       'workflow',
@@ -322,25 +348,31 @@ export class BullMQTransport implements Transport, ControlPlane {
     );
   }
 
-  /** Register a step handler (worker side). Starts the group's task consumer on first call. */
+  /**
+   * Register a step handler (worker side). Starts a DEDICATED task consumer for `name` on first
+   * registration — one BullMQ `Worker` per handler name, each on its own `tasksName` queue (via
+   * {@link tenantGroup}/{@link sanitizeQueueToken}), never a single queue shared across handlers.
+   * Re-registering an already-`handle()`d name just swaps the handler fn; its worker is untouched.
+   */
   handle(name: string, fn: StepHandler): void {
-    if (!this.group) throw new Error('BullMQTransport needs a `group` to register handlers');
     this.handlers.set(name, fn);
-    if (!this.taskWorker) {
-      const controller = this.controller();
-      this.taskWorker = new Worker(this.tasksName(this.group), (job) => this.runTask(job.data), {
-        connection: this.workerConnection(),
-        concurrency: controller.initialLimit,
-      });
-      // Run the control loop (fixed: tracks status only; adaptive: also re-tunes `taskWorker.concurrency`).
-      controller.start();
-      // This instance is now a worker for `group` — start stamping its liveness heartbeat.
-      this.startWorkerHeartbeat(this.group);
-    }
+    if (this.taskWorkers.has(name)) return;
+    const controller = this.controller();
+    const routingToken = tenantGroup(sanitizeQueueToken(name), this.partition);
+    const worker = new Worker(this.tasksName(routingToken), (job) => this.runTask(job.data), {
+      connection: this.workerConnection(),
+      concurrency: controller.initialLimit,
+    });
+    this.taskWorkers.set(name, worker);
+    // Run the shared control loop (idempotent across handlers): fixed mode just tracks status;
+    // adaptive mode also re-tunes every `taskWorkers` entry's concurrency.
+    controller.start();
+    // This instance is now a worker for `routingToken` — start stamping its liveness heartbeat.
+    this.startWorkerHeartbeat(routingToken);
   }
 
-  private workerHeartbeatKey(group: string, instanceId: string): string {
-    return `${this.#effectivePrefix()}-worker-heartbeat:${group}:${instanceId}`;
+  private workerHeartbeatKey(routingToken: string, instanceId: string): string {
+    return `${this.#effectivePrefix()}-worker-heartbeat:${routingToken}:${instanceId}`;
   }
 
   /** Lazily-created standalone client for the worker-heartbeat keys (writes + scans), reused so a
@@ -350,28 +382,35 @@ export class BullMQTransport implements Transport, ControlPlane {
     return this.workerHeartbeatRedis;
   }
 
-  /** Refresh this worker's TTL'd liveness key on an interval until `close()`. Best-effort: a failed
-   *  refresh is swallowed (the key then expires, and that gap is itself the signal). The first beat
-   *  fires immediately so a freshly-started worker is visible without waiting a full interval. */
-  private startWorkerHeartbeat(group: string): void {
-    if (this.workerHeartbeatTimer) return;
+  /** Refresh EVERY `handle()`d name's TTL'd liveness key on ONE shared interval until `close()` —
+   *  each handler name keeps its own key (`workerHeartbeatKey(routingToken, instanceId)`) so
+   *  `groupHealth`/`listWorkerGroups` still resolve liveness per per-handler queue. Best-effort: a
+   *  failed refresh is swallowed (the key then expires, and that gap is itself the signal). A newly
+   *  added token beats immediately so a freshly-registered handler is visible without waiting a full
+   *  interval. */
+  private startWorkerHeartbeat(routingToken: string): void {
     const client = this.workerRedis();
-    const key = this.workerHeartbeatKey(group, this.instanceId);
     const controller = this.controller();
-    const beat = () => {
+    const beatOne = (token: string) => {
+      const key = this.workerHeartbeatKey(token, this.instanceId);
       // Value is now `{ts,status}` JSON (was a bare ms timestamp); `listLiveWorkers` reads both forms.
       const value = JSON.stringify({ ts: Date.now(), status: controller.snapshot() });
       void client.set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS).catch(() => {});
     };
-    beat();
-    this.workerHeartbeatTimer = setInterval(beat, WORKER_HEARTBEAT_INTERVAL_MS);
+    const isNewToken = !this.heartbeatTokens.has(routingToken);
+    this.heartbeatTokens.add(routingToken);
+    if (isNewToken) beatOne(routingToken);
+    if (this.workerHeartbeatTimer) return;
+    this.workerHeartbeatTimer = setInterval(() => {
+      for (const token of this.heartbeatTokens) beatOne(token);
+    }, WORKER_HEARTBEAT_INTERVAL_MS);
     // Don't keep the event loop alive just for the heartbeat (a worker should exit when idle-closing).
     this.workerHeartbeatTimer.unref?.();
   }
 
-  /** Distinct groups with a live worker heartbeat, discovered by scanning the heartbeat keyspace.
-   *  A key is `<prefix>-worker-heartbeat:<group>:<instanceId>` and group/instanceId carry no `:`,
-   *  so the group is the segment between the fixed prefix and the next `:`. */
+  /** Distinct routing tokens with a live worker heartbeat, discovered by scanning the heartbeat
+   *  keyspace. A key is `<prefix>-worker-heartbeat:<routingToken>:<instanceId>` and neither segment
+   *  carries a `:`, so the token is the segment between the fixed prefix and the next `:`. */
   async listWorkerGroups(): Promise<string[]> {
     const client = this.workerRedis();
     const prefix = `${this.#effectivePrefix()}-worker-heartbeat:`;
@@ -613,7 +652,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   async close(): Promise<void> {
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
     this.workerController?.stop();
-    await this.taskWorker?.close();
+    await Promise.all([...this.taskWorkers.values()].map((w) => w.close()));
     await this.resultsWorker?.close();
     await this.decisionsWorker?.close();
     await this.stepEventsWorker?.close();
