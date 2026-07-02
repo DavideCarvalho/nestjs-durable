@@ -6,18 +6,21 @@ Two distinct concerns share this file:
    (falls back to ``self.namespace`` when unset). Decoupled from the wire: it never touches the
    transport prefix or a queue name.
 
-2. ``partition`` — the WIRE-level isolation suffix for THIS worker's queue routing (the redesigned
-   replacement for the old single declared ``group``). Routing moved from "one shared group queue"
-   to "one queue PER registered handler/workflow name": ``run_redis_worker`` starts one BullMQ
-   Worker per name in ``worker.names``, each on
-   ``f"{prefix}-tasks-{tenant_group(sanitize_queue_token(name), partition)}"``.
+2. ``partition`` — the WIRE-level isolation suffix for THIS worker's queue routing. The OLD Python
+   model had TWO axes: ``group`` (base queue) and ``tenant`` (isolation suffix, via ``_tenant_group``).
+   The redesign ELIMINATES the base (it is now the handler name) and RENAMES the suffix to
+   ``partition``. Routing moved from "one shared group queue" to "one queue PER registered
+   handler/workflow name": ``run_redis_worker`` starts one BullMQ Worker per name in ``worker.names``,
+   each on ``f"{prefix}-tasks-{tenant_group(sanitize_queue_token(name), partition)}"``.
 
        - ``sanitize_queue_token(name) = name.replace(':', '-')`` — BullMQ forbids ``:`` in a queue
          name; must byte-match the TypeScript ``sanitizeQueueToken``.
        - ``tenant_group(base, partition)`` is the byte-identical Python mirror of the TypeScript
          ``tenantGroup``: ``None``/``''``/``'default'`` -> the bare ``base``; any other partition ->
          ``"<base>@<partition>"``.
-       - ``Worker(group=...)`` is a deprecated back-compat alias for ``Worker(partition=...)``.
+       - ``Worker(tenant=...)`` is the deprecated ROUTING alias — it maps to ``partition`` so a
+         worker built the old way still subscribes to ``<handler>@<tenant>`` queues.
+       - ``Worker(group=...)`` is deprecated and IGNORED for routing (the base is the handler name).
 """
 
 import unittest
@@ -65,26 +68,37 @@ class TenantGroupTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Worker(group=...) — deprecated back-compat alias for Worker(partition=...)
+# Deprecated constructor aliases: tenant= -> partition (routing); group= ignored
 # ---------------------------------------------------------------------------
 
 
-class WorkerGroupDeprecatedAliasTest(unittest.TestCase):
-    def test_group_kwarg_maps_to_partition_and_warns(self):
+class WorkerDeprecatedAliasTest(unittest.TestCase):
+    def test_tenant_kwarg_maps_to_partition_and_warns(self):
+        # tenant= is the RENAMED suffix axis — it must set partition (the routing suffix).
         with self.assertWarns(DeprecationWarning):
-            worker = Worker(group="processing", auto_register=False)
-        self.assertEqual(worker.partition, "processing")
+            worker = Worker(tenant="davi-local", auto_register=False)
+        self.assertEqual(worker.partition, "davi-local")
+        # ...and Worker.tenant still reflects it for StartRunMessage stamping.
+        self.assertEqual(worker.tenant, "davi-local")
 
-    def test_explicit_partition_wins_over_group_alias(self):
+    def test_explicit_partition_wins_over_tenant_alias(self):
         with self.assertWarns(DeprecationWarning):
-            worker = Worker(partition="explicit", group="ignored", auto_register=False)
+            worker = Worker(partition="explicit", tenant="ignored", auto_register=False)
         self.assertEqual(worker.partition, "explicit")
 
-    def test_no_group_kwarg_is_silent(self):
+    def test_group_kwarg_is_ignored_for_routing_and_warns(self):
+        # group= is the ELIMINATED base axis — accepted, warned, but NEVER a routing suffix.
+        with self.assertWarns(DeprecationWarning):
+            worker = Worker(group="processing", auto_register=False)
+        self.assertIsNone(worker.partition)
+
+    def test_partition_is_silent(self):
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             worker = Worker(partition="processing", auto_register=False)
         self.assertEqual(worker.partition, "processing")
+        # Partition doubles as the tenant label when no separate tenant is given.
+        self.assertEqual(worker.tenant, "processing")
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +250,45 @@ class RunRedisWorkerPerNameQueueTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn("durable-tasks-crunch", _RecordingWorker.created_names)
+
+    async def test_tenant_alias_still_routes_to_partition_suffixed_queue(self):
+        # REGRESSION GUARD: flip's Python worker runs `Worker(tenant=DURABLE_TENANT)` with NO explicit
+        # partition and must keep subscribing to `<handler>@<tenant>` queues — else the operator
+        # dispatching to e.g. `crunch@davi-local` never reaches it. `tenant=` maps to `partition`.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            worker = Worker(tenant="davi-local", auto_register=False)
+
+        @worker.step("crunch")
+        def crunch(_data):
+            return None
+
+        with _RunnerNamePatches():
+            await run_redis_worker(
+                worker, partition=worker.partition, connection="redis://localhost:6379"
+            )
+
+        self.assertIn("durable-tasks-crunch@davi-local", _RecordingWorker.created_names)
+
+    async def test_group_alias_does_not_suffix_the_queue(self):
+        # `group=` is the ELIMINATED base axis: it must NOT contribute a suffix or a base. The queue
+        # stays the bare handler-name queue.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            worker = Worker(group="processing", auto_register=False)
+
+        @worker.step("crunch")
+        def crunch(_data):
+            return None
+
+        with _RunnerNamePatches():
+            await run_redis_worker(
+                worker, partition=worker.partition, connection="redis://localhost:6379"
+            )
+
+        self.assertIn("durable-tasks-crunch", _RecordingWorker.created_names)
+        self.assertNotIn("durable-tasks-crunch@processing", _RecordingWorker.created_names)
+        self.assertNotIn("durable-tasks-processing", _RecordingWorker.created_names)
 
     async def test_no_registered_names_raises(self):
         worker = Worker(auto_register=False)

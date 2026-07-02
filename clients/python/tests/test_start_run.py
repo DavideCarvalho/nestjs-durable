@@ -102,7 +102,10 @@ class StartRunPayloadTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_required_fields_are_present(self) -> None:
         capture = _Capture()
-        worker = Worker("processing", namespace="acme", auto_register=False)
+        # No partition set → Worker.tenant is None → the stamp falls back to the namespace. (Post
+        # Task 8 the positional arg is `partition`, which — when set — becomes the tenant identity;
+        # this test isolates the namespace-fallback path by leaving partition unset.)
+        worker = Worker(namespace="acme", auto_register=False)
         with _patch_queue(capture):
             await worker.start_run("invoice", {"orderId": "o-1"})
         data = capture.added[0]["data"]
@@ -146,9 +149,11 @@ class StartRunPayloadTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capture.added[0]["job"], "startRun")
 
     async def test_tenant_is_worker_namespace(self) -> None:
-        """The tenant field mirrors self.namespace so the control plane routes it correctly."""
+        """With no partition set, the tenant field falls back to self.namespace so the control plane
+        routes it correctly. (A worker WITH a partition stamps the partition instead — covered by
+        test_tenant_worker.py's StartRun cases.)"""
         capture = _Capture()
-        worker = Worker("processing", namespace="tenant-xyz", auto_register=False)
+        worker = Worker(namespace="tenant-xyz", auto_register=False)
         with _patch_queue(capture):
             await worker.start_run("wf", {})
         self.assertEqual(capture.added[0]["data"]["tenant"], "tenant-xyz")
