@@ -70,6 +70,16 @@ def _effective_prefix(prefix: str, namespace: "str | None") -> str:
     return f"{prefix}-{namespace}" if namespace and namespace != "default" else prefix
 
 
+def sanitize_queue_token(name: str) -> str:
+    """Make a registered step/workflow name safe as a BullMQ queue-name segment: BullMQ forbids
+    ``:`` in a queue name, so every colon becomes a dash. ``.`` is legal and left as-is.
+
+    CROSS-SDK CONTRACT — this MUST stay byte-identical to the TypeScript ``sanitizeQueueToken``
+    (``core/src/tenant-group.ts``): both sides route a step dispatched as ``"extraction:page"`` to
+    the SAME queue token ``"extraction-page"``."""
+    return name.replace(":", "-")
+
+
 def _tenant_group(base_group: str, tenant: "str | None") -> str:
     """The worker group a tenant's run dispatches to / a tenant worker registers under.
 
@@ -206,7 +216,10 @@ def redis_url_from_env(prefix: str = "REDIS") -> str:
 
 
 def _names(prefix: str, group: str) -> tuple[str, str]:
-    # Must match the TS BullMQTransport: '<prefix>-tasks-<group>' and '<prefix>-results'.
+    # Must match the TS BullMQTransport: '<prefix>-tasks-<group>' and '<prefix>-results'. Since the
+    # redesign (Task 8), `run_redis_worker` calls this ONCE PER registered name, with `group` already
+    # the sanitized, partition-suffixed queue token (`_tenant_group(sanitize_queue_token(name),
+    # partition)`) — not a single worker-wide group. The results queue stays single (prefix-driven).
     return f"{prefix}-tasks-{group}", f"{prefix}-results"
 
 
@@ -335,42 +348,59 @@ def _progress_message(task: Dict[str, Any], event: Dict[str, Any]) -> str:
     )
 
 
+class _MultiWorkerHandle:
+    """Closes every per-name BullMQ Worker a unified :func:`run_redis_worker` started, as ONE handle.
+
+    Task 8 replaced the single ``<prefix>-tasks-<group>`` queue with one queue PER registered
+    handler/workflow name, so a run now owns N underlying BullMQ ``Worker`` instances instead of one.
+    Callers (``Worker.run`` / ``run_workers``) still just want a single ``await handle.close()`` on
+    shutdown — this wraps the list so that contract stays unchanged."""
+
+    def __init__(self, bull_workers: "list[Any]") -> None:
+        self._bull_workers = bull_workers
+
+    async def close(self) -> None:
+        await asyncio.gather(*(bw.close() for bw in self._bull_workers), return_exceptions=True)
+
+
 async def run_redis_worker(
     worker: Worker,
     *,
-    group: str,
+    partition: "str | None" = None,
     connection: str = "redis://localhost:6379",
     prefix: str = "durable",
     cancellation: Optional[CancellationRegistry] = None,
     concurrency: "int | str | dict" = 1,
     namespace: str = "default",
-    tenant: "str | None" = None,
 ) -> Any:
-    """Start a BullMQ worker that runs ``worker``'s handlers. Returns the bullmq Worker.
-
-    The returned worker runs in the background; ``await worker.close()`` to stop it. When a
+    """Start one BullMQ worker PER name ``worker`` has registered (``@worker.step`` /
+    ``@worker.workflow``) and return a handle closing all of them. Returns a :class:`_MultiWorkerHandle`
+    (``await handle.close()`` to stop every underlying BullMQ Worker). When a
     :class:`CancellationRegistry` is given (one is created otherwise), the runner subscribes to the
     control channel and feeds it, so handlers see ``ctx.cancelled``.
 
     ``concurrency`` accepts an ``int`` (fixed), ``'adaptive'`` (self-tuning with defaults), or a
     config ``dict`` (``min``/``max``/``start``/``ramCeilingPct``/``cpuCeilingPct``/``tickMs``). An
-    :class:`AdaptiveController` tracks ``inFlight`` / latency / RSS / CPU for BOTH modes (so the
-    heartbeat carries a live ``WorkerStatus``); in adaptive mode it also tunes the live limit.
+    :class:`AdaptiveController` tracks ``inFlight`` / latency / RSS / CPU for BOTH modes (so every
+    per-name heartbeat carries a live ``WorkerStatus``); in adaptive mode it also tunes the live
+    limit across ALL of this worker's underlying BullMQ Workers together (one shared pool).
 
-    ``tenant`` is the tenant this instance serves — DISTINCT from ``namespace``/``prefix`` (the
-    transport prefix stays whatever it is, typically shared with the control plane). Only the
-    worker GROUP it registers/heartbeats under (and therefore consumes tasks from) is derived via
-    ``_tenant_group(group, tenant)``: ``None``/``''``/``'default'`` yields the bare ``group``
-    (production byte-identical — a single-tenant deployment never sees a suffix); any other tenant
-    yields ``<group>@<tenant>``, so an operator control plane's ``listWorkerGroups()`` can route
-    that tenant's runs to this worker. Mirrors the TypeScript ``runRedisWorker``'s ``tenant`` option
-    byte-identically (``@dudousxd/nestjs-durable-core``'s ``tenantGroup``).
+    REDESIGNED ROUTING (Task 8): there is no longer a single declared ``group`` queue. Each
+    registered name gets its OWN queue, ``f"{prefix}-tasks-{tenant_group(sanitize_queue_token(name),
+    partition)}"`` — ``partition`` is the WIRE-level isolation suffix for this worker instance
+    (``None``/``''``/``'default'`` yields the bare sanitized name; any other partition yields
+    ``<name>@<partition>``), mirroring the TypeScript ``RemoteStepDef.partition`` /
+    ``tenantGroup(sanitizeQueueToken(step.name), step.partition)`` byte-identically
+    (``@dudousxd/nestjs-durable-core``). ``worker.tenant`` (a separate, unrelated attribute — see
+    ``Worker.start_run``) never touches this routing; it only stamps the ``StartRunMessage.tenant``
+    data label.
 
-    UNIFIED: when ``worker`` also holds workflows (``@worker.workflow``), this one runner routes per
-    job off the single ``<prefix>-tasks-<group>`` queue — a WORKFLOW task (``is_workflow_task``) is
-    replayed and its decision added to ``<prefix>-decisions``; a STEP task runs its handler and the
-    result is added to ``<prefix>-results``. The shared concurrency pool counts both in-flight, but the
-    adaptive controller measures only STEP completions (``on_settle(..., kind=...)``)."""
+    UNIFIED: when ``worker`` also holds workflows (``@worker.workflow``), each of its per-name queues
+    can carry EITHER shape — a WORKFLOW task (``is_workflow_task``) is replayed and its decision added
+    to ``<prefix>-decisions``; a STEP task runs its handler and the result is added to
+    ``<prefix>-results``. All of this worker's underlying BullMQ Workers share ONE ``process``
+    callback and ONE concurrency pool, but the adaptive controller measures only STEP completions
+    (``on_settle(..., kind=...)``)."""
 
     from bullmq import Queue as BullQueue  # imported lazily so the SDK works without bullmq
     from bullmq import Worker as BullWorker
@@ -380,12 +410,15 @@ async def run_redis_worker(
     # Fold the namespace into the prefix ONCE, then thread the effective prefix everywhere a name is
     # built — so the worker shares one namespaced keyspace with a namespaced engine (cross-SDK contract).
     effective_prefix = _effective_prefix(prefix, namespace)
-    # The GROUP this instance actually registers/heartbeats under: tenant-suffixed for a real
-    # tenant, byte-identical to `group` for None/''/'default'. `effective_prefix` above is
-    # untouched by `tenant` — only the group name (and therefore the task queue it selects) carries it.
-    effective_group = _tenant_group(group, tenant)
 
-    tasks_name, results_name = _names(effective_prefix, effective_group)
+    # Every name this worker subscribes to — one queue per name (Task 8), not one shared group queue.
+    names = worker.names
+    if not names:
+        raise ValueError(
+            "run_redis_worker: worker has no registered @worker.step/@worker.workflow handlers"
+        )
+
+    results_name = _names(effective_prefix, "")[1]
     results = BullQueue(results_name, {"connection": connection})
     registry = cancellation or CancellationRegistry()
     await _subscribe_control(connection, effective_prefix, registry)
@@ -407,9 +440,12 @@ async def run_redis_worker(
         # Mirror run_redis_workflow_worker.process: replay OFF the loop (a turn can run minutes and would
         # block the heartbeat + BullMQ lock renewal → redelivery), beating a run-scoped liveness signal
         # so the engine doesn't wrongly re-drive a slow-but-alive run. Cancel the beat once it settles.
+        # `process` is shared across every per-name BullMQ Worker, so the beat's `group` is resolved
+        # from THIS job's own workflow name rather than a single worker-wide value.
+        job_group = _tenant_group(sanitize_queue_token(job.data.get("workflow") or ""), partition)
         beat_task = (
             asyncio.create_task(
-                _beat_run(beat_client, beat_channel, job.data.get("runId"), effective_group)
+                _beat_run(beat_client, beat_channel, job.data.get("runId"), job_group)
             )
             if beat_client is not None
             else None
@@ -463,18 +499,25 @@ async def run_redis_worker(
                 kind="workflow" if is_workflow else "step",
             )
 
-    # Seed BullMQ with the controller's starting limit (fixed N or the adaptive start).
+    # Seed BullMQ with the controller's starting limit (fixed N or the adaptive start). One BullMQ
+    # Worker per registered name, ALL sharing the same `process` callback and concurrency pool.
     worker_opts: Dict[str, Any] = {"connection": connection, "concurrency": controller.limit}
-    bull_worker = BullWorker(tasks_name, process, worker_opts)
+    bull_workers: "list[Any]" = []
+    for name in names:
+        queue_group = _tenant_group(sanitize_queue_token(name), partition)
+        tasks_name, _ = _names(effective_prefix, queue_group)
+        bull_workers.append(BullWorker(tasks_name, process, worker_opts))
+        await _start_heartbeat(connection, effective_prefix, queue_group, controller)
 
     # The bullmq python port re-reads ``opts['concurrency']`` each scheduling pass, so mutating it
-    # applies the controller's decision live (see adaptive.py module docstring).
+    # applies the controller's decision live (see adaptive.py module docstring) — across every
+    # per-name BullMQ Worker, since they share one concurrency pool.
     def apply_concurrency(new_limit: int) -> None:
-        bull_worker.opts["concurrency"] = new_limit
+        for bull_worker in bull_workers:
+            bull_worker.opts["concurrency"] = new_limit
 
-    await _start_heartbeat(connection, effective_prefix, effective_group, controller)
     controller.start(apply_cb=apply_concurrency)
-    return bull_worker
+    return _MultiWorkerHandle(bull_workers)
 
 
 async def _progress_publisher(

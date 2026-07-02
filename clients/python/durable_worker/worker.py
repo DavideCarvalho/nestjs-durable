@@ -12,6 +12,7 @@ import contextvars
 import inspect
 import time
 import uuid
+import warnings
 from types import TracebackType
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Type, Union
 
@@ -342,19 +343,20 @@ class _SubProcess:
 
 
 class Worker:
-    """A unified durable worker: registers step handlers AND workflows by name on ONE group, and
-    turns a dispatched task into a result (step) or a decision (workflow).
+    """A unified durable worker: registers step handlers AND workflows by name, and turns a
+    dispatched task into a result (step) or a decision (workflow).
 
-    Workflow turns and step tasks ride the SAME queue ``<prefix>-tasks-<group>`` (distinguished on the
-    wire by job shape — see :func:`~durable_worker.workflow.is_workflow_task`), so one ``Worker`` on
-    one group runs both — no separate ``WorkflowWorker`` / second group required::
+    ROUTING (redesigned — see the Task 8 note below): each registered name gets its OWN queue —
+    there is no single shared group queue to opt every handler into. Workflow turns and step tasks
+    for a given name ride the SAME per-name queue (distinguished on the wire by job shape — see
+    :func:`~durable_worker.workflow.is_workflow_task`)::
 
-        worker = Worker("processing", concurrency="adaptive")
+        worker = Worker(concurrency="adaptive")
 
-        @worker.workflow("processing")
+        @worker.workflow("pipeline")
         def pipeline(ctx, base_id):
             key = ctx.step("setup", lambda: f"/{base_id}/data.csv")
-            rows = ctx.call("ingest", {"key": key})   # no group → inherits "processing"
+            rows = ctx.call("ingest", {"key": key})
             return {"rows": rows}
 
         @worker.step("ingest", blocking=True)
@@ -363,13 +365,21 @@ class Worker:
         worker.run()                 # or run_workers([worker])
 
     A pure step-only worker (no ``@worker.workflow``) behaves exactly as before. The advanced split —
-    a workflow worker and a step worker on DIFFERENT groups — is still available via the deprecated
+    a workflow worker and a step worker registered separately — is still available via the deprecated
     :class:`~durable_worker.workflow.WorkflowWorker` + ``run_workers([wf, steps])``.
+
+    Task 8 (group -> partition): the constructor used to take a single ``group`` — the ONE queue
+    basename every handler shared. Since routing moved to per-registered-name queues, that slot is
+    now ``partition`` — the WIRE-level isolation suffix applied to every one of THIS worker's
+    per-name queues (``None`` = no suffix). ``group=`` is kept as a deprecated keyword alias mapping
+    to ``partition`` (mirrors the TypeScript ``remoteStep({group})`` -> ``{partition}`` alias). This
+    is DISTINCT from ``tenant``, which only stamps the ``StartRunMessage.tenant`` data label on
+    ``start_run`` and never touches queue routing.
     """
 
     def __init__(
         self,
-        group: str = "default",
+        partition: "str | None" = None,
         *,
         concurrency: "int | str | dict" = 1,
         namespace: str = "default",
@@ -377,27 +387,40 @@ class Worker:
         auto_register: bool = True,
         redis: str = "redis://localhost:6379",
         prefix: str = "durable",
+        group: "str | None" = None,
     ) -> None:
-        self.group = group
+        if group is not None:
+            warnings.warn(
+                "Worker(group=...) is deprecated; use Worker(partition=...) instead. group is a "
+                "back-compat alias of partition. Removed in a future major.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if partition is None:
+                partition = group
+        # The wire-level isolation suffix applied to every one of this worker's per-name queues (see
+        # the class docstring's Task 8 note). None keeps every queue bare (byte-identical to a
+        # deployment that never adopted partitions).
+        self.partition = partition
         # Logical deployment namespace, segmenting every queue/stream/key this worker touches so the
         # same Redis can host multiple isolated deployments (e.g. per-developer ``dev-alice``) without
         # crosstalk. ``"default"`` (or unset) keeps names BYTE-IDENTICAL to the un-namespaced scheme, so
         # an already-deployed worker is unaffected. Any other value MUST match the namespace of the
         # engine that dispatches to it — see ``_effective_prefix`` for the cross-SDK naming rule.
         self.namespace = namespace
-        # The tenant this worker instance serves — DISTINCT from ``namespace``: a pure Python
-        # tenant worker connects to a SHARED control-plane transport (its ``namespace``/prefix
-        # stays whatever the operator control plane uses) and declares its tenant identity as a
-        # DATA label, not by segmenting its wire. ``None`` (the default) keeps this worker
-        # byte-identical to before this attribute existed — ``start_run`` falls back to
-        # ``self.namespace`` and group registration/heartbeat stay on the bare group. A real tenant
-        # (1) is stamped verbatim as ``StartRunMessage.tenant`` and (2) suffixes the GROUP this
-        # worker registers/heartbeats under (and therefore the task queue it consumes) via
-        # ``_tenant_group`` — see ``run_redis_worker``'s ``tenant`` option.
+        # The tenant this worker instance serves — DISTINCT from ``namespace`` AND from ``partition``:
+        # a pure Python tenant worker connects to a SHARED control-plane transport (its
+        # ``namespace``/prefix stays whatever the operator control plane uses) and declares its
+        # tenant identity as a DATA label only. ``None`` (the default) keeps this worker byte-identical
+        # to before this attribute existed. A real tenant is stamped verbatim as
+        # ``StartRunMessage.tenant`` (falling back to ``self.namespace`` when unset) by
+        # :meth:`start_run` — it never touches queue routing (that's ``partition``'s job, see the
+        # class docstring's Task 8 note).
         self.tenant = tenant
-        # How many tasks this worker runs concurrently from its group's queue (BullMQ Worker
-        # concurrency). Default 1 (serial). Raise it so a fanned-out batch (e.g. the N remote steps of
-        # a ``gather_calls``) runs in parallel. Per process; total parallelism is concurrency × replicas.
+        # How many tasks this worker runs concurrently across its per-name queues (BullMQ Worker
+        # concurrency, shared by every underlying per-name Worker). Default 1 (serial). Raise it so a
+        # fanned-out batch (e.g. the N remote steps of a ``gather_calls``) runs in parallel. Per
+        # process; total parallelism is concurrency × replicas.
         #
         # Beyond a fixed ``int`` this accepts ``'adaptive'`` (the worker self-tunes its limit from a
         # gradient of observed latency, with a cgroup-aware RAM brake) or a config ``dict``
@@ -444,7 +467,8 @@ class Worker:
 
         ``fn(ctx, input)`` (or ``fn(ctx)``) — same authoring surface as
         :meth:`WorkflowWorker.workflow`. The worker's runner replays a workflow turn for this name and
-        runs ``@worker.step`` handlers for step tasks, both off the one ``<prefix>-tasks-<group>`` queue."""
+        runs ``@worker.step`` handlers for step tasks — each registered name gets its own queue (see
+        the class docstring's Task 8 note)."""
 
         def register(fn: Handler) -> Handler:
             self._workflows[name] = fn
@@ -461,6 +485,14 @@ class Worker:
         through the replay path instead of treating every job as a step."""
         return bool(self._workflows)
 
+    @property
+    def names(self) -> "list[str]":
+        """Every name this worker subscribes to — the union of registered step names
+        (``@worker.step``) and workflow names (``@worker.workflow``). ``run_redis_worker`` starts one
+        queue PER name here (see the class docstring's Task 8 note), so this is the single source of
+        truth for what a runner needs to enumerate. Sorted for deterministic queue-creation order."""
+        return sorted(set(self._handlers.keys()) | set(self._workflows.keys()))
+
     def process_workflow_task(
         self,
         task: Dict[str, Any],
@@ -468,12 +500,20 @@ class Worker:
         is_cancelled: Optional[Callable[[str], bool]] = None,
     ) -> Dict[str, Any]:
         """Replay one turn of a workflow task and return its wire-format decision. The worker's own
-        :attr:`group` is threaded into the :class:`~durable_worker.workflow.WorkflowContext`, so a step
-        ``call`` with no explicit group inherits this worker's group (one group → one worker)."""
+        :attr:`partition` is threaded into the :class:`~durable_worker.workflow.WorkflowContext` (as
+        its ``group``), so a step ``call`` with no explicit group inherits it. ``partition`` defaults
+        to ``None`` (Task 8), unlike the old ``group`` default of ``"default"`` — fall back to
+        ``"default"`` here so a bare ``ctx.call()`` with no partition set keeps resolving a group to
+        inherit instead of raising (byte-identical to pre-Task-8 behavior; ``workflow.py``'s
+        call-group inheritance is untouched by this task)."""
         from .workflow import process_workflow_task  # lazy: avoid an import cycle with workflow.py
 
         return process_workflow_task(
-            self._workflows, task, on_step=on_step, is_cancelled=is_cancelled, group=self.group
+            self._workflows,
+            task,
+            on_step=on_step,
+            is_cancelled=is_cancelled,
+            group=self.partition or "default",
         )
 
     def run(self, *, redis: str = "redis://localhost:6379", prefix: str = "durable") -> None:
@@ -481,7 +521,7 @@ class Worker:
         close gracefully. Owns the whole long-running bootstrap a worker process needs — the event
         loop, SIGTERM/SIGINT handling, and the broker connection — so the entrypoint is one call::
 
-            worker = Worker(group="processing")
+            worker = Worker()
 
             @worker.step("processing", blocking=True)
             def handle(data, ctx): ...
@@ -489,7 +529,8 @@ class Worker:
             worker.run(redis=redis_url_from_env())
 
         Blocks until a shutdown signal closes the worker (which finishes the active job and releases
-        its lock). For finer control (your own loop/signals), use :func:`run_redis_worker` directly.
+        its lock — every underlying per-name BullMQ Worker, see :func:`run_redis_worker`). For finer
+        control (your own loop/signals), use :func:`run_redis_worker` directly.
         """
         import signal as _signal
 
@@ -498,12 +539,11 @@ class Worker:
         async def _main() -> None:
             bull_worker = await run_redis_worker(
                 self,
-                group=self.group,
+                partition=self.partition,
                 connection=redis,
                 prefix=prefix,
                 concurrency=self.concurrency,
                 namespace=self.namespace,
-                tenant=self.tenant,
             )
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()
@@ -759,7 +799,7 @@ def run_workers(
     SIGTERM or SIGINT every handle is closed gracefully (finishing the active job and releasing
     its lock) before the loop exits::
 
-        step_worker    = Worker(group="processing")
+        step_worker    = Worker()
         wf_worker      = WorkflowWorker(group="py-workflows")
 
         @step_worker.step("processing.crunch", blocking=True)
@@ -800,12 +840,11 @@ def run_workers(
             else:
                 handle = await run_redis_worker(
                     worker,
-                    group=worker.group,
+                    partition=worker.partition,
                     connection=redis,
                     prefix=prefix,
                     concurrency=worker.concurrency,
                     namespace=effective_namespace,
-                    tenant=getattr(worker, "tenant", None),
                 )
             handles.append(handle)
 

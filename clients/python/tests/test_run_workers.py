@@ -4,6 +4,12 @@ run_workers does `from .redis_runner import run_redis_worker, run_redis_workflow
 inside _main() at call time, so we patch on `durable_worker.redis_runner` (the source module)
 rather than on `durable_worker.worker`.  asyncio.Event.wait is replaced with an instant-return
 coroutine so _main() exits right after the startup sequence, letting us inspect what was called.
+
+A step `Worker` forwards its `partition` (the redesigned per-name routing suffix that replaced the
+old declared `group` — see Task 8) to `run_redis_worker`; a `WorkflowWorker` (untouched by that
+redesign) still forwards its own `group` to `run_redis_workflow_worker`. Both fakes below normalize
+to a `(kind, worker, label)` tuple so the dispatch assertions read uniformly regardless of which
+concept backs `label`.
 """
 
 import asyncio
@@ -24,14 +30,24 @@ class _FakeHandle:
         self.closed = True
 
 
-def _make_fake_runner(handle, calls, kind):
-    """Return an async fake runner that appends (kind, worker, group) to *calls*.
+def _make_fake_step_runner(handle, calls):
+    """Return an async fake `run_redis_worker` that appends ("step", worker, partition) to *calls*.
 
-    Accepts ``**_`` so it tolerates the extra keyword args run_workers forwards to the real runners
-    (e.g. ``concurrency`` to the step runner) without each addition breaking the dispatch tests."""
+    Accepts ``**_`` so it tolerates the extra keyword args run_workers forwards (e.g. ``concurrency``)
+    without each addition breaking the dispatch tests."""
+
+    async def runner(worker, *, partition, connection, prefix, **_):
+        calls.append(("step", worker, partition))
+        return handle
+
+    return runner
+
+
+def _make_fake_workflow_runner(handle, calls):
+    """Return an async fake `run_redis_workflow_worker` that appends ("workflow", worker, group)."""
 
     async def runner(worker, *, group, connection, prefix, **_):
-        calls.append((kind, worker, group))
+        calls.append(("workflow", worker, group))
         return handle
 
     return runner
@@ -48,8 +64,8 @@ class RunWorkersDispatchTest(unittest.TestCase):
     def _run(self, workers, step_handle, wf_handle):
         """Drive run_workers with patched runners and an auto-stopping event."""
         calls = []
-        fake_step = _make_fake_runner(step_handle, calls, "step")
-        fake_wf = _make_fake_runner(wf_handle, calls, "workflow")
+        fake_step = _make_fake_step_runner(step_handle, calls)
+        fake_wf = _make_fake_workflow_runner(wf_handle, calls)
 
         with patch(
             "durable_worker.redis_runner.run_redis_worker",
@@ -63,16 +79,16 @@ class RunWorkersDispatchTest(unittest.TestCase):
         return calls
 
     def test_step_worker_uses_run_redis_worker(self):
-        step_worker = Worker(group="a")
+        step_worker = Worker(partition="a")
         step_handle = _FakeHandle()
 
         calls = self._run([step_worker], step_handle, _FakeHandle())
 
         self.assertEqual(len(calls), 1)
-        kind, worker, group = calls[0]
+        kind, worker, partition = calls[0]
         self.assertEqual(kind, "step")
         self.assertIs(worker, step_worker)
-        self.assertEqual(group, "a")
+        self.assertEqual(partition, "a")
 
     def test_workflow_worker_uses_run_redis_workflow_worker(self):
         wf_worker = WorkflowWorker(group="b")
@@ -87,7 +103,7 @@ class RunWorkersDispatchTest(unittest.TestCase):
         self.assertEqual(group, "b")
 
     def test_mixed_workers_dispatch_to_correct_runners(self):
-        step_worker = Worker(group="a")
+        step_worker = Worker(partition="a")
         wf_worker = WorkflowWorker(group="b")
         step_handle = _FakeHandle()
         wf_handle = _FakeHandle()
@@ -96,14 +112,14 @@ class RunWorkersDispatchTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 2)
 
-        step_calls = [(k, g) for k, _w, g in calls if k == "step"]
-        wf_calls = [(k, g) for k, _w, g in calls if k == "workflow"]
+        step_calls = [(k, label) for k, _w, label in calls if k == "step"]
+        wf_calls = [(k, label) for k, _w, label in calls if k == "workflow"]
 
         self.assertEqual(step_calls, [("step", "a")])
         self.assertEqual(wf_calls, [("workflow", "b")])
 
     def test_all_handles_are_closed_on_shutdown(self):
-        step_worker = Worker(group="a")
+        step_worker = Worker(partition="a")
         wf_worker = WorkflowWorker(group="b")
         step_handle = _FakeHandle()
         wf_handle = _FakeHandle()
@@ -119,15 +135,15 @@ class RunWorkersDispatchTest(unittest.TestCase):
             # No runners to patch; should not raise.
             run_workers([], redis="redis://localhost:6379", prefix="durable")
 
-    def test_correct_group_is_forwarded_to_runner(self):
-        """The group forwarded to the runner must come from worker.group, not a default."""
-        step_worker = Worker(group="custom-group")
+    def test_correct_partition_is_forwarded_to_runner(self):
+        """The partition forwarded to the runner must come from worker.partition, not a default."""
+        step_worker = Worker(partition="custom-partition")
         step_handle = _FakeHandle()
 
         calls = self._run([step_worker], step_handle, _FakeHandle())
 
-        _, _, group = calls[0]
-        self.assertEqual(group, "custom-group")
+        _, _, partition = calls[0]
+        self.assertEqual(partition, "custom-partition")
 
 
 if __name__ == "__main__":

@@ -1,33 +1,48 @@
-"""P4C.3 — tenant != namespace (Python worker side).
+"""P4C.3 (tenant field) + Task 8 (partition-routed per-name queues) — Python worker side.
 
-Review finding IMPORTANT #2: today ``Worker.namespace`` conflates two unrelated concerns — the
-effective queue PREFIX (the shared transport a worker connects to) and the ``tenant`` field stamped
-on a ``start_run`` request. A pure Python tenant worker connecting to a shared control-plane
-transport needs to declare its tenant identity WITHOUT segmenting its wire (the prefix it shares
-with every other tenant on that control plane).
+Two distinct concerns share this file:
 
-This fixes it: ``Worker`` gains a ``tenant`` attribute, distinct from ``namespace``.
+1. ``Worker.tenant`` — a DATA LABEL stamped verbatim on ``StartRunMessage.tenant`` by ``start_run``
+   (falls back to ``self.namespace`` when unset). Decoupled from the wire: it never touches the
+   transport prefix or a queue name.
 
-    - ``_tenant_group(base_group, tenant)`` is the byte-identical Python mirror of the TypeScript
-      ``tenantGroup`` (``packages/core/src/tenant-group.ts``): ``undefined``/``''``/``'default'`` ->
-      the bare ``base_group``; any other tenant -> ``"<base_group>@<tenant>"``.
-    - The worker GROUP it registers/heartbeats under (and therefore the ``<prefix>-tasks-<group>``
-      queue it consumes) is derived via ``_tenant_group(group, tenant)`` — so tenant selects which
-      group's queue this instance serves.
-    - The transport PREFIX (``_effective_prefix``, driven by ``namespace``) is UNTOUCHED by
-      ``tenant`` — a namespace-scoped engine keeps behaving exactly as today.
-    - ``start_run`` stamps ``tenant = self.tenant or self.namespace`` (back-compat: with no
-      ``tenant`` given, behaves byte-identically to before — tenant defaults to namespace).
-    - ``run_id`` passes through to the StartRunMessage verbatim (the idempotency key) — no fresh
-      uuid minted inside this retryable BullMQ dispatch path.
+2. ``partition`` — the WIRE-level isolation suffix for THIS worker's queue routing (the redesigned
+   replacement for the old single declared ``group``). Routing moved from "one shared group queue"
+   to "one queue PER registered handler/workflow name": ``run_redis_worker`` starts one BullMQ
+   Worker per name in ``worker.names``, each on
+   ``f"{prefix}-tasks-{tenant_group(sanitize_queue_token(name), partition)}"``.
+
+       - ``sanitize_queue_token(name) = name.replace(':', '-')`` — BullMQ forbids ``:`` in a queue
+         name; must byte-match the TypeScript ``sanitizeQueueToken``.
+       - ``tenant_group(base, partition)`` is the byte-identical Python mirror of the TypeScript
+         ``tenantGroup``: ``None``/``''``/``'default'`` -> the bare ``base``; any other partition ->
+         ``"<base>@<partition>"``.
+       - ``Worker(group=...)`` is a deprecated back-compat alias for ``Worker(partition=...)``.
 """
 
 import unittest
+import warnings
 from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 
 from durable_worker import Worker
-from durable_worker.redis_runner import _tenant_group, run_redis_worker
+from durable_worker.redis_runner import _tenant_group, run_redis_worker, sanitize_queue_token
+
+
+# ---------------------------------------------------------------------------
+# sanitize_queue_token — cross-SDK conformance (byte-identical to JS sanitizeQueueToken)
+# ---------------------------------------------------------------------------
+
+
+class SanitizeQueueTokenTest(unittest.TestCase):
+    def test_replaces_colon_with_dash(self):
+        self.assertEqual(sanitize_queue_token("extraction:page"), "extraction-page")
+
+    def test_leaves_dot_as_is(self):
+        self.assertEqual(sanitize_queue_token("payments.charge"), "payments.charge")
+
+    def test_replaces_every_colon(self):
+        self.assertEqual(sanitize_queue_token("a:b:c"), "a-b-c")
 
 
 # ---------------------------------------------------------------------------
@@ -36,21 +51,44 @@ from durable_worker.redis_runner import _tenant_group, run_redis_worker
 
 
 class TenantGroupTest(unittest.TestCase):
-    def test_real_tenant_suffixes_the_group(self):
+    def test_real_partition_suffixes_the_base(self):
         self.assertEqual(_tenant_group("processing", "davi-local"), "processing@davi-local")
 
-    def test_none_tenant_is_bare_group(self):
+    def test_none_partition_is_bare_base(self):
         self.assertEqual(_tenant_group("processing", None), "processing")
 
-    def test_empty_string_tenant_is_bare_group(self):
+    def test_empty_string_partition_is_bare_base(self):
         self.assertEqual(_tenant_group("processing", ""), "processing")
 
-    def test_default_tenant_is_bare_group(self):
+    def test_default_partition_is_bare_base(self):
         self.assertEqual(_tenant_group("processing", "default"), "processing")
 
 
 # ---------------------------------------------------------------------------
-# run_redis_worker — tenant selects the GROUP (task queue + heartbeat), NOT the prefix
+# Worker(group=...) — deprecated back-compat alias for Worker(partition=...)
+# ---------------------------------------------------------------------------
+
+
+class WorkerGroupDeprecatedAliasTest(unittest.TestCase):
+    def test_group_kwarg_maps_to_partition_and_warns(self):
+        with self.assertWarns(DeprecationWarning):
+            worker = Worker(group="processing", auto_register=False)
+        self.assertEqual(worker.partition, "processing")
+
+    def test_explicit_partition_wins_over_group_alias(self):
+        with self.assertWarns(DeprecationWarning):
+            worker = Worker(partition="explicit", group="ignored", auto_register=False)
+        self.assertEqual(worker.partition, "explicit")
+
+    def test_no_group_kwarg_is_silent(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            worker = Worker(partition="processing", auto_register=False)
+        self.assertEqual(worker.partition, "processing")
+
+
+# ---------------------------------------------------------------------------
+# run_redis_worker — one BullMQ Worker PER registered name, partition-suffixed
 # ---------------------------------------------------------------------------
 
 
@@ -83,7 +121,7 @@ class _RecordingWorker:
 
 
 class _RecordingHeartbeat:
-    """Captures the (prefix, group) pair _start_heartbeat was called with."""
+    """Captures the (prefix, group) pair _start_heartbeat was called with, once per registered name."""
 
     calls: list = []
 
@@ -125,32 +163,37 @@ class _RunnerNamePatches:
         return False
 
 
-class RunRedisWorkerTenantGroupTest(unittest.IsolatedAsyncioTestCase):
-    async def test_tenant_suffixes_the_task_queue_group_not_the_prefix(self):
-        worker = Worker("processing", namespace="default", tenant="davi-local", auto_register=False)
+class RunRedisWorkerPerNameQueueTest(unittest.IsolatedAsyncioTestCase):
+    async def test_partition_creates_one_queue_per_registered_name(self):
+        worker = Worker(partition="davi-local", auto_register=False)
 
-        @worker.step("crunch")
-        def crunch(_data):
+        @worker.workflow("pipeline")
+        def pipeline(_ctx):
+            return None
+
+        @worker.step("extraction:page")
+        def extract(_data):
             return None
 
         with _RunnerNamePatches():
             await run_redis_worker(
                 worker,
-                group=worker.group,
+                partition=worker.partition,
                 connection="redis://localhost:6379",
-                namespace=worker.namespace,
-                tenant=worker.tenant,
             )
 
-        # Task queue is tenant-suffixed (a real tenant selects its own group's queue)...
-        self.assertIn("durable-tasks-processing@davi-local", _RecordingWorker.created_names)
+        # One queue per registered name, partition-suffixed, colon sanitized to a dash...
+        self.assertIn("durable-tasks-pipeline@davi-local", _RecordingWorker.created_names)
+        self.assertIn("durable-tasks-extraction-page@davi-local", _RecordingWorker.created_names)
+        # ...NOT a single shared group queue.
         self.assertNotIn("durable-tasks-processing", _RecordingWorker.created_names)
-        # ...but the shared results queue (prefix-driven, not group-driven) is untouched — the
-        # transport PREFIX stays shared across tenants.
+        self.assertEqual(len(_RecordingWorker.created_names), 2)
+        # The shared results queue stays single (prefix-driven, not per-name).
         self.assertIn("durable-results", _RecordingQueue.created_names)
+        self.assertEqual(_RecordingQueue.created_names.count("durable-results"), 1)
 
-    async def test_heartbeat_registers_under_the_tenant_suffixed_group(self):
-        worker = Worker("processing", tenant="davi-local", auto_register=False)
+    async def test_heartbeat_registers_per_name_partition_suffixed_group(self):
+        worker = Worker(partition="davi-local", auto_register=False)
 
         @worker.step("crunch")
         def crunch(_data):
@@ -158,19 +201,16 @@ class RunRedisWorkerTenantGroupTest(unittest.IsolatedAsyncioTestCase):
 
         with _RunnerNamePatches():
             await run_redis_worker(
-                worker,
-                group=worker.group,
-                connection="redis://localhost:6379",
-                tenant=worker.tenant,
+                worker, partition=worker.partition, connection="redis://localhost:6379"
             )
 
         self.assertEqual(
-            _RecordingHeartbeat.calls[0],
-            {"prefix": "durable", "group": "processing@davi-local"},
+            _RecordingHeartbeat.calls,
+            [{"prefix": "durable", "group": "crunch@davi-local"}],
         )
 
-    async def test_no_tenant_stays_byte_identical_to_today(self):
-        worker = Worker("processing", auto_register=False)
+    async def test_no_partition_stays_bare_per_name(self):
+        worker = Worker(auto_register=False)
 
         @worker.step("crunch")
         def crunch(_data):
@@ -178,16 +218,13 @@ class RunRedisWorkerTenantGroupTest(unittest.IsolatedAsyncioTestCase):
 
         with _RunnerNamePatches():
             await run_redis_worker(
-                worker, group=worker.group, connection="redis://localhost:6379"
+                worker, partition=worker.partition, connection="redis://localhost:6379"
             )
 
-        self.assertIn("durable-tasks-processing", _RecordingWorker.created_names)
-        self.assertEqual(
-            _RecordingHeartbeat.calls[0], {"prefix": "durable", "group": "processing"}
-        )
+        self.assertIn("durable-tasks-crunch", _RecordingWorker.created_names)
 
-    async def test_default_tenant_string_stays_bare(self):
-        worker = Worker("processing", tenant="default", auto_register=False)
+    async def test_default_partition_string_stays_bare(self):
+        worker = Worker(partition="default", auto_register=False)
 
         @worker.step("crunch")
         def crunch(_data):
@@ -195,10 +232,17 @@ class RunRedisWorkerTenantGroupTest(unittest.IsolatedAsyncioTestCase):
 
         with _RunnerNamePatches():
             await run_redis_worker(
-                worker, group=worker.group, connection="redis://localhost:6379", tenant=worker.tenant
+                worker, partition=worker.partition, connection="redis://localhost:6379"
             )
 
-        self.assertIn("durable-tasks-processing", _RecordingWorker.created_names)
+        self.assertIn("durable-tasks-crunch", _RecordingWorker.created_names)
+
+    async def test_no_registered_names_raises(self):
+        worker = Worker(auto_register=False)
+
+        with _RunnerNamePatches():
+            with self.assertRaises(ValueError):
+                await run_redis_worker(worker, connection="redis://localhost:6379")
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +278,7 @@ class StartRunTenantDecoupledFromWireTest(unittest.IsolatedAsyncioTestCase):
     async def test_tenant_field_is_the_declared_tenant_not_the_namespace(self):
         capture = _Capture()
         # namespace stays "default" (bare, shared wire); tenant is a distinct data label.
-        worker = Worker("processing", namespace="default", tenant="davi-local", auto_register=False)
+        worker = Worker(namespace="default", tenant="davi-local", auto_register=False)
         with _patch_queue(capture):
             await worker.start_run("checkout", {"qty": 1})
         data = capture.added[0]["data"]
@@ -244,14 +288,14 @@ class StartRunTenantDecoupledFromWireTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_tenant_falls_back_to_namespace_back_compat(self):
         capture = _Capture()
-        worker = Worker("processing", namespace="acme", auto_register=False)
+        worker = Worker(namespace="acme", auto_register=False)
         with _patch_queue(capture):
             await worker.start_run("wf", {})
         self.assertEqual(capture.added[0]["data"]["tenant"], "acme")
 
     async def test_run_id_passes_through_verbatim_no_fresh_uuid_minted(self):
         capture = _Capture()
-        worker = Worker("processing", tenant="davi-local", auto_register=False)
+        worker = Worker(tenant="davi-local", auto_register=False)
         with _patch_queue(capture):
             await worker.start_run("wf", {}, run_id="caller-supplied-run-id")
         self.assertEqual(capture.added[0]["data"]["runId"], "caller-supplied-run-id")

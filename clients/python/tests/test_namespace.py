@@ -123,16 +123,19 @@ class _RunnerNamePatches:
 
 class StepRunnerNamespaceTest(unittest.IsolatedAsyncioTestCase):
     async def test_namespace_segments_the_step_queue_names(self):
-        worker = Worker("processing", namespace="dev-alice", auto_register=False)
+        # Routing is per registered NAME now (Task 8), not a single declared group — register the
+        # step itself as "processing" to keep this test's asserted queue name unchanged while
+        # reflecting the redesigned per-name routing.
+        worker = Worker(namespace="dev-alice", auto_register=False)
 
-        @worker.step("crunch")
+        @worker.step("processing")
         def crunch(_data):
             return None
 
         with _RunnerNamePatches():
             await run_redis_worker(
                 worker,
-                group="processing",
+                partition=worker.partition,
                 connection="redis://localhost:6379",
                 namespace=worker.namespace,
             )
@@ -141,15 +144,15 @@ class StepRunnerNamespaceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("durable-dev-alice-tasks-processing", _RecordingWorker.created_names)
 
     async def test_default_namespace_keeps_names_unchanged(self):
-        worker = Worker("processing", auto_register=False)
+        worker = Worker(auto_register=False)
 
-        @worker.step("crunch")
+        @worker.step("processing")
         def crunch(_data):
             return None
 
         with _RunnerNamePatches():
             await run_redis_worker(
-                worker, group="processing", connection="redis://localhost:6379"
+                worker, partition=worker.partition, connection="redis://localhost:6379"
             )
 
         self.assertIn("durable-results", _RecordingQueue.created_names)
@@ -189,8 +192,8 @@ class RunWorkersNamespaceTest(unittest.TestCase):
     def _capture_namespaces(self, workers, *, run_namespace):
         seen = []
 
-        async def fake_step(worker, *, group, connection, prefix, namespace="default", **_):
-            seen.append(("step", group, namespace))
+        async def fake_step(worker, *, partition, connection, prefix, namespace="default", **_):
+            seen.append(("step", partition, namespace))
             return _FakeHandle()
 
         async def fake_wf(worker, *, group, connection, prefix, namespace="default", **_):
@@ -209,12 +212,12 @@ class RunWorkersNamespaceTest(unittest.TestCase):
         return seen
 
     def test_run_workers_namespace_applies_to_workers_without_their_own(self):
-        worker = Worker("processing", auto_register=False)
+        worker = Worker(partition="processing", auto_register=False)
         seen = self._capture_namespaces([worker], run_namespace="dev-bob")
         self.assertEqual(seen, [("step", "processing", "dev-bob")])
 
     def test_explicit_worker_namespace_wins_over_run_workers_namespace(self):
-        worker = Worker("processing", namespace="dev-alice", auto_register=False)
+        worker = Worker(partition="processing", namespace="dev-alice", auto_register=False)
         seen = self._capture_namespaces([worker], run_namespace="dev-bob")
         self.assertEqual(seen, [("step", "processing", "dev-alice")])
 
