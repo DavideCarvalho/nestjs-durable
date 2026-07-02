@@ -28,17 +28,33 @@ via `WorkflowService`:
 ```ts title="approval.workflow.ts"
 import { Workflow } from '@dudousxd/nestjs-durable';
 import type { WorkflowCtx } from '@dudousxd/nestjs-durable-core';
+import { NotificationsService } from './notifications.service';
 
 @Workflow({ name: 'approval', version: '1' })
 export class ApprovalWorkflow {
+  constructor(private readonly notifications: NotificationsService) {}
+
   async run(ctx: WorkflowCtx, order: { id: string }) {
-    await ctx.step('request', () => this.notify(order.id));
+    await ctx.step(this.notifications.requestApproval, order.id);
     // Pause until someone signals this token (or 24h passes).
     const decision = await ctx.waitForSignal<{ approved: boolean }>(
       `approve:${order.id}`,
       { timeoutMs: 24 * 60 * 60 * 1000 },
     );
     return decision.approved ? 'shipped' : 'rejected';
+  }
+}
+```
+
+```ts title="notifications.service.ts"
+import { Step } from '@dudousxd/nestjs-durable';
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class NotificationsService {
+  @Step()
+  async requestApproval(orderId: string) {
+    // email/Slack the approver
   }
 }
 ```
@@ -93,21 +109,21 @@ export class WelcomeWorkflow {
 number of restarts; the timer poller resumes it when due. `duration` accepts `ms`-style strings.
 
 ```ts
-await ctx.step('draft', () => this.draft());
+await ctx.step(this.reports.draft, order.id);
 await ctx.sleep('7 days');           // durable — not setTimeout
-await ctx.step('send', () => this.send());
+await ctx.step(this.reports.send, order.id);
 ```
 
 ### Webhooks (third-party callbacks)
 
 `ctx.webhook()` mints a stable token + url **before** suspending, so you can hand the url to a third
-party, then `await wh.wait()` for the callback (delivered as `signal(token, body)`). Configure
-`webhookUrl` on the module to populate `wh.url`.
+party — inside a dispatched `ctx.step` — then `await wh.wait()` for the callback (delivered as
+`signal(token, body)`). Configure `webhookUrl` on the module to populate `wh.url`.
 
 ```ts
 const wh = ctx.webhook<{ status: string }>();
-await ctx.step('register', () => this.provider.callMeBack(wh.url)); // url is ready now
-const result = await wh.wait();                                     // resumes on the callback
+await ctx.step(this.provider.register, { callbackUrl: wh.url }); // url is ready now
+const result = await wh.wait();                                  // resumes on the callback
 ```
 
 ### signalWithStart — the accumulator pattern
@@ -132,13 +148,13 @@ await this.workflows.signalWithStart(
 // ✗ Wrong — a real timer is lost on restart; the delay is not durable
 async run(ctx, input) {
   await new Promise((r) => setTimeout(r, 7 * 86_400_000)); // gone if the process restarts
-  await ctx.step('send', () => this.send());
+  await ctx.step(this.reports.send, input);
 }
 
 // ✓ Correct — a durable timer the engine persists and resumes when due
 async run(ctx, input) {
   await ctx.sleep('7 days');
-  await ctx.step('send', () => this.send());
+  await ctx.step(this.reports.send, input);
 }
 ```
 

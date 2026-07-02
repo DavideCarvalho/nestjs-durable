@@ -2740,9 +2740,6 @@ export class WorkflowEngine {
       this.stepQueue.set(id, queue);
     }
 
-    // A bare `@Step()` (no `input`/`output` schemas attached) skips validation — schemas are opt-in
-    // runtime checks at the dispatch boundary, not a requirement of every step (see `StepDef`).
-    const validInput = step.input ? step.input.parse(input) : input;
     const enqueuedAt = new Date();
     // Persist the pending checkpoint BEFORE dispatching, so a fast result always finds it to complete.
     await this.store.saveCheckpoint({
@@ -2752,7 +2749,7 @@ export class WorkflowEngine {
       kind: 'remote',
       stepId: id,
       status: 'pending',
-      input: validInput,
+      input,
       attempts: attempt,
       workerGroup: tenantGroup(sanitizeQueueToken(step.name), step.partition),
       enqueuedAt,
@@ -2766,7 +2763,7 @@ export class WorkflowEngine {
         name: step.name,
         stepId: id,
         group: tenantGroup(sanitizeQueueToken(step.name), step.partition),
-        input: validInput,
+        input,
         traceparent: this.traceparent?.(),
         context: this.context?.(),
         priority: admission?.priority,

@@ -236,13 +236,32 @@ class WorkflowContext:
         return value is driven to completion before it is recorded). Records under a constant step
         name (``'sideEffect'``); each call still gets its own seq, so multiple side effects in one
         workflow are distinct history entries. Reuses the same inline local-step/``recordStep``
-        machinery :meth:`now` uses — the wire it emits is the same local checkpoint kind."""
+        machinery :meth:`now` uses — the wire it emits is the same local checkpoint kind.
+
+        Loop-aware: replay normally runs off the event loop (a plain executor thread — see
+        ``run_redis_worker``/``run_redis_workflow_worker``), so an async ``fn`` is driven with a
+        plain ``asyncio.run``. If this happens to be called from a thread that already has a loop
+        running (``asyncio.run`` would raise ``RuntimeError`` there), the coroutine is driven on a
+        fresh loop in its own thread instead — the join-and-return isolation :meth:`gather` already
+        uses to keep concurrent step bodies off the calling thread."""
 
         def body() -> Any:
             result = fn()
-            if inspect.isawaitable(result):
-                result = asyncio.run(result)
-            return result
+            if not inspect.isawaitable(result):
+                return result
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(result)  # no loop on this thread — the common case
+            holder: Dict[str, Any] = {}
+
+            def _drive() -> None:
+                holder["value"] = asyncio.run(result)
+
+            thread = threading.Thread(target=_drive)
+            thread.start()
+            thread.join()
+            return holder["value"]
 
         return self._local_step("sideEffect", body)
 

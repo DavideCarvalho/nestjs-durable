@@ -2,7 +2,7 @@
 name: durable-setup
 description: >
   Set up @dudousxd/nestjs-durable in a NestJS app — DurableModule.forRootAsync with a StateStore
-  + Transport, register @Workflow / @DurableStep providers, and start runs with WorkflowService.
+  + Transport, register @Workflow / @Step providers, and start runs with WorkflowService.
   Covers the zero-infra EventEmitterTransport + InMemoryStateStore default, start() enqueues vs
   waitForRun() settles, autoSchema, drive:false dashboard/API-only replicas, DurableModule as a
   thin worker (connection only, no store), forRoot vs forRootAsync, app.enableShutdownHooks for
@@ -23,7 +23,8 @@ infrastructure (in-process transport, in-memory store) — swap the store/transp
 
 ## Setup
 
-Install the module plus its core peer, a transport, and zod (remote-step contracts use it):
+Install the module plus its core peer, a transport, and zod (optional `@Step({ input, output })`
+runtime schemas use it):
 
 ```bash
 pnpm add @dudousxd/nestjs-durable @dudousxd/nestjs-durable-core \
@@ -58,7 +59,7 @@ import { PaymentsWorker } from './payments.worker';
 export class AppModule {}
 ```
 
-`@Workflow` and `@DurableStep` providers are plain providers — list them in `providers` (or any
+`@Workflow` and `@Step` providers are plain providers — list them in `providers` (or any
 imported module) and `DurableModule`'s discovery registers them on the engine at boot.
 
 Enable shutdown hooks so the engine drains in-flight runs on deploy:
@@ -137,7 +138,7 @@ import { DurableModule } from '@dudousxd/nestjs-durable';
 
 @Module({
   imports: [DurableModule.forRoot({ connection: 'redis://localhost:6379', partition: 'payments' })],
-  providers: [PaymentsWorker], // @DurableStep handlers this worker serves
+  providers: [PaymentsWorker], // @Step handlers this worker serves
 })
 export class WorkerAppModule {}
 ```

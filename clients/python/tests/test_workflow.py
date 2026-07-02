@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from durable_worker import WorkflowWorker
@@ -241,6 +242,31 @@ class WorkflowReplayTest(unittest.TestCase):
             return {"captured": captured}
 
         d1 = wf.process_task(task())
+        self.assertEqual(d1["commands"][0]["name"], "sideEffect")
+        self.assertEqual(d1["commands"][0]["output"], "async-value")
+
+    def test_side_effect_supports_an_async_callable_when_a_loop_is_already_running(self):
+        """`process_task` normally runs off the event loop (a plain executor thread), so
+        `side_effect`'s `asyncio.run` is safe there. Exercise the other case — called from a
+        thread that already HAS a running loop — where a nested `asyncio.run` would raise
+        `RuntimeError`; `side_effect` must still drive the coroutine and return its value."""
+        wf = WorkflowWorker()
+
+        @wf.workflow("wf")
+        def flow(ctx, _input):
+            async def gen():
+                return "async-value"
+
+            captured = ctx.side_effect(gen)
+            ctx.step("x", group="g")
+            return {"captured": captured}
+
+        async def run_under_a_loop():
+            # `process_task` is synchronous, but calling it from inside a running coroutine puts
+            # `side_effect`'s body on a thread that already has this loop running.
+            return wf.process_task(task())
+
+        d1 = asyncio.run(run_under_a_loop())
         self.assertEqual(d1["commands"][0]["name"], "sideEffect")
         self.assertEqual(d1["commands"][0]["output"], "async-value")
 
