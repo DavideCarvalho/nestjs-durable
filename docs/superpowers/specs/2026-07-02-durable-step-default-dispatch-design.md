@@ -38,8 +38,11 @@ class ExtractionService {
 Optional forms:
 - `@Step("custom:name")` — explicit name override (stable across refactors / cross-runtime contracts).
 - `@Step({ name?, input?: ZodType, output?: ZodType })` — opt-in **runtime validation** at the
-  dispatch boundary. Bare `@Step()` gives compile-time types from the method signature only; a step
-  that crosses into an untyped wire (a Python worker) should carry `input`/`output` schemas.
+  **serve boundary** (the handler validates its `input` when invoked, and its `output` before
+  returning — since the identity now lives on the `@Step` method, that is where the schemas are read).
+  Bare `@Step()` gives compile-time types from the method signature only; a step that crosses into an
+  untyped wire (a Python worker) should carry `input`/`output` schemas. (Note: this is the serve side,
+  not a JS-side pre-dispatch check — a cross-runtime Python step is validated where it runs.)
 
 ### Two call forms — reference and string
 
