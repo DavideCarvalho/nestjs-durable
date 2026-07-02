@@ -10,11 +10,8 @@ import { Test } from '@nestjs/testing';
 import { z } from 'zod';
 import { Step, Workflow } from './decorators';
 import { DurableStartClient } from './durable-start-client';
-import {
-  DURABLE_WORKER_RUNNERS,
-  DurableWorkerModule,
-  RUN_REDIS_WORKER,
-} from './durable-worker.module';
+import { DURABLE_WORKER_RUNNERS, RUN_REDIS_WORKER } from './durable-worker.module';
+import { DurableModule } from './durable.module';
 import { WorkflowService } from './workflow.service';
 
 const charge: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
@@ -28,7 +25,7 @@ const charge: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
 class CheckoutWorkflow {
   async run(ctx: WorkflowCtx, order: { amount: number }) {
     const doubled = await ctx.step('double', () => order.amount * 2);
-    const c = await ctx.call(charge, { amount: doubled });
+    const c = await ctx.remote(charge, { amount: doubled });
     return { doubled, chargeId: c.chargeId };
   }
 }
@@ -90,11 +87,11 @@ function fakeRunner(): FakeRunner {
   };
 }
 
-describe('DurableWorkerModule', () => {
+describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
   it('registers @Workflow + @Step on a store-less DurableWorkerRuntime', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableWorkerModule.forRoot({ connection: 'redis://x' })],
+      imports: [DurableModule.forRoot({ connection: 'redis://x' })],
       providers: [CheckoutWorkflow, PaymentsWorker],
     })
       .overrideProvider(RUN_REDIS_WORKER)
@@ -153,7 +150,7 @@ describe('DurableWorkerModule', () => {
   it('does NOT create a store / dashboard provider (control-plane-less)', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableWorkerModule.forRoot({ connection: 'redis://x' })],
+      imports: [DurableModule.forRoot({ connection: 'redis://x' })],
       providers: [CheckoutWorkflow],
     })
       .overrideProvider(RUN_REDIS_WORKER)
@@ -161,7 +158,7 @@ describe('DurableWorkerModule', () => {
       .compile();
     await moduleRef.init();
 
-    // The module IS control-plane-less: the WorkflowEngine token resolves to the store-less
+    // The role IS control-plane-less: the WorkflowEngine token resolves to the store-less
     // DurableStartClient facade (see the dedicated test below), never a full store-backed engine.
     expect(moduleRef.get(WorkflowEngine, { strict: false })).toBeInstanceOf(DurableStartClient);
 
@@ -171,7 +168,7 @@ describe('DurableWorkerModule', () => {
   it('provides a store-less start facade under the WorkflowEngine token', async () => {
     const moduleRef = await Test.createTestingModule({
       imports: [
-        DurableWorkerModule.forRoot({
+        DurableModule.forRoot({
           connection: 'redis://x',
           partition: 'davi-local',
         }),
@@ -192,7 +189,7 @@ describe('DurableWorkerModule', () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
       imports: [
-        DurableWorkerModule.forRoot({
+        DurableModule.forRoot({
           connection: 'redis://x',
           prefix: 'app',
           instanceId: 'w1',
@@ -217,7 +214,7 @@ describe('DurableWorkerModule', () => {
     expect(call?.partition).toBeUndefined();
 
     // Both discovered handlers are registered on the runtime the single call carries — the runner
-    // (Task 5) derives its per-name subscriptions from exactly this registry.
+    // derives its per-name subscriptions from exactly this registry.
     const runtime = moduleRef.get(DurableWorkerRuntime);
     expect(runtime.workflows.handles('checkout')).toBe(true);
     expect(runtime.steps.handles('charge')).toBe(true);
@@ -231,7 +228,7 @@ describe('DurableWorkerModule', () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
       imports: [
-        DurableWorkerModule.forRootAsync({
+        DurableModule.forRootAsync({
           useFactory: () => ({ connection: 'redis://y' }),
         }),
       ],
@@ -253,7 +250,7 @@ describe('DurableWorkerModule', () => {
   it('with a partition, the single runRedisWorker call carries it', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableWorkerModule.forRoot({ connection: 'redis://x', partition: 'p1' })],
+      imports: [DurableModule.forRoot({ connection: 'redis://x', partition: 'p1' })],
       providers: [WWorkflow],
     })
       .overrideProvider(RUN_REDIS_WORKER)
@@ -269,27 +266,10 @@ describe('DurableWorkerModule', () => {
     await moduleRef.close();
   });
 
-  it('with the deprecated `tenant` alias, the single call carries it as `partition`', async () => {
+  it('with no partition, the single call carries none', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableWorkerModule.forRoot({ connection: 'redis://x', tenant: 't1' })],
-      providers: [WWorkflow],
-    })
-      .overrideProvider(RUN_REDIS_WORKER)
-      .useValue(runner.runRedisWorker)
-      .compile();
-    await moduleRef.init();
-
-    expect(runner.calls).toHaveLength(1);
-    expect(runner.calls[0]?.partition).toBe('t1');
-
-    await moduleRef.close();
-  });
-
-  it('with no partition/tenant, the single call carries neither', async () => {
-    const runner = fakeRunner();
-    const moduleRef = await Test.createTestingModule({
-      imports: [DurableWorkerModule.forRoot({ connection: 'redis://x' })],
+      imports: [DurableModule.forRoot({ connection: 'redis://x' })],
       providers: [WWorkflow],
     })
       .overrideProvider(RUN_REDIS_WORKER)

@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import type { StepInvocation } from '@dudousxd/nestjs-durable-core';
-import { InMemoryStateStore } from '@dudousxd/nestjs-durable-core';
+import { InMemoryStateStore, InMemoryTransport } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { describe, expect, it } from 'vitest';
@@ -42,7 +42,9 @@ describe('@StepInterceptor (DI-injected step middleware)', () => {
     log.length = 0;
     const store = new InMemoryStateStore();
     const mod = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, timerPollMs: 0 })],
+      imports: [
+        DurableModule.forRoot({ store, transport: new InMemoryTransport(), timerPollMs: 0 }),
+      ],
       providers: [Recorder, TimingInterceptor, CalcWorkflow],
     }).compile();
     await mod.init();

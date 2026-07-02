@@ -1,4 +1,8 @@
-import { InMemoryStateStore, type WorkflowCtx } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  InMemoryTransport,
+  type WorkflowCtx,
+} from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { Workflow } from './decorators';
 import { DurableModule } from './durable.module';
@@ -15,7 +19,7 @@ describe('DurableModule', () => {
   it('discovers a @Workflow provider and runs it via WorkflowService', async () => {
     const store = new InMemoryStateStore();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store })],
+      imports: [DurableModule.forRoot({ store, transport: new InMemoryTransport() })],
       providers: [GreetWorkflow],
     }).compile();
     await moduleRef.init();

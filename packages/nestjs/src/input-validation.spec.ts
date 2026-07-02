@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { InMemoryStateStore } from '@dudousxd/nestjs-durable-core';
+import { InMemoryStateStore, InMemoryTransport } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { IsInt, IsString } from 'class-validator';
 import { describe, expect, it } from 'vitest';
@@ -23,7 +23,9 @@ describe('@Workflow inputSchema (class-validator)', () => {
   it('rejects invalid input at start, before creating the run', async () => {
     const store = new InMemoryStateStore();
     const mod = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, timerPollMs: 0 })],
+      imports: [
+        DurableModule.forRoot({ store, transport: new InMemoryTransport(), timerPollMs: 0 }),
+      ],
       providers: [CheckoutWorkflow],
     }).compile();
     await mod.init();

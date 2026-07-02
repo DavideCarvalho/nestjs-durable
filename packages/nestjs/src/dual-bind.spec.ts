@@ -2,6 +2,7 @@ import {
   DURABLE_OPTIONS,
   DURABLE_OPTIONS_CANONICAL,
   InMemoryStateStore,
+  InMemoryTransport,
   STATE_STORE,
   STATE_STORE_CANONICAL,
   TRANSPORT,
@@ -15,7 +16,7 @@ describe('DurableModule — dual-bind canonical token aliases', () => {
   it('canonical STATE_STORE_CANONICAL resolves the same instance as legacy STATE_STORE', async () => {
     const store = new InMemoryStateStore();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store })],
+      imports: [DurableModule.forRoot({ store, transport: new InMemoryTransport() })],
     }).compile();
     await moduleRef.init();
 
@@ -29,7 +30,7 @@ describe('DurableModule — dual-bind canonical token aliases', () => {
   it('canonical TRANSPORT_CANONICAL resolves the same instance as legacy TRANSPORT', async () => {
     const store = new InMemoryStateStore();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store })],
+      imports: [DurableModule.forRoot({ store, transport: new InMemoryTransport() })],
     }).compile();
     await moduleRef.init();
 
@@ -43,7 +44,7 @@ describe('DurableModule — dual-bind canonical token aliases', () => {
   it('canonical DURABLE_OPTIONS_CANONICAL resolves the same instance as legacy DURABLE_OPTIONS', async () => {
     const store = new InMemoryStateStore();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store })],
+      imports: [DurableModule.forRoot({ store, transport: new InMemoryTransport() })],
     }).compile();
     await moduleRef.init();
 

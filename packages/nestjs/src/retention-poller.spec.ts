@@ -7,8 +7,8 @@ import { RetentionPoller, validateRetention } from './retention-poller';
 function fakeStore(prune?: StateStore['pruneTerminalRuns']): StateStore {
   return { pruneTerminalRuns: prune } as unknown as StateStore;
 }
-function makePoller(store: StateStore, retention?: DurableRetentionOptions, worker?: boolean) {
-  const options = { store, retention, worker } as unknown as DurableModuleOptions;
+function makePoller(store: StateStore, retention?: DurableRetentionOptions, drive?: boolean) {
+  const options = { store, retention, drive } as unknown as DurableModuleOptions;
   return new RetentionPoller(store, options);
 }
 
@@ -81,7 +81,7 @@ describe('RetentionPoller', () => {
     expect(prune.mock.calls[0]?.[2]).toBe(2); // batchSize forwarded as the limit
   });
 
-  it('does not prune on a dashboard-only (worker:false) instance', async () => {
+  it('does not prune on a dashboard-only (drive:false) instance', async () => {
     const prune = vi.fn(async () => 0);
     const poller = makePoller(fakeStore(prune), onePolicy, false);
 

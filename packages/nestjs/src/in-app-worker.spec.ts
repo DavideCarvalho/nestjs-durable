@@ -25,16 +25,16 @@ import {
 } from './in-app-worker';
 
 // ---------------------------------------------------------------------------
-// In-app worker (uniform dispatch, opt-in) — NestJS wiring.
+// In-app worker (uniform dispatch, co-located role) — NestJS wiring.
 //
-// `DurableModule.forRoot({ ..., inAppWorker: { partition?, connection } })` turns one app into engine
-// + worker: every discovered `@Workflow` is registered GROUP-SERVED — its turns dispatched, PER
+// `DurableModule.forRoot({ store, transport, connection, partition? })` turns one app into engine +
+// worker: every discovered `@Workflow` is registered GROUP-SERVED — its turns dispatched, PER
 // WORKFLOW NAME, to `tenantGroup(sanitizeQueueToken(name), partition)` — and a co-located
-// `DurableWorkerRuntime` subscribes one queue per discovered name (via `runRedisWorker`, Task 5) to
-// replay the SAME bodies. These specs assert the WIRING (registration + consumer start + PER-WORKFLOW
-// routing token) with a fake `runRedisWorker` and a workflow-task transport double — no Redis. The
-// full dispatch→replay loop is proven at the core/worker level (packages/worker/in-app-worker.spec)
-// over the real executor + worker.
+// `DurableWorkerRuntime` subscribes one queue per discovered name (via `runRedisWorker`) to replay the
+// SAME bodies. These specs assert the WIRING (registration + consumer start + PER-WORKFLOW routing
+// token) with a fake `runRedisWorker` and a workflow-task transport double — no Redis. The full
+// dispatch→replay loop is proven at the core/worker level (packages/worker/in-app-worker.spec) over
+// the real executor + worker.
 // ---------------------------------------------------------------------------
 
 @Workflow({ name: 'greet', version: '1' })
@@ -115,7 +115,7 @@ function fakeRunner(): FakeRunner {
   };
 }
 
-describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
+describe('DurableModule co-located worker (store + connection)', () => {
   it('registers @Workflow group-served (per-name token) and starts a co-located consumer', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
@@ -124,12 +124,10 @@ describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
           store: new InMemoryStateStore(),
           transport: new WorkflowTaskTransport(),
           autoSchema: false,
-          inAppWorker: {
-            partition: 'tenantA',
-            connection: 'redis://x',
-            prefix: 'durable',
-            instanceId: 'w1',
-          },
+          partition: 'tenantA',
+          connection: 'redis://x',
+          prefix: 'durable',
+          instanceId: 'w1',
         }),
       ],
       providers: [GreetWorkflow, Emails],
@@ -165,7 +163,7 @@ describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
     expect(runner.handles.every((h) => h.closed)).toBe(true);
   });
 
-  it('keeps @Workflow inline and starts no consumer when inAppWorker is omitted (default)', async () => {
+  it('keeps @Workflow inline and starts no consumer when connection is omitted (plain operator)', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
       imports: [
@@ -192,7 +190,7 @@ describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
     await moduleRef.close();
   });
 
-  it('fails fast when inAppWorker is set but the transport cannot carry workflow tasks', async () => {
+  it('fails fast when co-located (store + connection) but the transport cannot carry workflow tasks', async () => {
     const runner = fakeRunner();
     await expect(
       Test.createTestingModule({
@@ -201,7 +199,7 @@ describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
             store: new InMemoryStateStore(),
             transport: new InProcessOnlyTransport(),
             autoSchema: false,
-            inAppWorker: { connection: 'redis://x' },
+            connection: 'redis://x',
           }),
         ],
         providers: [GreetWorkflow],
@@ -226,7 +224,8 @@ describe('DurableModule inAppWorker (uniform dispatch, opt-in)', () => {
           store: new InMemoryStateStore(),
           transport: new WorkflowTaskTransport(),
           autoSchema: false,
-          inAppWorker: { partition: 'tenantA', connection: 'redis://x' },
+          partition: 'tenantA',
+          connection: 'redis://x',
         }),
       ],
       providers: [AlphaWorkflow, BetaWorkflow],

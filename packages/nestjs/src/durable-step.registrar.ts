@@ -8,6 +8,7 @@ import { Inject, Injectable, type OnModuleInit } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { scanSteps } from './discovery-helpers';
 import type { DurableModuleOptions } from './durable.module';
+import { isDrivingOperator } from './role';
 
 /** A transport that can run step handlers in-process (e.g. the event-emitter transport). */
 interface LocalTaskHandling {
@@ -45,9 +46,10 @@ export class DurableStepRegistrar implements OnModuleInit {
   ) {}
 
   onModuleInit(): void {
-    // A dashboard/dispatch-only instance (`worker: false`) must not consume the queue — receiving
-    // and running step tasks is exactly the worker role we're switching off here.
-    if (this.options.worker === false) return;
+    // A non-driving operator (`drive: false`) or a thin worker (no `store`) must not consume the
+    // queue — receiving and running step tasks locally is exactly the driving-operator role we're
+    // switching off here (a thin worker registers its steps via `ThinStepRegistrar` instead).
+    if (!isDrivingOperator(this.options)) return;
     if (!supportsHandle(this.transport)) return;
     const transport = this.transport;
 

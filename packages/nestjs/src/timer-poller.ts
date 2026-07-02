@@ -10,6 +10,7 @@ import {
   type OnModuleDestroy,
 } from '@nestjs/common';
 import type { DurableModuleOptions } from './durable.module';
+import { isDrivingOperator } from './role';
 
 /**
  * Resumes suspended runs whose durable timer (`ctx.sleep`) is due, and fires any configured
@@ -28,12 +29,11 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    // Drive suspended runs forward when this instance's `drive` axis is on — defaults to the
-    // worker role (back-compat), but a `DurableControlPlaneModule` (`worker:false, drive:true`)
-    // also drives: it dispatches remotely instead of executing locally. A plain dashboard-only
-    // instance (`worker:false`, drive unset) must not resume timers — leave that to the workers.
-    const drive = this.options.drive ?? this.options.worker !== false;
-    if (!drive) return;
+    // Drive suspended runs forward when this operator instance is DRIVING (defaults to true) — it
+    // may execute locally or dispatch remotely (group-served / convention), either way it drives. A
+    // non-driving (dashboard-only) operator, or a thin worker with no `store` at all, must not
+    // resume timers — leave that to a driving instance.
+    if (!isDrivingOperator(this.options)) return;
     // Low-latency dispatch: when a run is enqueued elsewhere (e.g. an API pod), pick it up at once
     // over the control plane instead of waiting for the next poll tick. Leasing dedups across workers.
     this.unsubscribeEnqueued = this.engine.onEnqueued((runId) => void this.engine.runOne(runId));

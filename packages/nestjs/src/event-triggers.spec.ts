@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { InMemoryStateStore } from '@dudousxd/nestjs-durable-core';
+import { InMemoryStateStore, InMemoryTransport } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { describe, expect, it } from 'vitest';
 import { OnEvent, Workflow } from './decorators';
@@ -25,7 +25,9 @@ describe('event triggers (@Workflow onEvent + @OnEvent decorator)', () => {
   it('starts workflows subscribed via both the option and the decorator', async () => {
     const store = new InMemoryStateStore();
     const mod = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, timerPollMs: 0 })],
+      imports: [
+        DurableModule.forRoot({ store, transport: new InMemoryTransport(), timerPollMs: 0 }),
+      ],
       providers: [WelcomeWorkflow, AuditWorkflow],
     }).compile();
     await mod.init();

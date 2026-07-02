@@ -1,3 +1,4 @@
+import type { ConcurrencyOption } from '@dudousxd/durable-worker';
 import {
   type AdmissionBackend,
   type ControlPlane,
@@ -29,10 +30,14 @@ import {
 } from '@nestjs/common';
 import { DiscoveryModule, ModuleRef } from '@nestjs/core';
 import type { ContextAccessor } from './context-accessor';
+import { DurableStartClient } from './durable-start-client';
 import { DurableStepRegistrar } from './durable-step.registrar';
+import { thinWorkerProviders, unavailableRunGateway } from './durable-worker.module';
 import { EntityService } from './entity';
-import { type DurableInAppWorkerOptions, inAppWorkerProviders } from './in-app-worker';
+import { inAppWorkerProviders } from './in-app-worker';
+import { ProxyRunGateway } from './proxy-run-gateway';
 import { RetentionPoller } from './retention-poller';
+import { isDrivingOperator } from './role';
 import { RunRequestResponder, type RunRequestTransport } from './run-request-responder';
 import { StoreRunGateway } from './store-run-gateway';
 import { TenantEventRepublisher } from './tenant-event-republisher';
@@ -137,10 +142,10 @@ function isScopeableStore(store: StateStore): store is StateStore & ScopeableSto
  * `scopeReads` is off, `namespace` is unset, or the store can't scope itself, the original store is
  * returned unchanged (the operator view) — the caller can always pass an already-scoped store.
  */
-function scopedStore(options: DurableModuleOptions): StateStore {
-  if (options.scopeReads !== true || options.namespace === undefined) return options.store;
-  if (!isScopeableStore(options.store)) return options.store;
-  return options.store.withScope({ namespace: options.namespace });
+function scopedStore(store: StateStore, options: DurableModuleOptions): StateStore {
+  if (options.scopeReads !== true || options.namespace === undefined) return store;
+  if (!isScopeableStore(store)) return store;
+  return store.withScope({ namespace: options.namespace });
 }
 
 /**
@@ -170,12 +175,32 @@ export interface DurableRetentionOptions {
   batchSize?: number;
 }
 
+/**
+ * Options for `DurableModule.forRoot`/`forRootAsync`. The **role is inferred** from which of `store`/
+ * `connection` are set:
+ *
+ * - `{ store, transport }` — **operator**: a real `WorkflowEngine` + `StoreRunGateway` + drivers/
+ *   timer/retention/registrars, executing registered bodies INLINE. Driven by {@link drive} (default
+ *   `true`).
+ * - `{ connection }` (no `store`) — **thin worker**: `WorkflowEngine` resolves to a store-less
+ *   `DurableStartClient`; `RUN_GATEWAY` is a `ProxyRunGateway` when `transport` is also given, else
+ *   every method rejects with a clear error. No store/timer/retention/entity — just discovered
+ *   `@Workflow`/`@Step` handlers served over ONE `runRedisWorker` consumer.
+ * - `{ store, transport, connection }` — an **operator that also runs a co-located worker**: every
+ *   `@Workflow` is registered GROUP-SERVED (dispatched over the transport, PER WORKFLOW NAME, instead
+ *   of inline) and a co-located consumer (one `runRedisWorker` call) replays the same bodies.
+ *
+ * `forRoot` throws when neither `store` nor `connection` is set, and when `store` is set without a
+ * `transport`.
+ */
 export interface DurableModuleOptions {
-  store: StateStore;
+  /** State store — set this to play the **operator** role (see the interface doc for the full role
+   *  matrix). Omit for a store-less **thin worker** (`connection` only). */
+  store?: StateStore;
   transport?: Transport;
   /**
    * An ordered pool of named transports for failover / multi-broker setups. The engine dispatches on
-   * the first and fails over to the next; a step pins one via `ctx.call(step, input, { transport })`.
+   * the first and fails over to the next; a step pins one via `ctx.remote(step, input, { transport })`.
    * Use instead of `transport`.
    */
   transports?: NamedTransport[];
@@ -184,32 +209,34 @@ export interface DurableModuleOptions {
    * transport when it can broadcast (event-emitter, BullMQ); set explicitly to use a dedicated one.
    */
   controlPlane?: ControlPlane;
-  /** Interval (ms) for the durable-timer poller. `0` disables it. Defaults to 1000. */
+  /** Interval (ms) for the durable-timer poller. `0` disables it. Defaults to 1000. Operator only. */
   timerPollMs?: number;
   /**
    * Auto-create the durable tables on boot via `store.ensureSchema()`. Defaults to true. Turn
    * off in production and call the store adapter's `ensure*DurableSchema()` from a migration.
+   * Operator only.
    */
   autoSchema?: boolean;
   /**
-   * Worker-pool partition for this instance (forwarded to the engine). The poll paths
+   * Worker-pool namespace for this instance (forwarded to the engine). The poll paths
    * (`runPending`/`recoverIncomplete`/`resumeDueTimers`/`sweepTimeouts`) only act on runs in this
    * namespace. Set distinct values to safely share ONE state store across non-interchangeable
    * pools — e.g. a developer's local instance vs the deployed cluster. **Omit it to make this
    * instance an OPERATOR** — an unset namespace drives/recovers/resumes runs of EVERY namespace and
-   * leaves the transport on its bare prefix. See `WorkflowEngineDeps.namespace`.
+   * leaves the transport on its bare prefix. See `WorkflowEngineDeps.namespace`. Not to be confused
+   * with {@link partition} (the co-located/thin-worker QUEUE routing suffix).
    */
   namespace?: string;
   /**
    * Multi-instance recovery lease, in ms — how long an instance owns a run it picked up before
-   * another may take over. Defaults to 30000. Set above your longest synchronous run.
+   * another may take over. Defaults to 30000. Set above your longest synchronous run. Operator only.
    */
   leaseMs?: number;
-  /** Unique id for this instance (for leases). Defaults to a random id. */
+  /** Unique id for this instance (for leases, and the co-located/thin-worker consumer's heartbeats). */
   instanceId?: string;
   /**
    * Cap recovery attempts before a still-`running` run is moved to the `dead` dead-letter state
-   * (a poison pill that crashes the process every boot). Omit for unlimited.
+   * (a poison pill that crashes the process every boot). Omit for unlimited. Operator only.
    */
   maxRecoveryAttempts?: number;
   /**
@@ -218,6 +245,7 @@ export interface DurableModuleOptions {
    * and lets recovery re-drive; each heartbeat rearms the window so a slow-but-alive worker is never
    * re-driven. Pair with a worker SDK that emits run-scoped heartbeats (`@dudousxd/durable-worker` ≥ the
    * release that ships them, and the Python `durable-worker`). Omit for the prior unbounded await.
+   * Operator only.
    */
   remoteAdvanceSilenceMs?: number;
   /**
@@ -227,66 +255,59 @@ export interface DurableModuleOptions {
    * it can alert, compensate, or queue for review. Resolution per dead run: the workflow's inline
    * `@DeadLetter()` method → its `@Workflow({ deadLetterWorkflow })` reference → this default. Omit
    * everything to just leave dead runs parked (inspectable + retriable from the dashboard). Accepts a
-   * workflow class (refactor-safe) or a name (cross-runtime).
+   * workflow class (refactor-safe) or a name (cross-runtime). Operator only.
    */
   deadLetterWorkflow?: WorkflowRef;
   /**
-   * Whether this instance plays the **worker** role: register `@Step` handlers (consume the
-   * transport), recover incomplete runs on boot, and poll due timers. Defaults to `true`. Set
-   * `false` for a **dashboard/dispatch-only** instance (e.g. an API pod) that mounts the control
-   * plane and reads the store but must not process or recover workflows — leave that to the workers.
-   */
-  worker?: boolean;
-  /**
-   * Internal axis, orthogonal to {@link worker}: whether this instance DRIVES runs — polls
-   * pending, recovers crashed (`recoverIncomplete`), resumes due timers, sweeps timeouts — even
-   * when it does not itself execute `@Workflow`/`@Step` bodies. Defaults to `worker !== false`
-   * (back-compat: `worker:true` drives, and a plain `worker:false` API/dashboard pod does not).
-   * `DurableControlPlaneModule` sets this `true` alongside `worker:false`: an OPERATOR control
-   * plane that drives every run but dispatches each one to a remote tenant worker group (see
-   * {@link remoteByConvention}) instead of running it in-process. Most apps never set this
-   * directly — use `DurableModule` (a worker) or `DurableControlPlaneModule` (a driving,
-   * non-executing control plane) instead.
+   * Whether an **operator** instance actively DRIVES runs — polls pending, recovers crashed
+   * (`recoverIncomplete`), resumes due timers, sweeps timeouts, prunes retention, and consumes local
+   * steps — as opposed to a read-only/dashboard replica. Defaults to `true`. Set `false` for a
+   * **dashboard/dispatch-only** instance (e.g. an API pod) that mounts the store/dashboard but must
+   * not process or recover workflows — leave that to another driving instance. `drive: false` also
+   * installs the engine's no-op run dispatcher, so a freshly `start()`ed run stays enqueue-only until
+   * a driving instance's poll picks it up. Ignored (irrelevant) for a thin worker (no `store`).
    */
   drive?: boolean;
-  /** Max ms to wait for in-flight runs on shutdown before exiting. Defaults to 10000. */
+  /** Max ms to wait for in-flight runs on shutdown before exiting. Defaults to 10000. Operator only. */
   shutdownTimeoutMs?: number;
   /**
    * Recurring workflows to start on a schedule (fixed interval or cron). The timer poller fires
-   * them each tick on **worker** instances only; `engine.start` is idempotent by the schedule's
+   * them each tick on **driving** instances only; `engine.start` is idempotent by the schedule's
    * time-bucket run id, so racing instances start each window exactly once. Cron schedules need the
-   * optional `cron-parser` peer dependency.
+   * optional `cron-parser` peer dependency. Operator only.
    */
   schedules?: ScheduledWorkflow[];
   /**
    * Hard-prune terminal run history on an interval so `durable_workflow_runs` (and its child tables)
    * stays bounded — without it, completed/failed/cancelled runs accumulate forever and the timer
-   * poller's per-tick status scans get linearly slower. Worker instances only. Omit to keep all
+   * poller's per-tick status scans get linearly slower. Driving instances only. Omit to keep all
    * history (the default). Requires a store adapter that implements `pruneTerminalRuns` (the
    * MikroORM adapter does); other adapters no-op with a warning. See {@link DurableRetentionOptions}.
+   * Operator only.
    */
   retention?: DurableRetentionOptions;
   /**
    * Build the public callback URL for a `ctx.webhook()` token, e.g.
    * ``(t) => `https://api.example.com/durable/api/webhooks/${t}` ``. Populates `DurableWebhook.url`
    * so a step can hand the URL to a third party. The dashboard's `POST webhooks/:token` receives the
-   * callback. Omit to build URLs yourself from the token.
+   * callback. Omit to build URLs yourself from the token. Operator only.
    */
   webhookUrl?: (token: string) => string;
   /**
    * Flow-control queues for remote steps, registered on the engine at startup. Reference one from a
-   * workflow with `ctx.call(step, input, { queue: name })` to cap its concurrency / admission rate.
+   * workflow with `ctx.remote(step, input, { queue: name })` to cap its concurrency / admission rate.
+   * Operator only.
    */
   queues?: QueueConfig[];
   /**
    * Admission backend for the flow-control `queues`. Defaults to in-process (per-instance) caps. Pass
    * a `RedisAdmissionBackend` (from `@dudousxd/nestjs-durable-admission-redis`) to make concurrency /
-   * rate-limit / priority ordering GLOBAL across every engine replica.
+   * rate-limit / priority ordering GLOBAL across every engine replica. Operator only.
    */
   admission?: AdmissionBackend;
   /**
    * Provide the current W3C `traceparent` to stamp on dispatched remote tasks, so workers continue
-   * the distributed trace. Pass `otelTraceparent` from `@dudousxd/nestjs-durable-otel`.
+   * the distributed trace. Pass `otelTraceparent` from `@dudousxd/nestjs-durable-otel`. Operator only.
    */
   traceparent?: () => string | undefined;
   /**
@@ -303,37 +324,63 @@ export interface DurableModuleOptions {
    * Re-evaluated at each (re)dispatch — including a retry or a crash/scale-down resume that the engine
    * drives OUTSIDE the originating request scope, where this reader may return empty or stale values.
    * Treat the carrier as best-effort correlation/propagation metadata only — do NOT treat it as an
-   * authorization boundary.
+   * authorization boundary. Operator only.
    */
   context?: () => Record<string, unknown> | undefined;
-  /** Attempts for each saga compensation when a run fails. Default 1 (no retry). Idempotent undos. */
+  /** Attempts for each saga compensation when a run fails. Default 1 (no retry). Idempotent undos.
+   *  Operator only. */
   compensationRetries?: number;
-  /**
-   * Route an **unregistered** workflow whose name matches a live worker group to that group over the
-   * primary transport — no per-workflow `engine.remote()` registration needed. Default `false`. Set
-   * `true` on a control plane that dispatches to convention-named polyglot workers (see
-   * `WorkflowEngineDeps.remoteByConvention`).
-   */
-  remoteByConvention?: boolean;
   /**
    * Opt into tenant read scoping: when `true` AND {@link namespace} is set, the module confines the
    * store's reads to that namespace (a tenant-boundary view) instead of the operator view that sees
    * all namespaces. Default `false` — the control plane (e.g. flip's `/ctrl` operator screens) stays
    * unscoped. Requires a store that exposes the `withScope` capability (the MikroORM adapter does);
-   * a pre-built store without it is used as-is (construct it already-scoped instead). See
-   * {@link DurableModuleOptions.store}.
+   * a pre-built store without it is used as-is (construct it already-scoped instead). Operator only.
    */
   scopeReads?: boolean;
   /**
-   * Opt into an **in-app worker** (uniform dispatch): the same process runs the engine AND serves its
-   * own discovered `@Workflow`/`@Step`. Each `@Workflow` is registered GROUP-SERVED — its turns are
-   * dispatched, PER WORKFLOW NAME, to `tenantGroup(sanitizeQueueToken(name), partition)` over the
-   * transport and replayed by a co-located worker consumer that subscribes one queue per discovered
-   * name — instead of run inline. Requires a workflow-task transport (BullMQ). Omit (the default) to
-   * keep every `@Workflow` on the inline fast path with zero dispatch round-trips. See
-   * {@link DurableInAppWorkerOptions}.
+   * ioredis connection (string or options) for a **thin worker** (`connection` only) or the
+   * **co-located worker** consumer (`store` + `connection`). Set this to play a worker role (see the
+   * interface doc for the full role matrix). Omit to keep every `@Workflow` on the operator's inline
+   * fast path with zero dispatch round-trips.
    */
-  inAppWorker?: DurableInAppWorkerOptions;
+  connection?: string | Record<string, unknown>;
+  /**
+   * The isolation partition a worker role serves — a thin worker's or co-located worker's queue
+   * subscription, AND (for a co-located worker) the suffix each `@Workflow`'s dispatch token carries.
+   * Each handler's queue token is `tenantGroup(sanitizeQueueToken(name), partition)`
+   * (`@dudousxd/nestjs-durable-core`), so `undefined`, `''`, or `'default'` stays byte-identical to
+   * the bare (sanitized) name (single-tenant deployment unchanged), and any other partition serves
+   * `<name>@<partition>` — matching the queue name an operator's convention dispatch routes that
+   * tenant's runs to (`tenantGroup(run.workflow, run.namespace)` on the engine side). Not to be
+   * confused with {@link namespace} (the operator's own poll-scoping axis). Ignored for a plain
+   * operator (no `connection`).
+   */
+  partition?: string;
+  /** Key prefix namespacing the durable queues for a worker role's consumer. Defaults to `durable`
+   *  (matches the transport). Ignored for a plain operator (no `connection`). */
+  prefix?: string;
+  /**
+   * How many tasks a worker role's co-located/thin consumer runs concurrently PER SUBSCRIBED QUEUE
+   * (BullMQ Worker concurrency — the same limit is applied to every per-name queue the single
+   * `runRedisWorker` call starts). Defaults to 1. Raise it so a fanned-out batch (e.g. the N remote
+   * steps of a `gather`) runs in parallel instead of serially.
+   *
+   * Pass `'adaptive'` (or `{ mode:'adaptive', ... }`) to let the consumer self-tune its concurrency
+   * (latency gradient + RAM brake + backpressure) and publish a live status on its heartbeat. Ignored
+   * for a plain operator (no `connection`).
+   */
+  concurrency?: ConcurrencyOption;
+  /**
+   * Per-handler concurrency override, keyed by workflow/step NAME. Falls back to {@link concurrency}
+   * (then 1). NOT YET WIRED THROUGH: `runRedisWorker` (`@dudousxd/durable-worker`) currently applies
+   * one {@link concurrency} limit uniformly across every per-name queue it subscribes to from a
+   * single call — reserved here for when per-name concurrency lands there.
+   */
+  concurrencyByHandler?: Record<string, ConcurrencyOption>;
+  /** Timeout for a thin worker's `RunGateway` round-trip over `transport` before it rejects. Defaults
+   *  to 10_000ms inside `ProxyRunGateway`. Ignored for an operator (bound to `StoreRunGateway`). */
+  runGatewayTimeoutMs?: number;
 }
 
 export interface DurableModuleAsyncOptions {
@@ -343,11 +390,24 @@ export interface DurableModuleAsyncOptions {
   inject?: InjectionToken[];
 }
 
+/** Throws the exact role-inference contract errors documented on {@link DurableModuleOptions}. */
+function assertValidRole(options: DurableModuleOptions): void {
+  const hasStore = options.store !== undefined;
+  const hasConnection = options.connection !== undefined;
+  if (!hasStore && !hasConnection) {
+    throw new Error(
+      'a durable module needs either a `store` (operator) or a `connection` (worker)',
+    );
+  }
+  if (hasStore && options.transport === undefined) {
+    throw new Error('an operator (`store`) needs a `transport`');
+  }
+}
+
 /**
- * Boot-time wiring for the tenant run gateway's OPERATOR side, gated the same way as
- * {@link TimerPoller} (the `drive` axis — worker instances drive by default; a plain
- * `worker:false` dashboard/API pod does not). Two independent capabilities, each wired only when
- * the transport carries it:
+ * Boot-time wiring for the tenant run gateway's OPERATOR side, gated by {@link isDrivingOperator} (an
+ * operator instance drives by default; `drive: false` — or a thin worker with no `store` at all —
+ * does not). Two independent capabilities, each wired only when the transport carries it:
  *
  * 1. **`RunRequestResponder`** — answers a tenant's {@link RunRequest} against the bound
  *    {@link RUN_GATEWAY}, tenant-scoped. Wired when the transport implements both
@@ -365,13 +425,14 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
     private readonly engine: WorkflowEngine,
     @Inject(TRANSPORT_CANONICAL) private readonly transport: Transport | null,
     @Inject(RUN_GATEWAY) private readonly gateway: RunGateway,
-    @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore,
+    @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
   ) {}
 
   onApplicationBootstrap(): void {
-    const drive = this.options.drive ?? this.options.worker !== false;
-    if (!drive || !this.transport) return;
+    if (!isDrivingOperator(this.options) || !this.transport) return;
+    const store = this.store;
+    if (!store) return; // unreachable when isDrivingOperator is true — keeps types honest
 
     const { onRunRequest, publishRunReply, publishTenantEvent } = this.transport;
     if (typeof onRunRequest === 'function' && typeof publishRunReply === 'function') {
@@ -388,7 +449,7 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
 
     if (typeof publishTenantEvent === 'function') {
       const republisher = new TenantEventRepublisher(
-        this.store,
+        store,
         publishTenantEvent.bind(this.transport),
       );
       this.unsubscribe = this.engine.subscribe((event) => {
@@ -405,13 +466,18 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
 @Module({})
 export class DurableModule {
   static forRoot(options: DurableModuleOptions): DynamicModule {
+    assertValidRole(options);
     return DurableModule.build({ provide: DURABLE_OPTIONS_CANONICAL, useValue: options });
   }
 
   static forRootAsync(options: DurableModuleAsyncOptions): DynamicModule {
     return DurableModule.build({
       provide: DURABLE_OPTIONS_CANONICAL,
-      useFactory: options.useFactory,
+      useFactory: async (...args: Parameters<DurableModuleAsyncOptions['useFactory']>) => {
+        const resolved = await options.useFactory(...args);
+        assertValidRole(resolved);
+        return resolved;
+      },
       inject: options.inject ?? [],
     });
   }
@@ -425,7 +491,8 @@ export class DurableModule {
         optionsProvider,
         {
           provide: STATE_STORE_CANONICAL,
-          useFactory: (options: DurableModuleOptions) => scopedStore(options),
+          useFactory: (options: DurableModuleOptions): StateStore | null =>
+            options.store !== undefined ? scopedStore(options.store, options) : null,
           inject: [DURABLE_OPTIONS_CANONICAL],
         },
         {
@@ -438,24 +505,35 @@ export class DurableModule {
         { provide: TRANSPORT, useExisting: TRANSPORT_CANONICAL },
         { provide: DURABLE_OPTIONS, useExisting: DURABLE_OPTIONS_CANONICAL },
         {
+          // Shared token, bound EXACTLY once: a real engine for the operator role, or a store-less
+          // `DurableStartClient` facade for a thin worker (no `store`) — either way, `WorkflowService`
+          // and app code call `engine.start(...)` unchanged.
           provide: WorkflowEngine,
           useFactory: async (
-            store: StateStore,
+            options: DurableModuleOptions,
+            store: StateStore | null,
             transport: Transport | null,
-            opts: DurableModuleOptions,
             // The accessor from `@dudousxd/nestjs-context` is resolved at construction via ModuleRef
             // (shared CONTEXT_ACCESSOR symbol — no hard import). Absent → unchanged behavior.
             moduleRef: ModuleRef,
           ) => {
+            if (options.store === undefined) {
+              return new DurableStartClient(options);
+            }
+            if (!store) {
+              throw new Error(
+                'unreachable: STATE_STORE_CANONICAL must resolve a store when options.store is set',
+              );
+            }
             // The control-plane default is the primary task transport (single, or the pool's first)
             // when it can broadcast.
-            const primary = transport ?? opts.transports?.[0]?.transport;
+            const primary = transport ?? options.transports?.[0]?.transport;
             // Auto-feed the carrier from nestjs-context when an accessor is present AND the app didn't
             // pass its own `context` reader. The app's own reader always wins; with no accessor the
             // carrier stays `undefined` (unchanged behavior — `traceparent` etc. still work).
             const accessor = resolveAccessor(moduleRef);
             const context =
-              opts.context ?? (accessor ? () => carrierFromAccessor(accessor) : undefined);
+              options.context ?? (accessor ? () => carrierFromAccessor(accessor) : undefined);
             // Consume side: when nestjs-context is present (an accessor is bound), re-hydrate the
             // originating context AROUND each local step body, so a `@Step` reader sees the
             // tenant/user/trace ids ambiently via nestjs-context's ALS — no consumer wrapping needed.
@@ -472,38 +550,36 @@ export class DurableModule {
             const engine = new WorkflowEngine({
               store,
               transport: transport ?? undefined,
-              transports: opts.transports,
-              controlPlane: opts.controlPlane ?? (isControlPlane(primary) ? primary : undefined),
-              leaseMs: opts.leaseMs,
-              admission: opts.admission,
-              maxRecoveryAttempts: opts.maxRecoveryAttempts,
-              remoteAdvanceSilenceMs: opts.remoteAdvanceSilenceMs,
-              instanceId: opts.instanceId,
-              namespace: opts.namespace,
-              remoteByConvention: opts.remoteByConvention,
-              webhookUrl: opts.webhookUrl,
-              traceparent: opts.traceparent,
+              transports: options.transports,
+              controlPlane: options.controlPlane ?? (isControlPlane(primary) ? primary : undefined),
+              leaseMs: options.leaseMs,
+              admission: options.admission,
+              maxRecoveryAttempts: options.maxRecoveryAttempts,
+              remoteAdvanceSilenceMs: options.remoteAdvanceSilenceMs,
+              instanceId: options.instanceId,
+              namespace: options.namespace,
+              webhookUrl: options.webhookUrl,
+              traceparent: options.traceparent,
               context,
               rehydrate: rehydrate || undefined,
-              compensationRetries: opts.compensationRetries,
-              // A non-worker, non-driving (plain API/dashboard) instance must not run workflows:
-              // enqueue-only, leaving each `pending` run in the store for a DRIVING instance's poll.
-              // Workers AND driving control planes (`drive:true` — see `DurableControlPlaneModule`)
-              // get the engine's default in-process dispatcher: for a worker that executes the body
-              // locally, and for a driving-only control plane that has no local registration, the
-              // SAME default dispatcher routes it out remotely via `remoteByConvention` instead.
-              runDispatcher:
-                opts.worker === false && opts.drive !== true ? { dispatch: () => {} } : undefined,
+              compensationRetries: options.compensationRetries,
+              // A non-driving (dashboard/API) operator must not run workflows: enqueue-only, leaving
+              // each `pending` run in the store for a DRIVING instance's poll. A driving operator gets
+              // the engine's default in-process dispatcher: for a body registered inline, it runs
+              // locally; for one registered GROUP-SERVED (co-located worker) or left unregistered, the
+              // SAME default dispatcher routes it out remotely (group-served executor, or convention
+              // dispatch — always on) instead.
+              runDispatcher: options.drive === false ? { dispatch: () => {} } : undefined,
             });
-            for (const queue of opts.queues ?? []) engine.registerQueue(queue);
+            for (const queue of options.queues ?? []) engine.registerQueue(queue);
             // Dead-letter routing (per-workflow `@DeadLetter()` / `deadLetterWorkflow` + this global
             // default) is wired by the WorkflowRegistrar, which owns the `@Workflow` metadata.
             return engine;
           },
           inject: [
+            DURABLE_OPTIONS_CANONICAL,
             STATE_STORE_CANONICAL,
             TRANSPORT_CANONICAL,
-            DURABLE_OPTIONS_CANONICAL,
             ModuleRef,
           ],
         },
@@ -513,15 +589,41 @@ export class DurableModule {
         DurableStepRegistrar,
         TimerPoller,
         RetentionPoller,
-        // Tenant run gateway (operator side): the store-backed `RunGateway` a consumer (a thin
-        // controller, or the responder below) binds to instead of reaching for the engine/store
-        // directly, plus the boot-time wiring that starts the request responder and the
-        // tenant-event re-publisher when the transport carries the protocol.
-        { provide: RUN_GATEWAY, useClass: StoreRunGateway },
+        // Tenant run gateway: bound EXACTLY once — the store-backed `StoreRunGateway` for an operator,
+        // or (for a thin worker, no `store`) a `ProxyRunGateway` over `transport` when given, else a
+        // gateway whose every method rejects with a clear tenant error.
+        {
+          provide: RUN_GATEWAY,
+          useFactory: (
+            options: DurableModuleOptions,
+            store: StateStore | null,
+            engine: WorkflowEngine,
+          ): RunGateway => {
+            if (options.store !== undefined) {
+              if (!store) {
+                throw new Error(
+                  'unreachable: STATE_STORE_CANONICAL must resolve a store when options.store is set',
+                );
+              }
+              return new StoreRunGateway(store, engine);
+            }
+            return options.transport
+              ? new ProxyRunGateway(
+                  options.transport,
+                  options.partition ?? 'default',
+                  options.runGatewayTimeoutMs,
+                )
+              : unavailableRunGateway();
+          },
+          inject: [DURABLE_OPTIONS_CANONICAL, STATE_STORE_CANONICAL, WorkflowEngine],
+        },
         RunGatewayBootstrap,
-        // In-app worker (uniform dispatch, opt-in): inert when `inAppWorker` is unset — the binding
-        // resolves to null and the bootstrap no-ops, so a plain DurableModule is unchanged.
+        // Co-located in-app worker (uniform dispatch): inert unless BOTH `store` and `connection` are
+        // set — see `in-app-worker.ts`.
         ...inAppWorkerProviders(),
+        // Pure thin-worker consumer: inert unless `connection` is set WITHOUT `store` — see
+        // `durable-worker.module.ts`.
+        ...thinWorkerProviders(),
       ],
       exports: [
         WorkflowService,
@@ -535,38 +637,5 @@ export class DurableModule {
         RUN_GATEWAY,
       ],
     };
-  }
-}
-
-/**
- * The **control-plane** packaging of {@link DurableModule}: an intention-revealing alias that always
- * forces `worker: false, drive: true`. A control-plane instance mounts the engine, the dashboard, and
- * the store, and DRIVES every run — polls pending, recovers crashed, resumes due timers, sweeps
- * timeouts — but never itself executes a `@Workflow`/`@Step` body: pair it with
- * `remoteByConvention: true` (or per-workflow `engine.remote()`) so each driven run dispatches to a
- * remote tenant worker group instead of running in-process. A started run no longer sits orphaned
- * `pending` forever waiting for a worker's own poll — this instance drives it itself.
- *
- * Pair it with tenant workers packaged via `DurableWorkerModule` (which run `@Step`/`@Workflow`
- * handlers over the transport, hold no engine/store, and can `startRun` back over the protocol). Use
- * `DurableModule` directly when one instance should be BOTH dispatcher and worker.
- *
- * Any `worker`/`drive` passed in options is ignored — this factory hard-sets `worker: false, drive: true`.
- */
-@Module({})
-export class DurableControlPlaneModule {
-  static forRoot(options: DurableModuleOptions): DynamicModule {
-    return DurableModule.forRoot({ ...options, worker: false, drive: true });
-  }
-
-  static forRootAsync(options: DurableModuleAsyncOptions): DynamicModule {
-    return DurableModule.forRootAsync({
-      ...options,
-      useFactory: async (...args: Parameters<DurableModuleAsyncOptions['useFactory']>) => ({
-        ...(await options.useFactory(...args)),
-        worker: false,
-        drive: true,
-      }),
-    });
   }
 }

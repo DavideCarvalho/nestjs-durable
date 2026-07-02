@@ -1,4 +1,4 @@
-import { InMemoryStateStore } from '@dudousxd/nestjs-durable-core';
+import { InMemoryStateStore, InMemoryTransport } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { describe, expect, it } from 'vitest';
 import { Workflow } from './decorators';
@@ -16,7 +16,9 @@ describe('@Workflow tags', () => {
   it('stamps static tags merged with per-run tags onto the run', async () => {
     const store = new InMemoryStateStore();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, timerPollMs: 0 })],
+      imports: [
+        DurableModule.forRoot({ store, transport: new InMemoryTransport(), timerPollMs: 0 }),
+      ],
       providers: [TaggedWorkflow],
     }).compile();
     await moduleRef.init();

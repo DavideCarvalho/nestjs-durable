@@ -1,5 +1,6 @@
 import {
   InMemoryStateStore,
+  InMemoryTransport,
   STATE_STORE_CANONICAL,
   type StateStore,
 } from '@dudousxd/nestjs-durable-core';
@@ -29,7 +30,14 @@ describe('DurableModule — scopeReads option', () => {
   it('scopeReads:true + namespace re-scopes a capable store to that namespace', async () => {
     const store = new ScopeAwareStore();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, namespace: 'tenant-a', scopeReads: true })],
+      imports: [
+        DurableModule.forRoot({
+          store,
+          transport: new InMemoryTransport(),
+          namespace: 'tenant-a',
+          scopeReads: true,
+        }),
+      ],
     }).compile();
     await moduleRef.init();
 
@@ -44,7 +52,9 @@ describe('DurableModule — scopeReads option', () => {
   it('defaults to unscoped — without scopeReads the operator store is used as-is', async () => {
     const store = new ScopeAwareStore();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, namespace: 'tenant-a' })],
+      imports: [
+        DurableModule.forRoot({ store, transport: new InMemoryTransport(), namespace: 'tenant-a' }),
+      ],
     }).compile();
     await moduleRef.init();
 
@@ -58,7 +68,14 @@ describe('DurableModule — scopeReads option', () => {
   it('a non-scopeable store is used as-is even with scopeReads:true (documented constraint)', async () => {
     const store = new InMemoryStateStore();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, namespace: 'tenant-a', scopeReads: true })],
+      imports: [
+        DurableModule.forRoot({
+          store,
+          transport: new InMemoryTransport(),
+          namespace: 'tenant-a',
+          scopeReads: true,
+        }),
+      ],
     }).compile();
     await moduleRef.init();
 

@@ -25,6 +25,7 @@ import type { DurableModuleOptions } from './durable.module';
 import { entityConfigFor, getEntityMeta } from './entity';
 import { IN_APP_WORKER_BINDING, type InAppWorkerBinding } from './in-app-worker';
 import { classValidatorInput } from './input-validation';
+import { isDrivingOperator, isOperatorRole } from './role';
 import { type DurableStepInterceptor, isStepInterceptor } from './step-interceptor';
 
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
@@ -43,27 +44,26 @@ export class WorkflowRegistrar
     private readonly discovery: DiscoveryService,
     private readonly metadataScanner: MetadataScanner,
     private readonly engine: WorkflowEngine,
-    @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore,
+    @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
     // Group-served binding when the app opted into an in-app worker (uniform dispatch); null = inline.
     @Inject(IN_APP_WORKER_BINDING) private readonly inAppWorker: InAppWorkerBinding | null,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    // Recover runs left incomplete by a crash/deploy when this instance's `drive` axis is on —
-    // defaults to the worker role (back-compat), but a `DurableControlPlaneModule` (`worker:false,
-    // drive:true`) also recovers, re-enqueuing each for remote dispatch. A plain dashboard-only
-    // instance (`worker:false`, drive unset) must not pick up and re-run workflows — leave that to
-    // the workers.
-    const drive = this.options.drive ?? this.options.worker !== false;
-    if (!drive) return;
+    // Recover runs left incomplete by a crash/deploy when this operator instance is DRIVING
+    // (defaults to true). A non-driving (dashboard-only) operator, or a thin worker with no `store`
+    // at all, must not pick up and re-run workflows — leave that to a driving instance.
+    if (!isDrivingOperator(this.options)) return;
     await this.engine.recoverIncomplete();
   }
 
   /** On deploy/shutdown: stop picking up new runs and wait for in-flight ones to settle, then close
    *  the transport(s) so the broker workers stop consuming and connections are released. Closing
-   *  AFTER the drain keeps the transport alive while in-flight runs dispatch/await their remote steps. */
+   *  AFTER the drain keeps the transport alive while in-flight runs dispatch/await their remote steps.
+   *  Operator only — a thin worker (no `store`) holds no engine to drain. */
   async onApplicationShutdown(): Promise<void> {
+    if (!isOperatorRole(this.options)) return;
     await this.engine.drain(this.options.shutdownTimeoutMs);
     const transports = [
       this.options.transport,
@@ -73,8 +73,17 @@ export class WorkflowRegistrar
   }
 
   async onModuleInit(): Promise<void> {
+    // Operator only — a thin worker (no `store`) registers its bodies on a `DurableWorkerRuntime`
+    // instead (see `durable-worker.module.ts`'s `ThinWorkflowRegistrar`), never on this engine.
+    if (!isOperatorRole(this.options)) return;
+    const store = this.store;
+    if (!store) {
+      throw new Error(
+        'unreachable: STATE_STORE_CANONICAL must resolve a store when options.store is set',
+      );
+    }
     if (this.options.autoSchema !== false) {
-      await this.store.ensureSchema?.();
+      await store.ensureSchema?.();
     }
     // Maps a workflow name to the workflow its dead runs route to. Built from each `@Workflow`'s
     // inline `@DeadLetter()` method (preferred) or its `deadLetterWorkflow` reference; the

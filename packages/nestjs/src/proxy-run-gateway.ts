@@ -26,10 +26,10 @@ interface PendingRequest {
 /**
  * Tenant-side `RunGateway` — round-trips every verb as a `RunRequest`/`RunReply` pair over the
  * transport, correlated by a minted `requestId`, and bridges `subscribe` onto the transport's
- * per-tenant event stream. Bound under `RUN_GATEWAY` by `DurableWorkerModule` when the app supplies
- * a `transport` (see `unavailableRunGateway` for the no-transport fallback). The counterpart to the
- * operator-side `StoreRunGateway` (Task 3): a tenant worker never touches a store/driver directly,
- * only this proxy.
+ * per-tenant event stream. Bound under `RUN_GATEWAY` by `DurableModule`'s thin-worker role
+ * (`connection` set, no `store`) when the app supplies a `transport` (see `unavailableRunGateway`
+ * for the no-transport fallback). The counterpart to the operator-side `StoreRunGateway`: a tenant
+ * worker never touches a store/driver directly, only this proxy.
  */
 @Injectable()
 export class ProxyRunGateway implements RunGateway {

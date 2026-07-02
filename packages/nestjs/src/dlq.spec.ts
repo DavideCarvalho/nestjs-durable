@@ -1,5 +1,6 @@
 import {
   InMemoryStateStore,
+  InMemoryTransport,
   type StateStore,
   type WorkflowCtx,
 } from '@dudousxd/nestjs-durable-core';
@@ -46,7 +47,15 @@ async function bootWithDeadRun(
   });
 
   const moduleRef = await Test.createTestingModule({
-    imports: [DurableModule.forRoot({ store, timerPollMs: 0, maxRecoveryAttempts: 1, ...options })],
+    imports: [
+      DurableModule.forRoot({
+        store,
+        transport: new InMemoryTransport(),
+        timerPollMs: 0,
+        maxRecoveryAttempts: 1,
+        ...options,
+      }),
+    ],
     providers,
   }).compile();
   await moduleRef.init(); // bootstrap → recoverIncomplete → run dead → onDead → start the DLQ workflow
@@ -157,6 +166,7 @@ describe('dead-letter routing', () => {
       imports: [
         DurableModule.forRoot({
           store,
+          transport: new InMemoryTransport(),
           timerPollMs: 0,
           maxRecoveryAttempts: 1,
           deadLetterWorkflow: 'pipeline-dlq',
@@ -185,7 +195,13 @@ describe('dead-letter routing', () => {
     }
 
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store: new InMemoryStateStore(), timerPollMs: 0 })],
+      imports: [
+        DurableModule.forRoot({
+          store: new InMemoryStateStore(),
+          transport: new InMemoryTransport(),
+          timerPollMs: 0,
+        }),
+      ],
       providers: [PoisonBothWorkflow, DlqWorkflow],
     }).compile();
 

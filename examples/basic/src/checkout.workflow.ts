@@ -21,7 +21,7 @@ export class CheckoutWorkflow {
       return { reserved: true };
     });
 
-    const charge = await ctx.call(chargeCard, {
+    const charge = await ctx.remote(chargeCard, {
       orderId: order.id,
       amountCents: order.total,
     });

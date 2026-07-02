@@ -1,5 +1,4 @@
 import {
-  type ConcurrencyOption,
   DurableWorkerRuntime,
   type RunningWorker,
   runRedisWorker as defaultRunRedisWorker,
@@ -20,54 +19,23 @@ import {
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
 import type { RunRedisWorkerFn } from './durable-worker.module';
+import type { DurableModuleOptions } from './durable.module';
 
 /**
- * Opt-in config for an **in-app worker**: the same NestJS process runs the engine AND serves its own
- * discovered `@Workflow`/`@Step`. The engine registers each `@Workflow` GROUP-SERVED — its turns are
- * dispatched, PER WORKFLOW NAME, to `tenantGroup(sanitizeQueueToken(name), partition)` over the
- * transport via a per-workflow `RemoteWorkflowExecutor` instead of run inline — and a co-located
- * {@link DurableWorkerRuntime} subscribes one queue per discovered name (via `runRedisWorker`, Task 5)
- * and replays the very same TS bodies. This is the uniform-dispatch "one app, both roles" shape — every
- * turn pays a transport round-trip even though the worker is the same process. Requires a transport
- * that carries workflow tasks (BullMQ); an in-process-only transport cannot dispatch a
- * `WorkflowExecutor`.
- */
-export interface DurableInAppWorkerOptions {
-  /**
-   * The isolation partition this app's `@Workflow`s dispatch to AND its co-located worker consumes.
-   * Each workflow's queue token is `tenantGroup(sanitizeQueueToken(name), partition)` — omit (or
-   * `''`/`'default'`) to route by the bare (sanitized) name, byte-identical to a single-tenant
-   * deployment.
-   */
-  partition?: string;
-  /** ioredis connection (string or options) for the co-located worker consumer (`runRedisWorker`). */
-  connection: string | Record<string, unknown>;
-  /** Key prefix namespacing the durable queues. Defaults to `durable` (matches the transport). */
-  prefix?: string;
-  /** Stable id for this worker process in heartbeats/control. Defaults to a per-host/pid id. */
-  instanceId?: string;
-  /**
-   * How many tasks the co-located worker runs concurrently PER SUBSCRIBED QUEUE (BullMQ Worker
-   * concurrency — applied to every per-name queue it subscribes to). Defaults to 1. Raise it so a
-   * fanned-out batch (e.g. the N remote steps of a `gather`) runs in parallel. Per process; total
-   * parallelism is `concurrency × distinct names × replicas`.
-   *
-   * Pass `'adaptive'` (or `{ mode:'adaptive', ... }`) to let the worker self-tune its concurrency
-   * (latency gradient + RAM brake + backpressure) and publish a live status on its heartbeat.
-   */
-  concurrency?: ConcurrencyOption;
-}
-
-/** The resolved {@link DurableInAppWorkerOptions} or `null` when the app didn't opt in. */
-export const IN_APP_WORKER_OPTIONS = Symbol('nestjs-durable:in-app-worker-options');
-
-/**
- * The group-served binding the {@link import('./workflow.registrar').WorkflowRegistrar} applies to every
- * discovered `@Workflow`, or `null` when the app didn't opt into an in-app worker (workflows register
- * inline — the unchanged default). Carries the transport + partition, NOT a pre-built executor: the
- * registrar builds a fresh `RemoteWorkflowExecutor` PER WORKFLOW, keyed by that workflow's own name,
- * so each dispatches under its own `tenantGroup(sanitizeQueueToken(name), partition)` token — the
- * exact token the co-located worker's per-name subscription (Task 5) consumes.
+ * The **co-located in-app worker** (uniform dispatch): active whenever an app supplies BOTH `store`
+ * AND `connection` (`DurableModule.forRoot({ store, transport, connection, partition? })`) — the same
+ * process runs the engine AND serves its own discovered `@Workflow`/`@Step`. The engine registers each
+ * `@Workflow` GROUP-SERVED — its turns are dispatched, PER WORKFLOW NAME, to
+ * `tenantGroup(sanitizeQueueToken(name), partition)` over the transport via a per-workflow
+ * `RemoteWorkflowExecutor` instead of run inline — and a co-located {@link DurableWorkerRuntime}
+ * subscribes one queue per discovered name (via `runRedisWorker`) and replays the very same TS bodies.
+ * This is the uniform-dispatch "one app, both roles" shape — every turn pays a transport round-trip
+ * even though the worker is the same process. Requires a transport that carries workflow tasks
+ * (BullMQ); an in-process-only transport cannot dispatch a `WorkflowExecutor`.
+ *
+ * Distinct from the PURE thin-worker role (`connection` set, `store` unset — see
+ * `durable-worker.module.ts`'s `ThinWorkflowRegistrar`/`ThinStepRegistrar`/`ThinWorkerBootstrap`),
+ * which has no engine/store of its own at all.
  */
 export const IN_APP_WORKER_BINDING = Symbol('nestjs-durable:in-app-worker-binding');
 
@@ -86,20 +54,26 @@ export interface InAppWorkerBinding {
   partition?: string;
 }
 
+/** True for the **co-located** role — both `store` AND `connection` set. */
+function isCoLocatedWorker(options: DurableModuleOptions): boolean {
+  return options.store !== undefined && options.connection !== undefined;
+}
+
 /**
- * Builds the {@link IN_APP_WORKER_BINDING}: when `inAppWorker` is set, the engine's transport plus the
- * configured partition — the registrar builds a PER-WORKFLOW `RemoteWorkflowExecutor` from these, one
- * per discovered name; otherwise `null` (inline default). Fails fast if opted-in but the transport
- * can't carry workflow tasks — a group-served run would otherwise dead-end at dispatch.
+ * Builds the {@link IN_APP_WORKER_BINDING}: when this app is co-located (`store` + `connection`), the
+ * engine's transport plus the configured partition — the registrar builds a PER-WORKFLOW
+ * `RemoteWorkflowExecutor` from these, one per discovered name; otherwise `null` (inline default).
+ * Fails fast if co-located but the transport can't carry workflow tasks — a group-served run would
+ * otherwise dead-end at dispatch.
  */
 function inAppWorkerBinding(
   transport: Transport | null,
-  options: DurableInAppWorkerOptions | null,
+  options: DurableModuleOptions,
 ): InAppWorkerBinding | null {
-  if (!options) return null;
+  if (!isCoLocatedWorker(options)) return null;
   if (!transport?.dispatchWorkflowTask || !transport.onDecision) {
     throw new Error(
-      'inAppWorker requires a transport that carries workflow tasks (dispatchWorkflowTask + onDecision), e.g. BullMQTransport. An in-process transport cannot serve a group-served workflow.',
+      'a co-located worker (store + connection) requires a transport that carries workflow tasks (dispatchWorkflowTask + onDecision), e.g. BullMQTransport. An in-process transport cannot serve a group-served workflow.',
     );
   }
   return {
@@ -111,10 +85,10 @@ function inAppWorkerBinding(
 /**
  * The consumer half of the in-app worker: on init it registers every discovered `@Workflow`/`@Step`
  * on a {@link DurableWorkerRuntime} (the SAME bodies the engine registered group-served), and on
- * bootstrap it starts one `runRedisWorker` call that subscribes one queue per discovered name (Task
- * 5), suffixed by the configured partition, closing it on shutdown. A no-op when the app didn't opt
- * in. Mirrors the thin {@link import('./durable-worker.module').DurableWorkerModule}, but co-located
- * with a full engine.
+ * bootstrap it starts one `runRedisWorker` call that subscribes one queue per discovered name,
+ * suffixed by the configured partition, closing it on shutdown. A no-op outside the co-located role
+ * (see {@link isCoLocatedWorker}). Mirrors the thin {@link
+ * import('./durable-worker.module').ThinWorkerBootstrap}, but co-located with a full engine.
  */
 @Injectable()
 export class InAppWorkerBootstrap
@@ -125,14 +99,14 @@ export class InAppWorkerBootstrap
   constructor(
     private readonly discovery: DiscoveryService,
     private readonly metadataScanner: MetadataScanner,
-    @Inject(IN_APP_WORKER_OPTIONS) private readonly options: DurableInAppWorkerOptions | null,
+    @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
     @Inject(IN_APP_WORKER_RUNTIME) private readonly runtime: DurableWorkerRuntime,
     @Inject(IN_APP_RUN_REDIS_WORKER) private readonly runRedisWorker: RunRedisWorkerFn,
     @Inject(IN_APP_WORKER_RUNNERS) private readonly runnersSink: RunningWorker[],
   ) {}
 
   onModuleInit(): void {
-    if (!this.options) return;
+    if (!isCoLocatedWorker(this.options)) return;
     // Register the same TS bodies the engine serves group-served, so the consumer can replay them.
     scanWorkflows(this.discovery, (meta, instance) =>
       this.runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input)),
@@ -143,14 +117,15 @@ export class InAppWorkerBootstrap
   }
 
   async onApplicationBootstrap(): Promise<void> {
-    if (!this.options) return;
+    const options = this.options;
+    if (!isCoLocatedWorker(options) || options.connection === undefined) return;
     const handle = await this.runRedisWorker({
       runtime: this.runtime,
-      connection: this.options.connection,
-      ...(this.options.partition !== undefined ? { partition: this.options.partition } : {}),
-      ...(this.options.prefix !== undefined ? { prefix: this.options.prefix } : {}),
-      ...(this.options.instanceId !== undefined ? { instanceId: this.options.instanceId } : {}),
-      ...(this.options.concurrency !== undefined ? { concurrency: this.options.concurrency } : {}),
+      connection: options.connection,
+      ...(options.partition !== undefined ? { partition: options.partition } : {}),
+      ...(options.prefix !== undefined ? { prefix: options.prefix } : {}),
+      ...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
+      ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
     });
     this.runners.push(handle);
     this.runnersSink.push(handle);
@@ -162,38 +137,31 @@ export class InAppWorkerBootstrap
 }
 
 /**
- * The providers that stand up an in-app worker, added to {@link import('./durable.module').DurableModule}.
- * All are inert when `inAppWorker` is unset (the binding resolves to `null`, the bootstrap no-ops), so a
- * plain `DurableModule` is byte-for-byte unchanged.
+ * The providers that stand up the co-located in-app worker, added to {@link
+ * import('./durable.module').DurableModule}'s unified provider set. All are inert outside the
+ * co-located role (`store` + `connection` both set — see {@link isCoLocatedWorker}), so a plain
+ * operator (`store` only) or pure thin worker (`connection` only) is unaffected.
  */
 export function inAppWorkerProviders(): Provider[] {
   return [
     {
       provide: IN_APP_WORKER_BINDING,
-      useFactory: (
-        transport: Transport | null,
-        options: { inAppWorker?: DurableInAppWorkerOptions },
-      ) => inAppWorkerBinding(transport, options.inAppWorker ?? null),
+      useFactory: (transport: Transport | null, options: DurableModuleOptions) =>
+        inAppWorkerBinding(transport, options),
       inject: [TRANSPORT_CANONICAL, DURABLE_OPTIONS_CANONICAL],
-    },
-    {
-      provide: IN_APP_WORKER_OPTIONS,
-      useFactory: (options: { inAppWorker?: DurableInAppWorkerOptions }) =>
-        options.inAppWorker ?? null,
-      inject: [DURABLE_OPTIONS_CANONICAL],
     },
     {
       provide: IN_APP_WORKER_RUNTIME,
       // The runtime's `WorkflowWorker` uses its `group` ctor param as the WORKFLOW's
       // `workflowPartition` for any `ctx.remote` call that omits an explicit `partition` (see
       // `workflow-context.ts`'s `resolveCallGroup`) — that fallback MUST equal this app's own
-      // {@link DurableInAppWorkerOptions.partition}, or an implicit-partition remote step's decision
-      // carries a mismatched token and the engine dispatches it to a queue nothing here subscribes
-      // to. Explicit `''` (never `undefined`) so it does NOT fall through to `WorkflowWorker`'s
-      // unrelated `'workflows'` default parameter.
-      useFactory: (options: DurableInAppWorkerOptions | null) =>
-        new DurableWorkerRuntime({ workflowGroup: options?.partition ?? '' }),
-      inject: [IN_APP_WORKER_OPTIONS],
+      // `partition`, or an implicit-partition remote step's decision carries a mismatched token and
+      // the engine dispatches it to a queue nothing here subscribes to. Explicit `''` (never
+      // `undefined`) so it does NOT fall through to `WorkflowWorker`'s unrelated `'workflows'`
+      // default parameter.
+      useFactory: (options: DurableModuleOptions) =>
+        new DurableWorkerRuntime({ workflowGroup: options.partition ?? '' }),
+      inject: [DURABLE_OPTIONS_CANONICAL],
     },
     { provide: IN_APP_RUN_REDIS_WORKER, useValue: defaultRunRedisWorker },
     { provide: IN_APP_WORKER_RUNNERS, useValue: [] as RunningWorker[] },

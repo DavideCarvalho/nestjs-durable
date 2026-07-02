@@ -7,7 +7,7 @@ import {
   type WorkflowTask,
 } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
-import { DurableControlPlaneModule } from './durable.module';
+import { DurableModule } from './durable.module';
 
 /**
  * A broker-like transport whose `onRunRequest`/`publishRunReply` are real class methods that touch a
@@ -59,7 +59,7 @@ describe('RunGatewayBootstrap (operator responder wiring)', () => {
     const transport = new BrokerTransport();
 
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableControlPlaneModule.forRoot({ store, transport, remoteByConvention: true })],
+      imports: [DurableModule.forRoot({ store, transport, drive: true })],
     }).compile();
 
     // Before the fix this throws "Receiver must be an instance of class BrokerTransport" — the

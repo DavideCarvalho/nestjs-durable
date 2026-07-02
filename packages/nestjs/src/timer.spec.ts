@@ -1,4 +1,8 @@
-import { InMemoryStateStore, type WorkflowCtx } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  InMemoryTransport,
+  type WorkflowCtx,
+} from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { Workflow } from './decorators';
 import { DurableModule } from './durable.module';
@@ -41,7 +45,7 @@ describe('durable timers', () => {
     });
 
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store })],
+      imports: [DurableModule.forRoot({ store, transport: new InMemoryTransport() })],
       providers: [SleeperWorkflow],
     }).compile();
     await moduleRef.init();

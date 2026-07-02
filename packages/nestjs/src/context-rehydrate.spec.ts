@@ -1,5 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { InMemoryStateStore, type WorkflowCtx } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  InMemoryTransport,
+  type WorkflowCtx,
+} from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContextAccessor, UserRef } from './context-accessor';
@@ -79,7 +83,10 @@ describe('DurableModule — local step context re-hydration (consume side)', () 
       tenantId: 't1',
       userRef: { type: 'User', id: 7 },
     });
-    const { service, close } = await buildModule({ store }, accessor);
+    const { service, close } = await buildModule(
+      { store, transport: new InMemoryTransport() },
+      accessor,
+    );
 
     await service.start('wf', {}, 'r1');
     await service.waitForRun('r1', { timeoutMs: 2000 });
@@ -95,7 +102,7 @@ describe('DurableModule — local step context re-hydration (consume side)', () 
   it('runs the step normally (empty ambient context) when no accessor is bound', async () => {
     const store = new InMemoryStateStore();
     // No CONTEXT_ACCESSOR provider → rehydrate stays default passthrough; the step still runs.
-    const { service, close } = await buildModule({ store });
+    const { service, close } = await buildModule({ store, transport: new InMemoryTransport() });
 
     const start = await service.start('wf', {}, 'r2');
     expect(start.runId).toBe('r2');

@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { InMemoryStateStore } from '@dudousxd/nestjs-durable-core';
+import { InMemoryStateStore, InMemoryTransport } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { describe, expect, it } from 'vitest';
@@ -24,7 +24,9 @@ describe('@Entity / @On / EntityService', () => {
   it('runs serialized ops per key over durable state (methods survive replay)', async () => {
     const store = new InMemoryStateStore();
     const mod = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, timerPollMs: 0 })],
+      imports: [
+        DurableModule.forRoot({ store, transport: new InMemoryTransport(), timerPollMs: 0 }),
+      ],
       providers: [Cart],
     }).compile();
     await mod.init();

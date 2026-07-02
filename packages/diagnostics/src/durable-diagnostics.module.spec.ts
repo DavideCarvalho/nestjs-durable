@@ -1,6 +1,10 @@
 import 'reflect-metadata';
 import { DurableModule } from '@dudousxd/nestjs-durable';
-import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  InMemoryTransport,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -20,7 +24,10 @@ import { DurableDiagnosticsModule } from './durable-diagnostics.module';
 async function bootApp() {
   const store = new InMemoryStateStore();
   const moduleRef = await Test.createTestingModule({
-    imports: [DurableModule.forRoot({ store }), DurableDiagnosticsModule.forRoot()],
+    imports: [
+      DurableModule.forRoot({ store, transport: new InMemoryTransport() }),
+      DurableDiagnosticsModule.forRoot(),
+    ],
   }).compile();
   await moduleRef.init(); // fires onApplicationBootstrap
   return moduleRef;

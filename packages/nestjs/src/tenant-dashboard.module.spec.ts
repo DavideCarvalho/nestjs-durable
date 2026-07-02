@@ -2,11 +2,13 @@ import type { RunReply, RunRequest, TenantEvent, Transport } from '@dudousxd/nes
 import { DashboardService, DurableDashboardModule } from '@dudousxd/nestjs-durable-dashboard';
 import { Test } from '@nestjs/testing';
 import { describe, expect, it } from 'vitest';
-import { DurableWorkerModule, RUN_REDIS_WORKER } from './durable-worker.module';
+import { RUN_REDIS_WORKER } from './durable-worker.module';
+import { DurableModule } from './durable.module';
 
 /**
  * A store-less thin-worker `runRedisWorker` fake — mirrors `fakeRunner()` in
- * `durable-worker.module.spec.ts` — so `DurableWorkerModule.forRoot` boots without touching Redis.
+ * `durable-worker.module.spec.ts` — so `DurableModule.forRoot({ connection })` boots without
+ * touching Redis.
  */
 function makeRunner() {
   return {
@@ -43,7 +45,7 @@ function fakeTenantTransport(options: {
   };
 }
 
-describe('a tenant DurableWorkerModule mounting DurableDashboardModule', () => {
+describe('a tenant DurableModule (connection only) mounting DurableDashboardModule', () => {
   it('boots the dashboard and drives runs through the ProxyRunGateway', async () => {
     const dispatched: Array<{ tenant: string; body: RunRequest['body'] }> = [];
     const transport = fakeTenantTransport({ onDispatch: (req) => dispatched.push(req) });
@@ -51,10 +53,9 @@ describe('a tenant DurableWorkerModule mounting DurableDashboardModule', () => {
 
     const moduleRef = await Test.createTestingModule({
       imports: [
-        DurableWorkerModule.forRoot({
+        DurableModule.forRoot({
           connection: 'redis://x',
-          groups: ['pipeline'],
-          tenant: 'tenant-a',
+          partition: 'tenant-a',
           transport,
         }),
         DurableDashboardModule.forRoot(),
@@ -65,7 +66,7 @@ describe('a tenant DurableWorkerModule mounting DurableDashboardModule', () => {
       .compile();
 
     // Resolving DashboardService proves: (a) RUN_GATEWAY resolves globally on a tenant (the
-    // DurableWorkerModule that binds it is `global`), and (b) the constructor did NOT boot-break on
+    // DurableModule that binds it is `global`), and (b) the constructor did NOT boot-break on
     // `collectMetrics(startClient)` — the store-less start client bound under WorkflowEngine has no
     // `subscribe`, so the guard has to gate the metrics-collector init on store presence.
     const dashboard = moduleRef.get(DashboardService, { strict: false });

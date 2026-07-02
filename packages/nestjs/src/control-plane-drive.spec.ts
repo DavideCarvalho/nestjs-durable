@@ -8,7 +8,7 @@ import {
   type WorkflowTask,
 } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
-import { DurableControlPlaneModule, DurableModule } from './durable.module';
+import { DurableModule } from './durable.module';
 
 /** Reports a live 'processing' group and completes any dispatched workflow task immediately — the
  *  same fixture `remote-by-convention-module.spec.ts` uses, duplicated here so this file stands alone. */
@@ -60,8 +60,8 @@ async function tick(times = 5) {
   }
 }
 
-describe('DurableControlPlaneModule — drives while worker:false', () => {
-  it('TimerPoller picks up a raw pending run on boot (worker:false, drive:true) and routes it remotely', async () => {
+describe('DurableModule — a store-only pod (no local @Workflow) drives + convention-dispatches', () => {
+  it('TimerPoller picks up a raw pending run on boot (drive:true, no local body) and routes it remotely', async () => {
     const store = new InMemoryStateStore();
     const transport = new ConventionTransport();
     const now = new Date();
@@ -78,7 +78,7 @@ describe('DurableControlPlaneModule — drives while worker:false', () => {
     });
 
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableControlPlaneModule.forRoot({ store, transport, remoteByConvention: true })],
+      imports: [DurableModule.forRoot({ store, transport, drive: true })],
     }).compile();
     await moduleRef.init();
 
@@ -89,7 +89,7 @@ describe('DurableControlPlaneModule — drives while worker:false', () => {
     await moduleRef.close();
   });
 
-  it('WorkflowRegistrar recovers a crashed (running) run on boot (worker:false, drive:true) and routes it remotely', async () => {
+  it('WorkflowRegistrar recovers a crashed (running) run on boot (drive:true, no local body) and routes it remotely', async () => {
     const store = new InMemoryStateStore();
     const transport = new ConventionTransport();
     const now = new Date();
@@ -104,7 +104,7 @@ describe('DurableControlPlaneModule — drives while worker:false', () => {
     });
 
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableControlPlaneModule.forRoot({ store, transport, remoteByConvention: true })],
+      imports: [DurableModule.forRoot({ store, transport, drive: true })],
     }).compile();
     await moduleRef.init();
 
@@ -120,7 +120,7 @@ describe('DurableControlPlaneModule — drives while worker:false', () => {
     const transport = new ConventionTransport();
 
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableControlPlaneModule.forRoot({ store, transport, remoteByConvention: true })],
+      imports: [DurableModule.forRoot({ store, transport, drive: true })],
     }).compile();
     await moduleRef.init();
 
@@ -134,7 +134,7 @@ describe('DurableControlPlaneModule — drives while worker:false', () => {
     await moduleRef.close();
   });
 
-  it('regression: a plain DurableModule.forRoot({ worker: false }) API pod STILL has drive off — no-op dispatch, no boot poll', async () => {
+  it('regression: a plain DurableModule.forRoot({ drive: false }) API pod has drive off — no-op dispatch, no boot poll', async () => {
     const store = new InMemoryStateStore();
     const transport = new ConventionTransport();
     const now = new Date();
@@ -149,9 +149,7 @@ describe('DurableControlPlaneModule — drives while worker:false', () => {
     });
 
     const moduleRef = await Test.createTestingModule({
-      imports: [
-        DurableModule.forRoot({ store, transport, remoteByConvention: true, worker: false }),
-      ],
+      imports: [DurableModule.forRoot({ store, transport, drive: false })],
     }).compile();
     await moduleRef.init();
 
@@ -168,12 +166,12 @@ describe('DurableControlPlaneModule — drives while worker:false', () => {
     await moduleRef.close();
   });
 
-  it('regression: DurableModule.forRoot({}) (worker:true default) is unchanged — drives + dispatches immediately', async () => {
+  it('regression: DurableModule.forRoot({ store, transport }) (drive:true default) is unchanged — drives + dispatches immediately', async () => {
     const store = new InMemoryStateStore();
     const transport = new ConventionTransport();
 
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, transport, remoteByConvention: true })],
+      imports: [DurableModule.forRoot({ store, transport })],
     }).compile();
     await moduleRef.init();
 

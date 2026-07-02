@@ -18,7 +18,6 @@ import { WorkflowService } from './workflow.service';
 /** A remote step the workflow dispatches — the carrier rides on its dispatched task. */
 const ping = remoteStep({
   name: 'ext.ping',
-  group: 'ext',
   input: z.object({}),
   output: z.object({ pong: z.boolean() }),
 });
@@ -26,7 +25,7 @@ const ping = remoteStep({
 @Workflow({ name: 'wf', version: '1' })
 class Wf {
   async run(ctx: WorkflowCtx) {
-    await ctx.call(ping, {});
+    await ctx.remote(ping, {});
     return 'x';
   }
 }

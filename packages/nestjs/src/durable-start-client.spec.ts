@@ -27,7 +27,7 @@ describe('DurableStartClient', () => {
   it('dispatches a start-run message stamped with tenant, workflow name, input, runId, and searchAttributes', async () => {
     const sink: { name: string; data: unknown }[] = [];
     const client = new DurableStartClient(
-      { connection: 'redis://x', groups: ['pipeline'], tenant: 'davi-local' },
+      { connection: 'redis://x', partition: 'davi-local' },
       { Queue: makeFakeQueue(sink) },
     );
 
@@ -52,7 +52,7 @@ describe('DurableStartClient', () => {
   it('mints a runId when the caller omits one and returns it', async () => {
     const sink: { name: string; data: unknown }[] = [];
     const client = new DurableStartClient(
-      { connection: 'redis://x', groups: ['pipeline'], tenant: 'davi-local' },
+      { connection: 'redis://x', partition: 'davi-local' },
       { Queue: makeFakeQueue(sink) },
     );
     const result = await client.start(DemoWorkflow, { n: 2 });
@@ -64,7 +64,7 @@ describe('DurableStartClient', () => {
   it('falls back to the default tenant when none is configured', async () => {
     const sink: { name: string; data: unknown }[] = [];
     const client = new DurableStartClient(
-      { connection: 'redis://x', groups: ['pipeline'] },
+      { connection: 'redis://x' },
       { Queue: makeFakeQueue(sink) },
     );
     await client.start(DemoWorkflow, { n: 3 }, 'r3');
@@ -73,7 +73,7 @@ describe('DurableStartClient', () => {
 
   it('throws a clear tenant error for every store/driver op WorkflowService delegates', async () => {
     const client = new DurableStartClient(
-      { connection: 'redis://x', groups: ['pipeline'], tenant: 'davi-local' },
+      { connection: 'redis://x', partition: 'davi-local' },
       { Queue: makeFakeQueue([]) },
     );
     await expect(client.cancel('r1')).rejects.toThrow(/tenant/i);

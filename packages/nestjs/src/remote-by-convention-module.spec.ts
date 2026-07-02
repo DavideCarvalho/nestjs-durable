@@ -56,12 +56,12 @@ class ConventionTransport implements Transport {
   }
 }
 
-describe('DurableModule — remoteByConvention option', () => {
-  it('threads remoteByConvention into the engine so an unregistered workflow routes to its group', async () => {
+describe('DurableModule — convention dispatch (unconditional)', () => {
+  it('routes an unregistered workflow to its live group by convention, no flag needed', async () => {
     const store = new InMemoryStateStore();
     const transport = new ConventionTransport();
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, transport, remoteByConvention: true })],
+      imports: [DurableModule.forRoot({ store, transport })],
     }).compile();
     await moduleRef.init();
 
@@ -82,7 +82,7 @@ describe('DurableModule — remoteByConvention option', () => {
     const store = new InMemoryStateStore();
     const transport = new ConventionTransport(['orders-fulfill']);
     const moduleRef = await Test.createTestingModule({
-      imports: [DurableModule.forRoot({ store, transport, remoteByConvention: true })],
+      imports: [DurableModule.forRoot({ store, transport })],
     }).compile();
     await moduleRef.init();
 
@@ -96,9 +96,9 @@ describe('DurableModule — remoteByConvention option', () => {
     await moduleRef.close();
   });
 
-  it('defaults to off — an unregistered workflow throws "not registered"', async () => {
+  it('a workflow with no live group at all still throws "not registered"', async () => {
     const store = new InMemoryStateStore();
-    const transport = new ConventionTransport();
+    const transport = new ConventionTransport([]);
     const moduleRef = await Test.createTestingModule({
       imports: [DurableModule.forRoot({ store, transport })],
     }).compile();

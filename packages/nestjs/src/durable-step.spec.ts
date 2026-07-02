@@ -15,7 +15,6 @@ import { WorkflowService } from './workflow.service';
 
 const chargeCard: RemoteStepDef<{ amount: number }, { chargeId: string }> = {
   name: 'payments.charge-card',
-  group: 'payments',
   input: z.object({ amount: z.number() }),
   output: z.object({ chargeId: z.string() }),
   __remote: true,
@@ -32,7 +31,7 @@ class PaymentsWorker {
 @Workflow({ name: 'checkout', version: '1' })
 class CheckoutWorkflow {
   async run(ctx: WorkflowCtx, order: { amount: number }) {
-    const charge = await ctx.call(chargeCard, { amount: order.amount });
+    const charge = await ctx.remote(chargeCard, { amount: order.amount });
     return charge.chargeId;
   }
 }

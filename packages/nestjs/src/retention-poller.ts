@@ -12,6 +12,7 @@ import {
   type OnModuleDestroy,
 } from '@nestjs/common';
 import type { DurableModuleOptions, DurableRetentionOptions } from './durable.module';
+import { isDrivingOperator } from './role';
 
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
 const DEFAULT_BATCH_SIZE = 1_000;
@@ -67,17 +68,28 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
   private sweeping = false;
 
   constructor(
-    @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore,
+    @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
   ) {}
 
+  /** Non-null once past the `isDrivingOperator` guard (which requires `options.store` to be set). */
+  private requireStore(): StateStore {
+    if (!this.store) {
+      throw new Error(
+        'unreachable: STATE_STORE_CANONICAL must resolve a store when options.store is set',
+      );
+    }
+    return this.store;
+  }
+
   async onApplicationBootstrap(): Promise<void> {
-    // Only workers prune — a dashboard/dispatch-only instance must not delete history.
-    if (this.options.worker === false) return;
+    // Only a DRIVING operator prunes — a dashboard/dispatch-only instance, or a thin worker with no
+    // `store` at all, must not delete history.
+    if (!isDrivingOperator(this.options)) return;
     const retention = this.options.retention;
     if (!retention || retention.policies.length === 0) return;
     validateRetention(retention);
-    if (typeof this.store.pruneTerminalRuns !== 'function') {
+    if (typeof this.requireStore().pruneTerminalRuns !== 'function') {
       console.warn(
         '[nestjs-durable] `retention` is configured but the store adapter does not implement pruneTerminalRuns; retention is disabled.',
       );
@@ -101,7 +113,8 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
   private async sweep(): Promise<void> {
     if (this.sweeping) return; // never overlap two sweeps on this instance
     const retention = this.options.retention;
-    const prune = this.store.pruneTerminalRuns;
+    const store = this.requireStore();
+    const prune = store.pruneTerminalRuns;
     if (!retention || typeof prune !== 'function') return;
     this.sweeping = true;
     try {
@@ -109,7 +122,7 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
       const now = Date.now();
       for (const policy of retention.policies) {
         for (let batch = 0; batch < MAX_BATCHES_PER_POLICY; batch++) {
-          const deleted = await prune.call(this.store, policy, now, batchSize);
+          const deleted = await prune.call(store, policy, now, batchSize);
           if (deleted < batchSize) break; // backlog drained for this policy
         }
       }

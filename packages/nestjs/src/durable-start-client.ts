@@ -7,16 +7,16 @@ import {
   workflowName,
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
-import type { DurableWorkerModuleOptions } from './durable-worker.module';
+import type { DurableModuleOptions } from './durable.module';
 
 /**
  * The **store-less `engine.start` facade** for a tenant worker. Provided under the `WorkflowEngine`
- * DI token by {@link DurableWorkerModule}, so tenant code calls `engine.start(...)` UNCHANGED — it
- * has no idea it is a tenant. Instead of touching a DB, `start` publishes a `StartRunMessage` on the
- * SHARED `durable-start-run` queue (Option B: tenant rides as message DATA, never as wire
- * segmentation). The operator (control plane, `namespace: undefined`) consumes it, stamps the run's
- * namespace from `tenant`, and routes the run's task to `<workflow>@<tenant>` — the group THIS
- * tenant's worker serves.
+ * DI token by {@link import('./durable.module').DurableModule} (`forRoot({ connection })`, no
+ * `store`), so tenant code calls `engine.start(...)` UNCHANGED — it has no idea it is a tenant.
+ * Instead of touching a DB, `start` publishes a `StartRunMessage` on the SHARED `durable-start-run`
+ * queue (Option B: tenant rides as message DATA, never as wire segmentation). The operator (control
+ * plane, `namespace: undefined`) consumes it, stamps the run's namespace from `tenant`, and routes
+ * the run's task to `<workflow>@<tenant>` — the partition THIS tenant's worker serves.
  *
  * `cancel`/`deleteRun` need the store/driver a tenant does not have; they throw. No wire message
  * exists for them (the operator owns cancellation/retention).
@@ -26,10 +26,10 @@ export class DurableStartClient {
   private readonly tenant: string;
 
   constructor(
-    private readonly options: DurableWorkerModuleOptions,
+    private readonly options: DurableModuleOptions,
     private readonly deps?: StartRunDeps,
   ) {
-    this.tenant = options.tenant ?? 'default';
+    this.tenant = options.partition ?? 'default';
   }
 
   start<C extends WorkflowClass>(
