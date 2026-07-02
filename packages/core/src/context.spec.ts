@@ -144,13 +144,10 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
     expect(dispatched[0]?.context).toEqual({ tenantId: 't2', userRef: { type: 'User', id: 2 } });
   });
 
-  // NOTE (single ctx.step surface sweep, see docs/superpowers/plans/2026-07-02-durable-single-step.md):
-  // this test exercised the in-memory `timeoutMs` heartbeat dispatch site (`callRemoteInMemory`) via
-  // `RemoteStepDef.timeoutMs`. The new `ctx.step(name, input, opts?)` has no way to set `timeoutMs`
-  // per call (`StepDispatchOpts` = queue/priority/fairnessKey/transport only — see heartbeat.spec.ts
-  // for the full writeup), so that dispatch site is currently unreachable from any authoring surface.
-  // Skipped rather than deleted — the engine code (`callRemoteInMemory`) is still live, just orphaned.
-  it.skip('attaches context on the in-memory heartbeat path (remote step with `timeoutMs`, engine.ts ~2002) — orphaned: no authoring surface sets timeoutMs anymore', async () => {
+  // `ctx.step(name, input, opts?)` sets `timeoutMs` per call via `StepDispatchOpts` (see
+  // heartbeat.spec.ts / remote-retry.spec.ts for the full writeup), routing this call through the
+  // in-memory heartbeat dispatch site (`callRemoteInMemory`, engine.ts).
+  it('attaches context on the in-memory heartbeat path (remote step with `timeoutMs`, engine.ts ~2002)', async () => {
     const store = new InMemoryStateStore();
     const dispatched: RemoteTask[] = [];
     const engine = new WorkflowEngine({
@@ -161,7 +158,7 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
     // A `timeoutMs` step is awaited in-memory (callRemoteInMemory) with a heartbeat window, not via
     // the durable suspend path — a third, distinct dispatch site.
     engine.register('wf', '1', async (ctx) => {
-      await ctx.step(PING_STEP_NAME, {});
+      await ctx.step(PING_STEP_NAME, {}, { timeoutMs: 5000 });
       return 'x';
     });
 

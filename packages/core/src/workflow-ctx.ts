@@ -29,12 +29,38 @@ import type {
 } from './interfaces';
 import { breakpointToken } from './protocol';
 import { createStepLogger } from './step-logger';
-import { type StepRef, stepNameOf } from './step-name-symbol';
+import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol';
 import { type WorkflowRef, workflowName } from './workflow-ref';
 
 /** Normalize the `ctx.child`/`ctx.startChild` 3rd arg: a bare string is shorthand for `{ childId }`. */
 function normalizeChildOptions(options?: string | ChildCallOptions): ChildCallOptions {
   return typeof options === 'string' ? { childId: options } : (options ?? {});
+}
+
+/**
+ * Merge a `@Step`-declared {@link StepConfig} with a per-call {@link StepDispatchOpts} override into
+ * the dispatch-relevant `StepOptions` subset of a {@link StepDef} (`retries`/`backoff`/`backoffMs`/
+ * `backoffMaxMs`/`jitter`/`timeoutMs`), `opts` winning field-by-field. Omits every field neither side
+ * set — required under `exactOptionalPropertyTypes` (an explicit `undefined` value is a type error).
+ */
+function resolveStepPolicy(
+  config: StepConfig | undefined,
+  opts: StepDispatchOpts | undefined,
+): StepOptions {
+  const policy: StepOptions = {};
+  const retries = opts?.retries ?? config?.retries;
+  if (retries !== undefined) policy.retries = retries;
+  const backoff = opts?.backoff ?? config?.backoff;
+  if (backoff !== undefined) policy.backoff = backoff;
+  const backoffMs = opts?.backoffMs ?? config?.backoffMs;
+  if (backoffMs !== undefined) policy.backoffMs = backoffMs;
+  const backoffMaxMs = opts?.backoffMaxMs ?? config?.backoffMaxMs;
+  if (backoffMaxMs !== undefined) policy.backoffMaxMs = backoffMaxMs;
+  const jitter = opts?.jitter ?? config?.jitter;
+  if (jitter !== undefined) policy.jitter = jitter;
+  const timeoutMs = opts?.timeoutMs ?? config?.timeoutMs;
+  if (timeoutMs !== undefined) policy.timeoutMs = timeoutMs;
+  return policy;
 }
 
 /** A saga undo registered by a completed step, kept with its step name for visibility on failure. */
@@ -705,8 +731,13 @@ export function createWorkflowCtx(
   // ONE durable step primitive: always dispatched, always engine-scheduled — no local/remote
   // placement choice for the workflow author (see `WorkflowCtx.step`). Resolve the routing name off
   // a `@Step`-stamped handler reference, or take it literally for the cross-runtime string form; the
-  // reference itself is NEVER invoked here — only its stamped name is read (the serving worker
-  // re-resolves the real handler from DI), so an unbound `this` on `handlerOrName` is irrelevant.
+  // reference itself is NEVER invoked here — only its stamped name (and dispatch policy) is read (the
+  // serving worker re-resolves the real handler from DI), so an unbound `this` on `handlerOrName` is
+  // irrelevant. The effective durable-retry/liveness policy is `{ ...stepConfigOf(handlerOrName),
+  // ...opts }` — the `@Step`-declared def-level policy, with a per-call `opts` field winning wherever
+  // it's set. The string form has no stamped config, so it uses `opts` only. Carrying this policy onto
+  // the `StepDef` re-enables `callRemote`'s durable retry/backoff and liveness-timeout branches (see
+  // `engine.ts`), which were otherwise orphaned.
   function step<TInput, TOutput>(
     handlerOrName: StepRef<TInput, TOutput> | string,
     input: TInput,
@@ -718,7 +749,8 @@ export function createWorkflowCtx(
         'ctx.step: handler is not a @Step reference (no stamped step name) — pass a @Step-decorated method or a step name string',
       );
     }
-    const def: StepDef<TInput, TOutput> = { name };
+    const config = typeof handlerOrName === 'string' ? undefined : stepConfigOf(handlerOrName);
+    const def: StepDef<TInput, TOutput> = { name, ...resolveStepPolicy(config, opts) };
     return host.callRemote(runId, pos.next(), def, input, opts?.queue, opts?.transport, {
       priority: opts?.priority,
       fairnessKey: opts?.fairnessKey,

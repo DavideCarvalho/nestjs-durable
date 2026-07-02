@@ -1,6 +1,8 @@
 import {
+  DURABLE_STEP_CONFIG,
   DURABLE_STEP_NAME,
   type SingletonConfig,
+  type StepConfig,
   type StepError,
   WORKFLOW_NAME_KEY,
   type WorkflowRef,
@@ -142,7 +144,10 @@ export interface DurableStepMeta {
   output?: z.ZodType | undefined;
 }
 
-/** `@Step({ name?, input?, output? })` — the object call form. See {@link Step}. */
+/**
+ * `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?,
+ * timeoutMs? })` — the object call form. See {@link Step}.
+ */
 export interface StepOptions {
   /** Explicit routing name, overriding the derived `Class.method`. */
   name?: string;
@@ -150,6 +155,42 @@ export interface StepOptions {
   input?: z.ZodType;
   /** Runtime output schema, validated before the result is returned (opt-in). */
   output?: z.ZodType;
+  /**
+   * Def-level durable-dispatch policy stamped under `DURABLE_STEP_CONFIG` and read by `ctx.step` at
+   * the dispatch boundary (see `stepConfigOf`) — a per-call `ctx.step(ref, input, opts)` overrides
+   * these field-by-field. Max attempts before the step (and run) fails.
+   */
+  retries?: number;
+  /** How the delay between retries grows: `fixed` (constant) or `exp` (doubles each attempt). */
+  backoff?: 'fixed' | 'exp';
+  /** Base delay in ms between retries. Omit (or 0) to retry with no delay. */
+  backoffMs?: number;
+  /** Upper bound on the (exponential) backoff delay. */
+  backoffMaxMs?: number;
+  /** Add random jitter (50–100% of the computed delay) to avoid thundering-herd retries. */
+  jitter?: boolean;
+  /**
+   * Liveness window for a dispatched step: no result/heartbeat within this many ms presumes the
+   * worker dead and fails the dispatch with a `RemoteStepTimeout` (retryable — re-dispatches per
+   * `retries`). Omit to wait indefinitely.
+   */
+  timeoutMs?: number;
+}
+
+/** Build the {@link StepConfig} to stamp under `DURABLE_STEP_CONFIG` from `@Step` options — omitting
+ *  every unset field, so a bare `@Step()` (or one with only `name`/`input`/`output`) stamps `undefined`
+ *  and leaves `ctx.step` reading nothing but a per-call `opts` override. */
+function stepConfigFrom(options: StepOptions): StepConfig | undefined {
+  const config: StepConfig = {
+    retries: options.retries,
+    backoff: options.backoff,
+    backoffMs: options.backoffMs,
+    backoffMaxMs: options.backoffMaxMs,
+    jitter: options.jitter,
+    timeoutMs: options.timeoutMs,
+  };
+  const hasAnyField = Object.values(config).some((value) => value !== undefined);
+  return hasAnyField ? config : undefined;
 }
 
 /**
@@ -166,10 +207,15 @@ export interface StepOptions {
  *   (e.g. `ExtractionService.runExtractionPage`) — refactor-safe, no magic string.
  * - `@Step('custom:name')` — explicit name override (stable across refactors, or a cross-runtime
  *   contract with a non-JS worker that has no `@Step` of its own).
- * - `@Step({ name?, input?, output? })` — optional name override plus opt-in RUNTIME zod schemas.
- *   `input` validates before the method runs; `output` validates its return value before it's handed
- *   back (see `scanSteps`). A bare `@Step()` carries neither and skips validation — compile-time
- *   types from the method signature are the only check.
+ * - `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?,
+ *   timeoutMs? })` — optional name override, opt-in RUNTIME zod schemas, and a def-level
+ *   durable-retry/liveness-timeout policy. `input` validates before the method runs; `output`
+ *   validates its return value before it's handed back (see `scanSteps`). `retries`/`backoff`/
+ *   `backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` are the policy `ctx.step` reads off this method
+ *   reference (via `stepConfigOf`) to build the dispatched `StepDef`'s durable retry/backoff and
+ *   remote-liveness timeout — a per-call `ctx.step(ref, input, opts)` overrides them field-by-field.
+ *   A bare `@Step()` carries none of this and skips validation/retry/timeout — compile-time types
+ *   from the method signature are the only check, and the step dispatches with no retry/timeout.
  */
 export function Step(nameOrOptions?: string | StepOptions): MethodDecorator {
   return (target, propertyKey, descriptor: PropertyDescriptor) => {
@@ -187,6 +233,13 @@ export function Step(nameOrOptions?: string | StepOptions): MethodDecorator {
     // separately-declared def. `DURABLE_STEP_NAME` is core's `Symbol.for`-keyed constant, so a
     // duplicate copy of core still reads back the same key (see `step-name-symbol.ts`).
     (descriptor.value as { [DURABLE_STEP_NAME]?: string })[DURABLE_STEP_NAME] = derivedName;
+    // Stamp the def-level dispatch policy (retries/backoff/timeoutMs) core's `ctx.step` reads via
+    // `stepConfigOf`, under the same `Symbol.for`-keyed contract as `DURABLE_STEP_NAME`. Omitted
+    // entirely when no policy field is set, so a bare `@Step()` stamps nothing extra.
+    const config = stepConfigFrom(options);
+    if (config !== undefined) {
+      (descriptor.value as { [DURABLE_STEP_CONFIG]?: StepConfig })[DURABLE_STEP_CONFIG] = config;
+    }
     return descriptor;
   };
 }

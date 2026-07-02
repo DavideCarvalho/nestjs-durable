@@ -7,21 +7,11 @@ const flush = async () => {
   for (let i = 0; i < 5; i += 1) await new Promise((r) => setImmediate(r));
 };
 
-// NOTE (single ctx.step surface sweep, see docs/superpowers/plans/2026-07-02-durable-single-step.md):
-// this whole file exercised the DURABLE retry/backoff branch of `callRemote`
-// (`step.retries`/`backoffDelay(existing.attempts, step)` in `engine.ts`), driven by
-// `RemoteStepDef({ retries, backoffMs })` + `ctx.remote(def, input)`. The new
-// `ctx.step(handlerOrName, input, opts?)` only threads `StepDispatchOpts = { queue, priority,
-// fairnessKey, transport }` into the `StepDef` it builds (`{ name }` only — see `workflow-ctx.ts`
-// `step()`), and the cross-runtime `kind:'call'` wire command never carried `retries`/`backoffMs`
-// either (checked `engine.ts` `applyCommands` — only `name`/`group`/`input`/`parallelGroup`). So
-// per-call retry/backoff configuration is UNREACHABLE from any current authoring surface, though the
-// engine-side retry machinery (`callRemote`'s `existing.status === 'failed'` branch, `backoffDelay`)
-// is still live code. Skipped rather than deleted — flagging for the plan owner: either give a
-// dispatched step a way to opt into durable retry/backoff again (e.g. `@Step({ retries, backoffMs })`
-// read at the dispatch boundary, mirroring how `input`/`output` zod schemas attach), or this is now
-// dead code worth removing.
-describe.skip('durable remote step — retry with backoff — orphaned: no authoring surface sets retries/backoffMs anymore', () => {
+// Per-call retry/backoff configuration is threaded through the 3rd `ctx.step(name, input, opts)`
+// argument (`StepDispatchOpts.retries`/`backoffMs` — see `interfaces.ts`) into the `StepDef`
+// `ctx.step` builds (`workflow-ctx.ts` `step()`), re-enabling the engine-side retry machinery
+// (`callRemote`'s `existing.status === 'failed'` branch, `backoffDelay`).
+describe('durable remote step — retry with backoff', () => {
   it('re-dispatches a failed durable step up to `retries`, spacing attempts by the backoff', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
@@ -36,7 +26,8 @@ describe.skip('durable remote step — retry with backoff — orphaned: no autho
     engine.register(
       'wf',
       '1',
-      async (ctx) => (await ctx.step<{ ok: boolean }>('ext.flaky', {})).ok,
+      async (ctx) =>
+        (await ctx.step<{ ok: boolean }>('ext.flaky', {}, { retries: 3, backoffMs: 100 })).ok,
     );
 
     await engine.start('wf', {}, 'r1');
@@ -69,7 +60,7 @@ describe.skip('durable remote step — retry with backoff — orphaned: no autho
       throw err;
     });
     const engine = new WorkflowEngine({ store, transport });
-    engine.register('wf', '1', async (ctx) => ctx.step('ext.declined', {}));
+    engine.register('wf', '1', async (ctx) => ctx.step('ext.declined', {}, { retries: 5 }));
 
     await engine.start('wf', {}, 'r1');
     await flush();

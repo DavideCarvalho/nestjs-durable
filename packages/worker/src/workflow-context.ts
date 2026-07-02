@@ -219,6 +219,18 @@ export class WorkflowContext implements WorkflowCtx {
    *
    * The decision's `group` field carries the WORKFLOW's own partition (or `''`) — see
    * {@link resolveCallGroup}; there is no per-call partition override in this surface.
+   *
+   * **WARNING — retries/backoff/timeoutMs are accepted but NOT wire-expressible here.** `opts` also
+   * carries `retries`/`backoff`/`backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` (and a `@Step`-stamped
+   * `handler` may carry the same policy via `stepConfigOf`) for `WorkflowCtx` type conformance with
+   * the engine's in-process `ctx.step` (see `workflow-ctx.ts`), which threads them into the dispatched
+   * `StepDef` and re-enables `callRemote`'s durable retry/backoff and liveness-timeout branches. The
+   * `call` decision this thin worker emits has never carried that policy (`name`/`group`/`input`/
+   * `parallelGroup` only, unchanged across this rename) — the cross-SDK decision shape is frozen, and
+   * this dispatch site's retry/timeout policy is silently NOT applied. A portable workflow body that
+   * depends on durable retry/backoff or a remote-liveness `timeoutMs` MUST run in-process on the
+   * engine instead — the same rule {@link localStep} already documents for `options.retries`/
+   * `options.backoff`/`options.compensate`.
    */
   async step<TInput, TOutput>(
     handler: StepRef<TInput, TOutput>,

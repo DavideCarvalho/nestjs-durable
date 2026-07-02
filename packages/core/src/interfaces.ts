@@ -1031,7 +1031,14 @@ export interface DurableWebhook<TPayload = unknown> {
   wait(): Promise<TPayload>;
 }
 
-/** Options for a dispatched {@link WorkflowCtx.step} call. */
+/**
+ * Options for a dispatched {@link WorkflowCtx.step} call. `retries`/`backoff`/`backoffMs`/
+ * `backoffMaxMs`/`jitter`/`timeoutMs` are a PER-CALL override of the `@Step`-declared
+ * {@link StepConfig} (see `stepConfigOf`) — the effective policy `ctx.step` builds into the dispatched
+ * {@link StepDef} is `{ ...stepConfigOf(ref), ...opts }`, so a call-site value wins field-by-field. The
+ * string (cross-runtime) form of `ctx.step` has no stamped `@Step` to read, so it uses these fields
+ * as-is.
+ */
 export interface StepDispatchOpts {
   /** Subject the dispatch to a registered flow-control queue (concurrency / rate limit). */
   queue?: string;
@@ -1045,6 +1052,23 @@ export interface StepDispatchOpts {
   /** Pin the dispatch to a named transport in the pool (else the pool's first, with failover to the
    *  rest). See `engine.registerQueue` / the engine's `transports` option. */
   transport?: string;
+  /** Max attempts before the step (and run) fails. Overrides the `@Step`-declared value. */
+  retries?: number;
+  /** How the delay between retries grows: `fixed` (constant) or `exp` (doubles each attempt).
+   *  Overrides the `@Step`-declared value. */
+  backoff?: BackoffStrategy;
+  /** Base delay in ms between retries. Omit (or 0) to retry with no delay. Overrides the
+   *  `@Step`-declared value. */
+  backoffMs?: number;
+  /** Upper bound on the (exponential) backoff delay. Overrides the `@Step`-declared value. */
+  backoffMaxMs?: number;
+  /** Add random jitter (50–100% of the computed delay) to avoid thundering-herd retries. Overrides
+   *  the `@Step`-declared value. */
+  jitter?: boolean;
+  /** Liveness window for this dispatched step: no result/heartbeat within this many ms presumes the
+   *  worker dead and fails the dispatch with a `RemoteStepTimeout` (retryable — re-dispatches per
+   *  `retries`). Omit to wait indefinitely. Overrides the `@Step`-declared value. */
+  timeoutMs?: number;
 }
 
 /**

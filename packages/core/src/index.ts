@@ -14,7 +14,14 @@ export * from './events';
 export * from './metrics';
 export * from './scheduler';
 export { createStepLogger } from './step-logger';
-export { DURABLE_STEP_NAME, type StepRef, stepNameOf } from './step-name-symbol';
+export {
+  DURABLE_STEP_CONFIG,
+  DURABLE_STEP_NAME,
+  type StepConfig,
+  type StepRef,
+  stepConfigOf,
+  stepNameOf,
+} from './step-name-symbol';
 export * from './search-attributes';
 export * from './tenant-group';
 export * from './tokens';

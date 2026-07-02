@@ -1,8 +1,11 @@
 import 'reflect-metadata';
 import {
+  DURABLE_STEP_CONFIG,
   DURABLE_STEP_NAME,
   InMemoryStateStore,
+  type StepConfig,
   type WorkflowCtx,
+  stepConfigOf,
 } from '@dudousxd/nestjs-durable-core';
 import { EventEmitterTransport } from '@dudousxd/nestjs-durable-transport-event-emitter';
 import { Injectable } from '@nestjs/common';
@@ -105,6 +108,48 @@ describe('@Step({ name?, input?, output? }) — object form', () => {
     const meta = getDurableStepMeta(Svc.prototype.noop);
     expect(meta?.input).toBeUndefined();
     expect(meta?.output).toBeUndefined();
+  });
+});
+
+describe('@Step({ retries, backoff, backoffMs, backoffMaxMs, jitter, timeoutMs }) — dispatch policy', () => {
+  it('stamps the policy under DURABLE_STEP_CONFIG, readable via stepConfigOf', () => {
+    class Svc {
+      @Step({ retries: 3, backoff: 'exp', backoffMs: 100, backoffMaxMs: 5000, timeoutMs: 30_000 })
+      charge(_input: unknown) {
+        return null;
+      }
+    }
+
+    const config = stepConfigOf(Svc.prototype.charge);
+    expect(config).toEqual({
+      retries: 3,
+      backoff: 'exp',
+      backoffMs: 100,
+      backoffMaxMs: 5000,
+      timeoutMs: 30_000,
+    });
+    const stamped = (Svc.prototype.charge as { [DURABLE_STEP_CONFIG]?: StepConfig })[
+      DURABLE_STEP_CONFIG
+    ];
+    expect(stamped).toEqual(config);
+  });
+
+  it('a bare @Step() or @Step({ name/input/output only }) stamps no policy at all', () => {
+    class Bare {
+      @Step()
+      noop(_input: unknown) {
+        return null;
+      }
+    }
+    class NameOnly {
+      @Step({ name: 'custom' })
+      noop(_input: unknown) {
+        return null;
+      }
+    }
+
+    expect(stepConfigOf(Bare.prototype.noop)).toBeUndefined();
+    expect(stepConfigOf(NameOnly.prototype.noop)).toBeUndefined();
   });
 });
 
