@@ -472,6 +472,46 @@ export interface StartRunMessage {
   searchAttributes?: SearchAttributes | undefined;
 }
 
+/**
+ * A tenant worker → control plane read/control request over the shared transport. Enqueued on
+ * `<effectivePrefix>-run-request`; the control plane's `onRunRequest` consumer answers it, scoped to
+ * `tenant`, and publishes a {@link RunReply} on `<effectivePrefix>-run-reply` correlated by `requestId`.
+ */
+export interface RunRequest {
+  /** Correlation id minted by the tenant; the matching {@link RunReply} carries it back. */
+  requestId: string;
+  /** The requesting tenant — the operator scopes the run's namespace to this. */
+  tenant: string;
+  body: RunRequestKind;
+}
+
+/** The discriminated verb + args of a {@link RunRequest}. Mirrors the tenant-facing `RunGateway`. */
+export type RunRequestKind =
+  | { kind: 'getRunDetail'; runId: string }
+  | { kind: 'listRuns'; query: RunQuery }
+  | { kind: 'cancel'; runId: string }
+  | { kind: 'retry'; runId: string }
+  | { kind: 'continue'; runId: string }
+  | { kind: 'retryWithInput'; runId: string; input: unknown };
+
+/** The control plane's answer to a {@link RunRequest}, correlated by `requestId`. */
+export interface RunReply {
+  requestId: string;
+  result: RunReplyResult;
+}
+
+/** Success carries the verb's payload (JSON-serialised); failure carries a re-throwable error. */
+export type RunReplyResult =
+  | { ok: true; data: unknown }
+  | { ok: false; error: { message: string; code?: string } };
+
+/** A lifecycle event re-published to a single tenant's channel (`<effectivePrefix>-tenant-events-<tenant>`)
+ *  so a store-less tenant can live-tail ITS OWN runs. Scoped by the run's namespace at publish time. */
+export interface TenantEvent {
+  tenant: string;
+  event: EngineEvent;
+}
+
 /** A unit of work dispatched to a remote worker. This is the documented wire payload. */
 export interface RemoteTask {
   runId: string;
@@ -780,6 +820,23 @@ export interface Transport {
    * {@link dispatchStartRun}. Optional — only control-plane-side transports implement this.
    */
   onStartRun?(handler: (msg: StartRunMessage) => Promise<void>): void;
+  /**
+   * Tenant worker → control plane: publish a {@link RunRequest} (read/control) on
+   * `<effectivePrefix>-run-request`. Optional — only broker transports carry it.
+   */
+  dispatchRunRequest?(msg: RunRequest): Promise<void>;
+  /** control plane ← tenant worker: consume {@link RunRequest}s. Pair with {@link dispatchRunRequest}. */
+  onRunRequest?(handler: (msg: RunRequest) => Promise<void>): void;
+  /** control plane → tenant worker: publish a correlated {@link RunReply} on `<effectivePrefix>-run-reply`
+   *  (pub/sub; every tenant subscribes and filters by `requestId`). */
+  publishRunReply?(reply: RunReply): Promise<void>;
+  /** tenant worker ← control plane: consume {@link RunReply}s (filter by `requestId` client-side). */
+  onRunReply?(handler: (reply: RunReply) => void): void;
+  /** control plane → tenant worker: re-publish a lifecycle {@link TenantEvent} on the run's per-tenant
+   *  channel `<effectivePrefix>-tenant-events-<tenant>`. */
+  publishTenantEvent?(evt: TenantEvent): Promise<void>;
+  /** tenant worker ← control plane: subscribe to THIS tenant's event channel. Returns an unsubscribe fn. */
+  onTenantEvent?(tenant: string, handler: (evt: TenantEvent) => void): () => void;
 }
 
 /** How a worker decides its concurrency, carried in {@link WorkerStatus} so a dashboard can tell a
