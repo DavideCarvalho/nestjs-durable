@@ -65,7 +65,15 @@ export class ProxyRunGateway implements RunGateway {
         );
       }, this.timeoutMs);
       this.pending.set(requestId, { resolve, reject, timer });
-      void this.transport.dispatchRunRequest?.({ requestId, tenant: this.tenant, body });
+      this.transport
+        .dispatchRunRequest?.({ requestId, tenant: this.tenant, body })
+        .catch((error: unknown) => {
+          const stillPending = this.pending.get(requestId);
+          if (!stillPending) return;
+          clearTimeout(stillPending.timer);
+          this.pending.delete(requestId);
+          stillPending.reject(error instanceof Error ? error : new Error(String(error)));
+        });
     });
   }
 

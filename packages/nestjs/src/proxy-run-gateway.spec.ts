@@ -60,6 +60,20 @@ describe('ProxyRunGateway', () => {
     vi.useRealTimers();
   });
 
+  it('rejects immediately with the dispatch error when dispatchRunRequest rejects, without waiting for the timeout', async () => {
+    const tx = fakeTransport();
+    tx.dispatchRunRequest = async (msg) => {
+      tx.requests.push(msg);
+      throw new Error('broker down');
+    };
+    const gw = new ProxyRunGateway(tx, 'acme', 5000);
+    const p = gw.cancel('r1');
+    await expect(p).rejects.toThrow(/broker down/);
+    const requestId = tx.requests[0].requestId;
+    // reply for the already-settled request must be a silent no-op, not a double-settle
+    tx.emitReply({ requestId, result: { ok: true, data: { should: 'be-ignored' } } });
+  });
+
   it("routes only this run's tenant events to subscribe", () => {
     const tx = fakeTransport();
     const gw = new ProxyRunGateway(tx, 'acme', 5000);
