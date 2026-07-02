@@ -677,6 +677,18 @@ export function createWorkflowCtx(
     );
   };
 
+  // Dispatch a typed remote step and await its checkpointed result. `call` is a deprecated alias
+  // bound to this SAME closure — both keys below reference it, so there is exactly one dispatch path.
+  const remote = <TInput, TOutput>(
+    step: RemoteStepDef<TInput, TOutput>,
+    input: TInput,
+    opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
+  ): Promise<TOutput> =>
+    host.callRemote(runId, pos.next(), step, input, opts?.queue, opts?.transport, {
+      priority: opts?.priority,
+      fairnessKey: opts?.fairnessKey,
+    });
+
   return {
     runId,
     step,
@@ -701,10 +713,7 @@ export function createWorkflowCtx(
     now,
     random,
     uuid,
-    call: (remote, input, opts) =>
-      host.callRemote(runId, pos.next(), remote, input, opts?.queue, opts?.transport, {
-        priority: opts?.priority,
-        fairnessKey: opts?.fairnessKey,
-      }),
+    remote,
+    call: remote,
   };
 }

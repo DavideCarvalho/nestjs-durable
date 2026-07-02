@@ -1073,6 +1073,15 @@ export interface WorkflowCtx {
    * - `transport` — pin the dispatch to a named transport in the pool (else the pool's first, with
    *   failover to the rest). See `engine.registerQueue` / the engine's `transports` option.
    */
+  remote<TInput, TOutput>(
+    step: RemoteStepDef<TInput, TOutput>,
+    input: TInput,
+    opts?: { queue?: string; priority?: number; fairnessKey?: string; transport?: string },
+  ): Promise<TOutput>;
+  /**
+   * @deprecated Use `ctx.remote` instead. `call` is a back-compat alias of {@link WorkflowCtx.remote}
+   * and dispatches identically. Removed in a future major.
+   */
   call<TInput, TOutput>(
     step: RemoteStepDef<TInput, TOutput>,
     input: TInput,
