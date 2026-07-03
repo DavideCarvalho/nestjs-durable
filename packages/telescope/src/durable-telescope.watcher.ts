@@ -23,6 +23,12 @@ export class DurableTelescopeWatcher implements Watcher {
 
   register(ctx: WatcherContext): void {
     const engine = ctx.moduleRef.get(WorkflowEngine, { strict: false });
+    // A store-less thin-worker / tenant deployment (e.g. a local `DURABLE_TENANT=…` dev stack) binds
+    // the `WorkflowEngine` token to a start-only `DurableStartClient` facade — it proxies run starts
+    // over the transport and has NO local lifecycle event stream (those events live on the operator
+    // that holds the store). There's nothing local to observe, so skip registration gracefully
+    // instead of throwing "engine.subscribe is not a function".
+    if (typeof (engine as Partial<WorkflowEngine>)?.subscribe !== 'function') return;
     const tracer = trace.getTracer('@dudousxd/nestjs-durable-telescope');
 
     engine.subscribe((event) => {

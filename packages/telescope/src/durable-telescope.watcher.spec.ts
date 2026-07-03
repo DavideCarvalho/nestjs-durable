@@ -33,6 +33,17 @@ describe('DurableTelescopeWatcher', () => {
     expect(records[0]?.tags).toContain('run:run1');
   });
 
+  it('skips registration (no throw) when the engine has no subscribe — thin-worker/tenant facade', () => {
+    const records: RecordInput[] = [];
+    // A store-less thin-worker binds WorkflowEngine to a start-only DurableStartClient (no event
+    // stream). moduleRef.get returns that; the watcher must not throw and must record nothing.
+    const startOnlyFacade = { start: async () => ({}) } as unknown as WorkflowEngine;
+    expect(() =>
+      new DurableTelescopeWatcher().register(fakeCtx(startOnlyFacade, records)),
+    ).not.toThrow();
+    expect(records).toEqual([]);
+  });
+
   it('tags failed runs with "failed"', async () => {
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
     const records: RecordInput[] = [];
