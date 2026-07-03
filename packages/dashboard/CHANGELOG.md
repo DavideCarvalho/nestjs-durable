@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.25.0
+
+### Minor Changes
+
+- 45c7d75: Topology-agnostic dashboard: `DashboardService` run views/control/stream now route through the `RUN_GATEWAY` port, so a store-less tenant can mount the same `DurableDashboardModule` the operator uses (backed by `ProxyRunGateway`). `RunGateway.cancel` gains an optional `compensate` opts; `DurableWorkerModule` is now `global` so a globally-mounted dashboard resolves `RUN_GATEWAY` on a tenant. Operator-only operations (metrics, worker health, webhook delivery, live event read, update delivery) require the control plane and throw a clear error on a tenant.
+
 ## 0.24.0
 
 ### Minor Changes
