@@ -109,8 +109,8 @@ export class BufferedSignalEntity {
  * when `namespace` is undefined — the operator (control plane) sees all tenants. Returns a
  * `{ namespace }` equality predicate otherwise, confining the query to that tenant's rows.
  */
-function namespaceFilterCond(args: { namespace?: string }): { namespace?: string } {
-  if (args.namespace === undefined) return {};
+function namespaceFilterCond(args?: { namespace?: string }): { namespace?: string } {
+  if (args?.namespace === undefined) return {};
   return { namespace: args.namespace };
 }
 
@@ -128,6 +128,13 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
         name: 'namespace',
         cond: namespaceFilterCond,
         default: true,
+        // Optional args: the store's own forks set the scope via `setFilterParams` (undefined =
+        // operator, sees all), but an external consumer that shares this ORM (an operator app reading
+        // WorkflowRunEntity through its own EntityManager) never sets it. Without this, MikroORM
+        // throws "No arguments provided for filter 'namespace'" on those queries. `args: false` makes
+        // the param optional — cond then receives `undefined` and no-ops (sees all), which is exactly
+        // the operator view, while a scoped store still passes its namespace through.
+        args: false,
       },
     },
     // Indexes mirror the Prisma adapter so a store swap keeps the same plan. The poller hits these
