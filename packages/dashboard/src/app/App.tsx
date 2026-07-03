@@ -6,11 +6,16 @@ import {
   type RunDisplayStatus,
   type RunStatus,
   type StepCheckpoint,
+  type WorkerStatus,
   type WorkflowRun,
   durableClient,
   runDisplayStatus,
 } from '../client/durable-client';
+import { type PartitionView, groupByPartition } from '../client/group-by-partition';
 import { mergeLiveEvents } from '../client/merge-live-events';
+import { type WorkerView, pivotByWorker } from '../client/pivot-by-worker';
+import { partitionOf } from '../client/queue-partition';
+import { type HealthSummary, summarizeHealth } from '../client/summarize-health';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
@@ -151,86 +156,91 @@ function relAgoMs(atMs: number): string {
 }
 
 /**
- * Per-worker rows for an expanded group: each live worker's concurrency mode + live limit, in-flight
- * saturation, RAM%, throughput, and the adaptive controller's last move. A worker from an older SDK
- * with no `status` still lists (its measured cells read "—"), so a mixed fleet stays visible.
+ * One worker's live snapshot: concurrency mode + live limit, in-flight saturation, RAM/CPU%,
+ * throughput, p95, and the adaptive controller's last move. A worker from an older SDK with no
+ * `status` renders "no status" (a mixed fleet stays visible). Shared by the per-group `WorkerRows`
+ * and the by-pod worker view.
  */
-function WorkerRows({ workers }: { workers: GroupHealth['liveWorkers'] }) {
+function WorkerStatusCells({ status }: { status: WorkerStatus | undefined }) {
+  const c = status?.concurrency;
+  if (!status || !c) {
+    return <span className="mono text-[9px] text-zinc-600">no status</span>;
+  }
+  const saturated = c.limit > 0 && status.inFlight >= c.limit * 0.8;
   return (
-    <div className="flex flex-col divide-y divide-[var(--line-soft)]">
-      {workers.map((w) => {
-        const s = w.status;
-        const c = s?.concurrency;
-        const sat = s && c ? `${s.inFlight}/${c.limit}` : '—';
-        const saturated = !!(s && c && c.limit > 0 && s.inFlight >= c.limit * 0.8);
-        return (
-          <div key={w.instanceId} className="flex flex-col gap-1 px-2.5 py-2">
-            <div className="flex items-center justify-between gap-3">
-              <span className="mono truncate text-[10px] text-zinc-400">{w.instanceId}</span>
-              {c ? (
-                <span
-                  className={`mono shrink-0 rounded border px-1 text-[9px] uppercase tracking-wider ${
-                    c.mode === 'adaptive'
-                      ? 'border-sky-500/40 bg-sky-500/10 text-sky-300'
-                      : 'border-zinc-600/50 bg-zinc-800/60 text-zinc-400'
-                  }`}
-                >
-                  {c.mode === 'adaptive' ? `adaptive ${c.min ?? 1}–${c.max ?? 32}` : 'fixed'}
-                </span>
-              ) : (
-                <span className="mono shrink-0 text-[9px] text-zinc-600">no status</span>
-              )}
-            </div>
-            {s && c && (
-              <div className="mono flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-zinc-500">
-                <span className={saturated ? 'text-amber-300' : 'text-zinc-400'}>
-                  in-flight <span className="tnum">{sat}</span>
-                </span>
-                {typeof s.rssPct === 'number' && (
-                  <span className={s.rssPct >= 85 ? 'text-rose-300' : ''}>
-                    ram <span className="tnum">{Math.round(s.rssPct)}%</span>
-                  </span>
-                )}
-                {typeof s.cpuPct === 'number' && (
-                  <span>
-                    cpu <span className="tnum">{Math.round(s.cpuPct)}%</span>
-                  </span>
-                )}
-                {typeof s.throughputPerMin === 'number' && (
-                  <span>
-                    <span className="tnum">{Math.round(s.throughputPerMin)}</span>/min
-                  </span>
-                )}
-                {typeof s.p95Ms === 'number' && (
-                  <span>
-                    p95 <span className="tnum">{Math.round(s.p95Ms)}ms</span>
-                  </span>
-                )}
-              </div>
-            )}
-            {s?.lastAdjust && (
-              <div className="mono text-[10px] text-zinc-500">
-                {s.lastAdjust.reason}{' '}
-                <span className="tnum text-zinc-400">
-                  {s.lastAdjust.from}→{s.lastAdjust.to}
-                </span>{' '}
-                {relAgoMs(s.lastAdjust.at)}
-              </div>
-            )}
-          </div>
-        );
-      })}
+    <div className="flex flex-col gap-1">
+      <div className="mono flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-zinc-500">
+        <span
+          className={`shrink-0 rounded border px-1 text-[9px] uppercase tracking-wider ${
+            c.mode === 'adaptive'
+              ? 'border-sky-500/40 bg-sky-500/10 text-sky-300'
+              : 'border-zinc-600/50 bg-zinc-800/60 text-zinc-400'
+          }`}
+        >
+          {c.mode === 'adaptive' ? `adaptive ${c.min ?? 1}–${c.max ?? 32}` : 'fixed'}
+        </span>
+        <span className={saturated ? 'text-amber-300' : 'text-zinc-400'}>
+          in-flight{' '}
+          <span className="tnum">
+            {status.inFlight}/{c.limit}
+          </span>
+        </span>
+        {typeof status.rssPct === 'number' && (
+          <span className={status.rssPct >= 85 ? 'text-rose-300' : ''}>
+            ram <span className="tnum">{Math.round(status.rssPct)}%</span>
+          </span>
+        )}
+        {typeof status.cpuPct === 'number' && (
+          <span>
+            cpu <span className="tnum">{Math.round(status.cpuPct)}%</span>
+          </span>
+        )}
+        {typeof status.throughputPerMin === 'number' && (
+          <span>
+            <span className="tnum">{Math.round(status.throughputPerMin)}</span>/min
+          </span>
+        )}
+        {typeof status.p95Ms === 'number' && (
+          <span>
+            p95 <span className="tnum">{Math.round(status.p95Ms)}ms</span>
+          </span>
+        )}
+      </div>
+      {status.lastAdjust && (
+        <div className="mono text-[10px] text-zinc-500">
+          {status.lastAdjust.reason}{' '}
+          <span className="tnum text-zinc-400">
+            {status.lastAdjust.from}→{status.lastAdjust.to}
+          </span>{' '}
+          {relAgoMs(status.lastAdjust.at)}
+        </div>
+      )}
     </div>
   );
 }
 
+/** Per-worker rows for an expanded group: each live worker's id + its {@link WorkerStatusCells}. */
+function WorkerRows({ workers }: { workers: GroupHealth['liveWorkers'] }) {
+  return (
+    <div className="flex flex-col divide-y divide-[var(--line-soft)]">
+      {workers.map((w) => (
+        <div key={w.instanceId} className="flex flex-col gap-1 px-2.5 py-2">
+          <span className="mono truncate text-[10px] text-zinc-400">{w.instanceId}</span>
+          <WorkerStatusCells status={w.status} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+type WorkersPanelView = 'workers' | 'partitions' | 'alerts';
+
 /**
- * Per-group worker health, one chip per group: the live-worker count, turning RED when work is
- * queued but no worker is alive to drain it (`depth > 0 && liveWorkers === 0` — the "alive but not
- * consuming" failure). Clicking a chip with live workers expands a per-worker popover showing each
- * worker's adaptive/fixed limit, in-flight saturation, RAM%, throughput and last adjust (from the
- * status the heartbeat now carries). Polls `/workers`; renders nothing when the transport can't
- * report health.
+ * Worker health, three ways (toggle). Route-by-handler makes every `@Step`/`@Workflow` its own queue
+ * and one worker serves many, so a per-queue list is noise — these views collapse it onto the axes
+ * that actually vary: **workers** (each live pod + what it's serving; the default), **partitions**
+ * (the tenant-isolation axis), and **alerts** (only starved queues — `depth > 0` with no worker).
+ * Polls `/workers`; renders nothing when the transport can't report health.
  */
 function WorkersHealth() {
   const { data } = useQuery({
@@ -238,53 +248,193 @@ function WorkersHealth() {
     queryFn: () => durableClient.workers(),
     refetchInterval: 10_000,
   });
-  const [expanded, setExpanded] = useState<string | undefined>(undefined);
+  const [view, setView] = useState<WorkersPanelView>('workers');
   if (!data || data.length === 0) return null;
+  const summary = summarizeHealth(data);
   return (
     <div className="ml-auto flex flex-wrap items-center gap-1.5">
-      {data.map((g) => {
-        const live = g.liveWorkers.length;
-        const starved = g.depth > 0 && live === 0;
-        const open = expanded === g.group;
+      <div className="flex items-center gap-0.5 rounded border border-[var(--line)] bg-zinc-900/60 p-0.5">
+        {(['workers', 'partitions', 'alerts'] as const).map((v) => (
+          <button
+            key={v}
+            type="button"
+            onClick={() => setView(v)}
+            className={`mono rounded px-1.5 py-0.5 text-[10px] ${
+              view === v ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'
+            }`}
+          >
+            {v === 'workers' ? 'pods' : v === 'partitions' ? 'parts' : 'alerts'}
+            {v === 'alerts' && summary.starved.length > 0 && (
+              <span className="tnum ml-1 rounded bg-rose-500/80 px-1 text-[9px] text-white">
+                {summary.starved.length}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+      {view === 'workers' && <WorkersByPod workers={pivotByWorker(data)} />}
+      {view === 'partitions' && <PartitionsHealth groups={data} />}
+      {view === 'alerts' && <StarvationAlerts summary={summary} />}
+    </div>
+  );
+}
+
+/**
+ * Default view: one chip per live worker (pod), with its partition, how many handlers it serves, and
+ * its in-flight load. Clicking expands its full status ({@link WorkerStatusCells}) plus the list of
+ * handlers it's subscribed to.
+ */
+function WorkersByPod({ workers }: { workers: WorkerView[] }) {
+  const [open, setOpen] = useState<string | undefined>(undefined);
+  return (
+    <>
+      {workers.map((w) => {
+        const isOpen = open === w.instanceId;
+        const c = w.status?.concurrency;
+        const load = w.status && c ? `${w.status.inFlight}/${c.limit}` : undefined;
         return (
-          <div key={g.group} className="relative">
+          <div key={w.instanceId} className="relative">
             <button
               type="button"
-              disabled={live === 0}
-              onClick={() => setExpanded(open ? undefined : g.group)}
-              title={`${g.group}: ${live} live worker(s), ${g.depth} queued${starved ? ' — NO worker consuming' : live > 0 ? ' — click for per-worker status' : ''}`}
-              className={`mono flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] ${
-                starved
-                  ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
-                  : open
-                    ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
-                    : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
-              } ${live > 0 ? 'cursor-pointer hover:border-zinc-500' : 'cursor-default'}`}
+              onClick={() => setOpen(isOpen ? undefined : w.instanceId)}
+              title={`${w.instanceId} — ${w.handlers.length} handler(s) on ${w.partition}`}
+              className={`mono flex max-w-[220px] items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] hover:border-zinc-500 ${
+                isOpen
+                  ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
+                  : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
+              }`}
             >
-              <span
-                className={`dot ${starved ? 's-failed' : live > 0 ? 's-completed' : ''}`}
-                aria-hidden
-              />
-              {g.group}
-              <span className="tnum text-zinc-500">
-                {live}w{g.depth > 0 ? ` ${g.depth}q` : ''}
+              <span className={`dot ${w.status ? 's-completed' : ''}`} aria-hidden />
+              <span className="truncate">{w.instanceId}</span>
+              {w.partition !== 'default' && (
+                <span className="shrink-0 text-zinc-500">@{w.partition}</span>
+              )}
+              <span className="tnum shrink-0 text-zinc-500">
+                {w.handlers.length}h{load ? ` · ${load}` : ''}
               </span>
             </button>
-            {open && live > 0 && (
+            {isOpen && (
               <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
-                <div className="mono flex items-center justify-between border-b border-[var(--line)] px-2.5 py-1.5 text-[10px] text-zinc-500">
-                  <span className="text-zinc-300">{g.group}</span>
-                  <span className="tnum">
-                    {live} worker(s) · {g.depth} queued
+                <div className="mono flex items-center justify-between gap-2 border-b border-[var(--line)] px-2.5 py-1.5 text-[10px] text-zinc-500">
+                  <span className="truncate text-zinc-300">{w.instanceId}</span>
+                  <span className="shrink-0">
+                    {w.runtime ?? 'node'} · {w.partition}
                   </span>
                 </div>
-                <WorkerRows workers={g.liveWorkers} />
+                <div className="px-2.5 py-2">
+                  <WorkerStatusCells status={w.status} />
+                </div>
+                <div className="max-h-48 overflow-auto border-t border-[var(--line-soft)] px-2.5 py-1.5">
+                  <div className="mono mb-1 text-[9px] uppercase tracking-wider text-zinc-600">
+                    {w.handlers.length} handlers
+                  </div>
+                  {w.handlers.map((h) => (
+                    <div key={h} className="mono truncate text-[10px] text-zinc-400">
+                      {h}
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>
         );
       })}
-    </div>
+    </>
+  );
+}
+
+/**
+ * Partition view: one chip per tenant-isolation partition (`default` = the operator/control plane),
+ * with its worker count, handler count, and total queue depth — turning RED when any queue in it is
+ * starved. Clicking expands the partition's live workers ({@link WorkerRows}).
+ */
+function PartitionsHealth({ groups }: { groups: GroupHealth[] }) {
+  const [open, setOpen] = useState<string | undefined>(undefined);
+  const partitions = groupByPartition(groups);
+  function workersOf(partition: string): GroupHealth['liveWorkers'] {
+    const seen = new Map<string, GroupHealth['liveWorkers'][number]>();
+    for (const g of groups) {
+      if (partitionOf(g.group) !== partition) continue;
+      for (const w of g.liveWorkers) if (!seen.has(w.instanceId)) seen.set(w.instanceId, w);
+    }
+    return [...seen.values()];
+  }
+  return (
+    <>
+      {partitions.map((p: PartitionView) => {
+        const starved = p.starvedCount > 0;
+        const isOpen = open === p.partition;
+        return (
+          <div key={p.partition} className="relative">
+            <button
+              type="button"
+              disabled={p.workerCount === 0}
+              onClick={() => setOpen(isOpen ? undefined : p.partition)}
+              title={`${p.partition}: ${p.workerCount} worker(s), ${p.handlerCount} handler(s), ${p.totalDepth} queued${starved ? `, ${p.starvedCount} starved` : ''}`}
+              className={`mono flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] ${
+                starved
+                  ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
+                  : isOpen
+                    ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
+                    : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
+              } ${p.workerCount > 0 ? 'cursor-pointer hover:border-zinc-500' : 'cursor-default'}`}
+            >
+              <span
+                className={`dot ${starved ? 's-failed' : p.workerCount > 0 ? 's-completed' : ''}`}
+                aria-hidden
+              />
+              {p.partition}
+              <span className="tnum text-zinc-500">
+                {p.workerCount}w {p.handlerCount}h{p.totalDepth > 0 ? ` ${p.totalDepth}q` : ''}
+                {starved ? ` ${p.starvedCount}!` : ''}
+              </span>
+            </button>
+            {isOpen && p.workerCount > 0 && (
+              <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
+                <div className="mono flex items-center justify-between border-b border-[var(--line)] px-2.5 py-1.5 text-[10px] text-zinc-500">
+                  <span className="text-zinc-300">{p.partition}</span>
+                  <span className="tnum">
+                    {p.workerCount} worker(s) · {p.totalDepth} queued
+                  </span>
+                </div>
+                <WorkerRows workers={workersOf(p.partition)} />
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * Alerts view: the panel's actual purpose distilled — a compact summary plus a red chip for EACH
+ * starved queue (`depth > 0 && liveWorkers === 0`, work with no consumer). Nothing but the summary
+ * when everything is draining.
+ */
+function StarvationAlerts({ summary }: { summary: HealthSummary }) {
+  return (
+    <>
+      <span className="mono tnum text-[10px] text-zinc-500">
+        {summary.queueCount} queues · {summary.workerCount} workers ·{' '}
+        {summary.allDraining ? (
+          <span className="text-emerald-400">all draining</span>
+        ) : (
+          <span className="text-rose-300">{summary.starved.length} starved</span>
+        )}
+      </span>
+      {summary.starved.map((g) => (
+        <span
+          key={g.group}
+          title={`${g.group}: ${g.depth} queued, no worker consuming`}
+          className="mono flex items-center gap-1 rounded border border-rose-500/50 bg-rose-500/15 px-1.5 py-0.5 text-[10px] text-rose-300"
+        >
+          <span className="dot s-failed" aria-hidden />
+          <span className="max-w-[180px] truncate">{g.group}</span>
+          <span className="tnum shrink-0">{g.depth}q · 0w</span>
+        </span>
+      ))}
+    </>
   );
 }
 
