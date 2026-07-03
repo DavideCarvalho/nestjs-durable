@@ -1,8 +1,10 @@
 // Biome (>= 2.0) GritQL plugin: flag non-deterministic sources that corrupt a durable replay.
-// Biome plugins can't scope by decorator/method, so target it at your workflow files via biome.json
-// `overrides` (include "**/*.workflow.ts"). Calls inside a ctx.sideEffect(...) / ctx.task(...)
-// callback are NOT flagged — those bodies run once and are checkpointed, so non-determinism there
-// is replay-safe. In the orchestration body, use ctx.now() / ctx.sideEffect(fn) instead.
+// Scope it to your workflow files via biome.json `plugins` (or an override that includes
+// "**/*.workflow.ts"). Only the `run` method body — the replayed orchestration body — is checked, so
+// co-located @Step / @DeadLetter methods in the SAME file are NOT flagged: an @Step runs once on a
+// worker and is checkpointed, so `new Date()`/`Math.random()` there is replay-safe. Calls inside a
+// ctx.sideEffect(...) / ctx.task(...) callback are likewise skipped — those bodies run once and are
+// checkpointed. In the orchestration body, use ctx.now() / ctx.sideEffect(fn) instead.
 language js
 
 or {
@@ -13,7 +15,10 @@ or {
   `globalThis.crypto.randomUUID()`,
   `new Date()`
 } as $bad where {
-  not $bad <: within `$_.step($...)`,
+  // Only the workflow's `run` body replays; scope the rule to it so co-located @Step/@DeadLetter
+  // methods (their bodies run once, off the replay path) don't trip a false positive.
+  $bad <: within `run($...) { $... }`,
+  not $bad <: within `$_.sideEffect($...)`,
   not $bad <: within `$_.task($...)`,
   register_diagnostic(
     span = $bad,
