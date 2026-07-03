@@ -252,7 +252,7 @@ function WorkersHealth() {
   if (!data || data.length === 0) return null;
   const summary = summarizeHealth(data);
   return (
-    <div className="ml-auto flex flex-wrap items-center gap-1.5">
+    <div className="ml-auto flex flex-nowrap items-center gap-1.5">
       <div className="flex items-center gap-0.5 rounded border border-[var(--line)] bg-zinc-900/60 p-0.5">
         {(['workers', 'partitions', 'alerts'] as const).map((v) => (
           <button
@@ -272,9 +272,14 @@ function WorkersHealth() {
           </button>
         ))}
       </div>
-      {view === 'workers' && <WorkersByPod workers={pivotByWorker(data)} />}
-      {view === 'partitions' && <PartitionsHealth groups={data} />}
-      {view === 'alerts' && <StarvationAlerts summary={summary} />}
+      {/* Fixed-width, right-justified slot: toggling views swaps content inside a stable box, so the
+          header never reflows (no wrap to a 2nd line, no width jump). Overflow stays visible so the
+          per-chip expand popovers still escape downward. */}
+      <div className="flex w-[300px] flex-nowrap items-center justify-end gap-1.5">
+        {view === 'workers' && <WorkersByPod workers={pivotByWorker(data)} />}
+        {view === 'partitions' && <PartitionsHealth groups={data} />}
+        {view === 'alerts' && <StarvationAlerts summary={summary} />}
+      </div>
     </div>
   );
 }
@@ -438,17 +443,40 @@ function StarvationAlerts({ summary }: { summary: HealthSummary }) {
   );
 }
 
+/** Placeholder rows shown while the first `/runs` fetch is in flight, so the pane never flashes
+ *  "No runs yet." before real data lands. Same row footprint as a real run → no layout jump. */
+function RunsListSkeleton() {
+  return (
+    <ul className="divide-y divide-[var(--line-soft)]" aria-hidden>
+      {[0, 1, 2, 3, 4, 5].map((i) => (
+        <li key={i} className="flex flex-col gap-2 px-4 py-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="h-3.5 w-32 animate-pulse rounded bg-zinc-800" />
+            <div className="h-3 w-16 animate-pulse rounded bg-zinc-800/70" />
+          </div>
+          <div className="h-2.5 w-48 animate-pulse rounded bg-zinc-800/50" />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function RunsList({
   runs,
+  loading,
   selected,
   onSelect,
   onSelectTag,
 }: {
   runs: WorkflowRun[];
+  loading?: boolean;
   selected?: string | undefined;
   onSelect: (id?: string) => void;
   onSelectTag: (tag: string) => void;
 }) {
+  if (loading && runs.length === 0) {
+    return <RunsListSkeleton />;
+  }
   if (runs.length === 0) {
     return <div className="p-6 text-sm text-zinc-600">No runs yet.</div>;
   }
@@ -897,7 +925,7 @@ export function App() {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-  const { data: runs = [] } = useQuery({
+  const { data: runs = [], isPending: runsPending } = useQuery({
     queryKey: ['runs', tagFilter, attrPredicates.join('|')],
     queryFn: () =>
       durableClient.runs(
@@ -998,6 +1026,7 @@ export function App() {
             <div className="min-h-0 flex-1 overflow-auto">
               <RunsList
                 runs={shown}
+                loading={runsPending}
                 selected={selected}
                 onSelect={setSelected}
                 onSelectTag={setTagFilter}
