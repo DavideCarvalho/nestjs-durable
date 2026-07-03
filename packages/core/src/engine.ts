@@ -849,7 +849,7 @@ export class WorkflowEngine {
         workflow: name,
         workflowVersion: '1',
         status: 'pending',
-        // Stamp the namespace the REAL run will carry (:893) so convention routing resolves the same
+        // Stamp the namespace the REAL run will carry (below) so convention routing resolves the same
         // tenant-suffixed group the run will dispatch to — an operator starting a tenant's run via the
         // `onStartRun` wire (opts.namespace = tenant) must find the live `<workflow>@<tenant>` group,
         // not the bare group. Without this the start-run entry path can't reach a suffixed-only worker.
@@ -2374,8 +2374,13 @@ export class WorkflowEngine {
           parallelGroup: cmd.parallelGroup,
         });
         if (!(await this.store.getRun(childId))) {
+          // Inherit the parent run's namespace (see ctxHostFor.startChild) so a remote workflow's
+          // child stays on the parent's tenant/partition regardless of which engine executes it.
           queueMicrotask(
-            () => void this.start(cmd.workflow, cmd.input, childId).catch(() => undefined),
+            () =>
+              void this.start(cmd.workflow, cmd.input, childId, {
+                namespace: run.namespace,
+              }).catch(() => undefined),
           );
         }
       } else {
@@ -2468,7 +2473,12 @@ export class WorkflowEngine {
     const snapshot = await this.store.listCheckpoints(run.id);
     const replay = new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
-    const ctx = createWorkflowCtx(this.ctxHostFor(replay), run.id, compensations, run.workflow);
+    const ctx = createWorkflowCtx(
+      this.ctxHostFor(replay, run.namespace),
+      run.id,
+      compensations,
+      run.workflow,
+    );
     try {
       const output = await fn(ctx, run.input);
       // A compensating cancel may have been requested while this turn ran (or re-derived from a
@@ -2570,7 +2580,7 @@ export class WorkflowEngine {
   /** The seam handed to {@link createWorkflowCtx}: the authoring API reaches durability + lifecycle
    *  (checkpointing, dispatch, child start) through this, so the ctx primitives live in their own
    *  module and the engine stays the orchestrator. */
-  private ctxHostFor(replay?: Map<number, StepCheckpoint>): CtxHost {
+  private ctxHostFor(replay?: Map<number, StepCheckpoint>, parentNamespace?: string): CtxHost {
     return {
       store: this.store,
       replay,
@@ -2581,10 +2591,18 @@ export class WorkflowEngine {
       failStep: (s) => this.failStep(s),
       callRemote: (runId, seq, step, input, queue, transport, admission) =>
         this.callRemote(runId, seq, step, input, queue, transport, replay, admission),
-      // Defer so a fast child can't reentrantly resume a still-running parent.
+      // Defer so a fast child can't reentrantly resume a still-running parent. Stamp the child with
+      // the PARENT run's namespace (not this engine's) so a child belongs to the tenant/partition of
+      // the run it was spawned from — even when an operator (namespace: undefined, drives every
+      // namespace) is the one executing the parent. Otherwise an operator recovery-resuming a
+      // `davi-local` pipeline would stamp its `processing` child `default` and it would leak off the
+      // tenant's worker pool onto the shared/dev workers.
       startChild: (workflow, input, id, priority) => {
         queueMicrotask(
-          () => void this.start(workflow, input, id, { priority }).catch(() => undefined),
+          () =>
+            void this.start(workflow, input, id, { priority, namespace: parentNamespace }).catch(
+              () => undefined,
+            ),
         );
       },
       // Shallow-merge into the run's searchAttributes (the ctx primitive makes this exactly-once).
