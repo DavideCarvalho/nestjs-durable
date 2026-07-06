@@ -1,24 +1,28 @@
 ---
 title: Retries & backoff
-description: Local-step retries with fixed/exponential backoff and jitter, FatalError to opt out, the durable remote-step retry path (re-dispatch on a persisted wakeAt), retryable:false worker verdicts, and the in-memory timeoutMs + heartbeat liveness path.
+description: Durable step retries with fixed/exponential backoff and jitter (a failed step re-dispatches on a persisted wakeAt), FatalError and worker-side retryable:false to opt out, and the in-memory timeoutMs + heartbeat liveness path for presumed-dead workers.
 ---
 
 Transient failures are the normal case for anything that crosses a network boundary, so every step is
-retryable. The mechanics differ between a **local** step — work that runs in-process — and a **remote**
-step dispatched to a worker, because the engine can re-run a local function in place but a remote step has
-to survive the worker (and even the orchestrator) disappearing mid-flight.
+retryable. A step is always dispatched to a worker and the engine handles its failures along one
+**durable** retry path: the run suspends between attempts rather than holding a worker (or the
+orchestrator) in memory, so a step survives the worker — and even the orchestrator — disappearing
+mid-flight.
 
-## Local-step retries
+## Retries & backoff
 
-`ctx.step(name, fn, opts?)` runs a unit of work locally and checkpoints its result. If `fn` throws, the
-engine retries it up to `retries` attempts, spacing the attempts with the step's backoff configuration:
+A step's retry policy is declared on its `@Step` handler and applies wherever the step is dispatched. If
+the handler throws, the engine retries it up to `retries` attempts, spacing the attempts with the step's
+backoff configuration:
 
 ```ts
-const quote = await ctx.step(
-  'quote',
-  () => this.pricing.fetch(order),
-  { retries: 5, backoff: 'exp', backoffMs: 200, backoffMaxMs: 10_000, jitter: true },
-);
+@Step({ retries: 5, backoff: 'exp', backoffMs: 200, backoffMaxMs: 10_000, jitter: true })
+async fetchQuote(order: Order): Promise<Quote> {
+  return this.pricing.fetch(order);
+}
+
+// in the workflow — the declared policy applies:
+const quote = await ctx.step(this.pricing.fetchQuote, order);
 ```
 
 The options are:
@@ -31,62 +35,67 @@ The options are:
 - `jitter` — adds random jitter (50–100% of the computed delay) so a fleet of runs retrying the same
   downstream don't synchronize into a thundering herd.
 
+Every one of these is also a per-call override on `ctx.step(handler, input, opts)`: the effective policy is
+the `@Step`-declared one with any `opts` field winning, so a single call site can tighten or relax the
+default without changing the handler.
+
 With `backoff: 'exp'`, `backoffMs: 200` the delays before attempts 2, 3, 4… are 200ms, 400ms, 800ms… until
 they hit `backoffMaxMs`. With `jitter: true` each of those is then scaled to a random point in its top half,
-so two runs that failed at the same instant don't retry in lockstep. The same `backoffDelay` helper backs
-both the local loop and the durable remote-step retry below, so the two stay consistent.
+so two runs that failed at the same instant don't retry in lockstep.
 
 ### FatalError — never retried
 
 Not every failure is worth retrying. A declined card or invalid input will fail the same way on every
-attempt, so burning the retry budget on it just delays the inevitable. Throw a `FatalError` to fail the run
-immediately, regardless of the step's `retries`:
+attempt, so burning the retry budget on it just delays the inevitable. Throw a `FatalError` inside the
+handler to fail the run immediately, regardless of the step's `retries`:
 
 ```ts
 import { FatalError } from '@dudousxd/nestjs-durable-core';
 
-await ctx.step('charge', async () => {
-  const res = await stripe.charge(order);
+@Step()
+async charge(order: Order) {
+  const res = await this.stripe.charge(order);
   if (res.declined) throw new FatalError('card declined', 'declined');
   return res;
-});
+}
 ```
 
 The optional second argument is a machine-readable `code` (here `'declined'`) that ends up on the run's
 structured error. Use `FatalError` for deterministic business verdicts; let ordinary throws (a timeout, a
 502, a dropped connection) flow through the retry path.
 
-## Remote-step retries
+## The durable retry path
 
-A remote step declared with `remoteStep` and invoked with `ctx.remote` runs on a worker — possibly in another
-process or another language. There are **two distinct paths** for handling its failures, chosen by whether
-the step sets `timeoutMs`.
-
-### The durable path (no `timeoutMs`)
-
-This is the default and the recommended one. When you call a remote step that has no `timeoutMs`, the engine
+A step runs on a worker — possibly in another process or another language — so the engine handles its
+failures durably rather than by re-running a function in a loop. When a step has no `timeoutMs`, the engine
 dispatches the task, persists a `pending` checkpoint, and **suspends the run durably** — it is not held in
 memory awaiting the result. Whichever instance receives the worker's result resumes the run, so the worker
 pod (and even the dispatching orchestrator) can scale down or crash mid-step without losing the run or
 re-running completed work.
 
 ```ts
-export const chargeCard = remoteStep({
-  name: 'payments.charge-card',
-  input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
-  output: z.object({ chargeId: z.string() }),
-  retries: 4,
-  backoff: 'exp',
-  backoffMs: 500,
-  backoffMaxMs: 30_000,
-  jitter: true,
-});
+@Injectable()
+export class PaymentsService {
+  @Step({
+    name: 'payments.charge-card',
+    input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
+    output: z.object({ chargeId: z.string() }),
+    retries: 4,
+    backoff: 'exp',
+    backoffMs: 500,
+    backoffMaxMs: 30_000,
+    jitter: true,
+  })
+  async chargeCard(input: { orderId: string; amountCents: number }): Promise<{ chargeId: string }> {
+    return { chargeId: await this.stripe.charge(input) };
+  }
+}
 
 // in the workflow:
-const charge = await ctx.remote(chargeCard, { orderId: order.id, amountCents: order.total });
+const charge = await ctx.step(this.payments.chargeCard, { orderId: order.id, amountCents: order.total });
 ```
 
-When a worker reports a **failed** result for a durable step, the engine consults `retries`. If the attempt
+When a worker reports a **failed** result for a step, the engine consults `retries`. If the attempt
 budget remains, it re-dispatches — but durably, not in a loop. The first time it sees the failed checkpoint
 it computes the next retry deadline as `now + backoffDelay(attempt)` and stamps it on the failed
 checkpoint's `wakeAt`, in clock-space, then suspends. Because that deadline is **persisted on the
@@ -97,7 +106,7 @@ with an incremented `attempt`, and the cycle continues until the result lands or
 
 ### Opting out: `retryable: false`
 
-A durable remote step retries on a failed worker result **unless the worker marks the error as
+A dispatched step retries on a failed worker result **unless the worker marks the error as
 non-retryable**. A worker that reports an error has returned a deterministic verdict — a declined card, a
 validation failure — so re-dispatching it just hammers the worker for the same answer. Set `retryable: false`
 on the `StepError` the worker returns and the engine surfaces it to the workflow immediately instead of
@@ -105,7 +114,7 @@ retrying:
 
 ```ts
 // inside the worker handler (TypeScript or, symmetrically, the Python SDK):
-@DurableStep('payments.charge-card')
+@Step('payments.charge-card')
 async charge(input: { orderId: string; amountCents: number }) {
   const res = await this.stripe.charge(input);
   if (res.declined) {
@@ -117,24 +126,27 @@ async charge(input: { orderId: string; amountCents: number }) {
 ```
 
 The default is `retryable !== false`, i.e. an ordinary error is retried; only an explicit `retryable: false`
-opts out. This is the worker-side counterpart of throwing `FatalError` in a local step.
+opts out. This is the worker-side counterpart of throwing `FatalError` in a step handler.
 
 ### The in-memory liveness path (`timeoutMs`)
 
-Setting `timeoutMs` on a remote step opts it into a different path entirely. `timeoutMs` is a **liveness
+Setting `timeoutMs` on a step opts it into a different path entirely. `timeoutMs` is a **liveness
 window**: if the worker produces neither a result nor a heartbeat within that many ms, the engine presumes
 it dead, fails the dispatch with a `RemoteStepTimeout`, and — because that timeout is retryable —
 re-dispatches it in-place up to `retries`. Each heartbeat the worker emits (via `transport.onHeartbeat`)
 rearms the window, so a long but healthy step that keeps beating stays alive well past `timeoutMs`.
 
 ```ts
-export const renderVideo = remoteStep({
+@Step({
   name: 'media.render',
   input: z.object({ assetId: z.string() }),
   output: z.object({ url: z.string() }),
   timeoutMs: 60_000, // presume the worker dead after 60s of silence (no result, no heartbeat)
   retries: 3,
-});
+})
+async render(input: { assetId: string }): Promise<{ url: string }> {
+  return { url: await this.encoder.render(input.assetId) };
+}
 ```
 
 The crucial difference between the two paths: the durable path retries on a worker **reporting a failure**

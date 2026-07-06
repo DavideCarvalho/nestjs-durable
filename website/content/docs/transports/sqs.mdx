@@ -12,13 +12,13 @@ pnpm add @dudousxd/nestjs-durable-transport-sqs @aws-sdk/client-sqs
 
 ## How it works
 
-Say a checkout workflow calls the `payments.charge-card` remote step with no `partition` set. The
+Say a checkout workflow calls the `payments.charge-card` step on an un-partitioned deployment. The
 task routes to a queue named after the step itself, so a worker registers under that same name to
 consume it:
 
 ```ts title="the step + the call"
-// chargeCard = remoteStep({ name: 'payments.charge-card', … })
-const { chargeId } = await ctx.remote(chargeCard, { orderId, amountCents });
+// @Step({ name: 'payments.charge-card', … }) on a provider method
+const { chargeId } = await ctx.step(this.payments.chargeCard, { orderId, amountCents });
 ```
 
 With the default `durable` prefix, that one call moves three messages across two queues:
@@ -30,7 +30,7 @@ With the default `durable` prefix, that one call moves three messages across two
    its `payments.charge-card` handler, then sends the `StepResult` JSON to the shared results queue,
    **`durable-results`** (`<prefix>-results`) — every worker replies on the same one.
 3. **Resume** → the engine long-polls `durable-results`, matches the result to the suspended
-   `ctx.remote` by `stepId`, checkpoints it, and the workflow continues.
+   `ctx.step` by `stepId`, checkpoints it, and the workflow continues.
 
 ```text
  engine ──RemoteTask──▶ durable-tasks-payments.charge-card ──poll──▶ worker
@@ -51,7 +51,7 @@ transport.handle('payments.charge-card', async ({ orderId, amountCents }) => ({
 ```
 
 `group` is the queue token this instance polls — set it to the exact step name it serves (suffixed
-`@<partition>` if the step declares one). Handling a second step name needs a **second**
+`@<partition>` if the deployment routes that step to a partitioned worker pool). Handling a second step name needs a **second**
 `SqsTransport` instance with its own matching `group`; each instance polls exactly one queue.
 Reusing queues you already provisioned? Skip name resolution by passing their URLs directly:
 

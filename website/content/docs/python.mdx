@@ -1,11 +1,11 @@
 ---
 title: Python steps
-description: Run workflow steps in Python. A TypeScript workflow's ctx.remote dispatches to a Python worker over BullMQ/Redis, and the result flows back — one workflow, steps split across languages.
+description: Run workflow steps in Python. A TypeScript workflow's ctx.step dispatches to a Python worker over BullMQ/Redis, and the result flows back — one workflow, steps split across languages.
 ---
 
 A step doesn't have to run in Node. The `durable-worker` Python SDK registers step handlers by
 name and runs them over the same Redis queues the [BullMQ transport](/docs/transports/bullmq) uses
-— so a TypeScript workflow can `ctx.remote` a step implemented in Python.
+— so a TypeScript workflow's `ctx.step('payments.charge-card', …)` reaches a step implemented in Python.
 
 ```bash
 pip install "durable-worker[redis]"
@@ -49,8 +49,8 @@ per-step-name queues:
 ```
   NestJS engine                              Redis (the broker)                    Python worker
   ─────────────                              ──────────────────                    ─────────────
-  ctx.remote(step) ───dispatch───▶  durable-tasks-<name>[@<partition>]  ───consume──▶  @worker.step(name)
-  resume ctx.remote ◀──consume────  durable-results                     ◀───add──────  return / raise
+  ctx.step(name)   ───dispatch───▶  durable-tasks-<name>[@<partition>]  ───consume──▶  @worker.step(name)
+  resume ctx.step   ◀──consume────  durable-results                     ◀───add──────  return / raise
 ```
 
 So "connecting to the control plane" just means pointing the worker at the **same broker** the
@@ -64,12 +64,13 @@ same step **name**. Two things have to line up:
 
 Each registered step **name** gets its own queue — there's no separate group to declare or match.
 Sharing one broker across multiple isolated deployments (e.g. a dev cluster and a developer's
-laptop)? Set the same `partition` on both sides — `remoteStep({ ..., partition })` engine-side,
-`Worker(partition=...)` (or `run_redis_worker(worker, partition=...)`) worker-side — and every queue
-name is suffixed `<name>@<partition>` so the two deployments never cross-consume.
+laptop)? Set the same `partition` on both sides — `BullMQTransport({ ..., partition })` (or
+`DurableModule.forRoot({ ..., partition })`) engine-side, `Worker(partition=...)` (or
+`run_redis_worker(worker, partition=...)`) worker-side — and every queue name is suffixed
+`<name>@<partition>` so the two deployments never cross-consume.
 
-Match those and a `ctx.remote(chargeStep, …)` is delivered to whichever worker registered
-`chargeStep.name`. Nothing else to register — there's no handshake or service discovery; the queue
+Match those and a `ctx.step('payments.charge-card', …)` is delivered to whichever worker registered
+`payments.charge-card`. Nothing else to register — there's no handshake or service discovery; the queue
 name *is* the routing.
 
 A few properties that follow from this being queue-based:
@@ -81,7 +82,7 @@ A few properties that follow from this being queue-based:
 - **Workers are stateless and horizontal.** Run as many copies as you want for a given step; Redis
   hands each task to one of them. Scale a slow step by adding workers, not by touching the workflow.
 - **The engine owns correlation.** Every result carries the `stepId` it answers; the engine matches
-  it to the suspended `ctx.remote` and resumes the run. The worker never needs the run's state.
+  it to the suspended `ctx.step` and resumes the run. The worker never needs the run's state.
 
 ### Authentication
 

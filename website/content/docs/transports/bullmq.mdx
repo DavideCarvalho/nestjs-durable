@@ -12,7 +12,7 @@ pnpm add @dudousxd/nestjs-durable-transport-bullmq bullmq
 
 ## How it works
 
-- `ctx.remote` dispatches a task to a **per-name** queue: `<prefix>-tasks-<name>[@<partition>]`.
+- `ctx.step` dispatches a task to a **per-name** queue: `<prefix>-tasks-<name>[@<partition>]`.
 - A worker registered for that step name consumes it, runs the handler, and adds the result to the
   shared `<prefix>-results` queue.
 - The engine-side instance consumes results and checkpoints them.

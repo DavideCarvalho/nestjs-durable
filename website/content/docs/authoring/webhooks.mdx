@@ -58,8 +58,7 @@ replay-safe.
 ## Full example — a payment that calls back
 
 ```ts
-import { remoteStep } from '@dudousxd/nestjs-durable-core';
-import { z } from 'zod';
+import { FatalError } from '@dudousxd/nestjs-durable-core';
 
 interface PaymentResult {
   status: 'paid' | 'failed';
@@ -68,7 +67,10 @@ interface PaymentResult {
 
 @Workflow({ name: 'checkout', version: '1' })
 export class CheckoutWorkflow {
-  constructor(private readonly psp: PaymentProviderService) {}
+  constructor(
+    private readonly psp: PaymentProviderService,
+    private readonly orders: OrderService,
+  ) {}
 
   async run(ctx: WorkflowCtx, order: Order) {
     // 1. Mint the webhook: fixes a deterministic token and (with a builder) a public url.
@@ -76,12 +78,10 @@ export class CheckoutWorkflow {
 
     // 2. Hand the url to the third party INSIDE a step, so the handoff is checkpointed and
     //    happens exactly once — even across replay/recovery.
-    await ctx.step('start-payment', async () => {
-      await this.psp.createPayment({
-        orderId: order.id,
-        amountCents: order.total,
-        callbackUrl: hook.url, // the provider POSTs here when the payment settles
-      });
+    await ctx.step(this.psp.startPayment, {
+      orderId: order.id,
+      amountCents: order.total,
+      callbackUrl: hook.url, // the provider POSTs here when the payment settles
     });
 
     // 3. Suspend with zero compute until the provider calls back. No polling, no held thread.
@@ -91,7 +91,7 @@ export class CheckoutWorkflow {
       throw new FatalError(`payment ${result.providerRef} failed`, 'payment_failed');
     }
 
-    await ctx.step('fulfill', () => this.fulfil(order, result.providerRef));
+    await ctx.step(this.orders.fulfil, { order, providerRef: result.providerRef });
     return { orderId: order.id, providerRef: result.providerRef };
   }
 }

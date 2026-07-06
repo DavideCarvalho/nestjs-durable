@@ -6,7 +6,7 @@ description: Durable workflows for NestJS — write a workflow as plain code; ev
 import { Callout } from 'fumadocs-ui/components/callout';
 import { Steps, Step } from 'fumadocs-ui/components/steps';
 
-**`@dudousxd/nestjs-durable`** brings durable execution to NestJS. You write a workflow as ordinary async code — call a step, use its result, call the next — and the engine records every step's output. If the process crashes or you deploy mid-run, the workflow resumes from the last checkpoint instead of starting over. Steps can run locally in NestJS or on a remote worker (even a Python one), but it stays **one workflow**, with **one source of truth**, and **one end-to-end timeline**.
+**`@dudousxd/nestjs-durable`** brings durable execution to NestJS. You write a workflow as ordinary async code — call a step, use its result, call the next — and the engine records every step's output. If the process crashes or you deploy mid-run, the workflow resumes from the last checkpoint instead of starting over. Every step is dispatched to whatever worker serves it — in your NestJS app or on a separate one (even a Python worker) — but it stays **one workflow**, with **one source of truth**, and **one end-to-end timeline**.
 
 <Callout type="info" title="The one rule">
 The engine recovers a run by **replaying** the workflow function from the top. Completed steps return their saved result instead of executing again, so your `run` body must be deterministic — no `Date.now()`, `Math.random()`, or direct I/O outside a step. See [Durability & replay](/docs/concepts).
@@ -36,20 +36,43 @@ pnpm add @dudousxd/nestjs-durable @dudousxd/nestjs-durable-core @dudousxd/nestjs
 </Step>
 <Step>
 
-Write a workflow as plain async code. Every `ctx.step` is checkpointed; `ctx.waitForSignal` suspends the run until a signal arrives:
+Write a workflow as plain async code. Each step is a provider method marked `@Step`; the workflow calls it by reference with `ctx.step`, and every call is checkpointed. `ctx.waitForSignal` suspends the run until a signal arrives:
 
 ```ts title="checkout.workflow.ts"
 import { Workflow } from '@dudousxd/nestjs-durable';
 import type { WorkflowCtx } from '@dudousxd/nestjs-durable-core';
+import { InventoryWorker } from './inventory.worker';
 
 @Workflow({ name: 'checkout', version: '1' })
 export class CheckoutWorkflow {
+  constructor(private readonly inventory: InventoryWorker) {}
+
   async run(ctx: WorkflowCtx, order: { id: string; total: number }) {
-    await ctx.step('reserveStock', async () => ({ reserved: true }));
+    await ctx.step(this.inventory.reserveStock, order);
     const approval = await ctx.waitForSignal<{ approved: boolean }>(`approve:${order.id}`);
     if (!approval.approved) return { status: 'rejected' };
-    await ctx.step('ship', async () => ({ shipped: true }));
+    await ctx.step(this.inventory.ship, order);
     return { status: 'shipped' };
+  }
+}
+```
+
+Each step handler is an ordinary provider method — the engine dispatches every `ctx.step` call to one by name and checkpoints its result:
+
+```ts title="inventory.worker.ts"
+import { Step } from '@dudousxd/nestjs-durable';
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class InventoryWorker {
+  @Step()
+  async reserveStock(order: { id: string; total: number }) {
+    return { reserved: true };
+  }
+
+  @Step()
+  async ship(order: { id: string; total: number }) {
+    return { shipped: true };
   }
 }
 ```
@@ -66,6 +89,7 @@ import { EventEmitterTransport } from '@dudousxd/nestjs-durable-transport-event-
 import { Module } from '@nestjs/common';
 import { EventEmitter2, EventEmitterModule } from '@nestjs/event-emitter';
 import { CheckoutWorkflow } from './checkout.workflow';
+import { InventoryWorker } from './inventory.worker';
 
 @Module({
   imports: [
@@ -78,7 +102,7 @@ import { CheckoutWorkflow } from './checkout.workflow';
       }),
     }),
   ],
-  providers: [CheckoutWorkflow],
+  providers: [CheckoutWorkflow, InventoryWorker],
 })
 export class AppModule {}
 ```
@@ -109,23 +133,30 @@ Need the outcome inline instead? `await this.workflows.waitForRun(runId)` resolv
 
 ## Steps across apps and languages
 
-A step does not have to run in NestJS. Declare a **remote step** with a typed, validated contract and call it with `ctx.remote` — the engine dispatches it over a pluggable transport to wherever its handler lives:
+A step does not have to run in NestJS. There is one always-dispatched `ctx.step`; the transport is how every step reaches its handler over the wire. Declare the handler with `@Step` and a typed, validated contract, then call it by reference:
 
-```ts title="checkout.steps.ts"
-import { remoteStep } from '@dudousxd/nestjs-durable-core';
+```ts title="payments.worker.ts"
+import { Step } from '@dudousxd/nestjs-durable';
+import { Injectable } from '@nestjs/common';
 import { z } from 'zod';
 
-export const chargeCard = remoteStep({
-  name: 'payments.charge-card',
-  input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
-  output: z.object({ chargeId: z.string() }),
-  retries: 3,
-});
+@Injectable()
+export class PaymentsWorker {
+  @Step({
+    name: 'payments.charge-card',
+    input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
+    output: z.object({ chargeId: z.string() }),
+    retries: 3,
+  })
+  async chargeCard(input: { orderId: string; amountCents: number }) {
+    return { chargeId: `ch_${input.orderId}` };
+  }
+}
 ```
 
-The handler is just a provider method decorated with `@DurableStep`, decoupled from the workflow. With the event-emitter transport it runs in the same process; swap the transport for BullMQ to move it to a separate process — or implement it in a [Python worker](/docs/python) — without changing the workflow code.
+The workflow calls it with `ctx.step(this.payments.chargeCard, { orderId, amountCents })` — the same call whether the handler runs here or elsewhere. With the event-emitter transport it runs in the same process; swap the transport for BullMQ to move it to a separate process — or implement it in a [Python worker](/docs/python) — without changing the workflow code.
 
-The split goes both ways: a remote worker can implement a step the NestJS workflow calls, *or* author the whole workflow itself and call back into NestJS. Either way, the engine stays the single owner of durable state.
+The split goes both ways: a separate worker can implement a step the NestJS workflow calls, *or* author the whole workflow itself and call back into NestJS. Either way, the engine stays the single owner of durable state.
 
 ## What you get
 
@@ -139,7 +170,7 @@ The split goes both ways: a remote worker can implement a step the NestJS workfl
 <Cards>
   <Card title="Getting Started" href="/docs/getting-started" description="Install, write a workflow, register the module, and start your first run — step by step." />
   <Card title="Concepts" href="/docs/concepts" description="Durability, deterministic replay, and the mental model behind the engine." />
-  <Card title="Authoring" href="/docs/authoring" description="Workflows, steps, ctx.step / ctx.remote, sleep, and signals in depth." />
+  <Card title="Authoring" href="/docs/authoring" description="Workflows, steps, ctx.step, sleep, and signals in depth." />
   <Card title="Reliability" href="/docs/reliability" description="Retries, fatal errors, recovery, and exactly-once execution." />
   <Card title="Transports" href="/docs/transports" description="The event-emitter default and BullMQ for cross-process or Python steps." />
   <Card title="State stores" href="/docs/stores" description="Persist runs to Postgres, MySQL, or SQLite with your ORM of choice." />

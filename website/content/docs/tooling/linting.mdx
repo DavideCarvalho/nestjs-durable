@@ -61,7 +61,7 @@ export class CheckoutWorkflow {
 
 `crypto.randomUUID()` is matched whether called bare, as `globalThis.crypto.randomUUID()`. The rule
 only fires *inside the workflow body* — calling `Date.now()` elsewhere (a service, a controller, a
-`@DurableStep` handler that runs once and checkpoints its result) is fine, because those aren't
+`@Step` handler that runs once and checkpoints its result) is fine, because those aren't
 replayed.
 
 ## ESLint (flat config)

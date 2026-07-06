@@ -39,21 +39,40 @@ yarn add @dudousxd/nestjs-durable @dudousxd/nestjs-durable-core @dudousxd/nestjs
 
 </Tabs>
 
-## 2. Define a remote step (optional)
+## 2. Define your steps
 
-A step can run locally (`ctx.step`) or on a worker (`ctx.remote`). Declare remote steps with a
-typed contract:
+Steps are plain provider methods marked with `@Step` — there's one always-dispatched `ctx.step`,
+and the engine routes each call to a handler by name, giving it a checkpoint and exactly-once
+execution. Add an optional typed contract (zod `input`/`output`) and a retry policy where you want
+them:
 
-```ts title="checkout.steps.ts"
-import { remoteStep } from '@dudousxd/nestjs-durable-core';
+```ts title="payments.worker.ts"
+import { Step } from '@dudousxd/nestjs-durable';
+import { Injectable } from '@nestjs/common';
 import { z } from 'zod';
 
-export const chargeCard = remoteStep({
-  name: 'payments.charge-card',
-  input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
-  output: z.object({ chargeId: z.string() }),
-  retries: 3,
-});
+@Injectable()
+export class PaymentsWorker {
+  @Step()
+  async reserveStock(order: { id: string; total: number }) {
+    return { reserved: true };
+  }
+
+  @Step({
+    name: 'payments.charge-card',
+    input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
+    output: z.object({ chargeId: z.string() }),
+    retries: 3,
+  })
+  async chargeCard(input: { orderId: string; amountCents: number }) {
+    return { chargeId: `ch_${input.orderId}` };
+  }
+
+  @Step()
+  async ship(order: { id: string; total: number }) {
+    return { shipped: true };
+  }
+}
 ```
 
 ## 3. Write the workflow
@@ -61,39 +80,27 @@ export const chargeCard = remoteStep({
 ```ts title="checkout.workflow.ts"
 import { Workflow } from '@dudousxd/nestjs-durable';
 import type { WorkflowCtx } from '@dudousxd/nestjs-durable-core';
-import { chargeCard } from './checkout.steps';
+import { PaymentsWorker } from './payments.worker';
 
 @Workflow({ name: 'checkout', version: '1' })
 export class CheckoutWorkflow {
+  constructor(private readonly payments: PaymentsWorker) {}
+
   async run(ctx: WorkflowCtx, order: { id: string; total: number }) {
-    await ctx.step('reserveStock', async () => ({ reserved: true }));
-    const charge = await ctx.remote(chargeCard, { orderId: order.id, amountCents: order.total });
+    await ctx.step(this.payments.reserveStock, order);
+    const charge = await ctx.step(this.payments.chargeCard, {
+      orderId: order.id,
+      amountCents: order.total,
+    });
     const approval = await ctx.waitForSignal<{ approved: boolean }>(`approve:${order.id}`);
     if (!approval.approved) return { status: 'rejected', chargeId: charge.chargeId };
-    await ctx.step('ship', async () => ({ shipped: true }));
+    await ctx.step(this.payments.ship, order);
     return { status: 'shipped', chargeId: charge.chargeId };
   }
 }
 ```
 
-## 4. Implement the step handler
-
-Any provider method can handle a remote step in-process — decouple it from the workflow:
-
-```ts title="payments.worker.ts"
-import { DurableStep } from '@dudousxd/nestjs-durable';
-import { Injectable } from '@nestjs/common';
-
-@Injectable()
-export class PaymentsWorker {
-  @DurableStep('payments.charge-card')
-  async charge(input: { orderId: string; amountCents: number }) {
-    return { chargeId: `ch_${input.orderId}` };
-  }
-}
-```
-
-## 5. Register the module
+## 4. Register the module
 
 ```ts title="app.module.ts"
 import { DurableModule } from '@dudousxd/nestjs-durable';
@@ -120,12 +127,12 @@ import { PaymentsWorker } from './payments.worker';
 export class AppModule {}
 ```
 
-## 6. Start a run
+## 5. Start a run
 
 Inject `WorkflowService` and start the workflow. `start` **enqueues** the run and returns
 immediately with `{ runId, status: 'pending' }` — the HTTP handler never blocks on workflow logic.
-A worker executes the body (by default, the same instance, on a microtask), runs the local + remote
-steps, then suspends on the approval signal; a webhook resumes it:
+A worker executes the body (by default, the same instance, on a microtask), dispatches its steps,
+then suspends on the approval signal; a webhook resumes it:
 
 ```ts
 constructor(private readonly workflows: WorkflowService) {}
@@ -149,7 +156,7 @@ const { runId } = await this.workflows.start('checkout', order);
 const result = await this.workflows.waitForRun(runId); // resolves when the run settles
 ```
 
-That's it — a durable workflow whose remote step runs in-process, that pauses for human approval
+That's it — a durable workflow whose steps run in-process, that pauses for human approval
 and survives restarts. Next:
 
 - [Durability & replay](/docs/concepts/durability) — the one rule the model imposes.

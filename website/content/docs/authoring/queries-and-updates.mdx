@@ -4,7 +4,7 @@ description: Reading a live run's state with ctx.setEvent + engine.getEvent (sid
 ---
 
 A run is durable but it is not opaque. While it is in flight — suspended on a sleep, waiting on a
-remote step, parked on a signal — you often need to **read** what it has done so far, and sometimes
+dispatched step, parked on a signal — you often need to **read** what it has done so far, and sometimes
 to **steer** it from the outside. The engine gives you two distinct primitives for that, mirroring
 Temporal's split between *queries* (read-only) and *updates* (mutating, validated):
 
@@ -34,10 +34,10 @@ export class VideoEncodeWorkflow {
   async run(ctx: WorkflowCtx, job: EncodeJob) {
     await ctx.setEvent('progress', { phase: 'probing', pct: 0 });
 
-    const segments = await ctx.step('probe', () => this.encoder.probe(job.src));
+    const segments = await ctx.step(this.encoder.probe, job.src);
 
     for (let i = 0; i < segments.length; i++) {
-      await ctx.remote(encodeSegment, { jobId: job.id, segment: segments[i] });
+      await ctx.step(this.encoder.encodeSegment, { jobId: job.id, segment: segments[i] });
       // Publish progress after each segment — readers see the latest snapshot.
       await ctx.setEvent('progress', {
         phase: 'encoding',
@@ -129,7 +129,7 @@ export class ExpenseApprovalWorkflow {
       return { reimbursed: false };
     }
 
-    await ctx.step('reimburse', () => this.ledger.reimburse(expense, decision.approver));
+    await ctx.step(this.ledger.reimburse, { expense, approver: decision.approver });
     await ctx.setEvent('status', { state: 'reimbursed', by: decision.approver });
     return { reimbursed: true };
   }

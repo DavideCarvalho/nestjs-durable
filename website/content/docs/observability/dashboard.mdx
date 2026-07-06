@@ -48,7 +48,7 @@ DurableModule.forRoot({
 ```
 
 With `drive: false` the engine is still fully available — the dashboard can **dispatch retries and
-cancels**, and reads work — but the instance does **not** drive: it won't register `@DurableStep`
+cancels**, and reads work — but the instance does **not** drive: it won't register `@Step`
 handlers (so it never consumes the task queue), won't recover incomplete runs on boot, and won't poll
 due timers. Leave that to the driving pods. So a **retry clicked in the UI on an API pod still
 works**: the API dispatches the step, a driving pod picks it up and runs it. Only the processing is

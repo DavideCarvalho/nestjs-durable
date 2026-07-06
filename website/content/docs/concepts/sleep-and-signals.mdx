@@ -12,9 +12,9 @@ the run is suspended (no compute consumed) and resumes on its own, even across r
 `'7 days'`, or milliseconds.
 
 ```ts
-await ctx.step('draft', () => generate(topic));
+await ctx.step(this.digest.draft, topic);
 await ctx.sleep('7 days'); // gather signals for a week — nothing running
-await ctx.step('refine', () => refine(topic));
+await ctx.step(this.digest.refine, topic);
 ```
 
 Under the hood the run becomes `suspended` with a `wakeAt`; a poller (the `TimerPoller`, wired by

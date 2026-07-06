@@ -18,8 +18,10 @@ fails, the call throws in the parent (so a child failure fails the parent unless
 ```ts
 @Workflow({ name: 'checkout', version: '1' })
 export class CheckoutWorkflow {
+  constructor(private readonly payments: PaymentsService) {}
+
   async run(ctx: WorkflowCtx, order: Order) {
-    const payment = await ctx.step('charge', () => this.payments.charge(order));
+    const payment = await ctx.step(this.payments.charge, order);
     // Hand shipping to its own workflow and wait for the tracking number.
     const shipment = await ctx.child(ShippingWorkflow, { orderId: order.id });
     return { paymentId: payment.id, tracking: shipment.tracking };
@@ -59,8 +61,10 @@ parent keeps running instead of suspending. Use it for side work the parent does
 ```ts
 @Workflow({ name: 'publish-post', version: '1' })
 export class PublishPostWorkflow {
+  constructor(private readonly posts: PostsService) {}
+
   async run(ctx: WorkflowCtx, post: Post) {
-    await ctx.step('publish', () => this.posts.publish(post));
+    await ctx.step(this.posts.publish, post);
     // Kick off indexing + notifications; don't make publishing wait on them.
     await ctx.startChild(ReindexSearchWorkflow, { postId: post.id });
     await ctx.startChild(NotifyFollowersWorkflow, { postId: post.id });

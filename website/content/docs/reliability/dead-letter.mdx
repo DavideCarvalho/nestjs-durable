@@ -101,29 +101,26 @@ export class PipelineWorkflow {
   ) {}
 
   async run(ctx: WorkflowCtx, input: PipelineInput) {
-    const extracted = await ctx.step('extract', () => this.extract(input));
-    const transformed = await ctx.step('transform', () => this.transform(extracted));
-    return ctx.remote(loadStep, transformed);
+    const extracted = await ctx.step('pipeline.extract', input);
+    const transformed = await ctx.step('pipeline.transform', extracted);
+    return ctx.step('pipeline.load', transformed);
   }
 
   // Runs when a `pipeline` run is dead-lettered. Typed to the workflow's own input, same deps.
   @DeadLetter()
   async onDead(ctx: WorkflowCtx, dl: DeadLetter<PipelineInput>) {
-    await ctx.step('alert', () =>
-      this.alerts.page('durable-dead-letter', {
-        runId: dl.deadRunId,
-        workflow: dl.workflow,
-        error: dl.error?.message,
-      }),
-    );
+    await ctx.step(this.alerts.page, {
+      event: 'durable-dead-letter',
+      runId: dl.deadRunId,
+      workflow: dl.workflow,
+      error: dl.error?.message,
+    });
 
-    const ticket = await ctx.step('open-ticket', () =>
-      this.tickets.create({
-        title: `Dead-lettered run ${dl.deadRunId} (${dl.workflow})`,
-        body: dl.error?.message ?? 'unknown error',
-        payload: dl.input, // typed PipelineInput, ready to replay after a fix
-      }),
-    );
+    const ticket = await ctx.step(this.tickets.create, {
+      title: `Dead-lettered run ${dl.deadRunId} (${dl.workflow})`,
+      body: dl.error?.message ?? 'unknown error',
+      payload: dl.input, // typed PipelineInput, ready to replay after a fix
+    });
 
     return { ticketId: ticket.id };
   }

@@ -64,8 +64,8 @@ The referenced workflows are ordinary `@Workflow` providers:
 export class DailyReportWorkflow {
   constructor(private readonly reports: ReportService) {}
   async run(ctx: WorkflowCtx) {
-    const rows = await ctx.step('gather', () => this.reports.gatherYesterday());
-    await ctx.step('email', () => this.reports.email(rows));
+    const rows = await ctx.step(this.reports.gatherYesterday, undefined);
+    await ctx.step(this.reports.email, rows);
     return { rows: rows.length };
   }
 }

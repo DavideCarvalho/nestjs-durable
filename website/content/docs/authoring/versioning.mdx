@@ -35,19 +35,21 @@ next. Use the context's deterministic sources instead; each records its value on
 ```ts
 @Workflow({ name: 'invoice', version: '1' })
 export class InvoiceWorkflow {
+  constructor(private readonly invoices: InvoicesService) {}
+
   async run(ctx: WorkflowCtx, order: Order) {
     const issuedAt = await ctx.now(); // epoch ms — captured once, replayed verbatim
     const nonce = await ctx.uuid(); // deterministic UUID v4
     const sampled = (await ctx.random()) < 0.1; // deterministic [0, 1)
 
-    await ctx.step('issue', () => this.issue(order, { issuedAt, nonce, sampled }));
+    await ctx.step(this.invoices.issue, { order, issuedAt, nonce, sampled });
   }
 }
 ```
 
 Each of these is itself a checkpointed step, so the value is captured the first time and returned from
 the checkpoint on every replay. Reach for `Date.now()`/`Math.random()`/`crypto.randomUUID()` only
-*inside* a `ctx.step` body (whose whole result is checkpointed) — never in the deterministic prefix of
+*inside* an `@Step` handler (whose whole result is checkpointed) — never in the deterministic prefix of
 the workflow body.
 
 ## Workflow versions — for breaking changes
@@ -89,16 +91,22 @@ branch on it:
 ```ts
 @Workflow({ name: 'checkout', version: '1' })
 export class CheckoutWorkflow {
+  constructor(
+    private readonly pricing: PricingService,
+    private readonly fraud: FraudService,
+    private readonly payments: PaymentsService,
+  ) {}
+
   async run(ctx: WorkflowCtx, order: Order) {
-    const quote = await ctx.step('quote', () => this.price(order));
+    const quote = await ctx.step(this.pricing.quote, order);
 
     if (await ctx.patched('add-fraud-check')) {
       // New behaviour: runs that started AFTER this code shipped take this branch.
-      const risk = await ctx.remote(scoreFraud, { orderId: order.id });
+      const risk = await ctx.step(this.fraud.score, { orderId: order.id });
       if (risk.score > 0.9) throw new FatalError('high fraud risk', 'fraud');
     }
 
-    await ctx.remote(chargeCard, { orderId: order.id, amountCents: quote.total });
+    await ctx.step(this.payments.charge, { orderId: order.id, amountCents: quote.total });
   }
 }
 ```

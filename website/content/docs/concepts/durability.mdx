@@ -15,9 +15,9 @@ checkpoint returns its saved result instead of executing again:
 <ReplayDiagram />
 
 Only a **`completed`** checkpoint short-circuits replay. A non-terminal checkpoint —
-a remote step's `pending` (dispatched, awaiting its worker) or a local step's in-flight `running`
-(see [`trackStepStart`](/docs/concepts/workflows-and-steps)) — does **not**: the step is re-awaited
-(remote) or re-run (local). So a crash mid-step is safe — there's no half-finished result to honour.
+a step's `pending` (dispatched, awaiting its worker) or its in-flight `running`
+(see [`trackStepStart`](/docs/concepts/workflows-and-steps)) — does **not**: the step is re-awaited.
+So a crash mid-step is safe — there's no half-finished result to honour.
 
 You write ordinary linear code; the engine guarantees each step runs **exactly once**, logically,
 even across crashes and deploys.
@@ -29,12 +29,7 @@ even across crashes and deploys.
 `{ runId, status: 'pending' }`. The caller — an HTTP handler, say — never blocks on workflow logic;
 the body is dispatched to a worker.
 
-```text
-start('checkout', order)        → run created, status: 'pending', returns { runId } now
-  (a worker picks the run up)   → status: 'running', body executes
-  ctx.waitForSignal('approve')  → status: 'suspended'
-  signal('approve')             → resumes → completes
-```
+<CodeFlow scene="execution-model" />
 
 - **`'pending'`** is a new run status: created and enqueued, not yet picked up by a worker.
 - **Where a run executes is a `RunDispatcher`.** The default is **in-process** — the run executes on
@@ -77,10 +72,10 @@ async run(ctx, order) {
   const now = Date.now(); // different on every replay
 }
 
-// ✓ right — side effects inside steps
+// ✓ right — side effects inside dispatched steps
 async run(ctx, order) {
-  const quote = await ctx.step('quote', () => this.pricing.fetch(order)); // checkpointed
-  await ctx.step('charge', () => this.billing.charge(quote));
+  const quote = await ctx.step(this.pricing.fetch, order); // checkpointed
+  await ctx.step(this.billing.charge, quote);
 }
 ```
 
@@ -89,7 +84,8 @@ async run(ctx, order) {
 - **Idempotency.** The engine guarantees logical exactly-once, but if the process dies *after* a
   remote worker ran and *before* its checkpoint was written, the step may physically run twice.
   Steps receive a stable `stepId` — make handlers idempotent or dedupe on it.
-- **Retries.** Configure per step: `ctx.step(name, fn, { retries: 3, backoff: 'exp' })`. Throw a
+- **Retries.** Configure on the step's `@Step({ retries: 3, backoff: 'exp' })`, or override per call
+  with `ctx.step(ref, input, { retries: 3, backoff: 'exp' })`. Throw a
   [`FatalError`](/docs/concepts/workflows-and-steps#fatal-errors) to stop retrying a business
   failure outright.
 - **Self-healing recovery.** The engine resumes every run a previous process left `running`

@@ -14,7 +14,7 @@ its worker renews a recovery lease, and a crashed worker stops renewing, so its 
 it every tick — so an orphaned `running` run is reclaimed by another instance within ~`leaseMs`, not
 only on the next deploy. See [Durability & replay](/docs/concepts/durability#deploys-versioning--multiple-instances).
 
-The building blocks compose: a remote step can retry with backoff,
+The building blocks compose: a step can retry with backoff,
 register a compensation to undo itself, be admitted through a rate-limited queue, and — if recovery can
 never make it past a crash — land in the dead-letter queue for a human or a handler to deal with.
 
@@ -22,12 +22,12 @@ This section covers the four reliability primitives.
 
 ## Retries
 
-Both local steps (`ctx.step`) and remote steps (`ctx.remote`) retry on failure, but along different paths.
-A local step retries the in-process function up to `retries`, spacing attempts by a `fixed` or `exp`
-backoff (with optional jitter); throw a `FatalError` to opt a business failure out of retrying entirely.
-A remote step has a **durable** retry path — a failed `ctx.remote` re-dispatches by suspending the run on a
-persisted `wakeAt`, so retries survive a crash — plus an in-memory `timeoutMs` + heartbeat liveness path
-for presumed-dead workers. See [Retries & backoff](/docs/reliability/retries).
+Every step is dispatched to a worker and retries on failure along one **durable** path. A failed step
+re-dispatches per its `retries` policy, spacing attempts by a `fixed` or `exp` backoff (with optional
+jitter) and suspending the run on a persisted `wakeAt` between attempts, so retries survive a crash.
+Throw a `FatalError` inside the handler (or return a `retryable: false` error from the worker) to opt a
+deterministic business failure out of retrying entirely. An optional `timeoutMs` + heartbeat liveness path
+presumes a silent worker dead and re-dispatches. See [Retries & backoff](/docs/reliability/retries).
 
 ## Sagas & compensation
 
@@ -40,9 +40,9 @@ can also trigger the saga deliberately with `engine.cancel(runId, { compensate: 
 
 ## Flow control
 
-Remote steps can be subjected to a durable queue that caps concurrency and/or enforces a fixed-window
+Steps can be subjected to a durable queue that caps concurrency and/or enforces a fixed-window
 rate limit. Register a queue with `engine.registerQueue` (or the module's `queues` option) and reference
-it from a call with `ctx.remote(step, input, { queue: 'emails' })`. A call that can't be admitted re-suspends
+it from a call with `ctx.step(handler, input, { queue: 'emails' })`. A call that can't be admitted re-suspends
 with a retry time instead of dispatching, and the timer poller retries admission later — so the limit is
 durable and survives crashes. See [Flow control](/docs/reliability/flow-control).
 

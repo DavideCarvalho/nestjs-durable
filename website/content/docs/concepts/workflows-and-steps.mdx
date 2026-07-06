@@ -1,6 +1,6 @@
 ---
 title: Workflows & steps
-description: Declaring workflows with @Workflow, local steps with ctx.step, typed remote steps with remoteStep + ctx.remote and @DurableStep handlers, retries, fan-out and fatal errors.
+description: Declaring workflows with @Workflow, the one dispatched ctx.step primitive and its @Step handlers, retries and backoff, fan-out, fatal errors, and sub-process events.
 ---
 
 ## Workflows
@@ -22,57 +22,74 @@ Register it as a normal provider — `DurableModule` discovers it. Start runs wi
 `WorkflowService.start(CheckoutWorkflow, input)` — pass the workflow **class** for a typed input, or a
 **name** string for a cross-runtime workflow.
 
-## Local steps
+## Steps
 
-`ctx.step(name, fn, opts?)` runs a unit of work locally and checkpoints its result.
+A **step** is the one durable primitive: `ctx.step(...)` runs a unit of work and checkpoints its
+result, so on a crash, retry, or replay it is **not re-executed** — the saved result is returned.
+There is **no local/remote placement choice**: every step is **dispatched** and engine-scheduled — it
+runs on whatever worker serves its name, the run suspends with zero compute until the result lands,
+then resumes with it.
 
-```ts
-const quote = await ctx.step('quote', () => this.pricing.fetch(order), { retries: 3 });
-```
+You declare the work as a `@Step`-decorated provider method and call it from the workflow with
+`ctx.step`:
 
-### In-flight visibility
+<CodeFlow scene="dispatched-step" />
 
-When a local step's body begins, the engine emits a `step.started` lifecycle event and (by default)
-writes a `running` checkpoint, so a long step shows up in the [dashboard](/docs/observability/dashboard)
-the moment it starts — not only once it finishes. The `running` checkpoint is a placeholder
-overwritten by the step's `completed`/`failed` result; it never short-circuits
-[replay](/docs/concepts/durability) (only a `completed` checkpoint does), so a crash mid-body simply
-re-runs the step.
-
-Toggle this with the engine's `trackStepStart` option (default `true`). The `step.started` event
-fires either way — the live event stream always sees the start; the flag only gates the extra
-checkpoint write. Set it to `false` on hot paths with many short local steps to halve their
-checkpoint writes, at the cost of reload-survivable in-flight visibility.
-
-## Remote steps
-
-Declare a typed remote step with `remoteStep`, then call it with `ctx.remote` — the engine
-dispatches it over the [transport](/docs/transports) and checkpoints the result. The handler can
-live in another process or another language.
+The handler's single argument is the step **input**; its return value is the step **output**. Two call
+forms:
 
 ```ts
-export const chargeCard = remoteStep({
-  name: 'payments.charge-card',
-  input: z.object({ orderId: z.string(), amountCents: z.number().int() }),
-  output: z.object({ chargeId: z.string() }),
-  retries: 3,
-});
+// by method reference — typed by the handler's own signature, refactor-safe, autocompleted:
+const held = await ctx.step(this.inventory.reserve, order);
 
-// in the workflow:
-const charge = await ctx.remote(chargeCard, { orderId: order.id, amountCents: order.total });
+// by name — for a cross-runtime handler (e.g. a Python @step) with no JS reference to import:
+const out = await ctx.step<ProcResult>('processing:proc', input);
 ```
 
-A `@DurableStep` provider method handles it in-process (with an in-process transport):
+### Declaring a step with `@Step`
+
+`@Step` marks a provider method as a step handler. Three forms:
+
+- `@Step()` — **bare**: the routing name is derived from the method as `` `${ClassName}.${method}` ``
+  (e.g. `InventoryService.reserve`) — refactor-safe, no magic string. Carries no retry/timeout and no
+  runtime validation; the method's compile-time types are the only check.
+- `@Step('custom:name')` — an **explicit name** (stable across refactors, or a cross-runtime contract
+  with a non-JS worker).
+- `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, jitter?, timeoutMs? })` — optional
+  name override, opt-in runtime **zod** schemas (`input` validates before the method runs, `output`
+  before its result is handed back), and a def-level retry/backoff/liveness policy.
 
 ```ts
 @Injectable()
-export class PaymentsWorker {
-  @DurableStep('payments.charge-card')
-  async charge(input: { orderId: string; amountCents: number }) {
+export class PaymentsService {
+  @Step({ retries: 3, backoff: 'exp' })
+  async chargeCard(input: { orderId: string; amountCents: number }) {
     return { chargeId: await this.stripe.charge(input) };
   }
 }
 ```
+
+The policy on `@Step` is what `ctx.step` reads off the method reference; a per-call
+`ctx.step(ref, input, { retries })` overrides it field-by-field.
+
+<Callout title="@DurableStep is deprecated">
+`@DurableStep` still works as a back-compat alias of `@Step` (identical metadata), but new code should
+use `@Step`.
+</Callout>
+
+### In-flight visibility
+
+When a step's handler begins, the engine emits a `step.started` lifecycle event and (by default)
+writes a `running` checkpoint, so a long step shows up in the
+[dashboard](/docs/observability/dashboard) the moment it starts — not only once it finishes. The
+`running` checkpoint is a placeholder overwritten by the step's `completed`/`failed` result; it never
+short-circuits [replay](/docs/concepts/durability) (only a `completed` checkpoint does), so a crash
+mid-step simply re-runs it.
+
+Toggle this with the engine's `trackStepStart` option (default `true`). The `step.started` event fires
+either way — the live event stream always sees the start; the flag only gates the extra checkpoint
+write. Set it to `false` on hot paths with many short steps to halve their checkpoint writes, at the
+cost of reload-survivable in-flight visibility.
 
 ## Fan-out (parallel steps)
 
@@ -81,8 +98,8 @@ position is taken in the synchronous prefix before any `await`:
 
 ```ts
 const [a, b] = await Promise.all([
-  ctx.step('a', () => doA()),
-  ctx.step('b', () => doB()),
+  ctx.step(this.svc.doA, x),
+  ctx.step(this.svc.doB, y),
 ]);
 ```
 
@@ -94,21 +111,22 @@ retry can't fix, throw `FatalError` — it fails the run immediately:
 ```ts
 import { FatalError } from '@dudousxd/nestjs-durable-core';
 
-await ctx.step('charge', async () => {
-  const res = await stripe.charge(order);
+@Step()
+async charge(order: Order) {
+  const res = await this.stripe.charge(order);
   if (res.declined) throw new FatalError('card declined', 'declined');
   return res;
-});
+}
 ```
 
 ## Steps vs. sub-process events
 
 These look similar in the dashboard but are fundamentally different — the distinction is **durability**:
 
-- A **step** (`ctx.step` / `ctx.remote`) is a **durable checkpoint**. The engine records its result, so
-  on a crash, retry, or replay it is **not re-executed** — the saved result is replayed. It's a
-  first-class node in the run graph and the **unit of recovery**. Use a step for any unit that should
-  survive a crash or not be redone.
+- A **step** (`ctx.step`) is a **durable checkpoint**. The engine records its result, so on a crash,
+  retry, or replay it is **not re-executed** — the saved result is replayed. It's a first-class node in
+  the run graph and the **unit of recovery**. Use a step for any unit that should survive a crash or
+  not be redone.
 
 - A **sub-process event** is a **log annotation emitted _inside_ a step** via the step logger's
   `log.sub(name, status)` — e.g. one entry per item in a fan-out the step performs internally. It is
@@ -116,9 +134,12 @@ These look similar in the dashboard but are fundamentally different — the dist
   step retries, all of its sub-process events are produced again. Use it for **visibility**, not
   recovery.
 
+The step logger arrives as the handler's **second argument**:
+
 ```ts
 // One durable step that internally processes N items and records each outcome for visibility.
-await ctx.step('process-batch', async (log) => {
+@Step()
+async processBatch(batch: Item[], log: StepLogger) {
   for (const item of batch) {
     try {
       await handle(item);
@@ -127,7 +148,7 @@ await ctx.step('process-batch', async (log) => {
       log.sub(item.id, 'failed', String(e));
     }
   }
-});
+}
 ```
 
 Rule of thumb: if you want each unit to **retry or replay independently**, make it a **step** (or a
