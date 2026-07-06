@@ -1,4 +1,4 @@
 {
   "title": "Concepts",
-  "pages": ["durability", "workflows-and-steps", "sleep-and-signals"]
+  "pages": ["durability", "workflows-and-steps", "sleep-and-signals", "tenancy"]
 }

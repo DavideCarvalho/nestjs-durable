@@ -1,0 +1,72 @@
+---
+title: Tenancy & topologies
+description: One engine, three deployment shapes. How the operator/tenant split lets a store-less worker borrow a control plane's store over the transport — and the boundary that keeps each tenant to its own runs.
+---
+
+A durable deployment is built from two roles — an **operator** that owns the store and drives runs,
+and zero or more **tenants** that execute work without a store. Which roles you run, and how many,
+gives you three shapes. They share one codebase; only configuration differs.
+
+## Single deployment
+
+The default. One process holds the store, the engine, and the workers. Runs are stamped with the
+`default` namespace and the dashboard reads straight from the store. This is production for most
+apps — nothing below is needed until you want to split work across processes or machines.
+
+<TenancyDiagram variant="single" caption="One process owns everything. The transport can be your database or Redis." />
+
+## Operator + tenants
+
+Split the store-owner from the workers. The **operator** (control plane) holds the store, runs the
+dashboard, and drives/recovers runs of **every** namespace — its own namespace is left unset, which
+is how it sees everyone. Each **tenant** sets `DURABLE_TENANT` and runs store-less: its queues are
+suffixed with the tenant (`handler@blue`), its runs are stamped with it, and its `RUN_GATEWAY`
+becomes a **ProxyRunGateway** that round-trips reads and control verbs to the operator over the
+transport.
+
+<TenancyDiagram variant="tenants" caption="The operator owns the store; tenants borrow it over the transport. Each tenant's queues and runs carry its name." />
+
+The wire between them carries a few message kinds, all over the transport (no direct DB access from a
+tenant):
+
+- **start-run** — a tenant asks the operator to create a run; the operator stamps it with the
+  tenant's namespace.
+- **run-request / reply** — reads and control (`getRunDetail`, `listRuns`, `cancel`, `retry`, …)
+  proxied to the operator and answered on a correlated reply.
+- **tenant events** — lifecycle events streamed back per tenant, so a tenant's dashboard tails its
+  own runs live.
+
+This is what makes a developer's laptop a tenant of a shared cluster: point it at the cluster's
+transport, set `DURABLE_TENANT=your-name`, and your runs execute on your machine while the cluster's
+operator orchestrates and stores them — without your runs colliding with anyone else's.
+
+### The isolation boundary
+
+A tenant can only ever see and act on **its own** runs. This is enforced on the operator, not the
+client — the `RunRequestResponder` is the boundary:
+
+- **`listRuns`** overwrites the query's namespace with the requester's tenant. Whatever namespace the
+  client asks for is discarded, never merely validated — a tenant can't widen its query into
+  another's.
+- Every **runId-bearing** verb loads the run first and rejects with a `cross-tenant` error if
+  `run.namespace` doesn't match the requester — *before* the mutating method runs.
+
+So the guarantee holds even against a misbehaving client: the operator decides what a tenant is
+allowed to touch.
+
+## Cross-runtime
+
+Because tenants talk to the operator only over the transport, a tenant doesn't have to be the same
+language as the operator. A Node operator can orchestrate a **Python** tenant worker: the operator
+owns the pipeline and the store, and dispatches steps that the Python `durable-worker` picks up off
+the same queue names. Orchestration lives in one runtime, handlers in another.
+
+<TenancyDiagram variant="polyglot" caption="A Node operator and a Python tenant worker share one transport and one queue-naming scheme." />
+
+## Choosing a shape
+
+| Shape | Configuration | When to reach for it |
+| --- | --- | --- |
+| **Single** | no `DURABLE_TENANT`, has store | One process: store + engine + workers. The production default; simplest. |
+| **Operator + tenants** | operator (no tenant) + tenants (`DURABLE_TENANT` set) | Operator owns the store + dashboard; tenants run store-less and proxy over the transport. Multi-machine, per-developer, or per-team isolation. |
+| **Cross-runtime** | operator + tenant in another language | A tenant in another language (e.g. Python) driven by the operator over the transport. |

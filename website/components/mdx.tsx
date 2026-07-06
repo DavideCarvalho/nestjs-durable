@@ -1,11 +1,13 @@
+import { Screenshot } from '@/components/screenshot';
+import { TenancyDiagram } from '@/components/tenancy-diagram';
 import defaultMdxComponents from 'fumadocs-ui/mdx';
 import type { MDXComponents } from 'mdx/types';
-import { Screenshot } from '@/components/screenshot';
 
 export function getMDXComponents(components?: MDXComponents) {
   return {
     ...defaultMdxComponents,
     Screenshot,
+    TenancyDiagram,
     ...components,
   } satisfies MDXComponents;
 }
