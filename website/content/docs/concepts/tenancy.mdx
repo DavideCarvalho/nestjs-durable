@@ -24,7 +24,7 @@ suffixed with the tenant (`handler@blue`), its runs are stamped with it, and its
 becomes a **ProxyRunGateway** that round-trips reads and control verbs to the operator over the
 transport.
 
-<TenancyDiagram variant="tenants" caption="The operator owns the store; tenants borrow it over the transport. Each tenant's queues and runs carry its name." />
+<TenantFlow />
 
 The wire between them carries a few message kinds, all over the transport (no direct DB access from a
 tenant):
