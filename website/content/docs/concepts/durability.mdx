@@ -12,16 +12,7 @@ Each step records its result in the store at a deterministic position (`seq`). R
 **re-running the workflow function from the top** — but a step that already has a **`completed`**
 checkpoint returns its saved result instead of executing again:
 
-```text
-run abc
-  step[0] reserveStock  → execute → checkpoint {seq:0, completed, output}
-  step[1] chargeCard     → execute → checkpoint {seq:1, completed, output}
-  💥 crash
-  --- engine restarts, resumes run abc ---
-  step[0] reserveStock  → completed checkpoint → return saved output (NOT re-run)
-  step[1] chargeCard     → completed checkpoint → return saved output (NOT re-run)
-  step[2] ship           → no checkpoint → execute for real
-```
+<ReplayDiagram />
 
 Only a **`completed`** checkpoint short-circuits replay. A non-terminal checkpoint —
 a remote step's `pending` (dispatched, awaiting its worker) or a local step's in-flight `running`

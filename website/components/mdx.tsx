@@ -1,3 +1,4 @@
+import { ReplayDiagram } from '@/components/replay-diagram';
 import { Screenshot } from '@/components/screenshot';
 import { TenancyDiagram } from '@/components/tenancy-diagram';
 import defaultMdxComponents from 'fumadocs-ui/mdx';
@@ -6,6 +7,7 @@ import type { MDXComponents } from 'mdx/types';
 export function getMDXComponents(components?: MDXComponents) {
   return {
     ...defaultMdxComponents,
+    ReplayDiagram,
     Screenshot,
     TenancyDiagram,
     ...components,
