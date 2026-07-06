@@ -8,7 +8,7 @@
 // Degrades without JS: SSR renders the static topology (operator · transport · two tenants) with a
 // prompt to interact. Theme-aware via Fumadocs' `--color-fd-*` variables; respects reduced motion.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 const ink = 'var(--color-fd-foreground)';
 const muted = 'var(--color-fd-muted-foreground)';
@@ -130,6 +130,8 @@ function Node({
   rows,
   primary,
   highlight,
+  tip,
+  onTip,
 }: {
   x: number;
   y: number;
@@ -139,13 +141,27 @@ function Node({
   rows: string[];
   primary?: boolean;
   highlight: 'none' | 'go' | 'deny';
+  tip: { title: string; body: string };
+  onTip: (t: { ax: number; ay: number; title: string; body: string } | null) => void;
 }) {
   const lit = highlight !== 'none';
   const ring = highlight === 'deny' ? RED : accent;
   const fill = highlight === 'deny' ? tintRed : highlight === 'go' ? tintAccent : neutral;
   const stroke = lit ? ring : border;
+  const enter = () => onTip({ ax: x + w / 2, ay: y, title: tip.title, body: tip.body });
+  const leave = () => onTip(null);
   return (
-    <g className="tf-anim">
+    <g
+      className="tf-anim"
+      style={{ cursor: 'help' }}
+      tabIndex={0}
+      role="img"
+      aria-label={`${tip.title}. ${tip.body}`}
+      onMouseEnter={enter}
+      onMouseLeave={leave}
+      onFocus={enter}
+      onBlur={leave}
+    >
       {lit ? (
         <rect
           className="tf-ping"
@@ -194,6 +210,8 @@ function Wire({
   label,
   lx,
   ly,
+  tip,
+  onTip,
 }: {
   x1: number;
   y1: number;
@@ -202,10 +220,23 @@ function Wire({
   label: string;
   lx: number;
   ly: number;
+  tip: { title: string; body: string };
+  onTip: (t: { ax: number; ay: number; title: string; body: string } | null) => void;
 }) {
   const w = label.length * 6.2 + 14;
+  const enter = () => onTip({ ax: lx, ay: ly - 11, title: tip.title, body: tip.body });
+  const leave = () => onTip(null);
   return (
-    <g>
+    <g
+      style={{ cursor: 'help' }}
+      tabIndex={0}
+      role="img"
+      aria-label={`${tip.title}. ${tip.body}`}
+      onMouseEnter={enter}
+      onMouseLeave={leave}
+      onFocus={enter}
+      onBlur={leave}
+    >
       <line
         x1={x1}
         y1={y1}
@@ -238,6 +269,30 @@ export function TenantFlow() {
   const [scenario, setScenario] = useState<Stage[]>([]);
   const [stage, setStage] = useState(-1);
   const [reduced, setReduced] = useState(false);
+  const [tip, setTip] = useState<{ left: number; top: number; title: string; body: string } | null>(
+    null,
+  );
+  const svgRef = useRef<SVGSVGElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  // Map an SVG-space anchor to a pixel position within the wrapper so the HTML tooltip stays crisp.
+  function onTip(t: { ax: number; ay: number; title: string; body: string } | null) {
+    if (!t) {
+      setTip(null);
+      return;
+    }
+    const svg = svgRef.current;
+    const wrap = wrapRef.current;
+    if (!svg || !wrap) return;
+    const s = svg.getBoundingClientRect();
+    const w = wrap.getBoundingClientRect();
+    setTip({
+      left: (t.ax / 780) * s.width + (s.left - w.left),
+      top: (t.ay / 300) * s.height + (s.top - w.top),
+      title: t.title,
+      body: t.body,
+    });
+  }
 
   useEffect(() => {
     const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
@@ -289,136 +344,252 @@ export function TenantFlow() {
         @keyframes tf-ping { 0% { opacity: .5 } 70%, 100% { opacity: 0 } }
         @media (prefers-reduced-motion: reduce) { .tf-anim, .tf-token { transition: none } .tf-ping { animation: none; opacity: 0 } }
       `}</style>
-      <svg
-        viewBox="0 0 780 300"
-        width="100%"
-        role="img"
-        aria-label="Interactive operator and tenants: a run travels the transport, and cross-tenant reads are rejected"
-      >
-        <title>
-          A control-plane operator and two tenant workers wired over the transport. Enqueue a run to
-          watch start-run, dispatch and reply travel between a tenant and the operator; or read
-          another tenant's run to see the operator reject it with a cross-tenant error.
-        </title>
-        <defs>
-          <filter id="tf-soft" x="-10%" y="-10%" width="120%" height="140%">
-            <feDropShadow dx="0" dy="3" stdDeviation="5" floodOpacity="0.10" />
-          </filter>
-          <filter id="tf-glow" x="-80%" y="-80%" width="260%" height="260%">
-            <feDropShadow dx="0" dy="0" stdDeviation="5" floodColor={tone} floodOpacity="0.55" />
-          </filter>
-        </defs>
-
-        {/* Transport bus. */}
-        <rect
-          x={356}
-          y={60}
-          width={88}
-          height={180}
-          rx={44}
-          style={{ fill: tintAccent, stroke: border, strokeWidth: 1 }}
-          filter="url(#tf-soft)"
-        />
-        <text
-          x={400}
-          y={146}
-          textAnchor="middle"
-          style={{ fill: ink, fontSize: 12.5, fontWeight: 600 }}
+      <div ref={wrapRef} style={{ position: 'relative' }}>
+        <svg
+          ref={svgRef}
+          viewBox="0 0 780 300"
+          width="100%"
+          role="img"
+          aria-label="Interactive operator and tenants: a run travels the transport, and cross-tenant reads are rejected"
         >
-          Transport
-        </text>
-        <text
-          x={400}
-          y={163}
-          textAnchor="middle"
-          style={{ fill: muted, fontSize: 10.5, fontFamily: mono }}
-        >
-          (Redis)
-        </text>
+          <title>
+            A control-plane operator and two tenant workers wired over the transport. Enqueue a run
+            to watch start-run, dispatch and reply travel between a tenant and the operator; or read
+            another tenant's run to see the operator reject it with a cross-tenant error.
+          </title>
+          <defs>
+            <filter id="tf-soft" x="-10%" y="-10%" width="120%" height="140%">
+              <feDropShadow dx="0" dy="3" stdDeviation="5" floodOpacity="0.10" />
+            </filter>
+            <filter id="tf-glow" x="-80%" y="-80%" width="260%" height="260%">
+              <feDropShadow dx="0" dy="0" stdDeviation="5" floodColor={tone} floodOpacity="0.55" />
+            </filter>
+          </defs>
 
-        {/* Wires with chip labels. */}
-        <Wire x1={232} y1={150} x2={356} y2={150} label="control + reads" lx={294} ly={133} />
-        <Wire x1={444} y1={110} x2={524} y2={88} label="run@blue" lx={486} ly={92} />
-        <Wire x1={444} y1={200} x2={524} y2={216} label="run@green" lx={486} ly={212} />
+          {/* Transport bus. */}
+          <g
+            style={{ cursor: 'help' }}
+            tabIndex={0}
+            role="img"
+            aria-label="Transport — the broker every tenant-operator message travels over"
+            onMouseEnter={() =>
+              onTip({
+                ax: 400,
+                ay: 60,
+                title: 'Transport',
+                body: 'The broker (Redis, or your DB). Every tenant↔operator message travels here — a tenant never touches the store directly.',
+              })
+            }
+            onMouseLeave={() => onTip(null)}
+            onFocus={() =>
+              onTip({
+                ax: 400,
+                ay: 60,
+                title: 'Transport',
+                body: 'The broker (Redis, or your DB). Every tenant↔operator message travels here — a tenant never touches the store directly.',
+              })
+            }
+            onBlur={() => onTip(null)}
+          >
+            <rect
+              x={356}
+              y={60}
+              width={88}
+              height={180}
+              rx={44}
+              style={{ fill: tintAccent, stroke: border, strokeWidth: 1 }}
+              filter="url(#tf-soft)"
+            />
+            <text
+              x={400}
+              y={146}
+              textAnchor="middle"
+              style={{ fill: ink, fontSize: 12.5, fontWeight: 600 }}
+            >
+              Transport
+            </text>
+            <text
+              x={400}
+              y={163}
+              textAnchor="middle"
+              style={{ fill: muted, fontSize: 10.5, fontFamily: mono }}
+            >
+              (Redis)
+            </text>
+          </g>
 
-        {/* Nodes. */}
-        <Node
-          x={20}
-          y={86}
-          w={212}
-          h={128}
-          primary
-          highlight={opHi}
-          title="Control plane · operator"
-          rows={[
-            'engine · store · dashboard',
-            'namespace: — (drives all)',
-            'sees every tenant’s runs',
-          ]}
-        />
-        <Node
-          x={524}
-          y={40}
-          w={232}
-          h={96}
-          highlight={blueHi}
-          title="Tenant · blue"
-          rows={['DURABLE_TENANT=blue · no store', 'handler@blue · ProxyRunGateway']}
-        />
-        <Node
-          x={524}
-          y={168}
-          w={232}
-          h={96}
-          highlight={greenHi}
-          title="Tenant · green"
-          rows={['DURABLE_TENANT=green · no store', 'handler@green · ProxyRunGateway']}
-        />
+          {/* Wires with chip labels. */}
+          <Wire
+            x1={232}
+            y1={150}
+            x2={356}
+            y2={150}
+            label="control + reads"
+            lx={294}
+            ly={133}
+            onTip={onTip}
+            tip={{
+              title: 'Reads & control',
+              body: 'getRunDetail, listRuns, cancel, retry… proxied to the operator and answered on a correlated reply.',
+            }}
+          />
+          <Wire
+            x1={444}
+            y1={110}
+            x2={524}
+            y2={88}
+            label="run@blue"
+            lx={486}
+            ly={92}
+            onTip={onTip}
+            tip={{
+              title: 'run@blue channel',
+              body: 'blue’s run lifecycle rides here: start-run out, dispatch back to handler@blue, reply out.',
+            }}
+          />
+          <Wire
+            x1={444}
+            y1={200}
+            x2={524}
+            y2={216}
+            label="run@green"
+            lx={486}
+            ly={212}
+            onTip={onTip}
+            tip={{
+              title: 'run@green channel',
+              body: 'green’s run lifecycle rides here: start-run out, dispatch back to handler@green, reply out.',
+            }}
+          />
 
-        {/* Travelling token with a glow and a label chip. The chip sits opposite the nearest node
+          {/* Nodes. */}
+          <Node
+            x={20}
+            y={86}
+            w={212}
+            h={128}
+            primary
+            highlight={opHi}
+            title="Control plane · operator"
+            rows={[
+              'engine · store · dashboard',
+              'namespace: — (drives all)',
+              'sees every tenant’s runs',
+            ]}
+            onTip={onTip}
+            tip={{
+              title: 'Operator (control plane)',
+              body: 'Owns the store + dashboard and drives runs of every namespace. Its own namespace is unset, so it sees all tenants.',
+            }}
+          />
+          <Node
+            x={524}
+            y={40}
+            w={232}
+            h={96}
+            highlight={blueHi}
+            title="Tenant · blue"
+            rows={['DURABLE_TENANT=blue · no store', 'handler@blue · ProxyRunGateway']}
+            onTip={onTip}
+            tip={{
+              title: 'Tenant · blue',
+              body: 'A store-less worker. DURABLE_TENANT=blue → queues suffixed handler@blue, runs stamped blue, reads/control proxied to the operator.',
+            }}
+          />
+          <Node
+            x={524}
+            y={168}
+            w={232}
+            h={96}
+            highlight={greenHi}
+            title="Tenant · green"
+            rows={['DURABLE_TENANT=green · no store', 'handler@green · ProxyRunGateway']}
+            onTip={onTip}
+            tip={{
+              title: 'Tenant · green',
+              body: 'A store-less worker. DURABLE_TENANT=green → queues suffixed handler@green, runs stamped green, reads/control proxied to the operator.',
+            }}
+          />
+
+          {/* Travelling token with a glow and a label chip. The chip sits opposite the nearest node
             (right of the operator, left of a tenant, above the bus) so it never covers a node. */}
-        {active
-          ? (() => {
-              const lw = active.label.length * 6.3 + 18;
-              const dir = active.x < 330 ? 1 : active.x > 470 ? -1 : 0;
-              const chipX = dir === 0 ? -lw / 2 : dir > 0 ? 18 : -18 - lw;
-              const chipY = dir === 0 ? -36 : -10;
-              const textX = dir === 0 ? 0 : dir > 0 ? 18 + lw / 2 : -18 - lw / 2;
-              return (
-                <g
-                  className="tf-token"
-                  style={{ transform: `translate(${active.x}px, ${active.y}px)` }}
-                >
-                  {active.label ? (
-                    <g>
-                      <rect
-                        x={chipX}
-                        y={chipY}
-                        width={lw}
-                        height={20}
-                        rx={10}
-                        style={{ fill: cardBg, stroke: tone, strokeWidth: 1 }}
-                      />
-                      <text
-                        x={textX}
-                        y={chipY + 14}
-                        textAnchor="middle"
-                        style={{ fill: tone, fontSize: 10.5, fontFamily: mono }}
-                      >
-                        {active.label}
-                      </text>
-                    </g>
-                  ) : null}
-                  <circle
-                    r={13}
-                    filter="url(#tf-glow)"
-                    style={{ fill: tone, stroke: cardBg, strokeWidth: 2.5 }}
-                  />
-                </g>
-              );
-            })()
-          : null}
-      </svg>
+          {active
+            ? (() => {
+                const lw = active.label.length * 6.3 + 18;
+                const dir = active.x < 330 ? 1 : active.x > 470 ? -1 : 0;
+                const chipX = dir === 0 ? -lw / 2 : dir > 0 ? 18 : -18 - lw;
+                const chipY = dir === 0 ? -36 : -10;
+                const textX = dir === 0 ? 0 : dir > 0 ? 18 + lw / 2 : -18 - lw / 2;
+                return (
+                  <g
+                    className="tf-token"
+                    style={{ transform: `translate(${active.x}px, ${active.y}px)` }}
+                  >
+                    {active.label ? (
+                      <g>
+                        <rect
+                          x={chipX}
+                          y={chipY}
+                          width={lw}
+                          height={20}
+                          rx={10}
+                          style={{ fill: cardBg, stroke: tone, strokeWidth: 1 }}
+                        />
+                        <text
+                          x={textX}
+                          y={chipY + 14}
+                          textAnchor="middle"
+                          style={{ fill: tone, fontSize: 10.5, fontFamily: mono }}
+                        >
+                          {active.label}
+                        </text>
+                      </g>
+                    ) : null}
+                    <circle
+                      r={13}
+                      filter="url(#tf-glow)"
+                      style={{ fill: tone, stroke: cardBg, strokeWidth: 2.5 }}
+                    />
+                  </g>
+                );
+              })()
+            : null}
+        </svg>
+        {tip ? (
+          <div
+            style={{
+              position: 'absolute',
+              left: tip.left,
+              top: tip.top,
+              transform: 'translate(-50%, calc(-100% - 12px))',
+              width: 220,
+              pointerEvents: 'none',
+              zIndex: 5,
+              background: 'var(--color-fd-card)',
+              border: '1px solid var(--color-fd-border)',
+              borderRadius: 10,
+              padding: '8px 11px',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
+            }}
+          >
+            <div
+              style={{
+                fontSize: 12.5,
+                fontWeight: 700,
+                color: 'var(--color-fd-foreground)',
+                marginBottom: 3,
+              }}
+            >
+              {tip.title}
+            </div>
+            <div
+              style={{ fontSize: 11.5, lineHeight: 1.4, color: 'var(--color-fd-muted-foreground)' }}
+            >
+              {tip.body}
+            </div>
+          </div>
+        ) : null}
+      </div>
 
       {/* Controls. */}
       <div

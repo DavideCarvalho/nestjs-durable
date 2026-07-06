@@ -94,6 +94,8 @@ function Card({
   title,
   titleFill,
   sub,
+  tip,
+  onTip,
 }: {
   cx: number;
   y: number;
@@ -107,10 +109,24 @@ function Card({
   title: string;
   titleFill: string;
   sub: string;
+  tip: { title: string; body: string };
+  onTip: (t: { ax: number; ay: number; title: string; body: string } | null) => void;
 }) {
   const x = cx - CELL_W / 2;
+  const enter = () => onTip({ ax: cx, ay: y, title: tip.title, body: tip.body });
+  const leave = () => onTip(null);
   return (
-    <g className="rd-anim" style={{ opacity }}>
+    <g
+      className="rd-anim"
+      style={{ opacity, cursor: 'help' }}
+      tabIndex={0}
+      role="img"
+      aria-label={`${tip.title}. ${tip.body}`}
+      onMouseEnter={enter}
+      onMouseLeave={leave}
+      onFocus={enter}
+      onBlur={leave}
+    >
       <rect
         x={x}
         y={y}
@@ -151,11 +167,42 @@ function Card({
 }
 
 /** A checkpoint pill in the store tape. */
-function Pill({ cx, filled, seq }: { cx: number; filled: boolean; seq: number }) {
+function Pill({
+  cx,
+  filled,
+  seq,
+  onTip,
+}: {
+  cx: number;
+  filled: boolean;
+  seq: number;
+  onTip: (t: { ax: number; ay: number; title: string; body: string } | null) => void;
+}) {
   const w = 158;
   const x = cx - w / 2;
+  const tip = filled
+    ? {
+        title: `Checkpoint seq:${seq}`,
+        body: 'Completed — the step’s saved output. On replay it is returned instead of re-running the step.',
+      }
+    : {
+        title: `seq:${seq} · no checkpoint`,
+        body: 'Nothing saved here, so replay must execute this step for real.',
+      };
+  const enter = () => onTip({ ax: cx, ay: ST_Y, title: tip.title, body: tip.body });
+  const leave = () => onTip(null);
   return (
-    <g className="rd-anim">
+    <g
+      className="rd-anim"
+      style={{ cursor: 'help' }}
+      tabIndex={0}
+      role="img"
+      aria-label={`${tip.title}. ${tip.body}`}
+      onMouseEnter={enter}
+      onMouseLeave={leave}
+      onFocus={enter}
+      onBlur={leave}
+    >
       <rect
         x={x}
         y={ST_Y}
@@ -245,7 +292,31 @@ export function ReplayDiagram() {
   const [t, setT] = useState(999); // clamped below → SSR/first paint shows the resolved frame
   const [playing, setPlaying] = useState(false);
   const [reduced, setReduced] = useState(false);
+  const [tip, setTip] = useState<{ left: number; top: number; title: string; body: string } | null>(
+    null,
+  );
   const svgRef = useRef<SVGSVGElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  // Map an SVG-space anchor to a pixel position within the wrapper so the HTML tooltip stays crisp
+  // (it doesn't scale with the SVG) and sits centred just above the hovered element.
+  function onTip(t: { ax: number; ay: number; title: string; body: string } | null) {
+    if (!t) {
+      setTip(null);
+      return;
+    }
+    const svg = svgRef.current;
+    const wrap = wrapRef.current;
+    if (!svg || !wrap) return;
+    const s = svg.getBoundingClientRect();
+    const w = wrap.getBoundingClientRect();
+    setTip({
+      left: (t.ax / 800) * s.width + (s.left - w.left),
+      top: (t.ay / 340) * s.height + (s.top - w.top),
+      title: t.title,
+      body: t.body,
+    });
+  }
 
   const events = useMemo(() => buildEvents(checkpointed), [checkpointed]);
   const tc = Math.min(t, events.length);
@@ -363,297 +434,381 @@ export function ReplayDiagram() {
         @media (prefers-reduced-motion: reduce) { .rd-anim { transition: none } .rd-ping, .rd-flow { animation: none } .rd-ping { opacity: 0 } }
       `}</style>
 
-      <svg
-        ref={svgRef}
-        viewBox="0 0 800 340"
-        width="100%"
-        role="img"
-        aria-label="Interactive checkpoint and deterministic replay across a crash"
-      >
-        <title>
-          The first run executes each step and writes a checkpoint; after a crash, replay returns
-          the saved output for completed checkpoints and executes only the step that has none. Drag
-          the crash marker to change how many checkpoints exist before the crash.
-        </title>
-        <defs>
-          <marker
-            id="rd-arrow"
-            viewBox="0 0 10 10"
-            refX={8}
-            refY={5}
-            markerWidth={6}
-            markerHeight={6}
-            orient="auto-start-reverse"
-          >
-            <path d="M0,0 L10,5 L0,10 z" style={{ fill: muted }} />
-          </marker>
-          <marker
-            id="rd-arrow-on"
-            viewBox="0 0 10 10"
-            refX={8}
-            refY={5}
-            markerWidth={6}
-            markerHeight={6}
-            orient="auto-start-reverse"
-          >
-            <path d="M0,0 L10,5 L0,10 z" style={{ fill: accent }} />
-          </marker>
-          <filter id="rd-soft" x="-10%" y="-10%" width="120%" height="140%">
-            <feDropShadow dx="0" dy="3" stdDeviation="5" floodOpacity="0.10" />
-          </filter>
-        </defs>
-
-        {/* Column headers. */}
-        {STEPS.map((step, i) => (
-          <g key={step.idx}>
-            <text
-              x={COLS[i]}
-              y={30}
-              textAnchor="middle"
-              style={{ fill: ink, fontSize: 12, fontWeight: 700 }}
+      <div ref={wrapRef} style={{ position: 'relative' }}>
+        <svg
+          ref={svgRef}
+          viewBox="0 0 800 340"
+          width="100%"
+          role="img"
+          aria-label="Interactive checkpoint and deterministic replay across a crash"
+        >
+          <title>
+            The first run executes each step and writes a checkpoint; after a crash, replay returns
+            the saved output for completed checkpoints and executes only the step that has none.
+            Drag the crash marker to change how many checkpoints exist before the crash.
+          </title>
+          <defs>
+            <marker
+              id="rd-arrow"
+              viewBox="0 0 10 10"
+              refX={8}
+              refY={5}
+              markerWidth={6}
+              markerHeight={6}
+              orient="auto-start-reverse"
             >
-              {step.idx}
-            </text>
-            <text
-              x={COLS[i]}
-              y={45}
-              textAnchor="middle"
-              style={{ fill: muted, fontSize: 11, fontFamily: mono }}
+              <path d="M0,0 L10,5 L0,10 z" style={{ fill: muted }} />
+            </marker>
+            <marker
+              id="rd-arrow-on"
+              viewBox="0 0 10 10"
+              refX={8}
+              refY={5}
+              markerWidth={6}
+              markerHeight={6}
+              orient="auto-start-reverse"
             >
-              {step.name}
-            </text>
-          </g>
-        ))}
+              <path d="M0,0 L10,5 L0,10 z" style={{ fill: accent }} />
+            </marker>
+            <filter id="rd-soft" x="-10%" y="-10%" width="120%" height="140%">
+              <feDropShadow dx="0" dy="3" stdDeviation="5" floodOpacity="0.10" />
+            </filter>
+          </defs>
 
-        {/* Left rail labels. */}
-        <text
-          x={14}
-          y={FR_Y + FR_H / 2 - 5}
-          style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
-        >
-          FIRST
-        </text>
-        <text
-          x={14}
-          y={FR_Y + FR_H / 2 + 9}
-          style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
-        >
-          RUN
-        </text>
-        <text
-          x={14}
-          y={ST_Y + ST_H / 2 + 3}
-          style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
-        >
-          STORE
-        </text>
-        <text
-          x={14}
-          y={RP_Y + RP_H / 2 - 5}
-          style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
-        >
-          REPLAY
-        </text>
-        <text x={14} y={RP_Y + RP_H / 2 + 9} style={{ fill: muted, fontSize: 9, fontFamily: mono }}>
-          on crash
-        </text>
+          {/* Column headers. */}
+          {STEPS.map((step, i) => (
+            <g key={step.idx}>
+              <text
+                x={COLS[i]}
+                y={30}
+                textAnchor="middle"
+                style={{ fill: ink, fontSize: 12, fontWeight: 700 }}
+              >
+                {step.idx}
+              </text>
+              <text
+                x={COLS[i]}
+                y={45}
+                textAnchor="middle"
+                style={{ fill: muted, fontSize: 11, fontFamily: mono }}
+              >
+                {step.name}
+              </text>
+            </g>
+          ))}
 
-        {/* First-run band. */}
-        <g className="rd-anim" style={{ opacity: phase === 'replay' ? 0.55 : 1 }}>
-          {STEPS.map((step, i) => {
-            if (i >= checkpointed) {
+          {/* Left rail labels. */}
+          <text
+            x={14}
+            y={FR_Y + FR_H / 2 - 5}
+            style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
+          >
+            FIRST
+          </text>
+          <text
+            x={14}
+            y={FR_Y + FR_H / 2 + 9}
+            style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
+          >
+            RUN
+          </text>
+          <text
+            x={14}
+            y={ST_Y + ST_H / 2 + 3}
+            style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
+          >
+            STORE
+          </text>
+          <text
+            x={14}
+            y={RP_Y + RP_H / 2 - 5}
+            style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
+          >
+            REPLAY
+          </text>
+          <text
+            x={14}
+            y={RP_Y + RP_H / 2 + 9}
+            style={{ fill: muted, fontSize: 9, fontFamily: mono }}
+          >
+            on crash
+          </text>
+
+          {/* First-run band. */}
+          <g className="rd-anim" style={{ opacity: phase === 'replay' ? 0.55 : 1 }}>
+            {STEPS.map((step, i) => {
+              if (i >= checkpointed) {
+                return (
+                  <Card
+                    key={`fr-${step.idx}`}
+                    cx={COLS[i]}
+                    y={FR_Y}
+                    h={FR_H}
+                    fill={tintRed}
+                    stroke={border}
+                    dashed
+                    opacity={0.75}
+                    glyph="✕"
+                    glyphFill={RED}
+                    title="not reached"
+                    titleFill={muted}
+                    sub="crash was earlier"
+                    onTip={onTip}
+                    tip={{
+                      title: `${step.idx} · not reached`,
+                      body: 'The crash happened before this step ran, so it never wrote a checkpoint.',
+                    }}
+                  />
+                );
+              }
+              const on = firstDone(i);
               return (
                 <Card
                   key={`fr-${step.idx}`}
                   cx={COLS[i]}
                   y={FR_Y}
                   h={FR_H}
-                  fill={tintRed}
-                  stroke={border}
-                  dashed
-                  opacity={0.75}
-                  glyph="✕"
-                  glyphFill={RED}
-                  title="not reached"
-                  titleFill={muted}
-                  sub="crash was earlier"
+                  fill={on ? tintAccent : neutral}
+                  stroke={on ? accent : border}
+                  dashed={!on}
+                  opacity={on ? 1 : 0.6}
+                  glyph={on ? '▸' : '○'}
+                  glyphFill={on ? accent : muted}
+                  title="execute"
+                  titleFill={on ? ink : muted}
+                  sub="→ checkpoint"
+                  onTip={onTip}
+                  tip={{
+                    title: `${step.idx} · first run`,
+                    body: `${step.name} runs and writes its result to the store as checkpoint seq:${i}.`,
+                  }}
                 />
               );
-            }
-            const on = firstDone(i);
-            return (
-              <Card
-                key={`fr-${step.idx}`}
-                cx={COLS[i]}
-                y={FR_Y}
-                h={FR_H}
-                fill={on ? tintAccent : neutral}
-                stroke={on ? accent : border}
-                dashed={!on}
-                opacity={on ? 1 : 0.6}
-                glyph={on ? '▸' : '○'}
-                glyphFill={on ? accent : muted}
-                title="execute"
-                titleFill={on ? ink : muted}
-                sub="→ checkpoint"
-              />
-            );
-          })}
-        </g>
+            })}
+          </g>
 
-        {/* Store tape. */}
-        {STEPS.map((step, i) => (
-          <Pill key={`slot-${step.idx}`} cx={COLS[i]} filled={storeFilled(i)} seq={i} />
-        ))}
+          {/* Store tape. */}
+          {STEPS.map((step, i) => (
+            <Pill
+              key={`slot-${step.idx}`}
+              cx={COLS[i]}
+              filled={storeFilled(i)}
+              seq={i}
+              onTip={onTip}
+            />
+          ))}
 
-        {/* Replay band. */}
-        <g className="rd-anim" style={{ opacity: phase === 'first' ? 0.4 : 1 }}>
-          {STEPS.map((step, i) => {
-            if (i < checkpointed) {
-              const on = returned(i);
+          {/* Replay band. */}
+          <g className="rd-anim" style={{ opacity: phase === 'first' ? 0.4 : 1 }}>
+            {STEPS.map((step, i) => {
+              if (i < checkpointed) {
+                const on = returned(i);
+                return (
+                  <Card
+                    key={`rp-${step.idx}`}
+                    cx={COLS[i]}
+                    y={RP_Y}
+                    h={RP_H}
+                    fill={neutral}
+                    stroke={border}
+                    dashed
+                    opacity={on ? 0.92 : 0.5}
+                    glyph="↩"
+                    glyphFill={on ? accent : muted}
+                    title="return saved"
+                    titleFill={muted}
+                    sub="not re-run"
+                    onTip={onTip}
+                    tip={{
+                      title: `${step.idx} · replay`,
+                      body: 'A completed checkpoint exists, so the saved output is returned. The step body does not run again.',
+                    }}
+                  />
+                );
+              }
+              const on = replayed(i);
               return (
                 <Card
                   key={`rp-${step.idx}`}
                   cx={COLS[i]}
                   y={RP_Y}
                   h={RP_H}
-                  fill={neutral}
-                  stroke={border}
-                  dashed
-                  opacity={on ? 0.92 : 0.5}
-                  glyph="↩"
+                  fill={on ? tintAccent : neutral}
+                  stroke={on ? accent : border}
+                  dashed={!on}
+                  opacity={on ? 1 : 0.6}
+                  glyph={on ? '▸' : '○'}
                   glyphFill={on ? accent : muted}
-                  title="return saved"
-                  titleFill={muted}
-                  sub="not re-run"
+                  title="execute for real"
+                  titleFill={on ? ink : muted}
+                  sub="no checkpoint"
+                  onTip={onTip}
+                  tip={{
+                    title: `${step.idx} · replay`,
+                    body: `No checkpoint here, so ${step.name} executes for real now and writes seq:${i}.`,
+                  }}
                 />
               );
-            }
-            const on = replayed(i);
-            return (
-              <Card
-                key={`rp-${step.idx}`}
-                cx={COLS[i]}
-                y={RP_Y}
-                h={RP_H}
-                fill={on ? tintAccent : neutral}
-                stroke={on ? accent : border}
-                dashed={!on}
-                opacity={on ? 1 : 0.6}
-                glyph={on ? '▸' : '○'}
-                glyphFill={on ? accent : muted}
-                title="execute for real"
-                titleFill={on ? ink : muted}
-                sub="no checkpoint"
-              />
-            );
-          })}
-        </g>
+            })}
+          </g>
 
-        {/* Data-flow arrows. */}
-        {STEPS.map((step, i) =>
-          i < checkpointed ? (
-            <g key={`arr-${step.idx}`}>
+          {/* Data-flow arrows. */}
+          {STEPS.map((step, i) =>
+            i < checkpointed ? (
+              <g key={`arr-${step.idx}`}>
+                <VArrow
+                  cx={COLS[i]}
+                  y1={FR_Y + FR_H}
+                  y2={ST_Y}
+                  label={i === 0 ? 'write' : undefined}
+                  shown={firstDone(i)}
+                  flow={current?.kind === 'exec-first' && current.step === i}
+                />
+                <VArrow
+                  cx={COLS[i]}
+                  y1={ST_Y + ST_H}
+                  y2={RP_Y}
+                  label={i === 0 ? 'return' : undefined}
+                  shown={returned(i)}
+                  flow={current?.kind === 'return' && current.step === i}
+                />
+              </g>
+            ) : (
               <VArrow
+                key={`arr-${step.idx}`}
                 cx={COLS[i]}
-                y1={FR_Y + FR_H}
-                y2={ST_Y}
-                label={i === 0 ? 'write' : undefined}
-                shown={firstDone(i)}
-                flow={current?.kind === 'exec-first' && current.step === i}
+                y1={RP_Y}
+                y2={ST_Y + ST_H}
+                shown={replayed(i)}
+                flow={current?.kind === 'exec-replay' && current.step === i}
               />
-              <VArrow
-                cx={COLS[i]}
-                y1={ST_Y + ST_H}
-                y2={RP_Y}
-                label={i === 0 ? 'return' : undefined}
-                shown={returned(i)}
-                flow={current?.kind === 'return' && current.step === i}
-              />
-            </g>
-          ) : (
-            <VArrow
-              key={`arr-${step.idx}`}
-              cx={COLS[i]}
-              y1={RP_Y}
-              y2={ST_Y + ST_H}
-              shown={replayed(i)}
-              flow={current?.kind === 'exec-replay' && current.step === i}
+            ),
+          )}
+
+          {/* Ping ring on the step the current beat executed. */}
+          {current && (current.kind === 'exec-first' || current.kind === 'exec-replay') ? (
+            <rect
+              key={`ping-${tc}`}
+              className="rd-ping"
+              x={COLS[current.step] - CELL_W / 2 - 3}
+              y={(current.kind === 'exec-first' ? FR_Y : RP_Y) - 3}
+              width={CELL_W + 6}
+              height={(current.kind === 'exec-first' ? FR_H : RP_H) + 6}
+              rx={16}
+              style={{ fill: 'none', stroke: accent, strokeWidth: 2 }}
             />
-          ),
-        )}
+          ) : null}
 
-        {/* Ping ring on the step the current beat executed. */}
-        {current && (current.kind === 'exec-first' || current.kind === 'exec-replay') ? (
-          <rect
-            key={`ping-${tc}`}
-            className="rd-ping"
-            x={COLS[current.step] - CELL_W / 2 - 3}
-            y={(current.kind === 'exec-first' ? FR_Y : RP_Y) - 3}
-            width={CELL_W + 6}
-            height={(current.kind === 'exec-first' ? FR_H : RP_H) + 6}
-            rx={16}
-            style={{ fill: 'none', stroke: accent, strokeWidth: 2 }}
-          />
-        ) : null}
-
-        {/* Draggable crash marker: fault line across the first-run band + a grabbable handle. */}
-        <g
-          role="slider"
-          tabIndex={0}
-          aria-label="Crash point — number of checkpoints written before the crash"
-          aria-valuemin={0}
-          aria-valuemax={N}
-          aria-valuenow={checkpointed}
-          onPointerDown={onHandleDown}
-          onKeyDown={onHandleKey}
-          style={{ cursor: 'ew-resize', outline: 'none' }}
-          className="rd-anim"
-        >
-          {/* Jagged lightning fault line — a vector rupture, no emoji. */}
-          <path
-            d={`M ${crashX} ${FR_Y - 6} L ${crashX - 5} ${FR_Y + 12} L ${crashX + 5} ${FR_Y + 30} L ${crashX - 5} ${FR_Y + 48} L ${crashX + 5} ${FR_Y + 62} L ${crashX} ${FR_Y + FR_H + 6}`}
+          {/* Draggable crash marker: fault line across the first-run band + a grabbable handle. */}
+          <g
+            role="slider"
+            tabIndex={0}
+            aria-label="Crash point — number of checkpoints written before the crash"
+            aria-valuemin={0}
+            aria-valuemax={N}
+            aria-valuenow={checkpointed}
+            onPointerDown={onHandleDown}
+            onKeyDown={onHandleKey}
+            onMouseEnter={() =>
+              onTip({
+                ax: crashX,
+                ay: FR_Y - 32,
+                title: 'Crash point — drag me',
+                body: 'Choose when the process dies. Only steps checkpointed before the crash are skipped on replay; the rest re-run.',
+              })
+            }
+            onMouseLeave={() => onTip(null)}
+            onFocus={() =>
+              onTip({
+                ax: crashX,
+                ay: FR_Y - 32,
+                title: 'Crash point — arrow keys move me',
+                body: 'Choose when the process dies. Only steps checkpointed before the crash are skipped on replay; the rest re-run.',
+              })
+            }
+            onBlur={() => onTip(null)}
+            style={{ cursor: 'ew-resize', outline: 'none' }}
             className="rd-anim"
-            style={{
-              fill: 'none',
-              stroke: RED,
-              strokeWidth: 2,
-              strokeLinejoin: 'round',
-              strokeLinecap: 'round',
-              opacity: phase === 'crash' ? 1 : 0.85,
-            }}
-          />
-          {/* Handle tab: a drawn lightning bolt + label. */}
-          <rect
-            x={crashX - 35}
-            y={FR_Y - 32}
-            width={70}
-            height={23}
-            rx={7}
-            className="rd-anim"
-            style={{ fill: tintRed, stroke: RED, strokeWidth: 1.25 }}
-          />
-          <path
-            d={`M ${crashX - 17} ${FR_Y - 27} L ${crashX - 24} ${FR_Y - 19} L ${crashX - 20} ${FR_Y - 19} L ${crashX - 23} ${FR_Y - 13} L ${crashX - 14} ${FR_Y - 22} L ${crashX - 18} ${FR_Y - 22} Z`}
-            style={{ fill: RED }}
-          />
-          <text
-            x={crashX + 6}
-            y={FR_Y - 16}
-            textAnchor="middle"
-            style={{ fill: RED, fontSize: 10.5, fontWeight: 700, letterSpacing: 0.6 }}
           >
-            crash
-          </text>
-          <rect
-            x={crashX - 22}
-            y={FR_Y - 34}
-            width={44}
-            height={FR_H + 48}
-            style={{ fill: 'transparent' }}
-          />
-        </g>
-      </svg>
+            {/* Jagged lightning fault line — a vector rupture, no emoji. */}
+            <path
+              d={`M ${crashX} ${FR_Y - 6} L ${crashX - 5} ${FR_Y + 12} L ${crashX + 5} ${FR_Y + 30} L ${crashX - 5} ${FR_Y + 48} L ${crashX + 5} ${FR_Y + 62} L ${crashX} ${FR_Y + FR_H + 6}`}
+              className="rd-anim"
+              style={{
+                fill: 'none',
+                stroke: RED,
+                strokeWidth: 2,
+                strokeLinejoin: 'round',
+                strokeLinecap: 'round',
+                opacity: phase === 'crash' ? 1 : 0.85,
+              }}
+            />
+            {/* Handle tab: a drawn lightning bolt + label. */}
+            <rect
+              x={crashX - 35}
+              y={FR_Y - 32}
+              width={70}
+              height={23}
+              rx={7}
+              className="rd-anim"
+              style={{ fill: tintRed, stroke: RED, strokeWidth: 1.25 }}
+            />
+            <path
+              d={`M ${crashX - 17} ${FR_Y - 27} L ${crashX - 24} ${FR_Y - 19} L ${crashX - 20} ${FR_Y - 19} L ${crashX - 23} ${FR_Y - 13} L ${crashX - 14} ${FR_Y - 22} L ${crashX - 18} ${FR_Y - 22} Z`}
+              style={{ fill: RED }}
+            />
+            <text
+              x={crashX + 6}
+              y={FR_Y - 16}
+              textAnchor="middle"
+              style={{ fill: RED, fontSize: 10.5, fontWeight: 700, letterSpacing: 0.6 }}
+            >
+              crash
+            </text>
+            <rect
+              x={crashX - 22}
+              y={FR_Y - 34}
+              width={44}
+              height={FR_H + 48}
+              style={{ fill: 'transparent' }}
+            />
+          </g>
+        </svg>
+        {tip ? (
+          <div
+            style={{
+              position: 'absolute',
+              left: tip.left,
+              top: tip.top,
+              transform: 'translate(-50%, calc(-100% - 12px))',
+              width: 216,
+              pointerEvents: 'none',
+              zIndex: 5,
+              background: 'var(--color-fd-card)',
+              border: '1px solid var(--color-fd-border)',
+              borderRadius: 10,
+              padding: '8px 11px',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
+            }}
+          >
+            <div
+              style={{
+                fontSize: 12.5,
+                fontWeight: 700,
+                color: 'var(--color-fd-foreground)',
+                marginBottom: 3,
+              }}
+            >
+              {tip.title}
+            </div>
+            <div
+              style={{ fontSize: 11.5, lineHeight: 1.4, color: 'var(--color-fd-muted-foreground)' }}
+            >
+              {tip.body}
+            </div>
+          </div>
+        ) : null}
+      </div>
 
       {/* Controls. */}
       <div
