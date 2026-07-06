@@ -1,9 +1,10 @@
 'use client';
 
 // Interactive checkpoint-and-replay illustration for the durability docs. Hand-authored SVG, no
-// animation deps — plain React state + CSS transitions. Reads top-to-bottom as time across three
-// column-aligned bands (first run → checkpoint store → replay after crash). Play/step/scrub walks
-// logical time; the 💥 crash marker is draggable and reshapes what replay re-runs vs returns saved.
+// animation deps — plain React state + CSS transitions. Three column-aligned bands read top-to-bottom
+// as time: first run → checkpoint store → replay after crash. Play/step/scrub walks logical time;
+// the 💥 crash marker is draggable (and mirrored by the "Crash after" control) and reshapes what
+// replay re-runs vs returns from a checkpoint.
 //
 // Degrades without JS: SSR renders the fully-resolved frame (a readable static diagram). Theme-aware
 // via Fumadocs' `--color-fd-*` variables; respects `prefers-reduced-motion`.
@@ -12,15 +13,20 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 const ink = 'var(--color-fd-foreground)';
 const muted = 'var(--color-fd-muted-foreground)';
-const card = 'var(--color-fd-card)';
+const cardBg = 'var(--color-fd-card)';
 const border = 'var(--color-fd-border)';
 const accent = 'var(--color-fd-primary)';
-const accentSoft = 'color-mix(in srgb, var(--color-fd-primary) 14%, transparent)';
 const mono = 'ui-monospace, SFMono-Regular, Menlo, monospace';
+const RED = '#e5484d';
 
-const COLS = [200, 410, 620];
-const CELL_W = 156;
-const SLOT_W = 150;
+// Layered surface tints — opaque over the card so they read on any theme.
+const tintAccent = 'color-mix(in srgb, var(--color-fd-primary) 14%, var(--color-fd-card))';
+const tintAccentSoft = 'color-mix(in srgb, var(--color-fd-primary) 7%, var(--color-fd-card))';
+const neutral = 'color-mix(in srgb, var(--color-fd-foreground) 4%, var(--color-fd-card))';
+const tintRed = 'color-mix(in srgb, #e5484d 12%, var(--color-fd-card))';
+
+const COLS = [188, 418, 648];
+const CELL_W = 176;
 const N = 3;
 const STEPS = [
   { idx: 'step[0]', name: 'reserveStock' },
@@ -28,14 +34,17 @@ const STEPS = [
   { idx: 'step[2]', name: 'ship' },
 ];
 
-// Snap x for the crash marker when `checkpointedCount` = C (0..N): to the right of the last
-// checkpointed step, i.e. just left of column C (or past the last column when C === N).
-const BOUNDARY_X = [
-  COLS[0] - CELL_W / 2 - 15,
-  (COLS[0] + COLS[1]) / 2,
-  (COLS[1] + COLS[2]) / 2,
-  COLS[2] + CELL_W / 2 + 15,
-];
+// Vertical bands.
+const FR_Y = 60;
+const FR_H = 74;
+const ST_Y = 170;
+const ST_H = 46;
+const RP_Y = 246;
+const RP_H = 74;
+
+// Snap x for the crash marker when `checkpointedCount` = C (0..N): just right of the last
+// checkpointed step (or past the last column when C === N).
+const BOUNDARY_X = [96, 303, 533, 748];
 
 type Ev =
   | { kind: 'exec-first'; step: number }
@@ -56,10 +65,10 @@ function buildEvents(checkpointedCount: number): Ev[] {
 }
 
 function caption(e: Ev | undefined): string {
-  if (!e) return 'Ready — press play, or drag 💥 to move the crash.';
+  if (!e) return 'Ready — press play, drag 💥, or scrub the timeline.';
   switch (e.kind) {
     case 'exec-first':
-      return `First run: execute ${STEPS[e.step].name} → write checkpoint seq:${e.step}`;
+      return `First run: execute ${STEPS[e.step].name} → write checkpoint seq:${e.step}.`;
     case 'crash':
       return '💥 crash — the process dies mid-run.';
     case 'restart':
@@ -71,30 +80,35 @@ function caption(e: Ev | undefined): string {
   }
 }
 
-/** A step cell (first-run or replay band). */
-function Cell({
+/** A step card (first-run or replay band). Fully presentational — the parent computes the look. */
+function Card({
   cx,
   y,
   h,
-  tone,
-  active,
+  fill,
+  stroke,
+  dashed,
+  opacity,
+  glyph,
+  glyphFill,
   title,
+  titleFill,
   sub,
 }: {
   cx: number;
   y: number;
   h: number;
-  tone: 'exec' | 'saved' | 'idle';
-  active: boolean;
+  fill: string;
+  stroke: string;
+  dashed: boolean;
+  opacity: number;
+  glyph: string;
+  glyphFill: string;
   title: string;
+  titleFill: string;
   sub: string;
 }) {
   const x = cx - CELL_W / 2;
-  const isExec = tone === 'exec';
-  const stroke = isExec && active ? accent : border;
-  const dashed = !(isExec && active);
-  const opacity = active ? 1 : tone === 'idle' ? 0.4 : 0.5;
-  const titleFill = tone === 'saved' ? muted : active || tone !== 'exec' ? ink : muted;
   return (
     <g className="rd-anim" style={{ opacity }}>
       <rect
@@ -102,30 +116,31 @@ function Cell({
         y={y}
         width={CELL_W}
         height={h}
-        rx={10}
+        rx={13}
         className="rd-anim"
         style={{
-          fill: card,
+          fill,
           stroke,
-          strokeWidth: isExec && active ? 1.5 : 1,
-          strokeDasharray: dashed ? '4 3' : undefined,
+          strokeWidth: 1.25,
+          strokeDasharray: dashed ? '5 4' : undefined,
         }}
         filter="url(#rd-soft)"
       />
-      {isExec && active ? (
-        <rect x={x} y={y} width={4} height={h} rx={2} style={{ fill: accent }} />
-      ) : null}
+      <text x={x + 15} y={y + 23} style={{ fill: glyphFill, fontSize: 13 }}>
+        {glyph}
+      </text>
       <text
-        x={cx}
-        y={y + 26}
+        x={cx + 8}
+        y={y + h / 2 - 1}
         textAnchor="middle"
-        style={{ fill: titleFill, fontSize: 12.5, fontWeight: 600 }}
+        className="rd-anim"
+        style={{ fill: titleFill, fontSize: 13, fontWeight: 600 }}
       >
         {title}
       </text>
       <text
-        x={cx}
-        y={y + 44}
+        x={cx + 8}
+        y={y + h / 2 + 17}
         textAnchor="middle"
         style={{ fill: muted, fontSize: 10.5, fontFamily: mono }}
       >
@@ -135,73 +150,85 @@ function Cell({
   );
 }
 
-/** A checkpoint slot in the store lane. */
-function Slot({ cx, y, filled, seq }: { cx: number; y: number; filled: boolean; seq: number }) {
-  const x = cx - SLOT_W / 2;
+/** A checkpoint pill in the store tape. */
+function Pill({ cx, filled, seq }: { cx: number; filled: boolean; seq: number }) {
+  const w = 158;
+  const x = cx - w / 2;
   return (
     <g className="rd-anim">
       <rect
         x={x}
-        y={y}
-        width={SLOT_W}
-        height={44}
-        rx={8}
+        y={ST_Y}
+        width={w}
+        height={ST_H}
+        rx={ST_H / 2}
         className="rd-anim"
         style={{
-          fill: filled ? accentSoft : card,
-          stroke: border,
-          strokeWidth: 1,
-          strokeDasharray: filled ? undefined : '4 3',
+          fill: filled ? tintAccent : neutral,
+          stroke: filled ? accent : border,
+          strokeWidth: 1.25,
+          strokeDasharray: filled ? undefined : '5 4',
         }}
       />
       <text
-        x={cx}
-        y={y + 18}
-        textAnchor="middle"
+        x={x + 20}
+        y={ST_Y + ST_H / 2 + 4}
         className="rd-anim"
-        style={{ fill: filled ? ink : muted, fontSize: 10.5, fontWeight: 600, fontFamily: mono }}
+        style={{ fill: filled ? accent : muted, fontSize: 13 }}
       >
-        {filled ? `seq:${seq} · completed` : `seq:${seq} · none`}
+        {filled ? '✓' : '○'}
       </text>
       <text
-        x={cx}
-        y={y + 33}
+        x={cx + 12}
+        y={ST_Y + ST_H / 2 - 2}
         textAnchor="middle"
-        style={{ fill: muted, fontSize: 10, fontFamily: mono }}
+        className="rd-anim"
+        style={{ fill: filled ? ink : muted, fontSize: 11, fontWeight: 600, fontFamily: mono }}
       >
-        {filled ? 'saved output' : '—'}
+        seq:{seq}
+      </text>
+      <text
+        x={cx + 12}
+        y={ST_Y + ST_H / 2 + 13}
+        textAnchor="middle"
+        style={{ fill: muted, fontSize: 9.5, fontFamily: mono }}
+      >
+        {filled ? 'saved output' : 'empty'}
       </text>
     </g>
   );
 }
 
-/** A short vertical connector; arrowhead sits at (cx, y2). */
+/** A short vertical connector; arrowhead at (cx, y2). `flow` animates it as the active beat. */
 function VArrow({
   cx,
   y1,
   y2,
   label,
   shown,
+  flow,
 }: {
   cx: number;
   y1: number;
   y2: number;
   label?: string;
   shown: boolean;
+  flow: boolean;
 }) {
   return (
-    <g className="rd-anim" style={{ opacity: shown ? 1 : 0.15 }}>
+    <g className="rd-anim" style={{ opacity: shown ? 1 : 0.12 }}>
       <line
         x1={cx}
         y1={y1}
         x2={cx}
         y2={y2}
-        style={{ stroke: muted, strokeWidth: 1.5 }}
-        markerEnd="url(#rd-arrow)"
+        className={flow ? 'rd-flow' : undefined}
+        style={{ stroke: flow ? accent : muted, strokeWidth: 1.5 }}
+        markerEnd={flow ? 'url(#rd-arrow-on)' : 'url(#rd-arrow)'}
       />
       {label ? (
         <text
-          x={cx - 9}
+          x={cx - 10}
           y={(y1 + y2) / 2 + 3}
           textAnchor="end"
           style={{ fill: muted, fontSize: 9.5, fontFamily: mono }}
@@ -237,13 +264,15 @@ export function ReplayDiagram() {
       setPlaying(false);
       return;
     }
-    const id = setTimeout(() => setT((v) => Math.min(events.length, v + 1)), reduced ? 320 : 850);
+    const id = setTimeout(() => setT((v) => Math.min(events.length, v + 1)), reduced ? 320 : 900);
     return () => clearTimeout(id);
   }, [playing, tc, events.length, reduced]);
 
+  // Changing the crash point jumps to the resolved outcome so the effect is visible at once;
+  // press Reset/Play to watch it build up from the start.
   function resetTo(count: number) {
     setCheckpointed(count);
-    setT(0);
+    setT(999);
     setPlaying(false);
   }
 
@@ -251,7 +280,7 @@ export function ReplayDiagram() {
     const svg = svgRef.current;
     if (!svg) return;
     const rect = svg.getBoundingClientRect();
-    const x = ((clientX - rect.left) / rect.width) * 720;
+    const x = ((clientX - rect.left) / rect.width) * 800;
     let best = 0;
     let bestD = Number.POSITIVE_INFINITY;
     for (let c = 0; c <= N; c++) {
@@ -295,33 +324,48 @@ export function ReplayDiagram() {
   const restarted = has((e) => e.kind === 'restart');
   const phase: 'first' | 'crash' | 'replay' = !crashed ? 'first' : !restarted ? 'crash' : 'replay';
   const current = tc > 0 ? events[tc - 1] : undefined;
-
   const crashX = BOUNDARY_X[checkpointed];
+
   const btn = {
     font: 'inherit',
-    fontSize: 12.5,
+    fontSize: 13,
+    lineHeight: 1,
     color: 'var(--color-fd-foreground)',
+    background: 'transparent',
+    border: 'none',
+    borderRadius: 7,
+    padding: '7px 10px',
+    cursor: 'pointer',
+  } as const;
+  const group = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 2,
     background: 'var(--color-fd-card)',
     border: '1px solid var(--color-fd-border)',
-    borderRadius: 8,
-    padding: '4px 12px',
-    cursor: 'pointer',
+    borderRadius: 9,
+    padding: 2,
   } as const;
 
   return (
-    <figure className="my-6 overflow-hidden rounded-xl border border-fd-border bg-fd-card p-4">
+    <figure
+      className="my-6 rounded-2xl border border-fd-border p-3 sm:p-4"
+      style={{ background: tintAccentSoft }}
+    >
       <style>{`
-        .rd-anim { transition: opacity .35s ease, fill .35s ease, stroke .35s ease, stroke-width .35s ease; }
-        .rd-ping { animation: rd-ping 1s ease-out forwards; }
-        @keyframes rd-ping { 0% { opacity: .5 } 70%, 100% { opacity: 0 } }
-        @media (prefers-reduced-motion: reduce) {
-          .rd-anim { transition: none }
-          .rd-ping { animation: none; opacity: 0 }
-        }
+        .rd-anim { transition: opacity .4s ease, fill .4s ease, stroke .4s ease; }
+        .rd-ping { animation: rd-ping 1.1s ease-out forwards; }
+        @keyframes rd-ping { 0% { opacity: .55 } 70%, 100% { opacity: 0 } }
+        .rd-flow { stroke-dasharray: 5 4; animation: rd-flow .6s linear infinite; }
+        @keyframes rd-flow { to { stroke-dashoffset: -18 } }
+        .rd-seg { font: inherit; font-size: 12px; color: var(--color-fd-muted-foreground); background: transparent; border: none; border-radius: 6px; padding: 5px 9px; cursor: pointer; }
+        .rd-seg[data-on="true"] { color: var(--color-fd-primary-foreground); background: var(--color-fd-primary); }
+        @media (prefers-reduced-motion: reduce) { .rd-anim { transition: none } .rd-ping, .rd-flow { animation: none } .rd-ping { opacity: 0 } }
       `}</style>
+
       <svg
         ref={svgRef}
-        viewBox="0 0 720 292"
+        viewBox="0 0 800 340"
         width="100%"
         role="img"
         aria-label="Interactive checkpoint and deterministic replay across a crash"
@@ -343,120 +387,167 @@ export function ReplayDiagram() {
           >
             <path d="M0,0 L10,5 L0,10 z" style={{ fill: muted }} />
           </marker>
-          <filter id="rd-soft" x="-8%" y="-8%" width="116%" height="130%">
-            <feDropShadow dx="0" dy="2" stdDeviation="3" floodOpacity="0.12" />
+          <marker
+            id="rd-arrow-on"
+            viewBox="0 0 10 10"
+            refX={8}
+            refY={5}
+            markerWidth={6}
+            markerHeight={6}
+            orient="auto-start-reverse"
+          >
+            <path d="M0,0 L10,5 L0,10 z" style={{ fill: accent }} />
+          </marker>
+          <filter id="rd-soft" x="-10%" y="-10%" width="120%" height="140%">
+            <feDropShadow dx="0" dy="3" stdDeviation="5" floodOpacity="0.10" />
           </filter>
         </defs>
 
-        {COLS.map((cx) => (
-          <line
-            key={`guide-${cx}`}
-            x1={cx}
-            y1={40}
-            x2={cx}
-            y2={272}
-            style={{ stroke: border, strokeWidth: 1, strokeDasharray: '2 5', opacity: 0.7 }}
-          />
-        ))}
-
+        {/* Column headers. */}
         {STEPS.map((step, i) => (
           <g key={step.idx}>
             <text
               x={COLS[i]}
-              y={16}
+              y={30}
               textAnchor="middle"
-              style={{ fill: ink, fontSize: 11, fontWeight: 700 }}
+              style={{ fill: ink, fontSize: 12, fontWeight: 700 }}
             >
               {step.idx}
             </text>
             <text
               x={COLS[i]}
-              y={31}
+              y={45}
               textAnchor="middle"
-              style={{ fill: muted, fontSize: 10.5, fontFamily: mono }}
+              style={{ fill: muted, fontSize: 11, fontFamily: mono }}
             >
               {step.name}
             </text>
           </g>
         ))}
 
-        <text x={12} y={83} style={{ fill: ink, fontSize: 11, fontWeight: 600 }}>
-          First run
+        {/* Left rail labels. */}
+        <text
+          x={14}
+          y={FR_Y + FR_H / 2 - 5}
+          style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
+        >
+          FIRST
         </text>
-        <text x={12} y={152} style={{ fill: muted, fontSize: 10.5, fontWeight: 600 }}>
-          Checkpoint
+        <text
+          x={14}
+          y={FR_Y + FR_H / 2 + 9}
+          style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
+        >
+          RUN
         </text>
-        <text x={12} y={165} style={{ fill: muted, fontSize: 10.5, fontWeight: 600 }}>
-          store
+        <text
+          x={14}
+          y={ST_Y + ST_H / 2 + 3}
+          style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
+        >
+          STORE
         </text>
-        <text x={12} y={232} style={{ fill: ink, fontSize: 11, fontWeight: 600 }}>
-          Replay
+        <text
+          x={14}
+          y={RP_Y + RP_H / 2 - 5}
+          style={{ fill: muted, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}
+        >
+          REPLAY
         </text>
-        <text x={12} y={245} style={{ fill: muted, fontSize: 10.5 }}>
-          after crash
+        <text x={14} y={RP_Y + RP_H / 2 + 9} style={{ fill: muted, fontSize: 9, fontFamily: mono }}>
+          on crash
         </text>
 
         {/* First-run band. */}
-        <g className="rd-anim" style={{ opacity: phase === 'replay' ? 0.5 : 1 }}>
-          {STEPS.map((step, i) =>
-            i < checkpointed ? (
-              <Cell
+        <g className="rd-anim" style={{ opacity: phase === 'replay' ? 0.55 : 1 }}>
+          {STEPS.map((step, i) => {
+            if (i >= checkpointed) {
+              return (
+                <Card
+                  key={`fr-${step.idx}`}
+                  cx={COLS[i]}
+                  y={FR_Y}
+                  h={FR_H}
+                  fill={tintRed}
+                  stroke={border}
+                  dashed
+                  opacity={0.75}
+                  glyph="✕"
+                  glyphFill={RED}
+                  title="not reached"
+                  titleFill={muted}
+                  sub="crash was earlier"
+                />
+              );
+            }
+            const on = firstDone(i);
+            return (
+              <Card
                 key={`fr-${step.idx}`}
                 cx={COLS[i]}
-                y={48}
-                h={62}
-                tone="exec"
-                active={firstDone(i)}
+                y={FR_Y}
+                h={FR_H}
+                fill={on ? tintAccent : neutral}
+                stroke={on ? accent : border}
+                dashed={!on}
+                opacity={on ? 1 : 0.6}
+                glyph={on ? '▸' : '○'}
+                glyphFill={on ? accent : muted}
                 title="execute"
+                titleFill={on ? ink : muted}
                 sub="→ checkpoint"
               />
-            ) : (
-              <Cell
-                key={`fr-${step.idx}`}
-                cx={COLS[i]}
-                y={48}
-                h={62}
-                tone="idle"
-                active={false}
-                title="not reached"
-                sub="—"
-              />
-            ),
-          )}
+            );
+          })}
         </g>
 
-        {/* Checkpoint store. */}
+        {/* Store tape. */}
         {STEPS.map((step, i) => (
-          <Slot key={`slot-${step.idx}`} cx={COLS[i]} y={134} filled={storeFilled(i)} seq={i} />
+          <Pill key={`slot-${step.idx}`} cx={COLS[i]} filled={storeFilled(i)} seq={i} />
         ))}
 
         {/* Replay band. */}
         <g className="rd-anim" style={{ opacity: phase === 'first' ? 0.4 : 1 }}>
-          {STEPS.map((step, i) =>
-            i < checkpointed ? (
-              <Cell
+          {STEPS.map((step, i) => {
+            if (i < checkpointed) {
+              const on = returned(i);
+              return (
+                <Card
+                  key={`rp-${step.idx}`}
+                  cx={COLS[i]}
+                  y={RP_Y}
+                  h={RP_H}
+                  fill={neutral}
+                  stroke={border}
+                  dashed
+                  opacity={on ? 0.92 : 0.5}
+                  glyph="↩"
+                  glyphFill={on ? accent : muted}
+                  title="return saved"
+                  titleFill={muted}
+                  sub="not re-run"
+                />
+              );
+            }
+            const on = replayed(i);
+            return (
+              <Card
                 key={`rp-${step.idx}`}
                 cx={COLS[i]}
-                y={204}
-                h={64}
-                tone="saved"
-                active={returned(i)}
-                title="return saved"
-                sub="not re-run"
-              />
-            ) : (
-              <Cell
-                key={`rp-${step.idx}`}
-                cx={COLS[i]}
-                y={204}
-                h={64}
-                tone="exec"
-                active={replayed(i)}
+                y={RP_Y}
+                h={RP_H}
+                fill={on ? tintAccent : neutral}
+                stroke={on ? accent : border}
+                dashed={!on}
+                opacity={on ? 1 : 0.6}
+                glyph={on ? '▸' : '○'}
+                glyphFill={on ? accent : muted}
                 title="execute for real"
+                titleFill={on ? ink : muted}
                 sub="no checkpoint"
               />
-            ),
-          )}
+            );
+          })}
         </g>
 
         {/* Data-flow arrows. */}
@@ -465,39 +556,48 @@ export function ReplayDiagram() {
             <g key={`arr-${step.idx}`}>
               <VArrow
                 cx={COLS[i]}
-                y1={110}
-                y2={134}
+                y1={FR_Y + FR_H}
+                y2={ST_Y}
                 label={i === 0 ? 'write' : undefined}
                 shown={firstDone(i)}
+                flow={current?.kind === 'exec-first' && current.step === i}
               />
               <VArrow
                 cx={COLS[i]}
-                y1={178}
-                y2={204}
+                y1={ST_Y + ST_H}
+                y2={RP_Y}
                 label={i === 0 ? 'return' : undefined}
                 shown={returned(i)}
+                flow={current?.kind === 'return' && current.step === i}
               />
             </g>
           ) : (
-            <VArrow key={`arr-${step.idx}`} cx={COLS[i]} y1={204} y2={178} shown={replayed(i)} />
+            <VArrow
+              key={`arr-${step.idx}`}
+              cx={COLS[i]}
+              y1={RP_Y}
+              y2={ST_Y + ST_H}
+              shown={replayed(i)}
+              flow={current?.kind === 'exec-replay' && current.step === i}
+            />
           ),
         )}
 
-        {/* Ping ring on the element the current beat touched. */}
+        {/* Ping ring on the step the current beat executed. */}
         {current && (current.kind === 'exec-first' || current.kind === 'exec-replay') ? (
           <rect
             key={`ping-${tc}`}
             className="rd-ping"
             x={COLS[current.step] - CELL_W / 2 - 3}
-            y={(current.kind === 'exec-first' ? 48 : 204) - 3}
+            y={(current.kind === 'exec-first' ? FR_Y : RP_Y) - 3}
             width={CELL_W + 6}
-            height={(current.kind === 'exec-first' ? 62 : 64) + 6}
-            rx={12}
+            height={(current.kind === 'exec-first' ? FR_H : RP_H) + 6}
+            rx={16}
             style={{ fill: 'none', stroke: accent, strokeWidth: 2 }}
           />
         ) : null}
 
-        {/* Draggable crash marker. */}
+        {/* Draggable crash marker: fault line across the first-run band + a grabbable handle. */}
         <g
           role="slider"
           tabIndex={0}
@@ -510,76 +610,91 @@ export function ReplayDiagram() {
           style={{ cursor: 'ew-resize', outline: 'none' }}
           className="rd-anim"
         >
-          <line
-            x1={crashX}
-            y1={42}
-            x2={crashX}
-            y2={118}
+          {/* Jagged lightning fault line — a vector rupture, no emoji. */}
+          <path
+            d={`M ${crashX} ${FR_Y - 6} L ${crashX - 5} ${FR_Y + 12} L ${crashX + 5} ${FR_Y + 30} L ${crashX - 5} ${FR_Y + 48} L ${crashX + 5} ${FR_Y + 62} L ${crashX} ${FR_Y + FR_H + 6}`}
             className="rd-anim"
             style={{
-              stroke: accent,
+              fill: 'none',
+              stroke: RED,
               strokeWidth: 2,
-              strokeDasharray: '5 4',
+              strokeLinejoin: 'round',
+              strokeLinecap: 'round',
               opacity: phase === 'crash' ? 1 : 0.85,
             }}
           />
+          {/* Handle tab: a drawn lightning bolt + label. */}
           <rect
-            x={crashX - 16}
-            y={30}
-            width={32}
-            height={22}
-            rx={6}
+            x={crashX - 35}
+            y={FR_Y - 32}
+            width={70}
+            height={23}
+            rx={7}
             className="rd-anim"
-            style={{ fill: card, stroke: accent, strokeWidth: 1.5 }}
+            style={{ fill: tintRed, stroke: RED, strokeWidth: 1.25 }}
           />
-          <text x={crashX} y={45} textAnchor="middle" style={{ fontSize: 13 }}>
-            💥
+          <path
+            d={`M ${crashX - 17} ${FR_Y - 27} L ${crashX - 24} ${FR_Y - 19} L ${crashX - 20} ${FR_Y - 19} L ${crashX - 23} ${FR_Y - 13} L ${crashX - 14} ${FR_Y - 22} L ${crashX - 18} ${FR_Y - 22} Z`}
+            style={{ fill: RED }}
+          />
+          <text
+            x={crashX + 6}
+            y={FR_Y - 16}
+            textAnchor="middle"
+            style={{ fill: RED, fontSize: 10.5, fontWeight: 700, letterSpacing: 0.6 }}
+          >
+            crash
           </text>
-          {/* Wide invisible hit target for easy grabbing. */}
-          <rect x={crashX - 18} y={28} width={36} height={94} style={{ fill: 'transparent' }} />
+          <rect
+            x={crashX - 22}
+            y={FR_Y - 34}
+            width={44}
+            height={FR_H + 48}
+            style={{ fill: 'transparent' }}
+          />
         </g>
       </svg>
 
       {/* Controls. */}
       <div
-        style={{
-          display: 'flex',
-          flexWrap: 'wrap',
-          alignItems: 'center',
-          gap: 8,
-          marginTop: 12,
-        }}
+        style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, marginTop: 14 }}
       >
-        <button
-          type="button"
-          style={btn}
-          onClick={() => {
-            if (tc >= events.length) setT(0);
-            setPlaying((p) => !p);
-          }}
-        >
-          {playing ? '⏸ Pause' : '▶ Play'}
-        </button>
-        <button
-          type="button"
-          style={btn}
-          onClick={() => {
-            setPlaying(false);
-            setT((v) => Math.min(events.length, Math.min(v, events.length) + 1));
-          }}
-        >
-          ⏭ Step
-        </button>
-        <button
-          type="button"
-          style={btn}
-          onClick={() => {
-            setPlaying(false);
-            setT(0);
-          }}
-        >
-          ⟲ Reset
-        </button>
+        <div style={group}>
+          <button
+            type="button"
+            style={btn}
+            aria-label={playing ? 'Pause' : 'Play'}
+            onClick={() => {
+              if (tc >= events.length) setT(0);
+              setPlaying((p) => !p);
+            }}
+          >
+            {playing ? '⏸' : '▶'} {playing ? 'Pause' : 'Play'}
+          </button>
+          <button
+            type="button"
+            style={btn}
+            aria-label="Step forward"
+            onClick={() => {
+              setPlaying(false);
+              setT((v) => Math.min(events.length, Math.min(v, events.length) + 1));
+            }}
+          >
+            ⏭
+          </button>
+          <button
+            type="button"
+            style={btn}
+            aria-label="Reset"
+            onClick={() => {
+              setPlaying(false);
+              setT(0);
+            }}
+          >
+            ⟲
+          </button>
+        </div>
+
         <input
           type="range"
           min={0}
@@ -590,14 +705,36 @@ export function ReplayDiagram() {
             setPlaying(false);
             setT(Number(e.target.value));
           }}
-          style={{ flex: '1 1 140px', minWidth: 120, accentColor: 'var(--color-fd-primary)' }}
+          style={{ flex: '1 1 120px', minWidth: 110, accentColor: 'var(--color-fd-primary)' }}
         />
+
+        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 11.5, color: 'var(--color-fd-muted-foreground)' }}>
+            Crash after
+          </span>
+          <div style={group}>
+            {['0', '1', '2', '3'].map((n, c) => (
+              <button
+                key={n}
+                type="button"
+                className="rd-seg"
+                data-on={checkpointed === c}
+                aria-pressed={checkpointed === c}
+                onClick={() => resetTo(c)}
+              >
+                {c === 0 ? 'none' : n}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
+
       <figcaption
-        className="mt-2 border-t border-fd-border px-1 pt-2 text-xs text-fd-muted-foreground"
+        className="mt-3 border-t border-fd-border px-1 pt-2.5 text-xs text-fd-muted-foreground"
         aria-live="polite"
+        style={{ minHeight: 32 }}
       >
-        {caption(current)} <span style={{ opacity: 0.7 }}>Drag 💥 to move the crash.</span>
+        {caption(current)}
       </figcaption>
     </figure>
   );
