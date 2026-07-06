@@ -65,12 +65,12 @@ function buildEvents(checkpointedCount: number): Ev[] {
 }
 
 function caption(e: Ev | undefined): string {
-  if (!e) return 'Ready — press play, drag 💥, or scrub the timeline.';
+  if (!e) return 'Ready — press play, drag the crash marker, or scrub the timeline.';
   switch (e.kind) {
     case 'exec-first':
       return `First run: execute ${STEPS[e.step].name} → write checkpoint seq:${e.step}.`;
     case 'crash':
-      return '💥 crash — the process dies mid-run.';
+      return 'Crash — the process dies mid-run.';
     case 'restart':
       return 'Engine restarts and resumes the run from the top.';
     case 'return':
