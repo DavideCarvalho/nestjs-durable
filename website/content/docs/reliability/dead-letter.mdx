@@ -8,6 +8,14 @@ process every time recovery picks it up — a deserialization bug, a non-determi
 loop in a step. Left alone, crash-recovery would resume it, crash, resume it again on the next boot, and
 loop forever, taking the whole instance down with it each time. The dead-letter queue breaks that loop.
 
+The walkthrough below follows one poison-pill run the whole way: it crashes, crash-recovery keeps
+resuming it until it hits `maxRecoveryAttempts`, the engine moves it to the terminal `dead` status —
+and then a `@DeadLetter()` handler picks it up as a durable run of its own to page and file a ticket.
+Note the two lanes: the poisoned run **ends** on its lane — dead, in red — while the DLQ handler is a
+separate run living on the lane below.
+
+<CodeFlow scene="dead-letter" />
+
 ## Capping recovery: `maxRecoveryAttempts`
 
 Crash-recovery is **self-healing and periodic**: while a run executes its worker renews a recovery lease,

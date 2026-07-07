@@ -156,6 +156,22 @@ const { runId } = await this.workflows.start('checkout', order);
 const result = await this.workflows.waitForRun(runId); // resolves when the run settles
 ```
 
+<Callout title="WorkflowService or WorkflowEngine?">
+`WorkflowService` is a thin, NestJS-idiomatic facade — its `start` delegates to the core
+`WorkflowEngine`, defaulting the `runId` and adding conveniences (`signal`, `signalWithStart`,
+`waitForRun`, `publishEvent`). Prefer it in application code. `WorkflowEngine` is also injectable
+and equivalent for starting runs — reach for it directly when you want the lower-level engine
+surface (driving `runPending`, recovery, an explicit `runId` you supply). Both accept a workflow
+**class** (fully typed) or a **name** string:
+
+```ts
+// via the service (recommended)
+await this.workflows.start(CheckoutWorkflow, order);
+// via the engine, with an explicit idempotency key
+await this.engine.start(CheckoutWorkflow, order, uuidv7());
+```
+</Callout>
+
 That's it — a durable workflow whose steps run in-process, that pauses for human approval
 and survives restarts. Next:
 

@@ -15,6 +15,7 @@ const border = 'var(--color-fd-border)';
 
 const AMBER = '#f5a524';
 const GREEN = '#30a46c';
+const RED = '#e5484d';
 
 const tintAccent = 'color-mix(in srgb, var(--color-fd-primary) 14%, var(--color-fd-card))';
 const tintAccentSoft = 'color-mix(in srgb, var(--color-fd-primary) 7%, var(--color-fd-card))';
@@ -144,7 +145,7 @@ type Step = {
   caption: string;
   stage: string;
   active?: number; // timeline scenes: index of the lit beat
-  tone?: 'run' | 'wait' | 'done'; // timeline scenes: the active beat's colour
+  tone?: 'run' | 'wait' | 'done' | 'fail'; // timeline scenes: the active beat's colour
   child?: ChildState; // child-workflow scenes: parent/child lane state
 };
 
@@ -153,7 +154,7 @@ type ChildState = {
   pActive: number; // lit parent beat
   cActive: number; // lit child beat, or -1 when the child hasn't started
   arrow?: 'spawn' | 'return'; // which cross-lane arrow is lit this step
-  pTone?: 'run' | 'wait' | 'done'; // parent active-beat colour (wait = suspended)
+  pTone?: 'run' | 'wait' | 'done' | 'fail'; // parent active-beat colour (wait = suspended, fail = dead)
   pDone?: boolean; // parent fully settled (all parent beats done)
   cDone?: boolean; // child fully settled
 };
@@ -458,14 +459,14 @@ function DispatchDiagram({ step }: { step: Step }) {
 // A reusable rail of labelled beats — one per step/sleep/signal/child in a run body.
 // Each walkthrough step lights one beat (its `active` index) in a `tone` (run/wait/done);
 // passed beats show a check, upcoming beats stay neutral. Scenes supply the beat labels.
-function WorkflowTimeline({ beats, active, tone, actor }: { beats: string[]; active: number; tone: 'run' | 'wait' | 'done'; actor: string }) {
+function WorkflowTimeline({ beats, active, tone, actor }: { beats: string[]; active: number; tone: 'run' | 'wait' | 'done' | 'fail'; actor: string }) {
   const count = beats.length;
   const gap = 150;
   const x0 = 74;
   const width = x0 * 2 + (count - 1) * gap;
   const railY = 150;
   const cx = (i: number) => x0 + i * gap;
-  const toneColor = tone === 'wait' ? AMBER : tone === 'done' ? GREEN : accent;
+  const toneColor = tone === 'fail' ? RED : tone === 'wait' ? AMBER : tone === 'done' ? GREEN : accent;
   return (
     <svg viewBox={`0 0 ${width} 232`} width="100%" role="img" aria-label={actor} style={{ display: 'block' }}>
       <g className="cf-anim">
@@ -510,7 +511,7 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
   const cY = 190;
   const pcx = (i: number) => 190 + (i * (600 - 190)) / Math.max(1, np - 1);
   const ccx = (i: number) => 300 + (i * (600 - 300)) / Math.max(1, nc - 1);
-  const pTone = cs.pTone === 'wait' ? AMBER : cs.pTone === 'done' ? GREEN : accent;
+  const pTone = cs.pTone === 'fail' ? RED : cs.pTone === 'wait' ? AMBER : cs.pTone === 'done' ? GREEN : accent;
   const childStarted = cs.cActive >= 0;
   const spawnLit = cs.arrow === 'spawn';
   const returnLit = cs.arrow === 'return';
@@ -833,39 +834,126 @@ export class DailyReportWorkflow {
 
 const queries: Scene = {
   stack: true,
-  code: `async run(ctx: WorkflowCtx, job: EncodeJob) {
-  await ctx.setEvent('progress', { phase: 'probing', pct: 0 });
+  code: `// video-encode.workflow.ts — the run publishes progress as it works
+async run(ctx: WorkflowCtx, job: EncodeJob) {
   const segments = await ctx.step(this.encoder.probe, job.src);
 
-  // an operator can raise priority mid-run — validated, or times out:
-  let priority = job.priority;
-  try {
-    priority = await ctx.onUpdate('reprioritize', { timeoutMs: 30_000 });
-  } catch (err) {
-    if (!(err instanceof SignalTimeoutError)) throw err;
-  }
-
   for (let i = 0; i < segments.length; i++) {
-    await ctx.step(this.encoder.encodeSegment, { segment: segments[i], priority });
-    // readers poll engine.getEvent(runId, 'progress') for the latest snapshot:
+    await ctx.step(this.encoder.encodeSegment, segments[i]);
+    // overwrite the 'progress' key each pass — only the latest survives
     await ctx.setEvent('progress', {
-      phase: 'encoding',
       pct: Math.round(((i + 1) / segments.length) * 100),
     });
   }
-
-  await ctx.setEvent('progress', { phase: 'done', pct: 100 });
   return { jobId: job.id, segments: segments.length };
+}
+
+// jobs.controller.ts — an outside reader observes it, untouched
+@Get(':runId/progress')
+async progress(@Param('runId') runId: string) {
+  // side-effect-free: does not resume, suspend, or consume a position
+  return (await this.engine.getEvent(runId, 'progress')) ?? { pct: 0 };
 }`,
   steps: [
-    { lines: [2, 2], stage: '', active: 0, tone: 'run', title: 'publish', actor: 'ctx.setEvent → progress 0%', caption: 'ctx.setEvent publishes a named, queryable snapshot from inside the run; an outside reader observes it via engine.getEvent with no effect on the run.' },
-    { lines: [3, 3], stage: '', active: 1, tone: 'run', title: 'probe', actor: 'ctx.step → probe the source', caption: 'A normal step probes the media and checkpoints the segment list.' },
-    { lines: [8, 8], stage: '', active: 2, tone: 'wait', title: 'onUpdate', actor: 'external update bumps priority mid-run', caption: "ctx.onUpdate suspends with zero compute until engine.update(runId, 'reprioritize', arg) delivers a validated priority — or the 30s timeout throws SignalTimeoutError and the default priority stands." },
-    { lines: [14, 14], stage: '', active: 3, tone: 'run', title: 'encode', actor: 'ctx.step → encode each segment', caption: 'The loop encodes one segment per step at the (possibly updated) priority, checkpointing each result.' },
-    { lines: [16, 19], stage: '', active: 4, tone: 'run', title: 'read', actor: 'a client reads progress via engine.getEvent', caption: 'Each pass overwrites the progress key with the latest pct; a polling client reads that snapshot with engine.getEvent while the loop keeps running.' },
-    { lines: [22, 23], stage: '', active: 5, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'A final setEvent marks 100% and the body returns; published values stay queryable even after the run completes.' },
+    { lines: [3, 3], stage: '', active: 0, tone: 'run', title: 'probe', actor: 'ctx.step → probe the source', caption: 'A normal step probes the media and checkpoints the segment list — the run is busy, doing real work.' },
+    { lines: [6, 6], stage: '', active: 1, tone: 'run', title: 'encode', actor: 'ctx.step → encode each segment', caption: 'The loop encodes one segment per step, checkpointing each result as it goes.' },
+    { lines: [8, 11], stage: '', active: 2, tone: 'run', title: 'publish', actor: "ctx.setEvent('progress', …)", caption: 'Each pass overwrites the progress key from inside the run — checkpointed, replay-safe, and bounded (only the latest value survives a query).' },
+    { lines: [17, 20], stage: '', active: 3, tone: 'run', title: 'read', actor: 'engine.getEvent(runId, "progress")', caption: 'From outside — a controller, a poller, another service — engine.getEvent reads the latest snapshot with zero effect on the run: it does not resume it, consume a position, or appear in its history.' },
+    { lines: [13, 13], stage: '', active: 4, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns; published values live in the checkpoints, so they stay queryable even after the run completes.' },
   ],
-  render: timeline(['publish', 'probe', 'priority', 'encode', 'read', 'done']),
+  render: timeline(['probe', 'encode', 'publish', 'read', 'done']),
+};
+
+const updateTimeout: Scene = {
+  stack: true,
+  code: `// expense-approval.workflow.ts — the run parks on a decision, bounded by a deadline
+async run(ctx: WorkflowCtx, expense: Expense) {
+  await ctx.setEvent('status', { state: 'awaiting-approval' });
+
+  let decision: Decision;
+  try {
+    // suspends with zero compute until engine.update delivers — or 7 days pass
+    decision = await ctx.onUpdate('decision', { timeoutMs: 7 * DAY });
+  } catch (err) {
+    if (!(err instanceof SignalTimeoutError)) throw err;
+    // nobody decided in time — take the default branch and fail cleanly
+    await ctx.setEvent('status', { state: 'expired' });
+    throw new FatalError('approval timed out', 'expired');
+  }
+
+  await ctx.step(this.ledger.reimburse, { expense, by: decision.approver });
+  return { reimbursed: true };
+}`,
+  steps: [
+    { lines: [3, 3], stage: '', active: 0, tone: 'run', title: 'awaiting', actor: "ctx.setEvent('status', 'awaiting-approval')", caption: 'The run publishes its status and heads for the decision point.' },
+    { lines: [8, 8], stage: '', active: 1, tone: 'wait', title: 'onUpdate', actor: "ctx.onUpdate('decision', { timeoutMs: 7 days })", caption: 'The run suspends here with zero compute, waiting for an external decision — with a 7-day deadline on the wait.' },
+    { lines: [8, 9], stage: '', active: 2, tone: 'fail', title: '7d timeout', actor: 'no update arrives — SignalTimeoutError', caption: 'The deadline passes with nobody deciding, so the onUpdate call throws SignalTimeoutError instead of hanging forever.' },
+    { lines: [11, 13], stage: '', active: 3, tone: 'fail', title: 'expired', actor: 'catch → default branch, run fails cleanly', caption: 'The workflow catches the timeout, marks the status expired, and fails deliberately — a bounded wait turns an abandoned approval into a clean terminal outcome, not a stuck run.' },
+  ],
+  render: timeline(['awaiting', 'onUpdate', '7d timeout', 'expired']),
+};
+
+const updateHappy: Scene = {
+  stack: true,
+  code: `// expense-approval.workflow.ts — same run, but a decision arrives in time
+async run(ctx: WorkflowCtx, expense: Expense) {
+  await ctx.setEvent('status', { state: 'awaiting-approval' });
+  // suspended here — zero compute — until engine.update delivers a decision
+  const decision = await ctx.onUpdate('decision', { timeoutMs: 7 * DAY });
+
+  await ctx.step(this.ledger.reimburse, { expense, by: decision.approver });
+  return { reimbursed: true };
+}
+
+// expenses.controller.ts — the outside command that resumes the run
+@Post(':runId/decision')
+async decide(@Param('runId') runId: string, @Body() body: DecisionDto) {
+  // the validator runs first, in THIS request — a bad decision is rejected here
+  const result = await this.engine.update(runId, 'decision', body);
+  if (!result.accepted) throw new BadRequestException(result.reason);
+  return { status: result.run?.status ?? 'pending' };
+}`,
+  steps: [
+    { lines: [3, 3], stage: '', active: 0, tone: 'run', title: 'awaiting', actor: "ctx.setEvent('status', 'awaiting-approval')", caption: 'Same run, same status — it reaches the decision point and parks.' },
+    { lines: [5, 5], stage: '', active: 1, tone: 'wait', title: 'onUpdate', actor: "ctx.onUpdate('decision') — suspended", caption: 'The run suspends with zero compute, holding its place until an external command arrives.' },
+    { lines: [15, 15], stage: '', active: 2, tone: 'run', title: 'update →', actor: "engine.update(runId, 'decision', body)", caption: 'A separate request — the controller — calls engine.update with the decision. This is the command that steers the parked run.' },
+    { lines: [14, 14], stage: '', active: 3, tone: 'run', title: 'validate', actor: 'validator runs in the caller’s request', caption: 'Before the run is touched, the registered validator runs synchronously in this request. A bad decision returns { accepted: false, reason } here — the run never wakes for it.' },
+    { lines: [5, 5], stage: '', active: 4, tone: 'run', title: 'resume', actor: 'accepted → delivered to onUpdate, run resumes', caption: 'Accepted: the decision is delivered to the suspended ctx.onUpdate and the run comes back to life exactly where it left off.' },
+    { lines: [7, 7], stage: '', active: 5, tone: 'run', title: 'reimburse', actor: 'ctx.step → reimburse the expense', caption: 'The resumed body runs the next durable step with the delivered decision.' },
+    { lines: [8, 8], stage: '', active: 6, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes — the outside command carried it down the happy path.' },
+  ],
+  render: timeline(['awaiting', 'onUpdate', 'update →', 'validate', 'resume', 'reimburse', 'done']),
+};
+
+const deadLetter: Scene = {
+  stack: true,
+  code: `// pipeline.workflow.ts — a poison-pill run, and the handler that catches it
+@Workflow({ name: 'pipeline', version: '3' })
+export class PipelineWorkflow {
+  async run(ctx: WorkflowCtx, input: PipelineInput) {
+    const extracted = await ctx.step('pipeline.extract', input);
+    // a deserialization bug here throws on every recovery — a poison pill
+    return ctx.step('pipeline.transform', extracted);
+  }
+
+  // Auto-registered as 'pipeline.dlq' — a durable workflow of its own
+  @DeadLetter()
+  async onDead(ctx: WorkflowCtx, dl: DeadLetter<PipelineInput>) {
+    await ctx.step(this.alerts.page, { runId: dl.deadRunId, error: dl.error?.message });
+    const ticket = await ctx.step(this.tickets.create, { payload: dl.input });
+    return { ticketId: ticket.id };
+  }
+}`,
+  steps: [
+    { lines: [5, 5], stage: '', title: 'extract', actor: 'ctx.step → extract', caption: "The run's first step succeeds and checkpoints — nothing looks wrong yet.", child: { pActive: 0, cActive: -1, pTone: 'run' } },
+    { lines: [7, 7], stage: '', title: 'transform', actor: 'ctx.step → transform (throws)', caption: 'The transform step is the poison pill: a deserialization bug makes it throw the moment it runs.', child: { pActive: 1, cActive: -1, pTone: 'run' } },
+    { lines: [6, 7], stage: '', title: 'crash ×5', actor: 'crash-recovery resumes it → it throws again', caption: 'Crash-recovery reclaims the orphaned run and resumes it — it throws again, and again. Each pickup increments recoveryAttempts toward maxRecoveryAttempts.', child: { pActive: 2, cActive: -1, pTone: 'fail' } },
+    { lines: [7, 7], stage: '', title: 'dead', actor: 'past the cap → status: dead', caption: "Past maxRecoveryAttempts the engine stops resuming it: the run moves to the terminal 'dead' status and releases its lease. The crash loop is broken — one poison pill no longer takes the instance down.", child: { pActive: 3, cActive: -1, pTone: 'fail' } },
+    { lines: [11, 13], stage: '', title: 'DLQ: page', actor: '@DeadLetter handler starts as its own run', caption: 'Dead-lettering starts the @DeadLetter method as a separate durable run (pipeline.dlq), idempotent by dlq:<runId> — the dead run stays parked where it is. The handler’s first step pages on-call.', child: { pActive: 3, cActive: 0, arrow: 'spawn', pTone: 'fail' } },
+    { lines: [14, 14], stage: '', title: 'ticket', actor: 'ctx.step → open a ticket with the original input', caption: 'A second step opens a ticket carrying the dead run’s original typed input — ready to replay once the bug is fixed.', child: { pActive: 3, cActive: 1, pTone: 'fail' } },
+    { lines: [15, 15], stage: '', title: 'handled', actor: 'DLQ run settles — completed', caption: 'The DLQ run completes on its own lane. The poison pill stays dead — inspectable and retriable from the dashboard — handled, not lost.', child: { pActive: 3, cActive: 2, cDone: true, pTone: 'fail' } },
+  ],
+  render: (step) => <ChildDiagram step={step} parentBeats={['extract', 'transform', 'crash ×5', 'dead']} childBeats={['page', 'ticket', 'done']} spawnIdx={3} parentLabel="run · pipeline" childLabel="DLQ · pipeline.dlq" />,
 };
 
 const versioning: Scene = {
@@ -933,6 +1021,9 @@ const SCENES: Record<string, Scene> = {
   webhook,
   scheduling,
   queries,
+  'update-timeout': updateTimeout,
+  'update-happy': updateHappy,
+  'dead-letter': deadLetter,
   versioning,
   retries,
 };
