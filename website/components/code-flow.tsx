@@ -817,7 +817,10 @@ await ctx.step(this.inventory.reserve, order);`,
 
 const checkout: Scene = {
   stack: true,
-  code: `@Workflow({ name: 'checkout', version: '1' })
+  files: [
+    {
+      name: 'checkout.workflow.ts',
+      code: `@Workflow({ name: 'checkout', version: '1' })
 export class CheckoutWorkflow {
   constructor(
     private readonly inventory: InventoryService,
@@ -835,12 +838,41 @@ export class CheckoutWorkflow {
     return { chargeId: charge.id, tracking: label.tracking };
   }
 }`,
+    },
+    {
+      name: 'services.ts',
+      code: `// each handler is an ordinary @Step provider method — run on any worker
+@Injectable()
+export class InventoryService {
+  @Step({ retries: 3 })
+  async reserve(order: Order): Promise<Hold> { /* … */ }
+}
+
+@Injectable()
+export class PaymentsService {
+  @Step({ retries: 3, backoff: 'exp' })
+  async charge({ order, hold }: ChargeInput): Promise<Charge> { /* … */ }
+}
+
+@Injectable()
+export class ShippingService {
+  @Step()
+  async ship(order: Order): Promise<Label> { /* … */ }
+}
+
+@Injectable()
+export class EmailService {
+  @Step()
+  async confirm({ order, label }: ConfirmInput) { /* … */ }
+}`,
+    },
+  ],
   steps: [
-    { lines: [11, 11], stage: '', active: 0, tone: 'run', title: 'reserve', actor: 'ctx.step → reserve inventory', caption: 'Each ctx.step dispatches a unit and checkpoints its result; the run suspends until the hold lands, then resumes with it.' },
-    { lines: [12, 12], stage: '', active: 1, tone: 'run', title: 'charge', actor: 'ctx.step → charge the card', caption: 'The charge result is a durable checkpoint — saved before the next line runs, so a crash never repeats the charge.' },
+    { lines: [11, 11], split: { file: 1, lines: [4, 5], window: [2, 6], hint: 'reserve' }, stage: '', active: 0, tone: 'run', title: 'reserve', actor: 'ctx.step → reserve inventory', caption: 'Each ctx.step dispatches a unit and checkpoints its result; the run suspends until the hold lands, then resumes with it.' },
+    { lines: [12, 12], split: { file: 1, lines: [10, 11], window: [8, 12], hint: 'charge' }, stage: '', active: 1, tone: 'run', title: 'charge', actor: 'ctx.step → charge the card', caption: 'The charge result is a durable checkpoint — saved before the next line runs, so a crash never repeats the charge.' },
     { lines: [13, 13], stage: '', active: 2, tone: 'wait', title: 'waitForSignal', actor: "parked on 'packed' — zero compute", caption: "waitForSignal suspends the run until the warehouse signals 'packed'. No worker is held while it waits." },
-    { lines: [14, 14], stage: '', active: 3, tone: 'run', title: 'ship', actor: 'signal resumed the run → ship', caption: 'The signal woke the run; it ships and checkpoints the tracking label.' },
-    { lines: [15, 15], stage: '', active: 4, tone: 'run', title: 'confirm', actor: 'ctx.step → email the confirmation', caption: 'A final step emails the confirmation with the label.' },
+    { lines: [14, 14], split: { file: 1, lines: [16, 17], window: [14, 18], hint: 'ship' }, stage: '', active: 3, tone: 'run', title: 'ship', actor: 'signal resumed the run → ship', caption: 'The signal woke the run; it ships and checkpoints the tracking label.' },
+    { lines: [15, 15], split: { file: 1, lines: [22, 23], window: [20, 24], hint: 'confirm' }, stage: '', active: 4, tone: 'run', title: 'confirm', actor: 'ctx.step → email the confirmation', caption: 'A final step emails the confirmation with the label.' },
     { lines: [16, 16], stage: '', active: 5, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay, every completed step returns its saved result — none re-run.' },
   ],
   render: timeline(['reserve', 'charge', 'packed', 'ship', 'confirm', 'done']),
@@ -886,7 +918,7 @@ export class KycWorkflow {
   ],
   steps: [
     { file: 0, lines: [9, 9], stage: '', title: 'create', actor: 'ctx.step → create the account', caption: "A normal step creates the account. The child workflow hasn't started yet.", child: { pActive: 0, cActive: -1, pTone: 'run' } },
-    { file: 0, lines: [12, 12], stage: '', title: 'ctx.child', actor: 'ctx.child → start KycWorkflow, parent suspends', caption: 'ctx.child starts KycWorkflow — a full durable run of its own — and suspends the parent here (zero compute).', child: { pActive: 1, cActive: 0, arrow: 'spawn', pTone: 'wait' } },
+    { file: 0, lines: [12, 12], split: { file: 1, lines: [2, 3], window: [1, 4], hint: 'KycWorkflow' }, stage: '', title: 'ctx.child', actor: 'ctx.child → start KycWorkflow, parent suspends', caption: 'ctx.child starts KycWorkflow — a full durable run of its own — and suspends the parent here (zero compute).', child: { pActive: 1, cActive: 0, arrow: 'spawn', pTone: 'wait' } },
     { file: 0, lines: [12, 12], split: { file: 1, lines: [7, 8], window: [6, 9], hint: 'KycWorkflow' }, stage: '', title: 'child runs', actor: 'the child runs its own steps — the parent waits', caption: 'The child runs its own steps, with its own history, retries and dashboard entry. A child that takes hours costs the suspended parent nothing.', child: { pActive: 1, cActive: 1, pTone: 'wait' } },
     { file: 0, lines: [12, 12], split: { file: 1, lines: [9, 9], window: [6, 10] }, stage: '', title: 'result returns', actor: 'child settled → its output flows back', caption: 'The child reaches a terminal state and its output flows back, resuming the parent. (A child failure would throw in the parent instead.)', child: { pActive: 1, cActive: 2, cDone: true, arrow: 'return', pTone: 'wait' } },
     { file: 0, lines: [14, 14], stage: '', title: 'welcome', actor: 'parent resumed → welcome email', caption: "The parent resumes with the child's result and emails the user.", child: { pActive: 2, cActive: 2, cDone: true, pTone: 'run' } },
@@ -930,7 +962,7 @@ export class ReindexSearchWorkflow {
   ],
   steps: [
     { file: 0, lines: [6, 6], stage: '', title: 'publish', actor: 'ctx.step → publish the post', caption: 'A step publishes the post. Nothing has been spun off yet.', child: { pActive: 0, cActive: -1, pTone: 'run' } },
-    { file: 0, lines: [9, 9], stage: '', title: 'startChild', actor: "ctx.startChild → dispatch the child, don't wait", caption: 'ctx.startChild dispatches ReindexSearchWorkflow and returns its run id immediately — the parent does NOT suspend.', child: { pActive: 1, cActive: 0, arrow: 'spawn', pTone: 'run' } },
+    { file: 0, lines: [9, 9], split: { file: 1, lines: [2, 3], window: [1, 4], hint: 'ReindexSearchWorkflow' }, stage: '', title: 'startChild', actor: "ctx.startChild → dispatch the child, don't wait", caption: 'ctx.startChild dispatches ReindexSearchWorkflow and returns its run id immediately — the parent does NOT suspend.', child: { pActive: 1, cActive: 0, arrow: 'spawn', pTone: 'run' } },
     { file: 0, lines: [11, 11], stage: '', title: 'parent completes', actor: 'parent settles — the child keeps running', caption: 'The parent returns and completes right away, while the child keeps running on its own lane — an independent durable run.', child: { pActive: 2, cActive: 1, pDone: true, pTone: 'done' } },
     { file: 0, lines: [9, 9], split: { file: 1, lines: [7, 8], window: [6, 9], hint: 'ReindexSearchWorkflow' }, stage: '', title: 'child lives on', actor: 'the child finishes later, independently', caption: "The child finishes its own steps later; a failure there never touches the already-settled parent — inspect or retry it from the dashboard.", child: { pActive: 2, cActive: 2, cDone: true, pDone: true, pTone: 'done' } },
   ],
@@ -1368,9 +1400,9 @@ export class TripService {
     },
   ],
   steps: [
-    { file: 0, lines: [6, 8], stage: '', active: 0, tone: 'run', title: 'flight', actor: 'ctx.step → book flight, undo registered', caption: "The flight books on whatever worker serves bookFlight. Because the call completed, its compensate — cancelFlight, another @Step — is registered on the saga stack together with this call's { input, output }." },
-    { file: 0, lines: [9, 11], stage: '', active: 1, tone: 'run', title: 'hotel', actor: 'ctx.step → book hotel, undo registered', caption: "The hotel books and registers its own undo — pushed after the flight's, so it will be undone first." },
-    { file: 0, lines: [12, 13], stage: '', active: 2, tone: 'fail', title: 'deposit ✗', actor: 'ctx.step → charge deposit (fails)', caption: 'The deposit charge exhausts its retries and the run fails. It registered no undo of its own — but two earlier steps did.' },
+    { file: 0, lines: [6, 8], split: { file: 1, lines: [9, 10], window: [9, 10], hint: 'bookFlight' }, stage: '', active: 0, tone: 'run', title: 'flight', actor: 'ctx.step → book flight, undo registered', caption: "The flight books on whatever worker serves bookFlight. Because the call completed, its compensate — cancelFlight, another @Step — is registered on the saga stack together with this call's { input, output }." },
+    { file: 0, lines: [9, 11], split: { file: 1, lines: [12, 13], window: [12, 13], hint: 'bookHotel' }, stage: '', active: 1, tone: 'run', title: 'hotel', actor: 'ctx.step → book hotel, undo registered', caption: "The hotel books and registers its own undo — pushed after the flight's, so it will be undone first." },
+    { file: 0, lines: [12, 13], split: { file: 1, lines: [15, 16], window: [15, 16], hint: 'chargeDeposit' }, stage: '', active: 2, tone: 'fail', title: 'deposit ✗', actor: 'ctx.step → charge deposit (fails)', caption: 'The deposit charge exhausts its retries and the run fails. It registered no undo of its own — but two earlier steps did.' },
     { file: 0, lines: [10, 10], split: { file: 1, lines: [20, 23], window: [18, 23], hint: 'cancelHotel' }, stage: '', active: 3, tone: 'run', title: 'undo hotel', actor: 'engine dispatches cancelHotel — checkpoint −1', caption: 'The engine walks the stack in reverse and DISPATCHES the compensate registered here — cancelHotel, below — to its worker like any durable step, checkpointed at reserved seq −1: a crash mid-unwind resumes here instead of re-running finished undos. It receives the { input, output } of the hotel booking it undoes.' },
     { file: 0, lines: [7, 7], split: { file: 1, lines: [25, 28], window: [25, 28], hint: 'cancelFlight' }, stage: '', active: 4, tone: 'run', title: 'undo flight', actor: 'cancelFlight({ input, output }) — checkpoint −2', caption: "Then the flight's compensate runs, with both the original input AND the booking it must cancel in its envelope — UndoOf<TripService['bookFlight']> types it for free, and a Python worker could serve it by name." },
     { file: 0, lines: [12, 13], stage: '', active: 5, tone: 'fail', title: 'failed', actor: 'unwind done → run settles failed (original error)', caption: 'Both legs undone, the run settles failed with the ORIGINAL deposit error — never masked by the unwind. The compensate:* checkpoints keep the whole undo trail visible in the dashboard.' },
