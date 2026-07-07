@@ -144,6 +144,7 @@ function useStepper(count: number) {
 // ── code panel ───────────────────────────────────────────────────────────────
 type Step = {
   lines: [number, number];
+  file?: number; // multi-file scenes: which files[] tab this step lives in (default 0)
   title: string;
   actor: string;
   caption: string;
@@ -614,7 +615,9 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
 }
 
 // ── scenes ───────────────────────────────────────────────────────────────────
-type Scene = { code: string; steps: Step[]; render: (step: Step) => ReactNode; stack?: boolean };
+// A scene's code is either one anonymous snippet (`code`) or named files rendered as tabs
+// (`files`) — stepping into a step auto-switches to its file's tab.
+type Scene = { code?: string; files?: { name: string; code: string }[]; steps: Step[]; render: (step: Step) => ReactNode; stack?: boolean };
 
 const timeline = (beats: string[], opts?: { failed?: number[] }) => (step: Step) => <WorkflowTimeline beats={beats} active={step.active ?? 0} tone={step.tone ?? 'run'} actor={step.actor} failed={opts?.failed} attempts={step.attempts} />;
 
@@ -829,8 +832,10 @@ const sleepSignals: Scene = {
 
 const webhook: Scene = {
   stack: true,
-  code: `// checkout.workflow.ts
-async run(ctx: WorkflowCtx, order: Order) {
+  files: [
+    {
+      name: 'checkout.workflow.ts',
+      code: `async run(ctx: WorkflowCtx, order: Order) {
   // mint a durable webhook: deterministic token + public callback url
   const hook = ctx.webhook<PaymentResult>();
 
@@ -845,20 +850,27 @@ async run(ctx: WorkflowCtx, order: Order) {
   }
   await ctx.step(this.orders.fulfil, { order, providerRef: result.providerRef });
   return { orderId: order.id, providerRef: result.providerRef };
-}
+}`,
+    },
+    {
+      name: 'the provider · HTTP',
+      code: `// hours later — the PROVIDER hits the url the run handed out:
 
-// hours later — the PROVIDER hits the url the run handed out:
-//   POST /durable/webhooks/wh:af92:0   { "status": "paid", "providerRef": "psp_123" }
+POST /durable/webhooks/wh:af92:0
+{ "status": "paid", "providerRef": "psp_123" }
+
 // the built-in route resolves the token and delivers the body:
 //   engine.signal('wh:af92:0', { status: 'paid', providerRef: 'psp_123' })
 // → the suspended run resumes at hook.wait() with that payload`,
+    },
+  ],
   steps: [
-    { lines: [3, 4], stage: '', active: 0, tone: 'run', title: 'mint', actor: 'ctx.webhook → deterministic token + url', caption: 'ctx.webhook() reserves a logical position now and mints a handle with a token (wh:<runId>:<seq>) and public url — both stable across replay.' },
-    { lines: [6, 7], stage: '', active: 1, tone: 'run', title: 'hand url', actor: 'ctx.step → start payment with hook.url', caption: 'The url is handed to the provider inside a step, so the handoff is checkpointed and fires exactly once, even across replay/recovery.' },
-    { lines: [9, 10], stage: '', active: 2, tone: 'wait', title: 'hook.wait', actor: 'suspended — zero compute until the callback', caption: 'hook.wait() parks the run on the token the mint reserved. It suspends with zero compute — no polling, no held thread — for minutes or months.' },
-    { lines: [19, 23], stage: '', active: 3, tone: 'run', title: 'POST →', actor: 'the provider POSTs the callback url', caption: "This is the moment someone hits the endpoint: the provider POSTs the url it was given, and the built-in route turns that HTTP call into engine.signal(token, body) — no controller for you to write." },
-    { lines: [12, 15], stage: '', active: 4, tone: 'run', title: 'resume + fulfil', actor: 'wait() resumed with the payload → fulfil', caption: 'The signal delivered the PaymentResult and wait() resumed exactly where it parked. The workflow guards the status and fulfils the order in a step.' },
-    { lines: [16, 16], stage: '', active: 5, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay, the mint, step and callback payload all return their saved values — none re-run.' },
+    { file: 0, lines: [2, 3], stage: '', active: 0, tone: 'run', title: 'mint', actor: 'ctx.webhook → deterministic token + url', caption: 'ctx.webhook() reserves a logical position now and mints a handle with a token (wh:<runId>:<seq>) and public url — both stable across replay.' },
+    { file: 0, lines: [5, 6], stage: '', active: 1, tone: 'run', title: 'hand url', actor: 'ctx.step → start payment with hook.url', caption: 'The url is handed to the provider inside a step, so the handoff is checkpointed and fires exactly once, even across replay/recovery.' },
+    { file: 0, lines: [8, 9], stage: '', active: 2, tone: 'wait', title: 'hook.wait', actor: 'suspended — zero compute until the callback', caption: 'hook.wait() parks the run on the token the mint reserved. It suspends with zero compute — no polling, no held thread — for minutes or months.' },
+    { file: 1, lines: [3, 4], stage: '', active: 3, tone: 'run', title: 'POST →', actor: 'the provider POSTs the callback url', caption: 'This is the moment someone hits the endpoint: the provider POSTs the url it was given, and the built-in route turns that HTTP call into engine.signal(token, body) — no controller for you to write.' },
+    { file: 0, lines: [11, 14], stage: '', active: 4, tone: 'run', title: 'resume + fulfil', actor: 'wait() resumed with the payload → fulfil', caption: 'The signal delivered the PaymentResult and wait() resumed exactly where it parked. The workflow guards the status and fulfils the order in a step.' },
+    { file: 0, lines: [15, 15], stage: '', active: 5, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay, the mint, step and callback payload all return their saved values — none re-run.' },
   ],
   render: timeline(['mint', 'hand url', 'wait', 'POST →', 'fulfil', 'done']),
 };
@@ -884,8 +896,10 @@ export class DailyReportWorkflow {
 
 const queries: Scene = {
   stack: true,
-  code: `// video-encode.workflow.ts — the run publishes progress as it works
-async run(ctx: WorkflowCtx, job: EncodeJob) {
+  files: [
+    {
+      name: 'video-encode.workflow.ts',
+      code: `async run(ctx: WorkflowCtx, job: EncodeJob) {
   const segments = await ctx.step(this.encoder.probe, job.src);
 
   for (let i = 0; i < segments.length; i++) {
@@ -896,27 +910,31 @@ async run(ctx: WorkflowCtx, job: EncodeJob) {
     });
   }
   return { jobId: job.id, segments: segments.length };
-}
-
-// jobs.controller.ts — an outside reader observes it, untouched
+}`,
+    },
+    {
+      name: 'jobs.controller.ts',
+      code: `// an outside reader observes the run — without touching it
 @Get(':runId/progress')
 async progress(@Param('runId') runId: string) {
   // side-effect-free: does not resume, suspend, or consume a position
   return (await this.engine.getEvent(runId, 'progress')) ?? { pct: 0 };
 }`,
+    },
+  ],
   steps: [
-    { lines: [3, 3], stage: '', active: 0, tone: 'run', title: 'probe', actor: 'ctx.step → probe the source', caption: 'A normal step probes the media and checkpoints the segment list — the run is busy, doing real work.' },
-    { lines: [6, 6], stage: '', active: 1, tone: 'run', title: 'encode', actor: 'ctx.step → encode each segment', caption: 'The loop encodes one segment per step, checkpointing each result as it goes.' },
-    { lines: [8, 11], stage: '', active: 2, tone: 'run', title: 'publish', actor: "ctx.setEvent('progress', …)", caption: 'Each pass overwrites the progress key from inside the run — checkpointed, replay-safe, and bounded (only the latest value survives a query).' },
-    { lines: [17, 20], stage: '', active: 3, tone: 'run', title: 'read', actor: 'engine.getEvent(runId, "progress")', caption: 'From outside — a controller, a poller, another service — engine.getEvent reads the latest snapshot with zero effect on the run: it does not resume it, consume a position, or appear in its history.' },
-    { lines: [13, 13], stage: '', active: 4, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns; published values live in the checkpoints, so they stay queryable even after the run completes.' },
+    { file: 0, lines: [2, 2], stage: '', active: 0, tone: 'run', title: 'probe', actor: 'ctx.step → probe the source', caption: 'A normal step probes the media and checkpoints the segment list — the run is busy, doing real work.' },
+    { file: 0, lines: [5, 5], stage: '', active: 1, tone: 'run', title: 'encode', actor: 'ctx.step → encode each segment', caption: 'The loop encodes one segment per step, checkpointing each result as it goes.' },
+    { file: 0, lines: [6, 9], stage: '', active: 2, tone: 'run', title: 'publish', actor: "ctx.setEvent('progress', …)", caption: 'Each pass overwrites the progress key from inside the run — checkpointed, replay-safe, and bounded (only the latest value survives a query).' },
+    { file: 1, lines: [2, 5], stage: '', active: 3, tone: 'run', title: 'read', actor: 'engine.getEvent(runId, "progress")', caption: 'From outside — a controller, a poller, another service — engine.getEvent reads the latest snapshot with zero effect on the run: it does not resume it, consume a position, or appear in its history.' },
+    { file: 0, lines: [11, 11], stage: '', active: 4, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns; published values live in the checkpoints, so they stay queryable even after the run completes.' },
   ],
   render: timeline(['probe', 'encode', 'publish', 'read', 'done']),
 };
 
 const updateTimeout: Scene = {
   stack: true,
-  code: `// expense-approval.workflow.ts — the run parks on a decision, bounded by a deadline
+  code: `// the run parks on a decision, bounded by a deadline
 async run(ctx: WorkflowCtx, expense: Expense) {
   await ctx.setEvent('status', { state: 'awaiting-approval' });
 
@@ -945,7 +963,10 @@ async run(ctx: WorkflowCtx, expense: Expense) {
 
 const updateHappy: Scene = {
   stack: true,
-  code: `// expense-approval.workflow.ts — same run, but a decision arrives in time
+  files: [
+    {
+      name: 'expense-approval.workflow.ts',
+      code: `// same run as the timeout example — but a decision arrives in time
 async run(ctx: WorkflowCtx, expense: Expense) {
   await ctx.setEvent('status', { state: 'awaiting-approval' });
   // suspended here — zero compute — until engine.update delivers a decision
@@ -953,9 +974,11 @@ async run(ctx: WorkflowCtx, expense: Expense) {
 
   await ctx.step(this.ledger.reimburse, { expense, by: decision.approver });
   return { reimbursed: true };
-}
-
-// expenses.controller.ts — the outside command that resumes the run
+}`,
+    },
+    {
+      name: 'expenses.controller.ts',
+      code: `// the outside command that resumes the run
 @Post(':runId/decision')
 async decide(@Param('runId') runId: string, @Body() body: DecisionDto) {
   // the validator runs first, in THIS request — a bad decision is rejected here
@@ -963,21 +986,23 @@ async decide(@Param('runId') runId: string, @Body() body: DecisionDto) {
   if (!result.accepted) throw new BadRequestException(result.reason);
   return { status: result.run?.status ?? 'pending' };
 }`,
+    },
+  ],
   steps: [
-    { lines: [3, 3], stage: '', active: 0, tone: 'run', title: 'awaiting', actor: "ctx.setEvent('status', 'awaiting-approval')", caption: 'Same run, same status — it reaches the decision point and parks.' },
-    { lines: [5, 5], stage: '', active: 1, tone: 'wait', title: 'onUpdate', actor: "ctx.onUpdate('decision') — suspended", caption: 'The run suspends with zero compute, holding its place until an external command arrives.' },
-    { lines: [15, 15], stage: '', active: 2, tone: 'run', title: 'update →', actor: "engine.update(runId, 'decision', body)", caption: 'A separate request — the controller — calls engine.update with the decision. This is the command that steers the parked run.' },
-    { lines: [14, 14], stage: '', active: 3, tone: 'run', title: 'validate', actor: 'validator runs in the caller’s request', caption: 'Before the run is touched, the registered validator runs synchronously in this request. A bad decision returns { accepted: false, reason } here — the run never wakes for it.' },
-    { lines: [5, 5], stage: '', active: 4, tone: 'run', title: 'resume', actor: 'accepted → delivered to onUpdate, run resumes', caption: 'Accepted: the decision is delivered to the suspended ctx.onUpdate and the run comes back to life exactly where it left off.' },
-    { lines: [7, 7], stage: '', active: 5, tone: 'run', title: 'reimburse', actor: 'ctx.step → reimburse the expense', caption: 'The resumed body runs the next durable step with the delivered decision.' },
-    { lines: [8, 8], stage: '', active: 6, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes — the outside command carried it down the happy path.' },
+    { file: 0, lines: [3, 3], stage: '', active: 0, tone: 'run', title: 'awaiting', actor: "ctx.setEvent('status', 'awaiting-approval')", caption: 'Same run, same status — it reaches the decision point and parks.' },
+    { file: 0, lines: [5, 5], stage: '', active: 1, tone: 'wait', title: 'onUpdate', actor: "ctx.onUpdate('decision') — suspended", caption: 'The run suspends with zero compute, holding its place until an external command arrives.' },
+    { file: 1, lines: [5, 5], stage: '', active: 2, tone: 'run', title: 'update →', actor: "engine.update(runId, 'decision', body)", caption: 'A separate request — the controller — calls engine.update with the decision. This is the command that steers the parked run.' },
+    { file: 1, lines: [4, 6], stage: '', active: 3, tone: 'run', title: 'validate', actor: 'validator runs in the caller’s request', caption: 'Before the run is touched, the registered validator runs synchronously in this request. A bad decision returns { accepted: false, reason } here — the run never wakes for it.' },
+    { file: 0, lines: [5, 5], stage: '', active: 4, tone: 'run', title: 'resume', actor: 'accepted → delivered to onUpdate, run resumes', caption: 'Accepted: the decision is delivered to the suspended ctx.onUpdate and the run comes back to life exactly where it left off.' },
+    { file: 0, lines: [7, 7], stage: '', active: 5, tone: 'run', title: 'reimburse', actor: 'ctx.step → reimburse the expense', caption: 'The resumed body runs the next durable step with the delivered decision.' },
+    { file: 0, lines: [8, 8], stage: '', active: 6, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes — the outside command carried it down the happy path.' },
   ],
   render: timeline(['awaiting', 'onUpdate', 'update →', 'validate', 'resume', 'reimburse', 'done']),
 };
 
 const deadLetter: Scene = {
   stack: true,
-  code: `// pipeline.workflow.ts — a poison-pill run, and the handler that catches it
+  code: `// a poison-pill run, and the handler that catches it
 @Workflow({ name: 'pipeline', version: '3' })
 export class PipelineWorkflow {
   async run(ctx: WorkflowCtx, input: PipelineInput) {
@@ -1090,8 +1115,10 @@ export class ProcessDocumentWorkflow {
 
 const saga: Scene = {
   stack: true,
-  code: `// book-trip.workflow.ts — each ctx.step names its own undo
-@Workflow({ name: 'book-trip', version: '1' })
+  files: [
+    {
+      name: 'book-trip.workflow.ts',
+      code: `@Workflow({ name: 'book-trip', version: '1' })
 export class BookTripWorkflow {
   constructor(private readonly trips: TripService) {}
 
@@ -1106,20 +1133,39 @@ export class BookTripWorkflow {
     await ctx.step(this.trips.chargeDeposit, { trip, flight, hotel });
     return { flight, hotel };
   }
-}
-
-// trip.service.ts — an undo is an ordinary @Step, typed with UndoOf
-@Step()
-async cancelFlight({ output }: UndoOf<TripService['bookFlight']>) {
-  await this.flightsApi.cancel(output.bookingId);
 }`,
+    },
+    {
+      name: 'trip.service.ts',
+      code: `@Injectable()
+export class TripService {
+  @Step()
+  async bookFlight(trip: TripRequest): Promise<Flight> { /* … */ }
+
+  @Step()
+  async bookHotel(trip: TripRequest): Promise<Hotel> { /* … */ }
+
+  // an undo is an ordinary @Step — UndoOf gives it the { input, output }
+  // envelope of the call it compensates, fully typed:
+  @Step()
+  async cancelHotel({ output }: UndoOf<TripService['bookHotel']>) {
+    await this.hotelsApi.release(output.reservationId);
+  }
+
+  @Step()
+  async cancelFlight({ input, output }: UndoOf<TripService['bookFlight']>) {
+    await this.flightsApi.cancel(output.bookingId, { traveller: input.customerId });
+  }
+}`,
+    },
+  ],
   steps: [
-    { lines: [7, 9], stage: '', active: 0, tone: 'run', title: 'flight', actor: 'ctx.step → book flight, undo registered', caption: "The flight books on whatever worker serves bookFlight. Because the call completed, its compensate — cancelFlight, another @Step — is registered on the saga stack together with this call's { input, output }." },
-    { lines: [10, 12], stage: '', active: 1, tone: 'run', title: 'hotel', actor: 'ctx.step → book hotel, undo registered', caption: "The hotel books and registers its own undo — pushed after the flight's, so it will be undone first." },
-    { lines: [14, 15], stage: '', active: 2, tone: 'fail', title: 'deposit ✗', actor: 'ctx.step → charge deposit (fails)', caption: 'The deposit charge exhausts its retries and the run fails. It registered no undo of its own — but two earlier steps did.' },
-    { lines: [11, 11], stage: '', active: 3, tone: 'run', title: 'undo hotel', actor: 'engine dispatches cancelHotel — checkpoint −1', caption: 'The engine walks the stack in reverse and DISPATCHES cancelHotel to its worker like any durable step, checkpointed at reserved seq −1 — a crash mid-unwind resumes here instead of re-running finished undos.' },
-    { lines: [21, 24], stage: '', active: 4, tone: 'run', title: 'undo flight', actor: 'cancelFlight({ input, output }) — checkpoint −2', caption: "Then the flight's undo runs. An undo handler is an ordinary @Step called with the compensated call's { input, output } envelope — UndoOf<TripService['bookFlight']> types it for free, and a Python worker can serve it by name." },
-    { lines: [14, 15], stage: '', active: 5, tone: 'fail', title: 'failed', actor: 'unwind done → run settles failed (original error)', caption: 'Both legs undone, the run settles failed with the ORIGINAL deposit error — never masked by the unwind. The compensate:* checkpoints keep the whole undo trail visible in the dashboard.' },
+    { file: 0, lines: [6, 8], stage: '', active: 0, tone: 'run', title: 'flight', actor: 'ctx.step → book flight, undo registered', caption: "The flight books on whatever worker serves bookFlight. Because the call completed, its compensate — cancelFlight, another @Step — is registered on the saga stack together with this call's { input, output }." },
+    { file: 0, lines: [9, 11], stage: '', active: 1, tone: 'run', title: 'hotel', actor: 'ctx.step → book hotel, undo registered', caption: "The hotel books and registers its own undo — pushed after the flight's, so it will be undone first." },
+    { file: 0, lines: [12, 13], stage: '', active: 2, tone: 'fail', title: 'deposit ✗', actor: 'ctx.step → charge deposit (fails)', caption: 'The deposit charge exhausts its retries and the run fails. It registered no undo of its own — but two earlier steps did.' },
+    { file: 1, lines: [11, 14], stage: '', active: 3, tone: 'run', title: 'undo hotel', actor: 'engine dispatches cancelHotel — checkpoint −1', caption: 'The engine walks the stack in reverse and DISPATCHES cancelHotel to its worker like any durable step, checkpointed at reserved seq −1 — a crash mid-unwind resumes here instead of re-running finished undos. It receives the { input, output } of the hotel booking it undoes.' },
+    { file: 1, lines: [16, 19], stage: '', active: 4, tone: 'run', title: 'undo flight', actor: 'cancelFlight({ input, output }) — checkpoint −2', caption: "Then the flight's undo runs, with both the original input AND the booking it must cancel in its envelope — UndoOf<TripService['bookFlight']> types it for free, and a Python worker could serve it by name." },
+    { file: 0, lines: [12, 13], stage: '', active: 5, tone: 'fail', title: 'failed', actor: 'unwind done → run settles failed (original error)', caption: 'Both legs undone, the run settles failed with the ORIGINAL deposit error — never masked by the unwind. The compensate:* checkpoints keep the whole undo trail visible in the dashboard.' },
   ],
   render: timeline(['flight', 'hotel', 'deposit ✗', 'undo hotel', 'undo flight', 'failed'], { failed: [2] }),
 };
@@ -1151,7 +1197,10 @@ export class SendReceiptWorkflow {
 
 const singleton: Scene = {
   stack: true,
-  code: `// sync-inventory.workflow.ts — a durable mutex per store
+  files: [
+    {
+      name: 'sync-inventory.workflow.ts',
+      code: `// a durable mutex per store
 @Workflow({
   name: 'sync-inventory',
   version: '1',
@@ -1162,20 +1211,24 @@ export class SyncInventoryWorkflow {
     const stock = await ctx.step(this.inventory.pull, input);
     await ctx.step(this.inventory.reconcile, stock);
   }
-}
-
-// three starts arrive, back to back:
+}`,
+    },
+    {
+      name: 'app.service.ts',
+      code: `// three starts arrive, back to back:
 await workflows.start(SyncInventoryWorkflow, { storeId: 'A' }); // slot free → runs
 await workflows.start(SyncInventoryWorkflow, { storeId: 'A' }); // same key → GATED behind run 1
 await workflows.start(SyncInventoryWorkflow, { storeId: 'B' }); // other key → runs immediately`,
+    },
+  ],
   steps: [
-    { lines: [2, 6], stage: '', title: 'admitted', actor: "singleton.key → 'store:A' — slot free, run 1 admitted", caption: 'The singleton key derives store:A from the input. The first start finds the key’s only slot free (limit defaults to 1 — a mutex) and is admitted.', child: { pActive: 0, cActive: -1, pTone: 'run' } },
-    { lines: [15, 15], stage: '', title: 'run 1 works', actor: 'run 1 executes — it holds store:A’s slot', caption: 'Run 1 executes its steps normally, holding the store:A slot for as long as it is pending, running, or suspended.', child: { pActive: 1, cActive: -1, pTone: 'run' } },
-    { lines: [16, 16], stage: '', title: 'run 2 arrives', actor: 'second start, SAME key store:A', caption: 'A second start for store:A arrives while run 1 is in flight. It is a real run with its own runId — but it shares the singleton key.', child: { pActive: 1, cActive: 0, pTone: 'run', cTone: 'run' } },
-    { lines: [16, 17], stage: '', title: 'gated', actor: 'gate: run 1 holds store:A → run 2 waits (zero compute)', caption: 'The admission gate counts run 1 under the same key, so run 2 is NOT admitted: it suspends with a jittered retry and a wake-on-release notify — zero compute while it queues. store:B (last line) has its own key and runs immediately.', child: { pActive: 1, cActive: 1, pTone: 'run', cTone: 'wait' } },
-    { lines: [9, 11], stage: '', title: 'run 1 done', actor: 'run 1 settles → slot released → wakeNext', caption: 'Run 1 completes and releases the slot. The gate wakes the OLDEST waiter for store:A — FIFO by (createdAt, id), the same view on every instance, so admission is race-free across a fleet.', child: { pActive: 2, cActive: 1, pTone: 'done', cTone: 'wait' } },
-    { lines: [16, 16], stage: '', title: 'run 2 admitted', actor: 'run 2 admitted → executes the same workflow', caption: 'Run 2 is admitted and does its own sync — exactly one store:A sync at a time, and none of the requests were lost.', child: { pActive: 2, pDone: true, pTone: 'done', cActive: 2, cTone: 'run' } },
-    { lines: [10, 11], stage: '', title: 'run 2 done', actor: 'run 2 settles — the queue is drained', caption: 'Run 2 completes. Set maxQueueDepth to bound how many starts may queue behind the slot — past it, start() rejects with SingletonQueueFullError instead of growing the backlog.', child: { pActive: 2, pDone: true, pTone: 'done', cActive: 3, cDone: true, cTone: 'done' } },
+    { file: 0, lines: [2, 6], stage: '', title: 'admitted', actor: "singleton.key → 'store:A' — slot free, run 1 admitted", caption: 'The singleton key derives store:A from the input. The first start finds the key’s only slot free (limit defaults to 1 — a mutex) and is admitted.', child: { pActive: 0, cActive: -1, pTone: 'run' } },
+    { file: 1, lines: [2, 2], stage: '', title: 'run 1 works', actor: 'run 1 executes — it holds store:A’s slot', caption: 'Run 1 executes its steps normally, holding the store:A slot for as long as it is pending, running, or suspended.', child: { pActive: 1, cActive: -1, pTone: 'run' } },
+    { file: 1, lines: [3, 3], stage: '', title: 'run 2 arrives', actor: 'second start, SAME key store:A', caption: 'A second start for store:A arrives while run 1 is in flight. It is a real run with its own runId — but it shares the singleton key.', child: { pActive: 1, cActive: 0, pTone: 'run', cTone: 'run' } },
+    { file: 1, lines: [3, 4], stage: '', title: 'gated', actor: 'gate: run 1 holds store:A → run 2 waits (zero compute)', caption: 'The admission gate counts run 1 under the same key, so run 2 is NOT admitted: it suspends with a jittered retry and a wake-on-release notify — zero compute while it queues. store:B (last line) has its own key and runs immediately.', child: { pActive: 1, cActive: 1, pTone: 'run', cTone: 'wait' } },
+    { file: 0, lines: [8, 10], stage: '', title: 'run 1 done', actor: 'run 1 settles → slot released → wakeNext', caption: 'Run 1 completes and releases the slot. The gate wakes the OLDEST waiter for store:A — FIFO by (createdAt, id), the same view on every instance, so admission is race-free across a fleet.', child: { pActive: 2, cActive: 1, pTone: 'done', cTone: 'wait' } },
+    { file: 1, lines: [3, 3], stage: '', title: 'run 2 admitted', actor: 'run 2 admitted → executes the same workflow', caption: 'Run 2 is admitted and does its own sync — exactly one store:A sync at a time, and none of the requests were lost.', child: { pActive: 2, pDone: true, pTone: 'done', cActive: 2, cTone: 'run' } },
+    { file: 0, lines: [9, 10], stage: '', title: 'run 2 done', actor: 'run 2 settles — the queue is drained', caption: 'Run 2 completes. Set maxQueueDepth to bound how many starts may queue behind the slot — past it, start() rejects with SingletonQueueFullError instead of growing the backlog.', child: { pActive: 2, pDone: true, pTone: 'done', cActive: 3, cDone: true, cTone: 'done' } },
   ],
   render: (step) => <ChildDiagram step={step} parentBeats={['admitted', 'sync', 'done']} childBeats={['arrives', 'gated', 'sync', 'done']} spawnIdx={0} parentLabel="run 1 · key store:A" childLabel="run 2 · key store:A (same key)" parallel />,
 };
@@ -1206,11 +1259,21 @@ export function CodeFlow({ scene }: { scene: string }) {
   const data = SCENES[scene];
   const svgWrap = useRef<HTMLDivElement>(null);
   const stepper = useStepper(data ? data.steps.length : 1);
+  // Multi-file scenes render one tab per file; stepping auto-switches to the active step's tab
+  // (a manual tab click is a passive peek — the next step change re-syncs). Initialized to the
+  // LAST step's file so the resolved no-JS frame shows the right tab.
+  const [viewFile, setViewFile] = useState(data ? (data.steps[data.steps.length - 1]?.file ?? 0) : 0);
+  const stepFile = data ? (data.steps[stepper.index]?.file ?? 0) : 0;
+  useEffect(() => setViewFile(stepFile), [stepFile]);
   if (!data) return null;
   const step = data.steps[stepper.index];
+  const files = data.files ?? [{ name: '', code: data.code ?? '' }];
+  // When peeking at another tab, highlight nothing (the active step's lines live elsewhere).
+  const noLines: [number, number] = [-1, -1];
+  const activeLines = (step.file ?? 0) === viewFile ? step.lines : noLines;
 
   function jump(line: number) {
-    const target = data.steps.findIndex((s) => line >= s.lines[0] && line <= s.lines[1]);
+    const target = data.steps.findIndex((s) => (s.file ?? 0) === viewFile && line >= s.lines[0] && line <= s.lines[1]);
     if (target >= 0) stepper.go(target);
   }
 
@@ -1227,7 +1290,42 @@ export function CodeFlow({ scene }: { scene: string }) {
       `}</style>
 
       <div style={{ display: 'grid', gap: 14, gridTemplateColumns: 'minmax(0, 1fr)' }} className={`cf-grid ${data.stack ? 'cf-stack' : ''}`}>
-        <CodePanel code={data.code} active={step.lines} onJump={jump} />
+        <div style={{ minWidth: 0 }}>
+          {files.length > 1 && (
+            <div role="tablist" aria-label="Files" style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+              {files.map((file, i) => {
+                const on = i === viewFile;
+                return (
+                  <button
+                    key={file.name}
+                    type="button"
+                    role="tab"
+                    aria-selected={on}
+                    onClick={() => setViewFile(i)}
+                    className="cf-anim"
+                    style={{
+                      padding: '5px 12px',
+                      fontSize: 11.5,
+                      fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)',
+                      color: on ? ink : muted,
+                      background: on ? 'var(--color-fd-card)' : 'transparent',
+                      border: `1px solid ${on ? border : 'transparent'}`,
+                      borderBottom: on ? `1px solid var(--color-fd-card)` : '1px solid transparent',
+                      borderRadius: '8px 8px 0 0',
+                      cursor: 'pointer',
+                      position: 'relative',
+                      top: 1,
+                      boxShadow: on ? `inset 0 2px 0 ${accent}` : 'none',
+                    }}
+                  >
+                    {file.name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          <CodePanel code={files[viewFile]?.code ?? ''} active={activeLines} onJump={jump} />
+        </div>
         <div ref={svgWrap} style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', background: stepBg, border: `1px solid ${border}`, borderRadius: 12, padding: '10px 12px' }}>
           {data.render(step)}
         </div>
