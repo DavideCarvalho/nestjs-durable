@@ -1,7 +1,8 @@
-import type {
-  WorkflowDecision,
-  WorkflowStepEvent,
-  WorkflowTask,
+import {
+  type WorkflowDecision,
+  type WorkflowStepEvent,
+  type WorkflowTask,
+  runInWorkflowCtx,
 } from '@dudousxd/nestjs-durable-core';
 import { Cancelled, StepFailed, Suspend, toError } from './errors';
 import { WorkflowContext } from './workflow-context';
@@ -72,7 +73,9 @@ export class WorkflowWorker {
     });
 
     try {
-      const output = await fn(ctx, task.input);
+      // Same ambient-context wrap as the engine's body execution: class-first statics
+      // (`MyWorkflow.execute()`) inside a thin-worker body resolve THIS ctx.
+      const output = await runInWorkflowCtx(ctx, () => fn(ctx, task.input));
       return { ...base, status: 'completed', commands: ctx.commands, output };
     } catch (err) {
       if (err instanceof Suspend) {

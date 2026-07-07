@@ -1,4 +1,6 @@
 export * from './admission';
+export * from './ambient-ctx';
+export * from './durable-workflow';
 export * from './duration';
 export * from './engine';
 export * from './entities';

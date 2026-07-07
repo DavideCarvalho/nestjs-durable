@@ -156,6 +156,21 @@ Marks an `@Injectable()` class implementing `intercept(invocation: StepInvocatio
 as onion middleware around every LOCAL step's real execution (first-declared runs outermost). Fires
 only when a step actually executes, never on replay.
 
+## DurableWorkflow (class-first statics)
+
+Optional base class (`packages/core/src/durable-workflow.ts`) — `@Workflow` classes that extend it
+start from the class itself, with input/output types inferred from their own `run` signature. See
+[Class-first starts](/docs/concepts/workflows-and-steps#class-first-starts--myworkflowstart--myworkflowexecute).
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `start` | `static start<C>(this: C, input: WorkflowInputOf<C>, opts?: { id?: string } & StartOptions): Promise<RunResult>` | Fire-and-forget everywhere: `engine.start` outside a workflow; `ctx.startChild` (parent-linked, checkpointed) inside one. `opts.id` pins the run/child id. |
+| `execute` | `static execute<C>(this: C, input: WorkflowInputOf<C>, opts?: { id?: string; timeoutMs?: number } & StartOptions): Promise<WorkflowOutputOf<C>>` | Run-and-await everywhere: `ctx.child` inside a workflow; start + wait-until-terminal outside (throws `FatalError` if the run didn't complete). `timeoutMs` bounds the outside wait. |
+
+Related helpers: `currentWorkflowCtx()` returns the ambient `WorkflowCtx` on the executing body's
+async path (or `undefined` outside one); `bindWorkflowClass(ctor, client)` is what the registrar
+calls at boot to bind each class to the engine that registered it.
+
 ## WorkflowService
 
 Injectable NestJS-facing entry point (`packages/nestjs/src/workflow.service.ts`) — a thin pass-through
@@ -165,7 +180,7 @@ to the `WorkflowEngine` it wraps.
 | --- | --- | --- |
 | `start` | `start<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, runId?: string, opts?: StartOptions): Promise<RunResult>` | Enqueue a run (`pending`) and return immediately; a worker executes the body. `runId` defaults to a random id — pass your own for idempotent starts. |
 | `resume` | `resume(runId: string): Promise<RunResult>` | Resume a run's next turn. |
-| `waitForRun` | `waitForRun(runId: string, opts?: { timeoutMs?: number }): Promise<RunResult>` | Resolve once the run settles (terminal or suspended). Pair with `start` when a request needs the outcome. |
+| `waitForRun` | `waitForRun(runId: string, opts?: { timeoutMs?: number; until?: 'settled' \| 'terminal' }): Promise<RunResult>` | Resolve once the run settles (terminal or suspended); `until: 'terminal'` waits past suspensions until completed/failed/cancelled/dead. Pair with `start` when a request needs the outcome. |
 | `signal` | `signal(token: string, payload: unknown): Promise<RunResult \| null>` | Deliver an external signal to the run waiting on `token`. |
 | `signalWithStart` | `signalWithStart<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, runId: string, signal: { token: string; payload?: unknown }, opts?: StartOptions): Promise<{ runId: string }>` | Ensure the run exists, then signal it — race-free (buffered if the run isn't waiting yet). The durable-entity / accumulator pattern. |
 | `publishEvent` | `publishEvent(name: string, payload: unknown, opts?: { id?: string }): Promise<number>` | Resume every run parked on `ctx.waitForEvent(name, …)` and start every `@Workflow({ onEvent })` subscriber; returns the count touched. |

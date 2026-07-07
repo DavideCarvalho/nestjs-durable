@@ -164,6 +164,15 @@ async run(ctx: WorkflowCtx, batch: Batch) {
 }
 ```
 
+## Class-first alternative — `ChildWorkflow.execute` / `.start`
+
+A workflow that extends `DurableWorkflow` can be called child-style **from its own class**, no `ctx`
+threading: inside a workflow body, `ShippingWorkflow.execute(input)` IS
+`ctx.child(ShippingWorkflow, input)` (awaited, parent-linked) and `ShippingWorkflow.start(input)` IS
+`ctx.startChild` (fire-and-forget) — same checkpointing, same replay safety, detected via the
+ambient workflow context. See
+[Class-first starts](/docs/concepts/workflows-and-steps#class-first-starts--myworkflowstart--myworkflowexecute).
+
 ## When to use which
 
 | | `ctx.child` | `ctx.startChild` | `ctx.all` |

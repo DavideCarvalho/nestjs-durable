@@ -1,4 +1,5 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission';
+import { runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';
 import { instantCheckpoint, stepCheckpoint } from './checkpoints';
 import { type Completion } from './completion';
@@ -1305,7 +1306,10 @@ export class WorkflowEngine {
    * suspended (handed off to a timer/signal/event). The async counterpart to dispatch: pair it with
    * `start` when a call site needs the outcome — `await start(...); const r = await waitForRun(id)`.
    */
-  waitForRun(runId: string, opts?: { timeoutMs?: number }): Promise<RunResult> {
+  waitForRun(
+    runId: string,
+    opts?: { timeoutMs?: number; until?: 'settled' | 'terminal' },
+  ): Promise<RunResult> {
     // `cancelling` is NON-terminal (the saga undo is still running), so a `waitForRun` after a
     // compensating cancel keeps waiting until the run reaches the terminal `cancelled`.
     //
@@ -1314,11 +1318,17 @@ export class WorkflowEngine {
     // `suspended` is the engine's re-drive marker, not a body-emitted sleep/signal suspend. Resolving on
     // it would hand back a half-applied turn (e.g. a sleep whose `wakeAt` the decision hasn't written
     // yet). Wait until the decision lands and clears the marker (a real suspend) or the run goes terminal.
+    //
+    // `until: 'terminal'` skips settling on a real suspend too — it resolves only on
+    // completed/failed/cancelled/dead (the wait behind `MyWorkflow.execute()` outside a workflow).
+    const TERMINAL: ReadonlySet<string> = new Set(['completed', 'failed', 'cancelled', 'dead']);
     const isSettled = (run: WorkflowRun): boolean =>
-      run.status !== 'pending' &&
-      run.status !== 'running' &&
-      run.status !== 'cancelling' &&
-      !(run.status === 'suspended' && run.awaitingDecisionTaskId !== undefined);
+      opts?.until === 'terminal'
+        ? TERMINAL.has(run.status)
+        : run.status !== 'pending' &&
+          run.status !== 'running' &&
+          run.status !== 'cancelling' &&
+          !(run.status === 'suspended' && run.awaitingDecisionTaskId !== undefined);
     const toResult = (run: WorkflowRun): RunResult => ({
       runId,
       status: run.status,
@@ -1333,6 +1343,7 @@ export class WorkflowEngine {
           ? setTimeout(() => {
               if (done) return;
               done = true;
+              if (poller) clearInterval(poller);
               off();
               reject(new Error(`waitForRun(${runId}) timed out after ${opts.timeoutMs}ms`));
             }, opts.timeoutMs)
@@ -1341,6 +1352,7 @@ export class WorkflowEngine {
         if (done) return;
         done = true;
         if (timer) clearTimeout(timer);
+        if (poller) clearInterval(poller);
         off();
         resolve(toResult(run));
       };
@@ -1349,6 +1361,16 @@ export class WorkflowEngine {
           if (run && isSettled(run)) finish(run);
         });
       };
+      // Terminal mode also polls: cancelled/dead transitions have no `run.*` lifecycle event to
+      // react to (and a resume may happen on ANOTHER instance), so events alone can miss them.
+      const poller =
+        opts?.until === 'terminal'
+          ? (() => {
+              const interval = setInterval(check, 250);
+              interval.unref?.();
+              return interval;
+            })()
+          : undefined;
       // React only to this run's settling events (not its every step event), and subscribe BEFORE the
       // initial read so a run that settles in between isn't missed.
       off = this.subscribe((ev) => {
@@ -2502,7 +2524,9 @@ export class WorkflowEngine {
       run.workflow,
     );
     try {
-      const output = await fn(ctx, run.input);
+      // The ambient-context wrap is what lets class-first statics (`MyWorkflow.execute()`) find
+      // this ctx from anywhere on the body's async path — first run and every replay alike.
+      const output = await runInWorkflowCtx(ctx, () => fn(ctx, run.input));
       // A compensating cancel may have been requested while this turn ran (or re-derived from a
       // `cancelling` status on recovery): undo + settle cancelled rather than completing, so the cancel
       // is never lost when the body returns without first hitting a suspension point.
@@ -2727,7 +2751,15 @@ export class WorkflowEngine {
         return { wakeAt };
       }
       if (this.clock() < existing.wakeAt) return { wakeAt: existing.wakeAt };
-      await this.dispatchCompensationAttempt(run, seq, name, def, args, existing.attempts + 1, replay);
+      await this.dispatchCompensationAttempt(
+        run,
+        seq,
+        name,
+        def,
+        args,
+        existing.attempts + 1,
+        replay,
+      );
       return {};
     }
     // Absent: first dispatch.

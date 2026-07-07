@@ -22,6 +22,53 @@ Register it as a normal provider — `DurableModule` discovers it. Start runs wi
 `WorkflowService.start(CheckoutWorkflow, input)` — pass the workflow **class** for a typed input, or a
 **name** string for a cross-runtime workflow.
 
+## Class-first starts — `MyWorkflow.start` / `MyWorkflow.execute`
+
+Extend the optional `DurableWorkflow` base class and the workflow starts **from the class itself** —
+no engine or `WorkflowService` injection at the call site:
+
+```ts
+@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow extends DurableWorkflow {
+  constructor(private readonly inventory: InventoryService) {
+    super();
+  }
+  async run(ctx: WorkflowCtx, order: Order) {
+    /* ... */
+  }
+}
+
+// anywhere — a controller, a consumer, another workflow's body:
+const { runId } = await CheckoutWorkflow.start(order); // fire-and-forget, typed input
+const result = await CheckoutWorkflow.execute(order); //  run-and-await, typed output
+```
+
+Each method means the same thing everywhere; only the mechanism adapts to where you call it:
+
+| | Outside a workflow | Inside a workflow body |
+| --- | --- | --- |
+| `start(input)` | exactly `engine.start` — enqueue, return `{ runId, status }` immediately | `ctx.startChild` — checkpointed, replay-safe, **parent-linked** child |
+| `execute(input)` | start + wait until the run settles **terminally**, resolve the typed output (throws `FatalError` on failure) | `ctx.child` — the parent suspends (zero compute) and resumes with the output |
+
+Inside-ness is detected through the ambient workflow context the engine installs around every body
+execution, so calling `InnerWorkflow.execute(input)` inside another workflow's `run` is literally
+`ctx.child(InnerWorkflow, input)` — the child shows up linked under its parent in the dashboard, and
+both calls are deterministic on replay. `opts.id` pins the run id (outside) or child id (inside) for
+idempotent starts; `execute`'s `opts.timeoutMs` bounds the *outside* wait.
+
+<Callout type="warn">
+A `@Step` **handler** runs on a worker, off the workflow body's async path — it has no ambient
+workflow context, so a static called there starts a **top-level** run, not a child. That is correct
+(a handler is not the workflow body), but worth knowing. And prefer `start` over `execute` in HTTP
+handlers: `execute` outside a workflow holds the caller until the run settles — fine for a consumer
+or script, wrong for a request that would wait out a run that sleeps for hours.
+</Callout>
+
+The types are inferred from the subclass's own `run` signature — `start` checks the input,
+`execute` resolves `Awaited<ReturnType<run>>` — so there is no manual type parameter anywhere. In a
+store-less tenant worker the class is bound to a start facade that cannot wait: `start` works,
+`execute` outside a workflow throws a clear error.
+
 ## Steps
 
 A **step** is the one durable primitive: `ctx.step(...)` runs a unit of work and checkpoints its

@@ -6,6 +6,7 @@ import {
   type WorkflowCtx,
   WorkflowEngine,
   type WorkflowRun,
+  bindWorkflowClass,
   parseDuration,
   sanitizeQueueToken,
   tenantGroup,
@@ -148,6 +149,13 @@ export class WorkflowRegistrar
               ),
             }
           : {}),
+      });
+
+      // Class-first statics (`MyWorkflow.start()` / `.execute()`): bind the class to THIS engine,
+      // so the statics resolve the engine that registered it — no global engine singleton.
+      bindWorkflowClass(workflowCtor as new () => object, {
+        start: (name, input, runId, opts) => this.engine.start(name, input, runId, opts),
+        waitForRun: (runId, opts) => this.engine.waitForRun(runId, opts),
       });
 
       const inline = this.findDeadLetterHandler(workflow as unknown as object);
