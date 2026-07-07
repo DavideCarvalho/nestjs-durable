@@ -46,6 +46,11 @@ const held = await ctx.step(this.inventory.reserve, order);
 const out = await ctx.step<ProcResult>('processing:proc', input);
 ```
 
+A real workflow strings several steps together — the body is just orchestration, and each `ctx.step`
+is a durable checkpoint. Walk a checkout run line by line:
+
+<CodeFlow scene="checkout" />
+
 ### Declaring a step with `@Step`
 
 `@Step` marks a provider method as a step handler. Three forms:

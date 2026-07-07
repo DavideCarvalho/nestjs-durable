@@ -9,6 +9,8 @@ durable runs in their own right: their own history, retries, and dashboard entry
 
 There are two ways to call one, depending on whether the parent needs the result.
 
+<CodeFlow scene="child-workflow" />
+
 ## `ctx.child` — run a child and await its result
 
 `ctx.child(workflow, input)` starts the child **once** and suspends the parent — zero compute — until

@@ -6,6 +6,8 @@ description: Pause a workflow durably — ctx.sleep for time-based waits (minute
 Real workflows wait — for a delay, or for the outside world. Both kinds of pause are **durable**:
 the run is suspended (no compute consumed) and resumes on its own, even across restarts.
 
+<CodeFlow scene="sleep-signals" />
+
 ## Durable sleep
 
 `ctx.sleep(duration)` suspends the run until the timer is due. Accepts `'30s'`, `'2h'`,

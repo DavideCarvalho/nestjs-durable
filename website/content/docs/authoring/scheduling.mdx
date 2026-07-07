@@ -40,14 +40,14 @@ DurableModule.forRoot({
   store,
   transport,
   schedules: [
-    // Nightly report at 02:00 in São Paulo — DST-aware.
+    // Run the `daily-report` workflow at 02:00 in São Paulo — DST-aware.
     {
-      key: 'nightly-report',
+      key: 'daily-report',
       workflow: 'daily-report',
       cron: '0 2 * * *',
       timezone: 'America/Sao_Paulo',
     },
-    // Sync the cache every five minutes.
+    // Run the `cache-sync` workflow every five minutes.
     {
       key: 'cache-sync',
       workflow: 'cache-sync',
@@ -57,7 +57,10 @@ DurableModule.forRoot({
 });
 ```
 
-The referenced workflows are ordinary `@Workflow` providers:
+Each schedule's `workflow` field is the `@Workflow` **name** it starts. There's no schedule option on
+`@Workflow` itself — schedules are deployment config (which cadence runs where), kept separate from the
+workflow definition, so the same workflow can be scheduled differently per environment or started
+ad-hoc. The `daily-report` schedule above starts this ordinary provider:
 
 ```ts
 @Workflow({ name: 'daily-report', version: '1' })

@@ -137,7 +137,15 @@ function useStepper(count: number) {
 }
 
 // ── code panel ───────────────────────────────────────────────────────────────
-type Step = { lines: [number, number]; title: string; actor: string; caption: string; stage: string };
+type Step = {
+  lines: [number, number];
+  title: string;
+  actor: string;
+  caption: string;
+  stage: string;
+  active?: number; // timeline scenes: index of the lit beat
+  tone?: 'run' | 'wait' | 'done'; // timeline scenes: the active beat's colour
+};
 
 function CodePanel({
   code,
@@ -435,8 +443,54 @@ function DispatchDiagram({ step }: { step: Step }) {
   );
 }
 
+// ── workflow timeline (generic multi-beat walkthrough) ───────────────────────
+// A reusable rail of labelled beats — one per step/sleep/signal/child in a run body.
+// Each walkthrough step lights one beat (its `active` index) in a `tone` (run/wait/done);
+// passed beats show a check, upcoming beats stay neutral. Scenes supply the beat labels.
+function WorkflowTimeline({ beats, active, tone, actor }: { beats: string[]; active: number; tone: 'run' | 'wait' | 'done'; actor: string }) {
+  const count = beats.length;
+  const gap = 150;
+  const x0 = 74;
+  const width = x0 * 2 + (count - 1) * gap;
+  const railY = 150;
+  const cx = (i: number) => x0 + i * gap;
+  const toneColor = tone === 'wait' ? AMBER : tone === 'done' ? GREEN : accent;
+  return (
+    <svg viewBox={`0 0 ${width} 232`} width="100%" role="img" aria-label={actor} style={{ display: 'block' }}>
+      <g className="cf-anim">
+        <rect x={16} y={26} width={width - 32} height={48} rx={12} fill={tintAccentSoft} stroke={border} />
+        <circle cx={40} cy={50} r={5} fill={toneColor} className="cf-anim" />
+        <text x={58} y={54} style={{ fontSize: 13, fill: ink, fontWeight: 500 }}>
+          {actor}
+        </text>
+      </g>
+      <line x1={cx(active)} y1={74} x2={cx(active)} y2={railY - 24} stroke={toneColor} strokeWidth={1.5} strokeDasharray="4 4" className="cf-anim" />
+
+      <line x1={cx(0)} y1={railY} x2={cx(count - 1)} y2={railY} stroke={border} strokeWidth={2} />
+      <line x1={cx(0)} y1={railY} x2={cx(Math.max(0, active))} y2={railY} stroke={accent} strokeWidth={2} className="cf-anim" />
+
+      {beats.map((label, i) => {
+        const done = i < active;
+        const on = i === active;
+        return (
+          <g key={`${label}-${i}`} className="cf-anim">
+            {on && <circle cx={cx(i)} cy={railY} r={26} fill={toneColor} opacity={0.15} className="cf-pulse" />}
+            <circle cx={cx(i)} cy={railY} r={on ? 15 : 11} className="cf-anim" fill={on ? toneColor : done ? tintAccent : neutral} stroke={on ? toneColor : done ? accent : border} strokeWidth={1.5} />
+            {done && <path d={`M ${cx(i) - 4} ${railY} l 3 3 l 6 -7`} fill="none" stroke={accent} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />}
+            <text x={cx(i)} y={railY + 38} textAnchor="middle" className="cf-anim" style={{ fontSize: 12, fill: on ? ink : muted, fontWeight: on ? 600 : 400 }}>
+              {label}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
 // ── scenes ───────────────────────────────────────────────────────────────────
-type Scene = { code: string; steps: Step[]; render: (step: Step) => ReactNode };
+type Scene = { code: string; steps: Step[]; render: (step: Step) => ReactNode; stack?: boolean };
+
+const timeline = (beats: string[]) => (step: Step) => <WorkflowTimeline beats={beats} active={step.active ?? 0} tone={step.tone ?? 'run'} actor={step.actor} />;
 
 const executionModel: Scene = {
   code: `// returns at once — never blocks on the body
@@ -547,9 +601,88 @@ await ctx.step(this.inventory.reserve, order);`,
   render: (step) => <DispatchDiagram step={step} />,
 };
 
+const checkout: Scene = {
+  stack: true,
+  code: `@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow {
+  constructor(
+    private readonly inventory: InventoryService,
+    private readonly payments: PaymentsService,
+    private readonly shipping: ShippingService,
+    private readonly email: EmailService,
+  ) {}
+
+  async run(ctx: WorkflowCtx, order: Order) {
+    const hold = await ctx.step(this.inventory.reserve, order);
+    const charge = await ctx.step(this.payments.charge, { order, hold });
+    await ctx.waitForSignal('packed');
+    const label = await ctx.step(this.shipping.ship, order);
+    await ctx.step(this.email.confirm, { order, label });
+    return { chargeId: charge.id, tracking: label.tracking };
+  }
+}`,
+  steps: [
+    { lines: [11, 11], stage: '', active: 0, tone: 'run', title: 'reserve', actor: 'ctx.step → reserve inventory', caption: 'Each ctx.step dispatches a unit and checkpoints its result; the run suspends until the hold lands, then resumes with it.' },
+    { lines: [12, 12], stage: '', active: 1, tone: 'run', title: 'charge', actor: 'ctx.step → charge the card', caption: 'The charge result is a durable checkpoint — saved before the next line runs, so a crash never repeats the charge.' },
+    { lines: [13, 13], stage: '', active: 2, tone: 'wait', title: 'waitForSignal', actor: "parked on 'packed' — zero compute", caption: "waitForSignal suspends the run until the warehouse signals 'packed'. No worker is held while it waits." },
+    { lines: [14, 14], stage: '', active: 3, tone: 'run', title: 'ship', actor: 'signal resumed the run → ship', caption: 'The signal woke the run; it ships and checkpoints the tracking label.' },
+    { lines: [15, 15], stage: '', active: 4, tone: 'run', title: 'confirm', actor: 'ctx.step → email the confirmation', caption: 'A final step emails the confirmation with the label.' },
+    { lines: [16, 16], stage: '', active: 5, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay, every completed step returns its saved result — none re-run.' },
+  ],
+  render: timeline(['reserve', 'charge', 'packed', 'ship', 'confirm', 'done']),
+};
+
+const childWorkflow: Scene = {
+  stack: true,
+  code: `@Workflow({ name: 'onboard', version: '1' })
+export class OnboardWorkflow {
+  async run(ctx: WorkflowCtx, user: User) {
+    const account = await ctx.step(this.accounts.create, user);
+
+    // run a child workflow and await its result:
+    const kyc = await ctx.child(KycWorkflow, { userId: account.id });
+
+    await ctx.step(this.email.welcome, { user, kyc });
+    return { verified: kyc.passed };
+  }
+}`,
+  steps: [
+    { lines: [4, 4], stage: '', active: 0, tone: 'run', title: 'create account', actor: 'ctx.step → create the account', caption: 'A normal step creates the account and checkpoints its result.' },
+    { lines: [7, 7], stage: '', active: 1, tone: 'wait', title: 'ctx.child', actor: 'child KycWorkflow — suspended until it settles', caption: 'ctx.child starts KycWorkflow and suspends — zero compute — until the child reaches a terminal state, then resumes with its output. The childId is deterministic, so the child runs exactly once across replay.' },
+    { lines: [9, 9], stage: '', active: 2, tone: 'run', title: 'welcome', actor: 'ctx.step → welcome email', caption: "The parent resumed with the child's result and emails the user." },
+    { lines: [10, 10], stage: '', active: 3, tone: 'done', title: 'completes', actor: 'onboard settles — completed', caption: "The parent returns the child's verified flag; the run completes." },
+  ],
+  render: timeline(['create', 'KYC child', 'welcome', 'done']),
+};
+
+const sleepSignals: Scene = {
+  stack: true,
+  code: `async run(ctx: WorkflowCtx, order: Order) {
+  await ctx.step(this.orders.place, order);
+
+  // durable timer — suspend 2h, survives restarts:
+  await ctx.sleep('2h');
+
+  // or wait for an external signal (webhook, approval):
+  const approval = await ctx.waitForSignal('approved');
+  await ctx.step(this.orders.finalize, { order, approval });
+}`,
+  steps: [
+    { lines: [2, 2], stage: '', active: 0, tone: 'run', title: 'place', actor: 'ctx.step → place the order', caption: 'A step places the order and checkpoints its result.' },
+    { lines: [5, 5], stage: '', active: 1, tone: 'wait', title: 'ctx.sleep', actor: 'durable timer — suspended 2h', caption: 'ctx.sleep suspends the run for 2h with zero compute; a durable timer resumes it automatically, even across restarts.' },
+    { lines: [8, 8], stage: '', active: 2, tone: 'wait', title: 'waitForSignal', actor: "parked on 'approved'", caption: "waitForSignal parks the run until engine.signal('approved') arrives — buffered if it comes before the run waits, so a signal is never lost." },
+    { lines: [9, 9], stage: '', active: 3, tone: 'run', title: 'finalize', actor: 'signal resumed the run → finalize', caption: 'The signal woke the run; it finalizes with the payload.' },
+    { lines: [10, 10], stage: '', active: 4, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns; the run completes.' },
+  ],
+  render: timeline(['place', 'sleep 2h', 'approved', 'finalize', 'done']),
+};
+
 const SCENES: Record<string, Scene> = {
   'execution-model': executionModel,
   'dispatched-step': dispatchedStep,
+  checkout,
+  'child-workflow': childWorkflow,
+  'sleep-signals': sleepSignals,
 };
 
 // ── shell ────────────────────────────────────────────────────────────────────
@@ -577,7 +710,7 @@ export function CodeFlow({ scene }: { scene: string }) {
         @media (prefers-reduced-motion: reduce) { .cf-anim, .cf-token { transition: none } .cf-pulse, .cf-flow { animation: none } .cf-pulse { opacity: 0 } }
       `}</style>
 
-      <div style={{ display: 'grid', gap: 14, gridTemplateColumns: 'minmax(0, 1fr)' }} className="cf-grid">
+      <div style={{ display: 'grid', gap: 14, gridTemplateColumns: 'minmax(0, 1fr)' }} className={`cf-grid ${data.stack ? 'cf-stack' : ''}`}>
         <CodePanel code={data.code} active={step.lines} onJump={jump} />
         <div ref={svgWrap} style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', background: stepBg, border: `1px solid ${border}`, borderRadius: 12, padding: '10px 12px' }}>
           {data.render(step)}
@@ -604,7 +737,7 @@ export function CodeFlow({ scene }: { scene: string }) {
 
       <ControlBar index={stepper.index} count={data.steps.length} playing={stepper.playing} onToggle={stepper.toggle} onGo={stepper.go} />
 
-      <style>{`@media (min-width: 720px) { .cf-grid { grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr) !important; } }`}</style>
+      <style>{`@media (min-width: 720px) { .cf-grid:not(.cf-stack) { grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr) !important; } }`}</style>
     </figure>
   );
 }
