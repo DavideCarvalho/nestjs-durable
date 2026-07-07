@@ -1,122 +1,190 @@
 ---
 title: Sagas & compensation
-description: "Undo the side effects of a partially-completed run with per-step compensate callbacks that run in reverse on failure, compensationRetries for transient undos, compensate:<step> events, and compensating cancellation via engine.cancel(runId, { compensate: true })."
+description: "Undo a dispatched step's side effects with a compensate ref/name that receives a StepUndo<TInput, TOutput> envelope, retried per the undo's own @Step config and checkpointed at negative seqs for crash-safe resume — plus the ctx.localStep closure form, compensationRetries, compensate:<step> visibility, and compensating cancellation via engine.cancel(runId, { compensate: true })."
 ---
 
-A durable run often performs several irreversible side effects in sequence — reserve inventory, charge a
-card, allocate a shipment. If a later step fails, the earlier effects are still out there in the world, and
-"the run failed" is not an acceptable end state when money has moved. The saga pattern handles this:
-alongside each step that *does* something, you register how to *undo* it, and when the run fails the engine
-runs those undos in reverse order. nestjs-durable builds this in via a `compensate` option on
-`ctx.localStep` — the durable in-process step primitive.
+A durable run often performs several irreversible side effects in sequence — book a flight, book a hotel,
+charge a deposit. If a later step fails, the earlier effects are still out there in the world, and "the run
+failed" is not an acceptable end state when money has moved. The saga pattern handles this: alongside each
+step that *does* something, you register how to *undo* it, and when the run fails the engine runs those
+undos in reverse order. nestjs-durable builds this in via a `compensate` option — on a dispatched `ctx.step`
+call (the common case: the undo runs on a worker, same as the step it undoes) or on `ctx.localStep` (an
+in-process closure).
 
-## Registering a compensation
+Below is a trip booking that reserves a flight and a hotel before charging a deposit. Each booking step
+names its own undo as a `compensate` ref; when the deposit is declined, watch the compensations unwind in
+reverse — hotel, then flight — before the run settles failed:
 
-Attach a `compensate` callback to an in-process step (`ctx.localStep`). The callback is registered when the
-step completes; if the run later fails, the engine runs every registered compensation in **reverse order**
-(last completed step undone first), restoring the world before failing the run.
+<CodeFlow scene="saga" />
+
+## Compensating a dispatched step
+
+Pass `compensate` alongside a `ctx.step` call. The undo is itself an ordinary `@Step` — pass its **reference**
+(compile-time checked) or its **name** (for a cross-runtime undo, e.g. a Python `@step`):
 
 ```ts
-@Workflow({ name: 'checkout', version: '1' })
-export class CheckoutWorkflow {
-  constructor(
-    private readonly inventory: InventoryService,
-    private readonly payments: PaymentsService,
-    private readonly shipping: ShippingService,
-  ) {}
+@Workflow({ name: 'book-trip', version: '1' })
+export class BookTripWorkflow {
+  constructor(private readonly trips: TripService) {}
 
-  async run(ctx: WorkflowCtx, order: Order) {
-    const reservation = await ctx.localStep(
-      'reserve-inventory',
-      () => this.inventory.reserve(order.items),
-      { compensate: () => this.inventory.release(order.items) },
-    );
-
-    const charge = await ctx.localStep(
-      'charge-card',
-      () => this.payments.charge(order.customerId, order.totalCents),
-      { compensate: () => this.payments.refund(order.customerId, order.totalCents) },
-    );
-
-    // If this step throws, the engine runs the two compensations above in reverse:
-    // refund the card, then release the inventory — then fails the run.
-    const label = await ctx.localStep('allocate-shipment', () =>
-      this.shipping.allocate(order, reservation.id),
-    );
-
-    return { chargeId: charge.id, tracking: label.tracking };
+  async run(ctx: WorkflowCtx, trip: TripRequest) {
+    const flight = await ctx.step(this.trips.bookFlight, trip, {
+      compensate: this.trips.cancelFlight,
+    });
+    const hotel = await ctx.step(this.trips.bookHotel, trip, {
+      compensate: this.trips.cancelHotel,
+    });
+    // charge-deposit registers no compensate — nothing of its own to undo
+    await ctx.step(this.trips.chargeDeposit, { trip, flight, hotel });
+    return { flight, hotel };
   }
+}
+
+// trip.service.ts — an undo is an ordinary @Step, typed with UndoOf
+@Step()
+async cancelFlight(undo: UndoOf<TripService['bookFlight']>) {
+  await this.flightsApi.cancel(undo.output.bookingId);
 }
 ```
 
-If `allocate-shipment` throws (and exhausts its retries, or throws a `FatalError`), the run fails — but
-before it does, the engine refunds the card and releases the inventory. The saga is reconstructed from the
-run's history on replay, so it works correctly even after a crash: on replay, a completed `localStep`
-checkpoint returns its saved output *without re-running `fn`* — but a `compensate` callback still gets
-pushed onto the in-memory compensation stack for it, exactly as it was the first time. That's what makes the
-saga crash-safe: after a mid-run crash, the resumed execution reconstructs the full stack of undos for every
-step that had actually completed, not just the ones this pass happened to run.
+The undo is dispatched to whatever worker serves its name, called with **one** argument: the
+`StepUndo<TInput, TOutput>` envelope — `{ input, output }` of the call it's undoing (`bookFlight`'s `trip`
+input and its `{ bookingId }` result here), never the original handler re-invoked in-process. That's the
+whole contract, and it's why a Python worker can serve the undo by name with no side-channel lookup: it just
+reads `{ input, output }` off the task it received.
 
-> Compensations attach to **in-process** steps (`ctx.localStep`). A dispatched `ctx.step` handler is already
-> deduplicated by its deterministic `stepId` (`runId:seq`), which a worker can use as an idempotency key — so
-> to compensate dispatched work, register the undo as its own dispatched `ctx.step` invoked from a
-> compensating `ctx.localStep` (or fold the orchestration into one in-process step with its own undo).
+`UndoOf<H>` derives that envelope type from the original step method, so the ref form is compile-checked
+against the call it undoes instead of hand-written and driftable:
+
+```ts
+type UndoOf<H> = H extends (input: infer I, ...rest: never[]) => infer R
+  ? StepUndo<I, Awaited<R>>
+  : never;
+
+// cancelFlight's argument is exactly StepUndo<TripRequest, { bookingId: string }> —
+// derived from bookFlight's own signature, not restated by hand.
+async cancelFlight(undo: UndoOf<TripService['bookFlight']>) { ... }
+```
+
+The string form (`compensate: 'TripService.cancelFlight'`) works the same way for a handler with no JS
+reference to import — routing is by name either way.
+
+**The undo's retry policy is its own.** A dispatched compensation is dispatched exactly like any other
+`ctx.step` call — its `retries`/`backoff`/`backoffMs`/`backoffMaxMs`/`jitter` come from **its own**
+`@Step`-declared config, never from the compensated call's per-call `opts`. It's a separately-declared
+handler with its own failure policy, not an extension of the step it undoes.
+
+**The unwind is checkpointed, not just an in-memory pass.** Every undo — dispatched or local — gets a
+checkpoint at a reserved *negative* seq: the first one undone lands at `seq -1`, the next at `-2`, and so on,
+named `compensate:<originalStepName>`. Negative seqs can never collide with a body position (those start at
+`0`), so the saga's undo trail composes onto the run's ordinary checkpoint history with no schema change,
+and shows up in run detail exactly like any other step. Because `compensate:<originalStepName>` is
+deterministic and rebuilt identically on every replay, a crash mid-unwind resumes cleanly: an already-
+`completed` undo (dispatched or local) is skipped rather than re-run, and the next one in the stack still
+gets its turn — exactly once. A crash while a dispatched undo is `pending` just re-suspends the run on it,
+the same as a crash mid-dispatch of an ordinary step.
+
+## The in-process alternative: `ctx.localStep`
+
+`ctx.localStep`'s `compensate` is the in-process form — the undo runs as a plain closure instead of being
+dispatched to a worker. Reach for it when the undo is cheap in-process work (an in-memory cache release, a
+call into a service already injected into the workflow class) rather than something that belongs on a
+worker:
+
+```ts
+const reservation = await ctx.localStep(
+  'reserve-inventory',
+  () => this.inventory.reserve(order.items),
+  { compensate: () => this.inventory.release(order.items) },
+);
+```
+
+The callback is registered when the step completes; if the run later fails, the engine runs every
+registered compensation — local and dispatched together — in one strict reverse order. The saga is
+reconstructed from the run's history on replay: on resume, a completed `localStep` checkpoint returns its
+saved output *without re-running `fn`* — but its `compensate` closure still gets pushed onto the
+compensation stack, exactly as it was the first time. That's what makes it crash-safe at the registration
+level: after a mid-run crash, the resumed execution reconstructs the full stack of undos for every step that
+had actually completed, not just the ones this pass happened to run.
+
+Its unwind is checkpointed too, the same as the dispatched form's: a crash mid-unwind no longer re-runs a
+local undo that already completed, and doesn't restart its retry budget from attempt 1 — the checkpoint at
+its negative seq is what a later re-drive checks before running it again.
+
+Because a compensation can still run more than once in the field regardless — a transient retry that
+succeeded but whose result got lost before it checkpointed, for instance — **compensations should be
+idempotent**: releasing an already-released reservation or refunding an already-refunded charge should be a
+no-op either way.
 
 ## What triggers the saga
 
-Any error that escapes the workflow body triggers compensation — not just a business-logic throw. A
-`ctx.localStep` (or dispatched `ctx.step`) that exhausts its `retries`, or throws a `FatalError` directly,
-propagates out of `run()` exactly like an ordinary exception, and the engine treats that the same way
-regardless of *why* the step gave up. The saga does **not** run on every suspension: `ContinueAsNew` and an
-ordinary `waitForSignal`/`ctx.step` suspension both leave the run's compensation stack untouched — it's only
-consulted when the run's execution ends in an unhandled error.
+Any error that escapes the workflow body triggers compensation — not just a business-logic throw. A `ctx.step`
+or `ctx.localStep` that exhausts its `retries`, or throws a `FatalError` directly, propagates out of `run()`
+exactly like an ordinary exception, and the engine treats that the same way regardless of *why* the step gave
+up. The saga does **not** run on every suspension: `ContinueAsNew` and an ordinary `waitForSignal`/`ctx.step`
+suspension both leave the run's compensation stack untouched — it's only consulted when the run's execution
+ends in an unhandled error.
 
 The reverse order is a strict LIFO unwind of the compensations registered so far: the engine walks the stack
 from the most recently completed step to the first, undoing exactly the steps that finished before the
 failure (a step that never completed never registered a compensation, so there's nothing to undo for it).
-For the checkout example, that means `charge-card`'s refund runs before `reserve-inventory`'s release, because
-the charge completed second.
-
-Below is a longer-running saga — a trip booking that reserves a flight, a hotel and a car before charging a
-deposit. Each booking step registers its own undo; when the deposit is declined, watch the compensations
-unwind in reverse — car, then hotel, then flight — before the run settles failed:
-
-<CodeFlow scene="saga" />
+For the trip-booking example, that means `bookHotel`'s undo runs before `bookFlight`'s, because the hotel
+booking completed second.
 
 ## Retrying a transient undo
 
-A compensation can itself fail transiently — the refund API might be momentarily unreachable. The engine
-retries each compensation up to `compensationRetries` times. This is an engine/module-level option (it
-applies to every compensation), and it defaults to 1, i.e. a single attempt with no retry:
+A compensation can itself fail transiently — the cancel API might be momentarily unreachable. Where that
+retry policy comes from depends on the form:
+
+- **Dispatched** (`ctx.step`'s `compensate`): retried per the undo handler's **own** `@Step`-declared policy
+  (`retries`/`backoff`/`backoffMs`/`backoffMaxMs`/`jitter`) — the same durable retry/backoff every other
+  dispatched step gets, resumable across a crash.
+- **Local** (`ctx.localStep`'s `compensate`): retried in-process, back-to-back, up to the engine/module-level
+  `compensationRetries` option (applies to every local compensation; defaults to `1` — a single attempt, no
+  retry):
 
 ```ts
 DurableModule.forRoot({
   store,
   transport,
-  compensationRetries: 5, // retry each saga undo up to 5 times before giving up on it
+  compensationRetries: 5, // retry each LOCAL saga undo up to 5 times before giving up on it
 });
 ```
 
-Because a compensation may run more than once, **compensations should be idempotent** — releasing an
-already-released reservation or refunding an already-refunded charge must be a no-op. A compensation that
-keeps failing past `compensationRetries` is *skipped* rather than allowed to throw: the engine records the
-failure as a `compensate:<step>` event and moves on to the next one in the stack. One stuck undo never halts
-the unwind — every remaining compensation still gets its turn — and it never masks the original failure: the
-run still settles `failed` with the error that triggered the saga in the first place, not the compensation's.
+Either way, a compensation that keeps failing past its retry budget is *skipped* rather than allowed to
+throw or stall the rest of the unwind: the engine records the failure as a `compensate:<step>` event and
+moves on to the next one in the stack. One stuck undo never halts the unwind — every remaining compensation
+still gets its turn — and it never masks the original failure: the run still settles `failed` with the error
+that triggered the saga in the first place, not the compensation's.
+
+## V1 limits
+
+Two things a dispatched compensation does **not** get, unlike an ordinary `ctx.step` dispatch:
+
+- **No queue/admission.** A compensation dispatch skips flow-control entirely — it can't be routed through
+  a `queue`, so it isn't rate-limited or concurrency-capped the way a normal `ctx.step({ queue: ... })` call
+  can be. It always dispatches directly, by name.
+- **No `timeoutMs` liveness window.** An ordinary step's `timeoutMs` presumes the worker dead if no
+  result/heartbeat lands in time and fails the dispatch (retryable). A compensation dispatch has no such
+  window — an in-flight undo is waited on indefinitely, like a normal step call with no `timeoutMs` set.
+
+Neither is a correctness issue — the unwind is still checkpointed and crash-safe either way — but plan
+undo-handler capacity accordingly if a saga can fire under load.
 
 ## Compensations are visible
 
 Every compensation surfaces as a `compensate:<step>` event, emitted as a `step.completed` (the undo ran) or
-`step.failed` (it exhausted its retries) lifecycle event. The dashboard and the Telescope integration render
-these, so a stranded undo is *visible* rather than silently swallowed. For the checkout above you'd see
-`compensate:charge-card` and `compensate:reserve-inventory` appear in the timeline as the saga unwinds.
+`step.failed` (it exhausted its retries) lifecycle event, and as a real checkpoint at its reserved negative
+seq. The dashboard renders the whole unwind as an amber **Compensation** section on the run's timeline, so a
+stranded undo is *visible* rather than silently swallowed. For the trip-booking example you'd see
+`compensate:TripService.bookHotel` and `compensate:TripService.bookFlight` appear as the saga unwinds.
 
 ## Compensating cancellation
 
 The saga also runs when you deliberately cancel a run with compensation. A plain `engine.cancel(runId)` is
 **immediate**: it marks the run `cancelled` right away and broadcasts the cancellation so a worker actually
 running it can abort cooperatively — but it does *not* undo completed steps. Passing `{ compensate: true }`
-instead runs the saga first:
+instead runs the same unwind used on failure, dispatched and local compensations alike:
 
 ```ts
 // Immediate cancel — mark cancelled, abort in-flight work, but leave completed side effects in place:
@@ -128,12 +196,13 @@ await engine.cancel(runId, { compensate: true });
 
 A compensating cancel works by resuming the run with a cancellation pending: the replay re-registers the
 saga from history, and at the run's suspension point the engine runs the compensations in reverse and marks
-the run `cancelled` (rather than re-suspending). It settles the run through a transient `cancelling` status
-while the undo runs in the background, then flips to `cancelled` — so a compensating cancel is visible and
-crash-durable rather than looking like a still-running run. For the checkout example, cancelling a run that
-had already charged the card and reserved inventory with `{ compensate: true }` issues the refund and
-releases the reservation before the run becomes `cancelled` — leaving the world clean, exactly as a failure
-would.
+the run `cancelled` (rather than re-suspending). While the undo runs — including waiting on an in-flight
+dispatched compensation — the run's status stays `cancelling` rather than `suspended`: unlike the failure
+path (where re-suspending between undo dispatches is fine, a resumable state no different from an ordinary
+in-flight `ctx.step`), a compensating cancel needs `cancelling` to survive a crash and be recognized as
+still-in-progress by `waitForRun`, recovery, and a repeat `cancel` call. It flips to `cancelled` once every
+undo resolves — so a compensating cancel is visible and crash-durable rather than looking like a
+still-running run.
 
 ## Saga vs. retries vs. dead-letter
 

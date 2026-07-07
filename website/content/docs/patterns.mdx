@@ -189,37 +189,37 @@ is declined, the reservations must be undone, not left stranded.
 ```ts
 @Workflow({ name: 'trip-booking', version: '1' })
 export class TripBookingWorkflow {
-  constructor(
-    private readonly flights: FlightsService,
-    private readonly hotels: HotelsService,
-    private readonly billing: BillingService,
-  ) {}
+  constructor(private readonly trips: TripService) {}
 
   async run(ctx: WorkflowCtx, trip: TripRequest) {
-    const flight = await ctx.localStep(
-      'reserve-flight',
-      () => this.flights.reserve(trip.flightId),
-      { compensate: () => this.flights.release(trip.flightId) },
-    );
-    const hotel = await ctx.localStep(
-      'reserve-hotel',
-      () => this.hotels.reserve(trip.hotelId),
-      { compensate: () => this.hotels.release(trip.hotelId) },
-    );
+    const flight = await ctx.step(this.trips.reserveFlight, trip, {
+      compensate: this.trips.releaseFlight,
+    });
+    const hotel = await ctx.step(this.trips.reserveHotel, trip, {
+      compensate: this.trips.releaseHotel,
+    });
     // If this throws, the engine undoes the hotel then the flight reservation before failing.
-    const deposit = await ctx.localStep('charge-deposit', () =>
-      this.billing.chargeDeposit(trip.customerId, trip.depositCents),
-    );
+    const deposit = await ctx.step(this.trips.chargeDeposit, {
+      customerId: trip.customerId,
+      amountCents: trip.depositCents,
+    });
     return { flightRef: flight.ref, hotelRef: hotel.ref, depositId: deposit.id };
   }
 }
+
+// trip.service.ts — an undo is an ordinary @Step, typed with UndoOf
+@Step()
+async releaseFlight(undo: UndoOf<TripService['reserveFlight']>) {
+  await this.flightsApi.release(undo.output.ref);
+}
 ```
 
-Each `ctx.localStep` that has a real-world side effect registers its own `compensate` undo; if a
-later step fails (exhausts retries, or throws `FatalError`), the engine runs every registered
-compensation in reverse order before failing the run — here, release the hotel, then the flight.
-Sagas attach only to `ctx.localStep` (in-process), not the dispatched `ctx.step`. This is the short
-version — for retryable undos, visibility, and compensating cancellation, see
+Each `ctx.step` with a real-world side effect names its own `compensate` undo — an ordinary `@Step`,
+dispatched and typed against the call it undoes via `UndoOf`. If a later step fails (exhausts
+retries, or throws `FatalError`), the engine dispatches every registered undo in reverse order,
+checkpointed for crash-safe resume, before failing the run — here, release the hotel, then the
+flight. This is the short version — for the `StepUndo` envelope contract, the `ctx.localStep`
+in-process alternative, retry sourcing, and compensating cancellation, see
 [Sagas & compensation](/docs/reliability/sagas).
 
 ## 6. Rate-limited external API

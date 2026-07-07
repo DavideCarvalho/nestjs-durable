@@ -15,6 +15,11 @@ import { type PartitionView, groupByPartition } from '../client/group-by-partiti
 import { mergeLiveEvents } from '../client/merge-live-events';
 import { type WorkerView, pivotByWorker } from '../client/pivot-by-worker';
 import { partitionOf } from '../client/queue-partition';
+import {
+  compensationDisplayName,
+  compensationSummary,
+  splitCompensations,
+} from '../client/split-compensations';
 import { type HealthSummary, summarizeHealth } from '../client/summarize-health';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
@@ -530,6 +535,54 @@ function RunsList({
   );
 }
 
+/** The saga-compensation group, rendered after the body timeline in unwind order (seq -1 first).
+ *  Never mixes into the body graph/spans — this is its own amber-accented list. Each row is
+ *  clickable into the SAME step-detail panel the body uses (`onSelect` just forwards to it), so a
+ *  failed undo's input/output reads exactly like a normal step's. */
+function CompensationSection({
+  compensations,
+  selKey,
+  onSelect,
+}: {
+  compensations: StepCheckpoint[];
+  selKey: string | undefined;
+  onSelect: (step: StepCheckpoint) => void;
+}) {
+  return (
+    <div className="shrink-0 border-t border-amber-500/20 bg-black/20 px-7 py-3">
+      <div className="mono mb-2 text-[10px] uppercase tracking-[0.18em] text-amber-400/80">
+        compensation · unwind order
+      </div>
+      <ul className="flex flex-col gap-1">
+        {compensations.map((step) => {
+          const key = `${step.runId}#${step.seq}`;
+          return (
+            <li key={key}>
+              <button
+                type="button"
+                onClick={() => onSelect(step)}
+                className={`mono flex w-full items-center gap-2 rounded-md border px-2.5 py-1.5 text-left text-[11.5px] transition-colors ${
+                  key === selKey
+                    ? 'border-amber-500/50 bg-amber-500/15'
+                    : 'border-amber-500/20 bg-amber-500/5 hover:border-amber-500/40'
+                }`}
+              >
+                <StatusDot status={step.status} />
+                <span className="truncate text-amber-100">
+                  {compensationDisplayName(step.name)}
+                </span>
+                <span className="ml-auto shrink-0 text-[10px] uppercase tracking-wider text-amber-400/70">
+                  {step.status}
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => void }) {
   const qc = useQueryClient();
   const { data } = useQuery({
@@ -650,6 +703,11 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
 
   if (!data) return <div className="p-8 text-sm text-zinc-600">Loading run…</div>;
   const { run, timeline } = data;
+  // Saga compensations (seq < 0, one per undone step, in reverse) never mix into the body's
+  // graph/spans/step-count — split them out once, up front, and feed `body` to everything below that
+  // renders the normal flow. `compensations` gets its own section further down.
+  const { body, compensations } = splitCompensations(timeline);
+  const compSummary = compensationSummary(compensations);
   // A dead-letter run is a recovery path, not the normal flow — surface it as a banner. The two ends
   // of the relationship, linked both ways:
   //  - a `dlq:<id>` run is a handler → link back to the dead run it's handling
@@ -670,13 +728,43 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           cta: 'open DLQ handler →',
         }
       : undefined;
+  // Compensation banner copy, mutually exclusive: still unwinding takes priority over the settled
+  // outcome; a settled unwind reads differently for a failure than a cancellation. A failed undo
+  // (exhausted retries) appends a suffix to whichever of the three applies — the run's own error
+  // stays displayed as the ORIGINAL failure regardless.
+  const compBanner =
+    compensations.length > 0
+      ? (() => {
+          const failedSuffix =
+            compSummary.failed > 0
+              ? ` ${compSummary.failed} undo${compSummary.failed === 1 ? '' : 's'} failed after retries — check ${compSummary.failed === 1 ? 'it' : 'them'} below.`
+              : '';
+          if (compSummary.pending > 0) {
+            return {
+              title: 'Compensating',
+              subtitle: `undoing completed steps in reverse (${compSummary.done} of ${compSummary.total} done).${failedSuffix}`,
+            };
+          }
+          if (run.status === 'cancelled') {
+            return {
+              title: 'Cancelled with compensation',
+              subtitle: `completed steps were undone before cancelling.${failedSuffix}`,
+            };
+          }
+          return {
+            title: 'Saga compensated',
+            subtitle: `the run failed and its ${compSummary.total} completed step${compSummary.total === 1 ? '' : 's'} were undone in reverse.${failedSuffix}`,
+          };
+        })()
+      : undefined;
   const canRetry = run.status === 'failed' || run.status === 'suspended';
   const canCancel = run.status === 'running' || run.status === 'suspended';
   // Paused at a breakpoint = a pending `signal` checkpoint named `breakpoint:*` (see ctx.breakpoint).
-  const atBreakpoint = timeline.some(
+  const atBreakpoint = body.some(
     (s) => s.status === 'pending' && s.kind === 'signal' && s.name.startsWith('breakpoint'),
   );
-  // Stable key identifying the selected step across lanes (root + nested children).
+  // Stable key identifying the selected step across lanes (root + nested children); compensation
+  // steps share the same `runId#seq` shape (seq just happens to be negative), so this works for both.
   const selKey = selStep ? `${selStep.step.runId}#${selStep.step.seq}` : undefined;
 
   return (
@@ -690,12 +778,26 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
                 dlq
               </span>
             )}
-            <Badge status={runDisplayStatus(run, timeline)} />
+            <Badge status={runDisplayStatus(run, body)} />
+            {compensations.length > 0 && (
+              <span
+                className={`mono rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300 ${
+                  compSummary.pending > 0 ? 'pulse' : ''
+                }`}
+                title={
+                  compSummary.pending > 0
+                    ? `compensating: ${compSummary.done} of ${compSummary.total} undone`
+                    : `${compSummary.total} step${compSummary.total === 1 ? '' : 's'} compensated`
+                }
+              >
+                {compSummary.pending > 0 ? 'compensating' : 'compensated'}
+              </span>
+            )}
             <span className="mono rounded border border-[var(--line)] px-1.5 py-0.5 text-[10px] text-zinc-500">
               v{run.workflowVersion}
             </span>
             <span className="mono tnum text-[11px] text-zinc-600">
-              {timeline.length} {timeline.length === 1 ? 'step' : 'steps'}
+              {body.length} {body.length === 1 ? 'step' : 'steps'}
             </span>
           </div>
           <div className="mono mt-1 truncate text-[11px] text-zinc-600">{run.id}</div>
@@ -825,19 +927,33 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           </button>
         </div>
       )}
+      {compBanner && (
+        <div className="flex items-center gap-3 border-b border-amber-500/30 bg-amber-500/10 px-7 py-3">
+          <span
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-amber-500/40 bg-amber-500/15 text-sm text-amber-300"
+            aria-hidden
+          >
+            ↺
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-medium text-amber-200">{compBanner.title}</div>
+            <div className="mono truncate text-[11px] text-amber-300/70">{compBanner.subtitle}</div>
+          </div>
+        </div>
+      )}
       <div
         className="relative grid min-h-0 flex-1"
-        style={{ gridTemplateRows: timeline.length > 0 ? `1fr ${spanHeight}px` : '1fr' }}
+        style={{ gridTemplateRows: body.length > 0 ? `1fr ${spanHeight}px` : '1fr' }}
       >
         <div className="relative min-h-0">
-          {timeline.length === 0 ? (
+          {body.length === 0 ? (
             <div className="grid h-full place-items-center text-sm text-zinc-600">
               No steps recorded yet.
             </div>
           ) : (
             <WorkflowGraph
               run={run}
-              timeline={timeline}
+              timeline={body}
               selectedKey={selKey}
               onSelect={(step, stepRun) => setSelStep({ step, run: stepRun })}
               onOpenRun={onOpenRun}
@@ -852,7 +968,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             </div>
           )}
         </div>
-        {timeline.length > 0 && (
+        {body.length > 0 && (
           // The spans height lives in the GRID TRACK above (`clamp(...)`), not here — an `auto` track
           // sizes to the tall span content's min-content and collapses the `1fr` WorkflowGraph row to
           // 0. With the track clamped, this wrapper just fills it and clips; SpansTimeline scrolls.
@@ -865,7 +981,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             />
             <SpansTimeline
               run={run}
-              timeline={timeline}
+              timeline={body}
               selectedKey={selKey}
               onSelect={(step, stepRun) => setSelStep({ step, run: stepRun })}
               onOpenRun={onOpenRun}
@@ -884,6 +1000,13 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
         )}
         {showRunIO && <RunInfoPanel run={run} onClose={() => setShowRunIO(false)} />}
       </div>
+      {compensations.length > 0 && (
+        <CompensationSection
+          compensations={compensations}
+          selKey={selKey}
+          onSelect={(step) => setSelStep({ step, run })}
+        />
+      )}
     </div>
   );
 }

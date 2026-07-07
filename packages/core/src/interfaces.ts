@@ -1071,6 +1071,29 @@ export interface StepDispatchOpts {
   timeoutMs?: number;
 }
 
+/** What a saga undo handler receives: the compensated step's original input and its result — the
+ *  ONE argument a compensation `@Step` is called with, so it's self-describing on the wire (a
+ *  Python worker sees `{ input, output }` with no side-channel lookup needed). */
+export interface StepUndo<TInput, TOutput> {
+  input: TInput;
+  output: TOutput;
+}
+
+/**
+ * Derive a `ctx.step` compensation handler's expected argument from the ORIGINAL step's method
+ * type, so the ref form is compile-checked against the step it undoes:
+ *
+ * ```ts
+ * async cancelBooking(undo: UndoOf<FlightService['book']>) { ... }
+ * ```
+ *
+ * `...rest: never[]` pins this to a single-argument method (the shape every `@Step` handler has —
+ * see {@link StepRef}); `Awaited<R>` unwraps a `Promise<TOutput>` return down to `TOutput`.
+ */
+export type UndoOf<H> = H extends (input: infer I, ...rest: never[]) => infer R
+  ? StepUndo<I, Awaited<R>>
+  : never;
+
 /**
  * The context handed to a workflow function. Every interaction with the outside world goes
  * through it so the engine can checkpoint — the workflow body itself stays deterministic.
@@ -1094,13 +1117,24 @@ export interface WorkflowCtx {
    *
    * Both forms dispatch identically — a step runs on whatever worker serves that name and the run
    * suspends (zero compute) until the result lands, then resumes with it (durable, replay-safe).
+   *
+   * `opts.compensate` registers a SAGA UNDO for this call, dispatched (durably, in reverse order
+   * with every other registered undo) if the run later fails or is cancelled with
+   * `{ compensate: true }`. The undo is itself a normal `@Step` — pass its reference (compile-time
+   * checked: it must accept `StepUndo<TInput, TOutput>` of THIS call, see {@link UndoOf}) or its
+   * name for a cross-runtime undo handler. It runs on whatever worker serves that name, called with
+   * the ONE `{ input, output }` envelope — never the original handler re-invoked in-process.
    */
   step<TInput, TOutput>(
     handler: StepRef<TInput, TOutput>,
     input: TInput,
-    opts?: StepDispatchOpts,
+    opts?: StepDispatchOpts & { compensate?: StepRef<StepUndo<TInput, TOutput>, unknown> | string },
   ): Promise<TOutput>;
-  step<TOutput = unknown>(name: string, input: unknown, opts?: StepDispatchOpts): Promise<TOutput>;
+  step<TOutput = unknown, TInput = unknown>(
+    name: string,
+    input: TInput,
+    opts?: StepDispatchOpts & { compensate?: StepRef<StepUndo<TInput, TOutput>, unknown> | string },
+  ): Promise<TOutput>;
   /**
    * **Exactly-once** durable step for DB work: runs `fn` and writes the step's checkpoint in ONE
    * store transaction, so the business write and the "done" marker commit atomically — a crash can

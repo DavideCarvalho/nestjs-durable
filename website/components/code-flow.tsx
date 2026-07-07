@@ -1038,53 +1038,38 @@ export class ProcessDocumentWorkflow {
 
 const saga: Scene = {
   stack: true,
-  code: `@Workflow({ name: 'book-trip', version: '1' })
+  code: `// book-trip.workflow.ts — each ctx.step names its own undo
+@Workflow({ name: 'book-trip', version: '1' })
 export class BookTripWorkflow {
-  constructor(
-    private readonly flights: FlightService,
-    private readonly hotels: HotelService,
-    private readonly cars: CarService,
-    private readonly payments: PaymentsService,
-  ) {}
+  constructor(private readonly trips: TripService) {}
 
   async run(ctx: WorkflowCtx, trip: TripRequest) {
-    const flight = await ctx.localStep(
-      'book-flight',
-      () => this.flights.book(trip.flightId),
-      { compensate: () => this.flights.cancel(trip.flightId) },
-    );
-
-    const hotel = await ctx.localStep(
-      'book-hotel',
-      () => this.hotels.book(trip.hotelId),
-      { compensate: () => this.hotels.cancel(trip.hotelId) },
-    );
-
-    const car = await ctx.localStep(
-      'book-car',
-      () => this.cars.book(trip.carId),
-      { compensate: () => this.cars.cancel(trip.carId) },
-    );
-
-    // charge-deposit registers no compensate — there's nothing of its own to undo
-    await ctx.localStep('charge-deposit', () =>
-      this.payments.charge(trip.customerId, trip.depositCents),
-    );
-
-    return { flight, hotel, car };
+    const flight = await ctx.step(this.trips.bookFlight, trip, {
+      compensate: this.trips.cancelFlight,
+    });
+    const hotel = await ctx.step(this.trips.bookHotel, trip, {
+      compensate: this.trips.cancelHotel,
+    });
+    // the deposit registers no compensate — nothing of its own to undo
+    await ctx.step(this.trips.chargeDeposit, { trip, flight, hotel });
+    return { flight, hotel };
   }
+}
+
+// trip.service.ts — an undo is an ordinary @Step, typed with UndoOf
+@Step()
+async cancelFlight({ output }: UndoOf<TripService['bookFlight']>) {
+  await this.flightsApi.cancel(output.bookingId);
 }`,
   steps: [
-    { lines: [11, 15], stage: '', active: 0, tone: 'run', title: 'flight', actor: 'ctx.localStep → book flight', caption: 'ctx.localStep books the flight in-process; completing it registers the compensate callback (cancel the flight) on the saga stack.' },
-    { lines: [17, 21], stage: '', active: 1, tone: 'run', title: 'hotel', actor: 'ctx.localStep → book hotel', caption: 'The hotel booking completes and registers its own compensation — pushed after the flight’s.' },
-    { lines: [23, 27], stage: '', active: 2, tone: 'run', title: 'car', actor: 'ctx.localStep → book car', caption: 'The car rental completes third; its compensation is now the most recently registered — first to undo if the run fails.' },
-    { lines: [29, 32], stage: '', active: 3, tone: 'fail', title: 'deposit ✗', actor: 'ctx.localStep → charge deposit (throws)', caption: 'The deposit charge is declined and throws. charge-deposit registered no compensate of its own — but three earlier steps did.' },
-    { lines: [26, 26], stage: '', active: 4, tone: 'run', title: 'undo car', actor: 'engine unwinds the saga — car undone first', caption: 'The engine catches the failure and walks the saga stack from the top: car, then hotel, then flight. Car is undone first because it was registered last.' },
-    { lines: [20, 20], stage: '', active: 5, tone: 'run', title: 'undo hotel', actor: 'reverse order, continued → hotel undone second', caption: 'Next the hotel booking is cancelled — retried up to compensationRetries times if the undo itself fails transiently.' },
-    { lines: [14, 14], stage: '', active: 6, tone: 'run', title: 'undo flight', actor: 'reverse order, continued → flight undone last', caption: 'Finally the flight is cancelled — the first step taken is the last one undone, unwinding the saga back to a clean slate.' },
-    { lines: [29, 32], stage: '', active: 7, tone: 'fail', title: 'failed', actor: 'compensations done → run settles failed', caption: 'With every leg undone, the engine settles the run failed with the original deposit error — the world is left exactly as if none of the bookings had happened.' },
+    { lines: [7, 9], stage: '', active: 0, tone: 'run', title: 'flight', actor: 'ctx.step → book flight, undo registered', caption: "The flight books on whatever worker serves bookFlight. Because the call completed, its compensate — cancelFlight, another @Step — is registered on the saga stack together with this call's { input, output }." },
+    { lines: [10, 12], stage: '', active: 1, tone: 'run', title: 'hotel', actor: 'ctx.step → book hotel, undo registered', caption: "The hotel books and registers its own undo — pushed after the flight's, so it will be undone first." },
+    { lines: [14, 15], stage: '', active: 2, tone: 'fail', title: 'deposit ✗', actor: 'ctx.step → charge deposit (fails)', caption: 'The deposit charge exhausts its retries and the run fails. It registered no undo of its own — but two earlier steps did.' },
+    { lines: [11, 11], stage: '', active: 3, tone: 'run', title: 'undo hotel', actor: 'engine dispatches cancelHotel — checkpoint −1', caption: 'The engine walks the stack in reverse and DISPATCHES cancelHotel to its worker like any durable step, checkpointed at reserved seq −1 — a crash mid-unwind resumes here instead of re-running finished undos.' },
+    { lines: [21, 24], stage: '', active: 4, tone: 'run', title: 'undo flight', actor: 'cancelFlight({ input, output }) — checkpoint −2', caption: "Then the flight's undo runs. An undo handler is an ordinary @Step called with the compensated call's { input, output } envelope — UndoOf<TripService['bookFlight']> types it for free, and a Python worker can serve it by name." },
+    { lines: [14, 15], stage: '', active: 5, tone: 'fail', title: 'failed', actor: 'unwind done → run settles failed (original error)', caption: 'Both legs undone, the run settles failed with the ORIGINAL deposit error — never masked by the unwind. The compensate:* checkpoints keep the whole undo trail visible in the dashboard.' },
   ],
-  render: timeline(['flight', 'hotel', 'car', 'deposit ✗', 'undo car', 'undo hotel', 'undo flight', 'failed']),
+  render: timeline(['flight', 'hotel', 'deposit ✗', 'undo hotel', 'undo flight', 'failed']),
 };
 
 const flowControl: Scene = {

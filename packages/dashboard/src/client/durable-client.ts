@@ -271,3 +271,12 @@ export const durableClient = {
 // pipeline-runs view) reconstruct sub-processes from a step's events the exact same way the
 // dashboard does — by run identity (`subId`/`name`), treating `phase` events as a sub's lifecycle.
 export { type SubProcess, groupSubProcesses } from './group-subprocesses';
+
+// Re-export the canonical saga-compensation split so external consumers (e.g. flip) separate a
+// run's body from its undo checkpoints the exact same way the dashboard does — by `seq < 0`.
+export {
+  type CompensationSummary,
+  compensationDisplayName,
+  compensationSummary,
+  splitCompensations,
+} from './split-compensations';

@@ -36,6 +36,7 @@ import type {
   StepInvocation,
   StepKind,
   StepResult,
+  StepUndo,
   Transport,
   UpdateResult,
   UpdateValidator,
@@ -185,6 +186,19 @@ type RunOutcome =
   | { kind: 'completed'; output: unknown }
   | { kind: 'failed'; error: StepError }
   | { kind: 'suspended'; wakeAt?: number | undefined };
+
+/**
+ * What {@link WorkflowEngine.unwindCompensations} returns when the run must keep waiting on a
+ * dispatched compensation — `wakeAt` set while backing off a durable retry (the due-timer poller
+ * re-drives it once elapsed), absent while freshly dispatched/in flight (only the worker's result,
+ * via `completeRemoteResult`, re-drives it). `undefined` (no `UnwindPending`) means every
+ * compensation resolved. Deliberately NOT a `RunResult`: the two callers persist "still unwinding"
+ * differently (a plain `suspended` run for the failure path; `cancelling` held as-is for the cancel
+ * path — see `compensateAndCancel`), so the settling is left to them.
+ */
+interface UnwindPending {
+  wakeAt?: number | undefined;
+}
 
 export interface WorkflowEngineDeps {
   store: StateStore;
@@ -2396,17 +2410,25 @@ export class WorkflowEngine {
    * Undo the registered saga compensations in reverse and settle the run `cancelled`. Shared by EVERY
    * exit path of a run with a compensating cancel in flight — whether the resumed replay returned,
    * suspended, hit continue-as-new, or threw — so a cancel is never lost just because the body didn't
-   * stop at a suspension point. Clears the in-memory cancel flag.
+   * stop at a suspension point.
+   *
+   * A dispatched compensation still in flight (or backing off a retry) needs the run to keep waiting:
+   * unlike the failure path (which is fine going `suspended` — a resumable state no different from an
+   * ordinary in-flight `ctx.step`), THIS run must stay `cancelling` — `engine.cancel`'s idempotent
+   * re-check, `waitForRun`'s non-terminal treatment, and crash recovery (`recoverIncomplete` only
+   * re-drives `running`/`cancelling` runs — a `cancelling` one with a free lease, whatever it's
+   * internally waiting on) all key off that status. So on a pending unwind this returns WITHOUT
+   * touching `status` (already `cancelling`, untouched since `engine.cancel` set it) — the in-memory
+   * cancel flag stays too, re-derived from the status on any later re-drive regardless.
    */
   private async compensateAndCancel(
     run: WorkflowRun,
     compensations: Compensation[],
+    replay?: Map<number, StepCheckpoint>,
   ): Promise<RunResult> {
+    const pending = await this.unwindCompensations(run, compensations, replay);
+    if (pending) return { runId: run.id, status: 'cancelling' };
     this.cancelRequested.delete(run.id);
-    for (let i = compensations.length - 1; i >= 0; i -= 1) {
-      const comp = compensations[i];
-      if (comp) await this.runCompensation(run, comp);
-    }
     const error = { message: 'cancelled' };
     await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
     this.emit({
@@ -2484,12 +2506,16 @@ export class WorkflowEngine {
       // A compensating cancel may have been requested while this turn ran (or re-derived from a
       // `cancelling` status on recovery): undo + settle cancelled rather than completing, so the cancel
       // is never lost when the body returns without first hitting a suspension point.
-      if (this.cancelRequested.has(run.id)) return this.compensateAndCancel(run, compensations);
+      if (this.cancelRequested.has(run.id)) {
+        return this.compensateAndCancel(run, compensations, replay);
+      }
       return this.settleRun(run, { kind: 'completed', output });
     } catch (err) {
       if (err instanceof ContinueAsNew) {
         // A cancel in flight wins over continue-as-new: undo + cancel instead of spawning the next run.
-        if (this.cancelRequested.has(run.id)) return this.compensateAndCancel(run, compensations);
+        if (this.cancelRequested.has(run.id)) {
+          return this.compensateAndCancel(run, compensations, replay);
+        }
         // Hand off to a fresh execution with a clean history: complete this run, then start the next
         // (`<id>~N`) with the new input. Deferred + idempotent by the continuation id, so a crash
         // mid-handoff re-derives the same next run instead of forking.
@@ -2514,25 +2540,29 @@ export class WorkflowEngine {
       }
       if (err instanceof WorkflowSuspended) {
         // A compensating cancel resumed this run to reach here: undo + cancel instead of re-suspending.
-        if (this.cancelRequested.has(run.id)) return this.compensateAndCancel(run, compensations);
+        if (this.cancelRequested.has(run.id)) {
+          return this.compensateAndCancel(run, compensations, replay);
+        }
         return this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
       }
       // A cancel in flight that surfaced as a thrown error still settles cancelled (not failed) — the
       // saga undo runs either way; this just keeps the terminal status faithful to the cancel request.
-      if (this.cancelRequested.has(run.id)) return this.compensateAndCancel(run, compensations);
+      if (this.cancelRequested.has(run.id)) {
+        return this.compensateAndCancel(run, compensations, replay);
+      }
       const error = {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
       };
-      // Saga: undo completed steps in reverse, each retried up to `compensationRetries`. Outcomes
-      // are emitted as `compensate:<step>` step events so a stranded undo is VISIBLE (not silently
-      // swallowed) in the dashboard/telescope; a failing one is still skipped so it can't mask the
-      // original failure or strand the rest. (Compensations should be idempotent.)
-      for (let i = compensations.length - 1; i >= 0; i -= 1) {
-        const comp = compensations[i];
-        if (!comp) continue;
-        await this.runCompensation(run, comp);
-      }
+      // Saga: undo completed steps in reverse — local ones in-process, dispatched ones as durable
+      // remote-step dispatches (see `unwindCompensations`) — each made VISIBLE as a `compensate:<step>`
+      // step event/checkpoint so a stranded undo is never silently swallowed; a failing one is still
+      // skipped so it can't mask the original failure or strand the rest (compensations should be
+      // idempotent). A dispatched undo still in flight (or backing off a retry) SUSPENDS the run
+      // exactly like an ordinary `ctx.step` dispatch — the next re-drive (the worker's result landing,
+      // or the retry backoff elapsing) resumes `unwindCompensations` right where it left off.
+      const pending = await this.unwindCompensations(run, compensations, replay);
+      if (pending) return this.settleRun(run, { kind: 'suspended', wakeAt: pending.wakeAt });
       return this.settleRun(run, { kind: 'failed', error });
     } finally {
       // Release the recovery lease once the run reaches a terminal/suspended state, so the
@@ -2542,14 +2572,72 @@ export class WorkflowEngine {
   }
 
   /**
-   * Run one saga compensation, retried up to `compensationRetries`, emitting a `compensate:<step>`
-   * step event for its outcome so a stranded undo is visible. Never throws — a permanently-failing
-   * compensation is skipped so it can't mask the original failure.
+   * Undo every registered saga compensation in strict reverse order — the shared unwind both the
+   * run-failure path (`runExecution`'s catch) and the compensating-cancel path
+   * (`compensateAndCancel`) drive. Every entry, LOCAL or DISPATCHED, gets a NEGATIVE checkpoint seq
+   * `-(k + 1)` for its position `k` (0, 1, 2… walking the stack in reverse) — reserved space that can
+   * never collide with a body position (those start at 0), so a saga's undo trail composes onto the
+   * run's ordinary checkpoint history with no store-schema change, and shows up in run detail exactly
+   * like any other step. Deterministic because `compensations` is rebuilt identically on every replay
+   * (see `workflow-ctx.ts`), so the same comp always lands on the same negative seq across a crash +
+   * re-drive — the crash-safety this whole scheme rests on.
+   *
+   * A LOCAL entry runs in-process (`runCompensation`), which checkpoints its own outcome — completed,
+   * or failed once `compensationRetries` are exhausted — so a crash mid-unwind SKIPS an
+   * already-resolved one on the next pass instead of re-running it (and re-spending its retry budget)
+   * from attempt 1. A DISPATCHED entry is an ordinary remote-step dispatch under the hood
+   * (`dispatchCompensation`): when it needs the run to WAIT — freshly dispatched, still in flight, or
+   * backing off a durable retry — this function returns that wait signal immediately (skipping every
+   * comp after it in this pass); the CALLER decides how to represent "still unwinding" (see
+   * `compensateAndCancel`'s doc comment for why that differs between the two callers). Either way, the
+   * run resumes later exactly like any other dispatched step: `completeRemoteResult` completes the
+   * negative-seq checkpoint and re-drives, the body replays and deterministically re-throws the same
+   * exit it took before (the original failure, or the suspension `compensateAndCancel` resumed from),
+   * this function runs again, the now-resolved comp is skipped, and the unwind continues from there.
+   *
+   * Returns `undefined` once every compensation has resolved — the caller then finalizes the run
+   * (`failed` with the ORIGINAL body error, never masked by a comp outcome; or `cancelled`).
    */
-  private async runCompensation(run: WorkflowRun, comp: Compensation): Promise<void> {
+  private async unwindCompensations(
+    run: WorkflowRun,
+    compensations: Compensation[],
+    replay?: Map<number, StepCheckpoint>,
+  ): Promise<UnwindPending | undefined> {
+    for (let i = compensations.length - 1; i >= 0; i -= 1) {
+      const comp = compensations[i];
+      if (!comp) continue;
+      const seq = -(compensations.length - i);
+      if ('fn' in comp) {
+        const existing = replay?.get(seq) ?? (await this.store.getCheckpoint(run.id, seq));
+        if (existing) continue; // already resolved (completed or exhausted-failed) in an earlier pass
+        await this.runCompensation(run, comp, seq, replay);
+        continue;
+      }
+      const pending = await this.dispatchCompensation(run, comp, seq, replay);
+      if (pending) return pending;
+    }
+    return undefined;
+  }
+
+  /**
+   * Run one LOCAL saga compensation, retried up to `compensationRetries`, emitting a
+   * `compensate:<step>` step event for its outcome so a stranded undo is visible. Never throws — a
+   * permanently-failing compensation is skipped so it can't mask the original failure. Checkpoints
+   * its outcome at `seq` (a negative unwind position reserved by {@link unwindCompensations}) so a
+   * crash mid-unwind skips an already-resolved undo on a later pass instead of re-running it (and
+   * re-spending its retry budget) from attempt 1 — the checkpoint is durability/visibility only; the
+   * runtime retry-in-process-back-to-back semantics of `comp.fn()` are unchanged.
+   */
+  private async runCompensation(
+    run: WorkflowRun,
+    comp: Extract<Compensation, { fn: () => Promise<void> }>,
+    seq: number,
+    replay?: Map<number, StepCheckpoint>,
+  ): Promise<void> {
     const name = `compensate:${comp.name}`;
+    const enqueuedAt = new Date();
     for (let attempt = 1; attempt <= this.compensationRetries; attempt += 1) {
-      const startedAt = Date.now();
+      const startedAt = new Date();
       try {
         await comp.fn();
         this.emit({
@@ -2558,23 +2646,143 @@ export class WorkflowEngine {
           workflow: run.workflow,
           name,
           kind: 'local',
-          durationMs: Date.now() - startedAt,
+          durationMs: Date.now() - startedAt.getTime(),
         });
+        const cp = stepCheckpoint({
+          runId: run.id,
+          seq,
+          name,
+          kind: 'local',
+          status: 'completed',
+          attempts: attempt,
+          enqueuedAt,
+          startedAt,
+          finishedAt: new Date(),
+        });
+        await this.store.saveCheckpoint(cp);
+        replay?.set(seq, cp);
         return;
       } catch (err) {
         if (attempt >= this.compensationRetries) {
+          const error = { message: err instanceof Error ? err.message : String(err) };
           this.emit({
             type: 'step.failed',
             runId: run.id,
             workflow: run.workflow,
             name,
             kind: 'local',
-            error: { message: err instanceof Error ? err.message : String(err) },
-            durationMs: Date.now() - startedAt,
+            error,
+            durationMs: Date.now() - startedAt.getTime(),
           });
+          const cp = stepCheckpoint({
+            runId: run.id,
+            seq,
+            name,
+            kind: 'local',
+            status: 'failed',
+            attempts: attempt,
+            error,
+            enqueuedAt,
+            startedAt,
+            finishedAt: new Date(),
+          });
+          await this.store.saveCheckpoint(cp);
+          replay?.set(seq, cp);
         }
       }
     }
+  }
+
+  /**
+   * Resolve (or advance) ONE dispatched saga compensation at its reserved negative `seq` — the undo
+   * handler is an ordinary remote `@Step`, so this mirrors `callRemote`'s pending/failed/absent
+   * branches (engine.ts's `callRemote`), minus the queue/admission and in-memory-`timeoutMs` paths
+   * (V1: dispatch direct by name, always durable). Returns the wait signal when the run must pause for
+   * this compensation (freshly dispatched, still in flight, or backing off before a durable retry);
+   * `undefined` once it's resolved — completed (crash-safe skip), or retries exhausted/non-retryable
+   * (already visible: `completeRemoteResult` emitted `step.failed` for `compensate:<name>` when that
+   * checkpoint landed — never re-emitted here, and never allowed to block the rest of the unwind or
+   * mask the run's original failure).
+   */
+  private async dispatchCompensation(
+    run: WorkflowRun,
+    comp: Extract<Compensation, { dispatch: unknown }>,
+    seq: number,
+    replay?: Map<number, StepCheckpoint>,
+  ): Promise<UnwindPending | undefined> {
+    const { def, args } = comp.dispatch;
+    const name = `compensate:${comp.name}`;
+    const existing = replay?.get(seq) ?? (await this.store.getCheckpoint(run.id, seq));
+    if (existing?.status === 'completed') return undefined;
+    if (existing?.status === 'pending') return {}; // dispatched, awaiting the worker's result
+    if (existing?.status === 'failed') {
+      const maxAttempts = Math.max(1, def.retries ?? 1);
+      const retryable = existing.error?.retryable !== false;
+      if (!retryable || existing.attempts >= maxAttempts) return undefined;
+      if (existing.wakeAt == null) {
+        const wakeAt = this.clock() + backoffDelay(existing.attempts, def);
+        const withWakeAt = { ...existing, wakeAt };
+        await this.store.saveCheckpoint(withWakeAt);
+        replay?.set(seq, withWakeAt);
+        return { wakeAt };
+      }
+      if (this.clock() < existing.wakeAt) return { wakeAt: existing.wakeAt };
+      await this.dispatchCompensationAttempt(run, seq, name, def, args, existing.attempts + 1, replay);
+      return {};
+    }
+    // Absent: first dispatch.
+    await this.dispatchCompensationAttempt(run, seq, name, def, args, 1, replay);
+    return {};
+  }
+
+  /**
+   * Dispatch (or re-dispatch, on a durable retry) one compensation's undo handler — mirrors
+   * `callRemote`'s dispatch block (persist the `pending` checkpoint BEFORE handing off to the
+   * transport, so a fast result always finds it to complete). Two DIFFERENT names are in play: the
+   * checkpoint's `name` is `compensate:<originalStepName>` (what makes this undo show up on the run's
+   * timeline, and what `completeRemoteResult` emits `step.completed`/`step.failed` under); the WIRE
+   * task's `name` is the undo handler's OWN routing name (`def.name`) — a worker dispatches to the
+   * `@Step` it registered, not to this saga-visibility label.
+   */
+  private async dispatchCompensationAttempt(
+    run: WorkflowRun,
+    seq: number,
+    name: string,
+    def: StepDef<StepUndo<unknown, unknown>, unknown>,
+    args: StepUndo<unknown, unknown>,
+    attempt: number,
+    replay?: Map<number, StepCheckpoint>,
+  ): Promise<void> {
+    if (this.pool.size === 0) throw new Error('remote steps require a Transport');
+    const group = tenantGroup(sanitizeQueueToken(def.name), def.partition);
+    const enqueuedAt = new Date();
+    const cp = stepCheckpoint({
+      runId: run.id,
+      seq,
+      name,
+      kind: 'remote',
+      status: 'pending',
+      input: args,
+      attempts: attempt,
+      workerGroup: group,
+      enqueuedAt,
+      startedAt: enqueuedAt,
+      finishedAt: enqueuedAt,
+    });
+    await this.store.saveCheckpoint(cp);
+    replay?.set(seq, cp);
+    await this.pool.dispatch({
+      runId: run.id,
+      seq,
+      name: def.name,
+      stepId: cp.stepId,
+      group,
+      input: args,
+      traceparent: this.traceparent?.(),
+      context: this.context?.(),
+      attempt,
+    });
+    this.emit({ type: 'step.started', runId: run.id, seq, name, kind: 'remote' });
   }
 
   /** The seam handed to {@link createWorkflowCtx}: the authoring API reaches durability + lifecycle

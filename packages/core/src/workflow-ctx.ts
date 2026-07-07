@@ -25,6 +25,7 @@ import type {
   StepKind,
   StepLogger,
   StepOptions,
+  StepUndo,
   WorkflowCtx,
 } from './interfaces';
 import { breakpointToken } from './protocol';
@@ -63,11 +64,23 @@ function resolveStepPolicy(
   return policy;
 }
 
-/** A saga undo registered by a completed step, kept with its step name for visibility on failure. */
-export interface Compensation {
-  name: string;
-  fn: () => Promise<void>;
-}
+/**
+ * A saga undo registered by a completed step, kept with its step name for visibility on failure.
+ * Two shapes, pushed onto the SAME `compensations` stack so the engine unwinds them together in one
+ * strict reverse-completion order, regardless of which kind each one is:
+ * - `fn`: a LOCAL undo (`ctx.localStep`'s `compensate` closure) — run in-process.
+ * - `dispatch`: a DISPATCHED undo (`ctx.step`'s `compensate` ref/string) — an ordinary `@Step` def
+ *   the engine dispatches to a worker at unwind time, called with the `StepUndo` envelope (`args`).
+ */
+export type Compensation =
+  | { name: string; fn: () => Promise<void> }
+  | {
+      name: string;
+      dispatch: {
+        def: StepDef<StepUndo<unknown, unknown>, unknown>;
+        args: StepUndo<unknown, unknown>;
+      };
+    };
 
 /** A finished local step the host should checkpoint and announce (completed or failed). */
 export interface StepRecord {
@@ -720,6 +733,26 @@ export function createWorkflowCtx(
     );
   };
 
+  // Resolve a `ctx.step(..., { compensate })` ref/string into the undo's own dispatchable StepDef —
+  // same routing-name resolution as the step it's attached to (see `step` below), but its dispatch
+  // policy comes ONLY from its own `@Step`-stamped config (stepConfigOf), never the compensated
+  // call's per-call `opts`: the undo is a separately-declared handler with its own retry/backoff, not
+  // an extension of the step it undoes. The string form (cross-runtime, unchecked) has no stamped
+  // config, so it dispatches with engine defaults. Takes `unknown` (like `stepNameOf`/`stepConfigOf`
+  // themselves) rather than a `StepRef<StepUndo<TInput, TOutput>, ...>` — the caller's TInput/TOutput
+  // are call-site type parameters with no runtime shape to check here; the compile-time contract is
+  // already enforced by `WorkflowCtx.step`'s overload signature (interfaces.ts) that typed `opts`.
+  function resolveCompensateDef(compensate: unknown): StepDef<StepUndo<unknown, unknown>, unknown> {
+    const name = typeof compensate === 'string' ? compensate : stepNameOf(compensate);
+    if (name === undefined) {
+      throw new Error(
+        'ctx.step: compensate handler is not a @Step reference (no stamped step name) — pass a @Step-decorated method or a step name string',
+      );
+    }
+    const config = typeof compensate === 'string' ? undefined : stepConfigOf(compensate);
+    return { name, ...resolveStepPolicy(config, undefined) };
+  }
+
   // ONE durable step primitive: always dispatched, always engine-scheduled — no local/remote
   // placement choice for the workflow author (see `WorkflowCtx.step`). Resolve the routing name off
   // a `@Step`-stamped handler reference, or take it literally for the cross-runtime string form; the
@@ -733,7 +766,7 @@ export function createWorkflowCtx(
   function step<TInput, TOutput>(
     handlerOrName: StepRef<TInput, TOutput> | string,
     input: TInput,
-    opts?: StepDispatchOpts,
+    opts?: StepDispatchOpts & { compensate?: StepRef<StepUndo<TInput, TOutput>, unknown> | string },
   ): Promise<TOutput> {
     const name = typeof handlerOrName === 'string' ? handlerOrName : stepNameOf(handlerOrName);
     if (name === undefined) {
@@ -743,10 +776,27 @@ export function createWorkflowCtx(
     }
     const config = typeof handlerOrName === 'string' ? undefined : stepConfigOf(handlerOrName);
     const def: StepDef<TInput, TOutput> = { name, ...resolveStepPolicy(config, opts) };
-    return host.callRemote(runId, pos.next(), def, input, opts?.queue, opts?.transport, {
-      priority: opts?.priority,
-      fairnessKey: opts?.fairnessKey,
-    });
+    return host
+      .callRemote(runId, pos.next(), def, input, opts?.queue, opts?.transport, {
+        priority: opts?.priority,
+        fairnessKey: opts?.fairnessKey,
+      })
+      .then((output) => {
+        // `callRemote` resolves ONLY once this step is durably complete — the replay-completed branch
+        // (a checkpointed output) or the in-memory `timeoutMs` liveness path once the live result
+        // lands (engine.ts). Register the compensation HERE, after that resolution, so a saga only
+        // ever undoes steps that actually finished. Mirrors `localStep`'s rebuild-on-replay: the
+        // workflow body re-passes `compensate` on every replay of a completed call, and `input`/
+        // `output` come straight from this call (the checkpointed ones on replay) — no store-schema
+        // change needed to carry the undo's args.
+        if (opts?.compensate) {
+          compensations.push({
+            name,
+            dispatch: { def: resolveCompensateDef(opts.compensate), args: { input, output } },
+          });
+        }
+        return output;
+      });
   }
 
   return {

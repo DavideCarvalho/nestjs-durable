@@ -25,8 +25,8 @@ through it so the engine can checkpoint — the body itself stays deterministic 
 
 | Member | Signature | Notes |
 | --- | --- | --- |
-| `step` | `step<TIn, TOut>(handler: StepRef<TIn, TOut>, input: TIn, opts?: StepDispatchOpts): Promise<TOut>` | Dispatch a durable step by typed `@Step` method reference — the ONE step primitive, always engine-scheduled. See [Workflows & steps](/docs/concepts/workflows-and-steps). |
-| `step` (by name) | `step<TOut = unknown>(name: string, input: unknown, opts?: StepDispatchOpts): Promise<TOut>` | Same dispatch, by string name — for a cross-runtime handler (e.g. a Python `@step`) with no JS reference. |
+| `step` | `step<TIn, TOut>(handler: StepRef<TIn, TOut>, input: TIn, opts?: StepDispatchOpts & { compensate?: StepRef<StepUndo<TIn, TOut>, unknown> \| string }): Promise<TOut>` | Dispatch a durable step by typed `@Step` method reference — the ONE step primitive, always engine-scheduled. `compensate` registers a dispatched [saga undo](/docs/reliability/sagas) for this call. See [Workflows & steps](/docs/concepts/workflows-and-steps). |
+| `step` (by name) | `step<TOut = unknown, TIn = unknown>(name: string, input: TIn, opts?: StepDispatchOpts & { compensate?: StepRef<StepUndo<TIn, TOut>, unknown> \| string }): Promise<TOut>` | Same dispatch, by string name — for a cross-runtime handler (e.g. a Python `@step`) with no JS reference. |
 | `localStep` | `localStep<TOut>(name: string, fn: (log: StepLogger) => Promise<TOut>, options?: StepOptions): Promise<TOut>` | Escape hatch: a checkpointed step whose body runs **in-process** (not dispatched), so it can carry an in-memory `compensate` for [sagas](/docs/reliability/sagas). |
 | `transaction` | `transaction<TOut>(name: string, fn: (tx: unknown) => Promise<TOut>): Promise<TOut>` | Exactly-once DB step: runs `fn` and writes the checkpoint in ONE store transaction (business write + "done" marker are atomic). Needs a SQL store; throws otherwise. |
 
@@ -79,8 +79,10 @@ through it so the engine can checkpoint — the body itself stays deterministic 
 
 | Type | Shape | Notes |
 | --- | --- | --- |
-| `StepDispatchOpts` | `{ queue?, priority?, fairnessKey?, transport?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs? }` | Per-call override of a `@Step`-declared policy for a dispatched `ctx.step`. `queue` routes to a [flow-control](/docs/reliability/flow-control) queue; `priority`/`fairnessKey` apply within it. |
-| `StepOptions` | `{ retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs?, compensate? }` | Options for `ctx.task`/`ctx.localStep`. `compensate` registers a saga undo (local steps only). |
+| `StepDispatchOpts` | `{ queue?, priority?, fairnessKey?, transport?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs? }` | Per-call override of a `@Step`-declared policy for a dispatched `ctx.step`. `queue` routes to a [flow-control](/docs/reliability/flow-control) queue; `priority`/`fairnessKey` apply within it. `ctx.step`'s own `opts` additionally accepts `compensate?: StepRef<StepUndo<TIn, TOut>, unknown> \| string` (not part of `StepDispatchOpts` itself) — registers a dispatched [saga undo](/docs/reliability/sagas) for this call, retried per the undo's OWN `@Step` config (never this call's `opts`); no `queue`/admission and no `timeoutMs` liveness window apply to the undo's dispatch. |
+| `StepOptions` | `{ retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs?, compensate? }` | Options for `ctx.task`/`ctx.localStep`. `compensate: () => Promise<void>` registers an in-process saga undo, retried up to the module-level `compensationRetries` (default `1`). See [Sagas & compensation](/docs/reliability/sagas). |
+| `StepUndo<TIn, TOut>` | `{ input: TIn; output: TOut }` | The one argument a dispatched saga undo is called with — the compensated call's own input and result. |
+| `UndoOf<H>` | `H extends (input: infer I, ...rest: never[]) => infer R ? StepUndo<I, Awaited<R>> : never` | Derives a dispatched undo's expected argument from the ORIGINAL step method's type, so a `compensate` ref is compile-checked against the call it undoes: `async cancelBooking(undo: UndoOf<FlightService['book']>) { ... }`. |
 | `ChildCallOptions` | `{ childId?, priority? }` | Options for `ctx.child`/`ctx.startChild` (a bare string is shorthand for `{ childId }`). `priority` only affects a remote child. |
 
 ## Decorators
@@ -237,7 +239,7 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `admission` | `AdmissionBackend` | in-process caps | Backend for `queues` — pass a Redis-backed one to make limits fleet-global. Operator only. |
 | `traceparent` | `() => string \| undefined` | none | Current W3C traceparent to stamp on dispatched remote tasks. Operator only. |
 | `context` | `() => Record<string, unknown> \| undefined` | auto-fed from `@dudousxd/nestjs-context` if installed, else none | Opaque context carrier (tenant/user/correlation ids) stamped on dispatched tasks. Operator only. |
-| `compensationRetries` | `number` | `1` | Attempts per saga compensation on run failure. Operator only. |
+| `compensationRetries` | `number` | `1` | Attempts per IN-PROCESS (`ctx.localStep`) saga compensation on run failure. A dispatched (`ctx.step`) compensation retries per its own `@Step` config instead. Operator only. |
 | `scopeReads` | `boolean` | `false` | Confine the store's reads to `namespace` (tenant-boundary view) instead of the operator (all-namespaces) view. Needs a store with `withScope`. |
 | `connection` | `string \| Record<string, unknown>` | — | ioredis connection for a **thin worker** or a **co-located worker** consumer. Set to play a worker role. |
 | `partition` | `string` | `'default'` | Isolation partition a worker role serves/dispatch-suffixes (`<name>@<partition>`). Ignored for a plain operator. |
