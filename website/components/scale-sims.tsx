@@ -182,7 +182,8 @@ export function FanoutSim() {
           if (batchFailed) failedCount += 1;
           else doneCount += 1;
           pulses.push({ x: F_DONE.x - 24, y: F_DONE.y, t: 0, color: batchFailed ? SIM_RED : SIM_GREEN });
-          children = [];
+          // keep the settled children on screen through the rest — the per-child ✓/✗
+          // marks are the payoff; startWave replaces them.
           stage = 'rest';
           restT = 0;
         }
@@ -208,12 +209,17 @@ export function FanoutSim() {
       ctx2d.fillText(waiting ? 'suspended on' : 'ctx.all(Item,', F_PARENT.x - 60, F_PARENT.y + 2);
       ctx2d.fillText(waiting ? 'ctx.all(…)' : 'inputs)', F_PARENT.x - 60, F_PARENT.y + 20);
 
-      // child lanes + slots
-      for (const child of children) {
-        if (child.phase === 'gone') continue;
+      // child lanes + slots — each lane carries its index so the reader can map it to the
+      // per-child result marks under the join.
+      for (let i = 0; i < children.length; i++) {
+        const child = children[i];
+        if (!child || child.phase === 'gone') continue;
         const active = child.phase === 'working';
+        const settled = child.phase === 'joined' || child.phase === 'toJoin';
+        ctx2d.fillStyle = settled ? (child.failed ? SIM_RED : SIM_GREEN) : theme.muted;
+        ctx2d.fillText(`#${i}`, F_SLOT_X - 42, child.laneY + 4);
         ctx2d.fillStyle = theme.card;
-        ctx2d.strokeStyle = active ? (child.failed ? SIM_RED : theme.accent) : theme.border;
+        ctx2d.strokeStyle = active ? (child.failed ? SIM_RED : theme.accent) : settled ? (child.failed ? SIM_RED : SIM_GREEN) : theme.border;
         ctx2d.beginPath();
         ctx2d.arc(F_SLOT_X, child.laneY, 13, 0, Math.PI * 2);
         ctx2d.fill();
@@ -223,6 +229,24 @@ export function FanoutSim() {
           ctx2d.lineWidth = 2.2;
           ctx2d.beginPath();
           ctx2d.arc(F_SLOT_X, child.laneY, 13, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, child.t));
+          ctx2d.stroke();
+          ctx2d.lineWidth = 1;
+        }
+        // once a child settles, stamp its outcome right on the lane slot: ✓ or ✗
+        if (settled) {
+          ctx2d.strokeStyle = child.failed ? SIM_RED : SIM_GREEN;
+          ctx2d.lineWidth = 1.75;
+          ctx2d.beginPath();
+          if (child.failed) {
+            ctx2d.moveTo(F_SLOT_X - 4, child.laneY - 4);
+            ctx2d.lineTo(F_SLOT_X + 4, child.laneY + 4);
+            ctx2d.moveTo(F_SLOT_X + 4, child.laneY - 4);
+            ctx2d.lineTo(F_SLOT_X - 4, child.laneY + 4);
+          } else {
+            ctx2d.moveTo(F_SLOT_X - 4.5, child.laneY);
+            ctx2d.lineTo(F_SLOT_X - 1.5, child.laneY + 3);
+            ctx2d.lineTo(F_SLOT_X + 5, child.laneY - 4);
+          }
           ctx2d.stroke();
           ctx2d.lineWidth = 1;
         }
@@ -252,6 +276,49 @@ export function FanoutSim() {
       }
       ctx2d.fillStyle = theme.muted;
       ctx2d.fillText('join · waitAll', F_JOIN.x - 34, F_JOIN.y + 42);
+
+      // per-child results row under the join: one mark per index, in input order — the
+      // reader sees exactly WHICH children succeeded and which one failed.
+      if (children.length > 0) {
+        const rowSpacing = 20;
+        const rowX0 = F_JOIN.x - ((children.length - 1) * rowSpacing) / 2;
+        const rowY = F_JOIN.y + 62;
+        const failedIdx: number[] = [];
+        for (let i = 0; i < children.length; i++) {
+          const child = children[i];
+          if (!child) continue;
+          const joined = child.phase === 'joined';
+          if (joined && child.failed) failedIdx.push(i);
+          const mx = rowX0 + i * rowSpacing;
+          ctx2d.fillStyle = theme.card;
+          ctx2d.strokeStyle = joined ? (child.failed ? SIM_RED : SIM_GREEN) : theme.border;
+          ctx2d.beginPath();
+          ctx2d.arc(mx, rowY, 7, 0, Math.PI * 2);
+          ctx2d.fill();
+          ctx2d.stroke();
+          if (joined) {
+            ctx2d.strokeStyle = child.failed ? SIM_RED : SIM_GREEN;
+            ctx2d.lineWidth = 1.6;
+            ctx2d.beginPath();
+            if (child.failed) {
+              ctx2d.moveTo(mx - 2.5, rowY - 2.5);
+              ctx2d.lineTo(mx + 2.5, rowY + 2.5);
+              ctx2d.moveTo(mx + 2.5, rowY - 2.5);
+              ctx2d.lineTo(mx - 2.5, rowY + 2.5);
+            } else {
+              ctx2d.moveTo(mx - 3, rowY);
+              ctx2d.lineTo(mx - 1, rowY + 2);
+              ctx2d.lineTo(mx + 3.5, rowY - 3);
+            }
+            ctx2d.stroke();
+            ctx2d.lineWidth = 1;
+          }
+        }
+        if (failedIdx.length > 0 && arrived === total) {
+          ctx2d.fillStyle = SIM_RED;
+          ctx2d.fillText(`GatherError: child #${failedIdx.join(', #')} failed`, F_JOIN.x - 74, rowY + 24);
+        }
+      }
 
       // done boxes
       drawBox(ctx2d, theme, F_DONE.x - 24, F_DONE.y - 40, 74, 44, theme.border);
@@ -339,9 +406,10 @@ export function FanoutSim() {
       caption={
         <>
           Live model of <code>ctx.all</code>: the parent <b>suspends</b> (amber, zero compute) while N
-          children — each a full durable run — execute concurrently and <b>join</b> as they settle. Toggle
-          a failing child: the others still finish, and the join resolves as a <code>GatherError</code>{' '}
-          naming exactly which children failed.
+          children — each a full durable run, labelled <code>#i</code> — execute concurrently and{' '}
+          <b>join</b> as they settle, stamping a per-child ✓/✗ under the join. Toggle a failing child:
+          the others still finish green, and the join resolves as a <code>GatherError</code> naming
+          exactly which index failed.
         </>
       }
     />
