@@ -18,6 +18,10 @@ const GREEN = '#30a46c';
 const RED = '#e5484d';
 
 const tintAccent = 'color-mix(in srgb, var(--color-fd-primary) 14%, var(--color-fd-card))';
+// Semantic tints for PASSED beats — success/failure must read the same on every theme (the aviary
+// docs accent is crimson, so theming a "done" check by --color-fd-primary made it look like a fail).
+const tintGreen = `color-mix(in srgb, ${GREEN} 15%, var(--color-fd-card))`;
+const tintRed = `color-mix(in srgb, ${RED} 15%, var(--color-fd-card))`;
 const tintAccentSoft = 'color-mix(in srgb, var(--color-fd-primary) 7%, var(--color-fd-card))';
 const neutral = 'color-mix(in srgb, var(--color-fd-foreground) 4%, var(--color-fd-card))';
 const codeStr = 'color-mix(in srgb, var(--color-fd-primary) 45%, var(--color-fd-foreground))';
@@ -459,7 +463,7 @@ function DispatchDiagram({ step }: { step: Step }) {
 // A reusable rail of labelled beats — one per step/sleep/signal/child in a run body.
 // Each walkthrough step lights one beat (its `active` index) in a `tone` (run/wait/done);
 // passed beats show a check, upcoming beats stay neutral. Scenes supply the beat labels.
-function WorkflowTimeline({ beats, active, tone, actor }: { beats: string[]; active: number; tone: 'run' | 'wait' | 'done' | 'fail'; actor: string }) {
+function WorkflowTimeline({ beats, active, tone, actor, failed }: { beats: string[]; active: number; tone: 'run' | 'wait' | 'done' | 'fail'; actor: string; failed?: number[] }) {
   const count = beats.length;
   const gap = 150;
   const x0 = 74;
@@ -479,16 +483,22 @@ function WorkflowTimeline({ beats, active, tone, actor }: { beats: string[]; act
       <line x1={cx(active)} y1={74} x2={cx(active)} y2={railY - 24} stroke={toneColor} strokeWidth={1.5} strokeDasharray="4 4" className="cf-anim" />
 
       <line x1={cx(0)} y1={railY} x2={cx(count - 1)} y2={railY} stroke={border} strokeWidth={2} />
-      <line x1={cx(0)} y1={railY} x2={cx(Math.max(0, active))} y2={railY} stroke={accent} strokeWidth={2} className="cf-anim" />
+      <line x1={cx(0)} y1={railY} x2={cx(Math.max(0, active))} y2={railY} stroke={GREEN} strokeWidth={2} className="cf-anim" />
 
       {beats.map((label, i) => {
         const done = i < active;
         const on = i === active;
+        // A passed beat is SEMANTIC, not themed: green check = it succeeded, red ✗ = it failed
+        // (scenes flag those via `failed` — e.g. the saga's declined deposit stays a red ✗ while
+        // the undo beats light up after it).
+        const failedBeat = failed?.includes(i) ?? false;
+        const doneColor = failedBeat ? RED : GREEN;
         return (
           <g key={`${label}-${i}`} className="cf-anim">
             {on && <circle cx={cx(i)} cy={railY} r={26} fill={toneColor} opacity={0.15} className="cf-pulse" />}
-            <circle cx={cx(i)} cy={railY} r={on ? 15 : 11} className="cf-anim" fill={on ? toneColor : done ? tintAccent : neutral} stroke={on ? toneColor : done ? accent : border} strokeWidth={1.5} />
-            {done && <path d={`M ${cx(i) - 4} ${railY} l 3 3 l 6 -7`} fill="none" stroke={accent} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />}
+            <circle cx={cx(i)} cy={railY} r={on ? 15 : 11} className="cf-anim" fill={on ? toneColor : done ? (failedBeat ? tintRed : tintGreen) : neutral} stroke={on ? toneColor : done ? doneColor : border} strokeWidth={1.5} />
+            {done && !failedBeat && <path d={`M ${cx(i) - 4} ${railY} l 3 3 l 6 -7`} fill="none" stroke={GREEN} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />}
+            {done && failedBeat && <path d={`M ${cx(i) - 4} ${railY - 4} l 8 8 M ${cx(i) + 4} ${railY - 4} l -8 8`} fill="none" stroke={RED} strokeWidth={2} strokeLinecap="round" />}
             <text x={cx(i)} y={railY + 38} textAnchor="middle" className="cf-anim" style={{ fontSize: 12, fill: on ? ink : muted, fontWeight: on ? 600 : 400 }}>
               {label}
             </text>
@@ -503,7 +513,7 @@ function WorkflowTimeline({ beats, active, tone, actor }: { beats: string[]; act
 // Shows a child dispatched from the parent: the spawn arrow down, the child running its
 // own beats, and (for ctx.child) the return arrow back up as the parent resumes — or (for
 // startChild) the parent settling while the child keeps running on its own lane.
-function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, childLabel }: { step: Step; parentBeats: string[]; childBeats: string[]; spawnIdx: number; parentLabel: string; childLabel: string }) {
+function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, childLabel, pFailed }: { step: Step; parentBeats: string[]; childBeats: string[]; spawnIdx: number; parentLabel: string; childLabel: string; pFailed?: number[] }) {
   const cs = step.child ?? { pActive: 0, cActive: -1 };
   const np = parentBeats.length;
   const nc = childBeats.length;
@@ -516,12 +526,15 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
   const spawnLit = cs.arrow === 'spawn';
   const returnLit = cs.arrow === 'return';
 
-  function beat(x: number, y: number, on: boolean, done: boolean, color: string, label: string, labelY: number) {
+  // Passed beats read semantically on any theme: green check = succeeded, red ✗ = failed (`isFailed`).
+  function beat(x: number, y: number, on: boolean, done: boolean, color: string, label: string, labelY: number, isFailed = false) {
+    const doneColor = isFailed ? RED : GREEN;
     return (
       <g className="cf-anim">
         {on && <circle cx={x} cy={y} r={24} fill={color} opacity={0.15} className="cf-pulse" />}
-        <circle cx={x} cy={y} r={on ? 14 : 10} className="cf-anim" fill={on ? color : done ? tintAccent : neutral} stroke={on ? color : done ? accent : border} strokeWidth={1.5} />
-        {done && <path d={`M ${x - 4} ${y} l 3 3 l 6 -7`} fill="none" stroke={accent} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />}
+        <circle cx={x} cy={y} r={on ? 14 : 10} className="cf-anim" fill={on ? color : done ? (isFailed ? tintRed : tintGreen) : neutral} stroke={on ? color : done ? doneColor : border} strokeWidth={1.5} />
+        {done && !isFailed && <path d={`M ${x - 4} ${y} l 3 3 l 6 -7`} fill="none" stroke={GREEN} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />}
+        {done && isFailed && <path d={`M ${x - 3.5} ${y - 3.5} l 7 7 M ${x + 3.5} ${y - 3.5} l -7 7`} fill="none" stroke={RED} strokeWidth={2} strokeLinecap="round" />}
         <text x={x} y={labelY} textAnchor="middle" className="cf-anim" style={{ fontSize: 11.5, fill: on ? ink : muted, fontWeight: on ? 600 : 400 }}>
           {label}
         </text>
@@ -554,13 +567,13 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
 
       {/* parent rail */}
       <line x1={pcx(0)} y1={pY} x2={pcx(np - 1)} y2={pY} stroke={border} strokeWidth={2} />
-      <line x1={pcx(0)} y1={pY} x2={pcx(cs.pDone ? np - 1 : Math.max(0, cs.pActive))} y2={pY} stroke={accent} strokeWidth={2} className="cf-anim" />
-      {parentBeats.map((label, i) => beat(pcx(i), pY, !cs.pDone && i === cs.pActive, cs.pDone || i < cs.pActive, pTone, label, pY - 22))}
+      <line x1={pcx(0)} y1={pY} x2={pcx(cs.pDone ? np - 1 : Math.max(0, cs.pActive))} y2={pY} stroke={GREEN} strokeWidth={2} className="cf-anim" />
+      {parentBeats.map((label, i) => beat(pcx(i), pY, !cs.pDone && i === cs.pActive, cs.pDone || i < cs.pActive, pTone, label, pY - 22, pFailed?.includes(i) ?? false))}
 
       {/* child rail */}
       <g className="cf-anim" opacity={childStarted ? 1 : 0.4}>
         <line x1={ccx(0)} y1={cY} x2={ccx(nc - 1)} y2={cY} stroke={border} strokeWidth={2} />
-        <line x1={ccx(0)} y1={cY} x2={ccx(cs.cDone ? nc - 1 : Math.max(0, cs.cActive))} y2={cY} stroke={accent} strokeWidth={2} className="cf-anim" opacity={childStarted ? 1 : 0} />
+        <line x1={ccx(0)} y1={cY} x2={ccx(cs.cDone ? nc - 1 : Math.max(0, cs.cActive))} y2={cY} stroke={GREEN} strokeWidth={2} className="cf-anim" opacity={childStarted ? 1 : 0} />
         {childBeats.map((label, i) => beat(ccx(i), cY, childStarted && !cs.cDone && i === cs.cActive, cs.cDone || (childStarted && i < cs.cActive), accent, label, cY + 28))}
       </g>
     </svg>
@@ -570,7 +583,7 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
 // ── scenes ───────────────────────────────────────────────────────────────────
 type Scene = { code: string; steps: Step[]; render: (step: Step) => ReactNode; stack?: boolean };
 
-const timeline = (beats: string[]) => (step: Step) => <WorkflowTimeline beats={beats} active={step.active ?? 0} tone={step.tone ?? 'run'} actor={step.actor} />;
+const timeline = (beats: string[], opts?: { failed?: number[] }) => (step: Step) => <WorkflowTimeline beats={beats} active={step.active ?? 0} tone={step.tone ?? 'run'} actor={step.actor} failed={opts?.failed} />;
 
 const executionModel: Scene = {
   code: `// returns at once — never blocks on the body
@@ -890,7 +903,7 @@ async run(ctx: WorkflowCtx, expense: Expense) {
     { lines: [8, 9], stage: '', active: 2, tone: 'fail', title: '7d timeout', actor: 'no update arrives — SignalTimeoutError', caption: 'The deadline passes with nobody deciding, so the onUpdate call throws SignalTimeoutError instead of hanging forever.' },
     { lines: [11, 13], stage: '', active: 3, tone: 'fail', title: 'expired', actor: 'catch → default branch, run fails cleanly', caption: 'The workflow catches the timeout, marks the status expired, and fails deliberately — a bounded wait turns an abandoned approval into a clean terminal outcome, not a stuck run.' },
   ],
-  render: timeline(['awaiting', 'onUpdate', '7d timeout', 'expired']),
+  render: timeline(['awaiting', 'onUpdate', '7d timeout', 'expired'], { failed: [2] }),
 };
 
 const updateHappy: Scene = {
@@ -953,7 +966,7 @@ export class PipelineWorkflow {
     { lines: [14, 14], stage: '', title: 'ticket', actor: 'ctx.step → open a ticket with the original input', caption: 'A second step opens a ticket carrying the dead run’s original typed input — ready to replay once the bug is fixed.', child: { pActive: 3, cActive: 1, pTone: 'fail' } },
     { lines: [15, 15], stage: '', title: 'handled', actor: 'DLQ run settles — completed', caption: 'The DLQ run completes on its own lane. The poison pill stays dead — inspectable and retriable from the dashboard — handled, not lost.', child: { pActive: 3, cActive: 2, cDone: true, pTone: 'fail' } },
   ],
-  render: (step) => <ChildDiagram step={step} parentBeats={['extract', 'transform', 'crash ×5', 'dead']} childBeats={['page', 'ticket', 'done']} spawnIdx={3} parentLabel="run · pipeline" childLabel="DLQ · pipeline.dlq" />,
+  render: (step) => <ChildDiagram step={step} parentBeats={['extract', 'transform', 'crash ×5', 'dead']} childBeats={['page', 'ticket', 'done']} spawnIdx={3} parentLabel="run · pipeline" childLabel="DLQ · pipeline.dlq" pFailed={[1, 2]} />,
 };
 
 const versioning: Scene = {
@@ -1069,7 +1082,7 @@ async cancelFlight({ output }: UndoOf<TripService['bookFlight']>) {
     { lines: [21, 24], stage: '', active: 4, tone: 'run', title: 'undo flight', actor: 'cancelFlight({ input, output }) — checkpoint −2', caption: "Then the flight's undo runs. An undo handler is an ordinary @Step called with the compensated call's { input, output } envelope — UndoOf<TripService['bookFlight']> types it for free, and a Python worker can serve it by name." },
     { lines: [14, 15], stage: '', active: 5, tone: 'fail', title: 'failed', actor: 'unwind done → run settles failed (original error)', caption: 'Both legs undone, the run settles failed with the ORIGINAL deposit error — never masked by the unwind. The compensate:* checkpoints keep the whole undo trail visible in the dashboard.' },
   ],
-  render: timeline(['flight', 'hotel', 'deposit ✗', 'undo hotel', 'undo flight', 'failed']),
+  render: timeline(['flight', 'hotel', 'deposit ✗', 'undo hotel', 'undo flight', 'failed'], { failed: [2] }),
 };
 
 const flowControl: Scene = {
