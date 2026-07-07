@@ -24,6 +24,10 @@ const tintAccent = 'color-mix(in srgb, var(--color-fd-primary) 14%, var(--color-
 const tintAccentSoft = 'color-mix(in srgb, var(--color-fd-primary) 7%, var(--color-fd-card))';
 const neutral = 'color-mix(in srgb, var(--color-fd-foreground) 4%, var(--color-fd-card))';
 const tintRed = 'color-mix(in srgb, #e5484d 12%, var(--color-fd-card))';
+// Semantic success green — a WRITTEN checkpoint / a saved-output return must read as "safe" on any
+// theme (the aviary docs accent is crimson, where accent-as-done looks like a failure).
+const GREEN = '#30a46c';
+const tintGreen = 'color-mix(in srgb, #30a46c 14%, var(--color-fd-card))';
 
 const COLS = [188, 418, 648];
 const CELL_W = 176;
@@ -211,8 +215,8 @@ function Pill({
         rx={ST_H / 2}
         className="rd-anim"
         style={{
-          fill: filled ? tintAccent : neutral,
-          stroke: filled ? accent : border,
+          fill: filled ? tintGreen : neutral,
+          stroke: filled ? GREEN : border,
           strokeWidth: 1.25,
           strokeDasharray: filled ? undefined : '5 4',
         }}
@@ -221,7 +225,7 @@ function Pill({
         x={x + 20}
         y={ST_Y + ST_H / 2 + 4}
         className="rd-anim"
-        style={{ fill: filled ? accent : muted, fontSize: 13 }}
+        style={{ fill: filled ? GREEN : muted, fontSize: 13 }}
       >
         {filled ? '✓' : '○'}
       </text>
@@ -614,7 +618,7 @@ export function ReplayDiagram() {
                     dashed
                     opacity={on ? 0.92 : 0.5}
                     glyph="↩"
-                    glyphFill={on ? accent : muted}
+                    glyphFill={on ? GREEN : muted}
                     title="return saved"
                     titleFill={muted}
                     sub="not re-run"

@@ -150,6 +150,7 @@ type Step = {
   stage: string;
   active?: number; // timeline scenes: index of the lit beat
   tone?: 'run' | 'wait' | 'done' | 'fail'; // timeline scenes: the active beat's colour
+  attempts?: { done: ('fail' | 'ok')[]; max: number }; // retry scenes: per-attempt marks over the active beat
   child?: ChildState; // child-workflow scenes: parent/child lane state
 };
 
@@ -339,7 +340,7 @@ function LifecycleDiagram({ step, actor }: { step: Step; actor: string }) {
 
       {/* rail */}
       <line x1={cx(0)} y1={railY} x2={cx(STAGES.length - 1)} y2={railY} stroke={border} strokeWidth={2} />
-      <line x1={cx(0)} y1={railY} x2={cx(Math.max(0, activeIdx))} y2={railY} stroke={accent} strokeWidth={2} className="cf-anim" />
+      <line x1={cx(0)} y1={railY} x2={cx(Math.max(0, activeIdx))} y2={railY} stroke={GREEN} strokeWidth={2} className="cf-anim" />
 
       {STAGES.map((stage, i) => {
         const done = i < activeIdx;
@@ -352,11 +353,11 @@ function LifecycleDiagram({ step, actor }: { step: Step; actor: string }) {
               cy={railY}
               r={on ? 15 : 11}
               className="cf-anim"
-              fill={on ? stage.color : done ? tintAccent : neutral}
-              stroke={on || done ? stage.color : border}
+              fill={on ? stage.color : done ? tintGreen : neutral}
+              stroke={on ? stage.color : done ? GREEN : border}
               strokeWidth={1.5}
             />
-            {done && <path d={`M ${cx(i) - 4} ${railY} l 3 3 l 6 -7`} fill="none" stroke={accent} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />}
+            {done && <path d={`M ${cx(i) - 4} ${railY} l 3 3 l 6 -7`} fill="none" stroke={GREEN} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />}
             <text
               x={cx(i)}
               y={railY + 40}
@@ -463,7 +464,7 @@ function DispatchDiagram({ step }: { step: Step }) {
 // A reusable rail of labelled beats — one per step/sleep/signal/child in a run body.
 // Each walkthrough step lights one beat (its `active` index) in a `tone` (run/wait/done);
 // passed beats show a check, upcoming beats stay neutral. Scenes supply the beat labels.
-function WorkflowTimeline({ beats, active, tone, actor, failed }: { beats: string[]; active: number; tone: 'run' | 'wait' | 'done' | 'fail'; actor: string; failed?: number[] }) {
+function WorkflowTimeline({ beats, active, tone, actor, failed, attempts }: { beats: string[]; active: number; tone: 'run' | 'wait' | 'done' | 'fail'; actor: string; failed?: number[]; attempts?: { done: ('fail' | 'ok')[]; max: number } }) {
   const count = beats.length;
   const gap = 150;
   const x0 = 74;
@@ -481,6 +482,33 @@ function WorkflowTimeline({ beats, active, tone, actor, failed }: { beats: strin
         </text>
       </g>
       <line x1={cx(active)} y1={74} x2={cx(active)} y2={railY - 24} stroke={toneColor} strokeWidth={1.5} strokeDasharray="4 4" className="cf-anim" />
+
+      {/* per-attempt marks over the active beat (retry scenes): ✗ per failed attempt, ✓ on the one
+          that landed, faint slots for attempts never needed — with an "attempt k/max" counter. */}
+      {attempts && (() => {
+        const spacing = 22;
+        const rowX0 = cx(active) - ((attempts.max - 1) * spacing) / 2;
+        const rowY = 96;
+        return (
+          <g className="cf-anim">
+            {Array.from({ length: attempts.max }, (_, a) => {
+              const outcome = attempts.done[a];
+              const ax = rowX0 + a * spacing;
+              return (
+                <g key={`attempt-${a}`} className="cf-anim">
+                  <circle cx={ax} cy={rowY} r={8} fill={outcome === 'fail' ? tintRed : outcome === 'ok' ? tintGreen : 'var(--color-fd-card)'} stroke={outcome === 'fail' ? RED : outcome === 'ok' ? GREEN : border} strokeWidth={1.5} />
+                  {outcome === 'fail' && <path d={`M ${ax - 3} ${rowY - 3} l 6 6 M ${ax + 3} ${rowY - 3} l -6 6`} fill="none" stroke={RED} strokeWidth={1.75} strokeLinecap="round" />}
+                  {outcome === 'ok' && <path d={`M ${ax - 3.5} ${rowY} l 2.5 2.5 l 5 -6`} fill="none" stroke={GREEN} strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round" />}
+                </g>
+              );
+            })}
+            <rect x={cx(active) - 36} y={rowY + 12} width={72} height={15} rx={4} fill="var(--color-fd-card)" />
+            <text x={cx(active)} y={rowY + 23} textAnchor="middle" style={{ fontSize: 10.5, fill: muted, fontFamily: 'var(--font-mono, ui-monospace, monospace)' }}>
+              attempt {Math.min(attempts.done.length, attempts.max)}/{attempts.max}
+            </text>
+          </g>
+        );
+      })()}
 
       <line x1={cx(0)} y1={railY} x2={cx(count - 1)} y2={railY} stroke={border} strokeWidth={2} />
       <line x1={cx(0)} y1={railY} x2={cx(Math.max(0, active))} y2={railY} stroke={GREEN} strokeWidth={2} className="cf-anim" />
@@ -513,14 +541,16 @@ function WorkflowTimeline({ beats, active, tone, actor, failed }: { beats: strin
 // Shows a child dispatched from the parent: the spawn arrow down, the child running its
 // own beats, and (for ctx.child) the return arrow back up as the parent resumes — or (for
 // startChild) the parent settling while the child keeps running on its own lane.
-function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, childLabel, pFailed }: { step: Step; parentBeats: string[]; childBeats: string[]; spawnIdx: number; parentLabel: string; childLabel: string; pFailed?: number[] }) {
+// `parallel` renders the two lanes as INDEPENDENT runs (no spawn/return arrows, aligned starts,
+// both lanes always lit) — used to contrast two runs of the same workflow, e.g. old-vs-patched code.
+function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, childLabel, pFailed, parallel = false }: { step: Step; parentBeats: string[]; childBeats: string[]; spawnIdx: number; parentLabel: string; childLabel: string; pFailed?: number[]; parallel?: boolean }) {
   const cs = step.child ?? { pActive: 0, cActive: -1 };
   const np = parentBeats.length;
   const nc = childBeats.length;
   const pY = 82;
   const cY = 190;
   const pcx = (i: number) => 190 + (i * (600 - 190)) / Math.max(1, np - 1);
-  const ccx = (i: number) => 300 + (i * (600 - 300)) / Math.max(1, nc - 1);
+  const ccx = (i: number) => (parallel ? 190 : 300) + (i * (600 - (parallel ? 190 : 300))) / Math.max(1, nc - 1);
   const pTone = cs.pTone === 'fail' ? RED : cs.pTone === 'wait' ? AMBER : cs.pTone === 'done' ? GREEN : accent;
   const childStarted = cs.cActive >= 0;
   const spawnLit = cs.arrow === 'spawn';
@@ -553,17 +583,18 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
         </marker>
       </defs>
 
-      <text x={16} y={pY - 26} style={{ fontSize: 12, fill: muted, fontWeight: 600 }}>
+      {/* parallel lanes start at x=190, so their (longer) labels ride higher to clear the beat labels */}
+      <text x={16} y={parallel ? pY - 44 : pY - 26} style={{ fontSize: 12, fill: muted, fontWeight: 600 }}>
         {parentLabel}
       </text>
-      <text x={16} y={cY - 26} className="cf-anim" style={{ fontSize: 12, fill: childStarted ? muted : border, fontWeight: 600 }}>
+      <text x={16} y={parallel ? cY - 44 : cY - 26} className="cf-anim" style={{ fontSize: 12, fill: parallel || childStarted ? muted : border, fontWeight: 600 }}>
         {childLabel}
       </text>
 
-      {/* spawn arrow (parent → child) */}
-      <path d={`M ${pcx(spawnIdx)} ${pY + 16} C ${pcx(spawnIdx)} ${pY + 58}, ${ccx(0)} ${cY - 58}, ${ccx(0)} ${cY - 16}`} fill="none" stroke={spawnLit ? accent : border} strokeWidth={spawnLit ? 2 : 1.25} strokeDasharray="5 5" markerEnd={spawnLit ? 'url(#cf-c-spawn)' : undefined} className={`cf-anim ${spawnLit ? 'cf-flow' : ''}`} opacity={childStarted ? 1 : 0} />
+      {/* spawn arrow (parent → child) — hidden for parallel-runs scenes */}
+      {!parallel && <path d={`M ${pcx(spawnIdx)} ${pY + 16} C ${pcx(spawnIdx)} ${pY + 58}, ${ccx(0)} ${cY - 58}, ${ccx(0)} ${cY - 16}`} fill="none" stroke={spawnLit ? accent : border} strokeWidth={spawnLit ? 2 : 1.25} strokeDasharray="5 5" markerEnd={spawnLit ? 'url(#cf-c-spawn)' : undefined} className={`cf-anim ${spawnLit ? 'cf-flow' : ''}`} opacity={childStarted ? 1 : 0} />}
       {/* return arrow (child → parent) — ctx.child only */}
-      <path d={`M ${ccx(nc - 1)} ${cY - 16} C ${ccx(nc - 1)} ${cY - 58}, ${pcx(spawnIdx + 1)} ${pY + 58}, ${pcx(spawnIdx + 1)} ${pY + 16}`} fill="none" stroke={GREEN} strokeWidth={2} strokeDasharray="5 5" markerEnd="url(#cf-c-return)" className="cf-anim cf-flow" opacity={returnLit ? 1 : 0} />
+      {!parallel && <path d={`M ${ccx(nc - 1)} ${cY - 16} C ${ccx(nc - 1)} ${cY - 58}, ${pcx(spawnIdx + 1)} ${pY + 58}, ${pcx(spawnIdx + 1)} ${pY + 16}`} fill="none" stroke={GREEN} strokeWidth={2} strokeDasharray="5 5" markerEnd="url(#cf-c-return)" className="cf-anim cf-flow" opacity={returnLit ? 1 : 0} />}
 
       {/* parent rail */}
       <line x1={pcx(0)} y1={pY} x2={pcx(np - 1)} y2={pY} stroke={border} strokeWidth={2} />
@@ -571,9 +602,9 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
       {parentBeats.map((label, i) => beat(pcx(i), pY, !cs.pDone && i === cs.pActive, cs.pDone || i < cs.pActive, pTone, label, pY - 22, pFailed?.includes(i) ?? false))}
 
       {/* child rail */}
-      <g className="cf-anim" opacity={childStarted ? 1 : 0.4}>
+      <g className="cf-anim" opacity={parallel || childStarted ? 1 : 0.4}>
         <line x1={ccx(0)} y1={cY} x2={ccx(nc - 1)} y2={cY} stroke={border} strokeWidth={2} />
-        <line x1={ccx(0)} y1={cY} x2={ccx(cs.cDone ? nc - 1 : Math.max(0, cs.cActive))} y2={cY} stroke={GREEN} strokeWidth={2} className="cf-anim" opacity={childStarted ? 1 : 0} />
+        <line x1={ccx(0)} y1={cY} x2={ccx(cs.cDone ? nc - 1 : Math.max(0, cs.cActive))} y2={cY} stroke={GREEN} strokeWidth={2} className="cf-anim" opacity={parallel || childStarted ? 1 : 0} />
         {childBeats.map((label, i) => beat(ccx(i), cY, childStarted && !cs.cDone && i === cs.cActive, cs.cDone || (childStarted && i < cs.cActive), accent, label, cY + 28))}
       </g>
     </svg>
@@ -583,7 +614,7 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
 // ── scenes ───────────────────────────────────────────────────────────────────
 type Scene = { code: string; steps: Step[]; render: (step: Step) => ReactNode; stack?: boolean };
 
-const timeline = (beats: string[], opts?: { failed?: number[] }) => (step: Step) => <WorkflowTimeline beats={beats} active={step.active ?? 0} tone={step.tone ?? 'run'} actor={step.actor} failed={opts?.failed} />;
+const timeline = (beats: string[], opts?: { failed?: number[] }) => (step: Step) => <WorkflowTimeline beats={beats} active={step.active ?? 0} tone={step.tone ?? 'run'} actor={step.actor} failed={opts?.failed} attempts={step.attempts} />;
 
 const executionModel: Scene = {
   code: `// returns at once — never blocks on the body
@@ -796,15 +827,13 @@ const sleepSignals: Scene = {
 
 const webhook: Scene = {
   stack: true,
-  code: `async run(ctx: WorkflowCtx, order: Order) {
+  code: `// checkout.workflow.ts
+async run(ctx: WorkflowCtx, order: Order) {
   // mint a durable webhook: deterministic token + public callback url
   const hook = ctx.webhook<PaymentResult>();
 
   // hand the url to the provider INSIDE a step (checkpointed, fires once)
-  await ctx.step(this.psp.startPayment, {
-    orderId: order.id,
-    callbackUrl: hook.url,
-  });
+  await ctx.step(this.psp.startPayment, { orderId: order.id, callbackUrl: hook.url });
 
   // suspend with zero compute until the provider POSTs the callback
   const result = await hook.wait();
@@ -813,17 +842,23 @@ const webhook: Scene = {
     throw new FatalError(\`payment \${result.providerRef} failed\`, 'payment_failed');
   }
   await ctx.step(this.orders.fulfil, { order, providerRef: result.providerRef });
-
   return { orderId: order.id, providerRef: result.providerRef };
-}`,
+}
+
+// hours later — the PROVIDER hits the url the run handed out:
+//   POST /durable/webhooks/wh:af92:0   { "status": "paid", "providerRef": "psp_123" }
+// the built-in route resolves the token and delivers the body:
+//   engine.signal('wh:af92:0', { status: 'paid', providerRef: 'psp_123' })
+// → the suspended run resumes at hook.wait() with that payload`,
   steps: [
-    { lines: [3, 3], stage: '', active: 0, tone: 'run', title: 'mint', actor: 'ctx.webhook → deterministic token + url', caption: 'ctx.webhook() reserves a logical position now and mints a handle with a token (wh:<runId>:<seq>) and public url — both stable across replay.' },
-    { lines: [6, 9], stage: '', active: 1, tone: 'run', title: 'hand url', actor: 'ctx.step → start payment with hook.url', caption: 'The url is handed to the provider inside a step, so the handoff is checkpointed and fires exactly once, even across replay/recovery.' },
-    { lines: [12, 12], stage: '', active: 2, tone: 'wait', title: 'hook.wait', actor: 'suspended — zero compute until the callback', caption: 'hook.wait() parks the run on the token the mint reserved. It suspends with zero compute — no polling, no held thread — until the provider POSTs back as engine.signal(token, body).' },
-    { lines: [14, 17], stage: '', active: 3, tone: 'run', title: 'fulfil', actor: 'callback resumed the run → fulfil', caption: 'The callback delivered the PaymentResult; wait() resumed with it. The workflow guards the status and fulfils the order in a step.' },
-    { lines: [19, 19], stage: '', active: 4, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay, the mint, step and callback payload all return their saved values — none re-run.' },
+    { lines: [3, 4], stage: '', active: 0, tone: 'run', title: 'mint', actor: 'ctx.webhook → deterministic token + url', caption: 'ctx.webhook() reserves a logical position now and mints a handle with a token (wh:<runId>:<seq>) and public url — both stable across replay.' },
+    { lines: [6, 7], stage: '', active: 1, tone: 'run', title: 'hand url', actor: 'ctx.step → start payment with hook.url', caption: 'The url is handed to the provider inside a step, so the handoff is checkpointed and fires exactly once, even across replay/recovery.' },
+    { lines: [9, 10], stage: '', active: 2, tone: 'wait', title: 'hook.wait', actor: 'suspended — zero compute until the callback', caption: 'hook.wait() parks the run on the token the mint reserved. It suspends with zero compute — no polling, no held thread — for minutes or months.' },
+    { lines: [19, 23], stage: '', active: 3, tone: 'run', title: 'POST →', actor: 'the provider POSTs the callback url', caption: "This is the moment someone hits the endpoint: the provider POSTs the url it was given, and the built-in route turns that HTTP call into engine.signal(token, body) — no controller for you to write." },
+    { lines: [12, 15], stage: '', active: 4, tone: 'run', title: 'resume + fulfil', actor: 'wait() resumed with the payload → fulfil', caption: 'The signal delivered the PaymentResult and wait() resumed exactly where it parked. The workflow guards the status and fulfils the order in a step.' },
+    { lines: [16, 16], stage: '', active: 5, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay, the mint, step and callback payload all return their saved values — none re-run.' },
   ],
-  render: timeline(['mint', 'hand url', 'callback', 'fulfil', 'done']),
+  render: timeline(['mint', 'hand url', 'wait', 'POST →', 'fulfil', 'done']),
 };
 
 const scheduling: Scene = {
@@ -986,13 +1021,13 @@ export class CheckoutWorkflow {
   }
 }`,
   steps: [
-    { lines: [4, 4], stage: '', active: 0, tone: 'run', title: 'quote', actor: 'ctx.step → price the order', caption: 'The unchanged prefix runs identically for every run: ctx.step prices the order and checkpoints the quote at this position.' },
-    { lines: [6, 6], stage: '', active: 1, tone: 'run', title: 'patched gate', actor: "ctx.patched('add-fraud-check') — old vs new", caption: 'This one line forks by the code the run started on: a fresh run records a patch:add-fraud-check marker and returns true; an in-flight run, whose history already holds a real step at this position, returns false — the version stays pinned to what the run began under.' },
-    { lines: [7, 9], stage: '', active: 2, tone: 'run', title: 'new path', actor: 'true → fresh runs take the fraud check', caption: 'Runs that started after the patch shipped enter the new branch and score fraud. In-flight runs got false and skip it — the marker rewinds the logical position rather than consuming it, so their recorded checkpoints never shift.' },
-    { lines: [12, 12], stage: '', active: 3, tone: 'run', title: 'charge', actor: 'ctx.step → charge the card', caption: 'Both paths converge here on the same checkpoint position, so old and new runs charge deterministically — the guard changed the branch, not the surrounding sequence.' },
-    { lines: [13, 14], stage: '', active: 4, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. New runs finish on the new path, old runs finish on the old — neither replay is corrupted.' },
+    { lines: [4, 4], stage: '', title: 'quote', actor: 'both runs price the order — same prefix', caption: 'Two runs of the SAME workflow execute side by side: run A was in flight when the patch shipped; run B started after. The unchanged prefix is identical — both checkpoint the quote at position 0.', child: { pActive: 0, cActive: 0, pTone: 'run' } },
+    { lines: [6, 6], stage: '', title: 'patched gate', actor: "ctx.patched('add-fraud-check') — the fork", caption: "This one line forks by the code each run STARTED on: run A's history already holds a real step at this position → false; run B records a patch:add-fraud-check marker → true. The version stays pinned to what each run began under.", child: { pActive: 1, cActive: 1, pTone: 'run' } },
+    { lines: [7, 9], stage: '', title: 'new path', actor: 'only run B enters the fraud check', caption: 'Run B takes the new branch and scores fraud. Run A skips it entirely — the marker rewinds the logical position rather than consuming it, so its recorded checkpoints never shift.', child: { pActive: 2, cActive: 2, pTone: 'run' } },
+    { lines: [12, 12], stage: '', title: 'charge', actor: 'both runs converge on the charge', caption: 'Both paths converge on the same charge call — at each run’s own position in its own history — so old and new runs charge deterministically. The guard changed the branch, not the surrounding sequence.', child: { pActive: 2, cActive: 3, pTone: 'run' } },
+    { lines: [13, 14], stage: '', title: 'completes', actor: 'both settle — neither replay corrupted', caption: 'Run A finishes on the old path, run B on the new — one codebase, two safe histories. Without the guard, run A would have hit a NonDeterminismError the moment the fraud step shifted its positions.', child: { pActive: 3, cActive: 4, pDone: true, cDone: true, pTone: 'done' } },
   ],
-  render: timeline(['quote', 'patched?', 'fraud check', 'charge', 'done']),
+  render: (step) => <ChildDiagram step={step} parentBeats={['quote', 'gate→false', 'charge', 'done']} childBeats={['quote', 'gate→true', 'fraud', 'charge', 'done']} spawnIdx={0} parentLabel="run A · started on the OLD code" childLabel="run B · started AFTER the patch" parallel />,
 };
 
 const retries: Scene = {
@@ -1017,7 +1052,9 @@ export class CheckoutWorkflow {
   steps: [
     { lines: [12, 12], stage: '', active: 0, tone: 'run', title: 'fetch quote', actor: 'ctx.step → fetch the quote', caption: "ctx.step dispatches fetchQuote and checkpoints its result; the handler's declared @Step retry policy applies wherever it's called." },
     { lines: [3, 3], stage: '', active: 1, tone: 'run', title: 'retry policy', actor: '@Step declares retries: 3, exp backoff, jitter', caption: 'The charge handler declares its own durable retry policy — up to 3 attempts, exponential backoff from 500ms, jittered.' },
-    { lines: [13, 13], stage: '', active: 1, tone: 'run', title: 'charge (retries)', actor: 'attempt fails → re-dispatched → succeeds', caption: 'fails transiently → the engine re-dispatches per the retry policy → succeeds. The run suspends durably between attempts, so no worker is held.' },
+    { lines: [13, 13], stage: '', active: 1, tone: 'fail', title: 'attempt 1 ✗', actor: 'attempt 1/3 throws — failure checkpointed', attempts: { done: ['fail'], max: 3 }, caption: 'Stripe returns a transient 502 and chargeCard throws. The engine records the failed attempt on the checkpoint — that is attempt 1 of the 3 the policy allows.' },
+    { lines: [3, 3], stage: '', active: 1, tone: 'wait', title: 'backoff', actor: 'backoff ≈ 500ms × 2ⁿ + jitter — run suspended', attempts: { done: ['fail'], max: 3 }, caption: 'The retry deadline is stamped on the checkpoint as wakeAt and the run SUSPENDS durably — zero compute held while the backoff elapses, and the pending retry survives a crash or deploy.' },
+    { lines: [13, 13], stage: '', active: 1, tone: 'run', title: 'attempt 2 ✓', actor: 're-dispatched → attempt 2/3 succeeds', attempts: { done: ['fail', 'ok'], max: 3 }, caption: 'The timer poller re-dispatches the step when the backoff elapses; attempt 2 succeeds and its result checkpoints — the third attempt is never needed.' },
     { lines: [14, 14], stage: '', active: 2, tone: 'run', title: 'confirm', actor: 'ctx.step → confirm, { retries: 5 } per-call', caption: 'A per-call { retries: 5 } overrides the handler default field-by-field for just this call site.' },
     { lines: [15, 17], stage: '', active: 3, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay every completed step returns its saved result — the charge never re-runs.' },
   ],

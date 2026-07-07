@@ -16,6 +16,8 @@ const cardBg = 'var(--color-fd-card)';
 const border = 'var(--color-fd-border)';
 const accent = 'var(--color-fd-primary)';
 const RED = '#e5484d';
+// Semantic success green (named OK — `GREEN` below is the green tenant's waypoint).
+const OK = '#30a46c';
 
 const tintAccent = 'color-mix(in srgb, var(--color-fd-primary) 14%, var(--color-fd-card))';
 const tintAccentSoft = 'color-mix(in srgb, var(--color-fd-primary) 7%, var(--color-fd-card))';
@@ -23,7 +25,7 @@ const neutral = 'color-mix(in srgb, var(--color-fd-foreground) 4%, var(--color-f
 const tintRed = 'color-mix(in srgb, #e5484d 13%, var(--color-fd-card))';
 const mono = 'ui-monospace, SFMono-Regular, Menlo, monospace';
 
-type Tone = 'go' | 'deny';
+type Tone = 'go' | 'deny' | 'ok';
 type Highlight = 'none' | 'op' | 'blue' | 'green' | 'op-deny' | 'blue-deny';
 type Stage = { x: number; y: number; label: string; tone: Tone; hi: Highlight; caption: string };
 
@@ -76,7 +78,7 @@ function happyPath(name: 'blue' | 'green'): Stage[] {
     {
       ...OP,
       label: 'completed',
-      tone: 'go',
+      tone: 'ok',
       hi: 'op',
       caption: `Operator records the result. run@${name} completed.`,
     },
@@ -318,7 +320,7 @@ export function TenantFlow() {
   const opHi = hi === 'op' ? 'go' : hi === 'op-deny' ? 'deny' : 'none';
   const blueHi = hi === 'blue' ? 'go' : hi === 'blue-deny' ? 'deny' : 'none';
   const greenHi = hi === 'green' ? 'go' : 'none';
-  const tone = active?.tone === 'deny' ? RED : accent;
+  const tone = active?.tone === 'deny' ? RED : active?.tone === 'ok' ? OK : accent;
 
   const pill = {
     font: 'inherit',
