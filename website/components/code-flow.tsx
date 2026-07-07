@@ -153,6 +153,11 @@ type Step = {
   tone?: 'run' | 'wait' | 'done' | 'fail'; // timeline scenes: the active beat's colour
   attempts?: { done: ('fail' | 'ok')[]; max: number }; // retry scenes: per-attempt marks over the active beat
   child?: ChildState; // child-workflow scenes: parent/child lane state
+  // Vertical split: while this step's own lines are highlighted in its tab, ALSO show a cropped
+  // excerpt of another file below it (e.g. the saga unwind highlights `compensate:` in the workflow
+  // on top and the undo @Step it points at underneath). `window` bounds the excerpt (defaults to
+  // `lines` padded by one).
+  split?: { file: number; lines: [number, number]; window?: [number, number] };
 };
 
 // Two-lane parent↔child state for the ChildDiagram.
@@ -170,12 +175,22 @@ function CodePanel({
   code,
   active,
   onJump,
+  window: win,
 }: {
   code: string;
   active: [number, number];
   onJump: (line: number) => void;
+  window?: [number, number]; // crop to this line range (real line numbers kept, ⋯ marks the cuts)
 }) {
-  const lines = code.replace(/\n$/, '').split('\n');
+  const allLines = code.replace(/\n$/, '').split('\n');
+  const first = win ? Math.max(1, win[0]) : 1;
+  const last = win ? Math.min(allLines.length, win[1]) : allLines.length;
+  const lines = allLines.slice(first - 1, last);
+  const cutRow = (
+    <span style={{ display: 'flex', userSelect: 'none' }}>
+      <span style={{ width: 30, flex: '0 0 30px', textAlign: 'right', paddingRight: 12, color: muted, opacity: 0.45 }}>⋯</span>
+    </span>
+  );
   return (
     <pre
       style={{
@@ -191,8 +206,9 @@ function CodePanel({
       }}
     >
       <code>
+        {first > 1 && cutRow}
         {lines.map((line, i) => {
-          const lineNo = i + 1;
+          const lineNo = first + i;
           const on = lineNo >= active[0] && lineNo <= active[1];
           return (
             // biome-ignore lint/a11y/useKeyWithClickEvents: rows are a convenience jump; controls below are the primary affordance
@@ -232,6 +248,7 @@ function CodePanel({
             </span>
           );
         })}
+        {last < allLines.length && cutRow}
       </code>
     </pre>
   );
@@ -616,7 +633,9 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
 
 // ── scenes ───────────────────────────────────────────────────────────────────
 // A scene's code is either one anonymous snippet (`code`) or named files rendered as tabs
-// (`files`) — stepping into a step auto-switches to its file's tab.
+// (`files`) — stepping into a step auto-switches to its file's tab. Tabs are for the reader's own
+// browsing; auto-play should NOT bounce between them. A step whose action lives in another file
+// keeps its anchor line in the primary file and shows the other file's excerpt via `split` instead.
 type Scene = { code?: string; files?: { name: string; code: string }[]; steps: Step[]; render: (step: Step) => ReactNode; stack?: boolean };
 
 const timeline = (beats: string[], opts?: { failed?: number[] }) => (step: Step) => <WorkflowTimeline beats={beats} active={step.active ?? 0} tone={step.tone ?? 'run'} actor={step.actor} failed={opts?.failed} attempts={step.attempts} />;
@@ -675,8 +694,9 @@ await engine.signal('approve', { by: 'ops' });`,
       caption: 'waitForSignal parks the run as suspended and frees the worker — no thread is held while it waits.',
     },
     {
-      file: 1,
-      lines: [4, 5],
+      file: 0,
+      lines: [4, 4],
+      split: { file: 1, lines: [4, 5], window: [4, 5] },
       title: 'engine.signal',
       actor: "signal('approve') delivered from anywhere",
       stage: 'running',
@@ -722,6 +742,7 @@ await ctx.step(this.inventory.reserve, order);`,
     {
       file: 1,
       lines: [2, 2],
+      split: { file: 0, lines: [2, 2], window: [1, 5] },
       title: 'ctx.step dispatches',
       actor: 'dispatched over the transport by name',
       stage: 'dispatch',
@@ -730,6 +751,7 @@ await ctx.step(this.inventory.reserve, order);`,
     {
       file: 1,
       lines: [2, 2],
+      split: { file: 0, lines: [3, 4], window: [1, 5] },
       title: 'a worker runs it',
       actor: 'worker runs the handler — run suspends',
       stage: 'running',
@@ -738,6 +760,7 @@ await ctx.step(this.inventory.reserve, order);`,
     {
       file: 1,
       lines: [2, 2],
+      split: { file: 0, lines: [4, 4], window: [1, 5] },
       title: 'result checkpointed',
       actor: 'result saved → returned to the workflow',
       stage: 'checkpoint',
@@ -827,8 +850,8 @@ export class KycWorkflow {
   steps: [
     { file: 0, lines: [9, 9], stage: '', title: 'create', actor: 'ctx.step → create the account', caption: "A normal step creates the account. The child workflow hasn't started yet.", child: { pActive: 0, cActive: -1, pTone: 'run' } },
     { file: 0, lines: [12, 12], stage: '', title: 'ctx.child', actor: 'ctx.child → start KycWorkflow, parent suspends', caption: 'ctx.child starts KycWorkflow — a full durable run of its own — and suspends the parent here (zero compute).', child: { pActive: 1, cActive: 0, arrow: 'spawn', pTone: 'wait' } },
-    { file: 1, lines: [7, 8], stage: '', title: 'child runs', actor: 'the child runs its own steps — the parent waits', caption: 'The child runs its own steps, with its own history, retries and dashboard entry. A child that takes hours costs the suspended parent nothing.', child: { pActive: 1, cActive: 1, pTone: 'wait' } },
-    { file: 1, lines: [9, 9], stage: '', title: 'result returns', actor: 'child settled → its output flows back', caption: 'The child reaches a terminal state and its output flows back, resuming the parent. (A child failure would throw in the parent instead.)', child: { pActive: 1, cActive: 2, cDone: true, arrow: 'return', pTone: 'wait' } },
+    { file: 0, lines: [12, 12], split: { file: 1, lines: [7, 8], window: [6, 9] }, stage: '', title: 'child runs', actor: 'the child runs its own steps — the parent waits', caption: 'The child runs its own steps, with its own history, retries and dashboard entry. A child that takes hours costs the suspended parent nothing.', child: { pActive: 1, cActive: 1, pTone: 'wait' } },
+    { file: 0, lines: [12, 12], split: { file: 1, lines: [9, 9], window: [6, 10] }, stage: '', title: 'result returns', actor: 'child settled → its output flows back', caption: 'The child reaches a terminal state and its output flows back, resuming the parent. (A child failure would throw in the parent instead.)', child: { pActive: 1, cActive: 2, cDone: true, arrow: 'return', pTone: 'wait' } },
     { file: 0, lines: [14, 14], stage: '', title: 'welcome', actor: 'parent resumed → welcome email', caption: "The parent resumes with the child's result and emails the user.", child: { pActive: 2, cActive: 2, cDone: true, pTone: 'run' } },
     { file: 0, lines: [15, 15], stage: '', title: 'completes', actor: 'parent settles — completed', caption: "The parent returns the child's verified flag; the run completes.", child: { pActive: 3, cActive: 2, cDone: true, pDone: true, pTone: 'done' } },
   ],
@@ -872,7 +895,7 @@ export class ReindexSearchWorkflow {
     { file: 0, lines: [6, 6], stage: '', title: 'publish', actor: 'ctx.step → publish the post', caption: 'A step publishes the post. Nothing has been spun off yet.', child: { pActive: 0, cActive: -1, pTone: 'run' } },
     { file: 0, lines: [9, 9], stage: '', title: 'startChild', actor: "ctx.startChild → dispatch the child, don't wait", caption: 'ctx.startChild dispatches ReindexSearchWorkflow and returns its run id immediately — the parent does NOT suspend.', child: { pActive: 1, cActive: 0, arrow: 'spawn', pTone: 'run' } },
     { file: 0, lines: [11, 11], stage: '', title: 'parent completes', actor: 'parent settles — the child keeps running', caption: 'The parent returns and completes right away, while the child keeps running on its own lane — an independent durable run.', child: { pActive: 2, cActive: 1, pDone: true, pTone: 'done' } },
-    { file: 1, lines: [7, 8], stage: '', title: 'child lives on', actor: 'the child finishes later, independently', caption: "The child finishes its own steps later; a failure there never touches the already-settled parent — inspect or retry it from the dashboard.", child: { pActive: 2, cActive: 2, cDone: true, pDone: true, pTone: 'done' } },
+    { file: 0, lines: [9, 9], split: { file: 1, lines: [7, 8], window: [6, 9] }, stage: '', title: 'child lives on', actor: 'the child finishes later, independently', caption: "The child finishes its own steps later; a failure there never touches the already-settled parent — inspect or retry it from the dashboard.", child: { pActive: 2, cActive: 2, cDone: true, pDone: true, pTone: 'done' } },
   ],
   render: (step) => <ChildDiagram step={step} parentBeats={['publish', 'startChild', 'done']} childBeats={['reindex', 'warm', 'done']} spawnIdx={1} parentLabel="parent · publish-post" childLabel="child · ReindexSearchWorkflow" />,
 };
@@ -907,7 +930,7 @@ async approve(@Param('orderId') orderId: string, @Body() body: Approval) {
     { file: 0, lines: [2, 2], stage: '', active: 0, tone: 'run', title: 'place', actor: 'ctx.step → place the order', caption: 'A step places the order and checkpoints its result.' },
     { file: 0, lines: [5, 5], stage: '', active: 1, tone: 'wait', title: 'ctx.sleep', actor: 'durable timer — suspended 2h', caption: 'ctx.sleep suspends the run for 2h with zero compute; a durable timer resumes it automatically, even across restarts.' },
     { file: 0, lines: [8, 8], stage: '', active: 2, tone: 'wait', title: 'waitForSignal', actor: "parked on 'approved'", caption: 'waitForSignal parks the run on the token — zero compute, no worker held, for as long as it takes.' },
-    { file: 1, lines: [4, 4], stage: '', active: 3, tone: 'run', title: 'signal →', actor: "workflows.signal('approved', body) — from outside", caption: 'Someone approves: a controller (or webhook, or another service) sends the signal by token. Sent before anyone waits? It buffers — a signal is never lost.' },
+    { file: 0, lines: [8, 8], split: { file: 1, lines: [4, 4], window: [2, 5] }, stage: '', active: 3, tone: 'run', title: 'signal →', actor: "workflows.signal('approved', body) — from outside", caption: 'Someone approves: a controller (or webhook, or another service) sends the signal by token. Sent before anyone waits? It buffers — a signal is never lost.' },
     { file: 0, lines: [9, 9], stage: '', active: 4, tone: 'run', title: 'finalize', actor: 'signal resumed the run → finalize', caption: 'The signal woke the run; it finalizes with the delivered payload.' },
     { file: 0, lines: [10, 10], stage: '', active: 5, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns; the run completes.' },
   ],
@@ -952,7 +975,7 @@ POST /durable/webhooks/wh:af92:0
     { file: 0, lines: [2, 3], stage: '', active: 0, tone: 'run', title: 'mint', actor: 'ctx.webhook → deterministic token + url', caption: 'ctx.webhook() reserves a logical position now and mints a handle with a token (wh:<runId>:<seq>) and public url — both stable across replay.' },
     { file: 0, lines: [5, 6], stage: '', active: 1, tone: 'run', title: 'hand url', actor: 'ctx.step → start payment with hook.url', caption: 'The url is handed to the provider inside a step, so the handoff is checkpointed and fires exactly once, even across replay/recovery.' },
     { file: 0, lines: [8, 9], stage: '', active: 2, tone: 'wait', title: 'hook.wait', actor: 'suspended — zero compute until the callback', caption: 'hook.wait() parks the run on the token the mint reserved. It suspends with zero compute — no polling, no held thread — for minutes or months.' },
-    { file: 1, lines: [3, 4], stage: '', active: 3, tone: 'run', title: 'POST →', actor: 'the provider POSTs the callback url', caption: 'This is the moment someone hits the endpoint: the provider POSTs the url it was given, and the built-in route turns that HTTP call into engine.signal(token, body) — no controller for you to write.' },
+    { file: 0, lines: [9, 9], split: { file: 1, lines: [3, 4], window: [1, 4] }, stage: '', active: 3, tone: 'run', title: 'POST →', actor: 'the provider POSTs the callback url', caption: 'This is the moment someone hits the endpoint: the provider POSTs the url it was given, and the built-in route turns that HTTP call into engine.signal(token, body) — no controller for you to write.' },
     { file: 0, lines: [11, 14], stage: '', active: 4, tone: 'run', title: 'resume + fulfil', actor: 'wait() resumed with the payload → fulfil', caption: 'The signal delivered the PaymentResult and wait() resumed exactly where it parked. The workflow guards the status and fulfils the order in a step.' },
     { file: 0, lines: [15, 15], stage: '', active: 5, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay, the mint, step and callback payload all return their saved values — none re-run.' },
   ],
@@ -986,7 +1009,7 @@ export class DailyReportWorkflow {
     },
   ],
   steps: [
-    { file: 1, lines: [4, 6], stage: '', active: 0, tone: 'run', title: 'cron fires', actor: "07:00 São Paulo → engine starts 'daily-report'", caption: 'The schedule lives at the module level — cron fires and the engine starts the workflow with a deterministic per-window run id, so a double-fire of the same window never creates two runs.' },
+    { file: 0, lines: [1, 1], split: { file: 1, lines: [5, 5], window: [4, 6] }, stage: '', active: 0, tone: 'run', title: 'cron fires', actor: "07:00 São Paulo → engine starts 'daily-report'", caption: 'The schedule lives at the module level — cron fires and the engine starts the workflow it names with a deterministic per-window run id, so a double-fire of the same window never creates two runs.' },
     { file: 0, lines: [5, 5], stage: '', active: 1, tone: 'run', title: 'gather', actor: 'scheduled run → gather', caption: "Nothing in the workflow knows about the cadence — it's a normal durable run. The first step gathers yesterday's rows and checkpoints them, so a re-fire of the same window resumes with the saved result instead of re-gathering." },
     { file: 0, lines: [6, 6], stage: '', active: 2, tone: 'run', title: 'email', actor: 'ctx.step → email the report', caption: 'A second step emails the gathered rows; its result is a durable checkpoint, so a crash mid-send never re-runs the earlier gather.' },
     { file: 0, lines: [7, 7], stage: '', active: 3, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns the row count and the run completes. Next tick opens a new time-bucket window with a fresh run id; this one is done.' },
@@ -1026,7 +1049,7 @@ async progress(@Param('runId') runId: string) {
     { file: 0, lines: [2, 2], stage: '', active: 0, tone: 'run', title: 'probe', actor: 'ctx.step → probe the source', caption: 'A normal step probes the media and checkpoints the segment list — the run is busy, doing real work.' },
     { file: 0, lines: [5, 5], stage: '', active: 1, tone: 'run', title: 'encode', actor: 'ctx.step → encode each segment', caption: 'The loop encodes one segment per step, checkpointing each result as it goes.' },
     { file: 0, lines: [6, 9], stage: '', active: 2, tone: 'run', title: 'publish', actor: "ctx.setEvent('progress', …)", caption: 'Each pass overwrites the progress key from inside the run — checkpointed, replay-safe, and bounded (only the latest value survives a query).' },
-    { file: 1, lines: [2, 5], stage: '', active: 3, tone: 'run', title: 'read', actor: 'engine.getEvent(runId, "progress")', caption: 'From outside — a controller, a poller, another service — engine.getEvent reads the latest snapshot with zero effect on the run: it does not resume it, consume a position, or appear in its history.' },
+    { file: 0, lines: [7, 7], split: { file: 1, lines: [2, 5] }, stage: '', active: 3, tone: 'run', title: 'read', actor: 'engine.getEvent(runId, "progress")', caption: 'From outside — a controller, a poller, another service — engine.getEvent reads the latest snapshot with zero effect on the run: it does not resume it, consume a position, or appear in its history.' },
     { file: 0, lines: [11, 11], stage: '', active: 4, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns; published values live in the checkpoints, so they stay queryable even after the run completes.' },
   ],
   render: timeline(['probe', 'encode', 'publish', 'read', 'done']),
@@ -1091,8 +1114,8 @@ async decide(@Param('runId') runId: string, @Body() body: DecisionDto) {
   steps: [
     { file: 0, lines: [3, 3], stage: '', active: 0, tone: 'run', title: 'awaiting', actor: "ctx.setEvent('status', 'awaiting-approval')", caption: 'Same run, same status — it reaches the decision point and parks.' },
     { file: 0, lines: [5, 5], stage: '', active: 1, tone: 'wait', title: 'onUpdate', actor: "ctx.onUpdate('decision') — suspended", caption: 'The run suspends with zero compute, holding its place until an external command arrives.' },
-    { file: 1, lines: [5, 5], stage: '', active: 2, tone: 'run', title: 'update →', actor: "engine.update(runId, 'decision', body)", caption: 'A separate request — the controller — calls engine.update with the decision. This is the command that steers the parked run.' },
-    { file: 1, lines: [4, 6], stage: '', active: 3, tone: 'run', title: 'validate', actor: 'validator runs in the caller’s request', caption: 'Before the run is touched, the registered validator runs synchronously in this request. A bad decision returns { accepted: false, reason } here — the run never wakes for it.' },
+    { file: 0, lines: [5, 5], split: { file: 1, lines: [5, 5], window: [2, 7] }, stage: '', active: 2, tone: 'run', title: 'update →', actor: "engine.update(runId, 'decision', body)", caption: 'A separate request — the controller — calls engine.update with the decision. This is the command that steers the parked run.' },
+    { file: 0, lines: [5, 5], split: { file: 1, lines: [4, 6], window: [2, 7] }, stage: '', active: 3, tone: 'run', title: 'validate', actor: 'validator runs in the caller’s request', caption: 'Before the run is touched, the registered validator runs synchronously in this request. A bad decision returns { accepted: false, reason } here — the run never wakes for it.' },
     { file: 0, lines: [5, 5], stage: '', active: 4, tone: 'run', title: 'resume', actor: 'accepted → delivered to onUpdate, run resumes', caption: 'Accepted: the decision is delivered to the suspended ctx.onUpdate and the run comes back to life exactly where it left off.' },
     { file: 0, lines: [7, 7], stage: '', active: 5, tone: 'run', title: 'reimburse', actor: 'ctx.step → reimburse the expense', caption: 'The resumed body runs the next durable step with the delivered decision.' },
     { file: 0, lines: [8, 8], stage: '', active: 6, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes — the outside command carried it down the happy path.' },
@@ -1204,9 +1227,9 @@ export class PaymentsService {
   ],
   steps: [
     { file: 0, lines: [10, 10], stage: '', active: 0, tone: 'run', title: 'fetch quote', actor: 'ctx.step → fetch the quote', caption: "ctx.step dispatches fetchQuote and checkpoints its result; the handler's declared @Step retry policy applies wherever it's called." },
-    { file: 1, lines: [5, 5], stage: '', active: 1, tone: 'run', title: 'retry policy', actor: '@Step declares retries: 3, exp backoff, jitter', caption: 'The charge handler declares its own durable retry policy — up to 3 attempts, exponential backoff from 500ms, jittered.' },
+    { file: 0, lines: [11, 11], split: { file: 1, lines: [5, 5], window: [5, 8] }, stage: '', active: 1, tone: 'run', title: 'retry policy', actor: '@Step declares retries: 3, exp backoff, jitter', caption: 'The charge handler declares its own durable retry policy — up to 3 attempts, exponential backoff from 500ms, jittered.' },
     { file: 0, lines: [11, 11], stage: '', active: 1, tone: 'fail', title: 'attempt 1 ✗', actor: 'attempt 1/3 throws — failure checkpointed', attempts: { done: ['fail'], max: 3 }, caption: 'Stripe returns a transient 502 and chargeCard throws. The engine records the failed attempt on the checkpoint — that is attempt 1 of the 3 the policy allows.' },
-    { file: 1, lines: [5, 5], stage: '', active: 1, tone: 'wait', title: 'backoff', actor: 'backoff ≈ 500ms × 2ⁿ + jitter — run suspended', attempts: { done: ['fail'], max: 3 }, caption: 'The retry deadline is stamped on the checkpoint as wakeAt and the run SUSPENDS durably — zero compute held while the backoff elapses, and the pending retry survives a crash or deploy.' },
+    { file: 0, lines: [11, 11], split: { file: 1, lines: [5, 5], window: [5, 8] }, stage: '', active: 1, tone: 'wait', title: 'backoff', actor: 'backoff ≈ 500ms × 2ⁿ + jitter — run suspended', attempts: { done: ['fail'], max: 3 }, caption: 'The retry deadline is stamped on the checkpoint as wakeAt and the run SUSPENDS durably — zero compute held while the backoff elapses, and the pending retry survives a crash or deploy.' },
     { file: 0, lines: [11, 11], stage: '', active: 1, tone: 'run', title: 'attempt 2 ✓', actor: 're-dispatched → attempt 2/3 succeeds', attempts: { done: ['fail', 'ok'], max: 3 }, caption: 'The timer poller re-dispatches the step when the backoff elapses; attempt 2 succeeds and its result checkpoints — the third attempt is never needed.' },
     { file: 0, lines: [12, 12], stage: '', active: 2, tone: 'run', title: 'confirm', actor: 'ctx.step → confirm, { retries: 5 } per-call', caption: 'A per-call { retries: 5 } overrides the handler default field-by-field for just this call site.' },
     { file: 0, lines: [13, 14], stage: '', active: 3, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay every completed step returns its saved result — the charge never re-runs.' },
@@ -1246,7 +1269,7 @@ async def enrich(pdf):
   steps: [
     { file: 0, lines: [9, 9], stage: '', active: 0, tone: 'run', title: 'validate', actor: 'ctx.step → validate (same NestJS app)', caption: 'The in-process event-emitter transport dispatches this to a @Step handler in the SAME process — no network hop.' },
     { file: 0, lines: [10, 10], stage: '', active: 1, tone: 'run', title: 'render', actor: 'ctx.step → render to PDF (separate worker)', caption: 'Identical ctx.step call — but this transport carries the dispatch to a different worker process over Redis/SQS. The workflow code never changes.' },
-    { file: 1, lines: [2, 5], stage: '', active: 2, tone: 'run', title: 'python enrich', actor: "ctx.step<Summary>('python.enrich', pdf) → Python worker", caption: 'By-name dispatch reaches THIS handler — a Python worker registered under the same name, consuming the same wire-level RemoteTask and answering with a StepResult. Any language on the other end.' },
+    { file: 0, lines: [11, 11], split: { file: 1, lines: [2, 5] }, stage: '', active: 2, tone: 'run', title: 'python enrich', actor: "ctx.step<Summary>('python.enrich', pdf) → Python worker", caption: 'By-name dispatch reaches THIS handler — a Python worker registered under the same name, consuming the same wire-level RemoteTask and answering with a StepResult. Any language on the other end.' },
     { file: 0, lines: [12, 13], stage: '', active: 3, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The engine checkpointed every result as it landed, regardless of which process (or language) ran the step — replay never re-dispatches a settled one.' },
   ],
   render: timeline(['validate', 'render', 'python', 'done']),
@@ -1311,8 +1334,8 @@ export class TripService {
     { file: 0, lines: [6, 8], stage: '', active: 0, tone: 'run', title: 'flight', actor: 'ctx.step → book flight, undo registered', caption: "The flight books on whatever worker serves bookFlight. Because the call completed, its compensate — cancelFlight, another @Step — is registered on the saga stack together with this call's { input, output }." },
     { file: 0, lines: [9, 11], stage: '', active: 1, tone: 'run', title: 'hotel', actor: 'ctx.step → book hotel, undo registered', caption: "The hotel books and registers its own undo — pushed after the flight's, so it will be undone first." },
     { file: 0, lines: [12, 13], stage: '', active: 2, tone: 'fail', title: 'deposit ✗', actor: 'ctx.step → charge deposit (fails)', caption: 'The deposit charge exhausts its retries and the run fails. It registered no undo of its own — but two earlier steps did.' },
-    { file: 1, lines: [20, 23], stage: '', active: 3, tone: 'run', title: 'undo hotel', actor: 'engine dispatches cancelHotel — checkpoint −1', caption: 'The engine walks the stack in reverse and DISPATCHES cancelHotel to its worker like any durable step, checkpointed at reserved seq −1 — a crash mid-unwind resumes here instead of re-running finished undos. It receives the { input, output } of the hotel booking it undoes.' },
-    { file: 1, lines: [25, 28], stage: '', active: 4, tone: 'run', title: 'undo flight', actor: 'cancelFlight({ input, output }) — checkpoint −2', caption: "Then the flight's undo runs, with both the original input AND the booking it must cancel in its envelope — UndoOf<TripService['bookFlight']> types it for free, and a Python worker could serve it by name." },
+    { file: 0, lines: [10, 10], split: { file: 1, lines: [20, 23], window: [18, 23] }, stage: '', active: 3, tone: 'run', title: 'undo hotel', actor: 'engine dispatches cancelHotel — checkpoint −1', caption: 'The engine walks the stack in reverse and DISPATCHES the compensate registered here — cancelHotel, below — to its worker like any durable step, checkpointed at reserved seq −1: a crash mid-unwind resumes here instead of re-running finished undos. It receives the { input, output } of the hotel booking it undoes.' },
+    { file: 0, lines: [7, 7], split: { file: 1, lines: [25, 28] }, stage: '', active: 4, tone: 'run', title: 'undo flight', actor: 'cancelFlight({ input, output }) — checkpoint −2', caption: "Then the flight's compensate runs, with both the original input AND the booking it must cancel in its envelope — UndoOf<TripService['bookFlight']> types it for free, and a Python worker could serve it by name." },
     { file: 0, lines: [12, 13], stage: '', active: 5, tone: 'fail', title: 'failed', actor: 'unwind done → run settles failed (original error)', caption: 'Both legs undone, the run settles failed with the ORIGINAL deposit error — never masked by the unwind. The compensate:* checkpoints keep the whole undo trail visible in the dashboard.' },
   ],
   render: timeline(['flight', 'hotel', 'deposit ✗', 'undo hotel', 'undo flight', 'failed'], { failed: [2] }),
@@ -1351,9 +1374,9 @@ export class SendReceiptWorkflow {
   ],
   steps: [
     { file: 0, lines: [6, 10], stage: '', active: 0, tone: 'run', title: 'dispatch', actor: "ctx.step → dispatch through the 'emails' queue", caption: "The call names the emails queue and carries priority + fairnessKey — the engine asks the queue's admission controller for a slot before dispatching." },
-    { file: 1, lines: [5, 6], stage: '', active: 1, tone: 'wait', title: 'blocked', actor: 'queue at its concurrency cap — call blocked', caption: 'The queue registered here is full (concurrency: 2), so admission is blocked. The engine does NOT dispatch — it re-suspends the run with the retry time as wakeAt, and the timer poller retries later. Zero compute held.' },
+    { file: 0, lines: [7, 7], split: { file: 1, lines: [5, 6], window: [4, 7] }, stage: '', active: 1, tone: 'wait', title: 'blocked', actor: 'queue at its concurrency cap — call blocked', caption: 'The queue this line names — registered in app.module.ts, below — is full (concurrency: 2), so admission is blocked. The engine does NOT dispatch — it re-suspends the run with the retry time as wakeAt, and the timer poller retries later. Zero compute held.' },
     { file: 0, lines: [8, 8], stage: '', active: 2, tone: 'wait', title: 'priority', actor: 'priority: 10 — this urgent job jumps the line', caption: 'When a slot frees, admission goes to the rightful next waiter: higher priority wins first, so this urgent call is admitted ahead of already-waiting lower-priority calls.' },
-    { file: 0, lines: [9, 9], stage: '', active: 3, tone: 'wait', title: 'fair share', actor: 'fairnessKey round-robins by tenant', caption: "Within the same priority tier, fairness breaks the tie: with the queue's fairness: 'key' set (see app.module.ts), the least-recently-served fairnessKey is admitted next, so one busy tenant can't starve the others." },
+    { file: 0, lines: [9, 9], split: { file: 1, lines: [6, 6], window: [4, 7] }, stage: '', active: 3, tone: 'wait', title: 'fair share', actor: 'fairnessKey round-robins by tenant', caption: "Within the same priority tier, fairness breaks the tie: with the queue's fairness: 'key' set (below), the least-recently-served fairnessKey is admitted next, so one busy tenant can't starve the others." },
     { file: 0, lines: [6, 11], stage: '', active: 4, tone: 'done', title: 'admitted', actor: 'slot granted → step dispatches → email sent', caption: 'Once admitted, the slot is held until the result lands; the step dispatches, sends the email, and the run completes.' },
   ],
   render: timeline(['dispatch', 'blocked', 'priority', 'fair', 'done']),
@@ -1388,13 +1411,13 @@ await workflows.start(SyncInventoryWorkflow, { storeId: 'B' }); // other key →
     },
   ],
   steps: [
-    { file: 0, lines: [2, 6], stage: '', title: 'admitted', actor: "singleton.key → 'store:A' — slot free, run 1 admitted", caption: 'The singleton key derives store:A from the input. The first start finds the key’s only slot free (limit defaults to 1 — a mutex) and is admitted.', child: { pActive: 0, cActive: -1, pTone: 'run' } },
-    { file: 1, lines: [2, 2], stage: '', title: 'run 1 works', actor: 'run 1 executes — it holds store:A’s slot', caption: 'Run 1 executes its steps normally, holding the store:A slot for as long as it is pending, running, or suspended.', child: { pActive: 1, cActive: -1, pTone: 'run' } },
-    { file: 1, lines: [3, 3], stage: '', title: 'run 2 arrives', actor: 'second start, SAME key store:A', caption: 'A second start for store:A arrives while run 1 is in flight. It is a real run with its own runId — but it shares the singleton key.', child: { pActive: 1, cActive: 0, pTone: 'run', cTone: 'run' } },
-    { file: 1, lines: [3, 4], stage: '', title: 'gated', actor: 'gate: run 1 holds store:A → run 2 waits (zero compute)', caption: 'The admission gate counts run 1 under the same key, so run 2 is NOT admitted: it suspends with a jittered retry and a wake-on-release notify — zero compute while it queues. store:B (last line) has its own key and runs immediately.', child: { pActive: 1, cActive: 1, pTone: 'run', cTone: 'wait' } },
-    { file: 0, lines: [10, 12], stage: '', title: 'run 1 done', actor: 'run 1 settles → slot released → wakeNext', caption: 'Run 1 completes and releases the slot. The gate wakes the OLDEST waiter for store:A — FIFO by (createdAt, id), the same view on every instance, so admission is race-free across a fleet.', child: { pActive: 2, cActive: 1, pTone: 'done', cTone: 'wait' } },
-    { file: 1, lines: [3, 3], stage: '', title: 'run 2 admitted', actor: 'run 2 admitted → executes the same workflow', caption: 'Run 2 is admitted and does its own sync — exactly one store:A sync at a time, and none of the requests were lost.', child: { pActive: 2, pDone: true, pTone: 'done', cActive: 2, cTone: 'run' } },
-    { file: 0, lines: [11, 12], stage: '', title: 'run 2 done', actor: 'run 2 settles — the queue is drained', caption: 'Run 2 completes. Set maxQueueDepth to bound how many starts may queue behind the slot — past it, start() rejects with SingletonQueueFullError instead of growing the backlog.', child: { pActive: 2, pDone: true, pTone: 'done', cActive: 3, cDone: true, cTone: 'done' } },
+    { file: 0, lines: [2, 6], split: { file: 1, lines: [2, 2], window: [1, 4] }, stage: '', title: 'admitted', actor: "singleton.key → 'store:A' — slot free, run 1 admitted", caption: 'The singleton key derives store:A from the input. The first start (below) finds the key’s only slot free (limit defaults to 1 — a mutex) and is admitted.', child: { pActive: 0, cActive: -1, pTone: 'run' } },
+    { file: 0, lines: [11, 12], split: { file: 1, lines: [2, 2], window: [1, 4] }, stage: '', title: 'run 1 works', actor: 'run 1 executes — it holds store:A’s slot', caption: 'Run 1 executes its steps normally, holding the store:A slot for as long as it is pending, running, or suspended.', child: { pActive: 1, cActive: -1, pTone: 'run' } },
+    { file: 0, lines: [5, 5], split: { file: 1, lines: [3, 3], window: [1, 4] }, stage: '', title: 'run 2 arrives', actor: 'second start, SAME key store:A', caption: 'A second start for store:A arrives while run 1 is in flight. It is a real run with its own runId — but the key function derives the SAME store:A.', child: { pActive: 1, cActive: 0, pTone: 'run', cTone: 'run' } },
+    { file: 0, lines: [5, 5], split: { file: 1, lines: [3, 4], window: [1, 4] }, stage: '', title: 'gated', actor: 'gate: run 1 holds store:A → run 2 waits (zero compute)', caption: 'The admission gate counts run 1 under the same key, so run 2 is NOT admitted: it suspends with a jittered retry and a wake-on-release notify — zero compute while it queues. store:B (last line below) has its own key and runs immediately.', child: { pActive: 1, cActive: 1, pTone: 'run', cTone: 'wait' } },
+    { file: 0, lines: [10, 12], split: { file: 1, lines: [3, 3], window: [1, 4] }, stage: '', title: 'run 1 done', actor: 'run 1 settles → slot released → wakeNext', caption: 'Run 1 completes and releases the slot. The gate wakes the OLDEST waiter for store:A — FIFO by (createdAt, id), the same view on every instance, so admission is race-free across a fleet.', child: { pActive: 2, cActive: 1, pTone: 'done', cTone: 'wait' } },
+    { file: 0, lines: [11, 12], split: { file: 1, lines: [3, 3], window: [1, 4] }, stage: '', title: 'run 2 admitted', actor: 'run 2 admitted → executes the same workflow', caption: 'Run 2 is admitted and does its own sync — exactly one store:A sync at a time, and none of the requests were lost.', child: { pActive: 2, pDone: true, pTone: 'done', cActive: 2, cTone: 'run' } },
+    { file: 0, lines: [11, 12], split: { file: 1, lines: [3, 3], window: [1, 4] }, stage: '', title: 'run 2 done', actor: 'run 2 settles — the queue is drained', caption: 'Run 2 completes. Set maxQueueDepth to bound how many starts may queue behind the slot — past it, start() rejects with SingletonQueueFullError instead of growing the backlog.', child: { pActive: 2, pDone: true, pTone: 'done', cActive: 3, cDone: true, cTone: 'done' } },
   ],
   render: (step) => <ChildDiagram step={step} parentBeats={['admitted', 'sync', 'done']} childBeats={['arrives', 'gated', 'sync', 'done']} spawnIdx={0} parentLabel="run 1 · key store:A" childLabel="run 2 · key store:A (same key)" parallel />,
 };
@@ -1437,6 +1460,9 @@ export function CodeFlow({ scene }: { scene: string }) {
   // When peeking at another tab, highlight nothing (the active step's lines live elsewhere).
   const noLines: [number, number] = [-1, -1];
   const activeLines = (step.file ?? 0) === viewFile ? step.lines : noLines;
+  // The split pane only shows while its owner tab is in view — a manual peek at the other tab
+  // replaces it with the full file.
+  const split = (step.file ?? 0) === viewFile ? step.split : undefined;
 
   function jump(line: number) {
     const target = data.steps.findIndex((s) => (s.file ?? 0) === viewFile && line >= s.lines[0] && line <= s.lines[1]);
@@ -1491,6 +1517,30 @@ export function CodeFlow({ scene }: { scene: string }) {
             </div>
           )}
           <CodePanel code={files[viewFile]?.code ?? ''} active={activeLines} onJump={jump} />
+          {split && (
+            <div className="cf-anim">
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  margin: '8px 0 4px 2px',
+                  fontSize: 11.5,
+                  fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)',
+                  color: muted,
+                }}
+              >
+                <span aria-hidden style={{ color: accent }}>↳</span>
+                {files[split.file]?.name}
+              </div>
+              <CodePanel
+                code={files[split.file]?.code ?? ''}
+                active={split.lines}
+                onJump={() => setViewFile(split.file)}
+                window={split.window ?? [split.lines[0] - 1, split.lines[1] + 1]}
+              />
+            </div>
+          )}
         </div>
         <div ref={svgWrap} style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', background: stepBg, border: `1px solid ${border}`, borderRadius: 12, padding: '10px 12px' }}>
           {data.render(step)}
