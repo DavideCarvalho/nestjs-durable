@@ -27,6 +27,11 @@ const quote = await ctx.step(this.pricing.fetchQuote, order);
 
 <CodeFlow scene="retries" />
 
+And as a live system — watch the backoff **double** after each failed attempt while the run sits
+suspended:
+
+<RetrySim />
+
 The options are:
 
 - `retries` — maximum number of attempts before the step (and the run) fails. Defaults to 1 (a single try).

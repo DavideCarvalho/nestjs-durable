@@ -16,6 +16,11 @@ separate run living on the lane below.
 
 <CodeFlow scene="dead-letter" />
 
+And as a live system — inject a poison pill and watch it crash-loop, get dead-lettered, and hand off
+to the DLQ handler while the healthy traffic never stops:
+
+<DlqSim />
+
 ## Capping recovery: `maxRecoveryAttempts`
 
 Crash-recovery is **self-healing and periodic**: while a run executes its worker renews a recovery lease,
