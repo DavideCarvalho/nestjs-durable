@@ -1460,9 +1460,18 @@ export function CodeFlow({ scene }: { scene: string }) {
   // When peeking at another tab, highlight nothing (the active step's lines live elsewhere).
   const noLines: [number, number] = [-1, -1];
   const activeLines = (step.file ?? 0) === viewFile ? step.lines : noLines;
-  // The split pane only shows while its owner tab is in view — a manual peek at the other tab
-  // replaces it with the full file.
-  const split = (step.file ?? 0) === viewFile ? step.split : undefined;
+  // Which step's split pane to display: the active step's own, else the nearest step's (previous
+  // wins) shown dimmed — so the split area never sits empty and never shifts the layout; a step
+  // referencing the pane lights it up. Only panes owned by the tab in view qualify.
+  let splitIdx = -1;
+  for (let d = 0; d < data.steps.length && splitIdx < 0; d++) {
+    for (const i of [stepper.index - d, stepper.index + d]) {
+      if (data.steps[i]?.split && (data.steps[i].file ?? 0) === viewFile) {
+        splitIdx = i;
+        break;
+      }
+    }
+  }
 
   function jump(line: number) {
     const target = data.steps.findIndex((s) => (s.file ?? 0) === viewFile && line >= s.lines[0] && line <= s.lines[1]);
@@ -1517,28 +1526,46 @@ export function CodeFlow({ scene }: { scene: string }) {
             </div>
           )}
           <CodePanel code={files[viewFile]?.code ?? ''} active={activeLines} onJump={jump} />
-          {split && (
-            <div className="cf-anim">
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  margin: '8px 0 4px 2px',
-                  fontSize: 11.5,
-                  fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)',
-                  color: muted,
-                }}
-              >
-                <span aria-hidden style={{ color: accent }}>↳</span>
-                {files[split.file]?.name}
-              </div>
-              <CodePanel
-                code={files[split.file]?.code ?? ''}
-                active={split.lines}
-                onJump={() => setViewFile(split.file)}
-                window={split.window ?? [split.lines[0] - 1, split.lines[1] + 1]}
-              />
+          {/* Every step's split pane is stacked in one grid cell (area = tallest pane) so a split
+              appearing or disappearing never shifts the layout; between split steps the nearest
+              pane stays visible but dimmed instead of leaving a hole. */}
+          {data.steps.some((s) => s.split) && (
+            <div style={{ display: 'grid', marginTop: 8 }}>
+              {data.steps.map((s, i) => {
+                const sp = s.split;
+                if (!sp) return null;
+                const shown = i === splitIdx;
+                const lit = shown && i === stepper.index;
+                return (
+                  <div
+                    key={`split-${s.title}-${i}`}
+                    className="cf-anim"
+                    style={{ gridArea: '1 / 1', visibility: shown ? 'visible' : 'hidden', opacity: lit ? 1 : 0.35 }}
+                    aria-hidden={!shown}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        margin: '0 0 4px 2px',
+                        fontSize: 11.5,
+                        fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)',
+                        color: muted,
+                      }}
+                    >
+                      <span aria-hidden style={{ color: accent }}>↳</span>
+                      {files[sp.file]?.name}
+                    </div>
+                    <CodePanel
+                      code={files[sp.file]?.code ?? ''}
+                      active={lit ? sp.lines : noLines}
+                      onJump={() => setViewFile(sp.file)}
+                      window={sp.window ?? [sp.lines[0] - 1, sp.lines[1] + 1]}
+                    />
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
