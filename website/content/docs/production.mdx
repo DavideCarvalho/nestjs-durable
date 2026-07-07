@@ -1,0 +1,283 @@
+---
+title: Running in production
+description: The operational checklist for taking nestjs-durable from a single dev process to a real deployment — durable store and transport, multi-replica crash recovery, the dead-letter cap, graceful shutdown, replay-safe deploys, flow control, tenancy isolation, retention, observability, and schema management.
+---
+
+Everything below works out of the box in a single dev process with zero infrastructure — that's the
+point of the [durability model](/docs/concepts/durability). This page is the other half: what to
+change, and what to double-check, before that process becomes a real deployment with multiple
+replicas, real deploys, and someone else's uptime on the line. Each item says *why* it matters, shows
+the config, and links to the page with the full detail.
+
+## 1. Swap the dev defaults
+
+Two defaults exist purely to make `getting-started` zero-setup: `InMemoryStateStore` and
+`EventEmitterTransport`. Neither survives a process restart.
+
+- **Store.** `InMemoryStateStore` is exactly what it says — an in-memory `Map`. A crash or redeploy
+  loses every run. Swap in a real adapter (MikroORM, TypeORM, Prisma, or Drizzle) before anything
+  durability-sensitive ships. See [Stores](/docs/stores).
+- **Transport.** `EventEmitterTransport` dispatches steps in-process — fine for one process, but a
+  `@Step` handler never runs anywhere else, so there's no cross-process or cross-language worker.
+  Swap in `BullMQTransport` (Redis) once steps need to run in a separate worker (or a
+  [Python worker](/docs/python)). See [BullMQ / Redis](/docs/transports/bullmq).
+
+```ts
+DurableModule.forRootAsync({
+  inject: [MikroORM],
+  useFactory: (orm) => ({
+    store: new MikroOrmStateStore(orm),
+    transport: new BullMQTransport({ connection: { host: 'redis', port: 6379 } }),
+  }),
+});
+```
+
+## 2. Multi-replica correctness
+
+Running more than one replica is safe by design, not by convention — but it's worth knowing *why*
+before you rely on it:
+
+- **Crash recovery is a lease, not a boot-time sweep.** While a run executes, its worker renews a
+  recovery lease every `leaseMs / 2`. A crashed worker stops renewing, so the lease expires and
+  `engine.recoverIncomplete()` reclaims the orphaned run — on **any** instance, not only on the next
+  boot. `leaseMs` defaults to 30 000 (`packages/core/src/engine.ts:226`,
+  `this.leaseMs = deps.leaseMs ?? 30_000` at `packages/core/src/engine.ts:400`) — set it above your
+  longest single resume step, since the lease renews for the run's whole duration, not just its start.
+- **`recoverIncomplete` needs a heartbeat to run periodically, not just at boot.** The NestJS
+  `TimerPoller` calls it every tick (alongside `resumeDueTimers`/`sweepTimeouts`) — this is what turns
+  a 30-second lease into a real self-healing loop instead of a recovery that only fires once per
+  deploy. Make sure **every** operator instance runs the module (and isn't started with
+  `drive: false`) so the poller is actually ticking somewhere.
+- **Exactly one instance per run, by an atomic lease.** `StateStore.tryLockRun` is how the engine
+  picks a single owner for a `running` run even with several replicas racing to recover it — there's
+  no split-brain double-resume.
+
+None of this needs configuration beyond picking `leaseMs` — it's the default behavior of a durable
+store + `DurableModule`. Full mechanism: [Durability & replay](/docs/concepts/durability#deploys-versioning--multiple-instances)
+and [Reliability](/docs/reliability).
+
+## 3. Cap the blast radius: dead-letter poison pills
+
+Self-healing recovery is great until a run is a genuine **poison pill** — a deserialization bug, a
+non-deterministic change, an infinite loop — that crashes the process every single time recovery
+picks it up. Left unbounded, that's a crash loop that takes every other run down with it on every
+boot.
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  maxRecoveryAttempts: 5, // after 5 crash-recoveries, dead-letter the run instead of looping
+  deadLetterWorkflow: 'global-dlq', // fallback DLQ handler for workflows without their own
+});
+```
+
+`maxRecoveryAttempts` is unlimited by default (`packages/nestjs/src/durable.module.ts:241`) — recovery
+retries forever unless you set it. Once a run exceeds the cap, the engine moves it to the terminal
+`dead` status instead of resuming it again: inspectable and retriable from the dashboard, but no
+longer crash-looping the process. Route dead runs to a handler with `engine.onDead`, an inline
+`@DeadLetter()` method, or the module's `deadLetterWorkflow` default. See
+[Dead-letter queue](/docs/reliability/dead-letter).
+
+## 4. Graceful shutdown
+
+On `SIGTERM` you want the process to stop picking up new runs and let in-flight ones finish — not
+kill them mid-step and rely on the lease timeout to recover them a `leaseMs` later.
+
+```ts
+// main.ts
+app.enableShutdownHooks(); // required for Nest's OnApplicationShutdown to fire at all
+```
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  shutdownTimeoutMs: 15_000, // wait up to 15s for in-flight runs to settle before exiting
+});
+```
+
+`WorkflowRegistrar.onApplicationShutdown` calls `engine.drain(this.options.shutdownTimeoutMs)`
+(`packages/nestjs/src/workflow.registrar.ts:67`) — `shutdownTimeoutMs` defaults to 10 000
+(`packages/nestjs/src/durable.module.ts:271`). `drain` sets an internal flag that turns recovery and
+the pending-run poll into no-ops (`packages/core/src/engine.ts:1093`), so no *new* run starts, then
+waits for every currently in-flight execution to settle — up to the timeout — before returning.
+Transports are closed **after** the drain, deliberately, so an in-flight run can still dispatch to and
+await a remote step while it drains (`packages/nestjs/src/workflow.registrar.ts:61-64`). Only after
+`drain` resolves (or times out) does the process actually exit.
+
+What this means for a run that's still executing when the timeout is hit: `drain` just stops
+*waiting* — it doesn't cancel anything. The run keeps running until the process is actually killed;
+if that happens mid-step, the step's result is simply never checkpointed, its recovery lease expires
+on schedule, and another instance's `recoverIncomplete()` picks the run back up and replays it from
+its last completed checkpoint — the same crash-recovery path from #2, just triggered by a deploy
+instead of an unplanned crash. Set `shutdownTimeoutMs` above your typical in-flight run duration to
+make that the rare case rather than the common one.
+
+## 5. Deploys: replay-safety discipline
+
+A workflow body is replayed positionally — the same rule from
+[Durability & replay](/docs/concepts/durability#the-one-rule-workflows-are-deterministic) applies with
+extra force once real traffic is in flight when you deploy. Three layers catch a breaking change at a
+different point:
+
+- **Lint at author time.** `@dudousxd/nestjs-durable-eslint-plugin` flags `Date.now()`,
+  `Math.random()`, `new Date()`, `crypto.randomUUID()` and `performance.now()` inside a `@Workflow`
+  `run` — the most common way a workflow body accidentally goes non-deterministic — before it's ever
+  committed. Wire the rule (or Biome's GritQL plugin) into CI so a slipped call fails the build, not a
+  production replay. See [Linting for non-determinism](/docs/tooling/linting).
+- **Regression-test replay before you ship.** `assertReplayable(register, history)` (from
+  `@dudousxd/nestjs-durable-testing`) replays a captured real run's history against your **current**
+  workflow code and throws `NonDeterminismError` if they diverge — catch a shape-breaking change in
+  CI against a committed fixture, instead of an in-flight run in production. See [Testing](/docs/testing).
+- **Version bumps for breaking shape changes.** A workflow's `@Workflow({ version })` pins every run
+  that starts under it; a run always replays against the version it started on. When a change reorders,
+  inserts, or removes steps, register the new version **alongside** the old one and keep both until
+  every run that started on the old version has reached a terminal state. See
+  [Versioning & determinism](/docs/authoring/versioning).
+
+**Deploy workers and the operator/API together when a workflow or its steps changed.** Once steps run
+in a separate process — a BullMQ worker, or a [Python worker](/docs/python) — that worker's code
+must agree with the operator's on step names and workflow shape for the run it's replaying. A worker
+left running an old build after a step was renamed (without a matching `@Workflow` version bump) can
+pick up a run and surface a `NonDeterminismError`, or just hang — the same failure mode documented as
+a pitfall of a stale local worker in [Tenancy & topologies](/docs/concepts/tenancy#pitfalls). The lint
+rule and `assertReplayable` catch the code-level mistake; keeping workers and operator in lockstep on
+deploy is what keeps a *correct* version bump from still tripping over a stale process that hasn't
+picked it up yet.
+
+## 6. Concurrency and backpressure
+
+Two independent knobs, easy to conflate:
+
+- **Worker/transport concurrency** — how many dispatched tasks *this process* runs at once. On
+  `BullMQTransport`, `concurrency` defaults to `1` (one task at a time); pass a fixed number, or
+  `'adaptive'` to let an `AdaptiveController` self-tune the limit from a latency/backpressure gradient
+  and a RAM ceiling instead of you guessing it. See [BullMQ / Redis](/docs/transports/bullmq#concurrency).
+- **Admission (durable queues)** — a cap or rate limit that `ctx.step` calls opt into via
+  `engine.registerQueue` / the module's `queues` option, independent of how many workers you run. A
+  blocked call re-suspends and the timer poller retries admission later, so the limit survives a
+  crash. See [Flow control](/docs/reliability/flow-control).
+
+```ts
+const transport = new BullMQTransport({
+  connection: { host: 'redis', port: 6379 },
+  concurrency: { mode: 'adaptive', min: 2, max: 32, ramCeilingPct: 85 },
+});
+
+DurableModule.forRoot({
+  store,
+  transport,
+  queues: [{ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } }],
+});
+```
+
+By default, admission accounting is **per engine instance** — a `concurrency: 5` queue admits up to 5
+*per replica*, not 5 fleet-wide. For a true cross-instance cap, pass a `RedisAdmissionBackend` (from
+`@dudousxd/nestjs-durable-admission-redis`) as the module's `admission` option so every replica shares
+the same Redis-backed accounting. See
+[Local vs. global admission](/docs/reliability/flow-control#local-vs-global-admission).
+
+## 7. Isolation between environments
+
+If a dev cluster, a staging environment, and developers' local instances ever point at the **same**
+store/Redis, an un-namespaced instance is not an isolated observer — it's on the exact same queues and
+polling the exact same rows as everyone else, and it *will* steal or drive someone else's runs.
+`namespace` (`DurableModule.forRoot({ namespace })`) partitions both the store's poll paths and the
+transport's queue/stream/key names, so non-interchangeable pools can safely share one backing
+database and Redis:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  namespace: process.env.DURABLE_TENANT, // e.g. 'staging', or a developer's own name
+});
+```
+
+Omitting `namespace` makes the instance an **operator** that drives/recovers/resumes runs of *every*
+namespace — that's the shared cluster's control plane, not something to set on a random local
+process. See [Tenancy & topologies](/docs/concepts/tenancy) for the full operator/tenant model and its
+pitfalls.
+
+## 8. Retention
+
+Without a policy, completed/failed/cancelled runs accumulate in `durable_workflow_runs` (and its
+child tables) forever, and the timer poller's per-tick status scans get linearly slower as that table
+grows. Set a `retention` policy on a driving instance to hard-prune terminal history on an interval:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  retention: {
+    policies: [
+      { statuses: ['completed', 'cancelled'], maxAge: '14d', maxCount: 200 },
+      { statuses: ['failed'], maxAge: '90d' }, // keep failures longer for debugging
+    ],
+  },
+});
+```
+
+This requires a store adapter that implements bulk pruning (the MikroORM adapter does; others no-op
+with a warning). See [Retention](/docs/reliability/retention) for the full policy shape, the sweep
+interval/batch-size defaults, and how "keep" bounds combine.
+
+## 9. Observability
+
+Three views of the same engine lifecycle events, for different jobs:
+
+- **The dashboard** (`@dudousxd/nestjs-durable-dashboard`) is the operating surface — run list, the
+  step graph, retry/cancel/continue actions. It mounts at `/durable` with no auth of its own: **front
+  the base route with your own guard**, or fold `basePath` into a prefix your existing auth/proxy
+  rules already cover. See [Control plane](/docs/observability/dashboard).
+- **OpenTelemetry** (`@dudousxd/nestjs-durable-otel`) turns runs into traces — one root span per run,
+  one child span per step — for the tracing stack you already run. `attachDurableOtel(engine)` is
+  aimed at debugging production latency and correlation, not at operating a run. Note that the root
+  span ends on suspend and does **not** reopen on resume, so a workflow that sleeps or waits on a
+  signal shows post-resume steps as detached spans — use the Telescope watcher instead if you need one
+  trace per run across suspends. See [OpenTelemetry](/docs/observability/otel). The same package also
+  exports `attachDurableMetrics(engine)` — a dependency-free counter/percentile collector
+  (run/step counts by outcome, `p50`/`p95`/max duration) meant to back a `/metrics` route or a
+  scheduled exporter (`packages/otel/src/durable-metrics.ts`).
+- **Telescope** (`@dudousxd/nestjs-durable-telescope`), if you already run
+  `@dudousxd/nestjs-telescope`, surfaces durable runs/steps alongside your app's requests and jobs, and
+  its `durableTelescopeExtension()` adds a health dashboard (success rate, current-state gauges, top
+  failing workflows) driven partly from recent history and partly from **live** store reads, so the
+  current-state gauges aren't bounded by Telescope's prune window. See [Telescope](/docs/observability/telescope).
+
+## 10. Schema management
+
+By default the module calls `store.ensureSchema()` on boot for the MikroORM/TypeORM adapters — zero
+setup in dev. For MikroORM specifically, this runs `ensureMikroOrmDurableSchema`, which is
+**fingerprint-gated**: a marker table (`durable_schema_meta`) records a SHA-256 hash of the durable
+entity metadata last applied, and a steady-state boot does two cheap round-trips (a
+`CREATE TABLE IF NOT EXISTS` plus one PK read) to confirm nothing changed, skipping the expensive
+whole-database `information_schema` introspection entirely. Only a fresh database, an actual entity
+change, or a hand-bumped internal revision constant triggers the full heal — and that heal runs under
+a best-effort cross-pod **advisory lock** (MySQL `GET_LOCK`, Postgres `pg_advisory_lock`,
+`packages/store-mikro-orm/src/schema.ts:174-186`) so concurrent pods don't race the same DDL.
+
+If your environment restricts DDL to migrations (no runtime `CREATE TABLE`/`ALTER TABLE` at all), turn
+auto-schema off and own it explicitly:
+
+```ts
+DurableModule.forRoot({ store, transport, autoSchema: false });
+```
+
+```ts
+// in a migration
+import { ensureMikroOrmDurableSchema } from '@dudousxd/nestjs-durable-store-mikro-orm';
+
+export class AddDurableTables extends Migration {
+  async up() {
+    await ensureMikroOrmDurableSchema(this.getEntityManager().getOrm());
+  }
+}
+```
+
+`autoSchema` defaults to `true` (`packages/nestjs/src/durable.module.ts:219`). The same additive,
+non-destructive update runs either way — the auto-boot path and the migration helper call the exact
+same function, so turning it off changes *when* it runs, not *what* it does. See
+[MikroORM store](/docs/stores/mikro-orm#schema-auto-on-boot-or-your-own-migration) for the full
+mechanism, including the MySQL/MariaDB collation auto-convergence it also performs during a full heal.

@@ -1,6 +1,6 @@
 ---
 title: Workflows & steps
-description: Declaring workflows with @Workflow, the one dispatched ctx.step primitive and its @Step handlers, retries and backoff, fan-out, fatal errors, and sub-process events.
+description: Declaring workflows with @Workflow, the one dispatched ctx.step primitive and its @Step handlers, retries and backoff, fan-out, ctx.continueAsNew for long-running loops, fatal errors, sub-process events, step interceptors, tags, and search attributes.
 ---
 
 ## Workflows
@@ -60,9 +60,11 @@ is a durable checkpoint. Walk a checkout run line by line:
   runtime validation; the method's compile-time types are the only check.
 - `@Step('custom:name')` — an **explicit name** (stable across refactors, or a cross-runtime contract
   with a non-JS worker).
-- `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, jitter?, timeoutMs? })` — optional
-  name override, opt-in runtime **zod** schemas (`input` validates before the method runs, `output`
-  before its result is handed back), and a def-level retry/backoff/liveness policy.
+- `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs? })`
+  — optional name override, opt-in runtime **zod** schemas (`input` validates before the method runs,
+  `output` before its result is handed back), and a def-level retry/backoff/liveness policy.
+  `backoffMaxMs` caps an exponential backoff so it doesn't grow without bound — see
+  [Retries & backoff](/docs/reliability/retries).
 
 ```ts
 @Injectable()
@@ -107,6 +109,51 @@ const [a, b] = await Promise.all([
   ctx.step(this.svc.doB, y),
 ]);
 ```
+
+## Long-running loops — `ctx.continueAsNew`
+
+A workflow that loops forever — polling for new work, or a long-lived accumulator parked on
+`ctx.waitForSignal` — keeps writing a checkpoint on every turn it takes. Left unbounded, that history
+grows forever and every replay gets slower re-reading it. `ctx.continueAsNew(input?)` is the reset: it
+ends the **current** run and hands off to a **fresh execution of the same workflow** with a clean
+history.
+
+```ts
+continueAsNew(input?: unknown): Promise<never>;
+```
+
+It's terminal — the call always throws internally, so code written after it never runs (return its
+result, same as `return`/`throw`). The current run completes normally (no output), and the next
+execution starts under a new, traceable id: `<runId>` → `<runId>~1` → `<runId>~2` … Whatever the next
+iteration needs to keep going must be carried forward explicitly through `input` — the fresh run starts
+with empty history, not a continuation of the old one.
+
+```ts
+@Workflow({ name: 'poll-inbox', version: '1' })
+export class PollInboxWorkflow {
+  constructor(private readonly inbox: InboxService) {}
+
+  async run(ctx: WorkflowCtx, input: { mailbox: string; cursor?: string }) {
+    const { messages, nextCursor } = await ctx.step(this.inbox.fetchSince, {
+      mailbox: input.mailbox,
+      cursor: input.cursor,
+    });
+    for (const message of messages) {
+      await ctx.startChild(ProcessMessageWorkflow, message);
+    }
+    await ctx.sleep('30s');
+    // End this run and start fresh with the new cursor — history resets instead of growing forever.
+    return ctx.continueAsNew({ mailbox: input.mailbox, cursor: nextCursor });
+  }
+}
+```
+
+<Callout title="A waiting parent resolves at THIS run, not the whole chain">
+If a parent is awaiting this workflow via `ctx.child`/`ctx.all`, it resolves as soon as **this** run
+completes — it does not follow the run into its continuation. `continueAsNew` is for standalone
+long-running workflows (pollers, accumulators, per-key entities), not for one a parent needs a final
+result from.
+</Callout>
 
 ## Fatal errors
 
@@ -160,6 +207,53 @@ Rule of thumb: if you want each unit to **retry or replay independently**, make 
 [child workflow](/docs/authoring/child-workflows) when it has its own internal steps you want to see).
 If you only want to **see** what happened inside one durable unit, emit **sub-process events**.
 
+## Step interceptors
+
+For cross-cutting concerns around step execution — timing, structured logging, tracing, error
+enrichment — register an onion-style interceptor instead of repeating the same wrapper in every step
+handler. At the engine level that's `engine.use(interceptor)`, where `interceptor` is
+`(invocation, next) => Promise<unknown>`: call `next()` to run the step body (or the next interceptor
+in the chain) and return — or transform — its result; throw to fail the step. First-registered runs
+outermost.
+
+The NestJS package wraps this as a decorator so an interceptor is just another provider:
+
+```ts
+import { type DurableStepInterceptor, StepInterceptor } from '@dudousxd/nestjs-durable';
+import type { StepInvocation } from '@dudousxd/nestjs-durable-core';
+import { Injectable, Logger } from '@nestjs/common';
+
+@Injectable()
+@StepInterceptor()
+export class StepLoggingInterceptor implements DurableStepInterceptor {
+  private readonly logger = new Logger(StepLoggingInterceptor.name);
+
+  async intercept(invocation: StepInvocation, next: () => Promise<unknown>): Promise<unknown> {
+    const startedAt = Date.now();
+    try {
+      const result = await next();
+      this.logger.log(`${invocation.workflow} ${invocation.stepName} ok in ${Date.now() - startedAt}ms`);
+      return result;
+    } catch (err) {
+      this.logger.warn(`${invocation.workflow} ${invocation.stepName} failed: ${String(err)}`);
+      throw err;
+    }
+  }
+}
+```
+
+`DurableModule` discovers any `@Injectable()` marked with `@StepInterceptor()` on boot and registers it
+with the engine — no manual `engine.use` call needed. `invocation` carries `runId`, `workflow`,
+`stepName`, `seq`, and the 1-based `attempt` number.
+
+<Callout title="Wraps ctx.localStep, not the dispatched ctx.step">
+An interceptor wraps **in-process** step execution — `ctx.localStep`, plus the internal deterministic
+helpers built on it (`ctx.now`, `ctx.sideEffect`, and a `ctx.task`'s dispatch). It does **not** wrap
+`ctx.step`, since that step runs on a worker, not in the engine process. Interceptors also only fire
+when a step **actually executes** — a replayed step returns its recorded output without running the
+body (or the interceptor chain) again.
+</Callout>
+
 ## Tags
 
 Label runs with `tags` to find them later. Static tags on the `@Workflow` apply to every run; per-run
@@ -177,3 +271,64 @@ await this.workflows.start(PipelineWorkflow, input, runId, { tags: ['nightly'] }
 
 The dashboard shows a run's tags in the list and detail, and a tag filter box (clicking a tag filters
 the list). Programmatically, query by tag with `RunQuery.tag` or the dashboard API's `?tag=` param.
+
+## Search attributes
+
+Tags are a flat label; **search attributes** are typed, queryable key/value metadata on a run — an
+`amount`, a `tier`, a `customerId` — for the range/equality filters a tag alone can't express. Set them
+from inside the workflow with `ctx.upsertSearchAttributes(attrs)`:
+
+```ts
+upsertSearchAttributes(attrs: SearchAttributes): Promise<void>;
+
+type SearchAttributes = Record<string, string | number | boolean>;
+```
+
+```ts
+async run(ctx: WorkflowCtx, order: Order) {
+  await ctx.upsertSearchAttributes({ amount: order.total, tier: order.customer.tier });
+  /* ... */
+}
+```
+
+It's a **shallow merge** into the run's `searchAttributes` — keys you don't pass are kept — and it's
+durable and exactly-once: recorded at this position on the first run and skipped on replay, so calling
+it inside a loop doesn't multiply writes. Use it instead of injecting the `StateStore` to mutate the
+run you're executing (`store.updateRun(ctx.runId, …)` becomes `ctx.upsertSearchAttributes(…)`).
+
+### Querying by attribute — `RunQuery`
+
+The dashboard and `store.listRuns` filter on these through `RunQuery`:
+
+```ts
+interface RunQuery {
+  workflow?: string;
+  status?: RunStatus;
+  /** `status IN (...)`, ORed together and ANDed with the other predicates. */
+  statuses?: RunStatus[];
+  /** Exact match against a run's tags. */
+  tag?: string;
+  /** Typed/range predicates over searchAttributes, ANDed together. */
+  attributes?: { key: string; op: 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte'; value: string | number | boolean }[];
+  namespace?: string;
+  limit?: number;
+  offset?: number;
+}
+```
+
+`attributes` is where search attributes pay off — range and inequality predicates a tag can't express,
+ANDed together (pair it with `workflow`/`status`/`tag` to bound the scan on large stores):
+
+```ts
+const highValuePending = await store.listRuns({
+  workflow: 'checkout',
+  status: 'suspended',
+  attributes: [
+    { key: 'amount', op: 'gte', value: 20000 },
+    { key: 'tier', op: 'eq', value: 'pro' },
+  ],
+});
+```
+
+`statuses` is the other predicate worth knowing: use it instead of one `listRuns` call per status when
+you need several — e.g. counting `running` + `suspended` runs in a single scan.

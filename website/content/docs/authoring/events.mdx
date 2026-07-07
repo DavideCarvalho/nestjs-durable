@@ -1,0 +1,225 @@
+---
+title: Event-driven workflows
+description: publishEvent(name, payload) starts every @Workflow({ onEvent }) subscriber and resumes any run parked on ctx.waitForEvent — with optional debounce/batch coalescing for bursty sources.
+---
+
+Not every workflow starts from a direct `start` call, and not every wait is for a signal aimed at
+one specific run. **Events** are name-based pub/sub layered on top of the same suspend machinery:
+`engine.publishEvent(name, payload)` can **start** a fresh run of any workflow subscribed to that
+name, and can **resume** any in-flight run parked on `ctx.waitForEvent(name)` — in one call, fanning
+out to as many runs as care about it (`engine.ts:1382-1421`).
+
+## Publishing an event
+
+Call `engine.publishEvent(name, payload, opts?)` — or `WorkflowService.publishEvent`, the same
+method exposed for DI (`workflow.service.ts:94-95`) — from anywhere: a controller, another
+workflow's step, a queue consumer.
+
+```ts
+@Controller('webhooks')
+export class BillingWebhookController {
+  constructor(private readonly workflows: WorkflowService) {}
+
+  @Post('payment-settled')
+  async onPaymentSettled(@Body() body: { orderId: string; amount: number }) {
+    const touched = await this.workflows.publishEvent('payment.settled', body);
+    return { touched };
+  }
+}
+```
+
+`publishEvent` does two things, and returns the sum of how many runs it touched (`engine.ts:1382-1421`):
+
+1. **Resumes** every in-flight run currently parked on `ctx.waitForEvent(name, { match })` whose
+   `match` the payload satisfies — fan-out, unlike a signal's point-to-point token.
+2. **Starts** a fresh run of every workflow registered with `onEvent: [name]` (via
+   `@Workflow({ onEvent })` or `@OnEvent`), passing `payload` as that run's input.
+
+Publishing is **idempotent per subscriber**: pass `opts.id` to dedupe redeliveries of the same
+logical event. Each started run gets the id `evt:<id>:<workflow>`, so redelivering the same `id`
+finds the existing run instead of starting a second one (`engine.ts:1387-1419`, verified by
+`packages/core/src/event-triggers.spec.ts:42-63`, "is idempotent: redelivering the same event id
+does not start a second run"). Omit `id` and the engine generates a fresh uuid per publish, so every
+call starts its subscribers exactly once (`engine.ts:1401`).
+
+A subscriber whose `validateInput` rejects the payload simply never starts — it does not block the
+other subscribers or the waiters being resumed (`engine.ts:1403-1417`).
+
+## Starting a workflow from an event
+
+Subscribe a `@Workflow` to one or more event names with `onEvent`, or the equivalent `@OnEvent(...)`
+class decorator — the two are merged, so you can use whichever reads better, or both
+(`decorators.ts:81-87`, `decorators.ts:297-317`):
+
+```ts
+@Workflow({ name: 'send-welcome', version: '1', onEvent: ['user.registered'] })
+export class SendWelcomeWorkflow {
+  constructor(private readonly mailer: MailerService) {}
+
+  async run(ctx: WorkflowCtx, input: { email: string }) {
+    await ctx.step(this.mailer.sendWelcome, input.email);
+    return { sent: true };
+  }
+}
+```
+
+```ts
+// Equivalent, class-decorator form — merges with any `onEvent` array on the same class.
+@OnEvent('user.registered', 'user.invited')
+@Workflow({ name: 'audit-signup', version: '1' })
+export class AuditSignupWorkflow {
+  async run(_ctx: WorkflowCtx, input: { email: string }) {
+    /* ... */
+  }
+}
+```
+
+The next time anyone calls `publishEvent('user.registered', { email })`, both workflows above start
+a fresh run with `{ email }` as input (`event-triggers.spec.ts:7-40`, "starts a subscribed workflow
+when its event is published, with the payload as input" / "triggers on any event name in the
+array"). A publish can resume waiters and start subscribers **in the same call** — the returned count
+covers both (`event-triggers.spec.ts:65-84`).
+
+## Coalescing bursts: debounce and batch
+
+A source that fires many events in quick succession — a stream of file uploads, a chatty webhook —
+usually shouldn't start one run per event. `debounce` and `batch` coalesce an `onEvent` subscription
+so the workflow starts once per **burst** instead:
+
+```ts
+export interface WorkflowOptions {
+  // ...
+  /** Start one run only once events have been quiet for this long (resets on each event), with the
+   *  LAST payload. */
+  debounce?: string | number;
+  /** Start one run with ALL payloads (`{ events: [...] }`) once maxSize is reached or `within`
+   *  elapses from the first event. */
+  batch?: { maxSize: number; within: string | number };
+}
+```
+
+(`decorators.ts:88-98`.) Both are built the same way under the hood: instead of starting the target
+workflow directly, the engine routes each published event into a per-workflow **accumulator** — a
+long-lived built-in workflow (`__evt_debounce` / `__evt_batch`, registered once at engine construction,
+`event-accumulators.ts:32-36`) that collects payloads via `signalWithStart`, then `startChild`s the
+real target once, and finally `continueAsNew`s to re-arm itself for the next burst
+(`event-accumulators.ts:38-92`).
+
+### `debounce` — "reindex at most once a minute"
+
+```ts
+@Workflow({
+  name: 'reindex-search',
+  version: '1',
+  onEvent: ['catalog.item-changed'],
+  debounce: '1m',
+})
+export class ReindexSearchWorkflow {
+  constructor(private readonly search: SearchService) {}
+
+  async run(ctx: WorkflowCtx, lastChange: { itemId: string }) {
+    // Runs once the catalog has been quiet for a minute, with only the LAST change payload.
+    await ctx.step(this.search.reindex, lastChange);
+  }
+}
+```
+
+Every `catalog.item-changed` publish resets the quiet-window clock; the accumulator only fires
+`ReindexSearchWorkflow` once nothing new has arrived for `debounce` (`'1m'`, parsed by
+`parseDuration`, `packages/core/src/duration.ts:23-33`), and the run it starts receives the **last**
+payload published during the burst — earlier ones in the same burst are discarded
+(`event-accumulators.ts:53-68`, verified by `packages/core/src/event-batch.spec.ts:11-32`: three
+publishes within the window produce exactly one run, with the last payload).
+
+### `batch` — "process uploads in batches"
+
+```ts
+@Workflow({
+  name: 'process-uploads',
+  version: '1',
+  onEvent: ['upload.completed'],
+  batch: { maxSize: 100, within: '10s' },
+})
+export class ProcessUploadsWorkflow {
+  constructor(private readonly ingest: IngestService) {}
+
+  async run(ctx: WorkflowCtx, batch: { events: Array<{ fileId: string }> }) {
+    await ctx.step(this.ingest.processBatch, batch.events);
+  }
+}
+```
+
+The accumulator collects payloads as `upload.completed` is published and fires
+`ProcessUploadsWorkflow` as soon as **either** condition is met: `maxSize` events have arrived, or
+`within` has elapsed since the first one in the batch — whichever comes first
+(`event-accumulators.ts:70-92`). The target's input is always `{ events: [...] }` — the full array of
+payloads collected in that batch, in publish order (verified by `event-batch.spec.ts:34-50`: three
+`hit` events with `maxSize: 3` produce one run with `{ events: [{ n: 1 }, { n: 2 }, { n: 3 }] }`).
+
+`debounce` and `batch` are mutually exclusive per workflow, and both are declared once on the
+`@Workflow` (or via the plain `WorkflowOptions`) — the registrar translates `debounce: '30s'` into
+`{ mode: 'debounce', windowMs: parseDuration('30s') }`, and `batch: { maxSize, within }` into
+`{ mode: 'batch', maxSize, windowMs: parseDuration(within) }`, both accepting the same duration
+strings as `ctx.sleep` (`workflow.registrar.ts:114-122`).
+
+## Waiting for an event mid-run
+
+Where `onEvent` starts a **new** run, `ctx.waitForEvent<TPayload>(name, opts?)` lets an **already
+running** workflow suspend until a matching event arrives, then resume with its payload
+(`interfaces.ts:1152-1161`, `workflow-ctx.ts:386-423`):
+
+```ts
+@Workflow({ name: 'order', version: '1' })
+export class OrderWorkflow {
+  async run(ctx: WorkflowCtx, input: { orderId: string }) {
+    await ctx.step(this.orders.markAwaitingPayment, input.orderId);
+
+    // Suspends with zero compute until a `payment.settled` publish whose payload has this orderId.
+    const payment = await ctx.waitForEvent<{ amount: number }>('payment.settled', {
+      match: { orderId: input.orderId },
+      timeoutMs: 24 * 60 * 60 * 1000, // 1 day
+    });
+
+    return { orderId: input.orderId, paid: payment.amount };
+  }
+}
+```
+
+`match` is an optional subset of the payload that must deep-equal for this waiter to be resumed —
+`engine.publishEvent` lists every waiter registered for `name`, and only signals the ones whose
+`match` keys equal the corresponding payload values (`events.ts:34-41`, `engine.ts:1390-1398`).
+**Omit `match` and the waiter is a broadcast**: it resumes on *any* payload published under that name
+(verified by `events.spec.ts:31-45`, "a no-match waiter receives any event of that name"). With
+`match`, a publish only reaches the runs it concerns — two `OrderWorkflow` runs waiting on different
+`orderId`s each resume only from the `payment.settled` publish carrying their own id
+(`events.spec.ts:7-29`).
+
+Pass `{ timeoutMs }` to bound the wait — same shape as `ctx.waitForSignal`: if the deadline passes
+first, the call throws `SignalTimeoutError` (`errors.ts:40-49`) instead of waiting forever
+(`workflow-ctx.ts:398-422`). Omit it to wait indefinitely, consuming zero compute either way. The
+same determinism cost as any bounded wait applies: an unbounded `waitForEvent` consumes one logical
+position, a bounded one consumes two (deadline + wait) — see the note under
+[Timeouts](/docs/concepts/sleep-and-signals#timeouts).
+
+Under the hood, `waitForEvent` is a `waitForSignal` whose token encodes the event name **and** the
+match criteria (base64-encoded so they never collide with the token's `:` delimiter,
+`events.ts:1-23`) — `engine.publishEvent` finds candidate waiters by listing every token with that
+name's prefix, then checks each one's decoded `match` against the payload before signalling it
+(`events.ts:25-32`, `engine.ts:1392-1398`).
+
+## Events vs signals vs updates
+
+All three suspend a run with zero compute until something external resumes it, but they differ in
+addressing and delivery:
+
+| | Addressing | Delivery | Typical use |
+|---|---|---|---|
+| **Event** (`ctx.waitForEvent` / `engine.publishEvent`) | Name + optional `match` filter | Fan-out — one publish can resume many waiters **and** start many `onEvent` subscribers | Something happened that any number of runs (or none yet) might care about — a domain event, a webhook that many orders could be waiting on |
+| **Signal** (`ctx.waitForSignal` / `engine.signal`) | Exact token you choose | Point-to-point — resumes at most one waiter, buffered if it arrives early | A wakeup aimed at one specific run; see [Sleep & signals](/docs/concepts/sleep-and-signals) |
+| **Update** (`ctx.onUpdate` / `engine.update`) | Run-scoped name | Point-to-point, with a validator that can reject before the run is touched | Steering one specific run with a rejectable business rule; see [Queries & updates](/docs/authoring/queries-and-updates) |
+
+An event is a signal with the addressing inverted: a signal's token is chosen by the caller to hit
+one run, while an event's `name` is a stable, shared channel that any number of runs can subscribe
+to (by parking on `waitForEvent`) or be *created by* (via `onEvent`) — `match` narrows a broadcast
+down to the runs a given publish actually concerns. Reach for an update instead when the caller
+needs synchronous, validated rejection of a bad delivery — events and signals both always land.

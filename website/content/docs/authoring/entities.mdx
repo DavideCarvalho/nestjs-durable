@@ -1,0 +1,170 @@
+---
+title: Durable entities
+description: Keyed, long-lived virtual objects — @Entity + @On declare per-key state and its operations; ctx.callEntity/signalEntity or EntityService drive them, serialized per key, exactly once.
+---
+
+A workflow models a **process** — it has a beginning and (usually) an end. An entity models
+**state** — a shopping cart, an account balance, a device's last-known status — that outlives any
+single process and is addressed by a key rather than a run id. `nestjs-durable` gives you that as a
+**durable entity**: a keyed virtual object whose operations run **serialized per key** over
+**durable state**, the same idea as Azure Durable Functions' entities or a Temporal-style actor, built
+on this library's own suspend model rather than a separate primitive.
+
+Under the hood an entity is not a new mechanism — it is one long-lived **workflow run per key**
+(`entity:<name>:<key>`) that loops on `waitForSignal`, fed by `signalWithStart` calls from every
+caller (see [Sleep & signals](/docs/concepts/sleep-and-signals)). That loop, and the state it carries
+across iterations, is what `@Entity` and `@On` let you declare instead of hand-write.
+
+## When to use an entity vs a workflow
+
+| | Workflow | Entity |
+| --- | --- | --- |
+| Models | a process (has a start and an end) | long-lived, addressable state |
+| Identity | a run id | a stable key (`userId`, `cartId`, `deviceId`, ...) |
+| Lifetime | finishes | indefinite — one run per key, forever |
+| Driven by | `ctx.child` / `ctx.startChild` / `engine.start` | `ctx.callEntity` / `ctx.signalEntity` / `EntityService` |
+| Good fit | checkout, onboarding, a batch job | a cart, a counter, an account balance, a device twin |
+
+Reach for an entity when you keep re-deriving the same per-key state from scratch on every request
+(loading a row, mutating it, saving it back) and need that read-mutate-write to be **serialized** so
+two concurrent callers can't race on the same key.
+
+## Authoring an entity
+
+Mark an `@Injectable()` class `@Entity({ name })`, and mark each operation method `@On(op)`. The class
+itself **is** the state: its instance fields are what's persisted, and a fresh instance (built with no
+constructor arguments) is the initial state for a key that hasn't seen an op yet.
+
+```ts
+import { Entity, On } from '@dudousxd/nestjs-durable';
+import { Injectable } from '@nestjs/common';
+
+interface Item {
+  sku: string;
+  qty: number;
+}
+
+@Entity({ name: 'cart' })
+@Injectable()
+export class Cart {
+  items: Item[] = [];
+
+  @On('add') add(item: Item) {
+    this.items.push(item);
+  }
+
+  @On('remove') remove(sku: string) {
+    this.items = this.items.filter((item) => item.sku !== sku);
+  }
+
+  @On('list') list() {
+    return this.items;
+  }
+}
+```
+
+Register it as a provider on the module like any other injectable — `WorkflowRegistrar` discovers it
+at boot and registers it on the engine as `engine.registerEntity(name, ...)`:
+
+```ts
+@Module({
+  imports: [DurableModule.forRoot({ store, transport })],
+  providers: [Cart],
+})
+export class CartModule {}
+```
+
+Because the class **is** the durable state, keep it pure: fields only, no injected dependencies, no
+external calls inside an `@On` method. A fresh `new Cart()` must be a valid starting point for any
+key, and the fields must serialize cleanly (they're saved to the store between ops).
+
+## Calling an entity from a workflow
+
+Two calls on `WorkflowCtx`, mirroring `ctx.child`/`ctx.startChild` for workflows:
+
+- **`ctx.callEntity(name, key, op, arg?)`** — dispatch the op and suspend (zero compute) until the
+  entity's handler returns, then resume with its result.
+- **`ctx.signalEntity(name, key, op, arg?)`** — dispatch the op and move on immediately; you get no
+  result, only the guarantee that it will run.
+
+```ts
+@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow {
+  async run(ctx: WorkflowCtx, order: { userId: string; item: Item }) {
+    // Fire-and-forget: the workflow doesn't need the cart's new state to proceed.
+    await ctx.signalEntity('cart', order.userId, 'add', order.item);
+
+    // Await a result: suspend until the entity replies with the current list.
+    const items = await ctx.callEntity<Item[]>('cart', order.userId, 'list');
+    return { itemCount: items.length };
+  }
+}
+```
+
+Both dispatches are checkpointed at the point they're called, so replay never re-dispatches the op —
+each call happens exactly once from the workflow's side, regardless of how many times the run replays.
+
+## Driving an entity from outside a workflow
+
+Inject `EntityService` anywhere in your Nest app — a controller, another service — to signal an
+entity or read its state without going through a workflow:
+
+```ts
+@Controller('cart')
+export class CartController {
+  constructor(private readonly entities: EntityService) {}
+
+  @Post(':userId/items')
+  async addItem(@Param('userId') userId: string, @Body() item: Item) {
+    await this.entities.signal('cart', userId, 'add', item);
+    return { ok: true };
+  }
+
+  @Get(':userId')
+  async getCart(@Param('userId') userId: string) {
+    const state = await this.entities.getState<{ items: Item[] }>('cart', userId);
+    return { items: state?.items ?? [] };
+  }
+}
+```
+
+`EntityService` only exposes `signal` and `getState` — there is no external `call` that awaits a
+result; block on an entity's *return value* from outside a workflow by polling `getState` (as above),
+since a plain HTTP handler has nothing to suspend the way a workflow run does.
+
+## Reading state — `getState` / `getEntityState`
+
+`entities.getState(name, key)` (or `engine.getEntityState(name, key)` directly) returns the entity's
+current state for that key, or `undefined` if the key has never received an op. It reads the latest
+value the entity published after its last completed op — the same "publish + side-effect-free read"
+shape as `ctx.setEvent`/`engine.getEvent` (see [Queries & updates](/docs/authoring/queries-and-updates)):
+reading never disturbs the entity's run.
+
+## Guarantees
+
+- **Serialized per key.** Every op for a given `(name, key)` is delivered on the same signal token, and
+  signals buffer FIFO per token — so ops for one key always run one at a time, in the order they were
+  dispatched. Ops for *different* keys are fully independent and run concurrently.
+- **Exactly once.** Each op is delivered via `signalWithStart`, which starts the entity's run if it
+  doesn't exist yet (idempotent) and then signals it. Signal buffering means an op sent before the
+  entity's run is ready to receive it is never dropped — it's queued and consumed the instant the run
+  reaches its wait point.
+- **Durable across restarts and replay.** The handler's mutation and the resulting state are captured
+  in a single checkpoint per op, so a crash mid-op can't leave state saved without the "op complete"
+  marker (or vice versa) — replay restores the checkpointed state rather than re-running the handler.
+- **Ordering is per key only.** There is no cross-key ordering guarantee — don't rely on two different
+  entities observing operations in the same relative order.
+
+## Pitfalls
+
+- **No DI in the entity class.** The class instance is serialized durable state; it must be
+  constructible with no arguments and safe to persist. Reach for injected services from the
+  *workflow* or *controller* driving the entity, not from inside an `@On` method.
+- **`callEntity` suspends the caller.** Awaiting it from a workflow costs nothing while parked, but it
+  does mean the calling workflow won't proceed until the entity's op completes — for pure fire-and-forget
+  writes, use `signalEntity` instead so the workflow isn't gated on the entity's turnaround.
+- **There's no external "call and await."** `EntityService` only signals and reads state; if a
+  non-workflow caller needs the *result* of an op (not just the latest state), poll `getState` after
+  signaling, or wrap the call in a small workflow that uses `ctx.callEntity`.
+- **One handler per op name, and it must exist.** Dispatching an op the class has no `@On` for throws
+  a fatal error in the entity's run; there's no default/fallback handler.

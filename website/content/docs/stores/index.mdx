@@ -60,3 +60,97 @@ migration snippets. It only ever adds the durable tables — it never touches yo
 The **Prisma** and **Drizzle** adapters have no auto-schema: their ORMs already own your schema and
 migration history, so you create the durable tables with `prisma migrate` / `drizzle-kit` (the
 `autoSchema` option is a no-op for them).
+
+## Column naming
+
+All four adapters agree on physical column names for the `durable_*` tables so a run written by one
+is readable by another. The MikroORM and TypeORM adapters expose this as an explicit choice —
+`durableEntities({ naming })` — rather than leaving it to the host ORM's naming strategy, which is
+what silently diverged the adapters in the past:
+
+```ts
+import { durableEntities } from '@dudousxd/nestjs-durable-store-mikro-orm'; // or -typeorm
+
+entities: durableEntities({ naming: 'snake_case' }); // default; or 'preserve', or a (property) => string fn
+```
+
+`'snake_case'` is the default and canonical (matched by the Prisma and Drizzle schemas too).
+`'preserve'` keeps the camelCase property name verbatim — only for reading a table an old,
+unpinned TypeORM/Prisma adapter produced. See the [MikroORM](/docs/stores/mikro-orm#column-naming)
+and [TypeORM](/docs/stores/typeorm#column-naming) pages for the full signature.
+
+## Exactly-once DB writes with `ctx.transaction`
+
+A plain `ctx.step` is at-least-once: if the process dies after the step's business write commits but
+before its checkpoint does, the step re-runs on replay. `ctx.transaction(name, fn)` closes that gap by
+writing the business row **and** the checkpoint in the same store transaction, so they commit or fail
+together:
+
+```ts
+await ctx.transaction('create-order', async (tx) => {
+  await this.orders.insert(tx, { id: orderId, total }); // your write, on the store-native tx handle
+  // checkpoint commits atomically with the write above — never done-but-unrecorded
+});
+```
+
+`fn` receives the store-native transaction handle (a TypeORM/MikroORM `EntityManager`, a Prisma tx
+client, or a Drizzle tx) — run your own writes on it, not on your app's regular connection. Needs a
+SQL store that implements `transaction()` (all four bundled adapters do); throws on a store that
+doesn't (`packages/core/src/interfaces.ts:1112`).
+
+## Encrypting payloads
+
+`CodecStateStore` wraps ANY store and runs run/step **payloads** (`input`/`output`) through a
+`PayloadCodec` — encoded on write, decoded on read — so they're never persisted in the clear. Metadata
+the dashboard and queries need (id, status, workflow, tags, timestamps, the structured `error`) is
+left untouched:
+
+```ts
+import { CodecStateStore } from '@dudousxd/nestjs-durable-core';
+
+const store = new CodecStateStore(new TypeOrmStateStore(dataSource), {
+  encode: (value) => aesEncrypt(value),
+  decode: (value) => aesDecrypt(value),
+});
+
+DurableModule.forRoot({ store, transport });
+```
+
+Both `encode`/`decode` are synchronous — wrap an async KMS call yourself if you need one. It's
+adapter-agnostic, so it composes with any of the four stores.
+
+## Retention & pruning
+
+Terminal runs (`completed`, `failed`, `cancelled`, `dead`) otherwise accumulate forever. The
+`retention` module option sweeps them on an interval, hard-deleting whatever falls outside your
+policies:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  retention: {
+    sweepInterval: '1m',
+    batchSize: 1_000,
+    policies: [
+      { statuses: ['completed', 'cancelled'], maxAge: '14d', maxCount: 200 },
+      { statuses: ['failed'], maxAge: '90d' }, // keep failures longer for debugging
+    ],
+  },
+});
+```
+
+Each `RetentionPolicy` targets a disjoint set of terminal statuses; a run is kept only while it
+satisfies every bound you set on its status (`maxAge`, `maxCount`, or both — the most-restrictive
+wins) and is pruned the moment it violates one. `sweepInterval: 0` runs the sweep once on boot only.
+Pruning needs the store to implement `pruneTerminalRuns` — optional on `StateStore`, so a store
+without it no-ops with a warning instead of failing boot.
+
+<Callout type="warn">
+  **`withScope` is MikroORM-only.** Multi-tenant setups can turn on `scopeReads: true` (with
+  `namespace` set) to confine the operator's own reads to one tenant. The module applies this by
+  asking the store for a scoped view via an optional `withScope(scope)` capability — today only the
+  MikroORM adapter implements it. Against TypeORM, Prisma or Drizzle, `scopeReads` silently has no
+  effect: the store keeps returning every namespace's runs. If you need tenant-scoped reads on one of
+  those adapters, scope the query yourself rather than relying on `scopeReads`.
+</Callout>

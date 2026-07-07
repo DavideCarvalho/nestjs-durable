@@ -25,6 +25,21 @@ lifecycle event (`run.started`, `step.completed`, `run.completed`, `run.failed`,
 `workflow:<name>`, `run:<id>`, `kind:<step-kind>`, and `failed` on failures — so you can filter
 and group durable activity in the Telescope UI.
 
+It also **trace-groups** a run: it opens a root span per run and records every entry for that run
+inside the span's OTel context (each step gets its own child span), so a whole workflow's entries
+share one `traceId` and read as a single trace on Telescope's Traces page. When the host has no
+OTel SDK the spans are no-ops and entries simply carry no trace, same as before. See
+[OpenTelemetry](/docs/observability/otel) for the one boundary this shares with the OTel bridge —
+a run that suspends and resumes splits across more than one `traceId`.
+
+<Callout title="No-ops on a store-less tenant worker">
+A thin, DB-less tenant deployment (see [tenancy](/docs/concepts/tenancy)) binds `WorkflowEngine` to
+a start-only client facade that proxies run starts over the transport and has no local lifecycle
+event stream — the events live on the operator holding the store. The watcher detects this (no
+`.subscribe` method on the resolved engine) and skips registration instead of throwing, so it's
+safe to wire into every tenant's `TelescopeModule` regardless of topology.
+</Callout>
+
 ## Workflows dashboard
 
 The watcher gives you per-event entries; the **extension** adds a dedicated health view on top of
@@ -39,33 +54,59 @@ import { TelescopeModule } from '@dudousxd/nestjs-telescope';
 import { durableTelescopeExtension } from '@dudousxd/nestjs-durable-telescope';
 
 TelescopeModule.forRoot({
-  extensions: [durableTelescopeExtension({ runHref: '/durable/runs/{runId}' })],
+  extensions: [
+    durableTelescopeExtension({
+      runHref: '/durable/runs/{runId}',
+      recentFailuresWindowMs: 24 * 60 * 60 * 1000, // default: only show failures from the last 24h
+    }),
+  ],
 });
 ```
 
 The extension **bundles the `DurableTelescopeWatcher`**, so you still get the per-event entries
 described above — don't also pass the watcher under `watchers` when you use the extension. It adds
-the `durable` entry type, the `durable.workflows` dashboard, and three data providers.
+the `durable` entry type, the `durable.workflows` dashboard, and ten data providers.
 
-`runHref` is an optional URL template (default `'/durable/runs/{runId}'`) used to deep-link a failed
-run out to the [durable dashboard](/docs/observability/dashboard); `{runId}` is substituted per row.
+Both options are optional:
 
-The dashboard shows:
+- `runHref` — a URL template (default `'/durable/runs/{runId}'`) used to deep-link a failed run out
+  to the [durable dashboard](/docs/observability/dashboard); `{runId}` is substituted per row.
+- `recentFailuresWindowMs` — how far back the "Stuck runs" table looks (default 24h); a healthy
+  system then shows an **empty** table instead of surfacing days-old failures as a live incident.
+  Pass `0` to disable the window and show all failed/dead runs.
 
-- **Success rate (%)** and **Failed in window** — headline rollups over recent history.
-- **Current-state gauges** — **Dead now** / **Suspended now** / **Running now** / **Pending now**.
-- **Top failing workflows** — a bar of the workflows producing the most failures.
-- **Recent failed runs** — a table whose **Run** column deep-links each run via `runHref`.
+The dashboard is laid out in four sections:
 
-### Data sources
+- **Health** — **Success rate** (gauge), **Duration p95**, **Backlog** (pending-run count), and
+  **Throughput** (completed runs/hour, with a trend spark).
+- **Needs attention** — **Top failing workflows** (bar of the workflows producing the most
+  failures), **Stuck runs** (recent failed/dead runs as a table, deep-linked via `runHref`, bounded
+  by `recentFailuresWindowMs`), and **Worker health** (every worker group with its queue depth and
+  live-worker count, `STARVED` groups — backlog with zero live workers — sorted first).
+- **Workers** — one row per **live worker**, flattened from every group's heartbeats: concurrency
+  mode (fixed/adaptive) and limit, in-flight saturation, RAM %/CPU %, throughput, p95 latency, and
+  the adaptive controller's last limit change (`grow`/`shrink`/`ram_ceiling`/…). A worker from an
+  older SDK with no reported status still lists, with `—` in the measured columns.
+- **Trends** — **Runs over time** (stacked done/failed), **Duration distribution** (a histogram with
+  p50/p95/p99 markers), and **Runs by state** (a donut of running/pending/cancelling/completed/
+  failed/dead counts).
 
-The two kinds of panel read from two different places:
+### Data providers
 
-- **Rollups** (success rate, failed count, top failing workflows) are computed from the `durable`
-  entries Telescope already captured — so they're the **recent-history** view, bounded by Telescope's
-  prune window.
-- **Current-state gauges** (dead / suspended / running / pending **now**) are read **live** from the
-  durable store via `listRuns`, so they're exact and **not** limited by the prune window.
+Ten providers back the panels above, reading from three different sources:
+
+- **Telescope's own captured entries** (recent-history, bounded by Telescope's prune window):
+  `durable.timeseries` (success rate / failed count / top failures), `durable.duration` (p50/p95/p99
+  + histogram), `durable.runsOverTime`, `durable.successRate`, `durable.throughput`.
+- **The live durable store** (`listRuns`, exact and unbounded by the prune window):
+  `durable.state` (a single status count, e.g. Backlog), `durable.recentFailures` (the Stuck runs
+  table), `durable.stateBreakdown` (the Runs-by-state donut).
+- **The live engine/worker layer** (`WorkflowEngine.workerHealth()` — empty when the transport can't
+  introspect it; only the BullMQ transport currently implements `groupHealth`):
+  `durable.workerHealth` (per-group backlog + live-worker rows; query it with
+  `{ metric: 'starvedCount' }` for a single stat — the count of groups with backlog and zero live
+  workers) and `durable.workerStatus` (per-worker `WorkerStatus` — the same live adaptive-concurrency
+  snapshot the [dashboard](/docs/observability/dashboard) surfaces).
 
 Telescope is the health and visibility view, and deep-links out: **per-run actions** (retry, cancel)
 and the **workflow graph** stay in the [durable dashboard](/docs/observability/dashboard). For the

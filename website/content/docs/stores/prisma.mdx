@@ -124,3 +124,20 @@ Unlike the MikroORM and TypeORM adapters, this one has **no auto-schema** — Pr
 schema and migration history. The `autoSchema` option is a no-op here; the tables exist because
 `prisma migrate` created them from the models above. Treat the models as the source of truth and
 evolve them through Prisma like any other.
+
+<Callout type="warn">
+  **`ctx.transaction` needs Prisma's interactive transactions.** The adapter's `transaction()` is
+  implemented with `this.db.$transaction(async (tx) => …)` — Prisma's *interactive* transaction API.
+  That's a hard requirement, not just the recommended path: it breaks under a Prisma configuration
+  that doesn't support interactive transactions in the same process, such as **Accelerate** or the
+  **Data Proxy**. If you're on one of those, `ctx.transaction` isn't usable through this adapter —
+  stick to `ctx.step` for that work.
+</Callout>
+
+<Callout type="warn">
+  **Tag filtering isn't supported on SQLite.** `listRuns({ tag })` compiles to a Prisma
+  `array_contains` predicate against the `tags` JSON column, which Prisma's SQLite connector doesn't
+  support. It works on Postgres/MySQL. The store's own conformance suite reflects this: it disables
+  the tag-filter case for the Prisma + SQLite combination and only asserts it against a real
+  Postgres/MySQL database. If you're on SQLite with Prisma, avoid filtering `listRuns` by `tag`.
+</Callout>

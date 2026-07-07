@@ -1,13 +1,34 @@
 ---
 title: Flow control
-description: "Durable queues for dispatched steps — cap concurrency and enforce fixed-window rate limits with engine.registerQueue (or the module's queues option) and ctx.step(handler, input, { queue }). A call that can't be admitted re-suspends and the timer poller retries admission, so the limit survives crashes."
+description: "Every knob that throttles or prioritizes dispatched steps: durable queues (concurrency caps + fixed-window rate limits) via engine.registerQueue, per-call priority + fairnessKey on ctx.step, worker/transport concurrency (fixed or adaptive), and RedisAdmissionBackend for a fleet-wide global cap."
 ---
 
-Steps fan out work to workers, and sometimes you need to *throttle* that fan-out: a third-party API
-allows only N requests per minute, or a downstream service falls over above some concurrency. Flow-control
-queues cap how much work `ctx.step` admits at once — a concurrency limit, a fixed-window rate limit, or both
-— and, crucially, they do it **durably**: a call that can't be admitted doesn't busy-wait or hold the run in
-memory, it re-suspends and is retried by the timer poller, so the limit survives a crash.
+Steps fan out work to workers, and sometimes you need to *throttle* or *prioritize* that fan-out: a
+third-party API allows only N requests per minute, a downstream service falls over above some
+concurrency, an urgent job shouldn't wait behind a backlog of routine ones, or one noisy tenant
+shouldn't starve the rest. `nestjs-durable` gives you four independent levers for this:
+
+- **Queues** — register a named cap (`concurrency` and/or `rateLimit`) that `ctx.step` calls opt into.
+- **Per-call admission hints** — `priority` and `fairnessKey` on the `ctx.step(..., opts)` call, which
+  decide who gets the next slot when a queue is contended.
+- **Worker/transport concurrency** — how many dispatched tasks *this process* runs at once, fixed or
+  self-tuning (adaptive).
+- **Admission scope** — in-process (per engine instance) by default, or fleet-wide across every
+  replica via `RedisAdmissionBackend`.
+
+All four are durable in the sense that matters here: a call that can't be admitted doesn't busy-wait or
+hold the run in memory — it re-suspends, and the timer poller retries admission later, so the limit
+survives a crash.
+
+<CodeFlow scene="flow-control" />
+
+The walkthrough above dispatches one step through a queue with both `priority` and `fairnessKey` set.
+When the queue has a free slot, the call is admitted immediately. When it's contended, the admission
+controller picks the rightful next waiter in this order: higher `priority` first, then (for a queue
+configured with `fairness: 'key'`) the least-recently-served `fairnessKey`, then arrival order as the
+final tiebreak — the same `better()` comparison in `packages/core/src/queue.ts` that both the built-in
+in-process controller and `RedisAdmissionBackend` implement. Nothing is held in memory while a call
+waits: the run just re-suspends with a retry time and comes back later.
 
 ## Registering a queue
 
@@ -15,11 +36,15 @@ Register a queue on the engine with `engine.registerQueue`, or declare it on the
 option (which registers it at startup). A `QueueConfig` has:
 
 - `name` — the queue's name, referenced from `ctx.step(handler, input, { queue: name })`.
-- `concurrency` — the maximum number of steps in flight at once for this queue. Omit for unlimited.
+- `concurrency` — the maximum number of steps in flight at once for this queue, on this engine instance.
+  Omit for unlimited.
 - `rateLimit` — a fixed-window rate limit of `{ limit, periodMs }`: at most `limit` admissions per
-  `periodMs`. Omit for unlimited.
-- `retryMs` — how long (ms) a concurrency-blocked call waits before re-checking for a free slot. Defaults to
-  1000.
+  `periodMs`. Checked before concurrency, and unaffected by priority/fairness. Omit for unlimited.
+- `retryMs` — how long (ms) a blocked call waits before re-checking for a free slot. Defaults to 1000.
+- `fairness` — `'key'` round-robins admission across distinct `fairnessKey`s so one key can't monopolize
+  the budget; `'fifo'` (default) is plain first-come.
+- `order` — the arrival tiebreak among otherwise-equal waiters (same priority, same fairness rank):
+  `'fifo'` (default, earliest first) or `'lifo'` (most recent first, a stack).
 
 ```ts
 DurableModule.forRoot({
@@ -30,8 +55,13 @@ DurableModule.forRoot({
     { name: 'shipping-api', rateLimit: { limit: 100, periodMs: 60_000 } },
     // Cap a heavy downstream to 5 concurrent steps, re-checking every 500ms when full:
     { name: 'pdf-render', concurrency: 5, retryMs: 500 },
-    // Both at once: at most 10 in flight AND no more than 1000/hour:
-    { name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } },
+    // Both at once, PLUS fair admission across tenants under contention:
+    {
+      name: 'emails',
+      concurrency: 10,
+      rateLimit: { limit: 1000, periodMs: 3_600_000 },
+      fairness: 'key',
+    },
   ],
 });
 ```
@@ -42,9 +72,33 @@ The equivalent imperative form, when you hold the engine directly:
 engine.registerQueue({ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } });
 ```
 
+Registering the same name again replaces the queue's config.
+
+## Concurrency caps
+
+`concurrency` bounds how many admitted-but-not-yet-settled steps a queue allows at once, on this engine
+instance. A slot is held from the moment a call is admitted until the step's **result lands** (or the run
+is cancelled) — so accounting tracks real in-flight work, not just dispatch — and released for the next
+blocked waiter to claim on its next poll.
+
+```ts
+{ name: 'pdf-render', concurrency: 5, retryMs: 500 }
+```
+
+## Rate limits
+
+`rateLimit` is a fixed window: at most `limit` admissions per `periodMs`. It's checked first, ahead of
+concurrency and any priority/fairness ordering — a queue that's rate-limited blocks every call equally
+regardless of priority, until the window rolls over.
+
+```ts
+{ name: 'shipping-api', rateLimit: { limit: 100, periodMs: 60_000 } }
+```
+
 ## Using a queue from a workflow
 
-Subject a step dispatch to a queue by naming it in the call options:
+Subject a step dispatch to a queue by naming it in the call options — and, optionally, hint how it should
+be admitted when the queue is contended:
 
 ```ts
 @Injectable()
@@ -60,33 +114,142 @@ export class NotificationsWorker {
   }
 }
 
-// in the workflow — this dispatch is admitted through the `emails` queue:
-const sent = await ctx.step(this.notify.sendEmail, { to: order.email, template: 'receipt' }, { queue: 'emails' });
+// in the workflow — admitted through the `emails` queue, urgent jobs jump the line,
+// and each tenant gets a fair share of the slot when the queue is full:
+const sent = await ctx.step(this.notify.sendEmail, job, {
+  queue: 'emails',
+  priority: job.urgent ? 10 : 0,
+  fairnessKey: job.tenantId,
+});
+```
+
+## Priority
+
+`priority` on the `ctx.step` call opts (`StepDispatchOpts.priority`) is admission priority *within a
+queue*: higher is admitted first when a slot is contended (default `0`); it has no effect without a
+`queue`. The same value also rides along as *broker* priority: for a transport that supports job
+priority (BullMQ), it's carried onto the dispatched `RemoteTask` and translated into a BullMQ job
+`priority`, so an urgent task can jump ahead of already-enqueued lower-priority ones at the worker's own
+queue too — not just at the flow-control admission gate. Transports without broker priority support
+silently ignore it.
+
+```ts
+await ctx.step(this.notify.sendEmail, job, { queue: 'emails', priority: job.urgent ? 10 : 0 });
+```
+
+## Fairness
+
+`fairnessKey` on the call opts is the fairness bucket — e.g. a tenant id — used when the queue is
+registered with `fairness: 'key'`. The queue round-robins across distinct keys (the least-recently-served
+key wins the next contended slot), so one busy key can't monopolize the budget. It defaults to the run id
+when omitted, so unrelated runs are still fair to each other even if you never set it explicitly.
+Priority always wins over fairness; fairness only breaks ties *within* the same priority tier, and arrival
+order (`order: 'fifo' | 'lifo'`) breaks whatever's left.
+
+```ts
+// queue config: opt into fairness
+{ name: 'emails', concurrency: 10, fairness: 'key' }
+
+// call site: the fairness bucket
+await ctx.step(this.notify.sendEmail, job, { queue: 'emails', fairnessKey: job.tenantId });
 ```
 
 ## How admission works (and why it's durable)
 
-When a queued call is reached, the engine asks the queue's controller to admit one unit of work. If the
-queue is at its concurrency limit or has exhausted its rate-limit window, admission is **blocked** and the
-controller returns the epoch-ms time at which admission may next succeed (the start of the next rate-limit
-window, or `now + retryMs` for a concurrency block). The engine does **not** dispatch: it re-suspends the run
-with that retry time as its `wakeAt`. The durable-timer poller, which already wakes suspended runs whose
-timers come due, retries admission when the time arrives — and if it's still blocked, the run simply
-re-suspends again.
+When a queued call is reached, the engine asks the queue's admission backend to admit one unit of work.
+If the queue is at its concurrency limit or has exhausted its rate-limit window, admission is **blocked**
+and the backend returns the epoch-ms time at which admission may next succeed. The engine does **not**
+dispatch: it re-suspends the run with that retry time as its `wakeAt`. The durable-timer poller — the
+same one that wakes suspended runs whose timers come due — retries admission when the time arrives, and
+if it's still blocked, the run simply re-suspends again.
 
 Because the retry time is persisted on the run and the poller drives it, the limit is durable: a process
 that crashes while runs are parked waiting for a slot loses nothing — the parked runs come back when their
 timers are due. No run is ever held in memory waiting for a slot.
 
-A slot is held from the moment a call is admitted until the step's **result lands** (or the run is
-cancelled), at which point the slot is released and the next blocked run can be admitted on its next poll.
-This ties the concurrency accounting to the real in-flight work, not just to dispatch.
+## Worker / transport concurrency
 
-## Scope: per engine instance
+Flow-control queues throttle *admission* into a dispatch; worker concurrency throttles how many
+already-dispatched tasks *this process* executes at once. It's a transport-level option — on
+`BullMQTransport`, `concurrency` (a `ConcurrencyOption`) is the BullMQ Worker's own concurrency for the
+tasks it consumes:
 
-Flow-control accounting is **per engine instance** — the DBOS `workerConcurrency` tier. For the common
-single-orchestrator deployment this is exactly what you want, and it's correct without any cross-process
-coordination. If you run several orchestrator replicas, each enforces the limit independently (so a
-`concurrency: 5` queue admits up to 5 *per replica*). A truly global, cross-instance limit would need a
-durable counter in the store — a deliberate follow-up, not built here. Size your limits with your replica
-count in mind, or pin the queued workflow to a single orchestrator instance if you need a hard global cap.
+```ts
+const transport = new BullMQTransport({
+  connection: { host: 'localhost', port: 6379 },
+  concurrency: 8, // this pod runs up to 8 tasks in parallel; defaults to 1
+});
+```
+
+Total parallelism across a fleet is `concurrency × replicas`. Pass `'adaptive'` instead of a fixed number
+to let a self-tuning controller pick the limit at runtime instead of you guessing it:
+
+```ts
+const transport = new BullMQTransport({
+  connection: { host: 'localhost', port: 6379 },
+  concurrency: { mode: 'adaptive', min: 2, max: 32, ramCeilingPct: 85 },
+});
+```
+
+The adaptive controller (`AdaptiveController` in `@dudousxd/durable-worker`) runs an AIMD gradient loop
+on a `tickMs` interval (default 2000): it grows the limit when there's headroom, shrinks it when latency
+shows queuing or errors spike (`backpressure`), and hard-brakes on RAM (`ramCeilingPct`, default 85%) or,
+if configured, CPU (`cpuCeilingPct`). Every adjustment is recorded as a `WorkerAdjust` — `{ at, from, to,
+reason }` — so a dashboard can show *why* the limit moved, not just that it did. Tunables:
+
+- `min` / `max` — the floor and ceiling the controller won't cross. Defaults `1` / `32`.
+- `start` — the initial limit, clamped into `[min, max]`. Defaults to `min`.
+- `ramCeilingPct` — RSS percent of the memory ceiling that triggers the hard brake. Default `85`.
+- `cpuCeilingPct` — CPU percent ceiling; off (`undefined`) by default.
+- `tickMs` — control-loop period in ms. Default `2000`.
+
+Either way — fixed or adaptive — the live concurrency, in-flight count, and (in adaptive mode) the last
+adjustment ride the worker's heartbeat as a `WorkerStatus` payload, which the Telescope Workers dashboard
+renders per worker group so you can see saturation and self-tuning behavior without instrumenting
+anything yourself.
+
+## Local vs. global admission
+
+By default, flow-control accounting is **per engine instance** (in-process) — the DBOS
+`workerConcurrency` tier. For the common single-orchestrator deployment this is exactly what you want,
+correct without any cross-process coordination. If you run several orchestrator replicas, each enforces
+the limit independently, so a `concurrency: 5` queue admits up to 5 *per replica*, not 5 fleet-wide.
+
+For a true cross-instance cap, pass a `RedisAdmissionBackend` (from
+`@dudousxd/nestjs-durable-admission-redis`) as the `admission` option — it moves concurrency, rate-limit,
+and priority/fairness ordering into Redis so every replica shares the same accounting:
+
+```ts
+import { RedisAdmissionBackend } from '@dudousxd/nestjs-durable-admission-redis';
+
+DurableModule.forRoot({
+  store,
+  transport,
+  queues: [{ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } }],
+  admission: new RedisAdmissionBackend({
+    connection: { host: 'localhost', port: 6379 },
+  }),
+});
+```
+
+Concurrency slots are tracked per owning instance and reclaimed only once that instance's liveness
+heartbeat lapses (`instanceTtlMs`, default 30s) — so a live pod keeps its slot for the full step duration
+no matter how long it runs, while a crashed pod's slots free within the TTL window. Rate limiting is a
+Redis fixed-window counter, and priority/fairness ordering runs through the same atomic Lua acquire the
+in-process controller mirrors in logic, so behavior is identical — just fleet-wide instead of per-replica.
+This targets a single (non-cluster) Redis instance; size limits with that in mind.
+
+## Which knob when
+
+| You need to... | Reach for... | Configured on |
+| --- | --- | --- |
+| Cap in-flight calls to a fragile/expensive downstream | `concurrency` | `QueueConfig` |
+| Respect a hard external rate limit (calls per interval) | `rateLimit` | `QueueConfig` |
+| Let an urgent call skip the line when a queue is full | per-call `priority` | `ctx.step(..., opts)` |
+| Also jump the broker's own queue at the worker (BullMQ) | same `priority` value | `ctx.step(..., opts)` — mirrored automatically |
+| Stop one tenant/key from starving everyone else | `fairness: 'key'` + per-call `fairnessKey` | `QueueConfig` + `ctx.step(..., opts)` |
+| Break remaining ties by newest-first instead of oldest-first | `order: 'lifo'` | `QueueConfig` |
+| Raise how much work *this process* runs at once | transport `concurrency` (fixed number) | `BullMQTransport` options |
+| Let the process self-tune concurrency under CPU/RAM pressure | transport `concurrency: 'adaptive'` | `BullMQTransport` options |
+| Enforce a cap/rate limit across every replica, not per-pod | `admission: new RedisAdmissionBackend(...)` | `DurableModule.forRoot` / `engine` |
+| Retry a failed step with backoff | `retries` / `backoff` / `backoffMs` — not flow control | see [Retries & backoff](/docs/reliability/retries) |

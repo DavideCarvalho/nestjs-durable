@@ -1,6 +1,6 @@
 ---
 title: Child workflows
-description: Compose workflows by calling other workflows — await a child's result with ctx.child, or kick one off fire-and-forget with ctx.startChild. Pass the workflow class for a typed input and result, or a name string for a cross-runtime child.
+description: Compose workflows by calling other workflows — await a child's result with ctx.child, kick one off fire-and-forget with ctx.startChild, or fan out N children of the same workflow and wait for all with ctx.all. Pass the workflow class for a typed input and result, or a name string for a cross-runtime child.
 ---
 
 A workflow can run **another workflow** as a child — to break a big process into reusable pieces, to
@@ -79,20 +79,76 @@ The dispatch is checkpointed (replay-safe — it won't re-fire on resume) and id
 
 <CodeFlow scene="start-child" />
 
-### Scatter-gather: start many, then join
+## `ctx.all` — fan out N children of the same workflow, wait for all
 
-Because `startChild` returns the child id and the start is idempotent by that id, you can fan out with
-`startChild` and later join with `ctx.child` using the **same id** — the child runs exactly once, and
-the second call just attaches to it:
+The common scatter-gather shape — process a batch by running the **same workflow** once per item, then
+wait for every result — has a built-in primitive: `ctx.all(workflow, inputs, opts?)`. It dispatches one
+child per entry in `inputs` **concurrently**, suspends the parent — zero compute — until every child
+reaches a terminal state, then resumes with their outputs in **input order**:
 
 ```ts
 async run(ctx: WorkflowCtx, batch: Batch) {
-  // 1. Start every item's workflow without waiting — they run concurrently.
+  const results = await ctx.all(ProcessItemWorkflow, batch.items);
+  return results;
+}
+```
+
+Each child gets a stable, group-scoped id (`<runId>.all.<firstSeq>.<i>`), and the dashboard renders the
+whole fan-out as one group instead of a sequential chain (the running children share a `parallelGroup`
+tag). Empty `inputs` returns `[]` with no side effects.
+
+### Handling failures — `mode` and `GatherError`
+
+By default (`mode: 'waitAll'`), `ctx.all` waits for every child to finish, then throws an aggregate
+`GatherError` if any failed — one throw naming every failing child, instead of the first one masking
+the rest:
+
+```ts
+import { GatherError } from '@dudousxd/nestjs-durable-core';
+
+try {
+  const results = await ctx.all(ProcessItemWorkflow, batch.items);
+  return results;
+} catch (err) {
+  if (err instanceof GatherError) {
+    // err.failures: { index: number; id: string; error: string }[]
+    this.logger.warn(`${err.failures.length} item(s) failed: ${err.message}`);
+  }
+  throw err;
+}
+```
+
+Pass `{ mode: 'failFast' }` to throw the moment a failed child is *seen*, instead of waiting for the
+stragglers — useful when one bad item means the batch is a lost cause and there's no point waiting out
+the slowest sibling. Note siblings are not cancelled in v1; their eventual results are just ignored.
+
+```ts
+const results = await ctx.all(ProcessItemWorkflow, batch.items, { mode: 'failFast' });
+```
+
+`ctx.all` is the wait-all/fan-out counterpart to `ctx.child` — reach for it whenever every item runs
+the **same** workflow.
+
+### Manual scatter-gather: `startChild` + `child`, for the flexible cases
+
+`ctx.all` covers "same workflow, dispatch-then-join-immediately". When you need something it doesn't
+give you — a **different workflow per item**, custom per-item child ids, or to do other work *between*
+starting the children and joining them (`ctx.all` suspends as one call from dispatch straight through
+to the join) — fall back to the manual pattern it's built on: because `startChild` returns the child id
+and the start is idempotent by that id, you can fan out with `startChild` and later join with
+`ctx.child` using the **same id** — the child runs exactly once, and the second call just attaches to
+it:
+
+```ts
+async run(ctx: WorkflowCtx, batch: Batch) {
+  // 1. Start every item's workflow without waiting — they run concurrently. (Here every item uses the
+  //    same workflow, but each call could just as well target a different one per item.)
   const ids = await Promise.all(
     batch.items.map((item) => ctx.startChild(ProcessItemWorkflow, item, `item:${item.id}`)),
   );
 
-  // 2. ...do other work while they run...
+  // 2. ...do other work while they run — ctx.all can't interleave work here, since it suspends for
+  //    the whole dispatch-to-join span in one call.
 
   // 3. Join: await each by the same id (no re-dispatch — they're already running).
   const results = await Promise.all(
@@ -104,11 +160,11 @@ async run(ctx: WorkflowCtx, batch: Batch) {
 
 ## When to use which
 
-| | `ctx.child` | `ctx.startChild` |
-| --- | --- | --- |
-| Parent waits for the result | ✅ suspends until the child finishes | ❌ returns the id immediately |
-| Child failure affects the parent | ✅ throws in the parent | ❌ independent (inspect/retry the child run) |
-| Typical use | a sub-task whose output you need | side work; scatter-gather (then join with `child`) |
+| | `ctx.child` | `ctx.startChild` | `ctx.all` |
+| --- | --- | --- | --- |
+| Parent waits for the result | ✅ suspends until the child finishes | ❌ returns the id immediately | ✅ suspends until every child finishes |
+| Child failure affects the parent | ✅ throws in the parent | ❌ independent (inspect/retry the child run) | ✅ throws an aggregate `GatherError` |
+| Typical use | a sub-task whose output you need | side work; the dispatch half of scatter-gather | fan out N items through the **same** workflow |
 
-Both establish the same durable parent→child relationship, so a child started either way is a normal
+All three establish the same durable parent→child relationship, so a child started any way is a normal
 run you can inspect, retry, or cancel from the dashboard.

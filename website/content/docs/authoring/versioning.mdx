@@ -24,12 +24,12 @@ reordered them — the engine throws a `NonDeterminismError` rather than silentl
 This is a guard, not a fix. It tells you a code change is incompatible with runs that started under
 the old code. The two tools below let you make the change *anyway* — safely.
 
-## Deterministic sources — `now`, `random`, `uuid`
+## Deterministic sources — `ctx.now` and `ctx.sideEffect`
 
 The most common way to break replay is reading a value that changes every time the body runs. A raw
 `Date.now()`, `Math.random()`, or `crypto.randomUUID()` returns a different value on each replay,
 which silently corrupts a durable run — a timestamp captured into a step input one run won't match the
-next. Use the context's deterministic sources instead; each records its value on the first run and
+next. Use the context's deterministic capture instead; each records its value on the first run and
 **replays the same value** afterwards:
 
 ```ts
@@ -39,18 +39,22 @@ export class InvoiceWorkflow {
 
   async run(ctx: WorkflowCtx, order: Order) {
     const issuedAt = await ctx.now(); // epoch ms — captured once, replayed verbatim
-    const nonce = await ctx.uuid(); // deterministic UUID v4
-    const sampled = (await ctx.random()) < 0.1; // deterministic [0, 1)
+    const nonce = await ctx.sideEffect(() => crypto.randomUUID()); // captured once
+    const sampled = (await ctx.sideEffect(() => Math.random())) < 0.1; // captured once
 
     await ctx.step(this.invoices.issue, { order, issuedAt, nonce, sampled });
   }
 }
 ```
 
-Each of these is itself a checkpointed step, so the value is captured the first time and returned from
-the checkpoint on every replay. Reach for `Date.now()`/`Math.random()`/`crypto.randomUUID()` only
-*inside* an `@Step` handler (whose whole result is checkpointed) — never in the deterministic prefix of
-the workflow body.
+`ctx.now()` returns the checkpointed timestamp as a number (for an ISO string:
+`new Date(await ctx.now()).toISOString()`). `ctx.sideEffect(fn)` is the general form — it runs `fn`
+**once**, checkpoints the result, and on replay returns the saved value *without re-running `fn`*.
+Use it for any non-deterministic value you generate yourself: a UUID/ULID, a random sample, a config
+or env read. Keep `fn` effectively pure — it produces a value; it is not a place for real work with
+side effects. For that (a DB write, an API call), use a full `ctx.step` to an `@Step` handler, whose
+whole result is checkpointed. Either way, never read the raw clock or RNG in the deterministic prefix
+of the workflow body.
 
 ## Workflow versions — for breaking changes
 

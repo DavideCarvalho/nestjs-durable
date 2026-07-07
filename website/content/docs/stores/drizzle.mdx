@@ -58,3 +58,21 @@ npx drizzle-kit migrate
 Point your `drizzle.config.ts` at a schema file that re-exports `durableSchema` (or the individual
 tables) so the generated SQL includes `durable_workflow_runs`, `durable_step_checkpoints`,
 `durable_run_attributes`, `durable_signal_waiters` and `durable_buffered_signals`.
+
+<Callout type="warn">
+  **Tag filtering is a substring match, not a JSON containment check.** `tags` is stored as JSON
+  text, so `listRuns({ tag })` compiles to `LIKE '%"tag"%'` against that column (quoted, so filtering
+  by `etl` doesn't also match a tag like `etl-foo`). This is a different mechanism from the MikroORM/
+  TypeORM/Prisma adapters' native JSON containment operators — functionally equivalent for typical
+  tags, but worth knowing if you're auditing query plans or comparing adapters.
+</Callout>
+
+<Callout type="warn">
+  **Sync drivers reject `ctx.transaction`.** `better-sqlite3` is synchronous under the hood, and its
+  `db.transaction()` throws if you hand it an async callback — which is exactly what
+  `DrizzleStateStore.transaction()` does. The package's own conformance suite runs with
+  `supportsAsyncTransaction: false` against `better-sqlite3` and skips the transaction case entirely
+  for that driver. If you need `ctx.transaction` (exactly-once DB steps), use an async driver — libSQL
+  (`@libsql/client`, including local `file:` databases and Turso) supports it; plain `better-sqlite3`
+  does not.
+</Callout>

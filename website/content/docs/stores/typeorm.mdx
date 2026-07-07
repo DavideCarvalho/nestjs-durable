@@ -30,6 +30,25 @@ export const dataSource = new DataSource({
 `ENTITIES` is the five `durable_*` entities the engine owns — `WorkflowRunEntity`,
 `StepCheckpointEntity`, `RunAttributeEntity`, `SignalWaiterEntity`, `BufferedSignalEntity`.
 
+### Column naming
+
+`ENTITIES` uses the canonical `snake_case` columns. To read a table an older, unpinned setup wrote in
+camelCase, or to supply a custom mapping, build the schemas with `durableEntities({ naming })` instead:
+
+```ts
+import { durableEntities } from '@dudousxd/nestjs-durable-store-typeorm';
+
+export const dataSource = new DataSource({
+  type: 'postgres',
+  entities: [...durableEntities({ naming: 'snake_case' }), /* your own entities */],
+});
+```
+
+`naming` accepts `'snake_case'` (default), `'preserve'` (the legacy camelCase this adapter used to
+produce), or `(property: string) => string`. Same contract as the MikroORM adapter's
+[`durableEntities`](/docs/stores/mikro-orm#column-naming) — the physical column names must agree
+across adapters so a run written by one store stays readable by another.
+
 ## 2. Wire the store into the module
 
 `TypeOrmStateStore` takes the `DataSource`:
@@ -70,3 +89,17 @@ export class AddDurableTables implements MigrationInterface {
 ```ts title="disable auto-schema in production"
 DurableModule.forRoot({ store, transport, autoSchema: false });
 ```
+
+<Callout type="warn">
+  **Two gaps versus the MikroORM adapter, worth knowing before you pick this one:**
+
+  - **No `withScope`.** This adapter doesn't implement the tenant-namespace-scoped-view capability, so
+    `DurableModule`'s `scopeReads: true` option is a silent no-op here — the store keeps returning
+    every namespace's runs regardless of the setting. Only the MikroORM adapter honors it today.
+  - **No fingerprint gate.** `ensureTypeOrmDurableSchema` re-runs its `CREATE TABLE IF NOT EXISTS` /
+    `ALTER TABLE ... ADD COLUMN` diff on **every boot**, unconditionally — there's no marker-table
+    short-circuit like MikroORM's `durable_schema_meta` fingerprint check. It's a much lighter diff
+    than MikroORM's whole-schema introspection (this one only ever touches the durable tables), but
+    it's still real DDL-planning work repeated on every pod's every boot rather than skipped on a
+    steady-state boot where nothing changed.
+</Callout>

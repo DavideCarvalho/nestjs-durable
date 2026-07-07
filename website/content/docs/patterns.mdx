@@ -1,0 +1,294 @@
+---
+title: Patterns
+description: A cookbook of common durable-workflow shapes — human approval, webhook confirmation, batch fan-out, cron digests, booking sagas, rate-limited APIs, and long-lived pollers — each a short, self-contained recipe with a link to the full page.
+---
+
+Seven recipes for shapes that come up constantly once you're writing real workflows. Each one is
+short and self-contained — skim for the shape you need, then follow the link for the full
+treatment.
+
+## 1. Human-in-the-loop approval
+
+**Problem:** a run needs a person to make a call — approve an expense, review a flagged
+transaction — before it can continue, but it shouldn't wait forever if nobody responds.
+
+```ts
+@Workflow({ name: 'po-approval', version: '1' })
+export class PurchaseOrderApprovalWorkflow {
+  constructor(private readonly purchasing: PurchasingService) {}
+
+  async run(ctx: WorkflowCtx, po: PurchaseOrder) {
+    // Publish a queryable snapshot so a UI can poll status without touching the run.
+    await ctx.setEvent('status', { state: 'awaiting-approval', amountCents: po.amountCents });
+
+    let decision: { approved: boolean; approver: string };
+    try {
+      // Suspends here (zero compute) until engine.update(runId, 'decision', arg) delivers one,
+      // or 3 days pass.
+      decision = await ctx.onUpdate('decision', { timeoutMs: 3 * 24 * 60 * 60 * 1000 });
+    } catch (err) {
+      if (err instanceof SignalTimeoutError) {
+        await ctx.setEvent('status', { state: 'expired' });
+        return { approved: false, reason: 'expired' };
+      }
+      throw err;
+    }
+
+    if (!decision.approved) {
+      await ctx.setEvent('status', { state: 'rejected', by: decision.approver });
+      return { approved: false, reason: 'rejected' };
+    }
+
+    await ctx.step(this.purchasing.releaseOrder, { poId: po.id, approver: decision.approver });
+    await ctx.setEvent('status', { state: 'approved', by: decision.approver });
+    return { approved: true };
+  }
+}
+```
+
+`ctx.setEvent` gives a controller a side-effect-free snapshot to poll (`engine.getEvent`); pair
+`ctx.onUpdate` with `engine.registerUpdateValidator` if you need to reject a bad decision — wrong
+approver, missing note — before it ever touches the run. The `timeoutMs` on `onUpdate` is what
+turns "wait forever" into a clean expiry branch: catch `SignalTimeoutError` and take the default
+path instead of leaving the run parked. Full walkthrough, including the validator and the
+`engine.update` return shape: [Queries & updates](/docs/authoring/queries-and-updates).
+
+## 2. Payment + webhook confirmation
+
+**Problem:** a payment provider charges asynchronously and calls back a webhook URL once it
+settles — but you also want to give up cleanly if the callback never arrives.
+
+```ts
+@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow {
+  constructor(
+    private readonly psp: PaymentProviderService,
+    private readonly orders: OrderService,
+  ) {}
+
+  async run(ctx: WorkflowCtx, order: Order) {
+    // Mint the webhook first: fixes a deterministic token + public url.
+    const hook = ctx.webhook<{ status: 'paid' | 'failed'; providerRef: string }>();
+
+    // Hand the url to the provider INSIDE a step, so the handoff happens exactly once.
+    await ctx.step(this.psp.startPayment, {
+      orderId: order.id,
+      amountCents: order.total,
+      callbackUrl: hook.url,
+    });
+
+    // DurableWebhook.wait() has no timeout of its own — wait on its token via ctx.waitForSignal
+    // instead to bound how long the run parks for the callback.
+    let result: { status: 'paid' | 'failed'; providerRef: string };
+    try {
+      result = await ctx.waitForSignal(hook.token, { timeoutMs: 30 * 60 * 1000 });
+    } catch (err) {
+      if (err instanceof SignalTimeoutError) {
+        throw new FatalError(`payment for ${order.id} never confirmed`, 'payment_timeout');
+      }
+      throw err;
+    }
+
+    if (result.status !== 'paid') {
+      throw new FatalError(`payment ${result.providerRef} declined`, 'payment_failed');
+    }
+    await ctx.step(this.orders.fulfil, { order, providerRef: result.providerRef });
+    return { orderId: order.id, providerRef: result.providerRef };
+  }
+}
+```
+
+`ctx.webhook()` reserves the deterministic token/url up front; handing the url to the provider
+happens inside a `ctx.step` so the handoff is itself checkpointed and replay-safe. Because
+`DurableWebhook.wait()` takes no options, bound the wait yourself by calling
+`ctx.waitForSignal(hook.token, { timeoutMs })` instead of `hook.wait()` — same token, same delivery
+path (the callback still lands as `engine.signal(token, body)`), just with a deadline. Full
+details on minting, the handle shape, and delivering the callback yourself:
+[Durable webhooks](/docs/authoring/webhooks).
+
+## 3. Fan-out/fan-in over a batch
+
+**Problem:** process every item in a batch as its own tracked workflow, running concurrently, and
+come back with all the results (or bail out on the first failure).
+
+```ts
+@Workflow({ name: 'batch-import', version: '1' })
+export class BatchImportWorkflow {
+  async run(ctx: WorkflowCtx, batch: { records: ImportRecord[] }) {
+    try {
+      // Dispatches one ProcessRecordWorkflow per item, concurrently, and waits for every one to
+      // reach a terminal state — resumes with the outputs in input order.
+      const results = await ctx.all(ProcessRecordWorkflow, batch.records, { mode: 'waitAll' });
+      return { imported: results.length };
+    } catch (err) {
+      if (err instanceof GatherError) {
+        // err.failures: { index, id, error }[] — which records failed and why.
+        return { imported: batch.records.length - err.failures.length, failures: err.failures };
+      }
+      throw err;
+    }
+  }
+}
+```
+
+`ctx.all(workflow, inputs, opts)` is the built-in wait-all/fan-out primitive: each input starts its
+own child run, the parent suspends with zero compute until every child settles, and a mixed
+outcome throws an aggregate `GatherError` (mode `'waitAll'`, the default) so you can see exactly
+which items failed instead of losing that detail. Pass `{ mode: 'failFast' }` to bail the instant
+one child fails. If you need to start the batch, do other work, and join later (rather than
+waiting immediately), fan out with `ctx.startChild` per item and join each with `ctx.child` using
+the same id instead — see [Child workflows](/docs/authoring/child-workflows) for both forms.
+
+## 4. Cron digest
+
+**Problem:** send a weekly summary email on a fixed calendar schedule, with no risk of double-firing
+when several worker instances are racing the same tick.
+
+```ts
+// app.module.ts — deployment config: which cadence runs where
+DurableModule.forRoot({
+  store,
+  transport,
+  schedules: [
+    {
+      key: 'weekly-digest',
+      workflow: 'weekly-digest',
+      cron: '0 8 * * MON', // 08:00 every Monday, DST-aware in the given timezone
+      timezone: 'America/Sao_Paulo',
+    },
+  ],
+});
+```
+
+```ts
+// weekly-digest.workflow.ts — an ordinary workflow; it doesn't know it's scheduled
+@Workflow({ name: 'weekly-digest', version: '1' })
+export class WeeklyDigestWorkflow {
+  constructor(private readonly reports: ReportService) {}
+
+  async run(ctx: WorkflowCtx) {
+    const activity = await ctx.step(this.reports.gatherLastWeek, undefined);
+    await ctx.step(this.reports.emailDigest, activity);
+    return { recipients: activity.recipients.length };
+  }
+}
+```
+
+The schedule is deployment config, not part of `@Workflow` — the same `weekly-digest` workflow can
+be scheduled differently (or started ad-hoc) per environment. Each cron fire's time bucket becomes
+part of a deterministic run id, and `engine.start` is idempotent by run id, so **each window starts
+exactly once** even with multiple worker instances ticking at the same moment. Full details on
+`everyMs` vs. `cron` + `timezone` and the idempotent time-bucket mechanism:
+[Scheduling](/docs/authoring/scheduling).
+
+## 5. Booking saga
+
+**Problem:** a trip booking reserves a flight and a hotel before charging a deposit — if the charge
+is declined, the reservations must be undone, not left stranded.
+
+```ts
+@Workflow({ name: 'trip-booking', version: '1' })
+export class TripBookingWorkflow {
+  constructor(
+    private readonly flights: FlightsService,
+    private readonly hotels: HotelsService,
+    private readonly billing: BillingService,
+  ) {}
+
+  async run(ctx: WorkflowCtx, trip: TripRequest) {
+    const flight = await ctx.localStep(
+      'reserve-flight',
+      () => this.flights.reserve(trip.flightId),
+      { compensate: () => this.flights.release(trip.flightId) },
+    );
+    const hotel = await ctx.localStep(
+      'reserve-hotel',
+      () => this.hotels.reserve(trip.hotelId),
+      { compensate: () => this.hotels.release(trip.hotelId) },
+    );
+    // If this throws, the engine undoes the hotel then the flight reservation before failing.
+    const deposit = await ctx.localStep('charge-deposit', () =>
+      this.billing.chargeDeposit(trip.customerId, trip.depositCents),
+    );
+    return { flightRef: flight.ref, hotelRef: hotel.ref, depositId: deposit.id };
+  }
+}
+```
+
+Each `ctx.localStep` that has a real-world side effect registers its own `compensate` undo; if a
+later step fails (exhausts retries, or throws `FatalError`), the engine runs every registered
+compensation in reverse order before failing the run — here, release the hotel, then the flight.
+Sagas attach only to `ctx.localStep` (in-process), not the dispatched `ctx.step`. This is the short
+version — for retryable undos, visibility, and compensating cancellation, see
+[Sagas & compensation](/docs/reliability/sagas).
+
+## 6. Rate-limited external API
+
+**Problem:** a geocoding API allows only 60 requests/minute across the whole fleet, and a handful of
+tenants shouldn't be able to starve the rest of it.
+
+```ts
+// app.module.ts
+DurableModule.forRoot({
+  store,
+  transport,
+  queues: [
+    {
+      name: 'geocode-api',
+      concurrency: 10,
+      rateLimit: { limit: 60, periodMs: 60_000 },
+      fairness: 'key', // round-robin admission across distinct fairnessKeys
+    },
+  ],
+});
+```
+
+```ts
+// inside the workflow
+const location = await ctx.step(this.geocoder.lookup, address, {
+  queue: 'geocode-api',
+  priority: order.urgent ? 10 : 0,
+  fairnessKey: order.tenantId,
+});
+```
+
+`concurrency` and `rateLimit` on the queue bound how much work is admitted at once and per minute;
+`priority` and `fairnessKey` on the `ctx.step` call decide who wins a contended slot — higher
+priority first, then the least-recently-served `fairnessKey`. A blocked call never busy-waits or
+holds the run in memory: it re-suspends and the durable-timer poller retries admission later, so
+the limit survives a crash. Every other knob (worker concurrency, fleet-wide admission via
+`RedisAdmissionBackend`) is covered in [Flow control](/docs/reliability/flow-control).
+
+## 7. Long-lived poller
+
+**Problem:** poll an external feed every few minutes, forever — without the run's history growing
+unbounded and slowing down every replay.
+
+```ts
+@Workflow({ name: 'feed-poller', version: '1' })
+export class FeedPollerWorkflow {
+  constructor(private readonly feed: FeedService) {}
+
+  async run(ctx: WorkflowCtx, state: { feedId: string; cursor?: string; iterations: number }) {
+    let cursor = state.cursor;
+
+    for (let i = 0; i < 200; i++) {
+      const page = await ctx.step(this.feed.poll, { feedId: state.feedId, cursor });
+      cursor = page.nextCursor;
+      await ctx.sleep('2m');
+    }
+
+    // 200 iterations is enough checkpoints to slow down replay — start fresh with a clean
+    // history, carrying the cursor forward. Terminal: nothing after this line runs.
+    return ctx.continueAsNew({ feedId: state.feedId, cursor, iterations: state.iterations + 1 });
+  }
+}
+```
+
+Looping directly would accumulate one `step` + one `sleep` checkpoint per iteration forever, and
+every crash/resume replays all of them. `ctx.continueAsNew(input)` ends this run and starts a fresh
+execution of the same workflow (id `<runId>~N`) with a clean history, carrying forward whatever
+state the next iteration needs — here, the feed's cursor. It always throws, so nothing after the
+call ever runs; cap the loop at a fixed iteration count and call it on the way out, as above. See
+[Workflows & steps](/docs/concepts/workflows-and-steps) for the step/checkpoint model this is
+resetting, and [Sleep & signals](/docs/concepts/sleep-and-signals) for `ctx.sleep`.

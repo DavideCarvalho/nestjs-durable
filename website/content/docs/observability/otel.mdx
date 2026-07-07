@@ -1,6 +1,6 @@
 ---
 title: OpenTelemetry
-description: One trace per run, one span per step. Bridge the engine's lifecycle events to OpenTelemetry and see workflows in Jaeger, Grafana or Datadog.
+description: One span per step, one root span per run's first turn. Bridge the engine's lifecycle events to OpenTelemetry and see workflows in Jaeger, Grafana or Datadog.
 ---
 
 `@dudousxd/nestjs-durable-otel` turns workflow runs into OpenTelemetry traces — a root span per
@@ -17,14 +17,50 @@ import { attachDurableOtel } from '@dudousxd/nestjs-durable-otel';
 const detach = attachDurableOtel(engine); // uses the global tracer provider
 ```
 
-Each step span carries `durable.run_id`, `durable.step.seq` and `durable.step.kind`; a failed run
-marks its span with an error status. Step spans are timed from the engine's `durationMs`, so
-latencies are accurate.
+The root span carries `durable.run_id` and `durable.workflow`; each step span carries
+`durable.run_id`, `durable.step.seq` and `durable.step.kind`; a failed run marks its span with an
+error status. Step spans are timed from the engine's `durationMs`, so latencies are accurate.
+
+`attachDurableOtel` takes an options object if you don't want the global tracer provider:
+
+```ts
+export interface DurableOtelOptions {
+  /** Tracer to use. Defaults to one from the global provider (or `provider` if given). */
+  tracer?: Tracer;
+  provider?: TracerProvider;
+}
+```
+
+Pass `tracer` to supply an already-created `Tracer` directly, or `provider` to have
+`attachDurableOtel` pull one from a specific `TracerProvider` (both from `@opentelemetry/api`)
+instead of the process-wide global:
+
+```ts
+const detach = attachDurableOtel(engine, { provider: myTracerProvider });
+```
 
 It subscribes to the same engine lifecycle events the [dashboard](/docs/observability/dashboard)
 and [Telescope watcher](/docs/observability/telescope) use — three views of one event log. OTel is
 for **debugging in production** (latency, correlation, alerts); the dashboard is for **operating**
 the workflow.
+
+<Callout type="warn" title="A suspended-then-resumed run is NOT one continuous root span">
+The root span opens on `run.started` (the run's first `pending` → `running` transition) and is
+**ended and forgotten** on `run.suspended` — it does not reopen when the run resumes. `run.started`
+fires exactly once per run, so a workflow that suspends (a sleep, a signal wait, a remote dispatch
+awaiting a decision) and later resumes does **not** get a fresh root span either: there simply
+isn't one to attach the resumed steps to. In practice this means steps that execute *after* a
+resume show up as spans with no parent — detached from the run's original trace — rather than
+nested under one long-lived root.
+
+The [Telescope watcher](/docs/observability/telescope) trace-groups a run the same way (its own
+root span per run, ended on `run.suspended`) and hits the identical boundary — a run that suspends
+splits into more than one `traceId` on Telescope's Traces page too. What Telescope adds is a second,
+span-independent way to see the whole run: every entry it records also carries a `run:<runId>` tag,
+so filtering the Entries view by that tag reconstructs the full lifecycle — across any number of
+suspends — regardless of how the OTel trace was split. The [dashboard](/docs/observability/dashboard)'s
+run timeline is unaffected either way: it's built from the state store's checkpoints, not from spans.
+</Callout>
 
 ## Distributed tracing across workers
 

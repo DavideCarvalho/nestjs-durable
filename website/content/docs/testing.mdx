@@ -28,6 +28,16 @@ await t.engine.waitForRun(runId);                                  // resolves w
 await assertRunStatus(t.store, 'run1', 'completed');
 ```
 
+### One call instead of start + waitForRun
+
+`t.run(workflow, input, runId, opts)` is the same `start` then `waitForRun` in one shot, for tests
+that only care about the settled result:
+
+```ts
+const result = await t.run('checkout', order, 'run1');
+expect(result.status).toBe('completed');
+```
+
 ## Control time (durable sleep)
 
 `tick(ms)` advances the clock and resumes any durable sleep that is now due — no waiting:
@@ -45,6 +55,20 @@ const { runId } = await t.engine.start('digest', {}, 'run1'); // enqueues → { 
 await t.engine.waitForRun(runId);                             // settles on the durable sleep → suspended
 await t.tick(7 * 24 * 60 * 60 * 1000);                        // the sleep is due → completes
 await assertRunStatus(t.store, 'run1', 'completed');
+```
+
+`t.tick` is `t.clock.advance(ms)` followed by `engine.resumeDueTimers(clock.now())` — the clock itself
+(`MutableClock`) is a standalone piece of `createTestEngine`, with `set(ms)` (jump to an absolute
+instant) alongside `advance(ms)` (move forward by a delta). Reach for `t.clock` directly, without
+`tick`, when you need an absolute time before a run starts, or you're driving code that only takes a
+bare `now: () => number` and isn't wired into `resumeDueTimers`:
+
+```ts
+import { MutableClock } from '@dudousxd/nestjs-durable-testing';
+
+const clock = new MutableClock(1_720_000_000_000); // starts at this instant instead of the default
+clock.set(1_720_100_000_000);                       // jump to an absolute instant
+clock.advance(60_000);                              // ...then move forward a minute
 ```
 
 ## Inject crashes & retries
@@ -65,3 +89,85 @@ await assertStepAttempts(t.store, 'run1', 'charge', 2); // failed once, then suc
 
 `assertRunStatus`, `assertOutput`, `assertStepsRan`, `assertStepAttempts`, and `recordedSteps` —
 all read the store, so they work against any run the engine produced.
+
+## Replay a captured run in CI
+
+A code change can rename, reorder, or remove a step at a position an in-flight run already recorded a
+checkpoint for. The engine catches that as a `NonDeterminismError` on replay — but you want to catch it
+in CI, before it reaches a real in-flight run on deploy. `assertReplayable(register, history)` replays a
+captured run's history against the CURRENT workflow code and rethrows if they diverged:
+
+```ts
+import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import { assertReplayable, type RunHistory } from '@dudousxd/nestjs-durable-testing';
+
+// Capture a real run's history — do this once, then commit the result as a fixture.
+async function recordHistory(register: (e: WorkflowEngine) => void): Promise<RunHistory> {
+  const store = new InMemoryStateStore();
+  const engine = new WorkflowEngine({ store });
+  register(engine);
+  await engine.start('pipeline', {}, 'run1');
+  await engine.waitForRun('run1');
+  const run = await store.getRun('run1');
+  if (!run) throw new Error('no run');
+  return { run, checkpoints: await store.listCheckpoints('run1') };
+}
+
+const registerPipeline = (engine: WorkflowEngine) =>
+  engine.register('pipeline', '1', pipeline.run); // register exactly as the app does
+
+it('replays the recorded fixture against the current workflow code', async () => {
+  const fixture = await recordHistory(registerPipeline); // or: JSON committed from a real run
+  await assertReplayable(registerPipeline, fixture);      // throws NonDeterminismError on divergence
+});
+```
+
+## Testing a custom store/transport/admission backend
+
+If you're writing a new `StateStore`, `Transport`, or `AdmissionBackend` adapter, don't write your own
+behavioral spec from scratch — run the shared conformance suite the shipped adapters already run
+against. Each one throws (or fails its `it` block) on any divergence from the canonical (in-memory)
+semantics.
+
+**State store** — `runStateStoreContract(name, makeStore)` takes a `StateStoreFactory` that returns a
+fresh, empty store plus a `cleanup`:
+
+```ts
+import { runStateStoreContract } from '@dudousxd/nestjs-durable-testing';
+import { MyStateStore } from './my-state-store';
+
+runStateStoreContract('MyStateStore', async () => ({
+  store: new MyStateStore(/* fresh, empty */),
+  cleanup: async () => {
+    /* close the connection, drop the schema, etc. */
+  },
+}));
+```
+
+**Transport** — `assertTransportConformance(transport, idPrefix?)` proves a durable remote step
+round-trips to a worker and back, for both success and a throwing handler:
+
+```ts
+import { assertTransportConformance } from '@dudousxd/nestjs-durable-testing';
+import { MyTransport } from './my-transport';
+
+it('conforms to the Transport contract', async () => {
+  await assertTransportConformance(new MyTransport());
+});
+```
+
+**Admission backend** — `runAdmissionBackendContract(name, makeBackend)` takes an
+`AdmissionBackendFactory` (`(clock) => AdmissionBackend`) and asserts concurrency caps, rate limits,
+priority, FIFO/LIFO ordering, and fairness:
+
+```ts
+import { runAdmissionBackendContract } from '@dudousxd/nestjs-durable-testing';
+import { MyAdmissionBackend } from './my-admission-backend';
+
+runAdmissionBackendContract('MyAdmissionBackend', (clock) => new MyAdmissionBackend(clock));
+```
+
+If your store is a new ORM adapter, also assert its physical column names against the canonical
+snake_case contract, so a mismatch fails a unit test instead of "Unknown column" at runtime:
+`assertDurableColumns(resolve)` walks every table/property in `DURABLE_CANONICAL_COLUMNS` and returns
+the mismatches (empty when conformant) — `expect(assertDurableColumns(resolve)).toEqual([])`.

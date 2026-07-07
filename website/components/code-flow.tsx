@@ -1011,6 +1011,107 @@ export class CheckoutWorkflow {
   render: timeline(['quote', 'charge', 'confirm', 'done']),
 };
 
+const transportDispatch: Scene = {
+  stack: true,
+  code: `@Workflow({ name: 'process-doc', version: '1' })
+export class ProcessDocumentWorkflow {
+  constructor(
+    private readonly intake: IntakeService,
+    private readonly render: RenderService,
+  ) {}
+
+  async run(ctx: WorkflowCtx, doc: Document) {
+    const clean = await ctx.step(this.intake.validate, doc);
+    const pdf = await ctx.step(this.render.toPdf, clean);
+    const summary = await ctx.step<Summary>('python.enrich', pdf);
+    return { pdf, summary };
+  }
+}`,
+  steps: [
+    { lines: [9, 9], stage: '', active: 0, tone: 'run', title: 'validate', actor: 'ctx.step → validate (same NestJS app)', caption: 'The in-process event-emitter transport dispatches this to a @Step handler in the SAME process — no network hop.' },
+    { lines: [10, 10], stage: '', active: 1, tone: 'run', title: 'render', actor: 'ctx.step → render to PDF (separate worker)', caption: 'Identical ctx.step call — but this transport carries the dispatch to a different worker process over Redis/SQS. The workflow code never changes.' },
+    { lines: [11, 11], stage: '', active: 2, tone: 'run', title: 'python enrich', actor: "ctx.step<Summary>('python.enrich', pdf) → Python worker", caption: 'By-name dispatch reaches a Python worker registered under that name — same wire-level RemoteTask/StepResult, any language on the other end.' },
+    { lines: [12, 13], stage: '', active: 3, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The engine checkpointed every result as it landed, regardless of which process ran the step — replay never re-dispatches a settled one.' },
+  ],
+  render: timeline(['validate', 'render', 'python', 'done']),
+};
+
+const saga: Scene = {
+  stack: true,
+  code: `@Workflow({ name: 'book-trip', version: '1' })
+export class BookTripWorkflow {
+  constructor(
+    private readonly flights: FlightService,
+    private readonly hotels: HotelService,
+    private readonly cars: CarService,
+    private readonly payments: PaymentsService,
+  ) {}
+
+  async run(ctx: WorkflowCtx, trip: TripRequest) {
+    const flight = await ctx.localStep(
+      'book-flight',
+      () => this.flights.book(trip.flightId),
+      { compensate: () => this.flights.cancel(trip.flightId) },
+    );
+
+    const hotel = await ctx.localStep(
+      'book-hotel',
+      () => this.hotels.book(trip.hotelId),
+      { compensate: () => this.hotels.cancel(trip.hotelId) },
+    );
+
+    const car = await ctx.localStep(
+      'book-car',
+      () => this.cars.book(trip.carId),
+      { compensate: () => this.cars.cancel(trip.carId) },
+    );
+
+    // charge-deposit registers no compensate — there's nothing of its own to undo
+    await ctx.localStep('charge-deposit', () =>
+      this.payments.charge(trip.customerId, trip.depositCents),
+    );
+
+    return { flight, hotel, car };
+  }
+}`,
+  steps: [
+    { lines: [11, 15], stage: '', active: 0, tone: 'run', title: 'flight', actor: 'ctx.localStep → book flight', caption: 'ctx.localStep books the flight in-process; completing it registers the compensate callback (cancel the flight) on the saga stack.' },
+    { lines: [17, 21], stage: '', active: 1, tone: 'run', title: 'hotel', actor: 'ctx.localStep → book hotel', caption: 'The hotel booking completes and registers its own compensation — pushed after the flight’s.' },
+    { lines: [23, 27], stage: '', active: 2, tone: 'run', title: 'car', actor: 'ctx.localStep → book car', caption: 'The car rental completes third; its compensation is now the most recently registered — first to undo if the run fails.' },
+    { lines: [29, 32], stage: '', active: 3, tone: 'fail', title: 'deposit ✗', actor: 'ctx.localStep → charge deposit (throws)', caption: 'The deposit charge is declined and throws. charge-deposit registered no compensate of its own — but three earlier steps did.' },
+    { lines: [26, 26], stage: '', active: 4, tone: 'run', title: 'undo car', actor: 'engine unwinds the saga — car undone first', caption: 'The engine catches the failure and walks the saga stack from the top: car, then hotel, then flight. Car is undone first because it was registered last.' },
+    { lines: [20, 20], stage: '', active: 5, tone: 'run', title: 'undo hotel', actor: 'reverse order, continued → hotel undone second', caption: 'Next the hotel booking is cancelled — retried up to compensationRetries times if the undo itself fails transiently.' },
+    { lines: [14, 14], stage: '', active: 6, tone: 'run', title: 'undo flight', actor: 'reverse order, continued → flight undone last', caption: 'Finally the flight is cancelled — the first step taken is the last one undone, unwinding the saga back to a clean slate.' },
+    { lines: [29, 32], stage: '', active: 7, tone: 'fail', title: 'failed', actor: 'compensations done → run settles failed', caption: 'With every leg undone, the engine settles the run failed with the original deposit error — the world is left exactly as if none of the bookings had happened.' },
+  ],
+  render: timeline(['flight', 'hotel', 'car', 'deposit ✗', 'undo car', 'undo hotel', 'undo flight', 'failed']),
+};
+
+const flowControl: Scene = {
+  stack: true,
+  code: `@Workflow({ name: 'send-receipt', version: '1' })
+export class SendReceiptWorkflow {
+  constructor(private readonly notify: NotificationsWorker) {}
+
+  async run(ctx: WorkflowCtx, job: EmailJob) {
+    const sent = await ctx.step(this.notify.sendEmail, job, {
+      queue: 'emails',
+      priority: job.urgent ? 10 : 0,
+      fairnessKey: job.tenantId,
+    });
+    return { messageId: sent.messageId };
+  }
+}`,
+  steps: [
+    { lines: [6, 10], stage: '', active: 0, tone: 'run', title: 'dispatch', actor: "ctx.step → dispatch through the 'emails' queue", caption: "The call names the emails queue and carries priority + fairnessKey — the engine asks the queue's admission controller for a slot before dispatching." },
+    { lines: [6, 10], stage: '', active: 1, tone: 'wait', title: 'blocked', actor: 'queue at its concurrency cap — call blocked', caption: 'The queue is full, so admission is blocked. The engine does NOT dispatch — it re-suspends the run with the retry time as wakeAt, and the timer poller retries later. Zero compute held.' },
+    { lines: [7, 8], stage: '', active: 2, tone: 'wait', title: 'priority', actor: 'priority: 10 — this urgent job jumps the line', caption: 'When a slot frees, admission goes to the rightful next waiter: higher priority wins first, so this urgent call is admitted ahead of already-waiting lower-priority calls.' },
+    { lines: [9, 9], stage: '', active: 3, tone: 'wait', title: 'fair share', actor: 'fairnessKey round-robins by tenant', caption: "Within the same priority tier, fairness breaks the tie: with the queue's fairness: 'key' set, the least-recently-served fairnessKey (e.g. this tenant) is admitted next, so one busy tenant can't starve the others." },
+    { lines: [6, 11], stage: '', active: 4, tone: 'done', title: 'admitted', actor: 'slot granted → step dispatches → email sent', caption: 'Once admitted, the slot is held until the result lands; the step dispatches, sends the email, and the run completes.' },
+  ],
+  render: timeline(['dispatch', 'blocked', 'priority', 'fair', 'done']),
+};
+
 const SCENES: Record<string, Scene> = {
   'execution-model': executionModel,
   'dispatched-step': dispatchedStep,
@@ -1024,6 +1125,9 @@ const SCENES: Record<string, Scene> = {
   'update-timeout': updateTimeout,
   'update-happy': updateHappy,
   'dead-letter': deadLetter,
+  'transport-dispatch': transportDispatch,
+  saga,
+  'flow-control': flowControl,
   versioning,
   retries,
 };

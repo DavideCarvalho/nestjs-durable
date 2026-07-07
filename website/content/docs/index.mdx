@@ -169,12 +169,15 @@ The split goes both ways: a separate worker can implement a step the NestJS work
 
 <Cards>
   <Card title="Getting Started" href="/docs/getting-started" description="Install, write a workflow, register the module, and start your first run — step by step." />
+  <Card title="Comparison" href="/docs/comparison" description="How this library compares to Temporal, Inngest, and plain BullMQ — honestly." />
   <Card title="Concepts" href="/docs/concepts" description="Durability, deterministic replay, and the mental model behind the engine." />
-  <Card title="Authoring" href="/docs/authoring" description="Workflows, steps, ctx.step, sleep, and signals in depth." />
-  <Card title="Reliability" href="/docs/reliability" description="Retries, fatal errors, recovery, and exactly-once execution." />
+  <Card title="Authoring" href="/docs/authoring" description="Steps, children, entities, events, updates, webhooks, versioning, and scheduling in depth." />
+  <Card title="Reliability" href="/docs/reliability" description="Retries, sagas, flow control, singletons, dead-lettering, and retention." />
+  <Card title="Patterns" href="/docs/patterns" description="A cookbook: human approval, payment webhooks, fan-out, cron digests, sagas, rate limits." />
   <Card title="Transports" href="/docs/transports" description="The event-emitter default and BullMQ for cross-process or Python steps." />
   <Card title="State stores" href="/docs/stores" description="Persist runs to Postgres, MySQL, or SQLite with your ORM of choice." />
-  <Card title="Observability" href="/docs/observability" description="The control-plane dashboard, OpenTelemetry traces, and the Telescope watcher." />
+  <Card title="Observability" href="/docs/observability" description="The control-plane dashboard, OpenTelemetry traces, metrics, and the Telescope watcher." />
+  <Card title="Running in production" href="/docs/production" description="The operational checklist: replicas, deploys, shutdown, backpressure, retention." />
   <Card title="Python" href="/docs/python" description="Implement steps and author workflows from a Python worker." />
-  <Card title="Tooling" href="/docs/tooling" description="The CLI, the test harness, and developer ergonomics." />
+  <Card title="API reference" href="/docs/api-reference" description="Every WorkflowCtx method, decorator, module option, error, and status — from source." />
 </Cards>

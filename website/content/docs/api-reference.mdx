@@ -1,0 +1,290 @@
+---
+title: API reference
+description: Every public member of WorkflowCtx, the authoring decorators, WorkflowService, the WorkflowEngine's selected surface, DurableModuleOptions, the thrown error classes, and the run/checkpoint status enums — one line each, distilled from source.
+---
+
+This page is a flat lookup table generated from source (`packages/core/src/interfaces.ts`,
+`packages/core/src/engine.ts`, `packages/core/src/errors.ts`, `packages/core/src/scheduler.ts`,
+`packages/nestjs/src/workflow.service.ts`, `packages/nestjs/src/durable.module.ts`, and the
+`@dudousxd/nestjs-durable` decorators). It is deliberately terse — for the *why* behind any entry,
+follow its linked concept/authoring/reliability page.
+
+## WorkflowCtx
+
+The context handed to a workflow's `run(ctx, input)`. Every interaction with the outside world goes
+through it so the engine can checkpoint — the body itself stays deterministic (see
+[Durability & replay](/docs/concepts/durability)).
+
+### Properties
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `runId` | `readonly runId: string` | This run's id. |
+
+### Steps
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `step` | `step<TIn, TOut>(handler: StepRef<TIn, TOut>, input: TIn, opts?: StepDispatchOpts): Promise<TOut>` | Dispatch a durable step by typed `@Step` method reference — the ONE step primitive, always engine-scheduled. See [Workflows & steps](/docs/concepts/workflows-and-steps). |
+| `step` (by name) | `step<TOut = unknown>(name: string, input: unknown, opts?: StepDispatchOpts): Promise<TOut>` | Same dispatch, by string name — for a cross-runtime handler (e.g. a Python `@step`) with no JS reference. |
+| `localStep` | `localStep<TOut>(name: string, fn: (log: StepLogger) => Promise<TOut>, options?: StepOptions): Promise<TOut>` | Escape hatch: a checkpointed step whose body runs **in-process** (not dispatched), so it can carry an in-memory `compensate` for [sagas](/docs/reliability/sagas). |
+| `transaction` | `transaction<TOut>(name: string, fn: (tx: unknown) => Promise<TOut>): Promise<TOut>` | Exactly-once DB step: runs `fn` and writes the checkpoint in ONE store transaction (business write + "done" marker are atomic). Needs a SQL store; throws otherwise. |
+
+### Time
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `sleep` | `sleep(duration: string \| number): Promise<void>` | Durable sleep for a relative duration (`'30s'`, `'2h'`, ms) — zero compute, resumes across restarts. See [Sleep & signals](/docs/concepts/sleep-and-signals). |
+| `sleepUntil` | `sleepUntil(when: Date \| number): Promise<void>` | Durable sleep to an **absolute** deadline; the wake time is fixed on first run (replay-stable). |
+| `now` | `now(): Promise<number>` | Deterministic epoch-ms clock read — records on first run, replays the same value. Use instead of `Date.now()` inside a workflow body. |
+
+### Signals & events
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `waitForSignal` | `waitForSignal<T>(token: string, opts?: { timeoutMs?: number }): Promise<T>` | Suspend until an external `engine.signal(token, payload)` arrives; `timeoutMs` bounds the wait and throws `SignalTimeoutError` on expiry. |
+| `waitForEvent` | `waitForEvent<T>(name: string, opts?: { match?: Record<string, unknown>; timeoutMs?: number }): Promise<T>` | Suspend for a named pub/sub event published via `engine.publishEvent`; `match` filters which publishes resolve this run. |
+| `setEvent` | `setEvent<T>(key: string, value: T): Promise<void>` | Publish a queryable value, readable externally via `engine.getEvent(runId, key)` while the run is in flight. See [Queries & updates](/docs/authoring/queries-and-updates). |
+| `onUpdate` | `onUpdate<TArg>(name: string, opts?: { timeoutMs?: number }): Promise<TArg>` | Expose a run-scoped update point; suspends until `engine.update(runId, name, arg)` delivers `arg`, gated by any registered validator. |
+
+### Children
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `child` | `child<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, options?: string \| ChildCallOptions): Promise<WorkflowOutputOf<C>>` | Start (or reattach to) a child run and suspend — zero compute — until it's terminal, then resume with its output (throws `FatalError` if the child failed). See [Child workflows](/docs/authoring/child-workflows). |
+| `child` (by name) | `child<TOut>(workflow: string, input: unknown, options?: string \| ChildCallOptions): Promise<TOut>` | Same, for a cross-runtime child by name. |
+| `startChild` | `startChild<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, options?: string \| ChildCallOptions): Promise<string>` | Fire-and-forget: dispatch a child once and return its run id immediately; the parent keeps running. |
+| `all` | `all<C extends WorkflowClass>(workflow: C, inputs: WorkflowInputOf<C>[], opts?: { mode?: 'waitAll' \| 'failFast' }): Promise<WorkflowOutputOf<C>[]>` | Run N children of the SAME workflow in parallel and await all of them, in input order. `waitAll` (default) aggregates failures into `GatherError`; `failFast` throws on the first. |
+
+### External
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `task` | `task<T>(name: string, dispatch: () => Promise<void>, options?: StepOptions): Promise<T>` | An external task with async completion: run `dispatch` once, then suspend until `engine.completeTask`/`failTask` reports back. |
+| `webhook` | `webhook<TPayload>(): DurableWebhook<TPayload>` | Mint a durable callback handle (`token` + optional public `url`); `await handle.wait()` suspends until the third party's callback lands as `engine.signal(token, body)`. See [Durable webhooks](/docs/authoring/webhooks). |
+| `callEntity` | `callEntity<TResult = unknown>(name: string, key: string, op: string, arg?: unknown): Promise<TResult>` | Call a durable entity op (serialized per `key`) and await its result. See [Durable entities](/docs/authoring/entities). |
+| `signalEntity` | `signalEntity(name: string, key: string, op: string, arg?: unknown): Promise<void>` | Send an entity op fire-and-forget (no result awaited). |
+
+### State & metadata
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `patched` | `patched(id: string): Promise<boolean>` | Guard an in-place workflow change without a new version: `true` for a fresh run (takes the new branch), `false` for a run whose history predates the guard. See [Versioning & determinism](/docs/authoring/versioning). |
+| `continueAsNew` | `continueAsNew(input?: unknown): Promise<never>` | End this run and start a fresh execution of the same workflow with clean history (id `<runId>~N`). Always throws — terminal. |
+| `sideEffect` | `sideEffect<T>(fn: () => T \| Promise<T>): Promise<T>` | Deterministic capture: run `fn` once, checkpoint the result, replay returns the SAME value without re-running `fn` (e.g. `uuidv7()`, `Math.random()`). |
+| `upsertSearchAttributes` | `upsertSearchAttributes(attrs: SearchAttributes): Promise<void>` | Shallow-merge typed, queryable metadata onto this run's `searchAttributes` — exactly-once (skipped on replay). |
+| `breakpoint` | `breakpoint(label?: string): Promise<void>` | Pause the run here until a human resumes it (`engine.continue(runId)` or the dashboard) — a durable debugger breakpoint. |
+
+### Supporting option types
+
+| Type | Shape | Notes |
+| --- | --- | --- |
+| `StepDispatchOpts` | `{ queue?, priority?, fairnessKey?, transport?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs? }` | Per-call override of a `@Step`-declared policy for a dispatched `ctx.step`. `queue` routes to a [flow-control](/docs/reliability/flow-control) queue; `priority`/`fairnessKey` apply within it. |
+| `StepOptions` | `{ retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs?, compensate? }` | Options for `ctx.task`/`ctx.localStep`. `compensate` registers a saga undo (local steps only). |
+| `ChildCallOptions` | `{ childId?, priority? }` | Options for `ctx.child`/`ctx.startChild` (a bare string is shorthand for `{ childId }`). `priority` only affects a remote child. |
+
+## Decorators
+
+From `@dudousxd/nestjs-durable`.
+
+### `@Workflow(options)`
+
+Marks a provider class as a durable workflow; its `run(ctx, input)` becomes the replayed body.
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `name` | `string` | Required. Registered workflow name. |
+| `version` | `string` | Default `'1'`. Old runs keep resuming on the version they started on. |
+| `deadLetterWorkflow` | `WorkflowRef` | Route this workflow's dead runs to another registered workflow (class or name). Superseded by an inline `@DeadLetter()` method on the same class. See [Dead-letter queue](/docs/reliability/dead-letter). |
+| `tags` | `string[]` | Static labels stamped on every run, merged with per-run `start` tags. |
+| `singleton` | `SingletonConfig` (`{ key, limit?, maxQueueDepth? }`) | Durable FIFO mutex per key. See [Singleton workflows](/docs/reliability/singleton). |
+| `executionTimeout` | `string \| number` | Max wall-clock lifetime; an overrunning run is cancelled (`execution_timeout`) by the timer poller. |
+| `inputSchema` | `class` | Validate `start` input against a class-validator DTO (needs `class-validator`/`class-transformer`). |
+| `validateInput` | `(input: unknown) => void \| Promise<void>` | Custom validator; takes precedence over `inputSchema`. |
+| `onEvent` | `string[]` | Start a fresh run whenever any of these events is published. Merged with `@OnEvent`. |
+| `debounce` | `string \| number` | Coalesce `onEvent` triggers: fire once quiet for this long, with the last payload. |
+| `batch` | `{ maxSize: number; within: string \| number }` | Coalesce `onEvent` triggers: fire on size or window, with all payloads. |
+
+### `@Step(nameOrOptions?)`
+
+Marks a provider method as a durable step handler, routed BY NAME (derived `Class.method`, or explicit).
+
+| Form | Notes |
+| --- | --- |
+| `@Step()` | Bare — name derived as `` `${ClassName}.${method}` ``. |
+| `@Step('custom:name')` | Explicit name override. |
+| `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs? })` | Object form — `input`/`output` are opt-in runtime zod schemas validated at the serve boundary; `retries`/`backoff`/`backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` are the def-level dispatch policy `ctx.step` reads (a per-call `opts` overrides field-by-field). See [Retries & backoff](/docs/reliability/retries). |
+
+| StepOptions field | Type | Notes |
+| --- | --- | --- |
+| `name` | `string` | Explicit routing name override. |
+| `input` | `z.ZodType` | Runtime input schema. |
+| `output` | `z.ZodType` | Runtime output schema. |
+| `retries` | `number` | Max attempts before the step (and run) fails. |
+| `backoff` | `'fixed' \| 'exp'` | Constant or doubling delay between retries. |
+| `backoffMs` | `number` | Base delay in ms. |
+| `backoffMaxMs` | `number` | Upper bound on the (exponential) delay. |
+| `jitter` | `boolean` | Random 50–100% jitter to avoid thundering herds. |
+| `timeoutMs` | `number` | Liveness window; no result/heartbeat within it fails the dispatch with `RemoteStepTimeout` (retryable). |
+
+### `@DeadLetter()`
+
+Marks a method on a `@Workflow` class as its inline dead-letter handler — registered as
+`<workflow>.dlq`, receives a `DeadLetter` payload (`{ deadRunId, workflow, input, error? }`) when a
+run of the class is moved to `dead`. Takes precedence over `deadLetterWorkflow`. See
+[Dead-letter queue](/docs/reliability/dead-letter).
+
+### `@Entity(options)` / `@On(op)`
+
+`@Entity({ name })` marks an `@Injectable()` class as a durable entity (a keyed virtual object,
+constructible with no arguments); `@On(op)` marks a method as the handler for operation `op`, run
+serialized per key over durable state. Drive with `EntityService` or `ctx.callEntity`/`signalEntity`.
+See [Durable entities](/docs/authoring/entities).
+
+### `@OnEvent(...events)`
+
+Class decorator subscribing a `@Workflow` to one or more events — equivalent to
+`@Workflow({ onEvent })`; multiple declarations and the option are merged. See
+[Event-driven workflows](/docs/authoring/events).
+
+### `@StepInterceptor()`
+
+Marks an `@Injectable()` class implementing `intercept(invocation: StepInvocation, next: () => Promise<unknown>): Promise<unknown>`
+as onion middleware around every LOCAL step's real execution (first-declared runs outermost). Fires
+only when a step actually executes, never on replay.
+
+## WorkflowService
+
+Injectable NestJS-facing entry point (`packages/nestjs/src/workflow.service.ts`) — a thin pass-through
+to the `WorkflowEngine` it wraps.
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `start` | `start<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, runId?: string, opts?: StartOptions): Promise<RunResult>` | Enqueue a run (`pending`) and return immediately; a worker executes the body. `runId` defaults to a random id — pass your own for idempotent starts. |
+| `resume` | `resume(runId: string): Promise<RunResult>` | Resume a run's next turn. |
+| `waitForRun` | `waitForRun(runId: string, opts?: { timeoutMs?: number }): Promise<RunResult>` | Resolve once the run settles (terminal or suspended). Pair with `start` when a request needs the outcome. |
+| `signal` | `signal(token: string, payload: unknown): Promise<RunResult \| null>` | Deliver an external signal to the run waiting on `token`. |
+| `signalWithStart` | `signalWithStart<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, runId: string, signal: { token: string; payload?: unknown }, opts?: StartOptions): Promise<{ runId: string }>` | Ensure the run exists, then signal it — race-free (buffered if the run isn't waiting yet). The durable-entity / accumulator pattern. |
+| `publishEvent` | `publishEvent(name: string, payload: unknown, opts?: { id?: string }): Promise<number>` | Resume every run parked on `ctx.waitForEvent(name, …)` and start every `@Workflow({ onEvent })` subscriber; returns the count touched. |
+
+## WorkflowEngine (selected public surface)
+
+`WorkflowService` and the decorators cover most app code; reach for the engine directly (injectable)
+for dashboard/control-plane operations. This is a curated subset, not the full class.
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `start` | `start(workflow: WorkflowRef, input: unknown, runId: string, opts?: StartOptions): Promise<RunResult>` | Create + enqueue a run. Idempotent by `runId` — a redelivered `runId` returns the existing run's state. |
+| `signal` | `signal(token: string, payload: unknown): Promise<RunResult \| null>` | Deliver a signal; buffers it if no run is waiting yet (reliable regardless of arrival order). |
+| `signalWithStart` | `signalWithStart(workflow: WorkflowRef, input: unknown, runId: string, signal: { token: string; payload?: unknown }, opts?: StartOptions): Promise<{ runId: string }>` | Ensure-then-signal, race-free. |
+| `update` | `update(runId: string, name: string, arg: unknown): Promise<UpdateResult>` | Deliver a validated update to a run waiting at `ctx.onUpdate(name)`. Runs the registered validator first; rejection never touches the run. |
+| `registerUpdateValidator` | `registerUpdateValidator<TArg>(workflow: string, name: string, validate: UpdateValidator<TArg>): void` | Register (or replace) the validator gating `update` for a `(workflow, name)` pair. See [Queries & updates](/docs/authoring/queries-and-updates). |
+| `getEvent` | `getEvent<T = unknown>(runId: string, key: string): Promise<T \| undefined>` | Side-effect-free read of the latest value a run published via `ctx.setEvent`. |
+| `publishEvent` | `publishEvent(name: string, payload: unknown, opts?: { id?: string }): Promise<number>` | Same as `WorkflowService.publishEvent`. |
+| `cancel` | `cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult \| null>` | Cancel a run. `{ compensate: true }` resumes it first so registered saga undos run in reverse (status `cancelling` in the interim) before it settles `cancelled`. |
+| `cancelWhere` | `cancelWhere(filter: Omit<RunQuery, 'limit' \| 'offset'>, opts?: { compensate?: boolean }): Promise<RunResult[]>` | Bulk-cancel every run matching a `RunQuery` filter (workflow/status/tag/search-attribute), each through `cancel`. |
+| `retryWithInput` | `retryWithInput(runId: string, input: unknown, newRunId?: string): Promise<{ runId: string } \| null>` | Fix-and-replay: start a NEW run (default id `<runId>~retry~<uuid>`) with corrected `input`, clean history; the original stays inspectable. |
+| `deleteRun` | `deleteRun(runId: string): Promise<number>` | Hard-delete a run and its whole child subtree (cascades depth-first). Returns the count removed. Prefer `cancel` for a still-live run. |
+| `getRunChildren` | `getRunChildren(parentRunId: string): Promise<string[]>` | Ids of the runs this run spawned (awaited `ctx.child` + fire-and-forget `ctx.startChild`), stable even after they finish. |
+| `waitForRun` | `waitForRun(runId: string, opts?: { timeoutMs?: number }): Promise<RunResult>` | Same as `WorkflowService.waitForRun`. |
+| `completeTask` | `completeTask(runId: string, name: string, result: unknown): Promise<RunResult \| null>` | Report a `ctx.task(name, …)`'s async result back to its run. |
+| `failTask` | `failTask(runId: string, name: string, error: string): Promise<RunResult \| null>` | Report a `ctx.task` failure — the run resumes and throws a `FatalError` at the task. |
+| `onDead` | `onDead(listener: (run: WorkflowRun) => void): () => void` | Subscribe to dead-lettered runs (moved to `dead` past `maxRecoveryAttempts`). Returns an unsubscribe fn. |
+| `onEnqueued` | `onEnqueued(listener: (runId: string) => void): () => void` | Subscribe to runs enqueued on ANOTHER instance (control-plane broadcast) — a worker can pick them up immediately instead of waiting for its next poll. |
+| `onCancel` | `onCancel(listener: (runId: string) => void): () => void` | Subscribe to cancellations on ANY instance — for cooperative in-flight abort. |
+| `drain` | `drain(timeoutMs?: number): Promise<void>` | Graceful shutdown: stop picking up new runs, wait for in-flight executions up to `timeoutMs` (default 10000). |
+| `workerHealth` | `workerHealth(extra?: string[]): Promise<GroupHealth[]>` | Per-group queue backlog + live worker heartbeats (only transports that support introspection, e.g. BullMQ). |
+| `recoverIncomplete` | `recoverIncomplete(nowMs?: number): Promise<RunResult[]>` | Resume every run left `running` by a crash/deploy. Call on boot. |
+| `resumeDueTimers` | `resumeDueTimers(nowMs?: number): Promise<RunResult[]>` | Resume every suspended run whose durable timer is due. Call periodically. |
+| `runPending` | `runPending(nowMs?: number): Promise<RunResult[]>` | Pick up and execute every `pending` run (poll-based dispatch for a broker-less worker pod). |
+| `sweepTimeouts` | `sweepTimeouts(now?: number): Promise<void>` | Cancel in-flight runs that outlived their `@Workflow({ executionTimeout })`. |
+| `continue` | `continue(runId: string): Promise<RunResult \| null>` | Resume a run paused at `ctx.breakpoint` (the dashboard "continue" button). `null` if not paused there. |
+| `getRun` | `getRun(runId: string): Promise<WorkflowRun \| null>` | Read a run's current persisted state. |
+| `registerEntity` | `registerEntity<S>(name: string, config: EntityConfig<S>): void` | Register a durable entity's handlers + initial state. |
+| `use` | `use(interceptor: StepInterceptor): () => void` | Register a `StepInterceptor` (onion middleware around real local-step execution). |
+| `subscribe` | `subscribe(listener: EngineListener): () => void` | Subscribe to every `EngineEvent` (lifecycle events) the engine emits. |
+
+`engine.runSchedules` is **not** a method — `runSchedules(engine, schedules, nowMs, opts?)` is a
+standalone function exported from `@dudousxd/nestjs-durable-core` (`scheduler.ts`) that starts each
+`ScheduledWorkflow`'s current time-bucket run id (idempotent via `engine.start`). The NestJS module's
+`schedules` option wires it to the timer poller automatically — see [Scheduling](/docs/authoring/scheduling).
+
+## DurableModuleOptions
+
+Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / **thin worker** /
+**operator + co-located worker**) is inferred from which of `store` / `connection` are set.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `store` | `StateStore` | — | Set to play the **operator** role. See [State stores](/docs/stores). |
+| `transport` | `Transport` | — | Single task transport. Required alongside `store`. See [Transports](/docs/transports). |
+| `transports` | `NamedTransport[]` | — | Ordered pool for failover / multi-broker, instead of `transport`. |
+| `controlPlane` | `ControlPlane` | first broadcast-capable transport | Cross-instance lifecycle-event + cancellation pub/sub. |
+| `timerPollMs` | `number` | `1000` | Durable-timer poller interval; `0` disables it. Operator only. |
+| `autoSchema` | `boolean` | `true` | Auto-create durable tables via `store.ensureSchema()` on boot. Turn off in production; migrate instead. |
+| `namespace` | `string` | unset = **operator** | Worker-pool partition; poll paths only act on runs in this namespace. See [Tenancy & topologies](/docs/concepts/tenancy). |
+| `leaseMs` | `number` | `30000` | Multi-instance recovery-lease duration. Operator only. |
+| `instanceId` | `string` | random | Unique id for this instance (leases, worker heartbeats). |
+| `maxRecoveryAttempts` | `number` | unlimited | Cap recovery attempts before a poison-pill run moves to `dead`. See [Dead-letter queue](/docs/reliability/dead-letter). |
+| `remoteAdvanceSilenceMs` | `number` | unbounded await | Liveness deadline for a remote (polyglot) workflow `advance`; each heartbeat rearms it. Operator only. |
+| `deadLetterWorkflow` | `WorkflowRef` | none | Default DLQ target for workflows without their own. Operator only. |
+| `drive` | `boolean` | `true` | Whether this operator instance actively drives runs (poll/recover/resume/prune/consume). `false` = dashboard/dispatch-only. |
+| `shutdownTimeoutMs` | `number` | `10000` | Max ms to wait for in-flight runs on shutdown. Operator only. |
+| `schedules` | `ScheduledWorkflow[]` | none | Recurring workflows (fixed interval or cron), fired by the timer poller on driving instances. See [Scheduling](/docs/authoring/scheduling). |
+| `retention` | `DurableRetentionOptions` (`{ policies, sweepInterval?, batchSize? }`) | keep all history | Hard-prune terminal run history on an interval. See [Run retention & pruning](/docs/reliability/retention). |
+| `webhookUrl` | `(token: string) => string` | none (build your own) | Builds `DurableWebhook.url` for `ctx.webhook()`. Operator only. |
+| `queues` | `QueueConfig[]` | none | Flow-control queues registered on the engine at startup. See [Flow control](/docs/reliability/flow-control). |
+| `admission` | `AdmissionBackend` | in-process caps | Backend for `queues` — pass a Redis-backed one to make limits fleet-global. Operator only. |
+| `traceparent` | `() => string \| undefined` | none | Current W3C traceparent to stamp on dispatched remote tasks. Operator only. |
+| `context` | `() => Record<string, unknown> \| undefined` | auto-fed from `@dudousxd/nestjs-context` if installed, else none | Opaque context carrier (tenant/user/correlation ids) stamped on dispatched tasks. Operator only. |
+| `compensationRetries` | `number` | `1` | Attempts per saga compensation on run failure. Operator only. |
+| `scopeReads` | `boolean` | `false` | Confine the store's reads to `namespace` (tenant-boundary view) instead of the operator (all-namespaces) view. Needs a store with `withScope`. |
+| `connection` | `string \| Record<string, unknown>` | — | ioredis connection for a **thin worker** or a **co-located worker** consumer. Set to play a worker role. |
+| `partition` | `string` | `'default'` | Isolation partition a worker role serves/dispatch-suffixes (`<name>@<partition>`). Ignored for a plain operator. |
+| `prefix` | `string` | `'durable'` | Key prefix namespacing the durable queues for a worker role's consumer. Ignored for a plain operator. |
+| `concurrency` | `ConcurrencyOption` (`number \| 'adaptive' \| { mode: 'adaptive', ... }`) | `1` | Tasks a worker role's consumer runs concurrently per subscribed queue. Ignored for a plain operator. |
+| `concurrencyByHandler` | `Record<string, ConcurrencyOption>` | falls back to `concurrency` | Per-handler concurrency override — not yet wired through `runRedisWorker`. |
+| `runGatewayTimeoutMs` | `number` | `10000` | Timeout for a thin worker's `RunGateway` round-trip over `transport`. Ignored for an operator. |
+
+## Errors
+
+All exported from `@dudousxd/nestjs-durable-core`.
+
+| Error | Thrown when |
+| --- | --- |
+| `FatalError` | Thrown BY YOU inside a step/workflow for an unrecoverable business failure (e.g. a declined card) — the engine never retries it and fails the run immediately. |
+| `SignalTimeoutError` | `ctx.waitForSignal` / `ctx.waitForEvent` / `ctx.onUpdate`'s `timeoutMs` deadline passes before delivery. Catchable in the workflow to take a default branch. |
+| `NonDeterminismError` | On resume, the step at a logical position has a different name/kind than its checkpoint — the workflow code changed under an in-flight run without a new `@Workflow` version. See [Versioning & determinism](/docs/authoring/versioning). |
+| `SingletonQueueFullError` | `start` on a singleton workflow whose in-flight + gated backlog already equals `limit + maxQueueDepth`. Back-pressure — retry later. See [Singleton workflows](/docs/reliability/singleton). |
+| `GatherError` | `ctx.all` — one or more parallel children failed; carries per-item `{ index, id, error }` failures. |
+| `RemoteStepTimeout` | A dispatched step produces no result/heartbeat within its `timeoutMs` — the worker is presumed dead. Retryable, subject to the step's `retries`. |
+| `RemoteWorkflowTimeout` | A remote `WorkflowExecutor.advance` produces no decision/heartbeat within its configured `timeoutMs`. Recoverable, not a run failure — the engine releases the lease and lets `recoverIncomplete` re-drive. |
+| `ContinueAsNew` | Thrown internally by `ctx.continueAsNew(input)` to unwind the current run and hand off to a fresh execution. Not meant to be caught by workflow code. |
+| `WorkflowSuspended` | Internal control signal the engine throws to stop execution and persist `wakeAt`/suspension state. Not a user-facing error — never throw or catch it yourself. |
+
+## Statuses
+
+### Run status (`RunStatus`)
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Created + enqueued by `start`, not yet picked up. |
+| `running` | A worker is actively executing (or replaying) this run's body. |
+| `suspended` | Parked with zero compute — on a sleep, a signal/event/update, an awaited step or child. |
+| `cancelling` | A compensating `cancel({ compensate: true })` is in progress (saga undo running). Non-terminal. |
+| `completed` | Finished successfully. Terminal. |
+| `failed` | Finished with an unrecovered error. Terminal. |
+| `cancelled` | Cancelled (with or without compensation). Terminal. |
+| `dead` | Dead-lettered: crash-recovery gave up after `maxRecoveryAttempts` (a poison pill). Terminal. |
+
+Only `completed` / `failed` / `cancelled` / `dead` are **terminal** — eligible for
+[retention pruning](/docs/reliability/retention) and never transition on their own again.
+
+### Checkpoint status (`StepCheckpoint['status']`)
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | A remote step dispatched and awaiting its worker's result; the run is durably suspended. |
+| `running` | A local step's body is executing in-process right now. |
+| `completed` | Settled successfully — short-circuits on replay (the step is NOT re-executed). |
+| `failed` | Settled with an error — re-awaited (remote) or re-run (local) on replay unless retries are exhausted. |

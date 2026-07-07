@@ -1,0 +1,145 @@
+---
+title: Singleton workflows
+description: "@Workflow({ singleton }) serializes runs that share a key — a durable, FIFO mutex: at most limit run concurrently per key, the rest wait (suspended) and admit in creation order as slots free, with an optional maxQueueDepth back-pressure cap that rejects a start with SingletonQueueFullError instead of letting the same-key backlog grow forever."
+---
+
+Some work must never overlap for a given key, even though many *different* keys should run freely in
+parallel — one inventory sync per store, one statement generation per account, one deploy per
+environment. `singleton` is a durable, FIFO mutex over a workflow's runs: declare a key function once,
+and the engine guarantees at most `limit` runs sharing that key are ever in flight at the same time,
+across every instance.
+
+## Declaring a singleton: `@Workflow({ singleton })`
+
+```ts
+@Workflow({
+  name: 'sync-inventory',
+  singleton: { key: (input) => `store:${(input as { storeId: string }).storeId}` },
+})
+export class SyncInventoryWorkflow {
+  async run(ctx: WorkflowCtx, input: { storeId: string }) {
+    const items = await ctx.step(this.inventory.fetch, input);
+    await ctx.step(this.inventory.reconcile, items);
+  }
+}
+```
+
+With the key derived from `storeId`, two `sync-inventory` runs for `storeId: 'A'` never
+overlap, while a run for `storeId: 'B'` proceeds independently — its own key, its own slot. `SingletonConfig`
+has three fields:
+
+- `key` — derives the serialization key from the workflow's input. Any two runs whose `key(input)` returns
+  the same string compete for the same slot(s); everything else is unaffected.
+- `limit` — max concurrent runs sharing the key. Defaults to `1` (a true mutex, one at a time).
+- `maxQueueDepth` — caps the same-key *backlog* (see below). Omit for the old unbounded-queue behavior.
+
+## What happens when a second start arrives
+
+A singleton run is tagged `singleton:<key>` at start time so the admission gate can find every other
+run sharing that key (`packages/core/src/engine.ts:873-880`). When a run is picked up for its first
+execution, the gate checks whether it's among the `limit` **oldest** in-flight runs (status `running` or
+`suspended`, sorted by `(createdAt, id)`) sharing the key:
+
+```ts
+// packages/core/src/singleton-gate.ts:68-80
+async admit(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
+  const inflight = (await this.deps.store.listRuns({
+    tag: this.tag(cfg, run.input),
+    workflow: run.workflow,
+    statuses: ['running', 'suspended', 'cancelling'],
+  })).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+  const idx = inflight.findIndex((r) => r.id === run.id);
+  return idx >= 0 && idx < (cfg.limit ?? 1);
+}
+```
+
+If it wins a slot, it runs normally. If it doesn't, it's **not rejected** — it's suspended with a
+retry `wakeAt` (~1s, jittered ±250ms so a queue of gated runs doesn't wake in lockstep and stampede the
+next admission scan) and re-checks admission every time the timer poller wakes it. The sort is total —
+`(createdAt, id)` — so every instance computes the identical ordering: admission is FIFO and race-free
+across a fleet, not just within one process.
+
+Completion is push, not just poll: when a singleton run settles, the engine immediately notifies the
+oldest gated waiter(s) sharing its key (`wakeNext`, `packages/core/src/singleton-gate.ts:88-106`) instead
+of making them wait out their retry timer. The durable retry timer still exists as the crash/cross-instance
+fallback — if the notify is missed (e.g. the notifying instance dies first), the next timer tick catches up.
+
+```ts
+// A: singleton run, holds the slot on a long wait
+await startRun(engine, 'sync-inventory', { storeId: 'A' }, 'run-1');
+// B: same key, key is taken → suspended, gated behind A
+await startRun(engine, 'sync-inventory', { storeId: 'A' }, 'run-2');
+// C: different key → its own slot, runs immediately
+await startRun(engine, 'sync-inventory', { storeId: 'B' }, 'run-3');
+```
+
+A `pending` run (enqueued but not yet picked up for execution) doesn't count toward admission — only
+`running`/`suspended`/`cancelling` do — so a run can't be gated before it's even started running once
+(`packages/core/src/engine.ts:2433-2435`). A `cancelling` run skips the gate entirely: it's tearing down,
+not competing for a slot.
+
+## Bounding the queue: `maxQueueDepth` and `SingletonQueueFullError`
+
+Left unset, the same-key backlog can grow without bound — every `start` for a busy key is accepted and
+simply queues behind the ones ahead of it. Set `maxQueueDepth` to cap it: once in-flight + gated runs
+sharing the key reach `limit + maxQueueDepth`, a further `start` is rejected outright with
+`SingletonQueueFullError`, and **no run is created** for it — back-pressure against an unbounded backlog
+instead of silently piling up work nobody will get to for hours:
+
+```ts
+@Workflow({
+  name: 'sync-inventory',
+  singleton: {
+    key: (input) => `store:${(input as { storeId: string }).storeId}`,
+    limit: 1,
+    maxQueueDepth: 2, // at most 1 running + 2 waiting per store; a 4th start is rejected
+  },
+})
+export class SyncInventoryWorkflow { /* ... */ }
+```
+
+```ts
+try {
+  await engine.start('sync-inventory', { storeId: 'A' }, requestId);
+} catch (err) {
+  if (err instanceof SingletonQueueFullError) {
+    // err.workflow, err.key, err.maxQueueDepth are all populated — retry later or shed the request.
+  }
+  throw err;
+}
+```
+
+The check (`assertCapacity`, `packages/core/src/singleton-gate.ts:50-61`) counts `pending`/`running`/
+`suspended`/`cancelling` runs sharing the key in one scan and compares against `(cfg.limit ?? 1) +
+cfg.maxQueueDepth`. It runs *before* the run row is written, so a rejected start leaves no trace in the
+store. Once a slot frees (notify-on-release promotes the oldest waiter), the backlog count drops below
+the cap and the next `start` is admitted again.
+
+## Interaction with `signalWithStart`
+
+`signalWithStart` is just `start` (idempotent by `runId`) followed by a signal — it doesn't bypass the
+singleton gate. If the workflow it starts is a singleton and the derived key is already busy, the new run
+is created (or, with `maxQueueDepth` set, rejected with `SingletonQueueFullError` exactly as any other
+start) and gates like any other same-key run before its body — and therefore the signal it's waiting for
+— ever executes. Don't rely on `signalWithStart` to get a singleton-gated entity moving immediately; it
+still queues behind whatever else shares its key.
+
+## Singleton key vs. a deterministic `runId`
+
+Both look like "dedupe," but they solve different problems:
+
+- **Deterministic `runId`** dedupes the *start itself*. `start` is idempotent by `runId`
+  (`packages/core/src/engine.ts:866-871`): if a run with that id already exists, the call is a no-op that
+  returns the existing run's state — no new run, nothing queues. Use this when a redelivered trigger (an
+  at-least-once queue, a retried request) must not create a second run of *the same logical job*.
+- **`singleton` key** serializes *distinct* runs. Two different `runId`s that share a singleton key are
+  two real runs — each gets its own history, its own dashboard entry — but the engine admits only `limit`
+  of them at a time and gates the rest. Use this when overlapping runs for the same key are the problem
+  even though each one is a legitimately distinct execution (e.g. two independently-triggered inventory
+  syncs for the same store shouldn't race each other, but both should eventually run and both should be
+  individually inspectable).
+
+In short: a deterministic `runId` says "this is the same job, don't start it twice"; `singleton` says
+"these may be different jobs, but only one of them may run at a time." They compose — a singleton
+workflow can still be started with a deterministic `runId` to also dedupe exact-duplicate triggers on top
+of the per-key serialization.

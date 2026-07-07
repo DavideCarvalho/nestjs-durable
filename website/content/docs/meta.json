@@ -3,16 +3,24 @@
   "pages": [
     "index",
     "getting-started",
+    "comparison",
     "concepts",
     "authoring",
     "reliability",
     "transports",
     "stores",
     "observability",
+    "---Guides---",
+    "patterns",
+    "production",
+    "troubleshooting",
     "---Cross-language---",
     "python",
+    "---Tooling---",
     "tooling",
     "testing",
-    "cli"
+    "cli",
+    "---Reference---",
+    "api-reference"
   ]
 }

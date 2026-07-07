@@ -1,4 +1,4 @@
 {
   "title": "Observability",
-  "pages": ["dashboard", "otel", "telescope"]
+  "pages": ["dashboard", "otel", "metrics", "telescope"]
 }

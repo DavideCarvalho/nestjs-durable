@@ -156,6 +156,76 @@ HTTP:
   `ctx.onUpdate(name)`; the request body is the update argument. Any validator registered via
   `engine.registerUpdateValidator` runs first, so a rejected update never reaches the run.
 
+## Engine health & admin surface
+
+The dashboard's **Workers** panel and its retry/cancel actions are a thin layer over methods
+`WorkflowEngine` exposes directly — useful when you're scripting an operational task instead of
+clicking through the SPA.
+
+**Worker liveness and adaptive concurrency** — `engine.workerHealth(extra?: string[])` returns one
+`GroupHealth` per worker group (the same call the dashboard's `/durable/api/workers` route and the
+[Telescope](/docs/observability/telescope) worker panels use):
+
+```ts
+interface GroupHealth {
+  group: string;
+  /** Outstanding jobs in the group's task queue (waiting + active + delayed + prioritized). */
+  depth: number;
+  /** Workers with a non-expired heartbeat for this group. */
+  liveWorkers: WorkerHeartbeat[];
+}
+
+interface WorkerHeartbeat {
+  group: string;
+  /** Stable per-process id (host + pid) — N replicas of a group each show as a distinct worker. */
+  instanceId: string;
+  lastBeatAt: number;
+  /** Present on newer SDKs: concurrency mode/limit, in-flight, RAM %/CPU %, throughput, p95, last adjust. */
+  status?: WorkerStatus;
+}
+```
+
+`depth > 0 && liveWorkers.length === 0` is the actionable alert — work queued with nothing consuming
+it. Pass `extra` to include local-step groups the engine can't derive from its registrations (they
+have no heartbeat to discover otherwise). Only a `groupHealth`-capable transport (BullMQ) returns
+non-empty results.
+
+**Bulk operations:**
+
+- **`engine.cancelWhere(filter, opts?)`** — cancel every run matching a `RunQuery` (workflow /
+  status / tag / search-attribute predicates) — the same matching the dashboard's run list uses.
+  Each match runs through the normal `cancel` path (child cascade, optional saga `compensate`,
+  cancel listeners, control-plane broadcast), so it's the scriptable form of selecting rows and
+  hitting Cancel. Returns one `RunResult` per matched run.
+- **`engine.deleteRun(runId)`** — hard-delete a run and its entire subtree (checkpoints, signal
+  waiters, search-attribute rows), cascading depth-first via `getRunChildren`. Unlike `cancel`, the
+  run vanishes from `getRun`/`listRuns` entirely. Returns the number of runs deleted. Prefer `cancel`
+  for a still-live run — deleting one mid-flight orphans its worker.
+- **`engine.getRunChildren(parentRunId)`** — the ids a run spawned via `ctx.child` (awaited) or
+  `ctx.startChild` (fire-and-forget), the same parent→children edge `cancelWhere`'s cascade and the
+  dashboard's run-tree both walk.
+
+**Graceful shutdown** — `engine.drain(timeoutMs = 10_000)` stops the engine picking up new runs
+(recovery and the timer poller become no-ops) and waits for in-flight executions to settle, up to
+`timeoutMs`. Call it from your app's shutdown hook so a deploy hands off cleanly instead of leaving
+runs to time out their lease.
+
+**Cross-instance hooks** — `onEnqueued`/`onCancel` let a worker react to activity from *other*
+instances over the control plane, without polling:
+
+```ts
+// Wire a worker to pick up a run the instant another pod enqueues it.
+const stopEnqueued = engine.onEnqueued((runId) => engine.runOne(runId));
+
+// Cooperative cancellation: abort in-flight work instead of finishing it just to
+// have the result discarded.
+const stopCancel = engine.onCancel((runId) => myWorkerBridge.abort(runId));
+```
+
+Both return an unsubscribe function. `onEnqueued` is only useful on instances that should execute
+runs (workers); `onCancel` is for a worker bridge doing cooperative cancellation of long in-flight
+work (a subprocess, a remote call) that a plain status flip can't interrupt.
+
 ## API
 
 The SPA is backed by a small JSON API you can also call directly. A **codegen-emitted typed client**
@@ -176,6 +246,7 @@ await durableClient.retry(detail.run.id);
 | `GET` | `/durable/api/runs/:id` | run + step timeline |
 | `GET` (SSE) | `/durable/api/runs/:id/stream` | live-tail the run's lifecycle events |
 | `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |
+| `POST` | `/durable/api/runs/:id/retry-with-input` | fix-and-replay: start a fresh linked run from a dead/failed run with a corrected input (body: `{ input }`) |
 | `POST` | `/durable/api/runs/:id/cancel` | cancel the run (`?compensate=true` to undo the saga first) |
 | `POST` | `/durable/api/runs/:id/continue` | resume a run paused at a breakpoint |
 | `POST` | `/durable/api/webhooks/:token` | deliver a `ctx.webhook()` callback (body resumes the run) |

@@ -23,12 +23,27 @@ interface ScheduledWorkflow {
   cron?: string;
   /** IANA timezone the `cron` fires in (e.g. `America/Sao_Paulo`). Defaults to UTC. */
   timezone?: string;
+  /** Temporarily stop firing this schedule (kept registered). Defaults to false. */
+  paused?: boolean;
+  /** What to do when the previous window's run hasn't finished (fixed-interval only): `'allow'`
+   *  (default) starts the new window anyway; `'skip'` skips it while the prior run is still
+   *  `running`/`suspended`. */
+  overlap?: 'allow' | 'skip';
+  /** Randomly delay dispatch by up to this many ms, to spread load across instances ticking the
+   *  same boundary. Opt-in; absent = fire immediately. */
+  jitter?: number;
+  /** Enqueue windows missed while the scheduler was down, instead of silently skipping them.
+   *  `maxCatchup` bounds how many prior windows are backfilled. Opt-in; absent = only the current
+   *  window fires. */
+  backfill?: { maxCatchup: number };
 }
 ```
 
 Every schedule has a stable `key`, the `workflow` to start, and an optional `input`. The cadence is
 either `everyMs` (a fixed interval) **or** `cron` + `timezone` (a calendar expression) — they are
-mutually exclusive.
+mutually exclusive. The rest of the fields tune what happens around a fire: `paused` to stop it
+temporarily, `overlap` to guard against pile-up, `jitter` to spread load, and `backfill` to catch up
+on windows missed during downtime — each covered below.
 
 ## Wiring it up — the `schedules` option
 
@@ -116,6 +131,75 @@ npm i cron-parser
 
 Omitting it and using a `cron` schedule throws a clear error pointing you to install it.
 
+## Pausing a schedule — `paused`
+
+Set `paused: true` to stop a schedule from firing without removing it from your config. It stays
+registered — the dashboard still lists it, and un-pausing it later just resumes ticking — but the
+poller skips it entirely on every tick while paused:
+
+```ts
+{ key: 'nightly-report', workflow: 'daily-report', cron: '0 2 * * *', paused: true }
+```
+
+## Skipping overlapping runs — `overlap`
+
+By default (`overlap: 'allow'`), a fixed-interval schedule starts every window on schedule even if the
+previous window's run is still going — a slow run and a fresh one can end up in flight together. Set
+`overlap: 'skip'` to skip a window instead, while the immediately preceding window's run is still
+`running` or `suspended`:
+
+```ts
+{ key: 'cache-sync', workflow: 'cache-sync', everyMs: 60_000, overlap: 'skip' }
+```
+
+This is **fixed-interval only** (it checks the previous `everyMs` bucket) — cron windows aren't
+adjacent ids in the same way, so `overlap` has no effect on a `cron` schedule.
+
+## Dispatch jitter — `jitter`
+
+When many instances tick on the same boundary, they all try to start the same window at once. `jitter`
+randomly delays the dispatch by up to that many ms before firing, spreading the load instead of every
+instance hitting the store in the same instant:
+
+```ts
+{ key: 'cache-sync', workflow: 'cache-sync', everyMs: 60_000, jitter: 5_000 } // fire within 5s of the tick
+```
+
+Jitter only delays *when* an instance attempts the dispatch — it does not change the run id (still the
+time bucket), so idempotency is unchanged: however many instances jitter the same window, it still
+starts exactly once.
+
+## Catching up on missed windows — `backfill`
+
+If the process running the poller is down when a window would have fired, that window is missed —
+by default, only the *current* window fires the next time the poller runs. Set `backfill` to enqueue
+the windows that were missed instead:
+
+```ts
+{ key: 'hourly-rollup', workflow: 'hourly-rollup', everyMs: 60 * 60 * 1000, backfill: { maxCatchup: 6 } }
+```
+
+`maxCatchup` bounds how many *prior* windows are backfilled, so a long outage can't flood the system
+with a backlog — at most `maxCatchup` missed windows start, oldest first, followed by the current one.
+Backfilled runs use each missed window's own deterministic bucket run id, so if some of them already
+ran (e.g. another instance caught up first), `engine.start`'s idempotency skips those and only the
+genuinely-missing ones start.
+
+## Putting it together
+
+The four options compose — a schedule that skips pile-up, spreads load, and catches up after downtime:
+
+```ts
+{
+  key: 'hourly-rollup',
+  workflow: 'hourly-rollup',
+  everyMs: 60 * 60 * 1000,
+  overlap: 'skip', // don't pile up if a rollup runs long
+  jitter: 10_000, // spread dispatch across instances ticking the same hour
+  backfill: { maxCatchup: 6 }, // catch up on up to 6 hours missed while the poller was down
+}
+```
+
 ## Exactly-once across instances
 
 The guarantee that makes scheduling safe in a multi-instance deployment is the **idempotent
@@ -129,3 +213,37 @@ The mechanism is the same one used everywhere durability needs idempotency — s
 [Workflows & steps](/docs/concepts/workflows-and-steps) for how a deterministic run id underpins
 exactly-once starts in general. The result for scheduling: **each window starts exactly once**, no
 matter how many instances are racing the tick or how often the poller fires.
+
+## Driving schedules without the NestJS module
+
+The NestJS module's `TimerPoller` calls the underlying `runSchedules(engine, schedules, nowMs, opts?)`
+for you, once on boot and then on `timerPollMs` (default 1s). If you're using the engine directly —
+or driving schedules from your own poller, cron process, or serverless trigger — call it yourself:
+
+```ts
+import { runSchedules } from '@dudousxd/nestjs-durable-core';
+
+await runSchedules(engine, schedules, Date.now());
+```
+
+It fires each schedule's current window (applying `paused`/`overlap`/`jitter`/`backfill`) and returns
+the run ids it started. `opts` lets you override the `random`/`sleep` used for `jitter` — the engine
+uses real `Math.random`/`setTimeout` by default; tests inject deterministic ones instead.
+
+Two lower-level helpers back the run-id math, exported in case you need to look up or debug a
+schedule's run directly:
+
+- `scheduledRunId(key, everyMs, nowMs)` — the deterministic run id for a fixed-interval schedule's
+  current window (`sched:<key>:<bucket>`).
+- `prevCronFireMs(expr, nowMs, timezone?)` — the epoch ms of the most recent cron fire at or before
+  `nowMs`, evaluated in `timezone` (default UTC) — the same "bucket" a cron schedule's run id is keyed
+  on.
+
+For example, to check whether tonight's `daily-report` fire has already run:
+
+```ts
+import { prevCronFireMs } from '@dudousxd/nestjs-durable-core';
+
+const fireMs = prevCronFireMs('0 2 * * *', Date.now(), 'America/Sao_Paulo');
+const run = await engine.getRun(`sched:daily-report:${fireMs}`);
+```

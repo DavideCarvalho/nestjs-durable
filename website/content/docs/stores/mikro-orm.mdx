@@ -31,6 +31,25 @@ export default defineConfig({
 `ENTITIES` is `[WorkflowRunEntity, StepCheckpointEntity, RunAttributeEntity, SignalWaiterEntity, BufferedSignalEntity]` —
 the five tables the engine owns (`durable_*`). They never reference your entities.
 
+### Column naming
+
+`ENTITIES` is pinned to the canonical `snake_case` columns. If you need a different mapping — e.g.
+`'preserve'` to read a table an older, unpinned setup wrote in camelCase, or a custom function — build
+the schemas yourself with `durableEntities({ naming })` instead of importing `ENTITIES`:
+
+```ts
+import { durableEntities } from '@dudousxd/nestjs-durable-store-mikro-orm';
+
+export default defineConfig({
+  entities: [...durableEntities({ naming: 'snake_case' }), /* your own entities */],
+});
+```
+
+`naming` accepts `'snake_case'` (default), `'preserve'`, or `(property: string) => string`. The
+mapping is pinned explicitly on the entity schema rather than left to MikroORM's own naming strategy,
+since depending on the host strategy is what silently diverges the adapters — a run written by
+MikroORM has to stay readable by TypeORM, Prisma or Drizzle against the same table.
+
 ## 2. Wire the store into the module
 
 `MikroOrmStateStore` takes the `MikroORM` instance. Inject it and build the store in the factory:
@@ -50,6 +69,27 @@ DurableModule.forRootAsync({
 
 Each store operation runs on a forked `EntityManager`, so it owns its own unit of work and won't
 interfere with request-scoped EMs.
+
+## Tenant-scoped reads with `withScope`
+
+`MikroOrmStateStore` is the only bundled adapter that implements `withScope(scope)` — derive a store
+confined to one tenant `namespace`, sharing the same underlying connection:
+
+```ts
+const tenantStore = store.withScope({ namespace: 'acme-corp' });
+```
+
+This is what powers `DurableModule`'s `scopeReads: true` option: the module receives an
+already-built store and can't reconstruct it, so it asks for a scoped view through this optional
+capability. Reads (`listRuns`, `listIncompleteRuns`, `getRun`, …) go through a forked `EntityManager`
+with a `namespace` global filter active; writes bypass MikroORM global filters and are unaffected.
+Pass `{ namespace: undefined }` to get back the unscoped operator view.
+
+<Callout type="warn">
+  TypeORM, Prisma and Drizzle don't implement `withScope` — turning on `scopeReads` against any of
+  them is a silent no-op (the store keeps returning every namespace's runs). This is currently a
+  MikroORM-only capability.
+</Callout>
 
 ## Schema: auto on boot, or your own migration
 
@@ -75,3 +115,33 @@ DurableModule.forRoot({ store, transport, autoSchema: false });
 
 It only ever adds `durable_workflow_runs`, `durable_step_checkpoints`, `durable_run_attributes`,
 `durable_signal_waiters` and `durable_buffered_signals` — your tables are untouched.
+
+### The heal is fingerprint-gated
+
+`ensureMikroOrmDurableSchema` runs on every boot of every pod, and a full heal means
+`getUpdateSchemaSQL({ safe: true })` introspecting the **whole** database's `information_schema`
+(the store typically shares the host app's ORM) before filtering down to the durable tables —
+expensive to repeat on every steady-state boot. So a marker table, `durable_schema_meta`, records a
+SHA-256 fingerprint of the durable entity metadata last applied. On boot the module computes the
+current fingerprint and compares it to the stored one with two cheap round-trips (a
+`CREATE TABLE IF NOT EXISTS` for the marker plus one PK read); if they match, it returns immediately,
+skipping both the introspection and the collation check below.
+
+Only a fresh database (no marker row yet), an actual entity change, or a hand-bumped internal
+schema-revision constant triggers the full heal — done under a best-effort advisory lock (MySQL
+`GET_LOCK` / Postgres `pg_advisory_lock`) so concurrent pods don't race the same DDL, with a re-check
+after acquiring in case a sibling pod already healed while this one waited.
+
+### Collation auto-convergence (MySQL/MariaDB)
+
+MikroORM's auto-schema creates tables with the server's *default* collation (`utf8mb4_0900_ai_ci` on
+MySQL 8.4) and ignores the ORM's configured `collate` option. If your own tables are pinned to a
+different collation (commonly `utf8mb4_unicode_ci` via migrations), a `JOIN` between one of your
+tables and a durable table throws "Illegal mix of collations". The heal converges this automatically:
+after creating/extending the durable tables, it reads the ORM's configured `collate`, checks each
+durable table's current collation via `information_schema.tables`, and runs `ALTER TABLE ... CONVERT
+TO CHARACTER SET ... COLLATE ...` on any table that doesn't already match.
+
+This is idempotent (already-aligned tables are skipped), non-fatal (a failed `CONVERT` is logged as a
+warning, never crashes boot), and a no-op on Postgres/SQLite or when no `collate` is configured. It
+only runs as part of a full heal — the fingerprint gate above skips it too on a steady-state boot.

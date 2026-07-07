@@ -1,10 +1,11 @@
 ---
 title: CLI
-description: Inspect workflow runs and their step timelines from the terminal with `durable inspect`.
+description: Inspect and cancel workflow runs from the terminal with `durable inspect` and `durable cancel`.
 ---
 
-`@dudousxd/nestjs-durable-cli` gives you `durable inspect` — a quick look at runs and their step
-timelines without opening the [dashboard](/docs/observability/dashboard).
+`@dudousxd/nestjs-durable-cli` gives you `durable inspect` and `durable cancel` — a quick look at
+runs and their step timelines, and a way to stop one, without opening the
+[dashboard](/docs/observability/dashboard).
 
 ```bash
 pnpm add -D @dudousxd/nestjs-durable-cli
@@ -12,8 +13,8 @@ pnpm add -D @dudousxd/nestjs-durable-cli
 
 ## Point it at your store
 
-The CLI reads from a `durable.config.{mjs,js,cjs}` in your project that exports your already-
-configured store:
+The CLI reads from a `durable.config.{mjs,js,cjs}` in your project. Export your already-configured
+store as `store`, or as the default export:
 
 ```ts title="durable.config.mjs"
 import { MikroOrmStateStore } from '@dudousxd/nestjs-durable-store-mikro-orm';
@@ -21,6 +22,10 @@ import { buildOrm } from './src/orm';
 
 export const store = new MikroOrmStateStore(await buildOrm());
 ```
+
+A default export works too — either the store itself, or an object with a `store` property (e.g.
+`export default { store }`). The CLI checks `store`, then `default.store`, then `default`, in that
+order, and errors if none of them is a `StateStore`.
 
 ## Use it
 
@@ -46,8 +51,42 @@ wrun_8Kb2
   3  shipping.dispatch     (remote @logistics)  completed  800ms
 ```
 
+Reading the output:
+
+- `×2` after a step's duration is an attempt count — it only shows up once a step has retried
+  (`attempts > 1`); a step that succeeded on its first try has no suffix.
+- `@payments` / `@logistics` is the worker group the step ran on, shown only for steps that
+  recorded one.
+- Timestamps in the runs list (`UPDATED`) are relative — seconds/minutes/hours/days ago, rounded
+  to the coarsest unit that fits (`3s ago`, `2m ago`, `4h ago`, `1d ago`).
+
 | Option | Description |
 | --- | --- |
 | `--status <status>` | `running` / `suspended` / `completed` / `failed` / `cancelled` |
 | `--limit <n>` | max runs to list (default 50) |
 | `--config <path>` | path to the config (default: `./durable.config.{mjs,js,cjs}`) |
+
+## Cancel a run
+
+```bash
+durable cancel wrun_8Kb2
+```
+
+This marks the run `cancelled` in the store — a suspended run won't resume, and the recovery/timer
+poller skips it going forward. `--config` applies here too, same as `inspect`.
+
+It's a soft cancel, not a hard kill: if a step is already in flight on some worker, that worker
+finishes its current attempt before it next checks the run's status, so cancellation is observed at
+the next checkpoint rather than interrupting execution mid-step. Cancelling a run that's already
+`completed`, `failed`, or `cancelled` is a no-op — the CLI tells you it's already terminal and
+leaves it alone.
+
+## Usage and exit codes
+
+Running `durable` with no subcommand, or an unrecognized one, prints the usage text instead of
+doing anything:
+
+```bash
+durable            # prints usage, exits 0
+durable frobnicate  # prints usage, exits 1 (unknown subcommand)
+```

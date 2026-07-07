@@ -51,13 +51,37 @@ export class CheckoutWorkflow {
 
 If `allocate-shipment` throws (and exhausts its retries, or throws a `FatalError`), the run fails — but
 before it does, the engine refunds the card and releases the inventory. The saga is reconstructed from the
-run's history on replay, so it works correctly even after a crash: the steps that completed are the ones
-whose compensations get registered.
+run's history on replay, so it works correctly even after a crash: on replay, a completed `localStep`
+checkpoint returns its saved output *without re-running `fn`* — but a `compensate` callback still gets
+pushed onto the in-memory compensation stack for it, exactly as it was the first time. That's what makes the
+saga crash-safe: after a mid-run crash, the resumed execution reconstructs the full stack of undos for every
+step that had actually completed, not just the ones this pass happened to run.
 
 > Compensations attach to **in-process** steps (`ctx.localStep`). A dispatched `ctx.step` handler is already
 > deduplicated by its deterministic `stepId` (`runId:seq`), which a worker can use as an idempotency key — so
 > to compensate dispatched work, register the undo as its own dispatched `ctx.step` invoked from a
 > compensating `ctx.localStep` (or fold the orchestration into one in-process step with its own undo).
+
+## What triggers the saga
+
+Any error that escapes the workflow body triggers compensation — not just a business-logic throw. A
+`ctx.localStep` (or dispatched `ctx.step`) that exhausts its `retries`, or throws a `FatalError` directly,
+propagates out of `run()` exactly like an ordinary exception, and the engine treats that the same way
+regardless of *why* the step gave up. The saga does **not** run on every suspension: `ContinueAsNew` and an
+ordinary `waitForSignal`/`ctx.step` suspension both leave the run's compensation stack untouched — it's only
+consulted when the run's execution ends in an unhandled error.
+
+The reverse order is a strict LIFO unwind of the compensations registered so far: the engine walks the stack
+from the most recently completed step to the first, undoing exactly the steps that finished before the
+failure (a step that never completed never registered a compensation, so there's nothing to undo for it).
+For the checkout example, that means `charge-card`'s refund runs before `reserve-inventory`'s release, because
+the charge completed second.
+
+Below is a longer-running saga — a trip booking that reserves a flight, a hotel and a car before charging a
+deposit. Each booking step registers its own undo; when the deposit is declined, watch the compensations
+unwind in reverse — car, then hotel, then flight — before the run settles failed:
+
+<CodeFlow scene="saga" />
 
 ## Retrying a transient undo
 
@@ -75,8 +99,10 @@ DurableModule.forRoot({
 
 Because a compensation may run more than once, **compensations should be idempotent** — releasing an
 already-released reservation or refunding an already-refunded charge must be a no-op. A compensation that
-keeps failing past `compensationRetries` is *skipped* rather than allowed to throw: a permanently-failing
-undo must not mask the original failure or strand the remaining compensations.
+keeps failing past `compensationRetries` is *skipped* rather than allowed to throw: the engine records the
+failure as a `compensate:<step>` event and moves on to the next one in the stack. One stuck undo never halts
+the unwind — every remaining compensation still gets its turn — and it never masks the original failure: the
+run still settles `failed` with the error that triggered the saga in the first place, not the compensation's.
 
 ## Compensations are visible
 
@@ -108,3 +134,18 @@ crash-durable rather than looking like a still-running run. For the checkout exa
 had already charged the card and reserved inventory with `{ compensate: true }` issues the refund and
 releases the reservation before the run becomes `cancelled` — leaving the world clean, exactly as a failure
 would.
+
+## Saga vs. retries vs. dead-letter
+
+These three mechanisms answer different questions about a failure, and a single run typically uses all
+three at once. [Retries & backoff](/docs/reliability/retries) answer "can this exact step just be tried
+again?" — reach for them first, on the step itself, whenever a failure is transient (a timeout, a 502) and
+the step is naturally retriable. Sagas answer a different question: "this run is not going to complete —
+what do I need to undo?" — reach for `compensate` whenever a step has an irreversible real-world side effect
+that an *earlier* step in the same run would otherwise leave stranded. They compose: a step still exhausts
+its own `retries` (or throws `FatalError`) before its failure ever reaches the saga, so compensation is what
+happens *after* retrying has given up. [Dead-letter queues](/docs/reliability/dead-letter) answer a third,
+orthogonal question: "this run keeps crashing the process itself" — a poison pill that a saga can't help
+with, because the run's body never gets far enough to fail cleanly and trigger its compensations. Route a
+poison-pill run to a `@DeadLetter()` handler to break the crash loop; use sagas for a run that fails cleanly
+but has already done things in the world.

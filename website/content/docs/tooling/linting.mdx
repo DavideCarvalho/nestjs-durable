@@ -30,8 +30,8 @@ each is recorded once on the first execution and replayed verbatim afterwards:
 | `Date.now()` | wall clock, different every replay | `await ctx.now()` |
 | `performance.now()` | monotonic clock, different every replay | `await ctx.now()` |
 | `new Date()` (no args) | wraps `Date.now()` | `new Date(await ctx.now())` |
-| `Math.random()` | fresh entropy every replay | `await ctx.random()` |
-| `crypto.randomUUID()` | fresh entropy every replay | `await ctx.uuid()` |
+| `Math.random()` | fresh entropy every replay | `await ctx.sideEffect(() => Math.random())` |
+| `crypto.randomUUID()` | fresh entropy every replay | `await ctx.sideEffect(() => crypto.randomUUID())` |
 
 ```ts
 // ✗ corrupts the run on replay
@@ -51,8 +51,8 @@ export class CheckoutWorkflow {
 export class CheckoutWorkflow {
   async run(ctx: WorkflowCtx, order: Order) {
     const startedAt = await ctx.now();
-    const idempotencyKey = await ctx.uuid();
-    const jitter = await ctx.random();
+    const idempotencyKey = await ctx.sideEffect(() => crypto.randomUUID());
+    const jitter = await ctx.sideEffect(() => Math.random());
     const at = new Date(await ctx.now());
     /* ... */
   }
@@ -127,7 +127,7 @@ suffix like `*.workflow.ts`:
 
 The plugin pattern matches `Date.now()`, `performance.now()`, `Math.random()`, `crypto.randomUUID()`,
 `globalThis.crypto.randomUUID()` and `new Date()` and raises a diagnostic on each, with the same
-guidance to switch to `ctx.now()` / `ctx.random()` / `ctx.uuid()`. Because the scope is the *file*
+guidance to switch to `ctx.now()` / `ctx.sideEffect(...)`. Because the scope is the *file*
 rather than the *method*, keep one workflow per `*.workflow.ts` file (or another glob you reserve for
 workflow bodies) so the plugin doesn't flag a legitimate `Date.now()` that happens to share the file.
 

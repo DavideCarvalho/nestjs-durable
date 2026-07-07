@@ -1,6 +1,6 @@
 ---
 title: Durable webhooks
-description: ctx.webhook() mints a durable callback handle with a deterministic token and a public url; hand the url to a third party inside a step, then await handle.wait() to suspend with zero compute until the callback arrives as engine.signal(token, body).
+description: ctx.webhook() mints a durable callback handle with a deterministic token and a public url; hand the url to a third party inside a step, then await handle.wait() to suspend with zero compute until the callback arrives as engine.signal(token, body). ctx.task() is the general form for external work you deliver and complete yourself, with no callback URL.
 ---
 
 Plenty of third-party APIs are asynchronous: you ask them to do something, they hand you back a
@@ -124,6 +124,83 @@ export class WebhooksController {
 
 Because the token already encodes the run and position, there is nothing else to look up — the signal
 routes straight to the waiting run.
+
+## External tasks — `ctx.task`
+
+`ctx.webhook()` is specifically for the HTTP-callback shape: the engine mints a URL, you hand it to a
+third party, and *they* deliver the callback. Not every async handoff looks like that — sometimes
+there's no URL at all, just a message you drop on a queue, a foreign process you kick off, or a legacy
+system you poke, and *you* are the one who reports back when it's done. `ctx.task(name, dispatch,
+options?)` is the general form of "suspend until an external system finishes this":
+
+```ts
+task<TResult>(
+  name: string,
+  dispatch: () => Promise<void>,
+  options?: StepOptions,
+): Promise<TResult>;
+```
+
+Call it, and the engine runs `dispatch` **once** (checkpointed — it won't re-fire on replay or
+recovery), then suspends the run with **zero compute** until your own code reports the result back by
+calling `engine.completeTask(runId, name, result)` (or `engine.failTask(runId, name, error)` for a
+failure) — at which point the run resumes with `result` as `ctx.task`'s return value, or throws a
+`FatalError` at the task if it failed. `name` must be unique per run — it's the id both the dispatch's
+checkpoint and the completion signal key on. `options` (a `StepOptions` — `retries`, `backoff`, etc.)
+governs the `dispatch` call itself, not the wait.
+
+This is the durable, first-class counterpart of the hand-rolled "dispatch over a queue → wait for a
+completion signal" pattern — `ctx.webhook` is the special case where the "external system" is a
+browser-facing HTTP client and the engine builds the URL for you; `ctx.task` is for when you own the
+delivery mechanism (a queue, a subprocess, a cross-language worker) and just need to signal "done"
+from your own code, not from an inbound POST to a minted URL.
+
+### Example — dispatch to a queue, complete from a callback controller
+
+```ts
+@Workflow({ name: 'video-transcode', version: '1' })
+export class VideoTranscodeWorkflow {
+  constructor(private readonly transcodeQueue: TranscodeQueueService) {}
+
+  async run(ctx: WorkflowCtx, input: { videoId: string; s3Key: string }) {
+    const result = await ctx.task<{ outputKey: string }>('transcode', async () => {
+      // Runs ONCE — enqueue the job on a third-party transcoding service. It reports back later by
+      // calling engine.completeTask/failTask with this run's id and the task name above.
+      await this.transcodeQueue.enqueue({
+        runId: ctx.runId,
+        videoId: input.videoId,
+        s3Key: input.s3Key,
+      });
+    });
+    return result;
+  }
+}
+```
+
+The third-party service (or a worker consuming its completion queue) reports back from your own
+controller — there's no minted URL to hand out, just the run id and task name it was given at dispatch
+time:
+
+```ts
+@Controller('transcode-callbacks')
+export class TranscodeCallbacksController {
+  constructor(private readonly engine: WorkflowEngine) {}
+
+  @Post()
+  async receive(@Body() body: { runId: string; outputKey?: string; error?: string }) {
+    if (body.error) {
+      await this.engine.failTask(body.runId, 'transcode', body.error);
+    } else {
+      await this.engine.completeTask(body.runId, 'transcode', { outputKey: body.outputKey });
+    }
+    return { ok: true };
+  }
+}
+```
+
+`completeTask`/`failTask` return `null` if no run is waiting on that task (e.g. a duplicate or late
+delivery) — a safe no-op, so a retried callback from the third party can't corrupt an already-resumed
+run.
 
 ## Why this is better than rolling it yourself
 

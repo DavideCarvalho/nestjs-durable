@@ -1,0 +1,232 @@
+---
+title: Troubleshooting
+description: Symptom-first answers to the errors and stuck states you'll actually hit — NonDeterminismError, a run wedged in pending or suspended, SignalTimeoutError, dead-lettered runs, MySQL collation clashes, and an empty dashboard.
+---
+
+This page is organized by what you **see** — an error name, a stuck status, an empty screen — rather
+than by subsystem. Each entry names the exact symptom, why it happens, and how to fix it.
+
+## `NonDeterminismError` on resume
+
+**Symptom:** a run that was replaying (resumed after a suspend, or recovered after a crash) fails
+with an error named `NonDeterminismError` and a message like:
+
+```
+non-determinism at wrun_8Kb2#3: code expects "refund" but history recorded "charge". The workflow
+changed under an in-flight run — register a new @Workflow version.
+```
+
+**Cause:** replay pairs each step with the checkpoint recorded at its logical position (`seq`). The
+engine throws this the moment the *name* at a position no longer matches what was recorded — meaning
+the workflow's code changed shape (a step inserted, removed, or reordered) while this run was still
+in flight, without a version bump. This is deliberate: continuing would feed the wrong checkpoint into
+the wrong step and silently corrupt the run. The other common cause of the same symptom is a **stale
+worker** — an old build left running after a step/workflow rename picks up a run under its namespace
+whose history no longer matches its code.
+
+**Fix:**
+- For a genuinely structural change (new/removed/reordered steps), register a new `@Workflow({ version: '2' })`
+  alongside the old one — in-flight runs drain on the version they started on, new runs get the new
+  one. See [Versioning & determinism](/docs/authoring/versioning).
+- For a small, surgical change, guard it with `ctx.patched(id)` instead of a full version bump — it
+  rewinds the logical position for old runs so their checkpoints aren't shifted. Also covered in
+  [Versioning & determinism](/docs/authoring/versioning).
+- Deploy the workers that run your workflow code **together** with the operator/API — a partial
+  rollout means some instances are replaying old-shaped runs against new code. Find and kill any
+  stale local process still consuming a shared queue; see
+  ["Deploys: replay-safety discipline"](/docs/production#5-deploys-replay-safety-discipline) and the
+  "stale local worker" pitfalls in [Tenancy & topologies](/docs/concepts/tenancy#pitfalls).
+
+## A run is stuck in `suspended` forever
+
+**Symptom:** `durable inspect <runId>` (or the dashboard) shows the run parked at `suspended` and it
+never moves, even though you expected it to resume.
+
+**Cause:** `suspended` means the run is durably waiting on something — a `ctx.sleep`/`ctx.sleepUntil`
+timer, or a `ctx.waitForSignal` / `ctx.webhook().wait()` token — and that something hasn't happened.
+For a signal wait, the usual causes are:
+- **A token typo or mismatch.** `waitForSignal(token)`'s token is a **global string**, not
+  automatically scoped to the run — the underlying waiter row is keyed by `token` alone. If the
+  sender calls `engine.signal(...)` with a differently-spelled or non-run-scoped token, nothing ever
+  arrives for the waiter that's actually parked. See [Sleep & signals](/docs/concepts/sleep-and-signals).
+- **A webhook that's never called** — the third party never hit the callback URL, or hit the wrong
+  one.
+- An `ctx.onUpdate(name)` wait where the sender's `name` doesn't match (this one *is* prefixed with
+  the run id internally, so a mismatch here is usually the caller targeting the wrong run).
+
+**Fix:** first find out what it's actually waiting on — `durable inspect <runId>` prints the step
+timeline, and the dashboard's run graph tags each node by kind (`local` / `remote` / `sleep` /
+`signal`), so the suspended node tells you the token or wake time. See the [CLI](/docs/cli) and
+[Control plane](/docs/observability/dashboard) docs. Once you know the token:
+- Send the signal it's actually waiting for: `engine.signal(token, payload)` (or
+  `WorkflowService.signal`).
+- If it should never have been started, or the wait truly can't be satisfied, cancel it —
+  `durable cancel <runId>` or the dashboard's Cancel action.
+
+## A run is stuck in `pending`
+
+**Symptom:** a run sits at `pending` indefinitely instead of moving to `running` within moments of
+being created.
+
+**Cause:** `pending` means created and enqueued but not yet picked up. Nobody is driving it. The
+common reasons:
+- **Namespace mismatch between where the run was stamped and the instance polling for work.**
+  `runPending`/`recoverIncomplete`/`resumeDueTimers` all filter by the engine's own namespace — an
+  **operator** with no namespace set sees every run, but a **tenant** with `namespace`/`DURABLE_TENANT`
+  set only ever picks up runs stamped with that exact namespace. A run created under one namespace
+  with no worker polling that namespace (or a worker polling a different one) just sits. Likewise the
+  transport side: a tenant's queues are suffixed with its namespace (`handler@tenant`), so a worker
+  listening on the un-suffixed (or differently-suffixed) queue never sees the task either. See
+  [Tenancy & topologies](/docs/concepts/tenancy).
+- **No driving instance at all.** An instance with `drive: false` (an API/dashboard-only pod) never
+  polls pending runs, recovers, or resumes timers — it only enqueues and reads. If every instance in
+  the deployment is `drive: false`, nothing ever picks the run up. See
+  [Durability & replay](/docs/concepts/durability#execution-workers-api-pods-enqueue-driving-pods-run).
+- **The transport itself is down** — Redis/SQS/DB unreachable, so dispatch never reaches a worker
+  group in the first place. Check the relevant [transport](/docs/transports) is actually connected.
+
+**Fix:** confirm at least one instance is an operator (`store` set) with `drive` not `false`, that
+its namespace matches the run's, and that the transport is reachable. Once fixed, the next poll tick
+picks the run up on its own — no manual action needed.
+
+## `SignalTimeoutError`
+
+**Symptom:** `ctx.waitForSignal(token, { timeoutMs })` throws an error named `SignalTimeoutError`
+with a message like `timed out after 259200000ms waiting for signal "approve:order-42"`.
+
+**Cause:** this is **expected, not a bug** — it's what a bounded wait does when its deadline passes
+before a signal (buffered or live) arrives for that token. It's the supported way to race "signal vs.
+deadline".
+
+**Fix:** catch it in the workflow and branch, rather than letting it propagate and fail the run:
+
+```ts
+try {
+  const decision = await ctx.waitForSignal<Decision>(`approve:${order.id}`, {
+    timeoutMs: 3 * 24 * 60 * 60 * 1000,
+  });
+  return decision.approved ? { status: 'approved' } : { status: 'rejected' };
+} catch (err) {
+  if (err instanceof SignalTimeoutError) return { status: 'expired' };
+  throw err;
+}
+```
+
+See [Sleep & signals](/docs/concepts/sleep-and-signals#timeouts) for the full pattern, including why
+a bounded wait consumes two logical positions instead of one (relevant if you're adding/removing
+`{ timeoutMs }` on a wait that already has runs in flight — treat it like a version change).
+
+## A run went `dead`
+
+**Symptom:** the run's status is `dead` — a distinct terminal state, badged separately from `failed`
+in the dashboard and `durable inspect --status`.
+
+**Cause:** `maxRecoveryAttempts` was configured and this run exceeded it — crash-recovery kept
+resuming a still-`running` run (incrementing `recoveryAttempts` each time) and it crashed the process
+every time, i.e. a poison pill (a deserialization bug, an unguarded non-deterministic change, an
+infinite loop in a step). Rather than crash-looping forever, the engine moved it to `dead` with a
+`max_recovery_attempts` error and stopped touching it.
+
+**Fix:** `dead` is terminal but **not lost** — it stays fully inspectable (history, checkpoints,
+error) and is retriable once you've shipped a fix. Diagnose the root cause from the run's history in
+the dashboard or `durable inspect <runId>`, fix it (often the same fix as a `NonDeterminismError`
+above), then retry the run from the dashboard's Retry action. If you want active alerting instead of
+just parking it, subscribe with `engine.onDead`, or configure a `deadLetterWorkflow`/`@DeadLetter()`
+handler to run automatically. See [Dead-letter queue](/docs/reliability/dead-letter).
+
+## Step retries exhausted, or a step throws `FatalError` and doesn't retry
+
+**Symptom:** either a step keeps failing until its `retries` budget is used up and the **run** ends
+up `failed`, or a step fails on its **first** attempt and the run fails immediately even though
+`retries` was set higher than 1.
+
+**Cause:** these are two different, both-correct behaviors:
+- **Ordinary throws are retriable.** A failed step is retried up to its `@Step({ retries })` count
+  (default 1 — a single try), with backoff between attempts. Once that budget is exhausted, the
+  failure propagates and the run fails.
+- **`FatalError` is never retried**, regardless of `retries`. It exists for failures retrying can't
+  fix — a declined card, invalid input, a business-rule rejection — so the engine fails the run on the
+  first occurrence instead of burning the retry budget on a foregone conclusion.
+
+**Fix:** if you're seeing fast, immediate failures, check whether the step (or a library it calls)
+throws `FatalError` for that condition — that's working as intended, not a bug. If you're seeing
+slow failures after several attempts, that's the retry budget being legitimately exhausted; raise
+`retries`/`backoffMaxMs` if the downstream is expected to recover given more time. See
+[Retries & backoff](/docs/reliability/retries).
+
+## "Illegal mix of collations" on MySQL
+
+**Symptom:** a `JOIN` between one of your own tables and a `durable_*` table throws a MySQL error
+like `Illegal mix of collations (utf8mb4_unicode_ci,IMPLICIT) and (utf8mb4_0900_ai_ci,IMPLICIT)`.
+
+**Cause:** MikroORM's auto-schema creates the `durable_*` tables with the server's *default*
+collation (commonly `utf8mb4_0900_ai_ci` on MySQL 8). If your app pins a different collation on its
+own tables (commonly `utf8mb4_unicode_ci`, applied via migrations), the two collations clash the
+moment a query joins across them.
+
+**Fix:** nothing manual — `MikroOrmStateStore`'s schema bootstrap converges this automatically on
+boot: it reads your ORM's configured `collate`, checks each durable table's current collation via
+`information_schema.tables`, and runs `ALTER TABLE ... CONVERT TO` on any table that differs. If
+you're still seeing the error, confirm the store actually ran its schema-ensure step (e.g. it isn't
+disabled, or you're on a version predating the auto-converge). See [MikroORM](/docs/stores/mikro-orm).
+
+## Steps seem to run twice
+
+**Symptom:** you observe a side effect happening more than once for what should be a single logical
+run — an email sent twice, a charge attempted twice.
+
+**Cause:** usually **not** a step re-running on replay — a `completed` checkpoint short-circuits
+replay and returns its saved result instead of re-executing (that's the whole point of
+checkpoint-and-replay). What actually causes duplicate side effects is almost always that the side
+effect lives **in the workflow body** instead of inside a `@Step` handler dispatched via `ctx.step`.
+The workflow body re-runs from the top on every replay/recovery — that's fine for orchestration code
+(call a step, use its result, decide the next), but any real work executed directly in the body (an
+API call, a DB write) runs again on every replay, because there's no checkpoint protecting it.
+
+**Fix:** move the side effect into an `@Step` handler and call it via `ctx.step(...)` (or, for a pure
+non-deterministic value like a UUID, use `ctx.sideEffect(...)`) so it's checkpointed and only ever
+executes once, logically. See [Durability & replay](/docs/concepts/durability#the-one-rule-workflows-are-deterministic)
+for the determinism rule this falls out of.
+
+*(There is one narrower, legitimate exception: if the process dies after a remote worker actually ran
+a step but before its checkpoint was written, the step can physically execute twice — steps get a
+stable `stepId` for exactly this case; make handlers idempotent or dedupe on it.)*
+
+## Dashboard is empty, or runs are missing
+
+**Symptom:** `DurableDashboardModule`'s SPA loads, but the runs list is empty, or a run you know
+exists doesn't show up.
+
+**Cause:**
+- **Namespace filtering.** If the operator opted into `scopeReads: true` (with `namespace` set), its
+  store view only sees its own namespace — runs stamped with a different namespace are invisible to
+  it by design. Check whether `scopeReads` is on and whether it's pointed at the namespace you expect.
+- **The dashboard is pointed at a different store than the one the runs were written through** — e.g.
+  the CLI's `durable.config` or the dashboard module resolving a different `MikroORM`/connection than
+  your app's engine, so it's reading an empty or unrelated table set.
+- You're looking at the wrong instance in a split deployment — a `drive: false` API pod still serves
+  the dashboard fine (reads work regardless of `drive`), so this is rarely the cause, but confirm
+  you're hitting the pod/route you think you are.
+
+**Fix:** verify the store instance backing the dashboard is the same one your engine's `DurableModule`
+uses, and check `scopeReads`/`namespace` configuration. See [Tenancy & topologies](/docs/concepts/tenancy)
+and [Control plane](/docs/observability/dashboard).
+
+## Scheduled workflows or durable sleeps aren't firing
+
+**Symptom:** a `ScheduledWorkflow` never starts a run on its cadence, or a `ctx.sleep`/`ctx.sleepUntil`
+never wakes up.
+
+**Cause:** both are driven by the same NestJS `TimerPoller`, and it only runs on a **driving
+operator** instance — `store` set and `drive` not `false`. Concretely:
+- If every instance in the deployment is `drive: false` (or store-less, i.e. a tenant/worker with no
+  `store`), the poller never runs at all on any of them, so `resumeDueTimers` and the schedule check
+  never fire.
+- `timerPollMs: 0` disables the **recurring interval**, for when an external scheduler is expected to
+  call `WorkflowEngine.resumeDueTimers()`/drive schedules itself — if nothing else is doing that, due
+  timers and schedules simply accumulate unfired.
+
+**Fix:** make sure at least one operator instance is running with `drive` not `false` and either the
+default `timerPollMs` (1000ms) or a nonzero value, or that you're genuinely driving
+`resumeDueTimers()`/schedule checks from an external scheduler if you set it to `0`. See
+[Scheduling](/docs/authoring/scheduling) and [Durability & replay](/docs/concepts/durability).

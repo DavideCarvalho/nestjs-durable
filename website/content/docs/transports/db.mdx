@@ -28,6 +28,19 @@ Trade-off vs a real broker: throughput is bounded by polling + row contention �
 workflow/pipeline scale (modest rate, long steps), not for high-fanout firehoses. Requires
 `FOR UPDATE SKIP LOCKED`: **Postgres 9.5+** or **MySQL 8+** (not SQLite).
 
+## Options
+
+| Option | Description |
+| --- | --- |
+| `executor` | How to run SQL, built from the app's own connection. `mikroOrmExecutor(em)`, `typeOrmExecutor(dataSource)`, or a custom `SqlExecutor`. |
+| `group` | The queue token this instance serves — required to register `handle()`s. |
+| `prefix` | Table-name prefix. Default `durable`. |
+| `pollMs` | Poll interval in ms when a queue is empty. Default `500`. |
+| `batchSize` | Max rows claimed per poll. Default `10`. |
+| `leaseMs` | How long a claimed row is owned before it's reclaimable (crash recovery), in ms. Default `30_000`. |
+| `autoCreate` | Create the two tables on first use if missing. Default `true` — the `CREATE TABLE` statements in [The contract](#the-contract) are for reference/manual provisioning, not a required setup step. |
+| `instanceId` | Identifies this instance in `claimed_by`, for debugging. Defaults to a random id. |
+
 ## The contract
 
 This is the **single source of truth** for the table shape and the claim protocol. The TypeScript

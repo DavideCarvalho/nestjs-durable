@@ -67,15 +67,33 @@ new SqsTransport({
 SQS is at-least-once — a task whose worker crashes before deleting it is redelivered after the
 visibility timeout — so keep handlers **idempotent**.
 
+## Client
+
+Pass an existing `SQSClient` via `client` (recommended — reuse the app's, already configured with
+retries/region/credentials). Omit it and pass `clientConfig` instead (e.g. `{ region, endpoint,
+credentials }` for pointing at ElasticMQ in dev) to let the transport build its own client — which it
+then owns and destroys on `close()`. A `client` you pass in is left alone.
+
+## Sharing a queue with a non-durable consumer
+
+Set `marker` to have every durable message carry that SQS message attribute, and have the poller
+**skip** (release, don't delete) messages that lack it. That lets a queue already used by a
+legacy/non-durable consumer be shared, as long as that consumer likewise ignores durable-tagged
+messages. Leave it unset for the common case: a queue dedicated to durable traffic.
+
 ## Options
 
 | Option | Description |
 | --- | --- |
-| `client` | An `@aws-sdk/client-sqs` `SQSClient`. |
+| `client` | An `@aws-sdk/client-sqs` `SQSClient`. Used instead of `clientConfig` when set. |
+| `clientConfig` | Used only when `client` is omitted — e.g. `{ region, endpoint, credentials }` for ElasticMQ. |
 | `group` | The queue token this instance serves — required to register `handle()`s; must match the dispatched step's sanitized name (+ `@partition`, if set). |
 | `prefix` | Namespaces the fallback `<prefix>-tasks-*` / `<prefix>-results` names. Default `durable`. |
 | `autoCreate` | Create the by-name queues (`durable-tasks-<group>`, `durable-results`) if missing. Ignored for queues you supply via `taskQueueUrl` / `resultsQueueUrl` — those must already exist. |
 | `taskQueueUrl` / `resultsQueueUrl` | Reuse existing queues instead of resolving by name (a literal URL or a resolver). |
+| `marker` | SQS message attribute tagging durable messages, so a queue can be shared with a non-durable consumer. See [above](#sharing-a-queue-with-a-non-durable-consumer). Unset by default. |
+| `waitTimeSeconds` | Receive long-poll seconds (0–20). Default `20`. |
+| `visibilityTimeoutSec` | Visibility timeout for an in-flight task, in seconds — must exceed the step's runtime, or SQS redelivers it to another worker while it's still running. Default `60`. |
 
 The message body is the documented `RemoteTask` / `StepResult` JSON — identical to BullMQ — so a
 [Python worker](/docs/python#aws-sqs) on the same queues interoperates.

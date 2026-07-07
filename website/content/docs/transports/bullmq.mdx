@@ -34,6 +34,51 @@ const transport = new BullMQTransport({
 transport.handle('payments.charge-card', async (input) => ({ chargeId: await charge(input) }));
 ```
 
+## Concurrency
+
+`concurrency` controls how many tasks this instance runs at once from each of its per-name task
+queues (the BullMQ `Worker`'s own concurrency). It takes three forms:
+
+- a fixed number — always runs exactly that many in parallel. Defaults to `1` (one task at a time).
+- `'adaptive'` — an `AdaptiveController` self-tunes the limit from a latency gradient, a RAM brake,
+  and backpressure (errors/stalls), instead of you guessing a number.
+- `{ mode: 'adaptive', ... }` — adaptive with overrides (`min`, `max`, `start`, `ramCeilingPct`,
+  `cpuCeilingPct`, `tickMs`).
+
+```ts
+const transport = new BullMQTransport({
+  connection: { host: 'localhost', port: 6379 },
+  concurrency: { mode: 'adaptive', min: 2, max: 32, ramCeilingPct: 85 },
+});
+```
+
+Total parallelism across a fleet is `concurrency × replicas`. Either mode publishes its live
+status — current limit, in-flight count, and (adaptive) the last adjustment — on the worker's
+heartbeat as a `WorkerStatus`. See [Flow control](/docs/reliability/flow-control#worker--transport-concurrency)
+for the full set of tunables and how the Telescope Workers dashboard renders it.
+
+## Priority
+
+Per-call `priority` on `ctx.step` follows the engine's convention: **higher wins**. BullMQ's own job
+priority is the opposite — lower numbers run first — so the transport translates one into the other
+before enqueuing, keeping "higher = more urgent" true end-to-end regardless of transport. Leave
+`priority` unset for the default FIFO ordering.
+
+## Namespace
+
+`namespace` segments every queue/stream/key this instance touches, so a single Redis can host
+several isolated deployments — e.g. one per developer — without crosstalk. Leave it unset (or
+`"default"`) for production: names stay byte-identical to the un-namespaced scheme. Any other value
+inserts a `-<namespace>` segment into every name. See [Tenancy](/docs/concepts/tenancy) for the
+operator/tenant model this enables.
+
+## Control plane & tenant protocol
+
+Beyond `Transport`, `BullMQTransport` also implements `ControlPlane` — cross-instance broadcast for
+lifecycle events and cancellation — and carries the tenant `start-run` / `run-request` / `run-reply`
+/ tenant-event protocol a store-less tenant worker uses to proxy runs through an operator. See
+[Tenancy](/docs/concepts/tenancy) for the full model.
+
 ## Options
 
 | Option | Description |
@@ -41,6 +86,9 @@ transport.handle('payments.charge-card', async (input) => ({ chargeId: await cha
 | `connection` | ioredis connection options (or an `IORedis` instance). |
 | `partition` | Optional isolation suffix appended to every one of this instance's per-name queues (`<name>@<partition>`). Omit for a single-tenant deployment. |
 | `prefix` | Namespaces the queues. Defaults to `durable`. |
+| `namespace` | Logical deployment namespace segmenting every queue/stream/key. See [Namespace](#namespace) above. |
+| `instanceId` | Stable id for this worker process, stamped into its heartbeats/liveness keys. Defaults to `ts-<hostname>-<pid>`. |
+| `concurrency` | Fixed number, `'adaptive'`, or `{ mode: 'adaptive', ... }`. See [Concurrency](#concurrency) above. Defaults to `1`. |
 
 The payload is the documented `RemoteTask` / `StepResult` JSON, so a non-Node worker on the same
 queues interoperates — that's exactly how the [Python worker](/docs/python) plugs in.
