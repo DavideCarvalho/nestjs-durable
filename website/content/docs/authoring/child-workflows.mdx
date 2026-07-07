@@ -173,6 +173,12 @@ threading: inside a workflow body, `ShippingWorkflow.execute(input)` IS
 ambient workflow context. See
 [Class-first starts](/docs/concepts/workflows-and-steps#class-first-starts--myworkflowstart--myworkflowexecute).
 
+Inside a body, though, prefer the `ctx.*` forms as the default — `ctx` keeps every history operation
+visible at the call site, and it's the only form that reaches a child by **name** (a cross-runtime
+workflow) or `ctx.all`. Save the statics for deep helpers where threading `ctx` would be noise; see
+[Which to reach for](/docs/concepts/workflows-and-steps#which-to-reach-for). Outside a workflow, the
+opposite holds — the statics are the clean way to start a run without injecting `WorkflowService`.
+
 ## When to use which
 
 | | `ctx.child` | `ctx.startChild` | `ctx.all` |

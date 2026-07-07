@@ -69,6 +69,32 @@ The types are inferred from the subclass's own `run` signature — `start` check
 store-less tenant worker the class is bound to a start facade that cannot wait: `start` works,
 `execute` outside a workflow throws a clear error.
 
+### Which to reach for
+
+The statics and `ctx.child`/`ctx.startChild` do the same thing inside a workflow — but they read
+differently, and that difference is the guidance:
+
+- **Outside a workflow — prefer the statics.** A controller or consumer that only needs to kick off
+  a run shouldn't inject `WorkflowService` for it; `CheckoutWorkflow.start(order)` is the API the
+  class earns, and there's no ambiguity out here — outside, `start` *is* `engine.start`.
+- **Inside a workflow body — prefer `ctx.child` / `ctx.startChild`.** The `ctx` is the visible
+  determinism boundary: everything that touches the outside world goes through it, so a reviewer
+  scanning for `ctx.` sees every history operation at a glance. `Inner.execute()` does the identical
+  thing, but the call site no longer *looks* like a durable operation — and `ctx` also covers what
+  the statics can't: a child by **name** (`ctx.child('processing', input)` — a cross-runtime
+  workflow with no TS class) and fan-out with [`ctx.all`](/docs/authoring/child-workflows).
+- **The statics inside a body earn their place in deep helpers** — a domain service several calls
+  below `run` that would otherwise thread `ctx` through three signatures just to spawn a child. The
+  ambient context resolves it cleanly there.
+
+<Callout type="warn">
+The ambient context follows the body's `async`/`await` path, but a callback that **escapes** it — a
+`setTimeout`, an EventEmitter listener — is off that path: a static called from there silently starts
+a **top-level** run instead of a linked child, with no error. Inside a body, that's the failure mode
+`ctx.child` makes impossible (no `ctx` in hand, no call) — one more reason to keep `ctx` explicit in
+the body and let the statics shine outside it.
+</Callout>
+
 ## Steps
 
 A **step** is the one durable primitive: `ctx.step(...)` runs a unit of work and checkpoints its
