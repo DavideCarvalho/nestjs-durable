@@ -77,11 +77,10 @@ export class CheckoutWorkflow {
       callbackUrl: hook.url,
     });
 
-    // DurableWebhook.wait() has no timeout of its own — wait on its token via ctx.waitForSignal
-    // instead to bound how long the run parks for the callback.
+    // Bound how long the run parks for the callback — past the deadline, wait() throws.
     let result: { status: 'paid' | 'failed'; providerRef: string };
     try {
-      result = await ctx.waitForSignal(hook.token, { timeoutMs: 30 * 60 * 1000 });
+      result = await hook.wait({ timeoutMs: 30 * 60 * 1000 });
     } catch (err) {
       if (err instanceof SignalTimeoutError) {
         throw new FatalError(`payment for ${order.id} never confirmed`, 'payment_timeout');

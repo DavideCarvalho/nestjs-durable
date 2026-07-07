@@ -47,13 +47,15 @@ interface DurableWebhook<TPayload = unknown> {
   /** Public callback URL for `token`, built by the engine's webhookUrl option. */
   readonly url?: string;
   /** Suspend until the callback arrives, then resume with its payload. */
-  wait(): Promise<TPayload>;
+  wait(opts?: { timeoutMs?: number }): Promise<TPayload>;
 }
 ```
 
 The shape matters: minting the handle and **waiting** on it are separate steps. You mint it (which
 fixes the `token`/`url`), hand the url to the third party inside a `ctx.step` so that handoff is
-itself checkpointed, and only then `await hook.wait()`. `wait()` parks the run on the same logical
+itself checkpointed, and only then `await hook.wait()`. Pass `{ timeoutMs }` to bound the wait —
+past the deadline it throws `SignalTimeoutError`, so an abandoned callback becomes a branch you
+handle instead of a run parked forever. `wait()` parks the run on the same logical
 position the mint reserved — so it suspends with **zero compute** until the callback lands, and is
 replay-safe.
 

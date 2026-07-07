@@ -54,14 +54,14 @@ through it so the engine can checkpoint — the body itself stays deterministic 
 | `child` | `child<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, options?: string \| ChildCallOptions): Promise<WorkflowOutputOf<C>>` | Start (or reattach to) a child run and suspend — zero compute — until it's terminal, then resume with its output (throws `FatalError` if the child failed). See [Child workflows](/docs/authoring/child-workflows). |
 | `child` (by name) | `child<TOut>(workflow: string, input: unknown, options?: string \| ChildCallOptions): Promise<TOut>` | Same, for a cross-runtime child by name. |
 | `startChild` | `startChild<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, options?: string \| ChildCallOptions): Promise<string>` | Fire-and-forget: dispatch a child once and return its run id immediately; the parent keeps running. |
-| `all` | `all<C extends WorkflowClass>(workflow: C, inputs: WorkflowInputOf<C>[], opts?: { mode?: 'waitAll' \| 'failFast' }): Promise<WorkflowOutputOf<C>[]>` | Run N children of the SAME workflow in parallel and await all of them, in input order. `waitAll` (default) aggregates failures into `GatherError`; `failFast` throws on the first. |
+| `all` | `all<C extends WorkflowClass>(workflow: C, inputs: WorkflowInputOf<C>[], opts?: { mode?: 'waitAll' \| 'failFast' }): Promise<WorkflowOutputOf<C>[]>` | Run N children of the SAME workflow in parallel and await all of them, in input order. `waitAll` (default) aggregates failures into `GatherError`; `failFast` throws on the first and cancels the surviving siblings (best-effort, observed at their next checkpoint). |
 
 ### External
 
 | Member | Signature | Notes |
 | --- | --- | --- |
 | `task` | `task<T>(name: string, dispatch: () => Promise<void>, options?: StepOptions): Promise<T>` | An external task with async completion: run `dispatch` once, then suspend until `engine.completeTask`/`failTask` reports back. |
-| `webhook` | `webhook<TPayload>(): DurableWebhook<TPayload>` | Mint a durable callback handle (`token` + optional public `url`); `await handle.wait()` suspends until the third party's callback lands as `engine.signal(token, body)`. See [Durable webhooks](/docs/authoring/webhooks). |
+| `webhook` | `webhook<TPayload>(): DurableWebhook<TPayload>` | Mint a durable callback handle (`token` + optional public `url`); `await handle.wait({ timeoutMs? })` suspends until the third party's callback lands as `engine.signal(token, body)` — or throws `SignalTimeoutError` past the deadline. See [Durable webhooks](/docs/authoring/webhooks). |
 | `callEntity` | `callEntity<TResult = unknown>(name: string, key: string, op: string, arg?: unknown): Promise<TResult>` | Call a durable entity op (serialized per `key`) and await its result. See [Durable entities](/docs/authoring/entities). |
 | `signalEntity` | `signalEntity(name: string, key: string, op: string, arg?: unknown): Promise<void>` | Send an entity op fire-and-forget (no result awaited). |
 

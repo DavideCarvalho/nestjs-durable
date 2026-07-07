@@ -124,7 +124,9 @@ try {
 
 Pass `{ mode: 'failFast' }` to throw the moment a failed child is *seen*, instead of waiting for the
 stragglers — useful when one bad item means the batch is a lost cause and there's no point waiting out
-the slowest sibling. Note siblings are not cancelled in v1; their eventual results are just ignored.
+the slowest sibling. The surviving siblings are **cancelled** (best-effort — a child mid-step observes
+the cancellation at its next checkpoint), so no orphaned work keeps burning workers after the batch is
+already doomed.
 
 ```ts
 const results = await ctx.all(ProcessItemWorkflow, batch.items, { mode: 'failFast' });

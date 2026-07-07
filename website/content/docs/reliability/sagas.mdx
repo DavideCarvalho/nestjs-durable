@@ -157,19 +157,21 @@ moves on to the next one in the stack. One stuck undo never halts the unwind —
 still gets its turn — and it never masks the original failure: the run still settles `failed` with the error
 that triggered the saga in the first place, not the compensation's.
 
-## V1 limits
+## Design notes
 
-Two things a dispatched compensation does **not** get, unlike an ordinary `ctx.step` dispatch:
+Two ways a dispatched compensation deliberately differs from an ordinary `ctx.step` dispatch:
 
-- **No queue/admission.** A compensation dispatch skips flow-control entirely — it can't be routed through
-  a `queue`, so it isn't rate-limited or concurrency-capped the way a normal `ctx.step({ queue: ... })` call
-  can be. It always dispatches directly, by name.
-- **No `timeoutMs` liveness window.** An ordinary step's `timeoutMs` presumes the worker dead if no
-  result/heartbeat lands in time and fails the dispatch (retryable). A compensation dispatch has no such
-  window — an in-flight undo is waited on indefinitely, like a normal step call with no `timeoutMs` set.
+- **It never waits behind a queue.** A compensation dispatch skips flow-control on purpose: the saga is
+  often unwinding *because* the system is under pressure, and the very `queue` that throttled (or failed)
+  the forward work must not be able to starve its own undo. Compensations always dispatch directly, by
+  name.
+- **It is always a durable dispatch.** An ordinary step's `timeoutMs` switches it onto the in-memory
+  liveness path (held await + heartbeats — traded against durable suspension). An unwind must never make
+  that trade: a compensation is dispatched durably and waited on exactly like a step with no `timeoutMs`,
+  so a crash mid-undo resumes instead of losing the wait.
 
-Neither is a correctness issue — the unwind is still checkpointed and crash-safe either way — but plan
-undo-handler capacity accordingly if a saga can fire under load.
+Either way the unwind is checkpointed and crash-safe — but plan undo-handler capacity accordingly if a
+saga can fire under load.
 
 ## Compensations are visible
 
