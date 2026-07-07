@@ -22,6 +22,10 @@ the way you already do for the rest of your app.
 | State lives in | your Postgres/MySQL/SQLite | Temporal's persistence | Inngest's store | Redis |
 | Workflow model | replay + suspend, plain async code | replay, plain code | step memoization over HTTP | jobs + flows (no replay) |
 | Waits (sleep/signal) | zero-compute suspend | zero-compute | zero-compute | delayed jobs only |
+| Sagas (compensation) | built-in — `{ compensate }` on any step | manual try/catch pattern | manual | — |
+| Event triggers | `onEvent` + debounce/batch | schedules; signal-with-start by hand | core feature (debounce, batch) | — |
+| Per-key mutex | `singleton` (FIFO per key) | one run per workflow id | concurrency key = 1 | Pro only (groups) |
+| Durable entities | built-in (`@Entity`/`@On`) | — | — | — |
 | Cross-language | TS + Python workers, one workflow | per-language SDKs | HTTP (any language) | JS/TS only |
 | DI integration | native NestJS providers | manual | framework-agnostic | manual |
 | Dashboard | built in | Temporal Web | Inngest dashboard | third-party (Taskforce, Bull Board) |
@@ -32,7 +36,11 @@ the way you already do for the rest of your app.
 Temporal is the reference implementation of durable execution, and its model — deterministic replay
 of plain code — is the same one this library uses. If you've written a Temporal workflow,
 `ctx.step` / `ctx.sleep` / signals / `ctx.patched` will all feel familiar; even the
-query/update split is deliberately Temporal-shaped.
+query/update split is deliberately Temporal-shaped. A few things Temporal leaves as hand-rolled
+patterns are first-class here: [saga compensation](/docs/reliability/sagas) is a `{ compensate }`
+option on any step (undone in reverse, durably) instead of a try/catch you write yourself, and
+[durable entities](/docs/authoring/entities) — keyed, serialized actors — have no Temporal
+equivalent at all.
 
 The difference is operational. Temporal is a **separate orchestration cluster**: its own server,
 its own database, its own deployment lifecycle, workers connecting over gRPC. That buys enormous
@@ -58,7 +66,10 @@ NestJS dependency injection** — steps are provider methods, tested like any pr
 suspend model parks a waiting run as a database row rather than re-invoking a function per step.
 State stays in *your* database (a hard requirement in regulated or air-gapped environments), and
 step dispatch rides your own transport (in-process, BullMQ, SQS, or plain DB polling) instead of
-inbound HTTP.
+inbound HTTP. Inngest's signature event ergonomics have direct analogues too:
+[`@Workflow({ onEvent, debounce, batch })`](/docs/authoring/events) starts workflows from published
+events with the same coalescing patterns ("reindex at most once a minute", "process uploads in
+batches").
 
 Choose **Inngest** for serverless/edge architectures or when you want a managed platform with
 event-driven ergonomics. Choose **nestjs-durable** for long-running NestJS services, DI-first
