@@ -97,6 +97,10 @@ Each child gets a stable, group-scoped id (`<runId>.all.<firstSeq>.<i>`), and th
 whole fan-out as one group instead of a sequential chain (the running children share a `parallelGroup`
 tag). Empty `inputs` returns `[]` with no side effects.
 
+Here it is live — scatter, run concurrently, join on all results:
+
+<FanoutSim />
+
 ### Handling failures — `mode` and `GatherError`
 
 By default (`mode: 'waitAll'`), `ctx.all` waits for every child to finish, then throws an aggregate

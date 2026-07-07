@@ -100,6 +100,10 @@ regardless of priority, until the window rolls over.
 { name: 'shipping-api', rateLimit: { limit: 100, periodMs: 60_000 } }
 ```
 
+Watch the window budget drain and refill — a burst rides the windows through, `limit` at a time:
+
+<RateLimitSim />
+
 ## Using a queue from a workflow
 
 Subject a step dispatch to a queue by naming it in the call options — and, optionally, hint how it should

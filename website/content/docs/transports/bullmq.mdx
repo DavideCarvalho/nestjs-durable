@@ -45,6 +45,11 @@ queues (the BullMQ `Worker`'s own concurrency). It takes three forms:
 - `{ mode: 'adaptive', ... }` — adaptive with overrides (`min`, `max`, `start`, `ramCeilingPct`,
   `cpuCeilingPct`, `tickMs`).
 
+Watch an adaptive worker breathe — spike the load and it grows into its headroom; fire the RAM
+brake and it backs off before memory melts:
+
+<AdaptiveSim />
+
 ```ts
 const transport = new BullMQTransport({
   connection: { host: 'localhost', port: 6379 },
