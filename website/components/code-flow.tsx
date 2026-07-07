@@ -1547,6 +1547,8 @@ export function CodeFlow({ scene }: { scene: string }) {
         </div>
       </div>
 
+      {/* Every step's caption is stacked in the same grid cell, hidden except the active one, so
+          the box is born at the tallest caption's height — stepping never shifts the layout. */}
       <div
         className="cf-anim"
         style={{
@@ -1558,11 +1560,15 @@ export function CodeFlow({ scene }: { scene: string }) {
           fontSize: 13,
           lineHeight: 1.5,
           color: ink,
-          minHeight: 44,
+          display: 'grid',
         }}
       >
-        <span style={{ color: accent, fontWeight: 600, marginRight: 8 }}>{step.title}</span>
-        {step.caption}
+        {data.steps.map((s, i) => (
+          <div key={`cap-${s.title}-${i}`} style={{ gridArea: '1 / 1', visibility: i === stepper.index ? 'visible' : 'hidden' }} aria-hidden={i !== stepper.index}>
+            <span style={{ color: accent, fontWeight: 600, marginRight: 8 }}>{s.title}</span>
+            {s.caption}
+          </div>
+        ))}
       </div>
 
       <ControlBar index={stepper.index} count={data.steps.length} playing={stepper.playing} onToggle={stepper.toggle} onGo={stepper.go} />
