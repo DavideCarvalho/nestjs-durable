@@ -30,6 +30,11 @@ final tiebreak — the same `better()` comparison in `packages/core/src/queue.ts
 in-process controller and `RedisAdmissionBackend` implement. Nothing is held in memory while a call
 waits: the run just re-suspends with a retry time and comes back later.
 
+And here it is as a live system — dots are runs dispatching steps through a queue into a fixed pool
+of worker slots. Hit **burst** and watch backpressure work:
+
+<QueueSim />
+
 ## Registering a queue
 
 Register a queue on the engine with `engine.registerQueue`, or declare it on the NestJS module's `queues`

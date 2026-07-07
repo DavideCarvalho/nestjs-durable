@@ -1,4 +1,5 @@
 import { CodeFlow } from '@/components/code-flow';
+import { QueueSim, SingletonSim } from '@/components/queue-sim';
 import { ReplayDiagram } from '@/components/replay-diagram';
 import { Screenshot } from '@/components/screenshot';
 import { TenancyDiagram } from '@/components/tenancy-diagram';
@@ -10,6 +11,8 @@ export function getMDXComponents(components?: MDXComponents) {
   return {
     ...defaultMdxComponents,
     CodeFlow,
+    QueueSim,
+    SingletonSim,
     ReplayDiagram,
     Screenshot,
     TenancyDiagram,

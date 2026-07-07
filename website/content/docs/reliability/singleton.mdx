@@ -15,6 +15,10 @@ would run immediately on its own slot.
 
 <CodeFlow scene="singleton" />
 
+And as a live system — three keys, one mutex slot each. Burst `store:A` and only its lane backs up:
+
+<SingletonSim />
+
 ## Declaring a singleton: `@Workflow({ singleton })`
 
 ```ts
