@@ -74,6 +74,11 @@ export class DailyReportWorkflow {
 }
 ```
 
+The workflow body itself is ordinary — it doesn't know it's scheduled. The engine starts it
+on the cadence; from there it's just steps that checkpoint and resume like any other run:
+
+<CodeFlow scene="scheduling" />
+
 ## Fixed intervals — `everyMs`
 
 `everyMs` starts one run every interval. The current window is identified by the time bucket

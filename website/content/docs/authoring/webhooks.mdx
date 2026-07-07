@@ -9,6 +9,8 @@ standing up a callback endpoint, persisting "which run is waiting for which call
 run, and matching the inbound POST back to it. `ctx.webhook()` is the durable, replay-safe, first-class
 version of exactly that pattern — "expose a callback URL and wait for it" collapsed into two calls.
 
+<CodeFlow scene="webhook" />
+
 ## Minting a webhook — `ctx.webhook()`
 
 Calling `ctx.webhook<TPayload>()` reserves a logical position *now* and returns a

@@ -14,6 +14,13 @@ Temporal's split between *queries* (read-only) and *updates* (mutating, validate
   external `engine.update` delivers an argument — gated by an optional validator that can reject the
   update *before* it touches the run.
 
+The walkthrough below traces a video-encode run that does exactly this: it publishes progress with
+`ctx.setEvent` as it works, and pauses at a `ctx.onUpdate` point where an outside caller can bump its
+priority mid-run. Watch the two highlighted interaction beats — an external *read* of progress and an
+external *update* of priority — happen against a run that is otherwise busy.
+
+<CodeFlow scene="queries" />
+
 ## Queries
 
 A query is a side-effect-free read of a run's state. The run publishes values; readers observe them.

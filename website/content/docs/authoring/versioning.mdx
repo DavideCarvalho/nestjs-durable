@@ -111,6 +111,8 @@ export class CheckoutWorkflow {
 }
 ```
 
+<CodeFlow scene="versioning" />
+
 How it stays replay-safe:
 
 - A **fresh run** (started after the patch shipped) hits `ctx.patched('add-fraud-check')`, records a

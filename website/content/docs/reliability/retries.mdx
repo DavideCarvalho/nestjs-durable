@@ -25,6 +25,8 @@ async fetchQuote(order: Order): Promise<Quote> {
 const quote = await ctx.step(this.pricing.fetchQuote, order);
 ```
 
+<CodeFlow scene="retries" />
+
 The options are:
 
 - `retries` — maximum number of attempts before the step (and the run) fails. Defaults to 1 (a single try).

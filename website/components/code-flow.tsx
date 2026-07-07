@@ -677,12 +677,160 @@ const sleepSignals: Scene = {
   render: timeline(['place', 'sleep 2h', 'approved', 'finalize', 'done']),
 };
 
+const webhook: Scene = {
+  stack: true,
+  code: `async run(ctx: WorkflowCtx, order: Order) {
+  // mint a durable webhook: deterministic token + public callback url
+  const hook = ctx.webhook<PaymentResult>();
+
+  // hand the url to the provider INSIDE a step (checkpointed, fires once)
+  await ctx.step(this.psp.startPayment, {
+    orderId: order.id,
+    callbackUrl: hook.url,
+  });
+
+  // suspend with zero compute until the provider POSTs the callback
+  const result = await hook.wait();
+
+  if (result.status !== 'paid') {
+    throw new FatalError(\`payment \${result.providerRef} failed\`, 'payment_failed');
+  }
+  await ctx.step(this.orders.fulfil, { order, providerRef: result.providerRef });
+
+  return { orderId: order.id, providerRef: result.providerRef };
+}`,
+  steps: [
+    { lines: [3, 3], stage: '', active: 0, tone: 'run', title: 'mint', actor: 'ctx.webhook → deterministic token + url', caption: 'ctx.webhook() reserves a logical position now and mints a handle with a token (wh:<runId>:<seq>) and public url — both stable across replay.' },
+    { lines: [6, 9], stage: '', active: 1, tone: 'run', title: 'hand url', actor: 'ctx.step → start payment with hook.url', caption: 'The url is handed to the provider inside a step, so the handoff is checkpointed and fires exactly once, even across replay/recovery.' },
+    { lines: [12, 12], stage: '', active: 2, tone: 'wait', title: 'hook.wait', actor: 'suspended — zero compute until the callback', caption: 'hook.wait() parks the run on the token the mint reserved. It suspends with zero compute — no polling, no held thread — until the provider POSTs back as engine.signal(token, body).' },
+    { lines: [14, 17], stage: '', active: 3, tone: 'run', title: 'fulfil', actor: 'callback resumed the run → fulfil', caption: 'The callback delivered the PaymentResult; wait() resumed with it. The workflow guards the status and fulfils the order in a step.' },
+    { lines: [19, 19], stage: '', active: 4, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay, the mint, step and callback payload all return their saved values — none re-run.' },
+  ],
+  render: timeline(['mint', 'hand url', 'callback', 'fulfil', 'done']),
+};
+
+const scheduling: Scene = {
+  stack: true,
+  code: `@Workflow({ name: 'daily-report', version: '1' })
+export class DailyReportWorkflow {
+  constructor(private readonly reports: ReportService) {}
+  async run(ctx: WorkflowCtx) {
+    const rows = await ctx.step(this.reports.gatherYesterday, undefined);
+    await ctx.step(this.reports.email, rows);
+    return { rows: rows.length };
+  }
+}`,
+  steps: [
+    { lines: [5, 5], stage: '', active: 0, tone: 'run', title: 'gather', actor: 'engine started this on the cadence → gather', caption: "The engine starts this run on its schedule — nothing here calls it. The first step gathers yesterday's rows and checkpoints them, so a re-fire of the same window resumes with the saved result instead of re-gathering." },
+    { lines: [6, 6], stage: '', active: 1, tone: 'run', title: 'email', actor: 'ctx.step → email the report', caption: 'A second step emails the gathered rows; its result is a durable checkpoint, so a crash mid-send never re-runs the earlier gather.' },
+    { lines: [7, 7], stage: '', active: 2, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns the row count and the run completes. Next tick opens a new time-bucket window with a fresh run id; this one is done.' },
+  ],
+  render: timeline(['gather', 'email', 'done']),
+};
+
+const queries: Scene = {
+  stack: true,
+  code: `async run(ctx: WorkflowCtx, job: EncodeJob) {
+  await ctx.setEvent('progress', { phase: 'probing', pct: 0 });
+  const segments = await ctx.step(this.encoder.probe, job.src);
+
+  // an operator can raise priority mid-run — validated, or times out:
+  let priority = job.priority;
+  try {
+    priority = await ctx.onUpdate('reprioritize', { timeoutMs: 30_000 });
+  } catch (err) {
+    if (!(err instanceof SignalTimeoutError)) throw err;
+  }
+
+  for (let i = 0; i < segments.length; i++) {
+    await ctx.step(this.encoder.encodeSegment, { segment: segments[i], priority });
+    // readers poll engine.getEvent(runId, 'progress') for the latest snapshot:
+    await ctx.setEvent('progress', {
+      phase: 'encoding',
+      pct: Math.round(((i + 1) / segments.length) * 100),
+    });
+  }
+
+  await ctx.setEvent('progress', { phase: 'done', pct: 100 });
+  return { jobId: job.id, segments: segments.length };
+}`,
+  steps: [
+    { lines: [2, 2], stage: '', active: 0, tone: 'run', title: 'publish', actor: 'ctx.setEvent → progress 0%', caption: 'ctx.setEvent publishes a named, queryable snapshot from inside the run; an outside reader observes it via engine.getEvent with no effect on the run.' },
+    { lines: [3, 3], stage: '', active: 1, tone: 'run', title: 'probe', actor: 'ctx.step → probe the source', caption: 'A normal step probes the media and checkpoints the segment list.' },
+    { lines: [8, 8], stage: '', active: 2, tone: 'wait', title: 'onUpdate', actor: 'external update bumps priority mid-run', caption: "ctx.onUpdate suspends with zero compute until engine.update(runId, 'reprioritize', arg) delivers a validated priority — or the 30s timeout throws SignalTimeoutError and the default priority stands." },
+    { lines: [14, 14], stage: '', active: 3, tone: 'run', title: 'encode', actor: 'ctx.step → encode each segment', caption: 'The loop encodes one segment per step at the (possibly updated) priority, checkpointing each result.' },
+    { lines: [16, 19], stage: '', active: 4, tone: 'run', title: 'read', actor: 'a client reads progress via engine.getEvent', caption: 'Each pass overwrites the progress key with the latest pct; a polling client reads that snapshot with engine.getEvent while the loop keeps running.' },
+    { lines: [22, 23], stage: '', active: 5, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'A final setEvent marks 100% and the body returns; published values stay queryable even after the run completes.' },
+  ],
+  render: timeline(['publish', 'probe', 'priority', 'encode', 'read', 'done']),
+};
+
+const versioning: Scene = {
+  stack: true,
+  code: `@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow {
+  async run(ctx: WorkflowCtx, order: Order) {
+    const quote = await ctx.step(this.pricing.quote, order);
+
+    if (await ctx.patched('add-fraud-check')) {
+      // NEW branch — only runs that started after this shipped enter here
+      const risk = await ctx.step(this.fraud.score, { orderId: order.id });
+      if (risk.score > 0.9) throw new FatalError('high fraud risk', 'fraud');
+    }
+
+    await ctx.step(this.payments.charge, { orderId: order.id, amountCents: quote.total });
+  }
+}`,
+  steps: [
+    { lines: [4, 4], stage: '', active: 0, tone: 'run', title: 'quote', actor: 'ctx.step → price the order', caption: 'The unchanged prefix runs identically for every run: ctx.step prices the order and checkpoints the quote at this position.' },
+    { lines: [6, 6], stage: '', active: 1, tone: 'run', title: 'patched gate', actor: "ctx.patched('add-fraud-check') — old vs new", caption: 'This one line forks by the code the run started on: a fresh run records a patch:add-fraud-check marker and returns true; an in-flight run, whose history already holds a real step at this position, returns false — the version stays pinned to what the run began under.' },
+    { lines: [7, 9], stage: '', active: 2, tone: 'run', title: 'new path', actor: 'true → fresh runs take the fraud check', caption: 'Runs that started after the patch shipped enter the new branch and score fraud. In-flight runs got false and skip it — the marker rewinds the logical position rather than consuming it, so their recorded checkpoints never shift.' },
+    { lines: [12, 12], stage: '', active: 3, tone: 'run', title: 'charge', actor: 'ctx.step → charge the card', caption: 'Both paths converge here on the same checkpoint position, so old and new runs charge deterministically — the guard changed the branch, not the surrounding sequence.' },
+    { lines: [13, 14], stage: '', active: 4, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. New runs finish on the new path, old runs finish on the old — neither replay is corrupted.' },
+  ],
+  render: timeline(['quote', 'patched?', 'fraud check', 'charge', 'done']),
+};
+
+const retries: Scene = {
+  stack: true,
+  code: `@Injectable()
+export class PaymentsService {
+  @Step({ retries: 3, backoff: 'exp', backoffMs: 500, jitter: true })
+  async chargeCard(order: Order): Promise<Charge> {
+    return this.stripe.charge(order); // a transient 502 just throws — the engine retries
+  }
+}
+
+@Workflow({ name: 'checkout', version: '1' })
+export class CheckoutWorkflow {
+  async run(ctx: WorkflowCtx, order: Order) {
+    const quote = await ctx.step(this.pricing.fetchQuote, order);
+    const charge = await ctx.step(this.payments.chargeCard, order);
+    await ctx.step(this.email.confirm, { order, charge }, { retries: 5 });
+    return charge.id;
+  }
+}`,
+  steps: [
+    { lines: [12, 12], stage: '', active: 0, tone: 'run', title: 'fetch quote', actor: 'ctx.step → fetch the quote', caption: "ctx.step dispatches fetchQuote and checkpoints its result; the handler's declared @Step retry policy applies wherever it's called." },
+    { lines: [3, 3], stage: '', active: 1, tone: 'run', title: 'retry policy', actor: '@Step declares retries: 3, exp backoff, jitter', caption: 'The charge handler declares its own durable retry policy — up to 3 attempts, exponential backoff from 500ms, jittered.' },
+    { lines: [13, 13], stage: '', active: 1, tone: 'run', title: 'charge (retries)', actor: 'attempt fails → re-dispatched → succeeds', caption: 'fails transiently → the engine re-dispatches per the retry policy → succeeds. The run suspends durably between attempts, so no worker is held.' },
+    { lines: [14, 14], stage: '', active: 2, tone: 'run', title: 'confirm', actor: 'ctx.step → confirm, { retries: 5 } per-call', caption: 'A per-call { retries: 5 } overrides the handler default field-by-field for just this call site.' },
+    { lines: [15, 17], stage: '', active: 3, tone: 'done', title: 'completes', actor: 'run settles — completed', caption: 'The body returns and the run completes. On replay every completed step returns its saved result — the charge never re-runs.' },
+  ],
+  render: timeline(['quote', 'charge', 'confirm', 'done']),
+};
+
 const SCENES: Record<string, Scene> = {
   'execution-model': executionModel,
   'dispatched-step': dispatchedStep,
   checkout,
   'child-workflow': childWorkflow,
   'sleep-signals': sleepSignals,
+  webhook,
+  scheduling,
+  queries,
+  versioning,
+  retries,
 };
 
 // ── shell ────────────────────────────────────────────────────────────────────
