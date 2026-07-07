@@ -77,6 +77,8 @@ export class PublishPostWorkflow {
 
 The dispatch is checkpointed (replay-safe — it won't re-fire on resume) and idempotent by child id.
 
+<CodeFlow scene="start-child" />
+
 ### Scatter-gather: start many, then join
 
 Because `startChild` returns the child id and the start is idempotent by that id, you can fan out with

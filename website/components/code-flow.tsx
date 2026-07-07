@@ -145,6 +145,17 @@ type Step = {
   stage: string;
   active?: number; // timeline scenes: index of the lit beat
   tone?: 'run' | 'wait' | 'done'; // timeline scenes: the active beat's colour
+  child?: ChildState; // child-workflow scenes: parent/child lane state
+};
+
+// Two-lane parent↔child state for the ChildDiagram.
+type ChildState = {
+  pActive: number; // lit parent beat
+  cActive: number; // lit child beat, or -1 when the child hasn't started
+  arrow?: 'spawn' | 'return'; // which cross-lane arrow is lit this step
+  pTone?: 'run' | 'wait' | 'done'; // parent active-beat colour (wait = suspended)
+  pDone?: boolean; // parent fully settled (all parent beats done)
+  cDone?: boolean; // child fully settled
 };
 
 function CodePanel({
@@ -487,6 +498,74 @@ function WorkflowTimeline({ beats, active, tone, actor }: { beats: string[]; act
   );
 }
 
+// ── child-workflow diagram (two lanes: parent above, child below) ────────────
+// Shows a child dispatched from the parent: the spawn arrow down, the child running its
+// own beats, and (for ctx.child) the return arrow back up as the parent resumes — or (for
+// startChild) the parent settling while the child keeps running on its own lane.
+function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, childLabel }: { step: Step; parentBeats: string[]; childBeats: string[]; spawnIdx: number; parentLabel: string; childLabel: string }) {
+  const cs = step.child ?? { pActive: 0, cActive: -1 };
+  const np = parentBeats.length;
+  const nc = childBeats.length;
+  const pY = 82;
+  const cY = 190;
+  const pcx = (i: number) => 190 + (i * (600 - 190)) / Math.max(1, np - 1);
+  const ccx = (i: number) => 300 + (i * (600 - 300)) / Math.max(1, nc - 1);
+  const pTone = cs.pTone === 'wait' ? AMBER : cs.pTone === 'done' ? GREEN : accent;
+  const childStarted = cs.cActive >= 0;
+  const spawnLit = cs.arrow === 'spawn';
+  const returnLit = cs.arrow === 'return';
+
+  function beat(x: number, y: number, on: boolean, done: boolean, color: string, label: string, labelY: number) {
+    return (
+      <g className="cf-anim">
+        {on && <circle cx={x} cy={y} r={24} fill={color} opacity={0.15} className="cf-pulse" />}
+        <circle cx={x} cy={y} r={on ? 14 : 10} className="cf-anim" fill={on ? color : done ? tintAccent : neutral} stroke={on ? color : done ? accent : border} strokeWidth={1.5} />
+        {done && <path d={`M ${x - 4} ${y} l 3 3 l 6 -7`} fill="none" stroke={accent} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />}
+        <text x={x} y={labelY} textAnchor="middle" className="cf-anim" style={{ fontSize: 11.5, fill: on ? ink : muted, fontWeight: on ? 600 : 400 }}>
+          {label}
+        </text>
+      </g>
+    );
+  }
+
+  return (
+    <svg viewBox="0 0 640 240" width="100%" role="img" aria-label={step.actor} style={{ display: 'block' }}>
+      <defs>
+        <marker id="cf-c-spawn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill={accent} />
+        </marker>
+        <marker id="cf-c-return" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill={GREEN} />
+        </marker>
+      </defs>
+
+      <text x={16} y={pY - 26} style={{ fontSize: 12, fill: muted, fontWeight: 600 }}>
+        {parentLabel}
+      </text>
+      <text x={16} y={cY - 26} className="cf-anim" style={{ fontSize: 12, fill: childStarted ? muted : border, fontWeight: 600 }}>
+        {childLabel}
+      </text>
+
+      {/* spawn arrow (parent → child) */}
+      <path d={`M ${pcx(spawnIdx)} ${pY + 16} C ${pcx(spawnIdx)} ${pY + 58}, ${ccx(0)} ${cY - 58}, ${ccx(0)} ${cY - 16}`} fill="none" stroke={spawnLit ? accent : border} strokeWidth={spawnLit ? 2 : 1.25} strokeDasharray="5 5" markerEnd={spawnLit ? 'url(#cf-c-spawn)' : undefined} className={`cf-anim ${spawnLit ? 'cf-flow' : ''}`} opacity={childStarted ? 1 : 0} />
+      {/* return arrow (child → parent) — ctx.child only */}
+      <path d={`M ${ccx(nc - 1)} ${cY - 16} C ${ccx(nc - 1)} ${cY - 58}, ${pcx(spawnIdx + 1)} ${pY + 58}, ${pcx(spawnIdx + 1)} ${pY + 16}`} fill="none" stroke={GREEN} strokeWidth={2} strokeDasharray="5 5" markerEnd="url(#cf-c-return)" className="cf-anim cf-flow" opacity={returnLit ? 1 : 0} />
+
+      {/* parent rail */}
+      <line x1={pcx(0)} y1={pY} x2={pcx(np - 1)} y2={pY} stroke={border} strokeWidth={2} />
+      <line x1={pcx(0)} y1={pY} x2={pcx(cs.pDone ? np - 1 : Math.max(0, cs.pActive))} y2={pY} stroke={accent} strokeWidth={2} className="cf-anim" />
+      {parentBeats.map((label, i) => beat(pcx(i), pY, !cs.pDone && i === cs.pActive, cs.pDone || i < cs.pActive, pTone, label, pY - 22))}
+
+      {/* child rail */}
+      <g className="cf-anim" opacity={childStarted ? 1 : 0.4}>
+        <line x1={ccx(0)} y1={cY} x2={ccx(nc - 1)} y2={cY} stroke={border} strokeWidth={2} />
+        <line x1={ccx(0)} y1={cY} x2={ccx(cs.cDone ? nc - 1 : Math.max(0, cs.cActive))} y2={cY} stroke={accent} strokeWidth={2} className="cf-anim" opacity={childStarted ? 1 : 0} />
+        {childBeats.map((label, i) => beat(ccx(i), cY, childStarted && !cs.cDone && i === cs.cActive, cs.cDone || (childStarted && i < cs.cActive), accent, label, cY + 28))}
+      </g>
+    </svg>
+  );
+}
+
 // ── scenes ───────────────────────────────────────────────────────────────────
 type Scene = { code: string; steps: Step[]; render: (step: Step) => ReactNode; stack?: boolean };
 
@@ -647,12 +726,36 @@ export class OnboardWorkflow {
   }
 }`,
   steps: [
-    { lines: [4, 4], stage: '', active: 0, tone: 'run', title: 'create account', actor: 'ctx.step → create the account', caption: 'A normal step creates the account and checkpoints its result.' },
-    { lines: [7, 7], stage: '', active: 1, tone: 'wait', title: 'ctx.child', actor: 'child KycWorkflow — suspended until it settles', caption: 'ctx.child starts KycWorkflow and suspends — zero compute — until the child reaches a terminal state, then resumes with its output. The childId is deterministic, so the child runs exactly once across replay.' },
-    { lines: [9, 9], stage: '', active: 2, tone: 'run', title: 'welcome', actor: 'ctx.step → welcome email', caption: "The parent resumed with the child's result and emails the user." },
-    { lines: [10, 10], stage: '', active: 3, tone: 'done', title: 'completes', actor: 'onboard settles — completed', caption: "The parent returns the child's verified flag; the run completes." },
+    { lines: [4, 4], stage: '', title: 'create', actor: 'ctx.step → create the account', caption: "A normal step creates the account. The child workflow hasn't started yet.", child: { pActive: 0, cActive: -1, pTone: 'run' } },
+    { lines: [7, 7], stage: '', title: 'ctx.child', actor: 'ctx.child → start KycWorkflow, parent suspends', caption: 'ctx.child starts KycWorkflow — a full durable run of its own — and suspends the parent here (zero compute).', child: { pActive: 1, cActive: 0, arrow: 'spawn', pTone: 'wait' } },
+    { lines: [7, 7], stage: '', title: 'child runs', actor: 'the child runs its own steps — the parent waits', caption: 'The child runs its own steps, with its own history, retries and dashboard entry. A child that takes hours costs the suspended parent nothing.', child: { pActive: 1, cActive: 1, pTone: 'wait' } },
+    { lines: [7, 7], stage: '', title: 'result returns', actor: 'child settled → its output flows back', caption: 'The child reaches a terminal state and its output flows back, resuming the parent. (A child failure would throw in the parent instead.)', child: { pActive: 1, cActive: 2, cDone: true, arrow: 'return', pTone: 'wait' } },
+    { lines: [9, 9], stage: '', title: 'welcome', actor: 'parent resumed → welcome email', caption: "The parent resumes with the child's result and emails the user.", child: { pActive: 2, cActive: 2, cDone: true, pTone: 'run' } },
+    { lines: [10, 10], stage: '', title: 'completes', actor: 'parent settles — completed', caption: "The parent returns the child's verified flag; the run completes.", child: { pActive: 3, cActive: 2, cDone: true, pDone: true, pTone: 'done' } },
   ],
-  render: timeline(['create', 'KYC child', 'welcome', 'done']),
+  render: (step) => <ChildDiagram step={step} parentBeats={['create', 'ctx.child', 'welcome', 'done']} childBeats={['verify', 'score', 'done']} spawnIdx={1} parentLabel="parent · onboard" childLabel="child · KycWorkflow" />,
+};
+
+const startChild: Scene = {
+  stack: true,
+  code: `@Workflow({ name: 'publish-post', version: '1' })
+export class PublishPostWorkflow {
+  async run(ctx: WorkflowCtx, post: Post) {
+    await ctx.step(this.posts.publish, post);
+
+    // fire-and-forget — don't make publishing wait on indexing:
+    await ctx.startChild(ReindexSearchWorkflow, { postId: post.id });
+
+    return { published: true };
+  }
+}`,
+  steps: [
+    { lines: [4, 4], stage: '', title: 'publish', actor: 'ctx.step → publish the post', caption: 'A step publishes the post. Nothing has been spun off yet.', child: { pActive: 0, cActive: -1, pTone: 'run' } },
+    { lines: [7, 7], stage: '', title: 'startChild', actor: "ctx.startChild → dispatch the child, don't wait", caption: 'ctx.startChild dispatches ReindexSearchWorkflow and returns its run id immediately — the parent does NOT suspend.', child: { pActive: 1, cActive: 0, arrow: 'spawn', pTone: 'run' } },
+    { lines: [9, 9], stage: '', title: 'parent completes', actor: 'parent settles — the child keeps running', caption: 'The parent returns and completes right away, while the child keeps running on its own lane — an independent durable run.', child: { pActive: 2, cActive: 1, pDone: true, pTone: 'done' } },
+    { lines: [9, 9], stage: '', title: 'child lives on', actor: 'the child finishes later, independently', caption: "The child finishes on its own later; a failure there never touches the already-settled parent — inspect or retry it from the dashboard.", child: { pActive: 2, cActive: 2, cDone: true, pDone: true, pTone: 'done' } },
+  ],
+  render: (step) => <ChildDiagram step={step} parentBeats={['publish', 'startChild', 'done']} childBeats={['reindex', 'warm', 'done']} spawnIdx={1} parentLabel="parent · publish-post" childLabel="child · ReindexSearchWorkflow" />,
 };
 
 const sleepSignals: Scene = {
@@ -825,6 +928,7 @@ const SCENES: Record<string, Scene> = {
   'dispatched-step': dispatchedStep,
   checkout,
   'child-workflow': childWorkflow,
+  'start-child': startChild,
   'sleep-signals': sleepSignals,
   webhook,
   scheduling,
