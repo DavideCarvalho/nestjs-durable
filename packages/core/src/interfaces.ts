@@ -1299,6 +1299,20 @@ export interface WorkflowCtx {
    * `ctx.upsertSearchAttributes(…)`).
    */
   upsertSearchAttributes(attrs: SearchAttributes): Promise<void>;
+  /**
+   * Run a checkpointed step **in-process** — the escape hatch from the always-dispatched {@link step}
+   * for work that must run inline in the workflow body. Like `step`, its result is a durable checkpoint
+   * (returned, not re-run, on replay); unlike `step`, the body `fn` executes here rather than on a
+   * worker, so it can carry an in-memory `compensate` callback for **sagas** — an undo the engine runs
+   * in reverse if the run later fails (see [Sagas & compensation](/docs/reliability/sagas)). `fn`
+   * receives a {@link StepLogger} for sub-process events. Prefer {@link step} for ordinary work; reach
+   * for `localStep` when you need in-process execution or a compensation.
+   */
+  localStep<TOutput>(
+    name: string,
+    fn: (log: StepLogger) => Promise<TOutput>,
+    options?: StepOptions,
+  ): Promise<TOutput>;
 }
 
 /** Result of executing or resuming a workflow run. */

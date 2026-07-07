@@ -137,19 +137,11 @@ class Position {
 }
 
 /**
- * {@link WorkflowCtx} plus the internal in-process local-step primitive — used ONLY by the library's
- * own built-in workflows (the durable-entity runner) that need a checkpointed, in-process step the
- * public `ctx.step` (always-dispatched, no in-process placement) no longer provides. Every
- * `createWorkflowCtx` result actually carries `localStep` at runtime; this type just names the wider
- * shape for the internal consumers that need it, without widening the public {@link WorkflowCtx}.
+ * Back-compat alias of {@link WorkflowCtx}. `localStep` — the checkpointed in-process step primitive
+ * used for saga compensation — is now part of the public {@link WorkflowCtx}, so this type adds
+ * nothing; it is kept only so internal consumers (the durable-entity runner) keep compiling.
  */
-export interface InternalWorkflowCtx extends WorkflowCtx {
-  localStep<TOutput>(
-    name: string,
-    fn: (log: StepLogger) => Promise<TOutput>,
-    options?: StepOptions,
-  ): Promise<TOutput>;
-}
+export type InternalWorkflowCtx = WorkflowCtx;
 
 /**
  * Build the {@link WorkflowCtx} handed to a workflow body. Every primitive is a closure over the
