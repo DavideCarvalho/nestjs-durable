@@ -1,5 +1,32 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.47.0
+
+### Minor Changes
+
+- 54dc0af: Class-first workflow API: `@Workflow` classes extending the new `DurableWorkflow` base gain `MyWorkflow.start(input)` (fire-and-forget — `engine.start` outside a workflow, a parent-linked `ctx.startChild` inside one) and `MyWorkflow.execute(input)` (run-and-await the typed output — `ctx.child` inside, start + wait-until-terminal outside), with input/output inferred from the subclass's own `run` signature. Powered by a new ambient workflow context (`AsyncLocalStorage`) the engine and the thin worker install around every body execution (`currentWorkflowCtx()`), per-class engine bindings written by the registrar at boot (`bindWorkflowClass`), and `waitForRun`'s new `until: 'terminal'` option.
+- 23325d3: Saga compensation for dispatched steps — `ctx.step(ref, input, { compensate })`.
+
+  The undo is another `@Step` (a method reference, compile-checked to accept the
+  `StepUndo<TInput, TOutput>` envelope of the call it undoes — see the new `UndoOf<H>` helper — or a
+  name string for a cross-runtime handler, e.g. Python). On failure (or `cancel({ compensate: true })`)
+  the engine dispatches the registered undos durably in reverse order, each called with the
+  compensated step's `{ input, output }`.
+
+  The whole unwind is now checkpointed at reserved negative seqs (`-1` = first undo executed): a crash
+  mid-unwind resumes where it left off instead of re-running completed undos — this also applies to
+  `ctx.localStep` closures, whose in-process retry semantics are otherwise unchanged. The
+  `compensate:<step>` checkpoints make the saga visible in run detail; the dashboard renders them as
+  an amber Compensation section with a `compensated`/`compensating` header chip and banner, and the
+  client exports `splitCompensations`/`compensationSummary`/`compensationDisplayName` for consumers
+  rendering their own timelines.
+
+- cb0ae92: `ctx.all({ mode: 'failFast' })` now cancels the surviving siblings when it throws (best-effort —
+  a child mid-step observes the cancellation at its next checkpoint), instead of leaving them
+  running with ignored results. `DurableWebhook.wait()` accepts `{ timeoutMs }` with the same
+  durable-deadline semantics as `waitForSignal` (throws `SignalTimeoutError` past the deadline;
+  deadline stamped once and stable across replays).
+
 ## 0.46.1
 
 ### Patch Changes
