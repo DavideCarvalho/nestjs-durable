@@ -160,6 +160,7 @@ type ChildState = {
   cActive: number; // lit child beat, or -1 when the child hasn't started
   arrow?: 'spawn' | 'return'; // which cross-lane arrow is lit this step
   pTone?: 'run' | 'wait' | 'done' | 'fail'; // parent active-beat colour (wait = suspended, fail = dead)
+  cTone?: 'run' | 'wait' | 'done' | 'fail'; // child/second-lane active-beat colour (wait = gated/suspended)
   pDone?: boolean; // parent fully settled (all parent beats done)
   cDone?: boolean; // child fully settled
 };
@@ -552,6 +553,7 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
   const pcx = (i: number) => 190 + (i * (600 - 190)) / Math.max(1, np - 1);
   const ccx = (i: number) => (parallel ? 190 : 300) + (i * (600 - (parallel ? 190 : 300))) / Math.max(1, nc - 1);
   const pTone = cs.pTone === 'fail' ? RED : cs.pTone === 'wait' ? AMBER : cs.pTone === 'done' ? GREEN : accent;
+  const cTone = cs.cTone === 'fail' ? RED : cs.cTone === 'wait' ? AMBER : cs.cTone === 'done' ? GREEN : accent;
   const childStarted = cs.cActive >= 0;
   const spawnLit = cs.arrow === 'spawn';
   const returnLit = cs.arrow === 'return';
@@ -605,7 +607,7 @@ function ChildDiagram({ step, parentBeats, childBeats, spawnIdx, parentLabel, ch
       <g className="cf-anim" opacity={parallel || childStarted ? 1 : 0.4}>
         <line x1={ccx(0)} y1={cY} x2={ccx(nc - 1)} y2={cY} stroke={border} strokeWidth={2} />
         <line x1={ccx(0)} y1={cY} x2={ccx(cs.cDone ? nc - 1 : Math.max(0, cs.cActive))} y2={cY} stroke={GREEN} strokeWidth={2} className="cf-anim" opacity={parallel || childStarted ? 1 : 0} />
-        {childBeats.map((label, i) => beat(ccx(i), cY, childStarted && !cs.cDone && i === cs.cActive, cs.cDone || (childStarted && i < cs.cActive), accent, label, cY + 28))}
+        {childBeats.map((label, i) => beat(ccx(i), cY, childStarted && !cs.cDone && i === cs.cActive, cs.cDone || (childStarted && i < cs.cActive), cTone, label, cY + 28))}
       </g>
     </svg>
   );
@@ -1147,6 +1149,37 @@ export class SendReceiptWorkflow {
   render: timeline(['dispatch', 'blocked', 'priority', 'fair', 'done']),
 };
 
+const singleton: Scene = {
+  stack: true,
+  code: `// sync-inventory.workflow.ts — a durable mutex per store
+@Workflow({
+  name: 'sync-inventory',
+  version: '1',
+  singleton: { key: (input) => \`store:\${(input as SyncInput).storeId}\` },
+})
+export class SyncInventoryWorkflow {
+  async run(ctx: WorkflowCtx, input: SyncInput) {
+    const stock = await ctx.step(this.inventory.pull, input);
+    await ctx.step(this.inventory.reconcile, stock);
+  }
+}
+
+// three starts arrive, back to back:
+await workflows.start(SyncInventoryWorkflow, { storeId: 'A' }); // slot free → runs
+await workflows.start(SyncInventoryWorkflow, { storeId: 'A' }); // same key → GATED behind run 1
+await workflows.start(SyncInventoryWorkflow, { storeId: 'B' }); // other key → runs immediately`,
+  steps: [
+    { lines: [2, 6], stage: '', title: 'admitted', actor: "singleton.key → 'store:A' — slot free, run 1 admitted", caption: 'The singleton key derives store:A from the input. The first start finds the key’s only slot free (limit defaults to 1 — a mutex) and is admitted.', child: { pActive: 0, cActive: -1, pTone: 'run' } },
+    { lines: [15, 15], stage: '', title: 'run 1 works', actor: 'run 1 executes — it holds store:A’s slot', caption: 'Run 1 executes its steps normally, holding the store:A slot for as long as it is pending, running, or suspended.', child: { pActive: 1, cActive: -1, pTone: 'run' } },
+    { lines: [16, 16], stage: '', title: 'run 2 arrives', actor: 'second start, SAME key store:A', caption: 'A second start for store:A arrives while run 1 is in flight. It is a real run with its own runId — but it shares the singleton key.', child: { pActive: 1, cActive: 0, pTone: 'run', cTone: 'run' } },
+    { lines: [16, 17], stage: '', title: 'gated', actor: 'gate: run 1 holds store:A → run 2 waits (zero compute)', caption: 'The admission gate counts run 1 under the same key, so run 2 is NOT admitted: it suspends with a jittered retry and a wake-on-release notify — zero compute while it queues. store:B (last line) has its own key and runs immediately.', child: { pActive: 1, cActive: 1, pTone: 'run', cTone: 'wait' } },
+    { lines: [9, 11], stage: '', title: 'run 1 done', actor: 'run 1 settles → slot released → wakeNext', caption: 'Run 1 completes and releases the slot. The gate wakes the OLDEST waiter for store:A — FIFO by (createdAt, id), the same view on every instance, so admission is race-free across a fleet.', child: { pActive: 2, cActive: 1, pTone: 'done', cTone: 'wait' } },
+    { lines: [16, 16], stage: '', title: 'run 2 admitted', actor: 'run 2 admitted → executes the same workflow', caption: 'Run 2 is admitted and does its own sync — exactly one store:A sync at a time, and none of the requests were lost.', child: { pActive: 2, pDone: true, pTone: 'done', cActive: 2, cTone: 'run' } },
+    { lines: [10, 11], stage: '', title: 'run 2 done', actor: 'run 2 settles — the queue is drained', caption: 'Run 2 completes. Set maxQueueDepth to bound how many starts may queue behind the slot — past it, start() rejects with SingletonQueueFullError instead of growing the backlog.', child: { pActive: 2, pDone: true, pTone: 'done', cActive: 3, cDone: true, cTone: 'done' } },
+  ],
+  render: (step) => <ChildDiagram step={step} parentBeats={['admitted', 'sync', 'done']} childBeats={['arrives', 'gated', 'sync', 'done']} spawnIdx={0} parentLabel="run 1 · key store:A" childLabel="run 2 · key store:A (same key)" parallel />,
+};
+
 const SCENES: Record<string, Scene> = {
   'execution-model': executionModel,
   'dispatched-step': dispatchedStep,
@@ -1163,6 +1196,7 @@ const SCENES: Record<string, Scene> = {
   'transport-dispatch': transportDispatch,
   saga,
   'flow-control': flowControl,
+  singleton,
   versioning,
   retries,
 };

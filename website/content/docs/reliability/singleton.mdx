@@ -9,6 +9,12 @@ environment. `singleton` is a durable, FIFO mutex over a workflow's runs: declar
 and the engine guarantees at most `limit` runs sharing that key are ever in flight at the same time,
 across every instance.
 
+Watch it work: two starts arrive for the **same key** — the first is admitted, the second queues
+(suspended, zero compute) until the first settles and the gate wakes it; a start for a different key
+would run immediately on its own slot.
+
+<CodeFlow scene="singleton" />
+
 ## Declaring a singleton: `@Workflow({ singleton })`
 
 ```ts
