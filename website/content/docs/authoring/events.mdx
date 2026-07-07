@@ -47,9 +47,9 @@ other subscribers or the waiters being resumed (`engine.ts:1403-1417`).
 
 ## Starting a workflow from an event
 
-Subscribe a `@Workflow` to one or more event names with `onEvent`, or the equivalent `@OnEvent(...)`
-class decorator — the two are merged, so you can use whichever reads better, or both
-(`decorators.ts:81-87`, `decorators.ts:297-317`):
+Subscribe a `@Workflow` to one or more event names with `onEvent`, or the equivalent
+`@OnDurableEvent(...)` class decorator — the two are merged, so you can use whichever reads better,
+or both (`decorators.ts:81-87`, `decorators.ts:297-317`):
 
 ```ts
 @Workflow({ name: 'send-welcome', version: '1', onEvent: ['user.registered'] })
@@ -65,7 +65,7 @@ export class SendWelcomeWorkflow {
 
 ```ts
 // Equivalent, class-decorator form — merges with any `onEvent` array on the same class.
-@OnEvent('user.registered', 'user.invited')
+@OnDurableEvent('user.registered', 'user.invited')
 @Workflow({ name: 'audit-signup', version: '1' })
 export class AuditSignupWorkflow {
   async run(_ctx: WorkflowCtx, input: { email: string }) {
@@ -73,6 +73,12 @@ export class AuditSignupWorkflow {
   }
 }
 ```
+
+<Callout type="info">
+The decorator is named `OnDurableEvent` — not `OnEvent` — because `@nestjs/event-emitter` exports an
+`@OnEvent` of its own, and in an app using both libraries an auto-import picking the wrong one fails
+silently in either direction. `OnEvent` still works as a deprecated alias for one more minor.
+</Callout>
 
 The next time anyone calls `publishEvent('user.registered', { email })`, both workflows above start
 a fresh run with `{ email }` as input (`event-triggers.spec.ts:7-40`, "starts a subscribed workflow

@@ -87,7 +87,7 @@ export class WorkflowService {
 
   /**
    * Publish a named event. Resumes runs waiting on it via `ctx.waitForEvent(name, { match })` and
-   * starts a fresh run of every workflow subscribed via `@Workflow({ onEvent })` / `@OnEvent` (the
+   * starts a fresh run of every workflow subscribed via `@Workflow({ onEvent })` / `@OnDurableEvent` (the
    * payload becomes its input). Pass `opts.id` to dedupe redeliveries. Returns how many runs it
    * touched (resumed + started).
    */

@@ -103,7 +103,7 @@ Marks a provider class as a durable workflow; its `run(ctx, input)` becomes the 
 | `executionTimeout` | `string \| number` | Max wall-clock lifetime; an overrunning run is cancelled (`execution_timeout`) by the timer poller. |
 | `inputSchema` | `class` | Validate `start` input against a class-validator DTO (needs `class-validator`/`class-transformer`). |
 | `validateInput` | `(input: unknown) => void \| Promise<void>` | Custom validator; takes precedence over `inputSchema`. |
-| `onEvent` | `string[]` | Start a fresh run whenever any of these events is published. Merged with `@OnEvent`. |
+| `onEvent` | `string[]` | Start a fresh run whenever any of these events is published. Merged with `@OnDurableEvent`. |
 | `debounce` | `string \| number` | Coalesce `onEvent` triggers: fire once quiet for this long, with the last payload. |
 | `batch` | `{ maxSize: number; within: string \| number }` | Coalesce `onEvent` triggers: fire on size or window, with all payloads. |
 
@@ -143,10 +143,11 @@ constructible with no arguments); `@On(op)` marks a method as the handler for op
 serialized per key over durable state. Drive with `EntityService` or `ctx.callEntity`/`signalEntity`.
 See [Durable entities](/docs/authoring/entities).
 
-### `@OnEvent(...events)`
+### `@OnDurableEvent(...events)`
 
 Class decorator subscribing a `@Workflow` to one or more events — equivalent to
-`@Workflow({ onEvent })`; multiple declarations and the option are merged. See
+`@Workflow({ onEvent })`; multiple declarations and the option are merged. Named "durable" to avoid
+clashing with `@nestjs/event-emitter`'s `@OnEvent` (`OnEvent` remains a deprecated alias). See
 [Event-driven workflows](/docs/authoring/events).
 
 ### `@StepInterceptor()`

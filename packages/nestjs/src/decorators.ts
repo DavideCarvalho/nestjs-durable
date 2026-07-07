@@ -82,7 +82,7 @@ export interface WorkflowOptions {
    * Start a fresh run of this workflow whenever any of these events is published via
    * `publishEvent(name, payload)` — the payload becomes the run's input. e.g.
    * `onEvent: ['user.registered', 'user.invited']`. The same subscription can also be declared with
-   * the `@OnEvent(...)` class decorator; the two are merged.
+   * the `@OnDurableEvent(...)` class decorator; the two are merged.
    */
   onEvent?: string[];
   /**
@@ -299,17 +299,23 @@ export const ON_EVENT_METADATA = Symbol('nestjs-durable:on-event');
 /**
  * Subscribe a `@Workflow` class to one or more events: when any of them is published via
  * `publishEvent(name, payload)`, a fresh run of the workflow starts with the payload as input.
- * Equivalent to `@Workflow({ onEvent })` — use whichever reads better; multiple `@OnEvent(...)`
- * decorators and the option are all merged.
+ * Equivalent to `@Workflow({ onEvent })` — use whichever reads better; multiple
+ * `@OnDurableEvent(...)` decorators and the option are all merged.
+ *
+ * Named "durable" on purpose: `@nestjs/event-emitter` exports an `@OnEvent` decorator, and in an
+ * app using both libs an auto-import picking the wrong one fails silently in either direction.
  */
-export function OnEvent(...events: string[]): ClassDecorator {
+export function OnDurableEvent(...events: string[]): ClassDecorator {
   return (target) => {
     const existing = (Reflect.getMetadata(ON_EVENT_METADATA, target) as string[] | undefined) ?? [];
     Reflect.defineMetadata(ON_EVENT_METADATA, [...existing, ...events], target);
   };
 }
 
-/** All events a workflow class subscribes to — the union of `@Workflow({ onEvent })` and `@OnEvent`. */
+/** @deprecated Renamed to `OnDurableEvent` — this alias clashes with `@nestjs/event-emitter`'s `@OnEvent` and will be removed in the next minor. */
+export const OnEvent = OnDurableEvent;
+
+/** All events a workflow class subscribes to — the union of `@Workflow({ onEvent })` and `@OnDurableEvent`. */
 export function getOnEvents(meta: WorkflowMeta, target: object): string[] {
   const fromDecorator =
     (Reflect.getMetadata(ON_EVENT_METADATA, target) as string[] | undefined) ?? [];

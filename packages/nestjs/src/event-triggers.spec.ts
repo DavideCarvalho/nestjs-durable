@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import { InMemoryStateStore, InMemoryTransport } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { describe, expect, it } from 'vitest';
-import { OnEvent, Workflow } from './decorators';
+import { OnDurableEvent, OnEvent, Workflow } from './decorators';
 import { DurableModule } from './durable.module';
 import { WorkflowService } from './workflow.service';
 
@@ -14,14 +14,18 @@ class WelcomeWorkflow {
 }
 
 @Workflow({ name: 'audit', version: '1' })
-@OnEvent('user.registered', 'user.deleted')
+@OnDurableEvent('user.registered', 'user.deleted')
 class AuditWorkflow {
   async run(_ctx: unknown, input: { kind: string }) {
     return input.kind;
   }
 }
 
-describe('event triggers (@Workflow onEvent + @OnEvent decorator)', () => {
+describe('event triggers (@Workflow onEvent + @OnDurableEvent decorator)', () => {
+  it('keeps the deprecated @OnEvent alias pointing at OnDurableEvent', () => {
+    expect(OnEvent).toBe(OnDurableEvent);
+  });
+
   it('starts workflows subscribed via both the option and the decorator', async () => {
     const store = new InMemoryStateStore();
     const mod = await Test.createTestingModule({
