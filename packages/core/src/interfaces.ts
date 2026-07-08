@@ -490,6 +490,9 @@ export interface RunRequest {
 export type RunRequestKind =
   | { kind: 'getRunDetail'; runId: string }
   | { kind: 'listRuns'; query: RunQuery }
+  // Per-group worker health — the operator answers it scoped to the requester's own groups (see
+  // `RunRequestResponder`), so a tenant's Workers panel shows ITS queues, never another tenant's.
+  | { kind: 'workerHealth' }
   | { kind: 'cancel'; runId: string; opts?: { compensate?: boolean } }
   | { kind: 'retry'; runId: string }
   | { kind: 'continue'; runId: string }

@@ -42,6 +42,16 @@ export class RunRequestResponder {
       return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
+    if (body.kind === 'workerHealth') {
+      // Not runId-bearing, so it can't ride the getRunDetail namespace check below. Scope by the
+      // group-name convention instead: a tenant's queues are suffixed `<name>@<tenant>`, so keep only
+      // groups ending in the requester's `@<tenant>` — the operator's own bare groups and every other
+      // tenant's are dropped, so a tenant's Workers panel only ever sees ITS OWN queues.
+      const all = await this.gateway.workerHealth();
+      const data = all.filter((h) => h.group.endsWith(`@${msg.tenant}`));
+      return { requestId: msg.requestId, result: { ok: true, data } };
+    }
+
     // Every remaining verb is runId-bearing. Load the run FIRST — before calling the verb — so a
     // cross-tenant request never reaches the gateway's mutating methods (cancel/retry/continue).
     const detail = await this.gateway.getRunDetail(body.runId);
@@ -71,7 +81,10 @@ export class RunRequestResponder {
   }
 
   private callVerb(
-    body: Exclude<RunRequest['body'], { kind: 'listRuns' } | { kind: 'getRunDetail' }>,
+    body: Exclude<
+      RunRequest['body'],
+      { kind: 'listRuns' } | { kind: 'getRunDetail' } | { kind: 'workerHealth' }
+    >,
   ): Promise<unknown> {
     switch (body.kind) {
       case 'cancel':

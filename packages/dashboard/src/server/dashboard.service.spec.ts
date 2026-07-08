@@ -1,5 +1,6 @@
 import {
   type EngineEvent,
+  type GroupHealth,
   InMemoryStateStore,
   type RunGateway,
   type RunQuery,
@@ -25,6 +26,7 @@ function fakeRun(id: string): WorkflowRun {
 interface FakeGatewayOverrides {
   record?: (call: string) => void;
   listRuns?: (query: RunQuery) => Promise<WorkflowRun[]>;
+  workerHealth?: () => Promise<GroupHealth[]>;
   subscribe?: (runId: string, onEvent: (event: EngineEvent) => void) => () => void;
 }
 
@@ -38,6 +40,10 @@ function fakeGateway(overrides: FakeGatewayOverrides): RunGateway {
     async listRuns(query) {
       record('listRuns');
       return overrides.listRuns ? overrides.listRuns(query) : [];
+    },
+    async workerHealth() {
+      record('workerHealth');
+      return overrides.workerHealth ? overrides.workerHealth() : [];
     },
     async getRunDetail(runId) {
       record('getRunDetail');
@@ -75,6 +81,7 @@ describe('DashboardService', () => {
     await service.cancel('r1', { compensate: true });
     await service.continue('r1');
     await service.retryWithInput('r1', { fixed: true });
+    await service.workerHealth();
 
     expect(calls).toEqual([
       'listRuns',
@@ -83,7 +90,17 @@ describe('DashboardService', () => {
       'cancel:{"compensate":true}',
       'continue',
       'retryWithInput',
+      'workerHealth',
     ]);
+  });
+
+  it('workerHealth routes through the gateway (works on a tenant, scoped by the operator)', async () => {
+    const scoped: GroupHealth[] = [{ group: 'pipeline@acme', depth: 3, liveWorkers: [] }];
+    const service = new DashboardService(fakeGateway({ workerHealth: async () => scoped }));
+
+    // No store/engine (tenant shape) and it still resolves — the gateway (a ProxyRunGateway in
+    // production) answers with the operator's tenant-scoped groups instead of throwing.
+    await expect(service.workerHealth()).resolves.toEqual(scoped);
   });
 
   it('bulk goes through the gateway, scoped and capped', async () => {
@@ -97,7 +114,6 @@ describe('DashboardService', () => {
   it('operator-only ops throw a clear error without the control plane', async () => {
     const service = new DashboardService(fakeGateway({}));
 
-    await expect(service.workerHealth()).rejects.toThrow(/control plane/);
     await expect(service.metrics()).rejects.toThrow(/control plane/);
     await expect(service.getEvent('r1', 'k')).rejects.toThrow(/control plane/);
     await expect(service.update('r1', 'u', {})).rejects.toThrow(/control plane/);
@@ -133,7 +149,6 @@ describe('DashboardService', () => {
     const engine = new WorkflowEngine({ store });
     const service = new DashboardService(fakeGateway({}), store, engine);
 
-    await expect(service.workerHealth()).resolves.toEqual([]);
     await expect(service.metrics()).resolves.toContain('durable_pending_runs 0');
   });
 });

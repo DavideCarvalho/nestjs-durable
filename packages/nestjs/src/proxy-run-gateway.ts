@@ -1,5 +1,6 @@
 import type {
   EngineEvent,
+  GroupHealth,
   RunDetail,
   RunGateway,
   RunQuery,
@@ -83,6 +84,11 @@ export class ProxyRunGateway implements RunGateway {
 
   listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return this.request<WorkflowRun[]>({ kind: 'listRuns', query });
+  }
+
+  /** Round-trips to the operator, which scopes the result to this tenant's own `@<tenant>` groups. */
+  workerHealth(): Promise<GroupHealth[]> {
+    return this.request<GroupHealth[]>({ kind: 'workerHealth' });
   }
 
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {

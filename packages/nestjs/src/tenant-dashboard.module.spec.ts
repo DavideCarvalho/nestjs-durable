@@ -78,9 +78,13 @@ describe('a tenant DurableModule (connection only) mounting DurableDashboardModu
       body: { kind: 'cancel', runId: 'run-1', opts: { compensate: true } },
     });
 
-    // Operator-only ops: cleanly reject on a tenant (does NOT call the start client's missing
-    // methods, which would throw a confusing `undefined is not a function` instead).
-    await expect(dashboard.workerHealth()).rejects.toThrow(/control plane/);
+    // workerHealth now also rides the proxy (the operator scopes the reply to the tenant's own
+    // `@<tenant>` groups), so on a tenant it dispatches a request rather than throwing control-plane.
+    void dashboard.workerHealth();
+    expect(dispatched[1]).toMatchObject({ tenant: 'tenant-a', body: { kind: 'workerHealth' } });
+
+    // The remaining operator-only ops still cleanly reject on a tenant (does NOT call the start
+    // client's missing methods, which would throw a confusing `undefined is not a function`).
     await expect(dashboard.metrics()).rejects.toThrow(/control plane/);
 
     await moduleRef.close();

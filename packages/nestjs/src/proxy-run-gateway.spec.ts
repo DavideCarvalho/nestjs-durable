@@ -39,6 +39,19 @@ describe('ProxyRunGateway', () => {
     await expect(p).resolves.toMatchObject({ run: { id: 'r1' } });
   });
 
+  it('round-trips workerHealth and resolves with the operator-scoped groups', async () => {
+    const tx = fakeTransport();
+    const gw = new ProxyRunGateway(tx, 'acme', 5000);
+    const p = gw.workerHealth();
+    const req = tx.requests[0];
+    expect(req).toMatchObject({ tenant: 'acme', body: { kind: 'workerHealth' } });
+    tx.emitReply({
+      requestId: req.requestId,
+      result: { ok: true, data: [{ group: 'pipeline@acme', depth: 2, liveWorkers: [] }] },
+    });
+    await expect(p).resolves.toMatchObject([{ group: 'pipeline@acme', depth: 2 }]);
+  });
+
   it('rejects with the operator error', async () => {
     const tx = fakeTransport();
     const gw = new ProxyRunGateway(tx, 'acme', 5000);

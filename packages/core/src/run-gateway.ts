@@ -1,4 +1,11 @@
-import type { EngineEvent, RunQuery, RunResult, StepCheckpoint, WorkflowRun } from './interfaces';
+import type {
+  EngineEvent,
+  GroupHealth,
+  RunQuery,
+  RunResult,
+  StepCheckpoint,
+  WorkflowRun,
+} from './interfaces';
 
 /** A run + its timeline + child ids — the detail view. Mirrors the dashboard's `RunDetail`. */
 export interface RunDetail {
@@ -13,11 +20,15 @@ export interface RunDetail {
  * The bounded read/control/stream surface a consumer (e.g. a controller) needs, satisfied by BOTH
  * topologies: the control plane binds a store-backed impl (reuses `DashboardService`); a tenant binds
  * a `ProxyRunGateway` that round-trips over the transport. Deliberately smaller than the full dashboard
- * (no metrics/bulk/workerHealth/update/signal) — those stay control-plane-only.
+ * (no metrics/bulk/update/signal) — those stay control-plane-only. `workerHealth` IS on the port: the
+ * operator answers it scoped to the requester's own groups, so a tenant's Workers panel works too.
  */
 export interface RunGateway {
   getRunDetail(runId: string): Promise<RunDetail | null>;
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
+  /** Per-group worker health (queue backlog + live worker heartbeats). On the control plane this is
+   *  every group; over a tenant proxy the operator scopes it to the tenant's own groups. */
+  workerHealth(): Promise<GroupHealth[]>;
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null>;
   retry(runId: string): Promise<RunResult | null>;
   continue(runId: string): Promise<RunResult | null>;

@@ -1,5 +1,6 @@
 import {
   type EngineEvent,
+  type GroupHealth,
   type RunDetail,
   type RunGateway,
   type RunQuery,
@@ -36,6 +37,12 @@ export class StoreRunGateway implements RunGateway {
 
   listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return this.store.listRuns(query);
+  }
+
+  /** Every group the engine knows about — unscoped. A tenant proxy's request is scoped by the
+   *  `RunRequestResponder` (to the requester's `@<tenant>` groups); the operator's own UI sees all. */
+  workerHealth(): Promise<GroupHealth[]> {
+    return this.engine.workerHealth();
   }
 
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {

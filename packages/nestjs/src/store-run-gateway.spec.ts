@@ -159,6 +159,14 @@ describe('StoreRunGateway', () => {
     expect((await store.getRun('r1'))?.status).toBe('failed');
   });
 
+  it('workerHealth delegates to the engine (unscoped — the operator sees every group)', async () => {
+    const { gateway } = setup();
+    // In-memory engine with no broker pool has no worker groups, so this is []; the point is the
+    // gateway delegates to `engine.workerHealth()` without throwing — tenant-scoping is the
+    // responder's job (see run-request-responder.spec), never the store gateway's.
+    await expect(gateway.workerHealth()).resolves.toEqual([]);
+  });
+
   it('subscribe delivers only events for the requested run, and unsubscribe stops delivery', async () => {
     const { engine, gateway } = setup();
     engine.register('echo', '1', async (_ctx: WorkflowCtx, input) => input);

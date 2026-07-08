@@ -27,11 +27,12 @@ export interface RunDetail {
 
 /**
  * Read-model and actions backing the control-plane UI. Run-facing ops (list/detail/retry/cancel/
- * continue/retryWithInput/stream/bulk) route through the injected {@link RUN_GATEWAY} port, which
- * the lib binds on both topologies (a store-backed impl on the control plane, a proxy over the
- * transport on a store-less tenant) — so those ops work regardless of whether `store`/`engine`
- * are present. Operator-only ops (metrics/workerHealth/deliverWebhook/getEvent/update) still need
- * direct `store`/`engine` access; they stay `@Optional()` and throw a clear error when absent.
+ * continue/retryWithInput/stream/bulk/workerHealth) route through the injected {@link RUN_GATEWAY}
+ * port, which the lib binds on both topologies (a store-backed impl on the control plane, a proxy
+ * over the transport on a store-less tenant) — so those ops work regardless of whether `store`/
+ * `engine` are present (`workerHealth` is scoped to the tenant's own groups over the proxy).
+ * Operator-only ops (metrics/deliverWebhook/getEvent/update) still need direct `store`/`engine`
+ * access; they stay `@Optional()` and throw a clear error when absent.
  */
 @Injectable()
 export class DashboardService {
@@ -107,9 +108,11 @@ export class DashboardService {
   }
 
   /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. The
-   *  alert state a row turns red on is `depth > 0 && liveWorkers.length === 0`. Control-plane-only. */
+   *  alert state a row turns red on is `depth > 0 && liveWorkers.length === 0`. Routes through the
+   *  gateway so it works on BOTH topologies: the control plane returns every group; a tenant proxies
+   *  to the operator, which scopes the result to the tenant's own `@<tenant>` groups. */
   async workerHealth(): Promise<GroupHealth[]> {
-    return this.controlPlane().engine.workerHealth();
+    return this.gateway.workerHealth();
   }
 
   getRunDetail(runId: string): Promise<RunDetail | null> {

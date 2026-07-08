@@ -1,5 +1,6 @@
 import type {
   EngineEvent,
+  GroupHealth,
   RunDetail,
   RunGateway,
   RunQuery,
@@ -36,6 +37,13 @@ function fakeGateway(overrides: Partial<RunGateway> = {}): RunGateway {
     listRuns: vi.fn(
       async (query: RunQuery): Promise<WorkflowRun[]> => [
         fakeRun('x', query.namespace ?? 'default'),
+      ],
+    ),
+    workerHealth: vi.fn(
+      async (): Promise<GroupHealth[]> => [
+        { group: 'pipeline@acme', depth: 1, liveWorkers: [] },
+        { group: 'pipeline@beta', depth: 9, liveWorkers: [] },
+        { group: 'pipeline', depth: 0, liveWorkers: [] },
       ],
     ),
     cancel: vi.fn(async (): Promise<RunResult | null> => null),
@@ -114,6 +122,20 @@ describe('RunRequestResponder', () => {
       body: { kind: 'listRuns', query: { namespace: 'beta' } },
     });
     expect(gw.listRuns).toHaveBeenCalledWith({ namespace: 'acme' });
+  });
+
+  it('scopes workerHealth to the tenant own `@<tenant>` groups', async () => {
+    const gw = fakeGateway();
+    const tx = fakeTransport();
+    new RunRequestResponder(tx, gw).start();
+    await tx.deliver({ requestId: 'q7', tenant: 'acme', body: { kind: 'workerHealth' } });
+    // Only `pipeline@acme` survives — `pipeline@beta` (another tenant) and the operator's bare
+    // `pipeline` group are both dropped, so a tenant never sees another's queues.
+    expect(tx.replies[0]).toMatchObject({
+      requestId: 'q7',
+      result: { ok: true, data: [{ group: 'pipeline@acme' }] },
+    });
+    expect((tx.replies[0]?.result as { ok: true; data: GroupHealth[] }).data).toHaveLength(1);
   });
 
   it('denies a cross-tenant cancel WITHOUT calling engine cancel', async () => {

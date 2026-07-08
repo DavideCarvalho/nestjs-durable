@@ -7,6 +7,7 @@ import {
 import {
   DURABLE_OPTIONS_CANONICAL,
   type EngineEvent,
+  type GroupHealth,
   type RunDetail,
   type RunGateway,
   type RunQuery,
@@ -191,6 +192,9 @@ export function unavailableRunGateway(): RunGateway {
     },
     listRuns(_query: RunQuery): Promise<WorkflowRun[]> {
       return tenantGatewayUnavailable<WorkflowRun[]>('listRuns');
+    },
+    workerHealth(): Promise<GroupHealth[]> {
+      return tenantGatewayUnavailable<GroupHealth[]>('workerHealth');
     },
     cancel(_runId: string): Promise<RunResult | null> {
       return tenantGatewayUnavailable<RunResult | null>('cancel');
