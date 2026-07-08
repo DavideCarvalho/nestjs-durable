@@ -123,6 +123,20 @@ function Header({
       <span className="mono tnum text-zinc-600">{n}</span>
     </button>
   );
+  // Topology is fixed for a deployment's lifetime, so fetch once and never refetch.
+  const { data: topology } = useQuery({
+    queryKey: ['topology'],
+    queryFn: () => durableClient.topology(),
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const isTenant = topology?.role === 'tenant';
+  const roleLabel = !topology
+    ? ''
+    : isTenant
+      ? topology.tenant
+        ? `tenant · ${topology.tenant}`
+        : 'tenant'
+      : 'control plane';
   return (
     <header className="z-10 flex items-center gap-4 border-b border-[var(--line)] px-5 py-3">
       <div className="flex items-center gap-2.5">
@@ -131,8 +145,17 @@ function Header({
         </div>
         <div className="leading-none">
           <div className="text-sm font-semibold tracking-tight">durable</div>
-          <div className="mono text-[10px] uppercase tracking-[0.2em] text-zinc-600">
-            control plane
+          <div
+            className={`mono text-[10px] uppercase tracking-[0.2em] ${
+              isTenant ? 'text-amber-400/80' : 'text-zinc-600'
+            }`}
+            title={
+              isTenant
+                ? `Tenant deployment — partition ${topology?.tenant ?? '(unnamed)'}`
+                : 'Control-plane deployment'
+            }
+          >
+            {roleLabel}
           </div>
         </div>
       </div>

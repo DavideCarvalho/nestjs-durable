@@ -1,4 +1,5 @@
 import {
+  type DurableTopology,
   type EngineEvent,
   type GroupHealth,
   InMemoryStateStore,
@@ -27,6 +28,7 @@ interface FakeGatewayOverrides {
   record?: (call: string) => void;
   listRuns?: (query: RunQuery) => Promise<WorkflowRun[]>;
   workerHealth?: () => Promise<GroupHealth[]>;
+  topology?: () => DurableTopology;
   subscribe?: (runId: string, onEvent: (event: EngineEvent) => void) => () => void;
 }
 
@@ -44,6 +46,10 @@ function fakeGateway(overrides: FakeGatewayOverrides): RunGateway {
     async workerHealth() {
       record('workerHealth');
       return overrides.workerHealth ? overrides.workerHealth() : [];
+    },
+    topology() {
+      record('topology');
+      return overrides.topology ? overrides.topology() : { role: 'control-plane' };
     },
     async getRunDetail(runId) {
       record('getRunDetail');
@@ -92,6 +98,14 @@ describe('DashboardService', () => {
       'retryWithInput',
       'workerHealth',
     ]);
+  });
+
+  it('topology routes through the gateway (works on a tenant, reports role + partition)', () => {
+    const service = new DashboardService(
+      fakeGateway({ topology: () => ({ role: 'tenant', tenant: 'acme' }) }),
+    );
+    // No store/engine (tenant shape) and it still answers — the gateway knows its own topology.
+    expect(service.topology()).toEqual({ role: 'tenant', tenant: 'acme' });
   });
 
   it('workerHealth routes through the gateway (works on a tenant, scoped by the operator)', async () => {

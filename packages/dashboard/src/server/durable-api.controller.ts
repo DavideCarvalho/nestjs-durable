@@ -41,6 +41,12 @@ export class DurableApiController {
     return this.dashboard.workerHealth();
   }
 
+  /** This deployment's durable role (control plane vs tenant) + tenant name — for the header badge. */
+  @Get('topology')
+  topology() {
+    return this.dashboard.topology();
+  }
+
   @Get('runs/:id')
   async run(@Param('id') id: string) {
     const detail = await this.dashboard.getRunDetail(id);

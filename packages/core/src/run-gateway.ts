@@ -7,6 +7,15 @@ import type {
   WorkflowRun,
 } from './interfaces';
 
+/** Which durable topology a gateway speaks for — surfaced in the dashboard so an operator can tell a
+ *  control plane from a tenant at a glance (the store-backed gateway is the operator; the proxy is a
+ *  tenant). Cheap, synchronous, local knowledge — no round-trip. */
+export interface DurableTopology {
+  role: 'control-plane' | 'tenant';
+  /** The tenant's isolation partition name; set only when `role` is 'tenant'. */
+  tenant?: string;
+}
+
 /** A run + its timeline + child ids — the detail view. Mirrors the dashboard's `RunDetail`. */
 export interface RunDetail {
   run: WorkflowRun;
@@ -24,6 +33,8 @@ export interface RunDetail {
  * operator answers it scoped to the requester's own groups, so a tenant's Workers panel works too.
  */
 export interface RunGateway {
+  /** This deployment's durable role (control plane vs tenant) — synchronous local metadata. */
+  topology(): DurableTopology;
   getRunDetail(runId: string): Promise<RunDetail | null>;
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
   /** Per-group worker health (queue backlog + live worker heartbeats). On the control plane this is

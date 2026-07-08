@@ -1,4 +1,5 @@
 import {
+  type DurableTopology,
   type EngineEvent,
   type GroupHealth,
   type RunDetail,
@@ -24,6 +25,10 @@ export class StoreRunGateway implements RunGateway {
     @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore,
     private readonly engine: WorkflowEngine,
   ) {}
+
+  topology(): DurableTopology {
+    return { role: 'control-plane' };
+  }
 
   async getRunDetail(runId: string): Promise<RunDetail | null> {
     const run = await this.store.getRun(runId);

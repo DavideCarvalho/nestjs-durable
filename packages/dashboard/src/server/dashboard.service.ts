@@ -1,4 +1,5 @@
 import {
+  type DurableTopology,
   type EngineEvent,
   type GroupHealth,
   type MetricsCollector,
@@ -105,6 +106,13 @@ export class DashboardService {
 
   listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return this.gateway.listRuns(query);
+  }
+
+  /** This deployment's durable role (control plane vs tenant) + tenant name — for the dashboard header
+   *  badge. Routes through the gateway, which knows its own topology (store-backed = operator, proxy =
+   *  tenant). Works on both topologies (no store/engine needed). */
+  topology(): DurableTopology {
+    return this.gateway.topology();
   }
 
   /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. The

@@ -1,4 +1,5 @@
 import type {
+  DurableTopology,
   EngineEvent,
   GroupHealth,
   RunDetail,
@@ -27,6 +28,7 @@ function fakeRun(id: string, namespace: string): WorkflowRun {
 
 function fakeGateway(overrides: Partial<RunGateway> = {}): RunGateway {
   return {
+    topology: vi.fn((): DurableTopology => ({ role: 'control-plane' })),
     getRunDetail: vi.fn(
       async (id: string): Promise<RunDetail | null> => ({
         run: fakeRun(id, 'acme'),

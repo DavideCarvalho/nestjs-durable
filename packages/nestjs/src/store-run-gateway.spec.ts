@@ -159,6 +159,11 @@ describe('StoreRunGateway', () => {
     expect((await store.getRun('r1'))?.status).toBe('failed');
   });
 
+  it('reports control-plane topology', () => {
+    const { gateway } = setup();
+    expect(gateway.topology()).toEqual({ role: 'control-plane' });
+  });
+
   it('workerHealth delegates to the engine (unscoped — the operator sees every group)', async () => {
     const { gateway } = setup();
     // In-memory engine with no broker pool has no worker groups, so this is []; the point is the

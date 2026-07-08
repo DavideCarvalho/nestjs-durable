@@ -1,4 +1,5 @@
 import type {
+  DurableTopology,
   EngineEvent,
   GroupHealth,
   RunDetail,
@@ -76,6 +77,10 @@ export class ProxyRunGateway implements RunGateway {
           stillPending.reject(error instanceof Error ? error : new Error(String(error)));
         });
     });
+  }
+
+  topology(): DurableTopology {
+    return { role: 'tenant', tenant: this.tenant };
   }
 
   getRunDetail(runId: string): Promise<RunDetail | null> {

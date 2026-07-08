@@ -6,6 +6,7 @@ import {
 } from '@dudousxd/durable-worker';
 import {
   DURABLE_OPTIONS_CANONICAL,
+  type DurableTopology,
   type EngineEvent,
   type GroupHealth,
   type RunDetail,
@@ -187,6 +188,10 @@ function tenantGatewayUnavailable<T>(method: string): Promise<T> {
  */
 export function unavailableRunGateway(): RunGateway {
   return {
+    // Topology is local metadata, always answerable — a thin worker with no transport is still a tenant.
+    topology(): DurableTopology {
+      return { role: 'tenant' };
+    },
     getRunDetail(_runId: string): Promise<RunDetail | null> {
       return tenantGatewayUnavailable<RunDetail | null>('getRunDetail');
     },

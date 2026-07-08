@@ -39,6 +39,13 @@ describe('ProxyRunGateway', () => {
     await expect(p).resolves.toMatchObject({ run: { id: 'r1' } });
   });
 
+  it('reports tenant topology with its partition name (no round-trip)', () => {
+    const tx = fakeTransport();
+    const gw = new ProxyRunGateway(tx, 'acme', 5000);
+    expect(gw.topology()).toEqual({ role: 'tenant', tenant: 'acme' });
+    expect(tx.requests).toHaveLength(0);
+  });
+
   it('round-trips workerHealth and resolves with the operator-scoped groups', async () => {
     const tx = fakeTransport();
     const gw = new ProxyRunGateway(tx, 'acme', 5000);

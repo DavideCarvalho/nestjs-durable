@@ -9,6 +9,13 @@ export type RunStatus =
   | 'dead';
 export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
 
+/** This deployment's durable role — mirrors the server's `DurableTopology` (kept local so the SPA
+ *  stays standalone). `tenant` is the isolation partition name, set only when `role` is 'tenant'. */
+export interface DurableTopology {
+  role: 'control-plane' | 'tenant';
+  tenant?: string;
+}
+
 export interface WorkflowRun {
   id: string;
   workflow: string;
@@ -213,6 +220,10 @@ export const durableClient = {
   /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. */
   workers(): Promise<GroupHealth[]> {
     return http<GroupHealth[]>('/workers');
+  },
+  /** This deployment's durable role (control plane vs tenant) + tenant name — for the header badge. */
+  topology(): Promise<DurableTopology> {
+    return http<DurableTopology>('/topology');
   },
   retry(id: string): Promise<WorkflowRun> {
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
