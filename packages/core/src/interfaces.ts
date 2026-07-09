@@ -86,6 +86,28 @@ export interface WorkflowRun {
   updatedAt: Date;
 }
 
+/**
+ * WHAT an event-parked suspended run is waiting on, resolved for display — the engine keeps one
+ * generic `suspended` status (it's what drives recovery/timers/queries), but to a human "waiting on
+ * signal `approve`" reads very differently from "waiting on webhook `stripe-cb`". Computed by the
+ * store-backed gateway from the run's signal waiters (`listSignalWaiters`, ONE bulk scan), so the
+ * dashboard can NAME the wait in a list row without fetching each run's timeline. `on` is derived from
+ * the waiter token's prefix (see `classifyWaiterToken`): `wh:<runId>:<seq>` ⇒ `webhook`, `child:<id>`
+ * ⇒ `child`, `event:<name>:…` ⇒ `signal` (name decoded), anything else ⇒ `signal` (the token IS the
+ * signal name).
+ *
+ * Deliberately EVENT-only (no timer/step): `wakeAt` alone can't tell a real `ctx.sleep` from the
+ * reconcile-fallback `wakeAt` an event/step suspend now carries, and the store exposes no cheap bulk
+ * checkpoint scan to disambiguate — so the client shows a non-event suspend with a live worker as
+ * `running` (it flips off "no worker" the moment a worker returns) rather than guessing "sleeping".
+ * The detail view (which has the timeline) still distinguishes sleep vs in-flight step precisely.
+ */
+export interface RunWaiting {
+  on: 'signal' | 'webhook' | 'child';
+  /** The token/name the run is parked on — the signal name, webhook token, or awaited child id. */
+  name: string;
+}
+
 export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
 
 /**

@@ -78,6 +78,20 @@ describe('StoreRunGateway', () => {
     expect(await gateway.getRunDetail('nope')).toBeNull();
   });
 
+  it('stamps `waiting` on a run suspended on a signal (named from the waiter), and leaves others bare', async () => {
+    const { engine, gateway } = setup();
+    engine.register('approval', '1', async (ctx: WorkflowCtx) => ctx.waitForSignal('approve'));
+    engine.register('quick', '1', async (_ctx: WorkflowCtx) => 'ok');
+    await engine.start('approval', {}, 'r-wait');
+    await engine.start('quick', {}, 'r-done');
+    await engine.waitForRun('r-wait'); // suspends on the signal
+    await engine.waitForRun('r-done'); // completes
+
+    const byId = new Map((await gateway.listRuns({})).map((r) => [r.id, r]));
+    expect(byId.get('r-wait')?.waiting).toEqual({ on: 'signal', name: 'approve' });
+    expect(byId.get('r-done')?.waiting).toBeUndefined(); // completed → not parked on anything
+  });
+
   it('retries a failed run and can cancel a suspended one', async () => {
     const { engine, gateway } = setup();
     let fail = true;

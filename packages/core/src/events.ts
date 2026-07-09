@@ -22,6 +22,16 @@ export function eventToken(
   return `${eventPrefix(name)}${enc(JSON.stringify(match ?? {}))}:${runId}#${seq}`;
 }
 
+/** The event name embedded in an event waiter token (the 2nd `:`-segment is the base64 name), so a
+ *  dashboard can show "waiting on event `<name>`" instead of the opaque token. */
+export function eventNameOf(token: string): string {
+  try {
+    return dec(token.split(':')[1] ?? '');
+  } catch {
+    return token;
+  }
+}
+
 /** The match criteria embedded in an event waiter token (the 3rd `:`-segment is the base64 match). */
 export function eventMatchOf(token: string): Record<string, unknown> {
   try {

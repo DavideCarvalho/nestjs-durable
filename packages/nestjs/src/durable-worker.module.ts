@@ -11,9 +11,9 @@ import {
   type GroupHealth,
   type RunDetail,
   type RunGateway,
+  type RunListItem,
   type RunQuery,
   type RunResult,
-  type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
@@ -195,8 +195,8 @@ export function unavailableRunGateway(): RunGateway {
     getRunDetail(_runId: string): Promise<RunDetail | null> {
       return tenantGatewayUnavailable<RunDetail | null>('getRunDetail');
     },
-    listRuns(_query: RunQuery): Promise<WorkflowRun[]> {
-      return tenantGatewayUnavailable<WorkflowRun[]>('listRuns');
+    listRuns(_query: RunQuery): Promise<RunListItem[]> {
+      return tenantGatewayUnavailable<RunListItem[]>('listRuns');
     },
     workerHealth(): Promise<GroupHealth[]> {
       return tenantGatewayUnavailable<GroupHealth[]>('workerHealth');

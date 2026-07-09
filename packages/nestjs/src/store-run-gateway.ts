@@ -4,12 +4,14 @@ import {
   type GroupHealth,
   type RunDetail,
   type RunGateway,
+  type RunListItem,
   type RunQuery,
   type RunResult,
   STATE_STORE_CANONICAL,
   type StateStore,
   WorkflowEngine,
-  type WorkflowRun,
+  indexWaitersByRun,
+  resolveRunWaiting,
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable } from '@nestjs/common';
 
@@ -40,8 +42,16 @@ export class StoreRunGateway implements RunGateway {
     return { run, timeline, children };
   }
 
-  listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    return this.store.listRuns(query);
+  async listRuns(query: RunQuery): Promise<RunListItem[]> {
+    const runs = await this.store.listRuns(query);
+    // ONE bulk scan of the signal-waiter table (indexed by runId) resolves what each suspended run is
+    // parked on — signal / webhook / child — with no per-run timeline fetch. A timer wait falls back
+    // to the run's own `wakeAt`. Non-suspended (and remote-step-in-flight) runs carry no `waiting`.
+    const waiterByRun = indexWaitersByRun(await this.store.listSignalWaiters(''));
+    return runs.map((run) => {
+      const waiting = resolveRunWaiting(run, waiterByRun);
+      return waiting ? { ...run, waiting } : run;
+    });
   }
 
   /** Every group the engine knows about — unscoped. A tenant proxy's request is scoped by the
