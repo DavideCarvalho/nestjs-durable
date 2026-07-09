@@ -360,8 +360,33 @@ function loadOf(w: WorkerView): string | undefined {
   return w.status && c ? `${w.status.inFlight}/${c.limit}` : undefined;
 }
 
+/** The expanded body for one pod — its live status cells plus the full list of handlers it serves.
+ *  Shared by the inline pod chip's popover AND the "+N" overflow popover's expandable rows, so a pod
+ *  hidden behind "+N" reveals exactly the same detail as a visible chip. */
+function PodDetail({ w }: { w: WorkerView }) {
+  return (
+    <>
+      <div className="px-2.5 py-2">
+        <WorkerStatusCells status={w.status} />
+      </div>
+      <div className="max-h-48 overflow-auto border-t border-[var(--line-soft)] px-2.5 py-1.5">
+        <div className="mono mb-1 text-[9px] uppercase tracking-wider text-zinc-600">
+          {w.handlers.length} handlers
+        </div>
+        {w.handlers.map((h) => (
+          <div key={h} className="mono truncate text-[10px] text-zinc-400">
+            {h}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
 function WorkersByPod({ workers }: { workers: WorkerView[] }) {
   const [open, setOpen] = useState<string | undefined>(undefined);
+  // Which pod is expanded INSIDE the "+N" overflow popover (independent of the inline chips' `open`).
+  const [overflowPod, setOverflowPod] = useState<string | undefined>(undefined);
   // Cap inline chips so the pod row can never overflow its fixed slot and paint over the view toggle
   // (long pod instanceIds mean even a couple of full-width chips exceed 300px). The rest collapse into
   // a clickable "+N" chip whose popover lists exactly which pods it hides.
@@ -407,19 +432,7 @@ function WorkersByPod({ workers }: { workers: WorkerView[] }) {
                       {w.runtime ?? 'node'} · {w.partition}
                     </span>
                   </div>
-                  <div className="px-2.5 py-2">
-                    <WorkerStatusCells status={w.status} />
-                  </div>
-                  <div className="max-h-48 overflow-auto border-t border-[var(--line-soft)] px-2.5 py-1.5">
-                    <div className="mono mb-1 text-[9px] uppercase tracking-wider text-zinc-600">
-                      {w.handlers.length} handlers
-                    </div>
-                    {w.handlers.map((h) => (
-                      <div key={h} className="mono truncate text-[10px] text-zinc-400">
-                        {h}
-                      </div>
-                    ))}
-                  </div>
+                  <PodDetail w={w} />
                 </div>
               )}
             </div>
@@ -430,7 +443,10 @@ function WorkersByPod({ workers }: { workers: WorkerView[] }) {
         <div className="relative">
           <button
             type="button"
-            onClick={() => setOpen(overflowOpen ? undefined : OVERFLOW_KEY)}
+            onClick={() => {
+              setOpen(overflowOpen ? undefined : OVERFLOW_KEY);
+              setOverflowPod(undefined);
+            }}
             className={`mono shrink-0 rounded border px-1.5 py-0.5 text-[10px] hover:border-zinc-500 ${
               overflowOpen
                 ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
@@ -444,22 +460,34 @@ function WorkersByPod({ workers }: { workers: WorkerView[] }) {
               <div className="mono border-b border-[var(--line)] px-2.5 py-1.5 text-[9px] uppercase tracking-wider text-zinc-600">
                 {overflow.length} more {overflow.length === 1 ? 'pod' : 'pods'}
               </div>
-              <div className="max-h-56 overflow-auto divide-y divide-[var(--line-soft)]">
+              <div className="max-h-80 overflow-auto divide-y divide-[var(--line-soft)]">
                 {overflow.map((w) => {
                   const load = loadOf(w);
+                  const podOpen = overflowPod === w.instanceId;
                   return (
-                    <div
-                      key={w.instanceId}
-                      className="mono flex items-center justify-between gap-2 px-2.5 py-1.5 text-[10px]"
-                    >
-                      <span className="flex min-w-0 items-center gap-1 text-zinc-300">
-                        <span className={`dot ${w.status ? 's-completed' : ''}`} aria-hidden />
-                        <span className="truncate">{w.instanceId}</span>
-                      </span>
-                      <span className="tnum shrink-0 text-zinc-500">
-                        {w.partition !== 'default' ? `@${w.partition} · ` : ''}
-                        {w.handlers.length}h{load ? ` · ${load}` : ''}
-                      </span>
+                    <div key={w.instanceId}>
+                      {/* Same click-to-expand as a visible chip: the row toggles the pod's PodDetail. */}
+                      <button
+                        type="button"
+                        onClick={() => setOverflowPod(podOpen ? undefined : w.instanceId)}
+                        className={`mono flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-[10px] hover:bg-zinc-800/50 ${
+                          podOpen ? 'bg-zinc-800/40 text-zinc-200' : 'text-zinc-300'
+                        }`}
+                      >
+                        <span className="flex min-w-0 items-center gap-1">
+                          <span className={`dot ${w.status ? 's-completed' : ''}`} aria-hidden />
+                          <span className="truncate">{w.instanceId}</span>
+                        </span>
+                        <span className="tnum shrink-0 text-zinc-500">
+                          {w.partition !== 'default' ? `@${w.partition} · ` : ''}
+                          {w.handlers.length}h{load ? ` · ${load}` : ''}
+                        </span>
+                      </button>
+                      {podOpen && (
+                        <div className="border-t border-[var(--line-soft)] bg-zinc-900/40">
+                          <PodDetail w={w} />
+                        </div>
+                      )}
                     </div>
                   );
                 })}
