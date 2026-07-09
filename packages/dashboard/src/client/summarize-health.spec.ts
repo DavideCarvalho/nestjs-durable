@@ -73,8 +73,8 @@ describe('summarizeHealth', () => {
       // steps
       group({ group: 'PipelineWorkflow.bustBaseCache', kind: 'step' }),
       group({ group: 'handle_mel_dep_procs', kind: 'step' }),
-      // unclassified (no kind) counts toward neither bucket
-      group({ group: 'mystery', kind: undefined }),
+      // unclassified (kind absent) counts toward neither bucket
+      group({ group: 'mystery' }),
     ]);
     expect(summary.workflowCount).toBe(2);
     expect(summary.stepCount).toBe(2);
