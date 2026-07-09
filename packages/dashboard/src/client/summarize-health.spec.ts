@@ -56,9 +56,28 @@ describe('summarizeHealth', () => {
   it('empty input returns the documented zero value', () => {
     expect(summarizeHealth([])).toEqual({
       queueCount: 0,
+      workflowCount: 0,
+      stepCount: 0,
       workerCount: 0,
       starved: [],
       allDraining: true,
     });
+  });
+
+  it('counts distinct workflows vs steps by kind, deduped by base name across partitions', () => {
+    const summary = summarizeHealth([
+      // same workflow served on two partitions → ONE workflow
+      group({ group: 'pipeline@davi-local', kind: 'workflow' }),
+      group({ group: 'pipeline@default', kind: 'workflow' }),
+      group({ group: 'processing', kind: 'workflow' }),
+      // steps
+      group({ group: 'PipelineWorkflow.bustBaseCache', kind: 'step' }),
+      group({ group: 'handle_mel_dep_procs', kind: 'step' }),
+      // unclassified (no kind) counts toward neither bucket
+      group({ group: 'mystery', kind: undefined }),
+    ]);
+    expect(summary.workflowCount).toBe(2);
+    expect(summary.stepCount).toBe(2);
+    expect(summary.queueCount).toBe(6);
   });
 });

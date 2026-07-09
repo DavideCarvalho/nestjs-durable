@@ -921,6 +921,16 @@ export interface GroupHealth {
   depth: number;
   /** Workers with a non-expired heartbeat for this group. */
   liveWorkers: WorkerHeartbeat[];
+  /**
+   * Whether this group serves a `@Workflow` body or a `@Step`/handler — route-by-handler gives each
+   * its own queue, so a health list mixes both. Classified by the CONTROL PLANE from its authoritative
+   * registry (`workerHealth()`): a group whose base name is a registered workflow is `'workflow'`,
+   * everything else (in-process steps, remote `handle_*`) is `'step'`. `undefined` only when no
+   * control-plane registry was available to classify (e.g. a transport that reports health with no
+   * engine). Lets a dashboard summarise the fleet in domain terms ("N workflows · M steps") instead of
+   * leaking the raw queue count.
+   */
+  kind?: 'workflow' | 'step';
 }
 
 /**

@@ -181,6 +181,10 @@ export interface GroupHealth {
   group: string;
   depth: number;
   liveWorkers: WorkerHeartbeat[];
+  /** Whether this group serves a `@Workflow` or a `@Step`/handler (route-by-handler gives each its own
+   *  queue). Classified by the control plane from its registry; `undefined` when it couldn't. Lets the
+   *  panel summarise in domain terms ("N workflows · M steps") instead of the raw queue count. */
+  kind?: 'workflow' | 'step';
 }
 
 declare global {

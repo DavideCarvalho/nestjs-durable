@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useCallback, useEffect, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useState } from 'react';
 import {
   type GroupHealth,
   type RunDetail as RunDetailData,
@@ -247,6 +247,41 @@ function WorkerStatusCells({ status }: { status: WorkerStatus | undefined }) {
   );
 }
 
+/**
+ * A small styled hover tooltip that replaces the browser's native `title=` bubble — same dark surface
+ * as the panel's click popovers. Renders below-right (`right-0 top-full`) so it never clips the
+ * header's right edge, and `suppressed` hides it while the wrapped chip's own click-popover is open
+ * (so the two never stack). State-driven hover (not CSS `:hover`) so `suppressed` can win.
+ */
+function Tooltip({
+  label,
+  suppressed,
+  children,
+}: {
+  label: string;
+  suppressed?: boolean;
+  children: ReactNode;
+}) {
+  const [show, setShow] = useState(false);
+  return (
+    <span
+      className="relative inline-flex"
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}
+    >
+      {children}
+      {show && !suppressed && (
+        <span
+          role="tooltip"
+          className="pointer-events-none absolute right-0 top-full z-30 mt-1 max-w-[280px] whitespace-pre-line rounded-md border border-[var(--line)] bg-zinc-950/95 px-2 py-1 text-left text-[10px] leading-relaxed text-zinc-300 shadow-xl backdrop-blur"
+        >
+          {label}
+        </span>
+      )}
+    </span>
+  );
+}
+
 /** Per-worker rows for an expanded group: each live worker's id + its {@link WorkerStatusCells}. */
 function WorkerRows({ workers }: { workers: GroupHealth['liveWorkers'] }) {
   return (
@@ -317,74 +352,121 @@ function WorkersHealth() {
  * its in-flight load. Clicking expands its full status ({@link WorkerStatusCells}) plus the list of
  * handlers it's subscribed to.
  */
+// Sentinel `open` key for the "+N" overflow popover (can't collide with any real instanceId).
+const OVERFLOW_KEY = '__overflow__';
+
+function loadOf(w: WorkerView): string | undefined {
+  const c = w.status?.concurrency;
+  return w.status && c ? `${w.status.inFlight}/${c.limit}` : undefined;
+}
+
 function WorkersByPod({ workers }: { workers: WorkerView[] }) {
   const [open, setOpen] = useState<string | undefined>(undefined);
   // Cap inline chips so the pod row can never overflow its fixed slot and paint over the view toggle
   // (long pod instanceIds mean even a couple of full-width chips exceed 300px). The rest collapse into
-  // a "+N" chip whose tooltip lists them.
+  // a clickable "+N" chip whose popover lists exactly which pods it hides.
   const MAX_INLINE = 2;
   const visible = workers.slice(0, MAX_INLINE);
   const overflow = workers.slice(MAX_INLINE);
+  const overflowOpen = open === OVERFLOW_KEY;
   return (
     <>
       {visible.map((w) => {
         const isOpen = open === w.instanceId;
-        const c = w.status?.concurrency;
-        const load = w.status && c ? `${w.status.inFlight}/${c.limit}` : undefined;
+        const load = loadOf(w);
         return (
-          <div key={w.instanceId} className="relative">
-            <button
-              type="button"
-              onClick={() => setOpen(isOpen ? undefined : w.instanceId)}
-              title={`${w.instanceId} — ${w.handlers.length} handler(s) on ${w.partition}`}
-              className={`mono flex max-w-[120px] items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] hover:border-zinc-500 ${
-                isOpen
-                  ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
-                  : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
-              }`}
-            >
-              <span className={`dot ${w.status ? 's-completed' : ''}`} aria-hidden />
-              <span className="truncate">{w.instanceId}</span>
-              {w.partition !== 'default' && (
-                <span className="shrink-0 text-zinc-500">@{w.partition}</span>
-              )}
-              <span className="tnum shrink-0 text-zinc-500">
-                {w.handlers.length}h{load ? ` · ${load}` : ''}
-              </span>
-            </button>
-            {isOpen && (
-              <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
-                <div className="mono flex items-center justify-between gap-2 border-b border-[var(--line)] px-2.5 py-1.5 text-[10px] text-zinc-500">
-                  <span className="truncate text-zinc-300">{w.instanceId}</span>
-                  <span className="shrink-0">
-                    {w.runtime ?? 'node'} · {w.partition}
-                  </span>
-                </div>
-                <div className="px-2.5 py-2">
-                  <WorkerStatusCells status={w.status} />
-                </div>
-                <div className="max-h-48 overflow-auto border-t border-[var(--line-soft)] px-2.5 py-1.5">
-                  <div className="mono mb-1 text-[9px] uppercase tracking-wider text-zinc-600">
-                    {w.handlers.length} handlers
+          <Tooltip
+            key={w.instanceId}
+            suppressed={isOpen}
+            label={`${w.instanceId}\n${w.handlers.length} handlers · ${w.partition}${load ? ` · ${load} in-flight` : ''}`}
+          >
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setOpen(isOpen ? undefined : w.instanceId)}
+                className={`mono flex max-w-[120px] items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] hover:border-zinc-500 ${
+                  isOpen
+                    ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
+                    : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
+                }`}
+              >
+                <span className={`dot ${w.status ? 's-completed' : ''}`} aria-hidden />
+                <span className="truncate">{w.instanceId}</span>
+                {w.partition !== 'default' && (
+                  <span className="shrink-0 text-zinc-500">@{w.partition}</span>
+                )}
+                <span className="tnum shrink-0 text-zinc-500">
+                  {w.handlers.length}h{load ? ` · ${load}` : ''}
+                </span>
+              </button>
+              {isOpen && (
+                <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
+                  <div className="mono flex items-center justify-between gap-2 border-b border-[var(--line)] px-2.5 py-1.5 text-[10px] text-zinc-500">
+                    <span className="truncate text-zinc-300">{w.instanceId}</span>
+                    <span className="shrink-0">
+                      {w.runtime ?? 'node'} · {w.partition}
+                    </span>
                   </div>
-                  {w.handlers.map((h) => (
-                    <div key={h} className="mono truncate text-[10px] text-zinc-400">
-                      {h}
+                  <div className="px-2.5 py-2">
+                    <WorkerStatusCells status={w.status} />
+                  </div>
+                  <div className="max-h-48 overflow-auto border-t border-[var(--line-soft)] px-2.5 py-1.5">
+                    <div className="mono mb-1 text-[9px] uppercase tracking-wider text-zinc-600">
+                      {w.handlers.length} handlers
                     </div>
-                  ))}
+                    {w.handlers.map((h) => (
+                      <div key={h} className="mono truncate text-[10px] text-zinc-400">
+                        {h}
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          </Tooltip>
         );
       })}
       {overflow.length > 0 && (
-        <span
-          className="mono shrink-0 rounded border border-[var(--line)] bg-zinc-800/40 px-1.5 py-0.5 text-[10px] text-zinc-400"
-          title={overflow.map((w) => `${w.instanceId} — ${w.partition}`).join('\n')}
-        >
-          +{overflow.length}
-        </span>
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => setOpen(overflowOpen ? undefined : OVERFLOW_KEY)}
+            className={`mono shrink-0 rounded border px-1.5 py-0.5 text-[10px] hover:border-zinc-500 ${
+              overflowOpen
+                ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
+                : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
+            }`}
+          >
+            +{overflow.length}
+          </button>
+          {overflowOpen && (
+            <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
+              <div className="mono border-b border-[var(--line)] px-2.5 py-1.5 text-[9px] uppercase tracking-wider text-zinc-600">
+                {overflow.length} more {overflow.length === 1 ? 'pod' : 'pods'}
+              </div>
+              <div className="max-h-56 overflow-auto divide-y divide-[var(--line-soft)]">
+                {overflow.map((w) => {
+                  const load = loadOf(w);
+                  return (
+                    <div
+                      key={w.instanceId}
+                      className="mono flex items-center justify-between gap-2 px-2.5 py-1.5 text-[10px]"
+                    >
+                      <span className="flex min-w-0 items-center gap-1 text-zinc-300">
+                        <span className={`dot ${w.status ? 's-completed' : ''}`} aria-hidden />
+                        <span className="truncate">{w.instanceId}</span>
+                      </span>
+                      <span className="tnum shrink-0 text-zinc-500">
+                        {w.partition !== 'default' ? `@${w.partition} · ` : ''}
+                        {w.handlers.length}h{load ? ` · ${load}` : ''}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
       )}
     </>
   );
@@ -412,42 +494,47 @@ function PartitionsHealth({ groups }: { groups: GroupHealth[] }) {
         const starved = p.starvedCount > 0;
         const isOpen = open === p.partition;
         return (
-          <div key={p.partition} className="relative">
-            <button
-              type="button"
-              disabled={p.workerCount === 0}
-              onClick={() => setOpen(isOpen ? undefined : p.partition)}
-              title={`${p.partition}: ${p.workerCount} worker(s), ${p.handlerCount} handler(s), ${p.totalDepth} queued${starved ? `, ${p.starvedCount} starved` : ''}`}
-              className={`mono flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] ${
-                starved
-                  ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
-                  : isOpen
-                    ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
-                    : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
-              } ${p.workerCount > 0 ? 'cursor-pointer hover:border-zinc-500' : 'cursor-default'}`}
-            >
-              <span
-                className={`dot ${starved ? 's-failed' : p.workerCount > 0 ? 's-completed' : ''}`}
-                aria-hidden
-              />
-              {p.partition}
-              <span className="tnum text-zinc-500">
-                {p.workerCount}w {p.handlerCount}h{p.totalDepth > 0 ? ` ${p.totalDepth}q` : ''}
-                {starved ? ` ${p.starvedCount}!` : ''}
-              </span>
-            </button>
-            {isOpen && p.workerCount > 0 && (
-              <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
-                <div className="mono flex items-center justify-between border-b border-[var(--line)] px-2.5 py-1.5 text-[10px] text-zinc-500">
-                  <span className="text-zinc-300">{p.partition}</span>
-                  <span className="tnum">
-                    {p.workerCount} worker(s) · {p.totalDepth} queued
-                  </span>
+          <Tooltip
+            key={p.partition}
+            suppressed={isOpen}
+            label={`${p.partition}\n${p.workerCount} workers · ${p.handlerCount} handlers · ${p.totalDepth} queued${starved ? ` · ${p.starvedCount} starved` : ''}`}
+          >
+            <div className="relative">
+              <button
+                type="button"
+                disabled={p.workerCount === 0}
+                onClick={() => setOpen(isOpen ? undefined : p.partition)}
+                className={`mono flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] ${
+                  starved
+                    ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
+                    : isOpen
+                      ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
+                      : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
+                } ${p.workerCount > 0 ? 'cursor-pointer hover:border-zinc-500' : 'cursor-default'}`}
+              >
+                <span
+                  className={`dot ${starved ? 's-failed' : p.workerCount > 0 ? 's-completed' : ''}`}
+                  aria-hidden
+                />
+                {p.partition}
+                <span className="tnum text-zinc-500">
+                  {p.workerCount}w {p.handlerCount}h{p.totalDepth > 0 ? ` ${p.totalDepth}q` : ''}
+                  {starved ? ` ${p.starvedCount}!` : ''}
+                </span>
+              </button>
+              {isOpen && p.workerCount > 0 && (
+                <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
+                  <div className="mono flex items-center justify-between border-b border-[var(--line)] px-2.5 py-1.5 text-[10px] text-zinc-500">
+                    <span className="text-zinc-300">{p.partition}</span>
+                    <span className="tnum">
+                      {p.workerCount} worker(s) · {p.totalDepth} queued
+                    </span>
+                  </div>
+                  <WorkerRows workers={workersOf(p.partition)} />
                 </div>
-                <WorkerRows workers={workersOf(p.partition)} />
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          </Tooltip>
         );
       })}
     </>
@@ -460,26 +547,30 @@ function PartitionsHealth({ groups }: { groups: GroupHealth[] }) {
  * when everything is draining.
  */
 function StarvationAlerts({ summary }: { summary: HealthSummary }) {
+  const plural = (n: number, one: string) => `${n} ${n === 1 ? one : `${one}s`}`;
   return (
     <>
-      <span className="mono tnum text-[10px] text-zinc-500">
-        {summary.queueCount} queues · {summary.workerCount} workers ·{' '}
-        {summary.allDraining ? (
-          <span className="text-emerald-400">all draining</span>
-        ) : (
-          <span className="text-rose-300">{summary.starved.length} starved</span>
-        )}
-      </span>
-      {summary.starved.map((g) => (
-        <span
-          key={g.group}
-          title={`${g.group}: ${g.depth} queued, no worker consuming`}
-          className="mono flex items-center gap-1 rounded border border-rose-500/50 bg-rose-500/15 px-1.5 py-0.5 text-[10px] text-rose-300"
-        >
-          <span className="dot s-failed" aria-hidden />
-          <span className="max-w-[180px] truncate">{g.group}</span>
-          <span className="tnum shrink-0">{g.depth}q · 0w</span>
+      <Tooltip
+        label={`Route-by-handler: each @Workflow & @Step is served as its own queue.\n${summary.queueCount} queues across ${plural(summary.workerCount, 'worker')}.`}
+      >
+        <span className="mono tnum text-[10px] text-zinc-500">
+          {plural(summary.workflowCount, 'workflow')} · {plural(summary.stepCount, 'step')} ·{' '}
+          {plural(summary.workerCount, 'worker')} ·{' '}
+          {summary.allDraining ? (
+            <span className="text-emerald-400">all draining</span>
+          ) : (
+            <span className="text-rose-300">{summary.starved.length} starved</span>
+          )}
         </span>
+      </Tooltip>
+      {summary.starved.map((g) => (
+        <Tooltip key={g.group} label={`${g.group}\n${g.depth} queued, no worker consuming`}>
+          <span className="mono flex items-center gap-1 rounded border border-rose-500/50 bg-rose-500/15 px-1.5 py-0.5 text-[10px] text-rose-300">
+            <span className="dot s-failed" aria-hidden />
+            <span className="max-w-[180px] truncate">{g.group}</span>
+            <span className="tnum shrink-0">{g.depth}q · 0w</span>
+          </span>
+        </Tooltip>
       ))}
     </>
   );

@@ -63,4 +63,41 @@ describe('engine.workerHealth', () => {
     const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
     expect(await engine.workerHealth()).toEqual([]);
   });
+
+  it('classifies each group workflow-vs-step from the registry', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new HealthTransport(
+      {
+        // a local `@Workflow` name, served on a partition
+        'pipeline@davi-local': { group: 'pipeline@davi-local', depth: 0, liveWorkers: [] },
+        // a `@Step` (Class.method) — not a registered workflow
+        'PipelineWorkflow.bustBaseCache': {
+          group: 'PipelineWorkflow.bustBaseCache',
+          depth: 0,
+          liveWorkers: [],
+        },
+        // a remote workflow whose GROUP differs from its name
+        'processing-workflows': { group: 'processing-workflows', depth: 0, liveWorkers: [] },
+        // a remote step handler
+        handle_mel_dep_procs: { group: 'handle_mel_dep_procs', depth: 0, liveWorkers: [] },
+      },
+      ['pipeline@davi-local', 'PipelineWorkflow.bustBaseCache', 'handle_mel_dep_procs'],
+    );
+    const engine = new WorkflowEngine({ store, transport });
+    engine.register('pipeline', '1', async () => ({}));
+    engine.registerRemote('processing', '1', {
+      group: 'processing-workflows',
+      executor: {
+        async advance(run) {
+          return { taskId: 't', runId: run.id, status: 'completed', commands: [], output: {} };
+        },
+      },
+    });
+
+    const kindByGroup = new Map((await engine.workerHealth()).map((h) => [h.group, h.kind]));
+    expect(kindByGroup.get('pipeline@davi-local')).toBe('workflow'); // local workflow, partitioned
+    expect(kindByGroup.get('processing-workflows')).toBe('workflow'); // remote, group ≠ name
+    expect(kindByGroup.get('PipelineWorkflow.bustBaseCache')).toBe('step');
+    expect(kindByGroup.get('handle_mel_dep_procs')).toBe('step');
+  });
 });

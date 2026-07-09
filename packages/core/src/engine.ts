@@ -1713,10 +1713,23 @@ export class WorkflowEngine {
    *  (only the BullMQ transport implements `groupHealth`). */
   async workerHealth(extra: string[] = []): Promise<GroupHealth[]> {
     const groups = new Set([...this.knownGroups(extra), ...(await this.pool.listWorkerGroups())]);
+    // Classify each group workflow-vs-step from the registry (authoritative — no name heuristic): a
+    // group whose base token is a registered workflow serves a `@Workflow` body; anything else (an
+    // in-process `@Step`, a remote `handle_*` step) is a step. A LOCAL workflow's queue token is
+    // `sanitizeQueueToken(name)`; a REMOTE one (e.g. Python) routes to its `remote.group`, which can
+    // differ from the name — so seed the workflow-token set with BOTH.
+    const workflowTokens = new Set<string>();
+    for (const def of this.workflows.values()) {
+      workflowTokens.add(sanitizeQueueToken(def.name));
+      if (def.remote?.group) workflowTokens.add(def.remote.group);
+    }
     const out: GroupHealth[] = [];
     for (const group of groups) {
       const health = await this.pool.groupHealth(group);
-      if (health) out.push(health);
+      if (!health) continue;
+      const at = group.lastIndexOf('@');
+      const baseToken = at === -1 ? group : group.slice(0, at);
+      out.push({ ...health, kind: workflowTokens.has(baseToken) ? 'workflow' : 'step' });
     }
     return out;
   }
