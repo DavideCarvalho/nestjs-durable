@@ -319,9 +319,15 @@ function WorkersHealth() {
  */
 function WorkersByPod({ workers }: { workers: WorkerView[] }) {
   const [open, setOpen] = useState<string | undefined>(undefined);
+  // Cap inline chips so the pod row can never overflow its fixed slot and paint over the view toggle
+  // (long pod instanceIds mean even a couple of full-width chips exceed 300px). The rest collapse into
+  // a "+N" chip whose tooltip lists them.
+  const MAX_INLINE = 2;
+  const visible = workers.slice(0, MAX_INLINE);
+  const overflow = workers.slice(MAX_INLINE);
   return (
     <>
-      {workers.map((w) => {
+      {visible.map((w) => {
         const isOpen = open === w.instanceId;
         const c = w.status?.concurrency;
         const load = w.status && c ? `${w.status.inFlight}/${c.limit}` : undefined;
@@ -331,7 +337,7 @@ function WorkersByPod({ workers }: { workers: WorkerView[] }) {
               type="button"
               onClick={() => setOpen(isOpen ? undefined : w.instanceId)}
               title={`${w.instanceId} — ${w.handlers.length} handler(s) on ${w.partition}`}
-              className={`mono flex max-w-[220px] items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] hover:border-zinc-500 ${
+              className={`mono flex max-w-[120px] items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] hover:border-zinc-500 ${
                 isOpen
                   ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
                   : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
@@ -372,6 +378,14 @@ function WorkersByPod({ workers }: { workers: WorkerView[] }) {
           </div>
         );
       })}
+      {overflow.length > 0 && (
+        <span
+          className="mono shrink-0 rounded border border-[var(--line)] bg-zinc-800/40 px-1.5 py-0.5 text-[10px] text-zinc-400"
+          title={overflow.map((w) => `${w.instanceId} — ${w.partition}`).join('\n')}
+        >
+          +{overflow.length}
+        </span>
+      )}
     </>
   );
 }
