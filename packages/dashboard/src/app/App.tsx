@@ -8,6 +8,7 @@ import {
   type StepCheckpoint,
   type WorkerStatus,
   type WorkflowRun,
+  deriveRunState,
   durableClient,
   runDisplayStatus,
 } from '../client/durable-client';
@@ -624,12 +625,18 @@ function RunsListSkeleton() {
 
 function RunsList({
   runs,
+  allRuns,
+  health,
   loading,
   selected,
   onSelect,
   onSelectTag,
 }: {
   runs: WorkflowRun[];
+  /** The FULL (unfiltered) run list — needed to place a run among its singleton siblings even when the
+   *  leader is filtered out of `runs`. */
+  allRuns: WorkflowRun[];
+  health: GroupHealth[];
   loading?: boolean;
   selected?: string | undefined;
   onSelect: (id?: string) => void;
@@ -643,50 +650,58 @@ function RunsList({
   }
   return (
     <ul className="divide-y divide-[var(--line-soft)]">
-      {runs.map((r) => (
-        <li key={r.id}>
-          <button
-            type="button"
-            onClick={() => onSelect(r.id)}
-            className={`flex w-full flex-col gap-1 px-4 py-3 text-left transition-colors ${
-              selected === r.id ? 'bg-zinc-900' : 'hover:bg-zinc-900/50'
-            }`}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="flex min-w-0 items-center gap-1.5">
-                <span className="truncate text-sm font-medium text-zinc-200">{r.workflow}</span>
-                {r.id.startsWith('dlq:') && (
-                  <span className="mono shrink-0 rounded border border-rose-500/40 bg-rose-500/10 px-1 text-[9px] uppercase tracking-wider text-rose-300">
-                    dlq
-                  </span>
-                )}
-              </span>
-              <Badge status={runDisplayStatus(r)} />
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <span className="mono truncate text-[11px] text-zinc-600">{r.id}</span>
-              <span className="shrink-0 text-[11px] text-zinc-600">{relTime(r.updatedAt)}</span>
-            </div>
-            {r.tags && r.tags.length > 0 && (
-              <div className="flex flex-wrap gap-1">
-                {r.tags.map((t) => (
-                  // biome-ignore lint/a11y/useKeyWithClickEvents: span keeps the row clickable; tag click filters
-                  <span
-                    key={t}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onSelectTag(t);
-                    }}
-                    className="mono cursor-pointer rounded border border-[var(--line)] bg-zinc-800/40 px-1.5 text-[10px] text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
-                  >
-                    #{t}
-                  </span>
-                ))}
+      {runs.map((r) => {
+        const state = deriveRunState(r, { runs: allRuns, health });
+        return (
+          <li key={r.id}>
+            <button
+              type="button"
+              onClick={() => onSelect(r.id)}
+              className={`flex w-full flex-col gap-1 px-4 py-3 text-left transition-colors ${
+                selected === r.id ? 'bg-zinc-900' : 'hover:bg-zinc-900/50'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="truncate text-sm font-medium text-zinc-200">{r.workflow}</span>
+                  {r.id.startsWith('dlq:') && (
+                    <span className="mono shrink-0 rounded border border-rose-500/40 bg-rose-500/10 px-1 text-[9px] uppercase tracking-wider text-rose-300">
+                      dlq
+                    </span>
+                  )}
+                </span>
+                <Badge status={state.status} />
               </div>
-            )}
-          </button>
-        </li>
-      ))}
+              {/* WHY it's parked, in domain terms — the signal/webhook/child token, the singleton leader,
+                or the handler that has no live worker. Only for the derived waiting states. */}
+              {state.detail && (
+                <div className={`mono truncate text-[11px] s-${state.status}`}>{state.detail}</div>
+              )}
+              <div className="flex items-center justify-between gap-2">
+                <span className="mono truncate text-[11px] text-zinc-600">{r.id}</span>
+                <span className="shrink-0 text-[11px] text-zinc-600">{relTime(r.updatedAt)}</span>
+              </div>
+              {r.tags && r.tags.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {r.tags.map((t) => (
+                    // biome-ignore lint/a11y/useKeyWithClickEvents: span keeps the row clickable; tag click filters
+                    <span
+                      key={t}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectTag(t);
+                      }}
+                      className="mono cursor-pointer rounded border border-[var(--line)] bg-zinc-800/40 px-1.5 text-[10px] text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
+                    >
+                      #{t}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </button>
+          </li>
+        );
+      })}
     </ul>
   );
 }
@@ -1214,6 +1229,14 @@ export function App() {
       ),
     refetchInterval: 3000, // keep the run list live
   });
+  // Worker health, joined into each run row (no-worker) and the banner. Shares the `['workers']` cache
+  // with the Workers panel (same queryKey → one fetch); polled a touch faster so "no worker" clears
+  // promptly once a worker rejoins.
+  const { data: health = [] } = useQuery({
+    queryKey: ['workers'],
+    queryFn: () => durableClient.workers(),
+    refetchInterval: 5000,
+  });
   const bulk = useMutation({
     mutationFn: (action: 'retry' | 'cancel') =>
       durableClient.bulk(action, {
@@ -1229,12 +1252,33 @@ export function App() {
     return acc;
   }, {});
   const shown = filter === 'all' ? runs : runs.filter((r) => r.status === filter);
+  // Workflows with runs waiting on a handler that has NO live worker — surfaced as a banner so it's
+  // obvious nothing will progress until a worker rejoins (the "control plane up, no worker" case).
+  const stalledWorkflows = [
+    ...new Set(
+      runs
+        .filter((r) => deriveRunState(r, { runs, health }).status === 'no-worker')
+        .map((r) => r.workflow),
+    ),
+  ];
 
   return (
     <>
       <div className="app-bg" />
       <div className="relative z-10 flex h-full flex-col">
         <Header counts={counts} filter={filter} onFilter={setFilter} />
+        {stalledWorkflows.length > 0 && (
+          <div className="flex items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-200">
+            <span className="s-no-worker inline-flex items-center gap-1.5">
+              <span className="dot s-no-worker" aria-hidden />
+            </span>
+            <span>
+              Runs esperando handlers sem worker vivo:{' '}
+              <span className="mono text-amber-100">{stalledWorkflows.join(', ')}</span>. Suba um
+              worker pra destravar.
+            </span>
+          </div>
+        )}
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,360px)_1fr]">
           <aside className="flex min-h-0 flex-col border-r border-[var(--line)]">
             <div className="border-b border-[var(--line)] p-2">
@@ -1305,6 +1349,8 @@ export function App() {
             <div className="min-h-0 flex-1 overflow-auto">
               <RunsList
                 runs={shown}
+                allRuns={runs}
+                health={health}
                 loading={runsPending}
                 selected={selected}
                 onSelect={setSelected}

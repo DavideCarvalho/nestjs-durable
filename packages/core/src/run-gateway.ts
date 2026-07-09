@@ -3,9 +3,16 @@ import type {
   GroupHealth,
   RunQuery,
   RunResult,
+  RunWaiting,
   StepCheckpoint,
   WorkflowRun,
 } from './interfaces';
+
+/** A run as returned by the gateway's list — the durable run plus an optional {@link RunWaiting}
+ *  descriptor the control plane resolves (what a suspended run is parked on), so the dashboard can
+ *  name the wait in a list row without fetching each run's timeline. Additive: `waiting` is absent
+ *  on a non-parked run and on gateways/versions that don't compute it. */
+export type RunListItem = WorkflowRun & { waiting?: RunWaiting | undefined };
 
 /** Which durable topology a gateway speaks for — surfaced in the dashboard so an operator can tell a
  *  control plane from a tenant at a glance (the store-backed gateway is the operator; the proxy is a
@@ -36,7 +43,10 @@ export interface RunGateway {
   /** This deployment's durable role (control plane vs tenant) — synchronous local metadata. */
   topology(): DurableTopology;
   getRunDetail(runId: string): Promise<RunDetail | null>;
-  listRuns(query: RunQuery): Promise<WorkflowRun[]>;
+  /** List runs, each optionally carrying a {@link RunWaiting} descriptor (what a suspended run is
+   *  parked on). The store-backed gateway resolves `waiting`; a proxy relays whatever the control
+   *  plane sent. */
+  listRuns(query: RunQuery): Promise<RunListItem[]>;
   /** Per-group worker health (queue backlog + live worker heartbeats). On the control plane this is
    *  every group; over a tenant proxy the operator scopes it to the tenant's own groups. */
   workerHealth(): Promise<GroupHealth[]>;

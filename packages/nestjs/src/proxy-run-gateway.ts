@@ -4,12 +4,12 @@ import type {
   GroupHealth,
   RunDetail,
   RunGateway,
+  RunListItem,
   RunQuery,
   RunReply,
   RunRequestKind,
   RunResult,
   Transport,
-  WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 
@@ -87,8 +87,10 @@ export class ProxyRunGateway implements RunGateway {
     return this.request<RunDetail | null>({ kind: 'getRunDetail', runId });
   }
 
-  listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    return this.request<WorkflowRun[]>({ kind: 'listRuns', query });
+  /** The control plane's `StoreRunGateway` resolves each run's `waiting` descriptor; the reply carries
+   *  it through as plain JSON, so a tenant's list rows name the wait too. */
+  listRuns(query: RunQuery): Promise<RunListItem[]> {
+    return this.request<RunListItem[]>({ kind: 'listRuns', query });
   }
 
   /** Round-trips to the operator, which scopes the result to this tenant's own `@<tenant>` groups. */

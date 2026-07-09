@@ -4,6 +4,7 @@ import {
   type GroupHealth,
   type MetricsCollector,
   type RunGateway,
+  type RunListItem,
   type RunQuery,
   type RunResult,
   STATE_STORE_CANONICAL,
@@ -104,7 +105,7 @@ export class DashboardService {
     return `${this.metricsCollector?.prometheus() ?? ''}${gauges.join('\n')}\n`;
   }
 
-  listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+  listRuns(query: RunQuery): Promise<RunListItem[]> {
     return this.gateway.listRuns(query);
   }
 

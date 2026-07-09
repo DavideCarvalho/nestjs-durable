@@ -16,6 +16,13 @@ export interface DurableTopology {
   tenant?: string;
 }
 
+/** What an event-parked suspended run is waiting on — mirror of the server's `RunWaiting`. The control
+ *  plane resolves it from the run's signal waiters so a list row can NAME the wait without the timeline. */
+export interface RunWaiting {
+  on: 'signal' | 'webhook' | 'child';
+  name: string;
+}
+
 export interface WorkflowRun {
   id: string;
   workflow: string;
@@ -28,6 +35,8 @@ export interface WorkflowRun {
   recoveryAttempts?: number;
   tags?: string[];
   searchAttributes?: Record<string, string | number | boolean>;
+  /** Set on runs from `listRuns` (control-plane-enriched): what an event-parked suspended run waits on. */
+  waiting?: RunWaiting;
   createdAt: string;
   updatedAt: string;
 }
@@ -91,8 +100,83 @@ export interface RunDetail {
 }
 
 /** A run's status as shown to a human. The engine stores one generic `suspended` for any durably
- *  parked run, but WHY it's parked reads very differently, so we refine it for display only. */
-export type RunDisplayStatus = RunStatus | 'sleeping' | 'awaiting';
+ *  parked run, but WHY it's parked reads very differently, so we refine it for display only.
+ *  `no-worker` (blocked: no live worker for its handler) and `queued` (waiting behind a singleton
+ *  leader) are derived by {@link deriveRunState} from worker health + the sibling run list. */
+export type RunDisplayStatus = RunStatus | 'sleeping' | 'awaiting' | 'no-worker' | 'queued';
+
+/** A run's display state for a list row: the refined {@link RunDisplayStatus} (drives colour/pulse)
+ *  plus a short human `detail` naming WHY — the signal/webhook/child token, the singleton leader, or
+ *  the handler with no worker. `detail` is absent for plain states (running/completed/…). */
+export interface RunDisplayState {
+  status: RunDisplayStatus;
+  detail?: string;
+}
+
+/** Statuses that keep a singleton slot / queue behind it (mirrors the engine's `admit()` scan). */
+const SINGLETON_INFLIGHT = new Set<RunStatus>(['running', 'suspended', 'cancelling']);
+
+/** Strip the route-by-handler `@partition` suffix so a run's `workflow` matches its `GroupHealth.group`
+ *  base token (queues are `<name>@<tenant>` on tenants, bare `<name>` on the control plane). */
+export function baseGroup(group: string): string {
+  const at = group.lastIndexOf('@');
+  return at === -1 ? group : group.slice(0, at);
+}
+
+/** Whether any live worker serves `run.workflow` — matched by health group base token. A workflow with
+ *  no matching health entry (or every match at zero live workers) has no worker: the run can't advance. */
+function workflowHasLiveWorker(run: WorkflowRun, health: readonly GroupHealth[]): boolean {
+  return health.some((h) => baseGroup(h.group) === run.workflow && h.liveWorkers.length > 0);
+}
+
+/** The singleton leader among `runs` sharing this run's `singleton:<key>` tag: the oldest in-flight
+ *  (running/suspended/cancelling) by `(createdAt, id)` — the one holding the single slot (limit 1),
+ *  replicating the engine's `admit()`. `undefined` when the run isn't a singleton. */
+export function singletonLeader(
+  run: WorkflowRun,
+  runs: readonly WorkflowRun[],
+): WorkflowRun | undefined {
+  const tag = run.tags?.find((t) => t.startsWith('singleton:'));
+  if (!tag) return undefined;
+  const inflight = runs
+    .filter((r) => SINGLETON_INFLIGHT.has(r.status) && r.tags?.includes(tag))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+  return inflight[0];
+}
+
+/** Human label for an event wait: "signal `approve`" / "webhook `stripe-cb`" / "child `run-xyz`". */
+function waitingDetail(waiting: RunWaiting): string {
+  return `${waiting.on} ${waiting.name}`;
+}
+
+/**
+ * Refine a run into a list-row {@link RunDisplayState}, joining the run against the sibling run list
+ * (`runs`, for singleton position) and live worker `health` (for no-worker). Precedence for a
+ * suspended run: queued-behind-singleton → event wait (signal/webhook/child, named) → no-worker →
+ * running (a live worker is on it — in-flight or about to be, so it flips off "no worker"/"queued" the
+ * moment the fleet or the leader frees up). A `pending` run with no worker for its workflow also reads
+ * `no-worker`; every other status passes through.
+ */
+export function deriveRunState(
+  run: WorkflowRun,
+  ctx: { runs: readonly WorkflowRun[]; health: readonly GroupHealth[] },
+): RunDisplayState {
+  if (run.status === 'suspended') {
+    const leader = singletonLeader(run, ctx.runs);
+    if (leader && leader.id !== run.id) {
+      return { status: 'queued', detail: `atrás do líder ${leader.id.slice(0, 8)}` };
+    }
+    if (run.waiting) return { status: 'awaiting', detail: waitingDetail(run.waiting) };
+    if (!workflowHasLiveWorker(run, ctx.health))
+      return { status: 'no-worker', detail: run.workflow };
+    return { status: 'running' };
+  }
+  // A pending run nobody has picked up because its workflow has no live worker.
+  if (run.status === 'pending' && !workflowHasLiveWorker(run, ctx.health)) {
+    return { status: 'no-worker', detail: run.workflow };
+  }
+  return { status: run.status };
+}
 
 /**
  * Refine a run's stored status for display. The engine keeps `suspended` for every durably-parked

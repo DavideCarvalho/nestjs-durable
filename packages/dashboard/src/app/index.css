@@ -95,6 +95,15 @@ body {
 .s-pending {
   color: #94a3b8;
 }
+/* Blocked: waiting on a handler that has NO live worker — it can't progress until one rejoins. A warm
+   orange that reads as "act on this", distinct from the terminal red of `failed`/`dead`. */
+.s-no-worker {
+  color: #fb923c;
+}
+/* Queued behind a singleton leader: fine, just waiting its turn — a muted violet, not an alarm. */
+.s-queued {
+  color: #a78bfa;
+}
 
 .dot {
   width: 7px;
