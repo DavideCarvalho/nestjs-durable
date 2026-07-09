@@ -100,6 +100,7 @@ export class DurableWorkflow {
     opts?: { id?: string } & StartOptions,
   ): Promise<RunResult> {
     // biome-ignore lint/complexity/noThisInStatic: the polymorphic `this` IS the subclass being started — the class name would break every subclass
+    // biome-ignore lint/complexity/noUselessThisAlias: aliased ONCE on purpose so the noThisInStatic suppression lives in one place, not on every `this` use below
     const cls = this;
     const ctx = currentWorkflowCtx();
     if (ctx) {
@@ -122,6 +123,7 @@ export class DurableWorkflow {
     opts?: { id?: string; timeoutMs?: number } & StartOptions,
   ): Promise<WorkflowOutputOf<C>> {
     // biome-ignore lint/complexity/noThisInStatic: the polymorphic `this` IS the subclass being run — the class name would break every subclass
+    // biome-ignore lint/complexity/noUselessThisAlias: aliased ONCE on purpose so the noThisInStatic suppression lives in one place, not on every `this` use below
     const cls = this;
     const ctx = currentWorkflowCtx();
     if (ctx) return ctx.child(cls, input, opts?.id);

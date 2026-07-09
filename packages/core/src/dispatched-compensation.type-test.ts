@@ -1,3 +1,4 @@
+import type { StepUndo, UndoOf, WorkflowCtx } from './interfaces';
 /**
  * Compile-time guard for `ctx.step(handler, input, { compensate })`'s ref-form type contract: the
  * compensate handler must accept `StepUndo<TInput, TOutput>` of the STEP IT'S ATTACHED TO — a
@@ -6,7 +7,6 @@
  * src/**, excludes *.spec.ts) — see `dispatched-compensation.spec.ts` for the 6 runtime tests.
  */
 import type { StepRef } from './step-name-symbol';
-import type { StepUndo, UndoOf, WorkflowCtx } from './interfaces';
 
 interface BookInput {
   pax: string;
@@ -35,17 +35,19 @@ class FlightService {
     return { bookingId: `bk_${input.pax}` };
   }
 }
-export function _undoOfMatchesStepUndo(u: UndoOf<FlightService['book']>): StepUndo<
-  BookInput,
-  BookOutput
-> {
+export function _undoOfMatchesStepUndo(
+  u: UndoOf<FlightService['book']>,
+): StepUndo<BookInput, BookOutput> {
   return u; // no conversion needed — UndoOf<book> IS StepUndo<BookInput, BookOutput>
 }
 
 // Negative: a compensate ref typed for an UNRELATED step's `StepUndo` is rejected — the ref form is
 // checked against THIS call's TInput/TOutput, not just "any @Step-shaped function".
 export async function _rejectsMismatchedUndo(): Promise<void> {
-  const wrongUndo: StepRef<StepUndo<{ wrong: boolean }, { also: string }>, unknown> = async () => {};
+  const wrongUndo: StepRef<
+    StepUndo<{ wrong: boolean }, { also: string }>,
+    unknown
+  > = async () => {};
   // @ts-expect-error - compensate must accept StepUndo<BookInput, BookOutput>, not an unrelated shape
   await ctx.step(bookFlight, { pax: 'davi' }, { compensate: wrongUndo });
 }

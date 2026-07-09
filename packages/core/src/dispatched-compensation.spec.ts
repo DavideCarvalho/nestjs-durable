@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { stepCheckpoint } from './checkpoints';
 import { WorkflowEngine } from './engine';
 import type { StepUndo } from './interfaces';
-import { DURABLE_STEP_CONFIG, DURABLE_STEP_NAME, type StepConfig, type StepRef } from './step-name-symbol';
+import {
+  DURABLE_STEP_CONFIG,
+  DURABLE_STEP_NAME,
+  type StepConfig,
+  type StepRef,
+} from './step-name-symbol';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { InMemoryTransport } from './testing/in-memory-transport';
@@ -10,7 +15,7 @@ import { InMemoryTransport } from './testing/in-memory-transport';
 /** Stamp a plain function as a `@Step` reference (mirrors what the `@Step` decorator does in
  *  `@dudousxd/nestjs-durable`, unavailable to core's own tests). */
 function stepRef<TInput, TOutput>(name: string, config?: StepConfig): StepRef<TInput, TOutput> {
-  const ref = ((() => {}) as unknown) as StepRef<TInput, TOutput>;
+  const ref = (() => {}) as unknown as StepRef<TInput, TOutput>;
   (ref as { [DURABLE_STEP_NAME]?: string })[DURABLE_STEP_NAME] = name;
   if (config) (ref as { [DURABLE_STEP_CONFIG]?: StepConfig })[DURABLE_STEP_CONFIG] = config;
   return ref;
