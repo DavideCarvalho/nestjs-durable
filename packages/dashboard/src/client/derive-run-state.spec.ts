@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   type GroupHealth,
+  type StepCheckpoint,
   type WorkflowRun,
   baseGroup,
   deriveRunState,
@@ -15,6 +16,20 @@ function run(over: Partial<WorkflowRun> = {}): WorkflowRun {
     status: 'suspended',
     createdAt: '2026-01-01T00:00:00Z',
     updatedAt: '2026-01-01T00:00:00Z',
+    ...over,
+  };
+}
+
+function step(over: Partial<StepCheckpoint> = {}): StepCheckpoint {
+  return {
+    runId: 'r1',
+    seq: 0,
+    name: 'render',
+    kind: 'remote',
+    status: 'completed',
+    attempts: 1,
+    startedAt: '2026-01-01T00:00:00Z',
+    finishedAt: '2026-01-01T00:00:00Z',
     ...over,
   };
 }
@@ -124,7 +139,7 @@ describe('deriveRunState', () => {
     expect(deriveRunState(leader, { runs, health: withWorker }).status).toBe('running');
     const q = deriveRunState(queued, { runs, health: withWorker });
     expect(q.status).toBe('queued');
-    expect(q.detail).toBe('atrás do líder a');
+    expect(q.detail).toBe('behind leader a');
   });
 
   it('singleton-queued takes precedence over no-worker', () => {
@@ -157,5 +172,41 @@ describe('deriveRunState', () => {
     expect(
       deriveRunState(run(), { runs: [], health: [health('pipeline@davi-local', 1)] }).status,
     ).toBe('running');
+  });
+
+  // The detail view passes `timeline` — it must AGREE with the list row for the same run.
+  describe('with a timeline (detail view)', () => {
+    it('a settled step with nothing pending + no workflow worker reads no-worker (matches the list — the run needs its workflow worker to advance)', () => {
+      const timeline = [step({ name: 'render', status: 'completed' })];
+      expect(deriveRunState(run(), { runs: [], health: noWorker, timeline }).status).toBe(
+        'no-worker',
+      );
+    });
+
+    it('a step in flight reads running when its group has a worker, no-worker when it does not', () => {
+      const inflight = [step({ name: 'render', status: 'pending', workerGroup: 'render' })];
+      expect(
+        deriveRunState(run(), { runs: [], health: [health('render', 1)], timeline: inflight })
+          .status,
+      ).toBe('running');
+      expect(
+        deriveRunState(run(), { runs: [], health: [health('render', 0)], timeline: inflight })
+          .status,
+      ).toBe('no-worker');
+    });
+
+    it('a pending signal checkpoint reads awaiting, naming it the same way the list does', () => {
+      const timeline = [step({ kind: 'signal', name: 'wh:r1:0', status: 'pending' })];
+      const s = deriveRunState(run(), { runs: [], health: noWorker, timeline });
+      expect(s.status).toBe('awaiting');
+      expect(s.detail).toBe('webhook wh:r1:0');
+    });
+
+    it('a pending sleep checkpoint reads sleeping', () => {
+      const timeline = [step({ kind: 'sleep', name: 'sleep', status: 'pending' })];
+      expect(deriveRunState(run(), { runs: [], health: withWorker, timeline }).status).toBe(
+        'sleeping',
+      );
+    });
   });
 });

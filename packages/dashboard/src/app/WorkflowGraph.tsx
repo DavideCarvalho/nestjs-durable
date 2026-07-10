@@ -283,6 +283,7 @@ function subCounts(s: StepCheckpoint): SubCounts | undefined {
 export function WorkflowGraph({
   run,
   timeline,
+  endStatus,
   selectedKey,
   onSelect,
   onOpenRun,
@@ -292,6 +293,10 @@ export function WorkflowGraph({
 }: {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
+  /** The run's resolved display status for the end node — passed in so the graph agrees with the
+   *  health-aware detail header (no-worker / queued / awaiting). Falls back to the timeline-only
+   *  `runDisplayStatus` when omitted. */
+  endStatus?: RunDisplayStatus | undefined;
   /** `${runId}#${seq}` of the selected step (a nested child step lives in its own run). */
   selectedKey?: string | undefined;
   /** Open a step's detail — the step + the run it belongs to (root or a nested child run). */
@@ -491,7 +496,7 @@ export function WorkflowGraph({
     for (const firstId of root.firstIds) {
       edges.push({ id: `start->${firstId}`, source: 'start', target: firstId });
     }
-    const shown = runDisplayStatus(run, timeline);
+    const shown = endStatus ?? runDisplayStatus(run, timeline);
     nodes.push({
       id: 'end',
       type: 'terminal',
