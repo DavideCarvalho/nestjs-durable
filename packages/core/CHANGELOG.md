@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.50.1
+
+### Patch Changes
+
+- e5ae5ff: `readSearchAttributes` accepts a run whose `searchAttributes` is `null` (the nullable JSON column shape every ORM store entity exposes), not just `undefined`.
+
 ## 0.50.0
 
 ### Minor Changes
