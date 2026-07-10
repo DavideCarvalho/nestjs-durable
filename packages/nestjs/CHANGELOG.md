@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.32.0
+
+### Minor Changes
+
+- db17f15: `topology: { role: 'control-plane' }` accepts an optional `tenant`, mapped onto `namespace` — one `tenant` vocabulary for both roles, resolved to the right axis (operator poll-scoping vs worker queue-routing). Undefined = global operator, unchanged.
+
 ## 0.31.0
 
 ### Minor Changes
