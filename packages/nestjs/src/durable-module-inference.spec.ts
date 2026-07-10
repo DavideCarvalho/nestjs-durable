@@ -149,3 +149,117 @@ describe('DurableModule.forRoot — role inference', () => {
     );
   });
 });
+
+describe('DurableModule.forRoot — topology preset', () => {
+  it("{ topology: { role: 'control-plane' }, store, transport } resolves the operator role: real WorkflowEngine + StoreRunGateway", async () => {
+    const runner = fakeRunRedisWorker();
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          topology: { role: 'control-plane' },
+          store,
+          transport,
+          timerPollMs: 0,
+        }),
+      ],
+      providers: [GreetWorkflow],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.fn)
+      .compile();
+    await moduleRef.init();
+
+    const engine = moduleRef.get(WorkflowEngine);
+    expect(engine).toBeInstanceOf(WorkflowEngine);
+    expect(engine).not.toBeInstanceOf(DurableStartClient);
+
+    const gateway = moduleRef.get(RUN_GATEWAY, { strict: false });
+    expect(gateway).toBeInstanceOf(StoreRunGateway);
+    expect(gateway.topology()).toEqual({ role: 'control-plane' });
+
+    await moduleRef.close();
+  });
+
+  it("{ topology: { role: 'control-plane' } } missing `transport` throws the topology-specific error, not the generic role error", () => {
+    const store = new InMemoryStateStore();
+    expect(() => DurableModule.forRoot({ topology: { role: 'control-plane' }, store })).toThrow(
+      /needs `store` AND \(`transport` or `transports`\)/,
+    );
+  });
+
+  it("{ topology: { role: 'control-plane' } } with `partition` throws: partition is a worker axis", () => {
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    expect(() =>
+      DurableModule.forRoot({
+        topology: { role: 'control-plane' },
+        store,
+        transport,
+        partition: 'tenantA',
+      }),
+    ).toThrow(/forbids `partition`/);
+  });
+
+  it("{ topology: { role: 'tenant', tenant } } resolves the worker role: partition === tenant, ProxyRunGateway reports the tenant", async () => {
+    const runner = fakeRunRedisWorker();
+    const transport = new InMemoryTransport();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          topology: { role: 'tenant', tenant: 'tenantA' },
+          connection: 'redis://x',
+          transport,
+        }),
+      ],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.fn)
+      .compile();
+    await moduleRef.init();
+
+    const engine = moduleRef.get(WorkflowEngine);
+    expect(engine).toBeInstanceOf(DurableStartClient);
+
+    const gateway = moduleRef.get(RUN_GATEWAY, { strict: false });
+    expect(gateway).toBeInstanceOf(ProxyRunGateway);
+    expect(gateway.topology()).toEqual({ role: 'tenant', tenant: 'tenantA' });
+
+    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls[0]).toMatchObject({ partition: 'tenantA' });
+
+    await moduleRef.close();
+  });
+
+  it("{ topology: { role: 'tenant' } } with `store` throws: a tenant is store-less by definition", () => {
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    expect(() =>
+      DurableModule.forRoot({
+        topology: { role: 'tenant', tenant: 'tenantA' },
+        store,
+        transport,
+        connection: 'redis://x',
+      }),
+    ).toThrow(/forbids `store`/);
+  });
+
+  it("{ topology: { role: 'tenant' } } with a mismatched `partition` throws; a matching `partition` is a no-op", () => {
+    expect(() =>
+      DurableModule.forRoot({
+        topology: { role: 'tenant', tenant: 'tenantA' },
+        connection: 'redis://x',
+        partition: 'tenantB',
+      }),
+    ).toThrow(/conflicts with `partition: 'tenantB'`/);
+
+    expect(() =>
+      DurableModule.forRoot({
+        topology: { role: 'tenant', tenant: 'tenantA' },
+        connection: 'redis://x',
+        partition: 'tenantA',
+      }),
+    ).not.toThrow();
+  });
+});

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { eventToken } from './events';
 import type { SignalWaiter, WorkflowRun } from './interfaces';
+import { breakpointToken } from './protocol';
 import { classifyWaiterToken, indexWaitersByRun, resolveRunWaiting } from './run-waiting';
 
 function run(over: Partial<WorkflowRun> = {}): WorkflowRun {
@@ -37,6 +38,10 @@ describe('classifyWaiterToken', () => {
   it('treats a plain signal token as the signal name', () => {
     expect(classifyWaiterToken('approve')).toEqual({ on: 'signal', name: 'approve' });
   });
+
+  it('classifies a breakpoint token (bp:<runId>:<seq>) as `breakpoint`, not a raw-token signal', () => {
+    expect(classifyWaiterToken('bp:r1:3')).toEqual({ on: 'breakpoint', name: 'breakpoint' });
+  });
 });
 
 describe('indexWaitersByRun', () => {
@@ -64,5 +69,15 @@ describe('resolveRunWaiting', () => {
   it('is undefined for a non-suspended run even if a stale waiter lingers', () => {
     const idx = indexWaitersByRun([waiter({ token: 'approve', runId: 'r1' })]);
     expect(resolveRunWaiting(run({ id: 'r1', status: 'running' }), idx)).toBeUndefined();
+  });
+
+  it('resolves a real `ctx.breakpoint` waiter (bp:<runId>:<seq>) as `breakpoint`', () => {
+    const idx = indexWaitersByRun([
+      waiter({ token: breakpointToken('r1', 4), runId: 'r1', seq: 4 }),
+    ]);
+    expect(resolveRunWaiting(run({ id: 'r1' }), idx)).toEqual({
+      on: 'breakpoint',
+      name: 'breakpoint',
+    });
   });
 });

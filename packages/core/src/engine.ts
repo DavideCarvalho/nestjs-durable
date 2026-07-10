@@ -28,6 +28,7 @@ import type {
   RunResult,
   RunStatus,
   SearchAttributes,
+  SearchAttributesSchema,
   StateStore,
   StepCheckpoint,
   StepDef,
@@ -138,6 +139,9 @@ interface RegisteredWorkflow {
   executionTimeoutMs?: number | undefined;
   /** Validate the input at start; throw to reject before a run is created. Validator-agnostic. */
   validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+  /** Typed/validated `searchAttributes` shape. When set, `ctx.upsertSearchAttributes` validates the
+   *  merged result against it (see `createWorkflowCtx`). See `WorkflowMeta.searchAttributes`. */
+  searchAttributesSchema?: SearchAttributesSchema | undefined;
   /** Event names that start a fresh run of this workflow when published. See `publishEvent`. */
   onEvent?: string[] | undefined;
   /** Coalesce `onEvent` triggers: debounce (fire once it's quiet) or batch (fire on size/window). */
@@ -634,6 +638,8 @@ export class WorkflowEngine {
       singleton?: SingletonConfig | undefined;
       executionTimeout?: string | number | undefined;
       validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+      /** Typed/validated `searchAttributes` shape — see `RegisteredWorkflow.searchAttributesSchema`. */
+      searchAttributesSchema?: SearchAttributesSchema | undefined;
       onEvent?: string[] | undefined;
       eventBatch?: EventBatchConfig | undefined;
       /** Worker group to DISPATCH this workflow's turns to (uniform dispatch). Requires `executor`.
@@ -661,6 +667,7 @@ export class WorkflowEngine {
       executionTimeoutMs:
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts?.validateInput,
+      searchAttributesSchema: opts?.searchAttributesSchema,
       onEvent: opts?.onEvent,
       eventBatch: opts?.eventBatch,
       // A real, retained in-process body — so `workflowBody` can hand it to an in-app worker, and so
@@ -2634,6 +2641,7 @@ export class WorkflowEngine {
       run.id,
       compensations,
       run.workflow,
+      registered?.searchAttributesSchema,
     );
     try {
       // The ambient-context wrap is what lets class-first statics (`MyWorkflow.execute()`) find

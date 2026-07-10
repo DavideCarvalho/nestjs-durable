@@ -263,6 +263,7 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `concurrency` | `ConcurrencyOption` (`number \| 'adaptive' \| { mode: 'adaptive', ... }`) | `1` | Tasks a worker role's consumer runs concurrently per subscribed queue. Ignored for a plain operator. |
 | `concurrencyByHandler` | `Record<string, ConcurrencyOption>` | falls back to `concurrency` | Per-handler concurrency override — not yet wired through `runRedisWorker`. |
 | `runGatewayTimeoutMs` | `number` | `10000` | Timeout for a thin worker's `RunGateway` round-trip over `transport`. Ignored for an operator. |
+| `topology` | `{ role: 'control-plane' } \| { role: 'tenant'; tenant: string }` | none = existing inference | Explicit, VALIDATED role preset — see [Tenancy & topologies](/docs/concepts/tenancy#the-topology-preset). `'tenant'` maps `tenant` onto `partition` for you. |
 
 ## Errors
 

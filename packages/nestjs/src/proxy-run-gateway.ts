@@ -9,6 +9,7 @@ import type {
   RunReply,
   RunRequestKind,
   RunResult,
+  RunWaiting,
   Transport,
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
@@ -96,6 +97,12 @@ export class ProxyRunGateway implements RunGateway {
   /** Round-trips to the operator, which scopes the result to this tenant's own `@<tenant>` groups. */
   workerHealth(): Promise<GroupHealth[]> {
     return this.request<GroupHealth[]>({ kind: 'workerHealth' });
+  }
+
+  /** Bulk, one request for the whole id list (like `listRuns`, not one request per id). The operator
+   *  filters the reply to runs this tenant actually owns (see `RunRequestResponder`). */
+  waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>> {
+    return this.request<Record<string, RunWaiting>>({ kind: 'waitingFor', runIds });
   }
 
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {

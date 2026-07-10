@@ -23,7 +23,9 @@ export interface DurableTopology {
   tenant?: string;
 }
 
-/** A run + its timeline + child ids — the detail view. Mirrors the dashboard's `RunDetail`. */
+/** A run + its timeline + child ids — the detail view. Single source of truth: the dashboard server
+ *  re-exports this instead of re-declaring it, and the dashboard client derives its wire mirror from
+ *  it via {@link WireDates} instead of hand-mirroring field by field. */
 export interface RunDetail {
   run: WorkflowRun;
   /** Steps in execution order (local + remote). */
@@ -31,6 +33,22 @@ export interface RunDetail {
   /** Ids of runs this run spawned (parent→children tree). */
   children: string[];
 }
+
+/**
+ * Maps every `Date` (and `Date | undefined`) field of `T` to its ISO-string wire form — the shape a
+ * JSON response actually carries once dates cross the wire (`JSON.stringify` already does this
+ * coercion; this just types it). Homomorphic: each field keeps its own optional modifier, so a
+ * required `Date` becomes a required `string` and an optional one stays optional. Lets a consumer
+ * derive its own wire-facing client type from a core server type (e.g. the dashboard's SPA `WorkflowRun`/
+ * `StepCheckpoint`/`RunDetail`) instead of hand-mirroring it field by field and drifting.
+ */
+export type WireDates<T> = {
+  [K in keyof T]: T[K] extends Date
+    ? string
+    : T[K] extends Date | undefined
+      ? string | undefined
+      : T[K];
+};
 
 /**
  * The bounded read/control/stream surface a consumer (e.g. a controller) needs, satisfied by BOTH
@@ -47,6 +65,17 @@ export interface RunGateway {
    *  parked on). The store-backed gateway resolves `waiting`; a proxy relays whatever the control
    *  plane sent. */
   listRuns(query: RunQuery): Promise<RunListItem[]>;
+  /**
+   * Bulk-resolve {@link RunWaiting} for an arbitrary set of run ids — for a consumer with its OWN
+   * filtered/paginated run listing (so it isn't just `listRuns` under another name) that needs to know
+   * which of ITS runs are parked on a breakpoint (or any other event wait) without re-deriving the bulk
+   * waiter scan itself or reaching for raw SQL against `durable_step_checkpoints`. A `Record` (not a
+   * `Map`) because `ProxyRunGateway` serialises the reply over the transport as plain JSON. Entries are
+   * present ONLY for runs currently waiting — an unknown id, a non-suspended id, and a suspended id
+   * parked on something non-event (a bare `ctx.sleep`, an in-flight step) are simply absent, same as a
+   * `listRuns` row with no `waiting`.
+   */
+  waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>>;
   /** Per-group worker health (queue backlog + live worker heartbeats). On the control plane this is
    *  every group; over a tenant proxy the operator scopes it to the tenant's own groups. */
   workerHealth(): Promise<GroupHealth[]>;

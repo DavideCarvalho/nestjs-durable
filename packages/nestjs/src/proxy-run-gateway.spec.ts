@@ -104,6 +104,23 @@ describe('ProxyRunGateway', () => {
     });
   });
 
+  it('round-trips waitingFor with the whole id list in ONE request, not one per id', async () => {
+    const tx = fakeTransport();
+    const gw = new ProxyRunGateway(tx, 'acme', 5000);
+    const p = gw.waitingFor(['r1', 'r2', 'r3']);
+    expect(tx.requests).toHaveLength(1);
+    const req = tx.requests[0];
+    expect(req).toMatchObject({
+      tenant: 'acme',
+      body: { kind: 'waitingFor', runIds: ['r1', 'r2', 'r3'] },
+    });
+    tx.emitReply({
+      requestId: req.requestId,
+      result: { ok: true, data: { r1: { on: 'breakpoint', name: 'breakpoint' } } },
+    });
+    await expect(p).resolves.toEqual({ r1: { on: 'breakpoint', name: 'breakpoint' } });
+  });
+
   it('round-trips redispatchPending and resolves with the redispatched count', async () => {
     const tx = fakeTransport();
     const gw = new ProxyRunGateway(tx, 'acme', 5000);

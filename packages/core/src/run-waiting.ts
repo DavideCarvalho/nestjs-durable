@@ -2,11 +2,13 @@ import { eventNameOf } from './events';
 import type { RunWaiting, SignalWaiter, WorkflowRun } from './interfaces';
 
 // Waiter-token prefixes the engine stamps (see `workflow-ctx.ts`): a webhook mints `wh:<runId>:<seq>`,
-// an awaited child parks on `child:<id>`, a named event on `event:<b64 name>:…`. A plain
+// an awaited child parks on `child:<id>`, a `ctx.breakpoint` mints `bp:<runId>:<seq>` (see
+// `breakpointToken` in `protocol.ts`), a named event on `event:<b64 name>:…`. A plain
 // `ctx.waitForSignal(name)` uses `name` verbatim as the token, so an unrecognised token IS the signal
 // name.
 const WEBHOOK_PREFIX = 'wh:';
 const CHILD_PREFIX = 'child:';
+const BREAKPOINT_PREFIX = 'bp:';
 const EVENT_PREFIX = 'event:';
 
 /**
@@ -14,9 +16,15 @@ const EVENT_PREFIX = 'event:';
  * The token prefix carries the kind — no extra store lookup and no new persisted field. Used by the
  * store-backed run gateway to stamp {@link RunWaiting} onto each listed run so the dashboard can name
  * the wait in a row without fetching that run's timeline.
+ *
+ * `ctx.breakpoint` reuses the signal-waiter machinery (`engine.continue` resumes it via `signal()`
+ * like any other), so without this case it would fall through to the generic `signal` branch with the
+ * raw `bp:<runId>:<seq>` token as its display name — a real bug. Named `'breakpoint'` here instead;
+ * the token carries no separate label to recover cheaply (see {@link RunWaiting.name}).
  */
 export function classifyWaiterToken(token: string): RunWaiting {
   if (token.startsWith(WEBHOOK_PREFIX)) return { on: 'webhook', name: token };
+  if (token.startsWith(BREAKPOINT_PREFIX)) return { on: 'breakpoint', name: 'breakpoint' };
   if (token.startsWith(CHILD_PREFIX))
     return { on: 'child', name: token.slice(CHILD_PREFIX.length) };
   if (token.startsWith(EVENT_PREFIX)) return { on: 'signal', name: eventNameOf(token) };

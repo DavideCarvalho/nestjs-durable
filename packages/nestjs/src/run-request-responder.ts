@@ -1,4 +1,4 @@
-import type { RunGateway, RunReply, RunRequest } from '@dudousxd/nestjs-durable-core';
+import type { RunGateway, RunReply, RunRequest, RunWaiting } from '@dudousxd/nestjs-durable-core';
 
 /** The narrow slice of `Transport` the responder needs — a tenant's read/control request in, a
  *  correlated reply out. Both are OPTIONAL on the full `Transport` interface (only broker
@@ -52,6 +52,28 @@ export class RunRequestResponder {
       return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
+    if (body.kind === 'waitingFor') {
+      // Bulk, like `listRuns` — but unlike `listRuns` (which forces the query's namespace and so
+      // scopes itself) the caller supplies arbitrary ids, which could probe another tenant's runs. The
+      // gateway's own `waitingFor` has no namespace to filter by, so verify ownership per MATCHED entry
+      // (bounded by how many of the requested ids are actually waiting, never by `runIds.length`) the
+      // same way every other runId-bearing verb does below: `getRunDetail` + a `namespace` check.
+      const all = await this.gateway.waitingFor(body.runIds);
+      const owned = await Promise.all(
+        Object.entries(all).map(async ([runId, waiting]) => {
+          const runDetail = await this.gateway.getRunDetail(runId);
+          return runDetail && runDetail.run.namespace === msg.tenant
+            ? ([runId, waiting] as const)
+            : undefined;
+        }),
+      );
+      const data: Record<string, RunWaiting> = {};
+      for (const entry of owned) {
+        if (entry) data[entry[0]] = entry[1];
+      }
+      return { requestId: msg.requestId, result: { ok: true, data } };
+    }
+
     // Every remaining verb is runId-bearing. Load the run FIRST — before calling the verb — so a
     // cross-tenant request never reaches the gateway's mutating methods (cancel/retry/continue/redispatch).
     const detail = await this.gateway.getRunDetail(body.runId);
@@ -83,7 +105,10 @@ export class RunRequestResponder {
   private callVerb(
     body: Exclude<
       RunRequest['body'],
-      { kind: 'listRuns' } | { kind: 'getRunDetail' } | { kind: 'workerHealth' }
+      | { kind: 'listRuns' }
+      | { kind: 'getRunDetail' }
+      | { kind: 'workerHealth' }
+      | { kind: 'waitingFor' }
     >,
   ): Promise<unknown> {
     switch (body.kind) {

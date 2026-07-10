@@ -8,6 +8,7 @@ import type {
   RunReply,
   RunRequest,
   RunResult,
+  RunWaiting,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it, vi } from 'vitest';
@@ -41,6 +42,7 @@ function fakeGateway(overrides: Partial<RunGateway> = {}): RunGateway {
         fakeRun('x', query.namespace ?? 'default'),
       ],
     ),
+    waitingFor: vi.fn(async (): Promise<Record<string, RunWaiting>> => ({})),
     workerHealth: vi.fn(
       async (): Promise<GroupHealth[]> => [
         { group: 'pipeline@acme', depth: 1, liveWorkers: [] },
@@ -141,6 +143,74 @@ describe('RunRequestResponder', () => {
       result: { ok: true, data: [{ group: 'pipeline@acme' }] },
     });
     expect((tx.replies[0]?.result as { ok: true; data: GroupHealth[] }).data).toHaveLength(1);
+  });
+
+  it('waitingFor is bulk — ONE gateway.waitingFor call for the whole id list, not one per id', async () => {
+    const gw = fakeGateway({
+      waitingFor: vi.fn(
+        async (): Promise<Record<string, RunWaiting>> => ({
+          r1: { on: 'breakpoint', name: 'breakpoint' },
+          r2: { on: 'signal', name: 'approve' },
+        }),
+      ),
+      getRunDetail: vi.fn(
+        async (id: string): Promise<RunDetail | null> => ({
+          run: fakeRun(id, 'acme'),
+          timeline: [],
+          children: [],
+        }),
+      ),
+    });
+    const tx = fakeTransport();
+    new RunRequestResponder(tx, gw).start();
+    await tx.deliver({
+      requestId: 'q10',
+      tenant: 'acme',
+      body: { kind: 'waitingFor', runIds: ['r1', 'r2'] },
+    });
+    expect(gw.waitingFor).toHaveBeenCalledTimes(1);
+    expect(gw.waitingFor).toHaveBeenCalledWith(['r1', 'r2']);
+    expect(tx.replies[0]).toMatchObject({
+      requestId: 'q10',
+      result: {
+        ok: true,
+        data: {
+          r1: { on: 'breakpoint', name: 'breakpoint' },
+          r2: { on: 'signal', name: 'approve' },
+        },
+      },
+    });
+  });
+
+  it('waitingFor drops entries for runs belonging to another tenant', async () => {
+    const gw = fakeGateway({
+      waitingFor: vi.fn(
+        async (): Promise<Record<string, RunWaiting>> => ({
+          mine: { on: 'breakpoint', name: 'breakpoint' },
+          theirs: { on: 'signal', name: 'approve' },
+        }),
+      ),
+      getRunDetail: vi.fn(
+        async (id: string): Promise<RunDetail | null> => ({
+          run: fakeRun(id, id === 'theirs' ? 'beta' : 'acme'),
+          timeline: [],
+          children: [],
+        }),
+      ),
+    });
+    const tx = fakeTransport();
+    new RunRequestResponder(tx, gw).start();
+    await tx.deliver({
+      requestId: 'q11',
+      tenant: 'acme',
+      body: { kind: 'waitingFor', runIds: ['mine', 'theirs'] },
+    });
+    expect(tx.replies[0]).toMatchObject({
+      requestId: 'q11',
+      result: { ok: true, data: { mine: { on: 'breakpoint', name: 'breakpoint' } } },
+    });
+    const data = (tx.replies[0]?.result as { ok: true; data: Record<string, RunWaiting> }).data;
+    expect(Object.keys(data)).toEqual(['mine']);
   });
 
   it('denies a cross-tenant cancel WITHOUT calling engine cancel', async () => {

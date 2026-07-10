@@ -14,6 +14,24 @@ const DURABLE_TABLE_NAMES = new Set([
 ]);
 
 /**
+ * Tables this store creates and manages at boot (autoSchema). Feed to your ORM's migration differ
+ * exclude/skipTables so it never tries to drop them.
+ *
+ * ```ts
+ * await MikroORM.init({
+ *   // ...your entities/driver config
+ *   schemaGenerator: { skipTables: durableManagedTables() },
+ * });
+ * ```
+ *
+ * Derived from the same {@link DURABLE_TABLE_NAMES} set `ensureMikroOrmDurableSchema` scopes its own
+ * heal to — one list, so a consumer's denylist can never drift from what this store actually owns.
+ */
+export function durableManagedTables(): string[] {
+  return [...DURABLE_TABLE_NAMES];
+}
+
+/**
  * Marker table that records the fingerprint of the durable schema last applied to this database. A
  * single row (`id = 'durable'`) lets every boot decide — with two cheap round-trips — whether the
  * durable tables already match the entity metadata, so steady-state boots skip the expensive

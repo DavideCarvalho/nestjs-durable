@@ -27,6 +27,25 @@ const TABLE_TO_ENTITY = {
 } as const;
 
 /**
+ * Tables this store creates and manages at boot (autoSchema, see {@link ensureTypeOrmDurableSchema}).
+ * Feed to your ORM's migration differ exclude/skipTables so it never tries to drop them.
+ *
+ * ```ts
+ * // MikroORM-flavoured example (TypeORM has no built-in equivalent option); adapt to whichever
+ * // migration tool generates your diffs — e.g. exclude these names from a typeorm-generated
+ * // migration, or filter them out of `SELECT table_name FROM information_schema.tables` before
+ * // diffing against your own entities.
+ * const skipTables = new Set(durableManagedTables());
+ * ```
+ *
+ * Derived from the same {@link TABLE_TO_ENTITY} map the raw-SQL heal keys its column resolution off
+ * — one list, so a consumer's denylist can never drift from what this store actually owns.
+ */
+export function durableManagedTables(): string[] {
+  return Object.keys(TABLE_TO_ENTITY);
+}
+
+/**
  * Resolve `(table, property) => physical column name` from the DataSource's entity metadata. The
  * column names are NOT hardcoded here: they come from whatever the registered `durableEntities`
  * mapped (canonical `snake_case` by default, `'preserve'` for the legacy camelCase, or a custom

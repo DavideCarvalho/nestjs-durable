@@ -128,6 +128,7 @@ export class WorkflowRegistrar
         singleton: meta.singleton,
         executionTimeout: meta.executionTimeout,
         validateInput,
+        searchAttributesSchema: meta.searchAttributes,
         onEvent: getOnEvents(meta, workflowCtor),
         eventBatch,
         // Uniform dispatch (opt-in): when an in-app worker is configured, register the body GROUP-SERVED
