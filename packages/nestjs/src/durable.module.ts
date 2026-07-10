@@ -401,10 +401,18 @@ export interface DurableModuleOptions {
    *   dispatch routes a run's `namespace` to. `{ role: 'tenant' }` sets this FOR you from `tenant` —
    *   you never set `partition` directly under `topology`.
    *
+   * **One `tenant` word, two axes — the preset maps it to the right one per role:** on a
+   * `control-plane` an optional `tenant` scopes the OPERATOR to its own runs (maps to `namespace` —
+   * a self-contained local stack sharing a broker with a deployed cluster names itself so neither
+   * drives the other's runs; leave it unset on a deployed operator to drive every tenant). On a
+   * `tenant` role it is required and maps to `partition` (the worker's queue suffix).
+   *
    * ```ts
-   * // Control plane: owns the store, dispatches over the transport, prunes old runs.
+   * // Control plane: owns the store, dispatches over the transport, prunes old runs. The optional
+   * // `tenant` (e.g. from an env var) scopes this operator to its own runs — undefined on a
+   * // deployed operator (drives everything), set on a local stack sharing the broker.
    * DurableModule.forRoot({
-   *   topology: { role: 'control-plane' },
+   *   topology: { role: 'control-plane', tenant: process.env.DURABLE_TENANT },
    *   store,
    *   transport,
    *   retention: { policies: [{ statuses: ['completed', 'cancelled'], maxAge: '14d' }] },
@@ -420,7 +428,7 @@ export interface DurableModuleOptions {
    * Validated at `forRoot`/`forRootAsync` resolution time — see {@link DurableModule} for the exact
    * error messages, which double as the axis primer above.
    */
-  topology?: { role: 'control-plane' } | { role: 'tenant'; tenant: string };
+  topology?: { role: 'control-plane'; tenant?: string } | { role: 'tenant'; tenant: string };
 }
 
 export interface DurableModuleAsyncOptions {
@@ -474,11 +482,13 @@ function assertValidTopology(options: DurableModuleOptions): void {
           "`partition` (or `topology: { role: 'tenant', tenant }`) on the WORKER node instead.",
       );
     }
-    if ('tenant' in topology) {
+    if (
+      topology.tenant !== undefined &&
+      options.namespace !== undefined &&
+      options.namespace !== topology.tenant
+    ) {
       throw new Error(
-        "topology: { role: 'control-plane' } forbids a `tenant` field.\n" +
-          "tenant names a WORKER's isolation partition — a control-plane node serves every " +
-          "tenant's runs (via their namespace), it isn't scoped to one itself.",
+        `topology: { role: 'control-plane', tenant: '${topology.tenant}' } conflicts with \`namespace: '${options.namespace}'\`.\ntenant maps 1:1 onto namespace (the operator's poll-scoping axis) — set only \`tenant\`, or set \`namespace\` to the same value.`,
       );
     }
     return;
@@ -512,14 +522,21 @@ function assertValidTopology(options: DurableModuleOptions): void {
 }
 
 /**
- * Applies the {@link DurableModuleOptions.topology} preset's `tenant` → `partition` mapping —
- * validated already by {@link assertValidTopology} (an equal, explicit `partition` is a no-op; a
- * mismatched one throws before this runs). A no-op for `{ role: 'control-plane' }` and for an unset
- * `topology` (existing behavior, zero change).
+ * Applies the {@link DurableModuleOptions.topology} preset's `tenant` mapping — per role: onto
+ * `partition` (worker queue-routing) for `{ role: 'tenant' }`, onto `namespace` (operator
+ * poll-scoping) for `{ role: 'control-plane' }`. Validated already by {@link assertValidTopology}
+ * (an equal explicit value is a no-op; a mismatched one throws before this runs). A no-op for an
+ * unset `topology` (existing behavior, zero change).
  */
 function resolveTopology(options: DurableModuleOptions): DurableModuleOptions {
   const topology = options.topology;
-  if (topology === undefined || topology.role !== 'tenant') return options;
+  if (topology === undefined) return options;
+  if (topology.role === 'control-plane') {
+    // An optional tenant scopes the operator to its own runs — maps onto `namespace` (undefined =
+    // global operator, drives every tenant; validated against an explicit mismatched `namespace`).
+    if (topology.tenant === undefined || options.namespace !== undefined) return options;
+    return { ...options, namespace: topology.tenant };
+  }
   if (options.partition !== undefined) return options;
   return { ...options, partition: topology.tenant };
 }
