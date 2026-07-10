@@ -104,8 +104,8 @@ export interface RunDetail {
 
 /** A run's status as shown to a human. The engine stores one generic `suspended` for any durably
  *  parked run, but WHY it's parked reads very differently, so we refine it for display only.
- *  `no-worker` (blocked: no live worker for its handler) and `queued` (waiting behind a singleton
- *  leader) are derived by {@link deriveRunState} from worker health + the sibling run list. */
+ *  `no-worker` (blocked: its queue has a backlog with no live consumer) and `queued` (waiting behind
+ *  a singleton leader) are derived by {@link deriveRunState} from worker health + the sibling run list. */
 export type RunDisplayStatus = RunStatus | 'sleeping' | 'awaiting' | 'no-worker' | 'queued';
 
 /** A run's display state for a list row: the refined {@link RunDisplayStatus} (drives colour/pulse)
@@ -126,16 +126,20 @@ export function baseGroup(group: string): string {
   return at === -1 ? group : group.slice(0, at);
 }
 
-/** Whether any live worker serves `group` (matched by base token, ignoring the `@partition` suffix). */
-function groupHasLiveWorker(group: string, health: readonly GroupHealth[]): boolean {
+/** Whether `group` is STALLED — the library's own alert condition (`GroupHealth`, `interfaces.ts`):
+ *  it has queued work (`depth > 0`) and ZERO live workers anywhere to consume it. Bare
+ *  `liveWorkers === 0` is NOT a reliable "no worker" signal — a worker only heartbeats for a group
+ *  while it's serving it, so an IDLE group (a suspended run parked on its reconcile timer with nothing
+ *  enqueued, a scheduled workflow between its cron runs) legitimately reports zero live workers, and
+ *  flagging that "no worker" is a false positive. Real backlog with no consumer is the honest signal:
+ *  `workerHealth()` reports a registered group with backlog and zero workers precisely so this case is
+ *  visible. Matched by base token, ignoring the `@partition` suffix (queues aggregate across tenants). */
+function groupIsStalled(group: string, health: readonly GroupHealth[]): boolean {
   const base = baseGroup(group);
-  return health.some((h) => baseGroup(h.group) === base && h.liveWorkers.length > 0);
-}
-
-/** Whether any live worker serves `run.workflow`. A workflow with no matching health entry (or every
- *  match at zero live workers) has no worker: the run can't advance until one rejoins. */
-function workflowHasLiveWorker(run: WorkflowRun, health: readonly GroupHealth[]): boolean {
-  return groupHasLiveWorker(run.workflow, health);
+  const entries = health.filter((h) => baseGroup(h.group) === base);
+  const anyBacklog = entries.some((h) => h.depth > 0);
+  const anyWorker = entries.some((h) => h.liveWorkers.length > 0);
+  return anyBacklog && !anyWorker;
 }
 
 /** Label a signal-checkpoint token (the raw waiter token) the way the server names `RunWaiting`, so a
@@ -174,9 +178,11 @@ function waitingDetail(waiting: RunWaiting): string {
  *
  * Precedence for a suspended run: queued-behind-singleton → (with timeline) an in-flight step
  * running/no-worker · a genuine signal wait · a real sleep → the control-plane-named event wait
- * (list rows, no timeline) → no-worker when its workflow has no live worker → running. A live worker
- * flips it off "no worker"/"queued" on the next poll. A `pending` run with no worker also reads
- * `no-worker`; every other status passes through.
+ * (list rows, no timeline) → no-worker when its workflow queue is STALLED → running. "No worker" is
+ * gated on a real backlog with no consumer (`groupIsStalled`), NOT bare `liveWorkers === 0` — an idle
+ * group has no live heartbeat yet is not blocked, so bare-zero would falsely flag parked/settled runs.
+ * A live worker (or an empty backlog) flips it off "no worker"/"queued" on the next poll. A `pending`
+ * run whose queue is stalled also reads `no-worker`; every other status passes through.
  */
 export function deriveRunState(
   run: WorkflowRun,
@@ -187,7 +193,7 @@ export function deriveRunState(
   },
 ): RunDisplayState {
   if (run.status !== 'suspended') {
-    if (run.status === 'pending' && !workflowHasLiveWorker(run, ctx.health)) {
+    if (run.status === 'pending' && groupIsStalled(run.workflow, ctx.health)) {
       return { status: 'no-worker', detail: run.workflow };
     }
     return { status: run.status };
@@ -203,8 +209,9 @@ export function deriveRunState(
   if (pending) {
     if (pending.kind === 'signal') return { status: 'awaiting', detail: tokenDetail(pending.name) };
     if (pending.kind === 'sleep') return { status: 'sleeping' };
-    // A remote/local step in flight — running if a worker serves its group, else it's stuck no-worker.
-    if (pending.workerGroup && !groupHasLiveWorker(pending.workerGroup, ctx.health)) {
+    // A remote/local step in flight — its job is enqueued, so if that queue is stalled (backlog, no
+    // consumer) the step is genuinely blocked; otherwise a worker is (or will be) serving it: running.
+    if (pending.workerGroup && groupIsStalled(pending.workerGroup, ctx.health)) {
       return { status: 'no-worker', detail: baseGroup(pending.workerGroup) };
     }
     return { status: 'running' };
@@ -213,8 +220,13 @@ export function deriveRunState(
   // Control-plane-named event wait (list rows have no timeline to read the pending signal checkpoint).
   if (run.waiting) return { status: 'awaiting', detail: waitingDetail(run.waiting) };
 
-  // Nothing pending: the run has settled a step and needs its WORKFLOW worker to advance the decision.
-  if (!workflowHasLiveWorker(run, ctx.health)) return { status: 'no-worker', detail: run.workflow };
+  // Nothing pending: the run has settled its last step and is parked waiting to be replayed/advanced
+  // by its WORKFLOW worker. Only call that "no worker" when the workflow queue is genuinely stalled —
+  // a backlog with no consumer. A parked run with nothing enqueued (the common case, incl. the runs
+  // the reconcile fallback keeps retrying) has no backlog, so it reads as running (open, in flight),
+  // NOT a false "no worker". It flips to no-worker the moment its resume enqueues with no consumer.
+  if (groupIsStalled(run.workflow, ctx.health))
+    return { status: 'no-worker', detail: run.workflow };
   return { status: 'running' };
 }
 
