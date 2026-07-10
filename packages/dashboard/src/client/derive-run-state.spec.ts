@@ -34,11 +34,13 @@ function step(over: Partial<StepCheckpoint> = {}): StepCheckpoint {
   };
 }
 
-/** A `GroupHealth` for `group` with `live` live workers (0 = queue with no consumer). */
-function health(group: string, live = 0): GroupHealth {
+/** A `GroupHealth` for `group` with `live` live workers and `depth` queued jobs. `depth > 0 && live
+ *  === 0` is the STALLED alert case (backlog, no consumer); `depth === 0 && live === 0` is an IDLE
+ *  group (no work, no heartbeat) — not blocked, so NOT no-worker. */
+function health(group: string, live = 0, depth = 0): GroupHealth {
   return {
     group,
-    depth: 0,
+    depth,
     liveWorkers: Array.from({ length: live }, (_, i) => ({
       group,
       instanceId: `w${i}`,
@@ -87,7 +89,10 @@ describe('singletonLeader', () => {
 
 describe('deriveRunState', () => {
   const withWorker = [health('pipeline', 1)];
-  const noWorker = [health('pipeline', 0)];
+  // STALLED: a backlog (depth > 0) with no live worker — the genuine "no worker" alert case.
+  const stalled = [health('pipeline', 0, 1)];
+  // IDLE: no backlog and no live worker — a parked/settled run, NOT blocked.
+  const idle = [health('pipeline', 0, 0)];
 
   it('passes a non-suspended, non-pending status through', () => {
     expect(
@@ -117,14 +122,20 @@ describe('deriveRunState', () => {
     ).toBe('child kid-7');
   });
 
-  it('flags a suspended run whose workflow has no live worker as no-worker', () => {
-    const s = deriveRunState(run(), { runs: [], health: noWorker });
+  it('flags a suspended run whose workflow queue is stalled (backlog, no consumer) as no-worker', () => {
+    const s = deriveRunState(run(), { runs: [], health: stalled });
     expect(s.status).toBe('no-worker');
     expect(s.detail).toBe('pipeline');
   });
 
-  it('flags a suspended run whose workflow group is absent from health as no-worker', () => {
-    expect(deriveRunState(run(), { runs: [], health: [] }).status).toBe('no-worker');
+  it('does NOT flag an idle suspended run (no backlog, no live worker) — it reads running, not no-worker', () => {
+    // The false positive we fixed: a settled/parked run whose group is simply idle (no heartbeat, but
+    // nothing enqueued) must not be mislabelled "no worker".
+    expect(deriveRunState(run(), { runs: [], health: idle }).status).toBe('running');
+  });
+
+  it('does NOT flag a suspended run whose workflow group is absent from health (no backlog to stall)', () => {
+    expect(deriveRunState(run(), { runs: [], health: [] }).status).toBe('running');
   });
 
   it('shows a suspended run with a live worker (and no event wait) as running', () => {
@@ -146,7 +157,7 @@ describe('deriveRunState', () => {
     const tag = 'singleton:base:1';
     const leader = run({ id: 'a', tags: [tag], createdAt: '2026-01-01T00:00:00Z' });
     const queued = run({ id: 'b', tags: [tag], createdAt: '2026-01-01T00:05:00Z' });
-    expect(deriveRunState(queued, { runs: [leader, queued], health: noWorker }).status).toBe(
+    expect(deriveRunState(queued, { runs: [leader, queued], health: stalled }).status).toBe(
       'queued',
     );
   });
@@ -154,14 +165,17 @@ describe('deriveRunState', () => {
   it('an event wait takes precedence over no-worker (a signal needs no worker)', () => {
     const s = deriveRunState(run({ waiting: { on: 'signal', name: 'go' } }), {
       runs: [],
-      health: noWorker,
+      health: stalled,
     });
     expect(s.status).toBe('awaiting');
   });
 
-  it('flags a pending run with no worker for its workflow as no-worker; with one it stays pending', () => {
-    expect(deriveRunState(run({ status: 'pending' }), { runs: [], health: noWorker }).status).toBe(
+  it('flags a pending run whose queue is stalled as no-worker; idle or worked, it stays pending', () => {
+    expect(deriveRunState(run({ status: 'pending' }), { runs: [], health: stalled }).status).toBe(
       'no-worker',
+    );
+    expect(deriveRunState(run({ status: 'pending' }), { runs: [], health: idle }).status).toBe(
+      'pending',
     );
     expect(
       deriveRunState(run({ status: 'pending' }), { runs: [], health: withWorker }).status,
@@ -176,28 +190,33 @@ describe('deriveRunState', () => {
 
   // The detail view passes `timeline` — it must AGREE with the list row for the same run.
   describe('with a timeline (detail view)', () => {
-    it('a settled step with nothing pending + no workflow worker reads no-worker (matches the list — the run needs its workflow worker to advance)', () => {
+    it('a settled step, nothing pending, stalled workflow queue reads no-worker (matches the list)', () => {
       const timeline = [step({ name: 'render', status: 'completed' })];
-      expect(deriveRunState(run(), { runs: [], health: noWorker, timeline }).status).toBe(
+      expect(deriveRunState(run(), { runs: [], health: stalled, timeline }).status).toBe(
         'no-worker',
       );
     });
 
-    it('a step in flight reads running when its group has a worker, no-worker when it does not', () => {
+    it('a settled step, nothing pending, idle workflow queue reads running — not a false no-worker', () => {
+      const timeline = [step({ name: 'render', status: 'completed' })];
+      expect(deriveRunState(run(), { runs: [], health: idle, timeline }).status).toBe('running');
+    });
+
+    it('a step in flight reads running when its group has a worker, no-worker when its group is stalled', () => {
       const inflight = [step({ name: 'render', status: 'pending', workerGroup: 'render' })];
       expect(
         deriveRunState(run(), { runs: [], health: [health('render', 1)], timeline: inflight })
           .status,
       ).toBe('running');
       expect(
-        deriveRunState(run(), { runs: [], health: [health('render', 0)], timeline: inflight })
+        deriveRunState(run(), { runs: [], health: [health('render', 0, 1)], timeline: inflight })
           .status,
       ).toBe('no-worker');
     });
 
     it('a pending signal checkpoint reads awaiting, naming it the same way the list does', () => {
       const timeline = [step({ kind: 'signal', name: 'wh:r1:0', status: 'pending' })];
-      const s = deriveRunState(run(), { runs: [], health: noWorker, timeline });
+      const s = deriveRunState(run(), { runs: [], health: stalled, timeline });
       expect(s.status).toBe('awaiting');
       expect(s.detail).toBe('webhook wh:r1:0');
     });
