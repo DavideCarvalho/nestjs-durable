@@ -30,7 +30,7 @@ vi.mock('bullmq', () => ({
   }),
   Worker: vi.fn((name: string) => {
     captured.workerNames.push(name);
-    return { concurrency: 1, close: vi.fn().mockResolvedValue(undefined) };
+    return { concurrency: 1, close: vi.fn().mockResolvedValue(undefined), on: vi.fn() };
   }),
 }));
 

@@ -213,6 +213,11 @@ export function unavailableRunGateway(): RunGateway {
     retryWithInput(_runId: string, _input: unknown): Promise<{ runId: string } | null> {
       return tenantGatewayUnavailable<{ runId: string } | null>('retryWithInput');
     },
+    redispatchPending(_runId: string): Promise<(RunResult & { redispatched: number }) | null> {
+      return tenantGatewayUnavailable<(RunResult & { redispatched: number }) | null>(
+        'redispatchPending',
+      );
+    },
     subscribe(_runId: string, _onEvent: (event: EngineEvent) => void): () => void {
       throw new Error(
         'RunGateway.subscribe() is not available — pass `transport` to use RunGateway.',

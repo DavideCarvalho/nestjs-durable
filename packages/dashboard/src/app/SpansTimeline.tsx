@@ -2,7 +2,7 @@ import { useQueries, useQuery } from '@tanstack/react-query';
 import type React from 'react';
 import { useMemo, useState } from 'react';
 import type { RunDetail, StepCheckpoint, WorkflowRun } from '../client/durable-client';
-import { durableClient } from '../client/durable-client';
+import { durableClient, isStalePending } from '../client/durable-client';
 import { groupParallelSpans } from '../client/group-parallel-spans';
 import { groupSubProcesses } from '../client/group-subprocesses';
 import { childRunIdOf } from './child-link';
@@ -60,6 +60,15 @@ function fmtDur(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(2)}s`;
   return `${(ms / 60_000).toFixed(2)}m`;
+}
+
+/** Minutes since a remote step was dispatched (`enqueuedAt`, falling back to `startedAt`) — the
+ *  "Nm ago" a stale-pending warning reports. */
+function minutesSinceDispatch(step: StepCheckpoint): number {
+  const dispatchedAt = step.enqueuedAt
+    ? new Date(step.enqueuedAt).getTime()
+    : new Date(step.startedAt).getTime();
+  return Math.round((Date.now() - dispatchedAt) / 60_000);
 }
 
 type SubStatus = 'ok' | 'failed' | 'skipped';
@@ -132,6 +141,9 @@ function StepRow({
   const isExpanded = isChild && childRunId !== undefined && expanded.has(childRunId);
   const hasSubs = subRows.length > 0 && !isChild;
   const subsCollapsed = collapsedSubs.has(step.seq);
+  // Likely a lost dispatch (crashed worker / dropped job) — reconcile-wake can't recover a `pending`
+  // step, so flag it for a manual re-dispatch.
+  const stale = isStalePending(step, Date.now());
   return (
     <div>
       <button
@@ -227,6 +239,15 @@ function StepRow({
           </span>
         </span>
       </button>
+      {stale && (
+        <div
+          className="mono ml-[18px] mb-1 flex items-center gap-1 text-[10px] s-stale"
+          title="Reconcile-wake can't recover a stuck `pending` step — re-dispatch it from the run actions above"
+        >
+          <span aria-hidden>⚠</span>
+          awaiting worker result — dispatched {minutesSinceDispatch(step)}m ago (possibly lost)
+        </div>
+      )}
       {subRows.length > 0 && !subsCollapsed && (
         <div className="ml-[18px] mt-0.5 mb-1 space-y-0.5 border-l border-[var(--line-soft)] pl-2">
           {subRows.map((sub) => (

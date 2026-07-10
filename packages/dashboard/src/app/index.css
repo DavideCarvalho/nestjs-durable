@@ -104,6 +104,12 @@ body {
 .s-queued {
   color: #a78bfa;
 }
+/* Stale pending step: a remote step dispatched and still awaiting its worker result well past
+   STALE_PENDING_MS — likely a lost dispatch (crashed worker / dropped job) that needs a manual
+   re-dispatch. Same warm orange as `s-no-worker` (both read "act on this"). */
+.s-stale {
+  color: #fb923c;
+}
 
 .dot {
   width: 7px;

@@ -116,6 +116,13 @@ export class ProxyRunGateway implements RunGateway {
     return this.request<{ runId: string } | null>({ kind: 'retryWithInput', runId, input });
   }
 
+  redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) | null> {
+    return this.request<(RunResult & { redispatched: number }) | null>({
+      kind: 'redispatch',
+      runId,
+    });
+  }
+
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void {
     const unsubscribe = this.transport.onTenantEvent?.(this.tenant, (evt) => {
       if (evt.event.runId === runId) onEvent(evt.event);

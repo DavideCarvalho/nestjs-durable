@@ -25,7 +25,7 @@ import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
 import { WorkflowGraph } from './WorkflowGraph';
-import { PlayIcon, RetryIcon, XIcon } from './icons';
+import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
 
 /** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
  *  flowing into the next), in currentColor so it inherits the emerald accent. Replaces the bare `◆`. */
@@ -841,6 +841,12 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     onSuccess: invalidate,
   });
   const cont = useMutation({ mutationFn: () => durableClient.continue(id), onSuccess: invalidate });
+  // Manual recovery for a lost step dispatch (crashed worker / dropped job): re-dispatch every
+  // remote step stuck `pending`. Reconcile-wake can't recover this on its own.
+  const redispatch = useMutation({
+    mutationFn: () => durableClient.redispatch(id),
+    onSuccess: invalidate,
+  });
   // Fix-and-replay: edit the input as JSON, then re-run as a fresh linked run.
   const fixReplay = useMutation({
     mutationFn: (input: unknown) => durableClient.retryWithInput(id, input),
@@ -950,6 +956,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       : undefined;
   const canRetry = run.status === 'failed' || run.status === 'suspended';
   const canCancel = run.status === 'running' || run.status === 'suspended';
+  // A suspended/running run may have a step in flight — the only shape a lost dispatch can hang on.
+  const canRedispatch = run.status === 'suspended' || run.status === 'running';
   // Paused at a breakpoint = a pending `signal` checkpoint named `breakpoint:*` (see ctx.breakpoint).
   const atBreakpoint = body.some(
     (s) => s.status === 'pending' && s.kind === 'signal' && s.name.startsWith('breakpoint'),
@@ -1079,6 +1087,18 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             <RetryIcon width={12} height={12} />
             Retry
           </button>
+          {canRedispatch && (
+            <button
+              type="button"
+              disabled={redispatch.isPending}
+              onClick={() => redispatch.mutate()}
+              title="Re-dispatch stuck `pending` remote steps — recovery for a lost step dispatch (crashed worker or dropped job)"
+              className="flex items-center gap-1.5 rounded-md border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-sky-300 transition-colors enabled:hover:bg-sky-500/20 disabled:opacity-30"
+            >
+              <BoltIcon width={12} height={12} />
+              Re-dispatch
+            </button>
+          )}
           {(run.status === 'dead' || run.status === 'failed') && (
             <button
               type="button"

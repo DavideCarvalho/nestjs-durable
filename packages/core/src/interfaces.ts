@@ -518,7 +518,8 @@ export type RunRequestKind =
   | { kind: 'cancel'; runId: string; opts?: { compensate?: boolean } }
   | { kind: 'retry'; runId: string }
   | { kind: 'continue'; runId: string }
-  | { kind: 'retryWithInput'; runId: string; input: unknown };
+  | { kind: 'retryWithInput'; runId: string; input: unknown }
+  | { kind: 'redispatch'; runId: string };
 
 /** The control plane's answer to a {@link RunRequest}, correlated by `requestId`. */
 export interface RunReply {

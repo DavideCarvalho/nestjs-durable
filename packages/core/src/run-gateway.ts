@@ -53,6 +53,10 @@ export interface RunGateway {
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null>;
   retry(runId: string): Promise<RunResult | null>;
   continue(runId: string): Promise<RunResult | null>;
+  /** Re-dispatch every remote step of a run stuck `pending` — the operator recovery for a LOST step
+   *  dispatch (crashed worker / dropped job) that no automatic path re-drives. Returns the run's status
+   *  plus how many steps were re-dispatched, or null if the run is unknown. */
+  redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) | null>;
   retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null>;
   /** Live lifecycle events for one run; returns an unsubscribe fn. Framework-agnostic (no rxjs). */
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
