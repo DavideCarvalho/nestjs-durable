@@ -1,3 +1,4 @@
+export * from './attributes-of';
 export * from './context-accessor';
 export * from './decorators';
 export { DurableStartClient } from './durable-start-client';
