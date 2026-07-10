@@ -1,3 +1,4 @@
+import { getTableName } from 'drizzle-orm';
 import { integer, primaryKey, real, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 
 // SQLite / libSQL schema for the durable tables. Timestamps and `wakeAt` are epoch-ms integers
@@ -91,3 +92,21 @@ export const durableSchema = {
   signalWaiters,
   bufferedSignals,
 };
+
+/**
+ * Tables this store creates and manages (you run the migrations — see the package README — but
+ * these are the fixed set `durableSchema` declares). Feed to your ORM's migration differ
+ * exclude/skipTables so it never tries to drop them.
+ *
+ * ```ts
+ * // MikroORM-flavoured example (Drizzle Kit has no built-in equivalent option); adapt to whichever
+ * // migration tool generates your diffs.
+ * const skipTables = new Set(durableManagedTables());
+ * ```
+ *
+ * Derived from {@link durableSchema} via drizzle-orm's own `getTableName` — one list, so a
+ * consumer's denylist can never drift from the table names declared above.
+ */
+export function durableManagedTables(): string[] {
+  return Object.values(durableSchema).map((table) => getTableName(table));
+}

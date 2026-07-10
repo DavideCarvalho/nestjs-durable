@@ -92,6 +92,57 @@ describe('StoreRunGateway', () => {
     expect(byId.get('r-done')?.waiting).toBeUndefined(); // completed → not parked on anything
   });
 
+  it('stamps `waiting` as `breakpoint` for a run parked on `ctx.breakpoint` (not a raw-token signal)', async () => {
+    const { engine, gateway } = setup();
+    engine.register('paused', '1', async (ctx: WorkflowCtx) => {
+      await ctx.breakpoint('review');
+      return 'done';
+    });
+    await engine.start('paused', {}, 'r-bp');
+    await engine.waitForRun('r-bp');
+
+    const byId = new Map((await gateway.listRuns({})).map((r) => [r.id, r]));
+    expect(byId.get('r-bp')?.waiting).toEqual({ on: 'breakpoint', name: 'breakpoint' });
+  });
+
+  describe('waitingFor', () => {
+    it('bulk-resolves what each requested run is parked on — breakpoint / signal / webhook — and omits a running run', async () => {
+      const { engine, gateway } = setup();
+      engine.register('bp', '1', async (ctx: WorkflowCtx) => {
+        await ctx.breakpoint();
+        return 'done';
+      });
+      engine.register('sig', '1', async (ctx: WorkflowCtx) => ctx.waitForSignal('approve'));
+      engine.register(
+        'wh',
+        '1',
+        async (ctx: WorkflowCtx) => (await ctx.webhook().wait()) ?? 'done',
+      );
+      engine.register('quick', '1', async (_ctx: WorkflowCtx) => 'ok');
+
+      await engine.start('bp', {}, 'r-bp');
+      await engine.start('sig', {}, 'r-sig');
+      await engine.start('wh', {}, 'r-wh');
+      await engine.start('quick', {}, 'r-done');
+      await engine.waitForRun('r-bp');
+      await engine.waitForRun('r-sig');
+      await engine.waitForRun('r-wh');
+      await engine.waitForRun('r-done'); // completed — not suspended, so absent from the result
+
+      const result = await gateway.waitingFor(['r-bp', 'r-sig', 'r-wh', 'r-done', 'unknown-id']);
+      expect(result['r-bp']).toEqual({ on: 'breakpoint', name: 'breakpoint' });
+      expect(result['r-sig']).toEqual({ on: 'signal', name: 'approve' });
+      expect(result['r-wh']?.on).toBe('webhook');
+      expect(result['r-done']).toBeUndefined(); // completed, not suspended
+      expect(result['unknown-id']).toBeUndefined();
+    });
+
+    it('is empty for an empty id list (no store round-trip needed)', async () => {
+      const { gateway } = setup();
+      expect(await gateway.waitingFor([])).toEqual({});
+    });
+  });
+
   it('retries a failed run and can cancel a suspended one', async () => {
     const { engine, gateway } = setup();
     let fail = true;

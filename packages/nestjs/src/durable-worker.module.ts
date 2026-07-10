@@ -14,6 +14,7 @@ import {
   type RunListItem,
   type RunQuery,
   type RunResult,
+  type RunWaiting,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
@@ -197,6 +198,9 @@ export function unavailableRunGateway(): RunGateway {
     },
     listRuns(_query: RunQuery): Promise<RunListItem[]> {
       return tenantGatewayUnavailable<RunListItem[]>('listRuns');
+    },
+    waitingFor(_runIds: string[]): Promise<Record<string, RunWaiting>> {
+      return tenantGatewayUnavailable<Record<string, RunWaiting>>('waitingFor');
     },
     workerHealth(): Promise<GroupHealth[]> {
       return tenantGatewayUnavailable<GroupHealth[]>('workerHealth');

@@ -192,6 +192,10 @@ export interface DurableRetentionOptions {
  *
  * `forRoot` throws when neither `store` nor `connection` is set, and when `store` is set without a
  * `transport`.
+ *
+ * Set {@link DurableModuleOptions.topology} to name the role explicitly instead of relying on this
+ * inference — it additionally VALIDATES the axes above (`namespace` vs `partition`) that this prose
+ * is otherwise the only source of truth for. Omitting it changes nothing.
  */
 export interface DurableModuleOptions {
   /** State store — set this to play the **operator** role (see the interface doc for the full role
@@ -381,6 +385,42 @@ export interface DurableModuleOptions {
   /** Timeout for a thin worker's `RunGateway` round-trip over `transport` before it rejects. Defaults
    *  to 10_000ms inside `ProxyRunGateway`. Ignored for an operator (bound to `StoreRunGateway`). */
   runGatewayTimeoutMs?: number;
+  /**
+   * An explicit preset that NAMES the deployment role instead of leaving it to `store`/`connection`
+   * inference, and VALIDATES the axes that are otherwise only prose (see the interface doc's role
+   * matrix, and {@link namespace} vs {@link partition}). Omit to keep the existing inference —
+   * `topology` is entirely additive and changes nothing when unset.
+   *
+   * **`namespace` vs `partition` — the two axes this preset locks down:**
+   * - `namespace` is the OPERATOR's poll-scoping axis: which runs a control-plane instance
+   *   drives/recovers/resumes (`runPending`/`recoverIncomplete`/`resumeDueTimers`/`sweepTimeouts`).
+   *   Unset makes the instance see (drive) EVERY namespace.
+   *   `{ role: 'control-plane' }` is the only preset that allows it.
+   * - `partition` is the WORKER's queue-routing suffix: which queue a thin/co-located worker's
+   *   consumer subscribes to (`<name>@<partition>`), matching the queue an operator's convention
+   *   dispatch routes a run's `namespace` to. `{ role: 'tenant' }` sets this FOR you from `tenant` —
+   *   you never set `partition` directly under `topology`.
+   *
+   * ```ts
+   * // Control plane: owns the store, dispatches over the transport, prunes old runs.
+   * DurableModule.forRoot({
+   *   topology: { role: 'control-plane' },
+   *   store,
+   *   transport,
+   *   retention: { policies: [{ statuses: ['completed', 'cancelled'], maxAge: '14d' }] },
+   * });
+   *
+   * // Tenant: store-less worker scoped to its own partition — `tenant` maps to `partition` for you.
+   * DurableModule.forRoot({
+   *   topology: { role: 'tenant', tenant: 'acme-corp' },
+   *   connection: process.env.REDIS_URL,
+   * });
+   * ```
+   *
+   * Validated at `forRoot`/`forRootAsync` resolution time — see {@link DurableModule} for the exact
+   * error messages, which double as the axis primer above.
+   */
+  topology?: { role: 'control-plane' } | { role: 'tenant'; tenant: string };
 }
 
 export interface DurableModuleAsyncOptions {
@@ -402,6 +442,86 @@ function assertValidRole(options: DurableModuleOptions): void {
   if (hasStore && options.transport === undefined) {
     throw new Error('an operator (`store`) needs a `transport`');
   }
+}
+
+/**
+ * Validates the {@link DurableModuleOptions.topology} preset (a no-op when it's unset — existing
+ * inference is untouched). Each thrown message NAMES the role, the offending option, and a one-line
+ * explanation of the axis it protects — these messages are the feature: they teach `namespace` (the
+ * operator's poll-scoping axis) apart from `partition`/`tenant` (the worker's queue-routing axis),
+ * which today are only reconciled in consumer-app comments.
+ */
+function assertValidTopology(options: DurableModuleOptions): void {
+  const topology = options.topology;
+  if (topology === undefined) return;
+
+  if (topology.role === 'control-plane') {
+    if (
+      options.store === undefined ||
+      (options.transport === undefined && options.transports === undefined)
+    ) {
+      throw new Error(
+        "topology: { role: 'control-plane' } needs `store` AND (`transport` or `transports`).\n" +
+          'A control-plane node is the durable operator: it owns the state store and dispatches ' +
+          'runs to workers over a transport — without both, there is nothing for it to operate.',
+      );
+    }
+    if (options.partition !== undefined) {
+      throw new Error(
+        "topology: { role: 'control-plane' } forbids `partition`.\n" +
+          'partition is the WORKER queue-routing suffix — on a control-plane node, runs are ' +
+          "dispatched to tenant partitions via each run's namespace, not via this option. Set " +
+          "`partition` (or `topology: { role: 'tenant', tenant }`) on the WORKER node instead.",
+      );
+    }
+    if ('tenant' in topology) {
+      throw new Error(
+        "topology: { role: 'control-plane' } forbids a `tenant` field.\n" +
+          "tenant names a WORKER's isolation partition — a control-plane node serves every " +
+          "tenant's runs (via their namespace), it isn't scoped to one itself.",
+      );
+    }
+    return;
+  }
+
+  if (options.connection === undefined) {
+    throw new Error(
+      `topology: { role: 'tenant', tenant: '${topology.tenant}' } needs \`connection\`.\nA tenant is a store-less worker: it connects to the broker directly to pull its own partition of tasks instead of polling a store it does not have.`,
+    );
+  }
+  if (options.store !== undefined) {
+    throw new Error(
+      "topology: { role: 'tenant' } forbids `store`.\n" +
+        'A tenant is store-less BY DEFINITION — a `store` present means you actually wanted ' +
+        "`topology: { role: 'control-plane' }` (the store-owning role).",
+    );
+  }
+  if (options.namespace !== undefined) {
+    throw new Error(
+      "topology: { role: 'tenant' } forbids `namespace`.\n" +
+        "namespace is the OPERATOR's poll-scoping axis (which runs a control-plane instance " +
+        'drives/recovers/resumes) — a tenant worker has no poll loop for it to scope. Use this ' +
+        "preset's `tenant` field for the worker's own routing axis instead.",
+    );
+  }
+  if (options.partition !== undefined && options.partition !== topology.tenant) {
+    throw new Error(
+      `topology: { role: 'tenant', tenant: '${topology.tenant}' } conflicts with \`partition: '${options.partition}'\`.\ntenant maps 1:1 onto partition (the worker queue-routing suffix) — set only \`tenant\`, or set \`partition\` to the same value.`,
+    );
+  }
+}
+
+/**
+ * Applies the {@link DurableModuleOptions.topology} preset's `tenant` → `partition` mapping —
+ * validated already by {@link assertValidTopology} (an equal, explicit `partition` is a no-op; a
+ * mismatched one throws before this runs). A no-op for `{ role: 'control-plane' }` and for an unset
+ * `topology` (existing behavior, zero change).
+ */
+function resolveTopology(options: DurableModuleOptions): DurableModuleOptions {
+  const topology = options.topology;
+  if (topology === undefined || topology.role !== 'tenant') return options;
+  if (options.partition !== undefined) return options;
+  return { ...options, partition: topology.tenant };
 }
 
 /**
@@ -466,8 +586,11 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
 @Module({})
 export class DurableModule {
   static forRoot(options: DurableModuleOptions): DynamicModule {
-    assertValidRole(options);
-    return DurableModule.build({ provide: DURABLE_OPTIONS_CANONICAL, useValue: options });
+    DurableModule.assertValid(options);
+    return DurableModule.build({
+      provide: DURABLE_OPTIONS_CANONICAL,
+      useValue: resolveTopology(options),
+    });
   }
 
   static forRootAsync(options: DurableModuleAsyncOptions): DynamicModule {
@@ -475,11 +598,26 @@ export class DurableModule {
       provide: DURABLE_OPTIONS_CANONICAL,
       useFactory: async (...args: Parameters<DurableModuleAsyncOptions['useFactory']>) => {
         const resolved = await options.useFactory(...args);
-        assertValidRole(resolved);
-        return resolved;
+        DurableModule.assertValid(resolved);
+        return resolveTopology(resolved);
       },
       inject: options.inject ?? [],
     });
+  }
+
+  /**
+   * Validates role/axis constraints, in resolution order. When {@link DurableModuleOptions.topology}
+   * is set, it OWNS validation — {@link assertValidTopology}'s own store/transport/connection checks
+   * are strictly stronger than {@link assertValidRole}'s, so the topology-specific, axis-teaching
+   * message is what a `topology`-opted-in consumer sees (not the older generic one). Falls back to
+   * {@link assertValidRole} unchanged when `topology` is absent — zero behavior change.
+   */
+  private static assertValid(options: DurableModuleOptions): void {
+    if (options.topology !== undefined) {
+      assertValidTopology(options);
+      return;
+    }
+    assertValidRole(options);
   }
 
   private static build(optionsProvider: Provider): DynamicModule {

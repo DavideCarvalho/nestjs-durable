@@ -3,29 +3,25 @@ import {
   type EngineEvent,
   type GroupHealth,
   type MetricsCollector,
+  type RunDetail,
   type RunGateway,
   type RunListItem,
   type RunQuery,
   type RunResult,
   STATE_STORE_CANONICAL,
   type StateStore,
-  type StepCheckpoint,
   type UpdateResult,
   WorkflowEngine,
-  type WorkflowRun,
   collectMetrics,
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { Observable } from 'rxjs';
 import { RUN_GATEWAY } from './tokens.js';
 
-export interface RunDetail {
-  run: WorkflowRun;
-  /** Steps in execution order — the end-to-end timeline (local + remote). */
-  timeline: StepCheckpoint[];
-  /** Ids of runs this run spawned (ctx.child / ctx.startChild) — the parent→children tree. */
-  children: string[];
-}
+// Single source of truth: core owns `RunDetail` (`run-gateway.ts`) — re-exported here (not
+// re-declared) so this package's existing public API (`import type { RunDetail } from
+// '@dudousxd/nestjs-durable-dashboard'`) keeps working unchanged.
+export type { RunDetail };
 
 /**
  * Read-model and actions backing the control-plane UI. Run-facing ops (list/detail/retry/cancel/

@@ -15,6 +15,7 @@ import type {
   ChildCallOptions,
   DurableWebhook,
   SearchAttributes,
+  SearchAttributesSchema,
   StateStore,
   StepCheckpoint,
   StepDef,
@@ -36,6 +37,18 @@ import { type WorkflowRef, workflowName } from './workflow-ref';
 /** Normalize the `ctx.child`/`ctx.startChild` 3rd arg: a bare string is shorthand for `{ childId }`. */
 function normalizeChildOptions(options?: string | ChildCallOptions): ChildCallOptions {
   return typeof options === 'string' ? { childId: options } : (options ?? {});
+}
+
+/** Render a Standard Schema issue `path` (a mix of raw keys and `{ key }` segments) as a dotted
+ *  string, for a `searchAttributes` validation error — `['amount']` → `'amount'`, `[]`/`undefined` →
+ *  `'(root)'` (the merged object itself failed, not one of its keys). */
+function formatIssuePath(
+  path: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> | undefined,
+): string {
+  if (!path || path.length === 0) return '(root)';
+  return path
+    .map((segment) => String(typeof segment === 'object' ? segment.key : segment))
+    .join('.');
 }
 
 /**
@@ -176,6 +189,7 @@ export function createWorkflowCtx(
   runId: string,
   compensations: Compensation[],
   workflow = '',
+  searchAttributesSchema?: SearchAttributesSchema,
 ): InternalWorkflowCtx {
   const { store, replay } = host;
   const pos = new Position();
@@ -760,7 +774,38 @@ export function createWorkflowCtx(
       if (existing.name !== 'searchAttributes') {
         throw new NonDeterminismError(runId, current, 'searchAttributes', existing.name);
       }
+      // Replayed: the write already happened on a prior turn — skip it, and (deliberately) skip
+      // re-validating too. Validation only ever needs to run once, at the position it's recorded;
+      // re-running it on replay would be redundant at best and, for a schema whose rules change
+      // between deploys, a source of a replay throwing on history a live run already accepted.
       return;
+    }
+    if (searchAttributesSchema) {
+      // The schema describes the whole run's search-attribute shape (optional keys included), so
+      // validate the MERGED result — this call's `attrs` shallow-merged onto what's already on the
+      // run — not `attrs` alone. Mirrors the merge `host.upsertSearchAttributes` itself performs;
+      // read here is best-effort (not transactional with the host's own read+write), same as that
+      // merge already is.
+      const run = await store.getRun(runId);
+      const merged = { ...(run?.searchAttributes ?? {}), ...attrs };
+      const result = searchAttributesSchema['~standard'].validate(merged);
+      if (result instanceof Promise) {
+        throw new Error(
+          `workflow "${workflow}": ctx.upsertSearchAttributes schema validation must be synchronous (the searchAttributes schema's \`~standard.validate\` returned a Promise) — replay-determinism requires a sync validator; drop any async refinement from the schema passed to @Workflow({ searchAttributes }).`,
+        );
+      }
+      if (result.issues) {
+        const offendingKeys = [
+          ...new Set(result.issues.map((issue) => formatIssuePath(issue.path))),
+        ];
+        const details = result.issues
+          .map((issue) => `${formatIssuePath(issue.path)}: ${issue.message}`)
+          .join('; ');
+        throw new Error(
+          `workflow "${workflow}": ctx.upsertSearchAttributes rejected by its searchAttributes schema — ` +
+            `offending key(s) ${offendingKeys.join(', ')} — ${details}`,
+        );
+      }
     }
     await host.upsertSearchAttributes(runId, attrs);
     await writeCheckpoint(

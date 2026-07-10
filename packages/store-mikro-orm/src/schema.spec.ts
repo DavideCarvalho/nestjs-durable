@@ -1,6 +1,7 @@
 import type { MikroORM } from '@mikro-orm/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ensureMikroOrmDurableSchema } from './schema';
+import { ENTITIES } from './entities';
+import { durableManagedTables, ensureMikroOrmDurableSchema } from './schema';
 
 /** Minimal column shape the fingerprint reads off `meta.props`. */
 interface FakeProp {
@@ -369,5 +370,22 @@ describe('ensureMikroOrmDurableSchema fingerprint gate', () => {
     );
     expect(secondHeal).toHaveBeenCalledTimes(1);
     expect(marker.get('durable')?.fingerprint).not.toBe(firstFingerprint);
+  });
+});
+
+describe('durableManagedTables', () => {
+  it('returns the five durable table names', () => {
+    expect(durableManagedTables().sort()).toEqual([
+      'durable_buffered_signals',
+      'durable_run_attributes',
+      'durable_signal_waiters',
+      'durable_step_checkpoints',
+      'durable_workflow_runs',
+    ]);
+  });
+
+  it('stays in sync with the registered entity schemas', () => {
+    const entityTableNames = ENTITIES.map((entity) => entity.meta.tableName).sort();
+    expect(durableManagedTables().sort()).toEqual(entityTableNames);
   });
 });

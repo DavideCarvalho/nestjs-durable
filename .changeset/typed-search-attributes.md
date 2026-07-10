@@ -1,0 +1,6 @@
+---
+'@dudousxd/nestjs-durable-core': minor
+'@dudousxd/nestjs-durable': minor
+---
+
+Typed, validated search attributes. `@Workflow({ searchAttributes })` takes a **Standard Schema** (https://standardschema.dev — zod 3.24+, valibot, arktype, …) whose inferred output must be search-attribute-shaped (flat `string`/`number`/`boolean` values only — enforced at the declaration site, a nested-object schema is a compile error). When declared, `ctx.upsertSearchAttributes` validates the MERGED result (existing attributes shallow-merged with the patch) before writing — an invalid merge throws, naming the workflow, the offending key(s), and the schema's issues. Validation runs once, at the same first-run-only position as the write itself, so it's skipped on replay like the write. `WorkflowCtx` is now generic (`WorkflowCtx<A extends SearchAttributes = SearchAttributes>`, defaulting to the untyped shape, fully backward compatible) — pair it with the new `InferSearchAttributes<typeof mySchema>` helper to type a workflow's `run(ctx: WorkflowCtx<...>, input)`. Core also exports a new `readSearchAttributes(schema, run)` helper for the read side: safe-parse semantics — an invalid or missing `run.searchAttributes` returns `{}` (typed) instead of throwing, since older runs may predate the schema. No schema declared ⇒ unvalidated behavior is unchanged.

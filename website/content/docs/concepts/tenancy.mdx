@@ -102,6 +102,43 @@ resumes runs of *every* namespace (the poll filters no-op) and leaves the transp
 prefix — "seeing everyone" is the absence of a namespace, not a wildcard value
 (`packages/core/src/engine.ts:219`).
 
+## The `topology` preset
+
+`namespace` and `partition` are two axes that look alike (both take a string, both end up in a queue
+name) but belong to opposite roles — `namespace` is what the **operator** polls/drives/recovers;
+`partition` is what a **worker**'s consumer subscribes to. Nothing in the types stopped you from
+setting both on the same instance, or from setting `partition` on an operator where it does nothing.
+`DurableModuleOptions.topology` (`packages/nestjs/src/durable.module.ts`) makes the role an explicit,
+validated choice instead of an inferred one:
+
+```ts
+// Control plane: owns the store, dispatches over the transport.
+DurableModule.forRoot({
+  topology: { role: 'control-plane' },
+  store,
+  transport,
+});
+
+// Tenant: store-less worker scoped to its own partition — `tenant` maps onto `partition` for you.
+DurableModule.forRoot({
+  topology: { role: 'tenant', tenant: 'acme-corp' },
+  connection: process.env.REDIS_URL,
+});
+```
+
+Validated at `forRoot`/`forRootAsync` resolution time, each check named after the axis it protects:
+
+| `topology` | Requires | Forbids | Notes |
+| --- | --- | --- | --- |
+| `{ role: 'control-plane' }` | `store` AND (`transport` or `transports`) | `partition`; a `tenant` field | `namespace` and `connection` stay allowed — an operator may still poll-scope itself or run a co-located worker. |
+| `{ role: 'tenant', tenant }` | `connection` | `store`; `namespace` | `tenant` is mapped onto `partition` internally — set `partition` too only if it equals `tenant` (a no-op); a mismatch throws. |
+
+`topology` is entirely additive: omit it and `store`/`connection` inference behaves exactly as
+before. It exists for the case a plain inferred config doesn't catch — a consumer app that sets both
+`namespace` (meant for the operator) and `partition` (meant for a worker) on one instance because the
+two options read as near-synonyms; `topology` forces you to pick one role and rejects the other role's
+axis outright, with an error message that explains why.
+
 ## Child runs inherit the parent's namespace
 
 A child run (`ctx.child`, `ctx.gather_children`, or a remote workflow's `startChild`) is stamped with

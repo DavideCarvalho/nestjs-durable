@@ -1,6 +1,7 @@
 import {
   DURABLE_STEP_CONFIG,
   DURABLE_STEP_NAME,
+  type SearchAttributesSchema,
   type SingletonConfig,
   type StepConfig,
   type StepError,
@@ -27,6 +28,8 @@ export interface WorkflowMeta {
   inputSchema?: (new (...args: any[]) => object) | undefined;
   /** Custom input validator (throws on invalid). See `WorkflowOptions`. */
   validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+  /** Typed/validated `searchAttributes` shape. See `WorkflowOptions`. */
+  searchAttributes?: SearchAttributesSchema | undefined;
   /** Event names that start a fresh run of this workflow. See `WorkflowOptions`. */
   onEvent?: string[] | undefined;
   /** Debounce `onEvent` triggers — fire once it's quiet for this long. See `WorkflowOptions`. */
@@ -79,6 +82,32 @@ export interface WorkflowOptions {
    */
   validateInput?: (input: unknown) => void | Promise<void>;
   /**
+   * Validate this workflow's {@link WorkflowCtx.upsertSearchAttributes} writes against a **Standard
+   * Schema** (https://standardschema.dev — zod 3.24+, valibot, arktype, …). `ctx.upsertSearchAttributes`
+   * validates the MERGED result (existing attributes shallow-merged with the patch) on every call —
+   * an invalid merge throws, naming this workflow, the offending key(s), and the schema's issues. The
+   * schema's inferred output must be search-attribute-shaped (flat `string`/`number`/`boolean` values
+   * only) — a schema whose output has a nested object/array is a compile-time error here. Omit for
+   * the prior unvalidated behavior.
+   *
+   * ```ts
+   * import { z } from 'zod';
+   *
+   * const orderAttrs = z.object({
+   *   tier: z.enum(['free', 'pro']),
+   *   amount: z.number(),
+   * });
+   *
+   * @Workflow({ name: 'checkout', searchAttributes: orderAttrs })
+   * class CheckoutWorkflow {
+   *   async run(ctx: WorkflowCtx<InferSearchAttributes<typeof orderAttrs>>, input: CheckoutInput) {
+   *     await ctx.upsertSearchAttributes({ tier: input.tier, amount: input.total });
+   *   }
+   * }
+   * ```
+   */
+  searchAttributes?: SearchAttributesSchema;
+  /**
    * Start a fresh run of this workflow whenever any of these events is published via
    * `publishEvent(name, payload)` — the payload becomes the run's input. e.g.
    * `onEvent: ['user.registered', 'user.invited']`. The same subscription can also be declared with
@@ -113,6 +142,7 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       executionTimeout: options.executionTimeout,
       inputSchema: options.inputSchema,
       validateInput: options.validateInput,
+      searchAttributes: options.searchAttributes,
       onEvent: options.onEvent,
       debounce: options.debounce,
       batch: options.batch,

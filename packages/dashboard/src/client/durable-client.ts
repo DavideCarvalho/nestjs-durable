@@ -1,13 +1,22 @@
-export type RunStatus =
-  | 'pending'
-  | 'running'
-  | 'suspended'
-  | 'completed'
-  | 'failed'
-  | 'cancelling'
-  | 'cancelled'
-  | 'dead';
-export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
+import type {
+  RunListItem as CoreRunListItem,
+  RunStatus as CoreRunStatus,
+  RunWaiting as CoreRunWaiting,
+  StepCheckpoint as CoreStepCheckpoint,
+  StepEvent as CoreStepEvent,
+  StepKind as CoreStepKind,
+  StepError,
+  WireDates,
+} from '@dudousxd/nestjs-durable-core';
+
+// Type-only imports erase at build time (this is a standalone SPA bundle, never imports core's
+// runtime) — the dashboard package already depends on core server-side, so its client tsconfig
+// resolves these the same way. Wire types below are DERIVED from core via `WireDates` instead of
+// hand-mirrored field by field, so a new core field shows up here automatically instead of silently
+// drifting; each deliberate divergence from core is called out and justified inline where it's made.
+
+export type RunStatus = CoreRunStatus;
+export type StepKind = CoreStepKind;
 
 /** This deployment's durable role — mirrors the server's `DurableTopology` (kept local so the SPA
  *  stays standalone). `tenant` is the isolation partition name, set only when `role` is 'tenant'. */
@@ -16,89 +25,50 @@ export interface DurableTopology {
   tenant?: string;
 }
 
-/** What an event-parked suspended run is waiting on — mirror of the server's `RunWaiting`. The control
- *  plane resolves it from the run's signal waiters so a list row can NAME the wait without the timeline. */
-export interface RunWaiting {
-  on: 'signal' | 'webhook' | 'child';
-  name: string;
-}
+/** What an event-parked suspended run is waiting on. Derived from core: adding a new `on` variant
+ *  there (e.g. `breakpoint`) shows up here with no client-side edit needed. */
+export type RunWaiting = CoreRunWaiting;
 
-export interface WorkflowRun {
-  id: string;
-  workflow: string;
-  workflowVersion: string;
-  status: RunStatus;
-  input?: unknown;
-  output?: unknown;
-  error?: { message: string; code?: string };
-  wakeAt?: number;
-  recoveryAttempts?: number;
-  tags?: string[];
-  searchAttributes?: Record<string, string | number | boolean>;
-  /** The worker-pool partition (tenant) this run belongs to. `'default'` (or absent) on a single-pool
-   *  / control-plane run; a named tenant on a multi-tenant deployment — shown in the UI when set. */
-  namespace?: string;
-  /** Set on runs from `listRuns` (control-plane-enriched): what an event-parked suspended run waits on. */
-  waiting?: RunWaiting;
-  createdAt: string;
-  updatedAt: string;
-}
+/** No `Date` fields and already an exact structural match to core's `StepEvent` — derived directly. */
+export type StepEvent = CoreStepEvent;
 
-export interface StepEvent {
-  at: number;
-  level: 'debug' | 'info' | 'warn' | 'error';
-  message: string;
-  /** Stable run identity for a sub-process; distinct invocations of the same `name` get distinct ids. */
-  subId?: string;
-  /** For a sub-step/sub-process within the step: its name. */
-  name?: string;
-  /** Open, consumer-defined grouping label for a sub-process (e.g. a handler/lane). */
-  group?: string;
-  /** For a sub-step: its terminal outcome. */
-  status?: 'ok' | 'failed' | 'skipped';
-  /** Open, consumer-defined intermediate phase label for a sub-process transition (no `status`). */
-  phase?: string;
-  /** @deprecated owning sub-process **name** for a log line — superseded by `subId`. */
-  process?: string;
-  data?: unknown;
-}
-
-export interface StepCheckpoint {
-  runId: string;
-  seq: number;
-  name: string;
-  kind: StepKind;
+export type StepCheckpoint = Omit<
+  WireDates<CoreStepCheckpoint>,
+  'stepId' | 'enqueuedAt' | 'error'
+> & {
   /**
-   * `pending` = a remote step dispatched and awaiting its worker result (in-flight).
-   * `running` = a local step whose body is executing right now (in-flight).
+   * Kept OPTIONAL here (core's `enqueuedAt` is a required `Date`, always populated) — the two SPA
+   * reads of this field (`SpansTimeline.tsx`, `StepDetailPanel.tsx`) both treat an absent value as
+   * "nothing to show" for a local step's queue-wait, which is the display semantic that matters here,
+   * not core's storage guarantee. Deliberate, load-bearing local divergence.
    */
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  /** What the step was called with (a remote step's `ctx.call` args). */
-  input?: unknown;
-  output?: unknown;
-  error?: { message: string };
-  /** Structured events the step (or its worker) emitted — sub-process outcomes + debug/error logs. */
-  events?: StepEvent[];
-  /**
-   * Shared tag across the N siblings of one `ctx.gather`/`ctx.all` fan-out (e.g. `gather:1` /
-   * `all:1`). The prefix is cosmetic; every sibling of ONE fan shares the same exact string, so the
-   * dashboard groups by exact string to render them as same-level siblings. Absent for non-fan steps.
-   */
-  parallelGroup?: string;
-  attempts: number;
-  workerGroup?: string;
-  wakeAt?: number;
-  /** When the step was dispatched (remote) or began (local). Queue-wait = startedAt − enqueuedAt. */
   enqueuedAt?: string;
-  /** When processing actually began: worker pickup for a remote step, execution start for a local one. */
-  startedAt: string;
-  finishedAt: string;
-}
+  /** Widened from the old ad-hoc `{ message; code? }` to the real `StepError` shape (adds `retryable`/
+   *  `stack`) — every existing read (`step.error.message`) still works; this just stops re-declaring a
+   *  narrower shadow of the server's actual error type. */
+  error?: StepError;
+};
+
+export type WorkflowRun = Omit<WireDates<CoreRunListItem>, 'input' | 'error'> & {
+  /**
+   * Kept OPTIONAL here (core's `input` is a required `unknown`) — several SPA fixtures build a
+   * `WorkflowRun` without ever setting it, and `unknown` can't be enforced-present in any way that
+   * matters to a reader; the SPA never round-trips this value back to the server. Deliberate, load-
+   * bearing local divergence (dropping it would force `input: undefined` onto every construction site).
+   */
+  input?: unknown;
+  /** See {@link StepCheckpoint.error} — same widen-not-narrow convergence. */
+  error?: StepError;
+};
 
 export interface RunDetail {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
-  /** Ids of runs this run spawned (ctx.child / ctx.startChild) — the parent→children tree. */
+  /**
+   * Kept OPTIONAL here (core's `children` is a required, always-populated array) — the SPA's own
+   * preview/test fixtures (`preview.tsx`, `merge-live-events.spec.ts`) construct a `RunDetail` without
+   * it, and every read already guards with `?.`. Deliberate, load-bearing local divergence.
+   */
   children?: string[];
 }
 

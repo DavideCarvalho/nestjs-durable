@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { StandardSchemaV1 } from './standard-schema';
 import type { StepRef } from './step-name-symbol';
 import type { WorkflowClass, WorkflowInputOf, WorkflowOutputOf } from './workflow-ref';
 
@@ -93,8 +94,10 @@ export interface WorkflowRun {
  * store-backed gateway from the run's signal waiters (`listSignalWaiters`, ONE bulk scan), so the
  * dashboard can NAME the wait in a list row without fetching each run's timeline. `on` is derived from
  * the waiter token's prefix (see `classifyWaiterToken`): `wh:<runId>:<seq>` ⇒ `webhook`, `child:<id>`
- * ⇒ `child`, `event:<name>:…` ⇒ `signal` (name decoded), anything else ⇒ `signal` (the token IS the
- * signal name).
+ * ⇒ `child`, `bp:<runId>:<seq>` ⇒ `breakpoint` (a `ctx.breakpoint` DOES register a signal waiter —
+ * same machinery, `engine.continue` resumes it — so it's classified here, not left to fall through to
+ * the generic `signal` case with the raw token as its ugly display name), `event:<name>:…` ⇒ `signal`
+ * (name decoded), anything else ⇒ `signal` (the token IS the signal name).
  *
  * Deliberately EVENT-only (no timer/step): `wakeAt` alone can't tell a real `ctx.sleep` from the
  * reconcile-fallback `wakeAt` an event/step suspend now carries, and the store exposes no cheap bulk
@@ -103,8 +106,13 @@ export interface WorkflowRun {
  * The detail view (which has the timeline) still distinguishes sleep vs in-flight step precisely.
  */
 export interface RunWaiting {
-  on: 'signal' | 'webhook' | 'child';
-  /** The token/name the run is parked on — the signal name, webhook token, or awaited child id. */
+  on: 'signal' | 'webhook' | 'child' | 'breakpoint';
+  /**
+   * The token/name the run is parked on — the signal name, webhook token, or awaited child id. For a
+   * breakpoint this is always the literal `'breakpoint'`: the real label (if any) lives on the pending
+   * `breakpoint`/`breakpoint:<label>` checkpoint, which the detail view's timeline already shows —
+   * naming it here would need an extra per-run checkpoint read, defeating the bulk waiter scan.
+   */
   name: string;
 }
 
@@ -410,6 +418,42 @@ export interface RetentionPolicy {
 /** Typed, queryable per-run data — exact values for `eq`/`ne`, numbers/strings for range ops. */
 export type SearchAttributes = Record<string, string | number | boolean>;
 
+/**
+ * A Standard Schema (https://standardschema.dev — implemented by zod 3.24+, valibot, arktype, …)
+ * whose validated OUTPUT is search-attribute-shaped: flat `string`/`number`/`boolean` values only.
+ * Declared via `@Workflow({ searchAttributes })`, this makes `ctx.upsertSearchAttributes` reject any
+ * write whose merged result doesn't conform. The `Output extends SearchAttributes` bound is enforced
+ * structurally at the declaration site — a schema whose inferred output has a nested object/array
+ * value (e.g. `z.object({ meta: z.object({ ... }) })`) fails to satisfy this type, so it's a
+ * compile-time error to declare it as a `searchAttributes` schema, not a runtime surprise.
+ *
+ * @example
+ * ```ts
+ * import { z } from 'zod';
+ *
+ * const orderAttrs = z.object({
+ *   tier: z.enum(['free', 'pro']),
+ *   amount: z.number(),
+ *   rushOrder: z.boolean().optional(),
+ * });
+ *
+ * @Workflow({ name: 'checkout', searchAttributes: orderAttrs })
+ * class CheckoutWorkflow {
+ *   async run(ctx: WorkflowCtx<InferSearchAttributes<typeof orderAttrs>>, input: CheckoutInput) {
+ *     await ctx.upsertSearchAttributes({ tier: input.tier, amount: input.total });
+ *   }
+ * }
+ * ```
+ */
+export type SearchAttributesSchema<A extends SearchAttributes = SearchAttributes> =
+  StandardSchemaV1<unknown, A>;
+
+/** Infer the validated OUTPUT shape of a {@link SearchAttributesSchema} — the typed attributes a
+ *  workflow declares via `@Workflow({ searchAttributes })`. Feed it straight into `WorkflowCtx<A>`:
+ *  `WorkflowCtx<InferSearchAttributes<typeof mySchema>>`. */
+export type InferSearchAttributes<S extends StandardSchemaV1<unknown, SearchAttributes>> =
+  StandardSchemaV1.InferOutput<S>;
+
 export type AttributeOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte';
 
 /** One predicate over a run's {@link SearchAttributes}; a {@link RunQuery} ANDs them all. */
@@ -519,7 +563,10 @@ export type RunRequestKind =
   | { kind: 'retry'; runId: string }
   | { kind: 'continue'; runId: string }
   | { kind: 'retryWithInput'; runId: string; input: unknown }
-  | { kind: 'redispatch'; runId: string };
+  | { kind: 'redispatch'; runId: string }
+  // Bulk, not runId-bearing (like `listRuns`/`workerHealth`) — the operator answers it in one shot
+  // and filters the result to runs the requester's tenant actually owns (see `RunRequestResponder`).
+  | { kind: 'waitingFor'; runIds: string[] };
 
 /** The control plane's answer to a {@link RunRequest}, correlated by `requestId`. */
 export interface RunReply {
@@ -1139,8 +1186,13 @@ export type UndoOf<H> = H extends (input: infer I, ...rest: never[]) => infer R
 /**
  * The context handed to a workflow function. Every interaction with the outside world goes
  * through it so the engine can checkpoint — the workflow body itself stays deterministic.
+ *
+ * Generic over `A`, the run's {@link SearchAttributes} shape — narrows {@link upsertSearchAttributes}
+ * when a workflow declares a `@Workflow({ searchAttributes })` schema (pass
+ * `WorkflowCtx<InferSearchAttributes<typeof mySchema>>` as the `run` method's ctx type). Defaults to
+ * the untyped `SearchAttributes`, so every existing `WorkflowCtx` usage is unaffected.
  */
-export interface WorkflowCtx {
+export interface WorkflowCtx<A extends SearchAttributes = SearchAttributes> {
   readonly runId: string;
   /**
    * Run a durable step — always dispatched, always engine-scheduled: the ONE step primitive (no
@@ -1376,8 +1428,16 @@ export interface WorkflowCtx {
    * write, not one per turn. Use this instead of injecting the {@link StateStore} to mutate the run
    * you're executing (`@Inject(state-store)` + `store.updateRun(ctx.runId, …)` becomes
    * `ctx.upsertSearchAttributes(…)`).
+   *
+   * When the workflow declares a `@Workflow({ searchAttributes })` schema, the MERGED result (this
+   * run's existing `searchAttributes` shallow-merged with `attrs`) is validated against it before the
+   * write — an invalid merge throws, naming the workflow, the offending key(s), and the schema's
+   * issues. Validation runs once, on the same first-run-only position as the write itself (skipped
+   * entirely on replay, so it's never a source of nondeterminism); it must be synchronous — a schema
+   * whose `validate` returns a `Promise` throws instead of being awaited. No schema declared ⇒
+   * unchanged, unvalidated behavior.
    */
-  upsertSearchAttributes(attrs: SearchAttributes): Promise<void>;
+  upsertSearchAttributes(attrs: Partial<A>): Promise<void>;
   /**
    * Run a checkpointed step **in-process** — the escape hatch from the always-dispatched {@link step}
    * for work that must run inline in the workflow body. Like `step`, its result is a durable checkpoint

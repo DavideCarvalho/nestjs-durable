@@ -5,6 +5,7 @@ import {
   InMemoryStateStore,
   type RunGateway,
   type RunQuery,
+  type RunWaiting,
   WorkflowEngine,
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
@@ -42,6 +43,10 @@ function fakeGateway(overrides: FakeGatewayOverrides): RunGateway {
     async listRuns(query) {
       record('listRuns');
       return overrides.listRuns ? overrides.listRuns(query) : [];
+    },
+    async waitingFor(_runIds): Promise<Record<string, RunWaiting>> {
+      record('waitingFor');
+      return {};
     },
     async workerHealth() {
       record('workerHealth');
