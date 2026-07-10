@@ -23,6 +23,7 @@ export * from './workflow.service';
 export type {
   AttributeFilter,
   EngineEvent,
+  InferSearchAttributes,
   RunDetail,
   RunGateway,
   RunListItem,
@@ -30,9 +31,12 @@ export type {
   RunStatus,
   RunWaiting,
   SearchAttributes,
+  SearchAttributesSchema,
   StepCheckpoint,
+  StepEvent,
   StepLogger,
   WorkflowCtx,
+  WorkflowHandler,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
-export { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+export { readSearchAttributes, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
