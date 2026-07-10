@@ -202,6 +202,106 @@ describe('DurableModule.forRoot — topology preset', () => {
     ).toThrow(/forbids `partition`/);
   });
 
+  it("{ topology: { role: 'control-plane', tenant } } maps tenant onto `namespace` (operator scoped to its own runs)", async () => {
+    const runner = fakeRunRedisWorker();
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          topology: { role: 'control-plane', tenant: 'davi-local' },
+          store,
+          transport,
+          timerPollMs: 0,
+        }),
+      ],
+      providers: [GreetWorkflow],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.fn)
+      .compile();
+    await moduleRef.init();
+
+    // Behavioral: the operator's namespace stamps every run it creates.
+    const engine = moduleRef.get(WorkflowEngine);
+    const { runId } = await engine.start(GreetWorkflow, undefined, 'run-cp-tenant');
+    const run = await store.getRun(runId);
+    expect(run?.namespace).toBe('davi-local');
+
+    await moduleRef.close();
+  });
+
+  it("{ topology: { role: 'control-plane', tenant: undefined } } leaves `namespace` unset (global operator)", async () => {
+    const runner = fakeRunRedisWorker();
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          topology: { role: 'control-plane', tenant: undefined },
+          store,
+          transport,
+          timerPollMs: 0,
+        }),
+      ],
+      providers: [GreetWorkflow],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.fn)
+      .compile();
+    await moduleRef.init();
+
+    // Behavioral: no tenant → runs get the default namespace, exactly as with no topology at all.
+    const engine = moduleRef.get(WorkflowEngine);
+    const { runId } = await engine.start(GreetWorkflow, undefined, 'run-cp-global');
+    const run = await store.getRun(runId);
+    expect(run?.namespace).toBe('default');
+
+    await moduleRef.close();
+  });
+
+  it("{ topology: { role: 'control-plane', tenant } } with a MISMATCHED explicit `namespace` throws the conflict error", () => {
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    expect(() =>
+      DurableModule.forRoot({
+        topology: { role: 'control-plane', tenant: 'davi-local' },
+        store,
+        transport,
+        namespace: 'someone-else',
+      }),
+    ).toThrow(/conflicts with `namespace: 'someone-else'`/);
+  });
+
+  it("{ topology: { role: 'control-plane', tenant } } with a MATCHING explicit `namespace` is a no-op", async () => {
+    const runner = fakeRunRedisWorker();
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          topology: { role: 'control-plane', tenant: 'davi-local' },
+          store,
+          transport,
+          namespace: 'davi-local',
+          timerPollMs: 0,
+        }),
+      ],
+      providers: [GreetWorkflow],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.fn)
+      .compile();
+    await moduleRef.init();
+
+    const engine = moduleRef.get(WorkflowEngine);
+    const { runId } = await engine.start(GreetWorkflow, undefined, 'run-cp-match');
+    const run = await store.getRun(runId);
+    expect(run?.namespace).toBe('davi-local');
+
+    await moduleRef.close();
+  });
+
   it("{ topology: { role: 'tenant', tenant } } resolves the worker role: partition === tenant, ProxyRunGateway reports the tenant", async () => {
     const runner = fakeRunRedisWorker();
     const transport = new InMemoryTransport();
