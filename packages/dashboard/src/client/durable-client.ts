@@ -35,6 +35,9 @@ export interface WorkflowRun {
   recoveryAttempts?: number;
   tags?: string[];
   searchAttributes?: Record<string, string | number | boolean>;
+  /** The worker-pool partition (tenant) this run belongs to. `'default'` (or absent) on a single-pool
+   *  / control-plane run; a named tenant on a multi-tenant deployment — shown in the UI when set. */
+  namespace?: string;
   /** Set on runs from `listRuns` (control-plane-enriched): what an event-parked suspended run waits on. */
   waiting?: RunWaiting;
   createdAt: string;
@@ -123,10 +126,24 @@ export function baseGroup(group: string): string {
   return at === -1 ? group : group.slice(0, at);
 }
 
-/** Whether any live worker serves `run.workflow` — matched by health group base token. A workflow with
- *  no matching health entry (or every match at zero live workers) has no worker: the run can't advance. */
+/** Whether any live worker serves `group` (matched by base token, ignoring the `@partition` suffix). */
+function groupHasLiveWorker(group: string, health: readonly GroupHealth[]): boolean {
+  const base = baseGroup(group);
+  return health.some((h) => baseGroup(h.group) === base && h.liveWorkers.length > 0);
+}
+
+/** Whether any live worker serves `run.workflow`. A workflow with no matching health entry (or every
+ *  match at zero live workers) has no worker: the run can't advance until one rejoins. */
 function workflowHasLiveWorker(run: WorkflowRun, health: readonly GroupHealth[]): boolean {
-  return health.some((h) => baseGroup(h.group) === run.workflow && h.liveWorkers.length > 0);
+  return groupHasLiveWorker(run.workflow, health);
+}
+
+/** Label a signal-checkpoint token (the raw waiter token) the way the server names `RunWaiting`, so a
+ *  detail-view wait reads the same as its list row: `webhook <token>` / `child <id>` / `signal <name>`. */
+function tokenDetail(token: string): string {
+  if (token.startsWith('wh:')) return `webhook ${token}`;
+  if (token.startsWith('child:')) return `child ${token.slice('child:'.length)}`;
+  return `signal ${token}`;
 }
 
 /** The singleton leader among `runs` sharing this run's `singleton:<key>` tag: the oldest in-flight
@@ -150,32 +167,55 @@ function waitingDetail(waiting: RunWaiting): string {
 }
 
 /**
- * Refine a run into a list-row {@link RunDisplayState}, joining the run against the sibling run list
- * (`runs`, for singleton position) and live worker `health` (for no-worker). Precedence for a
- * suspended run: queued-behind-singleton → event wait (signal/webhook/child, named) → no-worker →
- * running (a live worker is on it — in-flight or about to be, so it flips off "no worker"/"queued" the
- * moment the fleet or the leader frees up). A `pending` run with no worker for its workflow also reads
+ * Refine a run into a {@link RunDisplayState}, joining it against the sibling run list (`runs`, for
+ * singleton position), live worker `health` (for no-worker), and — in the DETAIL view — its `timeline`
+ * for step-level precision. Passing the same `health`/`runs` makes the list row and the detail header
+ * AGREE (the list just omits `timeline`).
+ *
+ * Precedence for a suspended run: queued-behind-singleton → (with timeline) an in-flight step
+ * running/no-worker · a genuine signal wait · a real sleep → the control-plane-named event wait
+ * (list rows, no timeline) → no-worker when its workflow has no live worker → running. A live worker
+ * flips it off "no worker"/"queued" on the next poll. A `pending` run with no worker also reads
  * `no-worker`; every other status passes through.
  */
 export function deriveRunState(
   run: WorkflowRun,
-  ctx: { runs: readonly WorkflowRun[]; health: readonly GroupHealth[] },
+  ctx: {
+    runs: readonly WorkflowRun[];
+    health: readonly GroupHealth[];
+    timeline?: readonly StepCheckpoint[];
+  },
 ): RunDisplayState {
-  if (run.status === 'suspended') {
-    const leader = singletonLeader(run, ctx.runs);
-    if (leader && leader.id !== run.id) {
-      return { status: 'queued', detail: `atrás do líder ${leader.id.slice(0, 8)}` };
-    }
-    if (run.waiting) return { status: 'awaiting', detail: waitingDetail(run.waiting) };
-    if (!workflowHasLiveWorker(run, ctx.health))
+  if (run.status !== 'suspended') {
+    if (run.status === 'pending' && !workflowHasLiveWorker(run, ctx.health)) {
       return { status: 'no-worker', detail: run.workflow };
+    }
+    return { status: run.status };
+  }
+
+  const leader = singletonLeader(run, ctx.runs);
+  if (leader && leader.id !== run.id) {
+    return { status: 'queued', detail: `behind leader ${leader.id.slice(0, 8)}` };
+  }
+
+  // Detail view: the timeline says exactly what's in flight — a step, a signal wait, or a sleep.
+  const pending = ctx.timeline?.find((s) => s.status === 'pending' || s.status === 'running');
+  if (pending) {
+    if (pending.kind === 'signal') return { status: 'awaiting', detail: tokenDetail(pending.name) };
+    if (pending.kind === 'sleep') return { status: 'sleeping' };
+    // A remote/local step in flight — running if a worker serves its group, else it's stuck no-worker.
+    if (pending.workerGroup && !groupHasLiveWorker(pending.workerGroup, ctx.health)) {
+      return { status: 'no-worker', detail: baseGroup(pending.workerGroup) };
+    }
     return { status: 'running' };
   }
-  // A pending run nobody has picked up because its workflow has no live worker.
-  if (run.status === 'pending' && !workflowHasLiveWorker(run, ctx.health)) {
-    return { status: 'no-worker', detail: run.workflow };
-  }
-  return { status: run.status };
+
+  // Control-plane-named event wait (list rows have no timeline to read the pending signal checkpoint).
+  if (run.waiting) return { status: 'awaiting', detail: waitingDetail(run.waiting) };
+
+  // Nothing pending: the run has settled a step and needs its WORKFLOW worker to advance the decision.
+  if (!workflowHasLiveWorker(run, ctx.health)) return { status: 'no-worker', detail: run.workflow };
+  return { status: 'running' };
 }
 
 /**

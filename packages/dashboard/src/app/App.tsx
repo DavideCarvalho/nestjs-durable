@@ -10,7 +10,6 @@ import {
   type WorkflowRun,
   deriveRunState,
   durableClient,
-  runDisplayStatus,
 } from '../client/durable-client';
 import { type PartitionView, groupByPartition } from '../client/group-by-partition';
 import { mergeLiveEvents } from '../client/merge-live-events';
@@ -664,6 +663,14 @@ function RunsList({
               <div className="flex items-center justify-between gap-2">
                 <span className="flex min-w-0 items-center gap-1.5">
                   <span className="truncate text-sm font-medium text-zinc-200">{r.workflow}</span>
+                  {r.namespace && r.namespace !== 'default' && (
+                    <span
+                      className="mono shrink-0 rounded border border-sky-500/30 bg-sky-500/10 px-1 text-[9px] text-sky-300"
+                      title="Tenant / worker-pool partition"
+                    >
+                      {r.namespace}
+                    </span>
+                  )}
                   {r.id.startsWith('dlq:') && (
                     <span className="mono shrink-0 rounded border border-rose-500/40 bg-rose-500/10 px-1 text-[9px] uppercase tracking-wider text-rose-300">
                       dlq
@@ -769,6 +776,19 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       const s = (q.state.data as RunDetailData | undefined)?.run.status;
       return s === 'running' || s === 'suspended' ? 1500 : false;
     },
+  });
+  // Worker health + the sibling run list feed the SAME `deriveRunState` the list uses, so the detail
+  // header agrees with the list row (no-worker / queued / awaiting) instead of the old timeline-only
+  // guess. Shared query caches (same keys as the list/Workers panel) — no extra network.
+  const { data: health = [] } = useQuery({
+    queryKey: ['workers'],
+    queryFn: () => durableClient.workers(),
+    refetchInterval: 5000,
+  });
+  const { data: siblingRuns = [] } = useQuery({
+    queryKey: ['runs', '', ''],
+    queryFn: () => durableClient.runs(),
+    refetchInterval: 3000,
   });
   // Dead-letter link: a `dead` run may have been routed to a `dlq:<id>` handler workflow. Probe for
   // it (retry off so a 404 just hides the link) so we never render a dead link.
@@ -937,6 +957,10 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   // Stable key identifying the selected step across lanes (root + nested children); compensation
   // steps share the same `runId#seq` shape (seq just happens to be negative), so this works for both.
   const selKey = selStep ? `${selStep.step.runId}#${selStep.step.seq}` : undefined;
+  // Same deriver as the list row (with the timeline for step-level precision) → header + list AGREE.
+  const detailState = deriveRunState(run, { runs: siblingRuns, health, timeline: body });
+  // Show the tenant/partition only when it's a real named one (not the single-pool `default`).
+  const tenant = run.namespace && run.namespace !== 'default' ? run.namespace : undefined;
 
   return (
     <div className="flex h-full flex-col">
@@ -949,7 +973,20 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
                 dlq
               </span>
             )}
-            <Badge status={runDisplayStatus(run, body)} />
+            <Badge status={detailState.status} />
+            {detailState.detail && (
+              <span className={`mono text-[11px] s-${detailState.status}`}>
+                {detailState.detail}
+              </span>
+            )}
+            {tenant && (
+              <span
+                className="mono rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-300"
+                title="Tenant / worker-pool partition this run belongs to"
+              >
+                {tenant}
+              </span>
+            )}
             {compensations.length > 0 && (
               <span
                 className={`mono rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300 ${
@@ -1125,6 +1162,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             <WorkflowGraph
               run={run}
               timeline={body}
+              endStatus={detailState.status}
               selectedKey={selKey}
               onSelect={(step, stepRun) => setSelStep({ step, run: stepRun })}
               onOpenRun={onOpenRun}
@@ -1273,9 +1311,9 @@ export function App() {
               <span className="dot s-no-worker" aria-hidden />
             </span>
             <span>
-              Runs esperando handlers sem worker vivo:{' '}
-              <span className="mono text-amber-100">{stalledWorkflows.join(', ')}</span>. Suba um
-              worker pra destravar.
+              Runs waiting on handlers with no live worker:{' '}
+              <span className="mono text-amber-100">{stalledWorkflows.join(', ')}</span>. Start a
+              worker to unblock.
             </span>
           </div>
         )}
