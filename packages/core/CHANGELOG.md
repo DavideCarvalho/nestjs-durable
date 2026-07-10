@@ -1,5 +1,42 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.50.0
+
+### Minor Changes
+
+- 25f8000: **Breakpoint-aware `RunWaiting` + bulk `RunGateway.waitingFor`.** `ctx.breakpoint()` registers a
+  signal waiter under the hood (`bp:<runId>:<seq>`, resumed by `engine.continue`), but `RunWaiting` —
+  what the dashboard/an app names a suspended run as being parked on — had no `breakpoint` case, so a
+  paused run showed up as waiting on a raw-token `signal` named `bp:r1:7`. `RunWaiting.on` gains a
+  `'breakpoint'` variant (`classifyWaiterToken` now recognises the `bp:` prefix); this also fixes how
+  `listRuns` labels breakpoint waiters, since it shares the same classifier.
+
+  New `RunGateway.waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>>` — bulk-resolve
+  what a set of runs is currently parked on, for a consumer with its own filtered/paginated run listing
+  that needs "which of MY runs are stuck at a breakpoint" without re-deriving the waiter scan or
+  querying `durable_step_checkpoints` directly. Implemented on `StoreRunGateway` (two bulk store scans,
+  never one query per id) and forwarded by `ProxyRunGateway` over the existing run-request/reply
+  transport (one request for the whole id list); the operator-side `RunRequestResponder` scopes the
+  reply to runs the requesting tenant actually owns.
+
+- 25f8000: **`RunDetail` single-sourced from core.** `RunDetail` (a run + its timeline + child ids) was
+  independently re-declared three times — core's `RunGateway` port, the dashboard server's
+  `DashboardService`, and the dashboard client's SPA mirror (with its own client-local `WorkflowRun`/
+  `StepCheckpoint` types on top) — free to drift out of sync on any future field addition.
+
+  Core adds `WireDates<T>`, a small mapped type that turns every `Date` (and `Date | undefined`) field
+  of a server type into its ISO-string wire form, preserving each field's own optional modifier. The
+  dashboard server now imports and re-exports core's `RunDetail` instead of re-declaring it (no behavior
+  change — same shape, same export). The dashboard client's SPA `WorkflowRun`/`StepCheckpoint`/
+  `RunDetail`/`StepEvent`/`RunWaiting` are now derived from the core types via `WireDates` (type-only
+  imports; erased at build) instead of hand-mirrored field by field, so a new core field now shows up on
+  the client automatically. A few fields stay deliberately client-local and are documented inline where
+  they diverge (`StepCheckpoint.enqueuedAt` and `WorkflowRun.input` stay optional against core's
+  required equivalents; `error` widens to the real `StepError` shape; `RunDetail.children` stays
+  optional) — none of these change the client's public type surface for existing consumers.
+
+- 25f8000: Typed, validated search attributes. `@Workflow({ searchAttributes })` takes a **Standard Schema** (https://standardschema.dev — zod 3.24+, valibot, arktype, …) whose inferred output must be search-attribute-shaped (flat `string`/`number`/`boolean` values only — enforced at the declaration site, a nested-object schema is a compile error). When declared, `ctx.upsertSearchAttributes` validates the MERGED result (existing attributes shallow-merged with the patch) before writing — an invalid merge throws, naming the workflow, the offending key(s), and the schema's issues. Validation runs once, at the same first-run-only position as the write itself, so it's skipped on replay like the write. `WorkflowCtx` is now generic (`WorkflowCtx<A extends SearchAttributes = SearchAttributes>`, defaulting to the untyped shape, fully backward compatible) — pair it with the new `InferSearchAttributes<typeof mySchema>` helper to type a workflow's `run(ctx: WorkflowCtx<...>, input)`. Core also exports a new `readSearchAttributes(schema, run)` helper for the read side: safe-parse semantics — an invalid or missing `run.searchAttributes` returns `{}` (typed) instead of throwing, since older runs may predate the schema. No schema declared ⇒ unvalidated behavior is unchanged.
+
 ## 0.49.4
 
 ### Patch Changes

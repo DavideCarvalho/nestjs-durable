@@ -1,5 +1,59 @@
 # @dudousxd/nestjs-durable
 
+## 0.31.0
+
+### Minor Changes
+
+- 25f8000: **Breakpoint-aware `RunWaiting` + bulk `RunGateway.waitingFor`.** `ctx.breakpoint()` registers a
+  signal waiter under the hood (`bp:<runId>:<seq>`, resumed by `engine.continue`), but `RunWaiting` —
+  what the dashboard/an app names a suspended run as being parked on — had no `breakpoint` case, so a
+  paused run showed up as waiting on a raw-token `signal` named `bp:r1:7`. `RunWaiting.on` gains a
+  `'breakpoint'` variant (`classifyWaiterToken` now recognises the `bp:` prefix); this also fixes how
+  `listRuns` labels breakpoint waiters, since it shares the same classifier.
+
+  New `RunGateway.waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>>` — bulk-resolve
+  what a set of runs is currently parked on, for a consumer with its own filtered/paginated run listing
+  that needs "which of MY runs are stuck at a breakpoint" without re-deriving the waiter scan or
+  querying `durable_step_checkpoints` directly. Implemented on `StoreRunGateway` (two bulk store scans,
+  never one query per id) and forwarded by `ProxyRunGateway` over the existing run-request/reply
+  transport (one request for the whole id list); the operator-side `RunRequestResponder` scopes the
+  reply to runs the requesting tenant actually owns.
+
+- 25f8000: Re-export the everyday `@dudousxd/nestjs-durable-core` surface from `@dudousxd/nestjs-durable` — `RunGateway`, `RunDetail`, `RunListItem`, `RunWaiting`, `RunQuery`, `AttributeFilter`, `RunStatus`, `WorkflowRun`, `StepCheckpoint`, `WorkflowCtx`, `SearchAttributes`, `WorkflowEngine`, `EngineEvent`, and `StepLogger` (types re-exported type-only; `WorkflowEngine` as a value). Previously a consumer had to import `RUN_GATEWAY` from `@dudousxd/nestjs-durable` but its `RunGateway` type from `-core`, or the `Workflow` decorator from `@dudousxd/nestjs-durable` but `WorkflowEngine`/`WorkflowCtx` from `-core` — now both live under one import.
+- 25f8000: **`DurableModuleOptions.topology` — an explicit, validated deployment-role preset.** Today the
+  operator/worker split is only inferred from which of `store`/`connection` are set, and the boundary
+  between `namespace` (the operator's poll-scoping axis) and `partition` (the worker's queue-routing
+  suffix) is only documented in prose — a real consumer app grew a 250-line module whose comments exist
+  solely to reconcile the two. `topology` names the role up front and validates the axes for you:
+
+  ```ts
+  // Control plane: owns the store, dispatches over the transport.
+  DurableModule.forRoot({
+    topology: { role: "control-plane" },
+    store,
+    transport,
+  });
+
+  // Tenant: store-less worker scoped to its own partition — `tenant` maps onto `partition` for you.
+  DurableModule.forRoot({
+    topology: { role: "tenant", tenant: "acme-corp" },
+    connection: process.env.REDIS_URL,
+  });
+  ```
+
+  - `{ role: 'control-plane' }` requires `store` + (`transport` or `transports`); forbids `partition`
+    (a worker axis) and a `tenant` field. `namespace` and `connection` stay allowed.
+  - `{ role: 'tenant', tenant }` requires `connection`; forbids `store` (a tenant is store-less by
+    definition) and `namespace` (the operator's own axis); maps `tenant` onto `partition` internally —
+    an explicit `partition` that disagrees with `tenant` throws, one that matches is a no-op.
+  - Every rejection is a multi-line error naming the role, the offending option, and the one-line reason
+    — these messages are the point, not just the validation.
+  - `topology` is entirely additive: omit it and `store`/`connection` inference is unchanged.
+
+  See [Tenancy & topologies](https://davidecarvalho.github.io/aviary/docs/durable/concepts/tenancy#the-topology-preset).
+
+- 25f8000: Typed, validated search attributes. `@Workflow({ searchAttributes })` takes a **Standard Schema** (https://standardschema.dev — zod 3.24+, valibot, arktype, …) whose inferred output must be search-attribute-shaped (flat `string`/`number`/`boolean` values only — enforced at the declaration site, a nested-object schema is a compile error). When declared, `ctx.upsertSearchAttributes` validates the MERGED result (existing attributes shallow-merged with the patch) before writing — an invalid merge throws, naming the workflow, the offending key(s), and the schema's issues. Validation runs once, at the same first-run-only position as the write itself, so it's skipped on replay like the write. `WorkflowCtx` is now generic (`WorkflowCtx<A extends SearchAttributes = SearchAttributes>`, defaulting to the untyped shape, fully backward compatible) — pair it with the new `InferSearchAttributes<typeof mySchema>` helper to type a workflow's `run(ctx: WorkflowCtx<...>, input)`. Core also exports a new `readSearchAttributes(schema, run)` helper for the read side: safe-parse semantics — an invalid or missing `run.searchAttributes` returns `{}` (typed) instead of throwing, since older runs may predate the schema. No schema declared ⇒ unvalidated behavior is unchanged.
+
 ## 0.30.2
 
 ### Patch Changes

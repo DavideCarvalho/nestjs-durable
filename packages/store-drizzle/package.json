@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-store-drizzle",
-  "version": "0.10.4",
+  "version": "0.10.5",
   "description": "Drizzle ORM (SQLite/libSQL) adapter for the nestjs-durable StateStore",
   "license": "MIT",
   "author": "Davide Carvalho",
