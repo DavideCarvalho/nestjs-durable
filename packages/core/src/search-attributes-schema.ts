@@ -27,7 +27,9 @@ import type { InferSearchAttributes, SearchAttributes, SearchAttributesSchema } 
  */
 export function readSearchAttributes<S extends SearchAttributesSchema>(
   schema: S,
-  run: { searchAttributes?: SearchAttributes | undefined },
+  // `| null` because ORM store entities (MikroORM/TypeORM/Prisma) type the JSON column as
+  // nullable — the entity row is the argument every real consumer passes.
+  run: { searchAttributes?: SearchAttributes | null | undefined },
 ): InferSearchAttributes<S> {
   const result = schema['~standard'].validate(run.searchAttributes ?? {});
   if (result instanceof Promise) {
