@@ -53,7 +53,7 @@ export class RunRequestResponder {
     }
 
     // Every remaining verb is runId-bearing. Load the run FIRST — before calling the verb — so a
-    // cross-tenant request never reaches the gateway's mutating methods (cancel/retry/continue).
+    // cross-tenant request never reaches the gateway's mutating methods (cancel/retry/continue/redispatch).
     const detail = await this.gateway.getRunDetail(body.runId);
     if (detail && detail.run.namespace !== msg.tenant) {
       return {
@@ -95,6 +95,8 @@ export class RunRequestResponder {
         return this.gateway.continue(body.runId);
       case 'retryWithInput':
         return this.gateway.retryWithInput(body.runId, body.input);
+      case 'redispatch':
+        return this.gateway.redispatchPending(body.runId);
     }
   }
 }

@@ -104,6 +104,19 @@ describe('ProxyRunGateway', () => {
     });
   });
 
+  it('round-trips redispatchPending and resolves with the redispatched count', async () => {
+    const tx = fakeTransport();
+    const gw = new ProxyRunGateway(tx, 'acme', 5000);
+    const p = gw.redispatchPending('r1');
+    const req = tx.requests[0];
+    expect(req).toMatchObject({ tenant: 'acme', body: { kind: 'redispatch', runId: 'r1' } });
+    tx.emitReply({
+      requestId: req.requestId,
+      result: { ok: true, data: { runId: 'r1', status: 'running', redispatched: 2 } },
+    });
+    await expect(p).resolves.toMatchObject({ runId: 'r1', redispatched: 2 });
+  });
+
   it("routes only this run's tenant events to subscribe", () => {
     const tx = fakeTransport();
     const gw = new ProxyRunGateway(tx, 'acme', 5000);

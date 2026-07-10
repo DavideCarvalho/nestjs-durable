@@ -67,6 +67,10 @@ function fakeGateway(overrides: FakeGatewayOverrides): RunGateway {
       record('continue');
       return null;
     },
+    async redispatchPending(runId) {
+      record('redispatchPending');
+      return null;
+    },
     async retryWithInput(runId, input) {
       record('retryWithInput');
       return null;
@@ -86,6 +90,7 @@ describe('DashboardService', () => {
     await service.retry('r1');
     await service.cancel('r1', { compensate: true });
     await service.continue('r1');
+    await service.redispatch('r1');
     await service.retryWithInput('r1', { fixed: true });
     await service.workerHealth();
 
@@ -95,6 +100,7 @@ describe('DashboardService', () => {
       'retry',
       'cancel:{"compensate":true}',
       'continue',
+      'redispatchPending',
       'retryWithInput',
       'workerHealth',
     ]);

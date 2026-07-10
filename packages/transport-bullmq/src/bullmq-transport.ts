@@ -56,6 +56,30 @@ export function toBrokerPriority(priority?: number): number | undefined {
 // (the TS SDKs). Normalise to ms. ~1e12 ms ≈ year 2001; ~1e12 s is year 33658 — unambiguous.
 const EPOCH_MS_THRESHOLD = 1e12;
 
+// How long a FAILED task job's payload is kept in Redis before BullMQ GCs it (see `dispatch()`). Long
+// enough that a peer worker's stalled-check (default interval 30s, up to `maxStalledCount` cycles) has
+// failed a crashed worker's job and the terminal-failure bridge has read its `RemoteTask` — but bounded
+// so failed jobs don't accumulate unbounded.
+const TASK_FAILED_RETENTION_SECONDS = 24 * 60 * 60;
+
+/**
+ * Narrow a FAILED task job's `data` to the {@link RemoteTask} fields the terminal-failure bridge needs
+ * (runId/seq/stepId), WITHOUT an unsafe cast. Returns `undefined` for a job whose payload BullMQ has
+ * already GC'd (`removeOnFail`) or a malformed job — so the bridge safely no-ops instead of publishing
+ * a bogus result. `job.data` arrives as the broker's loosely-typed value; this is the one guarded gate.
+ */
+function failedTaskIdentity(
+  data: unknown,
+): { runId: string; seq: number; stepId: string } | undefined {
+  if (typeof data !== 'object' || data === null) return undefined;
+  if (!('runId' in data) || !('seq' in data) || !('stepId' in data)) return undefined;
+  const { runId, seq, stepId } = data;
+  if (typeof runId !== 'string' || typeof seq !== 'number' || typeof stepId !== 'string') {
+    return undefined;
+  }
+  return { runId, seq, stepId };
+}
+
 /**
  * Parse a worker-heartbeat key value into `{ lastBeatAt, status? }`, accepting BOTH forms:
  *   - the new `{"ts":<epoch>,"status":<WorkerStatus>}` JSON (newer SDKs),
@@ -290,7 +314,16 @@ export class BullMQTransport implements Transport, ControlPlane {
   /** `task.group` already carries the FINAL routing token (`tenantGroup(sanitizeQueueToken(name),
    *  partition)`), computed upstream by the engine — this targets that handler's dedicated queue. */
   async dispatch(task: RemoteTask): Promise<void> {
-    await this.queue(this.tasksName(task.group)).add('task', task, this.jobOptions(task.priority));
+    await this.queue(this.tasksName(task.group)).add('task', task, {
+      ...this.jobOptions(task.priority),
+      // Retain a FAILED task job's payload (age-bounded) instead of deleting it. A worker that
+      // crashes/stalls has its job failed by a PEER worker's stalled-check, and BullMQ's
+      // `removeOnFail: true` Lua path deletes the job hash in the SAME transaction it emits `failed`
+      // — leaving the terminal-failure bridge (see `handle()`) no `RemoteTask` to rebuild a
+      // StepResult from. Keeping it briefly lets the bridge settle the run's `pending` checkpoint
+      // (and doubles as failure forensics); BullMQ GCs it after the window.
+      removeOnFail: { age: TASK_FAILED_RETENTION_SECONDS },
+    });
   }
 
   private decisionsName(): string {
@@ -355,6 +388,29 @@ export class BullMQTransport implements Transport, ControlPlane {
     const worker = new Worker(this.tasksName(routingToken), (job) => this.runTask(job.data), {
       connection: this.workerConnection(),
       concurrency: controller.initialLimit,
+    });
+    // Terminal-failure bridge. A task job reaching a TERMINAL `failed` state is ALWAYS an
+    // INFRASTRUCTURE failure, never a handler business error: `runStepHandler` catches every handler
+    // throw and `runTask` publishes a failed StepResult for it (so the job SUCCEEDS). `failed` fires
+    // only for a worker crash / stalled-count exhaustion / an unexpected throw in `runTask` (e.g. a
+    // Redis publish failure) — none of which produce a StepResult, so without this the run hangs on
+    // its `pending` checkpoint forever. We bridge that back into a synthetic failed StepResult so the
+    // engine settles the checkpoint and its durable retry re-dispatches the step.
+    //
+    // We use the Worker `'failed'` listener over a separate `QueueEvents('failed')`. BullMQ's
+    // stalled-check runs ON a live Worker and emits `failed` WITH the (re-fetched) job, whereas
+    // `QueueEvents('failed')` carries only a jobId — and by then the failed job's hash has been GC'd
+    // (see `dispatch()`'s `removeOnFail`), so QueueEvents could not recover the `RemoteTask` to
+    // rebuild the result. A PEER replica's Worker fails a CRASHED worker's stalled job, so this
+    // listener still fires cross-process. Cleanup is inherent: the listener rides the per-handler
+    // Worker, which `close()` already tears down (no new connection/QueueEvents to leak).
+    //
+    // Residual gap: if the SOLE worker crashes and never restarts, no stalled-check ever runs, so
+    // nothing — Worker OR QueueEvents — can settle it; that needs an external liveness monitor.
+    worker.on('failed', (job, error) => {
+      const identity = failedTaskIdentity(job?.data);
+      if (!identity) return; // payload already GC'd or malformed — nothing safe to publish
+      void this.bridgeTaskFailure(identity, job?.failedReason ?? error.message ?? 'unknown');
     });
     this.taskWorkers.set(name, worker);
     // Run the shared control loop (idempotent across handlers): fixed mode just tracks status;
@@ -474,11 +530,64 @@ export class BullMQTransport implements Transport, ControlPlane {
         removeOnComplete: true,
         removeOnFail: true,
       });
+    } catch {
+      // In-process safety net for a crash we DIDN'T die from. `runStepHandler` is pure — it never
+      // throws (it returns a failed StepResult), so reaching here means the results-queue publish
+      // itself threw (e.g. Redis blipped). We still hold `task`, so synthesize a failed StepResult
+      // rather than let the engine's checkpoint hang on `pending`. We can't tell whether the
+      // un-published result was completed or failed, so we fail it RETRYABLE and let the engine
+      // re-dispatch (remote steps are already at-least-once; `completeRemoteResult` no-ops a
+      // checkpoint that's no longer `pending`, so any duplicate from the terminal-failure bridge is
+      // harmless). If THIS publish ALSO throws it propagates → the BullMQ job is marked `failed` →
+      // the terminal-failure bridge + durable retry become the last line of defence.
+      const fallback: StepResult = {
+        runId: task.runId,
+        seq: task.seq,
+        stepId: task.stepId,
+        status: 'failed',
+        error: { message: 'remote step worker failed: result publish error', retryable: true },
+      };
+      await this.queue(this.resultsName()).add('result', fallback, {
+        removeOnComplete: true,
+        removeOnFail: true,
+      });
     } finally {
       // The engine-side task worker runs STEP handlers only (`runStepHandler`), so every settlement
       // is a step — it feeds the adaptive measurement window. Workflow turns are replayed by the SDK
       // worker (`redis-runner`), never here.
       controller.onSettle(Date.now() - startedAt, ok, 'step');
+    }
+  }
+
+  /**
+   * Publish a synthetic FAILED {@link StepResult} for a task job that failed at the INFRASTRUCTURE
+   * level (worker crash / stalled-count exhaustion) — which produces no normal result. Routing it
+   * through the SAME results queue means the engine's ordinary `onResult` → `completeRemoteResult`
+   * path settles the checkpoint `failed` and its durable retry re-dispatches the step, instead of the
+   * run hanging on a `pending` checkpoint forever. `retryable: true` so a transient crash is retried,
+   * not dead-lettered. NOTE: `StepResult` carries NO `name` field (see core `interfaces.ts`) — the
+   * engine correlates purely by runId/seq/stepId, so we don't invent one. Best-effort: a publish
+   * failure here is swallowed (the engine's own reconcile is the last resort); a duplicate is a no-op
+   * on a non-`pending` checkpoint.
+   */
+  private async bridgeTaskFailure(
+    identity: { runId: string; seq: number; stepId: string },
+    reason: string,
+  ): Promise<void> {
+    const result: StepResult = {
+      runId: identity.runId,
+      seq: identity.seq,
+      stepId: identity.stepId,
+      status: 'failed',
+      error: { message: `remote step worker failed: ${reason}`, retryable: true },
+    };
+    try {
+      await this.queue(this.resultsName()).add('result', result, {
+        removeOnComplete: true,
+        removeOnFail: true,
+      });
+    } catch {
+      /* best-effort — the durable engine's reconcile path is the last line of defence */
     }
   }
 

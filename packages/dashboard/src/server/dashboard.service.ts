@@ -171,6 +171,11 @@ export class DashboardService {
     return this.gateway.continue(runId);
   }
 
+  /** Re-dispatch a run's stuck `pending` remote steps — recovery for a lost step dispatch. */
+  redispatch(runId: string) {
+    return this.gateway.redispatchPending(runId);
+  }
+
   /**
    * Deliver a `ctx.webhook()` callback: turn an inbound POST (token + body) into the signal the
    * waiting run is parked on. Returns the run result, or `null` if no run waits on that token (a

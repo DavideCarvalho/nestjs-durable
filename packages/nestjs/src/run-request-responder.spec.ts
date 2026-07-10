@@ -52,6 +52,9 @@ function fakeGateway(overrides: Partial<RunGateway> = {}): RunGateway {
     retry: vi.fn(async (): Promise<RunResult | null> => null),
     continue: vi.fn(async (): Promise<RunResult | null> => null),
     retryWithInput: vi.fn(async (): Promise<{ runId: string } | null> => ({ runId: 'n' })),
+    redispatchPending: vi.fn(
+      async (): Promise<(RunResult & { redispatched: number }) | null> => null,
+    ),
     subscribe: vi.fn((_onEvent: (event: EngineEvent) => void) => () => {}),
     ...overrides,
   };
@@ -167,6 +170,40 @@ describe('RunRequestResponder', () => {
       body: { kind: 'cancel', runId: 'r1', opts: { compensate: true } },
     });
     expect(gw.cancel).toHaveBeenCalledWith('r1', { compensate: true });
+  });
+
+  it('dispatches redispatch to the gateway', async () => {
+    const gw = fakeGateway();
+    const tx = fakeTransport();
+    new RunRequestResponder(tx, gw).start();
+    await tx.deliver({
+      requestId: 'q8',
+      tenant: 'acme',
+      body: { kind: 'redispatch', runId: 'r1' },
+    });
+    expect(gw.redispatchPending).toHaveBeenCalledWith('r1');
+    expect(tx.replies[0]).toMatchObject({ requestId: 'q8', result: { ok: true } });
+  });
+
+  it('denies a cross-tenant redispatch WITHOUT calling engine redispatchPending', async () => {
+    const gw = fakeGateway({
+      getRunDetail: vi.fn(
+        async (id: string): Promise<RunDetail | null> => ({
+          run: fakeRun(id, 'beta'),
+          timeline: [],
+          children: [],
+        }),
+      ),
+    });
+    const tx = fakeTransport();
+    new RunRequestResponder(tx, gw).start();
+    await tx.deliver({
+      requestId: 'q9',
+      tenant: 'acme',
+      body: { kind: 'redispatch', runId: 'r1' },
+    });
+    expect(gw.redispatchPending).not.toHaveBeenCalled();
+    expect(tx.replies[0]?.result).toMatchObject({ ok: false, error: { code: 'cross-tenant' } });
   });
 
   it('serialises a thrown verb error into an error reply', async () => {

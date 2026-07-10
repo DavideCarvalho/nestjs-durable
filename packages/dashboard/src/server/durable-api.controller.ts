@@ -103,6 +103,14 @@ export class DurableApiController {
     return result;
   }
 
+  /** Re-dispatch a run's stuck `pending` remote steps — recovery for a lost step dispatch. */
+  @Post('runs/:id/redispatch')
+  async redispatch(@Param('id') id: string) {
+    const result = await this.dashboard.redispatch(id);
+    if (!result) throw new NotFoundException(`run ${id} not found`);
+    return result;
+  }
+
   /**
    * Public callback endpoint for `ctx.webhook()`: a third party POSTs here (the url handed to it),
    * and the body resumes the waiting run. NOTE: this is reachable by external systems — protect it

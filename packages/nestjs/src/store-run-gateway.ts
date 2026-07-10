@@ -77,6 +77,10 @@ export class StoreRunGateway implements RunGateway {
     return this.engine.retryWithInput(runId, input);
   }
 
+  redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) | null> {
+    return this.engine.redispatchPending(runId);
+  }
+
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void {
     return this.engine.subscribe((event) => {
       if (event.runId === runId) onEvent(event);

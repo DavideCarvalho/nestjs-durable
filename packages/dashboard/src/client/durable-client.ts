@@ -102,6 +102,22 @@ export interface RunDetail {
   children?: string[];
 }
 
+/** How long a remote step may sit `pending` (dispatched, no result) before it's presumed a LOST
+ *  dispatch — the worker crashed or the transport dropped the job. Reconcile-wake can't recover this
+ *  (it re-suspends a pending step), so it needs an explicit re-dispatch. */
+export const STALE_PENDING_MS = 10 * 60 * 1000; // 10 min
+
+/** A remote step checkpoint that's been `pending` (dispatched, awaiting a worker result) longer than
+ *  STALE_PENDING_MS — likely a lost dispatch that will hang the run until re-dispatched. `nowMs` is
+ *  injectable for tests. Returns false for non-remote / non-pending / fresh checkpoints. */
+export function isStalePending(cp: StepCheckpoint, nowMs: number): boolean {
+  if (cp.kind !== 'remote' || cp.status !== 'pending') return false;
+  const dispatchedAt = cp.enqueuedAt
+    ? new Date(cp.enqueuedAt).getTime()
+    : new Date(cp.startedAt).getTime();
+  return nowMs - dispatchedAt > STALE_PENDING_MS;
+}
+
 /** A run's status as shown to a human. The engine stores one generic `suspended` for any durably
  *  parked run, but WHY it's parked reads very differently, so we refine it for display only.
  *  `no-worker` (blocked: its queue has a backlog with no live consumer) and `queued` (waiting behind
@@ -400,6 +416,14 @@ export const durableClient = {
   },
   continue(id: string): Promise<WorkflowRun> {
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/continue`, { method: 'POST' });
+  },
+  /** Re-dispatch a run's stuck `pending` remote steps — recovery for a lost step dispatch (a crashed
+   *  worker or a dropped job). Returns the run's status plus how many steps were re-dispatched. */
+  redispatch(id: string): Promise<{ runId: string; status: RunStatus; redispatched: number }> {
+    return http<{ runId: string; status: RunStatus; redispatched: number }>(
+      `/runs/${encodeURIComponent(id)}/redispatch`,
+      { method: 'POST' },
+    );
   },
   /**
    * Live-tail a run's lifecycle events over SSE (replaces polling). Calls `onEvent` per event;
