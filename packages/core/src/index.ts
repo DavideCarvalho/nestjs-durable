@@ -30,6 +30,7 @@ export * from './search-attributes-schema';
 export type { StandardSchemaV1 } from './standard-schema';
 export * from './tenant-group';
 export * from './tokens';
+export * from './workflow-handler';
 export * from './workflow-ref';
 export { InMemoryStateStore } from './testing/in-memory-state-store';
 export { InMemoryTransport } from './testing/in-memory-transport';
