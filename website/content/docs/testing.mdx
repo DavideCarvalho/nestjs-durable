@@ -144,6 +144,10 @@ runStateStoreContract('MyStateStore', async () => ({
 }));
 ```
 
+If the factory can't reach its backend at all (no Docker, no local Postgres), throw
+`StateStoreUnavailableError` from it instead of letting the connection error fail the suite — the
+contract skips that case gracefully rather than reporting a false failure.
+
 **Transport** — `assertTransportConformance(transport, idPrefix?)` proves a durable remote step
 round-trips to a worker and back, for both success and a throwing handler:
 
@@ -170,4 +174,6 @@ runAdmissionBackendContract('MyAdmissionBackend', (clock) => new MyAdmissionBack
 If your store is a new ORM adapter, also assert its physical column names against the canonical
 snake_case contract, so a mismatch fails a unit test instead of "Unknown column" at runtime:
 `assertDurableColumns(resolve)` walks every table/property in `DURABLE_CANONICAL_COLUMNS` and returns
-the mismatches (empty when conformant) — `expect(assertDurableColumns(resolve)).toEqual([])`.
+the mismatches (empty when conformant) — `expect(assertDurableColumns(resolve)).toEqual([])`. If your
+adapter intentionally preserves camelCase columns instead of following the snake_case contract, build
+the matching expectation map with `preserveColumnExpectation()` and pass it in place of the default.

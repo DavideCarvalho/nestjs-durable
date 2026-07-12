@@ -91,7 +91,7 @@ DurableModule.forRoot({ store, transport, autoSchema: false });
 ```
 
 <Callout type="warn">
-  **Two gaps versus the MikroORM adapter, worth knowing before you pick this one:**
+  **Three gaps versus the MikroORM adapter, worth knowing before you pick this one:**
 
   - **No `withScope`.** This adapter doesn't implement the tenant-namespace-scoped-view capability, so
     `DurableModule`'s `scopeReads: true` option is a silent no-op here — the store keeps returning
@@ -102,4 +102,7 @@ DurableModule.forRoot({ store, transport, autoSchema: false });
     than MikroORM's whole-schema introspection (this one only ever touches the durable tables), but
     it's still real DDL-planning work repeated on every pod's every boot rather than skipped on a
     steady-state boot where nothing changed.
+  - **No `pruneTerminalRuns`.** This adapter doesn't implement the [retention](/docs/stores#retention--pruning)
+    capability, so a `retention` policy configured against it no-ops with a warning instead of
+    actually deleting terminal runs. Only the MikroORM adapter implements it today.
 </Callout>

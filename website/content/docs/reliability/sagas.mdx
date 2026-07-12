@@ -125,6 +125,48 @@ up. The saga does **not** run on every suspension: `ContinueAsNew` and an ordina
 suspension both leave the run's compensation stack untouched — it's only consulted when the run's execution
 ends in an unhandled error.
 
+Mechanically, a suspend or `continueAsNew` unwinds the current turn by **throwing** internally
+(`WorkflowSuspended` / `ContinueAsNew`) — the exact same JS exception mechanism a real step failure uses to
+reach your `catch`. The engine tells the two apart with a shared marker,
+[`CONTROL_FLOW_SIGNAL`](/docs/api-reference#control-flow-signals), and the exported
+`isWorkflowControlFlowSignal(error)` predicate. This only matters to you if you write your own `try`/`catch`
+around a `ctx.step`/`ctx.sleep`/`ctx.waitForSignal`/etc. instead of relying on `compensate` — see the pitfall
+below.
+
+## Hand-rolled compensation: the control-flow-signal pitfall
+
+The `compensate` option (above) is the engine's own machinery for registering an undo, and it's already
+safe — reach for it whenever a step's undo is a static ref. But some compensation logic doesn't fit a static
+`compensate` ref (it's conditional, needs values only known deep in a `catch`, or you're porting saga code
+that predates `compensate`), so you write the catch yourself:
+
+```ts
+try {
+  await ctx.step(this.payments.chargeCard, input);
+} catch (error) {
+  if (isWorkflowControlFlowSignal(error)) throw error; // suspend/continue-as-new: rethrow as-is
+  await ctx.step(this.payments.refund, input); // a REAL failure — safe to run cleanup here
+  throw error;
+}
+```
+
+**The `isWorkflowControlFlowSignal(error)` check and rethrow are not optional.** `WorkflowSuspended` and
+`ContinueAsNew` are thrown internally to unwind a turn — on a durable sleep, an awaited-but-still-pending
+step, `ctx.continueAsNew`, and so on — and they are not real failures. If your `catch` doesn't rethrow them
+untouched and instead unconditionally runs its cleanup/compensation step, that compensation step gets
+recorded as an **extra** history command during what a later replay will see as a plain suspend, not a
+failure. The resumed replay then dies with a `NonDeterminismError`, because the code path it's replaying no
+longer matches what was checkpointed. See
+[Troubleshooting: a caught suspend runs compensation and corrupts the run](/docs/troubleshooting#a-caught-suspend-runs-compensation-and-corrupts-the-run).
+
+Deliberately **not** control-flow, and safe to compensate on directly — no guard needed: a cancelled run
+(`Cancelled`, thin worker) is a terminal outcome you may legitimately want to react to, and a `ctx.step` /
+`ctx.all` rejection that reaches your `catch` (a `StepFailed`/`GatherError` or an ordinary thrown error) is a
+real failure your saga is meant to compensate for.
+
+Import `isWorkflowControlFlowSignal` from `@dudousxd/nestjs-durable-core` (or `@dudousxd/nestjs-durable`,
+which re-exports it) — see [API reference](/docs/api-reference#control-flow-signals).
+
 The reverse order is a strict LIFO unwind of the compensations registered so far: the engine walks the stack
 from the most recently completed step to the first, undoing exactly the steps that finished before the
 failure (a step that never completed never registered a compensation, so there's nothing to undo for it).

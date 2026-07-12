@@ -112,9 +112,11 @@ setting both on the same instance, or from setting `partition` on an operator wh
 validated choice instead of an inferred one:
 
 ```ts
-// Control plane: owns the store, dispatches over the transport.
+// Control plane: owns the store, dispatches over the transport. `tenant` is optional here — leave it
+// unset on a deployed operator (drives every tenant); set it (e.g. from an env var) to scope a
+// self-contained local stack to its own runs while sharing a broker with a deployed cluster.
 DurableModule.forRoot({
-  topology: { role: 'control-plane' },
+  topology: { role: 'control-plane', tenant: process.env.DURABLE_TENANT },
   store,
   transport,
 });
@@ -130,8 +132,8 @@ Validated at `forRoot`/`forRootAsync` resolution time, each check named after th
 
 | `topology` | Requires | Forbids | Notes |
 | --- | --- | --- | --- |
-| `{ role: 'control-plane' }` | `store` AND (`transport` or `transports`) | `partition`; a `tenant` field | `namespace` and `connection` stay allowed — an operator may still poll-scope itself or run a co-located worker. |
-| `{ role: 'tenant', tenant }` | `connection` | `store`; `namespace` | `tenant` is mapped onto `partition` internally — set `partition` too only if it equals `tenant` (a no-op); a mismatch throws. |
+| `{ role: 'control-plane', tenant? }` | `store` AND (`transport` or `transports`) | `partition` | `tenant` is optional here and maps onto `namespace` — omit it on a deployed operator (drives every tenant); set it to scope a self-contained local stack to its own runs while sharing a broker with a deployed cluster. `namespace` and `connection` also stay allowed — set `namespace` explicitly too only if it equals `tenant` (a no-op); a mismatch throws. |
+| `{ role: 'tenant', tenant }` | `connection` | `store`; `namespace` | `tenant` is required and mapped onto `partition` internally — set `partition` too only if it equals `tenant` (a no-op); a mismatch throws. |
 
 `topology` is entirely additive: omit it and `store`/`connection` inference behaves exactly as
 before. It exists for the case a plain inferred config doesn't catch — a consumer app that sets both

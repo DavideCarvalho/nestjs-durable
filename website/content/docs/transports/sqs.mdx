@@ -81,6 +81,15 @@ Set `marker` to have every durable message carry that SQS message attribute, and
 legacy/non-durable consumer be shared, as long as that consumer likewise ignores durable-tagged
 messages. Leave it unset for the common case: a queue dedicated to durable traffic.
 
+## Worker health
+
+`SqsTransport` doesn't implement `groupHealth`/`listWorkerGroups` either — the engine's
+`workerHealth()` query, and the dashboard/Telescope worker-health panels built on it, return
+**empty** for this transport's groups; only a `groupHealth`-capable transport (BullMQ) returns
+non-empty results. Liveness here is the visibility timeout, not a queryable heartbeat: a message
+whose worker crashes before deleting it becomes visible again after `visibilityTimeoutSec`, and
+SQS's own redelivery is the recovery mechanism.
+
 ## Options
 
 | Option | Description |

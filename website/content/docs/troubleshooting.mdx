@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting
-description: Symptom-first answers to the errors and stuck states you'll actually hit — NonDeterminismError, a run wedged in pending or suspended, SignalTimeoutError, dead-lettered runs, MySQL collation clashes, and an empty dashboard.
+description: Symptom-first answers to the errors and stuck states you'll actually hit — NonDeterminismError, a caught suspend that corrupts a run via a missing isWorkflowControlFlowSignal guard, a run wedged in pending or suspended, SignalTimeoutError, dead-lettered runs, MySQL collation clashes, and an empty dashboard.
 ---
 
 This page is organized by what you **see** — an error name, a stuck status, an empty screen — rather
@@ -36,6 +36,41 @@ whose history no longer matches its code.
   stale local process still consuming a shared queue; see
   ["Deploys: replay-safety discipline"](/docs/production#5-deploys-replay-safety-discipline) and the
   "stale local worker" pitfalls in [Tenancy & topologies](/docs/concepts/tenancy#pitfalls).
+
+## A caught suspend runs compensation and corrupts the run
+
+**Symptom:** a workflow with a hand-rolled `try`/`catch` around a `ctx.step` (or `ctx.sleep` /
+`ctx.waitForSignal` / etc.) — instead of using the built-in `compensate` option — runs its
+cleanup/compensation logic on what looks like an ordinary suspend, and the run later fails on resume
+with `NonDeterminismError`, or the dashboard shows a compensation step that fired for no visible
+reason on a run that was simply sleeping or waiting on a signal.
+
+**Cause:** a durable sleep, an awaited-but-still-pending step, and `ctx.continueAsNew` all unwind the
+current turn by **throwing internally** (`WorkflowSuspended` / `ContinueAsNew` in the engine, `Suspend`
+in the thin worker) — the same JS exception mechanism a real failure uses to reach a `catch` block. A
+`catch` that doesn't distinguish the two and unconditionally runs a cleanup/compensation step treats a
+plain suspend as a failure: that extra step gets recorded as a command in the run's history during a
+turn a later replay will see as a plain suspend, not a failure, so the replay diverges and dies with
+`NonDeterminismError` (or, absent a version bump to surface that cleanly, silently corrupts the run).
+
+**Fix:** check `isWorkflowControlFlowSignal(error)` first and rethrow untouched before running any
+cleanup — only run compensation on an error that fails the check:
+
+```ts
+try {
+  await ctx.step(this.payments.chargeCard, input);
+} catch (error) {
+  if (isWorkflowControlFlowSignal(error)) throw error; // suspend/continue-as-new: rethrow as-is
+  await ctx.step(this.payments.refund, input); // a REAL failure — safe to run cleanup here
+  throw error;
+}
+```
+
+Import it from `@dudousxd/nestjs-durable-core` (or `@dudousxd/nestjs-durable`, which re-exports it) —
+see [API reference](/docs/api-reference#control-flow-signals). Where possible, prefer the engine's own
+`compensate` option (on `ctx.step`/`ctx.localStep`) over a hand-rolled `catch` in the first place — it's
+already immune to this, since the engine only ever runs registered compensations on a genuine failure.
+See [Sagas & compensation](/docs/reliability/sagas#hand-rolled-compensation-the-control-flow-signal-pitfall).
 
 ## A run is stuck in `suspended` forever
 

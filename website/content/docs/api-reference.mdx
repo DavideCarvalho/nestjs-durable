@@ -156,6 +156,26 @@ Marks an `@Injectable()` class implementing `intercept(invocation: StepInvocatio
 as onion middleware around every LOCAL step's real execution (first-declared runs outermost). Fires
 only when a step actually executes, never on replay.
 
+## `WorkflowHandler<TInput, TOutput, A>`
+
+Optional, TYPES-ONLY contract (`packages/core/src/workflow-handler.ts`, exported from
+`@dudousxd/nestjs-durable-core`) for a `@Workflow` class's `run` method: `implements
+WorkflowHandler<TInput, TOutput, A>` pins the signature against `TInput`/`TOutput`/the run's
+`SearchAttributes` shape `A`, so a wrong signature (renamed method, swapped/missing param, wrong
+return type) is a compile error at the class instead of a runtime discovery failure or a silently
+wrong type flowing out of `ctx.child`/`engine.start`. Nothing reads it at runtime — registration is
+still via `@Workflow` + reflected metadata; a class that skips it works exactly as before.
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `run` | `run(ctx: WorkflowCtx<A>, input: TInput): Promise<TOutput> \| TOutput` | The pinned workflow body. Pass `A` (see `InferSearchAttributes`) to narrow `ctx.upsertSearchAttributes` inside the body when paired with a `@Workflow({ searchAttributes })` schema. |
+
+<Callout type="warn">
+`implements WorkflowHandler` does not contextually infer `run`'s parameter types the way an object
+literal assigned to a typed variable would — annotate `ctx`/`input` on the method yourself. The
+interface only checks that what you wrote is assignable; it doesn't write the annotations for you.
+</Callout>
+
 ## DurableWorkflow (class-first statics)
 
 Optional base class (`packages/core/src/durable-workflow.ts`) — `@Workflow` classes that extend it
@@ -278,8 +298,27 @@ All exported from `@dudousxd/nestjs-durable-core`.
 | `GatherError` | `ctx.all` — one or more parallel children failed; carries per-item `{ index, id, error }` failures. |
 | `RemoteStepTimeout` | A dispatched step produces no result/heartbeat within its `timeoutMs` — the worker is presumed dead. Retryable, subject to the step's `retries`. |
 | `RemoteWorkflowTimeout` | A remote `WorkflowExecutor.advance` produces no decision/heartbeat within its configured `timeoutMs`. Recoverable, not a run failure — the engine releases the lease and lets `recoverIncomplete` re-drive. |
-| `ContinueAsNew` | Thrown internally by `ctx.continueAsNew(input)` to unwind the current run and hand off to a fresh execution. Not meant to be caught by workflow code. |
-| `WorkflowSuspended` | Internal control signal the engine throws to stop execution and persist `wakeAt`/suspension state. Not a user-facing error — never throw or catch it yourself. |
+| `ContinueAsNew` | Thrown internally by `ctx.continueAsNew(input)` to unwind the current run and hand off to a fresh execution. A [control-flow signal](#control-flow-signals) — a workflow's `catch` must rethrow it untouched. |
+| `WorkflowSuspended` | Internal control signal the engine throws to stop execution and persist `wakeAt`/suspension state. A [control-flow signal](#control-flow-signals) — never throw or catch-and-handle it yourself; rethrow untouched. |
+
+### Control-flow signals
+
+`WorkflowSuspended`/`ContinueAsNew` above (and `@dudousxd/durable-worker`'s `Suspend`, the thin worker's
+equivalent) are thrown **internally** to unwind the current turn — a durable sleep, a still-pending
+step, `ctx.continueAsNew` — never real failures. Because they're thrown with the same JS exception
+mechanism a real step failure uses, a workflow's own `try`/`catch` around a `ctx.step`/`ctx.sleep`/etc.
+can observe one — and MUST rethrow it untouched before running any cleanup/compensation, or the
+cleanup gets recorded as an extra history command during what replay will later see as a plain suspend,
+corrupting the run (`NonDeterminismError` on resume). See
+[Sagas: the control-flow-signal pitfall](/docs/reliability/sagas#hand-rolled-compensation-the-control-flow-signal-pitfall)
+and [Troubleshooting](/docs/troubleshooting#a-caught-suspend-runs-compensation-and-corrupts-the-run).
+
+| Export | Signature | Notes |
+| --- | --- | --- |
+| `CONTROL_FLOW_SIGNAL` | `const CONTROL_FLOW_SIGNAL: unique symbol` | `Symbol.for('aviary:durable:control-flow')` — the shared, global-registry marker stamped on every control-flow signal class, across package/module-instance boundaries. Rarely used directly; prefer `isWorkflowControlFlowSignal`. |
+| `isWorkflowControlFlowSignal` | `isWorkflowControlFlowSignal(error: unknown): boolean` | `true` for `WorkflowSuspended`, `ContinueAsNew`, or the thin worker's `Suspend` — regardless of which runtime threw it. **Not** true for `Cancelled` (a terminal, legitimately-catchable outcome) or a `StepFailed`/ordinary step rejection (a real failure a saga's `catch` is meant to compensate for). |
+
+Both are exported from `@dudousxd/nestjs-durable-core` and re-exported by `@dudousxd/nestjs-durable`.
 
 ## Statuses
 

@@ -6,6 +6,8 @@ description: Run workflow steps in Python. A TypeScript workflow's ctx.step disp
 A step doesn't have to run in Node. The `durable-worker` Python SDK registers step handlers by
 name and runs them over the same Redis queues the [BullMQ transport](/docs/transports/bullmq) uses
 — so a TypeScript workflow's `ctx.step('payments.charge-card', …)` reaches a step implemented in Python.
+The SDK isn't limited to steps, either — a `WorkflowWorker` can author the whole workflow function in
+Python; see [Authoring workflows in Python](#authoring-workflows-in-python) below.
 
 ```bash
 pip install "durable-worker[redis]"
@@ -293,3 +295,39 @@ runner) for each broker, each consuming and replying on its own transport. Each 
 its results on the broker it consumes, so there's nothing to route — no `reply_target` needed. Reach for
 `reply_target` only when a single worker loop genuinely multiplexes several brokers and has to decide,
 per task, where the reply goes.
+
+## Authoring workflows in Python
+
+Steps aren't the only thing a Python worker can own — a `WorkflowWorker` can author the whole
+workflow function, not just implement a step for one written in TypeScript. The engine stays the
+sole owner of durable state, recovery, and timers: it advances a run one **turn** at a time by
+sending the run's history as a workflow task, the Python runtime replays the workflow function
+locally against that history, and returns whatever commands the replay produced (a step dispatch, a
+sleep, a signal wait) for the engine to persist and act on — the same turn-based protocol, just
+driven from the Python side:
+
+```python
+from durable_worker import WorkflowWorker
+
+workflows = WorkflowWorker(group="py-workflows")
+
+@workflows.workflow("pipeline")
+def pipeline(ctx, base_id):
+    started_at = ctx.now()                                                          # replay-stable capture
+    rows = ctx.step("ingestion", {"key": f"/{base_id}/data.csv"}, group="pipeline")  # dispatched
+    ctx.sleep(60_000)                                                                # durable timer
+    return {"rows": rows, "startedAt": started_at}
+```
+
+`ctx` carries the same primitives as the TypeScript `WorkflowCtx` — `step`, `sleep`, `now`,
+`side_effect`, `wait_signal`, `start_child` — each keyed by a deterministic seq, so a completed op
+replays its recorded result instead of re-running. It also adds concurrent fan-out with no
+TypeScript equivalent yet: `gather` runs several local steps in parallel and waits for all of them,
+`gather_children` does the same for child workflows, and `gather_calls` dispatches several steps in
+parallel within a single run (no child runs). All three default to `wait_all` — raising an
+aggregate `GatherFailed` if anything fails — with an opt-in `fail_fast`.
+
+Run a `WorkflowWorker` with `run_redis_workflow_worker(workflows, connection=...)` — the
+workflow-shaped sibling of `run_redis_worker` — or mix step and workflow workers in one process with
+`run_workers([step_worker, workflows], redis=...)`: one event loop, one Redis pool, and a clean
+shutdown on SIGTERM/SIGINT for every worker in the list.

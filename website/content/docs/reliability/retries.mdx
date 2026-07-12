@@ -163,3 +163,26 @@ means — the durable path retries it (subject to `retryable`), while a `timeout
 a timeout, surfacing any reported error to the workflow on the first attempt. Reach for `timeoutMs` only when
 you genuinely need to detect and replace a stuck worker; otherwise leave it off and get the durable,
 crash-safe path.
+
+### A third case: the dispatch itself gets lost
+
+Neither path above covers a step whose job **never produces a result at all** — no failure, no
+`timeoutMs` heartbeat to time out — because the worker crashed mid-step or the transport dropped the job
+(a Redis flush/eviction, or a stalled BullMQ job moved to `failed` and removed). Reconcile re-drives are
+deliberately conservative here: they re-suspend a still-`pending` step rather than re-dispatching it, so
+a merely-slow worker is never double-run. Without a `timeoutMs`, that means the run hangs on `pending`
+forever unless something re-dispatches it:
+
+- The BullMQ transport closes this gap **automatically**: a crashed/stalled task job's terminal failure
+  is bridged into a synthetic failed `StepResult`, so the checkpoint fails and the normal durable retry
+  path above kicks in — no configuration needed.
+- For any transport, `engine.redispatchPending(runId)` (or the dashboard's **Re-dispatch** action)
+  manually re-enqueues a run's stuck `pending` remote steps.
+- `remoteRedispatchMs` — an **opt-in** engine option — makes this self-healing: a reconcile re-drive
+  that finds a remote step still `pending` past the window re-dispatches it, bounded by
+  `remoteRedispatchMax` (default 10) before giving up and failing the step as `remote_step_lost`. Off by
+  default, because re-dispatch can double-run a step whose job is merely slow — the window must exceed
+  the longest legitimate duration and the step must be idempotent.
+
+See [Recovering a lost remote step dispatch](/docs/observability/dashboard#recovering-a-lost-remote-step-dispatch)
+for the dashboard side of this (the stale-pending flag and the Re-dispatch button).

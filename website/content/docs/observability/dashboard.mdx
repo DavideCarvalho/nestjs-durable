@@ -56,13 +56,17 @@ gated, not the control plane. (Default is `drive: true`, so single-process apps 
 
 ## What it shows
 
-- **Runs** — every run with its status (**pending** / running / suspended / completed / failed /
-  cancelled / **dead**), filterable. **`pending`** is a run that's been created and enqueued but not
-  yet picked up by a worker — you'll see it briefly on every run, and persistently on an API pod
-  (`drive: false`) whose runs execute on separate driving pods. The status filter is a row of chips,
-  including a **`dead`** chip for the
+- **Runs** — every run with its stored status (**pending** / running / suspended / **cancelling** /
+  completed / failed / cancelled / **dead**), filterable. **`pending`** is a run that's been created
+  and enqueued but not yet picked up by a worker — you'll see it briefly on every run, and persistently
+  on an API pod (`drive: false`) whose runs execute on separate driving pods. **`cancelling`** is a
+  transient, durable status for a `cancel(runId, { compensate: true })` whose saga undo is still running
+  in the background — it survives a crash mid-compensation and finalizes to `cancelled`. The status
+  filter is a row of chips, including a **`dead`** chip for the
   [dead-letter](/docs/concepts/durability) state; a dead run carries a distinct badge so a poison
-  pill is easy to spot.
+  pill is easy to spot. The generic `suspended` status covers very different situations — sleeping on a
+  timer, waiting on a signal, blocked with no worker, queued behind a singleton leader — so the list and
+  detail views refine it into a more legible display state; see [Waiting states](#waiting-states) below.
 - **Timeline as a graph** — the selected run rendered with `react-flow`: a node pipeline from
   start through each step to the terminal state, tagged by kind (local / remote / sleep / signal),
   with worker group and duration. This is the "see the whole flow" view — a workflow whose steps
@@ -83,6 +87,57 @@ gated, not the control plane. (Default is `drive: true`, so single-process apps 
   dispatch) and cancel + undo runs the saga compensation **in the background** — neither replays the
   workflow inline in the HTTP request, so the dashboard action returns immediately and a worker does the
   work. (Previously an inline replay could hang the request.)
+
+### Waiting states
+
+The engine only ever persists one generic **`suspended`** status for a durably-parked run — that's what
+drives recovery, timers, and queries, and it never changes. But *why* a run is parked reads very
+differently depending on what it's waiting on, so the run list and the run detail header refine it into
+a more legible display state (both derive it the same way, so they always agree):
+
+| Display state | Means |
+| --- | --- |
+| `sleeping` | Parked on a durable `ctx.sleep` timer. |
+| `awaiting` | Waiting on a signal, webhook, awaited child, or a `ctx.breakpoint()` pause — named e.g. `signal approve`, `webhook stripe-cb`, `child run-xyz`, or `breakpoint`. |
+| `no-worker` | Blocked: the run's next step is queued but its worker group has a real backlog (`depth > 0`) with zero live workers to consume it. |
+| `queued` | A singleton run gated behind another run holding its key's slot — shown as "behind leader `<id>`". |
+| `running` | Everything else open/in-flight, including a settled step waiting to be replayed with nothing currently blocking it. |
+
+The `awaiting` label is a `RunWaiting` (`{ on: 'signal' | 'webhook' | 'child' | 'breakpoint', name }`),
+resolved from the run's pending signal waiters and classified by the waiter token's prefix — `wh:` →
+webhook, `child:` → child, `bp:` → breakpoint, anything else → a named signal. A `ctx.breakpoint()`
+pause is implemented as a signal wait under the hood, so it's classified and shown as `breakpoint`
+rather than a raw `signal bp:<runId>:<seq>` token.
+
+**`no-worker` is gated on a real backlog, not bare zero live workers.** A worker only heartbeats for a
+group while it's actively serving it, so a group that's simply idle right now — a suspended run parked
+on its reconcile timer with nothing enqueued, or a scheduled workflow between cron runs — legitimately
+reports zero live workers without anything being blocked. Flagging that `no-worker` was a false
+positive, fixed in dashboard 0.29.6: the check is `depth > 0 && liveWorkers.length === 0` (the same
+alert condition `GroupHealth` documents, see [below](#engine-health--admin-surface)) — a real backlog
+with no consumer. A parked/settled run with nothing enqueued now reads `running` (open, in flight) and
+only flips to `no-worker` once its resume actually enqueues behind a stalled queue. This also fixed the
+header banner, which used to count completed-work orphans as stalled.
+
+**Bulk-resolving waiting state — `RunGateway.waitingFor`:** if you're building your own filtered/
+paginated run list and need to know which of *your* runs are parked on a breakpoint (or any other
+event wait) without re-deriving the waiter scan yourself or querying checkpoints directly, call
+`waitingFor` on the injected `RUN_GATEWAY`:
+
+```ts
+import { RUN_GATEWAY, type RunGateway } from '@dudousxd/nestjs-durable';
+
+constructor(@Inject(RUN_GATEWAY) private readonly runGateway: RunGateway) {}
+
+async whichAreStuck(runIds: string[]) {
+  return this.runGateway.waitingFor(runIds);
+  // { 'run-1': { on: 'breakpoint', name: 'breakpoint' }, 'run-3': { on: 'signal', name: 'approve' } }
+}
+```
+
+It resolves in two bulk store scans (never one query per id), and on a tenant deployment it proxies
+over the control-plane transport in a single request for the whole id list, scoped to runs the
+requesting tenant actually owns.
 
 ### Live-tail over SSE
 
@@ -136,6 +191,47 @@ a `dlq:<runId>` id) carrying `{ deadRunId, workflow, input, error }`. The dashbo
 **relationship both ways**: the dead run links forward to its `dlq:<id>` handler, and the handler links
 back to the dead run it was started for — so you can jump between the failure and whatever your DLQ
 workflow did about it (alert, compensate, queue for review).
+
+### Recovering a lost remote step dispatch
+
+A remote step with no `timeoutMs` dispatches its task, persists a `pending` checkpoint, and suspends
+until the worker's result resumes it. If the worker crashed mid-step or the transport dropped the job
+(a Redis flush/eviction, or a stalled BullMQ job moved to `failed` and removed), the result never
+comes — and reconcile re-drives, by design, just re-suspend a still-`pending` step rather than
+re-dispatching it (so a merely-slow worker is never double-run). Left alone, the run hangs on `pending`
+forever.
+
+The dashboard flags this instead of masquerading it as a healthy in-flight step: a remote step
+`pending` past 10 minutes (`STALE_PENDING_MS`) shows in the timeline as "awaiting worker result —
+dispatched Nm ago (possibly lost)". From there:
+
+- **Re-dispatch action** — `POST runs/:id/redispatch` (`durableClient.redispatch(id)`, or the
+  dashboard's "Re-dispatch" button) re-enqueues the run's stuck `pending` remote steps, bumping their
+  `attempts` so the idempotent step re-runs and its result resumes the run — the manual escape hatch,
+  equivalent to `WorkflowEngine.redispatchPending(runId)`.
+- **BullMQ self-heals for free.** The BullMQ transport bridges a crashed/stalled task job's terminal
+  failure into a synthetic failed `StepResult` (via the worker's `'failed'` event), so the engine marks
+  the checkpoint `failed` and its normal durable retry re-dispatches — no config needed, and the run
+  never gets stuck on `pending` in the first place on this transport.
+- **Opt-in self-heal — `remoteRedispatchMs`** (any transport). Set this engine option and a reconcile
+  re-drive that finds a remote step still `pending` past the window automatically re-dispatches it,
+  bounded by `remoteRedispatchMax` (default 10) so a step that never settles fails as a
+  `remote_step_lost` error instead of looping forever:
+
+  ```ts
+  DurableModule.forRoot({
+    store,
+    transport,
+    remoteRedispatchMs: 15 * 60_000, // self-heal a remote step still pending after 15 minutes
+    remoteRedispatchMax: 10,
+  });
+  ```
+
+  **Off by default** — re-dispatch can double-run a step whose original job is merely slow, so the
+  window must exceed the longest such step's real duration and the step must be idempotent. Prefer a
+  per-step `timeoutMs` where you can (tighter, heartbeat-aware — see
+  [Retries & backoff](/docs/reliability/retries)); `remoteRedispatchMs` is the store-driven net for the
+  no-timeout steps that must still survive a lost dispatch.
 
 ### Webhook callbacks
 
@@ -247,6 +343,7 @@ await durableClient.retry(detail.run.id);
 | `GET` (SSE) | `/durable/api/runs/:id/stream` | live-tail the run's lifecycle events |
 | `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |
 | `POST` | `/durable/api/runs/:id/retry-with-input` | fix-and-replay: start a fresh linked run from a dead/failed run with a corrected input (body: `{ input }`) |
+| `POST` | `/durable/api/runs/:id/redispatch` | re-enqueue a run's stuck `pending` remote steps (a lost dispatch) |
 | `POST` | `/durable/api/runs/:id/cancel` | cancel the run (`?compensate=true` to undo the saga first) |
 | `POST` | `/durable/api/runs/:id/continue` | resume a run paused at a breakpoint |
 | `POST` | `/durable/api/webhooks/:token` | deliver a `ctx.webhook()` callback (body resumes the run) |

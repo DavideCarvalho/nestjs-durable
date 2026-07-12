@@ -77,6 +77,26 @@ several isolated deployments — e.g. one per developer — without crosstalk. L
 inserts a `-<namespace>` segment into every name. See [Tenancy](/docs/concepts/tenancy) for the
 operator/tenant model this enables.
 
+## Crash recovery
+
+A worker that crashes or stalls mid-step never produces a `StepResult`, so without help the step's
+checkpoint would stay `pending` forever. `BullMQTransport` closes that gap **automatically**:
+BullMQ's own stalled-check (run by a peer worker's `Worker`) marks a crashed/stalled task job
+`failed`, and a `Worker.on('failed')` listener bridges that into a synthetic failed `StepResult` —
+so the engine settles the checkpoint as `failed` and its normal durable retry re-dispatches the
+step. A handler business error is unaffected: `runStepHandler` already turns it into a
+*successful* job carrying a failed `StepResult`, so there's no double-publish.
+
+No configuration needed on your part — `dispatch()` sets `removeOnFail: { age: 24h }` on every
+task job (overriding the default immediate `removeOnFail`) so a failed job's payload survives long
+enough for the bridge to read the `runId`/`seq`/`stepId` it needs, before BullMQ garbage-collects
+it.
+
+Residual gap: if the **only** worker for a queue crashes and never restarts, no peer's
+stalled-check ever runs, so nothing settles the checkpoint — that needs an external liveness
+monitor, or the engine's opt-in `remoteRedispatchMs` self-heal. See
+[Recovering a lost remote step dispatch](/docs/observability/dashboard#recovering-a-lost-remote-step-dispatch).
+
 ## Control plane & tenant protocol
 
 Beyond `Transport`, `BullMQTransport` also implements `ControlPlane` — cross-instance broadcast for

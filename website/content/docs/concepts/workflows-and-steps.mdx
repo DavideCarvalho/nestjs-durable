@@ -106,6 +106,17 @@ then resumes with it.
 You declare the work as a `@Step`-decorated provider method and call it from the workflow with
 `ctx.step`:
 
+<Callout title="ctx.step always dispatches — for in-process work, that's ctx.localStep">
+`ctx.step` never runs its body in this process; it always goes over the wire to a worker (this
+process, another instance, another language — whichever serves the name). If you need a checkpointed
+step whose body runs **inline**, in the workflow process itself — a cheap synchronous transform, or a
+saga's local compensation closure — that's a different primitive, `ctx.localStep(name, fn, options?)`,
+not `ctx.step`. The two are easy to conflate because they're both "a checkpointed step you await," but
+they are opposite in **where the code executes** — confusing them has shipped real production bugs.
+`ctx.localStep` is covered where it's actually used: [step interceptors](#step-interceptors) (below)
+and [saga compensation](/docs/reliability/sagas#the-in-process-alternative-ctxlocalstep).
+</Callout>
+
 <CodeFlow scene="dispatched-step" />
 
 The handler's single argument is the step **input**; its return value is the step **output**. Two call

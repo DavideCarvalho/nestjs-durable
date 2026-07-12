@@ -144,7 +144,8 @@ Each `RetentionPolicy` targets a disjoint set of terminal statuses; a run is kep
 satisfies every bound you set on its status (`maxAge`, `maxCount`, or both — the most-restrictive
 wins) and is pruned the moment it violates one. `sweepInterval: 0` runs the sweep once on boot only.
 Pruning needs the store to implement `pruneTerminalRuns` — optional on `StateStore`, so a store
-without it no-ops with a warning instead of failing boot.
+without it no-ops with a warning instead of failing boot. Of the four bundled adapters, only
+**MikroORM** implements it today; TypeORM, Prisma and Drizzle no-op with the warning until they do.
 
 <Callout type="warn">
   **`withScope` is MikroORM-only.** Multi-tenant setups can turn on `scopeReads: true` (with

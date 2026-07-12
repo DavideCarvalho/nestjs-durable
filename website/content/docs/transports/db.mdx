@@ -28,6 +28,15 @@ Trade-off vs a real broker: throughput is bounded by polling + row contention â€
 workflow/pipeline scale (modest rate, long steps), not for high-fanout firehoses. Requires
 `FOR UPDATE SKIP LOCKED`: **Postgres 9.5+** or **MySQL 8+** (not SQLite).
 
+## Worker health
+
+`DbTransport` doesn't implement `groupHealth`/`listWorkerGroups` â€” the engine's `workerHealth()`
+query, and the dashboard/Telescope worker-health panels built on it, return **empty** for this
+transport's groups; only a `groupHealth`-capable transport (BullMQ) returns non-empty results.
+Liveness here is the lease itself, not a separate heartbeat: a claimed row whose `claimed_at` is
+older than `leaseMs` is treated as abandoned and reclaimed by the next poll (see
+[Claim protocol](#claim-protocol)).
+
 ## Options
 
 | Option | Description |
