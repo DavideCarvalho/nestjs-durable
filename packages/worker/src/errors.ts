@@ -1,4 +1,4 @@
-import type { StepError } from '@dudousxd/nestjs-durable-core';
+import { CONTROL_FLOW_SIGNAL, type StepError } from '@dudousxd/nestjs-durable-core';
 
 /** Base for workflow-runtime errors. Mirrors the Python `WorkflowError`. */
 export class WorkflowError extends Error {}
@@ -33,7 +33,8 @@ export class NondeterminismError extends WorkflowError {
 /**
  * A step/call/child the workflow awaited resolved to a failure. Catchable in workflow code
  * (`try/catch`) exactly like an awaited rejection — catch it to compensate, or let it propagate to
- * fail the run. Mirrors the Python `StepFailed`.
+ * fail the run. Mirrors the Python `StepFailed`. Deliberately NOT a control-flow signal — this IS a
+ * real failure a `catch` is meant to handle, unlike `Suspend`/`ContinueAsNew`/`WorkflowSuspended`.
  */
 export class StepFailed extends Error {
   readonly error: StepError;
@@ -76,10 +77,16 @@ export class GatherReplayError extends StepFailed {
 
 /**
  * Internal: stop the replay at the first unresolved blocking op. Ends a turn. Mirrors the Python
- * `_Suspend`. Never surfaces to workflow code — `WorkflowWorker.processTask` translates it to a
- * `continue` decision.
+ * `_Suspend`. `WorkflowWorker.processTask` translates it to a `continue` decision — but a workflow
+ * body's OWN `catch` block sits between the throwing op and `processTask`, so it CAN observe this
+ * (e.g. a `try { await ctx.step(...) } catch { cleanup } ` wrapping a still-pending op). Stamped
+ * with `CONTROL_FLOW_SIGNAL` (see `@dudousxd/nestjs-durable-core`'s `isWorkflowControlFlowSignal`)
+ * so such a catch can recognize it and rethrow untouched instead of misfiring cleanup/failure logic
+ * mid-suspend, which would emit extra commands and corrupt the replayed history.
  */
 export class Suspend extends Error {
+  /** Marks this as a control-flow signal — see `isWorkflowControlFlowSignal` (durable-core). */
+  readonly [CONTROL_FLOW_SIGNAL] = true;
   constructor() {
     super('workflow suspended');
     this.name = 'Suspend';
@@ -89,7 +96,9 @@ export class Suspend extends Error {
 /**
  * Raised at an op boundary when the run was cancelled mid-turn (the control channel broadcast a
  * cancel for this run id). `processTask` maps it to a `cancelled` decision. Mirrors the Python
- * `Cancelled`.
+ * `Cancelled`. Deliberately NOT a control-flow signal — cancellation is a TERMINAL outcome a
+ * workflow's `catch` may legitimately want to observe and react to (e.g. release a lock), unlike a
+ * mid-turn suspend/continue-as-new that must always be rethrown untouched.
  */
 export class Cancelled extends Error {
   readonly runId: string;
