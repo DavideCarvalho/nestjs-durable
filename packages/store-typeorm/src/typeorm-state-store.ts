@@ -335,6 +335,12 @@ export class TypeOrmStateStore implements StateStore {
     return waiter;
   }
 
+  async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
+    // Exact-match delete (token AND runId AND seq) — a plain `delete({ token })` would remove
+    // whatever row currently owns the token, even if a different run has since claimed it.
+    await this.waiters().delete({ token: waiter.token, runId: waiter.runId, seq: waiter.seq });
+  }
+
   async bufferSignal(token: string, payload: unknown): Promise<void> {
     await this.buffered().save({ token, payload: payload ?? null });
   }

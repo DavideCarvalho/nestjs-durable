@@ -112,6 +112,9 @@ export class CodecStateStore implements StateStore {
   listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
     return this.inner.listSignalWaiters(prefix);
   }
+  removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
+    return this.inner.removeSignalWaiter(waiter);
+  }
   bufferSignal(token: string, payload: unknown): Promise<void> {
     return this.inner.bufferSignal(token, this.enc(payload));
   }

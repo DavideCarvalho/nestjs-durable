@@ -474,6 +474,17 @@ export class MikroOrmStateStore implements StateStore {
     }));
   }
 
+  async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
+    const em = this.fork();
+    // Exact-match delete (token AND runId AND seq) — deleting by `token` alone would remove whatever
+    // row currently owns it, even if a different run has since claimed the same token.
+    await em.nativeDelete(SignalWaiterEntity, {
+      token: waiter.token,
+      runId: waiter.runId,
+      seq: waiter.seq,
+    });
+  }
+
   async bufferSignal(token: string, payload: unknown): Promise<void> {
     const em = this.fork();
     const e = new BufferedSignalEntity();

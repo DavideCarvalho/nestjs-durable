@@ -347,6 +347,15 @@ export class PrismaStateStore implements StateStore {
     }));
   }
 
+  async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
+    // Exact-match delete (token AND runId AND seq): `token` is the only unique column, so a plain
+    // `delete({ where: { token } })` would remove whatever row currently owns it, even if a different
+    // run has since claimed the same token — `deleteMany` with all three fields is a safe no-op then.
+    await this.db.durableSignalWaiter.deleteMany({
+      where: { token: waiter.token, runId: waiter.runId, seq: waiter.seq },
+    });
+  }
+
   async bufferSignal(token: string, payload: unknown): Promise<void> {
     await this.db.durableBufferedSignal.create({ data: { token, payload: jsonOrNull(payload) } });
   }

@@ -410,7 +410,26 @@ export function createWorkflowCtx(
       if (existing && existing.status === 'completed') return existing.output as T;
       const buffered = await consumeBuffered<T>(token, current);
       if (buffered) return buffered.value;
+      // Register, THEN check the buffer again before suspending — closes the lost-wake window
+      // between the check above and this registration: a signal delivered in that sliver found no
+      // waiter (we hadn't registered yet) and no buffer either by the time IT checked, so it buffered
+      // the payload; without this re-check we'd suspend with the payload sitting unpaired forever.
+      // (Registering UNCONDITIONALLY before even the first check — instead of only on a miss like
+      // here — reopens a worse window: a token an entity loop reuses across iterations would expose
+      // a "this turn is about to self-resolve from the buffer" waiter row to a concurrent signal for
+      // the NEXT iteration's payload, which can steal it via engine.signal's plain takeSignalWaiter
+      // and misdeliver. Checking first, so we only ever register when we're sure no buffer already
+      // existed, avoids that.) See the interleaving proof at engine.signal for the mirror-image
+      // take→buffer→re-take on the signaling side that this pairs with.
       await store.putSignalWaiter({ token, runId, seq: current });
+      const lateBuffered = await consumeBuffered<T>(token, current);
+      if (lateBuffered) {
+        // Resolved it ourselves — remove OUR OWN row via the exact match, not
+        // `takeSignalWaiter(token)`, which deletes ANY row for this token and could steal a
+        // different run's waiter that has since claimed the same token.
+        await store.removeSignalWaiter({ token, runId, seq: current });
+        return lateBuffered.value;
+      }
       throw new WorkflowSuspended();
     }
     const timeoutMs = opts.timeoutMs;
@@ -424,10 +443,20 @@ export function createWorkflowCtx(
     const buffered = await consumeBuffered<T>(token, waitSeq);
     if (buffered) return buffered.value;
     if (host.clock() >= deadline) {
-      await store.takeSignalWaiter(token).catch(() => undefined);
+      // A PRIOR replay of this same call may have already registered the waiter (below) before this
+      // one found the deadline past — clean up that exact row (own token/runId/seq only; a plain
+      // `takeSignalWaiter(token)` could otherwise steal a different run's waiter on the same token).
+      // A no-op if nothing was ever registered.
+      await store.removeSignalWaiter({ token, runId, seq: waitSeq }).catch(() => undefined);
       throw new SignalTimeoutError(token, timeoutMs);
     }
+    // Same reorder as the unbounded arm above: check, THEN register, THEN re-check before suspending.
     await store.putSignalWaiter({ token, runId, seq: waitSeq });
+    const lateBuffered = await consumeBuffered<T>(token, waitSeq);
+    if (lateBuffered) {
+      await store.removeSignalWaiter({ token, runId, seq: waitSeq });
+      return lateBuffered.value;
+    }
     throw new WorkflowSuspended(deadline);
   };
 
@@ -454,7 +483,9 @@ export function createWorkflowCtx(
     const waited = await readCheckpoint(waitSeq);
     if (waited && waited.status === 'completed') return waited.output as T;
     if (host.clock() >= deadline) {
-      await store.takeSignalWaiter(token).catch(() => undefined);
+      // Exact removal (see waitForSignal above) — takeSignalWaiter(token) deletes ANY row for this
+      // token and could steal a different run's waiter registered on it after ours timed out.
+      await store.removeSignalWaiter({ token, runId, seq: waitSeq }).catch(() => undefined);
       throw new SignalTimeoutError(`event:${name}`, timeoutMs);
     }
     await store.putSignalWaiter({ token, runId, seq: waitSeq });

@@ -342,6 +342,17 @@ export interface StateStore {
   listSignalWaiters(prefix: string): Promise<SignalWaiter[]>;
 
   /**
+   * Delete the EXACT waiter row — `token` AND `runId` AND `seq` must all match — no-op if absent.
+   * Unlike {@link takeSignalWaiter}, which deletes ANY row for `token` (fine when the caller just won
+   * the race to consume it), this is for a caller removing its OWN registration after resolving the
+   * wait some other way (a buffered hit, a timeout): blind `takeSignalWaiter(token)` there could steal
+   * a DIFFERENT run's waiter that has since claimed the same token (`token` is the store's primary key,
+   * so a later `putSignalWaiter` for the same token replaces the row). The exact-match variant only
+   * ever removes the row this caller itself put there.
+   */
+  removeSignalWaiter(waiter: SignalWaiter): Promise<void>;
+
+  /**
    * Buffer a signal whose waiter hasn't arrived yet, so the next `waitForSignal(token)` consumes it
    * instead of it being lost (FIFO per token). Makes signals reliable regardless of timing and
    * powers `signalWithStart`.

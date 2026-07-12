@@ -29,6 +29,7 @@ import type {
   RunStatus,
   SearchAttributes,
   SearchAttributesSchema,
+  SignalWaiter,
   StateStore,
   StepCheckpoint,
   StepDef,
@@ -53,6 +54,7 @@ import type { HistoryEvent } from './interfaces';
 import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
+import { indexWaitersByRun } from './run-waiting';
 import { SingletonGate } from './singleton-gate';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
@@ -1273,9 +1275,49 @@ export class WorkflowEngine {
   /**
    * Resume every suspended run whose durable timer is due. Call periodically (a poller) and on
    * boot. A run still not due re-suspends cheaply without running new work.
+   *
+   * Piggy-backs the signal-waiter reconcile safety net (see {@link reconcileSignalWaiter}): a crash
+   * between the waiter/buffer pairing ops on EITHER side (this run's own `putSignalWaiter` →
+   * `takeBufferedSignal`, or a signaler's `takeSignalWaiter` → `bufferSignal` → re-check — see
+   * `signal`'s interleaving proof) can leave both rows stranded with nothing left to pair them: the
+   * waiter's turn already suspended, the signaler that buffered it already returned. Event-wait
+   * suspends already carry a `reconcileMs` fallback `wakeAt` (see {@link reconcileWakeAt}) precisely so
+   * they show up HERE — that's what makes this due-timer pass the natural place for the sweep. One
+   * bulk waiter scan, filtered to just this tick's batch, keeps it cheap regardless of store size.
    */
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
-    return this.resumeLeased(await this.store.listDueTimers(nowMs, this.namespace), nowMs);
+    const due = await this.store.listDueTimers(nowMs, this.namespace);
+    if (due.length === 0) return [];
+    const waiterByRun = indexWaitersByRun(await this.store.listSignalWaiters(''));
+    return this.resumeLeased(due, nowMs, (run) =>
+      this.reconcileSignalWaiter(run, waiterByRun.get(run.id)),
+    );
+  }
+
+  /**
+   * The reconcile safety net's per-run check (see {@link resumeDueTimers}): if this suspended run has
+   * a registered signal waiter AND its token already has a buffered payload, pair and deliver them
+   * directly instead of falling through to a full replay. Event/child/breakpoint waiter tokens are
+   * never buffered (`publishEvent` doesn't buffer, and a child/breakpoint notifies via `signal` only
+   * once its counterpart is already registered) — so `takeBufferedSignal` on those is a guaranteed
+   * miss, and this is naturally signal-only without needing to classify the token.
+   *
+   * Returns `undefined` (not settled — `resumeLeased` proceeds with its normal `resume`) when there's
+   * no waiter or no buffered hit. Deliberately never returns `null`: a delivered signal always resumes
+   * via {@link deliverSignal}, and even a `NamespaceMismatch` there is reported as a real (non-nullish)
+   * result — returning `null` would read as "not settled" to `resumeLeased`'s `??` fallback and
+   * trigger a second, redundant `resume` call on the same run.
+   */
+  private async reconcileSignalWaiter(
+    run: WorkflowRun,
+    waiter: SignalWaiter | undefined,
+  ): Promise<RunResult | undefined> {
+    if (!waiter) return undefined;
+    const buffered = await this.store.takeBufferedSignal(waiter.token);
+    if (!buffered) return undefined;
+    await this.store.removeSignalWaiter(waiter);
+    const settled = await this.deliverSignal(waiter, buffered.payload);
+    return settled ?? { runId: run.id, status: run.status };
   }
 
   /**
@@ -1547,19 +1589,18 @@ export class WorkflowEngine {
     return touched;
   }
 
-  async signal(token: string, payload: unknown): Promise<RunResult | null> {
-    const waiter = await this.store.takeSignalWaiter(token);
-    if (!waiter) {
-      // No one is waiting yet — buffer it so the next `waitForSignal(token)` consumes it instead of
-      // dropping it (reliable signals; the basis of `signalWithStart`).
-      await this.store.bufferSignal(token, payload);
-      return null;
-    }
+  /**
+   * Deliver a signal to an already-known waiter: write its resolving `signal:<token>` checkpoint and
+   * resume the run. Shared by {@link signal}'s direct hit, its post-buffer re-check reclaim, and the
+   * due-timer reconcile sweep ({@link reconcileSignalWaiter}) — all three resolve a waiter the exact
+   * same way.
+   */
+  private async deliverSignal(waiter: SignalWaiter, payload: unknown): Promise<RunResult | null> {
     await this.store.saveCheckpoint(
       instantCheckpoint({
         runId: waiter.runId,
         seq: waiter.seq,
-        name: `signal:${token}`,
+        name: `signal:${waiter.token}`,
         kind: 'signal',
         output: payload,
         // Carry the awaiting command's fan group (set when a `ctx.gather_children`/`ctx.all` fan-out
@@ -1573,6 +1614,51 @@ export class WorkflowEngine {
       if (err instanceof NamespaceMismatch) return null;
       throw err;
     });
+  }
+
+  /**
+   * Deliver an external signal to the run waiting on `token`, resume it with `payload`, and return
+   * the run result — or null if no run is (or ends up) waiting for it.
+   *
+   * Race with the waiter side (`waitForSignal`'s check → `putSignalWaiter` → re-check, same shape in
+   * the remote `waitSignal` command): a waiter can register in the sliver between this method's
+   * initial `takeSignalWaiter` miss and its `bufferSignal` write, and the naive old flow (buffer and
+   * return) would then leave BOTH a buffered payload and a registered waiter sitting in the store with
+   * nothing left to pair them — a lost wake, forever suspended.
+   *
+   * The interleaving proof: the waiter side does check → put → re-check, this side does take → buffer
+   * → re-check. Whichever side's SECOND look runs last is guaranteed to observe the other side's
+   * write, because it always follows that write in real time:
+   *  - If the waiter's `put` lands before this method's first `take`, the take just finds it directly
+   *    (the pre-existing, non-racy path).
+   *  - If the waiter's `put` lands after this method's `bufferSignal`, our re-check below either sees
+   *    it (if `put` also lands before the re-check) or the waiter's OWN post-put re-check sees our
+   *    buffer (if `put` lands after our re-check but the waiter hasn't re-checked yet either — its
+   *    re-check strictly follows its own put).
+   *  - If the waiter's `put` lands between this method's `take` and its re-`take`, the re-check below
+   *    catches it.
+   * Either way, the destructive `take*` ops (on the waiter row, on the buffer) arbitrate: whichever
+   * side actually removes the row is the one that delivers, so a signal is never delivered twice.
+   */
+  async signal(token: string, payload: unknown): Promise<RunResult | null> {
+    const waiter = await this.store.takeSignalWaiter(token);
+    if (waiter) return this.deliverSignal(waiter, payload);
+    // No one was waiting yet — buffer it so the next `waitForSignal(token)` consumes it instead of
+    // dropping it (reliable signals; the basis of `signalWithStart`).
+    await this.store.bufferSignal(token, payload);
+    // Re-check: a waiter may have registered in the window between the miss above and this buffer
+    // write (see the interleaving proof above).
+    const lateWaiter = await this.store.takeSignalWaiter(token);
+    if (!lateWaiter) return null;
+    const reclaimed = await this.store.takeBufferedSignal(token);
+    if (!reclaimed) {
+      // The waiter side won the race to consume the buffer itself (its own checkpoint+resume already
+      // delivered the payload) in the sliver between our takeSignalWaiter and takeBufferedSignal just
+      // above. We've already (destructively) taken `lateWaiter` off the store, but there is nothing
+      // left to deliver — drop it deliberately rather than resuming the run a second time.
+      return null;
+    }
+    return this.deliverSignal(lateWaiter, reclaimed.payload);
   }
 
   /**
@@ -2086,6 +2172,15 @@ export class WorkflowEngine {
       void this.notifyParent(run.id, { ok: false, error: outcome.error.message });
       return { runId: run.id, status: 'failed', error: outcome.error };
     }
+    // This outcome was computed by a turn that started from a possibly-stale run snapshot. If the run
+    // was cancelled WHILE that turn was still executing (e.g. `ctx.all`'s failFast cancelling a
+    // sibling mid-turn — plain `cancel()` writes `cancelled` directly, without waiting for the target's
+    // in-flight turn to notice), this now-stale "suspended" outcome must not resurrect it: re-check the
+    // CURRENT persisted status right before writing and echo it instead of clobbering a real cancel.
+    const latest = await this.store.getRun(run.id);
+    if (latest?.status === 'cancelled') {
+      return { runId: run.id, status: 'cancelled', error: latest.error };
+    }
     await this.store.updateRun(run.id, {
       status: 'suspended',
       wakeAt: this.reconcileWakeAt(outcome.wakeAt),
@@ -2496,20 +2591,38 @@ export class WorkflowEngine {
         // engine.signal(name, payload) delivers it. If the signal was already delivered (buffered
         // before the workflow reached this point — e.g. signalWithStart), resolve it now and re-drive
         // on a macrotask, AFTER this turn suspends and frees the run lock (a re-entrant resume bails).
-        const buffered = await this.store.takeBufferedSignal(cmd.signal);
-        if (buffered) {
+        const deliverBuffered = async (payload: unknown): Promise<void> => {
           await this.store.saveCheckpoint(
             instantCheckpoint({
               runId: run.id,
               seq: cmd.seq,
               name: `signal:${cmd.signal}`,
               kind: 'signal',
-              output: buffered.payload,
+              output: payload,
             }),
           );
           setTimeout(() => void this.resume(run.id).catch(() => undefined), 0);
+        };
+        const buffered = await this.store.takeBufferedSignal(cmd.signal);
+        if (buffered) {
+          await deliverBuffered(buffered.payload);
         } else {
+          // Same reorder as the in-process ctx.waitForSignal (see there for why registering
+          // UNCONDITIONALLY before even the first check is unsafe — it would expose a "this turn is
+          // about to self-resolve" waiter row to a concurrent signal for a token a polyglot entity
+          // loop reuses, which could steal it and misdeliver): check first, and only on a miss
+          // register, then re-check once more before suspending — closing the lost-wake window where
+          // a signal races in between the miss above and the registration below (see the interleaving
+          // proof at engine.signal).
           await this.store.putSignalWaiter({ token: cmd.signal, runId: run.id, seq: cmd.seq });
+          const lateBuffered = await this.store.takeBufferedSignal(cmd.signal);
+          if (lateBuffered) {
+            // Resolved it ourselves — remove OUR OWN row via the exact match (not
+            // takeSignalWaiter(cmd.signal), which deletes ANY row for this token and could steal a
+            // different run's waiter that has since claimed the same token).
+            await this.store.removeSignalWaiter({ token: cmd.signal, runId: run.id, seq: cmd.seq });
+            await deliverBuffered(lateBuffered.payload);
+          }
         }
       } else if (cmd.kind === 'startChild') {
         // Start a child run and await it (the worker's ctx.start_child suspends until the child's

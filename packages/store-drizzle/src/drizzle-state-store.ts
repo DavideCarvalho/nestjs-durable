@@ -325,6 +325,20 @@ export class DrizzleStateStore implements StateStore {
     }));
   }
 
+  async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
+    // Exact-match delete (token AND runId AND seq) — deleting on `token` alone would remove whatever
+    // row currently owns it, even if a different run has since claimed the same token.
+    await this.db
+      .delete(signalWaiters)
+      .where(
+        and(
+          eq(signalWaiters.token, waiter.token),
+          eq(signalWaiters.runId, waiter.runId),
+          eq(signalWaiters.seq, waiter.seq),
+        ),
+      );
+  }
+
   async bufferSignal(token: string, payload: unknown): Promise<void> {
     await this.db.insert(bufferedSignals).values({ token, payload: payload ?? null });
   }

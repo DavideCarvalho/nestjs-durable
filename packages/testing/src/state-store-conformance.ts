@@ -572,6 +572,30 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    t(
+      "removeSignalWaiter deletes only the exact (token, runId, seq) row, never a different run's",
+      async () => {
+        // A stale identity for a token that's since been superseded (`token` is the store's primary
+        // key — a later `putSignalWaiter` for the same token replaces the row) must be a no-op: it
+        // must NOT steal the new owner's row out from under it.
+        await store.putSignalWaiter({ token: 'approve-1', runId: 'r1', seq: 3 });
+        await store.putSignalWaiter({ token: 'approve-1', runId: 'r2', seq: 7 });
+        await store.removeSignalWaiter({ token: 'approve-1', runId: 'r1', seq: 3 });
+        expect((await store.listSignalWaiters('approve-')).map((w) => w.runId)).toEqual(['r2']);
+
+        // A mismatched runId/seq against the CURRENT row is also a no-op.
+        await store.removeSignalWaiter({ token: 'approve-1', runId: 'r2', seq: 999 });
+        expect((await store.listSignalWaiters('approve-')).map((w) => w.runId)).toEqual(['r2']);
+
+        // The exact match deletes it.
+        await store.removeSignalWaiter({ token: 'approve-1', runId: 'r2', seq: 7 });
+        expect(await store.listSignalWaiters('approve-')).toEqual([]);
+
+        // Removing an absent row entirely is a no-op, not an error.
+        await store.removeSignalWaiter({ token: 'never-registered', runId: 'r1', seq: 0 });
+      },
+    );
+
     t('buffers signals and takes them FIFO per token', async () => {
       await store.bufferSignal('sig', { n: 1 });
       await store.bufferSignal('sig', { n: 2 });

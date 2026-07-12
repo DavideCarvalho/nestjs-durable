@@ -171,6 +171,16 @@ export class InMemoryStateStore implements StateStore {
       .map((w) => ({ ...w }));
   }
 
+  async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
+    // Keyed by token only (one row per token) — only delete if the CURRENT row still matches this
+    // exact (runId, seq); a later putSignalWaiter for the same token may have already replaced it
+    // with a different run's row, which must be left alone.
+    const current = this.signalWaiters.get(waiter.token);
+    if (current && current.runId === waiter.runId && current.seq === waiter.seq) {
+      this.signalWaiters.delete(waiter.token);
+    }
+  }
+
   // No real DB transaction (there's no DB) — run the work and save the checkpoint. Exactly-once
   // across a crash needs a SQL store; this keeps `ctx.transaction` usable in tests / local dev.
   async transaction<T>(
