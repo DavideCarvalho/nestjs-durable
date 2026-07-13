@@ -1,3 +1,4 @@
+import net from 'node:net';
 import {
   type EngineEvent,
   InMemoryStateStore,
@@ -8,6 +9,7 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
 import { Queue } from 'bullmq';
+import { Redis } from 'ioredis';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BullMQTransport, toBrokerPriority } from './bullmq-transport';
 
@@ -56,14 +58,90 @@ async function settle(store: InMemoryStateStore, runId: string, timeoutMs = 15_0
 }
 
 /** Poll `predicate` until it's true, mirroring `settle()`'s loop shape for non-store round-trips
- *  (e.g. a queue-delivered message landing in a locally-collected array). */
-async function waitUntil(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
+ *  (e.g. a queue-delivered message landing in a locally-collected array, or a server-side check
+ *  like `PUBSUB NUMSUB` read through a standalone admin client). */
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 15_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((r) => setTimeout(r, 25));
   }
   throw new Error('condition was never met');
+}
+
+/** `PUBSUB NUMSUB <channel>` subscriber count, read through a standalone admin client that talks
+ *  DIRECTLY to the real container (never through `startSilentProxy` below) — the ground truth for
+ *  "does the server think anyone is still subscribed". */
+async function numsub(admin: Redis, channel: string): Promise<number> {
+  const reply = await admin.pubsub('NUMSUB', channel);
+  const count = Array.isArray(reply) ? reply[1] : undefined;
+  return typeof count === 'number' ? count : 0;
+}
+
+/**
+ * A TCP relay that can, on `freeze()`, turn its currently-open connections silent — reproducing the
+ * exact failure this suite's watchdog exists for: a NAT/VPN/idle-timeout dropping a connection's
+ * state WITHOUT either endpoint's TCP stack observing a close. Unlike Redis's own `CLIENT KILL`
+ * (which sends a real FIN/RST — ioredis's ordinary close+reconnect handling already recovers from
+ * that on its own, watchdog or not), `freeze()` severs only the upstream (proxy → Redis) leg — so
+ * the real server drops the subscription (`PUBSUB NUMSUB` → 0) — while leaving the downstream
+ * (client → proxy) socket open and unresponsive: from ioredis's side, `status` stays `'ready'` and
+ * nothing ever errors; a `PING` sent into it just never gets a reply. That gap is precisely what the
+ * ping watchdog is for. A connection made AFTER `freeze()` (i.e. the reconnect the watchdog
+ * triggers) is unaffected and relays normally, so recovery is exercised end-to-end.
+ */
+function startSilentProxy(
+  targetHost: string,
+  targetPort: number,
+): Promise<{ port: number; freeze: () => void; close: () => Promise<void> }> {
+  return new Promise((resolve, reject) => {
+    const pairs: Array<{ down: net.Socket; up: net.Socket; frozen: boolean }> = [];
+    const server = net.createServer((down) => {
+      const up = net.connect(targetPort, targetHost);
+      const pair = { down, up, frozen: false };
+      pairs.push(pair);
+      down.on('data', (chunk) => {
+        if (!pair.frozen) up.write(chunk);
+      });
+      up.on('data', (chunk) => {
+        if (!pair.frozen) down.write(chunk);
+      });
+      down.on('error', () => {});
+      up.on('error', () => {});
+      down.on('close', () => {
+        if (!pair.frozen) up.destroy();
+      });
+    });
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('silent proxy failed to bind'));
+        return;
+      }
+      resolve({
+        port: address.port,
+        freeze: () => {
+          for (const pair of pairs) {
+            if (pair.frozen) continue;
+            pair.frozen = true;
+            pair.up.destroy(); // the server-side leg goes away; `down` is left open and silent
+          }
+        },
+        close: () =>
+          new Promise((res) => {
+            for (const pair of pairs) {
+              pair.down.destroy();
+              pair.up.destroy();
+            }
+            server.close(() => res());
+          }),
+      });
+    });
+  });
 }
 
 /** Resolve the live connection or self-skip the case when Docker isn't available. */
@@ -257,4 +335,46 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
     await controlPlane.close();
     await tenantWorker.close();
   }, 20_000);
+
+  it('heals a silently-dropped RunReply subscriber connection and keeps delivering replies', async (ctx) => {
+    const connection = liveConnection(ctx);
+    const prefix = `durtest-${Date.now()}-heal`;
+    const channel = `${prefix}-run-reply`;
+
+    // The tenant worker's subscriber talks through the silent proxy; everything else (the admin
+    // NUMSUB probe and the control plane's publish side) talks directly to the real container, so
+    // neither observes the freeze.
+    const proxy = await startSilentProxy(connection.host, connection.port);
+    const admin = new Redis(connection);
+    const controlPlane = new BullMQTransport({ connection, prefix });
+    const tenantWorker = new BullMQTransport({
+      connection: { host: '127.0.0.1', port: proxy.port },
+      prefix,
+      pingIntervalMs: 200,
+    });
+
+    const seen: RunReply[] = [];
+    tenantWorker.onRunReply((reply) => seen.push(reply));
+    await waitUntil(async () => (await numsub(admin, channel)) === 1);
+
+    // Sever the subscriber's connection to Redis WITHOUT the client ever observing a close — the
+    // real server drops the subscription immediately, but ioredis's client-side socket is left open
+    // and silent (see `startSilentProxy`).
+    proxy.freeze();
+    await waitUntil(async () => (await numsub(admin, channel)) === 0);
+
+    // The watchdog's next PING (within `pingIntervalMs`) hangs against the frozen socket, times out,
+    // and reconnects — well within the couple of ping intervals this asserts against.
+    await waitUntil(async () => (await numsub(admin, channel)) === 1, 5_000);
+
+    await controlPlane.publishRunReply({ requestId: 'heal-1', result: { ok: true, data: null } });
+    await waitUntil(() => seen.some((reply) => reply.requestId === 'heal-1'), 5_000);
+
+    expect(seen.some((reply) => reply.requestId === 'heal-1')).toBe(true);
+
+    await controlPlane.close();
+    await tenantWorker.close();
+    await admin.quit();
+    await proxy.close();
+  }, 30_000);
 });

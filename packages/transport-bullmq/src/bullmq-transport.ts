@@ -62,6 +62,27 @@ const EPOCH_MS_THRESHOLD = 1e12;
 // so failed jobs don't accumulate unbounded.
 const TASK_FAILED_RETENTION_SECONDS = 24 * 60 * 60;
 
+// Default `pingIntervalMs` (see `BullMQTransportOptions`) for the shared subscriber watchdog.
+const DEFAULT_PING_INTERVAL_MS = 30_000;
+// How long a single watchdog PING may take before its subscriber connection is presumed dead.
+const SUBSCRIBER_PING_TIMEOUT_MS = 5_000;
+// Belt-and-suspenders TCP keepalive (ms) applied to connections THIS transport builds itself (see
+// `redis()`) — makes a dead peer visible to the OS sooner. Not the primary defence: a `duplicate()`d
+// caller-supplied instance inherits whatever the caller configured, so the ping watchdog (which works
+// regardless of keepalive) is the layer that must catch a silent loss either way.
+const DEFAULT_KEEPALIVE_MS = 10_000;
+
+/**
+ * Normalise the `pingIntervalMs` option: `undefined` → the default interval, `0`/`false` → disabled
+ * (the watchdog never starts), any other number → itself (verbatim, including a caller's smaller
+ * interval for short-lived tests).
+ */
+function normalizePingInterval(value: number | false | undefined): number | false {
+  if (value === undefined) return DEFAULT_PING_INTERVAL_MS;
+  if (value === false || value === 0) return false;
+  return value;
+}
+
 /**
  * Narrow a FAILED task job's `data` to the {@link RemoteTask} fields the terminal-failure bridge needs
  * (runId/seq/stepId), WITHOUT an unsafe cast. Returns `undefined` for a job whose payload BullMQ has
@@ -148,6 +169,20 @@ export interface BullMQTransportOptions {
    * heartbeat in both modes — see {@link BullMQTransport.groupHealth} → {@link WorkerHeartbeat.status}.
    */
   concurrency?: ConcurrencyOption;
+  /**
+   * How often (ms) the shared subscriber watchdog PINGs every pub/sub subscriber connection this
+   * transport owns (`onControl`, `onHeartbeat`, `onRunReply`, `onTenantEvent`) to detect — and
+   * recover from — a silent connection loss. A subscriber connection never WRITEs on its own (it
+   * only ever receives PUBLISHed messages), so when a VPN/NAT/idle-timeout drops the underlying TCP
+   * connection, ioredis has nothing that would surface the loss: no write ever fails, no timeout
+   * ever fires, and the connection sits "subscribed" forever while the server's `PUBSUB NUMSUB`
+   * already shows 0 — every control-plane call blocks until the process restarts. `PING` is legal in
+   * subscriber mode; a rejection or timeout means the connection is dead, so we `disconnect(true)`
+   * it — ioredis's `retryStrategy` reconnects and `autoResubscribe` (default `true`) resubscribes
+   * every channel automatically. Pass `0` or `false` to disable the watchdog entirely (e.g. a
+   * short-lived test where the interval would otherwise outlive the test). Default `30_000`.
+   */
+  pingIntervalMs?: number | false;
 }
 
 /**
@@ -211,6 +246,13 @@ export class BullMQTransport implements Transport, ControlPlane {
   // Per-handler heartbeat tokens beaten on the single shared `workerHeartbeatTimer` — one entry per
   // `handle()`d name (its `tenantGroup(sanitizeQueueToken(name), partition)` queue token).
   private readonly heartbeatTokens = new Set<string>();
+  // Every pub/sub SUBSCRIBER connection this transport owns (control/heartbeat/runReply's single
+  // subscription plus every per-tenant one in `tenantEventSubs`) — the shared ping watchdog below
+  // iterates this set. PUBLISH-only connections (`controlPub`, `heartbeatPub`, …) are never added:
+  // they actively write, so a dead connection surfaces on their next `publish()` instead of silently.
+  private readonly subscribers = new Set<Redis>();
+  private pingWatchdogTimer?: ReturnType<typeof setInterval>;
+  private readonly pingIntervalMs: number | false;
 
   constructor(options: BullMQTransportOptions) {
     this.connection = options.connection;
@@ -220,6 +262,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.#explicitNamespace = options.namespace !== undefined;
     this.instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
     this.concurrency = options.concurrency;
+    this.pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
   }
 
   /**
@@ -599,7 +642,7 @@ export class BullMQTransport implements Transport, ControlPlane {
 
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
     if (this.heartbeatSub) return; // one subscription per transport
-    this.heartbeatSub = this.redis();
+    this.heartbeatSub = this.subscriberRedis();
     void this.heartbeatSub.subscribe(this.heartbeatChannel());
     this.heartbeatSub.on('message', (_channel, payload) => {
       try {
@@ -638,11 +681,102 @@ export class BullMQTransport implements Transport, ControlPlane {
   }
 
   /** A standalone Redis client from the same connection — duplicating a passed-in instance, or
-   *  building one from options (pub/sub can't share BullMQ's worker connections). */
+   *  building one from options (pub/sub can't share BullMQ's worker connections). A caller-supplied
+   *  instance's own options win as-is (`duplicate()` inherits them); a freshly-built one gets a
+   *  keepalive floor (`DEFAULT_KEEPALIVE_MS`) unless the passed options already set one. */
   private redis(): Redis {
     const c = this.connection;
     if (c instanceof Redis) return c.duplicate();
-    return new Redis(c as RedisOptions);
+    return new Redis({ keepAlive: DEFAULT_KEEPALIVE_MS, ...(c as RedisOptions) });
+  }
+
+  /**
+   * A subscriber-mode connection: the same underlying connection as `redis()`, but registered with
+   * the shared ping watchdog and a de-duplicated `error` listener (see `trackSubscriber`) — every
+   * `onControl`/`onHeartbeat`/`onRunReply`/`onTenantEvent` subscriber goes through here instead of
+   * `redis()` directly, since (unlike a publish-only connection) it never writes on its own and so
+   * can't surface a silent connection loss by itself.
+   */
+  private subscriberRedis(): Redis {
+    const sub = this.redis();
+    this.trackSubscriber(sub);
+    return sub;
+  }
+
+  /**
+   * Register `sub` with the shared ping watchdog (starting it if this is the first subscriber) and
+   * attach a de-duplicated `error` listener — an unhandled `error` event on an ioredis instance
+   * crashes the process in some setups, and a dead/reconnecting subscriber can emit a burst of them.
+   */
+  private trackSubscriber(sub: Redis): void {
+    this.subscribers.add(sub);
+    let loggedSinceReady = false;
+    sub.on('error', (err: Error) => {
+      if (loggedSinceReady) return; // one line per reconnect burst, not one per retry
+      loggedSinceReady = true;
+      console.warn(`[nestjs-durable] subscriber connection error: ${err.message}`);
+    });
+    sub.on('ready', () => {
+      loggedSinceReady = false;
+    });
+    this.startPingWatchdog();
+  }
+
+  /**
+   * Start the ONE shared interval that PINGs every subscriber connection this transport owns, if
+   * `pingIntervalMs` is enabled and it isn't already running (idempotent — one interval total, never
+   * one per connection). Unref'd so it never keeps the process alive on its own; torn down in
+   * `close()`.
+   */
+  private startPingWatchdog(): void {
+    if (this.pingWatchdogTimer || this.pingIntervalMs === false) return;
+    this.pingWatchdogTimer = setInterval(() => {
+      for (const sub of this.subscribers) void this.pingSubscriber(sub);
+    }, this.pingIntervalMs);
+    this.pingWatchdogTimer.unref?.();
+  }
+
+  /**
+   * PING one subscriber connection (legal in subscriber mode — see ioredis's
+   * `VALID_IN_SUBSCRIBER_MODE`); on rejection or timeout, `disconnect(true)` it so ioredis's
+   * `retryStrategy` reconnects and `autoResubscribe` restores its channel. Skips a connection that
+   * isn't `'ready'` — it's already mid-(re)connect, so a fresh ping would just race that cycle.
+   *
+   * The timeout is capped at `pingIntervalMs` itself (never above `SUBSCRIBER_PING_TIMEOUT_MS`):
+   * waiting longer than the gap between checks to declare one dead would just mean two checks race
+   * each other, and it lets a short `pingIntervalMs` (e.g. in a test) shrink the whole detect →
+   * reconnect cycle instead of always eating the full multi-second default.
+   */
+  private async pingSubscriber(sub: Redis): Promise<void> {
+    if (sub.status !== 'ready') return;
+    const timeoutMs =
+      this.pingIntervalMs === false
+        ? SUBSCRIBER_PING_TIMEOUT_MS
+        : Math.min(SUBSCRIBER_PING_TIMEOUT_MS, this.pingIntervalMs);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('ping timed out')), timeoutMs);
+        sub
+          .ping()
+          .then(() => {
+            clearTimeout(timer);
+            resolve();
+          })
+          .catch((err: unknown) => {
+            clearTimeout(timer);
+            reject(err instanceof Error ? err : new Error(String(err)));
+          });
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[nestjs-durable] subscriber connection unresponsive (${message}) — reconnecting to restore its subscription`,
+      );
+      sub.once('subscribe', () => {
+        console.warn('[nestjs-durable] subscriber connection reconnected and resubscribed');
+      });
+      sub.disconnect(true);
+    }
   }
 
   async publishControl(msg: ControlMessage): Promise<void> {
@@ -652,7 +786,7 @@ export class BullMQTransport implements Transport, ControlPlane {
 
   onControl(handler: (msg: ControlMessage) => void): void {
     if (this.controlSub) return; // one subscription per transport
-    this.controlSub = this.redis();
+    this.controlSub = this.subscriberRedis();
     void this.controlSub.subscribe(this.controlChannel());
     this.controlSub.on('message', (_channel, payload) => {
       try {
@@ -710,7 +844,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   /** Tenant worker ← control plane: consume {@link RunReply}s (filter by `requestId` client-side). */
   onRunReply(handler: (reply: RunReply) => void): void {
     if (this.runReplySub) return; // one subscription per transport
-    this.runReplySub = this.redis();
+    this.runReplySub = this.subscriberRedis();
     void this.runReplySub.subscribe(this.runReplyChannel());
     this.runReplySub.on('message', (_channel, payload) => {
       try {
@@ -733,7 +867,7 @@ export class BullMQTransport implements Transport, ControlPlane {
    *  may subscribe independently). Returns an unsubscribe fn that unsubscribes and disconnects. */
   onTenantEvent(tenant: string, handler: (evt: TenantEvent) => void): () => void {
     const channel = this.tenantEventChannel(tenant);
-    const sub = this.redis();
+    const sub = this.subscriberRedis();
     this.tenantEventSubs.add(sub);
     void sub.subscribe(channel);
     sub.on('message', (_channel, payload) => {
@@ -745,6 +879,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     });
     return () => {
       this.tenantEventSubs.delete(sub);
+      this.subscribers.delete(sub);
       void sub.unsubscribe(channel);
       sub.disconnect();
     };
@@ -753,6 +888,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   /** Close all workers and queues so the process can exit. */
   async close(): Promise<void> {
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
+    if (this.pingWatchdogTimer) clearInterval(this.pingWatchdogTimer);
+    this.subscribers.clear();
     this.workerController?.stop();
     await Promise.all([...this.taskWorkers.values()].map((w) => w.close()));
     await this.resultsWorker?.close();
