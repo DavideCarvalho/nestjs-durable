@@ -43,6 +43,7 @@ interface AttributeColumns {
   numValue: string;
 }
 import {
+  BufferedEventEntity,
   BufferedSignalEntity,
   RunAttributeEntity,
   SignalWaiterEntity,
@@ -501,6 +502,45 @@ export class MikroOrmStateStore implements StateStore {
     const payload = entity.payload ?? undefined;
     await em.remove(entity).flush();
     return { payload };
+  }
+
+  async bufferEvent(input: {
+    name: string;
+    payload: unknown;
+    id: string;
+    publishedAt: number;
+  }): Promise<void> {
+    const em = this.fork();
+    const e = new BufferedEventEntity();
+    e.id = input.id;
+    e.name = input.name;
+    e.payload = input.payload ?? null;
+    e.publishedAt = new Date(input.publishedAt);
+    em.persist(e);
+    await em.flush();
+  }
+
+  async listBufferedEvents(
+    name: string,
+    limit: number,
+  ): Promise<Array<{ id: string; payload: unknown; publishedAt: number }>> {
+    const em = this.fork();
+    const rows = await em.find(
+      BufferedEventEntity,
+      { name },
+      { orderBy: { publishedAt: 'asc' }, limit }, // oldest first
+    );
+    return rows.map((e) => ({
+      id: e.id,
+      payload: e.payload ?? undefined,
+      publishedAt: e.publishedAt.getTime(),
+    }));
+  }
+
+  async removeBufferedEvent(id: string): Promise<boolean> {
+    const em = this.fork();
+    const affected = await em.nativeDelete(BufferedEventEntity, { id });
+    return affected > 0;
   }
 }
 

@@ -26,5 +26,6 @@ export function durableManagedTables(): string[] {
     'durable_run_attributes',
     'durable_signal_waiters',
     'durable_buffered_signals',
+    'durable_buffered_events',
   ];
 }

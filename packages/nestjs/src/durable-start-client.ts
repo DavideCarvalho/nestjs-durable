@@ -98,7 +98,11 @@ export class DurableStartClient {
     return tenantUnsupported('signalWithStart');
   }
 
-  publishEvent(_name: string, _payload: unknown, _opts?: { id?: string }): Promise<void> {
+  publishEvent(
+    _name: string,
+    _payload: unknown,
+    _opts?: { id?: string; buffer?: boolean },
+  ): Promise<void> {
     return tenantUnsupported('publishEvent');
   }
 }

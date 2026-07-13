@@ -88,3 +88,16 @@ model DurableBufferedSignal {
   @@index([token])
   @@map("durable_buffered_signals")
 }
+
+// A published event that matched no live waiter (see `engine.publishEvent`'s buffering). Keyed by a
+// caller-minted `id` (a uuid, not autoincrement — `removeBufferedEvent` targets it directly), not by
+// runId: events are name-based pub/sub, not tied to any one run.
+model DurableBufferedEvent {
+  id          String @id
+  name        String
+  payload     Json?
+  publishedAt BigInt @map("published_at")
+
+  @@index([name, publishedAt])
+  @@map("durable_buffered_events")
+}

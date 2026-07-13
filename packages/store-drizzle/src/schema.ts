@@ -85,12 +85,23 @@ export const bufferedSignals = sqliteTable('durable_buffered_signals', {
   payload: text('payload', { mode: 'json' }),
 });
 
+// A published event that matched no live waiter (see `engine.publishEvent`'s buffering). Keyed by a
+// caller-minted `id` (a uuid, not autoincrement — `removeBufferedEvent` targets it directly), not by
+// `runId`: events are name-based pub/sub, not tied to any one run.
+export const bufferedEvents = sqliteTable('durable_buffered_events', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  payload: text('payload', { mode: 'json' }),
+  publishedAt: integer('published_at').notNull(),
+});
+
 export const durableSchema = {
   workflowRuns,
   stepCheckpoints,
   runAttributes,
   signalWaiters,
   bufferedSignals,
+  bufferedEvents,
 };
 
 /**

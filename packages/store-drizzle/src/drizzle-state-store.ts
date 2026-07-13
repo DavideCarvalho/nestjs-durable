@@ -28,6 +28,7 @@ import {
 } from 'drizzle-orm';
 import type { BaseSQLiteDatabase } from 'drizzle-orm/sqlite-core';
 import {
+  bufferedEvents,
   bufferedSignals,
   runAttributes,
   signalWaiters,
@@ -354,6 +355,42 @@ export class DrizzleStateStore implements StateStore {
     if (!row) return null;
     await this.db.delete(bufferedSignals).where(eq(bufferedSignals.id, row.id));
     return { payload: row.payload ?? undefined };
+  }
+
+  async bufferEvent(input: {
+    name: string;
+    payload: unknown;
+    id: string;
+    publishedAt: number;
+  }): Promise<void> {
+    await this.db.insert(bufferedEvents).values({
+      id: input.id,
+      name: input.name,
+      payload: input.payload ?? null,
+      publishedAt: input.publishedAt,
+    });
+  }
+
+  async listBufferedEvents(
+    name: string,
+    limit: number,
+  ): Promise<Array<{ id: string; payload: unknown; publishedAt: number }>> {
+    const rows = await this.db
+      .select()
+      .from(bufferedEvents)
+      .where(eq(bufferedEvents.name, name))
+      .orderBy(asc(bufferedEvents.publishedAt)) // oldest first
+      .limit(limit);
+    return rows.map((r) => ({
+      id: r.id,
+      payload: r.payload ?? undefined,
+      publishedAt: r.publishedAt,
+    }));
+  }
+
+  async removeBufferedEvent(id: string): Promise<boolean> {
+    const result = await this.db.delete(bufferedEvents).where(eq(bufferedEvents.id, id));
+    return (result as { changes?: number }).changes === 1;
   }
 }
 

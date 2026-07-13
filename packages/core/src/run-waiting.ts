@@ -1,4 +1,4 @@
-import { eventNameOf } from './events';
+import { EVENT_TOKEN_PREFIX, eventNameOf } from './events';
 import type { RunWaiting, SignalWaiter, WorkflowRun } from './interfaces';
 
 // Waiter-token prefixes the engine stamps (see `workflow-ctx.ts`): a webhook mints `wh:<runId>:<seq>`,
@@ -9,7 +9,7 @@ import type { RunWaiting, SignalWaiter, WorkflowRun } from './interfaces';
 const WEBHOOK_PREFIX = 'wh:';
 const CHILD_PREFIX = 'child:';
 const BREAKPOINT_PREFIX = 'bp:';
-const EVENT_PREFIX = 'event:';
+const EVENT_PREFIX = EVENT_TOKEN_PREFIX;
 
 /**
  * Resolve WHAT a suspended run is parked on from the token of the {@link SignalWaiter} it registered.

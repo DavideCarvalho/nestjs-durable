@@ -78,6 +78,13 @@ interface BufferedSignalRow {
   payload: unknown;
 }
 
+interface BufferedEventRow {
+  id: string;
+  name: string;
+  payload: unknown;
+  publishedAt: bigint;
+}
+
 // Prisma's per-model query args are generated generics; left as `any` at this single boundary.
 type Args = any;
 
@@ -100,6 +107,7 @@ export interface DurablePrismaTx {
   durableRunAttribute: Delegate<RunAttributeRow>;
   durableSignalWaiter: Delegate<WaiterRow>;
   durableBufferedSignal: Delegate<BufferedSignalRow>;
+  durableBufferedEvent: Delegate<BufferedEventRow>;
 }
 
 export interface DurablePrismaClient extends DurablePrismaTx {
@@ -368,6 +376,46 @@ export class PrismaStateStore implements StateStore {
     if (!row) return null;
     await this.db.durableBufferedSignal.delete({ where: { id: row.id } });
     return { payload: row.payload ?? undefined };
+  }
+
+  async bufferEvent(input: {
+    name: string;
+    payload: unknown;
+    id: string;
+    publishedAt: number;
+  }): Promise<void> {
+    await this.db.durableBufferedEvent.create({
+      data: {
+        id: input.id,
+        name: input.name,
+        payload: jsonOrNull(input.payload),
+        publishedAt: BigInt(input.publishedAt),
+      },
+    });
+  }
+
+  async listBufferedEvents(
+    name: string,
+    limit: number,
+  ): Promise<Array<{ id: string; payload: unknown; publishedAt: number }>> {
+    const rows = await this.db.durableBufferedEvent.findMany({
+      where: { name },
+      orderBy: { publishedAt: 'asc' }, // oldest first
+      take: limit,
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      payload: r.payload ?? undefined,
+      publishedAt: Number(r.publishedAt),
+    }));
+  }
+
+  async removeBufferedEvent(id: string): Promise<boolean> {
+    // deleteMany's `where: { id }` matches at most one row (id is the PK) and is a safe no-op if it's
+    // already gone — unlike `delete({ where: { id } })`, which throws P2025 on a missing row (the same
+    // reasoning as releaseRunLock's updateMany above).
+    const result = await this.db.durableBufferedEvent.deleteMany({ where: { id } });
+    return result.count === 1;
   }
 }
 

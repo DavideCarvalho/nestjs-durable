@@ -4,8 +4,9 @@ import { describe, expect, it } from 'vitest';
 import { durableManagedTables } from './schema';
 
 describe('durableManagedTables', () => {
-  it('returns the five durable table names', () => {
+  it('returns the six durable table names', () => {
     expect(durableManagedTables().sort()).toEqual([
+      'durable_buffered_events',
       'durable_buffered_signals',
       'durable_run_attributes',
       'durable_signal_waiters',

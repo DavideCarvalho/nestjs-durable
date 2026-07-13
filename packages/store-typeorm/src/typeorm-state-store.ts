@@ -24,6 +24,7 @@ import {
 } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import {
+  BufferedEventEntity,
   BufferedSignalEntity,
   RunAttributeEntity,
   SignalWaiterEntity,
@@ -54,6 +55,9 @@ export class TypeOrmStateStore implements StateStore {
   }
   private buffered() {
     return this.dataSource.getRepository(BufferedSignalEntity);
+  }
+  private bufferedEvents() {
+    return this.dataSource.getRepository(BufferedEventEntity);
   }
   private attributes() {
     return this.dataSource.getRepository(RunAttributeEntity);
@@ -350,6 +354,41 @@ export class TypeOrmStateStore implements StateStore {
     if (!e) return null;
     await this.buffered().delete({ id: e.id });
     return { payload: e.payload ?? undefined };
+  }
+
+  async bufferEvent(input: {
+    name: string;
+    payload: unknown;
+    id: string;
+    publishedAt: number;
+  }): Promise<void> {
+    await this.bufferedEvents().save({
+      id: input.id,
+      name: input.name,
+      payload: input.payload ?? null,
+      publishedAt: new Date(input.publishedAt),
+    });
+  }
+
+  async listBufferedEvents(
+    name: string,
+    limit: number,
+  ): Promise<Array<{ id: string; payload: unknown; publishedAt: number }>> {
+    const rows = await this.bufferedEvents().find({
+      where: { name },
+      order: { publishedAt: 'ASC' }, // oldest first
+      take: limit,
+    });
+    return rows.map((e) => ({
+      id: e.id,
+      payload: e.payload ?? undefined,
+      publishedAt: e.publishedAt.getTime(),
+    }));
+  }
+
+  async removeBufferedEvent(id: string): Promise<boolean> {
+    const result = await this.bufferedEvents().delete({ id });
+    return result.affected === 1;
   }
 }
 

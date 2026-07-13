@@ -90,8 +90,16 @@ export class WorkflowService {
    * starts a fresh run of every workflow subscribed via `@Workflow({ onEvent })` / `@OnDurableEvent` (the
    * payload becomes its input). Pass `opts.id` to dedupe redeliveries. Returns how many runs it
    * touched (resumed + started).
+   *
+   * Reliable by default: a publish that touches NOBODY (no live waiter, no subscriber) buffers ONE
+   * copy so a LATER `waitForEvent(name, { match })` still consumes it instead of it being dropped —
+   * see {@link WorkflowEngine.publishEvent}'s full semantics doc. Pass `opts.buffer: false` to opt out.
    */
-  publishEvent(name: string, payload: unknown, opts?: { id?: string }): Promise<number> {
+  publishEvent(
+    name: string,
+    payload: unknown,
+    opts?: { id?: string; buffer?: boolean },
+  ): Promise<number> {
     return this.engine.publishEvent(name, payload, opts);
   }
 }

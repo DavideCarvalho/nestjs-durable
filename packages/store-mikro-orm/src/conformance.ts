@@ -37,6 +37,7 @@ const TABLES = [
   'durable_step_checkpoints',
   'durable_signal_waiters',
   'durable_buffered_signals',
+  'durable_buffered_events',
   'durable_workflow_runs',
 ];
 

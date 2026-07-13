@@ -11,6 +11,7 @@ const DURABLE_TABLE_NAMES = new Set([
   'durable_run_attributes',
   'durable_signal_waiters',
   'durable_buffered_signals',
+  'durable_buffered_events',
 ]);
 
 /**

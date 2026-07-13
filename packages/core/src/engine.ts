@@ -15,7 +15,14 @@ import {
   WorkflowSuspended,
 } from './errors';
 import { EventAccumulators, type EventBatchConfig } from './event-accumulators';
-import { eventMatchOf, eventMatches, eventPrefix } from './events';
+import {
+  EVENT_BUFFER_SCAN_LIMIT,
+  eventMatchOf,
+  eventMatches,
+  eventNameOf,
+  eventPrefix,
+  isEventToken,
+} from './events';
 import type {
   ControlPlane,
   EngineEvent,
@@ -277,6 +284,19 @@ export interface WorkflowEngineDeps {
    */
   reconcileMs?: number | undefined;
   /**
+   * Retention for a BUFFERED event that no `waitForEvent` ever claims (see
+   * {@link WorkflowEngine.publishEvent}'s buffering — a publish matching no live waiter keeps ONE
+   * copy around for a later matching wait). Default `undefined`: keep it until consumed, same as
+   * {@link StateStore.bufferSignal}'s buffered signals — no silent expiry. Set a duration (ms) to
+   * have the {@link resumeDueTimers} reconcile pass prune rows past `publishedAt + eventBufferTtlMs`
+   * as it encounters them. Scoped to event NAMES the current reconcile tick's registered waiters
+   * reference (the sweep has no reason to otherwise enumerate every buffered name) — a name with a
+   * stale buffered event but zero waiters ever registered against it is not visited by this pass; that
+   * is an accepted gap given `listBufferedEvents` is name-scoped by design (see interfaces.ts), not a
+   * bug to route around here.
+   */
+  eventBufferTtlMs?: number | undefined;
+  /**
    * Opt-in self-heal window (ms) for a remote step with NO `timeoutMs` whose dispatched job was LOST —
    * the worker crashed mid-step leaving no result, or the transport dropped the job (a Redis
    * flush/eviction, or BullMQ moving a stalled job to `failed` and removing it). The `pending`
@@ -381,6 +401,7 @@ export class WorkflowEngine {
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly remoteAdvanceSilenceMs?: number | undefined;
   private readonly reconcileMs: number | undefined;
+  private readonly eventBufferTtlMs: number | undefined;
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
   private readonly webhookUrl?: ((token: string) => string) | undefined;
@@ -460,6 +481,8 @@ export class WorkflowEngine {
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
     this.reconcileMs = deps.reconcileMs === undefined ? 300_000 : deps.reconcileMs || undefined;
+    // Opt-in: unset (or 0) keeps buffered events around forever, same as buffered signals.
+    this.eventBufferTtlMs = deps.eventBufferTtlMs || undefined;
     // Opt-in: unset (or 0) leaves the by-design "re-suspend a lost dispatch, never re-dispatch" behavior.
     this.remoteRedispatchMs = deps.remoteRedispatchMs || undefined;
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
@@ -1276,14 +1299,16 @@ export class WorkflowEngine {
    * Resume every suspended run whose durable timer is due. Call periodically (a poller) and on
    * boot. A run still not due re-suspends cheaply without running new work.
    *
-   * Piggy-backs the signal-waiter reconcile safety net (see {@link reconcileSignalWaiter}): a crash
-   * between the waiter/buffer pairing ops on EITHER side (this run's own `putSignalWaiter` →
-   * `takeBufferedSignal`, or a signaler's `takeSignalWaiter` → `bufferSignal` → re-check — see
-   * `signal`'s interleaving proof) can leave both rows stranded with nothing left to pair them: the
-   * waiter's turn already suspended, the signaler that buffered it already returned. Event-wait
-   * suspends already carry a `reconcileMs` fallback `wakeAt` (see {@link reconcileWakeAt}) precisely so
-   * they show up HERE — that's what makes this due-timer pass the natural place for the sweep. One
-   * bulk waiter scan, filtered to just this tick's batch, keeps it cheap regardless of store size.
+   * Piggy-backs the signal/event-waiter reconcile safety net (see {@link reconcileSignalWaiter}): a
+   * crash between the waiter/buffer pairing ops on EITHER side (this run's own `putSignalWaiter` →
+   * `takeBufferedSignal`/`listBufferedEvents`, or the other side's `takeSignalWaiter`/fan-out →
+   * `bufferSignal`/`bufferEvent` → re-check — see `signal`'s interleaving proof, which `publishEvent`
+   * mirrors for events) can leave both rows stranded with nothing left to pair them: the waiter's turn
+   * already suspended, the other side that buffered it already returned. Event-wait suspends already
+   * carry a `reconcileMs` fallback `wakeAt` (see {@link reconcileWakeAt}) precisely so they show up
+   * HERE — that's what makes this due-timer pass the natural place for the sweep (and, for events, also
+   * where an `eventBufferTtlMs` prune piggy-backs — see {@link reconcileBufferedEvent}). One bulk waiter
+   * scan, filtered to just this tick's batch, keeps it cheap regardless of store size.
    */
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
     const due = await this.store.listDueTimers(nowMs, this.namespace);
@@ -1296,11 +1321,15 @@ export class WorkflowEngine {
 
   /**
    * The reconcile safety net's per-run check (see {@link resumeDueTimers}): if this suspended run has
-   * a registered signal waiter AND its token already has a buffered payload, pair and deliver them
-   * directly instead of falling through to a full replay. Event/child/breakpoint waiter tokens are
-   * never buffered (`publishEvent` doesn't buffer, and a child/breakpoint notifies via `signal` only
-   * once its counterpart is already registered) — so `takeBufferedSignal` on those is a guaranteed
-   * miss, and this is naturally signal-only without needing to classify the token.
+   * a registered signal OR event waiter and a matching payload is already buffered, pair and deliver
+   * them directly instead of falling through to a full replay. Child/breakpoint waiter tokens are
+   * never buffered (a child/breakpoint notifies via `signal` only once its counterpart is already
+   * registered) — `takeBufferedSignal` on those is a guaranteed miss, so this only ever does real work
+   * for a plain signal or an event waiter (classified via {@link isEventToken}).
+   *
+   * Also opportunistically prunes expired buffered EVENTS for this waiter's name when
+   * {@link eventBufferTtlMs} is set (see its doc — scoped to names a registered waiter references in
+   * this tick's batch, piggy-backing the SAME scan rather than a separate pass), even on a miss.
    *
    * Returns `undefined` (not settled — `resumeLeased` proceeds with its normal `resume`) when there's
    * no waiter or no buffered hit. Deliberately never returns `null`: a delivered signal always resumes
@@ -1313,11 +1342,41 @@ export class WorkflowEngine {
     waiter: SignalWaiter | undefined,
   ): Promise<RunResult | undefined> {
     if (!waiter) return undefined;
+    if (isEventToken(waiter.token)) return this.reconcileBufferedEvent(run, waiter);
     const buffered = await this.store.takeBufferedSignal(waiter.token);
     if (!buffered) return undefined;
     await this.store.removeSignalWaiter(waiter);
     const settled = await this.deliverSignal(waiter, buffered.payload);
     return settled ?? { runId: run.id, status: run.status };
+  }
+
+  /**
+   * The EVENT half of {@link reconcileSignalWaiter}: scan this waiter's name for a matching buffered
+   * event (same list+evaluate+claim shape as `waitForEvent`'s own consumption — the match predicate
+   * belongs to the waiter, never the store), pruning any expired candidates it encounters along the
+   * way when {@link eventBufferTtlMs} is configured. A pruned-but-non-matching candidate does not stop
+   * the scan; only a MATCHING hit (or exhausting the scan window) does.
+   */
+  private async reconcileBufferedEvent(
+    run: WorkflowRun,
+    waiter: SignalWaiter,
+  ): Promise<RunResult | undefined> {
+    const name = eventNameOf(waiter.token);
+    const match = eventMatchOf(waiter.token);
+    const candidates = await this.store.listBufferedEvents(name, EVENT_BUFFER_SCAN_LIMIT);
+    const nowMs = this.clock();
+    for (const candidate of candidates) {
+      if (this.eventBufferTtlMs != null && nowMs - candidate.publishedAt > this.eventBufferTtlMs) {
+        await this.store.removeBufferedEvent(candidate.id); // expired — prune regardless of match
+        continue;
+      }
+      if (!eventMatches(candidate.payload, match)) continue;
+      if (!(await this.store.removeBufferedEvent(candidate.id))) continue; // raced away — try the next
+      await this.store.removeSignalWaiter(waiter);
+      const settled = await this.deliverSignal(waiter, candidate.payload);
+      return settled ?? { runId: run.id, status: run.status };
+    }
+    return undefined;
   }
 
   /**
@@ -1555,8 +1614,27 @@ export class WorkflowEngine {
    *  2. **Starts** a fresh run of every workflow registered with `onEvent: [name]`, passing the
    *     payload as input. Idempotent by `evt:<id>:<workflow>` — pass `opts.id` to dedupe redeliveries
    *     of the same logical event (default: a fresh uuid, so each publish triggers once).
+   *
+   * Semantics (deliberate — mirrors `signalWithStart`'s reliability contract, so document it exactly):
+   * a publish that resumes ≥1 live waiter, OR routes into an `eventBatch` accumulator / starts ≥1
+   * subscriber, behaves exactly as above and is NOT buffered — fan-out stays live-only, same as
+   * today. A publish that touches NEITHER — no live waiter matched, no subscriber exists/started —
+   * buffers ONE copy (via {@link StateStore.bufferEvent}) unless `opts.buffer === false`, so it isn't
+   * silently dropped just because nobody happened to be listening yet. That buffered copy is consumed
+   * by the FIRST future `ctx.waitForEvent(name, { match })` whose match accepts its payload —
+   * point-to-point on redelivery, by design (only one waiter ever gets it, even though the LIVE path
+   * above is fan-out) — never by a second, later-registered onEvent subscriber (subscriber starts stay
+   * live-only; `opts.id` dedupe applies to those only, unchanged). Right after buffering, this re-checks
+   * `listSignalWaiters` ONCE — sandwich parity with `signal`'s own take → buffer → re-check — so a
+   * waiter that registers in the sliver between the initial miss and the buffer write is still paired
+   * instead of leaving both rows stranded (see `signal`'s interleaving proof; `waitForEvent`'s own
+   * post-registration buffer scan is the mirror-image half of this same race).
    */
-  async publishEvent(name: string, payload: unknown, opts?: { id?: string }): Promise<number> {
+  async publishEvent(
+    name: string,
+    payload: unknown,
+    opts?: { id?: string; buffer?: boolean },
+  ): Promise<number> {
     let touched = 0;
     const waiters = await this.store.listSignalWaiters(eventPrefix(name));
     for (const w of waiters) {
@@ -1586,6 +1664,33 @@ export class WorkflowEngine {
         }
       }
     }
+    // Nobody received it live (no waiter matched, no subscriber exists/started) — buffer ONE copy
+    // unless the caller opted out. `touched > 0` covers BOTH the waiter fan-out and the subscriber
+    // loop above, matching the "no one received it" condition the semantics doc promises.
+    if (touched > 0 || opts?.buffer === false) return touched;
+    const bufferedId = globalThis.crypto.randomUUID();
+    await this.store.bufferEvent({ name, payload, id: bufferedId, publishedAt: this.clock() });
+    // Re-check: a waiter may have registered in the window between the miss above and this buffer
+    // write (see the interleaving proof at `signal` — this is the events-side mirror of it). Only the
+    // FIRST late-registered matching waiter is considered: only one buffered copy exists, so once a
+    // claim attempt below either succeeds or finds the buffer already gone, there is nothing left for
+    // any other candidate regardless.
+    const lateWaiters = await this.store.listSignalWaiters(eventPrefix(name));
+    const lateWaiter = lateWaiters.find((w) => eventMatches(payload, eventMatchOf(w.token)));
+    if (!lateWaiter) return touched;
+    if (!(await this.store.removeBufferedEvent(bufferedId))) return touched; // claimed elsewhere already
+    // `takeSignalWaiter` is safe here even though it deletes ANY row for the token: an event token
+    // embeds this ONE `waitForEvent` call's own `runId#seq` (see eventToken in events.ts), so no other
+    // registration could ever share it.
+    const waiter = await this.store.takeSignalWaiter(lateWaiter.token);
+    if (waiter) {
+      const settled = await this.deliverSignal(waiter, payload);
+      if (settled) touched += 1;
+    }
+    // If `waiter` is null, that exact registration resolved itself some other way in the interim (most
+    // likely its own timeout deadline landing in this same sliver) — the buffered copy is already
+    // spent (claimed above), so — mirroring `signal`'s own reclaim precedent — drop it rather than
+    // resuming a run a second time or re-buffering for a THIRD, unrelated waiter to pick up later.
     return touched;
   }
 
@@ -2591,6 +2696,13 @@ export class WorkflowEngine {
         // engine.signal(name, payload) delivers it. If the signal was already delivered (buffered
         // before the workflow reached this point — e.g. signalWithStart), resolve it now and re-drive
         // on a macrotask, AFTER this turn suspends and frees the run lock (a re-entrant resume bails).
+        //
+        // NOTE: `WorkflowCommand` has no `waitEvent` kind — a polyglot (remote-executor) workflow has
+        // no way to issue `ctx.waitForEvent(name, { match })` today; only in-process TS workflows
+        // (`workflow-ctx.ts`) can. So buffered EVENTS (`bufferEvent`/`listBufferedEvents`/
+        // `removeBufferedEvent`) are reachable only from `engine.publishEvent` and the in-process
+        // `waitForEvent`/reconcile paths — never from this remote command loop. Extending the
+        // polyglot protocol with an event-wait command is future work, not something to invent here.
         const deliverBuffered = async (payload: unknown): Promise<void> => {
           await this.store.saveCheckpoint(
             instantCheckpoint({

@@ -48,6 +48,7 @@ CREATE INDEX durable_run_attributes_num_idx ON durable_run_attributes (key, num_
 CREATE INDEX durable_run_attributes_str_idx ON durable_run_attributes (key, str_value);
 CREATE TABLE durable_signal_waiters (token TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL, parallel_group TEXT);
 CREATE TABLE durable_buffered_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL, payload TEXT);
+CREATE TABLE durable_buffered_events (id TEXT PRIMARY KEY, name TEXT NOT NULL, payload TEXT, published_at INTEGER NOT NULL);
 `;
 
 function makeStore() {

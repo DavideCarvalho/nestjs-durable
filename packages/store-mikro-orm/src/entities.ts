@@ -96,6 +96,16 @@ export class BufferedSignalEntity {
   payload?: unknown;
 }
 
+/** A published event that matched no live waiter (see `engine.publishEvent`'s buffering). Keyed by a
+ *  caller-minted `id` (a uuid, not autoincrement — `removeBufferedEvent` targets it directly), not by
+ *  `runId`: events are name-based pub/sub, not tied to any one run. */
+export class BufferedEventEntity {
+  id!: string;
+  name!: string;
+  payload?: unknown;
+  publishedAt!: Date;
+}
+
 /**
  * Build the durable MikroORM entity schemas with column names pinned per `naming` (default
  * `'snake_case'`). Register the result in your MikroORM config / `MikroOrmModule.forFeature`.
@@ -247,7 +257,35 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     },
   });
 
-  return [workflowRuns, stepCheckpoints, runAttributes, signalWaiters, bufferedSignals];
+  const bufferedEvents = new EntitySchema<BufferedEventEntity>({
+    class: BufferedEventEntity,
+    tableName: 'durable_buffered_events',
+    // `(name, publishedAt)` serves both `listBufferedEvents`'s name-scoped scan and its oldest-first
+    // ordering in one index.
+    indexes: [
+      {
+        name: 'durable_buffered_events_name_published_at_idx',
+        properties: ['name', 'publishedAt'],
+      },
+    ],
+    properties: {
+      // Caller-minted uuid (engine.publishEvent), not autoincrement — removeBufferedEvent targets it
+      // directly and needs to be handed the SAME id it was buffered with.
+      id: { type: 'string', primary: true, fieldName: col('id') },
+      name: { type: 'string', fieldName: col('name') },
+      payload: { type: 'json', nullable: true, fieldName: col('payload') },
+      publishedAt: { type: 'Date', fieldName: col('publishedAt') },
+    },
+  });
+
+  return [
+    workflowRuns,
+    stepCheckpoints,
+    runAttributes,
+    signalWaiters,
+    bufferedSignals,
+    bufferedEvents,
+  ];
 }
 
 /** Durable entity schemas with the canonical `'snake_case'` column names. */

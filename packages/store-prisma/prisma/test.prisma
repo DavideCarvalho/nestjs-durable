@@ -94,3 +94,15 @@ model DurableBufferedSignal {
   @@index([token])
   @@map("durable_buffered_signals")
 }
+
+// Mirrors prisma/schema.prisma's DurableBufferedEvent — `id` is a caller-minted uuid (not
+// autoincrement), so unlike DurableBufferedSignal above this needs NO SQLite-specific divergence.
+model DurableBufferedEvent {
+  id          String @id
+  name        String
+  payload     Json?
+  publishedAt BigInt @map("published_at")
+
+  @@index([name, publishedAt])
+  @@map("durable_buffered_events")
+}

@@ -122,6 +122,24 @@ export class CodecStateStore implements StateStore {
     const buffered = await this.inner.takeBufferedSignal(token);
     return buffered && { payload: this.dec(buffered.payload) };
   }
+  bufferEvent(input: {
+    name: string;
+    payload: unknown;
+    id: string;
+    publishedAt: number;
+  }): Promise<void> {
+    return this.inner.bufferEvent({ ...input, payload: this.enc(input.payload) });
+  }
+  async listBufferedEvents(
+    name: string,
+    limit: number,
+  ): Promise<Array<{ id: string; payload: unknown; publishedAt: number }>> {
+    const events = await this.inner.listBufferedEvents(name, limit);
+    return events.map((e) => ({ ...e, payload: this.dec(e.payload) }));
+  }
+  removeBufferedEvent(id: string): Promise<boolean> {
+    return this.inner.removeBufferedEvent(id);
+  }
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return (await this.inner.listRuns(query)).map((r) => this.decRun(r));
   }

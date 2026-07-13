@@ -1,5 +1,6 @@
 import type { DataSource } from 'typeorm';
 import {
+  BufferedEventEntity,
   BufferedSignalEntity,
   RunAttributeEntity,
   SignalWaiterEntity,
@@ -13,6 +14,10 @@ import {
 export const JSON_BLOB_COLUMNS: Record<string, string[]> = {
   durable_workflow_runs: ['input', 'output', 'error', 'tags', 'searchAttributes'],
   durable_step_checkpoints: ['input', 'output', 'error', 'events'],
+  // NOTE: durable_buffered_signals/durable_buffered_events intentionally omitted here, same as the
+  // existing buffered-signals table — their `payload` column is created with the widened `txt` type
+  // (see `${bufCol('payload')} ${txt}` / the new table's `${bevCol('payload')} ${txt}` below) directly
+  // at CREATE TABLE time on a fresh install, so there's no pre-existing narrower column to widen.
 };
 
 /** Each durable table → its backing entity class, so a column resolver can look up the physical
@@ -24,6 +29,7 @@ const TABLE_TO_ENTITY = {
   durable_run_attributes: RunAttributeEntity,
   durable_signal_waiters: SignalWaiterEntity,
   durable_buffered_signals: BufferedSignalEntity,
+  durable_buffered_events: BufferedEventEntity,
 } as const;
 
 /**
@@ -132,12 +138,14 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
   const runAttributes = q('durable_run_attributes');
   const waiters = q('durable_signal_waiters');
   const buffered = q('durable_buffered_signals');
+  const bufferedEvents = q('durable_buffered_events');
   // Per-table quoted-column helpers: resolve an entity property to its physical column then quote it.
   const runsCol = (property: string) => q(resolve('durable_workflow_runs', property));
   const cpCol = (property: string) => q(resolve('durable_step_checkpoints', property));
   const attrCol = (property: string) => q(resolve('durable_run_attributes', property));
   const waiterCol = (property: string) => q(resolve('durable_signal_waiters', property));
   const bufCol = (property: string) => q(resolve('durable_buffered_signals', property));
+  const bevCol = (property: string) => q(resolve('durable_buffered_events', property));
   // Numeric side-table column for attribute range scans. `double precision` on Postgres, `double` on
   // MySQL, `real` on SQLite (all hold JS numbers without precision loss for the typical attribute).
   const num = isPg ? 'double precision' : isMysql ? 'double' : 'real';
@@ -187,6 +195,12 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
     )`,
     `CREATE TABLE IF NOT EXISTS ${buffered} (
       ${bufferedId}, ${bufCol('token')} ${str} NOT NULL, ${bufCol('payload')} ${txt}
+    )`,
+    // Caller-minted uuid PK (engine.publishEvent), not auto-increment — unlike durable_buffered_signals
+    // above, removeBufferedEvent needs to target the EXACT id it was buffered with.
+    `CREATE TABLE IF NOT EXISTS ${bufferedEvents} (
+      ${bevCol('id')} ${str} PRIMARY KEY, ${bevCol('name')} ${str} NOT NULL,
+      ${bevCol('payload')} ${txt}, ${bevCol('publishedAt')} ${ts} NOT NULL
     )`,
   ];
 
@@ -257,6 +271,11 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ],
       // buffered signals are taken FIFO per token (smallest id) — index the token for the scan.
       ['durable_buffered_signals_token_idx', `${buffered} (${bufCol('token')})`],
+      // buffered events are scanned oldest-first per name — one composite index serves both.
+      [
+        'durable_buffered_events_name_published_at_idx',
+        `${bufferedEvents} (${bevCol('name')}, ${bevCol('publishedAt')})`,
+      ],
       // Search-attribute pushdown: equality + range predicates probe by (key, value). Two composite
       // indexes — one per typed column — so a numeric range or a string equality is an index scan.
       [

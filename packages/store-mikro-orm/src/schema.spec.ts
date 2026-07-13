@@ -27,7 +27,7 @@ interface MarkerRow {
   applied_at: number;
 }
 
-/** The five durable tables described as MikroORM-ish metadata, enough for `computeExpectedFingerprint`. */
+/** The six durable tables described as MikroORM-ish metadata, enough for `computeExpectedFingerprint`. */
 function durableMetadata(opts: { extraColumn?: boolean } = {}): FakeMetadata {
   const tableNames = [
     'durable_workflow_runs',
@@ -35,6 +35,7 @@ function durableMetadata(opts: { extraColumn?: boolean } = {}): FakeMetadata {
     'durable_run_attributes',
     'durable_signal_waiters',
     'durable_buffered_signals',
+    'durable_buffered_events',
   ];
   const map = new Map<string, FakeMeta>();
   for (const tableName of tableNames) {
@@ -234,7 +235,7 @@ describe('ensureMikroOrmDurableSchema collation alignment', () => {
     );
 
     // One CONVERT per durable table, deriving the charset from the collation prefix.
-    expect(converts).toHaveLength(5);
+    expect(converts).toHaveLength(6);
     expect(
       converts.every((s) => /convert to character set utf8mb4 collate utf8mb4_unicode_ci/i.test(s)),
     ).toBe(true);
@@ -374,8 +375,9 @@ describe('ensureMikroOrmDurableSchema fingerprint gate', () => {
 });
 
 describe('durableManagedTables', () => {
-  it('returns the five durable table names', () => {
+  it('returns the six durable table names', () => {
     expect(durableManagedTables().sort()).toEqual([
+      'durable_buffered_events',
       'durable_buffered_signals',
       'durable_run_attributes',
       'durable_signal_waiters',

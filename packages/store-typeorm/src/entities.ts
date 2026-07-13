@@ -132,6 +132,16 @@ export class BufferedSignalEntity {
   payload?: unknown;
 }
 
+/** A published event that matched no live waiter (see `engine.publishEvent`'s buffering). Keyed by a
+ *  caller-minted `id` (a uuid, not autoincrement — `removeBufferedEvent` targets it directly), not by
+ *  `runId`: events are name-based pub/sub, not tied to any one run. */
+export class BufferedEventEntity {
+  id!: string;
+  name!: string;
+  payload?: unknown;
+  publishedAt!: Date;
+}
+
 /**
  * Build the durable TypeORM entity schemas with column names pinned per `naming` (default
  * `'snake_case'`). Register the result in your `DataSource`/`TypeOrmModule.forFeature`. The JSON-blob
@@ -295,7 +305,36 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     },
   });
 
-  return [workflowRuns, stepCheckpoints, runAttributes, signalWaiters, bufferedSignals];
+  const bufferedEvents = new EntitySchema<BufferedEventEntity>({
+    name: 'BufferedEventEntity',
+    target: BufferedEventEntity,
+    tableName: 'durable_buffered_events',
+    // No `indices` here (unlike MikroORM's EntitySchema, which does declare one): this store manages
+    // its DDL — including the `(name, publishedAt)` index — via raw SQL in `schema.ts`'s
+    // `ensureTypeOrmDurableSchema`, the same as every other durable_* table's indexes.
+    columns: {
+      // Caller-minted uuid (engine.publishEvent), not autoincrement — removeBufferedEvent targets it
+      // directly and needs to be handed the SAME id it was buffered with.
+      id: { type: 'text', primary: true, name: col('id') },
+      name: { type: 'text', name: col('name') },
+      payload: {
+        type: 'text',
+        nullable: true,
+        name: col('payload'),
+        transformer: jsonColumnTransformer('buffered.eventPayload'),
+      },
+      publishedAt: { type: Date, name: col('publishedAt') },
+    },
+  });
+
+  return [
+    workflowRuns,
+    stepCheckpoints,
+    runAttributes,
+    signalWaiters,
+    bufferedSignals,
+    bufferedEvents,
+  ];
 }
 
 /** Durable entity schemas with the canonical `'snake_case'` column names. */

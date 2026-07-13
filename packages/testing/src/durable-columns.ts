@@ -65,6 +65,12 @@ export const DURABLE_CANONICAL_COLUMNS = {
     token: 'token',
     payload: 'payload',
   },
+  durable_buffered_events: {
+    id: 'id',
+    name: 'name',
+    payload: 'payload',
+    publishedAt: 'published_at',
+  },
 } as const;
 
 export type DurableColumnMap = typeof DURABLE_CANONICAL_COLUMNS;

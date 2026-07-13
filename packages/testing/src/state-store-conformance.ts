@@ -607,6 +607,58 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.takeBufferedSignal('other')).toEqual({ payload: { n: 9 } });
     });
 
+    t('buffers events per name, oldest-first, and lists them without consuming', async () => {
+      await store.bufferEvent({
+        name: 'order.paid',
+        payload: { n: 1 },
+        id: 'e1',
+        publishedAt: 100,
+      });
+      await store.bufferEvent({
+        name: 'order.paid',
+        payload: { n: 2 },
+        id: 'e2',
+        publishedAt: 200,
+      });
+      await store.bufferEvent({
+        name: 'other.event',
+        payload: { n: 9 },
+        id: 'e3',
+        publishedAt: 50,
+      });
+
+      const listed = await store.listBufferedEvents('order.paid', 10);
+      expect(listed.map((e) => e.payload)).toEqual([{ n: 1 }, { n: 2 }]); // oldest (publishedAt) first
+      expect(listed.map((e) => e.id)).toEqual(['e1', 'e2']);
+      expect(listed[0]?.publishedAt).toBe(100);
+      // listing does not consume — the same rows are still there.
+      expect(await store.listBufferedEvents('order.paid', 10)).toHaveLength(2);
+      expect(await store.listBufferedEvents('other.event', 10)).toEqual([
+        { id: 'e3', payload: { n: 9 }, publishedAt: 50 },
+      ]);
+    });
+
+    t('listBufferedEvents caps at `limit`', async () => {
+      await store.bufferEvent({ name: 'evt', payload: 1, id: 'a', publishedAt: 1 });
+      await store.bufferEvent({ name: 'evt', payload: 2, id: 'b', publishedAt: 2 });
+      await store.bufferEvent({ name: 'evt', payload: 3, id: 'c', publishedAt: 3 });
+
+      expect(await store.listBufferedEvents('evt', 2)).toHaveLength(2);
+    });
+
+    t(
+      'removeBufferedEvent atomically deletes by id — true iff a row existed, false on a repeat/absent id',
+      async () => {
+        await store.bufferEvent({ name: 'evt', payload: { ok: true }, id: 'x1', publishedAt: 1 });
+
+        expect(await store.removeBufferedEvent('x1')).toBe(true);
+        expect(await store.listBufferedEvents('evt', 10)).toEqual([]);
+        // Already gone — a second attempt (the concurrent-claim arbiter) reports false, not an error.
+        expect(await store.removeBufferedEvent('x1')).toBe(false);
+        expect(await store.removeBufferedEvent('never-buffered')).toBe(false);
+      },
+    );
+
     // ---- transaction (optional) -------------------------------------------------------------
 
     t('transaction commits the checkpoint atomically and returns the work result', async () => {
