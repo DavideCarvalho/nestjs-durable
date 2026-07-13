@@ -132,7 +132,10 @@ DurableDashboardModule.forRoot({
 ```
 
 Open `/durable`, and an unauthenticated visit redirects to `GET /durable/login?returnTo=/durable`
-— a plain username/password form. On success it mints a `durable_dashboard_session` cookie
+— a plain username/password form. The password field is never `required`: the page passes it
+through to your `login` hook verbatim (an empty string when left blank), so a host that gates on
+username alone (e.g. any active admin's email, password ignored) works with this same built-in
+page. On success it mints a `durable_dashboard_session` cookie
 (`HttpOnly`, `SameSite=Lax`, `Secure` over https) and sends the browser back to `returnTo`. A
 missing/invalid/expired cookie on a page-level request (a full-page navigation) redirects to that
 login page; the same failure on an API request (`apiBasePath`, fetched by the SPA's own JS) is a

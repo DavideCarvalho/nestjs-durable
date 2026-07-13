@@ -1,5 +1,5 @@
 import { BadRequestException, NotFoundException, UnauthorizedException } from '@nestjs/common';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { parseCookieHeader } from './auth/cookie-header';
 import { resolveDashboardAuth } from './auth/dashboard-auth-config';
 import { verifySessionCookie } from './auth/session-cookie';
@@ -155,5 +155,58 @@ describe('DurableAuthController (dashboardAuth configured)', () => {
     expect(response.raw.statusCode).toBe(302);
     expect(response.location()).toBe('/durable/login');
     expect(response.ended()).toBe(true);
+  });
+});
+
+describe('DurableAuthController (password is optional end-to-end)', () => {
+  // The password field has no HTML `required` and the controller passes it through AS-IS (empty
+  // string when blank) — the `login` hook, not this controller, decides whether a password
+  // matters. This is what lets an email-only host (gate on username, ignore password) work with
+  // the same built-in login page as a host with real passwords.
+
+  it('an empty password reaches the login hook verbatim', async () => {
+    const loginSpy = vi.fn().mockReturnValue(null);
+    const auth = resolveDashboardAuth({ secret: SECRET, login: loginSpy });
+    const controller = new DurableAuthController(auth, BASE_PATH);
+
+    await controller
+      .login({ username: 'ops', password: '' }, { headers: {} }, makeResponse().raw)
+      .catch(() => undefined);
+
+    expect(loginSpy).toHaveBeenCalledWith('ops', '');
+  });
+
+  it('a hook rejecting an empty password still uniform-fails (generic 401)', async () => {
+    const auth = resolveDashboardAuth({
+      secret: SECRET,
+      login: (username, password) =>
+        username === 'ops' && password === 'real-password' ? { id: 'ops' } : null,
+    });
+    const controller = new DurableAuthController(auth, BASE_PATH);
+
+    await expect(
+      controller.login({ username: 'ops', password: '' }, { headers: {} }, makeResponse().raw),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('a hook that accepts an empty password (username-only gating) mints the session', async () => {
+    const auth = resolveDashboardAuth({
+      secret: SECRET,
+      login: (username) => (username === 'admin@example.com' ? { id: 'admin' } : null),
+    });
+    const controller = new DurableAuthController(auth, BASE_PATH);
+    const response = makeResponse();
+
+    const result = await controller.login(
+      { username: 'admin@example.com', password: '' },
+      { headers: {} },
+      response.raw,
+    );
+
+    expect(result).toEqual({ redirectTo: BASE_PATH });
+    const cookieValue = parseCookieHeader(response.setCookies()[0]).durable_dashboard_session;
+    expect(verifySessionCookie(cookieValue ?? '', { secret: SECRET })).toMatchObject({
+      sub: 'admin',
+    });
   });
 });

@@ -8,6 +8,12 @@
  * controlled config value, not user input — and the page body is otherwise a static template.
  * This sidesteps HTML-escaping entirely: there is no reflected query-param interpolation surface
  * to get wrong.
+ *
+ * The visual language (dark zinc card, mono type, emerald accent) mirrors
+ * `@dudousxd/nestjs-agent`'s dashboard login page so the two consoles feel like one family — only
+ * the submit flow differs (this page POSTs JSON via `fetch` and follows the JSON `redirectTo` it
+ * gets back, rather than a classic form POST + server redirect), which is why the markup keeps its
+ * own `<script>` rather than adopting agent-dashboard's plain `<form method="post">`.
  */
 export function renderLoginPage(basePath: string): string {
   const loginAction = `${basePath}/login`;
@@ -20,7 +26,7 @@ export function renderLoginPage(basePath: string): string {
 <meta name="robots" content="noindex, nofollow" />
 <title>Sign in — Durable</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body {
     margin: 0;
@@ -28,80 +34,85 @@ export function renderLoginPage(basePath: string): string {
     display: flex;
     align-items: center;
     justify-content: center;
-    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    background: #0b0f14;
-    color: #e5e7eb;
+    background: #09090b;
+    color: #e4e4e7;
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    padding: 16px;
   }
-  main {
+  .card {
     width: 100%;
-    max-width: 360px;
+    max-width: 384px;
+    border: 1px solid #27272a;
+    background: #18181b;
+    border-radius: 8px;
     padding: 32px;
+    box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.5);
   }
-  h1 {
+  .brand {
+    margin: 0 0 24px;
+    text-align: center;
     font-size: 18px;
     font-weight: 600;
-    margin: 0 0 4px;
+    color: #34d399;
   }
-  p.subtitle {
-    margin: 0 0 24px;
-    color: #9ca3af;
-    font-size: 13px;
-  }
-  label {
-    display: block;
-    font-size: 12px;
-    font-weight: 500;
-    margin-bottom: 6px;
-    color: #cbd5e1;
+  form { display: flex; flex-direction: column; gap: 16px; }
+  label { display: flex; flex-direction: column; gap: 6px; }
+  .field-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #71717a;
   }
   input {
-    width: 100%;
-    padding: 8px 10px;
-    margin-bottom: 16px;
-    border-radius: 6px;
-    border: 1px solid #374151;
-    background: #111827;
-    color: #e5e7eb;
-    font-size: 14px;
+    border-radius: 4px;
+    border: 1px solid #3f3f46;
+    background: #09090b;
+    color: #f4f4f5;
+    padding: 8px 12px;
+    font: inherit;
+    outline: none;
   }
-  input:focus { outline: 2px solid #3b82f6; outline-offset: 1px; }
-  button {
-    width: 100%;
-    padding: 9px 10px;
-    border-radius: 6px;
-    border: none;
-    background: #3b82f6;
-    color: white;
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-  }
-  button:disabled { opacity: 0.6; cursor: default; }
-  button:hover:not(:disabled) { background: #2563eb; }
+  input:focus { border-color: rgb(52 211 153 / 0.6); }
   #error {
     display: none;
-    margin-bottom: 16px;
-    padding: 8px 10px;
-    border-radius: 6px;
-    background: #7f1d1d;
-    color: #fecaca;
-    font-size: 13px;
+    margin: 0;
+    font-size: 12px;
+    color: #fb7185;
   }
+  button {
+    margin-top: 8px;
+    border-radius: 4px;
+    border: 1px solid rgb(52 211 153 / 0.4);
+    background: rgb(52 211 153 / 0.1);
+    color: #6ee7b7;
+    padding: 8px 12px;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: rgb(52 211 153 / 0.2); }
+  button:disabled { opacity: 0.6; cursor: default; }
 </style>
 </head>
 <body>
-<main>
-  <h1>Durable control plane</h1>
-  <p class="subtitle">Sign in to continue.</p>
-  <div id="error" role="alert">Invalid username or password.</div>
-  <form id="login-form" autocomplete="on">
-    <label for="username">Username</label>
-    <input id="username" name="username" type="text" autocomplete="username" required autofocus />
-    <label for="password">Password</label>
-    <input id="password" name="password" type="password" autocomplete="current-password" required />
-    <button id="submit" type="submit">Sign in</button>
-  </form>
-</main>
+  <div class="card">
+    <p class="brand">Durable</p>
+    <form id="login-form" autocomplete="on">
+      <label>
+        <span class="field-label">Username</span>
+        <input id="username" name="username" type="text" autocomplete="username" required autofocus />
+      </label>
+      <label>
+        <span class="field-label">Password</span>
+        <input id="password" name="password" type="password" autocomplete="current-password" />
+      </label>
+      <p id="error" role="alert">Invalid username or password.</p>
+      <button id="submit" type="submit">Sign in</button>
+    </form>
+  </div>
 <script>
 (function () {
   var LOGIN_ACTION = ${JSON.stringify(loginAction)};
