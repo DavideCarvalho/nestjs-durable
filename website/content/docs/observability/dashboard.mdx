@@ -54,6 +54,131 @@ due timers. Leave that to the driving pods. So a **retry clicked in the UI on an
 works**: the API dispatches the step, a driving pod picks it up and runs it. Only the processing is
 gated, not the control plane. (Default is `drive: true`, so single-process apps need nothing.)
 
+## Console auth
+
+Three ways to gate the console (the SPA at `basePath` and its JSON API at `apiBasePath`), from
+least to most work — pick one, or compose two:
+
+| | Open (default) | `guards` | `dashboardAuth` |
+| --- | --- | --- | --- |
+| Setup | none | you write (or already have) a guard | one config object, zero extra code |
+| Auth mechanism | whatever fronts the mount otherwise (reverse proxy, global guard) | whatever `CanActivate` you bring — typically your app's existing auth | a built-in signed session cookie + server-rendered login page |
+| Fronts the page (SPA shell + assets)? | no | yes, when set (see below) | yes — a missing/invalid session redirects the page to a login screen |
+| Best for | internal/dev use, or a mount already behind SSO/proxy | hosts that already authenticate the rest of the app and want ONE gate to reuse | standalone hosts with no existing admin auth |
+
+### `guards` — front it with your own auth
+
+`guards` (+ `imports` for its dependencies) stamps a guard class onto BOTH dashboard controllers —
+the SPA at `basePath` and its JSON API at `apiBasePath`:
+
+```ts
+DurableDashboardModule.forRoot({
+  guards: [ConsoleAuthGuard],
+  imports: [AuthModule], // resolves ConsoleAuthGuard's own dependencies
+});
+```
+
+A guard here must handle **cookies, not just headers**: the JSON API is fetched by the SPA's own
+`fetch`/XHR (a header-based guard works fine there), but the SPA shell itself is loaded by a full
+browser navigation — the browser sends whatever ambient cookie it has, never a custom
+`Authorization` header. A guard that only checks a bearer token will 403 the page shell for an
+already-logged-in admin whose next fetch to the API would have passed. A cookie-session guard
+that optionally redirects unauthenticated page navigations to your own sign-in screen:
+
+```ts
+import { type CanActivate, type ExecutionContext, Inject, Injectable } from '@nestjs/common';
+import { SessionService } from './session.service';
+
+@Injectable()
+export class ConsoleAuthGuard implements CanActivate {
+  constructor(@Inject(SessionService) private readonly sessions: SessionService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context.switchToHttp().getRequest();
+    const response = context.switchToHttp().getResponse();
+    const user = await this.sessions.verifyFromCookie(request);
+    if (user?.isAdmin) return true;
+
+    // A real browser navigation (loading the shell) vs the SPA's own fetch calls.
+    if (request.headers?.['sec-fetch-mode'] === 'navigate') {
+      response.redirect(302, '/signin?next=' + encodeURIComponent(request.originalUrl));
+    } else {
+      response.status(401).send({ message: 'Unauthorized' });
+    }
+    return false;
+  }
+}
+```
+
+### `dashboardAuth` — the built-in login
+
+`dashboardAuth` is the dashboard's own turnkey login: a stateless, signed session cookie plus a
+small, dependency-free, **server-rendered** login page — no infra, and no changes to the bundled
+React SPA (unlike `@dudousxd/nestjs-telescope`, whose `dashboardAuth` renders its login screen
+inside its own SPA bundle, the durable dashboard's login page is plain HTML served directly by
+its own controller, so gating the SPA shell never touches the Vite build):
+
+```ts
+DurableDashboardModule.forRoot({
+  dashboardAuth: {
+    secret: process.env.DURABLE_AUTH_SECRET, // REQUIRED HMAC-SHA256 key, 32+ bytes recommended
+    ttl: '8h', // optional, default 8h
+    login: (username, password) =>
+      username === process.env.DURABLE_USER && password === process.env.DURABLE_PASS
+        ? { id: 'ops' }
+        : null, // return null to deny — a uniform 401, no user-enumeration
+  },
+});
+```
+
+Open `/durable`, and an unauthenticated visit redirects to `GET /durable/login?returnTo=/durable`
+— a plain username/password form. On success it mints a `durable_dashboard_session` cookie
+(`HttpOnly`, `SameSite=Lax`, `Secure` over https) and sends the browser back to `returnTo`. A
+missing/invalid/expired cookie on a page-level request (a full-page navigation) redirects to that
+login page; the same failure on an API request (`apiBasePath`, fetched by the SPA's own JS) is a
+plain `401` instead — there's no page to redirect a `fetch` call to. `GET /durable/logout` clears
+the cookie and returns to the login page.
+
+Use `forRootAsync` when the `login` hook needs injected services (e.g. an `EntityManager` to look
+up a real admin user instead of an env var pair):
+
+```ts
+DurableDashboardModule.forRootAsync({
+  imports: [UsersModule],
+  inject: [UsersService],
+  useDashboardAuth: (users: UsersService) => ({
+    secret: process.env.DURABLE_AUTH_SECRET,
+    login: async (username, password) => {
+      const user = await users.verifyPassword(username, password);
+      return user?.isAdmin ? { id: user.id, name: user.name, roles: ['admin'] } : null;
+    },
+  }),
+});
+```
+
+Returning `undefined` from `useDashboardAuth` leaves the console open, exactly like omitting
+`dashboardAuth` from `forRoot`.
+
+Sliding renewal keeps an active session alive: a cookie past 50% of its TTL is transparently
+re-issued on the response, so a working operator is never logged out mid-session.
+
+**Composes with `guards`:** when both are set, a request must pass the built-in session check AND
+every guard in `guards` — the built-in guard runs first, so an invalid session never even reaches
+your own guard.
+
+```ts
+DurableDashboardModule.forRoot({
+  dashboardAuth: { secret: process.env.DURABLE_AUTH_SECRET, login: verifyOpsCredentials },
+  guards: [IpAllowlistGuard], // an extra restriction on top of the built-in login
+  imports: [NetworkModule],
+});
+```
+
+Auth here is deliberately **mount-level and role-agnostic**: neither `guards` nor `dashboardAuth`
+has any notion of the durable dashboard's control-plane vs tenant topology (the `GET topology`
+route behind the header badge, described below) — logging in only answers "is this a legitimate
+operator", nothing about what they can see changes based on who they are.
+
 ## What it shows
 
 - **Runs** — every run with its stored status (**pending** / running / suspended / **cancelling** /

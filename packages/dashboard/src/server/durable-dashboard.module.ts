@@ -1,8 +1,24 @@
 import 'reflect-metadata';
-import { type CanActivate, type DynamicModule, Module, type Type } from '@nestjs/common';
+import {
+  type CanActivate,
+  type DynamicModule,
+  type InjectionToken,
+  Module,
+  type OptionalFactoryDependency,
+  type Provider,
+  type Type,
+} from '@nestjs/common';
 import { RouterModule } from '@nestjs/core';
+import {
+  DASHBOARD_AUTH,
+  type DashboardAuthOptions,
+  resolveDashboardAuth,
+} from './auth/dashboard-auth-config.js';
+import { DashboardLoginRedirectFilter } from './auth/login-redirect.exception.js';
 import { DashboardService } from './dashboard.service.js';
 import { DurableApiController } from './durable-api.controller.js';
+import { DurableAuthController } from './durable-auth.controller.js';
+import { DurableApiSessionGuard, DurableUiSessionGuard } from './durable-session.guard.js';
 import {
   DASHBOARD_API_PATH,
   DASHBOARD_BASE_PATH,
@@ -57,6 +73,51 @@ export interface DurableDashboardOptions {
    * host's own auth module, e.g. `imports: [AuthModule]` alongside `guards: [JwtAuthGuard]`.
    */
   imports?: DynamicModule['imports'];
+  /**
+   * Gate the console (the SPA at `basePath` AND its JSON API at `apiBasePath`) behind a built-in,
+   * cookie-session login — no infra, no changes to the bundled React SPA. Unlike
+   * `@dudousxd/nestjs-telescope`'s `dashboardAuth` (a client-rendered login screen inside its SPA),
+   * the durable dashboard's login page is small, dependency-free, server-rendered HTML served
+   * directly by `DurableAuthController` at `GET <basePath>/login` — the SPA bundle itself never
+   * changes. A missing/invalid/expired session redirects a page-level request (a full-page
+   * navigation to `basePath`) to that login page with `?returnTo=<original url>`; an API request
+   * (`apiBasePath`, fetched by the SPA's own JS) gets a plain `401` instead.
+   *
+   * Auth here is mount-level and role-agnostic: this option (and the guards/controller it wires up)
+   * has no notion of control-plane vs tenant role (see the durable dashboard's topology note in
+   * `dashboard.service.ts`) — nothing role-specific changes based on who logs in.
+   *
+   * Composes with {@link guards}: when both are set, a request must pass the built-in session check
+   * AND every guard in `guards` — the SAME logical-AND semantics `@UseGuards` already gives multiple
+   * guards, since the built-in guard is simply prepended to whatever `guards` you pass. Omit to leave
+   * the console open (today's behavior, unchanged byte-for-byte) — front it with `guards`, a global
+   * guard, or a reverse proxy instead.
+   *
+   * See {@link DashboardAuthOptions} for the `secret`/`ttl`/`login` shape, and `forRootAsync` /
+   * {@link DurableDashboardAsyncOptions.useDashboardAuth} when the `login` hook needs DI (e.g. an
+   * `EntityManager` to look up an admin user).
+   */
+  dashboardAuth?: DashboardAuthOptions;
+}
+
+/**
+ * Async variant of {@link DurableDashboardOptions}. The mount paths and `guards` stay static (the
+ * router and guard metadata are bound at module-DEFINITION time — the same constraint `forRoot`
+ * already has), but `dashboardAuth` is built by an injected factory, so its `login` hook can reach
+ * your DB/services. Returning `undefined` from `useDashboardAuth` leaves the console open, exactly
+ * like omitting `dashboardAuth` from `forRoot`.
+ */
+export interface DurableDashboardAsyncOptions {
+  basePath?: string;
+  apiBasePath?: string;
+  guards?: Type<CanActivate>[];
+  imports?: DynamicModule['imports'];
+  /** Providers injected into `useDashboardAuth`, in order. Shared with a `guards` class's own deps. */
+  inject?: Array<InjectionToken | OptionalFactoryDependency>;
+  /** Build the `dashboardAuth` config from injected deps (or `undefined` to leave the console open). */
+  useDashboardAuth: (
+    ...deps: any[]
+  ) => DashboardAuthOptions | undefined | Promise<DashboardAuthOptions | undefined>;
 }
 
 /** Leading slash, no trailing slash. */
@@ -64,11 +125,21 @@ function normalize(path: string): string {
   return `/${path.replace(/^\/+|\/+$/g, '')}`;
 }
 
-/** Stamp (or clear) `@UseGuards`-equivalent metadata on the dashboard controllers — REPLACE, not append. */
-function stampGuards(guards: Type<CanActivate>[] | undefined, ...controllers: Type[]): void {
-  for (const controller of controllers) {
-    Reflect.defineMetadata(GUARDS_METADATA, guards ?? [], controller);
-  }
+/**
+ * Stamp (or clear) `@UseGuards`-equivalent metadata on a dashboard controller — REPLACE, not
+ * append, across repeated calls (a second `forRoot(...)` overwrites whatever a prior call
+ * stamped). `builtIn`, when given, is always prepended FIRST — it's the `dashboardAuth` session
+ * guard for that controller, which must run before any host `guards` (fail the session check
+ * before ever invoking host auth). Passing neither reproduces today's behavior byte-for-byte
+ * (an empty array — the controller unguarded).
+ */
+function stampGuards(
+  hostGuards: Type<CanActivate>[] | undefined,
+  builtIn: Type<CanActivate> | undefined,
+  controller: Type,
+): void {
+  const merged = [...(builtIn ? [builtIn] : []), ...(hostGuards ?? [])];
+  Reflect.defineMetadata(GUARDS_METADATA, merged, controller);
 }
 
 /**
@@ -84,12 +155,28 @@ export class DurableApiModule {
   static register(options: {
     imports?: DynamicModule['imports'];
     guards?: Type<CanActivate>[];
+    /** Provider for `DASHBOARD_AUTH` — a `useValue` (`forRoot`) or a `useFactory` (`forRootAsync`). */
+    authProvider: Provider;
+    /** Whether the built-in `DurableApiSessionGuard` should be stamped on `DurableApiController`
+     *  (true whenever `dashboardAuth` was set, or unconditionally for `forRootAsync`, where it's
+     *  resolved at runtime and is a no-op if it ends up unconfigured). */
+    authMayBeConfigured: boolean;
   }): DynamicModule {
+    stampGuards(
+      options.guards,
+      options.authMayBeConfigured ? DurableApiSessionGuard : undefined,
+      DurableApiController,
+    );
     return {
       module: DurableApiModule,
       imports: [...(options.imports ?? [])],
       controllers: [DurableApiController],
-      providers: [DashboardService, ...(options.guards ?? [])],
+      providers: [
+        DashboardService,
+        options.authProvider,
+        DurableApiSessionGuard,
+        ...(options.guards ?? []),
+      ],
       exports: [DashboardService],
     };
   }
@@ -97,17 +184,53 @@ export class DurableApiModule {
 
 /**
  * Mounts the control plane: the bundled React SPA at `basePath` and its JSON API at `apiBasePath`
- * (default `<basePath>/api`). Import via `DurableDashboardModule.forRoot(...)` alongside
- * `DurableModule` (global), so it resolves the engine and store. Front the routes with the first-class
- * `guards` option (plus `imports` for the guards' own dependencies) — see
- * {@link DurableDashboardOptions.guards}.
+ * (default `<basePath>/api`). Import via `DurableDashboardModule.forRoot(...)` (or `forRootAsync`
+ * when `dashboardAuth`'s `login` hook needs injected services) alongside `DurableModule` (global),
+ * so it resolves the engine and store. Front the routes with the first-class `guards` option
+ * (plus `imports` for the guards' own dependencies) — see {@link DurableDashboardOptions.guards} —
+ * or with the built-in `dashboardAuth` cookie login, or both.
  */
 @Module({})
 export class DurableDashboardModule {
   static forRoot(options: DurableDashboardOptions = {}): DynamicModule {
+    const authProvider: Provider = {
+      provide: DASHBOARD_AUTH,
+      useValue: resolveDashboardAuth(options.dashboardAuth),
+    };
+    return DurableDashboardModule.build(options, authProvider, options.dashboardAuth !== undefined);
+  }
+
+  static forRootAsync(options: DurableDashboardAsyncOptions): DynamicModule {
+    const authProvider: Provider = {
+      provide: DASHBOARD_AUTH,
+      inject: options.inject ?? [],
+      useFactory: async (...deps: any[]) =>
+        resolveDashboardAuth(await options.useDashboardAuth(...deps)),
+    };
+    // Always true: whether the resolved config ends up configured is only known at runtime, so the
+    // guards/auth-controller wiring must always be present — `DurableUiSessionGuard`/
+    // `DurableApiSessionGuard` are already no-ops when `DASHBOARD_AUTH` resolves to `null`.
+    return DurableDashboardModule.build(options, authProvider, true);
+  }
+
+  /** Shared wiring: static routing + the API module, with `dashboardAuth` supplied by `authProvider`. */
+  private static build(
+    options: {
+      basePath?: string;
+      apiBasePath?: string;
+      guards?: Type<CanActivate>[];
+      imports?: DynamicModule['imports'];
+    },
+    authProvider: Provider,
+    authMayBeConfigured: boolean,
+  ): DynamicModule {
     const basePath = normalize(options.basePath ?? '/durable');
     const apiBasePath = normalize(options.apiBasePath ?? `${basePath}/api`);
-    stampGuards(options.guards, DurableApiController, DurableUiController);
+    stampGuards(
+      options.guards,
+      authMayBeConfigured ? DurableUiSessionGuard : undefined,
+      DurableUiController,
+    );
     return {
       module: DurableDashboardModule,
       imports: [
@@ -118,17 +241,28 @@ export class DurableDashboardModule {
         DurableApiModule.register({
           ...(options.imports ? { imports: options.imports } : {}),
           ...(options.guards ? { guards: options.guards } : {}),
+          authProvider,
+          authMayBeConfigured,
         }),
         RouterModule.register([
-          { path: basePath, module: DurableDashboardModule }, // the UI controller below
+          { path: basePath, module: DurableDashboardModule }, // the UI + auth controllers below
           { path: apiBasePath, module: DurableApiModule },
         ]),
       ],
-      controllers: [DurableUiController],
+      controllers: [
+        DurableUiController,
+        // The auth controller (login page + logout) only exists when dashboardAuth might be
+        // configured — mounting it unconditionally would add a new `/login` route even for hosts
+        // that never set `dashboardAuth`, breaking "absent -> today's behavior byte-for-byte".
+        ...(authMayBeConfigured ? [DurableAuthController] : []),
+      ],
       providers: [
         { provide: DASHBOARD_BASE_PATH, useValue: basePath },
         { provide: DASHBOARD_API_PATH, useValue: apiBasePath },
-        // DurableUiController is hosted HERE, so its guards DI-instantiate from this module.
+        authProvider,
+        DurableUiSessionGuard,
+        // DurableUiController (and DurableAuthController, when present) are hosted HERE, so their
+        // guards DI-instantiate from this module.
         ...(options.guards ?? []),
       ],
       // Re-export the API module so its DashboardService reaches importers (e.g. flip's own controllers).

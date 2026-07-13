@@ -9,7 +9,9 @@ import {
   NotFoundException,
   Param,
   StreamableFile,
+  UseFilters,
 } from '@nestjs/common';
+import { DashboardLoginRedirectFilter } from './auth/login-redirect.exception.js';
 
 /** DI token carrying the UI mount base (e.g. `/durable`). */
 export const DASHBOARD_BASE_PATH = Symbol('DASHBOARD_BASE_PATH');
@@ -38,7 +40,14 @@ const CONTENT_TYPES: Record<string, string> = {
  * Serves the bundled control-plane SPA at the configured base (+ hashed assets at `<base>/assets`).
  * The path comes from `RouterModule` (set by `DurableDashboardModule.forRoot({ basePath })`), so the
  * controller routes are relative.
+ *
+ * `@UseFilters(DashboardLoginRedirectFilter)` is permanent (present regardless of whether
+ * `dashboardAuth` is configured): it only ever activates for a `DashboardLoginRedirectException`,
+ * which `DurableUiSessionGuard` only throws when it is ALSO stamped on this controller (see
+ * `DurableDashboardModule.forRoot`) — so leaving it decorated here is inert, not a behavior change,
+ * when `dashboardAuth` is absent.
  */
+@UseFilters(DashboardLoginRedirectFilter)
 @Controller()
 export class DurableUiController {
   private readonly dir = spaDir();
