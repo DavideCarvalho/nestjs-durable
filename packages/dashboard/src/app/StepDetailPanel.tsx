@@ -390,7 +390,9 @@ export function StepDetailPanel({
           />
           {step.workerGroup && <Field k="worker" v={`@${step.workerGroup}`} />}
           <Field k="started" v={clock(step.startedAt)} />
-          <Field k="finished" v={clock(step.finishedAt)} />
+          {/* A pending step's finishedAt is just its last write — showing it as "finished" reads
+              like the step ended while the duration says running. */}
+          {!pending && <Field k="finished" v={clock(step.finishedAt)} />}
           <Field k="offset" v={`+${sinceStart}`} />
         </div>
 

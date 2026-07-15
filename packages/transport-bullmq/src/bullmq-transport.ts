@@ -185,6 +185,17 @@ export interface BullMQTransportOptions {
    * short-lived test where the interval would otherwise outlive the test). Default `30_000`.
    */
   pingIntervalMs?: number | false;
+  /**
+   * Wall-clock ceiling (ms) for a single step handler on THIS worker. A wedged handler — an await
+   * that will never settle (dead connection swallowed by a wrapper stream, an external call with no
+   * timeout) — otherwise holds its BullMQ job forever: the lock renews on a timer regardless of
+   * progress, so the job is never reclaimed and the run waits until someone kills the process. When
+   * set, a step still pending after `stepTimeoutMs` publishes a RETRYABLE failed StepResult (the
+   * engine's durable retry re-dispatches it) and the orphaned handler promise is abandoned. Opt-in:
+   * pick a value comfortably above your slowest legitimate step. Unset = no ceiling (previous
+   * behavior).
+   */
+  stepTimeoutMs?: number;
 }
 
 /**
@@ -255,6 +266,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly subscribers = new Set<Redis>();
   private pingWatchdogTimer?: ReturnType<typeof setInterval>;
   private readonly pingIntervalMs: number | false;
+  private readonly stepTimeoutMs: number | undefined;
 
   constructor(options: BullMQTransportOptions) {
     this.connection = options.connection;
@@ -264,6 +276,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
     this.concurrency = options.concurrency;
     this.pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
+    this.stepTimeoutMs = options.stepTimeoutMs;
   }
 
   /**
@@ -579,7 +592,10 @@ export class BullMQTransport implements Transport, ControlPlane {
     controller.onStart();
     let ok = false;
     try {
-      const result = await runStepHandler(task, this.handlers.get(task.name));
+      const result = await this.withStepTimeout(
+        task,
+        runStepHandler(task, this.handlers.get(task.name)),
+      );
       ok = result.status === 'completed';
       await this.queue(this.resultsName()).add('result', result, {
         removeOnComplete: true,
@@ -612,6 +628,50 @@ export class BullMQTransport implements Transport, ControlPlane {
       // worker (`redis-runner`), never here.
       controller.onSettle(Date.now() - startedAt, ok, 'step');
     }
+  }
+
+  /**
+   * Race a step handler against the configured `stepTimeoutMs` ceiling. On timeout, resolve with a
+   * RETRYABLE failed StepResult — the engine's durable retry re-dispatches the step — and ABANDON
+   * the still-pending handler promise (a wedged await cannot be cancelled from outside; what matters
+   * is that the run stops waiting on a worker that will never answer). No ceiling configured →
+   * pass-through.
+   */
+  private withStepTimeout(task: RemoteTask, run: Promise<StepResult>): Promise<StepResult> {
+    const ms = this.stepTimeoutMs;
+    if (!ms) return run;
+    return new Promise<StepResult>((resolve) => {
+      const timedOut: StepResult = {
+        runId: task.runId,
+        seq: task.seq,
+        stepId: task.stepId,
+        status: 'failed',
+        error: {
+          message: `remote step worker failed: step exceeded stepTimeoutMs (${ms}ms) — presumed wedged`,
+          retryable: true,
+        },
+      };
+      const timer = setTimeout(() => resolve(timedOut), ms);
+      timer.unref?.();
+      // runStepHandler is pure (a handler throw becomes a failed StepResult), but guard anyway so a
+      // future refactor can't turn a rejection into an unhandled one that skips the settle path.
+      run.then(
+        (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        (err: unknown) => {
+          clearTimeout(timer);
+          resolve({
+            ...timedOut,
+            error: {
+              message: `remote step worker failed: ${err instanceof Error ? err.message : String(err)}`,
+              retryable: true,
+            },
+          });
+        },
+      );
+    });
   }
 
   /**
