@@ -21,7 +21,11 @@ vi.mock('bullmq', () => ({
       getJobCounts: vi.fn().mockResolvedValue({}),
     };
   }),
-  Worker: vi.fn(() => ({ concurrency: 1, close: vi.fn().mockResolvedValue(undefined), on: vi.fn() })),
+  Worker: vi.fn(() => ({
+    concurrency: 1,
+    close: vi.fn().mockResolvedValue(undefined),
+    on: vi.fn(),
+  })),
 }));
 
 vi.mock('ioredis', () => ({

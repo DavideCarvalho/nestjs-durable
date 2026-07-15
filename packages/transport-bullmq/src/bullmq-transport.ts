@@ -334,11 +334,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     const ns = this.#namespace;
     if (ns && ns !== 'default' && routingToken.includes('@')) {
       throw new Error(
-        `routing token "${routingToken}" carries a tenant suffix, but this transport is namespaced ` +
-          `"${ns}" (keys live under "${this.prefix}-${ns}-*") — tenant-suffixed groups follow the ` +
-          `operator convention and live on the BARE prefix. Add a bare-prefix transport to the pool ` +
-          `(e.g. new BullMQTransport({ connection, namespace: 'default' })) so dispatch fails over ` +
-          `to it, or unset the tenant on this deployment.`,
+        `routing token "${routingToken}" carries a tenant suffix, but this transport is namespaced "${ns}" (keys live under "${this.prefix}-${ns}-*") — tenant-suffixed groups follow the operator convention and live on the BARE prefix. Add a bare-prefix transport to the pool (e.g. new BullMQTransport({ connection, namespace: 'default' })) so dispatch fails over to it, or unset the tenant on this deployment.`,
       );
     }
   }

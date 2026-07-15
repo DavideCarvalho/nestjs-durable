@@ -1837,14 +1837,15 @@ export class WorkflowEngine {
     childId: string,
     opts?: StartOptions,
   ): void {
-    queueMicrotask(() =>
-      void this.start(workflow, input, childId, opts).catch((err) => {
-        const message = err instanceof Error ? err.message : String(err);
-        this.notifyParent(childId, {
-          ok: false,
-          error: `child workflow "${workflow}" failed to start: ${message}`,
-        });
-      }),
+    queueMicrotask(
+      () =>
+        void this.start(workflow, input, childId, opts).catch((err) => {
+          const message = err instanceof Error ? err.message : String(err);
+          this.notifyParent(childId, {
+            ok: false,
+            error: `child workflow "${workflow}" failed to start: ${message}`,
+          });
+        }),
     );
   }
 
