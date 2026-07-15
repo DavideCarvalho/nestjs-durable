@@ -26,6 +26,7 @@ import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
 import { WorkflowGraph } from './WorkflowGraph';
 import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
+import { parentRunIdOf, retryOriginOf } from './run-lineage';
 
 /** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
  *  flowing into the next), in currentColor so it inherits the emerald accent. Replaces the bare `◆`. */
@@ -976,6 +977,26 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
         <div className="min-w-0">
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-semibold tracking-tight">{run.workflow}</h2>
+            {parentRunIdOf(run.id) !== undefined && (
+              <button
+                type="button"
+                onClick={() => onOpenRun(parentRunIdOf(run.id) as string)}
+                className="mono rounded border border-indigo-500/40 bg-indigo-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-indigo-300 hover:bg-indigo-500/20"
+                title={`Open the parent run (${parentRunIdOf(run.id)}) — the macro view this child belongs to`}
+              >
+                ↑ parent
+              </button>
+            )}
+            {retryOriginOf(run.id) !== undefined && (
+              <button
+                type="button"
+                onClick={() => onOpenRun(retryOriginOf(run.id) as string)}
+                className="mono rounded border border-zinc-500/40 bg-zinc-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-300 hover:bg-zinc-500/20"
+                title={`This is a retry-with-input of ${retryOriginOf(run.id)} — open the original run`}
+              >
+                ↩ original
+              </button>
+            )}
             {isDlqHandler && (
               <span className="mono rounded border border-rose-500/40 bg-rose-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-rose-300">
                 dlq
