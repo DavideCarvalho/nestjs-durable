@@ -7,6 +7,7 @@ import { groupParallelSpans } from '../client/group-parallel-spans';
 import { groupSubProcesses } from '../client/group-subprocesses';
 import { childRunIdOf } from './child-link';
 import { ChildIcon, iconFor } from './icons';
+import { stalePendingView } from './stale-liveness';
 
 /** Fetch the RunDetail of each child-ref step in a timeline, so a row can read the child's real
  *  workflow name (instead of the raw `signal:child:<id>` checkpoint) and its full run duration. */
@@ -60,15 +61,6 @@ function fmtDur(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(2)}s`;
   return `${(ms / 60_000).toFixed(2)}m`;
-}
-
-/** Minutes since a remote step was dispatched (`enqueuedAt`, falling back to `startedAt`) — the
- *  "Nm ago" a stale-pending warning reports. */
-function minutesSinceDispatch(step: StepCheckpoint): number {
-  const dispatchedAt = step.enqueuedAt
-    ? new Date(step.enqueuedAt).getTime()
-    : new Date(step.startedAt).getTime();
-  return Math.round((Date.now() - dispatchedAt) / 60_000);
 }
 
 type SubStatus = 'ok' | 'failed' | 'skipped';
@@ -141,9 +133,24 @@ function StepRow({
   const isExpanded = isChild && childRunId !== undefined && expanded.has(childRunId);
   const hasSubs = subRows.length > 0 && !isChild;
   const subsCollapsed = collapsedSubs.has(step.seq);
-  // Likely a lost dispatch (crashed worker / dropped job) — reconcile-wake can't recover a `pending`
-  // step, so flag it for a manual re-dispatch.
+  // A remote step pending past the stale window is EITHER a long-running step still held by a live
+  // worker (wait) or a lost dispatch (re-dispatch) — resolve which by consulting the group's worker
+  // heartbeats instead of the wall clock alone. Shares the `['workers']` cache with the pods panel;
+  // only fetched while a stale row is actually on screen.
   const stale = isStalePending(step, Date.now());
+  const { data: workersHealth } = useQuery({
+    queryKey: ['workers'],
+    queryFn: () => durableClient.workers(),
+    refetchInterval: 10_000,
+    enabled: stale,
+  });
+  const staleView = stale
+    ? stalePendingView(
+        step,
+        workersHealth?.find((g) => g.group === step.workerGroup),
+        Date.now(),
+      )
+    : undefined;
   return (
     <div>
       <button
@@ -239,13 +246,24 @@ function StepRow({
           </span>
         </span>
       </button>
-      {stale && (
+      {staleView?.kind === 'working' && (
+        <div
+          className="mono ml-[18px] mb-1 flex items-center gap-1 text-[10px] text-emerald-500/80"
+          title="A live worker holds this dispatch — its heartbeat is fresh. Long steps are expected to sit here; only re-dispatch if the heartbeat goes stale."
+        >
+          <span aria-hidden>⚙</span>
+          being worked by {staleView.instanceId} — heartbeat {staleView.beatAgoS}s ago
+          {staleView.inFlight !== undefined ? ` · ${staleView.inFlight} in flight` : ''}
+        </div>
+      )}
+      {staleView?.kind === 'lost' && (
         <div
           className="mono ml-[18px] mb-1 flex items-center gap-1 text-[10px] s-stale"
-          title="Reconcile-wake can't recover a stuck `pending` step — re-dispatch it from the run actions above"
+          title="No live worker heartbeat on this step's group — reconcile-wake can't recover a stuck `pending` step; re-dispatch it from the run actions above"
         >
           <span aria-hidden>⚠</span>
-          awaiting worker result — dispatched {minutesSinceDispatch(step)}m ago (possibly lost)
+          awaiting worker result — dispatched {staleView.minutes}m ago, no live worker (possibly
+          lost)
         </div>
       )}
       {subRows.length > 0 && !subsCollapsed && (
