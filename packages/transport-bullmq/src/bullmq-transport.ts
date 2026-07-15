@@ -319,6 +319,29 @@ export class BullMQTransport implements Transport, ControlPlane {
   private tasksName(routingToken: string): string {
     return `${this.#effectivePrefix()}-tasks-${routingToken}`;
   }
+
+  /**
+   * A `@tenant`-suffixed routing token follows the OPERATOR convention: tenant workers (the Python
+   * SDK, the TS `role: 'tenant'` worker) subscribe `<name>@<tenant>` queues under the BARE prefix.
+   * Enqueueing such a token under a NAMESPACED prefix (`durable-<ns>-tasks-<name>@<tenant>`) is a
+   * double encoding of the tenant axis — no worker anywhere subscribes that queue, so the task would
+   * park invisibly forever (the exact black hole that hid a misrouted remote `processing` workflow).
+   * Refuse loudly instead: the engine's dispatch failover (TransportPool) moves on to the next
+   * transport in the pool, so a control plane that pairs a namespaced transport with a bare-prefix
+   * one (`new BullMQTransport({ connection, namespace: 'default' })`) routes these tokens correctly.
+   */
+  #assertRoutableToken(routingToken: string): void {
+    const ns = this.#namespace;
+    if (ns && ns !== 'default' && routingToken.includes('@')) {
+      throw new Error(
+        `routing token "${routingToken}" carries a tenant suffix, but this transport is namespaced ` +
+          `"${ns}" (keys live under "${this.prefix}-${ns}-*") — tenant-suffixed groups follow the ` +
+          `operator convention and live on the BARE prefix. Add a bare-prefix transport to the pool ` +
+          `(e.g. new BullMQTransport({ connection, namespace: 'default' })) so dispatch fails over ` +
+          `to it, or unset the tenant on this deployment.`,
+      );
+    }
+  }
   private resultsName(): string {
     return `${this.#effectivePrefix()}-results`;
   }
@@ -357,6 +380,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   /** `task.group` already carries the FINAL routing token (`tenantGroup(sanitizeQueueToken(name),
    *  partition)`), computed upstream by the engine — this targets that handler's dedicated queue. */
   async dispatch(task: RemoteTask): Promise<void> {
+    this.#assertRoutableToken(task.group);
     await this.queue(this.tasksName(task.group)).add('task', task, {
       ...this.jobOptions(task.priority),
       // Retain a FAILED task job's payload (age-bounded) instead of deleting it. A worker that
@@ -377,6 +401,7 @@ export class BullMQTransport implements Transport, ControlPlane {
    *  Python workflow worker consumes via `<prefix>-tasks-<routing-token>`). The decision comes back
    *  on `<prefix>-decisions`. */
   async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
+    this.#assertRoutableToken(task.group);
     await this.queue(this.tasksName(task.group)).add(
       'workflow',
       task,

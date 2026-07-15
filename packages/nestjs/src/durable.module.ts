@@ -447,8 +447,8 @@ function assertValidRole(options: DurableModuleOptions): void {
       'a durable module needs either a `store` (operator) or a `connection` (worker)',
     );
   }
-  if (hasStore && options.transport === undefined) {
-    throw new Error('an operator (`store`) needs a `transport`');
+  if (hasStore && options.transport === undefined && options.transports === undefined) {
+    throw new Error('an operator (`store`) needs a `transport` (or `transports`)');
   }
 }
 

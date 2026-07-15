@@ -1105,16 +1105,21 @@ export class WorkflowEngine {
   private async resolveRemoteByConvention(
     run: WorkflowRun,
   ): Promise<RegisteredWorkflow | undefined> {
-    const liveGroups = await this.pool.listWorkerGroups();
     // Workers register/heartbeat their liveGroups under the SANITIZED token (`sanitizeQueueToken`),
     // so the membership check must sanitize too — else a `:`-named workflow's live worker is under
     // `orders-fulfill` while this computes `orders:fulfill` and never matches.
     const group = tenantGroup(sanitizeQueueToken(run.workflow), run.namespace);
-    if (!liveGroups.includes(group)) return undefined;
+    // Resolve the TRANSPORT the group is live on, not just membership in the merged list: in a
+    // mixed pool (a tenant-scoped control plane pairing its namespaced transport with a bare-prefix
+    // one for operator-convention tenant workers), each transport scans a different keyspace —
+    // dispatching on `primary` while the worker heartbeats on another transport would park the turn
+    // on a queue nobody consumes.
+    const liveTransport = await this.pool.transportWithLiveGroup(group);
+    if (!liveTransport) return undefined;
     // Feed the workflow NAME + namespace-as-partition through, rather than the pre-combined
     // `group` string above — the executor computes the identical token itself (name+partition is
     // the new routing primitive; `group` here still exists only for the liveGroups membership check).
-    const executor = new RemoteWorkflowExecutor(this.pool.primary, run.workflow, run.namespace);
+    const executor = new RemoteWorkflowExecutor(liveTransport, run.workflow, run.namespace);
     return {
       name: run.workflow,
       version: run.workflowVersion,
@@ -1812,6 +1817,35 @@ export class WorkflowEngine {
    */
   private notifyParent(runId: string, completion: Completion<unknown>): void {
     void this.signal(`child:${runId}`, completion).catch(() => undefined);
+  }
+
+  /**
+   * Deferred child start shared by the in-process ctx host and the remote `startChild` command.
+   * Deferred (microtask) so a fast child can't reentrantly resume a still-suspending parent. A start
+   * that THROWS (unregistered/unroutable workflow, input validation, singleton back-pressure, store
+   * failure) must NOT be swallowed: the parent is already suspended on `child:<childId>` (the waiter
+   * is put BEFORE start on every path), so a silent drop parks it in suspended-forever, invisibly
+   * re-attempting on every recovery wake — a misconfigured remote child looks exactly like a healthy
+   * long wait. Instead the failure is delivered to that waiter like a failed child (notifyParent):
+   * the parent resumes and fails loudly with the cause. For a fire-and-forget `ctx.startChild`
+   * (spawn — no waiter) the completion is buffered; a later join by the same id consumes it and
+   * correctly observes the failed start.
+   */
+  private startChildDeferred(
+    workflow: string,
+    input: unknown,
+    childId: string,
+    opts?: StartOptions,
+  ): void {
+    queueMicrotask(() =>
+      void this.start(workflow, input, childId, opts).catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.notifyParent(childId, {
+          ok: false,
+          error: `child workflow "${workflow}" failed to start: ${message}`,
+        });
+      }),
+    );
   }
 
   /**
@@ -2756,12 +2790,7 @@ export class WorkflowEngine {
         if (!(await this.store.getRun(childId))) {
           // Inherit the parent run's namespace (see ctxHostFor.startChild) so a remote workflow's
           // child stays on the parent's tenant/partition regardless of which engine executes it.
-          queueMicrotask(
-            () =>
-              void this.start(cmd.workflow, cmd.input, childId, {
-                namespace: run.namespace,
-              }).catch(() => undefined),
-          );
+          this.startChildDeferred(cmd.workflow, cmd.input, childId, { namespace: run.namespace });
         }
       } else {
         throw new Error(
@@ -3183,12 +3212,7 @@ export class WorkflowEngine {
       // `davi-local` pipeline would stamp its `processing` child `default` and it would leak off the
       // tenant's worker pool onto the shared/dev workers.
       startChild: (workflow, input, id, priority) => {
-        queueMicrotask(
-          () =>
-            void this.start(workflow, input, id, { priority, namespace: parentNamespace }).catch(
-              () => undefined,
-            ),
-        );
+        this.startChildDeferred(workflow, input, id, { priority, namespace: parentNamespace });
       },
       // Deferred for the same reentrancy reason as `startChild` above. `cancel()` is already
       // idempotent on a terminal/cancelled run (returns its existing status without side effects), so

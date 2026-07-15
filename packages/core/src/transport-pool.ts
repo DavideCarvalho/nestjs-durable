@@ -119,6 +119,22 @@ export class TransportPool {
   }
 
   /**
+   * The first transport (in pool order) reporting a LIVE heartbeat for `group` — the one a
+   * convention-routed remote workflow must dispatch on. In a mixed pool (e.g. a tenant-scoped
+   * control plane pairing its namespaced transport with a bare-prefix one for operator-convention
+   * tenant workers), each transport sees a DIFFERENT keyspace: dispatching on `primary` while the
+   * live worker heartbeats on another transport parks the task on a queue nobody consumes. Returns
+   * `undefined` when no transport reports the group (mirrors the merged `listWorkerGroups` miss).
+   */
+  async transportWithLiveGroup(group: string): Promise<Transport | undefined> {
+    for (const { transport } of this.transports) {
+      if (!transport.listWorkerGroups) continue;
+      if ((await transport.listWorkerGroups()).includes(group)) return transport;
+    }
+    return undefined;
+  }
+
+  /**
    * Propagate the engine's `namespace` to every transport that partitions by it — so the same
    * namespace that scopes the store also scopes each transport's queues/keys. A transport that
    * doesn't partition (no `useNamespace`) is skipped. Idempotent; a transport given an explicit
