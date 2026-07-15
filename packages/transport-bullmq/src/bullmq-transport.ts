@@ -253,8 +253,12 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly subscribers = new Set<Redis>();
   private pingWatchdogTimer?: ReturnType<typeof setInterval>;
   private readonly pingIntervalMs: number | false;
+  // Original ctor options, retained so `withNamespace()` can clone a sibling transport that differs
+  // ONLY in its (explicit) namespace — same broker, prefix, partition, instanceId scheme, tuning.
+  readonly #options: BullMQTransportOptions;
 
   constructor(options: BullMQTransportOptions) {
+    this.#options = options;
     this.connection = options.connection;
     this.partition = options.partition;
     this.prefix = options.prefix ?? 'durable';
@@ -273,6 +277,18 @@ export class BullMQTransport implements Transport, ControlPlane {
   useNamespace(namespace: string): void {
     if (this.#explicitNamespace) return;
     this.#namespace = namespace;
+  }
+
+  /**
+   * A sibling transport on the same broker, pinned to `namespace` EXPLICITLY (so a later
+   * {@link useNamespace} never re-scopes it). Same connection/prefix/partition/tuning as this one.
+   * Powers the `tenantWorkers: 'bridge'` control-plane preset: a tenant-scoped operator pairs its
+   * namespaced primary with `withNamespace('default')` — a bare-prefix sibling — so
+   * operator-convention tenant workers (`<group>@<tenant>` under the bare prefix) are discoverable
+   * and dispatchable through the pool.
+   */
+  withNamespace(namespace: string): BullMQTransport {
+    return new BullMQTransport({ ...this.#options, namespace });
   }
 
   /**

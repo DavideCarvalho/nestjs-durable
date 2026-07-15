@@ -428,7 +428,24 @@ export interface DurableModuleOptions {
    * Validated at `forRoot`/`forRootAsync` resolution time — see {@link DurableModule} for the exact
    * error messages, which double as the axis primer above.
    */
-  topology?: { role: 'control-plane'; tenant?: string } | { role: 'tenant'; tenant: string };
+  topology?:
+    | {
+        role: 'control-plane';
+        tenant?: string;
+        /**
+         * `'bridge'` — this operator's tenant workers follow the OPERATOR convention (bare
+         * transport prefix + `@<tenant>`-suffixed groups: the Python SDK, the TS `role: 'tenant'`
+         * worker). When `tenant` is set, the preset pairs the configured `transport` with a
+         * bare-prefix sibling (`transport.withNamespace('default')`) in a pool, so those workers
+         * are discoverable and dispatchable from this otherwise-namespaced keyspace. INERT when
+         * `tenant` is unset (a global operator is already on the bare prefix) — safe to leave on a
+         * static config that reads `tenant` from an env var. CAUTION: the bare sibling consumes
+         * the shared bare control queues — only sound when this stack owns its broker (a private
+         * Redis); on a shared broker, point the tenant workers at a scoped prefix instead.
+         */
+        tenantWorkers?: 'bridge';
+      }
+    | { role: 'tenant'; tenant: string };
 }
 
 export interface DurableModuleAsyncOptions {
@@ -535,10 +552,43 @@ function resolveTopology(options: DurableModuleOptions): DurableModuleOptions {
     // An optional tenant scopes the operator to its own runs — maps onto `namespace` (undefined =
     // global operator, drives every tenant; validated against an explicit mismatched `namespace`).
     if (topology.tenant === undefined || options.namespace !== undefined) return options;
-    return { ...options, namespace: topology.tenant };
+    return resolveTenantWorkersBridge({ ...options, namespace: topology.tenant });
   }
   if (options.partition !== undefined) return options;
   return { ...options, partition: topology.tenant };
+}
+
+/**
+ * Applies the control-plane preset's `tenantWorkers: 'bridge'` sugar: pair the configured singular
+ * `transport` (about to be namespaced by the engine to the tenant) with a bare-prefix sibling
+ * (`transport.withNamespace('default')`) in a `transports` pool, so operator-convention tenant
+ * workers — bare prefix + `@<tenant>` groups (the Python SDK, the TS tenant role) — are
+ * discoverable and dispatchable. The singular `transport` is KEPT (it feeds `TRANSPORT_CANONICAL`,
+ * i.e. the step registrar / in-app worker). No-ops: bridge not requested, tenant unresolved (the
+ * caller only reaches here with a tenant), or an explicit `transports` pool (hand-wired wins). A
+ * transport without `withNamespace` can't be bridged — thrown as a config error, not silently
+ * ignored, because the whole point is reaching workers that would otherwise be invisible.
+ */
+function resolveTenantWorkersBridge(options: DurableModuleOptions): DurableModuleOptions {
+  const topology = options.topology;
+  if (topology?.role !== 'control-plane' || topology.tenantWorkers !== 'bridge') return options;
+  if (options.transports !== undefined) return options;
+  const primary = options.transport;
+  if (primary === undefined) return options; // assertValidTopology already rejects this shape
+  if (primary.withNamespace === undefined) {
+    throw new Error(
+      "topology: { tenantWorkers: 'bridge' } needs a transport implementing `withNamespace` " +
+        '(e.g. BullMQTransport) — the bridge derives a bare-prefix sibling from the configured ' +
+        'transport to reach operator-convention tenant workers.',
+    );
+  }
+  return {
+    ...options,
+    transports: [
+      { id: 'default', transport: primary },
+      { id: 'tenant-workers', transport: primary.withNamespace('default') },
+    ],
+  };
 }
 
 /**
@@ -652,7 +702,12 @@ export class DurableModule {
         },
         {
           provide: TRANSPORT_CANONICAL,
-          useFactory: (options: DurableModuleOptions) => options.transport ?? null,
+          // With a POOL (`transports`) and no singular `transport`, the canonical transport is the
+          // pool's PRIMARY — the same one the engine dispatches on first. Leaving it null starved
+          // the step registrar / in-app worker of a transport, so a pool-configured operator
+          // registered NO step handlers and its own steps parked in `wait` with no consumer.
+          useFactory: (options: DurableModuleOptions) =>
+            options.transport ?? options.transports?.[0]?.transport ?? null,
           inject: [DURABLE_OPTIONS_CANONICAL],
         },
         // Legacy back-compat aliases (deprecated tokens still resolve to the same instances):
