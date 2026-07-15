@@ -153,7 +153,9 @@ export interface BullMQTransportOptions {
    * multiple isolated deployments (e.g. per-developer `dev-alice`) without crosstalk. Unset or
    * `"default"` keeps names BYTE-IDENTICAL to the un-namespaced scheme (production is unchanged); any
    * other value inserts a `-<namespace>` segment after the prefix — see the cross-SDK naming rule on
-   * {@link BullMQTransport}. Passing it here is EXPLICIT and wins over a later {@link useNamespace}.
+   * {@link BullMQTransport}. Construction-time ONLY, an explicit whole-deployment isolation knob:
+   * the engine never infers it, and per-run TENANT routing is a different axis entirely (group
+   * suffixes — `<name>@<tenant>` — on this transport's own prefix; see `tenantGroup`).
    */
   namespace?: string;
   /** Stable id for this worker process in heartbeats. Defaults to `ts-<hostname>-<pid>`. */
@@ -200,11 +202,11 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly connection: ConnectionOptions;
   private readonly partition: string | undefined;
   private readonly prefix: string;
-  // Logical deployment namespace folded into every name via `#effectivePrefix()`. Mutable so an
-  // engine can push its namespace onto a transport via `useNamespace()` — but only when one wasn't
-  // passed EXPLICITLY at construction (tracked by `#explicitNamespace`), which always wins.
-  #namespace: string | undefined;
-  readonly #explicitNamespace: boolean;
+  // Logical deployment namespace folded into every name via `#effectivePrefix()`. Construction-time
+  // ONLY — an explicit deployment-isolation knob, never inferred: the engine does NOT push its
+  // tenancy namespace onto transports (per-run tenant routing rides GROUP suffixes instead, the
+  // cross-SDK canonical convention every worker runtime speaks).
+  readonly #namespace: string | undefined;
   private readonly handlers = new Map<string, StepHandler>();
   private readonly queues = new Map<string, Queue>();
   // One BullMQ `Worker` per registered handler name (see `handle()`) — never a single shared queue.
@@ -253,42 +255,15 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly subscribers = new Set<Redis>();
   private pingWatchdogTimer?: ReturnType<typeof setInterval>;
   private readonly pingIntervalMs: number | false;
-  // Original ctor options, retained so `withNamespace()` can clone a sibling transport that differs
-  // ONLY in its (explicit) namespace — same broker, prefix, partition, instanceId scheme, tuning.
-  readonly #options: BullMQTransportOptions;
 
   constructor(options: BullMQTransportOptions) {
-    this.#options = options;
     this.connection = options.connection;
     this.partition = options.partition;
     this.prefix = options.prefix ?? 'durable';
     this.#namespace = options.namespace;
-    this.#explicitNamespace = options.namespace !== undefined;
     this.instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
     this.concurrency = options.concurrency;
     this.pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
-  }
-
-  /**
-   * Adopt `namespace` (the engine's, typically), segmenting every queue/stream/key — but ONLY if a
-   * namespace wasn't passed explicitly to the constructor (an explicit one always wins). Idempotent.
-   * Satisfies the optional `Transport.useNamespace` hook the engine calls when wiring a transport.
-   */
-  useNamespace(namespace: string): void {
-    if (this.#explicitNamespace) return;
-    this.#namespace = namespace;
-  }
-
-  /**
-   * A sibling transport on the same broker, pinned to `namespace` EXPLICITLY (so a later
-   * {@link useNamespace} never re-scopes it). Same connection/prefix/partition/tuning as this one.
-   * Powers the `tenantWorkers: 'bridge'` control-plane preset: a tenant-scoped operator pairs its
-   * namespaced primary with `withNamespace('default')` — a bare-prefix sibling — so
-   * operator-convention tenant workers (`<group>@<tenant>` under the bare prefix) are discoverable
-   * and dispatchable through the pool.
-   */
-  withNamespace(namespace: string): BullMQTransport {
-    return new BullMQTransport({ ...this.#options, namespace });
   }
 
   /**

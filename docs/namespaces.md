@@ -41,6 +41,15 @@ the **same Redis + prefix + group**, a task dispatched by one can be consumed by
 To fully isolate two setups on a shared store, you need **both**: a distinct `namespace` *and* a
 distinct Redis/prefix. Namespace alone leaves the queues shared.
 
+**Per-run tenant ROUTING is a third, orthogonal mechanism** — and the only tenant encoding on the
+wire: work for a run in namespace `X` dispatches to `@X`-suffixed group tokens
+(`durable-tasks-processing@dev-alice`, see `tenantGroup`) on the transport's own prefix, and tenant
+workers (the Python SDK, the TS `role: 'tenant'` worker) subscribe those suffixed queues. That is
+how one control plane routes each tenant's runs to that tenant's worker pool over ONE shared
+keyspace. The engine's namespace never re-scopes the transport prefix — a scoped local control
+plane therefore reaches the same tenant workers the deployed global operator would, with no extra
+configuration.
+
 ## Local development against the shared dev store
 
 The pattern that motivates all of this:

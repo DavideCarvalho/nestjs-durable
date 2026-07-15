@@ -895,22 +895,6 @@ export interface Transport {
   onResult(handler: (result: StepResult) => Promise<void>): void;
   /** worker → engine: liveness signal for an in-flight long step. */
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void;
-  /**
-   * Partition this transport's queues/keys by `namespace` (matching the engine's store namespace), so
-   * multiple logical deployments can share one broker. Idempotent. An explicit namespace passed to the
-   * transport's constructor TAKES PRECEDENCE over this. No-op when `namespace === "default"`. Optional —
-   * transports that don't partition simply omit it.
-   */
-  useNamespace?(namespace: string): void;
-  /**
-   * A SIBLING transport on the same broker/connection, pinned to `namespace` (explicit — never
-   * re-scoped by a later {@link useNamespace}). Powers the tenant-worker bridge preset
-   * (`topology: { role: 'control-plane', tenant, tenantWorkers: 'bridge' }`): a tenant-scoped
-   * operator pairs its namespaced primary with `withNamespace('default')` — a bare-prefix sibling —
-   * so operator-convention tenant workers (`<group>@<tenant>` under the bare prefix) are
-   * discoverable and dispatchable. Optional — transports that don't partition simply omit it.
-   */
-  withNamespace?(namespace: string): Transport;
   /** Release the transport's resources (broker workers, queues, connections) for a clean shutdown.
    *  Optional — an in-process transport has nothing to close. Called on `onApplicationShutdown`
    *  after the engine drains, so a deploy hands off instead of leaving the broker to time out. */

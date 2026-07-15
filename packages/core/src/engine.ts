@@ -469,13 +469,17 @@ export class WorkflowEngine {
     this.admission.onFreed?.((queue) => this.wakeQueueWaiters(queue));
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
     this.namespace = deps.namespace;
-    // Propagate a SCOPED engine's namespace to its transport(s) so the same namespace that partitions
-    // the store also partitions the transport's queues/keys — set once, applied everywhere. An OPERATOR
-    // (namespace: undefined) drives every namespace itself, so its transport(s) stay on their
-    // constructor prefix (bare/shared) instead of being pinned to one namespace.
-    if (this.namespace !== undefined) {
-      this.pool.useNamespace(this.namespace);
-    }
+    // The engine's namespace deliberately does NOT touch the transport(s). The two tenancy axes are
+    // orthogonal and encode differently ON PURPOSE (the cross-SDK canonical wire convention):
+    //   - `namespace` scopes the STORE (which runs this engine drives/recovers) and stamps every run
+    //     it starts; per-run routing then suffixes GROUP tokens (`<name>@<tenant>`, see tenantGroup)
+    //     on the transport's own prefix — the same convention every worker SDK (Python, the TS
+    //     tenant role) speaks natively.
+    //   - Whole-DEPLOYMENT isolation on a shared broker is the transport's `prefix`/`namespace`
+    //     constructor options — explicit, never inferred from the engine.
+    // (An earlier design auto-folded a scoped engine's namespace into the transport prefix,
+    // producing a keyspace no tenant worker could see — the tenant ended up encoded twice, once in
+    // the prefix and once in the group suffix, and cross-runtime discovery silently failed.)
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
