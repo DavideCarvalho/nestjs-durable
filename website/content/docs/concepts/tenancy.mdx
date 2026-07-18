@@ -81,7 +81,7 @@ the same queue names. Orchestration lives in one runtime, handlers in another.
   `sweepTimeouts` — only act on runs stamped with this instance's namespace. Every run created by a
   namespaced engine is stamped with it, so a store shared by several pools (a dev cluster and a
   developer's laptop, say) never has one pool driving another's runs.
-- **The transport**, since `@dudousxd/nestjs-durable-core` 0.45.0. The engine propagates its
+- **The transport.** The engine propagates its
   namespace to every transport that implements `useNamespace` (`TransportPool.useNamespace`,
   `packages/core/src/transport-pool.ts:127`); `BullMQTransport` folds it into every queue/stream/key
   name (`<prefix>-<namespace>-...` for tasks, results, decisions, step-events, the worker-heartbeat
