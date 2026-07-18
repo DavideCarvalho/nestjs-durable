@@ -392,24 +392,16 @@ redis=...)`.
 
 ### Dispatching a Python workflow (NestJS side)
 
-You **don't** register anything on the NestJS side. When a run is started for a workflow name the
-engine doesn't have locally but a **live worker group of that name** does, the engine routes it
-there by **convention** — synthesizing the remote registration on the fly. So a NestJS workflow
-just calls the Python-authored one by name, exactly like a local child:
+A NestJS workflow calls the Python-authored one by its name, exactly like a local child:
 
 ```ts
 // Inside a NestJS @Workflow — `pipeline` is authored by the Python worker group of the same name.
 const result = await ctx.child('pipeline', { id: baseId });
 ```
 
-or start it directly with `engine.start('pipeline', input)`. A live Python worker registered as
-`pipeline` picks up the turns; nothing else to wire.
-
-<Callout type="info">
-Nothing is registered on the engine side — the **queue name is the routing**. If no live worker
-group matches the name, starting the run throws `is not registered` (the unchanged fail-fast), so a
-typo'd name never silently hangs.
-</Callout>
+or start it directly with `engine.start('pipeline', input)`. The **queue name is the routing**:
+whichever live Python worker is serving `pipeline` picks up the turns. If none is live, the start
+fails fast so a typo'd name never silently hangs.
 
 The workflow-task/decision wire is language-neutral, so the same Python workflow runs unchanged
 against a NestJS, an [Adonis](/docs/cluster/interop), or any other conformant control plane.

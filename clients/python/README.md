@@ -63,8 +63,8 @@ A step that fails raises `StepFailed` in the workflow — catch it to compensate
 awaited rejection), or let it propagate to fail the run. Changing the workflow's op sequence under a
 run already in flight raises `NondeterminismError` rather than silently diverging.
 
-On the NestJS side there is **nothing to register** — a run started for `pipeline` is routed to a
-live worker group of that name by convention (the queue name is the routing):
+On the NestJS side, start `pipeline` by its name — the queue name is the routing, so whichever live
+worker group serves `pipeline` picks it up:
 
 ```ts
 await engine.start('pipeline', input);      // or `ctx.child('pipeline', input)` from another workflow
