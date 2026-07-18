@@ -27,7 +27,7 @@ The walkthrough above dispatches one step through a queue with both `priority` a
 When the queue has a free slot, the call is admitted immediately. When it's contended, the admission
 controller picks the rightful next waiter in this order: higher `priority` first, then (for a queue
 configured with `fairness: 'key'`) the least-recently-served `fairnessKey`, then arrival order as the
-final tiebreak — the same `better()` comparison in `packages/core/src/queue.ts` that both the built-in
+final tiebreak — the same comparison both the built-in
 in-process controller and `RedisAdmissionBackend` implement. Nothing is held in memory while a call
 waits: the run just re-suspends with a retry time and comes back later.
 

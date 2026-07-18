@@ -4,11 +4,9 @@ description: Every public member of WorkflowCtx, the authoring decorators, Workf
 icon: BookMarked
 ---
 
-This page is a flat lookup table generated from source (`packages/core/src/interfaces.ts`,
-`packages/core/src/engine.ts`, `packages/core/src/errors.ts`, `packages/core/src/scheduler.ts`,
-`packages/nestjs/src/workflow.service.ts`, `packages/nestjs/src/durable.module.ts`, and the
-`@dudousxd/nestjs-durable` decorators). It is deliberately terse — for the *why* behind any entry,
-follow its linked concept/authoring/reliability page.
+This page is a flat lookup table of the public API — the `WorkflowCtx`, the engine, the errors, the
+scheduler, and the `@dudousxd/nestjs-durable` decorators. It is deliberately terse — for the *why*
+behind any entry, follow its linked concept/authoring/reliability page.
 
 ## WorkflowCtx
 
@@ -159,7 +157,7 @@ only when a step actually executes, never on replay.
 
 ## `WorkflowHandler<TInput, TOutput, A>`
 
-Optional, TYPES-ONLY contract (`packages/core/src/workflow-handler.ts`, exported from
+Optional, TYPES-ONLY contract (exported from
 `@dudousxd/nestjs-durable-core`) for a `@Workflow` class's `run` method: `implements
 WorkflowHandler<TInput, TOutput, A>` pins the signature against `TInput`/`TOutput`/the run's
 `SearchAttributes` shape `A`, so a wrong signature (renamed method, swapped/missing param, wrong
@@ -179,7 +177,7 @@ interface only checks that what you wrote is assignable; it doesn't write the an
 
 ## DurableWorkflow (class-first statics)
 
-Optional base class (`packages/core/src/durable-workflow.ts`) — `@Workflow` classes that extend it
+Optional base class — `@Workflow` classes that extend it
 start from the class itself, with input/output types inferred from their own `run` signature. See
 [Class-first starts](/docs/concepts/workflows-and-steps#class-first-starts--myworkflowstart--myworkflowexecute).
 

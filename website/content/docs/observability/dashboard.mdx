@@ -251,12 +251,12 @@ header banner, which used to count completed-work orphans as stalled.
 **Bulk-resolving waiting state — `RunGateway.waitingFor`:** if you're building your own filtered/
 paginated run list and need to know which of *your* runs are parked on a breakpoint (or any other
 event wait) without re-deriving the waiter scan yourself or querying checkpoints directly, call
-`waitingFor` on the injected `RUN_GATEWAY`:
+`waitingFor` on the injected `RunGateway`:
 
 ```ts
-import { RUN_GATEWAY, type RunGateway } from '@dudousxd/nestjs-durable';
+import { RunGateway } from '@dudousxd/nestjs-durable';
 
-constructor(@Inject(RUN_GATEWAY) private readonly runGateway: RunGateway) {}
+constructor(private readonly runGateway: RunGateway) {}
 
 async whichAreStuck(runIds: string[]) {
   return this.runGateway.waitingFor(runIds);

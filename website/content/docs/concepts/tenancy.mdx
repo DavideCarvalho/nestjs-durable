@@ -21,7 +21,7 @@ apps — nothing below is needed until you want to split work across processes o
 Split the store-owner from the workers. The **operator** (control plane) holds the store, runs the
 dashboard, and drives/recovers runs of **every** namespace — its own namespace is left unset, which
 is how it sees everyone. Each **tenant** sets `DURABLE_TENANT` and runs store-less: its queues are
-suffixed with the tenant (`handler@blue`), its runs are stamped with it, and its `RUN_GATEWAY`
+suffixed with the tenant (`handler@blue`), its runs are stamped with it, and its `RunGateway`
 round-trips reads and control verbs to the operator over the transport instead of touching a store
 directly.
 
@@ -158,7 +158,7 @@ engine" principle, applied to a different operation.
 
 ## Tenant model: operator, tenants, and the run gateway
 
-Every durable instance binds exactly one `RunGateway` behind the `RUN_GATEWAY` token, and the role
+Every durable instance binds exactly one `RunGateway`, and the role
 picks which implementation you get. An operator with a `store` set reads its store directly. A
 store-less tenant instead proxies every read, control verb, and start over the transport to the
 operator, which reads *its* store and answers. (If a store-less instance has no transport configured
