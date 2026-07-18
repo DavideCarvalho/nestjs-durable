@@ -63,13 +63,11 @@ A step that fails raises `StepFailed` in the workflow — catch it to compensate
 awaited rejection), or let it propagate to fail the run. Changing the workflow's op sequence under a
 run already in flight raises `NondeterminismError` rather than silently diverging.
 
-On the NestJS side, register the remote workflow so the engine drives this worker's group:
+On the NestJS side there is **nothing to register** — a run started for `pipeline` is routed to a
+live worker group of that name by convention (the queue name is the routing):
 
 ```ts
-engine.registerRemote('pipeline', '1', {
-  group: 'py-workflows',
-  executor: new RemoteWorkflowExecutor(transport),
-});
+await engine.start('pipeline', input);      // or `ctx.child('pipeline', input)` from another workflow
 ```
 
 These ops are wired end-to-end — the engine executes the commands they emit (dispatched step,

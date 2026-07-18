@@ -86,8 +86,8 @@ Non-deterministic captures (an id, a timestamp) don't need a full dispatched ste
 The split goes both ways. A remote worker can **implement a step** the NestJS workflow calls
 (above), or **author the whole workflow** itself and call back into NestJS — the engine stays the
 single owner of durable state either way. Crossing a *workflow* boundary (not just a step) is
-`ctx.child`; register a remote workflow with `engine.registerRemote(name, version, { group, executor })`
-and write the flow in the other language (see the
+`ctx.child`; a run started for a name a live worker group already serves is routed there by
+convention — nothing to register — so you just write the flow in the other language (see the
 [Python SDK](clients/python/README.md#authoring-workflows-in-python-coordinator-driven)).
 
 ## Status
