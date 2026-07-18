@@ -6,6 +6,7 @@ export * from './duration';
 export * from './engine';
 export * from './entities';
 export * from './errors';
+export * from './handshake/index';
 export * from './event-accumulators';
 export * from './interfaces';
 export * from './protocol';
