@@ -406,9 +406,9 @@ or start it directly with `engine.start('pipeline', input)`. A live Python worke
 `pipeline` picks up the turns; nothing else to wire.
 
 <Callout type="info">
-Convention routing is why there is no `registerRemote` boilerplate: the queue name **is** the
-routing. The explicit `engine.registerRemote(name, version, { group, executor })` still exists for
-when you want to pin a specific group/version, but the by-name convention is the default path.
+Nothing is registered on the engine side — the **queue name is the routing**. If no live worker
+group matches the name, starting the run throws `is not registered` (the unchanged fail-fast), so a
+typo'd name never silently hangs.
 </Callout>
 
 The workflow-task/decision wire is language-neutral, so the same Python workflow runs unchanged
