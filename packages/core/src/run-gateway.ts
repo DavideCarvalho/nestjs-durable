@@ -56,15 +56,21 @@ export type WireDates<T> = {
  * a `ProxyRunGateway` that round-trips over the transport. Deliberately smaller than the full dashboard
  * (no metrics/bulk/update/signal) — those stay control-plane-only. `workerHealth` IS on the port: the
  * operator answers it scoped to the requester's own groups, so a tenant's Workers panel works too.
+ *
+ * Declared as an **abstract class** rather than an interface so it doubles as its own NestJS DI token
+ * (the idiomatic inject-by-type pattern): providers bind `{ provide: RunGateway, useClass/useFactory }`
+ * and consumers inject `constructor(private readonly gateway: RunGateway)` with no string/symbol token.
+ * `StoreRunGateway`/`ProxyRunGateway` `implements RunGateway`; abstract methods carry no body, so the
+ * emitted runtime class is an empty, non-instantiable shell used only as the token.
  */
-export interface RunGateway {
+export abstract class RunGateway {
   /** This deployment's durable role (control plane vs tenant) — synchronous local metadata. */
-  topology(): DurableTopology;
-  getRunDetail(runId: string): Promise<RunDetail | null>;
+  abstract topology(): DurableTopology;
+  abstract getRunDetail(runId: string): Promise<RunDetail | null>;
   /** List runs, each optionally carrying a {@link RunWaiting} descriptor (what a suspended run is
    *  parked on). The store-backed gateway resolves `waiting`; a proxy relays whatever the control
    *  plane sent. */
-  listRuns(query: RunQuery): Promise<RunListItem[]>;
+  abstract listRuns(query: RunQuery): Promise<RunListItem[]>;
   /**
    * Bulk-resolve {@link RunWaiting} for an arbitrary set of run ids — for a consumer with its OWN
    * filtered/paginated run listing (so it isn't just `listRuns` under another name) that needs to know
@@ -75,18 +81,18 @@ export interface RunGateway {
    * parked on something non-event (a bare `ctx.sleep`, an in-flight step) are simply absent, same as a
    * `listRuns` row with no `waiting`.
    */
-  waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>>;
+  abstract waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>>;
   /** Per-group worker health (queue backlog + live worker heartbeats). On the control plane this is
    *  every group; over a tenant proxy the operator scopes it to the tenant's own groups. */
-  workerHealth(): Promise<GroupHealth[]>;
-  cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null>;
-  retry(runId: string): Promise<RunResult | null>;
-  continue(runId: string): Promise<RunResult | null>;
+  abstract workerHealth(): Promise<GroupHealth[]>;
+  abstract cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null>;
+  abstract retry(runId: string): Promise<RunResult | null>;
+  abstract continue(runId: string): Promise<RunResult | null>;
   /** Re-dispatch every remote step of a run stuck `pending` — the operator recovery for a LOST step
    *  dispatch (crashed worker / dropped job) that no automatic path re-drives. Returns the run's status
    *  plus how many steps were re-dispatched, or null if the run is unknown. */
-  redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) | null>;
-  retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null>;
+  abstract redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) | null>;
+  abstract retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null>;
   /** Live lifecycle events for one run; returns an unsubscribe fn. Framework-agnostic (no rxjs). */
-  subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
+  abstract subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
 }

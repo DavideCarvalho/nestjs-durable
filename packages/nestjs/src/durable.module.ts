@@ -7,7 +7,7 @@ import {
   type NamedTransport,
   type QueueConfig,
   type RetentionPolicy,
-  type RunGateway,
+  RunGateway,
   STATE_STORE,
   STATE_STORE_CANONICAL,
   type ScheduledWorkflow,
@@ -42,7 +42,7 @@ import { RunRequestResponder, type RunRequestTransport } from './run-request-res
 import { StoreRunGateway } from './store-run-gateway';
 import { TenantEventRepublisher } from './tenant-event-republisher';
 import { TimerPoller } from './timer-poller';
-import { CONTEXT_ACCESSOR, RUN_GATEWAY } from './tokens';
+import { CONTEXT_ACCESSOR } from './tokens';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
 
@@ -564,7 +564,7 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
   constructor(
     private readonly engine: WorkflowEngine,
     @Inject(TRANSPORT_CANONICAL) private readonly transport: Transport | null,
-    @Inject(RUN_GATEWAY) private readonly gateway: RunGateway,
+    private readonly gateway: RunGateway,
     @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
   ) {}
@@ -756,7 +756,7 @@ export class DurableModule {
         // or (for a thin worker, no `store`) a `ProxyRunGateway` over `transport` when given, else a
         // gateway whose every method rejects with a clear tenant error.
         {
-          provide: RUN_GATEWAY,
+          provide: RunGateway,
           useFactory: (
             options: DurableModuleOptions,
             store: StateStore | null,
@@ -797,7 +797,7 @@ export class DurableModule {
         TRANSPORT,
         TRANSPORT_CANONICAL,
         DURABLE_OPTIONS_CANONICAL,
-        RUN_GATEWAY,
+        RunGateway,
       ],
     };
   }

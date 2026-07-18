@@ -4,7 +4,7 @@ import {
   type GroupHealth,
   type MetricsCollector,
   type RunDetail,
-  type RunGateway,
+  RunGateway,
   type RunListItem,
   type RunQuery,
   type RunResult,
@@ -16,7 +16,6 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { Observable } from 'rxjs';
-import { RUN_GATEWAY } from './tokens.js';
 
 // Single source of truth: core owns `RunDetail` (`run-gateway.ts`) — re-exported here (not
 // re-declared) so this package's existing public API (`import type { RunDetail } from
@@ -39,7 +38,7 @@ export class DashboardService {
   private readonly metricsCollector: MetricsCollector | undefined;
 
   constructor(
-    @Inject(RUN_GATEWAY) private readonly gateway: RunGateway,
+    private readonly gateway: RunGateway,
     @Optional() @Inject(STATE_STORE_CANONICAL) private readonly store?: StateStore,
     @Optional() private readonly engine?: WorkflowEngine,
   ) {

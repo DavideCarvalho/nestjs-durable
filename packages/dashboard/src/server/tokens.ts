@@ -1,13 +1,13 @@
+import { RunGateway } from '@dudousxd/nestjs-durable-core';
+
 /**
- * Injection token for the bound `RunGateway`, owned by `@dudousxd/nestjs-durable` (the nestjs
- * package). The dashboard package does NOT depend on `@dudousxd/nestjs-durable` — its only
- * relevant peer dep is `@dudousxd/nestjs-durable-core` — so we do NOT import the token from
- * there. Instead we share its well-known token by value, the same pattern
- * `@dudousxd/nestjs-durable`'s own `tokens.ts` uses for `CONTEXT_ACCESSOR` (a cross-lib token
- * owned by `@dudousxd/nestjs-context`).
+ * @deprecated Inject the `RunGateway` abstract class directly (it is its own DI token). This alias
+ * is kept for internal back-compat only.
  *
- * `Symbol.for(key)` uses the global symbol registry, so this resolves to the SAME symbol
- * instance as `packages/nestjs/src/tokens.ts`'s `RUN_GATEWAY` without any import. The key MUST
- * stay byte-identical with that export.
+ * The bound `RunGateway` port is owned by `@dudousxd/nestjs-durable-core` — a required peer dep of
+ * both this dashboard package and `@dudousxd/nestjs-durable`. Since core's `RunGateway` is now an
+ * abstract class, that single class is the shared DI token across packages: both bind and inject the
+ * same imported class, so the previous `Symbol.for` value-sharing hack (which existed only because
+ * the dashboard cannot import from `@dudousxd/nestjs-durable`) is no longer needed.
  */
-export const RUN_GATEWAY = Symbol.for('nestjs-durable:run-gateway');
+export const RUN_GATEWAY = RunGateway;
