@@ -6,6 +6,19 @@ same step name implemented here is callable from a TypeScript workflow via ``ctx
 """
 
 from .cancellation import Cancelled, CancellationRegistry
+from .handshake import (
+    CURRENT_PROTOCOL_VERSION,
+    LEGACY_V1_CAPABILITIES,
+    LEGACY_V1_PROTOCOL,
+    WorkerDescriptor,
+    can_route,
+    descriptor_hash,
+    heartbeat_status,
+    is_legacy_descriptor,
+    negotiate,
+    required_capabilities,
+    resolve_routing,
+)
 from .redis_runner import redis_url_from_env, run_redis_worker
 from .routing import reply_target
 from .workflow import (
@@ -41,6 +54,18 @@ __all__ = [
     "Cancelled",
     "CancellationRegistry",
     "reply_target",
+    # Handshake & capability negotiation (design §7) — cross-SDK interop contract.
+    "WorkerDescriptor",
+    "descriptor_hash",
+    "heartbeat_status",
+    "negotiate",
+    "can_route",
+    "resolve_routing",
+    "required_capabilities",
+    "is_legacy_descriptor",
+    "CURRENT_PROTOCOL_VERSION",
+    "LEGACY_V1_PROTOCOL",
+    "LEGACY_V1_CAPABILITIES",
     # Context-local step access — record events from anywhere inside a handler without threading ctx.
     "current_step",
     "current_context",

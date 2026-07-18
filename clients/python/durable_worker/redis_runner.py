@@ -42,6 +42,10 @@ def _spawn_retained(coro: Any) -> "asyncio.Task[Any]":
 # own echo and drop them) — host + pid is plenty and avoids importing a uuid/random dependency.
 _INSTANCE_ID = f"py-{socket.gethostname()}-{os.getpid()}"
 
+# Process start time (epoch ms), captured once at import. Part of the handshake descriptor's content
+# hash — a restart changes it, so the control-plane sees a new descriptorHash and re-reads (design §7.2).
+_PROCESS_STARTED_AT_MS = int(time.time() * 1000)
+
 # Worker liveness heartbeat. The worker stamps a TTL'd key every INTERVAL seconds; if the worker
 # dies or its loop stalls, the key expires after TTL and the *absence* is the alert signal a monitor
 # watches for. TTL is comfortably larger than the interval so a single slow refresh doesn't flap.
@@ -102,6 +106,39 @@ def _heartbeat_key(prefix: str, group: str) -> str:
     return f"{prefix}-worker-heartbeat:{group}:{_INSTANCE_ID}"
 
 
+def _descriptor_key(prefix: str, group: str) -> str:
+    """Per-(group, instance) FULL worker-descriptor key (handshake design §7.2). The control-plane
+    re-reads this expensive value only when the compact heartbeat's ``descriptorHash`` ETag changes.
+    CROSS-SDK CONTRACT — MUST match the key the adonis + nestjs control-plane scan:
+    ``<prefix>-worker-descriptor:<group>:<instance>``."""
+    return f"{prefix}-worker-descriptor:{group}:{_INSTANCE_ID}"
+
+
+def _build_descriptor(worker: Any, partition: "str | None", namespace: "str | None") -> Any:
+    """Build this Python worker's :class:`WorkerDescriptor` (handshake design §7.1): ``runtime='python'``,
+    ``instanceId=py-<host>-<pid>``, its registered workflow/step handler names, and the durable
+    capabilities a Python execution worker provides. The shape is byte-identical to the adonis + nestjs
+    descriptors so a polyglot control-plane can negotiate + route to it."""
+    from . import __version__ as _sdk_version
+    from .handshake import LEGACY_V1_CAPABILITIES, WorkerDescriptor
+
+    workflows = sorted(getattr(worker, "_workflows", {}).keys())
+    steps = sorted(getattr(worker, "_handlers", {}).keys())
+    return WorkerDescriptor(
+        instance_id=_INSTANCE_ID,
+        runtime="python",
+        sdk={"name": "durable-worker", "version": _sdk_version},
+        protocol={"version": 1, "range": [1, 1]},
+        # A Python execution worker runs the v1 durable primitives; advertise the canonical baseline.
+        capabilities=list(LEGACY_V1_CAPABILITIES),
+        workflows=workflows,
+        steps=steps,
+        partition=partition if partition else None,
+        namespace=namespace if namespace and namespace != "default" else None,
+        started_at=int(_PROCESS_STARTED_AT_MS),
+    )
+
+
 async def _verify_connection(connection: str) -> None:
     """Fail FAST if Redis is unreachable. bullmq's Worker connects lazily and swallows the resulting
     ConnectionError inside a background task ("Task exception was never retrieved"), so a misconfigured
@@ -129,21 +166,31 @@ async def _verify_connection(connection: str) -> None:
                 pass
 
 
-def _heartbeat_value(controller: Optional[AdaptiveController]) -> str:
-    """The heartbeat key's value: JSON ``{"ts": <epochMs>, "status": <WorkerStatus>}``.
+def _heartbeat_value(
+    controller: Optional[AdaptiveController], descriptor_hash: Optional[str] = None
+) -> str:
+    """The heartbeat key's value: JSON ``{"ts": <epochMs>, "status": <WorkerStatus>, "descriptorHash"?}``.
 
     ``ts`` is epoch MILLISECONDS (not seconds — readers normalize seconds→ms only as a legacy
     fallback). ``status`` is the controller's live snapshot when one is wired (it always is for step
-    workers, omitted for the workflow worker). Readers accept both this JSON form and the legacy bare
-    number, so emitting JSON stays backward-compatible."""
+    workers, omitted for the workflow worker). ``descriptorHash`` is the two-tier handshake ETag
+    (design §7.2) — the control-plane re-reads the full ``<prefix>-worker-descriptor:`` key only when
+    it changes. Readers accept both this JSON form and the legacy bare number, and ignore fields they
+    don't know, so adding ``descriptorHash`` stays backward-compatible."""
     payload: Dict[str, Any] = {"ts": int(time.time() * 1000)}
     if controller is not None:
         payload["status"] = controller.snapshot()
+    if descriptor_hash is not None:
+        payload["descriptorHash"] = descriptor_hash
     return json.dumps(payload)
 
 
 async def _start_heartbeat(
-    connection: str, prefix: str, group: str, controller: Optional[AdaptiveController] = None
+    connection: str,
+    prefix: str,
+    group: str,
+    controller: Optional[AdaptiveController] = None,
+    descriptor: Optional[Any] = None,
 ) -> None:
     """Spawn a background task that refreshes the worker's TTL'd heartbeat key. Best-effort: a failed
     refresh is swallowed (the key then expires and the gap is itself the signal) and the whole thing
@@ -151,7 +198,12 @@ async def _start_heartbeat(
     an ongoing connectivity probe — if Redis drops, the key stops refreshing and expires.
 
     When a ``controller`` is supplied the value carries the live ``WorkerStatus`` snapshot, refreshed
-    on every beat (cheap — we're already beating)."""
+    on every beat (cheap — we're already beating).
+
+    Two-tier handshake advertisement (design §7.2): when a ``descriptor`` is supplied this ALSO
+    publishes the full :class:`WorkerDescriptor` to ``<prefix>-worker-descriptor:<group>:<instance>``
+    and stamps the compact beat with the descriptor's ``descriptorHash`` ETag. Both keys share the
+    heartbeat TTL, so a dead worker's descriptor expires alongside its liveness key."""
     try:
         import redis.asyncio as aioredis  # lazy: only needed when a transport is actually running
     except ImportError:
@@ -159,10 +211,24 @@ async def _start_heartbeat(
     client = aioredis.from_url(connection)
     key = _heartbeat_key(prefix, group)
 
+    descriptor_wire: Optional[str] = None
+    descriptor_etag: Optional[str] = None
+    descriptor_key: Optional[str] = None
+    if descriptor is not None:
+        from .handshake import descriptor_hash as _hash
+
+        descriptor_wire = json.dumps(descriptor.to_wire())
+        descriptor_etag = _hash(descriptor)
+        descriptor_key = _descriptor_key(prefix, group)
+
     async def beat() -> None:
         while True:
             try:
-                await client.set(key, _heartbeat_value(controller), ex=_HEARTBEAT_TTL_SECONDS)
+                await client.set(
+                    key, _heartbeat_value(controller, descriptor_etag), ex=_HEARTBEAT_TTL_SECONDS
+                )
+                if descriptor_key is not None and descriptor_wire is not None:
+                    await client.set(descriptor_key, descriptor_wire, ex=_HEARTBEAT_TTL_SECONDS)
             except Exception:  # noqa: BLE001 — never let a heartbeat hiccup kill the worker
                 pass
             await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
@@ -295,7 +361,9 @@ async def run_redis_workflow_worker(
         )
         return decision
 
-    await _start_heartbeat(connection, effective_prefix, group)
+    # Advertise the handshake descriptor alongside the liveness heartbeat (design §7.2).
+    descriptor = _build_descriptor(workflow_worker, None, namespace)
+    await _start_heartbeat(connection, effective_prefix, group, None, descriptor)
     return BullWorker(tasks_name, process, {"connection": connection})
 
 
@@ -503,11 +571,14 @@ async def run_redis_worker(
     # Worker per registered name, ALL sharing the same `process` callback and concurrency pool.
     worker_opts: Dict[str, Any] = {"connection": connection, "concurrency": controller.limit}
     bull_workers: "list[Any]" = []
+    # Handshake descriptor advertised alongside every per-name heartbeat (design §7.2): the
+    # control-plane negotiates + capability-routes against it and re-reads only when its ETag changes.
+    descriptor = _build_descriptor(worker, partition, namespace)
     for name in names:
         queue_group = _tenant_group(sanitize_queue_token(name), partition)
         tasks_name, _ = _names(effective_prefix, queue_group)
         bull_workers.append(BullWorker(tasks_name, process, worker_opts))
-        await _start_heartbeat(connection, effective_prefix, queue_group, controller)
+        await _start_heartbeat(connection, effective_prefix, queue_group, controller, descriptor)
 
     # The bullmq python port re-reads ``opts['concurrency']`` each scheduling pass, so mutating it
     # applies the controller's decision live (see adaptive.py module docstring) — across every

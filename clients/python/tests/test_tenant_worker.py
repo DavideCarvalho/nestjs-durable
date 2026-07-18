@@ -125,7 +125,10 @@ class _RecordingHeartbeat:
 
     calls: list = []
 
-    async def __call__(self, connection, prefix, group, controller=None):
+    async def __call__(self, connection, prefix, group, controller=None, descriptor=None):
+        # `descriptor` (the two-tier handshake advertisement) is accepted but not recorded here so the
+        # existing (prefix, group) assertions stay focused; descriptor advertisement is covered by the
+        # dedicated handshake advertisement test.
         _RecordingHeartbeat.calls.append({"prefix": prefix, "group": group})
 
 
