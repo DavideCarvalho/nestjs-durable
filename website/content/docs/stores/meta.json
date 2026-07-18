@@ -1,4 +1,11 @@
 {
   "title": "State stores",
-  "pages": ["index", "mikro-orm", "typeorm", "prisma", "drizzle"]
+  "icon": "Database",
+  "pages": [
+    "index",
+    "mikro-orm",
+    "typeorm",
+    "prisma",
+    "drizzle"
+  ]
 }

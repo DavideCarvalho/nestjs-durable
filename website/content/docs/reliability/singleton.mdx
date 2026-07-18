@@ -1,6 +1,7 @@
 ---
 title: Singleton workflows
 description: "@Workflow({ singleton }) serializes runs that share a key — a durable, FIFO mutex: at most limit run concurrently per key, the rest wait (suspended) and admit in creation order as slots free, with an optional maxQueueDepth back-pressure cap that rejects a start with SingletonQueueFullError instead of letting the same-key backlog grow forever."
+icon: Diamond
 ---
 
 Some work must never overlap for a given key, even though many *different* keys should run freely in

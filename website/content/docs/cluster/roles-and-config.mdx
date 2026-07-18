@@ -1,0 +1,93 @@
+---
+title: Roles & config
+description: The topology preset on DurableModule.forRoot, the co-located vs thin-worker vs api pods, and layered tenant authentication for a store-less fleet.
+icon: SlidersHorizontal
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+import { Steps, Step } from 'fumadocs-ui/components/steps';
+
+You pick the topology with the **`topology` preset** on `DurableModule.forRoot`. The preset names the deployment role explicitly (instead of leaving it to `store`/`connection` inference) and validates the axes — `namespace` (the operator's poll-scope) vs `partition` (a worker's queue suffix). `topology` is entirely additive: omit it and nothing changes.
+
+<Callout type="info">
+The two axes, one word: on a `control-plane` an optional `tenant` scopes the operator to its own runs (maps to `namespace`); on a `tenant` worker it is required and maps to `partition` (the worker's queue suffix). See [Tenancy](/docs/concepts/tenancy) for the full treatment.
+</Callout>
+
+## Operator (the default)
+
+Omit `topology` and you get the single-process operator — a control plane that also executes bodies. Add a `connection` to move execution onto a co-located BullMQ consumer; omit it to keep every `@Workflow` on the inline fast path.
+
+```ts
+DurableModule.forRoot({
+  store,                                   // owns durable state
+  transport: new EventEmitterTransport(),  // or BullMQ for cross-process
+})
+```
+
+## Control plane
+
+A pure coordinator: it owns the store and the transport, dispatches, recovers, fires timers, prunes retention, and answers thin-pod requests — but runs **no** worker. Bodies execute on separate `tenant` workers.
+
+```ts
+DurableModule.forRoot({
+  topology: { role: 'control-plane' },   // optional `tenant` scopes it to its own namespace
+  store,
+  transport,                             // BullMQ for a cross-process/polyglot fleet
+  retention: { policies: [{ statuses: ['completed', 'cancelled'], maxAge: '14d' }] },
+})
+```
+
+<Callout type="info">
+For **cross-ecosystem** fleets (a Python or Adonis worker on the same control plane), use the [BullMQ transport](/docs/cluster/interop) — it speaks the shared wire byte-for-byte.
+</Callout>
+
+## Tenant (store-less thin worker)
+
+A `tenant` worker sets a `connection` (Redis) and **no `store`** — that is what makes it store-less. It consumes its partition's queues, executes the `@Workflow`/`@Step` bodies registered in the module, and publishes results. The NestJS process **is** the worker (the module starts the consumer on bootstrap — no separate CLI).
+
+```ts
+DurableModule.forRoot({
+  topology: { role: 'tenant', tenant: 'acme-corp' },  // maps to the partition it serves
+  connection: process.env.REDIS_URL,                  // Redis — no `store`
+})
+```
+
+<Callout type="warn">
+Store-less isolation is structural: a `tenant` worker has no `store` binding at all. A non-driving operator or a thin worker never consumes the store's driving loops (poll/recover/timers) — those belong to the control plane.
+</Callout>
+
+## Worker vs api
+
+A store-less **api/dashboard pod** is an ordinary NestJS HTTP app whose durable reads and control actions are proxied to the control plane. Every read/control/start it performs goes through the same `RunGateway` the [dashboard](/docs/observability/dashboard) and your controllers already use — bound to a `ProxyRunGateway` that round-trips over the transport instead of a `StoreRunGateway`. No controller code changes. Tune the round-trip timeout with `runGatewayTimeoutMs` (default 10s).
+
+## Layered tenant authentication
+
+The `tenant` on a wire request is a **claim**. Without authentication the isolation boundary is meaningless. Durable stacks **two** layers:
+
+<Steps>
+
+<Step>
+
+### Prefix / network baseline
+
+Each tenant runs on a segmented transport prefix/namespace behind a Redis/network ACL, so a pod can only reach its own prefix. No application code.
+
+</Step>
+
+<Step>
+
+### Signed token on top
+
+Each tenant pod carries a secret-signed token. The control plane's `RunRequestResponder` **verifies the signature and derives the tenant from the token**, ignoring any `tenant` in the request body — defense in depth.
+
+</Step>
+
+</Steps>
+
+The `RunRequestResponder` is the **trust boundary**: it forces `listRuns` to the requester's own tenant (no cross-tenant enumeration), validates `run.namespace === tenant` on every get/signal/cancel (anti-IDOR), and rejects unknown verbs and tampered tokens.
+
+## Next steps
+
+- **[Handshake & capability negotiation](/docs/cluster/handshake)** — keep a mixed fleet version-safe.
+- **[Cross-ecosystem interop](/docs/cluster/interop)** — add Python and Adonis workers.

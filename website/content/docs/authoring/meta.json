@@ -1,4 +1,13 @@
 {
   "title": "Authoring",
-  "pages": ["child-workflows", "entities", "events", "queries-and-updates", "webhooks", "versioning", "scheduling"]
+  "icon": "PenLine",
+  "pages": [
+    "child-workflows",
+    "entities",
+    "events",
+    "queries-and-updates",
+    "webhooks",
+    "versioning",
+    "scheduling"
+  ]
 }

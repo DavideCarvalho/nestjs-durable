@@ -1,6 +1,7 @@
 ---
 title: Retries & backoff
 description: Durable step retries with fixed/exponential backoff and jitter (a failed step re-dispatches on a persisted wakeAt), FatalError and worker-side retryable:false to opt out, and the in-memory timeoutMs + heartbeat liveness path for presumed-dead workers.
+icon: RefreshCw
 ---
 
 Transient failures are the normal case for anything that crosses a network boundary, so every step is

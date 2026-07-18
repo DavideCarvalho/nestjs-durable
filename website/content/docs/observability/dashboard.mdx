@@ -1,6 +1,7 @@
 ---
 title: Control plane
 description: The embedded dashboard — a React SPA served by NestJS that lists runs and renders each one as a graph across local and remote steps, with retry and cancel.
+icon: LayoutDashboard
 ---
 
 `@dudousxd/nestjs-durable-dashboard` mounts a control plane at `/durable`: a bundled React SPA
@@ -379,6 +380,22 @@ HTTP:
 - **`POST runs/:id/updates/:name`** — deliver a validated **update** to a run waiting at
   `ctx.onUpdate(name)`; the request body is the update argument. Any validator registered via
   `engine.registerUpdateValidator` runs first, so a rejected update never reaches the run.
+
+## Fleet health
+
+When you run a [split or polyglot cluster](/docs/cluster), the dashboard grows a **health /
+compatibility panel** fed by the [handshake](/docs/cluster/handshake) descriptors and diagnostics
+events:
+
+- **Per pod** — its protocol version, negotiated level (**compatible** / **degraded** /
+  **incompatible**), and a red flag with the exact reason on a mismatch (e.g. *"worker speaks
+  protocol 2, control-plane speaks 1 → stopped"*).
+- **Blocked runs** — runs parked because no live worker advertises a
+  [required capability](/docs/cluster/handshake#capability-aware-routing) (*"requires capability X,
+  no worker"*), so a stuck fleet is diagnosable at a glance rather than a silent hang.
+
+A store-less `tenant` api/dashboard pod serves this same view — its reads proxy to the control
+plane over the wire, so the panel looks identical whether or not the pod owns a store.
 
 ## Engine health & admin surface
 

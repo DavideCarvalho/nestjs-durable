@@ -1,6 +1,7 @@
 ---
 title: Durable webhooks
 description: ctx.webhook() mints a durable callback handle with a deterministic token and a public url; hand the url to a third party inside a step, then await handle.wait() to suspend with zero compute until the callback arrives as engine.signal(token, body). ctx.task() is the general form for external work you deliver and complete yourself, with no callback URL.
+icon: Webhook
 ---
 
 Plenty of third-party APIs are asynchronous: you ask them to do something, they hand you back a

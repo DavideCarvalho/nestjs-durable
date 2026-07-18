@@ -1,0 +1,47 @@
+---
+title: Topologies
+description: Run durable as a single process, split the control plane from the workers, or spread store-less "thin" worker pods per tenant — one topology preset, no changes to your workflows.
+icon: Network
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+By default `@dudousxd/nestjs-durable` runs everything in one process: an operator that owns the store, dispatches work, and executes `@Workflow`/`@Step` bodies on its inline fast path. That is all most apps ever need. When you want to scale the executor pool independently, isolate tenants, or run a **store-less worker that never touches your database**, you select a different **topology** — via the `topology` preset on `DurableModule.forRoot`. Your workflows and steps do not change.
+
+<Callout type="info">
+Every topology runs the **same durable engine over the same wire**. Splitting the control plane from the workers does not change execution semantics: each dispatched `ctx.step` is still checkpointed. The only thing that moves is *where the code that executes the bodies lives*.
+</Callout>
+
+## The three roles
+
+| Role | Owns the store | Executes step bodies | Serves HTTP / dashboard | Read/control surface |
+|------|:---:|:---:|:---:|------|
+| operator *(default)* | ✅ | ✅ (inline / co-located) | optional | direct (store) |
+| `control-plane` | ✅ | ❌ | optional | direct (store) |
+| `tenant` (thin worker) | ❌ | ✅ | ❌ | proxied over the wire |
+| `tenant` (api/dashboard) | ❌ | ❌ | ✅ | proxied over the wire |
+
+- **operator** *(default)* — a control plane that also executes bodies (inline, or via a co-located BullMQ consumer when you set a `connection`). Omit `topology` and this is what you get, byte-for-byte. Zero infrastructure with the [event-emitter transport](/docs/getting-started); swap in [BullMQ](/docs/transports/bullmq) and an ORM store for production.
+- **`control-plane`** — a pure coordinator. It owns the store and does everything *except* run your bodies: dispatch, crash recovery, timers, retention, and answering read/control requests from thin pods. Bodies execute on separate `tenant` workers.
+- **`tenant`** — a **store-less thin worker**. It never owns a store; it consumes tasks off the broker, executes them, and publishes results. A tenant api/dashboard pod instead round-trips every read/control action over the wire to the control plane.
+
+## When to reach for each
+
+<Callout type="warn">
+Reach for a split topology when you have a concrete driver — not by default. The single-process operator is simpler to operate and is the right answer until one of these bites.
+</Callout>
+
+- **Scale the executor pool independently.** CPU-heavy steps shouldn't compete with the coordinator. A `control-plane` plus N `tenant` workers scales the workers without touching the coordinator.
+- **Isolation & security.** A `tenant` worker has **no store and no database credentials** — a compromised worker cannot read or corrupt durable state.
+- **Per-tenant routing.** Route each tenant's runs to its own pool with a `<name>@<tenant>` queue suffix, sharing one control plane and store. See [Tenancy](/docs/concepts/tenancy) for the `namespace` vs `partition` axes.
+- **Polyglot / thin workers.** Because the wire is byte-compatible, a **Python worker** (the `durable-worker` client) or an **Adonis worker** (`@adonis-agora/durable`) can execute your workflows' steps against the *same* control plane. See [Cross-ecosystem interop](/docs/cluster/interop).
+
+## What splits, and what doesn't
+
+The seam is the **control plane ↔ worker** boundary on the transport. The control plane owns the store and the authoritative run state; a worker pulls a task, runs the body, and publishes the result, holding no durable state. Your `@Workflow` and `@Step` classes are **identical across every role** — the dashboard, controllers, and reads all go through one `RunGateway` that is either store-backed or proxied over the wire, so nothing above that line can tell whether a store is present.
+
+## Next steps
+
+- **[Roles & config](/docs/cluster/roles-and-config)** — the `topology` preset on `forRoot`, the co-located vs thin-worker vs api pods, and layered tenant authentication.
+- **[Handshake & capability negotiation](/docs/cluster/handshake)** — how a mixed fleet stays version-safe: descriptors, negotiation, capability-aware routing, and blocked runs.
+- **[Cross-ecosystem interop](/docs/cluster/interop)** — run NestJS, Adonis, and Python workers on one control plane.

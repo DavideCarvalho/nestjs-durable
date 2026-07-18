@@ -1,4 +1,10 @@
 {
   "title": "Observability",
-  "pages": ["dashboard", "otel", "metrics", "telescope"]
+  "icon": "Telescope",
+  "pages": [
+    "dashboard",
+    "otel",
+    "metrics",
+    "telescope"
+  ]
 }

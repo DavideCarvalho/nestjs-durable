@@ -1,6 +1,7 @@
 ---
 title: Flow control
 description: "Every knob that throttles or prioritizes dispatched steps: durable queues (concurrency caps + fixed-window rate limits) via engine.registerQueue, per-call priority + fairnessKey on ctx.step, worker/transport concurrency (fixed or adaptive), and RedisAdmissionBackend for a fleet-wide global cap."
+icon: Gauge
 ---
 
 Steps fan out work to workers, and sometimes you need to *throttle* or *prioritize* that fan-out: a

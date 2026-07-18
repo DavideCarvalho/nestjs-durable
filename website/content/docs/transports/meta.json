@@ -1,4 +1,10 @@
 {
   "title": "Transports",
-  "pages": ["index", "bullmq", "sqs", "db"]
+  "icon": "Cable",
+  "pages": [
+    "index",
+    "bullmq",
+    "sqs",
+    "db"
+  ]
 }

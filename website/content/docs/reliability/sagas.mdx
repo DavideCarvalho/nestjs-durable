@@ -1,6 +1,7 @@
 ---
 title: Sagas & compensation
 description: "Undo a dispatched step's side effects with a compensate ref/name that receives a StepUndo<TInput, TOutput> envelope, retried per the undo's own @Step config and checkpointed at negative seqs for crash-safe resume — plus the ctx.localStep closure form, compensationRetries, compensate:<step> visibility, and compensating cancellation via engine.cancel(runId, { compensate: true })."
+icon: Undo2
 ---
 
 A durable run often performs several irreversible side effects in sequence — book a flight, book a hotel,

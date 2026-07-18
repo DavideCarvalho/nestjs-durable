@@ -1,6 +1,7 @@
 ---
 title: Run retention & pruning
 description: "The module's retention option hard-prunes terminal run history (completed/failed/cancelled/dead) on an interval via StateStore.pruneTerminalRuns, per disjoint RetentionPolicy rules (maxAge and/or maxCount) — without it, run history is kept forever by default and the durable tables grow unbounded."
+icon: Archive
 ---
 
 Every run — completed, failed, cancelled, or dead — stays in the store forever **by default**. That's

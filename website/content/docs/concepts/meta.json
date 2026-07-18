@@ -1,4 +1,10 @@
 {
   "title": "Concepts",
-  "pages": ["durability", "workflows-and-steps", "sleep-and-signals", "tenancy"]
+  "icon": "Lightbulb",
+  "pages": [
+    "durability",
+    "workflows-and-steps",
+    "sleep-and-signals",
+    "tenancy"
+  ]
 }
