@@ -3871,6 +3871,13 @@ export class WorkflowEngine {
     transport?: string,
   ): Promise<TOutput> {
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
+    // Capability/protocol routing guard (handshake design §7.5), same as the durable `callRemote` path:
+    // BEFORE the first dispatch, ensure a live worker on this step's group is capability-capable AND
+    // protocol-compatible. If descriptors are published on the group but none qualifies, throw
+    // `WorkflowBlocked` — the run-execution catch parks the run `blocked` instead of dispatching into a
+    // queue nobody consumes (this `timeoutMs` path would otherwise burn its liveness window + retries
+    // waiting on a worker that can't run it). No descriptors published → guard skipped (legacy, §7.7).
+    await this.ensureRoutable(tenantGroup(sanitizeQueueToken(step.name), step.partition), step.requires);
     // A bare `@Step()` (no `input`/`output` schemas attached) skips validation.
     const validInput = step.input ? step.input.parse(input) : input;
     const id = stepId(runId, seq);

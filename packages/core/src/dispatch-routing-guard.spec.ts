@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type { WorkerDescriptor } from './handshake/descriptor';
 import type {
@@ -243,5 +243,76 @@ describe('routing guard — remote workflow turn (design §7.5)', () => {
 
     expect(result?.status).toBe('suspended');
     expect(executor.dispatched).toBe(1); // the turn was enqueued
+  });
+});
+
+describe('routing guard — in-memory (timeoutMs) step path (design §7.5)', () => {
+  /** Register a workflow whose remote step has a liveness `timeoutMs` (the `callRemoteInMemory` path). */
+  function makeTimeoutEngine(transport: FakeTransport, clock: () => number = Date.now) {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({
+      store,
+      transport,
+      clock,
+      blockedPollMs: 5000,
+      runDispatcher: { dispatch: () => {} },
+    });
+    engine.register('checkout', '1', async (ctx: WorkflowCtx) => {
+      // `timeoutMs` diverts to the in-memory liveness path — the one that was previously unguarded.
+      await ctx.step('Billing.charge', { amount: 1 }, { requires: ['search-attr-v2'], timeoutMs: 60_000 });
+      return 'ok';
+    });
+    return { store, engine };
+  }
+
+  it('parks `blocked` on the timeout path when no capable worker exists (no dispatch into the void)', async () => {
+    const transport = new FakeTransport();
+    transport.descriptors = [worker('w1', ['saga'])]; // live but incapable
+    const { store, engine } = makeTimeoutEngine(transport);
+    const events: Array<{ type: string; error?: unknown }> = [];
+    engine.subscribe((e) => events.push({ type: e.type, error: e.error }));
+
+    await engine.start('checkout', {}, 'r1');
+    const result = await engine.runOne('r1');
+
+    expect(result?.status).toBe('blocked');
+    expect((await store.getRun('r1'))?.status).toBe('blocked');
+    // The guard fires BEFORE the in-memory dispatch — nothing was enqueued.
+    expect(transport.dispatched).toEqual([]);
+    const blocked = events.find((e) => e.type === 'run.blocked');
+    expect(blocked).toBeDefined();
+    expect((blocked?.error as { code?: string })?.code).toBe('capability.unavailable');
+  });
+
+  it('dispatches through the timeout path when a capable + compatible worker is live', async () => {
+    const transport = new FakeTransport();
+    transport.descriptors = [worker('w2', ['search-attr-v2'])];
+    const { engine } = makeTimeoutEngine(transport);
+
+    await engine.start('checkout', {}, 'r1');
+    // The in-memory path awaits the worker result in-flight (no result arrives in this test), so drive
+    // the run without awaiting completion and assert the guard PASSED — i.e. it actually dispatched.
+    void engine.runOne('r1');
+    await vi.waitFor(() => expect(transport.dispatched).toHaveLength(1));
+    expect(transport.dispatched[0]?.name).toBe('Billing.charge');
+  });
+
+  it('a timeout-path blocked run re-drives through the SAME recovery (re-parks while incapable)', async () => {
+    const transport = new FakeTransport();
+    transport.descriptors = [worker('w1', ['saga'])];
+    let now = 1_000_000;
+    const { store, engine } = makeTimeoutEngine(transport, () => now);
+
+    await engine.start('checkout', {}, 'r1');
+    expect((await engine.runOne('r1'))?.status).toBe('blocked');
+    const firstWake = (await store.getRun('r1'))?.wakeAt;
+
+    // The blocked-recovery poll (dueBlockedRuns) picks it up regardless of which dispatch path blocked it.
+    now += 6000;
+    const resumed = await engine.resumeDueTimers(now);
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0]?.status).toBe('blocked'); // still nobody capable → re-parks
+    expect(transport.dispatched).toEqual([]);
+    expect((await store.getRun('r1'))?.wakeAt).toBeGreaterThan(firstWake ?? 0);
   });
 });
