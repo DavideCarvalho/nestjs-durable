@@ -1,14 +1,23 @@
 ---
-title: Python steps
-description: Run workflow steps in Python. A TypeScript workflow's ctx.step dispatches to a Python worker over BullMQ/Redis, and the result flows back — one workflow, steps split across languages.
+title: Python
+description: Python is a first-class durable runtime. Implement steps a TypeScript workflow calls, OR author whole workflows in Python that the engine drives — both over the same Redis wire, with the engine owning durable state.
 icon: FileCode2
 ---
 
-A step doesn't have to run in Node. The `durable-worker` Python SDK registers step handlers by
-name and runs them over the same Redis queues the [BullMQ transport](/docs/transports/bullmq) uses
-— so a TypeScript workflow's `ctx.step('payments.charge-card', …)` reaches a step implemented in Python.
-The SDK isn't limited to steps, either — a `WorkflowWorker` can author the whole workflow function in
-Python; see [Authoring workflows in Python](#authoring-workflows-in-python) below.
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Python is a **first-class durable runtime**, not just a place to run a step. The `durable-worker`
+SDK does two things, and one worker can do both at once:
+
+- **Implement steps** a workflow (in any language) calls — a TypeScript workflow's
+  `ctx.step('payments.charge-card', …)` reaches a handler written in Python.
+- **Author whole workflows** in Python — the coordinator logic (`ctx.step`, `ctx.sleep`,
+  `ctx.gather_calls`, …) lives in Python, and the engine drives it turn by turn. See
+  [Authoring workflows in Python](#authoring-workflows-in-python).
+
+Either way the engine stays the sole owner of durable state, recovery, and timers — the Python
+worker is a stateless consumer on the broker. Everything rides the same Redis queues the
+[BullMQ transport](/docs/transports/bullmq) uses.
 
 ```bash
 pip install "durable-worker[redis]"
@@ -299,36 +308,108 @@ per task, where the reply goes.
 
 ## Authoring workflows in Python
 
-Steps aren't the only thing a Python worker can own — a `WorkflowWorker` can author the whole
-workflow function, not just implement a step for one written in TypeScript. The engine stays the
-sole owner of durable state, recovery, and timers: it advances a run one **turn** at a time by
-sending the run's history as a workflow task, the Python runtime replays the workflow function
-locally against that history, and returns whatever commands the replay produced (a step dispatch, a
-sleep, a signal wait) for the engine to persist and act on — the same turn-based protocol, just
-driven from the Python side:
+A Python worker can own **the whole workflow function**, not just a step. The engine stays the sole
+owner of durable state, recovery, and timers: it advances a run one **turn** at a time by sending
+the run's history as a workflow task, the Python runtime **replays** the workflow function locally
+against that history, and returns the commands the replay produced (a step dispatch, a sleep, a
+signal wait) for the engine to persist and act on — a pure, store-free coordinator (Temporal-style),
+just driven from Python.
+
+### One unified worker (recommended)
+
+The simplest deployment registers the workflow **and** its step handlers on **one** `Worker`. Each
+registered `@worker.workflow`/`@worker.step` **name** gets its own queue (route-by-handler), so a
+single process replays the workflow turns and runs the steps it dispatches — no separate step
+deployment. `run_workers` connects it and drains cleanly on `SIGTERM`/`SIGINT`:
+
+```python
+from durable_worker import Worker, WorkflowContext, redis_url_from_env, run_workers
+
+worker = Worker()
+
+@worker.step("ingestion")
+async def ingestion(data):
+    return {"rows": load(data["key"])}
+
+@worker.workflow("pipeline")
+def pipeline(ctx: WorkflowContext, data):
+    started_at = ctx.now()                               # replay-stable capture
+    # Fan several steps out as parallel remote dispatches within this one run:
+    results = ctx.gather_calls([
+        {"name": "ingestion", "input": {"key": f"/{data['id']}/a.csv"}},
+        {"name": "ingestion", "input": {"key": f"/{data['id']}/b.csv"}},
+    ])
+    ctx.sleep(60_000)                                    # durable timer
+    return {"rows": sum(r["rows"] for r in results), "startedAt": started_at}
+
+run_workers([worker], redis=redis_url_from_env())        # one loop, one Redis pool, graceful shutdown
+```
+
+### The `WorkflowContext` ops
+
+`ctx` mirrors the TypeScript `WorkflowCtx` — each op is keyed by a deterministic seq, so a completed
+op replays its recorded result instead of re-running. Changing the op sequence under a run already in
+flight raises `NondeterminismError` rather than silently diverging.
+
+| Op | Meaning |
+| --- | --- |
+| `ctx.step(name, input, group=...)` | Dispatch a step (routed by handler `name`, any language) and await its result. Always durable, always engine-scheduled. |
+| `ctx.now()` | A replay-stable epoch-ms timestamp (like JS `Date.now()`) — captured once, replayed thereafter. |
+| `ctx.side_effect(fn)` | Run `fn` once, checkpoint its result, replay the same value without re-running. For ids/random/env, e.g. `ctx.side_effect(lambda: str(uuid7()))`. |
+| `ctx.sleep(ms)` | Durable timer — the run suspends and the engine resumes it when it fires. |
+| `ctx.wait_signal(name)` | Block until a signal `name` is delivered (via `engine.signal`); returns its payload. |
+| `ctx.start_child(workflow, input)` | Start a child run and await its output (a failed child raises `StepFailed`). |
+| `ctx.gather_calls([{name, input}, …])` | Dispatch several steps **in parallel within one run** (flat, no child runs) and await all. |
+| `ctx.gather_children([…])` | Start several **child runs** in parallel and await all. |
+| `ctx.gather([…])` | Run several local steps in parallel and await all. |
+
+The three `gather*` fan-outs default to `wait_all` — raising an aggregate `GatherFailed` if anything
+fails — with an opt-in `fail_fast`. A single step that fails raises `StepFailed` in the workflow;
+catch it to compensate, or let it propagate to fail the run.
+
+### Dedicated workflow worker
+
+If you'd rather keep workflow replay and step execution in **separate** processes, author on a
+dedicated `WorkflowWorker` and run it with `run_redis_workflow_worker` (the workflow-shaped sibling
+of `run_redis_worker`):
 
 ```python
 from durable_worker import WorkflowWorker
+from durable_worker.redis_runner import run_redis_workflow_worker
 
 workflows = WorkflowWorker(group="py-workflows")
 
 @workflows.workflow("pipeline")
 def pipeline(ctx, base_id):
-    started_at = ctx.now()                                                          # replay-stable capture
-    rows = ctx.step("ingestion", {"key": f"/{base_id}/data.csv"}, group="pipeline")  # dispatched
-    ctx.sleep(60_000)                                                                # durable timer
-    return {"rows": rows, "startedAt": started_at}
+    rows = ctx.step("ingestion", {"key": f"/{base_id}/data.csv"}, group="pipeline")
+    return {"rows": rows}
+
+# await run_redis_workflow_worker(workflows, connection=redis_url_from_env())
 ```
 
-`ctx` carries the same primitives as the TypeScript `WorkflowCtx` — `step`, `sleep`, `now`,
-`side_effect`, `wait_signal`, `start_child` — each keyed by a deterministic seq, so a completed op
-replays its recorded result instead of re-running. It also adds concurrent fan-out with no
-TypeScript equivalent yet: `gather` runs several local steps in parallel and waits for all of them,
-`gather_children` does the same for child workflows, and `gather_calls` dispatches several steps in
-parallel within a single run (no child runs). All three default to `wait_all` — raising an
-aggregate `GatherFailed` if anything fails — with an opt-in `fail_fast`.
+You can also mix step and workflow workers in one process with `run_workers([step_worker, workflows],
+redis=...)`.
 
-Run a `WorkflowWorker` with `run_redis_workflow_worker(workflows, connection=...)` — the
-workflow-shaped sibling of `run_redis_worker` — or mix step and workflow workers in one process with
-`run_workers([step_worker, workflows], redis=...)`: one event loop, one Redis pool, and a clean
-shutdown on SIGTERM/SIGINT for every worker in the list.
+### Dispatching a Python workflow (NestJS side)
+
+You **don't** register anything on the NestJS side. When a run is started for a workflow name the
+engine doesn't have locally but a **live worker group of that name** does, the engine routes it
+there by **convention** — synthesizing the remote registration on the fly. So a NestJS workflow
+just calls the Python-authored one by name, exactly like a local child:
+
+```ts
+// Inside a NestJS @Workflow — `pipeline` is authored by the Python worker group of the same name.
+const result = await ctx.child('pipeline', { id: baseId });
+```
+
+or start it directly with `engine.start('pipeline', input)`. A live Python worker registered as
+`pipeline` picks up the turns; nothing else to wire.
+
+<Callout type="info">
+Convention routing is why there is no `registerRemote` boilerplate: the queue name **is** the
+routing. The explicit `engine.registerRemote(name, version, { group, executor })` still exists for
+when you want to pin a specific group/version, but the by-name convention is the default path.
+</Callout>
+
+The workflow-task/decision wire is language-neutral, so the same Python workflow runs unchanged
+against a NestJS, an [Adonis](/docs/cluster/interop), or any other conformant control plane.
