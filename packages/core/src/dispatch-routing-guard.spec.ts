@@ -37,7 +37,11 @@ class FakeTransport implements Transport {
 }
 
 /** A worker descriptor advertising `capabilities` under protocol v1 (the current major). */
-function worker(id: string, capabilities: string[], range: [number, number] = [1, 1]): WorkerDescriptor {
+function worker(
+  id: string,
+  capabilities: string[],
+  range: [number, number] = [1, 1],
+): WorkerDescriptor {
   return {
     instanceId: id,
     runtime: 'python',
@@ -75,7 +79,9 @@ describe('routing guard — park blocked when no capable worker (design §7.5)',
     transport.descriptors = [worker('w1', ['saga', 'signals'])];
     const { store, engine } = makeEngine(transport);
     const events: Array<{ type: string; error?: unknown; diagnostics?: unknown }> = [];
-    engine.subscribe((e) => events.push({ type: e.type, error: e.error, diagnostics: e.diagnostics }));
+    engine.subscribe((e) =>
+      events.push({ type: e.type, error: e.error, diagnostics: e.diagnostics }),
+    );
 
     await engine.start('checkout', {}, 'r1');
     const result = await engine.runOne('r1');
@@ -95,7 +101,11 @@ describe('routing guard — park blocked when no capable worker (design §7.5)',
     const blocked = events.find((e) => e.type === 'run.blocked');
     expect(blocked).toBeDefined();
     expect((blocked?.error as { code?: string })?.code).toBe('capability.unavailable');
-    const diag = blocked?.diagnostics as { code: string; requires: string[]; missingCapabilities?: string[] };
+    const diag = blocked?.diagnostics as {
+      code: string;
+      requires: string[];
+      missingCapabilities?: string[];
+    };
     expect(diag.code).toBe('capability.unavailable');
     expect(diag.requires).toEqual(['search-attr-v2']);
     expect(diag.missingCapabilities).toEqual(['search-attr-v2']);
@@ -259,7 +269,11 @@ describe('routing guard — in-memory (timeoutMs) step path (design §7.5)', () 
     });
     engine.register('checkout', '1', async (ctx: WorkflowCtx) => {
       // `timeoutMs` diverts to the in-memory liveness path — the one that was previously unguarded.
-      await ctx.step('Billing.charge', { amount: 1 }, { requires: ['search-attr-v2'], timeoutMs: 60_000 });
+      await ctx.step(
+        'Billing.charge',
+        { amount: 1 },
+        { requires: ['search-attr-v2'], timeoutMs: 60_000 },
+      );
       return 'ok';
     });
     return { store, engine };

@@ -1,11 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import {
-  type HeartbeatStatus,
-  type WorkerDescriptor,
-  descriptorHash,
-} from './descriptor';
+import { type HeartbeatStatus, type WorkerDescriptor, descriptorHash } from './descriptor';
 
 /**
  * Cross-SDK contract test (design §7.8). These golden fixtures are the polyglot wire contract: the

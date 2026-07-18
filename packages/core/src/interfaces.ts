@@ -1,6 +1,6 @@
 import type { z } from 'zod';
-import type { DispatchDiagnostics } from './handshake/dispatch-routing';
 import type { WorkerDescriptor } from './handshake/descriptor';
+import type { DispatchDiagnostics } from './handshake/dispatch-routing';
 import type { StandardSchemaV1 } from './standard-schema';
 import type { StepRef } from './step-name-symbol';
 import type { WorkflowClass, WorkflowInputOf, WorkflowOutputOf } from './workflow-ref';

@@ -1,10 +1,6 @@
 import { descriptorHash } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it } from 'vitest';
-import {
-  BullMQTransport,
-  buildWorkerDescriptor,
-  parseHeartbeatValue,
-} from './bullmq-transport';
+import { BullMQTransport, buildWorkerDescriptor, parseHeartbeatValue } from './bullmq-transport';
 
 /**
  * Handshake advertisement + negotiation wiring (design §7.2/§7.3/§7.4). The BullMQ transport, acting
@@ -35,7 +31,12 @@ describe('buildWorkerDescriptor — the node worker advertisement (design §7.1)
   });
 
   it('omits a default namespace (byte-identical to the un-namespaced wire shape)', () => {
-    const d = buildWorkerDescriptor({ instanceId: 'i', steps: [], startedAt: 0, namespace: 'default' });
+    const d = buildWorkerDescriptor({
+      instanceId: 'i',
+      steps: [],
+      startedAt: 0,
+      namespace: 'default',
+    });
     expect('namespace' in d).toBe(false);
   });
 

@@ -5,7 +5,11 @@ import {
   type ControlPlane,
   type GroupHealth,
   type Heartbeat,
+  LEGACY_V1_CAPABILITIES,
+  type NegotiationResult,
+  type RawWorkerDescriptor,
   type RemoteTask,
+  type RoutingResolution,
   type RunReply,
   type RunRequest,
   type StartRunMessage,
@@ -13,18 +17,14 @@ import {
   type StepResult,
   type TenantEvent,
   type Transport,
+  type WorkerDescriptor,
   type WorkerHeartbeat,
   type WorkerStatus,
   type WorkflowDecision,
   type WorkflowStepEvent,
   type WorkflowTask,
-  LEGACY_V1_CAPABILITIES,
-  type RawWorkerDescriptor,
-  type RoutingResolution,
-  type WorkerDescriptor,
   descriptorHash,
   negotiate,
-  type NegotiationResult,
   resolveRouting,
   runStepHandler,
   sanitizeQueueToken,
@@ -721,9 +721,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   async resolveDispatch(group: string, requires: string[] = []): Promise<RoutingResolution> {
     const advertised = await this.readWorkerDescriptors(group);
     // A worker whose protocol range can't overlap ours is unusable regardless of capabilities (§7.4).
-    const compatible = advertised.filter(
-      (w) => this.negotiateWith(w).outcome !== 'incompatible',
-    );
+    const compatible = advertised.filter((w) => this.negotiateWith(w).outcome !== 'incompatible');
     return resolveRouting(requires, compatible);
   }
 

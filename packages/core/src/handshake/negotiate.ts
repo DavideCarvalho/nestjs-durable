@@ -5,11 +5,7 @@
  * precise, structured reason — never a bare boolean (design §7.6).
  */
 
-import {
-  type RawWorkerDescriptor,
-  type WorkerDescriptor,
-  normalizeDescriptor,
-} from './descriptor';
+import { type RawWorkerDescriptor, type WorkerDescriptor, normalizeDescriptor } from './descriptor';
 
 /**
  * The three compatibility outcomes (design §7.4):

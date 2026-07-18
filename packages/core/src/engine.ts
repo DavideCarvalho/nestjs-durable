@@ -16,14 +16,6 @@ import {
 } from './errors';
 import { EventAccumulators, type EventBatchConfig } from './event-accumulators';
 import {
-  type BlockedDispatch,
-  type DispatchPlan,
-  type WorkerDescriptor,
-  WorkflowBlocked,
-  controlPlaneDescriptor,
-  planDispatch,
-} from './handshake/index';
-import {
   EVENT_BUFFER_SCAN_LIMIT,
   eventMatchOf,
   eventMatches,
@@ -31,6 +23,14 @@ import {
   eventPrefix,
   isEventToken,
 } from './events';
+import {
+  type BlockedDispatch,
+  type DispatchPlan,
+  type WorkerDescriptor,
+  WorkflowBlocked,
+  controlPlaneDescriptor,
+  planDispatch,
+} from './handshake/index';
 import type {
   ControlPlane,
   EngineEvent,
@@ -3498,7 +3498,12 @@ export class WorkflowEngine {
     const current = await this.store.getRun(run.id);
     if (current && (current.status === 'cancelled' || current.status === 'completed')) {
       await this.store.releaseRunLock(run.id);
-      return { runId: run.id, status: current.status, output: current.output, error: current.error };
+      return {
+        runId: run.id,
+        status: current.status,
+        output: current.output,
+        error: current.error,
+      };
     }
     const error: StepError = { message: blocked.reason, code: blocked.code, retryable: true };
     await this.store.updateRun(run.id, {
@@ -3527,7 +3532,9 @@ export class WorkflowEngine {
     const blocked = await this.store.listRuns({ statuses: ['blocked'] });
     return blocked.filter(
       (r) =>
-        (this.namespace === undefined || r.namespace === undefined || r.namespace === this.namespace) &&
+        (this.namespace === undefined ||
+          r.namespace === undefined ||
+          r.namespace === this.namespace) &&
         r.wakeAt !== undefined &&
         r.wakeAt <= nowMs,
     );
@@ -3631,7 +3638,10 @@ export class WorkflowEngine {
     // recovery poll) so it neither dispatches into a queue nobody consumes nor leaves a `pending` row a
     // later re-drive mistakes for "already dispatched". No descriptors published → guard skipped, the
     // legacy fleet keeps flowing (design §7.7).
-    await this.ensureRoutable(tenantGroup(sanitizeQueueToken(step.name), step.partition), step.requires);
+    await this.ensureRoutable(
+      tenantGroup(sanitizeQueueToken(step.name), step.partition),
+      step.requires,
+    );
 
     const id = stepId(runId, seq);
     // Flow control: a queued call that can't be admitted (concurrency/rate) does NOT dispatch — the
@@ -3877,7 +3887,10 @@ export class WorkflowEngine {
     // `WorkflowBlocked` — the run-execution catch parks the run `blocked` instead of dispatching into a
     // queue nobody consumes (this `timeoutMs` path would otherwise burn its liveness window + retries
     // waiting on a worker that can't run it). No descriptors published → guard skipped (legacy, §7.7).
-    await this.ensureRoutable(tenantGroup(sanitizeQueueToken(step.name), step.partition), step.requires);
+    await this.ensureRoutable(
+      tenantGroup(sanitizeQueueToken(step.name), step.partition),
+      step.requires,
+    );
     // A bare `@Step()` (no `input`/`output` schemas attached) skips validation.
     const validInput = step.input ? step.input.parse(input) : input;
     const id = stepId(runId, seq);

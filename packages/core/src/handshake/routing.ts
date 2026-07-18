@@ -7,11 +7,7 @@
  * Pure logic: no transport, no store. Consumers (the dispatcher/provider) feed live descriptors in.
  */
 
-import {
-  type RawWorkerDescriptor,
-  type WorkerDescriptor,
-  normalizeDescriptor,
-} from './descriptor';
+import { type RawWorkerDescriptor, type WorkerDescriptor, normalizeDescriptor } from './descriptor';
 
 /** A handler's capability demand — either a bare list, or anything carrying a `requires` array
  *  (a workflow/step ref). An absent/empty list means "runs anywhere" (design §7.5). */
