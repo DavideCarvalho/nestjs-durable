@@ -97,7 +97,7 @@ await ctx.transaction('create-order', async (tx) => {
 `fn` receives the store-native transaction handle (a TypeORM/MikroORM `EntityManager`, a Prisma tx
 client, or a Drizzle tx) — run your own writes on it, not on your app's regular connection. Needs a
 SQL store that implements `transaction()` (all four bundled adapters do); throws on a store that
-doesn't (`packages/core/src/interfaces.ts:1112`).
+doesn't.
 
 ## Encrypting payloads
 

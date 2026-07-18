@@ -59,7 +59,7 @@ Store-less isolation is structural: a `tenant` worker has no `store` binding at 
 
 ## Worker vs api
 
-A store-less **api/dashboard pod** is an ordinary NestJS HTTP app whose durable reads and control actions are proxied to the control plane. Every read/control/start it performs goes through the same `RunGateway` the [dashboard](/docs/observability/dashboard) and your controllers already use — bound to a `ProxyRunGateway` that round-trips over the transport instead of a `StoreRunGateway`. No controller code changes. Tune the round-trip timeout with `runGatewayTimeoutMs` (default 10s).
+A store-less **api/dashboard pod** is an ordinary NestJS HTTP app whose durable reads and control actions are proxied to the control plane. Every read/control/start it performs goes through the same `RunGateway` interface the [dashboard](/docs/observability/dashboard) and your controllers already use — but instead of reading a store directly, those calls round-trip over the transport to the control plane. No controller code changes. Tune the round-trip timeout with `runGatewayTimeoutMs` (default 10s).
 
 ## Layered tenant authentication
 
@@ -79,13 +79,13 @@ Each tenant runs on a segmented transport prefix/namespace behind a Redis/networ
 
 ### Signed token on top
 
-Each tenant pod carries a secret-signed token. The control plane's `RunRequestResponder` **verifies the signature and derives the tenant from the token**, ignoring any `tenant` in the request body — defense in depth.
+Each tenant pod carries a secret-signed token. The control plane **verifies the signature and derives the tenant from the token**, ignoring any `tenant` in the request body — defense in depth.
 
 </Step>
 
 </Steps>
 
-The `RunRequestResponder` is the **trust boundary**: it forces `listRuns` to the requester's own tenant (no cross-tenant enumeration), validates `run.namespace === tenant` on every get/signal/cancel (anti-IDOR), and rejects unknown verbs and tampered tokens.
+The control plane is the **trust boundary** for these proxied requests: it forces `listRuns` to the requester's own tenant (no cross-tenant enumeration), validates `run.namespace === tenant` on every get/signal/cancel (anti-IDOR), and rejects unknown verbs and tampered tokens.
 
 ## Next steps
 

@@ -38,11 +38,11 @@ DurableModule.forRoot({
 - `batchSize` — max runs hard-deleted per batch, per policy, looped until a batch comes back short (so a
   big backlog drains over several batches instead of one giant delete). Defaults to `1000`.
 
-Retention only runs on a **driving operator** instance (`retention-poller.ts:85-88`) — a dashboard/
+Retention only runs on a **driving operator** instance — a dashboard/
 dispatch-only instance (`drive: false`) or a thin worker (no `store`) never prunes, so you don't need to
 worry about two instances racing each other's sweeps. It also requires a store adapter that implements
 `pruneTerminalRuns` — the MikroORM adapter does; an adapter that omits it logs a warning and disables
-retention rather than failing boot (`retention-poller.ts:92-97`).
+retention rather than failing boot.
 
 ## `RetentionPolicy`: what gets pruned vs. kept
 
@@ -56,8 +56,8 @@ and pruned the moment it violates any:
   everything past that.
 
 Set one or both — with both, the **most restrictive wins**: a run is pruned once it's either past
-`maxCount` or older than `maxAge`, whichever bites first (`packages/core/src/interfaces.ts:371-380`).
-Boot-time validation (`validateRetention`, `retention-poller.ts:28-55`) rejects a misconfigured policy
+`maxCount` or older than `maxAge`, whichever bites first.
+Boot-time validation rejects a misconfigured policy
 before it can silently do the wrong thing:
 
 - every policy must set at least one of `maxAge`/`maxCount`;
@@ -75,7 +75,7 @@ runs at all, so a poison-pill run stays inspectable indefinitely unless you add 
 
 A prune sweep hard-**deletes** — not archives, not soft-deletes — the run row plus its checkpoints,
 signal waiters, and normalized search-attribute rows, in one transaction per batch, mirroring what
-`deleteRun` does for a single run (`packages/store-mikro-orm/src/mikro-orm-state-store.ts:193-199`). Once
+`deleteRun` does for a single run. Once
 pruned, a run is gone from `getRun`/`listRuns`/the dashboard — there's no undo. Pruning is evaluated
 **per run**, independent of parent/child relationships: unlike `engine.deleteRun` (which recursively
 cascades to a run's children), `pruneTerminalRuns` only ever deletes runs matched by a policy's own

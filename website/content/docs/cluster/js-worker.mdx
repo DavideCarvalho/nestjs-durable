@@ -203,7 +203,7 @@ the Python SDK byte-for-byte.
 
 A store-less worker has no engine to call `engine.start` on. To **request a new run** from the control
 plane over the broker, use `startRun` — it publishes a `StartRunMessage` onto `<prefix>-start-run`,
-which the control plane's `onStartRun` consumer turns into a durable run:
+which the control plane turns into a durable run:
 
 ```ts
 import { startRun } from '@dudousxd/durable-worker';

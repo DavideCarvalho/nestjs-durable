@@ -13,9 +13,8 @@ the run is suspended (no compute consumed) and resumes on its own, even across r
 
 `ctx.sleep(duration: string | number): Promise<void>` suspends the run until the timer is due.
 `duration` accepts milliseconds as a number, or a string like `'500ms'`, `'30s'`, `'15m'`, `'2h'`,
-`'7d'`, `'7 days'`, `'2 weeks'` (parsed by `parseDuration`,
-`packages/core/src/duration.ts:27`). For a fixed deadline instead of a relative delay, use
-`ctx.sleepUntil(when: Date | number): Promise<void>` (`interfaces.ts:1136`).
+`'7d'`, `'7 days'`, `'2 weeks'`. For a fixed deadline instead of a relative delay, use
+`ctx.sleepUntil(when: Date | number): Promise<void>`.
 
 ```ts
 await ctx.step(this.digest.draft, topic);
@@ -24,27 +23,25 @@ await ctx.step(this.digest.refine, topic);
 ```
 
 The first time this line runs, the engine computes the absolute wake time, records it as a
-`sleep`-kind checkpoint (`kind: 'sleep', wakeAt`), and throws `WorkflowSuspended(wakeAt)` — the run
-becomes `suspended` and **no compute is consumed** while it waits
-(`workflow-ctx.ts:291-311`, `interfaces.ts:657-659`).
+`sleep`-kind checkpoint (`kind: 'sleep', wakeAt`), and suspends the run — the run becomes
+`suspended` and **no compute is consumed** while it waits.
 
-What wakes it: the NestJS `TimerPoller`, wired automatically by `DurableModule`, calls
-`engine.resumeDueTimers()` on every poll tick (default every second, `timerPollMs`) —
-`packages/nestjs/src/timer-poller.ts:62`. There's no per-sleep timeout or setTimeout held in
-memory; a poller sweep is what notices the deadline has passed and resumes the run.
+What wakes it: the engine sweeps for due timers on a regular poll tick (default every second,
+`timerPollMs`) and resumes any run whose stored wake time has passed. There's no per-sleep timeout
+or setTimeout held in memory; a poller sweep is what notices the deadline has passed and resumes
+the run.
 
-**Replay:** on any re-run, `suspendUntil` reads the recorded checkpoint first. If the clock has
+**Replay:** on any re-run, the engine reads the recorded checkpoint first. If the clock has
 passed the recorded `wakeAt` it returns immediately (the sleep is "done"); otherwise it re-suspends
-on the *same* `wakeAt` (`workflow-ctx.ts:294-307`). The wake time is fixed by the first run's
-checkpoint, not recomputed on replay — so a clock skew or a redeploy can't accidentally shift an
-already-scheduled timer.
+on the *same* `wakeAt`. The wake time is fixed by the first run's checkpoint, not recomputed on
+replay — so a clock skew or a redeploy can't accidentally shift an already-scheduled timer.
 
 ## Signals
 
 `ctx.waitForSignal<TPayload>(token: string, opts?: { timeoutMs?: number }): Promise<TPayload>`
 suspends the run — with no timer by default — until an external `engine.signal(token, payload)`
-delivers a payload for that exact `token` (`interfaces.ts:1150`, `workflow-ctx.ts:343-381`). Good
-for approvals, third-party callbacks, or any point-to-point wakeup.
+delivers a payload for that exact `token`. Good for approvals, third-party callbacks, or any
+point-to-point wakeup.
 
 ```ts
 const decision = await ctx.waitForSignal<{ approved: boolean }>(`approve:${order.id}`);
@@ -52,22 +49,21 @@ if (!decision.approved) return { status: 'rejected' };
 ```
 
 **The token is a global namespace, not run-scoped.** Unlike `ctx.onUpdate(name)` — where the engine
-prefixes `name` with the run id internally (`update:${runId}:${name}`, `workflow-ctx.ts:656`) —
-`waitForSignal` uses the token you pass verbatim. Two different runs waiting on the same literal
-string collide: the underlying waiter row is keyed by `token` alone (`token` is the primary key of
-`durable_signal_waiters`, `packages/store-mikro-orm/src/entities.ts:230`), so registering a second
-waiter for a token that's already waited-on replaces the first. **Always embed the run's identity
-in the token** (`` `approve:${order.id}` ``, not `'approve'`) so it's unique across the whole
-engine.
+prefixes `name` with the run id internally (`update:${runId}:${name}`) — `waitForSignal` uses the
+token you pass verbatim. Two different runs waiting on the same literal string collide: the
+underlying waiter row is keyed by `token` alone (`token` is the primary key of
+`durable_signal_waiters`), so registering a second waiter for a token that's already waited-on
+replaces the first. **Always embed the run's identity in the token** (`` `approve:${order.id}` ``,
+not `'approve'`) so it's unique across the whole engine.
 
 **Replay:** the wait consumes one logical position (or two, if `{ timeoutMs }` is set — see
 [Timeouts](#timeouts)); on replay, a `completed` checkpoint at that position returns its saved
-payload instead of waiting again, exactly like a step (`workflow-ctx.ts:346-347`).
+payload instead of waiting again, exactly like a step.
 
 ## Sending a signal
 
 Deliver a signal from anywhere — typically a controller — via `engine.signal(token, payload)` or
-`WorkflowService.signal(token, payload)` (`packages/nestjs/src/workflow.service.ts:55`):
+`WorkflowService.signal(token, payload)`:
 
 ```ts
 @Post('orders/:id/approve')
@@ -83,8 +79,8 @@ if it replays again later.
 `token`. If one is parked, it resolves that waiter's checkpoint and resumes the run — **delivery is
 to exactly one waiter**, never a broadcast. If nobody is waiting *yet* (the signal arrives before
 the run reaches its `waitForSignal`), the engine buffers the payload — FIFO per token, in a
-`durable_buffered_signals` table row — instead of dropping it (`engine.ts:1423-1449`,
-`interfaces.ts:314-321`). There is no TTL or eviction on a buffered signal: it sits in the store
+`durable_buffered_signals` table row — instead of dropping it. There is no TTL or eviction on a
+buffered signal: it sits in the store
 until the matching `waitForSignal(token)` call consumes it (oldest first), however long that takes.
 That buffering is what makes `signalWithStart` (below) race-free.
 
@@ -100,9 +96,9 @@ engine.signalWithStart(
 ): Promise<{ runId: string }>
 ```
 
-(`engine.ts:1459-1471`, exposed on `WorkflowService.signalWithStart` at
-`workflow.service.ts:64-86`.) It does two things in order: **start** the workflow at `runId` if no
-run exists yet (idempotent — a no-op if it's already running), then **signal** it at
+Also exposed on `WorkflowService.signalWithStart`. It does two things in order: **start** the
+workflow at `runId` if no run exists yet (idempotent — a no-op if it's already running), then
+**signal** it at
 `signal.token`. Because signals buffer, this is race-free regardless of which caller gets there
 first: if the run is brand new and hasn't reached its `waitForSignal` yet, the signal buffers and
 is consumed the instant it does.
@@ -115,7 +111,7 @@ lifetime — each caller doesn't need to know whether the entity is already runn
 
 Pass `{ timeoutMs }` to bound the wait: `ctx.waitForSignal(token, { timeoutMs })`. If the deadline
 passes before a signal (or a buffered one) arrives, the call throws `SignalTimeoutError` — catch it
-in the workflow to take a default branch (`interfaces.ts:1144-1148`, `errors.ts:40-49`).
+in the workflow to take a default branch.
 
 ```ts
 try {
@@ -131,10 +127,10 @@ try {
 
 This is the supported, replay-safe way to race "signal vs. deadline" — the engine records the
 deadline as its own `sleep` checkpoint and the wait as a second checkpoint, and resumes on whichever
-comes first (`workflow-ctx.ts:353-380`). Note the determinism cost: a bounded wait consumes **two**
-logical positions (deadline + wait) where an unbounded one consumes **one** — so adding or removing
-`{ timeoutMs }` on an existing `waitForSignal` shifts the seq of every later step, and should be
-treated as a workflow-version change for runs already in flight (`workflow-ctx.ts:322-324`).
+comes first. Note the determinism cost: a bounded wait consumes **two** logical positions
+(deadline + wait) where an unbounded one consumes **one** — so adding or removing `{ timeoutMs }` on
+an existing `waitForSignal` shifts the seq of every later step, and should be treated as a
+workflow-version change for runs already in flight.
 
 A note on `Promise.race`: don't reach for `Promise.race([ctx.sleep(...), ctx.waitForSignal(...)])`
 to build a "whichever happens first" race by hand. Every suspending primitive resumes by *throwing*

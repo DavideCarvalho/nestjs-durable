@@ -47,12 +47,11 @@ has three fields:
 ## What happens when a second start arrives
 
 A singleton run is tagged `singleton:<key>` at start time so the admission gate can find every other
-run sharing that key (`packages/core/src/engine.ts:873-880`). When a run is picked up for its first
+run sharing that key. When a run is picked up for its first
 execution, the gate checks whether it's among the `limit` **oldest** in-flight runs (status `running` or
 `suspended`, sorted by `(createdAt, id)`) sharing the key:
 
 ```ts
-// packages/core/src/singleton-gate.ts:68-80
 async admit(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
   const inflight = (await this.deps.store.listRuns({
     tag: this.tag(cfg, run.input),
@@ -71,7 +70,7 @@ next admission scan) and re-checks admission every time the timer poller wakes i
 across a fleet, not just within one process.
 
 Completion is push, not just poll: when a singleton run settles, the engine immediately notifies the
-oldest gated waiter(s) sharing its key (`wakeNext`, `packages/core/src/singleton-gate.ts:88-106`) instead
+oldest gated waiter(s) sharing its key instead
 of making them wait out their retry timer. The durable retry timer still exists as the crash/cross-instance
 fallback — if the notify is missed (e.g. the notifying instance dies first), the next timer tick catches up.
 
@@ -85,8 +84,8 @@ await startRun(engine, 'sync-inventory', { storeId: 'B' }, 'run-3');
 ```
 
 A `pending` run (enqueued but not yet picked up for execution) doesn't count toward admission — only
-`running`/`suspended`/`cancelling` do — so a run can't be gated before it's even started running once
-(`packages/core/src/engine.ts:2433-2435`). A `cancelling` run skips the gate entirely: it's tearing down,
+`running`/`suspended`/`cancelling` do — so a run can't be gated before it's even started running once.
+A `cancelling` run skips the gate entirely: it's tearing down,
 not competing for a slot.
 
 ## Bounding the queue: `maxQueueDepth` and `SingletonQueueFullError`
@@ -120,7 +119,7 @@ try {
 }
 ```
 
-The check (`assertCapacity`, `packages/core/src/singleton-gate.ts:50-61`) counts `pending`/`running`/
+The capacity check counts `pending`/`running`/
 `suspended`/`cancelling` runs sharing the key in one scan and compares against `(cfg.limit ?? 1) +
 cfg.maxQueueDepth`. It runs *before* the run row is written, so a rejected start leaves no trace in the
 store. Once a slot frees (notify-on-release promotes the oldest waiter), the backlog count drops below
@@ -132,7 +131,7 @@ the cap and the next `start` is admitted again.
 singleton gate. If the workflow it starts is a singleton and the derived key is already busy, the new run
 is created (or, with `maxQueueDepth` set, rejected with `SingletonQueueFullError` exactly as any other
 start) and gates like any other same-key run before its body — and therefore the signal it's waiting for
-— ever executes. Don't rely on `signalWithStart` to get a singleton-gated entity moving immediately; it
+— ever executes. Don't rely on `signalWithStart` to get a gated singleton entity moving immediately; it
 still queues behind whatever else shares its key.
 
 ## Singleton key vs. a deterministic `runId`
@@ -140,7 +139,7 @@ still queues behind whatever else shares its key.
 Both look like "dedupe," but they solve different problems:
 
 - **Deterministic `runId`** dedupes the *start itself*. `start` is idempotent by `runId`
-  (`packages/core/src/engine.ts:866-871`): if a run with that id already exists, the call is a no-op that
+: if a run with that id already exists, the call is a no-op that
   returns the existing run's state — no new run, nothing queues. Use this when a redelivered trigger (an
   at-least-once queue, a retried request) must not create a second run of *the same logical job*.
 - **`singleton` key** serializes *distinct* runs. Two different `runId`s that share a singleton key are

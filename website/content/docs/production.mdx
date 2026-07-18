@@ -41,8 +41,7 @@ before you rely on it:
 - **Crash recovery is a lease, not a boot-time sweep.** While a run executes, its worker renews a
   recovery lease every `leaseMs / 2`. A crashed worker stops renewing, so the lease expires and
   `engine.recoverIncomplete()` reclaims the orphaned run — on **any** instance, not only on the next
-  boot. `leaseMs` defaults to 30 000 (`packages/core/src/engine.ts:226`,
-  `this.leaseMs = deps.leaseMs ?? 30_000` at `packages/core/src/engine.ts:400`) — set it above your
+  boot. `leaseMs` defaults to 30 000 — set it above your
   longest single resume step, since the lease renews for the run's whole duration, not just its start.
 - **`recoverIncomplete` needs a heartbeat to run periodically, not just at boot.** The NestJS
   `TimerPoller` calls it every tick (alongside `resumeDueTimers`/`sweepTimeouts`) — this is what turns
@@ -87,7 +86,7 @@ DurableModule.forRoot({
 });
 ```
 
-`maxRecoveryAttempts` is unlimited by default (`packages/nestjs/src/durable.module.ts:241`) — recovery
+`maxRecoveryAttempts` is unlimited by default — recovery
 retries forever unless you set it. Once a run exceeds the cap, the engine moves it to the terminal
 `dead` status instead of resuming it again: inspectable and retriable from the dashboard, but no
 longer crash-looping the process. Route dead runs to a handler with `engine.onDead`, an inline
@@ -112,13 +111,11 @@ DurableModule.forRoot({
 });
 ```
 
-`WorkflowRegistrar.onApplicationShutdown` calls `engine.drain(this.options.shutdownTimeoutMs)`
-(`packages/nestjs/src/workflow.registrar.ts:67`) — `shutdownTimeoutMs` defaults to 10 000
-(`packages/nestjs/src/durable.module.ts:271`). `drain` sets an internal flag that turns recovery and
-the pending-run poll into no-ops (`packages/core/src/engine.ts:1093`), so no *new* run starts, then
+On shutdown the module calls `engine.drain(shutdownTimeoutMs)` — `shutdownTimeoutMs` defaults to
+10 000. `drain` turns recovery and the pending-run poll into no-ops, so no *new* run starts, then
 waits for every currently in-flight execution to settle — up to the timeout — before returning.
 Transports are closed **after** the drain, deliberately, so an in-flight run can still dispatch to and
-await a remote step while it drains (`packages/nestjs/src/workflow.registrar.ts:61-64`). Only after
+await a remote step while it drains. Only after
 `drain` resolves (or times out) does the process actually exit.
 
 What this means for a run that's still executing when the timeout is hit: `drain` just stops
@@ -297,7 +294,7 @@ Three views of the same engine lifecycle events, for different jobs:
   trace per run across suspends. See [OpenTelemetry](/docs/observability/otel). The same package also
   exports `attachDurableMetrics(engine)` — a dependency-free counter/percentile collector
   (run/step counts by outcome, `p50`/`p95`/max duration) meant to back a `/metrics` route or a
-  scheduled exporter (`packages/otel/src/durable-metrics.ts`).
+  scheduled exporter.
 - **Telescope** (`@dudousxd/nestjs-durable-telescope`), if you already run
   `@dudousxd/nestjs-telescope`, surfaces durable runs/steps alongside your app's requests and jobs, and
   its `durableTelescopeExtension()` adds a health dashboard (success rate, current-state gauges, top
@@ -313,8 +310,8 @@ entity metadata last applied, and a steady-state boot does two cheap round-trips
 `CREATE TABLE IF NOT EXISTS` plus one PK read) to confirm nothing changed, skipping the expensive
 whole-database `information_schema` introspection entirely. Only a fresh database, an actual entity
 change, or a hand-bumped internal revision constant triggers the full heal — and that heal runs under
-a best-effort cross-pod **advisory lock** (MySQL `GET_LOCK`, Postgres `pg_advisory_lock`,
-`packages/store-mikro-orm/src/schema.ts:174-186`) so concurrent pods don't race the same DDL.
+a best-effort cross-pod **advisory lock** (MySQL `GET_LOCK`, Postgres `pg_advisory_lock`)
+so concurrent pods don't race the same DDL.
 
 If your environment restricts DDL to migrations (no runtime `CREATE TABLE`/`ALTER TABLE` at all), turn
 auto-schema off and own it explicitly:
@@ -334,7 +331,7 @@ export class AddDurableTables extends Migration {
 }
 ```
 
-`autoSchema` defaults to `true` (`packages/nestjs/src/durable.module.ts:219`). The same additive,
+`autoSchema` defaults to `true`. The same additive,
 non-destructive update runs either way — the auto-boot path and the migration helper call the exact
 same function, so turning it off changes *when* it runs, not *what* it does. See
 [MikroORM store](/docs/stores/mikro-orm#schema-auto-on-boot-or-your-own-migration) for the full
