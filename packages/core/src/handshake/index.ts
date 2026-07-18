@@ -34,3 +34,12 @@ export {
   capableWorkers,
   resolveRouting,
 } from './routing';
+export {
+  type DispatchDiagnostics,
+  type RoutableDispatch,
+  type BlockedDispatch,
+  type DispatchPlan,
+  WorkflowBlocked,
+  controlPlaneDescriptor,
+  planDispatch,
+} from './dispatch-routing';

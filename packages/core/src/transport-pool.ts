@@ -1,3 +1,4 @@
+import type { WorkerDescriptor } from './handshake/descriptor';
 import type {
   GroupHealth,
   Heartbeat,
@@ -105,6 +106,23 @@ export class TransportPool {
     for (const { transport } of this.transports) {
       transport.onStartRun?.(handler);
     }
+  }
+
+  /**
+   * The live handshake descriptors advertised for `group` (design §7.2), merged across every transport
+   * that can report them. Returns `[]` when NO transport implements
+   * {@link Transport.readWorkerDescriptors} (a pure in-process pool) OR when descriptors are supported
+   * but none is published — both are the "guard disengaged / legacy assume-compatible" case, so the
+   * engine's routing guard treats an empty result identically (design §7.7).
+   */
+  async readWorkerDescriptors(group: string): Promise<WorkerDescriptor[]> {
+    const descriptors: WorkerDescriptor[] = [];
+    for (const { transport } of this.transports) {
+      if (transport.readWorkerDescriptors) {
+        descriptors.push(...(await transport.readWorkerDescriptors(group)));
+      }
+    }
+    return descriptors;
   }
 
   /** Distinct worker groups with a live heartbeat, merged across every transport that can report it. */

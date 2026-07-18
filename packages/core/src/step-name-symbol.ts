@@ -42,6 +42,10 @@ export interface StepConfig {
    *  worker dead and fails the dispatch with a `RemoteStepTimeout` (retryable — re-dispatches per
    *  `retries`). Omit to wait indefinitely. */
   timeoutMs?: number | undefined;
+  /** Capabilities a live worker must advertise to run this step (handshake design §7.5). The
+   *  control-plane routes the step only to capable+compatible workers; if descriptors are published
+   *  on its group but none qualifies, the run parks `blocked`. Absent/empty = "runs anywhere". */
+  requires?: string[] | undefined;
 }
 
 function isStepConfig(value: unknown): value is StepConfig {
