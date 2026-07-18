@@ -36,6 +36,9 @@ export interface WorkflowMeta {
   debounce?: string | number | undefined;
   /** Batch `onEvent` triggers — fire on size or window. See `WorkflowOptions`. */
   batch?: { maxSize: number; within: string | number } | undefined;
+  /** Capabilities a live worker must advertise to run this workflow's turns (handshake §7.5). See
+   *  `WorkflowOptions`. */
+  requires?: string[] | undefined;
 }
 
 export interface WorkflowOptions {
@@ -67,6 +70,14 @@ export interface WorkflowOptions {
    * runs that get stuck or loop forever. Omit for no limit.
    */
   executionTimeout?: string | number;
+  /**
+   * Capabilities a live worker MUST advertise to run this workflow's turns (handshake design §7.5).
+   * Only meaningful for a group-served / remote workflow (an in-app worker or a cross-runtime body):
+   * the control-plane dispatches a turn only to a capability-capable + protocol-compatible worker, and
+   * if descriptors are published on its group but none qualifies the run parks `blocked` until the
+   * recovery poll finds one. Absent/empty = "runs anywhere" (a legacy fleet skips the guard, §7.7).
+   */
+  requires?: string[];
   /**
    * Validate the workflow input at `start` against a **class-validator DTO** (the same
    * `plainToInstance` + `validate` NestJS runs in controllers) — invalid input is rejected before any
@@ -146,6 +157,7 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       onEvent: options.onEvent,
       debounce: options.debounce,
       batch: options.batch,
+      requires: options.requires,
     };
     Reflect.defineMetadata(WORKFLOW_METADATA, meta, target);
     // Stamp the registered name so this class can be used as a typed workflow ref (ctx.child,
@@ -205,6 +217,15 @@ export interface StepOptions {
    * `retries`). Omit to wait indefinitely.
    */
   timeoutMs?: number;
+  /**
+   * Capabilities a live worker MUST advertise to run this step (handshake design §7.5). The
+   * control-plane routes the step only to workers whose descriptor advertises every name here; if
+   * descriptors are published on the step's group but none is capability-capable + protocol-compatible,
+   * the run parks `blocked` (never a silent hang) until the recovery poll finds one. Absent/empty =
+   * "runs anywhere" (the default — a legacy fleet publishing no descriptors skips the guard, §7.7). A
+   * per-call `ctx.step(ref, input, { requires })` overrides this.
+   */
+  requires?: string[];
 }
 
 /** Build the {@link StepConfig} to stamp under `DURABLE_STEP_CONFIG` from `@Step` options — omitting
@@ -218,6 +239,7 @@ function stepConfigFrom(options: StepOptions): StepConfig | undefined {
     backoffMaxMs: options.backoffMaxMs,
     jitter: options.jitter,
     timeoutMs: options.timeoutMs,
+    requires: options.requires,
   };
   const hasAnyField = Object.values(config).some((value) => value !== undefined);
   return hasAnyField ? config : undefined;

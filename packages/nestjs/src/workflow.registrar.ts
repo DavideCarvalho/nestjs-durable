@@ -127,6 +127,7 @@ export class WorkflowRegistrar
         tags: meta.tags,
         singleton: meta.singleton,
         executionTimeout: meta.executionTimeout,
+        requires: meta.requires,
         validateInput,
         searchAttributesSchema: meta.searchAttributes,
         onEvent: getOnEvents(meta, workflowCtor),
