@@ -1,4 +1,6 @@
 import type { z } from 'zod';
+import type { WorkerDescriptor } from './handshake/descriptor';
+import type { DispatchDiagnostics } from './handshake/dispatch-routing';
 import type { StandardSchemaV1 } from './standard-schema';
 import type { StepRef } from './step-name-symbol';
 import type { WorkflowClass, WorkflowInputOf, WorkflowOutputOf } from './workflow-ref';
@@ -27,6 +29,14 @@ export type RunStatus =
    * `cancelled`.
    */
   | 'cancelling'
+  /**
+   * No live worker on the run's next-dispatch group is BOTH capability-capable and protocol-compatible
+   * (handshake design §7.5). NON-TERMINAL — the run wrote no `pending` checkpoint and dispatched
+   * nothing; it carries a `wakeAt` so the blocked-recovery poll re-drives it to re-check the live
+   * fleet, and proceeds the moment a capable+compatible worker appears. Only engaged when descriptors
+   * are actually published (a legacy/pre-handshake fleet skips the guard, design §7.7).
+   */
+  | 'blocked'
   | 'completed'
   | 'failed'
   | 'cancelled'
@@ -920,6 +930,14 @@ export interface Transport {
    *  still surfaces. Pairs with {@link groupHealth}. */
   listWorkerGroups?(): Promise<string[]>;
   /**
+   * The live handshake {@link WorkerDescriptor}s advertised for `group` (design §7.2). Optional — only
+   * broker transports that carry the two-tier descriptor advertisement (BullMQ) implement it; a pure
+   * in-process transport returns nothing, so the engine's routing guard stays disengaged (legacy
+   * assume-compatible, design §7.7). The engine feeds these into {@link planDispatch} to decide whether
+   * a run can dispatch to `group` or must park `blocked`.
+   */
+  readWorkerDescriptors?(group: string): Promise<WorkerDescriptor[]>;
+  /**
    * DB-less tenant worker → control plane: publish a {@link StartRunMessage} requesting a new run.
    * Optional — only transports that carry the hosted-control-plane protocol (P4) implement this.
    * The message is enqueued on `<effectivePrefix>-start-run`; the control plane's
@@ -1106,6 +1124,15 @@ export interface StepOptions {
    */
   timeoutMs?: number;
   /**
+   * Capabilities a live worker MUST advertise to run this dispatched step (handshake design §7.5).
+   * The control-plane routes the step only to workers whose descriptor advertises every name here;
+   * if descriptors are published on the step's group but NONE is capability-capable + protocol-
+   * compatible, the run parks `blocked` (never a silent hang) and the blocked-recovery poll re-drives
+   * it when a capable worker appears. Absent/empty = "runs anywhere" (the default; backward-compatible
+   * — a legacy fleet publishing no descriptors skips the guard entirely, design §7.7).
+   */
+  requires?: string[];
+  /**
    * Saga compensation: if this step completes but the run later **fails**, the engine runs the
    * registered `compensate` callbacks in reverse order (undo what was done). Local steps only.
    * Idempotency note: a step is already deduplicated by its deterministic `stepId` (runId:seq) —
@@ -1195,6 +1222,9 @@ export interface StepDispatchOpts {
    *  worker dead and fails the dispatch with a `RemoteStepTimeout` (retryable — re-dispatches per
    *  `retries`). Omit to wait indefinitely. Overrides the `@Step`-declared value. */
   timeoutMs?: number;
+  /** Capabilities a live worker must advertise to run this dispatch (handshake design §7.5). Overrides
+   *  the `@Step`-declared `requires`. Absent = inherit the def-level value (or "runs anywhere"). */
+  requires?: string[];
 }
 
 /** What a saga undo handler receives: the compensated step's original input and its result — the
@@ -1526,7 +1556,13 @@ export type EngineEventType =
   // A single step event (log line / sub-process outcome) emitted WHILE a step is still running, so
   // observers tail a long step's progress live instead of waiting for `step.completed` to deliver
   // the whole `events` array at once. Carries `event`; never persisted (live-tail only).
-  | 'step.progress';
+  | 'step.progress'
+  // A run parked `blocked`: no live worker on its next-dispatch group is capability-capable +
+  // protocol-compatible (handshake design §7.5/§7.6). Carries the structured `diagnostics` delta
+  // (which capability/protocol gap, both descriptors) so the dashboard health panel + telescope
+  // timeline render exactly WHY — never a bare boolean. The `error.code` is the machine code
+  // (`capability.unavailable` / `protocol.incompatible`).
+  | 'run.blocked';
 
 /**
  * A lifecycle event emitted by the engine. The observability surfaces (dashboard, OTel, the
@@ -1552,6 +1588,12 @@ export interface EngineEvent {
   /** The live step event carried by a `step.progress` (the single log line / sub-process outcome a
    *  running step just emitted). Absent on lifecycle events. */
   event?: StepEvent | undefined;
+  /** Capabilities the blocked dispatch required (on a `run.blocked` event). */
+  requires?: string[] | undefined;
+  /** The structured routing delta on a `run.blocked` event (design §7.6): which capability/protocol
+   *  gap fired, how many live workers were considered, and both descriptors — enough for the health
+   *  panel/telescope to render the reason. Absent on all other event types. */
+  diagnostics?: DispatchDiagnostics | undefined;
   at: Date;
 }
 

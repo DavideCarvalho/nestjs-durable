@@ -23,6 +23,14 @@ import {
   eventPrefix,
   isEventToken,
 } from './events';
+import {
+  type BlockedDispatch,
+  type DispatchPlan,
+  type WorkerDescriptor,
+  WorkflowBlocked,
+  controlPlaneDescriptor,
+  planDispatch,
+} from './handshake/index';
 import type {
   ControlPlane,
   EngineEvent,
@@ -161,6 +169,10 @@ interface RegisteredWorkflow {
    *  dispatches a workflow task to `group`) rather than running `fn` in-process. See
    *  {@link WorkflowExecutor}. */
   remote?: { group: string; executor: WorkflowExecutor };
+  /** Capabilities a live worker must advertise to run this workflow's turns (handshake design §7.5).
+   *  Enforced before each remote turn's dispatch: if descriptors are published on its group but none is
+   *  capable+compatible, the run parks `blocked`. Absent/empty = "runs anywhere". */
+  requires?: string[] | undefined;
   /** True when `fn` is a real in-process body (`register`), false/absent for a body-less remote whose
    *  `fn` is the throwing stub (`registerRemote` / a synthesized remote child). Gates
    *  {@link WorkflowEngine.workflowBody} so an in-app worker only ever gets a runnable body. */
@@ -199,7 +211,8 @@ interface PendingRemote {
 type RunOutcome =
   | { kind: 'completed'; output: unknown }
   | { kind: 'failed'; error: StepError }
-  | { kind: 'suspended'; wakeAt?: number | undefined };
+  | { kind: 'suspended'; wakeAt?: number | undefined }
+  | { kind: 'blocked'; blocked: BlockedDispatch };
 
 /**
  * What {@link WorkflowEngine.unwindCompensations} returns when the run must keep waiting on a
@@ -318,6 +331,14 @@ export interface WorkflowEngineDeps {
    */
   remoteRedispatchMax?: number | undefined;
   /**
+   * How long (ms) a run parked `blocked` (no capability-capable + protocol-compatible live worker,
+   * handshake design §7.5) waits before the blocked-recovery poll re-drives it to re-check the live
+   * fleet. Default 5000. The run proceeds the moment a capable+compatible worker appears; until then it
+   * re-parks with a fresh `wakeAt` each poll. Only relevant once a step/workflow declares `requires`
+   * AND descriptors are published (a legacy fleet never parks blocked).
+   */
+  blockedPollMs?: number | undefined;
+  /**
    * Build the public callback URL for a `ctx.webhook()` token (e.g.
    * ``(t) => `https://api.example.com/durable/webhooks/${t}` ``). Populates
    * {@link DurableWebhook.url}. Omit if you build URLs yourself from the token.
@@ -404,6 +425,10 @@ export class WorkflowEngine {
   private readonly eventBufferTtlMs: number | undefined;
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
+  /** How long a `blocked` run waits before the recovery poll re-checks the live fleet (design §7.5). */
+  private readonly blockedPollMs: number;
+  /** This engine's control-plane handshake descriptor — negotiated against each worker (design §7.3). */
+  private readonly cpDescriptor: WorkerDescriptor;
   private readonly webhookUrl?: ((token: string) => string) | undefined;
   private readonly traceparent?: (() => string | undefined) | undefined;
   private readonly context?: (() => Record<string, unknown> | undefined) | undefined;
@@ -490,6 +515,14 @@ export class WorkflowEngine {
     // Opt-in: unset (or 0) leaves the by-design "re-suspend a lost dispatch, never re-dispatch" behavior.
     this.remoteRedispatchMs = deps.remoteRedispatchMs || undefined;
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
+    this.blockedPollMs = deps.blockedPollMs ?? 5000;
+    // The control-plane descriptor this engine negotiates against each worker's advertised descriptor
+    // (design §7.3): it speaks the current protocol band and is scoped to this engine's namespace so a
+    // pool-mismatched worker isn't considered. Capabilities empty — the CP routes, it doesn't execute.
+    this.cpDescriptor = controlPlaneDescriptor({
+      instanceId: `cp-${this.instanceId}`,
+      ...(this.namespace !== undefined ? { namespace: this.namespace } : {}),
+    });
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.context = deps.context;
@@ -678,6 +711,9 @@ export class WorkflowEngine {
        *  in-app worker, pair a transport-backed {@link RemoteWorkflowExecutor} (group consumed by a
        *  worker that calls {@link workflowBody}) so the retained `fn` runs through the transport hop. */
       executor?: WorkflowExecutor | undefined;
+      /** Capabilities a live worker must advertise to run this workflow's turns (handshake §7.5).
+       *  Only meaningful with `group`/`executor` (a remote/group-served workflow). Absent = runs anywhere. */
+      requires?: string[] | undefined;
     },
   ): void {
     // Group-served is all-or-nothing: a `group` with no `executor` (or vice-versa) is a wiring bug —
@@ -699,6 +735,7 @@ export class WorkflowEngine {
       searchAttributesSchema: opts?.searchAttributesSchema,
       onEvent: opts?.onEvent,
       eventBatch: opts?.eventBatch,
+      requires: opts?.requires,
       // A real, retained in-process body — so `workflowBody` can hand it to an in-app worker, and so
       // it is NOT confused with the throwing stub `registerRemote` installs for a body-less remote.
       hasBody: true,
@@ -746,6 +783,8 @@ export class WorkflowEngine {
       singleton?: SingletonConfig;
       executionTimeout?: string | number;
       validateInput?: (input: unknown) => void | Promise<void>;
+      /** Capabilities a live worker must advertise to run this remote workflow's turns (handshake §7.5). */
+      requires?: string[];
     },
   ): void {
     const registered: RegisteredWorkflow = {
@@ -760,6 +799,7 @@ export class WorkflowEngine {
       executionTimeoutMs:
         opts.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts.validateInput,
+      requires: opts.requires,
       remote: { group: opts.group, executor: opts.executor },
     };
     this.workflows.set(versionKey(name, version), registered);
@@ -791,6 +831,8 @@ export class WorkflowEngine {
       singleton?: SingletonConfig;
       executionTimeout?: string | number;
       validateInput?: (input: unknown) => void | Promise<void>;
+      /** Capabilities a live worker must advertise to run this workflow's turns (handshake §7.5). */
+      requires?: string[];
     },
   ): void {
     const { group, version, ...rest } = opts;
@@ -1321,9 +1363,14 @@ export class WorkflowEngine {
    */
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
     const due = await this.store.listDueTimers(nowMs, this.namespace);
-    if (due.length === 0) return [];
+    // ALSO re-drive runs parked `blocked` whose recovery poll is due (handshake design §7.5): re-driving
+    // re-checks the live fleet, so a run proceeds the moment a capable+compatible worker appears (else it
+    // re-parks with a fresh `wakeAt`). `listDueTimers` targets `suspended`+`wakeAt`, so blocked runs are
+    // gathered separately here rather than widening every store adapter's timer query.
+    const blocked = await this.dueBlockedRuns(nowMs);
+    if (due.length === 0 && blocked.length === 0) return [];
     const waiterByRun = indexWaitersByRun(await this.store.listSignalWaiters(''));
-    return this.resumeLeased(due, nowMs, (run) =>
+    return this.resumeLeased([...due, ...blocked], nowMs, (run) =>
       this.reconcileSignalWaiter(run, waiterByRun.get(run.id)),
     );
   }
@@ -2395,6 +2442,7 @@ export class WorkflowEngine {
       void this.notifyParent(run.id, { ok: false, error: outcome.error.message });
       return { runId: run.id, status: 'failed', error: outcome.error };
     }
+    if (outcome.kind === 'blocked') return this.parkBlocked(run, outcome.blocked);
     // This outcome was computed by a turn that started from a possibly-stale run snapshot. If the run
     // was cancelled WHILE that turn was still executing (e.g. `ctx.all`'s failFast cancelling a
     // sibling mid-turn — plain `cancel()` writes `cancelled` directly, without waiting for the target's
@@ -2479,6 +2527,18 @@ export class WorkflowEngine {
       await this.store.releaseRunLock(run.id);
       return { runId: run.id, status: 'suspended' };
     }
+
+    // Capability/protocol routing guard for the remote workflow turn (handshake design §7.5): if
+    // descriptors are published on its group but none is capability-capable + protocol-compatible, park
+    // `blocked` (never dispatch into a queue nobody consumes). No descriptors → skip (legacy, §7.7). The
+    // routing token mirrors the executor's own `tenantGroup(sanitizeQueueToken(group), …)` dispatch
+    // target — see RemoteWorkflowExecutor. Settled inline here (this path releases its own lease), unlike
+    // the step guard which parks via the run-execution catch.
+    const wfPlan = await this.planRoute(
+      tenantGroup(sanitizeQueueToken(remote.group), undefined),
+      registered.requires,
+    );
+    if (wfPlan?.status === 'blocked') return this.parkBlocked(run, wfPlan);
 
     const history = await this.remoteHistory(run.id);
 
@@ -3020,6 +3080,16 @@ export class WorkflowEngine {
         );
         return { runId: run.id, status: 'completed' };
       }
+      if (err instanceof WorkflowBlocked) {
+        // No live worker can run the next dispatch (capability/protocol gap) — park the run `blocked`
+        // (design §7.5/§7.6) with the structured diagnostics, instead of writing a `pending` checkpoint
+        // + dispatching into a queue nobody consumes. The blocked-recovery poll re-drives it when a
+        // capable+compatible worker appears. A compensating cancel in flight still wins.
+        if (this.cancelRequested.has(run.id)) {
+          return this.compensateAndCancel(run, compensations, replay);
+        }
+        return this.settleRun(run, { kind: 'blocked', blocked: err.plan });
+      }
       if (err instanceof WorkflowSuspended) {
         // A compensating cancel resumed this run to reach here: undo + cancel instead of re-suspending.
         if (this.cancelRequested.has(run.id)) {
@@ -3389,6 +3459,87 @@ export class WorkflowEngine {
     return { accepted: true, run: result };
   }
 
+  /**
+   * Plan a dispatch to `token` for a handler requiring `requires` (handshake design §7.5). Returns:
+   * - `undefined` — NO live descriptors published on this token: the guard does not engage, so a
+   *   pre-handshake fleet (or an in-process transport that advertises none) keeps flowing exactly as
+   *   before (design §7.7);
+   * - a `routable` plan — ≥1 live worker is capability-capable AND protocol-compatible (dispatch);
+   * - a `blocked` plan — descriptors exist but none can run it (park the run, never dispatch into it).
+   */
+  private async planRoute(
+    token: string,
+    requires: string[] | undefined,
+  ): Promise<DispatchPlan | undefined> {
+    const descriptors = await this.pool.readWorkerDescriptors(token);
+    if (descriptors.length === 0) return undefined; // legacy / no-descriptor path — skip the guard
+    return planDispatch(requires ?? [], descriptors, this.cpDescriptor, token);
+  }
+
+  /** Throw {@link WorkflowBlocked} when no live worker can run a dispatch to `token` — so the caller's
+   *  run-execution catch parks the run `blocked` (with the plan) instead of persisting a `pending`
+   *  checkpoint + dispatching into a queue nobody consumes (design §7.5). A no-op when the guard does
+   *  not engage (no descriptors) or a capable+compatible worker exists. */
+  private async ensureRoutable(token: string, requires: string[] | undefined): Promise<void> {
+    const plan = await this.planRoute(token, requires);
+    if (plan?.status === 'blocked') throw new WorkflowBlocked(plan);
+  }
+
+  /**
+   * Park a run `blocked` (handshake design §7.5/§7.6): no live worker on its next-dispatch group is
+   * capability-capable + protocol-compatible. Persists the `blocked` status with a human reason + the
+   * machine `code` + a `wakeAt` so the blocked-recovery poll re-drives it, emits the LOUD structured
+   * `capability.unavailable`/`protocol.incompatible` diagnostics (both descriptors + the precise delta),
+   * and releases the run lease so any instance can re-drive it. Re-checks the persisted status first so
+   * a concurrent cancel/complete is never clobbered. `releaseRunLock` is idempotent, so a caller whose
+   * own `finally` also releases (the run-execution path) is safe.
+   */
+  private async parkBlocked(run: WorkflowRun, blocked: BlockedDispatch): Promise<RunResult> {
+    const current = await this.store.getRun(run.id);
+    if (current && (current.status === 'cancelled' || current.status === 'completed')) {
+      await this.store.releaseRunLock(run.id);
+      return {
+        runId: run.id,
+        status: current.status,
+        output: current.output,
+        error: current.error,
+      };
+    }
+    const error: StepError = { message: blocked.reason, code: blocked.code, retryable: true };
+    await this.store.updateRun(run.id, {
+      status: 'blocked',
+      error,
+      wakeAt: this.clock() + this.blockedPollMs,
+      updatedAt: new Date(),
+    });
+    this.emit({
+      type: 'run.blocked',
+      runId: run.id,
+      workflow: run.workflow,
+      namespace: run.namespace,
+      error,
+      requires: blocked.requires,
+      diagnostics: blocked.diagnostics,
+    });
+    await this.store.releaseRunLock(run.id);
+    return { runId: run.id, status: 'blocked', error };
+  }
+
+  /** Runs parked `blocked` whose recovery poll is due (`wakeAt <= nowMs`), namespace-scoped like
+   *  {@link resumeDueTimers}. Re-driving one re-checks the live fleet: it dispatches if a
+   *  capable+compatible worker has appeared, else re-parks with a fresh `wakeAt` (design §7.5). */
+  private async dueBlockedRuns(nowMs: number): Promise<WorkflowRun[]> {
+    const blocked = await this.store.listRuns({ statuses: ['blocked'] });
+    return blocked.filter(
+      (r) =>
+        (this.namespace === undefined ||
+          r.namespace === undefined ||
+          r.namespace === this.namespace) &&
+        r.wakeAt !== undefined &&
+        r.wakeAt <= nowMs,
+    );
+  }
+
   private async callRemote<TInput, TOutput>(
     runId: string,
     seq: number,
@@ -3479,6 +3630,18 @@ export class WorkflowEngine {
       if (this.clock() < existing.wakeAt) throw new WorkflowSuspended(existing.wakeAt);
       attempt = existing.attempts + 1;
     }
+
+    // Capability/protocol routing guard (handshake design §7.5): BEFORE consuming an admission slot or
+    // writing a `pending` checkpoint, ensure a live worker on this step's group is capability-capable
+    // AND protocol-compatible. If descriptors are published on the group but none qualifies, throw
+    // `WorkflowBlocked` — the run-execution catch parks the run `blocked` (with a `wakeAt` for the
+    // recovery poll) so it neither dispatches into a queue nobody consumes nor leaves a `pending` row a
+    // later re-drive mistakes for "already dispatched". No descriptors published → guard skipped, the
+    // legacy fleet keeps flowing (design §7.7).
+    await this.ensureRoutable(
+      tenantGroup(sanitizeQueueToken(step.name), step.partition),
+      step.requires,
+    );
 
     const id = stepId(runId, seq);
     // Flow control: a queued call that can't be admitted (concurrency/rate) does NOT dispatch — the
@@ -3718,6 +3881,16 @@ export class WorkflowEngine {
     transport?: string,
   ): Promise<TOutput> {
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
+    // Capability/protocol routing guard (handshake design §7.5), same as the durable `callRemote` path:
+    // BEFORE the first dispatch, ensure a live worker on this step's group is capability-capable AND
+    // protocol-compatible. If descriptors are published on the group but none qualifies, throw
+    // `WorkflowBlocked` — the run-execution catch parks the run `blocked` instead of dispatching into a
+    // queue nobody consumes (this `timeoutMs` path would otherwise burn its liveness window + retries
+    // waiting on a worker that can't run it). No descriptors published → guard skipped (legacy, §7.7).
+    await this.ensureRoutable(
+      tenantGroup(sanitizeQueueToken(step.name), step.partition),
+      step.requires,
+    );
     // A bare `@Step()` (no `input`/`output` schemas attached) skips validation.
     const validInput = step.input ? step.input.parse(input) : input;
     const id = stepId(runId, seq);
