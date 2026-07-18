@@ -5,6 +5,7 @@
     "dashboard",
     "otel",
     "metrics",
-    "telescope"
+    "telescope",
+    "diagnostics"
   ]
 }

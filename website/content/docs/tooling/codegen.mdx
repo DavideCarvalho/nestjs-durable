@@ -1,0 +1,148 @@
+---
+title: Typed dashboard client
+description: Generate a fully-typed client (and TanStack hooks) for the durable dashboard's REST API — list/inspect runs, retry, cancel, deliver webhooks — with the nestjsDurableCodegen extension for @dudousxd/nestjs-codegen.
+icon: Wand2
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+The [dashboard](/docs/observability/dashboard) ships a REST API — list runs, read a run's timeline,
+retry, cancel, continue, deliver a webhook — and a React UI on top of it. When you want to drive that
+same control plane from **your own** frontend (a custom ops page, an admin panel, a "retry this run"
+button next to an order), you don't want to hand-write `fetch` calls and their response types.
+`@dudousxd/nestjs-durable-codegen` generates them: a single extension that emits a typed client for
+every durable API route into your existing [`@dudousxd/nestjs-codegen`](https://www.npmjs.com/package/@dudousxd/nestjs-codegen)
+output, so `api.durable.listRuns()` is as typed and as first-class as any of your app's own routes.
+
+```bash
+pnpm add -D @dudousxd/nestjs-durable-codegen
+```
+
+## Why it's an extension, not discovery
+
+`@dudousxd/nestjs-codegen` normally discovers your routes by static AST analysis of your controllers.
+The dashboard's routes don't work that way: they're mounted at runtime by a **factory** (so the base
+path is configurable), which static discovery can't see. `nestjsDurableCodegen()` closes that gap — it
+is a `CodegenExtension` that **injects** the durable route descriptors directly into the generation
+pass, exactly as if they had been discovered. The generated shapes (`Run`, the run detail
+`{ run, timeline }`, the query/param types) are baked into the extension and kept in lockstep with the
+dashboard's wire contract, so you never restate them.
+
+## Wire it into your codegen config
+
+Add the extension to your `@dudousxd/nestjs-codegen` config alongside whatever else you already
+generate:
+
+```ts title="codegen.config.ts"
+import { defineConfig } from '@dudousxd/nestjs-codegen';
+import { nestjsDurableCodegen } from '@dudousxd/nestjs-durable-codegen';
+
+export default defineConfig({
+  // ...your existing controllers / output config
+  extensions: [
+    nestjsDurableCodegen({
+      basePath: '/durable/api', // where the dashboard API is reachable through your fetcher's base
+      name: 'durable',          // client namespace → api.durable.*
+    }),
+  ],
+});
+```
+
+Run codegen as you normally do and the durable routes land in your generated `api.ts` under the
+`durable` namespace.
+
+<Callout title="Options">
+Both are optional.
+
+- **`basePath`** (default `/durable/api`) — the prefix where the dashboard's **API** is reachable
+  *through your codegen fetcher's base*. The dashboard mounts at `/durable`, with its API under
+  `/durable/api`. Most fetchers already prepend `/api`, and you'll often expose the dashboard behind a
+  proxy (say `/api/v1/control-panel/durable-runs`); set `basePath` to whatever your fetcher's base
+  resolves to. Trailing slashes are trimmed for you.
+- **`name`** (default `durable`) — the namespace the generated methods hang off (`api.<name>.listRuns`).
+  Change it if `durable` collides with something you already generate.
+</Callout>
+
+## What it generates
+
+Every route the dashboard API serves becomes a typed method (names shown for the default `durable`
+namespace):
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `api.durable.listRuns({ query })` | `GET /runs` | List runs, optionally filtered by `status`. |
+| `api.durable.getRun({ params: { id } })` | `GET /runs/:id` | One run plus its step `timeline` (or `null`). |
+| `api.durable.retry({ params: { id } })` | `POST /runs/:id/retry` | Re-drive a failed/dead run. |
+| `api.durable.cancel({ params: { id }, query })` | `POST /runs/:id/cancel` | Cancel a run; `compensate: 'true'` runs saga undos. |
+| `api.durable.continue({ params: { id } })` | `POST /runs/:id/continue` | Resume a run paused at `ctx.breakpoint`. |
+| `api.durable.deliverWebhook({ params: { token }, body })` | `POST /webhooks/:token` | Deliver a [durable webhook](/docs/authoring/webhooks) callback. |
+| `api.durable.getEvent({ params: { id, key } })` | `GET /runs/:id/events/:key` | Read a queryable value published via `ctx.setEvent`. |
+| `api.durable.update({ params: { id, name }, body })` | `POST /runs/:id/updates/:name` | Deliver a validated [update](/docs/authoring/queries-and-updates) to a run. |
+
+The `Run` response is fully typed — `status` is the exact `'running' | 'suspended' | 'completed' |
+'failed' | 'cancelling' | 'cancelled' | 'dead'` union, dates are ISO strings (the wire shape), and
+`getRun` returns `{ run, timeline } | null`.
+
+## Using it in the frontend
+
+Because the durable routes are ordinary generated methods, they get the same client and the same
+TanStack Query hooks as the rest of your API. A minimal ops panel:
+
+<Tabs items={['Typed client', 'TanStack hooks']}>
+
+<Tab value="Typed client">
+
+```ts
+// A raw call — the return type is inferred as Run[]
+const running = await api.durable.listRuns({ query: { status: 'running' } });
+
+// Run detail, then a control action
+const detail = await api.durable.getRun({ params: { id: runId } });
+if (detail?.run.status === 'failed') {
+  await api.durable.retry({ params: { id: runId } });
+}
+
+// Cancel with compensation (reverse-order saga undos)
+await api.durable.cancel({ params: { id: runId }, query: { compensate: 'true' } });
+```
+
+</Tab>
+
+<Tab value="TanStack hooks">
+
+```tsx
+function FailedRuns() {
+  const { data: runs } = api.durable.listRuns.useQuery({ query: { status: 'failed' } });
+  const retry = api.durable.retry.useMutation();
+
+  return (
+    <ul>
+      {runs?.map((run) => (
+        <li key={run.id}>
+          {run.workflow} — {run.status}
+          <button onClick={() => retry.mutate({ params: { id: run.id } })}>Retry</button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+</Tab>
+
+</Tabs>
+
+<Callout type="warn" title="It's still an unauthenticated control surface">
+The generated client talks to the same routes the dashboard does, and the dashboard mounts with **no
+auth of its own**. Front the base route with your own guard (or fold `basePath` into a prefix your
+existing auth/proxy already covers) before exposing retry/cancel/continue to a browser — see
+[Running in production → Observability](/docs/production#9-observability).
+</Callout>
+
+## See also
+
+- **[Control plane / dashboard](/docs/observability/dashboard)** — the API these routes wrap, and the
+  bundled React UI.
+- **[Durable webhooks](/docs/authoring/webhooks)** — the `deliverWebhook` route in context.
+- **[Queries & updates](/docs/authoring/queries-and-updates)** — what `getEvent` and `update` drive.

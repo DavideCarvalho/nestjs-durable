@@ -53,6 +53,20 @@ before you rely on it:
   picks a single owner for a `running` run even with several replicas racing to recover it — there's
   no split-brain double-resume.
 
+By default each replica takes a **random** `instanceId` — the identity stamped on recovery leases and
+worker heartbeats. That's fine, but a stable, human-readable id makes leases and the
+[dashboard](/docs/observability/dashboard)'s per-worker health legible (you can tell *which* pod holds
+a run's lease), so pin it to the orchestrator's pod identity:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  leaseMs: 60_000, // above your longest single resume step
+  instanceId: process.env.HOSTNAME, // e.g. the k8s pod name — stable, unique per replica
+});
+```
+
 None of this needs configuration beyond picking `leaseMs` — it's the default behavior of a durable
 store + `DurableModule`. Full mechanism: [Durability & replay](/docs/concepts/durability#deploys-versioning--multiple-instances)
 and [Reliability](/docs/reliability).
@@ -179,6 +193,49 @@ By default, admission accounting is **per engine instance** — a `concurrency: 
 the same Redis-backed accounting. See
 [Local vs. global admission](/docs/reliability/flow-control#local-vs-global-admission).
 
+For a **worker role** (a store-less thin worker, or a co-located `store` + `connection` process), the
+`concurrency` field is the worker consumer's own per-queue limit — it can also be `'adaptive'` (see
+[Node worker → Concurrency](/docs/cluster/js-worker#concurrency-fixed-or-adaptive)):
+
+```ts
+DurableModule.forRoot({
+  topology: { role: 'tenant', tenant: 'acme-corp' },
+  connection: process.env.REDIS_URL,
+  concurrency: { mode: 'adaptive', min: 2, max: 32, ramCeilingPct: 85 },
+  concurrencyByHandler: {
+    'reports.generate': 2, // a heavy step: keep it low regardless of the global limit
+  },
+});
+```
+
+<Callout type="warn">
+`concurrencyByHandler` (a `Record<string, ConcurrencyOption>`) is accepted as a per-handler override
+but is **not yet wired through `runRedisWorker`** — today every subscribed queue uses the single
+`concurrency` value. Set it to declare intent, but rely on `concurrency` for the effective limit until
+per-handler routing lands.
+</Callout>
+
+### Remote-worker liveness
+
+When steps or workflows run in a **separate** (or polyglot) worker, the engine can't tell a slow worker
+from a dead one by default — it just waits. Set `remoteAdvanceSilenceMs` on the operator so a remote
+workflow `advance` that goes silent longer than the deadline is treated as lost and re-driven by
+`recoverIncomplete`; each worker heartbeat rearms the deadline, so an alive-but-slow worker is never
+re-driven:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport, // BullMQ — remote/polyglot workers
+  remoteAdvanceSilenceMs: 30_000, // no decision/heartbeat for 30s ⇒ presume the turn lost, recover it
+});
+```
+
+This is the workflow-turn counterpart to a dispatched step's `timeoutMs`. Leave it unset and a remote
+`advance` waits unbounded (correct, but a genuinely dead worker's run stays `running` until its lease
+expires). See [Cross-ecosystem interop](/docs/cluster/interop) and the
+[Node worker](/docs/cluster/js-worker) for the worker side.
+
 ## 7. Isolation between environments
 
 If a dev cluster, a staging environment, and developers' local instances ever point at the **same**
@@ -282,3 +339,57 @@ non-destructive update runs either way — the auto-boot path and the migration 
 same function, so turning it off changes *when* it runs, not *what* it does. See
 [MikroORM store](/docs/stores/mikro-orm#schema-auto-on-boot-or-your-own-migration) for the full
 mechanism, including the MySQL/MariaDB collation auto-convergence it also performs during a full heal.
+
+## 11. Guard the run: input validation & a lifetime cap
+
+Two `@Workflow` options catch a whole class of production incidents at the boundary rather than deep in
+a replay — a malformed `start` payload, and a run that never ends.
+
+**Validate `start` input.** A run created with garbage input fails on its first step (or worse, halfway
+through), long after the caller has moved on. `inputSchema` validates the payload against a
+[class-validator](https://github.com/typestack/class-validator) DTO **before** the run is created, so a
+bad request is rejected synchronously at `start`:
+
+```ts
+import { IsString, IsInt, Min } from 'class-validator';
+
+class CheckoutInput {
+  @IsString() orderId!: string;
+  @IsInt() @Min(1) amountCents!: number;
+}
+
+@Workflow({ name: 'checkout', version: '1', inputSchema: CheckoutInput })
+export class CheckoutWorkflow {
+  async run(ctx: WorkflowCtx, input: CheckoutInput) {
+    /* input is guaranteed shape-valid here */
+  }
+}
+```
+
+`inputSchema` needs `class-validator`/`class-transformer` installed. For a rule that a DTO can't
+express (a cross-field invariant, an async lookup) use `validateInput` instead — a plain
+`(input) => void | Promise<void>` that throws to reject, and which takes precedence over `inputSchema`:
+
+```ts
+@Workflow({
+  name: 'transfer',
+  validateInput: (input: TransferInput) => {
+    if (input.from === input.to) throw new Error('cannot transfer to the same account');
+  },
+})
+export class TransferWorkflow { /* … */ }
+```
+
+**Cap the lifetime.** A workflow that waits on a signal or a child that never arrives will sit
+`suspended` forever, holding whatever it holds. `executionTimeout` bounds a run's total wall-clock life;
+the timer poller cancels an overrunning run (status `cancelled`, reason `execution_timeout`):
+
+```ts
+@Workflow({ name: 'approval', executionTimeout: '72h' }) // auto-cancel if not settled within 3 days
+export class ApprovalWorkflow { /* … */ }
+```
+
+The cap is enforced by `engine.sweepTimeouts`, which the NestJS `TimerPoller` calls every tick — so a
+driving operator instance must be running (not `drive: false`) for it to fire, exactly like durable
+timers and retention. See [Scheduling](/docs/authoring/scheduling) for the poller, and
+[Event-driven workflows](/docs/authoring/events) for `validateInput` on an event-triggered start.

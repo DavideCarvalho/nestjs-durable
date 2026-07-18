@@ -2,6 +2,7 @@
   "title": "Tooling",
   "icon": "Wrench",
   "pages": [
-    "linting"
+    "linting",
+    "codegen"
   ]
 }

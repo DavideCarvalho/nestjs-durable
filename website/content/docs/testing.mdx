@@ -74,16 +74,34 @@ clock.advance(60_000);                              // ...then move forward a mi
 
 ## Inject crashes & retries
 
-`failOnce` / `failTimes` make a step throw before succeeding — to drive retries and resume:
+`failOnce` and `failTimes` are step-body factories that **throw before succeeding**, so a test can drive
+the engine's retry/resume path deterministically instead of hoping a real dependency flakes. Each
+returns a fresh step body that counts its own calls: `failOnce(value)` throws once then returns
+`value`; `failTimes(n, value)` throws the first `n` calls then returns it (`failOnce` is exactly
+`failTimes(1)`). Both take an optional custom `Error` as the last argument.
 
 ```ts
-import { failOnce, assertStepAttempts } from '@dudousxd/nestjs-durable-testing';
+import { failOnce, failTimes, assertStepAttempts } from '@dudousxd/nestjs-durable-testing';
 
+// Throws once, then succeeds — proves the step is retried and the run resumes on attempt 2.
 t.engine.register('wf', '1', async (ctx) => ctx.step('charge', {}, { retries: 3 }));
-t.transport.handle('charge', failOnce({ ok: true })); // throws once, then succeeds
+t.transport.handle('charge', failOnce({ ok: true }));
 const { runId } = await t.engine.start('wf', {}, 'run1');
 await t.engine.waitForRun(runId);
 await assertStepAttempts(t.store, 'run1', 'charge', 2); // failed once, then succeeded
+```
+
+Use `failTimes(n, …)` to exhaust a retry budget — the classic "does a poison step actually fail the
+run after `retries`?" test — optionally with a specific error so the assertion is precise:
+
+```ts
+// retries: 2 means 3 total attempts; failing all 3 must fail the run.
+t.engine.register('wf', '1', async (ctx) => ctx.step('flaky', {}, { retries: 2 }));
+t.transport.handle('flaky', failTimes(3, { ok: true }, new Error('upstream 503')));
+const { runId } = await t.engine.start('wf', {}, 'run1');
+await t.engine.waitForRun(runId);
+await assertRunStatus(t.store, 'run1', 'failed');
+await assertStepAttempts(t.store, 'run1', 'flaky', 3); // all attempts thrown → run failed
 ```
 
 ## Assertions

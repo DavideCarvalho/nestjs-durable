@@ -1,0 +1,135 @@
+---
+title: Diagnostics channel
+description: Bridge every durable engine lifecycle event onto the node diagnostics-channel bus, so any @OnDiagnostic subscriber sees runs and steps alongside your app's other channels — additive to OTel and Telescope.
+icon: Radio
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+`@dudousxd/nestjs-durable-diagnostics` puts the durable engine on the **diagnostics-channel bus**.
+Every `EngineEvent` the engine emits — `run.started`, `run.failed`, `step.completed`, `step.progress`
+and the rest — is re-published on a `durable` channel, so any `@OnDiagnostic('durable', ...)`
+subscriber (or a raw `getChannel` consumer) observes durable's lifecycle the same way it observes
+every other channel in your app. It's the lowest-friction way to react to durable events in-process:
+no exporter, no store polling, no OTel or Telescope dependency.
+
+```bash
+pnpm add @dudousxd/nestjs-durable-diagnostics
+```
+
+<Callout title="Where this sits">
+This is a **peer** of the [OpenTelemetry](/docs/observability/otel) and [Telescope](/docs/observability/telescope)
+integrations, not a replacement. All three subscribe to the same engine event bus independently and
+additively — attach any combination. Reach for diagnostics when you want to *drive your own code* off
+durable events (a metric, an alert, an audit log) rather than ship them to a tracing/inspection UI.
+</Callout>
+
+## The module (recommended)
+
+Import `DurableDiagnosticsModule.forRoot()` once at the app root, next to `DurableModule`. It resolves
+the already-constructed `WorkflowEngine` from the container on bootstrap, attaches the bridge, and
+detaches it on shutdown — it never constructs or owns the engine:
+
+```ts title="app.module.ts"
+import { DurableModule } from '@dudousxd/nestjs-durable';
+import { DurableDiagnosticsModule } from '@dudousxd/nestjs-durable-diagnostics';
+import { Module } from '@nestjs/common';
+
+@Module({
+  imports: [
+    DurableModule.forRoot({ store, transport }),
+    DurableDiagnosticsModule.forRoot(), // put durable on the diagnostics bus
+  ],
+})
+export class AppModule {}
+```
+
+The module is `@Global`, so once imported, any provider anywhere can subscribe.
+
+## Subscribing to durable events
+
+Durable declaration-merges its channels into the diagnostics `ChannelRegistry`, so the `(lib, event)`
+pair is **typed** — the payload of `@OnDiagnostic('durable', 'run.failed')` is inferred as the full
+`EngineEvent`, with no cast:
+
+```ts
+import { OnDiagnostic } from '@dudousxd/nestjs-diagnostics';
+import type { EngineEvent } from '@dudousxd/nestjs-durable-core';
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class RunAlerts {
+  @OnDiagnostic('durable', 'run.failed')
+  onRunFailed(event: EngineEvent) {
+    // The whole EngineEvent is the payload: type, runId, workflow, error, durationMs, …
+    this.pager.notify(`durable run ${event.runId} (${event.workflow}) failed: ${event.error?.message}`);
+  }
+
+  @OnDiagnostic('durable', 'step.completed')
+  onStepDone(event: EngineEvent) {
+    this.metrics.observe('durable.step.ms', event.durationMs ?? 0, { step: event.name });
+  }
+}
+```
+
+Prefer a plain subscription (outside DI, or to fan several events into one handler)? Get the channel
+directly:
+
+```ts
+import { getChannel } from '@dudousxd/nestjs-diagnostics';
+
+const off = getChannel('durable', 'run.completed').subscribe((event) => {
+  audit.log('run.completed', event.runId, event.durationMs);
+});
+// off() to unsubscribe
+```
+
+The channels durable publishes are the engine lifecycle events:
+
+| Channel event | Emitted when |
+| --- | --- |
+| `run.started` | A run began executing (first turn). |
+| `run.completed` | A run reached `completed`. |
+| `run.failed` | A run reached `failed`. |
+| `run.suspended` | A run parked (sleep, signal, awaited step/child). |
+| `step.started` | A step began. |
+| `step.completed` | A step settled successfully (`durationMs`, `queueMs` for remote). |
+| `step.failed` | A step settled with an error. |
+| `step.progress` | A live log line / sub-process outcome while a step is still running. |
+
+The payload is the verbatim `EngineEvent` — `type`, `runId`, `workflow`, `namespace`, `seq`, `name`,
+`kind`, `output`, `error`, `durationMs`, `queueMs`, and the `at` timestamp — so a subscriber has
+everything the dashboard, OTel and Telescope get, without a store read.
+
+<Callout title="Filtering is the subscriber's job">
+The bridge forwards **every** engine event, including the high-frequency `step.progress` and
+`step.started`. That's cheap: `emit` short-circuits on `hasSubscribers`, so a channel nobody listens to
+costs nothing, and a subscriber that throws never propagates back into the engine. Subscribe only to the
+events you act on.
+</Callout>
+
+## Attaching manually
+
+If you construct a `WorkflowEngine` yourself (a script, a test harness, a non-Nest process) use the
+function the module wraps. `attachDurableDiagnostics(engine)` subscribes the bridge and returns an
+**unsubscribe** function:
+
+```ts
+import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import { attachDurableDiagnostics } from '@dudousxd/nestjs-durable-diagnostics';
+
+const engine = new WorkflowEngine({ store });
+const detach = attachDurableDiagnostics(engine); // now on the 'durable' channel
+
+// ...later
+detach(); // stop bridging
+```
+
+This is exactly what `DurableDiagnosticsModule` does on `onApplicationBootstrap` (attach) and
+`onApplicationShutdown` (call the returned `detach`).
+
+## See also
+
+- **[OpenTelemetry](/docs/observability/otel)** — the same events as traces + metrics.
+- **[Telescope](/docs/observability/telescope)** — the same events in the Telescope inspector.
+- **[Dashboard](/docs/observability/dashboard)** — the operating surface built on the same engine bus.

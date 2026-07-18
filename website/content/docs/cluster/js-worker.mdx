@@ -1,0 +1,236 @@
+---
+title: Node worker
+description: Author and run a store-less Node worker with @dudousxd/durable-worker — the JS counterpart to the Python client. Register @Step/@Workflow bodies on a DurableWorkerRuntime and drive them with runRedisWorker, with fixed or adaptive concurrency.
+icon: Cpu
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+`@dudousxd/durable-worker` is the **standalone Node worker SDK** — the JavaScript twin of the
+[Python client](/docs/python). It runs steps (and whole workflows) in a **store-less** process that
+owns no engine and no database: it consumes tasks off the broker, replays or executes, and publishes
+results back. The engine stays the sole owner of durable state, recovery and timers. This is the
+building block behind both the [store-less `tenant` worker and the co-located worker](/docs/cluster/roles-and-config)
+— reach for it directly when you want a worker **without** the full NestJS module (a script, a
+purpose-built pod, a sidecar), or when you want to understand what those roles start under the hood.
+
+```bash
+pnpm add @dudousxd/durable-worker bullmq ioredis
+```
+
+<Callout title="Module or SDK?">
+If your worker is already a NestJS app, you usually don't touch this package directly —
+`DurableModule.forRoot({ topology: { role: 'tenant', tenant }, connection })` discovers your
+`@Workflow`/`@Step` and starts the runner for you (see [Roles & config](/docs/cluster/roles-and-config)).
+Use `@dudousxd/durable-worker` when you want the raw runtime with no module, or a second worker loop
+inside an existing process.
+</Callout>
+
+## The runtime + a runner
+
+A worker is two pieces: a **`DurableWorkerRuntime`** (the pure routing core — it holds your registered
+workflows and steps) and a **runner** (`runRedisWorker`) that wires it to Redis. Register bodies, then
+start the runner:
+
+```ts title="worker.ts"
+import { DurableWorkerRuntime, runRedisWorker } from '@dudousxd/durable-worker';
+
+const runtime = new DurableWorkerRuntime()
+  // A step, routed by name — the same name a workflow's ctx.step('payments.charge-card', …) calls.
+  .registerStep('payments.charge-card', async (input: { orderId: string; amountCents: number }) => {
+    const res = await stripe.charge(input.orderId, input.amountCents);
+    return { chargeId: res.id };
+  })
+  // A whole workflow, replayed turn-by-turn against the history the engine sends.
+  .registerWorkflow('pipeline', async (ctx, input: { id: string }) => {
+    const rows = await ctx.step('ingestion', { key: `/${input.id}/data.csv` });
+    await ctx.sleep('1m');
+    return { rows };
+  });
+
+const worker = await runRedisWorker({
+  runtime,
+  connection: { host: '127.0.0.1', port: 6379 }, // same Redis the engine's BullMQTransport uses
+});
+
+// on SIGTERM: await worker.close();  — drains + stops every queue and pub/sub
+```
+
+`runRedisWorker` starts **one BullMQ `Worker` per registered name** (workflows ∪ steps, deduped) —
+there's no single hand-declared "group" queue. Each name gets its own queue, so the engine's
+`ctx.step('payments.charge-card', …)` or a dispatched `pipeline` turn is routed to exactly the worker
+that registered it. The **queue name is the routing**; nothing else to declare.
+
+<Callout title="It's the same wire as Python">
+A Node worker and a [Python worker](/docs/python) speak the identical JSON wire over the identical
+Redis queues — so you can mix them freely on one control plane (see
+[Cross-ecosystem interop](/docs/cluster/interop)). Everything on the Python page about the
+connection model, at-least-once delivery, idempotency, and cooperative cancellation applies here too.
+</Callout>
+
+## Step-only vs workflow-authoring
+
+`DurableWorkerRuntime` composes a **`StepWorker`** (runs remote steps → `StepResult`) and a
+**`WorkflowWorker`** (replays workflow turns → `WorkflowDecision`). Both are pure and transport-free —
+`processTask(task)` is a function of the task, so you can unit-test either without a broker:
+
+```ts
+import { StepWorker, WorkflowWorker } from '@dudousxd/durable-worker';
+
+const steps = new StepWorker().register('reserve', (input) => reserve(input));
+const result = await steps.processTask(task); // { status: 'completed', output, startedAt, … }
+
+const workflows = new WorkflowWorker().register('checkout', async (ctx, input) => {
+  await ctx.step('reserve', input);
+  return { ok: true };
+});
+const decision = await workflows.processTask(workflowTask); // { status: 'continue' | 'completed' | …, commands }
+```
+
+A step handler receives `(input, log)` — the `log` is a step-event sink that rides back on the result
+(`log.info(...)`, sub-process outcomes). An unknown name never throws the consumer down: it returns a
+`failed` result/decision with a clear message, so a misconfigured worker is a recorded failure, not a
+crash.
+
+## Authoring a workflow: the ctx
+
+A registered workflow receives a `WorkflowContext` that **implements** the engine's `WorkflowCtx`, so a
+body written against `WorkflowCtx` runs unchanged here. Each op is keyed by a deterministic seq: a
+completed op replays its recorded result instead of re-running, and changing the op sequence under an
+in-flight run throws `NondeterminismError` rather than diverging silently.
+
+The **wire-expressible** subset is supported:
+
+| Op | Meaning |
+| --- | --- |
+| `ctx.step(nameOrRef, input, opts?)` | Dispatch a durable step (routed by name, any language) and await it. Always engine-scheduled. |
+| `ctx.sleep(duration)` | Durable timer (`'30s'`, `'2h'`, or ms) — the run suspends, the engine resumes it. |
+| `ctx.waitForSignal(token)` | Suspend until `engine.signal(token, payload)` arrives; returns the payload. |
+| `ctx.child(workflow, input)` | Start a tracked child run and await its output. |
+| `ctx.all(workflow, inputs)` | Start N children of the same workflow in parallel, await all. |
+| `ctx.gather([[name, body], …])` | Run N local step bodies concurrently in one turn, await all (worker-only extension). |
+| `ctx.now()` / `ctx.sideEffect(fn)` | Deterministic capture — recorded once, replayed thereafter. |
+
+Everything else on `WorkflowCtx` — `transaction`, `callEntity`, `continueAsNew`, `sleepUntil`,
+`waitForEvent`, `task`, fire-and-forget `startChild`, `breakpoint`, `webhook`, `setEvent`, `onUpdate`,
+`patched` — needs engine/store/transport features the remote wire can't express, so each throws
+`UnsupportedOnThinWorker`. Run such a workflow **in-process on the engine** instead.
+
+<Callout type="warn" title="Retry/backoff/timeout policy isn't applied on the thin worker">
+`ctx.step` accepts `retries`/`backoff`/`timeoutMs` for `WorkflowCtx` conformance, but the `call`
+decision a thin worker emits has never carried that policy — durable retry/backoff and the
+remote-liveness timeout are **engine-side**, so a step dispatched from a thin-worker-authored workflow
+does not get them. A workflow body that depends on durable retry/backoff must run in-process on the
+engine. (The step's own `@Step({ retries })` policy still applies when the *engine* dispatches it.)
+</Callout>
+
+## Concurrency: fixed or adaptive
+
+By default a runner processes **one task per queue at a time** (`concurrency: 1`). Raise it so a
+fanned-out batch (the N steps of a `gather`, say) runs in parallel instead of serially. Total
+parallelism is `concurrency × distinct names × replicas`.
+
+<Tabs items={['Fixed', 'Adaptive']}>
+
+<Tab value="Fixed">
+
+```ts
+await runRedisWorker({
+  runtime,
+  connection,
+  concurrency: 8, // up to 8 in-flight tasks per subscribed queue, per process
+});
+```
+
+</Tab>
+
+<Tab value="Adaptive">
+
+```ts
+await runRedisWorker({
+  runtime,
+  connection,
+  // Self-tune the limit from a latency gradient, a RAM hard-brake, and an error/stall signal.
+  concurrency: { mode: 'adaptive', min: 2, max: 32, ramCeilingPct: 85 },
+});
+```
+
+Pass the bare string `'adaptive'` for all-defaults (`min: 1`, `max: 32`, RAM ceiling 85%, 2s tick).
+The `AdaptiveController` grows the limit while latency is flat and the worker is saturated, and shrinks
+it under a latency gradient, an error rate, a stall, or a RAM/CPU ceiling — a single AIMD loop. A live
+status snapshot (in-flight, RSS, throughput, p95) rides the worker heartbeat in **both** modes, so the
+[dashboard](/docs/observability/dashboard) shows per-worker load even for a fixed worker.
+
+</Tab>
+
+</Tabs>
+
+You can normalise a `concurrency` option yourself with the exported `resolveConcurrency(opt)` (a bare
+number or `undefined` → `{ mode: 'fixed', fixed }`; `'adaptive'`/`{ mode: 'adaptive', … }` →
+`{ mode: 'adaptive', adaptive }` with every default applied), and drive an `AdaptiveController`
+directly if you're building your own runner loop.
+
+## Runner options
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `runtime` | — | The `DurableWorkerRuntime` holding the registered workflows + steps. |
+| `connection` | — | ioredis connection options (or an `IORedis` instance) — the same shape `BullMQTransport` takes. Point it at the engine's Redis. |
+| `prefix` | `'durable'` | Key prefix namespacing the durable queues. **Must match the engine's `BullMQTransport` prefix.** |
+| `partition` | none | Isolation suffix — every per-name queue token becomes `<name>@<partition>`, so an operator can route a tenant's runs to this worker. Distinct from `prefix`. Omit / `''` / `'default'` = a bare, byte-identical single-tenant token. |
+| `instanceId` | `ts-<hostname>-<pid>` | Stable id for this process in heartbeats/control keys. |
+| `concurrency` | `1` | Tasks per subscribed queue — a number, `'adaptive'`, or `{ mode: 'adaptive', … }` (above). |
+| `lockDuration` | `5 min` | BullMQ job-lock duration. Generous by design so a long workflow turn never lapses its lock mid-run and gets redelivered. |
+
+```ts
+await runRedisWorker({
+  runtime,
+  connection: process.env.REDIS_URL,
+  prefix: 'durable',        // must equal BullMQTransport({ prefix })
+  partition: 'acme-corp',   // this worker serves the acme-corp tenant's queues (<name>@acme-corp)
+  instanceId: 'orders-worker-1',
+  concurrency: 'adaptive',
+});
+```
+
+The runner also, best-effort, subscribes to the `<prefix>-control` channel for cooperative
+cancellation, streams each local step's lifecycle live, and stamps a TTL'd liveness heartbeat per
+subscribed queue — none of which can block the worker from starting or processing. All of it mirrors
+the Python SDK byte-for-byte.
+
+## Starting runs without a database (`startRun`)
+
+A store-less worker has no engine to call `engine.start` on. To **request a new run** from the control
+plane over the broker, use `startRun` — it publishes a `StartRunMessage` onto `<prefix>-start-run`,
+which the control plane's `onStartRun` consumer turns into a durable run:
+
+```ts
+import { startRun } from '@dudousxd/durable-worker';
+
+await startRun(connection, {
+  tenant: 'acme-corp',
+  workflow: 'pipeline',
+  input: { id: 'order-42' },
+  runId: 'run-order-42', // supply your own for idempotent, at-least-once-safe redelivery
+});
+```
+
+<Callout type="warn" title="Pass your own runId for idempotency">
+`startRun` sits at the head of a retryable, at-least-once BullMQ path (queue add → consumer → engine).
+It passes your `runId` through **verbatim** and never mints one in its place — because substituting a
+fresh id per delivery would make a redelivered `startRun` create a *second* run. Omit `runId` and the
+control plane mints one, but a redelivery of that specific call is then not idempotent. Always supply
+your own `runId` when you need idempotent redelivery. For high-frequency callers, hold a
+`BullMQTransport` and call `transport.dispatchStartRun` directly instead of the one-shot `startRun`.
+</Callout>
+
+## See also
+
+- **[Python worker](/docs/python)** — the same SDK in Python, with the full wire-protocol and
+  cancellation treatment that applies equally here.
+- **[Roles & config](/docs/cluster/roles-and-config)** — the NestJS-module `tenant`/co-located worker
+  this SDK powers.
+- **[Cross-ecosystem interop](/docs/cluster/interop)** — mixing Node, Python and Adonis workers on one
+  control plane.
+- **[BullMQ / Redis transport](/docs/transports/bullmq)** — the engine side of the same broker.
