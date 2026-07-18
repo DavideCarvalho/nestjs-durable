@@ -18,6 +18,14 @@ import {
   type WorkflowDecision,
   type WorkflowStepEvent,
   type WorkflowTask,
+  LEGACY_V1_CAPABILITIES,
+  type RawWorkerDescriptor,
+  type RoutingResolution,
+  type WorkerDescriptor,
+  descriptorHash,
+  negotiate,
+  type NegotiationResult,
+  resolveRouting,
   runStepHandler,
   sanitizeQueueToken,
   tenantGroup,
@@ -111,6 +119,9 @@ function failedTaskIdentity(
 export function parseHeartbeatValue(raw: string | null): {
   lastBeatAt: number;
   status?: WorkerStatus;
+  /** The two-tier handshake ETag (design §7.2), when the beat carries one. The control-plane re-reads
+   *  the full `<prefix>-worker-descriptor:` key only when this changes. */
+  descriptorHash?: string;
 } {
   if (raw == null) return { lastBeatAt: 0 };
   const trimmed = raw.trim();
@@ -123,17 +134,58 @@ export function parseHeartbeatValue(raw: string | null): {
   if (!trimmed.startsWith('{')) return { lastBeatAt: toMs(Number(trimmed)) };
 
   try {
-    const parsed = JSON.parse(trimmed) as { ts?: unknown; status?: unknown };
+    const parsed = JSON.parse(trimmed) as {
+      ts?: unknown;
+      status?: unknown;
+      descriptorHash?: unknown;
+    };
     const ts = typeof parsed.ts === 'number' ? toMs(parsed.ts) : 0;
     const status =
       parsed.status && typeof parsed.status === 'object'
         ? (parsed.status as WorkerStatus)
         : undefined;
-    return status !== undefined ? { lastBeatAt: ts, status } : { lastBeatAt: ts };
+    const hash = typeof parsed.descriptorHash === 'string' ? parsed.descriptorHash : undefined;
+    return {
+      lastBeatAt: ts,
+      ...(status !== undefined ? { status } : {}),
+      ...(hash !== undefined ? { descriptorHash: hash } : {}),
+    };
   } catch {
     // Malformed JSON — fall back to a numeric read so a partially-written value still yields a beat.
     return { lastBeatAt: toMs(Number(trimmed)) };
   }
+}
+
+/** SDK identity stamped into every descriptor this transport advertises (observability only). */
+const SDK_NAME = '@dudousxd/nestjs-durable-transport-bullmq';
+
+/**
+ * Build this instance's handshake {@link WorkerDescriptor} (design §7.1) — the cross-ecosystem
+ * advertisement a `node` aviary worker publishes so a polyglot control-plane can negotiate + route to
+ * it. Byte-identical in shape to the adonis + python descriptors. `steps` are the handler names this
+ * instance has `handle()`d; `capabilities` is the canonical v1 baseline this SDK guarantees.
+ */
+export function buildWorkerDescriptor(opts: {
+  instanceId: string;
+  steps: string[];
+  workflows?: string[];
+  startedAt: number;
+  partition?: string | undefined;
+  namespace?: string | undefined;
+  sdkVersion?: string | undefined;
+}): WorkerDescriptor {
+  return {
+    instanceId: opts.instanceId,
+    runtime: 'node',
+    sdk: { name: SDK_NAME, version: opts.sdkVersion ?? '0' },
+    protocol: { version: 1, range: [1, 1] },
+    capabilities: [...LEGACY_V1_CAPABILITIES],
+    workflows: [...(opts.workflows ?? [])].sort(),
+    steps: [...opts.steps].sort(),
+    ...(opts.partition ? { partition: opts.partition } : {}),
+    ...(opts.namespace && opts.namespace !== 'default' ? { namespace: opts.namespace } : {}),
+    startedAt: opts.startedAt,
+  };
 }
 
 export interface BullMQTransportOptions {
@@ -259,6 +311,9 @@ export class BullMQTransport implements Transport, ControlPlane {
   // Per-handler heartbeat tokens beaten on the single shared `workerHeartbeatTimer` — one entry per
   // `handle()`d name (its `tenantGroup(sanitizeQueueToken(name), partition)` queue token).
   private readonly heartbeatTokens = new Set<string>();
+  // Process start time (epoch ms), captured once. Part of the handshake descriptor's content hash —
+  // a restart changes it, so the control-plane sees a new descriptorHash ETag and re-reads (§7.2).
+  private readonly startedAt = Date.now();
   // Every pub/sub SUBSCRIBER connection this transport owns (control/heartbeat/runReply's single
   // subscription plus every per-tenant one in `tenantEventSubs`) — the shared ping watchdog below
   // iterates this set. PUBLISH-only connections (`controlPub`, `heartbeatPub`, …) are never added:
@@ -492,6 +547,25 @@ export class BullMQTransport implements Transport, ControlPlane {
     return `${this.#effectivePrefix()}-worker-heartbeat:${routingToken}:${instanceId}`;
   }
 
+  /** Full worker-descriptor key (handshake design §7.2): the expensive value re-read only when the
+   *  compact heartbeat's ETag changes. CROSS-SDK CONTRACT — MUST match the key the adonis + python
+   *  SDKs advertise to: `<prefix>-worker-descriptor:<routingToken>:<instanceId>`. */
+  private workerDescriptorKey(routingToken: string, instanceId: string): string {
+    return `${this.#effectivePrefix()}-worker-descriptor:${routingToken}:${instanceId}`;
+  }
+
+  /** This instance's live handshake descriptor: its `handle()`d step names + the v1 capability
+   *  baseline. Rebuilt each beat so a handler registered after the timer started is advertised. */
+  private buildDescriptor(): WorkerDescriptor {
+    return buildWorkerDescriptor({
+      instanceId: this.instanceId,
+      steps: [...this.handlers.keys()],
+      startedAt: this.startedAt,
+      partition: this.partition,
+      namespace: this.#namespace,
+    });
+  }
+
   /** Lazily-created standalone client for the worker-heartbeat keys (writes + scans), reused so a
    *  worker doesn't open a fresh connection per beat/read. */
   private workerRedis(): Redis {
@@ -509,10 +583,24 @@ export class BullMQTransport implements Transport, ControlPlane {
     const client = this.workerRedis();
     const controller = this.controller();
     const beatOne = (token: string) => {
+      // Two-tier handshake advertisement (design §7.2): the cheap compact beat carries the descriptor
+      // ETag, and the full descriptor is published to its own key — the control-plane re-reads the
+      // latter only when the ETag changes. Both share the heartbeat TTL, so a dead worker's descriptor
+      // expires alongside its liveness key.
+      const descriptor = this.buildDescriptor();
+      const hash = descriptorHash(descriptor);
       const key = this.workerHeartbeatKey(token, this.instanceId);
-      // Value is now `{ts,status}` JSON (was a bare ms timestamp); `listLiveWorkers` reads both forms.
-      const value = JSON.stringify({ ts: Date.now(), status: controller.snapshot() });
+      // Value is `{ts,status,descriptorHash}` JSON (was a bare ms timestamp); readers accept all forms.
+      const value = JSON.stringify({
+        ts: Date.now(),
+        status: controller.snapshot(),
+        descriptorHash: hash,
+      });
       void client.set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS).catch(() => {});
+      const descKey = this.workerDescriptorKey(token, this.instanceId);
+      void client
+        .set(descKey, JSON.stringify(descriptor), 'EX', WORKER_HEARTBEAT_TTL_SECONDS)
+        .catch(() => {});
     };
     const isNewToken = !this.heartbeatTokens.has(routingToken);
     this.heartbeatTokens.add(routingToken);
@@ -582,6 +670,61 @@ export class BullMQTransport implements Transport, ControlPlane {
       }
     } while (cursor !== '0');
     return workers;
+  }
+
+  /**
+   * Control-plane READ side of the handshake (design §7.2/§7.3): SCAN the full worker-descriptor keys
+   * advertised for `group` and parse each into a {@link WorkerDescriptor}. A key present is live (the
+   * TTL hasn't expired). This is the expensive read the compact-heartbeat ETag lets a caller skip when
+   * nothing changed. Cross-SDK: reads descriptors published by node, python or adonis workers alike.
+   */
+  async readWorkerDescriptors(group: string): Promise<WorkerDescriptor[]> {
+    const client = this.workerRedis();
+    const match = this.workerDescriptorKey(group, '*');
+    const descriptors: WorkerDescriptor[] = [];
+    let cursor = '0';
+    do {
+      const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 100);
+      cursor = next;
+      for (const key of keys) {
+        const raw = await client.get(key);
+        if (raw == null) continue;
+        try {
+          descriptors.push(JSON.parse(raw) as WorkerDescriptor);
+        } catch {
+          // A partially-written/garbled descriptor is skipped — the next beat rewrites it.
+        }
+      }
+    } while (cursor !== '0');
+    return descriptors;
+  }
+
+  /**
+   * Negotiate this control-plane's descriptor against a remote worker's (design §7.3/§7.4) — the
+   * bilateral compatibility check. `required` are capabilities the caller needs the session to
+   * provide. Returns the full structured {@link NegotiationResult} (never a bare boolean).
+   */
+  negotiateWith(
+    remote: WorkerDescriptor | RawWorkerDescriptor,
+    required?: string[],
+  ): NegotiationResult {
+    return negotiate(this.buildDescriptor(), remote, required ? { required } : {});
+  }
+
+  /**
+   * Control-plane dispatch guard (design §7.5): can a handler requiring `requires` be dispatched to
+   * `group`'s live fleet? Reads the advertised descriptors, drops any whose protocol is incompatible
+   * with this control-plane, then resolves capability routing over the compatible remainder. Returns
+   * `routable` with the capable subset, or `blocked` with a precise reason — so a run PARKS visibly
+   * (`blocked: no compatible worker (requires X)`) instead of hanging silently.
+   */
+  async resolveDispatch(group: string, requires: string[] = []): Promise<RoutingResolution> {
+    const advertised = await this.readWorkerDescriptors(group);
+    // A worker whose protocol range can't overlap ours is unusable regardless of capabilities (§7.4).
+    const compatible = advertised.filter(
+      (w) => this.negotiateWith(w).outcome !== 'incompatible',
+    );
+    return resolveRouting(requires, compatible);
   }
 
   private async runTask(task: RemoteTask): Promise<void> {
