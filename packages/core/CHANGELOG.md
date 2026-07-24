@@ -1,5 +1,70 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.61.0
+
+### Minor Changes
+
+- b7568e3: Ambient step logger — record step events from anywhere inside a handler, without threading the `StepLogger` down.
+
+  The Python SDK has had context-local step access for a while (`current_step`, `log`, `sub`, `sub_event`, `sub_process`); TypeScript only ever handed the `StepLogger` to the step body as its second argument. A generic utility a few layers below the handler (a batch inserter, an HTTP client) therefore could not emit without every signature on the path being edited — which contradicts the library's own goal that "observability is symmetric regardless of where the step ran".
+
+  **core** — new `ambient-step.ts`, mirroring `ambient-ctx.ts` (the `AsyncLocalStorage` lives on `globalThis` under a `Symbol.for` key, so duplicate copies of core in a dependency tree share one storage):
+
+  - `runInStepLogger(logger, fn)` / `currentStep(): StepLogger | undefined`
+  - module-level shortcuts for the logger surface: `sub(...)`, `subEvent(...)`, `subProcess(name, body, opts?)`
+  - log lines in both spellings: `debug` / `info` / `warn` / `error` (one per `StepLogger` method — the idiomatic TS form, for a level known at the call site) and `log(level, message, data?)` (the literal twin of the Python SDK's `log`, for a level that is computed)
+
+  The engine installs the ALS at every point a logger is born — the local-step path (`ctx.step` in `workflow-ctx.ts`) and the remote-worker path (`runStepHandler`, so every transport gets it) — binding the SAME instance the body already receives as its argument, never a second one. Concurrent step invocations each see their own logger.
+
+  **worker** — the thin worker runtime binds it too, on both its step-handler path (`StepWorker.processTask`) and its local-step path (`WorkflowContext.runStepBody`).
+
+  Outside a step everything is a no-op: `currentStep()` returns `undefined`, `log`/`sub`/`subEvent` do nothing, and `subProcess` still runs its body (and still hands it a handle) but emits nothing. That is what lets a generic utility be instrumented with no `if` at the call site and stay usable in a unit test with no durable run around it.
+
+  Purely additive: the `StepLogger` second argument is unchanged.
+
+### Patch Changes
+
+- d648903: fix(core): retrying a dead-lettered run now actually resurrects it
+
+  `requeue` reset the failure state its docstring promises to reset — the failed checkpoints, the stale
+  `error` — but left the run-level `recoveryAttempts` at the cap. A run dead-lettered at
+  `maxRecoveryAttempts` therefore came back `pending` and the very next `recoverIncomplete` pass
+  computed `cap + 1` and dead-lettered it again within seconds: the retry was accepted, the run was
+  re-killed with the same generic `max_recovery_attempts` error, and nothing progressed. Dead runs were
+  effectively unrecoverable — including via the dashboard's bulk "retry every dead run matching …",
+  which reported every run as applied while each was re-killed moments later.
+
+  Resurrecting a `failed`/`dead` run now clears the counter (`recoveryAttempts: 0`), completing the
+  run-level half of the reset the checkpoint loop already did. `0` rather than `undefined`, because
+  adapters disagree on what an undefined patch value means (the MikroORM and TypeORM mappers skip it,
+  so it would silently leave the old count in place); `0` writes a real value everywhere and reads back
+  identically, since `countRecovery` uses `(recoveryAttempts ?? 0) + 1`.
+
+  The reset is scoped to runs that had come to rest: requeueing a run still `running`/`suspended` is
+  not a resurrection, and zeroing there would let a retry loop keep a genuinely crash-looping run alive
+  forever. A poison pill still dead-letters after a retry spends its fresh budget. The `signal:child:`
+  cascade requeues failed/dead children through the same path, so their budgets are restored too.
+
+- 35c7fbd: fix(core): orphan recovery no longer dead-letters a run whose remote step is still in flight
+
+  `recoverIncomplete` inferred "the run lease is acquirable" ⇒ "its worker crashed". That inference
+  does not hold for a run awaiting a **dispatched remote step**: the work sits on the transport and
+  nobody holds the RUN lease while a worker executes it. Every such pass incremented
+  `recoveryAttempts`, so a long-running step could exhaust `maxRecoveryAttempts` and the run was moved
+  to `dead` with a generic `max_recovery_attempts` error while its worker was still processing
+  normally (seen in production: 10 attempts in 57 seconds, the step's job still `active` on the queue).
+
+  `recoverIncomplete` now checks for an in-flight (`pending`) remote checkpoint before counting. When
+  one exists the run is not an orphan, so instead of counting an attempt and re-dispatching, the engine
+  re-asserts the state the contract already specifies for it (`StepCheckpoint.status`: `pending` = the
+  run is durably suspended) — it parks the run `suspended` on the reconcile timer and hands the lease
+  back. The worker's result resumes it as usual, `resumeDueTimers` remains the safety net, and the run
+  drops out of the orphan sweep entirely instead of accruing recovery attempts.
+
+  Genuine poison pills are unaffected: a run that crash-loops with no dispatched step in flight (or
+  whose remote steps have all settled) still counts attempts and still dead-letters. A LOST dispatch is
+  still not this pass's job — `remoteRedispatchMs` and `redispatchPending` own that, unchanged.
+
 ## 0.60.0
 
 ### Minor Changes
