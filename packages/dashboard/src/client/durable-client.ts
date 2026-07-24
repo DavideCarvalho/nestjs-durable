@@ -128,14 +128,6 @@ function groupIsStalled(group: string, health: readonly GroupHealth[]): boolean 
   return anyBacklog && !anyWorker;
 }
 
-/** The group a `blocked` run is waiting on, for the no-worker detail. The engine's parked reason names
- *  it in quotes (`no live worker on "<group>" — …`); fall back to the workflow when absent (a
- *  capability/protocol block carries a different reason shape). */
-function blockedGroup(run: WorkflowRun): string {
-  const quoted = run.error?.message?.match(/"([^"]+)"/);
-  return quoted?.[1] ?? run.workflow;
-}
-
 /** Label a signal-checkpoint token (the raw waiter token) the way the server names `RunWaiting`, so a
  *  detail-view wait reads the same as its list row: `webhook <token>` / `child <id>` / `signal <name>`. */
 function tokenDetail(token: string): string {
@@ -191,12 +183,11 @@ export function deriveRunState(
       return { status: 'no-worker', detail: run.workflow };
     }
     // The engine parked this run `blocked`: no live worker can serve its next dispatch (a capability /
-    // protocol gap, or — with `blockOnAbsentWorker` — a group with no worker at all). That is the same
-    // "act on this, nobody can run it" signal as a stalled queue, so it shares the `no-worker` display
-    // (colour + attention banner). Unlike a stalled queue, a blocked run enqueues NOTHING, so there is
-    // no backlog to read `health` from — the group it's waiting on comes from the parked reason.
+    // protocol gap). That is the same "act on this, nobody can run it" signal as a stalled queue, so it
+    // shares the `no-worker` display (colour + attention banner). The persisted `run.error` carries no
+    // routing token, so the detail names the workflow.
     if (run.status === 'blocked') {
-      return { status: 'no-worker', detail: blockedGroup(run) };
+      return { status: 'no-worker', detail: run.workflow };
     }
     return { status: run.status };
   }

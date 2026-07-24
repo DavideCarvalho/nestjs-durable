@@ -244,15 +244,6 @@ export interface DurableModuleOptions {
    */
   maxRecoveryAttempts?: number;
   /**
-   * Park a run `blocked` (a loud, dashboard-visible "waiting for its worker pool" state) when a step
-   * is dispatched to a routing token with NO live worker, instead of enqueuing into a queue nobody
-   * consumes. Self-heals when the pool appears (the blocked-recovery poll re-drives). Default `false`
-   * (the durable-queue enqueue-before-worker contract is preserved). Turn it on for a control plane
-   * routing to tenant pools that can be offline. See `WorkflowEngineDeps.blockOnAbsentWorker`.
-   * Operator only.
-   */
-  blockOnAbsentWorker?: boolean;
-  /**
    * Opt-in liveness deadline (ms) for a remote (polyglot) workflow `advance`. If the worker neither
    * returns a decision nor sends a run-scoped heartbeat within this window, the engine presumes it dead
    * and lets recovery re-drive; each heartbeat rearms the window so a slow-but-alive worker is never
@@ -755,7 +746,6 @@ export class DurableModule {
               leaseMs: options.leaseMs,
               admission: options.admission,
               maxRecoveryAttempts: options.maxRecoveryAttempts,
-              blockOnAbsentWorker: options.blockOnAbsentWorker,
               remoteAdvanceSilenceMs: options.remoteAdvanceSilenceMs,
               instanceId: options.instanceId,
               namespace: options.namespace,

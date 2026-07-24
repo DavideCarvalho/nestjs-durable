@@ -356,17 +356,6 @@ export interface WorkflowEngineDeps {
    */
   blockedPollMs?: number | undefined;
   /**
-   * Opt-in: when a step is about to dispatch to a routing token with NO live worker at all (no
-   * heartbeat on the group), park the run `blocked` with a `worker.absent` reason instead of
-   * enqueuing into a queue nobody consumes. The blocked-recovery poll re-drives it the moment a worker
-   * appears (self-healing, same as the capability guard). This makes "a run is waiting because its
-   * tenant/worker pool is offline" a LOUD, dashboard-visible state rather than a job sitting silently
-   * in the queue. Default `false` — enqueue-before-the-worker-exists (the durable-queue contract) is
-   * preserved, so single-tenant and worker-deploys-after-API setups are unchanged. Turn it on for a
-   * control plane routing to tenant pools that may be offline.
-   */
-  blockOnAbsentWorker?: boolean | undefined;
-  /**
    * Build the public callback URL for a `ctx.webhook()` token (e.g.
    * ``(t) => `https://api.example.com/durable/webhooks/${t}` ``). Populates
    * {@link DurableWebhook.url}. Omit if you build URLs yourself from the token.
@@ -455,7 +444,6 @@ export class WorkflowEngine {
   private readonly remoteRedispatchMax: number;
   /** How long a `blocked` run waits before the recovery poll re-checks the live fleet (design §7.5). */
   private readonly blockedPollMs: number;
-  private readonly blockOnAbsentWorker: boolean;
   /** This engine's control-plane handshake descriptor — negotiated against each worker (design §7.3). */
   private readonly cpDescriptor: WorkerDescriptor;
   private readonly webhookUrl?: ((token: string) => string) | undefined;
@@ -545,7 +533,6 @@ export class WorkflowEngine {
     this.remoteRedispatchMs = deps.remoteRedispatchMs || undefined;
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
     this.blockedPollMs = deps.blockedPollMs ?? 5000;
-    this.blockOnAbsentWorker = deps.blockOnAbsentWorker ?? false;
     // The control-plane descriptor this engine negotiates against each worker's advertised descriptor
     // (design §7.3): it speaks the current protocol band and is scoped to this engine's namespace so a
     // pool-mismatched worker isn't considered. Capabilities empty — the CP routes, it doesn't execute.
@@ -2253,7 +2240,11 @@ export class WorkflowEngine {
    *  from registrations, shows once its workers beat). Empty when no transport can introspect health
    *  (only the BullMQ transport implements `groupHealth`). */
   async workerHealth(extra: string[] = []): Promise<GroupHealth[]> {
-    const groups = new Set([...this.knownGroups(extra), ...(await this.pool.listWorkerGroups())]);
+    const groups = new Set([
+      ...this.knownGroups(extra),
+      ...(await this.pool.listWorkerGroups()),
+      ...(await this.inflightStepGroups()),
+    ]);
     // Classify each group workflow-vs-step from the registry (authoritative — no name heuristic): a
     // group whose base token is a registered workflow serves a `@Workflow` body; anything else (an
     // in-process `@Step`, a remote `handle_*` step) is a step. A LOCAL workflow's queue token is
@@ -2273,6 +2264,31 @@ export class WorkflowEngine {
       out.push({ ...health, kind: workflowTokens.has(baseToken) ? 'workflow' : 'step' });
     }
     return out;
+  }
+
+  /**
+   * The routing groups of every in-flight run's still-`pending` remote step — the queues where work is
+   * dispatched and awaiting a worker. Folded into {@link workerHealth} so a step waiting on a group
+   * that is NEITHER a registration NOR heartbeating (the exact shape of a run stuck on an offline
+   * tenant pool) still reports its backlog: without this the health scan can't "see" that queue, and
+   * the dashboard shows the run as running instead of no-worker. Only the BullMQ transport introspects
+   * health, so on any other transport this is harmless (the groups just resolve to no `groupHealth`).
+   *
+   * Cost: one `listRuns` over the non-terminal runs plus a checkpoint read each — a diagnostic-path
+   * scan, not a hot path. Scoped to `running`/`suspended`/`blocked` (a `pending` run has dispatched no
+   * step yet) and deduped to distinct groups.
+   */
+  private async inflightStepGroups(): Promise<string[]> {
+    const inflight = await this.store.listRuns({ statuses: ['running', 'suspended', 'blocked'] });
+    const groups = new Set<string>();
+    for (const run of inflight) {
+      for (const cp of await this.store.listCheckpoints(run.id)) {
+        if (cp.kind === 'remote' && cp.status === 'pending' && cp.workerGroup) {
+          groups.add(cp.workerGroup);
+        }
+      }
+    }
+    return [...groups];
   }
 
   /**
@@ -3584,31 +3600,6 @@ export class WorkflowEngine {
   private async ensureRoutable(token: string, requires: string[] | undefined): Promise<void> {
     const plan = await this.planRoute(token, requires);
     if (plan?.status === 'blocked') throw new WorkflowBlocked(plan);
-    // Opt-in liveness gate (see {@link WorkflowEngineDeps.blockOnAbsentWorker}): a `routable` plan
-    // already proved a live worker exists, so only check when the capability guard didn't engage (no
-    // descriptors — legacy OR nobody there). A live LEGACY worker (heartbeat, no descriptor) still
-    // passes `transportWithLiveGroup`, so only a genuinely EMPTY group parks — a loud "waiting for its
-    // pool" state that self-heals via the blocked-recovery poll when a worker appears.
-    if (
-      this.blockOnAbsentWorker &&
-      plan === undefined &&
-      !(await this.pool.transportWithLiveGroup(token))
-    ) {
-      throw new WorkflowBlocked({
-        status: 'blocked',
-        code: 'worker.absent',
-        reason: `blocked: no live worker on "${token}" — waiting for its pool to appear`,
-        requires: requires ?? [],
-        diagnostics: {
-          code: 'worker.absent',
-          token,
-          requires: requires ?? [],
-          liveWorkers: 0,
-          controlPlane: this.cpDescriptor,
-          workers: [],
-        },
-      });
-    }
   }
 
   /**
