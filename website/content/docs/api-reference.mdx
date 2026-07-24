@@ -190,6 +190,22 @@ Related helpers: `currentWorkflowCtx()` returns the ambient `WorkflowCtx` on the
 async path (or `undefined` outside one); `bindWorkflowClass(ctor, client)` is what the registrar
 calls at boot to bind each class to the engine that registered it.
 
+## Ambient step logger
+
+Context-local access to the running step's `StepLogger`, so code deep inside a handler can record
+events without the logger being threaded through every signature. See
+[Emitting from deep inside a step](/docs/concepts/workflows-and-steps#emitting-from-deep-inside-a-step).
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `currentStep` | `currentStep(): StepLogger \| undefined` | The logger of the step running on this async path — `undefined` outside one. Concurrent steps each see their own. |
+| `runInStepLogger` | `runInStepLogger<T>(logger: StepLogger, fn: () => T): T` | Engine-internal: binds the SAME logger the step body receives as its second argument. |
+| `debug` `info` `warn` `error` | `(message: string, data?: unknown): void` | Per-level shortcuts, one per method on `StepLogger`. The idiomatic form when the level is known at the call site. No-op outside a step. |
+| `log` | `log(level: 'debug' \| 'info' \| 'warn' \| 'error', message: string, data?: unknown): void` | Same emission with the level as a **value** — literal twin of the Python SDK's `log(level, …)`. Reach for it when the level is computed. No-op outside a step. |
+| `sub` | `sub(name: string, status: 'ok' \| 'failed' \| 'skipped', message?: string, data?: unknown): void` | No-op outside a step. |
+| `subEvent` | `subEvent(e: { id; name; group?; phase?; status?; message?; data? }): void` | No-op outside a step. |
+| `subProcess` | `subProcess<T>(name: string, body: (sp: SubProcessHandle) => Promise<T> \| T, opts?: { group?; id? }): Promise<T>` | Outside a step the body still **runs** (and still gets a handle); only the emission disappears. |
+
 ## WorkflowService
 
 Injectable NestJS-facing entry point (`packages/nestjs/src/workflow.service.ts`) — a thin pass-through

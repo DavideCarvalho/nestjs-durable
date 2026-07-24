@@ -292,6 +292,51 @@ Rule of thumb: if you want each unit to **retry or replay independently**, make 
 [child workflow](/docs/authoring/child-workflows) when it has its own internal steps you want to see).
 If you only want to **see** what happened inside one durable unit, emit **sub-process events**.
 
+### Emitting from deep inside a step
+
+The second argument only reaches the handler itself. When the code that actually knows the progress
+lives a few layers down — a shared batch inserter, an HTTP client, a parser — threading the logger
+through every signature on the way is the wrong trade. `currentStep()` reads the logger of the step
+running on the current async path instead (an `AsyncLocalStorage`, so concurrent step invocations
+never see each other's):
+
+```ts
+import { currentStep, subProcess } from '@dudousxd/nestjs-durable-core';
+
+// A generic utility. It takes no logger, and its callers were not edited.
+async function insertRows(rows: Row[]) {
+  for (const chunk of chunks(rows, 100)) {
+    await db.insert(chunk);
+    currentStep()?.subEvent({ id: 'insert', name: 'insert', phase: `${done} rows` });
+  }
+}
+```
+
+Module-level shortcuts cover the rest of the logger surface: `sub(...)`, `subEvent(...)` and
+`subProcess(name, body, opts?)`.
+
+Log lines come in two spellings, and both are supported on purpose:
+
+```ts
+import { info, log, warn } from '@dudousxd/nestjs-durable-core';
+
+info('parsed header');                 // level known at the call site — the idiomatic TS form,
+warn('row 42 skipped', { reason });    // one function per StepLogger method
+
+log(mapLevel(record.severity), record.message); // level computed — the Python-symmetric form
+```
+
+`debug` / `info` / `warn` / `error` are the per-level shortcuts, mirroring the same four methods on a
+`StepLogger` instance so ambient code reads exactly like code that was handed one. `log(level, …)`
+takes the level as a **value** — the literal twin of the Python SDK's `log(level, message, data)` —
+which is what you want when the level comes from data rather than from the source line. Neither
+subsumes the other, so pick by where the level comes from.
+
+**Outside a step everything is a no-op** — `currentStep()` is `undefined`, `log`/`sub`/`subEvent` do
+nothing, and `subProcess` still runs its body but emits nothing. That is deliberate: it is what lets
+a utility be instrumented once and stay usable on a non-durable path and in unit tests, with no `if`
+at the call site.
+
 ## Step interceptors
 
 For cross-cutting concerns around step execution — timing, structured logging, tracing, error

@@ -20,6 +20,7 @@ import type {
 import {
   createStepLogger,
   parseDuration,
+  runInStepLogger,
   stepNameOf,
   workflowName,
 } from '@dudousxd/nestjs-durable-core';
@@ -312,7 +313,9 @@ export class WorkflowContext implements WorkflowCtx {
     this.emitStep({ runId, seq, name, phase: 'running', startedAt, parallelGroup });
 
     try {
-      const result = await body(log);
+      // Bind the SAME sink ambiently too, so a helper deep inside the body can emit via
+      // `currentStep()` without the handle being threaded down (see core's `ambient-step.ts`).
+      const result = await runInStepLogger(log, () => body(log));
       const finishedAt = Date.now();
       const cmd: WorkflowCommand = {
         kind: 'recordStep',

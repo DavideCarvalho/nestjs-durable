@@ -1,5 +1,6 @@
 export * from './admission';
 export * from './ambient-ctx';
+export * from './ambient-step';
 export * from './control-flow-signal';
 export * from './durable-workflow';
 export * from './duration';

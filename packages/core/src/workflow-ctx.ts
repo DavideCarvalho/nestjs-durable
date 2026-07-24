@@ -1,3 +1,4 @@
+import { runInStepLogger } from './ambient-step';
 import { backoffDelay } from './backoff';
 import { instantCheckpoint } from './checkpoints';
 import { unwrapCompletion } from './completion';
@@ -259,7 +260,13 @@ export function createWorkflowCtx(
           seq: current,
           attempt,
         };
-        const body = () => fn(createStepLogger(events, host.clock));
+        // The SAME logger goes to the body's argument and into the ambient storage, so code deep
+        // inside the step emits into this attempt's `events` without the handle being threaded
+        // down through every signature (see `ambient-step.ts`).
+        const body = () => {
+          const logger = createStepLogger(events, host.clock);
+          return runInStepLogger(logger, () => fn(logger));
+        };
         const output = host.interceptStep
           ? await host.interceptStep(invocation, body)
           : await body();
