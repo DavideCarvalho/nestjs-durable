@@ -1,3 +1,4 @@
+import { runInStepLogger } from './ambient-step';
 import type { RemoteTask, StepEvent, StepLogger, StepResult } from './interfaces';
 import { createStepLogger } from './step-logger';
 
@@ -38,7 +39,10 @@ export async function runStepHandler(
   const withEvents = (result: StepResult): StepResult =>
     events.length > 0 ? { ...result, events } : result;
   try {
-    const output = await handler(task.input, createStepLogger(events, Date.now));
+    // The SAME logger goes to the handler's second argument and into the ambient storage, so a
+    // helper buried under the handler emits into this step's `events` without being handed one.
+    const logger = createStepLogger(events, Date.now);
+    const output = await runInStepLogger(logger, () => handler(task.input, logger));
     return withEvents({ ...base, status: 'completed', output });
   } catch (err) {
     // Carry `code`/`retryable` off the thrown error if present, so the engine's durable retry can

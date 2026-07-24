@@ -1,5 +1,5 @@
 import type { RemoteTask, StepEvent, StepResult } from '@dudousxd/nestjs-durable-core';
-import { createStepLogger } from '@dudousxd/nestjs-durable-core';
+import { createStepLogger, runInStepLogger } from '@dudousxd/nestjs-durable-core';
 import { toError } from './errors';
 import type { StepLog } from './workflow-context';
 
@@ -56,7 +56,9 @@ export class StepWorker {
     const events: StepEvent[] = [];
     const log = createStepLogger(events, () => Date.now());
     try {
-      const output = await handler(task.input, log);
+      // Bind the SAME sink ambiently too, so a helper deep inside the handler can emit via
+      // `currentStep()` without the handle being threaded down (see core's `ambient-step.ts`).
+      const output = await runInStepLogger(log, () => handler(task.input, log));
       const result: StepResult = { ...base, status: 'completed', output };
       if (events.length > 0) result.events = events;
       return result;
