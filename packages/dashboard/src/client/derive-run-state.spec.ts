@@ -100,6 +100,19 @@ describe('deriveRunState', () => {
     ).toBe('completed');
   });
 
+  it('surfaces a `blocked` run (no capable worker) as no-worker, named by its workflow', () => {
+    const s = deriveRunState(
+      run({
+        status: 'blocked',
+        error: { message: 'blocked: no compatible worker (requires saga)' },
+      }),
+      { runs: [], health: withWorker },
+    );
+    // Same warm "act on this" treatment as a stalled queue — both mean "nobody can run this yet".
+    expect(s.status).toBe('no-worker');
+    expect(s.detail).toBe('pipeline');
+  });
+
   it('names an event wait: signal / webhook / child', () => {
     const s = deriveRunState(run({ waiting: { on: 'signal', name: 'approve' } }), {
       runs: [],

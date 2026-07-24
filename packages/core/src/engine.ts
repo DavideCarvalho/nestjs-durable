@@ -181,6 +181,23 @@ interface RegisteredWorkflow {
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
 
+/**
+ * The routing token a dispatched step lands on: the step's own name, suffixed by the tenant the RUN
+ * belongs to. `runNamespace` — not the executing engine's namespace — is the tenant axis, because an
+ * operator (namespace unset) drives runs of EVERY tenant: deriving the token from the engine would
+ * send a tenant's work to the operator's own bare pool. This mirrors what an out-of-process worker
+ * already does for the bodies it replays (it stamps its own partition onto each emitted `call`
+ * command, see the worker SDK's `resolveCallGroup`) — the in-process executor had no equivalent,
+ * which is exactly the gap this closes.
+ *
+ * An explicit {@link StepDef.partition} still wins, so a step pinned to a dedicated pool stays pinned.
+ * `tenantGroup` maps `undefined`/`''`/`'default'` to the BARE token, so a single-tenant deployment
+ * (and every `default`-namespace run) keeps byte-identical wire names.
+ */
+function stepGroup(step: { name: string; partition?: string | undefined }, runNamespace?: string) {
+  return tenantGroup(sanitizeQueueToken(step.name), step.partition ?? runNamespace);
+}
+
 /** The id for the next continuation of a run: `r` → `r~1` → `r~2` … (stable, traceable lineage). */
 function nextContinuationId(runId: string): string {
   const m = runId.match(/^(.*)~(\d+)$/);
@@ -2223,7 +2240,11 @@ export class WorkflowEngine {
    *  from registrations, shows once its workers beat). Empty when no transport can introspect health
    *  (only the BullMQ transport implements `groupHealth`). */
   async workerHealth(extra: string[] = []): Promise<GroupHealth[]> {
-    const groups = new Set([...this.knownGroups(extra), ...(await this.pool.listWorkerGroups())]);
+    const groups = new Set([
+      ...this.knownGroups(extra),
+      ...(await this.pool.listWorkerGroups()),
+      ...(await this.inflightStepGroups()),
+    ]);
     // Classify each group workflow-vs-step from the registry (authoritative — no name heuristic): a
     // group whose base token is a registered workflow serves a `@Workflow` body; anything else (an
     // in-process `@Step`, a remote `handle_*` step) is a step. A LOCAL workflow's queue token is
@@ -2243,6 +2264,31 @@ export class WorkflowEngine {
       out.push({ ...health, kind: workflowTokens.has(baseToken) ? 'workflow' : 'step' });
     }
     return out;
+  }
+
+  /**
+   * The routing groups of every in-flight run's still-`pending` remote step — the queues where work is
+   * dispatched and awaiting a worker. Folded into {@link workerHealth} so a step waiting on a group
+   * that is NEITHER a registration NOR heartbeating (the exact shape of a run stuck on an offline
+   * tenant pool) still reports its backlog: without this the health scan can't "see" that queue, and
+   * the dashboard shows the run as running instead of no-worker. Only the BullMQ transport introspects
+   * health, so on any other transport this is harmless (the groups just resolve to no `groupHealth`).
+   *
+   * Cost: one `listRuns` over the non-terminal runs plus a checkpoint read each — a diagnostic-path
+   * scan, not a hot path. Scoped to `running`/`suspended`/`blocked` (a `pending` run has dispatched no
+   * step yet) and deduped to distinct groups.
+   */
+  private async inflightStepGroups(): Promise<string[]> {
+    const inflight = await this.store.listRuns({ statuses: ['running', 'suspended', 'blocked'] });
+    const groups = new Set<string>();
+    for (const run of inflight) {
+      for (const cp of await this.store.listCheckpoints(run.id)) {
+        if (cp.kind === 'remote' && cp.status === 'pending' && cp.workerGroup) {
+          groups.add(cp.workerGroup);
+        }
+      }
+    }
+    return [...groups];
   }
 
   /**
@@ -3378,7 +3424,9 @@ export class WorkflowEngine {
     replay?: Map<number, StepCheckpoint>,
   ): Promise<void> {
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
-    const group = tenantGroup(sanitizeQueueToken(def.name), def.partition);
+    // The undo belongs to the tenant that ran the step it undoes — route it off the RUN, never off
+    // the executing engine (see {@link stepGroup}).
+    const group = stepGroup(def, run.namespace);
     const enqueuedAt = new Date();
     const cp = stepCheckpoint({
       runId: run.id,
@@ -3421,8 +3469,13 @@ export class WorkflowEngine {
       startStep: (s) => this.startStep(s),
       completeStep: (s) => this.completeStep(s),
       failStep: (s) => this.failStep(s),
+      // Route the dispatch by the RUN's tenant (same reason as `startChild` below): the executing
+      // engine may be an operator driving every namespace, so the token must come from the run, not
+      // from this engine. See {@link stepGroup}.
       callRemote: (runId, seq, step, input, queue, transport, admission) =>
-        this.callRemote(runId, seq, step, input, queue, transport, replay, admission),
+        this.callRemote(runId, seq, step, input, queue, transport, replay, admission, {
+          namespace: parentNamespace,
+        }),
       // Defer so a fast child can't reentrantly resume a still-running parent. Stamp the child with
       // the PARENT run's namespace (not this engine's) so a child belongs to the tenant/partition of
       // the run it was spawned from — even when an operator (namespace: undefined, drives every
@@ -3613,7 +3666,9 @@ export class WorkflowEngine {
     transport?: string,
     replay?: Map<number, StepCheckpoint>,
     admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
+    routing?: { namespace?: string | undefined },
   ): Promise<TOutput> {
+    const group = stepGroup(step, routing?.namespace);
     // Read the prefix from the per-execution snapshot (avoids the O(N²) replay SELECTs); a seq absent
     // from the snapshot — not yet dispatched, or written after the snapshot — falls back to the store.
     const existing = replay?.get(seq) ?? (await this.store.getCheckpoint(runId, seq));
@@ -3626,7 +3681,7 @@ export class WorkflowEngine {
     // presumed-dead worker). Without one, the call SUSPENDS DURABLY: dispatch, persist a `pending`
     // checkpoint, and let the result resume the run on whichever instance receives it — so a worker
     // pod can scale down or crash mid-step without losing the run or re-running completed work.
-    if (step.timeoutMs) return this.callRemoteInMemory(runId, seq, step, input, transport);
+    if (step.timeoutMs) return this.callRemoteInMemory(runId, seq, step, input, transport, group);
     if (existing?.status === 'pending') {
       // Dispatched; normally we just keep waiting for the result to resume the run. But a LOST dispatch
       // (worker crashed with no result, or the transport dropped the job) would hang here forever — a
@@ -3668,7 +3723,7 @@ export class WorkflowEngine {
         seq,
         name: step.name,
         stepId: existing.stepId ?? stepId(runId, seq),
-        group: existing.workerGroup ?? tenantGroup(sanitizeQueueToken(step.name), step.partition),
+        group: existing.workerGroup ?? group,
         input: existing.input,
         priority: admission?.priority,
         attempt: reAttempt,
@@ -3702,10 +3757,7 @@ export class WorkflowEngine {
     // recovery poll) so it neither dispatches into a queue nobody consumes nor leaves a `pending` row a
     // later re-drive mistakes for "already dispatched". No descriptors published → guard skipped, the
     // legacy fleet keeps flowing (design §7.7).
-    await this.ensureRoutable(
-      tenantGroup(sanitizeQueueToken(step.name), step.partition),
-      step.requires,
-    );
+    await this.ensureRoutable(group, step.requires);
 
     const id = stepId(runId, seq);
     // Flow control: a queued call that can't be admitted (concurrency/rate) does NOT dispatch — the
@@ -3743,7 +3795,7 @@ export class WorkflowEngine {
       status: 'pending',
       input,
       attempts: attempt,
-      workerGroup: tenantGroup(sanitizeQueueToken(step.name), step.partition),
+      workerGroup: group,
       enqueuedAt,
       startedAt: enqueuedAt, // placeholders until the worker result lands
       finishedAt: enqueuedAt,
@@ -3753,7 +3805,7 @@ export class WorkflowEngine {
       seq,
       name: step.name,
       stepId: id,
-      group: tenantGroup(sanitizeQueueToken(step.name), step.partition),
+      group,
       input,
       priority: admission?.priority,
       attempt,
@@ -3943,6 +3995,8 @@ export class WorkflowEngine {
     step: StepDef<TInput, TOutput>,
     input: TInput,
     transport?: string,
+    /** The run-tenant-aware routing token, computed by {@link callRemote} (see {@link stepGroup}). */
+    group = stepGroup(step, undefined),
   ): Promise<TOutput> {
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
     // Capability/protocol routing guard (handshake design §7.5), same as the durable `callRemote` path:
@@ -3951,10 +4005,7 @@ export class WorkflowEngine {
     // `WorkflowBlocked` — the run-execution catch parks the run `blocked` instead of dispatching into a
     // queue nobody consumes (this `timeoutMs` path would otherwise burn its liveness window + retries
     // waiting on a worker that can't run it). No descriptors published → guard skipped (legacy, §7.7).
-    await this.ensureRoutable(
-      tenantGroup(sanitizeQueueToken(step.name), step.partition),
-      step.requires,
-    );
+    await this.ensureRoutable(group, step.requires);
     // A bare `@Step()` (no `input`/`output` schemas attached) skips validation.
     const validInput = step.input ? step.input.parse(input) : input;
     const id = stepId(runId, seq);
@@ -3978,7 +4029,7 @@ export class WorkflowEngine {
           seq,
           name: step.name,
           stepId: id,
-          group: tenantGroup(sanitizeQueueToken(step.name), step.partition),
+          group,
           input: validInput,
           traceparent: this.traceparent?.(),
           context: this.context?.(),
@@ -4005,7 +4056,7 @@ export class WorkflowEngine {
           output,
           events: resolution.events,
           attempts: attempt,
-          workerGroup: tenantGroup(sanitizeQueueToken(step.name), step.partition),
+          workerGroup: group,
           enqueuedAt,
           startedAt,
         });

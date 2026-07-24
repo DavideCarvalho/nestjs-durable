@@ -182,6 +182,13 @@ export function deriveRunState(
     if (run.status === 'pending' && groupIsStalled(run.workflow, ctx.health)) {
       return { status: 'no-worker', detail: run.workflow };
     }
+    // The engine parked this run `blocked`: no live worker can serve its next dispatch (a capability /
+    // protocol gap). That is the same "act on this, nobody can run it" signal as a stalled queue, so it
+    // shares the `no-worker` display (colour + attention banner). The persisted `run.error` carries no
+    // routing token, so the detail names the workflow.
+    if (run.status === 'blocked') {
+      return { status: 'no-worker', detail: run.workflow };
+    }
     return { status: run.status };
   }
 

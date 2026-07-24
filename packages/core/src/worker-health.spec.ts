@@ -100,4 +100,46 @@ describe('engine.workerHealth', () => {
     expect(kindByGroup.get('PipelineWorkflow.bustBaseCache')).toBe('step');
     expect(kindByGroup.get('handle_mel_dep_procs')).toBe('step');
   });
+
+  it('covers the group of an in-flight PENDING remote step, even with no registration and no heartbeat', async () => {
+    const store = new InMemoryStateStore();
+    // The tenant's step queue: it has the stuck job (depth 1) and NO live worker — the exact signal a
+    // run waiting on an offline tenant produces. The group is neither a registration nor heartbeating,
+    // so it is discoverable ONLY from the in-flight run's pending checkpoint.
+    const transport = new HealthTransport(
+      { 'ingest@jordi-local': { group: 'ingest@jordi-local', depth: 1, liveWorkers: [] } },
+      [], // no live heartbeats anywhere
+    );
+    const engine = new WorkflowEngine({ store, transport });
+
+    const now = new Date();
+    await store.createRun({
+      id: 'r1',
+      workflow: 'pipeline',
+      workflowVersion: '1',
+      status: 'suspended',
+      namespace: 'jordi-local',
+      input: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+    await store.saveCheckpoint({
+      runId: 'r1',
+      seq: 0,
+      name: 'ingest',
+      kind: 'remote',
+      status: 'pending',
+      attempts: 1,
+      workerGroup: 'ingest@jordi-local',
+      startedAt: now,
+      finishedAt: now,
+      enqueuedAt: now,
+    });
+
+    const health = await engine.workerHealth();
+    const stuck = health.find((h) => h.group === 'ingest@jordi-local');
+    expect(stuck?.depth).toBe(1);
+    expect(stuck?.liveWorkers).toHaveLength(0); // depth>0, no worker -> the dashboard's no-worker state
+    expect(stuck?.kind).toBe('step');
+  });
 });

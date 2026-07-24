@@ -12,7 +12,13 @@ import { isDrivingOperator } from './role';
 
 /** A transport that can run step handlers in-process (e.g. the event-emitter transport). */
 interface LocalTaskHandling {
-  handle(name: string, fn: (input: unknown, log: StepLogger) => Promise<unknown> | unknown): void;
+  handle(
+    name: string,
+    fn: (input: unknown, log: StepLogger) => Promise<unknown> | unknown,
+    /** Isolation partition to SERVE — the queue token is `tenantGroup(sanitizeQueueToken(name),
+     *  partition)`. Omitted (or undefined) keeps the transport's own constructor partition. */
+    partition?: string | undefined,
+  ): void;
 }
 
 function supportsHandle(transport: unknown): transport is LocalTaskHandling {
@@ -55,8 +61,12 @@ export class DurableStepRegistrar implements OnModuleInit {
     const transport = this.transport;
 
     // Forward the step logger as a second arg; methods that only declare `(input)` ignore it.
+    // The partition is the node's own tenant axis (`topology: { role: 'control-plane', tenant }`
+    // resolves it, see `resolveTopology`): this engine DISPATCHES a tenant run's steps to
+    // `<name>@<tenant>`, so its in-process handlers must SERVE that same token. Undefined on a global
+    // operator — the bare token, byte-identical to before.
     scanSteps(this.discovery, this.metadataScanner, (meta, handler) =>
-      transport.handle(meta.name, handler),
+      transport.handle(meta.name, handler, this.options.partition),
     );
   }
 }

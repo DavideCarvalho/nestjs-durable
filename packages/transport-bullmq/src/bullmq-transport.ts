@@ -503,11 +503,14 @@ export class BullMQTransport implements Transport, ControlPlane {
    * {@link tenantGroup}/{@link sanitizeQueueToken}), never a single queue shared across handlers.
    * Re-registering an already-`handle()`d name just swaps the handler fn; its worker is untouched.
    */
-  handle(name: string, fn: StepHandler): void {
+  handle(name: string, fn: StepHandler, partition?: string | undefined): void {
     this.handlers.set(name, fn);
     if (this.taskWorkers.has(name)) return;
     const controller = this.controller();
-    const routingToken = tenantGroup(sanitizeQueueToken(name), this.partition);
+    // A per-registration `partition` overrides this instance's own: a tenant-scoped control plane
+    // shares ONE transport for dispatch AND for serving its handlers, and its handlers must subscribe
+    // the `<name>@<tenant>` token its engine dispatches to. Omitted → the constructor partition.
+    const routingToken = tenantGroup(sanitizeQueueToken(name), partition ?? this.partition);
     const worker = new Worker(this.tasksName(routingToken), (job) => this.runTask(job.data), {
       connection: this.workerConnection(),
       concurrency: controller.initialLimit,

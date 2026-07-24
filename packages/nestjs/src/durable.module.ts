@@ -529,6 +529,24 @@ function assertValidTopology(options: DurableModuleOptions): void {
  * unset `topology` (existing behavior, zero change).
  */
 function resolveTopology(options: DurableModuleOptions): DurableModuleOptions {
+  return servingPartition(resolveTopologyPreset(options));
+}
+
+/**
+ * Fill the WORKER-side `partition` from this node's own `namespace` when it wasn't declared. The two
+ * are one axis on the wire: the engine dispatches a run's steps to `<name>@<run.namespace>` (core's
+ * `stepGroup`), so a node that stamps its runs with a namespace must SERVE the matching token or it
+ * enqueues into queues nobody consumes. This is what keeps the documented local-dev recipe
+ * (`docs/namespaces.md` — a namespaced engine on a private Redis) working with no extra wiring.
+ *
+ * An explicit `partition` always wins, so a node deliberately serving a different pool stays put.
+ */
+function servingPartition(options: DurableModuleOptions): DurableModuleOptions {
+  if (options.partition !== undefined || options.namespace === undefined) return options;
+  return { ...options, partition: options.namespace };
+}
+
+function resolveTopologyPreset(options: DurableModuleOptions): DurableModuleOptions {
   const topology = options.topology;
   if (topology === undefined) return options;
   if (topology.role === 'control-plane') {
@@ -537,8 +555,18 @@ function resolveTopology(options: DurableModuleOptions): DurableModuleOptions {
     // The namespace stays a STORE-side axis: the engine stamps runs with it and routes their work
     // via `@<tenant>` GROUP suffixes on the transport's own prefix (the cross-SDK convention every
     // tenant worker speaks natively) — it never re-scopes the transport keyspace.
-    if (topology.tenant === undefined || options.namespace !== undefined) return options;
-    return { ...options, namespace: topology.tenant };
+    if (topology.tenant === undefined) return options;
+    return {
+      ...options,
+      // An explicit `namespace` is already validated equal to `tenant` (assertValidTopology), so
+      // keeping it is a no-op rather than a conflict.
+      namespace: options.namespace ?? topology.tenant,
+      // The tenant is ALSO this node's worker-routing suffix: its engine now dispatches a run's steps
+      // to `<name>@<tenant>` (core's `stepGroup`), so its own co-located worker must SUBSCRIBE those
+      // same tokens. Without this the node would dispatch into queues it is not itself listening on.
+      // `partition` is user-forbidden on this role (assertValidTopology), so we own it here.
+      partition: topology.tenant,
+    };
   }
   if (options.partition !== undefined) return options;
   return { ...options, partition: topology.tenant };

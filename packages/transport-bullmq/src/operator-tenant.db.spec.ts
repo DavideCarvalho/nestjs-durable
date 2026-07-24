@@ -110,10 +110,12 @@ describe('operator ↔ tenant e2e (real Redis) [testcontainers]', () => {
     runtime.registerWorkflow(workflow, async () => ({ handledBy: 'tenant-worker', tenant }));
     const tenantWorker: RunningWorker = await runRedisWorker({
       runtime,
-      group: workflow,
-      tenant,
       connection: liveConnectionValue,
       prefix,
+      // Pre-existing rot, unrelated to tenant step routing: this called the long-removed
+      // `{ group, tenant }` option shape, which `runRedisWorker` ignored — so the worker came up on
+      // the BARE `w` token and `w@t1` never went live. The axis is `partition`.
+      partition: tenant,
     });
 
     // --- operator: namespace UNSET (drives every tenant), on the bare/shared prefix ---
@@ -176,6 +178,73 @@ describe('operator ↔ tenant e2e (real Redis) [testcontainers]', () => {
       expect(recovered.output).toEqual({ handledBy: 'tenant-worker', tenant });
     } finally {
       await tenantWorker.close();
+      await operatorTransport.close();
+    }
+  }, 30_000);
+
+  // Regression: the case above routes by CONVENTION (nothing registered locally). This one covers the
+  // hybrid that broke — the operator has the workflow registered LOCALLY (an app that registers every
+  // @Workflow app-wide, so its API pods can start runs), so it executes the body in-process. Its
+  // dispatched STEP used to fall back to the BARE token and get executed by whatever pool shares the
+  // broker — the deployed cluster — instead of the tenant's own workers.
+  it("a locally-registered body executed in-process still dispatches its step to the TENANT's pool", async (ctx) => {
+    const liveConnectionValue = liveConnection(ctx);
+    const prefix = `durtest-hybrid-${Date.now()}`;
+    const workflow = 'pipeline';
+    const step = 'IngestionRead.run';
+    const tenant = 'jordi-local';
+    const executedBy: string[] = [];
+
+    // --- the tenant's own worker: serves `<step>@jordi-local` ---
+    const tenantRuntime = new DurableWorkerRuntime({ workflowGroup: tenant });
+    tenantRuntime.registerStep(step, async () => {
+      executedBy.push('tenant');
+      return { from: 'tenant' };
+    });
+    const tenantWorker: RunningWorker = await runRedisWorker({
+      runtime: tenantRuntime,
+      connection: liveConnectionValue,
+      prefix,
+      partition: tenant,
+      instanceId: 'ts-tenant-laptop',
+    });
+
+    // --- the deployed cluster's worker: serves the BARE token on the SAME broker ---
+    const clusterRuntime = new DurableWorkerRuntime();
+    clusterRuntime.registerStep(step, async () => {
+      executedBy.push('cluster');
+      return { from: 'cluster' };
+    });
+    const clusterWorker: RunningWorker = await runRedisWorker({
+      runtime: clusterRuntime,
+      connection: liveConnectionValue,
+      prefix,
+      instanceId: 'ts-cluster-pod',
+    });
+
+    // --- the global operator, WITH the workflow registered locally ---
+    const store = new InMemoryStateStore();
+    const operatorTransport = new BullMQTransport({ connection: liveConnectionValue, prefix });
+    const operator = new WorkflowEngine({ store, transport: operatorTransport });
+    let ranInProcess = false;
+    operator.register(workflow, '1', async (c) => {
+      ranInProcess = true;
+      return await c.step(step, { file: 'tenant-upload.mp4' });
+    });
+
+    try {
+      await waitForLiveGroup(operatorTransport, tenantGroup(step, tenant));
+      await waitForLiveGroup(operatorTransport, step);
+
+      await operator.start(workflow, {}, 'run-hybrid-1', { namespace: tenant });
+      const run = await settle(store, 'run-hybrid-1');
+
+      expect(run.status).toBe('completed');
+      expect(ranInProcess).toBe(true); // the body DID run on the operator (unchanged by design)
+      expect(executedBy).toEqual(['tenant']); // ...but its step ran on the tenant's pool, not the cluster's
+    } finally {
+      await tenantWorker.close();
+      await clusterWorker.close();
       await operatorTransport.close();
     }
   }, 30_000);
