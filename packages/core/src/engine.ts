@@ -1284,8 +1284,9 @@ export class WorkflowEngine {
     if (this.draining) return [];
     const results: RunResult[] = [];
     for (const run of await this.store.listIncompleteRuns(this.namespace)) {
-      // A live worker renews its lease, so an acquirable lease means the run is genuinely orphaned
-      // (its worker crashed). Skip the ones still owned.
+      // An IN-PROCESS turn renews its lease, so an acquirable lease means no turn is executing this
+      // run right now. Skip the ones still owned. NOTE this is NOT the same as "the worker crashed" —
+      // see the dispatched-step guard below for the case it doesn't cover.
       const acquired = await this.store.tryLockRun(
         run.id,
         this.instanceId,
@@ -1293,6 +1294,35 @@ export class WorkflowEngine {
         nowMs,
       );
       if (!acquired) continue;
+      // NOT AN ORPHAN: a run with an in-flight (`pending`) remote step is not being executed in
+      // process at all — its work is sitting on the transport, run by a worker that holds NO run
+      // lease. So "the lease is acquirable" proves nothing about it, and by contract such a run is
+      // durably SUSPENDED (see `StepCheckpoint.status`), not `running`; finding it `running` means a
+      // turn ended without restoring that invariant. Counting it as a crash-recovery attempt burns
+      // the poison-pill budget on a perfectly healthy run — repeat it `maxRecoveryAttempts` times and
+      // the run is dead-lettered with a generic `max_recovery_attempts` error WHILE its worker is
+      // still happily executing the step (observed in the wild: 10 attempts in 57s). Re-assert the
+      // contract instead — park it `suspended` on the reconcile timer, which is exactly where a
+      // dispatched-and-waiting run belongs: the worker's result resumes it, and `resumeDueTimers`
+      // re-drives it as the safety net (replaying straight back to `callRemote`'s pending guard, or
+      // re-dispatching when `remoteRedispatchMs` is set). A LOST dispatch is still not this pass's
+      // job — `remoteRedispatchMs` / `redispatchPending` own that, unchanged.
+      //
+      // `cancelling` is deliberately excluded: it must keep its status (see below), so it stays on
+      // the counted path rather than being parked `suspended` and losing the cancel intent.
+      if (run.status === 'running') {
+        const dispatched = await this.inFlightRemoteStep(run.id);
+        if (dispatched) {
+          await this.store.updateRun(run.id, {
+            status: 'suspended',
+            wakeAt: this.reconcileWakeAt(dispatched.wakeAt ?? undefined),
+            updatedAt: new Date(),
+          });
+          await this.store.releaseRunLock(run.id);
+          results.push({ runId: run.id, status: 'suspended' });
+          continue;
+        }
+      }
       // Count the attempt / dead-letter a poison pill past maxRecoveryAttempts.
       const settled = await this.countRecovery(run);
       if (settled) {
@@ -1315,6 +1345,17 @@ export class WorkflowEngine {
       });
     }
     return results;
+  }
+
+  /**
+   * The remote step this run dispatched and is still awaiting a result for, if any — the signature
+   * that tells {@link recoverIncomplete} "this run's work is ON THE TRANSPORT, not in a crashed
+   * process". A `pending` remote checkpoint is written BEFORE the dispatch and settled by the
+   * worker's result, so its presence is the durable marker of an in-flight dispatched step.
+   */
+  private async inFlightRemoteStep(runId: string): Promise<StepCheckpoint | undefined> {
+    const checkpoints = await this.store.listCheckpoints(runId);
+    return checkpoints.find((cp) => cp.kind === 'remote' && cp.status === 'pending');
   }
 
   /**
@@ -1549,9 +1590,11 @@ export class WorkflowEngine {
    * Explicitly re-dispatch every remote step of `runId` stuck `pending` — the OPERATOR escape hatch for
    * a run whose dispatched step job was LOST (worker crashed with no result, or a transport that dropped
    * the job). No automatic recovery re-drives these: a reconcile re-drive re-suspends a still-pending
-   * step by design (unless `remoteRedispatchMs` is set), `recoverIncomplete` only reclaims LEASED runs,
-   * and `requeue` just replays back to the pending guard. This re-enqueues the same `stepId` so the
-   * (idempotent) step re-runs and its result resumes the run. Safe to call on a healthy run — it re-runs
+   * step by design (unless `remoteRedispatchMs` is set), `recoverIncomplete` explicitly SKIPS a run with
+   * an in-flight `pending` remote step (it re-asserts the durably-suspended invariant instead of counting
+   * a recovery attempt — see there), and `requeue` just replays back to the pending guard. This
+   * re-enqueues the same `stepId` so the (idempotent) step re-runs and its result resumes the run.
+   * Safe to call on a healthy run — it re-runs
    * only in-flight `pending` remote steps, which are idempotent by the durable contract. Returns the
    * run's current status (with the count re-dispatched), or null if the run is unknown.
    */
