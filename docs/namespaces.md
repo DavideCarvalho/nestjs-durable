@@ -42,7 +42,8 @@ To fully isolate two setups on a shared store, you need **both**: a distinct `na
 distinct Redis/prefix. Namespace alone leaves the queues shared.
 
 **Per-run tenant ROUTING is a third, orthogonal mechanism** — and the only tenant encoding on the
-wire: work for a run in namespace `X` dispatches to `@X`-suffixed group tokens
+wire. It covers a run's WHOLE fan-out: the workflow body, every dispatched `ctx.step`, every saga
+compensation, and every child run. Work for a run in namespace `X` dispatches to `@X`-suffixed group tokens
 (`durable-tasks-processing@dev-alice`, see `tenantGroup`) on the transport's own prefix, and tenant
 workers (the Python SDK, the TS `role: 'tenant'` worker) subscribe those suffixed queues. That is
 how one control plane routes each tenant's runs to that tenant's worker pool over ONE shared
@@ -68,7 +69,9 @@ Recipe:
 
 With that, a run you start locally is stamped `dev-<you>`, dispatched to your **local** Redis, consumed
 by your **local** worker, and checkpointed back to the shared DB under your namespace — fully isolated,
-while still reading real dev data. The dev cluster's recovery poller filters on `'default'`, so it
+while still reading real dev data. (Your node also *serves* `@dev-<you>`-suffixed tokens automatically —
+the serving `partition` defaults to your `namespace` — so the queues it dispatches to are the queues it
+listens on. Set `partition` explicitly only to serve a different pool on purpose.) The dev cluster's recovery poller filters on `'default'`, so it
 never touches a `dev-<you>` run even though it's sitting in the same database.
 
 > Give each developer a **unique** namespace (`dev-alice`, `dev-bob`). Two developers sharing both the

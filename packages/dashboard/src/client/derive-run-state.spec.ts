@@ -100,6 +100,28 @@ describe('deriveRunState', () => {
     ).toBe('completed');
   });
 
+  it('surfaces a `blocked` run as no-worker (the engine parked it: no live worker can serve it)', () => {
+    const s = deriveRunState(
+      run({
+        status: 'blocked',
+        error: {
+          message: 'no live worker on "ingest@jordi-local" — waiting for its pool to appear',
+        },
+      }),
+      { runs: [], health: withWorker },
+    );
+    // Same warm "act on this" treatment as a stalled queue — both mean "nobody can run this yet".
+    expect(s.status).toBe('no-worker');
+    // The detail names the group the run is waiting on, parsed from the reason.
+    expect(s.detail).toBe('ingest@jordi-local');
+  });
+
+  it('a `blocked` run with no error message still reads no-worker (detail falls back to the workflow)', () => {
+    const s = deriveRunState(run({ status: 'blocked' }), { runs: [], health: withWorker });
+    expect(s.status).toBe('no-worker');
+    expect(s.detail).toBe('pipeline');
+  });
+
   it('names an event wait: signal / webhook / child', () => {
     const s = deriveRunState(run({ waiting: { on: 'signal', name: 'approve' } }), {
       runs: [],

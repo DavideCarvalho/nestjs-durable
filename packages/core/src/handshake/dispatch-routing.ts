@@ -60,7 +60,7 @@ export function controlPlaneDescriptor(opts: {
  *  a bare boolean. Serializable (plain data), so it rides an `EngineEvent`/control-plane message. */
 export interface DispatchDiagnostics {
   /** Which machine code fired — a missing capability vs. an unbridgeable protocol gap. */
-  code: 'capability.unavailable' | 'protocol.incompatible';
+  code: 'capability.unavailable' | 'protocol.incompatible' | 'worker.absent';
   /** The routing token the work would have been dispatched to. */
   token: string;
   /** The capabilities the handler required (de-duplicated). */
@@ -89,7 +89,7 @@ export interface RoutableDispatch {
 /** No live worker can run the handler — the engine parks the run `blocked` with this reason/delta. */
 export interface BlockedDispatch {
   status: 'blocked';
-  code: 'capability.unavailable' | 'protocol.incompatible';
+  code: 'capability.unavailable' | 'protocol.incompatible' | 'worker.absent';
   /** Dashboard/telescope copy, e.g. `blocked: no compatible worker (requires saga)`. */
   reason: string;
   requires: string[];
