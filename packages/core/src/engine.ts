@@ -1523,7 +1523,9 @@ export class WorkflowEngine {
     //   live `running` placeholder, so replay re-registers the `child:<id>` waiter — a separately
     //   retried child's completion (already buffered, or still to come) then resumes this run.
     //   Retry child and parent in either order; signal buffering makes it converge.
-    if (run.status === 'failed' || run.status === 'dead') {
+    // - the run-level `recoveryAttempts` budget goes back to zero (see the final `updateRun`).
+    const resurrecting = run.status === 'failed' || run.status === 'dead';
+    if (resurrecting) {
       const isFailureCompletion = (v: unknown): boolean =>
         typeof v === 'object' && v !== null && (v as { ok?: unknown }).ok === false;
       for (const cp of await this.store.listCheckpoints(runId)) {
@@ -1577,9 +1579,28 @@ export class WorkflowEngine {
     await this.store.releaseRunLock(runId);
     // Explicit `error: undefined` CLEARS the stale failure (both stores spread the patch over the
     // run) — otherwise the dashboard keeps showing the old error while the run is re-executing.
+    //
+    // RESURRECTING a `failed`/`dead` run ALSO clears `recoveryAttempts`, or the retry is a lie: a run
+    // dead-lettered AT the cap comes back `pending`, the very next `recoverIncomplete` pass computes
+    // `maxRecoveryAttempts + 1` and kills it again within seconds — accepted retry, zero progress,
+    // same generic `max_recovery_attempts` error (observed in the wild). The budget bounds ONE
+    // crash-loop episode; an operator asking to resurrect a run that already came to rest is starting
+    // a new one. This is the run-level half of the same "reset the failure state" the checkpoint loop
+    // above does — the docstring promised it, the code only did the per-step part.
+    //
+    // ZERO, not `undefined`: the stores disagree on what an undefined patch value means. `toRunEntity`
+    // skips it (`if (run.recoveryAttempts !== undefined)`) and the TypeORM adapter passes it straight
+    // into `.set()`, so on both of those `undefined` would silently leave the old count in place. `0`
+    // writes a real column value everywhere, and reads back identically — `countRecovery` does
+    // `(run.recoveryAttempts ?? 0) + 1`.
+    //
+    // Gated on `resurrecting` on purpose: requeueing a run that is still `running`/`suspended` is not
+    // a resurrection, and zeroing there would let a crash-looping run be kept alive forever by a
+    // retry loop — the poison-pill guarantee has to survive this fix.
     await this.store.updateRun(runId, {
       status: 'pending',
       error: undefined,
+      ...(resurrecting ? { recoveryAttempts: 0 } : {}),
       updatedAt: new Date(),
     });
     await this.runDispatcher.dispatch(runId);
