@@ -10,7 +10,12 @@ describe('resolveDashboardAuth', () => {
     const login = () => null;
     const resolved = resolveDashboardAuth({ secret: 'x'.repeat(32), login });
 
-    expect(resolved).toEqual({ secret: 'x'.repeat(32), ttlMs: 8 * 60 * 60 * 1000, login });
+    expect(resolved).toEqual({
+      secret: 'x'.repeat(32),
+      ttlMs: 8 * 60 * 60 * 1000,
+      modes: ['login'],
+      login,
+    });
   });
 
   it('parses a custom ttl string', () => {
@@ -33,10 +38,27 @@ describe('resolveDashboardAuth', () => {
     );
   });
 
-  it('throws (fail closed) when login is missing', () => {
-    expect(() =>
-      // @ts-expect-error: exercising the missing-login boot guard (a non-TS caller could omit it)
-      resolveDashboardAuth({ secret: 's' }),
-    ).toThrow(/login is required/);
+  it('resolves with only a session hook (Mode A)', () => {
+    const session = () => null;
+    const resolved = resolveDashboardAuth({ secret: 'x'.repeat(32), session });
+    expect(resolved).toEqual({
+      secret: 'x'.repeat(32),
+      ttlMs: 8 * 60 * 60 * 1000,
+      modes: ['session'],
+      session,
+    });
+  });
+
+  it('resolves with both hooks and reports both modes', () => {
+    const session = () => null;
+    const login = () => null;
+    const resolved = resolveDashboardAuth({ secret: 's'.repeat(32), session, login });
+    expect(resolved?.modes).toEqual(['session', 'login']);
+  });
+
+  it('throws (fail closed) when neither hook is given', () => {
+    expect(() => resolveDashboardAuth({ secret: 's'.repeat(32) })).toThrow(
+      /at least one of `session` or `login`/,
+    );
   });
 });

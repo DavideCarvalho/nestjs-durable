@@ -1,36 +1,50 @@
 import type { DashboardSessionUser } from './session-cookie.js';
 
-/** Host hook validating submitted credentials from the built-in login page. */
+/** Host hook for Mode A — validates the host's own auth on the raw request. */
+export type SessionHook = (
+  request: unknown,
+) => Promise<DashboardSessionUser | null> | DashboardSessionUser | null;
+
+/** Host hook for Mode B — validates submitted credentials from the built-in login page. */
 export type LoginHook = (
   username: string,
   password: string,
 ) => Promise<DashboardSessionUser | null> | DashboardSessionUser | null;
 
+export type AuthMode = 'session' | 'login';
+
 /**
  * Author-facing `dashboardAuth` option on `DurableDashboardModule.forRoot`/`forRootAsync`. Gates
  * BOTH the SPA (a full-page navigation redirected to a server-rendered login page) and the JSON
  * API (a plain `401`) behind a signed session cookie, mirroring `@dudousxd/nestjs-telescope`'s
- * `dashboardAuth` mechanism (same HMAC-SHA256 cookie, same fail-closed validation). Unlike
- * Telescope's dashboard — a client-rendered SPA that can grow its own login screen — the durable
- * dashboard's bundled React app stays untouched: the login screen here is a small, dependency-free
- * server-rendered HTML page (`GET <basePath>/login`), so gating the SPA shell itself with a real
- * redirect doesn't require rebuilding or extending the Vite bundle.
+ * `dashboardAuth` mechanism (same HMAC-SHA256 cookie, same fail-closed validation). Two ways to
+ * mint that cookie: Mode A (`session`) — the host frontend, already carrying its own auth, POSTs
+ * to `<basePath>/session` and the host hook decides; or Mode B (`login`) — the built-in,
+ * dependency-free server-rendered login page (`GET <basePath>/login`). At least one of the two is
+ * required so an un-mintable gate is a boot error, not a silently-open (or silently-stuck) console.
  */
 export interface DashboardAuthOptions {
   /** REQUIRED HMAC-SHA256 signing key. Missing/empty => boot error (fail closed). */
   secret: string;
   /** Cookie TTL as a duration string (`'8h'`, `'30m'`, `'7d'`). Default `'8h'`. */
   ttl?: string;
-  /** Validates submitted username/password; return the session user, or `null` to deny. Thrown
-   *  errors are treated as a denial (logged once, never surfaced to the client). */
-  login: LoginHook;
+  /** Mode A: validates the host's own auth on the raw request POSTed to `<basePath>/session`;
+   *  return the session user, or `null` to deny. Thrown errors are treated as a denial (logged
+   *  once, never surfaced to the client). */
+  session?: SessionHook;
+  /** Mode B: validates submitted username/password from the built-in login page; return the
+   *  session user, or `null` to deny. Thrown errors are treated as a denial (logged once, never
+   *  surfaced to the client). */
+  login?: LoginHook;
 }
 
 /** Resolved, validated `dashboardAuth` config shared by the guards, auth controller, and login page. */
 export interface ResolvedDashboardAuth {
   secret: string;
   ttlMs: number;
-  login: LoginHook;
+  modes: AuthMode[];
+  session?: SessionHook;
+  login?: LoginHook;
 }
 
 /** DI token carrying the resolved `dashboardAuth` config (`ResolvedDashboardAuth | null`). */
@@ -57,7 +71,8 @@ function durationToMs(ttl: string): number {
 /**
  * Validate + resolve the `dashboardAuth` option. Returns `null` when unconfigured (today's
  * unauthenticated behavior, unchanged). Throws at boot (fail closed) when configured but missing a
- * secret or a `login` hook — the host learns immediately rather than shipping an un-mintable gate.
+ * secret, or missing both a `session` and a `login` hook — the host learns immediately rather than
+ * shipping an un-mintable gate.
  */
 export function resolveDashboardAuth(
   options: DashboardAuthOptions | undefined,
@@ -69,12 +84,20 @@ export function resolveDashboardAuth(
         '(HMAC-SHA256 signing key, 32+ bytes recommended). Failing closed.',
     );
   }
-  if (typeof options.login !== 'function') {
-    throw new Error('DurableDashboardModule: dashboardAuth.login is required (a login hook).');
+  const modes: AuthMode[] = [];
+  if (options.session !== undefined) modes.push('session');
+  if (options.login !== undefined) modes.push('login');
+  if (modes.length === 0) {
+    throw new Error(
+      'DurableDashboardModule: dashboardAuth needs at least one of `session` or `login` ' +
+        '(otherwise the cookie can never be minted). Failing closed.',
+    );
   }
   return {
     secret: options.secret,
     ttlMs: durationToMs(options.ttl ?? DEFAULT_TTL),
-    login: options.login,
+    modes,
+    ...(options.session !== undefined ? { session: options.session } : {}),
+    ...(options.login !== undefined ? { login: options.login } : {}),
   };
 }

@@ -46,7 +46,7 @@ export function appendSetCookie(response: unknown, cookie: string): void {
 
 interface RawRedirectResponse extends RawCookieResponse {
   statusCode: number;
-  end(): unknown;
+  end(chunk?: string): unknown;
 }
 
 function isRawRedirectResponse(value: unknown): value is RawRedirectResponse {
@@ -79,4 +79,18 @@ export function redirectRaw(response: unknown, location: string, status = 302): 
   raw.statusCode = status;
   raw.setHeader('location', location);
   raw.end();
+}
+
+/**
+ * Write a full HTML page directly on the raw response and END it. Used by
+ * `DashboardSessionRequiredFilter` (the Mode-A-only instruction page a guard renders in place of a
+ * login redirect that no longer exists) — same raw-response bypass, and the same reason it's safe:
+ * an exception filter is the terminal step of the request, so there's no second writer to race.
+ */
+export function writeHtmlRaw(response: unknown, html: string, status = 200): void {
+  const raw = resolveRedirectResponse(response);
+  if (!raw) return;
+  raw.statusCode = status;
+  raw.setHeader('content-type', 'text/html; charset=utf-8');
+  raw.end(html);
 }

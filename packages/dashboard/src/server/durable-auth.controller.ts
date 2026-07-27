@@ -44,8 +44,8 @@ function isString(value: unknown): value is string {
 @Controller()
 export class DurableAuthController {
   private readonly logger = new Logger(DurableAuthController.name);
-  /** Warn once so a throwing `login` hook doesn't spam logs on every failed attempt. */
-  private warnedOnHookThrow = false;
+  /** Warn once per hook kind so a throwing hook doesn't spam logs on every failed attempt. */
+  private readonly warnedHooks = new Set<string>();
 
   constructor(
     @Optional() @Inject(DASHBOARD_AUTH) private readonly auth: ResolvedDashboardAuth | null,
@@ -59,7 +59,8 @@ export class DurableAuthController {
   @Header('Content-Type', 'text/html; charset=utf-8')
   @Header('Cache-Control', 'no-store, must-revalidate')
   loginPage(): string {
-    if (!this.auth) throw new NotFoundException();
+    const auth = this.requireAuth();
+    if (!auth.login) throw new NotFoundException();
     return renderLoginPage(this.basePath);
   }
 
@@ -75,13 +76,32 @@ export class DurableAuthController {
     @Res({ passthrough: true }) response: unknown,
   ): Promise<{ redirectTo: string }> {
     const auth = this.requireAuth();
+    if (!auth.login) throw new NotFoundException();
     if (!isString(body?.username) || !isString(body?.password)) {
       throw new BadRequestException('Body must include string `username` and `password`.');
     }
-    const user = await this.runLoginHook(auth, body.username, body.password);
+    const { username, password } = body;
+    const user = await this.runHook('login', () => auth.login?.(username, password) ?? null);
     if (!user) throw new UnauthorizedException({ message: 'Invalid username or password.' });
     issueSessionCookie(user, { auth, request, response });
     return { redirectTo: sanitizeReturnTo(body.returnTo, this.basePath) };
+  }
+
+  // Mode A: the host frontend (carrying its own auth) POSTs here; the host hook validates the raw
+  // request and returns the session user, or `null` to deny. This is the SSO path — the host's own
+  // guard decides, and no credential ever reaches this library.
+  @Post('session')
+  @HttpCode(204)
+  async session(
+    @Req() request: unknown,
+    @Res({ passthrough: true }) response: unknown,
+  ): Promise<void> {
+    const auth = this.requireAuth();
+    // Mode A not configured => the endpoint does not exist for this host.
+    if (!auth.session) throw new NotFoundException();
+    const user = await this.runHook('session', () => auth.session?.(request) ?? null);
+    if (!user) throw new UnauthorizedException();
+    issueSessionCookie(user, { auth, request, response });
   }
 
   // Plain `GET` (not `POST`): logging out only ever destroys the CALLER's own session, so it's
@@ -92,33 +112,35 @@ export class DurableAuthController {
   logout(@Req() request: unknown, @Res() response: unknown): void {
     // Best-effort: even without dashboardAuth configured, clearing is harmless.
     clearSessionCookie({ request, response });
-    redirectRaw(response, `${this.basePath}/login`);
+    // Only bounce to the login page when Mode B is actually configured — under Mode A (only), that
+    // page 404s (see loginPage()); redirecting to basePath instead lands back on the guarded UI,
+    // which renders the Mode-A session-required instruction page.
+    redirectRaw(response, this.auth?.login ? `${this.basePath}/login` : this.basePath);
   }
 
   private requireAuth(): ResolvedDashboardAuth {
-    // login()/logout() only reach a real request when dashboardAuth is configured — this is a
-    // defensive guard (matching loginPage()'s 404), not a reachable runtime path in practice.
+    // login()/session()/logout() only reach a real request when dashboardAuth is configured — this
+    // is a defensive guard (matching loginPage()'s 404), not a reachable runtime path in practice.
     if (!this.auth) throw new NotFoundException();
     return this.auth;
   }
 
   /**
-   * Run the host's `login` hook defensively: a throw is treated as a denial (uniform failure) and
-   * warn-logged once, so a buggy hook never 500s the endpoint into a stack-trace leak nor floods
-   * the logs on repeated bad attempts.
+   * Run a host hook (`login` or `session`) defensively: a throw is treated as a denial (uniform
+   * failure) and warn-logged once PER KIND, so a buggy hook never 500s the endpoint into a
+   * stack-trace leak nor floods the logs on repeated bad attempts.
    */
-  private async runLoginHook(
-    auth: ResolvedDashboardAuth,
-    username: string,
-    password: string,
+  private async runHook(
+    kind: string,
+    run: () => Promise<DashboardSessionUser | null> | DashboardSessionUser | null,
   ): Promise<DashboardSessionUser | null> {
     try {
-      return (await auth.login(username, password)) ?? null;
+      return (await run()) ?? null;
     } catch (error) {
-      if (!this.warnedOnHookThrow) {
-        this.warnedOnHookThrow = true;
+      if (!this.warnedHooks.has(kind)) {
+        this.warnedHooks.add(kind);
         this.logger.warn(
-          `dashboardAuth login hook threw; treating as denial. ${error instanceof Error ? error.message : String(error)}`,
+          `dashboardAuth ${kind} hook threw; treating as denial. ${error instanceof Error ? error.message : String(error)}`,
         );
       }
       return null;

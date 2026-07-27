@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { resolveDashboardAuth } from './auth/dashboard-auth-config';
 import { DashboardLoginRedirectException } from './auth/login-redirect.exception';
 import { signSessionCookie } from './auth/session-cookie';
+import { DashboardSessionRequiredException } from './auth/session-required.exception';
 import { DurableApiSessionGuard, DurableUiSessionGuard } from './durable-session.guard';
 
 const SECRET = 'guard-spec-secret-key-0123456789-abcdef';
@@ -83,6 +84,13 @@ describe('DurableUiSessionGuard (dashboardAuth configured)', () => {
     const request = { headers: { cookie: 'durable_dashboard_session=garbage' }, url: '/durable' };
     const ctx = makeContext(request, makeResponse().raw);
     expect(() => guard.canActivate(ctx)).toThrow(DashboardLoginRedirectException);
+  });
+
+  it('serves the session-required page (not a login redirect) when only Mode A is configured', () => {
+    const modeAAuth = resolveDashboardAuth({ secret: SECRET, session: () => null });
+    const guard = new DurableUiSessionGuard(modeAAuth, BASE_PATH);
+    const ctx = makeContext({ headers: {} }, makeResponse().raw);
+    expect(() => guard.canActivate(ctx)).toThrow(DashboardSessionRequiredException);
   });
 
   it('slides renewal: re-issues the cookie once past 50% of its TTL', () => {

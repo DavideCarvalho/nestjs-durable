@@ -9,15 +9,18 @@ import { DASHBOARD_AUTH, type ResolvedDashboardAuth } from './auth/dashboard-aut
 import { DashboardLoginRedirectException } from './auth/login-redirect.exception.js';
 import { originalRequestUrl } from './auth/request.js';
 import { maybeRenewSession, readSessionFromRequest } from './auth/session-cookie-io.js';
+import { DashboardSessionRequiredException } from './auth/session-required.exception.js';
 import { DASHBOARD_BASE_PATH } from './durable-ui.controller.js';
 
 /**
  * Gates `DurableUiController` (the SPA shell + assets, a full-page browser navigation) on a valid
  * `dashboardAuth` session cookie. A no-op (always `true`) when `dashboardAuth` was not configured
- * — see `DurableDashboardModule.forRoot`'s `dashboardAuth` doc. Missing/invalid/expired session =>
- * a `302` to the built-in login page carrying `?returnTo=<original url>`, via
- * `DashboardLoginRedirectException` (see that file for why a guard can't just call
- * `response.redirect()` and return `false`).
+ * — see `DurableDashboardModule.forRoot`'s `dashboardAuth` doc. Missing/invalid/expired session,
+ * when Mode B (`login`) is configured, gets a `302` to the built-in login page carrying
+ * `?returnTo=<original url>`, via `DashboardLoginRedirectException` (see that file for why a guard
+ * can't just call `response.redirect()` and return `false`). When only Mode A (`session`) is
+ * configured there is no login page to redirect to — the host mints the session itself — so it
+ * instead throws `DashboardSessionRequiredException`, rendering a small instruction page.
  *
  * Auth is mount-level and role-agnostic: this guard has no notion of control-plane vs tenant
  * (see the durable dashboard's topology note in `dashboard.service.ts`) — it only ever answers
@@ -36,6 +39,11 @@ export class DurableUiSessionGuard implements CanActivate {
     const request = http.getRequest<unknown>();
     const session = readSessionFromRequest(this.auth, request);
     if (!session) {
+      if (!this.auth.login) {
+        // Mode A only: there is no login page to bounce to — the host mints the session. Serve the
+        // instruction page instead of redirecting into a 404.
+        throw new DashboardSessionRequiredException(this.basePath);
+      }
       const returnTo = encodeURIComponent(originalRequestUrl(request));
       throw new DashboardLoginRedirectException(`${this.basePath}/login?returnTo=${returnTo}`);
     }

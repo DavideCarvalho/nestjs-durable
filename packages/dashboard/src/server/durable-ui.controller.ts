@@ -12,6 +12,7 @@ import {
   UseFilters,
 } from '@nestjs/common';
 import { DashboardLoginRedirectFilter } from './auth/login-redirect.exception.js';
+import { DashboardSessionRequiredFilter } from './auth/session-required.exception.js';
 
 /** DI token carrying the UI mount base (e.g. `/durable`). */
 export const DASHBOARD_BASE_PATH = Symbol('DASHBOARD_BASE_PATH');
@@ -41,13 +42,15 @@ const CONTENT_TYPES: Record<string, string> = {
  * The path comes from `RouterModule` (set by `DurableDashboardModule.forRoot({ basePath })`), so the
  * controller routes are relative.
  *
- * `@UseFilters(DashboardLoginRedirectFilter)` is permanent (present regardless of whether
- * `dashboardAuth` is configured): it only ever activates for a `DashboardLoginRedirectException`,
- * which `DurableUiSessionGuard` only throws when it is ALSO stamped on this controller (see
- * `DurableDashboardModule.forRoot`) — so leaving it decorated here is inert, not a behavior change,
- * when `dashboardAuth` is absent.
+ * `@UseFilters(DashboardLoginRedirectFilter, DashboardSessionRequiredFilter)` is permanent (present
+ * regardless of whether `dashboardAuth` is configured): each only ever activates for its own
+ * exception type, which `DurableUiSessionGuard` only throws when it is ALSO stamped on this
+ * controller (see `DurableDashboardModule.forRoot`) — so leaving them decorated here is inert, not
+ * a behavior change, when `dashboardAuth` is absent. The guard picks between the two exceptions
+ * based on which mode is configured (Mode B => redirect to the login page; Mode A only => render
+ * the session-required instruction page in place, since there is no login page to redirect to).
  */
-@UseFilters(DashboardLoginRedirectFilter)
+@UseFilters(DashboardLoginRedirectFilter, DashboardSessionRequiredFilter)
 @Controller()
 export class DurableUiController {
   private readonly dir = spaDir();
