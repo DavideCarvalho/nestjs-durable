@@ -81,4 +81,15 @@ describe('resolveDashboardAuth', () => {
       }),
     ).toThrow(/dashboardAuth\.login must be a function/);
   });
+
+  it('throws (fail closed) when revalidate is present but not a function', () => {
+    expect(() =>
+      resolveDashboardAuth({
+        secret: 's'.repeat(32),
+        login: () => null,
+        // @ts-expect-error: exercising the wrong-type boot guard (a non-TS caller could pass this)
+        revalidate: 'not-a-function',
+      }),
+    ).toThrow(/dashboardAuth\.revalidate must be a function/);
+  });
 });

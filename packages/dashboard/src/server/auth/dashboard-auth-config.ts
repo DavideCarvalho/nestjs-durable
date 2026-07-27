@@ -109,6 +109,9 @@ export function resolveDashboardAuth(
     }
     modes.push('login');
   }
+  if (options.revalidate !== undefined && typeof options.revalidate !== 'function') {
+    throw new Error('DurableDashboardModule: dashboardAuth.revalidate must be a function.');
+  }
   if (modes.length === 0) {
     throw new Error(
       'DurableDashboardModule: dashboardAuth needs at least one of `session` or `login` ' +

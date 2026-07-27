@@ -119,6 +119,30 @@ describe('DurableUiSessionGuard (dashboardAuth configured)', () => {
       true,
     );
   });
+
+  it('redirects (not a 401) when revalidate revokes a renewable session, Mode B configured', async () => {
+    const revalidateAuth = resolveDashboardAuth({
+      secret: SECRET,
+      login: () => null,
+      revalidate: () => false,
+    });
+    const guard = new DurableUiSessionGuard(revalidateAuth, BASE_PATH);
+    const request = { headers: { cookie: signedCookieOlderThanHalfTtl(revalidateAuth) } };
+    const ctx = makeContext(request, makeResponse().raw);
+    await expect(guard.canActivate(ctx)).rejects.toThrow(DashboardLoginRedirectException);
+  });
+
+  it('serves the session-required page when revalidate revokes a renewable session, Mode A only', async () => {
+    const revalidateModeAAuth = resolveDashboardAuth({
+      secret: SECRET,
+      session: () => null,
+      revalidate: () => false,
+    });
+    const guard = new DurableUiSessionGuard(revalidateModeAAuth, BASE_PATH);
+    const request = { headers: { cookie: signedCookieOlderThanHalfTtl(revalidateModeAAuth) } };
+    const ctx = makeContext(request, makeResponse().raw);
+    await expect(guard.canActivate(ctx)).rejects.toThrow(DashboardSessionRequiredException);
+  });
 });
 
 describe('DurableApiSessionGuard (absent-option)', () => {

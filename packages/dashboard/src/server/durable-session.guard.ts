@@ -35,21 +35,31 @@ export class DurableUiSessionGuard implements CanActivate {
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     if (!this.auth) return true;
+    const auth = this.auth;
     const http = context.switchToHttp();
     const request = http.getRequest<unknown>();
-    const session = readSessionFromRequest(this.auth, request);
-    if (!session) {
-      if (!this.auth.login) throw new DashboardSessionRequiredException(this.basePath);
-      const returnTo = encodeURIComponent(originalRequestUrl(request));
-      throw new DashboardLoginRedirectException(`${this.basePath}/login?returnTo=${returnTo}`);
-    }
-    if (!(await maybeRenewSession(this.auth, session, request, http.getResponse()))) {
-      // Revoked mid-session: same treatment as an absent cookie.
-      if (!this.auth.login) throw new DashboardSessionRequiredException(this.basePath);
-      const returnTo = encodeURIComponent(originalRequestUrl(request));
-      throw new DashboardLoginRedirectException(`${this.basePath}/login?returnTo=${returnTo}`);
+    const session = readSessionFromRequest(auth, request);
+    if (!session) this.denyUnauthenticated(auth, request);
+    if (!(await maybeRenewSession(auth, session, request, http.getResponse()))) {
+      this.denyUnauthenticated(auth, request);
     }
     return true;
+  }
+
+  /**
+   * A revoked session (the host's `revalidate` hook says no) is denied exactly like an absent
+   * one — by design, there is nothing left to distinguish "never had a session" from "had one,
+   * then lost it" once the cookie is cleared, so both get the same Mode-aware treatment.
+   *
+   * Takes `auth` explicitly rather than reading `this.auth`: `canActivate`'s `!this.auth` early
+   * return narrows the field within that method only — TS doesn't carry it across a method call
+   * — so callers pass the already-narrowed value instead of this method re-deriving (or
+   * asserting away) the nullability.
+   */
+  private denyUnauthenticated(auth: ResolvedDashboardAuth, request: unknown): never {
+    if (!auth.login) throw new DashboardSessionRequiredException(this.basePath);
+    const returnTo = encodeURIComponent(originalRequestUrl(request));
+    throw new DashboardLoginRedirectException(`${this.basePath}/login?returnTo=${returnTo}`);
   }
 }
 
