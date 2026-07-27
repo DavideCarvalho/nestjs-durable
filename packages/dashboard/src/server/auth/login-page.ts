@@ -1,30 +1,22 @@
 /**
- * The built-in `dashboardAuth` login page (`GET <basePath>/login`). Deliberately a small,
- * dependency-free, hand-authored HTML page — NOT part of the bundled React SPA — so gating the
- * dashboard shell doesn't require rebuilding or extending the Vite bundle with a new route/screen.
+ * Shared HTML shell for the `dashboardAuth` server-rendered pages (the Mode B login page below and
+ * `renderSessionRequiredPage`'s Mode A instruction page) — same dark zinc card, mono type, emerald
+ * accent as `@dudousxd/nestjs-agent`'s dashboard login page, so every auth-adjacent page in this
+ * family looks like one product. `content` is placed inside the `.card` div verbatim, so a caller
+ * needing its own `<script>` (see `renderLoginPage`) can simply include it in `content` — a
+ * `<script>` renders identically whether it's the div's last child or a body-level sibling.
  *
- * `returnTo` and any error state are read CLIENT-SIDE from `location.search` (never server-echoed
- * into the HTML), so this function's only per-request-ish input is `basePath` — a developer-
- * controlled config value, not user input — and the page body is otherwise a static template.
- * This sidesteps HTML-escaping entirely: there is no reflected query-param interpolation surface
- * to get wrong.
- *
- * The visual language (dark zinc card, mono type, emerald accent) mirrors
- * `@dudousxd/nestjs-agent`'s dashboard login page so the two consoles feel like one family — only
- * the submit flow differs (this page POSTs JSON via `fetch` and follows the JSON `redirectTo` it
- * gets back, rather than a classic form POST + server redirect), which is why the markup keeps its
- * own `<script>` rather than adopting agent-dashboard's plain `<form method="post">`.
+ * `content` is always caller-controlled static markup, never user input reflected into the page,
+ * so this sidesteps HTML-escaping entirely.
  */
-export function renderLoginPage(basePath: string): string {
-  const loginAction = `${basePath}/login`;
-  const defaultReturnTo = basePath;
+function page(content: string, title = 'Durable'): string {
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex, nofollow" />
-<title>Sign in — Durable</title>
+<title>${title}</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -55,6 +47,13 @@ export function renderLoginPage(basePath: string): string {
     font-weight: 600;
     color: #34d399;
   }
+  h1 {
+    margin: 0 0 12px;
+    font-size: 16px;
+    font-weight: 600;
+    color: #f4f4f5;
+  }
+  p { margin: 0 0 16px; color: #a1a1aa; }
   form { display: flex; flex-direction: column; gap: 16px; }
   label { display: flex; flex-direction: column; gap: 6px; }
   .field-label {
@@ -79,7 +78,7 @@ export function renderLoginPage(basePath: string): string {
     font-size: 12px;
     color: #fb7185;
   }
-  button {
+  button, .button {
     margin-top: 8px;
     border-radius: 4px;
     border: 1px solid rgb(52 211 153 / 0.4);
@@ -92,14 +91,41 @@ export function renderLoginPage(basePath: string): string {
     text-transform: uppercase;
     letter-spacing: 0.05em;
     cursor: pointer;
+    display: inline-block;
+    text-align: center;
+    text-decoration: none;
+    box-sizing: border-box;
   }
-  button:hover:not(:disabled) { background: rgb(52 211 153 / 0.2); }
+  button:hover:not(:disabled), .button:hover { background: rgb(52 211 153 / 0.2); }
   button:disabled { opacity: 0.6; cursor: default; }
 </style>
 </head>
 <body>
   <div class="card">
-    <p class="brand">Durable</p>
+    ${content}
+  </div>
+</body>
+</html>`;
+}
+
+/**
+ * The built-in `dashboardAuth` login page (`GET <basePath>/login`, Mode B). Deliberately a small,
+ * dependency-free, hand-authored HTML page — NOT part of the bundled React SPA — so gating the
+ * dashboard shell doesn't require rebuilding or extending the Vite bundle with a new route/screen.
+ *
+ * `returnTo` and any error state are read CLIENT-SIDE from `location.search` (never server-echoed
+ * into the HTML), so this function's only per-request-ish input is `basePath` — a developer-
+ * controlled config value, not user input — and the page body is otherwise a static template.
+ *
+ * The submit flow (this page POSTs JSON via `fetch` and follows the JSON `redirectTo` it gets
+ * back, rather than a classic form POST + server redirect) is why the markup keeps its own
+ * `<script>` rather than adopting agent-dashboard's plain `<form method="post">`.
+ */
+export function renderLoginPage(basePath: string): string {
+  const loginAction = `${basePath}/login`;
+  const defaultReturnTo = basePath;
+  return page(
+    `<p class="brand">Durable</p>
     <form id="login-form" autocomplete="on">
       <label>
         <span class="field-label">Username</span>
@@ -112,7 +138,6 @@ export function renderLoginPage(basePath: string): string {
       <p id="error" role="alert">Invalid username or password.</p>
       <button id="submit" type="submit">Sign in</button>
     </form>
-  </div>
 <script>
 (function () {
   var LOGIN_ACTION = ${JSON.stringify(loginAction)};
@@ -159,7 +184,23 @@ export function renderLoginPage(basePath: string): string {
       });
   });
 })();
-</script>
-</body>
-</html>`;
+</script>`,
+    'Sign in — Durable',
+  );
+}
+
+/**
+ * Mode-A-only shell (`GET <basePath>/login` never renders under Mode A — this is what the page
+ * guard serves in its place, see `session-required.exception.ts`): there is no form here because
+ * the host mints the session. Mirrors `renderLoginPage`'s markup so the two pages look like one
+ * product. `basePath` drives the Retry link's `href` — a plain `<a>` back to the guarded mount
+ * (which re-runs the check once the host has minted a session), keeping this page free of any
+ * inline `<script>`, unlike `renderLoginPage`'s fetch-driven form.
+ */
+export function renderSessionRequiredPage(basePath: string): string {
+  return page(
+    `<h1>Open this console from your application</h1>
+     <p>Your session is minted by the host app. Use its console launcher to sign in, then reload.</p>
+     <a class="button" href="${basePath}">Retry</a>`,
+  );
 }

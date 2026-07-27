@@ -75,13 +75,36 @@ export interface DurableDashboardOptions {
   imports?: DynamicModule['imports'];
   /**
    * Gate the console (the SPA at `basePath` AND its JSON API at `apiBasePath`) behind a built-in,
-   * cookie-session login — no infra, no changes to the bundled React SPA. Unlike
-   * `@dudousxd/nestjs-telescope`'s `dashboardAuth` (a client-rendered login screen inside its SPA),
-   * the durable dashboard's login page is small, dependency-free, server-rendered HTML served
-   * directly by `DurableAuthController` at `GET <basePath>/login` — the SPA bundle itself never
-   * changes. A missing/invalid/expired session redirects a page-level request (a full-page
-   * navigation to `basePath`) to that login page with `?returnTo=<original url>`; an API request
-   * (`apiBasePath`, fetched by the SPA's own JS) gets a plain `401` instead.
+   * signed session cookie — no infra required. Two ways to mint it:
+   *
+   * - **Mode A (`session`, recommended)**: your host app already has its own auth (SSO/OIDC/
+   *   whatever) — the host frontend, carrying that auth, POSTs to `<basePath>/session`, your
+   *   `session` hook validates the raw request and returns the session user, and this library mints
+   *   its cookie from that. No credential this library understands ever exists; you keep your own
+   *   identity provider as the source of truth. A page-level request with no valid session (and only
+   *   Mode A configured) gets a small server-rendered instruction page telling the visitor to sign in
+   *   through your host app, since there is no login page to redirect to.
+   * - **Mode B (`login`, standalone fallback)**: no host frontend/IdP to lean on — the durable
+   *   dashboard serves its own small, dependency-free, server-rendered login page (`GET
+   *   <basePath>/login`, handled by `DurableAuthController`) and your `login` hook validates
+   *   submitted username/password. A missing/invalid/expired session redirects a page-level request
+   *   to that login page with `?returnTo=<original url>`.
+   *
+   * Either mode can be used alone, or both together (e.g. Mode A for normal use, Mode B as a
+   * break-glass fallback) — at least one is required, or `forRoot`/`forRootAsync` throws at boot
+   * (an un-mintable gate is a boot error, not a silently-open or silently-stuck console). An API
+   * request (`apiBasePath`, fetched by the SPA's own JS) always gets a plain `401` on a missing
+   * session, regardless of mode — the caller reads the status code, not HTML.
+   *
+   * A third, optional hook — **`revalidate`** — re-checks an already-minted session rather than
+   * minting one: once a session cookie is past 50% of its TTL, the guard slides it forward with a
+   * fresh one, and if `revalidate` is set it's consulted first, so a deactivated or demoted
+   * operator loses access instead of riding a self-renewing cookie indefinitely. It only runs on
+   * that renewal path, not on every request, so revocation has **latency, not immediacy**: an
+   * operator revoked right after a renewal keeps their existing cookie — and therefore console
+   * access — for up to `ttl/2` (4 hours at the default 8h TTL) before the next renewal check catches
+   * it. Do not rely on `revalidate` for a same-second cutoff; front the mount with your own guard
+   * (see {@link guards}) if you need that.
    *
    * Auth here is mount-level and role-agnostic: this option (and the guards/controller it wires up)
    * has no notion of control-plane vs tenant role (see the durable dashboard's topology note in
@@ -93,9 +116,9 @@ export interface DurableDashboardOptions {
    * the console open (today's behavior, unchanged byte-for-byte) — front it with `guards`, a global
    * guard, or a reverse proxy instead.
    *
-   * See {@link DashboardAuthOptions} for the `secret`/`ttl`/`login` shape, and `forRootAsync` /
-   * {@link DurableDashboardAsyncOptions.useDashboardAuth} when the `login` hook needs DI (e.g. an
-   * `EntityManager` to look up an admin user).
+   * See {@link DashboardAuthOptions} for the `secret`/`ttl`/`session`/`login`/`revalidate` shape,
+   * and `forRootAsync` / {@link DurableDashboardAsyncOptions.useDashboardAuth} when a hook needs DI
+   * (e.g. an `EntityManager` to look up an admin user).
    */
   dashboardAuth?: DashboardAuthOptions;
 }
@@ -103,9 +126,10 @@ export interface DurableDashboardOptions {
 /**
  * Async variant of {@link DurableDashboardOptions}. The mount paths and `guards` stay static (the
  * router and guard metadata are bound at module-DEFINITION time — the same constraint `forRoot`
- * already has), but `dashboardAuth` is built by an injected factory, so its `login` hook can reach
- * your DB/services. Returning `undefined` from `useDashboardAuth` leaves the console open, exactly
- * like omitting `dashboardAuth` from `forRoot`.
+ * already has), but `dashboardAuth` is built by an injected factory, so its `session`/`login` hooks
+ * can reach your DB/services — e.g. Mode A's `session` hook calling out to the same auth service
+ * your host app already uses to validate the raw request. Returning `undefined` from
+ * `useDashboardAuth` leaves the console open, exactly like omitting `dashboardAuth` from `forRoot`.
  */
 export interface DurableDashboardAsyncOptions {
   basePath?: string;

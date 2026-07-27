@@ -1,7 +1,36 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { type DashboardAuthOptions, resolveDashboardAuth } from './dashboard-auth-config';
 import { signSessionCookie, verifySessionCookie } from './session-cookie';
+import { maybeRenewSession } from './session-cookie-io';
 
 const SECRET = 'a-very-not-secret-test-key';
+
+/** `resolveDashboardAuth`, asserting the config was valid (never `null` for these fixtures). */
+function resolveAuth(options: DashboardAuthOptions) {
+  const auth = resolveDashboardAuth(options);
+  if (!auth) throw new Error('expected dashboardAuth to resolve for this test fixture');
+  return auth;
+}
+
+/** Minimal Node-response double recording Set-Cookie writes, over the `appendSetCookie` contract. */
+function mockResponse(): {
+  getHeader: (name: string) => unknown;
+  setHeader: (name: string, value: unknown) => void;
+} {
+  const headers: Record<string, unknown> = {};
+  return {
+    getHeader: (name) => headers[name.toLowerCase()],
+    setHeader: (name, value) => {
+      headers[name.toLowerCase()] = value;
+    },
+  };
+}
+
+/** Read the queued `Set-Cookie` header(s) off a `mockResponse()`. */
+function setCookiesOn(response: ReturnType<typeof mockResponse>): string[] {
+  const current = response.getHeader('set-cookie');
+  return Array.isArray(current) ? current.filter((c): c is string => typeof c === 'string') : [];
+}
 
 describe('session cookie sign/verify (round-trip)', () => {
   it('signs and verifies a session, round-tripping id/name/roles', () => {
@@ -64,5 +93,63 @@ describe('session cookie sign/verify (round-trip)', () => {
     expect(verifySessionCookie('not-a-cookie', { secret: SECRET })).toBeNull();
     expect(verifySessionCookie('.', { secret: SECRET })).toBeNull();
     expect(verifySessionCookie('abc.', { secret: SECRET })).toBeNull();
+  });
+});
+
+describe('maybeRenewSession (sliding renewal + revalidation)', () => {
+  const HALF_LIFE_PASSED = { iat: Date.now() - 5 * 60 * 60 * 1000, sub: '7', roles: ['admin'] };
+
+  it('does not call revalidate before half the TTL has passed', async () => {
+    const revalidate = vi.fn().mockResolvedValue(true);
+    const auth = resolveAuth({ secret: 's'.repeat(32), session: () => null, revalidate });
+    const fresh = { iat: Date.now(), sub: '7', roles: ['admin'] };
+    await maybeRenewSession(auth, fresh, { headers: {} }, mockResponse());
+    expect(revalidate).not.toHaveBeenCalled();
+  });
+
+  it('renews when revalidate approves', async () => {
+    const auth = resolveAuth({
+      secret: 's'.repeat(32),
+      session: () => null,
+      revalidate: () => true,
+    });
+    const response = mockResponse();
+    await expect(
+      maybeRenewSession(auth, HALF_LIFE_PASSED, { headers: {} }, response),
+    ).resolves.toBe(true);
+    expect(setCookiesOn(response)[0]).toContain('durable_dashboard_session=');
+  });
+
+  it('clears the cookie and denies when revalidate rejects', async () => {
+    const auth = resolveAuth({
+      secret: 's'.repeat(32),
+      session: () => null,
+      revalidate: () => false,
+    });
+    const response = mockResponse();
+    await expect(
+      maybeRenewSession(auth, HALF_LIFE_PASSED, { headers: {} }, response),
+    ).resolves.toBe(false);
+    expect(setCookiesOn(response)[0]).toContain('Max-Age=0');
+  });
+
+  it('fails closed when revalidate throws', async () => {
+    const auth = resolveAuth({
+      secret: 's'.repeat(32),
+      session: () => null,
+      revalidate: () => {
+        throw new Error('db down');
+      },
+    });
+    await expect(
+      maybeRenewSession(auth, HALF_LIFE_PASSED, { headers: {} }, mockResponse()),
+    ).resolves.toBe(false);
+  });
+
+  it('renews without a revalidate hook (unchanged behaviour)', async () => {
+    const auth = resolveAuth({ secret: 's'.repeat(32), session: () => null });
+    await expect(
+      maybeRenewSession(auth, HALF_LIFE_PASSED, { headers: {} }, mockResponse()),
+    ).resolves.toBe(true);
   });
 });

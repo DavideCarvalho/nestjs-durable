@@ -63,9 +63,9 @@ least to most work — pick one, or compose two:
 | | Open (default) | `guards` | `dashboardAuth` |
 | --- | --- | --- | --- |
 | Setup | none | you write (or already have) a guard | one config object, zero extra code |
-| Auth mechanism | whatever fronts the mount otherwise (reverse proxy, global guard) | whatever `CanActivate` you bring — typically your app's existing auth | a built-in signed session cookie + server-rendered login page |
-| Fronts the page (SPA shell + assets)? | no | yes, when set (see below) | yes — a missing/invalid session redirects the page to a login screen |
-| Best for | internal/dev use, or a mount already behind SSO/proxy | hosts that already authenticate the rest of the app and want ONE gate to reuse | standalone hosts with no existing admin auth |
+| Auth mechanism | whatever fronts the mount otherwise (reverse proxy, global guard) | whatever `CanActivate` you bring — typically your app's existing auth | a built-in signed session cookie, minted either by your own host auth (Mode A, `session`) or a server-rendered login page (Mode B, `login`) |
+| Fronts the page (SPA shell + assets)? | no | yes, when set (see below) | yes — a missing/invalid session redirects the page to a login screen (Mode B) or a "sign in through the host app" instruction page (Mode A only) |
+| Best for | internal/dev use, or a mount already behind SSO/proxy | hosts that already authenticate the rest of the app and want ONE gate to reuse | Mode A: hosts with their own SSO/OIDC that want the dashboard to ride it. Mode B: standalone hosts with no existing admin auth |
 
 ### `guards` — front it with your own auth
 
@@ -111,13 +111,49 @@ export class ConsoleAuthGuard implements CanActivate {
 }
 ```
 
-### `dashboardAuth` — the built-in login
+### `dashboardAuth` — the built-in session cookie
 
-`dashboardAuth` is the dashboard's own turnkey login: a stateless, signed session cookie plus a
-small, dependency-free, **server-rendered** login page — no infra, and no changes to the bundled
-React SPA (unlike `@dudousxd/nestjs-telescope`, whose `dashboardAuth` renders its login screen
-inside its own SPA bundle, the durable dashboard's login page is plain HTML served directly by
-its own controller, so gating the SPA shell never touches the Vite build):
+`dashboardAuth` gates the console behind the dashboard's own stateless, signed session cookie —
+no infra, and no changes to the bundled React SPA (unlike `@dudousxd/nestjs-telescope`, whose
+`dashboardAuth` renders its login screen inside its own SPA bundle, the durable dashboard's
+auth-adjacent pages are plain HTML served directly by their own controller, so gating the SPA
+shell never touches the Vite build). There are two ways to mint that cookie — **Mode A**
+(`session`) and **Mode B** (`login`) — used alone or together; at least one is required, or
+`forRoot`/`forRootAsync` throws at boot (an un-mintable gate is a boot error, not a silently-open
+or silently-stuck console).
+
+#### Mode A — `session`, ride your host's own auth
+
+Your host app already has its own auth (SSO/OIDC/whatever). The host frontend, carrying that
+auth, `POST`s to `<basePath>/session`; your `session` hook validates the raw request and returns
+the session user (or `null` to deny), and the library mints its cookie from that. No credential
+this library understands ever exists — your identity provider stays the source of truth:
+
+```ts
+DurableDashboardModule.forRoot({
+  dashboardAuth: {
+    secret: process.env.DURABLE_AUTH_SECRET, // REQUIRED HMAC-SHA256 key, 32+ bytes recommended
+    ttl: '8h', // optional, default 8h
+    session: (request) => {
+      const user = requireAuthenticatedUser(request); // however your host already authenticates
+      return user?.isAdmin ? { id: user.id, name: user.name, roles: ['admin'] } : null;
+    },
+  },
+});
+```
+
+Your own console launcher (a page in your app, gated by your own auth) `POST`s
+`<basePath>/session` before sending the visitor to `/durable` — a successful response mints the
+`durable_dashboard_session` cookie (`HttpOnly`, `SameSite=Lax`, `Secure` over https) exactly like
+Mode B's login does. With **only** Mode A configured there is no login page to redirect to, so a
+page-level request (a full-page navigation) with a missing/invalid/expired cookie instead renders
+a small, static instruction page telling the visitor to sign in through the host app; an API
+request (`apiBasePath`, fetched by the SPA's own JS) still gets a plain `401`, same as Mode B.
+
+#### Mode B — `login`, the built-in login page
+
+No host frontend/IdP to lean on. The dashboard serves its own small, dependency-free,
+**server-rendered** login page and your `login` hook validates submitted username/password:
 
 ```ts
 DurableDashboardModule.forRoot({
@@ -136,15 +172,14 @@ Open `/durable`, and an unauthenticated visit redirects to `GET /durable/login?r
 — a plain username/password form. The password field is never `required`: the page passes it
 through to your `login` hook verbatim (an empty string when left blank), so a host that gates on
 username alone (e.g. any active admin's email, password ignored) works with this same built-in
-page. On success it mints a `durable_dashboard_session` cookie
-(`HttpOnly`, `SameSite=Lax`, `Secure` over https) and sends the browser back to `returnTo`. A
-missing/invalid/expired cookie on a page-level request (a full-page navigation) redirects to that
-login page; the same failure on an API request (`apiBasePath`, fetched by the SPA's own JS) is a
-plain `401` instead — there's no page to redirect a `fetch` call to. `GET /durable/logout` clears
-the cookie and returns to the login page.
+page. On success it mints the same `durable_dashboard_session` cookie as Mode A and sends the
+browser back to `returnTo`. `GET /durable/logout` clears the cookie and returns to the login page
+when Mode B is configured, or to `basePath` (re-triggering whichever page-level gate applies)
+when it isn't.
 
-Use `forRootAsync` when the `login` hook needs injected services (e.g. an `EntityManager` to look
-up a real admin user instead of an env var pair):
+Use `forRootAsync` when a hook needs injected services (e.g. an `EntityManager` to look up a real
+admin user instead of an env var pair) — the same factory shape covers `session`, `login`, or
+both:
 
 ```ts
 DurableDashboardModule.forRootAsync({
@@ -163,8 +198,34 @@ DurableDashboardModule.forRootAsync({
 Returning `undefined` from `useDashboardAuth` leaves the console open, exactly like omitting
 `dashboardAuth` from `forRoot`.
 
+#### Sliding renewal and `revalidate`
+
 Sliding renewal keeps an active session alive: a cookie past 50% of its TTL is transparently
-re-issued on the response, so a working operator is never logged out mid-session.
+re-issued on the response, so a working operator isn't forced to re-authenticate mid-session.
+Add `revalidate` to have that renewal re-check the user instead of blindly extending them:
+
+```ts
+DurableDashboardModule.forRoot({
+  dashboardAuth: {
+    secret: process.env.DURABLE_AUTH_SECRET,
+    session: verifyHostSession,
+    revalidate: async (session) => {
+      const user = await users.findById(session.id);
+      return user?.isActive === true; // false/throw revokes — the cookie is cleared, request denied
+    },
+  },
+});
+```
+
+`revalidate` receives the already-minted session (not a fresh request — a console XHR carries no
+host auth to re-check, unlike Mode A's `session` hook), and runs at most once per `ttl/2` per
+session, so a DB round-trip here is cheap. Returning `false`, or throwing, clears the cookie and
+denies the request in place, the same treatment as an absent cookie. This closes the gap a
+sliding cookie otherwise leaves open — **but it isn't instant**: `revalidate` only runs on the
+renewal path, so a deactivated or demoted operator keeps console access for up to `ttl/2` (4 hours
+at the default 8h TTL) after their last renewal, not the moment they're deactivated. `revalidate`
+alone can't mint a session, so it doesn't count toward the `session`/`login` "at least one"
+requirement — pair it with one of those.
 
 **Composes with `guards`:** when both are set, a request must pass the built-in session check AND
 every guard in `guards` — the built-in guard runs first, so an invalid session never even reaches

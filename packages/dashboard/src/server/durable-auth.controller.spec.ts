@@ -65,6 +65,13 @@ describe('DurableAuthController (absent-option)', () => {
       true,
     );
   });
+
+  it('redirects logout to basePath, not the login page (there is no `login` hook to 404 on)', () => {
+    const response = makeResponse();
+    controller.logout({ headers: {} }, response.raw);
+    expect(response.raw.statusCode).toBe(302);
+    expect(response.location()).toBe(BASE_PATH);
+  });
 });
 
 describe('DurableAuthController (dashboardAuth configured)', () => {
@@ -208,5 +215,73 @@ describe('DurableAuthController (password is optional end-to-end)', () => {
     expect(verifySessionCookie(cookieValue ?? '', { secret: SECRET })).toMatchObject({
       sub: 'admin',
     });
+  });
+});
+
+describe('DurableAuthController (Mode A — session hook)', () => {
+  it('POST session mints the cookie when the host hook returns a user', async () => {
+    const auth = resolveDashboardAuth({
+      secret: SECRET,
+      session: () => ({ id: '7', roles: ['admin'] }),
+    });
+    const controller = new DurableAuthController(auth, BASE_PATH);
+    const response = makeResponse();
+
+    await controller.session({ headers: {} }, response.raw);
+
+    const cookieValue = parseCookieHeader(response.setCookies()[0]).durable_dashboard_session;
+    expect(cookieValue).toBeDefined();
+    const session = verifySessionCookie(cookieValue ?? '', { secret: SECRET });
+    expect(session).toMatchObject({ sub: '7', roles: ['admin'] });
+  });
+
+  it('POST session 401s when the host hook denies', async () => {
+    const auth = resolveDashboardAuth({ secret: SECRET, session: () => null });
+    const controller = new DurableAuthController(auth, BASE_PATH);
+    await expect(controller.session({ headers: {} }, makeResponse().raw)).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+  });
+
+  it('POST session 401s (not 500) when the host hook throws', async () => {
+    const auth = resolveDashboardAuth({
+      secret: SECRET,
+      session: () => {
+        throw new Error('db down');
+      },
+    });
+    const controller = new DurableAuthController(auth, BASE_PATH);
+    await expect(controller.session({ headers: {} }, makeResponse().raw)).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+  });
+
+  it('POST session 404s when only Mode B is configured', async () => {
+    const auth = resolveDashboardAuth({ secret: SECRET, login: () => null });
+    const controller = new DurableAuthController(auth, BASE_PATH);
+    await expect(controller.session({ headers: {} }, makeResponse().raw)).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+  });
+
+  it('GET login 404s when only Mode A is configured', () => {
+    const auth = resolveDashboardAuth({ secret: SECRET, session: () => null });
+    const controller = new DurableAuthController(auth, BASE_PATH);
+    expect(() => controller.loginPage()).toThrow(NotFoundException);
+  });
+
+  it('logout redirects to basePath (not the 404ing login page) when only Mode A is configured', () => {
+    const auth = resolveDashboardAuth({ secret: SECRET, session: () => null });
+    const controller = new DurableAuthController(auth, BASE_PATH);
+    const response = makeResponse();
+
+    controller.logout({ headers: {} }, response.raw);
+
+    expect(response.setCookies().some((c) => c.startsWith('durable_dashboard_session=;'))).toBe(
+      true,
+    );
+    expect(response.raw.statusCode).toBe(302);
+    expect(response.location()).toBe(BASE_PATH);
+    expect(response.ended()).toBe(true);
   });
 });

@@ -9,15 +9,18 @@ import { DASHBOARD_AUTH, type ResolvedDashboardAuth } from './auth/dashboard-aut
 import { DashboardLoginRedirectException } from './auth/login-redirect.exception.js';
 import { originalRequestUrl } from './auth/request.js';
 import { maybeRenewSession, readSessionFromRequest } from './auth/session-cookie-io.js';
+import { DashboardSessionRequiredException } from './auth/session-required.exception.js';
 import { DASHBOARD_BASE_PATH } from './durable-ui.controller.js';
 
 /**
  * Gates `DurableUiController` (the SPA shell + assets, a full-page browser navigation) on a valid
  * `dashboardAuth` session cookie. A no-op (always `true`) when `dashboardAuth` was not configured
- * — see `DurableDashboardModule.forRoot`'s `dashboardAuth` doc. Missing/invalid/expired session =>
- * a `302` to the built-in login page carrying `?returnTo=<original url>`, via
- * `DashboardLoginRedirectException` (see that file for why a guard can't just call
- * `response.redirect()` and return `false`).
+ * — see `DurableDashboardModule.forRoot`'s `dashboardAuth` doc. Missing/invalid/expired session,
+ * when Mode B (`login`) is configured, gets a `302` to the built-in login page carrying
+ * `?returnTo=<original url>`, via `DashboardLoginRedirectException` (see that file for why a guard
+ * can't just call `response.redirect()` and return `false`). When only Mode A (`session`) is
+ * configured there is no login page to redirect to — the host mints the session itself — so it
+ * instead throws `DashboardSessionRequiredException`, rendering a small instruction page.
  *
  * Auth is mount-level and role-agnostic: this guard has no notion of control-plane vs tenant
  * (see the durable dashboard's topology note in `dashboard.service.ts`) — it only ever answers
@@ -30,17 +33,35 @@ export class DurableUiSessionGuard implements CanActivate {
     @Inject(DASHBOARD_BASE_PATH) private readonly basePath: string,
   ) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     if (!this.auth) return true;
+    const auth = this.auth;
     const http = context.switchToHttp();
     const request = http.getRequest<unknown>();
-    const session = readSessionFromRequest(this.auth, request);
+    const session = readSessionFromRequest(auth, request);
     if (!session) {
-      const returnTo = encodeURIComponent(originalRequestUrl(request));
-      throw new DashboardLoginRedirectException(`${this.basePath}/login?returnTo=${returnTo}`);
+      this.denyUnauthenticated(auth, request);
     }
-    maybeRenewSession(this.auth, session, request, http.getResponse());
+    if (!(await maybeRenewSession(auth, session, request, http.getResponse()))) {
+      this.denyUnauthenticated(auth, request);
+    }
     return true;
+  }
+
+  /**
+   * A revoked session (the host's `revalidate` hook says no) is denied exactly like an absent
+   * one — by design, there is nothing left to distinguish "never had a session" from "had one,
+   * then lost it" once the cookie is cleared, so both get the same Mode-aware treatment.
+   *
+   * Takes `auth` explicitly rather than reading `this.auth`: `canActivate`'s `!this.auth` early
+   * return narrows the field within that method only — TS doesn't carry it across a method call
+   * — so callers pass the already-narrowed value instead of this method re-deriving (or
+   * asserting away) the nullability.
+   */
+  private denyUnauthenticated(auth: ResolvedDashboardAuth, request: unknown): never {
+    if (!auth.login) throw new DashboardSessionRequiredException(this.basePath);
+    const returnTo = encodeURIComponent(originalRequestUrl(request));
+    throw new DashboardLoginRedirectException(`${this.basePath}/login?returnTo=${returnTo}`);
   }
 }
 
@@ -56,13 +77,16 @@ export class DurableUiSessionGuard implements CanActivate {
 export class DurableApiSessionGuard implements CanActivate {
   constructor(@Inject(DASHBOARD_AUTH) private readonly auth: ResolvedDashboardAuth | null) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     if (!this.auth) return true;
     const http = context.switchToHttp();
     const request = http.getRequest<unknown>();
     const session = readSessionFromRequest(this.auth, request);
     if (!session) throw new UnauthorizedException();
-    maybeRenewSession(this.auth, session, request, http.getResponse());
+    if (!(await maybeRenewSession(this.auth, session, request, http.getResponse()))) {
+      // Revoked mid-session: same treatment as an absent cookie.
+      throw new UnauthorizedException();
+    }
     return true;
   }
 }
