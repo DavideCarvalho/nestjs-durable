@@ -244,12 +244,12 @@ describe('guards coexistence — both actually run (AND semantics)', () => {
 
     // Valid session, but the host guard denies => overall AND is false (session guard alone
     // would have said true).
-    expect(uiSessionGuard.canActivate(makeContext(validRequest))).toBe(true);
+    await expect(uiSessionGuard.canActivate(makeContext(validRequest))).resolves.toBe(true);
     expect(hostGuard.canActivate(makeContext(validRequest))).toBe(false);
 
     // No session at all => the built-in guard denies FIRST — the host guard is never even
     // reached in the real `@UseGuards` execution order (session guard is stamped first).
-    expect(() => uiSessionGuard.canActivate(makeContext(invalidRequest))).toThrow();
+    await expect(uiSessionGuard.canActivate(makeContext(invalidRequest))).rejects.toThrow();
 
     await app.close();
   });
@@ -307,7 +307,7 @@ describe('guards coexistence — both actually run (AND semantics)', () => {
       }),
     } as unknown as ExecutionContext;
 
-    expect(apiSessionGuard.canActivate(context)).toBe(true);
+    await expect(apiSessionGuard.canActivate(context)).resolves.toBe(true);
     expect(allowAllGuard.canActivate(context)).toBe(true);
 
     await app.close();

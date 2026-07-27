@@ -69,23 +69,39 @@ export function readSessionFromRequest(
 }
 
 /**
- * Sliding renewal: when a valid cookie is past 50% of its TTL, re-issue a fresh one so an active
- * session never expires mid-use. Appends a new `Set-Cookie` (preserving any others already queued).
+ * Sliding renewal + revalidation. When a valid cookie is past 50% of its TTL, re-issue a fresh one
+ * so an active session never expires mid-use — but first give the host's `revalidate` hook a say,
+ * so a deactivated or demoted user loses access instead of riding a self-renewing cookie forever.
+ *
+ * Returns `false` when the session was revoked (the clearing `Set-Cookie` is already queued and the
+ * caller must deny the request); `true` otherwise, including when no renewal was due.
  */
-export function maybeRenewSession(
+export async function maybeRenewSession(
   auth: ResolvedDashboardAuth,
   session: DashboardSession,
   request: unknown,
   response: unknown,
-): void {
-  const now = Date.now();
-  if (now - session.iat <= auth.ttlMs / 2) return;
-  issueSessionCookie(
-    {
-      id: session.sub,
-      ...(session.name !== undefined ? { name: session.name } : {}),
-      roles: session.roles,
-    },
-    { auth, request, response, now },
-  );
+  now: number = Date.now(),
+): Promise<boolean> {
+  if (now - session.iat <= auth.ttlMs / 2) return true;
+  const user: DashboardSessionUser = {
+    id: session.sub,
+    ...(session.name !== undefined ? { name: session.name } : {}),
+    roles: session.roles,
+  };
+  if (auth.revalidate) {
+    let allowed: boolean;
+    try {
+      allowed = await auth.revalidate(user);
+    } catch {
+      // Fail closed: a throwing hook revokes rather than silently extending the session.
+      allowed = false;
+    }
+    if (!allowed) {
+      clearSessionCookie({ request, response });
+      return false;
+    }
+  }
+  issueSessionCookie(user, { auth, request, response, now });
+  return true;
 }

@@ -11,6 +11,14 @@ export type LoginHook = (
   password: string,
 ) => Promise<DashboardSessionUser | null> | DashboardSessionUser | null;
 
+/**
+ * Re-checks a LIVE session when the cookie is slid forward. Runs at most once per `ttl/2` per
+ * session, so a DB round-trip here is cheap. Return `false` to revoke (the cookie is cleared and
+ * the request denied). Distinct from `session`: that hook reads the host's auth off a fresh
+ * request, which a console XHR does not carry — this one receives the already-minted session.
+ */
+export type RevalidateHook = (session: DashboardSessionUser) => Promise<boolean> | boolean;
+
 export type AuthMode = 'session' | 'login';
 
 /**
@@ -36,6 +44,9 @@ export interface DashboardAuthOptions {
    *  session user, or `null` to deny. Thrown errors are treated as a denial (logged once, never
    *  surfaced to the client). */
   login?: LoginHook;
+  /** Re-checks a live session on sliding renewal; see `RevalidateHook`. Not a mode — it cannot
+   *  mint a session, only revoke one already minted by `session`/`login`. */
+  revalidate?: RevalidateHook;
 }
 
 /** Resolved, validated `dashboardAuth` config shared by the guards, auth controller, and login page. */
@@ -45,6 +56,7 @@ export interface ResolvedDashboardAuth {
   modes: AuthMode[];
   session?: SessionHook;
   login?: LoginHook;
+  revalidate?: RevalidateHook;
 }
 
 /** DI token carrying the resolved `dashboardAuth` config (`ResolvedDashboardAuth | null`). */
@@ -109,5 +121,6 @@ export function resolveDashboardAuth(
     modes,
     ...(options.session !== undefined ? { session: options.session } : {}),
     ...(options.login !== undefined ? { login: options.login } : {}),
+    ...(options.revalidate !== undefined ? { revalidate: options.revalidate } : {}),
   };
 }

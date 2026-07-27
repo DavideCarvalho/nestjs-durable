@@ -45,31 +45,42 @@ function validCookie(now = Date.now()): string {
   );
 }
 
+/** A signed cookie issued far enough in the past to be due for sliding renewal. */
+function signedCookieOlderThanHalfTtl(auth: ReturnType<typeof resolveDashboardAuth>): string {
+  const ttlMs = auth?.ttlMs ?? 8 * 60 * 60 * 1000;
+  const issuedAt = Date.now() - ttlMs * 0.75;
+  const cookieValue = signSessionCookie(
+    { id: 'ops', roles: ['admin'] },
+    { secret: SECRET, ttlMs, now: issuedAt },
+  );
+  return `durable_dashboard_session=${cookieValue}`;
+}
+
 describe('DurableUiSessionGuard (absent-option)', () => {
-  it('is a no-op — always allows — when dashboardAuth is not configured', () => {
+  it('is a no-op — always allows — when dashboardAuth is not configured', async () => {
     const guard = new DurableUiSessionGuard(null, BASE_PATH);
     const ctx = makeContext({ headers: {} }, makeResponse().raw);
-    expect(guard.canActivate(ctx)).toBe(true);
+    await expect(guard.canActivate(ctx)).resolves.toBe(true);
   });
 });
 
 describe('DurableUiSessionGuard (dashboardAuth configured)', () => {
   const auth = resolveDashboardAuth({ secret: SECRET, login: () => null });
 
-  it('allows a request carrying a valid session cookie', () => {
+  it('allows a request carrying a valid session cookie', async () => {
     const guard = new DurableUiSessionGuard(auth, BASE_PATH);
     const request = { headers: { cookie: `durable_dashboard_session=${validCookie()}` } };
     const ctx = makeContext(request, makeResponse().raw);
-    expect(guard.canActivate(ctx)).toBe(true);
+    await expect(guard.canActivate(ctx)).resolves.toBe(true);
   });
 
-  it('redirects (302, not 401) a page request with no cookie, carrying ?returnTo', () => {
+  it('redirects (302, not 401) a page request with no cookie, carrying ?returnTo', async () => {
     const guard = new DurableUiSessionGuard(auth, BASE_PATH);
     const request = { headers: {}, originalUrl: '/durable/runs/abc' };
     const ctx = makeContext(request, makeResponse().raw);
     let caught: unknown;
     try {
-      guard.canActivate(ctx);
+      await guard.canActivate(ctx);
     } catch (error) {
       caught = error;
     }
@@ -79,21 +90,21 @@ describe('DurableUiSessionGuard (dashboardAuth configured)', () => {
     );
   });
 
-  it('redirects a request with a tampered/invalid cookie', () => {
+  it('redirects a request with a tampered/invalid cookie', async () => {
     const guard = new DurableUiSessionGuard(auth, BASE_PATH);
     const request = { headers: { cookie: 'durable_dashboard_session=garbage' }, url: '/durable' };
     const ctx = makeContext(request, makeResponse().raw);
-    expect(() => guard.canActivate(ctx)).toThrow(DashboardLoginRedirectException);
+    await expect(guard.canActivate(ctx)).rejects.toThrow(DashboardLoginRedirectException);
   });
 
-  it('serves the session-required page (not a login redirect) when only Mode A is configured', () => {
+  it('serves the session-required page (not a login redirect) when only Mode A is configured', async () => {
     const modeAAuth = resolveDashboardAuth({ secret: SECRET, session: () => null });
     const guard = new DurableUiSessionGuard(modeAAuth, BASE_PATH);
     const ctx = makeContext({ headers: {} }, makeResponse().raw);
-    expect(() => guard.canActivate(ctx)).toThrow(DashboardSessionRequiredException);
+    await expect(guard.canActivate(ctx)).rejects.toThrow(DashboardSessionRequiredException);
   });
 
-  it('slides renewal: re-issues the cookie once past 50% of its TTL', () => {
+  it('slides renewal: re-issues the cookie once past 50% of its TTL', async () => {
     const shortAuth = resolveDashboardAuth({ secret: SECRET, ttl: '2h', login: () => null });
     const guard = new DurableUiSessionGuard(shortAuth, BASE_PATH);
     const issuedAt = Date.now() - 90 * 60 * 1000; // 90m ago, past 50% of a 2h ttl
@@ -103,7 +114,7 @@ describe('DurableUiSessionGuard (dashboardAuth configured)', () => {
     );
     const response = makeResponse();
     const request = { headers: { cookie: `durable_dashboard_session=${cookie}` } };
-    expect(guard.canActivate(makeContext(request, response.raw))).toBe(true);
+    await expect(guard.canActivate(makeContext(request, response.raw))).resolves.toBe(true);
     expect(response.setCookies().some((c) => c.startsWith('durable_dashboard_session='))).toBe(
       true,
     );
@@ -111,32 +122,45 @@ describe('DurableUiSessionGuard (dashboardAuth configured)', () => {
 });
 
 describe('DurableApiSessionGuard (absent-option)', () => {
-  it('is a no-op — always allows — when dashboardAuth is not configured', () => {
+  it('is a no-op — always allows — when dashboardAuth is not configured', async () => {
     const guard = new DurableApiSessionGuard(null);
     const ctx = makeContext({ headers: {} }, makeResponse().raw);
-    expect(guard.canActivate(ctx)).toBe(true);
+    await expect(guard.canActivate(ctx)).resolves.toBe(true);
   });
 });
 
 describe('DurableApiSessionGuard (dashboardAuth configured)', () => {
   const auth = resolveDashboardAuth({ secret: SECRET, login: () => null });
 
-  it('allows a request carrying a valid session cookie', () => {
+  it('allows a request carrying a valid session cookie', async () => {
     const guard = new DurableApiSessionGuard(auth);
     const request = { headers: { cookie: `durable_dashboard_session=${validCookie()}` } };
-    expect(guard.canActivate(makeContext(request, makeResponse().raw))).toBe(true);
+    await expect(guard.canActivate(makeContext(request, makeResponse().raw))).resolves.toBe(true);
   });
 
-  it('throws a plain 401 (not a redirect) for a missing cookie — the API is fetched, not navigated', () => {
+  it('throws a plain 401 (not a redirect) for a missing cookie — the API is fetched, not navigated', async () => {
     const guard = new DurableApiSessionGuard(auth);
     const ctx = makeContext({ headers: {} }, makeResponse().raw);
-    expect(() => guard.canActivate(ctx)).toThrow(UnauthorizedException);
+    await expect(guard.canActivate(ctx)).rejects.toThrow(UnauthorizedException);
   });
 
-  it('throws 401 for a tampered cookie', () => {
+  it('throws 401 for a tampered cookie', async () => {
     const guard = new DurableApiSessionGuard(auth);
     const request = { headers: { cookie: 'durable_dashboard_session=garbage' } };
-    expect(() => guard.canActivate(makeContext(request, makeResponse().raw))).toThrow(
+    await expect(guard.canActivate(makeContext(request, makeResponse().raw))).rejects.toThrow(
+      UnauthorizedException,
+    );
+  });
+
+  it('denies the API when revalidate revokes a renewable session', async () => {
+    const revalidateAuth = resolveDashboardAuth({
+      secret: SECRET,
+      session: () => null,
+      revalidate: () => false,
+    });
+    const guard = new DurableApiSessionGuard(revalidateAuth);
+    const request = { headers: { cookie: signedCookieOlderThanHalfTtl(revalidateAuth) } };
+    await expect(guard.canActivate(makeContext(request, makeResponse().raw))).rejects.toThrow(
       UnauthorizedException,
     );
   });

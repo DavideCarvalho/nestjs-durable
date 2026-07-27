@@ -33,21 +33,22 @@ export class DurableUiSessionGuard implements CanActivate {
     @Inject(DASHBOARD_BASE_PATH) private readonly basePath: string,
   ) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     if (!this.auth) return true;
     const http = context.switchToHttp();
     const request = http.getRequest<unknown>();
     const session = readSessionFromRequest(this.auth, request);
     if (!session) {
-      if (!this.auth.login) {
-        // Mode A only: there is no login page to bounce to — the host mints the session. Serve the
-        // instruction page instead of redirecting into a 404.
-        throw new DashboardSessionRequiredException(this.basePath);
-      }
+      if (!this.auth.login) throw new DashboardSessionRequiredException(this.basePath);
       const returnTo = encodeURIComponent(originalRequestUrl(request));
       throw new DashboardLoginRedirectException(`${this.basePath}/login?returnTo=${returnTo}`);
     }
-    maybeRenewSession(this.auth, session, request, http.getResponse());
+    if (!(await maybeRenewSession(this.auth, session, request, http.getResponse()))) {
+      // Revoked mid-session: same treatment as an absent cookie.
+      if (!this.auth.login) throw new DashboardSessionRequiredException(this.basePath);
+      const returnTo = encodeURIComponent(originalRequestUrl(request));
+      throw new DashboardLoginRedirectException(`${this.basePath}/login?returnTo=${returnTo}`);
+    }
     return true;
   }
 }
@@ -64,13 +65,16 @@ export class DurableUiSessionGuard implements CanActivate {
 export class DurableApiSessionGuard implements CanActivate {
   constructor(@Inject(DASHBOARD_AUTH) private readonly auth: ResolvedDashboardAuth | null) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     if (!this.auth) return true;
     const http = context.switchToHttp();
     const request = http.getRequest<unknown>();
     const session = readSessionFromRequest(this.auth, request);
     if (!session) throw new UnauthorizedException();
-    maybeRenewSession(this.auth, session, request, http.getResponse());
+    if (!(await maybeRenewSession(this.auth, session, request, http.getResponse()))) {
+      // Revoked mid-session: same treatment as an absent cookie.
+      throw new UnauthorizedException();
+    }
     return true;
   }
 }
