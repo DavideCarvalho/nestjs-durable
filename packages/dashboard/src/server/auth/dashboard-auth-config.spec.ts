@@ -61,4 +61,24 @@ describe('resolveDashboardAuth', () => {
       /at least one of `session` or `login`/,
     );
   });
+
+  it('throws (fail closed) when session is present but not a function', () => {
+    expect(() =>
+      resolveDashboardAuth({
+        secret: 's'.repeat(32),
+        // @ts-expect-error: exercising the wrong-type boot guard (a non-TS caller could pass this)
+        session: 'not-a-function',
+      }),
+    ).toThrow(/dashboardAuth\.session must be a function/);
+  });
+
+  it('throws (fail closed) when login is present but not a function', () => {
+    expect(() =>
+      resolveDashboardAuth({
+        secret: 's'.repeat(32),
+        // @ts-expect-error: exercising the wrong-type boot guard (a non-TS caller could pass this)
+        login: 'not-a-function',
+      }),
+    ).toThrow(/dashboardAuth\.login must be a function/);
+  });
 });

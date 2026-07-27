@@ -262,4 +262,19 @@ describe('DurableAuthController (Mode A — session hook)', () => {
     const controller = new DurableAuthController(auth, BASE_PATH);
     expect(() => controller.loginPage()).toThrow(NotFoundException);
   });
+
+  it('logout redirects to basePath (not the 404ing login page) when only Mode A is configured', () => {
+    const auth = resolveDashboardAuth({ secret: SECRET, session: () => null });
+    const controller = new DurableAuthController(auth, BASE_PATH);
+    const response = makeResponse();
+
+    controller.logout({ headers: {} }, response.raw);
+
+    expect(response.setCookies().some((c) => c.startsWith('durable_dashboard_session=;'))).toBe(
+      true,
+    );
+    expect(response.raw.statusCode).toBe(302);
+    expect(response.location()).toBe(BASE_PATH);
+    expect(response.ended()).toBe(true);
+  });
 });

@@ -85,8 +85,18 @@ export function resolveDashboardAuth(
     );
   }
   const modes: AuthMode[] = [];
-  if (options.session !== undefined) modes.push('session');
-  if (options.login !== undefined) modes.push('login');
+  if (options.session !== undefined) {
+    if (typeof options.session !== 'function') {
+      throw new Error('DurableDashboardModule: dashboardAuth.session must be a function.');
+    }
+    modes.push('session');
+  }
+  if (options.login !== undefined) {
+    if (typeof options.login !== 'function') {
+      throw new Error('DurableDashboardModule: dashboardAuth.login must be a function.');
+    }
+    modes.push('login');
+  }
   if (modes.length === 0) {
     throw new Error(
       'DurableDashboardModule: dashboardAuth needs at least one of `session` or `login` ' +
