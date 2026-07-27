@@ -78,7 +78,7 @@ function page(content: string, title = 'Durable'): string {
     font-size: 12px;
     color: #fb7185;
   }
-  button {
+  button, .button {
     margin-top: 8px;
     border-radius: 4px;
     border: 1px solid rgb(52 211 153 / 0.4);
@@ -91,8 +91,12 @@ function page(content: string, title = 'Durable'): string {
     text-transform: uppercase;
     letter-spacing: 0.05em;
     cursor: pointer;
+    display: inline-block;
+    text-align: center;
+    text-decoration: none;
+    box-sizing: border-box;
   }
-  button:hover:not(:disabled) { background: rgb(52 211 153 / 0.2); }
+  button:hover:not(:disabled), .button:hover { background: rgb(52 211 153 / 0.2); }
   button:disabled { opacity: 0.6; cursor: default; }
 </style>
 </head>
@@ -189,13 +193,14 @@ export function renderLoginPage(basePath: string): string {
  * Mode-A-only shell (`GET <basePath>/login` never renders under Mode A — this is what the page
  * guard serves in its place, see `session-required.exception.ts`): there is no form here because
  * the host mints the session. Mirrors `renderLoginPage`'s markup so the two pages look like one
- * product. `basePath` isn't otherwise interpolated (nothing here links back to it), but the param
- * mirrors `renderLoginPage`'s signature for symmetry between the two dashboardAuth pages.
+ * product. `basePath` drives the Retry link's `href` — a plain `<a>` back to the guarded mount
+ * (which re-runs the check once the host has minted a session), keeping this page free of any
+ * inline `<script>`, unlike `renderLoginPage`'s fetch-driven form.
  */
 export function renderSessionRequiredPage(basePath: string): string {
   return page(
     `<h1>Open this console from your application</h1>
      <p>Your session is minted by the host app. Use its console launcher to sign in, then reload.</p>
-     <button type="button" onclick="location.reload()">Retry</button>`,
+     <a class="button" href="${basePath}">Retry</a>`,
   );
 }

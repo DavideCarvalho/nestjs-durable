@@ -65,6 +65,13 @@ describe('DurableAuthController (absent-option)', () => {
       true,
     );
   });
+
+  it('redirects logout to basePath, not the login page (there is no `login` hook to 404 on)', () => {
+    const response = makeResponse();
+    controller.logout({ headers: {} }, response.raw);
+    expect(response.raw.statusCode).toBe(302);
+    expect(response.location()).toBe(BASE_PATH);
+  });
 });
 
 describe('DurableAuthController (dashboardAuth configured)', () => {

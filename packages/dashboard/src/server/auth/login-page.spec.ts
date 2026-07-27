@@ -37,10 +37,12 @@ describe('renderSessionRequiredPage', () => {
     expect(html).not.toContain('id="password"');
   });
 
-  it('explains the host mints the session and offers a reload button', () => {
+  it('explains the host mints the session and links back to basePath, with no inline script', () => {
     expect(html).toContain('<h1>Open this console from your application</h1>');
     expect(html).toContain('Your session is minted by the host app.');
-    expect(html).toContain('onclick="location.reload()"');
+    expect(html).toContain('<a class="button" href="/durable">Retry</a>');
+    expect(html).not.toContain('<script>');
+    expect(html).not.toContain('onclick');
   });
 
   it("shares renderLoginPage's dark zinc/emerald palette (same page() shell)", () => {

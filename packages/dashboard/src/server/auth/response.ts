@@ -92,5 +92,8 @@ export function writeHtmlRaw(response: unknown, html: string, status = 200): voi
   if (!raw) return;
   raw.statusCode = status;
   raw.setHeader('content-type', 'text/html; charset=utf-8');
+  // Same as the auth controller's `@Header('Cache-Control', ...)` on the sibling login page: this
+  // page reflects live session state, so it must never be served stale from a cache.
+  raw.setHeader('cache-control', 'no-store, must-revalidate');
   raw.end(html);
 }

@@ -96,6 +96,16 @@ export interface DurableDashboardOptions {
    * request (`apiBasePath`, fetched by the SPA's own JS) always gets a plain `401` on a missing
    * session, regardless of mode — the caller reads the status code, not HTML.
    *
+   * A third, optional hook — **`revalidate`** — re-checks an already-minted session rather than
+   * minting one: once a session cookie is past 50% of its TTL, the guard slides it forward with a
+   * fresh one, and if `revalidate` is set it's consulted first, so a deactivated or demoted
+   * operator loses access instead of riding a self-renewing cookie indefinitely. It only runs on
+   * that renewal path, not on every request, so revocation has **latency, not immediacy**: an
+   * operator revoked right after a renewal keeps their existing cookie — and therefore console
+   * access — for up to `ttl/2` (4 hours at the default 8h TTL) before the next renewal check catches
+   * it. Do not rely on `revalidate` for a same-second cutoff; front the mount with your own guard
+   * (see {@link guards}) if you need that.
+   *
    * Auth here is mount-level and role-agnostic: this option (and the guards/controller it wires up)
    * has no notion of control-plane vs tenant role (see the durable dashboard's topology note in
    * `dashboard.service.ts`) — nothing role-specific changes based on who logs in.
@@ -106,8 +116,8 @@ export interface DurableDashboardOptions {
    * the console open (today's behavior, unchanged byte-for-byte) — front it with `guards`, a global
    * guard, or a reverse proxy instead.
    *
-   * See {@link DashboardAuthOptions} for the `secret`/`ttl`/`session`/`login` shape, and
-   * `forRootAsync` / {@link DurableDashboardAsyncOptions.useDashboardAuth} when a hook needs DI
+   * See {@link DashboardAuthOptions} for the `secret`/`ttl`/`session`/`login`/`revalidate` shape,
+   * and `forRootAsync` / {@link DurableDashboardAsyncOptions.useDashboardAuth} when a hook needs DI
    * (e.g. an `EntityManager` to look up an admin user).
    */
   dashboardAuth?: DashboardAuthOptions;

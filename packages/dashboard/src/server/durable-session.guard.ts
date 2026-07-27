@@ -39,7 +39,9 @@ export class DurableUiSessionGuard implements CanActivate {
     const http = context.switchToHttp();
     const request = http.getRequest<unknown>();
     const session = readSessionFromRequest(auth, request);
-    if (!session) this.denyUnauthenticated(auth, request);
+    if (!session) {
+      this.denyUnauthenticated(auth, request);
+    }
     if (!(await maybeRenewSession(auth, session, request, http.getResponse()))) {
       this.denyUnauthenticated(auth, request);
     }
