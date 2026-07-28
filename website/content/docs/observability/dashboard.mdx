@@ -150,6 +150,37 @@ page-level request (a full-page navigation) with a missing/invalid/expired cooki
 a small, static instruction page telling the visitor to sign in through the host app; an API
 request (`apiBasePath`, fetched by the SPA's own JS) still gets a plain `401`, same as Mode B.
 
+#### `unauthenticatedPage` — render that page yourself
+
+The built-in instruction page cannot know who hosts the console, so it can only say "open this
+console from your application" in the abstract — it can't name your launcher, link to it, or look
+like the rest of your product. Pass `unauthenticatedPage` and the whole response is yours:
+
+```ts
+DurableDashboardModule.forRoot({
+  dashboardAuth: {
+    secret: process.env.DURABLE_AUTH_SECRET,
+    session: (request) => resolveAdmin(request),
+    unauthenticatedPage: ({ request, response, basePath }) => {
+      // `request`/`response` are your platform's own objects (Express here). Render however you
+      // already render — a template engine, @dudousxd/nestjs-inertia, a plain string.
+      (response as Response).status(401).render('console-locked', { returnTo: basePath });
+    },
+  },
+});
+```
+
+The hook **owns** the response: it must write AND end it. Serving happens at the console's own URL,
+so `/durable` stays `/durable` (no redirect, no second route for you to own).
+
+It cannot open the console — it only ever runs on a request that has already been denied. If it
+throws, or returns without writing anything, the library logs a warning once and falls back to the
+built-in page, so a broken page can't hang the request or turn a denial into a `500`.
+
+This is **not** a replacement for Mode B's login form. To ship your own *login* UI, combine Mode A
+with this hook and `POST <basePath>/session` from your page — the mint endpoint is the supported
+primitive for exactly that.
+
 #### Mode B — `login`, the built-in login page
 
 No host frontend/IdP to lean on. The dashboard serves its own small, dependency-free,

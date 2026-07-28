@@ -82,6 +82,25 @@ export function redirectRaw(response: unknown, location: string, status = 302): 
 }
 
 /**
+ * Did something already write to this response?
+ *
+ * Used to decide whether a host's `unauthenticatedPage` hook actually produced a page. A hook that
+ * returns without writing (an early `return`, a forgotten `await`, a template that resolved to
+ * nothing) would otherwise leave the request hanging forever — the browser spins until it times
+ * out, with no error anywhere. Checking this lets the caller fall back to the built-in page.
+ *
+ * Reads the Node `ServerResponse.headersSent` through the same Express/Fastify unwrapping as the
+ * writers above; Fastify's own `reply.sent` is not consulted because `.raw.headersSent` is true in
+ * every case that matters here (the reply has been flushed to the socket).
+ */
+export function responseAlreadyWritten(response: unknown): boolean {
+  const raw = resolveRedirectResponse(response) as
+    | (RawRedirectResponse & { headersSent?: boolean })
+    | null;
+  return raw?.headersSent === true;
+}
+
+/**
  * Write a full HTML page directly on the raw response and END it. Used by
  * `DashboardSessionRequiredFilter` (the Mode-A-only instruction page a guard renders in place of a
  * login redirect that no longer exists) — same raw-response bypass, and the same reason it's safe:
