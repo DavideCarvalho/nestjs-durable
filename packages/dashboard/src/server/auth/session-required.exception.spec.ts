@@ -1,6 +1,6 @@
 import type { ArgumentsHost } from '@nestjs/common';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ResolvedDashboardAuth } from './dashboard-auth-config.js';
+import type { ResolvedDashboardAuth, UnauthenticatedPageHook } from './dashboard-auth-config.js';
 import {
   DashboardSessionRequiredException,
   DashboardSessionRequiredFilter,
@@ -36,9 +36,7 @@ function hostFor(response: unknown, request: unknown = { url: '/durable' }): Arg
   } as unknown as ArgumentsHost;
 }
 
-function authWith(
-  unauthenticatedPage: ResolvedDashboardAuth['unauthenticatedPage'],
-): ResolvedDashboardAuth {
+function authWith(unauthenticatedPage: UnauthenticatedPageHook): ResolvedDashboardAuth {
   return { secret: 's'.repeat(32), ttlMs: 1000, modes: ['session'], unauthenticatedPage };
 }
 
