@@ -10,7 +10,7 @@ import {
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it } from 'vitest';
-import { DashboardService } from './dashboard.service';
+import { DashboardService } from './dashboard.service.js';
 
 /** A run with just the required `WorkflowRun` fields filled in, for gateway fakes that only need an id. */
 function fakeRun(id: string): WorkflowRun {

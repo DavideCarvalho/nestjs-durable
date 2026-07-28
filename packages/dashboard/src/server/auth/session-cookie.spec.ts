@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { type DashboardAuthOptions, resolveDashboardAuth } from './dashboard-auth-config';
-import { signSessionCookie, verifySessionCookie } from './session-cookie';
-import { maybeRenewSession } from './session-cookie-io';
+import { type DashboardAuthOptions, resolveDashboardAuth } from './dashboard-auth-config.js';
+import { maybeRenewSession } from './session-cookie-io.js';
+import { signSessionCookie, verifySessionCookie } from './session-cookie.js';
 
 const SECRET = 'a-very-not-secret-test-key';
 
@@ -97,12 +97,22 @@ describe('session cookie sign/verify (round-trip)', () => {
 });
 
 describe('maybeRenewSession (sliding renewal + revalidation)', () => {
-  const HALF_LIFE_PASSED = { iat: Date.now() - 5 * 60 * 60 * 1000, sub: '7', roles: ['admin'] };
+  // `exp` is not read by `maybeRenewSession` (renewal is gated on `iat` only, see
+  // session-cookie-io.ts) but the fixtures still need a well-typed `DashboardSession`.
+  const DEFAULT_TTL_MS = 8 * 60 * 60 * 1000;
+  const HALF_LIFE_PASSED_IAT = Date.now() - 5 * 60 * 60 * 1000;
+  const HALF_LIFE_PASSED = {
+    iat: HALF_LIFE_PASSED_IAT,
+    exp: HALF_LIFE_PASSED_IAT + DEFAULT_TTL_MS,
+    sub: '7',
+    roles: ['admin'],
+  };
 
   it('does not call revalidate before half the TTL has passed', async () => {
     const revalidate = vi.fn().mockResolvedValue(true);
     const auth = resolveAuth({ secret: 's'.repeat(32), session: () => null, revalidate });
-    const fresh = { iat: Date.now(), sub: '7', roles: ['admin'] };
+    const now = Date.now();
+    const fresh = { iat: now, exp: now + DEFAULT_TTL_MS, sub: '7', roles: ['admin'] };
     await maybeRenewSession(auth, fresh, { headers: {} }, mockResponse());
     expect(revalidate).not.toHaveBeenCalled();
   });

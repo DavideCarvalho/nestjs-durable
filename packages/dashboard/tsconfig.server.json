@@ -6,6 +6,5 @@
     "outDir": "dist/server",
     "rootDir": "src/server"
   },
-  "include": ["src/server/**/*.ts"],
-  "exclude": ["src/server/**/*.spec.ts"]
+  "include": ["src/server/**/*.ts"]
 }

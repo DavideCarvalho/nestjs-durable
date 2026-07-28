@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseAttrFilters } from './attr-filter';
+import { parseAttrFilters } from './attr-filter.js';
 
 describe('parseAttrFilters', () => {
   it('parses a single key:op:value and coerces the value type', () => {

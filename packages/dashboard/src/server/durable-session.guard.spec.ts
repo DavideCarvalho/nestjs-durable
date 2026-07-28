@@ -1,11 +1,11 @@
 import type { ExecutionContext } from '@nestjs/common';
 import { UnauthorizedException } from '@nestjs/common';
 import { describe, expect, it } from 'vitest';
-import { resolveDashboardAuth } from './auth/dashboard-auth-config';
-import { DashboardLoginRedirectException } from './auth/login-redirect.exception';
-import { signSessionCookie } from './auth/session-cookie';
-import { DashboardSessionRequiredException } from './auth/session-required.exception';
-import { DurableApiSessionGuard, DurableUiSessionGuard } from './durable-session.guard';
+import { resolveDashboardAuth } from './auth/dashboard-auth-config.js';
+import { DashboardLoginRedirectException } from './auth/login-redirect.exception.js';
+import { signSessionCookie } from './auth/session-cookie.js';
+import { DashboardSessionRequiredException } from './auth/session-required.exception.js';
+import { DurableApiSessionGuard, DurableUiSessionGuard } from './durable-session.guard.js';
 
 const SECRET = 'guard-spec-secret-key-0123456789-abcdef';
 const BASE_PATH = '/durable';
