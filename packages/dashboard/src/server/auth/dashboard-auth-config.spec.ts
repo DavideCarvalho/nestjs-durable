@@ -92,4 +92,37 @@ describe('resolveDashboardAuth', () => {
       }),
     ).toThrow(/dashboardAuth\.revalidate must be a function/);
   });
+
+  it('throws (fail closed) when unauthenticatedPage is present but not a function', () => {
+    expect(() =>
+      resolveDashboardAuth({
+        secret: 's'.repeat(32),
+        session: () => null,
+        // @ts-expect-error: exercising the wrong-type boot guard (a non-TS caller could pass this)
+        unauthenticatedPage: '/my/login/page',
+      }),
+    ).toThrow(/dashboardAuth\.unauthenticatedPage must be a function/);
+  });
+
+  it('carries unauthenticatedPage through to the resolved config', () => {
+    const unauthenticatedPage = () => {};
+    const resolved = resolveDashboardAuth({
+      secret: 's'.repeat(32),
+      session: () => null,
+      unauthenticatedPage,
+    });
+    expect(resolved?.unauthenticatedPage).toBe(unauthenticatedPage);
+  });
+
+  it('is not a mode: a page hook alone cannot mint a session', () => {
+    // The page hook renders a denial — it can never grant one. Without `session` or `login` there is
+    // still no way to mint the cookie, so this must remain the same boot error as before rather than
+    // a console gated by a page that can't let anyone in.
+    expect(() =>
+      resolveDashboardAuth({
+        secret: 's'.repeat(32),
+        unauthenticatedPage: () => {},
+      }),
+    ).toThrow(/at least one of `session` or `login`/);
+  });
 });
