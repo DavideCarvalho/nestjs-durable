@@ -1,5 +1,77 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.39.0
+
+### Minor Changes
+
+- 2564a0f: **Headless console launcher: `openDurableConsole` / `mintDurableConsoleSession` / `durableConsoleSessionUrl`, exported from `@dudousxd/nestjs-durable-dashboard/client`.**
+
+  The console is entered from the HOST's app: a browser navigation to it carries no identity, so
+  something inside the host has to mint the Mode A session cookie first (an XHR that _does_ carry the
+  host's auth), then navigate. Every host was writing that by hand, which meant hardcoding two things
+  this package owns:
+
+  - **the session endpoint's path** — `<basePath>/session`. Nothing tells a host when that moves; the break
+    only shows up as a runtime 404 after a version bump.
+  - **`redirect: 'manual'`** — and this one is a real trap. `fetch` follows redirects by default, so a
+    host whose auth layer rewrites a 401 into a sign-in redirect gets a resolved 200 against the
+    sign-in HTML. `response.ok` reads true, the caller navigates, and the user lands in a console with
+    no session — indistinguishable from a permissions bug. The helper detects the redirect (browser
+    opaque response _and_ Node/undici 3xx) and throws a message naming the likely cause.
+
+  ```ts
+  import { openDurableConsole } from "@dudousxd/nestjs-durable-dashboard/client";
+
+  await openDurableConsole({
+    headers: () => ({ Authorization: `Bearer ${token()}` }),
+  });
+  ```
+
+  No UI: the host owns the button, the page and the copy. `headers` accepts a sync or async function
+  so a refreshing token is read at call time rather than captured at wiring time. `fetch` and
+  `navigate` are injectable (tests, routers, non-browser callers). A refused mint throws
+  `ConsoleSessionError` (carrying `status` and `url`) and **does not navigate** — a denied user gets a
+  real error instead of the console's "no session" page.
+
+  Additive only: nothing existing changes.
+
+- 2564a0f: **A React tier at the new `./react` subpath — so the console launcher has all three levels, not just the headless one.**
+
+  `@dudousxd/nestjs-durable-dashboard` had no React surface at all (unlike telescope's `./react`,
+  `nestjs-media-react` and `nestjs-agent-react`), so a host wiring a launcher had to build the UI from
+  scratch even though every host builds the same one. Now:
+
+  | Level    | Import                                        | You own    |
+  | -------- | --------------------------------------------- | ---------- |
+  | headless | `openDurableConsole` from `./client`          | everything |
+  | hook     | `useOpenDurableConsole()` from `./react`      | the markup |
+  | drop-in  | `<OpenDurableConsoleButton />` from `./react` | nothing    |
+
+  ```tsx
+  import { OpenDurableConsoleButton } from "@dudousxd/nestjs-durable-dashboard/react";
+
+  <OpenDurableConsoleButton
+    className="btn btn-primary"
+    headers={() => authHeaders()}
+  />;
+  ```
+
+  The button is **unstyled** and forwards `className`/`style`/every other button prop, so it inherits
+  the host's design system rather than importing CSS that would fight it. It renders the refusal by
+  default (a launcher that silently does nothing reads as broken rather than forbidden); pass
+  `renderError` to render your own node, or `renderError={null}` to opt out. It disables itself while
+  in flight so a double-click cannot fire a second mint that lands after the navigation.
+
+  `openDurableConsoleMutationOptions()` gives **TanStack Query integration without a TanStack
+  dependency**: it returns the object `useMutation` takes, so a host already using Query gets the
+  launcher in its cache, devtools and error handling, and a host that isn't pays nothing.
+
+  React and react-dom are **optional** peer dependencies, and the React code lives behind its own
+  subpath — a host that only mounts the NestJS module never pulls React in.
+
+  Also widens the repo's vitest `include` to `.tsx`: the `.ts`-only glob silently collected no specs
+  for these components.
+
 ## 0.38.0
 
 ### Minor Changes
