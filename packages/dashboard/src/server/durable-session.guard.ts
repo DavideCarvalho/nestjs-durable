@@ -59,7 +59,7 @@ export class DurableUiSessionGuard implements CanActivate {
    * asserting away) the nullability.
    */
   private denyUnauthenticated(auth: ResolvedDashboardAuth, request: unknown): never {
-    if (!auth.login) throw new DashboardSessionRequiredException(this.basePath);
+    if (!auth.modes.includes('login')) throw new DashboardSessionRequiredException(this.basePath);
     const returnTo = encodeURIComponent(originalRequestUrl(request));
     throw new DashboardLoginRedirectException(`${this.basePath}/login?returnTo=${returnTo}`);
   }
@@ -79,14 +79,25 @@ export class DurableApiSessionGuard implements CanActivate {
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     if (!this.auth) return true;
+    const auth = this.auth;
     const http = context.switchToHttp();
     const request = http.getRequest<unknown>();
-    const session = readSessionFromRequest(this.auth, request);
-    if (!session) throw new UnauthorizedException();
-    if (!(await maybeRenewSession(this.auth, session, request, http.getResponse()))) {
+    const session = readSessionFromRequest(auth, request);
+    if (!session) throw this.unauthorized(auth);
+    if (!(await maybeRenewSession(auth, session, request, http.getResponse()))) {
       // Revoked mid-session: same treatment as an absent cookie.
-      throw new UnauthorizedException();
+      throw this.unauthorized(auth);
     }
     return true;
+  }
+
+  /**
+   * A bare 401 body carrying `{ auth: { modes } }` — mirrors `@dudousxd/nestjs-telescope`'s
+   * dashboardAuth 401. The API is fetched (never navigated), so this is the ONLY way the console
+   * SPA (`durable-client.ts`) learns which auth surface to send the operator to on a mid-session
+   * 401; `DurableUiSessionGuard`'s redirect/session-required exceptions above don't reach it.
+   */
+  private unauthorized(auth: ResolvedDashboardAuth): UnauthorizedException {
+    return new UnauthorizedException({ auth: { modes: auth.modes } });
   }
 }

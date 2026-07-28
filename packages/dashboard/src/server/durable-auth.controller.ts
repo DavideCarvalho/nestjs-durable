@@ -60,7 +60,7 @@ export class DurableAuthController {
   @Header('Cache-Control', 'no-store, must-revalidate')
   loginPage(): string {
     const auth = this.requireAuth();
-    if (!auth.login) throw new NotFoundException();
+    if (!auth.modes.includes('login')) throw new NotFoundException();
     return renderLoginPage(this.basePath);
   }
 
@@ -76,7 +76,7 @@ export class DurableAuthController {
     @Res({ passthrough: true }) response: unknown,
   ): Promise<{ redirectTo: string }> {
     const auth = this.requireAuth();
-    if (!auth.login) throw new NotFoundException();
+    if (!auth.modes.includes('login')) throw new NotFoundException();
     if (!isString(body?.username) || !isString(body?.password)) {
       throw new BadRequestException('Body must include string `username` and `password`.');
     }
@@ -98,7 +98,7 @@ export class DurableAuthController {
   ): Promise<void> {
     const auth = this.requireAuth();
     // Mode A not configured => the endpoint does not exist for this host.
-    if (!auth.session) throw new NotFoundException();
+    if (!auth.modes.includes('session')) throw new NotFoundException();
     const user = await this.runHook('session', () => auth.session?.(request) ?? null);
     if (!user) throw new UnauthorizedException();
     issueSessionCookie(user, { auth, request, response });
@@ -115,7 +115,10 @@ export class DurableAuthController {
     // Only bounce to the login page when Mode B is actually configured — under Mode A (only), that
     // page 404s (see loginPage()); redirecting to basePath instead lands back on the guarded UI,
     // which renders the Mode-A session-required instruction page.
-    redirectRaw(response, this.auth?.login ? `${this.basePath}/login` : this.basePath);
+    redirectRaw(
+      response,
+      this.auth?.modes.includes('login') ? `${this.basePath}/login` : this.basePath,
+    );
   }
 
   private requireAuth(): ResolvedDashboardAuth {
