@@ -1,11 +1,11 @@
 import type { ExecutionContext } from '@nestjs/common';
 import { UnauthorizedException } from '@nestjs/common';
 import { describe, expect, it } from 'vitest';
-import { resolveDashboardAuth } from './auth/dashboard-auth-config';
-import { DashboardLoginRedirectException } from './auth/login-redirect.exception';
-import { signSessionCookie } from './auth/session-cookie';
-import { DashboardSessionRequiredException } from './auth/session-required.exception';
-import { DurableApiSessionGuard, DurableUiSessionGuard } from './durable-session.guard';
+import { resolveDashboardAuth } from './auth/dashboard-auth-config.js';
+import { DashboardLoginRedirectException } from './auth/login-redirect.exception.js';
+import { signSessionCookie } from './auth/session-cookie.js';
+import { DashboardSessionRequiredException } from './auth/session-required.exception.js';
+import { DurableApiSessionGuard, DurableUiSessionGuard } from './durable-session.guard.js';
 
 const SECRET = 'guard-spec-secret-key-0123456789-abcdef';
 const BASE_PATH = '/durable';
@@ -187,5 +187,43 @@ describe('DurableApiSessionGuard (dashboardAuth configured)', () => {
     await expect(guard.canActivate(makeContext(request, makeResponse().raw))).rejects.toThrow(
       UnauthorizedException,
     );
+  });
+
+  // The console SPA (`durable-client.ts`) has no other way to tell Mode A from Mode B on a
+  // mid-session 401 — it never sees `DashboardLoginRedirectException`/
+  // `DashboardSessionRequiredException` (those are page-guard-only); it only ever gets this bare
+  // 401. Carrying `modes` here (mirroring `@dudousxd/nestjs-telescope`'s dashboardAuth 401 body)
+  // is how the client learns which auth surface to send the operator to.
+  it('carries `auth.modes` on the 401 body for a missing cookie, so the SPA can pick the right auth surface', async () => {
+    const guard = new DurableApiSessionGuard(auth);
+    const ctx = makeContext({ headers: {} }, makeResponse().raw);
+    let caught: unknown;
+    try {
+      await guard.canActivate(ctx);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(UnauthorizedException);
+    expect((caught as UnauthorizedException).getResponse()).toEqual({ auth: { modes: ['login'] } });
+  });
+
+  it('carries `auth.modes` on the 401 body when revalidate revokes a renewable session', async () => {
+    const revalidateModeAAuth = resolveDashboardAuth({
+      secret: SECRET,
+      session: () => null,
+      revalidate: () => false,
+    });
+    const guard = new DurableApiSessionGuard(revalidateModeAAuth);
+    const request = { headers: { cookie: signedCookieOlderThanHalfTtl(revalidateModeAAuth) } };
+    let caught: unknown;
+    try {
+      await guard.canActivate(makeContext(request, makeResponse().raw));
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(UnauthorizedException);
+    expect((caught as UnauthorizedException).getResponse()).toEqual({
+      auth: { modes: ['session'] },
+    });
   });
 });

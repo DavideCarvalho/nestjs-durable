@@ -13,9 +13,11 @@ export type LoginHook = (
 
 /**
  * Re-checks a LIVE session when the cookie is slid forward. Runs at most once per `ttl/2` per
- * session, so a DB round-trip here is cheap. Return `false` to revoke (the cookie is cleared and
- * the request denied). Distinct from `session`: that hook reads the host's auth off a fresh
- * request, which a console XHR does not carry — this one receives the already-minted session.
+ * session, so a DB round-trip here is cheap — this holds even under concurrent traffic: N parallel
+ * requests carrying the same past-half-life cookie share ONE call (see `revalidateOnce` in
+ * `session-cookie-io.ts`), not N. Return `false` to revoke (the cookie is cleared and the request
+ * denied). Distinct from `session`: that hook reads the host's auth off a fresh request, which a
+ * console XHR does not carry — this one receives the already-minted session.
  */
 export type RevalidateHook = (session: DashboardSessionUser) => Promise<boolean> | boolean;
 

@@ -325,14 +325,68 @@ declare global {
   }
 }
 
+/** The SPA's own UI mount (e.g. `/durable`), independent of the (possibly host-overridden) API
+ *  base — this is where `DurableUiSessionGuard` lives, so it's the right target to navigate the
+ *  browser to when a session is gone and the destination isn't a known login page. */
+function uiBase(): string {
+  return (typeof window !== 'undefined' && window.__DURABLE_BASE__) || '/durable';
+}
+
 function apiBase(): string {
   if (typeof window !== 'undefined' && window.__DURABLE_API__) return window.__DURABLE_API__;
-  const base = (typeof window !== 'undefined' && window.__DURABLE_BASE__) || '/durable';
-  return `${base}/api`;
+  return `${uiBase()}/api`;
+}
+
+/**
+ * Best-effort read of the `{ auth: { modes } }` a `DurableApiSessionGuard` 401 carries (mirrors
+ * `@dudousxd/nestjs-telescope`'s dashboardAuth 401 body) — the same signal `DurableUiSessionGuard`
+ * would act on for a full-page navigation, just not directly reachable from an XHR. Returns
+ * `undefined` for anything that doesn't parse (including an older server that predates this body,
+ * or a host without `dashboardAuth` configured at all), so the caller can fall back safely.
+ */
+async function readAuthModes(res: Response): Promise<string[] | undefined> {
+  try {
+    const body: unknown = await res.json();
+    if (typeof body !== 'object' || body === null || !('auth' in body)) return undefined;
+    const auth = (body as { auth?: unknown }).auth;
+    if (typeof auth !== 'object' || auth === null || !('modes' in auth)) return undefined;
+    const modes = (auth as { modes?: unknown }).modes;
+    return Array.isArray(modes)
+      ? modes.filter((m): m is string => typeof m === 'string')
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A 401 mid-session (routine since `revalidate`: a deactivated/demoted operator's cookie is
+ * cleared on their next renewal) means there's nothing left to render — take the browser to the
+ * matching auth surface instead of leaving a raw error in the console. Mode B (`login` offered):
+ * the built-in login page, carrying `returnTo` back to here. Otherwise (Mode A, or an older server
+ * that sends a bare 401 with no `modes`): a plain navigation to the UI mount, which
+ * `DurableUiSessionGuard` itself renders as the Mode-A session-required page — so this never has
+ * to duplicate that guard's mode logic, only trigger it.
+ */
+function redirectToAuthSurface(modes: readonly string[] | undefined): void {
+  if (typeof window === 'undefined') return;
+  const base = uiBase();
+  if (modes?.includes('login')) {
+    const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
+    window.location.href = `${base}/login?returnTo=${returnTo}`;
+    return;
+  }
+  window.location.href = base;
 }
 
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(apiBase() + path, init);
+  if (res.status === 401) {
+    redirectToAuthSurface(await readAuthModes(res));
+    // The navigation above is async; reject so the caller's `.then`/`await` chain doesn't
+    // continue as if this call had succeeded while the browser is on its way elsewhere.
+    throw new Error('Session expired; redirecting to sign-in.');
+  }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as T;
 }

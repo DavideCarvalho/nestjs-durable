@@ -1,9 +1,9 @@
 import { BadRequestException, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { describe, expect, it, vi } from 'vitest';
-import { parseCookieHeader } from './auth/cookie-header';
-import { resolveDashboardAuth } from './auth/dashboard-auth-config';
-import { verifySessionCookie } from './auth/session-cookie';
-import { DurableAuthController } from './durable-auth.controller';
+import { parseCookieHeader } from './auth/cookie-header.js';
+import { resolveDashboardAuth } from './auth/dashboard-auth-config.js';
+import { verifySessionCookie } from './auth/session-cookie.js';
+import { DurableAuthController } from './durable-auth.controller.js';
 
 const SECRET = 'controller-spec-secret-key-0123456789';
 const BASE_PATH = '/durable';

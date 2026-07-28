@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { renderLoginPage, renderSessionRequiredPage } from './login-page';
+import { renderLoginPage, renderSessionRequiredPage } from './login-page.js';
 
 describe('renderLoginPage', () => {
   const html = renderLoginPage('/durable');

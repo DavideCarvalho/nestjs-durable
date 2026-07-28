@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveDashboardAuth } from './dashboard-auth-config';
+import { resolveDashboardAuth } from './dashboard-auth-config.js';
 
 describe('resolveDashboardAuth', () => {
   it('returns null when dashboardAuth is not configured (absent-option)', () => {
