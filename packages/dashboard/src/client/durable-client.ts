@@ -15,6 +15,17 @@ import type {
 // hand-mirrored field by field, so a new core field shows up here automatically instead of silently
 // drifting; each deliberate divergence from core is called out and justified inline where it's made.
 
+// Headless console-launcher primitives (path derivation + mint-then-navigate). Re-exported here
+// because `./client` resolves to this file — see the package's `exports` map.
+export {
+  ConsoleSessionError,
+  durableConsoleSessionUrl,
+  durableConsoleUrl,
+  mintDurableConsoleSession,
+  openDurableConsole,
+  type OpenConsoleOptions,
+} from './console-session.js';
+
 export type RunStatus = CoreRunStatus;
 export type StepKind = CoreStepKind;
 
