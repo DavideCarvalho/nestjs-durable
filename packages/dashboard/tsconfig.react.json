@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "jsx": "react-jsx",
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  // `src/client` is included (not just `src/react`) because the React tier re-exports it, and
+  // rootDir must cover both for the emitted paths to stay `dist/react/*` + `dist/client/*`. The
+  // duplicate client emit is byte-identical to tsconfig.client.json's and lands in the same place.
+  "include": ["src/react/**/*.ts", "src/react/**/*.tsx", "src/client/**/*.ts"],
+  "exclude": ["src/**/*.spec.ts", "src/**/*.spec.tsx"]
+}

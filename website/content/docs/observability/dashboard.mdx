@@ -150,6 +150,32 @@ page-level request (a full-page navigation) with a missing/invalid/expired cooki
 a small, static instruction page telling the visitor to sign in through the host app; an API
 request (`apiBasePath`, fetched by the SPA's own JS) still gets a plain `401`, same as Mode B.
 
+### Opening the console from your app
+
+Your launcher has to mint the Mode A cookie before navigating (see [Mode A](#mode-a--session-ride-your-hosts-own-auth)). The package ships that at three levels — take the one that fits and drop a level whenever it stops fitting:
+
+```tsx
+// 1. Drop-in. Unstyled; forwards className/style/every button prop.
+import { OpenDurableConsoleButton } from '@dudousxd/nestjs-durable-dashboard/react';
+<OpenDurableConsoleButton className="btn" headers={() => authHeaders()} />;
+
+// 2. Hook. You own the markup, it owns the states.
+import { useOpenDurableConsole } from '@dudousxd/nestjs-durable-dashboard/react';
+const { open, isPending, error } = useOpenDurableConsole({ headers });
+
+// 3. Headless. No React at all.
+import { openDurableConsole } from '@dudousxd/nestjs-durable-dashboard/client';
+await openDurableConsole({ headers });
+```
+
+Already on TanStack Query? `openDurableConsoleMutationOptions()` returns the object `useMutation` takes — this package does not depend on TanStack, so you get the integration and a host that doesn't use Query pays nothing.
+
+<Callout type="warn">
+  Do **not** hand-roll the `fetch`. `fetch` follows redirects by default, so an app whose auth layer rewrites a 401 into a sign-in redirect gets a resolved **200 against the sign-in HTML** — `response.ok` reads true, your code navigates, and the user lands in a console with no session, which looks exactly like a permissions bug. These helpers use `redirect: 'manual'` and turn that case into an error naming the likely cause. They also derive the session path from `basePath`, so a route change here can't silently 404 your launcher.
+</Callout>
+
+React and `react-dom` are optional peer dependencies and the React code lives behind the `./react` subpath, so mounting only the NestJS module pulls in neither.
+
 #### `unauthenticatedPage` — render that page yourself
 
 The built-in instruction page cannot know who hosts the console, so it can only say "open this
