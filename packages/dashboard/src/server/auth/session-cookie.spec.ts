@@ -162,4 +162,62 @@ describe('maybeRenewSession (sliding renewal + revalidation)', () => {
       maybeRenewSession(auth, HALF_LIFE_PASSED, { headers: {} }, mockResponse()),
     ).resolves.toBe(true);
   });
+
+  describe('concurrent-request de-duplication (stampede)', () => {
+    it('collapses N concurrent renewals of the SAME session into a single host revalidate call', async () => {
+      const revalidate = vi.fn().mockResolvedValue(true);
+      const auth = resolveAuth({ secret: 's'.repeat(32), session: () => null, revalidate });
+      const responses = [mockResponse(), mockResponse(), mockResponse()];
+
+      const results = await Promise.all(
+        responses.map((response) =>
+          maybeRenewSession(auth, HALF_LIFE_PASSED, { headers: {} }, response),
+        ),
+      );
+
+      expect(revalidate).toHaveBeenCalledTimes(1);
+      expect(results).toEqual([true, true, true]);
+      // Every caller still independently gets its own renewed cookie on its own response — only
+      // the host round trip is shared, not the per-request cookie issuance.
+      for (const response of responses) {
+        expect(setCookiesOn(response)[0]).toContain('durable_dashboard_session=');
+      }
+    });
+
+    it('does NOT collapse concurrent renewals of DIFFERENT sessions', async () => {
+      const revalidate = vi.fn().mockResolvedValue(true);
+      const auth = resolveAuth({ secret: 's'.repeat(32), session: () => null, revalidate });
+      const sessionA = { ...HALF_LIFE_PASSED, sub: 'user-a' };
+      const sessionB = { ...HALF_LIFE_PASSED, sub: 'user-b' };
+
+      await Promise.all([
+        maybeRenewSession(auth, sessionA, { headers: {} }, mockResponse()),
+        maybeRenewSession(auth, sessionB, { headers: {} }, mockResponse()),
+      ]);
+
+      expect(revalidate).toHaveBeenCalledTimes(2);
+    });
+
+    it('clears the in-flight entry on both resolve and reject — a later, non-concurrent cycle calls revalidate again', async () => {
+      let calls = 0;
+      const revalidate = vi.fn().mockImplementation(() => {
+        calls += 1;
+        if (calls === 1) throw new Error('db down'); // first cycle: hook throws
+        return true; // second, later cycle: hook succeeds
+      });
+      const auth = resolveAuth({ secret: 's'.repeat(32), session: () => null, revalidate });
+
+      await expect(
+        maybeRenewSession(auth, HALF_LIFE_PASSED, { headers: {} }, mockResponse()),
+      ).resolves.toBe(false);
+      // If the in-flight entry leaked (never cleared on the throw), this second, independent call
+      // would hang forever awaiting a promise nobody is going to resolve, or wrongly reuse the
+      // first cycle's denial — neither is correct for a fresh renewal cycle.
+      await expect(
+        maybeRenewSession(auth, HALF_LIFE_PASSED, { headers: {} }, mockResponse()),
+      ).resolves.toBe(true);
+
+      expect(revalidate).toHaveBeenCalledTimes(2);
+    });
+  });
 });

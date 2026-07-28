@@ -69,9 +69,48 @@ export function readSessionFromRequest(
 }
 
 /**
+ * In-flight `revalidate` calls, keyed by `<secret>:<sub>` (the secret disambiguates two
+ * `dashboardAuth` configs that happen to share a process, e.g. tests) — joined, not repeated, by
+ * every concurrent renewal of the SAME session. Entries are removed the moment their call settles
+ * (`finally`, below), so this only ever holds calls genuinely in flight right now: it can't grow
+ * without bound, and a throwing hook can't wedge a session's future renewals.
+ */
+const inFlightRevalidations = new Map<string, Promise<boolean>>();
+
+/**
+ * Run `auth.revalidate` for `user`, joining an already-in-flight call for the same session instead
+ * of starting a second one. This is what makes the `RevalidateHook` doc's "runs at most once per
+ * `ttl/2` per session" true under real traffic: a single console page load fires several parallel
+ * API calls, and without this every one of them carrying the same past-half-life cookie would
+ * independently call the host's hook before the first renewal's fresh cookie lands. Every caller
+ * still awaits the SAME outcome and applies it to its OWN request/response — only the host round
+ * trip is shared.
+ */
+function revalidateOnce(auth: ResolvedDashboardAuth, user: DashboardSessionUser): Promise<boolean> {
+  const revalidate = auth.revalidate;
+  if (!revalidate) return Promise.resolve(true);
+  const key = `${auth.secret}:${user.id}`;
+  const inFlight = inFlightRevalidations.get(key);
+  if (inFlight) return inFlight;
+  const call = Promise.resolve()
+    .then(() => revalidate(user))
+    // Fail closed: a throwing hook revokes rather than silently extending the session.
+    .catch(() => false)
+    .finally(() => {
+      // Cleared on BOTH outcomes (the `.catch` above means this only ever sees a resolution, never
+      // a rejection) so a later, non-concurrent renewal cycle calls the hook fresh rather than
+      // reusing a stale result — and so the map never accumulates settled entries.
+      inFlightRevalidations.delete(key);
+    });
+  inFlightRevalidations.set(key, call);
+  return call;
+}
+
+/**
  * Sliding renewal + revalidation. When a valid cookie is past 50% of its TTL, re-issue a fresh one
  * so an active session never expires mid-use — but first give the host's `revalidate` hook a say,
  * so a deactivated or demoted user loses access instead of riding a self-renewing cookie forever.
+ * Concurrent renewals of the same session share one `revalidate` call (see `revalidateOnce`).
  *
  * Returns `false` when the session was revoked (the clearing `Set-Cookie` is already queued and the
  * caller must deny the request); `true` otherwise, including when no renewal was due.
@@ -89,18 +128,10 @@ export async function maybeRenewSession(
     ...(session.name !== undefined ? { name: session.name } : {}),
     roles: session.roles,
   };
-  if (auth.revalidate) {
-    let allowed: boolean;
-    try {
-      allowed = await auth.revalidate(user);
-    } catch {
-      // Fail closed: a throwing hook revokes rather than silently extending the session.
-      allowed = false;
-    }
-    if (!allowed) {
-      clearSessionCookie({ request, response });
-      return false;
-    }
+  const allowed = await revalidateOnce(auth, user);
+  if (!allowed) {
+    clearSessionCookie({ request, response });
+    return false;
   }
   issueSessionCookie(user, { auth, request, response, now });
   return true;

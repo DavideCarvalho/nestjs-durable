@@ -219,13 +219,19 @@ DurableDashboardModule.forRoot({
 
 `revalidate` receives the already-minted session (not a fresh request — a console XHR carries no
 host auth to re-check, unlike Mode A's `session` hook), and runs at most once per `ttl/2` per
-session, so a DB round-trip here is cheap. Returning `false`, or throwing, clears the cookie and
-denies the request in place, the same treatment as an absent cookie. This closes the gap a
-sliding cookie otherwise leaves open — **but it isn't instant**: `revalidate` only runs on the
-renewal path, so a deactivated or demoted operator keeps console access for up to `ttl/2` (4 hours
-at the default 8h TTL) after their last renewal, not the moment they're deactivated. `revalidate`
-alone can't mint a session, so it doesn't count toward the `session`/`login` "at least one"
-requirement — pair it with one of those.
+session, so a DB round-trip here is cheap — this holds even under real console traffic: a page load
+firing several parallel API calls with the same past-half-life cookie triggers exactly one
+`revalidate` call, not one per call, in-flight renewals of the same session share the result.
+Returning `false`, or throwing, clears the cookie and denies the request in place, the same
+treatment as an absent cookie. This closes the gap a sliding cookie otherwise leaves open — **but
+it isn't instant**: `revalidate` only runs on the renewal path, so a deactivated or demoted
+operator keeps console access for up to `ttl/2` (4 hours at the default 8h TTL) after their last
+renewal, not the moment they're deactivated. `revalidate` alone can't mint a session, so it doesn't
+count toward the `session`/`login` "at least one" requirement — pair it with one of those.
+
+A `revalidate` denial (or any other mid-session 401 from the JSON API) sends the console SPA to the
+matching auth surface automatically — the login page under Mode B, the session-required page under
+Mode A — instead of surfacing a raw `401` as a query error.
 
 **Composes with `guards`:** when both are set, a request must pass the built-in session check AND
 every guard in `guards` — the built-in guard runs first, so an invalid session never even reaches
