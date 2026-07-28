@@ -1,5 +1,5 @@
-import type { GroupHealth } from './durable-client';
-import { baseHandlerName } from './queue-partition';
+import type { GroupHealth } from './durable-client.js';
+import { baseHandlerName } from './queue-partition.js';
 
 /** Health-first summary of the whole `/durable` worker fleet, across every queue. */
 export interface HealthSummary {

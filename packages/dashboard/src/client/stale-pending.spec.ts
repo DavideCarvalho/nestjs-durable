@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { STALE_PENDING_MS, type StepCheckpoint, isStalePending } from './durable-client';
+import { STALE_PENDING_MS, type StepCheckpoint, isStalePending } from './durable-client.js';
 
 function step(over: Partial<StepCheckpoint> = {}): StepCheckpoint {
   return {

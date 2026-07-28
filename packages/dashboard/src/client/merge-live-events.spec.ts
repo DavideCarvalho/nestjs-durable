@@ -4,8 +4,8 @@ import {
   type StepCheckpoint,
   type StepEvent,
   type WorkflowRun,
-} from './durable-client';
-import { mergeLiveEvents } from './merge-live-events';
+} from './durable-client.js';
+import { mergeLiveEvents } from './merge-live-events.js';
 
 const RUN: WorkflowRun = {
   id: 'r1',

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { baseHandlerName, partitionOf } from './queue-partition';
+import { baseHandlerName, partitionOf } from './queue-partition.js';
 
 describe('queue-partition', () => {
   it('reads the partition off a tenant-suffixed token', () => {

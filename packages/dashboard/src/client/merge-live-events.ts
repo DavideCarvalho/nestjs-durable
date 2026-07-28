@@ -1,4 +1,4 @@
-import type { RunDetail } from './durable-client';
+import type { RunDetail } from './durable-client.js';
 
 /**
  * Merge a freshly-fetched run with the previously-cached one, preserving the live event trail the SSE

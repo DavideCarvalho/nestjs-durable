@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { StepCheckpoint } from './durable-client';
-import { groupParallelSpans } from './group-parallel-spans';
+import type { StepCheckpoint } from './durable-client.js';
+import { groupParallelSpans } from './group-parallel-spans.js';
 
 function cp(over: Partial<StepCheckpoint> = {}): StepCheckpoint {
   return {

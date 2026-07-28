@@ -6,7 +6,7 @@ import {
   baseGroup,
   deriveRunState,
   singletonLeader,
-} from './durable-client';
+} from './durable-client.js';
 
 function run(over: Partial<WorkflowRun> = {}): WorkflowRun {
   return {

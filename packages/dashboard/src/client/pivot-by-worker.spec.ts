@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { GroupHealth, WorkerHeartbeat, WorkerStatus } from './durable-client';
-import { pivotByWorker } from './pivot-by-worker';
+import type { GroupHealth, WorkerHeartbeat, WorkerStatus } from './durable-client.js';
+import { pivotByWorker } from './pivot-by-worker.js';
 
 function status(over: Partial<WorkerStatus> = {}): WorkerStatus {
   return { concurrency: { mode: 'fixed', limit: 1 }, inFlight: 0, ...over };

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { type StepCheckpoint, type WorkflowRun, runDisplayStatus } from './durable-client';
+import { type StepCheckpoint, type WorkflowRun, runDisplayStatus } from './durable-client.js';
 
 function run(over: Partial<WorkflowRun> = {}): WorkflowRun {
   return {

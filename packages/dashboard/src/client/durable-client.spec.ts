@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { durableClient } from './durable-client';
+import { durableClient } from './durable-client.js';
 
 /** A fake `Window`, just enough of the surface `durable-client.ts` touches. */
 interface FakeWindow {
