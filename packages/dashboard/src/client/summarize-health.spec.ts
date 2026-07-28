@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { GroupHealth, WorkerHeartbeat } from './durable-client';
-import { summarizeHealth } from './summarize-health';
+import type { GroupHealth, WorkerHeartbeat } from './durable-client.js';
+import { summarizeHealth } from './summarize-health.js';
 
 function worker(over: Partial<WorkerHeartbeat> = {}): WorkerHeartbeat {
   return { group: '', instanceId: 'w1', lastBeatAt: 0, ...over };

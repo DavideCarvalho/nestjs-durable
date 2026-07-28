@@ -1,5 +1,5 @@
-import type { GroupHealth } from './durable-client';
-import { partitionOf } from './queue-partition';
+import type { GroupHealth } from './durable-client.js';
+import { partitionOf } from './queue-partition.js';
 
 /** Rolled-up worker health for one tenant-isolation partition (see `partitionOf`). */
 export interface PartitionView {

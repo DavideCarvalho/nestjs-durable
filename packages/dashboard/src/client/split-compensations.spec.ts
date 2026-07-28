@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import type { StepCheckpoint } from './durable-client';
+import type { StepCheckpoint } from './durable-client.js';
 import {
   compensationDisplayName,
   compensationSummary,
   splitCompensations,
-} from './split-compensations';
+} from './split-compensations.js';
 
 function step(over: Partial<StepCheckpoint> = {}): StepCheckpoint {
   return {

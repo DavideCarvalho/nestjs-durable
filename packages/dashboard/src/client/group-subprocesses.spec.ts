@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { StepEvent } from './durable-client';
-import { groupSubProcesses } from './group-subprocesses';
+import type { StepEvent } from './durable-client.js';
+import { groupSubProcesses } from './group-subprocesses.js';
 
 function ev(over: Partial<StepEvent> = {}): StepEvent {
   return { at: 0, level: 'info', message: '', ...over };

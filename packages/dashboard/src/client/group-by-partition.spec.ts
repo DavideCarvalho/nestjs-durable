@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { GroupHealth, WorkerHeartbeat } from './durable-client';
-import { groupByPartition } from './group-by-partition';
+import type { GroupHealth, WorkerHeartbeat } from './durable-client.js';
+import { groupByPartition } from './group-by-partition.js';
 
 function worker(over: Partial<WorkerHeartbeat> = {}): WorkerHeartbeat {
   return { group: '', instanceId: 'w1', lastBeatAt: 0, ...over };

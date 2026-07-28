@@ -1,5 +1,5 @@
-import type { GroupHealth, WorkerStatus } from './durable-client';
-import { baseHandlerName, partitionOf } from './queue-partition';
+import type { GroupHealth, WorkerStatus } from './durable-client.js';
+import { baseHandlerName, partitionOf } from './queue-partition.js';
 
 /** One real worker pod, pivoted out of the `group → liveWorkers` shape the engine reports. A single
  *  process subscribes to many handler queues and heartbeats into each, so `GroupHealth.liveWorkers`

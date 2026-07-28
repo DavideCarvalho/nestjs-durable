@@ -1,4 +1,4 @@
-import type { StepCheckpoint } from './durable-client';
+import type { StepCheckpoint } from './durable-client.js';
 
 /** Prefix the engine writes on a compensation checkpoint's `name` (`compensate:<originalStepName>`). */
 export const COMPENSATE_PREFIX = 'compensate:';

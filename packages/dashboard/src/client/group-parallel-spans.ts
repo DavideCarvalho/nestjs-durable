@@ -1,4 +1,4 @@
-import type { StepCheckpoint } from './durable-client';
+import type { StepCheckpoint } from './durable-client.js';
 
 /**
  * A timeline rendered as a sequence of nodes: a plain `single` step, or a `fan` — N steps that the

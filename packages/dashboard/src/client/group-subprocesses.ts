@@ -1,4 +1,4 @@
-import type { StepEvent } from './durable-client';
+import type { StepEvent } from './durable-client.js';
 
 /** A sub-process reconstructed from a step's events, keyed by run identity. */
 export interface SubProcess {
