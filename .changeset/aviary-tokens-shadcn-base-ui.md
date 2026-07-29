@@ -46,3 +46,9 @@ the full screen can be reviewed and screenshotted without a server, a database o
 The console's accent is unchanged. It is currently the same value as `--good`, which is a real
 ambiguity in a console whose primary information is run status — that is a brand decision, not a
 refactor, so it is flagged rather than made.
+
+`reflect-metadata` is now declared as a peer dependency. The server entry has always imported it
+(`durable-dashboard.module.ts` line 1) while only listing it as a dev dependency — the same shape as
+the `telescope-ui` incident, just benign in practice because every NestJS host already installs it.
+A new test bundles each published entry with esbuild and asserts that every package the bundler
+actually resolves is declared; that is what found it.
