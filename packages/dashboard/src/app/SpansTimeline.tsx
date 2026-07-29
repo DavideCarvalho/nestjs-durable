@@ -227,7 +227,7 @@ function StepRow({
         </span>
         <span className="relative h-5">
           {/* track */}
-          <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--line-soft)]" />
+          <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line-soft" />
           <span
             className={`absolute top-1/2 flex h-3.5 -translate-y-1/2 items-center rounded-[3px] transition-all duration-500 ease-out ${
               failed
@@ -279,7 +279,7 @@ function StepRow({
                 <span className="truncate text-[10px] text-zinc-400">{sub.name}</span>
               </span>
               <span className="relative h-3">
-                <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--line-soft)]" />
+                <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line-soft" />
                 <span
                   className={`absolute top-1/2 h-2 -translate-y-1/2 rounded-[2px] transition-all duration-500 ease-out ${SUB_BAR[sub.status]}`}
                   style={{ left: `${sub.left}%`, width: `${sub.width}%` }}
@@ -329,7 +329,7 @@ function ParallelFan({
   rowProps: Omit<React.ComponentProps<typeof StepRow>, 'row'>;
 }) {
   return (
-    <div className="rounded-md bg-zinc-900/30 ring-1 ring-[var(--line-soft)]">
+    <div className="rounded-md bg-zinc-900/30 ring-1 ring-line-soft">
       <div className="flex items-center gap-2 px-2 py-1">
         <span
           className="text-[11px] text-indigo-300/80"
