@@ -98,7 +98,7 @@ function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?:
       </button>
 
       {open && (
-        <div className="border-t border-[var(--line)]/60 px-2.5 py-2">
+        <div className="border-t border-line/60 px-2.5 py-2">
           {sub.phases.length > 0 && (
             <ul className="mono mb-2 flex flex-col gap-0.5 text-[10.5px]">
               {sub.phases.map((p, i) => (
@@ -117,7 +117,7 @@ function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?:
               className={`mono mb-2 rounded border p-2 text-[11px] ${
                 sub.status === 'failed'
                   ? 'border-red-500/25 bg-red-500/10 text-red-200'
-                  : 'border-[var(--line)] bg-black/20 text-zinc-300'
+                  : 'border-line bg-black/20 text-zinc-300'
               }`}
             >
               {sub.terminal.message}
@@ -198,7 +198,7 @@ function StepEvents({ events }: { events: StepEvent[] }) {
           <div className="mono mb-1.5 text-[10px] uppercase tracking-[0.18em] text-zinc-500">
             logs · {stepLogs.length}
           </div>
-          <div className="mono max-h-64 overflow-auto rounded-lg border border-[var(--line)] bg-black/40 p-2.5 text-[11px] leading-relaxed">
+          <div className="mono max-h-64 overflow-auto rounded-lg border border-line bg-black/40 p-2.5 text-[11px] leading-relaxed">
             {stepLogs.map((e, i) => (
               <LogLine key={`${e.at}-${i}`} e={e} />
             ))}
@@ -214,7 +214,7 @@ function CopyButton({ value }: { value: string }) {
   return (
     <button
       type="button"
-      className="flex items-center gap-1 rounded border border-[var(--line)] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-500 transition-colors hover:text-zinc-200"
+      className="flex items-center gap-1 rounded border border-line px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-500 transition-colors hover:text-zinc-200"
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(value);
@@ -239,7 +239,7 @@ export function Json({ label, value }: { label: string; value: unknown }) {
         <span className="mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">{label}</span>
         <CopyButton value={text} />
       </div>
-      <pre className="mono max-h-64 overflow-auto rounded-lg border border-[var(--line)] bg-black/40 p-3 text-[11.5px] leading-relaxed text-zinc-300">
+      <pre className="mono max-h-64 overflow-auto rounded-lg border border-line bg-black/40 p-3 text-[11.5px] leading-relaxed text-zinc-300">
         {text}
       </pre>
     </section>
@@ -290,7 +290,7 @@ function ChildRunInline({
     );
   }
   return (
-    <div className="mt-2 max-h-80 space-y-1 overflow-auto rounded-md border border-[var(--line)] bg-black/20 p-1.5">
+    <div className="mt-2 max-h-80 space-y-1 overflow-auto rounded-md border border-line bg-black/20 p-1.5">
       <RunSpans
         run={data.run}
         timeline={data.timeline}
@@ -330,8 +330,8 @@ export function StepDetailPanel({
     : 0;
 
   return (
-    <aside className="absolute inset-y-0 right-0 z-20 flex w-[380px] max-w-[90%] flex-col border-l border-[var(--line)] bg-[var(--panel)]/95 shadow-2xl backdrop-blur-md rise">
-      <div className="flex items-start justify-between gap-3 border-b border-[var(--line)] px-5 py-4">
+    <aside className="absolute inset-y-0 right-0 z-20 flex w-[380px] max-w-[90%] flex-col border-l border-line bg-panel/95 shadow-2xl backdrop-blur-md rise">
+      <div className="flex items-start justify-between gap-3 border-b border-line px-5 py-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span
@@ -356,7 +356,7 @@ export function StepDetailPanel({
         <button
           type="button"
           onClick={onClose}
-          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-[var(--line)] text-zinc-500 transition-colors hover:text-zinc-200"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line text-zinc-500 transition-colors hover:text-zinc-200"
           aria-label="Close"
         >
           <XIcon />
@@ -364,7 +364,7 @@ export function StepDetailPanel({
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-5 py-4">
-        <div className="rounded-lg border border-[var(--line)] bg-black/20 px-3.5 py-1">
+        <div className="rounded-lg border border-line bg-black/20 px-3.5 py-1">
           <Field k="seq" v={`#${step.seq}`} />
           {queueMs >= 1 && (
             <Field k="queued" v={<span className="text-sky-300">{fmtMs(queueMs)}</span>} />
@@ -419,7 +419,7 @@ export function StepDetailPanel({
                 <button
                   type="button"
                   onClick={() => onOpenRun(childRunId)}
-                  className="mono rounded border border-[var(--line)] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-500 transition-colors hover:text-zinc-200"
+                  className="mono rounded border border-line px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-500 transition-colors hover:text-zinc-200"
                 >
                   open ↗
                 </button>

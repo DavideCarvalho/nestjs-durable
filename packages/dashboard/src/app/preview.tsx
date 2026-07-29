@@ -2,14 +2,24 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { RunDetail, StepCheckpoint } from '../client/durable-client';
+import { App } from './App';
 import { RunSpans } from './SpansTimeline';
+import { installMockConsoleApi } from './mock-console';
+// Same two stylesheets `main.tsx` loads, in the same order — without react-flow's own CSS the
+// console's workflow graph renders unstyled, which would make any screenshot taken here a lie.
+import '@xyflow/react/dist/style.css';
 import './index.css';
 
 /**
- * Standalone visual-verification entry: renders the `RunSpans` timeline against a hand-built MOCK
- * run so the parallel-fan layout can be screenshotted with the dashboard's REAL styling. No server,
- * no API — `RunSpans` reads everything off static props (a fan with no child-ref steps fires no
- * `useChildRuns` query), so this is a faithful render of the production component.
+ * Standalone visual-verification entry, two views:
+ *
+ *  - default — renders the `RunSpans` timeline against a hand-built MOCK run so the parallel-fan
+ *    layout can be screenshotted with the dashboard's REAL styling. No server, no API (`RunSpans`
+ *    reads everything off static props, and a fan with no child-ref steps fires no `useChildRuns`
+ *    query), so this is a faithful render of the production component.
+ *  - `?view=console` — renders the WHOLE `App` against a stubbed `fetch` (see `mock-console.ts`), so
+ *    the header, filter chips, workers panel, run list and run detail can be screenshotted together.
+ *    Deep-link a run the same way the real console does: `?view=console#/run/ord-9f2c1a4b`.
  */
 
 const iso = (epoch: number): string => new Date(epoch).toISOString();
@@ -89,27 +99,36 @@ const queryClient = new QueryClient({
 
 const noop = (): void => {};
 
+const isConsole = new URLSearchParams(window.location.search).get('view') === 'console';
+if (isConsole) installMockConsoleApi();
+
 createRoot(document.getElementById('root') as HTMLElement).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <div className="app-bg" />
-      <div className="relative z-10 mx-auto max-w-3xl p-8">
-        <div className="mb-3 mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">
-          preview · parallel-fan timeline
-        </div>
-        <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-2">
-          <RunSpans
-            run={mock.run}
-            timeline={mock.timeline}
-            depth={0}
-            selectedKey={undefined}
-            onSelect={noop}
-            onOpenRun={noop}
-            expanded={new Set<string>()}
-            onToggleChild={noop}
-          />
-        </div>
-      </div>
+      {isConsole ? (
+        <App />
+      ) : (
+        <>
+          <div className="app-bg" />
+          <div className="relative z-10 mx-auto max-w-3xl p-8">
+            <div className="mb-3 mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">
+              preview · parallel-fan timeline
+            </div>
+            <div className="rounded-lg border border-line bg-panel p-2">
+              <RunSpans
+                run={mock.run}
+                timeline={mock.timeline}
+                depth={0}
+                selectedKey={undefined}
+                onSelect={noop}
+                onOpenRun={noop}
+                expanded={new Set<string>()}
+                onToggleChild={noop}
+              />
+            </div>
+          </div>
+        </>
+      )}
     </QueryClientProvider>
   </StrictMode>,
 );
