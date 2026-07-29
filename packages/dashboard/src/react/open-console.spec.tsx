@@ -9,6 +9,17 @@ function response(init: { status?: number; type?: string } = {}): Response {
   return { ok: status >= 200 && status < 300, status, type: init.type ?? 'basic' } as Response;
 }
 
+/**
+ * A `pageshow` event with the `persisted` flag browsers set only on a back/forward-cache restore.
+ *
+ * Built by hand rather than via `new PageTransitionEvent('pageshow', { persisted })`: happy-dom
+ * exposes the constructor but drops the `persisted` init (it reads back `undefined`), which would
+ * make every assertion below pass for the wrong reason.
+ */
+function pageshow(persisted: boolean): Event {
+  return Object.assign(new Event('pageshow'), { persisted });
+}
+
 describe('openDurableConsoleMutationOptions', () => {
   it('returns a useMutation-shaped object without depending on TanStack', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response());
@@ -139,5 +150,87 @@ describe('<OpenDurableConsoleButton>', () => {
     await act(async () => {
       release(response());
     });
+  });
+});
+
+describe('<OpenDurableConsoleButton> across a back/forward-cache restore', () => {
+  async function mintSuccessfully() {
+    const navigate = vi.fn();
+    const view = render(
+      <OpenDurableConsoleButton
+        fetch={vi.fn().mockResolvedValue(response())}
+        navigate={navigate}
+      />,
+    );
+    const button = screen.getByRole('button') as HTMLButtonElement;
+
+    await act(async () => {
+      button.click();
+    });
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/durable'));
+
+    return { button, view };
+  }
+
+  it('stays busy right after a successful mint', async () => {
+    const { button } = await mintSuccessfully();
+
+    // The anti-flicker guarantee, pinned: the navigation is already underway, so flipping the
+    // button back to idle would show "ready to click again" on a page that is leaving.
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute('aria-busy')).toBe('true');
+  });
+
+  it('goes idle again when the page is restored from the back/forward cache', async () => {
+    const { button } = await mintSuccessfully();
+
+    await act(async () => {
+      window.dispatchEvent(pageshow(true));
+    });
+
+    // The page did not die after all — the user pressed Back and got this component restored from
+    // memory with its state intact. Without this the launcher is a permanent spinner on a button
+    // that can no longer be clicked.
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute('aria-busy')).toBeNull();
+  });
+
+  it('ignores a pageshow that is not a restore', async () => {
+    const { button } = await mintSuccessfully();
+
+    await act(async () => {
+      window.dispatchEvent(pageshow(false));
+    });
+
+    // `persisted: false` is an ordinary load. Reacting to it would undo the anti-flicker behaviour
+    // on the very navigation that is still in progress.
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute('aria-busy')).toBe('true');
+  });
+
+  it('removes its pageshow listener on unmount', async () => {
+    const addEventListener = vi.spyOn(window, 'addEventListener');
+    const removeEventListener = vi.spyOn(window, 'removeEventListener');
+    const { view } = await mintSuccessfully();
+
+    const added = addEventListener.mock.calls.find(([type]) => type === 'pageshow');
+    expect(added).toBeDefined();
+
+    view.unmount();
+
+    const removed = removeEventListener.mock.calls.find(([type]) => type === 'pageshow');
+    // Same handler identity: removing a *different* function leaves the original attached, which
+    // leaks a listener that would then setState on an unmounted component.
+    expect(removed?.[1]).toBe(added?.[1]);
+
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await act(async () => {
+      window.dispatchEvent(pageshow(true));
+    });
+    expect(consoleError).not.toHaveBeenCalled();
+
+    consoleError.mockRestore();
+    addEventListener.mockRestore();
+    removeEventListener.mockRestore();
   });
 });
