@@ -227,7 +227,7 @@ function StepRow({
         </span>
         <span className="relative h-5">
           {/* track */}
-          <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--line-soft)]" />
+          <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line-soft" />
           <span
             className={`absolute top-1/2 flex h-3.5 -translate-y-1/2 items-center rounded-[3px] transition-all duration-500 ease-out ${
               failed
@@ -267,7 +267,7 @@ function StepRow({
         </div>
       )}
       {subRows.length > 0 && !subsCollapsed && (
-        <div className="ml-[18px] mt-0.5 mb-1 space-y-0.5 border-l border-[var(--line-soft)] pl-2">
+        <div className="ml-[18px] mt-0.5 mb-1 space-y-0.5 border-l border-line-soft pl-2">
           {subRows.map((sub) => (
             <div
               key={sub.key}
@@ -279,7 +279,7 @@ function StepRow({
                 <span className="truncate text-[10px] text-zinc-400">{sub.name}</span>
               </span>
               <span className="relative h-3">
-                <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--line-soft)]" />
+                <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line-soft" />
                 <span
                   className={`absolute top-1/2 h-2 -translate-y-1/2 rounded-[2px] transition-all duration-500 ease-out ${SUB_BAR[sub.status]}`}
                   style={{ left: `${sub.left}%`, width: `${sub.width}%` }}
@@ -296,7 +296,7 @@ function StepRow({
         </div>
       )}
       {isChild && childRunId !== undefined && isExpanded && (
-        <div className="ml-[18px] mt-0.5 mb-1 border-l border-[var(--line-soft)] pl-2">
+        <div className="ml-[18px] mt-0.5 mb-1 border-l border-line-soft pl-2">
           <ChildSpans
             id={childRunId}
             depth={depth + 1}
@@ -329,7 +329,7 @@ function ParallelFan({
   rowProps: Omit<React.ComponentProps<typeof StepRow>, 'row'>;
 }) {
   return (
-    <div className="rounded-md bg-zinc-900/30 ring-1 ring-[var(--line-soft)]">
+    <div className="rounded-md bg-zinc-900/30 ring-1 ring-line-soft">
       <div className="flex items-center gap-2 px-2 py-1">
         <span
           className="text-[11px] text-indigo-300/80"
@@ -342,7 +342,7 @@ function ParallelFan({
           {label}
         </span>
       </div>
-      <div className="ml-[10px] border-l border-[var(--line-soft)] pl-1">
+      <div className="ml-[10px] border-l border-line-soft pl-1">
         {memberRows.map((row) => (
           <StepRow key={row.step.seq} row={row} {...rowProps} />
         ))}
@@ -500,7 +500,7 @@ function ChildSpans({
   if (!data)
     return <div className="mono px-2 py-1 text-[10px] text-zinc-600">loading child run…</div>;
   return (
-    <div className="my-1 rounded-md border border-[var(--line)] bg-black/15">
+    <div className="my-1 rounded-md border border-line bg-black/15">
       <div className="mono flex items-center gap-2 px-2 py-1 text-[10px] text-zinc-500">
         <span className="text-indigo-300">⌁ {data.run.workflow}</span>
         <span className="tnum text-zinc-600">{id.slice(0, 8)}</span>
@@ -508,7 +508,7 @@ function ChildSpans({
         <button
           type="button"
           onClick={() => onOpenRun(id)}
-          className="ml-auto rounded border border-[var(--line)] px-1.5 text-zinc-400 hover:text-zinc-200"
+          className="ml-auto rounded border border-line px-1.5 text-zinc-400 hover:text-zinc-200"
         >
           open ↗
         </button>

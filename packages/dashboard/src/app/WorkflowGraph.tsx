@@ -125,8 +125,10 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   const collapsed = !!data.collapsed;
   const showChildChrome = isChild && !collapsed;
   const Icon = showChildChrome ? ChildIcon : iconFor(data.kind);
-  // Literal class strings per state (Tailwind can't see interpolated names): failed → red,
-  // in-flight → amber, done → emerald.
+  // Literal class strings per state (Tailwind can't see interpolated names): failed → `--bad`,
+  // in-flight → `--live` (the same blue the run list and the step badges already use for a running
+  // step; the amber this used to be overloaded `--warn`, whose job is suspended/awaiting), done →
+  // `--good`.
   const tone = failed
     ? {
         rail: 'bg-red-400',
@@ -135,9 +137,9 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
       }
     : pending
       ? {
-          rail: 'bg-amber-400',
-          badge: 'bg-amber-500/15 text-amber-300',
-          pill: 'bg-amber-500/20 text-amber-300',
+          rail: 'bg-live',
+          badge: 'bg-live/15 text-live',
+          pill: 'bg-live/20 text-live',
         }
       : {
           rail: 'bg-emerald-400',
@@ -147,14 +149,14 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   return (
     <div
       title={showChildChrome ? KIND_LABEL.child : (KIND_LABEL[data.kind] ?? data.kind)}
-      className={`group relative w-[208px] cursor-pointer overflow-hidden rounded-xl border bg-[var(--panel)]/95 shadow-lg backdrop-blur transition-all duration-150 hover:-translate-y-0.5 ${
+      className={`group relative w-[208px] cursor-pointer overflow-hidden rounded-xl border bg-panel/95 shadow-lg backdrop-blur transition-all duration-150 hover:-translate-y-0.5 ${
         data.selected
-          ? 'border-emerald-400/60 ring-2 ring-emerald-400/30'
+          ? 'border-brand/60 ring-2 ring-brand/30'
           : failed
             ? 'border-red-500/40 hover:border-red-400/60'
             : showChildChrome
               ? 'border-indigo-500/40 hover:border-indigo-400/60'
-              : 'border-[var(--line)] hover:border-zinc-600'
+              : 'border-line hover:border-zinc-600'
       }`}
     >
       {/* status rail */}
@@ -217,9 +219,7 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
               </button>
             </span>
           ) : (
-            <span className="rounded border border-[var(--line)] px-1 text-zinc-400">
-              {data.kind}
-            </span>
+            <span className="rounded border border-line px-1 text-zinc-400">{data.kind}</span>
           )}
           {data.attempts > 1 && (
             <span className="flex items-center gap-0.5 text-amber-300">
@@ -234,7 +234,7 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
           </span>
         </div>
         {data.subs && (
-          <div className="mono mt-1.5 flex items-center gap-2 border-t border-[var(--line)] pt-1.5 text-[10px]">
+          <div className="mono mt-1.5 flex items-center gap-2 border-t border-line pt-1.5 text-[10px]">
             {data.subs.ok > 0 && <span className="text-emerald-300">{data.subs.ok} ok</span>}
             {data.subs.failed > 0 && (
               <span className="text-red-300">{data.subs.failed} failed</span>
@@ -256,7 +256,7 @@ function TerminalNode({ data }: NodeProps<Node<EndData>>) {
   const live = data.status === 'running' || data.status === 'awaiting';
   return (
     <div
-      className={`s-${data.status} flex items-center gap-2 rounded-full border border-current/30 bg-[var(--panel)] px-3.5 py-1.5`}
+      className={`s-${data.status} flex items-center gap-2 rounded-full border border-current/30 bg-panel px-3.5 py-1.5`}
     >
       <Handle type="target" position={Position.Left} className="!border-0 !bg-zinc-600" />
       <span className={`dot ${live ? 'pulse' : ''}`} />
@@ -513,7 +513,9 @@ export function WorkflowGraph({
         source: exit.id,
         target: 'end',
         animated: live,
-        style: { stroke: live ? 'var(--accent)' : 'var(--line)', strokeWidth: live ? 2 : 1.5 },
+        // In flight is `--live`, not the brand accent: this edge is reporting run state, and the
+        // node it points at (the `running` terminal pill) is already that blue.
+        style: { stroke: live ? 'var(--live)' : 'var(--line)', strokeWidth: live ? 2 : 1.5 },
       });
     }
 

@@ -2,13 +2,33 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── Aviary console tokens ──────────────────────────────────────────────────────────────────────
+   Source of truth: `AVIARY-UI.md` (repo root of the nestjs libs checkout). The neutrals, the status
+   hues and the spacing are IDENTICAL across the four Aviary consoles (agent, durable, media,
+   telescope); `--accent` is the single per-console variable. If you change anything here, change it
+   in that file and in the other three consoles in the same session — a token that lands in one
+   console only is invisible until someone puts two screenshots side by side.
+   ──────────────────────────────────────────────────────────────────────────────────────────────── */
 :root {
+  /* Shared. Identical in all four consoles. Do not tune per console. */
   --bg: #09090b;
   --panel: #0c0c0f;
+  --panel-2: #101017; /* elevated surface: modal/dialog, drawer, popover, menu */
   --line: #1c1c22;
   --line-soft: #16161a;
   --text: #e7e7ea;
   --muted: #76767f;
+
+  /* Status. Semantic, never decorative — the `.s-*` hues below are built from these. */
+  --good: #34d399;
+  --warn: #fbbf24;
+  --bad: #f87171;
+  --live: #60a5fa; /* in flight: a workflow mid-execution, a step a worker is running now */
+
+  /* Per console. This is the ONLY line that differs between them.
+     NOTE: durable's accent is currently the SAME value as `--good`, so green carries two meanings
+     here (healthy AND interactive). AVIARY-UI.md flags this as an open brand decision; it is left
+     as-is deliberately rather than silently re-picked. */
   --accent: #34d399;
 }
 
@@ -38,7 +58,7 @@ body {
   pointer-events: none;
   background-image: radial-gradient(
       900px 400px at 78% -8%,
-      rgba(52, 211, 153, 0.08),
+      color-mix(in srgb, var(--accent) 8%, transparent),
       transparent 70%
     ), linear-gradient(to right, var(--line-soft) 1px, transparent 1px),
     linear-gradient(to bottom, var(--line-soft) 1px, transparent 1px);
@@ -57,10 +77,10 @@ body {
 
 /* Status hues */
 .s-running {
-  color: #60a5fa;
+  color: var(--live);
 }
 .s-suspended {
-  color: #fbbf24;
+  color: var(--warn);
 }
 /* Display-only refinements of `suspended` (see runDisplayStatus): a run actively running a remote
    step renders as `s-running`; these cover the genuinely-parked reasons. */
@@ -70,13 +90,13 @@ body {
 }
 .s-awaiting {
   /* Waiting on an external signal — amber, like the suspended state it refines. */
-  color: #fbbf24;
+  color: var(--warn);
 }
 .s-completed {
-  color: #34d399;
+  color: var(--good);
 }
 .s-failed {
-  color: #f87171;
+  color: var(--bad);
 }
 /* Compensating cancel in progress: a transient, in-flight amber — distinct from the grey terminal
    `cancelled` it flips to once the rollback completes. */

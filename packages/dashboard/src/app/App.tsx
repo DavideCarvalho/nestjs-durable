@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { type ReactNode, useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   type GroupHealth,
   type RunDetail as RunDetailData,
@@ -27,9 +27,17 @@ import { StepDetailPanel } from './StepDetailPanel';
 import { WorkflowGraph } from './WorkflowGraph';
 import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
 import { parentRunIdOf, retryOriginOf } from './run-lineage';
+import { Badge as Chip, badgeVariants } from './ui/badge';
+import { Button } from './ui/button';
+import { cn } from './ui/cn';
+import { Dialog } from './ui/dialog';
+import { InputField } from './ui/input';
+import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
+import { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
+import { Tooltip, TooltipProvider } from './ui/tooltip';
 
 /** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
- *  flowing into the next), in currentColor so it inherits the emerald accent. Replaces the bare `◆`. */
+ *  flowing into the next), in currentColor so it inherits the `--accent` token. Replaces the bare `◆`. */
 function LogoMark({ className }: { className?: string }) {
   return (
     <svg
@@ -89,12 +97,10 @@ function StatusDot({ status }: { status: RunDisplayStatus | StepCheckpoint['stat
 
 function Badge({ status }: { status: RunDisplayStatus | StepCheckpoint['status'] }) {
   return (
-    <span
-      className={`s-${status} inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider`}
-    >
+    <Chip variant="status" className={`s-${status} text-[11px]`}>
       <StatusDot status={status} />
       {status}
-    </span>
+    </Chip>
   );
 }
 
@@ -109,20 +115,21 @@ function Header({
 }) {
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   const chip = (key: RunStatus | 'all', label: string, n: number) => (
-    <button
+    <Button
       key={key}
-      type="button"
+      variant="ghost"
+      size="chip"
+      aria-pressed={filter === key}
       onClick={() => onFilter(key)}
-      className={`group flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs transition-colors ${
-        filter === key
-          ? 'border-zinc-600 bg-zinc-900 text-zinc-100'
-          : 'border-transparent text-zinc-500 hover:text-zinc-300'
-      }`}
+      className={cn(
+        'rounded-md',
+        filter === key && 'border-zinc-600 bg-zinc-900 text-zinc-100 hover:text-zinc-100',
+      )}
     >
       {key !== 'all' && <StatusDot status={key} />}
       <span className="uppercase tracking-wide">{label}</span>
       <span className="mono tnum text-zinc-600">{n}</span>
-    </button>
+    </Button>
   );
   // Topology is fixed for a deployment's lifetime, so fetch once and never refetch.
   const { data: topology } = useQuery({
@@ -139,10 +146,10 @@ function Header({
         : 'tenant'
       : 'control plane';
   return (
-    <header className="z-10 flex items-center gap-4 border-b border-[var(--line)] px-5 py-3">
+    <header className="z-10 flex items-center gap-4 border-b border-line px-5 py-3">
       <div className="flex items-center gap-2.5">
-        <div className="grid h-7 w-7 place-items-center rounded-md border border-emerald-500/30 bg-emerald-500/10">
-          <LogoMark className="h-4 w-4 text-emerald-400" />
+        <div className="grid h-7 w-7 place-items-center rounded-md border border-brand/30 bg-brand/10">
+          <LogoMark className="h-4 w-4 text-brand" />
         </div>
         <div className="leading-none">
           <div className="text-sm font-semibold tracking-tight">durable</div>
@@ -248,45 +255,10 @@ function WorkerStatusCells({ status }: { status: WorkerStatus | undefined }) {
   );
 }
 
-/**
- * A small styled hover tooltip that replaces the browser's native `title=` bubble — same dark surface
- * as the panel's click popovers. Renders below-right (`right-0 top-full`) so it never clips the
- * header's right edge, and `suppressed` hides it while the wrapped chip's own click-popover is open
- * (so the two never stack). State-driven hover (not CSS `:hover`) so `suppressed` can win.
- */
-function Tooltip({
-  label,
-  suppressed,
-  children,
-}: {
-  label: string;
-  suppressed?: boolean;
-  children: ReactNode;
-}) {
-  const [show, setShow] = useState(false);
-  return (
-    <span
-      className="relative inline-flex"
-      onMouseEnter={() => setShow(true)}
-      onMouseLeave={() => setShow(false)}
-    >
-      {children}
-      {show && !suppressed && (
-        <span
-          role="tooltip"
-          className="pointer-events-none absolute right-0 top-full z-30 mt-1 max-w-[280px] whitespace-pre-line rounded-md border border-[var(--line)] bg-zinc-950/95 px-2 py-1 text-left text-[10px] leading-relaxed text-zinc-300 shadow-xl backdrop-blur"
-        >
-          {label}
-        </span>
-      )}
-    </span>
-  );
-}
-
 /** Per-worker rows for an expanded group: each live worker's id + its {@link WorkerStatusCells}. */
 function WorkerRows({ workers }: { workers: GroupHealth['liveWorkers'] }) {
   return (
-    <div className="flex flex-col divide-y divide-[var(--line-soft)]">
+    <div className="flex flex-col divide-y divide-line-soft">
       {workers.map((w) => (
         <div key={w.instanceId} className="flex flex-col gap-1 px-2.5 py-2">
           <span className="mono truncate text-[10px] text-zinc-400">{w.instanceId}</span>
@@ -315,36 +287,44 @@ function WorkersHealth() {
   const [view, setView] = useState<WorkersPanelView>('workers');
   if (!data || data.length === 0) return null;
   const summary = summarizeHealth(data);
+  const label: Record<WorkersPanelView, string> = {
+    workers: 'pods',
+    partitions: 'parts',
+    alerts: 'alerts',
+  };
   return (
-    <div className="ml-auto flex flex-nowrap items-center gap-1.5">
-      <div className="flex items-center gap-0.5 rounded border border-[var(--line)] bg-zinc-900/60 p-0.5">
+    <Tabs
+      value={view}
+      onValueChange={(v) => setView(v as WorkersPanelView)}
+      className="ml-auto flex flex-nowrap items-center gap-1.5"
+    >
+      <TabsList>
         {(['workers', 'partitions', 'alerts'] as const).map((v) => (
-          <button
-            key={v}
-            type="button"
-            onClick={() => setView(v)}
-            className={`mono rounded px-1.5 py-0.5 text-[10px] ${
-              view === v ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'
-            }`}
-          >
-            {v === 'workers' ? 'pods' : v === 'partitions' ? 'parts' : 'alerts'}
+          <TabsTab key={v} value={v}>
+            {label[v]}
             {v === 'alerts' && summary.starved.length > 0 && (
               <span className="tnum ml-1 rounded bg-rose-500/80 px-1 text-[9px] text-white">
                 {summary.starved.length}
               </span>
             )}
-          </button>
+          </TabsTab>
         ))}
-      </div>
+      </TabsList>
       {/* Fixed-width, right-justified slot: toggling views swaps content inside a stable box, so the
-          header never reflows (no wrap to a 2nd line, no width jump). Overflow stays visible so the
-          per-chip expand popovers still escape downward. */}
+          header never reflows (no wrap to a 2nd line, no width jump). The expand popovers are
+          portalled, so they are no longer at the mercy of this box's overflow. */}
       <div className="flex w-[300px] flex-nowrap items-center justify-end gap-1.5">
-        {view === 'workers' && <WorkersByPod workers={pivotByWorker(data)} />}
-        {view === 'partitions' && <PartitionsHealth groups={data} />}
-        {view === 'alerts' && <StarvationAlerts summary={summary} />}
+        <TabsPanel value="workers" className="flex flex-nowrap items-center gap-1.5">
+          <WorkersByPod workers={pivotByWorker(data)} />
+        </TabsPanel>
+        <TabsPanel value="partitions" className="flex flex-nowrap items-center gap-1.5">
+          <PartitionsHealth groups={data} />
+        </TabsPanel>
+        <TabsPanel value="alerts" className="flex flex-nowrap items-center gap-1.5">
+          <StarvationAlerts summary={summary} />
+        </TabsPanel>
       </div>
-    </div>
+    </Tabs>
   );
 }
 
@@ -370,7 +350,7 @@ function PodDetail({ w }: { w: WorkerView }) {
       <div className="px-2.5 py-2">
         <WorkerStatusCells status={w.status} />
       </div>
-      <div className="max-h-48 overflow-auto border-t border-[var(--line-soft)] px-2.5 py-1.5">
+      <div className="max-h-48 overflow-auto border-t border-line-soft px-2.5 py-1.5">
         <div className="mono mb-1 text-[9px] uppercase tracking-wider text-zinc-600">
           {w.handlers.length} handlers
         </div>
@@ -401,101 +381,110 @@ function WorkersByPod({ workers }: { workers: WorkerView[] }) {
         const isOpen = open === w.instanceId;
         const load = loadOf(w);
         return (
-          <Tooltip
+          <Popover
             key={w.instanceId}
-            suppressed={isOpen}
-            label={`${w.instanceId}\n${w.handlers.length} handlers · ${w.partition}${load ? ` · ${load} in-flight` : ''}`}
+            open={isOpen}
+            onOpenChange={(next) => setOpen(next ? w.instanceId : undefined)}
           >
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setOpen(isOpen ? undefined : w.instanceId)}
-                className={`mono flex max-w-[120px] items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] hover:border-zinc-500 ${
-                  isOpen
-                    ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
-                    : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
-                }`}
-              >
-                <span className={`dot ${w.status ? 's-completed' : ''}`} aria-hidden />
-                <span className="truncate">{w.instanceId}</span>
-                {w.partition !== 'default' && (
-                  <span className="shrink-0 text-zinc-500">@{w.partition}</span>
-                )}
-                <span className="tnum shrink-0 text-zinc-500">
-                  {w.handlers.length}h{load ? ` · ${load}` : ''}
-                </span>
-              </button>
-              {isOpen && (
-                <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
-                  <div className="mono flex items-center justify-between gap-2 border-b border-[var(--line)] px-2.5 py-1.5 text-[10px] text-zinc-500">
-                    <span className="truncate text-zinc-300">{w.instanceId}</span>
-                    <span className="shrink-0">
-                      {w.runtime ?? 'node'} · {w.partition}
+            <Tooltip
+              suppressed={isOpen}
+              label={`${w.instanceId}\n${w.handlers.length} handlers · ${w.partition}${load ? ` · ${load} in-flight` : ''}`}
+            >
+              <PopoverTrigger
+                render={
+                  <Button
+                    variant="chip"
+                    size="xs"
+                    className={cn(
+                      'mono max-w-[120px] gap-1',
+                      isOpen && 'border-zinc-500 bg-zinc-800 text-zinc-200',
+                    )}
+                  >
+                    <span className={`dot ${w.status ? 's-completed' : ''}`} aria-hidden />
+                    <span className="truncate">{w.instanceId}</span>
+                    {w.partition !== 'default' && (
+                      <span className="shrink-0 text-zinc-500">@{w.partition}</span>
+                    )}
+                    <span className="tnum shrink-0 text-zinc-500">
+                      {w.handlers.length}h{load ? ` · ${load}` : ''}
                     </span>
-                  </div>
-                  <PodDetail w={w} />
-                </div>
-              )}
-            </div>
-          </Tooltip>
+                  </Button>
+                }
+              />
+            </Tooltip>
+            <PopoverContent>
+              <div className="mono flex items-center justify-between gap-2 border-b border-line px-2.5 py-1.5 text-[10px] text-zinc-500">
+                <span className="truncate text-zinc-300">{w.instanceId}</span>
+                <span className="shrink-0">
+                  {w.runtime ?? 'node'} · {w.partition}
+                </span>
+              </div>
+              <PodDetail w={w} />
+            </PopoverContent>
+          </Popover>
         );
       })}
       {overflow.length > 0 && (
-        <div className="relative">
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(overflowOpen ? undefined : OVERFLOW_KEY);
-              setOverflowPod(undefined);
-            }}
-            className={`mono shrink-0 rounded border px-1.5 py-0.5 text-[10px] hover:border-zinc-500 ${
-              overflowOpen
-                ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
-                : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
-            }`}
-          >
-            +{overflow.length}
-          </button>
-          {overflowOpen && (
-            <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
-              <div className="mono border-b border-[var(--line)] px-2.5 py-1.5 text-[9px] uppercase tracking-wider text-zinc-600">
-                {overflow.length} more {overflow.length === 1 ? 'pod' : 'pods'}
-              </div>
-              <div className="max-h-80 overflow-auto divide-y divide-[var(--line-soft)]">
-                {overflow.map((w) => {
-                  const load = loadOf(w);
-                  const podOpen = overflowPod === w.instanceId;
-                  return (
-                    <div key={w.instanceId}>
-                      {/* Same click-to-expand as a visible chip: the row toggles the pod's PodDetail. */}
-                      <button
-                        type="button"
-                        onClick={() => setOverflowPod(podOpen ? undefined : w.instanceId)}
-                        className={`mono flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-[10px] hover:bg-zinc-800/50 ${
-                          podOpen ? 'bg-zinc-800/40 text-zinc-200' : 'text-zinc-300'
-                        }`}
-                      >
-                        <span className="flex min-w-0 items-center gap-1">
-                          <span className={`dot ${w.status ? 's-completed' : ''}`} aria-hidden />
-                          <span className="truncate">{w.instanceId}</span>
-                        </span>
-                        <span className="tnum shrink-0 text-zinc-500">
-                          {w.partition !== 'default' ? `@${w.partition} · ` : ''}
-                          {w.handlers.length}h{load ? ` · ${load}` : ''}
-                        </span>
-                      </button>
-                      {podOpen && (
-                        <div className="border-t border-[var(--line-soft)] bg-zinc-900/40">
-                          <PodDetail w={w} />
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+        <Popover
+          open={overflowOpen}
+          onOpenChange={(next) => {
+            setOpen(next ? OVERFLOW_KEY : undefined);
+            setOverflowPod(undefined);
+          }}
+        >
+          <PopoverTrigger
+            render={
+              <Button
+                variant="chip"
+                size="xs"
+                className={cn(
+                  'mono shrink-0',
+                  overflowOpen && 'border-zinc-500 bg-zinc-800 text-zinc-200',
+                )}
+              >
+                +{overflow.length}
+              </Button>
+            }
+          />
+          <PopoverContent>
+            <div className="mono border-b border-line px-2.5 py-1.5 text-[9px] uppercase tracking-wider text-zinc-600">
+              {overflow.length} more {overflow.length === 1 ? 'pod' : 'pods'}
             </div>
-          )}
-        </div>
+            <div className="max-h-80 divide-y divide-line-soft overflow-auto">
+              {overflow.map((w) => {
+                const load = loadOf(w);
+                const podOpen = overflowPod === w.instanceId;
+                return (
+                  <div key={w.instanceId}>
+                    {/* Same click-to-expand as a visible chip: the row toggles the pod's PodDetail. */}
+                    <button
+                      type="button"
+                      onClick={() => setOverflowPod(podOpen ? undefined : w.instanceId)}
+                      className={cn(
+                        'mono flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-[10px] hover:bg-zinc-800/50',
+                        podOpen ? 'bg-zinc-800/40 text-zinc-200' : 'text-zinc-300',
+                      )}
+                    >
+                      <span className="flex min-w-0 items-center gap-1">
+                        <span className={`dot ${w.status ? 's-completed' : ''}`} aria-hidden />
+                        <span className="truncate">{w.instanceId}</span>
+                      </span>
+                      <span className="tnum shrink-0 text-zinc-500">
+                        {w.partition !== 'default' ? `@${w.partition} · ` : ''}
+                        {w.handlers.length}h{load ? ` · ${load}` : ''}
+                      </span>
+                    </button>
+                    {podOpen && (
+                      <div className="border-t border-line-soft bg-zinc-900/40">
+                        <PodDetail w={w} />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </PopoverContent>
+        </Popover>
       )}
     </>
   );
@@ -523,47 +512,52 @@ function PartitionsHealth({ groups }: { groups: GroupHealth[] }) {
         const starved = p.starvedCount > 0;
         const isOpen = open === p.partition;
         return (
-          <Tooltip
+          <Popover
             key={p.partition}
-            suppressed={isOpen}
-            label={`${p.partition}\n${p.workerCount} workers · ${p.handlerCount} handlers · ${p.totalDepth} queued${starved ? ` · ${p.starvedCount} starved` : ''}`}
+            open={isOpen && p.workerCount > 0}
+            onOpenChange={(next) => setOpen(next ? p.partition : undefined)}
           >
-            <div className="relative">
-              <button
-                type="button"
-                disabled={p.workerCount === 0}
-                onClick={() => setOpen(isOpen ? undefined : p.partition)}
-                className={`mono flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] ${
-                  starved
-                    ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
-                    : isOpen
-                      ? 'border-zinc-500 bg-zinc-800 text-zinc-200'
-                      : 'border-[var(--line)] bg-zinc-800/40 text-zinc-400'
-                } ${p.workerCount > 0 ? 'cursor-pointer hover:border-zinc-500' : 'cursor-default'}`}
-              >
-                <span
-                  className={`dot ${starved ? 's-failed' : p.workerCount > 0 ? 's-completed' : ''}`}
-                  aria-hidden
-                />
-                {p.partition}
-                <span className="tnum text-zinc-500">
-                  {p.workerCount}w {p.handlerCount}h{p.totalDepth > 0 ? ` ${p.totalDepth}q` : ''}
-                  {starved ? ` ${p.starvedCount}!` : ''}
-                </span>
-              </button>
-              {isOpen && p.workerCount > 0 && (
-                <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-md border border-[var(--line)] bg-zinc-950/95 shadow-xl backdrop-blur">
-                  <div className="mono flex items-center justify-between border-b border-[var(--line)] px-2.5 py-1.5 text-[10px] text-zinc-500">
-                    <span className="text-zinc-300">{p.partition}</span>
-                    <span className="tnum">
-                      {p.workerCount} worker(s) · {p.totalDepth} queued
+            <Tooltip
+              suppressed={isOpen}
+              label={`${p.partition}\n${p.workerCount} workers · ${p.handlerCount} handlers · ${p.totalDepth} queued${starved ? ` · ${p.starvedCount} starved` : ''}`}
+            >
+              <PopoverTrigger
+                render={
+                  <Button
+                    variant="chip"
+                    size="xs"
+                    disabled={p.workerCount === 0}
+                    className={cn(
+                      'mono gap-1',
+                      starved && 'border-rose-500/50 bg-rose-500/15 text-rose-300',
+                      !starved && isOpen && 'border-zinc-500 bg-zinc-800 text-zinc-200',
+                      p.workerCount > 0 ? 'cursor-pointer' : 'cursor-default',
+                    )}
+                  >
+                    <span
+                      className={`dot ${starved ? 's-failed' : p.workerCount > 0 ? 's-completed' : ''}`}
+                      aria-hidden
+                    />
+                    {p.partition}
+                    <span className="tnum text-zinc-500">
+                      {p.workerCount}w {p.handlerCount}h
+                      {p.totalDepth > 0 ? ` ${p.totalDepth}q` : ''}
+                      {starved ? ` ${p.starvedCount}!` : ''}
                     </span>
-                  </div>
-                  <WorkerRows workers={workersOf(p.partition)} />
-                </div>
-              )}
-            </div>
-          </Tooltip>
+                  </Button>
+                }
+              />
+            </Tooltip>
+            <PopoverContent>
+              <div className="mono flex items-center justify-between border-b border-line px-2.5 py-1.5 text-[10px] text-zinc-500">
+                <span className="text-zinc-300">{p.partition}</span>
+                <span className="tnum">
+                  {p.workerCount} worker(s) · {p.totalDepth} queued
+                </span>
+              </div>
+              <WorkerRows workers={workersOf(p.partition)} />
+            </PopoverContent>
+          </Popover>
         );
       })}
     </>
@@ -586,7 +580,7 @@ function StarvationAlerts({ summary }: { summary: HealthSummary }) {
           {plural(summary.workflowCount, 'workflow')} · {plural(summary.stepCount, 'step')} ·{' '}
           {plural(summary.workerCount, 'worker')} ·{' '}
           {summary.allDraining ? (
-            <span className="text-emerald-400">all draining</span>
+            <span className="text-good">all draining</span>
           ) : (
             <span className="text-rose-300">{summary.starved.length} starved</span>
           )}
@@ -594,11 +588,11 @@ function StarvationAlerts({ summary }: { summary: HealthSummary }) {
       </Tooltip>
       {summary.starved.map((g) => (
         <Tooltip key={g.group} label={`${g.group}\n${g.depth} queued, no worker consuming`}>
-          <span className="mono flex items-center gap-1 rounded border border-rose-500/50 bg-rose-500/15 px-1.5 py-0.5 text-[10px] text-rose-300">
+          <Chip variant="danger" className="mono gap-1 border-rose-500/50 bg-rose-500/15 py-0.5">
             <span className="dot s-failed" aria-hidden />
             <span className="max-w-[180px] truncate">{g.group}</span>
             <span className="tnum shrink-0">{g.depth}q · 0w</span>
-          </span>
+          </Chip>
         </Tooltip>
       ))}
     </>
@@ -609,7 +603,7 @@ function StarvationAlerts({ summary }: { summary: HealthSummary }) {
  *  "No runs yet." before real data lands. Same row footprint as a real run → no layout jump. */
 function RunsListSkeleton() {
   return (
-    <ul className="divide-y divide-[var(--line-soft)]" aria-hidden>
+    <ul className="divide-y divide-line-soft" aria-hidden>
       {[0, 1, 2, 3, 4, 5].map((i) => (
         <li key={i} className="flex flex-col gap-2 px-4 py-3">
           <div className="flex items-center justify-between gap-2">
@@ -649,7 +643,7 @@ function RunsList({
     return <div className="p-6 text-sm text-zinc-600">No runs yet.</div>;
   }
   return (
-    <ul className="divide-y divide-[var(--line-soft)]">
+    <ul className="divide-y divide-line-soft">
       {runs.map((r) => {
         const state = deriveRunState(r, { runs: allRuns, health });
         return (
@@ -665,17 +659,21 @@ function RunsList({
                 <span className="flex min-w-0 items-center gap-1.5">
                   <span className="truncate text-sm font-medium text-zinc-200">{r.workflow}</span>
                   {r.namespace && r.namespace !== 'default' && (
-                    <span
-                      className="mono shrink-0 rounded border border-sky-500/30 bg-sky-500/10 px-1 text-[9px] text-sky-300"
+                    <Chip
+                      variant="tenant"
+                      className="mono shrink-0 px-1 text-[9px]"
                       title="Tenant / worker-pool partition"
                     >
                       {r.namespace}
-                    </span>
+                    </Chip>
                   )}
                   {r.id.startsWith('dlq:') && (
-                    <span className="mono shrink-0 rounded border border-rose-500/40 bg-rose-500/10 px-1 text-[9px] uppercase tracking-wider text-rose-300">
+                    <Chip
+                      variant="danger"
+                      className="mono shrink-0 px-1 text-[9px] uppercase tracking-wider"
+                    >
                       dlq
-                    </span>
+                    </Chip>
                   )}
                 </span>
                 <Badge status={state.status} />
@@ -692,14 +690,17 @@ function RunsList({
               {r.tags && r.tags.length > 0 && (
                 <div className="flex flex-wrap gap-1">
                   {r.tags.map((t) => (
-                    // biome-ignore lint/a11y/useKeyWithClickEvents: span keeps the row clickable; tag click filters
+                    // biome-ignore lint/a11y/useKeyWithClickEvents: a nested <button> is invalid inside the row's own button — the row stays the keyboard target, the tag is a pointer shortcut for the same filter the sidebar field applies
                     <span
                       key={t}
                       onClick={(e) => {
                         e.stopPropagation();
                         onSelectTag(t);
                       }}
-                      className="mono cursor-pointer rounded border border-[var(--line)] bg-zinc-800/40 px-1.5 text-[10px] text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
+                      className={cn(
+                        badgeVariants({ variant: 'outline' }),
+                        'mono cursor-pointer hover:border-zinc-500 hover:text-zinc-200',
+                      )}
                     >
                       #{t}
                     </span>
@@ -856,15 +857,27 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       onOpenRun(r.runId);
     },
   });
+  // Fix-and-replay editor state. This used to be `window.prompt` + `window.alert`: a single-line,
+  // unstyled, un-resizable box for a multi-line JSON document, with the parse error arriving as a
+  // second modal AFTER the edit was already discarded. The dialog keeps the draft on a parse error.
+  const [fixOpen, setFixOpen] = useState(false);
+  const [fixDraft, setFixDraft] = useState('');
+  const [fixError, setFixError] = useState<string>();
   const onFixReplay = () => {
-    const current = JSON.stringify((data as RunDetailData | undefined)?.run.input ?? {}, null, 2);
-    const edited = window.prompt('Fix the input, then replay as a fresh run:', current);
-    if (edited == null) return;
+    setFixDraft(JSON.stringify((data as RunDetailData | undefined)?.run.input ?? {}, null, 2));
+    setFixError(undefined);
+    setFixOpen(true);
+  };
+  const submitFixReplay = () => {
+    let parsed: unknown;
     try {
-      fixReplay.mutate(JSON.parse(edited));
-    } catch {
-      window.alert('Invalid JSON');
+      parsed = JSON.parse(fixDraft);
+    } catch (e) {
+      setFixError(e instanceof Error ? e.message : 'Invalid JSON');
+      return;
     }
+    setFixOpen(false);
+    fixReplay.mutate(parsed);
   };
   // The selected step + the run it belongs to (a nested child step belongs to its child run, not the
   // root) — so the detail panel renders any lane's step, not just the root timeline's.
@@ -973,34 +986,36 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-start justify-between gap-4 border-b border-[var(--line)] px-7 py-5">
+      <div className="flex items-start justify-between gap-4 border-b border-line px-7 py-5">
         <div className="min-w-0">
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-semibold tracking-tight">{run.workflow}</h2>
             {parentRunIdOf(run.id) !== undefined && (
-              <button
-                type="button"
+              <Button
+                variant="alt"
+                size="xs"
                 onClick={() => onOpenRun(parentRunIdOf(run.id) as string)}
-                className="mono rounded border border-indigo-500/40 bg-indigo-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-indigo-300 hover:bg-indigo-500/20"
+                className="mono uppercase tracking-wider"
                 title={`Open the parent run (${parentRunIdOf(run.id)}) — the macro view this child belongs to`}
               >
                 ↑ parent
-              </button>
+              </Button>
             )}
             {retryOriginOf(run.id) !== undefined && (
-              <button
-                type="button"
+              <Button
+                variant="chip"
+                size="xs"
                 onClick={() => onOpenRun(retryOriginOf(run.id) as string)}
-                className="mono rounded border border-zinc-500/40 bg-zinc-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-300 hover:bg-zinc-500/20"
+                className="mono uppercase tracking-wider text-zinc-300"
                 title={`This is a retry-with-input of ${retryOriginOf(run.id)} — open the original run`}
               >
                 ↩ original
-              </button>
+              </Button>
             )}
             {isDlqHandler && (
-              <span className="mono rounded border border-rose-500/40 bg-rose-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-rose-300">
+              <Chip variant="danger" className="mono py-0.5 uppercase tracking-wider">
                 dlq
-              </span>
+              </Chip>
             )}
             <Badge status={detailState.status} />
             {detailState.detail && (
@@ -1009,18 +1024,21 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               </span>
             )}
             {tenant && (
-              <span
-                className="mono rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-300"
+              <Chip
+                variant="tenant"
+                className="mono py-0.5"
                 title="Tenant / worker-pool partition this run belongs to"
               >
                 {tenant}
-              </span>
+              </Chip>
             )}
             {compensations.length > 0 && (
-              <span
-                className={`mono rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300 ${
-                  compSummary.pending > 0 ? 'pulse' : ''
-                }`}
+              <Chip
+                variant="warn"
+                className={cn(
+                  'mono py-0.5 uppercase tracking-wider',
+                  compSummary.pending > 0 && 'pulse',
+                )}
                 title={
                   compSummary.pending > 0
                     ? `compensating: ${compSummary.done} of ${compSummary.total} undone`
@@ -1028,11 +1046,9 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
                 }
               >
                 {compSummary.pending > 0 ? 'compensating' : 'compensated'}
-              </span>
+              </Chip>
             )}
-            <span className="mono rounded border border-[var(--line)] px-1.5 py-0.5 text-[10px] text-zinc-500">
-              v{run.workflowVersion}
-            </span>
+            <Chip className="mono bg-transparent py-0.5 text-zinc-500">v{run.workflowVersion}</Chip>
             <span className="mono tnum text-[11px] text-zinc-600">
               {body.length} {body.length === 1 ? 'step' : 'steps'}
             </span>
@@ -1041,25 +1057,18 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           {run.tags && run.tags.length > 0 && (
             <div className="mt-1.5 flex flex-wrap gap-1">
               {run.tags.map((t) => (
-                <span
-                  key={t}
-                  className="mono rounded border border-[var(--line)] bg-zinc-800/40 px-1.5 text-[10px] text-zinc-400"
-                >
+                <Chip key={t} className="mono">
                   #{t}
-                </span>
+                </Chip>
               ))}
             </div>
           )}
           {run.searchAttributes && Object.keys(run.searchAttributes).length > 0 && (
             <div className="mt-1.5 flex flex-wrap gap-1">
               {Object.entries(run.searchAttributes).map(([k, v]) => (
-                <span
-                  key={k}
-                  className="mono rounded border border-indigo-500/30 bg-indigo-500/10 px-1.5 text-[10px] text-indigo-300"
-                  title="search attribute"
-                >
+                <Chip key={k} variant="attr" className="mono" title="search attribute">
                   {k}={String(v)}
-                </span>
+                </Chip>
               ))}
             </div>
           )}
@@ -1067,92 +1076,83 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             <div className="mt-1.5 flex flex-wrap items-center gap-1">
               <span className="text-[10px] text-zinc-600">children:</span>
               {(data as RunDetailData).children?.map((cid) => (
-                // biome-ignore lint/a11y/useKeyWithClickEvents: span keeps the row layout; click navigates
-                <span
+                <Button
                   key={cid}
+                  variant="chip"
+                  size="xs"
                   onClick={() => onOpenRun(cid)}
-                  className="mono cursor-pointer rounded border border-[var(--line)] bg-zinc-800/40 px-1.5 text-[10px] text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
+                  className="mono px-1.5 py-0"
                 >
                   {cid}
-                </span>
+                </Button>
               ))}
             </div>
           ) : null}
         </div>
         <div className="flex shrink-0 gap-2">
-          <button
-            type="button"
+          <Button
             onClick={() => setShowRunIO(true)}
-            className="mono rounded-md border border-[var(--line)] px-2.5 py-1.5 text-xs text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+            className="mono px-2.5 normal-case tracking-normal text-zinc-400"
             title="Run input / output"
           >
             {'{ }'}
-          </button>
+          </Button>
           {atBreakpoint && (
-            <button
-              type="button"
-              disabled={cont.isPending}
-              onClick={() => cont.mutate()}
-              className="flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-amber-200 transition-colors enabled:hover:bg-amber-500/25 disabled:opacity-30"
-            >
+            <Button variant="warn" disabled={cont.isPending} onClick={() => cont.mutate()}>
               <PlayIcon width={12} height={12} />
               Continue
-            </button>
+            </Button>
           )}
-          <button
-            type="button"
+          <Button
+            variant="brand"
             disabled={!canRetry || retry.isPending}
             onClick={() => retry.mutate()}
-            className="flex items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-emerald-300 transition-colors enabled:hover:bg-emerald-500/20 disabled:opacity-30"
           >
             <RetryIcon width={12} height={12} />
             Retry
-          </button>
+          </Button>
           {canRedispatch && (
-            <button
-              type="button"
+            <Button
+              variant="info"
               disabled={redispatch.isPending}
               onClick={() => redispatch.mutate()}
               title="Re-dispatch stuck `pending` remote steps — recovery for a lost step dispatch (crashed worker or dropped job)"
-              className="flex items-center gap-1.5 rounded-md border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-sky-300 transition-colors enabled:hover:bg-sky-500/20 disabled:opacity-30"
             >
               <BoltIcon width={12} height={12} />
               Re-dispatch
-            </button>
+            </Button>
           )}
           {(run.status === 'dead' || run.status === 'failed') && (
-            <button
-              type="button"
+            <Button
+              variant="alt"
               disabled={fixReplay.isPending}
               onClick={onFixReplay}
               title="Edit the input and re-run as a fresh linked run"
-              className="flex items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-indigo-300 transition-colors enabled:hover:bg-indigo-500/20 disabled:opacity-30"
             >
               <RetryIcon width={12} height={12} />
               Fix &amp; replay
-            </button>
+            </Button>
           )}
           {canCancel && (
-            <button
-              type="button"
+            <Button
+              variant="warn"
               disabled={cancel.isPending}
               onClick={() => cancel.mutate(true)}
               title="Cancel and run saga compensations (undo completed steps in reverse)"
-              className="flex items-center gap-1.5 rounded-md border border-amber-600/30 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-amber-300/90 transition-colors enabled:hover:bg-amber-900/20 disabled:opacity-30"
+              className="bg-transparent"
             >
               <RetryIcon width={12} height={12} />
               Cancel + Undo
-            </button>
+            </Button>
           )}
-          <button
-            type="button"
+          <Button
+            className="border-zinc-700"
             disabled={!canCancel || cancel.isPending}
             onClick={() => cancel.mutate(false)}
-            className="flex items-center gap-1.5 rounded-md border border-zinc-700 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-zinc-300 transition-colors enabled:hover:bg-zinc-800 disabled:opacity-30"
           >
             <XIcon width={12} height={12} />
             Cancel
-          </button>
+          </Button>
         </div>
       </div>
       {dlqLink && (
@@ -1167,13 +1167,13 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             <div className="text-[13px] font-medium text-rose-200">{dlqLink.title}</div>
             <div className="mono truncate text-[11px] text-rose-300/70">{dlqLink.subtitle}</div>
           </div>
-          <button
-            type="button"
+          <Button
+            variant="danger"
             onClick={() => onOpenRun(dlqLink.id)}
-            className="mono shrink-0 rounded-md border border-rose-500/40 bg-rose-500/15 px-2.5 py-1.5 text-[11px] text-rose-200 transition-colors hover:bg-rose-500/25"
+            className="mono shrink-0 border-rose-500/40 bg-rose-500/15 px-2.5 text-[11px] normal-case tracking-normal text-rose-200 enabled:hover:bg-rose-500/25"
           >
             {dlqLink.cta}
-          </button>
+          </Button>
         </div>
       )}
       {compBanner && (
@@ -1222,11 +1222,11 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           // The spans height lives in the GRID TRACK above (`clamp(...)`), not here — an `auto` track
           // sizes to the tall span content's min-content and collapses the `1fr` WorkflowGraph row to
           // 0. With the track clamped, this wrapper just fills it and clips; SpansTimeline scrolls.
-          <div className="relative min-h-0 overflow-hidden border-t border-[var(--line)] bg-black/20">
+          <div className="relative min-h-0 overflow-hidden border-t border-line bg-black/20">
             {/* Drag the top edge to resize the spans panel. */}
             <div
               onPointerDown={onResizeSpans}
-              className="absolute inset-x-0 top-0 z-10 h-1.5 -translate-y-1/2 cursor-row-resize hover:bg-emerald-500/40"
+              className="absolute inset-x-0 top-0 z-10 h-1.5 -translate-y-1/2 cursor-row-resize hover:bg-brand/40"
               title="Drag to resize"
             />
             <SpansTimeline
@@ -1257,6 +1257,42 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           onSelect={(step) => setSelStep({ step, run })}
         />
       )}
+      <Dialog
+        open={fixOpen}
+        onOpenChange={setFixOpen}
+        title="Fix & replay"
+        subtitle={`re-runs ${run.id} as a fresh linked run`}
+        footer={
+          <>
+            <Button onClick={() => setFixOpen(false)}>Cancel</Button>
+            <Button variant="alt" disabled={fixReplay.isPending} onClick={submitFixReplay}>
+              Replay
+            </Button>
+          </>
+        }
+      >
+        <label
+          className="mono mb-1.5 block text-[10px] uppercase tracking-[0.18em] text-zinc-500"
+          htmlFor="fix-replay-input"
+        >
+          input
+        </label>
+        <textarea
+          id="fix-replay-input"
+          value={fixDraft}
+          spellCheck={false}
+          onChange={(e) => {
+            setFixDraft(e.target.value);
+            setFixError(undefined);
+          }}
+          className="mono h-64 w-full resize-y rounded-lg border border-line bg-black/40 p-3 text-[11.5px] leading-relaxed text-zinc-300 focus:border-zinc-600 focus:outline-none"
+        />
+        {fixError && (
+          <p className="mono mt-2 rounded border border-bad/25 bg-bad/10 px-2 py-1 text-[11px] text-bad">
+            {fixError}
+          </p>
+        )}
+      </Dialog>
     </div>
   );
 }
@@ -1342,7 +1378,7 @@ export function App() {
   ];
 
   return (
-    <>
+    <TooltipProvider>
       <div className="app-bg" />
       <div className="relative z-10 flex h-full flex-col">
         <Header counts={counts} filter={filter} onFilter={setFilter} />
@@ -1359,70 +1395,53 @@ export function App() {
           </div>
         )}
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,360px)_1fr]">
-          <aside className="flex min-h-0 flex-col border-r border-[var(--line)]">
-            <div className="border-b border-[var(--line)] p-2">
-              <div className="flex items-center gap-1.5 rounded-md border border-[var(--line)] px-2">
-                <span className="text-zinc-600">#</span>
-                <input
-                  value={tagFilter}
-                  onChange={(e) => setTagFilter(e.target.value)}
-                  placeholder="filter by tag…"
-                  className="mono w-full bg-transparent py-1.5 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none"
-                />
-                {tagFilter && (
-                  <button
-                    type="button"
-                    onClick={() => setTagFilter('')}
-                    className="text-zinc-600 hover:text-zinc-300"
-                    title="clear tag filter"
-                  >
-                    <XIcon width={12} height={12} />
-                  </button>
-                )}
-              </div>
-              <div className="mt-1.5 flex items-center gap-1.5 rounded-md border border-[var(--line)] px-2">
-                <span className="text-zinc-600">⛃</span>
-                <input
-                  value={attrFilter}
-                  onChange={(e) => setAttrFilter(e.target.value)}
-                  placeholder="attrs e.g. amount:gte:200, tier:eq:pro"
-                  title="Typed search attributes: comma-separated key:op:value (ops eq ne gt gte lt lte)"
-                  className="mono w-full bg-transparent py-1.5 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none"
-                />
-                {attrFilter && (
-                  <button
-                    type="button"
-                    onClick={() => setAttrFilter('')}
-                    className="text-zinc-600 hover:text-zinc-300"
-                    title="clear attribute filter"
-                  >
-                    <XIcon width={12} height={12} />
-                  </button>
-                )}
-              </div>
+          <aside className="flex min-h-0 flex-col border-r border-line">
+            <div className="border-b border-line p-2">
+              <InputField
+                glyph="#"
+                value={tagFilter}
+                onChange={(e) => setTagFilter(e.target.value)}
+                onClear={() => setTagFilter('')}
+                clearLabel="clear tag filter"
+                placeholder="filter by tag…"
+                aria-label="filter by tag"
+              />
+              <InputField
+                glyph="⛃"
+                containerClassName="mt-1.5"
+                value={attrFilter}
+                onChange={(e) => setAttrFilter(e.target.value)}
+                onClear={() => setAttrFilter('')}
+                clearLabel="clear attribute filter"
+                placeholder="attrs e.g. amount:gte:200, tier:eq:pro"
+                aria-label="filter by search attribute"
+                title="Typed search attributes: comma-separated key:op:value (ops eq ne gt gte lt lte)"
+              />
             </div>
             {(filter !== 'all' || tagFilter || attrPredicates.length > 0) && shown.length > 0 && (
-              <div className="flex items-center gap-2 border-b border-[var(--line)] px-3 py-1.5">
+              <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
                 <span className="mono text-[10px] text-zinc-500">
                   {shown.length} {filter !== 'all' ? filter : ''} {tagFilter && `#${tagFilter}`}
                   {attrPredicates.length > 0 && ` ⛃${attrPredicates.length}`}
                 </span>
-                <button
-                  type="button"
+                <Button
+                  variant="brand"
+                  size="xs"
                   disabled={bulk.isPending}
                   onClick={() => bulk.mutate('retry')}
-                  className="mono ml-auto rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-300 transition-colors hover:bg-emerald-500/20 disabled:opacity-40"
+                  className="mono ml-auto rounded"
                 >
                   retry all
-                </button>
-                <button
-                  type="button"
+                </Button>
+                <Button
+                  variant="danger"
+                  size="xs"
                   disabled={bulk.isPending}
                   onClick={() => bulk.mutate('cancel')}
-                  className="mono rounded border border-rose-500/30 bg-rose-500/10 px-1.5 py-0.5 text-[10px] text-rose-300 transition-colors hover:bg-rose-500/20 disabled:opacity-40"
+                  className="mono rounded"
                 >
                   cancel all
-                </button>
+                </Button>
               </div>
             )}
             <div className="min-h-0 flex-1 overflow-auto">
@@ -1451,6 +1470,6 @@ export function App() {
           </main>
         </div>
       </div>
-    </>
+    </TooltipProvider>
   );
 }
