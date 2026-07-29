@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ConsoleSessionError,
   type OpenConsoleOptions,
@@ -41,6 +41,9 @@ export function useOpenDurableConsole(options: OpenConsoleOptions = {}): UseOpen
         // Deliberately NOT clearing `isPending` on success: the navigation is already underway and
         // this component is about to be torn down. Flipping the button back to idle first produces
         // a visible flicker of "ready to click again" on a page that is leaving.
+        //
+        // The page leaving is not the same as the page dying — see the `pageshow` effect below,
+        // which is what un-sticks this flag when the user comes back.
       })
       .catch((cause: unknown) => {
         setError(
@@ -50,6 +53,26 @@ export function useOpenDurableConsole(options: OpenConsoleOptions = {}): UseOpen
         );
         setIsPending(false);
       });
+  }, []);
+
+  // The counterpart to leaving `isPending` set on success. That choice assumes the launcher page is
+  // discarded once the navigation completes — but with the browser's back/forward cache it is not:
+  // pressing Back restores this page from memory with React state intact, so the user lands back on
+  // a spinner that never stops, on a button `disabled` by that very flag. This is the one signal
+  // that says "you are looking at a restored page": browsers fire `pageshow` with
+  // `persisted === true` only on a bfcache restore.
+  //
+  // Guard on `persisted` rather than on `pageshow` alone. A plain `pageshow` also fires on every
+  // ordinary load, and clearing the flag there would resurrect the flicker this hook exists to
+  // avoid — a mint that is genuinely still in flight (the user never left) must keep its spinner.
+  useEffect(() => {
+    // No `window` under SSR — and nothing to restore there either.
+    if (typeof window === 'undefined') return;
+    const onPageShow = (event: Event) => {
+      if ((event as PageTransitionEvent).persisted) setIsPending(false);
+    };
+    window.addEventListener('pageshow', onPageShow);
+    return () => window.removeEventListener('pageshow', onPageShow);
   }, []);
 
   const reset = useCallback(() => setError(null), []);
