@@ -29,7 +29,13 @@
      NOTE: durable's accent is currently the SAME value as `--good`, so green carries two meanings
      here (healthy AND interactive). AVIARY-UI.md flags this as an open brand decision; it is left
      as-is deliberately rather than silently re-picked. */
-  --accent: #34d399;
+  /* Lime, not the emerald this used to be: emerald IS `--good`, so the same hue meant both
+     "this step succeeded" and "this is interactive". Durable picked last and had the least room —
+     bad 0, its own no-worker 25, warn 45, good 160, media cyan 187, live 217, its own sleeping 239,
+     agent violet 258, telescope magenta 300, its own dead 347. Lime sits mid-arc at 82: 37 from
+     --warn, 78 from --good. Pink separates further but a pink primary action shares a row with a
+     red FAILED badge and borrows an alarm it does not mean. See AVIARY-UI.md. */
+  --accent: #a3e635;
 }
 
 * {
