@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { resolveCronParse } from './cron-compat';
 import type { WorkflowEngine } from './engine';
 
 // Resolve the optional `cron-parser` peer dependency in a way that works in BOTH the ESM and CJS
@@ -63,13 +64,12 @@ export function scheduledRunId(key: string, everyMs: number, nowMs: number): str
   return `sched:${key}:${Math.floor(nowMs / everyMs)}`;
 }
 
-type CronParser = typeof import('cron-parser');
-let cronParser: CronParser | undefined;
-function loadCronParser(): CronParser {
-  if (cronParser) return cronParser;
+let cronParser: unknown;
+function loadCronParser(): unknown {
+  if (cronParser !== undefined) return cronParser;
   try {
     // Lazy + optional: core stays dependency-free; only users who schedule by cron need this.
-    cronParser = nodeRequire('cron-parser') as CronParser;
+    cronParser = nodeRequire('cron-parser');
   } catch {
     throw new Error(
       'cron schedules need the optional peer dependency "cron-parser" — install it (e.g. `npm i cron-parser`).',
@@ -84,10 +84,17 @@ function loadCronParser(): CronParser {
  * interval resolves to the same fire time — and thus the same idempotent run id.
  */
 export function prevCronFireMs(expr: string, nowMs: number, timezone = 'UTC'): number {
-  const parser = loadCronParser();
+  const parse = resolveCronParse(loadCronParser());
+  if (!parse) {
+    throw new Error(
+      'the installed "cron-parser" exposes neither v4\'s parseExpression nor v5\'s CronExpressionParser.parse — the supported range is ^4.0.0 || ^5.0.0.',
+    );
+  }
   // `+1` makes a fire landing exactly on `nowMs` count as "at or before now", not the prior one.
-  const it = parser.parseExpression(expr, { currentDate: new Date(nowMs + 1), tz: timezone });
-  return it.prev().toDate().getTime();
+  return parse(expr, { currentDate: new Date(nowMs + 1), tz: timezone })
+    .prev()
+    .toDate()
+    .getTime();
 }
 
 /** The deterministic, idempotent run id for a schedule at `nowMs` — its current fire window. */
