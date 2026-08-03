@@ -91,7 +91,10 @@ export function prevCronFireMs(expr: string, nowMs: number, timezone = 'UTC'): n
     );
   }
   // `+1` makes a fire landing exactly on `nowMs` count as "at or before now", not the prior one.
-  return parse(expr, { currentDate: new Date(nowMs + 1), tz: timezone }).prev().toDate().getTime();
+  return parse(expr, { currentDate: new Date(nowMs + 1), tz: timezone })
+    .prev()
+    .toDate()
+    .getTime();
 }
 
 /** The deterministic, idempotent run id for a schedule at `nowMs` — its current fire window. */
