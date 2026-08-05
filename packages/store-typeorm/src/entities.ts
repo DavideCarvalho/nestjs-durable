@@ -82,6 +82,7 @@ export class WorkflowRunEntity {
   tags?: string[] | null;
   searchAttributes?: Record<string, string | number | boolean> | null;
   priority?: number | null;
+  namespace!: string;
   origin?: string | null;
   createdAt!: Date;
   updatedAt!: Date;
@@ -208,6 +209,18 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
         transformer: jsonColumnTransformer('runs.searchAttributes'),
       },
       priority: { type: 'integer', nullable: true, name: col('priority') },
+      // The worker-pool partition that owns the run. This is the tenant isolation boundary, not a
+      // label: a worker only picks up (`listPendingRuns`), recovers (`listIncompleteRuns`), resumes
+      // timers for (`listDueTimers`) and times out (`listRuns` with `namespace`) runs in its own
+      // namespace, so an unfiltered predicate here hands one tenant's runs to another tenant's worker.
+      //
+      // NOT NULL DEFAULT `'default'`, deliberately unlike `origin` below. A run written before this
+      // column existed DID execute in a namespace — the unscoped one — so `'default'` states a fact
+      // rather than guesses one, and the DDL default (see the `additive` map in ./schema) back-fills
+      // every pre-existing row with it. That back-fill is what makes the plain-equality predicates
+      // safe: a NULL here would match no namespace at all, so a worker asking for `'default'` would
+      // silently skip every run that predates the column.
+      namespace: { type: 'text', name: col('namespace'), default: 'default' },
       // Which library/module registered the workflow this run belongs to (e.g.
       // `@dudousxd/nestjs-catalog-pipeline`), derived at registration time — never caller input.
       // Nullable with NO default: an origin cannot be reconstructed for a row written before this

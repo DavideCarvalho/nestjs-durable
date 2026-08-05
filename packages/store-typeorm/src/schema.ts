@@ -132,6 +132,14 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
   const txt = jsonBlobColumnType(isMysql);
   const int = isMysql ? 'int' : 'integer';
   const ts = isPg ? 'timestamptz' : 'datetime';
+  // The tenant partition every poll predicate filters on. NOT NULL with a literal default so that
+  // adding it to a table that predates it back-fills each existing row with `'default'` — the
+  // namespace those runs actually executed in — instead of leaving NULLs that would match no
+  // namespace and so be invisible to every worker. Postgres (11+) and SQLite fill the existing rows
+  // from the default without rewriting the table; MySQL 8.0.12+ does it instantly, older MySQL
+  // rewrites the table once, so a very large `durable_workflow_runs` there should take the ALTER in a
+  // maintenance window rather than at boot.
+  const nsCol = `${str} NOT NULL DEFAULT 'default'`;
 
   const runs = q('durable_workflow_runs');
   const checkpoints = q('durable_step_checkpoints');
@@ -170,7 +178,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ${runsCol('wakeAt')} ${ts}, ${runsCol('lockedBy')} ${str}, ${runsCol('lockedUntil')} ${ts},
       ${runsCol('awaitingDecisionTaskId')} ${str},
       ${runsCol('recoveryAttempts')} ${int}, ${runsCol('tags')} ${txt}, ${runsCol('searchAttributes')} ${txt},
-      ${runsCol('priority')} ${int}, ${runsCol('origin')} ${str},
+      ${runsCol('priority')} ${int}, ${runsCol('namespace')} ${nsCol}, ${runsCol('origin')} ${str},
       ${runsCol('createdAt')} ${ts} NOT NULL, ${runsCol('updatedAt')} ${ts} NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS ${checkpoints} (
@@ -221,6 +229,11 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ['tags', txt],
       ['searchAttributes', txt],
       ['priority', int],
+      // Back-filled WITH a value, unlike `origin` below: the DDL default writes `'default'` onto
+      // every pre-existing row, because a run created before this column existed really did execute
+      // in the unscoped `'default'` namespace. Leaving those rows NULL would make them invisible to
+      // the worker that owns them — the list predicates are plain equality, so `NULL <> 'default'`.
+      ['namespace', nsCol],
       // Nullable and NOT back-filled with a value: every row that predates the column keeps a NULL
       // origin, which the store reads as `undefined` = "unknown origin". There is no honest value to
       // back-fill — the origin is derived from the registration that created the run, which is long
@@ -273,6 +286,15 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       [
         'durable_runs_workflow_status_idx',
         `${runs} (${runsCol('workflow')}, ${runsCol('status')})`,
+      ],
+      // namespace/status/createdAt: every poll tick of a namespaced worker filters on `namespace`
+      // ANDed with `status` (and `listPendingRuns` orders by `createdAt`), so without this the two
+      // indexes above degrade to a scan of the WHOLE table — including every other tenant's rows —
+      // on each tick. Created best-effort on every boot like the others, so a deployment whose table
+      // already exists picks it up as soon as it runs this version.
+      [
+        'durable_runs_namespace_status_idx',
+        `${runs} (${runsCol('namespace')}, ${runsCol('status')}, ${runsCol('createdAt')})`,
       ],
       // buffered signals are taken FIFO per token (smallest id) — index the token for the scan.
       ['durable_buffered_signals_token_idx', `${buffered} (${bufCol('token')})`],
