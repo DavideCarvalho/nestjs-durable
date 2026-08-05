@@ -34,6 +34,7 @@ interface RunRow {
   tags: unknown;
   searchAttributes: unknown;
   priority: number | null;
+  origin: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -259,6 +260,12 @@ export class PrismaStateStore implements StateStore {
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
+    // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
+    // before the column existed, or registered through a path the derivation could not classify)
+    // matches NO origin value — it is never folded into a bucket to make the facet look complete.
+    // Unknown-origin runs are reachable only with the filter OFF, so "all origins" must stay the
+    // default view; a dashboard that filtered by default would make those runs look deleted.
+    if (query.origin !== undefined) where.origin = query.origin;
     // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store). Combined with the
     // single-value `status` via AND when both are present, so the narrower set wins.
     if (query.status && query.statuses) {
@@ -454,6 +461,8 @@ function toRunData(run: WorkflowRun) {
     tags: jsonOrNull(run.tags),
     searchAttributes: jsonOrNull(run.searchAttributes),
     priority: run.priority ?? null,
+    // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
+    origin: run.origin ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -482,6 +491,7 @@ function toRunPatch(patch: Partial<WorkflowRun>) {
   if ('tags' in patch) data.tags = jsonOrNull(patch.tags);
   if ('searchAttributes' in patch) data.searchAttributes = jsonOrNull(patch.searchAttributes);
   if ('priority' in patch) data.priority = patch.priority ?? null;
+  if ('origin' in patch) data.origin = patch.origin ?? null;
   if (patch.createdAt != null) data.createdAt = patch.createdAt;
   if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;
   return data;
@@ -505,6 +515,8 @@ function fromRunRow(row: RunRow): WorkflowRun {
     searchAttributes:
       (row.searchAttributes as Record<string, string | number | boolean> | null) ?? undefined,
     priority: row.priority ?? undefined,
+    // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
+    origin: row.origin ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

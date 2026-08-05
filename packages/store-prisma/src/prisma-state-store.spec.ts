@@ -269,3 +269,69 @@ describe('PrismaStateStore', () => {
     expect(aRuns).toBe(1);
   });
 });
+
+/**
+ * `WorkflowRun.origin` — which library/module registered the workflow. The cases that matter are the
+ * ones about ABSENCE: `origin` is the one durable column that must never be defaulted, because a run
+ * written before the column existed has no recoverable origin and a plausible-looking stand-in would
+ * be indistinguishable from a real registration in the dashboard's facet.
+ *
+ * Lives in this file (rather than its own) so it reuses the single shared PrismaClient — a second
+ * client against the same SQLite file locks (P1008), as the setup above notes.
+ */
+describe('PrismaStateStore origin', () => {
+  it('persists origin and leaves it undefined when the run has none', async (ctx) => {
+    if (!available) ctx.skip();
+    await store.createRun(run({ id: 'a', origin: '@dudousxd/nestjs-catalog-pipeline' }));
+    await store.createRun(run({ id: 'b' }));
+
+    expect((await store.getRun('a'))?.origin).toBe('@dudousxd/nestjs-catalog-pipeline');
+    expect((await store.getRun('b'))?.origin).toBeUndefined();
+  });
+
+  it('does not lose the origin when an unrelated field is patched', async (ctx) => {
+    if (!available) ctx.skip();
+    await store.createRun(run({ id: 'a', origin: '@dudousxd/nestjs-agent' }));
+
+    await store.updateRun('a', { status: 'completed' });
+
+    expect((await store.getRun('a'))?.origin).toBe('@dudousxd/nestjs-agent');
+
+    // ...and a patch that DOES name it is mapped like every other run column.
+    await store.updateRun('a', { origin: '@dudousxd/nestjs-catalog-pipeline' });
+    expect((await store.getRun('a'))?.origin).toBe('@dudousxd/nestjs-catalog-pipeline');
+  });
+
+  it('reads a row that predates the column as undefined, never a defaulted value', async (ctx) => {
+    if (!available) ctx.skip();
+    // Written straight through the client, by an INSERT that never names `origin` — exactly what a
+    // row inserted before the migration looks like once `ALTER TABLE ... ADD COLUMN` has run.
+    await prisma.durableWorkflowRun.create({
+      data: {
+        id: 'old',
+        workflow: 'checkout',
+        workflowVersion: '1',
+        status: 'running',
+        createdAt: at,
+        updatedAt: at,
+      },
+    });
+
+    expect((await store.getRun('old'))?.origin).toBeUndefined();
+  });
+
+  it('filters listRuns by origin, excluding other origins AND unknown-origin runs', async (ctx) => {
+    if (!available) ctx.skip();
+    await store.createRun(run({ id: 'a', origin: '@dudousxd/nestjs-catalog-pipeline' }));
+    await store.createRun(run({ id: 'b', origin: '@dudousxd/nestjs-agent' }));
+    await store.createRun(run({ id: 'c' })); // unknown origin
+
+    expect(
+      (await store.listRuns({ origin: '@dudousxd/nestjs-catalog-pipeline' })).map((r) => r.id),
+    ).toEqual(['a']);
+    // An unknown origin is never folded into some bucket to make the facet look complete...
+    expect(await store.listRuns({ origin: 'unknown' })).toEqual([]);
+    // ...it is reachable only with the filter off, which is why "all origins" stays the default view.
+    expect((await store.listRuns({})).map((r) => r.id).sort()).toEqual(['a', 'b', 'c']);
+  });
+});

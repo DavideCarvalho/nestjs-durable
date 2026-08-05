@@ -402,13 +402,37 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+/**
+ * The later-added run facets, kept in one options bag rather than growing `runs()`'s positional tail
+ * to five arguments. Both are OMITTED by default, and that default is load-bearing: the console has
+ * always listed every tenant's runs (core: "read paths are NOT namespace-scoped"), so scoping is
+ * something an operator opts into, never something the client imposes.
+ */
+export interface RunFilterOptions {
+  /** Tenant / worker-pool partition — `WorkflowRun.namespace`, exact match. Absent = all tenants. */
+  namespace?: string | undefined;
+  /**
+   * The package that declared the workflow — `WorkflowRun.origin`, exact match. Absent = all origins.
+   * NOTE this cannot select UNATTRIBUTED runs: `RunQuery.origin` matches a string, and a run with no
+   * origin matches no value at all. See `run-origin.ts` for the facet that can.
+   */
+  origin?: string | undefined;
+}
+
 export const durableClient = {
-  runs(status?: RunStatus, tag?: string, attr?: string[]): Promise<WorkflowRun[]> {
+  runs(
+    status?: RunStatus,
+    tag?: string,
+    attr?: string[],
+    opts?: RunFilterOptions,
+  ): Promise<WorkflowRun[]> {
     const q = new URLSearchParams();
     if (status) q.set('status', status);
     if (tag) q.set('tag', tag);
     // Each `attr` is a `key:op:value` predicate; repeated params are ANDed server-side.
     for (const a of attr ?? []) q.append('attr', a);
+    if (opts?.namespace) q.set('namespace', opts.namespace);
+    if (opts?.origin) q.set('origin', opts.origin);
     const qs = q.toString();
     return http<WorkflowRun[]>(qs ? `/runs?${qs}` : '/runs');
   },
@@ -437,7 +461,7 @@ export const durableClient = {
   /** Bulk retry/cancel every run matching a filter. Returns how many matched + were acted on. */
   bulk(
     action: 'retry' | 'cancel',
-    filter: {
+    filter: RunFilterOptions & {
       status?: RunStatus | undefined;
       tag?: string | undefined;
       attr?: string[] | undefined;
@@ -447,6 +471,10 @@ export const durableClient = {
     if (filter.status) q.set('status', filter.status);
     if (filter.tag) q.set('tag', filter.tag);
     for (const a of filter.attr ?? []) q.append('attr', a);
+    // Every facet the operator can see MUST be sent: a bulk retry/cancel that is scoped more widely
+    // than the list it was launched from would act on runs the operator never looked at.
+    if (filter.namespace) q.set('namespace', filter.namespace);
+    if (filter.origin) q.set('origin', filter.origin);
     const qs = q.toString();
     return http<{ matched: number; applied: number }>(`/bulk/${action}${qs ? `?${qs}` : ''}`, {
       method: 'POST',
@@ -488,6 +516,27 @@ export const durableClient = {
 // pipeline-runs view) reconstruct sub-processes from a step's events the exact same way the
 // dashboard does — by run identity (`subId`/`name`), treating `phase` events as a sub's lifecycle.
 export { type SubProcess, groupSubProcesses } from './group-subprocesses.js';
+
+// Re-export the origin facet so external consumers (e.g. flip's embedded pipeline-runs view) spell
+// an unattributed run the exact same way this console does — `unknown`, never "app" and never blank.
+export {
+  ALL_ORIGINS,
+  type EmptyRunsNotice,
+  type OriginFacet,
+  type OriginFilter,
+  UNKNOWN_ORIGIN,
+  UNKNOWN_ORIGIN_TITLE,
+  emptyRunsNotice,
+  filterByOrigin,
+  isUnknownOrigin,
+  knownOrigin,
+  matchesOrigin,
+  originFacets,
+  originFilterKey,
+  originLabel,
+  sameOriginFilter,
+  unknownOriginCount,
+} from './run-origin.js';
 
 // Re-export the canonical saga-compensation split so external consumers (e.g. flip) separate a
 // run's body from its undo checkpoints the exact same way the dashboard does — by `seq < 0`.

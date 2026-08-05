@@ -82,6 +82,7 @@ export class WorkflowRunEntity {
   tags?: string[] | null;
   searchAttributes?: Record<string, string | number | boolean> | null;
   priority?: number | null;
+  origin?: string | null;
   createdAt!: Date;
   updatedAt!: Date;
 }
@@ -207,6 +208,14 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
         transformer: jsonColumnTransformer('runs.searchAttributes'),
       },
       priority: { type: 'integer', nullable: true, name: col('priority') },
+      // Which library/module registered the workflow this run belongs to (e.g.
+      // `@dudousxd/nestjs-catalog-pipeline`), derived at registration time — never caller input.
+      // Nullable with NO default: an origin cannot be reconstructed for a row written before this
+      // column existed, so it stays NULL and reads back as `undefined` = "unknown". Defaulting it to
+      // a real-looking string would be indistinguishable from a genuine registration in the
+      // dashboard's facet. `ensureTypeOrmDurableSchema` back-fills the COLUMN onto pre-existing
+      // tables (see the `additive` map in ./schema), never its value.
+      origin: { type: 'text', nullable: true, name: col('origin') },
       createdAt: { type: Date, name: col('createdAt') },
       updatedAt: { type: Date, name: col('updatedAt') },
     },

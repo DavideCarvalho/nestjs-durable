@@ -1,0 +1,7 @@
+{
+  "name": "@fixture/fake-lib",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Not a real package: a directory with its own package.json, so origin.spec.ts can prove a workflow is attributed to the package that DECLARED it rather than to the package that owns the @Workflow decorator. Never published (packages/nestjs ships `dist` only) and not a pnpm workspace member (`packages/*`)."
+}

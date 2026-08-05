@@ -33,7 +33,7 @@ CREATE TABLE durable_workflow_runs (
   id TEXT PRIMARY KEY, workflow TEXT NOT NULL, workflow_version TEXT NOT NULL, status TEXT NOT NULL,
   input TEXT, output TEXT, error TEXT, wake_at INTEGER, locked_by TEXT, locked_until INTEGER,
   awaiting_decision_task_id TEXT,
-  recovery_attempts INTEGER, tags TEXT, search_attributes TEXT, priority INTEGER,
+  recovery_attempts INTEGER, tags TEXT, search_attributes TEXT, priority INTEGER, origin TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE TABLE durable_step_checkpoints (

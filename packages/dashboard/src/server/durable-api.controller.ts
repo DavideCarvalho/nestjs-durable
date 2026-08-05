@@ -18,14 +18,31 @@ import { DashboardService } from './dashboard.service.js';
 export class DurableApiController {
   constructor(private readonly dashboard: DashboardService) {}
 
+  /**
+   * The run list, filtered by whatever the operator asked for. Every predicate is OPTIONAL and an
+   * omitted one means "don't narrow on this axis" — in particular `namespace`, whose absence keeps
+   * the historical, deliberate behaviour that read paths are NOT namespace-scoped (core,
+   * `WorkflowRun.namespace`): the console shows every tenant's runs until an operator chooses one.
+   * A blank param (`?namespace=`, from a cleared filter box) is the same as an absent one; passing
+   * `''` through would be an exact match on a tenant nobody has, i.e. a silently empty console.
+   */
   @Get('runs')
   runs(
     @Query('status') status?: RunStatus,
     @Query('workflow') workflow?: string,
     @Query('tag') tag?: string,
     @Query('attr') attr?: string | string[],
+    @Query('namespace') namespace?: string,
+    @Query('origin') origin?: string,
   ) {
-    return this.dashboard.listRuns({ status, workflow, tag, attributes: parseAttrFilters(attr) });
+    return this.dashboard.listRuns({
+      status,
+      workflow,
+      tag,
+      attributes: parseAttrFilters(attr),
+      namespace: namespace || undefined,
+      origin: origin || undefined,
+    });
   }
 
   /** Prometheus-text metrics (runs/steps by outcome, per-workflow counts) for a scrape. */
@@ -72,7 +89,11 @@ export class DurableApiController {
     return this.dashboard.retryWithInput(id, body?.input);
   }
 
-  /** Bulk retry/cancel every run matching a filter (status / tag / workflow). */
+  /**
+   * Bulk retry/cancel every run matching a filter (status / tag / workflow / namespace / origin).
+   * The filter takes the SAME params as `GET runs` and is parsed identically, so "retry all" acts on
+   * exactly the set the operator was looking at rather than a wider one.
+   */
   @Post('bulk/:action')
   bulk(
     @Param('action') action: 'retry' | 'cancel',
@@ -81,10 +102,19 @@ export class DurableApiController {
     @Query('workflow') workflow?: string,
     @Query('attr') attr?: string | string[],
     @Query('compensate') compensate?: string,
+    @Query('namespace') namespace?: string,
+    @Query('origin') origin?: string,
   ) {
     return this.dashboard.bulk(
       action === 'cancel' ? 'cancel' : 'retry',
-      { status, tag, workflow, attributes: parseAttrFilters(attr) },
+      {
+        status,
+        tag,
+        workflow,
+        attributes: parseAttrFilters(attr),
+        namespace: namespace || undefined,
+        origin: origin || undefined,
+      },
       { compensate: compensate === 'true' },
     );
   }
