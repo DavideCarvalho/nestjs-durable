@@ -320,6 +320,9 @@ operator", nothing about what they can see changes based on who they are.
   pill is easy to spot. The generic `suspended` status covers very different situations — sleeping on a
   timer, waiting on a signal, blocked with no worker, queued behind a singleton leader — so the list and
   detail views refine it into a more legible display state; see [Waiting states](#waiting-states) below.
+  Alongside status the list narrows by tag, search attribute, **tenant** and the **library that
+  declared the workflow** — the last two answer "whose run is this" and "whose code is this", and both
+  have a default worth understanding; see [Tenant and origin filters](#tenant-and-origin-filters).
 - **Timeline as a graph** — the selected run rendered with `react-flow`: a node pipeline from
   start through each step to the terminal state, tagged by kind (local / remote / sleep / signal),
   with worker group and duration. This is the "see the whole flow" view — a workflow whose steps
@@ -340,6 +343,58 @@ operator", nothing about what they can see changes based on who they are.
   dispatch) and cancel + undo runs the saga compensation **in the background** — neither replays the
   workflow inline in the HTTP request, so the dashboard action returns immediately and a worker does the
   work. (Previously an inline replay could hang the request.)
+
+### Tenant and origin filters
+
+Two of the run-list filters are about *provenance* rather than state, and they are wired differently
+on purpose — one pushes down to the store, the other cannot.
+
+**Tenant** is a sidebar box matched exactly against the run's `namespace` — the same field the engine
+partitions worker pools by, conventionally fed from `DURABLE_TENANT` (see
+[Tenancy](/docs/concepts/tenancy)). It is sent to the store as the `namespace` param on `GET runs`
+and `POST bulk/:action`, so a narrowed list is narrowed in SQL.
+Its default is **every namespace**, and that is a decision rather than an omission: read paths (the
+dashboard, `getRun`) are deliberately not namespace-scoped, so defaulting the console to one tenant
+would have silently removed runs that every existing operator had been looking at. This is a filter an
+operator chooses, not a scope imposed on them — and it is not an authorization boundary either
+([Console auth](#console-auth) is mount-level and role-agnostic).
+An empty box is treated as *absent*, not as an exact match on a tenant named `""`, so clearing it
+returns the all-tenants view rather than an empty one. The tenant chip on a run row is a click
+shortcut into the box, like the tag chips.
+
+**Origin** — which package declared the run's workflow — is a row of facet chips above the list:
+`all`, one chip per package (labelled without the npm scope, full name in the tooltip), and `unknown`
+when any run in the list has none, each with a count. It is **derived, never declared**: `@Workflow`
+resolves the file it is applied in to the nearest enclosing `package.json`, so a library is attributed
+without opting into anything and nothing a caller passes to `start` can claim another library's name.
+The registrar warns once at boot naming whatever it could not attribute, because a *wrong* origin is
+worse than an absent one.
+
+Which makes **`undefined` a real value meaning UNKNOWN**, not a blank to be tidied away. Runs created
+before the field existed have none; so do `registerRemote`, convention routing, and any workflow whose
+declaring package couldn't be resolved with confidence. `RunQuery.origin` is plain equality, so those
+runs match **no** origin value at all — picking a package *hides* them rather than folding them into a
+bucket. Hence the shape of the facet: `all` is the default and never goes away, the `unknown` count
+stays on screen while a package is selected, and an origin filter that comes back empty says which of
+the two things happened ("nothing matched" vs "these N runs cannot be matched by any package filter")
+and offers a jump into the unclassified ones. A run's detail header states `origin unknown` outright
+for the same reason, instead of leaving the field blank and letting it read as "the app".
+
+That is also why the origin facet is counted **in the browser**, over the list the console already
+holds, while tenant is pushed to the store. A store-side facet would have reported zero unattributed
+runs the moment an operator picked a library — which reads as "those runs do not exist". The
+server-side `origin` param is still wired and still sent with bulk actions, so **retry all** /
+**cancel all** stay scoped to the list they were launched from; under the `unknown` facet — the one
+filter the server cannot be told about — those buttons are disabled rather than quietly widening to
+every origin.
+
+<Callout type="warn">
+  **The Drizzle adapter needs the `origin` column added by hand.** It has no auto-schema, and Drizzle
+  SELECTs every column its schema declares, so on an existing database *every* run query fails until
+  `ALTER TABLE durable_workflow_runs ADD COLUMN origin TEXT;` has run — see
+  [Drizzle · Schema is owned by drizzle-kit](/docs/stores/drizzle#schema-is-owned-by-drizzle-kit). The
+  MikroORM and TypeORM adapters add it on boot, and Prisma emits it through Migrate.
+</Callout>
 
 ### Waiting states
 

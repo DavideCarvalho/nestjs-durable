@@ -198,6 +198,12 @@ export class DrizzleStateStore implements StateStore {
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const filters = [
       query.workflow ? eq(workflowRuns.workflow, query.workflow) : undefined,
+      // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
+      // before the column existed, or registered through a path the derivation could not classify)
+      // matches NO origin value — it is never folded into a bucket to make the facet look complete.
+      // Unknown-origin runs are reachable only with the filter OFF, so "all origins" must stay the
+      // default view; a dashboard that filtered by default would make those runs look deleted.
+      query.origin !== undefined ? eq(workflowRuns.origin, query.origin) : undefined,
       query.status ? eq(workflowRuns.status, query.status) : undefined,
       // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store).
       query.statuses
@@ -411,6 +417,8 @@ function toRunRow(run: WorkflowRun): RunRow {
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
     priority: run.priority ?? null,
+    // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
+    origin: run.origin ?? null,
     createdAt: run.createdAt.getTime(),
     updatedAt: run.updatedAt.getTime(),
   };
@@ -438,6 +446,7 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if ('tags' in patch) row.tags = patch.tags ?? null;
   if ('searchAttributes' in patch) row.searchAttributes = patch.searchAttributes ?? null;
   if ('priority' in patch) row.priority = patch.priority ?? null;
+  if ('origin' in patch) row.origin = patch.origin ?? null;
   if (patch.createdAt != null) row.createdAt = patch.createdAt.getTime();
   if (patch.updatedAt != null) row.updatedAt = patch.updatedAt.getTime();
   return row;
@@ -460,6 +469,8 @@ function fromRunRow(row: RunRow): WorkflowRun {
     tags: row.tags ?? undefined,
     searchAttributes: row.searchAttributes ?? undefined,
     priority: row.priority ?? undefined,
+    // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
+    origin: row.origin ?? undefined,
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };

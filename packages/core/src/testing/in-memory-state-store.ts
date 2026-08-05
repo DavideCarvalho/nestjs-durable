@@ -285,6 +285,8 @@ export class InMemoryStateStore implements StateStore {
     if (query.statuses) runs = runs.filter((r) => query.statuses?.includes(r.status));
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));
     if (query.namespace !== undefined) runs = runs.filter((r) => r.namespace === query.namespace);
+    // Exact match only: a run with no origin (unknown) matches no origin value — see `RunQuery.origin`.
+    if (query.origin !== undefined) runs = runs.filter((r) => r.origin === query.origin);
     if (query.attributes?.length) {
       // Pushdown: intersect per-predicate candidate sets from the key-indexed side-table, so we only
       // ever materialize the runs that already satisfy EVERY attribute filter (no full per-run scan).

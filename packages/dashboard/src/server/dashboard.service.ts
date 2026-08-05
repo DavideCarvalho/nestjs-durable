@@ -138,13 +138,17 @@ export class DashboardService {
   }
 
   /**
-   * Apply `retry` or `cancel` to every run matching a filter (status / tag / workflow) — e.g. "retry
-   * every `dead` run tagged `type:mel`". Capped at 500 runs per call; runs that can't be acted on
+   * Apply `retry` or `cancel` to every run matching a filter (status / tag / workflow / namespace /
+   * origin) — e.g. "retry every `dead` run tagged `type:mel`". The filter is the same one the run
+   * list uses, so a bulk action can never reach wider than the list it was launched from — but note
+   * an ABSENT predicate still means "every value on that axis" (an omitted `namespace` is every
+   * tenant), which is what makes passing the operator's full filter through mandatory, not optional.
+   * Capped at 500 runs per call; runs that can't be acted on
    * (already terminal) are skipped. Returns how many matched and how many the action applied to.
    */
   async bulk(
     action: 'retry' | 'cancel',
-    filter: Pick<RunQuery, 'status' | 'tag' | 'workflow' | 'attributes'>,
+    filter: Pick<RunQuery, 'status' | 'tag' | 'workflow' | 'attributes' | 'namespace' | 'origin'>,
     opts?: { compensate?: boolean },
   ): Promise<{ matched: number; applied: number }> {
     const runs = await this.gateway.listRuns({ ...filter, limit: 500 });

@@ -16,11 +16,23 @@ import { mergeLiveEvents } from '../client/merge-live-events';
 import { type WorkerView, pivotByWorker } from '../client/pivot-by-worker';
 import { partitionOf } from '../client/queue-partition';
 import {
+  ALL_ORIGINS,
+  type OriginFilter,
+  UNKNOWN_ORIGIN,
+  UNKNOWN_ORIGIN_TITLE,
+  emptyRunsNotice,
+  filterByOrigin,
+  knownOrigin,
+  originLabel,
+  unknownOriginCount,
+} from '../client/run-origin';
+import {
   compensationDisplayName,
   compensationSummary,
   splitCompensations,
 } from '../client/split-compensations';
 import { type HealthSummary, summarizeHealth } from '../client/summarize-health';
+import { OriginFacets } from './OriginFacets';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
@@ -625,6 +637,9 @@ function RunsList({
   selected,
   onSelect,
   onSelectTag,
+  onSelectNamespace,
+  onSelectOrigin,
+  emptyNotice,
 }: {
   runs: WorkflowRun[];
   /** The FULL (unfiltered) run list — needed to place a run among its singleton siblings even when the
@@ -635,17 +650,50 @@ function RunsList({
   selected?: string | undefined;
   onSelect: (id?: string) => void;
   onSelectTag: (tag: string) => void;
+  onSelectNamespace: (namespace: string) => void;
+  onSelectOrigin: (filter: OriginFilter) => void;
+  /** What to say when nothing matched — see `emptyRunsNotice`; an empty list must never read as
+   *  "these runs do not exist" when the truth is "this filter cannot match them". */
+  emptyNotice: ReturnType<typeof emptyRunsNotice>;
 }) {
   if (loading && runs.length === 0) {
     return <RunsListSkeleton />;
   }
   if (runs.length === 0) {
-    return <div className="p-6 text-sm text-zinc-600">No runs yet.</div>;
+    return (
+      <div className="flex flex-col items-start gap-2 p-6 text-sm text-zinc-600">
+        <span>{emptyNotice.message}</span>
+        {emptyNotice.unclassified !== undefined && (
+          <>
+            <span className="text-[11px] text-zinc-500">
+              {emptyNotice.unclassified} run{emptyNotice.unclassified === 1 ? '' : 's'} here{' '}
+              {emptyNotice.unclassified === 1 ? 'has' : 'have'} no recorded origin, so no package
+              filter can match {emptyNotice.unclassified === 1 ? 'it' : 'them'}.
+            </span>
+            <Button
+              variant="chip"
+              size="xs"
+              className="mono rounded"
+              title={UNKNOWN_ORIGIN_TITLE}
+              onClick={() => onSelectOrigin({ kind: 'unknown' })}
+            >
+              show unclassified
+            </Button>
+          </>
+        )}
+      </div>
+    );
   }
   return (
     <ul className="divide-y divide-line-soft">
       {runs.map((r) => {
         const state = deriveRunState(r, { runs: allRuns, health });
+        // Bound as consts so the click handlers close over a narrowed value (a property read would
+        // widen back to `string | undefined` inside the callback). Both chips are POINTER shortcuts
+        // for the sidebar filters, exactly like the tag chips below: a nested <button> would be
+        // invalid markup inside the row's own button, so the row stays the keyboard target.
+        const tenant = r.namespace && r.namespace !== 'default' ? r.namespace : undefined;
+        const origin = knownOrigin(r.origin);
         return (
           <li key={r.id}>
             <button
@@ -658,13 +706,33 @@ function RunsList({
               <div className="flex items-center justify-between gap-2">
                 <span className="flex min-w-0 items-center gap-1.5">
                   <span className="truncate text-sm font-medium text-zinc-200">{r.workflow}</span>
-                  {r.namespace && r.namespace !== 'default' && (
+                  {tenant && (
                     <Chip
                       variant="tenant"
-                      className="mono shrink-0 px-1 text-[9px]"
-                      title="Tenant / worker-pool partition"
+                      className="mono shrink-0 cursor-pointer px-1 text-[9px] hover:border-sky-400/60 hover:text-sky-200"
+                      title={`Tenant / worker-pool partition — click to show only ${tenant}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectNamespace(tenant);
+                      }}
                     >
-                      {r.namespace}
+                      {tenant}
+                    </Chip>
+                  )}
+                  {/* Origin, when the run HAS one. An unattributed run shows no chip here rather than
+                      a row of `unknown` noise — the facet above keeps its count on screen, the empty
+                      state names it, and the run's own detail header states it outright. */}
+                  {origin && (
+                    <Chip
+                      variant="origin"
+                      className="mono shrink-0 cursor-pointer px-1 text-[9px] hover:border-teal-400/60 hover:text-teal-200"
+                      title={`Declared by ${origin} — click to show only this library's runs`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectOrigin({ kind: 'origin', origin });
+                      }}
+                    >
+                      {originLabel(origin)}
                     </Chip>
                   )}
                   {r.id.startsWith('dlq:') && (
@@ -983,6 +1051,9 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   const detailState = deriveRunState(run, { runs: siblingRuns, health, timeline: body });
   // Show the tenant/partition only when it's a real named one (not the single-pool `default`).
   const tenant = run.namespace && run.namespace !== 'default' ? run.namespace : undefined;
+  // The declaring package, or `undefined` for UNKNOWN — which the header states outright rather
+  // than omitting, so "we don't know" never reads as "the app".
+  const origin = knownOrigin(run.origin);
 
   return (
     <div className="flex h-full flex-col">
@@ -1030,6 +1101,18 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
                 title="Tenant / worker-pool partition this run belongs to"
               >
                 {tenant}
+              </Chip>
+            )}
+            {/* WHICH LIBRARY declared this workflow — stated on every run, including the ones nobody
+                could attribute. Unlike the list row (dense, scannable), the detail view has room to
+                be explicit, and "unknown" is the honest answer here: not the host app, not blank. */}
+            {origin ? (
+              <Chip variant="origin" className="mono py-0.5" title={`Declared by ${origin}`}>
+                {originLabel(origin)}
+              </Chip>
+            ) : (
+              <Chip variant="origin-unknown" className="mono py-0.5" title={UNKNOWN_ORIGIN_TITLE}>
+                origin {UNKNOWN_ORIGIN}
               </Chip>
             )}
             {compensations.length > 0 && (
@@ -1309,6 +1392,12 @@ export function App() {
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
   const [tagFilter, setTagFilter] = useState('');
   const [attrFilter, setAttrFilter] = useState('');
+  // Empty = EVERY tenant, and that default is deliberate: core keeps read paths namespace-unscoped,
+  // so an operator who has always seen every tenant's runs keeps seeing them until they narrow.
+  const [namespaceFilter, setNamespaceFilter] = useState('');
+  // Origin is faceted in the browser (see OriginFacets) — it is the only filter here that must be
+  // able to select ABSENCE, which an exact-match `RunQuery.origin` cannot express.
+  const [originFilter, setOriginFilter] = useState<OriginFilter>(ALL_ORIGINS);
   // The open run lives in the URL hash so it survives reload and can be shared/linked.
   const [selected, setSelectedState] = useState<string | undefined>(() => runIdFromHash());
   const setSelected = useCallback((id?: string) => {
@@ -1335,12 +1424,14 @@ export function App() {
     .map((s) => s.trim())
     .filter(Boolean);
   const { data: runs = [], isPending: runsPending } = useQuery({
-    queryKey: ['runs', tagFilter, attrPredicates.join('|')],
+    queryKey: ['runs', tagFilter, attrPredicates.join('|'), namespaceFilter],
     queryFn: () =>
       durableClient.runs(
         undefined,
         tagFilter || undefined,
         attrPredicates.length ? attrPredicates : undefined,
+        // An empty box sends NO `namespace` param — all tenants, the historical default.
+        { namespace: namespaceFilter || undefined },
       ),
     refetchInterval: 3000, // keep the run list live
   });
@@ -1358,15 +1449,39 @@ export function App() {
         status: filter !== 'all' ? filter : undefined,
         tag: tagFilter || undefined,
         attr: attrPredicates.length ? attrPredicates : undefined,
+        namespace: namespaceFilter || undefined,
+        // Only a CONCRETE origin can be pushed to the server; `unknown` has no `RunQuery` spelling,
+        // which is exactly why the bulk buttons are disabled while it is selected (below) — sending
+        // no param there would quietly widen a destructive action to every origin.
+        origin: originFilter.kind === 'origin' ? originFilter.origin : undefined,
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['runs'] }),
   });
 
-  const counts = runs.reduce<Record<string, number>>((acc, r) => {
+  // The origin facet is applied FIRST, so the status counts and the list agree with the chip that is
+  // lit. `runs` (unfaceted) still feeds the facet counts and the singleton lineage below.
+  const originScoped = filterByOrigin(runs, originFilter);
+  const counts = originScoped.reduce<Record<string, number>>((acc, r) => {
     acc[r.status] = (acc[r.status] ?? 0) + 1;
     return acc;
   }, {});
-  const shown = filter === 'all' ? runs : runs.filter((r) => r.status === filter);
+  const shown = filter === 'all' ? originScoped : originScoped.filter((r) => r.status === filter);
+  // Counted BEFORE the origin facet — the whole point is to be able to say "these N runs cannot be
+  // matched by any package filter" at the moment a package filter shows nothing.
+  const unattributed = unknownOriginCount(runs);
+  const anyFilter =
+    filter !== 'all' ||
+    Boolean(tagFilter) ||
+    Boolean(namespaceFilter) ||
+    attrPredicates.length > 0 ||
+    originFilter.kind !== 'all';
+  // Why "retry all"/"cancel all" are off, or `undefined` when they're fine. The `unknown` facet is
+  // the one filter the server cannot be told about, so a bulk action launched under it would act on
+  // runs that are NOT on screen. Refusing loudly beats acting wider than the operator can see.
+  const bulkBlocked =
+    originFilter.kind === 'unknown'
+      ? 'Bulk actions cannot be scoped to unclassified runs — runs with no origin have no server-side filter. Retry or cancel them from their own run view.'
+      : undefined;
   // Workflows with runs waiting on a handler that has NO live worker — surfaced as a banner so it's
   // obvious nothing will progress until a worker rejoins (the "control plane up, no worker" case).
   const stalledWorkflows = [
@@ -1417,17 +1532,33 @@ export function App() {
                 aria-label="filter by search attribute"
                 title="Typed search attributes: comma-separated key:op:value (ops eq ne gt gte lt lte)"
               />
+              <InputField
+                glyph="@"
+                containerClassName="mt-1.5"
+                value={namespaceFilter}
+                onChange={(e) => setNamespaceFilter(e.target.value)}
+                onClear={() => setNamespaceFilter('')}
+                clearLabel="clear tenant filter"
+                placeholder="filter by tenant / namespace…"
+                aria-label="filter by tenant"
+                title="Tenant / worker-pool partition (WorkflowRun.namespace). Empty shows every tenant."
+              />
             </div>
-            {(filter !== 'all' || tagFilter || attrPredicates.length > 0) && shown.length > 0 && (
+            <OriginFacets runs={runs} value={originFilter} onChange={setOriginFilter} />
+            {anyFilter && shown.length > 0 && (
               <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
                 <span className="mono text-[10px] text-zinc-500">
                   {shown.length} {filter !== 'all' ? filter : ''} {tagFilter && `#${tagFilter}`}
+                  {namespaceFilter && ` @${namespaceFilter}`}
+                  {originFilter.kind === 'origin' && ` ⬡${originLabel(originFilter.origin)}`}
+                  {originFilter.kind === 'unknown' && ` ⬡${UNKNOWN_ORIGIN}`}
                   {attrPredicates.length > 0 && ` ⛃${attrPredicates.length}`}
                 </span>
                 <Button
                   variant="brand"
                   size="xs"
-                  disabled={bulk.isPending}
+                  disabled={bulk.isPending || bulkBlocked !== undefined}
+                  title={bulkBlocked}
                   onClick={() => bulk.mutate('retry')}
                   className="mono ml-auto rounded"
                 >
@@ -1436,7 +1567,8 @@ export function App() {
                 <Button
                   variant="danger"
                   size="xs"
-                  disabled={bulk.isPending}
+                  disabled={bulk.isPending || bulkBlocked !== undefined}
+                  title={bulkBlocked}
                   onClick={() => bulk.mutate('cancel')}
                   className="mono rounded"
                 >
@@ -1453,6 +1585,13 @@ export function App() {
                 selected={selected}
                 onSelect={setSelected}
                 onSelectTag={setTagFilter}
+                onSelectNamespace={setNamespaceFilter}
+                onSelectOrigin={setOriginFilter}
+                emptyNotice={emptyRunsNotice({
+                  anyFilter,
+                  origin: originFilter,
+                  unknownCount: unattributed,
+                })}
               />
             </div>
           </aside>

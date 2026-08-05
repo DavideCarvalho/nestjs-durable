@@ -93,7 +93,14 @@ import {
 // type never leaks into the public authoring surface while `EntityHost.register` still lines up.
 type WorkflowFn = (ctx: InternalWorkflowCtx, input: unknown) => Promise<unknown>;
 
-/** Options for {@link WorkflowEngine.start}. */
+/**
+ * Options for {@link WorkflowEngine.start}.
+ *
+ * Note the absence of `origin`: {@link WorkflowRun.origin} says which PACKAGE declared the workflow,
+ * which is a property of the registered code, not of whoever started it. It is taken from the
+ * registration and nothing here can override it — otherwise one caller could label its runs as
+ * another lib's, and an origin filter would quietly lie.
+ */
 export interface StartOptions {
   /** Run-scoped tags, merged with the workflow's static `@Workflow({ tags })` onto the run. */
   tags?: string[] | undefined;
@@ -177,6 +184,9 @@ interface RegisteredWorkflow {
    *  `fn` is the throwing stub (`registerRemote` / a synthesized remote child). Gates
    *  {@link WorkflowEngine.workflowBody} so an in-app worker only ever gets a runnable body. */
   hasBody?: boolean | undefined;
+  /** The package that declared this workflow, stamped onto every run it starts. See
+   *  {@link WorkflowRun.origin}. Absent = unknown; the engine never substitutes a default. */
+  origin?: string | undefined;
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
@@ -731,6 +741,12 @@ export class WorkflowEngine {
       /** Capabilities a live worker must advertise to run this workflow's turns (handshake §7.5).
        *  Only meaningful with `group`/`executor` (a remote/group-served workflow). Absent = runs anywhere. */
       requires?: string[] | undefined;
+      /** The package that DECLARED this workflow, stamped onto every run started from it (see
+       *  {@link WorkflowRun.origin}). Supplied by the registering integration — `@dudousxd/nestjs-durable`
+       *  derives it from the `@Workflow` class's declaring file — never by whoever calls `start`. Omit
+       *  when it cannot be derived with confidence: absent means UNKNOWN, and an absent origin is far
+       *  cheaper to live with than a wrong one. */
+      origin?: string | undefined;
     },
   ): void {
     // Group-served is all-or-nothing: a `group` with no `executor` (or vice-versa) is a wiring bug —
@@ -753,6 +769,7 @@ export class WorkflowEngine {
       onEvent: opts?.onEvent,
       eventBatch: opts?.eventBatch,
       requires: opts?.requires,
+      origin: opts?.origin,
       // A real, retained in-process body — so `workflowBody` can hand it to an in-app worker, and so
       // it is NOT confused with the throwing stub `registerRemote` installs for a body-less remote.
       hasBody: true,
@@ -1041,6 +1058,11 @@ export class WorkflowEngine {
       workflowVersion: registered.version,
       status: 'pending',
       namespace: opts?.namespace ?? this.namespace,
+      // DERIVED from the registration, exactly like `namespace` is derived from this engine — there is
+      // deliberately no `opts.origin`, so a caller cannot label its run as another package's work.
+      // `undefined` when the registration carried none (remote/convention/synthesized child, or a
+      // registrar that could not resolve the declaring package): unknown, not "the app".
+      origin: registered.origin,
       input,
       tags,
       searchAttributes: opts?.searchAttributes,

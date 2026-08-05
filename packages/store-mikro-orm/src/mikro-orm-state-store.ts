@@ -293,6 +293,12 @@ export class MikroOrmStateStore implements StateStore {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
     if (query.namespace !== undefined) where.namespace = query.namespace;
+    // Plain equality on the origin column, exactly like `namespace` above. A run whose origin is NULL
+    // (created before the column existed, or registered through a path the derivation could not
+    // classify) matches NO origin value — it is never folded into some bucket to make the facet look
+    // complete. Unknown-origin runs are reachable only with the filter OFF, so "all origins" must stay
+    // the default view; a dashboard that filtered by default would make those runs look deleted.
+    if (query.origin !== undefined) where.origin = query.origin;
     // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store). When both the
     // single `status` and `statuses` are set, AND them so the narrower set wins.
     if (query.status && query.statuses) {
@@ -565,6 +571,10 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   e.searchAttributes = run.searchAttributes ?? null;
   e.priority = run.priority ?? null;
   e.namespace = run.namespace ?? 'default';
+  // NOT `?? 'default'` like the line above: an absent origin is genuinely UNKNOWN and must stay NULL
+  // (see the column's docblock in ./entities). `null` — not left-undefined — so `Object.assign` in
+  // updateRun writes SQL NULL rather than skipping the column.
+  e.origin = run.origin ?? null;
   e.createdAt = run.createdAt;
   e.updatedAt = run.updatedAt;
   return e;
@@ -588,6 +598,8 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     searchAttributes: e.searchAttributes ?? undefined,
     priority: e.priority ?? undefined,
     namespace: e.namespace,
+    // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
+    origin: e.origin ?? undefined,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

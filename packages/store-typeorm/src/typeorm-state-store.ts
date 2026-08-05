@@ -102,6 +102,7 @@ export class TypeOrmStateStore implements StateStore {
     if ('tags' in patch) update.tags = patch.tags ?? null;
     if ('searchAttributes' in patch) update.searchAttributes = patch.searchAttributes ?? null;
     if ('priority' in patch) update.priority = patch.priority ?? null;
+    if ('origin' in patch) update.origin = patch.origin ?? null;
     if ('createdAt' in patch) update.createdAt = patch.createdAt;
     if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;
     const result = await this.runs()
@@ -220,6 +221,12 @@ export class TypeOrmStateStore implements StateStore {
     // and corrupt the LIKE pattern. Use the query builder with a raw parameter to bypass that.
     const qb = this.runs().createQueryBuilder('r');
     if (query.workflow) qb.andWhere('r.workflow = :workflow', { workflow: query.workflow });
+    // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
+    // before the column existed, or registered through a path the derivation could not classify)
+    // matches NO origin value — it is never folded into a bucket to make the facet look complete.
+    // Unknown-origin runs are reachable only with the filter OFF, so "all origins" must stay the
+    // default view; a dashboard that filtered by default would make those runs look deleted.
+    if (query.origin !== undefined) qb.andWhere('r.origin = :origin', { origin: query.origin });
     if (query.status) qb.andWhere('r.status = :status', { status: query.status });
     if (query.statuses)
       qb.andWhere(
@@ -409,6 +416,8 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
     priority: run.priority ?? null,
+    // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
+    origin: run.origin ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -431,6 +440,8 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     tags: e.tags ?? undefined,
     searchAttributes: e.searchAttributes ?? undefined,
     priority: e.priority ?? undefined,
+    // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
+    origin: e.origin ?? undefined,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

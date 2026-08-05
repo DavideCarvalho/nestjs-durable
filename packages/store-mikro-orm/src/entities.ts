@@ -46,6 +46,7 @@ export class WorkflowRunEntity {
   searchAttributes?: Record<string, string | number | boolean> | null;
   priority?: number | null;
   namespace!: string;
+  origin?: string | null;
   createdAt!: Date;
   updatedAt!: Date;
 }
@@ -182,6 +183,27 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       searchAttributes: { type: 'json', nullable: true, fieldName: col('searchAttributes') },
       priority: { type: 'integer', nullable: true, fieldName: col('priority') },
       namespace: { type: 'string', default: 'default', fieldName: col('namespace') },
+      // Which library/module registered the workflow this run belongs to (e.g.
+      // `@dudousxd/nestjs-catalog-pipeline`), derived at registration time — never caller input.
+      //
+      // NULLABLE WITH NO DEFAULT, deliberately unlike `namespace` above. `namespace` can honestly
+      // default a pre-existing row to `'default'` (that IS the namespace an unscoped engine ran it
+      // in); an origin cannot be reconstructed after the fact, so a row written before this column
+      // existed must read back as `undefined` = "unknown". Stamping it `'app'`/`'unknown'` would be
+      // indistinguishable from a real registration in the dashboard's facet — a wrong origin is worse
+      // than an absent one. Two MikroORM specifics reinforce it: a `default` here would NOT be
+      // back-filled onto existing rows anyway (the DDL default only applies to new inserts, and a
+      // TypeScript field initialiser never runs for rows the ORM did not create), so a default would
+      // buy nothing but a lie for future rows.
+      //
+      // No index, unlike `namespace`. That one is on the HOT path — every poll tick filters
+      // `listPendingRuns`/`listDueTimers`/`listIncompleteRuns` by it, hence
+      // `durable_workflow_runs_namespace_status_idx`. Nothing filters by `origin` except the
+      // dashboard's `listRuns`, where it is ANDed with the `status`/`workflow` predicates that
+      // `durable_workflow_runs_status_wake_at_idx` / `..._workflow_status_idx` already bound. If a
+      // deployment ever makes origin-filtered listings hot, add the composite index in your own
+      // migration rather than here.
+      origin: { type: 'string', nullable: true, fieldName: col('origin') },
       createdAt: { type: 'Date', fieldName: col('createdAt') },
       updatedAt: { type: 'Date', fieldName: col('updatedAt') },
     },

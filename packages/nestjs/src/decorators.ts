@@ -10,6 +10,7 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
 import type { z } from 'zod';
+import { declaringFile, rememberDeclaringFile } from './origin';
 
 export const WORKFLOW_METADATA = Symbol('nestjs-durable:workflow');
 
@@ -143,7 +144,14 @@ export interface WorkflowOptions {
  * workflow function the engine executes and replays.
  */
 export function Workflow(options: WorkflowOptions): ClassDecorator {
+  // Captured HERE, in the factory, because this is the one moment we are provably executing inside
+  // the module that declares the workflow — by the time a registrar scans providers, the only thing
+  // left of that module is a class object with no file on it. The path is resolved to the owning
+  // package lazily, at registration (see `origin.ts`); a runtime that yields no usable frame simply
+  // leaves the workflow unattributed, which the registrar reports at boot.
+  const declaredIn = declaringFile(Workflow);
   return (target) => {
+    rememberDeclaringFile(target, declaredIn);
     const meta: WorkflowMeta = {
       name: options.name,
       version: options.version ?? '1',

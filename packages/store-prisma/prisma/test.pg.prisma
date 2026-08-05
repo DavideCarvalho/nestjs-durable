@@ -31,6 +31,12 @@ model DurableWorkflowRun {
   tags            Json?
   searchAttributes Json?   @map("search_attributes")
   priority         Int?    @map("priority")
+  // Which library/module registered the workflow this run belongs to (e.g.
+  // `@dudousxd/nestjs-catalog-pipeline`), derived at registration time — never caller input.
+  // Nullable with NO default: an origin cannot be reconstructed for a row written before this
+  // column existed, so it stays NULL and reads back as `undefined` = "unknown". A real-looking
+  // default would be indistinguishable from a genuine registration in the dashboard facet.
+  origin           String? @map("origin")
   createdAt       DateTime @map("created_at")
   updatedAt       DateTime @map("updated_at")
 

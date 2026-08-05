@@ -15,6 +15,11 @@ import type {
  * It is deliberately a *representative* snapshot rather than a minimal one: several `completed`
  * (green) runs sit next to the green interactive affordances (accent logo, `retry all`, `Retry`) so a
  * screenshot can settle the accent-vs-status question in AVIARY-UI.md with evidence.
+ *
+ * It is also deliberately MIXED on the two provenance axes, because a snapshot where every run is
+ * attributed would hide the case that matters: two runs (`inv-2b91ee70`, `bck-4410aa03`) carry no
+ * `origin` at all — the "unknown" bucket a real deployment is mostly made of — and two sit in a named
+ * tenant rather than `default`.
  */
 
 const T0 = Date.parse('2026-07-29T09:14:00.000Z');
@@ -27,6 +32,7 @@ const runs: WorkflowRun[] = [
     workflowVersion: '4',
     status: 'failed',
     namespace: 'default',
+    origin: 'acme-storefront',
     createdAt: iso(-620_000),
     updatedAt: iso(-540_000),
     tags: ['tier:pro', 'region:us-east'],
@@ -39,6 +45,7 @@ const runs: WorkflowRun[] = [
     workflow: 'checkout',
     workflowVersion: '4',
     status: 'completed',
+    origin: 'acme-storefront',
     createdAt: iso(-1_800_000),
     updatedAt: iso(-1_744_000),
     tags: ['tier:free'],
@@ -59,6 +66,7 @@ const runs: WorkflowRun[] = [
     workflow: 'shipmentSync',
     workflowVersion: '1',
     status: 'running',
+    origin: '@dudousxd/nestjs-catalog-pipeline',
     createdAt: iso(-90_000),
     updatedAt: iso(-4_000),
     input: { carrier: 'dhl' },
@@ -68,6 +76,7 @@ const runs: WorkflowRun[] = [
     workflow: 'shipmentSync',
     workflowVersion: '1',
     status: 'completed',
+    origin: '@dudousxd/nestjs-catalog-pipeline',
     createdAt: iso(-3_400_000),
     updatedAt: iso(-3_330_000),
     input: { carrier: 'ups' },
@@ -77,6 +86,8 @@ const runs: WorkflowRun[] = [
     workflow: 'nightlyReport',
     workflowVersion: '7',
     status: 'suspended',
+    namespace: 'acme',
+    origin: '@dudousxd/nestjs-agent',
     createdAt: iso(-5_400_000),
     updatedAt: iso(-300_000),
     waiting: { on: 'signal', name: 'approve' },
@@ -87,6 +98,8 @@ const runs: WorkflowRun[] = [
     workflow: 'checkout',
     workflowVersion: '4',
     status: 'completed',
+    namespace: 'acme',
+    origin: 'acme-storefront',
     createdAt: iso(-7_200_000),
     updatedAt: iso(-7_120_000),
     tags: ['tier:pro'],
@@ -107,6 +120,7 @@ const runs: WorkflowRun[] = [
     workflow: 'checkout',
     workflowVersion: '4',
     status: 'pending',
+    origin: 'acme-storefront',
     createdAt: iso(-12_000),
     updatedAt: iso(-12_000),
     input: { orderId: 'ord-6650bb91', amount: 78 },
@@ -269,8 +283,21 @@ const workers: GroupHealth[] = [
 const topology: DurableTopology = { role: 'control-plane' };
 
 function body(path: string): unknown | undefined {
-  const [route] = path.split('?');
-  if (route === '/runs') return runs;
+  const [route, search] = path.split('?');
+  if (route === '/runs') {
+    // Honour the two server-side facets the console can send, the way a real store applies them
+    // (exact match, ANDed, absent = don't narrow) — otherwise the tenant box in the preview would
+    // look broken, and a screenshot of it would be a lie.
+    const params = new URLSearchParams(search ?? '');
+    const namespace = params.get('namespace');
+    const origin = params.get('origin');
+    return runs.filter(
+      (r) =>
+        (!namespace || r.namespace === namespace) &&
+        // A run with NO origin matches no origin value — the same asymmetry core documents.
+        (!origin || r.origin === origin),
+    );
+  }
   if (route === '/workers') return workers;
   if (route === '/topology') return topology;
   const run = route?.match(/^\/runs\/(.+)$/)?.[1];

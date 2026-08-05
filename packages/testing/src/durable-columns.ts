@@ -12,6 +12,13 @@
  *
  * The camelCase ("preserve") naming is simply the property names themselves (the object keys), so no
  * separate map is needed for it.
+ *
+ * A property belongs here only when EVERY adapter declares it — the assertion walks this map and
+ * reports a missing property as a mismatch, so listing a column one adapter doesn't have would fail
+ * that adapter for a divergence it isn't guilty of. `WorkflowRun.namespace` is the standing example:
+ * only the MikroORM adapter has a `namespace` column (it is the one with the tenant read filter), so
+ * it stays out. That absence records a real cross-adapter gap, not a naming one; if the other three
+ * ever gain the column, it belongs here on the same day.
  */
 export const DURABLE_CANONICAL_COLUMNS = {
   durable_workflow_runs: {
@@ -28,6 +35,11 @@ export const DURABLE_CANONICAL_COLUMNS = {
     recoveryAttempts: 'recovery_attempts',
     tags: 'tags',
     searchAttributes: 'search_attributes',
+    priority: 'priority',
+    // Which library registered the workflow. Single-word, so `snake_case` and `preserve` agree and
+    // an adapter can look canonical by accident — which is exactly why it is pinned here rather than
+    // left to four per-adapter assertions to keep saying the same thing.
+    origin: 'origin',
     createdAt: 'created_at',
     updatedAt: 'updated_at',
   },

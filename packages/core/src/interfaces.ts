@@ -77,6 +77,24 @@ export interface WorkflowRun {
    */
   namespace?: string | undefined;
   /**
+   * The npm package that DECLARED this run's workflow — e.g. `@dudousxd/nestjs-catalog-pipeline` for
+   * a workflow shipped by a library, or the host app's own `package.json` `name` for one written in
+   * the app. This is a CODE-PROVENANCE axis ("which lib owns this body"), NOT a tenancy axis — for
+   * that, see {@link namespace}.
+   *
+   * Stamped at creation from the workflow's registration, exactly as {@link namespace} is stamped
+   * from the creating engine. It is DERIVED, never caller input: `StartOptions` has no `origin`, so
+   * nothing a caller passes to `start` can make a run claim another lib's name.
+   *
+   * `undefined` means UNKNOWN — never "the app". It is what you get for a run created before this
+   * field existed, for a registration path that carries no origin (`registerRemote`, convention
+   * routing, a synthesized remote child, or a bare `engine.register` with no `origin` option), and
+   * for a workflow whose declaring package could not be resolved with confidence. A wrong origin is
+   * worse than an absent one: a filter that silently drops runs looks exactly like runs that never
+   * existed, so callers must render unknown as unknown and never fold it into a real package.
+   */
+  origin?: string | undefined;
+  /**
    * Dispatch priority for a REMOTE run (one advanced by a {@link WorkflowExecutor} over a broker):
    * carried onto each {@link WorkflowTask} so an urgent child workflow can jump ahead of enqueued
    * lower-priority ones at the worker. Higher wins; absent = unprioritised. Best-effort ordering, not
@@ -538,6 +556,15 @@ export interface RunQuery {
   attributes?: AttributeFilter[] | undefined;
   /** Restrict to runs in this namespace (exact match), ANDed with the other predicates. */
   namespace?: string | undefined;
+  /**
+   * Restrict to runs whose workflow was declared by this package (exact match against
+   * {@link WorkflowRun.origin}), ANDed with the other predicates.
+   *
+   * A run with NO origin (unknown — see the field) matches no `origin` value at all, so a UI facet
+   * built on this must keep an "all origins" option: filtering by any single package silently hides
+   * every unattributed run, which reads to an operator as "those runs do not exist".
+   */
+  origin?: string | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
 }

@@ -170,7 +170,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ${runsCol('wakeAt')} ${ts}, ${runsCol('lockedBy')} ${str}, ${runsCol('lockedUntil')} ${ts},
       ${runsCol('awaitingDecisionTaskId')} ${str},
       ${runsCol('recoveryAttempts')} ${int}, ${runsCol('tags')} ${txt}, ${runsCol('searchAttributes')} ${txt},
-      ${runsCol('priority')} ${int},
+      ${runsCol('priority')} ${int}, ${runsCol('origin')} ${str},
       ${runsCol('createdAt')} ${ts} NOT NULL, ${runsCol('updatedAt')} ${ts} NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS ${checkpoints} (
@@ -221,6 +221,11 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ['tags', txt],
       ['searchAttributes', txt],
       ['priority', int],
+      // Nullable and NOT back-filled with a value: every row that predates the column keeps a NULL
+      // origin, which the store reads as `undefined` = "unknown origin". There is no honest value to
+      // back-fill — the origin is derived from the registration that created the run, which is long
+      // gone by the time this ALTER runs.
+      ['origin', str],
     ],
     durable_step_checkpoints: [
       ['input', txt],

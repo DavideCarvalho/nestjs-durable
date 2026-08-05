@@ -2,13 +2,21 @@ import type { StepLogger, WorkflowCtx } from '@dudousxd/nestjs-durable-core';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { getDurableStepMeta, getWorkflowMeta } from './decorators';
 import type { DurableStepMeta, WorkflowMeta } from './decorators';
+import { originOfProvider } from './origin';
 
 export interface WorkflowInstance {
   run(ctx: WorkflowCtx, input: unknown): Promise<unknown>;
 }
 
 /**
- * Walks every provider that carries `@Workflow` metadata and invokes `register(meta, instance)`.
+ * Walks every provider that carries `@Workflow` metadata and invokes
+ * `register(meta, instance, origin)`.
+ *
+ * `origin` is the package that declared the workflow class ({@link originOfProvider}), derived from
+ * the provider wrapper — this is the ONE path every `@Workflow` in the app reaches, whichever role
+ * the app runs in, so a lib that has never heard of the feature is attributed anyway. It is
+ * `undefined` when the derivation could not answer confidently; the engine-side registrar
+ * (`WorkflowRegistrar`) reports those at boot, and their runs carry no origin rather than a guess.
  *
  * Guards applied (same as both registrars):
  *   - null / non-object provider instances are skipped
@@ -17,7 +25,7 @@ export interface WorkflowInstance {
  */
 export function scanWorkflows(
   discovery: DiscoveryService,
-  register: (meta: WorkflowMeta, instance: WorkflowInstance) => void,
+  register: (meta: WorkflowMeta, instance: WorkflowInstance, origin: string | undefined) => void,
 ): void {
   for (const wrapper of discovery.getProviders()) {
     const { instance } = wrapper;
@@ -28,7 +36,7 @@ export function scanWorkflows(
     if (typeof workflow.run !== 'function') {
       throw new Error(`@Workflow ${meta.name} must define a run(ctx, input) method`);
     }
-    register(meta, workflow);
+    register(meta, workflow, originOfProvider(wrapper));
   }
 }
 

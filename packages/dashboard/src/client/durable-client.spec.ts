@@ -18,6 +18,63 @@ function jsonResponse(body: unknown, status: number): Response {
 // `vitest.config.ts` runs this suite under `environment: 'node'` (no DOM), so `window` doesn't
 // exist by default — `durable-client.ts` already guards every access with `typeof window !==
 // 'undefined'`. Stub a minimal one here to exercise the browser-navigation branch.
+describe('durableClient: the run-list query string', () => {
+  /** Capture the URL the client fetches, answering with an empty run list. */
+  function captureUrl(): { calls: string[] } {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => {
+        calls.push(url);
+        return Promise.resolve(jsonResponse([], 200));
+      }),
+    );
+    return { calls };
+  }
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('sends NO namespace param by default — every tenant, as the console has always shown', async () => {
+    // Core: read paths are deliberately not namespace-scoped. Defaulting to the host's own tenant
+    // here would silently hide other tenants' runs from every existing operator.
+    const { calls } = captureUrl();
+    await durableClient.runs();
+    expect(calls[0]).toBe('/durable/api/runs');
+  });
+
+  it('drops an empty namespace/origin rather than filtering on the empty string', async () => {
+    // A cleared filter box is "all", not an exact match against a tenant nobody has.
+    const { calls } = captureUrl();
+    await durableClient.runs(undefined, undefined, undefined, { namespace: '', origin: '' });
+    expect(calls[0]).toBe('/durable/api/runs');
+  });
+
+  it('sends the namespace and origin the operator chose', async () => {
+    const { calls } = captureUrl();
+    await durableClient.runs(undefined, 'tier:pro', undefined, {
+      namespace: 'acme',
+      origin: '@dudousxd/nestjs-catalog-pipeline',
+    });
+    const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
+    expect(query.get('tag')).toBe('tier:pro');
+    expect(query.get('namespace')).toBe('acme');
+    expect(query.get('origin')).toBe('@dudousxd/nestjs-catalog-pipeline');
+  });
+
+  it('scopes a bulk action by the same facets, so it cannot reach wider than the list', async () => {
+    const { calls } = captureUrl();
+    await durableClient.bulk('cancel', {
+      status: 'dead',
+      namespace: 'acme',
+      origin: '@dudousxd/nestjs-agent',
+    });
+    const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
+    expect(query.get('status')).toBe('dead');
+    expect(query.get('namespace')).toBe('acme');
+    expect(query.get('origin')).toBe('@dudousxd/nestjs-agent');
+  });
+});
+
 describe('durableClient: 401 handling (session gone mid-console)', () => {
   beforeEach(() => {
     (globalThis as { window?: FakeWindow }).window = {

@@ -24,6 +24,17 @@ export const workflowRuns = sqliteTable('durable_workflow_runs', {
     Record<string, string | number | boolean>
   >(),
   priority: integer('priority'),
+  // Which library/module registered the workflow this run belongs to (e.g.
+  // `@dudousxd/nestjs-catalog-pipeline`), derived at registration time — never caller input.
+  // Nullable with NO default: an origin cannot be reconstructed for a row written before this column
+  // existed, so it stays NULL and reads back as `undefined` = "unknown". A real-looking default would
+  // be indistinguishable from a genuine registration in the dashboard's facet.
+  //
+  // MIGRATION (this adapter alone has no auto-schema — you own the migrations): an existing database
+  // needs `ALTER TABLE durable_workflow_runs ADD COLUMN origin TEXT;`. Drizzle SELECTs every column
+  // declared here, so until that runs, EVERY run query fails with "no such column: origin" — the same
+  // step `priority` needed before it.
+  origin: text('origin'),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
 });

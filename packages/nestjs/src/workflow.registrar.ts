@@ -105,8 +105,12 @@ export class WorkflowRegistrar
       }
     }
 
+    // Workflows whose declaring package could not be derived — reported once, after the scan.
+    const unattributed: string[] = [];
+
     // Workflow registration pass — shared scan, engine-specific registration callback.
-    scanWorkflows(this.discovery, (meta, workflow) => {
+    scanWorkflows(this.discovery, (meta, workflow, origin) => {
+      if (origin === undefined) unattributed.push(meta.name);
       // Input validation: a custom `validateInput` wins; otherwise build one from the class-validator
       // `inputSchema` DTO (lazy — class-validator is only required if a workflow uses inputSchema).
       const validateInput =
@@ -124,6 +128,10 @@ export class WorkflowRegistrar
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const workflowCtor: object = (workflow as any).constructor as object;
       this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input), {
+        // Stamped onto every run this workflow starts (see `WorkflowRun.origin`). Derived from the
+        // class's declaring file, so a lib gets attributed without opting in; `undefined` when it
+        // could not be derived, which the engine records as unknown rather than defaulting.
+        origin,
         tags: meta.tags,
         singleton: meta.singleton,
         executionTimeout: meta.executionTimeout,
@@ -172,14 +180,29 @@ export class WorkflowRegistrar
         // The inline handler is itself a durable workflow, registered as `<name>.dlq`, so it gets
         // checkpointing and a dashboard run linked to the dead run via the `dlq:<runId>` id.
         const dlqName = `${meta.name}.dlq`;
-        this.engine.register(dlqName, meta.version, inline);
+        // Declared on the very same class, so it carries the same origin.
+        this.engine.register(dlqName, meta.version, inline, { origin });
         deadLetterByWorkflow.set(meta.name, dlqName);
       } else if (meta.deadLetterWorkflow) {
         deadLetterByWorkflow.set(meta.name, workflowName(meta.deadLetterWorkflow));
       }
     });
 
+    this.reportUnattributed(unattributed);
     this.installDeadLetterRouting(deadLetterByWorkflow);
+  }
+
+  /**
+   * Says, once at boot, which workflows could not be attributed to a package — their runs are stamped
+   * with no `origin` at all, so an operator filtering the dashboard by origin will not see them. That
+   * is the deliberate trade (an absent origin over an invented one), but it has to be visible: a
+   * silently-dropped run is indistinguishable from a run that never happened.
+   */
+  private reportUnattributed(names: string[]): void {
+    if (names.length === 0) return;
+    console.warn(
+      `[nestjs-durable] could not derive an origin (declaring package) for ${names.length} workflow(s): ${names.join(', ')}. Their runs carry no origin and will not match an origin filter.`,
+    );
   }
 
   /** Returns the instance's `@DeadLetter()` method bound to the instance, or undefined if none. */
