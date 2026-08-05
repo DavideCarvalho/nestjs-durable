@@ -9,6 +9,7 @@ export * from './entities';
 export * from './errors';
 export * from './handshake/index';
 export * from './event-accumulators';
+export * from './execution-hooks';
 export * from './interfaces';
 export * from './protocol';
 export * from './queue';

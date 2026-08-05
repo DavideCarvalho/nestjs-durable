@@ -2,6 +2,7 @@ import {
   type WorkflowDecision,
   type WorkflowStepEvent,
   type WorkflowTask,
+  runDurableExecution,
   runInWorkflowCtx,
 } from '@dudousxd/nestjs-durable-core';
 import { Cancelled, StepFailed, Suspend, toError } from './errors';
@@ -63,6 +64,29 @@ export class WorkflowWorker {
       };
     }
 
+    // One turn = one unit of durable work, so the registered execution wrappers bracket the whole
+    // replay (body + the classification of what it threw), not just the body call: a Suspend or a
+    // StepFailed is part of this turn's story and belongs inside the same observability scope.
+    return runDurableExecution(
+      {
+        unit: 'workflow',
+        runId: task.runId,
+        workflow: task.workflow,
+        name: undefined,
+        seq: undefined,
+        attempt: undefined,
+      },
+      () => this.replayTurn(base, fn, task, opts),
+    );
+  }
+
+  /** The replay itself — see {@link processTask}, which wraps this in the execution hooks. */
+  private async replayTurn(
+    base: { taskId: string; runId: string },
+    fn: WorkflowFn,
+    task: WorkflowTask,
+    opts: ProcessTaskOptions,
+  ): Promise<WorkflowDecision> {
     const ctx = new WorkflowContext(task.runId, task.history, {
       // A no-explicit-partition `ctx.step` call inherits THIS worker's group as its
       // partition — continuity with the pre-redesign "one group, one worker" default.

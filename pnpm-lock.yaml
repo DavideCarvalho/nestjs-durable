@@ -78,9 +78,21 @@ importers:
         specifier: 3.25.76
         version: 3.25.76
     devDependencies:
+      '@dudousxd/nestjs-durable-telescope':
+        specifier: workspace:^
+        version: link:../../packages/telescope
+      '@dudousxd/nestjs-telescope':
+        specifier: 1.26.0
+        version: 1.26.0(@dudousxd/nestjs-context@0.1.0(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2))(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
       '@nestjs/testing':
         specifier: 11.1.26
         version: 11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.26(@nestjs/common@11.1.26(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))
+      '@opentelemetry/api':
+        specifier: 1.9.0
+        version: 1.9.0
+      '@opentelemetry/sdk-trace-base':
+        specifier: 1.30.1
+        version: 1.30.1(@opentelemetry/api@1.9.0)
       typescript:
         specifier: 5.9.3
         version: 5.9.3

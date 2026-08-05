@@ -17,6 +17,7 @@ export default defineConfig({
         new URL('./packages/dashboard/src/server/index.ts', import.meta.url),
       ),
       '@dudousxd/nestjs-durable': pkg('nestjs'),
+      '@dudousxd/nestjs-durable-telescope': pkg('telescope'),
       '@dudousxd/durable-worker': pkg('worker'),
     },
   },

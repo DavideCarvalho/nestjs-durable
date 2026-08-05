@@ -1,5 +1,9 @@
 import type { RemoteTask, StepEvent, StepResult } from '@dudousxd/nestjs-durable-core';
-import { createStepLogger, runInStepLogger } from '@dudousxd/nestjs-durable-core';
+import {
+  createStepLogger,
+  runDurableExecution,
+  runInStepLogger,
+} from '@dudousxd/nestjs-durable-core';
 import { toError } from './errors';
 import type { StepLog } from './workflow-context';
 
@@ -58,7 +62,20 @@ export class StepWorker {
     try {
       // Bind the SAME sink ambiently too, so a helper deep inside the handler can emit via
       // `currentStep()` without the handle being threaded down (see core's `ambient-step.ts`).
-      const output = await runInStepLogger(log, () => handler(task.input, log));
+      // The execution wrappers sit outside that, so a Telescope batch / OTel span opened for this
+      // step is ambient while the handler runs. A thin worker has no `WorkflowEngine` at all, which
+      // is why the registry they come from is process-level rather than hung off the engine.
+      const output = await runDurableExecution(
+        {
+          unit: 'step',
+          runId: task.runId,
+          workflow: undefined, // not carried on the step wire format
+          name: task.name,
+          seq: task.seq,
+          attempt: task.attempt,
+        },
+        async () => runInStepLogger(log, () => handler(task.input, log)),
+      );
       const result: StepResult = { ...base, status: 'completed', output };
       if (events.length > 0) result.events = events;
       return result;
