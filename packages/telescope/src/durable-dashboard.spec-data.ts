@@ -104,7 +104,10 @@ export function durableDashboard(
             // One row per LIVE worker (flattened from each group's heartbeats), exposing the live
             // WorkerStatus the heartbeat carries: fixed vs. adaptive limit, in-flight saturation,
             // RAM%/CPU%, throughput, p95, and why the adaptive controller last moved. A worker from
-            // an older SDK with no status still lists, with '—' in the measured columns. The
+            // an older SDK with no status still lists, reading 'n/a' — distinct from the '—' of a
+            // worker that reports fine but has nothing to measure yet, which is what an idle
+            // deployment looks like (throughput and p95 come off a rolling window of completions,
+            // so they are empty until a step finishes inside it). The
             // adaptive min–max range rides the In-flight column's row value (`minMax` key) for those
             // that want it; the visible columns stay readable.
             title: 'Workers',
