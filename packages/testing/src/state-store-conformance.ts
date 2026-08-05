@@ -367,7 +367,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.tryLockRun('r1', 'B', 6_000, 4_000)).toBe(false);
     });
 
-    // ---- list filters: status / statuses / tag ----------------------------------------------
+    // ---- list filters: status / statuses / tag / origin --------------------------------------
 
     t('filters listRuns by workflow and by status', async () => {
       await store.createRun(run({ id: 'a', workflow: 'checkout', status: 'running' }));
@@ -417,6 +417,35 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect((await store.listRuns({ tag: 'etl-foo' })).map((r) => r.id)).toEqual(['b']);
       expect(await store.listRuns({ tag: 'nope' })).toHaveLength(0);
     });
+
+    t(
+      'round-trips a run origin and filters listRuns by it, never matching an absent one',
+      async () => {
+        // `origin` (which library registered the workflow) is derived at registration, never declared,
+        // so ABSENCE is a first-class value: `undefined` means UNKNOWN — a row written before the
+        // column existed, a `registerRemote`, convention routing, an unresolvable package. It must
+        // survive the round trip as `undefined` rather than as any plausible-looking stand-in, which a
+        // real registration would then be indistinguishable from.
+        await store.createRun(run({ id: 'a', origin: '@dudousxd/nestjs-catalog-pipeline' }));
+        await store.createRun(run({ id: 'b', origin: '@dudousxd/nestjs-agent' }));
+        await store.createRun(run({ id: 'c' })); // unattributed — unknown origin
+
+        expect((await store.getRun('a'))?.origin).toBe('@dudousxd/nestjs-catalog-pipeline');
+        expect((await store.getRun('c'))?.origin).toBeUndefined();
+
+        // `RunQuery.origin` is plain equality, so the unattributed run matches NO origin value — it is
+        // excluded here exactly as `b` is, and is never folded into a bucket to make a facet look
+        // complete. A store that widened this to `= x OR IS NULL` would return `c` and fail.
+        expect(
+          (await store.listRuns({ origin: '@dudousxd/nestjs-catalog-pipeline' })).map((r) => r.id),
+        ).toEqual(['a']);
+        // Nor does it answer to a name invented for it.
+        expect(await store.listRuns({ origin: 'unknown' })).toEqual([]);
+        // Which is why "all origins" has to stay the default view: with the filter off — and only
+        // then — the unattributed run is reachable.
+        expect((await store.listRuns({})).map((r) => r.id).sort()).toEqual(['a', 'b', 'c']);
+      },
+    );
 
     t('orders listRuns newest-first and paginates with limit/offset', async () => {
       await store.createRun(run({ id: 'old', createdAt: new Date('2026-06-11T00:00:00.000Z') }));

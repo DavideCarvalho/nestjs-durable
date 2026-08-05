@@ -61,6 +61,10 @@ tables) so the generated SQL includes `durable_workflow_runs`, `durable_step_che
 `durable_run_attributes`, `durable_signal_waiters` and `durable_buffered_signals`.
 
 <Callout type="warn">
+  **An upgrade that adds a durable column is a migration you have to run — and skipping it breaks *every* run query, not just the new field.** Drizzle SELECTs every column the schema declares, so the moment the package declares a new one an un-migrated database answers `getRun`/`listRuns` with `no such column`. The MikroORM and TypeORM adapters heal this on boot and Prisma emits it through Migrate; this one has no auto-schema, so re-run `drizzle-kit generate` + `drizzle-kit migrate` after every upgrade — or apply the statement yourself. The current one is `origin` (which library declared the run's workflow): `ALTER TABLE durable_workflow_runs ADD COLUMN origin TEXT;`. It is nullable with **no default** on purpose — an existing row's origin cannot be reconstructed after the fact, so it stays NULL and reads back as `undefined`, meaning *unknown*, rather than as a plausible-looking package name. `priority` set the same trap before it.
+</Callout>
+
+<Callout type="warn">
   **Tag filtering is a substring match, not a JSON containment check.** `tags` is stored as JSON
   text, so `listRuns({ tag })` compiles to `LIKE '%"tag"%'` against that column (quoted, so filtering
   by `etl` doesn't also match a tag like `etl-foo`). This is a different mechanism from the MikroORM/
