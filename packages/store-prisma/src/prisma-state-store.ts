@@ -34,6 +34,8 @@ interface RunRow {
   tags: unknown;
   searchAttributes: unknown;
   priority: number | null;
+  /** NOT NULL in the schema (defaulted to `'default'`), so every row carries a real namespace. */
+  namespace: string;
   origin: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -117,9 +119,32 @@ export interface DurablePrismaClient extends DurablePrismaTx {
 }
 
 /**
+ * The `namespace` read boundary as a spreadable Prisma `where` fragment.
+ *
+ * `undefined` means NO RESTRICTION — `{}` — because that is the operator (control-plane) view that
+ * sees every tenant, and it is what the engine passes when it runs unscoped. It does NOT mean
+ * "namespace IS NULL": the column is NOT NULL, so `{ namespace: undefined }` would be Prisma's
+ * "ignore this predicate" anyway, but `{ namespace: null }` would match nothing in production while
+ * still looking correct in a single-tenant test where every worker polls unscoped.
+ *
+ * A named namespace is plain equality, so a worker sees only its own tenant's rows — the boundary
+ * {@link WorkflowRun.namespace} promises for the four worker paths (pick up, recover, resume timers,
+ * time out).
+ */
+function namespaceWhere(namespace?: string): { namespace?: string } {
+  if (namespace === undefined) return {};
+  return { namespace };
+}
+
+/**
  * Prisma-backed `StateStore`. Pass your `PrismaClient` after adding the models from
  * `prisma/schema.prisma` to your schema. JSON columns carry the run/step payloads directly;
  * `wakeAt` is a `BigInt` (epoch ms).
+ *
+ * Every path a worker acts on is namespace-scoped when it is given one — `listPendingRuns` (pick up),
+ * `listIncompleteRuns` (recover), `listDueTimers` (resume timers) and `listRuns`'s `namespace`
+ * (the engine's timeout sweep). Omit it for the operator view across all tenants. Point-reads
+ * (`getRun`, checkpoints) are deliberately NOT scoped, per {@link StateStore}.
  */
 export class PrismaStateStore implements StateStore {
   constructor(private readonly db: DurablePrismaClient) {}
@@ -196,25 +221,29 @@ export class PrismaStateStore implements StateStore {
     );
   }
 
-  async listIncompleteRuns(): Promise<WorkflowRun[]> {
+  async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.db.durableWorkflowRun.findMany({
-      where: { status: { in: ['running', 'cancelling'] } },
+      where: { status: { in: ['running', 'cancelling'] }, ...namespaceWhere(namespace) },
     });
     return rows.map(fromRunRow);
   }
 
-  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+  async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.db.durableWorkflowRun.findMany({
-      where: { status: 'pending' },
+      where: { status: 'pending', ...namespaceWhere(namespace) },
       orderBy: { createdAt: 'asc' }, // FIFO dispatch
       take: limit,
     });
     return rows.map(fromRunRow);
   }
 
-  async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
+  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.db.durableWorkflowRun.findMany({
-      where: { status: 'suspended', wakeAt: { not: null, lte: BigInt(nowMs) } },
+      where: {
+        status: 'suspended',
+        wakeAt: { not: null, lte: BigInt(nowMs) },
+        ...namespaceWhere(namespace),
+      },
     });
     return rows.map(fromRunRow);
   }
@@ -258,7 +287,12 @@ export class PrismaStateStore implements StateStore {
   }
 
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    const where: Record<string, unknown> = {};
+    // The tenant boundary, and NOT only a dashboard facet: the engine's `sweepTimeouts` finds the runs
+    // it may cancel through `listRuns({ workflow, status, namespace })`, so an unfiltered `namespace`
+    // here lets a worker serving one tenant time out another tenant's runs — a write, not a stale
+    // read. Same `undefined` = no restriction rule as the poll paths above (see `namespaceWhere`),
+    // which is what keeps the operator's dashboard showing every tenant by default.
+    const where: Record<string, unknown> = { ...namespaceWhere(query.namespace) };
     if (query.workflow) where.workflow = query.workflow;
     // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
     // before the column existed, or registered through a path the derivation could not classify)
@@ -461,6 +495,10 @@ function toRunData(run: WorkflowRun) {
     tags: jsonOrNull(run.tags),
     searchAttributes: jsonOrNull(run.searchAttributes),
     priority: run.priority ?? null,
+    // An absent namespace IS `'default'` — unlike `origin` below, this is a reconstruction and not a
+    // guess: an engine started without a namespace stamps its runs and routes its workers as
+    // `'default'`, so writing anything else (or NULL) would put the run in a partition no worker polls.
+    namespace: run.namespace ?? 'default',
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
     createdAt: run.createdAt,
@@ -491,6 +529,11 @@ function toRunPatch(patch: Partial<WorkflowRun>) {
   if ('tags' in patch) data.tags = jsonOrNull(patch.tags);
   if ('searchAttributes' in patch) data.searchAttributes = jsonOrNull(patch.searchAttributes);
   if ('priority' in patch) data.priority = patch.priority ?? null;
+  // `?? 'default'` rather than `?? null` like its neighbours: the column is NOT NULL, and clearing a
+  // run's namespace means "back to the unscoped partition", which is what `'default'` names. A patch
+  // that does not mention `namespace` leaves the stored one alone — a status update must never move a
+  // run between tenants.
+  if ('namespace' in patch) data.namespace = patch.namespace ?? 'default';
   if ('origin' in patch) data.origin = patch.origin ?? null;
   if (patch.createdAt != null) data.createdAt = patch.createdAt;
   if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;
@@ -515,6 +558,12 @@ function fromRunRow(row: RunRow): WorkflowRun {
     searchAttributes:
       (row.searchAttributes as Record<string, string | number | boolean> | null) ?? undefined,
     priority: row.priority ?? undefined,
+    // Read back verbatim, with NO `?? 'default'` fallback. The column is NOT NULL and the migration
+    // back-fills old rows, so there is nothing legitimate to fall back FROM; a fallback would only fire
+    // on a deployment that added the column nullable without back-filling, and there it would lie —
+    // the dashboard would show `default` for a row whose stored NULL keeps every `default` worker's
+    // `WHERE namespace = 'default'` from ever picking it up.
+    namespace: row.namespace,
     // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
     origin: row.origin ?? undefined,
     createdAt: row.createdAt,

@@ -27,6 +27,26 @@ model DurableWorkflowRun {
   tags            Json?
   searchAttributes Json?   @map("search_attributes")
   priority         Int?    @map("priority")
+  // The worker-pool partition that owns this run — the tenant boundary. A worker only picks up /
+  // recovers / resumes-timers-for / times-out runs in its own namespace, so this column sits on the
+  // predicate of every poll tick.
+  //
+  // NOT NULL WITH A DEFAULT, deliberately unlike `origin` below. A row written before this column
+  // existed was executed by an engine with no namespace, and such an engine stamps and routes as
+  // `'default'` — so `'default'` is that row's TRUE namespace, reconstructed rather than invented.
+  // Leaving old rows NULL is the option that breaks: a `'default'` worker polls
+  // `WHERE namespace = 'default'`, a NULL row never matches it, and the run is never picked up,
+  // recovered or timed out again. So the migration must back-fill (see below), and this adapter
+  // never coerces NULL to `'default'` on the way out — that would show a healthy namespace in the
+  // dashboard for a row no worker can see.
+  //
+  // Existing deployment (Prisma Migrate generates exactly this from the field):
+  //   ALTER TABLE durable_workflow_runs ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';
+  //   CREATE INDEX durable_workflow_runs_namespace_status_idx
+  //     ON durable_workflow_runs (namespace, status, created_at);
+  // The ADD COLUMN back-fills every existing row with `'default'` in one statement on
+  // Postgres/MySQL/SQLite alike. Use `VARCHAR(255)` for MySQL.
+  namespace       String   @default("default") @map("namespace")
   // Which library/module registered the workflow this run belongs to (e.g.
   // `@dudousxd/nestjs-catalog-pipeline`), derived at registration time — never caller input.
   // Nullable with NO default: an origin cannot be reconstructed for a row written before this
@@ -39,6 +59,7 @@ model DurableWorkflowRun {
   attributes      DurableRunAttribute[]
 
   @@index([status, wakeAt])
+  @@index([namespace, status, createdAt], map: "durable_workflow_runs_namespace_status_idx")
   @@map("durable_workflow_runs")
 }
 
