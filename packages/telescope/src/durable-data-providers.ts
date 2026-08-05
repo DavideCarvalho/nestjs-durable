@@ -238,20 +238,45 @@ function relAgo(atMs: number): string {
   return `${Math.round(h / 24)}d ago`;
 }
 
-/** Render a worker's last limit change as "shrink 8→5 2m ago", or '—' when it never moved. */
-function fmtLastAdjust(a: WorkerStatus['lastAdjust']): string {
-  if (!a) return '—';
+/**
+ * What a cell says when it has no number, and the two cases it has to keep apart.
+ *
+ * A blank cell used to mean both "this worker's SDK is too old to report anything" and "this worker
+ * reports fine, it just has nothing to measure yet" — and the second is the common one on an idle
+ * deployment, where the adaptive controller's rolling window is empty because no step has completed
+ * inside it. Reading one as the other sends someone hunting for a broken worker that is merely idle,
+ * or ignoring a fleet that has genuinely stopped reporting.
+ *
+ * `n/a` is the heartbeat carrying no {@link WorkerStatus} at all; `—` is a status that carries no
+ * value for this field yet.
+ */
+const NOT_REPORTED = 'n/a';
+const NOT_YET_MEASURED = '—';
+
+/**
+ * Render a worker's last limit change as "shrink 8→5 2m ago".
+ *
+ * `—` here means the adaptive controller has not moved the limit yet — the normal state of a worker
+ * that has been sitting at its floor. A fixed-mode worker never adjusts at all, which is what its
+ * `Mode` column already says.
+ */
+function fmtLastAdjust(status: WorkerStatus | undefined): string {
+  if (!status) return NOT_REPORTED;
+  const a = status.lastAdjust;
+  if (!a) return NOT_YET_MEASURED;
   return `${a.reason} ${a.from}→${a.to} ${relAgo(a.at)}`;
 }
 
-/** Round a 0..100(+) percent to a whole number for table display, or '—' when unmeasured. */
-function fmtPct(n: number | undefined): number | string {
-  return typeof n === 'number' ? Math.round(n) : '—';
+/** Round a 0..100(+) percent to a whole number for table display. */
+function fmtPct(n: number | undefined, status: WorkerStatus | undefined): number | string {
+  if (typeof n === 'number') return Math.round(n);
+  return status ? NOT_YET_MEASURED : NOT_REPORTED;
 }
 
-/** Round a rate/latency to a whole number for table display, or '—' when unmeasured. */
-function fmtNum(n: number | undefined): number | string {
-  return typeof n === 'number' ? Math.round(n) : '—';
+/** Round a rate/latency to a whole number for table display. */
+function fmtNum(n: number | undefined, status: WorkerStatus | undefined): number | string {
+  if (typeof n === 'number') return Math.round(n);
+  return status ? NOT_YET_MEASURED : NOT_REPORTED;
 }
 
 /**
@@ -278,15 +303,17 @@ export function durableWorkerStatusProvider(): DataProvider {
             .map((worker) => {
               const status = worker.status;
               const concurrency = status?.concurrency;
-              const mode = concurrency?.mode ?? '—';
-              const limit = concurrency?.limit ?? '—';
-              const inFlight = status?.inFlight ?? '—';
+              // Mode/limit/in-flight are not measurements — a status either declares them or the
+              // heartbeat carried no status at all, so their absence is always `n/a`.
+              const mode = concurrency?.mode ?? NOT_REPORTED;
+              const limit = concurrency?.limit ?? NOT_REPORTED;
+              const inFlight = status?.inFlight ?? NOT_REPORTED;
               const minMax =
                 concurrency?.mode === 'adaptive'
                   ? `${concurrency.min ?? 1}–${concurrency.max ?? 32}`
-                  : '—';
+                  : NOT_REPORTED;
               const saturation =
-                concurrency && status ? `${status.inFlight}/${concurrency.limit}` : '—';
+                concurrency && status ? `${status.inFlight}/${concurrency.limit}` : NOT_REPORTED;
               return {
                 group: group.group,
                 instanceId: worker.instanceId,
@@ -296,11 +323,11 @@ export function durableWorkerStatusProvider(): DataProvider {
                 inFlight,
                 saturation,
                 queued: group.depth,
-                rssPct: fmtPct(status?.rssPct),
-                cpuPct: fmtPct(status?.cpuPct),
-                throughputPerMin: fmtNum(status?.throughputPerMin),
-                p95Ms: fmtNum(status?.p95Ms),
-                lastAdjust: fmtLastAdjust(status?.lastAdjust),
+                rssPct: fmtPct(status?.rssPct, status),
+                cpuPct: fmtPct(status?.cpuPct, status),
+                throughputPerMin: fmtNum(status?.throughputPerMin, status),
+                p95Ms: fmtNum(status?.p95Ms, status),
+                lastAdjust: fmtLastAdjust(status),
               };
             }),
         );

@@ -390,7 +390,7 @@ describe('durableWorkerStatusProvider', () => {
               lastAdjust: { at: now - 120_000, from: 8, to: 5, reason: 'shrink' },
             },
           },
-          // Same group, older SDK worker with no status → graceful '—' fields.
+          // Same group, older SDK worker with no status at all → every field reads 'n/a'.
           { group: 'pipeline', instanceId: 'host-a:1', lastBeatAt: now },
         ],
       },
@@ -404,13 +404,13 @@ describe('durableWorkerStatusProvider', () => {
     expect(out.rows[0]).toMatchObject({
       group: 'pipeline',
       instanceId: 'host-a:1',
-      mode: '—',
-      limit: '—',
-      inFlight: '—',
-      saturation: '—',
+      mode: 'n/a',
+      limit: 'n/a',
+      inFlight: 'n/a',
+      saturation: 'n/a',
       queued: 7,
-      rssPct: '—',
-      lastAdjust: '—',
+      rssPct: 'n/a',
+      lastAdjust: 'n/a',
     });
     expect(out.rows[1]).toMatchObject({
       group: 'pipeline',
@@ -426,6 +426,65 @@ describe('durableWorkerStatusProvider', () => {
       p95Ms: 880,
     });
     expect(out.rows[1].lastAdjust).toMatch(/^shrink 8→5 .*ago$/);
+  });
+
+  // The two blanks are different incidents. A worker that reports no status has stopped talking, or
+  // is too old to; a worker that reports a status with no throughput/p95 is talking fine and simply
+  // has not completed a step inside the controller's rolling window — the normal state of an idle
+  // deployment, and not something to go debugging. Rendering both as '—' sent a reader looking for
+  // a broken fleet when every worker was healthy and merely idle.
+  it('separates a worker that reports nothing from one with nothing to measure yet', async () => {
+    const now = Date.now();
+    const health = [
+      {
+        group: 'ingest',
+        depth: 0,
+        liveWorkers: [
+          {
+            group: 'ingest',
+            instanceId: 'idle:1',
+            lastBeatAt: now,
+            // Reporting, and measuring what it can — the rolling window is just empty, so the
+            // Python controller's snapshot() omits throughput/p95 and has never adjusted.
+            status: {
+              runtime: 'python',
+              concurrency: { mode: 'adaptive', limit: 1, min: 1, max: 4 },
+              inFlight: 0,
+              rssPct: 3,
+              cpuPct: 0,
+            },
+          },
+          { group: 'ingest', instanceId: 'silent:1', lastBeatAt: now },
+        ],
+      },
+    ];
+    const out = (await durableWorkerStatusProvider().resolve(undefined, ctxWithHealth(health))) as {
+      rows: Array<Record<string, unknown>>;
+    };
+
+    const idle = out.rows.find((r) => r.instanceId === 'idle:1');
+    const silent = out.rows.find((r) => r.instanceId === 'silent:1');
+
+    // Idle: what it measures is a number (0 included), what it cannot measure yet is '—'.
+    expect(idle).toMatchObject({
+      mode: 'adaptive',
+      saturation: '0/1',
+      rssPct: 3,
+      cpuPct: 0,
+      throughputPerMin: '—',
+      p95Ms: '—',
+      lastAdjust: '—',
+    });
+    // Silent: no status at all, so nothing is a measurement — every cell says so.
+    expect(silent).toMatchObject({
+      mode: 'n/a',
+      saturation: 'n/a',
+      rssPct: 'n/a',
+      cpuPct: 'n/a',
+      throughputPerMin: 'n/a',
+      p95Ms: 'n/a',
+      lastAdjust: 'n/a',
+    });
   });
 
   it('sorts groups with a backlog ahead of idle groups', async () => {
