@@ -26,19 +26,71 @@ lifecycle event (`run.started`, `step.completed`, `run.completed`, `run.failed`,
 `workflow:<name>`, `run:<id>`, `kind:<step-kind>`, and `failed` on failures — so you can filter
 and group durable activity in the Telescope UI.
 
-It also **trace-groups** a run: it opens a root span per run and records every entry for that run
-inside the span's OTel context (each step gets its own child span), so a whole workflow's entries
-share one `traceId` and read as a single trace on Telescope's Traces page. When the host has no
-OTel SDK the spans are no-ops and entries simply carry no trace, same as before. See
-[OpenTelemetry](/docs/observability/otel) for the one boundary this shares with the OTel bridge —
-a run that suspends and resumes splits across more than one `traceId`.
+It also **trace-groups** a run: every entry for a run carries the same `traceId`, derived from the
+run id, so a whole workflow reads as a single trace on Telescope's Traces page. Because the id is a
+pure function of the run rather than a span held in memory, this survives everything a durable
+workflow does — a run that suspends for a week and resumes on another pod is still one trace, and a
+worker in a different process derives the same id from the same run id.
 
-<Callout title="No-ops on a store-less tenant worker">
+## Correlating what a workflow *did*
+
+Recording lifecycle events tells you a step failed. It does not tell you what the step was doing
+when it failed — the queries it issued, the outbound calls it made, the exception it threw all get
+recorded by Telescope's other watchers, and without a batch open around the execution they land
+outside every trace.
+
+So the watcher also opens a **Telescope batch around the execution itself** — one for each workflow
+turn, one for each step handler body — through the durable engine's `useDurableExecution` seam. The
+scope is open *while the body runs*, which is the only arrangement that catches an exception thrown
+from inside a step.
+
+Two consequences worth knowing:
+
+- **Batch granularity follows the execution shape.** With an in-process transport (event emitter,
+  in-memory) a step handler runs inside the turn that dispatched it and its result resumes the next
+  turn on that same async path, so the whole run is one batch — it is genuinely one causal chain.
+  With a queue-backed transport (BullMQ, SQS, a thin worker) each turn and each step is a separate
+  entry point in a separate process, so each gets its own batch. The `traceId` is the invariant that
+  holds either way.
+- **Batches are recorded with `origin: 'queue'`.** Telescope's `BatchOrigin` union has no
+  durable/workflow member; `'queue'` is the closest, and accurate — durable work reaches an executor
+  by being dispatched over a transport.
+
+If your app runs **no OpenTelemetry SDK** — most don't — pass `durableTraceContext()` so entries
+recorded by the *other* watchers during a turn or step pick up the run's trace id too.
+`@opentelemetry/api` on its own propagates nothing, so without it you get correlated batches and
+null trace ids:
+
+```ts
+import { TelescopeModule } from '@dudousxd/nestjs-telescope';
+import { durableTelescopeExtension, durableTraceContext } from '@dudousxd/nestjs-durable-telescope';
+
+TelescopeModule.forRoot({
+  extensions: [durableTelescopeExtension()],
+  traceContext: durableTraceContext(),
+});
+```
+
+An app that *does* run a full OTel SDK should keep passing `OtelTraceContextProvider` (optionally as
+`durableTraceContext(new OtelTraceContextProvider())`, which consults it first): the scope's spans
+already hang off the run's trace, so both agree.
+
+<Callout title="What is not covered">
+A **remote step** — one whose handler lives in another runtime, e.g. the Python worker — executes out
+of process, so nothing here can wrap it. Its lifecycle entries still carry the run's trace id, but
+the queries and exceptions *inside* that handler are for that runtime to record. A **remote
+workflow** (a run whose body lives in another runtime) is likewise unwrapped: the engine dispatches
+a workflow task and awaits a decision rather than executing a body.
+</Callout>
+
+<Callout title="Store-less tenant workers">
 A thin, DB-less tenant deployment (see [tenancy](/docs/concepts/tenancy)) binds `WorkflowEngine` to
 a start-only client facade that proxies run starts over the transport and has no local lifecycle
 event stream — the events live on the operator holding the store. The watcher detects this (no
-`.subscribe` method on the resolved engine) and skips registration instead of throwing, so it's
-safe to wire into every tenant's `TelescopeModule` regardless of topology.
+`.subscribe` method on the resolved engine) and skips the *subscription* instead of throwing, so
+it's safe to wire into every tenant's `TelescopeModule` regardless of topology. The execution batch
+is still installed there — a thin worker has no events to report but is exactly where step handlers
+run.
 </Callout>
 
 ## Workflows dashboard

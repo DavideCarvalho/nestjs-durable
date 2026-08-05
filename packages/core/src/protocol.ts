@@ -1,4 +1,5 @@
 import { runInStepLogger } from './ambient-step';
+import { runDurableExecution } from './execution-hooks';
 import type { RemoteTask, StepEvent, StepLogger, StepResult } from './interfaces';
 import { createStepLogger } from './step-logger';
 
@@ -42,7 +43,22 @@ export async function runStepHandler(
     // The SAME logger goes to the handler's second argument and into the ambient storage, so a
     // helper buried under the handler emits into this step's `events` without being handed one.
     const logger = createStepLogger(events, Date.now);
-    const output = await runInStepLogger(logger, () => handler(task.input, logger));
+    // The registered execution wrappers go OUTSIDE the handler and INSIDE this try/catch, so an
+    // observability scope opened here (a Telescope batch, an OTel span) is ambient while the handler
+    // body runs — a query it issues or an exception it throws is recorded inside the scope, which is
+    // the whole point. Wrapping the `runStepHandler` call from a transport instead would put the
+    // scope around the result-building too, and wrapping after the fact would put it around nothing.
+    const output = await runDurableExecution(
+      {
+        unit: 'step',
+        runId: task.runId,
+        workflow: undefined, // a dispatched step task does not carry its workflow name on the wire
+        name: task.name,
+        seq: task.seq,
+        attempt: task.attempt,
+      },
+      async () => runInStepLogger(logger, () => handler(task.input, logger)),
+    );
     return withEvents({ ...base, status: 'completed', output });
   } catch (err) {
     // Carry `code`/`retryable` off the thrown error if present, so the engine's durable retry can

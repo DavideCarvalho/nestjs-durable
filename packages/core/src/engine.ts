@@ -23,6 +23,7 @@ import {
   eventPrefix,
   isEventToken,
 } from './events';
+import { runDurableExecution } from './execution-hooks';
 import {
   type BlockedDispatch,
   type DispatchPlan,
@@ -3112,8 +3113,39 @@ export class WorkflowEngine {
     return { runId: run.id, status: 'cancelled', error };
   }
 
-  /** The run body, lease held + renewed by {@link execute}. */
-  private async runExecution(
+  /**
+   * The run body, lease held + renewed by {@link execute}, wrapped in the registered
+   * {@link runDurableExecution} wrappers so an observability scope covers ONE WHOLE TURN.
+   *
+   * The wrap goes here — around the entire turn — rather than tightly around the `fn(ctx, input)`
+   * call, because the store writes that bracket the body (the `pending` → `running` transition, the
+   * step checkpoints, the terminal `settleRun` update) are exactly the queries an operator wants
+   * correlated to the turn that issued them. Narrowing the wrap to the body would leave them
+   * uncorrelated for the sake of a purity that buys nothing.
+   *
+   * Only the TS path is wrapped. {@link runRemoteExecution} does not execute a body at all — it
+   * dispatches a workflow task and awaits the worker's decision — so a scope opened there would
+   * describe a dispatch, not an execution, and would mislead anyone reading the trace.
+   */
+  private runExecution(
+    run: WorkflowRun,
+    fn: WorkflowFn,
+    registered: RegisteredWorkflow | undefined,
+  ): Promise<RunResult> {
+    return runDurableExecution(
+      {
+        unit: 'workflow',
+        runId: run.id,
+        workflow: run.workflow,
+        name: undefined,
+        seq: undefined,
+        attempt: undefined,
+      },
+      () => this.runExecutionTurn(run, fn, registered),
+    );
+  }
+
+  private async runExecutionTurn(
     run: WorkflowRun,
     fn: WorkflowFn,
     registered: RegisteredWorkflow | undefined,

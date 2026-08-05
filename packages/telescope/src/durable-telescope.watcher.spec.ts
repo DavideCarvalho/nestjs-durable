@@ -1,5 +1,11 @@
-import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  WorkflowEngine,
+  clearDurableExecutionWrappers,
+  hasDurableExecutionWrappers,
+} from '@dudousxd/nestjs-durable-core';
 import type { RecordInput, WatcherContext } from '@dudousxd/nestjs-telescope';
+import { runTraceId } from './durable-run-trace';
 import { DurableTelescopeWatcher } from './durable-telescope.watcher';
 
 function fakeCtx(engine: WorkflowEngine, records: RecordInput[]): WatcherContext {
@@ -13,6 +19,8 @@ function fakeCtx(engine: WorkflowEngine, records: RecordInput[]): WatcherContext
 }
 
 describe('DurableTelescopeWatcher', () => {
+  afterEach(() => clearDurableExecutionWrappers());
+
   it('records a Telescope entry per engine lifecycle event', async () => {
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
     const records: RecordInput[] = [];
@@ -33,7 +41,20 @@ describe('DurableTelescopeWatcher', () => {
     expect(records[0]?.tags).toContain('run:run1');
   });
 
-  it('skips registration (no throw) when the engine has no subscribe — thin-worker/tenant facade', () => {
+  it('stamps every entry with the run trace, so a whole run is one trace', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const records: RecordInput[] = [];
+    new DurableTelescopeWatcher().register(fakeCtx(engine, records));
+
+    engine.register('checkout', '1', async () => 'ok');
+    await engine.start('checkout', {}, 'run1');
+    await engine.waitForRun('run1');
+
+    expect(records.length).toBeGreaterThan(0);
+    expect([...new Set(records.map((r) => r.traceId))]).toEqual([runTraceId('run1')]);
+  });
+
+  it('skips the subscription (no throw) when the engine has no subscribe — thin-worker facade', () => {
     const records: RecordInput[] = [];
     // A store-less thin-worker binds WorkflowEngine to a start-only DurableStartClient (no event
     // stream). moduleRef.get returns that; the watcher must not throw and must record nothing.
@@ -42,6 +63,19 @@ describe('DurableTelescopeWatcher', () => {
       new DurableTelescopeWatcher().register(fakeCtx(startOnlyFacade, records)),
     ).not.toThrow();
     expect(records).toEqual([]);
+    // …but the execution scope IS registered: a thin worker has no local event stream and yet is
+    // exactly where step handlers run, so skipping the whole registration would blind the one role
+    // that does the work.
+    expect(hasDurableExecutionWrappers()).toBe(true);
+  });
+
+  it('detaches its execution wrapper on unregister', () => {
+    const watcher = new DurableTelescopeWatcher();
+    const startOnlyFacade = { start: async () => ({}) } as unknown as WorkflowEngine;
+    watcher.register(fakeCtx(startOnlyFacade, []));
+    expect(hasDurableExecutionWrappers()).toBe(true);
+    watcher.unregister();
+    expect(hasDurableExecutionWrappers()).toBe(false);
   });
 
   it('tags failed runs with "failed"', async () => {

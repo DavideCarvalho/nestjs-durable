@@ -54,13 +54,12 @@ isn't one to attach the resumed steps to. In practice this means steps that exec
 resume show up as spans with no parent — detached from the run's original trace — rather than
 nested under one long-lived root.
 
-The [Telescope watcher](/docs/observability/telescope) trace-groups a run the same way (its own
-root span per run, ended on `run.suspended`) and hits the identical boundary — a run that suspends
-splits into more than one `traceId` on Telescope's Traces page too. What Telescope adds is a second,
-span-independent way to see the whole run: every entry it records also carries a `run:<runId>` tag,
-so filtering the Entries view by that tag reconstructs the full lifecycle — across any number of
-suspends — regardless of how the OTel trace was split. The [dashboard](/docs/observability/dashboard)'s
-run timeline is unaffected either way: it's built from the state store's checkpoints, not from spans.
+The [Telescope watcher](/docs/observability/telescope) does **not** hit this boundary: it derives a
+run's `traceId` from the run id rather than holding a root span, so a run that suspends and resumes
+stays one trace on Telescope's Traces page. Every entry it records also carries a `run:<runId>` tag,
+so filtering the Entries view by that tag reconstructs the full lifecycle either way. The
+[dashboard](/docs/observability/dashboard)'s run timeline is unaffected: it's built from the state
+store's checkpoints, not from spans.
 </Callout>
 
 ## Distributed tracing across workers
