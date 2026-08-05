@@ -36,6 +36,7 @@ CREATE TABLE durable_workflow_runs (
   input TEXT, output TEXT, error TEXT, wake_at INTEGER, locked_by TEXT, locked_until INTEGER,
   awaiting_decision_task_id TEXT,
   recovery_attempts INTEGER, tags TEXT, search_attributes TEXT, priority INTEGER,
+  namespace TEXT NOT NULL DEFAULT 'default',
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE TABLE durable_run_attributes (
