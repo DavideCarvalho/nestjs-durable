@@ -33,9 +33,12 @@ CREATE TABLE durable_workflow_runs (
   id TEXT PRIMARY KEY, workflow TEXT NOT NULL, workflow_version TEXT NOT NULL, status TEXT NOT NULL,
   input TEXT, output TEXT, error TEXT, wake_at INTEGER, locked_by TEXT, locked_until INTEGER,
   awaiting_decision_task_id TEXT,
-  recovery_attempts INTEGER, tags TEXT, search_attributes TEXT, priority INTEGER, origin TEXT,
+  recovery_attempts INTEGER, tags TEXT, search_attributes TEXT, priority INTEGER,
+  namespace TEXT NOT NULL DEFAULT 'default', origin TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
+CREATE INDEX durable_workflow_runs_namespace_status_idx
+  ON durable_workflow_runs (namespace, status, created_at);
 CREATE TABLE durable_step_checkpoints (
   run_id TEXT NOT NULL, seq INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, step_id TEXT NOT NULL,
   status TEXT NOT NULL, input TEXT, output TEXT, error TEXT, events TEXT, attempts INTEGER NOT NULL, worker_group TEXT, parallel_group TEXT, wake_at INTEGER,

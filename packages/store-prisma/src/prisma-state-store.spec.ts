@@ -335,3 +335,102 @@ describe('PrismaStateStore origin', () => {
     expect((await store.listRuns({})).map((r) => r.id).sort()).toEqual(['a', 'b', 'c']);
   });
 });
+
+/**
+ * `WorkflowRun.namespace` — the tenant boundary, not a dashboard facet. A worker only picks up,
+ * recovers, resumes-timers-for and times-out runs in its OWN namespace, so each of those four paths
+ * gets a case here proving the negative: the run belonging to the other tenant must be absent from
+ * the result, not merely ranked lower. The store took no `namespace` argument at all before this,
+ * which TypeScript accepts silently (an implementation may declare fewer parameters than its
+ * interface), so nothing but a behavioural assertion catches the regression.
+ *
+ * Lives in this file (rather than its own) so it reuses the single shared PrismaClient — a second
+ * client against the same SQLite file locks (P1008), as the setup above notes.
+ */
+describe('PrismaStateStore namespace', () => {
+  it('persists the namespace and defaults an unstamped run to "default"', async (ctx) => {
+    if (!available) ctx.skip();
+    await store.createRun(run({ id: 'a', namespace: 'alpha' }));
+    await store.createRun(run({ id: 'b' })); // unstamped — an engine started without a namespace
+
+    expect((await store.getRun('a'))?.namespace).toBe('alpha');
+    expect((await store.getRun('b'))?.namespace).toBe('default');
+  });
+
+  it('does not pick up (listPendingRuns) another namespace run', async (ctx) => {
+    if (!available) ctx.skip();
+    await store.createRun(run({ id: 'a', status: 'pending', namespace: 'alpha' }));
+    await store.createRun(run({ id: 'b', status: 'pending', namespace: 'beta' }));
+
+    expect((await store.listPendingRuns(10, 'alpha')).map((r) => r.id)).toEqual(['a']);
+    expect((await store.listPendingRuns(10, 'beta')).map((r) => r.id)).toEqual(['b']);
+    // `undefined` = no restriction: the operator/control-plane view over every tenant.
+    expect((await store.listPendingRuns(10)).map((r) => r.id).sort()).toEqual(['a', 'b']);
+  });
+
+  it('does not recover (listIncompleteRuns) another namespace run', async (ctx) => {
+    if (!available) ctx.skip();
+    await store.createRun(run({ id: 'a', status: 'running', namespace: 'alpha' }));
+    await store.createRun(run({ id: 'b', status: 'cancelling', namespace: 'beta' }));
+
+    expect((await store.listIncompleteRuns('alpha')).map((r) => r.id)).toEqual(['a']);
+    expect((await store.listIncompleteRuns('beta')).map((r) => r.id)).toEqual(['b']);
+    expect((await store.listIncompleteRuns()).map((r) => r.id).sort()).toEqual(['a', 'b']);
+  });
+
+  it('does not resume timers (listDueTimers) for another namespace run', async (ctx) => {
+    if (!available) ctx.skip();
+    await store.createRun(run({ id: 'a', status: 'suspended', wakeAt: 5_000, namespace: 'alpha' }));
+    await store.createRun(run({ id: 'b', status: 'suspended', wakeAt: 5_000, namespace: 'beta' }));
+
+    expect((await store.listDueTimers(10_000, 'alpha')).map((r) => r.id)).toEqual(['a']);
+    expect((await store.listDueTimers(10_000, 'beta')).map((r) => r.id)).toEqual(['b']);
+    expect((await store.listDueTimers(10_000)).map((r) => r.id).sort()).toEqual(['a', 'b']);
+  });
+
+  it('does not time out (listRuns) another namespace run', async (ctx) => {
+    if (!available) ctx.skip();
+    // The engine's `sweepTimeouts` selects its cancellation candidates with exactly this query, so an
+    // unscoped `namespace` here is a cross-tenant WRITE, not a leaky read.
+    await store.createRun(run({ id: 'a', status: 'running', namespace: 'alpha' }));
+    await store.createRun(run({ id: 'b', status: 'running', namespace: 'beta' }));
+
+    const candidates = await store.listRuns({
+      workflow: 'checkout',
+      status: 'running',
+      namespace: 'alpha',
+    });
+    expect(candidates.map((r) => r.id)).toEqual(['a']);
+    // Unfiltered stays the operator view — the dashboard lists every tenant by default.
+    expect((await store.listRuns({})).map((r) => r.id).sort()).toEqual(['a', 'b']);
+  });
+
+  it('treats a row that predates the column as "default", so a default worker still sees it', async (ctx) => {
+    if (!available) ctx.skip();
+    // Written by an INSERT that never names `namespace` — exactly what a row inserted before the
+    // migration looks like once `ALTER TABLE ... ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'`
+    // has run and back-filled it. The value is not a guess: an engine with no namespace stamps and
+    // polls as 'default', so that IS the partition this run executed in.
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO durable_workflow_runs (id, workflow, workflow_version, status, created_at, updated_at)
+       VALUES ('old', 'checkout', '1', 'running', ${at.getTime()}, ${at.getTime()})`,
+    );
+
+    expect((await store.getRun('old'))?.namespace).toBe('default');
+    // The clause that matters: the pre-migration row and a 'default' worker must not miss each other.
+    expect((await store.listIncompleteRuns('default')).map((r) => r.id)).toEqual(['old']);
+  });
+
+  it('keeps a run in its namespace across an unrelated patch', async (ctx) => {
+    if (!available) ctx.skip();
+    await store.createRun(run({ id: 'a', status: 'pending', namespace: 'alpha' }));
+
+    await store.updateRun('a', { status: 'running' });
+    expect((await store.getRun('a'))?.namespace).toBe('alpha');
+
+    // ...and a patch that DOES name it is mapped like every other run column.
+    await store.updateRun('a', { namespace: 'beta' });
+    expect((await store.getRun('a'))?.namespace).toBe('beta');
+    expect(await store.listIncompleteRuns('alpha')).toEqual([]);
+  });
+});

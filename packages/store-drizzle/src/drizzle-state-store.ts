@@ -28,6 +28,7 @@ import {
 } from 'drizzle-orm';
 import type { BaseSQLiteDatabase } from 'drizzle-orm/sqlite-core';
 import {
+  DEFAULT_NAMESPACE,
   bufferedEvents,
   bufferedSignals,
   runAttributes,
@@ -39,6 +40,29 @@ import {
 type RunRow = typeof workflowRuns.$inferSelect;
 type CheckpointRow = typeof stepCheckpoints.$inferSelect;
 type DrizzleSqlite = BaseSQLiteDatabase<'sync' | 'async', unknown>;
+
+/**
+ * The tenant-isolation predicate on the runs table, shared by every namespace-scoped path: the
+ * worker's pick-up (`listPendingRuns`), recovery (`listIncompleteRuns`), timer resume
+ * (`listDueTimers`) and timeout sweep (`listRuns({ namespace })`, issued by `engine.sweepTimeouts`).
+ *
+ * `undefined` means NO RESTRICTION — the operator / control-plane view spanning every tenant — and
+ * NOT "namespace IS NULL". Returning an `IS NULL` predicate there would pass a single-tenant test
+ * and hide every run in production.
+ *
+ * A request for `'default'` also matches rows where the column is NULL. Those exist only in a
+ * database that adopted this column with a bare `ADD COLUMN namespace TEXT` instead of the
+ * `NOT NULL DEFAULT 'default'` form `./schema` prescribes — rows written before the column existed,
+ * which ran in the default namespace, so the default worker is precisely who should see them.
+ * Without this they would be invisible to EVERY worker: pending forever, and silently. It cannot
+ * leak across tenants, because any other namespace is plain equality, which NULL never satisfies.
+ */
+function namespaceFilter(namespace?: string) {
+  if (namespace === undefined) return undefined;
+  if (namespace === DEFAULT_NAMESPACE)
+    return or(eq(workflowRuns.namespace, DEFAULT_NAMESPACE), isNull(workflowRuns.namespace));
+  return eq(workflowRuns.namespace, namespace);
+}
 
 /**
  * Drizzle (SQLite / libSQL) `StateStore`. Pass a drizzle db built with `./schema`. Timestamps are
@@ -130,25 +154,32 @@ export class DrizzleStateStore implements StateStore {
     );
   }
 
-  async listIncompleteRuns(): Promise<WorkflowRun[]> {
+  /** Recovery on boot. Namespace-scoped: a worker re-drives only its own tenant's crashed runs.
+   *  `and(...)` drops an `undefined` predicate, so an unscoped caller recovers every namespace. */
+  async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.db
       .select()
       .from(workflowRuns)
-      .where(inArray(workflowRuns.status, ['running', 'cancelling']));
+      .where(
+        and(inArray(workflowRuns.status, ['running', 'cancelling']), namespaceFilter(namespace)),
+      );
     return rows.map(fromRunRow);
   }
 
-  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+  /** Dispatch pick-up. Namespace-scoped — without it a worker serving one tenant drains another
+   *  tenant's queue, and the `limit` makes it worse: foreign runs consume the FIFO budget. */
+  async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.db
       .select()
       .from(workflowRuns)
-      .where(eq(workflowRuns.status, 'pending'))
+      .where(and(eq(workflowRuns.status, 'pending'), namespaceFilter(namespace)))
       .orderBy(asc(workflowRuns.createdAt)) // FIFO dispatch
       .limit(limit);
     return rows.map(fromRunRow);
   }
 
-  async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
+  /** Due durable timers. Namespace-scoped: a worker resumes only its own tenant's suspended runs. */
+  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.db
       .select()
       .from(workflowRuns)
@@ -157,6 +188,7 @@ export class DrizzleStateStore implements StateStore {
           eq(workflowRuns.status, 'suspended'),
           isNotNull(workflowRuns.wakeAt),
           lte(workflowRuns.wakeAt, nowMs),
+          namespaceFilter(namespace),
         ),
       );
     return rows.map(fromRunRow);
@@ -198,6 +230,11 @@ export class DrizzleStateStore implements StateStore {
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const filters = [
       query.workflow ? eq(workflowRuns.workflow, query.workflow) : undefined,
+      // The tenant boundary, ANDed with everything else. This is not only a dashboard facet: it is
+      // the fourth namespace-scoped worker path, because `engine.sweepTimeouts` cancels runs past
+      // their `executionTimeout` via `listRuns({ workflow, status, namespace })` — unscoped here, a
+      // worker would cancel another tenant's in-flight runs. Undefined = all namespaces.
+      namespaceFilter(query.namespace),
       // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
       // before the column existed, or registered through a path the derivation could not classify)
       // matches NO origin value — it is never folded into a bucket to make the facet look complete.
@@ -417,6 +454,10 @@ function toRunRow(run: WorkflowRun): RunRow {
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
     priority: run.priority ?? null,
+    // A run whose creating engine named no namespace ran in the default one, so it is written as
+    // 'default' rather than left blank — the same normalization the MikroORM column default and the
+    // in-memory reference store apply, so a run created here is found by a default-scoped worker.
+    namespace: run.namespace ?? DEFAULT_NAMESPACE,
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
     createdAt: run.createdAt.getTime(),
@@ -446,6 +487,10 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if ('tags' in patch) row.tags = patch.tags ?? null;
   if ('searchAttributes' in patch) row.searchAttributes = patch.searchAttributes ?? null;
   if ('priority' in patch) row.priority = patch.priority ?? null;
+  // Presence-based like the rest, but it can never be CLEARED to NULL: a patch that names namespace
+  // as undefined means the default namespace, not "no tenant" (matching `toRunRow`). A patch that
+  // does not mention it leaves the run in the tenant it was created in.
+  if ('namespace' in patch) row.namespace = patch.namespace ?? DEFAULT_NAMESPACE;
   if ('origin' in patch) row.origin = patch.origin ?? null;
   if (patch.createdAt != null) row.createdAt = patch.createdAt.getTime();
   if (patch.updatedAt != null) row.updatedAt = patch.updatedAt.getTime();
@@ -469,6 +514,11 @@ function fromRunRow(row: RunRow): WorkflowRun {
     tags: row.tags ?? undefined,
     searchAttributes: row.searchAttributes ?? undefined,
     priority: row.priority ?? undefined,
+    // The column is declared NOT NULL, but a database that adopted it with a bare `ADD COLUMN
+    // namespace TEXT` still hands back NULL for rows written before it existed. Read those as
+    // 'default' — the same value `namespaceFilter` matches them with, so what a worker sees on a run
+    // it picked up never contradicts why it picked it up.
+    namespace: row.namespace ?? DEFAULT_NAMESPACE,
     // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
     origin: row.origin ?? undefined,
     createdAt: new Date(row.createdAt),

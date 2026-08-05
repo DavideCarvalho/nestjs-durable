@@ -342,6 +342,60 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.listDueTimers(1_000)).toHaveLength(0);
     });
 
+    t('keeps a worker inside its own namespace on every path that picks work up', async () => {
+      // The boundary `WorkflowRun.namespace` documents: "A worker only picks up /
+      // recovers / resumes-timers-for / times-out runs in its own namespace."
+      //
+      // This case exists because that sentence was true of exactly one adapter. The
+      // other three did not declare the `namespace` parameter at all — and TypeScript
+      // lets an implementation take fewer parameters than the interface promises, so
+      // three stores silently ignored the argument and still satisfied `StateStore`.
+      // A worker serving one tenant listed, recovered and — through `sweepTimeouts`,
+      // which selects its cancellation candidates with `listRuns` — CANCELLED another
+      // tenant's runs. The last of those is a write, which is why this is asserted on
+      // all four paths rather than on the two that name `namespace` in their signature.
+      await store.createRun(run({ id: 'a-pending', status: 'pending', namespace: 'alpha' }));
+      await store.createRun(run({ id: 'b-pending', status: 'pending', namespace: 'beta' }));
+      await store.createRun(run({ id: 'a-running', status: 'running', namespace: 'alpha' }));
+      await store.createRun(run({ id: 'b-running', status: 'running', namespace: 'beta' }));
+      await store.createRun(
+        run({ id: 'a-timer', status: 'suspended', wakeAt: 5_000, namespace: 'alpha' }),
+      );
+      await store.createRun(
+        run({ id: 'b-timer', status: 'suspended', wakeAt: 5_000, namespace: 'beta' }),
+      );
+
+      expect((await store.listPendingRuns(10, 'alpha')).map((r) => r.id)).toEqual(['a-pending']);
+      expect((await store.listIncompleteRuns('alpha')).map((r) => r.id)).toEqual(['a-running']);
+      expect((await store.listDueTimers(10_000, 'alpha')).map((r) => r.id)).toEqual(['a-timer']);
+      expect(
+        (await store.listRuns({ namespace: 'alpha', status: 'running' })).map((r) => r.id),
+      ).toEqual(['a-running']);
+
+      // Foreign runs must not eat the FIFO budget either. Asking for one row while
+      // `beta` holds the oldest pending run has to return `alpha`'s, not nothing:
+      // a store that filtered AFTER applying the limit would answer with an empty
+      // page and look exactly like an idle tenant.
+      expect((await store.listPendingRuns(1, 'alpha')).map((r) => r.id)).toEqual(['a-pending']);
+
+      // `undefined` is NOT "namespace is null" — it is the operator view, every
+      // tenant at once. A store that read it as a null predicate would pass every
+      // single-tenant test written above and hide every run in a deployment that
+      // actually sets `DURABLE_TENANT`.
+      expect((await store.listPendingRuns(10)).map((r) => r.id).sort()).toEqual([
+        'a-pending',
+        'b-pending',
+      ]);
+      expect((await store.listIncompleteRuns()).map((r) => r.id).sort()).toEqual([
+        'a-running',
+        'b-running',
+      ]);
+      expect((await store.listDueTimers(10_000)).map((r) => r.id).sort()).toEqual([
+        'a-timer',
+        'b-timer',
+      ]);
+    });
+
     // ---- lease / lock -----------------------------------------------------------------------
 
     t('tryLockRun is atomic and respects lease expiry', async () => {

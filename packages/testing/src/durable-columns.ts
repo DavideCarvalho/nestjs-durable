@@ -15,10 +15,18 @@
  *
  * A property belongs here only when EVERY adapter declares it — the assertion walks this map and
  * reports a missing property as a mismatch, so listing a column one adapter doesn't have would fail
- * that adapter for a divergence it isn't guilty of. `WorkflowRun.namespace` is the standing example:
- * only the MikroORM adapter has a `namespace` column (it is the one with the tenant read filter), so
- * it stays out. That absence records a real cross-adapter gap, not a naming one; if the other three
- * ever gain the column, it belongs here on the same day.
+ * that adapter for a divergence it isn't guilty of. An absence here therefore records one of two
+ * different things, and telling them apart matters: a naming question nobody has settled, or a
+ * capability one adapter has and the others do not.
+ *
+ * `WorkflowRun.namespace` was the standing example of the second kind, and it is worth keeping the
+ * story because of how it ended. Only the MikroORM adapter had the column; the other three did not
+ * declare the `namespace` parameter on `listPendingRuns`/`listIncompleteRuns`/`listDueTimers` at
+ * all, which TypeScript permits, so they satisfied `StateStore` while ignoring the tenant boundary
+ * entirely. The gap was real and this map was right to stay quiet about it — but "this map is quiet"
+ * was also the only thing standing between that and a cross-tenant incident. All four adapters carry
+ * the column now, so it is pinned below, and the conformance suite asserts the boundary itself
+ * rather than only the column's name.
  */
 export const DURABLE_CANONICAL_COLUMNS = {
   durable_workflow_runs: {
@@ -40,6 +48,10 @@ export const DURABLE_CANONICAL_COLUMNS = {
     // an adapter can look canonical by accident — which is exactly why it is pinned here rather than
     // left to four per-adapter assertions to keep saying the same thing.
     origin: 'origin',
+    // The tenant a run belongs to, and the predicate on every poll tick. Pinned here
+    // now that all four adapters carry the column — see the note above, which used to
+    // name this as the standing example of a capability gap the map cannot express.
+    namespace: 'namespace',
     createdAt: 'created_at',
     updatedAt: 'updated_at',
   },

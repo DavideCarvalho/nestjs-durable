@@ -102,6 +102,9 @@ export class TypeOrmStateStore implements StateStore {
     if ('tags' in patch) update.tags = patch.tags ?? null;
     if ('searchAttributes' in patch) update.searchAttributes = patch.searchAttributes ?? null;
     if ('priority' in patch) update.priority = patch.priority ?? null;
+    // A patch that clears the namespace still lands on `'default'`, never NULL — the column is the
+    // isolation predicate, and a NULL there would match no worker's namespace at all.
+    if ('namespace' in patch) update.namespace = patch.namespace ?? 'default';
     if ('origin' in patch) update.origin = patch.origin ?? null;
     if ('createdAt' in patch) update.createdAt = patch.createdAt;
     if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;
@@ -157,24 +160,35 @@ export class TypeOrmStateStore implements StateStore {
     );
   }
 
-  async listIncompleteRuns(): Promise<WorkflowRun[]> {
-    const rows = await this.runs().findBy({ status: In(['running', 'cancelling']) });
+  /**
+   * The three worker-poll predicates below (recover / pick up / resume timers) each AND in
+   * `namespace` when one is given, and omit the predicate entirely when it is `undefined`. Omitting
+   * is NOT the same as `namespace IS NULL`: `undefined` means "no restriction" — the operator /
+   * control-plane view that legitimately sees every tenant — whereas a NULL-matching predicate would
+   * hide every real run behind an empty result while looking correct in a single-tenant test.
+   */
+  async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
+    const rows = await this.runs().findBy({
+      status: In(['running', 'cancelling']),
+      ...(namespace !== undefined ? { namespace } : {}),
+    });
     return rows.map(fromRunEntity);
   }
 
-  async listPendingRuns(limit: number): Promise<WorkflowRun[]> {
+  async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.runs().find({
-      where: { status: 'pending' },
+      where: { status: 'pending', ...(namespace !== undefined ? { namespace } : {}) },
       order: { createdAt: 'ASC' }, // FIFO dispatch
       take: limit,
     });
     return rows.map(fromRunEntity);
   }
 
-  async listDueTimers(nowMs: number): Promise<WorkflowRun[]> {
+  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.runs().findBy({
       status: 'suspended',
       wakeAt: LessThanOrEqual(new Date(nowMs)),
+      ...(namespace !== undefined ? { namespace } : {}),
     });
     return rows.map(fromRunEntity);
   }
@@ -221,6 +235,12 @@ export class TypeOrmStateStore implements StateStore {
     // and corrupt the LIKE pattern. Use the query builder with a raw parameter to bypass that.
     const qb = this.runs().createQueryBuilder('r');
     if (query.workflow) qb.andWhere('r.workflow = :workflow', { workflow: query.workflow });
+    // The tenant partition. This is not only a dashboard facet: the engine's execution-timeout sweep
+    // finds its in-flight runs through `listRuns({ workflow, status, namespace })`, so without this
+    // predicate a namespaced worker would cancel ANOTHER tenant's long-running runs. `undefined`
+    // leaves the predicate off = every namespace (the operator view), exactly as in the list methods.
+    if (query.namespace !== undefined)
+      qb.andWhere('r.namespace = :namespace', { namespace: query.namespace });
     // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
     // before the column existed, or registered through a path the derivation could not classify)
     // matches NO origin value — it is never folded into a bucket to make the facet look complete.
@@ -416,6 +436,10 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
     priority: run.priority ?? null,
+    // An absent namespace is persisted as `'default'` (what the core `WorkflowRun.namespace` docblock
+    // promises), so the column is always a value a worker can match on — the opposite of `origin`
+    // below, where NULL is the only honest answer.
+    namespace: run.namespace ?? 'default',
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
     createdAt: run.createdAt,
@@ -440,6 +464,10 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     tags: e.tags ?? undefined,
     searchAttributes: e.searchAttributes ?? undefined,
     priority: e.priority ?? undefined,
+    // Reported verbatim. A row can only be NULL here if the column was added by hand without the
+    // `'default'` back-fill the schema helper applies, and reading it back as `'default'` would then
+    // LIE: the row would claim a namespace that its own SQL predicate does not match.
+    namespace: e.namespace,
     // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
     origin: e.origin ?? undefined,
     createdAt: e.createdAt,
