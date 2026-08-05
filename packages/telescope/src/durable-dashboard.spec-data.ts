@@ -93,7 +93,11 @@ export function durableDashboard(
       },
       {
         title: 'Workers',
-        cols: 2,
+        // One column, because this section holds exactly one panel and that panel is the widest
+        // table on the dashboard. A section renders as a fixed `grid-cols-N` with no `colSpan`, so
+        // `cols: 2` gave the widest table on the dashboard half the viewport and left the cell
+        // beside it empty — it scrolled sideways inside its own card while a hole sat next to it.
+        cols: 1,
         panels: [
           {
             kind: 'table',
@@ -109,7 +113,8 @@ export function durableDashboard(
               { key: 'group', label: 'Group' },
               { key: 'instanceId', label: 'Worker' },
               { key: 'mode', label: 'Mode' },
-              { key: 'limit', label: 'Limit' },
+              // No separate `limit` column: In-flight renders `<inFlight>/<limit>`, so a Limit
+              // column beside it repeats its own denominator in every row.
               { key: 'saturation', label: 'In-flight' },
               { key: 'queued', label: 'Queued' },
               { key: 'rssPct', label: 'RAM %' },
