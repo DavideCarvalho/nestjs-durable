@@ -12,3 +12,6 @@ inside its own card, and left the cell beside it empty. `cols: 1` gives it the w
 A new spec asserts the invariant for **every** section, not just this one: a panel count that is
 not an exact multiple of `cols` leaves a visible hole beside the last row, and it now fails the
 build with the offending section named.
+
+The `Limit` column is gone with it: `In-flight` renders `<inFlight>/<limit>`, so a Limit column
+beside it repeated its own denominator on every row.
