@@ -93,7 +93,11 @@ export function durableDashboard(
       },
       {
         title: 'Workers',
-        cols: 2,
+        // One column, because this section holds exactly one panel and that panel is the widest
+        // table on the dashboard. A section renders as a fixed `grid-cols-N` with no `colSpan`, so
+        // `cols: 2` gave an eleven-column table half the viewport and left the cell beside it
+        // empty — the table scrolled sideways inside its own card while a hole sat next to it.
+        cols: 1,
         panels: [
           {
             kind: 'table',
