@@ -82,7 +82,7 @@ through it so the engine can checkpoint — the body itself stays deterministic 
 | `StepOptions` | `{ retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs?, compensate? }` | Options for `ctx.task`/`ctx.localStep`. `compensate: () => Promise<void>` registers an in-process saga undo, retried up to the module-level `compensationRetries` (default `1`). See [Sagas & compensation](/docs/reliability/sagas). |
 | `StepUndo<TIn, TOut>` | `{ input: TIn; output: TOut }` | The one argument a dispatched saga undo is called with — the compensated call's own input and result. |
 | `UndoOf<H>` | `H extends (input: infer I, ...rest: never[]) => infer R ? StepUndo<I, Awaited<R>> : never` | Derives a dispatched undo's expected argument from the ORIGINAL step method's type, so a `compensate` ref is compile-checked against the call it undoes: `async cancelBooking(undo: UndoOf<FlightService['book']>) { ... }`. |
-| `ChildCallOptions` | `{ childId?, priority? }` | Options for `ctx.child`/`ctx.startChild` (a bare string is shorthand for `{ childId }`). `priority` only affects a remote child. |
+| `ChildCallOptions` | `{ childId?, priority?, version? }` | Options for `ctx.child`/`ctx.startChild` (a bare string is shorthand for `{ childId }`). `priority` only affects a remote child. `version` pins the child to that exact registered version — pass a constant, see [Versioning](/docs/authoring/versioning). |
 
 ## Decorators
 
@@ -227,7 +227,7 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 
 | Member | Signature | Notes |
 | --- | --- | --- |
-| `start` | `start(workflow: WorkflowRef, input: unknown, runId: string, opts?: StartOptions): Promise<RunResult>` | Create + enqueue a run. Idempotent by `runId` — a redelivered `runId` returns the existing run's state. |
+| `start` | `start(workflow: WorkflowRef, input: unknown, runId: string, opts?: StartOptions): Promise<RunResult>` | Create + enqueue a run. Idempotent by `runId` — a redelivered `runId` returns the existing run's state. `opts.version` starts that exact registered version instead of the newest (throws if it isn't registered — never falls back). |
 | `signal` | `signal(token: string, payload: unknown): Promise<RunResult \| null>` | Deliver a signal; buffers it if no run is waiting yet (reliable regardless of arrival order). |
 | `signalWithStart` | `signalWithStart(workflow: WorkflowRef, input: unknown, runId: string, signal: { token: string; payload?: unknown }, opts?: StartOptions): Promise<{ runId: string }>` | Ensure-then-signal, race-free. |
 | `update` | `update(runId: string, name: string, arg: unknown): Promise<UpdateResult>` | Deliver a validated update to a run waiting at `ctx.onUpdate(name)`. Runs the registered validator first; rejection never touches the run. |
@@ -250,7 +250,7 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 | `recoverIncomplete` | `recoverIncomplete(nowMs?: number): Promise<RunResult[]>` | Resume every run left `running` by a crash/deploy. Call on boot. |
 | `resumeDueTimers` | `resumeDueTimers(nowMs?: number): Promise<RunResult[]>` | Resume every suspended run whose durable timer is due. Call periodically. |
 | `runPending` | `runPending(nowMs?: number): Promise<RunResult[]>` | Pick up and execute every `pending` run (poll-based dispatch for a broker-less worker pod). |
-| `sweepTimeouts` | `sweepTimeouts(now?: number): Promise<void>` | Cancel in-flight runs that outlived their `@Workflow({ executionTimeout })`. |
+| `sweepTimeouts` | `sweepTimeouts(now?: number): Promise<void>` | Cancel in-flight runs that outlived their `@Workflow({ executionTimeout })`, cascading to their children exactly as `cancel` does. |
 | `continue` | `continue(runId: string): Promise<RunResult \| null>` | Resume a run paused at `ctx.breakpoint` (the dashboard "continue" button). `null` if not paused there. |
 | `getRun` | `getRun(runId: string): Promise<WorkflowRun \| null>` | Read a run's current persisted state. |
 | `registerEntity` | `registerEntity<S>(name: string, config: EntityConfig<S>): void` | Register a durable entity's handlers + initial state. |

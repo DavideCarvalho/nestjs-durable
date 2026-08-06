@@ -143,8 +143,16 @@ export interface CtxHost {
     transport?: string,
     admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
   ): Promise<TOutput>;
-  /** Start a child run once, deferred so it can't reentrantly resume a still-running parent. */
-  startChild(workflow: string, input: unknown, id: string, priority?: number): void;
+  /** Start a child run once, deferred so it can't reentrantly resume a still-running parent.
+   *  `version` pins the child to that exact registered version (see `StartOptions.version`); omitted,
+   *  the child starts on the newest registered one. */
+  startChild(
+    workflow: string,
+    input: unknown,
+    id: string,
+    priority?: number,
+    version?: string,
+  ): void;
   /**
    * Best-effort cancel of a child run — deferred for the SAME reason as `startChild` (so ctx code
    * can't reentrantly mutate engine state while the parent's own step is still executing
@@ -574,7 +582,7 @@ export function createWorkflowCtx(
     input: unknown,
     options?: string | ChildCallOptions,
   ): Promise<T> => {
-    const { childId, priority } = normalizeChildOptions(options);
+    const { childId, priority, version } = normalizeChildOptions(options);
     const current = pos.next();
     const id = childId ?? `${runId}.child.${current}`;
     const existing = await readCheckpoint(current);
@@ -602,7 +610,8 @@ export function createWorkflowCtx(
       );
       return unwrapCompletion<T>(buffered.payload, `child "${id}"`);
     }
-    if (!(await store.getRun(id))) host.startChild(workflowName(workflow), input, id, priority);
+    if (!(await store.getRun(id)))
+      host.startChild(workflowName(workflow), input, id, priority, version);
     // Make the awaited child visible in the parent's timeline WHILE it runs: a `running` placeholder
     // at this seq with the same `signal:child:<id>` name the signal resolution later overwrites as
     // `completed`. So the dashboard shows the child node (and can inline-expand it) live, instead of
@@ -722,12 +731,13 @@ export function createWorkflowCtx(
     input: unknown,
     options?: string | ChildCallOptions,
   ): Promise<string> => {
-    const { childId, priority } = normalizeChildOptions(options);
+    const { childId, priority, version } = normalizeChildOptions(options);
     const current = pos.next();
     const id = childId ?? `${runId}.child.${current}`;
     const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') return existing.output as string;
-    if (!(await store.getRun(id))) host.startChild(workflowName(workflow), input, id, priority);
+    if (!(await store.getRun(id)))
+      host.startChild(workflowName(workflow), input, id, priority, version);
     await writeCheckpoint(
       instantCheckpoint({ runId, seq: current, name: `spawn:${id}`, kind: 'local', output: id }),
     );

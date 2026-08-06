@@ -1137,6 +1137,19 @@ export interface ChildCallOptions {
   /** Deterministic child run id; defaults to one derived from the parent run id + call position. */
   childId?: string | undefined;
   /**
+   * Pin the child to this EXACT registered version instead of the newest one — the same contract as
+   * `StartOptions.version`, reached from inside a workflow body: an unregistered version fails the
+   * child's start rather than quietly running a different body, and a version can only be pinned on a
+   * workflow that is really registered (not on the synthesized remote/convention routes). A `ctx.child`
+   * whose pinned start fails surfaces it as a failed child on the parent's waiter; a fire-and-forget
+   * `ctx.startChild` buffers it until the parent joins the id.
+   *
+   * Replay-safe as long as you pass a CONSTANT (`{ version: '2' }`), which is the point — it names the
+   * body you meant. Computing it from a live registry read at call time would make the body
+   * non-deterministic, exactly like reading the clock.
+   */
+  version?: string | undefined;
+  /**
    * Dispatch priority for a REMOTE child workflow — stamped on the child run and carried onto every
    * {@link WorkflowTask} dispatched to advance it, so an urgent child can jump ahead of enqueued
    * lower-priority ones at the worker. Higher wins; absent = unprioritised. Ignored for an in-process

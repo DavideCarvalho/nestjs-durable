@@ -84,6 +84,31 @@ they started under, while new runs start on the latest version. This is skew pro
 never breaks the v1 runs still in the system. Keep the old version registered until every run that
 started under it has reached a terminal state, then remove it.
 
+### Starting a specific version
+
+"Newest" is the default, not the only option. Pass `version` to start (or spawn as a child) the exact
+version you mean:
+
+```ts
+await engine.start('checkout', order, runId, { version: '1' }); // runs the V1 body, not V2
+await ctx.child('checkout', order, { childId: 'c1', version: '1' }); // same, from a workflow body
+```
+
+Reach for it when the caller *records* which version it ran — a catalog node, a pinned pipeline
+definition, a reproducible re-run of an old job. A version that is **not registered** throws at
+`start`, before any run row is created; it never quietly falls back to the newest, because a caller
+that asked for `checkout@1` and silently got `checkout@2` has no way to notice. Pass a **constant**
+from inside a workflow body: computing the version at call time would make the body non-deterministic,
+exactly like reading the clock.
+
+Pinning resolves against real registrations — `@Workflow({ version })`, `engine.register`,
+`engine.registerRemote`, `engine.remote({ version })`. It is deliberately **not** available on the two
+paths where the engine invents a registration because none exists: a child inheriting its remote
+parent's routing, and convention routing to a live worker group of the same name. Both stamp a
+placeholder version (the parent's, and `'1'`), which is not evidence that the worker has the body you
+asked for — so a pinned start on those paths throws rather than pretending. To pin a cross-SDK
+workflow, register it for real: `engine.remote('processing', { group: 'processing', version: '2' })`.
+
 Versioning is the right tool when the change is structural and you're prepared to keep both bodies
 around. For a small, surgical change, the version split is heavyweight — that's where `ctx.patched`
 comes in.
