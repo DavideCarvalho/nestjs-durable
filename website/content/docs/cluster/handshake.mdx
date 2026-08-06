@@ -94,6 +94,12 @@ and a queue it consumes; it never publishes one for a workflow it merely knows h
 That is what removes the ambiguity: an entry in the registry means a live process said "I can run
 this", not "somebody, somewhere, might".
 
+The announcer is always the process that consumes the queue — including when an engine and a worker
+share one process, where the [in-app worker](/docs/cluster/roles-and-config) announces and the engine
+beside it does not. So a **pure operator** (`store` with no `connection`) announces nothing: it runs
+its bodies inline, consumes no queue, and has no routing token to offer. Its workflows are real and
+startable through its own `start()`; they are simply not something an external picker can point at.
+
 Read the aggregate from any pod:
 
 ```ts

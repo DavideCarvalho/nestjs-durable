@@ -13,6 +13,14 @@
  * module folds those statements together. Every entry is therefore a fact somebody asserted, and the
  * aggregate is the same on every pod because every pod reads the same published statements.
  *
+ * The announcer is always the process that CONSUMES the queue, never the engine that dispatches to
+ * it — including when the two share a process (the co-located in-app worker announces; the engine
+ * beside it does not). One consequence is worth stating plainly rather than leaving to be
+ * rediscovered: a pure operator (`store` with no `connection`) runs its bodies inline, consumes no
+ * queue, and therefore announces NOTHING. Its workflows are real and startable through its own
+ * `start()`, but they are not in this registry, because nothing about them is externally addressable
+ * for a picker to point at.
+ *
  * ## Liveness
  *
  * There is no expiry logic here because there is no state here. An announcement lives on the
