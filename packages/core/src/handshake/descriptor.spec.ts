@@ -5,6 +5,8 @@ import {
   LEGACY_V1_PROTOCOL,
   type RawWorkerDescriptor,
   type WorkerDescriptor,
+  type WorkflowRegistration,
+  describeWorker,
   descriptorHash,
   heartbeatStatus,
   isLegacyDescriptor,
@@ -190,5 +192,104 @@ describe('constants', () => {
       'cancellation',
     ]);
     expect(Object.isFrozen(LEGACY_V1_CAPABILITIES)).toBe(true);
+  });
+});
+
+describe('registrations — the announcement rides the descriptor (design §7.9)', () => {
+  it('leaves the hash of a descriptor that announces nothing BYTE-identical to before the field', () => {
+    // The pinned cross-language hash of the golden fixture is computed by SDKs that predate
+    // `registrations`; the conditional key is what keeps every already-published ETag valid.
+    const bare = makeDescriptor();
+    expect(descriptorHash({ ...bare, registrations: undefined })).toBe(descriptorHash(bare));
+  });
+
+  it('changes the hash when the announcement changes (an ETag a control plane can trust)', () => {
+    const bare = makeDescriptor();
+    const announcing = makeDescriptor({ registrations: [{ name: 'pipeline', version: '1' }] });
+    expect(descriptorHash(announcing)).not.toBe(descriptorHash(bare));
+    expect(
+      descriptorHash(makeDescriptor({ registrations: [{ name: 'pipeline', version: '2' }] })),
+    ).not.toBe(descriptorHash(announcing));
+  });
+
+  it('is order-insensitive across announcements AND within a `requires` set', () => {
+    const a = makeDescriptor({
+      registrations: [
+        { name: 'b', requires: ['saga', 'signals'] },
+        { name: 'a', group: 'a@acme' },
+      ],
+    });
+    const b = makeDescriptor({
+      registrations: [
+        { name: 'a', group: 'a@acme' },
+        { name: 'b', requires: ['signals', 'saga'] },
+      ],
+    });
+    expect(descriptorHash(a)).toBe(descriptorHash(b));
+  });
+
+  it('distinguishes an un-stated field from a stated one (absence is not a value)', () => {
+    const unstated = makeDescriptor({ registrations: [{ name: 'pipeline' }] });
+    const stated = makeDescriptor({ registrations: [{ name: 'pipeline', group: 'pipeline' }] });
+    expect(descriptorHash(stated)).not.toBe(descriptorHash(unstated));
+  });
+
+  it('normalizeDescriptor keeps absent absent — it never defaults to an empty announcement', () => {
+    expect(normalizeDescriptor(makeDescriptor())).not.toHaveProperty('registrations');
+    expect(normalizeDescriptor(makeDescriptor({ registrations: [] })).registrations).toEqual([]);
+  });
+});
+
+describe('describeWorker — the one builder both TS advertisers publish through', () => {
+  it('sorts the set-valued fields so registration ORDER cannot change the published bytes', () => {
+    const a = describeWorker({
+      instanceId: 'i',
+      runtime: 'node',
+      sdk: { name: 'sdk', version: '1' },
+      steps: ['c', 'a'],
+      workflows: ['z', 'b'],
+      startedAt: 5,
+    });
+    expect(a.steps).toEqual(['a', 'c']);
+    expect(a.workflows).toEqual(['b', 'z']);
+    expect(a.protocol).toEqual({ version: CURRENT_PROTOCOL_VERSION, range: [1, 1] });
+    expect(a.capabilities).toEqual([...LEGACY_V1_CAPABILITIES]);
+  });
+
+  it('omits an empty announcement, a `default` namespace and an unset partition', () => {
+    const d = describeWorker({
+      instanceId: 'i',
+      runtime: 'python',
+      sdk: { name: 'sdk', version: '1' },
+      steps: [],
+      registrations: [],
+      namespace: 'default',
+      startedAt: 0,
+    });
+    expect('registrations' in d).toBe(false);
+    expect('namespace' in d).toBe(false);
+    expect('partition' in d).toBe(false);
+  });
+
+  it('orders announcements by name@version, so two replicas publish identical bytes', () => {
+    const of = (registrations: WorkflowRegistration[]) =>
+      describeWorker({
+        instanceId: 'i',
+        runtime: 'node',
+        sdk: { name: 'sdk', version: '1' },
+        steps: [],
+        registrations,
+        startedAt: 0,
+      });
+    const one = of([
+      { name: 'pipeline', version: '2' },
+      { name: 'extraction', version: '1' },
+    ]);
+    const two = of([
+      { name: 'extraction', version: '1' },
+      { name: 'pipeline', version: '2' },
+    ]);
+    expect(JSON.stringify(one)).toBe(JSON.stringify(two));
+    expect(one.registrations?.map((r) => r.name)).toEqual(['extraction', 'pipeline']);
   });
 });

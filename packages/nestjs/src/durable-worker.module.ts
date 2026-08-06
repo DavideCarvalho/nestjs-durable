@@ -67,8 +67,16 @@ export class ThinWorkflowRegistrar implements OnModuleInit {
 
   onModuleInit(): void {
     if (!isPureThinWorker(this.options)) return;
-    scanWorkflows(this.discovery, (meta, instance) =>
-      this.runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input)),
+    // The `@Workflow` metadata is also what this worker ANNOUNCES about each body it serves (design
+    // §7.9) — version, capability demand, and the declaring package `scanWorkflows` derived. It is
+    // passed straight through: the registry states what the decorator states, and an option the
+    // decorator left off stays un-stated rather than becoming a default.
+    scanWorkflows(this.discovery, (meta, instance, origin) =>
+      this.runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input), {
+        version: meta.version,
+        ...(meta.requires !== undefined ? { requires: meta.requires } : {}),
+        ...(origin !== undefined ? { origin } : {}),
+      }),
     );
   }
 }

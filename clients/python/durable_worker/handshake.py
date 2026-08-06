@@ -53,6 +53,53 @@ LEGACY_V1_CAPABILITIES: Tuple[str, ...] = (
 
 
 @dataclass
+class WorkflowRegistration:
+    """One workflow this worker ANNOUNCES it can execute — the richer form of a ``workflows`` name
+    (design §7.9).
+
+    The rule is "announce only what you can run": a worker publishes a registration for a workflow
+    whose body it holds and whose queue it consumes, never for one it merely knows how to route to.
+    Every field but ``name`` is optional and OMITTED from the wire when unset, because an absent field
+    means "not stated" — a reader must never read it as a value, and the aggregate never invents a
+    version, a group or an origin nobody announced.
+
+    CROSS-SDK CONTRACT — byte-identical to the TS ``WorkflowRegistration``
+    (``packages/core/src/handshake/descriptor.ts``)."""
+
+    name: str
+    version: Optional[str] = None
+    group: Optional[str] = None
+    requires: Optional[List[str]] = None
+    origin: Optional[str] = None
+
+    def to_wire(self) -> Dict[str, Any]:
+        """Serialize to the wire JSON shape, omitting every un-stated field (so a name-only
+        announcement is exactly ``{"name": "..."}``)."""
+        wire: Dict[str, Any] = {"name": self.name}
+        if self.version is not None:
+            wire["version"] = self.version
+        if self.group is not None:
+            wire["group"] = self.group
+        if self.requires is not None:
+            wire["requires"] = list(self.requires)
+        if self.origin is not None:
+            wire["origin"] = self.origin
+        return wire
+
+    @classmethod
+    def from_wire(cls, raw: Dict[str, Any]) -> "WorkflowRegistration":
+        """Parse one wire registration. An absent field stays ``None`` — never defaulted."""
+        requires = raw.get("requires")
+        return cls(
+            name=raw["name"],
+            version=raw.get("version"),
+            group=raw.get("group"),
+            requires=list(requires) if requires is not None else None,
+            origin=raw.get("origin"),
+        )
+
+
+@dataclass
 class WorkerDescriptor:
     """A worker's (or control-plane's) advertised identity, wire-protocol support, feature
     capabilities and registered handlers (design §7.1). Published on startup + on change and consumed
@@ -68,11 +115,17 @@ class WorkerDescriptor:
     started_at: int = 0
     partition: Optional[str] = None
     namespace: Optional[str] = None
+    # The richer per-workflow announcement (design §7.9). ``None`` means "this worker does not
+    # announce registrations" — distinct from ``[]`` ("announces none"), and only the latter licenses
+    # a reader to conclude the worker serves nothing. A worker that announces these ALSO lists the
+    # same names in ``workflows``, so a reader predating the field still sees the workflow at all.
+    registrations: Optional[List[WorkflowRegistration]] = None
 
     def to_wire(self) -> Dict[str, Any]:
         """Serialize to the wire JSON shape (camelCase keys, in the §7.1 field order). Optional
-        ``partition``/``namespace`` are omitted when unset — matching the TS SDK, which only includes
-        a present optional field (so a modern-with-partition and legacy-without agree)."""
+        ``partition``/``namespace``/``registrations`` are omitted when unset — matching the TS SDK,
+        which only includes a present optional field (so a modern-with-partition and legacy-without
+        agree, and a descriptor that announces nothing keeps the pre-§7.9 bytes exactly)."""
         wire: Dict[str, Any] = {
             "instanceId": self.instance_id,
             "runtime": self.runtime,
@@ -85,6 +138,8 @@ class WorkerDescriptor:
             "workflows": list(self.workflows),
             "steps": list(self.steps),
         }
+        if self.registrations is not None:
+            wire["registrations"] = [r.to_wire() for r in self.registrations]
         if self.partition is not None:
             wire["partition"] = self.partition
         if self.namespace is not None:
@@ -112,6 +167,14 @@ class WorkerDescriptor:
             partition=raw.get("partition"),
             namespace=raw.get("namespace"),
             started_at=raw.get("startedAt") or 0,
+            # Absent stays ``None`` (this SDK does not announce), an explicit ``[]`` stays ``[]``
+            # (announces none) — the same undefined-vs-empty distinction the TS ``normalizeDescriptor``
+            # keeps for ``capabilities``.
+            registrations=(
+                [WorkflowRegistration.from_wire(r) for r in raw["registrations"]]
+                if raw.get("registrations") is not None
+                else None
+            ),
         )
 
 
@@ -121,16 +184,40 @@ def is_legacy_descriptor(raw: Dict[str, Any]) -> bool:
     return raw.get("protocol") is None
 
 
+def _canonicalize_registrations(regs: Sequence[WorkflowRegistration]) -> List[Any]:
+    """Canonical, order-insensitive projection of the ``registrations`` announcement — byte-identical
+    to the TS ``canonicalizeRegistrations``. Each entry gets a FIXED key order with absent fields
+    collapsed to ``None``, ``requires`` sorted + de-duplicated, and the entries themselves
+    de-duplicated and sorted by their own canonical JSON, so announcement order cannot change the
+    hash — only the announced CONTENT can, which is when a control plane should re-read."""
+    canonical = [
+        {
+            "name": r.name,
+            "version": r.version,
+            "group": r.group,
+            "requires": sorted(set(r.requires)) if r.requires is not None else None,
+            "origin": r.origin,
+        }
+        for r in regs
+    ]
+    by_json = {json.dumps(entry, separators=(",", ":"), ensure_ascii=False): entry for entry in canonical}
+    return [by_json[k] for k in sorted(by_json)]
+
+
 def _canonicalize_for_hash(d: WorkerDescriptor) -> Dict[str, Any]:
     """Canonical, order-insensitive projection used for hashing — byte-identical to the TS
     ``canonicalizeForHash``. The three set-valued fields are sorted + de-duplicated so member order
     can never change the hash; optional fields collapse to ``None`` (JSON ``null``) so
-    present-with-``None`` and absent agree. Keys are emitted in a FIXED order."""
+    present-with-``None`` and absent agree. Keys are emitted in a FIXED order.
+
+    ``registrations`` is the ONE key emitted conditionally: a descriptor that does not announce them
+    hashes to the same bytes as before the field existed, so every already-published ETag — and the
+    pinned cross-language golden hash — is unchanged."""
 
     def as_set(xs: Sequence[str]) -> List[str]:
         return sorted(set(xs))
 
-    return {
+    canonical: Dict[str, Any] = {
         "instanceId": d.instance_id,
         "runtime": d.runtime,
         "sdk": {"name": d.sdk["name"], "version": d.sdk["version"]},
@@ -141,10 +228,13 @@ def _canonicalize_for_hash(d: WorkerDescriptor) -> Dict[str, Any]:
         "capabilities": as_set(d.capabilities),
         "workflows": as_set(d.workflows),
         "steps": as_set(d.steps),
-        "partition": d.partition,
-        "namespace": d.namespace,
-        "startedAt": d.started_at,
     }
+    if d.registrations is not None:
+        canonical["registrations"] = _canonicalize_registrations(d.registrations)
+    canonical["partition"] = d.partition
+    canonical["namespace"] = d.namespace
+    canonical["startedAt"] = d.started_at
+    return canonical
 
 
 def _fnv1a64_hex(text: str) -> str:

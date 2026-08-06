@@ -25,6 +25,7 @@ interface WorkerDescriptor {
   capabilities: string[]   // named features: 'saga', 'signals', 'priority', 'child-workflows', ...
   workflows: string[]      // registered handler names → routing
   steps: string[]
+  registrations?: WorkflowRegistration[]  // what this worker can EXECUTE — see below
   partition?: string
   namespace?: string
   startedAt: number
@@ -65,6 +66,95 @@ export class PaymentSteps {
 <Callout type="warn">
 `blocked: no compatible worker (requires 'saga')` is a first-class run status, visible in the [dashboard](/docs/observability/dashboard). The control plane re-checks blocked runs on a poll, so the moment a capable worker registers, the run resumes automatically. A capability mismatch is **never** a silent hang.
 </Callout>
+
+## What workflows exist in this deployment?
+
+A console that lets somebody assemble a pipeline needs a picker: *which existing workflows can this
+node call?* The engine's own registry cannot answer that. `engine.workflowBody(name, version)`
+answers for the process you happen to ask, and a **missing body is ambiguous** — it means "not
+registered here", but equally "registered via `registerRemote` against another SDK" or "a group this
+pod resolves by convention against a live worker". A picker built on that inference would show
+different options depending on which replica served the request.
+
+So registration is **announced, not inferred**. A worker publishes what it can execute as part of the
+descriptor it already advertises:
+
+```ts
+interface WorkflowRegistration {
+  name: string
+  version?: string   // absent = the announcer did not state one
+  group?: string     // the queue this worker consumes for it
+  requires?: string[]
+  origin?: string    // the package that declared the workflow
+}
+```
+
+The rule is **announce only what you can run**. A worker publishes a registration for a body it holds
+and a queue it consumes; it never publishes one for a workflow it merely knows how to *route to*.
+That is what removes the ambiguity: an entry in the registry means a live process said "I can run
+this", not "somebody, somewhere, might".
+
+The announcer is always the process that consumes the queue — including when an engine and a worker
+share one process, where the [in-app worker](/docs/cluster/roles-and-config) announces and the engine
+beside it does not. So a **pure operator** (`store` with no `connection`) announces nothing: it runs
+its bodies inline, consumes no queue, and has no routing token to offer. Its workflows are real and
+startable through its own `start()`; they are simply not something an external picker can point at.
+
+Read the aggregate from any pod:
+
+```ts
+const announced = await engine.announcedWorkflows()
+// [{ key: 'pipeline@2', name: 'pipeline', version: '2', groups: ['pipeline'],
+//    origins: ['flip-python-db'], requires: [['saga']], runtimes: ['python'],
+//    instances: ['py-1', 'py-2'], disagreements: [] }]
+```
+
+It costs **one scan of the advertisement keyspace per call** — nothing is added to the poll loop, and
+no pod keeps a table of the fleet's registrations in memory. It is scoped like every other poll
+surface: an engine with a `namespace` sees only its own tenant, an operator (namespace unset) sees
+everything.
+
+### Liveness
+
+An announcement rides the descriptor key, which is written with the worker-heartbeat TTL (`EX 35`)
+and refreshed by the same ~10s beat. A worker that dies stops refreshing, the key expires, and its
+announcements disappear with it — there is no expiry bookkeeping anywhere in the engine, and no way
+for an announcement to outlive its worker. The resolution of that liveness is the TTL, so an entry
+can name a worker that died within the last beat window; that is the same staleness the capability
+router already accepts when it reads descriptors to decide whether to dispatch.
+
+### Disagreement
+
+Two live workers can announce the same `name@version` with different groups, origins or capability
+demands. The registry **reports every distinct claim and picks none of them**:
+
+```ts
+{ key: 'pipeline@2', groups: ['pipeline', 'pipeline-v2'],
+  disagreements: [{ axis: 'group', values: ['pipeline', 'pipeline-v2'] }] }
+```
+
+Two origins for one `name@version` is a name collision between packages; two `requires` sets is two
+different code versions under one version tag; two groups means a caller cannot know which queue to
+dispatch to. Any of those is something a human has to resolve, so the aggregate surfaces it rather
+than merging it away. **Silence is not a claim** — a worker that announced no origin does not
+disagree with one that did.
+
+### Cross-SDK
+
+A Python worker participates. Every SDK already publishes `workflows: string[]`, and a bare name is
+accepted as a valid (unversioned, group-less) announcement, so a worker that has not adopted
+`registrations` is still listed rather than invisible. `@worker.workflow("pipeline", version="2",
+origin="flip-python-db")` fills in the richer axes; what you leave out is announced as un-stated, and
+the aggregate never invents a version, group or origin nobody stated.
+
+### Steps are out of scope, deliberately
+
+There is no equivalent registry for steps, and there never will be one shaped like this. A step is
+**not addressable from outside a run**: it is identified by its `(runId, seq)` position in one
+workflow's history, `ctx.step` is only callable from inside a replaying body, and no engine entry
+point starts a step on its own. "Call this step" is not an operation the engine can perform, so a
+picker offering steps would be offering something that does not exist. Step handler names still ride
+`steps` in the descriptor — that is a routing and capability fact, not an invocable catalog.
 
 ## Loud, structured failures
 

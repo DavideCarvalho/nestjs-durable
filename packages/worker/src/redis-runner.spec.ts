@@ -1,4 +1,9 @@
-import type { RemoteTask, WorkflowTask } from '@dudousxd/nestjs-durable-core';
+import {
+  type RemoteTask,
+  type WorkerDescriptor,
+  type WorkflowTask,
+  descriptorHash,
+} from '@dudousxd/nestjs-durable-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type RunnerDeps, runRedisWorker } from './redis-runner';
 import { DurableWorkerRuntime } from './runner-core';
@@ -10,6 +15,9 @@ import { DurableWorkerRuntime } from './runner-core';
 function makeFakeDeps(opts: { withRedis?: boolean } = {}) {
   const added: Array<{ queue: string; name: string; data: unknown }> = [];
   const published: Array<{ channel: string; payload: string }> = [];
+  // Every TTL'd key the runner stamps: the worker-liveness heartbeat AND the handshake descriptor
+  // that carries its workflow announcements — so a test can assert both the value and the TTL.
+  const sets: Array<{ key: string; value: string; ttlSeconds: number }> = [];
   const workers: Array<{
     name: string;
     opts: Record<string, unknown>;
@@ -22,7 +30,9 @@ function makeFakeDeps(opts: { withRedis?: boolean } = {}) {
     duplicate() {
       return { subscribe: async () => {}, on: () => {}, disconnect: () => {} };
     }
-    async set() {}
+    async set(key: string, value: string, _ex: string, ttlSeconds: number) {
+      sets.push({ key, value, ttlSeconds });
+    }
     async publish(channel: string, payload: string) {
       published.push({ channel, payload });
     }
@@ -56,6 +66,7 @@ function makeFakeDeps(opts: { withRedis?: boolean } = {}) {
     deps,
     added,
     published,
+    sets,
     workers,
     /** The queue names every started fake Worker subscribed on (one per registered name). */
     get workerQueueNames(): string[] {
@@ -231,5 +242,97 @@ describe('runRedisWorker — run-scoped liveness heartbeat during a workflow tur
     await fake.run('durable-tasks-charge', { data: remoteTask() });
 
     expect(fake.published.filter((p) => p.channel === 'durable-heartbeat')).toHaveLength(0);
+  });
+});
+
+describe('runRedisWorker — announcing what this worker can execute (handshake §7.9)', () => {
+  /** Parse the descriptor this runner published for `token`, or undefined if it published none. */
+  const announced = (
+    sets: Array<{ key: string; value: string; ttlSeconds: number }>,
+    token: string,
+  ) => {
+    const hit = sets.find((s) => s.key.startsWith(`durable-worker-descriptor:${token}:`));
+    return hit ? { ...hit, descriptor: JSON.parse(hit.value) as WorkerDescriptor } : undefined;
+  };
+
+  it('publishes the descriptor under EVERY subscribed token, with the heartbeat TTL', async () => {
+    const fake = makeFakeDeps({ withRedis: true });
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('pipeline', async () => 1);
+    runtime.registerStep<number, number>('extraction:page', (n) => n);
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
+
+    // Both tokens carry the advertisement, and each shares the liveness key's TTL — so when the beat
+    // stops, the announcement expires with it instead of outliving the worker that made it.
+    for (const token of ['pipeline', 'extraction-page']) {
+      const published = announced(fake.sets, token);
+      expect(published?.ttlSeconds).toBe(35);
+      expect(published?.descriptor.instanceId).toBe(
+        fake.sets.find((s) => s.key.startsWith('durable-worker-heartbeat:'))?.key.split(':')[2],
+      );
+    }
+  });
+
+  it('announces each workflow with the queue token it actually subscribed', async () => {
+    const fake = makeFakeDeps({ withRedis: true });
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('pipeline', async () => 1, {
+      version: '2',
+      requires: ['saga'],
+      origin: 'flip-python-db',
+    });
+    await runRedisWorker({ runtime, connection: {}, partition: 'acme', deps: fake.deps });
+
+    const descriptor = announced(fake.sets, 'pipeline@acme')?.descriptor;
+    expect(descriptor?.registrations).toEqual([
+      {
+        name: 'pipeline',
+        version: '2',
+        requires: ['saga'],
+        origin: 'flip-python-db',
+        // The SAME token the runner subscribed above — an announced group is a queue this worker
+        // really reads, never a claim about one.
+        group: 'pipeline@acme',
+      },
+    ]);
+    expect(fake.workerQueueNames).toContain('durable-tasks-pipeline@acme');
+  });
+
+  it('states nothing it was not told: an un-annotated workflow announces name + group only', async () => {
+    const fake = makeFakeDeps({ withRedis: true });
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('pipeline', async () => 1);
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
+
+    expect(announced(fake.sets, 'pipeline')?.descriptor.registrations).toEqual([
+      { name: 'pipeline', group: 'pipeline' },
+    ]);
+  });
+
+  it('announces NO workflow for a pure step worker (a step is not callable from outside a run)', async () => {
+    const fake = makeFakeDeps({ withRedis: true });
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerStep<number, number>('charge', (n) => n + 1);
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
+
+    const descriptor = announced(fake.sets, 'charge')?.descriptor;
+    // The handler name is still advertised for capability routing — it is just not an invocable
+    // catalog entry, so the announcement is omitted entirely (bytes unchanged for a step-only fleet).
+    expect(descriptor?.steps).toEqual(['charge']);
+    expect(descriptor?.registrations).toBeUndefined();
+  });
+
+  it('stamps the descriptor ETag on the compact beat (the two-tier read, design §7.2)', async () => {
+    const fake = makeFakeDeps({ withRedis: true });
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('pipeline', async () => 1, { version: '2' });
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
+
+    const beat = fake.sets.find((s) => s.key.startsWith('durable-worker-heartbeat:'));
+    const descriptor = announced(fake.sets, 'pipeline')?.descriptor;
+    expect(descriptor).toBeDefined();
+    expect(JSON.parse(beat?.value ?? '{}').descriptorHash).toBe(
+      descriptorHash(descriptor as WorkerDescriptor),
+    );
   });
 });

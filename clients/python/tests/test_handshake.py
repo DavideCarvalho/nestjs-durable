@@ -17,6 +17,7 @@ from durable_worker.handshake import (
     CURRENT_PROTOCOL_VERSION,
     LEGACY_V1_CAPABILITIES,
     WorkerDescriptor,
+    WorkflowRegistration,
     can_route,
     descriptor_hash,
     heartbeat_status,
@@ -340,3 +341,110 @@ def test_resolve_routing_routable_and_blocked():
 
     # Empty fleet always blocks.
     assert resolve_routing(["saga"], [])["status"] == "blocked"
+
+
+# --------------------------------------------------------------------------------------------------
+# Announced workflow registrations (design §7.9) — what this worker says it can EXECUTE.
+# --------------------------------------------------------------------------------------------------
+
+# Pinned in the TS conformance test too (packages/core/src/handshake/fixtures.contract.spec.ts).
+GOLDEN_REGISTRATIONS_HASH = "8923307c940a5dde"
+
+
+def test_golden_registrations_fixture_round_trips_and_hashes_identically():
+    raw = _read_raw("descriptor-registrations.json")
+    parsed = WorkerDescriptor.from_wire(json.loads(raw))
+    assert parsed.runtime == "python"
+    assert [r.name for r in parsed.registrations] == ["extraction", "pipeline"]
+    assert parsed.registrations[1].version == "2"
+    assert parsed.registrations[1].requires == ["saga"]
+    assert parsed.registrations[1].origin == "flip-python-db"
+    # Byte-identical round-trip AND the same 16-char ETag the TS SDK computes for these bytes.
+    assert json.dumps(parsed.to_wire(), indent=2) + "\n" == raw
+    assert descriptor_hash(parsed) == GOLDEN_REGISTRATIONS_HASH
+
+
+def test_registrations_absent_leaves_the_pre_announcement_hash_untouched():
+    # The whole point of emitting the key conditionally: every ETag published before §7.9 stays valid.
+    assert descriptor_hash(_make_descriptor(registrations=None)) == descriptor_hash(
+        _make_descriptor()
+    )
+    assert descriptor_hash(
+        _make_descriptor(registrations=[WorkflowRegistration(name="p")])
+    ) != descriptor_hash(_make_descriptor())
+
+
+def test_registrations_hash_is_order_insensitive_but_content_sensitive():
+    a = _make_descriptor(
+        registrations=[
+            WorkflowRegistration(name="b", requires=["saga", "signals"]),
+            WorkflowRegistration(name="a", group="a@acme"),
+        ]
+    )
+    b = _make_descriptor(
+        registrations=[
+            WorkflowRegistration(name="a", group="a@acme"),
+            WorkflowRegistration(name="b", requires=["signals", "saga"]),
+        ]
+    )
+    assert descriptor_hash(a) == descriptor_hash(b)
+    # An un-stated field is not the same claim as a stated one.
+    assert descriptor_hash(
+        _make_descriptor(registrations=[WorkflowRegistration(name="a")])
+    ) != descriptor_hash(
+        _make_descriptor(registrations=[WorkflowRegistration(name="a", group="a")])
+    )
+
+
+def test_a_python_worker_announces_what_it_serves_with_the_group_it_consumes():
+    from durable_worker import Worker
+    from durable_worker.redis_runner import _build_descriptor, _tenant_group, sanitize_queue_token
+
+    worker = Worker(auto_register=False)
+
+    @worker.workflow("pipeline", version="2", requires=["saga"], origin="flip-python-db")
+    def _pipeline(_ctx):
+        return None
+
+    @worker.workflow("extraction")
+    def _extraction(_ctx):
+        return None
+
+    d = _build_descriptor(
+        worker,
+        "acme",
+        "default",
+        lambda name: _tenant_group(sanitize_queue_token(name), "acme"),
+    )
+    wire = d.to_wire()
+    assert wire["registrations"] == [
+        # Announced by name + the queue this worker really consumes; nothing else was stated.
+        {"name": "extraction", "group": "extraction@acme"},
+        {
+            "name": "pipeline",
+            "version": "2",
+            "group": "pipeline@acme",
+            "requires": ["saga"],
+            "origin": "flip-python-db",
+        },
+    ]
+    # The same names still ride `workflows`, so a reader that predates §7.9 sees them too.
+    assert wire["workflows"] == ["extraction", "pipeline"]
+
+
+def test_a_step_only_python_worker_announces_nothing_at_all():
+    from durable_worker import Worker
+    from durable_worker.redis_runner import _build_descriptor
+
+    worker = Worker(auto_register=False)
+
+    @worker.step("Billing.charge")
+    def _charge(_data):
+        return None
+
+    d = _build_descriptor(worker, None, "default", lambda name: name)
+    # A step is not addressable from outside a run, so there is nothing to announce it for — and the
+    # field is omitted entirely, keeping a step-only worker's bytes (and ETag) exactly as before.
+    assert d.registrations is None
+    assert "registrations" not in d.to_wire()
+    assert d.steps == ["Billing.charge"]

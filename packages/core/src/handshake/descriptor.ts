@@ -7,6 +7,35 @@
  */
 
 /**
+ * One workflow a worker ANNOUNCES it can execute — the richer form of a `workflows` name.
+ *
+ * The rule is "announce only what you can run": a process publishes a registration for a workflow
+ * whose body it holds and whose queue it consumes. It never publishes one for a workflow it merely
+ * knows how to *route to* (an engine's `registerRemote`), because that claim says nothing about a
+ * live executor existing — which is precisely the ambiguity an aggregate registry has to remove.
+ *
+ * Every field but `name` is optional because the SDKs hold different amounts of this. A worker that
+ * knows only names (the Python `@worker.workflow("x")` form, or any pre-registrations SDK) publishes
+ * bare `workflows` names instead and is still a first-class announcer — see {@link WorkerDescriptor.registrations}.
+ * A reader must therefore treat an absent field as "not stated", never as a value: the aggregate in
+ * `./announced` never invents a version, a group or an origin that nobody announced.
+ */
+export interface WorkflowRegistration {
+  /** Registered workflow name — the `workflow` a {@link WorkflowTask} carries. */
+  name: string;
+  /** Registered version, when the announcer knows one. Absent = unversioned announcement. */
+  version?: string;
+  /** The routing token this workflow's turns are dispatched to (the queue this worker consumes for
+   *  it). Absent = the announcer did not say; a reader must NOT assume the by-convention token. */
+  group?: string;
+  /** Capabilities a worker must advertise to run it (design §7.5), as the announcer declares them. */
+  requires?: string[];
+  /** The package that DECLARED the workflow (see `WorkflowRun.origin`). Absent = unknown; nothing
+   *  ever substitutes a default, because a wrong origin is worse than no origin. */
+  origin?: string;
+}
+
+/**
  * A worker's (or control-plane's) advertised identity, wire-protocol support, feature capabilities
  * and registered handlers. Published on startup + on change (design §7.2) and consumed by
  * {@link negotiate} (compat) and the capability-aware router (design §7.5). Exactly the §7.1 shape.
@@ -32,6 +61,19 @@ export interface WorkerDescriptor {
   workflows: string[];
   /** Registered step handler names → routing targets. Order-insensitive (a set). */
   steps: string[];
+  /**
+   * The richer, per-workflow ANNOUNCEMENT of what this instance can execute (name + version + group
+   * + requires + origin). OPTIONAL and purely additive: an SDK that has only names keeps publishing
+   * {@link workflows} and is aggregated all the same, just unversioned. An SDK that publishes this
+   * SHOULD also list the same names in {@link workflows}, so a reader that predates this field still
+   * sees the workflow at all.
+   *
+   * It rides the descriptor rather than a registry of its own so it inherits the whole liveness
+   * story for free: the descriptor key is written with the heartbeat's TTL and refreshed by the same
+   * beat, so an announcement from a worker that has since died EXPIRES instead of offering a choice
+   * that fails at run time.
+   */
+  registrations?: WorkflowRegistration[];
   /** Optional routing partition (queue/group sharding). */
   partition?: string;
   /** Optional tenant namespace this instance serves. */
@@ -104,7 +146,13 @@ export function isLegacyDescriptor(raw: RawWorkerDescriptor | WorkerDescriptor):
  * - absent `workflows`/`steps` → `[]`, absent `sdk` → an `unknown` marker, absent `startedAt` → `0`.
  *
  * The undefined-vs-`[]` distinction is deliberate: an absent field means "legacy, doesn't advertise
- * this axis"; an explicit empty array means "modern SDK that genuinely advertises nothing".
+ * this axis"; an explicit empty array means "modern SDK that genuinely advertises nothing". The same
+ * reasoning keeps `registrations` ABSENT when it was absent (rather than defaulting to `[]`): "this
+ * SDK does not announce registrations" and "this SDK announces none" are different facts, and only
+ * the second one licenses a reader to conclude the worker serves nothing. (No SDK publishes `[]`
+ * today — {@link describeWorker} and the Python builder both OMIT the field when there is nothing to
+ * announce, so a worker with no workflows keeps its pre-announcement bytes and ETag — but a reader
+ * must not collapse the two cases on that basis.)
  */
 export function normalizeDescriptor(raw: RawWorkerDescriptor | WorkerDescriptor): WorkerDescriptor {
   return {
@@ -115,6 +163,7 @@ export function normalizeDescriptor(raw: RawWorkerDescriptor | WorkerDescriptor)
     capabilities: raw.capabilities ?? [...LEGACY_V1_CAPABILITIES],
     workflows: raw.workflows ?? [],
     steps: raw.steps ?? [],
+    ...(raw.registrations !== undefined ? { registrations: raw.registrations } : {}),
     ...(raw.partition !== undefined ? { partition: raw.partition } : {}),
     ...(raw.namespace !== undefined ? { namespace: raw.namespace } : {}),
     startedAt: raw.startedAt ?? 0,
@@ -142,9 +191,34 @@ export interface HeartbeatStatus {
   descriptorHash: string;
 }
 
+/**
+ * Canonical, order-insensitive projection of the `registrations` announcement: each entry gets a
+ * FIXED key order with absent fields collapsed to `null` (so present-with-undefined and absent
+ * agree), `requires` sorted + de-duplicated, and the entries themselves de-duplicated and sorted by
+ * their own canonical JSON. Announcement order therefore cannot change the hash — only the announced
+ * CONTENT can, which is exactly when a control plane should re-read.
+ */
+function canonicalizeRegistrations(regs: readonly WorkflowRegistration[]): unknown[] {
+  const canonical = regs.map((r) => ({
+    name: r.name,
+    version: r.version ?? null,
+    group: r.group ?? null,
+    requires: r.requires ? [...new Set(r.requires)].sort() : null,
+    origin: r.origin ?? null,
+  }));
+  const byJson = new Map<string, unknown>();
+  for (const entry of canonical) byJson.set(JSON.stringify(entry), entry);
+  return [...byJson.keys()].sort().map((k) => byJson.get(k));
+}
+
 /** Canonical, order-insensitive projection of a descriptor used for hashing. The three set-valued
  *  fields are sorted + de-duplicated so member order can never change the hash; scalar fields are
- *  taken verbatim; optional fields collapse to `null` so present-with-undefined and absent agree. */
+ *  taken verbatim; optional fields collapse to `null` so present-with-undefined and absent agree.
+ *
+ *  `registrations` is the ONE key emitted conditionally: a descriptor that does not announce them
+ *  hashes to BYTE-IDENTICAL bytes as before this field existed, so every already-published ETag —
+ *  and the pinned cross-language golden hash — is unchanged. A descriptor that DOES announce them
+ *  hashes differently, which is the point: changing what a worker serves must change its ETag. */
 function canonicalizeForHash(d: WorkerDescriptor): unknown {
   const set = (xs: string[]): string[] => [...new Set(xs)].sort();
   // Keys are emitted in a FIXED order (this literal's order) so the stringify below is stable
@@ -157,6 +231,9 @@ function canonicalizeForHash(d: WorkerDescriptor): unknown {
     capabilities: set(d.capabilities),
     workflows: set(d.workflows),
     steps: set(d.steps),
+    ...(d.registrations !== undefined
+      ? { registrations: canonicalizeRegistrations(d.registrations) }
+      : {}),
     partition: d.partition ?? null,
     namespace: d.namespace ?? null,
     startedAt: d.startedAt,
@@ -208,5 +285,50 @@ export function heartbeatStatus(
     ts: opts.ts ?? Date.now(),
     status: opts.status ?? 'up',
     descriptorHash: descriptorHash(descriptor),
+  };
+}
+
+/**
+ * Build a worker's own {@link WorkerDescriptor} in the exact §7.1 shape every SDK publishes — the
+ * single builder both TS advertisers use (the BullMQ transport's in-app worker and the standalone
+ * `runRedisWorker`), so two processes in the same fleet cannot drift into two dialects of the same
+ * wire.
+ *
+ * Set-valued fields are sorted here (not just in the hash projection) so the published BYTES are
+ * stable across registration order too — a re-registration in a different order must not look like a
+ * change to a reader diffing the raw value. `partition` and `namespace` are omitted when empty, and
+ * `namespace` additionally when it is `default`, keeping a single-tenant deployment byte-identical
+ * to the un-namespaced scheme. `capabilities` is the canonical v1 baseline this protocol guarantees.
+ */
+export function describeWorker(opts: {
+  instanceId: string;
+  runtime: 'node' | 'python';
+  sdk: { name: string; version: string };
+  steps: string[];
+  workflows?: string[] | undefined;
+  /** What this instance announces it can EXECUTE — see {@link WorkflowRegistration}. Omitted from
+   *  the descriptor entirely when absent or empty, so a worker with nothing to announce keeps the
+   *  pre-registrations bytes (and therefore the pre-registrations hash). */
+  registrations?: readonly WorkflowRegistration[] | undefined;
+  startedAt: number;
+  partition?: string | undefined;
+  namespace?: string | undefined;
+}): WorkerDescriptor {
+  const version = CURRENT_PROTOCOL_VERSION;
+  const registrations = [...(opts.registrations ?? [])].sort((a, b) =>
+    `${a.name}@${a.version ?? ''}`.localeCompare(`${b.name}@${b.version ?? ''}`),
+  );
+  return {
+    instanceId: opts.instanceId,
+    runtime: opts.runtime,
+    sdk: { name: opts.sdk.name, version: opts.sdk.version },
+    protocol: { version, range: [version, version] },
+    capabilities: [...LEGACY_V1_CAPABILITIES],
+    workflows: [...(opts.workflows ?? [])].sort(),
+    steps: [...opts.steps].sort(),
+    ...(registrations.length > 0 ? { registrations } : {}),
+    ...(opts.partition ? { partition: opts.partition } : {}),
+    ...(opts.namespace && opts.namespace !== 'default' ? { namespace: opts.namespace } : {}),
+    startedAt: opts.startedAt,
   };
 }

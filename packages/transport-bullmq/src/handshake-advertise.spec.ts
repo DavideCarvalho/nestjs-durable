@@ -47,6 +47,32 @@ describe('buildWorkerDescriptor — the node worker advertisement (design §7.1)
   });
 });
 
+describe('buildWorkerDescriptor — announcing what an instance can execute (design §7.9)', () => {
+  it('carries the announcement through, sorted, so registration order never changes the bytes', () => {
+    const of = (registrations: Parameters<typeof buildWorkerDescriptor>[0]['registrations']) =>
+      buildWorkerDescriptor({ instanceId: 'i', steps: [], registrations, startedAt: 1 });
+    const d = of([
+      { name: 'pipeline', version: '2', group: 'pipeline', origin: 'flip' },
+      { name: 'extraction', group: 'extraction' },
+    ]);
+    expect(d.registrations?.map((r) => r.name)).toEqual(['extraction', 'pipeline']);
+    expect(descriptorHash(d)).toBe(
+      descriptorHash(
+        of([
+          { name: 'extraction', group: 'extraction' },
+          { name: 'pipeline', version: '2', group: 'pipeline', origin: 'flip' },
+        ]),
+      ),
+    );
+  });
+
+  it('omits the field for a step-only transport — bytes unchanged for a fleet with nothing to announce', () => {
+    const d = buildWorkerDescriptor({ instanceId: 'i', steps: ['charge'], startedAt: 1 });
+    expect('registrations' in d).toBe(false);
+    expect(descriptorHash(d)).toBe(descriptorHash({ ...d, registrations: undefined } as typeof d));
+  });
+});
+
 describe('parseHeartbeatValue — extracts the two-tier ETag (design §7.2)', () => {
   it('reads descriptorHash off the compact beat', () => {
     const raw = JSON.stringify({

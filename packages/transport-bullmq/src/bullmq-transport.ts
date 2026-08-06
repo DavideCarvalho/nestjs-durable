@@ -5,7 +5,6 @@ import {
   type ControlPlane,
   type GroupHealth,
   type Heartbeat,
-  LEGACY_V1_CAPABILITIES,
   type NegotiationResult,
   type RawWorkerDescriptor,
   type RemoteTask,
@@ -21,8 +20,10 @@ import {
   type WorkerHeartbeat,
   type WorkerStatus,
   type WorkflowDecision,
+  type WorkflowRegistration,
   type WorkflowStepEvent,
   type WorkflowTask,
+  describeWorker,
   descriptorHash,
   negotiate,
   resolveRouting,
@@ -169,23 +170,25 @@ export function buildWorkerDescriptor(opts: {
   instanceId: string;
   steps: string[];
   workflows?: string[];
+  /** What this instance announces it can EXECUTE (design §7.9). Omit for a pure step transport —
+   *  this one consumes step queues, so it announces no workflows of its own. */
+  registrations?: readonly WorkflowRegistration[] | undefined;
   startedAt: number;
   partition?: string | undefined;
   namespace?: string | undefined;
   sdkVersion?: string | undefined;
 }): WorkerDescriptor {
-  return {
+  return describeWorker({
     instanceId: opts.instanceId,
     runtime: 'node',
     sdk: { name: SDK_NAME, version: opts.sdkVersion ?? '0' },
-    protocol: { version: 1, range: [1, 1] },
-    capabilities: [...LEGACY_V1_CAPABILITIES],
-    workflows: [...(opts.workflows ?? [])].sort(),
-    steps: [...opts.steps].sort(),
-    ...(opts.partition ? { partition: opts.partition } : {}),
-    ...(opts.namespace && opts.namespace !== 'default' ? { namespace: opts.namespace } : {}),
+    steps: opts.steps,
+    workflows: opts.workflows,
+    registrations: opts.registrations,
     startedAt: opts.startedAt,
-  };
+    partition: opts.partition,
+    namespace: opts.namespace,
+  });
 }
 
 export interface BullMQTransportOptions {
@@ -700,6 +703,41 @@ export class BullMQTransport implements Transport, ControlPlane {
       }
     } while (cursor !== '0');
     return descriptors;
+  }
+
+  /**
+   * Every live descriptor in this deployment, across all groups — the read behind the announced
+   * workflow registry (design §7.9). ONE `SCAN` of the advertisement keyspace
+   * (`<prefix>-worker-descriptor:*`), de-duplicated by `instanceId` because a worker publishes the
+   * same descriptor under every routing token it consumes. A key present is live by definition (the
+   * heartbeat TTL has not expired), so a dead worker's announcements are gone without any expiry
+   * bookkeeping here.
+   *
+   * Scoped by `#effectivePrefix()` like every other key this transport touches, so a namespaced
+   * deployment never sees another one's workers.
+   */
+  async readAllWorkerDescriptors(): Promise<WorkerDescriptor[]> {
+    const client = this.workerRedis();
+    const match = `${this.#effectivePrefix()}-worker-descriptor:*`;
+    const byInstance = new Map<string, WorkerDescriptor>();
+    let cursor = '0';
+    do {
+      const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 100);
+      cursor = next;
+      for (const key of keys) {
+        const raw = await client.get(key);
+        if (raw == null) continue;
+        try {
+          const descriptor = JSON.parse(raw) as WorkerDescriptor;
+          if (typeof descriptor?.instanceId !== 'string') continue;
+          if (!byInstance.has(descriptor.instanceId))
+            byInstance.set(descriptor.instanceId, descriptor);
+        } catch {
+          // A partially-written/garbled descriptor is skipped — the next beat rewrites it.
+        }
+      }
+    } while (cursor !== '0');
+    return [...byInstance.values()];
   }
 
   /**

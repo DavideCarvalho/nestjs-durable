@@ -163,6 +163,37 @@ describe('DurableModule co-located worker (store + connection)', () => {
     expect(runner.handles.every((h) => h.closed)).toBe(true);
   });
 
+  it('announces the co-located bodies from the CONSUMER, not from the engine sharing its process', async () => {
+    const runner = fakeRunner();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          store: new InMemoryStateStore(),
+          transport: new WorkflowTaskTransport(),
+          autoSchema: false,
+          connection: 'redis://x',
+        }),
+      ],
+      providers: [GreetWorkflow, Emails],
+    })
+      .overrideProvider(IN_APP_RUN_REDIS_WORKER)
+      .useValue(runner.runRedisWorker)
+      .compile();
+    await moduleRef.init();
+
+    // The process that CONSUMES the queue is the one entitled to announce (handshake §7.9): here the
+    // co-located runtime, whose `runRedisWorker` publishes the descriptor. The engine's own registry
+    // announces nothing — it is the same ambiguous "is a body here?" question the registry replaces.
+    const runtime = moduleRef.get<DurableWorkerRuntime>(IN_APP_WORKER_RUNTIME);
+    // `origin` is the package that DECLARED the workflow class, derived by `scanWorkflows` — here
+    // the spec's own package, since that is where `GreetWorkflow` is written.
+    expect(runtime.workflowRegistrations()).toEqual([
+      { name: 'greet', version: '1', origin: '@dudousxd/nestjs-durable' },
+    ]);
+
+    await moduleRef.close();
+  });
+
   it('keeps @Workflow inline and starts no consumer when connection is omitted (plain operator)', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({

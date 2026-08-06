@@ -10,12 +10,21 @@ export {
   type WorkerDescriptor,
   type RawWorkerDescriptor,
   type WorkerLifecycle,
+  type WorkflowRegistration,
   type HeartbeatStatus,
+  describeWorker,
   descriptorHash,
   heartbeatStatus,
   isLegacyDescriptor,
   normalizeDescriptor,
 } from './descriptor';
+export {
+  type AnnouncedWorkflow,
+  type Disagreement,
+  type WorkflowAnnouncement,
+  aggregateAnnouncements,
+  announcementsOf,
+} from './announced';
 export {
   type NegotiationOutcome,
   type NegotiationReason,

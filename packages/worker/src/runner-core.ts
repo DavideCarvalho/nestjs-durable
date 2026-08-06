@@ -2,6 +2,7 @@ import type {
   RemoteTask,
   StepResult,
   WorkflowDecision,
+  WorkflowRegistration,
   WorkflowStepEvent,
   WorkflowTask,
 } from '@dudousxd/nestjs-durable-core';
@@ -73,6 +74,22 @@ export function workerHeartbeatKey(prefix: string, group: string, instanceId: st
   return `${prefix}-worker-heartbeat:${group}:${instanceId}`;
 }
 
+/** `<prefix>-worker-descriptor:<group>:<instanceId>` — the TTL'd full handshake descriptor (design
+ *  §7.2), written with the SAME TTL as the heartbeat so a dead worker's advertisement (and every
+ *  workflow it announced) expires alongside its liveness key. CROSS-SDK CONTRACT: MUST byte-match
+ *  `BullMQTransport.workerDescriptorKey` and the Python SDK's `_descriptor_key`. */
+export function workerDescriptorKey(prefix: string, group: string, instanceId: string): string {
+  return `${prefix}-worker-descriptor:${group}:${instanceId}`;
+}
+
+/**
+ * What a worker announces about a registered workflow beyond its name — the announcement fields the
+ * REGISTERING side knows. `group` is deliberately absent: it is the queue token the runner
+ * subscribes, which the runner derives from the name + its own partition, so letting a registrar
+ * declare one would let it claim a queue nothing consumes.
+ */
+export type WorkflowRegistrationMeta = Omit<WorkflowRegistration, 'name' | 'group'>;
+
 /** The routed output of {@link DurableWorkerRuntime.handleTask}: either a replayed workflow turn's
  *  decision (→ `<prefix>-decisions`) or a step's result (→ `<prefix>-results`). */
 export type HandledTask =
@@ -112,15 +129,28 @@ export interface HandleTaskOptions {
 export class DurableWorkerRuntime {
   readonly workflows: WorkflowWorker;
   readonly steps: StepWorker;
+  /** What each registered workflow announces about itself beyond its name — see
+   *  {@link registerWorkflow}. Keyed by name; a workflow registered without meta has no entry, and
+   *  is announced as a bare name rather than with invented fields. */
+  private readonly workflowMeta = new Map<string, WorkflowRegistrationMeta>();
 
   constructor(options: { workflowGroup?: string; stepGroup?: string } = {}) {
     this.workflows = new WorkflowWorker(options.workflowGroup);
     this.steps = new StepWorker(options.stepGroup);
   }
 
-  /** Register `fn` as the workflow `name`. Chainable. */
-  registerWorkflow(name: string, fn: WorkflowFn): this {
+  /**
+   * Register `fn` as the workflow `name`. Chainable.
+   *
+   * `meta` is what this worker ANNOUNCES about the workflow beyond its name (design §7.9): its
+   * version, the capabilities it demands, and the package that declared it. It is registry metadata
+   * only — nothing here changes how the body replays, and omitting it costs only detail in the
+   * announcement, never execution. Pass what you actually know: an absent field means "not stated",
+   * and a reader is required to treat it that way rather than fill in a default.
+   */
+  registerWorkflow(name: string, fn: WorkflowFn, meta?: WorkflowRegistrationMeta): this {
     this.workflows.register(name, fn);
+    if (meta) this.workflowMeta.set(name, meta);
     return this;
   }
 
@@ -137,6 +167,17 @@ export class DurableWorkerRuntime {
    */
   registeredNames(): { workflows: string[]; steps: string[] } {
     return { workflows: this.workflows.names, steps: this.steps.names };
+  }
+
+  /**
+   * What this runtime announces it can EXECUTE: one entry per registered workflow, carrying whatever
+   * {@link registerWorkflow} was told about it. No `group` — the runner adds that, because the group
+   * is the queue the runner actually subscribed, and only the runner knows it. Only workflows: a step
+   * is not addressable from outside a run, so there is nothing to announce it FOR (see the "steps are
+   * out of scope" note in core's `handshake/announced`).
+   */
+  workflowRegistrations(): Array<{ name: string } & WorkflowRegistrationMeta> {
+    return this.workflows.names.map((name) => ({ name, ...this.workflowMeta.get(name) }));
   }
 
   /**

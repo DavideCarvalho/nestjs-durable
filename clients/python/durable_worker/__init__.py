@@ -11,6 +11,7 @@ from .handshake import (
     LEGACY_V1_CAPABILITIES,
     LEGACY_V1_PROTOCOL,
     WorkerDescriptor,
+    WorkflowRegistration,
     can_route,
     descriptor_hash,
     heartbeat_status,
@@ -56,6 +57,7 @@ __all__ = [
     "reply_target",
     # Handshake & capability negotiation (design §7) — cross-SDK interop contract.
     "WorkerDescriptor",
+    "WorkflowRegistration",
     "descriptor_hash",
     "heartbeat_status",
     "negotiate",

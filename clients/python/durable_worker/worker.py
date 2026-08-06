@@ -425,6 +425,10 @@ class Worker:
         # Workflows this worker also holds (unified worker). Empty for a pure step worker. Keyed by
         # workflow name; the runner routes a workflow task here and a step task to ``_handlers``.
         self._workflows: Dict[str, Handler] = {}
+        # What each workflow ANNOUNCES about itself beyond its name (design §7.9) — see
+        # :meth:`workflow`. Registry metadata only: nothing here changes how a turn replays. A
+        # workflow registered without any of it simply has no entry, and is announced by name alone.
+        self._workflow_meta: Dict[str, Dict[str, Any]] = {}
         # Auto-register into the module-level registry so :func:`run_all` can discover this worker
         # without the consumer listing it. Opt out with ``auto_register=False`` (one-off/test workers).
         if auto_register:
@@ -467,16 +471,44 @@ class Worker:
     def handles(self, name: str) -> bool:
         return name in self._handlers
 
-    def workflow(self, name: str) -> Callable[[Handler], Handler]:
+    def workflow(
+        self,
+        name: str,
+        *,
+        version: Optional[str] = None,
+        requires: Optional["list[str]"] = None,
+        origin: Optional[str] = None,
+    ) -> Callable[[Handler], Handler]:
         """Decorator registering ``fn`` as the workflow ``name`` on THIS worker (unified worker).
 
         ``fn(ctx, input)`` (or ``fn(ctx)``) — same authoring surface as
         :meth:`WorkflowWorker.workflow`. The worker's runner replays a workflow turn for this name and
         runs ``@worker.step`` handlers for step tasks — each registered name gets its own queue (see
-        the class docstring's Task 8 note)."""
+        the class docstring's Task 8 note).
+
+        ``version`` / ``requires`` / ``origin`` are what this worker ANNOUNCES about the workflow in
+        its handshake descriptor (design §7.9), so a control plane listing "what workflows exist in
+        this deployment" gets the same detail from a Python body as from a TypeScript one. They are
+        registry metadata ONLY — none of them changes replay, dispatch or routing here, and the
+        engine still owns the version a run actually starts on. All optional: what you leave out is
+        announced as un-stated rather than as a default, because a wrong version or origin in a picker
+        is worse than a missing one::
+
+            @worker.workflow("pipeline", version="2", origin="flip-python-db")
+            def pipeline(ctx, input): ...
+        """
 
         def register(fn: Handler) -> Handler:
             self._workflows[name] = fn
+            meta: Dict[str, Any] = {}
+            if version is not None:
+                meta["version"] = version
+            if requires is not None:
+                meta["requires"] = list(requires)
+            if origin is not None:
+                meta["origin"] = origin
+            if meta:
+                self._workflow_meta[name] = meta
             return fn
 
         return register
