@@ -28,9 +28,11 @@ const client = createClient({ url: process.env.DATABASE_URL! }); // file: or Tur
 export const db = drizzle(client, { schema: { ...durableSchema, /* your own tables */ } });
 ```
 
-`durableSchema` is `{ workflowRuns, stepCheckpoints, runAttributes, signalWaiters, bufferedSignals }`
+`durableSchema` is
+`{ workflowRuns, stepCheckpoints, runAttributes, signalWaiters, bufferedSignals, bufferedEvents }`
 (all mapped to the `durable_*` tables). You can also import any of those tables individually — e.g.
-to reference them in a `drizzle-kit` migration.
+to reference them in a `drizzle-kit` migration. `durableManagedTables()` derives the same six table
+names from that bundle, for a migration tool's exclude list.
 
 ## 2. Wire the store into the module
 
@@ -58,11 +60,54 @@ npx drizzle-kit migrate
 
 Point your `drizzle.config.ts` at a schema file that re-exports `durableSchema` (or the individual
 tables) so the generated SQL includes `durable_workflow_runs`, `durable_step_checkpoints`,
-`durable_run_attributes`, `durable_signal_waiters` and `durable_buffered_signals`.
+`durable_run_attributes`, `durable_signal_waiters`, `durable_buffered_signals` and
+`durable_buffered_events`.
 
 <Callout type="warn">
-  **An upgrade that adds a durable column is a migration you have to run — and skipping it breaks *every* run query, not just the new field.** Drizzle SELECTs every column the schema declares, so the moment the package declares a new one an un-migrated database answers `getRun`/`listRuns` with `no such column`. The MikroORM and TypeORM adapters heal this on boot and Prisma emits it through Migrate; this one has no auto-schema, so re-run `drizzle-kit generate` + `drizzle-kit migrate` after every upgrade — or apply the statement yourself. The current one is `origin` (which library declared the run's workflow): `ALTER TABLE durable_workflow_runs ADD COLUMN origin TEXT;`. It is nullable with **no default** on purpose — an existing row's origin cannot be reconstructed after the fact, so it stays NULL and reads back as `undefined`, meaning *unknown*, rather than as a plausible-looking package name. `priority` set the same trap before it.
+  **An upgrade that adds a durable column is a migration you have to run — and skipping it breaks
+  *every* query against that table, not just the new field.** Drizzle SELECTs every column the schema
+  declares, so the moment the package declares a new one an un-migrated database answers
+  `getRun`/`listRuns` with `no such column`. The MikroORM and TypeORM adapters heal this on boot and
+  Prisma emits it through Migrate; this one has no auto-schema, so **re-run `drizzle-kit generate` +
+  `drizzle-kit migrate` after every upgrade**. That diff — your database against the package's
+  `durableSchema` — is the authority on what a given upgrade needs; the section below explains the
+  two shapes it will hand you, but don't treat it as a hand-maintained list of columns to chase. Nor
+  is the trap confined to `durable_workflow_runs`: `parallel_group` landed on
+  `durable_step_checkpoints` and `durable_signal_waiters` the same way.
 </Callout>
+
+### The two shapes an added column takes
+
+**Nullable, no default** — `priority`, `origin`:
+
+```sql
+ALTER TABLE durable_workflow_runs ADD COLUMN origin TEXT;
+```
+
+Deliberate, not an oversight: an existing row's `origin` (which library registered its workflow)
+cannot be reconstructed after the fact, so it stays NULL and reads back as `undefined`, meaning
+*unknown*, rather than as a plausible-looking package name in the dashboard's facet.
+
+**NOT NULL with a default, plus an index** — the shape `namespace` took, and the one with the worst
+failure mode, because it is the tenant boundary rather than a dashboard facet:
+
+```sql
+ALTER TABLE durable_workflow_runs ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';
+CREATE INDEX IF NOT EXISTS durable_workflow_runs_namespace_status_idx
+  ON durable_workflow_runs (namespace, status, created_at);
+```
+
+SQLite applies the DEFAULT to every existing row as part of `ADD COLUMN`, so old runs land in
+`'default'` — the namespace they really did execute in — and stay visible to an unscoped worker. Run
+a bare `ADD COLUMN namespace TEXT` instead and those rows are NULL; this store reads NULL as
+`'default'` so they aren't orphaned, but the NOT NULL form above is the one to run.
+
+The index is not the optional half. `origin` gets none because only the dashboard's `listRuns` filters
+by it, whereas the pending pick-up (`listPendingRuns`) and the timer resume (`listDueTimers`) filter
+on `namespace` and `status` on **every poll tick** — and this is the only index the schema declares
+on `durable_workflow_runs`. `created_at` is third because the pending scan orders by it (FIFO); crash
+recovery (`listIncompleteRuns`) uses the same two leading columns, though only at boot. The index
+name is pinned to match the MikroORM adapter's so a store swap doesn't drop and rebuild it.
 
 <Callout type="warn">
   **Tag filtering is a substring match, not a JSON containment check.** `tags` is stored as JSON
