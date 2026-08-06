@@ -40,6 +40,11 @@ export const DURABLE_CANONICAL_COLUMNS = {
     wakeAt: 'wake_at',
     lockedBy: 'locked_by',
     lockedUntil: 'locked_until',
+    // The REMOTE turn the engine suspended on; `completeRemoteDecision` matches against it so only
+    // the currently-awaited turn's decision is applied. A store swap that lost this column would not
+    // fail loudly — it would apply a stale decision to the wrong turn — which is why it is pinned
+    // rather than left to each adapter's own spec.
+    awaitingDecisionTaskId: 'awaiting_decision_task_id',
     recoveryAttempts: 'recovery_attempts',
     tags: 'tags',
     searchAttributes: 'search_attributes',
@@ -68,6 +73,10 @@ export const DURABLE_CANONICAL_COLUMNS = {
     events: 'events',
     attempts: 'attempts',
     workerGroup: 'worker_group',
+    // A `ctx.gather`/`ctx.all` fan tags every sibling step with the same group so the dashboard can
+    // render them as one parallel group. Same physical name in the waiter table below — two tables,
+    // one column name, which is precisely the kind of near-duplicate that drifts if unpinned.
+    parallelGroup: 'parallel_group',
     wakeAt: 'wake_at',
     enqueuedAt: 'enqueued_at',
     startedAt: 'started_at',
@@ -83,6 +92,9 @@ export const DURABLE_CANONICAL_COLUMNS = {
     token: 'token',
     runId: 'run_id',
     seq: 'seq',
+    // The fan-out group threaded onto a child waiter, so the resolving `signal:child:` checkpoint
+    // carries it. Only fan-out child waiters populate it, but every adapter declares the column.
+    parallelGroup: 'parallel_group',
   },
   durable_buffered_signals: {
     id: 'id',
