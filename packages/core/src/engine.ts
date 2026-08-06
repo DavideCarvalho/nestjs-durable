@@ -103,6 +103,26 @@ type WorkflowFn = (ctx: InternalWorkflowCtx, input: unknown) => Promise<unknown>
  * another lib's, and an origin filter would quietly lie.
  */
 export interface StartOptions {
+  /**
+   * Start THIS registered version instead of the newest one. Omit (the default) and the run starts on
+   * the newest registered version, exactly as it always has — this option only ever narrows.
+   *
+   * Resolved against the by-name@version registry, so it pins anything explicitly registered:
+   * {@link WorkflowEngine.register}, {@link WorkflowEngine.registerRemote}, {@link WorkflowEngine.remote}.
+   * A version that is NOT registered throws before a run row is created and NEVER falls back to
+   * `latest` — a silent fallback is the exact failure this option exists to prevent (a caller that
+   * asked for `name@3` and got `name@4` has no way to tell, and its run is already going).
+   *
+   * NOT available on the two SYNTHESIZED registration paths, which exist precisely because nothing is
+   * registered: a child inheriting its remote ancestor's routing (see `findInheritedRegistration`),
+   * and convention routing to a live worker group of the same name (`resolveRemoteByConvention`).
+   * Both INVENT the version they stamp — the ancestor's, and the `'1'` convention default — as a
+   * routing placeholder; neither is evidence that the worker has a body at the version you asked for.
+   * A pinned start that reaches them therefore throws rather than pretending to have honoured the pin.
+   * To pin a cross-SDK workflow, register it for real — `engine.remote('name', { version: '2', group })`
+   * — which puts `name@2` in the registry and pins like any other registration.
+   */
+  version?: string | undefined;
   /** Run-scoped tags, merged with the workflow's static `@Workflow({ tags })` onto the run. */
   tags?: string[] | undefined;
   /** Typed, queryable run data stamped on the run (e.g. `{ amount: 200, tier: 'pro' }`). */
@@ -802,6 +822,16 @@ export class WorkflowEngine {
     return reg?.hasBody ? reg.fn : undefined;
   }
 
+  /** The registered versions of `name`, for the pinned-start error — "2 is not registered" is a
+   *  guess-the-typo error without them, and the answer (which versions this deploy actually carries)
+   *  is right here. `none` when the name is unknown entirely. */
+  private registeredVersions(name: string): string {
+    const versions = [...this.workflows.values()]
+      .filter((w) => w.name === name)
+      .map((w) => w.version);
+    return versions.length ? versions.join(', ') : 'none';
+  }
+
   /**
    * Register a workflow whose body runs in another SDK (e.g. Python). The engine owns the run exactly
    * as for a TS workflow — it persists checkpoints, recovers, runs timers — but advances it by handing
@@ -1001,8 +1031,14 @@ export class WorkflowEngine {
     opts?: StartOptions,
   ): Promise<RunResult> {
     const name = workflowName(workflow);
-    let registered = this.latest.get(name);
-    if (!registered) {
+    // PINNED (`opts.version`) resolves the by-name@version registry and stops there: no `latest`, and
+    // none of the synthesized fallbacks below, because none of them can prove the version exists (see
+    // {@link StartOptions.version}). Unpinned — every caller that has ever existed — takes `latest`
+    // and the fallback chain, byte-for-byte as before.
+    const pinned = opts?.version;
+    let registered =
+      pinned === undefined ? this.latest.get(name) : this.workflows.get(versionKey(name, pinned));
+    if (!registered && pinned === undefined) {
       // An unregistered run inherits remote routing from its spawning ancestor (see
       // {@link findInheritedRegistration}): the child of a remote workflow can be started without a
       // redundant `registerRemote` for its name. The child run doesn't exist yet, but its parent
@@ -1011,7 +1047,7 @@ export class WorkflowEngine {
       const ancestor = await this.findRemoteAncestor(runId);
       if (ancestor) registered = this.synthesizeRemoteChild(name, ancestor.version, ancestor);
     }
-    if (!registered) {
+    if (!registered && pinned === undefined) {
       // Convention routing: if the transport reports a live group of the same name, synthesize a
       // remote registration on the fly. Version '1' is the convention default (same as engine.remote()).
       const conventionRun: WorkflowRun = {
@@ -1030,7 +1066,13 @@ export class WorkflowEngine {
       };
       registered = await this.resolveRemoteByConvention(conventionRun);
     }
-    if (!registered) throw new Error(`workflow ${name} is not registered`);
+    if (!registered) {
+      throw new Error(
+        pinned === undefined
+          ? `workflow ${name} is not registered`
+          : `workflow ${versionKey(name, pinned)} is not registered — a pinned start never falls back to the newest version (registered: ${this.registeredVersions(name)})`,
+      );
+    }
     // Validate the input up front — a bad payload is rejected before any run is created.
     await registered.validateInput?.(input);
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
@@ -1283,7 +1325,32 @@ export class WorkflowEngine {
   /**
    * Cancel in-flight runs that have outlived their workflow's `executionTimeout`. Call it from the
    * timer poller alongside {@link resumeDueTimers}. A timed-out run is moved to `cancelled` with an
-   * `execution_timeout` error (terminal, so a late step result can't resurrect it).
+   * `execution_timeout` error (terminal, so a late step result can't resurrect it), AND its children
+   * are cascaded exactly as an explicit {@link cancel} cascades them.
+   *
+   * WHY THE TERMINAL WRITE IS DIRECT, not a call to {@link cancel}. Two reasons, both still standing:
+   * the run must land with the `execution_timeout` error `cancel` knows nothing about (`cancel` writes
+   * a plain `cancelled`, and the code is what a dashboard/alert distinguishes a timeout by), and this
+   * is a SCAN — it walks every in-flight run of every timed workflow on every poller tick, so it must
+   * not pay `cancel`'s per-run re-read and singleton/control-plane work on runs it isn't cancelling.
+   * The cascade below is charged only to the runs that ACTUALLY timed out, which are rare by
+   * construction; the scan itself is unchanged.
+   *
+   * The subtree, though, has no reason to differ, and before this it did: a timed-out parent's
+   * children kept running with the parent gone and nothing pointing at them — a silent orphan you
+   * could only find by reading the runs table by hand. {@link cancelChildren} is the SAME recursive
+   * walk `cancel` uses, so children of children go too, and it inherits that path's two guards:
+   * `cancel` returns early on a run that is already `completed`/`cancelled`/`dead` (a child that beat
+   * the sweep to the finish is never clobbered, and a re-cancel is a no-op), and it writes the
+   * parent's terminal status BEFORE recursing, so a cyclic parent→child graph terminates on the
+   * second visit instead of looping. Two pollers sweeping the same run concurrently therefore write
+   * the same terminal state twice and cascade into already-cancelled children — idempotent, not
+   * corrupting. The one window it does NOT close is the pre-existing check-then-write race an
+   * explicit `cancel` has always had (a child that completes between `cancel`'s read and its write);
+   * closing that needs a compare-and-set in the store contract, not a change here.
+   *
+   * Cascade failures are swallowed per subtree for the same reason `cancelChildren` swallows them per
+   * child: one unreachable child must not abort the sweep and leave every LATER timed-out run alive.
    */
   async sweepTimeouts(now: number = this.clock()): Promise<void> {
     for (const reg of new Set(this.latest.values())) {
@@ -1312,6 +1379,8 @@ export class WorkflowEngine {
           namespace: run.namespace,
           error,
         });
+        // The parent is terminal FIRST (above), so a child that cascades back into it stops there.
+        await this.cancelChildren(run.id).catch(() => undefined);
       }
     }
   }
@@ -2203,6 +2272,10 @@ export class WorkflowEngine {
    * `child:<id>` waiter) and fire-and-forget (`ctx.startChild`, found via its `spawn:<id>`
    * checkpoint). Recursive, so a whole subtree is cancelled; the terminal guard in `cancel` stops it
    * at finished / already-cancelled runs (no loops, no re-cancel).
+   *
+   * Two callers, deliberately the same walk: an explicit {@link cancel}, and {@link sweepTimeouts}
+   * when a parent hits its `executionTimeout` — a timed-out parent's subtree dies the same way an
+   * explicitly cancelled one's does, or the children are orphans nobody is holding a reference to.
    */
   private async cancelChildren(
     parentRunId: string,
@@ -3536,8 +3609,14 @@ export class WorkflowEngine {
       // namespace) is the one executing the parent. Otherwise an operator recovery-resuming a
       // `davi-local` pipeline would stamp its `processing` child `default` and it would leak off the
       // tenant's worker pool onto the shared/dev workers.
-      startChild: (workflow, input, id, priority) => {
-        this.startChildDeferred(workflow, input, id, { priority, namespace: parentNamespace });
+      startChild: (workflow, input, id, priority, version) => {
+        this.startChildDeferred(workflow, input, id, {
+          priority,
+          namespace: parentNamespace,
+          // Absent unless the body pinned one (`ctx.child(ref, input, { version })`) — an omitted
+          // pin must stay omitted, so the child keeps resolving `latest` exactly as before.
+          version,
+        });
       },
       // Deferred for the same reentrancy reason as `startChild` above. `cancel()` is already
       // idempotent on a terminal/cancelled run (returns its existing status without side effects), so

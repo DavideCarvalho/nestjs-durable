@@ -386,6 +386,11 @@ the timer poller cancels an overrunning run (status `cancelled`, reason `executi
 export class ApprovalWorkflow { /* … */ }
 ```
 
+A timed-out run takes its **children** with it, the same way an explicit `cancel` does — the whole
+subtree, depth-first, skipping any child that already finished. Otherwise a child outlives the parent
+that spawned it with nothing left pointing at it, and the only way to find it is to read the runs
+table by hand.
+
 The cap is enforced by `engine.sweepTimeouts`, which the NestJS `TimerPoller` calls every tick — so a
 driving operator instance must be running (not `drive: false`) for it to fire, exactly like durable
 timers and retention. See [Scheduling](/docs/authoring/scheduling) for the poller, and

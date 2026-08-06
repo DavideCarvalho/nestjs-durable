@@ -789,5 +789,73 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(aRuns).toBe(1);
       },
     );
+
+    t('starts the version the caller pinned, and refuses one that is not registered', async () => {
+      const engine = new WorkflowEngine({ store });
+      const ran: string[] = [];
+      engine.register('vwf', '1', async () => {
+        ran.push('v1');
+        return 'v1-output';
+      });
+      engine.register('vwf', '2', async () => {
+        ran.push('v2');
+        return 'v2-output';
+      });
+
+      await engine.start('vwf', {}, 'pinned-run', { version: '1' });
+      const pinned = await engine.waitForRun('pinned-run', { timeoutMs: 20_000 });
+
+      // The OLDER body ran and the store recorded the older version — so this run's every future
+      // resume replays v1 too. Asserted against a real store because the version is what the row
+      // must carry, not just what the in-process registry believed at start.
+      expect(pinned.output).toBe('v1-output');
+      expect(ran).toEqual(['v1']);
+      expect((await store.getRun('pinned-run'))?.workflowVersion).toBe('1');
+
+      // Unpinned is unchanged: newest wins.
+      await engine.start('vwf', {}, 'newest-run');
+      expect((await engine.waitForRun('newest-run', { timeoutMs: 20_000 })).output).toBe(
+        'v2-output',
+      );
+
+      // An unregistered version fails BEFORE a row exists — never a silent fall back to v2.
+      await expect(engine.start('vwf', {}, 'ghost-run', { version: '9' })).rejects.toThrow(
+        /vwf@9 is not registered/,
+      );
+      expect(await store.getRun('ghost-run')).toBeNull();
+    });
+
+    t('cancels a timed-out run’s live child subtree, not just the run itself', async () => {
+      const engine = new WorkflowEngine({ store });
+      // Only the parent is timed: a child reaching a terminal state can only be the cascade.
+      engine.register('t-grandchild', '1', async (ctx) => ctx.waitForSignal('never'));
+      engine.register('t-child', '1', async (ctx) => {
+        await ctx.startChild('t-grandchild', {}, 'tgc');
+        return ctx.waitForSignal('never');
+      });
+      engine.register(
+        't-parent',
+        '1',
+        async (ctx) => {
+          await ctx.startChild('t-child', {}, 'tc');
+          return ctx.waitForSignal('never');
+        },
+        { executionTimeout: '1h' },
+      );
+
+      await engine.start('t-parent', {}, 'tp');
+      for (const id of ['tp', 'tc', 'tgc']) {
+        expect((await engine.waitForRun(id, { timeoutMs: 20_000 })).status).toBe('suspended');
+      }
+
+      await engine.sweepTimeouts(Date.now() + 3_700_000);
+
+      const parent = await store.getRun('tp');
+      expect(parent?.status).toBe('cancelled');
+      expect(parent?.error?.code).toBe('execution_timeout');
+      // Both levels — the cascade is the same recursive walk an explicit `cancel` uses.
+      expect((await store.getRun('tc'))?.status).toBe('cancelled');
+      expect((await store.getRun('tgc'))?.status).toBe('cancelled');
+    });
   });
 }
