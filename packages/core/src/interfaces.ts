@@ -965,6 +965,19 @@ export interface Transport {
    */
   readWorkerDescriptors?(group: string): Promise<WorkerDescriptor[]>;
   /**
+   * Every live {@link WorkerDescriptor} in the deployment, across all groups — the read behind
+   * {@link WorkflowEngine.announcedWorkflows}. Optional, same as {@link readWorkerDescriptors}: a
+   * transport that cannot introspect the advertisement keyspace returns nothing and the registry is
+   * simply empty.
+   *
+   * Deliberately NOT `listWorkerGroups()` + a read per group: a worker publishes the SAME descriptor
+   * under every token it consumes, so per-group reads cost one round trip per group to re-fetch bytes
+   * the caller already has. One pass over the advertisement keyspace, de-duplicated by `instanceId`,
+   * answers with one scan and no per-group fan-out — and it also sees an instance whose groups the
+   * caller could not have enumerated.
+   */
+  readAllWorkerDescriptors?(): Promise<WorkerDescriptor[]>;
+  /**
    * DB-less tenant worker → control plane: publish a {@link StartRunMessage} requesting a new run.
    * Optional — only transports that carry the hosted-control-plane protocol (P4) implement this.
    * The message is enqueued on `<effectivePrefix>-start-run`; the control plane's

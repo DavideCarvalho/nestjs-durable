@@ -2,7 +2,11 @@ import { hostname } from 'node:os';
 import {
   type SearchAttributes,
   type StartRunMessage,
+  type WorkerDescriptor,
+  type WorkflowRegistration,
   type WorkflowStepEvent,
+  describeWorker,
+  descriptorHash,
   sanitizeQueueToken,
   tenantGroup,
 } from '@dudousxd/nestjs-durable-core';
@@ -19,6 +23,7 @@ import {
   startRunName,
   stepEventsName,
   tasksName,
+  workerDescriptorKey,
   workerHeartbeatKey,
 } from './runner-core';
 
@@ -192,6 +197,48 @@ function workerConnection(connection: RedisConnection): RedisConnection {
   return connection;
 }
 
+/** SDK identity stamped into the descriptor this runner advertises (observability only, never gates
+ *  dispatch — see `WorkerDescriptor.sdk`). */
+const SDK_NAME = '@dudousxd/durable-worker';
+
+/** Process start time (epoch ms), captured once at import. Part of the descriptor's content hash, so
+ *  a restart changes the ETag and a control plane re-reads (design §7.2). Mirrors the Python SDK's
+ *  module-level `_PROCESS_STARTED_AT_MS` and the BullMQ transport's per-instance `startedAt`. */
+const PROCESS_STARTED_AT = Date.now();
+
+/**
+ * This runner's handshake descriptor (design §7.1), including the workflows it ANNOUNCES it can
+ * execute (§7.9). Each announcement's `group` is the token the runner subscribes for that workflow —
+ * `tenantGroup(sanitizeQueueToken(name), partition)`, the SAME expression that built the queue this
+ * process consumes — so the group is a queue this worker really reads, not a claim about one.
+ *
+ * Only workflows are announced. Step handler names still ride `steps` for capability routing, but
+ * they are not an invocable catalog: a step is addressable only as a `(runId, seq)` position inside
+ * one workflow's history (see the "steps are out of scope" note in core's `handshake/announced`).
+ */
+export function buildRunnerDescriptor(
+  runtime: DurableWorkerRuntime,
+  instanceId: string,
+  partition?: string,
+  startedAt: number = PROCESS_STARTED_AT,
+): WorkerDescriptor {
+  const { workflows, steps } = runtime.registeredNames();
+  const registrations: WorkflowRegistration[] = runtime.workflowRegistrations().map((reg) => ({
+    ...reg,
+    group: tenantGroup(sanitizeQueueToken(reg.name), partition),
+  }));
+  return describeWorker({
+    instanceId,
+    runtime: 'node',
+    sdk: { name: SDK_NAME, version: '0' },
+    steps,
+    workflows,
+    registrations,
+    startedAt,
+    partition,
+  });
+}
+
 /**
  * Start one BullMQ `Worker` per name in `runtime.registeredNames()` (workflows ∪ steps, deduped),
  * each consuming `<prefix>-tasks-<sanitized-name>[@<partition>]`, and drive the
@@ -206,8 +253,10 @@ function workerConnection(connection: RedisConnection): RedisConnection {
  *
  * It also (best-effort): subscribes to `<prefix>-control` and feeds cancellation into the replay's
  * `isCancelled`; streams each local step's lifecycle onto `<prefix>-step-events`; and stamps a TTL'd
- * worker-liveness heartbeat key PER subscribed name. None of these can block the worker from
- * starting or processing.
+ * worker-liveness heartbeat key PER subscribed name, alongside the full handshake descriptor
+ * ({@link buildRunnerDescriptor}) that ANNOUNCES the workflows this worker can execute — same key
+ * TTL, same beat, so the announcement cannot outlive the worker. None of these can block the worker
+ * from starting or processing.
  *
  * `await close()` on the returned handle to drain + stop every worker, the queues, and pub/sub.
  */
@@ -320,12 +369,36 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       // One TTL'd key PER subscribed name/partition token, so `listWorkerGroups()` reports liveness
       // per queue rather than one blended signal for a process that may serve several handlers.
       const keys = queueTokens.map((token) => workerHeartbeatKey(prefix, token, instanceId));
+      const descriptorKeys = queueTokens.map((token) =>
+        workerDescriptorKey(prefix, token, instanceId),
+      );
+      // This worker's handshake descriptor, including what it ANNOUNCES it can execute (design
+      // §7.9). Built ONCE: the registration surface is fixed before the first task is consumed (both
+      // Nest registrars run in `onModuleInit`, this runner starts in `onApplicationBootstrap`), so
+      // rebuilding it per beat would re-serialize identical bytes every 10s for nothing. The ETag is
+      // hashed once for the same reason and reused on every beat.
+      const descriptor = buildRunnerDescriptor(runtime, instanceId, partition);
+      const descriptorJson = JSON.stringify(descriptor);
+      const etag = descriptorHash(descriptor);
       const beat = () => {
-        // The heartbeat value is now `{ts,status}` JSON (was a bare ms timestamp) — readers accept
-        // both. The status is the controller's live snapshot, refreshed cheaply on every beat.
-        const value = JSON.stringify({ ts: Date.now(), status: controller.snapshot() });
+        // The heartbeat value is now `{ts,status,descriptorHash}` JSON (was a bare ms timestamp) —
+        // readers accept both. The status is the controller's live snapshot, refreshed cheaply on
+        // every beat; the hash is the two-tier ETag that tells a control plane when to re-read the
+        // full descriptor below (design §7.2).
+        const value = JSON.stringify({
+          ts: Date.now(),
+          status: controller.snapshot(),
+          descriptorHash: etag,
+        });
         for (const key of keys) {
           void heartbeatClient?.set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS).catch(() => {});
+        }
+        // Refreshed on the SAME beat and with the SAME TTL as the liveness key, so this worker's
+        // announcements cannot outlive its liveness: stop beating and both expire together.
+        for (const key of descriptorKeys) {
+          void heartbeatClient
+            ?.set(key, descriptorJson, 'EX', WORKER_HEARTBEAT_TTL_SECONDS)
+            .catch(() => {});
         }
       };
       beat(); // fire immediately so a fresh worker is visible without waiting a full interval

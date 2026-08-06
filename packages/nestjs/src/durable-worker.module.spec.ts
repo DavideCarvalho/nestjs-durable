@@ -50,6 +50,14 @@ class ChargeWorker {
   }
 }
 
+/** A workflow whose decorator states the announcement axes a picker reads. */
+@Workflow({ name: 'announced', version: '3', requires: ['saga'] })
+class AnnouncedWorkflow {
+  async run(_ctx: WorkflowCtx, input: unknown) {
+    return input;
+  }
+}
+
 @Workflow({ name: 'w', version: '1' })
 class WWorkflow {
   async run(_ctx: WorkflowCtx, input: unknown) {
@@ -141,6 +149,27 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
       expect(stepOut.result.status).toBe('completed');
       expect(stepOut.result.output).toEqual({ chargeId: 'ch_42' });
     }
+
+    await moduleRef.close();
+  });
+
+  it("announces each @Workflow's version + requires, so the fleet registry is not name-only", async () => {
+    const runner = fakeRunner();
+    const moduleRef = await Test.createTestingModule({
+      imports: [DurableModule.forRoot({ connection: 'redis://x' })],
+      providers: [AnnouncedWorkflow],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.runRedisWorker)
+      .compile();
+    await moduleRef.init();
+
+    // What the decorator declares is what this worker announces (handshake §7.9) — the runner turns
+    // it into the descriptor's `registrations`, adding the queue token it subscribed.
+    const [registration] = moduleRef.get(DurableWorkerRuntime).workflowRegistrations();
+    expect(registration?.name).toBe('announced');
+    expect(registration?.version).toBe('3');
+    expect(registration?.requires).toEqual(['saga']);
 
     await moduleRef.close();
   });

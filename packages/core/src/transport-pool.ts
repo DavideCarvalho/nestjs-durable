@@ -125,6 +125,30 @@ export class TransportPool {
     return descriptors;
   }
 
+  /**
+   * Every live descriptor in the deployment, merged across every transport that can report them and
+   * de-duplicated by `instanceId` — one worker publishes the same descriptor under each token it
+   * consumes, and it must count once. Returns `[]` when no transport implements
+   * {@link Transport.readAllWorkerDescriptors} (a pure in-process pool advertises nothing).
+   *
+   * First writer wins on a duplicate id: the copies are the same bytes by construction (one process,
+   * one descriptor, published N times), so there is nothing to choose between. Two DIFFERENT
+   * processes sharing an `instanceId` would collapse into one here — that is a misconfiguration the
+   * fleet already suffers from (they also share heartbeat and descriptor keys, so they overwrite each
+   * other's advertisement), not something this read can repair.
+   */
+  async readAllWorkerDescriptors(): Promise<WorkerDescriptor[]> {
+    const byInstance = new Map<string, WorkerDescriptor>();
+    for (const { transport } of this.transports) {
+      if (!transport.readAllWorkerDescriptors) continue;
+      for (const descriptor of await transport.readAllWorkerDescriptors()) {
+        if (!byInstance.has(descriptor.instanceId))
+          byInstance.set(descriptor.instanceId, descriptor);
+      }
+    }
+    return [...byInstance.values()];
+  }
+
   /** Distinct worker groups with a live heartbeat, merged across every transport that can report it. */
   async listWorkerGroups(): Promise<string[]> {
     const groups = new Set<string>();

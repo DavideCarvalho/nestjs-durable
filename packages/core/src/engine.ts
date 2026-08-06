@@ -25,10 +25,12 @@ import {
 } from './events';
 import { runDurableExecution } from './execution-hooks';
 import {
+  type AnnouncedWorkflow,
   type BlockedDispatch,
   type DispatchPlan,
   type WorkerDescriptor,
   WorkflowBlocked,
+  aggregateAnnouncements,
   controlPlaneDescriptor,
   planDispatch,
 } from './handshake/index';
@@ -2287,6 +2289,33 @@ export class WorkflowEngine {
       out.push({ ...health, kind: workflowTokens.has(baseToken) ? 'workflow' : 'step' });
     }
     return out;
+  }
+
+  /**
+   * What workflows the LIVE fleet announces it can execute — the deployment-wide registry a picker
+   * ("call this existing workflow") needs, and the one question this engine's own registry cannot
+   * answer. {@link workflowBody} answers only for this process, and a missing body is ambiguous: it
+   * means "not registered here", but equally "registered via {@link registerRemote} against another
+   * SDK" or "a group resolved by convention against a worker". An inferred answer would therefore
+   * differ per replica. This one does not: every pod folds the same published announcements.
+   *
+   * Scoped like every other poll surface — an engine WITH a `namespace` sees only workers in it, and
+   * an operator (namespace unset) sees the whole deployment ("ver tudo = ausência de namespace"). A
+   * descriptor that states no namespace is `default`, matching how a single-tenant fleet publishes.
+   *
+   * Cost: one advertisement scan per CALL, on demand. Nothing is added to the poll loop and nothing
+   * is retained — no pod holds a table of the fleet's registrations. Empty when no transport can
+   * introspect the advertisement keyspace (a pure in-process transport advertises nothing).
+   *
+   * Workflows only, and deliberately: see the "steps are out of scope" note in `handshake/announced`.
+   */
+  async announcedWorkflows(): Promise<AnnouncedWorkflow[]> {
+    const descriptors = await this.pool.readAllWorkerDescriptors();
+    const mine =
+      this.namespace === undefined
+        ? descriptors
+        : descriptors.filter((d) => (d.namespace ?? 'default') === this.namespace);
+    return aggregateAnnouncements(mine);
   }
 
   /**

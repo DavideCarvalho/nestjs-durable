@@ -108,8 +108,15 @@ export class InAppWorkerBootstrap
   onModuleInit(): void {
     if (!isCoLocatedWorker(this.options)) return;
     // Register the same TS bodies the engine serves group-served, so the consumer can replay them.
-    scanWorkflows(this.discovery, (meta, instance) =>
-      this.runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input)),
+    // The metadata rides along as this worker's ANNOUNCEMENT of what it can execute (design §7.9):
+    // co-located or not, the process that CONSUMES the queue is the one entitled to announce the
+    // workflow, and here that is this runtime — not the engine sharing its process.
+    scanWorkflows(this.discovery, (meta, instance, origin) =>
+      this.runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input), {
+        version: meta.version,
+        ...(meta.requires !== undefined ? { requires: meta.requires } : {}),
+        ...(origin !== undefined ? { origin } : {}),
+      }),
     );
     scanSteps(this.discovery, this.metadataScanner, (meta, handler) =>
       this.runtime.registerStep(meta.name, handler),

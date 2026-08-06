@@ -705,6 +705,9 @@ class WorkflowWorker:
         # ``"default"`` keeps names byte-identical to the un-namespaced scheme.
         self.namespace = namespace
         self._workflows: Dict[str, WorkflowFn] = {}
+        # What each workflow ANNOUNCES about itself beyond its name (design §7.9) — see
+        # :meth:`workflow`. Read by the runner's ``_build_descriptor``; never by replay.
+        self._workflow_meta: Dict[str, Dict[str, Any]] = {}
         # Auto-register into the module-level registry so :func:`~durable_worker.worker.run_all` can
         # discover this worker. Opt out with ``auto_register=False``. Importing from ``.worker`` here
         # is safe: ``worker.py`` imports ``workflow.py`` only inside functions, so there's no cycle.
@@ -713,11 +716,30 @@ class WorkflowWorker:
 
             register_worker(self)
 
-    def workflow(self, name: str) -> Callable[[WorkflowFn], WorkflowFn]:
-        """Decorator registering ``fn`` as the workflow ``name``. ``fn(ctx, input)`` (or ``fn(ctx)``)."""
+    def workflow(
+        self,
+        name: str,
+        *,
+        version: Optional[str] = None,
+        requires: Optional[List[str]] = None,
+        origin: Optional[str] = None,
+    ) -> Callable[[WorkflowFn], WorkflowFn]:
+        """Decorator registering ``fn`` as the workflow ``name``. ``fn(ctx, input)`` (or ``fn(ctx)``).
+
+        ``version`` / ``requires`` / ``origin`` are announcement metadata only — identical in meaning
+        to :meth:`durable_worker.worker.Worker.workflow`'s (design §7.9), and equally optional."""
 
         def register(fn: WorkflowFn) -> WorkflowFn:
             self._workflows[name] = fn
+            meta: Dict[str, Any] = {}
+            if version is not None:
+                meta["version"] = version
+            if requires is not None:
+                meta["requires"] = list(requires)
+            if origin is not None:
+                meta["origin"] = origin
+            if meta:
+                self._workflow_meta[name] = meta
             return fn
 
         return register

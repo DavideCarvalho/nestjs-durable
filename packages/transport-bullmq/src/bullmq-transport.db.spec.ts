@@ -181,6 +181,58 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
     await transport.close();
   }, 30_000);
 
+  it('reads EVERY live descriptor across groups, so the engine can list what the fleet announces', async (ctx) => {
+    const connection = liveConnection(ctx);
+    const prefix = `durtest-${Date.now()}-a`;
+    const admin = new Redis(connection);
+
+    // A real in-app worker: `handle()` starts its advertisement, one descriptor key per token.
+    const local = new BullMQTransport({ connection, prefix, instanceId: 'ts-local' });
+    local.handle('payments.charge-card', async () => ({}));
+    local.handle('payments.refund', async () => ({}));
+
+    // A cross-SDK worker, written the way a Python worker writes it: same key scheme, announcing a
+    // workflow it serves. The control plane never learns this from a registration of its own.
+    const pythonDescriptor = {
+      instanceId: 'py-1',
+      runtime: 'python',
+      sdk: { name: 'durable-worker', version: '0.23.0' },
+      protocol: { version: 1, range: [1, 1] },
+      capabilities: ['saga'],
+      workflows: ['pipeline'],
+      steps: [],
+      registrations: [{ name: 'pipeline', version: '2', group: 'pipeline', origin: 'flip' }],
+      startedAt: 1,
+    };
+    await admin.set(
+      `${prefix}-worker-descriptor:pipeline:py-1`,
+      JSON.stringify(pythonDescriptor),
+      'EX',
+      35,
+    );
+
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport: local });
+    // Wait for the in-app worker's first beat to land, then assert BOTH sides are visible from one
+    // scan — the local one under two tokens, counted once.
+    await waitUntil(async () => (await local.readAllWorkerDescriptors()).length >= 2);
+    const descriptors = await local.readAllWorkerDescriptors();
+    expect(descriptors.map((d) => d.instanceId).sort()).toEqual(['py-1', 'ts-local']);
+
+    const announced = await engine.announcedWorkflows();
+    expect(announced.map((a) => a.key)).toEqual(['pipeline@2']);
+    expect(announced[0]?.instances).toEqual(['py-1']);
+    expect(announced[0]?.groups).toEqual(['pipeline']);
+    expect(announced[0]?.origins).toEqual(['flip']);
+
+    // Liveness IS the key's TTL: drop the key and the announcement is gone on the next read, with
+    // no expiry bookkeeping anywhere in the engine.
+    await admin.del(`${prefix}-worker-descriptor:pipeline:py-1`);
+    expect(await engine.announcedWorkflows()).toEqual([]);
+
+    await admin.quit();
+    await local.close();
+  }, 30_000);
+
   it('reports a failed result when the worker handler throws', async (ctx) => {
     const connection = liveConnection(ctx);
     const prefix = `durtest-${Date.now()}-f`;

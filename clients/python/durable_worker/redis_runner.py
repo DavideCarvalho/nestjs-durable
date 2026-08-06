@@ -114,16 +114,44 @@ def _descriptor_key(prefix: str, group: str) -> str:
     return f"{prefix}-worker-descriptor:{group}:{_INSTANCE_ID}"
 
 
-def _build_descriptor(worker: Any, partition: "str | None", namespace: "str | None") -> Any:
+def _build_descriptor(
+    worker: Any,
+    partition: "str | None",
+    namespace: "str | None",
+    group_of: "Optional[Callable[[str], str]]" = None,
+) -> Any:
     """Build this Python worker's :class:`WorkerDescriptor` (handshake design §7.1): ``runtime='python'``,
     ``instanceId=py-<host>-<pid>``, its registered workflow/step handler names, and the durable
     capabilities a Python execution worker provides. The shape is byte-identical to the adonis + nestjs
-    descriptors so a polyglot control-plane can negotiate + route to it."""
+    descriptors so a polyglot control-plane can negotiate + route to it.
+
+    It also ANNOUNCES what this worker can EXECUTE (design §7.9) as ``registrations``: one entry per
+    registered workflow, carrying whatever ``@worker.workflow(...)`` was told (version / requires /
+    origin — all optional, and an un-stated one stays un-stated) plus the group that workflow's turns
+    are dispatched to. ``group_of`` maps a workflow name to that group and MUST be the caller's own
+    queue expression, because only the caller knows which queue it subscribed: the unified worker
+    consumes one queue per name, while the split :class:`WorkflowWorker` consumes a single group for
+    all of them. Omit it and the announcement simply states no group rather than guessing one.
+
+    Steps are advertised (``steps``) but never announced as registrations: a step is addressable only
+    as a ``(runId, seq)`` position inside one workflow's history, so "call this step" is not an
+    operation the engine offers (see the note in the TS ``handshake/announced``)."""
     from . import __version__ as _sdk_version
-    from .handshake import LEGACY_V1_CAPABILITIES, WorkerDescriptor
+    from .handshake import LEGACY_V1_CAPABILITIES, WorkerDescriptor, WorkflowRegistration
 
     workflows = sorted(getattr(worker, "_workflows", {}).keys())
     steps = sorted(getattr(worker, "_handlers", {}).keys())
+    meta: Dict[str, Dict[str, Any]] = getattr(worker, "_workflow_meta", {})
+    registrations = [
+        WorkflowRegistration(
+            name=name,
+            version=meta.get(name, {}).get("version"),
+            group=group_of(name) if group_of is not None else None,
+            requires=meta.get(name, {}).get("requires"),
+            origin=meta.get(name, {}).get("origin"),
+        )
+        for name in workflows
+    ]
     return WorkerDescriptor(
         instance_id=_INSTANCE_ID,
         runtime="python",
@@ -136,6 +164,10 @@ def _build_descriptor(worker: Any, partition: "str | None", namespace: "str | No
         partition=partition if partition else None,
         namespace=namespace if namespace and namespace != "default" else None,
         started_at=int(_PROCESS_STARTED_AT_MS),
+        # Omitted (not ``[]``) when there is nothing to announce, matching the TS ``describeWorker``:
+        # a step-only worker's descriptor then stays BYTE-IDENTICAL to what it published before this
+        # field existed, so upgrading the SDK does not churn its ETag.
+        registrations=registrations or None,
     )
 
 
@@ -361,8 +393,10 @@ async def run_redis_workflow_worker(
         )
         return decision
 
-    # Advertise the handshake descriptor alongside the liveness heartbeat (design §7.2).
-    descriptor = _build_descriptor(workflow_worker, None, namespace)
+    # Advertise the handshake descriptor alongside the liveness heartbeat (design §7.2). EVERY
+    # workflow on this worker is served from the ONE `group` queue consumed above (the split
+    # WorkflowWorker's model), so that is the group each announcement states — not a per-name token.
+    descriptor = _build_descriptor(workflow_worker, None, namespace, lambda _name: group)
     await _start_heartbeat(connection, effective_prefix, group, None, descriptor)
     return BullWorker(tasks_name, process, {"connection": connection})
 
@@ -573,7 +607,14 @@ async def run_redis_worker(
     bull_workers: "list[Any]" = []
     # Handshake descriptor advertised alongside every per-name heartbeat (design §7.2): the
     # control-plane negotiates + capability-routes against it and re-reads only when its ETag changes.
-    descriptor = _build_descriptor(worker, partition, namespace)
+    # Each workflow announcement states the queue token THIS loop subscribes for that name below, so
+    # the announced group is a queue the worker really reads.
+    descriptor = _build_descriptor(
+        worker,
+        partition,
+        namespace,
+        lambda name: _tenant_group(sanitize_queue_token(name), partition),
+    )
     for name in names:
         queue_group = _tenant_group(sanitize_queue_token(name), partition)
         tasks_name, _ = _names(effective_prefix, queue_group)
