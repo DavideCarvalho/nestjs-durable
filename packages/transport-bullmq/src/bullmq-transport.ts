@@ -80,6 +80,35 @@ const SUBSCRIBER_PING_TIMEOUT_MS = 5_000;
 // caller-supplied instance inherits whatever the caller configured, so the ping watchdog (which works
 // regardless of keepalive) is the layer that must catch a silent loss either way.
 const DEFAULT_KEEPALIVE_MS = 10_000;
+// Default `closeTimeoutMs` (see `BullMQTransportOptions`): how long `close()` waits on the graceful
+// BullMQ closes before dropping the connections anyway. Generous enough that a healthy close (single
+// -digit ms in practice) is never cut short, small enough that a wedged one cannot hold a pod's
+// termination grace period or a test suite's teardown.
+const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
+
+/**
+ * Resolve when `work` settles or when `ms` elapses, whichever comes first — the loser is abandoned,
+ * never cancelled (there is nothing cancellable about a wedged `Worker.close()`).
+ *
+ * The timer is `unref`'d so that IT never becomes the reason the process stays alive: this runs on
+ * the shutdown path, and a pending 5s ref'd timer would add 5s to every clean exit.
+ *
+ * `ms <= 0` skips the wait entirely rather than scheduling a 0ms timer, so `closeTimeoutMs: 0` means
+ * "don't wait at all" instead of "wait one tick".
+ */
+async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
+  if (ms <= 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+  try {
+    await Promise.race([work.then(() => undefined), expiry]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /**
  * Normalise the `pingIntervalMs` option: `undefined` → the default interval, `0`/`false` → disabled
@@ -241,6 +270,25 @@ export interface BullMQTransportOptions {
    */
   pingIntervalMs?: number | false;
   /**
+   * Wall-clock ceiling (ms) {@link BullMQTransport.close} gives the graceful BullMQ worker/queue
+   * closes before it stops waiting on them and tears the Redis connections down anyway. Default
+   * `5_000`. Pass `0` to skip the graceful wait entirely.
+   *
+   * This exists because a graceful `Worker.close()` does not always come back. It waits for the
+   * current job AND for the blocking connection to be released, and if the worker is still coming
+   * up — which is what a CPU-starved box (a 2-vCPU CI runner, a throttled container) produces — that
+   * wait has no upper bound. Observed directly: across one run, 20 transports closed in 4-46ms
+   * (median 5ms) and 3 sat in `close()` for 120s, which was simply where the probe gave up. The
+   * distribution is bimodal, never in between — this is a wedge, not slowness, so no fixed budget
+   * "usually" covers it.
+   *
+   * Escalating is not an option: BullMQ's `Worker.close()` memoizes its own promise
+   * (`if (this.closing) return this.closing`), so a later `close(true)` returns the SAME pending
+   * promise rather than forcing anything. Once a graceful close wedges, the only way out is to stop
+   * awaiting it and drop the sockets — which is what the timeout does.
+   */
+  closeTimeoutMs?: number;
+  /**
    * Wall-clock ceiling (ms) for a single step handler on THIS worker. A wedged handler — an await
    * that will never settle (dead connection swallowed by a wrapper stream, an external call with no
    * timeout) — otherwise holds its BullMQ job forever: the lock renews on a timer regardless of
@@ -324,6 +372,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly subscribers = new Set<Redis>();
   private pingWatchdogTimer?: ReturnType<typeof setInterval>;
   private readonly pingIntervalMs: number | false;
+  private readonly closeTimeoutMs: number;
   private readonly stepTimeoutMs: number | undefined;
 
   constructor(options: BullMQTransportOptions) {
@@ -334,6 +383,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
     this.concurrency = options.concurrency;
     this.pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
+    this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.stepTimeoutMs = options.stepTimeoutMs;
   }
 
@@ -1139,19 +1189,47 @@ export class BullMQTransport implements Transport, ControlPlane {
     };
   }
 
-  /** Close all workers and queues so the process can exit. */
+  /**
+   * Close all workers and queues so the process can exit.
+   *
+   * Structured so that ONE wedged worker cannot strand the shutdown. Three properties, all
+   * load-bearing:
+   *
+   * 1. **Bounded.** Every graceful close races {@link BullMQTransportOptions.closeTimeoutMs}. A
+   *    `Worker.close()` that never settles (see that option's doc for why it happens and why
+   *    `close(true)` cannot rescue it) stops being awaited instead of hanging the caller forever.
+   * 2. **Concurrent, not sequential.** These used to be six sequential `await`s, so the FIRST wedged
+   *    worker also prevented the other five — and the queues — from ever being asked to close. The
+   *    budget is now spent once for all of them, not once each.
+   * 3. **The disconnects always run.** They were previously unreachable whenever any close hung,
+   *    which is the part that actually stranded the process: the sockets stayed up, so the blocking
+   *    connection that caused the wedge was never dropped either. They are synchronous and
+   *    unconditional now, and they are what lets the event loop drain.
+   *
+   * Abandoning a close is safe here in the sense that matters: the engine drains in-flight runs
+   * BEFORE the transport is closed (the operator's shutdown hook calls `engine.drain()` first), so
+   * what is dropped is a worker that is not going to come back on its own regardless.
+   */
   async close(): Promise<void> {
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
     if (this.pingWatchdogTimer) clearInterval(this.pingWatchdogTimer);
     this.subscribers.clear();
     this.workerController?.stop();
-    await Promise.all([...this.taskWorkers.values()].map((w) => w.close()));
-    await this.resultsWorker?.close();
-    await this.decisionsWorker?.close();
-    await this.stepEventsWorker?.close();
-    await this.startRunWorker?.close();
-    await this.runRequestWorker?.close();
-    await Promise.all([...this.queues.values()].map((q) => q.close()));
+    const closers: Array<Promise<void> | undefined> = [
+      ...[...this.taskWorkers.values()].map((w) => w.close()),
+      this.resultsWorker?.close(),
+      this.decisionsWorker?.close(),
+      this.stepEventsWorker?.close(),
+      this.startRunWorker?.close(),
+      this.runRequestWorker?.close(),
+      ...[...this.queues.values()].map((q) => q.close()),
+    ];
+    // `allSettled`, so one rejecting close does not mask the rest; the race bounds the whole set.
+    // A rejection here is not actionable during shutdown — the connections come down either way.
+    await withTimeout(
+      Promise.allSettled(closers.filter((p) => p !== undefined)),
+      this.closeTimeoutMs,
+    );
     this.controlPub?.disconnect();
     this.controlSub?.disconnect();
     this.heartbeatPub?.disconnect();
