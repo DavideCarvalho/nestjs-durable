@@ -137,7 +137,10 @@ export function buildWorkflowDirectory(input: {
   }
 
   const declared = aggregateAnnouncements(ownDescriptors);
-  const observed = observedAnnouncements(ownBeats, coveredTokens(declared, sanitize));
+  const observed = observedAnnouncements(
+    ownBeats,
+    coveredTokens(declared, ownDescriptors, sanitize),
+  );
   const workflows = [...declared, ...observed].sort((a, b) => a.key.localeCompare(b.key));
   const otherPartitions: PartitionSighting[] = [...foreign.entries()]
     .map(([partition, seen]) => ({
@@ -155,6 +158,15 @@ export function buildWorkflowDirectory(input: {
   };
 }
 
+/** A few names plus a count, for prose. Route-by-handler gives every step its own queue, so one
+ *  partitioned worker can be beating on dozens of tokens and inlining them all makes the sentence
+ *  unreadable — measured at 17 on a single live worker. The complete list stays on
+ *  {@link PartitionSighting.groups}, where a caller that wants it can read it in full. */
+function summarize(names: readonly string[], limit = 3): string {
+  if (names.length <= limit) return names.join(', ');
+  return `${names.slice(0, limit).join(', ')} and ${names.length - limit} more`;
+}
+
 /** The one sentence a picker shows. Says which of the states the reader is in, and — when nothing is
  *  callable but something IS beating elsewhere — names the partition, because that is the difference
  *  between "start a worker" and "the worker you started is on the wrong partition". */
@@ -168,8 +180,10 @@ function describeDirectory(
     otherPartitions.length === 0
       ? ''
       : ` Live workers were seen on ${otherPartitions
-          .map((p) => `"${p.partition}" (${p.groups.join(', ')})`)
-          .join(', ')}, which ${here} does not route to — a worker on the wrong partition looks exactly like no worker at all, so it is named here rather than left out.`;
+          .map((p) => `"${p.partition}" (${summarize(p.groups)})`)
+          .join(
+            ', ',
+          )}, which ${here} does not route to — a worker on the wrong partition looks exactly like no worker at all, so it is named here rather than left out.`;
 
   if (workflows.length === 0) {
     return `The fleet was asked just now and nothing is live in ${here}, so this list is empty because the deployment is empty — not because the question could not be put.${elsewhere}`;

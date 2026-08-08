@@ -1112,7 +1112,9 @@ export class WorkflowEngine {
         createdAt: new Date(),
         updatedAt: new Date(),
       };
-      registered = await this.resolveRemoteByConvention(conventionRun, { askFleetForVersion: true });
+      registered = await this.resolveRemoteByConvention(conventionRun, {
+        askFleetForVersion: true,
+      });
     }
     if (!registered) {
       throw new Error(

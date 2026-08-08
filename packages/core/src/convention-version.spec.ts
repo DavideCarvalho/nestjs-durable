@@ -72,7 +72,10 @@ describe('a convention-resolved remote records the version the FLEET declares', 
   it('says so when the fleet declares NO version, instead of wearing an invented one', async () => {
     const store = new InMemoryStateStore();
     // The deployed shape: a live group, and a worker too old to publish a descriptor for it.
-    const engine = new WorkflowEngine({ store, transport: new ConventionTransport(['processing']) });
+    const engine = new WorkflowEngine({
+      store,
+      transport: new ConventionTransport(['processing']),
+    });
 
     await engine.start('processing', { proc: 'all' }, 'run-2');
 

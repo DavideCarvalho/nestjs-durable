@@ -291,17 +291,45 @@ export function observedAnnouncements(
     .sort((a, b) => a.key.localeCompare(b.key));
 }
 
-/** Every routing token the DECLARED announcements already account for — the announced names in their
- *  queue-token form plus every group an announcer stated. `sanitize` is injected so this module keeps
- *  no dependency on the queue layer. */
+/**
+ * Every routing token a live descriptor already ACCOUNTS FOR, and which therefore needs no
+ * observation — for either of the two opposite reasons.
+ *
+ * - A token some worker announced as a WORKFLOW: already in the registry, richer than an
+ *   observation could ever be, and re-adding it would count one worker twice.
+ * - A token some worker declared as a STEP HANDLER (`WorkerDescriptor.steps`): it must be left OUT,
+ *   because a step is not addressable from outside a run and offering one as callable would be
+ *   offering an operation the engine does not have. Route-by-handler gives every step its own queue,
+ *   so without this the liveness floor turns a fleet's entire step surface into fake workflows.
+ *
+ * That second exclusion is a DECLARED negative — the worker said "this name is a step" — which is
+ * exactly the sort of fact an observation cannot supply for itself, and the clearest illustration of
+ * what the two tiers are each worth. A worker on an SDK too old to describe itself declares neither
+ * its workflows nor its steps, so every one of its tokens stays observed and indistinguishable: its
+ * step queues are listed alongside its workflow queues because nothing published says which is
+ * which. That is a fair report of the fleet, not a defect in the read.
+ *
+ * `sanitize` is injected so this module keeps no dependency on the queue layer; a declared name is
+ * covered in its bare token form and, for a partitioned worker, in the suffixed form its queues
+ * actually carry.
+ */
 export function coveredTokens(
   announced: readonly AnnouncedWorkflow[],
+  descriptors: readonly (RawWorkerDescriptor | WorkerDescriptor)[],
   sanitize: (name: string) => string,
 ): Set<string> {
   const tokens = new Set<string>();
   for (const entry of announced) {
     tokens.add(sanitize(entry.name));
     for (const group of entry.groups) tokens.add(group);
+  }
+  for (const raw of descriptors) {
+    const d = normalizeDescriptor(raw);
+    for (const step of d.steps) {
+      const token = sanitize(step);
+      tokens.add(token);
+      if (d.partition) tokens.add(`${token}@${d.partition}`);
+    }
   }
   return tokens;
 }

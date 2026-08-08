@@ -103,6 +103,30 @@ describe('workflowDirectory — the three states', () => {
     expect((await engine.workflowDirectory()).detail).toContain('cannot be checked');
   });
 
+  it('a token a worker DECLARED as a step is not offered as a workflow', async () => {
+    // Route-by-handler gives every step its own queue, so the heartbeat keyspace of a healthy fleet
+    // is mostly step tokens. Measured against a live deployment, the liveness floor without this
+    // turned 40+ step handlers into fake callable workflows.
+    const transport = new FleetTransport(
+      [
+        worker({
+          instanceId: 'ts-1',
+          steps: ['ExportService.runExport', 'ExportService.markError'],
+        }),
+      ],
+      [
+        beat('ExportService.runExport', 'ts-1'),
+        beat('ExportService.markError', 'ts-1'),
+        beat('processing', 'py-1'),
+      ],
+    );
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+
+    const { workflows } = await engine.workflowDirectory();
+    // Only the one nobody declared as anything survives — and it survives BECAUSE nobody declared it.
+    expect(workflows.map((w) => w.key)).toEqual(['processing']);
+  });
+
   it('a descriptor always wins — a described worker is never re-counted as an observation', async () => {
     const transport = new FleetTransport(
       [
