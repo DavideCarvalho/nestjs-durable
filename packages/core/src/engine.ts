@@ -30,7 +30,9 @@ import {
   type DispatchPlan,
   type WorkerDescriptor,
   WorkflowBlocked,
+  type WorkflowDirectory,
   aggregateAnnouncements,
+  buildWorkflowDirectory,
   controlPlaneDescriptor,
   planDispatch,
 } from './handshake/index';
@@ -210,7 +212,43 @@ interface RegisteredWorkflow {
   /** The package that declared this workflow, stamped onto every run it starts. See
    *  {@link WorkflowRun.origin}. Absent = unknown; the engine never substitutes a default. */
   origin?: string | undefined;
+  /**
+   * Whether {@link version} is a fact somebody stated or the engine's placeholder.
+   *
+   * Only ever `false` on a registration synthesized by convention resolution against a fleet that
+   * announced no version. Every other registration carries the version its author wrote, so the
+   * field is absent (= stated) and nothing changes for them.
+   *
+   * It exists because the alternative — a `'1'` that nobody chose, indistinguishable from a `'1'`
+   * somebody did — is what let a version pin pass by construction. See {@link VERSION_UNDECLARED_TAG}.
+   */
+  versionDeclared?: boolean | undefined;
 }
+
+/**
+ * Stamped on a run whose workflow version NOBODY declared: a remote resolved by convention, served
+ * by a worker that announces no version for it (an SDK too old to publish a descriptor, or a body
+ * whose author simply never stated one).
+ *
+ * ## Why a run has to carry this
+ *
+ * Such a run's `workflowVersion` is `'1'`, the engine's convention default. That value is a routing
+ * placeholder, not an observation — and read back later it is indistinguishable from a worker that
+ * genuinely declared version `'1'`. Any check comparing an authored pin against it therefore passes
+ * whenever the pin is `'1'` and fails whenever it is not, regardless of what the callee actually is.
+ * A check that cannot fail is worse than no check, because it reads as a guarantee.
+ *
+ * The tag is the difference, carried ON the run so a retrospective check needs no second read: a
+ * caller that pinned a version can see that the version it is comparing against was never stated,
+ * and say so, instead of reporting a match it did not really make. It is deliberately a tag rather
+ * than a new column — every store already persists and queries tags, so this needs no migration and
+ * shows up in run listings and dashboards for free. Follows the `singleton:<key>` precedent for an
+ * engine-stamped reserved tag.
+ *
+ * A run whose callee DOES declare a version never carries it; that run's version is the declared one
+ * and a pin against it is genuinely checked.
+ */
+export const VERSION_UNDECLARED_TAG = 'version:undeclared';
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
 
@@ -1051,7 +1089,15 @@ export class WorkflowEngine {
     }
     if (!registered && pinned === undefined) {
       // Convention routing: if the transport reports a live group of the same name, synthesize a
-      // remote registration on the fly. Version '1' is the convention default (same as engine.remote()).
+      // remote registration on the fly.
+      //
+      // The `'1'` below is a FALLBACK, not the answer. It used to be the answer: this synthetic run
+      // was stamped `'1'` and the resolver echoed it straight back as `registered.version`, so the
+      // run row recorded a version nothing had observed — and a pin compared against it could only
+      // ever pass on `'1'` and fail on everything else, whatever the worker really was. So the
+      // resolver is asked to consult the fleet (`askFleetForVersion`) and this value survives only
+      // when the fleet declares nothing, in which case the run is tagged {@link VERSION_UNDECLARED_TAG}
+      // so a later check can tell an assumed version from a stated one.
       const conventionRun: WorkflowRun = {
         id: runId,
         workflow: name,
@@ -1066,7 +1112,7 @@ export class WorkflowEngine {
         createdAt: new Date(),
         updatedAt: new Date(),
       };
-      registered = await this.resolveRemoteByConvention(conventionRun);
+      registered = await this.resolveRemoteByConvention(conventionRun, { askFleetForVersion: true });
     }
     if (!registered) {
       throw new Error(
@@ -1085,13 +1131,15 @@ export class WorkflowEngine {
     }
     const now = new Date();
     // A singleton workflow stamps a `singleton:<key>` tag so the admission gate (in execute) can find
-    // the other in-flight runs sharing the key via a tag+status query.
-    const tags = mergeTags(
-      registered.tags,
-      registered.singleton
-        ? [...(opts?.tags ?? []), this.singletons.tag(registered.singleton, input)]
-        : opts?.tags,
-    );
+    // the other in-flight runs sharing the key via a tag+status query. A convention-resolved remote
+    // whose version nobody declared stamps `version:undeclared` on the same principle: the fact has
+    // to travel WITH the run, because whoever checks a pin later reads the run row and nothing else.
+    const stampedTags = [
+      ...(opts?.tags ?? []),
+      ...(registered.singleton ? [this.singletons.tag(registered.singleton, input)] : []),
+      ...(registered.versionDeclared === false ? [VERSION_UNDECLARED_TAG] : []),
+    ];
+    const tags = mergeTags(registered.tags, stampedTags);
     // Singleton back-pressure: reject a start that would grow the same-key backlog past
     // `limit + maxQueueDepth` (no-op when no maxQueueDepth is configured).
     if (registered.singleton) {
@@ -1234,6 +1282,7 @@ export class WorkflowEngine {
    */
   private async resolveRemoteByConvention(
     run: WorkflowRun,
+    opts: { askFleetForVersion?: boolean } = {},
   ): Promise<RegisteredWorkflow | undefined> {
     // Workers register/heartbeat their liveGroups under the SANITIZED token (`sanitizeQueueToken`),
     // so the membership check must sanitize too — else a `:`-named workflow's live worker is under
@@ -1250,15 +1299,60 @@ export class WorkflowEngine {
     // `group` string above — the executor computes the identical token itself (name+partition is
     // the new routing primitive; `group` here still exists only for the liveGroups membership check).
     const executor = new RemoteWorkflowExecutor(liveTransport, run.workflow, run.namespace);
+    // The version a START records must come from the fleet, never from the caller. `resume` is the
+    // opposite case and passes nothing: replay is positional, so a resumed run is pinned to the
+    // version it BEGAN on and asking the fleet again could re-point a live run mid-flight.
+    const declared = opts.askFleetForVersion
+      ? await this.declaredVersion(liveTransport, group, run.workflow)
+      : undefined;
     return {
       name: run.workflow,
-      version: run.workflowVersion,
+      version: declared ?? run.workflowVersion,
       fn: () => {
         throw new Error(`remote workflow ${run.workflow} has no local body`);
       },
       hasBody: false,
       remote: { group, executor },
+      ...(opts.askFleetForVersion ? { versionDeclared: declared !== undefined } : {}),
     };
+  }
+
+  /**
+   * The version the LIVE fleet declares for `workflow` on `group`, or `undefined` when it declares
+   * none — which is a fact about the fleet, not a failure to read it.
+   *
+   * The read is the descriptor advertisement, scoped to the one group being resolved: the workers on
+   * that queue, their `registrations`, the entry whose `name` matches. That is where a version can
+   * come from at all — a heartbeat has no room for one, so a worker on an SDK too old to publish a
+   * descriptor declares nothing and the caller is told so rather than handed a default.
+   *
+   * `undefined` when the announcers DISAGREE, and deliberately: two live workers claiming different
+   * versions of one name is a deployment in the middle of something, and picking either would stamp
+   * a run with a version half the fleet does not serve. Undeclared is the honest reading of a
+   * contradiction, and it is the reading that refuses to let a pin pass on a coin flip.
+   */
+  private async declaredVersion(
+    transport: Transport,
+    group: string,
+    workflow: string,
+  ): Promise<string | undefined> {
+    if (!transport.readWorkerDescriptors) return undefined;
+    let descriptors: WorkerDescriptor[];
+    try {
+      descriptors = await transport.readWorkerDescriptors(group);
+    } catch {
+      // A live read can fail every way a network call can. Undeclared, not thrown: this decides how a
+      // version is LABELLED, and a Redis blip must not stop a run from starting.
+      return undefined;
+    }
+    const versions = new Set<string>();
+    for (const announced of aggregateAnnouncements(descriptors)) {
+      if (announced.name === workflow && announced.version !== undefined) {
+        versions.add(announced.version);
+      }
+    }
+    const only = [...versions];
+    return only.length === 1 ? only[0] : undefined;
   }
 
   /**
@@ -2383,12 +2477,31 @@ export class WorkflowEngine {
    * Workflows only, and deliberately: see the "steps are out of scope" note in `handshake/announced`.
    */
   async announcedWorkflows(): Promise<AnnouncedWorkflow[]> {
-    const descriptors = await this.pool.readAllWorkerDescriptors();
-    const mine =
-      this.namespace === undefined
-        ? descriptors
-        : descriptors.filter((d) => (d.namespace ?? 'default') === this.namespace);
-    return aggregateAnnouncements(mine);
+    return (await this.workflowDirectory()).workflows;
+  }
+
+  /**
+   * {@link announcedWorkflows}, plus the thing a list of workflows can never say: why it is the
+   * length it is. See {@link WorkflowDirectory} for the three states an empty array used to collapse
+   * into one — "nobody asked", "nothing is live", and the partition mismatch that reads exactly like
+   * the second from the caller's side.
+   *
+   * Two live reads, both on demand and neither retained: the descriptor advertisement (what workers
+   * SAY they serve) and the heartbeat keyspace (what is demonstrably consuming a queue right now).
+   * The second is why a worker on an SDK too old to publish a descriptor appears here at all — it
+   * beats and never describes itself, and reading only descriptors reported such a fleet as empty
+   * while `resolveRemoteByConvention`, a few lines away in this same class, was routing calls to it
+   * off those very keys. Two answers out of one Redis, disagreeing. Now they agree, and the entry
+   * says which of the two kinds of evidence it rests on rather than flattening them together.
+   */
+  async workflowDirectory(): Promise<WorkflowDirectory> {
+    return buildWorkflowDirectory({
+      descriptors: await this.pool.readAllWorkerDescriptors(),
+      heartbeats: await this.pool.readAllWorkerHeartbeats(),
+      namespace: this.namespace,
+      supported: this.pool.introspectsFleet,
+      sanitize: sanitizeQueueToken,
+    });
   }
 
   /**

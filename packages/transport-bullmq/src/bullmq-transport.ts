@@ -791,6 +791,45 @@ export class BullMQTransport implements Transport, ControlPlane {
   }
 
   /**
+   * Every live worker heartbeat in this deployment, across all groups — the liveness floor under the
+   * workflow directory. ONE `SCAN` of `<prefix>-worker-heartbeat:*`, the same keyspace
+   * {@link listWorkerGroups} walks, but keeping the instance behind each token instead of collapsing
+   * to distinct group names.
+   *
+   * This is what makes a worker from a pre-handshake SDK visible: it beats these keys and publishes
+   * no `<prefix>-worker-descriptor:` value at all, so a descriptor-only read reports it as absent
+   * while `resolveRemoteByConvention` is happily routing calls to it off these very keys. A key
+   * present is live by definition (the TTL has not expired).
+   *
+   * The key is `<prefix>-worker-heartbeat:<routingToken>:<instanceId>` and a routing token never
+   * contains `:` (`sanitizeQueueToken` rewrites it), so the FIRST `:` after the prefix splits the
+   * two — the same parse `listWorkerGroups` and `listLiveWorkers` already agree on.
+   */
+  async readAllWorkerHeartbeats(): Promise<WorkerHeartbeat[]> {
+    const client = this.workerRedis();
+    const prefix = `${this.#effectivePrefix()}-worker-heartbeat:`;
+    const beats: WorkerHeartbeat[] = [];
+    let cursor = '0';
+    do {
+      const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
+      cursor = next;
+      for (const key of keys) {
+        const rest = key.slice(prefix.length);
+        const sep = rest.indexOf(':');
+        if (sep <= 0) continue; // no token, or no instance segment — not a beat this can attribute
+        const parsed = parseHeartbeatValue(await client.get(key));
+        beats.push({
+          group: rest.slice(0, sep),
+          instanceId: rest.slice(sep + 1),
+          lastBeatAt: parsed.lastBeatAt,
+          ...(parsed.status !== undefined ? { status: parsed.status } : {}),
+        });
+      }
+    } while (cursor !== '0');
+    return beats;
+  }
+
+  /**
    * Negotiate this control-plane's descriptor against a remote worker's (design §7.3/§7.4) — the
    * bilateral compatibility check. `required` are capabilities the caller needs the session to
    * provide. Returns the full structured {@link NegotiationResult} (never a bare boolean).
