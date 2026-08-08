@@ -109,6 +109,34 @@ placeholder version (the parent's, and `'1'`), which is not evidence that the wo
 asked for — so a pinned start on those paths throws rather than pretending. To pin a cross-SDK
 workflow, register it for real: `engine.remote('processing', { group: 'processing', version: '2' })`.
 
+### What version a convention-resolved run records
+
+An **unpinned** start against a convention-resolved remote still has to write *something* into the
+run row's `workflowVersion`, and whoever checks a pin after the fact reads that value. It used to be
+the caller's own `'1'`, stamped onto the synthetic run *before* the resolver ran and echoed straight
+back — so a pin of `'1'` could never fail and any other value could never pass. A check that cannot
+fail is worse than no check, because it reads as a guarantee.
+
+The version now comes **from the fleet**: the descriptor advertisement for the group being resolved,
+where a worker declares it (`@worker.workflow("processing", version="2")` in Python,
+`@Workflow({ version })` in TypeScript). Two live workers claiming *different* versions of one name
+counts as undeclared rather than as a coin flip.
+
+When nobody declares a version, the routing default is kept — refusing outright would make an
+un-upgraded callee **uncallable**, and a callee should never have to change to be callable — and the
+run is tagged `version:undeclared`:
+
+```ts
+const run = await engine.getRun(runId);
+run.workflowVersion            // '1'  — the routing default, not an observation
+run.tags.includes('version:undeclared')  // true — so a pin check can say so
+```
+
+Read that tag before treating `workflowVersion` as something a pin was checked against. It travels on
+the run itself, so a retrospective check needs no second read, and it shows up in run listings and
+`byTag` queries like any other tag. **Resume is unaffected**: replay is positional, so an in-flight
+run stays on the version it began on however the fleet moves underneath it.
+
 Versioning is the right tool when the change is structural and you're prepared to keep both bodies
 around. For a small, surgical change, the version split is heavyweight — that's where `ctx.patched`
 comes in.

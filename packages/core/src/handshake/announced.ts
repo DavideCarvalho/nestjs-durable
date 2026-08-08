@@ -50,6 +50,25 @@
  * picker offering steps would be offering an operation that does not exist. Step HANDLER names are
  * still advertised (`WorkerDescriptor.steps`) — that is a routing/capability fact used to decide
  * whether a dispatched step can be run, not an invocable catalog.
+ *
+ * ## The floor: a live worker that announces nothing
+ *
+ * An SDK old enough to predate the descriptor advertisement publishes only its TTL'd liveness
+ * heartbeat — one key per routing token it consumes. Read strictly, such a fleet announces nothing
+ * and this registry would be empty while work is being served. That answer is not merely unhelpful,
+ * it CONTRADICTS the engine beside it: `resolveRemoteByConvention` routes a call to `X` the moment a
+ * token named `X` heartbeats, so the deployment already treats liveness as sufficient to CALL a
+ * workflow while claiming to know nothing when asked to LIST one. Both answers come out of the same
+ * Redis.
+ *
+ * So the heartbeat is folded in as a second, weaker tier of evidence ({@link AnnouncedWorkflow.evidence}
+ * `'observed'`): the entry exists because a live token of that name exists, which is exactly — no more
+ * and no less — the condition under which convention routing would resolve it. Listing it therefore
+ * cannot introduce a failure the dispatcher did not already have. What it CANNOT do is state a
+ * version, an origin, a runtime, or even that the token serves a workflow rather than a step handler
+ * of the same name: none of that is in a heartbeat, and every one of those stays un-stated rather than
+ * being guessed. A descriptor always wins — a token an announcement already covers is never re-added
+ * as an observation.
  */
 
 import type { RawWorkerDescriptor, WorkerDescriptor, WorkflowRegistration } from './descriptor';
@@ -70,25 +89,47 @@ export interface Disagreement {
   values: string[];
 }
 
+/**
+ * How strong the fleet's claim about a workflow is. The two tiers are NOT interchangeable and a
+ * caller must not read them as the same fact:
+ *
+ * - `'declared'` — at least one live worker published a descriptor naming this workflow. Everything
+ *   populated on the entry was STATED by that worker; everything absent it declined to state.
+ * - `'observed'` — nobody described it. What exists is a live routing token of this name, which is
+ *   precisely the condition `resolveRemoteByConvention` uses to route a call, so the name IS
+ *   reachable. Nothing else is known: no version, no origin, no runtime, and no assurance that the
+ *   worker consuming that token serves a WORKFLOW there rather than a step handler of the same name.
+ *   An entry like this is a live queue, not a promise.
+ */
+export type AnnouncementEvidence = 'declared' | 'observed';
+
 /** One workflow the live fleet announces, folded across every worker that announced it. */
 export interface AnnouncedWorkflow {
+  /** What kind of claim this entry rests on — see {@link AnnouncementEvidence}. A caller that shows
+   *  a version, an origin or a runtime must check this first: an `'observed'` entry has none of
+   *  them, and the emptiness is a fact about the fleet, not a rendering gap. */
+  evidence: AnnouncementEvidence;
   /** `name@version`, or the bare `name` when no announcer stated a version. Stable sort key. */
   key: string;
   name: string;
   /** Absent when no announcer stated one — never inferred from another announcer's version. */
   version?: string;
-  /** Every distinct routing group announced (sorted). Empty = nobody stated one. */
+  /** Every distinct routing group announced (sorted). Empty = nobody stated one. On an `'observed'`
+   *  entry this is the token the heartbeat was published UNDER — not a claim by anybody, but the
+   *  queue a call would actually land on, which is the one thing an observation does establish. */
   groups: string[];
   /** Every distinct declaring package announced (sorted). Empty = nobody stated one. */
   origins: string[];
   /** Every distinct capability demand announced, each de-duplicated + sorted. Empty = nobody stated
    *  one. Two entries here means two workers demand different capabilities for the same version. */
   requires: string[][];
-  /** Runtimes of the live announcers (sorted, de-duplicated). */
+  /** Runtimes of the live announcers (sorted, de-duplicated). EMPTY on an `'observed'` entry: a
+   *  heartbeat does not say what runtime wrote it, and the instance id's shape is a convention, not
+   *  a statement, so it is not read as one. */
   runtimes: ('node' | 'python')[];
   /** Instance ids of the live workers announcing it (sorted, de-duplicated). Its length is how many
    *  workers can currently run this workflow — `1` is a single point of failure, and it is never 0
-   *  (an entry exists only because somebody announced it). */
+   *  (an entry exists only because somebody announced it, or because somebody is beating on it). */
   instances: string[];
   /** The axes the announcers differ on, empty when they speak with one voice. A caller that must
    *  pick a single target has to resolve these itself — the registry refuses to guess. */
@@ -178,6 +219,7 @@ export function aggregateAnnouncements(
     const first = announcements[0];
     if (!first) continue;
     out.push({
+      evidence: 'declared',
       key,
       name: first.name,
       ...(first.version !== undefined ? { version: first.version } : {}),
@@ -190,4 +232,104 @@ export function aggregateAnnouncements(
     });
   }
   return out.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+/**
+ * The part of one live worker heartbeat this registry can read: the routing token the beat was
+ * published under, and which process published it. That is genuinely all a heartbeat holds — it is
+ * the cheap tier of the two-tier advertisement, and its job is liveness, not description.
+ *
+ * Structurally satisfied by `WorkerHeartbeat` (the transport-facing shape, which also carries a beat
+ * time and an execution snapshot). Declared here rather than imported so this module keeps its "pure
+ * data, no transport" footing and `interfaces.ts` can keep importing FROM it.
+ */
+export interface HeartbeatSighting {
+  /** The routing token the beat was published under (already partition-suffixed when partitioned). */
+  group: string;
+  /** The beating process's instance id. */
+  instanceId: string;
+}
+
+/**
+ * The weaker tier: one entry per live routing token that NO descriptor accounts for.
+ *
+ * `covered` holds every token the declared announcements already explain — both the sanitized form of
+ * each announced NAME and every group any announcer stated. A token in that set is dropped, so a
+ * fleet that describes itself properly gets exactly the same registry it got before this tier
+ * existed, and a worker is never counted twice under two kinds of evidence.
+ *
+ * Everything an observation cannot know stays empty rather than being filled with a plausible guess:
+ * no version (so nothing can be pinned against it), no origin, no requires, no runtime. The `name` is
+ * the token itself, which equals the workflow's name for every name a queue token can round-trip —
+ * `sanitizeQueueToken` rewrites `:` to `-` and that rewrite is not invertible, so a workflow named
+ * `orders:fulfill` is observed as `orders-fulfill`. Stated here because a picker showing that string
+ * should show what the queue is really called, not a reconstruction that might be wrong.
+ */
+export function observedAnnouncements(
+  heartbeats: readonly HeartbeatSighting[],
+  covered: ReadonlySet<string>,
+): AnnouncedWorkflow[] {
+  const byToken = new Map<string, Set<string>>();
+  for (const beat of heartbeats) {
+    if (!beat.group || covered.has(beat.group)) continue;
+    const instances = byToken.get(beat.group);
+    if (instances) instances.add(beat.instanceId);
+    else byToken.set(beat.group, new Set([beat.instanceId]));
+  }
+  return [...byToken.entries()]
+    .map(([group, instances]) => ({
+      evidence: 'observed' as const,
+      key: group,
+      name: group,
+      groups: [group],
+      origins: [],
+      requires: [],
+      runtimes: [],
+      instances: [...instances].sort(),
+      disagreements: [],
+    }))
+    .sort((a, b) => a.key.localeCompare(b.key));
+}
+
+/**
+ * Every routing token a live descriptor already ACCOUNTS FOR, and which therefore needs no
+ * observation — for either of the two opposite reasons.
+ *
+ * - A token some worker announced as a WORKFLOW: already in the registry, richer than an
+ *   observation could ever be, and re-adding it would count one worker twice.
+ * - A token some worker declared as a STEP HANDLER (`WorkerDescriptor.steps`): it must be left OUT,
+ *   because a step is not addressable from outside a run and offering one as callable would be
+ *   offering an operation the engine does not have. Route-by-handler gives every step its own queue,
+ *   so without this the liveness floor turns a fleet's entire step surface into fake workflows.
+ *
+ * That second exclusion is a DECLARED negative — the worker said "this name is a step" — which is
+ * exactly the sort of fact an observation cannot supply for itself, and the clearest illustration of
+ * what the two tiers are each worth. A worker on an SDK too old to describe itself declares neither
+ * its workflows nor its steps, so every one of its tokens stays observed and indistinguishable: its
+ * step queues are listed alongside its workflow queues because nothing published says which is
+ * which. That is a fair report of the fleet, not a defect in the read.
+ *
+ * `sanitize` is injected so this module keeps no dependency on the queue layer; a declared name is
+ * covered in its bare token form and, for a partitioned worker, in the suffixed form its queues
+ * actually carry.
+ */
+export function coveredTokens(
+  announced: readonly AnnouncedWorkflow[],
+  descriptors: readonly (RawWorkerDescriptor | WorkerDescriptor)[],
+  sanitize: (name: string) => string,
+): Set<string> {
+  const tokens = new Set<string>();
+  for (const entry of announced) {
+    tokens.add(sanitize(entry.name));
+    for (const group of entry.groups) tokens.add(group);
+  }
+  for (const raw of descriptors) {
+    const d = normalizeDescriptor(raw);
+    for (const step of d.steps) {
+      const token = sanitize(step);
+      tokens.add(token);
+      if (d.partition) tokens.add(`${token}@${d.partition}`);
+    }
+  }
+  return tokens;
 }

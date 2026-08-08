@@ -978,6 +978,21 @@ export interface Transport {
    */
   readAllWorkerDescriptors?(): Promise<WorkerDescriptor[]>;
   /**
+   * Every live worker heartbeat in the deployment, across all groups — the LIVENESS floor under
+   * {@link WorkflowEngine.workflowDirectory}. Optional, same as {@link readAllWorkerDescriptors}.
+   *
+   * It exists because a descriptor is the richer advertisement but not the universal one: an SDK
+   * that predates the handshake beats a liveness key and publishes no descriptor at all, and reading
+   * only descriptors reports such a fleet as EMPTY while it is serving work. Convention routing
+   * already resolves those workers off exactly these keys, so a directory built without them
+   * contradicts the dispatcher standing next to it.
+   *
+   * Distinct from {@link listWorkerGroups}, which answers with tokens alone: this carries the
+   * instance behind each one, so the directory can say how many workers back a name and a partition
+   * sighting can name who is beating there.
+   */
+  readAllWorkerHeartbeats?(): Promise<WorkerHeartbeat[]>;
+  /**
    * DB-less tenant worker → control plane: publish a {@link StartRunMessage} requesting a new run.
    * Optional — only transports that carry the hosted-control-plane protocol (P4) implement this.
    * The message is enqueued on `<effectivePrefix>-start-run`; the control plane's

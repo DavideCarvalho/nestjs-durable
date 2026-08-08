@@ -20,11 +20,22 @@ export {
 } from './descriptor';
 export {
   type AnnouncedWorkflow,
+  type AnnouncementEvidence,
   type Disagreement,
+  type HeartbeatSighting,
   type WorkflowAnnouncement,
   aggregateAnnouncements,
   announcementsOf,
+  coveredTokens,
+  observedAnnouncements,
 } from './announced';
+export {
+  DEFAULT_PARTITION,
+  type PartitionSighting,
+  type WorkflowDirectory,
+  buildWorkflowDirectory,
+  partitionOfToken,
+} from './directory';
 export {
   type NegotiationOutcome,
   type NegotiationReason,

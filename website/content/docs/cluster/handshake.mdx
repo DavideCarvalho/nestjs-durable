@@ -147,6 +147,60 @@ accepted as a valid (unversioned, group-less) announcement, so a worker that has
 origin="flip-python-db")` fills in the richer axes; what you leave out is announced as un-stated, and
 the aggregate never invents a version, group or origin nobody stated.
 
+### A worker that announces nothing at all
+
+The paragraph above holds for a worker that publishes a descriptor. A worker on an SDK old enough to
+predate the descriptor advertisement publishes **only its liveness heartbeat** — one key per routing
+token it consumes, and no `durable-worker-descriptor:` value anywhere. Read strictly, such a fleet
+announces nothing, and the registry used to report it as **empty while it was serving work**.
+
+That answer was not merely unhelpful, it contradicted the engine beside it: convention routing
+resolves a call to `X` the moment a token named `X` heartbeats, so the deployment already treated
+liveness as sufficient to *call* a workflow while claiming to know nothing when asked to *list* one —
+two answers out of the same Redis.
+
+So the heartbeat is a second, weaker tier of evidence, and every entry says which tier it rests on:
+
+```ts
+const { workflows } = await engine.workflowDirectory()
+// [{ evidence: 'declared', key: 'pipeline@2', version: '2', runtimes: ['python'], … },
+//  { evidence: 'observed', key: 'processing', groups: ['processing'], instances: ['py-1'],
+//    version: undefined, origins: [], requires: [], runtimes: [] }]
+```
+
+An `observed` entry exists because a live token of that name exists — precisely the condition under
+which convention routing would resolve it, so listing it cannot introduce a failure the dispatcher
+did not already have. It states **nothing it cannot know**: no version, no origin, no runtime, and no
+assurance that the token serves a workflow rather than a step handler of the same name. A descriptor
+always wins, and a token some worker *declared* as a step is excluded outright — that is a stated
+negative an observation cannot supply for itself, and it is what keeps a route-by-handler fleet's
+entire step surface out of the picker.
+
+### Why it is empty
+
+An empty list has three honest meanings, and returning `[]` for all of them hides the two that need
+acting on. `workflowDirectory()` separates them:
+
+| `supported` | `workflows` | means | do |
+| --- | --- | --- | --- |
+| `false` | `[]` | no transport here can introspect — **nobody asked** | configure a transport |
+| `true` | `[]` | the fleet was asked and **nothing is live** | start a worker |
+| `true` | populated | here it is | — |
+
+A fourth hides inside the second and is the most expensive to debug, because from the caller's side
+it is *identical* to "nothing is running": a worker live on a **partition this engine does not
+route to**. It consumes `<token>@<partition>`, convention resolution computes the token for this
+engine's namespace and misses. The heartbeat keyspace is shared, so the evidence is right there, and
+`otherPartitions` reports it rather than letting the caller conclude absence:
+
+```ts
+{ supported: true, workflows: [], otherPartitions: [
+    { partition: 'davi-local', groups: ['processing@davi-local', …], instances: ['py-1'] } ] }
+```
+
+`announcedWorkflows()` is unchanged as a call and now returns the directory's `workflows`, so an
+existing picker gets the visibility fix without touching its code.
+
 ### Steps are out of scope, deliberately
 
 There is no equivalent registry for steps, and there never will be one shaped like this. A step is
@@ -162,7 +216,7 @@ When negotiation rejects a worker or a run parks, durable emits structured diagn
 
 ## Backward compatibility
 
-A worker that advertises **no descriptor** (an older SDK release) is treated as **legacy v1** with the v1 capability baseline, and assumed compatible. Existing workers keep flowing untouched; rich negotiation lights up as SDKs adopt it.
+A worker that advertises **no descriptor** (an older SDK release) is treated as **legacy v1** with the v1 capability baseline, and assumed compatible. Existing workers keep flowing untouched; rich negotiation lights up as SDKs adopt it. It is also still *visible* — see [a worker that announces nothing at all](#a-worker-that-announces-nothing-at-all) — because a callee should never have to change to be callable, and that has to include being findable.
 
 The current wire protocol is **v1**. The whole point of the handshake is that a future **v2 breaking change is detectable** — an old worker and a new control plane discover the mismatch and refuse to corrupt each other, instead of failing in confusing ways at runtime.
 
