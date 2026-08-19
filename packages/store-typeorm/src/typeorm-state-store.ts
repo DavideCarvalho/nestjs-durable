@@ -1,6 +1,9 @@
 import {
   type AttributeFilter,
+  type RunFacetQuery,
+  type RunFacetRow,
   type RunQuery,
+  type RunStatus,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
@@ -9,6 +12,7 @@ import {
   type WorkflowRun,
   attributeColumnFor,
   attributeOperand,
+  mergeRunFacetRows,
   normalizeAttributeRows,
   sqlComparator,
 } from '@dudousxd/nestjs-durable-core';
@@ -229,7 +233,10 @@ export class TypeOrmStateStore implements StateStore {
     return result.affected === 1;
   }
 
-  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+  /** A query builder (root alias `r`) carrying the predicates every run query shares —
+   *  {@link listRuns} orders + pages it, {@link runFacets} groups it, so a facet count and the page
+   *  it labels are always taken over the same set. */
+  private runQueryBuilder(query: RunQuery): SelectQueryBuilder<WorkflowRunEntity> {
     // `tags` carries a custom JSON transformer, and TypeORM applies a column transformer's `to()` to
     // FindOperator values too — so a `Like('%"etl"%')` in a plain `where` would be JSON-stringified
     // and corrupt the LIKE pattern. Use the query builder with a raw parameter to bypass that.
@@ -246,7 +253,11 @@ export class TypeOrmStateStore implements StateStore {
     // matches NO origin value — it is never folded into a bucket to make the facet look complete.
     // Unknown-origin runs are reachable only with the filter OFF, so "all origins" must stay the
     // default view; a dashboard that filtered by default would make those runs look deleted.
-    if (query.origin !== undefined) qb.andWhere('r.origin = :origin', { origin: query.origin });
+    // `null` asks for exactly that absent bucket, which is how a paginated console offers an
+    // "unknown" chip without holding every run in the browser to find them.
+    if (query.origin === null) qb.andWhere('r.origin IS NULL');
+    else if (query.origin !== undefined)
+      qb.andWhere('r.origin = :origin', { origin: query.origin });
     if (query.status) qb.andWhere('r.status = :status', { status: query.status });
     if (query.statuses)
       qb.andWhere(
@@ -266,11 +277,31 @@ export class TypeOrmStateStore implements StateStore {
     if (query.attributes?.length) {
       query.attributes.forEach((f, i) => this.applyAttributeExists(qb, f, i));
     }
+    return qb;
+  }
+
+  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+    const qb = this.runQueryBuilder(query);
     qb.orderBy('r.createdAt', 'DESC'); // newest first — recent runs on top in the dashboard
     if (query.limit != null) qb.take(query.limit);
     if (query.offset != null) qb.skip(query.offset);
     const rows = await qb.getMany();
     return rows.map(fromRunEntity);
+  }
+
+  /** `GROUP BY status, origin` over the same predicates {@link listRuns} pages — one aggregate, so a
+   *  console can show whole-set counts next to a bounded page instead of downloading every run to
+   *  count them in the browser. */
+  async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    const rows = await this.runQueryBuilder(query)
+      .select('r.status', 'status')
+      .addSelect('r.origin', 'origin')
+      .addSelect('COUNT(*)', 'count')
+      .groupBy('r.status')
+      .addGroupBy('r.origin')
+      .getRawMany<{ status: RunStatus; origin: string | null; count: number | string }>();
+    // Most drivers hand `COUNT(*)` back as a string through `getRawMany`; normalise before merging.
+    return mergeRunFacetRows(rows.map((r) => ({ ...r, count: Number(r.count) })));
   }
 
   /** Add one attribute predicate to `qb` as an EXISTS subquery on the side-table. `i` namespaces the

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { GroupHealth, WorkerHeartbeat } from './durable-client.js';
-import { summarizeHealth } from './summarize-health.js';
+import { stalledWorkflows, summarizeHealth } from './summarize-health.js';
 
 function worker(over: Partial<WorkerHeartbeat> = {}): WorkerHeartbeat {
   return { group: '', instanceId: 'w1', lastBeatAt: 0, ...over };
@@ -79,5 +79,61 @@ describe('summarizeHealth', () => {
     expect(summary.workflowCount).toBe(2);
     expect(summary.stepCount).toBe(2);
     expect(summary.queueCount).toBe(6);
+  });
+});
+
+describe('stalledWorkflows', () => {
+  const group = (
+    name: string,
+    kind: 'workflow' | 'step',
+    depth: number,
+    workers: number,
+  ): GroupHealth => ({
+    group: name,
+    kind,
+    depth,
+    liveWorkers: Array.from({ length: workers }, (_, i) => ({
+      group: name,
+      instanceId: `w${i}`,
+      lastBeatAt: 0,
+    })),
+  });
+
+  it('names a workflow queue with backlog and nobody consuming it', () => {
+    expect(stalledWorkflows([group('ingestion', 'workflow', 4, 0)])).toEqual(['ingestion']);
+  });
+
+  it('stays quiet for a queue that has a worker, however deep the backlog', () => {
+    expect(stalledWorkflows([group('ingestion', 'workflow', 400, 1)])).toEqual([]);
+  });
+
+  it('stays quiet for an IDLE queue — no backlog is not the same as blocked', () => {
+    // A suspended run parked on its reconcile timer has no live worker and nothing enqueued. Calling
+    // that "no worker" is the false positive `deriveRunState` is careful to avoid.
+    expect(stalledWorkflows([group('ingestion', 'workflow', 0, 0)])).toEqual([]);
+  });
+
+  it('aggregates a workflow across its per-tenant partitions', () => {
+    // Queues are `<name>@<tenant>`; a worker on ANY partition means the workflow is being served.
+    expect(
+      stalledWorkflows([
+        group('ingestion@acme', 'workflow', 4, 0),
+        group('ingestion@globex', 'workflow', 0, 1),
+      ]),
+    ).toEqual([]);
+  });
+
+  it('ignores step queues — the banner is about workflows', () => {
+    expect(stalledWorkflows([group('extract', 'step', 9, 0)])).toEqual([]);
+  });
+
+  it('reads worker health alone, so it survives the run list being a page', () => {
+    // The banner used to be derived from the runs on screen. Now the list is paged, that would have
+    // gone quiet the moment the stalled runs scrolled past the page boundary — which is exactly when
+    // an operator most needs to see it.
+    expect(stalledWorkflows([group('a', 'workflow', 1, 0), group('b', 'workflow', 2, 0)])).toEqual([
+      'a',
+      'b',
+    ]);
   });
 });

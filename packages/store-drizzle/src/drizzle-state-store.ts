@@ -1,6 +1,9 @@
 import {
   type AttributeFilter,
+  type RunFacetQuery,
+  type RunFacetRow,
   type RunQuery,
+  type RunStatus,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
@@ -9,6 +12,7 @@ import {
   type WorkflowRun,
   attributeColumnFor,
   attributeOperand,
+  mergeRunFacetRows,
   normalizeAttributeRows,
   sqlComparator,
 } from '@dudousxd/nestjs-durable-core';
@@ -227,8 +231,10 @@ export class DrizzleStateStore implements StateStore {
     return (result as { changes?: number }).changes === 1;
   }
 
-  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    const filters = [
+  /** The predicates every run query shares — {@link listRuns} pages them, {@link runFacets} groups
+   *  them, so a facet count and the page it labels are always taken over the same set. */
+  private runFilters(query: RunQuery) {
+    return [
       query.workflow ? eq(workflowRuns.workflow, query.workflow) : undefined,
       // The tenant boundary, ANDed with everything else. This is not only a dashboard facet: it is
       // the fourth namespace-scoped worker path, because `engine.sweepTimeouts` cancels runs past
@@ -240,7 +246,13 @@ export class DrizzleStateStore implements StateStore {
       // matches NO origin value — it is never folded into a bucket to make the facet look complete.
       // Unknown-origin runs are reachable only with the filter OFF, so "all origins" must stay the
       // default view; a dashboard that filtered by default would make those runs look deleted.
-      query.origin !== undefined ? eq(workflowRuns.origin, query.origin) : undefined,
+      // `null` asks for exactly that absent bucket (`origin IS NULL`), which is how a paginated
+      // console offers an "unknown" chip without holding every run in the browser to find them.
+      query.origin === null
+        ? isNull(workflowRuns.origin)
+        : query.origin !== undefined
+          ? eq(workflowRuns.origin, query.origin)
+          : undefined,
       query.status ? eq(workflowRuns.status, query.status) : undefined,
       // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store).
       query.statuses
@@ -255,6 +267,10 @@ export class DrizzleStateStore implements StateStore {
       // full scan + in-process filter. ANDed: a run must satisfy every filter (one EXISTS per filter).
       ...(query.attributes?.map((f) => this.attributeExists(f)) ?? []),
     ].filter((f): f is NonNullable<typeof f> => f !== undefined);
+  }
+
+  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+    const filters = this.runFilters(query);
     const rows = await this.db
       .select()
       .from(workflowRuns)
@@ -263,6 +279,30 @@ export class DrizzleStateStore implements StateStore {
       .limit(query.limit ?? -1)
       .offset(query.offset ?? 0);
     return rows.map(fromRunRow);
+  }
+
+  /** `GROUP BY status, origin` over the same predicates {@link listRuns} pages — one aggregate, so a
+   *  console can show whole-set counts next to a bounded page instead of downloading every run to
+   *  count them in the browser. */
+  async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    const filters = this.runFilters(query);
+    const rows = await this.db
+      .select({
+        status: workflowRuns.status,
+        origin: workflowRuns.origin,
+        count: sql<number>`count(*)`,
+      })
+      .from(workflowRuns)
+      .where(filters.length ? and(...filters) : undefined)
+      .groupBy(workflowRuns.status, workflowRuns.origin);
+    // Some drivers hand `count(*)` back as a string; normalise before merging.
+    return mergeRunFacetRows(
+      rows.map((r) => ({
+        status: r.status as RunStatus,
+        origin: r.origin,
+        count: Number(r.count),
+      })),
+    );
   }
 
   /** One attribute predicate as an EXISTS subquery on the side-table, correlated to the outer run.

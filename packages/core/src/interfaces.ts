@@ -432,6 +432,17 @@ export interface StateStore {
 
   // Dashboard queries
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
+
+  /**
+   * Count the runs matching `query`, grouped by `(status, origin)` — the totals behind a console's
+   * status and origin chips, in ONE aggregate instead of a full listing the caller counts in memory.
+   * This is what lets a run list be paginated at all: `listRuns` can return 100 rows while the chips
+   * still say how many of the 9,000 are failed.
+   *
+   * Cells with a zero count are simply absent. Optional: a store that omits it still works — callers
+   * fall back to counting a {@link listRuns} result, which is correct but unbounded.
+   */
+  runFacets?(query: RunFacetQuery): Promise<RunFacetRow[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
 
   /**
@@ -560,13 +571,35 @@ export interface RunQuery {
    * Restrict to runs whose workflow was declared by this package (exact match against
    * {@link WorkflowRun.origin}), ANDed with the other predicates.
    *
-   * A run with NO origin (unknown — see the field) matches no `origin` value at all, so a UI facet
+   * A run with NO origin (unknown — see the field) matches no `origin` VALUE at all, so a UI facet
    * built on this must keep an "all origins" option: filtering by any single package silently hides
-   * every unattributed run, which reads to an operator as "those runs do not exist".
+   * every unattributed run, which reads to an operator as "those runs do not exist". `null` selects
+   * exactly that absent bucket (`origin IS NULL`), so a paginated console can offer an "unknown"
+   * facet without having to hold every run in the browser to find them.
    */
-  origin?: string | undefined;
+  origin?: string | null | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
+}
+
+/**
+ * The predicates a {@link RunFacetRow} count is taken over — a {@link RunQuery} minus the axes the
+ * facets THEMSELVES report (`status`/`origin`) and minus paging. Keeping them out of the type is
+ * what makes the counts answerable in one query: a console narrows by tag/tenant/attribute, and the
+ * one call back tells it how the matching runs split across every status and every origin at once.
+ */
+export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'origin' | 'limit' | 'offset'>;
+
+/**
+ * One `(status, origin)` cell of {@link StateStore.runFacets} — a `GROUP BY` row, not a page of runs.
+ * A console pivots these into its status chips and its origin chips, so both stay exact while the
+ * list itself is paginated. `origin` is `null` for runs carrying none (see {@link WorkflowRun.origin});
+ * that bucket is a real, countable answer here rather than the absence a value-match cannot express.
+ */
+export interface RunFacetRow {
+  status: RunStatus;
+  origin: string | null;
+  count: number;
 }
 
 /** The transaction handle `StateStore.transaction` hands to its work callback. */
@@ -637,6 +670,7 @@ export interface RunRequest {
 export type RunRequestKind =
   | { kind: 'getRunDetail'; runId: string }
   | { kind: 'listRuns'; query: RunQuery }
+  | { kind: 'runFacets'; query: RunFacetQuery }
   // Per-group worker health — the operator answers it scoped to the requester's own groups (see
   // `RunRequestResponder`), so a tenant's Workers panel shows ITS queues, never another tenant's.
   | { kind: 'workerHealth' }

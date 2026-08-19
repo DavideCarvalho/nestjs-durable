@@ -113,8 +113,11 @@ export interface RunDisplayState {
   detail?: string;
 }
 
-/** Statuses that keep a singleton slot / queue behind it (mirrors the engine's `admit()` scan). */
-const SINGLETON_INFLIGHT = new Set<RunStatus>(['running', 'suspended', 'cancelling']);
+/** Statuses that keep a singleton slot / queue behind it (mirrors the engine's `admit()` scan). Also
+ *  the query the console sends to fetch a suspended run's in-flight SIBLINGS, so the set it is placed
+ *  against is the same one the engine admits against. */
+export const SINGLETON_INFLIGHT_STATUSES: RunStatus[] = ['running', 'suspended', 'cancelling'];
+const SINGLETON_INFLIGHT = new Set<RunStatus>(SINGLETON_INFLIGHT_STATUSES);
 
 /** Strip the route-by-handler `@partition` suffix so a run's `workflow` matches its `GroupHealth.group`
  *  base token (queues are `<name>@<tenant>` on tenants, bare `<name>` on the control plane). */
@@ -413,18 +416,41 @@ export interface RunFilterOptions {
   namespace?: string | undefined;
   /**
    * The package that declared the workflow — `WorkflowRun.origin`, exact match. Absent = all origins.
-   * NOTE this cannot select UNATTRIBUTED runs: `RunQuery.origin` matches a string, and a run with no
-   * origin matches no value at all. See `run-origin.ts` for the facet that can.
+   * `null` selects the UNATTRIBUTED runs instead (the server's `unattributed` param): a run with no
+   * origin matches no string value at all, so absence needs its own spelling. See `run-origin.ts`.
    */
-  origin?: string | undefined;
+  origin?: string | null | undefined;
+}
+
+/** How much of the list to fetch. Absent bounds mean the whole listing — which on a busy control
+ *  plane is megabytes and thousands of rows, so the console always sends a `limit`. */
+export interface RunPageOptions {
+  limit?: number | undefined;
+  offset?: number | undefined;
+  /** Match ANY of these statuses (`status IN (...)`), for a caller that wants a set rather than the
+   *  single `status` argument — e.g. the in-flight runs a singleton leader is chosen among. */
+  statuses?: RunStatus[] | undefined;
+}
+
+/** One `(status, origin)` count from `GET runs/facets` — mirrors core's `RunFacetRow`. `origin` is
+ *  `null` for runs carrying none. */
+export interface RunFacetRow {
+  status: RunStatus;
+  origin: string | null;
+  count: number;
 }
 
 export const durableClient = {
+  /**
+   * A page of the run list. The server returns LIST ROWS: `input`, `output` and `error` are omitted
+   * (only the detail view renders them, and on a large deployment they are most of the bytes), which
+   * is why the three are optional on {@link WorkflowRun}.
+   */
   runs(
     status?: RunStatus,
     tag?: string,
     attr?: string[],
-    opts?: RunFilterOptions,
+    opts?: RunFilterOptions & RunPageOptions,
   ): Promise<WorkflowRun[]> {
     const q = new URLSearchParams();
     if (status) q.set('status', status);
@@ -432,9 +458,28 @@ export const durableClient = {
     // Each `attr` is a `key:op:value` predicate; repeated params are ANDed server-side.
     for (const a of attr ?? []) q.append('attr', a);
     if (opts?.namespace) q.set('namespace', opts.namespace);
-    if (opts?.origin) q.set('origin', opts.origin);
+    // `null` is the unattributed bucket, which has its own param — see `RunFilterOptions.origin`.
+    if (opts?.origin === null) q.set('unattributed', 'true');
+    else if (opts?.origin) q.set('origin', opts.origin);
+    // Repeated `status` params are ORed server-side into `RunQuery.statuses`.
+    for (const st of opts?.statuses ?? []) q.append('status', st);
+    if (opts?.limit !== undefined) q.set('limit', String(opts.limit));
+    if (opts?.offset !== undefined) q.set('offset', String(opts.offset));
     const qs = q.toString();
     return http<WorkflowRun[]>(qs ? `/runs?${qs}` : '/runs');
+  },
+  /**
+   * `(status, origin)` counts for the runs matching the same tag/tenant/attribute predicates as
+   * {@link runs} — the console's chips, counted over the WHOLE matching set rather than over the page
+   * it happens to be showing. `status`/`origin` are not sent: they are the axes being counted.
+   */
+  facets(tag?: string, attr?: string[], namespace?: string): Promise<RunFacetRow[]> {
+    const q = new URLSearchParams();
+    if (tag) q.set('tag', tag);
+    for (const a of attr ?? []) q.append('attr', a);
+    if (namespace) q.set('namespace', namespace);
+    const qs = q.toString();
+    return http<RunFacetRow[]>(qs ? `/runs/facets?${qs}` : '/runs/facets');
   },
   run(id: string): Promise<RunDetail> {
     return http<RunDetail>(`/runs/${encodeURIComponent(id)}`);
@@ -474,7 +519,8 @@ export const durableClient = {
     // Every facet the operator can see MUST be sent: a bulk retry/cancel that is scoped more widely
     // than the list it was launched from would act on runs the operator never looked at.
     if (filter.namespace) q.set('namespace', filter.namespace);
-    if (filter.origin) q.set('origin', filter.origin);
+    if (filter.origin === null) q.set('unattributed', 'true');
+    else if (filter.origin) q.set('origin', filter.origin);
     const qs = q.toString();
     return http<{ matched: number; applied: number }>(`/bulk/${action}${qs ? `?${qs}` : ''}`, {
       method: 'POST',

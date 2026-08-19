@@ -19,6 +19,28 @@ export interface HealthSummary {
 }
 
 /**
+ * The WORKFLOW queues that are stalled — backlog with no worker anywhere consuming it — by base name,
+ * ignoring the `@partition` suffix queues carry on a tenant (they aggregate across tenants, same rule
+ * as `deriveRunState`'s `groupIsStalled`).
+ *
+ * Read off worker health rather than off the run list, which matters now the console lists a PAGE: a
+ * banner derived from the runs on screen would go quiet the moment the stalled runs scrolled past the
+ * page boundary, which is exactly when an operator most needs to see it. A stalled queue has queued
+ * work by definition, so nothing is lost by not consulting the runs.
+ */
+export function stalledWorkflows(groups: readonly GroupHealth[]): string[] {
+  const backlog = new Set<string>();
+  const served = new Set<string>();
+  for (const group of groups) {
+    if (group.kind !== 'workflow') continue;
+    const base = baseHandlerName(group.group);
+    if (group.depth > 0) backlog.add(base);
+    if (group.liveWorkers.length > 0) served.add(base);
+  }
+  return [...backlog].filter((name) => !served.has(name)).sort();
+}
+
+/**
  * Reduce the (potentially ~40-queue) `GroupHealth` list to the one actionable signal: which
  * queues have backlog with nobody consuming it. `Array.prototype.sort` is stable (ES2019+), so
  * groups tied on `depth` keep their input order.

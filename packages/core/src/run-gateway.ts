@@ -1,6 +1,8 @@
 import type {
   EngineEvent,
   GroupHealth,
+  RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunResult,
   RunWaiting,
@@ -71,6 +73,12 @@ export abstract class RunGateway {
    *  parked on). The store-backed gateway resolves `waiting`; a proxy relays whatever the control
    *  plane sent. */
   abstract listRuns(query: RunQuery): Promise<RunListItem[]>;
+  /**
+   * Counts of the runs matching `query`, grouped by `(status, origin)` — what a console's status and
+   * origin chips display. Separate from {@link listRuns} precisely so the list can be PAGINATED: the
+   * page bounds what is rendered, these counts stay whole-set exact. Zero-count cells are absent.
+   */
+  abstract runFacets(query: RunFacetQuery): Promise<RunFacetRow[]>;
   /**
    * Bulk-resolve {@link RunWaiting} for an arbitrary set of run ids — for a consumer with its OWN
    * filtered/paginated run listing (so it isn't just `listRuns` under another name) that needs to know

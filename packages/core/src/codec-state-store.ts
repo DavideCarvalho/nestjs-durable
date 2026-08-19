@@ -1,4 +1,12 @@
-import type { RunQuery, SignalWaiter, StateStore, StepCheckpoint, WorkflowRun } from './interfaces';
+import type {
+  RunFacetQuery,
+  RunFacetRow,
+  RunQuery,
+  SignalWaiter,
+  StateStore,
+  StepCheckpoint,
+  WorkflowRun,
+} from './interfaces';
 
 /**
  * Transforms a payload value as it crosses the store boundary — e.g. encrypt-at-rest, compress, or
@@ -21,10 +29,21 @@ export interface PayloadCodec {
  * ```
  */
 export class CodecStateStore implements StateStore {
+  /**
+   * Forwarded verbatim — a facet cell counts `status`/`origin`, neither of which the codec touches
+   * (it encodes payloads: input/output/error). Bound as a PROPERTY, and only when the inner store
+   * actually aggregates, so `store.runFacets?.()` still reports absence through the wrapper instead
+   * of resolving to a silently wrong empty result.
+   */
+  readonly runFacets?: (query: RunFacetQuery) => Promise<RunFacetRow[]>;
+
   constructor(
     private readonly inner: StateStore,
     private readonly codec: PayloadCodec,
-  ) {}
+  ) {
+    const facets = inner.runFacets;
+    if (facets) this.runFacets = (query) => facets.call(inner, query);
+  }
 
   private enc(v: unknown): unknown {
     return v === undefined ? undefined : this.codec.encode(v);
@@ -143,6 +162,7 @@ export class CodecStateStore implements StateStore {
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return (await this.inner.listRuns(query)).map((r) => this.decRun(r));
   }
+
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
     return (await this.inner.listCheckpoints(runId)).map((c) => this.decCp(c));
   }

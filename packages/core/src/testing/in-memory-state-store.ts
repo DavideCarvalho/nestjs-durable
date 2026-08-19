@@ -1,4 +1,6 @@
 import type {
+  RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   SignalWaiter,
   StateStore,
@@ -6,6 +8,7 @@ import type {
   WorkflowRun,
 } from '../interfaces';
 import type { AttributeFilter } from '../interfaces';
+import { mergeRunFacetRows } from '../run-facets';
 import { type RunAttributeRow, normalizeAttributeRows } from '../search-attributes';
 
 /**
@@ -278,15 +281,18 @@ export class InMemoryStateStore implements StateStore {
     return out;
   }
 
-  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+  /** Every run satisfying `query`'s predicates, unsorted and unpaged — the shared body of
+   *  {@link listRuns} (which then sorts + pages it) and {@link runFacets} (which groups it). */
+  private matching(query: RunQuery): WorkflowRun[] {
     let runs = [...this.runs.values()];
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
     if (query.status) runs = runs.filter((r) => r.status === query.status);
     if (query.statuses) runs = runs.filter((r) => query.statuses?.includes(r.status));
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));
     if (query.namespace !== undefined) runs = runs.filter((r) => r.namespace === query.namespace);
-    // Exact match only: a run with no origin (unknown) matches no origin value — see `RunQuery.origin`.
-    if (query.origin !== undefined) runs = runs.filter((r) => r.origin === query.origin);
+    // Exact match on a value; `null` selects the runs carrying NO origin — see `RunQuery.origin`.
+    if (query.origin === null) runs = runs.filter((r) => r.origin == null);
+    else if (query.origin !== undefined) runs = runs.filter((r) => r.origin === query.origin);
     if (query.attributes?.length) {
       // Pushdown: intersect per-predicate candidate sets from the key-indexed side-table, so we only
       // ever materialize the runs that already satisfy EVERY attribute filter (no full per-run scan).
@@ -305,11 +311,22 @@ export class InMemoryStateStore implements StateStore {
       this.lastAttributeCandidates = ids.size;
       runs = runs.filter((r) => ids.has(r.id));
     }
+    return runs;
+  }
+
+  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+    const runs = this.matching(query);
     // Newest first (matches the store adapters' `createdAt DESC`) — recent runs on top in the dashboard.
     runs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
     const offset = query.offset ?? 0;
     const limit = query.limit ?? runs.length;
     return runs.slice(offset, offset + limit).map((r) => ({ ...r }));
+  }
+
+  async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    return mergeRunFacetRows(
+      this.matching(query).map((run) => ({ status: run.status, origin: run.origin, count: 1 })),
+    );
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {

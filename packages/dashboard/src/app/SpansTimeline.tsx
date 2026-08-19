@@ -1,6 +1,6 @@
 import { useQueries, useQuery } from '@tanstack/react-query';
 import type React from 'react';
-import { useMemo, useState } from 'react';
+import { memo, useMemo, useState } from 'react';
 import type { RunDetail, StepCheckpoint, WorkflowRun } from '../client/durable-client';
 import { durableClient, isStalePending } from '../client/durable-client';
 import { groupParallelSpans } from '../client/group-parallel-spans';
@@ -531,7 +531,12 @@ function ChildSpans({
  * A span waterfall (gantt) for the run: each checkpoint is a bar placed by its start offset and
  * sized by its real duration, so you read at a glance which step took the time. Click to inspect.
  */
-export function SpansTimeline({
+/** Memoised: this lays out one element per step, and a run can have hundreds (488 on the heaviest
+ *  measured). Without it, any parent render — the worker-health poll, a step-detail panel opening —
+ *  re-lays-out the whole run. Every prop it takes is a stable identity at the call site for the
+ *  same reason.
+ */
+export const SpansTimeline = memo(function SpansTimeline({
   run,
   timeline,
   selectedKey,
@@ -586,4 +591,4 @@ export function SpansTimeline({
       </div>
     </div>
   );
-}
+});

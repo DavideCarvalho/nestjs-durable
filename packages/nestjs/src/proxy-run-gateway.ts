@@ -3,6 +3,8 @@ import type {
   EngineEvent,
   GroupHealth,
   RunDetail,
+  RunFacetQuery,
+  RunFacetRow,
   RunGateway,
   RunListItem,
   RunQuery,
@@ -92,6 +94,11 @@ export class ProxyRunGateway implements RunGateway {
    *  it through as plain JSON, so a tenant's list rows name the wait too. */
   listRuns(query: RunQuery): Promise<RunListItem[]> {
     return this.request<RunListItem[]>({ kind: 'listRuns', query });
+  }
+
+  /** Counted on the operator, over the same tenant-scoped predicates its `listRuns` reply obeys. */
+  runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    return this.request<RunFacetRow[]>({ kind: 'runFacets', query });
   }
 
   /** Round-trips to the operator, which scopes the result to this tenant's own `@<tenant>` groups. */

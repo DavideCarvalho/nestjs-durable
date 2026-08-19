@@ -10,7 +10,7 @@ import {
   Position,
   ReactFlow,
 } from '@xyflow/react';
-import { useCallback, useMemo } from 'react';
+import { memo, useCallback, useMemo } from 'react';
 import {
   type RunDetail,
   type RunDisplayStatus,
@@ -280,7 +280,12 @@ function subCounts(s: StepCheckpoint): SubCounts | undefined {
   };
 }
 
-export function WorkflowGraph({
+/** Memoised: this lays out one element per step, and a run can have hundreds (488 on the heaviest
+ *  measured). Without it, any parent render — the worker-health poll, a step-detail panel opening —
+ *  re-lays-out the whole run. Every prop it takes is a stable identity at the call site for the
+ *  same reason.
+ */
+export const WorkflowGraph = memo(function WorkflowGraph({
   run,
   timeline,
   endStatus,
@@ -546,9 +551,14 @@ export function WorkflowGraph({
       nodesDraggable={false}
       panOnScroll
       minZoom={0.3}
+      // Mount only the nodes/edges inside the viewport. A run's graph is one node per step, and a
+      // long run has hundreds — measured at 488 steps, the graph alone was 11.7k DOM nodes and the
+      // pane froze for over a second on every poll. Culling costs nothing on the small graphs this
+      // was written for, because there is nothing offscreen to cull.
+      onlyRenderVisibleElements
     >
       <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#1c1c22" />
       <Controls showInteractive={false} position="bottom-right" />
     </ReactFlow>
   );
-}
+});

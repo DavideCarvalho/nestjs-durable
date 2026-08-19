@@ -135,3 +135,80 @@ describe('durableClient: 401 handling (session gone mid-console)', () => {
     });
   });
 });
+
+describe('durableClient: paging and the unattributed bucket', () => {
+  function captureUrl(): { calls: string[] } {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => {
+        calls.push(url);
+        return Promise.resolve(jsonResponse([], 200));
+      }),
+    );
+    return { calls };
+  }
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('bounds the listing with limit and offset', async () => {
+    const { calls } = captureUrl();
+
+    await durableClient.runs(undefined, undefined, undefined, { limit: 100, offset: 200 });
+
+    expect(calls[0]).toContain('limit=100');
+    expect(calls[0]).toContain('offset=200');
+  });
+
+  it('asks for the unattributed bucket by its own param, never as an origin VALUE', async () => {
+    // Any reserved `origin` string is a package name someone can legitimately publish, so absence
+    // gets its own spelling on the wire.
+    const { calls } = captureUrl();
+
+    await durableClient.runs(undefined, undefined, undefined, { origin: null });
+
+    expect(calls[0]).toContain('unattributed=true');
+    expect(calls[0]).not.toContain('origin=');
+  });
+
+  it('sends a concrete origin as `origin`, unchanged', async () => {
+    const { calls } = captureUrl();
+
+    await durableClient.runs(undefined, undefined, undefined, { origin: '@dudousxd/agent' });
+
+    expect(calls[0]).toContain('origin=%40dudousxd%2Fagent');
+    expect(calls[0]).not.toContain('unattributed');
+  });
+
+  it('repeats `status` for a status SET, which the server ORs', async () => {
+    const { calls } = captureUrl();
+
+    await durableClient.runs(undefined, undefined, undefined, {
+      statuses: ['running', 'suspended'],
+    });
+
+    expect(calls[0]).toContain('status=running');
+    expect(calls[0]).toContain('status=suspended');
+  });
+
+  it('carries the unattributed bucket into a BULK action, so it cannot act wider than the list', async () => {
+    const { calls } = captureUrl();
+
+    await durableClient.bulk('cancel', { origin: null });
+
+    expect(calls[0]).toContain('unattributed=true');
+  });
+
+  it('asks the facets endpoint only for the axes it does NOT report', async () => {
+    const { calls } = captureUrl();
+
+    await durableClient.facets('tier:pro', ['amount:gte:200'], 'acme');
+
+    expect(calls[0]).toContain('/runs/facets?');
+    expect(calls[0]).toContain('tag=tier%3Apro');
+    expect(calls[0]).toContain('namespace=acme');
+    expect(calls[0]).not.toContain('status=');
+    expect(calls[0]).not.toContain('origin=');
+    expect(calls[0]).not.toContain('limit=');
+  });
+});

@@ -501,6 +501,60 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    t(
+      'selects the UNATTRIBUTED runs when `origin` is null — the one thing a value cannot',
+      async () => {
+        // The console needs an "unknown origin" facet, and the same absence that makes `origin` match
+        // no value makes it unfilterable by one. `null` asks for `origin IS NULL` instead, which is what
+        // lets that facet page server-side rather than by holding every run in the browser.
+        await store.createRun(run({ id: 'a', origin: '@dudousxd/nestjs-agent' }));
+        await store.createRun(run({ id: 'b' }));
+        await store.createRun(run({ id: 'c' }));
+
+        expect((await store.listRuns({ origin: null })).map((r) => r.id).sort()).toEqual([
+          'b',
+          'c',
+        ]);
+        // And it stays ANDed with the other predicates rather than replacing them.
+        await store.createRun(run({ id: 'd', status: 'dead' }));
+        expect((await store.listRuns({ origin: null, status: 'dead' })).map((r) => r.id)).toEqual([
+          'd',
+        ]);
+      },
+    );
+
+    t('counts runs by (status, origin) without returning them', async () => {
+      // The aggregate behind a console's chips. It exists so the run LIST can be paged: the page
+      // bounds what is rendered, this bounds nothing — so a store that quietly applied the same limit
+      // would report the page size as the deployment's totals.
+      if (!store.runFacets) return; // optional on the port; every SQL adapter implements it
+      await store.createRun(run({ id: 'a', status: 'completed', origin: 'pkg-a' }));
+      await store.createRun(run({ id: 'b', status: 'completed', origin: 'pkg-a' }));
+      await store.createRun(run({ id: 'c', status: 'failed', origin: 'pkg-b' }));
+      await store.createRun(run({ id: 'd', status: 'failed' })); // unattributed
+      await store.createRun(run({ id: 'e', status: 'failed' })); // unattributed
+
+      const facets = await store.runFacets({});
+
+      expect(facets).toContainEqual({ status: 'completed', origin: 'pkg-a', count: 2 });
+      expect(facets).toContainEqual({ status: 'failed', origin: 'pkg-b', count: 1 });
+      // Runs with no origin are a real, countable cell here — `null`, not a stand-in name.
+      expect(facets).toContainEqual({ status: 'failed', origin: null, count: 2 });
+      expect(facets.reduce((n, f) => n + f.count, 0)).toBe(5);
+    });
+
+    t('narrows runFacets on the same predicates listRuns pages', async () => {
+      // A facet count that did not obey the tenant/tag the operator has typed would label the page
+      // with a number taken over a different set.
+      if (!store.runFacets) return;
+      await store.createRun(run({ id: 'a', status: 'failed', namespace: 'acme' }));
+      await store.createRun(run({ id: 'b', status: 'failed', namespace: 'globex' }));
+
+      expect(await store.runFacets({ namespace: 'acme' })).toEqual([
+        { status: 'failed', origin: null, count: 1 },
+      ]);
+    });
+
     t('orders listRuns newest-first and paginates with limit/offset', async () => {
       await store.createRun(run({ id: 'old', createdAt: new Date('2026-06-11T00:00:00.000Z') }));
       await store.createRun(run({ id: 'mid', createdAt: new Date('2026-06-11T00:00:01.000Z') }));

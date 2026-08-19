@@ -1,10 +1,12 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useCallback, useEffect, useState } from 'react';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   type GroupHealth,
   type RunDetail as RunDetailData,
   type RunDisplayStatus,
   type RunStatus,
+  SINGLETON_INFLIGHT_STATUSES,
   type StepCheckpoint,
   type WorkerStatus,
   type WorkflowRun,
@@ -21,17 +23,19 @@ import {
   UNKNOWN_ORIGIN,
   UNKNOWN_ORIGIN_TITLE,
   emptyRunsNotice,
-  filterByOrigin,
   knownOrigin,
+  matchesOrigin,
+  originFacetsFromCounts,
+  originFilterKey,
   originLabel,
-  unknownOriginCount,
+  unknownCountFromFacets,
 } from '../client/run-origin';
 import {
   compensationDisplayName,
   compensationSummary,
   splitCompensations,
 } from '../client/split-compensations';
-import { type HealthSummary, summarizeHealth } from '../client/summarize-health';
+import { type HealthSummary, stalledWorkflows, summarizeHealth } from '../client/summarize-health';
 import { OriginFacets } from './OriginFacets';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
@@ -629,9 +633,130 @@ function RunsListSkeleton() {
   );
 }
 
+/**
+ * One row of the run list. Split out and memoised because the list is LIVE: it refetches every few
+ * seconds, and without this every poll re-renders every mounted row even though a poll typically
+ * changes a handful. The derived state is computed here so a row that did not change does no work at
+ * all — `deriveRunState` joins against worker health and the sibling set, which is not free per row.
+ */
+const RunRow = memo(function RunRow({
+  run,
+  siblings,
+  health,
+  selected,
+  onSelect,
+  onSelectTag,
+  onSelectNamespace,
+  onSelectOrigin,
+}: {
+  run: WorkflowRun;
+  siblings: WorkflowRun[];
+  health: GroupHealth[];
+  selected: boolean;
+  onSelect: (id?: string) => void;
+  onSelectTag: (tag: string) => void;
+  onSelectNamespace: (namespace: string) => void;
+  onSelectOrigin: (filter: OriginFilter) => void;
+}) {
+  const state = deriveRunState(run, { runs: siblings, health });
+  // Bound as consts so the click handlers close over a narrowed value (a property read would
+  // widen back to `string | undefined` inside the callback). Both chips are POINTER shortcuts
+  // for the sidebar filters, exactly like the tag chips below: a nested <button> would be
+  // invalid markup inside the row's own button, so the row stays the keyboard target.
+  const tenant = run.namespace && run.namespace !== 'default' ? run.namespace : undefined;
+  const origin = knownOrigin(run.origin);
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(run.id)}
+      className={`flex w-full flex-col gap-1 px-4 py-3 text-left transition-colors ${
+        selected ? 'bg-zinc-900' : 'hover:bg-zinc-900/50'
+      }`}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate text-sm font-medium text-zinc-200">{run.workflow}</span>
+          {tenant && (
+            <Chip
+              variant="tenant"
+              className="mono shrink-0 cursor-pointer px-1 text-[9px] hover:border-sky-400/60 hover:text-sky-200"
+              title={`Tenant / worker-pool partition — click to show only ${tenant}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectNamespace(tenant);
+              }}
+            >
+              {tenant}
+            </Chip>
+          )}
+          {/* Origin, when the run HAS one. An unattributed run shows no chip here rather than
+              a row of `unknown` noise — the facet above keeps its count on screen, the empty
+              state names it, and the run's own detail header states it outright. */}
+          {origin && (
+            <Chip
+              variant="origin"
+              className="mono shrink-0 cursor-pointer px-1 text-[9px] hover:border-teal-400/60 hover:text-teal-200"
+              title={`Declared by ${origin} — click to show only this library's runs`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectOrigin({ kind: 'origin', origin });
+              }}
+            >
+              {originLabel(origin)}
+            </Chip>
+          )}
+          {run.id.startsWith('dlq:') && (
+            <Chip
+              variant="danger"
+              className="mono shrink-0 px-1 text-[9px] uppercase tracking-wider"
+            >
+              dlq
+            </Chip>
+          )}
+        </span>
+        <Badge status={state.status} />
+      </div>
+      {/* WHY it's parked, in domain terms — the signal/webhook/child token, the singleton leader,
+        or the handler that has no live worker. Only for the derived waiting states. */}
+      {state.detail && (
+        <div className={`mono truncate text-[11px] s-${state.status}`}>{state.detail}</div>
+      )}
+      <div className="flex items-center justify-between gap-2">
+        <span className="mono truncate text-[11px] text-zinc-600">{run.id}</span>
+        <span className="shrink-0 text-[11px] text-zinc-600">{relTime(run.updatedAt)}</span>
+      </div>
+      {run.tags && run.tags.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {run.tags.map((t) => (
+            // biome-ignore lint/a11y/useKeyWithClickEvents: a nested <button> is invalid inside the row's own button — the row stays the keyboard target, the tag is a pointer shortcut for the same filter the sidebar field applies
+            <span
+              key={t}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectTag(t);
+              }}
+              className={cn(
+                badgeVariants({ variant: 'outline' }),
+                'mono cursor-pointer hover:border-zinc-500 hover:text-zinc-200',
+              )}
+            >
+              #{t}
+            </span>
+          ))}
+        </div>
+      )}
+    </button>
+  );
+});
+
+/** Roughly how tall a row is before it is measured, in px — the virtualiser's starting guess for
+ *  rows it has not mounted yet. Every mounted row reports its real height back, so this only has to
+ *  be close enough to keep the scrollbar from jumping. */
+const ROW_ESTIMATE_PX = 86;
+
 function RunsList({
   runs,
-  allRuns,
+  siblings,
   health,
   loading,
   selected,
@@ -639,12 +764,14 @@ function RunsList({
   onSelectTag,
   onSelectNamespace,
   onSelectOrigin,
+  total,
+  onShowMore,
   emptyNotice,
 }: {
+  /** The loaded page, newest first. */
   runs: WorkflowRun[];
-  /** The FULL (unfiltered) run list — needed to place a run among its singleton siblings even when the
-   *  leader is filtered out of `runs`. */
-  allRuns: WorkflowRun[];
+  /** The in-flight runs a singleton row is placed among — see `App`'s `singletonSiblings`. */
+  siblings: WorkflowRun[];
   health: GroupHealth[];
   loading?: boolean;
   selected?: string | undefined;
@@ -652,10 +779,29 @@ function RunsList({
   onSelectTag: (tag: string) => void;
   onSelectNamespace: (namespace: string) => void;
   onSelectOrigin: (filter: OriginFilter) => void;
+  /** How many runs match the current filters in total — the page is a window onto this. */
+  total: number;
+  onShowMore: () => void;
   /** What to say when nothing matched — see `emptyRunsNotice`; an empty list must never read as
    *  "these runs do not exist" when the truth is "this filter cannot match them". */
   emptyNotice: ReturnType<typeof emptyRunsNotice>;
 }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Only the rows in view are mounted. A control plane's list runs to thousands of rows, and mounting
+  // them all is what made this pane freeze: ~12 DOM nodes per row put 115k nodes on the page, and
+  // every poll then had to reconcile all of them.
+  const virtualizer = useVirtualizer({
+    count: runs.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => ROW_ESTIMATE_PX,
+    // Rows vary in height (tags wrap, the "why parked" line is conditional), so measure the real one
+    // as each mounts instead of trusting the estimate.
+    measureElement: (el) => el.getBoundingClientRect().height,
+    overscan: 8,
+  });
+  const items = virtualizer.getVirtualItems();
+  const more = total > runs.length;
+
   if (loading && runs.length === 0) {
     return <RunsListSkeleton />;
   }
@@ -685,101 +831,49 @@ function RunsList({
     );
   }
   return (
-    <ul className="divide-y divide-line-soft">
-      {runs.map((r) => {
-        const state = deriveRunState(r, { runs: allRuns, health });
-        // Bound as consts so the click handlers close over a narrowed value (a property read would
-        // widen back to `string | undefined` inside the callback). Both chips are POINTER shortcuts
-        // for the sidebar filters, exactly like the tag chips below: a nested <button> would be
-        // invalid markup inside the row's own button, so the row stays the keyboard target.
-        const tenant = r.namespace && r.namespace !== 'default' ? r.namespace : undefined;
-        const origin = knownOrigin(r.origin);
-        return (
-          <li key={r.id}>
-            <button
-              type="button"
-              onClick={() => onSelect(r.id)}
-              className={`flex w-full flex-col gap-1 px-4 py-3 text-left transition-colors ${
-                selected === r.id ? 'bg-zinc-900' : 'hover:bg-zinc-900/50'
-              }`}
+    <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
+      {/* The separator is on the row, not `divide-y` on the list: virtualised children are absolutely
+          positioned, so a sibling-combinator rule would drop the border on whichever row happens to be
+          first in the window and move it as you scroll. */}
+      <ul className="relative" style={{ height: virtualizer.getTotalSize() }}>
+        {items.map((item) => {
+          const run = runs[item.index];
+          if (!run) return null;
+          return (
+            <li
+              key={run.id}
+              data-index={item.index}
+              ref={virtualizer.measureElement}
+              className="absolute left-0 top-0 w-full border-b border-line-soft"
+              style={{ transform: `translateY(${item.start}px)` }}
             >
-              <div className="flex items-center justify-between gap-2">
-                <span className="flex min-w-0 items-center gap-1.5">
-                  <span className="truncate text-sm font-medium text-zinc-200">{r.workflow}</span>
-                  {tenant && (
-                    <Chip
-                      variant="tenant"
-                      className="mono shrink-0 cursor-pointer px-1 text-[9px] hover:border-sky-400/60 hover:text-sky-200"
-                      title={`Tenant / worker-pool partition — click to show only ${tenant}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onSelectNamespace(tenant);
-                      }}
-                    >
-                      {tenant}
-                    </Chip>
-                  )}
-                  {/* Origin, when the run HAS one. An unattributed run shows no chip here rather than
-                      a row of `unknown` noise — the facet above keeps its count on screen, the empty
-                      state names it, and the run's own detail header states it outright. */}
-                  {origin && (
-                    <Chip
-                      variant="origin"
-                      className="mono shrink-0 cursor-pointer px-1 text-[9px] hover:border-teal-400/60 hover:text-teal-200"
-                      title={`Declared by ${origin} — click to show only this library's runs`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onSelectOrigin({ kind: 'origin', origin });
-                      }}
-                    >
-                      {originLabel(origin)}
-                    </Chip>
-                  )}
-                  {r.id.startsWith('dlq:') && (
-                    <Chip
-                      variant="danger"
-                      className="mono shrink-0 px-1 text-[9px] uppercase tracking-wider"
-                    >
-                      dlq
-                    </Chip>
-                  )}
-                </span>
-                <Badge status={state.status} />
-              </div>
-              {/* WHY it's parked, in domain terms — the signal/webhook/child token, the singleton leader,
-                or the handler that has no live worker. Only for the derived waiting states. */}
-              {state.detail && (
-                <div className={`mono truncate text-[11px] s-${state.status}`}>{state.detail}</div>
-              )}
-              <div className="flex items-center justify-between gap-2">
-                <span className="mono truncate text-[11px] text-zinc-600">{r.id}</span>
-                <span className="shrink-0 text-[11px] text-zinc-600">{relTime(r.updatedAt)}</span>
-              </div>
-              {r.tags && r.tags.length > 0 && (
-                <div className="flex flex-wrap gap-1">
-                  {r.tags.map((t) => (
-                    // biome-ignore lint/a11y/useKeyWithClickEvents: a nested <button> is invalid inside the row's own button — the row stays the keyboard target, the tag is a pointer shortcut for the same filter the sidebar field applies
-                    <span
-                      key={t}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onSelectTag(t);
-                      }}
-                      className={cn(
-                        badgeVariants({ variant: 'outline' }),
-                        'mono cursor-pointer hover:border-zinc-500 hover:text-zinc-200',
-                      )}
-                    >
-                      #{t}
-                    </span>
-                  ))}
-                </div>
-              )}
-            </button>
-          </li>
-        );
-      })}
-    </ul>
+              <RunRow
+                run={run}
+                siblings={siblings}
+                health={health}
+                selected={selected === run.id}
+                onSelect={onSelect}
+                onSelectTag={onSelectTag}
+                onSelectNamespace={onSelectNamespace}
+                onSelectOrigin={onSelectOrigin}
+              />
+            </li>
+          );
+        })}
+      </ul>
+      {/* The list is a page, so say so — an operator must never read the bottom of it as the end of
+          the runs. The count is the server's, not the page's. */}
+      <div className="flex items-center gap-2 border-t border-line px-4 py-2">
+        <span className="mono text-[10px] text-zinc-600">
+          {runs.length} of {total}
+        </span>
+        {more && (
+          <Button variant="chip" size="xs" className="mono ml-auto rounded" onClick={onShowMore}>
+            show more
+          </Button>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -831,7 +925,20 @@ function CompensationSection({
   );
 }
 
-function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => void }) {
+/**
+ * The open run: header, graph, span timeline, step detail.
+ *
+ * Memoised on its two props (both stable — `id` is a string, `onOpenRun` a `useCallback`), so the run
+ * list's poll every few seconds does NOT drag this subtree through a re-render. That matters because
+ * the subtree is proportional to the run's step count: on the heaviest run measured (488 checkpoints)
+ * an unmemoised parent render cost ~600ms of blocked main thread, several times a minute, while the
+ * run itself had not changed at all. This pane re-renders on its OWN query now, which is exactly when
+ * something about the run actually moved.
+ */
+const RunDetail = memo(function RunDetail({
+  id,
+  onOpenRun,
+}: { id: string; onOpenRun: (id: string) => void }) {
   const qc = useQueryClient();
   const { data } = useQuery({
     queryKey: ['run', id],
@@ -855,11 +962,9 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     queryFn: () => durableClient.workers(),
     refetchInterval: 5000,
   });
-  const { data: siblingRuns = [] } = useQuery({
-    queryKey: ['runs', '', ''],
-    queryFn: () => durableClient.runs(),
-    refetchInterval: 3000,
-  });
+  // The sibling set is only consulted when THIS run is a parked singleton, so ask for it only then.
+  const openRun = (data as RunDetailData | undefined)?.run;
+  const siblingRuns = useSingletonSiblings(openRun !== undefined && anySingleton([openRun]));
   // Dead-letter link: a `dead` run may have been routed to a `dlq:<id>` handler workflow. Probe for
   // it (retry off so a 404 just hides the link) so we never render a dead link.
   const handlerId =
@@ -968,7 +1073,9 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     window.addEventListener('pointerup', up);
   }
 
-  function toggleChild(childId: string) {
+  // Stable identity: `WorkflowGraph` and `SpansTimeline` are memoised, and a callback rebuilt each
+  // render would defeat that — they would re-render (and re-lay-out every step) on any parent render.
+  const toggleChild = useCallback((childId: string) => {
     setExpandedChildren((prev) => {
       const next = new Set(prev);
       if (next.has(childId)) {
@@ -978,14 +1085,24 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       }
       return next;
     });
-  }
-
-  if (!data) return <div className="p-8 text-sm text-zinc-600">Loading run…</div>;
-  const { run, timeline } = data;
+  }, []);
+  const selectStep = useCallback((step: StepCheckpoint, stepRun: WorkflowRun) => {
+    setSelStep({ step, run: stepRun });
+  }, []);
   // Saga compensations (seq < 0, one per undone step, in reverse) never mix into the body's
   // graph/spans/step-count — split them out once, up front, and feed `body` to everything below that
   // renders the normal flow. `compensations` gets its own section further down.
-  const { body, compensations } = splitCompensations(timeline);
+  //
+  // Memoised, and ABOVE the early return so it can be (hooks cannot follow one). `body` is the prop
+  // the memoised graph and span timeline are keyed on, so rebuilding the array on every render would
+  // re-lay-out every step of the run each time anything else on the page moved. React Query's
+  // structural sharing keeps `data.timeline` identical across a poll that changed nothing, so this
+  // recomputes exactly when the run's steps actually did.
+  const split = useMemo(() => splitCompensations(data?.timeline ?? []), [data?.timeline]);
+
+  if (!data) return <div className="p-8 text-sm text-zinc-600">Loading run…</div>;
+  const { run } = data;
+  const { body, compensations } = split;
   const compSummary = compensationSummary(compensations);
   // A dead-letter run is a recovery path, not the normal flow — surface it as a banner. The two ends
   // of the relationship, linked both ways:
@@ -1288,7 +1405,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               timeline={body}
               endStatus={detailState.status}
               selectedKey={selKey}
-              onSelect={(step, stepRun) => setSelStep({ step, run: stepRun })}
+              onSelect={selectStep}
               onOpenRun={onOpenRun}
               fmtDuration={durMs}
               expanded={expandedChildren}
@@ -1316,7 +1433,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               run={run}
               timeline={body}
               selectedKey={selKey}
-              onSelect={(step, stepRun) => setSelStep({ step, run: stepRun })}
+              onSelect={selectStep}
               onOpenRun={onOpenRun}
               expanded={expandedChildren}
               onToggleChild={toggleChild}
@@ -1378,7 +1495,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       </Dialog>
     </div>
   );
-}
+});
 
 /** The open run id encoded in the URL hash (`#/run/<id>`) — so a run is deep-linkable / shareable. */
 function runIdFromHash(): string | undefined {
@@ -1387,6 +1504,47 @@ function runIdFromHash(): string | undefined {
   const id = match?.[1];
   return id ? decodeURIComponent(id) : undefined;
 }
+
+/** Whether any of these runs is parked as a singleton — the only case whose display state needs the
+ *  sibling set at all. On a deployment that uses no singletons this is always false, so the query
+ *  below never runs. */
+function anySingleton(runs: readonly WorkflowRun[]): boolean {
+  return runs.some(
+    (r) => r.status === 'suspended' && r.tags?.some((t) => t.startsWith('singleton:')),
+  );
+}
+
+/**
+ * The IN-FLIGHT runs a singleton row is placed among — `deriveRunState` picks the oldest of them as
+ * the leader, exactly as the engine's `admit()` does.
+ *
+ * Fetched as its own bounded query rather than reusing whatever list is on screen, because both
+ * callers now hold a PAGE and the leader is by definition the oldest sibling — the row most likely to
+ * have fallen off it. In-flight is the working set, not the history, so this stays small no matter how
+ * many runs a control plane has accumulated. One `queryKey` for both callers, so the list and an open
+ * run share a single fetch.
+ */
+function useSingletonSiblings(needed: boolean): WorkflowRun[] {
+  const { data = [] } = useQuery({
+    queryKey: ['runs', 'in-flight'],
+    queryFn: () =>
+      durableClient.runs(undefined, undefined, undefined, {
+        statuses: SINGLETON_INFLIGHT_STATUSES,
+        limit: 500,
+      }),
+    enabled: needed,
+    refetchInterval: 5000,
+  });
+  return data;
+}
+
+/**
+ * How many runs one page of the list holds. Bounded deliberately: a control plane accumulates runs
+ * for as long as its retention policy keeps them (tens of thousands is ordinary), and an unbounded
+ * listing costs the browser both the transfer and a DOM node per row. 100 fills the pane several
+ * times over; "show more" raises the ceiling for an operator who wants to scroll further back.
+ */
+const PAGE_SIZE = 100;
 
 export function App() {
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
@@ -1417,23 +1575,57 @@ export function App() {
       window.removeEventListener('popstate', sync);
     };
   }, []);
+  // How many pages of the list are loaded. Every filter change resets it (see below) — an operator who
+  // narrows the view expects to land at the top of the new set, not 900 rows into it.
+  const [pages, setPages] = useState(1);
   const qc = useQueryClient();
   // Comma-separated `key:op:value` predicates (e.g. `amount:gte:200, tier:eq:pro`), ANDed server-side.
-  const attrPredicates = attrFilter
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const attrPredicates = useMemo(
+    () =>
+      attrFilter
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    [attrFilter],
+  );
+  const attrKey = attrPredicates.join('|');
+  // `undefined` = every origin; `null` = the unattributed bucket, which needs its own spelling because
+  // no string value matches a run that has no origin. Both go to the SERVER now: with a paged list, a
+  // facet applied in the browser would filter the page rather than the deployment.
+  const originParam =
+    originFilter.kind === 'origin'
+      ? originFilter.origin
+      : originFilter.kind === 'unknown'
+        ? null
+        : undefined;
+  const originKey = originFilterKey(originFilter);
+  const limit = PAGE_SIZE * pages;
   const { data: runs = [], isPending: runsPending } = useQuery({
-    queryKey: ['runs', tagFilter, attrPredicates.join('|'), namespaceFilter],
+    queryKey: ['runs', filter, tagFilter, attrKey, namespaceFilter, originKey, limit],
     queryFn: () =>
       durableClient.runs(
-        undefined,
+        filter === 'all' ? undefined : filter,
         tagFilter || undefined,
         attrPredicates.length ? attrPredicates : undefined,
         // An empty box sends NO `namespace` param — all tenants, the historical default.
-        { namespace: namespaceFilter || undefined },
+        { namespace: namespaceFilter || undefined, origin: originParam, limit },
       ),
     refetchInterval: 3000, // keep the run list live
+    // "Show more" and every filter change move the query key. Without this the list would blank back
+    // to its skeleton on each one, which reads as "the runs went away" rather than "loading more".
+    placeholderData: keepPreviousData,
+  });
+  // The chips' numbers, counted server-side over the WHOLE matching set. This is what makes paging the
+  // list safe: the page bounds what is rendered, never what the operator is told exists.
+  const { data: facets = [] } = useQuery({
+    queryKey: ['run-facets', tagFilter, attrKey, namespaceFilter],
+    queryFn: () =>
+      durableClient.facets(
+        tagFilter || undefined,
+        attrPredicates.length ? attrPredicates : undefined,
+        namespaceFilter || undefined,
+      ),
+    refetchInterval: 5000,
   });
   // Worker health, joined into each run row (no-worker) and the banner. Shares the `['workers']` cache
   // with the Workers panel (same queryKey → one fetch); polled a touch faster so "no worker" clears
@@ -1450,62 +1642,68 @@ export function App() {
         tag: tagFilter || undefined,
         attr: attrPredicates.length ? attrPredicates : undefined,
         namespace: namespaceFilter || undefined,
-        // Only a CONCRETE origin can be pushed to the server; `unknown` has no `RunQuery` spelling,
-        // which is exactly why the bulk buttons are disabled while it is selected (below) — sending
-        // no param there would quietly widen a destructive action to every origin.
-        origin: originFilter.kind === 'origin' ? originFilter.origin : undefined,
+        // Every facet the operator can see, INCLUDING the unattributed bucket — `origin: null` is sent
+        // as its own param, so a bulk action is scoped to exactly the set the list was showing.
+        origin: originParam,
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['runs'] }),
   });
 
-  // The origin facet is applied FIRST, so the status counts and the list agree with the chip that is
-  // lit. `runs` (unfaceted) still feeds the facet counts and the singleton lineage below.
-  const originScoped = filterByOrigin(runs, originFilter);
-  const counts = originScoped.reduce<Record<string, number>>((acc, r) => {
-    acc[r.status] = (acc[r.status] ?? 0) + 1;
+  // Status chips, from the server's facet counts pivoted onto the lit origin chip — so the two chip
+  // rows agree with each other AND with the whole matching set, not with the page on screen.
+  const counts = useMemo(() => {
+    const acc: Record<string, number> = {};
+    for (const cell of facets) {
+      if (!matchesOrigin({ origin: cell.origin ?? undefined }, originFilter)) continue;
+      acc[cell.status] = (acc[cell.status] ?? 0) + cell.count;
+    }
     return acc;
-  }, {});
-  const shown = filter === 'all' ? originScoped : originScoped.filter((r) => r.status === filter);
-  // Counted BEFORE the origin facet — the whole point is to be able to say "these N runs cannot be
-  // matched by any package filter" at the moment a package filter shows nothing.
-  const unattributed = unknownOriginCount(runs);
+  }, [facets, originFilter]);
+  // Counted over EVERY origin — the whole point is to be able to say "these N runs cannot be matched
+  // by any package filter" at the moment a package filter shows nothing.
+  const unattributed = useMemo(() => unknownCountFromFacets(facets), [facets]);
+  // How many runs the current filters match in total, so the list can say what it is NOT showing.
+  // Scoped by the lit STATUS chip as well as the origin one, or "show more" would offer to load runs
+  // the query cannot return and the summary line would count runs that are not in the list.
+  const matchedTotal = useMemo(
+    () =>
+      filter === 'all' ? Object.values(counts).reduce((a, b) => a + b, 0) : (counts[filter] ?? 0),
+    [counts, filter],
+  );
   const anyFilter =
     filter !== 'all' ||
     Boolean(tagFilter) ||
     Boolean(namespaceFilter) ||
     attrPredicates.length > 0 ||
     originFilter.kind !== 'all';
-  // Why "retry all"/"cancel all" are off, or `undefined` when they're fine. The `unknown` facet is
-  // the one filter the server cannot be told about, so a bulk action launched under it would act on
-  // runs that are NOT on screen. Refusing loudly beats acting wider than the operator can see.
-  const bulkBlocked =
-    originFilter.kind === 'unknown'
-      ? 'Bulk actions cannot be scoped to unclassified runs — runs with no origin have no server-side filter. Retry or cancel them from their own run view.'
-      : undefined;
-  // Workflows with runs waiting on a handler that has NO live worker — surfaced as a banner so it's
+  const originChips = useMemo(() => originFacetsFromCounts(facets), [facets]);
+  // Workflows whose queue has backlog and no worker consuming it — surfaced as a banner so it's
   // obvious nothing will progress until a worker rejoins (the "control plane up, no worker" case).
-  const stalledWorkflows = [
-    ...new Set(
-      runs
-        .filter((r) => deriveRunState(r, { runs, health }).status === 'no-worker')
-        .map((r) => r.workflow),
-    ),
-  ];
+  const stalled = useMemo(() => stalledWorkflows(health), [health]);
+
+  const singletonSiblings = useSingletonSiblings(useMemo(() => anySingleton(runs), [runs]));
+
+  // Landing 900 rows into a set the operator just re-scoped would be a non-sequitur; every filter
+  // change starts the new list at its first page.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the filters are the trigger, `pages` is the target
+  useEffect(() => {
+    setPages(1);
+  }, [filter, tagFilter, attrKey, namespaceFilter, originKey]);
 
   return (
     <TooltipProvider>
       <div className="app-bg" />
       <div className="relative z-10 flex h-full flex-col">
         <Header counts={counts} filter={filter} onFilter={setFilter} />
-        {stalledWorkflows.length > 0 && (
+        {stalled.length > 0 && (
           <div className="flex items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-200">
             <span className="s-no-worker inline-flex items-center gap-1.5">
               <span className="dot s-no-worker" aria-hidden />
             </span>
             <span>
               Runs waiting on handlers with no live worker:{' '}
-              <span className="mono text-amber-100">{stalledWorkflows.join(', ')}</span>. Start a
-              worker to unblock.
+              <span className="mono text-amber-100">{stalled.join(', ')}</span>. Start a worker to
+              unblock.
             </span>
           </div>
         )}
@@ -1544,11 +1742,11 @@ export function App() {
                 title="Tenant / worker-pool partition (WorkflowRun.namespace). Empty shows every tenant."
               />
             </div>
-            <OriginFacets runs={runs} value={originFilter} onChange={setOriginFilter} />
-            {anyFilter && shown.length > 0 && (
+            <OriginFacets facets={originChips} value={originFilter} onChange={setOriginFilter} />
+            {anyFilter && matchedTotal > 0 && (
               <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
                 <span className="mono text-[10px] text-zinc-500">
-                  {shown.length} {filter !== 'all' ? filter : ''} {tagFilter && `#${tagFilter}`}
+                  {matchedTotal} {filter !== 'all' ? filter : ''} {tagFilter && `#${tagFilter}`}
                   {namespaceFilter && ` @${namespaceFilter}`}
                   {originFilter.kind === 'origin' && ` ⬡${originLabel(originFilter.origin)}`}
                   {originFilter.kind === 'unknown' && ` ⬡${UNKNOWN_ORIGIN}`}
@@ -1557,8 +1755,7 @@ export function App() {
                 <Button
                   variant="brand"
                   size="xs"
-                  disabled={bulk.isPending || bulkBlocked !== undefined}
-                  title={bulkBlocked}
+                  disabled={bulk.isPending}
                   onClick={() => bulk.mutate('retry')}
                   className="mono ml-auto rounded"
                 >
@@ -1567,8 +1764,7 @@ export function App() {
                 <Button
                   variant="danger"
                   size="xs"
-                  disabled={bulk.isPending || bulkBlocked !== undefined}
-                  title={bulkBlocked}
+                  disabled={bulk.isPending}
                   onClick={() => bulk.mutate('cancel')}
                   className="mono rounded"
                 >
@@ -1576,24 +1772,24 @@ export function App() {
                 </Button>
               </div>
             )}
-            <div className="min-h-0 flex-1 overflow-auto">
-              <RunsList
-                runs={shown}
-                allRuns={runs}
-                health={health}
-                loading={runsPending}
-                selected={selected}
-                onSelect={setSelected}
-                onSelectTag={setTagFilter}
-                onSelectNamespace={setNamespaceFilter}
-                onSelectOrigin={setOriginFilter}
-                emptyNotice={emptyRunsNotice({
-                  anyFilter,
-                  origin: originFilter,
-                  unknownCount: unattributed,
-                })}
-              />
-            </div>
+            <RunsList
+              runs={runs}
+              siblings={singletonSiblings}
+              health={health}
+              loading={runsPending}
+              selected={selected}
+              onSelect={setSelected}
+              onSelectTag={setTagFilter}
+              onSelectNamespace={setNamespaceFilter}
+              onSelectOrigin={setOriginFilter}
+              total={matchedTotal}
+              onShowMore={() => setPages((n) => n + 1)}
+              emptyNotice={emptyRunsNotice({
+                anyFilter,
+                origin: originFilter,
+                unknownCount: unattributed,
+              })}
+            />
           </aside>
           <main className="min-h-0">
             {selected ? (
