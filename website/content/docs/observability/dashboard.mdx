@@ -401,8 +401,12 @@ action is scoped to precisely the set the list was showing, unattributed runs in
 A control plane accumulates runs for as long as its retention policy keeps them, so "list the runs" is
 not a bounded request. The console treats it as a **page**:
 
-- `GET runs` takes `limit` / `offset`, and the SPA asks for 100 rows at a time — **show more** raises
-  the ceiling for an operator scrolling further back. Every store adapter implements both.
+- `GET runs` takes `limit` / `offset`, and the SPA asks for 100 rows at a time, extending the page as
+  the last rows scroll into view. Every store adapter implements both. The load starts a lookahead
+  before the bottom, so the list reads as continuous rather than stalling at each boundary, and it is
+  gated on the fetch in flight and on the count the page was last requested at — otherwise a control
+  plane whose `total` briefly runs ahead of its own listing would walk the page size up on every
+  render, which is the failure paging exists to prevent.
 - The list is **virtualised**: only the rows in the viewport are mounted, so a deep page costs the same
   DOM as a shallow one.
 - `GET runs` returns list **rows**, not whole runs — `input`, `output` and `error` are omitted, because
