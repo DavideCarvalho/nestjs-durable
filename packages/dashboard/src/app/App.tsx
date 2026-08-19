@@ -42,6 +42,7 @@ import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
 import { WorkflowGraph } from './WorkflowGraph';
 import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
+import { shouldLoadMore } from './load-more';
 import { parentRunIdOf, retryOriginOf } from './run-lineage';
 import { Badge as Chip, badgeVariants } from './ui/badge';
 import { Button } from './ui/button';
@@ -754,6 +755,11 @@ const RunRow = memo(function RunRow({
  *  be close enough to keep the scrollbar from jumping. */
 const ROW_ESTIMATE_PX = 86;
 
+/** How many rows from the end the next page starts loading. Wide enough that a page lands before the
+ *  operator reaches the bottom on a normal scroll, so the list reads as continuous rather than as a
+ *  stall at every boundary. */
+const LOAD_AHEAD_ROWS = 12;
+
 function RunsList({
   runs,
   siblings,
@@ -765,7 +771,8 @@ function RunsList({
   onSelectNamespace,
   onSelectOrigin,
   total,
-  onShowMore,
+  onLoadMore,
+  loadingMore,
   emptyNotice,
 }: {
   /** The loaded page, newest first. */
@@ -781,7 +788,10 @@ function RunsList({
   onSelectOrigin: (filter: OriginFilter) => void;
   /** How many runs match the current filters in total — the page is a window onto this. */
   total: number;
-  onShowMore: () => void;
+  /** Extend the page. Called by the scroll watcher below, never by the operator directly. */
+  onLoadMore: () => void;
+  /** Whether a fetch is in flight. Gates the watcher so scrolling cannot stack up requests. */
+  loadingMore?: boolean | undefined;
   /** What to say when nothing matched — see `emptyRunsNotice`; an empty list must never read as
    *  "these runs do not exist" when the truth is "this filter cannot match them". */
   emptyNotice: ReturnType<typeof emptyRunsNotice>;
@@ -801,6 +811,27 @@ function RunsList({
   });
   const items = virtualizer.getVirtualItems();
   const more = total > runs.length;
+  // The page grows as the last rows come into view. Driven off the VIRTUALISER rather than a scroll
+  // handler or a sentinel element: the virtualiser already knows which rows are rendered, and it is
+  // the only thing that knows it while rows are still being measured.
+  const lastIndex = items.length > 0 ? (items[items.length - 1]?.index ?? -1) : -1;
+  // The length the last request was fired at. Without it, a control plane whose `total` is momentarily
+  // ahead of what `listRuns` returns (a run settled between the two queries) would re-fire on every
+  // render forever, since the list never reaches the count the facets promised.
+  const requestedAtLength = useRef(-1);
+  useEffect(() => {
+    const go = shouldLoadMore({
+      hasMore: more,
+      loading: Boolean(loadingMore),
+      lastRenderedIndex: lastIndex,
+      loadedCount: runs.length,
+      requestedAtCount: requestedAtLength.current,
+      loadAhead: LOAD_AHEAD_ROWS,
+    });
+    if (!go) return;
+    requestedAtLength.current = runs.length;
+    onLoadMore();
+  }, [more, loadingMore, lastIndex, runs.length, onLoadMore]);
 
   if (loading && runs.length === 0) {
     return <RunsListSkeleton />;
@@ -862,15 +893,20 @@ function RunsList({
         })}
       </ul>
       {/* The list is a page, so say so — an operator must never read the bottom of it as the end of
-          the runs. The count is the server's, not the page's. */}
-      <div className="flex items-center gap-2 border-t border-line px-4 py-2">
+          the runs. The count is the server's, not the page's, and it is the only thing on screen that
+          says more is coming while the next page is in flight. */}
+      <div
+        className="flex items-center gap-2 border-t border-line px-4 py-2"
+        aria-live="polite"
+        aria-busy={more && loadingMore}
+      >
         <span className="mono text-[10px] text-zinc-600">
           {runs.length} of {total}
         </span>
         {more && (
-          <Button variant="chip" size="xs" className="mono ml-auto rounded" onClick={onShowMore}>
-            show more
-          </Button>
+          <span className="mono ml-auto text-[10px] text-zinc-600">
+            {loadingMore ? 'loading…' : 'scroll for more'}
+          </span>
         )}
       </div>
     </div>
@@ -1600,7 +1636,11 @@ export function App() {
         : undefined;
   const originKey = originFilterKey(originFilter);
   const limit = PAGE_SIZE * pages;
-  const { data: runs = [], isPending: runsPending } = useQuery({
+  const {
+    data: runs = [],
+    isPending: runsPending,
+    isFetching: runsFetching,
+  } = useQuery({
     queryKey: ['runs', filter, tagFilter, attrKey, namespaceFilter, originKey, limit],
     queryFn: () =>
       durableClient.runs(
@@ -1682,6 +1722,10 @@ export function App() {
   const stalled = useMemo(() => stalledWorkflows(health), [health]);
 
   const singletonSiblings = useSingletonSiblings(useMemo(() => anySingleton(runs), [runs]));
+
+  const loadMore = useCallback(() => {
+    setPages((n) => n + 1);
+  }, []);
 
   // Landing 900 rows into a set the operator just re-scoped would be a non-sequitur; every filter
   // change starts the new list at its first page.
@@ -1783,7 +1827,8 @@ export function App() {
               onSelectNamespace={setNamespaceFilter}
               onSelectOrigin={setOriginFilter}
               total={matchedTotal}
-              onShowMore={() => setPages((n) => n + 1)}
+              onLoadMore={loadMore}
+              loadingMore={runsFetching}
               emptyNotice={emptyRunsNotice({
                 anyFilter,
                 origin: originFilter,
