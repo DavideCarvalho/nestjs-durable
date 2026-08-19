@@ -42,6 +42,13 @@ export class RunRequestResponder {
       return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
+    if (body.kind === 'runFacets') {
+      // Same forced scope as `listRuns` above, for the same reason: the counts label a tenant's own
+      // page, so they must be taken over exactly that tenant's runs and no one else's.
+      const data = await this.gateway.runFacets({ ...body.query, namespace: msg.tenant });
+      return { requestId: msg.requestId, result: { ok: true, data } };
+    }
+
     if (body.kind === 'workerHealth') {
       // Not runId-bearing, so it can't ride the getRunDetail namespace check below. Scope by the
       // group-name convention instead: a tenant's queues are suffixed `<name>@<tenant>`, so keep only
@@ -106,6 +113,7 @@ export class RunRequestResponder {
     body: Exclude<
       RunRequest['body'],
       | { kind: 'listRuns' }
+      | { kind: 'runFacets' }
       | { kind: 'getRunDetail' }
       | { kind: 'workerHealth' }
       | { kind: 'waitingFor' }

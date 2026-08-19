@@ -12,6 +12,49 @@ import {
 } from '@nestjs/common';
 import { parseAttrFilters } from './attr-filter.js';
 import { DashboardService } from './dashboard.service.js';
+import { type RunListRow, toRunListRow } from './run-list-row.js';
+
+/**
+ * How the console asks for a page. An absent bound means "no bound" — the historical whole-listing
+ * behaviour, kept so an existing API consumer is not silently truncated. A non-numeric or negative
+ * value is treated as absent rather than coerced to 0, which would return an empty page and read as
+ * "there are no runs".
+ */
+function pageBounds(limit?: string, offset?: string): { limit?: number; offset?: number } {
+  const bound = (raw?: string): number | undefined => {
+    const n = Number(raw);
+    return raw !== undefined && raw !== '' && Number.isInteger(n) && n >= 0 ? n : undefined;
+  };
+  const l = bound(limit);
+  const o = bound(offset);
+  return { ...(l !== undefined ? { limit: l } : {}), ...(o !== undefined ? { offset: o } : {}) };
+}
+
+/**
+ * One `status` narrows to that status; several (a repeated param) match ANY of them, which is how a
+ * caller asks for a SET — the console's in-flight sibling query, for one. Kept as one param rather
+ * than a second `statuses` param so `?status=running&status=suspended` reads the obvious way and an
+ * existing single-value caller is unaffected.
+ */
+function statusPredicate(status?: RunStatus | RunStatus[]): {
+  status?: RunStatus;
+  statuses?: RunStatus[];
+} {
+  if (Array.isArray(status)) return status.length ? { statuses: status } : {};
+  return status ? { status } : {};
+}
+
+/**
+ * The origin predicate, which has THREE states rather than two: a named package, the unattributed
+ * bucket, or no restriction. `unattributed=true` is its own param instead of a reserved `origin`
+ * value because any reserved string is a package name someone can legitimately have, and a console
+ * that quietly reinterpreted it would show the wrong runs. An explicit `unattributed` wins over a
+ * concurrent `origin`, which is a contradictory request either way.
+ */
+function originPredicate(origin?: string, unattributed?: string): { origin?: string | null } {
+  if (unattributed === 'true' || unattributed === '1') return { origin: null };
+  return origin ? { origin } : {};
+}
 
 /** JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule). */
 @Controller()
@@ -27,21 +70,50 @@ export class DurableApiController {
    * `''` through would be an exact match on a tenant nobody has, i.e. a silently empty console.
    */
   @Get('runs')
-  runs(
-    @Query('status') status?: RunStatus,
+  async runs(
+    @Query('status') status?: RunStatus | RunStatus[],
     @Query('workflow') workflow?: string,
     @Query('tag') tag?: string,
     @Query('attr') attr?: string | string[],
     @Query('namespace') namespace?: string,
     @Query('origin') origin?: string,
-  ) {
-    return this.dashboard.listRuns({
-      status,
+    @Query('unattributed') unattributed?: string,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ): Promise<RunListRow[]> {
+    const runs = await this.dashboard.listRuns({
+      ...statusPredicate(status),
       workflow,
       tag,
       attributes: parseAttrFilters(attr),
       namespace: namespace || undefined,
-      origin: origin || undefined,
+      ...originPredicate(origin, unattributed),
+      ...pageBounds(limit, offset),
+    });
+    // Rows only — the three payload fields are the bulk of a large listing and belong to `runs/:id`.
+    return runs.map(toRunListRow);
+  }
+
+  /**
+   * `(status, origin)` counts for the runs matching the same tag/tenant/attribute predicates as
+   * `GET runs`. This is what lets that listing be PAGED at all: the page bounds what the console
+   * renders, this bounds nothing and keeps its status and origin chips exact.
+   *
+   * `status`, `origin` and the page bounds are deliberately NOT accepted — they are the axes being
+   * counted, so narrowing by them would report the answer back to itself.
+   */
+  @Get('runs/facets')
+  facets(
+    @Query('workflow') workflow?: string,
+    @Query('tag') tag?: string,
+    @Query('attr') attr?: string | string[],
+    @Query('namespace') namespace?: string,
+  ) {
+    return this.dashboard.runFacets({
+      workflow,
+      tag,
+      attributes: parseAttrFilters(attr),
+      namespace: namespace || undefined,
     });
   }
 
@@ -104,6 +176,7 @@ export class DurableApiController {
     @Query('compensate') compensate?: string,
     @Query('namespace') namespace?: string,
     @Query('origin') origin?: string,
+    @Query('unattributed') unattributed?: string,
   ) {
     return this.dashboard.bulk(
       action === 'cancel' ? 'cancel' : 'retry',
@@ -113,7 +186,10 @@ export class DurableApiController {
         workflow,
         attributes: parseAttrFilters(attr),
         namespace: namespace || undefined,
-        origin: origin || undefined,
+        // The unattributed bucket is a scope a console can actually SELECT, so a bulk action launched
+        // under it must be narrowed to it. Dropping the param would widen a retry/cancel to every
+        // origin — acting on runs the operator was not looking at.
+        ...originPredicate(origin, unattributed),
       },
       { compensate: compensate === 'true' },
     );

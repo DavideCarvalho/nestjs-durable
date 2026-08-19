@@ -380,13 +380,13 @@ the two things happened ("nothing matched" vs "these N runs cannot be matched by
 and offers a jump into the unclassified ones. A run's detail header states `origin unknown` outright
 for the same reason, instead of leaving the field blank and letting it read as "the app".
 
-That is also why the origin facet is counted **in the browser**, over the list the console already
-holds, while tenant is pushed to the store. A store-side facet would have reported zero unattributed
-runs the moment an operator picked a library — which reads as "those runs do not exist". The
-server-side `origin` param is still wired and still sent with bulk actions, so **retry all** /
-**cancel all** stay scoped to the list they were launched from; under the `unknown` facet — the one
-filter the server cannot be told about — those buttons are disabled rather than quietly widening to
-every origin.
+Both filters push down to the store, including the `unknown` one. `RunQuery.origin` accepts **`null`**
+for exactly that bucket (`origin IS NULL`), which the console sends as `?unattributed=true` — its own
+param rather than a reserved `origin` value, because any reserved string is a package name someone can
+legitimately publish. The chips' counts come from [`GET runs/facets`](#counting-without-listing), not
+from the rows on screen, so the `unknown` count stays visible and exact while a package is selected —
+the property the facet exists for. **Retry all** / **cancel all** send the same predicate, so a bulk
+action is scoped to precisely the set the list was showing, unattributed runs included.
 
 <Callout type="warn">
   **The Drizzle adapter needs the `origin` column added by hand.** It has no auto-schema, and Drizzle
@@ -395,6 +395,48 @@ every origin.
   [Drizzle · Schema is owned by drizzle-kit](/docs/stores/drizzle#schema-is-owned-by-drizzle-kit). The
   MikroORM and TypeORM adapters add it on boot, and Prisma emits it through Migrate.
 </Callout>
+
+### At scale: paging, facets and what the numbers mean
+
+A control plane accumulates runs for as long as its retention policy keeps them, so "list the runs" is
+not a bounded request. The console treats it as a **page**:
+
+- `GET runs` takes `limit` / `offset`, and the SPA asks for 100 rows at a time — **show more** raises
+  the ceiling for an operator scrolling further back. Every store adapter implements both.
+- The list is **virtualised**: only the rows in the viewport are mounted, so a deep page costs the same
+  DOM as a shallow one.
+- `GET runs` returns list **rows**, not whole runs — `input`, `output` and `error` are omitted, because
+  no row renders them and on a busy deployment they are most of the bytes. `GET runs/:id` is unchanged
+  and still carries all three; that is where they are displayed.
+
+The numbers behind the design, measured against a deployment holding 9,533 runs: the unpaged listing
+was **12.24 MB** every three seconds, of which **63% was `error`** — a stack trace on every failed run,
+which the list never shows. Rendering it mounted 115,636 DOM nodes and blocked the tab's main thread
+for 26.9 out of every 30 seconds.
+
+<Callout>
+  The list endpoint is unbounded when you send no bound, so an existing API consumer is never silently
+  truncated. It is the console that always sends a `limit`.
+</Callout>
+
+#### Counting without listing
+
+Paging the list raises an obvious question: if the console holds 100 rows, where do the status and
+origin chips get their numbers? Not from the page — from `GET runs/facets`, one
+`GROUP BY status, origin` aggregate over the same tag / tenant / attribute predicates the listing uses:
+
+```ts
+const facets = await durableClient.facets(tag, attrs, namespace);
+// → [{ status: 'failed', origin: '@acme/billing', count: 3658 }, { status: 'failed', origin: null, count: 12 }, …]
+```
+
+`origin: null` is the unattributed bucket — a real, countable cell rather than the absence a value
+match cannot express. `status` and `origin` are deliberately **not** accepted as params: they are the
+axes being counted, so narrowing by them would report the answer back to itself.
+
+It is backed by `StateStore.runFacets` (optional on the port; a store without it falls back to counting
+a listing) and `RunGateway.runFacets`, which a tenant deployment round-trips to the control plane the
+same way it does `listRuns`.
 
 ### Waiting states
 
@@ -655,15 +697,16 @@ same routes with full types instead of hand-rolling `fetch`:
 ```ts
 import { durableClient } from '@dudousxd/nestjs-durable-dashboard/client';
 
-const runs = await durableClient.runs('failed');
+const runs = await durableClient.runs('failed', undefined, undefined, { limit: 100 });
 const detail = await durableClient.run(runs[0].id);
 await durableClient.retry(detail.run.id);
 ```
 
 | Method | Route | |
 | --- | --- | --- |
-| `GET` | `/durable/api/runs` | list runs (`?status=`, `?workflow=`) |
-| `GET` | `/durable/api/runs/:id` | run + step timeline |
+| `GET` | `/durable/api/runs` | list runs — `?status=` (repeat it to match a SET), `?workflow=`, `?tag=`, `?attr=`, `?namespace=`, `?origin=`, `?unattributed=true`, `?limit=`, `?offset=`. Returns list ROWS: no `input` / `output` / `error` |
+| `GET` | `/durable/api/runs/facets` | `(status, origin)` counts over the same tag / tenant / attribute predicates — the chips' numbers, whole-set rather than per-page |
+| `GET` | `/durable/api/runs/:id` | run + step timeline (the whole run, payloads included) |
 | `GET` (SSE) | `/durable/api/runs/:id/stream` | live-tail the run's lifecycle events |
 | `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |
 | `POST` | `/durable/api/runs/:id/retry-with-input` | fix-and-replay: start a fresh linked run from a dead/failed run with a corrected input (body: `{ input }`) |

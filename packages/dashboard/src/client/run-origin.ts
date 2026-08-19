@@ -105,27 +105,32 @@ export const UNKNOWN_ORIGIN_TITLE =
  * The origin chips for a run list: `all` first, then every attributed package (alphabetical), then
  * `unknown` LAST and only when there is something in it.
  *
- * Counted over the runs the console currently holds, the same way the header's status chips are — so
- * the counts and the list always agree, and (unlike a store-side facet) the unattributed bucket stays
- * visible and countable while a package is selected.
+ * Built from `(origin, count)` pairs rather than from runs, because the console's list is a PAGE:
+ * counting the rows it happens to hold would make every chip report the page size instead of the
+ * deployment. The pairs come from the server's `runs/facets` aggregate, so the unattributed bucket
+ * stays visible and countable while a package is selected — the property this facet exists for.
  */
-export function originFacets(runs: readonly Pick<WorkflowRun, 'origin'>[]): OriginFacet[] {
+export function originFacetsFromCounts(
+  counts: readonly { origin: string | null | undefined; count: number }[],
+): OriginFacet[] {
   const known = new Map<string, number>();
   let unknown = 0;
-  for (const run of runs) {
-    const origin = knownOrigin(run.origin);
+  let total = 0;
+  for (const entry of counts) {
+    total += entry.count;
+    const origin = knownOrigin(entry.origin ?? undefined);
     if (origin === undefined) {
-      unknown += 1;
+      unknown += entry.count;
       continue;
     }
-    known.set(origin, (known.get(origin) ?? 0) + 1);
+    known.set(origin, (known.get(origin) ?? 0) + entry.count);
   }
   const facets: OriginFacet[] = [
     {
       filter: ALL_ORIGINS,
       label: 'all',
       title: 'Every origin, including runs that have none',
-      count: runs.length,
+      count: total,
     },
   ];
   for (const origin of [...known.keys()].sort()) {
@@ -147,9 +152,23 @@ export function originFacets(runs: readonly Pick<WorkflowRun, 'origin'>[]): Orig
   return facets;
 }
 
+/** {@link originFacetsFromCounts} over a run list — one count per run. For callers that hold the
+ *  whole set (tests, an unpaginated embedder), not for the console's paged list. */
+export function originFacets(runs: readonly Pick<WorkflowRun, 'origin'>[]): OriginFacet[] {
+  return originFacetsFromCounts(runs.map((r) => ({ origin: r.origin, count: 1 })));
+}
+
 /** How many of these runs carry no origin — the size of the unattributed bucket. */
 export function unknownOriginCount(runs: readonly Pick<WorkflowRun, 'origin'>[]): number {
   return runs.reduce((n, r) => n + (isUnknownOrigin(r.origin) ? 1 : 0), 0);
+}
+
+/** The unattributed bucket's size straight from the server's facet counts — the paged console's
+ *  {@link unknownOriginCount}, which cannot count runs it never fetched. */
+export function unknownCountFromFacets(
+  counts: readonly { origin: string | null | undefined; count: number }[],
+): number {
+  return counts.reduce((n, c) => n + (isUnknownOrigin(c.origin ?? undefined) ? c.count : 0), 0);
 }
 
 /** What an empty run list should say, and whether to offer a jump to the unattributed runs. */

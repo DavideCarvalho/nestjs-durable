@@ -1,6 +1,9 @@
 import {
   type AttributeFilter,
+  type RunFacetQuery,
+  type RunFacetRow,
   type RunQuery,
+  type RunStatus,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
@@ -9,6 +12,7 @@ import {
   type WorkflowRun,
   attributeColumnFor,
   attributeOperand,
+  mergeRunFacetRows,
   normalizeAttributeRows,
 } from '@dudousxd/nestjs-durable-core';
 
@@ -102,6 +106,9 @@ interface Delegate<Row> {
   upsert(args: Args): Promise<Row>;
   delete(args: Args): Promise<Row>;
   deleteMany(args?: Args): Promise<{ count: number }>;
+  /** Aggregate form — used only by `runFacets`, whose rows are `(status, origin, count)` cells, not
+   *  model rows, so the result type is stated at the call site rather than derived from `Row`. */
+  groupBy(args: Args): Promise<Record<string, unknown>[]>;
 }
 
 export interface DurablePrismaTx {
@@ -286,7 +293,8 @@ export class PrismaStateStore implements StateStore {
     return result.count === 1;
   }
 
-  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+  /** The `where` every run query shares — {@link listRuns} pages it, {@link runFacets} groups it. */
+  private runWhere(query: RunQuery): Record<string, unknown> {
     // The tenant boundary, and NOT only a dashboard facet: the engine's `sweepTimeouts` finds the runs
     // it may cancel through `listRuns({ workflow, status, namespace })`, so an unfiltered `namespace`
     // here lets a worker serving one tenant time out another tenant's runs — a write, not a stale
@@ -299,6 +307,8 @@ export class PrismaStateStore implements StateStore {
     // matches NO origin value — it is never folded into a bucket to make the facet look complete.
     // Unknown-origin runs are reachable only with the filter OFF, so "all origins" must stay the
     // default view; a dashboard that filtered by default would make those runs look deleted.
+    // Passing `null` asks for exactly the unattributed bucket (`origin IS NULL`) — Prisma spells that
+    // as the same equality — which is how a paginated console can offer an "unknown" chip.
     if (query.origin !== undefined) where.origin = query.origin;
     // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store). Combined with the
     // single-value `status` via AND when both are present, so the narrower set wins.
@@ -317,14 +327,32 @@ export class PrismaStateStore implements StateStore {
       const existing = (where.AND as unknown[] | undefined) ?? [];
       where.AND = [...existing, ...query.attributes.map((f) => attributeSome(f))];
     }
+    return where;
+  }
+
+  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const orderBy = { createdAt: 'desc' as const }; // newest first — recent runs on top in the dashboard
     const rows = await this.db.durableWorkflowRun.findMany({
-      where,
+      where: this.runWhere(query),
       take: query.limit,
       skip: query.offset,
       orderBy,
     });
     return rows.map(fromRunRow);
+  }
+
+  /** `GROUP BY status, origin` over the same predicates {@link listRuns} pages — one aggregate, so a
+   *  console can show whole-set counts next to a bounded page instead of downloading every run to
+   *  count them in the browser. */
+  async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    const rows = (await this.db.durableWorkflowRun.groupBy({
+      by: ['status', 'origin'],
+      where: this.runWhere(query),
+      _count: { _all: true },
+    })) as { status: RunStatus; origin: string | null; _count: { _all: number } }[];
+    return mergeRunFacetRows(
+      rows.map((r) => ({ status: r.status, origin: r.origin, count: r._count._all })),
+    );
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {

@@ -10,6 +10,8 @@ import {
   type EngineEvent,
   type GroupHealth,
   type RunDetail,
+  type RunFacetQuery,
+  type RunFacetRow,
   type RunGateway,
   type RunListItem,
   type RunQuery,
@@ -206,6 +208,9 @@ export function unavailableRunGateway(): RunGateway {
     },
     listRuns(_query: RunQuery): Promise<RunListItem[]> {
       return tenantGatewayUnavailable<RunListItem[]>('listRuns');
+    },
+    runFacets(_query: RunFacetQuery): Promise<RunFacetRow[]> {
+      return tenantGatewayUnavailable<RunFacetRow[]>('runFacets');
     },
     waitingFor(_runIds: string[]): Promise<Record<string, RunWaiting>> {
       return tenantGatewayUnavailable<Record<string, RunWaiting>>('waitingFor');

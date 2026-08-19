@@ -4,6 +4,8 @@ import {
   type GroupHealth,
   type MetricsCollector,
   type RunDetail,
+  type RunFacetQuery,
+  type RunFacetRow,
   RunGateway,
   type RunListItem,
   type RunQuery,
@@ -102,6 +104,12 @@ export class DashboardService {
 
   listRuns(query: RunQuery): Promise<RunListItem[]> {
     return this.gateway.listRuns(query);
+  }
+
+  /** `(status, origin)` counts over the same predicates {@link listRuns} pages — what keeps the
+   *  console's chips exact while its list is bounded to a page. */
+  runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    return this.gateway.runFacets(query);
   }
 
   /** This deployment's durable role (control plane vs tenant) + tenant name — for the dashboard header

@@ -3,6 +3,8 @@ import {
   type EngineEvent,
   type GroupHealth,
   type RunDetail,
+  type RunFacetQuery,
+  type RunFacetRow,
   type RunGateway,
   type RunListItem,
   type RunQuery,
@@ -12,6 +14,7 @@ import {
   type StateStore,
   WorkflowEngine,
   indexWaitersByRun,
+  mergeRunFacetRows,
   resolveRunWaiting,
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable } from '@nestjs/common';
@@ -53,6 +56,18 @@ export class StoreRunGateway implements RunGateway {
       const waiting = resolveRunWaiting(run, waiterByRun);
       return waiting ? { ...run, waiting } : run;
     });
+  }
+
+  /**
+   * The `(status, origin)` counts behind a console's chips, straight off the store's aggregate. The
+   * console needs this precisely BECAUSE its list is paginated: the page bounds what is rendered,
+   * these counts stay whole-set exact. A store with no aggregate falls back to counting a full
+   * listing — correct, but the unbounded read this exists to avoid, so it is the last resort.
+   */
+  async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    if (this.store.runFacets) return this.store.runFacets(query);
+    const runs = await this.store.listRuns(query);
+    return mergeRunFacetRows(runs.map((r) => ({ status: r.status, origin: r.origin, count: 1 })));
   }
 
   /**

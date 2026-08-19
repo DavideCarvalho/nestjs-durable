@@ -9,9 +9,11 @@ import {
   knownOrigin,
   matchesOrigin,
   originFacets,
+  originFacetsFromCounts,
   originFilterKey,
   originLabel,
   sameOriginFilter,
+  unknownCountFromFacets,
   unknownOriginCount,
 } from './run-origin.js';
 
@@ -242,5 +244,71 @@ describe('emptyRunsNotice', () => {
     expect(emptyRunsNotice({ anyFilter: true, origin: ALL_ORIGINS, unknownCount: 9 }).message).toBe(
       'No runs match these filters.',
     );
+  });
+});
+
+describe('originFacetsFromCounts', () => {
+  it('builds the same chips from server counts as from a run list', () => {
+    // The paged console can no longer count the rows it holds — it counts nothing but a page — so the
+    // chips are built from the store's aggregate instead. Same chips, same order, same numbers.
+    const fromRuns = originFacets([
+      { origin: 'pkg-b' },
+      { origin: 'pkg-b' },
+      { origin: 'pkg-a' },
+      { origin: undefined },
+    ]);
+    const fromCounts = originFacetsFromCounts([
+      { origin: 'pkg-b', count: 2 },
+      { origin: 'pkg-a', count: 1 },
+      { origin: null, count: 1 },
+    ]);
+
+    expect(fromCounts).toEqual(fromRuns);
+  });
+
+  it('counts `all` as the whole set, not as the number of cells', () => {
+    const facets = originFacetsFromCounts([
+      { origin: 'pkg-a', count: 5000 },
+      { origin: null, count: 3000 },
+    ]);
+
+    expect(facets[0]).toMatchObject({ label: 'all', count: 8000 });
+  });
+
+  it('folds every blank spelling of an absent origin into the one unknown chip', () => {
+    const facets = originFacetsFromCounts([
+      { origin: null, count: 2 },
+      { origin: undefined, count: 3 },
+      { origin: '  ', count: 1 },
+    ]);
+
+    expect(facets.filter((f) => f.filter.kind === 'unknown')).toEqual([
+      expect.objectContaining({ count: 6 }),
+    ]);
+  });
+
+  it('omits the unknown chip when nothing is unattributed', () => {
+    const facets = originFacetsFromCounts([{ origin: 'pkg-a', count: 3 }]);
+
+    expect(facets.some((f) => f.filter.kind === 'unknown')).toBe(false);
+  });
+});
+
+describe('unknownCountFromFacets', () => {
+  it('reports the unattributed bucket the paged console cannot count for itself', () => {
+    // This number is what the empty state says when a package filter matches nothing — "N runs here
+    // have no recorded origin, so no package filter can match them". A page-local count would say 0
+    // in exactly the case the message exists for.
+    expect(
+      unknownCountFromFacets([
+        { origin: 'pkg-a', count: 100 },
+        { origin: null, count: 7 },
+        { origin: '', count: 2 },
+      ]),
+    ).toBe(9);
+  });
+
+  it('is zero when every run is attributed', () => {
+    expect(unknownCountFromFacets([{ origin: 'pkg-a', count: 4 }])).toBe(0);
   });
 });

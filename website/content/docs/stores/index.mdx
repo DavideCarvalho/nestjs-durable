@@ -13,6 +13,13 @@ interface, independent of the [transport](/docs/transports).
   [lease renewal](/docs/concepts/durability#deploys-versioning--multiple-instances) while a run executes)
   and `listPendingRuns(limit)` (so workers can poll for [`pending`](/docs/concepts/durability#the-execution-model-start-enqueues-a-worker-runs-the-body)
   runs to dispatch). All bundled adapters implement both.
+
+  It also declares **`runFacets(query)`** — `(status, origin)` counts, which is what lets the
+  [console](/docs/observability/dashboard#counting-without-listing) page its run list while its chips
+  keep reporting the whole set. That one is **optional**: a store that omits it still works, with the
+  caller falling back to counting a full listing. Every bundled adapter pushes it down to a
+  `GROUP BY`, and `RunQuery.origin` accepts `null` there and in `listRuns` to select the runs carrying
+  no origin at all.
 </Callout>
 
 ## Adapters

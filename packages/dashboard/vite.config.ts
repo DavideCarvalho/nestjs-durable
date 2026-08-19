@@ -10,12 +10,15 @@ export default defineConfig({
     outDir: 'dist/spa',
     emptyOutDir: true,
     rollupOptions: {
-      // `index.html` is the production SPA entry; `preview.html` is an additive, standalone
-      // mock-data entry used only for visual verification of the parallel-fan timeline. Both are
-      // listed explicitly so `vite build` keeps emitting the SPA while also compiling the preview.
+      // `index.html` is the production SPA entry. `preview.html` and `bench.html` are additive,
+      // standalone mock-data entries: preview for VISUAL verification of the parallel-fan timeline,
+      // bench for SCALE — the real `<App/>` against a control plane with tens of thousands of runs,
+      // which is the only way to catch the console going unresponsive before an operator does. All
+      // three are listed explicitly so `vite build` emits the SPA and compiles both harnesses.
       input: {
         index: resolve(__dirname, 'index.html'),
         preview: resolve(__dirname, 'preview.html'),
+        bench: resolve(__dirname, 'bench.html'),
       },
     },
   },

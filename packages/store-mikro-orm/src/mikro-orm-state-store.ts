@@ -1,7 +1,10 @@
 import {
   type AttributeFilter,
   type RetentionPolicy,
+  type RunFacetQuery,
+  type RunFacetRow,
   type RunQuery,
+  type RunStatus,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
@@ -10,10 +13,12 @@ import {
   type WorkflowRun,
   attributeColumnFor,
   attributeOperand,
+  mergeRunFacetRows,
   normalizeAttributeRows,
   parseDuration,
   sqlComparator,
 } from '@dudousxd/nestjs-durable-core';
+import { raw } from '@mikro-orm/core';
 import type { EntityManager, MikroORM } from '@mikro-orm/core';
 
 /** Minimal structural surface of the SQL EntityManager's QueryBuilder (from `@mikro-orm/knex`),
@@ -26,6 +31,14 @@ interface DurableQueryBuilder<T> {
   limit(n: number): DurableQueryBuilder<T>;
   offset(n: number): DurableQueryBuilder<T>;
   getResultList(): Promise<T[]>;
+  // Aggregate verbs — used only by `runFacets`' GROUP BY, which returns raw rows rather than entities.
+  // `addSelect` takes `unknown` because the count is a `raw()` expression, not a field name: passing
+  // it as a string makes the builder qualify it with the root alias (`r.count(*)`), which is not a
+  // column and fails on every engine.
+  select(fields: string[]): DurableQueryBuilder<T>;
+  addSelect(field: unknown): DurableQueryBuilder<T>;
+  groupBy(fields: string[]): DurableQueryBuilder<T>;
+  execute<R>(): Promise<R>;
 }
 type SqlEm = EntityManager & {
   createQueryBuilder<T>(entity: unknown, alias: string): DurableQueryBuilder<T>;
@@ -288,16 +301,18 @@ export class MikroOrmStateStore implements StateStore {
     return affected === 1;
   }
 
-  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    const em = this.fork();
+  /** The `where` every run query shares — {@link listRuns} pages it, {@link runFacets} groups it.
+   *  Only the predicates MikroORM can express declaratively; `tag`/`attributes` need raw SQL and are
+   *  applied by the QueryBuilder path in both callers. */
+  private runWhere(query: RunQuery): Record<string, unknown> {
     const where: Record<string, unknown> = {};
     if (query.workflow) where.workflow = query.workflow;
     if (query.namespace !== undefined) where.namespace = query.namespace;
     // Plain equality on the origin column, exactly like `namespace` above. A run whose origin is NULL
     // (created before the column existed, or registered through a path the derivation could not
     // classify) matches NO origin value — it is never folded into some bucket to make the facet look
-    // complete. Unknown-origin runs are reachable only with the filter OFF, so "all origins" must stay
-    // the default view; a dashboard that filtered by default would make those runs look deleted.
+    // complete. Passing `null` asks for exactly that bucket (`origin IS NULL`), which is how a
+    // paginated console offers an "unknown" chip without holding every run in the browser.
     if (query.origin !== undefined) where.origin = query.origin;
     // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store). When both the
     // single `status` and `statuses` are set, AND them so the narrower set wins.
@@ -308,6 +323,12 @@ export class MikroOrmStateStore implements StateStore {
     } else if (query.statuses) {
       where.status = { $in: query.statuses };
     }
+    return where;
+  }
+
+  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+    const em = this.fork();
+    const where = this.runWhere(query);
     const orderBy = { createdAt: 'desc' as const }; // newest first — recent runs on top in the dashboard
     // `tags`/attributes need raw SQL pushed through the QueryBuilder:
     //  - tag: `tags` is a JSON column (native json/jsonb on PG/MySQL), and MikroORM JSON-serializes a
@@ -318,24 +339,7 @@ export class MikroOrmStateStore implements StateStore {
     //    filters AND paginates — no full scan + in-process filter (ANDed: one EXISTS per filter).
     // Use a QueryBuilder with a fixed root alias `r` so the raw correlations are stable across drivers.
     if (query.tag || query.attributes?.length) {
-      // MikroORM global filters do not auto-apply to createQueryBuilder, so enforce the scope here
-      // explicitly. Mirrors the filter cond's semantics: undefined = no restriction (operator view).
-      if (this.scopeNamespace !== undefined) where.namespace = this.scopeNamespace;
-      const quote = this.idQuote(em);
-      const cols = this.attributeColumns(em);
-      const qb = (em as SqlEm)
-        .createQueryBuilder<WorkflowRunEntity>(WorkflowRunEntity, 'r')
-        .where(where)
-        .orderBy(orderBy);
-      if (query.tag) {
-        const tagsCol = this.tagsColumn(em);
-        const pattern = `%"${query.tag.replace(/'/g, "''")}"%`;
-        const colExpr = this.jsonAsText(em, `${quote('r')}.${quote(tagsCol)}`);
-        qb.andWhere(`${colExpr} LIKE '${pattern}'`);
-      }
-      for (const f of query.attributes ?? []) {
-        qb.andWhere(this.attributeExistsSql(f, quote, 'r', cols));
-      }
+      const qb = this.runQueryBuilder(em, query, where).orderBy(orderBy);
       if (query.limit != null) qb.limit(query.limit);
       if (query.offset != null) qb.offset(query.offset);
       const rows = await qb.getResultList();
@@ -347,6 +351,51 @@ export class MikroOrmStateStore implements StateStore {
       orderBy,
     });
     return rows.map(fromRunEntity);
+  }
+
+  /** A QueryBuilder over `durable_workflow_runs` (root alias `r`) carrying `where` plus the two
+   *  predicates only raw SQL can express — the `tag` JSON LIKE and one EXISTS per attribute filter.
+   *  Shared so a facet count and the page it labels are taken over the SAME set. */
+  private runQueryBuilder(
+    em: EntityManager,
+    query: RunQuery,
+    where: Record<string, unknown>,
+  ): DurableQueryBuilder<WorkflowRunEntity> {
+    // MikroORM global filters do not auto-apply to createQueryBuilder, so enforce the scope here
+    // explicitly. Mirrors the filter cond's semantics: undefined = no restriction (operator view).
+    if (this.scopeNamespace !== undefined) where.namespace = this.scopeNamespace;
+    const quote = this.idQuote(em);
+    const cols = this.attributeColumns(em);
+    const qb = (em as SqlEm)
+      .createQueryBuilder<WorkflowRunEntity>(WorkflowRunEntity, 'r')
+      .where(where);
+    if (query.tag) {
+      const tagsCol = this.tagsColumn(em);
+      const pattern = `%"${query.tag.replace(/'/g, "''")}"%`;
+      const colExpr = this.jsonAsText(em, `${quote('r')}.${quote(tagsCol)}`);
+      qb.andWhere(`${colExpr} LIKE '${pattern}'`);
+    }
+    for (const f of query.attributes ?? []) {
+      qb.andWhere(this.attributeExistsSql(f, quote, 'r', cols));
+    }
+    return qb;
+  }
+
+  /** `GROUP BY status, origin` over the same predicates {@link listRuns} pages — one aggregate, so a
+   *  console can show whole-set counts next to a bounded page instead of downloading every run to
+   *  count them in the browser. */
+  async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    const em = this.fork();
+    const meta = em.getMetadata().get(WorkflowRunEntity);
+    const statusCol = meta.properties.status?.fieldNames?.[0] ?? 'status';
+    const originCol = meta.properties.origin?.fieldNames?.[0] ?? 'origin';
+    const rows = await this.runQueryBuilder(em, query, this.runWhere(query))
+      .select([`r.${statusCol}`, `r.${originCol}`])
+      .addSelect(raw('count(*) as count'))
+      .groupBy([`r.${statusCol}`, `r.${originCol}`])
+      .execute<{ status: RunStatus; origin: string | null; count: number | string }[]>();
+    // MySQL returns `count(*)` as a string on some drivers; normalise before merging.
+    return mergeRunFacetRows(rows.map((r) => ({ ...r, count: Number(r.count) })));
   }
 
   /** One attribute predicate as a raw EXISTS subquery on the side-table, correlated to the outer run
