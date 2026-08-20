@@ -94,13 +94,16 @@ export class SingletonGate {
       await this.deps.store.listRuns({ tag, workflow: settled.workflow, statuses: ['suspended'] })
     ).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
     for (const next of gated.slice(0, cfg.limit ?? 1)) {
-      // Clear the durable retry timer as we hand the run over, so the timer poller can't also pick it
-      // up and double-dispatch. Only for runs that carry a wakeAt; dispatch after the clear commits.
-      if (next.wakeAt != null) {
-        await this.deps.store
-          .updateRun(next.id, { wakeAt: undefined, updatedAt: new Date() })
-          .catch(() => undefined);
-      }
+      // Stamp a due-NOW wakeAt as the run is handed over. `dispatch` goes through the configured
+      // `runDispatcher`, which may legitimately be a NO-OP (an API/dashboard pod that must not run
+      // workflows still settles runs it observes, so it still lands here), which makes the durable
+      // timer the only guaranteed pickup: a `suspended` run carrying no `wakeAt` is invisible to
+      // every poll path — `listPendingRuns`, `listIncompleteRuns` and `listDueTimers` alike — and
+      // never resumes. A dispatch + timer double-drive is safe: the run lock admits one executor and
+      // the loser's pickup is a cheap no-op.
+      await this.deps.store
+        .updateRun(next.id, { wakeAt: this.deps.clock(), updatedAt: new Date() })
+        .catch(() => undefined);
       this.deps.dispatch(next.id);
     }
   }
