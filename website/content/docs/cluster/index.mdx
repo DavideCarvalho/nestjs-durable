@@ -27,17 +27,42 @@ falls out of three independent facts about it:
 | --- | --- |
 | `store` set? | Whether it owns durable state — and so whether it can drive, recover, and answer reads directly. |
 | `drive: false`? | Whether it runs the store's loops (poll pending, recover crashed, resume timers, sweep timeouts, prune retention). |
-| Does it register `@Workflow`/`@Step` providers? | Whether bodies execute **in this process**. |
+| Does it register `@Workflow`/`@Step` providers, and on which `partition`? | Whether bodies execute **in this process**, and for whose runs. |
 
 The [`topology` preset](/docs/cluster/roles-and-config) names the first two explicitly and validates
-them. The third is up to your module graph: a process executes exactly the handlers it declares — so
-a control plane that must not run bodies is one whose module simply doesn't import them.
+them. The third is your module graph plus one routing rule, and it is worth being precise about,
+because "the control plane doesn't execute" is only true in some shapes.
+
+### Dispatch and execution are separate
+
+**Every** shape dispatches over the transport — that part never changes. What changes is who is
+*subscribed* to the queue a dispatch lands on. Two tokens have to agree:
+
+- **Dispatch side.** A step is routed to `<name>@<tenant>`, where the tenant comes from **the run's
+  namespace** (or the step's own `partition`, which wins). A `default`/unset namespace routes to the
+  bare `<name>`.
+- **Consume side.** A process subscribes `<name>@<tenant>` for every handler it declares, where the
+  tenant is **its own `partition`** — bare when unset.
+
+A process executes a body when, and only when, those two tokens match. There is no fallback: nothing
+"runs it anyway" because no worker showed up.
+
+That gives the two control-plane shapes different answers:
+
+- **A global control plane** (`{ role: 'control-plane' }`, no `tenant`) subscribes the bare tokens. A
+  tenant's run dispatches to `<name>@acme`, so it never sees that task — the tenant's workers do. It
+  is, for tenant work, exactly the pure coordinator you asked for. What it *does* execute is
+  default-namespace work, which is usually the point: something has to.
+- **A tenant-scoped control plane** (`{ role: 'control-plane', tenant: 'acme' }`) is deliberately
+  different: the preset maps `tenant` onto `partition` too, so the node subscribes the very tokens it
+  dispatches to. Otherwise it would dispatch into queues nothing in that process is listening on. Here
+  it *does* compete with any other `acme` worker for the same tasks — by design.
 
 <Callout type="warn">
-`topology: { role: 'control-plane' }` does **not** stop a process from executing bodies. It validates
-the store/transport axes and scopes the operator; if that same process also declares `@Step`
-providers on a transport that can serve them (BullMQ, event-emitter), it starts consumers for them
-and runs those bodies itself. Keep the handlers out of the module to keep them off the box.
+So `topology: { role: 'control-plane' }` is not a switch that turns execution off. If a process
+declares `@Step` providers on a transport that can serve them (BullMQ, event-emitter), it starts
+consumers for them — and whether that matters depends on whether its partition lines up with what it
+dispatches. To keep bodies off the box entirely, keep the handlers out of its module.
 </Callout>
 
 ## The shapes
@@ -45,7 +70,7 @@ and runs those bodies itself. Keep the handlers out of the module to keep them o
 | Shape | Owns the store | Drives runs | Executes bodies | Read/control surface |
 |---|:---:|:---:|:---:|---|
 | **Single process** *(default)* | ✅ | ✅ | ✅ inline | direct (store) |
-| **Control plane** | ✅ | ✅ | only what it declares | direct (store) |
+| **Control plane** | ✅ | ✅ | only what it declares, on its own partition | direct (store) |
 | **Thin worker** | ❌ | ❌ | ✅ off the broker | proxied over the wire |
 | **Thin api / dashboard** | ❌ | ❌ | ❌ | proxied over the wire |
 | **Read replica** (`drive: false`) | ✅ | ❌ | ❌ | direct (store) |

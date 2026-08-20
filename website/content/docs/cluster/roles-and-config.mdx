@@ -51,8 +51,11 @@ DurableModule.forRoot({
 
 <Callout type="warn">
 The preset does not switch execution off. Bodies run wherever their `@Workflow`/`@Step` providers are
-registered — so a control plane that must not execute keeps those providers out of its module graph.
-Declare them here and this process starts consumers for them and runs them itself.
+registered — declare them here and this process starts consumers for them. Whether that actually
+takes work from your workers depends on the partition: without `tenant` this node is on the bare
+queue tokens and never sees a tenant's dispatches, while **with** `tenant` it deliberately subscribes
+the same `<name>@<tenant>` tokens it dispatches to. See
+[dispatch vs execution](/docs/cluster#dispatch-and-execution-are-separate).
 </Callout>
 
 </Tab>
