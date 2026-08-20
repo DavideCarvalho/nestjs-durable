@@ -156,11 +156,16 @@ Tune the proxy round-trip with `runGatewayTimeoutMs` (default `10_000`). It is i
 operator, which is bound to the store-backed gateway.
 
 <Callout type="info">
-On a store-less pod the `WorkflowEngine` token is **start-only**: `start` publishes a start message
-over the wire, but `cancel`, `deleteRun`, `resume`, `signal`, `signalWithStart` and `publishEvent`
-reject with a named `tenantUnsupported(...)` error — they need a store the pod does not have. The
-control verbs are still reachable, just through `RunGateway` above. Reach for `RunGateway` in
-anything that must run on more than one shape.
+**`cancel` on a store-less pod: same verb, two objects, opposite answers.** Injecting
+`WorkflowEngine` there gets you a **start-only** client — `start` publishes a start message over the
+wire, but `cancel`, `deleteRun`, `resume`, `signal`, `signalWithStart` and `publishEvent` reject with
+a named `tenantUnsupported(...)` error, because they reach for a store the pod does not have. The
+`RunGateway` above has no such problem: its `cancel` is a wire request the control plane answers
+against *its* store, so it works on every shape.
+
+That is why the table lists `cancel` as a working verb. It is `RunGateway.cancel` that works;
+`WorkflowEngine.cancel` is the one that rejects. Inject `RunGateway` in anything that has to run on
+more than one shape, and you never meet the distinction.
 </Callout>
 
 ## Layered tenant authentication
