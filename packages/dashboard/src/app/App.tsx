@@ -44,6 +44,7 @@ import { WorkflowGraph } from './WorkflowGraph';
 import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
 import { shouldLoadMore } from './load-more';
 import { parentRunIdOf, retryOriginOf } from './run-lineage';
+import { runRowKey, runsFilterKey } from './run-list-identity';
 import { Badge as Chip, badgeVariants } from './ui/badge';
 import { Button } from './ui/button';
 import { cn } from './ui/cn';
@@ -797,6 +798,14 @@ function RunsList({
   emptyNotice: ReturnType<typeof emptyRunsNotice>;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  // React keys these rows by run id, so the virtualiser has to key its size and element caches by the
+  // same thing: otherwise a measurement stays attached to the SLOT instead of the row, and the poll
+  // that keeps this list live reorders it — one run starting pushes every row down an index without
+  // remounting any of them — leaving every offset computed from the height of whoever sat there
+  // before. Depends on `runs` on purpose: when the contents change under an unchanged count, that new
+  // identity is what tells the virtualiser to rebuild its measurements instead of reusing the last
+  // set's.
+  const getItemKey = useCallback((index: number) => runRowKey(runs, index), [runs]);
   // Only the rows in view are mounted. A control plane's list runs to thousands of rows, and mounting
   // them all is what made this pane freeze: ~12 DOM nodes per row put 115k nodes on the page, and
   // every poll then had to reconcile all of them.
@@ -804,6 +813,7 @@ function RunsList({
     count: runs.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_ESTIMATE_PX,
+    getItemKey,
     // Rows vary in height (tags wrap, the "why parked" line is conditional), so measure the real one
     // as each mounts instead of trusting the estimate.
     measureElement: (el) => el.getBoundingClientRect().height,
@@ -1611,9 +1621,11 @@ export function App() {
       window.removeEventListener('popstate', sync);
     };
   }, []);
-  // How many pages of the list are loaded. Every filter change resets it (see below) — an operator who
-  // narrows the view expects to land at the top of the new set, not 900 rows into it.
-  const [pages, setPages] = useState(1);
+  // How many pages of the list are loaded, and for WHICH result set. One piece of state rather than
+  // two, so that `pages` can be DERIVED below: reset it from an effect instead and the render that
+  // changes the filters still asks for every page the previous view had loaded, spending a request on
+  // a result the next render throws away.
+  const [paging, setPaging] = useState({ key: '', pages: 1 });
   const qc = useQueryClient();
   // Comma-separated `key:op:value` predicates (e.g. `amount:gte:200, tier:eq:pro`), ANDed server-side.
   const attrPredicates = useMemo(
@@ -1635,6 +1647,18 @@ export function App() {
         ? null
         : undefined;
   const originKey = originFilterKey(originFilter);
+  // Identity for the run list's `key` (see the `<RunsList key=…>` usage below) — every filter that
+  // changes which runs the list contains.
+  const runsListResetKey = runsFilterKey({
+    status: filter,
+    tag: tagFilter,
+    attrs: attrKey,
+    namespace: namespaceFilter,
+    origin: originKey,
+  });
+  // Landing 900 rows into a set the operator just re-scoped would be a non-sequitur, so a page count
+  // recorded against another result set counts for nothing: every filter change starts at page one.
+  const pages = paging.key === runsListResetKey ? paging.pages : 1;
   const limit = PAGE_SIZE * pages;
   const {
     data: runs = [],
@@ -1724,15 +1748,11 @@ export function App() {
   const singletonSiblings = useSingletonSiblings(useMemo(() => anySingleton(runs), [runs]));
 
   const loadMore = useCallback(() => {
-    setPages((n) => n + 1);
-  }, []);
-
-  // Landing 900 rows into a set the operator just re-scoped would be a non-sequitur; every filter
-  // change starts the new list at its first page.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: the filters are the trigger, `pages` is the target
-  useEffect(() => {
-    setPages(1);
-  }, [filter, tagFilter, attrKey, namespaceFilter, originKey]);
+    setPaging((p) => ({
+      key: runsListResetKey,
+      pages: p.key === runsListResetKey ? p.pages + 1 : 2,
+    }));
+  }, [runsListResetKey]);
 
   return (
     <TooltipProvider>
@@ -1817,6 +1837,11 @@ export function App() {
               </div>
             )}
             <RunsList
+              // Remounts on any filter change: cheap for this list size, and it's the simplest way to
+              // reset BOTH the virtualiser's scroll position and its row-height cache — a stale scroll
+              // offset from the pre-filter list would otherwise leave the view scrolled deep into a
+              // now much shorter one.
+              key={runsListResetKey}
               runs={runs}
               siblings={singletonSiblings}
               health={health}
