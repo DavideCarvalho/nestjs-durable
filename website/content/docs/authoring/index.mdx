@@ -1,0 +1,37 @@
+---
+title: Authoring
+description: Everything you compose a real workflow out of — child workflows, durable entities, events, queries and updates, webhooks and external tasks, versioning, and scheduling.
+icon: PenLine
+---
+
+[Workflows & steps](/docs/concepts/workflows-and-steps) covers the primitive every workflow is built
+from. This section is what you reach for once one workflow is no longer enough.
+
+## Composition
+
+- **[Child workflows](/docs/authoring/child-workflows)** — call a workflow from a workflow. `ctx.child`
+  awaits a result, `ctx.startChild` is fire-and-forget, and `ctx.all` fans out N children of the same
+  workflow and waits for all of them. Pass a class for typed input and output, or a name string for a
+  child in another runtime.
+- **[Durable entities](/docs/authoring/entities)** — keyed, long-lived virtual objects. `@Entity` +
+  `@On` declare per-key state and its operations, serialized per key and applied exactly once.
+
+## Talking to a running run
+
+- **[Queries & updates](/docs/authoring/queries-and-updates)** — read a live run's state without
+  disturbing it (`ctx.setEvent` + `engine.getEvent`), and steer it with validated updates that can be
+  rejected before they touch the run.
+- **[Event-driven workflows](/docs/authoring/events)** — `publishEvent` starts every subscriber and
+  resumes any run parked on `ctx.waitForEvent`, with optional debounce/batch coalescing for bursty
+  sources.
+- **[Durable webhooks](/docs/authoring/webhooks)** — mint a callback URL, hand it to a third party
+  inside a step, and suspend with zero compute until they call back. `ctx.task()` is the general form
+  for external work you complete yourself.
+
+## Keeping it running
+
+- **[Versioning & determinism](/docs/authoring/versioning)** — how in-flight runs stay replay-safe
+  across a deploy: workflow versions for breaking changes, the `NonDeterminismError` guard, the
+  deterministic `now`/`random`/`uuid` sources, and `ctx.patched` for an in-place change.
+- **[Scheduling](/docs/authoring/scheduling)** — recurring workflows on a fixed interval or a
+  DST-aware cron, started exactly once per window by an idempotent time-bucket run id.

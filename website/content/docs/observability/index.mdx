@@ -1,0 +1,38 @@
+---
+title: Observability
+description: Seeing what your workflows are doing — the embedded control-plane dashboard, OpenTelemetry spans, dependency-free metrics, the Telescope watcher, and the raw diagnostics bus underneath them.
+icon: Telescope
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+A durable run is a long-lived thing that spans processes, retries and deploys, so "check the logs" is
+rarely enough. Durable exposes the same lifecycle events through several surfaces; pick the ones that
+match how you already operate.
+
+## Start here
+
+- **[Control plane](/docs/observability/dashboard)** — the embedded React dashboard served by NestJS.
+  Lists runs, renders each one as a graph across local and remote steps, and lets you retry and cancel.
+  It is the fastest way to answer "what is this run waiting on?".
+
+## Wiring into your stack
+
+- **[OpenTelemetry](/docs/observability/otel)** — one span per step and one root span per run's first
+  turn, so workflows show up in Jaeger, Grafana or Datadog next to your HTTP traces.
+- **[Metrics](/docs/observability/metrics)** — dependency-free run/step counters and duration
+  percentiles you can hand straight to a `/metrics` route.
+- **[Telescope](/docs/observability/telescope)** — runs and steps inside
+  [nestjs-telescope](https://davidecarvalho.github.io/aviary/docs/telescope), alongside your app's
+  requests, queries and jobs.
+
+## Underneath
+
+- **[Diagnostics channel](/docs/observability/diagnostics)** — every engine lifecycle event on the
+  Node `diagnostics_channel` bus. This is the raw feed the surfaces above are built on; subscribe to it
+  when you want to route durable events somewhere none of them cover.
+
+<Callout type="info">
+These are additive, not alternatives — a production deployment typically runs the dashboard for humans
+and OTel or metrics for alerting, off the same event stream.
+</Callout>

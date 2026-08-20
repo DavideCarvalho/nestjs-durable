@@ -1,0 +1,36 @@
+---
+title: Concepts
+description: The mental model behind the engine — why replay is the durability mechanism, what a workflow and a step actually are, how a run waits for hours without holding a process, and whose runs a pool executes.
+icon: Lightbulb
+---
+
+Four ideas carry the whole engine. Everything else in these docs is a consequence of one of them.
+
+## Durability is replay
+
+A run survives a crash because the engine **replays the workflow body from the top** and feeds
+already-completed steps their saved results instead of executing them again. That single mechanism is
+what buys you crash recovery, and it is also the one rule it imposes: the body must be
+deterministic — no `Date.now()`, `Math.random()`, or direct I/O outside a step. See
+[Durability & replay](/docs/concepts/durability).
+
+## Workflows orchestrate, steps do
+
+A `@Workflow` decides *what happens next*; a `@Step` is the only place a side effect is allowed to
+happen. `ctx.step` is the single dispatched primitive — it checkpoints, routes to a worker, retries on
+its own policy, and returns the recorded result on the next replay. Everything else (fan-out, child
+workflows, entities) composes on top of it. See [Workflows & steps](/docs/concepts/workflows-and-steps).
+
+## Waiting costs nothing
+
+A run parked on `ctx.sleep` or `ctx.waitForSignal` holds no process, no thread, and no connection. Its
+state is a row and a wake time; the engine resumes it when the timer is due or the signal arrives. A
+month-long wait and a one-second wait cost the same while parked. See
+[Sleep & signals](/docs/concepts/sleep-and-signals).
+
+## Runs belong to someone
+
+Every run is stamped with a namespace, and that stamp decides which pool drives it and which workers
+execute it. It is what lets a shared broker host a deployed cluster and a developer's laptop at once
+without either stealing the other's work. See [Tenancy](/docs/concepts/tenancy), and
+[Topologies](/docs/cluster) for the deployment shapes it rides on.

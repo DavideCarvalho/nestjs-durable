@@ -153,7 +153,7 @@ in a separate process — a BullMQ worker, or a [Python worker](/docs/python) �
 must agree with the operator's on step names and workflow shape for the run it's replaying. A worker
 left running an old build after a step was renamed (without a matching `@Workflow` version bump) can
 pick up a run and surface a `NonDeterminismError`, or just hang — the same failure mode documented as
-a pitfall of a stale local worker in [Tenancy & topologies](/docs/concepts/tenancy#pitfalls). The lint
+a pitfall of a stale local worker in [Tenancy](/docs/concepts/tenancy#pitfalls). The lint
 rule and `assertReplayable` catch the code-level mistake; keeping workers and operator in lockstep on
 deploy is what keeps a *correct* version bump from still tripping over a stale process that hasn't
 picked it up yet.
@@ -252,7 +252,7 @@ DurableModule.forRoot({
 
 Omitting `namespace` makes the instance an **operator** that drives/recovers/resumes runs of *every*
 namespace — that's the shared cluster's control plane, not something to set on a random local
-process. See [Tenancy & topologies](/docs/concepts/tenancy) for the full operator/tenant model and its
+process. See [Tenancy](/docs/concepts/tenancy) for the full operator/tenant model and its
 pitfalls.
 
 ## 8. Retention

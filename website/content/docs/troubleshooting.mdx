@@ -36,7 +36,7 @@ whose history no longer matches its code.
   rollout means some instances are replaying old-shaped runs against new code. Find and kill any
   stale local process still consuming a shared queue; see
   ["Deploys: replay-safety discipline"](/docs/production#5-deploys-replay-safety-discipline) and the
-  "stale local worker" pitfalls in [Tenancy & topologies](/docs/concepts/tenancy#pitfalls).
+  "stale local worker" pitfalls in [Tenancy](/docs/concepts/tenancy#pitfalls).
 
 ## A caught suspend runs compensation and corrupts the run
 
@@ -113,11 +113,11 @@ common reasons:
   with no worker polling that namespace (or a worker polling a different one) just sits. Likewise the
   transport side: a tenant's queues are suffixed with its namespace (`handler@tenant`), so a worker
   listening on the un-suffixed (or differently-suffixed) queue never sees the task either. See
-  [Tenancy & topologies](/docs/concepts/tenancy).
+  [Tenancy](/docs/concepts/tenancy).
 - **No driving instance at all.** An instance with `drive: false` (an API/dashboard-only pod) never
   polls pending runs, recovers, or resumes timers — it only enqueues and reads. If every instance in
   the deployment is `drive: false`, nothing ever picks the run up. See
-  [Durability & replay](/docs/concepts/durability#execution-workers-api-pods-enqueue-driving-pods-run).
+  [Durability & replay](/docs/concepts/durability#execution--workers-api-pods-enqueue-driving-pods-run).
 - **The transport itself is down** — Redis/SQS/DB unreachable, so dispatch never reaches a worker
   group in the first place. Check the relevant [transport](/docs/transports) is actually connected.
 
@@ -245,7 +245,7 @@ exists doesn't show up.
   you're hitting the pod/route you think you are.
 
 **Fix:** verify the store instance backing the dashboard is the same one your engine's `DurableModule`
-uses, and check `scopeReads`/`namespace` configuration. See [Tenancy & topologies](/docs/concepts/tenancy)
+uses, and check `scopeReads`/`namespace` configuration. See [Tenancy](/docs/concepts/tenancy)
 and [Control plane](/docs/observability/dashboard).
 
 ## Scheduled workflows or durable sleeps aren't firing

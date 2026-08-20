@@ -1,6 +1,6 @@
 ---
 title: Roles & config
-description: The topology preset on DurableModule.forRoot, the co-located vs thin-worker vs api pods, and layered tenant authentication for a store-less fleet.
+description: The topology preset on DurableModule.forRoot, the RunGateway surface every shape shares, and layered tenant authentication for a store-less fleet.
 icon: SlidersHorizontal
 ---
 
@@ -8,26 +8,37 @@ import { Callout } from 'fumadocs-ui/components/callout';
 import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 import { Steps, Step } from 'fumadocs-ui/components/steps';
 
-You pick the topology with the **`topology` preset** on `DurableModule.forRoot`. The preset names the deployment role explicitly (instead of leaving it to `store`/`connection` inference) and validates the axes — `namespace` (the operator's poll-scope) vs `partition` (a worker's queue suffix). `topology` is entirely additive: omit it and nothing changes.
+Which [shape](/docs/cluster) a process takes is inferred from the options you give it. The
+**`topology` preset** on `DurableModule.forRoot` lets you name the role instead, and validates the
+two axes that otherwise read as synonyms — `namespace` (the operator's poll scope) versus `partition`
+(a worker's queue suffix). `topology` is entirely additive: omit it and inference behaves exactly as
+before.
 
-<Callout type="info">
-The two axes, one word: on a `control-plane` an optional `tenant` scopes the operator to its own runs (maps to `namespace`); on a `tenant` worker it is required and maps to `partition` (the worker's queue suffix). See [Tenancy](/docs/concepts/tenancy) for the full treatment.
-</Callout>
+## The configs
 
-## Operator (the default)
+<Tabs items={['Single process', 'Control plane', 'Thin worker', 'Read replica']}>
 
-Omit `topology` and you get the single-process operator — a control plane that also executes bodies. Add a `connection` to move execution onto a co-located BullMQ consumer; omit it to keep every `@Workflow` on the inline fast path.
+<Tab value="Single process">
+
+Omit `topology` and you get the default: an operator that owns the store and runs every `@Workflow`
+on the inline fast path.
 
 ```ts
 DurableModule.forRoot({
-  store,                                   // owns durable state
+  store,
   transport: new EventEmitterTransport(),  // or BullMQ for cross-process
 })
 ```
 
-## Control plane
+Add a `connection` and the same process keeps the store but moves execution onto a co-located BullMQ
+consumer — every `@Workflow` becomes group-served instead of inline.
 
-A pure coordinator: it owns the store and the transport, dispatches, recovers, fires timers, prunes retention, and answers thin-pod requests — but runs **no** worker. Bodies execute on separate `tenant` workers.
+</Tab>
+
+<Tab value="Control plane">
+
+A coordinator: it owns the store and the transport, dispatches, recovers, fires timers, prunes
+retention, and answers thin-pod requests.
 
 ```ts
 DurableModule.forRoot({
@@ -38,13 +49,20 @@ DurableModule.forRoot({
 })
 ```
 
-<Callout type="info">
-For **cross-ecosystem** fleets (a Python or Adonis worker on the same control plane), use the [BullMQ transport](/docs/cluster/interop) — it speaks the shared wire byte-for-byte.
+<Callout type="warn">
+The preset does not switch execution off. Bodies run wherever their `@Workflow`/`@Step` providers are
+registered — so a control plane that must not execute keeps those providers out of its module graph.
+Declare them here and this process starts consumers for them and runs them itself.
 </Callout>
 
-## Tenant (store-less thin worker)
+</Tab>
 
-A `tenant` worker sets a `connection` (Redis) and **no `store`** — that is what makes it store-less. It consumes its partition's queues, executes the `@Workflow`/`@Step` bodies registered in the module, and publishes results. The NestJS process **is** the worker (the module starts the consumer on bootstrap — no separate CLI).
+<Tab value="Thin worker">
+
+A store-less worker sets a `connection` (Redis) and **no `store`** — that is what makes it
+store-less. It consumes its partition's queues, executes the `@Workflow`/`@Step` bodies registered in
+the module, and publishes results. The NestJS process **is** the worker: the module starts the
+consumer on bootstrap, with no separate CLI.
 
 ```ts
 DurableModule.forRoot({
@@ -53,17 +71,100 @@ DurableModule.forRoot({
 })
 ```
 
+A store-less **api/dashboard pod** is the same config in an HTTP app that registers no handlers: it
+executes nothing and proxies every read and control action to the control plane.
+
+</Tab>
+
+<Tab value="Read replica">
+
+An operator that mounts the store and the dashboard for reads but runs none of the driving loops.
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  drive: false,   // no poll, recovery, timers, timeout sweep, retention or local step consumption
+})
+```
+
 <Callout type="warn">
-Store-less isolation is structural: a `tenant` worker has no `store` binding at all. A non-driving operator or a thin worker never consumes the store's driving loops (poll/recover/timers) — those belong to the control plane.
+`drive: false` is not "a lighter control plane" — nothing ticks on it. A driving operator must be
+running somewhere or pending runs never start, crashed runs never recover, and timers never fire.
 </Callout>
 
-## Worker vs api
+</Tab>
 
-A store-less **api/dashboard pod** is an ordinary NestJS HTTP app whose durable reads and control actions are proxied to the control plane. Every read/control/start it performs goes through the same `RunGateway` interface the [dashboard](/docs/observability/dashboard) and your controllers already use — but instead of reading a store directly, those calls round-trip over the transport to the control plane. No controller code changes. Tune the round-trip timeout with `runGatewayTimeoutMs` (default 10s).
+</Tabs>
+
+## What `topology` validates
+
+Each check is named after the axis it protects, and runs at `forRoot`/`forRootAsync` resolution time:
+
+| `topology` | Requires | Forbids | Notes |
+| --- | --- | --- | --- |
+| `{ role: 'control-plane', tenant? }` | `store` **and** (`transport` or `transports`) | `partition` | `tenant` is optional and maps onto `namespace`. Omit it on a deployed operator (it then drives every tenant); set it to scope a self-contained local stack to its own runs while sharing a broker with a deployed cluster. Setting `namespace` too is allowed only when it equals `tenant`; a mismatch throws. |
+| `{ role: 'tenant', tenant }` | `connection` | `store`, `namespace` | `tenant` is required and maps onto `partition`. Setting `partition` too is allowed only when it equals `tenant`; a mismatch throws. |
+
+The preset exists for the case plain inference can't catch: an app that sets both `namespace` (meant
+for the operator) and `partition` (meant for a worker) on one instance because the two options read
+as near-synonyms. `topology` forces you to pick one role and rejects the other role's axis outright,
+with an error message that explains why. What each axis actually partitions is
+[Tenancy](/docs/concepts/tenancy).
+
+## The shared surface: `RunGateway`
+
+Every shape binds exactly one `RunGateway`, and the role picks the implementation. An operator with a
+`store` reads its store directly (`StoreRunGateway`). A store-less pod binds a `ProxyRunGateway` that
+round-trips every call over the transport to the control plane, which reads *its* store and answers.
+
+**This is what makes application code portable across shapes.** Your controllers and the
+[dashboard](/docs/observability/dashboard) call the same interface either way, so a pod moving from
+single-process to store-less changes only its `forRoot` — no controller code, and the identical
+`DurableDashboardModule` mounts on both.
+
+```ts
+@Controller('runs')
+export class RunsController {
+  constructor(private readonly gateway: RunGateway) {}   // inject by type — the class is its own token
+
+  @Get(':id')
+  async show(@Param('id') id: string) {
+    return (await this.gateway.getRunDetail(id)) ?? {};
+  }
+}
+```
+
+| Verb | Purpose |
+| --- | --- |
+| `topology()` | this pod's role, plus its `tenant` when store-less. Synchronous — no round-trip. |
+| `getRunDetail(runId)` | one run plus its step timeline and child ids, or `null` |
+| `listRuns(query)` | a filtered listing (status, workflow, tag, namespace, search attributes), each row optionally carrying what a suspended run is parked on |
+| `runFacets(query)` | whole-set counts grouped by `(status, origin)` — exact even when the listing is paginated |
+| `waitingFor(runIds)` | bulk-resolve what each of an arbitrary set of runs is parked on |
+| `workerHealth()` | queue backlog and live worker heartbeats per group; scoped to the requester's own groups over a tenant proxy |
+| `cancel(runId, opts?)` | cancel a run, with `{ compensate: true }` to run its [saga undo](/docs/reliability/sagas) first |
+| `retry(runId)` / `continue(runId)` | re-drive a failed run, or push a dead one one step further |
+| `retryWithInput(runId, input)` | fix-and-replay: a fresh run from corrected input, keeping the original's namespace |
+| `redispatchPending(runId)` | re-enqueue every remote step still `pending` — the operator escape hatch for a lost dispatch |
+| `subscribe(runId, onEvent)` | live-tail one run's lifecycle events; returns the unsubscribe |
+
+Tune the proxy round-trip with `runGatewayTimeoutMs` (default `10_000`). It is ignored on an
+operator, which is bound to the store-backed gateway.
+
+<Callout type="info">
+On a store-less pod the `WorkflowEngine` token is **start-only**: `start` publishes a start message
+over the wire, but `cancel`, `deleteRun`, `resume`, `signal`, `signalWithStart` and `publishEvent`
+reject with a named `tenantUnsupported(...)` error — they need a store the pod does not have. The
+control verbs are still reachable, just through `RunGateway` above. Reach for `RunGateway` in
+anything that must run on more than one shape.
+</Callout>
 
 ## Layered tenant authentication
 
-The `tenant` on a wire request is a **claim**. Without authentication the isolation boundary is meaningless. Durable stacks **two** layers:
+The `tenant` on a wire request is a **claim**. Without authentication the
+[isolation boundary](/docs/concepts/tenancy#the-isolation-boundary) is meaningless — any pod could
+ask for any tenant's runs. Durable stacks **two** layers:
 
 <Steps>
 
@@ -71,7 +172,8 @@ The `tenant` on a wire request is a **claim**. Without authentication the isolat
 
 ### Prefix / network baseline
 
-Each tenant runs on a segmented transport prefix/namespace behind a Redis/network ACL, so a pod can only reach its own prefix. No application code.
+Each tenant runs on a segmented transport prefix/namespace behind a Redis/network ACL, so a pod can
+only reach its own prefix. No application code.
 
 </Step>
 
@@ -79,15 +181,20 @@ Each tenant runs on a segmented transport prefix/namespace behind a Redis/networ
 
 ### Signed token on top
 
-Each tenant pod carries a secret-signed token. The control plane **verifies the signature and derives the tenant from the token**, ignoring any `tenant` in the request body — defense in depth.
+Each tenant pod carries a secret-signed token. The control plane **verifies the signature and derives
+the tenant from the token**, ignoring any `tenant` in the request body — defense in depth.
 
 </Step>
 
 </Steps>
 
-The control plane is the **trust boundary** for these proxied requests: it forces `listRuns` to the requester's own tenant (no cross-tenant enumeration), validates `run.namespace === tenant` on every get/signal/cancel (anti-IDOR), and rejects unknown verbs and tampered tokens.
+The control plane is the **trust boundary** for these proxied requests: it forces `listRuns` to the
+requester's own tenant (no cross-tenant enumeration), validates `run.namespace === tenant` on every
+runId-bearing verb (anti-IDOR), and rejects unknown verbs and tampered tokens.
 
 ## Next steps
 
+- **[Tenancy](/docs/concepts/tenancy)** — what `namespace` and `partition` partition, and the rules
+  that keep a tenant's runs on the tenant's own pool.
 - **[Handshake & capability negotiation](/docs/cluster/handshake)** — keep a mixed fleet version-safe.
 - **[Cross-ecosystem interop](/docs/cluster/interop)** — add Python and Adonis workers.

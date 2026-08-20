@@ -1,45 +1,85 @@
 ---
-title: Tenancy & topologies
-description: One engine, three deployment shapes. How the operator/tenant split lets a store-less worker borrow a control plane's store over the transport — and the boundary that keeps each tenant to its own runs.
+title: Tenancy
+description: What namespace and partition actually partition, how a store-less tenant borrows the control plane's store over the transport, and the boundary that keeps each tenant to its own runs.
 icon: Building2
 ---
 
-A durable deployment is built from two roles — an **operator** that owns the store and drives runs,
-and zero or more **tenants** that execute work without a store. Which roles you run, and how many,
-gives you three shapes. They share one codebase; only configuration differs.
+import { Callout } from 'fumadocs-ui/components/callout';
 
-## Single deployment
+Tenancy is one axis: **whose runs are these, and which pool executes them.** It is independent of how
+many processes you run — see [Topologies](/docs/cluster) for that. This page is what the tenant axis
+means once you have reached for it.
 
-The default. One process holds the store, the engine, and the workers. Runs are stamped with the
-`default` namespace and the dashboard reads straight from the store. This is production for most
-apps — nothing below is needed until you want to split work across processes or machines.
-
-<TenancyDiagram variant="single" caption="One process owns everything. The transport can be your database or Redis." />
-
-## Operator + tenants
-
-Split the store-owner from the workers. The **operator** (control plane) holds the store, runs the
-dashboard, and drives/recovers runs of **every** namespace — its own namespace is left unset, which
-is how it sees everyone. Each **tenant** sets `DURABLE_TENANT` and runs store-less: its queues are
-suffixed with the tenant (`handler@blue`), its runs are stamped with it, and its `RunGateway`
-round-trips reads and control verbs to the operator over the transport instead of touching a store
-directly.
+Two roles carry it. An **operator** owns the store and drives runs. A **tenant** executes work without
+a store: its queues are suffixed with the tenant (`handler@blue`), its runs are stamped with it, and
+its `RunGateway` round-trips reads and control verbs to the operator over the transport instead of
+touching a store directly.
 
 <TenantFlow />
-
-The wire between them carries a few message kinds, all over the transport (no direct DB access from a
-tenant):
-
-- **start-run** — a tenant asks the operator to create a run; the operator stamps it with the
-  tenant's namespace.
-- **run-request / reply** — reads and control (`getRunDetail`, `listRuns`, `cancel`, `retry`, …)
-  proxied to the operator and answered on a correlated reply.
-- **tenant events** — lifecycle events streamed back per tenant, so a tenant's dashboard tails its
-  own runs live.
 
 This is what makes a developer's laptop a tenant of a shared cluster: point it at the cluster's
 transport, set `DURABLE_TENANT=your-name`, and your runs execute on your machine while the cluster's
 operator orchestrates and stores them — without your runs colliding with anyone else's.
+
+<Callout type="info">
+`DURABLE_TENANT` (as used throughout this page) isn't a variable the library reads itself. It's the
+app-level convention for feeding `DurableModuleOptions.namespace` — and, on the worker side,
+`partition` — from the environment. The
+[`topology` preset](/docs/cluster/roles-and-config#what-topology-validates) maps one `tenant` word
+onto whichever of the two the role calls for.
+</Callout>
+
+## What `namespace` partitions
+
+`namespace` is a `DurableModule.forRoot({ namespace })` option (forwarded to the engine's own
+`WorkflowEngineDeps.namespace`) and it isolates **two independent things** at once:
+
+- **The store.** The engine's poll paths — driving pending runs, recovering incomplete ones, resuming
+  due timers, and sweeping timeouts — only act on runs stamped with this instance's namespace. Every
+  run created by a namespaced engine is stamped with it, so a store shared by several pools (a dev
+  cluster and a developer's laptop, say) never has one pool driving another's runs.
+- **The transport.** The engine propagates its namespace to every transport that supports
+  namespacing; the BullMQ transport folds it into every queue/stream/key name
+  (`<prefix>-<namespace>-...` for tasks, results, decisions, step-events, the worker-heartbeat key,
+  and the control/heartbeat channels).
+
+Both axes share one **default-is-bare** rule: `undefined`, `""`, and `"default"` all collapse to the
+bare name/queue — only a real, non-default namespace suffixes anything. A single-tenant deployment is
+byte-identical to the un-namespaced scheme, and unaffected.
+
+**Omitting `namespace` makes the instance an operator**: an unset namespace drives, recovers, and
+resumes runs of *every* namespace (the poll filters no-op) and leaves the transport on its bare
+prefix. "Seeing everyone" is the absence of a namespace, not a wildcard value.
+
+## What `partition` partitions
+
+`partition` is the other half of the same word, on the worker side: which queue a worker's consumer
+subscribes to. A run's namespace becomes a worker-queue suffix, `<handler>@<tenant>`, so an operator
+dispatching a tenant's run and that tenant's worker subscribing to its `partition` land on the exact
+same queue name — the dispatch side derives the suffix from the run's namespace, the worker side from
+`DurableModuleOptions.partition`.
+
+That symmetry is the whole routing model, and it is why the two options read as synonyms without
+being interchangeable: `namespace` is what an operator **polls**, `partition` is what a worker
+**subscribes**. Setting both on one instance is the mistake the
+[`topology` preset](/docs/cluster/roles-and-config#what-topology-validates) exists to reject.
+
+## The wire between operator and tenant
+
+A tenant never touches the database. Three message kinds cross the boundary, all over the transport:
+
+- **`StartRunMessage`** (`<prefix>-start-run`) — `{ tenant, workflow, input, runId?, tags?,
+  searchAttributes? }`. A tenant publishes this instead of touching a DB; the operator turns it into a
+  durable run stamped with `tenant` as its namespace.
+- **`RunRequest` / `RunReply`** (correlated by `requestId`) — every read and control verb
+  (`getRunDetail`, `listRuns`, `cancel`, `retry`, `continue`, `retryWithInput`, …) proxied to the
+  operator and answered on the correlated reply.
+- **`TenantEvent`** — lifecycle events re-published per tenant, so a tenant's dashboard tails its own
+  runs live.
+
+A store-less instance with no transport configured either has nowhere to read from, and its gateway
+rejects every call. The surface each role exposes — and which verbs go over which path — is
+[Roles & config](/docs/cluster/roles-and-config#the-shared-surface-rungateway).
 
 ### The isolation boundary
 
@@ -55,140 +95,13 @@ client — the operator is the boundary:
 So the guarantee holds even against a misbehaving client: the operator decides what a tenant is
 allowed to touch.
 
-## Cross-runtime
-
-Because tenants talk to the operator only over the transport, a tenant doesn't have to be the same
-language as the operator. A Node operator can orchestrate a **Python** tenant worker: the operator
-owns the pipeline and the store, and dispatches steps that the Python `durable-worker` picks up off
-the same queue names. Orchestration lives in one runtime, handlers in another.
-
-<TenancyDiagram variant="polyglot" caption="A Node operator and a Python tenant worker share one transport and one queue-naming scheme." />
-
-## Choosing a shape
-
-| Shape | Configuration | When to reach for it |
-| --- | --- | --- |
-| **Single** | no `DURABLE_TENANT`, has store | One process: store + engine + workers. The production default; simplest. |
-| **Operator + tenants** | operator (no tenant) + tenants (`DURABLE_TENANT` set) | Operator owns the store + dashboard; tenants run store-less and proxy over the transport. Multi-machine, per-developer, or per-team isolation. |
-| **Cross-runtime** | operator + tenant in another language | A tenant in another language (e.g. Python) driven by the operator over the transport. |
-
-## What `namespace` partitions
-
-`namespace` is a `DurableModule.forRoot({ namespace })` option (forwarded to the engine's own
-`WorkflowEngineDeps.namespace`) and it isolates **two independent things** at once:
-
-- **The store.** The engine's poll paths — driving pending runs, recovering incomplete ones,
-  resuming due timers, and sweeping timeouts — only act on runs stamped with this instance's
-  namespace. Every run created by a namespaced engine is stamped with it, so a store shared by
-  several pools (a dev cluster and a developer's laptop, say) never has one pool driving another's
-  runs.
-- **The transport.** The engine propagates its namespace to every transport that supports
-  namespacing; the BullMQ transport folds it into every queue/stream/key name
-  (`<prefix>-<namespace>-...` for tasks, results, decisions, step-events, the worker-heartbeat key,
-  and the control/heartbeat channels). A namespace that's unset or `"default"` keeps every name
-  byte-identical to the un-namespaced scheme, so a single-tenant deployment is unaffected.
-
-Both axes share one **default-is-bare** rule: `undefined`, `""`, and `"default"` all collapse to the
-bare name/queue — only a real, non-default namespace suffixes anything. This is also how workflow
-*routing* is scoped: a run's namespace becomes a worker-queue suffix, `<handler>@<tenant>`, so an
-operator dispatching a tenant's run and that tenant's worker subscribing to its `partition` land on
-the exact same queue name — the dispatch side derives the suffix from the run's namespace and the
-worker side derives it from `DurableModuleOptions.partition`.
-
-**Omitting `namespace` makes the instance an operator**: an unset namespace drives, recovers, and
-resumes runs of *every* namespace (the poll filters no-op) and leaves the transport on its bare
-prefix — "seeing everyone" is the absence of a namespace, not a wildcard value.
-
-## The `topology` preset
-
-`namespace` and `partition` are two axes that look alike (both take a string, both end up in a queue
-name) but belong to opposite roles — `namespace` is what the **operator** polls/drives/recovers;
-`partition` is what a **worker**'s consumer subscribes to. Nothing in the types stopped you from
-setting both on the same instance, or from setting `partition` on an operator where it does nothing.
-`DurableModuleOptions.topology` makes the role an explicit, validated choice instead of an inferred
-one:
-
-```ts
-// Control plane: owns the store, dispatches over the transport. `tenant` is optional here — leave it
-// unset on a deployed operator (drives every tenant); set it (e.g. from an env var) to scope a
-// self-contained local stack to its own runs while sharing a broker with a deployed cluster.
-DurableModule.forRoot({
-  topology: { role: 'control-plane', tenant: process.env.DURABLE_TENANT },
-  store,
-  transport,
-});
-
-// Tenant: store-less worker scoped to its own partition — `tenant` maps onto `partition` for you.
-DurableModule.forRoot({
-  topology: { role: 'tenant', tenant: 'acme-corp' },
-  connection: process.env.REDIS_URL,
-});
-```
-
-Validated at `forRoot`/`forRootAsync` resolution time, each check named after the axis it protects:
-
-| `topology` | Requires | Forbids | Notes |
-| --- | --- | --- | --- |
-| `{ role: 'control-plane', tenant? }` | `store` AND (`transport` or `transports`) | `partition` | `tenant` is optional here and maps onto `namespace` — omit it on a deployed operator (drives every tenant); set it to scope a self-contained local stack to its own runs while sharing a broker with a deployed cluster. `namespace` and `connection` also stay allowed — set `namespace` explicitly too only if it equals `tenant` (a no-op); a mismatch throws. |
-| `{ role: 'tenant', tenant }` | `connection` | `store`; `namespace` | `tenant` is required and mapped onto `partition` internally — set `partition` too only if it equals `tenant` (a no-op); a mismatch throws. |
-
-`topology` is entirely additive: omit it and `store`/`connection` inference behaves exactly as
-before. It exists for the case a plain inferred config doesn't catch — a consumer app that sets both
-`namespace` (meant for the operator) and `partition` (meant for a worker) on one instance because the
-two options read as near-synonyms; `topology` forces you to pick one role and rejects the other role's
-axis outright, with an error message that explains why.
-
-## Child runs inherit the parent's namespace
-
-A child run (`ctx.child`, `ctx.gather_children`, or a remote workflow's `startChild`) is stamped with
-the **namespace of the run it was spawned from** — not the namespace of whichever engine happens to
-execute that parent. This matters because an operator (`namespace: undefined`) legitimately executes
-every tenant's parents during recovery; without this rule a recovery-resumed parent's child would
-fall back to `default` and dispatch to the shared/default worker pool instead of the tenant's own.
-
-The child inherits the *parent run's* namespace, never the executing engine's own. Top-level runs and
-an explicit `opts.namespace` are unaffected — this only sets the implicit default a child would
-otherwise get, so a tenant's child always dispatches to that tenant's worker pool even when an operator
-resumed the parent.
-
-A related but distinct rule covers **retries**: `retryWithInput` also re-stamps the new run with the
-original run's `namespace` so a fix-and-replay of a tenant's run stays that tenant's instead of
-falling to `default` on an operator — the same "inherit from the record, not from the executing
-engine" principle, applied to a different operation.
-
-## Tenant model: operator, tenants, and the run gateway
-
-Every durable instance binds exactly one `RunGateway`, and the role
-picks which implementation you get. An operator with a `store` set reads its store directly. A
-store-less tenant instead proxies every read, control verb, and start over the transport to the
-operator, which reads *its* store and answers. (If a store-less instance has no transport configured
-either, its gateway rejects every call — there's nowhere for it to read from.) App code and the
-dashboard call the same `RunGateway` interface either way, so a tenant can mount the identical
-`DurableDashboardModule` the operator uses, and no controller code changes between the two roles.
-
-Three wire message kinds cross that operator/tenant boundary, all over the transport — no direct DB
-access from a tenant:
-
-- **`StartRunMessage`** (`<prefix>-start-run`) — `{ tenant, workflow, input, runId?, tags?,
-  searchAttributes? }`. A tenant publishes this instead of touching a DB; the operator turns it into
-  a durable run stamped with `tenant` as its namespace.
-- **`RunRequest` / `RunReply`** (correlated by `requestId`) — every read/control verb
-  (`getRunDetail`, `listRuns`, `cancel`, `retry`, `continue`, `retryWithInput`) proxied to the
-  operator and answered on the correlated reply.
-- **`TenantEvent`** — lifecycle events re-published per tenant, so a tenant's dashboard tails its own
-  runs live.
-
-The start path and the gateway path don't overlap. On a tenant, the `WorkflowEngine` token is
-**start-only**: `start` publishes a `StartRunMessage`, but `cancel`, `deleteRun`, `resume`, `signal`,
-`signalWithStart`, and `publishEvent` reject with a named `tenantUnsupported(...)` error, since they
-need a store a tenant doesn't have and there's no wire message for them on that path. The control
-verbs (`cancel`, `retry`, `continue`, `retryWithInput`) are still reachable from a tenant — just
-through the *other* surface, the `RunGateway`, which proxies them to the operator as shown above.
-Prefer the dashboard/`RunGateway` path for those verbs on a tenant.
-
-`DURABLE_TENANT` (as used by this doc's examples) isn't a variable the library reads itself — it's
-the app-level convention for feeding `DurableModuleOptions.namespace` (and, on the worker side,
-`partition`) from the environment.
+<Callout type="warn">
+That boundary is only as strong as the claim it reads. The `tenant` on a wire request is asserted by
+the caller — on its own, nothing stops a pod from asserting someone else's. Pair this with
+[layered tenant authentication](/docs/cluster/roles-and-config#layered-tenant-authentication):
+network/prefix segmentation, and a signed token the control plane derives the tenant *from* rather
+than trusting the body.
+</Callout>
 
 ### Read scoping (`scopeReads`)
 
@@ -198,16 +111,30 @@ store to a view that only sees its own namespace, using the store's optional sco
 off by default — a control plane's own operator screens stay unscoped by design — and is a no-op for
 a store that doesn't support scoping.
 
+## Child runs inherit the parent's namespace
+
+A child run (`ctx.child`, `ctx.gather_children`, or a remote workflow's `startChild`) is stamped with
+the **namespace of the run it was spawned from** — not the namespace of whichever engine happens to
+execute that parent. This matters because an operator (`namespace: undefined`) legitimately executes
+every tenant's parents during recovery; without this rule a recovery-resumed parent's child would
+fall back to `default` and dispatch to the shared worker pool instead of the tenant's own.
+
+Top-level runs and an explicit `opts.namespace` are unaffected — this only sets the implicit default a
+child would otherwise get.
+
+The same principle covers **retries**: `retryWithInput` re-stamps the new run with the original run's
+namespace, so a fix-and-replay of a tenant's run stays that tenant's instead of falling to `default`
+on an operator. Inherit from the record, never from the executing engine.
+
 ## Multi-environment patterns
 
 Because namespace partitions both the store and the transport, one Redis/DB pair can safely host
 several non-interchangeable pools:
 
 - **A dev cluster + per-developer local instances.** Give the cluster's operator no namespace (or
-  `default`) and each developer's local engine a distinct one (e.g. `DURABLE_TENANT=blue`).
-  Point the local instance at the *same* transport/DB the cluster uses; its runs, queues, and keys
-  all carry its own namespace suffix, so it can iterate against shared infra without touching anyone
-  else's runs.
+  `default`) and each developer's local engine a distinct one (e.g. `DURABLE_TENANT=blue`). Point the
+  local instance at the *same* transport/DB the cluster uses; its runs, queues, and keys all carry its
+  own namespace suffix, so it can iterate against shared infra without touching anyone else's runs.
 - **Per-team or per-customer isolation** — the same shape, one namespace per team/tenant instead of
   per developer, all driven by one operator.
 
@@ -221,11 +148,19 @@ several non-interchangeable pools:
   and steals tasks from, them, and vice versa. Set a real, distinct namespace on the local instance;
   an un-namespaced local worker is not merely "another consumer," it shares the shared pool's queues.
 - **A stale local worker with an old build, even when namespaced, can misroute a run.** A worker
-  process left running after a step/workflow rename (without bumping the `@Workflow` version) can
-  pick up a run under its namespace with code that no longer matches the run's history, surfacing as
-  a `NonDeterminismError` or a hung run — kill stale local processes, don't just rely on the
-  namespace being distinct.
+  process left running after a step/workflow rename (without bumping the `@Workflow` version) can pick
+  up a run under its namespace with code that no longer matches the run's history, surfacing as a
+  `NonDeterminismError` or a hung run — kill stale local processes, don't just rely on the namespace
+  being distinct.
 - **`listRuns`'s namespace is enforced server-side, not client-side.** A tenant can't widen its own
-  query by passing a different `namespace` — the operator overwrites it with
-  the requester's tenant unconditionally. Don't rely on a client-side filter for isolation; there
-  isn't one to bypass in the first place.
+  query by passing a different `namespace` — the operator overwrites it with the requester's tenant
+  unconditionally. Don't rely on a client-side filter for isolation; there isn't one to bypass in the
+  first place.
+
+## Next steps
+
+- **[Topologies](/docs/cluster)** — the deployment shapes this axis rides on.
+- **[Roles & config](/docs/cluster/roles-and-config)** — the `topology` preset, the `RunGateway`
+  surface, and layered tenant authentication.
+- **[Cross-ecosystem interop](/docs/cluster/interop)** — a Python or Adonis tenant on the same
+  operator.

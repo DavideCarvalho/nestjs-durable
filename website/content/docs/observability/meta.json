@@ -2,6 +2,7 @@
   "title": "Observability",
   "icon": "Telescope",
   "pages": [
+    "index",
     "dashboard",
     "otel",
     "metrics",

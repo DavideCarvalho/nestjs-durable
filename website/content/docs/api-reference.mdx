@@ -275,7 +275,7 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `controlPlane` | `ControlPlane` | first broadcast-capable transport | Cross-instance lifecycle-event + cancellation pub/sub. |
 | `timerPollMs` | `number` | `1000` | Durable-timer poller interval; `0` disables it. Operator only. |
 | `autoSchema` | `boolean` | `true` | Auto-create durable tables via `store.ensureSchema()` on boot. Turn off in production; migrate instead. |
-| `namespace` | `string` | unset = **operator** | Worker-pool partition; poll paths only act on runs in this namespace. See [Tenancy & topologies](/docs/concepts/tenancy). |
+| `namespace` | `string` | unset = **operator** | Worker-pool partition; poll paths only act on runs in this namespace. See [Tenancy](/docs/concepts/tenancy). |
 | `leaseMs` | `number` | `30000` | Multi-instance recovery-lease duration. Operator only. |
 | `instanceId` | `string` | random | Unique id for this instance (leases, worker heartbeats). |
 | `maxRecoveryAttempts` | `number` | unlimited | Cap recovery attempts before a poison-pill run moves to `dead`. See [Dead-letter queue](/docs/reliability/dead-letter). |
@@ -298,7 +298,7 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `concurrency` | `ConcurrencyOption` (`number \| 'adaptive' \| { mode: 'adaptive', ... }`) | `1` | Tasks a worker role's consumer runs concurrently per subscribed queue. Ignored for a plain operator. |
 | `concurrencyByHandler` | `Record<string, ConcurrencyOption>` | falls back to `concurrency` | Per-handler concurrency override — not yet wired through `runRedisWorker`. |
 | `runGatewayTimeoutMs` | `number` | `10000` | Timeout for a thin worker's `RunGateway` round-trip over `transport`. Ignored for an operator. |
-| `topology` | `{ role: 'control-plane' } \| { role: 'tenant'; tenant: string }` | none = existing inference | Explicit, VALIDATED role preset — see [Tenancy & topologies](/docs/concepts/tenancy#the-topology-preset). `'tenant'` maps `tenant` onto `partition` for you. |
+| `topology` | `{ role: 'control-plane' } \| { role: 'tenant'; tenant: string }` | none = existing inference | Explicit, VALIDATED role preset — see [Roles & config](/docs/cluster/roles-and-config#what-topology-validates). `'tenant'` maps `tenant` onto `partition` for you. |
 
 ## Errors
 

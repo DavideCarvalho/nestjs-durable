@@ -2,6 +2,7 @@
   "title": "Authoring",
   "icon": "PenLine",
   "pages": [
+    "index",
     "child-workflows",
     "entities",
     "events",
