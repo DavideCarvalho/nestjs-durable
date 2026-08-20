@@ -1,0 +1,18 @@
+---
+title: Overview
+icon: Wrench
+description: The two build-time tools — a lint rule set that catches non-determinism inside a workflow body before it ever runs, and a codegen extension that emits a typed client for the dashboard's REST API.
+---
+
+Neither of these is needed to run a workflow. They exist for the two things the engine cannot check
+at runtime without it being too late.
+
+- **[Linting for non-determinism](/docs/tooling/linting)** — a workflow body must be deterministic, and
+  the engine only finds out it wasn't when a replay diverges, often long after the deploy.
+  `@dudousxd/nestjs-durable-eslint-plugin` catches `Date.now()`, `Math.random()`, `new Date()` and
+  `crypto.randomUUID()` inside a `@Workflow` at author time, for both ESLint (flat config) and Biome
+  (GritQL plugin).
+- **[Typed dashboard client](/docs/tooling/codegen)** — the dashboard ships a REST API for listing and
+  inspecting runs, retrying, cancelling and delivering webhooks. The `nestjsDurableCodegen` extension
+  for [`@dudousxd/nestjs-codegen`](https://davidecarvalho.github.io/aviary/docs/codegen) generates a
+  fully-typed client and TanStack hooks over it, so a custom console doesn't hand-write fetch calls.
