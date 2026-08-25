@@ -1,5 +1,13 @@
 import type { RunStatus, StepKind } from '@dudousxd/nestjs-durable-core';
-import { EntitySchema } from '@mikro-orm/core';
+import { EntityRepositoryType, EntitySchema } from '@mikro-orm/core';
+import {
+  BufferedEventRepository,
+  BufferedSignalRepository,
+  RunAttributeRepository,
+  SignalWaiterRepository,
+  StepCheckpointRepository,
+  WorkflowRunRepository,
+} from './repositories';
 
 /**
  * How property names map to physical column names. The durable tables are adapter-agnostic: a run
@@ -30,6 +38,8 @@ function columnNamer(naming: DurableColumnNaming): (property: string) => string 
 // still references these classes for `em.create`/`getMetadata`.
 
 export class WorkflowRunEntity {
+  [EntityRepositoryType]?: WorkflowRunRepository;
+
   id!: string;
   workflow!: string;
   workflowVersion!: string;
@@ -52,6 +62,8 @@ export class WorkflowRunEntity {
 }
 
 export class StepCheckpointEntity {
+  [EntityRepositoryType]?: StepCheckpointRepository;
+
   runId!: string;
   seq!: number;
   name!: string;
@@ -78,6 +90,8 @@ export class StepCheckpointEntity {
  * `numValue`, strings/booleans in `strValue` (booleans as "true"/"false"); see normalizeAttributeRows.
  */
 export class RunAttributeEntity {
+  [EntityRepositoryType]?: RunAttributeRepository;
+
   runId!: string;
   key!: string;
   strValue?: string | null;
@@ -85,6 +99,8 @@ export class RunAttributeEntity {
 }
 
 export class SignalWaiterEntity {
+  [EntityRepositoryType]?: SignalWaiterRepository;
+
   token!: string;
   runId!: string;
   seq!: number;
@@ -92,6 +108,8 @@ export class SignalWaiterEntity {
 }
 
 export class BufferedSignalEntity {
+  [EntityRepositoryType]?: BufferedSignalRepository;
+
   id!: number;
   token!: string;
   payload?: unknown;
@@ -101,6 +119,8 @@ export class BufferedSignalEntity {
  *  caller-minted `id` (a uuid, not autoincrement — `removeBufferedEvent` targets it directly), not by
  *  `runId`: events are name-based pub/sub, not tied to any one run. */
 export class BufferedEventEntity {
+  [EntityRepositoryType]?: BufferedEventRepository;
+
   id!: string;
   name!: string;
   payload?: unknown;
@@ -131,6 +151,9 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const workflowRuns = new EntitySchema<WorkflowRunEntity>({
     class: WorkflowRunEntity,
     tableName: 'durable_workflow_runs',
+    // Wired per schema rather than once on the class: `durableEntities` can be called again with a
+    // different `naming`, and each call builds a distinct EntitySchema over the same class.
+    repository: () => WorkflowRunRepository,
     // Global filter: confines every read to the tenant's namespace when the store is scoped.
     // The `cond` returns `{}` (no-op) when the `namespace` arg is `undefined`, so an unscoped
     // (operator / control-plane) store sees all rows unchanged — existing behaviour is preserved.
@@ -212,6 +235,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const stepCheckpoints = new EntitySchema<StepCheckpointEntity>({
     class: StepCheckpointEntity,
     tableName: 'durable_step_checkpoints',
+    repository: () => StepCheckpointRepository,
     properties: {
       runId: { type: 'string', primary: true, fieldName: col('runId') },
       seq: { type: 'integer', primary: true, fieldName: col('seq') },
@@ -240,6 +264,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const runAttributes = new EntitySchema<RunAttributeEntity>({
     class: RunAttributeEntity,
     tableName: 'durable_run_attributes',
+    repository: () => RunAttributeRepository,
     // The search-attribute EXISTS join (see the class docstring) pushes equality/range predicates down
     // onto `(key, numValue)` / `(key, strValue)`; mirror the Prisma adapter so those scans stay indexed.
     indexes: [
@@ -258,6 +283,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const signalWaiters = new EntitySchema<SignalWaiterEntity>({
     class: SignalWaiterEntity,
     tableName: 'durable_signal_waiters',
+    repository: () => SignalWaiterRepository,
     properties: {
       token: { type: 'string', primary: true, fieldName: col('token') },
       runId: { type: 'string', fieldName: col('runId') },
@@ -272,6 +298,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const bufferedSignals = new EntitySchema<BufferedSignalEntity>({
     class: BufferedSignalEntity,
     tableName: 'durable_buffered_signals',
+    repository: () => BufferedSignalRepository,
     properties: {
       id: { type: 'integer', primary: true, autoincrement: true, fieldName: col('id') },
       token: { type: 'string', index: true, fieldName: col('token') },
@@ -282,6 +309,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const bufferedEvents = new EntitySchema<BufferedEventEntity>({
     class: BufferedEventEntity,
     tableName: 'durable_buffered_events',
+    repository: () => BufferedEventRepository,
     // `(name, publishedAt)` serves both `listBufferedEvents`'s name-scoped scan and its oldest-first
     // ordering in one index.
     indexes: [

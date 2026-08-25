@@ -29,8 +29,51 @@ export default defineConfig({
 });
 ```
 
-`ENTITIES` is `[WorkflowRunEntity, StepCheckpointEntity, RunAttributeEntity, SignalWaiterEntity, BufferedSignalEntity]` —
-the five tables the engine owns (`durable_*`). They never reference your entities.
+`ENTITIES` is `[WorkflowRunEntity, StepCheckpointEntity, RunAttributeEntity, SignalWaiterEntity, BufferedSignalEntity, BufferedEventEntity]` —
+the six tables the engine owns (`durable_workflow_runs`, `durable_step_checkpoints`,
+`durable_run_attributes`, `durable_signal_waiters`, `durable_buffered_signals`,
+`durable_buffered_events`). They never reference your entities.
+
+### Custom repositories
+
+Each entity comes with a repository class, so app code that reads a durable table injects a typed
+handle instead of passing the entity class to every call:
+
+```ts
+import {
+  WorkflowRunEntity,
+  WorkflowRunRepository,
+} from '@dudousxd/nestjs-durable-store-mikro-orm';
+import { InjectRepository } from '@mikro-orm/nestjs';
+
+@Injectable()
+export class RunsService {
+  constructor(
+    @InjectRepository(WorkflowRunEntity)
+    private readonly runs: WorkflowRunRepository,
+  ) {}
+
+  failed() {
+    return this.runs.findAll({ where: { status: 'failed' } });
+  }
+}
+```
+
+`em.getRepository(WorkflowRunEntity)` returns the same thing, correctly typed — the entity declares
+its repository through MikroORM's `[EntityRepositoryType]` symbol. The full set is
+`WorkflowRunRepository`, `StepCheckpointRepository`, `RunAttributeRepository`,
+`SignalWaiterRepository`, `BufferedSignalRepository` and `BufferedEventRepository`.
+
+They are wired onto the schemas that `durableEntities()` builds, so they come along with any
+`naming` — including a second call with a different mapping. Their bodies are empty: the engine's own
+reads and writes go through `MikroOrmStateStore`, and these exist purely as an injectable handle for
+your code. Subclass one in your app if you want to hang query helpers off it.
+
+<Callout type="warn">
+  Repository reads are ordinary `EntityManager` reads, so the `namespace` global filter below applies
+  to them. On an EntityManager that never sets the filter param this is a no-op (you see every
+  namespace, the operator view); on one scoped to a tenant, the repository is scoped with it.
+</Callout>
 
 ### Column naming
 
@@ -115,7 +158,8 @@ DurableModule.forRoot({ store, transport, autoSchema: false });
 ```
 
 It only ever adds `durable_workflow_runs`, `durable_step_checkpoints`, `durable_run_attributes`,
-`durable_signal_waiters` and `durable_buffered_signals` — your tables are untouched.
+`durable_signal_waiters`, `durable_buffered_signals` and `durable_buffered_events` — your tables are
+untouched.
 
 ### The heal is fingerprint-gated
 
