@@ -5,6 +5,9 @@ import type {
   RunFacetRow,
   RunQuery,
   RunResult,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
   RunWaiting,
   StepCheckpoint,
   WorkflowRun,
@@ -79,6 +82,20 @@ export abstract class RunGateway {
    * page bounds what is rendered, these counts stay whole-set exact. Zero-count cells are absent.
    */
   abstract runFacets(query: RunFacetQuery): Promise<RunFacetRow[]>;
+  /**
+   * The distinct values of one filter axis over the runs matching `query`, with counts — what fills a
+   * console's tenant/tag/attribute pickers. On the port (not control-plane-only) because the pickers
+   * belong to the same panel as {@link listRuns}: a tenant that can list its runs has to be able to
+   * see what it may filter them by, or its console offers a blank dropdown.
+   *
+   * Returns `[]` when the underlying store does not implement the enumeration — an empty picker with
+   * free-text entry still standing, not an error.
+   */
+  abstract runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]>;
   /**
    * Bulk-resolve {@link RunWaiting} for an arbitrary set of run ids — for a consumer with its OWN
    * filtered/paginated run listing (so it isn't just `listRuns` under another name) that needs to know

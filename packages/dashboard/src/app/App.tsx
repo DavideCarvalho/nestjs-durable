@@ -36,6 +36,7 @@ import {
   splitCompensations,
 } from '../client/split-compensations';
 import { type HealthSummary, stalledWorkflows, summarizeHealth } from '../client/summarize-health';
+import { AttributeFilters } from './AttributeFilters';
 import { OriginFacets } from './OriginFacets';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
@@ -49,10 +50,21 @@ import { Badge as Chip, badgeVariants } from './ui/badge';
 import { Button } from './ui/button';
 import { cn } from './ui/cn';
 import { Dialog } from './ui/dialog';
-import { InputField } from './ui/input';
+import { MultiSelect, type MultiSelectOption } from './ui/multi-select';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
+
+/**
+ * A value picker's options, from what the server counted. The `null` row (a run with NO value on
+ * that axis) is dropped: it is a real bucket for counting, but nothing an operator can select as
+ * text — the origin facet has its own "unknown" chip for exactly that reason.
+ */
+function selectableValues(rows: { value: string | null; count: number }[]): MultiSelectOption[] {
+  return rows
+    .filter((row): row is { value: string; count: number } => row.value !== null)
+    .map((row) => ({ value: row.value, count: row.count }));
+}
 
 /** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
  *  flowing into the next), in currentColor so it inherits the `--accent` token. Replaces the bare `◆`. */
@@ -1594,11 +1606,13 @@ const PAGE_SIZE = 100;
 
 export function App() {
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
-  const [tagFilter, setTagFilter] = useState('');
-  const [attrFilter, setAttrFilter] = useState('');
+  // Arrays, not strings: each of these controls takes SEVERAL values, ORed within the axis and
+  // ANDed across them — comparing two tenants, or two tags, is one query rather than two views.
+  const [tagFilter, setTagFilter] = useState<string[]>([]);
+  const [attrFilter, setAttrFilter] = useState<string[]>([]);
   // Empty = EVERY tenant, and that default is deliberate: core keeps read paths namespace-unscoped,
   // so an operator who has always seen every tenant's runs keeps seeing them until they narrow.
-  const [namespaceFilter, setNamespaceFilter] = useState('');
+  const [namespaceFilter, setNamespaceFilter] = useState<string[]>([]);
   // Origin is faceted in the browser (see OriginFacets) — it is the only filter here that must be
   // able to select ABSENCE, which an exact-match `RunQuery.origin` cannot express.
   const [originFilter, setOriginFilter] = useState<OriginFilter>(ALL_ORIGINS);
@@ -1627,15 +1641,8 @@ export function App() {
   // a result the next render throws away.
   const [paging, setPaging] = useState({ key: '', pages: 1 });
   const qc = useQueryClient();
-  // Comma-separated `key:op:value` predicates (e.g. `amount:gte:200, tier:eq:pro`), ANDed server-side.
-  const attrPredicates = useMemo(
-    () =>
-      attrFilter
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-    [attrFilter],
-  );
+  // `key:op:value` predicates (e.g. `amount:gte:200`, `tier:in:pro|enterprise`), ANDed server-side.
+  const attrPredicates = attrFilter;
   const attrKey = attrPredicates.join('|');
   // `undefined` = every origin; `null` = the unattributed bucket, which needs its own spelling because
   // no string value matches a run that has no origin. Both go to the SERVER now: with a paged list, a
@@ -1651,9 +1658,9 @@ export function App() {
   // changes which runs the list contains.
   const runsListResetKey = runsFilterKey({
     status: filter,
-    tag: tagFilter,
+    tag: tagFilter.join('|'),
     attrs: attrKey,
-    namespace: namespaceFilter,
+    namespace: namespaceFilter.join('|'),
     origin: originKey,
   });
   // Landing 900 rows into a set the operator just re-scoped would be a non-sequitur, so a page count
@@ -1669,10 +1676,10 @@ export function App() {
     queryFn: () =>
       durableClient.runs(
         filter === 'all' ? undefined : filter,
-        tagFilter || undefined,
+        tagFilter,
         attrPredicates.length ? attrPredicates : undefined,
-        // An empty box sends NO `namespace` param — all tenants, the historical default.
-        { namespace: namespaceFilter || undefined, origin: originParam, limit },
+        // An empty selection sends NO `namespace` predicate — all tenants, the historical default.
+        { namespace: namespaceFilter, origin: originParam, limit },
       ),
     refetchInterval: 3000, // keep the run list live
     // "Show more" and every filter change move the query key. Without this the list would blank back
@@ -1685,12 +1692,50 @@ export function App() {
     queryKey: ['run-facets', tagFilter, attrKey, namespaceFilter],
     queryFn: () =>
       durableClient.facets(
-        tagFilter || undefined,
+        tagFilter,
         attrPredicates.length ? attrPredicates : undefined,
-        namespaceFilter || undefined,
+        namespaceFilter,
       ),
     refetchInterval: 5000,
   });
+  // What each picker OFFERS: the values these runs actually carry, counted server-side.
+  //
+  // Each picker's scope EXCLUDES its own axis. Including it would make the list collapse to what is
+  // already selected the moment an operator picks a value — a control that can only ever be narrowed
+  // once. Every other axis is included, so the offered values are the ones that would return runs.
+  const originScope =
+    originFilter.kind === 'unknown'
+      ? null
+      : originFilter.kind === 'origin'
+        ? originFilter.origin
+        : undefined;
+  const tagScope = useMemo(
+    () => ({ namespace: namespaceFilter, attr: attrFilter, origin: originScope }),
+    [namespaceFilter, attrFilter, originScope],
+  );
+  const namespaceScope = useMemo(
+    () => ({ tag: tagFilter, attr: attrFilter, origin: originScope }),
+    [tagFilter, attrFilter, originScope],
+  );
+  const attrScope = useMemo(
+    () => ({ tag: tagFilter, namespace: namespaceFilter, origin: originScope }),
+    [tagFilter, namespaceFilter, originScope],
+  );
+  const { data: tagValues = [] } = useQuery({
+    queryKey: ['run-values', 'tag', tagScope],
+    queryFn: () => durableClient.values('tag', tagScope),
+    staleTime: 10_000,
+  });
+  const { data: namespaceValues = [] } = useQuery({
+    queryKey: ['run-values', 'namespace', namespaceScope],
+    queryFn: () => durableClient.values('namespace', namespaceScope),
+    staleTime: 10_000,
+  });
+  // A `null` value belongs to an axis with an absent bucket (origin) — neither of these has one, and
+  // a picker cannot offer "no value" as something to type anyway.
+  const tagOptions = useMemo(() => selectableValues(tagValues), [tagValues]);
+  const namespaceOptions = useMemo(() => selectableValues(namespaceValues), [namespaceValues]);
+
   // Worker health, joined into each run row (no-worker) and the banner. Shares the `['workers']` cache
   // with the Workers panel (same queryKey → one fetch); polled a touch faster so "no worker" clears
   // promptly once a worker rejoins.
@@ -1703,9 +1748,9 @@ export function App() {
     mutationFn: (action: 'retry' | 'cancel') =>
       durableClient.bulk(action, {
         status: filter !== 'all' ? filter : undefined,
-        tag: tagFilter || undefined,
+        tag: tagFilter,
         attr: attrPredicates.length ? attrPredicates : undefined,
-        namespace: namespaceFilter || undefined,
+        namespace: namespaceFilter,
         // Every facet the operator can see, INCLUDING the unattributed bucket — `origin: null` is sent
         // as its own param, so a bulk action is scoped to exactly the set the list was showing.
         origin: originParam,
@@ -1736,8 +1781,8 @@ export function App() {
   );
   const anyFilter =
     filter !== 'all' ||
-    Boolean(tagFilter) ||
-    Boolean(namespaceFilter) ||
+    tagFilter.length > 0 ||
+    namespaceFilter.length > 0 ||
     attrPredicates.length > 0 ||
     originFilter.kind !== 'all';
   const originChips = useMemo(() => originFacetsFromCounts(facets), [facets]);
@@ -1746,6 +1791,18 @@ export function App() {
   const stalled = useMemo(() => stalledWorkflows(health), [health]);
 
   const singletonSiblings = useSingletonSiblings(useMemo(() => anySingleton(runs), [runs]));
+
+  // A chip on a run row ADDS its value to the picker rather than replacing the selection: clicking a
+  // second tag on a second row is how an operator builds "these two kinds of run", and replacing
+  // would make the first click undo the second.
+  const addTag = useCallback((tag: string) => {
+    setTagFilter((current) => (current.includes(tag) ? current : [...current, tag]));
+  }, []);
+  const addNamespace = useCallback((namespace: string) => {
+    setNamespaceFilter((current) =>
+      current.includes(namespace) ? current : [...current, namespace],
+    );
+  }, []);
 
   const loadMore = useCallback(() => {
     setPaging((p) => ({
@@ -1774,44 +1831,35 @@ export function App() {
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,360px)_1fr]">
           <aside className="flex min-h-0 flex-col border-r border-line">
             <div className="border-b border-line p-2">
-              <InputField
+              <MultiSelect
                 glyph="#"
-                value={tagFilter}
-                onChange={(e) => setTagFilter(e.target.value)}
-                onClear={() => setTagFilter('')}
-                clearLabel="clear tag filter"
+                label="filter by tag"
                 placeholder="filter by tag…"
-                aria-label="filter by tag"
+                value={tagFilter}
+                onChange={setTagFilter}
+                options={tagOptions}
+                title="Tags carried by a run (WorkflowRun.tags). Several match ANY of them."
               />
-              <InputField
-                glyph="⛃"
-                containerClassName="mt-1.5"
-                value={attrFilter}
-                onChange={(e) => setAttrFilter(e.target.value)}
-                onClear={() => setAttrFilter('')}
-                clearLabel="clear attribute filter"
-                placeholder="attrs e.g. amount:gte:200, tier:eq:pro"
-                aria-label="filter by search attribute"
-                title="Typed search attributes: comma-separated key:op:value (ops eq ne gt gte lt lte)"
-              />
-              <InputField
-                glyph="@"
-                containerClassName="mt-1.5"
-                value={namespaceFilter}
-                onChange={(e) => setNamespaceFilter(e.target.value)}
-                onClear={() => setNamespaceFilter('')}
-                clearLabel="clear tenant filter"
-                placeholder="filter by tenant / namespace…"
-                aria-label="filter by tenant"
-                title="Tenant / worker-pool partition (WorkflowRun.namespace). Empty shows every tenant."
-              />
+              <div className="mt-1.5">
+                <MultiSelect
+                  glyph="@"
+                  label="filter by tenant"
+                  placeholder="filter by tenant / namespace…"
+                  value={namespaceFilter}
+                  onChange={setNamespaceFilter}
+                  options={namespaceOptions}
+                  title="Tenant / worker-pool partition (WorkflowRun.namespace). None selected shows every tenant."
+                />
+              </div>
+              <AttributeFilters value={attrFilter} onChange={setAttrFilter} scope={attrScope} />
             </div>
             <OriginFacets facets={originChips} value={originFilter} onChange={setOriginFilter} />
             {anyFilter && matchedTotal > 0 && (
               <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
                 <span className="mono text-[10px] text-zinc-500">
-                  {matchedTotal} {filter !== 'all' ? filter : ''} {tagFilter && `#${tagFilter}`}
-                  {namespaceFilter && ` @${namespaceFilter}`}
+                  {matchedTotal} {filter !== 'all' ? filter : ''}
+                  {tagFilter.length > 0 && ` #${tagFilter.join(', ')}`}
+                  {namespaceFilter.length > 0 && ` @${namespaceFilter.join(', ')}`}
                   {originFilter.kind === 'origin' && ` ⬡${originLabel(originFilter.origin)}`}
                   {originFilter.kind === 'unknown' && ` ⬡${UNKNOWN_ORIGIN}`}
                   {attrPredicates.length > 0 && ` ⛃${attrPredicates.length}`}
@@ -1848,8 +1896,8 @@ export function App() {
               loading={runsPending}
               selected={selected}
               onSelect={setSelected}
-              onSelectTag={setTagFilter}
-              onSelectNamespace={setNamespaceFilter}
+              onSelectTag={addTag}
+              onSelectNamespace={addNamespace}
               onSelectOrigin={setOriginFilter}
               total={matchedTotal}
               onLoadMore={loadMore}

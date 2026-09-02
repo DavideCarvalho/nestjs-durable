@@ -26,6 +26,19 @@ export {
   type OpenConsoleOptions,
 } from './console-session.js';
 
+export {
+  type RunPredicates,
+  type RunValueField,
+  type RunValueRow,
+  runQueryString,
+} from './run-query-string.js';
+import {
+  type RunPredicates,
+  type RunValueField,
+  type RunValueRow,
+  runQueryString,
+} from './run-query-string.js';
+
 export type RunStatus = CoreRunStatus;
 export type StepKind = CoreStepKind;
 
@@ -412,8 +425,12 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
  * something an operator opts into, never something the client imposes.
  */
 export interface RunFilterOptions {
-  /** Tenant / worker-pool partition — `WorkflowRun.namespace`, exact match. Absent = all tenants. */
-  namespace?: string | undefined;
+  /**
+   * Tenant / worker-pool partition — `WorkflowRun.namespace`. Absent = all tenants. An ARRAY matches
+   * any of them, which is what a multi-select produces: two tenants compared side by side, in one
+   * query rather than two.
+   */
+  namespace?: string | string[] | undefined;
   /**
    * The package that declared the workflow — `WorkflowRun.origin`, exact match. Absent = all origins.
    * `null` selects the UNATTRIBUTED runs instead (the server's `unattributed` param): a run with no
@@ -448,24 +465,20 @@ export const durableClient = {
    */
   runs(
     status?: RunStatus,
-    tag?: string,
+    tag?: string | string[],
     attr?: string[],
     opts?: RunFilterOptions & RunPageOptions,
   ): Promise<WorkflowRun[]> {
-    const q = new URLSearchParams();
-    if (status) q.set('status', status);
-    if (tag) q.set('tag', tag);
-    // Each `attr` is a `key:op:value` predicate; repeated params are ANDed server-side.
-    for (const a of attr ?? []) q.append('attr', a);
-    if (opts?.namespace) q.set('namespace', opts.namespace);
-    // `null` is the unattributed bucket, which has its own param — see `RunFilterOptions.origin`.
-    if (opts?.origin === null) q.set('unattributed', 'true');
-    else if (opts?.origin) q.set('origin', opts.origin);
-    // Repeated `status` params are ORed server-side into `RunQuery.statuses`.
-    for (const st of opts?.statuses ?? []) q.append('status', st);
-    if (opts?.limit !== undefined) q.set('limit', String(opts.limit));
-    if (opts?.offset !== undefined) q.set('offset', String(opts.offset));
-    const qs = q.toString();
+    const qs = runQueryString(
+      {
+        status: status ?? opts?.statuses,
+        tag,
+        attr,
+        namespace: opts?.namespace,
+        origin: opts?.origin,
+      },
+      { limit: opts?.limit, offset: opts?.offset },
+    );
     return http<WorkflowRun[]>(qs ? `/runs?${qs}` : '/runs');
   },
   /**
@@ -473,13 +486,31 @@ export const durableClient = {
    * {@link runs} — the console's chips, counted over the WHOLE matching set rather than over the page
    * it happens to be showing. `status`/`origin` are not sent: they are the axes being counted.
    */
-  facets(tag?: string, attr?: string[], namespace?: string): Promise<RunFacetRow[]> {
-    const q = new URLSearchParams();
-    if (tag) q.set('tag', tag);
-    for (const a of attr ?? []) q.append('attr', a);
-    if (namespace) q.set('namespace', namespace);
-    const qs = q.toString();
+  facets(
+    tag?: string | string[],
+    attr?: string[],
+    namespace?: string | string[],
+  ): Promise<RunFacetRow[]> {
+    const qs = runQueryString({ tag, attr, namespace });
     return http<RunFacetRow[]>(qs ? `/runs/facets?${qs}` : '/runs/facets');
+  },
+
+  /**
+   * The distinct values one filter field takes across the runs matching the OTHER active predicates,
+   * most common first — what a value picker lists instead of asking an operator to type blind.
+   *
+   * Scoped by the rest of the filter on purpose: pick a tenant, and the tag picker offers that
+   * tenant's tags. `limit` bounds the answer, which matters rather than being a nicety — tag and
+   * search-attribute cardinality grows with the data (a `singleton:<key>` tag is minted per key), so
+   * the unbounded answer is a listing.
+   */
+  values(
+    field: RunValueField,
+    scope: RunPredicates = {},
+    opts?: { limit?: number },
+  ): Promise<RunValueRow[]> {
+    const qs = runQueryString(scope, {}, { field, ...(opts?.limit && { limit: opts.limit }) });
+    return http<RunValueRow[]>(`/runs/values?${qs}`);
   },
   run(id: string): Promise<RunDetail> {
     return http<RunDetail>(`/runs/${encodeURIComponent(id)}`);
@@ -508,20 +539,13 @@ export const durableClient = {
     action: 'retry' | 'cancel',
     filter: RunFilterOptions & {
       status?: RunStatus | undefined;
-      tag?: string | undefined;
+      tag?: string | string[] | undefined;
       attr?: string[] | undefined;
     },
   ): Promise<{ matched: number; applied: number }> {
-    const q = new URLSearchParams();
-    if (filter.status) q.set('status', filter.status);
-    if (filter.tag) q.set('tag', filter.tag);
-    for (const a of filter.attr ?? []) q.append('attr', a);
-    // Every facet the operator can see MUST be sent: a bulk retry/cancel that is scoped more widely
-    // than the list it was launched from would act on runs the operator never looked at.
-    if (filter.namespace) q.set('namespace', filter.namespace);
-    if (filter.origin === null) q.set('unattributed', 'true');
-    else if (filter.origin) q.set('origin', filter.origin);
-    const qs = q.toString();
+    // Every facet the operator can see MUST be sent: a bulk retry/cancel scoped more widely than the
+    // list it was launched from would act on runs the operator never looked at.
+    const qs = runQueryString(filter);
     return http<{ matched: number; applied: number }>(`/bulk/${action}${qs ? `?${qs}` : ''}`, {
       method: 'POST',
     });

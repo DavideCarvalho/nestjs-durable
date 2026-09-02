@@ -2,6 +2,9 @@ import type {
   RunFacetQuery,
   RunFacetRow,
   RunQuery,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -9,7 +12,12 @@ import type {
 } from '../interfaces';
 import type { AttributeFilter } from '../interfaces';
 import { mergeRunFacetRows } from '../run-facets';
-import { type RunAttributeRow, normalizeAttributeRows } from '../search-attributes';
+import { RUN_VALUE_FACET_SCAN, runValueFacetsFromRuns } from '../run-value-facets';
+import {
+  type RunAttributeRow,
+  attributePredicateOperands,
+  normalizeAttributeRows,
+} from '../search-attributes';
 
 /**
  * A non-durable, in-process `StateStore` for tests and local development.
@@ -250,33 +258,30 @@ export class InMemoryStateStore implements StateStore {
     const byRun = this.attributeIndex.get(f.key);
     const out = new Set<string>();
     if (!byRun) return out;
-    const numeric = typeof f.value === 'number';
-    const operand = typeof f.value === 'boolean' ? (f.value ? 'true' : 'false') : f.value;
+    // One comparison per operand — a scalar op has exactly one, `in` has one per member — ORed, the
+    // same shape the SQL stores emit inside their EXISTS. An `in` over no values compares nothing and
+    // so matches nothing, which is why this ORs a possibly-empty list instead of skipping the filter.
+    const comparisons = attributePredicateOperands(f);
     for (const row of byRun.values()) {
-      const actual = numeric ? row.numValue : row.strValue;
-      if (actual == null) continue;
-      let ok = false;
-      switch (f.op) {
-        case 'eq':
-          ok = actual === operand;
-          break;
-        case 'ne':
-          ok = actual !== operand;
-          break;
-        case 'gt':
-          ok = actual > operand;
-          break;
-        case 'gte':
-          ok = actual >= operand;
-          break;
-        case 'lt':
-          ok = actual < operand;
-          break;
-        case 'lte':
-          ok = actual <= operand;
-          break;
-      }
-      if (ok) out.add(row.runId);
+      const matched = comparisons.some(({ column, comparator, operand }) => {
+        const actual = column === 'numValue' ? row.numValue : row.strValue;
+        if (actual == null) return false;
+        switch (comparator) {
+          case '=':
+            return actual === operand;
+          case '<>':
+            return actual !== operand;
+          case '>':
+            return actual > operand;
+          case '>=':
+            return actual >= operand;
+          case '<':
+            return actual < operand;
+          default:
+            return actual <= operand;
+        }
+      });
+      if (matched) out.add(row.runId);
     }
     return out;
   }
@@ -286,13 +291,26 @@ export class InMemoryStateStore implements StateStore {
   private matching(query: RunQuery): WorkflowRun[] {
     let runs = [...this.runs.values()];
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
+    if (query.workflows) runs = runs.filter((r) => query.workflows?.includes(r.workflow));
     if (query.status) runs = runs.filter((r) => r.status === query.status);
     if (query.statuses) runs = runs.filter((r) => query.statuses?.includes(r.status));
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));
+    // ANY of the tags, against a run that carries a SET of them — see `RunQuery.tags`.
+    if (query.tags) runs = runs.filter((r) => r.tags?.some((t) => query.tags?.includes(t)));
     if (query.namespace !== undefined) runs = runs.filter((r) => r.namespace === query.namespace);
+    if (query.namespaces) {
+      runs = runs.filter(
+        (r) => r.namespace !== undefined && query.namespaces?.includes(r.namespace),
+      );
+    }
     // Exact match on a value; `null` selects the runs carrying NO origin — see `RunQuery.origin`.
     if (query.origin === null) runs = runs.filter((r) => r.origin == null);
     else if (query.origin !== undefined) runs = runs.filter((r) => r.origin === query.origin);
+    // `null` is a member like any other here, so a set can ask for named origins AND the
+    // unattributed bucket in one predicate.
+    if (query.origins) {
+      runs = runs.filter((r) => query.origins?.includes(r.origin ?? null));
+    }
     if (query.attributes?.length) {
       // Pushdown: intersect per-predicate candidate sets from the key-indexed side-table, so we only
       // ever materialize the runs that already satisfy EVERY attribute filter (no full per-run scan).
@@ -327,6 +345,18 @@ export class InMemoryStateStore implements StateStore {
     return mergeRunFacetRows(
       this.matching(query).map((run) => ({ status: run.status, origin: run.origin, count: 1 })),
     );
+  }
+
+  /** Counted over the newest `scan` matching runs for EVERY axis, not just `tag`: this store holds
+   *  its runs in a Map with no index to group by, so the bound that the SQL stores need only for tags
+   *  is the honest one to apply here throughout. */
+  async runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    const runs = await this.listRuns({ ...query, limit: opts?.scan ?? RUN_VALUE_FACET_SCAN });
+    return runValueFacetsFromRuns(runs, axis, opts);
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {

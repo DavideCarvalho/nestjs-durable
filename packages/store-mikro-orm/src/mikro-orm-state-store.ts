@@ -1,22 +1,27 @@
 import {
   type AttributeFilter,
+  RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
   type RunFacetQuery,
   type RunFacetRow,
   type RunQuery,
   type RunStatus,
+  type RunValueAxis,
+  type RunValueFacetOptions,
+  type RunValueFacetRow,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
   type StepError,
   type StepEvent,
   type WorkflowRun,
-  attributeColumnFor,
-  attributeOperand,
+  attributePredicateOperands,
+  axisIsRunColumn,
   mergeRunFacetRows,
+  mergeRunValueFacetRows,
   normalizeAttributeRows,
   parseDuration,
-  sqlComparator,
+  runValueFacetsFromRuns,
 } from '@dudousxd/nestjs-durable-core';
 import { raw } from '@mikro-orm/core';
 import type { EntityManager, MikroORM } from '@mikro-orm/core';
@@ -306,23 +311,40 @@ export class MikroOrmStateStore implements StateStore {
    *  applied by the QueryBuilder path in both callers. */
   private runWhere(query: RunQuery): Record<string, unknown> {
     const where: Record<string, unknown> = {};
+    // The single and the plural form of an axis are ANDed when both are set (the single narrows the
+    // set), and an empty plural matches nothing — same contract as `status`/`statuses` below. They go
+    // through `and()` rather than onto `where` directly because a key can only hold one condition.
+    const and: Record<string, unknown>[] = [];
     if (query.workflow) where.workflow = query.workflow;
+    if (query.workflows) and.push({ workflow: { $in: query.workflows } });
     if (query.namespace !== undefined) where.namespace = query.namespace;
+    if (query.namespaces) and.push({ namespace: { $in: query.namespaces } });
     // Plain equality on the origin column, exactly like `namespace` above. A run whose origin is NULL
     // (created before the column existed, or registered through a path the derivation could not
     // classify) matches NO origin value — it is never folded into some bucket to make the facet look
     // complete. Passing `null` asks for exactly that bucket (`origin IS NULL`), which is how a
     // paginated console offers an "unknown" chip without holding every run in the browser.
     if (query.origin !== undefined) where.origin = query.origin;
+    // A set of origins may include `null` (the unattributed bucket). SQL `IN` cannot carry it —
+    // `IN (NULL)` is never true — so the absent bucket becomes its own ORed `IS NULL` branch and the
+    // named values stay in the `IN`. An empty set produces an empty `$or`, which matches nothing.
+    if (query.origins) {
+      const named = query.origins.filter((o): o is string => o !== null);
+      const branches: Record<string, unknown>[] = [];
+      if (named.length) branches.push({ origin: { $in: named } });
+      if (query.origins.some((o) => o === null)) branches.push({ origin: null });
+      and.push(branches.length ? { $or: branches } : { origin: { $in: [] } });
+    }
     // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store). When both the
     // single `status` and `statuses` are set, AND them so the narrower set wins.
     if (query.status && query.statuses) {
-      where.$and = [{ status: query.status }, { status: { $in: query.statuses } }];
+      and.push({ status: query.status }, { status: { $in: query.statuses } });
     } else if (query.status) {
       where.status = query.status;
     } else if (query.statuses) {
       where.status = { $in: query.statuses };
     }
+    if (and.length) where.$and = and;
     return where;
   }
 
@@ -338,7 +360,7 @@ export class MikroOrmStateStore implements StateStore {
     //  - attributes: each filter becomes a raw EXISTS against the normalized side-table, so the DB
     //    filters AND paginates — no full scan + in-process filter (ANDed: one EXISTS per filter).
     // Use a QueryBuilder with a fixed root alias `r` so the raw correlations are stable across drivers.
-    if (query.tag || query.attributes?.length) {
+    if (query.tag || query.tags || query.attributes?.length) {
       const qb = this.runQueryBuilder(em, query, where).orderBy(orderBy);
       if (query.limit != null) qb.limit(query.limit);
       if (query.offset != null) qb.offset(query.offset);
@@ -369,16 +391,25 @@ export class MikroOrmStateStore implements StateStore {
     const qb = (em as SqlEm)
       .createQueryBuilder<WorkflowRunEntity>(WorkflowRunEntity, 'r')
       .where(where);
-    if (query.tag) {
-      const tagsCol = this.tagsColumn(em);
-      const pattern = `%"${query.tag.replace(/'/g, "''")}"%`;
-      const colExpr = this.jsonAsText(em, `${quote('r')}.${quote(tagsCol)}`);
-      qb.andWhere(`${colExpr} LIKE '${pattern}'`);
+    if (query.tag) qb.andWhere(this.tagLikeSql(em, query.tag, quote));
+    // ANY of the tags: one LIKE per tag, ORed. An empty set matches nothing, which has to be said
+    // explicitly — skipping the clause would WIDEN the query to every run.
+    if (query.tags) {
+      const branches = query.tags.map((t) => this.tagLikeSql(em, t, quote));
+      qb.andWhere(branches.length ? `(${branches.join(' OR ')})` : '1 = 0');
     }
     for (const f of query.attributes ?? []) {
       qb.andWhere(this.attributeExistsSql(f, quote, 'r', cols));
     }
     return qb;
+  }
+
+  /** `tags LIKE '%"etl"%'` — the quoted token, so `etl` doesn't match `etl-foo`. See the note in
+   *  {@link listRuns} for why this is raw SQL rather than a MikroORM condition. */
+  private tagLikeSql(em: EntityManager, tag: string, quote: (id: string) => string): string {
+    const pattern = `%"${tag.replace(/'/g, "''")}"%`;
+    const colExpr = this.jsonAsText(em, `${quote('r')}.${quote(this.tagsColumn(em))}`);
+    return `${colExpr} LIKE '${pattern}'`;
   }
 
   /** `GROUP BY status, origin` over the same predicates {@link listRuns} pages — one aggregate, so a
@@ -398,26 +429,61 @@ export class MikroOrmStateStore implements StateStore {
     return mergeRunFacetRows(rows.map((r) => ({ ...r, count: Number(r.count) })));
   }
 
+  /** Distinct values of one filter axis over the same predicates {@link listRuns} pages. A run-table
+   *  column is a `GROUP BY` like {@link runFacets}, exact over the whole matching set; the tag and
+   *  attribute axes live outside the row (json array / side table) and are counted from a bounded
+   *  page of runs instead — see {@link RunValueFacetOptions.scan}. */
+  async runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    if (!axisIsRunColumn(axis)) {
+      const runs = await this.listRuns({ ...query, limit: opts?.scan ?? RUN_VALUE_FACET_SCAN });
+      return runValueFacetsFromRuns(runs, axis, opts);
+    }
+    const em = this.fork();
+    const meta = em.getMetadata().get(WorkflowRunEntity);
+    const col = meta.properties[axis.field]?.fieldNames?.[0] ?? axis.field;
+    const rows = await this.runQueryBuilder(em, query, this.runWhere(query))
+      .select([`r.${col}`])
+      .addSelect(raw('count(*) as count'))
+      .groupBy([`r.${col}`])
+      .execute<Record<string, unknown>[]>();
+    return mergeRunValueFacetRows(
+      rows.map((row) => ({
+        value: (row[axis.field] as string | null | undefined) ?? null,
+        count: Number(row.count),
+      })),
+      opts,
+    );
+  }
+
   /** One attribute predicate as a raw EXISTS subquery on the side-table, correlated to the outer run
    *  alias. `<>` (ne) also excludes runs where the attribute is absent (missing-key-never-matches):
    *  EXISTS already requires a present row, so EXISTS(... <> ...) is exactly ne-with-present. Numeric
-   *  operands compare the num column, everything else the str column. Identifiers are quoted per
-   *  driver and operands are inlined as literals (string operands are escaped by doubling quotes). */
+   *  operands compare the num column, everything else the str column. `in` contributes one comparison
+   *  per member, ORed inside the single EXISTS — one subquery either way, and an `in` over no values
+   *  yields no comparison and so matches nothing. Identifiers are quoted per driver and operands are
+   *  inlined as literals (string operands are escaped by doubling quotes). */
   private attributeExistsSql(
     f: AttributeFilter,
     quote: (id: string) => string,
     alias: string,
     cols: AttributeColumns,
   ): string {
-    const col = attributeColumnFor(f) === 'numValue' ? cols.numValue : cols.strValue;
-    const cmp = sqlComparator(f.op);
-    const operand = attributeOperand(f);
-    const literal =
-      typeof operand === 'number' ? String(operand) : `'${String(operand).replace(/'/g, "''")}'`;
+    const comparisons = attributePredicateOperands(f).map(({ column, comparator, operand }) => {
+      const col = column === 'numValue' ? cols.numValue : cols.strValue;
+      const literal =
+        typeof operand === 'number' ? String(operand) : `'${String(operand).replace(/'/g, "''")}'`;
+      return `${quote('a')}.${quote(col)} ${comparator} ${literal}`;
+    });
+    if (comparisons.length === 0) return '1 = 0';
     const a = quote(cols.table);
     const sub = quote('a');
     const outerId = `${quote(alias)}.${quote(cols.runPk)}`; // run PK column on the outer alias
-    return `EXISTS (SELECT 1 FROM ${a} ${sub} WHERE ${sub}.${quote(cols.runId)} = ${outerId} AND ${sub}.${quote(cols.key)} = '${f.key.replace(/'/g, "''")}' AND ${sub}.${quote(col)} ${cmp} ${literal})`;
+    const match = comparisons.length === 1 ? comparisons[0] : `(${comparisons.join(' OR ')})`;
+    return `EXISTS (SELECT 1 FROM ${a} ${sub} WHERE ${sub}.${quote(cols.runId)} = ${outerId} AND ${sub}.${quote(cols.key)} = '${f.key.replace(/'/g, "''")}' AND ${match})`;
   }
 
   /** Resolve the side-table's actual column names from MikroORM metadata, so the raw EXISTS matches

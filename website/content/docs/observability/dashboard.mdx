@@ -323,6 +323,8 @@ operator", nothing about what they can see changes based on who they are.
   Alongside status the list narrows by tag, search attribute, **tenant** and the **library that
   declared the workflow** — the last two answer "whose run is this" and "whose code is this", and both
   have a default worth understanding; see [Tenant and origin filters](#tenant-and-origin-filters).
+  The tag, tenant and attribute controls are **pickers over what the runs actually contain**, and each
+  takes several values — see [Filter pickers](#filter-pickers).
 - **Timeline as a graph** — the selected run rendered with `react-flow`: a node pipeline from
   start through each step to the terminal state, tagged by kind (local / remote / sleep / signal),
   with worker group and duration. This is the "see the whole flow" view — a workflow whose steps
@@ -344,12 +346,52 @@ operator", nothing about what they can see changes based on who they are.
   workflow inline in the HTTP request, so the dashboard action returns immediately and a worker does the
   work. (Previously an inline replay could hang the request.)
 
+### Filter pickers
+
+The tag, tenant and search-attribute filters list the values the runs actually carry, with a count
+each, and take **several** of them.
+
+They used to be free-text boxes, and that made them usable only by an operator who already knew a
+tenant name or a tag: a typo returned an empty list, which reads exactly like "no runs match". Search
+attributes were worst — both the key and the value are data nobody memorises.
+
+```
+#  [ etl ×] [ nightly ×]        ← several values, ORed
+@  [ acme ×]                    ← tenant
+⛃ [ tier is any of pro, enterprise ×]  [+ attribute]
+```
+
+Three things make them worth the machinery:
+
+- **The options are counted over the runs the OTHER filters already select.** Pick a tenant, and the
+  tag picker offers that tenant's tags. A picker never offers a value whose result set is empty.
+- **Several values on one axis are ORed, and the axes are ANDed** — "these two tenants, tagged either
+  of these two ways". On search attributes that needs a set operator (`is any of`), because two
+  equality predicates on one key are ANDed like every other pair and no run has one attribute with
+  two values.
+- **Typed text still works.** The offered list is a bounded top-N (tag cardinality grows with the
+  data — a `singleton:<key>` tag is minted per key), so a rare value can be real and absent; Enter
+  takes it as typed.
+
+A tag or tenant chip on a run row **adds** to the selection rather than replacing it, which is how a
+"these two kinds of run" view gets built by clicking.
+
+The values come from `GET runs/values`, backed by `StateStore.runValueFacets`. A store that does not
+implement it answers `[]`, and the pickers degrade to free-text entry — no error, no empty console.
+
+<Callout>
+  Counts on the run-table axes (tenant, workflow, status, origin) are exact `GROUP BY`s over the whole
+  matching set. **Tag and search-attribute counts are taken over a bounded scan** of recent matching
+  runs — their values live inside a JSON array column and a side table rather than in the row being
+  counted — so treat those numbers as "how common, roughly", not as a total.
+</Callout>
+
 ### Tenant and origin filters
 
 Two of the run-list filters are about *provenance* rather than state, and they are wired differently
 on purpose — one pushes down to the store, the other cannot.
 
-**Tenant** is a sidebar box matched exactly against the run's `namespace` — the same field the engine
+**Tenant** is a sidebar picker matched exactly against the run's `namespace` — the same field the engine
 partitions worker pools by, conventionally fed from `DURABLE_TENANT` (see
 [Tenancy](/docs/concepts/tenancy)). It is sent to the store as the `namespace` param on `GET runs`
 and `POST bulk/:action`, so a narrowed list is narrowed in SQL.
@@ -358,9 +400,10 @@ dashboard, `getRun`) are deliberately not namespace-scoped, so defaulting the co
 would have silently removed runs that every existing operator had been looking at. This is a filter an
 operator chooses, not a scope imposed on them — and it is not an authorization boundary either
 ([Console auth](#console-auth) is mount-level and role-agnostic).
-An empty box is treated as *absent*, not as an exact match on a tenant named `""`, so clearing it
-returns the all-tenants view rather than an empty one. The tenant chip on a run row is a click
-shortcut into the box, like the tag chips.
+An empty selection is treated as *absent*, not as an exact match on a tenant named `""`, so clearing
+it returns the all-tenants view rather than an empty one. Selecting several compares them side by
+side (`RunQuery.namespaces`). The tenant chip on a run row adds itself to the selection, like the tag
+chips.
 
 **Origin** — which package declared the run's workflow — is a row of facet chips above the list:
 `all`, one chip per package (labelled without the npm scope, full name in the tooltip), and `unknown`
@@ -708,8 +751,9 @@ await durableClient.retry(detail.run.id);
 
 | Method | Route | |
 | --- | --- | --- |
-| `GET` | `/durable/api/runs` | list runs — `?status=` (repeat it to match a SET), `?workflow=`, `?tag=`, `?attr=`, `?namespace=`, `?origin=`, `?unattributed=true`, `?limit=`, `?offset=`. Returns list ROWS: no `input` / `output` / `error` |
+| `GET` | `/durable/api/runs` | list runs — `?status=` (repeat any of these to match a SET), `?workflow=`, `?tag=`, `?attr=`, `?namespace=`, `?origin=`, `?unattributed=true`, `?limit=`, `?offset=`. Also takes [nestjs-filter](https://www.npmjs.com/package/@dudousxd/nestjs-filter)'s structured form (`?filter[where][0][field]=tag&…`), which is what the console sends. Returns list ROWS: no `input` / `output` / `error` |
 | `GET` | `/durable/api/runs/facets` | `(status, origin)` counts over the same tag / tenant / attribute predicates — the chips' numbers, whole-set rather than per-page |
+| `GET` | `/durable/api/runs/values` | the distinct values of one filter field over the runs the other predicates select — `?groupByCount[field]=tag&groupByCount[limit]=20`. Answers `{ value, count }[]`; this is what fills the [pickers](#filter-pickers) |
 | `GET` | `/durable/api/runs/:id` | run + step timeline (the whole run, payloads included) |
 | `GET` (SSE) | `/durable/api/runs/:id/stream` | live-tail the run's lifecycle events |
 | `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |

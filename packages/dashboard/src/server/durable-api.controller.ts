@@ -1,4 +1,4 @@
-import type { RunStatus } from '@dudousxd/nestjs-durable-core';
+import { ApplyFilter, FilterRunner } from '@dudousxd/nestjs-filter';
 import {
   Body,
   Controller,
@@ -10,86 +10,33 @@ import {
   Query,
   Sse,
 } from '@nestjs/common';
-import { parseAttrFilters } from './attr-filter.js';
 import { DashboardService } from './dashboard.service.js';
+import { DurableRun } from './durable-run.js';
 import { type RunListRow, toRunListRow } from './run-list-row.js';
-
-/**
- * How the console asks for a page. An absent bound means "no bound" — the historical whole-listing
- * behaviour, kept so an existing API consumer is not silently truncated. A non-numeric or negative
- * value is treated as absent rather than coerced to 0, which would return an empty page and read as
- * "there are no runs".
- */
-function pageBounds(limit?: string, offset?: string): { limit?: number; offset?: number } {
-  const bound = (raw?: string): number | undefined => {
-    const n = Number(raw);
-    return raw !== undefined && raw !== '' && Number.isInteger(n) && n >= 0 ? n : undefined;
-  };
-  const l = bound(limit);
-  const o = bound(offset);
-  return { ...(l !== undefined ? { limit: l } : {}), ...(o !== undefined ? { offset: o } : {}) };
-}
-
-/**
- * One `status` narrows to that status; several (a repeated param) match ANY of them, which is how a
- * caller asks for a SET — the console's in-flight sibling query, for one. Kept as one param rather
- * than a second `statuses` param so `?status=running&status=suspended` reads the obvious way and an
- * existing single-value caller is unaffected.
- */
-function statusPredicate(status?: RunStatus | RunStatus[]): {
-  status?: RunStatus;
-  statuses?: RunStatus[];
-} {
-  if (Array.isArray(status)) return status.length ? { statuses: status } : {};
-  return status ? { status } : {};
-}
-
-/**
- * The origin predicate, which has THREE states rather than two: a named package, the unattributed
- * bucket, or no restriction. `unattributed=true` is its own param instead of a reserved `origin`
- * value because any reserved string is a package name someone can legitimately have, and a console
- * that quietly reinterpreted it would show the wrong runs. An explicit `unattributed` wins over a
- * concurrent `origin`, which is a contradictory request either way.
- */
-function originPredicate(origin?: string, unattributed?: string): { origin?: string | null } {
-  if (unattributed === 'true' || unattributed === '1') return { origin: null };
-  return origin ? { origin } : {};
-}
+import type { RunQueryDraft } from './run-query-draft.js';
+import { RunFilter } from './run.filter.js';
 
 /** JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule). */
 @Controller()
 export class DurableApiController {
-  constructor(private readonly dashboard: DashboardService) {}
+  constructor(
+    private readonly dashboard: DashboardService,
+    private readonly runner: FilterRunner,
+  ) {}
 
   /**
-   * The run list, filtered by whatever the operator asked for. Every predicate is OPTIONAL and an
-   * omitted one means "don't narrow on this axis" — in particular `namespace`, whose absence keeps
-   * the historical, deliberate behaviour that read paths are NOT namespace-scoped (core,
-   * `WorkflowRun.namespace`): the console shows every tenant's runs until an operator chooses one.
-   * A blank param (`?namespace=`, from a cleared filter box) is the same as an absent one; passing
-   * `''` through would be an exact match on a tenant nobody has, i.e. a silently empty console.
+   * The run list, filtered by whatever the operator asked for.
+   *
+   * The predicates are parsed, validated and translated by `@dudousxd/nestjs-filter` (see
+   * `RunFilter` for the two spellings it accepts, and `RunQueryAdapter` for how they become a
+   * `RunQuery`). Every predicate is OPTIONAL and an omitted one means "don't narrow on this axis" —
+   * in particular `namespace`, whose absence keeps the historical, deliberate behaviour that read
+   * paths are NOT namespace-scoped (core, `WorkflowRun.namespace`): the console shows every tenant's
+   * runs until an operator chooses one.
    */
   @Get('runs')
-  async runs(
-    @Query('status') status?: RunStatus | RunStatus[],
-    @Query('workflow') workflow?: string,
-    @Query('tag') tag?: string,
-    @Query('attr') attr?: string | string[],
-    @Query('namespace') namespace?: string,
-    @Query('origin') origin?: string,
-    @Query('unattributed') unattributed?: string,
-    @Query('limit') limit?: string,
-    @Query('offset') offset?: string,
-  ): Promise<RunListRow[]> {
-    const runs = await this.dashboard.listRuns({
-      ...statusPredicate(status),
-      workflow,
-      tag,
-      attributes: parseAttrFilters(attr),
-      namespace: namespace || undefined,
-      ...originPredicate(origin, unattributed),
-      ...pageBounds(limit, offset),
-    });
+  async runs(@ApplyFilter(RunFilter) draft: RunQueryDraft): Promise<RunListRow[]> {
+    const runs = await this.dashboard.listRuns(draft.query);
     // Rows only — the three payload fields are the bulk of a large listing and belong to `runs/:id`.
     return runs.map(toRunListRow);
   }
@@ -99,22 +46,30 @@ export class DurableApiController {
    * `GET runs`. This is what lets that listing be PAGED at all: the page bounds what the console
    * renders, this bounds nothing and keeps its status and origin chips exact.
    *
-   * `status`, `origin` and the page bounds are deliberately NOT accepted — they are the axes being
-   * counted, so narrowing by them would report the answer back to itself.
+   * `status`, `origin` and the page bounds are accepted (the route takes the same filter) but
+   * deliberately DROPPED before counting — they are the axes being counted, so narrowing by them
+   * would report the answer back to itself.
    */
   @Get('runs/facets')
-  facets(
-    @Query('workflow') workflow?: string,
-    @Query('tag') tag?: string,
-    @Query('attr') attr?: string | string[],
-    @Query('namespace') namespace?: string,
-  ) {
-    return this.dashboard.runFacets({
-      workflow,
-      tag,
-      attributes: parseAttrFilters(attr),
-      namespace: namespace || undefined,
-    });
+  facets(@ApplyFilter(RunFilter) draft: RunQueryDraft) {
+    return this.dashboard.runFacets(draft.facetQuery());
+  }
+
+  /**
+   * The distinct values one filter field takes across the runs matching every OTHER active
+   * predicate, with counts — what the console's tenant/tag/attribute pickers list.
+   *
+   * `?groupByCount[field]=tag&groupByCount[limit]=20`, with the filters in the structured
+   * `filter[where][...]` form (what `filterQuery()` builds). Scoping the values to the active
+   * filters is the point: picking a tenant leaves the tag picker offering only that tenant's tags,
+   * so a picker never offers a value whose result set is empty.
+   *
+   * `limit` matters rather than being a nicety — tag and attribute cardinality grows with the data
+   * (a `singleton:<key>` tag is minted per key), so the unbounded answer is a listing.
+   */
+  @Get('runs/values')
+  values(@Query() query: Record<string, unknown>) {
+    return this.runner.groupByCount(DurableRun, query, { filterClass: RunFilter });
   }
 
   /** Prometheus-text metrics (runs/steps by outcome, per-workflow counts) for a scrape. */
@@ -169,30 +124,16 @@ export class DurableApiController {
   @Post('bulk/:action')
   bulk(
     @Param('action') action: 'retry' | 'cancel',
-    @Query('status') status?: RunStatus,
-    @Query('tag') tag?: string,
-    @Query('workflow') workflow?: string,
-    @Query('attr') attr?: string | string[],
+    @ApplyFilter(RunFilter) draft: RunQueryDraft,
     @Query('compensate') compensate?: string,
-    @Query('namespace') namespace?: string,
-    @Query('origin') origin?: string,
-    @Query('unattributed') unattributed?: string,
   ) {
-    return this.dashboard.bulk(
-      action === 'cancel' ? 'cancel' : 'retry',
-      {
-        status,
-        tag,
-        workflow,
-        attributes: parseAttrFilters(attr),
-        namespace: namespace || undefined,
-        // The unattributed bucket is a scope a console can actually SELECT, so a bulk action launched
-        // under it must be narrowed to it. Dropping the param would widen a retry/cancel to every
-        // origin — acting on runs the operator was not looking at.
-        ...originPredicate(origin, unattributed),
-      },
-      { compensate: compensate === 'true' },
-    );
+    // The operator's page window is dropped, and only it: `bulk` acts on the whole matching SET (it
+    // applies its own bound), so carrying a `limit` of 100 over from the list would silently retry
+    // the first page and report success for the rest.
+    const { limit, offset, ...filter } = draft.query;
+    return this.dashboard.bulk(action === 'cancel' ? 'cancel' : 'retry', filter, {
+      compensate: compensate === 'true',
+    });
   }
 
   @Post('runs/:id/cancel')

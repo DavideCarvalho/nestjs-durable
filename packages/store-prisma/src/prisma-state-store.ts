@@ -1,19 +1,25 @@
 import {
   type AttributeFilter,
+  RUN_VALUE_FACET_SCAN,
   type RunFacetQuery,
   type RunFacetRow,
   type RunQuery,
   type RunStatus,
+  type RunValueAxis,
+  type RunValueFacetOptions,
+  type RunValueFacetRow,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
   type StepError,
   type StepEvent,
   type WorkflowRun,
-  attributeColumnFor,
-  attributeOperand,
+  attributePredicateOperands,
+  axisIsRunColumn,
   mergeRunFacetRows,
+  mergeRunValueFacetRows,
   normalizeAttributeRows,
+  runValueFacetsFromRuns,
 } from '@dudousxd/nestjs-durable-core';
 
 /* The Prisma client is generated per-schema, so the adapter can't import a concrete one. Instead
@@ -301,7 +307,13 @@ export class PrismaStateStore implements StateStore {
     // read. Same `undefined` = no restriction rule as the poll paths above (see `namespaceWhere`),
     // which is what keeps the operator's dashboard showing every tenant by default.
     const where: Record<string, unknown> = { ...namespaceWhere(query.namespace) };
+    // The plural predicates below can't sit on `where` directly (a key holds one condition, and the
+    // single form may already own it), so they accumulate here and are ANDed at the end. Each is ORed
+    // within itself and matches NOTHING when empty — the contract `statuses` already had.
+    const and: Record<string, unknown>[] = [];
     if (query.workflow) where.workflow = query.workflow;
+    if (query.workflows) and.push(anyOf(query.workflows.map((w) => ({ workflow: w }))));
+    if (query.namespaces) and.push(anyOf(query.namespaces.map((n) => ({ namespace: n }))));
     // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
     // before the column existed, or registered through a path the derivation could not classify)
     // matches NO origin value — it is never folded into a bucket to make the facet look complete.
@@ -310,23 +322,25 @@ export class PrismaStateStore implements StateStore {
     // Passing `null` asks for exactly the unattributed bucket (`origin IS NULL`) — Prisma spells that
     // as the same equality — which is how a paginated console can offer an "unknown" chip.
     if (query.origin !== undefined) where.origin = query.origin;
+    // `null` is a member like any other in a set of origins — Prisma spells `origin IS NULL` as the
+    // same equality — so one branch per value covers both the named ones and the unattributed bucket.
+    if (query.origins) and.push(anyOf(query.origins.map((o) => ({ origin: o }))));
     // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store). Combined with the
     // single-value `status` via AND when both are present, so the narrower set wins.
     if (query.status && query.statuses) {
-      where.AND = [{ status: query.status }, { status: { in: query.statuses } }];
+      and.push({ status: query.status }, { status: { in: query.statuses } });
     } else if (query.status) {
       where.status = query.status;
     } else if (query.statuses) {
       where.status = { in: query.statuses };
     }
     if (query.tag) where.tags = { array_contains: query.tag };
+    if (query.tags) and.push(anyOf(query.tags.map((t) => ({ tags: { array_contains: t } }))));
     // Typed/range attribute predicates push DOWN into SQL: each filter becomes a relation `some`
     // (EXISTS) on the normalized `durable_run_attributes` side-table, so the DB filters AND paginates
     // — no full scan + in-process filter. ANDed: a run must match every filter, so one `some` each.
-    if (query.attributes?.length) {
-      const existing = (where.AND as unknown[] | undefined) ?? [];
-      where.AND = [...existing, ...query.attributes.map((f) => attributeSome(f))];
-    }
+    if (query.attributes?.length) and.push(...query.attributes.map((f) => attributeSome(f)));
+    if (and.length) where.AND = and;
     return where;
   }
 
@@ -352,6 +366,30 @@ export class PrismaStateStore implements StateStore {
     })) as { status: RunStatus; origin: string | null; _count: { _all: number } }[];
     return mergeRunFacetRows(
       rows.map((r) => ({ status: r.status, origin: r.origin, count: r._count._all })),
+    );
+  }
+
+  /** Distinct values of one filter axis over the same predicates {@link listRuns} pages. A run-table
+   *  column is a `groupBy` like {@link runFacets}, exact over the whole matching set; the tag and
+   *  attribute axes live outside the row (json column / side table) and are counted from a bounded
+   *  page of runs instead — see `RunValueFacetOptions.scan`. */
+  async runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    if (!axisIsRunColumn(axis)) {
+      const runs = await this.listRuns({ ...query, limit: opts?.scan ?? RUN_VALUE_FACET_SCAN });
+      return runValueFacetsFromRuns(runs, axis, opts);
+    }
+    const rows = (await this.db.durableWorkflowRun.groupBy({
+      by: [axis.field],
+      where: this.runWhere(query),
+      _count: { _all: true },
+    })) as (Record<string, string | null> & { _count: { _all: number } })[];
+    return mergeRunValueFacetRows(
+      rows.map((r) => ({ value: r[axis.field] ?? null, count: r._count._all })),
+      opts,
     );
   }
 
@@ -494,12 +532,26 @@ export class PrismaStateStore implements StateStore {
  * runs where the attribute is absent (the missing-key-never-matches contract): `some` already
  * requires a matching row to exist. Numeric operands compare `numValue`, everything else `strValue`.
  */
-function attributeSome(f: AttributeFilter): { attributes: { some: Record<string, unknown> } } {
-  const col = attributeColumnFor(f); // 'numValue' | 'strValue'
-  const operand = attributeOperand(f);
-  const condition =
-    f.op === 'eq' ? operand : f.op === 'ne' ? { not: operand } : { [f.op]: operand }; // gt/gte/lt/lte map 1:1 to Prisma operators
-  return { attributes: { some: { key: f.key, [col]: condition } } };
+function attributeSome(f: AttributeFilter): Record<string, unknown> {
+  // One comparison for a scalar op, one per member for `in` — ORed inside the single `some`, since
+  // `in`'s operands may be of mixed types and so land in different typed columns. No comparisons at
+  // all (an `in` over no values) can match no run, which is a run-level fact, not a side-table one.
+  const comparisons = attributePredicateOperands(f).map(({ column, comparator, operand }) => ({
+    [column]:
+      comparator === '=' ? operand : comparator === '<>' ? { not: operand } : { [f.op]: operand },
+  }));
+  if (comparisons.length === 0) return MATCHES_NOTHING;
+  return { attributes: { some: { key: f.key, ...anyOf(comparisons) } } };
+}
+
+/** A where fragment no run satisfies — what a plural predicate over an EMPTY set means. Spelled as an
+ *  impossible `id` rather than `OR: []` so it does not depend on how a Prisma version reads an empty
+ *  disjunction. */
+const MATCHES_NOTHING: Record<string, unknown> = { id: { in: [] as string[] } };
+
+/** OR a set of where fragments, where an EMPTY set matches nothing rather than everything. */
+function anyOf(branches: Record<string, unknown>[]): Record<string, unknown> {
+  return branches.length ? { OR: branches } : MATCHES_NOTHING;
 }
 
 const bigOrNull = (n: number | undefined) => (n == null ? null : BigInt(n));

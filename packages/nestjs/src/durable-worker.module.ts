@@ -16,6 +16,9 @@ import {
   type RunListItem,
   type RunQuery,
   type RunResult,
+  type RunValueAxis,
+  type RunValueFacetOptions,
+  type RunValueFacetRow,
   type RunWaiting,
 } from '@dudousxd/nestjs-durable-core';
 import {
@@ -211,6 +214,13 @@ export function unavailableRunGateway(): RunGateway {
     },
     runFacets(_query: RunFacetQuery): Promise<RunFacetRow[]> {
       return tenantGatewayUnavailable<RunFacetRow[]>('runFacets');
+    },
+    runValueFacets(
+      _axis: RunValueAxis,
+      _query: RunFacetQuery,
+      _opts?: RunValueFacetOptions,
+    ): Promise<RunValueFacetRow[]> {
+      return tenantGatewayUnavailable<RunValueFacetRow[]>('runValueFacets');
     },
     waitingFor(_runIds: string[]): Promise<Record<string, RunWaiting>> {
       return tenantGatewayUnavailable<Record<string, RunWaiting>>('waitingFor');

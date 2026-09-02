@@ -10,6 +10,9 @@ import {
   type RunListItem,
   type RunQuery,
   type RunResult,
+  type RunValueAxis,
+  type RunValueFacetOptions,
+  type RunValueFacetRow,
   STATE_STORE_CANONICAL,
   type StateStore,
   type UpdateResult,
@@ -110,6 +113,17 @@ export class DashboardService {
    *  console's chips exact while its list is bounded to a page. */
   runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
     return this.gateway.runFacets(query);
+  }
+
+  /** The distinct values of one filter axis over the same predicates — what fills the console's
+   *  tenant/tag/attribute pickers, so an operator picks a value that exists instead of typing one
+   *  blind. `[]` when the store cannot enumerate them; the pickers then fall back to free text. */
+  runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    return this.gateway.runValueFacets(axis, query, opts);
   }
 
   /** This deployment's durable role (control plane vs tenant) + tenant name — for the dashboard header

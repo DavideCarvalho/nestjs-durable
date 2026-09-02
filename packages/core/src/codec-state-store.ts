@@ -2,6 +2,9 @@ import type {
   RunFacetQuery,
   RunFacetRow,
   RunQuery,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -37,12 +40,27 @@ export class CodecStateStore implements StateStore {
    */
   readonly runFacets?: (query: RunFacetQuery) => Promise<RunFacetRow[]>;
 
+  /**
+   * Forwarded verbatim, and safe to: the axes a value facet enumerates are searchable metadata
+   * (workflow, status, origin, namespace, tags, search attributes), none of which the codec encodes.
+   * Bound the same conditional way as {@link runFacets} so absence is reported, not faked.
+   */
+  readonly runValueFacets?: (
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ) => Promise<RunValueFacetRow[]>;
+
   constructor(
     private readonly inner: StateStore,
     private readonly codec: PayloadCodec,
   ) {
     const facets = inner.runFacets;
     if (facets) this.runFacets = (query) => facets.call(inner, query);
+    const valueFacets = inner.runValueFacets;
+    if (valueFacets) {
+      this.runValueFacets = (axis, query, opts) => valueFacets.call(inner, axis, query, opts);
+    }
   }
 
   private enc(v: unknown): unknown {

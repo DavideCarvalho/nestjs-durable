@@ -555,6 +555,178 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       ]);
     });
 
+    // ---- multi-value predicates (the console's multi-selects) -------------------------------
+
+    t('matches ANY of a set of statuses, workflows, tenants or origins', async () => {
+      // One control, several values. Each plural field ORs within itself and ANDs with the rest, so
+      // an operator comparing two tenants sees both without issuing two queries.
+      await store.createRun(run({ id: 'a', status: 'failed', namespace: 'acme', workflow: 'wa' }));
+      await store.createRun(run({ id: 'b', status: 'dead', namespace: 'globex', workflow: 'wb' }));
+      await store.createRun(
+        run({ id: 'c', status: 'completed', namespace: 'initech', workflow: 'wc' }),
+      );
+
+      expect(
+        (await store.listRuns({ statuses: ['failed', 'dead'] })).map((r) => r.id).sort(),
+      ).toEqual(['a', 'b']);
+      expect(
+        (await store.listRuns({ namespaces: ['acme', 'globex'] })).map((r) => r.id).sort(),
+      ).toEqual(['a', 'b']);
+      expect((await store.listRuns({ workflows: ['wa', 'wc'] })).map((r) => r.id).sort()).toEqual([
+        'a',
+        'c',
+      ]);
+    });
+
+    t('carries the absent-origin bucket INSIDE a set of origins', async () => {
+      // "This package plus the runs nothing claims" — a view the single `origin` cannot express at
+      // all, and the reason `null` is a member of the set rather than a separate flag.
+      await store.createRun(run({ id: 'a', origin: 'pkg-a' }));
+      await store.createRun(run({ id: 'b', origin: 'pkg-b' }));
+      await store.createRun(run({ id: 'c' }));
+
+      expect((await store.listRuns({ origins: ['pkg-a', null] })).map((r) => r.id).sort()).toEqual([
+        'a',
+        'c',
+      ]);
+      expect(
+        (await store.listRuns({ origins: ['pkg-a', 'pkg-b'] })).map((r) => r.id).sort(),
+      ).toEqual(['a', 'b']);
+    });
+
+    t('ANDs a plural predicate with everything else, and matches nothing when empty', async () => {
+      // An empty set is a real answer — "none of these" — and must not widen to every run, which is
+      // what dropping the clause would do.
+      await store.createRun(run({ id: 'a', status: 'failed', namespace: 'acme' }));
+      await store.createRun(run({ id: 'b', status: 'dead', namespace: 'acme' }));
+
+      expect(
+        (await store.listRuns({ namespaces: ['acme'], statuses: ['dead'] })).map((r) => r.id),
+      ).toEqual(['b']);
+      expect(await store.listRuns({ namespaces: [] })).toEqual([]);
+      expect(await store.listRuns({ statuses: [] })).toEqual([]);
+      expect(await store.listRuns({ origins: [] })).toEqual([]);
+    });
+
+    t('matches runs carrying ANY of a set of tags', async () => {
+      if (!supportsTagFilter) return;
+      // A run holds a SET of tags, so the useful multi-value question is membership in the union —
+      // asking for the intersection would return nothing for tags that never co-occur.
+      await store.createRun(run({ id: 'a', tags: ['etl'] }));
+      await store.createRun(run({ id: 'b', tags: ['nightly', 'batch'] }));
+      await store.createRun(run({ id: 'c', tags: ['adhoc'] }));
+
+      expect((await store.listRuns({ tags: ['etl', 'nightly'] })).map((r) => r.id).sort()).toEqual([
+        'a',
+        'b',
+      ]);
+      expect(await store.listRuns({ tags: [] })).toEqual([]);
+    });
+
+    t('matches a search attribute against a SET of values (the `in` predicate)', async () => {
+      // Two `eq` predicates on one key are ANDed like every other pair, and no run has one attribute
+      // with two values — so a multi-select over attribute values needs its own operator.
+      await store.createRun(run({ id: 'a', searchAttributes: { tier: 'pro' } }));
+      await store.createRun(run({ id: 'b', searchAttributes: { tier: 'enterprise' } }));
+      await store.createRun(run({ id: 'c', searchAttributes: { tier: 'free' } }));
+      await store.createRun(run({ id: 'd', searchAttributes: { amount: 200 } }));
+
+      const inSet = await store.listRuns({
+        attributes: [{ key: 'tier', op: 'in', values: ['pro', 'enterprise'] }],
+      });
+      expect(inSet.map((r) => r.id).sort()).toEqual(['a', 'b']);
+
+      // Mixed operand types land in different typed columns and still OR together.
+      const mixed = await store.listRuns({
+        attributes: [{ key: 'amount', op: 'in', values: [200, 'none'] }],
+      });
+      expect(mixed.map((r) => r.id)).toEqual(['d']);
+
+      // Empty set matches nothing, and a run missing the key never matches.
+      expect(await store.listRuns({ attributes: [{ key: 'tier', op: 'in', values: [] }] })).toEqual(
+        [],
+      );
+      expect(
+        (await store.listRuns({ attributes: [{ key: 'tier', op: 'in', values: ['pro'] }] })).map(
+          (r) => r.id,
+        ),
+      ).toEqual(['a']);
+    });
+
+    // ---- value facets (what fills a console's pickers) ---------------------------------------
+
+    t(
+      'enumerates the distinct values of a run column, counted and ordered by frequency',
+      async () => {
+        if (!store.runValueFacets) return; // optional on the port, like runFacets
+        await store.createRun(run({ id: 'a', namespace: 'acme' }));
+        await store.createRun(run({ id: 'b', namespace: 'acme' }));
+        await store.createRun(run({ id: 'c', namespace: 'globex' }));
+
+        expect(await store.runValueFacets({ field: 'namespace' }, {})).toEqual([
+          { value: 'acme', count: 2 },
+          { value: 'globex', count: 1 },
+        ]);
+      },
+    );
+
+    t('reports the unattributed bucket as a `null` value, not as a name', async () => {
+      if (!store.runValueFacets) return;
+      await store.createRun(run({ id: 'a', origin: 'pkg-a' }));
+      await store.createRun(run({ id: 'b' }));
+
+      const values = await store.runValueFacets({ field: 'origin' }, {});
+      expect(values).toContainEqual({ value: 'pkg-a', count: 1 });
+      expect(values).toContainEqual({ value: null, count: 1 });
+    });
+
+    t('scopes the values to the SAME predicates the list is under', async () => {
+      // The point of a picker: choose a tenant, and the tag picker offers that tenant's tags. A
+      // picker that ignored the active filters would offer values whose result set is empty.
+      if (!store.runValueFacets) return;
+      if (!supportsTagFilter) return;
+      await store.createRun(run({ id: 'a', namespace: 'acme', tags: ['etl'] }));
+      await store.createRun(run({ id: 'b', namespace: 'globex', tags: ['nightly'] }));
+
+      expect(await store.runValueFacets({ field: 'tag' }, { namespace: 'acme' })).toEqual([
+        { value: 'etl', count: 1 },
+      ]);
+    });
+
+    t('enumerates tags, attribute keys and the values under one key', async () => {
+      if (!store.runValueFacets) return;
+      await store.createRun(run({ id: 'a', tags: ['etl'], searchAttributes: { tier: 'pro' } }));
+      await store.createRun(
+        run({ id: 'b', tags: ['etl', 'nightly'], searchAttributes: { tier: 'free' } }),
+      );
+
+      expect(await store.runValueFacets({ field: 'tag' }, {})).toEqual([
+        { value: 'etl', count: 2 },
+        { value: 'nightly', count: 1 },
+      ]);
+      expect(await store.runValueFacets({ field: 'attributeKey' }, {})).toEqual([
+        { value: 'tier', count: 2 },
+      ]);
+      expect(
+        (await store.runValueFacets({ field: 'attributeValue', key: 'tier' }, {}))
+          .map((r) => r.value)
+          .sort(),
+      ).toEqual(['free', 'pro']);
+    });
+
+    t('bounds the values it returns, keeping the most common ones', async () => {
+      // Tag and attribute cardinality grows with the data (a `singleton:<key>` tag is minted per
+      // key), so the unbounded answer is a listing wearing an aggregate's shape.
+      if (!store.runValueFacets) return;
+      await store.createRun(run({ id: 'a', namespace: 'acme' }));
+      await store.createRun(run({ id: 'b', namespace: 'acme' }));
+      await store.createRun(run({ id: 'c', namespace: 'globex' }));
+
+      expect(await store.runValueFacets({ field: 'namespace' }, {}, { limit: 1 })).toEqual([
+        { value: 'acme', count: 2 },
+      ]);
+    });
+
     t('orders listRuns newest-first and paginates with limit/offset', async () => {
       await store.createRun(run({ id: 'old', createdAt: new Date('2026-06-11T00:00:00.000Z') }));
       await store.createRun(run({ id: 'mid', createdAt: new Date('2026-06-11T00:00:01.000Z') }));

@@ -20,6 +20,12 @@ interface, independent of the [transport](/docs/transports).
   caller falling back to counting a full listing. Every bundled adapter pushes it down to a
   `GROUP BY`, and `RunQuery.origin` accepts `null` there and in `listRuns` to select the runs carrying
   no origin at all.
+
+  **`runValueFacets(axis, query, opts?)`** is optional in the same way: the distinct VALUES of one
+  filter axis with counts, which is what lets a console offer a picker instead of a text box. A store
+  that omits it leaves those controls as free text. Every bundled adapter answers the run-table axes
+  with a `GROUP BY`; `tag` and the search-attribute axes are counted over a bounded scan, since their
+  values live outside the row being counted.
 </Callout>
 
 ## Adapters

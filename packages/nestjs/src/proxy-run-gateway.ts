@@ -11,6 +11,9 @@ import type {
   RunReply,
   RunRequestKind,
   RunResult,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
   RunWaiting,
   Transport,
 } from '@dudousxd/nestjs-durable-core';
@@ -99,6 +102,16 @@ export class ProxyRunGateway implements RunGateway {
   /** Counted on the operator, over the same tenant-scoped predicates its `listRuns` reply obeys. */
   runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
     return this.request<RunFacetRow[]>({ kind: 'runFacets', query });
+  }
+
+  /** Enumerated on the operator, over the same tenant-scoped predicates its `listRuns` reply obeys —
+   *  so a tenant's pickers offer its own tenants/tags/attributes and never another's. */
+  runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    return this.request<RunValueFacetRow[]>({ kind: 'runValueFacets', axis, query, opts });
   }
 
   /** Round-trips to the operator, which scopes the result to this tenant's own `@<tenant>` groups. */

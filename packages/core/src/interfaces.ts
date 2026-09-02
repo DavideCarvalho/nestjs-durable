@@ -443,6 +443,25 @@ export interface StateStore {
    * fall back to counting a {@link listRuns} result, which is correct but unbounded.
    */
   runFacets?(query: RunFacetQuery): Promise<RunFacetRow[]>;
+
+  /**
+   * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a
+   * console's tenant/tag/attribute pickers list instead of asking an operator to type a value blind.
+   *
+   * Scoped by the SAME predicates the list is under (`query`), so the options narrow as the operator
+   * narrows: picking a tenant leaves the tag picker offering only tags that tenant's runs actually
+   * carry, and a picker never offers a value that would return an empty list.
+   *
+   * Bounded by {@link RunValueFacetOptions} — read its `scan` note before trusting a `tag` count.
+   *
+   * Optional: a store that omits it still works — the console falls back to free-text entry for these
+   * filters, which is what it had before pickers existed.
+   */
+  runValueFacets?(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
 
   /**
@@ -537,17 +556,34 @@ export type SearchAttributesSchema<A extends SearchAttributes = SearchAttributes
 export type InferSearchAttributes<S extends StandardSchemaV1<unknown, SearchAttributes>> =
   StandardSchemaV1.InferOutput<S>;
 
-export type AttributeOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte';
+export type AttributeOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'in';
 
-/** One predicate over a run's {@link SearchAttributes}; a {@link RunQuery} ANDs them all. */
-export interface AttributeFilter {
-  key: string;
-  op: AttributeOp;
-  value: string | number | boolean;
-}
+/** One value a search attribute can hold, and so one operand a predicate compares against. */
+export type AttributeValue = string | number | boolean;
+
+/**
+ * One predicate over a run's {@link SearchAttributes}; a {@link RunQuery} ANDs them all.
+ *
+ * The scalar ops carry a single `value`. `in` carries a SET of values matched as OR, and it needs to
+ * exist as its own op because ORing inside ONE predicate is the only way to express "tier is pro or
+ * enterprise": two `eq` predicates on the same key are ANDed like every other pair, which no run can
+ * satisfy. An empty `values` matches nothing, mirroring {@link RunQuery.statuses}.
+ */
+export type AttributeFilter =
+  | { key: string; op: Exclude<AttributeOp, 'in'>; value: AttributeValue; values?: never }
+  | { key: string; op: 'in'; values: AttributeValue[]; value?: never };
+
+/** The single-operand members of {@link AttributeFilter} — every op except the `in` set. */
+export type ScalarAttributeFilter = Exclude<AttributeFilter, { op: 'in' }>;
 
 export interface RunQuery {
   workflow?: string | undefined;
+  /**
+   * Match any of these workflows (`workflow IN (...)`). Same shape as {@link statuses}: ORed with
+   * each other, ANDed with everything else, and further narrowed by a concurrent single `workflow`.
+   * Empty array = matches nothing.
+   */
+  workflows?: string[] | undefined;
   status?: RunStatus | undefined;
   /**
    * Match any of these statuses (a `status IN (...)` filter). ORed together, and ANDed with the other
@@ -560,6 +596,13 @@ export interface RunQuery {
   /** Only runs carrying this tag (exact match against {@link WorkflowRun.tags}). */
   tag?: string | undefined;
   /**
+   * Only runs carrying ANY of these tags. A run's tags are already a set, so the useful multi-value
+   * question is "in this set", not "has all of them" — an operator picking `etl` and `nightly` from a
+   * facet list means the union, and asking for their intersection through this field would return
+   * nothing for tags that never co-occur. ANDed with a concurrent single `tag`; empty = matches nothing.
+   */
+  tags?: string[] | undefined;
+  /**
    * Typed/range predicates over {@link WorkflowRun.searchAttributes}, ANDed together (e.g. `amount`
    * >= 200 and `tier` = 'pro'). Applied in-process after the coarse filters, so pair with
    * `workflow`/`status`/`tag` to bound the scan on large stores.
@@ -567,6 +610,9 @@ export interface RunQuery {
   attributes?: AttributeFilter[] | undefined;
   /** Restrict to runs in this namespace (exact match), ANDed with the other predicates. */
   namespace?: string | undefined;
+  /** Restrict to runs in ANY of these namespaces (`namespace IN (...)`), so a console can compare a
+   *  few tenants side by side. ANDed with a concurrent single `namespace`; empty = matches nothing. */
+  namespaces?: string[] | undefined;
   /**
    * Restrict to runs whose workflow was declared by this package (exact match against
    * {@link WorkflowRun.origin}), ANDed with the other predicates.
@@ -578,6 +624,13 @@ export interface RunQuery {
    * facet without having to hold every run in the browser to find them.
    */
   origin?: string | null | undefined;
+  /**
+   * Restrict to runs from ANY of these origins. `null` is a member like any other — it selects the
+   * unattributed bucket — so `['@acme/billing', null]` is "this package's runs plus the ones nothing
+   * could attribute", which the single {@link origin} cannot express at all. ANDed with a concurrent
+   * single `origin`; empty = matches nothing.
+   */
+  origins?: Array<string | null> | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
 }
@@ -600,6 +653,46 @@ export interface RunFacetRow {
   status: RunStatus;
   origin: string | null;
   count: number;
+}
+
+/**
+ * Which axis {@link StateStore.runValueFacets} enumerates the distinct VALUES of. Every member is an
+ * axis {@link RunQuery} can then filter by, which is the point: the answer to "what can I pick here"
+ * has to be spendable as a predicate, or a console is offering choices that return nothing.
+ *
+ * `attributeKey` lists the search-attribute keys in use (the left-hand side of a predicate);
+ * `attributeValue` lists the values recorded under ONE key (its right-hand side).
+ */
+export type RunValueAxis =
+  | { field: 'workflow' | 'status' | 'origin' | 'namespace' | 'tag' | 'attributeKey' }
+  | { field: 'attributeValue'; key: string };
+
+/**
+ * One distinct value of a {@link RunValueAxis} and how many of the matching runs carry it — the rows
+ * behind a console's value picker. `value` is `null` only where the axis itself has an absent bucket
+ * (a run with no `origin`); a count is never zero, since a value with no runs produces no row.
+ */
+export interface RunValueFacetRow {
+  value: string | null;
+  count: number;
+}
+
+/**
+ * How much of the store {@link StateStore.runValueFacets} may read to answer.
+ *
+ * `limit` bounds the ROWS RETURNED (highest count first): tag and attribute-value cardinality is
+ * unbounded in principle — a run tagged `singleton:<key>` mints a new tag per key — so a picker asks
+ * for the top slice rather than the whole domain, and keeps free text for everything else.
+ *
+ * `scan` bounds the RUNS READ, and applies to the axes whose values are not a column of the run row
+ * being counted — `tag` (inside a JSON array column) and the two attribute axes (a side table). Those
+ * report counts over the newest `scan` matching runs rather than over all of them: a bounded,
+ * deliberately approximate answer, where the alternative is a full scan on every keystroke. The
+ * column axes (`workflow`, `status`, `origin`, `namespace`) are exact and ignore `scan`.
+ */
+export interface RunValueFacetOptions {
+  limit?: number | undefined;
+  scan?: number | undefined;
 }
 
 /** The transaction handle `StateStore.transaction` hands to its work callback. */
@@ -671,6 +764,12 @@ export type RunRequestKind =
   | { kind: 'getRunDetail'; runId: string }
   | { kind: 'listRuns'; query: RunQuery }
   | { kind: 'runFacets'; query: RunFacetQuery }
+  | {
+      kind: 'runValueFacets';
+      axis: RunValueAxis;
+      query: RunFacetQuery;
+      opts?: RunValueFacetOptions | undefined;
+    }
   // Per-group worker health — the operator answers it scoped to the requester's own groups (see
   // `RunRequestResponder`), so a tenant's Workers panel shows ITS queues, never another tenant's.
   | { kind: 'workerHealth' }

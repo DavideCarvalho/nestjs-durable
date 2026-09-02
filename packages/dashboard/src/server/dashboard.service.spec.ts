@@ -48,6 +48,10 @@ function fakeGateway(overrides: FakeGatewayOverrides): RunGateway {
       record('runFacets');
       return [];
     },
+    async runValueFacets() {
+      record('runValueFacets');
+      return [];
+    },
     async waitingFor(_runIds): Promise<Record<string, RunWaiting>> {
       record('waitingFor');
       return {};

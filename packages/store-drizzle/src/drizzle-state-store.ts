@@ -1,22 +1,28 @@
 import {
   type AttributeFilter,
+  RUN_VALUE_FACET_SCAN,
   type RunFacetQuery,
   type RunFacetRow,
   type RunQuery,
   type RunStatus,
+  type RunValueAxis,
+  type RunValueFacetOptions,
+  type RunValueFacetRow,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
   type StepError,
   type StepEvent,
   type WorkflowRun,
-  attributeColumnFor,
-  attributeOperand,
+  attributePredicateOperands,
+  axisIsRunColumn,
   mergeRunFacetRows,
+  mergeRunValueFacetRows,
   normalizeAttributeRows,
-  sqlComparator,
+  runValueFacetsFromRuns,
 } from '@dudousxd/nestjs-durable-core';
 import {
+  type SQL,
   and,
   asc,
   desc,
@@ -61,6 +67,14 @@ type DrizzleSqlite = BaseSQLiteDatabase<'sync' | 'async', unknown>;
  * Without this they would be invisible to EVERY worker: pending forever, and silently. It cannot
  * leak across tenants, because any other namespace is plain equality, which NULL never satisfies.
  */
+/** OR a set of conditions, where an EMPTY set means "matches nothing" rather than "no restriction" —
+ *  which is what every plural {@link RunQuery} predicate promises, and what dropping the clause (as
+ *  `and(...)` does with `undefined`) would silently invert into "matches everything". */
+function anyOf(conditions: (SQL | undefined)[]): SQL {
+  const present = conditions.filter((c): c is SQL => c !== undefined);
+  return present.length ? (or(...present) as SQL) : sql`1 = 0`;
+}
+
 function namespaceFilter(namespace?: string) {
   if (namespace === undefined) return undefined;
   if (namespace === DEFAULT_NAMESPACE)
@@ -236,11 +250,16 @@ export class DrizzleStateStore implements StateStore {
   private runFilters(query: RunQuery) {
     return [
       query.workflow ? eq(workflowRuns.workflow, query.workflow) : undefined,
+      // The plural form of each axis below: ORed within itself, ANDed with everything else, and an
+      // empty set matches nothing — the same contract `statuses` already had.
+      query.workflows ? anyOf(query.workflows.map((w) => eq(workflowRuns.workflow, w))) : undefined,
       // The tenant boundary, ANDed with everything else. This is not only a dashboard facet: it is
       // the fourth namespace-scoped worker path, because `engine.sweepTimeouts` cancels runs past
       // their `executionTimeout` via `listRuns({ workflow, status, namespace })` — unscoped here, a
       // worker would cancel another tenant's in-flight runs. Undefined = all namespaces.
       namespaceFilter(query.namespace),
+      // Per-value `namespaceFilter`, so the default namespace keeps folding in legacy NULL rows.
+      query.namespaces ? anyOf(query.namespaces.map(namespaceFilter)) : undefined,
       // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
       // before the column existed, or registered through a path the derivation could not classify)
       // matches NO origin value — it is never folded into a bucket to make the facet look complete.
@@ -253,6 +272,15 @@ export class DrizzleStateStore implements StateStore {
         : query.origin !== undefined
           ? eq(workflowRuns.origin, query.origin)
           : undefined,
+      // A set of origins may include `null` (the unattributed bucket), which `IN` cannot carry —
+      // `IN (NULL)` is never true — so it becomes its own ORed `IS NULL` branch.
+      query.origins
+        ? anyOf(
+            query.origins.map((o) =>
+              o === null ? isNull(workflowRuns.origin) : eq(workflowRuns.origin, o),
+            ),
+          )
+        : undefined,
       query.status ? eq(workflowRuns.status, query.status) : undefined,
       // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store).
       query.statuses
@@ -262,6 +290,7 @@ export class DrizzleStateStore implements StateStore {
         : undefined,
       // `tags` is JSON text; match the quoted token so `etl` doesn't match `etl-foo`.
       query.tag ? like(workflowRuns.tags, `%"${query.tag}"%`) : undefined,
+      query.tags ? anyOf(query.tags.map((t) => like(workflowRuns.tags, `%"${t}"%`))) : undefined,
       // Typed/range attribute predicates push DOWN into SQL: each filter becomes an EXISTS against
       // the normalized `durable_run_attributes` side-table, so the DB filters AND paginates — no
       // full scan + in-process filter. ANDed: a run must satisfy every filter (one EXISTS per filter).
@@ -305,14 +334,43 @@ export class DrizzleStateStore implements StateStore {
     );
   }
 
+  /** Distinct values of one filter axis over the same predicates {@link listRuns} pages. A run-table
+   *  column is a `GROUP BY` like {@link runFacets}, exact over the whole matching set; the tag and
+   *  attribute axes live outside the row (json array / side table) and are counted from a bounded
+   *  page of runs instead — see `RunValueFacetOptions.scan`. */
+  async runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    if (!axisIsRunColumn(axis)) {
+      const runs = await this.listRuns({ ...query, limit: opts?.scan ?? RUN_VALUE_FACET_SCAN });
+      return runValueFacetsFromRuns(runs, axis, opts);
+    }
+    const column = workflowRuns[axis.field];
+    const filters = this.runFilters(query);
+    const rows = await this.db
+      .select({ value: column, count: sql<number>`count(*)` })
+      .from(workflowRuns)
+      .where(filters.length ? and(...filters) : undefined)
+      .groupBy(column);
+    return mergeRunValueFacetRows(
+      rows.map((r) => ({ value: r.value ?? null, count: Number(r.count) })),
+      opts,
+    );
+  }
+
   /** One attribute predicate as an EXISTS subquery on the side-table, correlated to the outer run.
    *  `<>` (ne) also excludes runs where the attribute is absent (the missing-key-never-matches
    *  contract): EXISTS already requires the key row to be present, so EXISTS(... <> ...) is exactly
    *  ne-with-present. Numeric operands compare `num_value`, everything else `str_value`. */
   private attributeExists(f: AttributeFilter) {
-    const col =
-      attributeColumnFor(f) === 'numValue' ? runAttributes.numValue : runAttributes.strValue;
-    const cmp = sqlComparator(f.op);
+    // One comparison for a scalar op, one per member for `in` — ORed inside the single EXISTS, since
+    // `in`'s operands may be of mixed types and so land in different typed columns.
+    const comparisons = attributePredicateOperands(f).map(
+      ({ column, comparator, operand }) =>
+        sql`${column === 'numValue' ? runAttributes.numValue : runAttributes.strValue} ${sql.raw(comparator)} ${operand}`,
+    );
     return exists(
       this.db
         .select({ one: sql`1` })
@@ -321,7 +379,7 @@ export class DrizzleStateStore implements StateStore {
           and(
             eq(runAttributes.runId, workflowRuns.id),
             eq(runAttributes.key, f.key),
-            sql`${col} ${sql.raw(cmp)} ${attributeOperand(f)}`,
+            anyOf(comparisons),
           ),
         ),
     );

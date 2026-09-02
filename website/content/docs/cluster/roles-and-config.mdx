@@ -144,6 +144,7 @@ export class RunsController {
 | `getRunDetail(runId)` | one run plus its step timeline and child ids, or `null` |
 | `listRuns(query)` | a filtered listing (status, workflow, tag, namespace, search attributes), each row optionally carrying what a suspended run is parked on |
 | `runFacets(query)` | whole-set counts grouped by `(status, origin)` — exact even when the listing is paginated |
+| `runValueFacets(axis, query, opts?)` | the distinct values of one filter axis (tag, tenant, origin, workflow, search-attribute key or value) with counts — what fills a console's pickers |
 | `waitingFor(runIds)` | bulk-resolve what each of an arbitrary set of runs is parked on |
 | `workerHealth()` | queue backlog and live worker heartbeats per group; scoped to the requester's own groups over a tenant proxy |
 | `cancel(runId, opts?)` | cancel a run, with `{ compensate: true }` to run its [saga undo](/docs/reliability/sagas) first |

@@ -15,6 +15,7 @@ export * from './protocol';
 export * from './queue';
 export * from './remote-workflow-executor';
 export * from './run-facets';
+export * from './run-value-facets';
 export * from './run-gateway';
 export * from './run-waiting';
 export * from './codec-state-store';

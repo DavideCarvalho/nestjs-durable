@@ -1,20 +1,25 @@
 import {
   type AttributeFilter,
+  RUN_VALUE_FACET_SCAN,
   type RunFacetQuery,
   type RunFacetRow,
   type RunQuery,
   type RunStatus,
+  type RunValueAxis,
+  type RunValueFacetOptions,
+  type RunValueFacetRow,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
   type StepError,
   type StepEvent,
   type WorkflowRun,
-  attributeColumnFor,
-  attributeOperand,
+  attributePredicateOperands,
+  axisIsRunColumn,
   mergeRunFacetRows,
+  mergeRunValueFacetRows,
   normalizeAttributeRows,
-  sqlComparator,
+  runValueFacetsFromRuns,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Brackets,
@@ -242,12 +247,24 @@ export class TypeOrmStateStore implements StateStore {
     // and corrupt the LIKE pattern. Use the query builder with a raw parameter to bypass that.
     const qb = this.runs().createQueryBuilder('r');
     if (query.workflow) qb.andWhere('r.workflow = :workflow', { workflow: query.workflow });
+    // The plural form of each axis: ORed within itself, ANDed with everything else, and an empty set
+    // matches nothing — the contract `statuses` already had, spelled the same way (`1 = 0`).
+    if (query.workflows)
+      qb.andWhere(
+        query.workflows.length ? 'r.workflow IN (:...workflows)' : '1 = 0',
+        query.workflows.length ? { workflows: query.workflows } : {},
+      );
     // The tenant partition. This is not only a dashboard facet: the engine's execution-timeout sweep
     // finds its in-flight runs through `listRuns({ workflow, status, namespace })`, so without this
     // predicate a namespaced worker would cancel ANOTHER tenant's long-running runs. `undefined`
     // leaves the predicate off = every namespace (the operator view), exactly as in the list methods.
     if (query.namespace !== undefined)
       qb.andWhere('r.namespace = :namespace', { namespace: query.namespace });
+    if (query.namespaces)
+      qb.andWhere(
+        query.namespaces.length ? 'r.namespace IN (:...namespaces)' : '1 = 0',
+        query.namespaces.length ? { namespaces: query.namespaces } : {},
+      );
     // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
     // before the column existed, or registered through a path the derivation could not classify)
     // matches NO origin value — it is never folded into a bucket to make the facet look complete.
@@ -258,6 +275,18 @@ export class TypeOrmStateStore implements StateStore {
     if (query.origin === null) qb.andWhere('r.origin IS NULL');
     else if (query.origin !== undefined)
       qb.andWhere('r.origin = :origin', { origin: query.origin });
+    // A set of origins may include `null` (the unattributed bucket), which `IN` cannot carry —
+    // `IN (NULL)` is never true — so it becomes its own ORed `IS NULL` branch.
+    if (query.origins) {
+      const named = query.origins.filter((o): o is string => o !== null);
+      const branches: string[] = [];
+      if (named.length) branches.push('r.origin IN (:...origins)');
+      if (query.origins.some((o) => o === null)) branches.push('r.origin IS NULL');
+      qb.andWhere(
+        branches.length ? `(${branches.join(' OR ')})` : '1 = 0',
+        named.length ? { origins: named } : {},
+      );
+    }
     if (query.status) qb.andWhere('r.status = :status', { status: query.status });
     if (query.statuses)
       qb.andWhere(
@@ -270,6 +299,13 @@ export class TypeOrmStateStore implements StateStore {
     // result set. The `statuses`/`workflow` predicates above bound that scan; if tag scans ever dominate,
     // promote tags to a normalized join table or a JSON/GIN index — a schema change, intentionally not done here.
     if (query.tag) qb.andWhere('r.tags LIKE :tagPattern', { tagPattern: `%"${query.tag}"%` });
+    if (query.tags) {
+      const branches = query.tags.map((_, i) => `r.tags LIKE :tagPattern${i}`);
+      qb.andWhere(
+        branches.length ? `(${branches.join(' OR ')})` : '1 = 0',
+        Object.fromEntries(query.tags.map((t, i) => [`tagPattern${i}`, `%"${t}"%`])),
+      );
+    }
     // Typed/range attribute predicates push DOWN into SQL: each filter becomes an EXISTS against the
     // normalized `durable_run_attributes` side-table (indexed on (key, numValue)/(key, strValue)), so
     // the DB does the filtering AND the LIMIT/OFFSET — no full scan + in-process filter. ANDed: a run
@@ -304,6 +340,30 @@ export class TypeOrmStateStore implements StateStore {
     return mergeRunFacetRows(rows.map((r) => ({ ...r, count: Number(r.count) })));
   }
 
+  /** Distinct values of one filter axis over the same predicates {@link listRuns} pages. A run-table
+   *  column is a `GROUP BY` like {@link runFacets}, exact over the whole matching set; the tag and
+   *  attribute axes live outside the row (json text / side table) and are counted from a bounded page
+   *  of runs instead — see `RunValueFacetOptions.scan`. */
+  async runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    if (!axisIsRunColumn(axis)) {
+      const runs = await this.listRuns({ ...query, limit: opts?.scan ?? RUN_VALUE_FACET_SCAN });
+      return runValueFacetsFromRuns(runs, axis, opts);
+    }
+    const rows = await this.runQueryBuilder(query)
+      .select(`r.${axis.field}`, 'value')
+      .addSelect('COUNT(*)', 'count')
+      .groupBy(`r.${axis.field}`)
+      .getRawMany<{ value: string | null; count: number | string }>();
+    return mergeRunValueFacetRows(
+      rows.map((r) => ({ value: r.value ?? null, count: Number(r.count) })),
+      opts,
+    );
+  }
+
   /** Add one attribute predicate to `qb` as an EXISTS subquery on the side-table. `i` namespaces the
    *  bind params so multiple ANDed filters don't collide. */
   private applyAttributeExists(
@@ -311,10 +371,10 @@ export class TypeOrmStateStore implements StateStore {
     f: AttributeFilter,
     i: number,
   ): void {
-    const valueProperty = attributeColumnFor(f); // 'numValue' | 'strValue' (entity property)
-    const cmp = sqlComparator(f.op);
+    // One comparison for a scalar op, one per member for `in` — ORed inside the single EXISTS, since
+    // `in`'s operands may be of mixed types and so land in different typed columns.
+    const comparisons = attributePredicateOperands(f);
     const keyParam = `attrKey${i}`;
-    const valParam = `attrVal${i}`;
     // Resolve the PHYSICAL column names from the entity metadata so this raw subquery tracks the
     // configured naming (canonical snake_case by default) instead of hardcoding camelCase — which
     // would break the EXISTS pushdown the moment the table is snake_case.
@@ -323,18 +383,25 @@ export class TypeOrmStateStore implements StateStore {
     const wrap = (name: string) => `${q}${name}${q}`;
     const runIdCol = wrap(resolve('durable_run_attributes', 'runId'));
     const keyCol = wrap(resolve('durable_run_attributes', 'key'));
-    const valueCol = wrap(resolve('durable_run_attributes', valueProperty));
     const runPkCol = wrap(resolve('durable_workflow_runs', 'id'));
     const table = wrap('durable_run_attributes');
     // `<>` (ne) must also exclude rows where the attribute is absent: the missing-key-never-matches
     // contract (see core matchesAttributes). EXISTS already requires the key row to be present, and a
     // row only exists when the value is non-null, so EXISTS(... <> ...) gives exactly ne-with-present.
     const a = `a${i}`;
-    const sql = `EXISTS (SELECT 1 FROM ${table} ${a} WHERE ${a}.${runIdCol} = r.${runPkCol} AND ${a}.${keyCol} = :${keyParam} AND ${a}.${valueCol} ${cmp} :${valParam})`;
-    qb.andWhere(sql, {
-      [keyParam]: f.key,
-      [valParam]: attributeOperand(f),
+    const params: Record<string, unknown> = { [keyParam]: f.key };
+    const branches = comparisons.map(({ column, comparator, operand }, j) => {
+      const valParam = `attrVal${i}_${j}`;
+      params[valParam] = operand;
+      return `${a}.${wrap(resolve('durable_run_attributes', column))} ${comparator} :${valParam}`;
     });
+    if (branches.length === 0) {
+      qb.andWhere('1 = 0');
+      return;
+    }
+    const match = branches.length === 1 ? branches[0] : `(${branches.join(' OR ')})`;
+    const sql = `EXISTS (SELECT 1 FROM ${table} ${a} WHERE ${a}.${runIdCol} = r.${runPkCol} AND ${a}.${keyCol} = :${keyParam} AND ${match})`;
+    qb.andWhere(sql, params);
   }
 
   /** The identifier quote char for the active driver (MySQL backtick, others double-quote). */

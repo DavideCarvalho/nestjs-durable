@@ -49,6 +49,18 @@ export class RunRequestResponder {
       return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
+    if (body.kind === 'runValueFacets') {
+      // Same forced scope as `listRuns`/`runFacets`: the values fill a picker for the tenant's own
+      // list, so enumerating them over anyone else's runs would both leak other tenants' tag and
+      // attribute vocabulary and offer choices this tenant's list can never match.
+      const data = await this.gateway.runValueFacets(
+        body.axis,
+        { ...body.query, namespace: msg.tenant },
+        body.opts,
+      );
+      return { requestId: msg.requestId, result: { ok: true, data } };
+    }
+
     if (body.kind === 'workerHealth') {
       // Not runId-bearing, so it can't ride the getRunDetail namespace check below. Scope by the
       // group-name convention instead: a tenant's queues are suffixed `<name>@<tenant>`, so keep only
@@ -114,6 +126,7 @@ export class RunRequestResponder {
       RunRequest['body'],
       | { kind: 'listRuns' }
       | { kind: 'runFacets' }
+      | { kind: 'runValueFacets' }
       | { kind: 'getRunDetail' }
       | { kind: 'workerHealth' }
       | { kind: 'waitingFor' }

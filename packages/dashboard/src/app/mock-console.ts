@@ -282,21 +282,92 @@ const workers: GroupHealth[] = [
 
 const topology: DurableTopology = { role: 'control-plane' };
 
+/** One decoded `filter[where]` clause from the console's query string. */
+interface MockClause {
+  field: string;
+  operator: string;
+  value: string | string[];
+}
+
+/** Decode the structured filter the console sends (`filter[where][0][field]=tag&…`). */
+function clauses(search: string | undefined): MockClause[] {
+  const byIndex = new Map<string, MockClause>();
+  for (const [key, value] of new URLSearchParams(search ?? '')) {
+    const match = /^filter\[where\]\[(\d+)\]\[(field|operator|value)\](?:\[(\d+)\])?$/.exec(key);
+    if (!match) continue;
+    const [, index, part, member] = match;
+    const clause = byIndex.get(index as string) ?? { field: '', operator: '', value: '' };
+    if (part === 'value' && member !== undefined) {
+      const list = Array.isArray(clause.value) ? clause.value : [];
+      list[Number(member)] = value;
+      clause.value = list;
+    } else if (part === 'value') {
+      clause.value = value;
+    } else {
+      clause[part as 'field' | 'operator'] = value;
+    }
+    byIndex.set(index as string, clause);
+  }
+  return [...byIndex.entries()].sort(([a], [b]) => Number(a) - Number(b)).map(([, c]) => c);
+}
+
+/** The values one run has on a filter axis — several for `tag`, one (or none) for the columns. */
+function valuesOn(run: WorkflowRun, field: string): (string | null)[] {
+  if (field === 'tag') return run.tags ?? [];
+  if (field === 'namespace') return [run.namespace ?? 'default'];
+  if (field === 'origin') return [run.origin ?? null];
+  if (field === 'status') return [run.status];
+  if (field === 'workflow') return [run.workflow];
+  if (field === 'attr') return Object.keys(run.searchAttributes ?? {});
+  if (field.startsWith('attr.')) {
+    const value = run.searchAttributes?.[field.slice(5)];
+    return value === undefined ? [] : [String(value)];
+  }
+  return [];
+}
+
+/**
+ * Apply the console's predicates the way a real store does — ANDed, `in` matching ANY, `isNull`
+ * selecting the unattributed bucket, absent meaning "don't narrow". Without this the filters in the
+ * preview would look broken, and a screenshot of them would be a lie.
+ */
+function matching(search: string | undefined): WorkflowRun[] {
+  return runs.filter((run) =>
+    clauses(search).every((clause) => {
+      const held = valuesOn(run, clause.field);
+      if (clause.operator === 'isNull') return held.includes(null);
+      const wanted = Array.isArray(clause.value) ? clause.value : [clause.value];
+      return held.some((value) => value !== null && wanted.includes(value));
+    }),
+  );
+}
+
 function body(path: string): unknown | undefined {
   const [route, search] = path.split('?');
-  if (route === '/runs') {
-    // Honour the two server-side facets the console can send, the way a real store applies them
-    // (exact match, ANDed, absent = don't narrow) — otherwise the tenant box in the preview would
-    // look broken, and a screenshot of it would be a lie.
+  if (route === '/runs') return matching(search);
+  if (route === '/runs/facets') {
+    const cells = new Map<string, { status: string; origin: string | null; count: number }>();
+    for (const run of matching(search)) {
+      const origin = run.origin ?? null;
+      const key = `${run.status}|${origin}`;
+      const cell = cells.get(key) ?? { status: run.status, origin, count: 0 };
+      cell.count += 1;
+      cells.set(key, cell);
+    }
+    return [...cells.values()];
+  }
+  if (route === '/runs/values') {
     const params = new URLSearchParams(search ?? '');
-    const namespace = params.get('namespace');
-    const origin = params.get('origin');
-    return runs.filter(
-      (r) =>
-        (!namespace || r.namespace === namespace) &&
-        // A run with NO origin matches no origin value — the same asymmetry core documents.
-        (!origin || r.origin === origin),
-    );
+    const field = params.get('groupByCount[field]') ?? '';
+    const limit = Number(params.get('groupByCount[limit]') ?? 100);
+    const counts = new Map<string | null, number>();
+    for (const run of matching(search)) {
+      for (const value of valuesOn(run, field)) counts.set(value, (counts.get(value) ?? 0) + 1);
+    }
+    return [...counts]
+      .map(([value, count]) => ({ value, count }))
+      .sort((a, b) => b.count - a.count || String(a.value).localeCompare(String(b.value)))
+      .slice(0, limit);
   }
   if (route === '/workers') return workers;
   if (route === '/topology') return topology;

@@ -434,12 +434,22 @@ The dashboard and `store.listRuns` filter on these through `RunQuery`:
 interface RunQuery {
   workflow?: string;
   status?: RunStatus;
-  /** `status IN (...)`, ORed together and ANDed with the other predicates. */
+  /** Each plural field matches ANY of its values, ANDed with the other predicates. An empty set
+   *  matches nothing; `origins` takes `null` as a member (the runs nothing could attribute). */
   statuses?: RunStatus[];
-  /** Exact match against a run's tags. */
+  workflows?: string[];
+  namespaces?: string[];
+  origins?: (string | null)[];
+  /** Exact match against a run's tags; `tags` matches a run carrying ANY of them. */
   tag?: string;
-  /** Typed/range predicates over searchAttributes, ANDed together. */
-  attributes?: { key: string; op: 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte'; value: string | number | boolean }[];
+  tags?: string[];
+  /** Typed/range predicates over searchAttributes, ANDed together. `in` carries a `values` SET,
+   *  matched as OR — the one thing two `eq` predicates on a key cannot express, since they are
+   *  ANDed and no run has one attribute with two values. */
+  attributes?: (
+    | { key: string; op: 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte'; value: string | number | boolean }
+    | { key: string; op: 'in'; values: (string | number | boolean)[] }
+  )[];
   namespace?: string;
   limit?: number;
   offset?: number;

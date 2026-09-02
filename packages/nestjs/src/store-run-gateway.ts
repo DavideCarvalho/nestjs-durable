@@ -9,6 +9,9 @@ import {
   type RunListItem,
   type RunQuery,
   type RunResult,
+  type RunValueAxis,
+  type RunValueFacetOptions,
+  type RunValueFacetRow,
   type RunWaiting,
   STATE_STORE_CANONICAL,
   type StateStore,
@@ -68,6 +71,21 @@ export class StoreRunGateway implements RunGateway {
     if (this.store.runFacets) return this.store.runFacets(query);
     const runs = await this.store.listRuns(query);
     return mergeRunFacetRows(runs.map((r) => ({ status: r.status, origin: r.origin, count: 1 })));
+  }
+
+  /**
+   * The distinct values behind a console's pickers, straight off the store's enumeration. A store
+   * without one answers `[]` rather than falling back to a listing: unlike the facet counts above —
+   * where a full listing is at least the RIGHT answer expensively — a picker built from an unbounded
+   * scan would be the same unbounded read on every keystroke, for a control whose free-text entry
+   * still works without it.
+   */
+  async runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    return this.store.runValueFacets?.(axis, query, opts) ?? [];
   }
 
   /**

@@ -1,9 +1,18 @@
-import type { AttributeFilter, AttributeOp, RunQuery, WorkflowRun } from './interfaces';
+import type {
+  AttributeFilter,
+  AttributeOp,
+  RunQuery,
+  ScalarAttributeFilter,
+  WorkflowRun,
+} from './interfaces';
 import type { SearchAttributes } from './interfaces';
 
-/** Compare one attribute value against a filter operand. Range ops need both sides comparable. */
-function compare(actual: unknown, op: AttributeOp, expected: string | number | boolean): boolean {
-  switch (op) {
+/** Compare one attribute value against a predicate. Range ops need both sides comparable; `in` is an
+ *  OR over its operand set, so an empty set matches nothing. */
+function compare(actual: unknown, filter: AttributeFilter): boolean {
+  if (filter.op === 'in') return filter.values.some((v) => actual === v);
+  const expected = filter.value;
+  switch (filter.op) {
     case 'eq':
       return actual === expected;
     case 'ne':
@@ -31,7 +40,7 @@ export function matchesAttributes(
 ): boolean {
   if (!filters?.length) return true;
   if (!attributes) return false;
-  return filters.every((f) => f.key in attributes && compare(attributes[f.key], f.op, f.value));
+  return filters.every((f) => f.key in attributes && compare(attributes[f.key], f));
 }
 
 /**
@@ -86,8 +95,12 @@ export function normalizeAttributeRows(
   return out;
 }
 
-/** SQL comparison operator for an {@link AttributeOp} (used to build pushdown predicates). */
-export function sqlComparator(op: AttributeOp): string {
+/**
+ * SQL comparison operator for a single-operand {@link AttributeOp} (used to build pushdown
+ * predicates). `in` is absent by construction: it compares against a SET, which a store emits as an
+ * OR of equalities over {@link attributePredicateOperands} rather than as one comparator.
+ */
+export function sqlComparator(op: Exclude<AttributeOp, 'in'>): string {
   switch (op) {
     case 'eq':
       return '=';
@@ -109,12 +122,51 @@ export function sqlComparator(op: AttributeOp): string {
  * numbers) hit `numValue`; everything else hits `strValue` (booleans are stored as `"true"`/`"false"`).
  * Keeping this in core means every SQL adapter pushes predicates down identically.
  */
-export function attributeColumnFor(filter: AttributeFilter): 'numValue' | 'strValue' {
+export function attributeColumnFor(filter: ScalarAttributeFilter): 'numValue' | 'strValue' {
   return typeof filter.value === 'number' ? 'numValue' : 'strValue';
 }
 
 /** The literal a side-table predicate compares against (booleans → `"true"`/`"false"` strings). */
-export function attributeOperand(filter: AttributeFilter): string | number {
+export function attributeOperand(filter: ScalarAttributeFilter): string | number {
   if (typeof filter.value === 'boolean') return filter.value ? 'true' : 'false';
   return filter.value;
+}
+
+/** One comparison a side-table predicate makes: which typed column, with which operator, against
+ *  which literal. */
+export interface AttributePredicateOperand {
+  column: 'numValue' | 'strValue';
+  comparator: string;
+  operand: string | number;
+}
+
+/**
+ * The comparisons one {@link AttributeFilter} makes, for a store to OR together inside its
+ * `EXISTS`/join on the normalized attribute side-table. A scalar op yields exactly ONE comparison
+ * (the same column/operator/literal {@link attributeColumnFor} and {@link attributeOperand} give);
+ * `in` yields one per member, each an equality, since its operands may be of mixed types and so land
+ * in different typed columns.
+ *
+ * An EMPTY list is a real answer, not a missing one: `in` over no values can match no run. A caller
+ * that ORs an empty list must emit a false predicate rather than dropping the filter, or the query
+ * silently widens to every run.
+ */
+export function attributePredicateOperands(filter: AttributeFilter): AttributePredicateOperand[] {
+  if (filter.op === 'in') {
+    return filter.values.map((value) => {
+      const scalar = { key: filter.key, op: 'eq', value } as ScalarAttributeFilter;
+      return {
+        column: attributeColumnFor(scalar),
+        comparator: '=',
+        operand: attributeOperand(scalar),
+      };
+    });
+  }
+  return [
+    {
+      column: attributeColumnFor(filter),
+      comparator: sqlComparator(filter.op),
+      operand: attributeOperand(filter),
+    },
+  ];
 }
