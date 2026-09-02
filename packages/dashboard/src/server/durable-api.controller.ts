@@ -1,4 +1,4 @@
-import { ApplyFilter, FilterRunner } from '@dudousxd/nestjs-filter';
+import { ApplyFilter, ApplyFilterInterceptor, FilterRunner } from '@dudousxd/nestjs-filter';
 import {
   Body,
   Controller,
@@ -9,6 +9,7 @@ import {
   Post,
   Query,
   Sse,
+  UseInterceptors,
 } from '@nestjs/common';
 import { DashboardService } from './dashboard.service.js';
 import { DurableRun } from './durable-run.js';
@@ -16,8 +17,16 @@ import { type RunListRow, toRunListRow } from './run-list-row.js';
 import type { RunQueryDraft } from './run-query-draft.js';
 import { RunFilter } from './run.filter.js';
 
-/** JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule). */
+/**
+ * JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule).
+ *
+ * The filter interceptor (what resolves `@ApplyFilter` into a query) is bound HERE rather than as
+ * the app-wide `APP_INTERCEPTOR` that `FilterModule.forRoot()` registers: a library must not add a
+ * global interceptor to its host, and on an app that already has one this would be the second copy,
+ * running every filter in the app twice.
+ */
 @Controller()
+@UseInterceptors(ApplyFilterInterceptor)
 export class DurableApiController {
   constructor(
     private readonly dashboard: DashboardService,

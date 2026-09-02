@@ -9,8 +9,14 @@ import {
   type RunValueFacetRow,
   type RunWaiting,
 } from '@dudousxd/nestjs-durable-core';
-import { FilterRunner } from '@dudousxd/nestjs-filter';
-import { BadRequestException } from '@nestjs/common';
+import {
+  APPLY_FILTER_REQ_KEY,
+  ApplyFilterInterceptor,
+  FilterRunner,
+} from '@dudousxd/nestjs-filter';
+import { BadRequestException, type ExecutionContext } from '@nestjs/common';
+import { INTERCEPTORS_METADATA } from '@nestjs/common/constants.js';
+import { firstValueFrom, from } from 'rxjs';
 import { describe, expect, it } from 'vitest';
 import { DashboardService } from './dashboard.service.js';
 import { DurableApiController } from './durable-api.controller.js';
@@ -26,6 +32,8 @@ interface Console {
   values(input: Record<string, unknown>): Promise<unknown>;
   bulk(action: 'retry' | 'cancel', input?: unknown, compensate?: string): Promise<unknown>;
   controller: DurableApiController;
+  /** Bound to the controller (not app-wide) — see `throughInterceptor`. */
+  interceptor: ApplyFilterInterceptor;
   queries: RunQuery[];
   facetQueries: RunFacetQuery[];
   valueFacets: Array<{ axis: RunValueAxis; query: RunFacetQuery; limit?: number }>;
@@ -105,6 +113,7 @@ async function makeConsole(runs: RunListItem[] = []): Promise<Console> {
     get: (token: unknown) => {
       if (token === RunFilter) return filter;
       if (token === RUN_QUERY_ADAPTER) return adapter;
+      if (token === FilterRunner) return runner;
       throw new Error('could not find');
     },
     // Typed off the constructor rather than off `ModuleRef` directly: the runner only ever calls
@@ -112,6 +121,7 @@ async function makeConsole(runs: RunListItem[] = []): Promise<Console> {
   } as unknown as ConstructorParameters<typeof FilterRunner>[0];
   const runner = new FilterRunner(moduleRef, { validation: 'off' }, null);
   const controller = new DurableApiController(new DashboardService(gateway), runner);
+  const interceptor = new ApplyFilterInterceptor(moduleRef);
   const draftFor = async (input: unknown): Promise<RunQueryDraft> => {
     const draft = adapter.createQueryBuilder(DurableRun) as RunQueryDraft;
     await runner.apply(RunFilter, input ?? {}, draft);
@@ -120,6 +130,7 @@ async function makeConsole(runs: RunListItem[] = []): Promise<Console> {
 
   return {
     controller,
+    interceptor,
     queries,
     facetQueries,
     valueFacets,
@@ -136,6 +147,38 @@ async function makeConsole(runs: RunListItem[] = []): Promise<Console> {
       return controller.bulk(action, await draftFor(input), compensate);
     },
   };
+}
+
+/**
+ * Drive a route the way a REQUEST does: through `ApplyFilterInterceptor`, which is what turns the
+ * `@ApplyFilter` parameter into a query. The controller's own tests hand it a draft directly; this
+ * one proves the step that BUILDS that draft is actually bound to the route, since the console binds
+ * the interceptor to its controller rather than as the app-wide `APP_INTERCEPTOR` a host would own.
+ */
+async function throughInterceptor(
+  c: Console,
+  route: 'runs' | 'facets',
+  query: Record<string, unknown>,
+): Promise<unknown> {
+  const request: Record<string | symbol, unknown> = { query, body: {} };
+  const context = {
+    getHandler: () => (c.controller as unknown as Record<string, unknown>)[route],
+    getClass: () => DurableApiController,
+    switchToHttp: () => ({ getRequest: () => request }),
+  } as unknown as ExecutionContext;
+  const handler = {
+    handle: () =>
+      // The param decorator reads the slot the interceptor filled, by position.
+      from(
+        Promise.resolve(
+          (c.controller[route] as (draft: RunQueryDraft) => unknown)(
+            (request[APPLY_FILTER_REQ_KEY] as RunQueryDraft[])[0] as RunQueryDraft,
+          ),
+        ),
+      ),
+  };
+  const observable = await firstValueFrom(c.interceptor.intercept(context, handler));
+  return observable;
 }
 
 /** A run as the gateway hands it over, payloads and all — the shape the list endpoint must strip. */
@@ -208,6 +251,37 @@ describe('DurableApiController: run-list filters', () => {
       namespace: 'acme',
     });
     expect(c.queries[0]?.attributes).toEqual([{ key: 'amount', op: 'gte', value: 200 }]);
+  });
+});
+
+describe('DurableApiController: the filter interceptor is bound to this controller', () => {
+  // The console wires `@dudousxd/nestjs-filter` privately — its own runner and its own interceptor,
+  // scoped to this module — because `FilterModule.forRoot()` is a GLOBAL registration and a library
+  // must not add an app-wide interceptor to its host (on an app that already has one, that would be
+  // a second copy running every filter in the app twice). Which means the binding below is the only
+  // thing making `@ApplyFilter` resolve at all: drop it and every list route gets `undefined`.
+  it('declares the interceptor on the controller itself', () => {
+    expect(Reflect.getMetadata(INTERCEPTORS_METADATA, DurableApiController)).toContain(
+      ApplyFilterInterceptor,
+    );
+  });
+
+  it('turns a request query into the run listing it selects', async () => {
+    const c = await makeConsole();
+
+    await throughInterceptor(c, 'runs', {
+      filter: { where: [{ field: 'tag', operator: 'in', value: ['etl', 'nightly'] }] },
+    });
+
+    expect(c.queries[0]).toMatchObject({ tags: ['etl', 'nightly'] });
+  });
+
+  it('feeds the facet route from the same parsing', async () => {
+    const c = await makeConsole();
+
+    await throughInterceptor(c, 'facets', { namespace: 'acme' });
+
+    expect(c.facetQueries[0]).toMatchObject({ namespace: 'acme' });
   });
 });
 

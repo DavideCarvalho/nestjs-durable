@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { FilterModule } from '@dudousxd/nestjs-filter';
+import { ApplyFilterInterceptor, FilterRunner } from '@dudousxd/nestjs-filter';
 import {
   type CanActivate,
   type DynamicModule,
@@ -9,7 +9,7 @@ import {
   type Provider,
   type Type,
 } from '@nestjs/common';
-import { RouterModule } from '@nestjs/core';
+import { ModuleRef, RouterModule } from '@nestjs/core';
 import {
   DASHBOARD_AUTH,
   type DashboardAuthOptions,
@@ -124,24 +124,6 @@ export interface DurableDashboardOptions {
    * (e.g. an `EntityManager` to look up an admin user).
    */
   dashboardAuth?: DashboardAuthOptions;
-  /**
-   * Who registers `@dudousxd/nestjs-filter`'s core — the console's run filters are written with it.
-   *
-   * - `'bootstrap'` (default): this module calls `FilterModule.forRoot()` itself, so the console
-   *   works in an app that has never heard of the filter library.
-   * - `'host'`: your app already calls `FilterModule.forRoot(...)`; this module registers only its
-   *   own filter and adapter.
-   *
-   * It has to be YOUR call rather than something detected, because `forRoot` is a GLOBAL
-   * registration: called twice, the second one's module options (validation policy, input format,
-   * page-size ceiling) shadow the first's, and the app-wide interceptor is registered twice. There
-   * is no moment at module-definition time when this module could see whether you have called it.
-   *
-   * Only the core is shared. The console's adapter never is: `RunFilter` names its own via
-   * `@Filterable({ adapter })`, so your global adapter (your ORM's) keeps answering for your filters
-   * and the run gateway answers for the console's, in the same process.
-   */
-  filterModule?: 'bootstrap' | 'host';
 }
 
 /**
@@ -157,8 +139,6 @@ export interface DurableDashboardAsyncOptions {
   apiBasePath?: string;
   guards?: Type<CanActivate>[];
   imports?: DynamicModule['imports'];
-  /** See {@link DurableDashboardOptions.filterModule}. */
-  filterModule?: 'bootstrap' | 'host';
   /** Providers injected into `useDashboardAuth`, in order. Shared with a `guards` class's own deps. */
   inject?: Array<InjectionToken | OptionalFactoryDependency>;
   /** Build the `dashboardAuth` config from injected deps (or `undefined` to leave the console open). */
@@ -208,8 +188,6 @@ export class DurableApiModule {
      *  (true whenever `dashboardAuth` was set, or unconditionally for `forRootAsync`, where it's
      *  resolved at runtime and is a no-op if it ends up unconfigured). */
     authMayBeConfigured: boolean;
-    /** See {@link DurableDashboardOptions.filterModule}. */
-    filterModule?: 'bootstrap' | 'host';
   }): DynamicModule {
     stampGuards(
       options.guards,
@@ -218,20 +196,32 @@ export class DurableApiModule {
     );
     return {
       module: DurableApiModule,
-      imports: [
-        ...(options.imports ?? []),
-        // `validation: 'off'`: the run filter's inputs are validated by its own translation — every
-        // field/operator pair either maps onto a `RunQuery` predicate or is rejected by name — so
-        // there is nothing left for class-validator to check, and requiring it would put a peer
-        // dependency on every consumer of this dashboard for no gain.
-        ...(options.filterModule === 'host' ? [] : [FilterModule.forRoot({ validation: 'off' })]),
-      ],
+      imports: [...(options.imports ?? [])],
       controllers: [DurableApiController],
       providers: [
         DashboardService,
-        // The adapter is bound to its own token (never to the global `FILTER_ADAPTER`), which is
-        // what lets the console's filter and the host app's own filters run on different backends
-        // in one process — see `RunFilter`'s `@Filterable({ adapter })`.
+        // `@dudousxd/nestjs-filter` is wired PRIVATELY here rather than through
+        // `FilterModule.forRoot()`, which is a global registration. A library calling that would
+        // fight the host app over one set of module options and register a second app-wide
+        // interceptor — and it cannot tell at module-definition time whether the host already
+        // called it. Everything below is scoped to this module, so the console composes with an app
+        // that uses the filter library, and with one that has never heard of it, identically.
+        //
+        // `validation: 'off'`: the run filter's inputs are validated by their own translation —
+        // every field/operator pair either maps onto a `RunQuery` predicate or is rejected by
+        // name — so there is nothing left for class-validator to check, and requiring it would put
+        // a peer dependency on every consumer of this dashboard for no gain.
+        //
+        // The `null` adapter is the GLOBAL one, deliberately absent: `RunFilter` names its own via
+        // `@Filterable({ adapter })`, so the console runs on the durable run gateway while the host
+        // app's filters keep running on whatever adapter it registered.
+        {
+          provide: FilterRunner,
+          useFactory: (moduleRef: ModuleRef) =>
+            new FilterRunner(moduleRef, { validation: 'off' }, null),
+          inject: [ModuleRef],
+        },
+        ApplyFilterInterceptor,
         RunQueryAdapter,
         { provide: RUN_QUERY_ADAPTER, useExisting: RunQueryAdapter },
         RunFilter,
@@ -282,7 +272,6 @@ export class DurableDashboardModule {
       apiBasePath?: string;
       guards?: Type<CanActivate>[];
       imports?: DynamicModule['imports'];
-      filterModule?: 'bootstrap' | 'host';
     },
     authProvider: Provider,
     authMayBeConfigured: boolean,
@@ -304,7 +293,6 @@ export class DurableDashboardModule {
         DurableApiModule.register({
           ...(options.imports ? { imports: options.imports } : {}),
           ...(options.guards ? { guards: options.guards } : {}),
-          ...(options.filterModule ? { filterModule: options.filterModule } : {}),
           authProvider,
           authMayBeConfigured,
         }),

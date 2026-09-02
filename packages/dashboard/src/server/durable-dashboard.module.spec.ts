@@ -122,6 +122,124 @@ describe('guard DI resolution in the API controller host module', () => {
   });
 });
 
+describe('the console composes with a host that has its OWN filter adapter', () => {
+  // The console's run filters are written with `@dudousxd/nestjs-filter`, and so are many host
+  // apps' — against their ORM. Both must work, in one process, with neither shadowing the other:
+  // `FilterModule.forRoot` is GLOBAL, so a library that called it would fight the host over one set
+  // of module options and add a second app-wide interceptor. This module wires its own privately.
+  it('answers from the run gateway while the host keeps its global adapter', async () => {
+    const { Module: ModuleDecorator, Global: GlobalDecorator } = await import('@nestjs/common');
+    const { NestFactory } = await import('@nestjs/core');
+    const { FilterModule, FilterRunner } = await import('@dudousxd/nestjs-filter');
+    const { RUN_GATEWAY } = await import('./tokens.js');
+
+    // A host adapter that would answer WRONGLY for a run query — if the console ever reached for
+    // the global adapter, these calls would be non-empty and the run list would come from an ORM
+    // that has never heard of a workflow run.
+    const hostAdapterCalls: string[] = [];
+    const hostAdapter = {
+      useFactory: () => ({
+        createQueryBuilder: () => {
+          hostAdapterCalls.push('createQueryBuilder');
+          return {};
+        },
+        applyColumnFilters: () => {
+          hostAdapterCalls.push('applyColumnFilters');
+        },
+        groupByCount: async () => {
+          hostAdapterCalls.push('groupByCount');
+          return [];
+        },
+      }),
+      inject: [],
+    };
+
+    const valueFacetCalls: unknown[] = [];
+    @GlobalDecorator()
+    @ModuleDecorator({
+      providers: [
+        {
+          provide: RUN_GATEWAY,
+          useValue: {
+            async runValueFacets(axis: unknown) {
+              valueFacetCalls.push(axis);
+              return [{ value: 'etl', count: 2 }];
+            },
+          },
+        },
+      ],
+      exports: [RUN_GATEWAY],
+    })
+    class HostGatewayModule {}
+
+    @ModuleDecorator({
+      imports: [
+        HostGatewayModule,
+        FilterModule.forRoot({ adapter: hostAdapter }),
+        DurableDashboardModule.forRoot(),
+      ],
+    })
+    class HostRootModule {}
+
+    const app = await NestFactory.createApplicationContext(HostRootModule, {
+      logger: false,
+      abortOnError: false,
+    });
+
+    const controller = app.get(DurableApiController, { strict: false });
+    const values = await controller.values({ groupByCount: { field: 'tag' } });
+
+    // The console's query reached the run gateway through its OWN adapter…
+    expect(values).toEqual([{ value: 'etl', count: 2 }]);
+    expect(valueFacetCalls).toEqual([{ field: 'tag' }]);
+    // …and the host's global adapter was never asked to answer it.
+    expect(hostAdapterCalls).toEqual([]);
+    // The host's own runner is still there, and is not the console's private one.
+    expect(app.get(FilterRunner, { strict: false })).toBeDefined();
+
+    await app.close();
+  });
+
+  it('works just as well in an app that has never heard of the filter library', async () => {
+    // The other half of the same property: the console brings its own runner and interceptor, so a
+    // host that never registers `FilterModule` gets a working run list rather than a boot error.
+    const { Module: ModuleDecorator, Global: GlobalDecorator } = await import('@nestjs/common');
+    const { NestFactory } = await import('@nestjs/core');
+    const { RUN_GATEWAY } = await import('./tokens.js');
+
+    @GlobalDecorator()
+    @ModuleDecorator({
+      providers: [
+        {
+          provide: RUN_GATEWAY,
+          useValue: {
+            async runValueFacets() {
+              return [{ value: 'acme', count: 1 }];
+            },
+          },
+        },
+      ],
+      exports: [RUN_GATEWAY],
+    })
+    class HostGatewayModule {}
+
+    @ModuleDecorator({ imports: [HostGatewayModule, DurableDashboardModule.forRoot()] })
+    class HostRootModule {}
+
+    const app = await NestFactory.createApplicationContext(HostRootModule, {
+      logger: false,
+      abortOnError: false,
+    });
+
+    const controller = app.get(DurableApiController, { strict: false });
+    expect(await controller.values({ groupByCount: { field: 'namespace' } })).toEqual([
+      { value: 'acme', count: 1 },
+    ]);
+
+    await app.close();
+  });
+});
+
 describe('DurableDashboardModule.forRoot dashboardAuth (absent-option)', () => {
   it("stamps NO built-in guard and mounts NO auth controller — byte-for-byte today's behavior", () => {
     const dynamicModule = DurableDashboardModule.forRoot();
