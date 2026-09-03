@@ -153,21 +153,51 @@ describe('<OpenDurableConsoleButton>', () => {
   });
 });
 
-describe('<OpenDurableConsoleButton> across a back/forward-cache restore', () => {
-  async function mintSuccessfully() {
-    const navigate = vi.fn();
-    const view = render(
+describe('<OpenDurableConsoleButton> when the CALLER navigates', () => {
+  // `navigate` is documented as the way to "route through your own router, or to open in a new
+  // tab" — and a new tab leaves this page on screen. Treating success as teardown there left the
+  // button `disabled` with no way back short of a reload: the launcher worked once per page.
+  async function mintWith(navigate: () => void) {
+    render(
       <OpenDurableConsoleButton
         fetch={vi.fn().mockResolvedValue(response())}
         navigate={navigate}
       />,
     );
     const button = screen.getByRole('button') as HTMLButtonElement;
+    await act(async () => {
+      button.click();
+    });
+    return button;
+  }
+
+  it('goes idle again once the mint resolves, so it can be clicked twice', async () => {
+    const navigate = vi.fn();
+    const button = await mintWith(navigate);
+
+    await waitFor(() => expect(button.disabled).toBe(false));
+    expect(button.getAttribute('aria-busy')).toBeNull();
 
     await act(async () => {
       button.click();
     });
-    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/durable'));
+    await waitFor(() => expect(navigate).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe('<OpenDurableConsoleButton> across a back/forward-cache restore', () => {
+  async function mintSuccessfully() {
+    // The DEFAULT navigation — the case where this page really is being replaced, and the one the
+    // anti-flicker guarantee below is about. Stubbed because no test environment navigates.
+    const assign = vi.fn();
+    vi.stubGlobal('location', { ...globalThis.location, assign });
+    const view = render(<OpenDurableConsoleButton fetch={vi.fn().mockResolvedValue(response())} />);
+    const button = screen.getByRole('button') as HTMLButtonElement;
+
+    await act(async () => {
+      button.click();
+    });
+    await waitFor(() => expect(assign).toHaveBeenCalledWith('/durable'));
 
     return { button, view };
   }

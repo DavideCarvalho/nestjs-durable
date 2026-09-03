@@ -16,7 +16,13 @@ import {
 export interface UseOpenConsoleResult {
   /** Start the mint-then-navigate. Never rejects — read `error` instead. */
   open: () => void;
-  /** True from the click until the navigation starts, or until it fails. */
+  /**
+   * True from the click until the navigation starts, or until it fails.
+   *
+   * With the DEFAULT navigation it stays true afterwards, because the page is being replaced and
+   * flipping the button back to idle would flicker "ready to click again" on a document that is
+   * leaving. With a caller-supplied `navigate` it is cleared on success — see {@link open}.
+   */
   isPending: boolean;
   /** The last refusal, or `null`. Cleared when `open()` is called again. */
   error: ConsoleSessionError | null;
@@ -36,14 +42,21 @@ export function useOpenDurableConsole(options: OpenConsoleOptions = {}): UseOpen
   const open = useCallback(() => {
     setIsPending(true);
     setError(null);
+    // Whether success ends this page's life is decided by WHO navigates.
+    //
+    // The default navigation replaces the document, so `isPending` is deliberately left set: the
+    // component is about to be torn down, and flipping the button back to idle first shows a
+    // flicker of "ready to click again" on a page that is leaving.
+    //
+    // A caller-supplied `navigate` carries no such promise — the option's own documentation offers
+    // "open in a new tab" as a use for it, and that keeps this page alive and on screen. Assuming
+    // teardown there left the button `disabled` forever, with only a reload to clear it: the launcher
+    // worked exactly once per page. So when the caller navigates, the flag reports the truth (the
+    // mint finished) rather than a guess about the page.
+    const callerNavigates = optionsRef.current.navigate !== undefined;
     void openDurableConsole(optionsRef.current)
       .then(() => {
-        // Deliberately NOT clearing `isPending` on success: the navigation is already underway and
-        // this component is about to be torn down. Flipping the button back to idle first produces
-        // a visible flicker of "ready to click again" on a page that is leaving.
-        //
-        // The page leaving is not the same as the page dying — see the `pageshow` effect below,
-        // which is what un-sticks this flag when the user comes back.
+        if (callerNavigates) setIsPending(false);
       })
       .catch((cause: unknown) => {
         setError(
@@ -55,8 +68,9 @@ export function useOpenDurableConsole(options: OpenConsoleOptions = {}): UseOpen
       });
   }, []);
 
-  // The counterpart to leaving `isPending` set on success. That choice assumes the launcher page is
-  // discarded once the navigation completes — but with the browser's back/forward cache it is not:
+  // The counterpart to leaving `isPending` set on success under the DEFAULT navigation. That choice
+  // assumes the launcher page is discarded once the navigation completes — but with the browser's
+  // back/forward cache it is not:
   // pressing Back restores this page from memory with React state intact, so the user lands back on
   // a spinner that never stops, on a button `disabled` by that very flag. This is the one signal
   // that says "you are looking at a restored page": browsers fire `pageshow` with
