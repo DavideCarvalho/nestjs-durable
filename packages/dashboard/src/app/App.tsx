@@ -41,6 +41,7 @@ import { OriginFacets } from './OriginFacets';
 import { RunInfoPanel } from './RunInfoPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
+import { ValuePicker } from './ValuePicker';
 import { WorkflowGraph } from './WorkflowGraph';
 import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
 import { shouldLoadMore } from './load-more';
@@ -50,21 +51,9 @@ import { Badge as Chip, badgeVariants } from './ui/badge';
 import { Button } from './ui/button';
 import { cn } from './ui/cn';
 import { Dialog } from './ui/dialog';
-import { MultiSelect, type MultiSelectOption } from './ui/multi-select';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
-
-/**
- * A value picker's options, from what the server counted. The `null` row (a run with NO value on
- * that axis) is dropped: it is a real bucket for counting, but nothing an operator can select as
- * text — the origin facet has its own "unknown" chip for exactly that reason.
- */
-function selectableValues(rows: { value: string | null; count: number }[]): MultiSelectOption[] {
-  return rows
-    .filter((row): row is { value: string; count: number } => row.value !== null)
-    .map((row) => ({ value: row.value, count: row.count }));
-}
 
 /** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
  *  flowing into the next), in currentColor so it inherits the `--accent` token. Replaces the bare `◆`. */
@@ -1721,21 +1710,6 @@ export function App() {
     () => ({ tag: tagFilter, namespace: namespaceFilter, origin: originScope }),
     [tagFilter, namespaceFilter, originScope],
   );
-  const { data: tagValues = [], isError: tagValuesFailed } = useQuery({
-    queryKey: ['run-values', 'tag', tagScope],
-    queryFn: () => durableClient.values('tag', tagScope),
-    staleTime: 10_000,
-  });
-  const { data: namespaceValues = [], isError: namespaceValuesFailed } = useQuery({
-    queryKey: ['run-values', 'namespace', namespaceScope],
-    queryFn: () => durableClient.values('namespace', namespaceScope),
-    staleTime: 10_000,
-  });
-  // A `null` value belongs to an axis with an absent bucket (origin) — neither of these has one, and
-  // a picker cannot offer "no value" as something to type anyway.
-  const tagOptions = useMemo(() => selectableValues(tagValues), [tagValues]);
-  const namespaceOptions = useMemo(() => selectableValues(namespaceValues), [namespaceValues]);
-
   // Worker health, joined into each run row (no-worker) and the banner. Shares the `['workers']` cache
   // with the Workers panel (same queryKey → one fetch); polled a touch faster so "no worker" clears
   // promptly once a worker rejoins.
@@ -1831,25 +1805,25 @@ export function App() {
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,360px)_1fr]">
           <aside className="flex min-h-0 flex-col border-r border-line">
             <div className="border-b border-line p-2">
-              <MultiSelect
+              <ValuePicker
+                field="tag"
+                scope={tagScope}
                 glyph="#"
                 label="filter by tag"
                 placeholder="filter by tag…"
                 value={tagFilter}
                 onChange={setTagFilter}
-                options={tagOptions}
-                failed={tagValuesFailed}
                 title="Tags carried by a run (WorkflowRun.tags). Several match ANY of them."
               />
               <div className="mt-1.5">
-                <MultiSelect
+                <ValuePicker
+                  field="namespace"
+                  scope={namespaceScope}
                   glyph="@"
                   label="filter by tenant"
                   placeholder="filter by tenant / namespace…"
                   value={namespaceFilter}
                   onChange={setNamespaceFilter}
-                  options={namespaceOptions}
-                  failed={namespaceValuesFailed}
                   title="Tenant / worker-pool partition (WorkflowRun.namespace). None selected shows every tenant."
                 />
               </div>

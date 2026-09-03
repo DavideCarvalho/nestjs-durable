@@ -36,8 +36,15 @@ describe('<AttributeFilters>', () => {
 
     fireEvent.click(screen.getByLabelText('filter by search attribute'));
 
-    // Scoped by the rest of the filter, like the other pickers.
-    await waitFor(() => expect(values).toHaveBeenCalledWith('attr', { namespace: ['acme'] }));
+    // Scoped by the rest of the filter, like the other pickers — and asked for as a PAGE, since the
+    // key list is bounded and searched on the server.
+    await waitFor(() =>
+      expect(values).toHaveBeenCalledWith(
+        'attr',
+        { namespace: ['acme'] },
+        expect.objectContaining({ limit: expect.any(Number), offset: 0 }),
+      ),
+    );
   });
 
   it('shows the predicates it currently holds', () => {

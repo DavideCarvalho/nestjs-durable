@@ -255,13 +255,15 @@ export class RunQueryAdapter implements FilterAdapter {
   /**
    * The distinct values of one field over the runs the active predicates select — the console's
    * pickers. `limit` is honoured because it has to be: tag and search-attribute cardinality grows
-   * with the data, so the unbounded answer is a listing rather than an aggregate.
+   * with the data, so the unbounded answer is a listing rather than an aggregate. `offset` and
+   * `search` are what keep that bound from becoming a ceiling — the picker pages as it scrolls and
+   * narrows as the operator types, both against the whole matching set rather than the fetched page.
    */
   async groupByCount(
     qb: unknown,
     field: GroupByCountField,
     entity: Type<unknown>,
-    opts?: { bucket?: number; limit?: number },
+    opts?: { bucket?: number; limit?: number; offset?: number; search?: string },
   ): Promise<Array<{ value: unknown; count: number }>> {
     this.assertDurableRun(entity);
     if (typeof field !== 'string') {
@@ -282,6 +284,8 @@ export class RunQueryAdapter implements FilterAdapter {
     }
     const rows = await this.gateway.runValueFacets(axis, this.draft(qb).facetQuery(), {
       limit: opts?.limit ?? RUN_VALUE_FACET_LIMIT,
+      ...(opts?.offset !== undefined && { offset: opts.offset }),
+      ...(opts?.search !== undefined && { search: opts.search }),
     });
     return rows.map((row) => ({ value: row.value, count: row.count }));
   }

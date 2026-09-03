@@ -69,7 +69,7 @@ function coerce(raw: string): string | number | boolean {
 export function runQueryString(
   predicates: RunPredicates,
   page: { limit?: number | undefined; offset?: number | undefined } = {},
-  groupByCount?: { field: RunValueField; limit?: number },
+  groupByCount?: { field: RunValueField; limit?: number; offset?: number; search?: string },
 ): string {
   const query = filterQuery();
   const narrow = (field: string, value: string | string[] | undefined): void => {

@@ -1,6 +1,7 @@
 import {
   type AttributeFilter,
-  RUN_VALUE_FACET_SCAN,
+  ENGINE_MINTED_TAG_PREFIXES,
+  RUN_VALUE_FACET_LIMIT,
   type RetentionPolicy,
   type RunFacetQuery,
   type RunFacetRow,
@@ -17,8 +18,8 @@ import {
   type WorkflowRun,
   attributePredicateOperands,
   axisIsRunColumn,
+  facetOrigin,
   mergeRunFacetRows,
-  mergeRunValueFacetRows,
   normalizeAttributeRows,
   parseDuration,
 } from '@dudousxd/nestjs-durable-core';
@@ -40,6 +41,9 @@ interface DurableQueryBuilder<T> {
   // it as a string makes the builder qualify it with the root alias (`r.count(*)`), which is not a
   // column and fails on every engine.
   select(fields: string[]): DurableQueryBuilder<T>;
+  /** The SQL this builder would run, with its parameters inlined — used to embed the run filter as a
+   *  subquery so a grouped value query and the listing it belongs to share one set of predicates. */
+  getFormattedQuery(): string;
   addSelect(field: unknown): DurableQueryBuilder<T>;
   groupBy(fields: string[]): DurableQueryBuilder<T>;
   execute<R>(): Promise<R>;
@@ -428,102 +432,149 @@ export class MikroOrmStateStore implements StateStore {
     return mergeRunFacetRows(rows.map((r) => ({ ...r, count: Number(r.count) })));
   }
 
-  /** Distinct values of one filter axis over the same predicates {@link listRuns} pages. A run-table
-   *  column is a `GROUP BY` like {@link runFacets}, exact over the whole matching set; the tag and
-   *  attribute axes live outside the row (json array / side table) and are counted from a bounded
-   *  page of runs instead — see {@link RunValueFacetOptions.scan}. */
+  /**
+   * Distinct values of one filter axis over the same predicates {@link listRuns} pages, with counts —
+   * what a console's value pickers list.
+   *
+   * All three axis families are answered by ONE grouped query against the filtered run set, so the
+   * counts are exact over that whole set (not a sample), the ordering is stable, and a picker can
+   * page and search server-side. That last part is what makes a picker usable on the axis that needs
+   * it most: tag cardinality grows with the data, so the values an operator is looking for are
+   * routinely outside any top slice, and a search that only filtered the fetched page could never
+   * find them.
+   *
+   * The predicates come from {@link runQueryBuilder} as a subquery rather than being rewritten here,
+   * so a picker and the list it filters can never disagree about which runs they are talking about.
+   */
   async runValueFacets(
     axis: RunValueAxis,
     query: RunFacetQuery,
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]> {
-    if (!axisIsRunColumn(axis)) {
-      return this.scannedValueFacets(axis, query, opts);
-    }
     const em = this.fork();
-    const meta = em.getMetadata().get(WorkflowRunEntity);
-    const col = meta.properties[axis.field]?.fieldNames?.[0] ?? axis.field;
-    const rows = await this.runQueryBuilder(em, query, this.runWhere(query))
-      .select([`r.${col}`])
-      .addSelect(raw('count(*) as count'))
-      .groupBy([`r.${col}`])
-      .execute<Record<string, unknown>[]>();
-    return mergeRunValueFacetRows(
-      rows.map((row) => ({
-        value: (row[axis.field] as string | null | undefined) ?? null,
-        count: Number(row.count),
-      })),
-      opts,
+    const quote = this.idQuote(em);
+    const limit = Math.max(0, opts?.limit ?? RUN_VALUE_FACET_LIMIT);
+    const offset = Math.max(0, opts?.offset ?? 0);
+    if (limit === 0) return [];
+
+    const runs = this.runSubquery(em, query, axis);
+    const { source, valueExpr } = this.valueSource(em, axis, runs, quote);
+    const conditions = [this.searchCondition(valueExpr, opts?.search)].filter(
+      (part): part is string => part !== undefined,
     );
+    const where = conditions.length ? ` where ${conditions.join(' and ')}` : '';
+    // Engine-minted per-key tags rank after everything else — see ENGINE_MINTED_TAG_PREFIXES for
+    // what they otherwise do to a picker. Expressed in SQL because the ordering is what makes the
+    // result pageable, so it cannot be re-applied after the page is cut.
+    const engineLast =
+      axis.field === 'tag'
+        ? `case when ${valueExpr} like '${ENGINE_MINTED_TAG_PREFIXES[0]}%' then 1 else 0 end, `
+        : '';
+    const sql =
+      `select ${valueExpr} as value, count(*) as count from ${source}${where} ` +
+      `group by ${valueExpr} ` +
+      `order by ${engineLast}count(*) desc, ${valueExpr} asc ` +
+      `limit ${limit} offset ${offset}`;
+
+    const rows = (await em.getConnection().execute(sql)) as unknown as {
+      value: unknown;
+      count: number | string;
+    }[];
+    return rows.map((row) => ({
+      // Blank and absent are the same thing to an operator on the origin axis — see facetOrigin.
+      value:
+        axis.field === 'origin' ? facetOrigin(row.value as string | null) : this.text(row.value),
+      count: Number(row.count),
+    }));
+  }
+
+  /** The filtered run set as a derived table, carrying only the columns the axis needs. One source
+   *  of truth with `listRuns`: the same builder, the same predicates. */
+  private runSubquery(em: EntityManager, query: RunFacetQuery, axis: RunValueAxis): string {
+    const meta = em.getMetadata().get(WorkflowRunEntity);
+    const idCol = meta.properties.id?.fieldNames?.[0] ?? 'id';
+    const columns =
+      axis.field === 'tag'
+        ? [`r.${idCol}`, `r.${this.tagsColumn(em)}`]
+        : axisIsRunColumn(axis)
+          ? [`r.${meta.properties[axis.field]?.fieldNames?.[0] ?? axis.field}`]
+          : [`r.${idCol}`];
+    return this.runQueryBuilder(em, query, this.runWhere(query))
+      .select(columns)
+      .getFormattedQuery();
+  }
+
+  /** Where the values of an axis come from, and how to name one — a column of the filtered runs, an
+   *  element of their tags array, or a row of the attribute side table. */
+  private valueSource(
+    em: EntityManager,
+    axis: RunValueAxis,
+    runs: string,
+    quote: (id: string) => string,
+  ): { source: string; valueExpr: string } {
+    const meta = em.getMetadata().get(WorkflowRunEntity);
+    if (axisIsRunColumn(axis)) {
+      const col = meta.properties[axis.field]?.fieldNames?.[0] ?? axis.field;
+      return { source: `(${runs}) as ${quote('r')}`, valueExpr: `${quote('r')}.${quote(col)}` };
+    }
+    if (axis.field === 'tag') {
+      return {
+        source: `(${runs}) as ${quote('r')} ${this.jsonArrayJoin(em, `${quote('r')}.${quote(this.tagsColumn(em))}`, quote)}`,
+        valueExpr: `${quote('t')}.${quote('value')}`,
+      };
+    }
+    const cols = this.attributeColumns(em);
+    const idCol = meta.properties.id?.fieldNames?.[0] ?? 'id';
+    const a = quote('a');
+    const join =
+      `${quote(cols.table)} as ${a} join (${runs}) as ${quote('r')} ` +
+      `on ${a}.${quote(cols.runId)} = ${quote('r')}.${quote(idCol)}`;
+    if (axis.field === 'attributeKey') {
+      return { source: join, valueExpr: `${a}.${quote(cols.key)}` };
+    }
+    // One key's values: exactly one typed column is set per row (see normalizeAttributeRows), so
+    // coalesce them into the one string a picker offers.
+    const key = (axis as { field: 'attributeValue'; key: string }).key.replace(/'/g, "''");
+    return {
+      source: `${join} and ${a}.${quote(cols.key)} = '${key}'`,
+      valueExpr: `coalesce(${a}.${quote(cols.strValue)}, cast(${a}.${quote(cols.numValue)} as char))`,
+    };
   }
 
   /**
-   * The axes whose values do not live in a column of the run row: `tag` (inside a JSON array) and the
-   * two search-attribute axes (a side table). Both read the newest `scan` matching runs.
-   *
-   * Neither reads a run's PAYLOAD. The obvious implementation — page `listRuns` and count in
-   * memory — pulls `input`, `output` and `error` for every run in the window, which on a control
-   * plane with real payloads is tens of megabytes fetched to produce a list of a hundred short
-   * strings, every time a picker opens. These project the one column each question needs instead:
-   * the tags column, or the run ids that then drive one grouped read of the side table.
+   * The dialect's way of turning a JSON array column into one row per element — the only portable
+   * thing about it being that all three have one. Without it a tag picker cannot be grouped in the
+   * database at all, and falls back to deduping a bounded page of runs in memory: counts that
+   * describe a sample, and an order that cannot be paged.
    */
-  private async scannedValueFacets(
-    axis: RunValueAxis,
-    query: RunFacetQuery,
-    opts?: RunValueFacetOptions,
-  ): Promise<RunValueFacetRow[]> {
-    const em = this.fork();
-    const scan = opts?.scan ?? RUN_VALUE_FACET_SCAN;
-    const where = this.runWhere(query);
-    const runMeta = em.getMetadata().get(WorkflowRunEntity);
-    const idCol = runMeta.properties.id?.fieldNames?.[0] ?? 'id';
-
-    if (axis.field === 'tag') {
-      const tagsCol = this.tagsColumn(em);
-      const rows = await this.runQueryBuilder(em, query, where)
-        .select([`r.${tagsCol}`])
-        .orderBy({ createdAt: 'desc' })
-        .limit(scan)
-        .execute<Record<string, unknown>[]>();
-      // A JSON column comes back as text on some drivers and as a parsed array on others; both mean
-      // the same list.
-      const values: { value: string; count: number }[] = [];
-      for (const row of rows) {
-        const raw = row.tags ?? row[tagsCol];
-        const tags = typeof raw === 'string' ? (JSON.parse(raw) as unknown) : raw;
-        if (!Array.isArray(tags)) continue;
-        for (const tag of tags) values.push({ value: String(tag), count: 1 });
-      }
-      return mergeRunValueFacetRows(values, opts);
+  private jsonArrayJoin(em: EntityManager, colRef: string, quote: (id: string) => string): string {
+    const platform = String(em.getPlatform().constructor.name).toLowerCase();
+    const t = quote('t');
+    if (platform.includes('postgre')) {
+      return `cross join lateral jsonb_array_elements_text(${colRef}::jsonb) as ${t}(${quote('value')})`;
     }
+    if (platform.includes('mysql') || platform.includes('mariadb')) {
+      // `cast(… as json)` is not decoration: JSON_TABLE refuses anything it is not already given as
+      // JSON ("Incorrect arguments to JSON_TABLE"), and this column is text on a schema created
+      // before the JSON type — the cast makes both shapes work.
+      return `join json_table(cast(${colRef} as json), '$[*]' columns (${quote('value')} varchar(512) path '$')) as ${t}`;
+    }
+    return `join json_each(${colRef}) as ${t}`;
+  }
 
-    // Attribute axes: the ids of the matching runs, then ONE grouped read of the side table for
-    // them. Those rows are (runId, key, value) triples — no payload anywhere.
-    const idRows = await this.runQueryBuilder(em, query, where)
-      .select([`r.${idCol}`])
-      .orderBy({ createdAt: 'desc' })
-      .limit(scan)
-      .execute<Record<string, unknown>[]>();
-    const runIds = idRows.map((row) => String(row.id ?? row[idCol]));
-    if (runIds.length === 0) return [];
+  /** `lower(value) like '%needle%'` — the picker's search box, applied BEFORE the page is cut so a
+   *  match outside the top slice is still reachable. */
+  private searchCondition(valueExpr: string, search?: string): string | undefined {
+    const needle = search?.trim().toLowerCase();
+    if (!needle) return undefined;
+    const escaped = needle.replace(/'/g, "''").replace(/[%_]/g, (c) => `\\${c}`);
+    return `lower(${valueExpr}) like '%${escaped}%'`;
+  }
 
-    const attributes = await em.find(
-      RunAttributeEntity,
-      axis.field === 'attributeValue'
-        ? { runId: { $in: runIds }, key: axis.key }
-        : { runId: { $in: runIds } },
-    );
-    return mergeRunValueFacetRows(
-      attributes.map((row) => ({
-        value:
-          axis.field === 'attributeKey'
-            ? row.key
-            : // Exactly one typed column is set per row — see normalizeAttributeRows.
-              (row.strValue ?? (row.numValue == null ? null : String(row.numValue))),
-        count: 1,
-      })),
-      opts,
-    );
+  /** A grouped value as the string a picker shows. Drivers return a JSON element or a numeric
+   *  attribute as something other than a string; `null` stays null (the absent bucket). */
+  private text(value: unknown): string | null {
+    return value === null || value === undefined ? null : String(value);
   }
 
   /** One attribute predicate as a raw EXISTS subquery on the side-table, correlated to the outer run

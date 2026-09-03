@@ -1,11 +1,10 @@
-import { useQuery } from '@tanstack/react-query';
-import { useMemo, useState } from 'react';
-import { type RunPredicates, durableClient } from '../client/durable-client';
+import { useState } from 'react';
+import type { RunPredicates } from '../client/durable-client';
+import { ValuePicker } from './ValuePicker';
 import { XIcon } from './icons';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
-import { MultiSelect } from './ui/multi-select';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 
 /** The operators a search-attribute predicate can carry, in the words an operator reads them in. */
@@ -62,34 +61,6 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
   const [op, setOp] = useState<Op>('eq');
   const [operands, setOperands] = useState<string[]>([]);
   const [text, setText] = useState('');
-
-  const { data: keys = [], isError: keysFailed } = useQuery({
-    queryKey: ['run-values', 'attr', scope],
-    queryFn: () => durableClient.values('attr', scope),
-    enabled: open,
-    staleTime: 5000,
-  });
-  const { data: values = [], isError: valuesFailed } = useQuery({
-    queryKey: ['run-values', `attr.${key}`, scope],
-    queryFn: () => durableClient.values(`attr.${key}`, scope),
-    enabled: open && key !== '',
-    staleTime: 5000,
-  });
-
-  const keyOptions = useMemo(
-    () =>
-      keys
-        .filter((row) => row.value !== null)
-        .map((row) => ({ value: row.value as string, count: row.count })),
-    [keys],
-  );
-  const valueOptions = useMemo(
-    () =>
-      values
-        .filter((row) => row.value !== null)
-        .map((row) => ({ value: row.value as string, count: row.count })),
-    [values],
-  );
 
   // Range operators compare against ONE operand and are usually numeric, so they take free text;
   // equality and set membership pick from what exists.
@@ -170,16 +141,17 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
                 ))}
               </div>
             )}
-            <MultiSelect
+            <ValuePicker
+              field="attr"
+              scope={scope}
               glyph="⛃"
               label="attribute key"
               placeholder="key…"
-              options={keyOptions}
-              failed={keysFailed}
+              single
               value={key ? [key] : []}
               onChange={(next) => {
-                // Single-select: the last click wins, and changing the key drops operands chosen
-                // for the previous one (they belong to a different value domain).
+                // Changing the key drops operands chosen for the previous one — they belong to a
+                // different value domain.
                 setKey(next.at(-1) ?? '');
                 setOperands([]);
               }}
@@ -197,14 +169,15 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
               ))}
             </select>
             {picksFromList ? (
-              <MultiSelect
+              <ValuePicker
+                field={`attr.${key}`}
+                scope={scope}
                 glyph="="
                 label="attribute value"
                 placeholder={key ? 'value…' : 'pick a key first'}
-                options={key ? valueOptions : []}
-                failed={valuesFailed}
+                {...(op !== 'in' && { single: true })}
                 value={operands}
-                onChange={(next) => setOperands(op === 'in' ? next : next.slice(-1))}
+                onChange={setOperands}
               />
             ) : (
               <div className="flex items-center gap-1.5 rounded-md border border-line px-2 focus-within:border-zinc-600">

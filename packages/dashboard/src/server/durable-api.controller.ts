@@ -74,7 +74,9 @@ export class DurableApiController {
    * so a picker never offers a value whose result set is empty.
    *
    * `limit` matters rather than being a nicety — tag and attribute cardinality grows with the data
-   * (a `singleton:<key>` tag is minted per key), so the unbounded answer is a listing.
+   * (a `singleton:<key>` tag is minted per key), so the unbounded answer is a listing. `offset` and
+   * `search` are what make that bound livable: a picker pages as it scrolls and narrows as the
+   * operator types, both server-side, so a value outside the first page is still reachable.
    */
   @Get('runs/values')
   values(@Query() query: Record<string, unknown>) {

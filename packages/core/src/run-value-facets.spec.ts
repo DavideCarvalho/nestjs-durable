@@ -60,6 +60,37 @@ describe('run value facets', () => {
     ]);
   });
 
+  it('searches before it bounds, so a rare value is reachable', () => {
+    // The search box exists precisely because the list was cut to fit. Filtering the already-cut
+    // page would make the values it was cut from unfindable — searchable only among what survived.
+    expect(
+      mergeRunValueFacetRows(
+        [
+          { value: 'type:mvr', count: 2 },
+          { value: 'etl', count: 900 },
+          { value: 'type:mel', count: 1 },
+        ],
+        { search: 'type:', limit: 1 },
+      ),
+    ).toEqual([{ value: 'type:mvr', count: 2 }]);
+  });
+
+  it('pages a stable order, so page two continues page one', () => {
+    const rows = [
+      { value: 'a', count: 3 },
+      { value: 'b', count: 2 },
+      { value: 'c', count: 1 },
+    ];
+
+    expect(mergeRunValueFacetRows(rows, { limit: 2 })).toEqual([
+      { value: 'a', count: 3 },
+      { value: 'b', count: 2 },
+    ]);
+    expect(mergeRunValueFacetRows(rows, { limit: 2, offset: 2 })).toEqual([
+      { value: 'c', count: 1 },
+    ]);
+  });
+
   it('counts the axes a run carries', () => {
     const runs = [
       run({ tags: ['etl'], searchAttributes: { tier: 'pro' }, namespace: 'acme' }),

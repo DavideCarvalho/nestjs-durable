@@ -678,21 +678,52 @@ export interface RunValueFacetRow {
 }
 
 /**
+ * The order {@link StateStore.runValueFacets} returns rows in, and the reason a caller can page
+ * them: most runs first, ties broken alphabetically, the absent bucket (`null`) last — and tags the
+ * engine mints one of per key after everything else, since they otherwise crowd out every tag a
+ * human wrote (see `ENGINE_MINTED_TAG_PREFIXES`).
+ *
+ * Fixed, not incidental: an unordered listing cannot be paged, because page two would be taken over
+ * a different arrangement of the same rows and would both repeat and skip.
+ */
+export type RunValueFacetOrder = 'engine-tags-last, count desc, value asc, null last';
+
+/**
  * How much of the store {@link StateStore.runValueFacets} may read to answer.
  *
  * `limit` bounds the ROWS RETURNED (highest count first): tag and attribute-value cardinality is
  * unbounded in principle — a run tagged `singleton:<key>` mints a new tag per key — so a picker asks
  * for the top slice rather than the whole domain, and keeps free text for everything else.
  *
- * `scan` bounds the RUNS READ, and applies to the axes whose values are not a column of the run row
- * being counted — `tag` (inside a JSON array column) and the two attribute axes (a side table). Those
- * report counts over the newest `scan` matching runs rather than over all of them: a bounded,
- * deliberately approximate answer, where the alternative is a full scan on every keystroke. The
- * column axes (`workflow`, `status`, `origin`, `namespace`) are exact and ignore `scan`.
+ * `scan` bounds the RUNS READ, for a store that cannot group an axis in the database and has to
+ * count it in memory instead. Those axes report over the newest `scan` matching runs rather than
+ * over all of them — a bounded, deliberately approximate answer, where the alternative is a full
+ * scan on every keystroke.
+ *
+ * Which axes those are is a property of the ADAPTER, not of the axis: the column axes are a `GROUP
+ * BY` everywhere, and an adapter that can expand a JSON array and join its attribute side table (the
+ * MikroORM one does) answers `tag` and the attribute axes exactly too, ignoring `scan` entirely.
  */
 export interface RunValueFacetOptions {
   limit?: number | undefined;
   scan?: number | undefined;
+  /**
+   * How many rows to skip, for a picker that pages as it scrolls. Meaningful only because the
+   * ordering is fixed (see {@link RunValueFacetRow}), so page two continues page one instead of
+   * re-shuffling it.
+   *
+   * On an axis answered from a bounded scan rather than a `GROUP BY` (see {@link scan}), paging is
+   * over that window: values outside it were never candidates on page one either.
+   */
+  offset?: number | undefined;
+  /**
+   * Narrow to values CONTAINING this text, case-insensitively — what a picker's search box sends.
+   *
+   * Server-side on purpose. A picker that filters an already-fetched page can only search what it
+   * happened to receive, so a rare value is unfindable precisely when searching is the only way to
+   * reach it: the top slice it was cut from is the reason the operator is typing.
+   */
+  search?: string | undefined;
 }
 
 /** The transaction handle `StateStore.transaction` hands to its work callback. */

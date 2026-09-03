@@ -503,13 +503,26 @@ export const durableClient = {
    * tenant's tags. `limit` bounds the answer, which matters rather than being a nicety — tag and
    * search-attribute cardinality grows with the data (a `singleton:<key>` tag is minted per key), so
    * the unbounded answer is a listing.
+   *
+   * `offset` walks that bound (the picker loads as it scrolls) and `search` narrows it, both over
+   * the WHOLE matching set. Searching the fetched page instead would make the values the bound cut
+   * unfindable — which is exactly when an operator starts typing.
    */
   values(
     field: RunValueField,
     scope: RunPredicates = {},
-    opts?: { limit?: number },
+    opts?: { limit?: number; offset?: number; search?: string },
   ): Promise<RunValueRow[]> {
-    const qs = runQueryString(scope, {}, { field, ...(opts?.limit && { limit: opts.limit }) });
+    const qs = runQueryString(
+      scope,
+      {},
+      {
+        field,
+        ...(opts?.limit && { limit: opts.limit }),
+        ...(opts?.offset && { offset: opts.offset }),
+        ...(opts?.search?.trim() && { search: opts.search.trim() }),
+      },
+    );
     return http<RunValueRow[]>(`/runs/values?${qs}`);
   },
   run(id: string): Promise<RunDetail> {

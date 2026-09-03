@@ -37,12 +37,12 @@ export function isEngineMintedTag(value: string | null): boolean {
  * Is this axis a plain column on the runs table, and so countable with a `GROUP BY` over the whole
  * matching set?
  *
- * The other three are not, in the same way for the same reason — the value isn't in a column of the
- * row being counted. A run's tags live inside ONE json array column that no `GROUP BY` portable
- * across sqlite/MySQL/Postgres reaches into, and its search attributes live in a side table whose
- * join back to the filtered run set differs per adapter. Those axes are counted in-process over a
- * bounded scan instead ({@link runValueFacetsFromRuns}), so their counts describe that window rather
- * than the whole store — which is why {@link RunValueFacetOptions.scan} exists.
+ * The other three are not: the value isn't in a column of the row being counted. A run's tags live
+ * inside ONE json array column, and its search attributes in a side table. Neither has a form that
+ * is the same across sqlite/MySQL/Postgres — each engine expands a JSON array its own way — so an
+ * adapter either writes that dialect SQL (the MikroORM one does, and answers those axes exactly) or
+ * counts them in-process over a bounded scan ({@link runValueFacetsFromRuns}), where the counts
+ * describe that window rather than the whole store. This function is what the second kind uses.
  */
 export function axisIsRunColumn(
   axis: RunValueAxis,
@@ -79,9 +79,9 @@ function valuesOf(run: WorkflowRun, axis: RunValueAxis): Array<string | null> {
 }
 
 /**
- * Fold, order and bound raw `(value, count)` rows into the answer callers see: highest count first,
- * ties broken alphabetically so a picker's order is stable between polls, the unattributed bucket
- * (`null`) last, and no more than `limit` rows.
+ * Fold, order, search and bound raw `(value, count)` rows into the answer callers see: highest count
+ * first, ties broken alphabetically so a picker's order is stable between polls (and therefore
+ * pageable), the unattributed bucket (`null`) last, and one `limit`-sized page from `offset`.
  *
  * Every store pipes its `GROUP BY` through this — the same role {@link mergeRunFacetRows} plays for
  * status/origin counts — so a picker lists the same values in the same order whichever adapter is
@@ -96,9 +96,14 @@ export function mergeRunValueFacetRows(
     const value = row.value ?? null;
     counts.set(value, (counts.get(value) ?? 0) + Number(row.count));
   }
+  const needle = opts?.search?.trim().toLowerCase();
   const merged = [...counts]
     .map(([value, count]) => ({ value, count }))
     .filter((row) => row.count > 0)
+    // Applied here rather than by the caller so every store searches identically — and before the
+    // bound, so a match outside the top slice is still reachable, which is the whole point of a
+    // search box on a list that was cut to fit.
+    .filter((row) => !needle || row.value?.toLowerCase().includes(needle))
     .sort((a, b) => {
       // Engine-minted per-key tags rank after everything else, however common they are — see
       // ENGINE_MINTED_TAG_PREFIXES for what they otherwise do to a picker.
@@ -110,7 +115,8 @@ export function mergeRunValueFacetRows(
       if (b.value === null) return -1;
       return a.value.localeCompare(b.value);
     });
-  return merged.slice(0, opts?.limit ?? RUN_VALUE_FACET_LIMIT);
+  const offset = opts?.offset ?? 0;
+  return merged.slice(offset, offset + (opts?.limit ?? RUN_VALUE_FACET_LIMIT));
 }
 
 /**

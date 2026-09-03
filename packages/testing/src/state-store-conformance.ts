@@ -714,6 +714,75 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       ).toEqual(['free', 'pro']);
     });
 
+    t('searches values server-side, BEFORE the bound', async () => {
+      // The search box exists because the list was cut to fit. Filtering the already-cut page would
+      // make the values it was cut from unfindable — searchable only among what already survived,
+      // which is exactly backwards on the axes with enough values to need searching.
+      if (!store.runValueFacets) return;
+      await store.createRun(run({ id: 'a', namespace: 'acme-prod' }));
+      await store.createRun(run({ id: 'b', namespace: 'acme-staging' }));
+      await store.createRun(run({ id: 'c', namespace: 'globex' }));
+      await store.createRun(run({ id: 'd', namespace: 'globex' }));
+
+      const matches = await store.runValueFacets({ field: 'namespace' }, {}, { search: 'acme' });
+      expect(matches.map((row) => row.value).sort()).toEqual(['acme-prod', 'acme-staging']);
+
+      // `globex` has the higher count, so it owns the only slot when nothing is searched — and the
+      // searched value would be unreachable if the search ran after that cut.
+      expect(
+        (await store.runValueFacets({ field: 'namespace' }, {}, { limit: 1 })).map((r) => r.value),
+      ).toEqual(['globex']);
+      expect(
+        (
+          await store.runValueFacets({ field: 'namespace' }, {}, { limit: 1, search: 'staging' })
+        ).map((r) => r.value),
+      ).toEqual(['acme-staging']);
+    });
+
+    t('pages values in a stable order, so page two continues page one', async () => {
+      // A picker that loads as it scrolls asks for the next slice of the SAME answer. Without a
+      // fixed order, page two is taken over a different arrangement and both repeats and skips.
+      if (!store.runValueFacets) return;
+      await store.createRun(run({ id: 'a', namespace: 'one' }));
+      await store.createRun(run({ id: 'b', namespace: 'one' }));
+      await store.createRun(run({ id: 'c', namespace: 'one' }));
+      await store.createRun(run({ id: 'd', namespace: 'two' }));
+      await store.createRun(run({ id: 'e', namespace: 'two' }));
+      await store.createRun(run({ id: 'f', namespace: 'three' }));
+
+      const first = await store.runValueFacets({ field: 'namespace' }, {}, { limit: 2 });
+      const second = await store.runValueFacets(
+        { field: 'namespace' },
+        {},
+        { limit: 2, offset: 2 },
+      );
+
+      expect(first).toEqual([
+        { value: 'one', count: 3 },
+        { value: 'two', count: 2 },
+      ]);
+      expect(second).toEqual([{ value: 'three', count: 1 }]);
+      // The two pages together are the whole answer, with nothing repeated between them.
+      expect(new Set([...first, ...second].map((r) => r.value)).size).toBe(3);
+    });
+
+    t('searches and pages the tag axis too, where the values actually pile up', async () => {
+      if (!store.runValueFacets) return;
+      if (!supportsTagFilter) return;
+      await store.createRun(run({ id: 'a', tags: ['type:mvr', 'etl'] }));
+      await store.createRun(run({ id: 'b', tags: ['type:mel', 'etl'] }));
+      await store.createRun(run({ id: 'c', tags: ['etl'] }));
+
+      expect(
+        (await store.runValueFacets({ field: 'tag' }, {}, { search: 'type:' }))
+          .map((r) => r.value)
+          .sort(),
+      ).toEqual(['type:mel', 'type:mvr']);
+      expect(await store.runValueFacets({ field: 'tag' }, {}, { limit: 1 })).toEqual([
+        { value: 'etl', count: 3 },
+      ]);
+    });
+
     t('bounds the values it returns, keeping the most common ones', async () => {
       // Tag and attribute cardinality grows with the data (a `singleton:<key>` tag is minted per
       // key), so the unbounded answer is a listing wearing an aggregate's shape.
