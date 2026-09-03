@@ -14,6 +14,26 @@ export const RUN_VALUE_FACET_LIMIT = 100;
 export const RUN_VALUE_FACET_SCAN = 5000;
 
 /**
+ * Tag prefixes the ENGINE mints one of PER KEY — `singleton:<key>` is stamped on every run of a
+ * singleton workflow so the admission gate can find its siblings.
+ *
+ * A picker ranks these last. They are machine bookkeeping with cardinality that grows with the data,
+ * and on a real deployment they crowd out everything an operator would actually choose: measured on
+ * a 12k-run control plane, 82 of the top 100 tags were `singleton:*`, pushing genuine tags like
+ * `type:mvr` to the edge of the list and past it.
+ *
+ * Ranked, not REMOVED: a singleton tag is still a legitimate thing to filter by (a run row's tag chip
+ * sets exactly that), so it stays offered — just after the tags a human wrote. `version:undeclared`
+ * is engine-minted too but is a single fixed value, so it competes fairly and is not listed here.
+ */
+export const ENGINE_MINTED_TAG_PREFIXES = ['singleton:'] as const;
+
+/** Is this a tag the engine mints one of per key? See {@link ENGINE_MINTED_TAG_PREFIXES}. */
+export function isEngineMintedTag(value: string | null): boolean {
+  return value !== null && ENGINE_MINTED_TAG_PREFIXES.some((prefix) => value.startsWith(prefix));
+}
+
+/**
  * Is this axis a plain column on the runs table, and so countable with a `GROUP BY` over the whole
  * matching set?
  *
@@ -80,6 +100,11 @@ export function mergeRunValueFacetRows(
     .map(([value, count]) => ({ value, count }))
     .filter((row) => row.count > 0)
     .sort((a, b) => {
+      // Engine-minted per-key tags rank after everything else, however common they are — see
+      // ENGINE_MINTED_TAG_PREFIXES for what they otherwise do to a picker.
+      const engineA = isEngineMintedTag(a.value);
+      const engineB = isEngineMintedTag(b.value);
+      if (engineA !== engineB) return engineA ? 1 : -1;
       if (b.count !== a.count) return b.count - a.count;
       if (a.value === null) return 1;
       if (b.value === null) return -1;

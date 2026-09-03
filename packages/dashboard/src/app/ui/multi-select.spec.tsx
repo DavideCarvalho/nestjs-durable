@@ -136,6 +136,24 @@ describe('<MultiSelect>', () => {
     ]);
   });
 
+  it('says the values could not be loaded, instead of looking empty', () => {
+    // A failed request and "this deployment has nothing to offer" are the same empty list to an
+    // operator — the exact silence that let a broken filter wire read as a console with no data.
+    render(
+      <MultiSelect
+        label="filter by tag"
+        placeholder="filter by tag…"
+        value={[]}
+        onChange={() => {}}
+        options={[]}
+        failed
+      />,
+    );
+    open();
+
+    expect(screen.getByText(/couldn't load values/)).toBeTruthy();
+  });
+
   it('clears the whole selection in one action', async () => {
     const onChange = vi.fn();
     render(

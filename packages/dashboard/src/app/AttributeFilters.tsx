@@ -63,13 +63,13 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
   const [operands, setOperands] = useState<string[]>([]);
   const [text, setText] = useState('');
 
-  const { data: keys = [] } = useQuery({
+  const { data: keys = [], isError: keysFailed } = useQuery({
     queryKey: ['run-values', 'attr', scope],
     queryFn: () => durableClient.values('attr', scope),
     enabled: open,
     staleTime: 5000,
   });
-  const { data: values = [] } = useQuery({
+  const { data: values = [], isError: valuesFailed } = useQuery({
     queryKey: ['run-values', `attr.${key}`, scope],
     queryFn: () => durableClient.values(`attr.${key}`, scope),
     enabled: open && key !== '',
@@ -115,22 +115,13 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
   };
 
   return (
-    <div className="mt-1.5 flex flex-wrap items-center gap-1">
-      {value.map((predicate) => (
-        <Badge key={predicate} variant="attr" className="mono gap-1 py-0.5">
-          {label(predicate)}
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-3 w-3 text-indigo-300/70 hover:text-indigo-100"
-            title={`remove ${label(predicate)}`}
-            aria-label={`remove ${label(predicate)}`}
-            onClick={() => onChange(value.filter((p) => p !== predicate))}
-          >
-            <XIcon width={10} height={10} />
-          </Button>
-        </Badge>
-      ))}
+    // The same bordered row the tag and tenant pickers use. It used to be a small dashed "+"
+    // affordance, which read as an empty decoration next to two controls that look like filters —
+    // an operator had no reason to think there was anything behind it.
+    <div className="mt-1.5 flex items-center gap-1.5 rounded-md border border-line px-2 py-1 transition-colors focus-within:border-zinc-600">
+      <span className="shrink-0 text-zinc-600" aria-hidden>
+        ⛃
+      </span>
       <Popover
         open={open}
         onOpenChange={(next) => {
@@ -142,21 +133,49 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
           render={
             <button
               type="button"
-              aria-label="add a search-attribute filter"
+              aria-label="filter by search attribute"
               title="Typed search attributes (WorkflowRun.searchAttributes)"
-              className="mono rounded border border-dashed border-line px-1.5 py-0.5 text-[10px] text-zinc-500 hover:border-zinc-600 hover:text-zinc-300"
+              className="mono flex min-w-0 flex-1 flex-wrap items-center gap-1 py-0.5 text-left text-xs text-zinc-200 focus:outline-none"
             />
           }
         >
-          ⛃ attribute
+          {value.length === 0 ? (
+            <span className="text-zinc-600">filter by attribute…</span>
+          ) : (
+            value.map((predicate) => (
+              <Badge key={predicate} variant="attr" className="mono max-w-[12rem] truncate">
+                {label(predicate)}
+              </Badge>
+            ))
+          )}
         </PopoverTrigger>
         <PopoverContent align="start" className="w-80 p-2">
           <div className="flex flex-col gap-1.5">
+            {value.length > 0 && (
+              <div className="flex flex-wrap gap-1 border-b border-line pb-1.5">
+                {value.map((predicate) => (
+                  <Badge key={predicate} variant="attr" className="mono gap-1 py-0.5">
+                    {label(predicate)}
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-3 w-3 text-indigo-300/70 hover:text-indigo-100"
+                      title={`remove ${label(predicate)}`}
+                      aria-label={`remove ${label(predicate)}`}
+                      onClick={() => onChange(value.filter((p) => p !== predicate))}
+                    >
+                      <XIcon width={10} height={10} />
+                    </Button>
+                  </Badge>
+                ))}
+              </div>
+            )}
             <MultiSelect
               glyph="⛃"
               label="attribute key"
               placeholder="key…"
               options={keyOptions}
+              failed={keysFailed}
               value={key ? [key] : []}
               onChange={(next) => {
                 // Single-select: the last click wins, and changing the key drops operands chosen
@@ -183,6 +202,7 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
                 label="attribute value"
                 placeholder={key ? 'value…' : 'pick a key first'}
                 options={key ? valueOptions : []}
+                failed={valuesFailed}
                 value={operands}
                 onChange={(next) => setOperands(op === 'in' ? next : next.slice(-1))}
               />
@@ -214,6 +234,18 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
           </div>
         </PopoverContent>
       </Popover>
+      {value.length > 0 && (
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => onChange([])}
+          title="clear attribute filters"
+          aria-label="clear attribute filters"
+          className="h-4 w-4"
+        >
+          <XIcon width={12} height={12} />
+        </Button>
+      )}
     </div>
   );
 }

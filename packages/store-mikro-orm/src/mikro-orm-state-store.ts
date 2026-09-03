@@ -21,7 +21,6 @@ import {
   mergeRunValueFacetRows,
   normalizeAttributeRows,
   parseDuration,
-  runValueFacetsFromRuns,
 } from '@dudousxd/nestjs-durable-core';
 import { raw } from '@mikro-orm/core';
 import type { EntityManager, MikroORM } from '@mikro-orm/core';
@@ -439,8 +438,7 @@ export class MikroOrmStateStore implements StateStore {
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]> {
     if (!axisIsRunColumn(axis)) {
-      const runs = await this.listRuns({ ...query, limit: opts?.scan ?? RUN_VALUE_FACET_SCAN });
-      return runValueFacetsFromRuns(runs, axis, opts);
+      return this.scannedValueFacets(axis, query, opts);
     }
     const em = this.fork();
     const meta = em.getMetadata().get(WorkflowRunEntity);
@@ -454,6 +452,75 @@ export class MikroOrmStateStore implements StateStore {
       rows.map((row) => ({
         value: (row[axis.field] as string | null | undefined) ?? null,
         count: Number(row.count),
+      })),
+      opts,
+    );
+  }
+
+  /**
+   * The axes whose values do not live in a column of the run row: `tag` (inside a JSON array) and the
+   * two search-attribute axes (a side table). Both read the newest `scan` matching runs.
+   *
+   * Neither reads a run's PAYLOAD. The obvious implementation — page `listRuns` and count in
+   * memory — pulls `input`, `output` and `error` for every run in the window, which on a control
+   * plane with real payloads is tens of megabytes fetched to produce a list of a hundred short
+   * strings, every time a picker opens. These project the one column each question needs instead:
+   * the tags column, or the run ids that then drive one grouped read of the side table.
+   */
+  private async scannedValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    const em = this.fork();
+    const scan = opts?.scan ?? RUN_VALUE_FACET_SCAN;
+    const where = this.runWhere(query);
+    const runMeta = em.getMetadata().get(WorkflowRunEntity);
+    const idCol = runMeta.properties.id?.fieldNames?.[0] ?? 'id';
+
+    if (axis.field === 'tag') {
+      const tagsCol = this.tagsColumn(em);
+      const rows = await this.runQueryBuilder(em, query, where)
+        .select([`r.${tagsCol}`])
+        .orderBy({ createdAt: 'desc' })
+        .limit(scan)
+        .execute<Record<string, unknown>[]>();
+      // A JSON column comes back as text on some drivers and as a parsed array on others; both mean
+      // the same list.
+      const values: { value: string; count: number }[] = [];
+      for (const row of rows) {
+        const raw = row.tags ?? row[tagsCol];
+        const tags = typeof raw === 'string' ? (JSON.parse(raw) as unknown) : raw;
+        if (!Array.isArray(tags)) continue;
+        for (const tag of tags) values.push({ value: String(tag), count: 1 });
+      }
+      return mergeRunValueFacetRows(values, opts);
+    }
+
+    // Attribute axes: the ids of the matching runs, then ONE grouped read of the side table for
+    // them. Those rows are (runId, key, value) triples — no payload anywhere.
+    const idRows = await this.runQueryBuilder(em, query, where)
+      .select([`r.${idCol}`])
+      .orderBy({ createdAt: 'desc' })
+      .limit(scan)
+      .execute<Record<string, unknown>[]>();
+    const runIds = idRows.map((row) => String(row.id ?? row[idCol]));
+    if (runIds.length === 0) return [];
+
+    const attributes = await em.find(
+      RunAttributeEntity,
+      axis.field === 'attributeValue'
+        ? { runId: { $in: runIds }, key: axis.key }
+        : { runId: { $in: runIds } },
+    );
+    return mergeRunValueFacetRows(
+      attributes.map((row) => ({
+        value:
+          axis.field === 'attributeKey'
+            ? row.key
+            : // Exactly one typed column is set per row — see normalizeAttributeRows.
+              (row.strValue ?? (row.numValue == null ? null : String(row.numValue))),
+        count: 1,
       })),
       opts,
     );

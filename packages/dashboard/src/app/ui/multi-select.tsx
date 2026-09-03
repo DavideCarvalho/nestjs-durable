@@ -23,6 +23,12 @@ export interface MultiSelectProps {
   /** Options are still being fetched — distinguishes "nothing matches" from "nothing yet". */
   loading?: boolean;
   /**
+   * The options could not be fetched. Says so, rather than rendering the empty list that a failed
+   * request would otherwise be indistinguishable from — the same silence that let a broken filter
+   * wire look like a console with nothing to offer.
+   */
+  failed?: boolean;
+  /**
    * Whether a value the list does not offer can be typed in. On by default, and it matters: the
    * offered list is a bounded top-N over a bounded scan, so a rare value can be real and absent.
    * Without this, a picker would be a smaller filter than the text box it replaced.
@@ -50,6 +56,7 @@ export function MultiSelect({
   onChange,
   options,
   loading,
+  failed,
   allowCustom = true,
   title,
 }: MultiSelectProps) {
@@ -150,8 +157,14 @@ export function MultiSelect({
               </button>
             )}
             {shown.length === 0 && !canAddCustom && (
-              <p className="px-2 py-2 text-[11px] text-zinc-600">
-                {loading ? 'loading…' : 'no values here'}
+              <p
+                className={cn('px-2 py-2 text-[11px]', failed ? 'text-rose-300' : 'text-zinc-600')}
+              >
+                {failed
+                  ? "couldn't load values — type one instead"
+                  : loading
+                    ? 'loading…'
+                    : 'no values here'}
               </p>
             )}
             {shown.map((option) => {

@@ -1721,12 +1721,12 @@ export function App() {
     () => ({ tag: tagFilter, namespace: namespaceFilter, origin: originScope }),
     [tagFilter, namespaceFilter, originScope],
   );
-  const { data: tagValues = [] } = useQuery({
+  const { data: tagValues = [], isError: tagValuesFailed } = useQuery({
     queryKey: ['run-values', 'tag', tagScope],
     queryFn: () => durableClient.values('tag', tagScope),
     staleTime: 10_000,
   });
-  const { data: namespaceValues = [] } = useQuery({
+  const { data: namespaceValues = [], isError: namespaceValuesFailed } = useQuery({
     queryKey: ['run-values', 'namespace', namespaceScope],
     queryFn: () => durableClient.values('namespace', namespaceScope),
     staleTime: 10_000,
@@ -1838,6 +1838,7 @@ export function App() {
                 value={tagFilter}
                 onChange={setTagFilter}
                 options={tagOptions}
+                failed={tagValuesFailed}
                 title="Tags carried by a run (WorkflowRun.tags). Several match ANY of them."
               />
               <div className="mt-1.5">
@@ -1848,6 +1849,7 @@ export function App() {
                   value={namespaceFilter}
                   onChange={setNamespaceFilter}
                   options={namespaceOptions}
+                  failed={namespaceValuesFailed}
                   title="Tenant / worker-pool partition (WorkflowRun.namespace). None selected shows every tenant."
                 />
               </div>
