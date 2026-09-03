@@ -110,6 +110,15 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
     if (this.timer) clearInterval(this.timer);
   }
 
+  /**
+   * Prune one round.
+   *
+   * Never rejects, for the same reason {@link TimerPoller.poll} does not: it is awaited inside
+   * `onApplicationBootstrap` (so a rejection propagates into the host's `bootstrap()` and kills the
+   * process) and fired as `void` on the interval (so a rejection is an unhandled one, also fatal).
+   * Pruning history is the least urgent thing this package does — a `pruneTerminalRuns` that fails
+   * on a locked table must cost this sweep and nothing more.
+   */
   private async sweep(): Promise<void> {
     if (this.sweeping) return; // never overlap two sweeps on this instance
     const retention = this.options.retention;
@@ -126,6 +135,8 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
           if (deleted < batchSize) break; // backlog drained for this policy
         }
       }
+    } catch (error) {
+      console.error('[nestjs-durable] retention sweep failed; retrying next interval:', error);
     } finally {
       this.sweeping = false;
     }
