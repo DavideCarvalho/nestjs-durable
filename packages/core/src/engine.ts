@@ -1977,6 +1977,15 @@ export class WorkflowEngine {
   /**
    * Resume each run only if this instance can acquire its recovery lease — so when several
    * replicas recover or poll at once, each run is picked up by exactly one of them.
+   *
+   * A run this instance cannot resume is SKIPPED, not allowed to abort the batch. The canonical
+   * case is skew protection: mid-rolling-deploy a pod leases a run whose workflow it does not have
+   * and `resume` throws by design — but the rest of the batch is runs it can drive perfectly well,
+   * and every caller here is a recovery sweep. Letting the first such run end the loop means one
+   * row stops recovery for the whole deployment, and (since the callers are pollers) sends the
+   * rejection into a lifecycle hook. Skipping leaves the run locked only until its lease expires,
+   * for a pod that does have the workflow — which is exactly what the skew-protection error asks
+   * for. Same posture as `publishEvent`'s per-subscriber isolation.
    */
   private async resumeLeased(
     runs: WorkflowRun[],
@@ -1993,9 +2002,19 @@ export class WorkflowEngine {
         nowMs,
       );
       if (!acquired) continue;
-      // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
-      const settled = onLocked ? await onLocked(run) : undefined;
-      results.push(settled ?? (await this.resume(run.id)));
+      try {
+        // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
+        const settled = onLocked ? await onLocked(run) : undefined;
+        results.push(settled ?? (await this.resume(run.id)));
+      } catch (error) {
+        // Loud, because a skip is not nothing: the run is still there and still not progressing, and
+        // the reason (a version skew, a store that just went away) is the only thing that tells an
+        // operator which of those it is.
+        console.error(
+          `[nestjs-durable] could not resume run ${run.id} (${run.workflow}@${run.workflowVersion}); leaving it for another instance:`,
+          error,
+        );
+      }
     }
     return results;
   }
