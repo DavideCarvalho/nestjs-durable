@@ -31,11 +31,40 @@ from .workflow import is_workflow_task
 _BACKGROUND_TASKS: set = set()
 
 
-def _spawn_retained(coro: Any) -> "asyncio.Task[Any]":
-    task = asyncio.create_task(coro)
+def _spawn_retained(coro: Any, name: Optional[str] = None) -> "asyncio.Task[Any]":
+    task = asyncio.create_task(coro, name=name)
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
+    task.add_done_callback(_report_unexpected_exit)
     return task
+
+
+def _report_unexpected_exit(task: "asyncio.Task[Any]") -> None:
+    """Say so when a retained background loop stops.
+
+    These loops are supposed to run for the life of the worker, so any exit is news. Without
+    this the task is simply dropped from the set and the worker keeps running with one of its
+    loops gone: the heartbeat stops refreshing and the worker reads as unregistered, or the
+    control-channel listener stops and cooperative cancellation is never observed. Both look
+    like a healthy process from the outside, which is the hardest kind of failure to find.
+    Cancellation is the ordinary shutdown path and stays quiet.
+    """
+    if task.cancelled():
+        return
+    label = task.get_name()
+    exc = task.exception()
+    if exc is None:
+        print(
+            f"durable-worker: background loop {label!r} exited on its own; "
+            "it will not restart in this process",
+            flush=True,
+        )
+        return
+    print(
+        f"durable-worker: background loop {label!r} died ({exc!r}); "
+        "it will not restart in this process",
+        flush=True,
+    )
 
 # Stable-ish id for the `from` field of control messages this worker publishes. It only has to
 # DIFFER from the engine instanceIds (so a dashboard engine doesn't treat our progress events as its
@@ -261,11 +290,16 @@ async def _start_heartbeat(
                 )
                 if descriptor_key is not None and descriptor_wire is not None:
                     await client.set(descriptor_key, descriptor_wire, ex=_HEARTBEAT_TTL_SECONDS)
-            except Exception:  # noqa: BLE001 — never let a heartbeat hiccup kill the worker
+            except asyncio.CancelledError:
+                raise  # ordinary shutdown — the loop is supposed to end here
+            except BaseException:  # noqa: BLE001 — never let a heartbeat hiccup kill the worker
+                # Deliberately wider than Exception. This loop refreshing is what makes the
+                # worker readable as registered, so if it dies the worker consumes nothing while
+                # still looking alive. Anything short of cancellation is worth surviving.
                 pass
             await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
 
-    _spawn_retained(beat())
+    _spawn_retained(beat(), name=f"heartbeat:{group}")
 
 
 def _run_heartbeat_channel(prefix: str) -> str:
@@ -699,12 +733,25 @@ async def _subscribe_control(
         return
 
     async def listen() -> None:
-        async for message in pubsub.listen():
-            if message.get("type") != "message":
-                continue
-            try:
-                registry.on_control_message(json.loads(message["data"]))
-            except (ValueError, TypeError):
-                pass  # ignore malformed control messages
+        # `pubsub.listen()` raises when the connection drops, which would end this loop and take
+        # cooperative cancellation with it — silently, since the worker keeps serving. Report it
+        # in the same shape as the subscribe failure above rather than vanishing.
+        try:
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    registry.on_control_message(json.loads(message["data"]))
+                except (ValueError, TypeError):
+                    pass  # ignore malformed control messages
+        except asyncio.CancelledError:
+            raise  # ordinary shutdown
+        except BaseException as exc:  # noqa: BLE001
+            print(
+                f"durable-worker: control-channel listener stopped ({exc!r}); "
+                "cooperative cancellation won't be observed",
+                flush=True,
+            )
+            raise
 
-    _spawn_retained(listen())
+    _spawn_retained(listen(), name=f"control-channel:{prefix}")
