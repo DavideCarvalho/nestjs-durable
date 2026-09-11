@@ -1,7 +1,7 @@
-import {
+import type {
   DurableWorkerRuntime,
-  type RunRedisWorkerOptions,
-  type RunningWorker,
+  RunRedisWorkerOptions,
+  RunningWorker,
 } from '@dudousxd/durable-worker';
 import type { WorkflowCtx, WorkflowTask } from '@dudousxd/nestjs-durable-core';
 import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
@@ -9,7 +9,11 @@ import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { Step, Workflow } from './decorators';
 import { DurableStartClient } from './durable-start-client';
-import { DURABLE_WORKER_RUNNERS, RUN_REDIS_WORKER } from './durable-worker.module';
+import {
+  DURABLE_WORKER_RUNNERS,
+  DURABLE_WORKER_RUNTIME,
+  RUN_REDIS_WORKER,
+} from './durable-worker.module';
 import { DurableModule } from './durable.module';
 import { WorkflowService } from './workflow.service';
 
@@ -103,7 +107,7 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
       .compile();
     await moduleRef.init();
 
-    const runtime = moduleRef.get(DurableWorkerRuntime);
+    const runtime = moduleRef.get<DurableWorkerRuntime>(DURABLE_WORKER_RUNTIME);
     expect(runtime.workflows.handles('checkout')).toBe(true);
     expect(runtime.steps).toBeDefined();
 
@@ -166,7 +170,9 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
 
     // What the decorator declares is what this worker announces (handshake §7.9) — the runner turns
     // it into the descriptor's `registrations`, adding the queue token it subscribed.
-    const [registration] = moduleRef.get(DurableWorkerRuntime).workflowRegistrations();
+    const [registration] = moduleRef
+      .get<DurableWorkerRuntime>(DURABLE_WORKER_RUNTIME)
+      .workflowRegistrations();
     expect(registration?.name).toBe('announced');
     expect(registration?.version).toBe('3');
     expect(registration?.requires).toEqual(['saga']);
@@ -236,13 +242,13 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
     expect(call?.connection).toBe('redis://x');
     expect(call?.prefix).toBe('app');
     expect(call?.instanceId).toBe('w1');
-    expect(call?.runtime).toBe(moduleRef.get(DurableWorkerRuntime));
+    expect(call?.runtime).toBe(moduleRef.get<DurableWorkerRuntime>(DURABLE_WORKER_RUNTIME));
     expect(call?.group).toBeUndefined();
     expect(call?.partition).toBeUndefined();
 
     // Both discovered handlers are registered on the runtime the single call carries — the runner
     // derives its per-name subscriptions from exactly this registry.
-    const runtime = moduleRef.get(DurableWorkerRuntime);
+    const runtime = moduleRef.get<DurableWorkerRuntime>(DURABLE_WORKER_RUNTIME);
     expect(runtime.workflows.handles('checkout')).toBe(true);
     expect(runtime.steps.handles('charge')).toBe(true);
     expect(runtime.registeredNames()).toEqual({ workflows: ['checkout'], steps: ['charge'] });
@@ -285,7 +291,7 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
       .compile();
     await moduleRef.init();
 
-    const runtime = moduleRef.get(DurableWorkerRuntime);
+    const runtime = moduleRef.get<DurableWorkerRuntime>(DURABLE_WORKER_RUNTIME);
     expect(runtime.workflows.handles('w')).toBe(true);
     expect(runner.calls).toHaveLength(1);
     expect(runner.calls[0]?.partition).toBe('p1');

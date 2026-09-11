@@ -1,8 +1,7 @@
-import {
+import type {
   DurableWorkerRuntime,
-  type RunRedisWorkerOptions,
-  type RunningWorker,
-  runRedisWorker as defaultRunRedisWorker,
+  RunRedisWorkerOptions,
+  RunningWorker,
 } from '@dudousxd/durable-worker';
 import {
   DURABLE_OPTIONS_CANONICAL,
@@ -32,6 +31,7 @@ import {
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
 import type { DurableModuleOptions } from './durable.module';
+import { createWorkerRuntime, runRedisWorker as defaultRunRedisWorker } from './worker-sdk';
 
 /**
  * The `runRedisWorker` function the module uses to start each partition's BullMQ consumer.
@@ -39,6 +39,13 @@ import type { DurableModuleOptions } from './durable.module';
  * fake so no real Redis is needed.
  */
 export const RUN_REDIS_WORKER = Symbol('nestjs-durable:run-redis-worker');
+
+/**
+ * The store-less {@link DurableWorkerRuntime} a pure thin worker registers its bodies on — `null` in
+ * every other role. A Symbol rather than the class itself: the class lives in an optional peer, and
+ * using it as a DI token would drag that peer into the package's static import graph.
+ */
+export const DURABLE_WORKER_RUNTIME = Symbol('nestjs-durable:worker-runtime');
 
 /** The list of started {@link RunningWorker} handles (the single handle {@link ThinWorkerBootstrap}
  *  starts), closed on shutdown. */
@@ -66,18 +73,19 @@ function isPureThinWorker(options: DurableModuleOptions): boolean {
 export class ThinWorkflowRegistrar implements OnModuleInit {
   constructor(
     private readonly discovery: DiscoveryService,
-    private readonly runtime: DurableWorkerRuntime,
+    @Inject(DURABLE_WORKER_RUNTIME) private readonly runtime: DurableWorkerRuntime | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
   ) {}
 
   onModuleInit(): void {
-    if (!isPureThinWorker(this.options)) return;
+    const runtime = this.runtime;
+    if (runtime === null || !isPureThinWorker(this.options)) return;
     // The `@Workflow` metadata is also what this worker ANNOUNCES about each body it serves (design
     // §7.9) — version, capability demand, and the declaring package `scanWorkflows` derived. It is
     // passed straight through: the registry states what the decorator states, and an option the
     // decorator left off stays un-stated rather than becoming a default.
     scanWorkflows(this.discovery, (meta, instance, origin) =>
-      this.runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input), {
+      runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input), {
         version: meta.version,
         ...(meta.requires !== undefined ? { requires: meta.requires } : {}),
         ...(origin !== undefined ? { origin } : {}),
@@ -97,14 +105,15 @@ export class ThinStepRegistrar implements OnModuleInit {
   constructor(
     private readonly discovery: DiscoveryService,
     private readonly metadataScanner: MetadataScanner,
-    private readonly runtime: DurableWorkerRuntime,
+    @Inject(DURABLE_WORKER_RUNTIME) private readonly runtime: DurableWorkerRuntime | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
   ) {}
 
   onModuleInit(): void {
-    if (!isPureThinWorker(this.options)) return;
+    const runtime = this.runtime;
+    if (runtime === null || !isPureThinWorker(this.options)) return;
     scanSteps(this.discovery, this.metadataScanner, (meta, handler) =>
-      this.runtime.registerStep(meta.name, handler),
+      runtime.registerStep(meta.name, handler),
     );
   }
 }
@@ -124,7 +133,7 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
   private readonly runners: RunningWorker[] = [];
 
   constructor(
-    private readonly runtime: DurableWorkerRuntime,
+    @Inject(DURABLE_WORKER_RUNTIME) private readonly runtime: DurableWorkerRuntime | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
     @Inject(RUN_REDIS_WORKER) private readonly runRedisWorker: RunRedisWorkerFn,
     @Inject(DURABLE_WORKER_RUNNERS) private readonly runnersSink: RunningWorker[],
@@ -132,12 +141,13 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
 
   async onApplicationBootstrap(): Promise<void> {
     const options = this.options;
-    if (!isPureThinWorker(options) || options.connection === undefined) return;
-    // ONE call: the runner subscribes one queue per name registered on `this.runtime` — populated by
+    const runtime = this.runtime;
+    if (runtime === null || !isPureThinWorker(options) || options.connection === undefined) return;
+    // ONE call: the runner subscribes one queue per name registered on `runtime` — populated by
     // `ThinWorkflowRegistrar`/`ThinStepRegistrar`'s `onModuleInit`, which Nest's lifecycle guarantees
     // run (across the whole app) before any `onApplicationBootstrap` hook.
     const handle = await this.runRedisWorker({
-      runtime: this.runtime,
+      runtime,
       connection: options.connection,
       ...(options.partition !== undefined ? { partition: options.partition } : {}),
       ...(options.prefix !== undefined ? { prefix: options.prefix } : {}),
@@ -164,7 +174,7 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
 export function thinWorkerProviders(): Provider[] {
   return [
     {
-      provide: DurableWorkerRuntime,
+      provide: DURABLE_WORKER_RUNTIME,
       // The runtime's `WorkflowWorker` falls back to its own `group` ctor param as the WORKFLOW's
       // `workflowPartition` for any `ctx.step` call (see `workflow-context.ts`'s `resolveCallGroup`)
       // — that fallback MUST equal this module's own `partition`, or a dispatched step's decision
@@ -172,8 +182,14 @@ export function thinWorkerProviders(): Provider[] {
       // to. Explicit `''` (never
       // `undefined`) so it does NOT fall through to `WorkflowWorker`'s unrelated `'workflows'`
       // default parameter.
+      //
+      // The role gate lives HERE, not just in the consumers: constructing the runtime resolves the
+      // optional `@dudousxd/durable-worker` peer, so an operator that never runs a worker must not
+      // reach this branch at all.
       useFactory: (options: DurableModuleOptions) =>
-        new DurableWorkerRuntime({ workflowGroup: options.partition ?? '' }),
+        isPureThinWorker(options)
+          ? createWorkerRuntime({ workflowGroup: options.partition ?? '' })
+          : null,
       inject: [DURABLE_OPTIONS_CANONICAL],
     },
     { provide: RUN_REDIS_WORKER, useValue: defaultRunRedisWorker },

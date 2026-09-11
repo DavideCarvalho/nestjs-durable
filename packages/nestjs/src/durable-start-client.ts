@@ -1,4 +1,4 @@
-import { type StartRunDeps, startRun } from '@dudousxd/durable-worker';
+import type { StartRunDeps } from '@dudousxd/durable-worker';
 import {
   type RunResult,
   type StartOptions,
@@ -8,6 +8,7 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import type { DurableModuleOptions } from './durable.module';
+import { startRun } from './worker-sdk';
 
 /**
  * The **store-less `engine.start` facade** for a tenant worker. Provided under the `WorkflowEngine`

@@ -1,8 +1,4 @@
-import {
-  DurableWorkerRuntime,
-  type RunningWorker,
-  runRedisWorker as defaultRunRedisWorker,
-} from '@dudousxd/durable-worker';
+import type { DurableWorkerRuntime, RunningWorker } from '@dudousxd/durable-worker';
 import {
   DURABLE_OPTIONS_CANONICAL,
   TRANSPORT_CANONICAL,
@@ -20,6 +16,7 @@ import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
 import type { RunRedisWorkerFn } from './durable-worker.module';
 import type { DurableModuleOptions } from './durable.module';
+import { createWorkerRuntime, runRedisWorker as defaultRunRedisWorker } from './worker-sdk';
 
 /**
  * The **co-located in-app worker** (uniform dispatch): active whenever an app supplies BOTH `store`
@@ -100,34 +97,36 @@ export class InAppWorkerBootstrap
     private readonly discovery: DiscoveryService,
     private readonly metadataScanner: MetadataScanner,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
-    @Inject(IN_APP_WORKER_RUNTIME) private readonly runtime: DurableWorkerRuntime,
+    @Inject(IN_APP_WORKER_RUNTIME) private readonly runtime: DurableWorkerRuntime | null,
     @Inject(IN_APP_RUN_REDIS_WORKER) private readonly runRedisWorker: RunRedisWorkerFn,
     @Inject(IN_APP_WORKER_RUNNERS) private readonly runnersSink: RunningWorker[],
   ) {}
 
   onModuleInit(): void {
-    if (!isCoLocatedWorker(this.options)) return;
+    const runtime = this.runtime;
+    if (runtime === null || !isCoLocatedWorker(this.options)) return;
     // Register the same TS bodies the engine serves group-served, so the consumer can replay them.
     // The metadata rides along as this worker's ANNOUNCEMENT of what it can execute (design §7.9):
     // co-located or not, the process that CONSUMES the queue is the one entitled to announce the
     // workflow, and here that is this runtime — not the engine sharing its process.
     scanWorkflows(this.discovery, (meta, instance, origin) =>
-      this.runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input), {
+      runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input), {
         version: meta.version,
         ...(meta.requires !== undefined ? { requires: meta.requires } : {}),
         ...(origin !== undefined ? { origin } : {}),
       }),
     );
     scanSteps(this.discovery, this.metadataScanner, (meta, handler) =>
-      this.runtime.registerStep(meta.name, handler),
+      runtime.registerStep(meta.name, handler),
     );
   }
 
   async onApplicationBootstrap(): Promise<void> {
     const options = this.options;
-    if (!isCoLocatedWorker(options) || options.connection === undefined) return;
+    const runtime = this.runtime;
+    if (runtime === null || !isCoLocatedWorker(options) || options.connection === undefined) return;
     const handle = await this.runRedisWorker({
-      runtime: this.runtime,
+      runtime,
       connection: options.connection,
       ...(options.partition !== undefined ? { partition: options.partition } : {}),
       ...(options.prefix !== undefined ? { prefix: options.prefix } : {}),
@@ -166,8 +165,14 @@ export function inAppWorkerProviders(): Provider[] {
       // to. Explicit `''` (never
       // `undefined`) so it does NOT fall through to `WorkflowWorker`'s unrelated `'workflows'`
       // default parameter.
+      //
+      // The role gate lives HERE, not just in the consumer: constructing the runtime resolves the
+      // optional `@dudousxd/durable-worker` peer, so an operator that never runs a worker must not
+      // reach this branch at all.
       useFactory: (options: DurableModuleOptions) =>
-        new DurableWorkerRuntime({ workflowGroup: options.partition ?? '' }),
+        isCoLocatedWorker(options)
+          ? createWorkerRuntime({ workflowGroup: options.partition ?? '' })
+          : null,
       inject: [DURABLE_OPTIONS_CANONICAL],
     },
     { provide: IN_APP_RUN_REDIS_WORKER, useValue: defaultRunRedisWorker },

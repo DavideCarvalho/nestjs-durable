@@ -5,6 +5,7 @@
 import { decoratorDualConfig } from '../../scripts/tsup-decorator.mjs';
 
 export default decoratorDualConfig([
+  '@dudousxd/durable-worker',
   '@dudousxd/nestjs-durable-core',
   '@dudousxd/nestjs-context',
   '@nestjs/common',
@@ -14,4 +15,5 @@ export default decoratorDualConfig([
   'class-validator',
   'reflect-metadata',
   'rxjs',
+  'zod',
 ]);
