@@ -41,7 +41,7 @@ jobs:
         # the variable unset that line carries an unresolved reference. Whether npm reads that as
         # absent (OIDC proceeds) or empty (OIDC does not) decides whether this job can publish, and
         # only a real release settles it.
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.4.0
         with:
           # pnpm 11.5 (the pinned packageManager) needs Node >= 22.13; .nvmrc pins it.
           # Trusted publishing needs >= 22.14.0, which that satisfies.
@@ -180,7 +180,7 @@ jobs:
         # the variable unset that line carries an unresolved reference. Whether npm reads that as
         # absent (OIDC proceeds) or empty (OIDC does not) decides whether this job can publish, and
         # only a real release settles it.
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.4.0
         with:
           node-version-file: .nvmrc
           cache: pnpm
