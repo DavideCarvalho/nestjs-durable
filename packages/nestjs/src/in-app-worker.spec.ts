@@ -1,4 +1,4 @@
-import { DurableWorkerRuntime } from '@dudousxd/durable-worker';
+import type { DurableWorkerRuntime } from '@dudousxd/durable-worker';
 import type {
   Heartbeat,
   RemoteTask,

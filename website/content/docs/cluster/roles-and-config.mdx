@@ -100,6 +100,12 @@ running somewhere or pending runs never start, crashed runs never recover, and t
 
 </Tabs>
 
+<Callout>
+Any role that sets `connection` executes bodies through `@dudousxd/durable-worker`, which is an
+**optional** peer — `pnpm add @dudousxd/durable-worker bullmq ioredis` alongside the module. An
+operator that only owns a `store` never loads it and does not need it installed.
+</Callout>
+
 ## What `topology` validates
 
 Each check is named after the axis it protects, and runs at `forRoot`/`forRootAsync` resolution time:
