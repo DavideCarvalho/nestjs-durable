@@ -404,14 +404,14 @@ importers:
         specifier: workspace:^
         version: link:../testing
       '@types/better-sqlite3':
-        specifier: 7.6.11
-        version: 7.6.11
+        specifier: 7.6.13
+        version: 7.6.13
       better-sqlite3:
         specifier: 12.10.0
         version: 12.10.0
       drizzle-orm:
         specifier: 0.44.7
-        version: 0.44.7(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.11)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.19.20))(pg@8.21.0)(prisma@6.19.3(typescript@5.9.3))
+        version: 0.44.7(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.19.20))(pg@8.21.0)(prisma@6.19.3(typescript@5.9.3))
       tsup:
         specifier: 8.3.5
         version: 8.3.5(@swc/core@1.15.41)(jiti@2.7.0)(postcss@8.5.15)(typescript@5.9.3)(yaml@2.9.0)
@@ -3324,8 +3324,8 @@ packages:
   '@types/babel__traverse@7.28.0':
     resolution: {integrity: sha512-8PvcXf70gTDZBgt9ptxJ8elBeBjcLOAcOtoO/mPJjtji1+CdGbHgm77om1GrsPxsiE+uXIpNSK64UYaIwQXd4Q==}
 
-  '@types/better-sqlite3@7.6.11':
-    resolution: {integrity: sha512-i8KcD3PgGtGBLl3+mMYA8PdKkButvPyARxA7IQAd6qeslht13qxb1zzO8dRCtE7U3IoJS782zDBAeoKiM695kg==}
+  '@types/better-sqlite3@7.6.13':
+    resolution: {integrity: sha512-NMv9ASNARoKksWtsq/SHakpYAYnhBrQgGD8zkLYk/jaK8jUGn08CfEdTRgYhMypUQAfzSP8W6gNLe0q19/t4VA==}
 
   '@types/cookiejar@2.1.5':
     resolution: {integrity: sha512-he+DHOWReW0nghN24E1WUqM0efK4kI9oTqDm6XmK8ZPe2djZ90BSNdGnIyCLzCPw7/pogPlGbzI2wHGGmi4O/Q==}
@@ -9530,7 +9530,7 @@ snapshots:
     dependencies:
       '@babel/types': 7.29.7
 
-  '@types/better-sqlite3@7.6.11':
+  '@types/better-sqlite3@7.6.13':
     dependencies:
       '@types/node': 25.9.2
 
@@ -10496,11 +10496,11 @@ snapshots:
 
   dotenv@16.6.1: {}
 
-  drizzle-orm@0.44.7(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.11)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.19.20))(pg@8.21.0)(prisma@6.19.3(typescript@5.9.3)):
+  drizzle-orm@0.44.7(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.19.20))(pg@8.21.0)(prisma@6.19.3(typescript@5.9.3)):
     optionalDependencies:
       '@opentelemetry/api': 1.9.1
       '@prisma/client': 6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3)
-      '@types/better-sqlite3': 7.6.11
+      '@types/better-sqlite3': 7.6.13
       better-sqlite3: 12.10.0
       kysely: 0.29.2
       mysql2: 3.22.4(@types/node@22.19.20)
