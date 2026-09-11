@@ -21,3 +21,34 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm build
       - run: pnpm test
+
+  # clients/python (durable-worker) ships separately to PyPI via the durable-worker-v* tag, and
+  # until now nothing ran its tests — the `build` job above is entirely the pnpm workspace. A
+  # library whose whole job is surviving a broken Redis should not rely on someone remembering
+  # to run pytest locally.
+  python-client:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The version release-python.yml builds the wheel on, and the version the first
+        # consumer (FLIP's flip-flask image) actually runs. `requires-python` says >=3.9, but
+        # the [redis] extra cannot resolve there: bullmq is capped <2.18 for the patched-msgpack
+        # reason in pyproject.toml, and no such bullmq supports 3.9. Testing a floor that cannot
+        # install the transport would just be a red job.
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: clients/python/pyproject.toml
+      # Every extra, not just [redis]: without them ~30 tests fail on missing boto3/asyncpg/
+      # aiomysql, which reads as a broken suite rather than an incomplete install.
+      - name: Install the client with all extras
+        working-directory: clients/python
+        run: pip install -e ".[redis,sqs,postgres,mysql]" pytest
+      - name: Run tests
+        working-directory: clients/python
+        run: pytest tests/ -q
