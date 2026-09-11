@@ -92,12 +92,7 @@ describe.skipIf(!built)('published module graph', () => {
   });
 
   it('no published entry reaches the SPA-only component layer', async () => {
-    const spaOnly = [
-      '@base-ui-components/react',
-      'class-variance-authority',
-      'clsx',
-      'tailwind-merge',
-    ];
+    const spaOnly = ['@base-ui/react', 'class-variance-authority', 'clsx', 'tailwind-merge'];
     for (const entry of ['react/index.js', 'client/durable-client.js', 'server/index.js']) {
       const reachable = await reachablePackages(entry);
       expect(spaOnly.filter((name) => reachable.has(name))).toEqual([]);
