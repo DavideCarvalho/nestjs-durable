@@ -30,10 +30,10 @@ Issues = "https://github.com/DavideCarvalho/nestjs-durable/issues"
 # pip resolve cleanly to the patched msgpack. We only use the stable
 # Queue/Worker/.add API, which is unchanged across 2.17.x. Lift the cap once
 # bullmq relaxes its exact msgpack pin upstream.
-redis = ["bullmq>=2.0,<2.18", "msgpack>=1.2.1"]
-sqs = ["boto3>=1.26"]
-postgres = ["asyncpg>=0.27"]
-mysql = ["aiomysql>=0.2"]
+redis = ["bullmq==2.17.0", "msgpack==1.2.2"]
+sqs = ["boto3==1.43.92"]
+postgres = ["asyncpg==0.31.0"]
+mysql = ["aiomysql==0.3.2"]
 
 [build-system]
 requires = ["hatchling"]
