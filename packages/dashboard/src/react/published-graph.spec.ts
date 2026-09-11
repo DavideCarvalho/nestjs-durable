@@ -93,7 +93,7 @@ describe.skipIf(!built)('published module graph', () => {
 
   it('no published entry reaches the SPA-only component layer', async () => {
     const spaOnly = [
-      '@base-ui-components/react',
+      '@base-ui/react',
       'class-variance-authority',
       'clsx',
       'tailwind-merge',
