@@ -512,8 +512,8 @@ importers:
         specifier: 8.3.5
         version: 8.3.5(@swc/core@1.15.41)(jiti@2.7.0)(postcss@8.5.15)(typescript@5.9.3)(yaml@2.9.0)
       typeorm:
-        specifier: 0.3.30
-        version: 0.3.30(better-sqlite3@12.10.0)(ioredis@5.4.2)(mysql2@3.11.5)(pg@8.13.1)
+        specifier: 0.3.31
+        version: 0.3.31(better-sqlite3@12.10.0)(ioredis@5.4.2)(mysql2@3.11.5)(pg@8.13.1)
       typescript:
         specifier: 5.9.3
         version: 5.9.3
@@ -602,8 +602,8 @@ importers:
         specifier: 8.3.5
         version: 8.3.5(@swc/core@1.15.41)(jiti@2.7.0)(postcss@8.5.15)(typescript@5.9.3)(yaml@2.9.0)
       typeorm:
-        specifier: 0.3.30
-        version: 0.3.30(better-sqlite3@12.10.0)(ioredis@5.4.2)(mysql2@3.11.5)(pg@8.13.1)
+        specifier: 0.3.31
+        version: 0.3.31(better-sqlite3@12.10.0)(ioredis@5.4.2)(mysql2@3.11.5)(pg@8.13.1)
       typescript:
         specifier: 5.9.3
         version: 5.9.3
@@ -6785,8 +6785,8 @@ packages:
   typedarray@0.0.6:
     resolution: {integrity: sha512-/aCDEGatGvZ2BIk+HmLf4ifCJFwvKFNb9/JeZPMulfgFracn9QFcAf5GO8B/mweUjSoblS5In0cWhqpfs/5PQA==}
 
-  typeorm@0.3.30:
-    resolution: {integrity: sha512-8T35PzjefOdqc2ZR9mwLQj0pUGp6lQhMbK2EvVMwJVJWlaoHm0v/Q6dThNOZkFchD+0yMg8gwjKM28ePiLSXSQ==}
+  typeorm@0.3.31:
+    resolution: {integrity: sha512-6u9EFtdLBgHjnPm78NStVeM+I/1MolTzKykDDcydzKUkh6E++YS6XViU/fePJbvDvEGU4Xq34KOM/CLeer9I2A==}
     engines: {node: '>=16.13.0'}
     hasBin: true
     peerDependencies:
@@ -6797,13 +6797,13 @@ packages:
       mongodb: ^5.8.0 || ^6.0.0
       mssql: ^9.1.1 || ^10.0.0 || ^11.0.0 || ^12.0.0
       mysql2: ^2.2.5 || ^3.0.1
-      oracledb: ^6.3.0
+      oracledb: ^6.3.0 || ^7.0.0
       pg: ^8.5.1
       pg-native: ^3.0.0
       pg-query-stream: ^4.0.0
       redis: ^3.1.1 || ^4.0.0 || ^5.0.14
       sql.js: ^1.4.0
-      sqlite3: ^5.0.3
+      sqlite3: ^5.0.3 || ^6.0.0
       ts-node: ^10.7.0
       typeorm-aurora-data-api-driver: ^2.0.0 || ^3.0.0
     peerDependenciesMeta:
@@ -7126,6 +7126,10 @@ packages:
 
   yargs@17.7.2:
     resolution: {integrity: sha512-7dSzzRQ++CKnNI/krKnYRV7JKKPUXMEh61soaHKg9mrWEhzFWhFnxPxGl+69cD1Ou63C13NUPCnmIcrvqCuM6w==}
+    engines: {node: '>=12'}
+
+  yargs@17.7.3:
+    resolution: {integrity: sha512-GZtjxm/J/4TSxuL3FNYjCmLktBTnIw/rVmKSIyKeYAZpmJB2ig9VauCC5xsa82GNKVKDAqpOn3KVzNt0zmrU0g==}
     engines: {node: '>=12'}
 
   yocto-queue@0.1.0:
@@ -13582,7 +13586,7 @@ snapshots:
 
   typedarray@0.0.6: {}
 
-  typeorm@0.3.30(better-sqlite3@12.10.0)(ioredis@5.4.2)(mysql2@3.11.5)(pg@8.13.1):
+  typeorm@0.3.31(better-sqlite3@12.10.0)(ioredis@5.4.2)(mysql2@3.11.5)(pg@8.13.1):
     dependencies:
       '@sqltools/formatter': 1.2.5
       ansis: 4.3.1
@@ -13598,7 +13602,7 @@ snapshots:
       sql-highlight: 6.1.0
       tslib: 2.8.1
       uuid: 11.1.1
-      yargs: 17.7.2
+      yargs: 17.7.3
     optionalDependencies:
       better-sqlite3: 12.10.0
       ioredis: 5.4.2
@@ -13945,6 +13949,16 @@ snapshots:
   yargs-parser@21.1.1: {}
 
   yargs@17.7.2:
+    dependencies:
+      cliui: 8.0.1
+      escalade: 3.2.0
+      get-caller-file: 2.0.5
+      require-directory: 2.1.1
+      string-width: 4.2.3
+      y18n: 5.0.8
+      yargs-parser: 21.1.1
+
+  yargs@17.7.3:
     dependencies:
       cliui: 8.0.1
       escalade: 3.2.0
