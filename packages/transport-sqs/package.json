@@ -34,7 +34,7 @@
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0"
   },
   "devDependencies": {
-    "@aws-sdk/client-sqs": "3.1034.0",
+    "@aws-sdk/client-sqs": "3.1128.0",
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "testcontainers": "10.28.0",
     "typescript": "5.9.3",
