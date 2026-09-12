@@ -9,6 +9,17 @@
     "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/transport-event-emitter"
   },
+  "homepage": "https://davidecarvalho.github.io/aviary/docs/durable",
+  "bugs": {
+    "url": "https://github.com/DavideCarvalho/nestjs-durable/issues"
+  },
+  "keywords": [
+    "nestjs",
+    "durable",
+    "transport",
+    "event",
+    "emitter"
+  ],
   "type": "module",
   "main": "./dist/index.cjs",
   "types": "./dist/index.d.ts",

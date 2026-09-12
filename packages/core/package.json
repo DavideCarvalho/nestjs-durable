@@ -9,6 +9,15 @@
     "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/core"
   },
+  "homepage": "https://davidecarvalho.github.io/aviary/docs/durable",
+  "bugs": {
+    "url": "https://github.com/DavideCarvalho/nestjs-durable/issues"
+  },
+  "keywords": [
+    "nestjs",
+    "durable",
+    "core"
+  ],
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",

@@ -9,6 +9,16 @@
     "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/admission-redis"
   },
+  "homepage": "https://davidecarvalho.github.io/aviary/docs/durable",
+  "bugs": {
+    "url": "https://github.com/DavideCarvalho/nestjs-durable/issues"
+  },
+  "keywords": [
+    "nestjs",
+    "durable",
+    "admission",
+    "redis"
+  ],
   "type": "module",
   "main": "./dist/index.cjs",
   "types": "./dist/index.d.ts",
