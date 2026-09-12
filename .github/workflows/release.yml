@@ -35,13 +35,7 @@ jobs:
         uses: pnpm/action-setup@v6.1.0
 
       - name: Setup Node
-        # Held at v4 while the two publish jobs here authenticate over OIDC. v7 stopped exporting
-        # setup-node's dummy NODE_AUTH_TOKEN, but it still writes
-        # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into .npmrc unconditionally, so with
-        # the variable unset that line carries an unresolved reference. Whether npm reads that as
-        # absent (OIDC proceeds) or empty (OIDC does not) decides whether this job can publish, and
-        # only a real release settles it.
-        uses: actions/setup-node@v4.4.0
+        uses: actions/setup-node@v7.0.0
         with:
           # pnpm 11.5 (the pinned packageManager) needs Node >= 22.13; .nvmrc pins it.
           # Trusted publishing needs >= 22.14.0, which that satisfies.
@@ -174,13 +168,7 @@ jobs:
         uses: pnpm/action-setup@v6.1.0
 
       - name: Setup Node
-        # Held at v4 while the two publish jobs here authenticate over OIDC. v7 stopped exporting
-        # setup-node's dummy NODE_AUTH_TOKEN, but it still writes
-        # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into .npmrc unconditionally, so with
-        # the variable unset that line carries an unresolved reference. Whether npm reads that as
-        # absent (OIDC proceeds) or empty (OIDC does not) decides whether this job can publish, and
-        # only a real release settles it.
-        uses: actions/setup-node@v4.4.0
+        uses: actions/setup-node@v7.0.0
         with:
           node-version-file: .nvmrc
           cache: pnpm
