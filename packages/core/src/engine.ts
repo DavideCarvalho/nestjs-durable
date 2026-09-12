@@ -3078,13 +3078,8 @@ export class WorkflowEngine {
     }
     const wakeAt = await this.applyCommands(run, decision.commands);
     const suspended = await this.settleRun(run, { kind: 'suspended', wakeAt });
-    // A turn is computed from a SNAPSHOT of history, and the ops it declares can all have settled
-    // while its decision was in flight. The canonical case is a remote `gather_calls` fan-out whose
-    // LAST call lands during the decision's lease window: `completeRemoteResult` -> `resume` ->
-    // `execute` finds the lease held and returns silently, so that call's wake is consumed with
-    // nothing to show for it, and this decision then parks the run on a `call` that is already
-    // complete. Nothing would ever wake it again — only the `reconcileMs` orphan sweep, minutes
-    // later. Re-drive instead: the replay is idempotent, and the next turn sees the full history.
+    // This turn may have been computed from a history older than the store's, in which case it just
+    // parked on ops that are already settled — see {@link redriveIfTurnSawStaleHistory}.
     await this.redriveIfTurnSawStaleHistory(run.id, decision.commands);
     return suspended;
   }
