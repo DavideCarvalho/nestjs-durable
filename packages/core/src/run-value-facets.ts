@@ -121,9 +121,10 @@ export function mergeRunValueFacetRows(
 
 /**
  * Count an axis's distinct values across runs already narrowed by the caller's predicates — the
- * in-process path, used by the in-memory store for every axis and by the SQL stores for `tag` (see
- * {@link axisIsGroupable}). `runs` must be ordered newest-first and already bounded to
- * {@link RunValueFacetOptions.scan}, since that window is what the counts then describe.
+ * in-process path, used by the in-memory store for every axis and by a SQL store for the axes it
+ * cannot group in the database (see {@link axisIsRunColumn}). `runs` must be ordered newest-first
+ * and already bounded to {@link RunValueFacetOptions.scan}, since that window is what the counts
+ * then describe.
  */
 export function runValueFacetsFromRuns(
   runs: readonly WorkflowRun[],
