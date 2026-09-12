@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.70.1
+
+### Patch Changes
+
+- 7ae6bbe: Fix the `runValueFacetsFromRuns` docblock: it linked a non-existent `axisIsGroupable` and said the SQL stores use the in-process path only for `tag`.
+
 ## 0.70.0
 
 ### Minor Changes
