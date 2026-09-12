@@ -3077,7 +3077,52 @@ export class WorkflowEngine {
       return { runId: run.id, status: fresh.status, output: fresh.output, error: fresh.error };
     }
     const wakeAt = await this.applyCommands(run, decision.commands);
-    return this.settleRun(run, { kind: 'suspended', wakeAt });
+    const suspended = await this.settleRun(run, { kind: 'suspended', wakeAt });
+    // A turn is computed from a SNAPSHOT of history, and the ops it declares can all have settled
+    // while its decision was in flight. The canonical case is a remote `gather_calls` fan-out whose
+    // LAST call lands during the decision's lease window: `completeRemoteResult` -> `resume` ->
+    // `execute` finds the lease held and returns silently, so that call's wake is consumed with
+    // nothing to show for it, and this decision then parks the run on a `call` that is already
+    // complete. Nothing would ever wake it again — only the `reconcileMs` orphan sweep, minutes
+    // later. Re-drive instead: the replay is idempotent, and the next turn sees the full history.
+    await this.redriveIfTurnSawStaleHistory(run.id, decision.commands);
+    return suspended;
+  }
+
+  /**
+   * Re-drive a run whose turn was computed from a history OLDER than the store's.
+   *
+   * A turn replays against a SNAPSHOT, and an op can settle while its decision is in flight. The
+   * canonical case is a remote `gather_calls` fan-out whose last call lands during the decision's
+   * lease window: `completeRemoteResult` -> `resume` -> `execute` finds the lease held and returns
+   * silently, so that call's wake is spent with nothing to show for it, and the decision then parks
+   * the run on a `call` that is already complete. Nothing would ever wake it again — only the
+   * `reconcileMs` orphan sweep, minutes later.
+   *
+   * The tell is precise: the turn (re)declared a blocking op whose checkpoint is already settled. A
+   * turn with an up-to-date history never does that, because a settled op is in its history and the
+   * replay skips it. That also makes this convergent — the re-driven turn sees the op resolved and
+   * cannot re-declare it, so one lost wake costs exactly one extra turn, never a loop.
+   *
+   * Scheduled off the current stack so it runs after the caller released the run lease.
+   */
+  private async redriveIfTurnSawStaleHistory(
+    runId: string,
+    commands: WorkflowCommand[],
+  ): Promise<void> {
+    const blocking = commands.filter(
+      (cmd) => cmd.kind === 'call' || cmd.kind === 'startChild' || cmd.kind === 'waitSignal',
+    );
+    if (blocking.length === 0) return;
+    for (const cmd of blocking) {
+      const checkpoint = await this.store.getCheckpoint(runId, cmd.seq);
+      if (checkpoint && checkpoint.status !== 'pending') {
+        setTimeout(() => {
+          void this.resume(runId).catch(() => undefined);
+        }, 0).unref?.();
+        return;
+      }
+    }
   }
 
   /** The run's resolved durable ops as replay inputs: completed/failed steps + elapsed timers. */
