@@ -45,11 +45,12 @@ import { PointToPointDecisionTransport } from './testing/point-to-point-decision
 const FAN = 3;
 const GROUP = 'proc';
 
-class SpyStore extends InMemoryStateStore {
-  readonly suspends: number[] = [];
+/** Counts suspends, so the test can prove the stale turn really DID park the run. */
+class SuspendCountingStore extends InMemoryStateStore {
+  suspends = 0;
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
-    if (patch.status === 'suspended') this.suspends.push(Date.now());
+    if (patch.status === 'suspended') this.suspends += 1;
     return super.updateRun(runId, patch);
   }
 }
@@ -69,7 +70,7 @@ async function settle(store: InMemoryStateStore, runId: string, max = 200): Prom
 
 describe('REGRESSION: a remote turn parked on already-settled ops must be re-driven', () => {
   it('a stale gather decision does not orphan the run — it COMPLETES without the reconcile sweep', async () => {
-    const store = new SpyStore();
+    const store = new SuspendCountingStore();
     const transport = new PointToPointDecisionTransport();
     for (let i = 0; i < FAN; i += 1) {
       transport.handle(`leaf_${i}`, async (input: { i: number }) => ({ r: input.i }));
@@ -79,6 +80,7 @@ describe('REGRESSION: a remote turn parked on already-settled ops must be re-dri
     // re-emits the last call, as a turn computed a moment earlier would have. This
     // is the decision the dropped-wake race makes the engine apply.
     let staleServed = false;
+    let suspendsWhenStaleServed = -1;
     transport.serveWorkflow((task: WorkflowTask): WorkflowDecision => {
       const seen = new Set(task.history.map((event) => event.seq));
       const base = { taskId: task.taskId, runId: task.runId } as const;
@@ -86,6 +88,7 @@ describe('REGRESSION: a remote turn parked on already-settled ops must be re-dri
 
       if (missing.length === 0 && !staleServed) {
         staleServed = true;
+        suspendsWhenStaleServed = store.suspends;
         return {
           ...base,
           status: 'continue',
@@ -147,6 +150,10 @@ describe('REGRESSION: a remote turn parked on already-settled ops must be re-dri
     }
 
     expect(staleServed).toBe(true);
+    // The stale decision must actually have PARKED the run: without this the test would
+    // still pass if the engine simply never applied it, which is a different behaviour
+    // from recovering out of the parked state.
+    expect(store.suspends).toBeGreaterThan(suspendsWhenStaleServed);
     // Every call really did settle — the run had no reason to stay parked.
     expect(checkpoints.filter((c) => c.status === 'completed').length).toBe(FAN);
     expect(run.status).toBe('completed');
