@@ -635,8 +635,8 @@ importers:
   packages/transport-sqs:
     devDependencies:
       '@aws-sdk/client-sqs':
-        specifier: 3.1128.0
-        version: 3.1128.0
+        specifier: 3.1129.0
+        version: 3.1129.0
       '@dudousxd/nestjs-durable-core':
         specifier: workspace:^
         version: link:../core
@@ -738,8 +738,8 @@ packages:
     resolution: {integrity: sha512-UrcABB+4bUrFABwbluTIBErXwvbsU/V7TZWfmbgJfbkwiBuziS9gxdODUyuiecfdGQ85jglMW6juS3+z5TsKLw==}
     engines: {node: '>=10'}
 
-  '@aws-sdk/client-sqs@3.1128.0':
-    resolution: {integrity: sha512-KQNQJsw+D291Js/VgcFLl5vhUpB3HeZ49+kKDLcmApARPjbCcJxLspwgikeVt45f+VtYcR4oFgkD/tJeIE/FNg==}
+  '@aws-sdk/client-sqs@3.1129.0':
+    resolution: {integrity: sha512-3thsBulVLZZt8h9vO3F8hjY7/6IfHKzwwXLtM3Rg0SJgmVhevwKMu5cHXjhJUDiZ2wCo1B2hfIXvcf+pmpg4BQ==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/core@3.978.0':
@@ -7037,7 +7037,7 @@ snapshots:
 
   '@alloc/quick-lru@5.2.0': {}
 
-  '@aws-sdk/client-sqs@3.1128.0':
+  '@aws-sdk/client-sqs@3.1129.0':
     dependencies:
       '@aws-sdk/core': 3.978.0
       '@aws-sdk/credential-provider-node': 3.972.83
