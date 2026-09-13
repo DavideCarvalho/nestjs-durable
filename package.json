@@ -33,7 +33,7 @@
     "@changesets/cli": "2.31.1",
     "@dudousxd/nestjs-durable-core": "workspace:*",
     "@dudousxd/nestjs-durable-transport-bullmq": "workspace:*",
-    "@swc/core": "1.15.41",
+    "@swc/core": "1.16.2",
     "@types/node": "22.19.20",
     "reflect-metadata": "0.2.2",
     "turbo": "2.9.17",
