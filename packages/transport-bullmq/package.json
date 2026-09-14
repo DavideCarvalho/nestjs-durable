@@ -39,7 +39,7 @@
     "@dudousxd/durable-worker": "workspace:^",
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@testcontainers/redis": "10.18.0",
-    "bullmq": "5.34.10",
+    "bullmq": "5.81.5",
     "ioredis": "5.4.2",
     "typescript": "5.9.3",
     "zod": "3.25.76",
