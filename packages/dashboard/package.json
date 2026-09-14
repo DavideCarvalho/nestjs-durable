@@ -78,7 +78,7 @@
     "@types/react-dom": "18.3.7",
     "@types/supertest": "6.0.3",
     "@vitejs/plugin-react": "4.3.4",
-    "@xyflow/react": "12.3.6",
+    "@xyflow/react": "12.11.6",
     "autoprefixer": "10.4.20",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
