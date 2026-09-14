@@ -112,8 +112,8 @@ importers:
         specifier: 10.18.0
         version: 10.18.0
       ioredis:
-        specifier: 5.4.2
-        version: 5.4.2
+        specifier: 5.11.1
+        version: 5.11.1
       tsup:
         specifier: 8.3.5
         version: 8.3.5(@swc/core@1.16.2)(jiti@2.7.0)(postcss@8.5.28)(typescript@5.9.3)(yaml@2.9.0)
@@ -516,7 +516,7 @@ importers:
         version: 8.3.5(@swc/core@1.16.2)(jiti@2.7.0)(postcss@8.5.28)(typescript@5.9.3)(yaml@2.9.0)
       typeorm:
         specifier: 0.3.31
-        version: 0.3.31(better-sqlite3@12.10.0)(ioredis@5.4.2)(mysql2@3.11.5)(pg@8.13.1)
+        version: 0.3.31(better-sqlite3@12.10.0)(ioredis@5.11.1)(mysql2@3.11.5)(pg@8.13.1)
       typescript:
         specifier: 5.9.3
         version: 5.9.3
@@ -572,8 +572,8 @@ importers:
         specifier: 5.34.10
         version: 5.34.10
       ioredis:
-        specifier: 5.4.2
-        version: 5.4.2
+        specifier: 5.11.1
+        version: 5.11.1
       tsup:
         specifier: 8.3.5
         version: 8.3.5(@swc/core@1.16.2)(jiti@2.7.0)(postcss@8.5.28)(typescript@5.9.3)(yaml@2.9.0)
@@ -606,7 +606,7 @@ importers:
         version: 8.3.5(@swc/core@1.16.2)(jiti@2.7.0)(postcss@8.5.28)(typescript@5.9.3)(yaml@2.9.0)
       typeorm:
         specifier: 0.3.31
-        version: 0.3.31(better-sqlite3@12.10.0)(ioredis@5.4.2)(mysql2@3.11.5)(pg@8.13.1)
+        version: 0.3.31(better-sqlite3@12.10.0)(ioredis@5.11.1)(mysql2@3.11.5)(pg@8.13.1)
       typescript:
         specifier: 5.9.3
         version: 5.9.3
@@ -662,8 +662,8 @@ importers:
         specifier: 5.34.10
         version: 5.34.10
       ioredis:
-        specifier: 5.4.2
-        version: 5.4.2
+        specifier: 5.11.1
+        version: 5.11.1
       tsup:
         specifier: 8.3.5
         version: 8.3.5(@swc/core@1.16.2)(jiti@2.7.0)(postcss@8.5.28)(typescript@5.9.3)(yaml@2.9.0)
@@ -4891,6 +4891,10 @@ packages:
 
   inline-style-parser@0.2.7:
     resolution: {integrity: sha512-Nb2ctOyNR8DqQoR0OwRG95uNWIC0C1lCgf5Naz5H6Ji72KZ8OcFZLz2P5sNgwlyoJ8Yif11oMuYs5pBQa86csA==}
+
+  ioredis@5.11.1:
+    resolution: {integrity: sha512-ehuGcf94bQXhfagULNXrJdfnWO38v070jxSx/qE87Kjzmu2fU7ro5EFAb+OPituLqgfyuQaym5DlrNydW2sJ9A==}
+    engines: {node: '>=12.22.0'}
 
   ioredis@5.4.2:
     resolution: {integrity: sha512-0SZXGNGZ+WzISQ67QDyZ2x0+wVxjjUndtD8oSeik/4ajifeiRufed8fCb8QW8VMyi4MXcS+UO1k/0NGhvq1PAg==}
@@ -11081,6 +11085,18 @@ snapshots:
 
   inline-style-parser@0.2.7: {}
 
+  ioredis@5.11.1:
+    dependencies:
+      '@ioredis/commands': 1.10.0
+      cluster-key-slot: 1.1.1
+      debug: 4.4.3
+      denque: 2.1.0
+      redis-errors: 1.2.0
+      redis-parser: 3.0.0
+      standard-as-callback: 2.1.0
+    transitivePeerDependencies:
+      - supports-color
+
   ioredis@5.4.2:
     dependencies:
       '@ioredis/commands': 1.10.0
@@ -13268,7 +13284,7 @@ snapshots:
 
   typedarray@0.0.6: {}
 
-  typeorm@0.3.31(better-sqlite3@12.10.0)(ioredis@5.4.2)(mysql2@3.11.5)(pg@8.13.1):
+  typeorm@0.3.31(better-sqlite3@12.10.0)(ioredis@5.11.1)(mysql2@3.11.5)(pg@8.13.1):
     dependencies:
       '@sqltools/formatter': 1.2.5
       ansis: 4.3.1
@@ -13287,7 +13303,7 @@ snapshots:
       yargs: 17.7.3
     optionalDependencies:
       better-sqlite3: 12.10.0
-      ioredis: 5.4.2
+      ioredis: 5.11.1
       mysql2: 3.11.5
       pg: 8.13.1
     transitivePeerDependencies:
