@@ -413,8 +413,8 @@ importers:
         specifier: 12.10.0
         version: 12.10.0
       drizzle-orm:
-        specifier: 0.44.7
-        version: 0.44.7(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(prisma@6.19.3(typescript@5.9.3))
+        specifier: 0.45.2
+        version: 0.45.2(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(prisma@6.19.3(typescript@5.9.3))
       tsup:
         specifier: 8.3.5
         version: 8.3.5(@swc/core@1.16.2)(jiti@2.7.0)(postcss@8.5.28)(typescript@5.9.3)(yaml@2.9.0)
@@ -4152,8 +4152,8 @@ packages:
     resolution: {integrity: sha512-IrPdXQsk2BbzvCBGBOTmmSH5SodmqZNt4ERAZDmW4CT+tL8VtvinqywuANaFu4bOMWki16nqf0e4oC0QIaDr/g==}
     engines: {node: '>=10'}
 
-  drizzle-orm@0.44.7:
-    resolution: {integrity: sha512-quIpnYznjU9lHshEOAYLoZ9s3jweleHlZIAWR/jX9gAWNg/JhQ1wj0KGRf7/Zm+obRrYd9GjPVJg790QY9N5AQ==}
+  drizzle-orm@0.45.2:
+    resolution: {integrity: sha512-kY0BSaTNYWnoDMVoyY8uxmyHjpJW1geOmBMdSSicKo9CIIWkSxMIj2rkeSR51b8KAPB7m+qysjuHme5nKP+E5Q==}
     peerDependencies:
       '@aws-sdk/client-rds-data': '>=3'
       '@cloudflare/workers-types': '>=4'
@@ -10199,7 +10199,7 @@ snapshots:
 
   dotenv@8.6.0: {}
 
-  drizzle-orm@0.44.7(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(prisma@6.19.3(typescript@5.9.3)):
+  drizzle-orm@0.45.2(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(prisma@6.19.3(typescript@5.9.3)):
     optionalDependencies:
       '@opentelemetry/api': 1.9.1
       '@prisma/client': 6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3)
