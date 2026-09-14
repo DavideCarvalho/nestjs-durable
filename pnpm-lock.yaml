@@ -192,8 +192,8 @@ importers:
         specifier: 12.0.1
         version: 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)
       '@tanstack/react-query':
-        specifier: 5.62.7
-        version: 5.62.7(react@18.3.1)
+        specifier: 5.102.8
+        version: 5.102.8(react@18.3.1)
       '@tanstack/react-virtual':
         specifier: 3.14.11
         version: 3.14.11(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
@@ -3108,11 +3108,11 @@ packages:
     engines: {node: '>=20.12.0'}
     hasBin: true
 
-  '@tanstack/query-core@5.62.7':
-    resolution: {integrity: sha512-fgpfmwatsrUal6V+8EC2cxZIQVl9xvL7qYa03gsdsCy985UTUlS4N+/3hCzwR0PclYDqisca2AqR1BVgJGpUDA==}
+  '@tanstack/query-core@5.102.8':
+    resolution: {integrity: sha512-ZNjkJ33CqvPNec/6lZBnHqLc3EVGPZ9ySLhYahU9TcuRFdmwXewuj0c4hwSWcGHqEUwcSrKeZ+oGcvPBqXcQcg==}
 
-  '@tanstack/react-query@5.62.7':
-    resolution: {integrity: sha512-+xCtP4UAFDTlRTYyEjLx0sRtWyr5GIk7TZjZwBu4YaNahi3Rt2oMyRqfpfVrtwsqY2sayP4iXVCwmC+ZqqFmuw==}
+  '@tanstack/react-query@5.102.8':
+    resolution: {integrity: sha512-TYBea4OuXWD7MhaSHq069TWbFe7rcwWN6kzT7JF0OKi1K6c1gTv2IzD6A6ExJsCMozdkqBWeuIUZmu4KQg0O5A==}
     peerDependencies:
       react: ^18 || ^19
 
@@ -9113,11 +9113,11 @@ snapshots:
       std-env: 4.1.0
       yaml: 2.9.0
 
-  '@tanstack/query-core@5.62.7': {}
+  '@tanstack/query-core@5.102.8': {}
 
-  '@tanstack/react-query@5.62.7(react@18.3.1)':
+  '@tanstack/react-query@5.102.8(react@18.3.1)':
     dependencies:
-      '@tanstack/query-core': 5.62.7
+      '@tanstack/query-core': 5.102.8
       react: 18.3.1
 
   '@tanstack/react-virtual@3.14.11(react-dom@18.3.1(react@18.3.1))(react@18.3.1)':
