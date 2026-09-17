@@ -410,10 +410,14 @@ class Worker:
         # process; total parallelism is concurrency × replicas.
         #
         # Beyond a fixed ``int`` this accepts ``'adaptive'`` (the worker self-tunes its limit from a
-        # gradient of observed latency, with a cgroup-aware RAM brake) or a config ``dict``
-        # (``min``/``max``/``start``/``ramCeilingPct``/``cpuCeilingPct``/``tickMs``). It is passed
-        # through verbatim to ``run_redis_worker``, which resolves it; either way the worker publishes
-        # a live status (inFlight / RSS / throughput / p95) on its heartbeat. (Default 1 = fixed.)
+        # gradient of observed latency, with a cgroup-aware RAM brake AND a memory admission gate that
+        # defers a step it cannot fit instead of starting it into an OOM) or a config ``dict``
+        # (``min``/``max``/``start``/``ramCeilingPct``/``cpuCeilingPct``/``tickMs`` plus the admission
+        # knobs — ``ramAdmission``/``ramAdmitPct``/``ramResumePct``/``admissionPollMs``/
+        # ``admissionMaxWaitMs``/``growHeadroomTicks``/``subtractPageCache``/``stepCostTracking``; see
+        # ``adaptive.py`` and the README). It is passed through verbatim to ``run_redis_worker``, which
+        # resolves it; either way the worker publishes a live status (inFlight / memory / throughput /
+        # p95) on its heartbeat. (Default 1 = fixed, never gated.)
         self.concurrency = concurrency
         # Redis URL and queue prefix used by :meth:`start_run` to publish start-run requests onto
         # ``<effectivePrefix>-start-run``. These default to the same values ``run()`` uses, so a

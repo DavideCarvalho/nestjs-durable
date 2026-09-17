@@ -146,6 +146,62 @@ ships results back:
   libraries share the schema. Requires Postgres 9.5+ or MySQL 8+.
 - Bring your own: anything that can deliver a task dict and accept a result dict.
 
+## Concurrency, and not being OOM-killed
+
+`Worker(concurrency=N)` runs N tasks at a time. `concurrency="adaptive"` lets the worker tune that
+number itself from a latency gradient, with a cgroup-aware memory brake — and, since 0.25, a
+**memory admission gate**: before each step starts, the worker asks "is there room for one more
+*right now*?" and **waits** instead of starting a step it cannot fit.
+
+```python
+worker = Worker(concurrency="adaptive")                 # gate on, all defaults
+worker = Worker(concurrency={"min": 1, "max": 16})      # adaptive with bounds
+worker = Worker(concurrency={"ramAdmission": False})    # gate off (pre-0.25 behaviour)
+```
+
+Why it exists: a worker whose handlers each build a few hundred MB (a DuckDB panel, a dataframe, a
+model) can be handed N jobs of the same handler at once. The old brake only *reacted*, on a tick,
+after the memory was already allocated — and it read `ru_maxrss`, the process **peak**, which never
+falls, so it also stayed braked forever. Now:
+
+- **Usage is current, not peak** — cgroup v2 `memory.current`, then cgroup v1
+  `memory.usage_in_bytes`, then `/proc/self/status` `VmRSS`, and only as a last resort `ru_maxrss`.
+  Reclaimable page cache (`memory.stat`'s `inactive_file`) is subtracted, giving the same "working
+  set" kubelet evicts on — a worker that streams GBs through temp files is not braked for cache the
+  kernel would simply drop.
+- **The gate defers, it never rejects.** A waiting step keeps its job (BullMQ renews the lock), so a
+  memory shortage never turns into a failed step. With **nothing in flight the gate always admits**,
+  so a worker can't deadlock waiting for memory only it could free.
+- **The brake is asymmetric.** Crossing `ramCeilingPct` drops the limit to `min` in one move (memory
+  kills the process — you don't walk it down 20% a tick); growing back needs `growHeadroomTicks`
+  consecutive ticks of real headroom.
+- **Costs are learned per step name.** When a step runs alone the worker measures what it cost and
+  reserves that much for the next one of that name, because usage at admission time does not yet
+  include what an admitted step is about to allocate. The **first task of a process runs alone** so
+  there is always one real measurement before anything runs in parallel.
+
+| Knob (camelCase or snake_case) | Default | What it does |
+| --- | --- | --- |
+| `min` / `max` / `start` | `1` / `32` / `min` | Bounds and starting limit. |
+| `ramCeilingPct` | `85` | Brake: at/above this, the limit collapses to `min`. |
+| `ramAdmitPct` | `75` | Gate: above this, new steps wait. Clamped to `ramCeilingPct`. |
+| `ramResumePct` | `65` | Hysteresis: once deferring, usage must fall under this to admit again. |
+| `ramAdmission` | `true` | **Set `false` to turn the gate off entirely** (adaptive mode only knob). |
+| `admissionPollMs` | `250` | How often a waiting step re-checks for headroom. |
+| `admissionMaxWaitMs` | `0` | `0` = wait as long as it takes. A non-zero budget **runs the step anyway** when it expires (failing a step over memory is what this layer exists to avoid), so a tight budget trades the gate away under sustained pressure. |
+| `growHeadroomTicks` | `3` | Consecutive ticks under `ramResumePct` required before growing. |
+| `subtractPageCache` | `true` | Subtract reclaimable `inactive_file` from the cgroup charge. |
+| `stepCostTracking` | `true` | Learn per-step-name costs and reserve them. `false` = usage-only gate. |
+| `cpuCeilingPct` / `tickMs` | off / `2000` | Optional CPU cap; control-loop period. |
+
+A **fixed** `concurrency=N` worker is never gated — N is your explicit promise — but it still
+publishes the same memory numbers on its heartbeat.
+
+Every heartbeat carries `status.rssBytes` / `rssPct` plus a Python-only `status.memory` block:
+which source the numbers came from (`cgroup_v2_working_set`, `proc_vmrss`, …), the gate state
+(`open` / `deferring`), how many steps are waiting, and what it has learned per step name. Telescope
+and the dashboard render the shared fields; the extra block is visible in the raw heartbeat.
+
 ## Tests
 
 ```bash
