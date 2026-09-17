@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
-import type { RemoteTask, WorkflowDecision, WorkflowTask } from './interfaces';
+import type {
+  RemoteTask,
+  StepCheckpoint,
+  WorkflowDecision,
+  WorkflowRun,
+  WorkflowTask,
+} from './interfaces';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { PointToPointDecisionTransport } from './testing/point-to-point-decision-transport';
@@ -89,6 +95,40 @@ function serveGather(transport: LossyTransport, ran: Map<string, number>): void 
   });
 }
 
+/** Counts the durable reads/writes the LOST step's checkpoint costs, so a hot heartbeat loop can be
+ *  held to a bounded number of them instead of one read + one write per beat. The `fail*` switches make
+ *  the store hostile one operation at a time, as a store outage does — each of the three calls the rearm
+ *  can make (the checkpoint READ, the checkpoint WRITE, and the run-row write of the lease
+ *  carry-forward) must be survivable on its own. */
+class CountingStore extends InMemoryStateStore {
+  reads = 0;
+  writes = 0;
+  failCheckpointReads = false;
+  failCheckpointWrites = false;
+  failRunWrites = false;
+
+  override async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
+    if (seq === LOST_SEQ) {
+      this.reads += 1;
+      if (this.failCheckpointReads) throw new Error('checkpoint read is down');
+    }
+    return super.getCheckpoint(runId, seq);
+  }
+
+  override async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
+    if (checkpoint.seq === LOST_SEQ) {
+      this.writes += 1;
+      if (this.failCheckpointWrites) throw new Error('checkpoint write is down');
+    }
+    return super.saveCheckpoint(checkpoint);
+  }
+
+  override async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+    if (this.failRunWrites) throw new Error('run write is down');
+    return super.updateRun(runId, patch);
+  }
+}
+
 interface Harness {
   engine: WorkflowEngine;
   store: InMemoryStateStore;
@@ -102,9 +142,9 @@ interface Harness {
 
 function harness(
   opts: { remoteRedispatchMs?: number; remoteRedispatchMax?: number } = {},
+  store: InMemoryStateStore = new InMemoryStateStore(),
 ): Harness {
   let now = 1_000_000;
-  const store = new InMemoryStateStore();
   const transport = new LossyTransport();
   const ran = new Map<string, number>();
   serveGather(transport, ran);
@@ -314,5 +354,109 @@ describe('REGRESSION: a gather_calls step whose worker was OOM-killed is re-driv
     await h.tick();
     await drain();
     expect(h.transport.attemptsFor(`leaf_${LOST_SEQ}`)).toBe(2);
+  });
+
+  it('renews on a bounded number of writes, not one per beat (a hot beat loop is not an UPDATE storm)', async () => {
+    // A worker beats every couple of seconds while it holds a step, and a `gather_calls` fan-out
+    // multiplies that by its in-flight steps. Defending the lease must therefore not cost a durable
+    // read-modify-write per beat. The throttle is the LEASE itself: a renewal buys at most one window,
+    // so it is only worth a write once the window is HALF spent — which bounds the cost at one read +
+    // one write per half-window per in-flight step, whatever the beat cadence, while still leaving
+    // half a window of headroom before the lease could lapse.
+    const store = new CountingStore();
+    const h = harness({ remoteRedispatchMs: 60_000 }, store);
+    h.transport.loseFirstDispatchOf.add(`leaf_${LOST_SEQ}`); // no result — but the worker is alive
+
+    await h.engine.start(GROUP, {}, 'run1');
+    await drain();
+    const dispatched = (await h.store.listCheckpoints('run1')).find((c) => c.seq === LOST_SEQ);
+    if (!dispatched?.stepId) throw new Error('expected a dispatched checkpoint');
+    expect(dispatched.wakeAt).toBe(h.now() + 60_000);
+
+    // 120 beats across one full window — a worker beating twice a second.
+    store.reads = 0;
+    store.writes = 0;
+    for (let i = 0; i < 120; i += 1) {
+      h.advance(500);
+      await h.transport.emitHeartbeat({
+        runId: 'run1',
+        seq: LOST_SEQ,
+        stepId: dispatched.stepId,
+        group: `leaf_${LOST_SEQ}`,
+      });
+    }
+
+    // Two half-windows elapsed, so a handful of durable operations — NOT 120 of each. (Observed: 2
+    // writes and 3 reads — the cold-map look plus one per renewal. Asserted as a BOUND, not pinned, so
+    // a later refactor of the mark is free to cost one more without a spurious failure.)
+    expect(store.writes).toBeGreaterThanOrEqual(1); // it really did renew
+    expect(store.writes).toBeLessThanOrEqual(4);
+    expect(store.reads).toBeLessThanOrEqual(4);
+
+    // And the lease is genuinely ahead of the clock with headroom — renewed early, never late.
+    const renewed = (await h.store.listCheckpoints('run1')).find((c) => c.seq === LOST_SEQ);
+    expect(renewed?.wakeAt).toBeGreaterThan(h.now() + 30_000);
+    // Still not re-driven: the beats kept the step alive the whole time.
+    await h.tick();
+    expect(h.transport.attemptsFor(`leaf_${LOST_SEQ}`)).toBe(1);
+  });
+
+  it('a store that throws never rejects out of the rearm, and the next beat still renews', async () => {
+    // The rearm runs inside the transport's beat handler, which delivers beats SERIALLY and does not
+    // catch — on `bullmq` the subscriber does `void handler(...)`, so a rejection here is an unhandled
+    // rejection that can take the pod down. Every store call it makes is therefore swallowed, WRITES
+    // included. Safe because the throttle's own headroom argument applies: a skipped renewal still
+    // leaves half a window, and the half-spent mark is only advanced after the lease write commits, so
+    // the next beat simply retries.
+    const store = new CountingStore();
+    const h = harness({ remoteRedispatchMs: 60_000 }, store);
+    h.transport.loseFirstDispatchOf.add(`leaf_${LOST_SEQ}`); // no result — but the worker is alive
+
+    await h.engine.start(GROUP, {}, 'run1');
+    await drain();
+    const dispatched = (await h.store.listCheckpoints('run1')).find((c) => c.seq === LOST_SEQ);
+    if (!dispatched?.stepId) throw new Error('expected a dispatched checkpoint');
+    const leaseAtDispatch = dispatched.wakeAt;
+    const leaseOf = async () =>
+      (await h.store.listCheckpoints('run1')).find((c) => c.seq === LOST_SEQ)?.wakeAt;
+
+    const beat = async () =>
+      h.transport.emitHeartbeat({
+        runId: 'run1',
+        seq: LOST_SEQ,
+        stepId: dispatched.stepId,
+        group: `leaf_${LOST_SEQ}`,
+      });
+
+    // Half the window is spent, so each beat below WOULD renew.
+    h.advance(31_000);
+
+    // 1. The checkpoint WRITE throws (the case a read-only guard missed): resolves, nothing committed.
+    store.failCheckpointWrites = true;
+    await expect(beat()).resolves.toBeUndefined();
+    await expect(beat()).resolves.toBeUndefined();
+    expect(await leaseOf()).toBe(leaseAtDispatch);
+
+    // 2. The checkpoint READ throws: resolves, still nothing committed.
+    store.failCheckpointWrites = false;
+    store.failCheckpointReads = true;
+    await expect(beat()).resolves.toBeUndefined();
+    expect(await leaseOf()).toBe(leaseAtDispatch);
+
+    // 3. The RUN-row write of the carry-forward throws, after the lease write has already committed:
+    // resolves, and the lease itself — the thing that actually stops the re-drive — is renewed.
+    store.failCheckpointReads = false;
+    store.failRunWrites = true;
+    await expect(beat()).resolves.toBeUndefined();
+    expect(await leaseOf()).toBe(h.now() + 60_000);
+
+    // The store comes back. The mark was advanced by that committed write, so re-park the clock at the
+    // next half-spent point and the following beat renews again — no state was corrupted by the outage.
+    store.failRunWrites = false;
+    h.advance(31_000);
+    await beat();
+    expect(await leaseOf()).toBe(h.now() + 60_000);
+    // And the step was never re-driven on account of any of it.
+    expect(h.transport.attemptsFor(`leaf_${LOST_SEQ}`)).toBe(1);
   });
 });

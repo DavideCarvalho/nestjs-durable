@@ -614,8 +614,9 @@ dispatched Nm ago (possibly lost)". From there:
   do get stuck on `pending`.
 - **Opt-in self-heal — `remoteRedispatchMs`** (any transport, any consumer). Set this engine option and
   a dispatched remote step carries a **lease** on its `pending` checkpoint: a result — or a step-scoped
-  heartbeat, which renews the lease — must land before it lapses, and a lapsed lease re-dispatches the
-  step automatically, bounded by `remoteRedispatchMax` (default 10) so a step that never settles fails
+  heartbeat, which renews the lease (throttled to one write per half-window, not one per beat) — must
+  land before it lapses, and a lapsed lease re-dispatches the step automatically, bounded by
+  `remoteRedispatchMax` (default 10) so a step that never settles fails
   as a `remote_step_lost` error instead of looping forever. Covers a polyglot workflow's
   `ctx.gather_calls` fan-out as well as an in-process `ctx.step` (core 0.71+):
 
