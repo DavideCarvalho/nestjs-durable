@@ -184,9 +184,10 @@ forever unless something re-dispatches it:
 - `remoteRedispatchMs` — an **opt-in** engine option — makes this self-healing: a dispatched remote
   step carries a **lease** on its `pending` checkpoint (`wakeAt`), and the run suspends on it (never
   later than the `reconcileMs` sweep would have woken it anyway). A result — or a step-scoped
-  heartbeat, which **renews** the lease — must land before it lapses; a lapsed lease re-dispatches the
-  same `stepId`, bounded by `remoteRedispatchMax` (default 10) before failing the step as
-  `remote_step_lost` (which reaches the workflow's own error path). Off by default, because
+  heartbeat, which **renews** the lease (throttled to one write per half-window, so a worker beating
+  every couple of seconds is not an `UPDATE` storm) — must land before it lapses; a lapsed lease
+  re-dispatches the same `stepId`, bounded by `remoteRedispatchMax` (default 10) before failing the
+  step as `remote_step_lost` (which reaches the workflow's own error path). Off by default, because
   re-dispatch can double-run a step whose job is merely slow **and does not beat**: the window must
   exceed the longest legitimate duration of a non-heartbeating step, and the step must be idempotent.
 

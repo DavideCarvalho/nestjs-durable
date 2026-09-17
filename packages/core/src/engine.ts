@@ -3237,6 +3237,10 @@ export class WorkflowEngine {
     return reconcile == null ? lease : Math.min(lease, this.clock() + reconcile);
   }
 
+  /** Earliest clock time a step's lease is worth LOOKING at again (`stepId` → clock ms) — the read
+   *  throttle for {@link rearmStepLease}, the step-scoped sibling of {@link decisionDeadlineRearms}. */
+  private readonly stepLeaseRearms = new Map<string, number>();
+
   /**
    * A step-scoped heartbeat for a durably-suspended remote step: push its LEASE forward so a worker
    * that is still working on it is never presumed dead and double-dispatched. The durable counterpart
@@ -3244,15 +3248,51 @@ export class WorkflowEngine {
    * instance that dispatched a `timeoutMs` step), and the step-scoped sibling of
    * {@link rearmDecisionDeadline}. No-op unless the lost-dispatch self-heal is on — without
    * `remoteRedispatchMs` nothing ever re-dispatches, so there is no lease to defend.
+   *
+   * THROTTLED BY THE LEASE ITSELF, not a fixed interval: a renewal buys at most ONE window, so it is
+   * only WORTH a write once the window is half spent. Beats arrive every couple of seconds from a hot
+   * worker loop — and a `gather_calls` fan-out multiplies that by its in-flight steps — so an
+   * unthrottled rearm is a per-beat SELECT + UPDATE storm (plus a `getRun` + `updateRun` whenever the
+   * run is parked exactly on this step's lease). The `cp.wakeAt >= renewed` guard it replaces never
+   * short-circuited anything, because `renewed` advances with the clock. So:
+   *  - a beat that finds more than half the window still on the clock writes nothing, and records the
+   *    half-spent mark so subsequent beats skip even the `getCheckpoint` READ until then;
+   *  - a beat at or past the mark renews, leaving a full half-window of headroom — the lease can never
+   *    lapse under a worker whose beats are anywhere near their normal cadence.
+   *
+   * That bounds the cost at ONE read + ONE write per half `remoteRedispatchMs` per in-flight step,
+   * independent of beat frequency (with a 30-minute window: two writes an hour). The in-memory mark is
+   * a pure optimisation — cold on a fresh instance, or on the one that didn't dispatch the step — and
+   * the durable half-spent check below re-derives the same answer from the checkpoint, so nothing
+   * depends on it surviving. Cleared wholesale past 1024 entries: a rare extra read, never a leak.
    */
   private async rearmStepLease(runId: string, seq: number): Promise<void> {
     if (this.remoteRedispatchMs == null) return;
-    const cp = await this.store.getCheckpoint(runId, seq);
-    if (!cp || cp.kind !== 'remote' || cp.status !== 'pending') return;
-    const renewed = this.clock() + this.remoteRedispatchMs;
-    if (cp.wakeAt != null && cp.wakeAt >= renewed) return;
+    const id = stepId(runId, seq);
+    const now = this.clock();
+    const lookAgainAt = this.stepLeaseRearms.get(id);
+    if (lookAgainAt !== undefined && now < lookAgainAt) return;
+    // Swallow a read failure: this runs inside the transport's beat handler, which delivers beats
+    // serially and does not catch — a throwing rearm would take the whole beat loop down (and on
+    // `bullmq`, where the subscriber does `void handler(...)`, surface as an unhandled rejection).
+    // A lost beat is harmless: the lease still has at least half its window left.
+    const cp = await this.store.getCheckpoint(runId, seq).catch(() => null);
+    if (!cp || cp.kind !== 'remote' || cp.status !== 'pending') {
+      // Settled (or gone): stop tracking it, so a long-lived worker's stale beats don't keep the entry.
+      this.stepLeaseRearms.delete(id);
+      return;
+    }
+    const halfWindow = Math.ceil(this.remoteRedispatchMs / 2);
+    // More than half the window left: nothing to buy, and nothing to look at until it is half spent.
+    if (cp.wakeAt != null && cp.wakeAt > now + halfWindow) {
+      this.stepLeaseRearms.set(id, cp.wakeAt - halfWindow);
+      return;
+    }
+    const renewed = now + this.remoteRedispatchMs;
     const previous = cp.wakeAt;
     await this.store.saveCheckpoint({ ...cp, wakeAt: renewed });
+    if (this.stepLeaseRearms.size > 1024) this.stepLeaseRearms.clear();
+    this.stepLeaseRearms.set(id, renewed - halfWindow);
     // If the run is parked EXACTLY on this step's old lease, carry its wake forward too — otherwise a
     // beating worker costs one wasted turn per renewal window. Only on an exact match: any other
     // `wakeAt` belongs to some other timer (a sleep, a sibling's shorter lease) and moving it would
@@ -4476,17 +4516,47 @@ export class WorkflowEngine {
     }
   }
 
+  /** Earliest clock time a suspended turn's deadline is worth LOOKING at again (`runId` → clock ms) —
+   *  the read throttle for {@link rearmDecisionDeadline}, the run-scoped sibling of
+   *  {@link stepLeaseRearms}. */
+  private readonly decisionDeadlineRearms = new Map<string, number>();
+
   /**
    * A run-scoped heartbeat for a run suspended awaiting a workflow-turn decision (the dispatch path):
    * push its durable re-drive deadline (`wakeAt`) forward so a still-working worker's turn is not
    * re-dispatched. The durable counterpart of an inline turn's in-memory `heartbeatResets` rearm.
+   *
+   * THROTTLED exactly as {@link rearmStepLease} is, and for the same reason: a long workflow turn's
+   * worker beats every couple of seconds, and each beat otherwise cost a `getRun` + `updateRun`.
+   * The window here is `remoteAdvanceSilenceMs`, and a renewal buys at most one of them — so it is
+   * only worth a write once the window is half spent, which leaves a full half-window of headroom
+   * before the timer poller would re-drive the turn. The in-memory mark is a pure optimisation: a
+   * cold (or different) instance re-derives the same answer from the run's own `wakeAt`.
    */
   private async rearmDecisionDeadline(runId: string): Promise<void> {
     const silenceMs = this.remoteAdvanceSilenceMs;
     if (silenceMs == null) return;
-    const run = await this.store.getRun(runId);
-    if (!run || run.status !== 'suspended' || run.awaitingDecisionTaskId === undefined) return;
-    await this.store.updateRun(runId, { wakeAt: this.clock() + silenceMs, updatedAt: new Date() });
+    const now = this.clock();
+    const lookAgainAt = this.decisionDeadlineRearms.get(runId);
+    if (lookAgainAt !== undefined && now < lookAgainAt) return;
+    // Swallow a read failure for the same reason the step-lease rearm does: the transport's beat loop
+    // is serial and uncaught, and a skipped beat costs nothing while half the window remains.
+    const run = await this.store.getRun(runId).catch(() => null);
+    if (!run || run.status !== 'suspended' || run.awaitingDecisionTaskId === undefined) {
+      // Not awaiting a turn any more (settled, or re-driven under a fresh taskId): stop tracking it.
+      this.decisionDeadlineRearms.delete(runId);
+      return;
+    }
+    const halfWindow = Math.ceil(silenceMs / 2);
+    // More than half the window left: nothing to buy, and nothing to look at until it is half spent.
+    if (run.wakeAt != null && run.wakeAt > now + halfWindow) {
+      this.decisionDeadlineRearms.set(runId, run.wakeAt - halfWindow);
+      return;
+    }
+    const renewed = now + silenceMs;
+    await this.store.updateRun(runId, { wakeAt: renewed, updatedAt: new Date() });
+    if (this.decisionDeadlineRearms.size > 1024) this.decisionDeadlineRearms.clear();
+    this.decisionDeadlineRearms.set(runId, renewed - halfWindow);
   }
 
   /**
