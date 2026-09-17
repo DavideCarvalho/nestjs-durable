@@ -39,6 +39,16 @@ def _spawn_retained(coro: Any, name: Optional[str] = None) -> "asyncio.Task[Any]
     return task
 
 
+def _spawn_oneshot(coro: Any, name: Optional[str] = None) -> "asyncio.Task[Any]":
+    """Fire-and-forget a SHORT-LIVED task, retaining its handle for the same weak-reference reason as
+    :func:`_spawn_retained` — but WITHOUT the exit report: a one-shot finishing is the expected
+    outcome, not the news that a background loop died."""
+    task = asyncio.create_task(coro, name=name)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
 def _report_unexpected_exit(task: "asyncio.Task[Any]") -> None:
     """Say so when a retained background loop stops.
 
@@ -459,6 +469,102 @@ def _step_event_publisher(step_events: Any) -> Callable[[Dict[str, Any]], None]:
     return publish
 
 
+def _job_data(job: Any) -> Optional[Dict[str, Any]]:
+    """The task payload of whatever BullMQ handed a ``failed`` listener — a ``Job``, a bare dict, or
+    (when the job hash is already gone) nothing we can use. Never raises: a listener that throws
+    would take the worker's event loop with it."""
+    if job is None:
+        return None
+    data = getattr(job, "data", None)
+    if isinstance(data, dict):
+        return data
+    return job if isinstance(job, dict) else None
+
+
+def _failed_step_result(data: Optional[Dict[str, Any]], reason: str) -> Optional[Dict[str, Any]]:
+    """Rebuild the ``StepResult`` a TERMINALLY-failed task job never produced.
+
+    ``aprocess_task`` catches every handler error and publishes a failed result itself, so the job
+    SUCCEEDS on a business failure. A job reaching BullMQ's terminal ``failed`` state is therefore
+    always an INFRASTRUCTURE failure — the worker process died holding it (an OOM kill) and a peer's
+    stalled-check exhausted ``maxStalledCount``, or the job threw somewhere outside the handler. None
+    of those produce a result, so without this the engine's ``pending`` checkpoint has nothing left
+    to settle it: the step is orphaned and its run waits forever (observed in dev, 2026-09-17).
+
+    ``retryable: True`` so the engine's durable retry owns what happens next — this says "the worker
+    that had it is gone", not "the work is impossible". A WORKFLOW-turn job is skipped: a turn is
+    re-driven by the engine's own `remoteAdvanceSilenceMs` window, not by a step result. Returns
+    ``None`` whenever the payload can't identify a step (already GC'd / malformed), mirroring the
+    TypeScript ``BullMQTransport``'s bridge, which drops it for the same reason.
+    """
+    if not data or is_workflow_task(data):
+        return None
+    run_id = data.get("runId")
+    seq = data.get("seq")
+    step_id = data.get("stepId")
+    if run_id is None or seq is None or step_id is None:
+        return None
+    return {
+        "runId": run_id,
+        "seq": seq,
+        "stepId": step_id,
+        "status": "failed",
+        "error": {"message": f"remote step worker failed: {reason}", "retryable": True},
+    }
+
+
+def _failure_reason(job: Any, error: Any) -> str:
+    """The most specific failure text available, preferring BullMQ's own ``failedReason`` (which
+    carries the stalled-check's wording for a job whose worker died)."""
+    reason = getattr(job, "failedReason", None)
+    if isinstance(reason, str) and reason:
+        return reason
+    if isinstance(error, BaseException):
+        return str(error) or error.__class__.__name__
+    return str(error) if error else "unknown"
+
+
+def _bridge_terminal_failures(bull_worker: Any, results: Any) -> None:
+    """Publish a synthetic failed result for every task job that reaches BullMQ's terminal ``failed``
+    state — the parity the TypeScript transport has had (`worker.on('failed')` → `bridgeTaskFailure`)
+    and this SDK did not, which is why a Python fleet's steps orphan where a Node fleet's do not.
+
+    A PEER worker's stalled-check is what fails a dead worker's job, so this listener still fires
+    cross-process: whichever replica is alive reports the death of the job the killed one held.
+
+    Defensive by construction: the listener is registered only if the installed ``bullmq`` exposes the
+    emitter API, and both the registration and the callback swallow everything. A worker must not fail
+    to start — nor die mid-job — over a best-effort recovery hook.
+    """
+    on = getattr(bull_worker, "on", None)
+    if not callable(on):
+        return
+
+    def handle(job: Any = None, error: Any = None, *_extra: Any) -> None:
+        try:
+            result = _failed_step_result(_job_data(job), _failure_reason(job, error))
+            if result is None:
+                return
+            _spawn_oneshot(
+                _publish_failed_result(results, result),
+                name=f"bridge-failed:{result['stepId']}",
+            )
+        except Exception:  # noqa: BLE001 — never let a recovery hook break the worker loop
+            pass
+
+    try:
+        on("failed", handle)
+    except Exception:  # noqa: BLE001 — an emitter API we don't recognise simply gets no bridge
+        pass
+
+
+async def _publish_failed_result(results: Any, result: Dict[str, Any]) -> None:
+    try:
+        await results.add("result", result, {"removeOnComplete": True, "removeOnFail": True})
+    except Exception:  # noqa: BLE001 — best-effort; the engine's lost-dispatch re-drive is the net
+        pass
+
+
 def _control_channel(prefix: str) -> str:
     # Mirrors BullMQTransport.controlChannel(): '<prefix>-control'.
     return f"{prefix}-control"
@@ -652,7 +758,12 @@ async def run_redis_worker(
     for name in names:
         queue_group = _tenant_group(sanitize_queue_token(name), partition)
         tasks_name, _ = _names(effective_prefix, queue_group)
-        bull_workers.append(BullWorker(tasks_name, process, worker_opts))
+        bull_worker = BullWorker(tasks_name, process, worker_opts)
+        # A task job that ends up TERMINALLY failed produced no result (the worker holding it died),
+        # so bridge it back into one — else the engine's `pending` checkpoint is never settled and the
+        # run waits forever. See _bridge_terminal_failures.
+        _bridge_terminal_failures(bull_worker, results)
+        bull_workers.append(bull_worker)
         await _start_heartbeat(connection, effective_prefix, queue_group, controller, descriptor)
 
     # The bullmq python port re-reads ``opts['concurrency']`` each scheduling pass, so mutating it

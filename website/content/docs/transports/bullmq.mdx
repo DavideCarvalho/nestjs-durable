@@ -93,10 +93,22 @@ task job (overriding the default immediate `removeOnFail`) so a failed job's pay
 enough for the bridge to read the `runId`/`seq`/`stepId` it needs, before BullMQ garbage-collects
 it.
 
-Residual gap: if the **only** worker for a queue crashes and never restarts, no peer's
-stalled-check ever runs, so nothing settles the checkpoint — that needs an external liveness
-monitor, or the engine's opt-in `remoteRedispatchMs` self-heal. See
-[Recovering a lost remote step dispatch](/docs/observability/dashboard#recovering-a-lost-remote-step-dispatch).
+**The bridge lives in the consumer, not the queue.** A worker in another language consumes the
+same queues, and the bridge only exists where somebody implemented it: the TypeScript transport
+here, and the Python `durable-worker` (from the release that ships its own `failed` listener —
+earlier versions had none, so a Python fleet's steps orphaned where a Node fleet's did not). If
+you run a worker on an SDK without it, treat the checkpoint as unsettled and rely on the engine's
+`remoteRedispatchMs` self-heal below.
+
+Residual gaps, both of which the engine's opt-in `remoteRedispatchMs` self-heal covers (see
+[Retries](/docs/reliability/retries#a-third-case-the-dispatch-itself-gets-lost)):
+
+- if the **only** worker for a queue crashes and never restarts, no peer's stalled-check ever
+  runs, so nothing settles the checkpoint;
+- if the consuming SDK has no failure bridge, the job's terminal failure is never turned into a
+  result.
+
+See also [Recovering a lost remote step dispatch](/docs/observability/dashboard#recovering-a-lost-remote-step-dispatch).
 
 ## Control plane & tenant protocol
 

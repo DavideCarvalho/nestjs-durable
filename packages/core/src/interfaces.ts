@@ -1820,6 +1820,15 @@ export interface EngineEvent {
   /** The live step event carried by a `step.progress` (the single log line / sub-process outcome a
    *  running step just emitted). Absent on lifecycle events. */
   event?: StepEvent | undefined;
+  /**
+   * On a `step.started`: this dispatch is a lost-dispatch RE-DRIVE, not a first attempt — the step's
+   * lease lapsed with no result and no heartbeat (the worker holding it is presumed gone), so the
+   * engine re-enqueued it (see `WorkflowEngineDeps.remoteRedispatchMs`). Absent on a normal dispatch
+   * and on a failure retry, so a dashboard/alert can tell "re-driven after a lost worker" apart from
+   * "retried after a failure". The step's persisted event trail carries the same fact durably
+   * (`step.redispatched`).
+   */
+  redispatched?: boolean | undefined;
   /** Capabilities the blocked dispatch required (on a `run.blocked` event). */
   requires?: string[] | undefined;
   /** The structured routing delta on a `run.blocked` event (design §7.6): which capability/protocol

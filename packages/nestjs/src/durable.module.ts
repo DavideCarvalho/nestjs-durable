@@ -253,6 +253,26 @@ export interface DurableModuleOptions {
    */
   remoteAdvanceSilenceMs?: number;
   /**
+   * Opt-in self-heal window (ms) for a dispatched remote step whose job was LOST — the worker was
+   * killed mid-step (an OOM kill leaves no result, and a non-TS consumer has no way to bridge the
+   * job's terminal failure back into one), or the broker dropped the job. The `pending` checkpoint
+   * then has nothing left to settle it, so the run waits forever. When set, the pending checkpoint
+   * carries a LEASE: a result — or a step-scoped heartbeat, which renews it, so a worker still
+   * holding the step is never double-dispatched — must land within the window, else the engine
+   * re-dispatches the same step (bumping `attempts`, bounded by {@link remoteRedispatchMax}).
+   * Covers both `ctx.step` and a polyglot workflow's `call` fan-out (`ctx.gather_calls`).
+   *
+   * Off by default: a re-dispatch double-runs a step whose original job was merely SLOW, so the
+   * window MUST exceed your longest remote step and the step MUST be idempotent. Operator only.
+   */
+  remoteRedispatchMs?: number;
+  /**
+   * Max times {@link remoteRedispatchMs} re-dispatches one lost step before failing it
+   * (`remote_step_lost`, surfaced on the run) instead of re-dispatching forever. Defaults to 10.
+   * Ignored when `remoteRedispatchMs` is unset. Operator only.
+   */
+  remoteRedispatchMax?: number;
+  /**
    * The **default** workflow to route dead-lettered runs to, for workflows that don't declare their
    * own. When a run is moved to `dead` (exceeded `maxRecoveryAttempts`), the started handler gets a
    * `DeadLetter` payload `{ deadRunId, workflow, input, error }` (idempotent by a `dlq:<runId>` id) —
@@ -747,6 +767,8 @@ export class DurableModule {
               admission: options.admission,
               maxRecoveryAttempts: options.maxRecoveryAttempts,
               remoteAdvanceSilenceMs: options.remoteAdvanceSilenceMs,
+              remoteRedispatchMs: options.remoteRedispatchMs,
+              remoteRedispatchMax: options.remoteRedispatchMax,
               instanceId: options.instanceId,
               namespace: options.namespace,
               webhookUrl: options.webhookUrl,

@@ -174,16 +174,41 @@ deliberately conservative here: they re-suspend a still-`pending` step rather th
 a merely-slow worker is never double-run. Without a `timeoutMs`, that means the run hangs on `pending`
 forever unless something re-dispatches it:
 
-- The BullMQ transport closes this gap **automatically**: a crashed/stalled task job's terminal failure
-  is bridged into a synthetic failed `StepResult`, so the checkpoint fails and the normal durable retry
-  path above kicks in — no configuration needed.
+- The BullMQ transport closes this gap **for the consumers that implement the bridge**: a
+  crashed/stalled task job's terminal failure is turned into a synthetic failed `StepResult`, so the
+  checkpoint fails and the normal durable retry path above kicks in. The TypeScript transport and the
+  Python `durable-worker` both do this; a worker on any other SDK (or an older `durable-worker`) does
+  not, and its steps stay `pending`.
 - For any transport, `engine.redispatchPending(runId)` (or the dashboard's **Re-dispatch** action)
   manually re-enqueues a run's stuck `pending` remote steps.
-- `remoteRedispatchMs` — an **opt-in** engine option — makes this self-healing: a reconcile re-drive
-  that finds a remote step still `pending` past the window re-dispatches it, bounded by
-  `remoteRedispatchMax` (default 10) before giving up and failing the step as `remote_step_lost`. Off by
-  default, because re-dispatch can double-run a step whose job is merely slow — the window must exceed
-  the longest legitimate duration and the step must be idempotent.
+- `remoteRedispatchMs` — an **opt-in** engine option — makes this self-healing: a dispatched remote
+  step carries a **lease** on its `pending` checkpoint (`wakeAt`), and the run suspends on it (never
+  later than the `reconcileMs` sweep would have woken it anyway). A result — or a step-scoped
+  heartbeat, which **renews** the lease — must land before it lapses; a lapsed lease re-dispatches the
+  same `stepId`, bounded by `remoteRedispatchMax` (default 10) before failing the step as
+  `remote_step_lost` (which reaches the workflow's own error path). Off by default, because
+  re-dispatch can double-run a step whose job is merely slow **and does not beat**: the window must
+  exceed the longest legitimate duration of a non-heartbeating step, and the step must be idempotent.
+
+  This covers both shapes of remote step: an in-process `ctx.step` and a polyglot workflow's `call`
+  fan-out (`ctx.gather_calls`). Before `@dudousxd/nestjs-durable-core` 0.71, the fan-out path ignored
+  the option entirely — a lost job there was skipped on every subsequent turn and the run waited
+  forever. If you wire the engine through `DurableModule`, note that the option is only forwarded
+  from `@dudousxd/nestjs-durable` 0.71 as well.
+
+  A re-drive is **observably different from a retry**: the `step.started` event carries
+  `redispatched: true`, and the checkpoint's own event trail gets a `warn` `step.redispatched`
+  (`step.lost` when the bound runs out). Alert on those to see a worker that is dying under you
+  rather than steps that merely fail.
+
+```ts
+DurableModule.forRoot({
+  // Longer than your longest remote step. A step that heartbeats renews its own lease, so this
+  // window only ever has to cover steps that go silent.
+  remoteRedispatchMs: 45 * 60_000,
+  remoteRedispatchMax: 3,
+});
+```
 
 See [Recovering a lost remote step dispatch](/docs/observability/dashboard#recovering-a-lost-remote-step-dispatch)
 for the dashboard side of this (the stale-pending flag and the Re-dispatch button).
