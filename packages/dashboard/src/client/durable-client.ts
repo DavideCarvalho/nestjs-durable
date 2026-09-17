@@ -283,6 +283,12 @@ export interface EngineEvent {
   name?: string;
   kind?: StepKind;
   durationMs?: number;
+  /** On a `step.started`: this dispatch is a lost-dispatch RE-DRIVE, not a first attempt — the step's
+   *  lease lapsed with no result and no heartbeat, so the engine re-enqueued it (core
+   *  `remoteRedispatchMs`). Absent on a normal dispatch and on a failure retry, so a UI can tell
+   *  "re-driven after a lost worker" apart from "retried after a failure". The step's persisted event
+   *  trail carries the same fact durably (`step.redispatched`). */
+  redispatched?: boolean;
   /** The live step event carried by a `step.progress` (a running step's just-emitted log/sub-process). */
   event?: StepEvent;
   at: string;

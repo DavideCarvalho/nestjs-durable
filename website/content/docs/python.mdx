@@ -95,6 +95,16 @@ A few properties that follow from this being queue-based:
   hands each task to one of them. Scale a slow step by adding workers, not by touching the workflow.
 - **The engine owns correlation.** Every result carries the `stepId` it answers; the engine matches
   it to the suspended `ctx.step` and resumes the run. The worker never needs the run's state.
+- **A killed worker reports the job it was holding.** A process killed mid-step (an OOM kill) produces
+  no result, and the engine's `pending` checkpoint would have nothing left to settle it. The runner
+  registers a `failed` listener on each of its BullMQ workers, so when a peer's stalled-check
+  terminally fails the dead worker's job, some live replica publishes a synthetic failed (retryable)
+  result and the engine's durable retry re-dispatches the step. Parity with the TypeScript transport's
+  bridge; earlier `durable-worker` releases had none, which is why a Python fleet's steps could sit
+  `pending` forever. If the **only** worker for a queue dies and never restarts, no stalled-check runs
+  at all — that case needs the engine's
+  [`remoteRedispatchMs`](/docs/reliability/retries#a-third-case-the-dispatch-itself-gets-lost)
+  self-heal.
 
 ### Authentication
 

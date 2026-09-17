@@ -606,14 +606,18 @@ dispatched Nm ago (possibly lost)". From there:
   dashboard's "Re-dispatch" button) re-enqueues the run's stuck `pending` remote steps, bumping their
   `attempts` so the idempotent step re-runs and its result resumes the run — the manual escape hatch,
   equivalent to `WorkflowEngine.redispatchPending(runId)`.
-- **BullMQ self-heals for free.** The BullMQ transport bridges a crashed/stalled task job's terminal
-  failure into a synthetic failed `StepResult` (via the worker's `'failed'` event), so the engine marks
-  the checkpoint `failed` and its normal durable retry re-dispatches — no config needed, and the run
-  never gets stuck on `pending` in the first place on this transport.
-- **Opt-in self-heal — `remoteRedispatchMs`** (any transport). Set this engine option and a reconcile
-  re-drive that finds a remote step still `pending` past the window automatically re-dispatches it,
-  bounded by `remoteRedispatchMax` (default 10) so a step that never settles fails as a
-  `remote_step_lost` error instead of looping forever:
+- **BullMQ self-heals for free — if the CONSUMER bridges.** The BullMQ transport bridges a
+  crashed/stalled task job's terminal failure into a synthetic failed `StepResult` (via the worker's
+  `'failed'` event), so the engine marks the checkpoint `failed` and its normal durable retry
+  re-dispatches. That bridge belongs to the SDK consuming the queue: the TypeScript transport and the
+  Python `durable-worker` (recent releases) have it; a worker on any other SDK does not, and its steps
+  do get stuck on `pending`.
+- **Opt-in self-heal — `remoteRedispatchMs`** (any transport, any consumer). Set this engine option and
+  a dispatched remote step carries a **lease** on its `pending` checkpoint: a result — or a step-scoped
+  heartbeat, which renews the lease — must land before it lapses, and a lapsed lease re-dispatches the
+  step automatically, bounded by `remoteRedispatchMax` (default 10) so a step that never settles fails
+  as a `remote_step_lost` error instead of looping forever. Covers a polyglot workflow's
+  `ctx.gather_calls` fan-out as well as an in-process `ctx.step` (core 0.71+):
 
   ```ts
   DurableModule.forRoot({
@@ -624,8 +628,10 @@ dispatched Nm ago (possibly lost)". From there:
   });
   ```
 
-  **Off by default** — re-dispatch can double-run a step whose original job is merely slow, so the
-  window must exceed the longest such step's real duration and the step must be idempotent. Prefer a
+  **Off by default** — re-dispatch can double-run a step whose original job is merely slow and sends no
+  heartbeat, so the window must exceed the longest such step's real duration and the step must be
+  idempotent. A re-drive is distinguishable from a retry: the `step.started` event carries
+  `redispatched: true` and the checkpoint's event trail gets a `warn` `step.redispatched`. Prefer a
   per-step `timeoutMs` where you can (tighter, heartbeat-aware — see
   [Retries & backoff](/docs/reliability/retries)); `remoteRedispatchMs` is the store-driven net for the
   no-timeout steps that must still survive a lost dispatch.
