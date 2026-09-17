@@ -232,6 +232,21 @@ class AdmissionGateTest(unittest.TestCase):
         fill(ctl, 4)
         self.assertEqual(ctl.in_flight, 4)
 
+    def test_a_workflow_turn_settling_does_not_retire_the_first_task_probe(self):
+        # On a unified worker the first settle may be a workflow turn, which teaches us nothing
+        # (nameless, and cost learning is step-only). Retiring the probe on it would let steps
+        # parallelise with zero cost data — the fresh-pod stampede the probe exists to prevent.
+        mem = FakeMemory(100)
+        ctl = controller(mem, probed=False)
+        turn = ctl.on_start(None)
+        ctl.on_settle(5.0, True, "workflow", turn)
+        step = ctl.on_start("handle_FAILURE_RISK")
+        self.assertFalse(ctl.try_admit("handle_FAILURE_RISK"))
+        mem.usage = 300
+        ctl.on_settle(100.0, True, "step", step)
+        ctl.on_start("handle_FAILURE_RISK")
+        self.assertTrue(ctl.try_admit("handle_FAILURE_RISK"))
+
     def test_a_reader_that_raises_is_treated_as_unreadable(self):
         def boom():
             raise OSError("cgroup went away")
@@ -342,6 +357,21 @@ class StepCostLearningTest(unittest.TestCase):
         token = ctl.on_start("handle_MVR")
         ctl.on_settle(100.0, True, "step", token)
         self.assertEqual(ctl._step_cost("handle_MVR"), 600)
+
+    def test_a_peak_reader_that_raises_never_fails_the_step(self):
+        # on_start/on_settle bracket the handler (on_settle runs in the runner's `finally`), so a
+        # host-injected reader that throws must not propagate and mask the handler's outcome.
+        def boom():
+            raise OSError("no rusage here")
+
+        config = resolve_concurrency({"min": 1, "max": 4, "tickMs": 10})
+        ctl = AdaptiveController(
+            config, rss_reader=FakeMemory(100), rss_limit_reader=lambda: LIMIT, peak_reader=boom
+        )
+        token = ctl.on_start("handle_MVR")
+        ctl.on_settle(100.0, True, "step", token)
+        self.assertEqual(ctl.in_flight, 0)
+        self.assertEqual(ctl._step_cost("handle_MVR"), 0)
 
     def test_samples_growth_on_every_tick(self):
         mem = FakeMemory(100)

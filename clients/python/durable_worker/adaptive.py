@@ -103,7 +103,10 @@ _DEFAULT_TICK_MS = 2000
 _DEFAULT_RAM_ADMIT_PCT = 75.0
 _DEFAULT_RAM_RESUME_PCT = 65.0
 _DEFAULT_ADMISSION_POLL_MS = 250
-_DEFAULT_ADMISSION_MAX_WAIT_MS = 0  # 0 = wait as long as it takes (pure backpressure)
+# 0 = wait as long as it takes (pure backpressure). A non-zero budget RUNS the step when it expires
+# (the alternative would be failing a step over memory, which this whole layer exists to avoid), so a
+# tight budget trades the gate away under sustained pressure rather than failing fast.
+_DEFAULT_ADMISSION_MAX_WAIT_MS = 0
 _DEFAULT_GROW_HEADROOM_TICKS = 3
 
 # How many per-name cost observations to keep. A rolling max over the last few SOLO runs: enough to
@@ -571,7 +574,7 @@ class AdaptiveController:
         record = _InFlight(name=name, solo=solo)
         if solo and self.config.step_cost_tracking:
             record.usage_at_start = self._usage_bytes()
-            record.peak_at_start = self._peak_reader()
+            record.peak_at_start = self._peak_bytes()
         self._inflight[token] = record
         return token
 
@@ -590,7 +593,11 @@ class AdaptiveController:
         ``token`` is what :meth:`on_start` returned. Without it the OLDEST in-flight record is retired
         instead, so an integration that predates tokens keeps counting correctly (it just can't learn
         a per-name cost)."""
-        self._probe_pending = False
+        if kind == "step":
+            # Only a STEP retires the probe: a workflow turn is nameless and teaches us nothing, so
+            # clearing it on a turn would drop rule 5's shield with still zero cost data — exactly the
+            # fresh-pod stampede the probe exists to prevent on a unified worker.
+            self._probe_pending = False
         record = self._inflight.pop(token, None) if token is not None else None
         if record is None and self._inflight:
             oldest = next(iter(self._inflight))
@@ -737,7 +744,7 @@ class AdaptiveController:
         if usage is not None:
             observed = max(observed, usage - record.usage_at_start)
         if record.peak_at_start is not None:
-            peak = self._peak_reader()
+            peak = self._peak_bytes()
             if peak is not None:
                 observed = max(observed, peak - record.peak_at_start)
         samples = self._step_costs.setdefault(record.name, deque(maxlen=_STEP_COST_SAMPLES))
@@ -926,6 +933,15 @@ class AdaptiveController:
         the worker (or the control loop) down with it."""
         try:
             return self._rss_reader()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _peak_bytes(self) -> Optional[int]:
+        """Process peak RSS in bytes, guarded like :meth:`_usage_bytes`. Cost learning is best-effort:
+        a host-injected reader that raises must never propagate out of ``on_start``/``on_settle`` — the
+        runner calls those around the handler, so a throw there would fail an otherwise good step."""
+        try:
+            return self._peak_reader()
         except Exception:  # noqa: BLE001
             return None
 

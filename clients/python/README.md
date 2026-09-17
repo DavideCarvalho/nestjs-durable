@@ -188,7 +188,7 @@ falls, so it also stayed braked forever. Now:
 | `ramResumePct` | `65` | Hysteresis: once deferring, usage must fall under this to admit again. |
 | `ramAdmission` | `true` | **Set `false` to turn the gate off entirely** (adaptive mode only knob). |
 | `admissionPollMs` | `250` | How often a waiting step re-checks for headroom. |
-| `admissionMaxWaitMs` | `0` | `0` = wait as long as it takes. Set a ms budget to cap the wait. |
+| `admissionMaxWaitMs` | `0` | `0` = wait as long as it takes. A non-zero budget **runs the step anyway** when it expires (failing a step over memory is what this layer exists to avoid), so a tight budget trades the gate away under sustained pressure. |
 | `growHeadroomTicks` | `3` | Consecutive ticks under `ramResumePct` required before growing. |
 | `subtractPageCache` | `true` | Subtract reclaimable `inactive_file` from the cgroup charge. |
 | `stepCostTracking` | `true` | Learn per-step-name costs and reserve them. `false` = usage-only gate. |
