@@ -275,7 +275,13 @@ describe('REGRESSION: a gather_calls step whose worker was OOM-killed is re-driv
     }
 
     const run = await h.store.getRun('run1');
-    expect(h.transport.attemptsFor(`leaf_${LOST_SEQ}`)).toBeLessThanOrEqual(3); // 1 + max 2 re-drives
+    // EXACTLY two: the initial dispatch (attempts=1), then one re-drive (attempts=2, which is
+    // `remoteRedispatchMax`) — the third lapse fails the step instead of dispatching again. Pinned,
+    // not bounded: a loose `<=` would also pass with no re-drive happening at all.
+    expect(h.transport.attemptsFor(`leaf_${LOST_SEQ}`)).toBe(2);
+    const cp = (await h.store.listCheckpoints('run1')).find((c) => c.seq === LOST_SEQ);
+    expect(cp?.status).toBe('failed');
+    expect(cp?.events?.map((e) => e.name)).toEqual(['step.redispatched', 'step.lost']);
     expect(run?.status).toBe('failed');
     expect(JSON.stringify(run?.error)).toMatch(/lost/i);
   });

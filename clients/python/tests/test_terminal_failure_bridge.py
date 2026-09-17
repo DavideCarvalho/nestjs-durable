@@ -49,6 +49,17 @@ class FailedStepResultTest(unittest.TestCase):
         self.assertIsNone(_failed_step_result({}, "boom"))
         self.assertIsNone(_failed_step_result({"runId": "r1", "seq": 1}, "boom"))
 
+    def test_skips_a_wrong_typed_payload(self):
+        # Presence is not enough (the TS `failedTaskIdentity` checks types too): a garbled job hash
+        # must publish NOTHING rather than a result the engine can match to no checkpoint.
+        self.assertIsNone(_failed_step_result({**STEP_TASK, "runId": 7}, "boom"))
+        self.assertIsNone(_failed_step_result({**STEP_TASK, "stepId": {"a": 1}}, "boom"))
+        self.assertIsNone(_failed_step_result({**STEP_TASK, "seq": "3"}, "boom"))
+        # `bool` is an `int` subclass in Python — a `True` seq is not a position.
+        self.assertIsNone(_failed_step_result({**STEP_TASK, "seq": True}, "boom"))
+        # A JSON number that arrived as a float is still a number, as it is in TypeScript.
+        self.assertIsNotNone(_failed_step_result({**STEP_TASK, "seq": 3.0}, "boom"))
+
     def test_reads_the_payload_off_a_job_object_or_a_bare_dict(self):
         job = type("Job", (), {"data": STEP_TASK})()
         self.assertEqual(_job_data(job), STEP_TASK)

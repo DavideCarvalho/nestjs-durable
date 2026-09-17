@@ -502,7 +502,13 @@ def _failed_step_result(data: Optional[Dict[str, Any]], reason: str) -> Optional
     run_id = data.get("runId")
     seq = data.get("seq")
     step_id = data.get("stepId")
-    if run_id is None or seq is None or step_id is None:
+    # Types too, not just presence — same three checks as the TypeScript `failedTaskIdentity`. A
+    # wrong-typed payload (a truncated/garbled job hash) would otherwise publish a result the engine
+    # can't match to any checkpoint, which is worse than publishing nothing: it looks like recovery
+    # happened. `bool` is excluded explicitly because it is an `int` subclass in Python.
+    if not isinstance(run_id, str) or not isinstance(step_id, str):
+        return None
+    if isinstance(seq, bool) or not isinstance(seq, (int, float)):
         return None
     return {
         "runId": run_id,
