@@ -1,5 +1,96 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.71.0
+
+### Minor Changes
+
+- [#327](https://github.com/DavideCarvalho/nestjs-durable/pull/327) [`f877666`](https://github.com/DavideCarvalho/nestjs-durable/commit/f877666d875ee62f088716a477b47f8f1854658d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Re-drive a `gather_calls` step whose worker was killed mid-step, instead of orphaning it forever.
+
+  A polyglot workflow's turn declares its fan-out as `call` commands; `applyCommands` writes a
+  `pending` checkpoint and dispatches each one. On every later turn the worker's replay RE-EMITS
+  the calls it is still waiting on, and the engine skips a command whose checkpoint already
+  exists — the guard that stops a partially-settled fan-out from double-dispatching its live
+  siblings.
+
+  That guard had no notion of a LOST job. A worker OOM-killed mid-step takes its in-flight job
+  with it, and for a non-TS consumer nothing bridges the job's terminal failure back into a
+  `StepResult` (the TypeScript transport has always done this; the Python SDK did not, which is
+  why a Python fleet's steps orphan where a Node fleet's do not — fixed on that side too, in
+  `durable-worker`). The checkpoint therefore stayed `pending` — "out for delivery" — and every
+  turn skipped it: the run woke on the `reconcileMs` sweep, dispatched a turn, had the calls
+  re-emitted, skipped them, and slept. Forever. Observed on a six-run fan-out: `pending`,
+  `attempts = 1`, checkpoint `wakeAt` NULL, over an hour, no retry, while sibling steps
+  dispatched in the same batch completed normally on the restarted worker.
+
+  The two tells name the gap exactly. `callRemote` (the `ctx.step` path) stamps a re-dispatch
+  deadline on the pending checkpoint's `wakeAt` and honours `remoteRedispatchMs`; the `call` path
+  did neither — so the documented lost-dispatch self-heal **did not exist for a fan-out**, no
+  matter how it was configured.
+
+  Now the two paths share one policy, and a pending remote checkpoint's `wakeAt` means the same
+  thing in both: the step's LEASE.
+
+  - A settled checkpoint always wins — a step that completed just before the crash is never re-run.
+  - `remoteRedispatchMs` unset (still the default) keeps the by-design "re-suspend, never
+    re-dispatch": a merely-slow worker is never double-run.
+  - Set it and the dispatched step carries a lease, and the run suspends ON it (never later than
+    the `reconcileMs` sweep would have woken it anyway). Only a LAPSED lease re-dispatches,
+    bounded by `remoteRedispatchMax` (default 10); past the bound the step is failed
+    `remote_step_lost`, which enters the run's history so the workflow's own error path surfaces
+    it rather than the engine looping.
+  - A step-scoped heartbeat now RENEWS that lease durably (`{ runId, seq, stepId, group }` on the
+    heartbeat channel), so a worker still holding a long step keeps it — the in-memory rearm only
+    ever protected a `timeoutMs` step, and only on the instance that dispatched it.
+  - Observability: a re-drive emits `step.started` with `redispatched: true` and appends a `warn`
+    `step.redispatched` event to the checkpoint's own trail (`step.lost` at the bound), so
+    "re-driven after a lost worker" reads differently from a failure retry — in the dashboard and
+    in the database.
+
+  `DurableModule` also **forwards `remoteRedispatchMs` / `remoteRedispatchMax`** for the first
+  time. They were engine-only options the Nest module never passed on, so every consumer wiring
+  the engine through `DurableModule` was stuck with the orphan-forever default regardless of what
+  it set.
+
+### Patch Changes
+
+- [#329](https://github.com/DavideCarvalho/nestjs-durable/pull/329) [`9786c43`](https://github.com/DavideCarvalho/nestjs-durable/commit/9786c431678e4f1e8b657b2265a2fc7792ecd813) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Throttle the two durable deadline renewals a heartbeat performs, so a hot beat loop is not an
+  `UPDATE` storm.
+
+  A worker beats while it holds a long step (or replays a long workflow turn) — every couple of
+  seconds, and a `gather_calls` fan-out multiplies that by its in-flight steps. Two engine-side rearms
+  paid for every one of those beats:
+
+  - `rearmStepLease` (the step-scoped beat, new in 0.71) did a `getCheckpoint` + a `saveCheckpoint`,
+    plus a `getRun` + `updateRun` whenever the run happened to be parked exactly on that step's lease.
+    Its `cp.wakeAt >= renewed` guard could only ever short-circuit a second beat inside the same clock
+    tick, because `renewed` advances with the clock.
+  - `rearmDecisionDeadline` (the run-scoped beat for a turn suspended on `remoteAdvanceSilenceMs`) did
+    a `getRun` + `updateRun`, with no guard at all.
+
+  Both are now throttled **by the window itself** rather than by a fixed interval: a renewal buys at
+  most one window, so it is only worth a write once the window is HALF spent. A beat that finds more
+  than half the window still on the clock writes nothing and records the half-spent mark, so later
+  beats skip even the read until then; a beat at or past the mark renews, leaving a full half-window of
+  headroom — the deadline can never lapse under a worker whose beats are anywhere near their normal
+  cadence.
+
+  That bounds the cost at one read + one write per half window per in-flight step (and per suspended
+  turn), independent of beat frequency: with a 30-minute `remoteRedispatchMs`, two writes an hour
+  instead of ~1800. Measured in the new tests, 120 beats across a full window now cost 2 writes and 3
+  reads, down from 120 of each.
+
+  The in-memory mark is a pure optimisation — cold on a fresh instance, or on the one that did not
+  dispatch the step — and the durable half-spent check re-derives the same answer from the checkpoint
+  (or the run), so nothing depends on it surviving; it is cleared wholesale past 1024 entries.
+
+  Both rearms are also fully best-effort now: every store call they make — the reads AND the writes —
+  is swallowed. They run inside the transport's beat handler, which delivers beats serially and does not
+  catch, so a throwing store call would take the beat loop down with it (on `bullmq`, where the
+  subscriber does `void handler(...)`, as an unhandled rejection that can kill the process). Nothing is
+  silently left stale: the half-spent mark is only advanced once the renewal write commits, so the very
+  next beat retries, and a skipped beat is harmless by the same headroom argument that justifies the
+  throttle.
+
 ## 0.70.3
 
 ### Patch Changes
