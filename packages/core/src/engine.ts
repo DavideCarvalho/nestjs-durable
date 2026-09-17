@@ -3272,35 +3272,42 @@ export class WorkflowEngine {
     const now = this.clock();
     const lookAgainAt = this.stepLeaseRearms.get(id);
     if (lookAgainAt !== undefined && now < lookAgainAt) return;
-    // Swallow a read failure: this runs inside the transport's beat handler, which delivers beats
-    // serially and does not catch — a throwing rearm would take the whole beat loop down (and on
-    // `bullmq`, where the subscriber does `void handler(...)`, surface as an unhandled rejection).
-    // A lost beat is harmless: the lease still has at least half its window left.
-    const cp = await this.store.getCheckpoint(runId, seq).catch(() => null);
-    if (!cp || cp.kind !== 'remote' || cp.status !== 'pending') {
-      // Settled (or gone): stop tracking it, so a long-lived worker's stale beats don't keep the entry.
-      this.stepLeaseRearms.delete(id);
-      return;
-    }
-    const halfWindow = Math.ceil(this.remoteRedispatchMs / 2);
-    // More than half the window left: nothing to buy, and nothing to look at until it is half spent.
-    if (cp.wakeAt != null && cp.wakeAt > now + halfWindow) {
-      this.stepLeaseRearms.set(id, cp.wakeAt - halfWindow);
-      return;
-    }
-    const renewed = now + this.remoteRedispatchMs;
-    const previous = cp.wakeAt;
-    await this.store.saveCheckpoint({ ...cp, wakeAt: renewed });
-    if (this.stepLeaseRearms.size > 1024) this.stepLeaseRearms.clear();
-    this.stepLeaseRearms.set(id, renewed - halfWindow);
-    // If the run is parked EXACTLY on this step's old lease, carry its wake forward too — otherwise a
-    // beating worker costs one wasted turn per renewal window. Only on an exact match: any other
-    // `wakeAt` belongs to some other timer (a sleep, a sibling's shorter lease) and moving it would
-    // delay that instead.
-    if (previous == null) return;
-    const run = await this.store.getRun(runId);
-    if (run?.status === 'suspended' && run.wakeAt === previous) {
-      await this.store.updateRun(runId, { wakeAt: renewed, updatedAt: new Date() });
+    // EVERY store call below is swallowed, reads AND writes: this runs inside the transport's beat
+    // handler, which delivers beats serially and does not catch — a throwing rearm would take the whole
+    // beat loop down (and on `bullmq`, where the subscriber does `void handler(...)`, surface as an
+    // unhandled rejection that can kill the process). A lost beat is harmless by the same headroom
+    // argument that justifies the throttle: the lease still has at least half its window left, and the
+    // half-spent mark is only advanced AFTER a successful write, so the very next beat retries.
+    try {
+      const cp = await this.store.getCheckpoint(runId, seq);
+      if (!cp || cp.kind !== 'remote' || cp.status !== 'pending') {
+        // Settled (or gone): stop tracking it, so a long-lived worker's stale beats don't keep the entry.
+        this.stepLeaseRearms.delete(id);
+        return;
+      }
+      const halfWindow = Math.ceil(this.remoteRedispatchMs / 2);
+      // More than half the window left: nothing to buy, and nothing to look at until it is half spent.
+      if (cp.wakeAt != null && cp.wakeAt > now + halfWindow) {
+        this.stepLeaseRearms.set(id, cp.wakeAt - halfWindow);
+        return;
+      }
+      const renewed = now + this.remoteRedispatchMs;
+      const previous = cp.wakeAt;
+      await this.store.saveCheckpoint({ ...cp, wakeAt: renewed });
+      if (this.stepLeaseRearms.size > 1024) this.stepLeaseRearms.clear();
+      this.stepLeaseRearms.set(id, renewed - halfWindow);
+      // If the run is parked EXACTLY on this step's old lease, carry its wake forward too — otherwise a
+      // beating worker costs one wasted turn per renewal window. Only on an exact match: any other
+      // `wakeAt` belongs to some other timer (a sleep, a sibling's shorter lease) and moving it would
+      // delay that instead.
+      if (previous == null) return;
+      const run = await this.store.getRun(runId);
+      if (run?.status === 'suspended' && run.wakeAt === previous) {
+        await this.store.updateRun(runId, { wakeAt: renewed, updatedAt: new Date() });
+      }
+    } catch {
+      // Best-effort liveness: a store blip costs one skipped renewal, never the beat loop. The mark was
+      // not advanced unless the lease write itself already committed, so nothing is silently left stale.
     }
   }
 
@@ -4539,24 +4546,30 @@ export class WorkflowEngine {
     const now = this.clock();
     const lookAgainAt = this.decisionDeadlineRearms.get(runId);
     if (lookAgainAt !== undefined && now < lookAgainAt) return;
-    // Swallow a read failure for the same reason the step-lease rearm does: the transport's beat loop
-    // is serial and uncaught, and a skipped beat costs nothing while half the window remains.
-    const run = await this.store.getRun(runId).catch(() => null);
-    if (!run || run.status !== 'suspended' || run.awaitingDecisionTaskId === undefined) {
-      // Not awaiting a turn any more (settled, or re-driven under a fresh taskId): stop tracking it.
-      this.decisionDeadlineRearms.delete(runId);
-      return;
+    // Read AND write swallowed, for the same reason {@link rearmStepLease} swallows its own: the
+    // transport's beat loop is serial and uncaught, so a throwing rearm takes it (or the process) down,
+    // while a skipped beat costs nothing while half the window remains — and the mark is only advanced
+    // after the write commits, so the next beat retries.
+    try {
+      const run = await this.store.getRun(runId);
+      if (!run || run.status !== 'suspended' || run.awaitingDecisionTaskId === undefined) {
+        // Not awaiting a turn any more (settled, or re-driven under a fresh taskId): stop tracking it.
+        this.decisionDeadlineRearms.delete(runId);
+        return;
+      }
+      const halfWindow = Math.ceil(silenceMs / 2);
+      // More than half the window left: nothing to buy, and nothing to look at until it is half spent.
+      if (run.wakeAt != null && run.wakeAt > now + halfWindow) {
+        this.decisionDeadlineRearms.set(runId, run.wakeAt - halfWindow);
+        return;
+      }
+      const renewed = now + silenceMs;
+      await this.store.updateRun(runId, { wakeAt: renewed, updatedAt: new Date() });
+      if (this.decisionDeadlineRearms.size > 1024) this.decisionDeadlineRearms.clear();
+      this.decisionDeadlineRearms.set(runId, renewed - halfWindow);
+    } catch {
+      // Best-effort liveness: a store blip costs one skipped renewal, never the beat loop.
     }
-    const halfWindow = Math.ceil(silenceMs / 2);
-    // More than half the window left: nothing to buy, and nothing to look at until it is half spent.
-    if (run.wakeAt != null && run.wakeAt > now + halfWindow) {
-      this.decisionDeadlineRearms.set(runId, run.wakeAt - halfWindow);
-      return;
-    }
-    const renewed = now + silenceMs;
-    await this.store.updateRun(runId, { wakeAt: renewed, updatedAt: new Date() });
-    if (this.decisionDeadlineRearms.size > 1024) this.decisionDeadlineRearms.clear();
-    this.decisionDeadlineRearms.set(runId, renewed - halfWindow);
   }
 
   /**

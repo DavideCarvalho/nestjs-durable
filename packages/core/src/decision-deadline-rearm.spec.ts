@@ -58,18 +58,27 @@ class SilentWorkflowTransport implements Transport {
 }
 
 /** Counts the durable reads/writes the run row costs, so a hot beat loop can be held to a bounded
- *  number of them instead of one read + one write per beat. */
+ *  number of them instead of one read + one write per beat. The `fail*` switches make the store hostile
+ *  one operation at a time, as a store outage does. */
 class CountingStore extends InMemoryStateStore {
   reads = 0;
   writes = 0;
+  failReads = false;
+  failWrites = false;
 
   override async getRun(runId: string): Promise<WorkflowRun | null> {
-    if (runId === RUN_ID) this.reads += 1;
+    if (runId === RUN_ID) {
+      this.reads += 1;
+      if (this.failReads) throw new Error('run read is down');
+    }
     return super.getRun(runId);
   }
 
   override async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
-    if (runId === RUN_ID) this.writes += 1;
+    if (runId === RUN_ID) {
+      this.writes += 1;
+      if (this.failWrites) throw new Error('run write is down');
+    }
     return super.updateRun(runId, patch);
   }
 }
@@ -204,5 +213,35 @@ describe("a suspended turn's heartbeat-rearmed deadline", () => {
 
     expect(h.store.writes).toBe(0);
     expect((await h.store.getRun(RUN_ID))?.wakeAt).toBeUndefined();
+  });
+
+  it('a store that throws never rejects out of the rearm, and the next beat still renews', async () => {
+    // Same blast radius as the step-lease rearm: this runs in the transport's serial, uncaught beat
+    // handler, so neither the read NOR the write may reject out of it. The mark is only advanced once
+    // the write commits, so an outage costs one skipped renewal and the next beat retries.
+    const h = harness();
+
+    await h.engine.start(WORKFLOW, {}, RUN_ID);
+    await drain();
+    const deadlineAtDispatch = (await h.store.getRun(RUN_ID))?.wakeAt;
+    expect(deadlineAtDispatch).toBe(h.now() + SILENCE_MS);
+
+    // Half the window spent, so each beat below WOULD renew.
+    h.advance(SILENCE_MS / 2 + 1_000);
+
+    h.store.failWrites = true;
+    await expect(h.transport.emitRunHeartbeat()).resolves.toBeUndefined();
+    await expect(h.transport.emitRunHeartbeat()).resolves.toBeUndefined();
+    h.store.failWrites = false;
+    h.store.failReads = true;
+    await expect(h.transport.emitRunHeartbeat()).resolves.toBeUndefined();
+    h.store.failReads = false;
+    expect((await h.store.getRun(RUN_ID))?.wakeAt).toBe(deadlineAtDispatch); // nothing committed
+
+    // The store is back: the next beat renews, and the turn was never re-driven meanwhile.
+    await h.transport.emitRunHeartbeat();
+    expect((await h.store.getRun(RUN_ID))?.wakeAt).toBe(h.now() + SILENCE_MS);
+    await h.tick();
+    expect(h.transport.tasks).toHaveLength(1);
   });
 });

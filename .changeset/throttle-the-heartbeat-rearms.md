@@ -32,7 +32,10 @@ The in-memory mark is a pure optimisation — cold on a fresh instance, or on th
 dispatch the step — and the durable half-spent check re-derives the same answer from the checkpoint
 (or the run), so nothing depends on it surviving; it is cleared wholesale past 1024 entries.
 
-Both rearms also `.catch(() => null)` their read now: they run inside the transport's beat handler,
-which delivers beats serially and does not catch, so a throwing store read would take the beat loop
-down with it (on `bullmq`, as an unhandled rejection). A skipped beat is harmless — the deadline
-still has at least half its window left.
+Both rearms are also fully best-effort now: every store call they make — the reads AND the writes —
+is swallowed. They run inside the transport's beat handler, which delivers beats serially and does not
+catch, so a throwing store call would take the beat loop down with it (on `bullmq`, where the
+subscriber does `void handler(...)`, as an unhandled rejection that can kill the process). Nothing is
+silently left stale: the half-spent mark is only advanced once the renewal write commits, so the very
+next beat retries, and a skipped beat is harmless by the same headroom argument that justifies the
+throttle.
