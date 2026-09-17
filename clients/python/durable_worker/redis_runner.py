@@ -604,10 +604,19 @@ class _MultiWorkerHandle:
     Callers (``Worker.run`` / ``run_workers``) still just want a single ``await handle.close()`` on
     shutdown — this wraps the list so that contract stays unchanged."""
 
-    def __init__(self, bull_workers: "list[Any]") -> None:
+    def __init__(
+        self, bull_workers: "list[Any]", controller: Optional[AdaptiveController] = None
+    ) -> None:
         self._bull_workers = bull_workers
+        self._controller = controller
 
     async def close(self) -> None:
+        # Release the memory gate FIRST: a step waiting there hasn't returned from `process`, so
+        # BullMQ's close would wait on it. Draining makes waiters proceed, bounding shutdown by a task
+        # duration rather than by "whenever memory frees". Then stop the control loop.
+        if self._controller is not None:
+            self._controller.begin_drain()
+            self._controller.stop()
         await asyncio.gather(*(bw.close() for bw in self._bull_workers), return_exceptions=True)
 
 
@@ -628,10 +637,12 @@ async def run_redis_worker(
     control channel and feeds it, so handlers see ``ctx.cancelled``.
 
     ``concurrency`` accepts an ``int`` (fixed), ``'adaptive'`` (self-tuning with defaults), or a
-    config ``dict`` (``min``/``max``/``start``/``ramCeilingPct``/``cpuCeilingPct``/``tickMs``). An
-    :class:`AdaptiveController` tracks ``inFlight`` / latency / RSS / CPU for BOTH modes (so every
-    per-name heartbeat carries a live ``WorkerStatus``); in adaptive mode it also tunes the live
-    limit across ALL of this worker's underlying BullMQ Workers together (one shared pool).
+    config ``dict`` (``min``/``max``/``start``/``ramCeilingPct``/``cpuCeilingPct``/``tickMs`` plus the
+    memory-admission knobs — see :mod:`durable_worker.adaptive`). An :class:`AdaptiveController` tracks
+    ``inFlight`` / latency / memory / CPU for BOTH modes (so every per-name heartbeat carries a live
+    ``WorkerStatus``); in adaptive mode it also tunes the live limit across ALL of this worker's
+    underlying BullMQ Workers together (one shared pool) and gates each step on memory headroom before
+    it starts (``ramAdmission``, on by default — a gated step WAITS, it is never failed).
 
     REDESIGNED ROUTING (Task 8): there is no longer a single declared ``group`` queue. Each
     registered name gets its OWN queue, ``f"{prefix}-tasks-{tenant_group(sanitize_queue_token(name),
@@ -729,7 +740,18 @@ async def run_redis_worker(
         # ``time.monotonic`` (not wall) for a clock-skew-immune duration; ``ok`` reflects the wire
         # status so a failed step counts toward errorRate.
         is_workflow = has_workflows and is_workflow_task(job.data)
-        controller.on_start()
+        step_name = None if is_workflow else job.data.get("name")
+        if not is_workflow:
+            # MEMORY ADMISSION (adaptive mode, on by default). Wait here — before the handler runs and
+            # allocates — until the controller says there is headroom for one more step. This is
+            # backpressure, never rejection: we still hold the job (BullMQ's lock timer keeps renewing
+            # it while we await), so a deferred step is a step that starts LATER, never a failed one.
+            # Workflow turns deliberately skip the gate: they replay, suspend and are cheap, and making
+            # a turn wait on memory could stall the very run whose steps would release it.
+            await controller.await_admission(
+                step_name, abort=lambda: registry.is_cancelled(job.data.get("runId") or "")
+            )
+        token = controller.on_start(step_name)
         started = time.monotonic()
         ok = False
         try:
@@ -745,6 +767,7 @@ async def run_redis_worker(
                 (time.monotonic() - started) * 1000.0,
                 ok,
                 kind="workflow" if is_workflow else "step",
+                token=token,
             )
 
     # Seed BullMQ with the controller's starting limit (fixed N or the adaptive start). One BullMQ
@@ -780,7 +803,7 @@ async def run_redis_worker(
             bull_worker.opts["concurrency"] = new_limit
 
     controller.start(apply_cb=apply_concurrency)
-    return _MultiWorkerHandle(bull_workers)
+    return _MultiWorkerHandle(bull_workers, controller)
 
 
 async def _progress_publisher(

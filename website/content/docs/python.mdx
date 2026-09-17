@@ -128,6 +128,54 @@ Use `redis://` for plaintext and `rediss://` for TLS. This is the same Redis the
 | `partition` | `None` | Optional isolation suffix — appends `@<partition>` to every one of this worker's per-name queues. |
 | `connection` | `redis://localhost:6379` | Redis URL (the broker the engine also uses). |
 | `prefix` | `durable` | Queue-key namespace; must match the engine's `BullMQTransport` prefix. |
+| `concurrency` | `1` | Tasks at a time: an `int` (fixed), `"adaptive"`, or a config dict — see [Concurrency and memory](#concurrency-and-memory). |
+
+## Concurrency and memory
+
+`concurrency` takes a fixed `int`, the string `"adaptive"`, or a dict of overrides. An adaptive worker
+tunes its own limit from a latency gradient and, since `durable-worker` 0.25, protects itself from
+OOM with a **memory admission gate**: before each step starts, the worker asks whether there is room
+for one more right now and **waits** rather than starting a step it cannot fit.
+
+```python
+worker = Worker(concurrency="adaptive")                  # gate on, all defaults
+worker = Worker(concurrency={"min": 1, "max": 16})       # adaptive, with bounds
+worker = Worker(concurrency={"ramAdmission": False})     # gate off (pre-0.25 behaviour)
+```
+
+Why a gate and not just the RAM brake: a brake evaluated on a control tick is too late for a handler
+that allocates hundreds of MB the instant it starts (an ML feature panel, a big dataframe), and the
+old numerator was `ru_maxrss` — the process **peak**, which never falls, so once it braked it stayed
+braked. Now usage is **current**: cgroup v2 `memory.current`, then cgroup v1 `memory.usage_in_bytes`,
+then `/proc/self/status` `VmRSS`, and only as a last resort `ru_maxrss`. Reclaimable page cache
+(`memory.stat` `inactive_file`) is subtracted, giving the same working set kubelet evicts on.
+
+- A deferred step is **not** a failed step — it keeps its job (BullMQ renews the lock) and starts as
+  soon as there is headroom.
+- With **nothing in flight the gate always admits**, so a worker can never deadlock waiting for
+  memory that only it could free.
+- Crossing `ramCeilingPct` drops the limit to `min` **in one move**; growing back requires
+  `growHeadroomTicks` consecutive ticks of real headroom.
+- Per-step-name costs are learned from steps that ran alone and reserved for the next one, because
+  usage at admission time doesn't yet include what an admitted step is about to allocate. The first
+  task of a process runs alone so there is always one real measurement.
+
+| Knob (camelCase or snake_case) | Default | What it does |
+| --- | --- | --- |
+| `min` / `max` / `start` | `1` / `32` / `min` | Bounds and starting limit. |
+| `ramCeilingPct` | `85` | Brake: at/above this the limit collapses to `min`. |
+| `ramAdmitPct` | `75` | Gate: above this, new steps wait. Clamped to `ramCeilingPct`. |
+| `ramResumePct` | `65` | Hysteresis: once deferring, usage must fall under this to admit again. |
+| `ramAdmission` | `true` | Set `false` to turn the gate off entirely. |
+| `admissionPollMs` | `250` | How often a waiting step re-checks for headroom. |
+| `admissionMaxWaitMs` | `0` | `0` = wait as long as it takes; set a ms budget to cap the wait. |
+| `growHeadroomTicks` | `3` | Consecutive ticks under `ramResumePct` required before growing. |
+| `subtractPageCache` | `true` | Subtract reclaimable `inactive_file` from the cgroup charge. |
+| `stepCostTracking` | `true` | Learn per-step-name costs and reserve them; `false` = usage-only gate. |
+
+A fixed `concurrency=N` worker is never gated — N is your explicit promise — but it still publishes
+the same memory numbers on its heartbeat. Adaptive protects **that pod**: a shared dependency still
+needs a global cap, and pod-count scaling is KEDA's job.
 
 ## Other transports
 

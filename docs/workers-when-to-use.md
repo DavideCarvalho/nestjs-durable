@@ -139,11 +139,21 @@ How it decides (same on both SDKs), every `tickMs` (default 2s):
   = queuing → **shrink** proportionally. Latency is bottleneck-agnostic — it catches a slow DB, CPU
   saturation, or lock contention without naming which.
 - **RAM ceiling (hard brake).** Reads RSS against the cgroup `memory.max` (falls back to host total).
-  Past `ramCeilingPct` (default 85%) it multiplicatively cuts the limit and refuses to grow — OOM is
-  fatal and sudden, so it's a brake, not a gradient input.
+  Past `ramCeilingPct` (default 85%) it cuts the limit and refuses to grow — OOM is fatal and sudden,
+  so it's a brake, not a gradient input.
 - **Backpressure.** A burst of errors or a stall (in-flight > 0 but nothing completing) shrinks the
   limit. `cpuCeilingPct` is an optional extra cap (off by default — the latency gradient already
   subsumes CPU for I/O-bound work).
+
+**Python only (durable-worker ≥ 0.25) — memory admission.** A brake that reacts on a tick is too late
+for a handler that allocates hundreds of MB the moment it starts, so the Python worker also *gates*:
+before each step starts it asks whether there is room for one more right now, and **waits** if there
+isn't (the job keeps its lock — a deferred step is never a failed step; with nothing in flight it
+always admits, so it cannot deadlock). It reads cgroup `memory.current` minus reclaimable page cache
+(the "working set") rather than the process peak, collapses the limit to `min` in one move when the
+ceiling is crossed, and only grows back after `growHeadroomTicks` of real headroom. Knobs and the
+opt-out (`ramAdmission: False`) are in
+[`clients/python/README.md`](../clients/python/README.md#concurrency-and-not-being-oom-killed).
 
 Bounds are `[min, max]` (defaults 1 and 32); it starts at `start` (default `min`). Adaptive is
 **per process** — it protects *that pod*. A shared dependency (one RDS behind many pods) still needs a
