@@ -1495,17 +1495,29 @@ export class WorkflowEngine {
   async recoverIncomplete(nowMs: number = this.clock()): Promise<RunResult[]> {
     if (this.draining) return [];
     const results: RunResult[] = [];
-    for (const run of await this.store.listIncompleteRuns(this.namespace)) {
+    for (const listed of await this.store.listIncompleteRuns(this.namespace)) {
       // An IN-PROCESS turn renews its lease, so an acquirable lease means no turn is executing this
       // run right now. Skip the ones still owned. NOTE this is NOT the same as "the worker crashed" —
       // see the dispatched-step guard below for the case it doesn't cover.
       const acquired = await this.store.tryLockRun(
-        run.id,
+        listed.id,
         this.instanceId,
         nowMs + this.leaseMs,
         nowMs,
       );
       if (!acquired) continue;
+      // Decide on the run as it is NOW that the lease is held, never on the listing. The listing is a
+      // snapshot taken before this loop reached the row, and a live run moves on in between: the turn
+      // that was executing it (`running`) suspends and releases its lease, a fast step result resumes
+      // it, it may even complete. Trusting the listed `running` then reads "free lease, no step in
+      // flight" as a crashed turn — and the branches below count a recovery attempt, rewrite the run
+      // to `pending` and re-enqueue it, i.e. start a SECOND execution beside the legitimate one (or
+      // resurrect a finished run). Only a run that still reads incomplete under the lease is ours.
+      const run = await this.store.getRun(listed.id);
+      if (!run || (run.status !== 'running' && run.status !== 'cancelling')) {
+        await this.store.releaseRunLock(listed.id);
+        continue;
+      }
       // NOT AN ORPHAN: a run with an in-flight (`pending`) remote step is not being executed in
       // process at all — its work is sitting on the transport, run by a worker that holds NO run
       // lease. So "the lease is acquirable" proves nothing about it, and by contract such a run is
@@ -3700,6 +3712,12 @@ export class WorkflowEngine {
       run.workflow,
       registered?.searchAttributesSchema,
     );
+    // Every settle below is `return await`ed, never a bare `return this.settleRun(...)`: inside
+    // `try … finally` a bare return runs the `finally` — which RELEASES THE LEASE — as soon as the
+    // return expression is evaluated, while the settle's own writes are still in flight. The run then
+    // sits unlocked but still reading `running`, which is exactly the shape `recoverIncomplete` takes
+    // for a crashed turn: it re-enqueued the run and a second execution replayed it alongside the one
+    // a fast step result had legitimately resumed. The lease must outlive the state it protects.
     try {
       // The ambient-context wrap is what lets class-first statics (`MyWorkflow.execute()`) find
       // this ctx from anywhere on the body's async path — first run and every replay alike.
@@ -3708,14 +3726,14 @@ export class WorkflowEngine {
       // `cancelling` status on recovery): undo + settle cancelled rather than completing, so the cancel
       // is never lost when the body returns without first hitting a suspension point.
       if (this.cancelRequested.has(run.id)) {
-        return this.compensateAndCancel(run, compensations, replay);
+        return await this.compensateAndCancel(run, compensations, replay);
       }
-      return this.settleRun(run, { kind: 'completed', output });
+      return await this.settleRun(run, { kind: 'completed', output });
     } catch (err) {
       if (err instanceof ContinueAsNew) {
         // A cancel in flight wins over continue-as-new: undo + cancel instead of spawning the next run.
         if (this.cancelRequested.has(run.id)) {
-          return this.compensateAndCancel(run, compensations, replay);
+          return await this.compensateAndCancel(run, compensations, replay);
         }
         // Hand off to a fresh execution with a clean history: complete this run, then start the next
         // (`<id>~N`) with the new input. Deferred + idempotent by the continuation id, so a crash
@@ -3745,21 +3763,21 @@ export class WorkflowEngine {
         // + dispatching into a queue nobody consumes. The blocked-recovery poll re-drives it when a
         // capable+compatible worker appears. A compensating cancel in flight still wins.
         if (this.cancelRequested.has(run.id)) {
-          return this.compensateAndCancel(run, compensations, replay);
+          return await this.compensateAndCancel(run, compensations, replay);
         }
-        return this.settleRun(run, { kind: 'blocked', blocked: err.plan });
+        return await this.settleRun(run, { kind: 'blocked', blocked: err.plan });
       }
       if (err instanceof WorkflowSuspended) {
         // A compensating cancel resumed this run to reach here: undo + cancel instead of re-suspending.
         if (this.cancelRequested.has(run.id)) {
-          return this.compensateAndCancel(run, compensations, replay);
+          return await this.compensateAndCancel(run, compensations, replay);
         }
-        return this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
+        return await this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
       }
       // A cancel in flight that surfaced as a thrown error still settles cancelled (not failed) — the
       // saga undo runs either way; this just keeps the terminal status faithful to the cancel request.
       if (this.cancelRequested.has(run.id)) {
-        return this.compensateAndCancel(run, compensations, replay);
+        return await this.compensateAndCancel(run, compensations, replay);
       }
       const error = {
         message: err instanceof Error ? err.message : String(err),
@@ -3773,8 +3791,8 @@ export class WorkflowEngine {
       // exactly like an ordinary `ctx.step` dispatch — the next re-drive (the worker's result landing,
       // or the retry backoff elapsing) resumes `unwindCompensations` right where it left off.
       const pending = await this.unwindCompensations(run, compensations, replay);
-      if (pending) return this.settleRun(run, { kind: 'suspended', wakeAt: pending.wakeAt });
-      return this.settleRun(run, { kind: 'failed', error });
+      if (pending) return await this.settleRun(run, { kind: 'suspended', wakeAt: pending.wakeAt });
+      return await this.settleRun(run, { kind: 'failed', error });
     } finally {
       // Release the recovery lease once the run reaches a terminal/suspended state, so the
       // next instance (or the timer poller) can pick it up promptly.
@@ -4226,7 +4244,16 @@ export class WorkflowEngine {
     const group = stepGroup(step, routing?.namespace);
     // Read the prefix from the per-execution snapshot (avoids the O(N²) replay SELECTs); a seq absent
     // from the snapshot — not yet dispatched, or written after the snapshot — falls back to the store.
-    const existing = replay?.get(seq) ?? (await this.store.getCheckpoint(runId, seq));
+    let existing = replay?.get(seq) ?? (await this.store.getCheckpoint(runId, seq));
+    // A `pending` step in the SNAPSHOT may already have its result: the snapshot is taken when this
+    // execution starts, and the result can land any time after. Every branch below that sees
+    // `pending` either suspends on it or WRITES the checkpoint back (`{ ...existing, wakeAt }` stamping
+    // the lost-dispatch lease, or a re-dispatch) — written from a stale row, that overwrites the landed
+    // `completed` result with `pending` and parks the run on a lease an hour out. So a pending step is
+    // re-read from the store before anything acts on it (one read, only at a suspension point).
+    if (existing?.status === 'pending' && replay?.has(seq)) {
+      existing = (await this.store.getCheckpoint(runId, seq)) ?? existing;
+    }
     if (existing && existing.name !== step.name) {
       throw new NonDeterminismError(runId, seq, step.name, existing.name);
     }
