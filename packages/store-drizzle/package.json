@@ -1,7 +1,7 @@
 {
   "name": "@dudousxd/nestjs-durable-store-drizzle",
   "version": "0.16.0",
-  "description": "Drizzle ORM (SQLite/libSQL) adapter for the nestjs-durable StateStore",
+  "description": "Drizzle ORM adapter for the nestjs-durable StateStore — SQLite/libSQL and PostgreSQL",
   "license": "MIT",
   "author": "Davide Carvalho",
   "repository": {
@@ -17,11 +17,20 @@
     "nestjs",
     "durable",
     "store",
-    "drizzle"
+    "drizzle",
+    "sqlite",
+    "postgres"
   ],
   "type": "module",
   "main": "./dist/index.cjs",
   "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "pg": [
+        "./dist/pg/index.d.ts"
+      ]
+    }
+  },
   "files": [
     "dist"
   ],
@@ -31,16 +40,21 @@
   },
   "peerDependencies": {
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
-    "drizzle-orm": "^0.36.0 || ^0.37.0 || ^0.38.0 || ^0.39.0 || ^0.40.0 || ^0.41.0 || ^0.42.0 || ^0.43.0 || ^0.44.0"
+    "drizzle-orm": "^0.36.0 || ^0.37.0 || ^0.38.0 || ^0.39.0 || ^0.40.0 || ^0.41.0 || ^0.42.0 || ^0.43.0 || ^0.44.0 || ^0.45.0"
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@dudousxd/nestjs-durable-testing": "workspace:^",
+    "@dudousxd/nestjs-durable-transport-db": "workspace:^",
+    "@testcontainers/postgresql": "10.18.0",
     "@types/better-sqlite3": "7.6.13",
+    "@types/pg": "8.11.10",
     "better-sqlite3": "12.10.0",
-    "drizzle-orm": "0.44.7",
-    "typescript": "5.9.3",
-    "tsup": "8.3.5"
+    "drizzle-orm": "0.45.3",
+    "pg": "8.13.1",
+    "postgres": "3.4.9",
+    "tsup": "8.3.5",
+    "typescript": "5.9.3"
   },
   "module": "./dist/index.js",
   "exports": {
@@ -52,6 +66,16 @@
       "require": {
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
+      }
+    },
+    "./pg": {
+      "import": {
+        "types": "./dist/pg/index.d.ts",
+        "default": "./dist/pg/index.js"
+      },
+      "require": {
+        "types": "./dist/pg/index.d.cts",
+        "default": "./dist/pg/index.cjs"
       }
     }
   }

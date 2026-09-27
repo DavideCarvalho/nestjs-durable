@@ -33,6 +33,11 @@
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
     "typeorm": "^0.3.0"
   },
+  "peerDependenciesMeta": {
+    "typeorm": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@testcontainers/postgresql": "10.18.0",

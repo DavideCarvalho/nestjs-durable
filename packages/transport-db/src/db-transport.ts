@@ -33,7 +33,8 @@ export interface DbTransportOptions {
   /**
    * How to run SQL — built from the app's **own** ORM/connection (no broker, no extra connection).
    * Use `mikroOrmExecutor(em)` to ride the app's MikroORM, `typeOrmExecutor(dataSource)` for TypeORM,
-   * or implement `SqlExecutor` for anything else.
+   * `drizzlePgExecutor(db)` (from `@dudousxd/nestjs-durable-store-drizzle/pg`) for Drizzle on
+   * Postgres, or implement `SqlExecutor` for anything else.
    */
   executor: SqlExecutor;
   /** The worker group this instance serves. Required to register `handle()` consumers. */
