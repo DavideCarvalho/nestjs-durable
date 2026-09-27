@@ -22,6 +22,38 @@ jobs:
       - run: pnpm build
       - run: pnpm test
 
+  # The Drizzle Postgres store against a real Postgres: the shared StateStore contract on both
+  # node-postgres and postgres-js, plus the DDL <-> pgTable parity, lease/SKIP LOCKED concurrency,
+  # retention and DbTransport cases. Uses a service container via DURABLE_TEST_PG_URL rather than
+  # testcontainers, so it needs no Docker-in-Docker and stays a ~1 minute job.
+  store-drizzle-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: durable
+          POSTGRES_PASSWORD: durable
+          POSTGRES_DB: durable
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U durable"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:db packages/store-drizzle
+        env:
+          DURABLE_TEST_PG_URL: postgres://durable:durable@localhost:5432/durable
+
   # clients/python (durable-worker) ships separately to PyPI via the durable-worker-v* tag, and
   # until now nothing ran its tests — the `build` job above is entirely the pnpm workspace. A
   # library whose whole job is surviving a broken Redis should not rely on someone remembering

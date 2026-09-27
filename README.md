@@ -125,7 +125,7 @@ multiple worker pools sharing one store/broker.
 | `@dudousxd/nestjs-durable-transport-event-emitter` | In-process Transport (zero-infra default) | ✅ |
 | `@dudousxd/nestjs-durable-transport-bullmq` | BullMQ/Redis Transport for cross-process / Python steps | ✅ |
 | `@dudousxd/nestjs-durable-store-mikro-orm` · `-store-typeorm` · `-store-prisma` | `StateStore` on Postgres / MySQL / SQLite | ✅ |
-| `@dudousxd/nestjs-durable-store-drizzle` | Drizzle `StateStore` (SQLite / libSQL) | ✅ |
+| `@dudousxd/nestjs-durable-store-drizzle` | Drizzle `StateStore` — SQLite / libSQL at the root, **PostgreSQL** at `/pg` | ✅ |
 | `@dudousxd/nestjs-durable-dashboard` | Embedded control-plane SPA (runs + timeline + retry/cancel) | ✅ |
 | `@dudousxd/nestjs-durable-otel` | OpenTelemetry — trace per run, span per step | ✅ |
 | `@dudousxd/nestjs-durable-telescope` | `@dudousxd/nestjs-telescope` watcher | ✅ |

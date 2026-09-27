@@ -6,7 +6,7 @@ import { defineConfig } from 'tsup';
 // uses no decorators, so esbuild (which can't emit `emitDecoratorMetadata`) is safe here.
 export default defineConfig([
   {
-    entry: ['src/index.ts'],
+    entry: { index: 'src/index.ts', 'pg/index': 'src/pg/index.ts' },
     format: ['esm'],
     dts: true,
     clean: true,
@@ -15,7 +15,7 @@ export default defineConfig([
     outDir: 'dist',
   },
   {
-    entry: ['src/index.ts'],
+    entry: { index: 'src/index.ts', 'pg/index': 'src/pg/index.ts' },
     format: ['cjs'],
     // Emit a CJS-flavoured declaration (index.d.cts) so the `require` condition resolves to types
     // matching the CommonJS output under NodeNext.

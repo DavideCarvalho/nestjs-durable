@@ -1,0 +1,161 @@
+---
+title: Drizzle (Postgres)
+description: The Drizzle StateStore adapter for PostgreSQL — pgTable definitions for drizzle-kit, or auto-schema on boot; jsonb payloads, timestamptz timers, atomic leases, SKIP LOCKED claiming, retention and tenant-scoped reads. Works with node-postgres, postgres-js and any other drizzle Postgres driver.
+icon: Database
+---
+
+`@dudousxd/nestjs-durable-store-drizzle/pg` persists runs and step checkpoints through **Drizzle** on
+**PostgreSQL**. It is the same package as the [SQLite / libSQL Drizzle store](/docs/stores/drizzle),
+behind a dialect subpath — the package root stays SQLite, `/pg` is Postgres.
+
+```bash
+pnpm add @dudousxd/nestjs-durable-store-drizzle
+```
+
+`drizzle-orm` is a peer (`^0.36` through `^0.45`). The store rides whatever drizzle Postgres db you
+already have — `drizzle-orm/node-postgres`, `drizzle-orm/postgres-js`, PGlite, Neon, … — and only
+uses the query builder, so you don't have to register the durable tables on your db's relational
+schema.
+
+## 1. Wire the store into the module
+
+```ts title="durable.module.ts"
+import { DurableModule } from '@dudousxd/nestjs-durable';
+import { DrizzlePgStateStore } from '@dudousxd/nestjs-durable-store-drizzle/pg';
+import { EventEmitterTransport } from '@dudousxd/nestjs-durable-transport-event-emitter';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { DB } from './db'; // your provider for `drizzle(pool)`
+
+DurableModule.forRootAsync({
+  inject: [DB, EventEmitter2],
+  useFactory: (db, emitter) => ({
+    store: new DrizzlePgStateStore(db),
+    transport: new EventEmitterTransport(emitter),
+    autoSchema: false, // drizzle-kit owns the tables — see below
+  }),
+});
+```
+
+## 2. Create the tables — drizzle-kit, or auto-schema
+
+**Option A — drizzle-kit (recommended when drizzle-kit already owns your migrations).** Re-export the
+durable tables from the schema file your `drizzle.config.ts` points at, then generate as usual:
+
+```ts title="src/db/schema.ts"
+export * from './app-tables';
+// The six durable_* pgTables (plus the store class, which drizzle-kit ignores).
+export * from '@dudousxd/nestjs-durable-store-drizzle/pg';
+```
+
+```bash
+npx drizzle-kit generate   # emits CREATE TABLE durable_workflow_runs … + indexes
+npx drizzle-kit migrate
+```
+
+Prefer an explicit list? The tables are exported individually — `durableWorkflowRuns`,
+`durableStepCheckpoints`, `durableRunAttributes`, `durableSignalWaiters`, `durableBufferedSignals`,
+`durableBufferedEvents` — and bundled as `durablePgSchema`. Set `autoSchema: false` so the module
+doesn't also try to create them (harmless — it is `IF NOT EXISTS` — but one owner is clearer).
+
+**Option B — auto-schema.** Leave `autoSchema` on (the default) and `DrizzlePgStateStore.ensureSchema()`
+creates the tables and indexes on boot: idempotent `CREATE … IF NOT EXISTS`, in one transaction under
+a `pg_advisory_xact_lock`, so several pods booting together don't race. The SQL is exported as
+`DURABLE_PG_DDL` (and `ensureDrizzlePgDurableSchema(db)`) if you'd rather run it from your own
+migration. If you pick this option, keep drizzle-kit off the tables with
+`tablesFilter: ['!durable_*']` in `drizzle.config.ts`.
+
+The two are the same schema: the shipped DDL is byte-for-byte what `drizzle-kit generate` emits for the
+`pgTable`s, and a real-Postgres spec pins them against each other — so a database created by
+`ensureSchema()` reports **no changes** under `drizzle-kit push`, and you can switch options later.
+
+## Schema
+
+Canonical table + column names (the same `durable_*` / snake_case contract as every other adapter),
+with Postgres-native types:
+
+| | |
+| --- | --- |
+| JSON payloads (`input`, `output`, `error`, `events`, `tags`, `search_attributes`, `payload`) | `jsonb` |
+| `created_at`, `updated_at`, `wake_at`, `locked_until`, step timestamps | `timestamptz` |
+| strings (ids, tokens, names) | `text` |
+| `namespace` | `text NOT NULL DEFAULT 'default'` |
+
+Indexes: `(namespace, status, created_at)` for every poll tick, `(status, wake_at)` for timers and
+recovery, `(workflow, status)` for the dashboard, `(status, updated_at)` for retention, a **GIN
+`jsonb_path_ops` index on `tags`**, `(key, num_value)` / `(key, str_value)` on the search-attribute
+side table, plus the per-token / per-name scans of the signal and event buffers.
+
+## What the Postgres flavour adds
+
+- **Atomic leases.** `tryLockRun` / `renewRunLock` are one conditional `UPDATE … RETURNING`: of N
+  instances racing for a run, exactly one wins (verified against real Postgres with concurrent
+  contenders).
+- **SKIP LOCKED claiming.** `takeBufferedSignal` claims the oldest buffered signal with
+  `FOR UPDATE SKIP LOCKED` and deletes it in the same statement, so concurrent takers get distinct
+  signals, never a duplicate. `takeSignalWaiter` is a single `DELETE … RETURNING`.
+- **Retention.** Implements `pruneTerminalRuns`, so the module's
+  [`retention`](/docs/stores#retention--pruning) option works. Each batch is selected with
+  `FOR UPDATE SKIP LOCKED`, so several pods sweeping at once split the backlog, and only terminal
+  statuses are ever eligible even if a policy names a live one.
+- **Indexed tag filters.** `listRuns({ tag })` is `tags @> '["tag"]'` — exact element match, served by
+  the GIN index. That matters for the singleton gate, which finds same-key runs by their
+  `singleton:<key>` tag.
+- **Tenant-scoped reads.** Implements `withScope`, so `scopeReads: true` (with `namespace`) confines
+  the operator's run reads to one namespace — see below.
+- **`ctx.transaction` with your Drizzle tx.** The `tx` handed to your callback is the drizzle
+  transaction; your writes commit atomically with the step checkpoint.
+
+## Multi-tenant workloads
+
+Two different axes, pick by what you need:
+
+- **`namespace` = a worker pool.** An engine with `namespace: 'x'` only picks up, recovers, resumes
+  timers for and times out runs in `x`, over the `(namespace, status, created_at)` index. Use it when
+  tenants get their own workers. `new DrizzlePgStateStore(db, { scope: { namespace } })` (or the
+  module's `scopeReads`) confines reads to one namespace too.
+- **One pool, many tenants** (the common SaaS shape): keep one namespace and put the tenant on the run.
+  Filter/list with a search attribute, and cap per-tenant concurrency with a singleton key:
+
+```ts
+@Workflow({
+  name: 'agent-turn',
+  // at most 3 concurrent turns per tenant; the rest queue durably, FIFO
+  singleton: { key: (input) => `tenant:${(input as { tenantId: string }).tenantId}`, limit: 3 },
+})
+class AgentTurnWorkflow { /* … */ }
+
+await engine.start('agent-turn', input, `turn:${tenantId}:${turnId}`, {
+  searchAttributes: { tenantId },
+});
+// indexed EXISTS probe on durable_run_attributes (key, str_value)
+await store.listRuns({ attributes: [{ key: 'tenantId', op: 'eq', value: tenantId }] });
+```
+
+## Broker-less remote steps on the same database
+
+`drizzlePgExecutor(db)` adapts your drizzle db to the [DB transport](/docs/transports/db)'s
+`SqlExecutor`, so remote steps become rows claimed with `FOR UPDATE SKIP LOCKED` — on the same pool
+as your app and the store, with no Redis:
+
+```ts
+import { DbTransport } from '@dudousxd/nestjs-durable-transport-db';
+import { DrizzlePgStateStore, drizzlePgExecutor } from '@dudousxd/nestjs-durable-store-drizzle/pg';
+
+DurableModule.forRoot({
+  store: new DrizzlePgStateStore(db),
+  transport: new DbTransport({ executor: drizzlePgExecutor(db), group: 'api' }),
+});
+```
+
+<Callout type="warn">
+  **Not byte-compatible with the TypeORM Postgres tables.** Names are canonical, but types differ:
+  TypeORM stores JSON as `text` and strings as `varchar(191)`, this adapter uses `jsonb` and `text`.
+  Pointing it at tables the TypeORM adapter created reads fine but tag filters (`@>`) fail on a `text`
+  column — migrate the columns to `jsonb` first. The MikroORM Postgres tables already use `jsonb`.
+</Callout>
+
+<Callout>
+  **Tables live in the connection's `search_path` schema** (usually `public`); there is no option to
+  put them in a separate Postgres schema yet. Wakeups are poll-based like every other store — there
+  is no `LISTEN/NOTIFY` yet; tune `timerPollMs` if you need sub-second timer resolution.
+</Callout>
