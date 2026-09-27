@@ -40,6 +40,7 @@ own migrations:
 | [TypeORM](/docs/stores/typeorm) | Postgres · MySQL/MariaDB · SQLite | auto-schema or `ensure*` | Register `ENTITIES` on your `DataSource`. |
 | [Prisma](/docs/stores/prisma) | any Prisma datasource | Prisma Migrate | Add the models, `prisma generate`, pass your `PrismaClient`. |
 | [Drizzle](/docs/stores/drizzle) | SQLite / libSQL (Turso, edge) | drizzle-kit | Build your db with the package's schema. |
+| [Drizzle (Postgres)](/docs/stores/drizzle-postgres) | PostgreSQL | drizzle-kit or auto-schema | `@dudousxd/nestjs-durable-store-drizzle/pg` — any drizzle Postgres driver. |
 
 The MikroORM and TypeORM adapters work on any SQL database their ORM supports — **Postgres, MySQL or
 SQLite** (timestamps use native datetime columns, so epoch values never overflow). The quickest wire
@@ -56,7 +57,7 @@ DurableModule.forRootAsync({
 
 ## Auto-schema
 
-For the **MikroORM** and **TypeORM** adapters, the module creates the durable tables on boot
+For the **MikroORM**, **TypeORM** and **Drizzle (Postgres)** adapters, the module creates the durable tables on boot
 (`durable_workflow_runs`, `durable_step_checkpoints`, `durable_run_attributes`,
 `durable_signal_waiters`, `durable_buffered_signals`) — zero setup in dev. Turn it off in production
 and own the schema via a migration:
@@ -65,15 +66,17 @@ and own the schema via a migration:
 DurableModule.forRoot({ store, autoSchema: false });
 ```
 
-Each of those two adapters exports the exact function to call from your own migration —
-`ensureMikroOrmDurableSchema(orm)` and `ensureTypeOrmDurableSchema(dataSource)`. See the
+Each of those adapters exports the exact function to call from your own migration —
+`ensureMikroOrmDurableSchema(orm)`, `ensureTypeOrmDurableSchema(dataSource)` and
+`ensureDrizzlePgDurableSchema(db)` (whose SQL is also exported as `DURABLE_PG_DDL`). See the
 [MikroORM](/docs/stores/mikro-orm#schema-auto-on-boot-or-your-own-migration) and
 [TypeORM](/docs/stores/typeorm#schema-auto-on-boot-or-your-own-migration) pages for the full
 migration snippets. It only ever adds the durable tables — it never touches yours.
 
-The **Prisma** and **Drizzle** adapters have no auto-schema: their ORMs already own your schema and
-migration history, so you create the durable tables with `prisma migrate` / `drizzle-kit` (the
-`autoSchema` option is a no-op for them).
+The **Prisma** and **Drizzle (SQLite)** adapters have no auto-schema: their ORMs already own your
+schema and migration history, so you create the durable tables with `prisma migrate` / `drizzle-kit`
+(the `autoSchema` option is a no-op for them). The Drizzle Postgres store supports both: re-export its
+`pgTable`s into your drizzle-kit schema, or let auto-schema create the identical tables.
 
 ## Column naming
 
@@ -158,14 +161,16 @@ Each `RetentionPolicy` targets a disjoint set of terminal statuses; a run is kep
 satisfies every bound you set on its status (`maxAge`, `maxCount`, or both — the most-restrictive
 wins) and is pruned the moment it violates one. `sweepInterval: 0` runs the sweep once on boot only.
 Pruning needs the store to implement `pruneTerminalRuns` — optional on `StateStore`, so a store
-without it no-ops with a warning instead of failing boot. Of the four bundled adapters, only
-**MikroORM** implements it today; TypeORM, Prisma and Drizzle no-op with the warning until they do.
+without it no-ops with a warning instead of failing boot. Of the bundled adapters, only
+**MikroORM** and **Drizzle (Postgres)** implement it today; TypeORM, Prisma and Drizzle (SQLite)
+no-op with the warning until they do.
 
 <Callout type="warn">
-  **`withScope` is MikroORM-only.** Multi-tenant setups can turn on `scopeReads: true` (with
-  `namespace` set) to confine the operator's own reads to one tenant. The module applies this by
-  asking the store for a scoped view via an optional `withScope(scope)` capability — today only the
-  MikroORM adapter implements it. Against TypeORM, Prisma or Drizzle, `scopeReads` silently has no
+  **`withScope` is MikroORM + Drizzle (Postgres) only.** Multi-tenant setups can turn on
+  `scopeReads: true` (with `namespace` set) to confine the operator's own reads to one tenant. The
+  module applies this by asking the store for a scoped view via an optional `withScope(scope)`
+  capability — today only the MikroORM and Drizzle Postgres adapters implement it. Against TypeORM,
+  Prisma or Drizzle (SQLite), `scopeReads` silently has no
   effect: the store keeps returning every namespace's runs. If you need tenant-scoped reads on one of
   those adapters, scope the query yourself rather than relying on `scopeReads`.
 </Callout>
