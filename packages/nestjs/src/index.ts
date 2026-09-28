@@ -31,6 +31,7 @@ export * from './workflow.service';
 // that resolves it. Keep classes here, types above.
 export type {
   AttributeFilter,
+  DynamicWorkflowCtx,
   EngineEvent,
   InferSearchAttributes,
   RunDetail,

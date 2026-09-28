@@ -1813,6 +1813,55 @@ export interface WorkflowCtx<A extends SearchAttributes = SearchAttributes> {
   ): Promise<TOutput>;
 }
 
+/**
+ * {@link WorkflowCtx} with ONE signature per method: the string-addressed forms of the four overloaded
+ * methods (`step`, `child`, `startChild`, `all`), everything else unchanged.
+ *
+ * For code that drives the ctx DYNAMICALLY — an interpreter that runs a user-defined graph and only
+ * ever knows workflow/step names as strings — and for test fakes. An overloaded method is awkward to
+ * satisfy structurally (a fake must implement every overload, and a hand-written narrow interface
+ * has to guess which overload TS will match), so depend on this instead:
+ *
+ * ```ts
+ * type InterpreterCtx = Pick<DynamicWorkflowCtx, 'runId' | 'localStep' | 'child' | 'all' | 'sleep'>;
+ * class Interpreter { constructor(private readonly ctx: InterpreterCtx) {} }
+ *
+ * async run(ctx: WorkflowCtx, input: Input) {
+ *   return new Interpreter(ctx).run(); // no cast — a WorkflowCtx IS a DynamicWorkflowCtx
+ * }
+ * ```
+ *
+ * Every `WorkflowCtx<A>` is assignable to `DynamicWorkflowCtx<A>` (guarded by
+ * `dynamic-workflow-ctx.type-test.ts`), and a `Pick` of it is a plain object literal in a test.
+ */
+export interface DynamicWorkflowCtx<A extends SearchAttributes = SearchAttributes>
+  extends Omit<WorkflowCtx<A>, 'step' | 'child' | 'startChild' | 'all'> {
+  /** {@link WorkflowCtx.step} by step name (a cross-runtime handler, or a `@Step` by its name). */
+  step<TOutput = unknown, TInput = unknown>(
+    name: string,
+    input: TInput,
+    opts?: StepDispatchOpts & { compensate?: string },
+  ): Promise<TOutput>;
+  /** {@link WorkflowCtx.child} by workflow name. */
+  child<TOutput = unknown>(
+    workflow: string,
+    input: unknown,
+    options?: string | ChildCallOptions,
+  ): Promise<TOutput>;
+  /** {@link WorkflowCtx.startChild} by workflow name. */
+  startChild(
+    workflow: string,
+    input: unknown,
+    options?: string | ChildCallOptions,
+  ): Promise<string>;
+  /** {@link WorkflowCtx.all} by workflow name. */
+  all<TOutput = unknown>(
+    workflow: string,
+    inputs: unknown[],
+    opts?: { mode?: 'waitAll' | 'failFast' },
+  ): Promise<TOutput[]>;
+}
+
 /** Result of executing or resuming a workflow run. */
 export interface RunResult {
   runId: string;
