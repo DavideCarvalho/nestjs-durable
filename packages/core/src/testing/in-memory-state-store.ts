@@ -1,14 +1,17 @@
-import type {
-  RunFacetQuery,
-  RunFacetRow,
-  RunQuery,
-  RunValueAxis,
-  RunValueFacetOptions,
-  RunValueFacetRow,
-  SignalWaiter,
-  StateStore,
-  StepCheckpoint,
-  WorkflowRun,
+import { parseDuration } from '../duration';
+import {
+  type RetentionPolicy,
+  type RunFacetQuery,
+  type RunFacetRow,
+  type RunQuery,
+  type RunValueAxis,
+  type RunValueFacetOptions,
+  type RunValueFacetRow,
+  type SignalWaiter,
+  type StateStore,
+  type StepCheckpoint,
+  TERMINAL_RUN_STATUSES,
+  type WorkflowRun,
 } from '../interfaces';
 import type { AttributeFilter } from '../interfaces';
 import { mergeRunFacetRows } from '../run-facets';
@@ -93,6 +96,40 @@ export class InMemoryStateStore implements StateStore {
     }
     // Drop the run's normalized attribute rows (reindex with no attributes clears them).
     this.reindexAttributes(runId, undefined);
+  }
+
+  async deleteRuns(runIds: string[]): Promise<void> {
+    for (const runId of runIds) await this.deleteRun(runId);
+  }
+
+  async pruneTerminalRuns(policy: RetentionPolicy, nowMs: number, limit: number): Promise<number> {
+    // Only terminal statuses are ever eligible — a policy naming a live status would race the engine.
+    const statuses = policy.statuses.filter((s) => TERMINAL_RUN_STATUSES.includes(s));
+    if (statuses.length === 0 || limit <= 0) return 0;
+    if (policy.maxAge == null && policy.maxCount == null) return 0;
+    const inScope = this.matching({ ...(policy.scope ?? {}), statuses });
+    const ids = new Set<string>();
+    if (policy.maxAge != null) {
+      const cutoff = nowMs - parseDuration(policy.maxAge);
+      const expired = inScope
+        .filter((r) => r.updatedAt.getTime() < cutoff)
+        .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime()) // oldest first
+        .slice(0, limit);
+      for (const r of expired) ids.add(r.id);
+    }
+    if (policy.maxCount != null && ids.size < limit) {
+      // Everything past the newest `maxCount` runs of the (scoped) status set.
+      const byRecency = [...inScope].sort(
+        (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime() || b.id.localeCompare(a.id),
+      );
+      for (const r of byRecency.slice(policy.maxCount)) {
+        if (ids.size >= limit) break;
+        ids.add(r.id);
+      }
+    }
+    const doomed = [...ids].slice(0, limit);
+    await this.deleteRuns(doomed);
+    return doomed.length;
   }
 
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {

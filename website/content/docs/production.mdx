@@ -274,9 +274,11 @@ DurableModule.forRoot({
 });
 ```
 
-This requires a store adapter that implements bulk pruning (the MikroORM adapter does; others no-op
-with a warning). See [Retention](/docs/reliability/retention) for the full policy shape, the sweep
-interval/batch-size defaults, and how "keep" bounds combine.
+Every bundled store adapter implements the bulk prune (a custom store without it no-ops with a
+warning). Policies can be scoped to a namespace, tags, workflows or search attributes, and
+`engine.purgeNamespace(ns)` / `engine.purgeRuns(scope)` delete a tenant's runs on demand. See
+[Retention](/docs/reliability/retention) for the full policy shape, the sweep interval/batch-size
+defaults, and how "keep" bounds combine.
 
 ## 9. Observability
 

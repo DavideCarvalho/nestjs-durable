@@ -70,7 +70,8 @@ import type {
   WorkflowRun,
   WorkflowStepEvent,
 } from './interfaces';
-import type { HistoryEvent } from './interfaces';
+import type { HistoryEvent, RunScope } from './interfaces';
+import { TERMINAL_RUN_STATUSES, isNonEmptyRunScope } from './interfaces';
 import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
@@ -2399,6 +2400,128 @@ export class WorkflowEngine {
     }
     await this.store.deleteRun(runId);
     return deleted + 1;
+  }
+
+  /**
+   * Hard-delete EVERY run matching `scope` — plus, by default, each one's whole child subtree — in
+   * bounded batches. The "forget this tenant" / "drop this feature's history" operation: where
+   * {@link deleteRun} removes one tree you already know the id of, this drains everything a scope
+   * selects (`{ namespace: 'acme' }`, `{ tag: 'tenant:acme' }`, `{ workflows: [...] }`, attribute
+   * predicates …) through the store API, so no caller has to reach into the `durable_*` tables.
+   *
+   *  - **Live runs** (not yet terminal) are {@link cancel cancelled} first (plain cancel, no saga
+   *    undo), which tells any worker holding one to stop, and then deleted with the rest. Pass
+   *    `cancelLive: false` to leave live runs (and live descendants of finished ones) alone and
+   *    delete terminal history only.
+   *  - **Children** are found through the same parent→child edges as {@link getRunChildren} and deleted
+   *    with their root even when they don't match `scope` themselves (children inherit `namespace`,
+   *    but not `tags`). `children: false` deletes exactly the matching runs.
+   *  - **Batched**: `batchSize` runs (default 500) per round, each round one bulk
+   *    {@link StateStore.deleteRuns} (falling back to per-run {@link StateStore.deleteRun}).
+   *
+   * An EMPTY scope is rejected — it would delete every run in the store. Returns how many runs were
+   * deleted (children included).
+   */
+  async purgeRuns(
+    scope: RunScope,
+    opts?: { batchSize?: number; cancelLive?: boolean; children?: boolean },
+  ): Promise<number> {
+    if (!isNonEmptyRunScope(scope)) {
+      throw new Error(
+        'purgeRuns: refusing an empty scope (it would delete every run) — pass at least one predicate, e.g. { namespace }',
+      );
+    }
+    const batchSize = Math.max(1, opts?.batchSize ?? 500);
+    const cancelLive = opts?.cancelLive ?? true;
+    const withChildren = opts?.children ?? true;
+    const statuses = cancelLive ? undefined : [...TERMINAL_RUN_STATUSES];
+    let deleted = 0;
+    let previous = '';
+    for (;;) {
+      const batch = await this.store.listRuns({ ...scope, statuses, limit: batchSize });
+      if (batch.length === 0) break;
+      const fingerprint = batch.map((r) => r.id).join('\u0000');
+      // Every listed run is deleted below, so the next page is new rows — the same page twice means
+      // the store is not deleting (a broken adapter); stop instead of spinning forever.
+      if (fingerprint === previous) {
+        throw new Error('purgeRuns: the store returned the same runs after deleting them');
+      }
+      previous = fingerprint;
+      const known = new Map(batch.map((r) => [r.id, r.status] as const));
+      const ids = withChildren
+        ? await this.collectSubtrees(batch.map((r) => r.id))
+        : batch.map((r) => r.id);
+      const doomed: string[] = [];
+      for (const id of ids) {
+        const status = known.has(id) ? known.get(id) : (await this.store.getRun(id))?.status;
+        if (status === undefined) continue; // already gone
+        if (!TERMINAL_RUN_STATUSES.includes(status)) {
+          // A live descendant of a finished root: cancel it with the tree, or leave it be.
+          if (!cancelLive) continue;
+          await this.cancel(id).catch(() => undefined);
+        }
+        doomed.push(id);
+      }
+      await this.deleteRunIds(doomed);
+      deleted += doomed.length;
+      if (batch.length < batchSize) break;
+    }
+    return deleted;
+  }
+
+  /**
+   * {@link purgeRuns} for one namespace — every run (and child) a tenant/partition owns. Children
+   * inherit their parent's namespace, so a namespace purge is complete by construction.
+   */
+  purgeNamespace(
+    namespace: string,
+    opts?: { batchSize?: number; cancelLive?: boolean },
+  ): Promise<number> {
+    return this.purgeRuns({ namespace }, opts);
+  }
+
+  /** The given runs plus every descendant, children before parents. One waiter scan for the batch. */
+  private async collectSubtrees(rootIds: string[]): Promise<string[]> {
+    const waitersByParent = new Map<string, string[]>();
+    for (const w of await this.store.listSignalWaiters('child:')) {
+      const list = waitersByParent.get(w.runId) ?? [];
+      list.push(w.token.slice('child:'.length));
+      waitersByParent.set(w.runId, list);
+    }
+    const prefixes = ['signal:child:', 'spawn:'];
+    const childrenOf = async (parent: string): Promise<string[]> => {
+      const ids = new Set(waitersByParent.get(parent) ?? []);
+      const cps = this.store.listCheckpointsByNamePrefix
+        ? await this.store.listCheckpointsByNamePrefix(parent, prefixes)
+        : (await this.store.listCheckpoints(parent)).filter((cp) =>
+            prefixes.some((p) => cp.name.startsWith(p)),
+          );
+      for (const cp of cps) {
+        if (cp.name.startsWith('signal:child:')) ids.add(cp.name.slice('signal:child:'.length));
+        if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') ids.add(cp.output);
+      }
+      return [...ids];
+    };
+    const ordered: string[] = [];
+    const seen = new Set<string>();
+    const visit = async (id: string): Promise<void> => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      for (const child of await childrenOf(id)) await visit(child);
+      ordered.push(id); // post-order: children first
+    };
+    for (const id of rootIds) await visit(id);
+    return ordered;
+  }
+
+  /** Bulk-delete through the store's `deleteRuns`, or one `deleteRun` per id when it has none. */
+  private async deleteRunIds(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    if (this.store.deleteRuns) {
+      await this.store.deleteRuns(ids);
+      return;
+    }
+    for (const id of ids) await this.store.deleteRun(id);
   }
 
   /**

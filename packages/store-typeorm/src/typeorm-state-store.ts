@@ -1,6 +1,7 @@
 import {
   type AttributeFilter,
   RUN_VALUE_FACET_SCAN,
+  type RetentionPolicy,
   type RunFacetQuery,
   type RunFacetRow,
   type RunQuery,
@@ -13,12 +14,14 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  TERMINAL_RUN_STATUSES,
   type WorkflowRun,
   attributePredicateOperands,
   axisIsRunColumn,
   mergeRunFacetRows,
   mergeRunValueFacetRows,
   normalizeAttributeRows,
+  parseDuration,
   runValueFacetsFromRuns,
 } from '@dudousxd/nestjs-durable-core';
 import {
@@ -139,6 +142,53 @@ export class TypeOrmStateStore implements StateStore {
     await this.waiters().delete({ runId });
     await this.attributes().delete({ runId });
     await this.runs().delete({ id: runId });
+  }
+
+  async deleteRuns(runIds: string[]): Promise<void> {
+    if (runIds.length === 0) return;
+    // Same cascade as deleteRun, one `IN (...)` per table, atomically.
+    await this.dataSource.transaction(async (em) => {
+      await em.getRepository(StepCheckpointEntity).delete({ runId: In(runIds) });
+      await em.getRepository(SignalWaiterEntity).delete({ runId: In(runIds) });
+      await em.getRepository(RunAttributeEntity).delete({ runId: In(runIds) });
+      await em.getRepository(WorkflowRunEntity).delete({ id: In(runIds) });
+    });
+  }
+
+  async pruneTerminalRuns(policy: RetentionPolicy, nowMs: number, limit: number): Promise<number> {
+    // Only terminal statuses are ever eligible — a policy naming a live status would race the engine.
+    const statuses = policy.statuses.filter((s) => TERMINAL_RUN_STATUSES.includes(s));
+    if (statuses.length === 0 || limit <= 0) return 0;
+    if (policy.maxAge == null && policy.maxCount == null) return 0;
+    // A scoped policy only ever sees (and, for maxCount, counts) the runs its scope matches.
+    const scoped = () =>
+      this.runQueryBuilder({ ...(policy.scope ?? {}), statuses }).select('r.id', 'id');
+    const ids = new Set<string>();
+    if (policy.maxAge != null) {
+      const cutoff = new Date(nowMs - parseDuration(policy.maxAge));
+      const rows: Array<{ id: string }> = await scoped()
+        .andWhere('r.updatedAt < :cutoff', { cutoff })
+        .orderBy('r.updatedAt', 'ASC') // oldest first
+        .limit(limit)
+        .getRawMany();
+      for (const r of rows) ids.add(r.id);
+    }
+    if (policy.maxCount != null && ids.size < limit) {
+      // Everything past the newest `maxCount` rows of the scoped status set (skipped by OFFSET).
+      const rows: Array<{ id: string }> = await scoped()
+        .orderBy('r.updatedAt', 'DESC')
+        .addOrderBy('r.id', 'DESC')
+        .limit(limit)
+        .offset(policy.maxCount)
+        .getRawMany();
+      for (const r of rows) {
+        if (ids.size >= limit) break;
+        ids.add(r.id);
+      }
+    }
+    const doomed = [...ids].slice(0, limit);
+    await this.deleteRuns(doomed);
+    return doomed.length;
   }
 
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {

@@ -173,11 +173,20 @@ export class DrizzlePgStateStore implements StateStore {
     });
   }
 
+  async deleteRuns(runIds: string[]): Promise<void> {
+    if (runIds.length === 0) return;
+    await this.db.transaction(async (tx) => {
+      await deleteRunsCascade(tx, runIds);
+    });
+  }
+
   async pruneTerminalRuns(policy: RetentionPolicy, nowMs: number, limit: number): Promise<number> {
     // Only terminal statuses are ever eligible — a policy naming a live status would race the engine.
     const statuses = policy.statuses.filter((s) => TERMINAL_RUN_STATUSES.includes(s));
     if (statuses.length === 0 || limit <= 0) return 0;
     if (policy.maxAge == null && policy.maxCount == null) return 0;
+    // A scoped policy only ever sees (and, for maxCount, counts) the runs its scope matches.
+    const scoped = this.runFilters({ ...(policy.scope ?? {}), statuses });
     return this.db.transaction(async (tx) => {
       const ids = new Set<string>();
       if (policy.maxAge != null) {
@@ -185,7 +194,7 @@ export class DrizzlePgStateStore implements StateStore {
         const rows = await tx
           .select({ id: workflowRuns.id })
           .from(workflowRuns)
-          .where(and(inArray(workflowRuns.status, statuses), lt(workflowRuns.updatedAt, cutoff)))
+          .where(and(...scoped, lt(workflowRuns.updatedAt, cutoff)))
           .orderBy(asc(workflowRuns.updatedAt)) // oldest first
           .limit(limit)
           .for('update', { skipLocked: true });
@@ -197,7 +206,7 @@ export class DrizzlePgStateStore implements StateStore {
         const rows = await tx
           .select({ id: workflowRuns.id })
           .from(workflowRuns)
-          .where(inArray(workflowRuns.status, statuses))
+          .where(and(...scoped))
           .orderBy(desc(workflowRuns.updatedAt), desc(workflowRuns.id))
           .limit(limit)
           .offset(policy.maxCount)
