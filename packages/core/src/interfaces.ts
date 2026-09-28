@@ -324,10 +324,24 @@ export interface StateStore {
    * first), cascading to their child rows exactly like {@link deleteRun}. Returns how many runs were
    * deleted — call again while it returns `limit` to drain a large backlog in bounded batches.
    *
+   * A policy with a {@link RetentionPolicy.scope} only ever selects (and counts, for `maxCount`) runs
+   * matching that scope.
+   *
    * Optional: only adapters that implement a bulk prune provide it; the retention poller no-ops with a
    * warning when the configured store omits it. See {@link RetentionPolicy} for the keep/prune rule.
    */
   pruneTerminalRuns?(policy: RetentionPolicy, nowMs: number, limit: number): Promise<number>;
+
+  /**
+   * Hard-delete a BATCH of runs and all of their rows in one go — exactly {@link deleteRun} applied to
+   * every id (checkpoints, signal waiters, attribute rows, then the runs), but as a handful of
+   * `IN (...)` statements in one transaction instead of four round-trips per run. Ids that don't exist
+   * are ignored. Like {@link deleteRun} it removes exactly the listed runs; the engine's
+   * `purgeRuns` walks the child edges first.
+   *
+   * Optional: a store that omits it still works — the engine falls back to one {@link deleteRun} per id.
+   */
+  deleteRuns?(runIds: string[]): Promise<void>;
 
   getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null>;
   /**
@@ -515,6 +529,42 @@ export interface RetentionPolicy {
   statuses: RunStatus[];
   maxAge?: number | string;
   maxCount?: number;
+  /**
+   * Confine the policy to the runs matching these predicates (same semantics as the {@link RunQuery}
+   * fields of the same names) — e.g. `{ namespace: 'acme' }` for one tenant, `{ tags: ['chat'] }` for
+   * one kind of run, `{ workflows: ['report', 'report.branch'] }` for a workflow family. Absent = every
+   * run in `statuses`. `maxCount` is then counted WITHIN the scope ("keep acme's newest 100").
+   *
+   * A scope matches runs by their own row, so a child run is only covered if it matches too (children
+   * inherit their parent's `namespace`, but not its `tags`) — scope by `namespace` or by `workflows`
+   * when a whole run tree must age out together.
+   */
+  scope?: RunScope | undefined;
+}
+
+/**
+ * The run predicates a bulk operation (a scoped {@link RetentionPolicy}, `engine.purgeRuns`) is
+ * confined to — the identity axes of a {@link RunQuery}: which tenant (`namespace`), which kind of
+ * run (`workflow`/`tags`), which business entity (`attributes`). Status, origin and paging are left
+ * out on purpose: each bulk operation owns its own status rule.
+ */
+export type RunScope = Pick<
+  RunQuery,
+  'workflow' | 'workflows' | 'tag' | 'tags' | 'namespace' | 'namespaces' | 'attributes'
+>;
+
+/** True when `scope` sets at least one predicate — a bulk delete refuses an empty (match-all) scope. */
+export function isNonEmptyRunScope(scope: RunScope | undefined): boolean {
+  if (!scope) return false;
+  return (
+    scope.workflow !== undefined ||
+    scope.workflows !== undefined ||
+    scope.tag !== undefined ||
+    scope.tags !== undefined ||
+    scope.namespace !== undefined ||
+    scope.namespaces !== undefined ||
+    (scope.attributes !== undefined && scope.attributes.length > 0)
+  );
 }
 
 /** Typed, queryable per-run data — exact values for `eq`/`ne`, numbers/strings for range ops. */

@@ -54,6 +54,8 @@ function isUnavailable(err: unknown): err is StateStoreUnavailableError {
 }
 
 const at = new Date('2026-06-11T00:00:00.000Z');
+const NOW = Date.parse('2026-06-20T00:00:00.000Z');
+const DAY = 86_400_000;
 
 const run = (over: Partial<WorkflowRun> = {}): WorkflowRun => ({
   id: 'r1',
@@ -194,6 +196,156 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     t('deleteRun is a no-op for a missing run', async () => {
       await expect(store.deleteRun('nope')).resolves.toBeUndefined();
     });
+
+    // ---- bulk delete / retention ------------------------------------------------------------
+
+    t('deleteRuns removes every listed run with its rows and ignores missing ids', async () => {
+      await store.createRun(run({ id: 'd1', searchAttributes: { tier: 'pro' } }));
+      await store.createRun(run({ id: 'd2' }));
+      await store.createRun(run({ id: 'keep' }));
+      await store.saveCheckpoint(checkpoint({ runId: 'd1', stepId: 'd1:0' }));
+      await store.putSignalWaiter({ token: 'approve-d2', runId: 'd2', seq: 0 });
+
+      expect(typeof store.deleteRuns).toBe('function');
+      await store.deleteRuns?.(['d1', 'd2', 'ghost']);
+
+      expect(await store.getRun('d1')).toBeNull();
+      expect(await store.getRun('d2')).toBeNull();
+      expect(await store.getRun('keep')).not.toBeNull();
+      expect(await store.listCheckpoints('d1')).toEqual([]);
+      expect(await store.listSignalWaiters('approve-')).toEqual([]);
+      expect(
+        await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'pro' }] }),
+      ).toEqual([]);
+      await expect(store.deleteRuns?.([])).resolves.toBeUndefined();
+    });
+
+    const aged = (id: string, ageDays: number, over: Partial<WorkflowRun> = {}): WorkflowRun =>
+      run({
+        id,
+        status: 'completed',
+        createdAt: new Date(NOW - ageDays * DAY),
+        updatedAt: new Date(NOW - ageDays * DAY),
+        ...over,
+      });
+    const ids = async (): Promise<string[]> => (await store.listRuns({})).map((r) => r.id).sort();
+
+    t('pruneTerminalRuns drops terminal runs past maxAge and never touches live ones', async () => {
+      await store.createRun(aged('old-done', 10));
+      await store.createRun(aged('old-failed', 10, { status: 'failed' }));
+      await store.createRun(aged('old-live', 10, { status: 'suspended' }));
+      await store.createRun(aged('fresh-done', 1));
+      await store.saveCheckpoint(checkpoint({ runId: 'old-done', stepId: 'old-done:0' }));
+
+      expect(typeof store.pruneTerminalRuns).toBe('function');
+      const deleted = await store.pruneTerminalRuns?.(
+        { statuses: ['completed', 'failed', 'suspended'], maxAge: '7d' },
+        NOW,
+        100,
+      );
+
+      expect(deleted).toBe(2);
+      expect(await ids()).toEqual(['fresh-done', 'old-live']);
+      expect(await store.listCheckpoints('old-done')).toEqual([]);
+    });
+
+    t(
+      'pruneTerminalRuns keeps only the newest maxCount and drains in batches of limit',
+      async () => {
+        for (let i = 1; i <= 5; i++) await store.createRun(aged(`c${i}`, i));
+
+        // Keep the 2 newest (c1, c2); 3 are over the cap, but one call deletes at most `limit` = 2.
+        const policy = { statuses: ['completed' as const], maxCount: 2 };
+        expect(await store.pruneTerminalRuns?.(policy, NOW, 2)).toBe(2);
+        expect(await store.pruneTerminalRuns?.(policy, NOW, 2)).toBe(1);
+        expect(await store.pruneTerminalRuns?.(policy, NOW, 2)).toBe(0);
+        expect(await ids()).toEqual(['c1', 'c2']);
+      },
+    );
+
+    t('a scoped retention policy only prunes (and counts) the runs its scope matches', async () => {
+      await store.createRun(aged('acme-old', 10, { namespace: 'acme' }));
+      await store.createRun(aged('acme-new', 1, { namespace: 'acme' }));
+      await store.createRun(aged('beta-old', 10, { namespace: 'beta' }));
+      await store.createRun(aged('report-old', 10, { workflow: 'report' }));
+
+      // By namespace: beta's equally old run survives.
+      await store.pruneTerminalRuns?.(
+        { statuses: ['completed'], maxAge: '7d', scope: { namespace: 'acme' } },
+        NOW,
+        100,
+      );
+      expect(await ids()).toEqual(['acme-new', 'beta-old', 'report-old']);
+
+      // By workflow set.
+      await store.pruneTerminalRuns?.(
+        { statuses: ['completed'], maxAge: '7d', scope: { workflows: ['report'] } },
+        NOW,
+        100,
+      );
+      expect(await ids()).toEqual(['acme-new', 'beta-old']);
+
+      // maxCount is counted WITHIN the scope: acme keeps its 1 newest even though other runs exist.
+      await store.createRun(aged('acme-mid', 3, { namespace: 'acme' }));
+      await store.pruneTerminalRuns?.(
+        { statuses: ['completed'], maxCount: 1, scope: { namespace: 'acme' } },
+        NOW,
+        100,
+      );
+      expect(await ids()).toEqual(['acme-new', 'beta-old']);
+    });
+
+    t('a retention scope can select by tag and by search attribute', async () => {
+      if (!supportsTagFilter) return;
+      await store.createRun(aged('chat-old', 10, { tags: ['chat', 'tenant:t1'] }));
+      await store.createRun(aged('chatty-old', 10, { tags: ['chatty'] }));
+      await store.createRun(aged('attr-old', 10, { searchAttributes: { tenantId: 't2' } }));
+      await store.createRun(aged('attr-other', 10, { searchAttributes: { tenantId: 't3' } }));
+
+      await store.pruneTerminalRuns?.(
+        { statuses: ['completed'], maxAge: '7d', scope: { tags: ['chat'] } },
+        NOW,
+        100,
+      );
+      expect(await ids()).toEqual(['attr-old', 'attr-other', 'chatty-old']);
+
+      await store.pruneTerminalRuns?.(
+        {
+          statuses: ['completed'],
+          maxAge: '7d',
+          scope: { attributes: [{ key: 'tenantId', op: 'eq', value: 't2' }] },
+        },
+        NOW,
+        100,
+      );
+      expect(await ids()).toEqual(['attr-other', 'chatty-old']);
+    });
+
+    t(
+      'engine.purgeRuns deletes a scope with its child subtrees and cancels live runs',
+      async () => {
+        const engine = new WorkflowEngine({ store });
+        engine.register('p-child', '1', async (ctx) => ctx.waitForSignal('never'));
+        engine.register('p-root', '1', async (ctx) => {
+          await ctx.startChild('p-child', {}, 'pc');
+          return ctx.waitForSignal('never');
+        });
+        engine.register('p-other', '1', async () => 'done');
+
+        await engine.start('p-root', {}, 'pr');
+        await engine.start('p-other', {}, 'po');
+        expect((await engine.waitForRun('pc', { timeoutMs: 20_000 })).status).toBe('suspended');
+        expect((await engine.waitForRun('po', { timeoutMs: 20_000 })).status).toBe('completed');
+
+        await expect(engine.purgeRuns({})).rejects.toThrow(/empty scope/);
+        // `p-child` is not in the scope: it goes because its root does.
+        expect(await engine.purgeRuns({ workflows: ['p-root'] })).toBe(2);
+
+        expect(await store.getRun('pr')).toBeNull();
+        expect(await store.getRun('pc')).toBeNull();
+        expect(await store.getRun('po')).not.toBeNull();
+      },
+    );
 
     t(
       'updateRun maps every patchable field — clears error and patches tags/lockedBy/input/timers',

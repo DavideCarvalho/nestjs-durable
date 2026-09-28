@@ -41,6 +41,26 @@ describe('validateRetention', () => {
     ).toThrow(/disjoint/);
   });
 
+  it('allows the same status in policies with different scopes, not with the same scope', () => {
+    expect(() =>
+      validateRetention({
+        policies: [
+          { statuses: ['completed'], maxAge: '30d' },
+          { statuses: ['completed'], maxAge: '1d', scope: { tags: ['chat'] } },
+          { statuses: ['completed'], maxCount: 10, scope: { namespace: 'acme' } },
+        ],
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateRetention({
+        policies: [
+          { statuses: ['completed'], maxAge: '1d', scope: { namespace: 'a', tags: ['x'] } },
+          { statuses: ['completed'], maxCount: 5, scope: { tags: ['x'], namespace: 'a' } },
+        ],
+      }),
+    ).toThrow(/disjoint per scope/);
+  });
+
   it('rejects a policy with no bound', () => {
     expect(() =>
       validateRetention({ policies: [{ statuses: ['completed'] } as RetentionPolicy] }),

@@ -15,6 +15,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  TERMINAL_RUN_STATUSES,
   type WorkflowRun,
   attributePredicateOperands,
   axisIsRunColumn,
@@ -174,51 +175,61 @@ export class MikroOrmStateStore implements StateStore {
     await em.nativeDelete(WorkflowRunEntity, { id: runId });
   }
 
-  async pruneTerminalRuns(policy: RetentionPolicy, nowMs: number, limit: number): Promise<number> {
-    if (policy.statuses.length === 0 || limit <= 0) return 0;
-    const em = this.fork();
-    const status = { $in: policy.statuses };
-    // Collect ids that violate EITHER bound (most-restrictive keep): too old, or past the count cap.
-    const ids = new Set<string>();
-
-    if (policy.maxAge != null) {
-      const cutoff = new Date(nowMs - parseDuration(policy.maxAge));
-      const rows = await em.find(
-        WorkflowRunEntity,
-        { status, updatedAt: { $lt: cutoff } },
-        { fields: ['id'], orderBy: { updatedAt: 'asc' }, limit }, // oldest first
-      );
-      for (const r of rows) ids.add(r.id);
-    }
-
-    if (policy.maxCount != null && ids.size < limit) {
-      // Everything beyond the newest `maxCount` rows in the status set — skip the kept window via offset.
-      const rows = await em.find(
-        WorkflowRunEntity,
-        { status },
-        {
-          fields: ['id'],
-          orderBy: { updatedAt: 'desc', id: 'desc' },
-          limit,
-          offset: policy.maxCount,
-        },
-      );
-      for (const r of rows) {
-        ids.add(r.id);
-        if (ids.size >= limit) break;
-      }
-    }
-
-    if (ids.size === 0) return 0;
-    const idList = [...ids].slice(0, limit);
-    const runId = { $in: idList };
-    // Cascade children then runs (mirrors deleteRun) in one transaction so a pruned run never dangles.
-    await em.transactional(async (tem) => {
+  async deleteRuns(runIds: string[]): Promise<void> {
+    if (runIds.length === 0) return;
+    const runId = { $in: runIds };
+    // Same cascade as deleteRun, one `IN (...)` per table, in one transaction.
+    await this.fork().transactional(async (tem) => {
       await tem.nativeDelete(StepCheckpointEntity, { runId });
       await tem.nativeDelete(SignalWaiterEntity, { runId });
       await tem.nativeDelete(RunAttributeEntity, { runId });
       await tem.nativeDelete(WorkflowRunEntity, { id: runId });
     });
+  }
+
+  async pruneTerminalRuns(policy: RetentionPolicy, nowMs: number, limit: number): Promise<number> {
+    // Only terminal statuses are ever eligible — a policy naming a live status would race the engine.
+    const statuses = policy.statuses.filter((s) => TERMINAL_RUN_STATUSES.includes(s));
+    if (statuses.length === 0 || limit <= 0) return 0;
+    if (policy.maxAge == null && policy.maxCount == null) return 0;
+    const em = this.fork();
+    const meta = em.getMetadata().get(WorkflowRunEntity);
+    const idCol = meta.properties.id?.fieldNames?.[0] ?? 'id';
+    // A scoped policy only ever sees (and, for maxCount, counts) the runs its scope matches — the same
+    // predicates (tag LIKE, attribute EXISTS) listRuns applies, via the shared query builder.
+    const query = { ...(policy.scope ?? {}), statuses };
+    const scoped = (extra?: Record<string, unknown>) =>
+      this.runQueryBuilder(em, query, { ...this.runWhere(query), ...(extra ?? {}) }).select([
+        `r.${idCol}`,
+      ]);
+    // Collect ids that violate EITHER bound (most-restrictive keep): too old, or past the count cap.
+    const ids = new Set<string>();
+
+    if (policy.maxAge != null) {
+      const cutoff = new Date(nowMs - parseDuration(policy.maxAge));
+      const rows = await scoped({ updatedAt: { $lt: cutoff } })
+        .orderBy({ 'r.updatedAt': 'asc' }) // oldest first
+        .limit(limit)
+        .execute<Array<Record<string, string>>>();
+      for (const r of rows) ids.add(String(r[idCol] ?? r.id));
+    }
+
+    if (policy.maxCount != null && ids.size < limit) {
+      // Everything beyond the newest `maxCount` rows in the scoped status set — skip the kept window.
+      const rows = await scoped()
+        .orderBy({ 'r.updatedAt': 'desc', 'r.id': 'desc' })
+        .limit(limit)
+        .offset(policy.maxCount)
+        .execute<Array<Record<string, string>>>();
+      for (const r of rows) {
+        if (ids.size >= limit) break;
+        ids.add(String(r[idCol] ?? r.id));
+      }
+    }
+
+    const idList = [...ids].slice(0, limit);
+    // Cascade children then runs (mirrors deleteRun) in one transaction so a pruned run never dangles.
+    await this.deleteRuns(idList);
     return idList.length;
   }
 

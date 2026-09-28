@@ -150,7 +150,7 @@ function scopedStore(store: StateStore, options: DurableModuleOptions): StateSto
 
 /**
  * Retention config for the {@link RetentionPoller}. One or more {@link RetentionPolicy policies}
- * (status sets must be disjoint — validated at boot), swept together on a shared interval.
+ * (status sets must be disjoint per scope — validated at boot), swept together on a shared interval.
  *
  * ```ts
  * retention: {
@@ -159,9 +159,14 @@ function scopedStore(store: StateStore, options: DurableModuleOptions): StateSto
  *   policies: [
  *     { statuses: ['completed', 'cancelled'], maxAge: '14d', maxCount: 200 },
  *     { statuses: ['failed'], maxAge: '90d' }, // keep failures longer for debugging
+ *     // Scoped: chat turns age out after a day, whatever the defaults above say.
+ *     { statuses: ['completed', 'failed', 'cancelled'], maxAge: '1d', scope: { tags: ['chat'] } },
  *   ],
  * }
  * ```
+ *
+ * Policies are applied one after another, so a run matched by several scopes is pruned by the
+ * strictest of them.
  */
 export interface DurableRetentionOptions {
   /** The retention rules, one per (disjoint) status group. */
@@ -305,8 +310,9 @@ export interface DurableModuleOptions {
    * Hard-prune terminal run history on an interval so `durable_workflow_runs` (and its child tables)
    * stays bounded — without it, completed/failed/cancelled runs accumulate forever and the timer
    * poller's per-tick status scans get linearly slower. Driving instances only. Omit to keep all
-   * history (the default). Requires a store adapter that implements `pruneTerminalRuns` (the
-   * MikroORM adapter does); other adapters no-op with a warning. See {@link DurableRetentionOptions}.
+   * history (the default). Requires a store adapter that implements `pruneTerminalRuns` (every
+   * first-party adapter does); a custom store without it no-ops with a warning. See
+   * {@link DurableRetentionOptions}.
    * Operator only.
    */
   retention?: DurableRetentionOptions;

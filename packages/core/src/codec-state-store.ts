@@ -1,4 +1,5 @@
 import type {
+  RetentionPolicy,
   RunFacetQuery,
   RunFacetRow,
   RunQuery,
@@ -51,10 +52,27 @@ export class CodecStateStore implements StateStore {
     opts?: RunValueFacetOptions,
   ) => Promise<RunValueFacetRow[]>;
 
+  /** Forwarded verbatim (deletes touch no payload). Bound only when the inner store has it, so the
+   *  engine's per-run fallback still kicks in through the wrapper. */
+  readonly deleteRuns?: (runIds: string[]) => Promise<void>;
+
+  /** Forwarded verbatim — retention selects by status/updatedAt/scope, never by payload. Bound only
+   *  when the inner store prunes, so the retention poller still sees (and warns about) its absence. */
+  readonly pruneTerminalRuns?: (
+    policy: RetentionPolicy,
+    nowMs: number,
+    limit: number,
+  ) => Promise<number>;
+
   constructor(
     private readonly inner: StateStore,
     private readonly codec: PayloadCodec,
   ) {
+    const deleteRuns = inner.deleteRuns;
+    if (deleteRuns) this.deleteRuns = (ids) => deleteRuns.call(inner, ids);
+    const prune = inner.pruneTerminalRuns;
+    if (prune)
+      this.pruneTerminalRuns = (policy, now, limit) => prune.call(inner, policy, now, limit);
     const facets = inner.runFacets;
     if (facets) this.runFacets = (query) => facets.call(inner, query);
     const valueFacets = inner.runValueFacets;

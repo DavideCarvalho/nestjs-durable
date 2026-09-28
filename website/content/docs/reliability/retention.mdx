@@ -1,6 +1,6 @@
 ---
 title: Run retention & pruning
-description: "The module's retention option hard-prunes terminal run history (completed/failed/cancelled/dead) on an interval via StateStore.pruneTerminalRuns, per disjoint RetentionPolicy rules (maxAge and/or maxCount) — without it, run history is kept forever by default and the durable tables grow unbounded."
+description: "The module's retention option hard-prunes terminal run history (completed/failed/cancelled/dead) on an interval via StateStore.pruneTerminalRuns, per RetentionPolicy rules (maxAge and/or maxCount, optionally scoped to a namespace, tag, workflow set or search attribute) — without it, run history is kept forever by default and the durable tables grow unbounded."
 icon: Archive
 ---
 
@@ -30,7 +30,7 @@ DurableModule.forRoot({
 
 `DurableRetentionOptions` has:
 
-- `policies` — the retention rules, one per (disjoint) status group. Required; omit `retention` entirely
+- `policies` — the retention rules, one per (disjoint, per scope) status group. Required; omit `retention` entirely
   to keep everything forever (the default).
 - `sweepInterval` — how often the prune sweep runs. A number is ms; a string is an `ms`-style duration
   (`'1m'`, `'5m'` — note `'m'` is **minutes**). `0` runs the sweep once, on boot only. Defaults to `60000`
@@ -41,8 +41,8 @@ DurableModule.forRoot({
 Retention only runs on a **driving operator** instance — a dashboard/
 dispatch-only instance (`drive: false`) or a thin worker (no `store`) never prunes, so you don't need to
 worry about two instances racing each other's sweeps. It also requires a store adapter that implements
-`pruneTerminalRuns` — the MikroORM adapter does; an adapter that omits it logs a warning and disables
-retention rather than failing boot.
+`pruneTerminalRuns` — every bundled adapter does (in-memory, Drizzle SQLite/Postgres, TypeORM, Prisma,
+MikroORM); a custom adapter that omits it logs a warning and disables retention rather than failing boot.
 
 ## `RetentionPolicy`: what gets pruned vs. kept
 
@@ -63,13 +63,60 @@ before it can silently do the wrong thing:
 - every policy must set at least one of `maxAge`/`maxCount`;
 - `statuses` may only name **terminal** statuses — `completed`, `failed`, `cancelled`, `dead`
   (`TERMINAL_RUN_STATUSES`); pruning a live status would race the engine and delete work in progress;
-- a status may appear in only **one** policy — the sets across all policies must be disjoint, so
-  "most-recent N" is unambiguous per status;
+- a status may appear in only **one** policy *per scope* — two policies over the same runs must not both
+  claim a status, so "most-recent N" is unambiguous (policies with different `scope`s may share statuses);
 - a malformed duration string (`'7days'`, `'1 month'`) throws at boot instead of quietly never pruning.
 
 **Statuses you don't name in any policy are never pruned** — e.g. the example above prunes
 `completed`/`cancelled` at 14 days (capped at 200 rows) and `failed` at 90 days, but never touches `dead`
 runs at all, so a poison-pill run stays inspectable indefinitely unless you add a policy for it.
+
+## Scoped policies: one tenant, one kind of run
+
+Add a `scope` to confine a policy to the runs matching it — the identity axes of a run query:
+`namespace`/`namespaces`, `workflow`/`workflows`, `tag`/`tags` (any of), and search-attribute
+`attributes`. A scoped policy only ever selects, and for `maxCount` only ever *counts*, runs in its
+scope, so "keep acme's newest 100" means 100 of acme's runs, not 100 overall.
+
+```ts
+retention: {
+  policies: [
+    // The default for everything…
+    { statuses: ['completed', 'failed', 'cancelled'], maxAge: '30d' },
+    // …but chat turns are throwaway after a day,
+    { statuses: ['completed', 'cancelled'], maxAge: '1d', scope: { tags: ['chat'] } },
+    // and one noisy tenant keeps only its newest 500 runs.
+    { statuses: ['completed'], maxCount: 500, scope: { namespace: 'acme' } },
+  ],
+},
+```
+
+Policies are applied one after another, so a run matched by several scopes is pruned by the strictest
+one. A scope matches each run by its **own** row: children inherit their parent's `namespace` but not
+its `tags`, so scope by `namespace` or by `workflows` (listing the child workflows too) when a whole run
+tree has to age out together.
+
+## Purging on demand
+
+Retention ages history out; sometimes you need everything for a scope gone *now* — a tenant deleted
+their account, a feature's data is being wiped. `WorkflowEngine.purgeRuns(scope, opts?)` hard-deletes
+every run matching a scope (same `RunScope` shape as above), in bounded batches, through the store API:
+
+```ts
+await engine.purgeNamespace('acme');                 // every run a tenant/partition owns
+await engine.purgeRuns({ tag: `tenant:${tenantId}` }); // or any other scope
+```
+
+- **Live runs** in the scope are cancelled first (plain cancel, no saga undo), then deleted.
+  `cancelLive: false` leaves live runs (and live descendants of finished ones) alone and deletes
+  terminal history only.
+- **Child runs** are deleted with their root even when they don't match the scope themselves
+  (`children: false` deletes exactly the matching runs).
+- `batchSize` (default 500) bounds each round; each round is one bulk `StateStore.deleteRuns` (a custom
+  store without it falls back to per-run `deleteRun`).
+- An **empty scope is rejected** — it would delete every run in the store.
+
+It returns how many runs were deleted, children included.
 
 ## What pruning removes
 

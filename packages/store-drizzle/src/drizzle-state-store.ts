@@ -1,6 +1,7 @@
 import {
   type AttributeFilter,
   RUN_VALUE_FACET_SCAN,
+  type RetentionPolicy,
   type RunFacetQuery,
   type RunFacetRow,
   type RunQuery,
@@ -13,12 +14,14 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  TERMINAL_RUN_STATUSES,
   type WorkflowRun,
   attributePredicateOperands,
   axisIsRunColumn,
   mergeRunFacetRows,
   mergeRunValueFacetRows,
   normalizeAttributeRows,
+  parseDuration,
   runValueFacetsFromRuns,
 } from '@dudousxd/nestjs-durable-core';
 import {
@@ -32,6 +35,7 @@ import {
   isNotNull,
   isNull,
   like,
+  lt,
   lte,
   or,
   sql,
@@ -130,6 +134,53 @@ export class DrizzleStateStore implements StateStore {
     await this.db.delete(signalWaiters).where(eq(signalWaiters.runId, runId));
     await this.db.delete(runAttributes).where(eq(runAttributes.runId, runId));
     await this.db.delete(workflowRuns).where(eq(workflowRuns.id, runId));
+  }
+
+  async deleteRuns(runIds: string[]): Promise<void> {
+    if (runIds.length === 0) return;
+    // Same cascade as deleteRun, one `IN (...)` per table. Not wrapped in `db.transaction`: on the
+    // synchronous better-sqlite3 driver it cannot take the async callback (see `transaction` below).
+    await this.db.delete(stepCheckpoints).where(inArray(stepCheckpoints.runId, runIds));
+    await this.db.delete(signalWaiters).where(inArray(signalWaiters.runId, runIds));
+    await this.db.delete(runAttributes).where(inArray(runAttributes.runId, runIds));
+    await this.db.delete(workflowRuns).where(inArray(workflowRuns.id, runIds));
+  }
+
+  async pruneTerminalRuns(policy: RetentionPolicy, nowMs: number, limit: number): Promise<number> {
+    // Only terminal statuses are ever eligible — a policy naming a live status would race the engine.
+    const statuses = policy.statuses.filter((s) => TERMINAL_RUN_STATUSES.includes(s));
+    if (statuses.length === 0 || limit <= 0) return 0;
+    if (policy.maxAge == null && policy.maxCount == null) return 0;
+    // A scoped policy only ever sees (and, for maxCount, counts) the runs its scope matches.
+    const scoped = this.runFilters({ ...(policy.scope ?? {}), statuses });
+    const ids = new Set<string>();
+    if (policy.maxAge != null) {
+      const cutoff = nowMs - parseDuration(policy.maxAge);
+      const rows = await this.db
+        .select({ id: workflowRuns.id })
+        .from(workflowRuns)
+        .where(and(...scoped, lt(workflowRuns.updatedAt, cutoff)))
+        .orderBy(asc(workflowRuns.updatedAt)) // oldest first
+        .limit(limit);
+      for (const r of rows) ids.add(r.id);
+    }
+    if (policy.maxCount != null && ids.size < limit) {
+      // Everything past the newest `maxCount` rows of the scoped status set (skipped by OFFSET).
+      const rows = await this.db
+        .select({ id: workflowRuns.id })
+        .from(workflowRuns)
+        .where(and(...scoped))
+        .orderBy(desc(workflowRuns.updatedAt), desc(workflowRuns.id))
+        .limit(limit)
+        .offset(policy.maxCount);
+      for (const r of rows) {
+        if (ids.size >= limit) break;
+        ids.add(r.id);
+      }
+    }
+    const doomed = [...ids].slice(0, limit);
+    await this.deleteRuns(doomed);
+    return doomed.length;
   }
 
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {

@@ -157,13 +157,14 @@ DurableModule.forRoot({
 });
 ```
 
-Each `RetentionPolicy` targets a disjoint set of terminal statuses; a run is kept only while it
+Each `RetentionPolicy` targets a set of terminal statuses (disjoint per `scope` — a policy can be
+confined to a namespace, tags, workflows or search attributes); a run is kept only while it
 satisfies every bound you set on its status (`maxAge`, `maxCount`, or both — the most-restrictive
 wins) and is pruned the moment it violates one. `sweepInterval: 0` runs the sweep once on boot only.
-Pruning needs the store to implement `pruneTerminalRuns` — optional on `StateStore`, so a store
-without it no-ops with a warning instead of failing boot. Of the bundled adapters, only
-**MikroORM** and **Drizzle (Postgres)** implement it today; TypeORM, Prisma and Drizzle (SQLite)
-no-op with the warning until they do.
+Pruning needs the store to implement `pruneTerminalRuns` — optional on `StateStore`, so a custom
+store without it no-ops with a warning instead of failing boot. Every bundled adapter implements it,
+along with the bulk `deleteRuns` behind `engine.purgeRuns` (see
+[Retention](/docs/reliability/retention#purging-on-demand)).
 
 <Callout type="warn">
   **`withScope` is MikroORM + Drizzle (Postgres) only.** Multi-tenant setups can turn on

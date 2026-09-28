@@ -26,8 +26,12 @@ const MAX_BATCHES_PER_POLICY = 100;
  * be disjoint (so "most recent N" is unambiguous per status group). Throws on the first violation.
  */
 export function validateRetention(retention: DurableRetentionOptions): void {
+  // Disjointness is per SCOPE: two policies over the same runs must not both claim a status ("keep 100"
+  // vs "keep 10" of the same set is ambiguous), but `{ namespace: 'a' }` and `{ namespace: 'b' }` — or a
+  // tenant-scoped policy next to an unscoped default — each rule their own selection.
   const seen = new Set<string>();
   for (const policy of retention.policies) {
+    const scopeKey = policy.scope ? stableKey(policy.scope) : '';
     if (policy.statuses.length === 0) {
       throw new Error('durable retention: each policy must list at least one status');
     }
@@ -44,14 +48,27 @@ export function validateRetention(retention: DurableRetentionOptions): void {
           )} can be pruned`,
         );
       }
-      if (seen.has(status)) {
+      const key = `${scopeKey}|${status}`;
+      if (seen.has(key)) {
         throw new Error(
-          `durable retention: status "${status}" appears in more than one policy; status sets must be disjoint`,
+          `durable retention: status "${status}" appears in more than one policy with the same scope; status sets must be disjoint per scope`,
         );
       }
-      seen.add(status);
+      seen.add(key);
     }
   }
+}
+
+/** A key-order-independent JSON key for a scope, so `{a,b}` and `{b,a}` compare equal. */
+function stableKey(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableKey).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableKey(v)}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 /**
