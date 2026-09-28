@@ -1,5 +1,77 @@
 # @dudousxd/nestjs-durable
 
+## 0.45.0
+
+### Minor Changes
+
+- [#337](https://github.com/DavideCarvalho/nestjs-durable/pull/337) [`099da78`](https://github.com/DavideCarvalho/nestjs-durable/commit/099da78b831bd85e1778a58bd0eb817d99a7a9c9) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - New `DynamicWorkflowCtx<A>` type: `WorkflowCtx` with ONE string-addressed signature for each of its
+  overloaded methods (`step`, `child`, `startChild`, `all`). Every `WorkflowCtx<A>` is assignable to it,
+  so code that drives the ctx by names (a graph interpreter) and test fakes can depend on it — or on a
+  `Pick` of it — instead of re-declaring a narrow interface and reaching for `ctx as unknown as …`.
+  A type-test guards that `WorkflowCtx` stays assignable to it and to a hand-written interpreter-style
+  interface. Re-exported from `@dudousxd/nestjs-durable`.
+
+- [#338](https://github.com/DavideCarvalho/nestjs-durable/pull/338) [`98072c9`](https://github.com/DavideCarvalho/nestjs-durable/commit/98072c92b4c836d50e36c6df493b9cb0fd7e63f3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - **Persisted schedules** — Temporal-style schedules managed at runtime and stored next to the runs,
+  instead of only the code-registered `schedules` option.
+
+  - `engine.schedules`: `create` / `upsert` / `get` / `list` / `pause(note?)` / `resume` / `trigger` /
+    `delete` / `tick`. A schedule starts `workflow` with `input` on a `cron` (+ IANA `timezone`) or a
+    fixed `every` interval, with a stable per-window `jitter`, an `overlap` policy (`allow` / `skip`
+    while the previous run is in flight), a `catchup` policy (`latest` missed window once, or `skip`),
+    `tags` (also stamped on its runs, plus `schedule:<id>`), `searchAttributes`, `priority` and a
+    `namespace`. Failed starts are recorded as `lastError`; `get`/`list` report next/last fire, last run
+    and fire count.
+  - **Multi-worker safe without locks**: a window's run id is deterministic (`sched:<id>:<windowMs>`, so
+    racing starts collapse) and advancing a schedule is a compare-and-set on its `next_fire_at`.
+  - `DurableModule.forRoot({ persistedSchedules: true })` fires due schedules on every timer-poll tick
+    (off by default — a deployment that never uses them doesn't need the new table).
+  - New `durable_schedules` table and five optional `StateStore` methods (`saveSchedule`, `getSchedule`,
+    `updateSchedule` with CAS, `deleteSchedule`, `listSchedules`), implemented by every bundled store:
+    in-memory, Drizzle SQLite + Postgres (pgTable + DDL), TypeORM and MikroORM (auto-schema), Prisma
+    (`DurableSchedule` model to copy). `CodecStateStore` forwards them and encodes the schedule input.
+    Drizzle SQLite users run `drizzle-kit generate`; Prisma users add the model — only if they use it.
+  - Dashboard: a header **schedules** chip listing cadence / next / last / error with pause, resume and
+    run-now; API `GET /schedules`, `POST /schedules/:id/{pause,resume,trigger}`.
+  - Core exports `nextCronFireMs` (the forward counterpart of `prevCronFireMs`).
+
+- [#335](https://github.com/DavideCarvalho/nestjs-durable/pull/335) [`a9d8571`](https://github.com/DavideCarvalho/nestjs-durable/commit/a9d8571fe1231be955a1632c5b675fea37ea228d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Retention can be **scoped**, and a tenant's runs can be **purged** through the engine — no more
+  reaching into the `durable_*` tables to do either.
+
+  - **`RetentionPolicy.scope`** confines a policy to the runs matching a `RunScope` — `namespace(s)`,
+    `workflow(s)`, `tag`/`tags`, search-attribute `attributes`. A scoped policy only selects, and for
+    `maxCount` only counts, runs in its scope ("keep acme's newest 100"). Boot validation now requires
+    status sets to be disjoint _per scope_, so a scoped policy can sit next to an unscoped default.
+  - **`engine.purgeRuns(scope, opts?)` / `engine.purgeNamespace(ns)`** hard-delete every run matching a
+    scope, with their child subtrees (children inherit `namespace`, not `tags` — they go with their root
+    either way), in bounded batches. Live runs are cancelled first (`cancelLive: false` keeps them). An
+    empty scope is rejected.
+  - **`StateStore.deleteRuns(ids)`** (optional): bulk cascading delete, one `IN (...)` per table. The
+    engine falls back to per-run `deleteRun` on a store without it.
+  - **`pruneTerminalRuns` everywhere.** The in-memory, Drizzle (SQLite), TypeORM and Prisma adapters now
+    implement it (MikroORM and Drizzle Postgres already did, and now honor `scope`), so `retention` works
+    on every bundled store. `CodecStateStore` now forwards `pruneTerminalRuns` and `deleteRuns` —
+    retention used to be silently disabled behind the codec wrapper.
+  - The shared StateStore contract covers `deleteRuns`, age/count/scoped pruning and `engine.purgeRuns`.
+
+- [#336](https://github.com/DavideCarvalho/nestjs-durable/pull/336) [`1b7824b`](https://github.com/DavideCarvalho/nestjs-durable/commit/1b7824bbe26dbf503861cadd4388d5dfc9be217e) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - **Start-time concurrency quotas.** Cap how many runs sharing a key can be in flight, and reject the
+  start that would exceed it — "a tenant can have at most 8 turns executing" without a hand-rolled
+  `SELECT count(*)` gate.
+
+  - `@Workflow({ concurrency: { key: (input) => …, limit, countStatuses? } })` (also on
+    `engine.register` / `registerRemote` / `remote`), or per start with
+    `StartOptions.concurrency: { key, limit, countStatuses? }` (overrides the workflow's). The key is
+    global, so several workflows can share one quota; `limit` may be an async function of the key
+    (per-plan limits); `countStatuses` narrows what occupies a slot (default: every non-terminal
+    status — e.g. use `['pending', 'running']` so runs parked on a human don't count).
+  - Over the limit, `start` throws **`ConcurrencyLimitError`** (`key`, `limit`, `active`, `workflow`) and
+    creates nothing. Quota-bearing runs carry the engine-minted tag `concurrency:<key>`.
+  - New optional **`StateStore.countRuns(query)`** — one `COUNT(*)` over the `listRuns` predicates —
+    implemented by every bundled store and forwarded by `CodecStateStore`; the engine falls back to
+    `runFacets`, then to a listing, for a custom store without it. Covered by the shared contract.
+
+  It is a soft cap under a race (count and insert are separate statements); use `singleton` for a strict,
+  queueing per-key limit.
+
 ## 0.44.0
 
 ### Minor Changes
