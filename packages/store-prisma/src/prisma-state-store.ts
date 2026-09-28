@@ -115,6 +115,7 @@ interface Delegate<Row> {
   upsert(args: Args): Promise<Row>;
   delete(args: Args): Promise<Row>;
   deleteMany(args?: Args): Promise<{ count: number }>;
+  count(args?: Args): Promise<number>;
   /** Aggregate form — used only by `runFacets`, whose rows are `(status, origin, count)` cells, not
    *  model rows, so the result type is stated at the call site rather than derived from `Row`. */
   groupBy(args: Args): Promise<Record<string, unknown>[]>;
@@ -404,6 +405,10 @@ export class PrismaStateStore implements StateStore {
       orderBy,
     });
     return rows.map(fromRunRow);
+  }
+
+  async countRuns(query: Omit<RunQuery, 'limit' | 'offset'>): Promise<number> {
+    return this.db.durableWorkflowRun.count({ where: this.runWhere(query) });
   }
 
   /** `GROUP BY status, origin` over the same predicates {@link listRuns} pages — one aggregate, so a

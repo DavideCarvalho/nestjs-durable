@@ -258,6 +258,7 @@ This targets a single (non-cluster) Redis instance; size limits with that in min
 | Let an urgent call skip the line when a queue is full | per-call `priority` | `ctx.step(..., opts)` |
 | Also jump the broker's own queue at the worker (BullMQ) | same `priority` value | `ctx.step(..., opts)` — mirrored automatically |
 | Stop one tenant/key from starving everyone else | `fairness: 'key'` + per-call `fairnessKey` | `QueueConfig` + `ctx.step(..., opts)` |
+| Refuse new *runs* once a tenant/key has N in flight | `concurrency` quota — see [Concurrency quotas](/docs/reliability/concurrency-quotas) | `@Workflow` / `StartOptions` |
 | Break remaining ties by newest-first instead of oldest-first | `order: 'lifo'` | `QueueConfig` |
 | Raise how much work *this process* runs at once | transport `concurrency` (fixed number) | `BullMQTransport` options |
 | Let the process self-tune concurrency under CPU/RAM pressure | transport `concurrency: 'adaptive'` | `BullMQTransport` options |

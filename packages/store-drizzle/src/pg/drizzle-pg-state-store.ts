@@ -381,6 +381,15 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async countRuns(query: Omit<RunQuery, 'limit' | 'offset'>): Promise<number> {
+    const filters = this.runFilters(query);
+    const rows = await this.db
+      .select({ count: sql<number>`count(*)`.mapWith(Number) })
+      .from(workflowRuns)
+      .where(filters.length ? and(...filters) : undefined);
+    return rows[0]?.count ?? 0;
+  }
+
   async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
     const filters = this.runFilters(query);
     const rows = await this.db

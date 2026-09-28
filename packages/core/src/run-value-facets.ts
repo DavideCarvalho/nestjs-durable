@@ -26,7 +26,7 @@ export const RUN_VALUE_FACET_SCAN = 5000;
  * sets exactly that), so it stays offered — just after the tags a human wrote. `version:undeclared`
  * is engine-minted too but is a single fixed value, so it competes fairly and is not listed here.
  */
-export const ENGINE_MINTED_TAG_PREFIXES = ['singleton:'] as const;
+export const ENGINE_MINTED_TAG_PREFIXES = ['singleton:', 'concurrency:'] as const;
 
 /** Is this a tag the engine mints one of per key? See {@link ENGINE_MINTED_TAG_PREFIXES}. */
 export function isEngineMintedTag(value: string | null): boolean {

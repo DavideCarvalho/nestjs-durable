@@ -426,6 +426,16 @@ export class MikroOrmStateStore implements StateStore {
     return `${colExpr} LIKE '${pattern}'`;
   }
 
+  async countRuns(query: Omit<RunQuery, 'limit' | 'offset'>): Promise<number> {
+    const em = this.fork();
+    const rows = await this.runQueryBuilder(em, query, this.runWhere(query))
+      .select([])
+      .addSelect(raw('count(*) as count'))
+      .execute<{ count: number | string }[]>();
+    // MySQL returns `count(*)` as a string on some drivers.
+    return Number(rows[0]?.count ?? 0);
+  }
+
   /** `GROUP BY status, origin` over the same predicates {@link listRuns} pages — one aggregate, so a
    *  console can show whole-set counts next to a bounded page instead of downloading every run to
    *  count them in the browser. */

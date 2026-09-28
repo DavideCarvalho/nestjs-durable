@@ -378,6 +378,10 @@ export class InMemoryStateStore implements StateStore {
     return runs.slice(offset, offset + limit).map((r) => ({ ...r }));
   }
 
+  async countRuns(query: Omit<RunQuery, 'limit' | 'offset'>): Promise<number> {
+    return this.matching(query).length;
+  }
+
   async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
     return mergeRunFacetRows(
       this.matching(query).map((run) => ({ status: run.status, origin: run.origin, count: 1 })),
