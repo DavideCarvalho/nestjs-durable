@@ -9,6 +9,8 @@ import {
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
+  type ScheduleQuery,
+  type ScheduleRecord,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
@@ -121,6 +123,19 @@ interface Delegate<Row> {
   groupBy(args: Args): Promise<Record<string, unknown>[]>;
 }
 
+interface ScheduleRow {
+  id: string;
+  namespace: string;
+  workflow: string;
+  paused: boolean;
+  nextFireAt: bigint | null;
+  tags: unknown;
+  spec: unknown;
+  state: unknown;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export interface DurablePrismaTx {
   durableWorkflowRun: Delegate<RunRow>;
   durableStepCheckpoint: Delegate<CheckpointRow>;
@@ -128,6 +143,8 @@ export interface DurablePrismaTx {
   durableSignalWaiter: Delegate<WaiterRow>;
   durableBufferedSignal: Delegate<BufferedSignalRow>;
   durableBufferedEvent: Delegate<BufferedEventRow>;
+  /** Only needed for persisted schedules (`engine.schedules`) — add the `DurableSchedule` model. */
+  durableSchedule?: Delegate<ScheduleRow>;
 }
 
 export interface DurablePrismaClient extends DurablePrismaTx {
@@ -449,6 +466,76 @@ export class PrismaStateStore implements StateStore {
     );
   }
 
+  // ---- persisted schedules ----------------------------------------------------------------------
+
+  private schedules(): Delegate<ScheduleRow> {
+    const delegate = this.db.durableSchedule;
+    if (!delegate) {
+      throw new Error(
+        'persisted schedules need the DurableSchedule model — copy it from prisma/schema.prisma into your schema and re-run `prisma generate`',
+      );
+    }
+    return delegate;
+  }
+
+  async saveSchedule(record: ScheduleRecord): Promise<void> {
+    const data = toScheduleData(record);
+    await this.schedules().upsert({ where: { id: record.id }, create: data, update: data });
+  }
+
+  async getSchedule(id: string): Promise<ScheduleRecord | null> {
+    const row = await this.schedules().findUnique({ where: { id } });
+    return row ? fromScheduleRow(row) : null;
+  }
+
+  /** One conditional `updateMany`: the compare-and-set on `next_fire_at` is a single statement. */
+  async updateSchedule(
+    id: string,
+    patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+    expectedNextFireAt?: number | null,
+  ): Promise<boolean> {
+    const data: Record<string, unknown> = {};
+    if (patch.namespace !== undefined) data.namespace = patch.namespace;
+    if (patch.workflow !== undefined) data.workflow = patch.workflow;
+    if (patch.paused !== undefined) data.paused = patch.paused;
+    if ('nextFireAt' in patch)
+      data.nextFireAt = patch.nextFireAt == null ? null : BigInt(patch.nextFireAt);
+    if ('tags' in patch) data.tags = jsonOrNull(patch.tags);
+    if (patch.spec !== undefined) data.spec = patch.spec;
+    if (patch.state !== undefined) data.state = patch.state;
+    if (patch.updatedAt !== undefined) data.updatedAt = patch.updatedAt;
+    if (!Object.keys(data).length) return (await this.getSchedule(id)) !== null;
+    const where: Record<string, unknown> = { id };
+    if (expectedNextFireAt !== undefined)
+      where.nextFireAt = expectedNextFireAt === null ? null : BigInt(expectedNextFireAt);
+    const { count } = await this.schedules().updateMany({ where, data });
+    return count > 0;
+  }
+
+  async deleteSchedule(id: string): Promise<boolean> {
+    const { count } = await this.schedules().deleteMany({ where: { id } });
+    return count > 0;
+  }
+
+  async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
+    const where: Record<string, unknown> = {};
+    if (query.namespace !== undefined) where.namespace = query.namespace;
+    if (query.workflow !== undefined) where.workflow = query.workflow;
+    if (query.paused !== undefined) where.paused = query.paused;
+    if (query.tag !== undefined) where.tags = { array_contains: query.tag };
+    if (query.dueBy !== undefined) {
+      where.AND = [{ paused: false }, { nextFireAt: { lte: BigInt(query.dueBy) } }];
+    }
+    const rows = await this.schedules().findMany({
+      where,
+      // Soonest-due first, never-firing (NULL) last, id as the stable tie-break.
+      orderBy: [{ nextFireAt: { sort: 'asc', nulls: 'last' } }, { id: 'asc' }],
+      take: query.limit,
+      skip: query.offset,
+    });
+    return rows.map(fromScheduleRow);
+  }
+
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
     const rows = await this.db.durableStepCheckpoint.findMany({
       where: { runId },
@@ -748,5 +835,36 @@ function fromCheckpointRow(row: CheckpointRow): StepCheckpoint {
     enqueuedAt: row.enqueuedAt ?? row.startedAt,
     startedAt: row.startedAt,
     finishedAt: row.finishedAt,
+  };
+}
+
+function toScheduleData(r: ScheduleRecord) {
+  return {
+    id: r.id,
+    namespace: r.namespace,
+    workflow: r.workflow,
+    paused: r.paused,
+    nextFireAt: r.nextFireAt == null ? null : BigInt(r.nextFireAt),
+    tags: jsonOrNull(r.tags),
+    spec: r.spec,
+    state: r.state,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+  };
+}
+
+function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
+  const tags = Array.isArray(row.tags) ? (row.tags as string[]) : undefined;
+  return {
+    id: row.id,
+    namespace: row.namespace,
+    workflow: row.workflow,
+    paused: row.paused,
+    nextFireAt: row.nextFireAt == null ? null : Number(row.nextFireAt),
+    ...(tags?.length ? { tags } : {}),
+    spec: (row.spec ?? {}) as Record<string, unknown>,
+    state: (row.state ?? {}) as Record<string, unknown>,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }

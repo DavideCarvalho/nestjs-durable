@@ -9,6 +9,8 @@ import {
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
+  type ScheduleQuery,
+  type ScheduleRecord,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
@@ -39,6 +41,7 @@ import {
   BufferedEventEntity,
   BufferedSignalEntity,
   RunAttributeEntity,
+  ScheduleEntity,
   SignalWaiterEntity,
   StepCheckpointEntity,
   WorkflowRunEntity,
@@ -73,6 +76,9 @@ export class TypeOrmStateStore implements StateStore {
   }
   private attributes() {
     return this.dataSource.getRepository(RunAttributeEntity);
+  }
+  private schedules() {
+    return this.dataSource.getRepository(ScheduleEntity);
   }
 
   /** Rewrite a run's normalized attribute rows: delete the old set, insert the current one. Mirrors
@@ -464,6 +470,67 @@ export class TypeOrmStateStore implements StateStore {
     return type === 'mysql' || type === 'mariadb' || type === 'aurora-mysql' ? '`' : '"';
   }
 
+  // ---- persisted schedules ----------------------------------------------------------------------
+
+  async saveSchedule(record: ScheduleRecord): Promise<void> {
+    await this.schedules().save(toScheduleEntity(record));
+  }
+
+  async getSchedule(id: string): Promise<ScheduleRecord | null> {
+    const e = await this.schedules().findOneBy({ id });
+    return e ? fromScheduleEntity(e) : null;
+  }
+
+  /** One conditional UPDATE: the compare-and-set on `next_fire_at` (an exact bigint) is atomic. */
+  async updateSchedule(
+    id: string,
+    patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+    expectedNextFireAt?: number | null,
+  ): Promise<boolean> {
+    const set: QueryDeepPartialEntity<ScheduleEntity> = {};
+    if (patch.namespace !== undefined) set.namespace = patch.namespace;
+    if (patch.workflow !== undefined) set.workflow = patch.workflow;
+    if (patch.paused !== undefined) set.paused = patch.paused;
+    if ('nextFireAt' in patch) set.nextFireAt = patch.nextFireAt ?? null;
+    if ('tags' in patch) set.tags = (patch.tags ?? null) as never;
+    if (patch.spec !== undefined) set.spec = patch.spec as never;
+    if (patch.state !== undefined) set.state = patch.state as never;
+    if (patch.updatedAt !== undefined) set.updatedAt = patch.updatedAt;
+    if (!Object.keys(set).length) return (await this.getSchedule(id)) !== null;
+    const qb = this.schedules().createQueryBuilder().update().set(set).where({ id });
+    if (expectedNextFireAt === null) qb.andWhere({ nextFireAt: IsNull() });
+    else if (expectedNextFireAt !== undefined) qb.andWhere({ nextFireAt: expectedNextFireAt });
+    const result = await qb.execute();
+    return (result.affected ?? 0) > 0;
+  }
+
+  async deleteSchedule(id: string): Promise<boolean> {
+    const result = await this.schedules().delete({ id });
+    return (result.affected ?? 0) > 0;
+  }
+
+  async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
+    const qb = this.schedules().createQueryBuilder('s');
+    if (query.namespace !== undefined)
+      qb.andWhere('s.namespace = :namespace', { namespace: query.namespace });
+    if (query.workflow !== undefined)
+      qb.andWhere('s.workflow = :workflow', { workflow: query.workflow });
+    if (query.paused !== undefined) qb.andWhere('s.paused = :paused', { paused: query.paused });
+    if (query.tag !== undefined) qb.andWhere('s.tags LIKE :tag', { tag: `%"${query.tag}"%` });
+    if (query.dueBy !== undefined)
+      qb.andWhere('s.paused = :notPaused AND s.nextFireAt <= :dueBy', {
+        notPaused: false,
+        dueBy: query.dueBy,
+      });
+    // Soonest-due first, never-firing (NULL) last, id as the stable tie-break.
+    qb.orderBy('CASE WHEN s.nextFireAt IS NULL THEN 1 ELSE 0 END', 'ASC')
+      .addOrderBy('s.nextFireAt', 'ASC')
+      .addOrderBy('s.id', 'ASC');
+    if (query.limit != null) qb.take(query.limit);
+    if (query.offset != null) qb.skip(query.offset);
+    return (await qb.getMany()).map(fromScheduleEntity);
+  }
+
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
     const rows = await this.checkpoints().find({ where: { runId }, order: { seq: 'ASC' } });
     return rows.map(fromCheckpointEntity);
@@ -669,5 +736,36 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
     enqueuedAt: e.enqueuedAt ?? e.startedAt,
     startedAt: e.startedAt,
     finishedAt: e.finishedAt,
+  };
+}
+
+function toScheduleEntity(r: ScheduleRecord): ScheduleEntity {
+  const e = new ScheduleEntity();
+  e.id = r.id;
+  e.namespace = r.namespace;
+  e.workflow = r.workflow;
+  e.paused = r.paused;
+  e.nextFireAt = r.nextFireAt;
+  e.tags = r.tags ?? null;
+  e.spec = r.spec;
+  e.state = r.state;
+  e.createdAt = r.createdAt;
+  e.updatedAt = r.updatedAt;
+  return e;
+}
+
+function fromScheduleEntity(e: ScheduleEntity): ScheduleRecord {
+  return {
+    id: e.id,
+    namespace: e.namespace,
+    workflow: e.workflow,
+    // SQLite/MySQL hand a boolean column back as 0/1.
+    paused: Boolean(e.paused),
+    nextFireAt: e.nextFireAt == null ? null : Number(e.nextFireAt),
+    ...(e.tags ? { tags: e.tags } : {}),
+    spec: e.spec ?? {},
+    state: e.state ?? {},
+    createdAt: e.createdAt,
+    updatedAt: e.updatedAt,
   };
 }

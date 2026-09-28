@@ -83,6 +83,7 @@ import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { indexWaitersByRun } from './run-waiting';
+import { ScheduleClient } from './schedules';
 import { SingletonGate } from './singleton-gate';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
@@ -546,6 +547,12 @@ export class WorkflowEngine {
 
   /** Per-key serialization for singleton workflows (admission, back-pressure, notify-on-release). */
   private readonly singletons: SingletonGate;
+  /**
+   * Persisted, runtime-managed schedules: create/upsert/pause/resume/delete/list/trigger them, and
+   * `tick()` fires the due ones (the NestJS timer poller does it when `persistedSchedules` is on).
+   * Needs a store that persists schedules — every bundled adapter does. See {@link ScheduleClient}.
+   */
+  readonly schedules: ScheduleClient;
   /** Every registered workflow, keyed by `name@version` — so old versions stay runnable. */
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
@@ -652,6 +659,14 @@ export class WorkflowEngine {
           this.latest.get(run.workflow)
         )?.singleton,
     });
+    this.schedules = new ScheduleClient(
+      this.store,
+      {
+        start: (workflow, input, runId, opts) => this.start(workflow, input, runId, opts),
+        getRun: (runId) => this.store.getRun(runId),
+      },
+      { namespace: this.namespace, clock: this.clock },
+    );
     this.pool.bind(
       async (result) => {
         // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.

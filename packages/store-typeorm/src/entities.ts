@@ -144,6 +144,22 @@ export class BufferedEventEntity {
   publishedAt!: Date;
 }
 
+/** A persisted schedule (`engine.schedules`). `spec`/`state` are engine-owned JSON documents. */
+export class ScheduleEntity {
+  id!: string;
+  namespace!: string;
+  workflow!: string;
+  paused!: boolean;
+  /** Epoch ms as a `bigint` (drivers hand it back as a string) — an exact integer, so the
+   *  compare-and-set in `updateSchedule` can't be defeated by a DATETIME's truncated milliseconds. */
+  nextFireAt?: string | number | null;
+  tags?: string[] | null;
+  spec!: Record<string, unknown>;
+  state!: Record<string, unknown>;
+  createdAt!: Date;
+  updatedAt!: Date;
+}
+
 /**
  * Build the durable TypeORM entity schemas with column names pinned per `naming` (default
  * `'snake_case'`). Register the result in your `DataSource`/`TypeOrmModule.forFeature`. The JSON-blob
@@ -349,6 +365,37 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     },
   });
 
+  const schedules = new EntitySchema<ScheduleEntity>({
+    name: 'ScheduleEntity',
+    target: ScheduleEntity,
+    tableName: 'durable_schedules',
+    columns: {
+      id: { type: 'text', primary: true, name: col('id') },
+      namespace: { type: 'text', name: col('namespace'), default: 'default' },
+      workflow: { type: 'text', name: col('workflow') },
+      paused: { type: Boolean, name: col('paused'), default: false },
+      nextFireAt: { type: 'bigint', nullable: true, name: col('nextFireAt') },
+      tags: {
+        type: 'text',
+        nullable: true,
+        name: col('tags'),
+        transformer: jsonColumnTransformer('schedules.tags'),
+      },
+      spec: {
+        type: 'text',
+        name: col('spec'),
+        transformer: jsonColumnTransformer('schedules.spec'),
+      },
+      state: {
+        type: 'text',
+        name: col('state'),
+        transformer: jsonColumnTransformer('schedules.state'),
+      },
+      createdAt: { type: Date, name: col('createdAt') },
+      updatedAt: { type: Date, name: col('updatedAt') },
+    },
+  });
+
   return [
     workflowRuns,
     stepCheckpoints,
@@ -356,6 +403,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     signalWaiters,
     bufferedSignals,
     bufferedEvents,
+    schedules,
   ];
 }
 

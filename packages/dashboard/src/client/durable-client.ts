@@ -2,6 +2,7 @@ import type {
   RunListItem as CoreRunListItem,
   RunStatus as CoreRunStatus,
   RunWaiting as CoreRunWaiting,
+  ScheduleDescription as CoreScheduleDescription,
   StepCheckpoint as CoreStepCheckpoint,
   StepEvent as CoreStepEvent,
   StepKind as CoreStepKind,
@@ -538,6 +539,24 @@ export const durableClient = {
   workers(): Promise<GroupHealth[]> {
     return http<GroupHealth[]>('/workers');
   },
+  /** Persisted schedules (`engine.schedules`), soonest-due first. Empty when unsupported. */
+  schedules(): Promise<ScheduleSummary[]> {
+    return http<ScheduleSummary[]>('/schedules');
+  },
+  pauseSchedule(id: string): Promise<ScheduleSummary> {
+    return http<ScheduleSummary>(`/schedules/${encodeURIComponent(id)}/pause`, { method: 'POST' });
+  },
+  resumeSchedule(id: string): Promise<ScheduleSummary> {
+    return http<ScheduleSummary>(`/schedules/${encodeURIComponent(id)}/resume`, {
+      method: 'POST',
+    });
+  },
+  /** Start one run of the schedule now. Returns the run it started. */
+  triggerSchedule(id: string): Promise<{ runId: string }> {
+    return http<{ runId: string }>(`/schedules/${encodeURIComponent(id)}/trigger`, {
+      method: 'POST',
+    });
+  },
   /** This deployment's durable role (control plane vs tenant) + tenant name — for the header badge. */
   topology(): Promise<DurableTopology> {
     return http<DurableTopology>('/topology');
@@ -635,3 +654,9 @@ export {
   compensationSummary,
   splitCompensations,
 } from './split-compensations.js';
+
+/** A persisted schedule as the API serves it (dates as ISO strings). */
+export type ScheduleSummary = Omit<WireDates<CoreScheduleDescription>, 'nextFireAt'> & {
+  /** When it is next due, or null (paused / never fires again). */
+  nextFireAt: string | null;
+};

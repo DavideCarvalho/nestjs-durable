@@ -97,6 +97,24 @@ export function prevCronFireMs(expr: string, nowMs: number, timezone = 'UTC'): n
     .getTime();
 }
 
+/**
+ * Epoch ms of the first cron fire STRICTLY after `afterMs`, evaluated in `timezone` (default UTC) —
+ * the forward counterpart of {@link prevCronFireMs}, used by persisted schedules to compute when a
+ * schedule is next due.
+ */
+export function nextCronFireMs(expr: string, afterMs: number, timezone = 'UTC'): number {
+  const parse = resolveCronParse(loadCronParser());
+  if (!parse) {
+    throw new Error(
+      'the installed "cron-parser" exposes neither v4\'s parseExpression nor v5\'s CronExpressionParser.parse — the supported range is ^4.0.0 || ^5.0.0.',
+    );
+  }
+  return parse(expr, { currentDate: new Date(afterMs), tz: timezone })
+    .next()
+    .toDate()
+    .getTime();
+}
+
 /** The deterministic, idempotent run id for a schedule at `nowMs` — its current fire window. */
 function scheduleRunIdAt(s: ScheduledWorkflow, nowMs: number): string {
   if (s.cron != null) return `sched:${s.key}:${prevCronFireMs(s.cron, nowMs, s.timezone)}`;

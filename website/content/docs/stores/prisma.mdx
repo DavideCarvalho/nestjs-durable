@@ -101,6 +101,10 @@ model DurableBufferedSignal {
 The `DurableRunAttribute` side-table is what lets search-attribute filters push down into SQL
 (an `EXISTS` on `(runId, key)`) instead of scanning every run.
 
+Using [persisted schedules](/docs/authoring/persisted-schedules)? Also copy the `DurableSchedule`
+model (table `durable_schedules`) from the package's `prisma/schema.prisma`. Without it every other
+store method works; `engine.schedules` throws a clear error pointing at the missing model.
+
 ## 2. Generate and wire the store
 
 ```bash

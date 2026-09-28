@@ -9,6 +9,8 @@ import {
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
+  type ScheduleQuery,
+  type ScheduleRecord,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
@@ -45,6 +47,7 @@ import {
   DEFAULT_NAMESPACE,
   bufferedEvents,
   bufferedSignals,
+  durableSchedules,
   runAttributes,
   signalWaiters,
   stepCheckpoints,
@@ -445,6 +448,85 @@ export class DrizzleStateStore implements StateStore {
     );
   }
 
+  // ---- persisted schedules ----------------------------------------------------------------------
+
+  async saveSchedule(record: ScheduleRecord): Promise<void> {
+    const row = toScheduleRow(record);
+    await this.db
+      .insert(durableSchedules)
+      .values(row)
+      .onConflictDoUpdate({ target: durableSchedules.id, set: row });
+  }
+
+  async getSchedule(id: string): Promise<ScheduleRecord | null> {
+    const rows = await this.db
+      .select()
+      .from(durableSchedules)
+      .where(eq(durableSchedules.id, id))
+      .limit(1);
+    return rows[0] ? fromScheduleRow(rows[0]) : null;
+  }
+
+  async updateSchedule(
+    id: string,
+    patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+    expectedNextFireAt?: number | null,
+  ): Promise<boolean> {
+    const set = toSchedulePatch(patch);
+    if (!Object.keys(set).length) return (await this.getSchedule(id)) !== null;
+    const rows = await this.db
+      .update(durableSchedules)
+      .set(set)
+      .where(
+        and(
+          eq(durableSchedules.id, id),
+          expectedNextFireAt === undefined
+            ? undefined
+            : expectedNextFireAt === null
+              ? isNull(durableSchedules.nextFireAt)
+              : eq(durableSchedules.nextFireAt, expectedNextFireAt),
+        ),
+      )
+      .returning({ id: durableSchedules.id });
+    return rows.length > 0;
+  }
+
+  async deleteSchedule(id: string): Promise<boolean> {
+    const rows = await this.db
+      .delete(durableSchedules)
+      .where(eq(durableSchedules.id, id))
+      .returning({ id: durableSchedules.id });
+    return rows.length > 0;
+  }
+
+  async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
+    const rows = await this.db
+      .select()
+      .from(durableSchedules)
+      .where(
+        and(
+          query.namespace !== undefined
+            ? eq(durableSchedules.namespace, query.namespace)
+            : undefined,
+          query.workflow !== undefined ? eq(durableSchedules.workflow, query.workflow) : undefined,
+          query.paused !== undefined ? eq(durableSchedules.paused, query.paused) : undefined,
+          query.tag !== undefined ? like(durableSchedules.tags, `%"${query.tag}"%`) : undefined,
+          query.dueBy !== undefined
+            ? and(eq(durableSchedules.paused, false), lte(durableSchedules.nextFireAt, query.dueBy))
+            : undefined,
+        ),
+      )
+      // Soonest-due first, never-firing (NULL) last, id as the stable tie-break.
+      .orderBy(
+        sql`${durableSchedules.nextFireAt} IS NULL`,
+        asc(durableSchedules.nextFireAt),
+        asc(durableSchedules.id),
+      )
+      .limit(query.limit ?? -1)
+      .offset(query.offset ?? 0);
+    return rows.map(fromScheduleRow);
+  }
+
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
     const rows = await this.db
       .select()
@@ -725,5 +807,53 @@ function fromCheckpointRow(row: CheckpointRow): StepCheckpoint {
     enqueuedAt: row.enqueuedAt == null ? new Date(row.startedAt) : new Date(row.enqueuedAt),
     startedAt: new Date(row.startedAt),
     finishedAt: new Date(row.finishedAt),
+  };
+}
+
+type ScheduleRow = typeof durableSchedules.$inferSelect;
+
+function toScheduleRow(r: ScheduleRecord): ScheduleRow {
+  return {
+    id: r.id,
+    namespace: r.namespace,
+    workflow: r.workflow,
+    paused: r.paused,
+    nextFireAt: r.nextFireAt,
+    tags: r.tags ?? null,
+    spec: r.spec,
+    state: r.state,
+    createdAt: r.createdAt.getTime(),
+    updatedAt: r.updatedAt.getTime(),
+  };
+}
+
+function toSchedulePatch(
+  patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+): Partial<ScheduleRow> {
+  const set: Partial<ScheduleRow> = {};
+  if ('namespace' in patch && patch.namespace !== undefined) set.namespace = patch.namespace;
+  if ('workflow' in patch && patch.workflow !== undefined) set.workflow = patch.workflow;
+  if ('paused' in patch && patch.paused !== undefined) set.paused = patch.paused;
+  if ('nextFireAt' in patch) set.nextFireAt = patch.nextFireAt ?? null;
+  if ('tags' in patch) set.tags = patch.tags ?? null;
+  if ('spec' in patch && patch.spec !== undefined) set.spec = patch.spec;
+  if ('state' in patch && patch.state !== undefined) set.state = patch.state;
+  if ('updatedAt' in patch && patch.updatedAt !== undefined)
+    set.updatedAt = patch.updatedAt.getTime();
+  return set;
+}
+
+function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
+  return {
+    id: row.id,
+    namespace: row.namespace,
+    workflow: row.workflow,
+    paused: row.paused,
+    nextFireAt: row.nextFireAt ?? null,
+    ...(row.tags ? { tags: row.tags } : {}),
+    spec: row.spec ?? {},
+    state: row.state ?? {},
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt),
   };
 }

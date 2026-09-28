@@ -185,7 +185,10 @@ describe('Drizzle Postgres schema [real engine]', () => {
           column.notNull,
         );
         if (column.hasDefault && column.default !== undefined)
-          expect(actual?.column_default).toContain(`'${String(column.default)}'`);
+          expect(actual?.column_default).toContain(
+            // Postgres reports a text default quoted ('default'), a boolean one bare (false).
+            typeof column.default === 'string' ? `'${column.default}'` : String(column.default),
+          );
       }
       const idx = await pool?.query(
         'SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1',

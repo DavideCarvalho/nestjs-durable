@@ -6,6 +6,8 @@ import type {
   RunValueAxis,
   RunValueFacetOptions,
   RunValueFacetRow,
+  ScheduleQuery,
+  ScheduleRecord,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -68,6 +70,18 @@ export class CodecStateStore implements StateStore {
    *  engine's facet/listing fallback still applies through the wrapper. */
   readonly countRuns?: (query: Omit<RunQuery, 'limit' | 'offset'>) => Promise<number>;
 
+  /** Schedules persist their run `input` inside `spec` — encoded like any other payload. Bound only
+   *  when the inner store persists schedules, so `engine.schedules` reports absence faithfully. */
+  readonly saveSchedule?: (record: ScheduleRecord) => Promise<void>;
+  readonly getSchedule?: (id: string) => Promise<ScheduleRecord | null>;
+  readonly updateSchedule?: (
+    id: string,
+    patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+    expectedNextFireAt?: number | null,
+  ) => Promise<boolean>;
+  readonly deleteSchedule?: (id: string) => Promise<boolean>;
+  readonly listSchedules?: (query: ScheduleQuery) => Promise<ScheduleRecord[]>;
+
   constructor(
     private readonly inner: StateStore,
     private readonly codec: PayloadCodec,
@@ -79,6 +93,22 @@ export class CodecStateStore implements StateStore {
       this.pruneTerminalRuns = (policy, now, limit) => prune.call(inner, policy, now, limit);
     const count = inner.countRuns;
     if (count) this.countRuns = (query) => count.call(inner, query);
+
+    const { saveSchedule, getSchedule, updateSchedule, deleteSchedule, listSchedules } = inner;
+    if (saveSchedule && getSchedule && updateSchedule && deleteSchedule && listSchedules) {
+      this.saveSchedule = (r) => saveSchedule.call(inner, this.encSchedule(r));
+      this.getSchedule = async (id) => this.decSchedule(await getSchedule.call(inner, id));
+      this.updateSchedule = (id, patch, expected) =>
+        updateSchedule.call(
+          inner,
+          id,
+          patch.spec ? { ...patch, spec: this.encSpec(patch.spec) } : patch,
+          expected,
+        );
+      this.deleteSchedule = (id) => deleteSchedule.call(inner, id);
+      this.listSchedules = async (q) =>
+        (await listSchedules.call(inner, q)).map((r) => this.decSchedule(r) as ScheduleRecord);
+    }
     const facets = inner.runFacets;
     if (facets) this.runFacets = (query) => facets.call(inner, query);
     const valueFacets = inner.runValueFacets;
@@ -105,6 +135,17 @@ export class CodecStateStore implements StateStore {
   }
   private decCp<T extends StepCheckpoint | null>(cp: T): T {
     return (cp && { ...cp, input: this.dec(cp.input), output: this.dec(cp.output) }) as T;
+  }
+
+  private encSpec(spec: Record<string, unknown>): Record<string, unknown> {
+    return 'input' in spec ? { ...spec, input: this.enc(spec.input) } : spec;
+  }
+  private encSchedule(r: ScheduleRecord): ScheduleRecord {
+    return { ...r, spec: this.encSpec(r.spec) };
+  }
+  private decSchedule(r: ScheduleRecord | null): ScheduleRecord | null {
+    if (!r || !('input' in r.spec)) return r;
+    return { ...r, spec: { ...r.spec, input: this.dec(r.spec.input) } };
   }
 
   ensureSchema(): Promise<void> {

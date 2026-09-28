@@ -14,6 +14,8 @@ import {
   type RunValueFacetOptions,
   type RunValueFacetRow,
   STATE_STORE_CANONICAL,
+  type ScheduleDescription,
+  type ScheduleListQuery,
   type StateStore,
   type UpdateResult,
   WorkflowEngine,
@@ -65,6 +67,31 @@ export class DashboardService {
       );
     }
     return { store: this.store, engine: this.engine };
+  }
+
+  /**
+   * The persisted schedules (`engine.schedules`), soonest-due first. Empty — not an error — on a
+   * tenant deployment or a store that doesn't persist schedules, so the console can simply hide the
+   * panel instead of special-casing either.
+   */
+  async listSchedules(query: ScheduleListQuery): Promise<ScheduleDescription[]> {
+    if (!this.store || !this.engine?.schedules?.supported) return [];
+    return this.engine.schedules.list(query);
+  }
+
+  /** Pause a persisted schedule (control plane only). */
+  pauseSchedule(id: string): Promise<ScheduleDescription> {
+    return this.controlPlane().engine.schedules.pause(id);
+  }
+
+  /** Resume a persisted schedule from its next window (control plane only). */
+  resumeSchedule(id: string): Promise<ScheduleDescription> {
+    return this.controlPlane().engine.schedules.resume(id);
+  }
+
+  /** Start one run of a persisted schedule now, outside its cadence (control plane only). */
+  triggerSchedule(id: string): Promise<RunResult> {
+    return this.controlPlane().engine.schedules.trigger(id);
   }
 
   /**

@@ -85,6 +85,18 @@ export const DURABLE_PG_DDL: readonly string[] = [
   "payload" jsonb,
   "published_at" timestamp with time zone NOT NULL
 )`,
+  `CREATE TABLE IF NOT EXISTS "durable_schedules" (
+  "id" text PRIMARY KEY NOT NULL,
+  "namespace" text DEFAULT 'default' NOT NULL,
+  "workflow" text NOT NULL,
+  "paused" boolean DEFAULT false NOT NULL,
+  "next_fire_at" timestamp with time zone,
+  "tags" jsonb,
+  "spec" jsonb NOT NULL,
+  "state" jsonb NOT NULL,
+  "created_at" timestamp with time zone NOT NULL,
+  "updated_at" timestamp with time zone NOT NULL
+)`,
   `CREATE INDEX IF NOT EXISTS "durable_runs_status_idx" ON "durable_workflow_runs" USING btree ("status","wake_at")`,
   `CREATE INDEX IF NOT EXISTS "durable_runs_workflow_status_idx" ON "durable_workflow_runs" USING btree ("workflow","status")`,
   `CREATE INDEX IF NOT EXISTS "durable_workflow_runs_namespace_status_idx" ON "durable_workflow_runs" USING btree ("namespace","status","created_at")`,
@@ -95,6 +107,7 @@ export const DURABLE_PG_DDL: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS "durable_signal_waiters_run_id_idx" ON "durable_signal_waiters" USING btree ("run_id")`,
   `CREATE INDEX IF NOT EXISTS "durable_buffered_signals_token_idx" ON "durable_buffered_signals" USING btree ("token","id")`,
   `CREATE INDEX IF NOT EXISTS "durable_buffered_events_name_published_at_idx" ON "durable_buffered_events" USING btree ("name","published_at")`,
+  `CREATE INDEX IF NOT EXISTS "durable_schedules_due_idx" ON "durable_schedules" USING btree ("paused","next_fire_at")`,
 ];
 
 /** Key for the transaction-scoped advisory lock that serializes concurrent heals (several pods

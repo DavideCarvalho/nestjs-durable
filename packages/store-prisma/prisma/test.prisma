@@ -133,3 +133,23 @@ model DurableBufferedEvent {
   @@index([name, publishedAt])
   @@map("durable_buffered_events")
 }
+
+// Persisted schedules (`engine.schedules`) — only needed if you use them. `spec`/`state` are
+// engine-owned JSON documents; `nextFireAt` is epoch ms as a BigInt (exact, so the compare-and-set in
+// `updateSchedule` can't be defeated by a timestamp's precision).
+model DurableSchedule {
+  id         String   @id
+  namespace  String   @default("default")
+  workflow   String
+  paused     Boolean  @default(false)
+  nextFireAt BigInt?  @map("next_fire_at")
+  tags       Json?
+  spec       Json
+  state      Json
+  createdAt  DateTime @map("created_at")
+  updatedAt  DateTime @map("updated_at")
+
+  // The poll's "due by T" scan: `paused = false AND next_fire_at <= T ORDER BY next_fire_at`.
+  @@index([paused, nextFireAt], map: "durable_schedules_due_idx")
+  @@map("durable_schedules")
+}

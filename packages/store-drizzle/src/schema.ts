@@ -148,6 +148,32 @@ export const bufferedEvents = sqliteTable('durable_buffered_events', {
   publishedAt: integer('published_at').notNull(),
 });
 
+/**
+ * Persisted schedules (`engine.schedules`). `spec`/`state` are JSON documents the engine owns; the
+ * store only filters on the columns. `next_fire_at` is epoch ms, NULL when it never fires again.
+ *
+ * MIGRATION (you own this adapter's migrations): `drizzle-kit generate` picks the table up from
+ * `durableSchema`; by hand it is the `durable_schedules` CREATE TABLE + index in the package docs.
+ * Only needed if you use persisted schedules.
+ */
+export const durableSchedules = sqliteTable(
+  'durable_schedules',
+  {
+    id: text('id').primaryKey(),
+    namespace: text('namespace').notNull().default(DEFAULT_NAMESPACE),
+    workflow: text('workflow').notNull(),
+    paused: integer('paused', { mode: 'boolean' }).notNull().default(false),
+    nextFireAt: integer('next_fire_at'),
+    tags: text('tags', { mode: 'json' }).$type<string[]>(),
+    spec: text('spec', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
+    state: text('state', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
+    createdAt: integer('created_at').notNull(),
+    updatedAt: integer('updated_at').notNull(),
+  },
+  // The poll's "due by T" scan: `paused = 0 AND next_fire_at <= T ORDER BY next_fire_at`.
+  (t) => [index('durable_schedules_due_idx').on(t.paused, t.nextFireAt)],
+);
+
 export const durableSchema = {
   workflowRuns,
   stepCheckpoints,
@@ -155,6 +181,7 @@ export const durableSchema = {
   signalWaiters,
   bufferedSignals,
   bufferedEvents,
+  durableSchedules,
 };
 
 /**

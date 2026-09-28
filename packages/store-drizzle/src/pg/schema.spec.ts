@@ -28,7 +28,7 @@ describe('Drizzle Postgres durable schema', () => {
     expect(Object.keys(DURABLE_CANONICAL_COLUMNS).sort()).toEqual(durablePgManagedTables().sort());
   });
 
-  it('owns the same six tables as the SQLite schema', () => {
+  it('owns the same seven tables as the SQLite schema', () => {
     expect(durablePgManagedTables().sort()).toEqual(durableManagedTables().sort());
   });
 

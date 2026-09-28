@@ -21,6 +21,7 @@ export interface CronOptions {
 
 export interface CronFire {
   prev(): { toDate(): Date };
+  next(): { toDate(): Date };
 }
 
 export type ParseCron = (expr: string, options: CronOptions) => CronFire;

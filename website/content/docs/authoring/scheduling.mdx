@@ -10,6 +10,9 @@ you — a nightly report, an hourly sync, a cleanup every five minutes. You desc
 The interesting part is the exactly-once guarantee: even with several worker instances racing on the
 same tick, each schedule window starts **exactly once**.
 
+These are **code-registered** schedules, fixed at deploy time. For schedules created and managed at
+runtime (one per user, per tenant, per automation) see [Persisted schedules](/docs/authoring/persisted-schedules).
+
 ## Describing a schedule — `ScheduledWorkflow`
 
 ```ts

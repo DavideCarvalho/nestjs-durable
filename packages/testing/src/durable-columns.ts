@@ -107,6 +107,19 @@ export const DURABLE_CANONICAL_COLUMNS = {
     payload: 'payload',
     publishedAt: 'published_at',
   },
+  // Persisted schedules (`engine.schedules`). `spec`/`state` are engine-owned JSON documents.
+  durable_schedules: {
+    id: 'id',
+    namespace: 'namespace',
+    workflow: 'workflow',
+    paused: 'paused',
+    nextFireAt: 'next_fire_at',
+    tags: 'tags',
+    spec: 'spec',
+    state: 'state',
+    createdAt: 'created_at',
+    updatedAt: 'updated_at',
+  },
 } as const;
 
 export type DurableColumnMap = typeof DURABLE_CANONICAL_COLUMNS;

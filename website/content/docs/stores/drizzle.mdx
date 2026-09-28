@@ -66,8 +66,9 @@ npx drizzle-kit migrate
 
 Point your `drizzle.config.ts` at a schema file that re-exports `durableSchema` (or the individual
 tables) so the generated SQL includes `durable_workflow_runs`, `durable_step_checkpoints`,
-`durable_run_attributes`, `durable_signal_waiters`, `durable_buffered_signals` and
-`durable_buffered_events`.
+`durable_run_attributes`, `durable_signal_waiters`, `durable_buffered_signals`,
+`durable_buffered_events` and `durable_schedules` (the last only used by
+[persisted schedules](/docs/authoring/persisted-schedules)).
 
 <Callout type="warn">
   **An upgrade that adds a durable column is a migration you have to run — and skipping it breaks

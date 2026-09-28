@@ -96,6 +96,43 @@ export class DurableApiController {
     return this.dashboard.workerHealth();
   }
 
+  /**
+   * The persisted schedules (`engine.schedules`), soonest-due first, optionally narrowed by
+   * `namespace`/`workflow`/`tag`/`paused`. Empty on a tenant or a store without schedules.
+   */
+  @Get('schedules')
+  schedules(
+    @Query('namespace') namespace?: string,
+    @Query('workflow') workflow?: string,
+    @Query('tag') tag?: string,
+    @Query('paused') paused?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.dashboard.listSchedules({
+      ...(namespace ? { namespace } : {}),
+      ...(workflow ? { workflow } : {}),
+      ...(tag ? { tag } : {}),
+      ...(paused === 'true' || paused === 'false' ? { paused: paused === 'true' } : {}),
+      limit: Math.min(Number(limit) || 200, 1_000),
+    });
+  }
+
+  @Post('schedules/:id/pause')
+  pauseSchedule(@Param('id') id: string) {
+    return this.dashboard.pauseSchedule(id).catch(notFound);
+  }
+
+  @Post('schedules/:id/resume')
+  resumeSchedule(@Param('id') id: string) {
+    return this.dashboard.resumeSchedule(id).catch(notFound);
+  }
+
+  /** Start one run of the schedule now, outside its cadence. */
+  @Post('schedules/:id/trigger')
+  triggerSchedule(@Param('id') id: string) {
+    return this.dashboard.triggerSchedule(id).catch(notFound);
+  }
+
   /** This deployment's durable role (control plane vs tenant) + tenant name — for the header badge. */
   @Get('topology')
   topology() {
@@ -193,4 +230,12 @@ export class DurableApiController {
   update(@Param('id') id: string, @Param('name') name: string, @Body() body: unknown) {
     return this.dashboard.update(id, name, body);
   }
+}
+
+/** Map core's `ScheduleNotFoundError` to a 404; rethrow anything else. */
+function notFound(error: unknown): never {
+  if (error instanceof Error && error.name === 'ScheduleNotFoundError') {
+    throw new NotFoundException(error.message);
+  }
+  throw error;
 }

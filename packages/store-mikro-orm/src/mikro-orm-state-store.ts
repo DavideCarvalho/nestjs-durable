@@ -10,6 +10,8 @@ import {
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
+  type ScheduleQuery,
+  type ScheduleRecord,
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
@@ -68,6 +70,7 @@ import {
   BufferedEventEntity,
   BufferedSignalEntity,
   RunAttributeEntity,
+  ScheduleEntity,
   SignalWaiterEntity,
   StepCheckpointEntity,
   WorkflowRunEntity,
@@ -669,6 +672,69 @@ export class MikroOrmStateStore implements StateStore {
     return (id: string) => `${ch}${id}${ch}`;
   }
 
+  // ---- persisted schedules ----------------------------------------------------------------------
+
+  async saveSchedule(record: ScheduleRecord): Promise<void> {
+    const em = this.fork();
+    await em.upsert(ScheduleEntity, toScheduleEntity(record));
+  }
+
+  async getSchedule(id: string): Promise<ScheduleRecord | null> {
+    const entity = await this.fork().findOne(ScheduleEntity, { id });
+    return entity ? fromScheduleEntity(entity) : null;
+  }
+
+  /** One conditional `nativeUpdate`: the compare-and-set on `next_fire_at` (an exact bigint) is a
+   *  single statement. */
+  async updateSchedule(
+    id: string,
+    patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+    expectedNextFireAt?: number | null,
+  ): Promise<boolean> {
+    const data: Record<string, unknown> = {};
+    if (patch.namespace !== undefined) data.namespace = patch.namespace;
+    if (patch.workflow !== undefined) data.workflow = patch.workflow;
+    if (patch.paused !== undefined) data.paused = patch.paused;
+    if ('nextFireAt' in patch) data.nextFireAt = patch.nextFireAt ?? null;
+    if ('tags' in patch) data.tags = patch.tags ?? null;
+    if (patch.spec !== undefined) data.spec = patch.spec;
+    if (patch.state !== undefined) data.state = patch.state;
+    if (patch.updatedAt !== undefined) data.updatedAt = patch.updatedAt;
+    if (!Object.keys(data).length) return (await this.getSchedule(id)) !== null;
+    const where: Record<string, unknown> = { id };
+    if (expectedNextFireAt !== undefined) where.nextFireAt = expectedNextFireAt;
+    const affected = await this.fork().nativeUpdate(ScheduleEntity, where, data);
+    return affected > 0;
+  }
+
+  async deleteSchedule(id: string): Promise<boolean> {
+    return (await this.fork().nativeDelete(ScheduleEntity, { id })) > 0;
+  }
+
+  async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
+    const em = this.fork();
+    const where: Record<string, unknown> = {};
+    if (query.namespace !== undefined) where.namespace = query.namespace;
+    if (query.workflow !== undefined) where.workflow = query.workflow;
+    if (query.paused !== undefined) where.paused = query.paused;
+    if (query.dueBy !== undefined) {
+      where.$and = [{ paused: false }, { nextFireAt: { $lte: query.dueBy } }];
+    }
+    const quote = this.idQuote(em);
+    const meta = em.getMetadata().get(ScheduleEntity);
+    const tagsCol = meta.properties.tags?.fieldNames?.[0] ?? 'tags';
+    const qb = (em as SqlEm).createQueryBuilder<ScheduleEntity>(ScheduleEntity, 'r').where(where);
+    if (query.tag !== undefined) {
+      const pattern = `%"${query.tag.replace(/'/g, "''")}"%`;
+      qb.andWhere(`${this.jsonAsText(em, `${quote('r')}.${quote(tagsCol)}`)} LIKE '${pattern}'`);
+    }
+    // Soonest-due first, never-firing (NULL) last, id as the stable tie-break.
+    qb.orderBy({ 'r.nextFireAt': 'asc nulls last', 'r.id': 'asc' });
+    if (query.limit != null) qb.limit(query.limit);
+    if (query.offset != null) qb.offset(query.offset);
+    return (await qb.getResultList()).map(fromScheduleEntity);
+  }
+
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
     const em = this.fork();
     const rows = await em.find(StepCheckpointEntity, { runId }, { orderBy: { seq: 'asc' } });
@@ -900,5 +966,35 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
     enqueuedAt: e.enqueuedAt ?? e.startedAt,
     startedAt: e.startedAt,
     finishedAt: e.finishedAt,
+  };
+}
+
+function toScheduleEntity(r: ScheduleRecord): ScheduleEntity {
+  const e = new ScheduleEntity();
+  e.id = r.id;
+  e.namespace = r.namespace;
+  e.workflow = r.workflow;
+  e.paused = r.paused;
+  e.nextFireAt = r.nextFireAt;
+  e.tags = r.tags ?? null;
+  e.spec = r.spec;
+  e.state = r.state;
+  e.createdAt = r.createdAt;
+  e.updatedAt = r.updatedAt;
+  return e;
+}
+
+function fromScheduleEntity(e: ScheduleEntity): ScheduleRecord {
+  return {
+    id: e.id,
+    namespace: e.namespace,
+    workflow: e.workflow,
+    paused: Boolean(e.paused),
+    nextFireAt: e.nextFireAt == null ? null : Number(e.nextFireAt),
+    ...(e.tags?.length ? { tags: e.tags } : {}),
+    spec: e.spec ?? {},
+    state: e.state ?? {},
+    createdAt: e.createdAt,
+    updatedAt: e.updatedAt,
   };
 }
