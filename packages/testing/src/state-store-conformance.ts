@@ -977,6 +977,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         };
 
         await engine.start('q-wait', {}, 'q1', { concurrency: quota });
+        expect((await engine.waitForRun('q1', { timeoutMs: 20_000 })).status).toBe('suspended');
         await expect(engine.start('q-wait', {}, 'q2', { concurrency: quota })).rejects.toThrow(
           /concurrency limit/,
         );
@@ -990,6 +991,9 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect((await store.getRun('q1'))?.status).toBe('cancelled');
         await engine.start('q-wait', {}, 'q4', { concurrency: quota });
         expect(await store.getRun('q4')).not.toBeNull();
+        // Let every started run park (and its execution settle) before the store is torn down.
+        for (const id of ['q3', 'q4']) await engine.waitForRun(id, { timeoutMs: 20_000 });
+        await engine.drain();
       },
     );
 
