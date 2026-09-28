@@ -84,6 +84,19 @@ through it so the engine can checkpoint — the body itself stays deterministic 
 | `UndoOf<H>` | `H extends (input: infer I, ...rest: never[]) => infer R ? StepUndo<I, Awaited<R>> : never` | Derives a dispatched undo's expected argument from the ORIGINAL step method's type, so a `compensate` ref is compile-checked against the call it undoes: `async cancelBooking(undo: UndoOf<FlightService['book']>) { ... }`. |
 | `ChildCallOptions` | `{ childId?, priority?, version? }` | Options for `ctx.child`/`ctx.startChild` (a bare string is shorthand for `{ childId }`). `priority` only affects a remote child. `version` pins the child to that exact registered version — pass a constant, see [Versioning](/docs/authoring/versioning). |
 
+### `DynamicWorkflowCtx<A>` — the non-overloaded view
+
+`WorkflowCtx` minus its four overloaded methods, re-declared with ONE string-addressed signature each:
+`step(name, input, opts?)`, `child(workflow, input, options?)`, `startChild(workflow, input, options?)`,
+`all(workflow, inputs, opts?)`. Every `WorkflowCtx<A>` is assignable to it without a cast. Depend on it
+(or a `Pick` of it) in code that drives the ctx by names — a graph interpreter — and in test fakes,
+where satisfying every overload of the full `WorkflowCtx` is impractical:
+
+```ts
+type InterpreterCtx = Pick<DynamicWorkflowCtx, 'runId' | 'localStep' | 'child' | 'all' | 'sleep'>;
+new Interpreter(ctx /* WorkflowCtx */); // accepts InterpreterCtx — no `as unknown as`
+```
+
 ## Decorators
 
 From `@dudousxd/nestjs-durable`.
