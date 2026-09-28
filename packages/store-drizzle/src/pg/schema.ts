@@ -1,6 +1,7 @@
 import { getTableName } from 'drizzle-orm';
 import {
   bigserial,
+  boolean,
   doublePrecision,
   index,
   integer,
@@ -153,6 +154,26 @@ export const durableBufferedEvents = pgTable(
   (t) => [index('durable_buffered_events_name_published_at_idx').on(t.name, t.publishedAt)],
 );
 
+// Persisted schedules (`engine.schedules`): the store filters on the columns; `spec`/`state` are
+// engine-owned JSON documents it keeps verbatim.
+export const durableSchedules = pgTable(
+  'durable_schedules',
+  {
+    id: text('id').primaryKey(),
+    namespace: text('namespace').notNull().default(DEFAULT_NAMESPACE),
+    workflow: text('workflow').notNull(),
+    paused: boolean('paused').notNull().default(false),
+    nextFireAt: tstz('next_fire_at'),
+    tags: jsonb('tags').$type<string[]>(),
+    spec: jsonb('spec').$type<Record<string, unknown>>().notNull(),
+    state: jsonb('state').$type<Record<string, unknown>>().notNull(),
+    createdAt: tstz('created_at').notNull(),
+    updatedAt: tstz('updated_at').notNull(),
+  },
+  // The poll's "due by T" scan: `paused = false AND next_fire_at <= T ORDER BY next_fire_at`.
+  (t) => [index('durable_schedules_due_idx').on(t.paused, t.nextFireAt)],
+);
+
 /**
  * Every durable table, keyed by the name to export it under. Spread into your drizzle-kit schema file
  * (`export const { durableWorkflowRuns, ... } = durablePgSchema;` or `export * from` the `/pg` entry)
@@ -165,6 +186,7 @@ export const durablePgSchema = {
   durableSignalWaiters,
   durableBufferedSignals,
   durableBufferedEvents,
+  durableSchedules,
 };
 
 /**

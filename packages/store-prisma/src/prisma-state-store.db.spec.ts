@@ -73,6 +73,7 @@ async function truncatePrisma(): Promise<void> {
   await sharedPrisma.durableSignalWaiter.deleteMany();
   await sharedPrisma.durableBufferedSignal.deleteMany();
   await sharedPrisma.durableBufferedEvent.deleteMany();
+  await sharedPrisma.durableSchedule.deleteMany();
   await sharedPrisma.durableRunAttribute.deleteMany(); // before runs (FK)
   await sharedPrisma.durableWorkflowRun.deleteMany();
 }

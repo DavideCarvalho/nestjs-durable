@@ -33,6 +33,7 @@ const TABLE_TO_CLASS: Record<string, string> = {
   durable_signal_waiters: 'SignalWaiterEntity',
   durable_buffered_signals: 'BufferedSignalEntity',
   durable_buffered_events: 'BufferedEventEntity',
+  durable_schedules: 'ScheduleEntity',
 };
 
 /** Init an ORM with the durable entities under `naming` and return a (table, property) → column resolver. */

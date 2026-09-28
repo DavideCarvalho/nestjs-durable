@@ -444,6 +444,28 @@ export interface StateStore {
    */
   transaction?<T>(work: (tx: StoreTransaction) => Promise<T>): Promise<T>;
 
+  // Persisted schedules (optional) — see {@link ScheduleRecord}. A store implements all five or none;
+  // `engine.schedules` refuses to run on a store without them.
+
+  /** Insert or fully replace the schedule `record.id`. */
+  saveSchedule?(record: ScheduleRecord): Promise<void>;
+  /** The schedule `id`, or null. */
+  getSchedule?(id: string): Promise<ScheduleRecord | null>;
+  /**
+   * Patch the schedule `id`. With `expectedNextFireAt`, a compare-and-set: the patch applies only if
+   * the stored `nextFireAt` still equals it (`null` matching `NULL`), which is how two schedulers racing
+   * on the same due schedule agree on who advanced it. Returns whether a row was updated.
+   */
+  updateSchedule?(
+    id: string,
+    patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+    expectedNextFireAt?: number | null,
+  ): Promise<boolean>;
+  /** Delete the schedule `id`. Returns whether it existed. Its past runs are left alone. */
+  deleteSchedule?(id: string): Promise<boolean>;
+  /** Schedules matching `query`, ordered by `nextFireAt` ascending (never-firing last), then `id`. */
+  listSchedules?(query: ScheduleQuery): Promise<ScheduleRecord[]>;
+
   // Dashboard queries
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
 
@@ -511,6 +533,46 @@ export interface StateStore {
    * plus an in-JS prefix scan that produces the identical result.
    */
   listCheckpointsByNamePrefix?(runId: string, prefixes: string[]): Promise<StepCheckpoint[]>;
+}
+
+/**
+ * A persisted schedule as the STORE sees it: a handful of queryable columns plus two JSON documents
+ * the store keeps verbatim (`spec`, `state`) and never interprets. The engine's schedule client owns
+ * their meaning (cron/interval math, overlap, catch-up) — so a store only has to persist rows and
+ * answer "which unpaused schedules are due by T".
+ */
+export interface ScheduleRecord {
+  /** Caller-chosen, stable id (e.g. `digest:user-42`) — also part of every run id it starts. */
+  id: string;
+  /** Partition: the namespace its runs are stamped with, and which schedulers fire it. */
+  namespace: string;
+  /** Registered workflow name the schedule starts. */
+  workflow: string;
+  /** A paused schedule is never due. */
+  paused: boolean;
+  /** Epoch ms at which it is next due (jitter included), or null when it will never fire again. */
+  nextFireAt: number | null;
+  /** Labels to list/filter schedules by (also stamped onto the runs it starts). */
+  tags?: string[] | undefined;
+  /** The schedule's definition — opaque to the store. */
+  spec: Record<string, unknown>;
+  /** The schedule's bookkeeping (last fire, last run id, last error…) — opaque to the store. */
+  state: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** Filter for {@link StateStore.listSchedules}. Every predicate is ANDed; absent = unrestricted. */
+export interface ScheduleQuery {
+  namespace?: string | undefined;
+  workflow?: string | undefined;
+  /** Only schedules carrying this tag. */
+  tag?: string | undefined;
+  paused?: boolean | undefined;
+  /** Only DUE schedules: unpaused, `nextFireAt <= dueBy`. */
+  dueBy?: number | undefined;
+  limit?: number | undefined;
+  offset?: number | undefined;
 }
 
 /** The terminal run statuses — a run in one of these is finished and will never change on its own.

@@ -307,6 +307,14 @@ export interface DurableModuleOptions {
    */
   schedules?: ScheduledWorkflow[];
   /**
+   * Fire the PERSISTED schedules managed at runtime through `engine.schedules` (create/upsert/pause/
+   * resume/delete/list) on every timer-poll tick of a driving instance — one indexed "due by now"
+   * query per tick. Off by default, so a deployment that never uses them doesn't need the
+   * `durable_schedules` table. Safe with any number of driving instances: each window's run id is
+   * deterministic and advancing a schedule is a compare-and-set. Operator only.
+   */
+  persistedSchedules?: boolean;
+  /**
    * Hard-prune terminal run history on an interval so `durable_workflow_runs` (and its child tables)
    * stays bounded — without it, completed/failed/cancelled runs accumulate forever and the timer
    * poller's per-tick status scans get linearly slower. Driving instances only. Omit to keep all

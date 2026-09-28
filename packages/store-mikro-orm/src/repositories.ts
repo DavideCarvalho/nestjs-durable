@@ -3,6 +3,7 @@ import type {
   BufferedEventEntity,
   BufferedSignalEntity,
   RunAttributeEntity,
+  ScheduleEntity,
   SignalWaiterEntity,
   StepCheckpointEntity,
   WorkflowRunEntity,
@@ -34,3 +35,5 @@ export class SignalWaiterRepository extends EntityRepository<SignalWaiterEntity>
 export class BufferedSignalRepository extends EntityRepository<BufferedSignalEntity> {}
 
 export class BufferedEventRepository extends EntityRepository<BufferedEventEntity> {}
+
+export class ScheduleRepository extends EntityRepository<ScheduleEntity> {}

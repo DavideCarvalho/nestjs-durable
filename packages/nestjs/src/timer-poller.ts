@@ -14,7 +14,8 @@ import { isDrivingOperator } from './role';
 
 /**
  * Resumes suspended runs whose durable timer (`ctx.sleep`) is due, and fires any configured
- * recurring `schedules` — once on boot, then on an interval. Set `timerPollMs` to `0` to disable
+ * recurring `schedules` (plus the persisted `engine.schedules` when `persistedSchedules` is on) —
+ * once on boot, then on an interval. Set `timerPollMs` to `0` to disable
  * the interval (e.g. when an external scheduler drives `WorkflowEngine.resumeDueTimers`).
  */
 @Injectable()
@@ -86,6 +87,9 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
       const schedules = this.options.schedules;
       if (schedules && schedules.length > 0) {
         await this.sweep('schedules', () => runSchedules(this.engine, schedules, Date.now()));
+      }
+      if (this.options.persistedSchedules) {
+        await this.sweep('persistedSchedules', () => this.engine.schedules.tick());
       }
     } finally {
       this.polling = false;

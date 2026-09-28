@@ -1,0 +1,97 @@
+---
+title: Persisted schedules
+description: "engine.schedules — Temporal-style schedules created, updated, paused, resumed, triggered and deleted at runtime, persisted in the store (durable_schedules), fired by every driving engine's timer poll with cron + timezone or fixed intervals, jitter, overlap and catch-up policies. Safe with any number of workers."
+icon: CalendarClock
+---
+
+The `schedules` module option ([Scheduling](/docs/authoring/scheduling)) covers cadences you know at
+deploy time. Many apps need schedules that **users create**: a morning brief per person at *their* 9:00,
+an automation per tenant on a cron they typed, a weekly digest per team. Those belong in the database,
+next to the runs they start — that is `engine.schedules`.
+
+## Turning it on
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  persistedSchedules: true, // the timer poller fires due persisted schedules each tick
+});
+```
+
+It needs the `durable_schedules` table. The TypeORM, MikroORM and Drizzle-Postgres adapters create it
+on boot with `autoSchema`; with Drizzle (SQLite) re-run `drizzle-kit generate`, and with Prisma copy the
+`DurableSchedule` model into your schema. It is only read when `persistedSchedules` is on (or when you
+call `engine.schedules` yourself), so a deployment that doesn't use it doesn't need the table.
+
+## Managing schedules
+
+Inject the `WorkflowEngine` and use `engine.schedules`:
+
+```ts
+await engine.schedules.upsert({
+  id: `brief:${user.id}`,              // stable id — also part of every run id it starts
+  workflow: MorningBriefWorkflow,      // class or registered name
+  input: { userId: user.id },
+  cron: '0 9 * * 1-5',                 // or `every: '15m'`
+  timezone: user.timezone,             // IANA zone; DST handled by cron-parser
+  jitter: '2m',                        // spread thousands of 9:00 briefs over two minutes
+  overlap: 'skip',                     // don't start while yesterday's is still running
+  catchup: 'latest',                   // after an outage, fire the most recent missed window once
+  tags: [`tenant:${user.tenantId}`],   // find schedules by tag; stamped on every run too
+  namespace: user.tenantId,            // optional: partition of the schedule and its runs
+});
+
+await engine.schedules.pause(`brief:${user.id}`, 'user on vacation');
+await engine.schedules.resume(`brief:${user.id}`);    // continues from the next window
+await engine.schedules.trigger(`brief:${user.id}`);   // one run now, outside the cadence
+await engine.schedules.list({ tag: `tenant:${tenantId}` });
+await engine.schedules.get(`brief:${user.id}`);        // next fire, last fire/run, fires, lastError
+await engine.schedules.delete(`brief:${user.id}`);     // its past runs are left alone
+```
+
+- `create` throws `ScheduleAlreadyExistsError` on a taken id; `upsert` creates or replaces the
+  definition while keeping history (last fire, last run, fire count) and a paused state.
+- Changing a definition recomputes the next fire from now, so an upsert never re-fires a window.
+- Every run carries the schedule's tags plus `schedule:<id>`, and optional `searchAttributes` /
+  `priority` from the definition. Its id is `sched:<id>:<windowMs>` (`sched:<id>:manual:<ms>` for a
+  trigger).
+
+## Policies
+
+| Option | Values | Meaning |
+| --- | --- | --- |
+| `cron` / `every` | cron expression / duration | Exactly one. Intervals are aligned to the epoch. Cron needs the `cron-parser` peer. |
+| `timezone` | IANA zone, default `UTC` | Zone the cron is evaluated in. |
+| `jitter` | duration | A stable per-(schedule, window) delay in `[0, jitter)` so schedules sharing a cron don't all start in the same second. The run id stays the nominal window. |
+| `overlap` | `'allow'` (default) / `'skip'` | `'skip'` skips a window while the previous run of this schedule is still in flight. |
+| `catchup` | `'latest'` (default) / `'skip'` | Windows missed while nothing polled: fire the most recent one once, or drop them. Never more than one catch-up run. |
+| `paused` | boolean | Create paused. On `upsert`, omit to keep the current state. |
+
+A start that fails (unregistered workflow, input validation, a concurrency limit…) is recorded as the
+schedule's `lastError` and the schedule moves on to its next window. A definition that stops evaluating
+(e.g. a timezone removed from the tz database) pauses the schedule with the reason in `lastError`.
+
+## Multi-worker safety
+
+Any number of driving instances can run `persistedSchedules` at once. Each tick is one indexed
+"due by now" query per instance (`paused = false AND next_fire_at <= now`). For each due schedule:
+
+1. the window's run is started with its deterministic id — racing instances collapse into one run,
+   because `start` is idempotent by id;
+2. the schedule is advanced with a **compare-and-set** on its `next_fire_at` — exactly one instance
+   moves it on; the others see the CAS fail and leave it.
+
+A crash between 1 and 2 just re-fires the same (idempotent) start on the next tick. No locks, no
+leases, no leader election.
+
+## Driving it yourself
+
+Without the NestJS module, call `await engine.schedules.tick()` from any poller; it fires every due
+schedule in the engine's namespace (all namespaces for an operator engine) and returns the run ids.
+
+## Dashboard
+
+The console header shows a **schedules** chip (count, paused count) whose popover lists every
+persisted schedule's cadence, next and last fire and last error, with **pause/resume** and **run now**.
+The API behind it is `GET /schedules` and `POST /schedules/:id/{pause,resume,trigger}`.

@@ -3,11 +3,12 @@ import { ENTITIES } from './entities';
 import { durableManagedTables } from './schema';
 
 describe('durableManagedTables', () => {
-  it('returns the six durable table names', () => {
+  it('returns the seven durable table names', () => {
     expect(durableManagedTables().sort()).toEqual([
       'durable_buffered_events',
       'durable_buffered_signals',
       'durable_run_attributes',
+      'durable_schedules',
       'durable_signal_waiters',
       'durable_step_checkpoints',
       'durable_workflow_runs',

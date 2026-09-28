@@ -3,6 +3,7 @@ import {
   BufferedEventEntity,
   BufferedSignalEntity,
   RunAttributeEntity,
+  ScheduleEntity,
   SignalWaiterEntity,
   StepCheckpointEntity,
   WorkflowRunEntity,
@@ -30,6 +31,7 @@ const TABLE_TO_ENTITY = {
   durable_signal_waiters: SignalWaiterEntity,
   durable_buffered_signals: BufferedSignalEntity,
   durable_buffered_events: BufferedEventEntity,
+  durable_schedules: ScheduleEntity,
 } as const;
 
 /**
@@ -154,6 +156,8 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
   const waiterCol = (property: string) => q(resolve('durable_signal_waiters', property));
   const bufCol = (property: string) => q(resolve('durable_buffered_signals', property));
   const bevCol = (property: string) => q(resolve('durable_buffered_events', property));
+  const schedules = q('durable_schedules');
+  const schCol = (property: string) => q(resolve('durable_schedules', property));
   // Numeric side-table column for attribute range scans. `double precision` on Postgres, `double` on
   // MySQL, `real` on SQLite (all hold JS numbers without precision loss for the typical attribute).
   const num = isPg ? 'double precision' : isMysql ? 'double' : 'real';
@@ -209,6 +213,16 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
     `CREATE TABLE IF NOT EXISTS ${bufferedEvents} (
       ${bevCol('id')} ${str} PRIMARY KEY, ${bevCol('name')} ${str} NOT NULL,
       ${bevCol('payload')} ${txt}, ${bevCol('publishedAt')} ${ts} NOT NULL
+    )`,
+    // Persisted schedules. `next_fire_at` is epoch ms as a bigint (exact, so the compare-and-set on
+    // it survives MySQL's DATETIME millisecond truncation); `spec`/`state` are engine-owned JSON.
+    `CREATE TABLE IF NOT EXISTS ${schedules} (
+      ${schCol('id')} ${str} PRIMARY KEY, ${schCol('namespace')} ${nsCol},
+      ${schCol('workflow')} ${str} NOT NULL,
+      ${schCol('paused')} boolean NOT NULL DEFAULT ${isPg ? 'false' : '0'},
+      ${schCol('nextFireAt')} bigint, ${schCol('tags')} ${txt},
+      ${schCol('spec')} ${txt} NOT NULL, ${schCol('state')} ${txt} NOT NULL,
+      ${schCol('createdAt')} ${ts} NOT NULL, ${schCol('updatedAt')} ${ts} NOT NULL
     )`,
   ];
 
@@ -305,6 +319,8 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ],
       // Search-attribute pushdown: equality + range predicates probe by (key, value). Two composite
       // indexes — one per typed column — so a numeric range or a string equality is an index scan.
+      // Persisted schedules: the poll's "due by T" scan (`paused = false AND next_fire_at <= T`).
+      ['durable_schedules_due_idx', `${schedules} (${schCol('paused')}, ${schCol('nextFireAt')})`],
       [
         'durable_run_attributes_num_idx',
         `${runAttributes} (${attrCol('key')}, ${attrCol('numValue')})`,

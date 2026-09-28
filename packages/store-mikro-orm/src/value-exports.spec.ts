@@ -21,6 +21,7 @@ describe('barrel re-exports keep the repository classes as VALUES', () => {
       'BufferedEventRepository',
       'BufferedSignalRepository',
       'RunAttributeRepository',
+      'ScheduleRepository',
       'SignalWaiterRepository',
       'StepCheckpointRepository',
       'WorkflowRunRepository',
@@ -34,6 +35,7 @@ describe('barrel re-exports keep the repository classes as VALUES', () => {
     'SignalWaiterRepository',
     'BufferedSignalRepository',
     'BufferedEventRepository',
+    'ScheduleRepository',
   ])('%s is re-exported as a value, not a type', (name) => {
     const exported = (barrel as Record<string, unknown>)[name];
     expect(

@@ -39,6 +39,7 @@ import { type HealthSummary, stalledWorkflows, summarizeHealth } from '../client
 import { AttributeFilters } from './AttributeFilters';
 import { OriginFacets } from './OriginFacets';
 import { RunInfoPanel } from './RunInfoPanel';
+import { SchedulesPanel } from './SchedulesPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
 import { ValuePicker } from './ValuePicker';
@@ -191,6 +192,7 @@ function Header({
         {STATUSES.map((s) => chip(s, s, counts[s] ?? 0))}
       </div>
       <WorkersHealth />
+      {!isTenant && <SchedulesPanel />}
       <div className="flex items-center gap-2 text-xs text-zinc-500">
         <span className="dot s-completed pulse" aria-hidden />
         live

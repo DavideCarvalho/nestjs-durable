@@ -9,6 +9,7 @@
     "queries-and-updates",
     "webhooks",
     "versioning",
-    "scheduling"
+    "scheduling",
+    "persisted-schedules"
   ]
 }

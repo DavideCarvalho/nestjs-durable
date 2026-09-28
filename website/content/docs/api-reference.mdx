@@ -251,6 +251,7 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 | `cancel` | `cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult \| null>` | Cancel a run. `{ compensate: true }` resumes it first so registered saga undos run in reverse (status `cancelling` in the interim) before it settles `cancelled`. |
 | `cancelWhere` | `cancelWhere(filter: Omit<RunQuery, 'limit' \| 'offset'>, opts?: { compensate?: boolean }): Promise<RunResult[]>` | Bulk-cancel every run matching a `RunQuery` filter (workflow/status/tag/search-attribute), each through `cancel`. |
 | `retryWithInput` | `retryWithInput(runId: string, input: unknown, newRunId?: string): Promise<{ runId: string } \| null>` | Fix-and-replay: start a NEW run (default id `<runId>~retry~<uuid>`) with corrected `input`, clean history; the original stays inspectable. |
+| `schedules` | `ScheduleClient` — `create`/`upsert`/`get`/`list`/`pause`/`resume`/`trigger`/`delete`/`tick` | Persisted, runtime-managed schedules (cron + timezone or interval, jitter, overlap, catch-up), multi-worker safe. See [Persisted schedules](/docs/authoring/persisted-schedules). |
 | `deleteRun` | `deleteRun(runId: string): Promise<number>` | Hard-delete a run and its whole child subtree (cascades depth-first). Returns the count removed. Prefer `cancel` for a still-live run. |
 | `purgeRuns` | `purgeRuns(scope: RunScope, opts?: { batchSize?, cancelLive?, children? }): Promise<number>` | Hard-delete every run matching `scope` (namespace/tags/workflows/attributes) with their child subtrees, in batches; live runs are cancelled first. Rejects an empty scope. See [Retention](/docs/reliability/retention#purging-on-demand). |
 | `purgeNamespace` | `purgeNamespace(namespace: string, opts?): Promise<number>` | `purgeRuns({ namespace })` — every run a tenant/partition owns. |
@@ -300,6 +301,7 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `drive` | `boolean` | `true` | Whether this operator instance actively drives runs (poll/recover/resume/prune/consume). `false` = dashboard/dispatch-only. |
 | `shutdownTimeoutMs` | `number` | `10000` | Max ms to wait for in-flight runs on shutdown. Operator only. |
 | `schedules` | `ScheduledWorkflow[]` | none | Recurring workflows (fixed interval or cron), fired by the timer poller on driving instances. See [Scheduling](/docs/authoring/scheduling). |
+| `persistedSchedules` | `boolean` | `false` | Fire the runtime-managed `engine.schedules` (stored in `durable_schedules`) on each timer-poll tick. See [Persisted schedules](/docs/authoring/persisted-schedules). |
 | `retention` | `DurableRetentionOptions` (`{ policies, sweepInterval?, batchSize? }`) | keep all history | Hard-prune terminal run history on an interval. See [Run retention & pruning](/docs/reliability/retention). |
 | `webhookUrl` | `(token: string) => string` | none (build your own) | Builds `DurableWebhook.url` for `ctx.webhook()`. Operator only. |
 | `queues` | `QueueConfig[]` | none | Flow-control queues registered on the engine at startup. See [Flow control](/docs/reliability/flow-control). |

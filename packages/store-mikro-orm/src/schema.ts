@@ -12,6 +12,7 @@ const DURABLE_TABLE_NAMES = new Set([
   'durable_signal_waiters',
   'durable_buffered_signals',
   'durable_buffered_events',
+  'durable_schedules',
 ]);
 
 /**

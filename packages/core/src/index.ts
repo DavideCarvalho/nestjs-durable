@@ -23,6 +23,7 @@ export * from './concurrency';
 export * from './events';
 export * from './metrics';
 export * from './scheduler';
+export * from './schedules';
 export { createStepLogger } from './step-logger';
 export {
   DURABLE_STEP_CONFIG,

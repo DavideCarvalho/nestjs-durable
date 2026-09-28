@@ -52,6 +52,12 @@ CREATE INDEX durable_run_attributes_str_idx ON durable_run_attributes (key, str_
 CREATE TABLE durable_signal_waiters (token TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL, parallel_group TEXT);
 CREATE TABLE durable_buffered_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL, payload TEXT);
 CREATE TABLE durable_buffered_events (id TEXT PRIMARY KEY, name TEXT NOT NULL, payload TEXT, published_at INTEGER NOT NULL);
+CREATE TABLE durable_schedules (
+  id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'default', workflow TEXT NOT NULL,
+  paused INTEGER NOT NULL DEFAULT 0, next_fire_at INTEGER, tags TEXT, spec TEXT NOT NULL, state TEXT NOT NULL,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX durable_schedules_due_idx ON durable_schedules (paused, next_fire_at);
 `;
 
 function makeStore() {
