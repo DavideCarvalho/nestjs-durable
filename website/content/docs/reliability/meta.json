@@ -7,6 +7,7 @@
     "sagas",
     "flow-control",
     "singleton",
+    "concurrency-quotas",
     "dead-letter",
     "retention"
   ]

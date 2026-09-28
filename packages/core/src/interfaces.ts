@@ -448,6 +448,16 @@ export interface StateStore {
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
 
   /**
+   * How many runs match `query` — a single `COUNT(*)` over the same predicates {@link listRuns}
+   * applies, without materializing a row. What the start-time concurrency quota asks on every start
+   * (`tag = concurrency:<key> AND status IN (...)`), so it must stay an aggregate, not a listing.
+   *
+   * Optional: a store that omits it still works — the engine falls back to summing {@link runFacets}
+   * cells, then to counting a {@link listRuns} result.
+   */
+  countRuns?(query: Omit<RunQuery, 'limit' | 'offset'>): Promise<number>;
+
+  /**
    * Count the runs matching `query`, grouped by `(status, origin)` — the totals behind a console's
    * status and origin chips, in ONE aggregate instead of a full listing the caller counts in memory.
    * This is what lets a run list be paginated at all: `listRuns` can return 100 rows while the chips

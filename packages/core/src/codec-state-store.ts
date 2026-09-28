@@ -64,6 +64,10 @@ export class CodecStateStore implements StateStore {
     limit: number,
   ) => Promise<number>;
 
+  /** Forwarded verbatim — a count reads no payload. Bound only when the inner store counts, so the
+   *  engine's facet/listing fallback still applies through the wrapper. */
+  readonly countRuns?: (query: Omit<RunQuery, 'limit' | 'offset'>) => Promise<number>;
+
   constructor(
     private readonly inner: StateStore,
     private readonly codec: PayloadCodec,
@@ -73,6 +77,8 @@ export class CodecStateStore implements StateStore {
     const prune = inner.pruneTerminalRuns;
     if (prune)
       this.pruneTerminalRuns = (policy, now, limit) => prune.call(inner, policy, now, limit);
+    const count = inner.countRuns;
+    if (count) this.countRuns = (query) => count.call(inner, query);
     const facets = inner.runFacets;
     if (facets) this.runFacets = (query) => facets.call(inner, query);
     const valueFacets = inner.runValueFacets;

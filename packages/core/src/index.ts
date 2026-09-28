@@ -19,6 +19,7 @@ export * from './run-value-facets';
 export * from './run-gateway';
 export * from './run-waiting';
 export * from './codec-state-store';
+export * from './concurrency';
 export * from './events';
 export * from './metrics';
 export * from './scheduler';

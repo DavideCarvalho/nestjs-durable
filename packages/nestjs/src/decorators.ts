@@ -1,4 +1,5 @@
 import {
+  type ConcurrencyConfig,
   DURABLE_STEP_CONFIG,
   DURABLE_STEP_NAME,
   type SearchAttributesSchema,
@@ -23,6 +24,8 @@ export interface WorkflowMeta {
   tags?: string[] | undefined;
   /** Per-key serialization (a durable mutex). See `WorkflowOptions`. */
   singleton?: SingletonConfig | undefined;
+  /** Start-time concurrency quota (rejecting). See `WorkflowOptions`. */
+  concurrency?: ConcurrencyConfig | undefined;
   /** Max wall-clock lifetime before a run is cancelled (e.g. `'2h'`). See `WorkflowOptions`. */
   executionTimeout?: string | number | undefined;
   /** class-validator DTO validated at start. See `WorkflowOptions`. */
@@ -65,6 +68,15 @@ export interface WorkflowOptions {
    * 1) raises the concurrency.
    */
   singleton?: SingletonConfig;
+  /**
+   * A start-time concurrency QUOTA: at most `limit` runs sharing a key in flight, and a start over it
+   * is REJECTED (`ConcurrencyLimitError`, nothing created) rather than queued. e.g.
+   * `concurrency: { key: (input) => `tenant:${input.tenantId}`, limit: 8 }` caps what one tenant can
+   * have executing at once. The key is shared across workflows; `limit` may be a (async) function of
+   * the key for per-plan limits; `countStatuses` narrows what occupies a slot (default: every
+   * non-terminal status). Use `singleton` instead when excess runs should wait their turn.
+   */
+  concurrency?: ConcurrencyConfig;
   /**
    * Max wall-clock lifetime for a run of this workflow (e.g. `'2h'`, `'7 days'`, or ms). A run that
    * outlives it is moved to `cancelled` (`execution_timeout`) by the timer poller — a backstop for
@@ -158,6 +170,7 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       deadLetterWorkflow: options.deadLetterWorkflow,
       tags: options.tags,
       singleton: options.singleton,
+      concurrency: options.concurrency,
       executionTimeout: options.executionTimeout,
       inputSchema: options.inputSchema,
       validateInput: options.validateInput,

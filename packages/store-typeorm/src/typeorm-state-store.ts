@@ -375,6 +375,10 @@ export class TypeOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
+  async countRuns(query: Omit<RunQuery, 'limit' | 'offset'>): Promise<number> {
+    return this.runQueryBuilder(query).getCount();
+  }
+
   /** `GROUP BY status, origin` over the same predicates {@link listRuns} pages — one aggregate, so a
    *  console can show whole-set counts next to a bounded page instead of downloading every run to
    *  count them in the browser. */

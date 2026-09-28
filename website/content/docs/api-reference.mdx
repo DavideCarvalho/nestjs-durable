@@ -99,6 +99,7 @@ Marks a provider class as a durable workflow; its `run(ctx, input)` becomes the 
 | `deadLetterWorkflow` | `WorkflowRef` | Route this workflow's dead runs to another registered workflow (class or name). Superseded by an inline `@DeadLetter()` method on the same class. See [Dead-letter queue](/docs/reliability/dead-letter). |
 | `tags` | `string[]` | Static labels stamped on every run, merged with per-run `start` tags. |
 | `singleton` | `SingletonConfig` (`{ key, limit?, maxQueueDepth? }`) | Durable FIFO mutex per key. See [Singleton workflows](/docs/reliability/singleton). |
+| `concurrency` | `ConcurrencyConfig` (`{ key, limit, countStatuses? }`) | Start-time quota per key (shared across workflows); an over-limit start throws `ConcurrencyLimitError`. See [Concurrency quotas](/docs/reliability/concurrency-quotas). |
 | `executionTimeout` | `string \| number` | Max wall-clock lifetime; an overrunning run is cancelled (`execution_timeout`) by the timer poller. |
 | `inputSchema` | `class` | Validate `start` input against a class-validator DTO (needs `class-validator`/`class-transformer`). |
 | `validateInput` | `(input: unknown) => void \| Promise<void>` | Custom validator; takes precedence over `inputSchema`. |
@@ -311,6 +312,7 @@ All exported from `@dudousxd/nestjs-durable-core`.
 | `FatalError` | Thrown BY YOU inside a step/workflow for an unrecoverable business failure (e.g. a declined card) — the engine never retries it and fails the run immediately. |
 | `SignalTimeoutError` | `ctx.waitForSignal` / `ctx.waitForEvent` / `ctx.onUpdate`'s `timeoutMs` deadline passes before delivery. Catchable in the workflow to take a default branch. |
 | `NonDeterminismError` | On resume, the step at a logical position has a different name/kind than its checkpoint — the workflow code changed under an in-flight run without a new `@Workflow` version. See [Versioning & determinism](/docs/authoring/versioning). |
+| `ConcurrencyLimitError` | `start` whose concurrency quota key already has `limit` runs in flight (`key`, `limit`, `active`, `workflow`). Nothing was created — shed load / answer 429. See [Concurrency quotas](/docs/reliability/concurrency-quotas). |
 | `SingletonQueueFullError` | `start` on a singleton workflow whose in-flight + gated backlog already equals `limit + maxQueueDepth`. Back-pressure — retry later. See [Singleton workflows](/docs/reliability/singleton). |
 | `GatherError` | `ctx.all` — one or more parallel children failed; carries per-item `{ index, id, error }` failures. |
 | `RemoteStepTimeout` | A dispatched step produces no result/heartbeat within its `timeoutMs` — the worker is presumed dead. Retryable, subject to the step's `retries`. |

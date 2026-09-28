@@ -1,0 +1,79 @@
+---
+title: Concurrency quotas
+description: "A start-time quota — at most `limit` runs sharing a key in flight, across workflows — that REJECTS an over-limit start with ConcurrencyLimitError before anything is created. Declared per workflow with @Workflow({ concurrency }) or per start with StartOptions.concurrency."
+icon: Gauge
+---
+
+A multi-tenant app wants one tenant unable to occupy every worker: "a company can have at most 8
+chat turns executing at once". That is a **quota on starting runs**, not a mutex — the ninth start
+should be refused right away ("busy, try again in a moment", an HTTP 429), not parked behind the
+other eight. `concurrency` is exactly that.
+
+## Declaring a quota
+
+On the workflow, deriving the key from the input:
+
+```ts
+@Workflow({
+  name: 'chat.turn',
+  concurrency: {
+    key: (input: TurnInput) => `tenant:${input.tenantId}`,
+    limit: 8,
+  },
+})
+export class ChatTurnWorkflow { /* … */ }
+```
+
+Or per start (overrides the workflow's config for that start):
+
+```ts
+await workflows.start(ChatTurnWorkflow, input, runId, {
+  concurrency: { key: `tenant:${tenantId}`, limit: plan.maxActiveTurns },
+});
+```
+
+A start that would exceed the quota throws `ConcurrencyLimitError` (`key`, `limit`, `active`,
+`workflow`) and **creates nothing** — map it to a 429:
+
+```ts
+try {
+  await workflows.start(ChatTurnWorkflow, input, runId);
+} catch (e) {
+  if (e instanceof ConcurrencyLimitError) throw new HttpException('Busy, retry shortly', 429);
+  throw e;
+}
+```
+
+## Options
+
+- `key` — the quota bucket. On `@Workflow` it's a function of the input; return `undefined` to leave
+  that start unlimited. The key is **global, not per workflow**: every workflow started with
+  `tenant:acme` draws on the same quota, so one limit can cover all the kinds of work a tenant runs.
+- `limit` — max runs of the key in flight. On `@Workflow` it may be a (sync or async) function of the
+  key, for per-plan limits: `limit: (key) => plans.maxActive(key)`. `limit <= 0` rejects every start.
+- `countStatuses` — which statuses occupy a slot. Default: every non-terminal status (`pending`,
+  `running`, `suspended`, `cancelling`, `blocked`). Narrow it to `['pending', 'running']` when runs
+  parked on a human (suspended on a signal) shouldn't hold a slot.
+
+## How it's enforced
+
+The run carries the tag `concurrency:<key>`, and `start` counts the runs with that tag in
+`countStatuses` with one `COUNT(*)` (`StateStore.countRuns`, implemented by every bundled store; a
+custom store without it falls back to `runFacets`, then to a listing). The store is the only source of
+truth, so there is nothing to leak or reconcile when a process crashes: a slot frees the moment its run
+leaves the counted statuses.
+
+- An idempotent re-`start` of an existing `runId` returns that run and is never rejected.
+- The quota applies wherever the workflow is started: `engine.start`, `ctx.child`/`startChild` (a
+  rejected child start fails the parent's `ctx.child`), event triggers and schedules.
+- It is a **soft cap under a race**: the count and the insert are separate statements, so starts that
+  are truly simultaneous on the last free slot can each see it free — the same guarantee a hand-rolled
+  `SELECT count(*)` gate gives, with an overshoot bounded by the number of simultaneous starts.
+
+## Quota, singleton, or flow control?
+
+| You want… | Use |
+| --- | --- |
+| Refuse work over a per-key limit, right away | `concurrency` (this page) |
+| Queue work over a per-key limit and run it in order when a slot frees | [`singleton`](/docs/reliability/singleton) (`limit`, `maxQueueDepth`) |
+| Cap concurrent **steps** hitting a downstream, fleet-wide | [flow-control queues](/docs/reliability/flow-control) (+ `RedisAdmissionBackend`) |

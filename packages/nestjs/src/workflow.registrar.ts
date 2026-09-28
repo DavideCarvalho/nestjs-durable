@@ -134,6 +134,7 @@ export class WorkflowRegistrar
         origin,
         tags: meta.tags,
         singleton: meta.singleton,
+        concurrency: meta.concurrency,
         executionTimeout: meta.executionTimeout,
         requires: meta.requires,
         validateInput,

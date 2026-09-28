@@ -3,6 +3,13 @@ import { runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints';
 import { type Completion } from './completion';
+import {
+  type ConcurrencyConfig,
+  type ConcurrencyQuota,
+  assertConcurrency,
+  concurrencyTag,
+  resolveConcurrency,
+} from './concurrency';
 import { parseDuration } from './duration';
 import { Entities, type EntityConfig } from './entities';
 import {
@@ -143,6 +150,12 @@ export interface StartOptions {
    * maps here), so one DB-less-tenant-facing engine can create runs across many namespaces.
    */
   namespace?: string | undefined;
+  /**
+   * A start-time concurrency quota for this start — at most `limit` runs sharing `key` in flight;
+   * over it, `start` throws {@link ConcurrencyLimitError} and creates nothing. Overrides the
+   * workflow's registered `concurrency`. See {@link ConcurrencyQuota}.
+   */
+  concurrency?: ConcurrencyQuota | undefined;
 }
 
 /**
@@ -185,6 +198,8 @@ interface RegisteredWorkflow {
   tags?: string[] | undefined;
   /** Per-key serialization (a durable mutex). See {@link SingletonConfig}. */
   singleton?: SingletonConfig | undefined;
+  /** Start-time concurrency quota (reject over the limit). See {@link ConcurrencyConfig}. */
+  concurrency?: ConcurrencyConfig | undefined;
   /** Max wall-clock lifetime (ms) before a run is cancelled by `sweepTimeouts`. */
   executionTimeoutMs?: number | undefined;
   /** Validate the input at start; throw to reject before a run is created. Validator-agnostic. */
@@ -792,6 +807,8 @@ export class WorkflowEngine {
     opts?: {
       tags?: string[] | undefined;
       singleton?: SingletonConfig | undefined;
+      /** Start-time concurrency quota — see {@link ConcurrencyConfig}. */
+      concurrency?: ConcurrencyConfig | undefined;
       executionTimeout?: string | number | undefined;
       validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
       /** Typed/validated `searchAttributes` shape — see `RegisteredWorkflow.searchAttributesSchema`. */
@@ -829,6 +846,7 @@ export class WorkflowEngine {
       fn,
       tags: opts?.tags,
       singleton: opts?.singleton,
+      concurrency: opts?.concurrency,
       executionTimeoutMs:
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts?.validateInput,
@@ -892,6 +910,7 @@ export class WorkflowEngine {
       executor: WorkflowExecutor;
       tags?: string[];
       singleton?: SingletonConfig;
+      concurrency?: ConcurrencyConfig;
       executionTimeout?: string | number;
       validateInput?: (input: unknown) => void | Promise<void>;
       /** Capabilities a live worker must advertise to run this remote workflow's turns (handshake §7.5). */
@@ -907,6 +926,7 @@ export class WorkflowEngine {
       },
       tags: opts.tags,
       singleton: opts.singleton,
+      concurrency: opts.concurrency,
       executionTimeoutMs:
         opts.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts.validateInput,
@@ -940,6 +960,7 @@ export class WorkflowEngine {
       version?: string;
       tags?: string[];
       singleton?: SingletonConfig;
+      concurrency?: ConcurrencyConfig;
       executionTimeout?: string | number;
       validateInput?: (input: unknown) => void | Promise<void>;
       /** Capabilities a live worker must advertise to run this workflow's turns (handshake §7.5). */
@@ -1137,6 +1158,10 @@ export class WorkflowEngine {
     if (prior) {
       return { runId, status: prior.status, output: prior.output, error: prior.error };
     }
+    // Start-time concurrency quota (per-start override, else the workflow's): reject BEFORE creating
+    // anything when the key's in-flight runs already reach the limit. See {@link ConcurrencyQuota}.
+    const quota = await resolveConcurrency(opts?.concurrency, registered.concurrency, input);
+    if (quota) await assertConcurrency(this.store, name, quota);
     const now = new Date();
     // A singleton workflow stamps a `singleton:<key>` tag so the admission gate (in execute) can find
     // the other in-flight runs sharing the key via a tag+status query. A convention-resolved remote
@@ -1145,6 +1170,7 @@ export class WorkflowEngine {
     const stampedTags = [
       ...(opts?.tags ?? []),
       ...(registered.singleton ? [this.singletons.tag(registered.singleton, input)] : []),
+      ...(quota ? [concurrencyTag(quota.key)] : []),
       ...(registered.versionDeclared === false ? [VERSION_UNDECLARED_TAG] : []),
     ];
     const tags = mergeTags(registered.tags, stampedTags);
