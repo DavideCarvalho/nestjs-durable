@@ -67,6 +67,7 @@ await engine.schedules.delete(`brief:${user.id}`);     // its past runs are left
 | `overlap` | `'allow'` (default) / `'skip'` | `'skip'` skips a window while the previous run of this schedule is still in flight. |
 | `catchup` | `'latest'` (default) / `'skip'` | Windows missed while nothing polled: fire the most recent one once, or drop them. Never more than one catch-up run. |
 | `paused` | boolean | Create paused. On `upsert`, omit to keep the current state. |
+| `concurrency` | `{ key, limit, countStatuses? }` | A [concurrency quota](/docs/reliability/concurrency-quotas) applied to every run it starts; an over-limit window is skipped and recorded as `lastError`. |
 
 A start that fails (unregistered workflow, input validation, a concurrency limit…) is recorded as the
 schedule's `lastError` and the schedule moves on to its next window. A definition that stops evaluating

@@ -1,3 +1,4 @@
+import type { ConcurrencyQuota } from './concurrency';
 import { parseDuration } from './duration';
 import type { StartOptions } from './engine';
 import type {
@@ -60,6 +61,12 @@ export interface ScheduleOptions {
   searchAttributes?: SearchAttributes | undefined;
   /** Dispatch priority for the runs it starts. */
   priority?: number | undefined;
+  /**
+   * A start-time concurrency quota applied to every run it starts (see `StartOptions.concurrency`):
+   * a window whose start would exceed it is recorded as the schedule's `lastError` and skipped, and
+   * the schedule moves on to its next window.
+   */
+  concurrency?: ConcurrencyQuota | undefined;
 }
 
 /** A schedule as `engine.schedules.get/list` describe it. */
@@ -79,6 +86,7 @@ export interface ScheduleDescription {
   tags?: string[] | undefined;
   searchAttributes?: SearchAttributes | undefined;
   priority?: number | undefined;
+  concurrency?: ConcurrencyQuota | undefined;
   /** When it is next due (jitter included), or null if it never fires again / paused. */
   nextFireAt: Date | null;
   /** The last window it fired for, and the run that window started. */
@@ -124,6 +132,7 @@ interface SpecDoc {
   note?: string;
   searchAttributes?: SearchAttributes;
   priority?: number;
+  concurrency?: ConcurrencyQuota;
 }
 
 /** The persisted bookkeeping (`ScheduleRecord.state`). */
@@ -442,6 +451,7 @@ function toSpec(opts: ScheduleOptions): SpecDoc {
     note: opts.note,
     searchAttributes: opts.searchAttributes,
     priority: opts.priority,
+    concurrency: opts.concurrency,
   }) as SpecDoc;
 }
 
@@ -482,6 +492,7 @@ function startOptions(record: ScheduleRecord): StartOptions {
     namespace: record.namespace,
     searchAttributes: spec.searchAttributes,
     priority: spec.priority,
+    concurrency: spec.concurrency,
   }) as StartOptions;
 }
 
@@ -504,6 +515,7 @@ function describe(record: ScheduleRecord): ScheduleDescription {
     tags: record.tags,
     searchAttributes: spec.searchAttributes,
     priority: spec.priority,
+    concurrency: spec.concurrency,
     nextFireAt: record.paused || record.nextFireAt == null ? null : new Date(record.nextFireAt),
     lastFireAt: state.lastFireAt != null ? new Date(state.lastFireAt) : undefined,
     lastRunId: state.lastRunId,
