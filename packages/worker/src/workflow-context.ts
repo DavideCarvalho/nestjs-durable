@@ -18,9 +18,12 @@ import type {
   WorkflowStepEvent,
 } from '@dudousxd/nestjs-durable-core';
 import {
+  NestedWorkflowCallError,
   createStepLogger,
+  currentStepScope,
   parseDuration,
   runInStepLogger,
+  runInStepScope,
   stepNameOf,
   workflowName,
 } from '@dudousxd/nestjs-durable-core';
@@ -144,8 +147,16 @@ export class WorkflowContext implements WorkflowCtx {
    * Every durable op takes its seq from here, so this is the single choke point where between-op
    * cancellation is enforced for the whole workflow API. Mirrors Python `_next`.
    */
-  private next(): number {
+  private next(primitive: string): number {
     this.raiseIfCancelled();
+    // Fail fast when called from INSIDE one of this ctx's local-step bodies (see core's
+    // NestedWorkflowCallError): the step replays from history without re-running its body, so the
+    // position claimed here would never be claimed again and every later op would shift. A position
+    // already present in history was journaled before this guard existed — let it replay as written.
+    const scope = currentStepScope();
+    if (scope !== undefined && scope.owner === this && !this.history.has(this.seq)) {
+      throw new NestedWorkflowCallError(this.runId, primitive, scope.step);
+    }
     const seq = this.seq;
     this.seq += 1;
     return seq;
@@ -254,7 +265,7 @@ export class WorkflowContext implements WorkflowCtx {
         'ctx.step: handler is not a @Step reference (no stamped step name) — pass a @Step-decorated method or a step name string',
       );
     }
-    const seq = this.next();
+    const seq = this.next('step');
     const { found, output } = this.replay(seq, 'call', name);
     if (found) return output;
     const group = this.resolveCallGroup();
@@ -285,7 +296,7 @@ export class WorkflowContext implements WorkflowCtx {
     fn: (log: StepLogger) => Promise<TOutput> | TOutput,
     _options?: StepOptions,
   ): Promise<TOutput> {
-    const seq = this.next();
+    const seq = this.next('localStep');
     const { found, output } = this.replay(seq, 'step', name);
     if (found) return output as TOutput;
 
@@ -315,7 +326,7 @@ export class WorkflowContext implements WorkflowCtx {
     try {
       // Bind the SAME sink ambiently too, so a helper deep inside the body can emit via
       // `currentStep()` without the handle being threaded down (see core's `ambient-step.ts`).
-      const result = await runInStepLogger(log, () => body(log));
+      const result = await runInStepScope(this, name, () => runInStepLogger(log, () => body(log)));
       const finishedAt = Date.now();
       const cmd: WorkflowCommand = {
         kind: 'recordStep',
@@ -369,7 +380,7 @@ export class WorkflowContext implements WorkflowCtx {
    * `sleep` and matches `WorkflowCtx.sleep`.
    */
   async sleep(duration: string | number): Promise<void> {
-    const seq = this.next();
+    const seq = this.next('sleep');
     const { found } = this.replay(seq, 'timer');
     if (found) return;
     this.commands.push({ kind: 'sleep', seq, ms: parseDuration(duration) });
@@ -394,7 +405,7 @@ export class WorkflowContext implements WorkflowCtx {
     if (opts?.timeoutMs != null) {
       return this.unsupported('waitForSignal with timeoutMs');
     }
-    const seq = this.next();
+    const seq = this.next('waitForSignal');
     const { found, output } = this.replay(seq, 'signal', token);
     if (found) return output as TPayload;
     const sig = this.signalsBySeq.get(seq);
@@ -427,7 +438,7 @@ export class WorkflowContext implements WorkflowCtx {
     _options?: string | ChildCallOptions,
   ): Promise<unknown> {
     const name = workflowName(workflow);
-    const seq = this.next();
+    const seq = this.next('child');
     const { found, output } = this.replay(seq, 'child', name);
     if (found) return output;
     this.commands.push({ kind: 'startChild', seq, workflow: name, input });
@@ -453,7 +464,12 @@ export class WorkflowContext implements WorkflowCtx {
   ): Promise<unknown[]> {
     // Reserve the contiguous seq block synchronously, in list order, before any await. This is the
     // determinism anchor: seqs are assigned by position, never by completion order.
-    const entries = items.map(([name, body], index) => ({ index, seq: this.next(), name, body }));
+    const entries = items.map(([name, body], index) => ({
+      index,
+      seq: this.next('gather'),
+      name,
+      body,
+    }));
     const first = entries[0];
     if (first === undefined) return [];
     const group = `gather:${first.seq}`;
@@ -524,7 +540,7 @@ export class WorkflowContext implements WorkflowCtx {
     const name = workflowName(workflow);
     const entries = inputs.map((input, index) => ({
       index,
-      seq: this.next(),
+      seq: this.next('all'),
       input,
       history: undefined as HistoryEvent | null | undefined,
     }));

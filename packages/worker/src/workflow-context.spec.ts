@@ -391,3 +391,32 @@ describe('WorkflowContext.replayEntry', () => {
     expect(() => ctx.replayEntry(0, 'step', 's')).toThrow(NondeterminismError);
   });
 });
+
+describe('WorkflowContext — primitives inside a local-step body fail fast', () => {
+  it('ctx.child called inside a localStep body fails the step with a NestedWorkflowCallError', async () => {
+    const ctx = new WorkflowContext('r1', []);
+    let caught: unknown;
+    await expect(
+      ctx.localStep('outer', async () => {
+        try {
+          await ctx.child('kid', {});
+        } catch (err) {
+          caught = err;
+          throw err;
+        }
+      }),
+    ).rejects.toBeInstanceOf(StepFailed);
+    expect((caught as Error).name).toBe('NestedWorkflowCallError');
+    expect((caught as Error).message).toMatch(
+      /ctx\.child\(\) was called inside the body of step "outer"/,
+    );
+    // Nothing was emitted for the nested call — only the failed outer step.
+    expect(ctx.commands.map((c) => c.kind)).toEqual(['recordStep']);
+  });
+
+  it('the same primitive OUTSIDE a step body is unaffected', async () => {
+    const ctx = new WorkflowContext('r1', []);
+    await ctx.localStep('outer', async () => 1);
+    await expect(ctx.child('kid', {})).rejects.toBeInstanceOf(Suspend);
+  });
+});

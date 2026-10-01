@@ -3,6 +3,7 @@ import {
   createStepLogger,
   runDurableExecution,
   runInStepLogger,
+  runOutsideWorkflowCtx,
 } from '@dudousxd/nestjs-durable-core';
 import { toError } from './errors';
 import type { StepLog } from './workflow-context';
@@ -74,7 +75,9 @@ export class StepWorker {
           seq: task.seq,
           attempt: task.attempt,
         },
-        async () => runInStepLogger(log, () => handler(task.input, log)),
+        // A handler is not the workflow body: never let an in-process caller's ambient ctx leak in.
+        async () =>
+          runOutsideWorkflowCtx(() => runInStepLogger(log, () => handler(task.input, log))),
       );
       const result: StepResult = { ...base, status: 'completed', output };
       if (events.length > 0) result.events = events;
