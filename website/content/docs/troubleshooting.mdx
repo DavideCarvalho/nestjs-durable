@@ -38,6 +38,27 @@ whose history no longer matches its code.
   ["Deploys: replay-safety discipline"](/docs/production#5-deploys-replay-safety-discipline) and the
   "stale local worker" pitfalls in [Tenancy](/docs/concepts/tenancy#pitfalls).
 
+## `NestedWorkflowCallError`: a ctx call inside a step body
+
+**Symptom:** a run fails at a step with `NestedWorkflowCallError` (code `nested_workflow_call`):
+
+```
+ctx.startChild() was called inside the body of step "dispatch-turn" (run wrun_8Kb2). Workflow
+primitives (...) must be called from the workflow body, never from inside a step body ...
+```
+
+**Cause:** something inside a `ctx.localStep` / `ctx.transaction` / `ctx.sideEffect` / `ctx.now` body
+called a workflow primitive — directly (`ctx.startChild(...)`) or through the ambient ctx
+(`OtherWorkflow.start()` / `.execute()` resolve the running workflow's ctx). A step body runs once and
+then replays from its checkpoint *without* re-running, so the nested call claims a journal position on
+the first run that no replay ever claims again. Before this guard, that run kept going and died later
+with a `NonDeterminismError` on its next replay, far from the cause.
+
+**Fix:** move the call out of the step body into the workflow body (start the child before/after the
+step, passing whatever the step computed). From a dispatched `@Step` handler, `OtherWorkflow.start()`
+starts a top-level run — a handler never sees the workflow's ctx, in-process transports included.
+Runs journaled before the guard existed (the nested call already recorded) keep replaying unchanged.
+
 ## A caught suspend runs compensation and corrupts the run
 
 **Symptom:** a workflow with a hand-rolled `try`/`catch` around a `ctx.step` (or `ctx.sleep` /

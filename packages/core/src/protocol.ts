@@ -1,3 +1,4 @@
+import { runOutsideWorkflowCtx } from './ambient-ctx';
 import { runInStepLogger } from './ambient-step';
 import { runDurableExecution } from './execution-hooks';
 import type { RemoteTask, StepEvent, StepLogger, StepResult } from './interfaces';
@@ -57,7 +58,10 @@ export async function runStepHandler(
         seq: task.seq,
         attempt: task.attempt,
       },
-      async () => runInStepLogger(logger, () => handler(task.input, logger)),
+      // Outside any ambient workflow ctx: an in-process transport runs the handler on the parent
+      // body's async path, but a handler is not the body (see `runOutsideWorkflowCtx`).
+      async () =>
+        runOutsideWorkflowCtx(() => runInStepLogger(logger, () => handler(task.input, logger))),
     );
     return withEvents({ ...base, status: 'completed', output });
   } catch (err) {

@@ -156,3 +156,26 @@ async charge(input: { orderId: string; amountCents: number }) {
 The engine guarantees *logical* exactly-once, but a crash after the worker ran and before its
 checkpoint was written can physically re-run the step — dedupe on something stable in the input.
 Source: website/content/docs/concepts/durability.mdx ("Idempotency").
+
+### 4. Calling a ctx primitive from inside a step body
+
+```ts
+// ✗ Wrong — the step body starts a child through the ambient ctx. The step replays from its
+// checkpoint WITHOUT re-running its body, so the child's journal position is never claimed again.
+await ctx.localStep('plan', async () => {
+  const plan = await this.planner.plan(input);
+  await ExecutePlanWorkflow.start(plan); // → NestedWorkflowCallError at this line
+  return plan;
+});
+
+// ✓ Correct — the step computes, the BODY orchestrates.
+const plan = await ctx.localStep('plan', () => this.planner.plan(input));
+await ExecutePlanWorkflow.start(plan);
+```
+
+Any primitive (`ctx.startChild`/`child`/`step`/`sleep`/`waitForSignal`/`sideEffect`/…, and the
+`MyWorkflow.start()`/`.execute()` statics) called inside a `ctx.localStep`/`ctx.transaction`/
+`ctx.sideEffect`/`ctx.now` body throws `NestedWorkflowCallError` (a `FatalError`) at the call site.
+A dispatched `@Step` handler never sees the workflow ctx, so `MyWorkflow.start()` there starts a
+top-level run. Source: packages/core/src/errors.ts (`NestedWorkflowCallError`),
+packages/core/src/workflow-ctx.ts (the guard).
