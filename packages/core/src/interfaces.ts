@@ -306,6 +306,24 @@ export interface StateStore {
    */
   ensureSchema?(): Promise<void>;
 
+  /**
+   * Atomically read active runs sharing workflow/tag in this store's read scope, preserve durable
+   * admitted holders, and claim a free slot for an eligible FIFO waiter. The claim persists the
+   * reserved SINGLETON_ADMITTED_TAG in tags. Execution lease expiry never releases a slot; terminal
+   * status does. Optional for general stores, required when using singleton workflows. Implement
+   * with a database transaction that serializes competing claims BEFORE reading; list/update alone
+   * is unsafe across engine instances. If retryWakeAt is supplied, denial must atomically suspend
+   * the still-active candidate with that wakeAt while the same locks are held. Never overwrite a
+   * cancelling or terminal run on denial. Return false for missing/terminal/out-of-scope runs.
+   */
+  tryAdmitSingleton?(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean>;
+
   createRun(run: WorkflowRun): Promise<void>;
   updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void>;
   getRun(runId: string): Promise<WorkflowRun | null>;

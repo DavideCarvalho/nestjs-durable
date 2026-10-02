@@ -9,6 +9,7 @@ import {
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
+  SINGLETON_ACTIVE_STATUSES,
   type ScheduleQuery,
   type ScheduleRecord,
   type SignalWaiter,
@@ -21,11 +22,14 @@ import {
   type WorkflowRun,
   attributePredicateOperands,
   axisIsRunColumn,
+  clearTerminalSingletonAdmission,
   mergeRunFacetRows,
   mergeRunValueFacetRows,
   normalizeAttributeRows,
   parseDuration,
   runValueFacetsFromRuns,
+  singletonAdmissionDenialPatch,
+  singletonAdmissionTags,
 } from '@dudousxd/nestjs-durable-core';
 import {
   type SQL,
@@ -141,6 +145,34 @@ export class DrizzlePgStateStore implements StateStore {
     return namespaceFilter(this.scopeNamespace);
   }
 
+  async tryAdmitSingleton(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean> {
+    return this.db.transaction(async (tx) => {
+      const where = and(
+        eq(workflowRuns.workflow, workflow),
+        inArray(workflowRuns.status, SINGLETON_ACTIVE_STATUSES),
+        this.scope(),
+      );
+      await tx.update(workflowRuns).set({ workflow }).where(where);
+      const rows = await tx.select().from(workflowRuns).where(where);
+      const runs = rows.map(fromRunRow);
+      const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
+      if (!tags) {
+        const patch = singletonAdmissionDenialPatch(runs, runId, tag, workflow, retryWakeAt);
+        if (patch)
+          await tx.update(workflowRuns).set(toRunPatch(patch)).where(eq(workflowRuns.id, runId));
+        return false;
+      }
+      await tx.update(workflowRuns).set({ tags }).where(eq(workflowRuns.id, runId));
+      return true;
+    });
+  }
+
   async createRun(run: WorkflowRun): Promise<void> {
     // One transaction: a run is never visible without its attribute rows (or vice versa).
     await this.db.transaction(async (tx) => {
@@ -149,7 +181,14 @@ export class DrizzlePgStateStore implements StateStore {
     });
   }
 
-  async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+  async updateRun(runId: string, inputPatch: Partial<WorkflowRun>): Promise<void> {
+    // Writes are unscoped, so preserve tags even when settling a run outside the read scope.
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) =>
+            this.withScope({}).getRun(id),
+          )
+        : inputPatch;
     const row = toRunPatch(patch);
     const reindex = 'searchAttributes' in patch;
     if (!Object.keys(row).length && !reindex) return;

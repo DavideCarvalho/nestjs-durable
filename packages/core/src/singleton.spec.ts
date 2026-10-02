@@ -1,9 +1,75 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from './engine';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('singleton (serialize runs by key)', () => {
+  afterEach(() => vi.useRealTimers());
+  it('preserves an admitted holder when a later same-millisecond id sorts first', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(1000);
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, clock: () => 1000 });
+    const entered: string[] = [];
+    engine.register(
+      'job',
+      '1',
+      async (ctx, input) => {
+        await ctx.localStep('enter', async () => void entered.push(input as string));
+        await ctx.waitForSignal(`release:${input}`);
+      },
+      { singleton: { key: () => 'k' } },
+    );
+    await startRun(engine, 'job', 'holder', 'z-holder');
+    await startRun(engine, 'job', 'waiter', 'a-waiter');
+    expect(entered).toEqual(['holder']);
+    await engine.drain();
+  });
+
+  it('a second engine preserves a sleeping holder across recovery and later starts', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(1000);
+    const store = new InMemoryStateStore();
+    let now = 1000;
+    const first = new WorkflowEngine({ store, clock: () => now });
+    const second = new WorkflowEngine({ store, clock: () => now });
+    const entered: string[] = [];
+    for (const engine of [first, second]) {
+      engine.register(
+        'job',
+        '1',
+        async (ctx, input) => {
+          await ctx.localStep('enter', async () => void entered.push(input as string));
+          await ctx.sleep(10000);
+        },
+        { singleton: { key: () => 'k' } },
+      );
+    }
+    await startRun(first, 'job', 'holder', 'z-holder');
+    await first.drain();
+    await second.recoverIncomplete();
+    await startRun(second, 'job', 'waiter', 'a-waiter');
+    expect(entered).toEqual(['holder']);
+    now += 11000;
+    await second.resumeDueTimers(now);
+    for (let i = 0; i < 100 && entered.length < 2; i++)
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    expect(entered).toEqual(['holder', 'waiter']);
+    await second.drain();
+  });
+
+  it('rejects a custom store without atomic admission before creating a run', async () => {
+    const store = new InMemoryStateStore();
+    Object.defineProperty(store, 'tryAdmitSingleton', { value: undefined });
+    const engine = new WorkflowEngine({ store });
+    engine.register('job', '1', async () => 'done', { singleton: { key: () => 'k' } });
+    await expect(engine.start('job', {}, 'unsupported')).rejects.toThrow(
+      'StateStore.tryAdmitSingleton',
+    );
+    expect(await store.getRun('unsupported')).toBeNull();
+    await engine.drain();
+  });
+
   it('admits an uncontended singleton run immediately and emits run.started', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });

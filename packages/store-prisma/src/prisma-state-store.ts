@@ -9,6 +9,7 @@ import {
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
+  SINGLETON_ACTIVE_STATUSES,
   type ScheduleQuery,
   type ScheduleRecord,
   type SignalWaiter,
@@ -20,11 +21,14 @@ import {
   type WorkflowRun,
   attributePredicateOperands,
   axisIsRunColumn,
+  clearTerminalSingletonAdmission,
   mergeRunFacetRows,
   mergeRunValueFacetRows,
   normalizeAttributeRows,
   parseDuration,
   runValueFacetsFromRuns,
+  singletonAdmissionDenialPatch,
+  singletonAdmissionTags,
 } from '@dudousxd/nestjs-durable-core';
 
 /* The Prisma client is generated per-schema, so the adapter can't import a concrete one. Instead
@@ -183,12 +187,41 @@ function namespaceWhere(namespace?: string): { namespace?: string } {
 export class PrismaStateStore implements StateStore {
   constructor(private readonly db: DurablePrismaClient) {}
 
+  async tryAdmitSingleton(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean> {
+    return this.db.$transaction(async (tx) => {
+      const where = { workflow, status: { in: SINGLETON_ACTIVE_STATUSES } };
+      // A locking write first: concurrent claims cannot read the same free slot.
+      await tx.durableWorkflowRun.updateMany({ where, data: { workflow } });
+      const rows = await tx.durableWorkflowRun.findMany({ where });
+      const runs = rows.map(fromRunRow);
+      const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
+      if (!tags) {
+        const patch = singletonAdmissionDenialPatch(runs, runId, tag, workflow, retryWakeAt);
+        if (patch)
+          await tx.durableWorkflowRun.update({ where: { id: runId }, data: toRunPatch(patch) });
+        return false;
+      }
+      await tx.durableWorkflowRun.update({ where: { id: runId }, data: { tags } });
+      return true;
+    });
+  }
+
   async createRun(run: WorkflowRun): Promise<void> {
     await this.db.durableWorkflowRun.create({ data: toRunData(run) });
     await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
-  async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+  async updateRun(runId: string, inputPatch: Partial<WorkflowRun>): Promise<void> {
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) => this.getRun(id))
+        : inputPatch;
     await this.db.durableWorkflowRun.update({ where: { id: runId }, data: toRunPatch(patch) });
     // Keep the side-table in step with the run's attributes whenever they're patched.
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);

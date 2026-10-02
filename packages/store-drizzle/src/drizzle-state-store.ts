@@ -9,6 +9,7 @@ import {
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
+  SINGLETON_ACTIVE_STATUSES,
   type ScheduleQuery,
   type ScheduleRecord,
   type SignalWaiter,
@@ -20,11 +21,14 @@ import {
   type WorkflowRun,
   attributePredicateOperands,
   axisIsRunColumn,
+  clearTerminalSingletonAdmission,
   mergeRunFacetRows,
   mergeRunValueFacetRows,
   normalizeAttributeRows,
   parseDuration,
   runValueFacetsFromRuns,
+  singletonAdmissionDenialPatch,
+  singletonAdmissionTags,
 } from '@dudousxd/nestjs-durable-core';
 import {
   type SQL,
@@ -97,12 +101,59 @@ function namespaceFilter(namespace?: string) {
 export class DrizzleStateStore implements StateStore {
   constructor(private readonly db: DrizzleSqlite) {}
 
+  async tryAdmitSingleton(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean> {
+    // Keep the callback synchronous on better-sqlite3; libSQL returns promises from run/all.
+    return this.db.transaction((tx) => {
+      const where = and(
+        eq(workflowRuns.workflow, workflow),
+        inArray(workflowRuns.status, SINGLETON_ACTIVE_STATUSES),
+      );
+      const claim = (rows: RunRow[]): boolean | Promise<boolean> => {
+        const runs = rows.map(fromRunRow);
+        const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
+        if (!tags) {
+          const patch = singletonAdmissionDenialPatch(runs, runId, tag, workflow, retryWakeAt);
+          if (!patch) return false;
+          const parked = tx
+            .update(workflowRuns)
+            .set(toRunPatch(patch))
+            .where(eq(workflowRuns.id, runId))
+            .run();
+          return parked instanceof Promise ? parked.then(() => false) : false;
+        }
+        const written = tx
+          .update(workflowRuns)
+          .set({ tags })
+          .where(eq(workflowRuns.id, runId))
+          .run();
+        return written instanceof Promise ? written.then(() => true) : true;
+      };
+      const read = (): boolean | Promise<boolean> => {
+        const rows = tx.select().from(workflowRuns).where(where).all();
+        return rows instanceof Promise ? rows.then(claim) : claim(rows);
+      };
+      // First acquire SQLite's write lock, then read; never upgrade a stale read transaction.
+      const locked = tx.update(workflowRuns).set({ workflow }).where(where).run();
+      return locked instanceof Promise ? locked.then(read) : read();
+    });
+  }
+
   async createRun(run: WorkflowRun): Promise<void> {
     await this.db.insert(workflowRuns).values(toRunRow(run));
     await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
-  async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+  async updateRun(runId: string, inputPatch: Partial<WorkflowRun>): Promise<void> {
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) => this.getRun(id))
+        : inputPatch;
     const row = toRunPatch(patch);
     // Drizzle throws on `.set({})`; skip the UPDATE when no mapped column actually changed.
     if (Object.keys(row).length)

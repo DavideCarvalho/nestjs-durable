@@ -35,6 +35,15 @@ export interface PayloadCodec {
  * ```
  */
 export class CodecStateStore implements StateStore {
+  /** Atomic claims touch only searchable metadata and bypass payload encoding. */
+  readonly tryAdmitSingleton?: (
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ) => Promise<boolean>;
+
   /**
    * Forwarded verbatim — a facet cell counts `status`/`origin`, neither of which the codec touches
    * (it encodes payloads: input/output/error). Bound as a PROPERTY, and only when the inner store
@@ -86,6 +95,7 @@ export class CodecStateStore implements StateStore {
     private readonly inner: StateStore,
     private readonly codec: PayloadCodec,
   ) {
+    if (inner.tryAdmitSingleton) this.tryAdmitSingleton = inner.tryAdmitSingleton.bind(inner);
     const deleteRuns = inner.deleteRuns;
     if (deleteRuns) this.deleteRuns = (ids) => deleteRuns.call(inner, ids);
     const prune = inner.pruneTerminalRuns;

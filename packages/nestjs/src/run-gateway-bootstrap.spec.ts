@@ -1,12 +1,16 @@
+import { setImmediate } from 'node:timers/promises';
 import {
+  type EngineEvent,
   type Heartbeat,
   InMemoryStateStore,
   type StepResult,
   type Transport,
   type WorkflowDecision,
+  WorkflowEngine,
   type WorkflowTask,
 } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
+import { vi } from 'vitest';
 import { DurableModule } from './durable.module';
 
 /**
@@ -69,5 +73,55 @@ describe('RunGatewayBootstrap (operator responder wiring)', () => {
     expect(transport.runRequestStarted).toBe(true);
 
     await moduleRef.close();
+  });
+  it('contains a rejected namespace lookup in the subscribed tenant republisher', async () => {
+    const store = new InMemoryStateStore();
+    const publishTenantEvent = vi.fn(async () => {});
+    const transport = Object.assign(new BrokerTransport(), { publishTenantEvent });
+    const moduleRef = await Test.createTestingModule({
+      imports: [DurableModule.forRoot({ store, transport, drive: true })],
+    }).compile();
+    await moduleRef.init();
+    const engine = moduleRef.get(WorkflowEngine);
+    const lookup = vi
+      .spyOn(store, 'getRun')
+      .mockRejectedValue(new Error('namespace lookup failed'));
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      (engine as unknown as { emit: (event: Omit<EngineEvent, 'at'>) => void }).emit({
+        type: 'step.started',
+        runId: 'run',
+        seq: 0,
+        name: 'step',
+        kind: 'local',
+      });
+      await setImmediate();
+      expect(lookup).toHaveBeenCalledOnce();
+      expect(unhandled).not.toHaveBeenCalled();
+      lookup.mockResolvedValue({
+        id: 'run',
+        workflow: 'job',
+        workflowVersion: '1',
+        status: 'running',
+        input: {},
+        namespace: 'tenant',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      (engine as unknown as { emit: (event: Omit<EngineEvent, 'at'>) => void }).emit({
+        type: 'step.started',
+        runId: 'run',
+        seq: 1,
+        name: 'next',
+        kind: 'local',
+      });
+      await setImmediate();
+      expect(publishTenantEvent).toHaveBeenCalledOnce();
+    } finally {
+      lookup.mockRestore();
+      process.off('unhandledRejection', unhandled);
+      await moduleRef.close();
+    }
   });
 });

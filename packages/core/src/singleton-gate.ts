@@ -1,6 +1,7 @@
 import type { SingletonConfig } from './engine';
 import { SingletonQueueFullError } from './errors';
 import type { StateStore, WorkflowRun } from './interfaces';
+import { SINGLETON_ACTIVE_STATUSES, SINGLETON_ADMITTED_TAG } from './singleton-admission';
 
 const SINGLETON_RETRY_MS = 1000;
 /**
@@ -11,7 +12,7 @@ const SINGLETON_RETRY_MS = 1000;
 const SINGLETON_RETRY_JITTER_MS = 250;
 
 export interface SingletonGateDeps {
-  store: Pick<StateStore, 'listRuns' | 'updateRun'>;
+  store: Pick<StateStore, 'listRuns' | 'updateRun' | 'tryAdmitSingleton'>;
   clock: () => number;
   /** Hand a gated run to the run dispatcher (fire-and-forget, like the engine's other dispatches). */
   dispatch: (runId: string) => void;
@@ -20,7 +21,7 @@ export interface SingletonGateDeps {
 }
 
 /**
- * Per-key serialization for singleton workflows — start-time back-pressure, FIFO race-free
+ * Per-key serialization for singleton workflows — start-time back-pressure, durable atomic
  * admission, and notify-on-release wakeups. Extracted from {@link WorkflowEngine} so the whole
  * singleton feature lives in one place instead of being smeared across `start`, `execute`, both run
  * loops, and `cancel`.
@@ -30,6 +31,11 @@ export class SingletonGate {
 
   /** The tag a singleton run carries, so the gate can find others sharing its key. */
   tag(cfg: SingletonConfig, input: unknown): string {
+    if (!this.deps.store.tryAdmitSingleton) {
+      throw new Error(
+        'Singleton workflows require StateStore.tryAdmitSingleton for atomic durable admission',
+      );
+    }
     return `singleton:${cfg.key(input)}`;
   }
 
@@ -44,7 +50,7 @@ export class SingletonGate {
 
   /**
    * Reject a start that would grow the same-key backlog past `limit + maxQueueDepth` (counting
-   * `pending`/`running`/`suspended` runs sharing the key in one scan). No-op when no `maxQueueDepth`
+   * `pending`/`running`/`suspended`/`blocked`/`cancelling` runs sharing the key in one scan). No-op when no `maxQueueDepth`
    * is configured.
    */
   async assertCapacity(workflow: string, cfg: SingletonConfig, input: unknown): Promise<void> {
@@ -53,30 +59,31 @@ export class SingletonGate {
     const queued = await this.deps.store.listRuns({
       tag: this.tag(cfg, input),
       workflow,
-      statuses: ['pending', 'running', 'suspended', 'cancelling'],
+      statuses: SINGLETON_ACTIVE_STATUSES,
     });
     if (queued.length >= cap) {
       throw new SingletonQueueFullError(workflow, cfg.key(input), cfg.maxQueueDepth);
     }
   }
 
-  /**
-   * Whether `run` may run now under its key: it's among the `limit` oldest in-flight (running or
-   * suspended) runs sharing the key, by `(createdAt, id)` order. A consistent store gives every
-   * instance the same ordering, so admission is race-free + FIFO.
-   */
+  /** Preserve durable holders and atomically claim one of the remaining slots. */
   async admit(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
-    // ONE scan for both in-flight statuses; the total `(createdAt, id)` sort makes admission order
-    // independent of the store's row order, preserving the FIFO + race-free-across-instances contract.
-    const inflight = (
-      await this.deps.store.listRuns({
-        tag: this.tag(cfg, run.input),
-        workflow: run.workflow,
-        statuses: ['running', 'suspended', 'cancelling'],
-      })
-    ).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
-    const idx = inflight.findIndex((r) => r.id === run.id);
-    return idx >= 0 && idx < (cfg.limit ?? 1);
+    if (!this.deps.store.tryAdmitSingleton) {
+      throw new Error(
+        'Singleton workflows require StateStore.tryAdmitSingleton for atomic durable admission',
+      );
+    }
+    const admitted = await this.deps.store.tryAdmitSingleton(
+      run.id,
+      this.tag(cfg, run.input),
+      run.workflow,
+      cfg.limit ?? 1,
+      this.retryWakeAt(),
+    );
+    if (admitted && !run.tags?.includes(SINGLETON_ADMITTED_TAG)) {
+      run.tags = [...(run.tags ?? []), SINGLETON_ADMITTED_TAG];
+    }
+    return admitted;
   }
 
   /**

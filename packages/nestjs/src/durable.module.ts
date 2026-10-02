@@ -655,7 +655,8 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
         publishTenantEvent.bind(this.transport),
       );
       this.unsubscribe = this.engine.subscribe((event) => {
-        void republisher.handle(event);
+        // Tenant event mirroring is best-effort; a namespace lookup outage must not kill the worker.
+        void republisher.handle(event).catch(() => undefined);
       });
     }
   }

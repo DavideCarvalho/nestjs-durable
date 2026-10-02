@@ -24,6 +24,7 @@ export function makeMikroOrmStoreFactory(
     await truncateAll(orm);
     return {
       store,
+      peerStore: new MikroOrmStateStore(orm),
       cleanup: async () => {
         await truncateAll(orm);
         await orm.close(true);

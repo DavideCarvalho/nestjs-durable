@@ -22,6 +22,7 @@ export function makeTypeOrmStoreFactory(
     await truncateAll(dataSource);
     return {
       store,
+      peerStore: new TypeOrmStateStore(dataSource),
       cleanup: async () => {
         await truncateAll(dataSource);
         await dataSource.destroy();

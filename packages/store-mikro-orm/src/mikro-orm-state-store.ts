@@ -10,6 +10,7 @@ import {
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
+  SINGLETON_ACTIVE_STATUSES,
   type ScheduleQuery,
   type ScheduleRecord,
   type SignalWaiter,
@@ -21,10 +22,13 @@ import {
   type WorkflowRun,
   attributePredicateOperands,
   axisIsRunColumn,
+  clearTerminalSingletonAdmission,
   facetOrigin,
   mergeRunFacetRows,
   normalizeAttributeRows,
   parseDuration,
+  singletonAdmissionDenialPatch,
+  singletonAdmissionTags,
 } from '@dudousxd/nestjs-durable-core';
 import { raw } from '@mikro-orm/core';
 import type { EntityManager, MikroORM } from '@mikro-orm/core';
@@ -133,6 +137,43 @@ export class MikroOrmStateStore implements StateStore {
     await ensureMikroOrmDurableSchema(this.orm);
   }
 
+  async tryAdmitSingleton(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean> {
+    return this.fork().transactional(async (em) => {
+      const where = {
+        workflow,
+        status: { $in: SINGLETON_ACTIVE_STATUSES },
+        ...(this.scopeNamespace !== undefined ? { namespace: this.scopeNamespace } : {}),
+      };
+      // nativeUpdate bypasses read filters, so namespace is explicit on the locking write too.
+      await em.nativeUpdate(WorkflowRunEntity, where, { workflow });
+      const rows = await em.find(WorkflowRunEntity, where);
+      const runs = rows.map(fromRunEntity);
+      const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
+      if (!tags) {
+        const patch = singletonAdmissionDenialPatch(runs, runId, tag, workflow, retryWakeAt);
+        if (patch)
+          await em.nativeUpdate(
+            WorkflowRunEntity,
+            { id: runId },
+            {
+              status: 'suspended',
+              wakeAt: new Date(patch.wakeAt),
+              updatedAt: patch.updatedAt,
+            },
+          );
+        return false;
+      }
+      await em.nativeUpdate(WorkflowRunEntity, { id: runId }, { tags });
+      return true;
+    });
+  }
+
   async createRun(run: WorkflowRun): Promise<void> {
     const em = this.fork();
     em.create(WorkflowRunEntity, toRunEntity(run));
@@ -140,7 +181,14 @@ export class MikroOrmStateStore implements StateStore {
     await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
-  async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+  async updateRun(runId: string, inputPatch: Partial<WorkflowRun>): Promise<void> {
+    // Writes are unscoped, so preserve tags even when settling a run outside the read scope.
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) =>
+            this.withScope({}).getRun(id),
+          )
+        : inputPatch;
     const em = this.fork();
     const entity = await em.findOneOrFail(WorkflowRunEntity, { id: runId });
     Object.assign(entity, toRunEntity({ ...fromRunEntity(entity), ...patch } as WorkflowRun));
