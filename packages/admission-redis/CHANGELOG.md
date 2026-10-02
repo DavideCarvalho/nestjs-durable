@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-admission-redis
 
+## 0.1.1
+
+### Patch Changes
+
+- [#344](https://github.com/DavideCarvalho/nestjs-durable/pull/344) [`717fa46`](https://github.com/DavideCarvalho/nestjs-durable/commit/717fa46fdd07993d117ca36047c70e0e45371ef4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Prevent handled workflow turn failures from creating an unhandled tracking rejection. Reject and clean up waitForRun when its store lookup fails, and contain background tenant-event lookup and initial Redis liveness failures so temporary storage errors do not terminate the worker.
+
 ## 0.1.0
 
 ### Minor Changes

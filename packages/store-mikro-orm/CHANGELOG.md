@@ -1,5 +1,20 @@
 # @dudousxd/nestjs-durable-store-mikro-orm
 
+## 0.27.1
+
+### Patch Changes
+
+- [#344](https://github.com/DavideCarvalho/nestjs-durable/pull/344) [`717fa46`](https://github.com/DavideCarvalho/nestjs-durable/commit/717fa46fdd07993d117ca36047c70e0e45371ef4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Make singleton admission atomic and durable across engine instances. Persist admitted slots in
+  reserved run tags so later same-millisecond starts cannot displace existing holders. Preserve slots
+  through sleep, signals, blocked routing, cancellation, recovery and expired execution leases; clear
+  admission on terminal settlement. Park denied waiters within the admission transaction so concurrent
+  cancellation cannot revive a settled run. All bundled stores support the new atomic admission operation.
+
+  Custom stores must implement `StateStore.tryAdmitSingleton` to use singleton workflows; unsupported
+  starts fail before creating a run. Drain existing singleton runs and upgrade all workers together
+  before resuming starts, because older active rows have no admission marker. No schema migration is
+  required.
+
 ## 0.27.0
 
 ### Minor Changes
