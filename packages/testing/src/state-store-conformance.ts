@@ -1,4 +1,5 @@
 import {
+  SINGLETON_ADMITTED_TAG,
   type ScheduleQuery,
   type ScheduleRecord,
   type StateStore,
@@ -15,6 +16,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
  */
 export interface StateStoreContext {
   store: StateStore;
+  /** A second wrapper sharing the database/pool, used to exercise cross-instance claims. */
+  peerStore?: StateStore;
   cleanup: () => Promise<void>;
   /**
    * Whether the store's optional `transaction` can run an ASYNC work callback. Defaults to `true`.
@@ -99,6 +102,7 @@ const checkpoint = (over: Partial<StepCheckpoint> = {}): StepCheckpoint => ({
 export function runStateStoreContract(name: string, makeStore: StateStoreFactory): void {
   describe(`StateStore contract: ${name}`, () => {
     let store: StateStore;
+    let peerStore: StateStore;
     let cleanup: (() => Promise<void>) | undefined;
     let supportsAsyncTransaction = true;
     let supportsTagFilter = true;
@@ -109,6 +113,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       try {
         const ctx = await makeStore();
         store = ctx.store;
+        peerStore = ctx.peerStore ?? ctx.store;
         cleanup = ctx.cleanup;
         supportsAsyncTransaction = ctx.supportsAsyncTransaction ?? true;
         supportsTagFilter = ctx.supportsTagFilter ?? true;
@@ -137,6 +142,106 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         await fn();
       });
     };
+
+    t('atomically admits holders without displacement by later same-millisecond IDs', async () => {
+      expect(store.tryAdmitSingleton).toBeTypeOf('function');
+      const claim = (id: string, limit = 1) =>
+        store.tryAdmitSingleton?.(id, 'singleton:k', 'checkout', limit);
+      await store.createRun(run({ id: 'z-holder', tags: ['singleton:k', 'user-tag'] }));
+      expect(await claim('z-holder')).toBe(true);
+      await store.updateRun('z-holder', { status: 'suspended', wakeAt: 10_000 });
+      expect(await claim('z-holder')).toBe(true);
+      await store.updateRun('z-holder', { status: 'blocked', lockedBy: 'expired', lockedUntil: 0 });
+      await store.createRun(run({ id: 'a-waiter', tags: ['singleton:k'] }));
+      expect(await claim('a-waiter')).toBe(false);
+      expect(await claim('z-holder')).toBe(true);
+      await store.updateRun('z-holder', { status: 'cancelling' });
+      expect(await claim('a-waiter')).toBe(false);
+      await store.updateRun('z-holder', { status: 'completed' });
+      expect((await store.getRun('z-holder'))?.tags).toEqual(['singleton:k', 'user-tag']);
+      expect(await claim('a-waiter')).toBe(true);
+      await store.updateRun('z-holder', { status: 'running' });
+      expect(await claim('z-holder')).toBe(false);
+      expect(await claim('missing')).toBe(false);
+    });
+
+    t(
+      'singleton denial atomically parks waiters and preserves cancelling/terminal state',
+      async () => {
+        await store.createRun(run({ id: 'holder', tags: ['singleton:k'] }));
+        expect(await store.tryAdmitSingleton?.('holder', 'singleton:k', 'checkout', 1)).toBe(true);
+        await store.createRun(run({ id: 'waiter', tags: ['singleton:k'] }));
+        expect(
+          await peerStore.tryAdmitSingleton?.('waiter', 'singleton:k', 'checkout', 1, 12000),
+        ).toBe(false);
+        expect(await store.getRun('waiter')).toMatchObject({ status: 'suspended', wakeAt: 12000 });
+        await store.updateRun('waiter', { status: 'cancelling', wakeAt: undefined });
+        expect(
+          await peerStore.tryAdmitSingleton?.('waiter', 'singleton:k', 'checkout', 1, 14000),
+        ).toBe(false);
+        expect(await store.getRun('waiter')).toMatchObject({ status: 'cancelling' });
+        expect((await store.getRun('waiter'))?.wakeAt).toBeUndefined();
+        await store.updateRun('waiter', { status: 'cancelled' });
+        expect(
+          await peerStore.tryAdmitSingleton?.('waiter', 'singleton:k', 'checkout', 1, 16000),
+        ).toBe(false);
+        expect((await store.getRun('waiter'))?.status).toBe('cancelled');
+        await store.updateRun('holder', { status: 'completed' });
+        await store.createRun(
+          run({ id: 'cancelling', status: 'cancelling', tags: ['singleton:k'] }),
+        );
+        expect(
+          await store.tryAdmitSingleton?.('cancelling', 'singleton:k', 'checkout', 1, 18000),
+        ).toBe(false);
+        expect((await store.getRun('cancelling'))?.tags).not.toContain(SINGLETON_ADMITTED_TAG);
+      },
+    );
+
+    t('competing store instances atomically claim an empty singleton slot', async () => {
+      for (const id of ['a-first', 'b-second', 'c-third']) {
+        await store.createRun(run({ id, tags: ['singleton:k'] }));
+      }
+      const results = await Promise.all([
+        peerStore.tryAdmitSingleton?.('b-second', 'singleton:k', 'checkout', 1),
+        store.tryAdmitSingleton?.('a-first', 'singleton:k', 'checkout', 1),
+        peerStore.tryAdmitSingleton?.('c-third', 'singleton:k', 'checkout', 1),
+      ]);
+      expect(results).toEqual([false, true, false]);
+      expect(await peerStore.tryAdmitSingleton?.('a-first', 'singleton:k', 'checkout', 1)).toBe(
+        true,
+      );
+      expect((await store.getRun('a-first'))?.tags).toContain(SINGLETON_ADMITTED_TAG);
+    });
+
+    t('concurrent singleton claims honor limits and independent keys/workflows', async () => {
+      const claim = (id: string, tag = 'singleton:k', workflow = 'checkout') =>
+        store.tryAdmitSingleton?.(id, tag, workflow, 2);
+      for (const id of ['z-holder', 'y-holder']) {
+        await store.createRun(run({ id, tags: ['singleton:k'] }));
+        expect(await claim(id)).toBe(true);
+      }
+      for (const id of ['a-waiter', 'b-waiter', 'c-waiter']) {
+        await store.createRun(run({ id, status: 'pending', tags: ['singleton:k'] }));
+      }
+      expect(
+        await Promise.all(['a-waiter', 'b-waiter', 'c-waiter'].map((id) => claim(id))),
+      ).toEqual([false, false, false]);
+      await store.updateRun('z-holder', { status: 'failed' });
+      expect(
+        await Promise.all(['c-waiter', 'b-waiter', 'a-waiter'].map((id) => claim(id))),
+      ).toEqual([false, false, true]);
+      const active = await store.listRuns({
+        workflow: 'checkout',
+        statuses: ['running', 'pending'],
+      });
+      expect(active.filter((r) => r.tags?.includes(SINGLETON_ADMITTED_TAG))).toHaveLength(2);
+      await store.createRun(run({ id: 'other-key', tags: ['singleton:other'] }));
+      expect(await claim('other-key', 'singleton:other')).toBe(true);
+      await store.createRun(
+        run({ id: 'other-workflow', workflow: 'other', tags: ['singleton:k'] }),
+      );
+      expect(await claim('other-workflow', 'singleton:k', 'other')).toBe(true);
+    });
 
     // ---- create / get / update --------------------------------------------------------------
 

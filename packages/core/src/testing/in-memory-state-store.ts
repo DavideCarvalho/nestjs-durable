@@ -23,6 +23,11 @@ import {
   attributePredicateOperands,
   normalizeAttributeRows,
 } from '../search-attributes';
+import {
+  SINGLETON_ADMITTED_TAG,
+  singletonAdmissionDenialPatch,
+  singletonAdmissionTags,
+} from '../singleton-admission';
 
 /**
  * A non-durable, in-process `StateStore` for tests and local development.
@@ -67,6 +72,28 @@ export class InMemoryStateStore implements StateStore {
     }
   }
 
+  async tryAdmitSingleton(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean> {
+    // No await between snapshot and claim: JavaScript's synchronous turn is the critical section.
+    const runs = [...this.runs.values()];
+    const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
+    if (!tags) {
+      const patch = singletonAdmissionDenialPatch(runs, runId, tag, workflow, retryWakeAt);
+      const candidate = this.runs.get(runId);
+      if (patch && candidate) this.runs.set(runId, { ...candidate, ...patch });
+      return false;
+    }
+    const run = this.runs.get(runId);
+    if (!run) return false;
+    this.runs.set(runId, { ...run, tags });
+    return true;
+  }
+
   async createRun(run: WorkflowRun): Promise<void> {
     // Normalize undefined namespace to 'default', matching the SQL stores' column DEFAULT 'default'
     // (interfaces.ts: "the store persists it as 'default'"). This ensures legacy runs (created without
@@ -75,7 +102,16 @@ export class InMemoryStateStore implements StateStore {
     this.reindexAttributes(run.id, run.searchAttributes);
   }
 
-  async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+  async updateRun(runId: string, inputPatch: Partial<WorkflowRun>): Promise<void> {
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? {
+            ...inputPatch,
+            tags: ('tags' in inputPatch ? inputPatch.tags : this.runs.get(runId)?.tags)?.filter(
+              (tag) => tag !== SINGLETON_ADMITTED_TAG,
+            ),
+          }
+        : inputPatch;
     const existing = this.runs.get(runId);
     if (!existing) throw new Error(`run ${runId} not found`);
     const next = { ...existing, ...patch };

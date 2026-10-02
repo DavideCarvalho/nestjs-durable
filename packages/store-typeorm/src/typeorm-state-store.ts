@@ -9,6 +9,7 @@ import {
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
+  SINGLETON_ACTIVE_STATUSES,
   type ScheduleQuery,
   type ScheduleRecord,
   type SignalWaiter,
@@ -20,11 +21,14 @@ import {
   type WorkflowRun,
   attributePredicateOperands,
   axisIsRunColumn,
+  clearTerminalSingletonAdmission,
   mergeRunFacetRows,
   mergeRunValueFacetRows,
   normalizeAttributeRows,
   parseDuration,
   runValueFacetsFromRuns,
+  singletonAdmissionDenialPatch,
+  singletonAdmissionTags,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Brackets,
@@ -47,6 +51,10 @@ import {
   WorkflowRunEntity,
 } from './entities';
 import { durableColumnResolver, ensureTypeOrmDurableSchema } from './schema';
+
+// SQLite exposes one transaction connection per DataSource. Share this queue across store wrappers
+// so simultaneous async claims cannot issue overlapping BEGIN statements on that connection.
+const sqliteSingletonClaims = new WeakMap<DataSource, Promise<void>>();
 
 /**
  * TypeORM-backed `StateStore`. Works on any TypeORM driver — Postgres, MySQL, SQLite (tested);
@@ -94,12 +102,65 @@ export class TypeOrmStateStore implements StateStore {
     if (rows.length) await repo.insert(rows);
   }
 
+  async tryAdmitSingleton(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean> {
+    const previous = sqliteSingletonClaims.get(this.dataSource) ?? Promise.resolve();
+    const sqlite = ['sqlite', 'better-sqlite3', 'sqljs'].includes(this.dataSource.options.type);
+    let release: (() => void) | undefined;
+    if (sqlite) {
+      const next = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      sqliteSingletonClaims.set(
+        this.dataSource,
+        previous.then(() => next),
+      );
+      await previous;
+    }
+    try {
+      return await this.dataSource.transaction(async (em) => {
+        const repo = em.getRepository(WorkflowRunEntity);
+        const where = { workflow, status: In(SINGLETON_ACTIVE_STATUSES) };
+        // Acquire write locks BEFORE taking the admission snapshot (also serializes SQLite writers).
+        await repo.update(where, { workflow });
+        const runs = (await repo.find({ where })).map(fromRunEntity);
+        const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
+        if (!tags) {
+          const patch = singletonAdmissionDenialPatch(runs, runId, tag, workflow, retryWakeAt);
+          if (patch)
+            await repo.update(
+              { id: runId },
+              {
+                status: 'suspended',
+                wakeAt: new Date(patch.wakeAt),
+                updatedAt: patch.updatedAt,
+              },
+            );
+          return false;
+        }
+        await repo.update({ id: runId }, { tags });
+        return true;
+      });
+    } finally {
+      release?.();
+    }
+  }
+
   async createRun(run: WorkflowRun): Promise<void> {
     await this.runs().save(toRunEntity(run));
     await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
-  async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+  async updateRun(runId: string, inputPatch: Partial<WorkflowRun>): Promise<void> {
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) => this.getRun(id))
+        : inputPatch;
     // Single UPDATE (no pre-SELECT + save round-trips): map only the patched fields. The query
     // builder still applies the entities' JSON column transformers to the `set` values (as in
     // listRuns/tryLockRun). Preserve the not-found throw any caller may rely on.

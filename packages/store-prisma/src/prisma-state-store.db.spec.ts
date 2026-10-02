@@ -93,6 +93,7 @@ runStateStoreContract('Prisma (Postgres)', async () => {
   await truncatePrisma();
   return {
     store: new PrismaStateStore(sharedPrisma),
+    peerStore: new PrismaStateStore(sharedPrisma),
     // Postgres supports `array_contains`, so the tag filter is exercised here (unlike SQLite).
     supportsTagFilter: true,
     cleanup: async () => undefined,

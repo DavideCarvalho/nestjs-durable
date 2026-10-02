@@ -1,4 +1,9 @@
-import { type WorkflowCtx, WorkflowEngine, type WorkflowRun } from '@dudousxd/nestjs-durable-core';
+import {
+  SINGLETON_ADMITTED_TAG,
+  type WorkflowCtx,
+  WorkflowEngine,
+  type WorkflowRun,
+} from '@dudousxd/nestjs-durable-core';
 import {
   type StateStoreContext,
   StateStoreUnavailableError,
@@ -105,6 +110,9 @@ for (const driver of ['node-postgres', 'postgres-js'] as const) {
       `Drizzle Postgres (${driver})`,
       async (): Promise<StateStoreContext> => ({
         store: await freshStore(driver),
+        peerStore: new DrizzlePgStateStore(
+          liveDb(driver === 'node-postgres' ? 'postgres-js' : 'node-postgres'),
+        ),
         cleanup: truncate,
       }),
     );
@@ -146,6 +154,57 @@ function run(over: Partial<WorkflowRun> = {}): WorkflowRun {
 function available(): boolean {
   return !skipped && !bootError && !!nodePgDb;
 }
+
+describe('Drizzle Postgres singleton admission [real engine]', () => {
+  it('separate clients wait for a durable claim while another contender is inserted', async (ctx) => {
+    if (!available()) return ctx.skip();
+    const store = await freshStore();
+    const peer = new DrizzlePgStateStore(liveDb('postgres-js'));
+    await store.createRun(run({ id: 'z-holder', tags: ['singleton:k'] }));
+    await store.createRun(run({ id: 'b-waiter', tags: ['singleton:k'] }));
+    if (!pool) throw new Error('Postgres pool unavailable');
+    const connection = await pool.connect();
+    const claims: Promise<boolean>[] = [];
+    try {
+      await connection.query('BEGIN');
+      // Pause the holder transaction after persisting its claim but before commit.
+      await connection.query('UPDATE durable_workflow_runs SET tags = $1::jsonb WHERE id = $2', [
+        JSON.stringify(['singleton:k', SINGLETON_ADMITTED_TAG]),
+        'z-holder',
+      ]);
+      claims.push(peer.tryAdmitSingleton('b-waiter', 'singleton:k', 'checkout', 1));
+      // A new row is committed while the competing claim is waiting on the existing holder.
+      await store.createRun(run({ id: 'a-later', tags: ['singleton:k'] }));
+      claims.push(store.tryAdmitSingleton('a-later', 'singleton:k', 'checkout', 1));
+      await connection.query('COMMIT');
+      expect(await Promise.all(claims)).toEqual([false, false]);
+      expect(await peer.tryAdmitSingleton('z-holder', 'singleton:k', 'checkout', 1)).toBe(true);
+    } finally {
+      await connection.query('ROLLBACK');
+      connection.release();
+      await Promise.allSettled(claims);
+    }
+  });
+
+  it('scoped stores confine both claims and competing holders to their namespace', async (ctx) => {
+    if (!available()) return ctx.skip();
+    const store = await freshStore();
+    for (const namespace of ['alpha', 'beta']) {
+      await store.createRun(run({ id: namespace, namespace, tags: ['singleton:k'] }));
+    }
+    const alpha = store.withScope({ namespace: 'alpha' });
+    const beta = store.withScope({ namespace: 'beta' });
+    expect(
+      await Promise.all([
+        alpha.tryAdmitSingleton('alpha', 'singleton:k', 'checkout', 1),
+        beta.tryAdmitSingleton('beta', 'singleton:k', 'checkout', 1),
+      ]),
+    ).toEqual([true, true]);
+    expect(await alpha.tryAdmitSingleton('beta', 'singleton:k', 'checkout', 1)).toBe(false);
+    await alpha.updateRun('beta', { status: 'completed' });
+    expect((await store.getRun('beta'))?.tags).toEqual(['singleton:k']);
+  });
+});
 
 describe('Drizzle Postgres schema [real engine]', () => {
   it('ensureSchema is idempotent and safe to race from several pods', async (ctx) => {

@@ -1,5 +1,7 @@
+import { setImmediate } from 'node:timers/promises';
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
 import { Redis } from 'ioredis';
+import { vi } from 'vitest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RedisAdmissionBackend } from './redis-admission-backend';
 
@@ -116,5 +118,49 @@ describe('RedisAdmissionBackend — distributed behaviour', () => {
     // Past the ghost's waiter TTL it is pruned, so `real` proceeds instead of yielding forever.
     now += 10_000;
     expect((await backend.tryAdmit('q', { waiterId: 'real', priority: 1 })).ok).toBe(true);
+  });
+  maybe('contains an initial Redis SET rejection and recovers on the next heartbeat', async () => {
+    const admin = redis as Redis;
+    const username = 'durable-startup-heartbeat';
+    await admin.acl('SETUSER', username, 'on', '>test-password', '~*', '+ping', '+info');
+    if (!container) throw new Error('Redis container not started');
+    const restricted = new Redis({
+      host: container.getHost(),
+      port: container.getFirstMappedPort(),
+      username,
+      password: 'test-password',
+    });
+    const set = vi.spyOn(restricted, 'set');
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    let backend: RedisAdmissionBackend | undefined;
+    try {
+      await restricted.ping();
+      backend = new RedisAdmissionBackend({
+        connection: restricted,
+        prefix: 'startup-test',
+        instanceId: 'pod',
+        instanceTtlMs: 3000,
+      });
+      await expect(set.mock.results[0].value).rejects.toMatchObject({
+        message: expect.stringContaining('NOPERM'),
+      });
+      await setImmediate();
+      expect(unhandled).not.toHaveBeenCalled();
+      await admin.acl('SETUSER', username, '+set');
+      await vi.waitFor(
+        async () => {
+          expect(await admin.get('startup-test:adm:inst:pod')).toBe('1');
+        },
+        { timeout: 3000, interval: 25 },
+      );
+      expect(set.mock.calls.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      await backend?.close();
+      process.off('unhandledRejection', unhandled);
+      set.mockRestore();
+      restricted.disconnect();
+      await admin.acl('DELUSER', username);
+    }
   });
 });

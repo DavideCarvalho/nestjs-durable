@@ -84,6 +84,7 @@ import type { QueueConfig } from './queue';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { indexWaitersByRun } from './run-waiting';
 import { ScheduleClient } from './schedules';
+import { SINGLETON_ADMITTED_TAG } from './singleton-admission';
 import { SingletonGate } from './singleton-gate';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
@@ -162,8 +163,8 @@ export interface StartOptions {
 /**
  * Serialize runs of a workflow that share a key — a durable, FIFO mutex (e.g. one pipeline per base).
  * Excess runs are admitted in creation order, `limit` at a time; the rest wait (suspended) and retry
- * admission on a timer until a slot frees. Race-free on a consistent store (admission order is the
- * same `(createdAt, id)` view for every instance).
+ * admission on a timer until a slot frees. The store atomically reserves durable slots before
+ * ordering unadmitted waiters by `(createdAt, id)`, so later starts cannot displace a holder.
  */
 export interface SingletonConfig {
   /** Derive the serialization key from the workflow input. */
@@ -174,7 +175,7 @@ export interface SingletonConfig {
    * Max GATED (waiting-for-admission) runs allowed to queue behind the `limit` in-flight ones. When
    * set, `start` rejects with {@link SingletonQueueFullError} once in-flight + gated reaches
    * `limit + maxQueueDepth` — back-pressure against an unbounded same-key backlog. Omit for the
-   * default unbounded queue. Counts `pending`/`running`/`suspended` runs sharing the key.
+   * default unbounded queue. Counts pending/running/suspended/blocked/cancelling runs sharing the key.
    */
   maxQueueDepth?: number;
 }
@@ -1188,7 +1189,10 @@ export class WorkflowEngine {
       ...(quota ? [concurrencyTag(quota.key)] : []),
       ...(registered.versionDeclared === false ? [VERSION_UNDECLARED_TAG] : []),
     ];
-    const tags = mergeTags(registered.tags, stampedTags);
+    // Admission is owned by the store, never supplied or inherited by a fresh run.
+    const tags = mergeTags(registered.tags, stampedTags)?.filter(
+      (tag) => tag !== SINGLETON_ADMITTED_TAG,
+    );
     // Singleton back-pressure: reject a start that would grow the same-key backlog past
     // `limit + maxQueueDepth` (no-op when no maxQueueDepth is configured).
     if (registered.singleton) {
@@ -1285,6 +1289,12 @@ export class WorkflowEngine {
     // workflow body against old checkpoints would corrupt the run. The direct lookup is synchronous
     // (`??` short-circuits): a registered run never awaits here, so its resume timing is unchanged —
     // only an UNREGISTERED run pays the inheritance walk (see {@link findInheritedRegistration}).
+    // A failed run being explicitly retried must compete for a slot again. This also handles
+    // terminal records retained from before the store cleared admission markers on settlement.
+    if (run.status === 'failed' && run.tags?.includes(SINGLETON_ADMITTED_TAG)) {
+      run.tags = run.tags.filter((tag) => tag !== SINGLETON_ADMITTED_TAG);
+      await this.store.updateRun(run.id, { tags: run.tags });
+    }
     const registered =
       this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
       (await this.findInheritedRegistration(run)) ??
@@ -1475,7 +1485,10 @@ export class WorkflowEngine {
   /** Track an in-flight execution so {@link drain} can wait for it. */
   private track(p: Promise<RunResult>): Promise<RunResult> {
     this.inflight.add(p);
-    void p.finally(() => this.inflight.delete(p));
+    const done = () => {
+      this.inflight.delete(p);
+    };
+    void p.then(done, done);
     return p;
   }
 
@@ -1893,7 +1906,12 @@ export class WorkflowEngine {
     await this.store.updateRun(runId, {
       status: 'pending',
       error: undefined,
-      ...(resurrecting ? { recoveryAttempts: 0 } : {}),
+      ...(resurrecting
+        ? {
+            recoveryAttempts: 0,
+            tags: run.tags?.filter((tag) => tag !== SINGLETON_ADMITTED_TAG),
+          }
+        : {}),
       updatedAt: new Date(),
     });
     await this.runDispatcher.dispatch(runId);
@@ -2031,10 +2049,19 @@ export class WorkflowEngine {
         off();
         resolve(toResult(run));
       };
+      const fail = (error: unknown): void => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        if (poller) clearInterval(poller);
+        off();
+        reject(error);
+      };
       const check = (): void => {
+        if (done) return;
         void this.store.getRun(runId).then((run) => {
           if (run && isSettled(run)) finish(run);
-        });
+        }, fail);
       };
       // Terminal mode also polls: cancelled/dead transitions have no `run.*` lifecycle event to
       // react to (and a resume may happen on ANOTHER instance), so events alone can miss them.
@@ -2924,6 +2951,27 @@ export class WorkflowEngine {
     });
   }
 
+  /** Admission persists the wait atomically; never overwrite a cancellation after it returns. */
+  private async singletonWaitResult(run: WorkflowRun): Promise<RunResult> {
+    const current = await this.store.getRun(run.id);
+    await this.store.releaseRunLock(run.id);
+    if (!current) throw new Error(`run ${run.id} was deleted during singleton admission`);
+    if (current.status === 'suspended') {
+      this.emit({
+        type: 'run.suspended',
+        runId: current.id,
+        workflow: current.workflow,
+        namespace: current.namespace,
+      });
+    }
+    return {
+      runId: current.id,
+      status: current.status,
+      output: current.output,
+      error: current.error,
+    };
+  }
+
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
     // Synchronous fast path (`??` short-circuits) for registered runs — no extra await, so execution
     // timing for the common case is unchanged; only an unregistered (inherited-remote) run awaits.
@@ -3097,16 +3145,7 @@ export class WorkflowEngine {
       });
     }
     if (registered.singleton && !(await this.singletons.admit(run, registered.singleton))) {
-      const wakeAt = this.singletons.retryWakeAt();
-      await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
-      this.emit({
-        type: 'run.suspended',
-        runId: run.id,
-        workflow: run.workflow,
-        namespace: run.namespace,
-      });
-      await this.store.releaseRunLock(run.id);
-      return { runId: run.id, status: 'suspended' };
+      return this.singletonWaitResult(run);
     }
 
     // Capability/protocol routing guard for the remote workflow turn (handshake design §7.5): if
@@ -3858,8 +3897,7 @@ export class WorkflowEngine {
     // cancelled (this is what makes a compensating cancel durable across a crash).
     if (run.status === 'cancelling') this.cancelRequested.add(run.id);
     // First execution of an enqueued run: mark it running and announce the start, BEFORE the singleton
-    // gate — `singletons.admit` only counts `running`/`suspended` runs, so a still-`pending` run could
-    // never be admitted. A resumed run is already past `pending`, so this fires exactly once.
+    // gate. A resumed run is already past `pending`, so this fires exactly once.
     if (run.status === 'pending') {
       await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
       run.status = 'running';
@@ -3879,16 +3917,7 @@ export class WorkflowEngine {
       registered?.singleton &&
       !(await this.singletons.admit(run, registered.singleton))
     ) {
-      const wakeAt = this.singletons.retryWakeAt();
-      await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
-      this.emit({
-        type: 'run.suspended',
-        runId: run.id,
-        workflow: run.workflow,
-        namespace: run.namespace,
-      });
-      await this.store.releaseRunLock(run.id);
-      return { runId: run.id, status: 'suspended' };
+      return this.singletonWaitResult(run);
     }
     // Saga compensations registered by completed steps; run in reverse if the run later fails.
     const compensations: Compensation[] = [];

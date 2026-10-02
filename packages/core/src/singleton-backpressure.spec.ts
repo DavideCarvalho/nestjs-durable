@@ -92,6 +92,24 @@ describe('singleton notify-on-release', () => {
 });
 
 describe('singleton maxQueueDepth back-pressure', () => {
+  it('counts a blocked admitted holder when maxQueueDepth is zero', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register(
+      'job',
+      '1',
+      async (ctx) => {
+        await ctx.waitForSignal('release');
+      },
+      { singleton: { key: () => 'k', maxQueueDepth: 0 } },
+    );
+    await startRun(engine, 'job', {}, 'holder');
+    await store.updateRun('holder', { status: 'blocked' });
+    await expect(engine.start('job', {}, 'waiter')).rejects.toBeInstanceOf(SingletonQueueFullError);
+    expect(await store.getRun('waiter')).toBeNull();
+    await engine.drain();
+  });
+
   it('rejects a start that would exceed limit + maxQueueDepth', async () => {
     const store = new InMemoryStateStore();
     let now = 1000;
