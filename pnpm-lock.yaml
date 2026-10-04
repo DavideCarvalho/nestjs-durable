@@ -43,7 +43,7 @@ importers:
         version: 1.5.9(@swc/core@1.16.13)(rollup@4.61.1)
       vitest:
         specifier: 2.1.9
-        version: 2.1.9(@types/node@22.20.2)(happy-dom@20.11.1)(lightningcss@1.32.0)
+        version: 2.1.9(@types/node@22.20.2)(happy-dom@20.14.5)(lightningcss@1.32.0)
       zod:
         specifier: 3.25.76
         version: 3.25.76
@@ -231,8 +231,8 @@ importers:
         specifier: 0.28.2
         version: 0.28.2
       happy-dom:
-        specifier: 20.11.1
-        version: 20.11.1
+        specifier: 20.14.5
+        version: 20.14.5
       postcss:
         specifier: 8.5.28
         version: 8.5.28
@@ -570,7 +570,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: 2.1.9
-        version: 2.1.9(@types/node@25.9.6)(happy-dom@20.11.1)(lightningcss@1.32.0)
+        version: 2.1.9(@types/node@25.9.6)(happy-dom@20.14.5)(lightningcss@1.32.0)
 
   packages/transport-bullmq:
     devDependencies:
@@ -687,7 +687,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: 2.1.9
-        version: 2.1.9(@types/node@25.9.6)(happy-dom@20.11.1)(lightningcss@1.32.0)
+        version: 2.1.9(@types/node@25.9.6)(happy-dom@20.14.5)(lightningcss@1.32.0)
 
   website:
     dependencies:
@@ -4819,8 +4819,8 @@ packages:
   graceful-fs@4.2.11:
     resolution: {integrity: sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==}
 
-  happy-dom@20.11.1:
-    resolution: {integrity: sha512-XSt8tMzbW9ymE7687xztkO1ckR7qJNQ3LywY9vlYGhGi3zXrGBHuUo2Cl1ztZaICW+1eAGdkLbj6iwVqDT33kg==}
+  happy-dom@20.14.5:
+    resolution: {integrity: sha512-x/RzkpWO40bTjIoT30iQtt64FLLmH/iRcUCN2X//bLx7H3ifkdfPXyqsro/OYtqzIAhiLMMA7mmiOR9C3NOKjQ==}
     engines: {node: '>=20.0.0'}
 
   has-flag@4.0.0:
@@ -10966,7 +10966,7 @@ snapshots:
 
   graceful-fs@4.2.11: {}
 
-  happy-dom@20.11.1:
+  happy-dom@20.14.5:
     dependencies:
       '@types/node': 25.9.6
       '@types/whatwg-mimetype': 3.0.2
@@ -13576,7 +13576,7 @@ snapshots:
       fsevents: 2.3.3
       lightningcss: 1.32.0
 
-  vitest@2.1.9(@types/node@22.20.2)(happy-dom@20.11.1)(lightningcss@1.32.0):
+  vitest@2.1.9(@types/node@22.20.2)(happy-dom@20.14.5)(lightningcss@1.32.0):
     dependencies:
       '@vitest/expect': 2.1.9
       '@vitest/mocker': 2.1.9(vite@5.4.21(@types/node@22.20.2)(lightningcss@1.32.0))
@@ -13600,7 +13600,7 @@ snapshots:
       why-is-node-running: 2.3.0
     optionalDependencies:
       '@types/node': 22.20.2
-      happy-dom: 20.11.1
+      happy-dom: 20.14.5
     transitivePeerDependencies:
       - less
       - lightningcss
@@ -13612,7 +13612,7 @@ snapshots:
       - supports-color
       - terser
 
-  vitest@2.1.9(@types/node@25.9.6)(happy-dom@20.11.1)(lightningcss@1.32.0):
+  vitest@2.1.9(@types/node@25.9.6)(happy-dom@20.14.5)(lightningcss@1.32.0):
     dependencies:
       '@vitest/expect': 2.1.9
       '@vitest/mocker': 2.1.9(vite@5.4.21(@types/node@22.20.2)(lightningcss@1.32.0))
@@ -13636,7 +13636,7 @@ snapshots:
       why-is-node-running: 2.3.0
     optionalDependencies:
       '@types/node': 25.9.6
-      happy-dom: 20.11.1
+      happy-dom: 20.14.5
     transitivePeerDependencies:
       - less
       - lightningcss
