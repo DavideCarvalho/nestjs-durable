@@ -56,6 +56,29 @@ describe('durableStateProvider', () => {
   });
 });
 
+describe('state counts on a store that can count', () => {
+  it('uses countRuns, so a status past the listing cap is counted exactly without loading rows', async () => {
+    const listed: string[] = [];
+    const store = {
+      countRuns: async ({ status }: { status?: string }) => (status === 'running' ? 150_000 : 3),
+      listRuns: async ({ status }: { status?: string }) => {
+        listed.push(String(status));
+        return [];
+      },
+    };
+    const gauge = (await durableStateProvider().resolve({ status: 'running' }, ctxWith(store))) as {
+      value: number;
+    };
+    expect(gauge.value).toBe(150_000);
+
+    const pie = (await durableStateBreakdownProvider().resolve({}, ctxWith(store))) as {
+      segments: Array<{ label: string; value: number }>;
+    };
+    expect(pie.segments.find((s) => s.label === 'running')?.value).toBe(150_000);
+    expect(listed).toEqual([]);
+  });
+});
+
 describe('durableRecentFailuresProvider', () => {
   it('returns failed+dead rows newest-first with an updatedAt stamp (windowMs:0 = all)', async () => {
     const provider = durableRecentFailuresProvider();

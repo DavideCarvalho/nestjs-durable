@@ -18,6 +18,7 @@ export * from './run-facets';
 export * from './run-value-facets';
 export * from './run-gateway';
 export * from './run-waiting';
+export { parentRunIdOf } from './fan-join';
 export * from './codec-state-store';
 export * from './concurrency';
 export * from './events';

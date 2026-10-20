@@ -1,5 +1,6 @@
 import {
   type AttributeFilter,
+  type ChildWait,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -636,6 +637,75 @@ export class PrismaStateStore implements StateStore {
       seq: r.seq,
       parallelGroup: r.parallelGroup ?? undefined,
     }));
+  }
+
+  async registerChildWaits(entries: ChildWait[]): Promise<void> {
+    if (entries.length === 0) return;
+    // Prisma has no multi-row upsert: one upsert per row, inside a single transaction.
+    await this.db.$transaction(async (tx) => {
+      for (const { waiter } of entries) {
+        const data = {
+          runId: waiter.runId,
+          seq: waiter.seq,
+          parallelGroup: waiter.parallelGroup ?? null,
+        };
+        await tx.durableSignalWaiter.upsert({
+          where: { token: waiter.token },
+          create: { token: waiter.token, ...data },
+          update: data,
+        });
+      }
+      for (const { checkpoint } of entries) {
+        const data = toCheckpointData(checkpoint);
+        await tx.durableStepCheckpoint.upsert({
+          where: { runId_seq: { runId: checkpoint.runId, seq: checkpoint.seq } },
+          create: data,
+          update: data,
+        });
+      }
+    });
+  }
+
+  async compactCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    into: StepCheckpoint,
+  ): Promise<void> {
+    await this.db.$transaction(async (tx) => {
+      await tx.durableStepCheckpoint.deleteMany({
+        where: { runId, seq: { gte: fromSeq, lte: toSeq } },
+      });
+      const data = toCheckpointData(into);
+      await tx.durableStepCheckpoint.upsert({
+        where: { runId_seq: { runId: into.runId, seq: into.seq } },
+        create: data,
+        update: data,
+      });
+    });
+  }
+
+  async listSignalWaitersByRun(runIds: string[]): Promise<SignalWaiter[]> {
+    if (runIds.length === 0) return [];
+    const rows = await this.db.durableSignalWaiter.findMany({ where: { runId: { in: runIds } } });
+    return rows.map((r) => ({
+      token: r.token,
+      runId: r.runId,
+      seq: r.seq,
+      parallelGroup: r.parallelGroup ?? undefined,
+    }));
+  }
+
+  async hasSignalWaiter(runId: string, tokenPrefix: string): Promise<boolean> {
+    // On SQLite, Prisma's `startsWith` is a bare `LIKE`: `_`/`%` in the prefix act as wildcards and
+    // case is ignored. So a hit is confirmed in JS; only a pattern match that is not a real prefix
+    // match pays for the full read.
+    const where = { runId, token: { startsWith: tokenPrefix } };
+    const first = await this.db.durableSignalWaiter.findFirst({ where, select: { token: true } });
+    if (!first) return false;
+    if (first.token.startsWith(tokenPrefix)) return true;
+    const rows = await this.db.durableSignalWaiter.findMany({ where, select: { token: true } });
+    return rows.some((r) => r.token.startsWith(tokenPrefix));
   }
 
   async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {

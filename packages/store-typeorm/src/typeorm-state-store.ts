@@ -1,5 +1,6 @@
 import {
   type AttributeFilter,
+  type ChildWait,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -31,6 +32,7 @@ import {
   singletonAdmissionTags,
 } from '@dudousxd/nestjs-durable-core';
 import {
+  Between,
   Brackets,
   type DataSource,
   type EntityManager,
@@ -631,6 +633,66 @@ export class TypeOrmStateStore implements StateStore {
       seq: e.seq,
       parallelGroup: e.parallelGroup ?? undefined,
     }));
+  }
+
+  async registerChildWaits(entries: ChildWait[]): Promise<void> {
+    if (entries.length === 0) return;
+    await this.dataSource.transaction(async (em) => {
+      await em.getRepository(SignalWaiterEntity).upsert(
+        entries.map(({ waiter }) => ({
+          token: waiter.token,
+          runId: waiter.runId,
+          seq: waiter.seq,
+          parallelGroup: waiter.parallelGroup ?? null,
+        })),
+        ['token'],
+      );
+      await em.getRepository(StepCheckpointEntity).upsert(
+        entries.map(
+          ({ checkpoint }) =>
+            toCheckpointEntity(checkpoint) as QueryDeepPartialEntity<StepCheckpointEntity>,
+        ),
+        ['runId', 'seq'],
+      );
+    });
+  }
+
+  async compactCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    into: StepCheckpoint,
+  ): Promise<void> {
+    await this.dataSource.transaction(async (em) => {
+      const checkpoints = em.getRepository(StepCheckpointEntity);
+      await checkpoints.delete({ runId, seq: Between(fromSeq, toSeq) });
+      await checkpoints.upsert(
+        toCheckpointEntity(into) as QueryDeepPartialEntity<StepCheckpointEntity>,
+        ['runId', 'seq'],
+      );
+    });
+  }
+
+  async listSignalWaitersByRun(runIds: string[]): Promise<SignalWaiter[]> {
+    if (runIds.length === 0) return [];
+    const rows = await this.waiters().find({ where: { runId: In(runIds) } });
+    return rows.map((e) => ({
+      token: e.token,
+      runId: e.runId,
+      seq: e.seq,
+      parallelGroup: e.parallelGroup ?? undefined,
+    }));
+  }
+
+  async hasSignalWaiter(runId: string, tokenPrefix: string): Promise<boolean> {
+    // `LIKE` reads `_`/`%` in the prefix as wildcards (and ignores case on some dialects), so a hit is
+    // confirmed in JS; only a pattern match that is not a real prefix match pays for the full read.
+    const where = { runId, token: Like(`${tokenPrefix}%`) };
+    const first = await this.waiters().findOne({ where, select: { token: true } });
+    if (!first) return false;
+    if (first.token.startsWith(tokenPrefix)) return true;
+    const rows = await this.waiters().find({ where, select: { token: true } });
+    return rows.some((r) => r.token.startsWith(tokenPrefix));
   }
 
   async takeSignalWaiter(token: string): Promise<SignalWaiter | null> {

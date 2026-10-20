@@ -1,5 +1,6 @@
 import {
   type AttributeFilter,
+  type ChildWait,
   ENGINE_MINTED_TAG_PREFIXES,
   RUN_VALUE_FACET_LIMIT,
   type RetentionPolicy,
@@ -847,6 +848,60 @@ export class MikroOrmStateStore implements StateStore {
       seq: e.seq,
       parallelGroup: e.parallelGroup ?? undefined,
     }));
+  }
+
+  async registerChildWaits(entries: ChildWait[]): Promise<void> {
+    if (entries.length === 0) return;
+    await this.fork().transactional(async (em) => {
+      await em.upsertMany(
+        SignalWaiterEntity,
+        entries.map(({ waiter }) => ({
+          token: waiter.token,
+          runId: waiter.runId,
+          seq: waiter.seq,
+          parallelGroup: waiter.parallelGroup ?? null,
+        })),
+      );
+      await em.upsertMany(
+        StepCheckpointEntity,
+        entries.map(({ checkpoint }) => toCheckpointEntity(checkpoint)),
+      );
+    });
+  }
+
+  async compactCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    into: StepCheckpoint,
+  ): Promise<void> {
+    await this.fork().transactional(async (em) => {
+      await em.nativeDelete(StepCheckpointEntity, { runId, seq: { $gte: fromSeq, $lte: toSeq } });
+      await em.upsert(StepCheckpointEntity, toCheckpointEntity(into));
+    });
+  }
+
+  async listSignalWaitersByRun(runIds: string[]): Promise<SignalWaiter[]> {
+    if (runIds.length === 0) return [];
+    const rows = await this.fork().find(SignalWaiterEntity, { runId: { $in: runIds } });
+    return rows.map((e) => ({
+      token: e.token,
+      runId: e.runId,
+      seq: e.seq,
+      parallelGroup: e.parallelGroup ?? undefined,
+    }));
+  }
+
+  async hasSignalWaiter(runId: string, tokenPrefix: string): Promise<boolean> {
+    const em = this.fork();
+    // `LIKE` reads `_`/`%` in the prefix as wildcards (and ignores case on some dialects), so a hit is
+    // confirmed in JS; only a pattern match that is not a real prefix match pays for the full read.
+    const where = { runId, token: { $like: `${tokenPrefix}%` } };
+    const first = await em.findOne(SignalWaiterEntity, where, { fields: ['token'] });
+    if (!first) return false;
+    if (first.token.startsWith(tokenPrefix)) return true;
+    const rows = await em.find(SignalWaiterEntity, where, { fields: ['token'] });
+    return rows.some((r) => r.token.startsWith(tokenPrefix));
   }
 
   async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {

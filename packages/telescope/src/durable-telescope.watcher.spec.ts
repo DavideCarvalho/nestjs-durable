@@ -78,6 +78,34 @@ describe('DurableTelescopeWatcher', () => {
     expect(hasDurableExecutionWrappers()).toBe(false);
   });
 
+  it('tags a child run with its parent, so a whole fan is one filter away', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const records: RecordInput[] = [];
+    new DurableTelescopeWatcher().register(fakeCtx(engine, records));
+
+    engine.register('item', '1', async () => 'ok');
+    engine.register('batch', '1', async (ctx) => {
+      await ctx.all('item', [{}, {}]);
+      return ctx.child('item', {});
+    });
+    await engine.start('batch', {}, 'p');
+    // waitForRun settles on the parent's first suspension; wait for the whole fan instead.
+    for (let i = 0; i < 200 && (await engine.getRun('p'))?.status !== 'completed'; i += 1) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    const childRuns = new Set(
+      records
+        .filter((r) => r.tags?.includes('parent:p'))
+        .map((r) => (r.content as { runId: string }).runId),
+    );
+    expect([...childRuns].sort()).toEqual(['p.all.0.0', 'p.all.0.1', 'p.child.2']);
+    const parentEntry = records.find((r) => (r.content as { runId: string }).runId === 'p');
+    expect(parentEntry?.tags?.some((t) => t.startsWith('parent:'))).toBe(false);
+    const childEntry = records.find((r) => (r.content as { runId: string }).runId === 'p.child.2');
+    expect((childEntry?.content as { parentRunId?: string }).parentRunId).toBe('p');
+  });
+
   it('tags failed runs with "failed"', async () => {
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
     const records: RecordInput[] = [];

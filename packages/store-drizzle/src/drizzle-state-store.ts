@@ -1,5 +1,6 @@
 import {
   type AttributeFilter,
+  type ChildWait,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -32,11 +33,14 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import {
   type SQL,
+  type Table,
   and,
   asc,
   desc,
   eq,
   exists,
+  getTableColumns,
+  gte,
   inArray,
   isNotNull,
   isNull,
@@ -660,6 +664,113 @@ export class DrizzleStateStore implements StateStore {
     }));
   }
 
+  async registerChildWaits(entries: ChildWait[]): Promise<void> {
+    if (entries.length === 0) return;
+    // Keep the callback synchronous on better-sqlite3; libSQL returns promises from run.
+    await this.db.transaction((tx) => {
+      const statements: Array<() => unknown> = [];
+      // Kept well under SQLite's bound-parameter limit (a checkpoint row binds ~20).
+      for (let at = 0; at < entries.length; at += 100) {
+        const chunk = entries.slice(at, at + 100);
+        statements.push(() =>
+          tx
+            .insert(signalWaiters)
+            .values(
+              chunk.map(({ waiter }) => ({
+                token: waiter.token,
+                runId: waiter.runId,
+                seq: waiter.seq,
+                parallelGroup: waiter.parallelGroup ?? null,
+              })),
+            )
+            .onConflictDoUpdate({
+              target: signalWaiters.token,
+              set: excludedSet(signalWaiters, ['runId', 'seq', 'parallelGroup']),
+            })
+            .run(),
+        );
+        statements.push(() =>
+          tx
+            .insert(stepCheckpoints)
+            .values(chunk.map(({ checkpoint }) => toCheckpointRow(checkpoint)))
+            .onConflictDoUpdate({
+              target: [stepCheckpoints.runId, stepCheckpoints.seq],
+              set: excludedSet(stepCheckpoints),
+            })
+            .run(),
+        );
+      }
+      const runFrom = (i: number): undefined | Promise<undefined> => {
+        const statement = statements[i];
+        if (!statement) return undefined;
+        const done = statement();
+        return done instanceof Promise ? done.then(() => runFrom(i + 1)) : runFrom(i + 1);
+      };
+      return runFrom(0);
+    });
+  }
+
+  async compactCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    into: StepCheckpoint,
+  ): Promise<void> {
+    const row = toCheckpointRow(into);
+    // Keep the callback synchronous on better-sqlite3; libSQL returns promises from run.
+    await this.db.transaction((tx) => {
+      const deleted = tx
+        .delete(stepCheckpoints)
+        .where(
+          and(
+            eq(stepCheckpoints.runId, runId),
+            gte(stepCheckpoints.seq, fromSeq),
+            lte(stepCheckpoints.seq, toSeq),
+          ),
+        )
+        .run();
+      const insert = () =>
+        tx
+          .insert(stepCheckpoints)
+          .values(row)
+          .onConflictDoUpdate({ target: [stepCheckpoints.runId, stepCheckpoints.seq], set: row })
+          .run();
+      return deleted instanceof Promise ? deleted.then(insert) : insert();
+    });
+  }
+
+  async listSignalWaitersByRun(runIds: string[]): Promise<SignalWaiter[]> {
+    if (runIds.length === 0) return [];
+    const rows = await this.db
+      .select()
+      .from(signalWaiters)
+      .where(inArray(signalWaiters.runId, runIds));
+    return rows.map((r) => ({
+      token: r.token,
+      runId: r.runId,
+      seq: r.seq,
+      parallelGroup: r.parallelGroup ?? undefined,
+    }));
+  }
+
+  async hasSignalWaiter(runId: string, tokenPrefix: string): Promise<boolean> {
+    // `LIKE` reads `_`/`%` in the prefix as wildcards (and ignores case on some dialects), so a hit is
+    // confirmed in JS; only a pattern match that is not a real prefix match pays for the full read.
+    const where = and(eq(signalWaiters.runId, runId), like(signalWaiters.token, `${tokenPrefix}%`));
+    const first = await this.db
+      .select({ token: signalWaiters.token })
+      .from(signalWaiters)
+      .where(where)
+      .limit(1);
+    if (first.length === 0) return false;
+    if (first[0]?.token.startsWith(tokenPrefix)) return true;
+    const rows = await this.db
+      .select({ token: signalWaiters.token })
+      .from(signalWaiters)
+      .where(where);
+    return rows.some((r) => r.token.startsWith(tokenPrefix));
+  }
+
   async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
     // Exact-match delete (token AND runId AND seq) — deleting on `token` alone would remove whatever
     // row currently owns it, even if a different run has since claimed the same token.
@@ -907,4 +1018,16 @@ function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };
+}
+
+/**
+ * The `ON CONFLICT DO UPDATE` set for a multi-row upsert: each column (or each of `only`) takes the
+ * value the conflicting row proposed.
+ */
+function excludedSet<T extends Table>(table: T, only?: string[]): Record<string, SQL> {
+  return Object.fromEntries(
+    Object.entries(getTableColumns(table))
+      .filter(([key]) => !only || only.includes(key))
+      .map(([key, column]) => [key, sql.raw(`excluded."${column.name}"`)]),
+  );
 }

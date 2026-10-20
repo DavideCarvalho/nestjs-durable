@@ -17,6 +17,7 @@ import {
   type StateStore,
   WorkflowEngine,
   indexWaitersByRun,
+  listSignalWaitersOfRuns,
   mergeRunFacetRows,
   resolveRunWaiting,
 } from '@dudousxd/nestjs-durable-core';
@@ -51,10 +52,15 @@ export class StoreRunGateway implements RunGateway {
 
   async listRuns(query: RunQuery): Promise<RunListItem[]> {
     const runs = await this.store.listRuns(query);
-    // ONE bulk scan of the signal-waiter table (indexed by runId) resolves what each suspended run is
-    // parked on — signal / webhook / child — with no per-run timeline fetch. A timer wait falls back
-    // to the run's own `wakeAt`. Non-suspended (and remote-step-in-flight) runs carry no `waiting`.
-    const waiterByRun = indexWaitersByRun(await this.store.listSignalWaiters(''));
+    // One read of the listed suspended runs' signal waiters resolves what each is parked on — signal
+    // / webhook / child — with no per-run timeline fetch. A timer wait falls back to the run's own
+    // `wakeAt`. Non-suspended (and remote-step-in-flight) runs carry no `waiting`.
+    const waiterByRun = indexWaitersByRun(
+      await listSignalWaitersOfRuns(
+        this.store,
+        runs.filter((run) => run.status === 'suspended').map((run) => run.id),
+      ),
+    );
     return runs.map((run) => {
       const waiting = resolveRunWaiting(run, waiterByRun);
       return waiting ? { ...run, waiting } : run;
@@ -91,19 +97,19 @@ export class StoreRunGateway implements RunGateway {
   /**
    * Bulk-resolve what each of `runIds` is currently parked on — for a consumer with its own filtered/
    * paginated run listing (e.g. "which of MY suspended runs are stuck at a breakpoint") without
-   * re-deriving `listRuns`' waiter scan or querying `durable_step_checkpoints` directly. Mirrors
-   * `listRuns`' waiting computation (the SAME bulk signal-waiter scan + `resolveRunWaiting`), but ALSO
+   * re-deriving `listRuns`' waiter read or querying `durable_step_checkpoints` directly. Mirrors
+   * `listRuns`' waiting computation (the requested runs' signal waiters + `resolveRunWaiting`), but ALSO
    * bulk-fetches the currently-suspended runs to check real status: `engine.cancel` (the non-compensate
    * path) doesn't clear a run's signal waiter row, so a cancelled run can leave an ORPHANED waiter
    * behind — trusting waiter presence alone would wrongly report a terminal run as still waiting.
-   * Two bulk scans total (never one query per requested id), same as `listRuns`.
+   * Two bulk reads total (never one query per requested id), same as `listRuns`.
    */
   async waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>> {
     if (runIds.length === 0) return {};
     const idSet = new Set(runIds);
     const [suspended, waiters] = await Promise.all([
       this.store.listRuns({ statuses: ['suspended'] }),
-      this.store.listSignalWaiters(''),
+      listSignalWaitersOfRuns(this.store, runIds),
     ]);
     const waiterByRun = indexWaitersByRun(waiters);
     const result: Record<string, RunWaiting> = {};

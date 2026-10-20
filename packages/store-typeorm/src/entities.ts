@@ -314,6 +314,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     name: 'SignalWaiterEntity',
     target: SignalWaiterEntity,
     tableName: 'durable_signal_waiters',
+    indices: [{ name: 'durable_signal_waiters_run_id_idx', columns: ['runId'] }],
     columns: {
       token: { type: 'text', primary: true, name: col('token') },
       runId: { type: 'text', name: col('runId') },

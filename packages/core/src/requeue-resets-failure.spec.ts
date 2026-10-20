@@ -149,6 +149,29 @@ describe('requeue of a FAILED run resets its failure state so replay re-executes
     expect((await store.getRun('pc'))?.output).toBe('parent saw child-ok');
   });
 
+  it('a ctx.all parent failed by one child: requeue converges on the retried child', async () => {
+    const store = new InMemoryStateStore();
+    let healthy = false;
+    const engine = new WorkflowEngine({ store });
+    engine.register('child', '1', async (_ctx, input) => {
+      const i = (input as { i: number }).i;
+      if (i === 1 && !healthy) throw new Error('boom');
+      return i;
+    });
+    engine.register('parent', '1', async (ctx) =>
+      ctx.all<number>('child', [{ i: 0 }, { i: 1 }, { i: 2 }]),
+    );
+
+    await engine.start('parent', {}, 'p');
+    await poll(async () => (await store.getRun('p'))?.status === 'failed');
+
+    healthy = true;
+    await engine.requeue('p');
+    await poll(async () => (await store.getRun('p'))?.status === 'completed');
+    expect((await store.getRun('p'))?.output).toEqual([0, 1, 2]);
+    expect(await store.listSignalWaiters('child:p.')).toEqual([]);
+  });
+
   it('requeue CLEARS the stale run.error while the run re-executes', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();

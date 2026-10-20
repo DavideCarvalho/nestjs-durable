@@ -1,5 +1,6 @@
 import {
   type AttributeFilter,
+  type ChildWait,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -33,11 +34,14 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import {
   type SQL,
+  type Table,
   and,
   asc,
   desc,
   eq,
   exists,
+  getTableColumns,
+  gte,
   inArray,
   isNotNull,
   isNull,
@@ -635,6 +639,76 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.map(fromWaiterRow);
   }
 
+  async registerChildWaits(entries: ChildWait[]): Promise<void> {
+    if (entries.length === 0) return;
+    await this.db.transaction(async (tx) => {
+      await tx
+        .insert(signalWaiters)
+        .values(
+          entries.map(({ waiter }) => ({
+            token: waiter.token,
+            runId: waiter.runId,
+            seq: waiter.seq,
+            parallelGroup: waiter.parallelGroup ?? null,
+          })),
+        )
+        .onConflictDoUpdate({
+          target: signalWaiters.token,
+          set: excludedSet(signalWaiters, ['runId', 'seq', 'parallelGroup']),
+        });
+      await tx
+        .insert(stepCheckpoints)
+        .values(entries.map(({ checkpoint }) => toCheckpointRow(checkpoint)))
+        .onConflictDoUpdate({
+          target: [stepCheckpoints.runId, stepCheckpoints.seq],
+          set: excludedSet(stepCheckpoints),
+        });
+    });
+  }
+
+  async compactCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    into: StepCheckpoint,
+  ): Promise<void> {
+    await this.db.transaction(async (tx) => {
+      await tx
+        .delete(stepCheckpoints)
+        .where(
+          and(
+            eq(stepCheckpoints.runId, runId),
+            gte(stepCheckpoints.seq, fromSeq),
+            lte(stepCheckpoints.seq, toSeq),
+          ),
+        );
+      await upsertCheckpoint(tx, into);
+    });
+  }
+
+  async listSignalWaitersByRun(runIds: string[]): Promise<SignalWaiter[]> {
+    if (runIds.length === 0) return [];
+    const rows = await this.db
+      .select()
+      .from(signalWaiters)
+      .where(inArray(signalWaiters.runId, runIds));
+    return rows.map(fromWaiterRow);
+  }
+
+  async hasSignalWaiter(runId: string, tokenPrefix: string): Promise<boolean> {
+    const rows = await this.db
+      .select({ token: signalWaiters.token })
+      .from(signalWaiters)
+      .where(
+        and(
+          eq(signalWaiters.runId, runId),
+          like(signalWaiters.token, `${escapeLike(tokenPrefix)}%`),
+        ),
+      )
+      .limit(1);
+    return rows.length > 0;
+  }
+
   async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
     // Exact match — never remove a row a DIFFERENT run has since claimed the token with.
     await this.db
@@ -917,4 +991,16 @@ function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+/**
+ * The `ON CONFLICT DO UPDATE` set for a multi-row upsert: each column (or each of `only`) takes the
+ * value the conflicting row proposed.
+ */
+function excludedSet<T extends Table>(table: T, only?: string[]): Record<string, SQL> {
+  return Object.fromEntries(
+    Object.entries(getTableColumns(table))
+      .filter(([key]) => !only || only.includes(key))
+      .map(([key, column]) => [key, sql.raw(`excluded."${column.name}"`)]),
+  );
 }
