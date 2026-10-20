@@ -66,9 +66,19 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.unsubscribeEnqueued?.();
+    const budget = this.options.shutdownTimeoutMs ?? 10_000;
+    // Optional call: an older core (the peer range is wide) has no `beginDrain`, and a TypeError here
+    // would reject `app.close()` on Nest 10/11 before the registrar ever drains. Always begin the
+    // drain on a driving operator so the engine's state does not depend on whether a poll was in
+    // flight. The budget is passed only when we are about to wait, so `drain()` spends what is left
+    // and the poller wait plus the drain stay within one `shutdownTimeoutMs`.
+    this.engine.beginDrain?.(this.current ? budget : undefined);
     if (!this.current) return;
-    this.engine.beginDrain();
-    await settleWithin(this.current, this.options.shutdownTimeoutMs ?? 10_000);
+    if (await settleWithin(this.current, budget)) {
+      console.warn(
+        `[nestjs-durable] timer poll still running after ${budget}ms at shutdown; continuing (it may report store errors if the host ends its pool now)`,
+      );
+    }
   }
 
   /**

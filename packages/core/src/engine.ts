@@ -592,6 +592,8 @@ export class WorkflowEngine {
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Set<Promise<RunResult>>();
   private draining = false;
+  /** Absolute ms by which a drain that was announced with a budget must be done; see `beginDrain`. */
+  private drainDeadline: number | undefined;
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
@@ -1498,8 +1500,13 @@ export class WorkflowEngine {
    * their per-run lock loops) start nothing once this is called. {@link drain} calls it first; a
    * poller calls it on its own shutdown so an in-flight sweep stops locking runs before it is awaited.
    */
-  beginDrain(): void {
+  beginDrain(timeoutMs?: number): void {
     this.draining = true;
+    // A caller that is about to WAIT (the timer poller awaiting its sweep) passes its budget so the
+    // later {@link drain} spends only what is left, keeping the whole shutdown within one deadline.
+    if (timeoutMs !== undefined && this.drainDeadline === undefined) {
+      this.drainDeadline = Date.now() + timeoutMs;
+    }
   }
 
   /**
@@ -1509,9 +1516,13 @@ export class WorkflowEngine {
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     this.beginDrain();
+    const budget =
+      this.drainDeadline === undefined
+        ? timeoutMs
+        : Math.min(timeoutMs, Math.max(0, this.drainDeadline - Date.now()));
     if (this.inflight.size === 0) return;
     const timer = new Promise<void>((resolve) => {
-      const t = setTimeout(resolve, timeoutMs);
+      const t = setTimeout(resolve, budget);
       (t as { unref?: () => void }).unref?.();
     });
     await Promise.race([Promise.allSettled([...this.inflight]), timer]);
@@ -2129,6 +2140,13 @@ export class WorkflowEngine {
         nowMs,
       );
       if (!acquired) continue;
+      if (this.draining) {
+        // Drain began while the lock was being taken. Starting the run now would hand `drain()` (which
+        // already snapshotted its in-flight set) something it will not wait for, and an exit would
+        // strand the lease until it expires. Give the lease back; the run stays for the next instance.
+        await this.store.releaseRunLock(run.id);
+        break;
+      }
       try {
         // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
         const settled = onLocked ? await onLocked(run) : undefined;

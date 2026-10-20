@@ -100,19 +100,23 @@ describe('shutdown waits for the in-flight timer poll', () => {
   });
 
   it('[shutdown-awaits-poll] fires no persisted schedule once close begins', async () => {
-    const { state, proxy } = instrument(new InMemoryStateStore(), 'listSchedules');
+    const raw = new InMemoryStateStore();
+    const { state, proxy } = instrument(raw, 'listSchedules');
     const moduleRef = await boot(proxy, { persistedSchedules: true });
     const engine = moduleRef.get(WorkflowEngine);
-    await engine.schedules.create({ id: 'due', workflow: ShutdownJob, every: 20 });
-    await new Promise((r) => setTimeout(r, 40)); // let the schedule become due
     state.armed = true;
+    await engine.schedules.create({ id: 'due', workflow: ShutdownJob, every: 20 });
+    await state.reached; // the poll's tick is inside the (blocked) listSchedules
+    await new Promise((r) => setTimeout(r, 60)); // the schedule becomes due while the tick is held
+    const due = await raw.listSchedules?.({ dueBy: Date.now() });
+    expect(due?.length).toBeGreaterThan(0); // precondition: the block is real, the tick WOULD fire it
     state.calls.length = 0;
-    await state.reached; // the poll's tick is inside listSchedules
 
     const closing = moduleRef.close().then(() => {
       state.closed = true;
     });
     await new Promise((r) => setTimeout(r, 30));
+    expect(state.closed).toBe(false); // close() is still waiting on the blocked tick
     state.release();
     await closing;
     await new Promise((r) => setTimeout(r, 100));

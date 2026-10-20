@@ -377,3 +377,36 @@ describe('runRedisWorker — close() while the control subscriber is still conne
     }
   });
 });
+
+describe('runRedisWorker — a failed control-channel subscribe', () => {
+  it('[control-subscribe-logged] warns, because cancellations would silently never arrive', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fake = makeFakeDeps();
+    class FailingSubscribeRedis {
+      duplicate() {
+        return {
+          subscribe: async () => {
+            throw new Error('NOPERM this user has no permissions');
+          },
+          on: () => {},
+          disconnect: () => {},
+        };
+      }
+      async set() {}
+      async publish() {}
+      on() {}
+      disconnect() {}
+    }
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('wf', async () => 1);
+    const runner = await runRedisWorker({
+      runtime,
+      connection: {},
+      deps: { ...fake.deps, Redis: FailingSubscribeRedis as unknown as RunnerDeps['Redis'] },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    await runner.close();
+    expect(warn.mock.calls.flat().join(' ')).toMatch(/control-channel subscribe failed.*NOPERM/);
+    warn.mockRestore();
+  });
+});

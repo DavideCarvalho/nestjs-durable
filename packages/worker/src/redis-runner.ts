@@ -347,6 +347,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
 
   // --- best-effort pub/sub control channel + worker-liveness heartbeat (mirror the Python SDK) ---
   let controlSub: RedisSubClient | undefined;
+  let closing = false;
   let heartbeatClient: InstanceType<NonNullable<RunnerDeps['Redis']>> | undefined;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -358,7 +359,14 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       // Best-effort like the rest of this block. The subscribe is queued until the connection is
       // ready and ioredis rejects it with "Connection is closed." if `close()` disconnects first;
       // unhandled, that rejection would terminate the process.
-      void Promise.resolve(controlSub.subscribe(controlChannel(prefix))).catch(() => {});
+      void Promise.resolve(controlSub.subscribe(controlChannel(prefix))).catch((err: unknown) => {
+        // Not silent: this channel carries `cancel`, so a failed subscribe (ACL, bad prefix) means
+        // cancellations never reach this worker. Only the disconnect from our own close() is expected.
+        if (closing) return;
+        console.warn(
+          `[nestjs-durable] worker control-channel subscribe failed; cancellations will not reach this worker: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
       controlSub.on('message', (_channel, payload) => {
         try {
           const msg = JSON.parse(payload) as { kind?: string; runId?: string };
@@ -416,6 +424,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
 
   return {
     async close(): Promise<void> {
+      closing = true;
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       controller.stop();
       await Promise.all(workersRef.current.map((w) => w.close()));

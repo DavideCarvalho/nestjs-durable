@@ -132,7 +132,13 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
   async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.stopping = true;
-    if (this.current) await settleWithin(this.current, this.options.shutdownTimeoutMs ?? 10_000);
+    if (!this.current) return;
+    const budget = this.options.shutdownTimeoutMs ?? 10_000;
+    if (await settleWithin(this.current, budget)) {
+      console.warn(
+        `[nestjs-durable] retention sweep still running after ${budget}ms at shutdown; continuing`,
+      );
+    }
   }
 
   /**

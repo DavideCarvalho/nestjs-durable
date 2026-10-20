@@ -1248,7 +1248,14 @@ export class BullMQTransport implements Transport, ControlPlane {
       this.tenantEventSubs.delete(sub);
       this.subscribers.delete(sub);
       // The disconnect right after rejects an unsubscribe still queued on a connecting socket.
-      sub.unsubscribe(channel).catch(() => {});
+      sub.unsubscribe(channel).catch((err: unknown) => {
+        // Our own disconnect, right below, rejects an unsubscribe still queued: expected.
+        if (this.closed || (err instanceof Error && /Connection is closed/.test(err.message)))
+          return;
+        console.warn(
+          `[nestjs-durable] unsubscribe from ${channel} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
       sub.disconnect();
     };
   }
@@ -1262,9 +1269,10 @@ export class BullMQTransport implements Transport, ControlPlane {
    * 1. **Bounded.** Every graceful close races {@link BullMQTransportOptions.closeTimeoutMs}. A
    *    `Worker.close()` that never settles (see that option's doc for why it happens and why
    *    `close(true)` cannot rescue it) stops being awaited instead of hanging the caller forever.
-   * 2. **Concurrent, not sequential.** These used to be six sequential `await`s, so the FIRST wedged
-   *    worker also prevented the other five — and the queues — from ever being asked to close. The
-   *    budget is now spent once for all of them, not once each.
+   * 2. **Workers concurrently, then queues.** These used to be six sequential `await`s, so the FIRST
+   *    wedged worker also prevented the other five — and the queues — from ever being asked to close.
+   *    The workers now close together and the queues after them, because a worker finishing its
+   *    in-flight job publishes through a queue; the one `closeTimeoutMs` budget covers both phases.
    * 3. **The disconnects always run.** They were previously unreachable whenever any close hung,
    *    which is the part that actually stranded the process: the sockets stayed up, so the blocking
    *    connection that caused the wedge was never dropped either. They are synchronous and
@@ -1280,21 +1288,30 @@ export class BullMQTransport implements Transport, ControlPlane {
     if (this.pingWatchdogTimer) clearInterval(this.pingWatchdogTimer);
     this.subscribers.clear();
     this.workerController?.stop();
-    const closers: Array<Promise<void> | undefined> = [
+    // ORDER MATTERS. `Worker.close()` waits for the job in flight, and that job publishes its result
+    // (or decision, or reply) through one of the queues below. Closing both sets concurrently let a
+    // queue that owns its connection `quit()` under the publish, which then failed with "Connection is
+    // closed." and lost a step result on an ordinary SIGTERM. So: workers first, then queues, under
+    // ONE deadline (`closeTimeoutMs` bounds the whole close, not each phase).
+    const deadline = Date.now() + this.closeTimeoutMs;
+    const workerCloses = [
       ...[...this.taskWorkers.values()].map((w) => w.close()),
       this.resultsWorker?.close(),
       this.decisionsWorker?.close(),
       this.stepEventsWorker?.close(),
       this.startRunWorker?.close(),
       this.runRequestWorker?.close(),
-      ...[...this.queues.values()].map((q) => q.close()),
     ];
-    // `allSettled`, so one rejecting close does not mask the rest; the race bounds the whole set.
+    // `allSettled`, so one rejecting close does not mask the rest; the race bounds the phase.
     // A rejection here is not actionable during shutdown — the connections come down either way.
     await withTimeout(
-      Promise.allSettled(closers.filter((p) => p !== undefined)),
+      Promise.allSettled(workerCloses.filter((p) => p !== undefined)),
       this.closeTimeoutMs,
     );
+    // Queues are asked to close even when a worker wedged (the budget may be spent); only the wait
+    // shrinks to what is left.
+    const queueCloses = [...this.queues.values()].map((q) => q.close());
+    await withTimeout(Promise.allSettled(queueCloses), Math.max(0, deadline - Date.now()));
     this.controlPub?.disconnect();
     this.controlSub?.disconnect();
     this.heartbeatPub?.disconnect();
