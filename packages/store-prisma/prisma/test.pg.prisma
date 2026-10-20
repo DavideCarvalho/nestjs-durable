@@ -111,6 +111,7 @@ model DurableSignalWaiter {
   seq           Int
   parallelGroup String? @map("parallel_group")
 
+  @@index([runId], map: "durable_signal_waiters_run_id_idx")
   @@map("durable_signal_waiters")
 }
 

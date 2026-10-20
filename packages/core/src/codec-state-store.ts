@@ -1,4 +1,5 @@
 import type {
+  ChildWait,
   RetentionPolicy,
   RunFacetQuery,
   RunFacetRow,
@@ -78,6 +79,19 @@ export class CodecStateStore implements StateStore {
   /** Forwarded verbatim — a count reads no payload. Bound only when the inner store counts, so the
    *  engine's facet/listing fallback still applies through the wrapper. */
   readonly countRuns?: (query: Omit<RunQuery, 'limit' | 'offset'>) => Promise<number>;
+  /** The placeholder checkpoints are encoded like any other checkpoint. */
+  readonly registerChildWaits?: (entries: ChildWait[]) => Promise<void>;
+  /** The folded checkpoint carries the children's outputs, so it is encoded. */
+  readonly compactCheckpoints?: (
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    into: StepCheckpoint,
+  ) => Promise<void>;
+  /** Forwarded verbatim — a waiter carries no payload. */
+  readonly listSignalWaitersByRun?: (runIds: string[]) => Promise<SignalWaiter[]>;
+  /** Forwarded verbatim — a waiter carries no payload. */
+  readonly hasSignalWaiter?: (runId: string, tokenPrefix: string) => Promise<boolean>;
 
   /** Schedules persist their run `input` inside `spec` — encoded like any other payload. Bound only
    *  when the inner store persists schedules, so `engine.schedules` reports absence faithfully. */
@@ -103,6 +117,22 @@ export class CodecStateStore implements StateStore {
       this.pruneTerminalRuns = (policy, now, limit) => prune.call(inner, policy, now, limit);
     const count = inner.countRuns;
     if (count) this.countRuns = (query) => count.call(inner, query);
+    const registerChildWaits = inner.registerChildWaits;
+    if (registerChildWaits)
+      this.registerChildWaits = (entries) =>
+        registerChildWaits.call(
+          inner,
+          entries.map((e) => ({ waiter: e.waiter, checkpoint: this.encCp(e.checkpoint) })),
+        );
+    const compact = inner.compactCheckpoints;
+    if (compact)
+      this.compactCheckpoints = (runId, fromSeq, toSeq, into) =>
+        compact.call(inner, runId, fromSeq, toSeq, this.encCp(into));
+    const byRun = inner.listSignalWaitersByRun;
+    if (byRun) this.listSignalWaitersByRun = (runIds) => byRun.call(inner, runIds);
+    const hasWaiter = inner.hasSignalWaiter;
+    if (hasWaiter)
+      this.hasSignalWaiter = (runId, tokenPrefix) => hasWaiter.call(inner, runId, tokenPrefix);
 
     const { saveSchedule, getSchedule, updateSchedule, deleteSchedule, listSchedules } = inner;
     if (saveSchedule && getSchedule && updateSchedule && deleteSchedule && listSchedules) {

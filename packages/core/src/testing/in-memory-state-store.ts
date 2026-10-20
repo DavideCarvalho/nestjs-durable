@@ -1,5 +1,6 @@
 import { parseDuration } from '../duration';
 import {
+  type ChildWait,
   type RetentionPolicy,
   type RunFacetQuery,
   type RunFacetRow,
@@ -255,6 +256,33 @@ export class InMemoryStateStore implements StateStore {
     return [...this.signalWaiters.values()]
       .filter((w) => w.token.startsWith(prefix))
       .map((w) => ({ ...w }));
+  }
+
+  async registerChildWaits(entries: ChildWait[]): Promise<void> {
+    for (const { waiter } of entries) this.signalWaiters.set(waiter.token, { ...waiter });
+    for (const { checkpoint } of entries) await this.saveCheckpoint(checkpoint);
+  }
+
+  async compactCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    into: StepCheckpoint,
+  ): Promise<void> {
+    for (let seq = fromSeq; seq <= toSeq; seq += 1) this.checkpoints.delete(this.key(runId, seq));
+    this.checkpoints.set(this.key(runId, into.seq), { ...into, runId });
+  }
+
+  async listSignalWaitersByRun(runIds: string[]): Promise<SignalWaiter[]> {
+    const ids = new Set(runIds);
+    return [...this.signalWaiters.values()].filter((w) => ids.has(w.runId)).map((w) => ({ ...w }));
+  }
+
+  async hasSignalWaiter(runId: string, tokenPrefix: string): Promise<boolean> {
+    for (const w of this.signalWaiters.values()) {
+      if (w.runId === runId && w.token.startsWith(tokenPrefix)) return true;
+    }
+    return false;
   }
 
   async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {

@@ -310,6 +310,8 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
         'durable_runs_namespace_status_idx',
         `${runs} (${runsCol('namespace')}, ${runsCol('status')}, ${runsCol('createdAt')})`,
       ],
+      // A run's waiters: the `ctx.all` join barrier probes them once per settled child.
+      ['durable_signal_waiters_run_id_idx', `${waiters} (${waiterCol('runId')})`],
       // buffered signals are taken FIFO per token (smallest id) — index the token for the scan.
       ['durable_buffered_signals_token_idx', `${buffered} (${bufCol('token')})`],
       // buffered events are scanned oldest-first per name — one composite index serves both.

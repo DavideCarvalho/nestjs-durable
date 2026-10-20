@@ -114,6 +114,7 @@ model DurableSignalWaiter {
   // parallel group. Nullable: only fan-out child waiters carry it.
   parallelGroup String? @map("parallel_group")
 
+  @@index([runId], map: "durable_signal_waiters_run_id_idx")
   @@map("durable_signal_waiters")
 }
 

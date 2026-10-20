@@ -24,7 +24,10 @@ TelescopeModule.forRoot({
 The watcher resolves the engine from the (global) durable providers and records one entry per
 lifecycle event (`run.started`, `step.completed`, `run.completed`, `run.failed`, …), tagged
 `workflow:<name>`, `run:<id>`, `kind:<step-kind>`, and `failed` on failures — so you can filter
-and group durable activity in the Telescope UI.
+and group durable activity in the Telescope UI. A child run started by `ctx.all`, `ctx.child` or
+`ctx.startChild` (without a caller-chosen id) is also tagged `parent:<parent run id>`, and carries
+`parentRunId` in its content: each child has its own trace, so filtering on `parent:<id>` is how
+you find every child of one run, a whole `ctx.all` fan included.
 
 It also **trace-groups** a run: every entry for a run carries the same `traceId`, derived from the
 run id, so a whole workflow reads as a single trace on Telescope's Traces page. Because the id is a
@@ -151,9 +154,11 @@ Ten providers back the panels above, reading from three different sources:
 - **Telescope's own captured entries** (recent-history, bounded by Telescope's prune window):
   `durable.timeseries` (success rate / failed count / top failures), `durable.duration` (p50/p95/p99
   + histogram), `durable.runsOverTime`, `durable.successRate`, `durable.throughput`.
-- **The live durable store** (`listRuns`, exact and unbounded by the prune window):
+- **The live durable store** (exact and unbounded by the prune window):
   `durable.state` (a single status count, e.g. Backlog), `durable.recentFailures` (the Stuck runs
-  table), `durable.stateBreakdown` (the Runs-by-state donut).
+  table), `durable.stateBreakdown` (the Runs-by-state donut). The counts come from the store's
+  `countRuns`, a `COUNT` that stays exact and cheap when a wide fan puts tens of thousands of runs
+  in one status; a store without it falls back to a listing capped at 10,000 runs.
 - **The live engine/worker layer** (`WorkflowEngine.workerHealth()` — empty when the transport can't
   introspect it; only the BullMQ transport currently implements `groupHealth`):
   `durable.workerHealth` (per-group backlog + live-worker rows; query it with

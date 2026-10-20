@@ -1,5 +1,5 @@
 import { EVENT_TOKEN_PREFIX, eventNameOf } from './events';
-import type { RunWaiting, SignalWaiter, WorkflowRun } from './interfaces';
+import type { RunWaiting, SignalWaiter, StateStore, WorkflowRun } from './interfaces';
 
 // Waiter-token prefixes the engine stamps (see `workflow-ctx.ts`): a webhook mints `wh:<runId>:<seq>`,
 // an awaited child parks on `child:<id>`, a `ctx.breakpoint` mints `bp:<runId>:<seq>` (see
@@ -45,6 +45,29 @@ export function resolveRunWaiting(
   if (run.status !== 'suspended') return undefined;
   const waiter = waiterByRun.get(run.id);
   return waiter ? classifyWaiterToken(waiter.token) : undefined;
+}
+
+const RUN_ID_BATCH = 500;
+
+/**
+ * The signal waiters of `runIds`: through the store's {@link StateStore.listSignalWaitersByRun} in
+ * bounded batches, or, for a store without it, one scan of every waiter filtered to those runs.
+ */
+export async function listSignalWaitersOfRuns(
+  store: StateStore,
+  runIds: readonly string[],
+): Promise<SignalWaiter[]> {
+  const unique = [...new Set(runIds)];
+  if (unique.length === 0) return [];
+  if (!store.listSignalWaitersByRun) {
+    const ids = new Set(unique);
+    return (await store.listSignalWaiters('')).filter((w) => ids.has(w.runId));
+  }
+  const out: SignalWaiter[] = [];
+  for (let at = 0; at < unique.length; at += RUN_ID_BATCH) {
+    out.push(...(await store.listSignalWaitersByRun(unique.slice(at, at + RUN_ID_BATCH))));
+  }
+  return out;
 }
 
 /** Index signal waiters by `runId`, keeping the first seen per run (a run parks on one waiter at a

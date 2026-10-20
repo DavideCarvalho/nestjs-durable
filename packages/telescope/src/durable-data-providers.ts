@@ -97,6 +97,17 @@ function dedupeRunEvents(entries: StorageEntry[]): StorageEntry[] {
 
 const STATE_CAP = 10_000;
 
+/**
+ * How many runs are in `status`: an exact `COUNT` through the store's `countRuns`, or, for a store
+ * without one, the length of a listing capped at {@link STATE_CAP}. A wide `ctx.all` fan can put
+ * tens of thousands of runs in one status, which the capped listing would both under-count and pay
+ * for by loading every row.
+ */
+function countByStatus(store: StateStore, status: RunStatus): Promise<number> {
+  if (store.countRuns) return store.countRuns({ status });
+  return store.listRuns({ status, limit: STATE_CAP }).then((runs) => runs.length);
+}
+
 // ─── Existing providers ───────────────────────────────────────────────────────
 
 /** Source C: current-state gauge from the durable store. query.status selects which (default 'dead'). */
@@ -106,8 +117,7 @@ export function durableStateProvider(): DataProvider {
     async resolve(query, ctx: ExtensionContext) {
       const store = ctx.moduleRef.get(STATE_STORE_CANONICAL, { strict: false }) as StateStore;
       const status = (query?.status as RunStatus) ?? 'dead';
-      const runs = await store.listRuns({ status, limit: STATE_CAP });
-      return { value: runs.length };
+      return { value: await countByStatus(store, status) };
     },
   };
 }
@@ -557,7 +567,7 @@ const STATE_BREAKDOWN_PALETTE = [
 ];
 
 /**
- * Counts from `STATE_STORE.listRuns({ status })` for each of the statuses and returns pie
+ * Counts per status (see {@link countByStatus}) for each of the statuses and returns pie
  * segments with the standard palette: `{ segments: Array<{ label, value, color }> }`.
  */
 export function durableStateBreakdownProvider(): DataProvider {
@@ -566,9 +576,7 @@ export function durableStateBreakdownProvider(): DataProvider {
     async resolve(_query, ctx: ExtensionContext) {
       const store = ctx.moduleRef.get(STATE_STORE_CANONICAL, { strict: false }) as StateStore;
       const counts = await Promise.all(
-        STATE_BREAKDOWN_STATUSES.map((status) =>
-          store.listRuns({ status, limit: STATE_CAP }).then((runs) => runs.length),
-        ),
+        STATE_BREAKDOWN_STATUSES.map((status) => countByStatus(store, status)),
       );
       const segments = STATE_BREAKDOWN_STATUSES.map((label, i) => ({
         label,

@@ -19,6 +19,7 @@ import {
   durableClient,
   runDisplayStatus,
 } from '../client/durable-client';
+import { stepDisplayName } from '../client/folded-children';
 import { groupParallelSpans } from '../client/group-parallel-spans';
 import { childRunIdOf } from './child-link';
 import { BoltIcon, CheckIcon, ChildIcon, KIND_LABEL, XIcon, iconFor } from './icons';
@@ -394,7 +395,7 @@ export const WorkflowGraph = memo(function WorkflowGraph({
         ? loneChild.step.name
         : childId !== undefined
           ? (childDetail?.run.workflow ?? 'child workflow')
-          : s.name;
+          : stepDisplayName(s);
       const failed = bodyStep.status === 'failed';
       nodes.push({
         id,

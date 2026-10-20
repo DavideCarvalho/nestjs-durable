@@ -303,6 +303,8 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     class: SignalWaiterEntity,
     tableName: 'durable_signal_waiters',
     repository: () => SignalWaiterRepository,
+    // A run's waiters: the `ctx.all` join barrier probes them once per settled child.
+    indexes: [{ name: 'durable_signal_waiters_run_id_idx', properties: ['runId'] }],
     properties: {
       token: { type: 'string', primary: true, fieldName: col('token') },
       runId: { type: 'string', fieldName: col('runId') },

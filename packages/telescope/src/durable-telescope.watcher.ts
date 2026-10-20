@@ -1,6 +1,7 @@
 import {
   type EngineEvent,
   WorkflowEngine,
+  parentRunIdOf,
   useDurableExecution,
 } from '@dudousxd/nestjs-durable-core';
 import type { Watcher, WatcherContext } from '@dudousxd/nestjs-telescope';
@@ -80,6 +81,7 @@ export class DurableTelescopeWatcher implements Watcher {
             event: event.type,
             workflow: event.workflow,
             runId: event.runId,
+            parentRunId: parentRunIdOf(event.runId),
             seq: event.seq,
             name: event.name,
             kind: event.kind,
@@ -139,6 +141,10 @@ export class DurableTelescopeWatcher implements Watcher {
 
   private tags(event: EngineEvent): string[] {
     const tags = ['durable', event.type, `run:${event.runId}`];
+    // A child run's own trace is separate from its parent's; this tag is how the entries of every
+    // child of one run (a whole `ctx.all` fan) are found from the parent.
+    const parent = parentRunIdOf(event.runId);
+    if (parent) tags.push(`parent:${parent}`);
     if (event.workflow) tags.push(`workflow:${event.workflow}`);
     if (event.kind) tags.push(`kind:${event.kind}`);
     if (event.type === 'run.failed') tags.push('failed');
