@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import type { DurableModuleOptions } from './durable.module';
 import { isDrivingOperator } from './role';
+import { settleWithin } from './settle-within';
 
 /**
  * Resumes suspended runs whose durable timer (`ctx.sleep`) is due, and fires any configured
@@ -22,6 +23,8 @@ import { isDrivingOperator } from './role';
 export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private polling = false;
+  /** The sweep in flight, so shutdown can wait for it instead of racing the store's close. */
+  private current: Promise<void> | undefined;
   private unsubscribeEnqueued?: () => void;
 
   constructor(
@@ -53,9 +56,37 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     }
   }
 
-  onModuleDestroy(): void {
+  /**
+   * Stop polling and wait for the sweep in flight (bounded by `shutdownTimeoutMs`, default 10s).
+   * Nest runs every `onModuleDestroy` before any `onApplicationShutdown`, so returning here only once
+   * the sweep has settled means no store call is still pending when the registrar drains and the
+   * host closes its connection pool. The engine is told to stop first so a sweep working through a
+   * backlog stops locking runs instead of finishing the backlog. The time spent waiting is deducted
+   * from the later `engine.drain()`, so poll wait plus drain stay within one `shutdownTimeoutMs`.
+   */
+  async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.unsubscribeEnqueued?.();
+    // Only an operator that DRIVES the engine has a poll to wait for, and only it stops taking work
+    // here. A non-driving operator (dashboard-only, `drive: false`) keeps running whatever its
+    // finishing requests or `beforeApplicationShutdown` hooks start; `drain()` in the registrar
+    // still waits for those.
+    if (!isDrivingOperator(this.options)) return;
+    // Optional call: an older core (the peer range is wide) has no `beginDrain`, and a TypeError here
+    // would reject `app.close()` on Nest 10/11 before the registrar ever drains.
+    this.engine.beginDrain?.();
+    if (!this.current) return;
+    const budget = this.options.shutdownTimeoutMs ?? 10_000;
+    const started = Date.now();
+    const timedOut = await settleWithin(this.current, budget);
+    // Charge the drain only for the time spent waiting here, not for whatever Nest does between this
+    // hook and the registrar's drain.
+    this.engine.beginDrain?.(Date.now() - started);
+    if (timedOut) {
+      console.warn(
+        `[nestjs-durable] timer poll still running after ${budget}ms at shutdown; continuing (it may report store errors if the host ends its pool now)`,
+      );
+    }
   }
 
   /**
@@ -73,10 +104,19 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
    * `recoverIncomplete` says nothing about whether durable timers should still fire, and skipping
    * the rest of the tick would silently widen one subsystem's outage into all of them.
    */
-  private async poll(): Promise<void> {
-    if (this.polling) return; // never overlap two sweeps
+  private poll(): Promise<void> {
+    if (this.polling) return this.current ?? Promise.resolve(); // never overlap two sweeps
     this.polling = true;
-    try {
+    const run = this.pollOnce().finally(() => {
+      this.polling = false;
+      if (this.current === run) this.current = undefined;
+    });
+    this.current = run;
+    return run;
+  }
+
+  private async pollOnce(): Promise<void> {
+    {
       // Pick up runs enqueued elsewhere (an API pod's `start`, or another worker) still `pending`,
       // reclaim runs orphaned by a crashed worker (lease expired — a live worker renews its lease so
       // only dead ones are reclaimed), then resume due timers and sweep execution timeouts.
@@ -91,8 +131,6 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
       if (this.options.persistedSchedules) {
         await this.sweep('persistedSchedules', () => this.engine.schedules.tick());
       }
-    } finally {
-      this.polling = false;
     }
   }
 

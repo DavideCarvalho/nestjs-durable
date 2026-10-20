@@ -286,6 +286,10 @@ export interface BullMQTransportOptions {
    * (`if (this.closing) return this.closing`), so a later `close(true)` returns the SAME pending
    * promise rather than forcing anything. Once a graceful close wedges, the only way out is to stop
    * awaiting it and drop the sockets — which is what the timeout does.
+   *
+   * ONE budget covers the whole close: the workers close first (a job finishing during shutdown
+   * publishes through a queue, so the queues must still be open), then the queues, which get only
+   * what is left. Total wait is therefore about `closeTimeoutMs`, not twice it.
    */
   closeTimeoutMs?: number;
   /**
@@ -370,6 +374,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   // iterates this set. PUBLISH-only connections (`controlPub`, `heartbeatPub`, …) are never added:
   // they actively write, so a dead connection surfaces on their next `publish()` instead of silently.
   private readonly subscribers = new Set<Redis>();
+  /** Set when `close()` begins; a subscribe rejected after that is the expected disconnect. */
+  private closed = false;
   private pingWatchdogTimer?: ReturnType<typeof setInterval>;
   private readonly pingIntervalMs: number | false;
   private readonly closeTimeoutMs: number;
@@ -986,7 +992,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
     if (this.heartbeatSub) return; // one subscription per transport
     this.heartbeatSub = this.subscriberRedis();
-    void this.heartbeatSub.subscribe(this.heartbeatChannel());
+    this.subscribeQuietly(this.heartbeatSub, this.heartbeatChannel());
     this.heartbeatSub.on('message', (_channel, payload) => {
       try {
         void handler(JSON.parse(payload) as Heartbeat);
@@ -1050,6 +1056,22 @@ export class BullMQTransport implements Transport, ControlPlane {
     const sub = this.redis();
     this.trackSubscriber(sub);
     return sub;
+  }
+
+  /**
+   * Subscribe without leaving the returned promise unhandled. ioredis queues a `subscribe` issued
+   * before the connection is ready and rejects it with "Connection is closed." when `close()`
+   * disconnects first, which would otherwise surface as an `unhandledRejection` (fatal under Node's
+   * default policy). A rejection after closing began is expected and dropped; any other is logged,
+   * and the reconnect path resubscribes on its own.
+   */
+  private subscribeQuietly(sub: Redis, channel: string): void {
+    sub.subscribe(channel).catch((err: unknown) => {
+      if (this.closed || sub.status === 'end') return;
+      console.warn(
+        `[nestjs-durable] subscribe to ${channel} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
   }
 
   /**
@@ -1136,7 +1158,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   onControl(handler: (msg: ControlMessage) => void): void {
     if (this.controlSub) return; // one subscription per transport
     this.controlSub = this.subscriberRedis();
-    void this.controlSub.subscribe(this.controlChannel());
+    this.subscribeQuietly(this.controlSub, this.controlChannel());
     this.controlSub.on('message', (_channel, payload) => {
       try {
         handler(JSON.parse(payload) as ControlMessage);
@@ -1194,7 +1216,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   onRunReply(handler: (reply: RunReply) => void): void {
     if (this.runReplySub) return; // one subscription per transport
     this.runReplySub = this.subscriberRedis();
-    void this.runReplySub.subscribe(this.runReplyChannel());
+    this.subscribeQuietly(this.runReplySub, this.runReplyChannel());
     this.runReplySub.on('message', (_channel, payload) => {
       try {
         handler(JSON.parse(payload) as RunReply);
@@ -1218,7 +1240,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     const channel = this.tenantEventChannel(tenant);
     const sub = this.subscriberRedis();
     this.tenantEventSubs.add(sub);
-    void sub.subscribe(channel);
+    this.subscribeQuietly(sub, channel);
     sub.on('message', (_channel, payload) => {
       try {
         handler(JSON.parse(payload) as TenantEvent);
@@ -1229,7 +1251,15 @@ export class BullMQTransport implements Transport, ControlPlane {
     return () => {
       this.tenantEventSubs.delete(sub);
       this.subscribers.delete(sub);
-      void sub.unsubscribe(channel);
+      // The disconnect right after rejects an unsubscribe still queued on a connecting socket.
+      sub.unsubscribe(channel).catch((err: unknown) => {
+        // Our own disconnect, right below, rejects an unsubscribe still queued: expected.
+        if (this.closed || (err instanceof Error && /Connection is closed/.test(err.message)))
+          return;
+        console.warn(
+          `[nestjs-durable] unsubscribe from ${channel} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
       sub.disconnect();
     };
   }
@@ -1243,9 +1273,10 @@ export class BullMQTransport implements Transport, ControlPlane {
    * 1. **Bounded.** Every graceful close races {@link BullMQTransportOptions.closeTimeoutMs}. A
    *    `Worker.close()` that never settles (see that option's doc for why it happens and why
    *    `close(true)` cannot rescue it) stops being awaited instead of hanging the caller forever.
-   * 2. **Concurrent, not sequential.** These used to be six sequential `await`s, so the FIRST wedged
-   *    worker also prevented the other five — and the queues — from ever being asked to close. The
-   *    budget is now spent once for all of them, not once each.
+   * 2. **Workers concurrently, then queues.** These used to be six sequential `await`s, so the FIRST
+   *    wedged worker also prevented the other five — and the queues — from ever being asked to close.
+   *    The workers now close together and the queues after them, because a worker finishing its
+   *    in-flight job publishes through a queue; the one `closeTimeoutMs` budget covers both phases.
    * 3. **The disconnects always run.** They were previously unreachable whenever any close hung,
    *    which is the part that actually stranded the process: the sockets stayed up, so the blocking
    *    connection that caused the wedge was never dropped either. They are synchronous and
@@ -1256,25 +1287,35 @@ export class BullMQTransport implements Transport, ControlPlane {
    * what is dropped is a worker that is not going to come back on its own regardless.
    */
   async close(): Promise<void> {
+    this.closed = true;
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
     if (this.pingWatchdogTimer) clearInterval(this.pingWatchdogTimer);
     this.subscribers.clear();
     this.workerController?.stop();
-    const closers: Array<Promise<void> | undefined> = [
+    // ORDER MATTERS. `Worker.close()` waits for the job in flight, and that job publishes its result
+    // (or decision, or reply) through one of the queues below. Closing both sets concurrently let a
+    // queue that owns its connection `quit()` under the publish, which then failed with "Connection is
+    // closed." and lost a step result on an ordinary SIGTERM. So: workers first, then queues, under
+    // ONE deadline (`closeTimeoutMs` bounds the whole close, not each phase).
+    const deadline = Date.now() + this.closeTimeoutMs;
+    const workerCloses = [
       ...[...this.taskWorkers.values()].map((w) => w.close()),
       this.resultsWorker?.close(),
       this.decisionsWorker?.close(),
       this.stepEventsWorker?.close(),
       this.startRunWorker?.close(),
       this.runRequestWorker?.close(),
-      ...[...this.queues.values()].map((q) => q.close()),
     ];
-    // `allSettled`, so one rejecting close does not mask the rest; the race bounds the whole set.
+    // `allSettled`, so one rejecting close does not mask the rest; the race bounds the phase.
     // A rejection here is not actionable during shutdown — the connections come down either way.
     await withTimeout(
-      Promise.allSettled(closers.filter((p) => p !== undefined)),
+      Promise.allSettled(workerCloses.filter((p) => p !== undefined)),
       this.closeTimeoutMs,
     );
+    // Queues are asked to close even when a worker wedged (the budget may be spent); only the wait
+    // shrinks to what is left.
+    const queueCloses = [...this.queues.values()].map((q) => q.close());
+    await withTimeout(Promise.allSettled(queueCloses), Math.max(0, deadline - Date.now()));
     this.controlPub?.disconnect();
     this.controlSub?.disconnect();
     this.heartbeatPub?.disconnect();

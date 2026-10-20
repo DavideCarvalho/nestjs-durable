@@ -99,4 +99,35 @@ describe('BullMQTransport — close() with a wedged worker', () => {
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(disconnect).toHaveBeenCalled();
   });
+
+  it('[close-shared-deadline] workers that never settle spend closeTimeoutMs once, and the queues are still asked to close', async () => {
+    const { Queue } = await import('bullmq');
+    const transport = new BullMQTransport({
+      connection,
+      pingIntervalMs: false,
+      closeTimeoutMs: 200,
+    });
+    transport.handle('some-step', async () => ({}));
+    await transport.dispatch({
+      runId: 'r',
+      seq: 0,
+      name: 's',
+      stepId: 'r:0',
+      group: 'some-step',
+      input: null,
+      attempt: 1,
+    });
+    const queue = vi.mocked(Queue).mock.results.at(-1)?.value as {
+      close: ReturnType<typeof vi.fn>;
+    };
+
+    queue.close.mockImplementation(neverSettles); // the queue wedges too, so the phase is bounded by the timer
+    const started = Date.now();
+    await transport.close();
+    const took = Date.now() - started;
+
+    expect(queue.close).toHaveBeenCalled();
+    expect(took).toBeGreaterThanOrEqual(180);
+    expect(took).toBeLessThan(330); // one budget for both phases, not two
+  });
 });

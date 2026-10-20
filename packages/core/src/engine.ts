@@ -594,6 +594,8 @@ export class WorkflowEngine {
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Set<Promise<RunResult>>();
   private draining = false;
+  /** Wait already spent on this shutdown before `drain()` (see `beginDrain`). */
+  private drainSpentMs = 0;
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
@@ -667,6 +669,7 @@ export class WorkflowEngine {
       {
         start: (workflow, input, runId, opts) => this.start(workflow, input, runId, opts),
         getRun: (runId) => this.store.getRun(runId),
+        isDraining: () => this.draining,
       },
       { namespace: this.namespace, clock: this.clock },
     );
@@ -1494,15 +1497,35 @@ export class WorkflowEngine {
   }
 
   /**
+   * Stop picking up new work without waiting: recovery, timer, schedule and timeout sweeps (and
+   * their per-run lock loops) start nothing once this is called, and {@link runOne} returns null. A
+   * poller calls it on its own shutdown so an in-flight sweep stops locking runs before it is awaited.
+   *
+   * `spentMs` is wait time ALREADY spent on this shutdown (the poller awaiting its in-flight sweep).
+   * It is deducted from the budget of a later {@link drain}, so that wait plus the drain stay within
+   * one `shutdownTimeoutMs`. Only time actually spent waiting is charged: time that merely passes
+   * between this call and `drain()` (other hooks, the HTTP server closing) never is. Calls add up.
+   */
+  beginDrain(spentMs = 0): void {
+    this.draining = true;
+    this.drainSpentMs += Math.max(0, spentMs);
+  }
+
+  /**
    * Graceful shutdown: stop picking up new runs (recovery/timer become no-ops) and wait for
    * in-flight executions to settle, up to `timeoutMs`. Call from your app's shutdown hook so a
    * deploy hands off cleanly instead of leaving runs to the lease timeout.
+   *
+   * `timeoutMs` is the total budget for waiting on in-flight runs; any wait already reported through
+   * {@link beginDrain} (`spentMs`) is deducted, so a shutdown that already waited on the timer poll
+   * for part of it waits only for the remainder. With nothing reported, the full `timeoutMs` applies.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
-    this.draining = true;
+    this.beginDrain();
+    const budget = Math.max(0, timeoutMs - this.drainSpentMs);
     if (this.inflight.size === 0) return;
     const timer = new Promise<void>((resolve) => {
-      const t = setTimeout(resolve, timeoutMs);
+      const t = setTimeout(resolve, budget);
       (t as { unref?: () => void }).unref?.();
     });
     await Promise.race([Promise.allSettled([...this.inflight]), timer]);
@@ -1540,6 +1563,7 @@ export class WorkflowEngine {
    */
   async sweepTimeouts(now: number = this.clock()): Promise<void> {
     for (const reg of new Set(this.latest.values())) {
+      if (this.draining) return;
       if (reg.executionTimeoutMs == null) continue;
       const deadline = now - reg.executionTimeoutMs;
       const inflight = [
@@ -1555,6 +1579,7 @@ export class WorkflowEngine {
         })),
       ];
       for (const run of inflight) {
+        if (this.draining) return;
         if (run.createdAt.getTime() > deadline) continue;
         const error = { message: 'execution timeout', code: 'execution_timeout' };
         await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
@@ -1579,6 +1604,7 @@ export class WorkflowEngine {
     if (this.draining) return [];
     const results: RunResult[] = [];
     for (const listed of await this.store.listIncompleteRuns(this.namespace)) {
+      if (this.draining) break;
       // An IN-PROCESS turn renews its lease, so an acquirable lease means no turn is executing this
       // run right now. Skip the ones still owned. NOTE this is NOT the same as "the worker crashed" —
       // see the dispatched-step guard below for the case it doesn't cover.
@@ -2128,6 +2154,7 @@ export class WorkflowEngine {
     if (this.draining) return []; // shutting down — don't pick up new runs
     const results: RunResult[] = [];
     for (const run of runs) {
+      if (this.draining) break; // drain began mid-batch: lock and start nothing more
       const acquired = await this.store.tryLockRun(
         run.id,
         this.instanceId,
@@ -2135,6 +2162,13 @@ export class WorkflowEngine {
         nowMs,
       );
       if (!acquired) continue;
+      if (this.draining) {
+        // Drain began while the lock was being taken. Starting the run now would hand `drain()` (which
+        // already snapshotted its in-flight set) something it will not wait for, and an exit would
+        // strand the lease until it expires. Give the lease back; the run stays for the next instance.
+        await this.store.releaseRunLock(run.id);
+        break;
+      }
       try {
         // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
         const settled = onLocked ? await onLocked(run) : undefined;
