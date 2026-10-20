@@ -1030,7 +1030,13 @@ export class BullMQTransport implements Transport, ControlPlane {
   private redis(): Redis {
     const c = this.connection;
     if (c instanceof Redis) return c.duplicate();
-    return new Redis({ keepAlive: DEFAULT_KEEPALIVE_MS, ...(c as RedisOptions) });
+    // `Omit<…, 'replyMapping'>`: ioredis 6 types that option `T | undefined` on `RedisOptions` but
+    // `T` on its constructor, which no overload accepts under `exactOptionalPropertyTypes`. Static
+    // only — a caller's value still reaches ioredis; a no-op on ioredis 5, which lacks the option.
+    return new Redis({
+      keepAlive: DEFAULT_KEEPALIVE_MS,
+      ...(c as Omit<RedisOptions, 'replyMapping'>),
+    });
   }
 
   /**

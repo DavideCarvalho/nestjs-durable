@@ -181,8 +181,14 @@ export class RedisAdmissionBackend implements AdmissionBackend {
   private subscriber?: Redis;
 
   constructor(options: RedisAdmissionOptions) {
+    // ioredis 6 declares `RedisOptions.replyMapping` as `T | undefined` but its constructor overloads
+    // as `replyMapping?: T`, so under `exactOptionalPropertyTypes` a plain `RedisOptions` matches no
+    // overload. Omitting the key only narrows the static type (a caller's value still reaches ioredis);
+    // on ioredis 5, which has no such option, the Omit is a no-op.
     this.redis = (
-      options.connection instanceof Redis ? options.connection : new Redis(options.connection)
+      options.connection instanceof Redis
+        ? options.connection
+        : new Redis(options.connection as Omit<RedisOptions, 'replyMapping'>)
     ) as RedisWithAcquire;
     this.prefix = options.prefix ?? 'durable';
     this.instanceId = options.instanceId ?? randomUUID();

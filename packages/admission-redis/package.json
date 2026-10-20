@@ -31,13 +31,13 @@
   },
   "peerDependencies": {
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
-    "ioredis": "^5.0.0"
+    "ioredis": "^5.0.0 || ^6.0.0"
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@dudousxd/nestjs-durable-testing": "workspace:^",
     "@testcontainers/redis": "10.18.0",
-    "ioredis": "5.4.2",
+    "ioredis": "6.0.0",
     "typescript": "5.9.3",
     "tsup": "8.3.5"
   },
