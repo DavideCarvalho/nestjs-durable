@@ -64,17 +64,23 @@ describe('drain stops new work', () => {
     expect((await store.getRun('r1'))?.status).toBe('running');
   });
 
-  it('[drain-deadline] drain() spends only what is left of a budget announced by beginDrain', async () => {
+  it('[drain-deadline] drain() is charged for time spent waiting on the poll, not for time that merely passes', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     engine.register('wf', '1', () => new Promise<void>(() => {})); // never finishes
     await engine.start('wf', {}, 'r1');
-    engine.beginDrain(100);
-    await new Promise((r) => setTimeout(r, 120)); // the budget is spent elsewhere (a poller wait)
 
-    const started = Date.now();
-    await engine.drain(5_000);
+    // Poller destroyed with no poll waited on: a long gap (other hooks, HTTP close) costs nothing.
+    engine.beginDrain();
+    await new Promise((r) => setTimeout(r, 150));
+    let started = Date.now();
+    await engine.drain(200);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(150); // the full 200ms budget was available
 
-    expect(Date.now() - started).toBeLessThan(1_000);
+    // Time actually spent waiting on the poll IS deducted.
+    engine.beginDrain(150);
+    started = Date.now();
+    await engine.drain(200);
+    expect(Date.now() - started).toBeLessThan(150); // only ~50ms left of the 200ms
   });
 });

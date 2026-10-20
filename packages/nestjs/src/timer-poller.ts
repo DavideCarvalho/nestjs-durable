@@ -61,20 +61,28 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
    * Nest runs every `onModuleDestroy` before any `onApplicationShutdown`, so returning here only once
    * the sweep has settled means no store call is still pending when the registrar drains and the
    * host closes its connection pool. The engine is told to stop first so a sweep working through a
-   * backlog stops locking runs instead of finishing the backlog.
+   * backlog stops locking runs instead of finishing the backlog. The time spent waiting is deducted
+   * from the later `engine.drain()`, so poll wait plus drain stay within one `shutdownTimeoutMs`.
    */
   async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.unsubscribeEnqueued?.();
-    const budget = this.options.shutdownTimeoutMs ?? 10_000;
+    // Only an operator that DRIVES the engine has a poll to wait for, and only it stops taking work
+    // here. A non-driving operator (dashboard-only, `drive: false`) keeps running whatever its
+    // finishing requests or `beforeApplicationShutdown` hooks start; `drain()` in the registrar
+    // still waits for those.
+    if (!isDrivingOperator(this.options)) return;
     // Optional call: an older core (the peer range is wide) has no `beginDrain`, and a TypeError here
-    // would reject `app.close()` on Nest 10/11 before the registrar ever drains. Always begin the
-    // drain on a driving operator so the engine's state does not depend on whether a poll was in
-    // flight. The budget is passed only when we are about to wait, so `drain()` spends what is left
-    // and the poller wait plus the drain stay within one `shutdownTimeoutMs`.
-    this.engine.beginDrain?.(this.current ? budget : undefined);
+    // would reject `app.close()` on Nest 10/11 before the registrar ever drains.
+    this.engine.beginDrain?.();
     if (!this.current) return;
-    if (await settleWithin(this.current, budget)) {
+    const budget = this.options.shutdownTimeoutMs ?? 10_000;
+    const started = Date.now();
+    const timedOut = await settleWithin(this.current, budget);
+    // Charge the drain only for the time spent waiting here, not for whatever Nest does between this
+    // hook and the registrar's drain.
+    this.engine.beginDrain?.(Date.now() - started);
+    if (timedOut) {
       console.warn(
         `[nestjs-durable] timer poll still running after ${budget}ms at shutdown; continuing (it may report store errors if the host ends its pool now)`,
       );

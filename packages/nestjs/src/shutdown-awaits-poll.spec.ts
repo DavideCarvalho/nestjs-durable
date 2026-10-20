@@ -126,3 +126,37 @@ describe('shutdown waits for the in-flight timer poll', () => {
     expect(state.afterClose).toEqual([]);
   });
 });
+
+describe('non-driving operator at shutdown', () => {
+  it('[non-driving-shutdown-run] a run started in beforeApplicationShutdown still completes', async () => {
+    const { Injectable, Inject } = await import('@nestjs/common');
+    let engineRef: WorkflowEngine | undefined;
+    @Injectable()
+    class StartsDuringShutdown {
+      constructor(@Inject(WorkflowEngine) private readonly engine: WorkflowEngine) {
+        engineRef = engine;
+      }
+      async beforeApplicationShutdown() {
+        // A non-driving operator dispatches nothing itself; work handed to it explicitly must still run.
+        await this.engine.start('shutdown-job', {}, 'late-run');
+        await this.engine.runOne('late-run');
+      }
+    }
+    const store = new InMemoryStateStore();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          store,
+          transport: new InMemoryTransport(),
+          drive: false,
+          timerPollMs: 20,
+        }),
+      ],
+      providers: [ShutdownJob, StartsDuringShutdown],
+    }).compile();
+    await moduleRef.init();
+    await moduleRef.close();
+    expect(engineRef).toBeDefined();
+    expect((await store.getRun('late-run'))?.status).toBe('completed');
+  });
+});

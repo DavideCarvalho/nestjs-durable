@@ -592,8 +592,8 @@ export class WorkflowEngine {
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Set<Promise<RunResult>>();
   private draining = false;
-  /** Absolute ms by which a drain that was announced with a budget must be done; see `beginDrain`. */
-  private drainDeadline: number | undefined;
+  /** Wait already spent on this shutdown before `drain()` (see `beginDrain`). */
+  private drainSpentMs = 0;
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
@@ -1497,29 +1497,31 @@ export class WorkflowEngine {
 
   /**
    * Stop picking up new work without waiting: recovery, timer, schedule and timeout sweeps (and
-   * their per-run lock loops) start nothing once this is called. {@link drain} calls it first; a
+   * their per-run lock loops) start nothing once this is called, and {@link runOne} returns null. A
    * poller calls it on its own shutdown so an in-flight sweep stops locking runs before it is awaited.
+   *
+   * `spentMs` is wait time ALREADY spent on this shutdown (the poller awaiting its in-flight sweep).
+   * It is deducted from the budget of a later {@link drain}, so that wait plus the drain stay within
+   * one `shutdownTimeoutMs`. Only time actually spent waiting is charged: time that merely passes
+   * between this call and `drain()` (other hooks, the HTTP server closing) never is. Calls add up.
    */
-  beginDrain(timeoutMs?: number): void {
+  beginDrain(spentMs = 0): void {
     this.draining = true;
-    // A caller that is about to WAIT (the timer poller awaiting its sweep) passes its budget so the
-    // later {@link drain} spends only what is left, keeping the whole shutdown within one deadline.
-    if (timeoutMs !== undefined && this.drainDeadline === undefined) {
-      this.drainDeadline = Date.now() + timeoutMs;
-    }
+    this.drainSpentMs += Math.max(0, spentMs);
   }
 
   /**
    * Graceful shutdown: stop picking up new runs (recovery/timer become no-ops) and wait for
    * in-flight executions to settle, up to `timeoutMs`. Call from your app's shutdown hook so a
    * deploy hands off cleanly instead of leaving runs to the lease timeout.
+   *
+   * `timeoutMs` is the total budget for waiting on in-flight runs; any wait already reported through
+   * {@link beginDrain} (`spentMs`) is deducted, so a shutdown that already waited on the timer poll
+   * for part of it waits only for the remainder. With nothing reported, the full `timeoutMs` applies.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     this.beginDrain();
-    const budget =
-      this.drainDeadline === undefined
-        ? timeoutMs
-        : Math.min(timeoutMs, Math.max(0, this.drainDeadline - Date.now()));
+    const budget = Math.max(0, timeoutMs - this.drainSpentMs);
     if (this.inflight.size === 0) return;
     const timer = new Promise<void>((resolve) => {
       const t = setTimeout(resolve, budget);

@@ -286,6 +286,10 @@ export interface BullMQTransportOptions {
    * (`if (this.closing) return this.closing`), so a later `close(true)` returns the SAME pending
    * promise rather than forcing anything. Once a graceful close wedges, the only way out is to stop
    * awaiting it and drop the sockets — which is what the timeout does.
+   *
+   * ONE budget covers the whole close: the workers close first (a job finishing during shutdown
+   * publishes through a queue, so the queues must still be open), then the queues, which get only
+   * what is left. Total wait is therefore about `closeTimeoutMs`, not twice it.
    */
   closeTimeoutMs?: number;
   /**

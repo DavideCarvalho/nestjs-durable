@@ -111,8 +111,23 @@ DurableModule.forRoot({
 });
 ```
 
-On shutdown the module calls `engine.drain(shutdownTimeoutMs)` — `shutdownTimeoutMs` defaults to
-10 000. `drain` turns recovery and the pending-run poll into no-ops, so no *new* run starts, then
+Shutdown happens in three steps, in this order (Nest runs every `onModuleDestroy` before any
+`beforeApplicationShutdown` or `onApplicationShutdown`):
+
+1. **Poller stop (driving operators only).** The timer poller stops its interval, tells the engine to
+   stop starting work (`beginDrain`), and waits for the sweep in flight, up to `shutdownTimeoutMs`.
+   Nothing it was about to lock or start is started, and no store call from the poll is pending
+   afterwards. A non-driving operator (`drive: false`, a dashboard) does none of this, so runs started
+   by its finishing requests or `beforeApplicationShutdown` hooks still execute in process. On a
+   driving operator the engine stops executing newly started runs from this point: they stay
+   `pending` for another instance's poll or the next boot.
+2. **Drain.** The module calls `engine.drain(shutdownTimeoutMs)` — `shutdownTimeoutMs` defaults to
+   10 000. Time already spent in step 1 waiting for the poll is deducted, so steps 1 and 2 together
+   take at most `shutdownTimeoutMs`; time that merely passes between them (other hooks, the HTTP
+   server closing) is not charged, and with no poll in flight `drain` gets the full timeout.
+3. **Transport close**, bounded separately by the transport's `closeTimeoutMs`.
+
+`drain` turns recovery and the pending-run poll into no-ops, so no *new* run starts, then
 waits for every currently in-flight execution to settle — up to the timeout — before returning.
 Transports are closed **after** the drain, deliberately, so an in-flight run can still dispatch to and
 await a remote step while it drains. Only after

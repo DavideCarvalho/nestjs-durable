@@ -64,7 +64,7 @@ describe('TimerPoller shutdown', () => {
     await expect(destroying).resolves.toBeUndefined();
   });
 
-  it('[poller-timeout] gives up after shutdownTimeoutMs, says so, and passes the budget to the engine', async () => {
+  it('[poller-timeout] gives up after shutdownTimeoutMs, says so, and reports the wait it spent to the engine', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const beginDrain = vi.fn();
     const { engine, release, entered } = blockingEngine({ beginDrain });
@@ -76,19 +76,30 @@ describe('TimerPoller shutdown', () => {
     await poller.onModuleDestroy();
 
     expect(Date.now() - started).toBeLessThan(1_000);
-    expect(beginDrain).toHaveBeenCalledWith(40);
+    expect(beginDrain).toHaveBeenCalledTimes(2);
+    expect(beginDrain.mock.calls[1]?.[0]).toBeGreaterThanOrEqual(30); // the wait actually spent
     expect(warn.mock.calls.flat().join(' ')).toMatch(/still running after 40ms/);
     release();
   });
 
-  it('begins the drain even when no sweep is in flight, without a budget', async () => {
+  it('begins the drain even when no sweep is in flight, charging nothing', async () => {
     const beginDrain = vi.fn();
     const { engine } = blockingEngine({ beginDrain });
     const poller = new TimerPoller(engine, opts({ timerPollMs: 0 }));
     await poller.onApplicationBootstrap();
     await poller.onModuleDestroy();
-    expect(beginDrain).toHaveBeenCalledWith(undefined);
+    expect(beginDrain).toHaveBeenCalledTimes(1);
+    expect(beginDrain).toHaveBeenCalledWith();
   });
+});
+
+it('[poller-non-driving] a non-driving operator does not begin draining', async () => {
+  const beginDrain = vi.fn();
+  const { engine } = blockingEngine({ beginDrain });
+  const poller = new TimerPoller(engine, opts({ drive: false }));
+  await poller.onApplicationBootstrap();
+  await poller.onModuleDestroy();
+  expect(beginDrain).not.toHaveBeenCalled();
 });
 
 describe('RetentionPoller shutdown', () => {
