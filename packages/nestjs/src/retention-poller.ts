@@ -13,6 +13,7 @@ import {
 } from '@nestjs/common';
 import type { DurableModuleOptions, DurableRetentionOptions } from './durable.module';
 import { isDrivingOperator } from './role';
+import { settleWithin } from './settle-within';
 
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
 const DEFAULT_BATCH_SIZE = 1_000;
@@ -83,6 +84,9 @@ function stableKey(value: unknown): string {
 export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private sweeping = false;
+  private stopping = false;
+  /** The sweep in flight, so shutdown can wait for it before the store closes. */
+  private current: Promise<void> | undefined;
 
   constructor(
     @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore | null,
@@ -123,8 +127,12 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
     }
   }
 
-  onModuleDestroy(): void {
+  /** Stop sweeping and wait for the sweep in flight (bounded by `shutdownTimeoutMs`, default 10s),
+   *  so no prune is still pending when the host closes its connection pool. */
+  async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
+    this.stopping = true;
+    if (this.current) await settleWithin(this.current, this.options.shutdownTimeoutMs ?? 10_000);
   }
 
   /**
@@ -136,8 +144,17 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
    * Pruning history is the least urgent thing this package does — a `pruneTerminalRuns` that fails
    * on a locked table must cost this sweep and nothing more.
    */
-  private async sweep(): Promise<void> {
-    if (this.sweeping) return; // never overlap two sweeps on this instance
+  private sweep(): Promise<void> {
+    if (this.sweeping) return this.current ?? Promise.resolve(); // never overlap two sweeps
+    const run = this.sweepOnce().finally(() => {
+      if (this.current === run) this.current = undefined;
+    });
+    this.current = run;
+    return run;
+  }
+
+  private async sweepOnce(): Promise<void> {
+    if (this.stopping) return;
     const retention = this.options.retention;
     const store = this.requireStore();
     const prune = store.pruneTerminalRuns;
@@ -148,6 +165,7 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
       const now = Date.now();
       for (const policy of retention.policies) {
         for (let batch = 0; batch < MAX_BATCHES_PER_POLICY; batch++) {
+          if (this.stopping) return;
           const deleted = await prune.call(store, policy, now, batchSize);
           if (deleted < batchSize) break; // backlog drained for this policy
         }

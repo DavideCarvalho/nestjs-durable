@@ -665,6 +665,7 @@ export class WorkflowEngine {
       {
         start: (workflow, input, runId, opts) => this.start(workflow, input, runId, opts),
         getRun: (runId) => this.store.getRun(runId),
+        isDraining: () => this.draining,
       },
       { namespace: this.namespace, clock: this.clock },
     );
@@ -1493,12 +1494,21 @@ export class WorkflowEngine {
   }
 
   /**
+   * Stop picking up new work without waiting: recovery, timer, schedule and timeout sweeps (and
+   * their per-run lock loops) start nothing once this is called. {@link drain} calls it first; a
+   * poller calls it on its own shutdown so an in-flight sweep stops locking runs before it is awaited.
+   */
+  beginDrain(): void {
+    this.draining = true;
+  }
+
+  /**
    * Graceful shutdown: stop picking up new runs (recovery/timer become no-ops) and wait for
    * in-flight executions to settle, up to `timeoutMs`. Call from your app's shutdown hook so a
    * deploy hands off cleanly instead of leaving runs to the lease timeout.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
-    this.draining = true;
+    this.beginDrain();
     if (this.inflight.size === 0) return;
     const timer = new Promise<void>((resolve) => {
       const t = setTimeout(resolve, timeoutMs);
@@ -1539,6 +1549,7 @@ export class WorkflowEngine {
    */
   async sweepTimeouts(now: number = this.clock()): Promise<void> {
     for (const reg of new Set(this.latest.values())) {
+      if (this.draining) return;
       if (reg.executionTimeoutMs == null) continue;
       const deadline = now - reg.executionTimeoutMs;
       const inflight = [
@@ -1554,6 +1565,7 @@ export class WorkflowEngine {
         })),
       ];
       for (const run of inflight) {
+        if (this.draining) return;
         if (run.createdAt.getTime() > deadline) continue;
         const error = { message: 'execution timeout', code: 'execution_timeout' };
         await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
@@ -1578,6 +1590,7 @@ export class WorkflowEngine {
     if (this.draining) return [];
     const results: RunResult[] = [];
     for (const listed of await this.store.listIncompleteRuns(this.namespace)) {
+      if (this.draining) break;
       // An IN-PROCESS turn renews its lease, so an acquirable lease means no turn is executing this
       // run right now. Skip the ones still owned. NOTE this is NOT the same as "the worker crashed" —
       // see the dispatched-step guard below for the case it doesn't cover.
@@ -2108,6 +2121,7 @@ export class WorkflowEngine {
     if (this.draining) return []; // shutting down — don't pick up new runs
     const results: RunResult[] = [];
     for (const run of runs) {
+      if (this.draining) break; // drain began mid-batch: lock and start nothing more
       const acquired = await this.store.tryLockRun(
         run.id,
         this.instanceId,

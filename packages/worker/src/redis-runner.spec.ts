@@ -336,3 +336,44 @@ describe('runRedisWorker — announcing what this worker can execute (handshake 
     );
   });
 });
+
+describe('runRedisWorker — close() while the control subscriber is still connecting', () => {
+  it('[close-during-subscribe] raises no unhandled rejection from the queued control subscribe', async () => {
+    const fake = makeFakeDeps();
+    // Reproduce ioredis: a subscribe queued before the connection is ready rejects on disconnect.
+    class QueuedSubscribeRedis {
+      duplicate() {
+        let reject: (e: Error) => void = () => {};
+        const queued = new Promise<void>((_, r) => {
+          reject = r;
+        });
+        return {
+          subscribe: () => queued,
+          on: () => {},
+          disconnect: () => reject(new Error('Connection is closed.')),
+        };
+      }
+      async set() {}
+      async publish() {}
+      on() {}
+      disconnect() {}
+    }
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on('unhandledRejection', onRejection);
+    try {
+      const runtime = new DurableWorkerRuntime();
+      runtime.registerWorkflow('wf', async () => 1);
+      const runner = await runRedisWorker({
+        runtime,
+        connection: {},
+        deps: { ...fake.deps, Redis: QueuedSubscribeRedis as unknown as RunnerDeps['Redis'] },
+      });
+      await runner.close();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(rejections.map(String)).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+});

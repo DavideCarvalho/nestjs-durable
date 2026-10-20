@@ -355,7 +355,10 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       const base = new deps.Redis(connection);
       // Subscribe blocks the client, so use a dedicated (duplicated) connection for it.
       controlSub = base.duplicate();
-      void controlSub.subscribe(controlChannel(prefix));
+      // Best-effort like the rest of this block. The subscribe is queued until the connection is
+      // ready and ioredis rejects it with "Connection is closed." if `close()` disconnects first;
+      // unhandled, that rejection would terminate the process.
+      void Promise.resolve(controlSub.subscribe(controlChannel(prefix))).catch(() => {});
       controlSub.on('message', (_channel, payload) => {
         try {
           const msg = JSON.parse(payload) as { kind?: string; runId?: string };

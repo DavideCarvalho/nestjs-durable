@@ -370,6 +370,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   // iterates this set. PUBLISH-only connections (`controlPub`, `heartbeatPub`, …) are never added:
   // they actively write, so a dead connection surfaces on their next `publish()` instead of silently.
   private readonly subscribers = new Set<Redis>();
+  /** Set when `close()` begins; a subscribe rejected after that is the expected disconnect. */
+  private closed = false;
   private pingWatchdogTimer?: ReturnType<typeof setInterval>;
   private readonly pingIntervalMs: number | false;
   private readonly closeTimeoutMs: number;
@@ -986,7 +988,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
     if (this.heartbeatSub) return; // one subscription per transport
     this.heartbeatSub = this.subscriberRedis();
-    void this.heartbeatSub.subscribe(this.heartbeatChannel());
+    this.subscribeQuietly(this.heartbeatSub, this.heartbeatChannel());
     this.heartbeatSub.on('message', (_channel, payload) => {
       try {
         void handler(JSON.parse(payload) as Heartbeat);
@@ -1050,6 +1052,22 @@ export class BullMQTransport implements Transport, ControlPlane {
     const sub = this.redis();
     this.trackSubscriber(sub);
     return sub;
+  }
+
+  /**
+   * Subscribe without leaving the returned promise unhandled. ioredis queues a `subscribe` issued
+   * before the connection is ready and rejects it with "Connection is closed." when `close()`
+   * disconnects first, which would otherwise surface as an `unhandledRejection` (fatal under Node's
+   * default policy). A rejection after closing began is expected and dropped; any other is logged,
+   * and the reconnect path resubscribes on its own.
+   */
+  private subscribeQuietly(sub: Redis, channel: string): void {
+    sub.subscribe(channel).catch((err: unknown) => {
+      if (this.closed || sub.status === 'end') return;
+      console.warn(
+        `[nestjs-durable] subscribe to ${channel} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
   }
 
   /**
@@ -1136,7 +1154,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   onControl(handler: (msg: ControlMessage) => void): void {
     if (this.controlSub) return; // one subscription per transport
     this.controlSub = this.subscriberRedis();
-    void this.controlSub.subscribe(this.controlChannel());
+    this.subscribeQuietly(this.controlSub, this.controlChannel());
     this.controlSub.on('message', (_channel, payload) => {
       try {
         handler(JSON.parse(payload) as ControlMessage);
@@ -1194,7 +1212,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   onRunReply(handler: (reply: RunReply) => void): void {
     if (this.runReplySub) return; // one subscription per transport
     this.runReplySub = this.subscriberRedis();
-    void this.runReplySub.subscribe(this.runReplyChannel());
+    this.subscribeQuietly(this.runReplySub, this.runReplyChannel());
     this.runReplySub.on('message', (_channel, payload) => {
       try {
         handler(JSON.parse(payload) as RunReply);
@@ -1218,7 +1236,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     const channel = this.tenantEventChannel(tenant);
     const sub = this.subscriberRedis();
     this.tenantEventSubs.add(sub);
-    void sub.subscribe(channel);
+    this.subscribeQuietly(sub, channel);
     sub.on('message', (_channel, payload) => {
       try {
         handler(JSON.parse(payload) as TenantEvent);
@@ -1229,7 +1247,8 @@ export class BullMQTransport implements Transport, ControlPlane {
     return () => {
       this.tenantEventSubs.delete(sub);
       this.subscribers.delete(sub);
-      void sub.unsubscribe(channel);
+      // The disconnect right after rejects an unsubscribe still queued on a connecting socket.
+      sub.unsubscribe(channel).catch(() => {});
       sub.disconnect();
     };
   }
@@ -1256,6 +1275,7 @@ export class BullMQTransport implements Transport, ControlPlane {
    * what is dropped is a worker that is not going to come back on its own regardless.
    */
   async close(): Promise<void> {
+    this.closed = true;
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
     if (this.pingWatchdogTimer) clearInterval(this.pingWatchdogTimer);
     this.subscribers.clear();

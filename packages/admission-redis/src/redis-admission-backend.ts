@@ -179,6 +179,7 @@ export class RedisAdmissionBackend implements AdmissionBackend {
   private readonly configs = new Map<string, QueueConfig>();
   private readonly heartbeat: ReturnType<typeof setInterval>;
   private subscriber?: Redis;
+  private closed = false;
 
   constructor(options: RedisAdmissionOptions) {
     // ioredis 6 declares `RedisOptions.replyMapping` as `T | undefined` but its constructor overloads
@@ -272,12 +273,21 @@ export class RedisAdmissionBackend implements AdmissionBackend {
     // A subscriber connection can't run normal commands, so use a dedicated dup of the connection.
     const sub = this.redis.duplicate();
     this.subscriber = sub;
-    void sub.subscribe(this.freedChannel());
+    // ioredis queues this until the connection is ready and rejects it with "Connection is closed."
+    // if `close()` disconnects first; that is expected, any other failure is only logged because the
+    // retry tick, not this notification, is what guarantees a waiter re-contends.
+    sub.subscribe(this.freedChannel()).catch((err: unknown) => {
+      if (this.closed) return;
+      console.warn(
+        `[nestjs-durable] admission freed-channel subscribe failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
     sub.on('message', (_channel, queue) => handler(queue));
   }
 
   /** Stop the liveness heartbeat + subscriber (held slots lapse within `instanceTtlMs`). */
   async close(): Promise<void> {
+    this.closed = true;
     clearInterval(this.heartbeat);
     this.subscriber?.disconnect();
   }

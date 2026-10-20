@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import type { DurableModuleOptions } from './durable.module';
 import { isDrivingOperator } from './role';
+import { settleWithin } from './settle-within';
 
 /**
  * Resumes suspended runs whose durable timer (`ctx.sleep`) is due, and fires any configured
@@ -22,6 +23,8 @@ import { isDrivingOperator } from './role';
 export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private polling = false;
+  /** The sweep in flight, so shutdown can wait for it instead of racing the store's close. */
+  private current: Promise<void> | undefined;
   private unsubscribeEnqueued?: () => void;
 
   constructor(
@@ -53,9 +56,19 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     }
   }
 
-  onModuleDestroy(): void {
+  /**
+   * Stop polling and wait for the sweep in flight (bounded by `shutdownTimeoutMs`, default 10s).
+   * Nest runs every `onModuleDestroy` before any `onApplicationShutdown`, so returning here only once
+   * the sweep has settled means no store call is still pending when the registrar drains and the
+   * host closes its connection pool. The engine is told to stop first so a sweep working through a
+   * backlog stops locking runs instead of finishing the backlog.
+   */
+  async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.unsubscribeEnqueued?.();
+    if (!this.current) return;
+    this.engine.beginDrain();
+    await settleWithin(this.current, this.options.shutdownTimeoutMs ?? 10_000);
   }
 
   /**
@@ -73,10 +86,19 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
    * `recoverIncomplete` says nothing about whether durable timers should still fire, and skipping
    * the rest of the tick would silently widen one subsystem's outage into all of them.
    */
-  private async poll(): Promise<void> {
-    if (this.polling) return; // never overlap two sweeps
+  private poll(): Promise<void> {
+    if (this.polling) return this.current ?? Promise.resolve(); // never overlap two sweeps
     this.polling = true;
-    try {
+    const run = this.pollOnce().finally(() => {
+      this.polling = false;
+      if (this.current === run) this.current = undefined;
+    });
+    this.current = run;
+    return run;
+  }
+
+  private async pollOnce(): Promise<void> {
+    {
       // Pick up runs enqueued elsewhere (an API pod's `start`, or another worker) still `pending`,
       // reclaim runs orphaned by a crashed worker (lease expired — a live worker renews its lease so
       // only dead ones are reclaimed), then resume due timers and sweep execution timeouts.
@@ -91,8 +113,6 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
       if (this.options.persistedSchedules) {
         await this.sweep('persistedSchedules', () => this.engine.schedules.tick());
       }
-    } finally {
-      this.polling = false;
     }
   }
 
