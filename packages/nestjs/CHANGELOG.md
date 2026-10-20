@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.46.1
+
+### Patch Changes
+
+- [#356](https://github.com/DavideCarvalho/nestjs-durable/pull/356) [`dbe222d`](https://github.com/DavideCarvalho/nestjs-durable/commit/dbe222de4ac8be195ac9bfd7049e4af3169abaa0) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Shutdown now waits for the in-flight timer/retention poll. `TimerPoller` and `RetentionPoller` await their current sweep in `onModuleDestroy`, bounded by `shutdownTimeoutMs` (default 10s) and logging when the bound wins. On a driving operator the timer poller also calls `beginDrain`, so from module destroy the engine starts no new runs in process (they stay pending for the next poll or boot); a non-driving operator is unchanged and still runs work started during shutdown. The wait the poller actually spent is deducted from the registrar's `engine.drain()`, so poll wait plus drain stay within one `shutdownTimeoutMs`; time passing between the two (other hooks, HTTP close) is not charged. Core adds `WorkflowEngine.beginDrain(spentMs?)` and an optional `ScheduleHost.isDraining()`; `resumeLeased`, `recoverIncomplete`, `sweepTimeouts` and `schedules.tick` stop starting work once draining, and `resumeLeased` releases a lease taken as drain began. nestjs calls `beginDrain` optionally, so it still works against an older core.
+
 ## 0.46.0
 
 ### Minor Changes
