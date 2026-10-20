@@ -43,8 +43,8 @@
   },
   "peerDependencies": {
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
-    "bullmq": "^5.0.0",
-    "ioredis": "^5.0.0"
+    "bullmq": "^5.0.0 || ^6.0.0",
+    "ioredis": "^5.0.0 || ^6.0.0"
   },
   "peerDependenciesMeta": {
     "bullmq": {
@@ -56,8 +56,8 @@
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
-    "bullmq": "5.34.10",
-    "ioredis": "5.4.2",
+    "bullmq": "6.3.17",
+    "ioredis": "6.0.0",
     "typescript": "5.9.3",
     "vitest": "2.1.9",
     "tsup": "8.3.5"
