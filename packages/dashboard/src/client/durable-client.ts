@@ -250,6 +250,14 @@ export function deriveRunState(
   // Detail view: the timeline says exactly what's in flight — a step, a signal wait, or a sleep.
   const pending = ctx.timeline?.find((s) => s.status === 'pending' || s.status === 'running');
   if (pending) {
+    // The run failed and handed its failure to an onError handler, whose name the waiter's input holds.
+    if (pending.name === `signal:child:${run.id}.onError`) {
+      const handler = (pending.input as { workflow?: unknown } | undefined)?.workflow;
+      return {
+        status: 'awaiting',
+        detail: typeof handler === 'string' ? `failure handler ${handler}` : 'failure handler',
+      };
+    }
     if (pending.kind === 'signal') return { status: 'awaiting', detail: tokenDetail(pending.name) };
     if (pending.kind === 'sleep') return { status: 'sleeping' };
     // A remote/local step in flight — its job is enqueued, so if that queue is stalled (backlog, no

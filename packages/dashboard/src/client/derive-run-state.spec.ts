@@ -234,6 +234,20 @@ describe('deriveRunState', () => {
       expect(s.detail).toBe('webhook wh:r1:0');
     });
 
+    it('a run waiting on its onError handler names the handler', () => {
+      const timeline = [
+        step({ kind: 'signal', name: 'validate', status: 'failed' }),
+        step({
+          kind: 'signal',
+          name: `signal:child:${run().id}.onError`,
+          status: 'running',
+          input: { workflow: 'line.onError.invalid', input: {} },
+        }),
+      ];
+      const s = deriveRunState(run(), { runs: [], health: withWorker, timeline });
+      expect(s).toEqual({ status: 'awaiting', detail: 'failure handler line.onError.invalid' });
+    });
+
     it('a pending sleep checkpoint reads sleeping', () => {
       const timeline = [step({ kind: 'sleep', name: 'sleep', status: 'pending' })];
       expect(deriveRunState(run(), { runs: [], health: withWorker, timeline }).status).toBe(
