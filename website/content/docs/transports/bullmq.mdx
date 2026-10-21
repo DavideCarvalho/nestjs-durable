@@ -46,6 +46,11 @@ queues (the BullMQ `Worker`'s own concurrency). It takes three forms:
 - `{ mode: 'adaptive', ... }` — adaptive with overrides (`min`, `max`, `start`, `ramCeilingPct`,
   `cpuCeilingPct`, `tickMs`).
 
+A number that is not finite or is out of range falls back to its default: a fixed value, `min`,
+`max`, `start` or `tickMs` below 1 (or `NaN`, `Infinity`) uses the default, and so does a
+`ramCeilingPct` of 0 or less. A bad `cpuCeilingPct` turns the CPU ceiling off. A fractional count
+is rounded down.
+
 Watch an adaptive worker breathe — spike the load and it grows into its headroom; fire the RAM
 brake and it backs off before memory melts:
 

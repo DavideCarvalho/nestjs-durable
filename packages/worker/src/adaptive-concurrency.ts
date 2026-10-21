@@ -59,27 +59,42 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+/** `value` floored when it is a finite number of at least 1, else `fallback`. */
+function wholeAtLeastOne(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+/** `value` when it is a finite number above 0, else `fallback`. */
+function finitePositive<T>(value: number | undefined, fallback: T): number | T {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 /**
  * Normalise a {@link ConcurrencyOption} into a {@link ResolvedConcurrency}: a bare number (or
  * `undefined` → 1) becomes `{ mode:'fixed', fixed }`; `'adaptive'` / `{ mode:'adaptive', ... }`
  * become `{ mode:'adaptive', adaptive }` with every default from the spec applied and `start`
  * clamped into `[min,max]`.
+ *
+ * A non-finite or out-of-range number falls back to its default (a bad `cpuCeilingPct` turns the
+ * CPU ceiling off): BullMQ throws on a `NaN` or sub-1 concurrency, a `NaN` ceiling never brakes, and
+ * a `NaN` `tickMs` makes the control loop fire every millisecond.
  */
 export function resolveConcurrency(opt?: ConcurrencyOption): ResolvedConcurrency {
   if (opt === undefined) return { mode: 'fixed', fixed: 1 };
-  if (typeof opt === 'number') return { mode: 'fixed', fixed: opt };
+  if (typeof opt === 'number') return { mode: 'fixed', fixed: wholeAtLeastOne(opt, 1) };
 
   const overrides: AdaptiveConcurrencyOptions = opt === 'adaptive' ? {} : opt;
-  const min = overrides.min ?? DEFAULT_MIN;
-  const max = Math.max(min, overrides.max ?? DEFAULT_MAX);
-  const start = clamp(overrides.start ?? min, min, max);
+  const min = wholeAtLeastOne(overrides.min, DEFAULT_MIN);
+  const max = Math.max(min, wholeAtLeastOne(overrides.max, DEFAULT_MAX));
+  const start = clamp(wholeAtLeastOne(overrides.start, min), min, max);
+  const cpuCeilingPct = finitePositive(overrides.cpuCeilingPct, undefined);
   const adaptive: AdaptiveConfig = {
     min,
     max,
     start,
-    ramCeilingPct: overrides.ramCeilingPct ?? DEFAULT_RAM_CEILING_PCT,
-    tickMs: overrides.tickMs ?? DEFAULT_TICK_MS,
-    ...(overrides.cpuCeilingPct !== undefined ? { cpuCeilingPct: overrides.cpuCeilingPct } : {}),
+    ramCeilingPct: finitePositive(overrides.ramCeilingPct, DEFAULT_RAM_CEILING_PCT),
+    tickMs: wholeAtLeastOne(overrides.tickMs, DEFAULT_TICK_MS),
+    ...(cpuCeilingPct !== undefined ? { cpuCeilingPct } : {}),
   };
   return { mode: 'adaptive', adaptive };
 }
