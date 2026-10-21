@@ -515,6 +515,8 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         'earliest',
         'middle',
       ]);
+    });
+
     t('countCheckpoints counts a seq range by status', async () => {
       if (!store.countCheckpoints) return;
       await store.createRun(run());
