@@ -19,6 +19,24 @@ export function allGroup(firstSeq: number, mode: 'waitAll' | 'failFast'): string
   return mode === 'failFast' ? `all:${firstSeq}:failFast` : `all:${firstSeq}`;
 }
 
+/**
+ * The `parallelGroup` of a step fan (`ctx.all` over a `@Step`). It carries the fan's position block,
+ * so the engine's join barrier can tell from any one step's checkpoint which steps it waits on.
+ */
+export function stepFanGroup(firstSeq: number, size: number, mode: 'waitAll' | 'failFast'): string {
+  const group = `steps:${firstSeq}:${size}`;
+  return mode === 'failFast' ? `${group}:failFast` : group;
+}
+
+/** The position block a {@link stepFanGroup} names, or undefined for any other group. */
+export function parseStepFanGroup(
+  group: string | undefined,
+): { firstSeq: number; size: number } | undefined {
+  const m = group ? /^steps:(\d+):(\d+)(?::failFast)?$/.exec(group) : null;
+  if (!m) return undefined;
+  return { firstSeq: Number(m[1]), size: Number(m[2]) };
+}
+
 /** The waiter and checkpoint name prefixes shared by a fan's children, or one wave's. */
 export function allWait(runId: string, firstSeq: number, wave?: number): FanWait {
   const base = allBase(runId, firstSeq, wave);

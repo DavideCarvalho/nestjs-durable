@@ -139,6 +139,20 @@ one child fails. If you need to start the batch, do other work, and join later (
 waiting immediately), fan out with `ctx.startChild` per item and join each with `ctx.child` using
 the same id instead — see [Child workflows](/docs/authoring/child-workflows) for both forms.
 
+When an item is just one step rather than a workflow of its own, pass the `@Step` reference
+instead of a workflow. Each input becomes one durable step instead of a child run, which is far
+cheaper for a large batch:
+
+```ts
+// One processRecord step per record, at most 500 in flight. The workflow wakes once per settled
+// wave, not once per record, and the dashboard shows the steps as one fan.
+const results = await ctx.all(this.records.processRecord, batch.records, { concurrency: 500 });
+```
+
+The same `mode`, `concurrency` and `GatherError` apply. Every step of the fan uses the `@Step`'s
+retry policy (or the per-call `retries` / `backoff` you pass). A flow-control `queue` and a liveness
+`timeoutMs` are not supported on a step fan.
+
 ## 4. Cron digest
 
 **Problem:** send a weekly summary email on a fixed calendar schedule, with no risk of double-firing

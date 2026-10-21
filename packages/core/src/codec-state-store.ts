@@ -71,6 +71,13 @@ export class CodecStateStore implements StateStore {
   /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it, so the engine's
    *  plain-save fallback still kicks in through the wrapper. */
   readonly saveCheckpointIfPending?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  /** Forwarded verbatim — a count reads no payload. Bound only when the inner store has it. */
+  readonly countCheckpoints?: (
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ) => Promise<number>;
 
   /** Forwarded verbatim — retention selects by status/updatedAt/scope, never by payload. Bound only
    *  when the inner store prunes, so the retention poller still sees (and warns about) its absence. */
@@ -119,6 +126,10 @@ export class CodecStateStore implements StateStore {
     const saveIfPending = inner.saveCheckpointIfPending;
     if (saveIfPending)
       this.saveCheckpointIfPending = (cp) => saveIfPending.call(inner, this.encCp(cp));
+    const countCps = inner.countCheckpoints;
+    if (countCps)
+      this.countCheckpoints = (runId, from, to, statuses) =>
+        countCps.call(inner, runId, from, to, statuses);
     const prune = inner.pruneTerminalRuns;
     if (prune)
       this.pruneTerminalRuns = (policy, now, limit) => prune.call(inner, policy, now, limit);

@@ -605,6 +605,20 @@ export interface StateStore {
    * plus an in-JS prefix scan that produces the identical result.
    */
   listCheckpointsByNamePrefix?(runId: string, prefixes: string[]): Promise<StepCheckpoint[]>;
+  /**
+   * How many of the run's checkpoints with `fromSeq <= seq <= toSeq` have one of `statuses`. The join
+   * barrier of a step fan (`ctx.all` over a `@Step`) asks this on every result — "is any step of the
+   * fan still `pending`?" — so it must be a count, not a load of the fan.
+   *
+   * Optional: a store that omits it still works — the engine falls back to {@link listCheckpoints}
+   * and counts in JS, which loads the whole run on every result of a fan.
+   */
+  countCheckpoints?(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<number>;
 }
 
 /**
@@ -942,6 +956,22 @@ export interface AllOptions {
    *
    * Part of the fan's identity: child ids carry the wave, so changing it for an in-flight run is a
    * non-deterministic change like changing `inputs`.
+   */
+  concurrency?: number;
+}
+
+/**
+ * Options for `ctx.all` over a `@Step` — one durable step per input instead of one child workflow
+ * per input. The per-call step policy (`retries`, `backoff`, …) applies to every step of the fan.
+ * Flow-control `queue`s and a liveness `timeoutMs` are not supported on a fan.
+ */
+export interface AllStepsOptions extends Omit<StepDispatchOpts, 'queue' | 'timeoutMs'> {
+  /** `waitAll` (default) or `failFast` — see {@link WorkflowCtx.all}. */
+  mode?: 'waitAll' | 'failFast';
+  /**
+   * The most steps in flight at once. Unset sends the whole fan immediately. When set, steps go out
+   * in waves of `concurrency`, the next once the previous has settled; each wave costs the parent one
+   * turn. Part of the fan's identity, like `inputs`.
    */
   concurrency?: number;
 }
@@ -1872,6 +1902,18 @@ export interface WorkflowCtx<A extends SearchAttributes = SearchAttributes> {
     inputs: WorkflowInputOf<C>[],
     opts?: AllOptions,
   ): Promise<WorkflowOutputOf<C>[]>;
+  /**
+   * Run one durable **step** per entry in `inputs` in parallel and wait for all of them — the same
+   * fan as above with a `@Step` instead of a child workflow, so each item costs a step instead of a
+   * whole run. The steps share a `parallelGroup` (the dashboard renders them as one fan), the parent
+   * replays once per settled wave rather than once per result, and outputs come back in input order;
+   * failures surface as a {@link GatherError}, like the child fan.
+   */
+  all<TInput, TOutput>(
+    step: StepRef<TInput, TOutput>,
+    inputs: TInput[],
+    opts?: AllStepsOptions,
+  ): Promise<TOutput[]>;
   all<TOutput = unknown>(
     workflow: string,
     inputs: unknown[],
