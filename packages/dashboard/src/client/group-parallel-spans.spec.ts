@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { FanSummary, StepCheckpoint } from './durable-client.js';
-import { fanProgress, fanStatus, groupParallelSpans } from './group-parallel-spans.js';
+import {
+  fanProgress,
+  fanSizeLabel,
+  fanStatus,
+  groupParallelSpans,
+  runFinished,
+} from './group-parallel-spans.js';
 
 function cp(over: Partial<StepCheckpoint> = {}): StepCheckpoint {
   return {
@@ -159,6 +165,7 @@ function fan(over: Partial<FanSummary> = {}): FanSummary {
     firstSeq: 1,
     lastSeq: 40000,
     size: 40000,
+    failFast: false,
     counts: { completed: 40000 },
     failures: [],
     ...over,
@@ -225,7 +232,11 @@ describe('fanProgress / fanStatus', () => {
       failed: 2,
       running: 0,
       pending: 0,
-      size: 5,
+      interrupted: 0,
+      notStarted: 0,
+      skipped: 0,
+      started: 5,
+      total: 5,
     });
   });
 
@@ -234,5 +245,40 @@ describe('fanProgress / fanStatus', () => {
     expect(fanStatus(fan({ counts: { completed: 1, pending: 1 } }))).toBe('pending');
     expect(fanStatus(fan({ counts: { completed: 1, failed: 1 } }))).toBe('failed');
     expect(fanStatus(fan({ counts: { completed: 2 } }))).toBe('completed');
+  });
+
+  it('counts the members a live run has not started yet, and stays in flight for them', () => {
+    const waves = fan({ size: 500, total: 40000, notStarted: 39500, counts: { completed: 500 } });
+    const p = fanProgress(waves);
+    expect(p).toMatchObject({ completed: 500, notStarted: 39500, skipped: 0, total: 40000 });
+    expect(fanStatus(waves)).toBe('pending');
+    expect(fanSizeLabel(p)).toBe('500 of 40000');
+  });
+
+  it('once the run finished, still-running members are interrupted and the rest never ran', () => {
+    const stopped = fan({
+      size: 600,
+      total: 40000,
+      notStarted: 39400,
+      failFast: true,
+      counts: { completed: 580, failed: 1, running: 19 },
+    });
+    const p = fanProgress(stopped, true);
+    expect(p).toMatchObject({ running: 0, interrupted: 19, notStarted: 0, skipped: 39400 });
+    expect(fanStatus(stopped, true)).toBe('failed');
+    expect(fanSizeLabel(p)).toBe('600 of 40000');
+  });
+
+  it('shows ×N for a fan that ran whole, or whose group does not carry a size', () => {
+    expect(fanSizeLabel(fanProgress(fan({ size: 3000, total: 3000 })))).toBe('×3000');
+    expect(fanSizeLabel(fanProgress(fan({ size: 3000 })))).toBe('×3000');
+  });
+});
+
+describe('runFinished', () => {
+  it('is false while the run can still start or finish a member', () => {
+    for (const s of ['pending', 'running', 'suspended', 'cancelling'])
+      expect(runFinished(s)).toBe(false);
+    for (const s of ['completed', 'failed', 'cancelled', 'dead']) expect(runFinished(s)).toBe(true);
   });
 });

@@ -18,3 +18,6 @@ The console handles runs with wide fans. For a 40,000-member fan, a run's detail
   - No child detail is fetched for a summarized fan, and other child fetches are capped at 50.
   - The header lists 12 child chips plus `+N more`.
   - Live events refetch at most every 1.5s, and the graph layout is memoized.
+- **A fan's declared size.** A child fan's `parallelGroup` now carries its size (`all:<seq>:n<size>[:failFast]`, still read in its old form), as a step fan's already did. `FanSummary` adds `total`, `notStarted` and `failFast`, and a fan declared wider than the threshold is summarized even when only a few of its members have started. The console shows `started of total`:
+  - while the run is live, the members not sent yet (waves under `concurrency`) are **not started**;
+  - once it has finished, members still running are **interrupted** and the rest **never ran**, marked `(failFast)` when that is why.

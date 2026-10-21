@@ -6,9 +6,16 @@ import type { FanSummary, RunDetail, StepCheckpoint, WorkflowRun } from '../clie
 import { durableClient, isStalePending } from '../client/durable-client';
 import { FAN_PAGE_SIZE, fanPagesInView } from '../client/fan-pages';
 import { stepDisplayName } from '../client/folded-children';
-import { fanProgress, fanStatus, groupParallelSpans } from '../client/group-parallel-spans';
+import {
+  fanProgress,
+  fanSizeLabel,
+  fanStatus,
+  groupParallelSpans,
+  runFinished,
+} from '../client/group-parallel-spans';
 import { groupSubProcesses } from '../client/group-subprocesses';
 import { childDetailIds, childFallbackLabel, childRunIdOf, detailsById } from './child-link';
+import { FAN_PROGRESS_SEGMENTS } from './fan-progress-style';
 import { ChildIcon, iconFor } from './icons';
 import { stalePendingView } from './stale-liveness';
 
@@ -415,13 +422,6 @@ type RowProps = Omit<React.ComponentProps<typeof StepRow>, 'row'>;
 /** A member row's height before it is measured (a row grows when its sub-processes show). */
 const MEMBER_ROW_PX = 28;
 
-const PROGRESS_SEGMENTS = [
-  { key: 'completed', className: 'bg-emerald-500/60', text: 'text-emerald-300', label: 'done' },
-  { key: 'failed', className: 'bg-red-500/70', text: 'text-red-300', label: 'failed' },
-  { key: 'running', className: 'bg-live/70', text: 'text-live', label: 'running' },
-  { key: 'pending', className: 'bg-zinc-600/60', text: 'text-zinc-400', label: 'pending' },
-] as const;
-
 /**
  * A fan too wide to list, drawn from its {@link FanSummary}: a header with its size and time span, a
  * per-status progress bar, the server's sample of failed members as ordinary rows, and on demand the
@@ -438,8 +438,9 @@ function SummarizedFan({
 }) {
   const [open, setOpen] = useState(false);
   const [failedOnly, setFailedOnly] = useState(false);
-  const progress = fanProgress(fan);
-  const status = fanStatus(fan);
+  const done = runFinished(rowProps.run.status);
+  const progress = fanProgress(fan, done);
+  const status = fanStatus(fan, done);
   const inFlight = status === 'running' || status === 'pending';
   const runLive = rowProps.run.status === 'running' || rowProps.run.status === 'suspended';
   const start = fan.startedAt ? new Date(fan.startedAt).getTime() : undefined;
@@ -460,7 +461,7 @@ function SummarizedFan({
             type="button"
             onClick={() => setOpen((v) => !v)}
             className="shrink-0 text-zinc-500 transition-colors hover:text-zinc-300"
-            title={open ? 'Hide the members' : `List all ${fan.size} members`}
+            title={open ? 'Hide the members' : `List the ${fan.size} members started`}
           >
             <span
               className="inline-block transition-transform"
@@ -476,7 +477,7 @@ function SummarizedFan({
             className={`truncate text-[12px] ${status === 'failed' ? 'text-red-400' : 'text-zinc-300'}`}
             title={fan.group}
           >
-            {fan.label} ×{fan.size}
+            {fan.label} ×{progress.total}
           </span>
         </span>
         <span className="relative h-5">
@@ -508,21 +509,25 @@ function SummarizedFan({
       </div>
       <div className="flex items-center gap-3 px-2 pb-1.5 pl-[26px]">
         <span className="flex h-1.5 w-40 shrink-0 overflow-hidden rounded-full bg-zinc-800">
-          {PROGRESS_SEGMENTS.map((seg) =>
+          {FAN_PROGRESS_SEGMENTS.map((seg) =>
             progress[seg.key] > 0 ? (
               <span
                 key={seg.key}
                 className={seg.className}
-                style={{ width: `${(progress[seg.key] / Math.max(progress.size, 1)) * 100}%` }}
+                style={{ width: `${(progress[seg.key] / Math.max(progress.total, 1)) * 100}%` }}
               />
             ) : null,
           )}
         </span>
         <span className="mono tnum flex flex-wrap gap-2 text-[10px]">
-          {PROGRESS_SEGMENTS.map((seg) =>
+          {progress.started < progress.total && (
+            <span className="text-zinc-400">{fanSizeLabel(progress)} started</span>
+          )}
+          {FAN_PROGRESS_SEGMENTS.map((seg) =>
             progress[seg.key] > 0 ? (
               <span key={seg.key} className={seg.text}>
                 {progress[seg.key]} {seg.label}
+                {seg.key === 'skipped' && fan.failFast ? ' (failFast)' : ''}
               </span>
             ) : null,
           )}

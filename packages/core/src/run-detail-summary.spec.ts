@@ -118,3 +118,35 @@ describe('pageFan', () => {
     expect(page.items[0]?.seq).toBe(0);
   });
 });
+
+describe('a fan whose size its group declares', () => {
+  it('counts the members not started yet, and summarizes a fan sent in small waves', () => {
+    // 30 of 40.000 sent so far (concurrency 30): narrow in rows, wide by declaration.
+    const sent = Array.from({ length: 30 }, (_, i) =>
+      cp(i, { parallelGroup: 'steps:0:40000', status: i < 10 ? 'completed' : 'pending' }),
+    );
+    const { fans, timeline } = summarizeTimeline(sent, 50);
+    expect(timeline).toEqual([]);
+    expect(fans[0]).toMatchObject({ size: 30, total: 40000, notStarted: 39970, failFast: false });
+  });
+
+  it('reads the size and the failFast mark off a child fan group, and tolerates the old one', () => {
+    const member = (group: string) =>
+      cp(0, {
+        name: 'signal:child:p.all.0.0',
+        kind: 'signal',
+        parallelGroup: group,
+        output: { ok: true },
+      });
+    expect(summarizeTimeline([member('all:0:n3000:failFast')], 0).fans[0]).toMatchObject({
+      total: 3000,
+      notStarted: 2999,
+      failFast: true,
+    });
+    expect(summarizeTimeline([member('all:0')], 0).fans[0]).toMatchObject({
+      total: undefined,
+      notStarted: undefined,
+      failFast: false,
+    });
+  });
+});

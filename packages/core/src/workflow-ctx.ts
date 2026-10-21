@@ -702,7 +702,7 @@ export function createWorkflowCtx(
     // Reserve the whole block in list order BEFORE any dispatch — replay re-derives identical seqs.
     const positions = inputs.map(() => pos.next());
     const firstSeq = positions[0] as number;
-    const group = allGroup(firstSeq, mode);
+    const group = allGroup(firstSeq, inputs.length, mode);
     const waveOf = (i: number) => (waves ? Math.floor(i / waves.waveSize) : undefined);
     const id = (i: number) => allChildId(runId, firstSeq, i, waveOf(i));
     const { checkpoints: existing, folded } = await readFan(positions, [

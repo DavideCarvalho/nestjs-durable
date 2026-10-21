@@ -1,4 +1,4 @@
-import { FOLDED_PREFIX, type FoldedChildren } from './fan-join';
+import { FOLDED_PREFIX, type FoldedChildren, parseFanGroup } from './fan-join';
 import type { StepCheckpoint } from './interfaces';
 
 /**
@@ -13,8 +13,17 @@ export interface FanSummary {
   label: string;
   firstSeq: number;
   lastSeq: number;
-  /** Members: steps, or child runs (a folded checkpoint counts as the children it stands for). */
+  /** Members started so far: steps, or child runs (a folded checkpoint counts as the children it stands for). */
   size: number;
+  /**
+   * The fan's declared size, when its group carries it. More than `size` while waves are still to
+   * be sent (`concurrency`), and for good when a failFast fan stopped early.
+   */
+  total?: number | undefined;
+  /** `total - size`: members never started yet — or never to start, once the run has finished. */
+  notStarted?: number | undefined;
+  /** The fan stops at its first failure. */
+  failFast: boolean;
   /** Members by status. A child that failed counts as `failed`, though its checkpoint is `completed`. */
   counts: Partial<Record<StepCheckpoint['status'], number>>;
   startedAt?: Date | undefined;
@@ -88,12 +97,17 @@ export function summarizeFan(group: string, members: StepCheckpoint[]): FanSumma
       startedAt = cp.enqueuedAt;
     }
   }
+  const parsed = parseFanGroup(group);
+  const total = parsed?.size;
   return {
     group,
     label: fanLabel(members),
     firstSeq,
     lastSeq,
     size,
+    total,
+    notStarted: total === undefined ? undefined : Math.max(0, total - size),
+    failFast: parsed?.failFast ?? false,
     counts,
     startedAt,
     finishedAt,
@@ -103,8 +117,8 @@ export function summarizeFan(group: string, members: StepCheckpoint[]): FanSumma
 
 /**
  * Split a run's timeline into the checkpoints a detail view lists one by one and the fans it draws as
- * one node each: every `parallelGroup` with more than `over` members becomes a {@link FanSummary},
- * and its members leave the timeline. Smaller groups and ungrouped steps stay as they are.
+ * one node each: every `parallelGroup` with more than `over` members, or declared wider than that,
+ * becomes a {@link FanSummary}, and its members leave the timeline. Smaller groups and ungrouped steps stay as they are.
  */
 export function summarizeTimeline(
   timeline: StepCheckpoint[],
@@ -120,7 +134,8 @@ export function summarizeTimeline(
   const summarized = new Set<string>();
   const fans: FanSummary[] = [];
   for (const [group, members] of byGroup) {
-    if (members.length <= over) continue;
+    // A fan sent in small waves has few rows yet; its declared size is what makes it wide.
+    if (members.length <= over && (parseFanGroup(group)?.size ?? 0) <= over) continue;
     summarized.add(group);
     fans.push(summarizeFan(group, members));
   }

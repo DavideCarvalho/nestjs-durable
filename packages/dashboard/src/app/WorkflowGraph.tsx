@@ -21,7 +21,13 @@ import {
   runDisplayStatus,
 } from '../client/durable-client';
 import { stepDisplayName } from '../client/folded-children';
-import { fanProgress, fanStatus, groupParallelSpans } from '../client/group-parallel-spans';
+import {
+  fanProgress,
+  fanSizeLabel,
+  fanStatus,
+  groupParallelSpans,
+  runFinished,
+} from '../client/group-parallel-spans';
 import {
   CHILD_DETAIL_LIMIT,
   childDetailIds,
@@ -29,6 +35,7 @@ import {
   childRunIdOf,
   detailsById,
 } from './child-link';
+import { FAN_PROGRESS_SEGMENTS } from './fan-progress-style';
 import { BoltIcon, CheckIcon, ChildIcon, KIND_LABEL, XIcon, iconFor } from './icons';
 
 /** Stable empty set so a graph with no `expanded` prop doesn't re-run the layout memo each render. */
@@ -117,7 +124,7 @@ type StepData = {
   laneRun?: WorkflowRun;
 };
 type EndData = { status: RunDisplayStatus; label: string };
-type FanData = { fan: FanSummary; depth?: number | undefined };
+type FanData = { fan: FanSummary; runFinished: boolean; depth?: number | undefined };
 
 function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   const failed = data.status === 'failed';
@@ -257,12 +264,12 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
 /** A summarized fan as one node: its label and size, a progress bar, and its members by status. */
 function FanCardNode({ data }: NodeProps<Node<FanData>>) {
   const { fan } = data;
-  const progress = fanProgress(fan);
-  const status = fanStatus(fan);
+  const progress = fanProgress(fan, data.runFinished);
+  const status = fanStatus(fan, data.runFinished);
   const failed = status === 'failed';
   const pending = status === 'pending' || status === 'running';
   const rail = failed ? 'bg-red-400' : pending ? 'bg-live' : 'bg-emerald-400';
-  const pct = (n: number) => `${(n / Math.max(progress.size, 1)) * 100}%`;
+  const pct = (n: number) => `${(n / Math.max(progress.total, 1)) * 100}%`;
   return (
     <div
       title={`parallel fan ${fan.group}`}
@@ -280,22 +287,27 @@ function FanCardNode({ data }: NodeProps<Node<FanData>>) {
             ⑃
           </span>
           <span className="truncate text-[13px] font-medium text-zinc-100">{fan.label}</span>
-          <span className="mono tnum ml-auto shrink-0 text-[11px] text-zinc-400">×{fan.size}</span>
+          <span className="mono tnum ml-auto shrink-0 text-[11px] text-zinc-400">
+            {fanSizeLabel(progress)}
+          </span>
         </div>
         <div className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-zinc-800">
-          <span className="bg-emerald-500/60" style={{ width: pct(progress.completed) }} />
-          <span className="bg-red-500/70" style={{ width: pct(progress.failed) }} />
-          <span className="bg-live/70" style={{ width: pct(progress.running) }} />
-          <span className="bg-zinc-600/60" style={{ width: pct(progress.pending) }} />
+          {FAN_PROGRESS_SEGMENTS.map((seg) => (
+            <span
+              key={seg.key}
+              className={seg.className}
+              style={{ width: pct(progress[seg.key]) }}
+            />
+          ))}
         </div>
         <div className="mono tnum mt-1.5 flex flex-wrap items-center gap-2 text-[10px]">
-          {progress.completed > 0 && (
-            <span className="text-emerald-300">{progress.completed} done</span>
-          )}
-          {progress.failed > 0 && <span className="text-red-300">{progress.failed} failed</span>}
-          {progress.running > 0 && <span className="text-live">{progress.running} running</span>}
-          {progress.pending > 0 && (
-            <span className="text-zinc-400">{progress.pending} pending</span>
+          {FAN_PROGRESS_SEGMENTS.map((seg) =>
+            progress[seg.key] > 0 ? (
+              <span key={seg.key} className={seg.text}>
+                {progress[seg.key]} {seg.label}
+                {seg.key === 'skipped' && fan.failFast ? ' (failFast)' : ''}
+              </span>
+            ) : null,
           )}
           <span className="ml-auto text-zinc-500">
             #{fan.firstSeq}–{fan.lastSeq}
@@ -533,11 +545,17 @@ export const WorkflowGraph = memo(function WorkflowGraph({
             type: 'fan',
             draggable: false,
             position: { x: cursorX, y: baseY },
-            data: { fan: node.fan, depth } satisfies FanData,
+            data: {
+              fan: node.fan,
+              runFinished: runFinished(laneRun.status),
+              depth,
+            } satisfies FanData,
           });
           if (firstIds.length === 0) firstIds.push(id);
           for (const from of connectors) edges.push(mainEdge(from.id, id, from.failed));
-          connectors = [{ id, failed: fanStatus(node.fan) === 'failed' }];
+          connectors = [
+            { id, failed: fanStatus(node.fan, runFinished(laneRun.status)) === 'failed' },
+          ];
           cursorX += gapX;
           continue;
         }

@@ -111,29 +111,63 @@ function groupSteps(timeline: StepCheckpoint[]): TimelineNode[] {
   return nodes;
 }
 
-/** A summarized fan's members by status, every status present (zero when the server omitted it). */
+/**
+ * A summarized fan's members by status, every status present. While its run is live, members not
+ * started yet are `notStarted` (waves still to send). Once the run has finished, members still
+ * `running`/`pending` are `interrupted` and the never-started ones `skipped`: a failFast fan that
+ * stopped early, or a run cancelled mid-fan.
+ */
 export interface FanProgress {
   completed: number;
   failed: number;
   running: number;
   pending: number;
-  size: number;
+  interrupted: number;
+  notStarted: number;
+  skipped: number;
+  /** Members started so far. */
+  started: number;
+  /** The fan's declared size, or `started` when its group does not carry one. */
+  total: number;
 }
 
-export function fanProgress(fan: FanSummary): FanProgress {
+export function fanProgress(fan: FanSummary, runFinished = false): FanProgress {
+  const running = fan.counts.running ?? 0;
+  const pending = fan.counts.pending ?? 0;
+  const notStarted = fan.notStarted ?? 0;
   return {
     completed: fan.counts.completed ?? 0,
     failed: fan.counts.failed ?? 0,
-    running: fan.counts.running ?? 0,
-    pending: fan.counts.pending ?? 0,
-    size: fan.size,
+    running: runFinished ? 0 : running,
+    pending: runFinished ? 0 : pending,
+    interrupted: runFinished ? running + pending : 0,
+    notStarted: runFinished ? 0 : notStarted,
+    skipped: runFinished ? notStarted : 0,
+    started: fan.size,
+    total: fan.total ?? fan.size,
   };
 }
 
-/** One status for a summarized fan's node: in flight while any member is, else failed if any did. */
-export function fanStatus(fan: FanSummary): StepCheckpoint['status'] {
-  const p = fanProgress(fan);
+/** One status for a summarized fan's node: in flight while anything is left to run, else failed if
+ *  any member failed or was cut short. */
+export function fanStatus(fan: FanSummary, runFinished = false): StepCheckpoint['status'] {
+  const p = fanProgress(fan, runFinished);
   if (p.running > 0) return 'running';
-  if (p.pending > 0) return 'pending';
-  return p.failed > 0 ? 'failed' : 'completed';
+  if (p.pending > 0 || p.notStarted > 0) return 'pending';
+  return p.failed > 0 || p.interrupted > 0 ? 'failed' : 'completed';
+}
+
+/** The fan's size as a node shows it: `×N`, or `started of N` while (or when) not all of it ran. */
+export function fanSizeLabel(p: FanProgress): string {
+  return p.started < p.total ? `${p.started} of ${p.total}` : `×${p.total}`;
+}
+
+/** A run is past its fans once it can no longer start or finish a member. */
+export function runFinished(status: string): boolean {
+  return (
+    status !== 'pending' &&
+    status !== 'running' &&
+    status !== 'suspended' &&
+    status !== 'cancelling'
+  );
 }

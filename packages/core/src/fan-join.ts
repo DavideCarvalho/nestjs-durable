@@ -14,9 +14,13 @@ export function allChildId(runId: string, firstSeq: number, index: number, wave?
   return `${allBase(runId, firstSeq, wave)}${index}`;
 }
 
-/** The fan's `parallelGroup`. A failFast fan is marked so the barrier wakes it on the first failure. */
-export function allGroup(firstSeq: number, mode: 'waitAll' | 'failFast'): string {
-  return mode === 'failFast' ? `all:${firstSeq}:failFast` : `all:${firstSeq}`;
+/**
+ * The fan's `parallelGroup`: its first seq, its size (so a view can count the children not started
+ * yet), and a failFast mark so the barrier wakes it on the first failure.
+ */
+export function allGroup(firstSeq: number, size: number, mode: 'waitAll' | 'failFast'): string {
+  const group = `all:${firstSeq}:n${size}`;
+  return mode === 'failFast' ? `${group}:failFast` : group;
 }
 
 /**
@@ -32,9 +36,30 @@ export function stepFanGroup(firstSeq: number, size: number, mode: 'waitAll' | '
 export function parseStepFanGroup(
   group: string | undefined,
 ): { firstSeq: number; size: number } | undefined {
-  const m = group ? /^steps:(\d+):(\d+)(?::failFast)?$/.exec(group) : null;
+  const fan = parseFanGroup(group);
+  if (fan?.kind !== 'steps' || fan.size === undefined) return undefined;
+  return { firstSeq: fan.firstSeq, size: fan.size };
+}
+
+/**
+ * What a fan's `parallelGroup` says about it: a child fan (`all:<seq>[:n<size>][:failFast]`) or a
+ * step fan (`steps:<seq>:<size>[:failFast]`). `size` is absent on a child fan dispatched before the
+ * group carried it.
+ */
+export function parseFanGroup(
+  group: string | undefined,
+):
+  | { kind: 'all' | 'steps'; firstSeq: number; size?: number | undefined; failFast: boolean }
+  | undefined {
+  const m = group ? /^(all|steps):(\d+)(?::n?(\d+))?(:failFast)?$/.exec(group) : null;
   if (!m) return undefined;
-  return { firstSeq: Number(m[1]), size: Number(m[2]) };
+  if (m[1] === 'steps' && m[3] === undefined) return undefined;
+  return {
+    kind: m[1] as 'all' | 'steps',
+    firstSeq: Number(m[2]),
+    size: m[3] === undefined ? undefined : Number(m[3]),
+    failFast: m[4] !== undefined,
+  };
 }
 
 /** The waiter and checkpoint name prefixes shared by a fan's children, or one wave's. */
@@ -106,7 +131,7 @@ export function parentRunIdOf(runId: string): string | undefined {
   return ENGINE_CHILD_ID.exec(runId)?.[1];
 }
 
-const GROUP = /^all:(\d+)(:failFast)?$/;
+const GROUP = /^all:(\d+)(?::n\d+)?(:failFast)?$/;
 const REST = /^(?:w(\d+)\.)?\d+$/;
 
 /**

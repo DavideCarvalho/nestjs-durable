@@ -110,6 +110,7 @@ describe('RunSpans with a summarized fan', () => {
     firstSeq: 1,
     lastSeq: 40000,
     size: 40000,
+    failFast: false,
     counts: { completed: 39990, failed: 10 },
     startedAt: '2026-01-01T00:00:01.000Z',
     finishedAt: '2026-01-01T00:00:04.000Z',
