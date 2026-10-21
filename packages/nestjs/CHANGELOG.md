@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.47.1
+
+### Patch Changes
+
+- [#377](https://github.com/DavideCarvalho/nestjs-durable/pull/377) [`b02f7ad`](https://github.com/DavideCarvalho/nestjs-durable/commit/b02f7adb7bd1ac85c8d9c030f6e3c738de10dbe9) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `DurableModule.forRoot` / `forRootAsync` now forward `timerBatchSize`, `reconcileMs`, `eventBufferTtlMs`, `blockedPollMs` and `trackStepStart` to the `WorkflowEngine`. Before, those options could only be set on a hand-built engine, so module users always got the defaults (for example a timer batch of 500).
+
 ## 0.47.0
 
 ### Minor Changes
