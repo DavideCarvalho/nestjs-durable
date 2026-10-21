@@ -197,6 +197,7 @@ export class WorkflowRegistrar
     });
 
     this.reportUnattributed(unattributed);
+    void this.reportUnservedOnErrorRoutes();
     this.installDeadLetterRouting(deadLetterByWorkflow);
   }
 
@@ -210,6 +211,22 @@ export class WorkflowRegistrar
     if (names.length === 0) return;
     console.warn(
       `[nestjs-durable] could not derive an origin (declaring package) for ${names.length} workflow(s): ${names.join(', ')}. Their runs carry no origin and will not match an origin filter.`,
+    );
+  }
+
+  /**
+   * Says, once at boot, which onError routes name a handler workflow nothing can run yet, so a typo
+   * is caught before the first failure goes nowhere. A handler served by workers that start later
+   * also shows up here; the route still works once they are live.
+   */
+  private async reportUnservedOnErrorRoutes(): Promise<void> {
+    const unserved = await this.engine.unservedOnErrorRoutes().catch(() => []);
+    if (unserved.length === 0) return;
+    const list = unserved
+      .map(({ workflow, route }) => `${workflow} → ${route.workflow} (code ${route.code ?? '*'})`)
+      .join(', ');
+    console.warn(
+      `[nestjs-durable] ${unserved.length} onError route(s) name a handler workflow that is not registered here and has no live worker: ${list}.`,
     );
   }
 

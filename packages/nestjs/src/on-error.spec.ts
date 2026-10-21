@@ -104,7 +104,7 @@ describe('@OnError', () => {
     expect(deadLetters.stored).toEqual([
       { line: { n: 3, amount: 'x' }, error: 'line 3: amount is not a number', runId: 'r1' },
     ]);
-    expect((await store.getRun('r1.onError'))?.workflow).toBe('line.onError.invalid');
+    expect((await store.getRun('r1.onError.0'))?.workflow).toBe('line.onError.invalid');
   });
 
   it('routes a code from @Workflow({ onError }) to a separate workflow', async () => {

@@ -387,3 +387,62 @@ class GatherProcessTaskTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AllSettledTest(unittest.TestCase):
+    def _ctx(self, history=None):
+        return WorkflowContext("run1", history or [])
+
+    def test_first_turn_emits_the_same_fan_as_gather_children(self):
+        settled = self._ctx()
+        with self.assertRaises(_Suspend):
+            settled.all_settled("handle", [{"p": "A"}, {"p": "B"}])
+        gathered = self._ctx()
+        with self.assertRaises(_Suspend):
+            gathered.gather_children("handle", [{"p": "A"}, {"p": "B"}])
+        self.assertEqual(settled.commands, gathered.commands)
+
+    def test_returns_every_outcome_in_input_order(self):
+        history = [
+            {"seq": 0, "kind": "child", "name": "handle", "output": {"r": 1}},
+            {
+                "seq": 1,
+                "kind": "child",
+                "name": "handle",
+                "error": {"message": "bad line", "code": "invalid_line", "details": {"n": 1}},
+            },
+            {"seq": 2, "kind": "child", "name": "handle", "error": {"message": "boom"}},
+        ]
+        out = self._ctx(history).all_settled("handle", [{}, {}, {}])
+        self.assertEqual(
+            out,
+            [
+                {"status": "fulfilled", "value": {"r": 1}},
+                {
+                    "status": "rejected",
+                    "id": "run1.child.1",
+                    "error": "bad line",
+                    "code": "invalid_line",
+                    "details": {"n": 1},
+                },
+                {"status": "rejected", "id": "run1.child.2", "error": "boom"},
+            ],
+        )
+
+    def test_empty_inputs_returns_empty(self):
+        ctx = self._ctx()
+        self.assertEqual(ctx.all_settled("handle", []), [])
+        self.assertEqual(ctx.commands, [])
+
+
+class ToErrorTest(unittest.TestCase):
+    def test_carries_code_and_details(self):
+        from durable_worker import FatalError
+        from durable_worker.workflow import _to_error
+
+        try:
+            raise FatalError("invalid line", code="invalid_line", details=[{"path": ["amount"]}])
+        except FatalError as err:
+            out = _to_error(err)
+        self.assertEqual(out["code"], "invalid_line")
+        self.assertEqual(out["details"], [{"path": ["amount"]}])

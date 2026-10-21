@@ -34,7 +34,7 @@ import inspect
 import threading
 import time
 import traceback
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .cancellation import Cancelled
 
@@ -84,6 +84,9 @@ def _to_error(err: Exception) -> Dict[str, Any]:
     code = getattr(err, "code", None)
     if code:
         out["code"] = code
+    details = getattr(err, "details", None)
+    if details is not None:
+        out["details"] = details
     out["stack"] = traceback.format_exc()
     return out
 
@@ -533,15 +536,55 @@ class WorkflowContext:
         idempotent on the engine (a child has no history entry until it settles) — same contract as
         the single ``start_child``.
         """
+        _, histories = self._child_fan(workflow, inputs, mode)
+        if not histories:
+            return []
+        return self._aggregate(histories, lambda _ev: workflow)
+
+    def all_settled(self, workflow: str, inputs: "List[Any]") -> "List[Dict[str, Any]]":
+        """:meth:`gather_children` that never raises for a failed child: waits for every child to
+        settle, then returns one dict per input, in input order — the twin of the TS
+        ``ctx.allSettled``. Same fan as ``gather_children`` in ``wait_all`` mode (seqs, ``startChild``
+        commands, parallel group); only the ending differs.
+
+        A fulfilled child is ``{"status": "fulfilled", "value": output}``; a failed one is
+        ``{"status": "rejected", "id": "<runId>.child.<seq>", "error": message}``, plus the recorded
+        ``code`` and ``details`` when the child's error carries them. The id is the child run id the
+        engine mints for a worker's ``startChild``.
+        """
+        seqs, histories = self._child_fan(workflow, inputs, "wait_all")
+        out: List[Dict[str, Any]] = []
+        for seq, ev in zip(seqs, histories):
+            error = ev.get("error")
+            if error is None:
+                out.append({"status": "fulfilled", "value": ev.get("output")})
+                continue
+            rejected: Dict[str, Any] = {
+                "status": "rejected",
+                "id": f"{self.run_id}.child.{seq}",
+                "error": error.get("message", "child failed"),
+            }
+            if error.get("code") is not None:
+                rejected["code"] = error["code"]
+            if error.get("details") is not None:
+                rejected["details"] = error["details"]
+            out.append(rejected)
+        return out
+
+    def _child_fan(
+        self, workflow: str, inputs: "List[Any]", mode: str
+    ) -> "Tuple[List[int], List[Dict[str, Any]]]":
+        """The fan :meth:`gather_children` and :meth:`all_settled` share: reserves a contiguous seq
+        block, emits a ``startChild`` per unresolved child under one parallel group, and suspends until
+        every child has a history entry. ``fail_fast`` raises on the first resolved failure."""
         seqs = [self._next() for _ in inputs]
         if not seqs:
-            return []
+            return [], []
         group = f"gather:{seqs[0]}"
         histories = [self._replay_entry(seq, "child", workflow) for seq in seqs]
 
-        # fail_fast: bail the moment any resolved child is a failure.
         if mode == "fail_fast":
-            for seq, ev in zip(seqs, histories):
+            for ev in histories:
                 if ev is not None and ev.get("error") is not None:
                     raise GatherFailed([{"name": workflow, "error": ev["error"]}])
 
@@ -555,8 +598,7 @@ class WorkflowContext:
                 pending = True
         if pending:
             raise _Suspend()
-
-        return self._aggregate(histories, lambda _ev: workflow)
+        return seqs, histories  # type: ignore[return-value]
 
     def gather_calls(
         self,
