@@ -148,7 +148,7 @@ const results = await ctx.all(this.lines.processLine, lines, { concurrency: 500 
 
 When a failed item is an expected outcome rather than a reason to fail the run, use
 `ctx.allSettled` instead: the same fan, resolving with `{ status: 'fulfilled', value }` or
-`{ status: 'rejected', id, error }` per input, in input order, and never throwing for an item. Throw
+`{ status: 'rejected', id, error, code?, details? }` per input, in input order, and never throwing for an item. The rejected `code`/`details` are the `FatalError`'s (absent for a plain `Error`). Throw
 `FatalError` in the step for a failure a retry can't fix (a schema mismatch); it settles as rejected
 without spending the retries:
 
