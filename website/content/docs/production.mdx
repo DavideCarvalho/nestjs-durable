@@ -231,6 +231,49 @@ but is **not yet wired through `runRedisWorker`** — today every subscribed que
 per-handler routing lands.
 </Callout>
 
+### Tuning for wide fans
+
+A fan of tens of thousands of items stresses different parts of the system than a stream of small
+runs. These knobs matter, roughly in order:
+
+1. **Fan out steps, not children, when an item is one step.**
+   `ctx.all(this.lines.process, lines)` costs a checkpoint and a dispatch per item;
+   `ctx.all(LineWorkflow, lines)` costs a whole run per item (row, turn, lease, parent signal). See
+   [The same step over many inputs](/docs/concepts/workflows-and-steps#the-same-step-over-many-inputs--ctxallstep-inputs).
+2. **Cap the fan with `concurrency`** on the `ctx.all` call, so the queue and the store do not hold
+   the whole fan at once. Each settled wave costs the parent one turn.
+3. **Raise the workers' `concurrency`** (or make it adaptive) so the steps actually run in
+   parallel. Fleet parallelism is `concurrency × replicas`.
+4. **Raise `resultConcurrency`** on the instances that consume results. With the default of `1`,
+   each pod handles one result at a time, and every result runs its run's turn inline. Results of
+   one run still resume it in order on an instance. See
+   [Result concurrency](/docs/transports/bullmq#result-concurrency).
+
+```ts
+const transport = new BullMQTransport({
+  connection: { host: 'redis', port: 6379 },
+  concurrency: { mode: 'adaptive', max: 64 }, // tasks this pod runs at once
+  resultConcurrency: 16,                       // results this pod handles at once
+});
+```
+
+**Due timers come in batches.** Every driving instance runs `resumeDueTimers` on each timer-poll
+tick. When thousands of runs come due together (recovery after an outage, a fan's children waking
+at once), each pass loads at most `timerBatchSize` of them, most overdue first, and walks them in a
+shuffled order so instances spread over the batch instead of contending for the same leases. The
+default is 500. It is a `WorkflowEngine` constructor option; `DurableModule.forRoot` does not pass it
+through, so the module's engine always uses 500. A value that is not a finite number of at least 1
+falls back to 500.
+
+```ts
+const engine = new WorkflowEngine({ store, transport, timerBatchSize: 1000 });
+```
+
+**The console summarizes wide fans.** The dashboard's run detail folds any fan wider than 50 into
+one summary row and pages its members on demand, so opening a 40,000-member fan no longer ships
+every checkpoint to the browser. The server still reads the run's whole checkpoint list from the
+store on each poll. See [Wide fans](/docs/observability/dashboard#wide-fans).
+
 ### Remote-worker liveness
 
 When steps or workflows run in a **separate** (or polyglot) worker, the engine can't tell a slow worker

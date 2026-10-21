@@ -169,8 +169,15 @@ reads one row per earlier wave rather than one per earlier child.
 (`<runId>.all.<firstSeq>.w<k>.<i>`). Changing it while a run is in flight is a non-deterministic
 change, the same as changing `inputs`.
 
+The fan's `parallelGroup` is `all:<firstSeq>:n<size>`, with `:failFast` appended in `failFast` mode.
+It carries the declared size so the [dashboard](/docs/observability/dashboard#wide-fans) can show
+how many children have not started yet while waves are still to be sent. The engine still reads the
+older `all:<firstSeq>[:failFast]` shape, which runs suspended before core 0.78 keep.
+
 `ctx.all` is the wait-all/fan-out counterpart to `ctx.child` — reach for it whenever every item runs
-the **same** workflow.
+the **same** workflow. When each item is a single step rather than a workflow of its own, pass the
+`@Step` reference instead: [`ctx.all(step, inputs)`](/docs/concepts/workflows-and-steps#the-same-step-over-many-inputs--ctxallstep-inputs)
+runs one step per input, which costs a checkpoint instead of a whole child run.
 
 ### Manual scatter-gather: `startChild` + `child`, for the flexible cases
 
@@ -222,7 +229,7 @@ opposite holds — the statics are the clean way to start a run without injectin
 | --- | --- | --- | --- |
 | Parent waits for the result | ✅ suspends until the child finishes | ❌ returns the id immediately | ✅ suspends until every child finishes |
 | Child failure affects the parent | ✅ throws in the parent | ❌ independent (inspect/retry the child run) | ✅ throws an aggregate `GatherError` |
-| Typical use | a sub-task whose output you need | side work; the dispatch half of scatter-gather | fan out N items through the **same** workflow |
+| Typical use | a sub-task whose output you need | side work; the dispatch half of scatter-gather | fan out N items through the **same** workflow (or the same `@Step`) |
 
 All three establish the same durable parent→child relationship, so a child started any way is a normal
 run you can inspect, retry, or cancel from the dashboard.

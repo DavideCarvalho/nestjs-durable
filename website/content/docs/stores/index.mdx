@@ -28,6 +28,38 @@ interface, independent of the [transport](/docs/transports).
   values live outside the row being counted.
 </Callout>
 
+## Writing a custom store: the fan and hot-path methods
+
+Several `StateStore` methods exist only to keep wide fans and busy deployments cheap. All but one are
+optional, and the engine falls back to something slower but correct when a store leaves one out.
+Run the [shared store contract](/docs/testing#testing-a-custom-storetransportadmission-backend)
+(`runStateStoreContract`) against your adapter. Its `listDueTimers` case checks the ordering and
+the `limit`, and its `countCheckpoints` and `saveCheckpointIfPending` cases skip themselves when your
+store does not implement the method. Some cases for the other optional methods, such as
+`registerChildWaits` and `listCheckpointsByNamePrefix`, expect the method to exist, because every
+bundled adapter has it.
+
+| Method | Required? | What the engine uses it for | Without it |
+| --- | --- | --- | --- |
+| `listDueTimers(nowMs, namespace?, limit?)` | required; honoring `limit` is optional | the due-timer pass. Return the most overdue first (`wakeAt` ascending), at most `limit` runs. The engine passes its `timerBatchSize` (default 500). | A store that ignores `limit` still works; every instance then loads the whole due set on each tick. |
+| `countCheckpoints(runId, fromSeq, toSeq, statuses)` | optional | a step fan's join barrier asks, on every result, how many checkpoints in the fan's seq range are still `pending`. Must be a `COUNT`, not a load. An empty `statuses` counts 0. | The engine loads the run's checkpoints and counts in memory, once per result of the fan. |
+| `saveCheckpointIfPending(checkpoint)` | optional | a compare-and-set: overwrite `(runId, seq)` only while the stored row is still `pending`, and resolve whether it wrote. Used to settle a step from its result (which also drops a duplicate delivery), to stamp a redispatch deadline, and to re-dispatch. | The engine uses `saveCheckpoint`, which keeps the race where a turn writes a settled step back to `pending` and the step runs twice. |
+| `hasSignalWaiter(runId, tokenPrefix)` | optional | a child fan's join barrier. | The parent replays once per settled child, which is O(N²) over the fan. |
+| `registerChildWaits(entries)` | optional | writes a child fan's waiters and `running` placeholders in one transaction, 500 at a time. | Waiters and placeholders are written one by one. |
+| `compactCheckpoints(runId, fromSeq, toSeq, into)` | optional | folds a settled child fan (or wave) of 100+ into one `fan:` checkpoint. | Settled fans keep one checkpoint per child. |
+| `listCheckpointsByNamePrefix(runId, prefixes)` | optional | reads a fan's existing checkpoints in one prefix query. | `listCheckpoints` plus a prefix filter in memory. |
+| `listSignalWaitersByRun(runIds)` | optional | run-scoped waiter reads (run detail, cancel, purge, the timer pass). | Those reads scan every waiter. |
+
+Every bundled adapter implements `listDueTimers` with `limit` and ordering, and the four optional
+methods from `hasSignalWaiter` down. `countCheckpoints` and `saveCheckpointIfPending` are implemented
+by the MikroORM adapter and the in-memory store; the TypeORM, Prisma and Drizzle adapters use the
+fallbacks.
+
+`CodecStateStore` exposes an optional method only when the store it wraps has it, so wrapping a
+store never hides a capability or invents one. It encodes the payload for `saveCheckpointIfPending`,
+forwards `countCheckpoints` verbatim (a count reads no payload), and decodes the runs
+`listDueTimers` returns.
+
 ## Adapters
 
 Each adapter has its own page with the full setup — register/copy the schema, wire the store, and

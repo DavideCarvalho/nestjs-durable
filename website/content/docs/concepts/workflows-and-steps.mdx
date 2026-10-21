@@ -195,6 +195,77 @@ const [a, b] = await Promise.all([
 ]);
 ```
 
+`Promise.all` is right for a handful of different steps. It has no join barrier, though: every
+result that lands replays the workflow, so a fan of N steps costs N replays and O(N²) checkpoint
+reads. For the **same** step over many inputs, use `ctx.all` with the `@Step` reference.
+
+### The same step over many inputs — `ctx.all(step, inputs)`
+
+`ctx.all` takes a `@Step` method reference as well as a workflow. With a step it runs **one durable
+step per input**, waits for all of them, and returns the outputs in input order:
+
+```ts
+@Workflow({ name: 'import-file', version: '1' })
+export class ImportFileWorkflow {
+  constructor(private readonly lines: LineService) {}
+
+  async run(ctx: WorkflowCtx, file: { lines: Line[] }) {
+    // One Lines.process step per line, at most 500 in flight.
+    const results = await ctx.all(this.lines.process, file.lines, { concurrency: 500 });
+    return { imported: results.length };
+  }
+}
+```
+
+A step is much cheaper than a child: it costs a checkpoint and a dispatch, where a child workflow
+(`ctx.all(LineWorkflow, inputs)`) costs a run row, a turn, a lease and a parent signal each. Use the
+step form whenever an item is one step; use the [child form](/docs/authoring/child-workflows#ctxall--fan-out-n-children-of-the-same-workflow-wait-for-all)
+when an item is a workflow of its own.
+
+**One wake per wave, not per result.** The fan's steps share one `parallelGroup`,
+`steps:<firstSeq>:<size>` (`steps:<firstSeq>:<size>:failFast` in `failFast` mode), so any single
+result tells the engine which fan it belongs to. A result resumes the workflow only once no step of
+the fan is still `pending`, or when the result is a failure. A 60-step fan therefore takes about 3
+turns of the parent (dispatch, then the replay that collects the results) instead of 61. The
+dashboard draws the group as one fan.
+
+| Option | Default | Behaviour |
+| --- | --- | --- |
+| `concurrency` | unset: send every step at once | Send the steps in waves of `concurrency`. The next wave goes out once every step of the previous one has settled, and each wave costs the parent one turn. Must be a positive integer. Part of the fan's identity, like `inputs`: don't change it under an in-flight run. |
+| `mode` | `'waitAll'` | `'waitAll'` lets every step settle, then throws a `GatherError` whose `failures` list every failed index. `'failFast'` throws a `GatherError` carrying the first failure the parent sees. |
+| `retries`, `backoff`, `backoffMs`, `backoffMaxMs`, `jitter` | the `@Step`'s policy | Applied to every step of the fan. A step only counts as failed once its retries are spent. |
+| `priority`, `fairnessKey`, `transport` | as for `ctx.step` | Applied to every dispatch of the fan. |
+
+```ts
+import { GatherError } from '@dudousxd/nestjs-durable-core';
+
+try {
+  return await ctx.all(this.lines.process, file.lines, { concurrency: 500 });
+} catch (err) {
+  if (err instanceof GatherError) {
+    // err.failures: { index, id, error }[], where index is the input's position.
+    return { failed: err.failures.map((f) => f.index) };
+  }
+  throw err;
+}
+```
+
+A step fan differs from a child fan in a few ways:
+
+- **`failFast` sends nothing further, and cancels nothing.** Steps that were never dispatched (later
+  waves under `concurrency`) are never sent. Steps already in flight keep running on their workers;
+  unlike a child fan, there are no sibling runs to cancel. The dashboard shows the unsent steps as
+  **never ran (failFast)** once the run has finished.
+- **Waves are strict.** The child fan sends half-size waves two at a time; the step fan sends one
+  wave of `concurrency` and waits for all of it before sending the next.
+- **No flow-control `queue` and no liveness `timeoutMs`.** `ctx.all` rejects a `queue` option, and
+  it rejects a step whose `@Step` declares a `timeoutMs`.
+
+Each fan step's checkpoint is written `pending` before any step of the fan is dispatched, so two
+turns of the same run never send a step twice. A result that another instance settles while the
+dispatching turn still holds the lease is picked up when that turn releases it. Every step runs
+exactly once, however many instances share the results.
+
 ## Long-running loops — `ctx.continueAsNew`
 
 A workflow that loops forever — polling for new work, or a long-lived accumulator parked on

@@ -485,6 +485,64 @@ It is backed by `StateStore.runFacets` (optional on the port; a store without it
 a listing) and `RunGateway.runFacets`, which a tenant deployment round-trips to the control plane the
 same way it does `listRuns`.
 
+### Wide fans
+
+A run with a 40,000-member fan, whether from `ctx.all` over children or over a `@Step`, cannot be
+shown member by member. Its full detail is megabytes of JSON, and a row, a graph node and a child
+fetch per member would stall the tab. So the console draws each wide fan as one node.
+
+**The server summarizes.** `GET runs/:id` folds every `parallelGroup` with more than 50 members, or
+declared wider than 50, into a `FanSummary` and leaves its members out of `timeline`. A fan sent in
+small waves is summarized from its first wave, because the group carries the fan's declared size.
+`children` is capped at 200 ids, with `childCount` carrying the total. Pass `?full=true` for the
+whole timeline and every child id.
+
+**One row and one node per fan.** In the spans panel a summarized fan is a single row labelled with
+the members' step name (or `child runs`) and `×<total>`. Under it are a segmented progress bar and a
+legend with a count for each state that is present:
+
+| Segment | Meaning |
+| --- | --- |
+| done | the member completed |
+| failed | a step that failed after its retries, or a child run that failed |
+| running / pending | in flight, while the run is live |
+| not started | not sent yet, while waves are still to go out under `concurrency` |
+| interrupted | still running or pending when the run finished |
+| never ran | never sent, once the run has finished. Marked `(failFast)` when a `failFast` fan stopped early. |
+
+When fewer members have started than the fan declares, the legend leads with
+`<started> of <total> started`, for example `5100 of 20000 started · 4800 done · 300 pending · 14900 not started`. The
+first 20 failures are listed under the row, so a failure is visible without opening the fan. The
+graph shows the same fan as one card node, with the label, `×<total>` (or `<started> of <total>`),
+the progress bar, the legend and the seq range.
+
+A run counts as finished for this purpose only when it is `completed`, `failed`, `cancelled` or
+`dead`. A `blocked` or `suspended` run is still in flight, so its unsent members read as
+**not started** rather than **never ran**.
+
+**Members open by page.** Expanding the row lists the members in a virtualized list. Only the
+100-member pages under the visible rows are fetched from `GET runs/:id/fans/:group`, and they are
+refreshed while the fan is in flight. A **failed only** toggle narrows the list to failed members.
+The typed client calls the same routes:
+
+```ts
+import { durableClient } from '@dudousxd/nestjs-durable-dashboard/client';
+
+const detail = await durableClient.run(runId); // summarized: detail.fans, detail.childCount
+for (const fan of detail.fans ?? []) {
+  const page = await durableClient.fanMembers(runId, fan.group, { offset: 0, limit: 100, failed: true });
+  console.log(fan.label, `${page.total} failed`, page.items.map((cp) => cp.seq));
+}
+```
+
+**Other caps.** The header lists 12 child chips plus `+N more`. The console fetches no child detail
+for the members of a summarized fan, and fetches at most 50 child details for the rest of the run.
+Live events trigger a refetch at most every 1.5 s.
+
+The summary is computed by the [`RunGateway`](/docs/cluster/roles-and-config#the-shared-surface-rungateway)
+after it loads the run's checkpoints, so every poll still reads the whole run from the store. It
+trims what goes over the wire and what the browser renders, not the store read.
+
 ### Waiting states
 
 The engine only ever persists one generic **`suspended`** status for a durably-parked run — that's what
@@ -761,7 +819,8 @@ await durableClient.retry(detail.run.id);
 | `GET` | `/durable/api/runs` | list runs — `?status=` (repeat any of these to match a SET), `?workflow=`, `?tag=`, `?attr=`, `?namespace=`, `?origin=`, `?unattributed=true`, `?limit=`, `?offset=`. Also takes [nestjs-filter](https://www.npmjs.com/package/@dudousxd/nestjs-filter)'s structured form (`?filter[where][0][field]=tag&…`), which is what the console sends. Returns list ROWS: no `input` / `output` / `error` |
 | `GET` | `/durable/api/runs/facets` | `(status, origin)` counts over the same tag / tenant / attribute predicates — the chips' numbers, whole-set rather than per-page |
 | `GET` | `/durable/api/runs/values` | the distinct values of one filter field over the runs the other predicates select — `?groupByCount[field]=tag&groupByCount[limit]=20`. Answers `{ value, count }[]`; this is what fills the [pickers](#filter-pickers) |
-| `GET` | `/durable/api/runs/:id` | run + step timeline (the whole run, payloads included) |
+| `GET` | `/durable/api/runs/:id` | run + step timeline, payloads included. Fans wider than 50 come back as `fans: FanSummary[]` instead of their members, and `children` is capped at 200 with `childCount` as the total; `?full=true` returns everything. See [Wide fans](#wide-fans) |
+| `GET` | `/durable/api/runs/:id/fans/:group` | one page of a fan's members in seq order, `{ items, total }` — `?offset=` (default 0), `?limit=` (default 100, at most 500), `?failed=true` for failed members only. `:group` is the fan's URL-encoded `parallelGroup`. 404 for an unknown run, or when the gateway cannot page fans |
 | `GET` (SSE) | `/durable/api/runs/:id/stream` | live-tail the run's lifecycle events |
 | `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |
 | `POST` | `/durable/api/runs/:id/retry-with-input` | fix-and-replay: start a fresh linked run from a dead/failed run with a corrected input (body: `{ input }`) |
