@@ -289,9 +289,11 @@ async charge(order: Order) {
 Any thrown error is retried to the step's limit; only `FatalError` short-circuits retries.
 
 When a failure is an expected outcome rather than a reason to fail the run (a line that fails
-validation), route its code to an `@OnError` handler. The engine starts the method as its own run
-(`<workflow>.onError.<method>`) when the run fails with that code, and the run completes with the
-method's output, so a `ctx.all` over the workflow keeps going. It works for remote (Python) bodies too:
+validation), route its code to an `@OnError` handler. The engine starts the handler workflow
+(`<workflow>.onError.<method>`) as run `<runId>.onError` with `{ runId, workflow, input, error }`
+when the run fails with that code, and the run settles with the handler's outcome (its output, or
+its error when the handler fails); the body never runs again, so a `ctx.all` over the workflow
+keeps going. It works for remote (Python) bodies too:
 
 ```ts
 class InvalidLine extends FatalError {
@@ -305,6 +307,7 @@ async invalid(ctx: WorkflowCtx, failure: OnErrorInput<Line>): Promise<LineResult
 }
 ```
 
-It matches on `code`, never `instanceof`, must return `run`'s output type, and never sees cancellation,
-timeouts or non-determinism. `@Workflow({ onError: [{ code, workflow }] })` routes to another workflow.
+It matches on `code`, never `instanceof`, must return `run`'s output type, and never sees
+cancellation (a `cancelled` run never routes), `nested_workflow_call` ctx misuse, or `non_determinism`
+(`NonDeterminismError` carries `code: 'non_determinism'`). `@Workflow({ onError: [{ code, workflow }] })` routes to another workflow.
 Source: packages/core/src/workflow-ctx.ts (`step` retry loop), packages/core/src/errors.ts.
