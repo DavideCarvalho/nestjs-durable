@@ -743,7 +743,18 @@ export class WorkflowEngine {
         }
         // Durable path: no in-memory waiter (the step suspended the run, possibly on another
         // instance) → complete the checkpoint and resume the run here.
-        await this.serializedPerRun(result.runId, () => this.completeRemoteResult(result));
+        // Settling runs in parallel; only the resume (the run's turn) is serialized per run, so the
+        // results of one wide step fan are not queued behind each other on an instance.
+        if (!(await this.completeRemoteResult(result))) return;
+        await this.serializedPerRun(result.runId, () =>
+          this.resumeImplicit(result.runId).then(
+            () => undefined,
+            (err) => {
+              if (err instanceof NamespaceMismatch) return;
+              throw err;
+            },
+          ),
+        );
       },
       // A heartbeat resets the liveness window for whatever it targets: an in-flight long STEP (keyed
       // by stepId, see callRemote) or — when stepId is absent — the in-flight workflow TURN (keyed by
@@ -5157,11 +5168,6 @@ export class WorkflowEngine {
   }
 
   /**
-   * Complete a durable remote step from its worker result and resume the run — runs on whichever
-   * instance receives the result (the dispatching one may be gone), so the run is crash/scale-safe.
-   * A no-op if the checkpoint isn't `pending` (a duplicate or late delivery).
-   */
-  /**
    * Run `work` after every earlier `work` for the same run on this instance has settled. A result
    * resumes its run inline, and `execute` lets this instance into a lease it already holds — so two
    * results of one run handled at once here would run two turns of it concurrently. Results of
@@ -5178,9 +5184,15 @@ export class WorkflowEngine {
     return next;
   }
 
-  private async completeRemoteResult(result: StepResult): Promise<void> {
+  /**
+   * Complete a durable remote step from its worker result — runs on whichever instance receives the
+   * result (the dispatching one may be gone), so the run is crash/scale-safe. Resolves whether the
+   * run should now be resumed: not for a duplicate or late delivery (the checkpoint isn't `pending`),
+   * a run already finished, or a step fan whose barrier is still closed.
+   */
+  private async completeRemoteResult(result: StepResult): Promise<boolean> {
     const cp = await this.store.getCheckpoint(result.runId, result.seq);
-    if (!cp || cp.status !== 'pending') return;
+    if (!cp || cp.status !== 'pending') return false;
     // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Done
     // before the cancelled-run early-return below, so a cancellation can't leak the slot. Released
     // fire-and-forget: the slot/notify is best-effort (a global backend self-heals via lease), and
@@ -5189,7 +5201,7 @@ export class WorkflowEngine {
     // Drop a late result for a run that was cancelled/finished meanwhile — don't complete the step
     // or resume (the run is already terminal). This is the engine side of cooperative cancellation.
     const run = await this.store.getRun(result.runId);
-    if (run && (run.status === 'cancelled' || run.status === 'completed')) return;
+    if (run && (run.status === 'cancelled' || run.status === 'completed')) return false;
     const finishedAt = new Date();
     const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
     // Claimed, not blindly written: a duplicate delivery of this result settled it first.
@@ -5202,7 +5214,7 @@ export class WorkflowEngine {
       startedAt,
       finishedAt,
     });
-    if (!claimed) return;
+    if (!claimed) return false;
     this.noteSettledHere(`${result.runId}:${result.seq}`);
     this.emit({
       type: result.status === 'completed' ? 'step.completed' : 'step.failed',
@@ -5215,11 +5227,7 @@ export class WorkflowEngine {
       queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
       durationMs: finishedAt.getTime() - startedAt.getTime(),
     });
-    if (await this.stepFanStillRunning(cp, result)) return;
-    await this.resumeImplicit(result.runId).catch((err) => {
-      if (err instanceof NamespaceMismatch) return null;
-      throw err;
-    });
+    return !(await this.stepFanStillRunning(cp, result));
   }
 
   /**

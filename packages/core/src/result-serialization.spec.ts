@@ -30,7 +30,7 @@ async function until(check: () => boolean | Promise<boolean>, max = 500): Promis
 }
 
 describe('step results of one run on one instance', () => {
-  it('are handled one at a time, so the run never has two concurrent turns', async () => {
+  it('resume the run one at a time, so it never has two concurrent turns', async () => {
     const store = new InMemoryStateStore();
     const transport = new CapturingTransport();
     const engine = new WorkflowEngine({ store, transport, reconcileMs: 0 });
