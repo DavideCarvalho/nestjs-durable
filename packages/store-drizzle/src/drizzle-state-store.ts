@@ -306,8 +306,8 @@ export class DrizzleStateStore implements StateStore {
   }
 
   /** Due durable timers. Namespace-scoped: a worker resumes only its own tenant's suspended runs. */
-  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
-    const rows = await this.db
+  async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
+    const query = this.db
       .select()
       .from(workflowRuns)
       .where(
@@ -317,7 +317,9 @@ export class DrizzleStateStore implements StateStore {
           lte(workflowRuns.wakeAt, nowMs),
           namespaceFilter(namespace),
         ),
-      );
+      )
+      .orderBy(asc(workflowRuns.wakeAt));
+    const rows = limit !== undefined ? await query.limit(limit) : await query;
     return rows.map(fromRunRow);
   }
 

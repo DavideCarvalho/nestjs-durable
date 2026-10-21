@@ -315,8 +315,8 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
-  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
-    const rows = await this.db
+  async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
+    const query = this.db
       .select()
       .from(workflowRuns)
       .where(
@@ -327,7 +327,9 @@ export class DrizzlePgStateStore implements StateStore {
           namespaceFilter(namespace),
           this.scope(),
         ),
-      );
+      )
+      .orderBy(asc(workflowRuns.wakeAt));
+    const rows = limit !== undefined ? await query.limit(limit) : await query;
     return rows.map(fromRunRow);
   }
 

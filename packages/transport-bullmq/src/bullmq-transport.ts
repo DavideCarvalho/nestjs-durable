@@ -313,6 +313,14 @@ export interface BullMQTransportOptions {
    * behavior).
    */
   stepTimeoutMs?: number;
+  /**
+   * How many step results this instance handles at once from the results queue. Each result
+   * settles its checkpoint and resumes its run inline, so with the default of 1 a pod drives one
+   * run turn at a time off results, and a wide fan's results queue up behind it. Raising it lets
+   * results of different runs proceed in parallel; the engine still handles one run's results in
+   * order on this instance, so a run never gets two concurrent turns from it. Default 1.
+   */
+  resultConcurrency?: number;
 }
 
 /**
@@ -390,6 +398,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly pingIntervalMs: number | false;
   private readonly closeTimeoutMs: number;
   private readonly stepTimeoutMs: number | undefined;
+  private readonly resultConcurrency: number;
 
   constructor(options: BullMQTransportOptions) {
     this.connection = options.connection;
@@ -401,6 +410,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.stepTimeoutMs = options.stepTimeoutMs;
+    this.resultConcurrency = Math.max(1, Math.floor(options.resultConcurrency ?? 1));
   }
 
   /**
@@ -987,6 +997,7 @@ export class BullMQTransport implements Transport, ControlPlane {
   onResult(handler: (result: StepResult) => Promise<void>): void {
     this.resultsWorker = new Worker(this.resultsName(), (job) => handler(job.data as StepResult), {
       connection: this.workerConnection(),
+      concurrency: this.resultConcurrency,
     });
     this.resultsWorker.on('failed', (job, error) => {
       if (!job || job.attemptsMade < (job.opts.attempts ?? 1)) return;

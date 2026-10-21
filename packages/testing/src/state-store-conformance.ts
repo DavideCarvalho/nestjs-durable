@@ -496,6 +496,25 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
 
     // ---- checkpoints ------------------------------------------------------------------------
 
+    t('listDueTimers returns the most overdue first, capped at limit', async () => {
+      for (const [id, wakeAt] of [
+        ['late', 3_000],
+        ['earliest', 1_000],
+        ['middle', 2_000],
+        ['future', 9_000],
+      ] as const) {
+        await store.createRun(run({ id, status: 'suspended', wakeAt }));
+      }
+
+      expect((await store.listDueTimers(5_000)).map((r) => r.id)).toEqual([
+        'earliest',
+        'middle',
+        'late',
+      ]);
+      expect((await store.listDueTimers(5_000, undefined, 2)).map((r) => r.id)).toEqual([
+        'earliest',
+        'middle',
+      ]);
     t('countCheckpoints counts a seq range by status', async () => {
       if (!store.countCheckpoints) return;
       await store.createRun(run());

@@ -384,8 +384,12 @@ export interface StateStore {
   /** The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. */
   listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]>;
 
-  /** Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume. */
-  listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]>;
+  /**
+   * Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume — the most
+   * overdue first, at most `limit` of them when it is given. Every driving instance polls this each
+   * tick, so a recovery wave of thousands of due runs must come back in batches, not all at once.
+   */
+  listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]>;
 
   /**
    * Atomically acquire the recovery lease on a run for `owner` until `leaseUntilMs`, but only if

@@ -353,13 +353,15 @@ export class PrismaStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
-  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
     const rows = await this.db.durableWorkflowRun.findMany({
       where: {
         status: 'suspended',
         wakeAt: { not: null, lte: BigInt(nowMs) },
         ...namespaceWhere(namespace),
       },
+      orderBy: { wakeAt: 'asc' },
+      ...(limit !== undefined ? { take: limit } : {}),
     });
     return rows.map(fromRunRow);
   }
