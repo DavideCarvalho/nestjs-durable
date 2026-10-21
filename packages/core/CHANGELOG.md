@@ -1,5 +1,28 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.77.0
+
+### Minor Changes
+
+- [#367](https://github.com/DavideCarvalho/nestjs-durable/pull/367) [`c38e83c`](https://github.com/DavideCarvalho/nestjs-durable/commit/c38e83cd9d8261aac254b654bd47a762b7ea9592) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `ctx.all` over a `@Step`: `ctx.all(this.lines.processLine, lines, { concurrency })` runs one durable step per input instead of one child workflow per input, and returns the outputs in input order. A child costs a whole run (row, turn, lease, parent signal); a step costs a checkpoint and a dispatch.
+
+  - The steps share a `parallelGroup` (`steps:<firstSeq>:<size>`), so the dashboard renders them as one fan.
+  - The engine adds a join barrier for steps: a result resumes the workflow only when no step of the fan is still `pending`, or when one fails. The workflow replays once per settled wave instead of once per result. `Promise.all` over `ctx.step` replays on every result, which makes a fan of N steps cost O(N²) checkpoint reads.
+  - `concurrency` sends the steps in waves of that size; `mode: 'failFast'` throws on the first failed step; `waitAll` (the default) throws a `GatherError` with the failed indexes once every step has settled. Every step uses the `@Step`'s retry policy, or the per-call `retries`/`backoff`. A flow-control `queue` and a liveness `timeoutMs` are rejected.
+  - A fan's new steps are written `pending` before any is dispatched, so a turn running concurrently with the dispatching one never sends them twice. After the dispatching turn releases its lease, it re-checks the fan, which covers a last result that another instance settled while that turn held the lease.
+  - New optional `StateStore.countCheckpoints(runId, fromSeq, toSeq, statuses)`, which the barrier calls on every result. MikroORM and the in-memory store implement it, `CodecStateStore` forwards it, and the shared store contract covers it. A store without it falls back to loading the run's checkpoints.
+
+- [#368](https://github.com/DavideCarvalho/nestjs-durable/pull/368) [`6588790`](https://github.com/DavideCarvalho/nestjs-durable/commit/6588790f6845318c40f8cc9f3eb1648c09a4fd20) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Throughput for wide fans.
+
+  - **`BullMQTransport({ resultConcurrency })`.** Sets how many step results an instance handles at once (default 1). Each result resumes its run inline, so with one at a time a wide fan's results queued up behind a single run turn per pod.
+  - **One run's resumes go in order on an instance.** Settling results still runs in parallel. Only the resume each result triggers — the run's turn — is serialized per run on an instance, so the results of one wide step fan don't queue behind each other, and different runs proceed in parallel. A result resumes its run inline, and `execute` admits an instance into a lease it already holds, so two results of one run handled together ran two turns of that run concurrently. That already happened with an in-process transport, which delivers results concurrently, before this option existed.
+  - **Due timers come in batches.** `listDueTimers(nowMs, namespace, limit)` returns the most overdue first, at most `limit`. The engine's `resumeDueTimers` loads at most `timerBatchSize` (a new engine option, default 500) per pass and walks it in a shuffled order. Every driving instance runs that pass each tick, so a wave of thousands of due runs — a recovery after an outage, a fan's children waking together — had every instance load all of it and contend for the same leases row by row.
+    - All five bundled stores implement `limit` and the ordering, and the shared store contract covers both. A custom store that ignores `limit` still works; the engine then gets the whole due set as before.
+
+### Patch Changes
+
+- [#370](https://github.com/DavideCarvalho/nestjs-durable/pull/370) [`56f10e3`](https://github.com/DavideCarvalho/nestjs-durable/commit/56f10e3601f9d00e2c4a8e6f80ac02c921bcbd68) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `timerBatchSize` and `resultConcurrency` fall back to their defaults (500, 1) for a non-finite or sub-1 value. Before, `NaN` passed straight through `Math.max`, and a `NaN` timer batch stalled timer recovery on every tick.
+
 ## 0.76.1
 
 ### Patch Changes
