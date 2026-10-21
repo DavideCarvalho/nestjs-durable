@@ -39,8 +39,8 @@ interface PendingRequest {
 /** The control plane answered a verb it does not know — an older release than this tenant's. */
 class UnsupportedRunRequestError extends Error {}
 
-/** A control plane on 0.46.x or earlier answers a verb it does not know with `ok: true` and no
- *  `data`; a later one answers it with an {@link UNSUPPORTED_RUN_REQUEST} error. Both mean the same. */
+/** An {@link UNSUPPORTED_RUN_REQUEST} error reply. Older responders answer an unknown verb with
+ *  `ok: true` and no `data` instead, which `getFanMembers` checks for itself. */
 function isUnsupported(err: unknown): boolean {
   return err instanceof UnsupportedRunRequestError;
 }

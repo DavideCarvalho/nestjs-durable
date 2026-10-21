@@ -8,8 +8,8 @@ import type {
 
 /**
  * The error `code` a responder replies with for a verb it does not know, so a newer tenant can tell
- * "this control plane is older than me" from a real failure and fall back at once. Responders on
- * 0.46.x and earlier reply `ok: true` with no `data` instead; `ProxyRunGateway` reads both.
+ * "this control plane is older than me" from a real failure and fall back at once. Earlier
+ * responders reply `ok: true` with no `data` instead; `ProxyRunGateway` reads both.
  */
 export const UNSUPPORTED_RUN_REQUEST = 'unsupported-request';
 
