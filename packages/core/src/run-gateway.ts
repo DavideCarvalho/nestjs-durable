@@ -45,6 +45,16 @@ export interface RunDetail {
   fans?: FanSummary[] | undefined;
   /** How many children the run has, when `children` lists only the first of them. */
   childCount?: number | undefined;
+  /**
+   * A validator for this detail, when the gateway can compute one without reading the timeline:
+   * it changes whenever the run or any of its checkpoints does. Absent when it cannot.
+   */
+  etag?: string | undefined;
+  /**
+   * Set when {@link RunDetailOptions.ifNoneMatch} matched {@link etag}: nothing changed, so only
+   * `run` was read — `timeline` and `children` are empty, not the run's.
+   */
+  notModified?: true | undefined;
 }
 
 /** How to shape a {@link RunDetail}. */
@@ -55,6 +65,11 @@ export interface RunDetailOptions {
    * with a wide fan should set it: the full detail of a 40k-member fan is megabytes.
    */
   summarizeFansOver?: number | undefined;
+  /**
+   * An HTTP `If-None-Match` value. When it names the detail's current {@link RunDetail.etag}, the
+   * gateway answers `notModified` without reading the timeline. A gateway that cannot tell ignores it.
+   */
+  ifNoneMatch?: string | undefined;
 }
 
 /**
