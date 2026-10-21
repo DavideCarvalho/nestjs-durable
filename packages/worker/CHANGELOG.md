@@ -1,5 +1,11 @@
 # @dudousxd/durable-worker
 
+## 0.10.4
+
+### Patch Changes
+
+- [#377](https://github.com/DavideCarvalho/nestjs-durable/pull/377) [`b02f7ad`](https://github.com/DavideCarvalho/nestjs-durable/commit/b02f7adb7bd1ac85c8d9c030f6e3c738de10dbe9) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A `concurrency` that is not a finite number of at least 1 falls back to its default instead of reaching BullMQ, which throws on it. The adaptive config gets the same guard: a bad `min`, `max`, `start` or `tickMs` uses its default (a `NaN` `tickMs` ran the control loop every millisecond), a bad `ramCeilingPct` uses 85 (a `NaN` one never braked), and a bad `cpuCeilingPct` turns the CPU ceiling off. Fractional counts are rounded down.
+
 ## 0.10.3
 
 ### Patch Changes
