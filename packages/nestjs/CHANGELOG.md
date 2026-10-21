@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.46.2
+
+### Patch Changes
+
+- [#359](https://github.com/DavideCarvalho/nestjs-durable/pull/359) [`3102694`](https://github.com/DavideCarvalho/nestjs-durable/commit/3102694eaff63cf6c40f69822810d62472f28a15) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Drain budget edge cases. `WorkflowEngine.beginDrain(spentMs)` now ignores non-finite or negative values instead of turning later drains into a ~1 ms wait. A `drain()` already waiting re-reads the reported wait, so a late `beginDrain(spentMs)` shortens it (deadline is its start plus the timeout minus the reported wait). The docs and the retention poller's comment now state that the retention sweep's shutdown wait is bounded by `shutdownTimeoutMs` on its own and is not deducted from the drain.
+
 ## 0.46.1
 
 ### Patch Changes
