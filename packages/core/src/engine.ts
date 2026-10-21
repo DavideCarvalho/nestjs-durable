@@ -596,6 +596,8 @@ export class WorkflowEngine {
   private draining = false;
   /** Wait already spent on this shutdown before `drain()` (see `beginDrain`). */
   private drainSpentMs = 0;
+  /** Re-arms the deadline of every `drain()` currently waiting, when more wait is reported. */
+  private readonly drainRearms = new Set<() => void>();
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
@@ -1508,7 +1510,12 @@ export class WorkflowEngine {
    */
   beginDrain(spentMs = 0): void {
     this.draining = true;
-    this.drainSpentMs += Math.max(0, spentMs);
+    // Non-finite values (NaN, Infinity) and negatives are ignored: one bad report must not turn
+    // every later drain into a 1 ms wait.
+    if (Number.isFinite(spentMs) && spentMs > 0) {
+      this.drainSpentMs += spentMs;
+      for (const rearm of this.drainRearms) rearm();
+    }
   }
 
   /**
@@ -1522,13 +1529,28 @@ export class WorkflowEngine {
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     this.beginDrain();
-    const budget = Math.max(0, timeoutMs - this.drainSpentMs);
     if (this.inflight.size === 0) return;
+    // The deadline is `start + timeoutMs - spent`, re-read whenever `beginDrain(spentMs)` reports more
+    // wait, so a drain that starts while the poller is still waiting is shortened once it reports.
+    const start = Date.now();
+    let rearm = (): void => {};
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     const timer = new Promise<void>((resolve) => {
-      const t = setTimeout(resolve, budget);
-      (t as { unref?: () => void }).unref?.();
+      rearm = () => {
+        clearTimeout(timeout);
+        const remaining = Math.max(0, start + timeoutMs - this.drainSpentMs - Date.now());
+        timeout = setTimeout(resolve, remaining);
+        (timeout as { unref?: () => void }).unref?.();
+      };
+      rearm();
     });
-    await Promise.race([Promise.allSettled([...this.inflight]), timer]);
+    this.drainRearms.add(rearm);
+    try {
+      await Promise.race([Promise.allSettled([...this.inflight]), timer]);
+    } finally {
+      this.drainRearms.delete(rearm);
+      clearTimeout(timeout);
+    }
   }
 
   /**

@@ -83,4 +83,33 @@ describe('drain stops new work', () => {
     await engine.drain(200);
     expect(Date.now() - started).toBeLessThan(150); // only ~50ms left of the 200ms
   });
+  it('[drain-spent-invalid] beginDrain ignores NaN, Infinity and negative reports', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('wf', '1', () => new Promise<void>(() => {}));
+    await engine.start('wf', {}, 'r1');
+    await new Promise((r) => setTimeout(r, 20)); // let the run register as in flight
+    engine.beginDrain(Number.NaN);
+    engine.beginDrain(Number.POSITIVE_INFINITY);
+    engine.beginDrain(-500);
+    engine.beginDrain('x' as unknown as number);
+    const started = Date.now();
+    await engine.drain(200);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(150); // the full budget, not ~1ms
+  });
+
+  it('[drain-rearm] a drain in progress is shortened when the poller reports its wait late', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('wf', '1', () => new Promise<void>(() => {}));
+    await engine.start('wf', {}, 'r1');
+    await new Promise((r) => setTimeout(r, 20)); // let the run register as in flight
+    const started = Date.now();
+    const draining = engine.drain(400);
+    await new Promise((r) => setTimeout(r, 50));
+    engine.beginDrain(300); // the poller settles after the drain began
+    await draining;
+    const took = Date.now() - started;
+    expect(took).toBeLessThan(250); // deadline is start + 400 - 300 = ~100ms, not 400
+  });
 });
