@@ -585,6 +585,12 @@ export class WorkflowEngine {
   private readonly updateValidators = new Map<string, UpdateValidator>();
   /** Runs being cancelled WITH saga compensation — see `cancel({ compensate: true })`. */
   private readonly cancelRequested = new Set<string>();
+  /**
+   * Seqs of the dispatched remote steps a turn suspended on, by run, while that turn executes on
+   * THIS instance — so the turn can re-check them once its lease is released (see
+   * {@link redriveSettledSteps}).
+   */
+  private readonly awaitedRemoteSteps = new Map<string, Set<number>>();
   /** Flow-control admission backend for remote steps (see {@link registerQueue}). */
   private readonly admission: AdmissionBackend;
   /** Runs on THIS instance blocked on admission, by queue — woken early on a freed-slot signal. */
@@ -2361,6 +2367,25 @@ export class WorkflowEngine {
    * itself. Only re-drives for a group with no waiter left whose checkpoints are all settled, which
    * the next turn is then guaranteed to see — so it cannot loop.
    */
+  /**
+   * Re-drive a run that just suspended on dispatched remote steps which, by now, have a result.
+   *
+   * Same race as {@link redriveSettledChildren}, for `ctx.step`: a result landing while the turn
+   * that dispatched it still holds the lease has its wake dropped by {@link execute}, and the turn
+   * then suspends with nothing left to wake it before the step's redispatch deadline. Called after
+   * the lease is released, so any later result wakes the run itself; it only re-drives for a
+   * checkpoint that is already settled, which the next turn replays past — so it cannot loop.
+   */
+  private async redriveSettledSteps(runId: string, seqs: Set<number>): Promise<void> {
+    for (const seq of seqs) {
+      const cp = await this.store.getCheckpoint(runId, seq);
+      if (cp && (cp.status === 'completed' || cp.status === 'failed')) {
+        await this.resumeImplicit(runId);
+        return;
+      }
+    }
+  }
+
   private async redriveSettledChildren(runId: string, fan: FanJoin): Promise<void> {
     if (!this.store.hasSignalWaiter) return;
     for (const wait of fan.waits) {
@@ -4050,6 +4075,9 @@ export class WorkflowEngine {
     const replay = new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
     let suspendedOnFan: FanJoin | undefined;
+    let suspendedOnSteps = false;
+    const awaitedSteps = new Set<number>();
+    this.awaitedRemoteSteps.set(run.id, awaitedSteps);
     const ctx = createWorkflowCtx(
       this.ctxHostFor(replay, run.namespace),
       run.id,
@@ -4119,6 +4147,7 @@ export class WorkflowEngine {
         }
         const suspended = await this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
         suspendedOnFan = err.fan;
+        suspendedOnSteps = suspended.status === 'suspended';
         return suspended;
       }
       // A cancel in flight that surfaced as a thrown error still settles cancelled (not failed) — the
@@ -4143,9 +4172,15 @@ export class WorkflowEngine {
     } finally {
       // Release the recovery lease once the run reaches a terminal/suspended state, so the
       // next instance (or the timer poller) can pick it up promptly.
+      if (this.awaitedRemoteSteps.get(run.id) === awaitedSteps) {
+        this.awaitedRemoteSteps.delete(run.id);
+      }
       await this.store.releaseRunLock(run.id);
       if (suspendedOnFan) {
         void this.redriveSettledChildren(run.id, suspendedOnFan).catch(() => undefined);
+      }
+      if (suspendedOnSteps && awaitedSteps.size > 0) {
+        void this.redriveSettledSteps(run.id, awaitedSteps).catch(() => undefined);
       }
     }
   }
@@ -4615,6 +4650,7 @@ export class WorkflowEngine {
     // pod can scale down or crash mid-step without losing the run or re-running completed work.
     if (step.timeoutMs) return this.callRemoteInMemory(runId, seq, step, input, transport, group);
     if (existing?.status === 'pending') {
+      this.awaitedRemoteSteps.get(runId)?.add(seq);
       // Dispatched; normally we just keep waiting for the result to resume the run. But a LOST dispatch
       // (worker crashed with no result, or the transport dropped the job) would hang here forever — a
       // reconcile re-drive replays straight back to this guard. Opt-in self-heal: once the step has been
@@ -4758,6 +4794,7 @@ export class WorkflowEngine {
       transport,
     });
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
+    this.awaitedRemoteSteps.get(runId)?.add(seq);
     throw new WorkflowSuspended();
   }
 
