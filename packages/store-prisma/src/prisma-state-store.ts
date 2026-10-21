@@ -316,6 +316,17 @@ export class PrismaStateStore implements StateStore {
     });
   }
 
+  async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
+    // One conditional `updateMany` (`UPDATE … WHERE run_id = ? AND seq = ? AND status = 'pending'`):
+    // the status predicate is the compare, the row count the answer, and a missing row is never made.
+    const { runId, seq, ...data } = toCheckpointData(checkpoint);
+    const { count } = await this.db.durableStepCheckpoint.updateMany({
+      where: { runId, seq, status: 'pending' },
+      data,
+    });
+    return count > 0;
+  }
+
   async transaction<T>(
     work: (tx: {
       raw: unknown;
@@ -589,6 +600,18 @@ export class PrismaStateStore implements StateStore {
       orderBy: { seq: 'desc' },
     });
     return row ? fromCheckpointRow(row) : undefined;
+  }
+
+  async countCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<number> {
+    if (statuses.length === 0) return 0;
+    return this.db.durableStepCheckpoint.count({
+      where: { runId, seq: { gte: fromSeq, lte: toSeq }, status: { in: statuses } },
+    });
   }
 
   async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {

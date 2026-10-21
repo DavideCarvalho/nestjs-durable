@@ -217,6 +217,31 @@ describe('PrismaStateStore', () => {
     }
   });
 
+  it('runs the checkpoint compare-and-set and the fan count as one statement each', async (ctx) => {
+    if (!available) ctx.skip();
+    await store.createRun(run());
+    await store.saveCheckpoint(checkpoint({ status: 'pending', output: undefined }));
+    const queries: string[] = [];
+    const onQuery = (e: { query: string }) => queries.push(e.query);
+    prisma.$on('query', onQuery);
+    try {
+      const sql = () => queries.filter((q) => /durable_step_checkpoints/i.test(q));
+      queries.length = 0;
+      expect(await store.saveCheckpointIfPending(checkpoint())).toBe(true);
+      // No read before the write: the status predicate rides on the UPDATE itself.
+      expect(sql()).toHaveLength(1);
+      expect(sql()[0]).toMatch(/^update/i);
+      expect(sql()[0]).toMatch(/status/i);
+
+      queries.length = 0;
+      expect(await store.countCheckpoints('r1', 0, 5, ['completed'])).toBe(1);
+      expect(sql()).toHaveLength(1);
+      expect(sql()[0]).toMatch(/count\(/i);
+    } finally {
+      prisma.$off?.('query', onQuery);
+    }
+  });
+
   it('maintains the side-table on create and re-indexes on update', async (ctx) => {
     if (!available) ctx.skip();
     await store.createRun(run({ id: 'a', searchAttributes: { tier: 'free', amount: 10 } }));

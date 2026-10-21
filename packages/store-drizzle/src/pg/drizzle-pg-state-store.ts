@@ -282,6 +282,25 @@ export class DrizzlePgStateStore implements StateStore {
     await upsertCheckpoint(this.db, checkpoint);
   }
 
+  async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
+    // One conditional UPDATE: a writer racing a settling result blocks on the row lock, then
+    // re-evaluates `status = 'pending'` against the committed row and matches nothing. A missing
+    // row matches nothing either, so it is never created.
+    const { runId, seq, ...set } = toCheckpointRow(checkpoint);
+    const rows = await this.db
+      .update(stepCheckpoints)
+      .set(set)
+      .where(
+        and(
+          eq(stepCheckpoints.runId, runId),
+          eq(stepCheckpoints.seq, seq),
+          eq(stepCheckpoints.status, 'pending'),
+        ),
+      )
+      .returning({ seq: stepCheckpoints.seq });
+    return rows.length === 1;
+  }
+
   async transaction<T>(work: (tx: StoreTransaction) => Promise<T>): Promise<T> {
     return this.db.transaction(async (tx) =>
       work({ raw: tx, saveCheckpoint: (cp) => upsertCheckpoint(tx, cp) }),
@@ -593,6 +612,27 @@ export class DrizzlePgStateStore implements StateStore {
       .orderBy(desc(stepCheckpoints.seq))
       .limit(1);
     return rows[0] ? fromCheckpointRow(rows[0]) : undefined;
+  }
+
+  async countCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<number> {
+    if (statuses.length === 0) return 0;
+    const rows = await this.db
+      .select({ count: sql<number>`count(*)`.mapWith(Number) })
+      .from(stepCheckpoints)
+      .where(
+        and(
+          eq(stepCheckpoints.runId, runId),
+          gte(stepCheckpoints.seq, fromSeq),
+          lte(stepCheckpoints.seq, toSeq),
+          inArray(stepCheckpoints.status, statuses),
+        ),
+      );
+    return rows[0]?.count ?? 0;
   }
 
   async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {
