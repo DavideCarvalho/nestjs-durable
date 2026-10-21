@@ -122,9 +122,13 @@ Shutdown happens in three steps, in this order (Nest runs every `onModuleDestroy
    driving operator the engine stops executing newly started runs from this point: they stay
    `pending` for another instance's poll or the next boot.
 2. **Drain.** The module calls `engine.drain(shutdownTimeoutMs)` — `shutdownTimeoutMs` defaults to
-   10 000. Time already spent in step 1 waiting for the poll is deducted, so steps 1 and 2 together
-   take at most `shutdownTimeoutMs`; time that merely passes between them (other hooks, the HTTP
-   server closing) is not charged, and with no poll in flight `drain` gets the full timeout.
+   10 000. Time already spent in step 1 waiting for the timer poll is deducted, so the timer poll's wait
+   and the drain together take at most `shutdownTimeoutMs`; time that merely passes between them
+   (other hooks, the HTTP server closing) is not charged, and with no poll in flight `drain` gets the
+   full timeout. The retention sweep's own wait (also bounded by `shutdownTimeoutMs`) runs
+   concurrently in step 1 and is not deducted, so a slow prune can add up to one more
+   `shutdownTimeoutMs` before the drain. A `drain()` you call yourself while the poller is still
+   waiting starts with the full budget and is shortened as soon as the poller reports its wait.
 3. **Transport close**, bounded separately by the transport's `closeTimeoutMs`.
 
 `drain` turns recovery and the pending-run poll into no-ops, so no *new* run starts, then

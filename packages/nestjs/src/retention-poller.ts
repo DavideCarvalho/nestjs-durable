@@ -128,7 +128,9 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
   }
 
   /** Stop sweeping and wait for the sweep in flight (bounded by `shutdownTimeoutMs`, default 10s),
-   *  so no prune is still pending when the host closes its connection pool. */
+   *  so no prune is still pending when the host closes its connection pool. This wait runs concurrently
+   *  with the timer poller's and is NOT deducted from the engine's drain budget (the retention poller
+   *  holds no engine), so a slow prune can add up to one more `shutdownTimeoutMs` before the drain. */
   async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.stopping = true;
