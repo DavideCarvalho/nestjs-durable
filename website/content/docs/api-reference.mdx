@@ -300,6 +300,11 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `instanceId` | `string` | random | Unique id for this instance (leases, worker heartbeats). |
 | `maxRecoveryAttempts` | `number` | unlimited | Cap recovery attempts before a poison-pill run moves to `dead`. See [Dead-letter queue](/docs/reliability/dead-letter). |
 | `remoteAdvanceSilenceMs` | `number` | unbounded await | Liveness deadline for a remote (polyglot) workflow `advance`; each heartbeat rearms it. Operator only. |
+| `reconcileMs` | `number` | `300000` | Fallback re-drive for a run suspended on an event whose wake-up was lost; `0` disables it. Operator only. |
+| `timerBatchSize` | `number` | `500` | Most due timers one timer-poll pass loads and drives, most overdue first. A non-finite or sub-1 value falls back to 500. Operator only. |
+| `eventBufferTtlMs` | `number` | keep until consumed | Retention for a buffered event no `waitForEvent` claims; pruned by the reconcile pass. Operator only. |
+| `blockedPollMs` | `number` | `5000` | How often a run parked `blocked` (no capable live worker) re-checks the fleet. Operator only. |
+| `trackStepStart` | `boolean` | `true` | Persist a `running` checkpoint when a local step starts; `false` halves checkpoint writes on hot paths. Operator only. |
 | `deadLetterWorkflow` | `WorkflowRef` | none | Default DLQ target for workflows without their own. Operator only. |
 | `drive` | `boolean` | `true` | Whether this operator instance actively drives runs (poll/recover/resume/prune/consume). `false` = dashboard/dispatch-only. |
 | `shutdownTimeoutMs` | `number` | `10000` | Max ms to wait for in-flight runs on shutdown. Operator only. |

@@ -272,6 +272,26 @@ export class TypeOrmStateStore implements StateStore {
     await this.checkpoints().upsert(entity, ['runId', 'seq']);
   }
 
+  async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
+    // One conditional UPDATE: the `status = 'pending'` predicate is the compare, the affected-row
+    // count the answer. A missing row matches nothing, so it is never created.
+    const { runId, seq, ...data } = toCheckpointEntity(checkpoint);
+    const set: QueryDeepPartialEntity<StepCheckpointEntity> = {
+      ...(data as QueryDeepPartialEntity<StepCheckpointEntity>),
+      wakeAt: checkpoint.wakeAt != null ? new Date(checkpoint.wakeAt) : () => 'NULL',
+    };
+    for (const key of Object.keys(set) as (keyof typeof set)[]) {
+      if (set[key] === undefined) delete set[key];
+    }
+    const result = await this.checkpoints()
+      .createQueryBuilder()
+      .update()
+      .set(set)
+      .where({ runId, seq, status: 'pending' })
+      .execute();
+    return (result.affected ?? 0) > 0;
+  }
+
   async transaction<T>(
     work: (tx: {
       raw: unknown;
@@ -609,6 +629,23 @@ export class TypeOrmStateStore implements StateStore {
   ): Promise<StepCheckpoint | undefined> {
     const e = await this.checkpoints().findOne({ where: { runId, name }, order: { seq: 'DESC' } });
     return e ? fromCheckpointEntity(e) : undefined;
+  }
+
+  async countCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<number> {
+    if (statuses.length === 0) return 0;
+    // A plain `COUNT(*)` over the `(runId, seq)` primary key; `Repository.count` would emit a
+    // `COUNT(DISTINCT …)` over the composite key instead.
+    const row = await this.checkpoints()
+      .createQueryBuilder('cp')
+      .select('COUNT(*)', 'count')
+      .where({ runId, seq: Between(fromSeq, toSeq), status: In(statuses) })
+      .getRawOne<{ count: number | string }>();
+    return Number(row?.count ?? 0);
   }
 
   async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {

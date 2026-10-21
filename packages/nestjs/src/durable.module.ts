@@ -278,6 +278,37 @@ export interface DurableModuleOptions {
    */
   remoteRedispatchMax?: number;
   /**
+   * Fallback wake-up (ms) for a run suspended on an event (child, signal, `waitForEvent`, remote
+   * result) whose wake-up was lost: the reconcile pass re-drives it after this window, an idempotent
+   * replay that re-suspends a still-pending wait. Defaults to 300000 (5min); `0` disables it.
+   * See `WorkflowEngineDeps.reconcileMs`. Operator only.
+   */
+  reconcileMs?: number;
+  /**
+   * The most due timers one timer-poll pass loads and drives, most overdue first, so a wave of
+   * thousands of due runs is worked through in batches. Defaults to 500; a non-finite or sub-1 value
+   * falls back to the default. See `WorkflowEngineDeps.timerBatchSize`. Operator only.
+   */
+  timerBatchSize?: number;
+  /**
+   * Retention (ms) for a buffered event that no `waitForEvent` ever claims; the reconcile pass prunes
+   * rows past `publishedAt + eventBufferTtlMs`. Omit (or `0`) to keep them until consumed, the
+   * default. See `WorkflowEngineDeps.eventBufferTtlMs`. Operator only.
+   */
+  eventBufferTtlMs?: number;
+  /**
+   * How long (ms) a run parked `blocked` (no capable, protocol-compatible live worker) waits before
+   * the blocked-recovery poll re-checks the fleet. Defaults to 5000. See
+   * `WorkflowEngineDeps.blockedPollMs`. Operator only.
+   */
+  blockedPollMs?: number;
+  /**
+   * Persist a `running` checkpoint when a local step's body begins, so an in-flight step survives a
+   * dashboard reload. Defaults to `true`; set `false` on hot paths with many short local steps to
+   * halve their checkpoint writes. See `WorkflowEngineDeps.trackStepStart`. Operator only.
+   */
+  trackStepStart?: boolean;
+  /**
    * The **default** workflow to route dead-lettered runs to, for workflows that don't declare their
    * own. When a run is moved to `dead` (exceeded `maxRecoveryAttempts`), the started handler gets a
    * `DeadLetter` payload `{ deadRunId, workflow, input, error }` (idempotent by a `dlq:<runId>` id) —
@@ -784,6 +815,11 @@ export class DurableModule {
               remoteAdvanceSilenceMs: options.remoteAdvanceSilenceMs,
               remoteRedispatchMs: options.remoteRedispatchMs,
               remoteRedispatchMax: options.remoteRedispatchMax,
+              reconcileMs: options.reconcileMs,
+              timerBatchSize: options.timerBatchSize,
+              eventBufferTtlMs: options.eventBufferTtlMs,
+              blockedPollMs: options.blockedPollMs,
+              trackStepStart: options.trackStepStart,
               instanceId: options.instanceId,
               namespace: options.namespace,
               webhookUrl: options.webhookUrl,
