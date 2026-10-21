@@ -591,6 +591,12 @@ export class WorkflowEngine {
    * {@link redriveSettledSteps}).
    */
   private readonly awaitedRemoteSteps = new Map<string, Set<number>>();
+  /**
+   * When THIS instance settled a remote step from its result, by `runId:seq`. That result's resume
+   * runs here, and `execute` lets it into a lease this instance holds, so its wake is never the
+   * dropped one {@link redriveSettledSteps} recovers. Pruned by age (see {@link noteSettledHere}).
+   */
+  private readonly settledHere = new Map<string, number>();
   /** Flow-control admission backend for remote steps (see {@link registerQueue}). */
   private readonly admission: AdmissionBackend;
   /** Runs on THIS instance blocked on admission, by queue — woken early on a freed-slot signal. */
@@ -2389,6 +2395,21 @@ export class WorkflowEngine {
     for (const seq of seqs) {
       const cp = await this.store.getCheckpoint(runId, seq);
       if (cp && (cp.status === 'completed' || cp.status === 'failed')) {
+        // Settled on this instance: its own resume drives the run. Re-driving would replay the
+        // body once more, and a workflow body with effects between steps is not free to replay.
+        if (this.settledHere.has(`${runId}:${seq}`)) return;
+        // Take the lease first, like `runOne`. The result's own resume may already hold it, and
+        // `execute` lets this instance re-enter its own lease, so resuming without it would run a
+        // second, concurrent turn of the run. Whichever turn holds it replays the settled step.
+        const nowMs = this.clock();
+        if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) {
+          return;
+        }
+        const run = await this.store.getRun(runId);
+        if (run?.status !== 'suspended') {
+          await this.store.releaseRunLock(runId);
+          return;
+        }
         await this.resumeImplicit(runId);
         return;
       }
@@ -4834,6 +4855,16 @@ export class WorkflowEngine {
     throw new WorkflowSuspended();
   }
 
+  /** Remember a step settled here, forgetting entries older than a lease so the map stays small. */
+  private noteSettledHere(key: string): void {
+    const now = this.clock();
+    this.settledHere.set(key, now);
+    if (this.settledHere.size < 1024) return;
+    for (const [k, at] of this.settledHere) {
+      if (now - at > this.leaseMs) this.settledHere.delete(k);
+    }
+  }
+
   /** {@link StateStore.saveCheckpointIfPending}, or a plain save on a store without it. */
   private async savePendingCheckpoint(checkpoint: StepCheckpoint): Promise<boolean> {
     if (this.store.saveCheckpointIfPending) return this.store.saveCheckpointIfPending(checkpoint);
@@ -4902,6 +4933,7 @@ export class WorkflowEngine {
       finishedAt,
     });
     if (!claimed) return;
+    this.noteSettledHere(`${result.runId}:${result.seq}`);
     this.emit({
       type: result.status === 'completed' ? 'step.completed' : 'step.failed',
       runId: result.runId,
