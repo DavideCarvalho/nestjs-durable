@@ -260,4 +260,35 @@ describe('StoreRunGateway', () => {
     await engine.waitForRun('r1-again');
     expect(seen).toEqual([]); // no more deliveries after unsubscribe
   });
+
+  it('summarizes a wide fan on request: one FanSummary, its members paged on demand', async () => {
+    const { store, engine, gateway } = setup();
+    engine.register('child', '1', async (_ctx, input) => (input as { i: number }).i);
+    engine.register('parent', '1', async (ctx) =>
+      ctx.all<number>(
+        'child',
+        Array.from({ length: 80 }, (_, i) => ({ i })),
+      ),
+    );
+    await engine.start('parent', {}, 'p');
+    for (let i = 0; i < 400 && (await store.getRun('p'))?.status !== 'completed'; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+
+    const full = await gateway.getRunDetail('p');
+    expect(full?.fans).toBeUndefined();
+    expect(full?.children).toHaveLength(80);
+
+    const summarized = await gateway.getRunDetail('p', { summarizeFansOver: 50 });
+    expect(summarized?.fans).toHaveLength(1);
+    expect(summarized?.fans?.[0]).toMatchObject({ label: 'child runs', size: 80 });
+    expect(summarized?.timeline.length).toBeLessThan(full?.timeline.length ?? 0);
+    expect(summarized?.childCount).toBe(80);
+
+    const group = summarized?.fans?.[0]?.group as string;
+    const page = await gateway.getFanMembers('p', group, { offset: 0, limit: 10 });
+    expect(page?.items.length).toBeGreaterThan(0);
+    expect(page?.items.every((cp) => cp.parallelGroup === group)).toBe(true);
+    expect(await gateway.getFanMembers('missing', group, {})).toBeNull();
+  });
 });

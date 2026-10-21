@@ -1,6 +1,8 @@
 import type { z } from 'zod';
 import type { WorkerDescriptor } from './handshake/descriptor';
 import type { DispatchDiagnostics } from './handshake/dispatch-routing';
+import type { FanPageQuery } from './run-detail-summary';
+import type { RunDetailOptions } from './run-gateway';
 import type { StandardSchemaV1 } from './standard-schema';
 import type { StepRef } from './step-name-symbol';
 import type { WorkflowClass, WorkflowInputOf, WorkflowOutputOf } from './workflow-ref';
@@ -1042,7 +1044,8 @@ export interface RunRequest {
 
 /** The discriminated verb + args of a {@link RunRequest}. Mirrors the tenant-facing `RunGateway`. */
 export type RunRequestKind =
-  | { kind: 'getRunDetail'; runId: string }
+  | { kind: 'getRunDetail'; runId: string; options?: RunDetailOptions | undefined }
+  | { kind: 'getFanMembers'; runId: string; group: string; query: FanPageQuery }
   | { kind: 'listRuns'; query: RunQuery }
   | { kind: 'runFacets'; query: RunFacetQuery }
   | {

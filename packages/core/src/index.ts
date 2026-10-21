@@ -17,6 +17,7 @@ export * from './remote-workflow-executor';
 export * from './run-facets';
 export * from './run-value-facets';
 export * from './run-gateway';
+export * from './run-detail-summary';
 export * from './run-waiting';
 export { parentRunIdOf } from './fan-join';
 export * from './codec-state-store';

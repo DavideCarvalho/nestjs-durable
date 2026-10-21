@@ -12,6 +12,7 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from './interfaces';
+import type { FanPage, FanPageQuery, FanSummary } from './run-detail-summary';
 
 /** A run as returned by the gateway's list — the durable run plus an optional {@link RunWaiting}
  *  descriptor the control plane resolves (what a suspended run is parked on), so the dashboard can
@@ -33,10 +34,27 @@ export interface DurableTopology {
  *  it via {@link WireDates} instead of hand-mirroring field by field. */
 export interface RunDetail {
   run: WorkflowRun;
-  /** Steps in execution order (local + remote). */
+  /**
+   * Steps in execution order (local + remote). With {@link RunDetailOptions.summarizeFansOver}, the
+   * members of a summarized fan are left out — see {@link fans}.
+   */
   timeline: StepCheckpoint[];
-  /** Ids of runs this run spawned (parent→children tree). */
+  /** Ids of runs this run spawned (parent→children tree). Capped when summarized — see {@link childCount}. */
   children: string[];
+  /** The fans drawn as one node each, when the detail was asked to summarize them. */
+  fans?: FanSummary[] | undefined;
+  /** How many children the run has, when `children` lists only the first of them. */
+  childCount?: number | undefined;
+}
+
+/** How to shape a {@link RunDetail}. */
+export interface RunDetailOptions {
+  /**
+   * Summarize every fan with more than this many members into a {@link FanSummary} instead of
+   * listing them, and cap `children`. Unset returns the full timeline, as before. A view of a run
+   * with a wide fan should set it: the full detail of a 40k-member fan is megabytes.
+   */
+  summarizeFansOver?: number | undefined;
 }
 
 /**
@@ -71,7 +89,17 @@ export type WireDates<T> = {
 export abstract class RunGateway {
   /** This deployment's durable role (control plane vs tenant) — synchronous local metadata. */
   abstract topology(): DurableTopology;
-  abstract getRunDetail(runId: string): Promise<RunDetail | null>;
+  abstract getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null>;
+  /**
+   * One page of a fan's members, for a view that drew the fan from its {@link FanSummary}. Optional:
+   * a gateway without it serves summarized details whose fans cannot be expanded.
+   */
+  getFanMembers?(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null>;
+  /**
+   * The run alone, without its timeline. Optional: a caller that only needs the run (an ownership
+   * check) falls back to {@link getRunDetail}, which reads every checkpoint.
+   */
+  getRun?(runId: string): Promise<WorkflowRun | null>;
   /** List runs, each optionally carrying a {@link RunWaiting} descriptor (what a suspended run is
    *  parked on). The store-backed gateway resolves `waiting`; a proxy relays whatever the control
    *  plane sent. */

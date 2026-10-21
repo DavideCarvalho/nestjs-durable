@@ -1,4 +1,5 @@
 import type {
+  FanSummary as CoreFanSummary,
   RunListItem as CoreRunListItem,
   RunStatus as CoreRunStatus,
   RunWaiting as CoreRunWaiting,
@@ -95,6 +96,27 @@ export interface RunDetail {
    * it, and every read already guards with `?.`. Deliberate, load-bearing local divergence.
    */
   children?: string[];
+  /** The fans drawn as one node each: their members are absent from `timeline`. */
+  fans?: FanSummary[] | undefined;
+  /** How many children the run has, when `children` lists only the first of them. */
+  childCount?: number | undefined;
+}
+
+export type FanSummary = Omit<WireDates<CoreFanSummary>, 'failures'> & {
+  failures: StepCheckpoint[];
+};
+
+/** One page of a summarized fan's members, in seq order. `total` counts every matching member. */
+export interface FanPage {
+  items: StepCheckpoint[];
+  total: number;
+}
+
+export interface FanPageOptions {
+  offset?: number | undefined;
+  limit?: number | undefined;
+  /** Only failed members (a failed step, or a child that failed). */
+  failed?: boolean | undefined;
 }
 
 /** How long a remote step may sit `pending` (dispatched, no result) before it's presumed a LOST
@@ -534,6 +556,16 @@ export const durableClient = {
   },
   run(id: string): Promise<RunDetail> {
     return http<RunDetail>(`/runs/${encodeURIComponent(id)}`);
+  },
+  /** One page of a summarized fan's members — the ones {@link run} left out of its timeline. */
+  fanMembers(runId: string, group: string, opts: FanPageOptions = {}): Promise<FanPage> {
+    const params = new URLSearchParams();
+    if (opts.offset !== undefined) params.set('offset', String(opts.offset));
+    if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts.failed) params.set('failed', 'true');
+    const qs = params.toString();
+    const path = `/runs/${encodeURIComponent(runId)}/fans/${encodeURIComponent(group)}`;
+    return http<FanPage>(qs ? `${path}?${qs}` : path);
   },
   /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. */
   workers(): Promise<GroupHealth[]> {

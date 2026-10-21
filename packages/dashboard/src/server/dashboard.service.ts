@@ -1,9 +1,12 @@
 import {
   type DurableTopology,
   type EngineEvent,
+  type FanPage,
+  type FanPageQuery,
   type GroupHealth,
   type MetricsCollector,
   type RunDetail,
+  type RunDetailOptions,
   type RunFacetQuery,
   type RunFacetRow,
   RunGateway,
@@ -168,8 +171,13 @@ export class DashboardService {
     return this.gateway.workerHealth();
   }
 
-  getRunDetail(runId: string): Promise<RunDetail | null> {
-    return this.gateway.getRunDetail(runId);
+  getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    return this.gateway.getRunDetail(runId, options);
+  }
+
+  /** A page of one fan's members, or null when the run is unknown or the gateway can't page fans. */
+  async getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    return (await this.gateway.getFanMembers?.(runId, group, query)) ?? null;
   }
 
   /** Fix-and-replay a dead/failed run with a corrected input — a fresh linked run. Returns its id. */

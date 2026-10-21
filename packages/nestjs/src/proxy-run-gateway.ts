@@ -1,8 +1,11 @@
 import type {
   DurableTopology,
   EngineEvent,
+  FanPage,
+  FanPageQuery,
   GroupHealth,
   RunDetail,
+  RunDetailOptions,
   RunFacetQuery,
   RunFacetRow,
   RunGateway,
@@ -89,8 +92,12 @@ export class ProxyRunGateway implements RunGateway {
     return { role: 'tenant', tenant: this.tenant };
   }
 
-  getRunDetail(runId: string): Promise<RunDetail | null> {
-    return this.request<RunDetail | null>({ kind: 'getRunDetail', runId });
+  getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    return this.request<RunDetail | null>({ kind: 'getRunDetail', runId, options });
+  }
+
+  getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    return this.request<FanPage | null>({ kind: 'getFanMembers', runId, group, query });
   }
 
   /** The control plane's `StoreRunGateway` resolves each run's `waiting` descriptor; the reply carries

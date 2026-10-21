@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import type { StepCheckpoint, WorkflowRun } from '../client/durable-client';
+import type { FanSummary, StepCheckpoint, WorkflowRun } from '../client/durable-client';
 import { RunSpans } from './SpansTimeline';
 
 // A structural (not pixel) render test for the StepRow / ParallelFan split: render RunSpans to a
@@ -34,7 +34,7 @@ function cp(over: Partial<StepCheckpoint> = {}): StepCheckpoint {
 
 /** Render RunSpans for a timeline to a static HTML string (wrapped in a QueryClientProvider, which
  *  `useChildRuns` needs). */
-function renderSpans(timeline: StepCheckpoint[]): string {
+function renderSpans(timeline: StepCheckpoint[], fans?: FanSummary[]): string {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return renderToStaticMarkup(
     createElement(
@@ -43,6 +43,7 @@ function renderSpans(timeline: StepCheckpoint[]): string {
       createElement(RunSpans, {
         run: RUN,
         timeline,
+        fans,
         depth: 0,
         onSelect: () => {},
         onOpenRun: () => {},
@@ -98,5 +99,40 @@ describe('RunSpans render structure', () => {
     expect(count(html, FAN_HEADER)).toBe(0);
     expect(count(html, STEP_ROW)).toBe(3);
     for (const name of ['a', 'b', 'c']) expect(html).toContain(name);
+  });
+});
+
+describe('RunSpans with a summarized fan', () => {
+  const failure = cp({ seq: 7, name: 'work', status: 'failed', parallelGroup: 'steps:1:40000' });
+  const fan: FanSummary = {
+    group: 'steps:1:40000',
+    label: 'work',
+    firstSeq: 1,
+    lastSeq: 40000,
+    size: 40000,
+    failFast: false,
+    counts: { completed: 39990, failed: 10 },
+    startedAt: '2026-01-01T00:00:01.000Z',
+    finishedAt: '2026-01-01T00:00:04.000Z',
+    failures: [failure],
+  };
+
+  it('draws the fan as one header with its size and counts, not a row per member', () => {
+    const html = renderSpans(
+      [cp({ seq: 0, name: 'setup' }), cp({ seq: 40001, name: 'finalize' })],
+      [fan],
+    );
+    expect(html).toContain('work ×40000');
+    expect(html).toContain('39990 done');
+    expect(html).toContain('10 failed');
+    // setup + finalize + the fan header + its one sampled failure.
+    expect(count(html, STEP_ROW)).toBe(4);
+    expect(html.indexOf('setup')).toBeLessThan(html.indexOf('work ×40000'));
+    expect(html.indexOf('work ×40000')).toBeLessThan(html.indexOf('finalize'));
+  });
+
+  it('says the failures listed are a sample when there are more', () => {
+    const html = renderSpans([], [fan]);
+    expect(html).toContain('first 1 of 10 failed');
   });
 });

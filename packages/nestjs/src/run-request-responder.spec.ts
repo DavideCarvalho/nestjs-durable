@@ -96,6 +96,63 @@ describe('RunRequestResponder', () => {
     expect(tx.replies[0]).toMatchObject({ requestId: 'q1', result: { ok: true } });
   });
 
+  it('passes getRunDetail options through, and pages a fan only for the owning tenant', async () => {
+    const getFanMembers = vi.fn(async () => ({ items: [], total: 0 }));
+    const gw = fakeGateway({ getFanMembers });
+    const tx = fakeTransport();
+    new RunRequestResponder(tx, gw).start();
+
+    await tx.deliver({
+      requestId: 'q1',
+      tenant: 'acme',
+      body: { kind: 'getRunDetail', runId: 'r1', options: { summarizeFansOver: 50 } },
+    });
+    expect(gw.getRunDetail).toHaveBeenCalledWith('r1', { summarizeFansOver: 50 });
+
+    await tx.deliver({
+      requestId: 'q2',
+      tenant: 'acme',
+      body: { kind: 'getFanMembers', runId: 'r1', group: 'steps:0:9', query: { limit: 5 } },
+    });
+    expect(getFanMembers).toHaveBeenCalledWith('r1', 'steps:0:9', { limit: 5 });
+    expect(tx.replies[1]).toMatchObject({ requestId: 'q2', result: { ok: true } });
+
+    await tx.deliver({
+      requestId: 'q3',
+      tenant: 'beta',
+      body: { kind: 'getFanMembers', runId: 'r1', group: 'steps:0:9', query: {} },
+    });
+    expect(getFanMembers).toHaveBeenCalledTimes(1);
+    expect(tx.replies[2]).toMatchObject({ result: { ok: false } });
+  });
+
+  it('checks ownership on the run alone when the gateway can read it, never the timeline', async () => {
+    const getRun = vi.fn(async (id: string) => fakeRun(id, 'acme'));
+    const getFanMembers = vi.fn(async () => ({ items: [], total: 0 }));
+    const gw = fakeGateway({ getRun, getFanMembers });
+    const tx = fakeTransport();
+    new RunRequestResponder(tx, gw).start();
+
+    await tx.deliver({
+      requestId: 'q1',
+      tenant: 'acme',
+      body: { kind: 'getFanMembers', runId: 'r1', group: 'steps:0:9', query: {} },
+    });
+    await tx.deliver({ requestId: 'q2', tenant: 'acme', body: { kind: 'cancel', runId: 'r1' } });
+    await tx.deliver({
+      requestId: 'q3',
+      tenant: 'beta',
+      body: { kind: 'retry', runId: 'r1' },
+    });
+
+    expect(gw.getRunDetail).not.toHaveBeenCalled();
+    expect(getRun).toHaveBeenCalledTimes(3);
+    expect(getFanMembers).toHaveBeenCalledTimes(1);
+    expect(gw.cancel).toHaveBeenCalledTimes(1);
+    expect(gw.retry).not.toHaveBeenCalled();
+    expect(tx.replies[2]).toMatchObject({ result: { ok: false } });
+  });
+
   it('denies a cross-tenant getRunDetail and never calls the verb again', async () => {
     const gw = fakeGateway({
       getRunDetail: vi.fn(
