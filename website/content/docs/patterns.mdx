@@ -151,7 +151,13 @@ const results = await ctx.all(this.records.processRecord, batch.records, { concu
 
 The same `mode`, `concurrency` and `GatherError` apply. Every step of the fan uses the `@Step`'s
 retry policy (or the per-call `retries` / `backoff` you pass). A flow-control `queue` and a liveness
-`timeoutMs` are not supported on a step fan.
+`timeoutMs` are not supported on a step fan. Under `concurrency` the steps go out in strict waves of
+that size, and `failFast` stops sending further waves without cancelling the steps already in
+flight. See [The same step over many inputs](/docs/concepts/workflows-and-steps#the-same-step-over-many-inputs--ctxallstep-inputs).
+
+For a wide fan, also raise the BullMQ transport's `resultConcurrency` on the instances that consume
+results, so the fan's results are not handled one at a time per pod. See
+[Tuning for wide fans](/docs/production#tuning-for-wide-fans).
 
 ## 4. Cron digest
 

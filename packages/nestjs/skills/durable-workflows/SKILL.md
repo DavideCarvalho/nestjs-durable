@@ -6,7 +6,8 @@ description: >
   always dispatched, always engine-scheduled. @Step()-decorated provider methods carry the routing
   identity (derived Class.method name, or an explicit override); a method reference dispatches a
   same-process/typed step, a string name dispatches a cross-runtime one (e.g. a Python worker). Covers
-  retries/backoff and FatalError, Promise.all fan-out, sub-process log.sub/subProcess annotations
+  retries/backoff and FatalError, Promise.all fan-out, ctx.all over a @Step (step fans with
+  concurrency waves and waitAll/failFast), sub-process log.sub/subProcess annotations
   inside a @Step handler, ctx.child for cross-runtime sub-workflows, and constructor dependency
   injection inside a workflow class.
 license: MIT
@@ -148,6 +149,34 @@ const results = await ctx.all(this.lines.processLine, lines, { concurrency: 500 
 Prefer it to `Promise.all` past a handful of steps: every result of a `Promise.all` replays the
 workflow, which makes a fan of N steps cost O(N²) checkpoint reads. Prefer it to a child-workflow
 `ctx.all` when each item is just a step: a child costs a whole run (row, turn, lease, signal).
+
+How the step fan behaves (`AllStepsOptions`):
+
+- `concurrency` sends strict waves of that many steps; the next wave goes out once the whole
+  previous wave has settled. It is part of the fan's identity, like `inputs` — don't change it under
+  an in-flight run. It must be a positive integer.
+- `mode: 'waitAll'` (default) lets every step settle, then throws `GatherError` with every failed
+  index. `mode: 'failFast'` throws `GatherError` with the first failure, sends no further waves, and
+  does NOT cancel steps already in flight.
+- A step only counts as failed once its retries (the `@Step` policy, or per-call `retries` /
+  `backoff`) are spent.
+- Rejected: a `queue` option, and a `@Step` that declares `timeoutMs`.
+- The steps share `parallelGroup` `steps:<firstSeq>:<size>[:failFast]`.
+
+```ts
+import { GatherError } from '@dudousxd/nestjs-durable-core';
+
+let failedAt: number | undefined;
+try {
+  await ctx.all(this.lines.processLine, lines, { concurrency: 500, mode: 'failFast' });
+} catch (err) {
+  if (!(err instanceof GatherError)) throw err;
+  failedAt = err.failures[0]?.index; // the first failed input's position
+}
+```
+
+For a wide fan over `BullMQTransport`, raise `resultConcurrency` (default 1) on the instances that
+consume results; one run's results still resume it in order on an instance.
 
 ### Sub-process events inside a step
 

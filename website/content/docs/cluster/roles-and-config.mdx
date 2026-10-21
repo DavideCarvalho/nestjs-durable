@@ -147,7 +147,9 @@ export class RunsController {
 | Verb | Purpose |
 | --- | --- |
 | `topology()` | this pod's role, plus its `tenant` when store-less. Synchronous — no round-trip. |
-| `getRunDetail(runId)` | one run plus its step timeline and child ids, or `null` |
+| `getRunDetail(runId, options?)` | one run plus its step timeline and child ids, or `null`. With `{ summarizeFansOver: n }`, every fan wider than `n` comes back as a `FanSummary` in `fans` instead of its members, and `children` is capped at 200 with `childCount` as the total. Unset returns the full detail. |
+| `getFanMembers?(runId, group, query)` | *optional* — one page `{ items, total }` of a fan's members; `query` is `{ offset?, limit?, failedOnly? }` (limit defaults to 100, at most 500) |
+| `getRun?(runId)` | *optional* — the run alone, without its timeline |
 | `listRuns(query)` | a filtered listing (status, workflow, tag, namespace, search attributes), each row optionally carrying what a suspended run is parked on |
 | `runFacets(query)` | whole-set counts grouped by `(status, origin)` — exact even when the listing is paginated |
 | `runValueFacets(axis, query, opts?)` | the distinct values of one filter axis (tag, tenant, origin, workflow, search-attribute key or value) with counts — what fills a console's pickers |
@@ -161,6 +163,26 @@ export class RunsController {
 
 Tune the proxy round-trip with `runGatewayTimeoutMs` (default `10_000`). It is ignored on an
 operator, which is bound to the store-backed gateway.
+
+### Wide fans over the gateway
+
+The dashboard asks `getRunDetail(id, { summarizeFansOver: 50 })` and pages a fan with
+`getFanMembers` (see [Wide fans](/docs/observability/dashboard#wide-fans)). `StoreRunGateway`
+implements both, plus `getRun`. On a store-less pod, `ProxyRunGateway` forwards the detail options
+in its `getRunDetail` request and sends a `getFanMembers` request kind. The control plane's
+responder checks that the requesting tenant owns the run before it pages the fan, as it does
+before every run-scoped verb, so a tenant cannot page another tenant's fan.
+
+If you implement `RunGateway` yourself:
+
+- **`summarizeFansOver`** is a hint. A gateway that ignores it returns the full detail, and the
+  console renders every member as before.
+- **`getFanMembers`** is optional. Without it, the dashboard's `GET runs/:id/fans/:group` answers
+  404, so a summarized fan can be drawn but not expanded. Core exports `summarizeTimeline`,
+  `summarizeFan`, `pageFan` and `childIdsOf`, so a gateway that already loads the checkpoints can
+  implement both in a few lines, the way `StoreRunGateway` does.
+- **`getRun`** is optional. The ownership check uses it to read only the run row; without it, the
+  check falls back to `getRunDetail`, which reads every checkpoint of the run.
 
 <Callout type="info">
 **`cancel` on a store-less pod: same verb, two objects, opposite answers.** Injecting

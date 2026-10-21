@@ -44,7 +44,9 @@ queues (the BullMQ `Worker`'s own concurrency). It takes three forms:
 - `'adaptive'` — an `AdaptiveController` self-tunes the limit from a latency gradient, a RAM brake,
   and backpressure (errors/stalls), instead of you guessing a number.
 - `{ mode: 'adaptive', ... }` — adaptive with overrides (`min`, `max`, `start`, `ramCeilingPct`,
-  `cpuCeilingPct`, `tickMs`).
+  `cpuCeilingPct`, `tickMs`). The defaults are `min: 1`, `max: 32`, `start: min`,
+  `ramCeilingPct: 85`, no CPU ceiling, and `tickMs: 2000`. To pin the limit instead, pass a plain
+  number.
 
 A number that is not finite or is out of range falls back to its default: a fixed value, `min`,
 `max`, `start` or `tickMs` below 1 (or `NaN`, `Infinity`) uses the default, and so does a
@@ -67,6 +69,39 @@ Total parallelism across a fleet is `concurrency × replicas`. Either mode publi
 status — current limit, in-flight count, and (adaptive) the last adjustment — on the worker's
 heartbeat as a `WorkerStatus`. See [Flow control](/docs/reliability/flow-control#worker--transport-concurrency)
 for the full set of tunables and how the Telescope Workers dashboard renders it.
+
+### Result concurrency
+
+`concurrency` governs the **task** queues a worker consumes. The engine side consumes the shared
+`<prefix>-results` queue, and `resultConcurrency` sets how many results this instance handles at
+once. It defaults to `1`.
+
+Each result settles its step's checkpoint and then resumes the run inline. With one result at a time,
+a pod drives one run turn at a time off results, so the results of a wide fan queue up behind it.
+Raise `resultConcurrency` on the instances that consume results:
+
+```ts
+const transport = new BullMQTransport({
+  connection: { host: 'localhost', port: 6379 },
+  resultConcurrency: 16, // results of different runs handled in parallel
+});
+```
+
+Results of the **same** run still resume it in order on an instance. Settling a result (claiming its
+checkpoint, checking a step fan's join barrier) runs in parallel; only the turn each result triggers
+waits for the previous turn of that run on this instance. A run never gets two concurrent turns from
+one instance, and different runs proceed in parallel. The engine applies the same ordering to any
+transport that delivers results concurrently, including the in-process ones.
+
+A value that is not a finite number of at least 1 (`NaN`, `Infinity`, `0`) falls back to the default
+of `1`; a fractional value is rounded down.
+
+### Result delivery
+
+A result job whose handler throws (a store error at peak load, say) is retried up to 5 times with
+exponential backoff starting at 500 ms. A result that still fails is kept in the results queue for
+24 hours instead of being removed, and the transport logs that it gave up on it, with the step and
+run ids.
 
 ## Priority
 
@@ -132,6 +167,7 @@ lifecycle events and cancellation — and carries the tenant `start-run` / `run-
 | `namespace` | Logical deployment namespace segmenting every queue/stream/key. See [Namespace](#namespace) above. |
 | `instanceId` | Stable id for this worker process, stamped into its heartbeats/liveness keys. Defaults to `ts-<hostname>-<pid>`. |
 | `concurrency` | Fixed number, `'adaptive'`, or `{ mode: 'adaptive', ... }`. See [Concurrency](#concurrency) above. Defaults to `1`. |
+| `resultConcurrency` | How many step results this instance handles at once from the results queue. One run's results still resume it in order. See [Result concurrency](#result-concurrency). Defaults to `1`. |
 
 The payload is the documented `RemoteTask` / `StepResult` JSON, so a non-Node worker on the same
 queues interoperates — that's exactly how the [Python worker](/docs/python) plugs in.

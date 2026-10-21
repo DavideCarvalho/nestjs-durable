@@ -53,7 +53,8 @@ through it so the engine can checkpoint — the body itself stays deterministic 
 | `child` | `child<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, options?: string \| ChildCallOptions): Promise<WorkflowOutputOf<C>>` | Start (or reattach to) a child run and suspend — zero compute — until it's terminal, then resume with its output (throws `FatalError` if the child failed). See [Child workflows](/docs/authoring/child-workflows). |
 | `child` (by name) | `child<TOut>(workflow: string, input: unknown, options?: string \| ChildCallOptions): Promise<TOut>` | Same, for a cross-runtime child by name. |
 | `startChild` | `startChild<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, options?: string \| ChildCallOptions): Promise<string>` | Fire-and-forget: dispatch a child once and return its run id immediately; the parent keeps running. |
-| `all` | `all<C extends WorkflowClass>(workflow: C, inputs: WorkflowInputOf<C>[], opts?: { mode?: 'waitAll' \| 'failFast' }): Promise<WorkflowOutputOf<C>[]>` | Run N children of the SAME workflow in parallel and await all of them, in input order. `waitAll` (default) aggregates failures into `GatherError`; `failFast` throws on the first and cancels the surviving siblings (best-effort, observed at their next checkpoint). |
+| `all` | `all<C extends WorkflowClass>(workflow: C, inputs: WorkflowInputOf<C>[], opts?: AllOptions): Promise<WorkflowOutputOf<C>[]>` | Run N children of the SAME workflow in parallel and await all of them, in input order. `waitAll` (default) aggregates failures into `GatherError`; `failFast` throws on the first and cancels the surviving siblings (best-effort, observed at their next checkpoint). `concurrency` caps how many children run at once. Also takes a workflow name (`all<TOut>(workflow: string, …)`). See [Child workflows](/docs/authoring/child-workflows#ctxall--fan-out-n-children-of-the-same-workflow-wait-for-all). |
+| `all` (over a step) | `all<TIn, TOut>(step: StepRef<TIn, TOut>, inputs: TIn[], opts?: AllStepsOptions): Promise<TOut[]>` | One durable step per input, joined once: the parent wakes once per settled wave, not once per result. Outputs in input order; failures as `GatherError`. A `@Step` that declares `timeoutMs`, or a `queue` option, is rejected. See [The same step over many inputs](/docs/concepts/workflows-and-steps#the-same-step-over-many-inputs--ctxallstep-inputs). |
 
 ### External
 
@@ -82,6 +83,8 @@ through it so the engine can checkpoint — the body itself stays deterministic 
 | `StepOptions` | `{ retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs?, compensate? }` | Options for `ctx.task`/`ctx.localStep`. `compensate: () => Promise<void>` registers an in-process saga undo, retried up to the module-level `compensationRetries` (default `1`). See [Sagas & compensation](/docs/reliability/sagas). |
 | `StepUndo<TIn, TOut>` | `{ input: TIn; output: TOut }` | The one argument a dispatched saga undo is called with — the compensated call's own input and result. |
 | `UndoOf<H>` | `H extends (input: infer I, ...rest: never[]) => infer R ? StepUndo<I, Awaited<R>> : never` | Derives a dispatched undo's expected argument from the ORIGINAL step method's type, so a `compensate` ref is compile-checked against the call it undoes: `async cancelBooking(undo: UndoOf<FlightService['book']>) { ... }`. |
+| `AllOptions` | `{ mode?: 'waitAll' \| 'failFast'; concurrency?: number }` | For `ctx.all` over children. `concurrency` sends waves of `floor(concurrency / 2)`, two at a time. Part of the fan's identity: don't change it under an in-flight run. |
+| `AllStepsOptions` | `Omit<StepDispatchOpts, 'queue' \| 'timeoutMs'> & { mode?: 'waitAll' \| 'failFast'; concurrency?: number }` | For `ctx.all` over a `@Step`. The retry/backoff/priority options apply to every step of the fan. `concurrency` sends strict waves of that size. `failFast` stops sending without cancelling steps already in flight. |
 | `ChildCallOptions` | `{ childId?, priority?, version? }` | Options for `ctx.child`/`ctx.startChild` (a bare string is shorthand for `{ childId }`). `priority` only affects a remote child. `version` pins the child to that exact registered version — pass a constant, see [Versioning](/docs/authoring/versioning). |
 
 ### `DynamicWorkflowCtx<A>` — the non-overloaded view
@@ -265,7 +268,7 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 | `drain` | `drain(timeoutMs?: number): Promise<void>` | Graceful shutdown: stop picking up new runs, wait for in-flight executions up to `timeoutMs` (default 10000). |
 | `workerHealth` | `workerHealth(extra?: string[]): Promise<GroupHealth[]>` | Per-group queue backlog + live worker heartbeats (only transports that support introspection, e.g. BullMQ). |
 | `recoverIncomplete` | `recoverIncomplete(nowMs?: number): Promise<RunResult[]>` | Resume every run left `running` by a crash/deploy. Call on boot. |
-| `resumeDueTimers` | `resumeDueTimers(nowMs?: number): Promise<RunResult[]>` | Resume every suspended run whose durable timer is due. Call periodically. |
+| `resumeDueTimers` | `resumeDueTimers(nowMs?: number): Promise<RunResult[]>` | Resume suspended runs whose durable timer is due: at most `timerBatchSize` per pass (a `WorkflowEngine` constructor option, default 500), most overdue first, walked in shuffled order. Call periodically. |
 | `runPending` | `runPending(nowMs?: number): Promise<RunResult[]>` | Pick up and execute every `pending` run (poll-based dispatch for a broker-less worker pod). |
 | `sweepTimeouts` | `sweepTimeouts(now?: number): Promise<void>` | Cancel in-flight runs that outlived their `@Workflow({ executionTimeout })`, cascading to their children exactly as `cancel` does. |
 | `continue` | `continue(runId: string): Promise<RunResult \| null>` | Resume a run paused at `ctx.breakpoint` (the dashboard "continue" button). `null` if not paused there. |
@@ -323,6 +326,26 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `runGatewayTimeoutMs` | `number` | `10000` | Timeout for a thin worker's `RunGateway` round-trip over `transport`. Ignored for an operator. |
 | `topology` | `{ role: 'control-plane' } \| { role: 'tenant'; tenant: string }` | none = existing inference | Explicit, VALIDATED role preset — see [Roles & config](/docs/cluster/roles-and-config#what-topology-validates). `'tenant'` maps `tenant` onto `partition` for you. |
 
+## Run detail and fan types
+
+Exported from `@dudousxd/nestjs-durable-core`. Used by the [`RunGateway`](/docs/cluster/roles-and-config#the-shared-surface-rungateway)
+and the [dashboard](/docs/observability/dashboard#wide-fans).
+
+| Type / function | Shape | Notes |
+| --- | --- | --- |
+| `RunDetail` | `{ run, timeline, children, fans?, childCount? }` | What `getRunDetail` returns. When summarized, `timeline` omits the members of each summarized fan, `fans` holds one `FanSummary` per fan, and `children` lists at most 200 ids with `childCount` as the total. |
+| `RunDetailOptions` | `{ summarizeFansOver?: number }` | Summarize every fan with more than this many members, or declared wider than that. Unset returns the full detail. |
+| `FanSummary` | `{ group, label, firstSeq, lastSeq, size, total?, notStarted?, failFast, counts, startedAt?, finishedAt?, failures }` | `label` is the members' step name, or `child runs`. `size` counts members started (a folded checkpoint counts as the children it stands for); `total` is the declared size from the group; `notStarted` is `total - size`. `counts` is per status, with a failed child counted as `failed`. `failures` holds the first 20 failed members. |
+| `FanPageQuery` | `{ offset?, limit?, failedOnly? }` | `offset` defaults to 0; `limit` to 100, clamped to 1–500. |
+| `FanPage` | `{ items: StepCheckpoint[]; total: number }` | One page of a fan's members in seq order; `total` counts every member matching the query. |
+| `summarizeTimeline(timeline, over)` | `→ { timeline, fans }` | Split a run's checkpoints into the listed ones and the summarized fans. |
+| `summarizeFan(group, members)` | `→ FanSummary` | Summarize one fan's members. |
+| `pageFan(timeline, group, query)` | `→ FanPage` | One page of a fan out of a run's checkpoints. |
+| `childIdsOf(timeline)` | `→ string[]` | The child run ids a run's checkpoints reference. |
+
+A fan's `parallelGroup` is `all:<firstSeq>:n<size>[:failFast]` for children (older runs may carry
+`all:<firstSeq>[:failFast]`) and `steps:<firstSeq>:<size>[:failFast]` for steps.
+
 ## Errors
 
 All exported from `@dudousxd/nestjs-durable-core`.
@@ -335,7 +358,7 @@ All exported from `@dudousxd/nestjs-durable-core`.
 | `NestedWorkflowCallError` | A ctx primitive (`ctx.startChild`/`child`/`step`/`sleep`/`sideEffect`/…, or a `MyWorkflow.start()`/`.execute()` static via the ambient ctx) was called from INSIDE a step body (`ctx.localStep`/`transaction`/`sideEffect`/`now`). Thrown at the call site, as a `FatalError` (code `nested_workflow_call`). See [Troubleshooting](/docs/troubleshooting#nestedworkflowcallerror-a-ctx-call-inside-a-step-body). |
 | `ConcurrencyLimitError` | `start` whose concurrency quota key already has `limit` runs in flight (`key`, `limit`, `active`, `workflow`). Nothing was created — shed load / answer 429. See [Concurrency quotas](/docs/reliability/concurrency-quotas). |
 | `SingletonQueueFullError` | `start` on a singleton workflow whose in-flight + gated backlog already equals `limit + maxQueueDepth`. Back-pressure — retry later. See [Singleton workflows](/docs/reliability/singleton). |
-| `GatherError` | `ctx.all` — one or more parallel children failed; carries per-item `{ index, id, error }` failures. |
+| `GatherError` | `ctx.all` — one or more children or steps of a fan failed; carries per-item `{ index, id, error }` failures, where `index` is the input's position. Under `failFast` it carries the first failure seen. |
 | `RemoteStepTimeout` | A dispatched step produces no result/heartbeat within its `timeoutMs` — the worker is presumed dead. Retryable, subject to the step's `retries`. |
 | `RemoteWorkflowTimeout` | A remote `WorkflowExecutor.advance` produces no decision/heartbeat within its configured `timeoutMs`. Recoverable, not a run failure — the engine releases the lease and lets `recoverIncomplete` re-drive. |
 | `ContinueAsNew` | Thrown internally by `ctx.continueAsNew(input)` to unwind the current run and hand off to a fresh execution. A [control-flow signal](#control-flow-signals) — a workflow's `catch` must rethrow it untouched. |
