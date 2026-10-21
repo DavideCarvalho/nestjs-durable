@@ -4663,7 +4663,21 @@ export class WorkflowEngine {
       // becomes this deadline, so a reconcile re-drive lands exactly when it's due to re-dispatch.
       if (existing.wakeAt == null) {
         const wakeAt = this.clock() + this.remoteRedispatchMs;
-        await this.store.saveCheckpoint({ ...existing, wakeAt });
+        // The result may have settled the row since it was read: then nothing was written, and the
+        // step is re-read from the store.
+        if (!(await this.savePendingCheckpoint({ ...existing, wakeAt }))) {
+          return this.callRemote(
+            runId,
+            seq,
+            step,
+            input,
+            queue,
+            transport,
+            undefined,
+            admission,
+            routing,
+          );
+        }
         throw new WorkflowSuspended(wakeAt);
       }
       if (this.clock() < existing.wakeAt) throw new WorkflowSuspended(existing.wakeAt);
@@ -4678,7 +4692,7 @@ export class WorkflowEngine {
       const reAttempt = existing.attempts + 1;
       const nextDeadline = this.clock() + this.remoteRedispatchMs;
       const reEnqueuedAt = new Date();
-      await this.store.saveCheckpoint({
+      const claimed = await this.savePendingCheckpoint({
         ...existing,
         attempts: reAttempt,
         wakeAt: nextDeadline,
@@ -4692,6 +4706,19 @@ export class WorkflowEngine {
           lostStepEvent(this.clock(), reAttempt, 'redispatched'),
         ],
       });
+      if (!claimed) {
+        return this.callRemote(
+          runId,
+          seq,
+          step,
+          input,
+          queue,
+          transport,
+          undefined,
+          admission,
+          routing,
+        );
+      }
       await this.dispatchRemoteTask({
         runId,
         seq,
@@ -4798,6 +4825,13 @@ export class WorkflowEngine {
     throw new WorkflowSuspended();
   }
 
+  /** {@link StateStore.saveCheckpointIfPending}, or a plain save on a store without it. */
+  private async savePendingCheckpoint(checkpoint: StepCheckpoint): Promise<boolean> {
+    if (this.store.saveCheckpointIfPending) return this.store.saveCheckpointIfPending(checkpoint);
+    await this.store.saveCheckpoint(checkpoint);
+    return true;
+  }
+
   /** Enqueue a remote step task to its worker group via the transport pool. Shared by the initial
    *  dispatch, the opt-in self-heal re-dispatch (see `remoteRedispatchMs`), and the explicit
    *  {@link redispatchPending}. Carries the current trace/context so a re-dispatch is traceable. */
@@ -4848,7 +4882,8 @@ export class WorkflowEngine {
     if (run && (run.status === 'cancelled' || run.status === 'completed')) return;
     const finishedAt = new Date();
     const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
-    await this.store.saveCheckpoint({
+    // Claimed, not blindly written: a duplicate delivery of this result settled it first.
+    const claimed = await this.savePendingCheckpoint({
       ...cp,
       status: result.status,
       output: result.status === 'completed' ? result.output : cp.output,
@@ -4857,6 +4892,7 @@ export class WorkflowEngine {
       startedAt,
       finishedAt,
     });
+    if (!claimed) return;
     this.emit({
       type: result.status === 'completed' ? 'step.completed' : 'step.failed',
       runId: result.runId,

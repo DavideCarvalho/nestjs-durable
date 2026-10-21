@@ -71,6 +71,16 @@ const EPOCH_MS_THRESHOLD = 1e12;
 // so failed jobs don't accumulate unbounded.
 const TASK_FAILED_RETENTION_SECONDS = 24 * 60 * 60;
 
+// A result job is retried when the engine's handler throws (a store timeout or deadlock at peak
+// load), since a result dropped there leaves its step `pending` until the redispatch deadline and
+// runs it again. Retrying is safe: the engine settles a step only while it is still `pending`.
+const RESULT_JOB_OPTIONS = {
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 500 },
+  removeOnComplete: true,
+  removeOnFail: { age: TASK_FAILED_RETENTION_SECONDS },
+} as const;
+
 // Default `pingIntervalMs` (see `BullMQTransportOptions`) for the shared subscriber watchdog.
 const DEFAULT_PING_INTERVAL_MS = 30_000;
 // How long a single watchdog PING may take before its subscriber connection is presumed dead.
@@ -874,10 +884,7 @@ export class BullMQTransport implements Transport, ControlPlane {
         runStepHandler(task, this.handlers.get(task.name)),
       );
       ok = result.status === 'completed';
-      await this.queue(this.resultsName()).add('result', result, {
-        removeOnComplete: true,
-        removeOnFail: true,
-      });
+      await this.queue(this.resultsName()).add('result', result, RESULT_JOB_OPTIONS);
     } catch {
       // In-process safety net for a crash we DIDN'T die from. `runStepHandler` is pure — it never
       // throws (it returns a failed StepResult), so reaching here means the results-queue publish
@@ -895,10 +902,7 @@ export class BullMQTransport implements Transport, ControlPlane {
         status: 'failed',
         error: { message: 'remote step worker failed: result publish error', retryable: true },
       };
-      await this.queue(this.resultsName()).add('result', fallback, {
-        removeOnComplete: true,
-        removeOnFail: true,
-      });
+      await this.queue(this.resultsName()).add('result', fallback, RESULT_JOB_OPTIONS);
     } finally {
       // The engine-side task worker runs STEP handlers only (`runStepHandler`), so every settlement
       // is a step — it feeds the adaptive measurement window. Workflow turns are replayed by the SDK
@@ -974,10 +978,7 @@ export class BullMQTransport implements Transport, ControlPlane {
       error: { message: `remote step worker failed: ${reason}`, retryable: true },
     };
     try {
-      await this.queue(this.resultsName()).add('result', result, {
-        removeOnComplete: true,
-        removeOnFail: true,
-      });
+      await this.queue(this.resultsName()).add('result', result, RESULT_JOB_OPTIONS);
     } catch {
       /* best-effort — the durable engine's reconcile path is the last line of defence */
     }
@@ -986,6 +987,14 @@ export class BullMQTransport implements Transport, ControlPlane {
   onResult(handler: (result: StepResult) => Promise<void>): void {
     this.resultsWorker = new Worker(this.resultsName(), (job) => handler(job.data as StepResult), {
       connection: this.workerConnection(),
+    });
+    this.resultsWorker.on('failed', (job, error) => {
+      if (!job || job.attemptsMade < (job.opts.attempts ?? 1)) return;
+      const result = job.data as StepResult;
+      console.error(
+        `[nestjs-durable] gave up on the result of step ${result.stepId} (run ${result.runId}) after ${job.attemptsMade} attempts:`,
+        error,
+      );
     });
   }
 

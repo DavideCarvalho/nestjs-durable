@@ -297,6 +297,16 @@ export class MikroOrmStateStore implements StateStore {
     await em.flush();
   }
 
+  async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
+    const { runId: _runId, seq: _seq, ...data } = toCheckpointEntity(checkpoint);
+    const affected = await this.fork().nativeUpdate(
+      StepCheckpointEntity,
+      { runId: checkpoint.runId, seq: checkpoint.seq, status: 'pending' },
+      { ...data, wakeAt: checkpoint.wakeAt != null ? new Date(checkpoint.wakeAt) : null },
+    );
+    return affected > 0;
+  }
+
   async transaction<T>(
     work: (tx: {
       raw: unknown;
