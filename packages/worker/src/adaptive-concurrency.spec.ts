@@ -52,6 +52,50 @@ describe('resolveConcurrency', () => {
   });
 });
 
+describe('resolveConcurrency — non-finite values fall back to defaults', () => {
+  const bad = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -2, 0.5];
+
+  it.each(bad)('a fixed %s becomes 1', (value) => {
+    expect(resolveConcurrency(value)).toEqual({ mode: 'fixed', fixed: 1 });
+  });
+
+  it('a valid fixed value is floored', () => {
+    expect(resolveConcurrency(4.7)).toEqual({ mode: 'fixed', fixed: 4 });
+  });
+
+  it.each(bad)('adaptive min/max/start/tickMs of %s fall back to their defaults', (value) => {
+    expect(
+      resolveConcurrency({ mode: 'adaptive', min: value, max: value, start: value, tickMs: value }),
+    ).toEqual({
+      mode: 'adaptive',
+      adaptive: { min: 1, max: 32, start: 1, ramCeilingPct: 85, tickMs: 2000 },
+    });
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -5])(
+    'a ramCeilingPct of %s falls back to 85 and a cpuCeilingPct of it turns the CPU ceiling off',
+    (value) => {
+      expect(
+        resolveConcurrency({ mode: 'adaptive', ramCeilingPct: value, cpuCeilingPct: value }),
+      ).toEqual({
+        mode: 'adaptive',
+        adaptive: { min: 1, max: 32, start: 1, ramCeilingPct: 85, tickMs: 2000 },
+      });
+    },
+  );
+
+  it('a NaN ram ceiling still brakes at the default 85%', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 16, start: 10, ramCeilingPct: Number.NaN },
+      rss: 900_000_000,
+      memLimit: 1_000_000_000,
+    });
+    fill(controller, 20, 100);
+    controller.tick();
+    expect(applied).toEqual([8]);
+  });
+});
+
 describe('AdaptiveController.snapshot — the WorkerStatus contract', () => {
   it('fixed mode reports mode:fixed, limit, inFlight, rss* and (after work) throughput/p95', () => {
     const { controller } = makeController({
