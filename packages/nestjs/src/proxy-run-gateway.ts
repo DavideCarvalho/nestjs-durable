@@ -20,7 +20,12 @@ import type {
   RunWaiting,
   Transport,
 } from '@dudousxd/nestjs-durable-core';
-import { SUMMARY_CHILD_LIMIT, pageFan, summarizeTimeline } from '@dudousxd/nestjs-durable-core';
+import {
+  SUMMARY_CHILD_LIMIT,
+  childIdsOf,
+  pageFan,
+  summarizeTimeline,
+} from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { UNSUPPORTED_RUN_REQUEST } from './run-request-responder';
 
@@ -124,12 +129,13 @@ export class ProxyRunGateway implements RunGateway {
     const over = options?.summarizeFansOver;
     if (over === undefined || !detail || detail.fans !== undefined) return detail;
     const { timeline, fans } = summarizeTimeline(detail.timeline, over);
+    const ids = childIdsOf(detail.timeline);
     return {
       ...detail,
       timeline,
-      children: detail.children.slice(0, SUMMARY_CHILD_LIMIT),
+      children: ids.slice(0, SUMMARY_CHILD_LIMIT),
       fans,
-      childCount: detail.childCount ?? detail.children.length,
+      childCount: ids.length,
     };
   }
 

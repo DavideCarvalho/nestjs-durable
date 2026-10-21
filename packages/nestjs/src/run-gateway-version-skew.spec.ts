@@ -245,7 +245,12 @@ function timeline(): StepCheckpoint[] {
       ...(i % 7 === 0 ? { status: 'failed' as const } : {}),
     }),
   );
-  return [checkpoint(0, { name: 'prepare' }), ...members, checkpoint(31, { name: 'report' })];
+  return [
+    checkpoint(0, { name: 'prepare' }),
+    ...members,
+    checkpoint(31, { name: 'spawn:audit', output: 'child-a' }),
+    checkpoint(32, { name: 'signal:child:child-b' }),
+  ];
 }
 
 /** The current control plane: the real `StoreRunGateway` over a store holding the one run. */
@@ -254,7 +259,10 @@ function currentGateway(): StoreRunGateway {
     getRun: async (id: string) => (id === 'r1' ? run() : null),
     listCheckpoints: async (id: string) => (id === 'r1' ? timeline() : []),
   } as unknown as StateStore;
-  const engine = { getRunChildren: async () => [] } as unknown as WorkflowEngine;
+  // The child-edge read lists children in its own order, not the timeline's.
+  const engine = {
+    getRunChildren: async () => ['child-b', 'child-a'],
+  } as unknown as WorkflowEngine;
   return new StoreRunGateway(store, engine);
 }
 
@@ -317,7 +325,11 @@ describe('run gateway version skew', () => {
       expect(detail?.fans?.map((f) => [f.group, f.size, f.counts])).toEqual([
         [FAN, 30, { completed: 25, failed: 5 }],
       ]);
-      expect(detail?.timeline.map((cp) => cp.name)).toEqual(['prepare', 'report']);
+      expect(detail?.timeline.map((cp) => cp.name)).toEqual([
+        'prepare',
+        'spawn:audit',
+        'signal:child:child-b',
+      ]);
       expect(detail).toEqual(expected);
     });
 
@@ -380,7 +392,7 @@ describe('run gateway version skew', () => {
       const proxy = new ProxyRunGateway(w.tenantSide, 'acme');
       await expect(proxy.cancel('r1')).resolves.toEqual({ runId: 'r1', status: 'cancelled' });
       const full = await proxy.getRunDetail('r1');
-      expect(full?.timeline).toHaveLength(32);
+      expect(full?.timeline).toHaveLength(33);
       expect(full?.fans).toBeUndefined();
     });
   });
@@ -398,7 +410,7 @@ describe('run gateway version skew', () => {
       const detail = await new LegacyProxyRunGateway(w.tenantSide, 'acme').getRunDetail('r1');
 
       expect(detail).toEqual(expected);
-      expect(detail?.timeline).toHaveLength(32);
+      expect(detail?.timeline).toHaveLength(33);
       expect(detail).not.toHaveProperty('fans');
     });
 
@@ -430,7 +442,7 @@ describe('run gateway version skew', () => {
       for (let i = 0; i < 4; i++) {
         const detail = await proxy.getRunDetail('r1', { summarizeFansOver: WIDE });
         expect(detail?.fans).toHaveLength(1);
-        expect(detail?.timeline).toHaveLength(2);
+        expect(detail?.timeline).toHaveLength(3);
       }
       const page = await proxy.getFanMembers('r1', FAN, { limit: 4 });
       expect(page?.items.map((cp) => cp.seq)).toEqual([1, 2, 3, 4]);
