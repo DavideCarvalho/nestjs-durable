@@ -1,6 +1,5 @@
 import {
   DURABLE_OPTIONS_CANONICAL,
-  type OnErrorRoute,
   RemoteWorkflowExecutor,
   STATE_STORE_CANONICAL,
   type StateStore,
@@ -27,6 +26,7 @@ import type { DurableModuleOptions } from './durable.module';
 import { entityConfigFor, getEntityMeta } from './entity';
 import { IN_APP_WORKER_BINDING, type InAppWorkerBinding } from './in-app-worker';
 import { classValidatorInput } from './input-validation';
+import { onErrorHandlersOf } from './on-error-handlers';
 import { isDrivingOperator, isOperatorRole } from './role';
 import { type DurableStepInterceptor, isStepInterceptor } from './step-interceptor';
 
@@ -129,8 +129,8 @@ export class WorkflowRegistrar
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const workflowCtor: object = (workflow as any).constructor as object;
       // Each `@OnError` method is a durable workflow of its own, inline like an `@DeadLetter` one.
-      const handlers = this.findOnErrorHandlers(meta.name, workflow as unknown as object);
-      for (const [name, fn] of handlers.workflows) {
+      const onError = onErrorHandlersOf(meta, workflow as unknown as object, this.metadataScanner);
+      for (const [name, fn] of onError.handlers) {
         this.engine.register(name, meta.version, fn, { origin });
       }
       this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input), {
@@ -147,7 +147,7 @@ export class WorkflowRegistrar
         searchAttributesSchema: meta.searchAttributes,
         onEvent: getOnEvents(meta, workflowCtor),
         eventBatch,
-        onError: [...handlers.routes, ...optionRoutes(meta)],
+        onError: onError.routes,
         // Uniform dispatch (opt-in): when an in-app worker is configured, register the body GROUP-SERVED
         // so the engine dispatches its turns over the transport instead of running it inline; the
         // co-located worker consumer (Task 5: one queue PER REGISTERED NAME) replays the same body.
@@ -213,28 +213,6 @@ export class WorkflowRegistrar
     );
   }
 
-  /**
-   * The instance's `@OnError` methods as handler workflows (`<workflow>.onError.<method>`, bound to the
-   * instance), and the routes to them, one per code a method declares.
-   */
-  private findOnErrorHandlers(
-    workflow: string,
-    instance: object,
-  ): { workflows: [string, WorkflowFn][]; routes: OnErrorRoute[] } {
-    const workflows: [string, WorkflowFn][] = [];
-    const routes: OnErrorRoute[] = [];
-    const prototype = Object.getPrototypeOf(instance);
-    for (const methodName of this.metadataScanner.getAllMethodNames(prototype)) {
-      const method = (instance as Record<string, unknown>)[methodName];
-      const codes = typeof method === 'function' ? onErrorCodesOf(method) : undefined;
-      if (!codes) continue;
-      const name = `${workflow}.onError.${methodName}`;
-      workflows.push([name, (ctx, input) => (method as WorkflowFn).call(instance, ctx, input)]);
-      for (const code of codes) routes.push({ code, workflow: name });
-    }
-    return { workflows, routes };
-  }
-
   /** Returns the instance's `@DeadLetter()` method bound to the instance, or undefined if none. */
   private findDeadLetterHandler(instance: object): WorkflowFn | undefined {
     const prototype = Object.getPrototypeOf(instance);
@@ -272,12 +250,4 @@ export class WorkflowRegistrar
         .catch(() => undefined);
     });
   }
-}
-
-/** The `@Workflow({ onError })` routes, with class refs resolved to names and error classes to codes. */
-function optionRoutes(meta: WorkflowMeta): OnErrorRoute[] {
-  return (meta.onError ?? []).map((r) => ({
-    code: r.code === undefined || typeof r.code === 'string' ? r.code : r.code.code,
-    workflow: workflowName(r.workflow),
-  }));
 }
