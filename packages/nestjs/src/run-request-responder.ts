@@ -80,10 +80,10 @@ export class RunRequestResponder {
       const all = await this.gateway.waitingFor(body.runIds);
       const owned = await Promise.all(
         Object.entries(all).map(async ([runId, waiting]) => {
-          const runDetail = await this.gateway.getRunDetail(runId);
-          return runDetail && runDetail.run.namespace === msg.tenant
-            ? ([runId, waiting] as const)
-            : undefined;
+          const owner = this.gateway.getRun
+            ? await this.gateway.getRun(runId)
+            : (await this.gateway.getRunDetail(runId))?.run;
+          return owner && owner.namespace === msg.tenant ? ([runId, waiting] as const) : undefined;
         }),
       );
       const data: Record<string, RunWaiting> = {};
@@ -95,11 +95,17 @@ export class RunRequestResponder {
 
     // Every remaining verb is runId-bearing. Load the run FIRST — before calling the verb — so a
     // cross-tenant request never reaches the gateway's mutating methods (cancel/retry/continue/redispatch).
-    const detail = await this.gateway.getRunDetail(
-      body.runId,
-      body.kind === 'getRunDetail' ? body.options : undefined,
-    );
-    if (detail && detail.run.namespace !== msg.tenant) {
+    // Only `getRunDetail` needs the timeline; every other verb checks ownership on the run alone.
+    const detail =
+      body.kind === 'getRunDetail' || !this.gateway.getRun
+        ? await this.gateway.getRunDetail(
+            body.runId,
+            body.kind === 'getRunDetail' ? body.options : undefined,
+          )
+        : undefined;
+    const run =
+      detail !== undefined ? (detail?.run ?? null) : await this.gateway.getRun?.(body.runId);
+    if (run && run.namespace !== msg.tenant) {
       return {
         requestId: msg.requestId,
         result: {
@@ -114,7 +120,7 @@ export class RunRequestResponder {
     }
 
     if (body.kind === 'getFanMembers') {
-      const data = detail
+      const data = run
         ? ((await this.gateway.getFanMembers?.(body.runId, body.group, body.query)) ?? null)
         : null;
       return { requestId: msg.requestId, result: { ok: true, data } };

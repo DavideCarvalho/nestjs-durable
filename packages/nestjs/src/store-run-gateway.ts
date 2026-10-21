@@ -20,6 +20,7 @@ import {
   SUMMARY_CHILD_LIMIT,
   type StateStore,
   WorkflowEngine,
+  type WorkflowRun,
   childIdsOf,
   indexWaitersByRun,
   listSignalWaitersOfRuns,
@@ -59,7 +60,8 @@ export class StoreRunGateway implements RunGateway {
       return { run, timeline, children };
     }
     // Summarized: the children come from the timeline already loaded, rather than a second read of
-    // every child-edge checkpoint (one per child of a wide fan).
+    // every child-edge checkpoint (one per child of a wide fan). A child whose waiter is written but
+    // whose placeholder checkpoint is not yet is missing for that one read; the next one lists it.
     const full = await this.store.listCheckpoints(runId);
     const { timeline, fans } = summarizeTimeline(full, over);
     const ids = childIdsOf(full);
@@ -70,6 +72,10 @@ export class StoreRunGateway implements RunGateway {
       fans,
       childCount: ids.length,
     };
+  }
+
+  getRun(runId: string): Promise<WorkflowRun | null> {
+    return this.store.getRun(runId);
   }
 
   async getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {

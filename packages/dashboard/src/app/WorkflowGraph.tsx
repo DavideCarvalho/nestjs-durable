@@ -22,7 +22,13 @@ import {
 } from '../client/durable-client';
 import { stepDisplayName } from '../client/folded-children';
 import { fanProgress, fanStatus, groupParallelSpans } from '../client/group-parallel-spans';
-import { CHILD_DETAIL_LIMIT, childDetailIds, childRunIdOf, detailsById } from './child-link';
+import {
+  CHILD_DETAIL_LIMIT,
+  childDetailIds,
+  childFallbackLabel,
+  childRunIdOf,
+  detailsById,
+} from './child-link';
 import { BoltIcon, CheckIcon, ChildIcon, KIND_LABEL, XIcon, iconFor } from './icons';
 
 /** Stable empty set so a graph with no `expanded` prop doesn't re-run the layout memo each render. */
@@ -444,7 +450,7 @@ export const WorkflowGraph = memo(function WorkflowGraph({
       const displayName = loneChild
         ? loneChild.step.name
         : childId !== undefined
-          ? (childDetail?.run.workflow ?? 'child workflow')
+          ? (childDetail?.run.workflow ?? childFallbackLabel(childId, s.runId))
           : stepDisplayName(s);
       const failed = bodyStep.status === 'failed';
       nodes.push({

@@ -95,6 +95,11 @@ export abstract class RunGateway {
    * a gateway without it serves summarized details whose fans cannot be expanded.
    */
   getFanMembers?(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null>;
+  /**
+   * The run alone, without its timeline. Optional: a caller that only needs the run (an ownership
+   * check) falls back to {@link getRunDetail}, which reads every checkpoint.
+   */
+  getRun?(runId: string): Promise<WorkflowRun | null>;
   /** List runs, each optionally carrying a {@link RunWaiting} descriptor (what a suspended run is
    *  parked on). The store-backed gateway resolves `waiting`; a proxy relays whatever the control
    *  plane sent. */

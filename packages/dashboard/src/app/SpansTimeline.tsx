@@ -8,7 +8,7 @@ import { FAN_PAGE_SIZE, fanPagesInView } from '../client/fan-pages';
 import { stepDisplayName } from '../client/folded-children';
 import { fanProgress, fanStatus, groupParallelSpans } from '../client/group-parallel-spans';
 import { groupSubProcesses } from '../client/group-subprocesses';
-import { childDetailIds, childRunIdOf, detailsById } from './child-link';
+import { childDetailIds, childFallbackLabel, childRunIdOf, detailsById } from './child-link';
 import { ChildIcon, iconFor } from './icons';
 import { stalePendingView } from './stale-liveness';
 
@@ -266,7 +266,7 @@ function StepRow({
           </span>
           <span className="truncate text-[12px] text-zinc-300">
             {childRunId !== undefined
-              ? (childRuns[childRunId]?.run.workflow ?? 'child workflow')
+              ? (childRuns[childRunId]?.run.workflow ?? childFallbackLabel(childRunId, step.runId))
               : stepDisplayName(step)}
           </span>
           {isChild && childRunId !== undefined && (
@@ -623,6 +623,15 @@ function FanMembers({
     return at < 0 ? undefined : results[at]?.data?.items[index % FAN_PAGE_SIZE];
   };
 
+  const failedPage = results.find((r) => r.isError);
+  if (total === undefined && failedPage) {
+    return (
+      <div className="mono px-2 py-1 text-[10px] text-red-400">
+        couldn't load members:{' '}
+        {failedPage.error instanceof Error ? failedPage.error.message : String(failedPage.error)}
+      </div>
+    );
+  }
   if (total === undefined) {
     return <div className="mono px-2 py-1 text-[10px] text-zinc-600">loading members…</div>;
   }

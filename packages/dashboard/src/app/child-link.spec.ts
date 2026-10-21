@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { childChips, childDetailIds, childRunIdOf } from './child-link';
+import { childChips, childDetailIds, childFallbackLabel, childRunIdOf } from './child-link';
 
 describe('childRunIdOf', () => {
   it('extracts the child run id from a ctx.startChild spawn checkpoint', () => {
@@ -40,6 +40,13 @@ describe('childDetailIds', () => {
     expect(ids).toHaveLength(50);
     expect(ids[0]).toBe('c0');
     expect(ids[49]).toBe('c49');
+  });
+});
+
+describe('childFallbackLabel', () => {
+  it('names a child by its id under the parent, so failed children are tell-apart', () => {
+    expect(childFallbackLabel('dpas.all.1.w0.7', 'dpas')).toBe('child all.1.w0.7');
+    expect(childFallbackLabel('other-run', 'dpas')).toBe('child other-run');
   });
 });
 

@@ -37,6 +37,15 @@ export function childDetailIds(
   return [...ids];
 }
 
+/**
+ * A child row's label when its detail was not fetched (past the cap, or in a summarized fan): the
+ * child's id without its parent's prefix (`all.1.w0.7`), so failed children stay tell-apart.
+ */
+export function childFallbackLabel(childRunId: string, parentRunId: string): string {
+  const prefix = `${parentRunId}.`;
+  return `child ${childRunId.startsWith(prefix) ? childRunId.slice(prefix.length) : childRunId}`;
+}
+
 /** The most child-run chips a run header lists before folding the rest into `+N more`. */
 export const CHILD_CHIP_LIMIT = 12;
 
