@@ -261,12 +261,11 @@ const transport = new BullMQTransport({
 tick. When thousands of runs come due together (recovery after an outage, a fan's children waking
 at once), each pass loads at most `timerBatchSize` of them, most overdue first, and walks them in a
 shuffled order so instances spread over the batch instead of contending for the same leases. The
-default is 500. It is a `WorkflowEngine` constructor option; `DurableModule.forRoot` does not pass it
-through, so the module's engine always uses 500. A value that is not a finite number of at least 1
-falls back to 500.
+default is 500. Set it on the module (or on a `WorkflowEngine` you build yourself). A value that is not
+a finite number of at least 1 falls back to 500.
 
 ```ts
-const engine = new WorkflowEngine({ store, transport, timerBatchSize: 1000 });
+DurableModule.forRoot({ store, transport, timerBatchSize: 1000 });
 ```
 
 **The console summarizes wide fans.** The dashboard's run detail folds any fan wider than 50 into

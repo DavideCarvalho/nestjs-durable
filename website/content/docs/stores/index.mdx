@@ -34,10 +34,9 @@ Several `StateStore` methods exist only to keep wide fans and busy deployments c
 optional, and the engine falls back to something slower but correct when a store leaves one out.
 Run the [shared store contract](/docs/testing#testing-a-custom-storetransportadmission-backend)
 (`runStateStoreContract`) against your adapter. Its `listDueTimers` case checks the ordering and
-the `limit`, and its `countCheckpoints` and `saveCheckpointIfPending` cases skip themselves when your
-store does not implement the method. Some cases for the other optional methods, such as
-`registerChildWaits` and `listCheckpointsByNamePrefix`, expect the method to exist, because every
-bundled adapter has it.
+the `limit`. Its cases for `countCheckpoints`, `saveCheckpointIfPending`, `registerChildWaits` and
+`listCheckpointsByNamePrefix` expect the method to exist, because every bundled adapter has it: a
+custom store that leaves one out fails those cases even though the engine would fall back.
 
 | Method | Required? | What the engine uses it for | Without it |
 | --- | --- | --- | --- |
@@ -50,10 +49,10 @@ bundled adapter has it.
 | `listCheckpointsByNamePrefix(runId, prefixes)` | optional | reads a fan's existing checkpoints in one prefix query. | `listCheckpoints` plus a prefix filter in memory. |
 | `listSignalWaitersByRun(runIds)` | optional | run-scoped waiter reads (run detail, cancel, purge, the timer pass). | Those reads scan every waiter. |
 
-Every bundled adapter implements `listDueTimers` with `limit` and ordering, and the four optional
-methods from `hasSignalWaiter` down. `countCheckpoints` and `saveCheckpointIfPending` are implemented
-by the MikroORM adapter and the in-memory store; the TypeORM, Prisma and Drizzle adapters use the
-fallbacks.
+Every bundled adapter (MikroORM, TypeORM, Prisma, Drizzle on SQLite/MySQL and on Postgres, and the
+in-memory store) implements `listDueTimers` with `limit` and ordering and every optional method in the
+table. `saveCheckpointIfPending` is a single conditional `UPDATE … WHERE status = 'pending'` in each,
+never a read followed by a write, and `countCheckpoints` is one `COUNT(*)` over the run's seq range.
 
 `CodecStateStore` exposes an optional method only when the store it wraps has it, so wrapping a
 store never hides a capability or invents one. It encodes the payload for `saveCheckpointIfPending`,
