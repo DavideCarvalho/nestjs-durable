@@ -65,6 +65,7 @@ import type {
   RunStatus,
   SearchAttributes,
   SearchAttributesSchema,
+  Settled,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -4970,9 +4971,10 @@ export class WorkflowEngine {
       concurrency?: number | undefined;
       transport?: string | undefined;
       admission?: { priority?: number | undefined; fairnessKey?: string | undefined };
+      settle?: boolean | undefined;
     },
     routing?: { namespace?: string | undefined },
-  ): Promise<TOutput[]> {
+  ): Promise<TOutput[] | Settled<TOutput>[]> {
     if (step.timeoutMs) {
       throw new Error(
         `ctx.all: step "${step.name}" has a liveness timeoutMs; a step fan needs durable steps`,
@@ -5052,6 +5054,16 @@ export class WorkflowEngine {
     if (inFlight + batch.length > 0) {
       this.awaitedStepFans.get(runId)?.push({ from: first, to: last });
       throw new WorkflowSuspended(wakeAt);
+    }
+    if (opts.settle) {
+      const failed = new Map(failures.map((f) => [f.index, f]));
+      // `outputs` has a hole at every failed index, which `map` would skip.
+      return Array.from(outputs, (value, i): Settled<TOutput> => {
+        const f = failed.get(i);
+        return f
+          ? { status: 'rejected', id: f.id, error: f.error }
+          : { status: 'fulfilled', value };
+      });
     }
     if (failures.length > 0) throw new GatherError(failures, inputs.length);
     return outputs;

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
-import { GatherError } from './errors';
+import { FatalError, GatherError } from './errors';
 import type { RemoteTask, StepResult, Transport, WorkflowRun } from './interfaces';
 import {
   DURABLE_STEP_CONFIG,
@@ -158,6 +158,28 @@ describe('ctx.all over a @Step', () => {
     const second = (await store.listCheckpoints('p')).find((c) => c.seq === 1);
     expect(second?.attempts).toBe(2);
     expect(second?.parallelGroup).toBe('steps:0:3');
+  });
+
+  it('does not retry a step that throws a FatalError', async () => {
+    const { store, engine, runs } = setup(async ({ i }) => {
+      if (i === 1) throw new FatalError('invalid line');
+      return i;
+    });
+    const retried = stepRef<{ i: number }, number>(LINE, { retries: 3 });
+    engine.register('fan', '1', async (ctx) => {
+      try {
+        return await ctx.all(retried, lines(3));
+      } catch (err) {
+        if (err instanceof GatherError) return { failed: err.failures.map((f) => f.index) };
+        throw err;
+      }
+    });
+
+    await startRun(engine, 'fan', {}, 'p');
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+
+    expect((await store.getRun('p'))?.output).toEqual({ failed: [1] });
+    expect(runs.filter((i) => i === 1)).toHaveLength(1);
   });
 
   it('continues past the fan on replay, with the steps after it in order', async () => {

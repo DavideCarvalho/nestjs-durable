@@ -146,6 +146,17 @@ outputs in input order (a `GatherError` carries the failed indexes, as for a chi
 const results = await ctx.all(this.lines.processLine, lines, { concurrency: 500 });
 ```
 
+When a failed item is an expected outcome rather than a reason to fail the run, use
+`ctx.allSettled` instead: the same fan, resolving with `{ status: 'fulfilled', value }` or
+`{ status: 'rejected', id, error }` per input, in input order, and never throwing for an item. Throw
+`FatalError` in the step for a failure a retry can't fix (a schema mismatch); it settles as rejected
+without spending the retries:
+
+```ts
+const results = await ctx.allSettled(this.lines.validateLine, lines, { concurrency: 500 });
+const rejected = results.filter((r) => r.status === 'rejected');
+```
+
 Prefer it to `Promise.all` past a handful of steps: every result of a `Promise.all` replays the
 workflow, which makes a fan of N steps cost O(N²) checkpoint reads. Prefer it to a child-workflow
 `ctx.all` when each item is just a step: a child costs a whole run (row, turn, lease, signal).
@@ -213,7 +224,7 @@ const rows = await ctx.child<{ rows: number }>('processing', { baseId });
 `ctx.child` starts the child once (checkpointed) and suspends — zero compute — until it reaches a
 terminal state, then resumes with its output (or throws if the child failed). Use `ctx.all(Class,
 inputs)` / `ctx.all(name, inputs)` to fan out N children of the same workflow and wait for all of
-them.
+them, or `ctx.allSettled(...)` to get every outcome back instead of a `GatherError`.
 
 ## Common mistakes
 

@@ -238,3 +238,34 @@ describe('WorkflowContext.all', () => {
     await expect(c2.all('child', [{ x: 1 }])).rejects.toBeInstanceOf(NondeterminismError);
   });
 });
+
+describe('WorkflowContext.allSettled', () => {
+  it('first turn emits the same startChild fan as all, then suspends', async () => {
+    const ctx = new WorkflowContext('r1', []);
+    await expect(ctx.allSettled('child', [{ x: 1 }, { x: 2 }])).rejects.toBeInstanceOf(Suspend);
+    expect(ctx.commands.map((c) => c.kind === 'startChild' && [c.seq, c.parallelGroup])).toEqual([
+      [0, 'gather:0'],
+      [1, 'gather:0'],
+    ]);
+  });
+
+  it('resolves with every outcome in input order instead of throwing', async () => {
+    const history: HistoryEvent[] = [
+      { seq: 0, kind: 'child', name: 'child', output: 'a' },
+      { seq: 1, kind: 'child', name: 'child', error: { message: 'boom' } },
+      { seq: 2, kind: 'child', name: 'child', output: 'c' },
+    ];
+    const ctx = new WorkflowContext('r1', history);
+    expect(await ctx.allSettled('child', [{ x: 1 }, { x: 2 }, { x: 3 }])).toEqual([
+      { status: 'fulfilled', value: 'a' },
+      { status: 'rejected', id: 'r1.child.1', error: 'boom' },
+      { status: 'fulfilled', value: 'c' },
+    ]);
+  });
+
+  it('empty inputs returns []', async () => {
+    const ctx = new WorkflowContext('r1', []);
+    expect(await ctx.allSettled('child', [])).toEqual([]);
+    expect(ctx.commands).toHaveLength(0);
+  });
+});
