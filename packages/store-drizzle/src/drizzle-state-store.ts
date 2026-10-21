@@ -258,6 +258,25 @@ export class DrizzleStateStore implements StateStore {
       .onConflictDoUpdate({ target: [stepCheckpoints.runId, stepCheckpoints.seq], set: row });
   }
 
+  async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
+    // One conditional UPDATE: the `status = 'pending'` predicate is the compare, the changed-row
+    // count the answer, and a missing row matches nothing, so it is never created.
+    const { runId, seq, ...set } = toCheckpointRow(checkpoint);
+    const result = await this.db
+      .update(stepCheckpoints)
+      .set(set)
+      .where(
+        and(
+          eq(stepCheckpoints.runId, runId),
+          eq(stepCheckpoints.seq, seq),
+          eq(stepCheckpoints.status, 'pending'),
+        ),
+      );
+    // better-sqlite3 reports `changes`, libSQL `rowsAffected`.
+    const { changes, rowsAffected } = result as { changes?: number; rowsAffected?: number };
+    return (changes ?? rowsAffected ?? 0) > 0;
+  }
+
   async transaction<T>(
     work: (tx: {
       raw: unknown;
@@ -604,6 +623,27 @@ export class DrizzleStateStore implements StateStore {
       .orderBy(desc(stepCheckpoints.seq))
       .limit(1);
     return rows[0] ? fromCheckpointRow(rows[0]) : undefined;
+  }
+
+  async countCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<number> {
+    if (statuses.length === 0) return 0;
+    const rows = await this.db
+      .select({ count: sql<number>`count(*)` })
+      .from(stepCheckpoints)
+      .where(
+        and(
+          eq(stepCheckpoints.runId, runId),
+          gte(stepCheckpoints.seq, fromSeq),
+          lte(stepCheckpoints.seq, toSeq),
+          inArray(stepCheckpoints.status, statuses),
+        ),
+      );
+    return Number(rows[0]?.count ?? 0);
   }
 
   async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {
