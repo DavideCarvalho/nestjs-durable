@@ -496,6 +496,29 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
 
     // ---- checkpoints ------------------------------------------------------------------------
 
+    t('countCheckpoints counts a seq range by status', async () => {
+      if (!store.countCheckpoints) return;
+      await store.createRun(run());
+      for (const [seq, status] of [
+        [0, 'completed'],
+        [1, 'pending'],
+        [2, 'pending'],
+        [3, 'failed'],
+        [4, 'pending'],
+      ] as const) {
+        await store.saveCheckpoint(checkpoint({ seq, status, stepId: `r1:${seq}` }));
+      }
+      await store.createRun(run({ id: 'other' }));
+      await store.saveCheckpoint(
+        checkpoint({ runId: 'other', seq: 2, status: 'pending', stepId: 'other:2' }),
+      );
+
+      expect(await store.countCheckpoints('r1', 1, 3, ['pending'])).toBe(2);
+      expect(await store.countCheckpoints('r1', 0, 4, ['pending', 'failed'])).toBe(4);
+      expect(await store.countCheckpoints('r1', 5, 9, ['pending'])).toBe(0);
+      expect(await store.countCheckpoints('r1', 0, 4, [])).toBe(0);
+    });
+
     t('saveCheckpointIfPending writes over a pending row only', async () => {
       if (!store.saveCheckpointIfPending) return;
       await store.createRun(run());

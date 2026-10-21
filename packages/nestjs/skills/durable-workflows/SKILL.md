@@ -137,6 +137,18 @@ const [a, b] = await Promise.all([
 ]);
 ```
 
+For the same step over many inputs, use `ctx.all` with the `@Step` reference. It dispatches one step
+per input, wakes the workflow once per settled wave instead of once per result, and returns the
+outputs in input order (a `GatherError` carries the failed indexes, as for a child fan):
+
+```ts
+const results = await ctx.all(this.lines.processLine, lines, { concurrency: 500 });
+```
+
+Prefer it to `Promise.all` past a handful of steps: every result of a `Promise.all` replays the
+workflow, which makes a fan of N steps cost O(N²) checkpoint reads. Prefer it to a child-workflow
+`ctx.all` when each item is just a step: a child costs a whole run (row, turn, lease, signal).
+
 ### Sub-process events inside a step
 
 For pure visibility *inside* one step's execution, the `@Step` handler's optional second argument
