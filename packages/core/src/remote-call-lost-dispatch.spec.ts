@@ -313,6 +313,11 @@ describe('REGRESSION: a gather_calls step whose worker was OOM-killed is re-driv
       await h.tick();
       await drain();
     }
+    // Failing the lost step re-drives the run off a timer (after the turn released its lease), so
+    // wait for that turn rather than for a fixed number of event-loop rounds.
+    for (let i = 0; i < 100 && (await h.store.getRun('run1'))?.status !== 'failed'; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
 
     const run = await h.store.getRun('run1');
     // EXACTLY two: the initial dispatch (attempts=1), then one re-drive (attempts=2, which is

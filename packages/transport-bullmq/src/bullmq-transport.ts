@@ -410,7 +410,9 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.stepTimeoutMs = options.stepTimeoutMs;
-    this.resultConcurrency = Math.max(1, Math.floor(options.resultConcurrency ?? 1));
+    const results = options.resultConcurrency;
+    this.resultConcurrency =
+      results !== undefined && Number.isFinite(results) && results >= 1 ? Math.floor(results) : 1;
   }
 
   /**
