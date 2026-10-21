@@ -95,7 +95,10 @@ export class RunRequestResponder {
 
     // Every remaining verb is runId-bearing. Load the run FIRST — before calling the verb — so a
     // cross-tenant request never reaches the gateway's mutating methods (cancel/retry/continue/redispatch).
-    const detail = await this.gateway.getRunDetail(body.runId);
+    const detail = await this.gateway.getRunDetail(
+      body.runId,
+      body.kind === 'getRunDetail' ? body.options : undefined,
+    );
     if (detail && detail.run.namespace !== msg.tenant) {
       return {
         requestId: msg.requestId,
@@ -108,6 +111,13 @@ export class RunRequestResponder {
 
     if (body.kind === 'getRunDetail') {
       return { requestId: msg.requestId, result: { ok: true, data: detail } };
+    }
+
+    if (body.kind === 'getFanMembers') {
+      const data = detail
+        ? ((await this.gateway.getFanMembers?.(body.runId, body.group, body.query)) ?? null)
+        : null;
+      return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
     try {
@@ -128,6 +138,7 @@ export class RunRequestResponder {
       | { kind: 'runFacets' }
       | { kind: 'runValueFacets' }
       | { kind: 'getRunDetail' }
+      | { kind: 'getFanMembers' }
       | { kind: 'workerHealth' }
       | { kind: 'waitingFor' }
     >,

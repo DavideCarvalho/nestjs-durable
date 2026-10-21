@@ -12,6 +12,9 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { DashboardService } from './dashboard.service.js';
+
+/** Fans with more members than this come back summarized in a run's detail. */
+const FAN_INLINE_MAX = 50;
 import { DurableRun } from './durable-run.js';
 import { type RunListRow, toRunListRow } from './run-list-row.js';
 import type { RunQueryDraft } from './run-query-draft.js';
@@ -139,11 +142,36 @@ export class DurableApiController {
     return this.dashboard.topology();
   }
 
+  /**
+   * A run's detail. Fans wider than {@link FAN_INLINE_MAX} come back as one `FanSummary` each, their
+   * members paged by `runs/:id/fans/:group`; `?full=true` returns every checkpoint instead.
+   */
   @Get('runs/:id')
-  async run(@Param('id') id: string) {
-    const detail = await this.dashboard.getRunDetail(id);
+  async run(@Param('id') id: string, @Query('full') full?: string) {
+    const detail = await this.dashboard.getRunDetail(
+      id,
+      full === 'true' ? undefined : { summarizeFansOver: FAN_INLINE_MAX },
+    );
     if (!detail) throw new NotFoundException(`run ${id} not found`);
     return detail;
+  }
+
+  /** One page of a summarized fan's members, in seq order. */
+  @Get('runs/:id/fans/:group')
+  async fanMembers(
+    @Param('id') id: string,
+    @Param('group') group: string,
+    @Query('offset') offset?: string,
+    @Query('limit') limit?: string,
+    @Query('failed') failed?: string,
+  ) {
+    const page = await this.dashboard.getFanMembers(id, group, {
+      offset: offset === undefined ? undefined : Number(offset),
+      limit: limit === undefined ? undefined : Number(limit),
+      failedOnly: failed === 'true',
+    });
+    if (!page) throw new NotFoundException(`fan ${group} of run ${id} not found`);
+    return page;
   }
 
   /** Server-Sent Events stream of a run's live lifecycle events — the dashboard tails it instead

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { childRunIdOf } from './child-link';
+import { childChips, childDetailIds, childRunIdOf } from './child-link';
 
 describe('childRunIdOf', () => {
   it('extracts the child run id from a ctx.startChild spawn checkpoint', () => {
@@ -20,5 +20,43 @@ describe('childRunIdOf', () => {
     expect(childRunIdOf({ name: 'signal:wh:r1:3' })).toBeUndefined(); // webhook
     expect(childRunIdOf({ name: 'signal:breakpoint' })).toBeUndefined(); // breakpoint
     expect(childRunIdOf({ name: 'now' })).toBeUndefined();
+  });
+});
+
+describe('childDetailIds', () => {
+  it('lists distinct child ids in timeline order, skipping non-child steps', () => {
+    const timeline = [
+      { name: 'setup' },
+      { name: 'signal:child:b' },
+      { name: 'spawn:a' },
+      { name: 'signal:child:b' },
+    ];
+    expect(childDetailIds(timeline)).toEqual(['b', 'a']);
+  });
+
+  it('stops at the limit instead of one fetch per child', () => {
+    const timeline = Array.from({ length: 5000 }, (_, i) => ({ name: `signal:child:c${i}` }));
+    const ids = childDetailIds(timeline);
+    expect(ids).toHaveLength(50);
+    expect(ids[0]).toBe('c0');
+    expect(ids[49]).toBe('c49');
+  });
+});
+
+describe('childChips', () => {
+  it('lists every child when there are few', () => {
+    expect(childChips(['a', 'b'], undefined)).toEqual({ shown: ['a', 'b'], more: 0 });
+  });
+
+  it('caps the chips and counts the rest of the listed children', () => {
+    const children = Array.from({ length: 120 }, (_, i) => `c${i}`);
+    const { shown, more } = childChips(children, undefined);
+    expect(shown).toHaveLength(12);
+    expect(more).toBe(108);
+  });
+
+  it('counts past the listed ids with childCount, when the server capped the list', () => {
+    const children = Array.from({ length: 200 }, (_, i) => `c${i}`);
+    expect(childChips(children, 40000).more).toBe(39988);
   });
 });

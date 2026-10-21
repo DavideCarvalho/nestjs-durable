@@ -5539,8 +5539,8 @@ export class RemoteStepError extends Error {
 /** Checkpoint names that record a parent→child edge: an awaited child, a folded group of them, a spawn. */
 const CHILD_EDGE_PREFIXES = ['signal:child:', FOLDED_PREFIX, 'spawn:'];
 
-/** The child run ids a parent's {@link CHILD_EDGE_PREFIXES} checkpoints point at. */
-function childIdsOf(checkpoints: StepCheckpoint[]): string[] {
+/** The child run ids a parent's {@link CHILD_EDGE_PREFIXES} checkpoints point at (others are skipped). */
+export function childIdsOf(checkpoints: StepCheckpoint[]): string[] {
   const ids: string[] = [];
   for (const cp of checkpoints) {
     if (cp.name.startsWith('signal:child:')) ids.push(cp.name.slice('signal:child:'.length));

@@ -1,14 +1,17 @@
-import type { StepCheckpoint } from './durable-client.js';
+import type { FanSummary, StepCheckpoint } from './durable-client.js';
 import { foldedChildCount } from './folded-children.js';
 
 /**
- * A timeline rendered as a sequence of nodes: a plain `single` step, or a `fan` — N steps that the
+ * A timeline rendered as a sequence of nodes: a plain `single` step, a `fan` — N steps that the
  * engine tagged with the same `parallelGroup` (a `ctx.gather`/`ctx.all` fan-out, e.g. processing's 7
- * handlers) and that therefore ran as siblings, to be laid out at the same level rather than stacked.
+ * handlers) and that therefore ran as siblings, to be laid out at the same level rather than stacked —
+ * or a `summary`: a fan too wide for the detail to list, which the server sent as a {@link FanSummary}
+ * with its members left out of the timeline.
  */
 export type TimelineNode =
   | { kind: 'single'; step: StepCheckpoint }
-  | { kind: 'fan'; group: string; steps: StepCheckpoint[]; label: string };
+  | { kind: 'fan'; group: string; steps: StepCheckpoint[]; label: string }
+  | { kind: 'summary'; fan: FanSummary };
 
 /** Longest shared leading word-ish prefix across names, trimmed of trailing separators. */
 function commonPrefix(names: string[]): string {
@@ -36,14 +39,45 @@ function fanLabel(steps: StepCheckpoint[]): string {
   return `${prefix.length >= 2 ? prefix : 'parallel'} ×${steps.length}`;
 }
 
+function firstSeqOf(node: TimelineNode): number {
+  if (node.kind === 'single') return node.step.seq;
+  if (node.kind === 'fan') return node.steps[0]?.seq ?? Number.POSITIVE_INFINITY;
+  return node.fan.firstSeq;
+}
+
 /**
  * Collapse consecutive steps that share a non-empty `parallelGroup` into one `fan` node (the engine
  * tags every sibling of one `ctx.gather`/`ctx.all` fan with the SAME exact group string — the
  * `gather:`/`all:` prefix is cosmetic, grouping is by exact string). A fan keeps its position where
  * its first member sat; input order is preserved. Steps with no `parallelGroup`, or a group of one,
  * stay `single`.
+ *
+ * Each of `fans` becomes one `summary` node, placed where its first member would have sat: before the
+ * first node whose first seq is past the fan's `firstSeq`.
  */
-export function groupParallelSpans(timeline: StepCheckpoint[]): TimelineNode[] {
+export function groupParallelSpans(
+  timeline: StepCheckpoint[],
+  fans: readonly FanSummary[] = [],
+): TimelineNode[] {
+  const nodes = groupSteps(timeline);
+  if (fans.length === 0) return nodes;
+  const pending = [...fans].sort((a, b) => a.firstSeq - b.firstSeq);
+  const merged: TimelineNode[] = [];
+  let f = 0;
+  for (const node of nodes) {
+    const seq = firstSeqOf(node);
+    while (f < pending.length && (pending[f] as FanSummary).firstSeq < seq) {
+      merged.push({ kind: 'summary', fan: pending[f] as FanSummary });
+      f += 1;
+    }
+    merged.push(node);
+  }
+  for (; f < pending.length; f += 1)
+    merged.push({ kind: 'summary', fan: pending[f] as FanSummary });
+  return merged;
+}
+
+function groupSteps(timeline: StepCheckpoint[]): TimelineNode[] {
   const nodes: TimelineNode[] = [];
   let i = 0;
   while (i < timeline.length) {
@@ -75,4 +109,31 @@ export function groupParallelSpans(timeline: StepCheckpoint[]): TimelineNode[] {
     i = j;
   }
   return nodes;
+}
+
+/** A summarized fan's members by status, every status present (zero when the server omitted it). */
+export interface FanProgress {
+  completed: number;
+  failed: number;
+  running: number;
+  pending: number;
+  size: number;
+}
+
+export function fanProgress(fan: FanSummary): FanProgress {
+  return {
+    completed: fan.counts.completed ?? 0,
+    failed: fan.counts.failed ?? 0,
+    running: fan.counts.running ?? 0,
+    pending: fan.counts.pending ?? 0,
+    size: fan.size,
+  };
+}
+
+/** One status for a summarized fan's node: in flight while any member is, else failed if any did. */
+export function fanStatus(fan: FanSummary): StepCheckpoint['status'] {
+  const p = fanProgress(fan);
+  if (p.running > 0) return 'running';
+  if (p.pending > 0) return 'pending';
+  return p.failed > 0 ? 'failed' : 'completed';
 }

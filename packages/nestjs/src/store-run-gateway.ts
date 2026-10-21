@@ -1,8 +1,11 @@
 import {
   type DurableTopology,
   type EngineEvent,
+  type FanPage,
+  type FanPageQuery,
   type GroupHealth,
   type RunDetail,
+  type RunDetailOptions,
   type RunFacetQuery,
   type RunFacetRow,
   type RunGateway,
@@ -14,12 +17,16 @@ import {
   type RunValueFacetRow,
   type RunWaiting,
   STATE_STORE_CANONICAL,
+  SUMMARY_CHILD_LIMIT,
   type StateStore,
   WorkflowEngine,
+  childIdsOf,
   indexWaitersByRun,
   listSignalWaitersOfRuns,
   mergeRunFacetRows,
+  pageFan,
   resolveRunWaiting,
+  summarizeTimeline,
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable } from '@nestjs/common';
 
@@ -40,14 +47,34 @@ export class StoreRunGateway implements RunGateway {
     return { role: 'control-plane' };
   }
 
-  async getRunDetail(runId: string): Promise<RunDetail | null> {
+  async getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
     const run = await this.store.getRun(runId);
     if (!run) return null;
-    const [timeline, children] = await Promise.all([
-      this.store.listCheckpoints(runId),
-      this.engine.getRunChildren(runId), // canonical parent→children edge (shared with cancel cascade)
-    ]);
-    return { run, timeline, children };
+    const over = options?.summarizeFansOver;
+    if (over === undefined) {
+      const [timeline, children] = await Promise.all([
+        this.store.listCheckpoints(runId),
+        this.engine.getRunChildren(runId), // canonical parent→children edge (shared with cancel cascade)
+      ]);
+      return { run, timeline, children };
+    }
+    // Summarized: the children come from the timeline already loaded, rather than a second read of
+    // every child-edge checkpoint (one per child of a wide fan).
+    const full = await this.store.listCheckpoints(runId);
+    const { timeline, fans } = summarizeTimeline(full, over);
+    const ids = childIdsOf(full);
+    return {
+      run,
+      timeline,
+      children: ids.slice(0, SUMMARY_CHILD_LIMIT),
+      fans,
+      childCount: ids.length,
+    };
+  }
+
+  async getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    if (!(await this.store.getRun(runId))) return null;
+    return pageFan(await this.store.listCheckpoints(runId), group, query);
   }
 
   async listRuns(query: RunQuery): Promise<RunListItem[]> {
