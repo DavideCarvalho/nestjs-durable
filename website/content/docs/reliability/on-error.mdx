@@ -1,0 +1,130 @@
+---
+title: Routing a run's failure — @OnError
+description: Route a failed run to a handler workflow by error code, and have the run settle with the handler's outcome — orchestrated by the engine, so it works the same for inline, in-app-worker and remote (Python) bodies, and a fan-out over the workflow keeps going when one item fails.
+icon: LifeBuoy
+---
+
+Some failures are not accidents. A line that fails validation, a record a downstream system rejects, an
+order for a product that no longer exists: retrying won't change the answer, and failing the run isn't the
+right end state either, because something should happen next (record the line, tell someone, move on).
+
+`@OnError` routes such a failure to a **handler workflow**. When a run ends `failed` with an error whose
+`code` matches, the engine starts the handler and the failed run waits for it, then settles with the
+handler's outcome: its return value becomes the run's output, so the run completes.
+
+```ts
+import { FatalError, type OnErrorInput, type WorkflowCtx } from '@dudousxd/nestjs-durable-core';
+import { OnError, Workflow } from '@dudousxd/nestjs-durable';
+
+export class InvalidLine extends FatalError {
+  static readonly code = 'invalid_line';
+  constructor(message: string) {
+    super(message, InvalidLine.code);
+  }
+}
+
+@Workflow({ name: 'line' })
+export class LineWorkflow {
+  constructor(private readonly steps: LineSteps) {}
+
+  async run(ctx: WorkflowCtx, line: Line): Promise<LineResult> {
+    await ctx.step(this.steps.validate, line); // throws InvalidLine for a bad line
+    await ctx.step(this.steps.ingest, line);
+    return { ok: 1, failed: 0 };
+  }
+
+  @OnError(InvalidLine)
+  async invalid(ctx: WorkflowCtx, failure: OnErrorInput<Line>): Promise<LineResult> {
+    await ctx.step(this.steps.recordDeadLetter, { line: failure.input, error: failure.error.message });
+    return { ok: 0, failed: 1 };
+  }
+}
+```
+
+A file that fans out over its lines with `ctx.all(LineWorkflow, lines)` now completes with one
+`LineResult` per line, instead of failing on the first invalid one.
+
+## How the engine runs it
+
+The engine does the routing, at the point where it settles a run as failed. It never looks inside the
+body, so the same thing happens whatever ran it: inline, an in-app worker, or a remote worker in another
+language.
+
+1. The run's body fails with an error carrying `code: 'invalid_line'`. Saga compensations of the body
+   run, as for any failure.
+2. Instead of marking the run `failed`, the engine starts the handler as its own run, with the id
+   `<runId>.onError` and an `OnErrorInput` (`{ runId, workflow, input, error }`), and suspends the failed
+   run on it the way a parent waits for a `ctx.child`.
+3. From then on the run only follows its handler: the body is never run again, not by a recovery wake
+   nor by a manual resume. When the handler finishes, the run settles with its outcome: `completed`
+   with the handler's output, or `failed` with the handler's error.
+
+The handler is an ordinary durable run: it shows up in the dashboard, its steps are checkpointed and
+retried, and the wait survives a crash like any child wait. A `@OnError` method is registered as the
+workflow `<workflow>.onError.<method>` and shares the class's injected dependencies.
+
+## Matching
+
+Routing matches on the error's **`code`**, not its class: a dispatched step's error reaches the engine
+as a plain `{ message, code }`, and a remote body's failure was never a JavaScript error at all.
+
+- `@OnError(InvalidLine)` reads `InvalidLine.code`. A class without a static `code` is rejected when the
+  decorator runs.
+- `@OnError('invalid_line')` names the code directly.
+- `@OnError()` with no argument is the catch-all: any failure no other code matches.
+- Stack the decorator to give one method several codes.
+
+The code comes from `FatalError`'s second argument, from a `code` on whatever a step handler threw, or
+from the code a remote worker reported for the failed step. A failure from a step reaches the route once
+the step's retries are spent; a `FatalError` skips them.
+
+Never routed: cancellation, timeouts, dead-lettering, and the failures that mean the deployment is broken
+(non-determinism, a ctx call nested in a step). Those keep their usual meaning.
+
+## Typing
+
+The method is checked against the workflow: it receives `OnErrorInput<Input>`, where `Input` is `run`'s
+input, and must return `run`'s output type. A handler that returns a different shape doesn't compile, so
+`ctx.all` over the workflow stays honestly typed.
+
+## Remote workflows
+
+For a workflow the engine serves by convention (a Python body, or any worker it discovers by its live
+queue), the routes come from what the workers **announce** in their handshake descriptor, the same place
+the engine reads the workflow's version from. In the Python SDK:
+
+```python
+@worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-dead-letter"}])
+def line(ctx, input): ...
+```
+
+The handler can be a workflow of any runtime; the engine only starts a run by name. If the live workers
+announce different routes for the workflow (a rollout in progress), the failure is not routed, the same
+way two announced versions leave a run's version undeclared.
+
+## A handler in another workflow
+
+To route to a separate workflow (shared across workflows, or one registered by another runtime), list it
+on the class:
+
+```ts
+@Workflow({
+  name: 'line',
+  onError: [{ code: 'upstream_unavailable', workflow: UpstreamOutageWorkflow }],
+})
+```
+
+On the engine directly, both forms are `register(name, version, fn, { onError: [{ code?, workflow }] })`.
+`registerRemote` / `remote` take the same option, for a remote workflow registered by hand rather than
+served by convention.
+
+## `@OnError`, `ctx.allSettled` and `@DeadLetter`
+
+| | Who decides | Fires on |
+| --- | --- | --- |
+| `@OnError` | the workflow, for every caller | a run that failed with a routed code |
+| [`ctx.allSettled`](/docs/authoring/child-workflows#when-a-failed-item-is-an-expected-outcome--ctxallsettled) | the parent, for one fan | a failed child or step |
+| [`@DeadLetter`](/docs/reliability/dead-letter) | the workflow | a run that crash recovery gave up on (`dead`) |
+
+Reach for `@OnError` when the failure policy belongs to the workflow, and for `ctx.allSettled` when it
+belongs to one caller.

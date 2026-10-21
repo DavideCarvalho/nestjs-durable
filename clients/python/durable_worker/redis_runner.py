@@ -188,6 +188,7 @@ def _build_descriptor(
             group=group_of(name) if group_of is not None else None,
             requires=meta.get(name, {}).get("requires"),
             origin=meta.get(name, {}).get("origin"),
+            on_error=meta.get(name, {}).get("on_error"),
         )
         for name in workflows
     ]

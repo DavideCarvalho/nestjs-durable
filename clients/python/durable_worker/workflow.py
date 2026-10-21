@@ -47,6 +47,9 @@ class NondeterminismError(WorkflowError):
     """The history doesn't match what the replay produced at a seq — the workflow code changed under
     a run that is already in flight. The run fails loudly rather than silently diverging."""
 
+    #: Marks the failure as a broken deploy, which the engine's onError routing never takes.
+    code = "non_determinism"
+
 
 class StepFailed(Exception):
     """A step/call/child the workflow awaited resolved to a failure. Catchable in workflow code
@@ -723,11 +726,13 @@ class WorkflowWorker:
         version: Optional[str] = None,
         requires: Optional[List[str]] = None,
         origin: Optional[str] = None,
+        on_error: Optional[List[Dict[str, str]]] = None,
     ) -> Callable[[WorkflowFn], WorkflowFn]:
         """Decorator registering ``fn`` as the workflow ``name``. ``fn(ctx, input)`` (or ``fn(ctx)``).
 
-        ``version`` / ``requires`` / ``origin`` are announcement metadata only — identical in meaning
-        to :meth:`durable_worker.worker.Worker.workflow`'s (design §7.9), and equally optional."""
+        ``version`` / ``requires`` / ``origin`` are announcement metadata only, and ``on_error`` the
+        routes the engine applies to a failed run — identical in meaning to
+        :meth:`durable_worker.worker.Worker.workflow`'s (design §7.9), and equally optional."""
 
         def register(fn: WorkflowFn) -> WorkflowFn:
             self._workflows[name] = fn
@@ -738,6 +743,8 @@ class WorkflowWorker:
                 meta["requires"] = list(requires)
             if origin is not None:
                 meta["origin"] = origin
+            if on_error is not None:
+                meta["on_error"] = [dict(route) for route in on_error]
             if meta:
                 self._workflow_meta[name] = meta
             return fn

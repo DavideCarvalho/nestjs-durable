@@ -71,6 +71,10 @@ class WorkflowRegistration:
     group: Optional[str] = None
     requires: Optional[List[str]] = None
     origin: Optional[str] = None
+    #: Where the engine routes a failed run of this workflow, by error ``code`` (no ``code`` = the
+    #: catch-all): ``[{"code": "invalid_line", "workflow": "line-dead-letter"}, {"workflow": "..."}]``.
+    #: The one announced field the engine ACTS on, for a workflow it serves by convention.
+    on_error: Optional[List[Dict[str, str]]] = None
 
     def to_wire(self) -> Dict[str, Any]:
         """Serialize to the wire JSON shape, omitting every un-stated field (so a name-only
@@ -84,18 +88,22 @@ class WorkflowRegistration:
             wire["requires"] = list(self.requires)
         if self.origin is not None:
             wire["origin"] = self.origin
+        if self.on_error is not None:
+            wire["onError"] = [dict(route) for route in self.on_error]
         return wire
 
     @classmethod
     def from_wire(cls, raw: Dict[str, Any]) -> "WorkflowRegistration":
         """Parse one wire registration. An absent field stays ``None`` — never defaulted."""
         requires = raw.get("requires")
+        on_error = raw.get("onError")
         return cls(
             name=raw["name"],
             version=raw.get("version"),
             group=raw.get("group"),
             requires=list(requires) if requires is not None else None,
             origin=raw.get("origin"),
+            on_error=[dict(route) for route in on_error] if on_error is not None else None,
         )
 
 
@@ -184,22 +192,36 @@ def is_legacy_descriptor(raw: Dict[str, Any]) -> bool:
     return raw.get("protocol") is None
 
 
+def canonical_routes(routes: Sequence[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """onError routes in a fixed key order, de-duplicated and sorted by their canonical JSON — byte-
+    identical to the TS ``canonicalRoutes``, so their order never changes the hash."""
+    by_json: Dict[str, Dict[str, Any]] = {}
+    for route in routes:
+        entry = {"code": route.get("code"), "workflow": route["workflow"]}
+        by_json[json.dumps(entry, separators=(",", ":"), ensure_ascii=False)] = entry
+    return [by_json[k] for k in sorted(by_json)]
+
+
 def _canonicalize_registrations(regs: Sequence[WorkflowRegistration]) -> List[Any]:
     """Canonical, order-insensitive projection of the ``registrations`` announcement — byte-identical
     to the TS ``canonicalizeRegistrations``. Each entry gets a FIXED key order with absent fields
     collapsed to ``None``, ``requires`` sorted + de-duplicated, and the entries themselves
     de-duplicated and sorted by their own canonical JSON, so announcement order cannot change the
     hash — only the announced CONTENT can, which is when a control plane should re-read."""
-    canonical = [
-        {
+    canonical = []
+    for r in regs:
+        entry: Dict[str, Any] = {
             "name": r.name,
             "version": r.version,
             "group": r.group,
             "requires": sorted(set(r.requires)) if r.requires is not None else None,
             "origin": r.origin,
         }
-        for r in regs
-    ]
+        # Conditional, so a registration that states no routes keeps the hash it had before routes
+        # existed — byte-identical to the TS ``canonicalizeRegistrations``.
+        if r.on_error is not None:
+            entry["onError"] = canonical_routes(r.on_error)
+        canonical.append(entry)
     by_json = {json.dumps(entry, separators=(",", ":"), ensure_ascii=False): entry for entry in canonical}
     return [by_json[k] for k in sorted(by_json)]
 

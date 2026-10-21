@@ -153,6 +153,16 @@ Marks a method on a `@Workflow` class as its inline dead-letter handler — regi
 run of the class is moved to `dead`. Takes precedence over `deadLetterWorkflow`. See
 [Dead-letter queue](/docs/reliability/dead-letter).
 
+### `@OnError(match?)`
+
+Marks a method on a `@Workflow` class as the handler workflow for a failure of its runs: when a run ends
+`failed` with an error whose `code` matches (an error class with a static `code`, or the code string; no
+argument for the catch-all), the engine starts the method as `<workflow>.onError.<method>` with an
+`OnErrorInput` and the run settles with its outcome. Typed against `run`'s input and output; stackable.
+`@Workflow({ onError: [{ code?, workflow }] })` routes to a separate workflow, and the engine's
+`register` / `registerRemote` take the same `onError` option. See
+[Routing a run's failure](/docs/reliability/on-error).
+
 ### `@Entity(options)` / `@On(op)`
 
 `@Entity({ name })` marks an `@Injectable()` class as a durable entity (a keyed virtual object,

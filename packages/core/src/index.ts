@@ -24,6 +24,7 @@ export * from './codec-state-store';
 export * from './concurrency';
 export * from './events';
 export * from './metrics';
+export * from './on-error';
 export * from './scheduler';
 export * from './schedules';
 export { createStepLogger } from './step-logger';

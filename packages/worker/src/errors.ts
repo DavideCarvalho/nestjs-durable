@@ -13,6 +13,8 @@ export class WorkflowError extends Error {}
  * and the thin worker; the human-readable `.message` is derived from those fields.
  */
 export class NondeterminismError extends WorkflowError {
+  /** Marks the failure as a broken deploy, which the engine's `onError` routing never takes. */
+  readonly code = 'non_determinism';
   readonly runId: string;
   readonly seq: number;
   readonly expected: string;
