@@ -1229,7 +1229,16 @@ export class WorkflowEngine {
       createdAt: now,
       updatedAt: now,
     };
-    await this.store.createRun(run);
+    try {
+      await this.store.createRun(run);
+    } catch (err) {
+      // A racing start of the same id inserted it between the check above and this insert (two
+      // turns of one parent starting the same `ctx.all` child, say). The winner dispatched it;
+      // converge on its run instead of reporting a start that did not fail.
+      const winner = await this.store.getRun(runId).catch(() => null);
+      if (!winner) throw err;
+      return { runId, status: winner.status, output: winner.output, error: winner.error };
+    }
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
     await this.runDispatcher.dispatch(runId);
