@@ -295,6 +295,15 @@ const versionKey = (name: string, version: string): string => `${name}@${version
 /** How many checkpoint writes / dispatches a step fan sends at once. */
 const STEP_FAN_CHUNK = 200;
 
+/** Fisher–Yates, in place. */
+function shuffle<T>(items: T[]): T[] {
+  for (let i = items.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [items[i], items[j]] = [items[j] as T, items[i] as T];
+  }
+  return items;
+}
+
 function stepGroup(step: { name: string; partition?: string | undefined }, runNamespace?: string) {
   return tenantGroup(sanitizeQueueToken(step.name), step.partition ?? runNamespace);
 }
@@ -414,6 +423,13 @@ export interface WorkflowEngineDeps {
    * for a genuinely-orphaned run. Default 5min; set `0` to disable (the prior wake-forever behavior).
    */
   reconcileMs?: number | undefined;
+  /**
+   * The most due timers one {@link WorkflowEngine.resumeDueTimers} pass loads and drives, most
+   * overdue first. Every driving instance runs that pass each tick, so a wave of thousands of due
+   * runs (a recovery after an outage, a fan's children waking together) is worked through in
+   * batches instead of every instance loading and walking all of it. Default 500.
+   */
+  timerBatchSize?: number | undefined;
   /**
    * Retention for a BUFFERED event that no `waitForEvent` ever claims (see
    * {@link WorkflowEngine.publishEvent}'s buffering — a publish matching no live waiter keeps ONE
@@ -540,6 +556,7 @@ export class WorkflowEngine {
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly remoteAdvanceSilenceMs?: number | undefined;
   private readonly reconcileMs: number | undefined;
+  private readonly timerBatchSize: number;
   private readonly eventBufferTtlMs: number | undefined;
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
@@ -614,6 +631,8 @@ export class WorkflowEngine {
   private readonly awaitedStepFans = new Map<string, { from: number; to: number }[]>();
   /** Step fans whose join barrier this instance opened, by `runId:firstSeq` — see {@link settledHere}. */
   private readonly stepFansFiredHere = new Map<string, number>();
+  /** The tail of each run's queue of results being handled on this instance — see {@link serializedPerRun}. */
+  private readonly resultChains = new Map<string, Promise<void>>();
   /** Flow-control admission backend for remote steps (see {@link registerQueue}). */
   private readonly admission: AdmissionBackend;
   /** Runs on THIS instance blocked on admission, by queue — woken early on a freed-slot signal. */
@@ -657,6 +676,7 @@ export class WorkflowEngine {
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
     this.reconcileMs = deps.reconcileMs === undefined ? 300_000 : deps.reconcileMs || undefined;
+    this.timerBatchSize = Math.max(1, deps.timerBatchSize ?? 500);
     // Opt-in: unset (or 0) keeps buffered events around forever, same as buffered signals.
     this.eventBufferTtlMs = deps.eventBufferTtlMs || undefined;
     // Opt-in: unset (or 0) leaves the by-design "re-suspend a lost dispatch, never re-dispatch" behavior.
@@ -723,7 +743,18 @@ export class WorkflowEngine {
         }
         // Durable path: no in-memory waiter (the step suspended the run, possibly on another
         // instance) → complete the checkpoint and resume the run here.
-        await this.completeRemoteResult(result);
+        // Settling runs in parallel; only the resume (the run's turn) is serialized per run, so the
+        // results of one wide step fan are not queued behind each other on an instance.
+        if (!(await this.completeRemoteResult(result))) return;
+        await this.serializedPerRun(result.runId, () =>
+          this.resumeImplicit(result.runId).then(
+            () => undefined,
+            (err) => {
+              if (err instanceof NamespaceMismatch) return;
+              throw err;
+            },
+          ),
+        );
       },
       // A heartbeat resets the liveness window for whatever it targets: an in-flight long STEP (keyed
       // by stepId, see callRemote) or — when stepId is absent — the in-flight workflow TURN (keyed by
@@ -1796,7 +1827,9 @@ export class WorkflowEngine {
    * scan, filtered to just this tick's batch, keeps it cheap regardless of store size.
    */
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
-    const due = await this.store.listDueTimers(nowMs, this.namespace);
+    // Shuffled: every instance loads the same most-overdue batch, and walking it in the same order
+    // would have them all contend for the same leases one row at a time.
+    const due = shuffle(await this.store.listDueTimers(nowMs, this.namespace, this.timerBatchSize));
     // ALSO re-drive runs parked `blocked` whose recovery poll is due (handshake design §7.5): re-driving
     // re-checks the live fleet, so a run proceeds the moment a capable+compatible worker appears (else it
     // re-parks with a fresh `wakeAt`). `listDueTimers` targets `suspended`+`wakeAt`, so blocked runs are
@@ -5135,13 +5168,31 @@ export class WorkflowEngine {
   }
 
   /**
-   * Complete a durable remote step from its worker result and resume the run — runs on whichever
-   * instance receives the result (the dispatching one may be gone), so the run is crash/scale-safe.
-   * A no-op if the checkpoint isn't `pending` (a duplicate or late delivery).
+   * Run `work` after every earlier `work` for the same run on this instance has settled. A result
+   * resumes its run inline, and `execute` lets this instance into a lease it already holds — so two
+   * results of one run handled at once here would run two turns of it concurrently. Results of
+   * different runs still go in parallel, which is what a results consumer with concurrency > 1 is for.
    */
-  private async completeRemoteResult(result: StepResult): Promise<void> {
+  private serializedPerRun(runId: string, work: () => Promise<void>): Promise<void> {
+    const previous = this.resultChains.get(runId) ?? Promise.resolve();
+    const next = previous.then(work, work);
+    const tail = next.catch(() => undefined);
+    this.resultChains.set(runId, tail);
+    void tail.then(() => {
+      if (this.resultChains.get(runId) === tail) this.resultChains.delete(runId);
+    });
+    return next;
+  }
+
+  /**
+   * Complete a durable remote step from its worker result — runs on whichever instance receives the
+   * result (the dispatching one may be gone), so the run is crash/scale-safe. Resolves whether the
+   * run should now be resumed: not for a duplicate or late delivery (the checkpoint isn't `pending`),
+   * a run already finished, or a step fan whose barrier is still closed.
+   */
+  private async completeRemoteResult(result: StepResult): Promise<boolean> {
     const cp = await this.store.getCheckpoint(result.runId, result.seq);
-    if (!cp || cp.status !== 'pending') return;
+    if (!cp || cp.status !== 'pending') return false;
     // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Done
     // before the cancelled-run early-return below, so a cancellation can't leak the slot. Released
     // fire-and-forget: the slot/notify is best-effort (a global backend self-heals via lease), and
@@ -5150,7 +5201,7 @@ export class WorkflowEngine {
     // Drop a late result for a run that was cancelled/finished meanwhile — don't complete the step
     // or resume (the run is already terminal). This is the engine side of cooperative cancellation.
     const run = await this.store.getRun(result.runId);
-    if (run && (run.status === 'cancelled' || run.status === 'completed')) return;
+    if (run && (run.status === 'cancelled' || run.status === 'completed')) return false;
     const finishedAt = new Date();
     const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
     // Claimed, not blindly written: a duplicate delivery of this result settled it first.
@@ -5163,7 +5214,7 @@ export class WorkflowEngine {
       startedAt,
       finishedAt,
     });
-    if (!claimed) return;
+    if (!claimed) return false;
     this.noteSettledHere(`${result.runId}:${result.seq}`);
     this.emit({
       type: result.status === 'completed' ? 'step.completed' : 'step.failed',
@@ -5176,11 +5227,7 @@ export class WorkflowEngine {
       queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
       durationMs: finishedAt.getTime() - startedAt.getTime(),
     });
-    if (await this.stepFanStillRunning(cp, result)) return;
-    await this.resumeImplicit(result.runId).catch((err) => {
-      if (err instanceof NamespaceMismatch) return null;
-      throw err;
-    });
+    return !(await this.stepFanStillRunning(cp, result));
   }
 
   /**

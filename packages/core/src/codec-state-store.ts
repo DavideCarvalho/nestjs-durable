@@ -251,8 +251,8 @@ export class CodecStateStore implements StateStore {
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     return (await this.inner.listPendingRuns(limit, namespace)).map((r) => this.decRun(r));
   }
-  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
-    return (await this.inner.listDueTimers(nowMs, namespace)).map((r) => this.decRun(r));
+  async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
+    return (await this.inner.listDueTimers(nowMs, namespace, limit)).map((r) => this.decRun(r));
   }
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean> {
     return this.inner.tryLockRun(runId, owner, leaseUntilMs, nowMs);

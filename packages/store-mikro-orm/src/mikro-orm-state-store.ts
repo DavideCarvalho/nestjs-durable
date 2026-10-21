@@ -342,13 +342,17 @@ export class MikroOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
-  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
     const em = this.fork();
-    const rows = await em.find(WorkflowRunEntity, {
-      status: 'suspended',
-      wakeAt: { $ne: null, $lte: new Date(nowMs) },
-      ...(namespace !== undefined ? { namespace } : {}),
-    });
+    const rows = await em.find(
+      WorkflowRunEntity,
+      {
+        status: 'suspended',
+        wakeAt: { $ne: null, $lte: new Date(nowMs) },
+        ...(namespace !== undefined ? { namespace } : {}),
+      },
+      { orderBy: { wakeAt: 'asc' }, ...(limit !== undefined ? { limit } : {}) },
+    );
     return rows.map(fromRunEntity);
   }
 

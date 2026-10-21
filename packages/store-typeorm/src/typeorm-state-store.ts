@@ -312,11 +312,15 @@ export class TypeOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
-  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
-    const rows = await this.runs().findBy({
-      status: 'suspended',
-      wakeAt: LessThanOrEqual(new Date(nowMs)),
-      ...(namespace !== undefined ? { namespace } : {}),
+  async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
+    const rows = await this.runs().find({
+      where: {
+        status: 'suspended',
+        wakeAt: LessThanOrEqual(new Date(nowMs)),
+        ...(namespace !== undefined ? { namespace } : {}),
+      },
+      order: { wakeAt: 'ASC' },
+      ...(limit !== undefined ? { take: limit } : {}),
     });
     return rows.map(fromRunEntity);
   }

@@ -207,8 +207,8 @@ export class InMemoryStateStore implements StateStore {
       .map((r) => ({ ...r }));
   }
 
-  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
-    return [...this.runs.values()]
+  async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
+    const due = [...this.runs.values()]
       .filter(
         (r) =>
           r.status === 'suspended' &&
@@ -216,7 +216,8 @@ export class InMemoryStateStore implements StateStore {
           r.wakeAt <= nowMs &&
           (namespace === undefined || r.namespace === namespace),
       )
-      .map((r) => ({ ...r }));
+      .sort((a, b) => (a.wakeAt ?? 0) - (b.wakeAt ?? 0));
+    return (limit === undefined ? due : due.slice(0, limit)).map((r) => ({ ...r }));
   }
 
   async tryLockRun(
