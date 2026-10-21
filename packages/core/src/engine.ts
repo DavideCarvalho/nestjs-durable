@@ -676,7 +676,10 @@ export class WorkflowEngine {
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
     this.reconcileMs = deps.reconcileMs === undefined ? 300_000 : deps.reconcileMs || undefined;
-    this.timerBatchSize = Math.max(1, deps.timerBatchSize ?? 500);
+    // A non-finite or sub-1 value falls back to the default: a NaN limit would stall timer recovery.
+    const batch = deps.timerBatchSize;
+    this.timerBatchSize =
+      batch !== undefined && Number.isFinite(batch) && batch >= 1 ? Math.floor(batch) : 500;
     // Opt-in: unset (or 0) keeps buffered events around forever, same as buffered signals.
     this.eventBufferTtlMs = deps.eventBufferTtlMs || undefined;
     // Opt-in: unset (or 0) leaves the by-design "re-suspend a lost dispatch, never re-dispatch" behavior.

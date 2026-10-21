@@ -72,3 +72,26 @@ describe('step results of one run on one instance', () => {
     expect(maxActive).toBe(1);
   });
 });
+
+describe('timerBatchSize', () => {
+  it('falls back to the default for a non-finite value, so due timers still resume', async () => {
+    const store = new InMemoryStateStore();
+    let now = 1_000;
+    const engine = new WorkflowEngine({
+      store,
+      timerBatchSize: Number.NaN,
+      reconcileMs: 0,
+      clock: () => now,
+    });
+    engine.register('nap', '1', async (ctx) => {
+      await ctx.sleep('1s');
+      return 'awake';
+    });
+
+    await engine.start('nap', {}, 'r1');
+    await until(async () => (await store.getRun('r1'))?.status === 'suspended');
+    now += 2_000;
+    await engine.resumeDueTimers();
+    await until(async () => (await store.getRun('r1'))?.status === 'completed');
+  });
+});
