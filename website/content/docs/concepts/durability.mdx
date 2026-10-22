@@ -117,5 +117,10 @@ Because the engine is embedded in your app, deploys and replicas need a word.
   Set `leaseMs` above how long a single resume step runs (no longer your whole synchronous run, since
   the lease is renewed).
 - **Graceful shutdown.** On `OnApplicationShutdown` the engine **drains**: it stops picking up new
-  runs and waits for in-flight ones to settle, then releases their leases so the next instance takes
-  over immediately. Enable it with `app.enableShutdownHooks()`.
+  runs and waits for in-flight ones to settle. If the budget (`shutdownTimeoutMs`) runs out first, it
+  releases the leases of the runs still executing (and fences those turns, so they never write), so
+  the next instance takes over immediately instead of after `leaseMs`. Enable it with
+  `app.enableShutdownHooks()`.
+- **A stalled turn can't clobber its successor.** A turn whose lease renewal reports the lease lost
+  (another instance took the run over after it expired) is fenced: its outcome is not written. See
+  [Production → crash recovery](/docs/production#3-crash-recovery-is-a-lease).

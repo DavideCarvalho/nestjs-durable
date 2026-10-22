@@ -1,0 +1,102 @@
+---
+title: Stalled runs
+description: Get paged about stranded runs instead of hearing about them from a customer. engine.onStalled (or the DurableModule onStalled option) plus stalledAfterMs turn "suspended forever" and "dispatched and lost" into an alert, once per stranded episode; listStalledRuns, findStalledRuns and durable inspect --stale are the same query on demand.
+icon: BellRing
+---
+
+`suspended` is not an error. A run waiting on a slow worker, a long `ctx.sleep` and a run whose wake-up
+was lost all look the same in the runs list, so nothing alerts anyone when a run is actually stuck.
+The stalled-run pager watches for the two shapes a stuck run takes and reports them.
+
+## What counts as stranded
+
+A `running` or `suspended` run is reported when it has been untouched (`updatedAt`) for at least
+`stalledAfterMs` **and** one of these holds:
+
+- **`wakeForever`**: it is `suspended` with no wake timer at all, so nothing will ever re-drive it.
+  This is the `reconcileMs: 0` hazard. With the default `reconcileMs` every event-waiting suspension
+  carries a fallback wake, so this shape means something cleared it.
+- **`stalePending`**: its oldest `pending` remote step was enqueued longer ago than the threshold and
+  **nothing is leasing it**. A remote step with a `timeoutMs`, a heartbeat renewing it, or
+  `remoteRedispatchMs` carries a lease (`wakeAt`) in the future and is not reported. A step with no
+  lease, or with a lease that lapsed, most likely lost its dispatch.
+
+Healthy long work is excluded: a long `ctx.sleep` has a future `wakeAt` and no pending step, and a
+beating long step keeps a future lease.
+
+## Page on it
+
+Pass `onStalled` to the module, or register it on the engine from any provider (exactly like
+[`engine.onDead`](/docs/reliability/dead-letter)):
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  stalledAfterMs: 30 * 60_000, // above your longest legitimate remote step; default 15 min
+  onStalled: ({ run, ageMs, wakeForever, stalePending }) => {
+    pager.alert(`durable run ${run.id} (${run.workflow}) stalled for ${Math.round(ageMs / 60_000)}min`, {
+      wakeForever,
+      stalePending, // { seq, name, attempts, ageMs, leaseUntil } when a lost remote step is the cause
+    });
+  },
+});
+```
+
+```ts
+@Injectable()
+export class StalledRunAlerts implements OnModuleInit {
+  constructor(private readonly engine: WorkflowEngine) {}
+
+  onModuleInit() {
+    this.engine.onStalled((info) => this.pager.alert(info));
+  }
+}
+```
+
+`onStalled` returns an unsubscribe function, and a listener that throws never breaks the sweep.
+
+## How the sweep runs
+
+- **In the timer poller.** Every tick of a [driving operator](/docs/cluster/roles-and-config)'s timer
+  poller calls `engine.sweepStalled()`. The engine throttles it to one pass a minute, skips it while
+  draining, and does nothing when no listener is registered. A `drive: false` operator or a thin
+  worker never sweeps, so register the listener on a driving instance. If you drive the engine
+  yourself (`timerPollMs: 0`), call `engine.sweepStalled()` from your scheduler.
+- **Once per episode, per instance.** A run already reported is skipped until it makes progress
+  (its `updatedAt` changes) and strands again, so a wedged run does not page you every minute. That
+  memory is in-process: with several driving replicas each one reports the episode once, and a
+  restart forgets what it reported. Register the listener on one process, or deduplicate in the pager
+  by `run.id` + `run.updatedAt`.
+- **Bounded and namespaced.** A pass inspects up to 1000 in-flight runs (newest first, in pages of
+  200), reads the checkpoints of the idle ones, and stays in the engine's own `namespace`. An operator
+  with no namespace sweeps every namespace.
+
+Set `stalledAfterMs` above your longest legitimate remote step. A slow but healthy step under the
+threshold is exactly the case the engine refuses to guess about. Values under one minute are raised to
+one minute.
+
+## List them on demand
+
+The same query, without notifying anyone:
+
+```ts
+const stranded = await engine.listStalledRuns({ thresholdMs: 60 * 60_000 });
+```
+
+`findStalledRuns(store, { thresholdMs, namespace, scan, now })` from `@dudousxd/nestjs-durable-core`
+runs it on a bare `StateStore`, for an ops script with no engine. From a terminal:
+
+```bash
+durable inspect --stale        # default threshold, 15 minutes
+durable inspect --stale=1h --namespace tenant-a
+```
+
+See the [CLI](/docs/cli#find-stranded-runs).
+
+## Recovering a stranded run
+
+- A lost remote step: `engine.redispatchPending(runId)` re-enqueues its pending remote checkpoints
+  now. `remoteRedispatchMs` makes future ones heal on their own.
+- A wake-forever run: deliver the signal or event it waits on, or `engine.resume(runId)` to replay it.
+- A run nobody needs any more: cancel it (`engine.cancel(runId)` or `durable cancel <runId>`).

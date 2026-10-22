@@ -120,6 +120,7 @@ import {
   withoutSingletonMarkers,
 } from './singleton-admission';
 import { SingletonGate } from './singleton-gate';
+import { DEFAULT_STALLED_AFTER_MS, type StalledRunInfo, findStalledRuns } from './stalled-runs';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
 import {
@@ -526,6 +527,14 @@ export interface WorkflowEngineDeps {
    */
   reconcileMs?: number | undefined;
   /**
+   * How long an in-flight run must sit untouched, with the stranded signature (a wake-forever
+   * suspension, or an old pending remote step with no live lease), before the
+   * {@link WorkflowEngine.onStalled} listeners are notified. Default 900 000 (15 min); floored at
+   * 60 000. The sweep ({@link WorkflowEngine.sweepStalled}) only does work when a listener is
+   * registered.
+   */
+  stalledAfterMs?: number | undefined;
+  /**
    * The most due timers one {@link WorkflowEngine.resumeDueTimers} pass loads and drives, most
    * overdue first. Every driving instance runs that pass each tick, so a wave of thousands of due
    * runs (a recovery after an outage, a fan's children waking together) is worked through in
@@ -631,6 +640,29 @@ export interface WorkflowEngineDeps {
    * run `runPending` on a worker pod to pick those up; or a broker-backed one for a worker pool.
    */
   runDispatcher?: RunDispatcher | undefined;
+}
+
+/** Options for {@link WorkflowEngine.listStalledRuns}. */
+export interface ListStalledRunsOptions {
+  /** Idle threshold in ms. Defaults to the engine's `stalledAfterMs` (15 min). */
+  thresholdMs?: number | undefined;
+  /** Max candidate runs inspected (newest first). Default 1000. */
+  scan?: number | undefined;
+  /** Evaluate as of this clock time. Defaults to the engine clock. */
+  now?: number | undefined;
+}
+
+/**
+ * The lease state of one execution in flight on THIS instance (see `executionLeases`). `lost` is the
+ * zombie fence: a renewal reported the lease gone (another instance took the run over after expiry),
+ * or `drain()` released it on timeout. `handedOff` marks a lease this execution released on purpose
+ * (a remote turn suspending on its dispatched decision, a blocked park), whose failing renewals are
+ * NOT a takeover. `done` marks an execution that already left, so a late renewal can't fence anything.
+ */
+interface ExecutionLease {
+  lost: boolean;
+  handedOff: boolean;
+  done: boolean;
 }
 
 /** Thrown by {@link WorkflowEngine.resume} when the run belongs to a different namespace. */
@@ -765,6 +797,18 @@ export class WorkflowEngine {
   private readonly stepQueue = new Map<string, string>();
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Set<Promise<RunResult>>();
+  /**
+   * The run lease of each execution in flight on THIS instance, by run id — renewed while it runs
+   * and checked by every settle (the zombie fence, see {@link ExecutionLease}). Also what `drain()`
+   * releases when its budget runs out.
+   */
+  private readonly executionLeases = new Map<string, ExecutionLease>();
+  /** Pager hooks for stranded runs (see {@link onStalled}). */
+  private readonly stalledListeners = new Set<(info: StalledRunInfo) => void>();
+  /** Runs already paged about, by id → the `updatedAt` of the paged episode (see {@link sweepStalled}). */
+  private readonly notifiedStalled = new Map<string, number>();
+  private lastStalledSweepAt = Number.NEGATIVE_INFINITY;
+  private readonly stalledAfterMs: number;
   private draining = false;
   /** Wait already spent on this shutdown before `drain()` (see `beginDrain`). */
   private drainSpentMs = 0;
@@ -802,6 +846,11 @@ export class WorkflowEngine {
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
     this.reconcileMs = deps.reconcileMs === undefined ? 300_000 : deps.reconcileMs || undefined;
+    const stalledAfter = deps.stalledAfterMs;
+    this.stalledAfterMs =
+      stalledAfter !== undefined && Number.isFinite(stalledAfter)
+        ? Math.max(60_000, stalledAfter)
+        : DEFAULT_STALLED_AFTER_MS;
     // A non-finite or sub-1 value falls back to the default: a NaN limit would stall timer recovery.
     const batch = deps.timerBatchSize;
     this.timerBatchSize =
@@ -1267,6 +1316,67 @@ export class WorkflowEngine {
     return () => this.deadListeners.delete(listener);
   }
 
+  /**
+   * Register a pager hook for STRANDED runs: an in-flight run untouched past `stalledAfterMs` that is
+   * either suspended with NO wake timer (wake-forever: nothing will ever re-drive it) or parked on an
+   * old pending remote step with no live lease (dispatched and, most likely, lost). The timer poller
+   * sweeps for these ({@link sweepStalled}, throttled to one pass a minute) and notifies each episode
+   * ONCE per instance: a run is paged again only after it makes progress and strands again. Wire your
+   * alerting here like {@link onDead}. A listener that throws never breaks the sweep. Returns an
+   * unsubscribe function.
+   */
+  onStalled(listener: (info: StalledRunInfo) => void): () => void {
+    this.stalledListeners.add(listener);
+    return () => this.stalledListeners.delete(listener);
+  }
+
+  /**
+   * Detect stranded in-flight runs and notify the {@link onStalled} listeners. Self-throttled to one
+   * pass a minute, skipped while draining, and a no-op without listeners — call it every tick (the
+   * NestJS timer poller does). Scoped to this engine's `namespace` (an operator engine with no
+   * namespace sweeps every namespace). Returns the runs notified THIS pass.
+   */
+  async sweepStalled(now: number = this.clock()): Promise<StalledRunInfo[]> {
+    if (this.stalledListeners.size === 0 || this.draining) return [];
+    if (now - this.lastStalledSweepAt < 60_000) return [];
+    this.lastStalledSweepAt = now;
+    const notified: StalledRunInfo[] = [];
+    for (const info of await this.listStalledRuns({ now })) {
+      const episode = info.run.updatedAt.getTime();
+      if (this.notifiedStalled.get(info.run.id) === episode) continue;
+      this.notifiedStalled.set(info.run.id, episode);
+      // Bounded: at worst a cleared map re-pages a still-stranded run once.
+      if (this.notifiedStalled.size > 1_000) this.notifiedStalled.clear();
+      for (const listener of this.stalledListeners) {
+        try {
+          listener(info);
+        } catch {
+          /* a pager hook must not break the sweep */
+        }
+      }
+      notified.push(info);
+    }
+    return notified;
+  }
+
+  /**
+   * The stranded runs right now, without notifying anyone: the query behind {@link sweepStalled} and
+   * the CLI's `durable inspect --stale`. A `running`/`suspended` run qualifies when it has been
+   * untouched for `thresholdMs` (default `stalledAfterMs`) AND either it is suspended with no wake
+   * timer, or its oldest pending remote step is older than the threshold with no lease in the future
+   * (a step with a `timeoutMs`, a heartbeat or `remoteRedispatchMs` keeps a lease; a long
+   * `ctx.sleep` has a future `wakeAt`; neither is stranded). Scans up to `scan` candidates (default
+   * 1000), newest first, in this engine's namespace.
+   */
+  async listStalledRuns(options: ListStalledRunsOptions = {}): Promise<StalledRunInfo[]> {
+    return findStalledRuns(this.store, {
+      now: options.now ?? this.clock(),
+      thresholdMs: options.thresholdMs ?? this.stalledAfterMs,
+      scan: options.scan,
+      namespace: this.namespace,
+    });
+  }
+
   private notifyDead(run: WorkflowRun): void {
     for (const fn of this.deadListeners) {
       try {
@@ -1463,6 +1573,12 @@ export class WorkflowEngine {
     return this.store.getRun(runId);
   }
 
+  /** A run's full checkpoint timeline, ordered by seq. A thin pass-through to the store (it is what
+   *  the testing kit's `captureHistory` reads, next to {@link getRun}). */
+  listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+    return this.store.listCheckpoints(runId);
+  }
+
   /**
    * Re-execute a run's body (replaying its checkpoints). This is the EXPLICIT entry point: besides
    * driving a live run, it re-drives a `failed` run — the manual retry (prefer {@link requeue}, which
@@ -1562,6 +1678,11 @@ export class WorkflowEngine {
    * diagnosis.
    */
   private async releaseLeaseBestEffort(runId: string): Promise<void> {
+    // A fenced execution no longer owns the lease: releasing it would free the NEW owner's lease
+    // (the release is not owner-scoped on every store), letting a third instance in.
+    if (this.isFenced(runId)) return;
+    // Released on purpose: a renewal racing this release must not read it as a takeover.
+    this.handOffLease(runId);
     try {
       await this.store.releaseRunLock(runId);
     } catch (err) {
@@ -1890,11 +2011,46 @@ export class WorkflowEngine {
       rearm();
     });
     this.drainRearms.add(rearm);
+    let settled = false;
     try {
-      await Promise.race([Promise.allSettled([...this.inflight]), timer]);
+      await Promise.race([
+        Promise.allSettled([...this.inflight]).then(() => {
+          settled = true;
+        }),
+        timer,
+      ]);
     } finally {
       this.drainRearms.delete(rearm);
       clearTimeout(timeout);
+    }
+    if (!settled) await this.releaseInflightLeases();
+  }
+
+  /**
+   * The drain budget ran out with executions still in flight: release their recovery leases so
+   * another instance re-drives those runs on its next recovery pass, instead of waiting out
+   * `leaseMs` after this process exits. Each still-running turn is FENCED first, so whatever it
+   * computes after this point is never written over the new owner's work (see settleRun). Its
+   * completed steps are checkpointed, so the new owner replays them; a step still executing here
+   * may run again there, exactly as after a crash. The release is owner-scoped where the store
+   * supports it (only a lease this instance still holds is cleared). Best effort: never throws.
+   */
+  private async releaseInflightLeases(): Promise<void> {
+    const released: string[] = [];
+    for (const [runId, lease] of [...this.executionLeases]) {
+      if (lease.lost || lease.handedOff || lease.done) continue;
+      lease.lost = true;
+      try {
+        await this.store.releaseRunLock(runId, this.instanceId);
+        released.push(runId);
+      } catch {
+        /* best effort: drain() must never throw because of this */
+      }
+    }
+    if (released.length > 0) {
+      console.warn(
+        `[nestjs-durable] drain timed out with ${released.length} run(s) still executing; released their leases so another instance recovers them now: ${released.join(', ')}`,
+      );
     }
   }
 
@@ -3623,7 +3779,11 @@ export class WorkflowEngine {
 
   private async singletonWaitResult(run: WorkflowRun): Promise<RunResult> {
     const current = await this.store.getRun(run.id);
-    await this.store.releaseRunLock(run.id);
+    // Not when fenced: the lease is another instance's now (see holdExecutionLease).
+    if (!this.isFenced(run.id)) {
+      this.handOffLease(run.id);
+      await this.store.releaseRunLock(run.id);
+    }
     if (!current) throw new Error(`run ${run.id} was deleted during singleton admission`);
     if (current.status === 'suspended') {
       this.emit({
@@ -3661,15 +3821,7 @@ export class WorkflowEngine {
         return { runId: run.id, status: run.status };
       }
     }
-    const renew = setInterval(
-      () => {
-        void this.store
-          .renewRunLock(run.id, this.instanceId, this.clock() + this.leaseMs)
-          .catch(() => undefined);
-      },
-      Math.max(50, Math.floor(this.leaseMs / 2)),
-    );
-    renew.unref?.();
+    const held = this.holdExecutionLease(run.id);
     try {
       // A remote (e.g. Python) workflow is advanced by dispatching workflow tasks, not by running an
       // in-process body — but everything around it (lease, recovery, timers, the resume that lands us
@@ -3691,8 +3843,64 @@ export class WorkflowEngine {
       }
       return result;
     } finally {
-      clearInterval(renew);
+      held.stop();
     }
+  }
+
+  /**
+   * Renew `runId`'s lease for as long as this execution holds it, and register it in
+   * {@link executionLeases} so settles can check the zombie fence and `drain()` can release it.
+   *
+   * A renewal that returns `false` means the lease is gone: this turn stalled past `leaseMs` and
+   * another instance reclaimed the run, so this executor is now a zombie. It is FENCED (`lost`): its
+   * settles degrade to an echo of the store's state instead of clobbering the new owner's writes, and
+   * its own lease release is skipped (it would free the new owner's lease). A renewal that THROWS (a
+   * transient store error) is not evidence of a takeover, so it stays swallowed and the next
+   * interval retries. A lease this execution released on purpose (`handedOff`) is not renewed, and a
+   * renewal resolving after the execution ended (`done`) fences nothing.
+   */
+  private holdExecutionLease(runId: string): { lease: ExecutionLease; stop: () => void } {
+    const lease: ExecutionLease = { lost: false, handedOff: false, done: false };
+    this.executionLeases.set(runId, lease);
+    const renew = setInterval(
+      () => {
+        if (lease.handedOff || lease.lost || lease.done) return;
+        void this.store
+          .renewRunLock(runId, this.instanceId, this.clock() + this.leaseMs)
+          .then((renewed) => {
+            if (renewed || lease.handedOff || lease.lost || lease.done) return;
+            lease.lost = true;
+            console.warn(
+              `[nestjs-durable] lost the lease of run ${runId} while executing it (another instance took it over after it expired); this instance will not write the run's outcome`,
+            );
+          })
+          .catch(() => undefined);
+      },
+      Math.max(50, Math.floor(this.leaseMs / 2)),
+    );
+    renew.unref?.();
+    return {
+      lease,
+      stop: () => {
+        clearInterval(renew);
+        lease.done = true;
+        if (this.executionLeases.get(runId) === lease) this.executionLeases.delete(runId);
+      },
+    };
+  }
+
+  /** Whether `runId`'s execution on this instance lost its lease (see {@link holdExecutionLease}). */
+  private isFenced(runId: string): boolean {
+    return this.executionLeases.get(runId)?.lost === true;
+  }
+
+  /**
+   * Mark `runId`'s lease as given away on purpose by its own execution (released mid-turn), so a
+   * renewal that now fails is not read as a takeover.
+   */
+  private handOffLease(runId: string): void {
+    const lease = this.executionLeases.get(runId);
+    if (lease) lease.handedOff = true;
   }
 
   /**
@@ -3894,6 +4102,12 @@ export class WorkflowEngine {
    * keeps its own lease handling (the TS executor's `finally`, the remote path's caller).
    */
   private async settleRun(run: WorkflowRun, outcome: RunOutcome): Promise<RunResult> {
+    // Zombie fence: this turn's lease was lost mid-execution (a renewal returned false, or drain()
+    // released it on timeout), so another instance owns the run and is (re)executing it. This
+    // outcome was computed by a stale executor: report the store's state instead of writing. The
+    // status compare-and-set below would NOT catch it — the new owner's run is legitimately in a
+    // settle-eligible status while it executes.
+    if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
     const updatedAt = new Date();
     if (outcome.kind === 'completed') {
       // This outcome was computed by a turn that started from a possibly-stale run snapshot. If the
@@ -4062,6 +4276,9 @@ export class WorkflowEngine {
     // decision/heartbeat lands before it lapses (including a dispatch that throws below), the timer
     // poller re-drives by re-marking + re-enqueuing a fresh turn.
     if (remote.executor.dispatch) {
+      // Zombie fence, as in settleRun: a lost lease means another instance owns the run now, and a
+      // stale turn must neither re-mark it nor enqueue a second turn.
+      if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
       const taskId = `${run.id}:wf:${globalThis.crypto.randomUUID().slice(0, 8)}`;
       const silenceMs = this.remoteAdvanceSilenceMs;
       const wakeAt = silenceMs != null ? this.clock() + silenceMs : undefined;
@@ -4084,6 +4301,8 @@ export class WorkflowEngine {
       // RELEASE BEFORE ENQUEUE: the decision must be able to BOTH match the marker AND acquire the lease
       // the instant it arrives — even a few ms after the enqueue. Holding the lease through the enqueue
       // would drop a fast decision at lock contention. Idempotent vs. `execute`'s own finally release.
+      // Handed off on purpose: the execution's renewals must not read this release as a takeover.
+      this.handOffLease(run.id);
       await this.store.releaseRunLock(run.id);
       // THEN enqueue. A failed/lost dispatch leaves the run suspended-awaiting with `wakeAt` set, so the
       // timer poller re-drives it — no lost run.
@@ -4147,6 +4366,8 @@ export class WorkflowEngine {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
       };
+      // Zombie fence (as in settleRun): a stale turn must not fail a run another instance owns.
+      if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
       // terminal failure: lease expires naturally — no recovery re-drive will race it
       await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
       this.emit({
@@ -4170,6 +4391,8 @@ export class WorkflowEngine {
    * — the caller has already ensured this is the decision for the currently-awaited turn.
    */
   private async applyDecision(run: WorkflowRun, decision: WorkflowDecision): Promise<RunResult> {
+    // Zombie fence (as in settleRun): a decision applied under a lost lease must not write.
+    if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
     if (decision.status === 'completed') {
       // Persist the local steps THIS turn ran before marking the run done. A workflow that runs
       // straight to completion in a single turn (every step inline, never suspending — e.g. a Python
@@ -4729,6 +4952,9 @@ export class WorkflowEngine {
     compensations: Compensation[],
     replay?: Map<number, StepCheckpoint>,
   ): Promise<RunResult> {
+    // Zombie fence (as in settleRun): the new owner re-derives the cancel from the durable
+    // `cancelling` status, so this stale turn must neither undo nor write.
+    if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
     const pending = await this.unwindCompensations(run, compensations, replay);
     if (pending) return { runId: run.id, status: 'cancelling' };
     this.cancelRequested.delete(run.id);
@@ -4855,6 +5081,8 @@ export class WorkflowEngine {
       return await this.settleRun(run, { kind: 'completed', output });
     } catch (err) {
       if (err instanceof ContinueAsNew) {
+        // Zombie fence first: a fenced turn must not complete the run or fork a continuation.
+        if (this.isFenced(run.id)) return await this.echoCurrentStatus(run.id);
         // A cancel in flight wins over continue-as-new: undo + cancel instead of spawning the next run.
         if (this.cancelRequested.has(run.id)) {
           return await this.compensateAndCancel(run, compensations, replay);
@@ -5346,6 +5574,7 @@ export class WorkflowEngine {
    * own `finally` also releases (the run-execution path) is safe.
    */
   private async parkBlocked(run: WorkflowRun, blocked: BlockedDispatch): Promise<RunResult> {
+    if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
     const error: StepError = { message: blocked.reason, code: blocked.code, retryable: true };
     const applied = await (this.store.updateRunIf ?? this.updateRunIfFallback).call(
       this.store,
@@ -6083,15 +6312,7 @@ export class WorkflowEngine {
     ) {
       return;
     }
-    const renew = setInterval(
-      () => {
-        void this.store
-          .renewRunLock(decision.runId, this.instanceId, this.clock() + this.leaseMs)
-          .catch(() => undefined);
-      },
-      Math.max(50, Math.floor(this.leaseMs / 2)),
-    );
-    renew.unref?.();
+    const held = this.holdExecutionLease(decision.runId);
     try {
       // Re-read under the lease and re-check the marker — it may have changed (a re-drive applied
       // first, or another decision raced in) between the unlocked pre-check and acquiring the lease.
@@ -6110,8 +6331,10 @@ export class WorkflowEngine {
       fresh.awaitingDecisionTaskId = undefined;
       await this.applyDecision(fresh, decision);
     } finally {
-      clearInterval(renew);
-      await this.store.releaseRunLock(decision.runId);
+      const fenced = held.lease.lost;
+      held.stop();
+      // A fenced apply no longer owns the lease; releasing would free the new owner's.
+      if (!fenced) await this.store.releaseRunLock(decision.runId);
     }
   }
 

@@ -57,7 +57,7 @@ import {
   sql,
 } from 'drizzle-orm';
 import type { PgDatabase } from 'drizzle-orm/pg-core';
-import { ensureDrizzlePgDurableSchema } from './ddl';
+import { type DurableSchemaLogger, ensureDrizzlePgDurableSchema } from './ddl';
 import { rowsOf } from './executor';
 import {
   DEFAULT_NAMESPACE,
@@ -89,6 +89,12 @@ export interface DrizzlePgStateStoreOptions {
    * this for you via {@link DrizzlePgStateStore.withScope}.
    */
   scope?: { namespace?: string | undefined } | undefined;
+  /**
+   * Where `ensureSchema()` (the boot-time auto-schema) reports a schema repair it actually applied
+   * — a missing table or index it had to create. Defaults to `console`. NestJS's `Logger`
+   * satisfies it.
+   */
+  schemaLogger?: DurableSchemaLogger | undefined;
 }
 
 /** OR a set of conditions where an EMPTY set means "matches nothing" (every plural `RunQuery`
@@ -152,7 +158,7 @@ export class DrizzlePgStateStore implements StateStore {
   /** Idempotent CREATE TABLE / INDEX IF NOT EXISTS under an advisory lock — called on boot when the
    *  module's `autoSchema` is on. Turn `autoSchema` off if drizzle-kit owns these tables. */
   async ensureSchema(): Promise<void> {
-    await ensureDrizzlePgDurableSchema(this.db);
+    await ensureDrizzlePgDurableSchema(this.db, { logger: this.options.schemaLogger });
   }
 
   /** The read-scope predicate on the runs table (undefined when the store is unscoped). */
@@ -472,11 +478,15 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.length === 1;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
     await this.db
       .update(workflowRuns)
       .set({ lockedBy: null, lockedUntil: null })
-      .where(eq(workflowRuns.id, runId));
+      .where(
+        owner === undefined
+          ? eq(workflowRuns.id, runId)
+          : and(eq(workflowRuns.id, runId), eq(workflowRuns.lockedBy, owner)),
+      );
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {

@@ -5,6 +5,7 @@ import { GUARDS_METADATA as REAL_GUARDS_METADATA } from '@nestjs/common/constant
 import { describe, expect, it } from 'vitest';
 import { DurableApiController } from './durable-api.controller.js';
 import { DurableAuthController } from './durable-auth.controller.js';
+import { DurableDashboardGateGuard } from './durable-dashboard-gate.guard.js';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
 import { DurableApiSessionGuard, DurableUiSessionGuard } from './durable-session.guard.js';
 import { DurableUiController } from './durable-ui.controller.js';
@@ -37,8 +38,13 @@ describe('DurableDashboardModule.forRoot guards', () => {
     DurableDashboardModule.forRoot({ guards: [FakeGuard] });
     DurableDashboardModule.forRoot();
 
-    expect(Reflect.getMetadata(REAL_GUARDS_METADATA, DurableApiController)).toEqual([]);
-    expect(Reflect.getMetadata(REAL_GUARDS_METADATA, DurableUiController)).toEqual([]);
+    // Only the fail-closed default gate remains — the prior host guard is gone.
+    expect(Reflect.getMetadata(REAL_GUARDS_METADATA, DurableApiController)).toEqual([
+      DurableDashboardGateGuard,
+    ]);
+    expect(Reflect.getMetadata(REAL_GUARDS_METADATA, DurableUiController)).toEqual([
+      DurableDashboardGateGuard,
+    ]);
   });
 
   it('passes an `imports` passthrough into the dynamic module for guard-dependency resolution', () => {
@@ -241,11 +247,15 @@ describe('the console composes with a host that has its OWN filter adapter', () 
 });
 
 describe('DurableDashboardModule.forRoot dashboardAuth (absent-option)', () => {
-  it("stamps NO built-in guard and mounts NO auth controller — byte-for-byte today's behavior", () => {
+  it('stamps only the fail-closed gate (no session guard) and mounts NO auth controller', () => {
     const dynamicModule = DurableDashboardModule.forRoot();
 
-    expect(Reflect.getMetadata(REAL_GUARDS_METADATA, DurableApiController)).toEqual([]);
-    expect(Reflect.getMetadata(REAL_GUARDS_METADATA, DurableUiController)).toEqual([]);
+    expect(Reflect.getMetadata(REAL_GUARDS_METADATA, DurableApiController)).toEqual([
+      DurableDashboardGateGuard,
+    ]);
+    expect(Reflect.getMetadata(REAL_GUARDS_METADATA, DurableUiController)).toEqual([
+      DurableDashboardGateGuard,
+    ]);
     expect(dynamicModule.controllers).not.toContain(DurableAuthController);
   });
 });
@@ -441,6 +451,7 @@ describe('DurableDashboardModule.forRootAsync', () => {
     expect(dynamicModule.controllers).toContain(DurableAuthController);
     expect(Reflect.getMetadata(REAL_GUARDS_METADATA, DurableUiController)).toEqual([
       DurableUiSessionGuard,
+      DurableDashboardGateGuard,
     ]);
   });
 

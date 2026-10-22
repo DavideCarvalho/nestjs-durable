@@ -1,8 +1,10 @@
 ---
 title: CLI
-description: Inspect and cancel workflow runs from the terminal with `durable inspect` and `durable cancel`.
+description: Inspect, cancel and export workflow runs from the terminal — `durable inspect` (including the `--stale` stranded-run view), `durable cancel`, and `durable export` for CI replay fixtures.
 icon: SquareTerminal
 ---
+
+import { Callout } from 'fumadocs-ui/components/callout';
 
 `@dudousxd/nestjs-durable-cli` gives you `durable inspect` and `durable cancel` — a quick look at
 runs and their step timelines, and a way to stop one, without opening the
@@ -65,7 +67,50 @@ Reading the output:
 | --- | --- |
 | `--status <status>` | `running` / `suspended` / `completed` / `failed` / `cancelled` |
 | `--limit <n>` | max runs to list (default 50) |
+| `--stale[=<duration>]` | only the runs that look stranded, idle at least `<duration>` (default 15m). See below. |
+| `--namespace <ns>` | restrict the listing to one namespace |
 | `--config <path>` | path to the config (default: `./durable.config.{mjs,js,cjs}`) |
+
+## Find stranded runs
+
+```bash
+durable inspect --stale              # idle 15 minutes or more
+durable inspect --stale=1h           # your own threshold: ms, s, m, h or d (90s, 15m, 4h, 2d)
+durable inspect --stale --namespace tenant-a
+```
+
+```text
+RUN        WORKFLOW  STATUS     IDLE    WHY
+wrun_8Kb2  pipeline  suspended  4h12m   step 2 charge pending 4h12m (attempt 1)
+wrun_Qz71  onboard   suspended  52m0s   suspended, no wake timer
+```
+
+`--stale` lists the `running`/`suspended` runs that are either suspended with no wake timer, or
+parked on an old pending remote step that nothing is leasing (no `timeoutMs`, heartbeat or
+`remoteRedispatchMs` lease in the future). It is the same query as `engine.listStalledRuns()` and
+the [stalled-run pager](/docs/reliability/stalled-runs), run as `findStalledRuns(store, ...)` against
+your configured store. It inspects up to 1000 in-flight runs and prints at most `--limit`. An
+unparseable duration (`--stale=15mins`) exits 1.
+
+## Export a replay fixture
+
+```bash
+durable export wrun_8Kb2 --out test/fixtures/pipeline-wrun_8Kb2.json
+durable export wrun_8Kb2 > fixture.json   # or to stdout
+```
+
+`export` writes the run row and its full checkpoint timeline as a JSON fixture (`{ version: 1, run,
+checkpoints }`, the format of the testing kit's `serializeRunHistory`). Commit it and assert it in CI
+with `assertReplayable(register, parseRunHistory(json))`: a code change that renames, reorders or
+removes a step at a position the run already recorded then fails the build instead of breaking an
+in-flight run on deploy. See [Testing → Replay a captured run in CI](/docs/testing#replay-a-captured-run-in-ci).
+An unknown run exits 1.
+
+<Callout type="warn" title="A fixture holds the run's payloads">
+The fixture contains the run's input, outputs, step logs and errors exactly as the store returns
+them. If your `durable.config` wraps the store in a `CodecStateStore`, they come out decoded. Scrub
+anything sensitive before committing it.
+</Callout>
 
 ## Cancel a run
 

@@ -467,8 +467,15 @@ export interface StateStore {
    */
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean>;
 
-  /** Release a run's recovery lease so another instance can pick it up (e.g. once it suspends). */
-  releaseRunLock(runId: string): Promise<void>;
+  /**
+   * Release a run's recovery lease so another instance can pick it up (e.g. once it suspends).
+   *
+   * `owner`, when given, makes the release owner-scoped: clear the lease ONLY if `owner` still holds
+   * it, so an instance releasing a lease it may have lost (a drain that timed out) never frees the
+   * lease another instance took over. Without it the release is unconditional. A store that ignores
+   * the argument stays correct, only less precise in that race.
+   */
+  releaseRunLock(runId: string, owner?: string): Promise<void>;
 
   /**
    * Extend a run's lease to `leaseUntilMs`, but ONLY if `owner` still holds it — so a live worker

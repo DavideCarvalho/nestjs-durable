@@ -91,6 +91,36 @@ export class AddDurableTables implements MigrationInterface {
 DurableModule.forRoot({ store, transport, autoSchema: false });
 ```
 
+### Schema repair warning
+
+When `ensureTypeOrmDurableSchema` changes a durable schema that already existed (it creates a table
+that was missing while the others exist, adds a column, creates an index, or widens a MySQL JSON
+column from `text` to `longtext`), it logs **one** warning that lists each change:
+
+```
+[nestjs-durable] store-typeorm repaired the durable schema at boot: created table
+durable_schedules; added column durable_workflow_runs.origin; created index
+durable_runs_namespace_status_idx on durable_workflow_runs. The database had drifted from the
+schema this library version expects … add a migration that calls
+`ensureTypeOrmDurableSchema(queryRunner.connection)`. …
+```
+
+It means the database was behind the library, the boot fixed it, and your migration history doesn't
+know. Add a migration that calls `ensureTypeOrmDurableSchema(q.connection)` so the change is recorded
+(it is idempotent, so on an already-repaired database it does nothing). An already-current schema
+logs nothing. A fresh install (no durable table existed yet) also logs nothing, because creating
+every table on the first boot is expected, not drift. The MySQL widen now runs only for columns that
+are not `longtext` yet, so a current schema issues no `ALTER` at all.
+
+The warning goes to `console.warn` by default. To send it to your own logger, pass anything with a
+`warn(message)` method (Nest's `Logger` works):
+
+```ts
+new TypeOrmStateStore(dataSource, { schemaLogger: new Logger('DurableSchema') });
+// or, from a migration / script:
+await ensureTypeOrmDurableSchema(dataSource, { logger });
+```
+
 <Callout type="warn">
   **Two gaps versus the MikroORM adapter, worth knowing before you pick this one:**
 

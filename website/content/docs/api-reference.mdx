@@ -278,7 +278,11 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 | `onDead` | `onDead(listener: (run: WorkflowRun) => void): () => void` | Subscribe to dead-lettered runs (moved to `dead` past `maxRecoveryAttempts`). Returns an unsubscribe fn. |
 | `onEnqueued` | `onEnqueued(listener: (runId: string) => void): () => void` | Subscribe to runs enqueued on ANOTHER instance (control-plane broadcast) — a worker can pick them up immediately instead of waiting for its next poll. |
 | `onCancel` | `onCancel(listener: (runId: string) => void): () => void` | Subscribe to cancellations on ANY instance — for cooperative in-flight abort. |
-| `drain` | `drain(timeoutMs?: number): Promise<void>` | Graceful shutdown: stop picking up new runs, wait for in-flight executions up to `timeoutMs` (default 10000). |
+| `onStalled` | `onStalled(listener: (info: StalledRunInfo) => void): () => void` | Pager hook for stranded runs, swept by the timer poller once a minute and reported once per stranded episode. See [Stalled runs](/docs/reliability/stalled-runs). |
+| `sweepStalled` | `sweepStalled(now?: number): Promise<StalledRunInfo[]>` | Detect stranded runs and notify `onStalled` listeners. Throttled to a pass a minute; a no-op without listeners or while draining. |
+| `listStalledRuns` | `listStalledRuns(opts?: { thresholdMs?, scan?, now? }): Promise<StalledRunInfo[]>` | The stranded runs right now, in this engine's namespace, without notifying anyone. The standalone `findStalledRuns(store, opts)` runs the same query on a bare store. |
+| `listCheckpoints` | `listCheckpoints(runId: string): Promise<StepCheckpoint[]>` | A run's checkpoint timeline (pass-through to the store), e.g. for `captureHistory`. |
+| `drain` | `drain(timeoutMs?: number): Promise<void>` | Graceful shutdown: stop picking up new runs, wait for in-flight executions up to `timeoutMs` (default 10000). On timeout, releases (owner-scoped) and fences the leases of the runs still executing so another instance recovers them at once. |
 | `workerHealth` | `workerHealth(extra?: string[]): Promise<GroupHealth[]>` | Per-group queue backlog + live worker heartbeats (only transports that support introspection, e.g. BullMQ). |
 | `recoverIncomplete` | `recoverIncomplete(nowMs?: number): Promise<RunResult[]>` | Resume every run left `running` by a crash/deploy. Call on boot. |
 | `resumeDueTimers` | `resumeDueTimers(nowMs?: number): Promise<RunResult[]>` | Resume suspended runs whose durable timer is due: at most `timerBatchSize` per pass (a `WorkflowEngine` constructor option, default 500), most overdue first, walked in shuffled order. Call periodically. |
@@ -314,6 +318,8 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `maxRecoveryAttempts` | `number` | unlimited | Cap recovery attempts before a poison-pill run moves to `dead`. See [Dead-letter queue](/docs/reliability/dead-letter). |
 | `remoteAdvanceSilenceMs` | `number` | unbounded await | Liveness deadline for a remote (polyglot) workflow `advance`; each heartbeat rearms it. Operator only. |
 | `reconcileMs` | `number` | `300000` | Fallback re-drive for a run suspended on an event whose wake-up was lost; `0` disables it. Operator only. |
+| `stalledAfterMs` | `number` | `900000` | Idle time before a stranded run is reported to `onStalled` listeners (floored at 60000). Operator only. |
+| `onStalled` | `(info: StalledRunInfo) => void` | none | Registered as `engine.onStalled(...)`; the timer poller of a driving operator sweeps once a minute. See [Stalled runs](/docs/reliability/stalled-runs). |
 | `timerBatchSize` | `number` | `500` | Most due timers one timer-poll pass loads and drives, most overdue first. A non-finite or sub-1 value falls back to 500. Operator only. |
 | `eventBufferTtlMs` | `number` | keep until consumed | Retention for a buffered event no `waitForEvent` claims; pruned by the reconcile pass. Operator only. |
 | `blockedPollMs` | `number` | `5000` | How often a run parked `blocked` (no capable live worker) re-checks the fleet. Operator only. |

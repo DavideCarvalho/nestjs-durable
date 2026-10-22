@@ -173,8 +173,8 @@ doesn't.
 
 `CodecStateStore` wraps ANY store and runs run/step **payloads** (`input`/`output`) through a
 `PayloadCodec` — encoded on write, decoded on read — so they're never persisted in the clear. Metadata
-the dashboard and queries need (id, status, workflow, tags, timestamps, the structured `error`) is
-left untouched:
+the dashboard and queries need (id, status, workflow, tags, timestamps) is left untouched, and by
+default so are the structured `error` and step `events` (see [Coverage](#coverage)):
 
 ```ts
 import { CodecStateStore } from '@dudousxd/nestjs-durable-core';
@@ -189,6 +189,36 @@ DurableModule.forRoot({ store, transport });
 
 Both `encode`/`decode` are synchronous — wrap an async KMS call yourself if you need one. It's
 adapter-agnostic, so it composes with any of the four stores.
+
+### Coverage
+
+A third constructor argument picks what goes through the codec:
+
+```ts
+const store = new CodecStateStore(inner, codec, { coverage: 'extended' });
+```
+
+| Field | `'payloads'` (default) | `'extended'` |
+| --- | --- | --- |
+| Run `input` / `output` | encoded | encoded |
+| Checkpoint `input` / `output` | encoded | encoded |
+| Schedule `spec.input`, buffered signal and event payloads | encoded | encoded |
+| Checkpoint `events` (step logs, sub-step outcomes) | clear | encoded |
+| Checkpoint `error` | clear | encoded |
+| Run `error` | clear | encoded |
+| Ids, status, workflow, version, tags, search attributes, namespace, origin, timestamps, leases | clear | clear |
+
+The default is `'payloads'`, which is how the wrapper has always behaved. It leaves step logs and
+error messages (`message`, `stack`, `details`) as written, so a step that logs or throws sensitive
+data stores it in the clear. `'extended'` covers those too, on every write and read path: `createRun`,
+`updateRun`, `updateRunIf`, the checkpoint saves (plain, if-pending, batched, inside `transaction`),
+`registerChildWaits`, `compactCheckpoints`, and every run and checkpoint reader. Queryable metadata
+stays clear in both modes, so filters, facets and the dashboard keep working. A patch with
+`error: undefined` still clears the error.
+
+Only turn on `'extended'` on a fresh table, or with a codec whose `decode` recognizes its own
+ciphertext and returns anything else unchanged. Rows written before the switch hold `events` and
+`error` as plaintext, and a `decode` that can't tell the two apart will garble them on read.
 
 ## Retention & pruning
 

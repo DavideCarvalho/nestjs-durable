@@ -291,9 +291,9 @@ export class InMemoryStateStore implements StateStore {
     return true;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
     const run = this.runs.get(runId);
-    if (run) {
+    if (run && (owner === undefined || run.lockedBy === owner)) {
       run.lockedBy = undefined;
       run.lockedUntil = undefined;
     }

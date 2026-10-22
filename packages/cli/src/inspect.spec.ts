@@ -1,5 +1,5 @@
 import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
-import { cancelRun, inspect } from './inspect';
+import { cancelRun, exportRun, inspect, parseDurationMs } from './inspect';
 
 async function storeWithRuns() {
   const store = new InMemoryStateStore();
@@ -61,5 +61,66 @@ describe('cancelRun', () => {
   it('is a no-op on an already-completed run', async () => {
     const store = await storeWithRuns();
     expect(await cancelRun(store, 'run1')).toMatch(/already completed/i);
+  });
+});
+
+describe('inspect --stale', () => {
+  async function storeWithStranded() {
+    const store = new InMemoryStateStore();
+    const old = new Date(Date.now() - 30 * 60_000);
+    const base = { workflowVersion: '1', input: {}, createdAt: old, updatedAt: old };
+    // Suspended with no wake timer: nothing will re-drive it.
+    await store.createRun({ ...base, id: 'stuck', workflow: 'pipeline', status: 'suspended' });
+    // A long sleep: future wakeAt, not stranded.
+    await store.createRun({
+      ...base,
+      id: 'napping',
+      workflow: 'pipeline',
+      status: 'suspended',
+      wakeAt: Date.now() + 60 * 60_000,
+    });
+    await store.createRun({ ...base, id: 'finished', workflow: 'pipeline', status: 'completed' });
+    return store;
+  }
+
+  it('lists only the stranded runs, with a recovery hint', async () => {
+    const out = await inspect(await storeWithStranded(), { staleMs: 15 * 60_000 });
+    expect(out).toContain('stuck');
+    expect(out).toContain('no wake timer');
+    expect(out).not.toContain('napping');
+    expect(out).not.toContain('finished');
+    expect(out).toContain('redispatchPending');
+  });
+
+  it('respects the threshold', async () => {
+    const out = await inspect(await storeWithStranded(), { staleMs: 60 * 60_000 });
+    expect(out).toBe('No stranded runs.');
+  });
+
+  it('parses compact durations', () => {
+    expect(parseDurationMs('90s')).toBe(90_000);
+    expect(parseDurationMs('15m')).toBe(900_000);
+    expect(parseDurationMs('4h')).toBe(4 * 3_600_000);
+    expect(parseDurationMs('2d')).toBe(2 * 86_400_000);
+    expect(parseDurationMs('500ms')).toBe(500);
+    expect(parseDurationMs('15mins')).toBeUndefined();
+  });
+});
+
+describe('export', () => {
+  it('writes a replay fixture of the run and its checkpoints', async () => {
+    const json = await exportRun(await storeWithRuns(), 'run1');
+    expect(json).not.toBeNull();
+    const parsed = JSON.parse(json as string);
+    expect(parsed.version).toBe(1);
+    expect(parsed.run.id).toBe('run1');
+    expect(parsed.checkpoints.map((c: { name: string }) => c.name)).toEqual([
+      'reserveStock',
+      'ship',
+    ]);
+  });
+
+  it('returns null for an unknown run', async () => {
+    expect(await exportRun(new InMemoryStateStore(), 'nope')).toBeNull();
   });
 });
