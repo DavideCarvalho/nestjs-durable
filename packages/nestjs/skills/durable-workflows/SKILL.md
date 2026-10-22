@@ -302,7 +302,7 @@ class InvalidLine extends FatalError {
 
 @OnError(InvalidLine) // or @OnError('invalid_line'); @OnError() catches anything else
 async invalid(ctx: WorkflowCtx, failure: OnErrorInput<Line>): Promise<LineResult> {
-  await ctx.step(this.steps.recordDeadLetter, { line: failure.input, error: failure.error.message });
+  await ctx.step(this.steps.recordRejectedLine, { line: failure.input, error: failure.error.message });
   return { ok: 0, failed: 1 };
 }
 ```

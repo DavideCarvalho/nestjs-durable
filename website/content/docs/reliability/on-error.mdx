@@ -35,7 +35,7 @@ export class LineWorkflow {
 
   @OnError(InvalidLine)
   async invalid(ctx: WorkflowCtx, failure: OnErrorInput<Line>): Promise<LineResult> {
-    await ctx.step(this.steps.recordDeadLetter, { line: failure.input, error: failure.error.message });
+    await ctx.step(this.steps.recordRejectedLine, { line: failure.input, error: failure.error.message });
     return { ok: 0, failed: 1 };
   }
 }
@@ -127,7 +127,7 @@ queue), the routes come from what the workers **announce** in their handshake de
 the engine reads the workflow's version from. In the Python SDK:
 
 ```python
-@worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-dead-letter"}])
+@worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-rejected"}])
 def line(ctx, input): ...
 ```
 
