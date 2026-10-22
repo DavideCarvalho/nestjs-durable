@@ -276,6 +276,41 @@ a finite number of at least 1 falls back to 500.
 DurableModule.forRoot({ store, transport, timerBatchSize: 1000 });
 ```
 
+**The instance running a wide fan stays bounded.** A run started on a driving instance executes
+there, in-process, and so do the children of a `ctx.all` it runs. Each instance executes at most
+`localRunConcurrency` (default 256) of these at once, and the same bound applies to the runs other
+instances announce as enqueued, which an instance skips after one read if someone else already
+took them. The rest wait as run ids in memory while the runs stay `pending` in the store, where any
+instance's poll can pick them up. The children's starts are queued under the same bound. Without
+it, a 40,000-child fan started and executed all 40,000 children on the parent's instance at once,
+each turn holding its state until the store answered, and that instance ran out of memory while the
+others idled.
+
+One instance also never runs two turns of the same run side by side. Wakes that arrive while a turn
+of the run is executing on it (the last children of a fan settling together, a result and a timer)
+share one more turn after it, instead of each running its own replay of the fan with every
+checkpoint loaded.
+
+```ts
+DurableModule.forRoot({ store, transport, localRunConcurrency: 128 });
+```
+
+**Lost wakes heal on their own.** A crash, an OOM or a scale-down can land between two writes the
+engine makes in sequence. Each gap has a recovery path that needs nobody:
+
+- A child persists `completed` (or `failed`) and then tells its parent. If the parent never hears,
+  its next turn (its `reconcileMs` wake at the latest, or a recovery) reads the children it waits on
+  in batches of 500, settles every finished one exactly as the notification would have, and goes on.
+  The notification itself retries a store error a few times before leaving it to that turn.
+- A step result is written and then resumes its run. A redelivered result whose step already
+  settled still resumes the run if it is `suspended` (subject to a step fan's barrier), so the
+  transport's retry of a result whose resume failed now finishes the job. A result whose resume
+  found the run leased by another instance looks again once that lease is free, so a holder that
+  went down mid-turn costs one lease period, not the run's timer.
+- With `remoteRedispatchMs` set, a run waiting on a dispatched step parks no later than
+  `reconcileMs`, not on the redispatch deadline itself, so a lost wake costs minutes, not the hour a
+  long redispatch window allows.
+
 **The console summarizes wide fans.** The dashboard's run detail folds any fan wider than 50 into
 one summary row and pages its members on demand, so opening a 40,000-member fan no longer ships
 every checkpoint to the browser. On a store with `checkpointStats` and `queryCheckpoints` (every

@@ -275,6 +275,7 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 | `failTask` | `failTask(runId: string, name: string, error: string): Promise<RunResult \| null>` | Report a `ctx.task` failure — the run resumes and throws a `FatalError` at the task. |
 | `onDead` | `onDead(listener: (run: WorkflowRun) => void): () => void` | Subscribe to dead-lettered runs (moved to `dead` past `maxRecoveryAttempts`). Returns an unsubscribe fn. |
 | `onEnqueued` | `onEnqueued(listener: (runId: string) => void): () => void` | Subscribe to runs enqueued on ANOTHER instance (control-plane broadcast) — a worker can pick them up immediately instead of waiting for its next poll. |
+| `runEnqueued` | `runEnqueued(runId: string): void` | Run an announced run here if it is still `pending`, bounded by `localRunConcurrency`. The `onEnqueued` handler the Nest module installs. |
 | `onCancel` | `onCancel(listener: (runId: string) => void): () => void` | Subscribe to cancellations on ANY instance — for cooperative in-flight abort. |
 | `drain` | `drain(timeoutMs?: number): Promise<void>` | Graceful shutdown: stop picking up new runs, wait for in-flight executions up to `timeoutMs` (default 10000). |
 | `workerHealth` | `workerHealth(extra?: string[]): Promise<GroupHealth[]>` | Per-group queue backlog + live worker heartbeats (only transports that support introspection, e.g. BullMQ). |
@@ -315,6 +316,7 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `timerBatchSize` | `number` | `500` | Most due timers one timer-poll pass loads and drives, most overdue first. A non-finite or sub-1 value falls back to 500. Operator only. |
 | `eventBufferTtlMs` | `number` | keep until consumed | Retention for a buffered event no `waitForEvent` claims; pruned by the reconcile pass. Operator only. |
 | `blockedPollMs` | `number` | `5000` | How often a run parked `blocked` (no capable live worker) re-checks the fleet. Operator only. |
+| `localRunConcurrency` | `number` | `256` | Most runs an instance executes in-process at once when it picks them up itself: the runs it starts (a `ctx.all` fan's children included) and the runs other instances announce as enqueued. Past it, run ids wait in memory while the runs stay `pending` for any instance to take. `Infinity` removes the bound; a non-finite or sub-1 value falls back to 256. Operator only. |
 | `trackStepStart` | `boolean` | `true` | Persist a `running` checkpoint when a local step starts; `false` halves checkpoint writes on hot paths. Operator only. |
 | `deadLetterWorkflow` | `WorkflowRef` | none | Default DLQ target for workflows without their own. Operator only. |
 | `drive` | `boolean` | `true` | Whether this operator instance actively drives runs (poll/recover/resume/prune/consume). `false` = dashboard/dispatch-only. |

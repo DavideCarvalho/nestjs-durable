@@ -51,6 +51,7 @@ import type {
 } from './interfaces';
 import { codeAndDetails } from './on-error';
 import { breakpointToken } from './protocol';
+import { getRunsByIds } from './run-waiting';
 import { createStepLogger } from './step-logger';
 import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol';
 import { type WorkflowRef, workflowName } from './workflow-ref';
@@ -840,12 +841,13 @@ export function createWorkflowCtx(
         for (const i of chunk) host.startChild(name, inputs[i], id(i));
       }
       // A placeholder written by a turn that crashed before the deferred start ran: start it now.
-      for (let at = 0; at < toEnsure.length; at += FAN_CHUNK) {
-        await Promise.all(
-          toEnsure.slice(at, at + FAN_CHUNK).map(async (i) => {
-            if (!(await store.getRun(id(i)))) host.startChild(name, inputs[i], id(i));
-          }),
+      // One batched read for the lot, not one per child: a replay of a wide fan has thousands.
+      if (toEnsure.length > 0) {
+        const started = await getRunsByIds(
+          store,
+          toEnsure.map((i) => id(i)),
         );
+        for (const i of toEnsure) if (!started.has(id(i))) host.startChild(name, inputs[i], id(i));
       }
     }
     if (active.length > 0) {

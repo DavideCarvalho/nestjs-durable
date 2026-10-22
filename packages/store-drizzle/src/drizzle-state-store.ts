@@ -190,6 +190,15 @@ export class DrizzleStateStore implements StateStore {
     return rows[0] ? fromRunRow(rows[0]) : null;
   }
 
+  async getRuns(runIds: string[]): Promise<WorkflowRun[]> {
+    if (runIds.length === 0) return [];
+    const rows = await this.db
+      .select()
+      .from(workflowRuns)
+      .where(inArray(workflowRuns.id, [...new Set(runIds)]));
+    return rows.map(fromRunRow);
+  }
+
   async deleteRun(runId: string): Promise<void> {
     // Child rows first, then the run — checkpoints, signal waiters, attribute rows.
     await this.db.delete(stepCheckpoints).where(eq(stepCheckpoints.runId, runId));

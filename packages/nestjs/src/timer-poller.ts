@@ -43,7 +43,15 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     // The `.catch` is load-bearing, not decorative: this is fire-and-forget, so an unhandled
     // rejection here terminates the process under Node's default policy — and the run it could not
     // drive is still waiting for the next poll tick either way.
+    //
+    // `runEnqueued` is bounded by `localRunConcurrency` and skips a run another
+    // instance already took; every instance receives every announcement, so a 40,000-child fan
+    // would otherwise lease and replay 40,000 runs here at once. Optional for an older core.
     this.unsubscribeEnqueued = this.engine.onEnqueued((runId) => {
+      if (typeof this.engine.runEnqueued === 'function') {
+        this.engine.runEnqueued(runId);
+        return;
+      }
       void this.engine.runOne(runId).catch((error) => {
         console.error(`[nestjs-durable] could not run enqueued run ${runId}:`, error);
       });

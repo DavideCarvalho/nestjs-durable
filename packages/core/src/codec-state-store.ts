@@ -113,6 +113,8 @@ export class CodecStateStore implements StateStore {
     toSeq: number,
     into: StepCheckpoint,
   ) => Promise<void>;
+  /** Decodes each run like {@link getRun}. Bound only when the inner store has it. */
+  readonly getRuns?: (runIds: string[]) => Promise<WorkflowRun[]>;
   /** Forwarded verbatim — a waiter carries no payload. */
   readonly listSignalWaitersByRun?: (runIds: string[]) => Promise<SignalWaiter[]>;
   /** Forwarded verbatim — a waiter carries no payload. */
@@ -173,6 +175,10 @@ export class CodecStateStore implements StateStore {
     if (compact)
       this.compactCheckpoints = (runId, fromSeq, toSeq, into) =>
         compact.call(inner, runId, fromSeq, toSeq, this.encCp(into));
+    const getRuns = inner.getRuns;
+    if (getRuns)
+      this.getRuns = async (runIds) =>
+        (await getRuns.call(inner, runIds)).map((r) => this.decRun(r) as WorkflowRun);
     const byRun = inner.listSignalWaitersByRun;
     if (byRun) this.listSignalWaitersByRun = (runIds) => byRun.call(inner, runIds);
     const hasWaiter = inner.hasSignalWaiter;

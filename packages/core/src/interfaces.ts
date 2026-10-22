@@ -332,6 +332,14 @@ export interface StateStore {
   createRun(run: WorkflowRun): Promise<void>;
   updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void>;
   getRun(runId: string): Promise<WorkflowRun | null>;
+  /**
+   * The runs with these ids, in any order; an id with no run is left out. One `IN (...)` read: the
+   * engine looks up a fan's children with it (which to start, which already finished) instead of
+   * one {@link getRun} per child. Callers pass ids in bounded batches.
+   *
+   * Optional: without it the engine reads each run with {@link getRun}.
+   */
+  getRuns?(runIds: string[]): Promise<WorkflowRun[]>;
 
   /**
    * Hard-delete a run and all of its rows — the run plus its checkpoints, signal waiters, and

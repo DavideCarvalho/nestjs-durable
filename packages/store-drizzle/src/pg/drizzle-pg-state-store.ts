@@ -218,6 +218,15 @@ export class DrizzlePgStateStore implements StateStore {
     return rows[0] ? fromRunRow(rows[0]) : null;
   }
 
+  async getRuns(runIds: string[]): Promise<WorkflowRun[]> {
+    if (runIds.length === 0) return [];
+    const rows = await this.db
+      .select()
+      .from(workflowRuns)
+      .where(and(inArray(workflowRuns.id, [...new Set(runIds)]), this.scope()));
+    return rows.map(fromRunRow);
+  }
+
   async deleteRun(runId: string): Promise<void> {
     await this.db.transaction(async (tx) => {
       await deleteRunsCascade(tx, [runId]);
