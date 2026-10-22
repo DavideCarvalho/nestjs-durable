@@ -1,4 +1,32 @@
-import type { RunGateway, RunReply, RunRequest, RunWaiting } from '@dudousxd/nestjs-durable-core';
+import type {
+  RunGateway,
+  RunReply,
+  RunRequest,
+  RunRequestKind,
+  RunWaiting,
+} from '@dudousxd/nestjs-durable-core';
+
+/**
+ * The error `code` a responder replies with for a verb it does not know, so a newer tenant can tell
+ * "this control plane is older than me" from a real failure and fall back at once. Earlier
+ * responders reply `ok: true` with no `data` instead; `ProxyRunGateway` reads both.
+ */
+export const UNSUPPORTED_RUN_REQUEST = 'unsupported-request';
+
+const KNOWN_KINDS: ReadonlySet<string> = new Set<RunRequestKind['kind']>([
+  'getRunDetail',
+  'getFanMembers',
+  'listRuns',
+  'runFacets',
+  'runValueFacets',
+  'workerHealth',
+  'cancel',
+  'retry',
+  'continue',
+  'retryWithInput',
+  'redispatch',
+  'waitingFor',
+]);
 
 /** The narrow slice of `Transport` the responder needs — a tenant's read/control request in, a
  *  correlated reply out. Both are OPTIONAL on the full `Transport` interface (only broker
@@ -28,13 +56,37 @@ export class RunRequestResponder {
    *  failure never throws back into the transport (errors are captured into an error reply). */
   start(): void {
     this.transport.onRunRequest(async (msg) => {
-      const reply = await this.handle(msg);
+      let reply: RunReply;
+      try {
+        reply = await this.handle(msg);
+      } catch (err) {
+        // Without a reply the tenant waits out its whole timeout for an answer that never comes.
+        reply = {
+          requestId: msg.requestId,
+          result: {
+            ok: false,
+            error: { message: err instanceof Error ? err.message : String(err) },
+          },
+        };
+      }
       await this.transport.publishRunReply(reply);
     });
   }
 
   private async handle(msg: RunRequest): Promise<RunReply> {
     const { body } = msg;
+    if (!KNOWN_KINDS.has(body.kind)) {
+      return {
+        requestId: msg.requestId,
+        result: {
+          ok: false,
+          error: {
+            message: `the control plane does not support the ${String(body.kind)} run request`,
+            code: UNSUPPORTED_RUN_REQUEST,
+          },
+        },
+      };
+    }
     if (body.kind === 'listRuns') {
       // Force the namespace to the requester's tenant — the client-supplied value is discarded,
       // never merely validated, so a tenant can't widen its own query into another's namespace.

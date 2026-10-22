@@ -20,7 +20,14 @@ import type {
   RunWaiting,
   Transport,
 } from '@dudousxd/nestjs-durable-core';
+import {
+  SUMMARY_CHILD_LIMIT,
+  childIdsOf,
+  pageFan,
+  summarizeTimeline,
+} from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
+import { UNSUPPORTED_RUN_REQUEST } from './run-request-responder';
 
 /**
  * Method-shorthand signatures (not arrow-function-typed properties) are deliberate: TypeScript
@@ -34,6 +41,15 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** The control plane answered a verb it does not know — an older release than this tenant's. */
+class UnsupportedRunRequestError extends Error {}
+
+/** An {@link UNSUPPORTED_RUN_REQUEST} error reply. Older responders answer an unknown verb with
+ *  `ok: true` and no `data` instead, which `getFanMembers` checks for itself. */
+function isUnsupported(err: unknown): boolean {
+  return err instanceof UnsupportedRunRequestError;
+}
+
 /**
  * Tenant-side `RunGateway` — round-trips every verb as a `RunRequest`/`RunReply` pair over the
  * transport, correlated by a minted `requestId`, and bridges `subscribe` onto the transport's
@@ -45,11 +61,17 @@ interface PendingRequest {
 @Injectable()
 export class ProxyRunGateway implements RunGateway {
   private readonly pending = new Map<string, PendingRequest>();
+  /** Verb → when to ask the control plane for it again, after it answered that it does not know it.
+   *  During a rolling upgrade the control plane is several pods of mixed versions behind one queue,
+   *  and a reply does not say which pod sent it, so the whole control plane is assumed old until the
+   *  entry expires. */
+  private readonly unsupportedUntil = new Map<RunRequestKind['kind'], number>();
 
   constructor(
     private readonly transport: Transport,
     private readonly tenant: string,
     private readonly timeoutMs = 10_000,
+    private readonly capabilityTtlMs = 60_000,
   ) {
     this.transport.onRunReply?.((reply: RunReply) => this.handleReply(reply));
   }
@@ -61,6 +83,8 @@ export class ProxyRunGateway implements RunGateway {
     this.pending.delete(reply.requestId);
     if (reply.result.ok) {
       pending.resolve(reply.result.data);
+    } else if (reply.result.error.code === UNSUPPORTED_RUN_REQUEST) {
+      pending.reject(new UnsupportedRunRequestError(reply.result.error.message));
     } else {
       pending.reject(new Error(reply.result.error.message));
     }
@@ -92,12 +116,55 @@ export class ProxyRunGateway implements RunGateway {
     return { role: 'tenant', tenant: this.tenant };
   }
 
-  getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
-    return this.request<RunDetail | null>({ kind: 'getRunDetail', runId, options });
+  /**
+   * A control plane that predates {@link RunDetailOptions} ignores them and sends the full detail;
+   * a summarized detail always carries `fans`, so its absence means the summary is made here.
+   */
+  async getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    const detail = await this.request<RunDetail | null>(
+      options === undefined
+        ? { kind: 'getRunDetail', runId }
+        : { kind: 'getRunDetail', runId, options },
+    );
+    const over = options?.summarizeFansOver;
+    if (over === undefined || !detail || detail.fans !== undefined) return detail;
+    const { timeline, fans } = summarizeTimeline(detail.timeline, over);
+    const ids = childIdsOf(detail.timeline);
+    return {
+      ...detail,
+      timeline,
+      children: ids.slice(0, SUMMARY_CHILD_LIMIT),
+      fans,
+      childCount: ids.length,
+    };
   }
 
-  getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
-    return this.request<FanPage | null>({ kind: 'getFanMembers', runId, group, query });
+  /** Paged from the full detail when the control plane is too old to page a fan itself. */
+  async getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    if (!this.knownUnsupported('getFanMembers')) {
+      try {
+        const page = await this.request<FanPage | null | undefined>({
+          kind: 'getFanMembers',
+          runId,
+          group,
+          query,
+        });
+        if (page !== undefined) return page;
+      } catch (err) {
+        if (!isUnsupported(err)) throw err;
+      }
+      this.unsupportedUntil.set('getFanMembers', Date.now() + this.capabilityTtlMs);
+    }
+    const detail = await this.request<RunDetail | null>({ kind: 'getRunDetail', runId });
+    return detail ? pageFan(detail.timeline, group, query) : null;
+  }
+
+  private knownUnsupported(kind: RunRequestKind['kind']): boolean {
+    const until = this.unsupportedUntil.get(kind);
+    if (until === undefined) return false;
+    if (Date.now() < until) return true;
+    this.unsupportedUntil.delete(kind);
+    return false;
   }
 
   /** The control plane's `StoreRunGateway` resolves each run's `waiting` descriptor; the reply carries
