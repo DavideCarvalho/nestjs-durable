@@ -213,9 +213,16 @@ reason }` — so a dashboard can show *why* the limit moved, not just that it di
 - `cpuCeilingPct` — CPU percent ceiling; off (`undefined`) by default.
 - `tickMs` — control-loop period in ms. Default `2000`.
 
-Either way — fixed or adaptive — the live concurrency, in-flight count, and (in adaptive mode) the last
-adjustment ride the worker's heartbeat as a `WorkerStatus` payload, which the Telescope Workers dashboard
-renders per worker group so you can see saturation and self-tuning behavior without instrumenting
+If you drive an `AdaptiveController` yourself, `readCpuUsage` and `readCpuCount` (next to `readRss`,
+`readMemoryLimit` and `now`) replace `process.cpuUsage()` and `os.cpus().length`, so a test can push CPU
+over `cpuCeilingPct` and watch the `cpu_ceiling` move.
+
+In fixed mode no control loop runs: the limit stays the number you passed, and the heartbeat samples CPU
+itself (at most once per 2s). Either way — fixed or adaptive — the live concurrency, in-flight count, RSS,
+CPU, throughput, p95 and (in adaptive mode) the last adjustment ride the worker's heartbeat as a
+`WorkerStatus` payload. `throughputPerMin` counts the completions of the trailing minute, so it decays
+while a worker sits idle and reads `0` once a minute passes without one. The Telescope Workers dashboard
+renders it per worker group so you can see saturation and self-tuning behavior without instrumenting
 anything yourself.
 
 ## Local vs. global admission

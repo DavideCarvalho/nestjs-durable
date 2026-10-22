@@ -342,7 +342,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
         concurrency: controller.initialLimit,
       }),
   );
-  // Run the control loop (a no-op-on-limit timer for a fixed worker, an AIMD loop for an adaptive one).
+  // Start the AIMD loop for an adaptive worker; a fixed worker only takes its CPU baseline.
   controller.start();
 
   // --- best-effort pub/sub control channel + worker-liveness heartbeat (mirror the Python SDK) ---
