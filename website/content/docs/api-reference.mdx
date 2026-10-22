@@ -291,9 +291,12 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 | `subscribe` | `subscribe(listener: EngineListener): () => void` | Subscribe to every `EngineEvent` (lifecycle events) the engine emits. |
 
 `engine.runSchedules` is **not** a method — `runSchedules(engine, schedules, nowMs, opts?)` is a
-standalone function exported from `@dudousxd/nestjs-durable-core` (`scheduler.ts`) that starts each
+standalone function (exported from `@dudousxd/nestjs-durable`, and from `-core`) that starts each
 `ScheduledWorkflow`'s current time-bucket run id (idempotent via `engine.start`). The NestJS module's
-`schedules` option wires it to the timer poller automatically — see [Scheduling](/docs/authoring/scheduling).
+`schedules` option wires it to the timer poller automatically; call it yourself to [fire schedules from
+your own trigger](/docs/authoring/scheduling#firing-schedules-from-your-own-trigger).
+`scheduleRunIdAt(schedule, nowMs)` returns the run id of a schedule's window at `nowMs`, for
+[looking a window's run up](/docs/authoring/scheduling#looking-up-a-schedules-run) with `getRun`.
 
 ## DurableModuleOptions
 
