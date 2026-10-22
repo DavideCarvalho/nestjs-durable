@@ -839,7 +839,9 @@ export class MikroOrmStateStore implements StateStore {
       { runId, $or: prefixes.map((p) => ({ name: { $like: `${p}%` } })) },
       { orderBy: { seq: 'asc' } },
     );
-    return rows.map(fromCheckpointEntity);
+    // `LIKE` reads `_` and `%` in the prefix as wildcards, so it can match more than the prefix: keep
+    // only the exact matches.
+    return rows.filter((r) => prefixes.some((p) => r.name.startsWith(p))).map(fromCheckpointEntity);
   }
 
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
@@ -870,12 +872,16 @@ export class MikroOrmStateStore implements StateStore {
   async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
     const em = this.fork();
     const rows = await em.find(SignalWaiterEntity, { token: { $like: `${prefix}%` } });
-    return rows.map((e) => ({
-      token: e.token,
-      runId: e.runId,
-      seq: e.seq,
-      parallelGroup: e.parallelGroup ?? undefined,
-    }));
+    // `LIKE` reads `_` and `%` in the prefix as wildcards, so it can match more than the prefix: keep
+    // only the exact matches.
+    return rows
+      .filter((e) => e.token.startsWith(prefix))
+      .map((e) => ({
+        token: e.token,
+        runId: e.runId,
+        seq: e.seq,
+        parallelGroup: e.parallelGroup ?? undefined,
+      }));
   }
 
   async registerChildWaits(entries: ChildWait[]): Promise<void> {
