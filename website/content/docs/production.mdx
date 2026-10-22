@@ -249,6 +249,14 @@ runs. These knobs matter, roughly in order:
    one run still resume it in order on an instance. See
    [Result concurrency](/docs/transports/bullmq#result-concurrency).
 
+   It also decides how results are batched. An instance settles one run's results in batches: the
+   results that arrive while one batch is being written go into the next, up to 256. A batch is
+   one `saveCheckpointsIfPending` call (one commit) and one barrier `COUNT`, and it resumes the run
+   at most once. So with `resultConcurrency: 64`, a step fan's results cost about one checkpoint
+   read and 1/64 of a commit each, against a read, a commit and a `COUNT` each at `1`. A result is
+   acknowledged only after its batch commits, and a batch the store rejects is retried row by row,
+   so one bad row fails only its own result.
+
 ```ts
 const transport = new BullMQTransport({
   connection: { host: 'redis', port: 6379 },
