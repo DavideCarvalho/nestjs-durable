@@ -446,3 +446,55 @@ class ToErrorTest(unittest.TestCase):
             out = _to_error(err)
         self.assertEqual(out["code"], "invalid_line")
         self.assertEqual(out["details"], [{"path": ["amount"]}])
+
+
+class GatherCallsSettledTest(unittest.TestCase):
+    CALLS = [
+        {"name": "validate", "input": {"i": 0}, "group": "ext"},
+        {"name": "validate", "input": {"i": 1}, "group": "ext"},
+        {"name": "validate", "input": {"i": 2}, "group": "ext"},
+    ]
+
+    def _ctx(self, history=None):
+        return WorkflowContext("run1", history or [])
+
+    def test_first_turn_emits_the_same_fan_as_gather_calls(self):
+        settled = self._ctx()
+        with self.assertRaises(_Suspend):
+            settled.gather_calls_settled(self.CALLS)
+        gathered = self._ctx()
+        with self.assertRaises(_Suspend):
+            gathered.gather_calls(self.CALLS)
+        self.assertEqual(settled.commands, gathered.commands)
+
+    def test_returns_every_outcome_in_input_order(self):
+        history = [
+            {"seq": 0, "kind": "call", "name": "validate", "output": {"ok": 0}},
+            {
+                "seq": 1,
+                "kind": "call",
+                "name": "validate",
+                "error": {"message": "bad line", "code": "invalid", "details": {"field": "amount"}},
+            },
+            {"seq": 2, "kind": "call", "name": "validate", "error": {"message": "down"}},
+        ]
+        out = self._ctx(history).gather_calls_settled(self.CALLS)
+        self.assertEqual(
+            out,
+            [
+                {"status": "fulfilled", "value": {"ok": 0}},
+                {
+                    "status": "rejected",
+                    "id": "run1:1",
+                    "error": "bad line",
+                    "code": "invalid",
+                    "details": {"field": "amount"},
+                },
+                {"status": "rejected", "id": "run1:2", "error": "down"},
+            ],
+        )
+
+    def test_empty_calls_returns_empty(self):
+        ctx = self._ctx()
+        self.assertEqual(ctx.gather_calls_settled([]), [])
+        self.assertEqual(ctx.commands, [])

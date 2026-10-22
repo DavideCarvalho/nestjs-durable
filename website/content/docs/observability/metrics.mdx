@@ -43,7 +43,17 @@ steps:
 
 ```ts
 export interface DurableMetricsSnapshot {
-  runs: { started: number; completed: number; failed: number; suspended: number };
+  /** `routed`: failures handed to an onError handler; `unrouted`: routes that could not be applied. */
+  runs: {
+    started: number;
+    completed: number;
+    failed: number;
+    suspended: number;
+    routed: number;
+    unrouted: number;
+  };
+  /** Routed failures by error code (`*` without one). */
+  routedByCode: Record<string, number>;
   steps: { completed: number; failed: number };
   /** Per-step wall-clock (from the `durationMs` on step events). */
   stepDurationMs: { count: number; p50: number; p95: number; max: number };
@@ -98,7 +108,15 @@ export interface MetricsCollector {
 
 ```ts
 export interface MetricsSnapshot {
-  runs: { started: number; completed: number; failed: number; suspended: number };
+  runs: {
+    started: number;
+    completed: number;
+    failed: number;
+    suspended: number;
+    routed: number;
+    unrouted: number;
+  };
+  routedByCode: Record<string, number>;
   steps: { started: number; completed: number; failed: number };
   /** Per-workflow run counters, keyed by workflow name. */
   byWorkflow: Record<string, { started: number; completed: number; failed: number }>;
@@ -152,3 +170,7 @@ Both subscribe to the same event stream and are safe to run side by side — `co
 Reach for `collectMetrics` (core) when you already scrape Prometheus text; reach for
 `attachDurableMetrics` (otel package) when you want p50/p95/max duration percentiles out of the box,
 or a JSON snapshot for a custom dashboard rather than a text exposition format.
+
+A failure handed to an [onError handler](/docs/reliability/on-error) is counted as `routed`, not
+`failed`, and broken down by error code in `routedByCode` (Prometheus: `durable_runs_routed_total{code}`).
+An `unrouted` count above zero means a deploy left workers announcing different routes.

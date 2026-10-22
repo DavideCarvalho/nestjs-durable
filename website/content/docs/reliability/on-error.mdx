@@ -92,8 +92,8 @@ In Python: `raise FatalError("line 3 is invalid", "invalid_line", details=issues
 
 Retrying a failed run (from the console, or `engine.requeue`) runs its **body** again. A handoff the run
 made before is retired: it stays in the timeline, renamed `onError:retried:<handler id>`, and is never
-followed again. If the body fails again, the engine hands the new failure to a new handler run
-(`<runId>.onError.1`, then `.2`, …).
+followed again, and the run's `onError:<code>` tag is removed. If the body fails again, the engine hands
+the new failure to a new handler run (`<runId>.onError.1`, then `.2`, …), tagged again.
 
 ## Matching
 
@@ -138,9 +138,16 @@ the reason. The engine reuses what it read for a few seconds, so a burst of fail
 
 ## Catching a misnamed handler
 
-At boot, the Nest module warns about any route whose handler workflow is neither registered in the
-process nor served by a live worker, so a typo shows up before the first failure goes nowhere. The same
-check is `engine.unservedOnErrorRoutes()`.
+After boot, the Nest module warns about any route whose handler workflow is neither registered in the
+process nor served by a live worker, so a typo shows up before the first failure goes nowhere. A route
+unserved at boot is checked again 30 seconds later before it is reported, so a handler whose workers
+start after the API is not flagged. The same check is `engine.unservedOnErrorRoutes()`.
+
+## Seeing it
+
+The console shows the failure's `code` and its `details` (as JSON) on the failed step and on a failed
+run. Handoffs are counted as `routed` in the [metrics](/docs/observability/metrics), marked on the run's
+[OpenTelemetry](/docs/observability/otel) span, and tagged `routed` in [Telescope](/docs/observability/telescope).
 
 ## A handler in another workflow
 

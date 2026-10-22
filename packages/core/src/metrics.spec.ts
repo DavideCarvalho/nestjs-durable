@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { FatalError } from './errors';
 import { collectMetrics } from './metrics';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
@@ -32,6 +33,28 @@ describe('collectMetrics', () => {
     expect(prom).toContain('durable_runs_total{event="completed"} 1');
     expect(prom).toContain('durable_runs_by_workflow_total{workflow="ok",event="completed"} 1');
 
+    metrics.stop();
+  });
+
+  it('counts failures handed to an onError handler, and exposes them by code', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const metrics = collectMetrics(engine);
+    engine.register('dlq', '1', async () => 'handled');
+    engine.register(
+      'line',
+      '1',
+      async () => {
+        throw new FatalError('bad line', 'invalid_line');
+      },
+      { onError: [{ code: 'invalid_line', workflow: 'dlq' }] },
+    );
+
+    await startRun(engine, 'line', {}, 'r');
+    await engine.waitForRun('r', { until: 'terminal' });
+
+    expect(metrics.snapshot().runs.routed).toBe(1);
+    expect(metrics.snapshot().routedByCode).toEqual({ invalid_line: 1 });
+    expect(metrics.prometheus()).toContain('durable_runs_routed_total{code="invalid_line"} 1');
     metrics.stop();
   });
 });

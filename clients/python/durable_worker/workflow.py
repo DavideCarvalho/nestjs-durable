@@ -553,23 +553,7 @@ class WorkflowContext:
         engine mints for a worker's ``startChild``.
         """
         seqs, histories = self._child_fan(workflow, inputs, "wait_all")
-        out: List[Dict[str, Any]] = []
-        for seq, ev in zip(seqs, histories):
-            error = ev.get("error")
-            if error is None:
-                out.append({"status": "fulfilled", "value": ev.get("output")})
-                continue
-            rejected: Dict[str, Any] = {
-                "status": "rejected",
-                "id": f"{self.run_id}.child.{seq}",
-                "error": error.get("message", "child failed"),
-            }
-            if error.get("code") is not None:
-                rejected["code"] = error["code"]
-            if error.get("details") is not None:
-                rejected["details"] = error["details"]
-            out.append(rejected)
-        return out
+        return _settled(seqs, histories, lambda seq: f"{self.run_id}.child.{seq}")
 
     def _child_fan(
         self, workflow: str, inputs: "List[Any]", mode: str
@@ -622,21 +606,44 @@ class WorkflowContext:
         re-dispatch when a checkpoint for that seq already exists) — same contract as ``start_child`` /
         ``gather_children``.
         """
+        _, histories = self._call_fan(calls, mode)
+        if not histories:
+            return []
+        return self._aggregate(histories, lambda ev: ev.get("name"))
+
+    def gather_calls_settled(self, calls: "List[Any]") -> "List[Dict[str, Any]]":
+        """:meth:`gather_calls` that never raises for a failed call: waits for every remote step to
+        settle, then returns one dict per call, in input order — the twin of the TS ``ctx.allSettled``
+        over a ``@Step``. Same fan as ``gather_calls`` in ``wait_all`` mode (seqs, ``call`` commands,
+        parallel group); only the ending differs.
+
+        A fulfilled call is ``{"status": "fulfilled", "value": output}``; a failed one is
+        ``{"status": "rejected", "id": "<runId>:<seq>", "error": message}``, plus the recorded ``code``
+        and ``details`` when the step's error carries them. The id is the engine's step id.
+        """
+        seqs, histories = self._call_fan(calls, "wait_all")
+        return _settled(seqs, histories, lambda seq: f"{self.run_id}:{seq}")
+
+    def _call_fan(
+        self, calls: "List[Any]", mode: str
+    ) -> "Tuple[List[int], List[Dict[str, Any]]]":
+        """The fan :meth:`gather_calls` and :meth:`gather_calls_settled` share: reserves a contiguous
+        seq block, emits a ``call`` per unresolved step under one parallel group, and suspends until
+        every call has a history entry. ``fail_fast`` raises on the first resolved failure."""
         normalized = [_normalize_call(c) for c in calls]
         seqs = [self._next() for _ in normalized]
         if not seqs:
-            return []
+            return [], []
         group_tag = f"gather:{seqs[0]}"
         histories = [
             self._replay_entry(seq, "call", name)
             for seq, (name, _input, _group) in zip(seqs, normalized)
         ]
 
-        # fail_fast: bail the moment any resolved call is a failure.
         if mode == "fail_fast":
-            for seq, ev in zip(seqs, histories):
+            for ev in histories:
                 if ev is not None and ev.get("error") is not None:
-                    return self._aggregate([ev], lambda e: e.get("name"))
+                    self._aggregate([ev], lambda e: e.get("name"))
 
         pending = False
         for seq, (name, input_, call_group), ev in zip(seqs, normalized, histories):
@@ -649,8 +656,31 @@ class WorkflowContext:
                 pending = True
         if pending:
             raise _Suspend()
+        return seqs, histories  # type: ignore[return-value]
 
-        return self._aggregate(histories, lambda ev: ev.get("name"))
+
+def _settled(
+    seqs: "List[int]", histories: "List[Dict[str, Any]]", id_of: Callable[[int], str]
+) -> "List[Dict[str, Any]]":
+    """One ``fulfilled``/``rejected`` dict per settled fan item, in order. A rejected item carries the
+    ``id`` ``id_of(seq)`` names, the error message, and the error's ``code``/``details`` when set."""
+    out: List[Dict[str, Any]] = []
+    for seq, ev in zip(seqs, histories):
+        error = ev.get("error")
+        if error is None:
+            out.append({"status": "fulfilled", "value": ev.get("output")})
+            continue
+        rejected: Dict[str, Any] = {
+            "status": "rejected",
+            "id": id_of(seq),
+            "error": error.get("message", "failed"),
+        }
+        if error.get("code") is not None:
+            rejected["code"] = error["code"]
+        if error.get("details") is not None:
+            rejected["details"] = error["details"]
+        out.append(rejected)
+    return out
 
 
 WorkflowFn = Callable[..., Any]

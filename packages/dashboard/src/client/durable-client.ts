@@ -58,6 +58,9 @@ export type RunWaiting = CoreRunWaiting;
 /** No `Date` fields and already an exact structural match to core's `StepEvent` — derived directly. */
 export type StepEvent = CoreStepEvent;
 
+/** A failure as the server reports it: message, machine `code`, structured `details`. */
+export type { StepError };
+
 export type StepCheckpoint = Omit<
   WireDates<CoreStepCheckpoint>,
   'stepId' | 'enqueuedAt' | 'error'

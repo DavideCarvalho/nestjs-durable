@@ -1,4 +1,4 @@
-import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import { FatalError, InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import {
   BasicTracerProvider,
   InMemorySpanExporter,
@@ -50,5 +50,28 @@ describe('attachDurableOtel', () => {
 
     const run = exporter.getFinishedSpans().find((s) => s.name === 'workflow wf');
     expect(run?.status.code).toBe(2); // SpanStatusCode.ERROR
+  });
+
+  it('marks the handoff to an onError handler on the run span', async () => {
+    const { tracer, exporter } = tracerWithExporter();
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    attachDurableOtel(engine, { tracer });
+    engine.register('dlq', '1', async () => 'handled');
+    engine.register(
+      'line',
+      '1',
+      async () => {
+        throw new FatalError('bad line', 'invalid_line');
+      },
+      { onError: [{ code: 'invalid_line', workflow: 'dlq' }] },
+    );
+    await engine.start('line', {}, 'r');
+    await engine.waitForRun('r', { until: 'terminal' });
+
+    const run = exporter.getFinishedSpans().find((s) => s.name === 'workflow line');
+    expect(run?.events.find((e) => e.name === 'durable.run.routed')?.attributes).toMatchObject({
+      'durable.on_error.handler': 'dlq',
+      'durable.error.code': 'invalid_line',
+    });
   });
 });

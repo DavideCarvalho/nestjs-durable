@@ -38,6 +38,9 @@ type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
  *
  * For the shutdown drain to fire, enable Nest's shutdown hooks: `app.enableShutdownHooks()`.
  */
+/** How long after boot an onError route unserved at boot is checked again before it is reported. */
+const UNSERVED_ROUTES_RECHECK_MS = 30_000;
+
 @Injectable()
 export class WorkflowRegistrar
   implements OnModuleInit, OnApplicationBootstrap, OnApplicationShutdown
@@ -215,11 +218,14 @@ export class WorkflowRegistrar
   }
 
   /**
-   * Says, once at boot, which onError routes name a handler workflow nothing can run yet, so a typo
-   * is caught before the first failure goes nowhere. A handler served by workers that start later
-   * also shows up here; the route still works once they are live.
+   * Says, once after boot, which onError routes name a handler workflow nothing can run, so a typo is
+   * caught before the first failure goes nowhere. Routes unserved at boot are checked again after
+   * {@link UNSERVED_ROUTES_RECHECK_MS}, so a handler whose workers start after this process is not
+   * reported.
    */
-  private async reportUnservedOnErrorRoutes(): Promise<void> {
+  async reportUnservedOnErrorRoutes(recheckMs = UNSERVED_ROUTES_RECHECK_MS): Promise<void> {
+    if ((await this.engine.unservedOnErrorRoutes().catch(() => [])).length === 0) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, recheckMs).unref());
     const unserved = await this.engine.unservedOnErrorRoutes().catch(() => []);
     if (unserved.length === 0) return;
     const list = unserved
