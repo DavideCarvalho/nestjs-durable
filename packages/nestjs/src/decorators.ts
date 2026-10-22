@@ -325,8 +325,8 @@ function stepConfigFrom(options: StepOptions): StepConfig | undefined {
  * - `@Step('custom:name')` — explicit name override (stable across refactors, or a cross-runtime
  *   contract with a non-JS worker that has no `@Step` of its own).
  * - `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?,
- *   timeoutMs? })` — optional name override, opt-in RUNTIME zod schemas, and a def-level
- *   durable-retry/liveness-timeout policy. `input` validates before the method runs; `output`
+ *   timeoutMs? })` — optional name override, opt-in RUNTIME schemas (a Standard Schema or a DTO
+ *   class), and a def-level durable-retry/liveness-timeout policy. `input` validates before the method runs; `output`
  *   validates its return value before it's handed back (see `scanSteps`). `retries`/`backoff`/
  *   `backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` are the policy `ctx.step` reads off this method
  *   reference (via `stepConfigOf`) to build the dispatched `StepDef`'s durable retry/backoff and

@@ -76,6 +76,14 @@ function classValidatorParser(cls: DtoClass, code: string, label: string): Parse
         `${label} uses a class-validator DTO, which needs the optional peers "class-validator" and "class-transformer" — install them, or use a Standard Schema (zod, valibot, …) instead.`,
       );
     }
+    // A DTO describes an object. class-validator crashes on `null`/`undefined` (a bare TypeError) and
+    // reports nothing useful for a string or an array (which `plainToInstance` turns into an array of
+    // instances), so anything else is rejected here, on the same coded contract as a failed check.
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      const got = value === null ? 'null' : Array.isArray(value) ? 'an array' : typeof value;
+      const message = `expected an object, got ${got}`;
+      throw new FatalError(`invalid ${label}: ${message}`, code, [{ message }]);
+    }
     const instance = ct.plainToInstance(cls, value);
     const errors = await cv.validate(instance, { whitelist: true });
     if (errors.length > 0) {

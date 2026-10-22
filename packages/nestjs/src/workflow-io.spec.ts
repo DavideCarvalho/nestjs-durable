@@ -164,6 +164,23 @@ describe('@Workflow({ input, output })', () => {
     expect((seen[0] as OrderDto).placedAt).toBeInstanceOf(Date);
   });
 
+  it('rejects a non-object input to a DTO schema on the same invalid_input contract', async () => {
+    const { mod, store, svc } = await boot();
+    close = () => mod.close();
+
+    for (const [input, got] of [
+      [null, 'null'],
+      ['x', 'string'],
+      [[], 'an array'],
+    ] as const) {
+      await expect(svc.start('dto-io', input, 'bad')).rejects.toMatchObject({
+        code: 'invalid_input',
+        message: `invalid workflow "dto-io" input: expected an object, got ${got}`,
+      });
+    }
+    expect(await store.getRun('bad')).toBeNull();
+  });
+
   it('keeps inputSchema working as an alias of input', async () => {
     const { mod, store, svc } = await boot();
     close = () => mod.close();
