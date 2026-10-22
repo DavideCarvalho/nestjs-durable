@@ -591,3 +591,20 @@ def test_the_split_workflow_worker_has_the_same_inline_on_error():
     assert worker._workflow_meta["line"]["on_error"] == [
         {"code": "invalid_line", "workflow": "line.onError.reject_line"}
     ]
+
+
+def test_the_announced_sdk_version_is_the_installed_one():
+    from importlib.metadata import version
+
+    from durable_worker import Worker
+    from durable_worker.redis_runner import _build_descriptor
+
+    worker = Worker(auto_register=False)
+
+    @worker.workflow("p")
+    def _p(_ctx):
+        return None
+
+    assert _build_descriptor(worker, None, "default", lambda n: n).sdk["version"] == version(
+        "durable-worker"
+    )
