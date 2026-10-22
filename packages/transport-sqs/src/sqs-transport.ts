@@ -345,13 +345,21 @@ export class SqsTransport implements Transport {
     );
   }
 
+  /** Wait 1s, or until `close()` aborts. The abort listener is removed when the timer fires, so
+   *  sustained failures never accumulate listeners on the shared signal. */
   private backoff(): Promise<void> {
-    return new Promise((r) => {
-      const timer = setTimeout(r, 1000);
-      this.abort.signal.addEventListener('abort', () => {
+    return new Promise((resolve) => {
+      const signal = this.abort.signal;
+      if (signal.aborted) return resolve();
+      const onAbort = () => {
         clearTimeout(timer);
-        r(undefined);
-      });
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, 1000);
+      signal.addEventListener('abort', onAbort, { once: true });
     });
   }
 

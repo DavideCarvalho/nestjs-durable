@@ -1,4 +1,9 @@
-import type { StepResult, WorkflowDecision } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  type StepResult,
+  type WorkflowDecision,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
 import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
@@ -89,7 +94,7 @@ describe('BullMQTransport consumers [real Redis]', () => {
     }
   });
 
-  it('a second onResult does not start (and leak) a second results worker', async (ctx) => {
+  it('delivers every result to every onResult handler, over one results worker (no leak)', async (ctx) => {
     const connection = live(ctx);
     const prefix = `res${Date.now()}`;
     const t = new BullMQTransport({ connection, prefix, pingIntervalMs: false });
@@ -103,15 +108,43 @@ describe('BullMQTransport consumers [real Redis]', () => {
     const q = new Queue(`${prefix}-results`, { connection });
     try {
       await q.add('result', result('s1'));
-      await until(() => seen.length > 0);
+      await until(() => seen.length >= 2);
+      expect([...seen].sort()).toEqual(['first:s1', 'second:s1']);
       await t.close();
       // After close() nothing may consume: a leaked worker would still take this one.
       await q.add('result', result('s2'));
       await sleep(800);
-      expect(seen).toEqual(['first:s1']);
+      expect(seen).toHaveLength(2);
       expect(await q.getWaitingCount()).toBe(1);
     } finally {
       await q.close();
+      await t.close();
+    }
+  });
+
+  it('two engines sharing one transport (and store) settle a result exactly once', async (ctx) => {
+    const connection = live(ctx);
+    const prefix = `two${Date.now()}`;
+    const t = new BullMQTransport({ connection, prefix, pingIntervalMs: false });
+    t.handle('charge', async () => 'ok');
+    const store = new InMemoryStateStore();
+    const completed: string[] = [];
+    const make = (id: string) => {
+      const engine = new WorkflowEngine({ store, transport: t, instanceId: id });
+      engine.register('pay', '1', async (c) => c.step<string>('charge', {}));
+      engine.subscribe((ev) => {
+        if (ev.type === 'step.completed') completed.push(id);
+      });
+      return engine;
+    };
+    const a = make('a');
+    make('b');
+    try {
+      await a.start('pay', {}, `run-${prefix}`);
+      await until(async () => (await store.getRun(`run-${prefix}`))?.status === 'completed');
+      await sleep(300);
+      expect(completed).toHaveLength(1);
+    } finally {
       await t.close();
     }
   });

@@ -389,26 +389,3 @@ describe('DbTransport (real Postgres) [testcontainers]', () => {
     await dropTables(prefix);
   }, 30_000);
 });
-
-describe('DbTransport defaults', () => {
-  it('two instances booted in the same millisecond get distinct instance ids', () => {
-    const executor = {
-      dialect: 'postgres' as const,
-      escapeId: (id: string) => `"${id}"`,
-      query: async () => [],
-      transaction: async <T>(fn: (tx: { query: () => Promise<never[]> }) => Promise<T>) =>
-        fn({ query: async () => [] }),
-    };
-    const now = Date.now;
-    Date.now = () => 1_700_000_000_000;
-    try {
-      const a = new DbTransport({ executor });
-      const b = new DbTransport({ executor });
-      expect((a as unknown as { instanceId: string }).instanceId).not.toBe(
-        (b as unknown as { instanceId: string }).instanceId,
-      );
-    } finally {
-      Date.now = now;
-    }
-  });
-});

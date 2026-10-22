@@ -368,6 +368,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   // One BullMQ `Worker` per registered handler name (see `handle()`) — never a single shared queue.
   private readonly taskWorkers = new Map<string, ConsumerLike>();
   private resultsWorker?: ConsumerLike;
+  // Every `onResult` handler — each gets every result (see `onResult`).
+  private readonly resultHandlers = new Set<(result: StepResult) => Promise<void>>();
   private decisionsWorker?: ConsumerLike;
   // Every `onDecision` handler — each gets every decision (see `onDecision`).
   private readonly decisionHandlers = new Set<(decision: WorkflowDecision) => Promise<void>>();
@@ -1109,14 +1111,24 @@ export class BullMQTransport implements Transport, ControlPlane {
     }
   }
 
-  /** Engine side: consume step results. Starts the consumer on first call; a later call is a no-op
-   *  (it used to start a second results worker that replaced the first, which `close()` then never
-   *  closed — it kept consuming after shutdown). */
+  /**
+   * Engine side: consume step results. Starts ONE results consumer on the first call; EVERY handler
+   * registered gets every result, like {@link onDecision}. Safe for two engines sharing this
+   * transport: an engine settles a result by claiming the step's still-`pending` checkpoint, so an
+   * engine that doesn't know the run does nothing and, over one store, only one engine wins the claim
+   * (no double settle). A throwing handler fails the job and BullMQ retries it for all handlers,
+   * which the same claim makes idempotent. A second call used to start another results worker that
+   * replaced the first — `close()` never closed that one, so it kept consuming after shutdown.
+   */
   onResult(handler: (result: StepResult) => Promise<void>): void {
+    this.resultHandlers.add(handler);
     if (this.resultsWorker) return;
     this.resultsWorker = this.makeWorker(
       this.resultsName(),
-      (job) => handler(job.data as StepResult),
+      async (job) => {
+        const result = job.data as StepResult;
+        await Promise.all([...this.resultHandlers].map((h) => h(result)));
+      },
       { concurrency: this.resultConcurrency },
     );
     this.resultsWorker.on('failed', (job, error) => {

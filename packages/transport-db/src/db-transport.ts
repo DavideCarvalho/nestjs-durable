@@ -72,6 +72,14 @@ export interface DbTransportOptions {
 }
 
 /**
+ * A numeric option: `fallback` unless `value` is a finite number of at least `min`. `Math.max(1, NaN)`
+ * is `NaN`, so a clamp alone would let a `NaN` through (to `LIMIT NaN`, or a `NaN` timer).
+ */
+function numberOption(value: number | undefined, fallback: number, min: number): number {
+  return value !== undefined && Number.isFinite(value) && value >= min ? value : fallback;
+}
+
+/**
  * A SQL-backed `Transport` — DBOS-style. Instead of a broker (Redis/SQS), remote steps are **rows**
  * in the same database the durable store already uses: `dispatch` inserts a task row, a worker
  * claims it with `SELECT … FOR UPDATE SKIP LOCKED` (so instances never double-claim), runs it, and
@@ -116,10 +124,10 @@ export class DbTransport implements Transport {
     const prefix = options.prefix ?? 'durable';
     this.tasksTable = `${prefix}_transport_tasks`;
     this.resultsTable = `${prefix}_transport_results`;
-    this.pollMs = options.pollMs ?? 500;
-    this.leaseMs = options.leaseMs ?? 30_000;
-    this.batchSize = Math.max(1, Math.floor(options.batchSize ?? 10));
-    this.concurrency = Math.max(1, Math.floor(options.concurrency ?? 1));
+    this.pollMs = numberOption(options.pollMs, 500, 0);
+    this.leaseMs = numberOption(options.leaseMs, 30_000, 1);
+    this.batchSize = Math.floor(numberOption(options.batchSize, 10, 1));
+    this.concurrency = Math.floor(numberOption(options.concurrency, 1, 1));
     this.onError = options.onError ?? ((err) => console.error('[DbTransport]', err));
     this.autoCreate = options.autoCreate ?? true;
     // Random, not time-based: two instances booted in the same millisecond must not share an id.

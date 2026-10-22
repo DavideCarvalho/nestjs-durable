@@ -11,3 +11,4 @@ DbTransport no longer runs a task twice when it outlives `leaseMs`, and a worker
 - New `onError` option. A throwing result handler is reported and its row re-delivered after the lease; the rest of the batch continues.
 - `instanceId` defaults to a random UUID (two instances booted in the same millisecond used to share one).
 - A failed `CREATE TABLE` (two instances racing it on a fresh database) is retried instead of breaking the transport until restart.
+- A non-finite numeric option (`NaN`, `Infinity`) falls back to its default instead of reaching the SQL as `LIMIT NaN`.

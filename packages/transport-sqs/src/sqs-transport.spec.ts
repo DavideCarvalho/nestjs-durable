@@ -1,3 +1,4 @@
+import { getEventListeners } from 'node:events';
 import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
@@ -7,7 +8,7 @@ import {
   SendMessageCommand,
 } from '@aws-sdk/client-sqs';
 import type { RemoteTask, StepResult } from '@dudousxd/nestjs-durable-core';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SqsTransport } from './sqs-transport';
 
 /**
@@ -197,6 +198,24 @@ describe('SqsTransport poll loops survive failures', () => {
     // s1's result was not sent, so its task is still on the queue for redelivery.
     expect(sqs.bodies(TASKS)).toEqual([JSON.stringify(task('s1'))]);
     expect(unhandled).toEqual([]);
+  });
+});
+
+describe('SqsTransport backoff', () => {
+  it('does not accumulate abort listeners across repeated failures', async () => {
+    vi.useFakeTimers();
+    try {
+      const t = transport(new FakeSqs());
+      const internals = t as unknown as { backoff(): Promise<void>; abort: AbortController };
+      for (let i = 0; i < 20; i += 1) {
+        const wait = internals.backoff();
+        await vi.advanceTimersByTimeAsync(1_000);
+        await wait;
+      }
+      expect(getEventListeners(internals.abort.signal, 'abort')).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

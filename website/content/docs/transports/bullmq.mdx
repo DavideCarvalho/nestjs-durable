@@ -178,8 +178,10 @@ and is not parked.
 
 ## Control plane & tenant protocol
 
-Every `onDecision` handler registered on one transport gets every workflow-turn decision (each
-engine sharing the transport applies it by run id); `onResult` keeps a single results consumer.
+Every `onDecision` and `onResult` handler registered on one transport gets every decision and every
+result, over a single consumer each. Two engines sharing a transport is safe: an engine settles a
+result by claiming the step's still-pending checkpoint, so an engine that doesn't know the run does
+nothing, and over one store only one engine wins the claim.
 
 Beyond `Transport`, `BullMQTransport` also implements `ControlPlane` — cross-instance broadcast for
 lifecycle events and cancellation — and carries the tenant `start-run` / `run-request` / `run-reply`
