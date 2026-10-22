@@ -4,6 +4,7 @@ import {
   type CheckpointQuery,
   type CheckpointStat,
   type ChildWait,
+  type OwnedLeaseReclaim,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -41,6 +42,7 @@ import {
   type EntityManager,
   In,
   IsNull,
+  LessThan,
   LessThanOrEqual,
   Like,
   type Repository,
@@ -166,6 +168,7 @@ export class TypeOrmStateStore implements StateStore {
               {
                 status: 'suspended',
                 wakeAt: new Date(patch.wakeAt),
+                tags: patch.tags,
                 updatedAt: patch.updatedAt,
               },
             );
@@ -348,7 +351,12 @@ export class TypeOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
-  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]> {
     if (limit <= 0) return [];
     const now = new Date(nowMs);
     const rows = await this.runs().find({
@@ -363,6 +371,17 @@ export class TypeOrmStateStore implements StateStore {
           lockedUntil: LessThanOrEqual(now),
           ...(namespace !== undefined ? { namespace } : {}),
         },
+        // A live lease left by a previous process with the caller's own instance id.
+        ...(ownedBy
+          ? [
+              {
+                status: In(['running', 'cancelling']),
+                lockedBy: ownedBy.owner,
+                lockedUntil: LessThan(new Date(ownedBy.lockedBefore)),
+                ...(namespace !== undefined ? { namespace } : {}),
+              },
+            ]
+          : []),
       ],
       order: { createdAt: 'ASC' },
       take: limit,

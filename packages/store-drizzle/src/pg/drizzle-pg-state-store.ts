@@ -4,6 +4,7 @@ import {
   type CheckpointQuery,
   type CheckpointStat,
   type ChildWait,
+  type OwnedLeaseReclaim,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -382,7 +383,12 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
-  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]> {
     if (limit <= 0) return [];
     const rows = await this.db
       .select()
@@ -390,7 +396,17 @@ export class DrizzlePgStateStore implements StateStore {
       .where(
         and(
           inArray(workflowRuns.status, ['running', 'cancelling']),
-          or(isNull(workflowRuns.lockedUntil), lte(workflowRuns.lockedUntil, new Date(nowMs))),
+          or(
+            isNull(workflowRuns.lockedUntil),
+            lte(workflowRuns.lockedUntil, new Date(nowMs)),
+            // A live lease left by a previous process with the caller's own instance id.
+            ownedBy
+              ? and(
+                  eq(workflowRuns.lockedBy, ownedBy.owner),
+                  lt(workflowRuns.lockedUntil, new Date(ownedBy.lockedBefore)),
+                )
+              : undefined,
+          ),
           namespaceFilter(namespace),
           this.scope(),
         ),

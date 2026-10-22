@@ -208,6 +208,20 @@ DurableModule.forRoot({
 });
 ```
 
+A stable `instanceId` also shortens recovery after a hard kill. A pod killed without a graceful
+shutdown (OOM, `SIGKILL`) leaves its runs `running` under leases nobody renews. When it comes back
+under the same `instanceId`, its first recovery pass reclaims those runs right away instead of
+waiting up to `leaseMs`. It only takes back leases that expire before its own boot time plus
+`leaseMs`, so they were taken by the previous process, and it skips any run this process is
+already executing. Other instances still wait for those leases to expire. Every bundled store
+supports this (through the optional `ownedBy` argument of `StateStore.listOrphanedRuns`). A custom
+store that ignores the argument falls back to waiting for the lease to expire.
+
+This depends on the rule above: **a live `instanceId` must be unique per process.** Two processes
+running under one id at the same time share leases, and a restarted one would take back runs the
+other is still executing. A pod identity that is reused only after the old pod is gone, like a
+StatefulSet ordinal or a k8s pod name, is fine. A fixed id shared by every replica is not.
+
 None of this needs configuration beyond picking `leaseMs` — it's the default behavior of a durable
 store + `DurableModule`. Full mechanism: [Durability & replay](/docs/concepts/durability#deploys-versioning--multiple-instances)
 and [Reliability](/docs/reliability).
@@ -348,6 +362,13 @@ a pitfall of a stale local worker in [Tenancy](/docs/concepts/tenancy#pitfalls).
 rule and `assertReplayable` catch the code-level mistake; keeping workers and operator in lockstep on
 deploy is what keeps a *correct* version bump from still tripping over a stale process that hasn't
 picked it up yet.
+
+**Singleton workflows tolerate a rolling upgrade.** Replicas older than 0.73 admit
+[singleton](/docs/reliability/singleton) runs by a scan and write no admission marker. Newer replicas
+also count an old replica's untagged holder as holding its slot, so they don't start a second run
+for the key beside it. Old and new replicas can serve singleton workflows side by side while you
+roll out. While old replicas are still running, the fleet is only as strict as their scan, so finish
+the rollout. See [Store support and upgrades](/docs/reliability/singleton#store-support-and-upgrades).
 
 ## 7. Producer-only processes
 
