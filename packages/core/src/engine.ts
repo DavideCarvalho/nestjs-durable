@@ -4211,8 +4211,15 @@ export class WorkflowEngine {
     // mid-turn aborts cooperatively; on recovery (the broadcast was lost to a crash) this still settles
     // the run deterministically instead of resurrecting it by re-advancing.
     if (run.status === 'cancelling') {
+      // Zombie fence (as in settleRun): the new owner sees the same `cancelling` status and settles
+      // it itself; a stale turn writing here would emit, notify and broadcast the cancel twice.
+      if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
       const error = { message: 'cancelled' };
       await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
+      // The lease can be lost while that write is in flight. The write converges with the new
+      // owner's (both settle `cancelling` → `cancelled`), but the lifecycle event, the cancel
+      // notification and the control-plane broadcast are the new owner's to send, once.
+      if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
       this.emit({
         type: 'run.failed',
         runId: run.id,

@@ -1,4 +1,8 @@
-import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  RUN_HISTORY_FIXTURE_VERSION,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
 import { cancelRun, exportRun, inspect, parseDurationMs } from './inspect';
 
 async function storeWithRuns() {
@@ -112,7 +116,7 @@ describe('export', () => {
     const json = await exportRun(await storeWithRuns(), 'run1');
     expect(json).not.toBeNull();
     const parsed = JSON.parse(json as string);
-    expect(parsed.version).toBe(1);
+    expect(parsed.version).toBe(RUN_HISTORY_FIXTURE_VERSION);
     expect(parsed.run.id).toBe('run1');
     expect(parsed.checkpoints.map((c: { name: string }) => c.name)).toEqual([
       'reserveStock',

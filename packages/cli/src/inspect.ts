@@ -94,14 +94,23 @@ export function parseDurationMs(input: string): number | undefined {
 
 /**
  * A run's replayable history as a JSON fixture — the same format as the testing kit's
- * `serializeRunHistory` (`{ version: 1, run, checkpoints }`), so CI can assert it with
+ * `serializeRunHistory` (`{ version, run, checkpoints }`, `version` being core's shared
+ * `RUN_HISTORY_FIXTURE_VERSION`), so CI can assert it with
  * `assertReplayable(register, parseRunHistory(json))`. Returns `null` for an unknown run.
  */
 export async function exportRun(store: StateStore, runId: string): Promise<string | null> {
+  // Optional at runtime, like findStalledRuns: an older core (the peer range is wide) lacks it, and
+  // guessing the version would let the two fixture writers drift apart.
+  const version = (core as Partial<typeof core>).RUN_HISTORY_FIXTURE_VERSION;
+  if (typeof version !== 'number') {
+    throw new Error(
+      'export needs a newer @dudousxd/nestjs-durable-core (one that exports RUN_HISTORY_FIXTURE_VERSION).',
+    );
+  }
   const run = await store.getRun(runId);
   if (!run) return null;
   const checkpoints = await store.listCheckpoints(runId);
-  return `${JSON.stringify({ version: 1, run, checkpoints }, null, 2)}\n`;
+  return `${JSON.stringify({ version, run, checkpoints }, null, 2)}\n`;
 }
 
 function runsTable(runs: WorkflowRun[]): string {

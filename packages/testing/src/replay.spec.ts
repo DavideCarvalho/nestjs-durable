@@ -86,4 +86,30 @@ describe('replay fixtures (captureHistory / serializeRunHistory / parseRunHistor
   it('rejects JSON that is not a fixture', () => {
     expect(() => parseRunHistory('{"hello":1}')).toThrow(/not a run history fixture/);
   });
+
+  it('rejects a fixture written in another format version', async () => {
+    const { engine } = await runV1();
+    const history = await captureHistory(engine, 'run1');
+    if (!history) throw new Error('no history');
+    const future = JSON.stringify({ ...JSON.parse(serializeRunHistory(history)), version: 2 });
+    expect(() => parseRunHistory(future)).toThrow(/unsupported run history fixture version 2/);
+    const garbled = JSON.stringify({ ...JSON.parse(serializeRunHistory(history)), version: '1' });
+    expect(() => parseRunHistory(garbled)).toThrow(/unsupported run history fixture version/);
+  });
+
+  it('reads a pre-marker fixture (no version) as version 1', async () => {
+    const { engine } = await runV1();
+    const history = await captureHistory(engine, 'run1');
+    if (!history) throw new Error('no history');
+    const legacy = JSON.stringify(history);
+    await expect(assertReplayable(v1, parseRunHistory(legacy))).resolves.toBeUndefined();
+  });
+
+  it('parses what the CLI exports (one shared format version)', async () => {
+    const { store } = await runV1();
+    const { exportRun } = await import('../../cli/src/inspect');
+    const json = await exportRun(store, 'run1');
+    expect(JSON.parse(json as string).version).toBe(RUN_HISTORY_FIXTURE_VERSION);
+    await expect(assertReplayable(v1, parseRunHistory(json as string))).resolves.toBeUndefined();
+  });
 });

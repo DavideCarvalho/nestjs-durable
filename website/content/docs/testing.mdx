@@ -156,7 +156,7 @@ it('replays the recorded fixture against the current workflow code', async () =>
 | --- | --- |
 | `captureHistory(source, runId)` | `{ run, checkpoints }` from anything with `getRun` + `listCheckpoints` (an engine or a store); `null` for an unknown run |
 | `serializeRunHistory(history)` | pretty JSON with a format marker (`version: 1`) and a trailing newline, the same format `durable export` writes |
-| `parseRunHistory(json)` | back to a `RunHistory` with real `Date`s; throws on JSON that isn't a fixture |
+| `parseRunHistory(json)` | back to a `RunHistory` with real `Date`s; throws on JSON that isn't a fixture, or on a fixture whose `version` isn't `RUN_HISTORY_FIXTURE_VERSION` (a fixture with no `version` is read as version 1) |
 | `assertReplayable(register, history)` | replays the history against the current code; throws `NonDeterminismError` on divergence |
 
 A fixture holds the run's payloads (input, outputs, step logs, errors), decoded if your store is

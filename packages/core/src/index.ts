@@ -6,6 +6,7 @@ export * from './durable-workflow';
 export * from './duration';
 export * from './engine';
 export * from './stalled-runs';
+export * from './run-history';
 export * from './entities';
 export * from './errors';
 export * from './handshake/index';

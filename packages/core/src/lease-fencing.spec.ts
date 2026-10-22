@@ -153,3 +153,63 @@ describe('drain() releases leases on timeout', () => {
     expect((await store.getRun('r1'))?.lockedBy).toBe('e2');
   });
 });
+
+describe('lease takeover fencing on the remote cancelling settle', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('a fenced turn neither emits nor notifies the cancel the new owner will settle', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // The `cancelled` write stalls past expiry; meanwhile e2 takes the run over.
+    class SlowCancelStore extends InMemoryStateStore {
+      override async updateRun(
+        runId: string,
+        patch: Parameters<InMemoryStateStore['updateRun']>[1],
+      ): Promise<void> {
+        if (patch.status === 'cancelled') {
+          await this.releaseRunLock(runId);
+          await this.tryLockRun(runId, 'e2', Date.now() + 60_000, Date.now());
+          await sleep(150); // > leaseMs / 2: e1's renewal runs, reports the lease lost
+        }
+        return super.updateRun(runId, patch);
+      }
+    }
+    const store = new SlowCancelStore();
+    const engine = new WorkflowEngine({
+      store,
+      instanceId: 'e1',
+      leaseMs: 100,
+      runDispatcher: noDispatch,
+    });
+    engine.registerRemote('remote-wf', '1', {
+      group: 'py',
+      executor: {
+        async advance() {
+          throw new Error('a cancelling run must not be advanced');
+        },
+      },
+    });
+    const now = new Date();
+    await store.createRun({
+      id: 'r1',
+      workflow: 'remote-wf',
+      workflowVersion: '1',
+      status: 'cancelling',
+      input: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+    const events: string[] = [];
+    engine.subscribe((e) => {
+      if (e.runId === 'r1') events.push(e.type);
+    });
+    const cancelled: string[] = [];
+    engine.onCancel((runId) => cancelled.push(runId));
+
+    await engine.runOne('r1');
+    expect(events).not.toContain('run.failed');
+    expect(cancelled).toEqual([]);
+    expect((await store.getRun('r1'))?.lockedBy).toBe('e2');
+  });
+});

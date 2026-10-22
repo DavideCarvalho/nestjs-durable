@@ -1,5 +1,6 @@
 import {
   InMemoryStateStore,
+  RUN_HISTORY_FIXTURE_VERSION,
   type StepCheckpoint,
   WorkflowEngine,
   type WorkflowRun,
@@ -10,8 +11,9 @@ export interface RunHistory {
   checkpoints: StepCheckpoint[];
 }
 
-/** Format marker of a fixture written by {@link serializeRunHistory} (and `durable export`). */
-export const RUN_HISTORY_FIXTURE_VERSION = 1;
+/** Format marker of a fixture written by {@link serializeRunHistory} (and `durable export`). Defined
+ *  in core so the CLI writes the same value; re-exported here for fixture authors. */
+export { RUN_HISTORY_FIXTURE_VERSION };
 
 /**
  * Capture a run's replayable history (the run row + its full checkpoint timeline) from anything with
@@ -44,11 +46,25 @@ export function serializeRunHistory(history: RunHistory): string {
  * Parse a committed fixture (what {@link serializeRunHistory} / `durable export` writes) back into a
  * {@link RunHistory}, reviving the `Date` fields JSON flattened to ISO strings, so
  * `assertReplayable(register, parseRunHistory(readFileSync('fixture.json', 'utf8')))` just works.
+ *
+ * Throws on a fixture whose `version` is not {@link RUN_HISTORY_FIXTURE_VERSION}: a fixture written
+ * in another format would otherwise replay against the wrong shape. A fixture with NO `version` (a
+ * hand-built `{ run, checkpoints }`, the shape these docs showed before the marker existed) is read
+ * as version 1.
  */
 export function parseRunHistory(json: string): RunHistory {
-  const raw = JSON.parse(json) as { run?: WorkflowRun; checkpoints?: StepCheckpoint[] };
+  const raw = JSON.parse(json) as {
+    version?: unknown;
+    run?: WorkflowRun;
+    checkpoints?: StepCheckpoint[];
+  };
   if (!raw || typeof raw !== 'object' || !raw.run || !Array.isArray(raw.checkpoints)) {
     throw new Error('not a run history fixture: expected { run, checkpoints }');
+  }
+  if (raw.version !== undefined && raw.version !== RUN_HISTORY_FIXTURE_VERSION) {
+    throw new Error(
+      `unsupported run history fixture version ${JSON.stringify(raw.version)} (this kit reads version ${RUN_HISTORY_FIXTURE_VERSION}); re-export the fixture or upgrade @dudousxd/nestjs-durable-testing`,
+    );
   }
   const date = (v: unknown): Date => new Date(v as string | number | Date);
   const run: WorkflowRun = {
