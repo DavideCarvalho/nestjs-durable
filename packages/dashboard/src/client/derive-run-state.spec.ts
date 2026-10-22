@@ -239,7 +239,7 @@ describe('deriveRunState', () => {
         step({ kind: 'signal', name: 'validate', status: 'failed' }),
         step({
           kind: 'signal',
-          name: `signal:child:${run().id}.onError`,
+          name: `signal:child:${run().id}.onError.0`,
           status: 'running',
           input: { workflow: 'line.onError.invalid', input: {} },
         }),

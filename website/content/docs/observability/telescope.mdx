@@ -23,7 +23,8 @@ TelescopeModule.forRoot({
 
 The watcher resolves the engine from the (global) durable providers and records one entry per
 lifecycle event (`run.started`, `step.completed`, `run.completed`, `run.failed`, …), tagged
-`workflow:<name>`, `run:<id>`, `kind:<step-kind>`, and `failed` on failures — so you can filter
+`workflow:<name>`, `run:<id>`, `kind:<step-kind>`, `failed` on failures, and `routed` / `unrouted`
+plus `onError:<code>` on a failure handed to (or not applicable to) an onError handler — so you can filter
 and group durable activity in the Telescope UI. A child run started by `ctx.all`, `ctx.child` or
 `ctx.startChild` (without a caller-chosen id) is also tagged `parent:<parent run id>`, and carries
 `parentRunId` in its content: each child has its own trace, so filtering on `parent:<id>` is how

@@ -8,9 +8,10 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { OnError, Workflow } from './decorators';
 import { DurableModule } from './durable.module';
+import { WorkflowRegistrar } from './workflow.registrar';
 
 class InvalidLine extends FatalError {
   static readonly code = 'invalid_line';
@@ -104,7 +105,7 @@ describe('@OnError', () => {
     expect(deadLetters.stored).toEqual([
       { line: { n: 3, amount: 'x' }, error: 'line 3: amount is not a number', runId: 'r1' },
     ]);
-    expect((await store.getRun('r1.onError'))?.workflow).toBe('line.onError.invalid');
+    expect((await store.getRun('r1.onError.0'))?.workflow).toBe('line.onError.invalid');
   });
 
   it('routes a code from @Workflow({ onError }) to a separate workflow', async () => {
@@ -141,5 +142,52 @@ describe('@OnError', () => {
   it('rejects an error class without a static code', () => {
     class NoCode extends Error {}
     expect(() => OnError(NoCode as unknown as { code: string })).toThrow('no static `code`');
+  });
+});
+
+@Workflow({ name: 'misrouted', version: '1', onError: [{ code: 'x', workflow: 'handler-later' }] })
+class MisroutedWorkflow {
+  async run() {
+    return 'ok';
+  }
+}
+
+describe('the boot warning for an unserved onError route', () => {
+  async function bootMisrouted() {
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          store: new InMemoryStateStore(),
+          transport: new InMemoryTransport(),
+        }),
+      ],
+      providers: [MisroutedWorkflow],
+    }).compile();
+    await moduleRef.init();
+    return { engine: moduleRef.get(WorkflowEngine), registrar: moduleRef.get(WorkflowRegistrar) };
+  }
+
+  it('warns about a route still unserved after the recheck', async () => {
+    const { registrar } = await bootMisrouted();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await registrar.reportUnservedOnErrorRoutes(5);
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('misrouted → handler-later (code x)'),
+    );
+    warn.mockRestore();
+  });
+
+  it('stays quiet when the handler appears before the recheck', async () => {
+    const { engine, registrar } = await bootMisrouted();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const report = registrar.reportUnservedOnErrorRoutes(20);
+    engine.register('handler-later', '1', async () => 'handled');
+    await report;
+
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('handler-later'));
+    warn.mockRestore();
   });
 });

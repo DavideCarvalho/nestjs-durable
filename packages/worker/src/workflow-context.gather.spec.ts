@@ -252,13 +252,24 @@ describe('WorkflowContext.allSettled', () => {
   it('resolves with every outcome in input order instead of throwing', async () => {
     const history: HistoryEvent[] = [
       { seq: 0, kind: 'child', name: 'child', output: 'a' },
-      { seq: 1, kind: 'child', name: 'child', error: { message: 'boom' } },
+      {
+        seq: 1,
+        kind: 'child',
+        name: 'child',
+        error: { message: 'boom', code: 'invalid_line', details: { field: 'amount' } },
+      },
       { seq: 2, kind: 'child', name: 'child', output: 'c' },
     ];
     const ctx = new WorkflowContext('r1', history);
     expect(await ctx.allSettled('child', [{ x: 1 }, { x: 2 }, { x: 3 }])).toEqual([
       { status: 'fulfilled', value: 'a' },
-      { status: 'rejected', id: 'r1.child.1', error: 'boom' },
+      {
+        status: 'rejected',
+        id: 'r1.child.1',
+        error: 'boom',
+        code: 'invalid_line',
+        details: { field: 'amount' },
+      },
       { status: 'fulfilled', value: 'c' },
     ]);
   });
@@ -267,5 +278,18 @@ describe('WorkflowContext.allSettled', () => {
     const ctx = new WorkflowContext('r1', []);
     expect(await ctx.allSettled('child', [])).toEqual([]);
     expect(ctx.commands).toHaveLength(0);
+  });
+});
+
+describe('toError', () => {
+  it('carries a thrown error’s code and details onto the wire error', async () => {
+    const { toError } = await import('./errors');
+    const { FatalError } = await import('@dudousxd/nestjs-durable-core');
+    expect(toError(new FatalError('bad', 'invalid', { field: 'amount' }))).toMatchObject({
+      message: 'bad',
+      code: 'invalid',
+      details: { field: 'amount' },
+      retryable: false,
+    });
   });
 });

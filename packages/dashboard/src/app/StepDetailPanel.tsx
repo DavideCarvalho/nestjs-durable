@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 import { durableClient } from '../client/durable-client';
-import type { StepCheckpoint, StepEvent, WorkflowRun } from '../client/durable-client';
+import type { StepCheckpoint, StepError, StepEvent, WorkflowRun } from '../client/durable-client';
 import { type SubProcess, groupSubProcesses } from '../client/group-subprocesses';
 import { RunSpans } from './SpansTimeline';
 import { childRunIdOf } from './child-link';
@@ -246,6 +246,28 @@ export function Json({ label, value }: { label: string; value: unknown }) {
   );
 }
 
+/** A failure: its message, its machine `code` and, when it carries any, its structured `details`. */
+export function ErrorBlock({ error }: { error: StepError }) {
+  return (
+    <>
+      <section className="rise">
+        <div className="mono mb-1.5 flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-red-400/80">
+          <span>error</span>
+          {error.code && (
+            <span className="rounded border border-red-500/30 px-1.5 py-px normal-case tracking-normal text-red-300">
+              {error.code}
+            </span>
+          )}
+        </div>
+        <div className="mono rounded-lg border border-red-500/25 bg-red-500/10 p-3 text-[11.5px] leading-relaxed text-red-200">
+          {error.message}
+        </div>
+      </section>
+      {error.details !== undefined && <Json label="error details" value={error.details} />}
+    </>
+  );
+}
+
 function Field({ k, v, mono = true }: { k: string; v: React.ReactNode; mono?: boolean }) {
   return (
     <div className="flex items-baseline justify-between gap-3 py-1.5">
@@ -396,16 +418,7 @@ export function StepDetailPanel({
           <Field k="offset" v={`+${sinceStart}`} />
         </div>
 
-        {failed && step.error && (
-          <section className="rise">
-            <div className="mono mb-1.5 text-[10px] uppercase tracking-[0.18em] text-red-400/80">
-              error
-            </div>
-            <div className="mono rounded-lg border border-red-500/25 bg-red-500/10 p-3 text-[11.5px] leading-relaxed text-red-200">
-              {step.error.message}
-            </div>
-          </section>
-        )}
+        {failed && step.error && <ErrorBlock error={step.error} />}
 
         {step.events && step.events.length > 0 && <StepEvents events={step.events} />}
 

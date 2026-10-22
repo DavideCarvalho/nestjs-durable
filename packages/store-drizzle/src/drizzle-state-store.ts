@@ -658,7 +658,9 @@ export class DrizzleStateStore implements StateStore {
         ),
       )
       .orderBy(asc(stepCheckpoints.seq));
-    return rows.map(fromCheckpointRow);
+    // `LIKE` reads `_` and `%` in the prefix as wildcards, so it can match more than the prefix: keep
+    // only the exact matches.
+    return rows.filter((r) => prefixes.some((p) => r.name.startsWith(p))).map(fromCheckpointRow);
   }
 
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
@@ -698,12 +700,16 @@ export class DrizzleStateStore implements StateStore {
       .select()
       .from(signalWaiters)
       .where(like(signalWaiters.token, `${prefix}%`));
-    return rows.map((r) => ({
-      token: r.token,
-      runId: r.runId,
-      seq: r.seq,
-      parallelGroup: r.parallelGroup ?? undefined,
-    }));
+    // `LIKE` reads `_` and `%` in the prefix as wildcards, so it can match more than the prefix: keep
+    // only the exact matches.
+    return rows
+      .filter((r) => r.token.startsWith(prefix))
+      .map((r) => ({
+        token: r.token,
+        runId: r.runId,
+        seq: r.seq,
+        parallelGroup: r.parallelGroup ?? undefined,
+      }));
   }
 
   async registerChildWaits(entries: ChildWait[]): Promise<void> {

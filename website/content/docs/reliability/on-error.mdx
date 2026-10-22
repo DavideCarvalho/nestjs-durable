@@ -53,15 +53,47 @@ language.
 1. The run's body fails with an error carrying `code: 'invalid_line'`. Saga compensations of the body
    run, as for any failure.
 2. Instead of marking the run `failed`, the engine starts the handler as its own run, with the id
-   `<runId>.onError` and an `OnErrorInput` (`{ runId, workflow, input, error }`), and suspends the failed
-   run on it the way a parent waits for a `ctx.child`.
+   `<runId>.onError.<attempt>` and an `OnErrorInput` (`{ runId, workflow, input, error }`), tags the run
+   `onError:<code>`, emits `run.routed`, and suspends the failed run on the handler the way a parent
+   waits for a `ctx.child`.
 3. From then on the run only follows its handler: the body is never run again, not by a recovery wake
    nor by a manual resume. When the handler finishes, the run settles with its outcome: `completed`
    with the handler's output, or `failed` with the handler's error.
 
-The handler is an ordinary durable run: it shows up in the dashboard, its steps are checkpointed and
-retried, and the wait survives a crash like any child wait. A `@OnError` method is registered as the
-workflow `<workflow>.onError.<method>` and shares the class's injected dependencies.
+The handler is an ordinary durable run: it shows up in the dashboard linked to the run it handles, its
+steps are checkpointed and retried, and the wait survives a crash like any child wait. A `@OnError`
+method is registered as the workflow `<workflow>.onError.<method>` and shares the class's injected
+dependencies. The `onError:<code>` tag makes the handled runs a filter away in the console.
+
+## The failure's details
+
+`error` carries the failure's `message`, `code` and `details`. `details` is whatever JSON-serializable
+value the failure was raised with, so a handler can record exactly what went wrong:
+
+```ts
+// in the step
+const parsed = LineSchema.safeParse(line);
+if (!parsed.success) throw new InvalidLine(`line ${line.n} is invalid`, parsed.error.issues);
+
+// FatalError(message, code, details)
+class InvalidLine extends FatalError {
+  static readonly code = 'invalid_line';
+  constructor(message: string, issues: unknown) {
+    super(message, InvalidLine.code, issues);
+  }
+}
+
+// in the handler: failure.error.details is the issues array
+```
+
+In Python: `raise FatalError("line 3 is invalid", "invalid_line", details=issues)`.
+
+## Retrying a run
+
+Retrying a failed run (from the console, or `engine.requeue`) runs its **body** again. A handoff the run
+made before is retired: it stays in the timeline, renamed `onError:retried:<handler id>`, and is never
+followed again, and the run's `onError:<code>` tag is removed. If the body fails again, the engine hands
+the new failure to a new handler run (`<runId>.onError.1`, then `.2`, …), tagged again.
 
 ## Matching
 
@@ -101,7 +133,21 @@ def line(ctx, input): ...
 
 The handler can be a workflow of any runtime; the engine only starts a run by name. If the live workers
 announce different routes for the workflow (a rollout in progress), the failure is not routed, the same
-way two announced versions leave a run's version undeclared.
+way two announced versions leave a run's version undeclared, and the engine emits `run.unrouted` with
+the reason. The engine reuses what it read for a few seconds, so a burst of failures costs one read.
+
+## Catching a misnamed handler
+
+After boot, the Nest module warns about any route whose handler workflow is neither registered in the
+process nor served by a live worker, so a typo shows up before the first failure goes nowhere. A route
+unserved at boot is checked again 30 seconds later before it is reported, so a handler whose workers
+start after the API is not flagged. The same check is `engine.unservedOnErrorRoutes()`.
+
+## Seeing it
+
+The console shows the failure's `code` and its `details` (as JSON) on the failed step and on a failed
+run. Handoffs are counted as `routed` in the [metrics](/docs/observability/metrics), marked on the run's
+[OpenTelemetry](/docs/observability/otel) span, and tagged `routed` in [Telescope](/docs/observability/telescope).
 
 ## A handler in another workflow
 

@@ -363,7 +363,7 @@ All exported from `@dudousxd/nestjs-durable-core`.
 
 | Error | Thrown when |
 | --- | --- |
-| `FatalError` | Thrown BY YOU inside a step/workflow for an unrecoverable business failure (e.g. a declined card) — the engine never retries it, in a local or a dispatched step, and fails the run immediately. |
+| `FatalError` | `new FatalError(message, code?, details?)` — thrown BY YOU inside a step/workflow for an unrecoverable business failure (e.g. a declined card) — the engine never retries it, in a local or a dispatched step, and fails the run immediately. `code` and `details` travel with the failure to the run's error, a parent's `allSettled` item or `ctx.child` catch, and an onError handler. |
 | `SignalTimeoutError` | `ctx.waitForSignal` / `ctx.waitForEvent` / `ctx.onUpdate`'s `timeoutMs` deadline passes before delivery. Catchable in the workflow to take a default branch. |
 | `NonDeterminismError` | On resume, the step at a logical position has a different name/kind than its checkpoint — the workflow code changed under an in-flight run without a new `@Workflow` version. See [Versioning & determinism](/docs/authoring/versioning). |
 | `NestedWorkflowCallError` | A ctx primitive (`ctx.startChild`/`child`/`step`/`sleep`/`sideEffect`/…, or a `MyWorkflow.start()`/`.execute()` static via the ambient ctx) was called from INSIDE a step body (`ctx.localStep`/`transaction`/`sideEffect`/`now`). Thrown at the call site, as a `FatalError` (code `nested_workflow_call`). See [Troubleshooting](/docs/troubleshooting#nestedworkflowcallerror-a-ctx-call-inside-a-step-body). |

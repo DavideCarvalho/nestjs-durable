@@ -103,12 +103,15 @@ def sub_process(
 class FatalError(Exception):
     """Raise inside a handler to signal a non-retryable failure (mirrors the TS ``FatalError``).
 
-    The engine will not retry the step regardless of its ``retries`` setting.
+    The engine will not retry the step regardless of its ``retries`` setting. ``details`` is any
+    JSON-serializable value that rides the wire error next to ``code`` (e.g. a validation's issues),
+    and reaches an ``onError`` handler as ``error["details"]``.
     """
 
-    def __init__(self, message: str, code: str | None = None) -> None:
+    def __init__(self, message: str, code: str | None = None, details: Any = None) -> None:
         super().__init__(message)
         self.code = code
+        self.details = details
 
 
 class StepContext:
@@ -785,6 +788,8 @@ class Worker:
         # the case where the sub-process outcomes matter most.
         if isinstance(err, FatalError):
             error = {"message": str(err), "code": err.code, "retryable": False}
+            if err.details is not None:
+                error["details"] = err.details
         else:
             error = {"message": str(err)}
         return _with_events({**base, "status": "failed", "error": error}, ctx)

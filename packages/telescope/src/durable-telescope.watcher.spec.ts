@@ -1,4 +1,5 @@
 import {
+  FatalError,
   InMemoryStateStore,
   WorkflowEngine,
   clearDurableExecutionWrappers,
@@ -121,6 +122,27 @@ describe('DurableTelescopeWatcher', () => {
 
     const failed = records.find((r) => (r.content as { event: string }).event === 'run.failed');
     expect(failed?.tags).toContain('failed');
+  });
+
+  it('tags a handoff to an onError handler with "routed" and its code', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const records: RecordInput[] = [];
+    new DurableTelescopeWatcher().register(fakeCtx(engine, records));
+    engine.register('dlq', '1', async () => 'handled');
+    engine.register(
+      'line',
+      '1',
+      async () => {
+        throw new FatalError('bad line', 'invalid_line');
+      },
+      { onError: [{ code: 'invalid_line', workflow: 'dlq' }] },
+    );
+    await engine.start('line', {}, 'r');
+    await engine.waitForRun('r', { until: 'terminal' });
+
+    const routed = records.find((r) => (r.content as { event: string }).event === 'run.routed');
+    expect(routed?.tags).toEqual(expect.arrayContaining(['routed', 'onError:invalid_line']));
+    expect((routed?.content as { name?: string }).name).toBe('dlq');
   });
 
   it('records durationMs from run.completed events', () => {

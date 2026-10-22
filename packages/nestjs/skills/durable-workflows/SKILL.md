@@ -148,7 +148,7 @@ const results = await ctx.all(this.lines.processLine, lines, { concurrency: 500 
 
 When a failed item is an expected outcome rather than a reason to fail the run, use
 `ctx.allSettled` instead: the same fan, resolving with `{ status: 'fulfilled', value }` or
-`{ status: 'rejected', id, error }` per input, in input order, and never throwing for an item. Throw
+`{ status: 'rejected', id, error, code?, details? }` per input, in input order, and never throwing for an item. The rejected `code`/`details` are the `FatalError`'s (absent for a plain `Error`). Throw
 `FatalError` in the step for a failure a retry can't fix (a schema mismatch); it settles as rejected
 without spending the retries:
 
@@ -290,7 +290,7 @@ Any thrown error is retried to the step's limit; only `FatalError` short-circuit
 
 When a failure is an expected outcome rather than a reason to fail the run (a line that fails
 validation), route its code to an `@OnError` handler. The engine starts the handler workflow
-(`<workflow>.onError.<method>`) as run `<runId>.onError` with `{ runId, workflow, input, error }`
+(`<workflow>.onError.<method>`) as run `<runId>.onError.<attempt>` with `{ runId, workflow, input, error }`
 when the run fails with that code, and the run settles with the handler's outcome (its output, or
 its error when the handler fails); the body never runs again, so a `ctx.all` over the workflow
 keeps going. It works for remote (Python) bodies too:
@@ -307,6 +307,8 @@ async invalid(ctx: WorkflowCtx, failure: OnErrorInput<Line>): Promise<LineResult
 }
 ```
 
+`error.details` is the third argument of `FatalError(message, code, details)` (e.g. validation
+issues). Retrying the run runs its body again; a new failure goes to a new handler run.
 It matches on `code`, never `instanceof`, must return `run`'s output type, and never sees
 cancellation (a `cancelled` run never routes), `nested_workflow_call` ctx misuse, or `non_determinism`
 (`NonDeterminismError` carries `code: 'non_determinism'`). `@Workflow({ onError: [{ code, workflow }] })` routes to another workflow.
