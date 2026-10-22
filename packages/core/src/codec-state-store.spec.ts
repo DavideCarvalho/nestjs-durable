@@ -91,6 +91,14 @@ describe('CodecStateStore', () => {
     });
     const orphans = await store.listOrphanedRuns?.(now.getTime(), 10);
     expect(orphans?.map((r) => r.input)).toEqual([{ secret: 'value' }]);
+    // The own-lease reclaim argument reaches the inner store.
+    await inner.tryLockRun('r1', 'self', now.getTime() + 100, now.getTime());
+    expect(await store.listOrphanedRuns?.(now.getTime(), 10)).toEqual([]);
+    const owned = await store.listOrphanedRuns?.(now.getTime(), 10, undefined, {
+      owner: 'self',
+      lockedBefore: now.getTime() + 101,
+    });
+    expect(owned?.map((r) => r.input)).toEqual([{ secret: 'value' }]);
 
     Object.defineProperty(inner, 'listOrphanedRuns', { value: undefined });
     expect(new CodecStateStore(inner, wrapCodec).listOrphanedRuns).toBeUndefined();

@@ -2,6 +2,7 @@ import type {
   CheckpointQuery,
   CheckpointStat,
   ChildWait,
+  OwnedLeaseReclaim,
   RetentionPolicy,
   RunFacetQuery,
   RunFacetRow,
@@ -77,6 +78,7 @@ export class CodecStateStore implements StateStore {
     nowMs: number,
     limit: number,
     namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
   ) => Promise<WorkflowRun[]>;
 
   /** Encodes the patch like {@link updateRun}. Bound only when the inner store has it, so the
@@ -156,8 +158,8 @@ export class CodecStateStore implements StateStore {
     if (deleteRuns) this.deleteRuns = (ids) => deleteRuns.call(inner, ids);
     const orphans = inner.listOrphanedRuns;
     if (orphans)
-      this.listOrphanedRuns = async (nowMs, limit, namespace) =>
-        (await orphans.call(inner, nowMs, limit, namespace)).map(
+      this.listOrphanedRuns = async (nowMs, limit, namespace, ownedBy) =>
+        (await orphans.call(inner, nowMs, limit, namespace, ownedBy)).map(
           (r) => this.decRun(r) as WorkflowRun,
         );
     const updateIf = inner.updateRunIf;

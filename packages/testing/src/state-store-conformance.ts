@@ -1,5 +1,6 @@
 import {
   SINGLETON_ADMITTED_TAG,
+  SINGLETON_TRACKED_TAG,
   type ScheduleQuery,
   type ScheduleRecord,
   type StateStore,
@@ -199,8 +200,10 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     );
 
     t('competing store instances atomically claim an empty singleton slot', async () => {
+      // `running` and tracked: the engine stamps SINGLETON_TRACKED_TAG on a run's first execution,
+      // before it claims (an untracked untagged running run reads as a pre-0.73 holder, below).
       for (const id of ['a-first', 'b-second', 'c-third']) {
-        await store.createRun(run({ id, tags: ['singleton:k'] }));
+        await store.createRun(run({ id, tags: ['singleton:k', SINGLETON_TRACKED_TAG] }));
       }
       const results = await Promise.all([
         peerStore.tryAdmitSingleton?.('b-second', 'singleton:k', 'checkout', 1),
@@ -242,6 +245,89 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         run({ id: 'other-workflow', workflow: 'other', tags: ['singleton:k'] }),
       );
       expect(await claim('other-workflow', 'singleton:k', 'other')).toBe(true);
+    });
+
+    // A replica older than 0.73 admits by a scan (the `limit` oldest running/suspended/cancelling
+    // runs of the key) and writes no admission tag. During a rolling upgrade such a holder must
+    // still occupy its slot for the new replicas.
+    const created = (offset: number) => new Date(at.getTime() + offset * 1_000);
+
+    t('singleton admission counts an untagged pre-0.73 holder (rolling upgrade)', async () => {
+      const claim = (id: string, wakeAt?: number) =>
+        store.tryAdmitSingleton?.(id, 'singleton:k', 'checkout', 1, wakeAt);
+      // Written by an old replica: admitted by its scan, running, no admission tag. It is NEWER
+      // than the run below, which was still `pending` (invisible to the old scan) back then.
+      await store.createRun(run({ id: 'legacy', tags: ['singleton:k'], createdAt: created(1) }));
+      // The older run, now picked up by a new replica: tracked from its first execution.
+      await store.createRun(
+        run({ id: 'new', tags: ['singleton:k', SINGLETON_TRACKED_TAG], createdAt: created(0) }),
+      );
+      expect(await claim('new', 12_000)).toBe(false);
+      expect(await store.getRun('new')).toMatchObject({ status: 'suspended', wakeAt: 12_000 });
+      expect((await store.getRun('new'))?.tags).toContain(SINGLETON_TRACKED_TAG);
+      // A legacy holder parked on its own sleep still holds the slot.
+      await store.updateRun('legacy', { status: 'suspended', wakeAt: 20_000 });
+      expect(await claim('new')).toBe(false);
+      // Once it settles, the new admission takes over.
+      await store.updateRun('legacy', { status: 'completed' });
+      expect(await claim('new')).toBe(true);
+      expect((await store.getRun('new'))?.tags).toEqual(['singleton:k', SINGLETON_ADMITTED_TAG]);
+      await store.updateRun('new', { status: 'completed' });
+      expect((await store.getRun('new'))?.tags).toEqual(['singleton:k']);
+    });
+
+    t('legacy singleton waiters keep their FIFO place across the upgrade', async () => {
+      const claim = (id: string) => store.tryAdmitSingleton?.(id, 'singleton:k', 'checkout', 1);
+      await store.createRun(run({ id: 'holder', tags: ['singleton:k'], createdAt: created(0) }));
+      // Denied by an old replica: suspended on its retry timer, no tag.
+      await store.createRun(
+        run({
+          id: 'old-waiter',
+          status: 'suspended',
+          wakeAt: 5_000,
+          tags: ['singleton:k'],
+          createdAt: created(1),
+        }),
+      );
+      await store.createRun(
+        run({ id: 'new-run', tags: ['singleton:k', SINGLETON_TRACKED_TAG], createdAt: created(2) }),
+      );
+      expect(await claim('new-run')).toBe(false);
+      expect(await claim('old-waiter')).toBe(false);
+      // A legacy waiter re-checked by a new replica is tracked from then on; it keeps its place.
+      expect(
+        await store.tryAdmitSingleton?.('old-waiter', 'singleton:k', 'checkout', 1, 6_000),
+      ).toBe(false);
+      expect((await store.getRun('old-waiter'))?.tags).toContain(SINGLETON_TRACKED_TAG);
+      await store.updateRun('holder', { status: 'completed' });
+      expect(await claim('new-run')).toBe(false);
+      expect(await claim('old-waiter')).toBe(true);
+      expect(await claim('new-run')).toBe(false);
+      await store.updateRun('old-waiter', { status: 'completed' });
+      expect(await claim('new-run')).toBe(true);
+    });
+
+    t('concurrent claims never over-admit beside an untagged legacy holder', async () => {
+      await store.createRun(run({ id: 'legacy', tags: ['singleton:k'], createdAt: created(0) }));
+      const ids = ['c1', 'c2', 'c3', 'c4'];
+      for (const [i, id] of ids.entries()) {
+        await store.createRun(
+          run({ id, tags: ['singleton:k', SINGLETON_TRACKED_TAG], createdAt: created(i + 1) }),
+        );
+      }
+      const results = await Promise.all(
+        [...ids]
+          .reverse()
+          .map((id, i) =>
+            (i % 2 ? peerStore : store).tryAdmitSingleton?.(id, 'singleton:k', 'checkout', 2),
+          ),
+      );
+      // One slot is the legacy holder's; only the oldest new run takes the other.
+      expect(results).toEqual([false, false, false, true]);
+      const active = await store.listRuns({ workflow: 'checkout', statuses: ['running'] });
+      expect(
+        active.filter((r) => r.tags?.includes(SINGLETON_ADMITTED_TAG)).map((r) => r.id),
+      ).toEqual(['c1']);
     });
 
     // ---- create / get / update --------------------------------------------------------------
@@ -597,6 +683,32 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(await store.listOrphanedRuns(NOW, 0)).toEqual([]);
       },
     );
+
+    t("listOrphanedRuns also returns the owner's live leases taken before its cutoff", async () => {
+      if (!store.listOrphanedRuns) return;
+      const created = (offset: number) => new Date(at.getTime() + offset * 1_000);
+      // Live leases (expiring after NOW) left by a previous process of instance `pod-a`.
+      await store.createRun(run({ id: 'own-old', createdAt: created(1) }));
+      expect(await store.tryLockRun('own-old', 'pod-a', NOW + 10_000, NOW)).toBe(true);
+      await store.createRun(run({ id: 'own-new', createdAt: created(2) }));
+      expect(await store.tryLockRun('own-new', 'pod-a', NOW + 30_000, NOW)).toBe(true);
+      await store.createRun(run({ id: 'foreign', createdAt: created(3) }));
+      expect(await store.tryLockRun('foreign', 'pod-b', NOW + 10_000, NOW)).toBe(true);
+      await store.createRun(run({ id: 'own-parked', status: 'suspended', createdAt: created(4) }));
+      expect(await store.tryLockRun('own-parked', 'pod-a', NOW + 10_000, NOW)).toBe(true);
+      await store.createRun(run({ id: 'free', createdAt: created(5) }));
+
+      const ownedBy = { owner: 'pod-a', lockedBefore: NOW + 30_000 };
+      expect((await store.listOrphanedRuns(NOW, 10)).map((r) => r.id)).toEqual(['free']);
+      expect((await store.listOrphanedRuns(NOW, 10, undefined, ownedBy)).map((r) => r.id)).toEqual([
+        'own-old',
+        'free',
+      ]);
+      expect((await store.listOrphanedRuns(NOW, 1, undefined, ownedBy)).map((r) => r.id)).toEqual([
+        'own-old',
+      ]);
+      expect((await store.listOrphanedRuns(NOW, 10, 'beta', ownedBy)).map((r) => r.id)).toEqual([]);
+    });
 
     t('updateRunIf writes only over an expected status', async () => {
       // Optional on the interface (the engine falls back to read-then-write, which keeps a race
