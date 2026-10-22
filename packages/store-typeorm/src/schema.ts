@@ -310,6 +310,13 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
         'durable_runs_namespace_status_idx',
         `${runs} (${runsCol('namespace')}, ${runsCol('status')}, ${runsCol('createdAt')})`,
       ],
+      // A run's checkpoints by fan, in seq order: the run detail's per-group aggregates and fan
+      // pages. `parallel_group` is `varchar(191)` in this DDL (also when added by ALTER above), so
+      // MySQL can key it without a prefix length.
+      [
+        'durable_step_checkpoints_group_idx',
+        `${checkpoints} (${cpCol('runId')}, ${cpCol('parallelGroup')}, ${cpCol('seq')})`,
+      ],
       // A run's waiters: the `ctx.all` join barrier probes them once per settled child.
       ['durable_signal_waiters_run_id_idx', `${waiters} (${waiterCol('runId')})`],
       // buffered signals are taken FIFO per token (smallest id) — index the token for the scan.
