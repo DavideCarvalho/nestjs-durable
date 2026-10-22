@@ -486,7 +486,8 @@ class Worker:
         requires: Optional["list[str]"] = None,
         origin: Optional[str] = None,
         on_error: Optional[List[Dict[str, str]]] = None,
-    ) -> Callable[[Handler], Handler]:
+        factory: Optional[Callable[[type], Any]] = None,
+    ) -> Callable[[Any], Any]:
         """Decorator registering ``fn`` as the workflow ``name`` on THIS worker (unified worker).
 
         ``fn(ctx, input)`` (or ``fn(ctx)``) — same authoring surface as
@@ -523,10 +524,23 @@ class Worker:
             @line.on_error("invalid_line")
             def reject_line(ctx, failure):  # {"runId", "workflow", "input", "error"}
                 return {"ok": 0, "failed": 1}
+
+        It decorates a class too: the instance's ``run(self, ctx, input)`` is the body and each method
+        marked :func:`durable_worker.on_error` is a handler (``<name>.onError.<method>``). The class is
+        instantiated once, at registration, with ``factory(cls)`` (default ``cls()``) — pass a factory
+        to build it with its dependencies — and can then be passed wherever a workflow name is::
+
+            @worker.workflow("line")
+            class LineWorkflow:
+                def run(self, ctx, line): ...
+
+                @on_error(InvalidLine)
+                def reject_line(self, ctx, failure): ...
+
+            ctx.all_settled(LineWorkflow, lines)
         """
 
-        def register(fn: Handler) -> Handler:
-            self._workflows[name] = fn
+        def register(target: Any) -> Any:
             meta: Dict[str, Any] = {}
             if version is not None:
                 meta["version"] = version
@@ -536,12 +550,9 @@ class Worker:
                 meta["origin"] = origin
             if on_error is not None:
                 meta["on_error"] = [dict(route) for route in on_error]
-            if meta:
-                self._workflow_meta[name] = meta
-            from .workflow import _inline_on_error
+            from .workflow import _register_workflow
 
-            _inline_on_error(self, name, fn)
-            return fn
+            return _register_workflow(self, name, target, meta, factory)
 
         return register
 

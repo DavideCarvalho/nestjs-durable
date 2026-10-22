@@ -29,6 +29,8 @@ from .workflow import (
     WorkflowContext,
     WorkflowError,
     WorkflowWorker,
+    on_error,
+    workflow_name,
 )
 from .worker import (
     FatalError,
@@ -49,6 +51,8 @@ from .worker import (
 )
 
 __all__ = [
+    "on_error",
+    "workflow_name",
     "Worker",
     "FatalError",
     "StepContext",
