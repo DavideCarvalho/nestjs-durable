@@ -448,3 +448,64 @@ def test_a_step_only_python_worker_announces_nothing_at_all():
     assert d.registrations is None
     assert "registrations" not in d.to_wire()
     assert d.steps == ["Billing.charge"]
+
+
+# --------------------------------------------------------------------------------------------------
+# Announced onError routes — the one registration field the engine acts on.
+# --------------------------------------------------------------------------------------------------
+
+# Pinned in the TS conformance test too (packages/core/src/handshake/fixtures.contract.spec.ts).
+GOLDEN_ON_ERROR_HASH = "d2be2d3bfe108eda"
+
+
+def test_golden_on_error_fixture_round_trips_and_hashes_identically():
+    raw = _read_raw("descriptor-on-error.json")
+    parsed = WorkerDescriptor.from_wire(json.loads(raw))
+    assert parsed.registrations[0].on_error == [
+        {"code": "invalid_line", "workflow": "line-dead-letter"},
+        {"workflow": "line-failure"},
+    ]
+    assert json.dumps(parsed.to_wire(), indent=2) + "\n" == raw
+    assert descriptor_hash(parsed) == GOLDEN_ON_ERROR_HASH
+
+
+def test_on_error_routes_hash_the_same_in_any_order():
+    routes = [{"code": "a", "workflow": "x"}, {"workflow": "y"}]
+    forward = _make_descriptor(registrations=[WorkflowRegistration(name="p", on_error=routes)])
+    backward = _make_descriptor(
+        registrations=[WorkflowRegistration(name="p", on_error=list(reversed(routes)))]
+    )
+    assert descriptor_hash(forward) == descriptor_hash(backward)
+    assert descriptor_hash(forward) != descriptor_hash(
+        _make_descriptor(registrations=[WorkflowRegistration(name="p")])
+    )
+
+
+def test_a_python_worker_announces_the_on_error_routes_it_was_given():
+    from durable_worker import Worker
+    from durable_worker.redis_runner import _build_descriptor
+
+    worker = Worker(auto_register=False)
+
+    @worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-dead-letter"}])
+    def _line(_ctx):
+        return None
+
+    @worker.workflow("plain")
+    def _plain(_ctx):
+        return None
+
+    wire = _build_descriptor(worker, None, "default", lambda name: name).to_wire()
+    assert wire["registrations"] == [
+        {"name": "line", "group": "line", "onError": [{"code": "invalid_line", "workflow": "line-dead-letter"}]},
+        {"name": "plain", "group": "plain"},
+    ]
+
+
+def test_non_determinism_carries_the_code_the_engine_never_routes():
+    from durable_worker.workflow import NondeterminismError, _to_error
+
+    try:
+        raise NondeterminismError("history mismatch")
+    except NondeterminismError as err:
+        assert _to_error(err)["code"] == "non_determinism"

@@ -570,6 +570,10 @@ export class WorkflowContext implements WorkflowCtx {
               status: 'rejected',
               id: `${this.runId}.child.${e.seq}`,
               error: e.history.error.message,
+              ...(e.history.error.code !== undefined ? { code: e.history.error.code } : {}),
+              ...(e.history.error.details !== undefined
+                ? { details: e.history.error.details }
+                : {}),
             }
           : { status: 'fulfilled', value: e.history.output },
     );

@@ -2,12 +2,13 @@ import { currentStepScope, runInStepScope } from './ambient-ctx';
 import { runInStepLogger } from './ambient-step';
 import { backoffDelay } from './backoff';
 import { instantCheckpoint } from './checkpoints';
-import { unwrapCompletion } from './completion';
+import { type Completion, completionError, unwrapCompletion } from './completion';
 import { parseDuration } from './duration';
 import {
   ContinueAsNew,
   FatalError,
   GatherError,
+  type GatherItemFailure,
   NestedWorkflowCallError,
   NonDeterminismError,
   SignalTimeoutError,
@@ -48,6 +49,7 @@ import type {
   StepUndo,
   WorkflowCtx,
 } from './interfaces';
+import { codeAndDetails } from './on-error';
 import { breakpointToken } from './protocol';
 import { createStepLogger } from './step-logger';
 import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol';
@@ -346,6 +348,7 @@ export function createWorkflowCtx(
             error: {
               message: err instanceof Error ? err.message : String(err),
               stack: err instanceof Error ? err.stack : undefined,
+              ...codeAndDetails(err),
             },
             events,
             attempts: attempt,
@@ -855,13 +858,14 @@ export function createWorkflowCtx(
     // All resolved: build outputs in INPUT order, aggregating any failures.
     const outputs: unknown[] = [];
     const results: Settled<unknown>[] = [];
-    const failures: { index: number; id: string; error: string }[] = [];
+    const failures: GatherItemFailure[] = [];
     for (let i = 0; i < inputs.length; i += 1) {
-      const c = existing[i]?.output as { ok?: boolean; value?: unknown; error?: string } | null;
+      const c = existing[i]?.output as Completion<unknown> | null;
       if (c && typeof c === 'object' && 'ok' in c && c.ok === false) {
-        const error = c.error ?? 'unknown';
-        failures.push({ index: i, id: id(i), error });
-        results.push({ status: 'rejected', id: id(i), error });
+        const { message, ...rest } = completionError({ ...c, error: c.error ?? 'unknown' });
+        const failure = { id: id(i), error: message, ...rest };
+        failures.push({ index: i, ...failure });
+        results.push({ status: 'rejected', ...failure });
         outputs.push(undefined);
       } else {
         const value = (c as { value?: unknown } | null)?.value;

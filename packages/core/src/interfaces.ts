@@ -292,6 +292,9 @@ export interface StepError {
   message: string;
   /** Optional machine-readable code, e.g. `declined`, `timeout`. */
   code?: string | undefined;
+  /** Structured, JSON-serializable detail of the failure (e.g. validation issues), from
+   *  `FatalError`'s third argument or a `details` on what a step handler threw. */
+  details?: unknown;
   /** Whether the engine should treat this as retryable. */
   retryable?: boolean | undefined;
   stack?: string | undefined;
@@ -994,7 +997,15 @@ export type AllStepsSettledOptions = Omit<AllStepsOptions, 'mode'>;
  */
 export type Settled<T> =
   | { status: 'fulfilled'; value: T }
-  | { status: 'rejected'; id: string; error: string };
+  | {
+      status: 'rejected';
+      id: string;
+      error: string;
+      /** The failure's `code` (e.g. a `FatalError`'s), so a parent can tell its kinds apart. */
+      code?: string | undefined;
+      /** The failure's structured `details`, when it carried any. */
+      details?: unknown;
+    };
 
 /** One child of a fan as {@link StateStore.registerChildWaits} writes it. */
 export interface ChildWait {
@@ -2153,7 +2164,13 @@ export type EngineEventType =
   // (which capability/protocol gap, both descriptors) so the dashboard health panel + telescope
   // timeline render exactly WHY — never a bare boolean. The `error.code` is the machine code
   // (`capability.unavailable` / `protocol.incompatible`).
-  | 'run.blocked';
+  | 'run.blocked'
+  // A failed run handed its failure to an onError handler (`name` is the handler workflow, `error`
+  // the failure). The run now waits on the handler and settles with its outcome.
+  | 'run.routed'
+  // A failed run had onError routes that could not be applied — its live workers announce different
+  // ones (`reason` says so) — so it failed instead of being handed off.
+  | 'run.unrouted';
 
 /**
  * A lifecycle event emitted by the engine. The observability surfaces (dashboard, OTel, the
@@ -2194,6 +2211,8 @@ export interface EngineEvent {
    *  gap fired, how many live workers were considered, and both descriptors — enough for the health
    *  panel/telescope to render the reason. Absent on all other event types. */
   diagnostics?: DispatchDiagnostics | undefined;
+  /** Why a `run.unrouted` run's onError routes were not applied. */
+  reason?: string | undefined;
   at: Date;
 }
 

@@ -620,7 +620,9 @@ export class PrismaStateStore implements StateStore {
       where: { runId, OR: prefixes.map((p) => ({ name: { startsWith: p } })) },
       orderBy: { seq: 'asc' },
     });
-    return rows.map(fromCheckpointRow);
+    // On some providers (SQLite) `startsWith` compiles to a `LIKE` that reads `_` and `%` as wildcards,
+    // so it can match more than the prefix: keep only the exact matches.
+    return rows.filter((r) => prefixes.some((p) => r.name.startsWith(p))).map(fromCheckpointRow);
   }
 
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
@@ -656,12 +658,16 @@ export class PrismaStateStore implements StateStore {
     const rows = await this.db.durableSignalWaiter.findMany({
       where: { token: { startsWith: prefix } },
     });
-    return rows.map((r) => ({
-      token: r.token,
-      runId: r.runId,
-      seq: r.seq,
-      parallelGroup: r.parallelGroup ?? undefined,
-    }));
+    // On some providers (SQLite) `startsWith` compiles to a `LIKE` that reads `_` and `%` as wildcards,
+    // so it can match more than the prefix: keep only the exact matches.
+    return rows
+      .filter((r) => r.token.startsWith(prefix))
+      .map((r) => ({
+        token: r.token,
+        runId: r.runId,
+        seq: r.seq,
+        parallelGroup: r.parallelGroup ?? undefined,
+      }));
   }
 
   async registerChildWaits(entries: ChildWait[]): Promise<void> {

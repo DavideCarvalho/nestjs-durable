@@ -103,12 +103,15 @@ def sub_process(
 class FatalError(Exception):
     """Raise inside a handler to signal a non-retryable failure (mirrors the TS ``FatalError``).
 
-    The engine will not retry the step regardless of its ``retries`` setting.
+    The engine will not retry the step regardless of its ``retries`` setting. ``details`` is any
+    JSON-serializable value that rides the wire error next to ``code`` (e.g. a validation's issues),
+    and reaches an ``onError`` handler as ``error["details"]``.
     """
 
-    def __init__(self, message: str, code: str | None = None) -> None:
+    def __init__(self, message: str, code: str | None = None, details: Any = None) -> None:
         super().__init__(message)
         self.code = code
+        self.details = details
 
 
 class StepContext:
@@ -482,6 +485,7 @@ class Worker:
         version: Optional[str] = None,
         requires: Optional["list[str]"] = None,
         origin: Optional[str] = None,
+        on_error: Optional[List[Dict[str, str]]] = None,
     ) -> Callable[[Handler], Handler]:
         """Decorator registering ``fn`` as the workflow ``name`` on THIS worker (unified worker).
 
@@ -500,6 +504,14 @@ class Worker:
 
             @worker.workflow("pipeline", version="2", origin="flip-python-db")
             def pipeline(ctx, input): ...
+
+        ``on_error`` is the exception: the engine ACTS on it. When a run of this workflow fails with
+        an error whose ``code`` matches a route (a route without ``code`` takes any other failure), the
+        engine starts the route's handler workflow instead of failing the run, and the run settles
+        with the handler's outcome. The handler can be a workflow of any runtime::
+
+            @worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-dead-letter"}])
+            def line(ctx, input): ...
         """
 
         def register(fn: Handler) -> Handler:
@@ -511,6 +523,8 @@ class Worker:
                 meta["requires"] = list(requires)
             if origin is not None:
                 meta["origin"] = origin
+            if on_error is not None:
+                meta["on_error"] = [dict(route) for route in on_error]
             if meta:
                 self._workflow_meta[name] = meta
             return fn
@@ -774,6 +788,8 @@ class Worker:
         # the case where the sub-process outcomes matter most.
         if isinstance(err, FatalError):
             error = {"message": str(err), "code": err.code, "retryable": False}
+            if err.details is not None:
+                error["details"] = err.details
         else:
             error = {"message": str(err)}
         return _with_events({**base, "status": "failed", "error": error}, ctx)

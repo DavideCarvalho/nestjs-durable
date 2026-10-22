@@ -31,6 +31,7 @@ import {
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
 import type { DurableModuleOptions } from './durable.module';
+import { registerOnRuntime } from './runtime-registration';
 import { createWorkerRuntime, runRedisWorker as defaultRunRedisWorker } from './worker-sdk';
 
 /**
@@ -73,6 +74,7 @@ function isPureThinWorker(options: DurableModuleOptions): boolean {
 export class ThinWorkflowRegistrar implements OnModuleInit {
   constructor(
     private readonly discovery: DiscoveryService,
+    private readonly metadataScanner: MetadataScanner,
     @Inject(DURABLE_WORKER_RUNTIME) private readonly runtime: DurableWorkerRuntime | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
   ) {}
@@ -85,11 +87,7 @@ export class ThinWorkflowRegistrar implements OnModuleInit {
     // passed straight through: the registry states what the decorator states, and an option the
     // decorator left off stays un-stated rather than becoming a default.
     scanWorkflows(this.discovery, (meta, instance, origin) =>
-      runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input), {
-        version: meta.version,
-        ...(meta.requires !== undefined ? { requires: meta.requires } : {}),
-        ...(origin !== undefined ? { origin } : {}),
-      }),
+      registerOnRuntime(runtime, this.metadataScanner, meta, instance, origin),
     );
   }
 }

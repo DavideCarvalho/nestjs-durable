@@ -160,7 +160,8 @@ input, in input order, and leaves the parent to decide what a failure means:
 
 ```ts
 const results = await ctx.allSettled(ProcessItemWorkflow, batch.items, { concurrency: 1000 });
-// results[i]: { status: 'fulfilled'; value } | { status: 'rejected'; id: string; error: string }
+// results[i]: { status: 'fulfilled'; value }
+//           | { status: 'rejected'; id: string; error: string; code?: string; details?: unknown }
 
 const rejected = results.flatMap((r, i) =>
   r.status === 'rejected' ? [{ item: batch.items[i], error: r.error }] : [],
@@ -173,7 +174,9 @@ It takes the same `concurrency`, works over a `@Step` reference too, and lays th
 Cancelling the parent still cancels the run; only the items' failures are collected.
 
 For a failure that retrying can't fix, throw `FatalError` in the child or step: it skips the retries
-and settles as `rejected` straight away.
+and settles as `rejected` straight away. Its `code` and `details` come back on the rejected item, so the
+parent can tell an invalid line from an outage. A failed `ctx.child` throws a `FatalError` carrying the
+child's `code` and `details` the same way.
 
 ### Capping how many children run at once — `concurrency`
 

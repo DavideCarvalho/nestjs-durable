@@ -153,6 +153,16 @@ Marks a method on a `@Workflow` class as its inline dead-letter handler — regi
 run of the class is moved to `dead`. Takes precedence over `deadLetterWorkflow`. See
 [Dead-letter queue](/docs/reliability/dead-letter).
 
+### `@OnError(match?)`
+
+Marks a method on a `@Workflow` class as the handler workflow for a failure of its runs: when a run ends
+`failed` with an error whose `code` matches (an error class with a static `code`, or the code string; no
+argument for the catch-all), the engine starts the method as `<workflow>.onError.<method>` with an
+`OnErrorInput` and the run settles with its outcome. Typed against `run`'s input and output; stackable.
+`@Workflow({ onError: [{ code?, workflow }] })` routes to a separate workflow, and the engine's
+`register` / `registerRemote` take the same `onError` option. See
+[Routing a run's failure](/docs/reliability/on-error).
+
 ### `@Entity(options)` / `@On(op)`
 
 `@Entity({ name })` marks an `@Injectable()` class as a durable entity (a keyed virtual object,
@@ -353,7 +363,7 @@ All exported from `@dudousxd/nestjs-durable-core`.
 
 | Error | Thrown when |
 | --- | --- |
-| `FatalError` | Thrown BY YOU inside a step/workflow for an unrecoverable business failure (e.g. a declined card) — the engine never retries it, in a local or a dispatched step, and fails the run immediately. |
+| `FatalError` | `new FatalError(message, code?, details?)` — thrown BY YOU inside a step/workflow for an unrecoverable business failure (e.g. a declined card) — the engine never retries it, in a local or a dispatched step, and fails the run immediately. `code` and `details` travel with the failure to the run's error, a parent's `allSettled` item or `ctx.child` catch, and an onError handler. |
 | `SignalTimeoutError` | `ctx.waitForSignal` / `ctx.waitForEvent` / `ctx.onUpdate`'s `timeoutMs` deadline passes before delivery. Catchable in the workflow to take a default branch. |
 | `NonDeterminismError` | On resume, the step at a logical position has a different name/kind than its checkpoint — the workflow code changed under an in-flight run without a new `@Workflow` version. See [Versioning & determinism](/docs/authoring/versioning). |
 | `NestedWorkflowCallError` | A ctx primitive (`ctx.startChild`/`child`/`step`/`sleep`/`sideEffect`/…, or a `MyWorkflow.start()`/`.execute()` static via the ambient ctx) was called from INSIDE a step body (`ctx.localStep`/`transaction`/`sideEffect`/`now`). Thrown at the call site, as a `FatalError` (code `nested_workflow_call`). See [Troubleshooting](/docs/troubleshooting#nestedworkflowcallerror-a-ctx-call-inside-a-step-body). |

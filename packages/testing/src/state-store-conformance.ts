@@ -652,6 +652,20 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    t('a name or token prefix matches literally — `_` and `%` are not wildcards', async () => {
+      await store.createRun(run());
+      await store.saveCheckpoint(checkpoint({ seq: 0, name: 'signal:child:job_1.onError.0' }));
+      await store.saveCheckpoint(checkpoint({ seq: 1, name: 'signal:child:jobX1.onError.0' }));
+      await store.putSignalWaiter({ token: 'child:job_1.child.0', runId: 'r1', seq: 2 });
+      await store.putSignalWaiter({ token: 'child:jobX1.child.0', runId: 'r1', seq: 3 });
+
+      const matches = await store.listCheckpointsByNamePrefix?.('r1', ['signal:child:job_1.']);
+      expect(matches?.map((c) => c.name)).toEqual(['signal:child:job_1.onError.0']);
+      expect((await store.listSignalWaiters('child:job_1.')).map((w) => w.token)).toEqual([
+        'child:job_1.child.0',
+      ]);
+    });
+
     t('round-trips checkpoint events and reads back a missing checkpoint as null', async () => {
       await store.createRun(run());
       await store.saveCheckpoint(

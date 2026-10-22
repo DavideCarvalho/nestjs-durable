@@ -8,6 +8,7 @@
     "flow-control",
     "singleton",
     "concurrency-quotas",
+    "on-error",
     "dead-letter",
     "retention"
   ]

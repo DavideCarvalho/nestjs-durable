@@ -81,6 +81,37 @@ describe('golden fixture: descriptor-registrations.json (design §7.9)', () => {
   });
 });
 
+/** The pinned hash of the onError-routes fixture — verified equal in the Python SDK's test_handshake. */
+const GOLDEN_ON_ERROR_HASH = 'd2be2d3bfe108eda';
+
+describe('golden fixture: descriptor-on-error.json (announced onError routes)', () => {
+  const raw = readRaw('descriptor-on-error.json');
+  const parsed = JSON.parse(raw) as WorkerDescriptor;
+
+  it('parses the routes a worker announces for a workflow', () => {
+    expect(parsed.registrations?.[0]?.onError).toEqual([
+      { code: 'invalid_line', workflow: 'line-dead-letter' },
+      { workflow: 'line-failure' },
+    ]);
+  });
+
+  it('round-trips byte-identically (serialize(parse(bytes)) === bytes)', () => {
+    expect(`${JSON.stringify(parsed, null, 2)}\n`).toBe(raw);
+  });
+
+  it('computes the pinned cross-language hash (d2be2d3bfe108eda)', () => {
+    expect(descriptorHash(parsed)).toBe(GOLDEN_ON_ERROR_HASH);
+  });
+
+  it('hashes the same whatever order the routes are listed in', () => {
+    const [line, ...rest] = parsed.registrations ?? [];
+    const reversed = { ...line, onError: [...(line?.onError ?? [])].reverse() };
+    expect(
+      descriptorHash({ ...parsed, registrations: [reversed as typeof line, ...rest] as never }),
+    ).toBe(GOLDEN_ON_ERROR_HASH);
+  });
+});
+
 describe('golden fixture: heartbeat-status.json (two-tier ETag)', () => {
   const raw = readRaw('heartbeat-status.json');
   const parsed = JSON.parse(raw) as HeartbeatStatus;

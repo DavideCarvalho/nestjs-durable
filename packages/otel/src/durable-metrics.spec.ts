@@ -1,4 +1,4 @@
-import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import { FatalError, InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it } from 'vitest';
 import { attachDurableMetrics } from './durable-metrics';
 
@@ -40,5 +40,26 @@ describe('attachDurableMetrics', () => {
     const snap = metrics.snapshot();
     expect(snap.runs.failed).toBe(1);
     expect(snap.steps.failed).toBe(1);
+  });
+
+  it('counts a failure handed to an onError handler, by code', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const metrics = attachDurableMetrics(engine);
+    engine.register('dlq', '1', async () => 'handled');
+    engine.register(
+      'line',
+      '1',
+      async () => {
+        throw new FatalError('bad line', 'invalid_line');
+      },
+      { onError: [{ code: 'invalid_line', workflow: 'dlq' }] },
+    );
+    await engine.start('line', {}, 'r');
+    await engine.waitForRun('r', { until: 'terminal' });
+
+    const snap = metrics.snapshot();
+    expect(snap.runs.routed).toBe(1);
+    expect(snap.runs.failed).toBe(0);
+    expect(snap.routedByCode).toEqual({ invalid_line: 1 });
   });
 });

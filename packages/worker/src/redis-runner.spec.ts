@@ -298,6 +298,23 @@ describe('runRedisWorker — announcing what this worker can execute (handshake 
     expect(fake.workerQueueNames).toContain('durable-tasks-pipeline@acme');
   });
 
+  it('announces the onError routes the engine applies to a workflow it serves by convention', async () => {
+    const fake = makeFakeDeps({ withRedis: true });
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('line', async () => 1, {
+      onError: [{ code: 'invalid_line', workflow: 'line.onError.invalid' }],
+    });
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
+
+    expect(announced(fake.sets, 'line')?.descriptor.registrations).toEqual([
+      {
+        name: 'line',
+        onError: [{ code: 'invalid_line', workflow: 'line.onError.invalid' }],
+        group: 'line',
+      },
+    ]);
+  });
+
   it('states nothing it was not told: an un-annotated workflow announces name + group only', async () => {
     const fake = makeFakeDeps({ withRedis: true });
     const runtime = new DurableWorkerRuntime();
