@@ -117,7 +117,7 @@ Marks a provider class as a durable workflow; its `run(ctx, input)` becomes the 
 | `tags` | `string[]` | Static labels stamped on every run, merged with per-run `start` tags. |
 | `singleton` | `SingletonConfig` (`{ key, limit?, maxQueueDepth? }`) | Durable FIFO mutex per key. See [Singleton workflows](/docs/reliability/singleton). |
 | `concurrency` | `ConcurrencyConfig` (`{ key, limit, countStatuses? }`) | Start-time quota per key (shared across workflows); an over-limit start throws `ConcurrencyLimitError`. See [Concurrency quotas](/docs/reliability/concurrency-quotas). |
-| `executionTimeout` | `string \| number` | Max wall-clock lifetime; an overrunning run is cancelled (`execution_timeout`) by the timer poller. |
+| `executionTimeout` | `string \| number` | Max wall-clock lifetime, counted from `createdAt`; an overrunning run — `pending`, `blocked`, `running` or `suspended` — is cancelled (`execution_timeout`) by the timer poller. See [Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap). |
 | `inputSchema` | `class` | Validate `start` input against a class-validator DTO (needs `class-validator`/`class-transformer`). |
 | `validateInput` | `(input: unknown) => void \| Promise<void>` | Custom validator; takes precedence over `inputSchema`. |
 | `onEvent` | `string[]` | Start a fresh run whenever any of these events is published. Merged with `@OnDurableEvent`. |

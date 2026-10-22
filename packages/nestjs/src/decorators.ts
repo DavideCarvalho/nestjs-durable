@@ -89,9 +89,11 @@ export interface WorkflowOptions {
    */
   concurrency?: ConcurrencyConfig;
   /**
-   * Max wall-clock lifetime for a run of this workflow (e.g. `'2h'`, `'7 days'`, or ms). A run that
-   * outlives it is moved to `cancelled` (`execution_timeout`) by the timer poller — a backstop for
-   * runs that get stuck or loop forever. Omit for no limit.
+   * Max wall-clock lifetime for a run of this workflow (e.g. `'2h'`, `'7 days'`, or ms), counted from
+   * the run's creation. A run that outlives it is moved to `cancelled` (`execution_timeout`) by the
+   * timer poller — whether it is `pending`, `blocked`, `running` or `suspended` — a backstop for runs
+   * that get stuck, loop forever or are never picked up. A run in `cancelling` finishes its saga undo
+   * instead. Omit for no limit.
    */
   executionTimeout?: string | number;
   /**
