@@ -1,5 +1,21 @@
 # @dudousxd/durable-worker
 
+## 0.11.0
+
+### Minor Changes
+
+- [#373](https://github.com/DavideCarvalho/nestjs-durable/pull/373) [`4a9aa48`](https://github.com/DavideCarvalho/nestjs-durable/commit/4a9aa48a7a87c1ab263045ee6464547bd152f010) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `ctx.allSettled(workflow | step, inputs, { concurrency })`: the same fan as `ctx.all` in `waitAll` mode, resolving with one `{ status: 'fulfilled', value } | { status: 'rejected', id, error }` per input, in input order, instead of throwing a `GatherError`. A `FatalError` thrown in a dispatched step is no longer retried: it carries `retryable: false`, which the step result builders already honour.
+
+- [#378](https://github.com/DavideCarvalho/nestjs-durable/pull/378) [`f4a6674`](https://github.com/DavideCarvalho/nestjs-durable/commit/f4a667449cd12ee7d82da2bf31c592fa8505c9d7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - onError and allSettled follow-ups:
+  - Retrying a run whose failure was handed off runs its body again; the previous handoff is retired (renamed `onError:retried:<id>`), and a new failure goes to a new handler run. Handler runs are now `<runId>.onError.<attempt>`, and handoff checkpoints sit at seq 1,000,000,000 and up, past anything a body reaches.
+  - `FatalError(message, code?, details?)`: `details` (JSON-serializable) travels on the `StepError` to the run's error, an onError handler's input, and, with `code`, through a child's completion to the parent: `allSettled` rejected items carry `code`/`details`, and a failed `ctx.child` throws a `FatalError` with them. The Python SDK takes `FatalError(..., details=...)` and adds `ctx.all_settled`.
+  - A handed-off run is tagged `onError:<code>`, and the engine emits `run.routed`, or `run.unrouted` when the workers announce different routes. Announced routes are read once per 5s.
+  - `engine.unservedOnErrorRoutes()`, and a boot warning from the Nest module, for routes whose handler nothing can run.
+
+### Patch Changes
+
+- [#374](https://github.com/DavideCarvalho/nestjs-durable/pull/374) [`b4ba4c1`](https://github.com/DavideCarvalho/nestjs-durable/commit/b4ba4c1fe3805bbd31ffda81209f36b6c8db8e34) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `onError` routes: when a run ends `failed` with an error whose `code` matches, the engine starts a handler workflow (`<runId>.onError`, input `{ runId, workflow, input, error }`) instead of failing the run, and the run settles with the handler's outcome. The run only follows its handler from then on; its body never runs again. Engine-orchestrated, so it holds for inline, in-app-worker and remote bodies: routes come from the local registration (`@OnError(ErrorClass | code?)` methods, `@Workflow({ onError })`, `register` / `registerRemote({ onError })`) or, for a workflow served by convention, from the `onError` its live workers announce on `WorkflowRegistration` (new golden fixture `descriptor-on-error.json`; the Python SDK announces it via `@worker.workflow(..., on_error=[...])`). `NonDeterminismError` now carries `code: 'non_determinism'`, which is never routed.
+
 ## 0.10.4
 
 ### Patch Changes
