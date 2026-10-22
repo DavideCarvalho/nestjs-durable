@@ -88,6 +88,7 @@ export class DurableTelescopeWatcher implements Watcher {
             output: event.output,
             error: event.error,
             durationMs: event.durationMs,
+            reason: event.reason,
           },
           tags: this.tags(event),
         });
@@ -148,6 +149,10 @@ export class DurableTelescopeWatcher implements Watcher {
     if (event.workflow) tags.push(`workflow:${event.workflow}`);
     if (event.kind) tags.push(`kind:${event.kind}`);
     if (event.type === 'run.failed') tags.push('failed');
+    if (event.type === 'run.routed' || event.type === 'run.unrouted') {
+      tags.push(event.type === 'run.routed' ? 'routed' : 'unrouted');
+      tags.push(`onError:${event.error?.code ?? '*'}`);
+    }
     return tags;
   }
 }

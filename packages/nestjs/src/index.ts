@@ -33,6 +33,7 @@ export type {
   AttributeFilter,
   DynamicWorkflowCtx,
   EngineEvent,
+  OnErrorInput,
   InferSearchAttributes,
   RunDetail,
   RunListItem,

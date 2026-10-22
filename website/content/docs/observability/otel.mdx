@@ -62,6 +62,12 @@ so filtering the Entries view by that tag reconstructs the full lifecycle either
 store's checkpoints, not from spans.
 </Callout>
 
+## onError handoffs
+
+A failure handed to an [onError handler](/docs/reliability/on-error) adds a `durable.run.routed` event
+to the run's span (attributes `durable.on_error.handler`, `durable.error.code`, `durable.error.message`).
+Routes that could not be applied add `durable.run.unrouted` with `durable.on_error.reason`.
+
 ## Distributed tracing across workers
 
 A remote step runs in **another process** — often another language (the [Python SDK](/docs/python)).

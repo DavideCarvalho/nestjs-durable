@@ -33,6 +33,13 @@ export interface WorkflowRegistration {
   /** The package that DECLARED the workflow (see `WorkflowRun.origin`). Absent = unknown; nothing
    *  ever substitutes a default, because a wrong origin is worse than no origin. */
   origin?: string;
+  /**
+   * Where the engine routes a failed run of this workflow, by error `code` (`code` absent = the
+   * catch-all): the handler workflow it starts instead of failing the run. The one announced field
+   * the engine ACTS on, for a workflow it serves by convention rather than by local registration.
+   * Absent = not stated, which routes nothing.
+   */
+  onError?: { code?: string; workflow: string }[];
 }
 
 /**
@@ -205,10 +212,26 @@ function canonicalizeRegistrations(regs: readonly WorkflowRegistration[]): unkno
     group: r.group ?? null,
     requires: r.requires ? [...new Set(r.requires)].sort() : null,
     origin: r.origin ?? null,
+    // Conditional, so a registration that states no routes keeps the hash it had before routes existed.
+    ...(r.onError !== undefined ? { onError: canonicalRoutes(r.onError) } : {}),
   }));
   const byJson = new Map<string, unknown>();
   for (const entry of canonical) byJson.set(JSON.stringify(entry), entry);
   return [...byJson.keys()].sort().map((k) => byJson.get(k));
+}
+
+/** Routes in a fixed key order, de-duplicated and sorted, so their order never changes the hash. */
+export function canonicalRoutes(
+  routes: readonly { code?: string; workflow: string }[],
+): { code: string | null; workflow: string }[] {
+  const byJson = new Map<string, { code: string | null; workflow: string }>();
+  for (const r of routes) {
+    const entry = { code: r.code ?? null, workflow: r.workflow };
+    byJson.set(JSON.stringify(entry), entry);
+  }
+  return [...byJson.keys()]
+    .sort()
+    .map((k) => byJson.get(k) as { code: string | null; workflow: string });
 }
 
 /** Canonical, order-insensitive projection of a descriptor used for hashing. The three set-valued

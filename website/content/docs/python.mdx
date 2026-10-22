@@ -420,6 +420,9 @@ flight raises `NondeterminismError` rather than silently diverging.
 | `ctx.gather_calls([{name, input}, …])` | Dispatch several steps **in parallel within one run** (flat, no child runs) and await all. |
 | `ctx.gather_children([…])` | Start several **child runs** in parallel and await all. |
 | `ctx.gather([…])` | Run several local steps in parallel and await all. |
+| `ctx.all_settled(workflow, inputs)` | `gather_children` that never raises for a failed child: one `{"status": "fulfilled", "value"}` / `{"status": "rejected", "id", "error", "code"?, "details"?}` per input, in order. |
+| `ctx.gather_calls_settled([{name, input}, …])` | The same for a step fan: `gather_calls` that returns every outcome instead of raising. |
+| `ctx.gather_settled([(name, body), …])` | The same for local steps: `gather` that runs and records every body, then returns every outcome instead of raising. |
 
 The three `gather*` fan-outs default to `wait_all` — raising an aggregate `GatherFailed` if anything
 fails — with an opt-in `fail_fast`. A single step that fails raises `StepFailed` in the workflow;

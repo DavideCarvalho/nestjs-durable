@@ -20,12 +20,13 @@ import {
   type OnModuleInit,
 } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
-import { getOnEvents, isDeadLetterHandler } from './decorators';
+import { type WorkflowMeta, getOnEvents, isDeadLetterHandler, onErrorCodesOf } from './decorators';
 import { scanWorkflows } from './discovery-helpers';
 import type { DurableModuleOptions } from './durable.module';
 import { entityConfigFor, getEntityMeta } from './entity';
 import { IN_APP_WORKER_BINDING, type InAppWorkerBinding } from './in-app-worker';
 import { classValidatorInput } from './input-validation';
+import { onErrorHandlersOf } from './on-error-handlers';
 import { isDrivingOperator, isOperatorRole } from './role';
 import { type DurableStepInterceptor, isStepInterceptor } from './step-interceptor';
 
@@ -37,6 +38,9 @@ type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
  *
  * For the shutdown drain to fire, enable Nest's shutdown hooks: `app.enableShutdownHooks()`.
  */
+/** How long after boot an onError route unserved at boot is checked again before it is reported. */
+const UNSERVED_ROUTES_RECHECK_MS = 30_000;
+
 @Injectable()
 export class WorkflowRegistrar
   implements OnModuleInit, OnApplicationBootstrap, OnApplicationShutdown
@@ -127,6 +131,11 @@ export class WorkflowRegistrar
           : undefined;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const workflowCtor: object = (workflow as any).constructor as object;
+      // Each `@OnError` method is a durable workflow of its own, inline like an `@DeadLetter` one.
+      const onError = onErrorHandlersOf(meta, workflow as unknown as object, this.metadataScanner);
+      for (const [name, fn] of onError.handlers) {
+        this.engine.register(name, meta.version, fn, { origin });
+      }
       this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input), {
         // Stamped onto every run this workflow starts (see `WorkflowRun.origin`). Derived from the
         // class's declaring file, so a lib gets attributed without opting in; `undefined` when it
@@ -141,6 +150,7 @@ export class WorkflowRegistrar
         searchAttributesSchema: meta.searchAttributes,
         onEvent: getOnEvents(meta, workflowCtor),
         eventBatch,
+        onError: onError.routes,
         // Uniform dispatch (opt-in): when an in-app worker is configured, register the body GROUP-SERVED
         // so the engine dispatches its turns over the transport instead of running it inline; the
         // co-located worker consumer (Task 5: one queue PER REGISTERED NAME) replays the same body.
@@ -190,6 +200,7 @@ export class WorkflowRegistrar
     });
 
     this.reportUnattributed(unattributed);
+    void this.reportUnservedOnErrorRoutes();
     this.installDeadLetterRouting(deadLetterByWorkflow);
   }
 
@@ -203,6 +214,25 @@ export class WorkflowRegistrar
     if (names.length === 0) return;
     console.warn(
       `[nestjs-durable] could not derive an origin (declaring package) for ${names.length} workflow(s): ${names.join(', ')}. Their runs carry no origin and will not match an origin filter.`,
+    );
+  }
+
+  /**
+   * Says, once after boot, which onError routes name a handler workflow nothing can run, so a typo is
+   * caught before the first failure goes nowhere. Routes unserved at boot are checked again after
+   * {@link UNSERVED_ROUTES_RECHECK_MS}, so a handler whose workers start after this process is not
+   * reported.
+   */
+  async reportUnservedOnErrorRoutes(recheckMs = UNSERVED_ROUTES_RECHECK_MS): Promise<void> {
+    if ((await this.engine.unservedOnErrorRoutes().catch(() => [])).length === 0) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, recheckMs).unref());
+    const unserved = await this.engine.unservedOnErrorRoutes().catch(() => []);
+    if (unserved.length === 0) return;
+    const list = unserved
+      .map(({ workflow, route }) => `${workflow} → ${route.workflow} (code ${route.code ?? '*'})`)
+      .join(', ');
+    console.warn(
+      `[nestjs-durable] ${unserved.length} onError route(s) name a handler workflow that is not registered here and has no live worker: ${list}.`,
     );
   }
 

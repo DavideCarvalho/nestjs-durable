@@ -3,11 +3,11 @@ import type {
   RunRedisWorkerOptions,
   RunningWorker,
 } from '@dudousxd/durable-worker';
-import type { WorkflowCtx, WorkflowTask } from '@dudousxd/nestjs-durable-core';
+import type { OnErrorInput, WorkflowCtx, WorkflowTask } from '@dudousxd/nestjs-durable-core';
 import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { Step, Workflow } from './decorators';
+import { OnError, Step, Workflow } from './decorators';
 import { DurableStartClient } from './durable-start-client';
 import {
   DURABLE_WORKER_RUNNERS,
@@ -59,6 +59,23 @@ class ChargeWorker {
 class AnnouncedWorkflow {
   async run(_ctx: WorkflowCtx, input: unknown) {
     return input;
+  }
+}
+
+/** A workflow that routes its failures: one handler method, and a route to another workflow. */
+@Workflow({
+  name: 'routed',
+  version: '2',
+  onError: [{ code: 'upstream', workflow: 'outage' }],
+})
+class RoutedWorkflow {
+  async run(_ctx: WorkflowCtx, input: { n: number }): Promise<number> {
+    return input.n;
+  }
+
+  @OnError('invalid_line')
+  async invalid(_ctx: WorkflowCtx, failure: OnErrorInput<{ n: number }>): Promise<number> {
+    return -failure.input.n;
   }
 }
 
@@ -176,6 +193,42 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
     expect(registration?.name).toBe('announced');
     expect(registration?.version).toBe('3');
     expect(registration?.requires).toEqual(['saga']);
+
+    await moduleRef.close();
+  });
+
+  it('announces the onError routes and serves the handler workflows the engine starts by name', async () => {
+    const runner = fakeRunner();
+    const moduleRef = await Test.createTestingModule({
+      imports: [DurableModule.forRoot({ connection: 'redis://x' })],
+      providers: [RoutedWorkflow],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.runRedisWorker)
+      .compile();
+    await moduleRef.init();
+
+    const runtime = moduleRef.get<DurableWorkerRuntime>(DURABLE_WORKER_RUNTIME);
+    const byName = new Map(runtime.workflowRegistrations().map((r) => [r.name, r]));
+    expect(byName.get('routed')?.onError).toEqual([
+      { code: 'invalid_line', workflow: 'routed.onError.invalid' },
+      { code: 'upstream', workflow: 'outage' },
+    ]);
+    expect(byName.get('routed.onError.invalid')).toMatchObject({ version: '2' });
+
+    const out = await runtime.handleTask({
+      taskId: 't1',
+      runId: 'r1.onError',
+      workflow: 'routed.onError.invalid',
+      workflowVersion: '2',
+      input: { runId: 'r1', workflow: 'routed', input: { n: 7 }, error: { message: 'x' } },
+      history: [],
+      group: 'routed.onError.invalid',
+    } satisfies WorkflowTask);
+    expect(out.kind === 'decision' && out.decision).toMatchObject({
+      status: 'completed',
+      output: -7,
+    });
 
     await moduleRef.close();
   });

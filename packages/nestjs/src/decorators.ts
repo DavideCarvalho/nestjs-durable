@@ -2,11 +2,13 @@ import {
   type ConcurrencyConfig,
   DURABLE_STEP_CONFIG,
   DURABLE_STEP_NAME,
+  type OnErrorInput,
   type SearchAttributesSchema,
   type SingletonConfig,
   type StepConfig,
   type StepError,
   WORKFLOW_NAME_KEY,
+  type WorkflowCtx,
   type WorkflowRef,
 } from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
@@ -20,6 +22,8 @@ export interface WorkflowMeta {
   version: string;
   /** The workflow this workflow's dead runs route to (a name or a class). See `WorkflowOptions`. */
   deadLetterWorkflow?: WorkflowRef | undefined;
+  /** Where failed runs are routed by error code. See `WorkflowOptions`. */
+  onError?: { code?: string | ErrorClassWithCode; workflow: WorkflowRef }[] | undefined;
   /** Static searchable labels stamped on every run of this workflow. See `WorkflowOptions`. */
   tags?: string[] | undefined;
   /** Per-key serialization (a durable mutex). See `WorkflowOptions`. */
@@ -56,6 +60,13 @@ export interface WorkflowOptions {
    * {@link DeadLetter} payload, idempotent by a `dlq:<runId>` id.
    */
   deadLetterWorkflow?: WorkflowRef;
+  /**
+   * Route failed runs of this workflow to other **registered** workflows by error code — the
+   * separate-class form of an `@OnError` method (see it for the semantics). Each handler receives an
+   * {@link OnErrorInput}; omit `code` for the catch-all. A code routed here and by an `@OnError`
+   * method on the class is a boot-time error.
+   */
+  onError?: { code?: string | ErrorClassWithCode; workflow: WorkflowRef }[];
   /**
    * Static labels stamped on **every run** of this workflow (e.g. `tags: ['etl', 'critical']`) and
    * merged with any per-run tags passed to `start`. Searchable/filterable in the dashboard.
@@ -168,6 +179,7 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       name: options.name,
       version: options.version ?? '1',
       deadLetterWorkflow: options.deadLetterWorkflow,
+      onError: options.onError,
       tags: options.tags,
       singleton: options.singleton,
       concurrency: options.concurrency,
@@ -365,6 +377,66 @@ export function DeadLetter(): MethodDecorator {
 // biome-ignore lint/complexity/noBannedTypes: reflect-metadata reads from the method function
 export function isDeadLetterHandler(method: Function): boolean {
   return Reflect.getMetadata(DEAD_LETTER_METADATA, method) === true;
+}
+
+export const ON_ERROR_METADATA = Symbol('nestjs-durable:on-error');
+
+/**
+ * An error class that declares the `code` it is thrown with (`static readonly code = 'invalid_line'`).
+ * `@OnError(Class)` matches on that code, not on `instanceof`: a dispatched step's error reaches the
+ * workflow as a plain `{ message, code }`, without its class.
+ */
+export interface ErrorClassWithCode {
+  readonly code: string;
+}
+
+type WorkflowShape = { run(ctx: any, input: any): Promise<unknown> };
+
+/**
+ * An `@OnError` method: a workflow body that receives the failed run's {@link OnErrorInput}, typed with
+ * `run`'s input, and returns what `run` returns.
+ */
+export type OnErrorMethod<T extends WorkflowShape> = (
+  ctx: WorkflowCtx<any>,
+  failure: OnErrorInput<Parameters<T['run']>[1]>,
+) => Promise<Awaited<ReturnType<T['run']>>>;
+
+/**
+ * Marks a method on a `@Workflow` class as the handler for a failure of that workflow's runs. When a
+ * run ends `failed` with an error of the given `code` (a string, or an {@link ErrorClassWithCode}),
+ * the engine starts the method as its own durable workflow — registered as
+ * `<workflow>.onError.<method>`, with a `<runId>.onError` id — and the failed run waits for it, then
+ * settles with its outcome: the method's return value as its output, or its error. Without an
+ * argument it takes any failure no other code matches.
+ *
+ * The engine routes the failure, so this holds for whatever ran the body (inline, an in-app worker,
+ * another runtime). The method's signature is checked against the workflow: `(ctx, failure)`, with
+ * `failure.input` typed as `run`'s input and the return type as `run`'s. Stack the decorator to give
+ * one method several codes. Saga compensations of the failed body run before the handoff;
+ * cancellation and non-determinism are never routed.
+ */
+export function OnError(match?: string | ErrorClassWithCode) {
+  const code = match === undefined || typeof match === 'string' ? match : match.code;
+  if (match !== undefined && typeof code !== 'string') {
+    throw new Error(
+      '@OnError(ErrorClass): the class has no static `code`. Declare `static readonly code = "..."` on it, or pass the code string.',
+    );
+  }
+  return <T extends WorkflowShape>(
+    _target: T,
+    _propertyKey: string | symbol,
+    descriptor: { value?: OnErrorMethod<T> | undefined },
+  ): void => {
+    const method = descriptor.value as object;
+    const codes: (string | undefined)[] = Reflect.getMetadata(ON_ERROR_METADATA, method) ?? [];
+    Reflect.defineMetadata(ON_ERROR_METADATA, [...codes, code], method);
+  };
+}
+
+/** The codes an `@OnError` method takes (`undefined` for the catch-all), or undefined if it has none. */
+// biome-ignore lint/complexity/noBannedTypes: reflect-metadata reads from the method function
+export function onErrorCodesOf(method: Function): (string | undefined)[] | undefined {
+  return Reflect.getMetadata(ON_ERROR_METADATA, method);
 }
 
 export const ON_EVENT_METADATA = Symbol('nestjs-durable:on-event');
