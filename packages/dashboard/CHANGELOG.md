@@ -1,5 +1,30 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.51.0
+
+### Minor Changes
+
+- [#381](https://github.com/DavideCarvalho/nestjs-durable/pull/381) [`b1e3440`](https://github.com/DavideCarvalho/nestjs-durable/commit/b1e34400fb3f2f9e6c51d3a6309efb99f84bcd1a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `GET runs/:id` and `GET runs/:id/fans/:group` send an `ETag` with `Cache-Control: private, no-cache` whenever the gateway can version the response. A poll whose `If-None-Match` still names that ETag gets a bare `304`, and the timeline is never read. The browser adds `If-None-Match` to the console's `fetch` polls by itself and hands TanStack Query the cached body, so the client needs no change. A gateway that cannot version a response (an older operator, a custom store without the aggregates, `?full=true`) answers in full as before.
+
+### Patch Changes
+
+- [#374](https://github.com/DavideCarvalho/nestjs-durable/pull/374) [`c93d44c`](https://github.com/DavideCarvalho/nestjs-durable/commit/c93d44c78869007c993820cc0d2902a79ab1dba7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console links an onError handler run (`<runId>.onError`) to the run it handles, and a run waiting on its handler reads "awaiting · failure handler <workflow>". `parentRunIdOf` reads `<parent>.onError` too, so the telescope watcher stamps the handler's `parentRunId`.
+
+- [#378](https://github.com/DavideCarvalho/nestjs-durable/pull/378) [`f4a6674`](https://github.com/DavideCarvalho/nestjs-durable/commit/f4a667449cd12ee7d82da2bf31c592fa8505c9d7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - onError and allSettled follow-ups:
+
+  - Retrying a run whose failure was handed off runs its body again; the previous handoff is retired (renamed `onError:retried:<id>`), and a new failure goes to a new handler run. Handler runs are now `<runId>.onError.<attempt>`, and handoff checkpoints sit at seq 1,000,000,000 and up, past anything a body reaches.
+  - `FatalError(message, code?, details?)`: `details` (JSON-serializable) travels on the `StepError` to the run's error, an onError handler's input, and, with `code`, through a child's completion to the parent: `allSettled` rejected items carry `code`/`details`, and a failed `ctx.child` throws a `FatalError` with them. The Python SDK takes `FatalError(..., details=...)` and adds `ctx.all_settled`.
+  - A handed-off run is tagged `onError:<code>`, and the engine emits `run.routed`, or `run.unrouted` when the workers announce different routes. Announced routes are read once per 5s.
+  - `engine.unservedOnErrorRoutes()`, and a boot warning from the Nest module, for routes whose handler nothing can run.
+
+- [#383](https://github.com/DavideCarvalho/nestjs-durable/pull/383) [`cf54b7a`](https://github.com/DavideCarvalho/nestjs-durable/commit/cf54b7ad7a8eafc33020117ceb2b1ec7e1b37333) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - onError polish:
+  - Metrics count `run.routed` / `run.unrouted` (`runs.routed`, `runs.unrouted`, `routedByCode`, Prometheus `durable_runs_routed_total{code}`); the OTel bridge adds `durable.run.routed` / `durable.run.unrouted` span events; Telescope tags them `routed` / `unrouted` and `onError:<code>`, with the `reason`.
+  - The console shows a failure's `code` and `details` on the failed step and run.
+  - The boot warning for an unserved onError route rechecks after 30s, so handlers whose workers start later are not reported.
+  - A retry drops the run's `onError:<code>` tag along with the retired handoff.
+  - `listCheckpointsByNamePrefix` and `listSignalWaiters` match a prefix literally on every SQL store: `_` / `%` were read as `LIKE` wildcards (and Prisma's `startsWith` on SQLite). New conformance case.
+  - Python: `ctx.gather_calls_settled`.
+
 ## 0.50.0
 
 ### Minor Changes

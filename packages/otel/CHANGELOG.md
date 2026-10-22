@@ -1,5 +1,17 @@
 # @dudousxd/nestjs-durable-otel
 
+## 0.4.0
+
+### Minor Changes
+
+- [#383](https://github.com/DavideCarvalho/nestjs-durable/pull/383) [`cf54b7a`](https://github.com/DavideCarvalho/nestjs-durable/commit/cf54b7ad7a8eafc33020117ceb2b1ec7e1b37333) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - onError polish:
+  - Metrics count `run.routed` / `run.unrouted` (`runs.routed`, `runs.unrouted`, `routedByCode`, Prometheus `durable_runs_routed_total{code}`); the OTel bridge adds `durable.run.routed` / `durable.run.unrouted` span events; Telescope tags them `routed` / `unrouted` and `onError:<code>`, with the `reason`.
+  - The console shows a failure's `code` and `details` on the failed step and run.
+  - The boot warning for an unserved onError route rechecks after 30s, so handlers whose workers start later are not reported.
+  - A retry drops the run's `onError:<code>` tag along with the retired handoff.
+  - `listCheckpointsByNamePrefix` and `listSignalWaiters` match a prefix literally on every SQL store: `_` / `%` were read as `LIKE` wildcards (and Prisma's `startsWith` on SQLite). New conformance case.
+  - Python: `ctx.gather_calls_settled`.
+
 ## 0.3.0
 
 ### Minor Changes

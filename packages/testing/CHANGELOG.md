@@ -1,5 +1,35 @@
 # @dudousxd/nestjs-durable-testing
 
+## 0.18.0
+
+### Minor Changes
+
+- [#382](https://github.com/DavideCarvalho/nestjs-durable/pull/382) [`eefd017`](https://github.com/DavideCarvalho/nestjs-durable/commit/eefd01757304865595a8b32bd96786ed22981a95) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Every bundled store implements `saveCheckpointsIfPending(checkpoints)`: `saveCheckpointIfPending` for a batch, resolving one boolean per entry, in one commit. If it rejects, it wrote nothing.
+
+  - Drizzle Postgres runs one `UPDATE … FROM (VALUES …) WHERE c.status = 'pending' RETURNING c.run_id, c.seq` per 500 rows. A row named twice in one batch goes into a later statement, so the second entry is compared against the first one's write.
+  - Drizzle SQLite/libSQL, TypeORM, Prisma and MikroORM run the same conditional `UPDATE` as `saveCheckpointIfPending`, once per entry and in order, inside one transaction.
+
+  The shared `runStateStoreContract` expects the method to exist and checks it: rows already settled are refused, a second copy of a row in one batch is compared against the first, missing rows are never created, rows of different runs can share a batch, a pending-to-pending write leaves the row open for a later entry, and a 600-row batch is written whole. A custom store without the method now fails those cases. The engine still works with such a store, settling each result with its own `saveCheckpointIfPending`.
+
+- [#381](https://github.com/DavideCarvalho/nestjs-durable/pull/381) [`b1e3440`](https://github.com/DavideCarvalho/nestjs-durable/commit/b1e34400fb3f2f9e6c51d3a6309efb99f84bcd1a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A summarized run detail and a fan page no longer read the run's whole checkpoint list.
+
+  - `StateStore` has two new optional methods. `checkpointStats(runId, { group? })` is one `GROUP BY parallel_group, status, <name kind>` that returns counts, seq and timestamp bounds and an attempt sum per bucket. `queryCheckpoints(runId, { group, excludeGroups, statuses, namePrefixes, offset, limit })` pages checkpoints in seq order. Every bundled store implements both, and `CodecStateStore` forwards them.
+  - Core's `summarizeRunFromStore` and `pageFanFromStore` build the same `RunDetail` and `FanPage` that `summarizeTimeline` and `pageFan` build from a full read. They read the aggregates, the rows outside wide fans, the folded `fan:` checkpoints, up to 20 failures per fan and the first child edges. While a wide child fan is in flight they also read its completed `signal:child:` rows, because only the payload tells whether a child failed.
+  - `StoreRunGateway` uses them when the store has both methods. Otherwise it falls back to the full read. On a 40,000-member step fan, a detail poll now reads 21 rows instead of 40,001, and a page of 100 reads 100.
+  - The summarized detail and the fan page carry an `etag`, derived from the run row and the checkpoint buckets. `RunDetailOptions.ifNoneMatch` and `FanPageQuery.ifNoneMatch` let the gateway answer `notModified` after reading only the run and the buckets. The options travel through `ProxyRunGateway` unchanged, so a tenant's poll costs the operator the same.
+  - Each store adds a `durable_step_checkpoints_group_idx` index on `(run_id, parallel_group, seq)`.
+  - The shared `runStateStoreContract` now expects both methods. It checks them against their in-memory references, and checks that the detail and the pages built on them match the ones built from a full read. The fixture covers step fans, child fans, folded checkpoints, failFast, partial waves and narrow fans.
+
+### Patch Changes
+
+- [#383](https://github.com/DavideCarvalho/nestjs-durable/pull/383) [`cf54b7a`](https://github.com/DavideCarvalho/nestjs-durable/commit/cf54b7ad7a8eafc33020117ceb2b1ec7e1b37333) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - onError polish:
+  - Metrics count `run.routed` / `run.unrouted` (`runs.routed`, `runs.unrouted`, `routedByCode`, Prometheus `durable_runs_routed_total{code}`); the OTel bridge adds `durable.run.routed` / `durable.run.unrouted` span events; Telescope tags them `routed` / `unrouted` and `onError:<code>`, with the `reason`.
+  - The console shows a failure's `code` and `details` on the failed step and run.
+  - The boot warning for an unserved onError route rechecks after 30s, so handlers whose workers start later are not reported.
+  - A retry drops the run's `onError:<code>` tag along with the retired handoff.
+  - `listCheckpointsByNamePrefix` and `listSignalWaiters` match a prefix literally on every SQL store: `_` / `%` were read as `LIKE` wildcards (and Prisma's `startsWith` on SQLite). New conformance case.
+  - Python: `ctx.gather_calls_settled`.
+
 ## 0.17.0
 
 ### Minor Changes

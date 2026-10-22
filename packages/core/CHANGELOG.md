@@ -1,5 +1,48 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.79.0
+
+### Minor Changes
+
+- [#382](https://github.com/DavideCarvalho/nestjs-durable/pull/382) [`eefd017`](https://github.com/DavideCarvalho/nestjs-durable/commit/eefd01757304865595a8b32bd96786ed22981a95) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A run's step results are settled in batches. The results of one run that arrive while a batch is being written go into the next one, up to 256. A batch claims its checkpoints with one call to the new optional `StateStore.saveCheckpointsIfPending`, checks a step fan's join barrier once, and resumes the run at most once. With `resultConcurrency: 64`, a 5,000-step fan on SQLite drops from 4 SQL statements and one commit per result to about 2 statements and 1/64 of a commit.
+
+  What stays the same: each step settles exactly once (a duplicate delivery, in the same batch or a later one, is dropped by the compare-and-set), the parent wakes once per settled wave, a failure still wakes it, and a result is acknowledged only after the write holding it commits. If the batched write rejects, the engine writes the batch's rows one by one, so one bad row fails only its own result. A barrier count that fails now resumes the run rather than failing the result. With `resultConcurrency: 1` (the default) every batch holds one result, which is the same path as before.
+
+  `CodecStateStore` forwards `saveCheckpointsIfPending`, encoding every entry, when the store it wraps has it. The in-memory store implements it.
+
+- [#373](https://github.com/DavideCarvalho/nestjs-durable/pull/373) [`4a9aa48`](https://github.com/DavideCarvalho/nestjs-durable/commit/4a9aa48a7a87c1ab263045ee6464547bd152f010) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `ctx.allSettled(workflow | step, inputs, { concurrency })`: the same fan as `ctx.all` in `waitAll` mode, resolving with one `{ status: 'fulfilled', value } | { status: 'rejected', id, error }` per input, in input order, instead of throwing a `GatherError`. A `FatalError` thrown in a dispatched step is no longer retried: it carries `retryable: false`, which the step result builders already honour.
+
+- [#378](https://github.com/DavideCarvalho/nestjs-durable/pull/378) [`f4a6674`](https://github.com/DavideCarvalho/nestjs-durable/commit/f4a667449cd12ee7d82da2bf31c592fa8505c9d7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - onError and allSettled follow-ups:
+
+  - Retrying a run whose failure was handed off runs its body again; the previous handoff is retired (renamed `onError:retried:<id>`), and a new failure goes to a new handler run. Handler runs are now `<runId>.onError.<attempt>`, and handoff checkpoints sit at seq 1,000,000,000 and up, past anything a body reaches.
+  - `FatalError(message, code?, details?)`: `details` (JSON-serializable) travels on the `StepError` to the run's error, an onError handler's input, and, with `code`, through a child's completion to the parent: `allSettled` rejected items carry `code`/`details`, and a failed `ctx.child` throws a `FatalError` with them. The Python SDK takes `FatalError(..., details=...)` and adds `ctx.all_settled`.
+  - A handed-off run is tagged `onError:<code>`, and the engine emits `run.routed`, or `run.unrouted` when the workers announce different routes. Announced routes are read once per 5s.
+  - `engine.unservedOnErrorRoutes()`, and a boot warning from the Nest module, for routes whose handler nothing can run.
+
+- [#383](https://github.com/DavideCarvalho/nestjs-durable/pull/383) [`cf54b7a`](https://github.com/DavideCarvalho/nestjs-durable/commit/cf54b7ad7a8eafc33020117ceb2b1ec7e1b37333) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - onError polish:
+
+  - Metrics count `run.routed` / `run.unrouted` (`runs.routed`, `runs.unrouted`, `routedByCode`, Prometheus `durable_runs_routed_total{code}`); the OTel bridge adds `durable.run.routed` / `durable.run.unrouted` span events; Telescope tags them `routed` / `unrouted` and `onError:<code>`, with the `reason`.
+  - The console shows a failure's `code` and `details` on the failed step and run.
+  - The boot warning for an unserved onError route rechecks after 30s, so handlers whose workers start later are not reported.
+  - A retry drops the run's `onError:<code>` tag along with the retired handoff.
+  - `listCheckpointsByNamePrefix` and `listSignalWaiters` match a prefix literally on every SQL store: `_` / `%` were read as `LIKE` wildcards (and Prisma's `startsWith` on SQLite). New conformance case.
+  - Python: `ctx.gather_calls_settled`.
+
+- [#381](https://github.com/DavideCarvalho/nestjs-durable/pull/381) [`b1e3440`](https://github.com/DavideCarvalho/nestjs-durable/commit/b1e34400fb3f2f9e6c51d3a6309efb99f84bcd1a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A summarized run detail and a fan page no longer read the run's whole checkpoint list.
+
+  - `StateStore` has two new optional methods. `checkpointStats(runId, { group? })` is one `GROUP BY parallel_group, status, <name kind>` that returns counts, seq and timestamp bounds and an attempt sum per bucket. `queryCheckpoints(runId, { group, excludeGroups, statuses, namePrefixes, offset, limit })` pages checkpoints in seq order. Every bundled store implements both, and `CodecStateStore` forwards them.
+  - Core's `summarizeRunFromStore` and `pageFanFromStore` build the same `RunDetail` and `FanPage` that `summarizeTimeline` and `pageFan` build from a full read. They read the aggregates, the rows outside wide fans, the folded `fan:` checkpoints, up to 20 failures per fan and the first child edges. While a wide child fan is in flight they also read its completed `signal:child:` rows, because only the payload tells whether a child failed.
+  - `StoreRunGateway` uses them when the store has both methods. Otherwise it falls back to the full read. On a 40,000-member step fan, a detail poll now reads 21 rows instead of 40,001, and a page of 100 reads 100.
+  - The summarized detail and the fan page carry an `etag`, derived from the run row and the checkpoint buckets. `RunDetailOptions.ifNoneMatch` and `FanPageQuery.ifNoneMatch` let the gateway answer `notModified` after reading only the run and the buckets. The options travel through `ProxyRunGateway` unchanged, so a tenant's poll costs the operator the same.
+  - Each store adds a `durable_step_checkpoints_group_idx` index on `(run_id, parallel_group, seq)`.
+  - The shared `runStateStoreContract` now expects both methods. It checks them against their in-memory references, and checks that the detail and the pages built on them match the ones built from a full read. The fixture covers step fans, child fans, folded checkpoints, failFast, partial waves and narrow fans.
+
+- [#374](https://github.com/DavideCarvalho/nestjs-durable/pull/374) [`b4ba4c1`](https://github.com/DavideCarvalho/nestjs-durable/commit/b4ba4c1fe3805bbd31ffda81209f36b6c8db8e34) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `onError` routes: when a run ends `failed` with an error whose `code` matches, the engine starts a handler workflow (`<runId>.onError`, input `{ runId, workflow, input, error }`) instead of failing the run, and the run settles with the handler's outcome. The run only follows its handler from then on; its body never runs again. Engine-orchestrated, so it holds for inline, in-app-worker and remote bodies: routes come from the local registration (`@OnError(ErrorClass | code?)` methods, `@Workflow({ onError })`, `register` / `registerRemote({ onError })`) or, for a workflow served by convention, from the `onError` its live workers announce on `WorkflowRegistration` (new golden fixture `descriptor-on-error.json`; the Python SDK announces it via `@worker.workflow(..., on_error=[...])`). `NonDeterminismError` now carries `code: 'non_determinism'`, which is never routed.
+
+### Patch Changes
+
+- [#374](https://github.com/DavideCarvalho/nestjs-durable/pull/374) [`c93d44c`](https://github.com/DavideCarvalho/nestjs-durable/commit/c93d44c78869007c993820cc0d2902a79ab1dba7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console links an onError handler run (`<runId>.onError`) to the run it handles, and a run waiting on its handler reads "awaiting · failure handler <workflow>". `parentRunIdOf` reads `<parent>.onError` too, so the telescope watcher stamps the handler's `parentRunId`.
+
 ## 0.78.0
 
 ### Minor Changes
