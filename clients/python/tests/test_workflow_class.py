@@ -13,9 +13,9 @@ class InvalidLine(FatalError):
     code = "invalid_line"
 
 
-class Rejections:
-    def __init__(self) -> None:
-        self.recorded: list = []
+class LineConfig:
+    def __init__(self, threshold: int) -> None:
+        self.threshold = threshold
 
 
 def _task(workflow: str, input_: object, history: list | None = None) -> dict:
@@ -31,12 +31,11 @@ def _task(workflow: str, input_: object, history: list | None = None) -> dict:
 
 def test_a_class_registers_its_run_and_its_handler_methods():
     worker = Worker(auto_register=False)
-    rejections = Rejections()
 
     @workflow("line", version="2")
     class LineWorkflow:
-        def __init__(self, rejections: Rejections) -> None:
-            self.rejections = rejections
+        def __init__(self, config: LineConfig) -> None:
+            self.config = config
 
         def run(self, _ctx, line):
             return {"ok": 1, "n": line["n"]}
@@ -44,14 +43,13 @@ def test_a_class_registers_its_run_and_its_handler_methods():
         @on_error(InvalidLine)
         @on_error("bad_row")
         def reject_line(self, _ctx, failure):
-            self.rejections.recorded.append(failure["input"])
-            return {"ok": 0, "failed": 1}
+            return {"ok": 0, "failed": 1, "over": failure["input"]["n"] > self.config.threshold}
 
         @on_error()
         def other(self, _ctx, _failure):
             return {"ok": 0, "failed": 1}
 
-    worker.register(LineWorkflow(rejections))
+    worker.register(LineWorkflow(LineConfig(threshold=2)))
 
     assert process_workflow_task(worker._workflows, _task("line", {"n": 3}))["output"] == {
         "ok": 1,
@@ -61,9 +59,8 @@ def test_a_class_registers_its_run_and_its_handler_methods():
         worker._workflows,
         _task("line.onError.reject_line", {"runId": "r0", "input": {"n": 3}, "error": {}}),
     )
-    assert handled["output"] == {"ok": 0, "failed": 1}
-    # The handler is bound to the instance that was registered, dependencies included.
-    assert rejections.recorded == [{"n": 3}]
+    # The handler is bound to the instance that was registered, what it was built with included.
+    assert handled["output"] == {"ok": 0, "failed": 1, "over": True}
 
     wire = _build_descriptor(worker, None, "default", lambda name: name).to_wire()
     by_name = {r["name"]: r for r in wire["registrations"]}

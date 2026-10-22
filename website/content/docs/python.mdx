@@ -419,40 +419,37 @@ def reject_line(ctx: WorkflowContext, failure):  # {"runId", "workflow", "input"
 ### Workflows as classes
 
 A workflow can be a class: `run(self, ctx, input)` is the body, and each method marked
-`@on_error(code)` is a handler (`<name>.onError.<method>`), bound to the instance. Declare the class
-with `@workflow(name, ...)` (the same options as `@worker.workflow`) and hand the worker an instance built
-with whatever it needs. A class that takes no arguments can be decorated with `@worker.workflow(name)`
-directly. A registered class is a workflow reference: pass it to `ctx.start_child`,
-`ctx.gather_children` or `ctx.all_settled` instead of the name.
+`@on_error(code)` is a handler (`<name>.onError.<method>`). Decorate it with `@worker.workflow(name)`.
+A registered class is a workflow reference: pass it to `ctx.start_child`, `ctx.gather_children` or
+`ctx.all_settled` instead of the name.
 
 ```python
-from durable_worker import FatalError, WorkflowContext, on_error, workflow
+from durable_worker import FatalError, WorkflowContext, on_error
 
 class InvalidLine(FatalError):
     code = "invalid_line"
 
-@workflow("line", version="2")
+@worker.workflow("line")
 class LineWorkflow:
-    def __init__(self, rejections):
-        self.rejections = rejections
-
     def run(self, ctx: WorkflowContext, line):
-        ctx.gather_calls([{"name": "validate_line", "input": line}])
+        ctx.step("validate_line", line)
         return {"ok": 1, "failed": 0}
 
     @on_error(InvalidLine)
     def reject_line(self, ctx: WorkflowContext, failure):
-        self.rejections.add(failure["input"], failure["error"].get("details"))
+        ctx.step("record_rejected_line", failure)  # side effects go in steps
         return {"ok": 0, "failed": 1}
-
-worker.register(LineWorkflow(rejections=RejectionsRepo()))
 
 @worker.workflow("file")
 def file(ctx: WorkflowContext, lines):
     return ctx.all_settled(LineWorkflow, lines)
 ```
 
-The instance serves every run and every replay, so keep only dependencies on it, never run state.
+The body and the handlers are replayed, so their side effects belong in steps, like any workflow's. A
+class that needs something at construction (configuration, a client for its steps' names) is declared
+with `@workflow(name, ...)` instead and handed to the worker built: `worker.register(LineWorkflow(cfg))`.
+The instance serves every run and every replay, so keep only what it was built with on it, never run
+state.
 A function workflow keeps `@line.on_error(code)` for the same thing.
 
 ### The `WorkflowContext` ops

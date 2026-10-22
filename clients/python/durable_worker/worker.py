@@ -544,7 +544,7 @@ class Worker:
         """Register a workflow class declared with :func:`durable_worker.workflow` — an instance built
         with its dependencies, or the class itself when it takes none::
 
-            worker.register(LineWorkflow(rejections=repo))
+            worker.register(LineWorkflow(config))
         """
         from .workflow import _register_declared
 

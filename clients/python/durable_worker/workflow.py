@@ -202,13 +202,13 @@ def workflow(
 
         @workflow("line", version="2")
         class LineWorkflow:
-            def __init__(self, rejections): ...
+            def __init__(self, config): ...
             def run(self, ctx, line): ...
 
             @on_error(InvalidLine)
             def reject_line(self, ctx, failure): ...
 
-        worker.register(LineWorkflow(rejections=repo))
+        worker.register(LineWorkflow(config))
 
     The class is a workflow reference from here on, for ``ctx.start_child`` / ``ctx.all_settled``."""
 
