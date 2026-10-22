@@ -35,7 +35,7 @@ whose history no longer matches its code.
 - Deploy the workers that run your workflow code **together** with the operator/API — a partial
   rollout means some instances are replaying old-shaped runs against new code. Find and kill any
   stale local process still consuming a shared queue; see
-  ["Deploys: replay-safety discipline"](/docs/production#5-deploys-replay-safety-discipline) and the
+  ["Deploys: replay-safety discipline"](/docs/production#6-deploys-replay-safety-discipline) and the
   "stale local worker" pitfalls in [Tenancy](/docs/concepts/tenancy#pitfalls).
 
 ## `NestedWorkflowCallError`: a ctx call inside a step body
