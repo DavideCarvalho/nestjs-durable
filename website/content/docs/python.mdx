@@ -403,6 +403,19 @@ def pipeline(ctx: WorkflowContext, data):
 run_workers([worker], redis=redis_url_from_env())        # one loop, one Redis pool, graceful shutdown
 ```
 
+A failure the workflow should turn into an outcome (a line that fails validation) is routed to a
+handler: `.on_error(code)` on the workflow function registers the handler as its own workflow
+(`pipeline.onError.<function>`) and announces the route, and the engine starts it when a run fails with
+that code. Raise `FatalError(message, code, details=...)` in the step so it skips the retries and the
+handler gets `failure["error"]["details"]`. See [Routing a run's failure](/docs/reliability/on-error).
+
+```python
+@pipeline.on_error("invalid_line")
+def reject_line(ctx: WorkflowContext, failure):  # {"runId", "workflow", "input", "error"}
+    ctx.gather_calls([{"name": "record_rejected_line", "input": failure}])
+    return {"rows": 0, "rejected": True}
+```
+
 ### The `WorkflowContext` ops
 
 `ctx` mirrors the TypeScript `WorkflowCtx` — each op is keyed by a deterministic seq, so a completed

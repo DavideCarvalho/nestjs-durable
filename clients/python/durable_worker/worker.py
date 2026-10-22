@@ -510,8 +510,19 @@ class Worker:
         engine starts the route's handler workflow instead of failing the run, and the run settles
         with the handler's outcome. The handler can be a workflow of any runtime::
 
-            @worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-dead-letter"}])
+            @worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-rejected"}])
             def line(ctx, input): ...
+
+        Or declare the handler inline: the decorated function gets ``.on_error(code)``, which registers
+        the handler as the workflow ``<name>.onError.<function>`` and announces the route to it. ``code``
+        is a code string, an exception class with a ``code`` attribute, or nothing for the catch-all::
+
+            @worker.workflow("line")
+            def line(ctx, input): ...
+
+            @line.on_error("invalid_line")
+            def reject_line(ctx, failure):  # {"runId", "workflow", "input", "error"}
+                return {"ok": 0, "failed": 1}
         """
 
         def register(fn: Handler) -> Handler:
@@ -527,6 +538,9 @@ class Worker:
                 meta["on_error"] = [dict(route) for route in on_error]
             if meta:
                 self._workflow_meta[name] = meta
+            from .workflow import _inline_on_error
+
+            _inline_on_error(self, name, fn)
             return fn
 
         return register

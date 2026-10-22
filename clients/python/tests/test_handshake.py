@@ -509,3 +509,85 @@ def test_non_determinism_carries_the_code_the_engine_never_routes():
         raise NondeterminismError("history mismatch")
     except NondeterminismError as err:
         assert _to_error(err)["code"] == "non_determinism"
+
+
+def test_an_inline_on_error_handler_is_registered_and_its_route_announced():
+    from durable_worker import FatalError, Worker
+    from durable_worker.redis_runner import _build_descriptor
+
+    class InvalidLine(FatalError):
+        code = "invalid_line"
+
+    worker = Worker(auto_register=False)
+
+    @worker.workflow("line", version="2", origin="flip-python-db")
+    def line(_ctx, _input):
+        return {"ok": 1}
+
+    @line.on_error(InvalidLine)
+    @line.on_error("bad_row")
+    def reject_line(_ctx, failure):
+        return {"ok": 0, "failed": 1, "why": failure["error"]["code"]}
+
+    @line.on_error()
+    def other(_ctx, _failure):
+        return {"ok": 0, "failed": 1}
+
+    assert worker._workflows["line.onError.reject_line"] is reject_line
+    assert worker._workflows["line.onError.other"] is other
+    wire = _build_descriptor(worker, None, "default", lambda name: name).to_wire()
+    by_name = {r["name"]: r for r in wire["registrations"]}
+    assert by_name["line"]["onError"] == [
+        {"code": "bad_row", "workflow": "line.onError.reject_line"},
+        {"code": "invalid_line", "workflow": "line.onError.reject_line"},
+        {"workflow": "line.onError.other"},
+    ]
+    # The handler is a workflow this worker serves, announced with the workflow's version and origin.
+    assert by_name["line.onError.reject_line"] == {
+        "name": "line.onError.reject_line",
+        "version": "2",
+        "group": "line.onError.reject_line",
+        "origin": "flip-python-db",
+    }
+
+
+def test_an_inline_on_error_rejects_a_duplicate_code_and_a_class_without_one():
+    from durable_worker import Worker
+
+    worker = Worker(auto_register=False)
+
+    @worker.workflow("line")
+    def line(_ctx, _input):
+        return None
+
+    @line.on_error("invalid_line")
+    def first(_ctx, _failure):
+        return None
+
+    with pytest.raises(ValueError, match='for code "invalid_line"'):
+
+        @line.on_error("invalid_line")
+        def second(_ctx, _failure):
+            return None
+
+    with pytest.raises(ValueError, match="needs a `code` attribute"):
+        line.on_error(ValueError)
+
+
+def test_the_split_workflow_worker_has_the_same_inline_on_error():
+    from durable_worker.workflow import WorkflowWorker
+
+    worker = WorkflowWorker("lines")
+
+    @worker.workflow("line")
+    def line(_ctx, _input):
+        return None
+
+    @line.on_error("invalid_line")
+    def reject_line(_ctx, _failure):
+        return None
+
+    assert worker.handles("line.onError.reject_line")
+    assert worker._workflow_meta["line"]["on_error"] == [
+        {"code": "invalid_line", "workflow": "line.onError.reject_line"}
+    ]

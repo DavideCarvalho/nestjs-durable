@@ -91,6 +91,46 @@ def _to_error(err: Exception) -> Dict[str, Any]:
     return out
 
 
+
+def _inline_on_error(owner: Any, name: str, fn: Callable[..., Any]) -> None:
+    """Give a registered workflow function ``fn.on_error(code)``: a decorator that registers the decorated
+    function as the workflow ``<name>.onError.<function>`` on ``owner`` and adds the route to it to the
+    workflow's announced ``on_error``. The engine routes the failure; this only declares and announces it,
+    like a Nest ``@OnError`` method.
+
+    ``code`` is a code string, an exception class with a ``code`` attribute, or ``None`` for the
+    catch-all. Stack the decorator to give one handler several codes. The handler is announced with
+    the workflow's version and origin."""
+
+    def on_error(code: Any = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        resolved = code if code is None or isinstance(code, str) else getattr(code, "code", None)
+        if code is not None and not isinstance(resolved, str):
+            raise ValueError(
+                f"on_error({code!r}): an exception class needs a `code` attribute; or pass the code string"
+            )
+
+        def register(handler: Callable[..., Any]) -> Callable[..., Any]:
+            handler_name = f"{name}.onError.{handler.__name__}"
+            meta = owner._workflow_meta.setdefault(name, {})
+            routes = meta.setdefault("on_error", [])
+            if any(r.get("code") == resolved for r in routes):
+                which = "without a code" if resolved is None else f'for code "{resolved}"'
+                raise ValueError(f"workflow {name}: more than one on_error route {which}")
+            route = {"workflow": handler_name}
+            if resolved is not None:
+                route = {"code": resolved, **route}
+            routes.append(route)
+            owner._workflows[handler_name] = handler
+            announced = {k: meta[k] for k in ("version", "origin") if k in meta}
+            if announced:
+                owner._workflow_meta[handler_name] = announced
+            return handler
+
+        return register
+
+    fn.on_error = on_error  # type: ignore[attr-defined]
+
+
 class WorkflowContext:
     """The replay context handed to a workflow function. Its ops are deterministic: same code + same
     history ⇒ same seqs ⇒ same decisions."""
@@ -825,7 +865,8 @@ class WorkflowWorker:
 
         ``version`` / ``requires`` / ``origin`` are announcement metadata only, and ``on_error`` the
         routes the engine applies to a failed run — identical in meaning to
-        :meth:`durable_worker.worker.Worker.workflow`'s (design §7.9), and equally optional."""
+        :meth:`durable_worker.worker.Worker.workflow`'s (design §7.9), and equally optional. The
+        returned function also has ``.on_error(code)`` for an inline handler, as on ``Worker``."""
 
         def register(fn: WorkflowFn) -> WorkflowFn:
             self._workflows[name] = fn
@@ -840,6 +881,7 @@ class WorkflowWorker:
                 meta["on_error"] = [dict(route) for route in on_error]
             if meta:
                 self._workflow_meta[name] = meta
+            _inline_on_error(self, name, fn)
             return fn
 
         return register
