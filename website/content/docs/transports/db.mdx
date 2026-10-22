@@ -13,6 +13,9 @@ row to resume the run. The database you already operate *is* the queue.
 pnpm add @dudousxd/nestjs-durable-transport-db
 ```
 
+How it compares to the other transports, and what the SQL transport doesn't support: see
+[Choosing a transport](/docs/transports/choosing).
+
 ```ts title="engine side"
 new DbTransport({ executor: mikroOrmExecutor(em) });           // rides your app's connection
 ```
