@@ -43,6 +43,10 @@ before you rely on it:
   `engine.recoverIncomplete()` reclaims the orphaned run — on **any** instance, not only on the next
   boot. `leaseMs` defaults to 30 000 — set it above your
   longest single resume step, since the lease renews for the run's whole duration, not just its start.
+  Releasing the lease at the end of a turn is best effort: if the store refuses that write (say the
+  connection is stuck in an aborted transaction after the step that failed the run), the engine
+  logs a `[nestjs-durable] releasing the lease of run … failed` warning and keeps the turn's real
+  outcome. The lease then expires on its own and recovery takes over.
 - **`recoverIncomplete` needs a heartbeat to run periodically, not just at boot.** The NestJS
   `TimerPoller` calls it every tick (alongside `resumeDueTimers`/`sweepTimeouts`) — this is what turns
   a 30-second lease into a real self-healing loop instead of a recovery that only fires once per

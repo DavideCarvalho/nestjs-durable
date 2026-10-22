@@ -1468,6 +1468,31 @@ export class WorkflowEngine {
     void tail.then(close, close);
   }
 
+  /**
+   * Release a run's lease AFTER its outcome is decided (persisted, or about to be returned). Best
+   * effort, and that matters most on the failure path: the thing that failed the run is frequently
+   * the very store this release talks to (a step that violated a DB constraint leaves Postgres
+   * refusing every further statement on that connection), so the release throws too. A throwing
+   * release in a `finally` REPLACES the run's real outcome with a lease write nobody asked about,
+   * skips the post-turn re-drives after it, and, for a turn driven as a background resume, surfaces
+   * as an unhandled rejection instead of a failed run.
+   *
+   * Letting it go is safe: the lease expires on its own and `recoverIncomplete` re-drives whatever
+   * is still held. A lost release costs one lease window of latency; a masked error costs the
+   * diagnosis.
+   */
+  private async releaseLeaseBestEffort(runId: string): Promise<void> {
+    try {
+      await this.store.releaseRunLock(runId);
+    } catch (err) {
+      console.warn(
+        `[nestjs-durable] releasing the lease of run ${runId} failed (it expires on its own and recovery re-drives): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   /** The run's persisted state as a {@link RunResult}, without executing anything. */
   private async echoCurrentStatus(runId: string): Promise<RunResult> {
     const run = await this.store.getRun(runId);
@@ -3730,7 +3755,7 @@ export class WorkflowEngine {
           .publishControl({ kind: 'cancel', runId: run.id, from: this.instanceId })
           .catch(() => undefined);
       }
-      await this.store.releaseRunLock(run.id);
+      await this.releaseLeaseBestEffort(run.id);
       return { runId: run.id, status: 'cancelled', error };
     }
     const remote = registered.remote as NonNullable<RegisteredWorkflow['remote']>;
@@ -3765,7 +3790,7 @@ export class WorkflowEngine {
     if (handoff) {
       // A run that handed its failure to an onError handler only follows the handler from here on.
       const result = await this.settleRun(run, await this.followHandoff(run, handoff));
-      await this.store.releaseRunLock(run.id);
+      await this.releaseLeaseBestEffort(run.id);
       return result;
     }
     const history = await this.remoteHistory(run.id, checkpoints);
@@ -3858,7 +3883,7 @@ export class WorkflowEngine {
       // lease (released just below) stays free. `releaseRunLock` is idempotent, and `renewRunLock` is a
       // no-op once `lockedBy` is cleared, so a renew tick racing the release cannot re-acquire it.
       if (err instanceof RemoteWorkflowTimeout) {
-        await this.store.releaseRunLock(run.id);
+        await this.releaseLeaseBestEffort(run.id);
         // The suspended path returned early above; run is always `running` here — left for recovery to re-drive.
         return { runId: run.id, status: 'running' as const };
       }
@@ -4648,7 +4673,7 @@ export class WorkflowEngine {
         this.awaitedRemoteSteps.delete(run.id);
       }
       if (this.awaitedStepFans.get(run.id) === awaitedFans) this.awaitedStepFans.delete(run.id);
-      await this.store.releaseRunLock(run.id);
+      await this.releaseLeaseBestEffort(run.id);
       if (suspendedOnFan) {
         void this.redriveSettledChildren(run.id, suspendedOnFan).catch(() => undefined);
       }
