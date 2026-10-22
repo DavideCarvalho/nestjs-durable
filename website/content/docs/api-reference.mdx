@@ -255,7 +255,7 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 
 | Member | Signature | Notes |
 | --- | --- | --- |
-| `start` | `start(workflow: WorkflowRef, input: unknown, runId: string, opts?: StartOptions): Promise<RunResult>` | Create + enqueue a run. Idempotent by `runId` — a redelivered `runId` returns the existing run's state. `opts.version` starts that exact registered version instead of the newest (throws if it isn't registered — never falls back). |
+| `start` | `start(workflow: WorkflowRef, input: unknown, runId: string, opts?: StartOptions): Promise<RunResult>` | Create + enqueue a run. Idempotent by `runId` — a redelivered `runId` returns the existing run's state. `opts.version` starts that exact registered version instead of the newest (throws if it isn't registered — never falls back). `opts.startAt` (epoch ms or `Date`) delays the start: the run is parked `suspended` on its durable wake timer until then (see [Delayed start](/docs/concepts/sleep-and-signals#delayed-start)). |
 | `signal` | `signal(token: string, payload: unknown): Promise<RunResult \| null>` | Deliver a signal; buffers it if no run is waiting yet (reliable regardless of arrival order). |
 | `signalWithStart` | `signalWithStart(workflow: WorkflowRef, input: unknown, runId: string, signal: { token: string; payload?: unknown }, opts?: StartOptions): Promise<{ runId: string }>` | Ensure-then-signal, race-free. |
 | `update` | `update(runId: string, name: string, arg: unknown): Promise<UpdateResult>` | Deliver a validated update to a run waiting at `ctx.onUpdate(name)`. Runs the registered validator first; rejection never touches the run. |

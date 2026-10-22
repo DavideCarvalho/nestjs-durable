@@ -186,6 +186,18 @@ export interface StartOptions {
    * workflow's registered `concurrency`. See {@link ConcurrencyQuota}.
    */
   concurrency?: ConcurrencyQuota | undefined;
+  /**
+   * Delayed start: don't execute before this time (epoch ms, or a `Date`), compared against the
+   * engine's clock. The run is created `suspended` with its `wakeAt` set to it, which is the same
+   * durable timer a `ctx.sleep` parks on: nothing is held in memory, it survives restarts, and the
+   * timer poller (`resumeDueTimers`) starts it once due, on any instance. A time that is not in the
+   * future starts the run at once, as if it were omitted.
+   *
+   * A delayed run reads `suspended` until it fires (so `start` returns `suspended`, and `waitForRun`
+   * settles on that right away), and skips the `run.started` event's `pending → running` hop. It
+   * counts as in flight for singleton back-pressure and concurrency quotas while it waits.
+   */
+  startAt?: number | Date | undefined;
 }
 
 /**
@@ -1372,11 +1384,17 @@ export class WorkflowEngine {
     if (registered.singleton) {
       await this.singletons.assertCapacity(name, registered.singleton, input);
     }
+    // Delayed start: park the run on its durable wake timer instead of dispatching it now (see
+    // StartOptions.startAt). Compared against the ENGINE clock, the one the timer poller uses.
+    const startAtMs = opts?.startAt instanceof Date ? opts.startAt.getTime() : opts?.startAt;
+    const delayed =
+      startAtMs !== undefined && Number.isFinite(startAtMs) && startAtMs > this.clock();
     const run: WorkflowRun = {
       id: runId,
       workflow: name,
       workflowVersion: registered.version,
-      status: 'pending',
+      status: delayed ? 'suspended' : 'pending',
+      ...(delayed ? { wakeAt: startAtMs } : {}),
       namespace: opts?.namespace ?? this.namespace,
       // DERIVED from the registration, exactly like `namespace` is derived from this engine — there is
       // deliberately no `opts.origin`, so a caller cannot label its run as another package's work.
@@ -1399,6 +1417,11 @@ export class WorkflowEngine {
       const winner = await this.store.getRun(runId).catch(() => null);
       if (!winner) throw err;
       return { runId, status: winner.status, output: winner.output, error: winner.error };
+    }
+    // A delayed run waits for its timer: the timer poller starts it, so nothing is dispatched now.
+    if (delayed) {
+      this.emit({ type: 'run.suspended', runId, workflow: name, namespace: run.namespace });
+      return { runId, status: 'suspended' };
     }
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
