@@ -1,5 +1,25 @@
 # @dudousxd/nestjs-durable-testing
 
+## 0.21.0
+
+### Minor Changes
+
+- [#406](https://github.com/DavideCarvalho/nestjs-durable/pull/406) [`4d9e840`](https://github.com/DavideCarvalho/nestjs-durable/commit/4d9e8406948130b55de0072e1276bbe06666ddd3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Lease takeover fencing, and `drain()` releases leases on timeout.
+
+  **Fencing.** The engine used to ignore the result of its lease renewals. A turn that stalled past `leaseMs` (a blocked event loop, a long GC pause, a store outage) kept running after another instance had taken the run over, and then wrote its outcome over the new owner's work. Now a renewal that reports the lease lost fences that execution: its completion, failure, suspension, continue-as-new, saga undo, blocked park or remote-turn decision is not written (the store's current state is reported instead), and it no longer releases the lease, which belongs to the new owner. It logs `[nestjs-durable] lost the lease of run … while executing it`. A renewal that throws is still not treated as a takeover, and a lease a turn gives away on purpose (a remote turn suspending on its dispatched decision) is not mistaken for one.
+
+  **Drain.** When `drain(timeoutMs)` (`shutdownTimeoutMs` in `DurableModule`) runs out of budget with runs still executing, it now releases their recovery leases, fencing those turns first, so another instance recovers them on its next pass instead of waiting up to `leaseMs`. It logs which runs it released.
+
+  **`StateStore.releaseRunLock(runId, owner?)`.** The new optional `owner` argument makes the release owner-scoped: only a lease `owner` still holds is cleared. The drain uses it so it never frees a lease another instance already took over. Every first-party store, the in-memory store and `CodecStateStore` implement it; a third-party store that ignores the argument keeps working (it releases unconditionally, as before). The state-store conformance suite in `@dudousxd/nestjs-durable-testing` gains a case for it.
+
+  Also adds `engine.listCheckpoints(runId)`, a pass-through to the store.
+
+- [#406](https://github.com/DavideCarvalho/nestjs-durable/pull/406) [`4d9e840`](https://github.com/DavideCarvalho/nestjs-durable/commit/4d9e8406948130b55de0072e1276bbe06666ddd3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Replay fixtures for CI.
+
+  - The testing kit adds `captureHistory(engineOrStore, runId)`, `serializeRunHistory(history)` and `parseRunHistory(json)`. Use them to capture a run with its checkpoints as a JSON fixture, commit it, and assert it with `assertReplayable(register, parseRunHistory(json))`.
+  - `durable export <runId> [--out file]` writes the same fixture from your configured store.
+  - Both writers stamp core's new `RUN_HISTORY_FIXTURE_VERSION` (re-exported by the testing kit), and `parseRunHistory` rejects a fixture stamped with any other version. A fixture without `version` is read as version 1.
+
 ## 0.20.0
 
 ### Minor Changes

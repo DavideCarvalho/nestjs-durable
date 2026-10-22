@@ -1,5 +1,35 @@
 # @dudousxd/nestjs-durable-store-typeorm
 
+## 0.25.0
+
+### Minor Changes
+
+- [#406](https://github.com/DavideCarvalho/nestjs-durable/pull/406) [`4d9e840`](https://github.com/DavideCarvalho/nestjs-durable/commit/4d9e8406948130b55de0072e1276bbe06666ddd3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Lease takeover fencing, and `drain()` releases leases on timeout.
+
+  **Fencing.** The engine used to ignore the result of its lease renewals. A turn that stalled past `leaseMs` (a blocked event loop, a long GC pause, a store outage) kept running after another instance had taken the run over, and then wrote its outcome over the new owner's work. Now a renewal that reports the lease lost fences that execution: its completion, failure, suspension, continue-as-new, saga undo, blocked park or remote-turn decision is not written (the store's current state is reported instead), and it no longer releases the lease, which belongs to the new owner. It logs `[nestjs-durable] lost the lease of run … while executing it`. A renewal that throws is still not treated as a takeover, and a lease a turn gives away on purpose (a remote turn suspending on its dispatched decision) is not mistaken for one.
+
+  **Drain.** When `drain(timeoutMs)` (`shutdownTimeoutMs` in `DurableModule`) runs out of budget with runs still executing, it now releases their recovery leases, fencing those turns first, so another instance recovers them on its next pass instead of waiting up to `leaseMs`. It logs which runs it released.
+
+  **`StateStore.releaseRunLock(runId, owner?)`.** The new optional `owner` argument makes the release owner-scoped: only a lease `owner` still holds is cleared. The drain uses it so it never frees a lease another instance already took over. Every first-party store, the in-memory store and `CodecStateStore` implement it; a third-party store that ignores the argument keeps working (it releases unconditionally, as before). The state-store conformance suite in `@dudousxd/nestjs-durable-testing` gains a case for it.
+
+  Also adds `engine.listCheckpoints(runId)`, a pass-through to the store.
+
+- [#406](https://github.com/DavideCarvalho/nestjs-durable/pull/406) [`4d9e840`](https://github.com/DavideCarvalho/nestjs-durable/commit/4d9e8406948130b55de0072e1276bbe06666ddd3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The boot-time schema check now logs one warning when it actually repairs a durable schema.
+
+  `ensureSchema()` (auto-schema) on the MikroORM, TypeORM and Drizzle Postgres stores fixes a schema that is behind the library: a missing table, column or index, a MySQL JSON column still `text`, or a MySQL collation that drifted. It used to do this silently. Now, when it changes something, it logs one line listing each change, for example:
+
+  ```
+  [nestjs-durable] store-typeorm repaired the durable schema at boot: added column durable_workflow_runs.origin; created index durable_runs_namespace_status_idx on durable_workflow_runs. The database had drifted from the schema this library version expects …
+  ```
+
+  An already-current schema logs nothing. A fresh install (no durable table existed yet) logs nothing too, because creating every table on the first boot is expected, not drift.
+
+  The warning goes to `console.warn` by default. Pass `schemaLogger` (anything with `warn(message)`, such as Nest's `Logger`) to the store constructor, or `{ logger }` as the new optional second argument of `ensureMikroOrmDurableSchema` / `ensureTypeOrmDurableSchema` / `ensureDrizzlePgDurableSchema`. Existing calls compile and behave as before, apart from the warning.
+
+  TypeORM on MySQL: the `text` to `longtext` widen now runs only for columns that are not `longtext` yet, instead of an `ALTER … MODIFY` on every boot.
+
+  The Drizzle SQLite store and the Prisma store have no auto-schema, so they don't log this.
+
 ## 0.24.0
 
 ### Minor Changes
