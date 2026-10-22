@@ -498,3 +498,79 @@ class GatherCallsSettledTest(unittest.TestCase):
         ctx = self._ctx()
         self.assertEqual(ctx.gather_calls_settled([]), [])
         self.assertEqual(ctx.commands, [])
+
+
+class GatherSettledTest(unittest.TestCase):
+    @staticmethod
+    def _items(calls):
+        from durable_worker import FatalError
+
+        def ok(n):
+            def body():
+                calls.append(n)
+                return n * 10
+
+            return body
+
+        def invalid():
+            calls.append(1)
+            raise FatalError("bad line", code="invalid", details={"field": "amount"})
+
+        def down():
+            calls.append(2)
+            raise RuntimeError("down")
+
+        return [("a", ok(0)), ("b", invalid), ("c", down)]
+
+    @staticmethod
+    def _without_times(commands):
+        return [
+            {k: v for k, v in c.items() if k not in ("startedAt", "finishedAt")} for c in commands
+        ]
+
+    def test_first_run_records_the_same_commands_as_gather(self):
+        settled = WorkflowContext("run1", [])
+        settled.gather_settled(self._items([]))
+        gathered = WorkflowContext("run1", [])
+        with self.assertRaises(_GF):
+            gathered.gather(self._items([]))
+        self.assertEqual(
+            [{k: v for k, v in c.items() if k != "error"} for c in self._without_times(settled.commands)],
+            [{k: v for k, v in c.items() if k != "error"} for c in self._without_times(gathered.commands)],
+        )
+        self.assertEqual([c.get("error", {}).get("message") for c in settled.commands], [None, "bad line", "down"])
+
+    def test_returns_every_outcome_in_input_order(self):
+        out = WorkflowContext("run1", []).gather_settled(self._items([]))
+        self.assertEqual(
+            out,
+            [
+                {"status": "fulfilled", "value": 0},
+                {
+                    "status": "rejected",
+                    "id": "run1:1",
+                    "error": "bad line",
+                    "code": "invalid",
+                    "details": {"field": "amount"},
+                },
+                {"status": "rejected", "id": "run1:2", "error": "down"},
+            ],
+        )
+
+    def test_replay_returns_the_recorded_outcomes_without_running_bodies(self):
+        first = WorkflowContext("run1", [])
+        expected = first.gather_settled(self._items([]))
+        history = [
+            {"seq": c["seq"], "kind": "step", "name": c["name"], **({"error": c["error"]} if "error" in c else {"output": c["output"]})}
+            for c in first.commands
+        ]
+        calls = []
+        replayed = WorkflowContext("run1", history)
+        self.assertEqual(replayed.gather_settled(self._items(calls)), expected)
+        self.assertEqual(calls, [])
+        self.assertEqual(replayed.commands, [])
+
+    def test_empty_items_returns_empty(self):
+        ctx = WorkflowContext("run1", [])
+        self.assertEqual(ctx.gather_settled([]), [])
+        self.assertEqual(ctx.commands, [])

@@ -399,17 +399,42 @@ class WorkflowContext:
         Returns results in input order. Deterministic: on replay (all seqs already in history) it
         reconstructs the result/raise from history WITHOUT invoking any body.
         """
+        _, outcomes = self._local_fan(items, mode)
+        if not outcomes:
+            return []
+        return self._aggregate(outcomes, lambda ev: ev["name"])
+
+    def gather_settled(self, items: "List[tuple]") -> "List[Dict[str, Any]]":
+        """:meth:`gather` that never raises for a failed body: runs and records every item exactly as
+        ``gather`` does in ``wait_all`` mode (seqs, ``recordStep`` commands, parallel group, replay
+        without re-running bodies), then returns one dict per item, in input order.
+
+        A fulfilled item is ``{"status": "fulfilled", "value": output}``; a failed one is
+        ``{"status": "rejected", "id": "<runId>:<seq>", "error": message}``, plus the recorded ``code``
+        and ``details`` when the body raised with them. The id is the engine's step id.
+        """
+        seqs, outcomes = self._local_fan(items, "wait_all")
+        return _settled(seqs, outcomes, lambda seq: f"{self.run_id}:{seq}")
+
+    def _local_fan(
+        self, items: "List[tuple]", mode: str
+    ) -> "Tuple[List[int], List[Dict[str, Any]]]":
+        """The fan :meth:`gather` and :meth:`gather_settled` share: reserves a contiguous seq block,
+        and either replays every recorded outcome or runs every body in its own thread and records
+        each as a ``recordStep``. Returns the seqs and one history-shaped entry per item
+        (``{"name", "output"}`` or ``{"name", "error"}``), in input order."""
         from .worker import StepContext, _current_step  # lazy: avoid import cycle with worker.py
 
         entries = [(self._next(), name, body) for name, body in items]
         if not entries:
-            return []
+            return [], []
+        seqs = [seq for seq, _, _ in entries]
         group = f"gather:{entries[0][0]}"
 
         # Replay: inline steps all record in ONE turn, so either ALL or NONE of the seqs are present.
         if all(self._replay_entry(seq, "step", name) is not None for seq, name, _ in entries):
-            replay_entries = [self._replay_entry(seq, "step", name) for seq, name, _ in entries]
-            return self._aggregate(replay_entries, lambda ev: ev["name"])
+            replayed = [self._replay_entry(seq, "step", name) for seq, name, _ in entries]
+            return seqs, replayed  # type: ignore[return-value]
 
         cancel = threading.Event()
         run_cancel = self._is_cancelled
@@ -450,8 +475,7 @@ class WorkflowContext:
             t.join()
 
         finished = int(time.time() * 1000)
-        outputs = []
-        failures = []
+        outcomes: List[Dict[str, Any]] = []
         for seq, name, _ in entries:
             r = results.get(seq, {"error": {"message": "gather item did not run"}, "events": []})
             cmd: Dict[str, Any] = {
@@ -460,11 +484,10 @@ class WorkflowContext:
             }
             if "error" in r:
                 cmd["error"] = r["error"]
-                failures.append({"name": name, "error": r["error"]})
-                outputs.append(None)
+                outcomes.append({"name": name, "error": r["error"]})
             else:
                 cmd["output"] = r["output"]
-                outputs.append(r["output"])
+                outcomes.append({"name": name, "output": r["output"]})
             if r.get("events"):
                 cmd["events"] = r["events"]
             self.commands.append(cmd)
@@ -480,9 +503,7 @@ class WorkflowContext:
                 event["output"] = r["output"]
             self._emit_step(event)
 
-        if failures:
-            raise GatherFailed(failures)
-        return outputs
+        return seqs, outcomes
 
     def sleep(self, ms: int) -> None:
         """Durably sleep ``ms``; the run suspends and the engine resumes it when the timer fires."""
