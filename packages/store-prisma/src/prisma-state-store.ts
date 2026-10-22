@@ -231,6 +231,27 @@ export class PrismaStateStore implements StateStore {
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
   }
 
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    inputPatch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    if (expectedStatuses.length === 0) return false;
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) => this.getRun(id))
+        : inputPatch;
+    // One conditional `updateMany` (`UPDATE … WHERE id = ? AND status IN (…)`): the status
+    // predicate is the compare, the row count the answer, and a missing row matches nothing.
+    const { count } = await this.db.durableWorkflowRun.updateMany({
+      where: { id: runId, status: { in: expectedStatuses } },
+      data: toRunPatch(patch),
+    });
+    if (count === 0) return false;
+    if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
+    return true;
+  }
+
   /** Rewrite a run's normalized attribute rows: delete the old set, insert the current one. Mirrors
    *  the in-memory store's reindex so the side-table always reflects the run's live searchAttributes. */
   private async reindexAttributes(

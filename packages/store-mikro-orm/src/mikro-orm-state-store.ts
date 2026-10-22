@@ -201,6 +201,41 @@ export class MikroOrmStateStore implements StateStore {
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
   }
 
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    inputPatch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    if (expectedStatuses.length === 0) return false;
+    // Writes are unscoped, like updateRun.
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) =>
+            this.withScope({}).getRun(id),
+          )
+        : inputPatch;
+    const data = runUpdateData(patch);
+    const em = this.fork();
+    let applied: boolean;
+    if (Object.keys(data).length) {
+      // One conditional UPDATE: the status predicate is the compare, the changed-row count the
+      // answer, and a missing row matches nothing.
+      applied =
+        (await em.nativeUpdate(
+          WorkflowRunEntity,
+          { id: runId, status: { $in: expectedStatuses } },
+          data,
+        )) > 0;
+    } else {
+      // Nothing to write but (maybe) the attribute side-table: the compare is a read.
+      applied =
+        (await em.count(WorkflowRunEntity, { id: runId, status: { $in: expectedStatuses } })) > 0;
+    }
+    if (applied && 'searchAttributes' in patch)
+      await this.reindexAttributes(runId, patch.searchAttributes);
+    return applied;
+  }
+
   /** Rewrite a run's normalized attribute rows: delete the old set, insert the current one. Mirrors
    *  the in-memory store's reindex so the side-table always reflects the run's live searchAttributes. */
   private async reindexAttributes(
@@ -1119,6 +1154,33 @@ export class MikroOrmStateStore implements StateStore {
     const affected = await em.nativeDelete(BufferedEventEntity, { id });
     return affected > 0;
   }
+}
+
+/** The `nativeUpdate` data for a run patch: only the patched fields; a cleared one is written NULL. */
+function runUpdateData(patch: Partial<WorkflowRun>): Record<string, unknown> {
+  const data: Record<string, unknown> = {};
+  if ('workflow' in patch) data.workflow = patch.workflow;
+  if ('workflowVersion' in patch) data.workflowVersion = patch.workflowVersion;
+  if ('status' in patch) data.status = patch.status;
+  if ('input' in patch) data.input = patch.input ?? null;
+  if ('output' in patch) data.output = patch.output ?? null;
+  if ('error' in patch) data.error = patch.error ?? null;
+  if ('wakeAt' in patch) data.wakeAt = patch.wakeAt == null ? null : new Date(patch.wakeAt);
+  if ('lockedBy' in patch) data.lockedBy = patch.lockedBy ?? null;
+  if ('lockedUntil' in patch)
+    data.lockedUntil = patch.lockedUntil == null ? null : new Date(patch.lockedUntil);
+  if ('awaitingDecisionTaskId' in patch)
+    data.awaitingDecisionTaskId = patch.awaitingDecisionTaskId ?? null;
+  if ('recoveryAttempts' in patch) data.recoveryAttempts = patch.recoveryAttempts ?? null;
+  if ('tags' in patch) data.tags = patch.tags ?? null;
+  if ('searchAttributes' in patch) data.searchAttributes = patch.searchAttributes ?? null;
+  if ('priority' in patch) data.priority = patch.priority ?? null;
+  // The column is the isolation predicate: a cleared namespace lands on 'default', never NULL.
+  if ('namespace' in patch) data.namespace = patch.namespace ?? 'default';
+  if ('origin' in patch) data.origin = patch.origin ?? null;
+  if (patch.createdAt != null) data.createdAt = patch.createdAt;
+  if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;
+  return data;
 }
 
 function toRunEntity(run: WorkflowRun): WorkflowRunEntity {

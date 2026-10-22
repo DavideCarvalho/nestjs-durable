@@ -6,6 +6,7 @@ import type {
   RunFacetQuery,
   RunFacetRow,
   RunQuery,
+  RunStatus,
   RunValueAxis,
   RunValueFacetOptions,
   RunValueFacetRow,
@@ -69,6 +70,14 @@ export class CodecStateStore implements StateStore {
   /** Forwarded verbatim (deletes touch no payload). Bound only when the inner store has it, so the
    *  engine's per-run fallback still kicks in through the wrapper. */
   readonly deleteRuns?: (runIds: string[]) => Promise<void>;
+
+  /** Encodes the patch like {@link updateRun}. Bound only when the inner store has it, so the
+   *  engine's read-then-write fallback still kicks in through the wrapper. */
+  readonly updateRunIf?: (
+    runId: string,
+    expectedStatuses: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ) => Promise<boolean>;
 
   /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it, so the engine's
    *  plain-save fallback still kicks in through the wrapper. */
@@ -137,6 +146,10 @@ export class CodecStateStore implements StateStore {
     if (inner.tryAdmitSingleton) this.tryAdmitSingleton = inner.tryAdmitSingleton.bind(inner);
     const deleteRuns = inner.deleteRuns;
     if (deleteRuns) this.deleteRuns = (ids) => deleteRuns.call(inner, ids);
+    const updateIf = inner.updateRunIf;
+    if (updateIf)
+      this.updateRunIf = (runId, expected, patch) =>
+        updateIf.call(inner, runId, expected, this.encRunPatch(patch));
     const saveIfPending = inner.saveCheckpointIfPending;
     if (saveIfPending)
       this.saveCheckpointIfPending = (cp) => saveIfPending.call(inner, this.encCp(cp));
@@ -241,10 +254,13 @@ export class CodecStateStore implements StateStore {
     return this.inner.createRun(this.encRun(run));
   }
   updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+    return this.inner.updateRun(runId, this.encRunPatch(patch));
+  }
+  private encRunPatch(patch: Partial<WorkflowRun>): Partial<WorkflowRun> {
     const next = { ...patch };
     if ('input' in patch) next.input = this.enc(patch.input);
     if ('output' in patch) next.output = this.enc(patch.output);
-    return this.inner.updateRun(runId, next);
+    return next;
   }
   async getRun(runId: string): Promise<WorkflowRun | null> {
     return this.decRun(await this.inner.getRun(runId));

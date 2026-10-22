@@ -170,6 +170,36 @@ export class DrizzleStateStore implements StateStore {
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
   }
 
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    inputPatch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    if (expectedStatuses.length === 0) return false;
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) => this.getRun(id))
+        : inputPatch;
+    const row = toRunPatch(patch);
+    if (!Object.keys(row).length) {
+      // Nothing to write but (maybe) the attribute side-table: the compare is a read.
+      const current = await this.getRun(runId);
+      if (!current || !expectedStatuses.includes(current.status)) return false;
+    } else {
+      // One conditional UPDATE: the status predicate is the compare, the changed-row count the
+      // answer, and a missing row matches nothing.
+      const result = await this.db
+        .update(workflowRuns)
+        .set(row)
+        .where(and(eq(workflowRuns.id, runId), inArray(workflowRuns.status, expectedStatuses)));
+      // better-sqlite3 reports `changes`, libSQL `rowsAffected`.
+      const { changes, rowsAffected } = result as { changes?: number; rowsAffected?: number };
+      if ((changes ?? rowsAffected ?? 0) === 0) return false;
+    }
+    if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
+    return true;
+  }
+
   /** Rewrite a run's normalized attribute rows: delete the old set, insert the current one. Mirrors
    *  the in-memory store's reindex so the side-table always reflects the run's live searchAttributes. */
   private async reindexAttributes(
