@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   type Heartbeat,
   type RemoteTask,
@@ -6,7 +7,7 @@ import {
   type Transport,
   runStepHandler,
 } from '@dudousxd/nestjs-durable-core';
-import type { SqlExecutor } from './executors';
+import type { SqlExecutor, SqlTx } from './executors';
 
 export { mikroOrmExecutor, type SqlExecutor, type SqlTx, typeOrmExecutor } from './executors';
 
@@ -43,10 +44,27 @@ export interface DbTransportOptions {
   prefix?: string;
   /** Poll interval in ms when a queue is empty. Default 500. */
   pollMs?: number;
-  /** How long a claimed row is owned before it's reclaimable (crash recovery), in ms. Default 30_000. */
+  /**
+   * How long a claimed row is owned before it's reclaimable (crash recovery), in ms. Default 30_000.
+   * Every claim this instance holds is renewed every `leaseMs / 3` while it is waiting or running, so
+   * a step may run longer than `leaseMs`; only a crashed (or event-loop-blocked) instance loses it.
+   */
   leaseMs?: number;
-  /** Max rows claimed per poll. Default 10. */
+  /**
+   * Max rows claimed per poll. Default 10. The task loop claims only as many rows as it has free
+   * {@link concurrency} slots (capped by this); the results loop claims up to this many.
+   */
   batchSize?: number;
+  /**
+   * How many tasks this instance runs at once (worker side). Default 1. A row is claimed only when a
+   * slot is free to run it, so rows never wait claimed behind a slow task while a sibling sits idle.
+   */
+  concurrency?: number;
+  /**
+   * Where a transport failure is reported: a failing poll, a throwing result handler (the result is
+   * re-delivered after the lease), a lost claim. Default `console.error`.
+   */
+  onError?: (err: unknown) => void;
   /** Create the two tables on first use if missing. Default true. */
   autoCreate?: boolean;
   /** Identifies this instance in `claimed_by` (for debugging). Defaults to a random id. */
@@ -74,15 +92,23 @@ export class DbTransport implements Transport {
   private readonly pollMs: number;
   private readonly leaseMs: number;
   private readonly batchSize: number;
+  private readonly concurrency: number;
+  private readonly onError: (err: unknown) => void;
   private readonly autoCreate: boolean;
   private readonly instanceId: string;
   private readonly isPg: boolean;
 
   private readonly handlers = new Map<string, StepHandler>();
   private running = true;
-  private schemaReady?: Promise<void>;
+  private schemaReady?: Promise<void> | undefined;
   private taskLoop?: Promise<void>;
   private resultLoop?: Promise<void>;
+  /** Tasks running on this instance (at most `concurrency`). */
+  private readonly runningTasks = new Set<Promise<void>>();
+  /** Claim tokens this instance holds, by table — every one is renewed on `renewTimer`. */
+  private readonly held = new Map<string, Set<string>>();
+  private renewTimer?: ReturnType<typeof setInterval> | undefined;
+  private renewal?: Promise<void> | undefined;
 
   constructor(options: DbTransportOptions) {
     this.exec = options.executor;
@@ -92,9 +118,12 @@ export class DbTransport implements Transport {
     this.resultsTable = `${prefix}_transport_results`;
     this.pollMs = options.pollMs ?? 500;
     this.leaseMs = options.leaseMs ?? 30_000;
-    this.batchSize = options.batchSize ?? 10;
+    this.batchSize = Math.max(1, Math.floor(options.batchSize ?? 10));
+    this.concurrency = Math.max(1, Math.floor(options.concurrency ?? 1));
+    this.onError = options.onError ?? ((err) => console.error('[DbTransport]', err));
     this.autoCreate = options.autoCreate ?? true;
-    this.instanceId = options.instanceId ?? `db-${Math.floor(Date.now()).toString(36)}`;
+    // Random, not time-based: two instances booted in the same millisecond must not share an id.
+    this.instanceId = options.instanceId ?? `db-${randomUUID()}`;
     this.isPg = this.exec.dialect === 'postgres';
   }
 
@@ -112,8 +141,27 @@ export class DbTransport implements Transport {
 
   // ── schema ───────────────────────────────────────────────────────────────────────────────────
   private ensureSchema(): Promise<void> {
-    if (!this.schemaReady) this.schemaReady = this.createTables();
+    if (!this.schemaReady) {
+      // A failed attempt is not cached: the next call tries again instead of failing forever.
+      this.schemaReady = this.createTables().catch((err) => {
+        this.schemaReady = undefined;
+        throw err;
+      });
+    }
     return this.schemaReady;
+  }
+
+  /**
+   * Run one `CREATE … IF NOT EXISTS`. Two instances booting on a fresh database race it, and Postgres
+   * can reject the loser with a unique violation on its catalog even with `IF NOT EXISTS`; the
+   * statement is simply re-run, by which point the table exists and it is a no-op.
+   */
+  private async createIfMissing(sql: string): Promise<void> {
+    try {
+      await this.exec.query(sql);
+    } catch {
+      await this.exec.query(sql);
+    }
   }
 
   private async createTables(): Promise<void> {
@@ -122,7 +170,7 @@ export class DbTransport implements Transport {
     const txt = this.isPg ? 'text' : 'longtext';
     const tasks = this.q(this.tasksTable);
     const results = this.q(this.resultsTable);
-    await this.exec.query(
+    await this.createIfMissing(
       `CREATE TABLE IF NOT EXISTS ${tasks} (
         ${this.q('step_id')} ${str} PRIMARY KEY,
         ${this.q('run_id')} ${str} NOT NULL,
@@ -137,7 +185,7 @@ export class DbTransport implements Transport {
         ${this.q('created_at')} bigint NOT NULL
       )`,
     );
-    await this.exec.query(
+    await this.createIfMissing(
       `CREATE TABLE IF NOT EXISTS ${results} (
         ${this.q('step_id')} ${str} PRIMARY KEY,
         ${this.q('run_id')} ${str} NOT NULL,
@@ -213,24 +261,65 @@ export class DbTransport implements Transport {
   // ── polling ──────────────────────────────────────────────────────────────────────────────────
   /** Run `tick` repeatedly; sleep `pollMs` when it reports an empty queue. Stops on `close()`. */
   private async loop(tick: () => Promise<number>): Promise<void> {
-    await this.ensureSchema();
     while (this.running) {
       let processed = 0;
       try {
+        await this.ensureSchema();
         processed = await tick();
       } catch (err) {
-        if (this.running) console.error('[DbTransport] poll failed', err);
+        if (this.running) this.onError(err);
       }
-      if (processed === 0) await this.sleep(this.pollMs);
+      if (processed === 0 && this.running) await this.sleep(this.pollMs);
     }
   }
 
-  /** Claim a batch of tasks (FOR UPDATE SKIP LOCKED), then run each outside the lock. */
+  /**
+   * One task-loop round: claim as many rows as there are free slots (never more — a claimed row that
+   * isn't running is one an idle sibling can't run), and start each. With every slot busy, wait for
+   * one to free instead of polling.
+   */
   private async drainTasks(group: string): Promise<number> {
-    const claimed = await this.claim<TaskRow>(this.tasksTable, `${this.q('grp')} = ${this.ph(1)}`, [
-      group,
-    ]);
-    for (const row of claimed) {
+    const free = this.concurrency - this.runningTasks.size;
+    if (free <= 0) {
+      await Promise.race(this.runningTasks);
+      return 1;
+    }
+    const { rows, token } = await this.claim<TaskRow>(
+      this.tasksTable,
+      Math.min(free, this.batchSize),
+      `${this.q('grp')} = ${this.ph(1)}`,
+      [group],
+    );
+    if (rows.length === 0) return 0;
+    this.hold(this.tasksTable, token);
+    let left = rows.length;
+    for (const row of rows) {
+      const run = this.runTask(row, group, token).finally(() => {
+        this.runningTasks.delete(run);
+        left -= 1;
+        if (left === 0) this.release(this.tasksTable, token);
+      });
+      this.runningTasks.add(run);
+    }
+    return rows.length;
+  }
+
+  /**
+   * Run one claimed task and settle it — only while this instance still holds the claim: the claim is
+   * re-checked before running, and the task row is deleted and its result written in ONE transaction,
+   * conditional on the claim token, so an instance whose claim was taken over neither deletes the new
+   * holder's row nor publishes a second result.
+   */
+  private async runTask(row: TaskRow, group: string, token: string): Promise<void> {
+    try {
+      if (!(await this.stillHolds(row.step_id, token))) {
+        this.onError(
+          new Error(
+            `[DbTransport] lost the claim on task ${row.step_id} before running it — another instance took it over; not running it here`,
+          ),
+        );
+        return;
+      }
       const task: RemoteTask = {
         runId: row.run_id,
         seq: Number(row.seq),
@@ -241,70 +330,188 @@ export class DbTransport implements Transport {
         attempt: Number(row.attempt),
       };
       const result = await runStepHandler(task, this.handlers.get(task.name));
-      await this.insertResult(result);
-      await this.exec.query(
-        `DELETE FROM ${this.q(this.tasksTable)} WHERE ${this.q('step_id')} = ${this.ph(1)}`,
-        [task.stepId],
-      );
+      if (!(await this.settleTask(task.stepId, token, result))) {
+        this.onError(
+          new Error(
+            `[DbTransport] lost the claim on task ${task.stepId} while running it (this instance went silent past leaseMs) — another instance took it over and may run it too; this run's result was dropped. Raise leaseMs if steps block the event loop`,
+          ),
+        );
+      }
+    } catch (err) {
+      // A database error settling the row (or a malformed row): it stays claimed, stops being
+      // renewed, and is reclaimed after the lease — at-least-once, like a crash.
+      this.onError(err);
     }
-    return claimed.length;
   }
 
-  /** Claim a batch of results, deliver each to the engine, then delete it. */
-  private async drainResults(handler: (result: StepResult) => Promise<void>): Promise<number> {
-    const claimed = await this.claim<ResultRow>(this.resultsTable, '1 = 1', []);
-    for (const row of claimed) {
-      const result: StepResult = {
-        runId: row.run_id,
-        seq: Number(row.seq),
-        stepId: row.step_id,
-        status: row.status as StepResult['status'],
-        output: row.output == null ? undefined : JSON.parse(row.output),
-        error: row.error == null ? undefined : JSON.parse(row.error),
-        startedAt: row.started_at == null ? undefined : Number(row.started_at),
-      };
-      await handler(result);
-      await this.exec.query(
-        `DELETE FROM ${this.q(this.resultsTable)} WHERE ${this.q('step_id')} = ${this.ph(1)}`,
-        [result.stepId],
+  /** Whether the claim on `stepId` is still `token`'s (re-stamping it if so). */
+  private async stillHolds(stepId: string, token: string): Promise<boolean> {
+    const t = this.q(this.tasksTable);
+    const rows = await this.exec.transaction(async (tx) => {
+      const held = await tx.query<{ step_id: string }>(
+        `SELECT ${this.q('step_id')} FROM ${t} WHERE ${this.q('step_id')} = ${this.ph(1)} AND ${this.q('claimed_by')} = ${this.ph(2)} FOR UPDATE`,
+        [stepId, token],
       );
-    }
-    return claimed.length;
+      if (held.length > 0) {
+        await tx.query(
+          `UPDATE ${t} SET ${this.q('claimed_at')} = ${this.ph(1)} WHERE ${this.q('step_id')} = ${this.ph(2)} AND ${this.q('claimed_by')} = ${this.ph(3)}`,
+          [this.now(), stepId, token],
+        );
+      }
+      return held;
+    });
+    return rows.length > 0;
+  }
+
+  /** Delete the task row and publish its result in ONE transaction, only while `token` holds it. */
+  private async settleTask(stepId: string, token: string, result: StepResult): Promise<boolean> {
+    const t = this.q(this.tasksTable);
+    return this.exec.transaction(async (tx) => {
+      const held = await tx.query<{ step_id: string }>(
+        `SELECT ${this.q('step_id')} FROM ${t} WHERE ${this.q('step_id')} = ${this.ph(1)} AND ${this.q('claimed_by')} = ${this.ph(2)} FOR UPDATE`,
+        [stepId, token],
+      );
+      if (held.length === 0) return false;
+      await tx.query(
+        `DELETE FROM ${t} WHERE ${this.q('step_id')} = ${this.ph(1)} AND ${this.q('claimed_by')} = ${this.ph(2)}`,
+        [stepId, token],
+      );
+      await this.insertResult(result, tx);
+      return true;
+    });
   }
 
   /**
-   * Atomically claim up to `batchSize` un-leased rows matching `where` and stamp them with this
-   * instance's lease. `SELECT … FOR UPDATE SKIP LOCKED` inside the txn means concurrent instances
-   * skip each other's locked rows instead of blocking, so no row is claimed twice.
+   * Claim a batch of results, deliver each to the engine, and delete it — only after its handler ran
+   * (at-least-once), and only while this round still holds the claim (a newer result for the same
+   * step that replaced the row resets the claim, so it is delivered next instead of deleted). The
+   * batch's claim is renewed until it is done. A throwing handler is reported and its row left for
+   * re-delivery after the lease; the rest of the batch continues.
+   */
+  private async drainResults(handler: (result: StepResult) => Promise<void>): Promise<number> {
+    const { rows, token } = await this.claim<ResultRow>(
+      this.resultsTable,
+      this.batchSize,
+      '1 = 1',
+      [],
+    );
+    if (rows.length === 0) return 0;
+    this.hold(this.resultsTable, token);
+    try {
+      for (const row of rows) {
+        if (!this.running) break;
+        try {
+          const result: StepResult = {
+            runId: row.run_id,
+            seq: Number(row.seq),
+            stepId: row.step_id,
+            status: row.status as StepResult['status'],
+            output: row.output == null ? undefined : JSON.parse(row.output),
+            error: row.error == null ? undefined : JSON.parse(row.error),
+            startedAt: row.started_at == null ? undefined : Number(row.started_at),
+          };
+          await handler(result);
+          await this.exec.query(
+            `DELETE FROM ${this.q(this.resultsTable)} WHERE ${this.q('step_id')} = ${this.ph(1)} AND ${this.q('claimed_by')} = ${this.ph(2)}`,
+            [row.step_id, token],
+          );
+        } catch (err) {
+          this.onError(err);
+        }
+      }
+    } finally {
+      this.release(this.resultsTable, token);
+    }
+    return rows.length;
+  }
+
+  /**
+   * Atomically claim up to `limit` un-leased rows matching `where` and stamp them with a claim token
+   * unique to this round (`<instanceId>:<uuid>`). `SELECT … FOR UPDATE SKIP LOCKED` inside the txn
+   * means concurrent instances skip each other's locked rows instead of blocking, so no row is
+   * claimed twice; the token is what every later delete/settle is conditional on.
    */
   private async claim<T extends { step_id: string }>(
     table: string,
+    limit: number,
     where: string,
     whereParams: unknown[],
-  ): Promise<T[]> {
+  ): Promise<{ rows: T[]; token: string }> {
     const t = this.q(table);
     const staleBefore = this.now() - this.leaseMs;
-    return this.exec.transaction(async (tx) => {
+    const token = `${this.instanceId}:${randomUUID()}`;
+    const rows = await this.exec.transaction(async (tx) => {
       const leaseClause = `(${this.q('claimed_at')} IS NULL OR ${this.q('claimed_at')} < ${this.ph(whereParams.length + 1)})`;
-      const rows = await tx.query<T>(
+      const found = await tx.query<T>(
         `SELECT * FROM ${t} WHERE ${where} AND ${leaseClause}
-         ORDER BY ${this.q('created_at')} ASC LIMIT ${this.batchSize} FOR UPDATE SKIP LOCKED`,
+         ORDER BY ${this.q('created_at')} ASC LIMIT ${Math.max(1, Math.floor(limit))} FOR UPDATE SKIP LOCKED`,
         [...whereParams, staleBefore],
       );
-      if (rows.length > 0) {
-        const ids = rows.map((r) => r.step_id);
+      if (found.length > 0) {
+        const ids = found.map((r) => r.step_id);
         const placeholders = ids.map((_, i) => this.ph(i + 3)).join(', ');
         await tx.query(
           `UPDATE ${t} SET ${this.q('claimed_by')} = ${this.ph(1)}, ${this.q('claimed_at')} = ${this.ph(2)}
            WHERE ${this.q('step_id')} IN (${placeholders})`,
-          [this.instanceId, this.now(), ...ids],
+          [token, this.now(), ...ids],
         );
       }
-      return rows;
+      return found;
     });
+    return { rows, token };
   }
 
-  private async insertResult(result: StepResult): Promise<void> {
+  // ── claim renewal: every claim held, not only the row being run ─────────────────────────────
+  private hold(table: string, token: string): void {
+    let tokens = this.held.get(table);
+    if (!tokens) {
+      tokens = new Set();
+      this.held.set(table, tokens);
+    }
+    tokens.add(token);
+    if (this.renewTimer) return;
+    const intervalMs = Math.max(10, Math.floor(this.leaseMs / 3));
+    this.renewTimer = setInterval(() => {
+      if (this.renewal) return; // a slow database never stacks renewal rounds
+      const round = this.renewHeld()
+        .catch((err) => this.onError(err))
+        .finally(() => {
+          if (this.renewal === round) this.renewal = undefined;
+        });
+      this.renewal = round;
+    }, intervalMs);
+    this.renewTimer.unref?.();
+  }
+
+  private release(table: string, token: string): void {
+    const tokens = this.held.get(table);
+    tokens?.delete(token);
+    if (tokens?.size === 0) this.held.delete(table);
+    if (this.held.size === 0 && this.renewTimer) {
+      clearInterval(this.renewTimer);
+      this.renewTimer = undefined;
+    }
+  }
+
+  /** Re-stamp `claimed_at` on every row still claimed under a token this instance holds. */
+  private async renewHeld(): Promise<void> {
+    for (const [table, tokens] of this.held) {
+      if (tokens.size === 0) continue;
+      const list = [...tokens];
+      const placeholders = list.map((_, i) => this.ph(i + 2)).join(', ');
+      await this.exec.query(
+        `UPDATE ${this.q(table)} SET ${this.q('claimed_at')} = ${this.ph(1)} WHERE ${this.q('claimed_by')} IN (${placeholders})`,
+        [this.now(), ...list],
+      );
+    }
+  }
+
+  /**
+   * Write a result row. A result already waiting for the same step (an earlier attempt's, not yet
+   * deleted by the engine) is REPLACED and its claim reset, never kept: `step_id` is stable across
+   * attempts, so keeping the old row would silently drop a retry's result.
+   */
+  private async insertResult(result: StepResult, tx: SqlTx = this.exec): Promise<void> {
     const t = this.q(this.resultsTable);
     const cols = [
       'step_id',
@@ -316,14 +523,20 @@ export class DbTransport implements Transport {
       'started_at',
       'created_at',
     ];
-    const head = this.isPg
-      ? `INSERT INTO ${t} (...) ON CONFLICT (${this.q('step_id')}) DO NOTHING`
-      : `INSERT IGNORE INTO ${t} (...)`;
-    const sql = head.replace(
-      '(...)',
-      `(${cols.map((c) => this.q(c)).join(', ')}) VALUES (${cols.map((_, i) => this.ph(i + 1)).join(', ')})`,
-    );
-    await this.exec.query(sql, [
+    const replace = ['run_id', 'seq', 'status', 'output', 'error', 'started_at', 'created_at'];
+    const values = `(${cols.map((c) => this.q(c)).join(', ')}) VALUES (${cols.map((_, i) => this.ph(i + 1)).join(', ')})`;
+    const sql = this.isPg
+      ? `INSERT INTO ${t} ${values} ON CONFLICT (${this.q('step_id')}) DO UPDATE SET ${[
+          ...replace.map((c) => `${this.q(c)} = EXCLUDED.${this.q(c)}`),
+          `${this.q('claimed_by')} = NULL`,
+          `${this.q('claimed_at')} = NULL`,
+        ].join(', ')}`
+      : `INSERT INTO ${t} ${values} ON DUPLICATE KEY UPDATE ${[
+          ...replace.map((c) => `${this.q(c)} = VALUES(${this.q(c)})`),
+          `${this.q('claimed_by')} = NULL`,
+          `${this.q('claimed_at')} = NULL`,
+        ].join(', ')}`;
+    await tx.query(sql, [
       result.stepId,
       result.runId,
       result.seq,
@@ -343,5 +556,10 @@ export class DbTransport implements Transport {
   async close(): Promise<void> {
     this.running = false;
     await Promise.allSettled([this.taskLoop, this.resultLoop]);
+    // Let running tasks settle (their claims keep being renewed until they do).
+    await Promise.allSettled([...this.runningTasks]);
+    if (this.renewTimer) clearInterval(this.renewTimer);
+    this.renewTimer = undefined;
+    await this.renewal;
   }
 }

@@ -46,10 +46,12 @@ older than `leaseMs` is treated as abandoned and reclaimed by the next poll (see
 | `group` | The queue token this instance serves — required to register `handle()`s. |
 | `prefix` | Table-name prefix. Default `durable`. |
 | `pollMs` | Poll interval in ms when a queue is empty. Default `500`. |
-| `batchSize` | Max rows claimed per poll. Default `10`. |
-| `leaseMs` | How long a claimed row is owned before it's reclaimable (crash recovery), in ms. Default `30_000`. |
+| `batchSize` | Max rows claimed per poll. Default `10`. The task loop claims only as many rows as it has free `concurrency` slots (capped by this). |
+| `concurrency` | How many tasks this instance runs at once. Default `1`. |
+| `leaseMs` | How long a claimed row is owned before it's reclaimable (crash recovery), in ms. Default `30_000`. Every claim the instance holds is renewed every `leaseMs / 3`, so a step may run longer than this. |
+| `onError` | Where a failing poll, a throwing result handler or a lost claim is reported. Default `console.error`. |
 | `autoCreate` | Create the two tables on first use if missing. Default `true` — the `CREATE TABLE` statements in [The contract](#the-contract) are for reference/manual provisioning, not a required setup step. |
-| `instanceId` | Identifies this instance in `claimed_by`, for debugging. Defaults to a random id. |
+| `instanceId` | Prefix of the claim token this instance stamps in `claimed_by`. Defaults to a random UUID. |
 
 ## The contract
 
@@ -94,9 +96,11 @@ worker stamps when it picked the task up, the engine subtracts its dispatch time
 
 ### Claim protocol
 
-A worker claims a batch atomically, runs each task outside the lock, then records the result:
+A worker claims only what it can run, keeps every claim it holds alive, and settles a task only
+while it still owns it:
 
-1. **Claim** — in one transaction, lease up to `batchSize` un-leased rows for the group:
+1. **Claim** — in one transaction, lease up to as many un-leased rows as the worker has free slots,
+   stamped with a token unique to this claim round (`<instanceId>:<uuid>`):
    ```sql
    SELECT * FROM durable_transport_tasks
     WHERE grp = ? AND (claimed_at IS NULL OR claimed_at < ?)   -- ? = now − leaseMs
@@ -107,13 +111,20 @@ A worker claims a batch atomically, runs each task outside the lock, then record
    `SKIP LOCKED` is the heart of it: concurrent workers step over each other's locked rows instead of
    blocking, so a row is never claimed twice. The `claimed_at < now − leaseMs` clause **reclaims** a
    row whose worker crashed mid-flight (crash recovery, in place of heartbeats).
-2. **Run** — execute the handler for `name` with the parsed `input`.
-3. **Record** — insert the result row (idempotent: `ON CONFLICT DO NOTHING` / `INSERT IGNORE`) and
-   `DELETE` the task row.
+2. **Renew** — while a row is claimed, its worker re-stamps `claimed_at` (every `leaseMs / 3`), so
+   only a dead worker's rows age into a reclaim.
+3. **Run** — re-check the row is still claimed under the token, then execute the handler for `name`
+   with the parsed `input`.
+4. **Settle** — in one transaction, and only if `claimed_by` is still the token: `DELETE` the task
+   row and write the result row. A worker whose claim was taken over writes nothing. A result row
+   already waiting for the same `step_id` (an earlier attempt's) is replaced and its claim cleared
+   (`ON CONFLICT … DO UPDATE` / `ON DUPLICATE KEY UPDATE`), so a retry's result is never dropped.
 
-The engine side mirrors it on the results table: claim → deliver to the suspended `ctx.step` →
-`DELETE`. Delivery is at-least-once (a crash between insert-result and delete-task can re-run a
-handler), so **handlers should be idempotent**, keyed on `step_id`.
+The engine side mirrors it on the results table: claim (with a token) → deliver to the suspended
+`ctx.step` → `DELETE … WHERE step_id = ? AND claimed_by = <token>`. A result handler that throws is
+reported through `onError` and the row is re-delivered after the lease. Delivery is at-least-once (a
+worker that crashes mid-handler, or blocks its event loop past `leaseMs`, can have its task re-run
+elsewhere), so **handlers should be idempotent**, keyed on `step_id`.
 
 ### Dialect notes
 
@@ -123,5 +134,6 @@ Only two things differ between Postgres and MySQL, and both libraries handle the
 | --- | --- | --- |
 | Placeholders | `$1, $2, …` | `?` / `%s` |
 | Identifier quoting | `"col"` | `` `col` `` |
-| Idempotent insert | `ON CONFLICT (step_id) DO NOTHING` | `INSERT IGNORE` |
+| Idempotent task insert | `ON CONFLICT (step_id) DO NOTHING` | `INSERT IGNORE` |
+| Result upsert | `ON CONFLICT (step_id) DO UPDATE` | `ON DUPLICATE KEY UPDATE` |
 | JSON column | `text` | `longtext` |
