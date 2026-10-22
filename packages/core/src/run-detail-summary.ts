@@ -37,6 +37,14 @@ export interface FanPage {
   items: StepCheckpoint[];
   /** Members matching the query, across all pages. */
   total: number;
+  /** A validator for this page, when the gateway can compute one without reading the members. */
+  etag?: string | undefined;
+  /**
+   * Set when the query's `ifNoneMatch` matched {@link etag}: the page has not changed, so nothing
+   * was read. `items` is empty and `total` is 0 as placeholders, not the fan's; keep the page the
+   * caller already holds.
+   */
+  notModified?: true | undefined;
 }
 
 export interface FanPageQuery {
@@ -44,6 +52,8 @@ export interface FanPageQuery {
   limit?: number | undefined;
   /** Only failed members (a failed step, or a child that failed). */
   failedOnly?: boolean | undefined;
+  /** An HTTP `If-None-Match` value: a page whose `etag` it names comes back `notModified`. */
+  ifNoneMatch?: string | undefined;
 }
 
 export const FAN_SUMMARY_FAILURES = 20;
@@ -51,7 +61,8 @@ export const FAN_SUMMARY_FAILURES = 20;
 export const SUMMARY_CHILD_LIMIT = 200;
 const FAN_PAGE_MAX = 500;
 
-function foldedCount(cp: StepCheckpoint): number | undefined {
+/** How many children a folded `fan:` checkpoint stands for; undefined for any other checkpoint. */
+export function foldedCount(cp: StepCheckpoint): number | undefined {
   if (!cp.name.startsWith(FOLDED_PREFIX)) return undefined;
   const values = (cp.output as Partial<FoldedChildren> | null | undefined)?.values;
   return Array.isArray(values) ? values.length : 0;
@@ -153,6 +164,12 @@ export function pageFan(timeline: StepCheckpoint[], group: string, query: FanPag
   const matching = timeline.filter(
     (cp) => cp.parallelGroup === group && (!query.failedOnly || isFailedMember(cp)),
   );
+  const { offset, limit } = fanPageBounds(query);
+  return { items: matching.slice(offset, offset + limit), total: matching.length };
+}
+
+/** A {@link FanPageQuery}'s offset and limit, clamped to sane bounds. */
+export function fanPageBounds(query: FanPageQuery): { offset: number; limit: number } {
   const offset =
     query.offset !== undefined && Number.isFinite(query.offset)
       ? Math.max(0, Math.floor(query.offset))
@@ -161,5 +178,5 @@ export function pageFan(timeline: StepCheckpoint[], group: string, query: FanPag
     query.limit !== undefined && Number.isFinite(query.limit)
       ? Math.min(FAN_PAGE_MAX, Math.max(1, Math.floor(query.limit)))
       : 100;
-  return { items: matching.slice(offset, offset + limit), total: matching.length };
+  return { offset, limit };
 }

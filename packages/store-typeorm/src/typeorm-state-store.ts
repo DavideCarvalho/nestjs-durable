@@ -1,5 +1,8 @@
 import {
   type AttributeFilter,
+  type CheckpointNameKind,
+  type CheckpointQuery,
+  type CheckpointStat,
   type ChildWait,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
@@ -53,6 +56,28 @@ import {
   WorkflowRunEntity,
 } from './entities';
 import { durableColumnResolver, ensureTypeOrmDurableSchema } from './schema';
+
+/** {@link checkpointNameKind} as a SQL expression over the `cp` alias, for selecting and grouping. */
+const CHECKPOINT_NAME_KIND_SQL =
+  "CASE WHEN cp.name LIKE 'signal:child:%' THEN 'child' WHEN cp.name LIKE 'fan:%' THEN 'folded'" +
+  " WHEN cp.name LIKE 'spawn:%' THEN 'spawn' ELSE 'step' END";
+
+/** A {@link TypeOrmStateStore.checkpointStats} row as the driver returns it, before conversion. */
+interface RawCheckpointStat {
+  group: string | null;
+  status: StepCheckpoint['status'];
+  nameKind: CheckpointNameKind;
+  count: number | string;
+  minSeq: number | string;
+  maxSeq: number | string;
+  minName: string;
+  maxName: string;
+  minEnqueuedAt: unknown;
+  minStartedAt: unknown;
+  maxStartedAt: unknown;
+  maxFinishedAt: unknown;
+  sumAttempts: number | string;
+}
 
 // SQLite exposes one transaction connection per DataSource. Share this queue across store wrappers
 // so simultaneous async claims cannot issue overlapping BEGIN statements on that connection.
@@ -657,6 +682,95 @@ export class TypeOrmStateStore implements StateStore {
     // `LIKE` reads `_` and `%` in the prefix as wildcards, so it can match more than the prefix: keep
     // only the exact matches.
     return rows.filter((r) => prefixes.some((p) => r.name.startsWith(p))).map(fromCheckpointEntity);
+  }
+
+  /** `GROUP BY parallelGroup, status, nameKind` over one run's checkpoints — one aggregate, so a run
+   *  detail draws a wide fan from a few bucket rows instead of loading every member. The `CASE` is
+   *  {@link checkpointNameKind} in SQL, and the date aggregates are hydrated through the driver the
+   *  way an entity read hydrates the column, so a bucket compares equal to the in-memory reference. */
+  async checkpointStats(
+    runId: string,
+    opts?: { group?: string | undefined },
+  ): Promise<CheckpointStat[]> {
+    const qb = this.checkpoints()
+      .createQueryBuilder('cp')
+      .select('cp.parallelGroup', 'group')
+      .addSelect('cp.status', 'status')
+      .addSelect(CHECKPOINT_NAME_KIND_SQL, 'nameKind')
+      .addSelect('COUNT(*)', 'count')
+      .addSelect('MIN(cp.seq)', 'minSeq')
+      .addSelect('MAX(cp.seq)', 'maxSeq')
+      .addSelect('MIN(cp.name)', 'minName')
+      .addSelect('MAX(cp.name)', 'maxName')
+      // `listCheckpoints` reads a row without `enqueuedAt` as enqueued when it started.
+      .addSelect('MIN(COALESCE(cp.enqueuedAt, cp.startedAt))', 'minEnqueuedAt')
+      .addSelect('MIN(cp.startedAt)', 'minStartedAt')
+      .addSelect('MAX(cp.startedAt)', 'maxStartedAt')
+      .addSelect('MAX(cp.finishedAt)', 'maxFinishedAt')
+      .addSelect('SUM(cp.attempts)', 'sumAttempts')
+      .where('cp.runId = :runId', { runId });
+    if (opts?.group !== undefined) qb.andWhere('cp.parallelGroup = :group', { group: opts.group });
+    const rows = await qb
+      .groupBy('cp.parallelGroup')
+      .addGroupBy('cp.status')
+      .addGroupBy(CHECKPOINT_NAME_KIND_SQL)
+      .getRawMany<RawCheckpointStat>();
+    // A raw aggregate skips entity hydration: drivers hand COUNT/SUM back as strings, and a date
+    // aggregate as whatever the driver yields for that column (an ISO-ish string on SQLite).
+    const dateColumn = this.dataSource
+      .getMetadata(StepCheckpointEntity)
+      .findColumnWithPropertyName('startedAt');
+    const toDate = (raw: unknown): Date =>
+      dateColumn
+        ? this.dataSource.driver.prepareHydratedValue(raw, dateColumn)
+        : new Date(raw as string);
+    return rows.map((r) => ({
+      group: r.group ?? null,
+      status: r.status,
+      nameKind: r.nameKind,
+      count: Number(r.count),
+      minSeq: Number(r.minSeq),
+      maxSeq: Number(r.maxSeq),
+      minName: r.minName,
+      maxName: r.maxName,
+      minEnqueuedAt: toDate(r.minEnqueuedAt),
+      minStartedAt: toDate(r.minStartedAt),
+      maxStartedAt: toDate(r.maxStartedAt),
+      maxFinishedAt: toDate(r.maxFinishedAt),
+      sumAttempts: Number(r.sumAttempts),
+    }));
+  }
+
+  /** One run's checkpoints matching `query`, in `seq` order and paged in SQL — the read the run
+   *  detail uses for a fan's failures, its folded checkpoints and one page of members. An empty
+   *  `statuses`/`namePrefixes` matches nothing; an empty `excludeGroups` excludes nothing. */
+  async queryCheckpoints(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]> {
+    if (query.statuses?.length === 0 || query.namePrefixes?.length === 0) return [];
+    const qb = this.checkpoints().createQueryBuilder('cp').where('cp.runId = :runId', { runId });
+    if (query.group !== undefined) qb.andWhere('cp.parallelGroup = :group', { group: query.group });
+    // `NOT IN` is never true for NULL, so ungrouped rows need their own branch to be kept.
+    if (query.excludeGroups?.length) {
+      qb.andWhere('(cp.parallelGroup IS NULL OR cp.parallelGroup NOT IN (:...excludeGroups))', {
+        excludeGroups: query.excludeGroups,
+      });
+    }
+    if (query.statuses) qb.andWhere('cp.status IN (:...statuses)', { statuses: query.statuses });
+    if (query.namePrefixes) {
+      // Escaped, so a prefix is matched literally (as `startsWith`) rather than as a LIKE pattern.
+      const prefixes = query.namePrefixes.map((p) => `${p.replace(/[!%_]/g, '!$&')}%`);
+      const branches = prefixes.map((_, i) => `cp.name LIKE :namePrefix${i} ESCAPE '!'`);
+      qb.andWhere(
+        `(${branches.join(' OR ')})`,
+        Object.fromEntries(prefixes.map((p, i) => [`namePrefix${i}`, p])),
+      );
+    }
+    qb.orderBy('cp.seq', 'ASC');
+    if (query.offset != null) qb.offset(query.offset);
+    // MySQL has no OFFSET without LIMIT, so an open-ended page gets an unreachable limit.
+    if (query.limit != null || query.offset != null) {
+      qb.limit(query.limit ?? Number.MAX_SAFE_INTEGER);
+    }
+    return (await qb.getMany()).map(fromCheckpointEntity);
   }
 
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {

@@ -116,3 +116,21 @@ export function writeHtmlRaw(response: unknown, html: string, status = 200): voi
   raw.setHeader('cache-control', 'no-store, must-revalidate');
   raw.end(html);
 }
+
+/** Set one header on the raw response, through the same Express/Fastify unwrapping as above. */
+export function setRawHeader(response: unknown, name: string, value: string): void {
+  resolveCookieResponse(response)?.setHeader(name, value);
+}
+
+/**
+ * Write a bodiless `304 Not Modified` carrying its validator, and END the response. Same terminal
+ * raw-response bypass as {@link redirectRaw}: its only caller is an exception filter.
+ */
+export function writeNotModifiedRaw(response: unknown, etag: string): void {
+  const raw = resolveRedirectResponse(response);
+  if (!raw) return;
+  raw.statusCode = 304;
+  raw.setHeader('etag', etag);
+  raw.setHeader('cache-control', 'private, no-cache');
+  raw.end();
+}

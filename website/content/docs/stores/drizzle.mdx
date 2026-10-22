@@ -116,6 +116,17 @@ on `durable_workflow_runs`. `created_at` is third because the pending scan order
 recovery (`listIncompleteRuns`) uses the same two leading columns, though only at boot. The index
 name is pinned to match the MikroORM adapter's so a store swap doesn't drop and rebuild it.
 
+**An added index**: `durable_step_checkpoints_group_idx`. The console's run detail reads one fan at
+a time (`checkpointStats`, `queryCheckpoints`), so `drizzle-kit generate` hands you:
+
+```sql
+CREATE INDEX IF NOT EXISTS durable_step_checkpoints_group_idx
+  ON durable_step_checkpoints (run_id, parallel_group, seq);
+```
+
+Without it everything still works. A fan's page then scans the run's rows in seq order instead of
+the fan's.
+
 <Callout type="warn">
   **Tag filtering is a substring match, not a JSON containment check.** `tags` is stored as JSON
   text, so `listRuns({ tag })` compiles to `LIKE '%"tag"%'` against that column (quoted, so filtering

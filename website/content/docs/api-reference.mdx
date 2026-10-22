@@ -344,15 +344,22 @@ and the [dashboard](/docs/observability/dashboard#wide-fans).
 
 | Type / function | Shape | Notes |
 | --- | --- | --- |
-| `RunDetail` | `{ run, timeline, children, fans?, childCount? }` | What `getRunDetail` returns. When summarized, `timeline` omits the members of each summarized fan, `fans` holds one `FanSummary` per fan, and `children` lists at most 200 ids with `childCount` as the total. |
-| `RunDetailOptions` | `{ summarizeFansOver?: number }` | Summarize every fan with more than this many members, or declared wider than that. Unset returns the full detail. |
+| `RunDetail` | `{ run, timeline, children, fans?, childCount?, etag?, notModified? }` | What `getRunDetail` returns. When summarized, `timeline` omits the members of each summarized fan, `fans` holds one `FanSummary` per fan, and `children` lists at most 200 ids with `childCount` as the total. `etag` is set when the gateway can version the detail without reading the timeline. `notModified: true` means `ifNoneMatch` matched it: only `run` was read, and `timeline` and `children` are empty. |
+| `RunDetailOptions` | `{ summarizeFansOver?: number; ifNoneMatch?: string }` | Summarize every fan with more than this many members, or declared wider than that. Unset returns the full detail. `ifNoneMatch` is an HTTP `If-None-Match` value. A gateway that cannot version the detail ignores it. |
 | `FanSummary` | `{ group, label, firstSeq, lastSeq, size, total?, notStarted?, failFast, counts, startedAt?, finishedAt?, failures }` | `label` is the members' step name, or `child runs`. `size` counts members started (a folded checkpoint counts as the children it stands for); `total` is the declared size from the group; `notStarted` is `total - size`. `counts` is per status, with a failed child counted as `failed`. `failures` holds the first 20 failed members. |
-| `FanPageQuery` | `{ offset?, limit?, failedOnly? }` | `offset` defaults to 0; `limit` to 100, clamped to 1–500. |
-| `FanPage` | `{ items: StepCheckpoint[]; total: number }` | One page of a fan's members in seq order; `total` counts every member matching the query. |
+| `FanPageQuery` | `{ offset?, limit?, failedOnly?, ifNoneMatch? }` | `offset` defaults to 0; `limit` to 100, clamped to 1–500. `ifNoneMatch` works as on `RunDetailOptions`. |
+| `FanPage` | `{ items: StepCheckpoint[]; total: number; etag?; notModified? }` | One page of a fan's members in seq order; `total` counts every member matching the query. `etag` and `notModified` work as on `RunDetail`. A `notModified` page carries no members: `items` is empty and `total` is 0 as placeholders. |
 | `summarizeTimeline(timeline, over)` | `→ { timeline, fans }` | Split a run's checkpoints into the listed ones and the summarized fans. |
 | `summarizeFan(group, members)` | `→ FanSummary` | Summarize one fan's members. |
 | `pageFan(timeline, group, query)` | `→ FanPage` | One page of a fan out of a run's checkpoints. |
 | `childIdsOf(timeline)` | `→ string[]` | The child run ids a run's checkpoints reference. |
+| `CheckpointStat` | `{ group, status, nameKind, count, minSeq, maxSeq, minName, maxName, minEnqueuedAt, minStartedAt, maxStartedAt, maxFinishedAt, sumAttempts }` | One bucket of `StateStore.checkpointStats`. `group` is `null` for ungrouped checkpoints; `nameKind` is `child`, `folded`, `spawn` or `step`. |
+| `CheckpointQuery` | `{ group?, excludeGroups?, statuses?, namePrefixes?, offset?, limit? }` | What `StateStore.queryCheckpoints` selects, in seq order. |
+| `summarizeRunFromStore(store, runId, over, stats?)` | `→ Promise<{ timeline, fans, children, childCount }>` | The summarized detail, built from the store's aggregates. Equal to `summarizeTimeline` plus `childIdsOf` over a full read. |
+| `pageFanFromStore(store, runId, group, query, stats?)` | `→ Promise<FanPage>` | `pageFan`, read one page at a time from the store. |
+| `checkpointStatsOf(checkpoints, { group? })` / `queryCheckpointsOf(checkpoints, query)` | `→ CheckpointStat[]` / `→ StepCheckpoint[]` | The in-memory references a store's `checkpointStats` and `queryCheckpoints` must agree with. |
+| `runDetailEtag(run, stats, over)` / `fanPageEtag(group, stats, query)` | `→ string` | The ETags `StoreRunGateway` sends. |
+| `etagMatches(ifNoneMatch, etag)` | `→ boolean` | Weak `If-None-Match` comparison, `*` included. |
 
 A fan's `parallelGroup` is `all:<firstSeq>:n<size>[:failFast]` for children (older runs may carry
 `all:<firstSeq>[:failFast]`) and `steps:<firstSeq>:<size>[:failFast]` for steps.

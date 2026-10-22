@@ -4,6 +4,7 @@ import {
   type StepCheckpoint,
   WorkflowEngine,
   type WorkflowRun,
+  checkpointStatsOf,
 } from '@dudousxd/nestjs-durable-core';
 import { runStateStoreContract } from '@dudousxd/nestjs-durable-testing';
 import { PrismaStateStore } from './prisma-state-store';
@@ -458,5 +459,37 @@ describe('PrismaStateStore namespace', () => {
     await store.updateRun('a', { namespace: 'beta' });
     expect((await store.getRun('a'))?.namespace).toBe('beta');
     expect(await store.listIncompleteRuns('alpha')).toEqual([]);
+  });
+});
+
+describe('PrismaStateStore checkpointStats', () => {
+  it('reads a NULL enqueuedAt as startedAt, as listCheckpoints does', async (ctx) => {
+    if (!available) ctx.skip();
+    await store.createRun(run());
+    const ms = (n: number) => new Date(at.getTime() + n);
+    // Bucket A mixes enqueued rows with older NULL rows, one of which started earliest of all;
+    // bucket B is NULL rows only.
+    await store.saveCheckpoint(
+      checkpoint({ seq: 0, parallelGroup: 'g', enqueuedAt: ms(50), startedAt: ms(60) }),
+    );
+    await store.saveCheckpoint(checkpoint({ seq: 1, parallelGroup: 'g', startedAt: ms(20) }));
+    await store.saveCheckpoint(
+      checkpoint({ seq: 2, parallelGroup: 'g', enqueuedAt: ms(30), startedAt: ms(40) }),
+    );
+    await store.saveCheckpoint(checkpoint({ seq: 3, status: 'failed', startedAt: ms(70) }));
+    await store.saveCheckpoint(checkpoint({ seq: 4, status: 'failed', startedAt: ms(80) }));
+    await prisma.durableStepCheckpoint.updateMany({
+      where: { runId: 'r1', seq: { in: [1, 3, 4] } },
+      data: { enqueuedAt: null },
+    });
+
+    const stats = await store.checkpointStats('r1');
+    const byGroup = (g: string | null) => stats.find((s) => s.group === g)?.minEnqueuedAt;
+    expect(stats).toHaveLength(2);
+    expect(byGroup('g')).toEqual(ms(20));
+    expect(byGroup(null)).toEqual(ms(70));
+    expect(stats).toEqual(
+      expect.arrayContaining(checkpointStatsOf(await store.listCheckpoints('r1'))),
+    );
   });
 });

@@ -90,6 +90,11 @@ describe('TypeOrmStateStore', () => {
     const names = indexes.map((i) => i.name);
     expect(names).toContain('durable_runs_status_idx'); // timer poller / recovery
     expect(names).toContain('durable_runs_workflow_status_idx'); // dashboard listRuns
+    const checkpointIndexes = (await dataSource.query(
+      `PRAGMA index_info("durable_step_checkpoints_group_idx")`,
+    )) as Array<{ name: string }>;
+    // run detail aggregates and fan pages
+    expect(checkpointIndexes.map((c) => c.name)).toEqual(['run_id', 'parallel_group', 'seq']);
     await dataSource.destroy();
   });
 

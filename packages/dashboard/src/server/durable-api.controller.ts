@@ -4,11 +4,14 @@ import {
   Controller,
   Get,
   Header,
+  Headers,
   NotFoundException,
   Param,
   Post,
   Query,
+  Res,
   Sse,
+  UseFilters,
   UseInterceptors,
 } from '@nestjs/common';
 import { DashboardService } from './dashboard.service.js';
@@ -16,6 +19,7 @@ import { DashboardService } from './dashboard.service.js';
 /** Fans with more members than this come back summarized in a run's detail. */
 const FAN_INLINE_MAX = 50;
 import { DurableRun } from './durable-run.js';
+import { NotModifiedException, NotModifiedFilter, setEtag } from './not-modified.js';
 import { type RunListRow, toRunListRow } from './run-list-row.js';
 import type { RunQueryDraft } from './run-query-draft.js';
 import { RunFilter } from './run.filter.js';
@@ -30,6 +34,7 @@ import { RunFilter } from './run.filter.js';
  */
 @Controller()
 @UseInterceptors(ApplyFilterInterceptor)
+@UseFilters(NotModifiedFilter)
 export class DurableApiController {
   constructor(
     private readonly dashboard: DashboardService,
@@ -145,18 +150,34 @@ export class DurableApiController {
   /**
    * A run's detail. Fans wider than {@link FAN_INLINE_MAX} come back as one `FanSummary` each, their
    * members paged by `runs/:id/fans/:group`; `?full=true` returns every checkpoint instead.
+   *
+   * When the gateway can version the detail without reading it, the response carries an `ETag`, and
+   * a poll whose `If-None-Match` still names it gets a 304 before the timeline is read. The browser
+   * sends that header itself (the response is `no-cache`), so a console poll needs no code for it.
    */
   @Get('runs/:id')
-  async run(@Param('id') id: string, @Query('full') full?: string) {
+  async run(
+    @Param('id') id: string,
+    @Query('full') full?: string,
+    @Headers('if-none-match') ifNoneMatch?: string,
+    @Res({ passthrough: true }) response?: unknown,
+  ) {
     const detail = await this.dashboard.getRunDetail(
       id,
-      full === 'true' ? undefined : { summarizeFansOver: FAN_INLINE_MAX },
+      full === 'true'
+        ? undefined
+        : { summarizeFansOver: FAN_INLINE_MAX, ...(ifNoneMatch && { ifNoneMatch }) },
     );
     if (!detail) throw new NotFoundException(`run ${id} not found`);
-    return detail;
+    const { etag, notModified, ...body } = detail;
+    if (etag) {
+      if (notModified) throw new NotModifiedException(etag);
+      setEtag(response, etag);
+    }
+    return body;
   }
 
-  /** One page of a summarized fan's members, in seq order. */
+  /** One page of a summarized fan's members, in seq order. Versioned like {@link run}. */
   @Get('runs/:id/fans/:group')
   async fanMembers(
     @Param('id') id: string,
@@ -164,14 +185,22 @@ export class DurableApiController {
     @Query('offset') offset?: string,
     @Query('limit') limit?: string,
     @Query('failed') failed?: string,
+    @Headers('if-none-match') ifNoneMatch?: string,
+    @Res({ passthrough: true }) response?: unknown,
   ) {
     const page = await this.dashboard.getFanMembers(id, group, {
       offset: offset === undefined ? undefined : Number(offset),
       limit: limit === undefined ? undefined : Number(limit),
       failedOnly: failed === 'true',
+      ...(ifNoneMatch && { ifNoneMatch }),
     });
     if (!page) throw new NotFoundException(`fan ${group} of run ${id} not found`);
-    return page;
+    const { etag, notModified, ...body } = page;
+    if (etag) {
+      if (notModified) throw new NotModifiedException(etag);
+      setEtag(response, etag);
+    }
+    return body;
   }
 
   /** Server-Sent Events stream of a run's live lifecycle events — the dashboard tails it instead

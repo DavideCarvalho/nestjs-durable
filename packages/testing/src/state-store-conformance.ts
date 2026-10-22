@@ -8,6 +8,7 @@ import {
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { registerCheckpointAggregationCases } from './checkpoint-aggregation-contract';
 
 /**
  * A freshly provisioned, empty {@link StateStore} plus a `cleanup` to release its resources (close
@@ -548,6 +549,8 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.countCheckpoints('r1', 5, 9, ['pending'])).toBe(0);
       expect(await store.countCheckpoints('r1', 0, 4, [])).toBe(0);
     });
+
+    registerCheckpointAggregationCases(t, () => store, run);
 
     t('saveCheckpointIfPending writes over a pending row only', async () => {
       // Optional on the interface (the engine falls back to a blind save, which can clobber a settled
