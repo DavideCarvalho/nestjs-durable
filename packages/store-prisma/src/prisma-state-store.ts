@@ -1,5 +1,8 @@
 import {
   type AttributeFilter,
+  type CheckpointNameKind,
+  type CheckpointQuery,
+  type CheckpointStat,
   type ChildWait,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
@@ -123,8 +126,8 @@ interface Delegate<Row> {
   delete(args: Args): Promise<Row>;
   deleteMany(args?: Args): Promise<{ count: number }>;
   count(args?: Args): Promise<number>;
-  /** Aggregate form — used only by `runFacets`, whose rows are `(status, origin, count)` cells, not
-   *  model rows, so the result type is stated at the call site rather than derived from `Row`. */
+  /** Aggregate form — used by the run facets and `checkpointStats`, whose rows are aggregate cells,
+   *  not model rows, so the result type is stated at the call site rather than derived from `Row`. */
   groupBy(args: Args): Promise<Record<string, unknown>[]>;
 }
 
@@ -638,6 +641,86 @@ export class PrismaStateStore implements StateStore {
       where: { runId, OR: prefixes.map((p) => ({ name: { startsWith: p } })) },
       orderBy: { seq: 'asc' },
     });
+    // On some providers (SQLite) `startsWith` compiles to a `LIKE` that reads `_` and `%` as wildcards,
+    // so it can match more than the prefix: keep only the exact matches.
+    return rows.filter((r) => prefixes.some((p) => r.name.startsWith(p))).map(fromCheckpointRow);
+  }
+
+  /**
+   * One `groupBy(parallelGroup, status)` per {@link CheckpointNameKind}, each narrowed to its kind by
+   * a name-prefix predicate, run concurrently — Prisma cannot group by a `CASE`, so the kind is the
+   * `where` instead. `minEnqueuedAt` reads a NULL `enqueuedAt` as `startedAt` (as
+   * {@link fromCheckpointRow} does): a bucket whose non-null `enqueuedAt` count falls short of its
+   * row count has such rows, and only for those kinds is the NULL subset's `min(startedAt)` asked for.
+   *
+   * On SQLite `startsWith` is a case-insensitive `LIKE`, as in {@link listCheckpointsByNamePrefix};
+   * the kind prefixes are lower-case and wildcard-free, so only a step whose name starts with one of
+   * them in another case would be classified differently there.
+   */
+  async checkpointStats(
+    runId: string,
+    opts?: { group?: string | undefined },
+  ): Promise<CheckpointStat[]> {
+    const scope = opts?.group === undefined ? { runId } : { runId, parallelGroup: opts.group };
+    const grouped = await Promise.all(
+      NAME_KINDS.map(async ({ kind, where }) => ({
+        kind,
+        where,
+        rows: (await this.db.durableStepCheckpoint.groupBy({
+          by: ['parallelGroup', 'status'],
+          where: { ...scope, ...where },
+          _count: { _all: true, enqueuedAt: true },
+          _min: { seq: true, name: true, enqueuedAt: true, startedAt: true },
+          _max: { seq: true, name: true, startedAt: true, finishedAt: true },
+          _sum: { attempts: true },
+        })) as CheckpointStatRow[],
+      })),
+    );
+    const stats = await Promise.all(
+      grouped.map(async ({ kind, where, rows }) => {
+        const unenqueued = rows.some((r) => r._count.enqueuedAt < r._count._all)
+          ? await this.unenqueuedStartedAt({ ...scope, ...where })
+          : new Map<string, Date>();
+        return rows.map((r) => toCheckpointStat(kind, r, unenqueued));
+      }),
+    );
+    return stats.flat();
+  }
+
+  /** `min(startedAt)` per `(parallelGroup, status)` over the rows whose `enqueuedAt` is NULL. */
+  private async unenqueuedStartedAt(where: Record<string, unknown>): Promise<Map<string, Date>> {
+    const rows = (await this.db.durableStepCheckpoint.groupBy({
+      by: ['parallelGroup', 'status'],
+      where: { ...where, enqueuedAt: null },
+      _min: { startedAt: true },
+    })) as { parallelGroup: string | null; status: string; _min: { startedAt: Date } }[];
+    return new Map(rows.map((r) => [bucketKey(r.parallelGroup, r.status), r._min.startedAt]));
+  }
+
+  /** {@link CheckpointQuery} as one `findMany`, in `seq` order, paged by `skip`/`take`. Ungrouped rows
+   *  are kept past `excludeGroups` explicitly: `NOT IN` alone drops a NULL `parallelGroup`. */
+  async queryCheckpoints(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]> {
+    if (query.statuses?.length === 0 || query.namePrefixes?.length === 0) return [];
+    const and: Record<string, unknown>[] = [];
+    if (query.excludeGroups?.length) {
+      and.push({
+        OR: [{ parallelGroup: null }, { parallelGroup: { notIn: query.excludeGroups } }],
+      });
+    }
+    if (query.namePrefixes) {
+      and.push({ OR: query.namePrefixes.map((p) => ({ name: { startsWith: p } })) });
+    }
+    const rows = await this.db.durableStepCheckpoint.findMany({
+      where: {
+        runId,
+        ...(query.group === undefined ? {} : { parallelGroup: query.group }),
+        ...(query.statuses ? { status: { in: query.statuses } } : {}),
+        ...(and.length ? { AND: and } : {}),
+      },
+      orderBy: { seq: 'asc' },
+      skip: query.offset,
+      take: query.limit,
+    });
     return rows.map(fromCheckpointRow);
   }
 
@@ -674,12 +757,16 @@ export class PrismaStateStore implements StateStore {
     const rows = await this.db.durableSignalWaiter.findMany({
       where: { token: { startsWith: prefix } },
     });
-    return rows.map((r) => ({
-      token: r.token,
-      runId: r.runId,
-      seq: r.seq,
-      parallelGroup: r.parallelGroup ?? undefined,
-    }));
+    // On some providers (SQLite) `startsWith` compiles to a `LIKE` that reads `_` and `%` as wildcards,
+    // so it can match more than the prefix: keep only the exact matches.
+    return rows
+      .filter((r) => r.token.startsWith(prefix))
+      .map((r) => ({
+        token: r.token,
+        runId: r.runId,
+        seq: r.seq,
+        parallelGroup: r.parallelGroup ?? undefined,
+      }));
   }
 
   async registerChildWaits(entries: ChildWait[]): Promise<void> {
@@ -937,6 +1024,63 @@ function fromRunRow(row: RunRow): WorkflowRun {
     origin: row.origin ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  };
+}
+
+/** The name prefix each non-`step` {@link CheckpointNameKind} is, as `checkpointNameKind` reads it. */
+const KIND_PREFIXES: [CheckpointNameKind, string][] = [
+  ['child', 'signal:child:'],
+  ['folded', 'fan:'],
+  ['spawn', 'spawn:'],
+];
+
+/** Each {@link CheckpointNameKind} as the `where` that selects its rows; `step` is "none of the others". */
+const NAME_KINDS: { kind: CheckpointNameKind; where: Record<string, unknown> }[] = [
+  ...KIND_PREFIXES.map(([kind, prefix]) => ({ kind, where: { name: { startsWith: prefix } } })),
+  {
+    kind: 'step',
+    where: { NOT: KIND_PREFIXES.map(([, prefix]) => ({ name: { startsWith: prefix } })) },
+  },
+];
+
+/** One `groupBy` row of {@link PrismaStateStore.checkpointStats}. */
+type CheckpointStatRow = {
+  parallelGroup: string | null;
+  status: string;
+  _count: { _all: number; enqueuedAt: number };
+  _min: { seq: number; name: string; enqueuedAt: Date | null; startedAt: Date };
+  _max: { seq: number; name: string; startedAt: Date; finishedAt: Date };
+  _sum: { attempts: number | bigint | null };
+};
+
+function bucketKey(group: string | null, status: string): string {
+  return JSON.stringify([group, status]);
+}
+
+function toCheckpointStat(
+  nameKind: CheckpointNameKind,
+  r: CheckpointStatRow,
+  unenqueued: Map<string, Date>,
+): CheckpointStat {
+  const fallback = unenqueued.get(bucketKey(r.parallelGroup, r.status));
+  const enqueued = r._min.enqueuedAt;
+  const minEnqueuedAt =
+    enqueued && fallback ? (enqueued < fallback ? enqueued : fallback) : (enqueued ?? fallback);
+  return {
+    group: r.parallelGroup,
+    status: r.status as StepCheckpoint['status'],
+    nameKind,
+    count: r._count._all,
+    minSeq: r._min.seq,
+    maxSeq: r._max.seq,
+    minName: r._min.name,
+    maxName: r._max.name,
+    // Every row has `enqueuedAt` or is in the NULL subset, so one of the two is set.
+    minEnqueuedAt: minEnqueuedAt as Date,
+    minStartedAt: r._min.startedAt,
+    maxStartedAt: r._max.startedAt,
+    maxFinishedAt: r._max.finishedAt,
+    sumAttempts: Number(r._sum.attempts ?? 0),
   };
 }
 

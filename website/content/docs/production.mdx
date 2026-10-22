@@ -278,8 +278,12 @@ DurableModule.forRoot({ store, transport, timerBatchSize: 1000 });
 
 **The console summarizes wide fans.** The dashboard's run detail folds any fan wider than 50 into
 one summary row and pages its members on demand, so opening a 40,000-member fan no longer ships
-every checkpoint to the browser. The server still reads the run's whole checkpoint list from the
-store on each poll. See [Wide fans](/docs/observability/dashboard#wide-fans).
+every checkpoint to the browser. On a store with `checkpointStats` and `queryCheckpoints` (every
+bundled store) the server does not read the whole run either. It aggregates the checkpoints with one
+`GROUP BY` and loads only the rows it shows. For a 40,000-member step fan that is 21 rows per poll
+instead of 40,001, and a page of 100 members reads 100. An unchanged run answers the next poll with
+a `304` after reading only the run row and the aggregate. A custom store without the two methods
+falls back to the full read. See [Wide fans](/docs/observability/dashboard#wide-fans).
 
 ### Remote-worker liveness
 

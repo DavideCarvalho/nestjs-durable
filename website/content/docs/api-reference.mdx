@@ -55,6 +55,7 @@ through it so the engine can checkpoint — the body itself stays deterministic 
 | `startChild` | `startChild<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, options?: string \| ChildCallOptions): Promise<string>` | Fire-and-forget: dispatch a child once and return its run id immediately; the parent keeps running. |
 | `all` | `all<C extends WorkflowClass>(workflow: C, inputs: WorkflowInputOf<C>[], opts?: AllOptions): Promise<WorkflowOutputOf<C>[]>` | Run N children of the SAME workflow in parallel and await all of them, in input order. `waitAll` (default) aggregates failures into `GatherError`; `failFast` throws on the first and cancels the surviving siblings (best-effort, observed at their next checkpoint). `concurrency` caps how many children run at once. Also takes a workflow name (`all<TOut>(workflow: string, …)`). See [Child workflows](/docs/authoring/child-workflows#ctxall--fan-out-n-children-of-the-same-workflow-wait-for-all). |
 | `all` (over a step) | `all<TIn, TOut>(step: StepRef<TIn, TOut>, inputs: TIn[], opts?: AllStepsOptions): Promise<TOut[]>` | One durable step per input, joined once: the parent wakes once per settled wave, not once per result. Outputs in input order; failures as `GatherError`. A `@Step` that declares `timeoutMs`, or a `queue` option, is rejected. See [The same step over many inputs](/docs/concepts/workflows-and-steps#the-same-step-over-many-inputs--ctxallstep-inputs). |
+| `allSettled` | `allSettled<C extends WorkflowClass>(workflow: C, inputs: WorkflowInputOf<C>[], opts?: { concurrency?: number }): Promise<Settled<WorkflowOutputOf<C>>[]>` | The same fan as `all` in `waitAll` mode, resolving with one `{ status: 'fulfilled', value } \| { status: 'rejected', id, error }` per input instead of throwing. Also takes a `@Step` reference. See [Child workflows](/docs/authoring/child-workflows#when-a-failed-item-is-an-expected-outcome--ctxallsettled). |
 
 ### External
 
@@ -151,6 +152,16 @@ Marks a method on a `@Workflow` class as its inline dead-letter handler — regi
 `<workflow>.dlq`, receives a `DeadLetter` payload (`{ deadRunId, workflow, input, error? }`) when a
 run of the class is moved to `dead`. Takes precedence over `deadLetterWorkflow`. See
 [Dead-letter queue](/docs/reliability/dead-letter).
+
+### `@OnError(match?)`
+
+Marks a method on a `@Workflow` class as the handler workflow for a failure of its runs: when a run ends
+`failed` with an error whose `code` matches (an error class with a static `code`, or the code string; no
+argument for the catch-all), the engine starts the method as `<workflow>.onError.<method>` with an
+`OnErrorInput` and the run settles with its outcome. Typed against `run`'s input and output; stackable.
+`@Workflow({ onError: [{ code?, workflow }] })` routes to a separate workflow, and the engine's
+`register` / `registerRemote` take the same `onError` option. See
+[Routing a run's failure](/docs/reliability/on-error).
 
 ### `@Entity(options)` / `@On(op)`
 
@@ -333,15 +344,22 @@ and the [dashboard](/docs/observability/dashboard#wide-fans).
 
 | Type / function | Shape | Notes |
 | --- | --- | --- |
-| `RunDetail` | `{ run, timeline, children, fans?, childCount? }` | What `getRunDetail` returns. When summarized, `timeline` omits the members of each summarized fan, `fans` holds one `FanSummary` per fan, and `children` lists at most 200 ids with `childCount` as the total. |
-| `RunDetailOptions` | `{ summarizeFansOver?: number }` | Summarize every fan with more than this many members, or declared wider than that. Unset returns the full detail. |
+| `RunDetail` | `{ run, timeline, children, fans?, childCount?, etag?, notModified? }` | What `getRunDetail` returns. When summarized, `timeline` omits the members of each summarized fan, `fans` holds one `FanSummary` per fan, and `children` lists at most 200 ids with `childCount` as the total. `etag` is set when the gateway can version the detail without reading the timeline. `notModified: true` means `ifNoneMatch` matched it: only `run` was read, and `timeline` and `children` are empty. |
+| `RunDetailOptions` | `{ summarizeFansOver?: number; ifNoneMatch?: string }` | Summarize every fan with more than this many members, or declared wider than that. Unset returns the full detail. `ifNoneMatch` is an HTTP `If-None-Match` value. A gateway that cannot version the detail ignores it. |
 | `FanSummary` | `{ group, label, firstSeq, lastSeq, size, total?, notStarted?, failFast, counts, startedAt?, finishedAt?, failures }` | `label` is the members' step name, or `child runs`. `size` counts members started (a folded checkpoint counts as the children it stands for); `total` is the declared size from the group; `notStarted` is `total - size`. `counts` is per status, with a failed child counted as `failed`. `failures` holds the first 20 failed members. |
-| `FanPageQuery` | `{ offset?, limit?, failedOnly? }` | `offset` defaults to 0; `limit` to 100, clamped to 1–500. |
-| `FanPage` | `{ items: StepCheckpoint[]; total: number }` | One page of a fan's members in seq order; `total` counts every member matching the query. |
+| `FanPageQuery` | `{ offset?, limit?, failedOnly?, ifNoneMatch? }` | `offset` defaults to 0; `limit` to 100, clamped to 1–500. `ifNoneMatch` works as on `RunDetailOptions`. |
+| `FanPage` | `{ items: StepCheckpoint[]; total: number; etag?; notModified? }` | One page of a fan's members in seq order; `total` counts every member matching the query. `etag` and `notModified` work as on `RunDetail`. A `notModified` page carries no members: `items` is empty and `total` is 0 as placeholders. |
 | `summarizeTimeline(timeline, over)` | `→ { timeline, fans }` | Split a run's checkpoints into the listed ones and the summarized fans. |
 | `summarizeFan(group, members)` | `→ FanSummary` | Summarize one fan's members. |
 | `pageFan(timeline, group, query)` | `→ FanPage` | One page of a fan out of a run's checkpoints. |
 | `childIdsOf(timeline)` | `→ string[]` | The child run ids a run's checkpoints reference. |
+| `CheckpointStat` | `{ group, status, nameKind, count, minSeq, maxSeq, minName, maxName, minEnqueuedAt, minStartedAt, maxStartedAt, maxFinishedAt, sumAttempts }` | One bucket of `StateStore.checkpointStats`. `group` is `null` for ungrouped checkpoints; `nameKind` is `child`, `folded`, `spawn` or `step`. |
+| `CheckpointQuery` | `{ group?, excludeGroups?, statuses?, namePrefixes?, offset?, limit? }` | What `StateStore.queryCheckpoints` selects, in seq order. |
+| `summarizeRunFromStore(store, runId, over, stats?)` | `→ Promise<{ timeline, fans, children, childCount }>` | The summarized detail, built from the store's aggregates. Equal to `summarizeTimeline` plus `childIdsOf` over a full read. |
+| `pageFanFromStore(store, runId, group, query, stats?)` | `→ Promise<FanPage>` | `pageFan`, read one page at a time from the store. |
+| `checkpointStatsOf(checkpoints, { group? })` / `queryCheckpointsOf(checkpoints, query)` | `→ CheckpointStat[]` / `→ StepCheckpoint[]` | The in-memory references a store's `checkpointStats` and `queryCheckpoints` must agree with. |
+| `runDetailEtag(run, stats, over)` / `fanPageEtag(group, stats, query)` | `→ string` | The ETags `StoreRunGateway` sends. |
+| `etagMatches(ifNoneMatch, etag)` | `→ boolean` | Weak `If-None-Match` comparison, `*` included. |
 
 A fan's `parallelGroup` is `all:<firstSeq>:n<size>[:failFast]` for children (older runs may carry
 `all:<firstSeq>[:failFast]`) and `steps:<firstSeq>:<size>[:failFast]` for steps.
@@ -352,7 +370,7 @@ All exported from `@dudousxd/nestjs-durable-core`.
 
 | Error | Thrown when |
 | --- | --- |
-| `FatalError` | Thrown BY YOU inside a step/workflow for an unrecoverable business failure (e.g. a declined card) — the engine never retries it and fails the run immediately. |
+| `FatalError` | `new FatalError(message, code?, details?)` — thrown BY YOU inside a step/workflow for an unrecoverable business failure (e.g. a declined card) — the engine never retries it, in a local or a dispatched step, and fails the run immediately. `code` and `details` travel with the failure to the run's error, a parent's `allSettled` item or `ctx.child` catch, and an onError handler. |
 | `SignalTimeoutError` | `ctx.waitForSignal` / `ctx.waitForEvent` / `ctx.onUpdate`'s `timeoutMs` deadline passes before delivery. Catchable in the workflow to take a default branch. |
 | `NonDeterminismError` | On resume, the step at a logical position has a different name/kind than its checkpoint — the workflow code changed under an in-flight run without a new `@Workflow` version. See [Versioning & determinism](/docs/authoring/versioning). |
 | `NestedWorkflowCallError` | A ctx primitive (`ctx.startChild`/`child`/`step`/`sleep`/`sideEffect`/…, or a `MyWorkflow.start()`/`.execute()` static via the ambient ctx) was called from INSIDE a step body (`ctx.localStep`/`transaction`/`sideEffect`/`now`). Thrown at the call site, as a `FatalError` (code `nested_workflow_call`). See [Troubleshooting](/docs/troubleshooting#nestedworkflowcallerror-a-ctx-call-inside-a-step-body). |

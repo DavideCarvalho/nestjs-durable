@@ -171,7 +171,8 @@ The dashboard asks `getRunDetail(id, { summarizeFansOver: 50 })` and pages a fan
 implements both, plus `getRun`. On a store-less pod, `ProxyRunGateway` forwards the detail options
 in its `getRunDetail` request and sends a `getFanMembers` request kind. The control plane's
 responder checks that the requesting tenant owns the run before it pages the fan, as it does
-before every run-scoped verb, so a tenant cannot page another tenant's fan.
+before every run-scoped verb, so a tenant cannot page another tenant's fan. A control plane older
+than the tenant still serves both. See [Rolling upgrades](#rolling-upgrades).
 
 If you implement `RunGateway` yourself:
 
@@ -196,6 +197,29 @@ That is why the table lists `cancel` as a working verb. It is `RunGateway.cancel
 `WorkflowEngine.cancel` is the one that rejects. Inject `RunGateway` in anything that has to run on
 more than one shape, and you never meet the distinction.
 </Callout>
+
+### Rolling upgrades
+
+Tenant pods and the control plane can be upgraded in either order. While they are on different
+releases, run detail keeps working in both directions:
+
+| Tenant | Control plane | What happens |
+| --- | --- | --- |
+| 0.47.2+ | 0.46.x or older | The old responder ignores the detail options and has no `getFanMembers`. `ProxyRunGateway` sees the full detail come back without `fans` and summarizes it on the tenant. A `getFanMembers` gets no data from an old responder, so the proxy reads the full detail and pages the fan out of it. Both fallbacks happen on that reply, with no timeout wait. |
+| 0.47.0 or 0.47.1 | 0.46.x or older | These tenants have no fallback: run detail comes back unsummarized and fan pages answer 404. Upgrade the control plane first, or move the tenants straight to 0.47.2. |
+| 0.46.x or older | 0.47.0+ | An old proxy never sends detail options or `getFanMembers`. The new responder answers its requests exactly as before: a full detail, and the same ownership checks. |
+
+After a control plane answers that it does not know `getFanMembers`, the proxy pages fans locally
+for the next minute before it asks again. The control plane can be several pods behind one queue,
+mid-upgrade themselves, and a reply does not say which pod sent it. So the proxy treats the whole
+control plane as old until that minute is up. The result is the same either way. Only the cost
+changes: the old path moves every checkpoint of the run over the wire, so on a run with a very wide
+fan, finish upgrading the control plane soon.
+
+From 0.47.2 on, a responder answers a request kind it does not know with an error whose `code` is
+`unsupported-request`, without touching the store. The next new verb can fall back the same way on a
+control plane that does not have it. A responder whose gateway throws replies with that error, so a
+tenant no longer waits out `runGatewayTimeoutMs` for an answer that will never come.
 
 ## Layered tenant authentication
 

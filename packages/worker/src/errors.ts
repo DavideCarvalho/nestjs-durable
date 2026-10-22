@@ -13,6 +13,8 @@ export class WorkflowError extends Error {}
  * and the thin worker; the human-readable `.message` is derived from those fields.
  */
 export class NondeterminismError extends WorkflowError {
+  /** Marks the failure as a broken deploy, which the engine's `onError` routing never takes. */
+  readonly code = 'non_determinism';
   readonly runId: string;
   readonly seq: number;
   readonly expected: string;
@@ -136,6 +138,8 @@ export function toError(err: unknown): StepError {
     const out: StepError = { message: err.message || err.name };
     const code = (err as { code?: unknown }).code;
     if (typeof code === 'string' && code) out.code = code;
+    const details = (err as { details?: unknown }).details;
+    if (details !== undefined) out.details = details;
     // Carry the handler's `retryable` verdict so the engine's durable retry honours a worker's
     // "don't retry this" (e.g. a declined card) — mirrors `runStepHandler` in core's protocol.ts.
     const retryable = (err as { retryable?: unknown }).retryable;

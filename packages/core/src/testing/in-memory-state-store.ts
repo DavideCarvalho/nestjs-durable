@@ -1,5 +1,7 @@
 import { parseDuration } from '../duration';
 import {
+  type CheckpointQuery,
+  type CheckpointStat,
   type ChildWait,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -17,6 +19,7 @@ import {
   type WorkflowRun,
 } from '../interfaces';
 import type { AttributeFilter } from '../interfaces';
+import { checkpointStatsOf, queryCheckpointsOf } from '../run-detail-store';
 import { mergeRunFacetRows } from '../run-facets';
 import { RUN_VALUE_FACET_SCAN, runValueFacetsFromRuns } from '../run-value-facets';
 import {
@@ -55,6 +58,11 @@ export class InMemoryStateStore implements StateStore {
    * so this lets the benchmark contrast "fetch N, scan in JS" against "fetch the k that match".
    */
   lastCheckpointRowsRead = 0;
+  /**
+   * Test/observability hook: checkpoint rows materialized since construction, across every
+   * checkpoint read that returns rows — what a run-detail benchmark compares between paths.
+   */
+  checkpointRowsRead = 0;
 
   private key(runId: string, seq: number): string {
     return `${runId}:${seq}`;
@@ -538,6 +546,25 @@ export class InMemoryStateStore implements StateStore {
       .sort((a, b) => a.seq - b.seq)
       .map((cp) => ({ ...cp }));
     this.lastCheckpointRowsRead = rows.length;
+    this.checkpointRowsRead += rows.length;
+    return rows;
+  }
+
+  private runCheckpoints(runId: string): StepCheckpoint[] {
+    return [...this.checkpoints.values()].filter((cp) => cp.runId === runId);
+  }
+
+  async checkpointStats(
+    runId: string,
+    opts?: { group?: string | undefined },
+  ): Promise<CheckpointStat[]> {
+    return checkpointStatsOf(this.runCheckpoints(runId), opts);
+  }
+
+  async queryCheckpoints(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]> {
+    const rows = queryCheckpointsOf(this.runCheckpoints(runId), query).map((cp) => ({ ...cp }));
+    this.lastCheckpointRowsRead = rows.length;
+    this.checkpointRowsRead += rows.length;
     return rows;
   }
 
@@ -579,6 +606,7 @@ export class InMemoryStateStore implements StateStore {
       .sort((a, b) => a.seq - b.seq)
       .map((cp) => ({ ...cp }));
     this.lastCheckpointRowsRead = rows.length;
+    this.checkpointRowsRead += rows.length;
     return rows;
   }
 }

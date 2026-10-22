@@ -72,7 +72,7 @@
  */
 
 import type { RawWorkerDescriptor, WorkerDescriptor, WorkflowRegistration } from './descriptor';
-import { normalizeDescriptor } from './descriptor';
+import { canonicalRoutes, normalizeDescriptor } from './descriptor';
 
 /** One live worker's claim about one workflow: the registration plus who announced it. */
 export interface WorkflowAnnouncement extends WorkflowRegistration {
@@ -85,7 +85,7 @@ export interface WorkflowAnnouncement extends WorkflowRegistration {
 /** An axis on which the live announcers of one workflow do not agree. `values` holds every distinct
  *  DECLARED value (sorted); an announcer that stated nothing on the axis contributes nothing. */
 export interface Disagreement {
-  axis: 'group' | 'origin' | 'requires';
+  axis: 'group' | 'origin' | 'requires' | 'onError';
   values: string[];
 }
 
@@ -123,6 +123,9 @@ export interface AnnouncedWorkflow {
   /** Every distinct capability demand announced, each de-duplicated + sorted. Empty = nobody stated
    *  one. Two entries here means two workers demand different capabilities for the same version. */
   requires: string[][];
+  /** Every distinct set of `onError` routes announced, each in canonical order. Empty = nobody stated
+   *  one. Two entries here means the live workers route this workflow's failures differently. */
+  onError: { code?: string; workflow: string }[][];
   /** Runtimes of the live announcers (sorted, de-duplicated). EMPTY on an `'observed'` entry: a
    *  heartbeat does not say what runtime wrote it, and the instance id's shape is a convention, not
    *  a statement, so it is not read as one. */
@@ -209,11 +212,24 @@ export function aggregateAnnouncements(
       x.join(',').localeCompare(y.join(',')),
     );
 
+    const routesByJson = new Map<string, { code?: string; workflow: string }[]>();
+    for (const a of announcements) {
+      if (a.onError === undefined) continue;
+      const canonical = canonicalRoutes(a.onError).map((r) =>
+        r.code === null ? { workflow: r.workflow } : { code: r.code, workflow: r.workflow },
+      );
+      routesByJson.set(JSON.stringify(canonical), canonical);
+    }
+    const onError = [...routesByJson.keys()].sort().map((k) => routesByJson.get(k) ?? []);
+
     const disagreements: Disagreement[] = [];
     if (groups.length > 1) disagreements.push({ axis: 'group', values: groups });
     if (origins.length > 1) disagreements.push({ axis: 'origin', values: origins });
     if (requires.length > 1) {
       disagreements.push({ axis: 'requires', values: requires.map((r) => r.join(',')) });
+    }
+    if (onError.length > 1) {
+      disagreements.push({ axis: 'onError', values: [...routesByJson.keys()].sort() });
     }
 
     const first = announcements[0];
@@ -226,6 +242,7 @@ export function aggregateAnnouncements(
       groups,
       origins,
       requires,
+      onError,
       runtimes: [...new Set(announcements.map((a) => a.runtime))].sort(),
       instances: [...new Set(announcements.map((a) => a.instanceId))].sort(),
       disagreements,
@@ -284,6 +301,7 @@ export function observedAnnouncements(
       groups: [group],
       origins: [],
       requires: [],
+      onError: [],
       runtimes: [],
       instances: [...instances].sort(),
       disagreements: [],

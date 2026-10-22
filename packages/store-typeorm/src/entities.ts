@@ -254,6 +254,14 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     name: 'StepCheckpointEntity',
     target: StepCheckpointEntity,
     tableName: 'durable_step_checkpoints',
+    // A run's fan, in member order: `checkpointStats`/`queryCheckpoints` narrow by group and page by
+    // seq. The DDL that actually creates it lives in `ensureTypeOrmDurableSchema`.
+    indices: [
+      {
+        name: 'durable_step_checkpoints_group_idx',
+        columns: ['runId', 'parallelGroup', 'seq'],
+      },
+    ],
     columns: {
       runId: { type: 'text', primary: true, name: col('runId') },
       seq: { type: 'integer', primary: true, name: col('seq') },

@@ -1,4 +1,6 @@
 import type {
+  CheckpointQuery,
+  CheckpointStat,
   ChildWait,
   RetentionPolicy,
   RunFacetQuery,
@@ -89,6 +91,16 @@ export class CodecStateStore implements StateStore {
     limit: number,
   ) => Promise<number>;
 
+  /** Forwarded verbatim — the buckets aggregate names, statuses and timestamps, never a payload.
+   *  Bound only when the inner store aggregates, so the run detail's fallback still applies. */
+  readonly checkpointStats?: (
+    runId: string,
+    opts?: { group?: string | undefined },
+  ) => Promise<CheckpointStat[]>;
+  /** Filters on unencoded columns, then decodes the rows like {@link listCheckpoints}. Bound only
+   *  when the inner store has it. */
+  readonly queryCheckpoints?: (runId: string, query: CheckpointQuery) => Promise<StepCheckpoint[]>;
+
   /** Forwarded verbatim — a count reads no payload. Bound only when the inner store counts, so the
    *  engine's facet/listing fallback still applies through the wrapper. */
   readonly countRuns?: (query: Omit<RunQuery, 'limit' | 'offset'>) => Promise<number>;
@@ -139,6 +151,12 @@ export class CodecStateStore implements StateStore {
     if (countCps)
       this.countCheckpoints = (runId, from, to, statuses) =>
         countCps.call(inner, runId, from, to, statuses);
+    const stats = inner.checkpointStats;
+    if (stats) this.checkpointStats = (runId, opts) => stats.call(inner, runId, opts);
+    const queryCps = inner.queryCheckpoints;
+    if (queryCps)
+      this.queryCheckpoints = async (runId, query) =>
+        (await queryCps.call(inner, runId, query)).map((c) => this.decCp(c));
     const prune = inner.pruneTerminalRuns;
     if (prune)
       this.pruneTerminalRuns = (policy, now, limit) => prune.call(inner, policy, now, limit);

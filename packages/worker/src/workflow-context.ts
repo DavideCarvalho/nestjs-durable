@@ -3,6 +3,7 @@ import type {
   DurableWebhook,
   HistoryEvent,
   SearchAttributes,
+  Settled,
   StepDispatchOpts,
   StepError,
   StepEvent,
@@ -537,6 +538,53 @@ export class WorkflowContext implements WorkflowCtx {
     inputs: unknown[],
     opts: { mode?: GatherMode } = {},
   ): Promise<unknown[]> {
+    const { name, entries } = this.childFan(workflow, inputs, opts.mode ?? 'waitAll');
+    const failures: GatherFailure[] = [];
+    const outputs = entries.map((e) => {
+      if (e.history.error != null) {
+        failures.push({ index: e.index, workflow: name, error: e.history.error });
+        return undefined;
+      }
+      return e.history.output;
+    });
+    if (failures.length > 0) throw new GatherReplayError(failures);
+    return outputs;
+  }
+
+  /**
+   * {@link all} that resolves with one {@link Settled} per child, in input order, instead of throwing
+   * for a failed one. The same fan as `all` in `waitAll` mode. Matches `WorkflowCtx.allSettled`; a
+   * rejected item's `id` is the child run id the engine minted for it (`<runId>.child.<seq>`).
+   */
+  allSettled<C extends WorkflowClass>(
+    workflow: C,
+    inputs: WorkflowInputOf<C>[],
+  ): Promise<Settled<WorkflowOutputOf<C>>[]>;
+  allSettled<TOutput = unknown>(workflow: string, inputs: unknown[]): Promise<Settled<TOutput>[]>;
+  async allSettled(workflow: WorkflowRef, inputs: unknown[]): Promise<Settled<unknown>[]> {
+    const { entries } = this.childFan(workflow, inputs, 'waitAll');
+    return entries.map(
+      (e): Settled<unknown> =>
+        e.history.error != null
+          ? {
+              status: 'rejected',
+              id: `${this.runId}.child.${e.seq}`,
+              error: e.history.error.message,
+              ...(e.history.error.code !== undefined ? { code: e.history.error.code } : {}),
+              ...(e.history.error.details !== undefined
+                ? { details: e.history.error.details }
+                : {}),
+            }
+          : { status: 'fulfilled', value: e.history.output },
+    );
+  }
+
+  /** The fan `all` and `allSettled` share: returns once every child has settled, suspends before. */
+  private childFan(
+    workflow: WorkflowRef,
+    inputs: unknown[],
+    mode: GatherMode,
+  ): { name: string; entries: { index: number; seq: number; history: HistoryEvent }[] } {
     const name = workflowName(workflow);
     const entries = inputs.map((input, index) => ({
       index,
@@ -545,11 +593,11 @@ export class WorkflowContext implements WorkflowCtx {
       history: undefined as HistoryEvent | null | undefined,
     }));
     const first = entries[0];
-    if (first === undefined) return [];
+    if (first === undefined) return { name, entries: [] };
     const group = `gather:${first.seq}`;
     for (const e of entries) e.history = this.replayEntry(e.seq, 'child', name);
 
-    if ((opts.mode ?? 'waitAll') === 'failFast') {
+    if (mode === 'failFast') {
       for (const e of entries) {
         if (e.history?.error != null) {
           throw new GatherReplayError([{ index: e.index, workflow: name, error: e.history.error }]);
@@ -571,18 +619,14 @@ export class WorkflowContext implements WorkflowCtx {
       }
     }
     if (pending) throw new Suspend();
-
-    const failures: GatherFailure[] = [];
-    const outputs = entries.map((e) => {
-      const ev = e.history as HistoryEvent;
-      if (ev.error != null) {
-        failures.push({ index: e.index, workflow: name, error: ev.error });
-        return undefined;
-      }
-      return ev.output;
-    });
-    if (failures.length > 0) throw new GatherReplayError(failures);
-    return outputs;
+    return {
+      name,
+      entries: entries.map((e) => ({
+        index: e.index,
+        seq: e.seq,
+        history: e.history as HistoryEvent,
+      })),
+    };
   }
 
   // -- deterministic sources (recorded once, replayed) ---------------------

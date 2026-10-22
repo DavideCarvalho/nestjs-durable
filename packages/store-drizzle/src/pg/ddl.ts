@@ -102,6 +102,7 @@ export const DURABLE_PG_DDL: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS "durable_workflow_runs_namespace_status_idx" ON "durable_workflow_runs" USING btree ("namespace","status","created_at")`,
   `CREATE INDEX IF NOT EXISTS "durable_runs_tags_gin_idx" ON "durable_workflow_runs" USING gin ("tags" jsonb_path_ops)`,
   `CREATE INDEX IF NOT EXISTS "durable_runs_status_updated_idx" ON "durable_workflow_runs" USING btree ("status","updated_at")`,
+  `CREATE INDEX IF NOT EXISTS "durable_step_checkpoints_group_idx" ON "durable_step_checkpoints" USING btree ("run_id","parallel_group","seq")`,
   `CREATE INDEX IF NOT EXISTS "durable_run_attributes_num_idx" ON "durable_run_attributes" USING btree ("key","num_value")`,
   `CREATE INDEX IF NOT EXISTS "durable_run_attributes_str_idx" ON "durable_run_attributes" USING btree ("key","str_value")`,
   `CREATE INDEX IF NOT EXISTS "durable_signal_waiters_run_id_idx" ON "durable_signal_waiters" USING btree ("run_id")`,

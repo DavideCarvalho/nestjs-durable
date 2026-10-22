@@ -21,12 +21,18 @@ import {
   type StateStore,
   WorkflowEngine,
   type WorkflowRun,
+  aggregatesCheckpoints,
   childIdsOf,
+  etagMatches,
+  fanPageEtag,
   indexWaitersByRun,
   listSignalWaitersOfRuns,
   mergeRunFacetRows,
   pageFan,
+  pageFanFromStore,
   resolveRunWaiting,
+  runDetailEtag,
+  summarizeRunFromStore,
   summarizeTimeline,
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable } from '@nestjs/common';
@@ -59,9 +65,19 @@ export class StoreRunGateway implements RunGateway {
       ]);
       return { run, timeline, children };
     }
-    // Summarized: the children come from the timeline already loaded, rather than a second read of
-    // every child-edge checkpoint (one per child of a wide fan). A child whose waiter is written but
-    // whose placeholder checkpoint is not yet is missing for that one read; the next one lists it.
+    // Summarized: the children come from the checkpoints, rather than from a read of every
+    // child-edge checkpoint plus the waiters. A child whose waiter is written but whose placeholder
+    // checkpoint is not yet is missing for that one read; the next one lists it.
+    if (aggregatesCheckpoints(this.store)) {
+      // The buckets are read before any row, so a write landing mid-read leaves the ETag older than
+      // the body: the next poll misses and re-reads, rather than pinning a stale body.
+      const stats = await this.store.checkpointStats(runId);
+      const etag = runDetailEtag(run, stats, over);
+      if (etagMatches(options?.ifNoneMatch, etag)) {
+        return { run, timeline: [], children: [], notModified: true, etag };
+      }
+      return { run, ...(await summarizeRunFromStore(this.store, runId, over, stats)), etag };
+    }
     const full = await this.store.listCheckpoints(runId);
     const { timeline, fans } = summarizeTimeline(full, over);
     const ids = childIdsOf(full);
@@ -80,6 +96,14 @@ export class StoreRunGateway implements RunGateway {
 
   async getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
     if (!(await this.store.getRun(runId))) return null;
+    if (aggregatesCheckpoints(this.store)) {
+      const stats = await this.store.checkpointStats(runId, { group });
+      const etag = fanPageEtag(group, stats, query);
+      if (etagMatches(query.ifNoneMatch, etag)) {
+        return { items: [], total: 0, notModified: true, etag };
+      }
+      return { ...(await pageFanFromStore(this.store, runId, group, query, stats)), etag };
+    }
     return pageFan(await this.store.listCheckpoints(runId), group, query);
   }
 

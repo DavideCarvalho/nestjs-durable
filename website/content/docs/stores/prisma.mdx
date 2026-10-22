@@ -76,6 +76,7 @@ model DurableStepCheckpoint {
   finishedAt  DateTime @map("finished_at")
 
   @@id([runId, seq])
+  @@index([runId, parallelGroup, seq], map: "durable_step_checkpoints_group_idx")
   @@map("durable_step_checkpoints")
 }
 

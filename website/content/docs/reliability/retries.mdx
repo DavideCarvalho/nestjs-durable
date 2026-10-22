@@ -70,7 +70,9 @@ async charge(order: Order) {
 
 The optional second argument is a machine-readable `code` (here `'declined'`) that ends up on the run's
 structured error. Use `FatalError` for deterministic business verdicts; let ordinary throws (a timeout, a
-502, a dropped connection) flow through the retry path.
+502, a dropped connection) flow through the retry path. When the verdict is an expected outcome rather
+than a reason to fail the run, give the workflow an [`@OnError`](/docs/reliability/on-error) method for that
+`code`.
 
 ## The durable retry path
 

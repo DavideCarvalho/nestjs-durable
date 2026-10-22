@@ -98,7 +98,11 @@ export const durableStepCheckpoints = pgTable(
     finishedAt: tstz('finished_at').notNull(),
   },
   // (run_id, seq) is the primary key, so listCheckpoints / getEvent already hit an index.
-  (t) => [primaryKey({ columns: [t.runId, t.seq] })],
+  (t) => [
+    primaryKey({ columns: [t.runId, t.seq] }),
+    // A run detail reads one fan at a time: checkpointStats / queryCheckpoints by group, seq-paged.
+    index('durable_step_checkpoints_group_idx').on(t.runId, t.parallelGroup, t.seq),
+  ],
 );
 
 // Normalized search-attribute side-table: one row per (run, key), so attribute predicates push DOWN

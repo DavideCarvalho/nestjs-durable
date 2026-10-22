@@ -180,3 +180,35 @@ describe('aggregateAnnouncements — disagreement is reported, never resolved', 
     expect(out[0]?.groups).toEqual(['a', 'b']);
   });
 });
+
+describe('aggregateAnnouncements — onError routes', () => {
+  const routed = (instanceId: string, onError?: { code?: string; workflow: string }[]) =>
+    worker({
+      instanceId,
+      registrations: [{ name: 'line', version: '1', ...(onError ? { onError } : {}) }],
+    });
+
+  it('folds the same routes, listed in any order, into one set', () => {
+    const [entry] = aggregateAnnouncements([
+      routed('a', [{ code: 'x', workflow: 'dlq' }, { workflow: 'all' }]),
+      routed('b', [{ workflow: 'all' }, { code: 'x', workflow: 'dlq' }]),
+    ]);
+    expect(entry?.onError).toEqual([[{ code: 'x', workflow: 'dlq' }, { workflow: 'all' }]]);
+    expect(entry?.disagreements).toEqual([]);
+  });
+
+  it('flags workers that route the same workflow differently', () => {
+    const [entry] = aggregateAnnouncements([
+      routed('a', [{ code: 'x', workflow: 'dlq' }]),
+      routed('b', [{ code: 'x', workflow: 'dlq-v2' }]),
+    ]);
+    expect(entry?.onError).toHaveLength(2);
+    expect(entry?.disagreements.map((d) => d.axis)).toEqual(['onError']);
+  });
+
+  it('does not count a worker that states no routes as disagreeing', () => {
+    const [entry] = aggregateAnnouncements([routed('a', [{ workflow: 'dlq' }]), routed('b')]);
+    expect(entry?.onError).toEqual([[{ workflow: 'dlq' }]]);
+    expect(entry?.disagreements).toEqual([]);
+  });
+});

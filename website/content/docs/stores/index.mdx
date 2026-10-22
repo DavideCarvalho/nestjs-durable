@@ -35,7 +35,7 @@ optional, and the engine falls back to something slower but correct when a store
 Run the [shared store contract](/docs/testing#testing-a-custom-storetransportadmission-backend)
 (`runStateStoreContract`) against your adapter. Its `listDueTimers` case checks the ordering and
 the `limit`. Its cases for `countCheckpoints`, `saveCheckpointIfPending`, `saveCheckpointsIfPending`,
-`registerChildWaits` and `listCheckpointsByNamePrefix` expect the method to exist, because every bundled adapter has it: a
+`registerChildWaits`, `listCheckpointsByNamePrefix`, `checkpointStats` and `queryCheckpoints` expect the method to exist, because every bundled adapter has it: a
 custom store that leaves one out fails those cases even though the engine would fall back.
 
 | Method | Required? | What the engine uses it for | Without it |
@@ -49,6 +49,8 @@ custom store that leaves one out fails those cases even though the engine would 
 | `compactCheckpoints(runId, fromSeq, toSeq, into)` | optional | folds a settled child fan (or wave) of 100+ into one `fan:` checkpoint. | Settled fans keep one checkpoint per child. |
 | `listCheckpointsByNamePrefix(runId, prefixes)` | optional | reads a fan's existing checkpoints in one prefix query. | `listCheckpoints` plus a prefix filter in memory. |
 | `listSignalWaitersByRun(runIds)` | optional | run-scoped waiter reads (run detail, cancel, purge, the timer pass). | Those reads scan every waiter. |
+| `checkpointStats(runId, { group? })` | optional, paired with `queryCheckpoints` | the console's summarized run detail and fan pages, and their ETag. One `GROUP BY parallel_group, status, <name kind>` returning a `CheckpointStat` per bucket: count, seq and name bounds, earliest `enqueuedAt` (read as `startedAt` when null), start and finish bounds, attempt sum. The name kind is `child` (`signal:child:`), `folded` (`fan:`), `spawn` (`spawn:`) or `step`. | `StoreRunGateway` reads every checkpoint of the run and summarizes in memory, on every poll. A 40,000-member fan is a full read each time. |
+| `queryCheckpoints(runId, { group?, excludeGroups?, statuses?, namePrefixes?, offset?, limit? })` | optional, paired with `checkpointStats` | the rows the summary still needs (those outside wide fans, folded checkpoints, a fan's first 20 failures, the first child edges) and one page of a fan's members. Seq order. `excludeGroups` keeps ungrouped rows. An empty `statuses` or `namePrefixes` matches nothing. | Same as above: one full read per detail and per page. |
 
 Every bundled adapter (MikroORM, TypeORM, Prisma, Drizzle on SQLite/MySQL and on Postgres, and the
 in-memory store) implements `listDueTimers` with `limit` and ordering and every optional method in the
@@ -58,10 +60,23 @@ never a read followed by a write, and `countCheckpoints` is one `COUNT(*)` over 
 500 rows on Drizzle Postgres, and those same conditional `UPDATE`s, one per row, in one transaction
 on the other stores. It is one commit per batch either way.
 
+`checkpointStats` is one aggregate query. Each SQL store also declares a
+`durable_step_checkpoints_group_idx` index on `(run_id, parallel_group, seq)` for the per-fan reads.
+MikroORM and TypeORM add it on boot, Drizzle Postgres's `DURABLE_PG_DDL` creates it `IF NOT EXISTS`,
+and Prisma and Drizzle SQLite get it from your next migration.
+
+Two things the store must not try to do in SQL: decide whether a child failed, or count the children
+a folded checkpoint stands for. Both live in the payload (`{ ok: false }`, `output.values`), which a
+`CodecStateStore` may have encrypted. Core loads those rows through `queryCheckpoints` and reads them
+after decoding. On a collation that ignores case (MySQL's default), the name kind and the
+`namePrefixes` match ignore case too. Engine-written names are lower-case, so in practice only a step
+you named something like `FAN:x` would be affected.
+
 `CodecStateStore` exposes an optional method only when the store it wraps has it, so wrapping a
 store never hides a capability or invents one. It encodes the payload for `saveCheckpointIfPending`
-and for every entry of `saveCheckpointsIfPending`, forwards `countCheckpoints` verbatim (a count
-reads no payload), and decodes the runs `listDueTimers` returns.
+and for every entry of `saveCheckpointsIfPending`, forwards `countCheckpoints` and `checkpointStats`
+verbatim (neither reads a payload), decodes the rows `queryCheckpoints` returns, and decodes the runs
+`listDueTimers` returns.
 
 ## Adapters
 

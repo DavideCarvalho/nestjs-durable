@@ -497,6 +497,23 @@ small waves is summarized from its first wave, because the group carries the fan
 `children` is capped at 200 ids, with `childCount` carrying the total. Pass `?full=true` for the
 whole timeline and every child id.
 
+**The store aggregates.** When the store implements `checkpointStats` and `queryCheckpoints` (every
+bundled store does), the summary is built from one `GROUP BY parallel_group, status` over the run's
+checkpoints. Only the rows the response carries are loaded: the checkpoints outside wide fans, each
+wide fan's first 20 failures, the folded `fan:` checkpoints, and the first child edges. A child fan
+still in flight also loads its completed `signal:child:` rows, because only their payload says
+whether the child failed. On a 40,000-member step fan a poll reads 21 rows instead of 40,001. A
+custom store without the two methods gets the same response from a full read.
+
+**Polls revalidate.** `GET runs/:id` and `GET runs/:id/fans/:group` send an `ETag` with
+`Cache-Control: private, no-cache`. The ETag is derived from the run row and the checkpoint
+aggregates: a new checkpoint, a status change, a retry or any run update moves it. The browser adds
+`If-None-Match` to the console's next `fetch` by itself. While nothing has changed, the server
+answers `304` after reading the run row and the aggregate, and the browser gives TanStack Query the
+body it already has. Over a tenant proxy the operator makes the same check, so an unchanged
+tenant's poll costs it no timeline read either. A gateway that cannot version the detail, such as an
+older operator, a store without the aggregates, or `?full=true`, answers in full every time.
+
 **One row and one node per fan.** In the spans panel a summarized fan is a single row labelled with
 the members' step name (or `child runs`) and `×<total>`. Under it are a segmented progress bar and a
 legend with a count for each state that is present:
@@ -819,8 +836,8 @@ await durableClient.retry(detail.run.id);
 | `GET` | `/durable/api/runs` | list runs — `?status=` (repeat any of these to match a SET), `?workflow=`, `?tag=`, `?attr=`, `?namespace=`, `?origin=`, `?unattributed=true`, `?limit=`, `?offset=`. Also takes [nestjs-filter](https://www.npmjs.com/package/@dudousxd/nestjs-filter)'s structured form (`?filter[where][0][field]=tag&…`), which is what the console sends. Returns list ROWS: no `input` / `output` / `error` |
 | `GET` | `/durable/api/runs/facets` | `(status, origin)` counts over the same tag / tenant / attribute predicates — the chips' numbers, whole-set rather than per-page |
 | `GET` | `/durable/api/runs/values` | the distinct values of one filter field over the runs the other predicates select — `?groupByCount[field]=tag&groupByCount[limit]=20`. Answers `{ value, count }[]`; this is what fills the [pickers](#filter-pickers) |
-| `GET` | `/durable/api/runs/:id` | run + step timeline, payloads included. Fans wider than 50 come back as `fans: FanSummary[]` instead of their members, and `children` is capped at 200 with `childCount` as the total; `?full=true` returns everything. See [Wide fans](#wide-fans) |
-| `GET` | `/durable/api/runs/:id/fans/:group` | one page of a fan's members in seq order, `{ items, total }` — `?offset=` (default 0), `?limit=` (default 100, at most 500), `?failed=true` for failed members only. `:group` is the fan's URL-encoded `parallelGroup`. 404 for an unknown run, or when the gateway cannot page fans |
+| `GET` | `/durable/api/runs/:id` | run + step timeline, payloads included. Fans wider than 50 come back as `fans: FanSummary[]` instead of their members, and `children` is capped at 200 with `childCount` as the total; `?full=true` returns everything. Sends an `ETag` when the gateway can version it, and answers a matching `If-None-Match` with `304`. See [Wide fans](#wide-fans) |
+| `GET` | `/durable/api/runs/:id/fans/:group` | one page of a fan's members in seq order, `{ items, total }` — `?offset=` (default 0), `?limit=` (default 100, at most 500), `?failed=true` for failed members only. `:group` is the fan's URL-encoded `parallelGroup`. 404 for an unknown run, or when the gateway cannot page fans. `ETag` / `304` as above |
 | `GET` (SSE) | `/durable/api/runs/:id/stream` | live-tail the run's lifecycle events |
 | `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |
 | `POST` | `/durable/api/runs/:id/retry-with-input` | fix-and-replay: start a fresh linked run from a dead/failed run with a corrected input (body: `{ input }`) |

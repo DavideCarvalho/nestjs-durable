@@ -1,5 +1,8 @@
 import {
   type AttributeFilter,
+  type CheckpointNameKind,
+  type CheckpointQuery,
+  type CheckpointStat,
   type ChildWait,
   ENGINE_MINTED_TAG_PREFIXES,
   RUN_VALUE_FACET_LIMIT,
@@ -858,6 +861,100 @@ export class MikroOrmStateStore implements StateStore {
       { runId, $or: prefixes.map((p) => ({ name: { $like: `${p}%` } })) },
       { orderBy: { seq: 'asc' } },
     );
+    // `LIKE` reads `_` and `%` in the prefix as wildcards, so it can match more than the prefix: keep
+    // only the exact matches.
+    return rows.filter((r) => prefixes.some((p) => r.name.startsWith(p))).map(fromCheckpointEntity);
+  }
+
+  /** One `GROUP BY parallel_group, status, <name kind>` over the run's checkpoints — the buckets a
+   *  run detail summarizes a fan from, without loading its rows. The name-kind `CASE` is the SQL of
+   *  `checkpointNameKind`, and `min(coalesce(enqueued_at, started_at))` reads `enqueuedAt` the way
+   *  {@link listCheckpoints} does. Raw SQL on metadata-resolved names, so a custom column naming
+   *  strategy is honoured. */
+  async checkpointStats(
+    runId: string,
+    opts?: { group?: string | undefined },
+  ): Promise<CheckpointStat[]> {
+    const em = this.fork();
+    const quote = this.idQuote(em);
+    const meta = em.getMetadata().get(StepCheckpointEntity);
+    const c = (prop: keyof typeof meta.properties) =>
+      quote(meta.properties[prop]?.fieldNames?.[0] ?? prop);
+    const nameKind =
+      `case when ${c('name')} like 'signal:child:%' then 'child' ` +
+      `when ${c('name')} like 'fan:%' then 'folded' ` +
+      `when ${c('name')} like 'spawn:%' then 'spawn' else 'step' end`;
+    const params: unknown[] = [runId];
+    let where = `${c('runId')} = ?`;
+    if (opts?.group !== undefined) {
+      where += ` and ${c('parallelGroup')} = ?`;
+      params.push(opts.group);
+    }
+    const sql =
+      `select ${c('parallelGroup')} as ${quote('grp')}, ${c('status')} as ${quote('status')}, ` +
+      `${nameKind} as ${quote('name_kind')}, count(*) as ${quote('n')}, ` +
+      `min(${c('seq')}) as ${quote('min_seq')}, max(${c('seq')}) as ${quote('max_seq')}, ` +
+      `min(${c('name')}) as ${quote('min_name')}, max(${c('name')}) as ${quote('max_name')}, ` +
+      `min(coalesce(${c('enqueuedAt')}, ${c('startedAt')})) as ${quote('min_enqueued_at')}, ` +
+      `min(${c('startedAt')}) as ${quote('min_started_at')}, ` +
+      `max(${c('startedAt')}) as ${quote('max_started_at')}, ` +
+      `max(${c('finishedAt')}) as ${quote('max_finished_at')}, ` +
+      `sum(${c('attempts')}) as ${quote('sum_attempts')} ` +
+      `from ${quote(meta.tableName)} where ${where} ` +
+      `group by ${c('parallelGroup')}, ${c('status')}, ${nameKind}`;
+    const rows = (await em.getConnection().execute(sql, params)) as unknown as Record<
+      string,
+      unknown
+    >[];
+    const date = aggregateDateReader(em);
+    // pg/mysql return count/sum as strings or bigints, and an aggregated date un-hydrated.
+    return rows.map((row) => ({
+      group: (row.grp as string | null) ?? null,
+      status: row.status as StepCheckpoint['status'],
+      nameKind: row.name_kind as CheckpointNameKind,
+      count: Number(row.n),
+      minSeq: Number(row.min_seq),
+      maxSeq: Number(row.max_seq),
+      minName: String(row.min_name),
+      maxName: String(row.max_name),
+      minEnqueuedAt: date(row.min_enqueued_at),
+      minStartedAt: date(row.min_started_at),
+      maxStartedAt: date(row.max_started_at),
+      maxFinishedAt: date(row.max_finished_at),
+      sumAttempts: Number(row.sum_attempts),
+    }));
+  }
+
+  /** The run's checkpoints matching `query`, in `seq` order and paged in the database — a fan's
+   *  failures or one page of its members without the rest of the run. An excluded group keeps the
+   *  ungrouped rows (`parallel_group is null or not in (...)`); an empty `statuses`/`namePrefixes`
+   *  matches nothing, so it returns before querying. */
+  async queryCheckpoints(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]> {
+    if (query.statuses?.length === 0 || query.namePrefixes?.length === 0) return [];
+    const and: Record<string, unknown>[] = [{ runId }];
+    if (query.group !== undefined) and.push({ parallelGroup: query.group });
+    if (query.excludeGroups?.length) {
+      and.push({
+        $or: [{ parallelGroup: null }, { parallelGroup: { $nin: query.excludeGroups } }],
+      });
+    }
+    if (query.statuses) and.push({ status: { $in: query.statuses } });
+    if (query.namePrefixes) {
+      and.push({ $or: query.namePrefixes.map((p) => ({ name: { $like: `${p}%` } })) });
+    }
+    const rows = await this.fork().find(
+      StepCheckpointEntity,
+      { $and: and },
+      {
+        orderBy: { seq: 'asc' },
+        // An offset alone is not valid SQL on SQLite/MySQL, so an unbounded page gets a limit no
+        // run reaches.
+        ...(query.limit !== undefined || query.offset
+          ? { limit: query.limit ?? Number.MAX_SAFE_INTEGER }
+          : {}),
+        ...(query.offset ? { offset: query.offset } : {}),
+      },
+    );
     return rows.map(fromCheckpointEntity);
   }
 
@@ -889,12 +986,16 @@ export class MikroOrmStateStore implements StateStore {
   async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
     const em = this.fork();
     const rows = await em.find(SignalWaiterEntity, { token: { $like: `${prefix}%` } });
-    return rows.map((e) => ({
-      token: e.token,
-      runId: e.runId,
-      seq: e.seq,
-      parallelGroup: e.parallelGroup ?? undefined,
-    }));
+    // `LIKE` reads `_` and `%` in the prefix as wildcards, so it can match more than the prefix: keep
+    // only the exact matches.
+    return rows
+      .filter((e) => e.token.startsWith(prefix))
+      .map((e) => ({
+        token: e.token,
+        runId: e.runId,
+        seq: e.seq,
+        parallelGroup: e.parallelGroup ?? undefined,
+      }));
   }
 
   async registerChildWaits(entries: ChildWait[]): Promise<void> {
@@ -1072,6 +1173,27 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     origin: e.origin ?? undefined,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
+  };
+}
+
+/**
+ * Read an aggregated date column (`min`/`max` of a `Date` property) into the `Date` hydration would
+ * produce: a raw query skips the entity mapper, so drivers hand back a `Date`, an epoch number, a
+ * bigint or a zone-less string (MySQL's `dateStrings`). Zone-less strings get the platform's
+ * configured timezone appended, as MikroORM's result mapper does.
+ */
+function aggregateDateReader(em: EntityManager): (value: unknown) => Date {
+  const platform = em.getPlatform();
+  const tz = platform.getTimezone();
+  return (value) => {
+    if (value instanceof Date) return value;
+    if (typeof value === 'bigint') return platform.parseDate(Number(value)) as Date;
+    if (typeof value === 'number' || !tz || tz === 'local') {
+      return platform.parseDate(value as string | number) as Date;
+    }
+    const text = String(value);
+    const zoned = text.includes('+') || text.lastIndexOf('-') > 10 || text.endsWith('Z');
+    return platform.parseDate(zoned ? text : `${text}${tz}`) as Date;
   };
 }
 

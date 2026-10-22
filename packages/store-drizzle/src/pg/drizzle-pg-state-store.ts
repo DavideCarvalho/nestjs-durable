@@ -1,5 +1,8 @@
 import {
   type AttributeFilter,
+  type CheckpointNameKind,
+  type CheckpointQuery,
+  type CheckpointStat,
   type ChildWait,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
@@ -48,6 +51,7 @@ import {
   like,
   lt,
   lte,
+  notInArray,
   or,
   sql,
 } from 'drizzle-orm';
@@ -674,6 +678,82 @@ export class DrizzlePgStateStore implements StateStore {
       )
       .orderBy(asc(stepCheckpoints.seq));
     return rows.map(fromCheckpointRow);
+  }
+
+  /** {@link StateStore.checkpointStats}: one `GROUP BY parallel_group, status, name_kind` over the
+   *  run's checkpoints, so a wide fan comes back as a few bucket rows instead of every member. */
+  async checkpointStats(
+    runId: string,
+    opts?: { group?: string | undefined },
+  ): Promise<CheckpointStat[]> {
+    const c = stepCheckpoints;
+    const nameKind = sql<CheckpointNameKind>`CASE
+      WHEN ${c.name} LIKE 'signal:child:%' THEN 'child'
+      WHEN ${c.name} LIKE 'fan:%' THEN 'folded'
+      WHEN ${c.name} LIKE 'spawn:%' THEN 'spawn'
+      ELSE 'step' END`.as('name_kind');
+    // Aggregates come back raw from the driver (count/sum as bigint strings, timestamps unparsed);
+    // `mapWith` a column decodes them as that column's rows are decoded.
+    const rows = await this.db
+      .select({
+        group: c.parallelGroup,
+        status: c.status,
+        nameKind,
+        count: sql<number>`count(*)`.mapWith(Number),
+        minSeq: sql<number>`min(${c.seq})`.mapWith(Number),
+        maxSeq: sql<number>`max(${c.seq})`.mapWith(Number),
+        minName: sql<string>`min(${c.name})`,
+        maxName: sql<string>`max(${c.name})`,
+        minEnqueuedAt: sql<Date>`min(coalesce(${c.enqueuedAt}, ${c.startedAt}))`.mapWith(
+          c.startedAt,
+        ),
+        minStartedAt: sql<Date>`min(${c.startedAt})`.mapWith(c.startedAt),
+        maxStartedAt: sql<Date>`max(${c.startedAt})`.mapWith(c.startedAt),
+        maxFinishedAt: sql<Date>`max(${c.finishedAt})`.mapWith(c.finishedAt),
+        sumAttempts: sql<number>`sum(${c.attempts})`.mapWith(Number),
+      })
+      .from(c)
+      .where(
+        and(
+          eq(c.runId, runId),
+          opts?.group !== undefined ? eq(c.parallelGroup, opts.group) : undefined,
+        ),
+      )
+      .groupBy(c.parallelGroup, c.status, sql`name_kind`);
+    return rows.map((r) => ({
+      ...r,
+      group: r.group ?? null,
+      status: r.status as StepCheckpoint['status'],
+    }));
+  }
+
+  /** {@link StateStore.queryCheckpoints}: the run's checkpoints narrowed in SQL, in `seq` order and
+   *  paged there, so reading one page of a wide fan never loads the rest of it. */
+  async queryCheckpoints(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]> {
+    if (query.statuses?.length === 0 || query.namePrefixes?.length === 0) return [];
+    const c = stepCheckpoints;
+    const base = this.db
+      .select()
+      .from(c)
+      .where(
+        and(
+          eq(c.runId, runId),
+          query.group !== undefined ? eq(c.parallelGroup, query.group) : undefined,
+          // `NOT IN` is never true for a NULL group, so ungrouped rows are kept explicitly.
+          query.excludeGroups?.length
+            ? or(isNull(c.parallelGroup), notInArray(c.parallelGroup, query.excludeGroups))
+            : undefined,
+          query.statuses ? inArray(c.status, query.statuses) : undefined,
+          query.namePrefixes
+            ? or(...query.namePrefixes.map((p) => like(c.name, `${escapeLike(p)}%`)))
+            : undefined,
+        ),
+      )
+      .orderBy(asc(c.seq))
+      .$dynamic();
+    if (query.limit != null) base.limit(query.limit);
+    if (query.offset != null) base.offset(query.offset);
+    return (await base).map(fromCheckpointRow);
   }
 
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {

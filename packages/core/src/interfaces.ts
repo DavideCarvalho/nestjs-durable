@@ -292,6 +292,9 @@ export interface StepError {
   message: string;
   /** Optional machine-readable code, e.g. `declined`, `timeout`. */
   code?: string | undefined;
+  /** Structured, JSON-serializable detail of the failure (e.g. validation issues), from
+   *  `FatalError`'s third argument or a `details` on what a step handler threw. */
+  details?: unknown;
   /** Whether the engine should treat this as retryable. */
   retryable?: boolean | undefined;
   stack?: string | undefined;
@@ -635,6 +638,81 @@ export interface StateStore {
     toSeq: number,
     statuses: StepCheckpoint['status'][],
   ): Promise<number>;
+
+  /**
+   * The run's checkpoints aggregated into {@link CheckpointStat} buckets — one per
+   * `(parallelGroup, status, nameKind)` present — with `opts.group` narrowing it to one group. A
+   * `GROUP BY`, not a load: it is what lets a run detail draw a 40,000-member fan from a few rows.
+   * Ungrouped checkpoints come back under `group: null`. Bucket order is unspecified.
+   *
+   * Optional: a store that omits it still works — the console's run detail then loads every
+   * checkpoint and summarizes it in JS (`summarizeTimeline`), which is the same answer read the
+   * expensive way. A store that implements it must implement {@link queryCheckpoints} too.
+   */
+  checkpointStats?(runId: string, opts?: { group?: string | undefined }): Promise<CheckpointStat[]>;
+
+  /**
+   * The run's checkpoints that match `query`, in `seq` order (the order of {@link listCheckpoints}),
+   * paged by `offset`/`limit`. Every filter is optional; an absent one does not narrow. An EMPTY
+   * `statuses` or `namePrefixes` matches nothing; an empty `excludeGroups` excludes nothing.
+   *
+   * Optional, paired with {@link checkpointStats}: the run detail reads a fan's failures, its folded
+   * checkpoints and one page of its members through it, instead of the run's whole history.
+   */
+  queryCheckpoints?(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]>;
+}
+
+/**
+ * How a checkpoint's name classifies it, for {@link CheckpointStat}: an awaited child's
+ * `signal:child:` checkpoint, a folded `fan:` checkpoint standing for many children, a `spawn:`
+ * edge to a fire-and-forget child, or any other step.
+ */
+export type CheckpointNameKind = 'child' | 'folded' | 'spawn' | 'step';
+
+/** The {@link CheckpointNameKind} of a checkpoint name — what a store's SQL `CASE` must agree with. */
+export function checkpointNameKind(name: string): CheckpointNameKind {
+  if (name.startsWith('signal:child:')) return 'child';
+  if (name.startsWith('fan:')) return 'folded';
+  if (name.startsWith('spawn:')) return 'spawn';
+  return 'step';
+}
+
+/**
+ * One bucket of {@link StateStore.checkpointStats}: the checkpoints of one run sharing a
+ * `parallelGroup`, a `status` and a {@link CheckpointNameKind}, reduced to aggregates.
+ */
+export interface CheckpointStat {
+  /** The bucket's `parallelGroup`, or `null` for ungrouped checkpoints. */
+  group: string | null;
+  status: StepCheckpoint['status'];
+  nameKind: CheckpointNameKind;
+  /** Rows in the bucket (at least 1). */
+  count: number;
+  minSeq: number;
+  maxSeq: number;
+  /** Smallest and largest `name`, by the database's string order. Equal when every row shares one. */
+  minName: string;
+  maxName: string;
+  /** Earliest `enqueuedAt`, read as {@link StateStore.listCheckpoints} reads it (falling back to `startedAt`). */
+  minEnqueuedAt: Date;
+  minStartedAt: Date;
+  maxStartedAt: Date;
+  maxFinishedAt: Date;
+  /** Sum of `attempts` — moves when a step is retried in place, so a change marker sees it. */
+  sumAttempts: number;
+}
+
+/** What {@link StateStore.queryCheckpoints} selects. */
+export interface CheckpointQuery {
+  /** Only this `parallelGroup`'s checkpoints. */
+  group?: string | undefined;
+  /** Leave out these groups' checkpoints (ungrouped checkpoints are kept). */
+  excludeGroups?: string[] | undefined;
+  statuses?: StepCheckpoint['status'][] | undefined;
+  /** Only names starting with one of these. */
+  namePrefixes?: string[] | undefined;
+  offset?: number | undefined;
+  limit?: number | undefined;
 }
 
 /**
@@ -991,6 +1069,28 @@ export interface AllStepsOptions extends Omit<StepDispatchOpts, 'queue' | 'timeo
    */
   concurrency?: number;
 }
+
+/** Options for {@link WorkflowCtx.allSettled} over child workflows: {@link AllOptions} without `mode`. */
+export type AllSettledOptions = Omit<AllOptions, 'mode'>;
+
+/** Options for {@link WorkflowCtx.allSettled} over a `@Step`: {@link AllStepsOptions} without `mode`. */
+export type AllStepsSettledOptions = Omit<AllStepsOptions, 'mode'>;
+
+/**
+ * One item of a {@link WorkflowCtx.allSettled} fan, in input order. `id` is the child run id (child
+ * fan) or the step id (step fan); `error` is the failure message the child or step settled with.
+ */
+export type Settled<T> =
+  | { status: 'fulfilled'; value: T }
+  | {
+      status: 'rejected';
+      id: string;
+      error: string;
+      /** The failure's `code` (e.g. a `FatalError`'s), so a parent can tell its kinds apart. */
+      code?: string | undefined;
+      /** The failure's structured `details`, when it carried any. */
+      details?: unknown;
+    };
 
 /** One child of a fan as {@link StateStore.registerChildWaits} writes it. */
 export interface ChildWait {
@@ -1937,6 +2037,29 @@ export interface WorkflowCtx<A extends SearchAttributes = SearchAttributes> {
     opts?: AllOptions,
   ): Promise<TOutput[]>;
   /**
+   * {@link all} that never throws for a failed item: waits for every child (or step) to settle, then
+   * resolves with one {@link Settled} per input, in **input order** — the durable
+   * `Promise.allSettled`. Same fan as `all` in `waitAll` mode (ids, `parallelGroup`, `concurrency`
+   * waves, one parent turn per settled wave); only the ending differs. Use it when one item failing
+   * is an expected outcome the parent handles (record it, dead-letter it) rather than a reason to
+   * fail the whole run. Cancelling the parent still propagates.
+   */
+  allSettled<C extends WorkflowClass>(
+    workflow: C,
+    inputs: WorkflowInputOf<C>[],
+    opts?: AllSettledOptions,
+  ): Promise<Settled<WorkflowOutputOf<C>>[]>;
+  allSettled<TInput, TOutput>(
+    step: StepRef<TInput, TOutput>,
+    inputs: TInput[],
+    opts?: AllStepsSettledOptions,
+  ): Promise<Settled<TOutput>[]>;
+  allSettled<TOutput = unknown>(
+    workflow: string,
+    inputs: unknown[],
+    opts?: AllSettledOptions,
+  ): Promise<Settled<TOutput>[]>;
+  /**
    * Pause the run at this point until a human resumes it from the dashboard (or
    * `engine.continue(runId)`). Records a visible `pending` checkpoint so the breakpoint shows up
    * in the timeline, then suspends with zero compute — the durable equivalent of a debugger
@@ -2031,8 +2154,8 @@ export interface WorkflowCtx<A extends SearchAttributes = SearchAttributes> {
 }
 
 /**
- * {@link WorkflowCtx} with ONE signature per method: the string-addressed forms of the four overloaded
- * methods (`step`, `child`, `startChild`, `all`), everything else unchanged.
+ * {@link WorkflowCtx} with ONE signature per method: the string-addressed forms of the five overloaded
+ * methods (`step`, `child`, `startChild`, `all`, `allSettled`), everything else unchanged.
  *
  * For code that drives the ctx DYNAMICALLY — an interpreter that runs a user-defined graph and only
  * ever knows workflow/step names as strings — and for test fakes. An overloaded method is awkward to
@@ -2052,7 +2175,7 @@ export interface WorkflowCtx<A extends SearchAttributes = SearchAttributes> {
  * `dynamic-workflow-ctx.type-test.ts`), and a `Pick` of it is a plain object literal in a test.
  */
 export interface DynamicWorkflowCtx<A extends SearchAttributes = SearchAttributes>
-  extends Omit<WorkflowCtx<A>, 'step' | 'child' | 'startChild' | 'all'> {
+  extends Omit<WorkflowCtx<A>, 'step' | 'child' | 'startChild' | 'all' | 'allSettled'> {
   /** {@link WorkflowCtx.step} by step name (a cross-runtime handler, or a `@Step` by its name). */
   step<TOutput = unknown, TInput = unknown>(
     name: string,
@@ -2077,6 +2200,12 @@ export interface DynamicWorkflowCtx<A extends SearchAttributes = SearchAttribute
     inputs: unknown[],
     opts?: AllOptions,
   ): Promise<TOutput[]>;
+  /** {@link WorkflowCtx.allSettled} by workflow name. */
+  allSettled<TOutput = unknown>(
+    workflow: string,
+    inputs: unknown[],
+    opts?: AllSettledOptions,
+  ): Promise<Settled<TOutput>[]>;
 }
 
 /** Result of executing or resuming a workflow run. */
@@ -2120,7 +2249,13 @@ export type EngineEventType =
   // (which capability/protocol gap, both descriptors) so the dashboard health panel + telescope
   // timeline render exactly WHY — never a bare boolean. The `error.code` is the machine code
   // (`capability.unavailable` / `protocol.incompatible`).
-  | 'run.blocked';
+  | 'run.blocked'
+  // A failed run handed its failure to an onError handler (`name` is the handler workflow, `error`
+  // the failure). The run now waits on the handler and settles with its outcome.
+  | 'run.routed'
+  // A failed run had onError routes that could not be applied — its live workers announce different
+  // ones (`reason` says so) — so it failed instead of being handed off.
+  | 'run.unrouted';
 
 /**
  * A lifecycle event emitted by the engine. The observability surfaces (dashboard, OTel, the
@@ -2161,6 +2296,8 @@ export interface EngineEvent {
    *  gap fired, how many live workers were considered, and both descriptors — enough for the health
    *  panel/telescope to render the reason. Absent on all other event types. */
   diagnostics?: DispatchDiagnostics | undefined;
+  /** Why a `run.unrouted` run's onError routes were not applied. */
+  reason?: string | undefined;
   at: Date;
 }
 

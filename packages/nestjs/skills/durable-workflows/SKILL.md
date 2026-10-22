@@ -146,6 +146,17 @@ outputs in input order (a `GatherError` carries the failed indexes, as for a chi
 const results = await ctx.all(this.lines.processLine, lines, { concurrency: 500 });
 ```
 
+When a failed item is an expected outcome rather than a reason to fail the run, use
+`ctx.allSettled` instead: the same fan, resolving with `{ status: 'fulfilled', value }` or
+`{ status: 'rejected', id, error, code?, details? }` per input, in input order, and never throwing for an item. The rejected `code`/`details` are the `FatalError`'s (absent for a plain `Error`). Throw
+`FatalError` in the step for a failure a retry can't fix (a schema mismatch); it settles as rejected
+without spending the retries:
+
+```ts
+const results = await ctx.allSettled(this.lines.validateLine, lines, { concurrency: 500 });
+const rejected = results.filter((r) => r.status === 'rejected');
+```
+
 Prefer it to `Promise.all` past a handful of steps: every result of a `Promise.all` replays the
 workflow, which makes a fan of N steps cost O(N²) checkpoint reads. Prefer it to a child-workflow
 `ctx.all` when each item is just a step: a child costs a whole run (row, turn, lease, signal).
@@ -213,7 +224,7 @@ const rows = await ctx.child<{ rows: number }>('processing', { baseId });
 `ctx.child` starts the child once (checkpointed) and suspends — zero compute — until it reaches a
 terminal state, then resumes with its output (or throws if the child failed). Use `ctx.all(Class,
 inputs)` / `ctx.all(name, inputs)` to fan out N children of the same workflow and wait for all of
-them.
+them, or `ctx.allSettled(...)` to get every outcome back instead of a `GatherError`.
 
 ## Common mistakes
 
@@ -276,4 +287,29 @@ async charge(order: Order) {
 ```
 
 Any thrown error is retried to the step's limit; only `FatalError` short-circuits retries.
+
+When a failure is an expected outcome rather than a reason to fail the run (a line that fails
+validation), route its code to an `@OnError` handler. The engine starts the handler workflow
+(`<workflow>.onError.<method>`) as run `<runId>.onError.<attempt>` with `{ runId, workflow, input, error }`
+when the run fails with that code, and the run settles with the handler's outcome (its output, or
+its error when the handler fails); the body never runs again, so a `ctx.all` over the workflow
+keeps going. It works for remote (Python) bodies too:
+
+```ts
+class InvalidLine extends FatalError {
+  static readonly code = 'invalid_line';
+}
+
+@OnError(InvalidLine) // or @OnError('invalid_line'); @OnError() catches anything else
+async invalid(ctx: WorkflowCtx, failure: OnErrorInput<Line>): Promise<LineResult> {
+  await ctx.step(this.steps.recordDeadLetter, { line: failure.input, error: failure.error.message });
+  return { ok: 0, failed: 1 };
+}
+```
+
+`error.details` is the third argument of `FatalError(message, code, details)` (e.g. validation
+issues). Retrying the run runs its body again; a new failure goes to a new handler run.
+It matches on `code`, never `instanceof`, must return `run`'s output type, and never sees
+cancellation (a `cancelled` run never routes), `nested_workflow_call` ctx misuse, or `non_determinism`
+(`NonDeterminismError` carries `code: 'non_determinism'`). `@Workflow({ onError: [{ code, workflow }] })` routes to another workflow.
 Source: packages/core/src/workflow-ctx.ts (`step` retry loop), packages/core/src/errors.ts.

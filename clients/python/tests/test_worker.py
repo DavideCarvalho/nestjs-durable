@@ -91,6 +91,26 @@ class WorkerTest(unittest.TestCase):
         self.assertFalse(result["error"]["retryable"])
         self.assertEqual(result["error"]["code"], "declined")
 
+    def test_fatal_error_details_ride_the_wire_error(self):
+        worker = Worker()
+        issues = [{"path": ["amount"], "message": "Expected number"}]
+
+        @worker.step("payments.charge-card")
+        def charge(_data):
+            raise FatalError("invalid line", code="invalid_line", details=issues)
+
+        result = worker.process_task(task())
+        self.assertEqual(result["error"]["details"], issues)
+
+    def test_fatal_error_without_details_omits_the_key(self):
+        worker = Worker()
+
+        @worker.step("payments.charge-card")
+        def charge(_data):
+            raise FatalError("card declined", code="declined")
+
+        self.assertNotIn("details", worker.process_task(task())["error"])
+
 
     def test_handler_without_ctx_param_omits_events(self):
         worker = Worker()

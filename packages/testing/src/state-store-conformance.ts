@@ -8,6 +8,7 @@ import {
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { registerCheckpointAggregationCases } from './checkpoint-aggregation-contract';
 
 /**
  * A freshly provisioned, empty {@link StateStore} plus a `cleanup` to release its resources (close
@@ -549,6 +550,8 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.countCheckpoints('r1', 0, 4, [])).toBe(0);
     });
 
+    registerCheckpointAggregationCases(t, () => store, run);
+
     t('saveCheckpointIfPending writes over a pending row only', async () => {
       // Optional on the interface (the engine falls back to a blind save, which can clobber a settled
       // row), but a conformant store MUST provide it — assert presence, then exercise it.
@@ -737,6 +740,20 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(await listCheckpointsByNamePrefix.call(store, 'r1', [])).toEqual([]);
       },
     );
+
+    t('a name or token prefix matches literally — `_` and `%` are not wildcards', async () => {
+      await store.createRun(run());
+      await store.saveCheckpoint(checkpoint({ seq: 0, name: 'signal:child:job_1.onError.0' }));
+      await store.saveCheckpoint(checkpoint({ seq: 1, name: 'signal:child:jobX1.onError.0' }));
+      await store.putSignalWaiter({ token: 'child:job_1.child.0', runId: 'r1', seq: 2 });
+      await store.putSignalWaiter({ token: 'child:jobX1.child.0', runId: 'r1', seq: 3 });
+
+      const matches = await store.listCheckpointsByNamePrefix?.('r1', ['signal:child:job_1.']);
+      expect(matches?.map((c) => c.name)).toEqual(['signal:child:job_1.onError.0']);
+      expect((await store.listSignalWaiters('child:job_1.')).map((w) => w.token)).toEqual([
+        'child:job_1.child.0',
+      ]);
+    });
 
     t('round-trips checkpoint events and reads back a missing checkpoint as null', async () => {
       await store.createRun(run());

@@ -16,6 +16,7 @@ import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
 import type { RunRedisWorkerFn } from './durable-worker.module';
 import type { DurableModuleOptions } from './durable.module';
+import { registerOnRuntime } from './runtime-registration';
 import { createWorkerRuntime, runRedisWorker as defaultRunRedisWorker } from './worker-sdk';
 
 /**
@@ -110,11 +111,7 @@ export class InAppWorkerBootstrap
     // co-located or not, the process that CONSUMES the queue is the one entitled to announce the
     // workflow, and here that is this runtime — not the engine sharing its process.
     scanWorkflows(this.discovery, (meta, instance, origin) =>
-      runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input), {
-        version: meta.version,
-        ...(meta.requires !== undefined ? { requires: meta.requires } : {}),
-        ...(origin !== undefined ? { origin } : {}),
-      }),
+      registerOnRuntime(runtime, this.metadataScanner, meta, instance, origin),
     );
     scanSteps(this.discovery, this.metadataScanner, (meta, handler) =>
       runtime.registerStep(meta.name, handler),
