@@ -1,5 +1,15 @@
 # @dudousxd/nestjs-durable-transport-bullmq
 
+## 0.22.2
+
+### Patch Changes
+
+- [#387](https://github.com/DavideCarvalho/nestjs-durable/pull/387) [`d075b35`](https://github.com/DavideCarvalho/nestjs-durable/commit/d075b351e77dbb4da3eaac534969f1d42547f985) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Adaptive concurrency controller fixes:
+
+  - `throughputPerMin` on the worker heartbeat is now a rate over the trailing minute. It decays while a worker sits idle and reads 0 once a minute passes with no completion, instead of reporting the last burst's rate forever.
+  - In fixed mode (`concurrency` is a plain number) the controller no longer runs its control-loop timer. The limit stays the fixed value; the heartbeat snapshot samples CPU itself, at most once per 2s, so `cpuPct` is still reported.
+  - `AdaptiveController` takes optional `readCpuUsage` and `readCpuCount` readers (defaults `process.cpuUsage()` and `os.cpus().length`), so the CPU ceiling can be driven in tests. A non-finite core count falls back to 1.
+
 ## 0.22.1
 
 ### Patch Changes
