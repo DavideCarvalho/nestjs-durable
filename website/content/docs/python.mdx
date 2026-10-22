@@ -412,7 +412,7 @@ handler gets `failure["error"]["details"]`. See [Routing a run's failure](/docs/
 ```python
 @pipeline.on_error("invalid_line")
 def reject_line(ctx: WorkflowContext, failure):  # {"runId", "workflow", "input", "error"}
-    ctx.gather_calls([{"name": "record_rejected_line", "input": failure}])
+    ctx.step("record_rejected_line", failure)
     return {"rows": 0, "rejected": True}
 ```
 
