@@ -1,5 +1,8 @@
 import {
   type AttributeFilter,
+  type CheckpointNameKind,
+  type CheckpointQuery,
+  type CheckpointStat,
   type ChildWait,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
@@ -47,6 +50,7 @@ import {
   like,
   lt,
   lte,
+  notInArray,
   or,
   sql,
 } from 'drizzle-orm';
@@ -658,6 +662,89 @@ export class DrizzleStateStore implements StateStore {
         ),
       )
       .orderBy(asc(stepCheckpoints.seq));
+    return rows.map(fromCheckpointRow);
+  }
+
+  /** {@link StateStore.checkpointStats}: one `GROUP BY parallel_group, status, name_kind` over the
+   *  run's checkpoints, so a wide fan comes back as a few bucket rows instead of every member. */
+  async checkpointStats(
+    runId: string,
+    opts?: { group?: string | undefined },
+  ): Promise<CheckpointStat[]> {
+    const c = stepCheckpoints;
+    // `substr` rather than `LIKE`: SQLite's LIKE ignores ASCII case, `checkpointNameKind` does not.
+    const nameKind = sql<CheckpointNameKind>`CASE
+      WHEN substr(${c.name}, 1, 13) = 'signal:child:' THEN 'child'
+      WHEN substr(${c.name}, 1, 4) = 'fan:' THEN 'folded'
+      WHEN substr(${c.name}, 1, 6) = 'spawn:' THEN 'spawn'
+      ELSE 'step' END`.as('name_kind');
+    const rows = await this.db
+      .select({
+        group: c.parallelGroup,
+        status: c.status,
+        nameKind,
+        count: sql<number>`count(*)`,
+        minSeq: sql<number>`min(${c.seq})`,
+        maxSeq: sql<number>`max(${c.seq})`,
+        minName: sql<string>`min(${c.name})`,
+        maxName: sql<string>`max(${c.name})`,
+        minEnqueuedAt: sql<number>`min(coalesce(${c.enqueuedAt}, ${c.startedAt}))`,
+        minStartedAt: sql<number>`min(${c.startedAt})`,
+        maxStartedAt: sql<number>`max(${c.startedAt})`,
+        maxFinishedAt: sql<number>`max(${c.finishedAt})`,
+        sumAttempts: sql<number>`sum(${c.attempts})`,
+      })
+      .from(c)
+      .where(
+        and(
+          eq(c.runId, runId),
+          opts?.group !== undefined ? eq(c.parallelGroup, opts.group) : undefined,
+        ),
+      )
+      .groupBy(c.parallelGroup, c.status, sql`name_kind`);
+    return rows.map((r) => ({
+      group: r.group ?? null,
+      status: r.status as StepCheckpoint['status'],
+      nameKind: r.nameKind,
+      count: Number(r.count),
+      minSeq: Number(r.minSeq),
+      maxSeq: Number(r.maxSeq),
+      minName: r.minName,
+      maxName: r.maxName,
+      minEnqueuedAt: new Date(Number(r.minEnqueuedAt)),
+      minStartedAt: new Date(Number(r.minStartedAt)),
+      maxStartedAt: new Date(Number(r.maxStartedAt)),
+      maxFinishedAt: new Date(Number(r.maxFinishedAt)),
+      sumAttempts: Number(r.sumAttempts),
+    }));
+  }
+
+  /** {@link StateStore.queryCheckpoints}: the run's checkpoints narrowed in SQL, in `seq` order and
+   *  paged there, so reading one page of a wide fan never loads the rest of it. */
+  async queryCheckpoints(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]> {
+    if (query.statuses?.length === 0 || query.namePrefixes?.length === 0) return [];
+    const c = stepCheckpoints;
+    const rows = await this.db
+      .select()
+      .from(c)
+      .where(
+        and(
+          eq(c.runId, runId),
+          query.group !== undefined ? eq(c.parallelGroup, query.group) : undefined,
+          // `NOT IN` is never true for a NULL group, so ungrouped rows are kept explicitly.
+          query.excludeGroups?.length
+            ? or(isNull(c.parallelGroup), notInArray(c.parallelGroup, query.excludeGroups))
+            : undefined,
+          query.statuses ? inArray(c.status, query.statuses) : undefined,
+          query.namePrefixes
+            ? or(...query.namePrefixes.map((p) => sql`substr(${c.name}, 1, length(${p})) = ${p}`))
+            : undefined,
+        ),
+      )
+      .orderBy(asc(c.seq))
+      // SQLite has no OFFSET without LIMIT, and drizzle drops a negative limit, so "no limit" is max.
+      .limit(query.limit ?? Number.MAX_SAFE_INTEGER)
+      .offset(query.offset ?? 0);
     return rows.map(fromCheckpointRow);
   }
 

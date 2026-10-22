@@ -97,6 +97,8 @@ model DurableStepCheckpoint {
   finishedAt  DateTime @map("finished_at")
 
   @@id([runId, seq])
+  // One fan of a run, in seq order: the run detail aggregates and pages a fan through it.
+  @@index([runId, parallelGroup, seq], map: "durable_step_checkpoints_group_idx")
   @@map("durable_step_checkpoints")
 }
 

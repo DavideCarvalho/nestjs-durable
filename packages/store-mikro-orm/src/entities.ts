@@ -255,6 +255,15 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     class: StepCheckpointEntity,
     tableName: 'durable_step_checkpoints',
     repository: () => StepCheckpointRepository,
+    // `(runId, parallelGroup, seq)` serves the run detail's per-group reads — `checkpointStats` with a
+    // group and `queryCheckpoints` paging one fan in `seq` order — without scanning the whole run.
+    // Mirrors the Prisma adapter's index of the same name.
+    indexes: [
+      {
+        name: 'durable_step_checkpoints_group_idx',
+        properties: ['runId', 'parallelGroup', 'seq'],
+      },
+    ],
     properties: {
       runId: { type: 'string', primary: true, fieldName: col('runId') },
       seq: { type: 'integer', primary: true, fieldName: col('seq') },

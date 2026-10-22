@@ -44,6 +44,8 @@ CREATE TABLE durable_step_checkpoints (
   status TEXT NOT NULL, input TEXT, output TEXT, error TEXT, events TEXT, attempts INTEGER NOT NULL, worker_group TEXT, parallel_group TEXT, wake_at INTEGER,
   enqueued_at INTEGER, started_at INTEGER NOT NULL, finished_at INTEGER NOT NULL, PRIMARY KEY (run_id, seq)
 );
+CREATE INDEX IF NOT EXISTS durable_step_checkpoints_group_idx
+  ON durable_step_checkpoints (run_id, parallel_group, seq);
 CREATE TABLE durable_run_attributes (
   run_id TEXT NOT NULL, key TEXT NOT NULL, str_value TEXT, num_value REAL, PRIMARY KEY (run_id, key)
 );
@@ -112,6 +114,27 @@ describe('DrizzleStateStore', () => {
     expect((await store.getCheckpoint('r1', 0))?.output).toEqual({ ok: true });
     expect((await store.getCheckpoint('r1', 1))?.name).toBe('charge');
     expect(await store.listCheckpoints('r1')).toHaveLength(2);
+    sqlite.close();
+  });
+
+  it('aggregates a row with no enqueued_at as listCheckpoints reads it (enqueued at its start)', async () => {
+    const { store, sqlite } = makeStore();
+    await store.createRun(run());
+    await store.saveCheckpoint(
+      checkpoint({ startedAt: new Date(5_000), finishedAt: new Date(6_000) }),
+    );
+    await store.saveCheckpoint(
+      checkpoint({
+        seq: 1,
+        enqueuedAt: new Date(7_000),
+        startedAt: new Date(8_000),
+        finishedAt: new Date(9_000),
+      }),
+    );
+    sqlite.exec('UPDATE durable_step_checkpoints SET enqueued_at = NULL WHERE seq = 0');
+    const [stat] = await store.checkpointStats('r1');
+    expect(stat?.minEnqueuedAt).toEqual((await store.listCheckpoints('r1'))[0]?.enqueuedAt);
+    expect(stat?.minEnqueuedAt).toEqual(new Date(5_000));
     sqlite.close();
   });
 

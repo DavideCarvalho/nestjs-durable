@@ -104,7 +104,15 @@ export const stepCheckpoints = sqliteTable(
     startedAt: integer('started_at').notNull(),
     finishedAt: integer('finished_at').notNull(),
   },
-  (t) => [primaryKey({ columns: [t.runId, t.seq] })],
+  (t) => [
+    primaryKey({ columns: [t.runId, t.seq] }),
+    // A run detail reads one fan at a time (`checkpointStats({ group })`, `queryCheckpoints({ group })`
+    // paged by seq). Like every index here, an already-deployed database needs it run by hand:
+    //
+    //     CREATE INDEX IF NOT EXISTS durable_step_checkpoints_group_idx
+    //       ON durable_step_checkpoints (run_id, parallel_group, seq);
+    index('durable_step_checkpoints_group_idx').on(t.runId, t.parallelGroup, t.seq),
+  ],
 );
 
 // Normalized search-attribute side-table: one row per (run, key), so range/equality attribute
