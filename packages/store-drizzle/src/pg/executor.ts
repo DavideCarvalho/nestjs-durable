@@ -31,7 +31,7 @@ export function toDrizzleSql(text: string, params: unknown[] = []): SQL {
 }
 
 /** node-postgres / PGlite hand back `{ rows }`; postgres-js hands back the row array itself. */
-function rowsOf<T>(result: unknown): T[] {
+export function rowsOf<T>(result: unknown): T[] {
   if (Array.isArray(result)) return result as T[];
   return ((result as { rows?: T[] } | undefined)?.rows ?? []) as T[];
 }

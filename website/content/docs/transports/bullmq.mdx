@@ -87,10 +87,12 @@ const transport = new BullMQTransport({
 });
 ```
 
-Results of the **same** run still resume it in order on an instance. Settling a result (claiming its
-checkpoint, checking a step fan's join barrier) runs in parallel; only the turn each result triggers
-waits for the previous turn of that run on this instance. A run never gets two concurrent turns from
-one instance, and different runs proceed in parallel. The engine applies the same ordering to any
+Results of the **same** run still resume it in order on an instance. They are settled in batches:
+the results of a run that arrive while one batch is being written go into the next, which claims
+their checkpoints with one `saveCheckpointsIfPending` call and checks a step fan's join barrier once.
+A batch resumes the run at most once, and each result is acknowledged only after its batch commits.
+The turn a batch triggers waits for the previous turn of that run on this instance. A run never gets
+two concurrent turns from one instance, and different runs proceed in parallel. The engine applies the same ordering to any
 transport that delivers results concurrently, including the in-process ones.
 
 A value that is not a finite number of at least 1 (`NaN`, `Infinity`, `0`) falls back to the default

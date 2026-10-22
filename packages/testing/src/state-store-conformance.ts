@@ -584,6 +584,92 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.getCheckpoint('r1', 9)).toBeNull();
     });
 
+    t('saveCheckpointsIfPending settles a batch row by row, in order', async () => {
+      // Optional on the interface (the engine falls back to one saveCheckpointIfPending per entry),
+      // but a conformant store MUST provide it — assert presence, then exercise it.
+      expect(store.saveCheckpointsIfPending).toBeDefined();
+      if (!store.saveCheckpointsIfPending) return;
+      expect(await store.saveCheckpointsIfPending([])).toEqual([]);
+      await store.createRun(run());
+      await store.createRun(run({ id: 'r2' }));
+      const pending = (runId: string, seq: number) =>
+        checkpoint({
+          runId,
+          seq,
+          stepId: `${runId}:${seq}`,
+          status: 'pending',
+          output: undefined,
+          wakeAt: 5_000,
+        });
+      for (const seq of [0, 1, 2, 3]) await store.saveCheckpoint(pending('r1', seq));
+      await store.saveCheckpoint(pending('r2', 0));
+      // seq 1 already settled: a stale write must not land on it.
+      await store.saveCheckpoint({
+        ...pending('r1', 1),
+        status: 'completed',
+        output: { first: 1 },
+      });
+      const done = (runId: string, seq: number, output: unknown) => ({
+        ...pending(runId, seq),
+        status: 'completed' as const,
+        output,
+        wakeAt: undefined,
+      });
+
+      const wrote = await store.saveCheckpointsIfPending([
+        done('r1', 0, { n: 0 }),
+        done('r1', 1, { n: 1 }),
+        // A second copy of the same row: compared against the first copy's write, so refused.
+        done('r1', 0, { n: 'dup' }),
+        { ...pending('r1', 2), status: 'failed', error: { message: 'boom' }, wakeAt: undefined },
+        // No such row: nothing is written.
+        done('r1', 9, { n: 9 }),
+        // Another run's row, same seq as one above.
+        done('r2', 0, { n: 'r2' }),
+      ]);
+      expect(wrote).toEqual([true, false, false, true, false, true]);
+
+      const r1 = await store.listCheckpoints('r1');
+      expect(r1.map((c) => [c.seq, c.status, c.output])).toEqual([
+        [0, 'completed', { n: 0 }],
+        [1, 'completed', { first: 1 }],
+        [2, 'failed', undefined],
+        [3, 'pending', undefined],
+      ]);
+      expect(r1[2]?.error).toEqual({ message: 'boom' });
+      // The settling write carried no deadline, so the one the pending row held is cleared.
+      expect(r1[0]?.wakeAt).toBeUndefined();
+      expect(r1[3]?.wakeAt).toBe(5_000);
+      expect(await store.getCheckpoint('r1', 9)).toBeNull();
+      expect((await store.getCheckpoint('r2', 0))?.output).toEqual({ n: 'r2' });
+
+      // A pending-to-pending write keeps the row pending, so a later entry still lands on it.
+      expect(
+        await store.saveCheckpointsIfPending([
+          { ...pending('r1', 3), wakeAt: 9_000 },
+          done('r1', 3, { n: 3 }),
+        ]),
+      ).toEqual([true, true]);
+      expect((await store.getCheckpoint('r1', 3))?.output).toEqual({ n: 3 });
+    });
+
+    t('saveCheckpointsIfPending writes a wide batch', async () => {
+      if (!store.saveCheckpointsIfPending) return;
+      await store.createRun(run());
+      const n = 600;
+      const rows = Array.from({ length: n }, (_, seq) =>
+        checkpoint({ seq, stepId: `r1:${seq}`, status: 'pending', output: undefined }),
+      );
+      for (const row of rows) await store.saveCheckpoint(row);
+      const wrote = await store.saveCheckpointsIfPending(
+        rows.map((row) => ({ ...row, status: 'completed' as const, output: { seq: row.seq } })),
+      );
+      expect(wrote.every((w) => w === true)).toBe(true);
+      expect(wrote).toHaveLength(n);
+      expect(await store.countCheckpoints?.('r1', 0, n - 1, ['completed'])).toBe(n);
+      expect((await store.getCheckpoint('r1', n - 1))?.output).toEqual({ seq: n - 1 });
+    });
+
     t(
       'upserts checkpoints, reads them by (runId, seq), and lists them ordered by seq',
       async () => {

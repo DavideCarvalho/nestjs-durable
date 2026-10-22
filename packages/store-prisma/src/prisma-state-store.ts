@@ -330,6 +330,24 @@ export class PrismaStateStore implements StateStore {
     return count > 0;
   }
 
+  async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+    if (checkpoints.length === 0) return [];
+    // The conditional `updateMany` of `saveCheckpointIfPending`, once per entry, in order, in one
+    // transaction: one commit for the batch, and a rejection writes nothing.
+    return this.db.$transaction(async (tx) => {
+      const wrote: boolean[] = [];
+      for (const checkpoint of checkpoints) {
+        const { runId, seq, ...data } = toCheckpointData(checkpoint);
+        const { count } = await tx.durableStepCheckpoint.updateMany({
+          where: { runId, seq, status: 'pending' },
+          data,
+        });
+        wrote.push(count > 0);
+      }
+      return wrote;
+    });
+  }
+
   async transaction<T>(
     work: (tx: {
       raw: unknown;

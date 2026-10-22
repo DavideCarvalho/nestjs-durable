@@ -281,6 +281,48 @@ export class DrizzleStateStore implements StateStore {
     return (changes ?? rowsAffected ?? 0) > 0;
   }
 
+  async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+    if (checkpoints.length === 0) return [];
+    const wrote: boolean[] = [];
+    // The conditional UPDATE of `saveCheckpointIfPending`, once per entry, in order, in one
+    // transaction. The callback stays synchronous on better-sqlite3; libSQL returns promises.
+    await this.db.transaction((tx) => {
+      const update = (checkpoint: StepCheckpoint) => {
+        const { runId, seq, ...set } = toCheckpointRow(checkpoint);
+        return tx
+          .update(stepCheckpoints)
+          .set(set)
+          .where(
+            and(
+              eq(stepCheckpoints.runId, runId),
+              eq(stepCheckpoints.seq, seq),
+              eq(stepCheckpoints.status, 'pending'),
+            ),
+          )
+          .run();
+      };
+      const record = (result: unknown) => {
+        const { changes, rowsAffected } = result as { changes?: number; rowsAffected?: number };
+        wrote.push((changes ?? rowsAffected ?? 0) > 0);
+      };
+      const runFrom = (from: number): undefined | Promise<undefined> => {
+        for (let i = from; i < checkpoints.length; i += 1) {
+          const result = update(checkpoints[i] as StepCheckpoint);
+          if (result instanceof Promise) {
+            return result.then((r) => {
+              record(r);
+              return runFrom(i + 1);
+            });
+          }
+          record(result);
+        }
+        return undefined;
+      };
+      return runFrom(0);
+    });
+    return wrote;
+  }
+
   async transaction<T>(
     work: (tx: {
       raw: unknown;

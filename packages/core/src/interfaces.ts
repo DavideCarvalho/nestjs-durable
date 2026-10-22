@@ -382,6 +382,16 @@ export interface StateStore {
    * Optional: a store that omits it falls back to {@link saveCheckpoint}, which keeps that race.
    */
   saveCheckpointIfPending?(checkpoint: StepCheckpoint): Promise<boolean>;
+  /**
+   * {@link saveCheckpointIfPending} for many checkpoints in one call: resolves, per entry and in
+   * input order, whether it wrote. Same result as calling it on each entry in turn (a later entry for
+   * the same `(runId, seq)` is compared against the earlier one's write), with each row's
+   * compare-and-set still atomic. The call as a whole is atomic too: if it rejects, nothing was
+   * written. The engine settles a batch of one run's step results through it, one call per batch.
+   *
+   * Optional: a store that omits it gets one {@link saveCheckpointIfPending} per entry.
+   */
+  saveCheckpointsIfPending?(checkpoints: StepCheckpoint[]): Promise<boolean[]>;
 
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
