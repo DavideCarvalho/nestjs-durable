@@ -53,6 +53,49 @@ describe('CodecStateStore', () => {
     expect(new CodecStateStore(inner, wrapCodec).tryAdmitSingleton).toBeUndefined();
   });
 
+  it('forwards the status compare-and-set, encoding the patch like a plain update', async () => {
+    const inner = new InMemoryStateStore();
+    const store = new CodecStateStore(inner, wrapCodec);
+    const now = new Date();
+    await store.createRun({
+      id: 'r1',
+      workflow: 'wf',
+      workflowVersion: '1',
+      status: 'running',
+      createdAt: now,
+      updatedAt: now,
+    });
+    expect(await store.updateRunIf?.('r1', ['suspended'], { status: 'completed' })).toBe(false);
+    expect(
+      await store.updateRunIf?.('r1', ['running'], { status: 'completed', output: { ok: 1 } }),
+    ).toBe(true);
+    expect((await inner.getRun('r1'))?.output).toEqual({ __enc: JSON.stringify({ ok: 1 }) });
+    expect((await store.getRun('r1'))?.output).toEqual({ ok: 1 });
+
+    Object.defineProperty(inner, 'updateRunIf', { value: undefined });
+    expect(new CodecStateStore(inner, wrapCodec).updateRunIf).toBeUndefined();
+  });
+
+  it('forwards the orphan listing, decoding the runs', async () => {
+    const inner = new InMemoryStateStore();
+    const store = new CodecStateStore(inner, wrapCodec);
+    const now = new Date();
+    await store.createRun({
+      id: 'r1',
+      workflow: 'wf',
+      workflowVersion: '1',
+      status: 'running',
+      input: { secret: 'value' },
+      createdAt: now,
+      updatedAt: now,
+    });
+    const orphans = await store.listOrphanedRuns?.(now.getTime(), 10);
+    expect(orphans?.map((r) => r.input)).toEqual([{ secret: 'value' }]);
+
+    Object.defineProperty(inner, 'listOrphanedRuns', { value: undefined });
+    expect(new CodecStateStore(inner, wrapCodec).listOrphanedRuns).toBeUndefined();
+  });
+
   it('forwards the pending-only checkpoint write, encoding it like a plain save', async () => {
     const inner = new InMemoryStateStore();
     const store = new CodecStateStore(inner, wrapCodec);

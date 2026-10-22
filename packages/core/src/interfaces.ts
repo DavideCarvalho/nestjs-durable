@@ -331,6 +331,25 @@ export interface StateStore {
 
   createRun(run: WorkflowRun): Promise<void>;
   updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void>;
+  /**
+   * {@link updateRun}, but only if the run's CURRENT status is one of `expectedStatuses`: a
+   * compare-and-set on the status. Resolves whether the patch applied; never throws on a mismatch or
+   * a missing run (both resolve `false`). The engine settles a turn's outcome (completed, failed,
+   * suspended, blocked) through it, so a run that reached `cancelled`/`completed`/`dead` through
+   * another path while the turn executed (an operator's `cancel()`, a timeout sweep, a dead-letter)
+   * is never overwritten by the turn's stale outcome.
+   *
+   * For a SQL store the predicate must be part of the `UPDATE ... WHERE` itself; a read-then-write
+   * in application code reintroduces the race this exists to close.
+   *
+   * Optional: a store that omits it gets the engine's read-then-write fallback, which narrows the
+   * race to the gap between that read and the write but cannot close it.
+   */
+  updateRunIf?(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ): Promise<boolean>;
   getRun(runId: string): Promise<WorkflowRun | null>;
 
   /**
@@ -395,6 +414,17 @@ export interface StateStore {
 
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
+
+  /**
+   * The ORPHANS a periodic recovery pass should reclaim: {@link listIncompleteRuns}'s runs
+   * (`running` or `cancelling`) whose lease is free (`lockedUntil` unset or `<= nowMs`), oldest
+   * (`createdAt`) first, at most `limit`. When `namespace` is given, restricted to that partition.
+   *
+   * Optional but recommended: without it the engine lists every incomplete run and filters the
+   * leases in process, which on a busy fleet reads every healthy running run once per tick per
+   * worker.
+   */
+  listOrphanedRuns?(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]>;
 
   /** The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. */
   listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]>;

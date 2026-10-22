@@ -1,5 +1,5 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission';
-import { runInWorkflowCtx } from './ambient-ctx';
+import { currentWorkflowCtx, runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints';
 import {
@@ -186,6 +186,18 @@ export interface StartOptions {
    * workflow's registered `concurrency`. See {@link ConcurrencyQuota}.
    */
   concurrency?: ConcurrencyQuota | undefined;
+  /**
+   * Delayed start: don't execute before this time (epoch ms, or a `Date`), compared against the
+   * engine's clock. The run is created `suspended` with its `wakeAt` set to it, which is the same
+   * durable timer a `ctx.sleep` parks on: nothing is held in memory, it survives restarts, and the
+   * timer poller (`resumeDueTimers`) starts it once due, on any instance. A time that is not in the
+   * future starts the run at once, as if it were omitted.
+   *
+   * A delayed run reads `suspended` until it fires (so `start` returns `suspended`, and `waitForRun`
+   * settles on that right away), and skips the `run.started` event's `pending → running` hop. It
+   * counts as in flight for singleton back-pressure and concurrency quotas while it waits.
+   */
+  startAt?: number | Date | undefined;
 }
 
 /**
@@ -375,6 +387,43 @@ interface RemoteResolution {
 interface PendingRemote {
   resolve: (result: RemoteResolution) => void;
   reject: (error: Error) => void;
+}
+
+/**
+ * The statuses a turn's completed/failed outcome may be written over: every status except the
+ * genuinely final `cancelled`, `completed` and `dead`. `failed` is included because an explicit
+ * retry re-drives a failed run from that status; `cancelling` because a turn that finishes the body
+ * while a compensating cancel was requested settles as it always has (completion wins). The settle is
+ * a compare-and-set on this set, so a run that reached a final state through another path while the
+ * turn executed (an operator's `cancel()`, a timeout sweep, a dead-letter) keeps it.
+ */
+const SETTLE_ELIGIBLE_STATUSES: RunStatus[] = [
+  'pending',
+  'running',
+  'suspended',
+  'blocked',
+  'failed',
+  'cancelling',
+];
+
+/**
+ * The statuses a suspend (or a `blocked` park) may be written over: {@link SETTLE_ELIGIBLE_STATUSES}
+ * minus `cancelling`, so a compensating cancel requested while the turn ran is not parked away as an
+ * ordinary suspension. The compensation turn queued behind this one (or recovery) finishes it.
+ */
+const SUSPEND_ELIGIBLE_STATUSES: RunStatus[] = SETTLE_ELIGIBLE_STATUSES.filter(
+  (status) => status !== 'cancelling',
+);
+
+/** How many orphaned runs one {@link WorkflowEngine.recoverIncomplete} pass asks the store for. */
+const RECOVERY_BATCH = 500;
+
+/** See `WorkflowEngine.runGates`. */
+interface RunGate {
+  /** The last execution chained for the run in this process: the one running, or the queued one. */
+  tail: Promise<RunResult>;
+  /** The resume waiting for `tail`'s predecessor; later resumes coalesce into it until it starts. */
+  queued?: { allowFailed: boolean; result: Promise<RunResult> } | undefined;
 }
 
 /** A terminal/suspended transition handed to {@link WorkflowEngine.settleRun}. */
@@ -676,6 +725,18 @@ export class WorkflowEngine {
   private readonly awaitedStepFans = new Map<string, { from: number; to: number }[]>();
   /** Step fans whose join barrier this instance opened, by `runId:firstSeq` — see {@link settledHere}. */
   private readonly stepFansFiredHere = new Map<string, number>();
+  /**
+   * The in-process execution gate, by run id: the execution of the run currently in flight in THIS
+   * process (`tail`), and at most one resume queued behind it (`queued`). See {@link resumeRun}.
+   *
+   * The run lease is keyed by engine instance, so it fences OTHER processes only: to the store, a
+   * second execution in this same process holds the very same lease (and {@link execute} skips
+   * `tryLockRun` when its snapshot says this instance holds it). Without this gate, a resume landing
+   * while this process was still executing the run (a signal, a late step result, a child wake, an
+   * explicit `resume()`) went straight past the lease and ran the body concurrently: a
+   * not-yet-checkpointed step executed twice.
+   */
+  private readonly runGates = new Map<string, RunGate>();
   /** The tail of each run's queue of results being handled on this instance — see {@link serializedPerRun}. */
   private readonly resultChains = new Map<string, Promise<void>>();
   /** Each run's results waiting to be settled on this instance — see {@link completeRemoteResult}. */
@@ -1323,11 +1384,17 @@ export class WorkflowEngine {
     if (registered.singleton) {
       await this.singletons.assertCapacity(name, registered.singleton, input);
     }
+    // Delayed start: park the run on its durable wake timer instead of dispatching it now (see
+    // StartOptions.startAt). Compared against the ENGINE clock, the one the timer poller uses.
+    const startAtMs = opts?.startAt instanceof Date ? opts.startAt.getTime() : opts?.startAt;
+    const delayed =
+      startAtMs !== undefined && Number.isFinite(startAtMs) && startAtMs > this.clock();
     const run: WorkflowRun = {
       id: runId,
       workflow: name,
       workflowVersion: registered.version,
-      status: 'pending',
+      status: delayed ? 'suspended' : 'pending',
+      ...(delayed ? { wakeAt: startAtMs } : {}),
       namespace: opts?.namespace ?? this.namespace,
       // DERIVED from the registration, exactly like `namespace` is derived from this engine — there is
       // deliberately no `opts.origin`, so a caller cannot label its run as another package's work.
@@ -1350,6 +1417,11 @@ export class WorkflowEngine {
       const winner = await this.store.getRun(runId).catch(() => null);
       if (!winner) throw err;
       return { runId, status: winner.status, output: winner.output, error: winner.error };
+    }
+    // A delayed run waits for its timer: the timer poller starts it, so nothing is dispatched now.
+    if (delayed) {
+      this.emit({ type: 'run.suspended', runId, workflow: name, namespace: run.namespace });
+      return { runId, status: 'suspended' };
     }
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
@@ -1391,7 +1463,122 @@ export class WorkflowEngine {
     return this.resumeRun(runId, false);
   }
 
-  private async resumeRun(runId: string, allowFailed: boolean): Promise<RunResult> {
+  /**
+   * One execution of a run at a time in this process. A resume that lands while the run executes
+   * here neither joins that execution (the double-run) nor no-ops against its held lease (a lost
+   * wake: its checkpoint may postdate the running turn's snapshot): it is QUEUED, and re-drives the
+   * run once the running execution has settled and released its lease, re-reading the run then
+   * (terminal: echoed, never re-executed). Resumes landing while one is already queued coalesce
+   * into it: it has not started yet, so it will observe every write they made. Their callers get
+   * the queued execution's result, i.e. the run's state after their own wake was applied.
+   *
+   * Across processes, exclusion stays the lease's job: {@link execute} still `tryLockRun`s when it
+   * does not hold the lease.
+   */
+  private resumeRun(runId: string, allowFailed: boolean): Promise<RunResult> {
+    const gate = this.runGates.get(runId);
+    if (!gate) {
+      const tail = this.resumeRunNow(runId, allowFailed);
+      const fresh: RunGate = { tail };
+      this.runGates.set(runId, fresh);
+      this.closeGateAfter(runId, fresh, tail);
+      return tail;
+    }
+    let queued = gate.queued;
+    if (queued) {
+      queued.allowFailed ||= allowFailed;
+    } else {
+      const entry: { allowFailed: boolean; result?: Promise<RunResult> } = { allowFailed };
+      const result = gate.tail
+        .catch(() => undefined)
+        .then(() => {
+          // Now running: a resume landing from here on queues behind THIS execution.
+          if (gate.queued === entry) gate.queued = undefined;
+          return this.resumeRunNow(runId, entry.allowFailed);
+        });
+      entry.result = result;
+      queued = entry as { allowFailed: boolean; result: Promise<RunResult> };
+      gate.queued = queued;
+      gate.tail = result;
+      this.closeGateAfter(runId, gate, result);
+      // Tracked for `drain()`: between the running execution settling (leaving `inflight`) and this
+      // one re-entering it, nothing else would hold the queued re-drive. Its rejection is the
+      // caller's to handle; the tracked copy must not surface as an unhandled rejection.
+      void this.track(result).catch(() => undefined);
+    }
+    // A resume issued from INSIDE this run's own execution (its ambient ctx is this run) can only be
+    // satisfied once that execution ends: awaiting it there would deadlock. Queue it, answer now.
+    if (currentWorkflowCtx()?.runId === runId) return this.echoCurrentStatus(runId);
+    return queued.result;
+  }
+
+  /** Drop `gate` once `tail` settles, unless another execution queued behind it meanwhile. */
+  private closeGateAfter(runId: string, gate: RunGate, tail: Promise<RunResult>): void {
+    const close = () => {
+      if (this.runGates.get(runId) === gate && gate.tail === tail) this.runGates.delete(runId);
+    };
+    void tail.then(close, close);
+  }
+
+  /**
+   * Release a run's lease AFTER its outcome is decided (persisted, or about to be returned). Best
+   * effort, and that matters most on the failure path: the thing that failed the run is frequently
+   * the very store this release talks to (a step that violated a DB constraint leaves Postgres
+   * refusing every further statement on that connection), so the release throws too. A throwing
+   * release in a `finally` REPLACES the run's real outcome with a lease write nobody asked about,
+   * skips the post-turn re-drives after it, and, for a turn driven as a background resume, surfaces
+   * as an unhandled rejection instead of a failed run.
+   *
+   * Letting it go is safe: the lease expires on its own and `recoverIncomplete` re-drives whatever
+   * is still held. A lost release costs one lease window of latency; a masked error costs the
+   * diagnosis.
+   */
+  private async releaseLeaseBestEffort(runId: string): Promise<void> {
+    try {
+      await this.store.releaseRunLock(runId);
+    } catch (err) {
+      console.warn(
+        `[nestjs-durable] releasing the lease of run ${runId} failed (it expires on its own and recovery re-drives): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * The run's persisted state as a {@link RunResult}, without executing anything: the answer to a
+   * resume issued from inside the run's own execution, and to a settle whose compare-and-set lost
+   * (the path that won already emitted and notified). A run that is gone reads as `cancelled`, the
+   * safest terminal reading, never a fabricated success.
+   */
+  private async echoCurrentStatus(runId: string): Promise<RunResult> {
+    const run = await this.store.getRun(runId);
+    return {
+      runId,
+      status: run?.status ?? 'cancelled',
+      output: run?.output,
+      error: run?.error,
+    };
+  }
+
+  /**
+   * The engine's stand-in for {@link StateStore.updateRunIf} on a store without it, called with the
+   * store as `this`: read-then-write, which narrows the race to the gap between the read and the
+   * write (the pre-CAS behavior, now applied to every settle) but cannot close it.
+   */
+  private async updateRunIfFallback(
+    this: StateStore,
+    runId: string,
+    expected: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    const current = await this.getRun(runId);
+    if (!current || !expected.includes(current.status)) return false;
+    await this.updateRun(runId, patch);
+    return true;
+  }
+
+  private async resumeRunNow(runId: string, allowFailed: boolean): Promise<RunResult> {
     const run = await this.store.getRun(runId);
     if (!run) throw new Error(`run ${runId} not found`);
     // A definitively-finished run must not be re-executed (e.g. a worker result landing after the
@@ -1752,7 +1939,7 @@ export class WorkflowEngine {
   async recoverIncomplete(nowMs: number = this.clock()): Promise<RunResult[]> {
     if (this.draining) return [];
     const results: RunResult[] = [];
-    for (const listed of await this.store.listIncompleteRuns(this.namespace)) {
+    for (const listed of await this.orphanedRuns(nowMs)) {
       if (this.draining) break;
       // An IN-PROCESS turn renews its lease, so an acquirable lease means no turn is executing this
       // run right now. Skip the ones still owned. NOTE this is NOT the same as "the worker crashed" —
@@ -1827,6 +2014,26 @@ export class WorkflowEngine {
       });
     }
     return results;
+  }
+
+  /**
+   * The runs {@link recoverIncomplete} should try to reclaim: incomplete runs whose lease is free or
+   * expired, never the healthy ones a live turn is renewing. Every worker runs recovery on every
+   * timer tick, so listing every running run and lock-probing each (one doomed UPDATE per healthy
+   * run per worker per tick) was pure database load. The store answers it directly when it can
+   * ({@link StateStore.listOrphanedRuns}, bounded by {@link RECOVERY_BATCH}); else the full list is
+   * filtered here, which still spares the probes. Shuffled, like the due-timer pass, so instances
+   * recovering at once spread over the batch instead of contending for the same leases.
+   */
+  private async orphanedRuns(nowMs: number): Promise<WorkflowRun[]> {
+    if (this.store.listOrphanedRuns) {
+      return shuffle(await this.store.listOrphanedRuns(nowMs, RECOVERY_BATCH, this.namespace));
+    }
+    return shuffle(
+      (await this.store.listIncompleteRuns(this.namespace)).filter(
+        (run) => run.lockedUntil == null || run.lockedUntil <= nowMs,
+      ),
+    );
   }
 
   /**
@@ -3555,13 +3762,23 @@ export class WorkflowEngine {
   private async settleRun(run: WorkflowRun, outcome: RunOutcome): Promise<RunResult> {
     const updatedAt = new Date();
     if (outcome.kind === 'completed') {
-      // Clear any error from an earlier failed-then-retried attempt — a completed run is a success.
-      await this.store.updateRun(run.id, {
-        status: 'completed',
-        output: outcome.output,
-        error: undefined,
-        updatedAt,
-      });
+      // This outcome was computed by a turn that started from a possibly-stale run snapshot. If the
+      // run reached `cancelled`/`completed`/`dead` WHILE that turn was executing (an operator's
+      // `cancel()`, a timeout sweep, a dead-letter), it must not be overwritten: the write is a
+      // compare-and-set on the status (see {@link SETTLE_ELIGIBLE_STATUSES}). Also clears any error
+      // from an earlier failed-then-retried attempt: a completed run is a success.
+      const applied = await (this.store.updateRunIf ?? this.updateRunIfFallback).call(
+        this.store,
+        run.id,
+        SETTLE_ELIGIBLE_STATUSES,
+        {
+          status: 'completed',
+          output: outcome.output,
+          error: undefined,
+          updatedAt,
+        },
+      );
+      if (!applied) return this.echoCurrentStatus(run.id);
       this.emit({
         type: 'run.completed',
         runId: run.id,
@@ -3576,7 +3793,18 @@ export class WorkflowEngine {
       const handed = await this.routeFailure(run, outcome.error);
       if (handed && handed.kind !== 'failed') return this.settleRun(run, handed);
       const error = handed?.error ?? outcome.error;
-      await this.store.updateRun(run.id, { status: 'failed', error, updatedAt });
+      // Same race as the `completed` branch, guarded the same way.
+      const applied = await (this.store.updateRunIf ?? this.updateRunIfFallback).call(
+        this.store,
+        run.id,
+        SETTLE_ELIGIBLE_STATUSES,
+        {
+          status: 'failed',
+          error,
+          updatedAt,
+        },
+      );
+      if (!applied) return this.echoCurrentStatus(run.id);
       this.emit({
         type: 'run.failed',
         runId: run.id,
@@ -3591,17 +3819,21 @@ export class WorkflowEngine {
     // This outcome was computed by a turn that started from a possibly-stale run snapshot. If the run
     // was cancelled WHILE that turn was still executing (e.g. `ctx.all`'s failFast cancelling a
     // sibling mid-turn — plain `cancel()` writes `cancelled` directly, without waiting for the target's
-    // in-flight turn to notice), this now-stale "suspended" outcome must not resurrect it: re-check the
-    // CURRENT persisted status right before writing and echo it instead of clobbering a real cancel.
-    const latest = await this.store.getRun(run.id);
-    if (latest?.status === 'cancelled') {
-      return { runId: run.id, status: 'cancelled', error: latest.error };
-    }
-    await this.store.updateRun(run.id, {
-      status: 'suspended',
-      wakeAt: this.reconcileWakeAt(outcome.wakeAt),
-      updatedAt,
-    });
+    // in-flight turn to notice), this now-stale "suspended" outcome must not resurrect it. The
+    // compare-and-set IS the guard; it also catches `completed`/`dead` reached mid-turn, and a
+    // compensating cancel (`cancelling`) requested mid-turn, which the queued compensation turn (or
+    // recovery, on another instance) finishes instead of the run parking as `suspended`.
+    const applied = await (this.store.updateRunIf ?? this.updateRunIfFallback).call(
+      this.store,
+      run.id,
+      SUSPEND_ELIGIBLE_STATUSES,
+      {
+        status: 'suspended',
+        wakeAt: this.reconcileWakeAt(outcome.wakeAt),
+        updatedAt,
+      },
+    );
+    if (!applied) return this.echoCurrentStatus(run.id);
     this.emit({
       type: 'run.suspended',
       runId: run.id,
@@ -3646,7 +3878,7 @@ export class WorkflowEngine {
           .publishControl({ kind: 'cancel', runId: run.id, from: this.instanceId })
           .catch(() => undefined);
       }
-      await this.store.releaseRunLock(run.id);
+      await this.releaseLeaseBestEffort(run.id);
       return { runId: run.id, status: 'cancelled', error };
     }
     const remote = registered.remote as NonNullable<RegisteredWorkflow['remote']>;
@@ -3681,7 +3913,7 @@ export class WorkflowEngine {
     if (handoff) {
       // A run that handed its failure to an onError handler only follows the handler from here on.
       const result = await this.settleRun(run, await this.followHandoff(run, handoff));
-      await this.store.releaseRunLock(run.id);
+      await this.releaseLeaseBestEffort(run.id);
       return result;
     }
     const history = await this.remoteHistory(run.id, checkpoints);
@@ -3774,7 +4006,7 @@ export class WorkflowEngine {
       // lease (released just below) stays free. `releaseRunLock` is idempotent, and `renewRunLock` is a
       // no-op once `lockedBy` is cleared, so a renew tick racing the release cannot re-acquire it.
       if (err instanceof RemoteWorkflowTimeout) {
-        await this.store.releaseRunLock(run.id);
+        await this.releaseLeaseBestEffort(run.id);
         // The suspended path returned early above; run is always `running` here — left for recovery to re-drive.
         return { runId: run.id, status: 'running' as const };
       }
@@ -4564,7 +4796,7 @@ export class WorkflowEngine {
         this.awaitedRemoteSteps.delete(run.id);
       }
       if (this.awaitedStepFans.get(run.id) === awaitedFans) this.awaitedStepFans.delete(run.id);
-      await this.store.releaseRunLock(run.id);
+      await this.releaseLeaseBestEffort(run.id);
       if (suspendedOnFan) {
         void this.redriveSettledChildren(run.id, suspendedOnFan).catch(() => undefined);
       }
@@ -4964,23 +5196,22 @@ export class WorkflowEngine {
    * own `finally` also releases (the run-execution path) is safe.
    */
   private async parkBlocked(run: WorkflowRun, blocked: BlockedDispatch): Promise<RunResult> {
-    const current = await this.store.getRun(run.id);
-    if (current && (current.status === 'cancelled' || current.status === 'completed')) {
-      await this.store.releaseRunLock(run.id);
-      return {
-        runId: run.id,
-        status: current.status,
-        output: current.output,
-        error: current.error,
-      };
-    }
     const error: StepError = { message: blocked.reason, code: blocked.code, retryable: true };
-    await this.store.updateRun(run.id, {
-      status: 'blocked',
-      error,
-      wakeAt: this.clock() + this.blockedPollMs,
-      updatedAt: new Date(),
-    });
+    const applied = await (this.store.updateRunIf ?? this.updateRunIfFallback).call(
+      this.store,
+      run.id,
+      SUSPEND_ELIGIBLE_STATUSES,
+      {
+        status: 'blocked',
+        error,
+        wakeAt: this.clock() + this.blockedPollMs,
+        updatedAt: new Date(),
+      },
+    );
+    if (!applied) {
+      await this.store.releaseRunLock(run.id);
+      return this.echoCurrentStatus(run.id);
+    }
     this.emit({
       type: 'run.blocked',
       runId: run.id,

@@ -192,29 +192,7 @@ export class TypeOrmStateStore implements StateStore {
     // Single UPDATE (no pre-SELECT + save round-trips): map only the patched fields. The query
     // builder still applies the entities' JSON column transformers to the `set` values (as in
     // listRuns/tryLockRun). Preserve the not-found throw any caller may rely on.
-    const update: Record<string, unknown> = {};
-    if ('workflow' in patch) update.workflow = patch.workflow;
-    if ('workflowVersion' in patch) update.workflowVersion = patch.workflowVersion;
-    if ('status' in patch) update.status = patch.status;
-    if ('input' in patch) update.input = patch.input ?? null;
-    if ('output' in patch) update.output = patch.output ?? null;
-    if ('error' in patch) update.error = patch.error ?? null;
-    if ('wakeAt' in patch) update.wakeAt = patch.wakeAt == null ? null : new Date(patch.wakeAt);
-    if ('lockedBy' in patch) update.lockedBy = patch.lockedBy ?? null;
-    if ('lockedUntil' in patch)
-      update.lockedUntil = patch.lockedUntil == null ? null : new Date(patch.lockedUntil);
-    if ('awaitingDecisionTaskId' in patch)
-      update.awaitingDecisionTaskId = patch.awaitingDecisionTaskId ?? null;
-    if ('recoveryAttempts' in patch) update.recoveryAttempts = patch.recoveryAttempts;
-    if ('tags' in patch) update.tags = patch.tags ?? null;
-    if ('searchAttributes' in patch) update.searchAttributes = patch.searchAttributes ?? null;
-    if ('priority' in patch) update.priority = patch.priority ?? null;
-    // A patch that clears the namespace still lands on `'default'`, never NULL — the column is the
-    // isolation predicate, and a NULL there would match no worker's namespace at all.
-    if ('namespace' in patch) update.namespace = patch.namespace ?? 'default';
-    if ('origin' in patch) update.origin = patch.origin ?? null;
-    if ('createdAt' in patch) update.createdAt = patch.createdAt;
-    if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;
+    const update = runUpdateSet(patch);
     const result = await this.runs()
       .createQueryBuilder()
       .update()
@@ -224,6 +202,29 @@ export class TypeOrmStateStore implements StateStore {
     if (!result.affected) throw new Error(`run ${runId} not found`);
     // Keep the side-table in step with the run's attributes whenever they're patched.
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
+  }
+
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    inputPatch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    if (expectedStatuses.length === 0) return false;
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) => this.getRun(id))
+        : inputPatch;
+    // The status predicate is part of the UPDATE itself: the database arbitrates the race, and the
+    // changed-row count is the answer (a missing row matches nothing).
+    const result = await this.runs()
+      .createQueryBuilder()
+      .update()
+      .set(runUpdateSet(patch))
+      .where({ id: runId, status: In(expectedStatuses) })
+      .execute();
+    if (!result.affected) return false;
+    if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
+    return true;
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
@@ -341,6 +342,28 @@ export class TypeOrmStateStore implements StateStore {
     const rows = await this.runs().findBy({
       status: In(['running', 'cancelling']),
       ...(namespace !== undefined ? { namespace } : {}),
+    });
+    return rows.map(fromRunEntity);
+  }
+
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const now = new Date(nowMs);
+    const rows = await this.runs().find({
+      where: [
+        {
+          status: In(['running', 'cancelling']),
+          lockedUntil: IsNull(),
+          ...(namespace !== undefined ? { namespace } : {}),
+        },
+        {
+          status: In(['running', 'cancelling']),
+          lockedUntil: LessThanOrEqual(now),
+          ...(namespace !== undefined ? { namespace } : {}),
+        },
+      ],
+      order: { createdAt: 'ASC' },
+      take: limit,
     });
     return rows.map(fromRunEntity);
   }
@@ -1055,6 +1078,34 @@ function fromScheduleEntity(e: ScheduleEntity): ScheduleRecord {
  * One conditional UPDATE: the `status = 'pending'` predicate is the compare, the affected-row count
  * the answer. A missing row matches nothing, so it is never created.
  */
+/** The UPDATE `set` for a run patch: only the patched fields, mapped to their columns. */
+function runUpdateSet(patch: Partial<WorkflowRun>): Record<string, unknown> {
+  const update: Record<string, unknown> = {};
+  if ('workflow' in patch) update.workflow = patch.workflow;
+  if ('workflowVersion' in patch) update.workflowVersion = patch.workflowVersion;
+  if ('status' in patch) update.status = patch.status;
+  if ('input' in patch) update.input = patch.input ?? null;
+  if ('output' in patch) update.output = patch.output ?? null;
+  if ('error' in patch) update.error = patch.error ?? null;
+  if ('wakeAt' in patch) update.wakeAt = patch.wakeAt == null ? null : new Date(patch.wakeAt);
+  if ('lockedBy' in patch) update.lockedBy = patch.lockedBy ?? null;
+  if ('lockedUntil' in patch)
+    update.lockedUntil = patch.lockedUntil == null ? null : new Date(patch.lockedUntil);
+  if ('awaitingDecisionTaskId' in patch)
+    update.awaitingDecisionTaskId = patch.awaitingDecisionTaskId ?? null;
+  if ('recoveryAttempts' in patch) update.recoveryAttempts = patch.recoveryAttempts;
+  if ('tags' in patch) update.tags = patch.tags ?? null;
+  if ('searchAttributes' in patch) update.searchAttributes = patch.searchAttributes ?? null;
+  if ('priority' in patch) update.priority = patch.priority ?? null;
+  // A patch that clears the namespace still lands on `'default'`, never NULL — the column is the
+  // isolation predicate, and a NULL there would match no worker's namespace at all.
+  if ('namespace' in patch) update.namespace = patch.namespace ?? 'default';
+  if ('origin' in patch) update.origin = patch.origin ?? null;
+  if ('createdAt' in patch) update.createdAt = patch.createdAt;
+  if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;
+  return update;
+}
+
 async function updateIfPending(
   repo: Repository<StepCheckpointEntity>,
   checkpoint: StepCheckpoint,

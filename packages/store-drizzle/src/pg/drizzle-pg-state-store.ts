@@ -209,6 +209,36 @@ export class DrizzlePgStateStore implements StateStore {
     });
   }
 
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    inputPatch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    if (expectedStatuses.length === 0) return false;
+    // Writes are unscoped, like updateRun.
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) =>
+            this.withScope({}).getRun(id),
+          )
+        : inputPatch;
+    const row = toRunPatch(patch);
+    const reindex = 'searchAttributes' in patch;
+    const matches = and(eq(workflowRuns.id, runId), inArray(workflowRuns.status, expectedStatuses));
+    return this.db.transaction(async (tx) => {
+      // One conditional UPDATE: a writer racing another blocks on the row lock, then re-evaluates
+      // the status predicate against the committed row. With no mapped column to write, the compare
+      // is a locking read instead.
+      const applied = Object.keys(row).length
+        ? (await tx.update(workflowRuns).set(row).where(matches).returning({ id: workflowRuns.id }))
+            .length === 1
+        : (await tx.select({ id: workflowRuns.id }).from(workflowRuns).where(matches).for('update'))
+            .length === 1;
+      if (applied && reindex) await reindexAttributes(tx, runId, patch.searchAttributes);
+      return applied;
+    });
+  }
+
   async getRun(runId: string): Promise<WorkflowRun | null> {
     const rows = await this.db
       .select()
@@ -349,6 +379,24 @@ export class DrizzlePgStateStore implements StateStore {
           this.scope(),
         ),
       );
+    return rows.map(fromRunRow);
+  }
+
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const rows = await this.db
+      .select()
+      .from(workflowRuns)
+      .where(
+        and(
+          inArray(workflowRuns.status, ['running', 'cancelling']),
+          or(isNull(workflowRuns.lockedUntil), lte(workflowRuns.lockedUntil, new Date(nowMs))),
+          namespaceFilter(namespace),
+          this.scope(),
+        ),
+      )
+      .orderBy(asc(workflowRuns.createdAt))
+      .limit(limit);
     return rows.map(fromRunRow);
   }
 

@@ -34,13 +34,15 @@ Several `StateStore` methods exist only to keep wide fans and busy deployments c
 optional, and the engine falls back to something slower but correct when a store leaves one out.
 Run the [shared store contract](/docs/testing#testing-a-custom-storetransportadmission-backend)
 (`runStateStoreContract`) against your adapter. Its `listDueTimers` case checks the ordering and
-the `limit`. Its cases for `countCheckpoints`, `saveCheckpointIfPending`, `saveCheckpointsIfPending`,
+the `limit`. Its cases for `listOrphanedRuns`, `updateRunIf`, `countCheckpoints`, `saveCheckpointIfPending`, `saveCheckpointsIfPending`,
 `registerChildWaits`, `listCheckpointsByNamePrefix`, `checkpointStats` and `queryCheckpoints` expect the method to exist, because every bundled adapter has it: a
 custom store that leaves one out fails those cases even though the engine would fall back.
 
 | Method | Required? | What the engine uses it for | Without it |
 | --- | --- | --- | --- |
 | `listDueTimers(nowMs, namespace?, limit?)` | required; honoring `limit` is optional | the due-timer pass. Return the most overdue first (`wakeAt` ascending), at most `limit` runs. The engine passes its `timerBatchSize` (default 500). | A store that ignores `limit` still works; every instance then loads the whole due set on each tick. |
+| `listOrphanedRuns(nowMs, limit, namespace?)` | optional | the periodic recovery pass. Return the `running` and `cancelling` runs whose lease is free (`lockedUntil` null or `<= nowMs`), oldest `createdAt` first, at most `limit` (the engine asks for 500), restricted to `namespace` when given. On a healthy fleet that is about zero rows per tick. | The engine lists every incomplete run with `listIncompleteRuns` on every tick, on every worker, and drops the leased ones in memory. |
+| `updateRunIf(runId, expectedStatuses, patch)` | optional | a compare-and-set on the run's status: apply `patch` only while the run's status is one of `expectedStatuses`, and resolve whether it wrote (a missing run resolves `false`, never throws). A turn settles its outcome (completed, failed, suspended, blocked) through it, so a run that reached `cancelled`, `completed` or `dead` through another path while the turn ran (an operator's `cancel()`, a timeout sweep, a dead-letter) keeps that state. The predicate must be in the `UPDATE … WHERE` itself. | The engine re-reads the run and then writes, which narrows the race to the gap between the two but cannot close it. |
 | `countCheckpoints(runId, fromSeq, toSeq, statuses)` | optional | a step fan's join barrier asks, once per batch of results, how many checkpoints in the fan's seq range are still `pending`. Must be a `COUNT`, not a load. An empty `statuses` counts 0. | The engine loads the run's checkpoints and counts in memory, once per batch of results. |
 | `saveCheckpointIfPending(checkpoint)` | optional | a compare-and-set: overwrite `(runId, seq)` only while the stored row is still `pending`, and resolve whether it wrote. Used to settle a step from its result (which also drops a duplicate delivery), to stamp a redispatch deadline, and to re-dispatch. | The engine uses `saveCheckpoint`, which keeps the race where a turn writes a settled step back to `pending` and the step runs twice. |
 | `saveCheckpointsIfPending(checkpoints)` | optional | `saveCheckpointIfPending` for many rows in one call, resolving one boolean per entry in input order. It must give the same answers as calling `saveCheckpointIfPending` on each entry in turn: a second entry for the same row is compared against the first one's write. Each row's compare-and-set stays atomic, and so does the call: if it rejects, it wrote nothing. The engine settles a batch of one run's step results with one call. | One `saveCheckpointIfPending` per result. |
@@ -54,8 +56,9 @@ custom store that leaves one out fails those cases even though the engine would 
 
 Every bundled adapter (MikroORM, TypeORM, Prisma, Drizzle on SQLite/MySQL and on Postgres, and the
 in-memory store) implements `listDueTimers` with `limit` and ordering and every optional method in the
-table. `saveCheckpointIfPending` is a single conditional `UPDATE … WHERE status = 'pending'` in each,
-never a read followed by a write, and `countCheckpoints` is one `COUNT(*)` over the run's seq range.
+table. `updateRunIf` is a single conditional `UPDATE … WHERE id = ? AND status IN (…)` in each, and
+`saveCheckpointIfPending` a single conditional `UPDATE … WHERE status = 'pending'`, never a read
+followed by a write, and `countCheckpoints` is one `COUNT(*)` over the run's seq range.
 `saveCheckpointsIfPending` is one `UPDATE … FROM (VALUES …) WHERE status = 'pending' RETURNING` per
 500 rows on Drizzle Postgres, and those same conditional `UPDATE`s, one per row, in one transaction
 on the other stores. It is one commit per batch either way.
@@ -73,10 +76,11 @@ after decoding. On a collation that ignores case (MySQL's default), the name kin
 you named something like `FAN:x` would be affected.
 
 `CodecStateStore` exposes an optional method only when the store it wraps has it, so wrapping a
-store never hides a capability or invents one. It encodes the payload for `saveCheckpointIfPending`
+store never hides a capability or invents one. It encodes the payload for `updateRunIf` (like
+`updateRun`), for `saveCheckpointIfPending`
 and for every entry of `saveCheckpointsIfPending`, forwards `countCheckpoints` and `checkpointStats`
 verbatim (neither reads a payload), decodes the rows `queryCheckpoints` returns, and decodes the runs
-`listDueTimers` returns.
+`listDueTimers` and `listOrphanedRuns` return.
 
 ## Adapters
 

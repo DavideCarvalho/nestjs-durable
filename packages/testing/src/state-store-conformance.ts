@@ -442,6 +442,10 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
 
         await engine.start('p-root', {}, 'pr');
         await engine.start('p-other', {}, 'po');
+        // Wait for the ROOT to park too, not only the child: the root's `spawn:pc` checkpoint (the
+        // edge purge follows to find `pc`) is written after the child is started, so the child can
+        // reach `suspended` first on a slow store, and a purge then would not see the edge yet.
+        expect((await engine.waitForRun('pr', { timeoutMs: 20_000 })).status).toBe('suspended');
         expect((await engine.waitForRun('pc', { timeoutMs: 20_000 })).status).toBe('suspended');
         expect((await engine.waitForRun('po', { timeoutMs: 20_000 })).status).toBe('completed');
 
@@ -551,6 +555,115 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     });
 
     registerCheckpointAggregationCases(t, () => store, run);
+
+    t(
+      'listOrphanedRuns returns incomplete runs with a free or expired lease, oldest first',
+      async () => {
+        // Optional on the interface (the engine falls back to listing every incomplete run and
+        // filtering in process), but a conformant store MUST provide it.
+        expect(store.listOrphanedRuns).toBeDefined();
+        if (!store.listOrphanedRuns) return;
+        // Whole seconds apart: MySQL's DATETIME drops milliseconds, which would tie the ordering.
+        const created = (offset: number) => new Date(at.getTime() + offset * 1_000);
+        await store.createRun(run({ id: 'held', createdAt: created(1) }));
+        expect(await store.tryLockRun('held', 'live', NOW + 30_000, NOW)).toBe(true);
+        await store.createRun(run({ id: 'expired', createdAt: created(3) }));
+        expect(await store.tryLockRun('expired', 'dead', NOW, NOW - 1)).toBe(true);
+        await store.createRun(run({ id: 'free', createdAt: created(2) }));
+        await store.createRun(
+          run({ id: 'compensating', status: 'cancelling', createdAt: created(4) }),
+        );
+        await store.createRun(run({ id: 'parked', status: 'suspended', createdAt: created(0) }));
+        await store.createRun(run({ id: 'done', status: 'completed', createdAt: created(0) }));
+        await store.createRun(run({ id: 'tenant', namespace: 'beta', createdAt: created(5) }));
+
+        expect((await store.listOrphanedRuns(NOW, 10)).map((r) => r.id)).toEqual([
+          'free',
+          'expired',
+          'compensating',
+          'tenant',
+        ]);
+        // Capped, oldest first.
+        expect((await store.listOrphanedRuns(NOW, 2)).map((r) => r.id)).toEqual([
+          'free',
+          'expired',
+        ]);
+        // Namespace-scoped.
+        expect((await store.listOrphanedRuns(NOW, 10, 'beta')).map((r) => r.id)).toEqual([
+          'tenant',
+        ]);
+        // Once the live lease lapses, that run is an orphan too.
+        expect((await store.listOrphanedRuns(NOW + 30_000, 10)).map((r) => r.id)).toContain('held');
+        expect(await store.listOrphanedRuns(NOW, 0)).toEqual([]);
+      },
+    );
+
+    t('updateRunIf writes only over an expected status', async () => {
+      // Optional on the interface (the engine falls back to read-then-write, which keeps a race
+      // window), but a conformant store MUST provide it: assert presence, then exercise it.
+      expect(store.updateRunIf).toBeDefined();
+      if (!store.updateRunIf) return;
+      await store.createRun(run({ error: { message: 'earlier attempt' } }));
+
+      // A status outside the expected set: refused, nothing written.
+      expect(
+        await store.updateRunIf('r1', ['suspended', 'blocked'], {
+          status: 'completed',
+          output: { total: 1 },
+        }),
+      ).toBe(false);
+      let current = await store.getRun('r1');
+      expect(current?.status).toBe('running');
+      expect(current?.output).toBeUndefined();
+
+      // In the set: the whole patch lands, clears included.
+      expect(
+        await store.updateRunIf('r1', ['pending', 'running'], {
+          status: 'suspended',
+          wakeAt: 7_000,
+          error: undefined,
+          updatedAt: new Date(at.getTime() + 1_000),
+        }),
+      ).toBe(true);
+      current = await store.getRun('r1');
+      expect(current?.status).toBe('suspended');
+      expect(current?.wakeAt).toBe(7_000);
+      expect(current?.error).toBeUndefined();
+      expect(current?.updatedAt.getTime()).toBe(at.getTime() + 1_000);
+
+      // A run that went terminal meanwhile keeps its state.
+      await store.updateRun('r1', { status: 'cancelled', error: { message: 'cancelled' } });
+      expect(
+        await store.updateRunIf('r1', ['running', 'suspended'], {
+          status: 'completed',
+          output: { total: 2 },
+        }),
+      ).toBe(false);
+      current = await store.getRun('r1');
+      expect(current?.status).toBe('cancelled');
+      expect(current?.error).toEqual({ message: 'cancelled' });
+      expect(current?.output).toBeUndefined();
+
+      // No row: nothing to compare against, never throws, never creates one.
+      expect(await store.updateRunIf('missing', ['running'], { status: 'completed' })).toBe(false);
+      expect(await store.getRun('missing')).toBeNull();
+    });
+
+    t(
+      'updateRunIf settling a run terminal drops its singleton admission like updateRun',
+      async () => {
+        expect(store.updateRunIf).toBeDefined();
+        if (!store.updateRunIf) return;
+        await store.createRun(run({ tags: ['singleton:k', SINGLETON_ADMITTED_TAG] }));
+        expect(
+          await store.updateRunIf('r1', ['running'], { status: 'completed', output: { ok: true } }),
+        ).toBe(true);
+        const settled = await store.getRun('r1');
+        expect(settled?.status).toBe('completed');
+        expect(settled?.output).toEqual({ ok: true });
+        expect(settled?.tags).toEqual(['singleton:k']);
+      },
+    );
 
     t('saveCheckpointIfPending writes over a pending row only', async () => {
       // Optional on the interface (the engine falls back to a blind save, which can clobber a settled

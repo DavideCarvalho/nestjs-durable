@@ -7,6 +7,7 @@ import {
   type RunFacetQuery,
   type RunFacetRow,
   type RunQuery,
+  type RunStatus,
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
@@ -112,6 +113,23 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async updateRun(runId: string, inputPatch: Partial<WorkflowRun>): Promise<void> {
+    this.applyRunPatch(runId, inputPatch);
+  }
+
+  updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    // No await between the compare and the write: the base `updateRun` writes synchronously, so
+    // JavaScript's synchronous turn is the critical section. Routed through `updateRun` so a test
+    // store that intercepts it still sees every run write.
+    const existing = this.runs.get(runId);
+    if (!existing || !expectedStatuses.includes(existing.status)) return Promise.resolve(false);
+    return this.updateRun(runId, patch).then(() => true);
+  }
+
+  private applyRunPatch(runId: string, inputPatch: Partial<WorkflowRun>): void {
     const patch =
       inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
         ? {
@@ -202,6 +220,19 @@ export class InMemoryStateStore implements StateStore {
       this.checkpoints.set(key, { ...checkpoint });
       return true;
     });
+  }
+
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    return [...this.runs.values()]
+      .filter(
+        (r) =>
+          (r.status === 'running' || r.status === 'cancelling') &&
+          (r.lockedUntil == null || r.lockedUntil <= nowMs) &&
+          (namespace === undefined || r.namespace === namespace),
+      )
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .slice(0, Math.max(0, limit))
+      .map((r) => ({ ...r }));
   }
 
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
