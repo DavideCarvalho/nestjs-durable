@@ -187,6 +187,15 @@ export class InMemoryStateStore implements StateStore {
     return true;
   }
 
+  async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+    return checkpoints.map((checkpoint) => {
+      const key = this.key(checkpoint.runId, checkpoint.seq);
+      if (this.checkpoints.get(key)?.status !== 'pending') return false;
+      this.checkpoints.set(key, { ...checkpoint });
+      return true;
+    });
+  }
+
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
     return [...this.runs.values()]
       .filter(

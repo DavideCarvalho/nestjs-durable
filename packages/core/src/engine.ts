@@ -295,6 +295,19 @@ const versionKey = (name: string, version: string): string => `${name}@${version
 /** How many checkpoint writes / dispatches a step fan sends at once. */
 const STEP_FAN_CHUNK = 200;
 
+/** The most results of one run settled by one batched write (see `completeRemoteResult`). */
+const RESULT_BATCH_MAX = 256;
+
+/** A step result waiting for its run's next batched settle. */
+interface QueuedResult {
+  result: StepResult;
+  resolve: (wake: boolean) => void;
+  reject: (err: unknown) => void;
+}
+
+/** One result's part of a batched settle: whether it resumes the run, or why it could not settle. */
+type ResultOutcome = boolean | { error: unknown };
+
 /** Fisher–Yates, in place. */
 function shuffle<T>(items: T[]): T[] {
   for (let i = items.length - 1; i > 0; i -= 1) {
@@ -633,6 +646,8 @@ export class WorkflowEngine {
   private readonly stepFansFiredHere = new Map<string, number>();
   /** The tail of each run's queue of results being handled on this instance — see {@link serializedPerRun}. */
   private readonly resultChains = new Map<string, Promise<void>>();
+  /** Each run's results waiting to be settled on this instance — see {@link completeRemoteResult}. */
+  private readonly resultQueues = new Map<string, QueuedResult[]>();
   /** Flow-control admission backend for remote steps (see {@link registerQueue}). */
   private readonly admission: AdmissionBackend;
   /** Runs on THIS instance blocked on admission, by queue — woken early on a freed-slot signal. */
@@ -746,8 +761,8 @@ export class WorkflowEngine {
         }
         // Durable path: no in-memory waiter (the step suspended the run, possibly on another
         // instance) → complete the checkpoint and resume the run here.
-        // Settling runs in parallel; only the resume (the run's turn) is serialized per run, so the
-        // results of one wide step fan are not queued behind each other on an instance.
+        // One run's results settle in batches and different runs' in parallel; the resume (the
+        // run's turn) is serialized per run. A batch resumes its run at most once.
         if (!(await this.completeRemoteResult(result))) return;
         await this.serializedPerRun(result.runId, () =>
           this.resumeImplicit(result.runId).then(
@@ -2481,12 +2496,7 @@ export class WorkflowEngine {
   ): Promise<void> {
     for (const fan of fans) {
       if (this.stepFansFiredHere.has(`${runId}:${fan.from}`)) continue;
-      const pending = this.store.countCheckpoints
-        ? await this.store.countCheckpoints(runId, fan.from, fan.to, ['pending'])
-        : (await this.store.listCheckpoints(runId)).filter(
-            (c) => c.seq >= fan.from && c.seq <= fan.to && c.status === 'pending',
-          ).length;
-      if (pending > 0) continue;
+      if ((await this.stepFanPending(runId, fan.from, fan.to)) > 0) continue;
       const nowMs = this.clock();
       if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) {
         return;
@@ -5139,6 +5149,29 @@ export class WorkflowEngine {
     return true;
   }
 
+  /**
+   * {@link savePendingCheckpoint} for checkpoints at distinct seqs of one run: one
+   * {@link StateStore.saveCheckpointsIfPending} call when the store has it, else one write each.
+   * Never rejects as a whole: a write that failed is reported as that entry's error, and the batch
+   * call rejecting means it wrote nothing, so the entries are then written one by one.
+   */
+  private async savePendingCheckpoints(
+    checkpoints: StepCheckpoint[],
+  ): Promise<(boolean | { error: unknown })[]> {
+    if (checkpoints.length > 1 && this.store.saveCheckpointsIfPending) {
+      try {
+        const wrote = await this.store.saveCheckpointsIfPending(checkpoints);
+        return checkpoints.map((_, i) => wrote[i] === true);
+      } catch {
+        // Fall through: one bad row must not fail the whole batch.
+      }
+    }
+    const settled = await Promise.allSettled(
+      checkpoints.map((cp) => this.savePendingCheckpoint(cp)),
+    );
+    return settled.map((s) => (s.status === 'fulfilled' ? s.value : { error: s.reason }));
+  }
+
   /** Enqueue a remote step task to its worker group via the transport pool. Shared by the initial
    *  dispatch, the opt-in self-heal re-dispatch (see `remoteRedispatchMs`), and the explicit
    *  {@link redispatchPending}. Carries the current trace/context so a re-dispatch is traceable. */
@@ -5192,66 +5225,171 @@ export class WorkflowEngine {
    * result (the dispatching one may be gone), so the run is crash/scale-safe. Resolves whether the
    * run should now be resumed: not for a duplicate or late delivery (the checkpoint isn't `pending`),
    * a run already finished, or a step fan whose barrier is still closed.
+   *
+   * Results of one run are settled in batches: the first starts a batch, and the ones that arrive
+   * while it is being written form the next. Under load a wide fan's results are written by one
+   * {@link StateStore.saveCheckpointsIfPending} call per batch, and the fan's barrier is asked once
+   * per batch, not once per result. A result resolves only once its own write has committed, so the
+   * transport acknowledges nothing that is not durable yet.
    */
-  private async completeRemoteResult(result: StepResult): Promise<boolean> {
-    const cp = await this.store.getCheckpoint(result.runId, result.seq);
-    if (!cp || cp.status !== 'pending') return false;
-    // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Done
-    // before the cancelled-run early-return below, so a cancellation can't leak the slot. Released
-    // fire-and-forget: the slot/notify is best-effort (a global backend self-heals via lease), and
-    // not awaiting keeps it off the result-processing critical path (no ordering shift).
-    void this.releaseQueueSlot(cp.stepId).catch(() => undefined);
+  private completeRemoteResult(result: StepResult): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+      const entry = { result, resolve, reject };
+      const queued = this.resultQueues.get(result.runId);
+      if (queued) {
+        queued.push(entry);
+        return;
+      }
+      const queue = [entry];
+      this.resultQueues.set(result.runId, queue);
+      void this.drainResultQueue(result.runId, queue);
+    });
+  }
+
+  /** Settle `queue` (a run's queued results) batch by batch until it is empty, then retire it. */
+  private async drainResultQueue(runId: string, queue: QueuedResult[]): Promise<void> {
+    // Results delivered in the same tick as the first join its batch.
+    await Promise.resolve();
+    while (queue.length > 0) {
+      const batch = queue.splice(0, RESULT_BATCH_MAX);
+      let outcomes: ResultOutcome[];
+      try {
+        outcomes = await this.completeRemoteResults(
+          runId,
+          batch.map((q) => q.result),
+        );
+      } catch (err) {
+        outcomes = batch.map(() => ({ error: err }));
+      }
+      batch.forEach((q, i) => {
+        const outcome = outcomes[i] ?? false;
+        if (typeof outcome === 'boolean') q.resolve(outcome);
+        else q.reject(outcome.error);
+      });
+    }
+    // Same tick as the empty check: a result arriving later starts a new queue.
+    this.resultQueues.delete(runId);
+  }
+
+  /**
+   * Settle a batch of one run's step results. At most one of them resolves `true` (resume the run):
+   * that resume replays every write of the batch, so a second would only replay it again. A result
+   * whose read or write failed resolves its error, and the transport redelivers just that one.
+   */
+  private async completeRemoteResults(
+    runId: string,
+    results: StepResult[],
+  ): Promise<ResultOutcome[]> {
+    const outcomes: ResultOutcome[] = results.map(() => false);
+    // A second copy of a result in the same batch is a duplicate delivery: dropped, like a late one.
+    const seen = new Set<number>();
+    const live = results.flatMap((r, i) => {
+      if (seen.has(r.seq)) return [];
+      seen.add(r.seq);
+      return [i];
+    });
+    const reads = await Promise.allSettled(
+      live.map((i) => this.store.getCheckpoint(runId, (results[i] as StepResult).seq)),
+    );
+    const pending: { index: number; cp: StepCheckpoint }[] = [];
+    reads.forEach((read, k) => {
+      const index = live[k] as number;
+      if (read.status === 'rejected') outcomes[index] = { error: read.reason };
+      else if (read.value?.status === 'pending') pending.push({ index, cp: read.value });
+    });
+    if (pending.length === 0) return outcomes;
+    // A result settling a step frees its flow-control slot (no-op if it wasn't queued). Done before
+    // the finished-run check below, so a cancellation can't leak the slot. Fire-and-forget: the slot
+    // is best-effort (a global backend self-heals via lease) and stays off the critical path.
+    for (const { cp } of pending) void this.releaseQueueSlot(cp.stepId).catch(() => undefined);
     // Drop a late result for a run that was cancelled/finished meanwhile — don't complete the step
     // or resume (the run is already terminal). This is the engine side of cooperative cancellation.
-    const run = await this.store.getRun(result.runId);
-    if (run && (run.status === 'cancelled' || run.status === 'completed')) return false;
+    const run = await this.store.getRun(runId);
+    if (run && (run.status === 'cancelled' || run.status === 'completed')) return outcomes;
     const finishedAt = new Date();
-    const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
-    // Claimed, not blindly written: a duplicate delivery of this result settled it first.
-    const claimed = await this.savePendingCheckpoint({
-      ...cp,
-      status: result.status,
-      output: result.status === 'completed' ? result.output : cp.output,
-      error: result.error,
-      events: result.events ?? cp.events,
-      startedAt,
-      finishedAt,
+    const writes = pending.map(({ index, cp }) => {
+      const result = results[index] as StepResult;
+      return {
+        ...cp,
+        status: result.status,
+        output: result.status === 'completed' ? result.output : cp.output,
+        error: result.error,
+        events: result.events ?? cp.events,
+        startedAt: result.startedAt ? new Date(result.startedAt) : cp.startedAt,
+        finishedAt,
+      };
     });
-    if (!claimed) return false;
-    this.noteSettledHere(`${result.runId}:${result.seq}`);
-    this.emit({
-      type: result.status === 'completed' ? 'step.completed' : 'step.failed',
-      runId: result.runId,
-      seq: result.seq,
-      name: cp.name,
-      kind: cp.kind,
-      output: result.output,
-      error: result.error,
-      queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
-      durationMs: finishedAt.getTime() - startedAt.getTime(),
+    // Claimed, not blindly written: a duplicate delivery of a result settled its step first.
+    const claims = await this.savePendingCheckpoints(writes);
+    const settled: { index: number; cp: StepCheckpoint; result: StepResult }[] = [];
+    claims.forEach((claim, k) => {
+      const { index, cp } = pending[k] as { index: number; cp: StepCheckpoint };
+      if (claim === true) settled.push({ index, cp, result: results[index] as StepResult });
+      else if (claim !== false) outcomes[index] = claim;
     });
-    return !(await this.stepFanStillRunning(cp, result));
+    for (const { cp, result } of settled) {
+      this.noteSettledHere(`${runId}:${result.seq}`);
+      const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
+      this.emit({
+        type: result.status === 'completed' ? 'step.completed' : 'step.failed',
+        runId,
+        seq: result.seq,
+        name: cp.name,
+        kind: cp.kind,
+        output: result.output,
+        error: result.error,
+        queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
+        durationMs: finishedAt.getTime() - startedAt.getTime(),
+      });
+    }
+    // Asked after every write of the batch committed, so the batch holding a fan's last step sees
+    // the barrier open.
+    const barriers = new Map<number, Promise<boolean>>();
+    let carrier: number | undefined;
+    for (const { index, cp, result } of settled) {
+      if (!(await this.stepFanStillRunning(cp, result, barriers))) carrier = index;
+    }
+    if (carrier !== undefined) outcomes[carrier] = true;
+    return outcomes;
   }
 
   /**
    * The join barrier of a step fan: a result for one of its steps resumes the parent only once no
    * step of the fan is still `pending` (a settled wave), or on a failure (failFast surfaces it, and a
    * retry needs the parent to schedule it). Without it every result would replay the whole parent,
-   * which makes a fan of N steps cost O(N²) checkpoint reads.
+   * which makes a fan of N steps cost O(N²) checkpoint reads. `barriers` holds the answer per fan
+   * for the rest of a batch. A barrier that cannot be read counts as open: a spare resume replays and
+   * re-suspends, a lost one strands the run.
    */
-  private async stepFanStillRunning(cp: StepCheckpoint, result: StepResult): Promise<boolean> {
+  private async stepFanStillRunning(
+    cp: StepCheckpoint,
+    result: StepResult,
+    barriers: Map<number, Promise<boolean>>,
+  ): Promise<boolean> {
     const fan = parseStepFanGroup(cp.parallelGroup);
     if (!fan) return false;
     if (result.status === 'failed') return false;
-    const to = fan.firstSeq + fan.size - 1;
-    const pending = this.store.countCheckpoints
-      ? await this.store.countCheckpoints(result.runId, fan.firstSeq, to, ['pending'])
-      : (await this.store.listCheckpoints(result.runId)).filter(
-          (c) => c.seq >= fan.firstSeq && c.seq <= to && c.status === 'pending',
-        ).length;
-    if (pending > 0) return true;
+    let closed = barriers.get(fan.firstSeq);
+    if (!closed) {
+      closed = this.stepFanPending(result.runId, fan.firstSeq, fan.firstSeq + fan.size - 1).then(
+        (pending) => pending > 0,
+        () => false,
+      );
+      barriers.set(fan.firstSeq, closed);
+    }
+    if (await closed) return true;
     this.noteRecent(this.stepFansFiredHere, `${result.runId}:${fan.firstSeq}`);
     return false;
+  }
+
+  /** How many steps of a step fan's seq range are still `pending`. */
+  private async stepFanPending(runId: string, from: number, to: number): Promise<number> {
+    if (this.store.countCheckpoints) {
+      return this.store.countCheckpoints(runId, from, to, ['pending']);
+    }
+    return (await this.store.listCheckpoints(runId)).filter(
+      (c) => c.seq >= from && c.seq <= to && c.status === 'pending',
+    ).length;
   }
 
   /**

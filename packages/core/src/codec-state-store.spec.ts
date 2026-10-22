@@ -83,6 +83,38 @@ describe('CodecStateStore', () => {
     expect(new CodecStateStore(inner, wrapCodec).saveCheckpointIfPending).toBeUndefined();
   });
 
+  it('forwards the batched pending-only write, encoding every checkpoint', async () => {
+    const inner = new InMemoryStateStore();
+    const store = new CodecStateStore(inner, wrapCodec);
+    const at = new Date();
+    const pending = (seq: number) => ({
+      runId: 'r1',
+      seq,
+      name: 'charge',
+      kind: 'remote' as const,
+      stepId: `r1:${seq}`,
+      status: 'pending' as const,
+      attempts: 1,
+      enqueuedAt: at,
+      startedAt: at,
+      finishedAt: at,
+    });
+    await store.saveCheckpoint(pending(0));
+    await store.saveCheckpoint(pending(1));
+
+    const done = (seq: number) => ({ ...pending(seq), status: 'completed' as const, output: seq });
+    expect(await store.saveCheckpointsIfPending?.([done(0), done(1), done(2)])).toEqual([
+      true,
+      true,
+      false,
+    ]);
+    expect((await inner.getCheckpoint('r1', 1))?.output).toEqual({ __enc: JSON.stringify(1) });
+    expect((await store.getCheckpoint('r1', 1))?.output).toBe(1);
+
+    Object.defineProperty(inner, 'saveCheckpointsIfPending', { value: undefined });
+    expect(new CodecStateStore(inner, wrapCodec).saveCheckpointsIfPending).toBeUndefined();
+  });
+
   it('encodes payloads at rest and decodes them on read', async () => {
     const inner = new InMemoryStateStore();
     const store = new CodecStateStore(inner, wrapCodec);
