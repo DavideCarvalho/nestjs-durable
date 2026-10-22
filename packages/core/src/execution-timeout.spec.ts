@@ -41,6 +41,51 @@ describe('executionTimeout (sweepTimeouts)', () => {
     expect(old?.error?.code).toBe('execution_timeout');
     expect((await store.getRun('safe'))?.status).toBe('suspended');
   });
+
+  it('cancels a run that never started (pending) or cannot run (blocked), but not one compensating', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('slow', '1', async () => undefined, { executionTimeout: '1h' });
+
+    const at = new Date(1000);
+    for (const [id, status] of [
+      ['never-picked-up', 'pending'],
+      ['no-capable-worker', 'blocked'],
+      ['undoing', 'cancelling'],
+    ] as const) {
+      await store.createRun({
+        id,
+        workflow: 'slow',
+        workflowVersion: '1',
+        status,
+        input: {},
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+    // Same status, created after the deadline's cutoff: left alone.
+    const recent = new Date(1000 + 3_000_000);
+    await store.createRun({
+      id: 'young',
+      workflow: 'slow',
+      workflowVersion: '1',
+      status: 'pending',
+      input: {},
+      createdAt: recent,
+      updatedAt: recent,
+    });
+
+    await engine.sweepTimeouts(1000 + 3_700_000);
+
+    for (const id of ['never-picked-up', 'no-capable-worker']) {
+      const run = await store.getRun(id);
+      expect(run?.status).toBe('cancelled');
+      expect(run?.error?.code).toBe('execution_timeout');
+    }
+    // A compensating cancel finishes its saga undo and ends `cancelled` by itself.
+    expect((await store.getRun('undoing'))?.status).toBe('cancelling');
+    expect((await store.getRun('young'))?.status).toBe('pending');
+  });
 });
 
 /**

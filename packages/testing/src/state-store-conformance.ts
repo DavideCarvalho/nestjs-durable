@@ -1930,6 +1930,41 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.getRun('ghost-run')).toBeNull();
     });
 
+    t(
+      'times out every unfinished run of its workflow and namespace, except one compensating',
+      async () => {
+        // `sweepTimeouts` selects its candidates with ONE `listRuns({ workflow, statuses, namespace })`,
+        // so this is the store answering that combined filter, not just the engine deciding.
+        const engine = new WorkflowEngine({ store, namespace: 'alpha' });
+        engine.register('t-capped', '1', async () => undefined, { executionTimeout: '1h' });
+        const old = { workflow: 't-capped', namespace: 'alpha', createdAt: new Date(1000) };
+        await store.createRun(run({ ...old, id: 'tc-pending', status: 'pending' }));
+        await store.createRun(run({ ...old, id: 'tc-running', status: 'running' }));
+        await store.createRun(run({ ...old, id: 'tc-suspended', status: 'suspended' }));
+        await store.createRun(run({ ...old, id: 'tc-blocked', status: 'blocked' }));
+        await store.createRun(run({ ...old, id: 'tc-cancelling', status: 'cancelling' }));
+        await store.createRun(run({ ...old, id: 'tc-done', status: 'completed' }));
+        await store.createRun(
+          run({ ...old, id: 'tc-other-tenant', status: 'pending', namespace: 'beta' }),
+        );
+        await store.createRun(
+          run({ ...old, id: 'tc-other-workflow', status: 'pending', workflow: 't-uncapped' }),
+        );
+
+        await engine.sweepTimeouts(1000 + 3_700_000);
+
+        for (const id of ['tc-pending', 'tc-running', 'tc-suspended', 'tc-blocked']) {
+          const swept = await store.getRun(id);
+          expect(swept?.status, id).toBe('cancelled');
+          expect(swept?.error?.code, id).toBe('execution_timeout');
+        }
+        expect((await store.getRun('tc-cancelling'))?.status).toBe('cancelling');
+        expect((await store.getRun('tc-done'))?.status).toBe('completed');
+        expect((await store.getRun('tc-other-tenant'))?.status).toBe('pending');
+        expect((await store.getRun('tc-other-workflow'))?.status).toBe('pending');
+      },
+    );
+
     t('cancels a timed-out run’s live child subtree, not just the run itself', async () => {
       const engine = new WorkflowEngine({ store });
       // Only the parent is timed: a child reaching a terminal state can only be the cascade.

@@ -406,6 +406,10 @@ const SETTLE_ELIGIBLE_STATUSES: RunStatus[] = [
   'cancelling',
 ];
 
+/** The statuses {@link WorkflowEngine.sweepTimeouts} cancels once a run outlives its
+ *  `executionTimeout` — every unfinished one except `cancelling` (see the method for why). */
+const TIMEOUT_SWEPT_STATUSES: RunStatus[] = ['pending', 'running', 'suspended', 'blocked'];
+
 /**
  * The statuses a suspend (or a `blocked` park) may be written over: {@link SETTLE_ELIGIBLE_STATUSES}
  * minus `cancelling`, so a compensating cancel requested while the turn ran is not parked away as an
@@ -1873,6 +1877,15 @@ export class WorkflowEngine {
    * `execution_timeout` error (terminal, so a late step result can't resurrect it), AND its children
    * are cascaded exactly as an explicit {@link cancel} cascades them.
    *
+   * WHICH RUNS. Every run not yet finished, counted from `createdAt`: `pending` and `blocked` as well
+   * as `running` and `suspended`. A run nobody picks up (no worker on its queue) or nobody can run (no
+   * worker with its capabilities) is as stuck as one that hangs mid-body, and the cap is the backstop
+   * for exactly that — leaving them out meant a run that never started lived forever while one that
+   * started and hung was cut off. Cancelling one a worker is picking up at that moment is safe: the
+   * worker's settle only writes over a live status ({@link SETTLE_ELIGIBLE_STATUSES}), so it can't
+   * bring the run back. `cancelling` is left alone on purpose — a compensating cancel's saga undo is
+   * running, it ends `cancelled` by itself, and cutting it short would skip the undo.
+   *
    * WHY THE TERMINAL WRITE IS DIRECT, not a call to {@link cancel}. Two reasons, both still standing:
    * the run must land with the `execution_timeout` error `cancel` knows nothing about (`cancel` writes
    * a plain `cancelled`, and the code is what a dashboard/alert distinguishes a timeout by), and this
@@ -1885,8 +1898,8 @@ export class WorkflowEngine {
    * children kept running with the parent gone and nothing pointing at them — a silent orphan you
    * could only find by reading the runs table by hand. {@link cancelChildren} is the SAME recursive
    * walk `cancel` uses, so children of children go too, and it inherits that path's two guards:
-   * `cancel` returns early on a run that is already `completed`/`cancelled`/`dead` (a child that beat
-   * the sweep to the finish is never clobbered, and a re-cancel is a no-op), and it writes the
+   * `cancel` returns early on a run that is already terminal (a child that beat the sweep to the
+   * finish is never clobbered, and a re-cancel is a no-op), and it writes the
    * parent's terminal status BEFORE recursing, so a cyclic parent→child graph terminates on the
    * second visit instead of looping. Two pollers sweeping the same run concurrently therefore write
    * the same terminal state twice and cascade into already-cancelled children — idempotent, not
@@ -1902,18 +1915,11 @@ export class WorkflowEngine {
       if (this.draining) return;
       if (reg.executionTimeoutMs == null) continue;
       const deadline = now - reg.executionTimeoutMs;
-      const inflight = [
-        ...(await this.store.listRuns({
-          workflow: reg.name,
-          status: 'running',
-          namespace: this.namespace,
-        })),
-        ...(await this.store.listRuns({
-          workflow: reg.name,
-          status: 'suspended',
-          namespace: this.namespace,
-        })),
-      ];
+      const inflight = await this.store.listRuns({
+        workflow: reg.name,
+        statuses: TIMEOUT_SWEPT_STATUSES,
+        namespace: this.namespace,
+      });
       for (const run of inflight) {
         if (this.draining) return;
         if (run.createdAt.getTime() > deadline) continue;

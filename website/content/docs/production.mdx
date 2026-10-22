@@ -732,6 +732,23 @@ the timer poller cancels an overrunning run (status `cancelled`, reason `executi
 export class ApprovalWorkflow { /* … */ }
 ```
 
+**What counts.** The clock starts at the run's `createdAt`, so time spent waiting in the queue counts.
+Every run that hasn't finished is covered — `pending` (no worker has picked it up), `blocked` (no live
+worker has the capabilities it [requires](/docs/cluster/handshake)), `running` and `suspended` — because
+a run that never starts is as stuck as one that hangs halfway. Two consequences worth knowing:
+
+- A run in `cancelling` is left alone: its saga undo is running, and it ends `cancelled` on its own.
+- A delayed start (`startAt`) waits `suspended`, so its wait counts too. A `startAt` further out than
+  the timeout is cancelled before it ever runs.
+
+The timeout comes from the newest registered version of the workflow and applies to that workflow's runs
+of every version, so adding, raising or removing it on a new version also changes it for in-flight runs
+of older ones. The sweep only covers runs in the engine's own [namespace](/docs/concepts/tenancy).
+
+A timeout is reported like any cancel: the run is `cancelled`, its `error.code` is `execution_timeout`,
+and the engine emits `run.failed` — the event every cancellation emits. Alert on the code, not on the
+event type.
+
 A timed-out run takes its **children** with it, the same way an explicit `cancel` does — the whole
 subtree, depth-first, skipping any child that already finished. Otherwise a child outlives the parent
 that spawned it with nothing left pointing at it, and the only way to find it is to read the runs
