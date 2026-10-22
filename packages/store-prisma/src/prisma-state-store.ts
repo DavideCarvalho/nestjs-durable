@@ -1005,7 +1005,7 @@ function toRunData(run: WorkflowRun) {
     // An absent namespace IS `'default'` — unlike `origin` below, this is a reconstruction and not a
     // guess: an engine started without a namespace stamps its runs and routes its workers as
     // `'default'`, so writing anything else (or NULL) would put the run in a partition no worker polls.
-    namespace: run.namespace ?? 'default',
+    namespace: run.namespace || 'default', // '' is the default pool too
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
     createdAt: run.createdAt,
@@ -1040,7 +1040,7 @@ function toRunPatch(patch: Partial<WorkflowRun>) {
   // run's namespace means "back to the unscoped partition", which is what `'default'` names. A patch
   // that does not mention `namespace` leaves the stored one alone — a status update must never move a
   // run between tenants.
-  if ('namespace' in patch) data.namespace = patch.namespace ?? 'default';
+  if ('namespace' in patch) data.namespace = patch.namespace || 'default';
   if ('origin' in patch) data.origin = patch.origin ?? null;
   if (patch.createdAt != null) data.createdAt = patch.createdAt;
   if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;

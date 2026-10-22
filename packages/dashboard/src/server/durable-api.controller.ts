@@ -272,7 +272,7 @@ export class DurableApiController {
   @Post('webhooks/:token')
   async webhook(@Param('token') token: string, @Body() body: unknown) {
     const result = await this.dashboard.deliverWebhook(token, body);
-    if (!result) throw new NotFoundException(`no run is waiting on webhook ${token}`);
+    if (!result) throw new NotFoundException(`no live run is waiting for webhook ${token}`);
     return result;
   }
 

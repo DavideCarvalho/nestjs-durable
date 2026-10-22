@@ -20,9 +20,11 @@ import {
   type ScheduleDescription,
   type ScheduleListQuery,
   type StateStore,
+  TERMINAL_RUN_STATUSES,
   type UpdateResult,
   WorkflowEngine,
   collectMetrics,
+  parseWebhookToken,
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { Observable } from 'rxjs';
@@ -234,11 +236,30 @@ export class DashboardService {
 
   /**
    * Deliver a `ctx.webhook()` callback: turn an inbound POST (token + body) into the signal the
-   * waiting run is parked on. Returns the run result, or `null` if no run waits on that token (a
-   * stale/duplicate callback) — a safe no-op the controller maps to 404. Control-plane-only.
+   * run is (or will be) parked on. A callback that arrives BEFORE the run reaches `wait()` (the url
+   * was handed out and the run is still busy or sleeping) is buffered, and `wait()` consumes it, so
+   * the result is the run's current status. Returns `null` — mapped to 404 by the controller — for a
+   * token that is not a webhook token, whose run doesn't exist or is terminal, or whose wait already
+   * resolved (a duplicate): nothing is buffered for those, so a public endpoint can't leave junk
+   * rows behind or signal non-webhook tokens. Control-plane-only.
    */
   async deliverWebhook(token: string, body: unknown): Promise<RunResult | null> {
-    return this.controlPlane().engine.signal(token, body);
+    const { store, engine } = this.controlPlane();
+    const parsed = parseWebhookToken(token);
+    if (!parsed) return null;
+    const run = await store.getRun(parsed.runId);
+    if (!run || TERMINAL_RUN_STATUSES.includes(run.status)) return null;
+    const resolved = await store.getCheckpoint(parsed.runId, parsed.seq);
+    if (resolved?.status === 'completed') return null;
+    const delivered = await engine.signal(token, body);
+    if (delivered) return delivered;
+    // Buffered. A concurrent duplicate may have resolved the wait between the check above and our
+    // buffer write: then nothing will ever read this row, so take it back and answer 404. (If the
+    // take finds nothing, the waiter consumed our payload itself — a real delivery.)
+    const now = await store.getCheckpoint(parsed.runId, parsed.seq);
+    if (now?.status === 'completed' && (await store.takeBufferedSignal(token))) return null;
+    const fresh = await store.getRun(parsed.runId);
+    return { runId: run.id, status: fresh?.status ?? run.status };
   }
 
   /** Side-effect-free read of a value a run published via `ctx.setEvent` (a live query). Control-plane-only. */

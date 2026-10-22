@@ -841,7 +841,7 @@ export class MikroOrmStateStore implements StateStore {
     expectedNextFireAt?: number | null,
   ): Promise<boolean> {
     const data: Record<string, unknown> = {};
-    if (patch.namespace !== undefined) data.namespace = patch.namespace;
+    if (patch.namespace !== undefined) data.namespace = patch.namespace || 'default';
     if (patch.workflow !== undefined) data.workflow = patch.workflow;
     if (patch.paused !== undefined) data.paused = patch.paused;
     if ('nextFireAt' in patch) data.nextFireAt = patch.nextFireAt ?? null;
@@ -1205,7 +1205,7 @@ function runUpdateData(patch: Partial<WorkflowRun>): Record<string, unknown> {
   if ('searchAttributes' in patch) data.searchAttributes = patch.searchAttributes ?? null;
   if ('priority' in patch) data.priority = patch.priority ?? null;
   // The column is the isolation predicate: a cleared namespace lands on 'default', never NULL.
-  if ('namespace' in patch) data.namespace = patch.namespace ?? 'default';
+  if ('namespace' in patch) data.namespace = patch.namespace || 'default';
   if ('origin' in patch) data.origin = patch.origin ?? null;
   if (patch.createdAt != null) data.createdAt = patch.createdAt;
   if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;
@@ -1232,7 +1232,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   e.tags = run.tags ?? null;
   e.searchAttributes = run.searchAttributes ?? null;
   e.priority = run.priority ?? null;
-  e.namespace = run.namespace ?? 'default';
+  e.namespace = run.namespace || 'default'; // '' is the default pool too
   // NOT `?? 'default'` like the line above: an absent origin is genuinely UNKNOWN and must stay NULL
   // (see the column's docblock in ./entities). `null` — not left-undefined — so `Object.assign` in
   // updateRun writes SQL NULL rather than skipping the column.

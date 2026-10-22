@@ -264,3 +264,22 @@ describe('DrizzleStateStore namespace', () => {
     sqlite.close();
   });
 });
+
+describe("Drizzle store — '' is the default pool", () => {
+  it("writes '' as 'default' and folds legacy '' rows into the default pool", async () => {
+    const { store, sqlite } = makeStore();
+    await store.createRun(run({ id: 'blank', namespace: '' }));
+    expect((await store.getRun('blank'))?.namespace).toBe('default');
+
+    // A legacy row an engine configured with `namespace: ''` wrote before the normalisation.
+    sqlite.exec(
+      "INSERT INTO durable_workflow_runs (id, workflow, workflow_version, status, namespace, created_at, updated_at) VALUES ('legacy', 'checkout', '1', 'pending', '', 0, 0)",
+    );
+    expect((await store.getRun('legacy'))?.namespace).toBe('default');
+    expect((await store.listPendingRuns(10, 'default')).map((r) => r.id).sort()).toEqual([
+      'blank',
+      'legacy',
+    ]);
+    expect(await store.listPendingRuns(10, 'acme')).toEqual([]);
+  });
+});

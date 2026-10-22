@@ -87,6 +87,8 @@ const RESULT_JOB_OPTIONS = {
 
 // Default `pingIntervalMs` (see `BullMQTransportOptions`) for the shared subscriber watchdog.
 const DEFAULT_PING_INTERVAL_MS = 30_000;
+/** The largest delay `setTimeout`/`setInterval` honour (a signed 32-bit int); above it Node uses 1ms. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 // How long a single watchdog PING may take before its subscriber connection is presumed dead.
 const SUBSCRIBER_PING_TIMEOUT_MS = 5_000;
 // Belt-and-suspenders TCP keepalive (ms) applied to connections THIS transport builds itself (see
@@ -126,12 +128,17 @@ async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
 
 /**
  * Normalise the `pingIntervalMs` option: `undefined` → the default interval, `0`/`false` → disabled
- * (the watchdog never starts), any other number → itself (verbatim, including a caller's smaller
- * interval for short-lived tests).
+ * (the watchdog never starts), a positive finite number up to the timer limit → itself (verbatim,
+ * including a caller's smaller interval for short-lived tests). Anything else (negative, NaN,
+ * Infinity, above 2^31-1) → the default: Node clamps such a `setInterval` delay to 1ms, which would
+ * PING every subscriber about every millisecond.
  */
 function normalizePingInterval(value: number | false | undefined): number | false {
   if (value === undefined) return DEFAULT_PING_INTERVAL_MS;
   if (value === false || value === 0) return false;
+  if (!Number.isFinite(value) || value < 0 || value > MAX_TIMER_DELAY_MS) {
+    return DEFAULT_PING_INTERVAL_MS;
+  }
   return value;
 }
 
@@ -296,7 +303,8 @@ export interface BullMQTransportOptions {
    * subscriber mode; a rejection or timeout means the connection is dead, so we `disconnect(true)`
    * it — ioredis's `retryStrategy` reconnects and `autoResubscribe` (default `true`) resubscribes
    * every channel automatically. Pass `0` or `false` to disable the watchdog entirely (e.g. a
-   * short-lived test where the interval would otherwise outlive the test). Default `30_000`.
+   * short-lived test where the interval would otherwise outlive the test). Default `30_000`; a
+   * negative, NaN, infinite or above-2^31-1 value also falls back to the default.
    */
   pingIntervalMs?: number | false;
   /**
@@ -666,7 +674,20 @@ export class BullMQTransport implements Transport, ControlPlane {
     if (this.decisionsWorker) return;
     this.decisionsWorker = this.makeWorker(this.decisionsName(), async (job) => {
       const decision = job.data as WorkflowDecision;
-      await Promise.all([...this.decisionHandlers].map((h) => h(decision)));
+      // Every handler, concurrently, and ALL settle before a failure fails (and redelivers) the job:
+      // with `Promise.all` the redelivery started while the other handlers were still running, so
+      // they ran again concurrently with themselves, and only the first failure was reported. The
+      // extra failures are logged; the first is rethrown so BullMQ retries (safe: the engine applies
+      // a decision at most once, fenced by its task id).
+      const settled = await Promise.allSettled([...this.decisionHandlers].map((h) => h(decision)));
+      const failures = settled.flatMap((r) => (r.status === 'rejected' ? [r.reason] : []));
+      if (failures.length === 0) return;
+      for (const err of failures.slice(1)) {
+        console.warn(
+          `[nestjs-durable] bullmq decision handler failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      throw failures[0];
     });
   }
 
@@ -1147,7 +1168,15 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.subscribeQuietly(this.heartbeatSub, this.heartbeatChannel());
     this.heartbeatSub.on('message', (_channel, payload) => {
       try {
-        void handler(JSON.parse(payload) as Heartbeat);
+        // The engine's handler writes to the store: report a rejection, never leave it unhandled
+        // (fatal under Node's default `--unhandled-rejections=throw`).
+        void handler(JSON.parse(payload) as Heartbeat).catch((err: unknown) => {
+          console.warn(
+            `[nestjs-durable] heartbeat handler failed (the next beat retries): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
       } catch {
         /* ignore malformed heartbeats */
       }
