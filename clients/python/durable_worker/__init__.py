@@ -99,4 +99,16 @@ __all__ = [
     "StepFailed",
     "GatherFailed",
 ]
-__version__ = "0.23.0"
+def _installed_version() -> str:
+    """The installed distribution's version, so the SDK version a worker announces in its handshake
+    descriptor is the one actually running. ``0.0.0`` when run from a source tree that was never
+    installed."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("durable-worker")
+    except PackageNotFoundError:
+        return "0.0.0"
+
+
+__version__ = _installed_version()
