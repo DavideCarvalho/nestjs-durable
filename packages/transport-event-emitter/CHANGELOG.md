@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-transport-event-emitter
 
+## 0.5.2
+
+### Patch Changes
+
+- [#394](https://github.com/DavideCarvalho/nestjs-durable/pull/394) [`3d29adb`](https://github.com/DavideCarvalho/nestjs-durable/commit/3d29adb1beb50a1db24efff1e798b97c6730d9f4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A result or heartbeat handler that rejects no longer becomes an unhandled rejection (fatal under Node's default). The error goes to the new `onError` option (`new EventEmitterTransport(emitter, { onError })`, default `console.error`), and a failed result is redelivered with backoff (100ms doubling, capped at 5s) until `close()` instead of being lost. Adds `close()`.
+
 ## 0.5.1
 
 ### Patch Changes
