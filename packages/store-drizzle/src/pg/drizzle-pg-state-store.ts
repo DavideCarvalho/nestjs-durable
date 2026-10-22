@@ -382,6 +382,24 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const rows = await this.db
+      .select()
+      .from(workflowRuns)
+      .where(
+        and(
+          inArray(workflowRuns.status, ['running', 'cancelling']),
+          or(isNull(workflowRuns.lockedUntil), lte(workflowRuns.lockedUntil, new Date(nowMs))),
+          namespaceFilter(namespace),
+          this.scope(),
+        ),
+      )
+      .orderBy(asc(workflowRuns.createdAt))
+      .limit(limit);
+    return rows.map(fromRunRow);
+  }
+
   /** FIFO pick-up, served by `durable_workflow_runs_namespace_status_idx`. The engine then leases
    *  each run with {@link tryLockRun}; the listing itself takes no locks (it runs outside a tx). */
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {

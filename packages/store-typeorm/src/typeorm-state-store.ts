@@ -346,6 +346,28 @@ export class TypeOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const now = new Date(nowMs);
+    const rows = await this.runs().find({
+      where: [
+        {
+          status: In(['running', 'cancelling']),
+          lockedUntil: IsNull(),
+          ...(namespace !== undefined ? { namespace } : {}),
+        },
+        {
+          status: In(['running', 'cancelling']),
+          lockedUntil: LessThanOrEqual(now),
+          ...(namespace !== undefined ? { namespace } : {}),
+        },
+      ],
+      order: { createdAt: 'ASC' },
+      take: limit,
+    });
+    return rows.map(fromRunEntity);
+  }
+
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.runs().find({
       where: { status: 'pending', ...(namespace !== undefined ? { namespace } : {}) },

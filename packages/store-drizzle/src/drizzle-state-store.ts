@@ -388,6 +388,23 @@ export class DrizzleStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const rows = await this.db
+      .select()
+      .from(workflowRuns)
+      .where(
+        and(
+          inArray(workflowRuns.status, ['running', 'cancelling']),
+          or(isNull(workflowRuns.lockedUntil), lte(workflowRuns.lockedUntil, nowMs)),
+          namespaceFilter(namespace),
+        ),
+      )
+      .orderBy(asc(workflowRuns.createdAt))
+      .limit(limit);
+    return rows.map(fromRunRow);
+  }
+
   /** Dispatch pick-up. Namespace-scoped — without it a worker serving one tenant drains another
    *  tenant's queue, and the `limit` makes it worse: foreign runs consume the FIFO budget. */
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {

@@ -403,6 +403,9 @@ const SUSPEND_ELIGIBLE_STATUSES: RunStatus[] = SETTLE_ELIGIBLE_STATUSES.filter(
   (status) => status !== 'cancelling',
 );
 
+/** How many orphaned runs one {@link WorkflowEngine.recoverIncomplete} pass asks the store for. */
+const RECOVERY_BATCH = 500;
+
 /** See `WorkflowEngine.runGates`. */
 interface RunGate {
   /** The last execution chained for the run in this process: the one running, or the queued one. */
@@ -1913,7 +1916,7 @@ export class WorkflowEngine {
   async recoverIncomplete(nowMs: number = this.clock()): Promise<RunResult[]> {
     if (this.draining) return [];
     const results: RunResult[] = [];
-    for (const listed of await this.store.listIncompleteRuns(this.namespace)) {
+    for (const listed of await this.orphanedRuns(nowMs)) {
       if (this.draining) break;
       // An IN-PROCESS turn renews its lease, so an acquirable lease means no turn is executing this
       // run right now. Skip the ones still owned. NOTE this is NOT the same as "the worker crashed" —
@@ -1988,6 +1991,26 @@ export class WorkflowEngine {
       });
     }
     return results;
+  }
+
+  /**
+   * The runs {@link recoverIncomplete} should try to reclaim: incomplete runs whose lease is free or
+   * expired, never the healthy ones a live turn is renewing. Every worker runs recovery on every
+   * timer tick, so listing every running run and lock-probing each (one doomed UPDATE per healthy
+   * run per worker per tick) was pure database load. The store answers it directly when it can
+   * ({@link StateStore.listOrphanedRuns}, bounded by {@link RECOVERY_BATCH}); else the full list is
+   * filtered here, which still spares the probes. Shuffled, like the due-timer pass, so instances
+   * recovering at once spread over the batch instead of contending for the same leases.
+   */
+  private async orphanedRuns(nowMs: number): Promise<WorkflowRun[]> {
+    if (this.store.listOrphanedRuns) {
+      return shuffle(await this.store.listOrphanedRuns(nowMs, RECOVERY_BATCH, this.namespace));
+    }
+    return shuffle(
+      (await this.store.listIncompleteRuns(this.namespace)).filter(
+        (run) => run.lockedUntil == null || run.lockedUntil <= nowMs,
+      ),
+    );
   }
 
   /**

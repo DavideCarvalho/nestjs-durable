@@ -222,6 +222,19 @@ export class InMemoryStateStore implements StateStore {
     });
   }
 
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    return [...this.runs.values()]
+      .filter(
+        (r) =>
+          (r.status === 'running' || r.status === 'cancelling') &&
+          (r.lockedUntil == null || r.lockedUntil <= nowMs) &&
+          (namespace === undefined || r.namespace === namespace),
+      )
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .slice(0, Math.max(0, limit))
+      .map((r) => ({ ...r }));
+  }
+
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
     return [...this.runs.values()]
       .filter(

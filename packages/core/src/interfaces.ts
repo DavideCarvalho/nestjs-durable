@@ -415,6 +415,17 @@ export interface StateStore {
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
 
+  /**
+   * The ORPHANS a periodic recovery pass should reclaim: {@link listIncompleteRuns}'s runs
+   * (`running` or `cancelling`) whose lease is free (`lockedUntil` unset or `<= nowMs`), oldest
+   * (`createdAt`) first, at most `limit`. When `namespace` is given, restricted to that partition.
+   *
+   * Optional but recommended: without it the engine lists every incomplete run and filters the
+   * leases in process, which on a busy fleet reads every healthy running run once per tick per
+   * worker.
+   */
+  listOrphanedRuns?(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]>;
+
   /** The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. */
   listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]>;
 

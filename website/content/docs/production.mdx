@@ -51,7 +51,10 @@ before you rely on it:
   `TimerPoller` calls it every tick (alongside `resumeDueTimers`/`sweepTimeouts`) — this is what turns
   a 30-second lease into a real self-healing loop instead of a recovery that only fires once per
   deploy. Make sure **every** operator instance runs the module (and isn't started with
-  `drive: false`) so the poller is actually ticking somewhere.
+  `drive: false`) so the poller is actually ticking somewhere. Each pass asks the store only for
+  orphans (`listOrphanedRuns`: incomplete runs whose lease is free or expired, at most 500 per pass),
+  so a fleet with thousands of healthy running runs costs one indexed query per tick, not a read and
+  a lock attempt per run.
 - **Exactly one instance per run, by an atomic lease.** `StateStore.tryLockRun` is how the engine
   picks a single owner for a `running` run even with several replicas racing to recover it — there's
   no split-brain double-resume.

@@ -76,6 +76,26 @@ describe('CodecStateStore', () => {
     expect(new CodecStateStore(inner, wrapCodec).updateRunIf).toBeUndefined();
   });
 
+  it('forwards the orphan listing, decoding the runs', async () => {
+    const inner = new InMemoryStateStore();
+    const store = new CodecStateStore(inner, wrapCodec);
+    const now = new Date();
+    await store.createRun({
+      id: 'r1',
+      workflow: 'wf',
+      workflowVersion: '1',
+      status: 'running',
+      input: { secret: 'value' },
+      createdAt: now,
+      updatedAt: now,
+    });
+    const orphans = await store.listOrphanedRuns?.(now.getTime(), 10);
+    expect(orphans?.map((r) => r.input)).toEqual([{ secret: 'value' }]);
+
+    Object.defineProperty(inner, 'listOrphanedRuns', { value: undefined });
+    expect(new CodecStateStore(inner, wrapCodec).listOrphanedRuns).toBeUndefined();
+  });
+
   it('forwards the pending-only checkpoint write, encoding it like a plain save', async () => {
     const inner = new InMemoryStateStore();
     const store = new CodecStateStore(inner, wrapCodec);

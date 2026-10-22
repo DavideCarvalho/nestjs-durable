@@ -71,6 +71,14 @@ export class CodecStateStore implements StateStore {
    *  engine's per-run fallback still kicks in through the wrapper. */
   readonly deleteRuns?: (runIds: string[]) => Promise<void>;
 
+  /** Decodes the runs like {@link listIncompleteRuns}. Bound only when the inner store has it, so
+   *  the engine's list-and-filter fallback still kicks in through the wrapper. */
+  readonly listOrphanedRuns?: (
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+  ) => Promise<WorkflowRun[]>;
+
   /** Encodes the patch like {@link updateRun}. Bound only when the inner store has it, so the
    *  engine's read-then-write fallback still kicks in through the wrapper. */
   readonly updateRunIf?: (
@@ -146,6 +154,12 @@ export class CodecStateStore implements StateStore {
     if (inner.tryAdmitSingleton) this.tryAdmitSingleton = inner.tryAdmitSingleton.bind(inner);
     const deleteRuns = inner.deleteRuns;
     if (deleteRuns) this.deleteRuns = (ids) => deleteRuns.call(inner, ids);
+    const orphans = inner.listOrphanedRuns;
+    if (orphans)
+      this.listOrphanedRuns = async (nowMs, limit, namespace) =>
+        (await orphans.call(inner, nowMs, limit, namespace)).map(
+          (r) => this.decRun(r) as WorkflowRun,
+        );
     const updateIf = inner.updateRunIf;
     if (updateIf)
       this.updateRunIf = (runId, expected, patch) =>

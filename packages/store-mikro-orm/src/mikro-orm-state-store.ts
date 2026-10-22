@@ -389,6 +389,21 @@ export class MikroOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const em = this.fork();
+    const rows = await em.find(
+      WorkflowRunEntity,
+      {
+        status: { $in: ['running', 'cancelling'] },
+        $or: [{ lockedUntil: null }, { lockedUntil: { $lte: new Date(nowMs) } }],
+        ...(namespace !== undefined ? { namespace } : {}),
+      },
+      { orderBy: { createdAt: 'ASC' }, limit: limit },
+    );
+    return rows.map(fromRunEntity);
+  }
+
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const em = this.fork();
     const rows = await em.find(

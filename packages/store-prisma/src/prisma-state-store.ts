@@ -397,6 +397,20 @@ export class PrismaStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const rows = await this.db.durableWorkflowRun.findMany({
+      where: {
+        status: { in: ['running', 'cancelling'] },
+        OR: [{ lockedUntil: null }, { lockedUntil: { lte: new Date(nowMs) } }],
+        ...namespaceWhere(namespace),
+      },
+      orderBy: { createdAt: 'asc' },
+      take: limit,
+    });
+    return rows.map(fromRunRow);
+  }
+
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.db.durableWorkflowRun.findMany({
       where: { status: 'pending', ...namespaceWhere(namespace) },
