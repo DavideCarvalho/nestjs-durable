@@ -12,7 +12,7 @@ import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 const NOW = 1_000_000;
 
-function seed(store: InMemoryStateStore): Promise<void[]> {
+async function seed(store: InMemoryStateStore): Promise<void> {
   const base = (id: string, over: Partial<WorkflowRun>): WorkflowRun => ({
     id,
     workflow: 'wf',
@@ -29,7 +29,7 @@ function seed(store: InMemoryStateStore): Promise<void[]> {
   }
   runs.push(base('crashed', { lockedBy: 'dead', lockedUntil: NOW - 1 }));
   runs.push(base('never-leased', {}));
-  return Promise.all(runs.map((r) => store.createRun(r)));
+  await Promise.all(runs.map((r) => store.createRun(r)));
 }
 
 /** The in-memory store without `listOrphanedRuns`, as a third-party store that predates it. */
