@@ -328,6 +328,9 @@ importers:
       '@dudousxd/nestjs-durable-dashboard':
         specifier: workspace:*
         version: link:../dashboard
+      '@dudousxd/nestjs-durable-testing':
+        specifier: workspace:^
+        version: link:../testing
       '@dudousxd/nestjs-durable-transport-bullmq':
         specifier: workspace:*
         version: link:../transport-bullmq
@@ -2291,6 +2294,7 @@ packages:
   '@opentelemetry/sdk-trace-base@1.30.1':
     resolution: {integrity: sha512-jVPgBbH1gCy2Lb7X0AVQ8XAfgg0pJ4nvl8/IiQA6nxOsPvS+0zMJaFSs2ltXe0J6C8dqjcnpyqINDJmU30+uOg==}
     engines: {node: '>=14'}
+    deprecated: Use @opentelemetry/sdk-trace package
     peerDependencies:
       '@opentelemetry/api': '>=1.0.0 <1.10.0'
 
