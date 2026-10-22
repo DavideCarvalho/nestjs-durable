@@ -23,8 +23,9 @@ infrastructure (in-process transport, in-memory store) — swap the store/transp
 
 ## Setup
 
-Install the module plus its core peer, a transport, and zod (optional `@Step({ input, output })`
-runtime schemas use it):
+Install the module plus its core peer, a transport, and a schema library (optional —
+`@Step({ input, output })` / `@Workflow({ input, output })` runtime schemas take a Standard Schema
+such as zod, or a class-validator DTO class):
 
 ```bash
 pnpm add @dudousxd/nestjs-durable @dudousxd/nestjs-durable-core \
