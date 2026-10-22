@@ -91,6 +91,182 @@ def _to_error(err: Exception) -> Dict[str, Any]:
     return out
 
 
+
+_ON_ERROR_CODES = "__durable_on_error__"
+_WORKFLOW_NAME = "__durable_workflow__"
+
+
+def _resolve_code(code: Any) -> Optional[str]:
+    """An on_error ``code``: a string, an exception class's ``code`` attribute, or ``None`` (catch-all)."""
+    resolved = code if code is None or isinstance(code, str) else getattr(code, "code", None)
+    if code is not None and not isinstance(resolved, str):
+        raise ValueError(
+            f"on_error({code!r}): an exception class needs a `code` attribute; or pass the code string"
+        )
+    return resolved
+
+
+def _add_on_error_route(
+    owner: Any, name: str, handler_name: str, handler: Callable[..., Any], code: Optional[str]
+) -> None:
+    """Register ``handler`` as the workflow ``handler_name`` on ``owner`` and add the route to it, for
+    ``code``, to the workflow ``name``'s announced ``on_error``. The engine routes the failure; this only
+    declares and announces it. The handler is announced with the workflow's version and origin."""
+    meta = owner._workflow_meta.setdefault(name, {})
+    routes = meta.setdefault("on_error", [])
+    if any(r.get("code") == code for r in routes):
+        which = "without a code" if code is None else f'for code "{code}"'
+        raise ValueError(f"workflow {name}: more than one on_error route {which}")
+    route = {"workflow": handler_name}
+    if code is not None:
+        route = {"code": code, **route}
+    routes.append(route)
+    owner._workflows[handler_name] = handler
+    announced = {k: meta[k] for k in ("version", "origin") if k in meta}
+    if announced:
+        owner._workflow_meta[handler_name] = announced
+
+
+def _inline_on_error(owner: Any, name: str, fn: Callable[..., Any]) -> None:
+    """Give a registered workflow function ``fn.on_error(code)``: a decorator that registers the decorated
+    function as the workflow ``<name>.onError.<function>`` and routes ``code`` to it, like a Nest
+    ``@OnError`` method. Stack the decorator to give one handler several codes."""
+
+    def on_error(code: Any = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        resolved = _resolve_code(code)
+
+        def register(handler: Callable[..., Any]) -> Callable[..., Any]:
+            _add_on_error_route(owner, name, f"{name}.onError.{handler.__name__}", handler, resolved)
+            return handler
+
+        return register
+
+    fn.on_error = on_error  # type: ignore[attr-defined]
+
+
+def on_error(code: Any = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Mark a method of a workflow class as the handler for that workflow's failures with ``code`` (a
+    code string, an exception class with a ``code`` attribute, or nothing for the catch-all). When the
+    class is registered, the method becomes the workflow ``<name>.onError.<method>``, bound to the
+    instance, and the route to it is announced. Stack it to give one method several codes::
+
+        @worker.workflow("line")
+        class LineWorkflow:
+            def run(self, ctx, line): ...
+
+            @on_error(InvalidLine)
+            def reject_line(self, ctx, failure): ...
+    """
+    resolved = _resolve_code(code)
+
+    def mark(method: Callable[..., Any]) -> Callable[..., Any]:
+        setattr(method, _ON_ERROR_CODES, [*getattr(method, _ON_ERROR_CODES, ()), resolved])
+        return method
+
+    return mark
+
+
+_WORKFLOW_META = "__durable_workflow_meta__"
+
+
+def _workflow_meta(
+    version: Optional[str],
+    requires: Optional[List[str]],
+    origin: Optional[str],
+    on_error: Optional[List[Dict[str, str]]],
+) -> Dict[str, Any]:
+    """The announcement a workflow registration carries; an option left out is not stated."""
+    meta: Dict[str, Any] = {}
+    if version is not None:
+        meta["version"] = version
+    if requires is not None:
+        meta["requires"] = list(requires)
+    if origin is not None:
+        meta["origin"] = origin
+    if on_error is not None:
+        meta["on_error"] = [dict(route) for route in on_error]
+    return meta
+
+
+def workflow(
+    name: str,
+    *,
+    version: Optional[str] = None,
+    requires: Optional[List[str]] = None,
+    origin: Optional[str] = None,
+    on_error: Optional[List[Dict[str, str]]] = None,
+) -> Callable[[type], type]:
+    """Declare a class as the workflow ``name``, with what a worker announces about it (the same
+    options as ``Worker.workflow``). It registers nothing: hand an instance to ``worker.register`` —
+    built with whatever the class needs — or the class itself when it takes no arguments::
+
+        @workflow("line", version="2")
+        class LineWorkflow:
+            def __init__(self, config): ...
+            def run(self, ctx, line): ...
+
+            @on_error(InvalidLine)
+            def reject_line(self, ctx, failure): ...
+
+        worker.register(LineWorkflow(config))
+
+    The class is a workflow reference from here on, for ``ctx.start_child`` / ``ctx.all_settled``."""
+
+    def declare(cls: type) -> type:
+        setattr(cls, _WORKFLOW_NAME, name)
+        setattr(cls, _WORKFLOW_META, _workflow_meta(version, requires, origin, on_error))
+        return cls
+
+    return declare
+
+
+def _register_workflow(owner: Any, name: str, target: Any, meta: Dict[str, Any]) -> Any:
+    """Register ``target`` as the workflow ``name`` on ``owner``. A function is the body and gets
+    ``.on_error(code)`` for an inline handler. A class (built with no arguments) or an instance of one
+    contributes its ``run`` as the body and its ``@on_error`` methods, bound to the instance, as its
+    handlers; the class is stamped with its name so it serves as a workflow reference."""
+    if meta:
+        owner._workflow_meta[name] = meta
+    if not inspect.isclass(target) and not callable(getattr(target, "run", None)):
+        owner._workflows[name] = target
+        _inline_on_error(owner, name, target)
+        return target
+    cls = target if inspect.isclass(target) else type(target)
+    instance = target() if inspect.isclass(target) else target
+    body = getattr(instance, "run", None)
+    if not callable(body):
+        raise TypeError(f"workflow class {cls.__name__} needs a run(self, ctx, input) method")
+    owner._workflows[name] = body
+    for attr in dir(cls):
+        codes = getattr(getattr(cls, attr, None), _ON_ERROR_CODES, None)
+        if not codes:
+            continue
+        handler = getattr(instance, attr)
+        for code in codes:
+            _add_on_error_route(owner, name, f"{name}.onError.{attr}", handler, code)
+    setattr(cls, _WORKFLOW_NAME, name)
+    return target
+
+
+def _register_declared(owner: Any, target: Any) -> Any:
+    """``worker.register``: a class declared with :func:`workflow`, or an instance of one."""
+    cls = target if inspect.isclass(target) else type(target)
+    name = getattr(cls, _WORKFLOW_NAME, None)
+    if not isinstance(name, str):
+        raise TypeError(f"{cls.__name__} is not declared with @workflow(name)")
+    return _register_workflow(owner, name, target, dict(getattr(cls, _WORKFLOW_META, {})))
+
+
+def workflow_name(workflow: Any) -> str:
+    """The registered name of a workflow reference: a name string, or a registered workflow class."""
+    if isinstance(workflow, str):
+        return workflow
+    name = getattr(workflow, _WORKFLOW_NAME, None)
+    if not isinstance(name, str):
+        raise TypeError(f"{workflow!r} is not a registered workflow (pass its name, or register the class)")
+    return name
+
+
 class WorkflowContext:
     """The replay context handed to a workflow function. Its ops are deterministic: same code + same
     history ⇒ same seqs ⇒ same decisions."""
@@ -526,8 +702,10 @@ class WorkflowContext:
         self.commands.append({"kind": "waitSignal", "seq": seq, "signal": name})
         raise _Suspend()
 
-    def start_child(self, workflow: str, input: Any = None) -> Any:
-        """Start a child run and await its output (its own durable lifecycle)."""
+    def start_child(self, workflow: Any, input: Any = None) -> Any:
+        """Start a child run and await its output (its own durable lifecycle). ``workflow`` is a name or
+        a registered workflow class."""
+        workflow = workflow_name(workflow)
         seq = self._next()
         found, output = self._replay(seq, "child", workflow)
         if found:
@@ -539,7 +717,7 @@ class WorkflowContext:
 
     def gather_children(
         self,
-        workflow: str,
+        workflow: Any,
         inputs: "List[Any]",
         mode: str = "wait_all",
     ) -> "List[Any]":
@@ -557,12 +735,13 @@ class WorkflowContext:
         idempotent on the engine (a child has no history entry until it settles) — same contract as
         the single ``start_child``.
         """
+        workflow = workflow_name(workflow)
         _, histories = self._child_fan(workflow, inputs, mode)
         if not histories:
             return []
         return self._aggregate(histories, lambda _ev: workflow)
 
-    def all_settled(self, workflow: str, inputs: "List[Any]") -> "List[Dict[str, Any]]":
+    def all_settled(self, workflow: Any, inputs: "List[Any]") -> "List[Dict[str, Any]]":
         """:meth:`gather_children` that never raises for a failed child: waits for every child to
         settle, then returns one dict per input, in input order — the twin of the TS
         ``ctx.allSettled``. Same fan as ``gather_children`` in ``wait_all`` mode (seqs, ``startChild``
@@ -573,7 +752,7 @@ class WorkflowContext:
         ``code`` and ``details`` when the child's error carries them. The id is the child run id the
         engine mints for a worker's ``startChild``.
         """
-        seqs, histories = self._child_fan(workflow, inputs, "wait_all")
+        seqs, histories = self._child_fan(workflow_name(workflow), inputs, "wait_all")
         return _settled(seqs, histories, lambda seq: f"{self.run_id}.child.{seq}")
 
     def _child_fan(
@@ -820,29 +999,25 @@ class WorkflowWorker:
         requires: Optional[List[str]] = None,
         origin: Optional[str] = None,
         on_error: Optional[List[Dict[str, str]]] = None,
-    ) -> Callable[[WorkflowFn], WorkflowFn]:
+    ) -> Callable[[Any], Any]:
         """Decorator registering ``fn`` as the workflow ``name``. ``fn(ctx, input)`` (or ``fn(ctx)``).
 
         ``version`` / ``requires`` / ``origin`` are announcement metadata only, and ``on_error`` the
         routes the engine applies to a failed run — identical in meaning to
-        :meth:`durable_worker.worker.Worker.workflow`'s (design §7.9), and equally optional."""
+        :meth:`durable_worker.worker.Worker.workflow`'s (design §7.9), and equally optional. It
+        decorates a function or a class, exactly as :meth:`durable_worker.worker.Worker.workflow` does."""
 
-        def register(fn: WorkflowFn) -> WorkflowFn:
-            self._workflows[name] = fn
-            meta: Dict[str, Any] = {}
-            if version is not None:
-                meta["version"] = version
-            if requires is not None:
-                meta["requires"] = list(requires)
-            if origin is not None:
-                meta["origin"] = origin
-            if on_error is not None:
-                meta["on_error"] = [dict(route) for route in on_error]
-            if meta:
-                self._workflow_meta[name] = meta
-            return fn
+        def register(target: Any) -> Any:
+            return _register_workflow(
+                self, name, target, _workflow_meta(version, requires, origin, on_error)
+            )
 
         return register
+
+    def register(self, workflow: Any) -> Any:
+        """Register a class declared with :func:`workflow`, or an instance of one (built with its
+        dependencies) — as :meth:`durable_worker.worker.Worker.register`."""
+        return _register_declared(self, workflow)
 
     def handles(self, name: str) -> bool:
         return name in self._workflows

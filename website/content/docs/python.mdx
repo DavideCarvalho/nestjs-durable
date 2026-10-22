@@ -403,6 +403,55 @@ def pipeline(ctx: WorkflowContext, data):
 run_workers([worker], redis=redis_url_from_env())        # one loop, one Redis pool, graceful shutdown
 ```
 
+A failure the workflow should turn into an outcome (a line that fails validation) is routed to a
+handler: `.on_error(code)` on the workflow function registers the handler as its own workflow
+(`pipeline.onError.<function>`) and announces the route, and the engine starts it when a run fails with
+that code. Raise `FatalError(message, code, details=...)` in the step so it skips the retries and the
+handler gets `failure["error"]["details"]`. See [Routing a run's failure](/docs/reliability/on-error).
+
+```python
+@pipeline.on_error("invalid_line")
+def reject_line(ctx: WorkflowContext, failure):  # {"runId", "workflow", "input", "error"}
+    ctx.step("record_rejected_line", failure)
+    return {"rows": 0, "rejected": True}
+```
+
+### Workflows as classes
+
+A workflow can be a class: `run(self, ctx, input)` is the body, and each method marked
+`@on_error(code)` is a handler (`<name>.onError.<method>`). Decorate it with `@worker.workflow(name)`.
+A registered class is a workflow reference: pass it to `ctx.start_child`, `ctx.gather_children` or
+`ctx.all_settled` instead of the name.
+
+```python
+from durable_worker import FatalError, WorkflowContext, on_error
+
+class InvalidLine(FatalError):
+    code = "invalid_line"
+
+@worker.workflow("line")
+class LineWorkflow:
+    def run(self, ctx: WorkflowContext, line):
+        ctx.step("validate_line", line)
+        return {"ok": 1, "failed": 0}
+
+    @on_error(InvalidLine)
+    def reject_line(self, ctx: WorkflowContext, failure):
+        ctx.step("record_rejected_line", failure)  # side effects go in steps
+        return {"ok": 0, "failed": 1}
+
+@worker.workflow("file")
+def file(ctx: WorkflowContext, lines):
+    return ctx.all_settled(LineWorkflow, lines)
+```
+
+The body and the handlers are replayed, so their side effects belong in steps, like any workflow's. A
+class that needs something at construction (configuration, a client for its steps' names) is declared
+with `@workflow(name, ...)` instead and handed to the worker built: `worker.register(LineWorkflow(cfg))`.
+The instance serves every run and every replay, so keep only what it was built with on it, never run
+state.
+A function workflow keeps `@line.on_error(code)` for the same thing.
+
 ### The `WorkflowContext` ops
 
 `ctx` mirrors the TypeScript `WorkflowCtx` — each op is keyed by a deterministic seq, so a completed

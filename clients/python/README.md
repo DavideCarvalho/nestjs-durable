@@ -21,7 +21,9 @@ async def charge(data):
 The handler's argument is the step **input** (already schema-validated by the engine); its
 return value is the step **output**. Raise `FatalError` for a non-retryable failure (e.g. a
 declined card); any other exception is treated as retryable and the engine applies the step's
-retry policy.
+retry policy. `FatalError(message, code, details=...)` carries a machine `code` and any
+JSON-serializable `details` (e.g. validation issues) with the failure, to the run's error, a parent's
+`all_settled` item and an `on_error` handler.
 
 ## Authoring workflows in Python (coordinator-driven)
 
@@ -57,11 +59,61 @@ decisions:
 | `ctx.side_effect(fn)` | The general deterministic-capture primitive (Temporal's `sideEffect`): run `fn` once, checkpoint its result, and replay the same value without re-running `fn`. Use for ids/random/env reads, e.g. `ctx.side_effect(lambda: str(uuid7()))`. |
 | `ctx.sleep(ms)` | Durable timer — the run suspends and the engine resumes it when the timer fires. |
 | `ctx.wait_signal(name)` | Block until a signal `name` is delivered to the run (via `engine.signal`); returns its payload. |
-| `ctx.start_child(workflow, input)` | Start a child run and await its output (a failed child raises `StepFailed`). |
+| `ctx.start_child(workflow, input)` | Start a child run and await its output (a failed child raises `StepFailed`). `workflow` is a name or a registered workflow class. |
+| `ctx.gather_calls([{name, input}, …])` / `ctx.gather_children(workflow, inputs)` / `ctx.gather([…])` | Fan steps, child runs or local steps out in parallel and await all; raises `GatherFailed` if any failed (`mode="fail_fast"` to raise on the first). |
+| `ctx.gather_calls_settled(…)` / `ctx.all_settled(workflow, inputs)` / `ctx.gather_settled(…)` | The same fans, returning every outcome instead of raising: `{"status": "fulfilled", "value"}` or `{"status": "rejected", "id", "error", "code"?, "details"?}` per item, in input order. |
 
 A step that fails raises `StepFailed` in the workflow — catch it to compensate (just like an
 awaited rejection), or let it propagate to fail the run. Changing the workflow's op sequence under a
 run already in flight raises `NondeterminismError` rather than silently diverging.
+
+### Routing a failure to a handler — `on_error`
+
+A failure that should become an outcome (a line that fails validation) is routed to a handler
+workflow by its error `code`: the engine starts the handler when the run fails with that code, and the
+run settles with the handler's return value. The worker only declares the route and announces it; the
+engine does the routing. Declare the handler inline on a function workflow:
+
+```python
+@workflows.workflow("line")
+def line(ctx, data):
+    ctx.step("validate_line", data)      # raises FatalError("…", "invalid_line", details=issues)
+    return {"ok": 1, "failed": 0}
+
+@line.on_error("invalid_line")           # a code string, an exception class with `code`, or nothing
+def reject_line(ctx, failure):           # {"runId", "workflow", "input", "error"}
+    ctx.step("record_rejected_line", failure)
+    return {"ok": 0, "failed": 1}
+```
+
+or route to any registered workflow, of any runtime, by name:
+`@workflows.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-rejected"}])`.
+
+### Workflows as classes
+
+A workflow can be a class: `run(self, ctx, input)` is the body and each method marked
+`@on_error(code)` is a handler (`<name>.onError.<method>`). A registered class is a workflow reference
+for `ctx.start_child` / `ctx.gather_children` / `ctx.all_settled`.
+
+```python
+from durable_worker import on_error, workflow
+
+@workflows.workflow("line")
+class LineWorkflow:
+    def run(self, ctx, data):
+        ctx.step("validate_line", data)
+        return {"ok": 1, "failed": 0}
+
+    @on_error(InvalidLine)
+    def reject_line(self, ctx, failure):
+        ctx.step("record_rejected_line", failure)
+        return {"ok": 0, "failed": 1}
+```
+
+A class that needs something at construction is declared with `@workflow("line", ...)` (which
+registers nothing) and handed to the worker built: `workflows.register(LineWorkflow(config))`. The body
+and the handlers are replayed, so side effects belong in steps, and the instance (shared by every run)
+holds only what it was built with.
 
 On the NestJS side, start `pipeline` by its name — the queue name is the routing, so whichever live
 worker group serves `pipeline` picks it up:

@@ -131,6 +131,24 @@ the engine reads the workflow's version from. In the Python SDK:
 def line(ctx, input): ...
 ```
 
+Or declare the handler inline, the Python twin of an `@OnError` method: `.on_error(code)` on the
+workflow function registers the handler as `<workflow>.onError.<function>` and announces the route to
+it. `code` is a code string, an exception class with a `code` attribute, or nothing for the catch-all:
+
+```python
+@worker.workflow("line")
+def line(ctx, input): ...
+
+@line.on_error(InvalidLine)
+def reject_line(ctx, failure):  # {"runId", "workflow", "input", "error"}
+    ctx.step("record_rejected_line", {"line": failure["input"], "error": failure["error"]})
+    return {"ok": 0, "failed": 1}
+```
+
+A workflow class does the same with methods: `@on_error(InvalidLine)` on a method of a class registered
+with `@worker.workflow("line")` makes it the handler `line.onError.<method>`. See
+[Python: workflows as classes](/docs/python#workflows-as-classes).
+
 The handler can be a workflow of any runtime; the engine only starts a run by name. If the live workers
 announce different routes for the workflow (a rollout in progress), the failure is not routed, the same
 way two announced versions leave a run's version undeclared, and the engine emits `run.unrouted` with

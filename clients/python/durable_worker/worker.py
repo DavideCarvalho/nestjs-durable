@@ -486,7 +486,7 @@ class Worker:
         requires: Optional["list[str]"] = None,
         origin: Optional[str] = None,
         on_error: Optional[List[Dict[str, str]]] = None,
-    ) -> Callable[[Handler], Handler]:
+    ) -> Callable[[Any], Any]:
         """Decorator registering ``fn`` as the workflow ``name`` on THIS worker (unified worker).
 
         ``fn(ctx, input)`` (or ``fn(ctx)``) — same authoring surface as
@@ -510,26 +510,45 @@ class Worker:
         engine starts the route's handler workflow instead of failing the run, and the run settles
         with the handler's outcome. The handler can be a workflow of any runtime::
 
-            @worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-dead-letter"}])
+            @worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-rejected"}])
             def line(ctx, input): ...
+
+        Or declare the handler inline: the decorated function gets ``.on_error(code)``, which registers
+        the handler as the workflow ``<name>.onError.<function>`` and announces the route to it. ``code``
+        is a code string, an exception class with a ``code`` attribute, or nothing for the catch-all::
+
+            @worker.workflow("line")
+            def line(ctx, input): ...
+
+            @line.on_error("invalid_line")
+            def reject_line(ctx, failure):  # {"runId", "workflow", "input", "error"}
+                return {"ok": 0, "failed": 1}
+
+        It decorates a class that takes no arguments too: the instance's ``run(self, ctx, input)`` is
+        the body and each method marked :func:`durable_worker.on_error` is a handler
+        (``<name>.onError.<method>``). A class with dependencies is declared with
+        :func:`durable_worker.workflow` and handed to :meth:`register` as an instance. Either way the
+        class can then be passed wherever a workflow name is (``ctx.all_settled(LineWorkflow, lines)``).
         """
 
-        def register(fn: Handler) -> Handler:
-            self._workflows[name] = fn
-            meta: Dict[str, Any] = {}
-            if version is not None:
-                meta["version"] = version
-            if requires is not None:
-                meta["requires"] = list(requires)
-            if origin is not None:
-                meta["origin"] = origin
-            if on_error is not None:
-                meta["on_error"] = [dict(route) for route in on_error]
-            if meta:
-                self._workflow_meta[name] = meta
-            return fn
+        def register(target: Any) -> Any:
+            from .workflow import _register_workflow, _workflow_meta
+
+            return _register_workflow(
+                self, name, target, _workflow_meta(version, requires, origin, on_error)
+            )
 
         return register
+
+    def register(self, workflow: Any) -> Any:
+        """Register a workflow class declared with :func:`durable_worker.workflow` — an instance built
+        with its dependencies, or the class itself when it takes none::
+
+            worker.register(LineWorkflow(config))
+        """
+        from .workflow import _register_declared
+
+        return _register_declared(self, workflow)
 
     def handles_workflow(self, name: str) -> bool:
         return name in self._workflows
