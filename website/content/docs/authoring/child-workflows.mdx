@@ -166,7 +166,7 @@ const results = await ctx.allSettled(ProcessItemWorkflow, batch.items, { concurr
 const rejected = results.flatMap((r, i) =>
   r.status === 'rejected' ? [{ item: batch.items[i], error: r.error }] : [],
 );
-if (rejected.length > 0) await ctx.step(this.deadLetters.record, rejected);
+if (rejected.length > 0) await ctx.step(this.rejectedLines.record, rejected);
 ```
 
 It takes the same `concurrency`, works over a `@Step` reference too, and lays the fan out exactly as
