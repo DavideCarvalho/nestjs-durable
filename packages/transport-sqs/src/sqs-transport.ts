@@ -17,7 +17,8 @@ import {
   runStepHandler,
 } from '@dudousxd/nestjs-durable-core';
 
-/** Resolve a group's tasks queue URL. Sync or async; resolved once and cached. */
+/** Resolve a group's tasks queue URL. Sync or async; resolved once per group and cached (a rejected
+ *  resolution is not cached — the next call asks again). */
 export type QueueUrlResolver = (group: string) => string | Promise<string>;
 
 export interface SqsTransportOptions {
@@ -36,7 +37,7 @@ export interface SqsTransportOptions {
    * Map a group → an **existing** tasks queue URL. This is the seam for reusing queues you already
    * have (e.g. `extraction`, `ingestion`) instead of letting the transport mint its own. When
    * omitted, the transport resolves `${prefix}-tasks-${group}` by name (and creates it if
-   * `autoCreate`). Return value is awaited and cached.
+   * `autoCreate`). Return value is awaited and cached per group.
    */
   taskQueueUrl?: QueueUrlResolver;
   /**
@@ -63,9 +64,32 @@ export interface SqsTransportOptions {
 
   /** SQS receive long-poll seconds (0–20). Default 20. */
   waitTimeSeconds?: number;
-  /** Visibility timeout for an in-flight task, in seconds. Must exceed the step's runtime. Default 60. */
+  /**
+   * Visibility timeout for a received task, in seconds. Default 60. Every message this instance has
+   * received — the one running and the ones of the same batch waiting behind it — is kept invisible by
+   * re-extending it (`ChangeMessageVisibility`) every third of this, so a step may run longer; only a
+   * crashed instance's messages reappear, after at most this long.
+   */
   visibilityTimeoutSec?: number;
+  /**
+   * Where a transport failure is reported: a failing receive, a result handler that throws, a result
+   * send that fails, a message whose body isn't JSON. The message involved is NOT deleted: SQS
+   * redelivers it after its visibility timeout, and a queue redrive policy (`maxReceiveCount` → DLQ)
+   * moves one that keeps failing aside. Default `console.error`.
+   */
+  onError?: (err: unknown) => void;
 }
+
+/** A received message, as the poll loops use it. */
+interface Received {
+  Body?: string | undefined;
+  ReceiptHandle?: string | undefined;
+  MessageId?: string | undefined;
+  MessageAttributes?: Record<string, unknown> | undefined;
+}
+
+/** The results queue's visibility timeout (seconds). */
+const RESULT_VISIBILITY_SEC = 30;
 
 /**
  * An SQS-backed `Transport` — dispatch remote steps over Amazon SQS (or ElasticMQ). Unlike the
@@ -89,9 +113,12 @@ export class SqsTransport implements Transport {
   private readonly visibilityTimeoutSec: number;
   private readonly taskQueueUrlResolver?: QueueUrlResolver | undefined;
   private readonly resultsQueueUrlOption?: string | (() => string | Promise<string>) | undefined;
+  private readonly onError: (err: unknown) => void;
 
   private readonly handlers = new Map<string, StepHandler>();
   private readonly urlCache = new Map<string, string>();
+  /** `taskQueueUrl` resolutions per group (the promise, so concurrent dispatches share one call). */
+  private readonly groupUrlCache = new Map<string, Promise<string>>();
   private running = true;
   private readonly abort = new AbortController();
   private taskLoop?: Promise<void>;
@@ -108,6 +135,7 @@ export class SqsTransport implements Transport {
     this.visibilityTimeoutSec = options.visibilityTimeoutSec ?? 60;
     this.taskQueueUrlResolver = options.taskQueueUrl;
     this.resultsQueueUrlOption = options.resultsQueueUrl;
+    this.onError = options.onError ?? ((err) => console.error('[SqsTransport]', err));
   }
 
   // ── queue resolution ───────────────────────────────────────────────────────────────────────
@@ -132,8 +160,19 @@ export class SqsTransport implements Transport {
   }
 
   private async tasksUrl(group: string): Promise<string> {
-    if (this.taskQueueUrlResolver) return this.taskQueueUrlResolver(group);
-    return this.resolveByName(`${this.prefix}-tasks-${group}`);
+    const resolver = this.taskQueueUrlResolver;
+    if (!resolver) return this.resolveByName(`${this.prefix}-tasks-${group}`);
+    let url = this.groupUrlCache.get(group);
+    if (!url) {
+      url = Promise.resolve()
+        .then(() => resolver(group))
+        .catch((err) => {
+          this.groupUrlCache.delete(group);
+          throw err;
+        });
+      this.groupUrlCache.set(group, url);
+    }
+    return url;
   }
 
   private async resultsUrl(): Promise<string> {
@@ -177,17 +216,109 @@ export class SqsTransport implements Transport {
 
   // ── polling loops ──────────────────────────────────────────────────────────────────────────
 
-  private async pollTasks(group: string): Promise<void> {
-    const QueueUrl = await this.tasksUrl(group);
+  /**
+   * Receive a batch and hand each message to `each`, one at a time, never letting a failure escape:
+   * a throw is reported through `onError` and its message is left on the queue (SQS redelivers it
+   * after the visibility timeout; a redrive policy DLQs one that keeps failing). Every message of the
+   * batch is kept invisible until it is handled (see {@link holdVisible}), so the ones waiting behind a
+   * slow handler are never redelivered to another consumer meanwhile.
+   */
+  private async pollLoop(
+    queueUrl: () => Promise<string>,
+    visibilitySec: number,
+    each: (QueueUrl: string, msg: Received) => Promise<void>,
+  ): Promise<void> {
     while (this.running) {
-      const messages = await this.receive(QueueUrl, this.visibilityTimeoutSec);
-      for (const msg of messages) {
-        if (this.shouldSkip(msg)) {
-          // Not ours (shared queue): release immediately so the legacy consumer can take it.
-          await this.release(QueueUrl, msg.ReceiptHandle);
-          continue;
+      let QueueUrl: string;
+      try {
+        QueueUrl = await queueUrl();
+      } catch (err) {
+        if (!this.running) return;
+        this.onError(err);
+        await this.backoff();
+        continue;
+      }
+      const messages = await this.receive(QueueUrl, visibilitySec);
+      const pending = new Set<Received>(messages);
+      const stopHolding = this.holdVisible(QueueUrl, pending, visibilitySec);
+      try {
+        for (const msg of messages) {
+          if (!this.running) break; // close(): what is left reappears after its visibility timeout
+          try {
+            if (this.shouldSkip(msg)) {
+              // Not ours (shared queue): release immediately so the legacy consumer can take it.
+              pending.delete(msg);
+              await this.release(QueueUrl, msg.ReceiptHandle);
+              continue;
+            }
+            await each(QueueUrl, msg);
+          } catch (err) {
+            this.onError(err);
+          } finally {
+            pending.delete(msg);
+          }
         }
-        const task = JSON.parse(msg.Body ?? '{}') as RemoteTask;
+      } finally {
+        stopHolding();
+      }
+    }
+  }
+
+  /**
+   * Keep `messages` invisible while they wait or run: every third of the visibility timeout, extend
+   * each one still in the set back to the full timeout. Returns the stop function.
+   */
+  private holdVisible(
+    QueueUrl: string,
+    messages: Set<Received>,
+    visibilitySec: number,
+  ): () => void {
+    if (messages.size === 0) return () => {};
+    const intervalMs = Math.max(200, Math.floor((visibilitySec * 1000) / 3));
+    let round: Promise<void> | undefined;
+    const timer = setInterval(() => {
+      if (round) return;
+      round = Promise.all(
+        [...messages].map((msg) =>
+          msg.ReceiptHandle
+            ? this.client
+                .send(
+                  new ChangeMessageVisibilityCommand({
+                    QueueUrl,
+                    ReceiptHandle: msg.ReceiptHandle,
+                    VisibilityTimeout: visibilitySec,
+                  }),
+                )
+                .then(() => undefined)
+                .catch((err) => {
+                  if (this.running) this.onError(err);
+                })
+            : undefined,
+        ),
+      ).then(() => {
+        round = undefined;
+      });
+    }, intervalMs);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+
+  private parse<T>(msg: Received): T {
+    try {
+      return JSON.parse(msg.Body ?? '') as T;
+    } catch {
+      throw new Error(
+        `[SqsTransport] message ${msg.MessageId ?? '?'} has a non-JSON body; leaving it for the queue's redrive policy`,
+      );
+    }
+  }
+
+  private pollTasks(group: string): Promise<void> {
+    return this.pollLoop(
+      () => this.tasksUrl(group),
+      this.visibilityTimeoutSec,
+      async (QueueUrl, msg) => {
+        const task = this.parse<RemoteTask>(msg);
         const result = await runStepHandler(task, this.handlers.get(task.name));
         await this.client.send(
           new SendMessageCommand({
@@ -199,27 +330,33 @@ export class SqsTransport implements Transport {
           }),
         );
         await this.del(QueueUrl, msg.ReceiptHandle);
-      }
-    }
+      },
+    );
   }
 
-  private async pollResults(handler: (result: StepResult) => Promise<void>): Promise<void> {
-    const QueueUrl = await this.resultsUrl();
-    while (this.running) {
-      const messages = await this.receive(QueueUrl, 30);
-      for (const msg of messages) {
-        if (this.shouldSkip(msg)) {
-          await this.release(QueueUrl, msg.ReceiptHandle);
-          continue;
-        }
-        await handler(JSON.parse(msg.Body ?? '{}') as StepResult);
+  private pollResults(handler: (result: StepResult) => Promise<void>): Promise<void> {
+    return this.pollLoop(
+      () => this.resultsUrl(),
+      RESULT_VISIBILITY_SEC,
+      async (QueueUrl, msg) => {
+        await handler(this.parse<StepResult>(msg));
         await this.del(QueueUrl, msg.ReceiptHandle);
-      }
-    }
+      },
+    );
+  }
+
+  private backoff(): Promise<void> {
+    return new Promise((r) => {
+      const timer = setTimeout(r, 1000);
+      this.abort.signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        r(undefined);
+      });
+    });
   }
 
   /** One long-poll receive. Swallows the abort thrown on `close()`; logs and backs off otherwise. */
-  private async receive(QueueUrl: string, visibility: number) {
+  private async receive(QueueUrl: string, visibility: number): Promise<Received[]> {
     try {
       const out = await this.client.send(
         new ReceiveMessageCommand({
@@ -234,8 +371,8 @@ export class SqsTransport implements Transport {
       return out.Messages ?? [];
     } catch (err) {
       if (!this.running) return [];
-      console.error('[SqsTransport] receive failed', err);
-      await new Promise((r) => setTimeout(r, 1000));
+      this.onError(err);
+      await this.backoff();
       return [];
     }
   }
