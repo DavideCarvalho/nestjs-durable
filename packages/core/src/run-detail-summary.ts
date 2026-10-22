@@ -40,8 +40,9 @@ export interface FanPage {
   /** A validator for this page, when the gateway can compute one without reading the members. */
   etag?: string | undefined;
   /**
-   * Set when the query's `ifNoneMatch` matched {@link etag}: the page has not changed, and `items`
-   * is empty rather than read.
+   * Set when the query's `ifNoneMatch` matched {@link etag}: the page has not changed, so nothing
+   * was read. `items` is empty and `total` is 0 as placeholders, not the fan's; keep the page the
+   * caller already holds.
    */
   notModified?: true | undefined;
 }
