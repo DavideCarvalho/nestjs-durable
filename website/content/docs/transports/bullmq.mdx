@@ -11,6 +11,8 @@ that run in another process or another language (e.g. a [Python worker](/docs/py
 pnpm add @dudousxd/nestjs-durable-transport-bullmq bullmq
 ```
 
+How it compares to the other transports: see [Choosing a transport](/docs/transports/choosing).
+
 ## How it works
 
 - `ctx.step` dispatches a task to a **per-name** queue: `<prefix>-tasks-<name>[@<partition>]`.

@@ -3,6 +3,7 @@
   "icon": "Cable",
   "pages": [
     "index",
+    "choosing",
     "bullmq",
     "sqs",
     "db"

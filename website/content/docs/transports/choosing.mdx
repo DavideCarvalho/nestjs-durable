@@ -1,0 +1,173 @@
+---
+title: Choosing a transport
+description: A capability matrix of every transport (BullMQ, SQS, SQL, event-emitter, in-memory) checked against the source, the known limitations of each, and which one to pick.
+icon: Scale
+---
+
+Every transport carries the same `RemoteTask` / `StepResult` JSON, and the engine's durable machinery
+(checkpoints, replay, retry backoff, timers, flow-control admission, dead-lettering) runs on top of
+any of them. The transports differ in everything **around** that contract: how fast a task is picked
+up, how many run at once, how a crashed worker is detected, and which optional `Transport` capabilities
+they implement. The engine only enables some cluster features when the transport implements them.
+
+This page compares them side by side. Every cell reflects what the transport's source does today.
+
+## Capability matrix
+
+✅ supported · ⚠️ partial or conditional (see the numbered note) · ❌ not supported
+
+`InMemoryTransport` is the in-process transport exported from `@dudousxd/nestjs-durable-core` for tests
+(see [Testing](/docs/testing)); it's listed for completeness, not for production.
+
+### Delivery
+
+| | BullMQ | SQS | SQL (`DbTransport`) | Event emitter | In-memory (test) |
+| --- | --- | --- | --- | --- | --- |
+| How a task reaches the worker | Push: BullMQ worker on Redis blocking commands | Long-poll: `ReceiveMessage` with `waitTimeSeconds` (default 20) | Polling: a claim query every `pollMs` (default 500 ms) while the table is empty | In-process `emit` | Direct call inside `dispatch` |
+| Pickup latency on an idle system | Milliseconds | Returns as soon as a message arrives | Up to `pollMs` per hop; a step pays it twice (task, then result) | Same tick | Inline |
+| Cost while idle | Held Redis connections, a heartbeat key write per handler every 10 s, a subscriber `PING` every 30 s | One `ReceiveMessage` request per loop per 20 s (billed by AWS) | One claim transaction per loop every 500 ms against your database | None | None |
+
+### Throughput
+
+| | BullMQ | SQS | SQL (`DbTransport`) | Event emitter | In-memory (test) |
+| --- | --- | --- | --- | --- | --- |
+| Steps run concurrently per process | ✅ `concurrency` (default 1) | ❌ one at a time¹ | ❌ one at a time¹ | ⚠️ unbounded² | ⚠️ inline in `dispatch` |
+| Adaptive concurrency (`concurrency: 'adaptive'`) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Results handled concurrently (engine side) | ✅ `resultConcurrency` (default 1) | ❌ one at a time | ❌ one at a time | ⚠️ unbounded² | ⚠️ unbounded |
+| Broker-level step priority | ✅ `priority` mapped to BullMQ job priority | ❌ ignored | ❌ ignored | ❌ | ❌ |
+| What one worker instance consumes | Any number of step names, one queue each | One `group` | One `group` | Every registered step name | Every registered step name |
+
+### Reliability
+
+| | BullMQ | SQS | SQL (`DbTransport`) | Event emitter | In-memory (test) |
+| --- | --- | --- | --- | --- | --- |
+| Delivery guarantee | At-least-once | At-least-once | At-least-once | At-most-once (lost on crash) | At-most-once |
+| Detects a crashed worker via | Job lock + a peer worker's stalled-check | Visibility timeout (`visibilityTimeoutSec`, default 60 s) | Lease expiry (`leaseMs`, default 30 s) | ❌ | ❌ |
+| Time to recover a crashed step | About 30–60 s with BullMQ defaults (30 s lock, 30 s stalled-check)³ | `visibilityTimeoutSec` | `leaseMs` plus up to `pollMs` | ❌ | ❌ |
+| Lock/lease renewed while a long step runs | ✅ BullMQ renews the job lock | ❌ a step longer than the visibility timeout is redelivered while still running⁴ | ❌ a batch running longer than `leaseMs` is reclaimed while still running⁴ | n/a | n/a |
+| Failed-job bridge (crash ➜ failed `StepResult` ➜ durable retry) | ✅ | ❌ redelivered until it succeeds, unless the queue has a redrive policy⁵ | ❌ reclaimed indefinitely, no attempt cap⁵ | ❌ | ❌ |
+| Per-step wall-clock ceiling (`stepTimeoutMs`) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Step heartbeats (keep a `timeoutMs` window open) | ✅ `<prefix>-heartbeat` pub/sub, published with `transport.heartbeat()` | ❌⁶ | ❌⁶ | ⚠️ listens on `durable.heartbeat`, but nothing in the library emits it | ⚠️ `emitHeartbeat()` test hook |
+| Result redelivered when the engine's handler throws | ✅ result job retried 5 times, exponential backoff | ❌ the result poller stops⁷ | ⚠️ the row is redelivered after `leaseMs` | ❌ | ❌ |
+
+### Cluster features
+
+| | BullMQ | SQS | SQL (`DbTransport`) | Event emitter | In-memory (test) |
+| --- | --- | --- | --- | --- | --- |
+| Steps in another process | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Python steps | ✅ `run_redis_worker` | ✅ `run_sqs_worker` | ✅ `run_db_worker` | ❌ | ❌ |
+| Remote workflows (Python `@workflow`, `@dudousxd/durable-worker`, streamed step events) | ✅ `dispatchWorkflowTask` / `onDecision` / `onStepEvent` | ❌ | ❌ | ❌ | ❌ |
+| Store-less tenant pods (`dispatchStartRun`, `RunRequest`/`RunReply`, `TenantEvent`) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Worker health in the dashboard (`groupHealth`, live workers, queue depth) | ✅ | ❌ panels stay empty | ❌ panels stay empty | ❌ | ❌ |
+| Worker descriptors (handshake routing guard, announced workflows, workflow directory) | ✅ | ❌ guard disengaged | ❌ guard disengaged | ❌ | ❌ |
+
+### Operations
+
+| | BullMQ | SQS | SQL (`DbTransport`) | Event emitter | In-memory (test) |
+| --- | --- | --- | --- | --- | --- |
+| Infrastructure to run | Redis | SQS queues (auto-created only with `autoCreate`) | Postgres 9.5+ or MySQL 8+ (two tables, auto-created) | None | None |
+| Several engine instances | ✅ | ✅ | ✅ | ❌ single process | ❌ single process |
+| Built-in control plane (cross-pod live-tail and `cancel` fan-out) | ✅ Redis pub/sub | ❌ pass a separate `controlPlane`⁸ | ❌ pass a separate `controlPlane`⁸ | ⚠️ in-process only | ⚠️ in-process only |
+| Cancellation reaches a running Python handler (`ctx.cancelled`) | ✅ `run_redis_worker` subscribes to `<prefix>-control` | ❌ | ❌ | ❌ | ❌ |
+| Bounded shutdown | ✅ `closeTimeoutMs` (default 5 s) | ⚠️ aborts the long poll, then waits for the message being processed | ⚠️ waits for the claimed batch to finish | Nothing to close | Nothing to close |
+
+**Notes**
+
+1. `SqsTransport` receives up to 10 messages and `DbTransport` claims up to `batchSize` (default 10)
+   rows per round trip, but both then run the handlers **sequentially** in a single loop. Batching
+   saves round trips; it doesn't add parallelism. To scale, run more worker processes.
+2. Every `emit` starts its handler immediately, so there is no limit. A burst of steps runs all at
+   once in the same process.
+3. Recovery needs a **live peer**: BullMQ's stalled-check runs on a worker, so if the only worker for a
+   queue dies and never comes back, nothing settles the step. The engine's opt-in `remoteRedispatchMs`
+   covers that case on every transport (see [Retries](/docs/reliability/retries#a-third-case-the-dispatch-itself-gets-lost)).
+4. Neither transport extends the visibility timeout or the lease while a handler is still running. On
+   SQS the 60 s visibility clock starts at receive time for all 10 received messages, so it covers the
+   *whole sequential batch*, not one step. On the SQL transport the lease is stamped once at claim time
+   for the whole batch and is never renewed. Either way, a slow step or a long batch lets another
+   worker pick up the same task and run it again. Keep `visibilityTimeoutSec` / `leaseMs` well above
+   the worst-case **batch** runtime, and make handlers idempotent on `stepId`.
+5. A task whose handler crashes the worker process every time ("poison" task) is redelivered on every
+   visibility/lease expiry. No failed `StepResult` is ever produced, so the engine's step `retries` never
+   come into play. On SQS, set a redrive policy (DLQ) on the tasks queue. The SQL transport has no
+   equivalent.
+6. A step's `timeoutMs` still works, but with no heartbeats nothing keeps the window open. Set it above
+   the step's real runtime.
+7. The SQS poll loops have no error handling around processing. An exception (the engine's result
+   handler throwing, a `SendMessage` failure, a non-JSON body) ends the loop, and that instance stops
+   consuming until it restarts.
+8. `SqsTransport` and `DbTransport` are point-to-point only. Without a `controlPlane`, events and
+   cancellation stay on the instance that produced them. Any `ControlPlane` works, including a
+   `BullMQTransport` instance passed only as `controlPlane`
+   (see [Control plane](/docs/transports#control-plane-separate-from-the-transport)).
+
+**The same on every transport:** retry backoff (a durable `wakeAt` on the failed checkpoint),
+flow-control admission priority and fairness, `remoteRedispatchMs`, recovery of runs, and failover
+across a [transport pool](/docs/transports#multiple-transports--failover) are all engine-side, so they
+behave the same whichever transport carries the step.
+
+## Limitations per transport
+
+**BullMQ.** It needs Redis. Crash recovery depends on a live peer worker's stalled-check, and the
+failure bridge exists only in consumers that implement it (the TypeScript transport and the Python
+`durable-worker`). A namespaced transport refuses to dispatch `@tenant`-suffixed routing tokens. Pair
+it with a bare-prefix transport in the pool.
+
+**SQS.** Each process runs one step at a time. There is no visibility extension (long steps get
+redelivered while still running), no heartbeats, no failure bridge, no worker health, and no control
+plane. The poll loop stops on an unexpected error (note 7). Remote workflows and store-less tenant pods
+are BullMQ-only. One instance consumes one `group`.
+
+**SQL (`DbTransport`).** It's polling-based, so idle latency is `pollMs` per hop and it keeps querying
+your primary database while idle. Each process runs one step at a time, the lease is never renewed,
+there is no attempt cap on reclaimed rows, and there are no heartbeats, worker health or control plane.
+It needs `FOR UPDATE SKIP LOCKED` (no SQLite). One instance consumes one `group`. Throughput is bounded
+by row contention on the database your store also uses.
+
+**Event emitter.** Single process only. There is no persistence (a crash loses in-flight steps), no
+concurrency limit, and no Python. A dispatched step with no registered handler is ignored silently,
+because another subscriber might own it, so the run waits on it.
+
+**In-memory.** For tests. It runs the handler inside `dispatch` and needs `onResult` registered first.
+
+## Which one to pick
+
+<Callout type="info" title="Recommended for production: BullMQ">
+`BullMQTransport` is the most complete transport, and several features exist **only** on it:
+
+- **Throughput controls.** Per-process `concurrency` (fixed or `adaptive`), `resultConcurrency`, and
+  broker-level `priority`. SQS and SQL run one step at a time per process.
+- **Crash handling for long steps.** BullMQ renews the job lock while a step runs, so a slow step isn't
+  redelivered. A crashed worker's job is failed by a peer's stalled-check and bridged into a retryable
+  `StepResult`, `stepTimeoutMs` caps a wedged handler, and a result whose engine-side handling throws
+  is retried 5 times.
+- **Everything in [Cluster](/docs/cluster).** Remote workflows (Python `@workflow`, the
+  `@dudousxd/durable-worker` JS worker), store-less tenant pods, worker descriptors, and the handshake
+  routing guard all require transport methods only BullMQ implements.
+- **Observability and control.** Worker health and queue depth in the dashboard, step heartbeats, and a
+  built-in control plane for cross-pod live-tail and cancellation (including cooperative cancel in
+  Python workers).
+
+If you can run Redis, use BullMQ.
+</Callout>
+
+**SQL (`DbTransport`)** is a reasonable choice when you can't or don't want to run Redis or a broker.
+It fits steps with a modest dispatch rate and runtimes well under `leaseMs`, steps that are idempotent,
+and setups where one database is all you want to operate. Add processes for parallelism, and pass a
+separate `controlPlane` if you run more than one engine instance and need cross-pod cancellation or
+live-tail.
+
+**SQS** is a reasonable choice for an AWS-native shop that doesn't want to add Redis, or that already
+runs SQS queues it wants steps on (`taskQueueUrl` / `resultsQueueUrl` reuse existing queues). Size
+`visibilityTimeoutSec` for the worst-case batch, put a redrive policy on the tasks queue, and run more
+processes for parallelism. Remote workflows and tenant pods aren't available on SQS.
+
+**Event emitter** is for a single process: a monolith splitting work across modules, local
+development, or a first deploy. It needs no infrastructure, and moving to BullMQ later is a transport
+swap with no workflow-code change.
+
+**In-memory** is for tests only.
+
+You don't have to pick only one: the engine accepts an ordered
+[pool of transports](/docs/transports#multiple-transports--failover) with failover and per-step
+pinning.

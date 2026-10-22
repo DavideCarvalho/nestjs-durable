@@ -11,6 +11,9 @@ icon: Cloud
 pnpm add @dudousxd/nestjs-durable-transport-sqs @aws-sdk/client-sqs
 ```
 
+How it compares to the other transports, and what SQS doesn't support: see
+[Choosing a transport](/docs/transports/choosing).
+
 ## How it works
 
 Say a checkout workflow calls the `payments.charge-card` step on an un-partitioned deployment. The
