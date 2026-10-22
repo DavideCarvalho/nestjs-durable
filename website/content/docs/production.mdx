@@ -51,6 +51,12 @@ before you rely on it:
 - **Exactly one instance per run, by an atomic lease.** `StateStore.tryLockRun` is how the engine
   picks a single owner for a `running` run even with several replicas racing to recover it — there's
   no split-brain double-resume.
+- **Exactly one execution per run inside a process, too.** The lease is keyed by `instanceId`, so it
+  only fences *other* instances. Within one engine, resumes of a run are serialized: a signal, a late
+  step result, a child wake or an explicit `resume()` that lands while the run is executing waits for
+  that execution to settle, then re-drives the run once (wakes that pile up meanwhile coalesce into
+  that one re-drive). This is also why `instanceId` must be unique per process: two processes sharing
+  one share the lease.
 
 By default each replica takes a **random** `instanceId` — the identity stamped on recovery leases and
 worker heartbeats. That's fine, but a stable, human-readable id makes leases and the

@@ -1,5 +1,5 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission';
-import { runInWorkflowCtx } from './ambient-ctx';
+import { currentWorkflowCtx, runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints';
 import {
@@ -377,6 +377,14 @@ interface PendingRemote {
   reject: (error: Error) => void;
 }
 
+/** See `WorkflowEngine.runGates`. */
+interface RunGate {
+  /** The last execution chained for the run in this process: the one running, or the queued one. */
+  tail: Promise<RunResult>;
+  /** The resume waiting for `tail`'s predecessor; later resumes coalesce into it until it starts. */
+  queued?: { allowFailed: boolean; result: Promise<RunResult> } | undefined;
+}
+
 /** A terminal/suspended transition handed to {@link WorkflowEngine.settleRun}. */
 type RunOutcome =
   | { kind: 'completed'; output: unknown }
@@ -676,6 +684,18 @@ export class WorkflowEngine {
   private readonly awaitedStepFans = new Map<string, { from: number; to: number }[]>();
   /** Step fans whose join barrier this instance opened, by `runId:firstSeq` — see {@link settledHere}. */
   private readonly stepFansFiredHere = new Map<string, number>();
+  /**
+   * The in-process execution gate, by run id: the execution of the run currently in flight in THIS
+   * process (`tail`), and at most one resume queued behind it (`queued`). See {@link resumeRun}.
+   *
+   * The run lease is keyed by engine instance, so it fences OTHER processes only: to the store, a
+   * second execution in this same process holds the very same lease (and {@link execute} skips
+   * `tryLockRun` when its snapshot says this instance holds it). Without this gate, a resume landing
+   * while this process was still executing the run (a signal, a late step result, a child wake, an
+   * explicit `resume()`) went straight past the lease and ran the body concurrently: a
+   * not-yet-checkpointed step executed twice.
+   */
+  private readonly runGates = new Map<string, RunGate>();
   /** The tail of each run's queue of results being handled on this instance — see {@link serializedPerRun}. */
   private readonly resultChains = new Map<string, Promise<void>>();
   /** Each run's results waiting to be settled on this instance — see {@link completeRemoteResult}. */
@@ -1391,7 +1411,71 @@ export class WorkflowEngine {
     return this.resumeRun(runId, false);
   }
 
-  private async resumeRun(runId: string, allowFailed: boolean): Promise<RunResult> {
+  /**
+   * One execution of a run at a time in this process. A resume that lands while the run executes
+   * here neither joins that execution (the double-run) nor no-ops against its held lease (a lost
+   * wake: its checkpoint may postdate the running turn's snapshot): it is QUEUED, and re-drives the
+   * run once the running execution has settled and released its lease, re-reading the run then
+   * (terminal: echoed, never re-executed). Resumes landing while one is already queued coalesce
+   * into it: it has not started yet, so it will observe every write they made. Their callers get
+   * the queued execution's result, i.e. the run's state after their own wake was applied.
+   *
+   * Across processes, exclusion stays the lease's job: {@link execute} still `tryLockRun`s when it
+   * does not hold the lease.
+   */
+  private resumeRun(runId: string, allowFailed: boolean): Promise<RunResult> {
+    const gate = this.runGates.get(runId);
+    if (!gate) {
+      const tail = this.resumeRunNow(runId, allowFailed);
+      const fresh: RunGate = { tail };
+      this.runGates.set(runId, fresh);
+      this.closeGateAfter(runId, fresh, tail);
+      return tail;
+    }
+    let queued = gate.queued;
+    if (queued) {
+      queued.allowFailed ||= allowFailed;
+    } else {
+      const entry: { allowFailed: boolean; result?: Promise<RunResult> } = { allowFailed };
+      const result = gate.tail
+        .catch(() => undefined)
+        .then(() => {
+          // Now running: a resume landing from here on queues behind THIS execution.
+          if (gate.queued === entry) gate.queued = undefined;
+          return this.resumeRunNow(runId, entry.allowFailed);
+        });
+      entry.result = result;
+      queued = entry as { allowFailed: boolean; result: Promise<RunResult> };
+      gate.queued = queued;
+      gate.tail = result;
+      this.closeGateAfter(runId, gate, result);
+      // Tracked for `drain()`: between the running execution settling (leaving `inflight`) and this
+      // one re-entering it, nothing else would hold the queued re-drive. Its rejection is the
+      // caller's to handle; the tracked copy must not surface as an unhandled rejection.
+      void this.track(result).catch(() => undefined);
+    }
+    // A resume issued from INSIDE this run's own execution (its ambient ctx is this run) can only be
+    // satisfied once that execution ends: awaiting it there would deadlock. Queue it, answer now.
+    if (currentWorkflowCtx()?.runId === runId) return this.echoCurrentStatus(runId);
+    return queued.result;
+  }
+
+  /** Drop `gate` once `tail` settles, unless another execution queued behind it meanwhile. */
+  private closeGateAfter(runId: string, gate: RunGate, tail: Promise<RunResult>): void {
+    const close = () => {
+      if (this.runGates.get(runId) === gate && gate.tail === tail) this.runGates.delete(runId);
+    };
+    void tail.then(close, close);
+  }
+
+  /** The run's persisted state as a {@link RunResult}, without executing anything. */
+  private async echoCurrentStatus(runId: string): Promise<RunResult> {
+    const run = await this.store.getRun(runId);
+    if (!run) throw new Error(`run ${runId} not found`);
+    return { runId, status: run.status, output: run.output, error: run.error };
+  }
+
+  private async resumeRunNow(runId: string, allowFailed: boolean): Promise<RunResult> {
     const run = await this.store.getRun(runId);
     if (!run) throw new Error(`run ${runId} not found`);
     // A definitively-finished run must not be re-executed (e.g. a worker result landing after the
