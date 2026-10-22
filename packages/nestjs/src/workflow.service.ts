@@ -46,8 +46,13 @@ export class WorkflowService {
    * Resolve once a run settles — terminal (completed/failed/cancelled/dead) or suspended. `start`
    * only enqueues (a worker runs the body), so pair them when a request needs the outcome:
    * `const { runId } = await svc.start(...); const result = await svc.waitForRun(runId)`.
+   * `until: 'terminal'` waits past suspensions until the run completes/fails/is cancelled — what a
+   * delayed start (`opts.startAt`) needs, since it is `suspended` until its timer fires.
    */
-  waitForRun(runId: string, opts?: { timeoutMs?: number }): Promise<RunResult> {
+  waitForRun(
+    runId: string,
+    opts?: { timeoutMs?: number; until?: 'settled' | 'terminal' },
+  ): Promise<RunResult> {
     return this.engine.waitForRun(runId, opts);
   }
 

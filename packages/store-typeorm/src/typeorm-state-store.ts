@@ -216,13 +216,15 @@ export class TypeOrmStateStore implements StateStore {
         : inputPatch;
     // The status predicate is part of the UPDATE itself: the database arbitrates the race, and the
     // changed-row count is the answer (a missing row matches nothing).
-    const result = await this.runs()
-      .createQueryBuilder()
-      .update()
-      .set(runUpdateSet(patch))
-      .where({ id: runId, status: In(expectedStatuses) })
-      .execute();
-    if (!result.affected) return false;
+    const set = runUpdateSet(patch);
+    const where = { id: runId, status: In(expectedStatuses) };
+    // Nothing to write but (maybe) the attribute side-table: the compare is a read (TypeORM refuses
+    // an UPDATE with no values).
+    const matched = Object.keys(set).length
+      ? ((await this.runs().createQueryBuilder().update().set(set).where(where).execute())
+          .affected ?? 0)
+      : await this.runs().countBy(where);
+    if (!matched) return false;
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
     return true;
   }
