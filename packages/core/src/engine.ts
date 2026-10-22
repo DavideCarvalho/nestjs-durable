@@ -94,7 +94,7 @@ import type {
   WorkflowStepEvent,
 } from './interfaces';
 import type { HistoryEvent, RunScope } from './interfaces';
-import { TERMINAL_RUN_STATUSES, isNonEmptyRunScope } from './interfaces';
+import { TERMINAL_RUN_STATUSES, isNonEmptyRunScope, poolNamespace } from './interfaces';
 import {
   HANDOFF_SEQ_BASE,
   type OnErrorRoute,
@@ -771,7 +771,8 @@ export class WorkflowEngine {
     // instead of waiting for their retry tick. Best-effort (the retry tick remains the guarantee).
     this.admission.onFreed?.((queue) => this.wakeQueueWaiters(queue));
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
-    this.namespace = deps.namespace;
+    // `''` is the default pool, like `'default'` (an empty env var, say) — only UNSET means operator.
+    this.namespace = poolNamespace(deps.namespace);
     // The engine's namespace deliberately does NOT touch the transport(s). The two tenancy axes are
     // orthogonal and encode differently ON PURPOSE (the cross-SDK canonical wire convention):
     //   - `namespace` scopes the STORE (which runs this engine drives/recovers) and stamps every run
@@ -940,7 +941,11 @@ export class WorkflowEngine {
       }
     });
     this.accumulators = new EventAccumulators(this);
-    this.entities = new Entities(this);
+    this.entities = new Entities(this, {
+      bufferSignal: (token, payload) => this.store.bufferSignal(token, payload),
+      wakeWaiter: (token, payload) => this.wakeSignalWaiter(token, payload),
+      ensureStarted: (workflow, input, runId) => this.start(workflow, input, runId),
+    });
   }
 
   /**
@@ -1340,7 +1345,7 @@ export class WorkflowEngine {
         // tenant-suffixed group the run will dispatch to — an operator starting a tenant's run via the
         // `onStartRun` wire (opts.namespace = tenant) must find the live `<workflow>@<tenant>` group,
         // not the bare group. Without this the start-run entry path can't reach a suffixed-only worker.
-        namespace: opts?.namespace ?? this.namespace,
+        namespace: poolNamespace(opts?.namespace) ?? this.namespace,
         input,
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -1399,7 +1404,7 @@ export class WorkflowEngine {
       workflowVersion: registered.version,
       status: delayed ? 'suspended' : 'pending',
       ...(delayed ? { wakeAt: startAtMs } : {}),
-      namespace: opts?.namespace ?? this.namespace,
+      namespace: poolNamespace(opts?.namespace) ?? this.namespace,
       // DERIVED from the registration, exactly like `namespace` is derived from this engine — there is
       // deliberately no `opts.origin`, so a caller cannot label its run as another package's work.
       // `undefined` when the registration carried none (remote/convention/synthesized child, or a
@@ -1611,7 +1616,7 @@ export class WorkflowEngine {
     if (
       this.namespace !== undefined &&
       run.namespace !== undefined &&
-      run.namespace !== this.namespace
+      poolNamespace(run.namespace) !== this.namespace
     ) {
       await this.store.releaseRunLock(runId);
       throw new NamespaceMismatch();
@@ -2083,6 +2088,9 @@ export class WorkflowEngine {
         error,
       });
       this.notifyDead({ ...run, status: 'dead', error, recoveryAttempts: attempts });
+      // `dead` is terminal like `failed`: a parent awaiting this run as a child (ctx.child, a ctx.all /
+      // allSettled fan) must learn it now, as a failed child, not on its next reconcile wake.
+      this.notifyParent(run.id, failedCompletion(error));
       return { runId: run.id, status: 'dead', error };
     }
     // Count BEFORE resuming, so a crash mid-resume still advances the counter.
@@ -2849,6 +2857,17 @@ export class WorkflowEngine {
       return null;
     }
     return this.deliverSignal(lateWaiter, reclaimed.payload);
+  }
+
+  /**
+   * Wake the run parked on `token` with `payload`, if there is one; otherwise do nothing — unlike
+   * {@link signal}, it never buffers. For a wake-up whose real payload is ALREADY buffered on the
+   * token (an entity op, see `Entities.kick`): a run that isn't parked reads that buffer at its next
+   * wait, so there is nothing to keep.
+   */
+  private async wakeSignalWaiter(token: string, payload: unknown): Promise<RunResult | null> {
+    const waiter = await this.store.takeSignalWaiter(token);
+    return waiter ? this.deliverSignal(waiter, payload) : null;
   }
 
   /**
@@ -5102,6 +5121,24 @@ export class WorkflowEngine {
           () => void this.entities.dispatch(name, key, op, arg, reply).catch(() => undefined),
         );
       },
+      // The durable half of a workflow-side entity send: awaited inside the turn (a store write
+      // only, never an inline entity turn), so the ctx can checkpoint after it. See Entities.enqueue.
+      enqueueEntityOp: (name, key, op, arg, id, reply) =>
+        this.entities.enqueue(name, key, op, arg, id, reply),
+      // Start/wake the entity for what enqueueEntityOp buffered — deferred like signalEntity above,
+      // so it never re-enters a still-executing turn. A failed wake loses nothing: the op stays
+      // buffered for the entity's next wait (and recovery's buffered-entity wake).
+      kickEntity: (name, key) => {
+        queueMicrotask(
+          () =>
+            void this.entities.kick(name, key).catch((err) => {
+              console.warn(
+                `[nestjs-durable] waking entity "${name}" key "${key}" failed (its op stays buffered for the next wake):`,
+                err,
+              );
+            }),
+        );
+      },
       interceptStep: (invocation, body) => this.interceptStep(invocation, body),
     };
   }
@@ -5250,7 +5287,7 @@ export class WorkflowEngine {
       (r) =>
         (this.namespace === undefined ||
           r.namespace === undefined ||
-          r.namespace === this.namespace) &&
+          poolNamespace(r.namespace) === this.namespace) &&
         r.wakeAt !== undefined &&
         r.wakeAt <= nowMs,
     );
@@ -5934,7 +5971,7 @@ export class WorkflowEngine {
     if (
       this.namespace !== undefined &&
       run.namespace !== undefined &&
-      run.namespace !== this.namespace
+      poolNamespace(run.namespace) !== this.namespace
     ) {
       return;
     }

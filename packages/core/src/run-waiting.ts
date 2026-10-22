@@ -12,6 +12,21 @@ const BREAKPOINT_PREFIX = 'bp:';
 const EVENT_PREFIX = EVENT_TOKEN_PREFIX;
 
 /**
+ * Split a `ctx.webhook()` token (`wh:<runId>:<seq>`) into its run id and logical position, or `null`
+ * for any other token. The run id may itself contain `:` (an entity run is `entity:<name>:<key>`), so
+ * the seq is the LAST segment.
+ */
+export function parseWebhookToken(token: string): { runId: string; seq: number } | null {
+  if (!token.startsWith(WEBHOOK_PREFIX)) return null;
+  const rest = token.slice(WEBHOOK_PREFIX.length);
+  const at = rest.lastIndexOf(':');
+  if (at <= 0) return null;
+  const seqText = rest.slice(at + 1);
+  if (!/^\d+$/.test(seqText)) return null;
+  return { runId: rest.slice(0, at), seq: Number(seqText) };
+}
+
+/**
  * Resolve WHAT a suspended run is parked on from the token of the {@link SignalWaiter} it registered.
  * The token prefix carries the kind — no extra store lookup and no new persisted field. Used by the
  * store-backed run gateway to stamp {@link RunWaiting} onto each listed run so the dashboard can name

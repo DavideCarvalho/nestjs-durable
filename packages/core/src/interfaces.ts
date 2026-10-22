@@ -788,6 +788,16 @@ export interface ScheduleQuery {
 /** The terminal run statuses — a run in one of these is finished and will never change on its own.
  *  Only these are eligible for retention pruning (a {@link RetentionPolicy} targeting a non-terminal
  *  status would race the engine and delete live work). */
+/**
+ * Normalise a namespace to the worker pool it names: `''` is the default pool, exactly like
+ * `'default'` (the transport already maps both to the bare token), so it is stamped, polled and
+ * compared as `'default'`. `undefined` passes through untouched: an UNSET engine namespace is the
+ * operator (drives every namespace), and an unset run namespace belongs to everyone.
+ */
+export function poolNamespace(namespace: string | undefined): string | undefined {
+  return namespace === '' ? 'default' : namespace;
+}
+
 export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
   'completed',
   'failed',

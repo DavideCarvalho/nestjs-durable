@@ -49,7 +49,9 @@ export class EventEmitterTransport implements Transport, ControlPlane {
     this.onError =
       options.onError ?? ((err) => console.error('[EventEmitterTransport] handler failed', err));
     this.emitter.on(TASK_EVENT, (taskInput: RemoteTask) => {
-      void this.process(taskInput);
+      // runStepHandler already turns a handler throw into a failed result; anything else that
+      // rejects here is reported, never left as an unhandled rejection.
+      void this.process(taskInput).catch((err) => this.onError(err));
     });
   }
 

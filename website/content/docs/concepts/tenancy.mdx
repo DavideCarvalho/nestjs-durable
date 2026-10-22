@@ -49,7 +49,9 @@ byte-identical to the un-namespaced scheme, and unaffected.
 
 **Omitting `namespace` makes the instance an operator**: an unset namespace drives, recovers, and
 resumes runs of *every* namespace (the poll filters no-op) and leaves the transport on its bare
-prefix. "Seeing everyone" is the absence of a namespace, not a wildcard value.
+prefix. "Seeing everyone" is the absence of a namespace, not a wildcard value. An empty string is
+not "unset": `namespace: ""` (an empty env var, say) is the `default` pool, so the engine stamps and
+polls `default`, and a run started with `{ namespace: "" }` is stamped `default` too.
 
 ## What `partition` partitions
 

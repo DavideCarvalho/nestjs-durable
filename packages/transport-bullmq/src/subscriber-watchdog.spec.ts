@@ -94,3 +94,50 @@ describe('BullMQTransport — subscriber ping watchdog lifecycle', () => {
     expect(clearIntervalSpy).not.toHaveBeenCalled();
   });
 });
+
+describe('BullMQTransport — an invalid pingIntervalMs falls back to the default', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([-1, -5000, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31])(
+    'pingIntervalMs %s never arms a ~1ms PING hot loop',
+    async (pingIntervalMs) => {
+      const setIntervalSpy = vi.spyOn(global, 'setInterval');
+      const transport = new BullMQTransport({ connection, pingIntervalMs });
+      transport.onControl(() => {});
+      const [, intervalMs] = setIntervalSpy.mock.calls[0] ?? [];
+      expect(intervalMs).toBe(30_000);
+      await transport.close();
+    },
+  );
+});
+
+describe('BullMQTransport — heartbeat handler rejections', () => {
+  it('a rejecting heartbeat handler is reported, never an unhandled rejection', async () => {
+    const { Redis } = await import('ioredis');
+    const transport = new BullMQTransport({ connection, pingIntervalMs: false });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      transport.onHeartbeat(async () => {
+        throw new Error('store down');
+      });
+      const results = vi.mocked(Redis).mock.results;
+      const sub = results[results.length - 1]?.value as { on: ReturnType<typeof vi.fn> };
+      const onMessage = sub.on.mock.calls.find(([event]) => event === 'message')?.[1] as (
+        channel: string,
+        payload: string,
+      ) => void;
+      onMessage('hb', JSON.stringify({ runId: 'r', seq: 0 }));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(unhandled).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+      warn.mockRestore();
+      await transport.close();
+    }
+  });
+});
