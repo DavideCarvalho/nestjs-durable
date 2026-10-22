@@ -486,7 +486,6 @@ class Worker:
         requires: Optional["list[str]"] = None,
         origin: Optional[str] = None,
         on_error: Optional[List[Dict[str, str]]] = None,
-        factory: Optional[Callable[[type], Any]] = None,
     ) -> Callable[[Any], Any]:
         """Decorator registering ``fn`` as the workflow ``name`` on THIS worker (unified worker).
 
@@ -525,36 +524,31 @@ class Worker:
             def reject_line(ctx, failure):  # {"runId", "workflow", "input", "error"}
                 return {"ok": 0, "failed": 1}
 
-        It decorates a class too: the instance's ``run(self, ctx, input)`` is the body and each method
-        marked :func:`durable_worker.on_error` is a handler (``<name>.onError.<method>``). The class is
-        instantiated once, at registration, with ``factory(cls)`` (default ``cls()``) — pass a factory
-        to build it with its dependencies — and can then be passed wherever a workflow name is::
-
-            @worker.workflow("line")
-            class LineWorkflow:
-                def run(self, ctx, line): ...
-
-                @on_error(InvalidLine)
-                def reject_line(self, ctx, failure): ...
-
-            ctx.all_settled(LineWorkflow, lines)
+        It decorates a class that takes no arguments too: the instance's ``run(self, ctx, input)`` is
+        the body and each method marked :func:`durable_worker.on_error` is a handler
+        (``<name>.onError.<method>``). A class with dependencies is declared with
+        :func:`durable_worker.workflow` and handed to :meth:`register` as an instance. Either way the
+        class can then be passed wherever a workflow name is (``ctx.all_settled(LineWorkflow, lines)``).
         """
 
         def register(target: Any) -> Any:
-            meta: Dict[str, Any] = {}
-            if version is not None:
-                meta["version"] = version
-            if requires is not None:
-                meta["requires"] = list(requires)
-            if origin is not None:
-                meta["origin"] = origin
-            if on_error is not None:
-                meta["on_error"] = [dict(route) for route in on_error]
-            from .workflow import _register_workflow
+            from .workflow import _register_workflow, _workflow_meta
 
-            return _register_workflow(self, name, target, meta, factory)
+            return _register_workflow(
+                self, name, target, _workflow_meta(version, requires, origin, on_error)
+            )
 
         return register
+
+    def register(self, workflow: Any) -> Any:
+        """Register a workflow class declared with :func:`durable_worker.workflow` — an instance built
+        with its dependencies, or the class itself when it takes none::
+
+            worker.register(LineWorkflow(rejections=repo))
+        """
+        from .workflow import _register_declared
+
+        return _register_declared(self, workflow)
 
     def handles_workflow(self, name: str) -> bool:
         return name in self._workflows

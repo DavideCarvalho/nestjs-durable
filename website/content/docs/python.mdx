@@ -418,19 +418,20 @@ def reject_line(ctx: WorkflowContext, failure):  # {"runId", "workflow", "input"
 
 ### Workflows as classes
 
-`@worker.workflow` also decorates a class: the instance's `run(self, ctx, input)` is the body, and each
-method marked `@on_error(code)` is a handler (`<name>.onError.<method>`), bound to the instance. The
-class is built once, at registration, with `factory(cls)` (default `cls()`), so a factory can hand it
-its dependencies. A registered class is a workflow reference: pass it to `ctx.start_child`,
+A workflow can be a class: `run(self, ctx, input)` is the body, and each method marked
+`@on_error(code)` is a handler (`<name>.onError.<method>`), bound to the instance. Declare the class
+with `@workflow(name, ...)` (the same options as `@worker.workflow`) and hand the worker an instance built
+with whatever it needs. A class that takes no arguments can be decorated with `@worker.workflow(name)`
+directly. A registered class is a workflow reference: pass it to `ctx.start_child`,
 `ctx.gather_children` or `ctx.all_settled` instead of the name.
 
 ```python
-from durable_worker import FatalError, WorkflowContext, on_error
+from durable_worker import FatalError, WorkflowContext, on_error, workflow
 
 class InvalidLine(FatalError):
     code = "invalid_line"
 
-@worker.workflow("line", factory=lambda cls: cls(rejections=RejectionsRepo()))
+@workflow("line", version="2")
 class LineWorkflow:
     def __init__(self, rejections):
         self.rejections = rejections
@@ -444,11 +445,14 @@ class LineWorkflow:
         self.rejections.add(failure["input"], failure["error"].get("details"))
         return {"ok": 0, "failed": 1}
 
+worker.register(LineWorkflow(rejections=RejectionsRepo()))
+
 @worker.workflow("file")
 def file(ctx: WorkflowContext, lines):
     return ctx.all_settled(LineWorkflow, lines)
 ```
 
+The instance serves every run and every replay, so keep only dependencies on it, never run state.
 A function workflow keeps `@line.on_error(code)` for the same thing.
 
 ### The `WorkflowContext` ops

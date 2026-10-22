@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from durable_worker import FatalError, Worker, on_error, workflow_name
+from durable_worker import FatalError, Worker, on_error, workflow, workflow_name
 from durable_worker.redis_runner import _build_descriptor
 from durable_worker.workflow import WorkflowWorker, process_workflow_task
 
@@ -33,7 +33,7 @@ def test_a_class_registers_its_run_and_its_handler_methods():
     worker = Worker(auto_register=False)
     rejections = Rejections()
 
-    @worker.workflow("line", version="2", factory=lambda cls: cls(rejections))
+    @workflow("line", version="2")
     class LineWorkflow:
         def __init__(self, rejections: Rejections) -> None:
             self.rejections = rejections
@@ -51,6 +51,8 @@ def test_a_class_registers_its_run_and_its_handler_methods():
         def other(self, _ctx, _failure):
             return {"ok": 0, "failed": 1}
 
+    worker.register(LineWorkflow(rejections))
+
     assert process_workflow_task(worker._workflows, _task("line", {"n": 3}))["output"] == {
         "ok": 1,
         "n": 3,
@@ -60,7 +62,7 @@ def test_a_class_registers_its_run_and_its_handler_methods():
         _task("line.onError.reject_line", {"runId": "r0", "input": {"n": 3}, "error": {}}),
     )
     assert handled["output"] == {"ok": 0, "failed": 1}
-    # The handler is bound to the instance the factory built, dependencies included.
+    # The handler is bound to the instance that was registered, dependencies included.
     assert rejections.recorded == [{"n": 3}]
 
     wire = _build_descriptor(worker, None, "default", lambda name: name).to_wire()
@@ -89,6 +91,44 @@ def test_a_registered_class_is_a_workflow_reference():
     decision = process_workflow_task(worker._workflows, _task("file", [{"n": 1}]))
     assert workflow_name(LineWorkflow) == "line"
     assert [c["workflow"] for c in decision["commands"] if c["kind"] == "startChild"] == ["line"]
+
+
+def test_a_class_without_arguments_can_be_decorated_directly():
+    worker = Worker(auto_register=False)
+
+    @worker.workflow("line")
+    class LineWorkflow:
+        def run(self, _ctx, line):
+            return line
+
+        @on_error("invalid_line")
+        def reject_line(self, _ctx, _failure):
+            return None
+
+    assert process_workflow_task(worker._workflows, _task("line", 7))["output"] == 7
+    assert "line.onError.reject_line" in worker._workflows
+
+
+def test_register_needs_a_declared_class():
+    worker = Worker(auto_register=False)
+
+    class Undeclared:
+        def run(self, _ctx):
+            return None
+
+    with pytest.raises(TypeError, match="not declared with @workflow"):
+        worker.register(Undeclared())
+
+
+def test_a_callable_object_without_run_is_still_a_function_workflow():
+    worker = Worker(auto_register=False)
+
+    class Body:
+        def __call__(self, _ctx, value):
+            return value * 2
+
+    worker.workflow("double")(Body())
+    assert process_workflow_task(worker._workflows, _task("double", 4))["output"] == 8
 
 
 def test_class_registration_errors():

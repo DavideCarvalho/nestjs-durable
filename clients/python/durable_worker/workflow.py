@@ -166,38 +166,95 @@ def on_error(code: Any = None) -> Callable[[Callable[..., Any]], Callable[..., A
     return mark
 
 
-def _register_workflow(
-    owner: Any,
+_WORKFLOW_META = "__durable_workflow_meta__"
+
+
+def _workflow_meta(
+    version: Optional[str],
+    requires: Optional[List[str]],
+    origin: Optional[str],
+    on_error: Optional[List[Dict[str, str]]],
+) -> Dict[str, Any]:
+    """The announcement a workflow registration carries; an option left out is not stated."""
+    meta: Dict[str, Any] = {}
+    if version is not None:
+        meta["version"] = version
+    if requires is not None:
+        meta["requires"] = list(requires)
+    if origin is not None:
+        meta["origin"] = origin
+    if on_error is not None:
+        meta["on_error"] = [dict(route) for route in on_error]
+    return meta
+
+
+def workflow(
     name: str,
-    target: Any,
-    meta: Dict[str, Any],
-    factory: Optional[Callable[[type], Any]],
-) -> Any:
-    """Register ``target`` as the workflow ``name`` on ``owner``: a function as the body, or a class
-    whose instance's ``run`` is the body and whose ``@on_error`` methods are its handlers. A class is
-    instantiated once, here, with ``factory(cls)`` (default ``cls()``), and stamped with its name so it
-    can be passed wherever a workflow name is (``ctx.start_child(LineWorkflow, ...)``). A function gets
-    ``.on_error(code)`` for an inline handler."""
+    *,
+    version: Optional[str] = None,
+    requires: Optional[List[str]] = None,
+    origin: Optional[str] = None,
+    on_error: Optional[List[Dict[str, str]]] = None,
+) -> Callable[[type], type]:
+    """Declare a class as the workflow ``name``, with what a worker announces about it (the same
+    options as ``Worker.workflow``). It registers nothing: hand an instance to ``worker.register`` —
+    built with whatever the class needs — or the class itself when it takes no arguments::
+
+        @workflow("line", version="2")
+        class LineWorkflow:
+            def __init__(self, rejections): ...
+            def run(self, ctx, line): ...
+
+            @on_error(InvalidLine)
+            def reject_line(self, ctx, failure): ...
+
+        worker.register(LineWorkflow(rejections=repo))
+
+    The class is a workflow reference from here on, for ``ctx.start_child`` / ``ctx.all_settled``."""
+
+    def declare(cls: type) -> type:
+        setattr(cls, _WORKFLOW_NAME, name)
+        setattr(cls, _WORKFLOW_META, _workflow_meta(version, requires, origin, on_error))
+        return cls
+
+    return declare
+
+
+def _register_workflow(owner: Any, name: str, target: Any, meta: Dict[str, Any]) -> Any:
+    """Register ``target`` as the workflow ``name`` on ``owner``. A function is the body and gets
+    ``.on_error(code)`` for an inline handler. A class (built with no arguments) or an instance of one
+    contributes its ``run`` as the body and its ``@on_error`` methods, bound to the instance, as its
+    handlers; the class is stamped with its name so it serves as a workflow reference."""
     if meta:
         owner._workflow_meta[name] = meta
-    if not inspect.isclass(target):
+    if not inspect.isclass(target) and not callable(getattr(target, "run", None)):
         owner._workflows[name] = target
         _inline_on_error(owner, name, target)
         return target
-    instance = factory(target) if factory is not None else target()
+    cls = target if inspect.isclass(target) else type(target)
+    instance = target() if inspect.isclass(target) else target
     body = getattr(instance, "run", None)
     if not callable(body):
-        raise TypeError(f"workflow class {target.__name__} needs a run(self, ctx, input) method")
+        raise TypeError(f"workflow class {cls.__name__} needs a run(self, ctx, input) method")
     owner._workflows[name] = body
-    for attr in dir(target):
-        codes = getattr(getattr(target, attr, None), _ON_ERROR_CODES, None)
+    for attr in dir(cls):
+        codes = getattr(getattr(cls, attr, None), _ON_ERROR_CODES, None)
         if not codes:
             continue
         handler = getattr(instance, attr)
         for code in codes:
             _add_on_error_route(owner, name, f"{name}.onError.{attr}", handler, code)
-    setattr(target, _WORKFLOW_NAME, name)
+    setattr(cls, _WORKFLOW_NAME, name)
     return target
+
+
+def _register_declared(owner: Any, target: Any) -> Any:
+    """``worker.register``: a class declared with :func:`workflow`, or an instance of one."""
+    cls = target if inspect.isclass(target) else type(target)
+    name = getattr(cls, _WORKFLOW_NAME, None)
+    if not isinstance(name, str):
+        raise TypeError(f"{cls.__name__} is not declared with @workflow(name)")
+    return _register_workflow(owner, name, target, dict(getattr(cls, _WORKFLOW_META, {})))
 
 
 def workflow_name(workflow: Any) -> str:
@@ -942,7 +999,6 @@ class WorkflowWorker:
         requires: Optional[List[str]] = None,
         origin: Optional[str] = None,
         on_error: Optional[List[Dict[str, str]]] = None,
-        factory: Optional[Callable[[type], Any]] = None,
     ) -> Callable[[Any], Any]:
         """Decorator registering ``fn`` as the workflow ``name``. ``fn(ctx, input)`` (or ``fn(ctx)``).
 
@@ -952,18 +1008,16 @@ class WorkflowWorker:
         decorates a function or a class, exactly as :meth:`durable_worker.worker.Worker.workflow` does."""
 
         def register(target: Any) -> Any:
-            meta: Dict[str, Any] = {}
-            if version is not None:
-                meta["version"] = version
-            if requires is not None:
-                meta["requires"] = list(requires)
-            if origin is not None:
-                meta["origin"] = origin
-            if on_error is not None:
-                meta["on_error"] = [dict(route) for route in on_error]
-            return _register_workflow(self, name, target, meta, factory)
+            return _register_workflow(
+                self, name, target, _workflow_meta(version, requires, origin, on_error)
+            )
 
         return register
+
+    def register(self, workflow: Any) -> Any:
+        """Register a class declared with :func:`workflow`, or an instance of one (built with its
+        dependencies) — as :meth:`durable_worker.worker.Worker.register`."""
+        return _register_declared(self, workflow)
 
     def handles(self, name: str) -> bool:
         return name in self._workflows
