@@ -307,6 +307,25 @@ export class MikroOrmStateStore implements StateStore {
     return affected > 0;
   }
 
+  async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+    if (checkpoints.length === 0) return [];
+    // The conditional UPDATE of `saveCheckpointIfPending`, once per entry, in order, in one
+    // transaction: one commit for the batch, and a rejection writes nothing.
+    return this.fork().transactional(async (em) => {
+      const wrote: boolean[] = [];
+      for (const checkpoint of checkpoints) {
+        const { runId: _runId, seq: _seq, ...data } = toCheckpointEntity(checkpoint);
+        const affected = await em.nativeUpdate(
+          StepCheckpointEntity,
+          { runId: checkpoint.runId, seq: checkpoint.seq, status: 'pending' },
+          { ...data, wakeAt: checkpoint.wakeAt != null ? new Date(checkpoint.wakeAt) : null },
+        );
+        wrote.push(affected > 0);
+      }
+      return wrote;
+    });
+  }
+
   async transaction<T>(
     work: (tx: {
       raw: unknown;

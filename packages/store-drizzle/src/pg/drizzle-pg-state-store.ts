@@ -53,6 +53,7 @@ import {
 } from 'drizzle-orm';
 import type { PgDatabase } from 'drizzle-orm/pg-core';
 import { ensureDrizzlePgDurableSchema } from './ddl';
+import { rowsOf } from './executor';
 import {
   DEFAULT_NAMESPACE,
   durableBufferedEvents as bufferedEvents,
@@ -299,6 +300,31 @@ export class DrizzlePgStateStore implements StateStore {
       )
       .returning({ seq: stepCheckpoints.seq });
     return rows.length === 1;
+  }
+
+  async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+    const wrote = checkpoints.map(() => false);
+    if (checkpoints.length === 0) return wrote;
+    await this.db.transaction(async (tx) => {
+      // One statement can only update a row once, so a repeated row goes in a later round, which
+      // then compares against the earlier entry's write.
+      for (const round of distinctRounds(checkpoints)) {
+        for (let at = 0; at < round.length; at += CHECKPOINT_BATCH_ROWS) {
+          const chunk = round.slice(at, at + CHECKPOINT_BATCH_ROWS);
+          const updated = rowsOf<{ run_id: string; seq: number }>(
+            await tx.execute(
+              updateIfPendingFrom(chunk.map((i) => checkpoints[i] as StepCheckpoint)),
+            ),
+          );
+          const byKey = new Map(chunk.map((i) => [rowKey(checkpoints[i] as StepCheckpoint), i]));
+          for (const row of updated) {
+            const i = byKey.get(rowKey({ runId: row.run_id, seq: Number(row.seq) }));
+            if (i !== undefined) wrote[i] = true;
+          }
+        }
+      }
+    });
+    return wrote;
   }
 
   async transaction<T>(work: (tx: StoreTransaction) => Promise<T>): Promise<T> {
@@ -829,6 +855,51 @@ export class DrizzlePgStateStore implements StateStore {
 /** Escape LIKE metacharacters so a literal prefix (`event:50%_off`) matches only itself. */
 function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+/** Rows per `UPDATE … FROM (VALUES …)`: 17 parameters each, well under Postgres's 65535. */
+const CHECKPOINT_BATCH_ROWS = 500;
+
+const rowKey = (cp: { runId: string; seq: number }): string => `${cp.seq}:${cp.runId}`;
+
+/** Indexes of `checkpoints` split into rounds that each name a row at most once, in input order. */
+function distinctRounds(checkpoints: StepCheckpoint[]): number[][] {
+  const rounds: number[][] = [];
+  const seen = new Map<string, number>();
+  checkpoints.forEach((cp, i) => {
+    const key = rowKey(cp);
+    const round = seen.get(key) ?? 0;
+    seen.set(key, round + 1);
+    const indexes = rounds[round] ?? [];
+    rounds[round] = indexes;
+    indexes.push(i);
+  });
+  return rounds;
+}
+
+/**
+ * `saveCheckpointIfPending` for many rows in one statement: each `VALUES` row overwrites its
+ * checkpoint only while that row is still `pending` (a concurrent writer blocks on the row lock,
+ * then re-evaluates the predicate against the committed row), and `RETURNING` names the rows that
+ * were written. The rows must be distinct.
+ */
+function updateIfPendingFrom(checkpoints: StepCheckpoint[]): SQL {
+  const json = (v: unknown) => (v == null ? null : JSON.stringify(v));
+  const ts = (v: Date | null) => (v == null ? null : v.toISOString());
+  const values = checkpoints.map((cp) => {
+    const r = toCheckpointRow(cp);
+    return sql`(${r.runId}::text, ${r.seq}::integer, ${r.name}::text, ${r.kind}::text, ${r.stepId}::text, ${r.status}::text, ${json(r.input)}::jsonb, ${json(r.output)}::jsonb, ${json(r.error)}::jsonb, ${json(r.events)}::jsonb, ${r.attempts}::integer, ${r.workerGroup}::text, ${r.parallelGroup}::text, ${ts(r.wakeAt)}::timestamptz, ${ts(r.enqueuedAt)}::timestamptz, ${ts(r.startedAt)}::timestamptz, ${ts(r.finishedAt)}::timestamptz)`;
+  });
+  return sql`UPDATE ${stepCheckpoints} AS c SET
+    name = v.name, kind = v.kind, step_id = v.step_id, status = v.status, input = v.input,
+    output = v.output, error = v.error, events = v.events, attempts = v.attempts,
+    worker_group = v.worker_group, parallel_group = v.parallel_group, wake_at = v.wake_at,
+    enqueued_at = v.enqueued_at, started_at = v.started_at, finished_at = v.finished_at
+  FROM (VALUES ${sql.join(values, sql`, `)}) AS v(run_id, seq, name, kind, step_id, status, input,
+    output, error, events, attempts, worker_group, parallel_group, wake_at, enqueued_at, started_at,
+    finished_at)
+  WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'
+  RETURNING c.run_id, c.seq`;
 }
 
 async function upsertCheckpoint(db: DrizzlePgDatabase, cp: StepCheckpoint): Promise<void> {

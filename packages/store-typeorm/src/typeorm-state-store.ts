@@ -40,6 +40,7 @@ import {
   IsNull,
   LessThanOrEqual,
   Like,
+  type Repository,
   type SelectQueryBuilder,
 } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
@@ -273,23 +274,19 @@ export class TypeOrmStateStore implements StateStore {
   }
 
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
-    // One conditional UPDATE: the `status = 'pending'` predicate is the compare, the affected-row
-    // count the answer. A missing row matches nothing, so it is never created.
-    const { runId, seq, ...data } = toCheckpointEntity(checkpoint);
-    const set: QueryDeepPartialEntity<StepCheckpointEntity> = {
-      ...(data as QueryDeepPartialEntity<StepCheckpointEntity>),
-      wakeAt: checkpoint.wakeAt != null ? new Date(checkpoint.wakeAt) : () => 'NULL',
-    };
-    for (const key of Object.keys(set) as (keyof typeof set)[]) {
-      if (set[key] === undefined) delete set[key];
-    }
-    const result = await this.checkpoints()
-      .createQueryBuilder()
-      .update()
-      .set(set)
-      .where({ runId, seq, status: 'pending' })
-      .execute();
-    return (result.affected ?? 0) > 0;
+    return updateIfPending(this.checkpoints(), checkpoint);
+  }
+
+  async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+    if (checkpoints.length === 0) return [];
+    // The conditional UPDATE of `saveCheckpointIfPending`, once per entry, in order, in one
+    // transaction: one commit for the batch, and a rejection writes nothing.
+    return this.dataSource.transaction(async (em) => {
+      const repo = em.getRepository(StepCheckpointEntity);
+      const wrote: boolean[] = [];
+      for (const checkpoint of checkpoints) wrote.push(await updateIfPending(repo, checkpoint));
+      return wrote;
+    });
   }
 
   async transaction<T>(
@@ -932,4 +929,29 @@ function fromScheduleEntity(e: ScheduleEntity): ScheduleRecord {
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
+}
+
+/**
+ * One conditional UPDATE: the `status = 'pending'` predicate is the compare, the affected-row count
+ * the answer. A missing row matches nothing, so it is never created.
+ */
+async function updateIfPending(
+  repo: Repository<StepCheckpointEntity>,
+  checkpoint: StepCheckpoint,
+): Promise<boolean> {
+  const { runId, seq, ...data } = toCheckpointEntity(checkpoint);
+  const set: QueryDeepPartialEntity<StepCheckpointEntity> = {
+    ...(data as QueryDeepPartialEntity<StepCheckpointEntity>),
+    wakeAt: checkpoint.wakeAt != null ? new Date(checkpoint.wakeAt) : () => 'NULL',
+  };
+  for (const key of Object.keys(set) as (keyof typeof set)[]) {
+    if (set[key] === undefined) delete set[key];
+  }
+  const result = await repo
+    .createQueryBuilder()
+    .update()
+    .set(set)
+    .where({ runId, seq, status: 'pending' })
+    .execute();
+  return (result.affected ?? 0) > 0;
 }
