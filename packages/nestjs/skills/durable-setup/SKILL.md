@@ -172,8 +172,11 @@ return this.workflows.waitForRun(runId); // resolves once the run settles
 ```
 
 `start` creates the run as `'pending'` (or `'suspended'` when `opts.startAt` is in the future)
-and a worker runs the body asynchronously; only `waitForRun`
-resolves with the settled outcome. Source: packages/nestjs/src/workflow.service.ts.
+and a worker runs the body asynchronously; only `waitForRun` resolves with the settled outcome.
+By default `waitForRun` settles on the first suspension too, so for a delayed start (or any run
+that sleeps or waits on a signal) await the real result with
+`waitForRun(runId, { until: 'terminal' })`. Source: packages/nestjs/src/workflow.service.ts,
+`WorkflowEngine.waitForRun` in packages/core/src/engine.ts.
 
 ### 2. Leaving `autoSchema` on in production
 

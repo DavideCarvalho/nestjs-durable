@@ -650,6 +650,21 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     });
 
     t(
+      'updateRunIf with an empty patch is a pure compare: never throws, writes nothing',
+      async () => {
+        expect(store.updateRunIf).toBeDefined();
+        if (!store.updateRunIf) return;
+        await store.createRun(run({ output: { kept: true } }));
+        expect(await store.updateRunIf('r1', ['running'], {})).toBe(true);
+        expect(await store.updateRunIf('r1', ['suspended'], {})).toBe(false);
+        expect(await store.updateRunIf('missing', ['running'], {})).toBe(false);
+        const current = await store.getRun('r1');
+        expect(current?.status).toBe('running');
+        expect(current?.output).toEqual({ kept: true });
+      },
+    );
+
+    t(
       'updateRunIf settling a run terminal drops its singleton admission like updateRun',
       async () => {
         expect(store.updateRunIf).toBeDefined();

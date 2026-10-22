@@ -57,4 +57,40 @@ describe('lease release is best-effort', () => {
     expect((await store.getRun('r2'))?.status).toBe('completed');
     warn.mockRestore();
   });
+
+  it('keeps the blocked outcome when releasing the lease after a blocked park throws', async () => {
+    const store = new InMemoryStateStore();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // A live worker on the group that lacks the step's required capability: the run parks `blocked`.
+    const transport = {
+      dispatch: async () => {},
+      onResult: () => {},
+      onHeartbeat: () => {},
+      readWorkerDescriptors: async () => [
+        {
+          instanceId: 'w1',
+          runtime: 'python',
+          sdk: { name: 'durable-worker', version: '1' },
+          protocol: { version: 1, range: [1, 1] as [number, number] },
+          capabilities: ['saga'],
+          workflows: [],
+          steps: ['Billing.charge'],
+          startedAt: 0,
+        },
+      ],
+    };
+    const engine = new WorkflowEngine({ store, transport, runDispatcher: { dispatch: () => {} } });
+    engine.register('checkout', '1', async (ctx) => {
+      await ctx.step('Billing.charge', {}, { requires: ['search-attr-v2'] });
+      return 'ok';
+    });
+    await engine.start('checkout', {}, 'r3');
+    vi.spyOn(store, 'releaseRunLock').mockRejectedValue(poison());
+
+    const result = await engine.runOne('r3');
+    expect(result?.status).toBe('blocked');
+    expect((await store.getRun('r3'))?.status).toBe('blocked');
+    expect(warn.mock.calls.flat().join(' ')).toMatch(/releasing the lease of run r3 failed/);
+    warn.mockRestore();
+  });
 });

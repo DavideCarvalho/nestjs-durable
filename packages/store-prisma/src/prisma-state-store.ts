@@ -243,10 +243,13 @@ export class PrismaStateStore implements StateStore {
         : inputPatch;
     // One conditional `updateMany` (`UPDATE … WHERE id = ? AND status IN (…)`): the status
     // predicate is the compare, the row count the answer, and a missing row matches nothing.
-    const { count } = await this.db.durableWorkflowRun.updateMany({
-      where: { id: runId, status: { in: expectedStatuses } },
-      data: toRunPatch(patch),
-    });
+    const where = { id: runId, status: { in: expectedStatuses } };
+    const data = toRunPatch(patch);
+    // Nothing to write but (maybe) the attribute side-table: the compare is a read (an `updateMany`
+    // with no data would report zero rows even on a match).
+    const count = Object.keys(data).length
+      ? (await this.db.durableWorkflowRun.updateMany({ where, data })).count
+      : await this.db.durableWorkflowRun.count({ where });
     if (count === 0) return false;
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
     return true;

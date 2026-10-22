@@ -81,7 +81,10 @@ export class DurableStartClient {
     return tenantUnsupported('resume');
   }
 
-  waitForRun(_runId: string, _opts?: { timeoutMs?: number }): Promise<void> {
+  waitForRun(
+    _runId: string,
+    _opts?: { timeoutMs?: number; until?: 'settled' | 'terminal' },
+  ): Promise<void> {
     return tenantUnsupported('waitForRun');
   }
 

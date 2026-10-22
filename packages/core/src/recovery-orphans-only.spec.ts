@@ -71,6 +71,32 @@ for (const variant of ['listOrphanedRuns', 'fallback'] as const) {
   });
 }
 
+describe('recoverIncomplete fallback (no listOrphanedRuns)', () => {
+  it('reclaims at most one batch of 500 orphans per pass', async () => {
+    const inner = new InMemoryStateStore();
+    for (let i = 0; i < 600; i += 1) {
+      await inner.createRun({
+        id: `orphan-${i}`,
+        workflow: 'wf',
+        workflowVersion: '1',
+        status: 'running',
+        createdAt: new Date(i),
+        updatedAt: new Date(i),
+      });
+    }
+    const tryLock = vi.spyOn(inner, 'tryLockRun');
+    const engine = new WorkflowEngine({
+      store: withoutOrphanQuery(inner),
+      clock: () => NOW,
+      runDispatcher: { dispatch: () => Promise.resolve() },
+    });
+    engine.register('wf', '1', async () => 'ok');
+
+    expect(await engine.recoverIncomplete(NOW)).toHaveLength(500);
+    expect(tryLock).toHaveBeenCalledTimes(500);
+  });
+});
+
 describe('InMemoryStateStore.listOrphanedRuns', () => {
   it('returns running and cancelling runs with a free or expired lease, oldest first, capped', async () => {
     const store = new InMemoryStateStore();

@@ -1507,7 +1507,13 @@ export class WorkflowEngine {
       void this.track(result).catch(() => undefined);
     }
     // A resume issued from INSIDE this run's own execution (its ambient ctx is this run) can only be
-    // satisfied once that execution ends: awaiting it there would deadlock. Queue it, answer now.
+    // satisfied once that execution ends: awaiting it there would deadlock. Answer now, but it must
+    // still be QUEUED above, not dropped: the execution it came from may already be past the point
+    // that would observe its wake. The live case is a signal delivered while the run parks on it
+    // (the waiter is written, the turn is about to settle `suspended`): only the queued re-drive
+    // consumes that signal. Dropping it parks the run forever (see same-process-exclusion.spec.ts,
+    // "a signal delivered while the run is still parking"). When there was nothing to wake on, the
+    // cost is one re-read that echoes the settled state.
     if (currentWorkflowCtx()?.runId === runId) return this.echoCurrentStatus(runId);
     return queued.result;
   }
@@ -2029,10 +2035,12 @@ export class WorkflowEngine {
     if (this.store.listOrphanedRuns) {
       return shuffle(await this.store.listOrphanedRuns(nowMs, RECOVERY_BATCH, this.namespace));
     }
+    // Same bound and order as the store query: the oldest RECOVERY_BATCH orphans, then shuffled.
     return shuffle(
-      (await this.store.listIncompleteRuns(this.namespace)).filter(
-        (run) => run.lockedUntil == null || run.lockedUntil <= nowMs,
-      ),
+      (await this.store.listIncompleteRuns(this.namespace))
+        .filter((run) => run.lockedUntil == null || run.lockedUntil <= nowMs)
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        .slice(0, RECOVERY_BATCH),
     );
   }
 
@@ -5208,8 +5216,10 @@ export class WorkflowEngine {
         updatedAt: new Date(),
       },
     );
+    // The lease is released best effort on both paths: the park (or the state that beat it) is
+    // already persisted, and a failing release must not replace it (see releaseLeaseBestEffort).
     if (!applied) {
-      await this.store.releaseRunLock(run.id);
+      await this.releaseLeaseBestEffort(run.id);
       return this.echoCurrentStatus(run.id);
     }
     this.emit({
@@ -5221,7 +5231,7 @@ export class WorkflowEngine {
       requires: blocked.requires,
       diagnostics: blocked.diagnostics,
     });
-    await this.store.releaseRunLock(run.id);
+    await this.releaseLeaseBestEffort(run.id);
     return { runId: run.id, status: 'blocked', error };
   }
 
