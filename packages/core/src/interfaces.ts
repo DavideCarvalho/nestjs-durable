@@ -304,6 +304,17 @@ export interface StepError {
 // StateStore — where runs and checkpoints live (Postgres / MySQL / SQLite via ORM adapters)
 // ---------------------------------------------------------------------------
 
+/**
+ * See {@link StateStore.listOrphanedRuns}: the live leases a rebooted engine instance may take back
+ * immediately, i.e. those its previous incarnation (same `instanceId`) held when it died.
+ */
+export interface OwnedLeaseReclaim {
+  /** The engine instance id the lease must be held by. */
+  owner: string;
+  /** Only leases expiring strictly before this epoch ms (the caller's boot time + `leaseMs`). */
+  lockedBefore: number;
+}
+
 export interface StateStore {
   /**
    * Provision the tables/collections this store needs, idempotently. Called on boot when the
@@ -423,8 +434,21 @@ export interface StateStore {
    * Optional but recommended: without it the engine lists every incomplete run and filters the
    * leases in process, which on a busy fleet reads every healthy running run once per tick per
    * worker.
+   *
+   * When `ownedBy` is given, ALSO return the runs whose lease is still live but held by
+   * `ownedBy.owner` with `lockedUntil < ownedBy.lockedBefore` (strictly), under the same status,
+   * namespace, order and `limit`. The engine passes its own `instanceId` and its boot time plus
+   * `leaseMs`: a lease that expires before then was taken by a PREVIOUS process with the same stable
+   * `instanceId` (one killed without a graceful shutdown), never by this one, so it reclaims those
+   * at once instead of waiting out the lease. A store that ignores the argument keeps the plain
+   * behaviour: those runs are reclaimed once their lease expires.
    */
-  listOrphanedRuns?(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]>;
+  listOrphanedRuns?(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]>;
 
   /** The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. */
   listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]>;

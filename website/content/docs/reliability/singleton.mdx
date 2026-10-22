@@ -94,15 +94,41 @@ serialize competing claims before reading, preserve admitted holders, select rem
 atomically park a denied active waiter as suspended with that wake time inside the same transaction.
 Never replace a terminal or cancelling status on denial; the exported
 `singletonAdmissionDenialPatch` helper selects this patch. The exported
-`singletonAdmissionTags` helper handles selection inside that atomic transaction. Clear the marker
-on terminal status updates and preserve it across active recovery. Follow the store's existing read
+`singletonAdmissionTags` helper handles selection inside that atomic transaction. Clear the markers
+(`durable:singleton:admitted` and `durable:singleton:tracked`, both in `SINGLETON_RESERVED_TAGS`) on
+terminal status updates and preserve them across active recovery. Persist the `tags` of the denial
+patch, which marks the waiter as tracked. Follow the store's existing read
 scope: an unscoped store shares the key across namespaces, while a scoped store sees only its own
 namespace. Treat the admission marker as reserved metadata when changing tags.
 
-Before upgrading from scan-based singleton admission, stop new singleton starts and let existing
-singleton runs settle, then update all workers and resume starts. Older active rows lack admission
-markers, so holders and gated waiters cannot be distinguished safely. Mixing old and new workers
-while singleton runs remain active does not provide the new admission guarantee.
+### Rolling upgrades from scan-based admission
+
+Replicas older than 0.73 admit by a scan: a run may execute when it is among the `limit` oldest
+`running`/`suspended`/`cancelling` runs of its key, ordered by `(createdAt, id)`. They write no
+admission marker. Old and new replicas can run side by side during a rolling upgrade. New replicas
+count a holder an old replica admitted as occupying a slot, so they never admit a run beside it.
+
+That only works if a new replica can tell an old replica's holder from a waiter. A denial looks the
+same in both versions: the run is parked `suspended` with a retry `wakeAt`, exactly like a holder
+sleeping in `ctx.sleep`. So new replicas write a second reserved tag, `durable:singleton:tracked`,
+when they first execute a singleton run (`pending` to `running`, before it claims a slot) and when
+they deny one. Admission and terminal settlement remove it. The holder count then includes:
+
+- every run carrying `durable:singleton:admitted`, and
+- every **legacy holder**: an untagged `running`/`suspended`/`cancelling` run of the key that either
+  lacks `durable:singleton:tracked` (a new replica never executed it, so an old replica did), or is
+  inside the old scan's window (the `limit` oldest such runs). The second case covers a run an old
+  replica admitted after a new replica had denied and marked it.
+
+Once a legacy holder settles, it drops out of the count and admission continues with markers.
+Waiters an old replica parked keep their FIFO place. Until a new replica re-checks one (one retry,
+about 1s), it also counts as a possible holder, which only delays admission and never over-admits.
+With `limit: 1` and no old replicas left, the window rule never changes a decision. With a larger
+limit it can delay one, never over-admit.
+
+Old replicas still admit by their own scan while they run, and that scan has its own gaps. For
+example, it can admit an older run beside a newer holder. So the fleet is fully protected once the
+last old replica is gone. Finish the rollout instead of running a mixed fleet for long.
 
 ## Bounding the queue: `maxQueueDepth` and `SingletonQueueFullError`
 

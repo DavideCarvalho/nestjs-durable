@@ -5,6 +5,7 @@ import {
   type CheckpointStat,
   type ChildWait,
   ENGINE_MINTED_TAG_PREFIXES,
+  type OwnedLeaseReclaim,
   RUN_VALUE_FACET_LIMIT,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -168,6 +169,7 @@ export class MikroOrmStateStore implements StateStore {
             {
               status: 'suspended',
               wakeAt: new Date(patch.wakeAt),
+              tags: patch.tags,
               updatedAt: patch.updatedAt,
             },
           );
@@ -389,14 +391,26 @@ export class MikroOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
-  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]> {
     if (limit <= 0) return [];
     const em = this.fork();
     const rows = await em.find(
       WorkflowRunEntity,
       {
         status: { $in: ['running', 'cancelling'] },
-        $or: [{ lockedUntil: null }, { lockedUntil: { $lte: new Date(nowMs) } }],
+        $or: [
+          { lockedUntil: null },
+          { lockedUntil: { $lte: new Date(nowMs) } },
+          // A live lease left by a previous process with the caller's own instance id.
+          ...(ownedBy
+            ? [{ lockedBy: ownedBy.owner, lockedUntil: { $lt: new Date(ownedBy.lockedBefore) } }]
+            : []),
+        ],
         ...(namespace !== undefined ? { namespace } : {}),
       },
       { orderBy: { createdAt: 'ASC' }, limit: limit },

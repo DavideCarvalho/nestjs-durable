@@ -112,7 +112,13 @@ import type { QueueConfig } from './queue';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { indexWaitersByRun, listSignalWaitersOfRuns } from './run-waiting';
 import { ScheduleClient } from './schedules';
-import { SINGLETON_ADMITTED_TAG } from './singleton-admission';
+import {
+  SINGLETON_ADMITTED_TAG,
+  SINGLETON_RESERVED_TAGS,
+  SINGLETON_TRACKED_TAG,
+  withSingletonTracked,
+  withoutSingletonMarkers,
+} from './singleton-admission';
 import { SingletonGate } from './singleton-gate';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
@@ -649,6 +655,12 @@ export class WorkflowEngine {
   private readonly instanceId: string;
   private readonly namespace: string | undefined;
   private readonly leaseMs: number;
+  /**
+   * Leases held by this `instanceId` that expire strictly before this epoch ms were taken by a
+   * PREVIOUS process with the same id (every lease this one takes or renews expires at
+   * `clock() + leaseMs`, so at or after it). See {@link orphanedRuns}.
+   */
+  private readonly ownLeaseCutoffMs: number;
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly remoteAdvanceSilenceMs?: number | undefined;
   private readonly reconcileMs: number | undefined;
@@ -785,6 +797,7 @@ export class WorkflowEngine {
     // producing a keyspace no tenant worker could see — the tenant ended up encoded twice, once in
     // the prefix and once in the group suffix, and cross-runtime discovery silently failed.)
     this.leaseMs = deps.leaseMs ?? 30_000;
+    this.ownLeaseCutoffMs = this.clock() + this.leaseMs;
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
@@ -1386,7 +1399,7 @@ export class WorkflowEngine {
     ];
     // Admission is owned by the store, never supplied or inherited by a fresh run.
     const tags = mergeTags(registered.tags, stampedTags)?.filter(
-      (tag) => tag !== SINGLETON_ADMITTED_TAG,
+      (tag) => !SINGLETON_RESERVED_TAGS.includes(tag),
     );
     // Singleton back-pressure: reject a start that would grow the same-key backlog past
     // `limit + maxQueueDepth` (no-op when no maxQueueDepth is configured).
@@ -1627,8 +1640,11 @@ export class WorkflowEngine {
     // only an UNREGISTERED run pays the inheritance walk (see {@link findInheritedRegistration}).
     // A failed run being explicitly retried must compete for a slot again. This also handles
     // terminal records retained from before the store cleared admission markers on settlement.
-    if (run.status === 'failed' && run.tags?.includes(SINGLETON_ADMITTED_TAG)) {
-      run.tags = run.tags.filter((tag) => tag !== SINGLETON_ADMITTED_TAG);
+    if (
+      run.status === 'failed' &&
+      (run.tags?.includes(SINGLETON_ADMITTED_TAG) || run.tags?.includes(SINGLETON_TRACKED_TAG))
+    ) {
+      run.tags = withoutSingletonMarkers(run.tags);
       await this.store.updateRun(run.id, { tags: run.tags });
     }
     const registered =
@@ -1958,79 +1974,134 @@ export class WorkflowEngine {
     const results: RunResult[] = [];
     for (const listed of await this.orphanedRuns(nowMs)) {
       if (this.draining) break;
-      // An IN-PROCESS turn renews its lease, so an acquirable lease means no turn is executing this
-      // run right now. Skip the ones still owned. NOTE this is NOT the same as "the worker crashed" —
-      // see the dispatched-step guard below for the case it doesn't cover.
-      const acquired = await this.store.tryLockRun(
-        listed.id,
-        this.instanceId,
-        nowMs + this.leaseMs,
-        nowMs,
-      );
-      if (!acquired) continue;
-      // Decide on the run as it is NOW that the lease is held, never on the listing. The listing is a
-      // snapshot taken before this loop reached the row, and a live run moves on in between: the turn
-      // that was executing it (`running`) suspends and releases its lease, a fast step result resumes
-      // it, it may even complete. Trusting the listed `running` then reads "free lease, no step in
-      // flight" as a crashed turn — and the branches below count a recovery attempt, rewrite the run
-      // to `pending` and re-enqueue it, i.e. start a SECOND execution beside the legitimate one (or
-      // resurrect a finished run). Only a run that still reads incomplete under the lease is ours.
-      const run = await this.store.getRun(listed.id);
-      if (!run || (run.status !== 'running' && run.status !== 'cancelling')) {
-        await this.store.releaseRunLock(listed.id);
-        continue;
-      }
-      // NOT AN ORPHAN: a run with an in-flight (`pending`) remote step is not being executed in
-      // process at all — its work is sitting on the transport, run by a worker that holds NO run
-      // lease. So "the lease is acquirable" proves nothing about it, and by contract such a run is
-      // durably SUSPENDED (see `StepCheckpoint.status`), not `running`; finding it `running` means a
-      // turn ended without restoring that invariant. Counting it as a crash-recovery attempt burns
-      // the poison-pill budget on a perfectly healthy run — repeat it `maxRecoveryAttempts` times and
-      // the run is dead-lettered with a generic `max_recovery_attempts` error WHILE its worker is
-      // still happily executing the step (observed in the wild: 10 attempts in 57s). Re-assert the
-      // contract instead — park it `suspended` on the reconcile timer, which is exactly where a
-      // dispatched-and-waiting run belongs: the worker's result resumes it, and `resumeDueTimers`
-      // re-drives it as the safety net (replaying straight back to `callRemote`'s pending guard, or
-      // re-dispatching when `remoteRedispatchMs` is set). A LOST dispatch is still not this pass's
-      // job — `remoteRedispatchMs` / `redispatchPending` own that, unchanged.
-      //
-      // `cancelling` is deliberately excluded: it must keep its status (see below), so it stays on
-      // the counted path rather than being parked `suspended` and losing the cancel intent.
-      if (run.status === 'running') {
-        const dispatched = await this.inFlightRemoteStep(run.id);
-        if (dispatched) {
-          await this.store.updateRun(run.id, {
-            status: 'suspended',
-            wakeAt: this.reconcileWakeAt(dispatched.wakeAt ?? undefined),
-            updatedAt: new Date(),
-          });
-          await this.store.releaseRunLock(run.id);
-          results.push({ runId: run.id, status: 'suspended' });
-          continue;
-        }
-      }
-      // Count the attempt / dead-letter a poison pill past maxRecoveryAttempts.
-      const settled = await this.countRecovery(run);
-      if (settled) {
-        results.push(settled);
-        continue;
-      }
+      const outcome = this.isOwnLiveLease(listed, nowMs)
+        ? await this.reclaimOwnLease(listed, nowMs)
+        : await this.recoverOrphan(listed, nowMs);
+      if (!outcome) continue;
       // Re-enqueue rather than resume inline: recovery must NOT block (boot, or a poll tick) on a
       // long workflow step. A dispatcher/worker re-runs it, replaying its checkpoints.
-      await this.store.releaseRunLock(run.id);
-      // A `cancelling` run keeps its status (resetting to `pending` would lose the persisted cancel
-      // intent and resurrect the run): the re-driven turn re-derives it from the status and finishes
-      // the cancel. Every other run re-enqueues as `pending` for a clean (re)start.
-      if (run.status !== 'cancelling') {
-        await this.store.updateRun(run.id, { status: 'pending', updatedAt: new Date() });
-      }
-      await this.runDispatcher.dispatch(run.id);
-      results.push({
-        runId: run.id,
-        status: run.status === 'cancelling' ? 'cancelling' : 'pending',
-      });
+      if (outcome.dispatch) await this.runDispatcher.dispatch(outcome.result.runId);
+      results.push(outcome.result);
     }
     return results;
+  }
+
+  /** A run whose still-live lease is held by this very `instanceId` (see {@link reclaimOwnLease}). */
+  private isOwnLiveLease(run: WorkflowRun, nowMs: number): boolean {
+    return run.lockedBy === this.instanceId && (run.lockedUntil ?? 0) > nowMs;
+  }
+
+  /**
+   * Recover a run whose lease is still live but held by THIS `instanceId` and predates this process
+   * (listed by {@link orphanedRuns}): the previous process with this stable id died without a
+   * graceful shutdown (OOM, SIGKILL), so nothing is renewing that lease and waiting for it to expire
+   * only delays the run. The lease is taken back with `renewRunLock` (a compare-and-set on the
+   * owner; `tryLockRun` refuses a live lease), so the lease alone cannot fence a live execution in
+   * THIS process from its own recovery: the in-process run gate does. A run with a
+   * gate is executing (or about to) here and is skipped; otherwise a gate is held while the run is
+   * recovered, so a resume landing meanwhile queues behind the recovery instead of running beside it.
+   * The gate is released before the re-dispatch, which may resume the run on this instance.
+   */
+  private async reclaimOwnLease(
+    listed: WorkflowRun,
+    nowMs: number,
+  ): Promise<{ result: RunResult; dispatch: boolean } | undefined> {
+    if (this.runGates.has(listed.id)) return undefined;
+    let release!: (result: RunResult) => void;
+    const tail = new Promise<RunResult>((resolve) => {
+      release = resolve;
+    });
+    const gate: RunGate = { tail };
+    this.runGates.set(listed.id, gate);
+    this.closeGateAfter(listed.id, gate, tail);
+    let outcome: { result: RunResult; dispatch: boolean } | undefined;
+    try {
+      // Re-check on the row as it is now, under the gate: a lease this process took or renewed since
+      // the listing (a `runOne` pickup, a decision being applied) is a live one, never an orphan.
+      const fresh = await this.store.getRun(listed.id);
+      const liveHere =
+        fresh?.lockedBy === this.instanceId &&
+        (fresh.lockedUntil ?? 0) > nowMs &&
+        (fresh.lockedUntil ?? 0) >= this.ownLeaseCutoffMs;
+      if (fresh && !liveHere) outcome = await this.recoverOrphan(listed, nowMs, true);
+    } finally {
+      release(outcome?.result ?? { runId: listed.id, status: listed.status });
+    }
+    return outcome;
+  }
+
+  /**
+   * One run of a {@link recoverIncomplete} pass: take its lease and decide on it. Resolves the
+   * pass's result for it and whether it must be re-dispatched, or `undefined` when it was not ours.
+   * `ownLease`: the run's live lease is this instance id's own, left by a previous process (see
+   * {@link reclaimOwnLease}), so it is taken back by owner rather than acquired as a free one.
+   */
+  private async recoverOrphan(
+    listed: WorkflowRun,
+    nowMs: number,
+    ownLease = false,
+  ): Promise<{ result: RunResult; dispatch: boolean } | undefined> {
+    // An IN-PROCESS turn renews its lease, so an acquirable lease means no turn is executing this
+    // run right now. Skip the ones still owned. NOTE this is NOT the same as "the worker crashed" —
+    // see the dispatched-step guard below for the case it doesn't cover.
+    const acquired = ownLease
+      ? await this.store.renewRunLock(listed.id, this.instanceId, nowMs + this.leaseMs)
+      : await this.store.tryLockRun(listed.id, this.instanceId, nowMs + this.leaseMs, nowMs);
+    if (!acquired) return undefined;
+    // Decide on the run as it is NOW that the lease is held, never on the listing. The listing is a
+    // snapshot taken before this loop reached the row, and a live run moves on in between: the turn
+    // that was executing it (`running`) suspends and releases its lease, a fast step result resumes
+    // it, it may even complete. Trusting the listed `running` then reads "free lease, no step in
+    // flight" as a crashed turn — and the branches below count a recovery attempt, rewrite the run
+    // to `pending` and re-enqueue it, i.e. start a SECOND execution beside the legitimate one (or
+    // resurrect a finished run). Only a run that still reads incomplete under the lease is ours.
+    const run = await this.store.getRun(listed.id);
+    if (!run || (run.status !== 'running' && run.status !== 'cancelling')) {
+      await this.store.releaseRunLock(listed.id);
+      return undefined;
+    }
+    // NOT AN ORPHAN: a run with an in-flight (`pending`) remote step is not being executed in
+    // process at all — its work is sitting on the transport, run by a worker that holds NO run
+    // lease. So "the lease is acquirable" proves nothing about it, and by contract such a run is
+    // durably SUSPENDED (see `StepCheckpoint.status`), not `running`; finding it `running` means a
+    // turn ended without restoring that invariant. Counting it as a crash-recovery attempt burns
+    // the poison-pill budget on a perfectly healthy run — repeat it `maxRecoveryAttempts` times and
+    // the run is dead-lettered with a generic `max_recovery_attempts` error WHILE its worker is
+    // still happily executing the step (observed in the wild: 10 attempts in 57s). Re-assert the
+    // contract instead — park it `suspended` on the reconcile timer, which is exactly where a
+    // dispatched-and-waiting run belongs: the worker's result resumes it, and `resumeDueTimers`
+    // re-drives it as the safety net (replaying straight back to `callRemote`'s pending guard, or
+    // re-dispatching when `remoteRedispatchMs` is set). A LOST dispatch is still not this pass's
+    // job — `remoteRedispatchMs` / `redispatchPending` own that, unchanged.
+    //
+    // `cancelling` is deliberately excluded: it must keep its status (see below), so it stays on
+    // the counted path rather than being parked `suspended` and losing the cancel intent.
+    if (run.status === 'running') {
+      const dispatched = await this.inFlightRemoteStep(run.id);
+      if (dispatched) {
+        await this.store.updateRun(run.id, {
+          status: 'suspended',
+          wakeAt: this.reconcileWakeAt(dispatched.wakeAt ?? undefined),
+          updatedAt: new Date(),
+        });
+        await this.store.releaseRunLock(run.id);
+        return { result: { runId: run.id, status: 'suspended' }, dispatch: false };
+      }
+    }
+    // Count the attempt / dead-letter a poison pill past maxRecoveryAttempts.
+    const settled = await this.countRecovery(run);
+    if (settled) return { result: settled, dispatch: false };
+    await this.store.releaseRunLock(run.id);
+    // A `cancelling` run keeps its status (resetting to `pending` would lose the persisted cancel
+    // intent and resurrect the run): the re-driven turn re-derives it from the status and finishes
+    // the cancel. Every other run re-enqueues as `pending` for a clean (re)start.
+    if (run.status !== 'cancelling') {
+      await this.store.updateRun(run.id, { status: 'pending', updatedAt: new Date() });
+    }
+    return {
+      result: { runId: run.id, status: run.status === 'cancelling' ? 'cancelling' : 'pending' },
+      dispatch: true,
+    };
   }
 
   /**
@@ -2041,15 +2112,27 @@ export class WorkflowEngine {
    * ({@link StateStore.listOrphanedRuns}, bounded by {@link RECOVERY_BATCH}); else the full list is
    * filtered here, which still spares the probes. Shuffled, like the due-timer pass, so instances
    * recovering at once spread over the batch instead of contending for the same leases.
+   *
+   * Also listed: runs still leased by THIS `instanceId` with a lease taken before this process
+   * booted ({@link ownLeaseCutoffMs}). With a stable `instanceId` (pinned to the pod identity), that
+   * is the previous process, killed without a graceful shutdown; see {@link reclaimOwnLease}.
    */
   private async orphanedRuns(nowMs: number): Promise<WorkflowRun[]> {
+    const ownedBy = { owner: this.instanceId, lockedBefore: this.ownLeaseCutoffMs };
     if (this.store.listOrphanedRuns) {
-      return shuffle(await this.store.listOrphanedRuns(nowMs, RECOVERY_BATCH, this.namespace));
+      return shuffle(
+        await this.store.listOrphanedRuns(nowMs, RECOVERY_BATCH, this.namespace, ownedBy),
+      );
     }
     // Same bound and order as the store query: the oldest RECOVERY_BATCH orphans, then shuffled.
     return shuffle(
       (await this.store.listIncompleteRuns(this.namespace))
-        .filter((run) => run.lockedUntil == null || run.lockedUntil <= nowMs)
+        .filter(
+          (run) =>
+            run.lockedUntil == null ||
+            run.lockedUntil <= nowMs ||
+            (run.lockedBy === ownedBy.owner && run.lockedUntil < ownedBy.lockedBefore),
+        )
         .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
         .slice(0, RECOVERY_BATCH),
     );
@@ -2353,7 +2436,7 @@ export class WorkflowEngine {
       ...(resurrecting
         ? {
             recoveryAttempts: 0,
-            tags: run.tags?.filter((tag) => tag !== SINGLETON_ADMITTED_TAG),
+            tags: withoutSingletonMarkers(run.tags),
           }
         : {}),
       updatedAt: new Date(),
@@ -3520,6 +3603,24 @@ export class WorkflowEngine {
   }
 
   /** Admission persists the wait atomically; never overwrite a cancellation after it returns. */
+  /**
+   * A run's first execution: `pending` -> `running`. A singleton run not yet admitted is stamped
+   * {@link SINGLETON_TRACKED_TAG} in the same write, BEFORE it competes for a slot, so a run this
+   * replica is about to admit or deny is never mistaken for a holder admitted by a replica older
+   * than 0.73 (see `legacySingletonHolders`).
+   */
+  private async markStarted(run: WorkflowRun, singleton: boolean): Promise<void> {
+    const tags = singleton ? withSingletonTracked(run.tags) : run.tags;
+    const retag = tags !== run.tags;
+    await this.store.updateRun(run.id, {
+      status: 'running',
+      ...(retag ? { tags } : {}),
+      updatedAt: new Date(),
+    });
+    run.status = 'running';
+    if (retag) run.tags = tags;
+  }
+
   private async singletonWaitResult(run: WorkflowRun): Promise<RunResult> {
     const current = await this.store.getRun(run.id);
     await this.store.releaseRunLock(run.id);
@@ -3916,8 +4017,7 @@ export class WorkflowEngine {
     }
     const remote = registered.remote as NonNullable<RegisteredWorkflow['remote']>;
     if (run.status === 'pending') {
-      await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
-      run.status = 'running';
+      await this.markStarted(run, registered?.singleton !== undefined);
       this.emit({
         type: 'run.started',
         runId: run.id,
@@ -4689,8 +4789,7 @@ export class WorkflowEngine {
     // First execution of an enqueued run: mark it running and announce the start, BEFORE the singleton
     // gate. A resumed run is already past `pending`, so this fires exactly once.
     if (run.status === 'pending') {
-      await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
-      run.status = 'running';
+      await this.markStarted(run, registered?.singleton !== undefined);
       this.emit({
         type: 'run.started',
         runId: run.id,

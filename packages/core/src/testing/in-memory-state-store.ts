@@ -19,7 +19,7 @@ import {
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
 } from '../interfaces';
-import type { AttributeFilter } from '../interfaces';
+import type { AttributeFilter, OwnedLeaseReclaim } from '../interfaces';
 import { checkpointStatsOf, queryCheckpointsOf } from '../run-detail-store';
 import { mergeRunFacetRows } from '../run-facets';
 import { RUN_VALUE_FACET_SCAN, runValueFacetsFromRuns } from '../run-value-facets';
@@ -29,9 +29,9 @@ import {
   normalizeAttributeRows,
 } from '../search-attributes';
 import {
-  SINGLETON_ADMITTED_TAG,
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
+  withoutSingletonMarkers,
 } from '../singleton-admission';
 
 /**
@@ -134,8 +134,8 @@ export class InMemoryStateStore implements StateStore {
       inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
         ? {
             ...inputPatch,
-            tags: ('tags' in inputPatch ? inputPatch.tags : this.runs.get(runId)?.tags)?.filter(
-              (tag) => tag !== SINGLETON_ADMITTED_TAG,
+            tags: withoutSingletonMarkers(
+              'tags' in inputPatch ? inputPatch.tags : this.runs.get(runId)?.tags,
             ),
           }
         : inputPatch;
@@ -222,12 +222,21 @@ export class InMemoryStateStore implements StateStore {
     });
   }
 
-  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]> {
     return [...this.runs.values()]
       .filter(
         (r) =>
           (r.status === 'running' || r.status === 'cancelling') &&
-          (r.lockedUntil == null || r.lockedUntil <= nowMs) &&
+          (r.lockedUntil == null ||
+            r.lockedUntil <= nowMs ||
+            (ownedBy !== undefined &&
+              r.lockedBy === ownedBy.owner &&
+              r.lockedUntil < ownedBy.lockedBefore)) &&
           (namespace === undefined || r.namespace === namespace),
       )
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())

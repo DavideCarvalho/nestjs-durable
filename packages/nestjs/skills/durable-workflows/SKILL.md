@@ -96,7 +96,8 @@ const out = await ctx.step<ProcResult>('processing:proc', input);
 `@Step()` (bare) derives the routing name from the method as `` `${ClassName}.${method}` ``;
 `@Step('custom:name')` overrides it explicitly — needed for a cross-runtime contract where the other
 side has no `@Step` of its own. `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?,
-backoffMaxMs?, jitter?, timeoutMs? })` additionally opts into RUNTIME zod validation (`input`
+backoffMaxMs?, jitter?, timeoutMs? })` additionally opts into RUNTIME validation (a Standard Schema such as zod, or a class-validator DTO
+class) (`input`
 validates before the method runs, `output` validates its return value) and a def-level durable-retry
 policy — a bare `@Step()` skips both and dispatches with no retry/timeout.
 
