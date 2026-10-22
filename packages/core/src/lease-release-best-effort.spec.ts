@@ -13,7 +13,8 @@ import { InMemoryStateStore } from './testing/in-memory-state-store';
  * turn is driven as a background resume it surfaces as an unhandled rejection instead.
  */
 describe('lease release is best-effort', () => {
-  const poison = () => new Error('current transaction is aborted, commands ignored until end of transaction block');
+  const poison = () =>
+    new Error('current transaction is aborted, commands ignored until end of transaction block');
 
   it('keeps the workflow error when releasing the lease throws', async () => {
     const store = new InMemoryStateStore();

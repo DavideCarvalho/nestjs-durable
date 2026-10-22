@@ -16,7 +16,12 @@ import { InMemoryStateStore } from './testing/in-memory-state-store';
  * mid-execution, then counts how many times step bodies ran.
  */
 
-function gate(): { reached: Promise<void>; hit: () => void; release: () => void; open: Promise<void> } {
+function gate(): {
+  reached: Promise<void>;
+  hit: () => void;
+  release: () => void;
+  open: Promise<void>;
+} {
   let hit!: () => void;
   const reached = new Promise<void>((resolve) => {
     hit = resolve;
