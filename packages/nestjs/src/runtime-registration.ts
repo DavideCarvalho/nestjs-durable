@@ -3,6 +3,7 @@ import type { MetadataScanner } from '@nestjs/core';
 import type { WorkflowMeta } from './decorators';
 import type { WorkflowInstance } from './discovery-helpers';
 import { onErrorHandlersOf } from './on-error-handlers';
+import { workflowIo } from './workflow-io';
 
 /**
  * Register a `@Workflow` body on a worker runtime with what it ANNOUNCES about it (design §7.9):
@@ -22,7 +23,10 @@ export function registerOnRuntime(
     version: meta.version,
     ...(origin !== undefined ? { origin } : {}),
   };
-  runtime.registerWorkflow(meta.name, (ctx, input) => instance.run(ctx, input), {
+  // The same parse-around-the-body the engine-side registrar applies, so a turn this worker replays
+  // sees the parsed input too.
+  const body = workflowIo(meta).wrap((ctx, input) => instance.run(ctx, input));
+  runtime.registerWorkflow(meta.name, body, {
     ...announced,
     ...(meta.requires !== undefined ? { requires: meta.requires } : {}),
     // A catch-all goes on the wire without a `code` key, not with an undefined one.

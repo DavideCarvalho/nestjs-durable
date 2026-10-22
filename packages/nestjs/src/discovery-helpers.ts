@@ -3,6 +3,7 @@ import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { getDurableStepMeta, getWorkflowMeta } from './decorators';
 import type { DurableStepMeta, WorkflowMeta } from './decorators';
 import { originOfProvider } from './origin';
+import { schemaParser } from './schema-parse';
 
 export interface WorkflowInstance {
   run(ctx: WorkflowCtx, input: unknown): Promise<unknown>;
@@ -52,7 +53,7 @@ export function scanWorkflows(
  * The handler passed to `register` is already bound to its instance, and is the ONE place a `@Step`
  * method actually runs with real input/output in this package — every registrar
  * (`DurableStepRegistrar`, `InAppWorkerBootstrap`, `ThinStepRegistrar`) funnels through here — so
- * this is where `@Step`'s optional `input`/`output` zod schemas are enforced: `input` validates
+ * this is where `@Step`'s optional `input`/`output` schemas are enforced: `input` validates
  * before the method runs, `output` validates its return value before it's handed back. A bare
  * `@Step()` (no schemas attached) skips both checks — `meta.input`/`meta.output` are `undefined`.
  */
@@ -74,10 +75,14 @@ export function scanSteps(
       const meta = getDurableStepMeta(method);
       if (!meta) continue;
       const boundMethod = method as (input: unknown, log: StepLogger) => unknown;
+      const parseInput =
+        meta.input && schemaParser(meta.input, 'input', `step "${meta.name}" input`);
+      const parseOutput =
+        meta.output && schemaParser(meta.output, 'output', `step "${meta.name}" output`);
       const handler = async (input: unknown, log: StepLogger): Promise<unknown> => {
-        const validInput = meta.input ? meta.input.parse(input) : input;
+        const validInput = parseInput ? await parseInput(input) : input;
         const output = await boundMethod.call(instance, validInput, log);
-        return meta.output ? meta.output.parse(output) : output;
+        return parseOutput ? parseOutput(output) : output;
       };
       register(meta, handler);
     }

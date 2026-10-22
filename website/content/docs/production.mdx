@@ -689,39 +689,87 @@ Two `@Workflow` options catch a whole class of production incidents at the bound
 a replay — a malformed `start` payload, and a run that never ends.
 
 **Validate `start` input.** A run created with garbage input fails on its first step (or worse, halfway
-through), long after the caller has moved on. `inputSchema` validates the payload against a
-[class-validator](https://github.com/typestack/class-validator) DTO **before** the run is created, so a
-bad request is rejected synchronously at `start`:
+through), long after the caller has moved on. `input` declares the run's input schema, and the payload
+is checked against it **before** the run is created, so a bad request is rejected at `start`. It takes
+the same two forms `@Step({ input })` does: a [Standard Schema](https://standardschema.dev) (zod 3.24+,
+valibot, arktype, …) or a [class-validator](https://github.com/typestack/class-validator) DTO class —
+the two validation styles NestJS itself supports (`StandardSchemaValidationPipe` and `ValidationPipe`).
 
 ```ts
-import { IsString, IsInt, Min } from 'class-validator';
+import { z } from 'zod';
 
-class CheckoutInput {
-  @IsString() orderId!: string;
-  @IsInt() @Min(1) amountCents!: number;
-}
+const CheckoutInput = z.object({
+  orderId: z.string(),
+  amountCents: z.number().int().min(1),
+  placedAt: z.coerce.date(),
+});
 
-@Workflow({ name: 'checkout', version: '1', inputSchema: CheckoutInput })
+@Workflow({ name: 'checkout', version: '1', input: CheckoutInput })
 export class CheckoutWorkflow {
-  async run(ctx: WorkflowCtx, input: CheckoutInput) {
-    /* input is guaranteed shape-valid here */
+  async run(ctx: WorkflowCtx, input: z.infer<typeof CheckoutInput>) {
+    input.placedAt.getTime(); // a real Date, on the first execution and on every replay
   }
 }
 ```
 
-`inputSchema` needs `class-validator`/`class-transformer` installed. For a rule that a DTO can't
-express (a cross-field invariant, an async lookup) use `validateInput` instead — a plain
-`(input) => void | Promise<void>` that throws to reject, and which takes precedence over `inputSchema`:
+```ts
+import { Type } from 'class-transformer';
+import { IsDate, IsInt, IsString, Min } from 'class-validator';
+
+class CheckoutInput {
+  @IsString() orderId!: string;
+  @IsInt() @Min(1) amountCents!: number;
+  @Type(() => Date) @IsDate() placedAt!: Date;
+}
+
+@Workflow({ name: 'checkout', version: '1', input: CheckoutInput })
+export class CheckoutWorkflow {
+  async run(ctx: WorkflowCtx, input: CheckoutInput) {
+    /* input is a CheckoutInput instance here */
+  }
+}
+```
+
+A DTO class needs `class-validator`/`class-transformer` installed. `inputSchema` is an alias of `input`,
+kept for workflows declared before `input` existed (setting both is an error).
+
+**The run stores what was sent; the body sees what was parsed.** The run's stored `input` is the
+payload exactly as the caller sent it. `run(ctx, input)` receives the schema's **parsed** value — coerced
+and transformed — and that value is re-parsed from the stored input before every turn, replays
+included. A value the stored JSON can't carry (a `Date`, a DTO instance with methods) therefore reaches
+the body the same way on every turn. Two rules follow:
+
+- **The schema must be deterministic.** No `default(() => Date.now())`, no random ids: a replay must
+  parse the same value the first execution did.
+- **Changing the schema is a breaking change to the workflow** — bump `version`, like any other change
+  to the body ([section 6](#6-deploys-replay-safety-discipline)). An in-flight run whose stored input no
+  longer parses fails with `code: 'invalid_input'`.
+
+**Validate the output.** `output` takes the same forms. The value `run()` returns is parsed before the
+run completes, and the parsed value is stored as the run's output; a mismatch fails the run with
+`code: 'invalid_output'`. Both codes come from a `FatalError` (never retried) whose `details` carry the
+schema's issues, so an alert or an [`onError` route](/docs/reliability/on-error) can match them.
+
+For a rule a schema can't express (a cross-field invariant, an async lookup) add `validateInput` — a plain
+`(input) => void | Promise<void>` that throws to reject. It runs at `start` after `input` parses, and
+sees the input as it was sent:
 
 ```ts
 @Workflow({
   name: 'transfer',
-  validateInput: (input: TransferInput) => {
-    if (input.from === input.to) throw new Error('cannot transfer to the same account');
+  input: TransferInput,
+  validateInput: (input) => {
+    const { from, to } = input as { from: string; to: string };
+    if (from === to) throw new Error('cannot transfer to the same account');
   },
 })
 export class TransferWorkflow { /* … */ }
 ```
+
+One limit: validation at `start` needs the `@Workflow` class in the process that calls `start`. A
+control plane that only routes runs to a [worker](/docs/cluster/js-worker) by name can't check the input
+there, so a bad payload surfaces when the worker runs the body — as a failed run with
+`code: 'invalid_input'`, not as an error from `start`.
 
 **Cap the lifetime.** A workflow that waits on a signal or a child that never arrives will sit
 `suspended` forever, holding whatever it holds. `executionTimeout` bounds a run's total wall-clock life;

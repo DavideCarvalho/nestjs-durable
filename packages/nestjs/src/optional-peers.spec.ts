@@ -255,19 +255,19 @@ describe('optional peers are absent-safe in the built package', () => {
 describe('lazily loaded optional peers work when they are installed', () => {
   it('validates @Workflow({ inputSchema }) from the ESM entry', () => {
     expect(runWithout([], validateInputEsm, 'mjs')).toContain(
-      'rejected: invalid input for workflow: orderId must be a string',
+      'rejected: invalid workflow "order" input: orderId must be a string',
     );
   });
 
   it('validates @Workflow({ inputSchema }) from the CJS entry', () => {
     expect(runWithout([], validateInputCjs, 'cjs')).toContain(
-      'rejected: invalid input for workflow: orderId must be a string',
+      'rejected: invalid workflow "order" input: orderId must be a string',
     );
   });
 
   it('names the missing peers when inputSchema is used without class-validator', () => {
     expect(runWithout(['class-validator'], validateInputWithoutPeer, 'mjs')).toContain(
-      'rejected: @Workflow({ inputSchema }) needs the optional peers',
+      'rejected: workflow "order" input uses a class-validator DTO, which needs the optional peers',
     );
   });
 });

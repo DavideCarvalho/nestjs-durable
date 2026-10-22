@@ -40,7 +40,7 @@ logical event. Each started run gets the id `evt:<id>:<workflow>`, so redeliveri
 finds the existing run instead of starting a second one. Omit `id` and the engine generates a fresh
 uuid per publish, so every call starts its subscribers exactly once.
 
-A subscriber whose `validateInput` rejects the payload simply never starts — it does not block the
+A subscriber whose `input` schema or `validateInput` rejects the payload simply never starts — it does not block the
 other subscribers or the waiters being resumed.
 
 ## Starting a workflow from an event
