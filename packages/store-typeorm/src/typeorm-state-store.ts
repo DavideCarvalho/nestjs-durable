@@ -58,7 +58,11 @@ import {
   StepCheckpointEntity,
   WorkflowRunEntity,
 } from './entities';
-import { durableColumnResolver, ensureTypeOrmDurableSchema } from './schema';
+import {
+  type DurableSchemaLogger,
+  durableColumnResolver,
+  ensureTypeOrmDurableSchema,
+} from './schema';
 
 /** {@link checkpointNameKind} as a SQL expression over the `cp` alias, for selecting and grouping. */
 const CHECKPOINT_NAME_KIND_SQL =
@@ -86,15 +90,28 @@ interface RawCheckpointStat {
 // so simultaneous async claims cannot issue overlapping BEGIN statements on that connection.
 const sqliteSingletonClaims = new WeakMap<DataSource, Promise<void>>();
 
+/** Options for a {@link TypeOrmStateStore}. */
+export interface TypeOrmStateStoreOptions {
+  /**
+   * Where `ensureSchema()` (the boot-time auto-schema) reports a schema repair it actually applied
+   * — a missing table, column or index it had to add. Defaults to `console`. NestJS's `Logger`
+   * satisfies it.
+   */
+  schemaLogger?: DurableSchemaLogger | undefined;
+}
+
 /**
  * TypeORM-backed `StateStore`. Works on any TypeORM driver — Postgres, MySQL, SQLite (tested);
  * timestamps use native datetime columns and `wakeAt` is stored as a datetime too.
  */
 export class TypeOrmStateStore implements StateStore {
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly options: TypeOrmStateStoreOptions = {},
+  ) {}
 
   async ensureSchema(): Promise<void> {
-    await ensureTypeOrmDurableSchema(this.dataSource);
+    await ensureTypeOrmDurableSchema(this.dataSource, { logger: this.options.schemaLogger });
   }
 
   private runs() {
@@ -433,8 +450,11 @@ export class TypeOrmStateStore implements StateStore {
     return result.affected === 1;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
-    await this.runs().update({ id: runId }, { lockedBy: null, lockedUntil: () => 'NULL' });
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
+    await this.runs().update(owner === undefined ? { id: runId } : { id: runId, lockedBy: owner }, {
+      lockedBy: null,
+      lockedUntil: () => 'NULL',
+    });
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {

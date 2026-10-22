@@ -1097,6 +1097,19 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.tryLockRun('r1', 'C', 9_000, 2_600)).toBe(true);
     });
 
+    t('releaseRunLock with an owner clears only a lease that owner still holds', async () => {
+      await store.createRun(run({ id: 'r1' }));
+      expect(await store.tryLockRun('r1', 'A', 2_000, 1_000)).toBe(true);
+      // A's lease lapsed and B took the run over: A's owner-scoped release must not free B's lease.
+      expect(await store.tryLockRun('r1', 'B', 4_000, 2_500)).toBe(true);
+      await store.releaseRunLock('r1', 'A');
+      expect(await store.tryLockRun('r1', 'C', 9_000, 3_000)).toBe(false);
+      expect((await store.getRun('r1'))?.lockedBy).toBe('B');
+      // The holder's own owner-scoped release does clear it.
+      await store.releaseRunLock('r1', 'B');
+      expect(await store.tryLockRun('r1', 'C', 9_000, 3_000)).toBe(true);
+    });
+
     t('renewRunLock only succeeds for the current owner', async () => {
       await store.createRun(run({ id: 'r1' }));
       expect(await store.tryLockRun('r1', 'A', 2_000, 1_000)).toBe(true);

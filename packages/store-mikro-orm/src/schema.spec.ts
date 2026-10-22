@@ -1,7 +1,11 @@
 import type { MikroORM } from '@mikro-orm/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ENTITIES } from './entities';
-import { durableManagedTables, ensureMikroOrmDurableSchema } from './schema';
+import {
+  durableManagedTables,
+  ensureMikroOrmDurableSchema,
+  mikroOrmSchemaRepairWarning,
+} from './schema';
 
 /** Minimal column shape the fingerprint reads off `meta.props`. */
 interface FakeProp {
@@ -155,12 +159,20 @@ describe('ensureMikroOrmDurableSchema resilience', () => {
       ran.push(statement);
     });
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const repairs: string[] = [];
 
-    await expect(ensureMikroOrmDurableSchema(makeOrm(sql, execute))).resolves.toBeUndefined();
+    await expect(
+      ensureMikroOrmDurableSchema(makeOrm(sql, execute), {
+        logger: { warn: (message) => repairs.push(message) },
+      }),
+    ).resolves.toBeUndefined();
 
     // The required add-column ran; the failed modify was swallowed with a warning.
     expect(ran.some((s) => /add column/i.test(s))).toBe(true);
     expect(warn).toHaveBeenCalledTimes(1);
+    // Only the APPLIED add-column is reported as a repair; the skipped modify is not.
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]).toContain('added column durable_step_checkpoints.foo.');
   });
 
   it('rethrows when required structure (add column / create table) fails', async () => {
@@ -371,6 +383,104 @@ describe('ensureMikroOrmDurableSchema fingerprint gate', () => {
     );
     expect(secondHeal).toHaveBeenCalledTimes(1);
     expect(marker.get('durable')?.fingerprint).not.toBe(firstFingerprint);
+  });
+});
+
+describe('ensureMikroOrmDurableSchema repair warning', () => {
+  function recordingLogger(): { warn: (message: string) => void; messages: string[] } {
+    const messages: string[] = [];
+    return { warn: (message) => messages.push(message), messages };
+  }
+
+  it('lists every applied change in ONE warning (mysql statement shapes)', async () => {
+    const sql = [
+      'alter table `durable_workflow_runs` add `origin` varchar(255) null, add index `durable_workflow_runs_origin_index`(`origin`)',
+      'alter table `durable_step_checkpoints` add column `queue` varchar(255) null',
+      'create table `durable_schedules` (`id` varchar(255) not null, primary key (`id`))',
+      'alter table `durable_schedules` add index `durable_schedules_due_idx`(`paused`, `next_fire_at`)',
+      'alter table `durable_step_checkpoints` modify `events` json null',
+    ].join(';\n');
+    const logger = recordingLogger();
+
+    await ensureMikroOrmDurableSchema(
+      makeOrm(sql, async () => undefined),
+      { logger },
+    );
+
+    expect(logger.messages).toHaveLength(1);
+    expect(logger.messages[0]).toContain(
+      '[nestjs-durable] store-mikro-orm repaired the durable schema at boot: added column durable_workflow_runs.origin; created index durable_workflow_runs_origin_index on durable_workflow_runs; added column durable_step_checkpoints.queue; created table durable_schedules; altered durable_step_checkpoints (alter table `durable_step_checkpoints` modify `events` json null).',
+    );
+    // The new table's own index is part of creating it, so it is not listed separately.
+    expect(logger.messages[0]).not.toContain('durable_schedules_due_idx');
+  });
+
+  it('lists postgres-shaped create index / add column statements', async () => {
+    const sql = [
+      'alter table "durable_signal_waiters" add column "parallel_group" varchar(255) null',
+      'create index "durable_runs_status_idx" on "durable_workflow_runs" ("status", "wake_at")',
+    ].join(';\n');
+    const logger = recordingLogger();
+
+    await ensureMikroOrmDurableSchema(
+      makeOrm(sql, async () => undefined, { platform: 'PostgreSqlPlatform' }),
+      { logger },
+    );
+
+    expect(logger.messages).toEqual([
+      expect.stringContaining(
+        'at boot: added column durable_signal_waiters.parallel_group; created index durable_runs_status_idx on durable_workflow_runs.',
+      ),
+    ]);
+  });
+
+  it('reports a MySQL collation conversion', async () => {
+    const execute = vi.fn(async (statement: string) =>
+      /information_schema/i.test(statement) ? [{ collation: 'utf8mb4_0900_ai_ci' }] : undefined,
+    );
+    const logger = recordingLogger();
+
+    await ensureMikroOrmDurableSchema(
+      makeOrm('', execute, { platform: 'MySqlPlatform', collate: 'utf8mb4_unicode_ci' }),
+      { logger },
+    );
+
+    expect(logger.messages).toHaveLength(1);
+    expect(logger.messages[0]).toContain(
+      'converted durable_workflow_runs collation from utf8mb4_0900_ai_ci to utf8mb4_unicode_ci',
+    );
+  });
+
+  it('stays quiet on a fresh install (every durable table created by this heal)', async () => {
+    const sql = [...durableManagedTables()]
+      .flatMap((table) => [
+        `create table \`${table}\` (\`id\` varchar(255) not null, primary key (\`id\`))`,
+        `create index \`${table}_idx\` on \`${table}\` (\`id\`)`,
+      ])
+      .join(';\n');
+    const logger = recordingLogger();
+
+    await ensureMikroOrmDurableSchema(
+      makeOrm(sql, async () => undefined),
+      { logger },
+    );
+
+    expect(logger.messages).toEqual([]);
+  });
+
+  it('stays quiet when the heal had nothing to apply', async () => {
+    const logger = recordingLogger();
+    await ensureMikroOrmDurableSchema(
+      makeOrm('', async () => undefined),
+      { logger },
+    );
+    expect(logger.messages).toEqual([]);
+  });
+
+  it('formats the message', () => {
+    expect(mikroOrmSchemaRepairWarning(['added column t.a'])).toMatch(
+      /^\[nestjs-durable\] store-mikro-orm repaired the durable schema at boot: added column t\.a\. .*ensureMikroOrmDurableSchema\(orm\)/,
+    );
   });
 });
 

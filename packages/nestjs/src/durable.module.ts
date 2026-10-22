@@ -11,6 +11,7 @@ import {
   STATE_STORE,
   STATE_STORE_CANONICAL,
   type ScheduledWorkflow,
+  type StalledRunInfo,
   type StateStore,
   TRANSPORT,
   TRANSPORT_CANONICAL,
@@ -284,6 +285,19 @@ export interface DurableModuleOptions {
    * See `WorkflowEngineDeps.reconcileMs`. Operator only.
    */
   reconcileMs?: number;
+  /**
+   * Idle time (ms) before a stranded in-flight run is reported to {@link onStalled} listeners.
+   * Defaults to 900000 (15 min), floored at 60000. See `WorkflowEngineDeps.stalledAfterMs`.
+   * Operator only.
+   */
+  stalledAfterMs?: number;
+  /**
+   * Pager hook for stranded runs, registered on the engine as `engine.onStalled(...)`: a run
+   * suspended with no wake timer, or parked on an old pending remote step nothing is leasing. The
+   * timer poller sweeps once a minute and reports each stranded episode once per instance.
+   * Equivalent to calling `engine.onStalled` from a provider; only a DRIVING operator sweeps.
+   */
+  onStalled?: (info: StalledRunInfo) => void;
   /**
    * The most due timers one timer-poll pass loads and drives, most overdue first, so a wave of
    * thousands of due runs is worked through in batches. Defaults to 500; a non-finite or sub-1 value
@@ -847,6 +861,7 @@ export class DurableModule {
               remoteRedispatchMs: options.remoteRedispatchMs,
               remoteRedispatchMax: options.remoteRedispatchMax,
               reconcileMs: options.reconcileMs,
+              stalledAfterMs: options.stalledAfterMs,
               timerBatchSize: options.timerBatchSize,
               eventBufferTtlMs: options.eventBufferTtlMs,
               blockedPollMs: options.blockedPollMs,
@@ -867,6 +882,7 @@ export class DurableModule {
               runDispatcher: options.drive === false ? { dispatch: () => {} } : undefined,
             });
             for (const queue of options.queues ?? []) engine.registerQueue(queue);
+            if (options.onStalled) engine.onStalled(options.onStalled);
             // Dead-letter routing (per-workflow `@DeadLetter()` / `deadLetterWorkflow` + this global
             // default) is wired by the WorkflowRegistrar, which owns the `@Workflow` metadata.
             return engine;

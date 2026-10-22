@@ -170,6 +170,16 @@ before you rely on it:
   picks a single owner for a `running` run even with several replicas racing to recover it — there's
   no split-brain double-resume. Recovery decides on the run as it reads **after** taking the lease,
   never on the listing, so a run that suspended or completed in between is left alone.
+- **A turn that lost its lease is fenced.** If a turn stalls past `leaseMs` (a blocked event loop, a
+  long GC pause, a store outage that ate its renewals), another instance can take the run over and
+  re-execute it. The stalled instance finds out on its next renewal, which reports the lease gone:
+  from then on that execution is a zombie, and the engine refuses its writes. Its completion,
+  failure, suspension, continue-as-new, saga undo or remote-turn decision is not written. It reports
+  the store's current state instead, and it does not release the lease (that lease belongs to the new
+  owner now). It logs `[nestjs-durable] lost the lease of run … while executing it`. Steps the zombie
+  already checkpointed stay checkpointed, so the new owner replays them instead of running them
+  again. A renewal that *throws* (a transient store error) is not treated as a takeover. The fence is
+  per execution: the next execution of that run on the same instance starts clean.
 - **A terminal state is final.** Settling a turn never overwrites a terminal state reached
   meanwhile: a cancel or a dead-letter that lands while the body runs survives the turn completing,
   failing or suspending.
@@ -306,10 +316,15 @@ its last completed checkpoint — the same crash-recovery path from [#3](#3-cras
 just triggered by a deploy instead of an unplanned crash. Set `shutdownTimeoutMs` above your typical
 in-flight run duration to make that the rare case rather than the common one.
 
-`drain` does not release the leases of runs still executing when it times out. They stay held until
-the process dies and the lease lapses, so another instance can take them up to `leaseMs` after the
-last renewal, not immediately. A `leaseMs` far above your step durations makes a timed-out deploy
-slower to recover. The drain runs on every operator, including a `drive: false` API pod, so runs
+When the budget runs out, `drain` **releases the recovery leases** of the runs still executing, so
+another instance's next `recoverIncomplete()` picks them up at once instead of waiting up to `leaseMs`
+for the lease to lapse. It logs `[nestjs-durable] drain timed out with N run(s) still executing;
+released their leases …` with the run ids. Each of those turns is [fenced](#3-crash-recovery-is-a-lease)
+before its lease is released. Whatever it computes after that is never written over the new owner's
+work, and a step it still has in flight may run again on the new owner, exactly as after a crash.
+The release is owner-scoped (`StateStore.releaseRunLock(runId, owner)`): a lease another instance
+already took over is left alone. A store adapter that ignores the `owner` argument releases
+unconditionally, which is only less precise in that race. The drain runs on every operator, including a `drive: false` API pod, so runs
 that pod resumed itself (a signal it handled, say) are waited for as well.
 
 ## 6. Deploys: replay-safety discipline
@@ -602,11 +617,13 @@ DurableModule.forRoot({ store, transport });
 
 Know what it covers. It encodes run `input`/`output`, checkpoint `input`/`output`, a persisted
 schedule's `input`, and buffered signal and event payloads. It leaves searchable metadata alone (ids,
-status, workflow, tags, search attributes, timestamps) along with the structured `error`, and a
-step's recorded `events`, so error messages and step logs are stored as written. It wraps the
-**store** only: tasks and results on the transport (Redis, SQS, the SQL task tables) still carry the
-plain payload, so protect the broker separately. There is no option to widen the coverage. See
-[Encrypting payloads](/docs/stores#encrypting-payloads).
+status, workflow, tags, search attributes, timestamps). By default it also leaves the structured
+`error` and a step's recorded `events` alone, so error messages and step logs are stored as written.
+Pass `{ coverage: 'extended' }` as the third argument to encode step `events`, step `error` and run
+`error` too, but only on a fresh table or with a codec whose `decode` passes through values it didn't
+encode (older rows hold those fields as plaintext). It wraps the **store** only: tasks and results on
+the transport (Redis, SQS, the SQL task tables) still carry the plain payload, so protect the broker
+separately. See [Encrypting payloads](/docs/stores#coverage).
 
 ## 12. Observability
 

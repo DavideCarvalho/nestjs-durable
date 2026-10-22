@@ -190,3 +190,34 @@ TO CHARACTER SET ... COLLATE ...` on any table that doesn't already match.
 This is idempotent (already-aligned tables are skipped), non-fatal (a failed `CONVERT` is logged as a
 warning, never crashes boot), and a no-op on Postgres/SQLite or when no `collate` is configured. It
 only runs as part of a full heal — the fingerprint gate above skips it too on a steady-state boot.
+
+### Schema repair warning
+
+When the heal changes a durable schema that already existed (it creates a table that was missing
+while the others exist, adds a column or index, changes a column type, or converts a collation), it
+logs **one** warning that lists each change:
+
+```
+[nestjs-durable] store-mikro-orm repaired the durable schema at boot: created index
+durable_schedules_due_idx on durable_schedules; added column durable_workflow_runs.origin;
+converted durable_signal_waiters collation from utf8mb4_0900_ai_ci to utf8mb4_unicode_ci. The
+database had drifted from the schema this library version expects … add a migration that calls
+`ensureMikroOrmDurableSchema(orm)`. …
+```
+
+It means the database was behind the library, the boot fixed it, and your migration history doesn't
+know. Add a migration that calls `ensureMikroOrmDurableSchema(orm)` so the change is recorded
+(it is idempotent, so on an already-repaired database it does nothing). An already-current schema
+logs nothing. A fresh install (no durable table existed yet) also logs nothing, because creating
+every table on the first boot is expected, not drift. Because of the fingerprint gate, a column
+dropped by hand after the marker was written is only noticed on the next full heal: after an
+upgrade, or after you delete the `durable_schema_meta` row.
+
+The warning goes to `console.warn` by default. To send it to your own logger, pass anything with a
+`warn(message)` method (Nest's `Logger` works):
+
+```ts
+new MikroOrmStateStore(orm, { schemaLogger: new Logger('DurableSchema') });
+// or, from a migration / script:
+await ensureMikroOrmDurableSchema(orm, { logger });
+```

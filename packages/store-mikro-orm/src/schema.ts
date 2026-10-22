@@ -54,6 +54,110 @@ const SCHEMA_LOCK_NAME = 'durable_schema';
  */
 const SCHEMA_REVISION = 1;
 
+/**
+ * Where {@link ensureMikroOrmDurableSchema} reports a schema repair it actually applied. `console`
+ * (the default) satisfies it, and so does NestJS's `Logger`, so an app can route the warning into
+ * its own log stream.
+ */
+export interface DurableSchemaLogger {
+  warn(message: string): void;
+}
+
+export interface EnsureMikroOrmDurableSchemaOptions {
+  /** Sink for the schema-repair warning. Defaults to `console`. */
+  logger?: DurableSchemaLogger | undefined;
+}
+
+/**
+ * The warning logged when the boot-time heal changed an EXISTING durable schema: created a table
+ * that was missing next to ones that exist, added a column or index, changed a column type, or
+ * converted a table's collation. Never logged when the schema was already current, and never on a
+ * fresh install (no durable table existed, so creating them all is the expected first boot).
+ *
+ * The discriminator matters more than the wording: a warning on every boot would be filtered as
+ * noise, and a silent repair hides a migration-managed schema that has drifted from the library.
+ */
+export function mikroOrmSchemaRepairWarning(repairs: readonly string[]): string {
+  return [
+    `[nestjs-durable] store-mikro-orm repaired the durable schema at boot: ${repairs.join('; ')}.`,
+    'The database had drifted from the schema this library version expects (it was created by an',
+    'older version, or a migration left these out), so they were applied at runtime and nothing',
+    'recorded them in your migration history. To make them permanent, add a migration that calls',
+    '`ensureMikroOrmDurableSchema(orm)`. This warning appears only when a repair was applied; a',
+    'schema that is already current logs nothing.',
+  ].join(' ');
+}
+
+/** Strip identifier quotes (`"x"`, `` `x` ``, `'x'`) from a DDL token. */
+function unquote(identifier: string): string {
+  return identifier.replace(/^[`"']|[`"']$/g, '');
+}
+
+/**
+ * A short, human description of one applied durable-table DDL statement, for the repair warning.
+ * Recognizes the shapes MikroORM's safe diff emits (create table / create index / alter table … add
+ * column / add index / add constraint); anything else (a type change) is quoted, trimmed.
+ */
+function describeDurableStatement(statement: string): string[] {
+  const table = targetTable(statement) ?? '?';
+  if (/^create\s+table\b/i.test(statement)) return [`created table ${table}`];
+  const createIndex = statement.match(
+    /^create\s+(?:unique\s+)?index\s+(?:if\s+not\s+exists\s+)?([`"']?[\w$]+[`"']?)/i,
+  );
+  if (createIndex?.[1]) return [`created index ${unquote(createIndex[1])} on ${table}`];
+  if (/^alter\s+table\b/i.test(statement)) {
+    const out: string[] = [];
+    let other = false;
+    // Split the alter's comma-separated actions at top level (a column type may carry `(10,2)`).
+    for (const action of splitTopLevel(
+      statement.replace(/^alter\s+table\s+[`"']?[\w$]+[`"']?\s*/i, ''),
+    )) {
+      const index = action.match(
+        /^add\s+(?:unique\s+|fulltext\s+)?(?:index|key)\s+([`"']?[\w$]+[`"']?)/i,
+      );
+      const constraint = action.match(/^add\s+constraint\s+([`"']?[\w$]+[`"']?)/i);
+      const column = action.match(/^add\s+(?:column\s+)?([`"']?[\w$]+[`"']?)/i);
+      if (index?.[1]) out.push(`created index ${unquote(index[1])} on ${table}`);
+      else if (constraint?.[1]) out.push(`added constraint ${unquote(constraint[1])} on ${table}`);
+      else if (column?.[1] && !/^add\s+(?:primary|unique|fulltext|foreign)\b/i.test(action))
+        out.push(`added column ${table}.${unquote(column[1])}`);
+      else other = true;
+    }
+    if (other || out.length === 0) {
+      const flat = statement.replace(/\s+/g, ' ');
+      out.push(`altered ${table} (${flat.length > 160 ? `${flat.slice(0, 157)}...` : flat})`);
+    }
+    return out;
+  }
+  return [`ran ${statement.replace(/\s+/g, ' ').slice(0, 160)}`];
+}
+
+/** Split on commas that are not inside parentheses or quotes. */
+function splitTopLevel(text: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let quote: string | undefined;
+  let current = '';
+  for (const ch of text) {
+    if (quote) {
+      if (ch === quote) quote = undefined;
+    } else if (ch === "'" || ch === '"' || ch === '`') {
+      quote = ch;
+    } else if (ch === '(') {
+      depth++;
+    } else if (ch === ')') {
+      depth--;
+    } else if (ch === ',' && depth === 0) {
+      parts.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
 /** A JSON value the canonical serializer understands. No `any`: the fingerprint input is plain data. */
 type JsonScalar = string | number | boolean | null;
 type JsonValue = JsonScalar | JsonValue[] | { [key: string]: JsonValue };
@@ -255,8 +359,18 @@ async function releaseSchemaLock(orm: MikroORM, dialect: SqlDialect): Promise<vo
  * the marker + one PK read), skipping BOTH the introspection AND the collation probes. Only a fresh
  * DB (no marker), an entity change, or a {@link SCHEMA_REVISION} bump runs the full heal — under a
  * best-effort advisory lock, with a re-check in case a sibling pod healed while we waited.
+ *
+ * When the heal changes an existing durable schema (a missing table, column or index, a column type,
+ * a MySQL collation), it logs ONE warning listing each change to `options.logger` (default
+ * `console`); see {@link mikroOrmSchemaRepairWarning}. A current schema and a fresh install log
+ * nothing. Because of the fingerprint gate, a column dropped by hand AFTER the marker was written is
+ * not noticed until the fingerprint changes (an upgrade) or the marker row is deleted.
  */
-export async function ensureMikroOrmDurableSchema(orm: MikroORM): Promise<void> {
+export async function ensureMikroOrmDurableSchema(
+  orm: MikroORM,
+  options: EnsureMikroOrmDurableSchemaOptions = {},
+): Promise<void> {
+  const logger = options.logger ?? console;
   const dialect = detectSqlDialect(orm);
 
   // 1. Bootstrap the marker table. Idempotent, no introspection — works on a brand-new empty DB,
@@ -278,8 +392,9 @@ export async function ensureMikroOrmDurableSchema(orm: MikroORM): Promise<void> 
     if ((await readStoredFingerprint(orm)) === expected) {
       return;
     }
-    await healDurableSchema(orm);
+    const { repairs, freshInstall } = await healDurableSchema(orm);
     await writeFingerprint(orm, dialect, expected);
+    if (repairs.length > 0 && !freshInstall) logger.warn(mikroOrmSchemaRepairWarning(repairs));
   } finally {
     await releaseSchemaLock(orm, dialect);
   }
@@ -288,9 +403,12 @@ export async function ensureMikroOrmDurableSchema(orm: MikroORM): Promise<void> 
 /**
  * The additive heal itself: compute the safe diff, execute only the statements targeting our durable
  * tables, then converge their collation. Extracted from {@link ensureMikroOrmDurableSchema} so the
- * fingerprint gate can skip it wholesale in steady state.
+ * fingerprint gate can skip it wholesale in steady state. Returns what it changed (for the repair
+ * warning) and whether this was a fresh install (every durable table created by this heal).
  */
-async function healDurableSchema(orm: MikroORM): Promise<void> {
+async function healDurableSchema(
+  orm: MikroORM,
+): Promise<{ repairs: string[]; freshInstall: boolean }> {
   const sql = await orm.schema.getUpdateSchemaSQL({ safe: true });
   const ours = sql
     .split(';')
@@ -300,9 +418,20 @@ async function healDurableSchema(orm: MikroORM): Promise<void> {
       return table !== undefined && DURABLE_TABLE_NAMES.has(table);
     });
   const connection = orm.em.getConnection();
+  // Tables this heal creates: their indexes come with them, so they are not listed one by one.
+  const created = new Set(
+    ours
+      .filter((statement) => /^create\s+table\b/i.test(statement))
+      .map((statement) => targetTable(statement) as string),
+  );
+  const repairs: string[] = [];
   for (const statement of ours) {
     try {
       await connection.execute(statement);
+      const table = targetTable(statement) as string;
+      const isCreateTable = /^create\s+table\b/i.test(statement);
+      if (isCreateTable || !created.has(table))
+        repairs.push(...describeDurableStatement(statement));
     } catch (err) {
       // Required structure (create table / add column / add index) must succeed — rethrow.
       if (isRequiredStructure(statement)) {
@@ -321,7 +450,12 @@ async function healDurableSchema(orm: MikroORM): Promise<void> {
   }
 
   // Converge collation last, once the tables exist (whether just created above or pre-existing).
-  await alignDurableCollation(orm);
+  const converted = await alignDurableCollation(orm);
+  for (const { table, from, to } of converted) {
+    if (!created.has(table)) repairs.push(`converted ${table} collation from ${from} to ${to}`);
+  }
+  const freshInstall = [...DURABLE_TABLE_NAMES].every((table) => created.has(table));
+  return { repairs, freshInstall };
 }
 
 /** A MySQL identifier we are willing to interpolate into DDL (charset / collation names). */
@@ -339,21 +473,25 @@ function isSafeSqlIdentifier(value: string): boolean {
  * here: read the configured collation and `CONVERT` only the durable tables whose collation differs.
  *
  * Idempotent (matching tables are skipped), non-fatal (a CONVERT failure is warned, never crashes
- * boot), and a no-op when no `collate` is configured or the platform isn't MySQL/MariaDB.
+ * boot), and a no-op when no `collate` is configured or the platform isn't MySQL/MariaDB. Returns
+ * the tables it converted.
  */
-async function alignDurableCollation(orm: MikroORM): Promise<void> {
+async function alignDurableCollation(
+  orm: MikroORM,
+): Promise<Array<{ table: string; from: string; to: string }>> {
+  const converted: Array<{ table: string; from: string; to: string }> = [];
   const platform = String(orm.em.getPlatform().constructor.name).toLowerCase();
   if (!platform.includes('mysql') && !platform.includes('maria')) {
-    return;
+    return converted;
   }
   const collate = orm.config.get('collate');
   if (typeof collate !== 'string' || !isSafeSqlIdentifier(collate)) {
-    return;
+    return converted;
   }
   // utf8mb4_unicode_ci → utf8mb4. CONVERT TO needs the charset that owns the collation.
   const charset = collate.split('_')[0];
   if (!charset || !isSafeSqlIdentifier(charset)) {
-    return;
+    return converted;
   }
   const connection = orm.em.getConnection();
   for (const table of DURABLE_TABLE_NAMES) {
@@ -370,6 +508,7 @@ async function alignDurableCollation(orm: MikroORM): Promise<void> {
       await connection.execute(
         `alter table \`${table}\` convert to character set ${charset} collate ${collate}`,
       );
+      converted.push({ table, from: current, to: collate });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.warn(
@@ -377,4 +516,5 @@ async function alignDurableCollation(orm: MikroORM): Promise<void> {
       );
     }
   }
+  return converted;
 }

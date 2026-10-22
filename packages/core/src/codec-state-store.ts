@@ -29,17 +29,38 @@ export interface PayloadCodec {
   decode(value: unknown): unknown;
 }
 
+/** What {@link CodecStateStore} runs through the codec. */
+export interface CodecStateStoreOptions {
+  /**
+   * `'payloads'` (default, the historical behaviour): run/step `input` + `output` only (plus a
+   * schedule's `input` and buffered signal/event payloads, which are always encoded). **Know what
+   * that leaves in the clear**: step `events` (everything step code passes to `ctx.log` and every
+   * sub-step outcome) and the structured step/run `error` (message, stack, details). A deployment
+   * sold as "encrypted payloads" still leaks whatever its steps log or throw.
+   *
+   * `'extended'`: also encode step `events`, step `error` and run `error`. Searchable metadata (ids,
+   * status, workflow, tags, search attributes, namespace, origin, timestamps) stays clear — it must
+   * remain queryable. ONLY enable on a FRESH table, or with a codec whose `decode` recognizes its own
+   * ciphertext and passes other values through: rows written before the switch hold those fields as
+   * plaintext, and a decode that can't tell would garble them.
+   */
+  coverage?: 'payloads' | 'extended';
+}
+
 /**
- * A `StateStore` decorator that runs run/step **payloads** (input + output) through a
- * {@link PayloadCodec} — encoded on write, decoded on read — so they're never stored in the clear.
- * Adapter-agnostic: wrap any store. Searchable metadata (id, status, workflow, tags, timestamps) and
- * the structured `error` are left untouched so the dashboard, queries, and recovery still work.
+ * A `StateStore` decorator that runs run/step **payloads** through a {@link PayloadCodec} — encoded
+ * on write, decoded on read — so they're never stored in the clear. Adapter-agnostic: wrap any
+ * store. Searchable metadata (id, status, workflow, tags, timestamps) is left untouched so the
+ * dashboard, queries, and recovery still work. See {@link CodecStateStoreOptions.coverage} for
+ * exactly which fields are covered — the default covers `input`/`output` only.
  *
  * ```ts
- * const store = new CodecStateStore(new TypeOrmStateStore(ds), aesCodec);
+ * const store = new CodecStateStore(new TypeOrmStateStore(ds), aesCodec, { coverage: 'extended' });
  * ```
  */
 export class CodecStateStore implements StateStore {
+  private readonly extended: boolean;
+
   /** Atomic claims touch only searchable metadata and bypass payload encoding. */
   readonly tryAdmitSingleton?: (
     runId: string,
@@ -51,9 +72,9 @@ export class CodecStateStore implements StateStore {
 
   /**
    * Forwarded verbatim — a facet cell counts `status`/`origin`, neither of which the codec touches
-   * (it encodes payloads: input/output/error). Bound as a PROPERTY, and only when the inner store
-   * actually aggregates, so `store.runFacets?.()` still reports absence through the wrapper instead
-   * of resolving to a silently wrong empty result.
+   * (it encodes payloads: input/output, plus events/error under `extended` coverage). Bound as a
+   * PROPERTY, and only when the inner store actually aggregates, so `store.runFacets?.()` still
+   * reports absence through the wrapper instead of resolving to a silently wrong empty result.
    */
   readonly runFacets?: (query: RunFacetQuery) => Promise<RunFacetRow[]>;
 
@@ -152,7 +173,9 @@ export class CodecStateStore implements StateStore {
   constructor(
     private readonly inner: StateStore,
     private readonly codec: PayloadCodec,
+    options: CodecStateStoreOptions = {},
   ) {
+    this.extended = options.coverage === 'extended';
     if (inner.tryAdmitSingleton) this.tryAdmitSingleton = inner.tryAdmitSingleton.bind(inner);
     const deleteRuns = inner.deleteRuns;
     if (deleteRuns) this.deleteRuns = (ids) => deleteRuns.call(inner, ids);
@@ -239,16 +262,36 @@ export class CodecStateStore implements StateStore {
   }
 
   private encRun(run: WorkflowRun): WorkflowRun {
-    return { ...run, input: this.enc(run.input), output: this.enc(run.output) };
+    const next = { ...run, input: this.enc(run.input), output: this.enc(run.output) };
+    if (this.extended && run.error !== undefined) {
+      next.error = this.enc(run.error) as WorkflowRun['error'];
+    }
+    return next;
   }
   private decRun<T extends WorkflowRun | null>(run: T): T {
-    return (run && { ...run, input: this.dec(run.input), output: this.dec(run.output) }) as T;
+    if (!run) return run;
+    const next = { ...run, input: this.dec(run.input), output: this.dec(run.output) };
+    if (this.extended && run.error !== undefined) {
+      next.error = this.dec(run.error) as WorkflowRun['error'];
+    }
+    return next;
   }
   private encCp(cp: StepCheckpoint): StepCheckpoint {
-    return { ...cp, input: this.enc(cp.input), output: this.enc(cp.output) };
+    const next = { ...cp, input: this.enc(cp.input), output: this.enc(cp.output) };
+    if (this.extended) {
+      if (cp.events !== undefined) next.events = this.enc(cp.events) as StepCheckpoint['events'];
+      if (cp.error !== undefined) next.error = this.enc(cp.error) as StepCheckpoint['error'];
+    }
+    return next;
   }
   private decCp<T extends StepCheckpoint | null>(cp: T): T {
-    return (cp && { ...cp, input: this.dec(cp.input), output: this.dec(cp.output) }) as T;
+    if (!cp) return cp;
+    const next = { ...cp, input: this.dec(cp.input), output: this.dec(cp.output) };
+    if (this.extended) {
+      if (cp.events !== undefined) next.events = this.dec(cp.events) as StepCheckpoint['events'];
+      if (cp.error !== undefined) next.error = this.dec(cp.error) as StepCheckpoint['error'];
+    }
+    return next;
   }
 
   private encSpec(spec: Record<string, unknown>): Record<string, unknown> {
@@ -276,6 +319,10 @@ export class CodecStateStore implements StateStore {
     const next = { ...patch };
     if ('input' in patch) next.input = this.enc(patch.input);
     if ('output' in patch) next.output = this.enc(patch.output);
+    // An explicit `error: undefined` clears the column — leave it undefined, never encode it.
+    if (this.extended && patch.error !== undefined) {
+      next.error = this.enc(patch.error) as WorkflowRun['error'];
+    }
     return next;
   }
   async getRun(runId: string): Promise<WorkflowRun | null> {
@@ -316,8 +363,10 @@ export class CodecStateStore implements StateStore {
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean> {
     return this.inner.tryLockRun(runId, owner, leaseUntilMs, nowMs);
   }
-  releaseRunLock(runId: string): Promise<void> {
-    return this.inner.releaseRunLock(runId);
+  releaseRunLock(runId: string, owner?: string): Promise<void> {
+    return owner === undefined
+      ? this.inner.releaseRunLock(runId)
+      : this.inner.releaseRunLock(runId, owner);
   }
   renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
     return this.inner.renewRunLock(runId, owner, leaseUntilMs);

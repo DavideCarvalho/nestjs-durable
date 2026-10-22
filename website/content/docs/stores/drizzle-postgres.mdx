@@ -68,6 +68,35 @@ The two are the same schema: the shipped DDL is byte-for-byte what `drizzle-kit 
 `pgTable`s, and a real-Postgres spec pins them against each other — so a database created by
 `ensureSchema()` reports **no changes** under `drizzle-kit push`, and you can switch options later.
 
+### Schema repair warning
+
+The DDL is all `IF NOT EXISTS`, which doesn't report whether it created anything. So before running
+it, `ensureDrizzlePgDurableSchema` reads the current durable tables, columns and indexes from the
+catalog (inside the advisory lock). When it creates something on a durable schema that already
+existed (a table that was missing while the others exist, or a missing index), it logs **one**
+warning after the transaction commits, listing each change:
+
+```
+[nestjs-durable] store-drizzle repaired the durable schema at boot: created table
+durable_schedules; created index durable_runs_tags_gin_idx on durable_workflow_runs. The database
+had drifted from the schema this library version expects … generate a drizzle-kit migration from
+`durablePgSchema` (or apply `DURABLE_PG_DDL` in a migration). …
+```
+
+It means the database was behind the library, and the boot fixed it without a migration. If
+drizzle-kit owns your migrations (Option A), generate one so the change is recorded. An
+already-current schema logs nothing. A fresh install (no durable table existed yet) also logs
+nothing, because creating every table on the first boot is expected, not drift.
+
+The warning goes to `console.warn` by default. To send it to your own logger, pass anything with a
+`warn(message)` method (Nest's `Logger` works):
+
+```ts
+new DrizzlePgStateStore(db, { schemaLogger: new Logger('DurableSchema') });
+// or, from a migration / script:
+await ensureDrizzlePgDurableSchema(db, { logger });
+```
+
 ## Schema
 
 Canonical table + column names (the same `durable_*` / snake_case contract as every other adapter),

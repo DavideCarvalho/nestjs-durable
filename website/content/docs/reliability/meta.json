@@ -10,6 +10,7 @@
     "concurrency-quotas",
     "on-error",
     "dead-letter",
+    "stalled-runs",
     "retention"
   ]
 }

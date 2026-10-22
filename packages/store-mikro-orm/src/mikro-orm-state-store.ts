@@ -84,7 +84,7 @@ import {
   StepCheckpointEntity,
   WorkflowRunEntity,
 } from './entities';
-import { ensureMikroOrmDurableSchema } from './schema';
+import { type DurableSchemaLogger, ensureMikroOrmDurableSchema } from './schema';
 
 /** Options for scoping a `MikroOrmStateStore` to a single tenant namespace. */
 export interface MikroOrmStateStoreOptions {
@@ -96,6 +96,12 @@ export interface MikroOrmStateStoreOptions {
   scope?: {
     namespace?: string;
   };
+  /**
+   * Where `ensureSchema()` (the boot-time auto-schema) reports a schema repair it actually applied
+   * — a missing table, column or index it had to add. Defaults to `console`. NestJS's `Logger`
+   * satisfies it.
+   */
+  schemaLogger?: DurableSchemaLogger | undefined;
 }
 
 /**
@@ -111,9 +117,9 @@ export class MikroOrmStateStore implements StateStore {
 
   constructor(
     private readonly orm: MikroORM,
-    opts?: MikroOrmStateStoreOptions,
+    private readonly opts: MikroOrmStateStoreOptions = {},
   ) {
-    this.scopeNamespace = opts?.scope?.namespace;
+    this.scopeNamespace = opts.scope?.namespace;
   }
 
   /**
@@ -123,7 +129,7 @@ export class MikroOrmStateStore implements StateStore {
    * reconstruct it. Pass `{ namespace: undefined }` for the unscoped operator view.
    */
   withScope(scope: { namespace?: string }): MikroOrmStateStore {
-    return new MikroOrmStateStore(this.orm, { scope });
+    return new MikroOrmStateStore(this.orm, { ...this.opts, scope });
   }
 
   /**
@@ -139,7 +145,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async ensureSchema(): Promise<void> {
-    await ensureMikroOrmDurableSchema(this.orm);
+    await ensureMikroOrmDurableSchema(this.orm, { logger: this.opts.schemaLogger });
   }
 
   async tryAdmitSingleton(
@@ -457,9 +463,13 @@ export class MikroOrmStateStore implements StateStore {
     return affected === 1;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
     const em = this.fork();
-    await em.nativeUpdate(WorkflowRunEntity, { id: runId }, { lockedBy: null, lockedUntil: null });
+    await em.nativeUpdate(
+      WorkflowRunEntity,
+      owner === undefined ? { id: runId } : { id: runId, lockedBy: owner },
+      { lockedBy: null, lockedUntil: null },
+    );
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {

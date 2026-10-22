@@ -19,6 +19,12 @@ import { DashboardLoginRedirectFilter } from './auth/login-redirect.exception.js
 import { DashboardService } from './dashboard.service.js';
 import { DurableApiController } from './durable-api.controller.js';
 import { DurableAuthController } from './durable-auth.controller.js';
+import {
+  DASHBOARD_GATE,
+  type DashboardGateOptions,
+  DurableDashboardGateGuard,
+  dashboardGateProvider,
+} from './durable-dashboard-gate.guard.js';
 import { DurableApiSessionGuard, DurableUiSessionGuard } from './durable-session.guard.js';
 import {
   DASHBOARD_API_PATH,
@@ -53,8 +59,10 @@ export interface DurableDashboardOptions {
    * Guard classes fronting BOTH dashboard controllers (the SPA at `basePath` and its JSON API at
    * `apiBasePath`). Stamped onto each controller via `@nestjs/common`'s own `@UseGuards` metadata key
    * — REPLACE semantics, so a second `forRoot(...)` call overwrites (not appends to) whatever a prior
-   * call stamped, same as re-applying `@UseGuards` by hand. Omit to leave the routes unguarded (the
-   * host fronts them another way, e.g. a global guard or reverse-proxy auth).
+   * call stamped, same as re-applying `@UseGuards` by hand. A non-empty `guards` counts as the
+   * console's authentication, so the fail-closed default gate steps aside (see
+   * {@link allowUnauthenticated}). If the host fronts the routes another way (a global guard,
+   * reverse-proxy auth), say so with `allowUnauthenticated: true` instead.
    *
    * A guard's own DEPENDENCIES resolve from this module's `imports` (see {@link imports}) — the
    * dashboard module has no application context of its own to pull them from otherwise.
@@ -115,15 +123,36 @@ export interface DurableDashboardOptions {
    *
    * Composes with {@link guards}: when both are set, a request must pass the built-in session check
    * AND every guard in `guards` — the SAME logical-AND semantics `@UseGuards` already gives multiple
-   * guards, since the built-in guard is simply prepended to whatever `guards` you pass. Omit to leave
-   * the console open (today's behavior, unchanged byte-for-byte) — front it with `guards`, a global
-   * guard, or a reverse proxy instead.
+   * guards, since the built-in guard is simply prepended to whatever `guards` you pass. Setting it
+   * counts as the console's authentication (the fail-closed default gate steps aside). Omit it and
+   * configure `guards`, a {@link token}, or {@link allowUnauthenticated} instead.
    *
    * See {@link DashboardAuthOptions} for the `secret`/`ttl`/`session`/`login`/`revalidate` shape,
    * and `forRootAsync` / {@link DurableDashboardAsyncOptions.useDashboardAuth} when a hook needs DI
    * (e.g. an `EntityManager` to look up an admin user).
    */
   dashboardAuth?: DashboardAuthOptions;
+  /**
+   * Explicitly serve the console with NO authentication from this module. Use it only when
+   * something outside the module already protects it: a global guard, a reverse proxy / SSO in
+   * front of the mount, a private network. Logs a boot warning.
+   *
+   * Without it, an unconfigured console (no `guards`, no `dashboardAuth`, no token) is DENIED when
+   * `NODE_ENV=production` (every UI and API request answers `403`, and one boot error explains how
+   * to configure it). Outside production it is still served open, with a boot warning. Ignored when
+   * `guards`, `dashboardAuth` or a token is configured.
+   */
+  allowUnauthenticated?: boolean;
+  /**
+   * Bearer-token gate for the console. Defaults to `process.env.DURABLE_DASHBOARD_TOKEN` (read at
+   * boot). Only applies when neither `guards` nor `dashboardAuth` is configured: every UI and API
+   * request must then carry it as `Authorization: Bearer <token>`, an `x-durable-token` header, or
+   * (GET/HEAD only) a `?token=` query param, compared in constant time; anything else gets `401`.
+   *
+   * Meant for scripts and reverse proxies that inject the header: the bundled SPA does not attach
+   * the token to its own asset and API requests. Browser operators want `dashboardAuth` or `guards`.
+   */
+  token?: string;
 }
 
 /**
@@ -132,7 +161,9 @@ export interface DurableDashboardOptions {
  * already has), but `dashboardAuth` is built by an injected factory, so its `session`/`login` hooks
  * can reach your DB/services — e.g. Mode A's `session` hook calling out to the same auth service
  * your host app already uses to validate the raw request. Returning `undefined` from
- * `useDashboardAuth` leaves the console open, exactly like omitting `dashboardAuth` from `forRoot`.
+ * `useDashboardAuth` is exactly like omitting `dashboardAuth` from `forRoot`: the console then
+ * falls back to `guards` / the token / `allowUnauthenticated`, and is DENIED in production when
+ * none of those is configured.
  */
 export interface DurableDashboardAsyncOptions {
   basePath?: string;
@@ -141,10 +172,14 @@ export interface DurableDashboardAsyncOptions {
   imports?: DynamicModule['imports'];
   /** Providers injected into `useDashboardAuth`, in order. Shared with a `guards` class's own deps. */
   inject?: Array<InjectionToken | OptionalFactoryDependency>;
-  /** Build the `dashboardAuth` config from injected deps (or `undefined` to leave the console open). */
+  /** Build the `dashboardAuth` config from injected deps (or `undefined` for no session auth). */
   useDashboardAuth: (
     ...deps: any[]
   ) => DashboardAuthOptions | undefined | Promise<DashboardAuthOptions | undefined>;
+  /** See {@link DurableDashboardOptions.allowUnauthenticated}. */
+  allowUnauthenticated?: boolean;
+  /** See {@link DurableDashboardOptions.token}. */
+  token?: string;
 }
 
 /** Leading slash, no trailing slash. */
@@ -155,17 +190,19 @@ function normalize(path: string): string {
 /**
  * Stamp (or clear) `@UseGuards`-equivalent metadata on a dashboard controller — REPLACE, not
  * append, across repeated calls (a second `forRoot(...)` overwrites whatever a prior call
- * stamped). `builtIn`, when given, is always prepended FIRST — it's the `dashboardAuth` session
- * guard for that controller, which must run before any host `guards` (fail the session check
- * before ever invoking host auth). Passing neither reproduces today's behavior byte-for-byte
- * (an empty array — the controller unguarded).
+ * stamped). `builtIn` guards, when given, are always prepended FIRST, in order — the
+ * `dashboardAuth` session guard for that controller, then the fail-closed gate — so they run before
+ * any host `guards` (fail the session check before ever invoking host auth).
  */
 function stampGuards(
   hostGuards: Type<CanActivate>[] | undefined,
-  builtIn: Type<CanActivate> | undefined,
+  builtIn: Array<Type<CanActivate> | undefined>,
   controller: Type,
 ): void {
-  const merged = [...(builtIn ? [builtIn] : []), ...(hostGuards ?? [])];
+  const merged = [
+    ...builtIn.filter((guard): guard is Type<CanActivate> => guard !== undefined),
+    ...(hostGuards ?? []),
+  ];
   Reflect.defineMetadata(GUARDS_METADATA, merged, controller);
 }
 
@@ -188,10 +225,17 @@ export class DurableApiModule {
      *  (true whenever `dashboardAuth` was set, or unconditionally for `forRootAsync`, where it's
      *  resolved at runtime and is a no-op if it ends up unconfigured). */
     authMayBeConfigured: boolean;
+    /** What the fail-closed gate needs; resolved into `DASHBOARD_GATE` at boot (logged once). */
+    gate: DashboardGateOptions;
+    /** Whether `DurableDashboardGateGuard` is stamped (false when guards/dashboardAuth are static). */
+    stampGate: boolean;
   }): DynamicModule {
     stampGuards(
       options.guards,
-      options.authMayBeConfigured ? DurableApiSessionGuard : undefined,
+      [
+        options.authMayBeConfigured ? DurableApiSessionGuard : undefined,
+        options.stampGate ? DurableDashboardGateGuard : undefined,
+      ],
       DurableApiController,
     );
     return {
@@ -227,9 +271,13 @@ export class DurableApiModule {
         RunFilter,
         options.authProvider,
         DurableApiSessionGuard,
+        // Resolved ONCE here (this module is imported by the UI module, which reuses it via the
+        // export below), so the boot report is logged once per mount.
+        dashboardGateProvider(options.gate),
+        DurableDashboardGateGuard,
         ...(options.guards ?? []),
       ],
-      exports: [DashboardService],
+      exports: [DashboardService, DASHBOARD_GATE],
     };
   }
 }
@@ -241,6 +289,8 @@ export class DurableApiModule {
  * so it resolves the engine and store. Front the routes with the first-class `guards` option
  * (plus `imports` for the guards' own dependencies) — see {@link DurableDashboardOptions.guards} —
  * or with the built-in `dashboardAuth` cookie login, or both.
+ * With none of those (and no `token` / `allowUnauthenticated`), the console fails closed when
+ * `NODE_ENV=production` — see {@link DurableDashboardOptions.allowUnauthenticated}.
  */
 @Module({})
 export class DurableDashboardModule {
@@ -249,7 +299,8 @@ export class DurableDashboardModule {
       provide: DASHBOARD_AUTH,
       useValue: resolveDashboardAuth(options.dashboardAuth),
     };
-    return DurableDashboardModule.build(options, authProvider, options.dashboardAuth !== undefined);
+    const authConfigured = options.dashboardAuth !== undefined;
+    return DurableDashboardModule.build(options, authProvider, authConfigured, authConfigured);
   }
 
   static forRootAsync(options: DurableDashboardAsyncOptions): DynamicModule {
@@ -262,7 +313,8 @@ export class DurableDashboardModule {
     // Always true: whether the resolved config ends up configured is only known at runtime, so the
     // guards/auth-controller wiring must always be present — `DurableUiSessionGuard`/
     // `DurableApiSessionGuard` are already no-ops when `DASHBOARD_AUTH` resolves to `null`.
-    return DurableDashboardModule.build(options, authProvider, true);
+    // Not statically configured: the fail-closed gate reads the resolved `DASHBOARD_AUTH` at boot.
+    return DurableDashboardModule.build(options, authProvider, true, false);
   }
 
   /** Shared wiring: static routing + the API module, with `dashboardAuth` supplied by `authProvider`. */
@@ -272,15 +324,34 @@ export class DurableDashboardModule {
       apiBasePath?: string;
       guards?: Type<CanActivate>[];
       imports?: DynamicModule['imports'];
+      allowUnauthenticated?: boolean;
+      token?: string;
     },
     authProvider: Provider,
     authMayBeConfigured: boolean,
+    authStaticallyConfigured: boolean,
   ): DynamicModule {
     const basePath = normalize(options.basePath ?? '/durable');
     const apiBasePath = normalize(options.apiBasePath ?? `${basePath}/api`);
+    const hasGuards = (options.guards?.length ?? 0) > 0;
+    const gate: DashboardGateOptions = {
+      hasGuards,
+      ...(options.allowUnauthenticated !== undefined
+        ? { allowUnauthenticated: options.allowUnauthenticated }
+        : {}),
+      ...(options.token !== undefined ? { token: options.token } : {}),
+    };
+    // The gate is only stamped when the module can't already prove the console is protected:
+    // non-empty `guards` or a static `dashboardAuth` ARE the protection, so stamping a pass-through
+    // guard would be noise. Everything else (no auth, or `forRootAsync`'s runtime-resolved auth)
+    // gets the gate, which decides at boot.
+    const stampGate = !hasGuards && !authStaticallyConfigured;
     stampGuards(
       options.guards,
-      authMayBeConfigured ? DurableUiSessionGuard : undefined,
+      [
+        authMayBeConfigured ? DurableUiSessionGuard : undefined,
+        stampGate ? DurableDashboardGateGuard : undefined,
+      ],
       DurableUiController,
     );
     return {
@@ -295,6 +366,8 @@ export class DurableDashboardModule {
           ...(options.guards ? { guards: options.guards } : {}),
           authProvider,
           authMayBeConfigured,
+          gate,
+          stampGate,
         }),
         RouterModule.register([
           { path: basePath, module: DurableDashboardModule }, // the UI + auth controllers below
@@ -313,6 +386,8 @@ export class DurableDashboardModule {
         { provide: DASHBOARD_API_PATH, useValue: apiBasePath },
         authProvider,
         DurableUiSessionGuard,
+        // `DASHBOARD_GATE` itself comes from the imported DurableApiModule (resolved once there).
+        DurableDashboardGateGuard,
         // DurableUiController (and DurableAuthController, when present) are hosted HERE, so their
         // guards DI-instantiate from this module.
         ...(options.guards ?? []),
