@@ -65,9 +65,11 @@ const transport = new BullMQTransport({
 });
 ```
 
-Total parallelism across a fleet is `concurrency × replicas`. Either mode publishes its live
-status — current limit, in-flight count, and (adaptive) the last adjustment — on the worker's
-heartbeat as a `WorkerStatus`. See [Flow control](/docs/reliability/flow-control#worker--transport-concurrency)
+Total parallelism across a fleet is `concurrency × replicas`. Only adaptive mode runs a control
+loop; a fixed limit never moves and runs no timer. Either mode publishes its live status — current
+limit, in-flight count, RSS, CPU, throughput, p95 and (adaptive) the last adjustment — on the
+worker's heartbeat as a `WorkerStatus`. Throughput is completions per minute over the trailing
+minute, so an idle worker's reading decays and drops to 0 once a minute passes with no completion. See [Flow control](/docs/reliability/flow-control#worker--transport-concurrency)
 for the full set of tunables and how the Telescope Workers dashboard renders it.
 
 ### Result concurrency

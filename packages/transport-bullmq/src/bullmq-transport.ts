@@ -620,8 +620,8 @@ export class BullMQTransport implements Transport, ControlPlane {
       void this.bridgeTaskFailure(identity, job?.failedReason ?? error.message ?? 'unknown');
     });
     this.taskWorkers.set(name, worker);
-    // Run the shared control loop (idempotent across handlers): fixed mode just tracks status;
-    // adaptive mode also re-tunes every `taskWorkers` entry's concurrency.
+    // Start the shared control loop (idempotent across handlers). Only adaptive mode runs one, which
+    // re-tunes every `taskWorkers` entry's concurrency; fixed mode just tracks status.
     controller.start();
     // This instance is now a worker for `routingToken` — start stamping its liveness heartbeat.
     this.startWorkerHeartbeat(routingToken);
