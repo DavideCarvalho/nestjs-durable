@@ -1,5 +1,9 @@
 import { hostname } from 'node:os';
-import { AdaptiveController, type ConcurrencyOption } from '@dudousxd/durable-worker';
+import {
+  AdaptiveController,
+  type ConcurrencyOption,
+  normalizeRedisConnection,
+} from '@dudousxd/durable-worker';
 import {
   type ControlMessage,
   type ControlPlane,
@@ -31,7 +35,7 @@ import {
   sanitizeQueueToken,
   tenantGroup,
 } from '@dudousxd/nestjs-durable-core';
-import { type ConnectionOptions, Queue, Worker } from 'bullmq';
+import { type ConnectionOptions, type Job, Queue, Worker } from 'bullmq';
 import { Redis, type RedisOptions } from 'ioredis';
 
 // Worker liveness heartbeat: a worker stamps a TTL'd key while it's consuming; the key expiring is
@@ -230,9 +234,25 @@ export function buildWorkerDescriptor(opts: {
   });
 }
 
+/** The part of a BullMQ `Worker` this transport touches — also satisfied by the stand-in a deferred
+ *  consumer gets until {@link BullMQTransport.startConsumers}. */
+interface ConsumerLike {
+  concurrency: number;
+  on(event: 'failed', listener: (job: Job | undefined, error: Error) => void): unknown;
+  close(): Promise<void>;
+}
+
 export interface BullMQTransportOptions {
-  /** ioredis connection options (or an IORedis instance). */
-  connection: ConnectionOptions;
+  /**
+   * ioredis connection options, an IORedis instance, or a `redis://` / `rediss://` URL (host, port,
+   * credentials, db and TLS are read from it; query parameters are refused).
+   */
+  connection: ConnectionOptions | string;
+  /**
+   * Start with every point-to-point consumer parked — see {@link BullMQTransport.deferConsumers}.
+   * Default `false`.
+   */
+  deferConsumers?: boolean;
   /**
    * Logical isolation partition suffixing every per-handler tasks queue this instance subscribes to
    * (via {@link tenantGroup}) — e.g. so several isolated worker pools can share one Redis without a
@@ -346,12 +366,19 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly handlers = new Map<string, StepHandler>();
   private readonly queues = new Map<string, Queue>();
   // One BullMQ `Worker` per registered handler name (see `handle()`) — never a single shared queue.
-  private readonly taskWorkers = new Map<string, Worker>();
-  private resultsWorker?: Worker;
-  private decisionsWorker?: Worker;
-  private stepEventsWorker?: Worker;
-  private startRunWorker?: Worker;
-  private runRequestWorker?: Worker;
+  private readonly taskWorkers = new Map<string, ConsumerLike>();
+  private resultsWorker?: ConsumerLike;
+  // Every `onResult` handler — each gets every result (see `onResult`).
+  private readonly resultHandlers = new Set<(result: StepResult) => Promise<void>>();
+  private decisionsWorker?: ConsumerLike;
+  // Every `onDecision` handler — each gets every decision (see `onDecision`).
+  private readonly decisionHandlers = new Set<(decision: WorkflowDecision) => Promise<void>>();
+  private stepEventsWorker?: ConsumerLike;
+  private startRunWorker?: ConsumerLike;
+  private runRequestWorker?: ConsumerLike;
+  // Deferred consumption (see `deferConsumers`): consumer starts parked until `startConsumers()`.
+  private consumersDeferred = false;
+  private readonly deferredStarts: Array<() => void> = [];
   // Control plane runs over Redis pub/sub (not a queue): every instance gets every message, which
   // is what live-tail + cancellation need. Subscribe needs its own connection (it blocks the client).
   private controlPub?: Redis;
@@ -401,7 +428,10 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly resultConcurrency: number;
 
   constructor(options: BullMQTransportOptions) {
-    this.connection = options.connection;
+    // A `redis://` string becomes options: BullMQ and the `{ ...connection }` spreads below would
+    // read a bare string character by character and silently connect to 127.0.0.1:6379.
+    this.connection = normalizeRedisConnection(options.connection) as ConnectionOptions;
+    this.consumersDeferred = options.deferConsumers === true;
     this.partition = options.partition;
     this.prefix = options.prefix ?? 'durable';
     this.#namespace = options.namespace;
@@ -451,6 +481,86 @@ export class BullMQTransport implements Transport, ControlPlane {
       });
     }
     return this.workerController;
+  }
+
+  /**
+   * Park every point-to-point consumer registered from now on — the task (`handle`), results,
+   * decisions, step-events, start-run and run-request workers — until {@link startConsumers}, and
+   * don't advertise this instance as a live worker meanwhile.
+   *
+   * WHY: a BullMQ `Worker` starts fetching the moment it is constructed, and these queues hand each
+   * job to ONE consumer. A process that boots the module without being a worker — a CLI command, a
+   * REPL, a migration or seed script — would otherwise compete with the real fleet: it claims jobs
+   * it then dies holding (re-run after the stalled check) and takes results addressed to the
+   * long-lived engines. Deferring makes such a process a pure producer: it still dispatches and
+   * publishes; the jobs stay on the queues. Pub/sub subscriptions (heartbeats, control, run replies,
+   * tenant events) are broadcast, take nothing from anyone, and are left alone.
+   *
+   * Call it before any consumer is registered (or pass `deferConsumers: true`); consumers already
+   * started are not stopped.
+   */
+  deferConsumers(): void {
+    this.consumersDeferred = true;
+  }
+
+  /** Start every consumer parked by {@link deferConsumers} and stop deferring. Idempotent; a no-op
+   *  when consumption was never deferred. */
+  startConsumers(): void {
+    if (!this.consumersDeferred) return;
+    this.consumersDeferred = false;
+    for (const start of this.deferredStarts.splice(0)) start();
+  }
+
+  /** Run `start` now, or on {@link startConsumers} while consumption is deferred. */
+  private whenConsuming(start: () => void): void {
+    if (this.consumersDeferred) this.deferredStarts.push(start);
+    else start();
+  }
+
+  /**
+   * A BullMQ `Worker`, unless consumption is deferred: then a stand-in that records `failed`
+   * listeners and `concurrency` assignments and builds the real worker — replaying both — on
+   * {@link startConsumers}. `close()` on a never-started stand-in is a no-op.
+   */
+  private makeWorker(
+    name: string,
+    processor: (job: Job) => Promise<unknown>,
+    opts: { concurrency?: number } = {},
+  ): ConsumerLike {
+    const build = (concurrency: number | undefined): Worker =>
+      new Worker(name, processor, {
+        connection: this.workerConnection(),
+        ...(concurrency !== undefined ? { concurrency } : {}),
+      });
+    if (!this.consumersDeferred) return build(opts.concurrency);
+    const listeners: Array<(job: Job | undefined, error: Error) => void> = [];
+    let real: Worker | undefined;
+    let closed = false;
+    let concurrency = opts.concurrency;
+    const standIn: ConsumerLike = {
+      get concurrency() {
+        return real ? real.concurrency : (concurrency ?? 1);
+      },
+      set concurrency(limit: number) {
+        if (real) real.concurrency = limit;
+        else concurrency = limit;
+      },
+      on: (_event, listener) => {
+        if (real) real.on('failed', listener);
+        else listeners.push(listener);
+        return standIn;
+      },
+      close: async () => {
+        closed = true;
+        await real?.close();
+      },
+    };
+    this.deferredStarts.push(() => {
+      if (closed) return;
+      real = build(concurrency);
+      for (const listener of listeners) real.on('failed', listener);
+    });
+    return standIn;
   }
 
   // BullMQ queue names must not contain ':' (its Redis key separator), so use '-'. `routingToken` is
@@ -545,14 +655,19 @@ export class BullMQTransport implements Transport, ControlPlane {
     );
   }
 
-  /** workflow worker → engine: consume replayed decisions. Starts the consumer on first call. */
+  /**
+   * workflow worker → engine: consume replayed decisions. Starts the consumer on first call; EVERY
+   * handler registered gets every decision (each engine sharing this transport applies it durably by
+   * run id and ignores a turn it isn't awaiting). Keeping only the first handler silently dropped the
+   * decisions of every later subscriber.
+   */
   onDecision(handler: (decision: WorkflowDecision) => Promise<void>): void {
+    this.decisionHandlers.add(handler);
     if (this.decisionsWorker) return;
-    this.decisionsWorker = new Worker(
-      this.decisionsName(),
-      (job) => handler(job.data as WorkflowDecision),
-      { connection: this.workerConnection() },
-    );
+    this.decisionsWorker = this.makeWorker(this.decisionsName(), async (job) => {
+      const decision = job.data as WorkflowDecision;
+      await Promise.all([...this.decisionHandlers].map((h) => h(decision)));
+    });
   }
 
   private stepEventsName(): string {
@@ -571,10 +686,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   /** engine ← workflow worker: consume streamed step lifecycle events. Starts the consumer on first call. */
   onStepEvent(handler: (event: WorkflowStepEvent) => Promise<void>): void {
     if (this.stepEventsWorker) return;
-    this.stepEventsWorker = new Worker(
-      this.stepEventsName(),
-      (job) => handler(job.data as WorkflowStepEvent),
-      { connection: this.workerConnection() },
+    this.stepEventsWorker = this.makeWorker(this.stepEventsName(), (job) =>
+      handler(job.data as WorkflowStepEvent),
     );
   }
 
@@ -592,8 +705,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     // shares ONE transport for dispatch AND for serving its handlers, and its handlers must subscribe
     // the `<name>@<tenant>` token its engine dispatches to. Omitted → the constructor partition.
     const routingToken = tenantGroup(sanitizeQueueToken(name), partition ?? this.partition);
-    const worker = new Worker(this.tasksName(routingToken), (job) => this.runTask(job.data), {
-      connection: this.workerConnection(),
+    const worker = this.makeWorker(this.tasksName(routingToken), (job) => this.runTask(job.data), {
       concurrency: controller.initialLimit,
     });
     // Terminal-failure bridge. A task job reaching a TERMINAL `failed` state is ALWAYS an
@@ -620,11 +732,14 @@ export class BullMQTransport implements Transport, ControlPlane {
       void this.bridgeTaskFailure(identity, job?.failedReason ?? error.message ?? 'unknown');
     });
     this.taskWorkers.set(name, worker);
-    // Start the shared control loop (idempotent across handlers). Only adaptive mode runs one, which
-    // re-tunes every `taskWorkers` entry's concurrency; fixed mode just tracks status.
-    controller.start();
-    // This instance is now a worker for `routingToken` — start stamping its liveness heartbeat.
-    this.startWorkerHeartbeat(routingToken);
+    // Once consuming (now, or on `startConsumers()` when deferred — a parked process must not be
+    // advertised as a live worker): start the shared control loop (idempotent across handlers; only
+    // adaptive mode runs one, re-tuning every `taskWorkers` entry's concurrency) and stamp this
+    // instance's liveness heartbeat for `routingToken`.
+    this.whenConsuming(() => {
+      controller.start();
+      this.startWorkerHeartbeat(routingToken);
+    });
   }
 
   private workerHeartbeatKey(routingToken: string, instanceId: string): string {
@@ -996,11 +1111,26 @@ export class BullMQTransport implements Transport, ControlPlane {
     }
   }
 
+  /**
+   * Engine side: consume step results. Starts ONE results consumer on the first call; EVERY handler
+   * registered gets every result, like {@link onDecision}. Safe for two engines sharing this
+   * transport: an engine settles a result by claiming the step's still-`pending` checkpoint, so an
+   * engine that doesn't know the run does nothing and, over one store, only one engine wins the claim
+   * (no double settle). A throwing handler fails the job and BullMQ retries it for all handlers,
+   * which the same claim makes idempotent. A second call used to start another results worker that
+   * replaced the first — `close()` never closed that one, so it kept consuming after shutdown.
+   */
   onResult(handler: (result: StepResult) => Promise<void>): void {
-    this.resultsWorker = new Worker(this.resultsName(), (job) => handler(job.data as StepResult), {
-      connection: this.workerConnection(),
-      concurrency: this.resultConcurrency,
-    });
+    this.resultHandlers.add(handler);
+    if (this.resultsWorker) return;
+    this.resultsWorker = this.makeWorker(
+      this.resultsName(),
+      async (job) => {
+        const result = job.data as StepResult;
+        await Promise.all([...this.resultHandlers].map((h) => h(result)));
+      },
+      { concurrency: this.resultConcurrency },
+    );
     this.resultsWorker.on('failed', (job, error) => {
       if (!job || job.attemptsMade < (job.opts.attempts ?? 1)) return;
       const result = job.data as StepResult;
@@ -1202,10 +1332,8 @@ export class BullMQTransport implements Transport, ControlPlane {
    *  on first call (idempotent — a second call is a no-op). */
   onStartRun(handler: (msg: StartRunMessage) => Promise<void>): void {
     if (this.startRunWorker) return;
-    this.startRunWorker = new Worker(
-      this.#startRunName(),
-      (job) => handler(job.data as StartRunMessage),
-      { connection: this.workerConnection() },
+    this.startRunWorker = this.makeWorker(this.#startRunName(), (job) =>
+      handler(job.data as StartRunMessage),
     );
   }
 
@@ -1221,10 +1349,8 @@ export class BullMQTransport implements Transport, ControlPlane {
    *  call is a no-op). */
   onRunRequest(handler: (msg: RunRequest) => Promise<void>): void {
     if (this.runRequestWorker) return;
-    this.runRequestWorker = new Worker(
-      this.#runRequestName(),
-      (job) => handler(job.data as RunRequest),
-      { connection: this.workerConnection() },
+    this.runRequestWorker = this.makeWorker(this.#runRequestName(), (job) =>
+      handler(job.data as RunRequest),
     );
   }
 
@@ -1310,6 +1436,8 @@ export class BullMQTransport implements Transport, ControlPlane {
    */
   async close(): Promise<void> {
     this.closed = true;
+    // A consumer parked by `deferConsumers()` must not start during (or after) shutdown.
+    this.deferredStarts.splice(0);
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
     if (this.pingWatchdogTimer) clearInterval(this.pingWatchdogTimer);
     this.subscribers.clear();

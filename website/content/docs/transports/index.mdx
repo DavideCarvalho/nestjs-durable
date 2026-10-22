@@ -41,6 +41,11 @@ DurableModule.forRootAsync({
 Great for splitting a workflow across modules in one app, and for tests. When you need the step
 to run elsewhere, swap the transport — the workflow code is unchanged.
 
+A result whose engine-side handler throws (the store briefly unreachable while the checkpoint is
+written) is reported through `onError` (default `console.error`) and redelivered with backoff
+(100ms doubling, capped at 5s) until `close()` — the in-memory copy is the only one. Pass it as the
+second argument: `new EventEmitterTransport(emitter, { onError })`.
+
 ## Control plane (separate from the transport)
 
 The transport is **point-to-point**: it carries a `RemoteTask` to one worker and a `StepResult`

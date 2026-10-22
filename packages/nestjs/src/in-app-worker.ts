@@ -122,6 +122,8 @@ export class InAppWorkerBootstrap
     const options = this.options;
     const runtime = this.runtime;
     if (runtime === null || !isCoLocatedWorker(options) || options.connection === undefined) return;
+    // `consumers: false`: a producer-only process (CLI, REPL, script) starts no consumer.
+    if (options.consumers === false) return;
     const handle = await this.runRedisWorker({
       runtime,
       connection: options.connection,

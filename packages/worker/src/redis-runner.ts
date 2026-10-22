@@ -11,6 +11,7 @@ import {
   tenantGroup,
 } from '@dudousxd/nestjs-durable-core';
 import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency';
+import { normalizeRedisConnection } from './redis-url';
 import {
   DEFAULT_PREFIX,
   type DurableWorkerRuntime,
@@ -265,7 +266,9 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   const instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
   const lockDuration = options.lockDuration ?? DEFAULT_LOCK_DURATION_MS;
   const deps = options.deps ?? (await loadDeps());
-  const { runtime, connection, partition } = options;
+  const { runtime, partition } = options;
+  // A `redis://` string becomes options: BullMQ would read a bare string as 127.0.0.1:6379.
+  const connection = normalizeRedisConnection(options.connection);
   // One queue TOKEN per distinct registered name (workflows ∪ steps, deduped): the token IS the
   // routing address the engine dispatches that name's tasks on — `tenantGroup(sanitizeQueueToken(
   // name), partition)` — byte-identical to the expression the engine + transport use (Task 2/4).
@@ -505,7 +508,7 @@ export async function startRun(connection: RedisConnection, opts: StartRunOption
   const effectivePrefix = effectivePrefixOf(opts.prefix ?? DEFAULT_PREFIX, opts.namespace);
   const queueName = startRunName(effectivePrefix);
   const { Queue } = opts.deps ?? (await loadStartRunDeps());
-  const queue = new Queue(queueName, { connection });
+  const queue = new Queue(queueName, { connection: normalizeRedisConnection(connection) });
   const msg: StartRunMessage = {
     tenant: opts.tenant,
     workflow: opts.workflow,
