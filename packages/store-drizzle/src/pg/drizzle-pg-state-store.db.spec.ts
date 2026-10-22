@@ -517,3 +517,21 @@ describe('Drizzle Postgres engine durability [real engine]', () => {
     await pool?.query('DROP TABLE durable_test_drafts');
   }, 30_000);
 });
+
+describe("Drizzle Postgres — '' is the default pool [real engine]", () => {
+  it("writes '' as 'default' and folds legacy '' rows into the default pool", async (ctx) => {
+    if (!available()) return ctx.skip();
+    const store = await freshStore();
+    await store.createRun(run({ id: 'blank', status: 'pending', namespace: '' }));
+    expect((await store.getRun('blank'))?.namespace).toBe('default');
+    await store.createRun(run({ id: 'legacy', status: 'pending' }));
+    // A legacy row an engine configured with `namespace: ''` wrote before the normalisation.
+    await pool?.query("UPDATE durable_workflow_runs SET namespace = '' WHERE id = 'legacy'");
+    expect((await store.getRun('legacy'))?.namespace).toBe('default');
+    expect((await store.listPendingRuns(10, 'default')).map((r) => r.id).sort()).toEqual([
+      'blank',
+      'legacy',
+    ]);
+    expect(await store.listPendingRuns(10, 'acme')).toEqual([]);
+  });
+});

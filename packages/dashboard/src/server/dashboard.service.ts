@@ -251,7 +251,15 @@ export class DashboardService {
     if (!run || TERMINAL_RUN_STATUSES.includes(run.status)) return null;
     const resolved = await store.getCheckpoint(parsed.runId, parsed.seq);
     if (resolved?.status === 'completed') return null;
-    return (await engine.signal(token, body)) ?? { runId: run.id, status: run.status };
+    const delivered = await engine.signal(token, body);
+    if (delivered) return delivered;
+    // Buffered. A concurrent duplicate may have resolved the wait between the check above and our
+    // buffer write: then nothing will ever read this row, so take it back and answer 404. (If the
+    // take finds nothing, the waiter consumed our payload itself — a real delivery.)
+    const now = await store.getCheckpoint(parsed.runId, parsed.seq);
+    if (now?.status === 'completed' && (await store.takeBufferedSignal(token))) return null;
+    const fresh = await store.getRun(parsed.runId);
+    return { runId: run.id, status: fresh?.status ?? run.status };
   }
 
   /** Side-effect-free read of a value a run published via `ctx.setEvent` (a live query). Control-plane-only. */

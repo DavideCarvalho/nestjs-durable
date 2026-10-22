@@ -964,7 +964,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     // An absent namespace is persisted as `'default'` (what the core `WorkflowRun.namespace` docblock
     // promises), so the column is always a value a worker can match on — the opposite of `origin`
     // below, where NULL is the only honest answer.
-    namespace: run.namespace ?? 'default',
+    namespace: run.namespace || 'default', // '' is the default pool too
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
     createdAt: run.createdAt,
@@ -1101,7 +1101,7 @@ function runUpdateSet(patch: Partial<WorkflowRun>): Record<string, unknown> {
   if ('priority' in patch) update.priority = patch.priority ?? null;
   // A patch that clears the namespace still lands on `'default'`, never NULL — the column is the
   // isolation predicate, and a NULL there would match no worker's namespace at all.
-  if ('namespace' in patch) update.namespace = patch.namespace ?? 'default';
+  if ('namespace' in patch) update.namespace = patch.namespace || 'default';
   if ('origin' in patch) update.origin = patch.origin ?? null;
   if ('createdAt' in patch) update.createdAt = patch.createdAt;
   if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;

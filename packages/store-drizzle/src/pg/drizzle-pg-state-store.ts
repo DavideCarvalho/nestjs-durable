@@ -98,9 +98,14 @@ function anyOf(conditions: (SQL | undefined)[]): SQL {
 }
 
 /** `undefined` = no restriction (the operator view), never `namespace IS NULL`. The column is
- *  NOT NULL DEFAULT 'default', so plain equality is exact. */
+ *  NOT NULL DEFAULT 'default', so plain equality is exact — except that the default pool also
+ *  matches legacy `''` rows (an engine configured with `namespace: ''` before '' was normalised). */
 function namespaceFilter(namespace: string | undefined): SQL | undefined {
-  return namespace === undefined ? undefined : eq(workflowRuns.namespace, namespace);
+  if (namespace === undefined) return undefined;
+  if (namespace === DEFAULT_NAMESPACE || namespace === '') {
+    return inArray(workflowRuns.namespace, [DEFAULT_NAMESPACE, '']);
+  }
+  return eq(workflowRuns.namespace, namespace);
 }
 
 /** `tags @> '["tag"]'::jsonb` — exact element containment (so `etl` never matches `etl-foo`), and
@@ -1083,7 +1088,7 @@ function toRunRow(run: WorkflowRun): RunInsert {
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
     priority: run.priority ?? null,
-    namespace: run.namespace ?? DEFAULT_NAMESPACE,
+    namespace: run.namespace || DEFAULT_NAMESPACE, // '' is the default pool too
     origin: run.origin ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
@@ -1110,7 +1115,7 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunInsert> {
   if ('searchAttributes' in patch) row.searchAttributes = patch.searchAttributes ?? null;
   if ('priority' in patch) row.priority = patch.priority ?? null;
   // Never cleared to NULL: an undefined namespace means the default one.
-  if ('namespace' in patch) row.namespace = patch.namespace ?? DEFAULT_NAMESPACE;
+  if ('namespace' in patch) row.namespace = patch.namespace || DEFAULT_NAMESPACE;
   if ('origin' in patch) row.origin = patch.origin ?? null;
   if (patch.createdAt != null) row.createdAt = patch.createdAt;
   if (patch.updatedAt != null) row.updatedAt = patch.updatedAt;
@@ -1134,7 +1139,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     tags: row.tags ?? undefined,
     searchAttributes: row.searchAttributes ?? undefined,
     priority: row.priority ?? undefined,
-    namespace: row.namespace,
+    namespace: row.namespace || DEFAULT_NAMESPACE, // a legacy '' row reads back as the default pool
     origin: row.origin ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,

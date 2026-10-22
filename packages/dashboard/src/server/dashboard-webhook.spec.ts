@@ -55,3 +55,37 @@ describe('DashboardService.deliverWebhook', () => {
     expect(await store.takeBufferedSignal('wh:r2:0')).toBeNull();
   });
 });
+
+describe('DashboardService.deliverWebhook — concurrent duplicate', () => {
+  it('a duplicate that lost the race to a resolved wait takes its buffered row back and 404s', async () => {
+    const { store, engine, svc, advance } = setup();
+    await engine.start('wf', {}, 'r3');
+    await engine.waitForRun('r3');
+    await svc.deliverWebhook('wh:r3:0', { ok: true });
+    await engine.resumeDueTimers(advance(20_000));
+    expect((await store.getRun('r3'))?.status).toBe('completed');
+
+    // Replay the race: the duplicate's pre-check ran while the run was still live and unresolved.
+    const realGetRun = store.getRun.bind(store);
+    const realGetCheckpoint = store.getCheckpoint.bind(store);
+    let firstRun = true;
+    let firstCp = true;
+    store.getRun = async (id) => {
+      const r = await realGetRun(id);
+      if (firstRun && r) {
+        firstRun = false;
+        return { ...r, status: 'suspended' };
+      }
+      return r;
+    };
+    store.getCheckpoint = async (id, seq) => {
+      if (firstCp) {
+        firstCp = false;
+        return null;
+      }
+      return realGetCheckpoint(id, seq);
+    };
+    expect(await svc.deliverWebhook('wh:r3:0', { ok: 'dup' })).toBeNull();
+    expect(await store.takeBufferedSignal('wh:r3:0')).toBeNull(); // no junk row left behind
+  });
+});

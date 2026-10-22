@@ -96,8 +96,14 @@ function anyOf(conditions: (SQL | undefined)[]): SQL {
 
 function namespaceFilter(namespace?: string) {
   if (namespace === undefined) return undefined;
-  if (namespace === DEFAULT_NAMESPACE)
-    return or(eq(workflowRuns.namespace, DEFAULT_NAMESPACE), isNull(workflowRuns.namespace));
+  // The default pool folds in legacy NULL rows and legacy '' rows (an engine configured with
+  // `namespace: ''` before '' was normalised to 'default').
+  if (namespace === DEFAULT_NAMESPACE || namespace === '')
+    return or(
+      eq(workflowRuns.namespace, DEFAULT_NAMESPACE),
+      eq(workflowRuns.namespace, ''),
+      isNull(workflowRuns.namespace),
+    );
   return eq(workflowRuns.namespace, namespace);
 }
 
@@ -1083,7 +1089,7 @@ function toRunRow(run: WorkflowRun): RunRow {
     // A run whose creating engine named no namespace ran in the default one, so it is written as
     // 'default' rather than left blank — the same normalization the MikroORM column default and the
     // in-memory reference store apply, so a run created here is found by a default-scoped worker.
-    namespace: run.namespace ?? DEFAULT_NAMESPACE,
+    namespace: run.namespace || DEFAULT_NAMESPACE, // '' is the default pool too
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
     createdAt: run.createdAt.getTime(),
@@ -1116,7 +1122,7 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunRow> {
   // Presence-based like the rest, but it can never be CLEARED to NULL: a patch that names namespace
   // as undefined means the default namespace, not "no tenant" (matching `toRunRow`). A patch that
   // does not mention it leaves the run in the tenant it was created in.
-  if ('namespace' in patch) row.namespace = patch.namespace ?? DEFAULT_NAMESPACE;
+  if ('namespace' in patch) row.namespace = patch.namespace || DEFAULT_NAMESPACE;
   if ('origin' in patch) row.origin = patch.origin ?? null;
   if (patch.createdAt != null) row.createdAt = patch.createdAt.getTime();
   if (patch.updatedAt != null) row.updatedAt = patch.updatedAt.getTime();
@@ -1144,7 +1150,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     // namespace TEXT` still hands back NULL for rows written before it existed. Read those as
     // 'default' — the same value `namespaceFilter` matches them with, so what a worker sees on a run
     // it picked up never contradicts why it picked it up.
-    namespace: row.namespace ?? DEFAULT_NAMESPACE,
+    namespace: row.namespace || DEFAULT_NAMESPACE,
     // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
     origin: row.origin ?? undefined,
     createdAt: new Date(row.createdAt),
