@@ -118,8 +118,10 @@ Marks a provider class as a durable workflow; its `run(ctx, input)` becomes the 
 | `singleton` | `SingletonConfig` (`{ key, limit?, maxQueueDepth? }`) | Durable FIFO mutex per key. See [Singleton workflows](/docs/reliability/singleton). |
 | `concurrency` | `ConcurrencyConfig` (`{ key, limit, countStatuses? }`) | Start-time quota per key (shared across workflows); an over-limit start throws `ConcurrencyLimitError`. See [Concurrency quotas](/docs/reliability/concurrency-quotas). |
 | `executionTimeout` | `string \| number` | Max wall-clock lifetime, counted from `createdAt`; an overrunning run — `pending`, `blocked`, `running` or `suspended` — is cancelled (`execution_timeout`) by the timer poller. See [Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap). |
-| `inputSchema` | `class` | Validate `start` input against a class-validator DTO (needs `class-validator`/`class-transformer`). |
-| `validateInput` | `(input: unknown) => void \| Promise<void>` | Custom validator; takes precedence over `inputSchema`. |
+| `input` | `IoSchema` (Standard Schema \| class-validator DTO class) | Input schema. Checked at `start` (invalid input creates no run); the run stores the input as sent, and `run()` receives the parsed value, re-parsed before every turn. See [Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap). |
+| `output` | `IoSchema` | Output schema. `run()`'s return value is parsed before the run completes; a mismatch fails it with `invalid_output`. |
+| `inputSchema` | `IoSchema` | Alias of `input`, for workflows declared before it existed. Setting both is an error. |
+| `validateInput` | `(input: unknown) => void \| Promise<void>` | Extra check at `start` (throw to reject), run after `input` parses, on the input as sent. |
 | `onEvent` | `string[]` | Start a fresh run whenever any of these events is published. Merged with `@OnDurableEvent`. |
 | `debounce` | `string \| number` | Coalesce `onEvent` triggers: fire once quiet for this long, with the last payload. |
 | `batch` | `{ maxSize: number; within: string \| number }` | Coalesce `onEvent` triggers: fire on size or window, with all payloads. |
@@ -132,7 +134,7 @@ Marks a provider method as a durable step handler, routed BY NAME (derived `Clas
 | --- | --- |
 | `@Step()` | Bare — name derived as `` `${ClassName}.${method}` ``. |
 | `@Step('custom:name')` | Explicit name override. |
-| `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs? })` | Object form — `input`/`output` are opt-in runtime zod schemas validated at the serve boundary; `retries`/`backoff`/`backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` are the def-level dispatch policy `ctx.step` reads (a per-call `opts` overrides field-by-field). See [Retries & backoff](/docs/reliability/retries). |
+| `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs? })` | Object form — `input`/`output` are opt-in runtime schemas (a Standard Schema such as zod, or a class-validator DTO class — the same forms `@Workflow` takes) validated at the serve boundary, and the method receives the parsed input; `retries`/`backoff`/`backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` are the def-level dispatch policy `ctx.step` reads (a per-call `opts` overrides field-by-field). See [Retries & backoff](/docs/reliability/retries). |
 
 | StepOptions field | Type | Notes |
 | --- | --- | --- |

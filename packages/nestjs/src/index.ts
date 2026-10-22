@@ -8,6 +8,7 @@ export * from './entity';
 export * from './in-app-worker';
 export * from './proxy-run-gateway';
 export * from './role';
+export type { DtoClass, IoSchema } from './schema-parse';
 export * from './run-request-responder';
 export * from './step-interceptor';
 export * from './store-run-gateway';

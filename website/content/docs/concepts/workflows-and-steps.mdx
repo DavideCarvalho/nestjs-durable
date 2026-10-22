@@ -146,8 +146,9 @@ is a durable checkpoint. Walk a checkout run line by line:
 - `@Step('custom:name')` — an **explicit name** (stable across refactors, or a cross-runtime contract
   with a non-JS worker).
 - `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs? })`
-  — optional name override, opt-in runtime **zod** schemas (`input` validates before the method runs,
-  `output` before its result is handed back), and a def-level retry/backoff/liveness policy.
+  — optional name override, opt-in runtime schemas — a Standard Schema (zod, valibot, …)
+  or a class-validator DTO class, the same forms `@Workflow({ input, output })` takes (`input` validates
+  before the method runs, which receives the parsed value; `output` before its result is handed back), and a def-level retry/backoff/liveness policy.
   `backoffMaxMs` caps an exponential backoff so it doesn't grow without bound — see
   [Retries & backoff](/docs/reliability/retries).
 

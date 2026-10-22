@@ -25,10 +25,10 @@ import { scanWorkflows } from './discovery-helpers';
 import type { DurableModuleOptions } from './durable.module';
 import { entityConfigFor, getEntityMeta } from './entity';
 import { IN_APP_WORKER_BINDING, type InAppWorkerBinding } from './in-app-worker';
-import { classValidatorInput } from './input-validation';
 import { onErrorHandlersOf } from './on-error-handlers';
 import { isDrivingOperator, isOperatorRole } from './role';
 import { type DurableStepInterceptor, isStepInterceptor } from './step-interceptor';
+import { workflowIo } from './workflow-io';
 
 type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
@@ -115,11 +115,9 @@ export class WorkflowRegistrar
     // Workflow registration pass — shared scan, engine-specific registration callback.
     scanWorkflows(this.discovery, (meta, workflow, origin) => {
       if (origin === undefined) unattributed.push(meta.name);
-      // Input validation: a custom `validateInput` wins; otherwise build one from the class-validator
-      // `inputSchema` DTO (lazy — class-validator is only required if a workflow uses inputSchema).
-      const validateInput =
-        meta.validateInput ??
-        (meta.inputSchema ? classValidatorInput(meta.inputSchema) : undefined);
+      // `input`/`output` schemas: checked at start, and parsed around the body on every turn.
+      const io = workflowIo(meta);
+      const body = io.wrap((ctx, input) => workflow.run(ctx, input));
       const eventBatch = meta.debounce
         ? ({ mode: 'debounce', windowMs: parseDuration(meta.debounce) } as const)
         : meta.batch
@@ -136,7 +134,7 @@ export class WorkflowRegistrar
       for (const [name, fn] of onError.handlers) {
         this.engine.register(name, meta.version, fn, { origin });
       }
-      this.engine.register(meta.name, meta.version, (ctx, input) => workflow.run(ctx, input), {
+      this.engine.register(meta.name, meta.version, body, {
         // Stamped onto every run this workflow starts (see `WorkflowRun.origin`). Derived from the
         // class's declaring file, so a lib gets attributed without opting in; `undefined` when it
         // could not be derived, which the engine records as unknown rather than defaulting.
@@ -146,7 +144,7 @@ export class WorkflowRegistrar
         concurrency: meta.concurrency,
         executionTimeout: meta.executionTimeout,
         requires: meta.requires,
-        validateInput,
+        validateInput: io.validateAtStart,
         searchAttributesSchema: meta.searchAttributes,
         onEvent: getOnEvents(meta, workflowCtor),
         eventBatch,
