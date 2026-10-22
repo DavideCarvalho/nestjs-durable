@@ -442,6 +442,10 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
 
         await engine.start('p-root', {}, 'pr');
         await engine.start('p-other', {}, 'po');
+        // Wait for the ROOT to park too, not only the child: the root's `spawn:pc` checkpoint (the
+        // edge purge follows to find `pc`) is written after the child is started, so the child can
+        // reach `suspended` first on a slow store, and a purge then would not see the edge yet.
+        expect((await engine.waitForRun('pr', { timeoutMs: 20_000 })).status).toBe('suspended');
         expect((await engine.waitForRun('pc', { timeoutMs: 20_000 })).status).toBe('suspended');
         expect((await engine.waitForRun('po', { timeoutMs: 20_000 })).status).toBe('completed');
 
