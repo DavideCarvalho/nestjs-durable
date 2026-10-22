@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-transport-bullmq",
-  "version": "0.22.3",
+  "version": "0.22.4",
   "description": "BullMQ (Redis) Transport for nestjs-durable — cross-process and cross-language steps",
   "license": "MIT",
   "author": "Davide Carvalho",

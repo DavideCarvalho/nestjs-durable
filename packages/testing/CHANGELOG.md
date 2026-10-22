@@ -1,5 +1,15 @@
 # @dudousxd/nestjs-durable-testing
 
+## 0.20.0
+
+### Minor Changes
+
+- [#405](https://github.com/DavideCarvalho/nestjs-durable/pull/405) [`c6eaaa2`](https://github.com/DavideCarvalho/nestjs-durable/commit/c6eaaa2a1720481ac09e4dd94e8f1626c12431b4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Immediate self-reclaim after a crash, and singleton admission that is safe during a rolling upgrade.
+
+  **Self-reclaim.** Since 0.80, recovery only lists runs whose lease is free or expired. A pod with a stable `instanceId` that was killed without a graceful shutdown (OOM, SIGKILL) therefore waited up to `leaseMs` for its own leases after it restarted. Recovery now also reclaims, right away, the runs still leased by its own `instanceId` whose lease expires before this process's boot time plus `leaseMs`. Those leases were taken by the previous process. Any lease this process takes or renews expires later than that, and a run this process is executing (its in-process run gate is open) is skipped. A gate is held while such a run is recovered, so a resume landing meanwhile queues behind it. Other instances still wait for the lease to expire. `StateStore.listOrphanedRuns` takes an optional fourth argument, `ownedBy: { owner, lockedBefore }`, implemented by every bundled store, the in-memory store and `CodecStateStore`, and covered by the store contract. A custom store that ignores it keeps the 0.80 behaviour. This relies on a live `instanceId` being unique per process.
+
+  **Singleton rolling upgrade.** Replicas older than 0.73 admit singleton runs by a scan and write no `durable:singleton:admitted` tag, so a new replica could start a second run beside an old replica's holder. The holder count now also includes legacy holders: untagged `running`/`suspended`/`cancelling` runs of the key that lack the new reserved `durable:singleton:tracked` marker, or that sit inside the old scan's `limit` window. New replicas write that marker on a singleton run's first execution and on every denial (`singletonAdmissionDenialPatch` now returns `tags`). Admission and terminal settlement remove it, and it is stripped from user start tags (`SINGLETON_RESERVED_TAGS`). Legacy waiters keep their FIFO place, and the new admission takes over once a legacy holder settles. The singleton and production docs no longer tell you to drain singleton runs before upgrading.
+
 ## 0.19.1
 
 ### Patch Changes
