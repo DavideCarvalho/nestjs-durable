@@ -4507,7 +4507,12 @@ export class WorkflowEngine {
   private async requestWakeAfterTurn(runId: string): Promise<void> {
     await this.store.bufferSignal(wakeRequestToken(runId), null);
     const run = await this.store.getRun(runId);
-    if (!run || run.status === 'running') return;
+    if (run?.status === 'running') return;
+    // Gone (deleted or pruned meanwhile): no turn will take the request, so take it back.
+    if (!run) {
+      await this.takeWakeRequests(runId);
+      return;
+    }
     if (!(await this.takeWakeRequests(runId))) return;
     if (TERMINAL_RUN_STATUSES.includes(run.status)) return;
     this.recheckAfterLease(runId, run.lockedUntil);

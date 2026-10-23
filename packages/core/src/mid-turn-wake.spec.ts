@@ -168,3 +168,15 @@ describe.each([
     }, 30_000);
   });
 });
+
+describe('a kept wake for a run that is gone', () => {
+  it('is taken back when the run was deleted before the request was looked at', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    // The run vanished between the lease attempt and the re-read (a delete or a prune).
+    await (
+      engine as unknown as { requestWakeAfterTurn(runId: string): Promise<void> }
+    ).requestWakeAfterTurn('gone');
+    expect(await store.takeBufferedSignal('durable:wake-after-turn:gone')).toBeNull();
+  });
+});
