@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import { resolveCronParse } from './cron-compat';
 import type { WorkflowEngine } from './engine';
+import { type WorkflowInputOf, type WorkflowRef, workflowName } from './workflow-ref';
 
 // Resolve the optional `cron-parser` peer dependency in a way that works in BOTH the ESM and CJS
 // builds of this package (dual publish). `createRequire(import.meta.url)` gives a real `require` in
@@ -8,11 +9,20 @@ import type { WorkflowEngine } from './engine';
 // call resolves there too. This keeps the load synchronous (no async leak into the scheduler API).
 const nodeRequire = createRequire(import.meta.url);
 
-export interface ScheduledWorkflow {
+/**
+ * A recurring start of `workflow`, fired on a fixed interval or a cron.
+ *
+ * `workflow` is a registered name or a `@Workflow` class. A class types `input` against its `run`;
+ * annotate the schedule to get that check, as in
+ * `const nightly: ScheduledWorkflow<typeof ReportWorkflow> = { workflow: ReportWorkflow, … }`.
+ */
+export interface ScheduledWorkflow<W extends WorkflowRef = WorkflowRef> {
   /** Stable key identifying this schedule — part of the deterministic run id. */
   key: string;
-  workflow: string;
-  input?: unknown;
+  /** The workflow to start: a registered name (any runtime) or a `@Workflow` class. */
+  workflow: W;
+  /** The input every run starts with — typed against `run` when `workflow` is a class. */
+  input?: WorkflowInputOf<W>;
   /** Start one run every `everyMs`. Mutually exclusive with `cron`. */
   everyMs?: number;
   /**
@@ -189,7 +199,7 @@ export async function runSchedules(
     // once per schedule, before firing — the run ids below are unaffected, so idempotency holds.
     if (s.jitter && s.jitter > 0) await sleep(Math.floor(random() * s.jitter));
     for (const runId of scheduleRunIdsAt(s, nowMs)) {
-      await engine.start(s.workflow, s.input, runId);
+      await engine.start(workflowName(s.workflow), s.input, runId);
       ids.push(runId);
     }
   }

@@ -13,6 +13,19 @@ class BeatWorkflow {
   }
 }
 
+@Workflow({ name: 'report' })
+class ReportWorkflow {
+  async run(_ctx: unknown, input: { region: string }) {
+    return `report for ${input.region}`;
+  }
+}
+
+class NotAWorkflow {
+  async run() {
+    return 'never';
+  }
+}
+
 describe('scheduled workflows', () => {
   it('fires a configured schedule on bootstrap (driving operator)', async () => {
     const store = new InMemoryStateStore();
@@ -32,6 +45,49 @@ describe('scheduled workflows', () => {
     const runs = await store.listRuns({ workflow: 'beat' });
     expect(runs.length).toBe(1);
     expect(runs[0]?.output).toBe('tick');
+  });
+
+  it('takes the workflow class instead of its name', async () => {
+    const store = new InMemoryStateStore();
+    const report: ScheduledWorkflow<typeof ReportWorkflow> = {
+      key: 'report',
+      workflow: ReportWorkflow,
+      input: { region: 'eu' },
+      everyMs: 60_000,
+    };
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          store,
+          transport: new InMemoryTransport(),
+          timerPollMs: 0,
+          schedules: [report],
+        }),
+      ],
+      providers: [ReportWorkflow],
+    }).compile();
+    await moduleRef.init();
+
+    const run = await store.getRun(scheduleRunIdAt(report, Date.now()));
+    expect(run).toMatchObject({ workflow: 'report', output: 'report for eu' });
+    await moduleRef.close();
+  });
+
+  it('refuses to boot with a schedule whose class is not a @Workflow', async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          store: new InMemoryStateStore(),
+          transport: new InMemoryTransport(),
+          timerPollMs: 0,
+          schedules: [{ key: 'nope', workflow: NotAWorkflow, everyMs: 60_000 }],
+        }),
+      ],
+    }).compile();
+
+    await expect(moduleRef.init()).rejects.toThrow(
+      'workflow class NotAWorkflow has no registered name',
+    );
   });
 
   it('a dashboard-only instance (drive:false) does not fire schedules', async () => {

@@ -16,11 +16,13 @@ runtime (one per user, per tenant, per automation) see [Persisted schedules](/do
 ## Describing a schedule — `ScheduledWorkflow`
 
 ```ts
-interface ScheduledWorkflow {
+interface ScheduledWorkflow<W extends WorkflowRef = WorkflowRef> {
   /** Stable key identifying this schedule — part of the deterministic run id. */
   key: string;
-  workflow: string;
-  input?: unknown;
+  /** The workflow to start: a `@Workflow` class, or a registered name. */
+  workflow: W;
+  /** The input every run starts with — typed against `run` when `workflow` is a class. */
+  input?: WorkflowInputOf<W>;
   /** Start one run every `everyMs`. Mutually exclusive with `cron`. */
   everyMs?: number;
   /** A cron expression evaluated in `timezone`. Mutually exclusive with `everyMs`. */
@@ -57,19 +59,22 @@ then every `timerPollMs` (default 1s):
 
 ```ts title="src/schedules.ts"
 import type { ScheduledWorkflow } from '@dudousxd/nestjs-durable';
+import { CacheSyncWorkflow } from './cache/cache-sync.workflow';
+import { DailyReportWorkflow } from './reports/daily-report.workflow';
 
-// Run the `daily-report` workflow at 02:00 in São Paulo — DST-aware.
-export const dailyReport: ScheduledWorkflow = {
+// Run DailyReportWorkflow at 02:00 in São Paulo — DST-aware.
+export const dailyReport: ScheduledWorkflow<typeof DailyReportWorkflow> = {
   key: 'daily-report',
-  workflow: 'daily-report',
+  workflow: DailyReportWorkflow,
+  input: { recipients: ['ops@example.com'] },
   cron: '0 2 * * *',
   timezone: 'America/Sao_Paulo',
 };
 
-// Run the `cache-sync` workflow every five minutes.
+// Run CacheSyncWorkflow every five minutes.
 export const cacheSync: ScheduledWorkflow = {
   key: 'cache-sync',
-  workflow: 'cache-sync',
+  workflow: CacheSyncWorkflow,
   everyMs: 5 * 60 * 1000,
 };
 
@@ -107,18 +112,24 @@ DurableModule.forRootAsync({
 });
 ```
 
-Each schedule's `workflow` field is the `@Workflow` **name** it starts. There's no schedule option on
-`@Workflow` itself — schedules are deployment config (which cadence runs where), kept separate from the
-workflow definition, so the same workflow can be scheduled differently per environment or started
-ad-hoc. The `daily-report` schedule above starts this ordinary provider:
+Each schedule's `workflow` is the `@Workflow` class it starts, the same reference `ctx.child` and
+`engine.start` take. Annotating the schedule as `ScheduledWorkflow<typeof DailyReportWorkflow>` checks
+`input` against the class's `run`, so a schedule can't drift from the workflow it starts; the plain
+`ScheduledWorkflow` accepts any input. A class that isn't decorated with `@Workflow` stops the app from
+booting, instead of failing on its first fire. For a workflow that runs in another runtime (a Python
+worker, say), pass its registered **name** as a string instead.
+
+There's no schedule option on `@Workflow` itself — schedules are deployment config (which cadence runs
+where), kept separate from the workflow definition, so the same workflow can be scheduled differently
+per environment or started ad-hoc. The `daily-report` schedule above starts this ordinary provider:
 
 ```ts
 @Workflow({ name: 'daily-report', version: '1' })
 export class DailyReportWorkflow {
   constructor(private readonly reports: ReportService) {}
-  async run(ctx: WorkflowCtx) {
+  async run(ctx: WorkflowCtx, input: { recipients: string[] }) {
     const rows = await ctx.step(this.reports.gatherYesterday, undefined);
-    await ctx.step(this.reports.email, rows);
+    await ctx.step(this.reports.email, { rows, to: input.recipients });
     return { rows: rows.length };
   }
 }
@@ -136,7 +147,7 @@ on the cadence; from there it's just steps that checkpoint and resume like any o
 the same window resolves to the same run id, so re-firing the schedule within a window is a no-op.
 
 ```ts
-{ key: 'cache-sync', workflow: 'cache-sync', everyMs: 5 * 60 * 1000 } // every 5 minutes
+{ key: 'cache-sync', workflow: CacheSyncWorkflow, everyMs: 5 * 60 * 1000 } // every 5 minutes
 ```
 
 Use a fixed interval when "roughly every N" is what you want and you don't care about wall-clock
@@ -150,7 +161,7 @@ evaluated in the named timezone, it is **DST-aware** — `0 2 * * *` in `America
 02:00 local regardless of daylight-saving shifts, not at a fixed UTC offset.
 
 ```ts
-{ key: 'nightly-report', workflow: 'daily-report', cron: '0 2 * * *', timezone: 'America/Sao_Paulo' }
+{ key: 'nightly-report', workflow: DailyReportWorkflow, cron: '0 2 * * *', timezone: 'America/Sao_Paulo' }
 ```
 
 The window for a cron schedule is its most recent fire time at or before now — the deterministic
@@ -173,7 +184,7 @@ registered — the dashboard still lists it, and un-pausing it later just resume
 poller skips it entirely on every tick while paused:
 
 ```ts
-{ key: 'nightly-report', workflow: 'daily-report', cron: '0 2 * * *', paused: true }
+{ key: 'nightly-report', workflow: DailyReportWorkflow, cron: '0 2 * * *', paused: true }
 ```
 
 ## Skipping overlapping runs — `overlap`
@@ -184,7 +195,7 @@ previous window's run is still going — a slow run and a fresh one can end up i
 `running` or `suspended`:
 
 ```ts
-{ key: 'cache-sync', workflow: 'cache-sync', everyMs: 60_000, overlap: 'skip' }
+{ key: 'cache-sync', workflow: CacheSyncWorkflow, everyMs: 60_000, overlap: 'skip' }
 ```
 
 This is **fixed-interval only** (it checks the previous `everyMs` bucket) — cron windows aren't
@@ -197,7 +208,7 @@ randomly delays the dispatch by up to that many ms before firing, spreading the 
 instance hitting the store in the same instant:
 
 ```ts
-{ key: 'cache-sync', workflow: 'cache-sync', everyMs: 60_000, jitter: 5_000 } // fire within 5s of the tick
+{ key: 'cache-sync', workflow: CacheSyncWorkflow, everyMs: 60_000, jitter: 5_000 } // fire within 5s of the tick
 ```
 
 Jitter only delays *when* an instance attempts the dispatch — it does not change the run id (still the
@@ -211,7 +222,7 @@ by default, only the *current* window fires the next time the poller runs. Set `
 the windows that were missed instead:
 
 ```ts
-{ key: 'hourly-rollup', workflow: 'hourly-rollup', everyMs: 60 * 60 * 1000, backfill: { maxCatchup: 6 } }
+{ key: 'hourly-rollup', workflow: HourlyRollupWorkflow, everyMs: 60 * 60 * 1000, backfill: { maxCatchup: 6 } }
 ```
 
 `maxCatchup` bounds how many *prior* windows are backfilled, so a long outage can't flood the system
@@ -227,7 +238,7 @@ The four options compose — a schedule that skips pile-up, spreads load, and ca
 ```ts
 {
   key: 'hourly-rollup',
-  workflow: 'hourly-rollup',
+  workflow: HourlyRollupWorkflow,
   everyMs: 60 * 60 * 1000,
   overlap: 'skip', // don't pile up if a rollup runs long
   jitter: 10_000, // spread dispatch across instances ticking the same hour
