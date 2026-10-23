@@ -1,5 +1,34 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.83.0
+
+### Minor Changes
+
+- [#410](https://github.com/DavideCarvalho/nestjs-durable/pull/410) [`1b2ad79`](https://github.com/DavideCarvalho/nestjs-durable/commit/1b2ad7970a67fcaa188677ea759afaaa3919a6e9) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `schedules` takes the workflow class: `{ key: 'daily-report', workflow: DailyReportWorkflow, cron: '0 2 * * *' }`, the same reference `ctx.child` and `engine.start` take. A registered name still works, for a workflow in another runtime.
+
+  - `ScheduledWorkflow<typeof DailyReportWorkflow>` checks `input` against the class's `run`. The plain `ScheduledWorkflow` accepts any input, as before.
+  - A schedule whose class isn't decorated with `@Workflow` makes the app fail to boot, instead of failing on every tick.
+
+- [#411](https://github.com/DavideCarvalho/nestjs-durable/pull/411) [`1fb5681`](https://github.com/DavideCarvalho/nestjs-durable/commit/1fb5681eef1d0cb87bcc71d1573cbae402929008) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `runSchedules` catches up with `@adonis-agora/durable`:
+
+  - **Fix: `jitter` no longer stalls the timer poll.** A schedule with `jitter` slept up to that long on every tick, even when its window had already fired, holding up due timers, retries and timeouts behind it. It now sleeps once per window, only when the window has no run yet.
+  - Each engine remembers the windows whose run it has seen exist, so a window that already fired costs no store read on later ticks. Idempotency is unchanged: a window this process has not seen still goes to the store.
+  - `runSchedules` returns only the run ids it started. It used to return the current window's id on every call for the rest of the window.
+  - `ScheduledWorkflow.namespace` stamps the runs with a namespace instead of the firing instance's own, for a workflow only one pool can run.
+  - `runSchedules` stops firing once the engine is draining. `WorkflowEngine.isDraining()` is public.
+
+- [#403](https://github.com/DavideCarvalho/nestjs-durable/pull/403) [`6c881fd`](https://github.com/DavideCarvalho/nestjs-durable/commit/6c881fd2fa5c0d6d4138dc4e15c1738ac3957fdc) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Scheduling helpers for NestJS apps, without reaching into `-core`.
+
+  - `scheduleRunIdAt(schedule, nowMs)` is now public. It returns the run id of a schedule's window at `nowMs`, so `engine.getRun(scheduleRunIdAt(dailyReport, Date.now()))` finds the run a schedule started, from the same `ScheduledWorkflow` object the module was given, without rebuilding the id from its key, cron expression and timezone.
+  - `@dudousxd/nestjs-durable` re-exports `runSchedules`, `scheduleRunIdAt`, `scheduledRunId`, `prevCronFireMs` and the `ScheduledWorkflow` / `RunSchedulesOptions` types.
+
+- [#409](https://github.com/DavideCarvalho/nestjs-durable/pull/409) [`1874fd5`](https://github.com/DavideCarvalho/nestjs-durable/commit/1874fd5ed5689fee67b1948af1f292d4bd16a458) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `SchemaValidationError`: schema failures are one error class, with the same codes, message and `details` as `@adonis-agora/durable`.
+
+  - `@Workflow({ input, output })` and `@Step({ input, output })` throw a `SchemaValidationError` (exported from core, a `FatalError`), still with `code: 'invalid_input'` / `'invalid_output'`.
+  - `details` changes from the issues array to `{ issues }`, and the error also has `.issues`. Each issue is `{ message, path: string[] }`; `path` is now always present (`[]` for an issue on the value itself). An alert or an onError handler reading `failure.error.details[0]` must read `failure.error.details.issues[0]`.
+  - A rejected `ctx.upsertSearchAttributes` write throws a `SchemaValidationError` with `code: 'schema_validation'` (it was a plain `Error`), so it is never retried and can be routed. Its message is now `invalid workflow "<name>" ctx.upsertSearchAttributes: <key>: <message>`.
+  - An onError route for `schema_validation` — `@OnError(SchemaValidationError)`, whose `static code` it is — also catches `invalid_input` and `invalid_output` when no route names them.
+
 ## 0.82.0
 
 ### Minor Changes
