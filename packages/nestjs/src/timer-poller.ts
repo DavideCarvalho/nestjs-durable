@@ -2,6 +2,7 @@ import {
   DURABLE_OPTIONS_CANONICAL,
   WorkflowEngine,
   runSchedules,
+  workflowName,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
@@ -33,6 +34,9 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
+    // A schedule whose `workflow` is a class that was never decorated would only fail on its first
+    // fire, logged and retried every tick. Resolve every class now so the app fails to boot instead.
+    for (const s of this.options.schedules ?? []) workflowName(s.workflow);
     // Drive suspended runs forward when this operator instance is DRIVING (defaults to true) — it
     // may execute locally or dispatch remotely (group-served / convention), either way it drives. A
     // non-driving (dashboard-only) operator, or a thin worker with no `store` at all, must not

@@ -324,7 +324,7 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `deadLetterWorkflow` | `WorkflowRef` | none | Default DLQ target for workflows without their own. Operator only. |
 | `drive` | `boolean` | `true` | Whether this operator instance actively drives runs (poll/recover/resume/prune/consume). `false` = dashboard/dispatch-only. |
 | `shutdownTimeoutMs` | `number` | `10000` | Max ms to wait for in-flight runs on shutdown. Operator only. |
-| `schedules` | `ScheduledWorkflow[]` | none | Recurring workflows (fixed interval or cron), fired by the timer poller on driving instances. See [Scheduling](/docs/authoring/scheduling). |
+| `schedules` | `ScheduledWorkflow[]` | none | Recurring workflows (fixed interval or cron), fired by the timer poller on driving instances. Each `workflow` is a `@Workflow` class (resolved at boot; `ScheduledWorkflow<typeof X>` types `input`) or a registered name. See [Scheduling](/docs/authoring/scheduling). |
 | `persistedSchedules` | `boolean` | `false` | Fire the runtime-managed `engine.schedules` (stored in `durable_schedules`) on each timer-poll tick. See [Persisted schedules](/docs/authoring/persisted-schedules). |
 | `retention` | `DurableRetentionOptions` (`{ policies, sweepInterval?, batchSize? }`) | keep all history | Hard-prune terminal run history on an interval. See [Run retention & pruning](/docs/reliability/retention). |
 | `webhookUrl` | `(token: string) => string` | none (build your own) | Builds `DurableWebhook.url` for `ctx.webhook()`. Operator only. |
