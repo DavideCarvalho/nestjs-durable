@@ -221,6 +221,22 @@ const MID_TURN = [
   },
 ];
 
+/** Where the instance holding a run's lease goes down, and the first call it never gets an answer to. */
+const HOLDER_DIES = [
+  {
+    when: 'after deciding to run the turn a kept wake asks for, before running it',
+    // The lease of that turn, or its dispatch on the run queue.
+    storeTrigger: ['tryLockRun'],
+    transportTrigger: ['dispatchRuns'],
+  },
+  {
+    when: 'right after writing its suspension, before looking at the kept wake',
+    // Releasing the lease, which comes before the look.
+    storeTrigger: ['releaseRunLock'],
+    transportTrigger: [] as string[],
+  },
+];
+
 async function shutdown(all: Instance[], transports: Transport[]): Promise<void> {
   await Promise.allSettled(all.map(({ engine }) => engine.drain(2_000)));
   await Promise.allSettled(transports.map((t) => t.close?.()));
@@ -867,98 +883,103 @@ export function runRunDispatchContract(
       );
     }
 
-    it(
-      'a wake kept for a turn survives the instance that looked at it going down before running it',
-      async (ctx) => {
-        const pair = await pairOrSkip(() => ctx.skip());
-        if (!pair) return;
-        const inner = new InMemoryStateStore();
-        let now = Date.now();
-        const clock = () => now;
-        // The holder goes down once it has decided to run the turn a kept wake asks for: from then
-        // on nothing it sends to the store or the broker lands.
-        let armed = false;
-        let dead = false;
-        const hang = () => new Promise<never>(() => {});
-        const cutOff = <T extends object>(target: T, trigger: string[]): T =>
-          new Proxy(target, {
+    for (const { when, storeTrigger, transportTrigger } of HOLDER_DIES) {
+      it(
+        `a wake kept for a turn survives the instance holding the run going down ${when}`,
+        async (ctx) => {
+          const pair = await pairOrSkip(() => ctx.skip());
+          if (!pair) return;
+          const inner = new InMemoryStateStore();
+          let now = Date.now();
+          const clock = () => now;
+          // From the moment the holder goes down, nothing it sends to the store or the broker lands.
+          let armed = false;
+          let dead = false;
+          const hang = () => new Promise<never>(() => {});
+          const cutOff = <T extends object>(target: T, trigger: string[]): T =>
+            new Proxy(target, {
+              get(t, prop, receiver) {
+                const value = Reflect.get(t, prop, receiver);
+                if (typeof value !== 'function') return value;
+                return (...args: unknown[]) => {
+                  if (armed && trigger.includes(String(prop))) dead = true;
+                  return dead ? hang() : value.apply(t, args);
+                };
+              },
+            });
+          const holderStore = cutOff(inner, storeTrigger);
+          const holderTransport = cutOff(pair[0], transportTrigger);
+          let requesterDead = false;
+          const requesterStore = new Proxy(inner, {
             get(t, prop, receiver) {
               const value = Reflect.get(t, prop, receiver);
               if (typeof value !== 'function') return value;
-              return (...args: unknown[]) => {
-                if (armed && trigger.includes(String(prop))) dead = true;
-                return dead ? hang() : value.apply(t, args);
-              };
+              return (...args: unknown[]) => (requesterDead ? hang() : value.apply(t, args));
             },
           });
-        const holderStore = cutOff(inner, ['tryLockRun']);
-        const holderTransport = cutOff(pair[0], ['dispatchRuns']);
-        let requesterDead = false;
-        const requesterStore = new Proxy(inner, {
-          get(t, prop, receiver) {
-            const value = Reflect.get(t, prop, receiver);
-            if (typeof value !== 'function') return value;
-            return (...args: unknown[]) => (requesterDead ? hang() : value.apply(t, args));
-          },
-        });
-        let turns = 0;
-        let openTurn!: () => void;
-        const held = new Promise<void>((resolve) => {
-          openTurn = resolve;
-        });
-        const make = (store: StateStore, transport: Transport) => {
-          const engine = new WorkflowEngine({
-            store,
-            transport,
-            clock,
-            reconcileMs: 300_000,
+          let turns = 0;
+          let openTurn!: () => void;
+          const held = new Promise<void>((resolve) => {
+            openTurn = resolve;
           });
-          engine.register('kept', '1', async (wctx) => {
-            turns += 1;
-            if (turns === 2) await held;
-            await wctx.waitForSignal('go');
-          });
-          return engine;
-        };
-        const holder = make(holderStore, holderTransport);
-        const requester = make(requesterStore, pair[1]);
-        let survivor: WorkflowEngine | undefined;
-        try {
-          holder.consumeRuns();
-          await holder.start('kept', {}, 'p');
-          await until(async () => (await inner.getRun('p'))?.status === 'suspended', timeoutMs);
-          // The holder's turn runs; a wake for the run lands on the other instance meanwhile.
-          void holder.resume('p').catch(() => undefined);
-          await until(() => turns === 2, timeoutMs);
-          await requester.resume('p');
-          // The other instance keeps its wake, then goes down too.
-          await pause(100);
-          requesterDead = true;
-          armed = true;
-          openTurn();
-          await until(() => dead, timeoutMs);
-          expect(turns).toBe(2);
-          // A process that is gone takes nothing off the run queue either. Its closing may wait on
-          // the work it was cut off in, so it is not waited for long.
-          await Promise.race([pair[0].close?.(), pause(2_000)]);
-          // A long poll the broker had already given it ends unanswered, not with the next message.
-          await pause(1_500);
-          // A fresh instance whose timer poll is all that is left: past the holder's lease, well
-          // short of the run's reconcile wake.
-          survivor = make(inner, pair[1]);
-          survivor.consumeRuns();
-          now += 31_000;
-          await survivor.resumeDueTimers(now);
-          await until(() => turns === 3, timeoutMs);
-          expect((await inner.getRun('p'))?.status).toBe('suspended');
-        } finally {
-          openTurn();
-          requesterDead = true;
-          await Promise.allSettled([survivor?.drain(2_000)]);
-          await Promise.race([Promise.allSettled(pair.map((t) => t.close?.())), pause(5_000)]);
-        }
-      },
-      timeoutMs + 20_000,
-    );
+          const make = (store: StateStore, transport: Transport) => {
+            const engine = new WorkflowEngine({
+              store,
+              transport,
+              clock,
+              reconcileMs: 300_000,
+            });
+            engine.register('kept', '1', async (wctx) => {
+              turns += 1;
+              if (turns === 2) await held;
+              await wctx.waitForSignal('go');
+            });
+            return engine;
+          };
+          const holder = make(holderStore, holderTransport);
+          const requester = make(requesterStore, pair[1]);
+          let survivor: WorkflowEngine | undefined;
+          try {
+            holder.consumeRuns();
+            await holder.start('kept', {}, 'p');
+            await until(async () => (await inner.getRun('p'))?.status === 'suspended', timeoutMs);
+            // The holder's turn runs; a wake for the run lands on the other instance meanwhile.
+            void holder.resume('p').catch(() => undefined);
+            await until(() => turns === 2, timeoutMs);
+            await requester.resume('p');
+            // The other instance keeps its wake and sets the run's timer, then goes down too.
+            await until(async () => {
+              const run = await inner.getRun('p');
+              return run?.wakeAt !== undefined && run.wakeAt <= now + 31_000;
+            }, timeoutMs);
+            await pause(100);
+            requesterDead = true;
+            armed = true;
+            openTurn();
+            await until(() => dead, timeoutMs);
+            expect(turns).toBe(2);
+            // A process that is gone takes nothing off the run queue either. Its closing may wait on
+            // the work it was cut off in, so it is not waited for long.
+            await Promise.race([pair[0].close?.(), pause(2_000)]);
+            // A long poll the broker had already given it ends unanswered, not with the next message.
+            await pause(1_500);
+            // A fresh instance whose timer poll is all that is left: past the holder's lease, well
+            // short of the run's reconcile wake.
+            survivor = make(inner, pair[1]);
+            survivor.consumeRuns();
+            now += 31_000;
+            await survivor.resumeDueTimers(now);
+            await until(() => turns === 3, timeoutMs);
+            expect((await inner.getRun('p'))?.status).toBe('suspended');
+          } finally {
+            openTurn();
+            requesterDead = true;
+            await Promise.allSettled([survivor?.drain(2_000)]);
+            await Promise.race([Promise.allSettled(pair.map((t) => t.close?.())), pause(5_000)]);
+          }
+        },
+        timeoutMs + 20_000,
+      );
+    }
   });
 }
