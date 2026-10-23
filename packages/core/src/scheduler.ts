@@ -58,6 +58,16 @@ export interface ScheduledWorkflow<W extends WorkflowRef = WorkflowRef> {
    * deterministic bucket run id, so `engine.start` idempotency skips any that already ran.
    */
   backfill?: { maxCatchup: number };
+  /**
+   * The namespace this schedule's runs are stamped with, overriding the ticking engine's own. Opt-in;
+   * absent = the run gets the namespace of whichever engine fired it.
+   *
+   * The run id is a time bucket, so the instance that wins the race to fire a window decides which
+   * namespace (worker pool) the run lands in. When the workflow can only run in one pool — its steps
+   * need a capability only that pool's workers have — pin it here, so whoever fires the window, the
+   * run is stamped for (and only picked up by) that pool.
+   */
+  namespace?: string;
 }
 
 /** Injectable dispatch-path effects (kept out of the deterministic run-id logic). Defaults to real
@@ -172,22 +182,38 @@ function scheduleRunIdsAt(s: ScheduledWorkflow, nowMs: number): string[] {
  * Start each schedule's current-window run. The run id is the time bucket (a fixed-interval index,
  * or the cron fire time) and `engine.start` is idempotent, so firing this on an interval — or
  * racing two instances on the same tick — starts **each window exactly once**. Wire it to a
- * `setInterval`, the durable timer poller, or `@nestjs/schedule`. Returns the run ids for the
- * current windows.
+ * `setInterval`, the durable timer poller, or `@nestjs/schedule`. Returns the run ids this call
+ * started: a window that already has a run is not started or returned again, and once this process
+ * has seen a window's run exist, later calls in that window skip it without a store read or a
+ * jitter sleep.
  */
 export async function runSchedules(
-  engine: Pick<WorkflowEngine, 'start' | 'getRun'>,
+  engine: Pick<WorkflowEngine, 'start' | 'getRun'> & Partial<Pick<WorkflowEngine, 'isDraining'>>,
   schedules: readonly ScheduledWorkflow[],
   nowMs: number,
   opts?: RunSchedulesOptions,
 ): Promise<string[]> {
   const random = opts?.random ?? Math.random;
   const sleep = opts?.sleep ?? defaultSleep;
+  const settled = settledIdsFor(engine);
   const ids: string[] = [];
   for (const s of schedules) {
+    if (engine.isDraining?.()) break; // shutting down: fire no further windows
     if (s.paused) continue;
+
+    // The windows that might still need firing: every one this process has not already seen exist.
+    // A run id is derived from the window's fire time, so it is CONSTANT for the whole window, and
+    // asking the store about it again on the next tick can only produce the answer already got.
+    // See {@link settledIdsFor}.
+    const candidates = scheduleRunIdsAt(s, nowMs).filter((id) => !settled.get(s.key)?.has(id));
+    // Nothing to do this tick, and no I/O to prove it — nor a jitter sleep: a schedule whose window
+    // already fired used to sleep up to `jitter` ms on EVERY tick, stalling the whole timer poll
+    // (due timers, retries, timeouts) behind it.
+    if (candidates.length === 0) continue;
+
     // overlap:'skip' (fixed-interval): don't start this window while the previous window's run is
     // still in-flight, so a slow run can't pile up. Interval-only — cron windows aren't adjacent ids.
+    // Checked after the candidate filter: it only matters when something is about to start.
     if (s.overlap === 'skip' && s.everyMs) {
       const prevBucket = Math.floor(nowMs / s.everyMs) - 1;
       if (prevBucket >= 0) {
@@ -198,10 +224,56 @@ export async function runSchedules(
     // Dispatch-path jitter (not workflow code): spread same-boundary ticks across instances. Applied
     // once per schedule, before firing — the run ids below are unaffected, so idempotency holds.
     if (s.jitter && s.jitter > 0) await sleep(Math.floor(random() * s.jitter));
-    for (const runId of scheduleRunIdsAt(s, nowMs)) {
-      await engine.start(workflowName(s.workflow), s.input, runId);
+    for (const runId of candidates) {
+      if (engine.isDraining?.()) break; // drain began during the jitter / an await
+      // Only fire (and report) windows that don't exist yet. `start` is idempotent by run id anyway,
+      // but reporting its no-op re-ticks made every tick return the current window's id for the rest
+      // of the window. Two instances racing on the same boundary can both get here; `start`'s
+      // idempotency keeps it to one run — only the returned ids may briefly overcount.
+      const existing = await engine.getRun(runId);
+      remember(settled, s.key, runId);
+      if (existing) continue;
+      await engine.start(workflowName(s.workflow), s.input, runId, { namespace: s.namespace });
       ids.push(runId);
     }
   }
   return ids;
+}
+
+/**
+ * Per-engine memo of run ids this process has already seen exist in the store.
+ *
+ * A schedule's run id is the id of its fire WINDOW, so within a window it never changes. Once a tick
+ * has learned that id exists, every later tick in the same window would ask the store a question
+ * whose answer cannot have changed, and pay a round trip (and the schedule's jitter) for it.
+ *
+ * Idempotency is untouched: the memo only skips work this process KNOWS already happened. It is never
+ * consulted for an id this process has not observed, so a fresh process, and the first tick of every
+ * new window, still go to the store — which is where the cross-instance race is decided.
+ *
+ * Bounded: only the current window's ids per schedule key are kept. A WeakMap keyed by the engine, so
+ * two engines in one process (tests, multi-tenant hosts) never share it, and it goes with the engine.
+ */
+const settledRunIds = new WeakMap<object, Map<string, Set<string>>>();
+
+function settledIdsFor(engine: object): Map<string, Set<string>> {
+  let memo = settledRunIds.get(engine);
+  if (memo === undefined) {
+    memo = new Map();
+    settledRunIds.set(engine, memo);
+  }
+  return memo;
+}
+
+/** Record `runId` as known to exist, dropping older windows' ids for that key. */
+function remember(memo: Map<string, Set<string>>, key: string, runId: string): void {
+  const seen = memo.get(key);
+  if (seen === undefined) {
+    memo.set(key, new Set([runId]));
+    return;
+  }
+  // A backfill tick settles several ids at once, so keep this pass's ids together; a set past any
+  // sane backfill span (a schedule reconfigured at runtime) starts over from this id.
+  seen.add(runId);
+  if (seen.size > 64) memo.set(key, new Set([runId]));
 }

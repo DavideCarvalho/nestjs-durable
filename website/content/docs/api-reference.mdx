@@ -292,7 +292,8 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 
 `engine.runSchedules` is **not** a method — `runSchedules(engine, schedules, nowMs, opts?)` is a
 standalone function (exported from `@dudousxd/nestjs-durable`, and from `-core`) that starts each
-`ScheduledWorkflow`'s current time-bucket run id (idempotent via `engine.start`). The NestJS module's
+`ScheduledWorkflow`'s current time-bucket run id (idempotent via `engine.start`) and returns the ids it
+started — a window that already has a run is skipped, and not returned. The NestJS module's
 `schedules` option wires it to the timer poller automatically; call it yourself to [fire schedules from
 your own trigger](/docs/authoring/scheduling#firing-schedules-from-your-own-trigger).
 `scheduleRunIdAt(schedule, nowMs)` returns the run id of a schedule's window at `nowMs`, for

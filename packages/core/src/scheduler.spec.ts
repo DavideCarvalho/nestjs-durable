@@ -159,12 +159,13 @@ describe('runSchedules — jitter', () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     engine.register('beat', '1', async () => 'tick');
-    for (const rnd of [0, 0.1, 0.9, 0.999999]) {
+    for (const [i, rnd] of [0, 0.1, 0.9, 0.999999].entries()) {
       const sleeps: number[] = [];
+      // A fresh window each time: a window that already fired is skipped without a sleep.
       await runSchedules(
         engine,
         [{ key: 'b', workflow: 'beat', everyMs: 1000, jitter: 300 }],
-        1000,
+        (i + 1) * 1000,
         {
           random: () => rnd,
           sleep: async (ms) => void sleeps.push(ms),
@@ -173,6 +174,23 @@ describe('runSchedules — jitter', () => {
       expect(sleeps[0]).toBeGreaterThanOrEqual(0);
       expect(sleeps[0]).toBeLessThan(300);
     }
+  });
+
+  it('sleeps once per window: a window that already fired is skipped without the jitter', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('beat', '1', async () => 'tick');
+    const sleeps: number[] = [];
+    const opts = { random: () => 0.9, sleep: async (ms: number) => void sleeps.push(ms) };
+    const beat = [{ key: 'b', workflow: 'beat', everyMs: 1000, jitter: 5000 }];
+
+    expect(await runSchedules(engine, beat, 1000, opts)).toEqual(['sched:b:1']);
+    expect(await runSchedules(engine, beat, 1300, opts)).toEqual([]);
+    expect(await runSchedules(engine, beat, 1600, opts)).toEqual([]);
+    expect(sleeps).toEqual([4500]);
+
+    expect(await runSchedules(engine, beat, 2000, opts)).toEqual(['sched:b:2']);
+    expect(sleeps).toEqual([4500, 4500]);
   });
 
   it('does not sleep when jitter is absent (default behavior preserved)', async () => {
@@ -271,5 +289,61 @@ describe('runSchedules — backfill', () => {
     const yest = Date.UTC(2026, 0, 9, 0, 0, 0);
     const before = Date.UTC(2026, 0, 8, 0, 0, 0);
     expect(ids.sort()).toEqual([`sched:n:${today}`, `sched:n:${yest}`, `sched:n:${before}`].sort());
+  });
+});
+
+describe('runSchedules — settled windows', () => {
+  it('reads the store once per window, then skips the window from memory', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('beat', '1', async () => 'tick');
+    let reads = 0;
+    const counted = {
+      start: engine.start.bind(engine),
+      getRun: async (id: string) => {
+        reads += 1;
+        return engine.getRun(id);
+      },
+    } as Pick<WorkflowEngine, 'start' | 'getRun'>;
+    const beat = [{ key: 'b', workflow: 'beat', everyMs: 1000 }];
+
+    await runSchedules(counted, beat, 1000);
+    await runSchedules(counted, beat, 1200);
+    await runSchedules(counted, beat, 1400);
+    expect(reads).toBe(1);
+  });
+
+  it('does not report a window another instance already started', async () => {
+    const store = new InMemoryStateStore();
+    const a = new WorkflowEngine({ store });
+    const b = new WorkflowEngine({ store });
+    for (const e of [a, b]) e.register('beat', '1', async () => 'tick');
+    const beat = [{ key: 'b', workflow: 'beat', everyMs: 1000 }];
+
+    expect(await runSchedules(a, beat, 1000)).toEqual(['sched:b:1']);
+    expect(await runSchedules(b, beat, 1000)).toEqual([]);
+    expect(await store.listRuns({ workflow: 'beat' })).toHaveLength(1);
+  });
+
+  it('stamps the pinned namespace on the run, whichever engine fires it', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, namespace: 'web' });
+    engine.register('beat', '1', async () => 'tick');
+
+    await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000, namespace: 'gpu' }], 1000);
+
+    expect((await store.getRun('sched:b:1'))?.namespace).toBe('gpu');
+  });
+
+  it('fires nothing once the engine is draining', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('beat', '1', async () => 'tick');
+    engine.beginDrain();
+
+    expect(await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000 }], 1000)).toEqual(
+      [],
+    );
+    expect(await store.getRun('sched:b:1')).toBeNull();
   });
 });
