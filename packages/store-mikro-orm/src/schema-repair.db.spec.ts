@@ -207,7 +207,7 @@ describe.skipIf(mysqlSkipped)('ensureMikroOrmDurableSchema repair warning [real 
     );
   });
 
-  it('upgrades second-precision datetime columns left by an older version to millisecond precision', async () => {
+  it('upgrades second-precision datetime columns left by an older version to datetime(6)', async () => {
     orm = await MySqlMikroORM.init({
       clientUrl: mysqlUrl,
       entities: [...ENTITIES],
@@ -233,8 +233,9 @@ describe.skipIf(mysqlSkipped)('ensureMikroOrmDurableSchema repair warning [real 
       await connection.execute(
         "select table_name as table_name, column_name as column_name, datetime_precision as `precision` from information_schema.columns where table_schema = database() and data_type = 'datetime' and table_name like 'durable\\_%'",
       );
-    expect(rows.length).toBeGreaterThan(0);
-    expect(rows.filter((row) => Number(row.precision) < 3)).toEqual([]);
+    // Every timestamp column of every durable table, at exactly the precision the heal targets.
+    expect(rows).toHaveLength(11);
+    expect(rows.filter((row) => Number(row.precision) !== 6)).toEqual([]);
     expect(logger.messages).toHaveLength(1);
     expect(logger.messages[0]).toContain('durable_workflow_runs');
     expect(logger.messages[0]).toContain('durable_buffered_events');

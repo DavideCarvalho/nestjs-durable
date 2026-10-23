@@ -20,7 +20,8 @@ import { BullMQTransport } from './bullmq-transport';
  * round-trip (dispatch → tenant execution → decision → completion) actually works end-to-end.
  *
  * Mirrors `bullmq-transport.db.spec.ts`'s real-broker harness: one Redis container (testcontainers),
- * skipped cleanly (never failed) when Docker is unavailable or `SKIP_TESTCONTAINERS` is set. Run
+ * skipped cleanly (never failed) when Docker is unavailable or `SKIP_TESTCONTAINERS` is set, unless
+ * `DURABLE_TEST_REDIS_URL` points it at a running Redis. Run
  * with `pnpm test:db`.
  *
  * The run is seeded directly into the operator's store with `namespace: 't1'` rather than routed
@@ -32,7 +33,9 @@ import { BullMQTransport } from './bullmq-transport';
  */
 
 const CONTAINER_TIMEOUT = 180_000;
-const skipped = !!process.env.SKIP_TESTCONTAINERS;
+// A shared Redis is fine: every case keys under its own prefix.
+const externalUrl = process.env.DURABLE_TEST_REDIS_URL;
+const skipped = !externalUrl && !!process.env.SKIP_TESTCONTAINERS;
 
 let redis: StartedRedisContainer | undefined;
 let redisError: unknown;
@@ -41,6 +44,11 @@ let connection: { host: string; port: number } | undefined;
 beforeAll(async () => {
   if (skipped) return;
   try {
+    if (externalUrl) {
+      const u = new URL(externalUrl);
+      connection = { host: u.hostname, port: Number(u.port || 6379) };
+      return;
+    }
     redis = await new RedisContainer('redis:7-alpine').start();
     connection = { host: redis.getHost(), port: redis.getFirstMappedPort() };
   } catch (err) {
