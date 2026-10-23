@@ -8,8 +8,8 @@ type WorkflowBody = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
  * The `@Workflow({ input, output, validateInput })` contract, split into the two places it applies.
  *
  * - `validateAtStart` is handed to the engine, which calls it in `start` before any run is created:
- *   the input schema must parse, then `validateInput` must not throw. Its result is discarded — the
- *   run stores the input as it was sent.
+ *   the input schema must parse, then `validateInput` must not throw on the parsed value. The parsed
+ *   value is then discarded — the run stores the input as it was sent.
  * - `wrap` turns `run(ctx, input)` into the body every role registers (inline, in-app worker, thin
  *   worker): the stored input is parsed before the body runs and the returned value is parsed before
  *   it becomes the run's output. It wraps the BODY, not `start`, because the body is what runs on
@@ -29,8 +29,8 @@ export function workflowIo(meta: WorkflowMeta): {
     validateAtStart:
       parseInput || validateInput
         ? async (input) => {
-            if (parseInput) await parseInput(input);
-            await validateInput?.(input);
+            const parsed = parseInput ? await parseInput(input) : input;
+            await validateInput?.(parsed);
           }
         : undefined,
     wrap: (body) =>
