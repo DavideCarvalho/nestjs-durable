@@ -145,6 +145,9 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
       // The stalled-run pager: throttled to a pass a minute inside the engine, a no-op without an
       // `onStalled` listener. Optional call: an older core (the peer range is wide) has no sweep.
       await this.sweep('sweepStalled', async () => this.engine.sweepStalled?.());
+      // Buffered child completions no parent will consume: a few pages per tick until a pass ends,
+      // then a rest (throttled inside the engine). Optional call, like the stalled sweep.
+      await this.sweep('sweepBufferedSignals', async () => this.engine.sweepBufferedSignals?.());
       const schedules = this.options.schedules;
       if (schedules && schedules.length > 0) {
         await this.sweep('schedules', () => runSchedules(this.engine, schedules, Date.now()));

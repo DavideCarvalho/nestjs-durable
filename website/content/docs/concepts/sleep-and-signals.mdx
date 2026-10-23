@@ -101,6 +101,14 @@ buffered signal: it sits in the store
 until the matching `waitForSignal(token)` call consumes it (oldest first), however long that takes.
 That buffering is what makes `signalWithStart` (below) race-free.
 
+A child workflow's completion travels the same way, on the token `child:<childRunId>`, but the
+engine only buffers it when a parent can still take it: a fire-and-forget child of a live parent,
+or a success for a child a `failed`/`dead` parent may be retried on. A root run (started from a
+controller or a schedule) has no parent and buffers nothing, and neither does a child whose parent
+already holds that outcome or is gone. The timer poller also sweeps `child:` rows that no parent
+will consume (rows an older version left behind), a few pages per tick until a pass completes, then
+every ten minutes, on an engine without a `namespace`. Signals you send yourself are never swept.
+
 ## signalWithStart
 
 ```ts

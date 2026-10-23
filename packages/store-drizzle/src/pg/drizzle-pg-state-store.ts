@@ -1,5 +1,6 @@
 import {
   type AttributeFilter,
+  type BufferedSignalRow,
   type CheckpointNameKind,
   type CheckpointQuery,
   type CheckpointStat,
@@ -45,6 +46,7 @@ import {
   eq,
   exists,
   getTableColumns,
+  gt,
   gte,
   inArray,
   isNotNull,
@@ -978,6 +980,32 @@ export class DrizzlePgStateStore implements StateStore {
       .returning({ payload: bufferedSignals.payload });
     const row = rows[0];
     return row ? { payload: row.payload ?? undefined } : null;
+  }
+
+  async listBufferedSignals(
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<BufferedSignalRow[]> {
+    const rows = await this.db
+      .select()
+      .from(bufferedSignals)
+      .where(
+        and(
+          like(bufferedSignals.token, `${escapeLike(tokenPrefix)}%`),
+          afterId !== undefined ? gt(bufferedSignals.id, Number(afterId)) : undefined,
+        ),
+      )
+      .orderBy(asc(bufferedSignals.id))
+      .limit(limit);
+    return rows
+      .filter((r) => r.token.startsWith(tokenPrefix))
+      .map((r) => ({ id: String(r.id), token: r.token, payload: r.payload ?? undefined }));
+  }
+
+  async deleteBufferedSignals(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.db.delete(bufferedSignals).where(inArray(bufferedSignals.id, ids.map(Number)));
   }
 
   async bufferEvent(input: {

@@ -1942,6 +1942,55 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    t('lists buffered signals by token prefix in insertion order, a page at a time', async () => {
+      expect(store.listBufferedSignals).toBeTypeOf('function');
+      const list = (prefix: string, after: string | undefined, limit: number) =>
+        store.listBufferedSignals?.(prefix, after, limit) ?? Promise.resolve([]);
+      await store.bufferSignal('child:a', { ok: true, value: { n: 1 } });
+      await store.bufferSignal('order:1', { paid: true });
+      await store.bufferSignal('child:b', { ok: false, error: 'x' });
+      await store.bufferSignal('child:a', { ok: true, value: { n: 2 } });
+      // `_` and `%` in a prefix are literal, not LIKE wildcards.
+      await store.bufferSignal('wake_x:1', null);
+      await store.bufferSignal('wakeyx:1', null);
+
+      const all = await list('child:', undefined, 10);
+      expect(all.map((r) => [r.token, r.payload])).toEqual([
+        ['child:a', { ok: true, value: { n: 1 } }],
+        ['child:b', { ok: false, error: 'x' }],
+        ['child:a', { ok: true, value: { n: 2 } }],
+      ]);
+      expect(all.map((r) => typeof r.id)).toEqual(['string', 'string', 'string']);
+
+      const first = await list('child:', undefined, 2);
+      expect(first.map((r) => r.id)).toEqual(all.slice(0, 2).map((r) => r.id));
+      const rest = await list('child:', first.at(-1)?.id, 2);
+      expect(rest.map((r) => r.id)).toEqual([all[2]?.id]);
+      expect(await list('child:', all[2]?.id, 2)).toEqual([]);
+
+      expect((await list('wake_x:', undefined, 10)).map((r) => r.token)).toEqual(['wake_x:1']);
+    });
+
+    t('deletes buffered signals by id and leaves the rest in FIFO order', async () => {
+      expect(store.deleteBufferedSignals).toBeTypeOf('function');
+      await store.bufferSignal('child:a', { n: 1 });
+      await store.bufferSignal('child:a', { n: 2 });
+      await store.bufferSignal('child:a', { n: 3 });
+      await store.bufferSignal('child:b', { n: 4 });
+      const rows = (await store.listBufferedSignals?.('child:', undefined, 10)) ?? [];
+      await store.deleteBufferedSignals?.([
+        rows[1]?.id as string,
+        rows[3]?.id as string,
+        '999999999',
+      ]);
+      await store.deleteBufferedSignals?.([]);
+
+      expect(await store.takeBufferedSignal('child:a')).toEqual({ payload: { n: 1 } });
+      expect(await store.takeBufferedSignal('child:a')).toEqual({ payload: { n: 3 } });
+      expect(await store.takeBufferedSignal('child:a')).toBeNull();
+      expect(await store.takeBufferedSignal('child:b')).toBeNull();
+    });
+
     t('buffers signals and takes them FIFO per token', async () => {
       await store.bufferSignal('sig', { n: 1 });
       await store.bufferSignal('sig', { n: 2 });

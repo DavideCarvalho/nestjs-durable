@@ -1,3 +1,4 @@
+import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import {
   type StateStoreContext,
   StateStoreUnavailableError,
@@ -7,7 +8,7 @@ import { MikroORM as MySqlMikroORM } from '@mikro-orm/mysql';
 import { MikroORM as PostgresMikroORM } from '@mikro-orm/postgresql';
 import { MySqlContainer, type StartedMySqlContainer } from '@testcontainers/mysql';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
-import { afterAll, beforeAll, describe } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { makeMikroOrmStoreFactory } from './conformance';
 
 /**
@@ -96,5 +97,57 @@ describe('MikroORM (MySQL) [real engine]', () => {
       );
     if (!mysqlFactory) throw new StateStoreUnavailableError('MySQL container not started');
     return mysqlFactory();
+  });
+});
+
+// --- Buffered child completions through the engine, on each real engine ---------------------------
+
+/**
+ * A duplicate child notification compares its completion with the one the parent already holds. A
+ * JSON column (MySQL `json`, Postgres `jsonb`) hands the parent's copy back with its keys reordered,
+ * so a byte comparison saw two different completions and buffered a row nothing ever consumed.
+ */
+async function duplicateNotificationLeavesNoBuffer(factory: Factory | undefined): Promise<void> {
+  if (!factory) throw new Error('backend not started');
+  const { store, cleanup } = await factory();
+  const engine = new WorkflowEngine({ store });
+  try {
+    const value = { zeta: 1, alpha: { y: 2, b: 3 }, ok: 'yes' };
+    engine.register('fetch', '1', async () => value);
+    engine.register('parent', '1', async (ctx) => {
+      const out = await ctx.child('fetch', {});
+      await ctx.waitForSignal('more');
+      return out;
+    });
+    await engine.start('parent', {}, 'p');
+    const deadline = Date.now() + 15_000;
+    while ((await store.getRun('p'))?.status !== 'suspended') {
+      if (Date.now() > deadline) throw new Error('parent never suspended');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await (
+      engine as unknown as { deliverToParent(token: string, c: unknown): Promise<void> }
+    ).deliverToParent('child:p.child.0', { ok: true, value });
+    // A root run's completion has no parent to buffer for either.
+    engine.register('root', '1', async () => ({ b: 1, a: 2 }));
+    await engine.start('root', {}, 'root-run');
+    while ((await store.getRun('root-run'))?.status !== 'completed') {
+      if (Date.now() > deadline) throw new Error('root never completed');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await engine.drain(5_000);
+    expect(await store.listBufferedSignals?.('child:', undefined, 100)).toEqual([]);
+  } finally {
+    await engine.drain(5_000);
+    await cleanup?.();
+  }
+}
+
+describe.skipIf(skipped)('MikroORM buffered child completions [real engine]', () => {
+  it('Postgres: a duplicate notification read back from jsonb buffers nothing', async () => {
+    await duplicateNotificationLeavesNoBuffer(pgFactory);
+  });
+  it('MySQL: a duplicate notification read back from a json column buffers nothing', async () => {
+    await duplicateNotificationLeavesNoBuffer(mysqlFactory);
   });
 });

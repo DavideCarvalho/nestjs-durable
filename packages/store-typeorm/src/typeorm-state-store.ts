@@ -1,5 +1,6 @@
 import {
   type AttributeFilter,
+  type BufferedSignalRow,
   type CheckpointNameKind,
   type CheckpointQuery,
   type CheckpointStat,
@@ -45,6 +46,7 @@ import {
   LessThan,
   LessThanOrEqual,
   Like,
+  MoreThan,
   type Repository,
   type SelectQueryBuilder,
 } from 'typeorm';
@@ -960,6 +962,30 @@ export class TypeOrmStateStore implements StateStore {
     if (!e) return null;
     await this.buffered().delete({ id: e.id });
     return { payload: e.payload ?? undefined };
+  }
+
+  async listBufferedSignals(
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<BufferedSignalRow[]> {
+    const rows = await this.buffered().find({
+      where: {
+        token: Like(`${tokenPrefix}%`),
+        ...(afterId !== undefined ? { id: MoreThan(Number(afterId)) } : {}),
+      },
+      order: { id: 'ASC' },
+      take: limit,
+    });
+    // `LIKE` reads `_`/`%` as wildcards and may ignore case: keep only the real prefix matches.
+    return rows
+      .filter((r) => r.token.startsWith(tokenPrefix))
+      .map((r) => ({ id: String(r.id), token: r.token, payload: r.payload ?? undefined }));
+  }
+
+  async deleteBufferedSignals(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.buffered().delete({ id: In(ids.map(Number)) });
   }
 
   async bufferEvent(input: {

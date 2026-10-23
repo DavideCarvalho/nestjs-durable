@@ -1,5 +1,6 @@
 import {
   type AttributeFilter,
+  type BufferedSignalRow,
   type CheckpointNameKind,
   type CheckpointQuery,
   type CheckpointStat,
@@ -44,6 +45,7 @@ import {
   eq,
   exists,
   getTableColumns,
+  gt,
   gte,
   inArray,
   isNotNull,
@@ -1059,6 +1061,34 @@ export class DrizzleStateStore implements StateStore {
     if (!row) return null;
     await this.db.delete(bufferedSignals).where(eq(bufferedSignals.id, row.id));
     return { payload: row.payload ?? undefined };
+  }
+
+  async listBufferedSignals(
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<BufferedSignalRow[]> {
+    const rows = await this.db
+      .select()
+      .from(bufferedSignals)
+      .where(
+        and(
+          like(bufferedSignals.token, `${tokenPrefix}%`),
+          afterId !== undefined ? gt(bufferedSignals.id, Number(afterId)) : undefined,
+        ),
+      )
+      .orderBy(asc(bufferedSignals.id))
+      .limit(limit);
+    // SQLite's `LIKE` has no default escape character, so `_`/`%` in the prefix stay wildcards (and it
+    // ignores ASCII case): keep only the real prefix matches.
+    return rows
+      .filter((r) => r.token.startsWith(tokenPrefix))
+      .map((r) => ({ id: String(r.id), token: r.token, payload: r.payload ?? undefined }));
+  }
+
+  async deleteBufferedSignals(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.db.delete(bufferedSignals).where(inArray(bufferedSignals.id, ids.map(Number)));
   }
 
   async bufferEvent(input: {
