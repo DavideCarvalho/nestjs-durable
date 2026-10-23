@@ -49,9 +49,19 @@ interface PendingRequest {
  * another tenant), ... — so a caller can tell an authentication failure from a real one, as with
  * Agora's proxy.
  */
+/**
+ * The codes the run-request responder replies with. `string & {}` keeps a code from a newer control
+ * plane assignable without losing autocomplete on the known ones.
+ */
+export type RunGatewayErrorCode =
+  | 'unauthorized'
+  | 'cross-tenant'
+  | typeof UNSUPPORTED_RUN_REQUEST
+  | (string & {});
+
 export class RunGatewayError extends Error {
-  readonly code: string | undefined;
-  constructor(message: string, code?: string) {
+  readonly code: RunGatewayErrorCode | undefined;
+  constructor(message: string, code?: RunGatewayErrorCode) {
     super(message);
     this.name = 'RunGatewayError';
     this.code = code;
