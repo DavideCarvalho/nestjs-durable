@@ -1,7 +1,12 @@
 // @vitest-environment happy-dom
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import { ALL_ORIGINS, type OriginFilter, originFacets } from '../client/run-origin';
+import {
+  ALL_ORIGINS,
+  type OriginFilter,
+  originFacets,
+  originFacetsFromCounts,
+} from '../client/run-origin';
 import { OriginFacets } from './OriginFacets';
 
 // No jest-dom in this package (see `open-console.spec.tsx`): matchers like `toBeChecked` /
@@ -45,11 +50,11 @@ describe('<OriginFacets>', () => {
       'all6',
       'nestjs-agent1',
       'nestjs-catalog-pipeline2',
-      'unknown3',
+      'app3',
     ]);
   });
 
-  it('keeps the unknown count on screen even while a package is selected', () => {
+  it('keeps the app count on screen even while a package is selected', () => {
     // This is the reason the facet counts client-side instead of pushing `RunQuery.origin` down: a
     // store-filtered list would report zero unattributed runs, so they would look like they had
     // ceased to exist the moment an operator picked a library.
@@ -61,7 +66,7 @@ describe('<OriginFacets>', () => {
       />,
     );
 
-    expect(chipByLabel('unknown').textContent).toBe('unknown3');
+    expect(chipByLabel('app').textContent).toBe('app3');
   });
 
   it('marks the selected facet as pressed, and only that one', () => {
@@ -87,11 +92,11 @@ describe('<OriginFacets>', () => {
     expect(chipByLabel('all').getAttribute('aria-pressed')).toBe('true');
   });
 
-  it('selects the unattributed bucket by value, so unclassified runs are reachable', () => {
+  it('selects the app bucket by value, so runs with no origin are reachable', () => {
     const onChange = vi.fn<(filter: OriginFilter) => void>();
     render(<OriginFacets facets={originFacets(runs)} value={ALL_ORIGINS} onChange={onChange} />);
 
-    chipByLabel('unknown').click();
+    chipByLabel('app').click();
 
     expect(onChange).toHaveBeenCalledWith({ kind: 'unknown' });
   });
@@ -106,10 +111,12 @@ describe('<OriginFacets>', () => {
     expect(onChange).toHaveBeenCalledWith({ kind: 'origin', origin: CATALOG });
   });
 
-  it('spells out what unknown means rather than leaving a bare word', () => {
+  it("spells out that the app chip is the app's own workflows (no package origin)", () => {
     render(<OriginFacets facets={originFacets(runs)} value={ALL_ORIGINS} onChange={vi.fn()} />);
 
-    expect(chipByLabel('unknown').getAttribute('title')).toMatch(/no recorded origin/i);
+    const title = chipByLabel('app').getAttribute('title');
+    expect(title).toMatch(/app's own workflows/i);
+    expect(title).toMatch(/no package origin/i);
   });
 
   it('carries the full package name as a title, so shortening hides nothing', () => {
@@ -124,5 +131,51 @@ describe('<OriginFacets>', () => {
     );
 
     expect(container.innerHTML).toBe('');
+  });
+
+  it("renders nothing when no run carries a named origin (only the app's own runs)", () => {
+    // The plain-app case: no workflow declares an origin, so `all 100 | app 100` would be pure noise.
+    const { container } = render(
+      <OriginFacets
+        facets={originFacetsFromCounts([{ origin: null, count: 100 }])}
+        value={ALL_ORIGINS}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(container.innerHTML).toBe('');
+  });
+
+  it('shows the row once a single run has a named origin, with app carrying the rest', () => {
+    render(
+      <OriginFacets
+        facets={originFacetsFromCounts([
+          { origin: CATALOG, count: 1 },
+          { origin: null, count: 99 },
+        ])}
+        value={ALL_ORIGINS}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(chips().map((c) => c.textContent)).toEqual([
+      'all100',
+      'nestjs-catalog-pipeline1',
+      'app99',
+    ]);
+  });
+
+  it('keeps the row while a non-default facet is selected, so the operator can get back to all', () => {
+    const onChange = vi.fn<(filter: OriginFilter) => void>();
+    render(
+      <OriginFacets
+        facets={originFacetsFromCounts([{ origin: null, count: 3 }])}
+        value={{ kind: 'unknown' }}
+        onChange={onChange}
+      />,
+    );
+
+    chipByLabel('all').click();
+    expect(onChange).toHaveBeenCalledWith(ALL_ORIGINS);
   });
 });

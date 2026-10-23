@@ -669,7 +669,7 @@ export const durableClient = {
 export { type SubProcess, groupSubProcesses } from './group-subprocesses.js';
 
 // Re-export the origin facet so external consumers (e.g. flip's embedded pipeline-runs view) spell
-// an unattributed run the exact same way this console does — `unknown`, never "app" and never blank.
+// a run with no origin the exact same way this console does — `app` (the app's own), never blank.
 export {
   ALL_ORIGINS,
   type EmptyRunsNotice,
@@ -679,6 +679,7 @@ export {
   UNKNOWN_ORIGIN_TITLE,
   emptyRunsNotice,
   filterByOrigin,
+  hasNamedOrigin,
   isUnknownOrigin,
   knownOrigin,
   matchesOrigin,
