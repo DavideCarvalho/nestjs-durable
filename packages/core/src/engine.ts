@@ -4622,7 +4622,7 @@ export class WorkflowEngine {
         this.inBackground(this.honorWakeRequests(run.id, settledFans, served));
       } else if (TERMINAL_RUN_STATUSES.includes(result.status)) {
         this.inBackground(
-          this.listWakeRequests(run.id).then((kept) => this.dropWakeRequests(kept)),
+          this.listWakeRequests(run.id, true).then((kept) => this.dropWakeRequests(kept)),
         );
       }
       return result;
