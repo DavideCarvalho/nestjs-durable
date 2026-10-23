@@ -523,10 +523,11 @@ DurableModule.forRoot({ store, transport, timerBatchSize: 1000 });
 
 **Runs spread over every driving instance.** On a transport with a run queue (BullMQ, SQS and
 the SQL transport), every driving instance consumes that queue, and the runs any instance starts
-go through it: a `ctx.all` fan's children, `ctx.child`, `start`, event and schedule triggers,
-`signalWithStart` and entity runners, continue-as-new, `requeue`/`retryWithInput`, recovery of a
-crashed run, the next run of a freed singleton slot, and the pending runs and due timers the poll
-finds. Whichever instance has a free slot takes the next run, so a 40,000-child fan executes across
+or wakes go through it: a `ctx.all` / `ctx.allSettled` fan's children, `ctx.child`, `start`, event
+and schedule triggers, `signalWithStart` and entity runners, continue-as-new,
+`requeue`/`retryWithInput`, recovery of a crashed run, and the wakes of a suspended run (a signal,
+a child's completion reaching its parent, a due timer, a freed singleton or queue slot, a lease that
+came free). Whichever instance has a free slot takes the next run, so a 40,000-child fan executes across
 the deployment instead of on the instance running the parent. A fan's children reach the broker in
 bulk writes of up to 500, not one round trip each. Nothing to configure: the Nest module wires the
 consumer on every driving operator (not on `drive: false` or a thin worker), and workflow code is
@@ -538,15 +539,15 @@ A run whose queueing fails stays `pending`, and the next poll queues it again, o
 while the broker is down. At shutdown an instance stops taking runs and waits for the ones it holds
 within `shutdownTimeoutMs`; what is left in the queue goes to the other instances.
 
-A run asked for again while an instance is handling its previous queue entry (a requeue, a due
-timer, a recovery) gets another turn after that one; it is not dropped as a duplicate.
+A start re-sent for the same `pending` state is queued once; a run that went `pending` again, or
+a wake, landing while an instance handles the run's previous entry gets another turn after it. A
+due timer is claimed for one lease period while its wake waits, so the poll does not queue it again;
+a wake the transport refused resumes the run where it was raised instead of waiting for its timer.
 
-Wakes of a run that already exists resume it where they land, under the run's lease. Step results,
-workflow decisions and a child's completion already land on an arbitrary instance: they come off
-the broker's shared queues, or from a child that itself ran wherever the run queue put it, so a
-second hop through the run queue would add latency without spreading anything. `engine.signal`,
-`publishEvent` and the other calls an application makes resolve with the run's state after the
-turn they trigger, which they could not do if that turn ran on another instance.
+With a run queue, `engine.signal` (and `signalWithStart`, an entity operation) resolves once the
+wake is queued, with the run's status at that moment; use `waitForRun` for the outcome. Step results
+and workflow decisions still resume their run where they land: they come off the broker's shared
+results queues, so they already land on an arbitrary instance.
 
 **Each instance stays bounded.** One budget of 256 covers everything an instance takes on itself:
 the runs it takes off the queue, a fan's child starts, and on a transport without a run queue (the

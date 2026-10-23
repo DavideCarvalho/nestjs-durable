@@ -25,11 +25,12 @@ interface TaskRow {
 }
 interface RunRow {
   run_id: string;
+  wake: number | string;
 }
 
 /** A claimed run row: its run id and the token of this claim. */
 interface ClaimedRun {
-  runId: string;
+  run: RunDispatch;
   token: string;
 }
 
@@ -245,6 +246,7 @@ export class DbTransport implements Transport {
         ${this.q('run_id')} ${str} PRIMARY KEY,
         ${this.q('ns')} ${str} NOT NULL,
         ${this.q('priority')} integer NOT NULL,
+        ${this.q('wake')} integer NOT NULL,
         ${this.q('claimed_by')} ${str},
         ${this.q('claim_token')} ${str},
         ${this.q('claimed_at')} bigint,
@@ -323,13 +325,18 @@ export class DbTransport implements Transport {
    * being handled is not lost when that entry is deleted. Up to {@link RUNS_INSERT_CHUNK} rows per
    * insert.
    */
-  async dispatchRuns(runs: RunDispatch[], opts?: RunQueueOptions): Promise<void> {
+  async dispatchRuns(runs: readonly RunDispatch[], opts?: RunQueueOptions): Promise<void> {
     if (runs.length === 0) return;
     await this.ensureSchema();
-    // One row per run: an upsert may not touch the same row twice in one statement.
-    const unique = [...new Map(runs.map((run) => [run.runId, run])).values()];
+    // One row per run (an upsert may not touch the same row twice in one statement); a wake among
+    // a run's dispatches makes its row a wake.
+    const byRun = new Map<string, RunDispatch>();
+    for (const run of runs) {
+      if (!byRun.has(run.runId) || run.reason === 'wake') byRun.set(run.runId, run);
+    }
+    const unique = [...byRun.values()];
     const t = this.q(this.runsTable);
-    const cols = ['run_id', 'ns', 'priority', 'created_at'];
+    const cols = ['run_id', 'ns', 'priority', 'wake', 'created_at'];
     const now = this.now();
     for (let at = 0; at < unique.length; at += RUNS_INSERT_CHUNK) {
       const chunk = unique.slice(at, at + RUNS_INSERT_CHUNK);
@@ -340,12 +347,19 @@ export class DbTransport implements Transport {
       const release = ['claimed_by', 'claim_token', 'claimed_at']
         .map((c) => `${this.q(c)} = NULL`)
         .join(', ');
+      const wake = this.q('wake');
       const sql = this.isPg
-        ? `INSERT ${insert} ON CONFLICT (${this.q('run_id')}) DO UPDATE SET ${release}`
-        : `INSERT ${insert} ON DUPLICATE KEY UPDATE ${release}`;
+        ? `INSERT ${insert} ON CONFLICT (${this.q('run_id')}) DO UPDATE SET ${release}, ${wake} = GREATEST(${t}.${wake}, EXCLUDED.${wake})`
+        : `INSERT ${insert} ON DUPLICATE KEY UPDATE ${release}, ${wake} = GREATEST(${wake}, VALUES(${wake}))`;
       await this.exec.query(
         sql,
-        chunk.flatMap((run, r) => [run.runId, opts?.namespace ?? '', run.priority ?? 0, now + r]),
+        chunk.flatMap((run, r) => [
+          run.runId,
+          opts?.namespace ?? '',
+          run.priority ?? 0,
+          run.reason === 'wake' ? 1 : 0,
+          now + r,
+        ]),
       );
     }
   }
@@ -358,7 +372,7 @@ export class DbTransport implements Transport {
    * resolves once the runs in flight settled.
    */
   onDispatchedRun(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: RunConsumerOptions,
   ): () => Promise<void> {
     const consumer: RunConsumer = {
@@ -385,7 +399,7 @@ export class DbTransport implements Transport {
 
   private async consumeRuns(
     consumer: RunConsumer,
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     concurrency: number,
     ns: string,
   ): Promise<void> {
@@ -412,9 +426,9 @@ export class DbTransport implements Transport {
         } catch (err) {
           if (this.running && !consumer.stopped) this.onError(err);
         }
-        for (const { runId, token } of rows) {
+        for (const { run, token } of rows) {
           consumer.inflight.add(token);
-          const done = handler(runId)
+          const done = handler(run)
             .catch(() => undefined)
             .then(() =>
               this.exec
@@ -444,16 +458,25 @@ export class DbTransport implements Transport {
     const staleBefore = this.now() - this.leaseMs;
     return this.exec.transaction(async (tx) => {
       const rows = await tx.query<RunRow>(
-        `SELECT ${this.q('run_id')} FROM ${t}
+        `SELECT ${this.q('run_id')}, ${this.q('wake')} FROM ${t}
          WHERE ${this.q('ns')} = ${this.ph(1)}
            AND (${this.q('claimed_at')} IS NULL OR ${this.q('claimed_at')} < ${this.ph(2)})
          ORDER BY ${this.q('priority')} DESC, ${this.q('created_at')} ASC
          LIMIT ${Math.floor(limit)} FOR UPDATE SKIP LOCKED`,
         [ns, staleBefore],
       );
-      const claimed = rows.map((r) => ({ runId: r.run_id, token: globalThis.crypto.randomUUID() }));
+      const claimed = rows.map((r) => ({
+        run: {
+          runId: r.run_id,
+          reason: Number(r.wake) === 1 ? ('wake' as const) : ('start' as const),
+        },
+        token: globalThis.crypto.randomUUID(),
+      }));
       const now = this.now();
-      for (const { runId, token } of claimed) {
+      for (const {
+        run: { runId },
+        token,
+      } of claimed) {
         await tx.query(
           `UPDATE ${t} SET ${this.q('claimed_by')} = ${this.ph(1)}, ${this.q('claim_token')} = ${this.ph(2)}, ${this.q('claimed_at')} = ${this.ph(3)}
            WHERE ${this.q('run_id')} = ${this.ph(4)}`,

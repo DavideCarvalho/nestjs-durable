@@ -98,6 +98,7 @@ CREATE TABLE durable_transport_runs (
   run_id      varchar(191) PRIMARY KEY,  -- one row per queued run
   ns          varchar(191) NOT NULL,     -- the engine namespace ('' for one that drives all)
   priority    integer      NOT NULL,     -- higher first
+  wake        integer      NOT NULL,     -- 1 for a wake, 0 for a start
   claimed_by  varchar(191),
   claim_token varchar(191),              -- this claim; the row is deleted by it
   claimed_at  bigint,                    -- lease stamp, renewed while the run is in flight
@@ -146,9 +147,10 @@ Engines queue the runs they start in `<prefix>_transport_runs`, and every drivin
 it claims up to 50 rows at a time for its namespace with the same `FOR UPDATE SKIP LOCKED`
 transaction (highest `priority`, then oldest), at most 256 runs in flight per instance, renews the
 lease of the rows it holds and deletes a row by its `claim_token` once the run's turn settles.
-Queueing a run whose row exists is an upsert that clears the claim (`ON CONFLICT DO UPDATE` /
-`ON DUPLICATE KEY UPDATE`): a run waiting is not queued twice, and one queued again while an instance
-holds its row is taken once more instead of being deleted with it.
+Queueing a run whose row exists is an upsert that clears the claim and keeps `wake` if either side
+is a wake (`ON CONFLICT DO UPDATE` / `ON DUPLICATE KEY UPDATE`): a run waiting is not queued twice,
+and one queued again while an instance holds its row is taken once more instead of being deleted
+with it.
 
 ### Dialect notes
 

@@ -296,12 +296,98 @@ export function runRunDispatchContract(
           );
           expect(turns).toBe(2);
           consumer.engine.consumeRuns();
-          await pair[0].dispatchRuns?.([{ runId: 'finished' }, { runId: 'parked' }]);
+          await pair[0].dispatchRuns?.([
+            { runId: 'finished', reason: 'start', key: '1' },
+            { runId: 'parked', reason: 'start', key: '1' },
+          ]);
           await pause(1_500);
           expect(turns).toBe(2);
           expect((await store.getRun('parked'))?.status).toBe('suspended');
         } finally {
           await shutdown([local, consumer], pair);
+        }
+      },
+      timeoutMs + 10_000,
+    );
+
+    it(
+      'a wake resumes a parked run, and skips a finished one',
+      async (ctx) => {
+        const pair = await pairOrSkip(() => ctx.skip());
+        if (!pair) return;
+        const store = new InMemoryStateStore();
+        const [local, consumer] = instances(store, pair) as [Instance, Instance];
+        let parkedTurns = 0;
+        let finishedTurns = 0;
+        for (const { engine } of [local, consumer]) {
+          engine.register('done', '1', async () => {
+            finishedTurns += 1;
+            return 1;
+          });
+          engine.register('waiting', '1', async (wctx) => {
+            parkedTurns += 1;
+            await wctx.waitForSignal('never');
+          });
+        }
+        try {
+          await local.engine.start('done', {}, 'finished');
+          await local.engine.start('waiting', {}, 'parked');
+          await until(
+            async () => (await store.getRun('parked'))?.status === 'suspended',
+            timeoutMs,
+          );
+          await until(
+            async () => (await store.getRun('finished'))?.status === 'completed',
+            timeoutMs,
+          );
+          consumer.engine.consumeRuns();
+          await pair[0].dispatchRuns?.([
+            { runId: 'finished', reason: 'wake' },
+            { runId: 'parked', reason: 'wake' },
+          ]);
+          await until(() => parkedTurns === 2, timeoutMs);
+          await pause(500);
+          expect(parkedTurns).toBe(2);
+          expect(finishedTurns).toBe(1);
+          expect((await store.getRun('parked'))?.status).toBe('suspended');
+        } finally {
+          await shutdown([local, consumer], pair);
+        }
+      },
+      timeoutMs + 10_000,
+    );
+
+    it(
+      "a signal's wake goes through the queue, and signal resolves once it is queued",
+      async (ctx) => {
+        const pair = await pairOrSkip(() => ctx.skip());
+        if (!pair) return;
+        const store = new InMemoryStateStore();
+        const a = recorded(pair[0]);
+        const all = instances(store, [a.transport, pair[1]]);
+        const resumedOn: string[] = [];
+        for (const { name, engine } of all) {
+          engine.register('waits', '1', async (wctx) => {
+            const got = await wctx.waitForSignal<string>('go');
+            return wctx.localStep('after', async () => {
+              resumedOn.push(name);
+              return got;
+            });
+          });
+          engine.consumeRuns();
+        }
+        try {
+          await all[0]?.engine.start('waits', {}, 'w');
+          await until(async () => (await store.getRun('w'))?.status === 'suspended', timeoutMs);
+          a.batches.length = 0;
+          const result = await all[0]?.engine.signal('go', 'payload');
+          expect(result?.status).toBe('suspended');
+          await until(async () => (await store.getRun('w'))?.status === 'completed', timeoutMs);
+          expect(a.batches.flat()).toEqual([{ runId: 'w', reason: 'wake' }]);
+          expect((await store.getRun('w'))?.output).toBe('payload');
+          expect(resumedOn).toHaveLength(1);
+        } finally {
+          await shutdown(all, pair);
         }
       },
       timeoutMs + 10_000,
@@ -374,7 +460,7 @@ export function runRunDispatchContract(
           release = resolve;
         });
         const opts: RunConsumerOptions = { concurrency: 3 };
-        const stop = consumerTransport.onDispatchedRun?.(async (runId) => {
+        const stop = consumerTransport.onDispatchedRun?.(async ({ runId }) => {
           active += 1;
           peak = Math.max(peak, active);
           await gate;
@@ -423,8 +509,8 @@ export function runRunDispatchContract(
             createdAt: new Date(),
             updatedAt: new Date(),
           });
-          await pair[0].dispatchRuns?.([{ runId: 'twice' }]);
-          await pair[0].dispatchRuns?.([{ runId: 'twice' }]);
+          await pair[0].dispatchRuns?.([{ runId: 'twice', reason: 'start', key: '1' }]);
+          await pair[0].dispatchRuns?.([{ runId: 'twice', reason: 'start', key: '2' }]);
           for (const { engine } of all) engine.consumeRuns();
           await until(async () => (await store.getRun('twice'))?.status === 'suspended', timeoutMs);
           await pause(1_500);
@@ -444,10 +530,11 @@ export function runRunDispatchContract(
         const [producer, consumerTransport] = pair;
         const handled: string[] = [];
         try {
-          await producer.dispatchRuns?.([{ runId: 'once' }]);
-          await producer.dispatchRuns?.([{ runId: 'once' }, { runId: 'once' }]);
+          const once = { runId: 'once', reason: 'start', key: '1' } as const;
+          await producer.dispatchRuns?.([once]);
+          await producer.dispatchRuns?.([once, once]);
           const stop = consumerTransport.onDispatchedRun?.(
-            async (runId) => {
+            async ({ runId }) => {
               handled.push(runId);
             },
             { concurrency: 4 },
@@ -463,44 +550,49 @@ export function runRunDispatchContract(
       timeoutMs + 10_000,
     );
 
-    it(
-      'hands a run out again when it was dispatched while its entry was being handled',
-      async (ctx) => {
-        const pair = await pairOrSkip(() => ctx.skip());
-        if (!pair) return;
-        const [producer, consumerTransport] = pair;
-        const handled: string[] = [];
-        let release!: () => void;
-        const gate = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        let taken = 0;
-        const stop = consumerTransport.onDispatchedRun?.(
-          async (runId) => {
-            taken += 1;
-            if (taken === 1) await gate;
-            handled.push(runId);
-          },
-          { concurrency: 2 },
-        );
-        try {
-          await producer.dispatchRuns?.([{ runId: 'busy' }]);
-          await until(() => taken === 1, timeoutMs);
-          // Dispatched again while its first entry is still being handled: a wake, a requeue or a
-          // due timer the poll found. The run must get another turn after this one.
-          await producer.dispatchRuns?.([{ runId: 'busy' }]);
-          await pause(200);
-          release();
-          await until(() => handled.length >= 2, timeoutMs);
-          expect(handled.slice(0, 2)).toEqual(['busy', 'busy']);
-        } finally {
-          release();
-          await stop?.();
-          await Promise.allSettled(pair.map((t) => t.close?.()));
-        }
-      },
-      timeoutMs + 10_000,
-    );
+    for (const [what, again] of [
+      ['a start for a new pending state', { reason: 'start', key: '2' }],
+      ['a wake', { reason: 'wake' }],
+    ] as const) {
+      it(
+        `hands a run out again when ${what} lands while its entry is being handled`,
+        async (ctx) => {
+          const pair = await pairOrSkip(() => ctx.skip());
+          if (!pair) return;
+          const [producer, consumerTransport] = pair;
+          const handled: string[] = [];
+          let release!: () => void;
+          const gate = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          let taken = 0;
+          const stop = consumerTransport.onDispatchedRun?.(
+            async ({ runId }) => {
+              taken += 1;
+              if (taken === 1) await gate;
+              handled.push(runId);
+            },
+            { concurrency: 2 },
+          );
+          try {
+            await producer.dispatchRuns?.([{ runId: 'busy', reason: 'start', key: '1' }]);
+            await until(() => taken === 1, timeoutMs);
+            // Dispatched again while its first entry is still being handled: a requeue (a new pending
+            // state) or a wake. The run must get another turn after this one.
+            await producer.dispatchRuns?.([{ runId: 'busy', ...again }]);
+            await pause(200);
+            release();
+            await until(() => handled.length >= 2, timeoutMs);
+            expect(handled.slice(0, 2)).toEqual(['busy', 'busy']);
+          } finally {
+            release();
+            await stop?.();
+            await Promise.allSettled(pair.map((t) => t.close?.()));
+          }
+        },
+        timeoutMs + 10_000,
+      );
+    }
 
     it(
       'stops taking runs on stop, and resolves once the runs in flight settled',
@@ -515,7 +607,7 @@ export function runRunDispatchContract(
           release = resolve;
         });
         const stopFirst = first.onDispatchedRun?.(
-          async (runId) => {
+          async ({ runId }) => {
             active += 1;
             await gate;
             handledFirst.push(runId);
@@ -541,7 +633,7 @@ export function runRunDispatchContract(
           // The runs queued after the stop are still there for another instance.
           const handledSecond: string[] = [];
           const stopSecond = second.onDispatchedRun?.(
-            async (runId) => {
+            async ({ runId }) => {
               handledSecond.push(runId);
             },
             { concurrency: 2 },

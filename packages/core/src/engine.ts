@@ -67,6 +67,7 @@ import type {
   GroupHealth,
   NamedTransport,
   RemoteTask,
+  RunDispatch,
   RunDispatcher,
   RunQuery,
   RunResult,
@@ -378,6 +379,18 @@ function deferred<T>(): Deferred<T> {
   promise.catch(() => undefined);
   return { promise, resolve, reject };
 }
+
+/**
+ * The {@link RunDispatch.key} of the `pending` state a run entered at `at`: the same for every
+ * dispatch of that state (a start re-sent by the poll), so a transport can drop the repeat.
+ */
+const pendingStateKey = (at: Date): string => String(new Date(at).getTime());
+
+/**
+ * The {@link RunDispatch.key} of a run put back to `pending` (a retry, a recovery): a new pending
+ * state, never the key of the run's earlier start, even within the same millisecond.
+ */
+const freshPendingKey = (): string => `${Date.now()}-${globalThis.crypto.randomUUID().slice(0, 8)}`;
 
 /** The checkpoint name prefix of an awaited child: `signal:child:<childId>`. */
 const CHILD_SIGNAL_PREFIX = 'signal:child:';
@@ -985,18 +998,27 @@ export class WorkflowEngine {
     this.customDispatcher = deps.runDispatcher;
     this.runBatcher = new RunDispatchBatcher(
       (runs) => this.pool.dispatchRuns(runs, { namespace: this.namespace }),
-      (runs, err) =>
+      (runs, err) => {
+        // A start stays `pending` for the next poll. A wake is not left to the run's timer (minutes
+        // away): it resumes the run here, as it would without a run queue.
+        for (const run of runs) {
+          if (run.reason === 'wake' && !this.draining) {
+            this.inBackground(this.resumeImplicit(run.runId));
+          }
+        }
         console.error(
-          `[nestjs-durable] could not queue ${runs.length} run(s) on the transport; they stay pending for the next poll:`,
+          `[nestjs-durable] could not queue ${runs.length} run(s) on the transport; starts stay pending for the next poll, wakes resume here:`,
           err,
-        ),
+        );
+      },
     );
     this.runDispatcher = { dispatch: (runId) => this.dispatchRun(runId) };
     this.singletons = new SingletonGate({
       store: this.store,
       clock: this.clock,
       dispatch: (runId) => {
-        this.runDispatcher.dispatch(runId);
+        if (this.queuesRunsOverTransport) void this.wake(runId);
+        else this.runDispatcher.dispatch(runId);
       },
       configFor: (run) =>
         (
@@ -1174,7 +1196,7 @@ export class WorkflowEngine {
     if (!this.pool.dispatchesRuns) return undefined;
     if (this.runConsumerStops.length === 0) {
       this.runConsumerStops = this.pool.onDispatchedRun(
-        (runId) => this.localWork.run(() => this.runFromQueue(runId)),
+        (run) => this.localWork.run(() => this.runFromQueue(run)),
         {
           concurrency: LOCAL_RUN_CONCURRENCY,
           namespace: this.namespace,
@@ -1210,24 +1232,43 @@ export class WorkflowEngine {
    * bounded by {@link LOCAL_RUN_CONCURRENCY}. A run whose queueing fails stays `pending` for a
    * `runPending` poll.
    */
-  private dispatchRun(runId: string, priority?: number): void | Promise<void> {
+  private dispatchRun(runId: string, priority?: number, key?: string): void | Promise<void> {
     if (this.customDispatcher) return this.customDispatcher.dispatch(runId);
     if (this.dispatchesOverTransport) {
-      this.runBatcher.add({ runId, ...(priority !== undefined ? { priority } : {}) });
+      this.runBatcher.add({
+        runId,
+        reason: 'start',
+        ...(priority !== undefined ? { priority } : {}),
+        ...(key !== undefined ? { key } : {}),
+      });
       return;
     }
     this.localWork.submit(`run:${runId}`, () => this.runOne(runId));
   }
 
   /**
-   * Take a turn of a run taken off the transport's run queue, if the store says it has one due: a
-   * `pending` run (a start, a re-dispatch, a requeue), a `cancelling` one being recovered, or a
-   * `suspended`/`blocked` one whose `wakeAt` is due (a timer the poll queued). Anything else was
-   * already taken by another instance, or its wake was not this entry's, and is skipped after one
-   * read. Never rejects.
+   * Wake a suspended run that has something new to see (a delivered signal or child completion, a
+   * lease that came free, a freed slot): while this engine consumes the transport's run queue, on
+   * whichever instance takes the wake (the result then only says it was handed over); otherwise
+   * here, now.
    */
-  private async runFromQueue(runId: string): Promise<void> {
+  private wake(runId: string): Promise<RunResult> {
+    if (this.queuesRunsOverTransport) {
+      this.runBatcher.add({ runId, reason: 'wake' });
+      return Promise.resolve({ runId, status: 'suspended' });
+    }
+    return this.resumeImplicit(runId);
+  }
+
+  /**
+   * Take a turn of a run taken off the transport's run queue. A `start` runs only while the run is
+   * still `pending` (or `cancelling`, a recovered cancel): any other state means another instance
+   * already took it. A `wake` leases and resumes the run unless it is finished. The run lease admits
+   * one executor either way. Never rejects.
+   */
+  private async runFromQueue(dispatch: RunDispatch): Promise<void> {
     if (this.draining) return;
+    const { runId } = dispatch;
     try {
       const run = await this.store.getRun(runId);
       if (!run) return;
@@ -1235,19 +1276,67 @@ export class WorkflowEngine {
         await this.runOne(runId);
         return;
       }
+      if (dispatch.reason !== 'wake' || TERMINAL_RUN_STATUSES.includes(run.status)) return;
       const nowMs = this.clock();
-      if (
-        (run.status === 'suspended' || run.status === 'blocked') &&
-        run.wakeAt !== undefined &&
-        run.wakeAt <= nowMs
-      ) {
+      if (run.wakeAt !== undefined && run.wakeAt <= nowMs) {
+        // A due timer's wake also pairs a stranded waiter, as the due-timer poll does.
         const waiters = indexWaitersByRun(await listSignalWaitersOfRuns(this.store, [runId]));
-        await this.resumeLeased([run], nowMs, (locked) =>
+        const resumed = await this.resumeLeased([run], nowMs, (locked) =>
           this.reconcileSignalWaiter(locked, waiters.get(locked.id)),
         );
+        if (resumed.length === 0) this.recheckAfterLease(runId, run.lockedUntil);
+        return;
       }
+      // Leased by the turn itself; a lease another instance holds is looked at again once free.
+      await this.resumeImplicit(runId).catch((err) => {
+        if (!(err instanceof NamespaceMismatch)) throw err;
+      });
     } catch (error) {
       console.error(`[nestjs-durable] could not run queued run ${runId}:`, error);
+    }
+  }
+
+  /**
+   * Hand due runs (timers, blocked runs due for a fleet re-check) to whichever instance takes them
+   * off the run queue. Each is claimed first, under its lease, by pushing its `wakeAt` one lease
+   * period out, so the next poll (here or elsewhere) does not queue it again while it waits; a wake
+   * that is lost brings it back due after that period. False when the transport refused the wakes,
+   * so the caller resumes them itself.
+   */
+  private async handOffDue(runs: WorkflowRun[], nowMs: number): Promise<boolean> {
+    const claimed: WorkflowRun[] = [];
+    for (const run of runs) {
+      if (this.draining) break;
+      if (!(await this.store.tryLockRun(run.id, this.instanceId, nowMs + this.leaseMs, nowMs))) {
+        continue;
+      }
+      try {
+        const patch = { wakeAt: nowMs + this.leaseMs };
+        if (this.store.updateRunIf) {
+          if (await this.store.updateRunIf(run.id, [run.status], patch)) claimed.push(run);
+        } else {
+          await this.store.updateRun(run.id, patch);
+          claimed.push(run);
+        }
+      } finally {
+        await this.store.releaseRunLock(run.id);
+      }
+    }
+    try {
+      for (let at = 0; at < claimed.length; at += RUN_DISPATCH_BATCH) {
+        await this.pool.dispatchRuns(
+          claimed.slice(at, at + RUN_DISPATCH_BATCH).map((run) => ({
+            runId: run.id,
+            reason: 'wake' as const,
+            ...(run.priority !== undefined ? { priority: run.priority } : {}),
+          })),
+          { namespace: this.namespace },
+        );
+      }
+      return true;
+    } catch (error) {
+      console.error('[nestjs-durable] could not queue due runs on the transport:', error);
+      return false;
     }
   }
 
@@ -1261,6 +1350,8 @@ export class WorkflowEngine {
         await this.pool.dispatchRuns(
           runs.slice(at, at + RUN_DISPATCH_BATCH).map((run) => ({
             runId: run.id,
+            reason: 'start' as const,
+            key: pendingStateKey(run.updatedAt),
             ...(run.priority !== undefined ? { priority: run.priority } : {}),
           })),
           { namespace: this.namespace },
@@ -1810,7 +1901,7 @@ export class WorkflowEngine {
     }
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
-    await this.dispatchRun(runId, run.priority);
+    await this.dispatchRun(runId, run.priority, pendingStateKey(run.updatedAt));
     // Nudge worker instances to pick it up now instead of on their next poll (no-op without a control
     // plane; self-receipt is filtered, so it only helps OTHER pods — e.g. an API pod's enqueue). A run
     // queued on the transport needs no nudge: the instance that takes it off the queue runs it, and
@@ -2452,7 +2543,9 @@ export class WorkflowEngine {
       if (!outcome) continue;
       // Re-enqueue rather than resume inline: recovery must NOT block (boot, or a poll tick) on a
       // long workflow step. A dispatcher/worker re-runs it, replaying its checkpoints.
-      if (outcome.dispatch) await this.dispatchRun(outcome.result.runId, listed.priority);
+      if (outcome.dispatch) {
+        await this.dispatchRun(outcome.result.runId, listed.priority, freshPendingKey());
+      }
       results.push(outcome.result);
     }
     return results;
@@ -2682,7 +2775,7 @@ export class WorkflowEngine {
     // instance takes them, instead of all resuming on the instance that polled.
     if (this.queuesRunsOverTransport && !this.draining) {
       const runs = [...due, ...blocked];
-      if (await this.queueOnTransport(runs)) {
+      if (await this.handOffDue(runs, nowMs)) {
         return runs.map((run) => ({ runId: run.id, status: run.status }));
       }
     }
@@ -2724,7 +2817,7 @@ export class WorkflowEngine {
     const buffered = await this.store.takeBufferedSignal(waiter.token);
     if (!buffered) return undefined;
     await this.store.removeSignalWaiter(waiter);
-    const settled = await this.deliverSignal(waiter, buffered.payload);
+    const settled = await this.deliverSignal(waiter, buffered.payload, true);
     return settled ?? { runId: run.id, status: run.status };
   }
 
@@ -2751,7 +2844,7 @@ export class WorkflowEngine {
       if (!eventMatches(candidate.payload, match)) continue;
       if (!(await this.store.removeBufferedEvent(candidate.id))) continue; // raced away — try the next
       await this.store.removeSignalWaiter(waiter);
-      const settled = await this.deliverSignal(waiter, candidate.payload);
+      const settled = await this.deliverSignal(waiter, candidate.payload, true);
       return settled ?? { runId: run.id, status: run.status };
     }
     return undefined;
@@ -2921,7 +3014,7 @@ export class WorkflowEngine {
         : {}),
       updatedAt: new Date(),
     });
-    await this.dispatchRun(runId, run.priority);
+    await this.dispatchRun(runId, run.priority, freshPendingKey());
     return { runId, status: 'pending' };
   }
 
@@ -3252,7 +3345,11 @@ export class WorkflowEngine {
    * due-timer reconcile sweep ({@link reconcileSignalWaiter}) — all three resolve a waiter the exact
    * same way.
    */
-  private async deliverSignal(waiter: SignalWaiter, payload: unknown): Promise<RunResult | null> {
+  private async deliverSignal(
+    waiter: SignalWaiter,
+    payload: unknown,
+    resumeHere = false,
+  ): Promise<RunResult | null> {
     await this.store.saveCheckpoint(
       instantCheckpoint({
         runId: waiter.runId,
@@ -3270,10 +3367,13 @@ export class WorkflowEngine {
     if (await this.fanStillWaiting(waiter, payload)) {
       return { runId: waiter.runId, status: 'suspended' };
     }
-    return this.resumeImplicit(waiter.runId).catch((err) => {
-      if (err instanceof NamespaceMismatch) return null;
-      throw err;
-    });
+    // The caller holds the run's lease (the due-timer reconcile): resume under it, here.
+    return (resumeHere ? this.resumeImplicit(waiter.runId) : this.wake(waiter.runId)).catch(
+      (err) => {
+        if (err instanceof NamespaceMismatch) return null;
+        throw err;
+      },
+    );
   }
 
   /**
@@ -4388,6 +4488,10 @@ export class WorkflowEngine {
     if (run.lockedUntil !== undefined && run.lockedUntil > nowMs) {
       if (attempt < LEASE_RECHECK_ATTEMPTS)
         this.recheckAfterLease(runId, run.lockedUntil, attempt + 1);
+      return;
+    }
+    if (this.queuesRunsOverTransport) {
+      await this.wake(runId);
       return;
     }
     if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) return;
@@ -7008,7 +7112,7 @@ export class WorkflowEngine {
     if (!waiters || waiters.size === 0) return;
     const runIds = [...waiters];
     waiters.clear();
-    for (const runId of runIds) void this.resumeImplicit(runId).catch(() => undefined);
+    for (const runId of runIds) void this.wake(runId).catch(() => undefined);
   }
 
   /** Release the flow-control slot a dispatched step held (if any), by its stepId. */

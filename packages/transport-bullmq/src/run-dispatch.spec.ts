@@ -18,8 +18,6 @@ const workers: {
   close: ReturnType<typeof vi.fn>;
   listeners: Map<string, (job: { data: unknown }) => void>;
 }[] = [];
-// The re-dispatch marks, as Redis would hold them.
-const marks = new Map<string, string>();
 
 vi.mock('bullmq', () => ({
   Queue: vi.fn((name: string) => ({
@@ -55,30 +53,10 @@ vi.mock('ioredis', () => ({
     subscribe: vi.fn().mockResolvedValue(undefined),
     on: vi.fn(),
     disconnect: vi.fn(),
-    pipeline: () => {
-      const ops: [string, string][] = [];
-      const p = {
-        set: (key: string, value: string) => {
-          ops.push([key, value]);
-          return p;
-        },
-        exec: async () => {
-          for (const [k, v] of ops) marks.set(k, v);
-          return [];
-        },
-      };
-      return p;
-    },
-    del: async (key: string) => (marks.delete(key) ? 1 : 0),
-    getdel: async (key: string) => {
-      const v = marks.get(key) ?? null;
-      marks.delete(key);
-      return v;
-    },
   })),
 }));
 
-const { BullMQTransport, runJobId, toBrokerPriority } = await import('./bullmq-transport');
+const { BullMQTransport, runStartJobId, toBrokerPriority } = await import('./bullmq-transport');
 
 const connection = { host: '127.0.0.1', port: 6379 };
 
@@ -90,7 +68,7 @@ describe('BullMQTransport run queue', () => {
     await transport.dispatchRuns(runs);
     expect(bulks.map((b) => b.queue)).toEqual(['app-runs', 'app-runs', 'app-runs']);
     expect(bulks.map((b) => b.jobs.length)).toEqual([500, 500, 200]);
-    expect(bulks.flatMap((b) => b.jobs.map((j) => j.opts.jobId))).toEqual(runs.map((r) => r.runId));
+    expect(bulks.flatMap((b) => b.jobs.map((j) => j.data.runId))).toEqual(runs.map((r) => r.runId));
     expect(bulks[0]?.jobs[0]).toMatchObject({
       name: 'run',
       data: { runId: 'r0' },
@@ -110,9 +88,9 @@ describe('BullMQTransport run queue', () => {
   });
 
   it('escapes the `:` BullMQ rejects in a custom job id, reversibly', () => {
-    expect(runJobId('evt:e1:onSignup')).toBe('evt%3Ae1%3AonSignup');
-    expect(runJobId('a%3Ab')).toBe('a%253Ab');
-    expect(runJobId('evt:e1')).not.toBe(runJobId('evt%3Ae1'));
+    expect(runStartJobId('evt:e1:onSignup', '1')).toBe('start-evt%3Ae1%3AonSignup-1');
+    expect(runStartJobId('a%3Ab', '1')).toBe('start-a%253Ab-1');
+    expect(runStartJobId('evt:e1', '1')).not.toBe(runStartJobId('evt%3Ae1', '1'));
   });
 
   it("uses a namespace's own queue, under the transport's namespace prefix", async () => {
@@ -127,7 +105,7 @@ describe('BullMQTransport run queue', () => {
     workers.length = 0;
     const transport = new BullMQTransport({ connection });
     const handled: string[] = [];
-    const stop = transport.onDispatchedRun(async (runId) => void handled.push(runId), {
+    const stop = transport.onDispatchedRun(async (run) => void handled.push(run.runId), {
       concurrency: 256,
     });
     expect(workers).toHaveLength(1);
@@ -142,46 +120,35 @@ describe('BullMQTransport run queue', () => {
     expect(workers[0]?.close).toHaveBeenCalledTimes(1);
   });
 
-  it('queues a run again when it was dispatched while its job was being handled', async () => {
-    workers.length = 0;
+  it('gives a start the job id of its run and pending state, and a wake none', async () => {
     bulks.length = 0;
-    marks.clear();
     const transport = new BullMQTransport({ connection });
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    transport.onDispatchedRun(async () => gate, { concurrency: 1 });
-    await transport.dispatchRuns([{ runId: 'r', priority: 3 }]);
-    const worker = workers[0];
-    // The job is taken (clearing the mark), and while it is handled the run is dispatched again:
-    // BullMQ ignores the add (same job id), the mark records it.
-    const handling = worker?.processor({ data: { runId: 'r', priority: 3 } });
-    await new Promise((resolve) => setImmediate(resolve));
-    await transport.dispatchRuns([{ runId: 'r', priority: 3 }]);
-    release();
-    await handling;
-    bulks.length = 0;
-    worker?.listeners.get('completed')?.({ data: { runId: 'r', priority: 3 } });
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(bulks.flatMap((b) => b.jobs.map((j) => j.data.runId))).toEqual(['r']);
-    expect(bulks[0]?.jobs[0]?.opts.priority).toBe(toBrokerPriority(3));
+    await transport.dispatchRuns([
+      { runId: 'evt:e1:x', reason: 'start', key: '100' },
+      { runId: 'evt:e1:x', reason: 'start', key: '100' },
+      { runId: 'evt:e1:x', reason: 'start', key: '200' },
+      { runId: 'evt:e1:x', reason: 'wake' },
+    ]);
+    const ids = bulks.flatMap((b) => b.jobs.map((j) => j.opts.jobId));
+    // The same pending state twice: one job id, so BullMQ keeps one job. A new pending state is a
+    // new job even while the first one is being handled. A wake is never deduplicated.
+    expect(ids).toEqual([
+      'start-evt%3Ae1%3Ax-100',
+      'start-evt%3Ae1%3Ax-100',
+      'start-evt%3Ae1%3Ax-200',
+      undefined,
+    ]);
+    expect(bulks[0]?.jobs[3]?.data).toEqual({ runId: 'evt:e1:x', reason: 'wake' });
     await transport.close();
   });
 
-  it('does not queue a run again when it was only waiting when dispatched twice', async () => {
+  it('hands the consumer the dispatch as sent, its reason included', async () => {
     workers.length = 0;
-    bulks.length = 0;
-    marks.clear();
     const transport = new BullMQTransport({ connection });
-    transport.onDispatchedRun(async () => undefined, { concurrency: 1 });
-    await transport.dispatchRuns([{ runId: 'w' }]);
-    await transport.dispatchRuns([{ runId: 'w' }]);
-    await workers[0]?.processor({ data: { runId: 'w' } });
-    bulks.length = 0;
-    workers[0]?.listeners.get('completed')?.({ data: { runId: 'w' } });
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(bulks).toEqual([]);
+    const handled: unknown[] = [];
+    transport.onDispatchedRun(async (run) => void handled.push(run), { concurrency: 2 });
+    await workers[0]?.processor({ data: { runId: 'r', reason: 'wake' } });
+    expect(handled).toEqual([{ runId: 'r', reason: 'wake' }]);
     await transport.close();
   });
 

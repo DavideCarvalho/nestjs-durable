@@ -1531,11 +1531,29 @@ export interface RunDispatcher {
   dispatch(runId: string): void | Promise<void>;
 }
 
-/** One run handed to {@link Transport.dispatchRuns}: a `pending` run any driving instance may execute. */
+/**
+ * One run handed to a transport's run queue ({@link Transport.dispatchRuns}), for whichever driving
+ * instance takes it.
+ *
+ * - `start` (the default): a freshly created or re-queued `pending` run. The consumer runs it only
+ *   while it is still `pending`; any other state means another instance already took it.
+ * - `wake`: a suspended run with something new to see (a delivered signal or child completion, a
+ *   due timer, a freed singleton or queue slot, a lease that came free). The consumer leases and
+ *   resumes it unless it is finished.
+ */
 export interface RunDispatch {
   runId: string;
   /** The run's admission priority (higher = more urgent), for a queue that orders by priority. */
   priority?: number | undefined;
+  reason?: 'start' | 'wake' | undefined;
+  /**
+   * Which `pending` state of the run a `start` is for: the same for every dispatch of one pending
+   * state (a start re-sent by the poll), different once the run went `pending` again (a retry, a
+   * recovery). A transport that deduplicates may drop a start whose `runId` and `key` match one it
+   * still holds; it must not drop one with a new key, even while the earlier one is being handled,
+   * nor a wake. Absent on a wake.
+   */
+  key?: string | undefined;
 }
 
 /**
@@ -1646,14 +1664,15 @@ export interface Transport {
    * dispatches the runs it starts here instead of executing them in-process. A rejection leaves the
    * runs `pending` in the store for a `runPending` poll.
    */
-  dispatchRuns?(runs: RunDispatch[], opts?: RunQueueOptions): Promise<void>;
+  dispatchRuns?(runs: readonly RunDispatch[], opts?: RunQueueOptions): Promise<void>;
   /**
    * engine ← engine: consume the run queue, at most `opts.concurrency` runs at once on this
-   * instance; `handler` resolves when its turn of the run settles. Returns a stop function that stops
+   * instance, handing each {@link RunDispatch} to `handler` as dispatched (its `reason` included);
+   * `handler` resolves when its turn of the run settles. Returns a stop function that stops
    * taking runs and resolves once the runs in flight have settled. Pair with {@link dispatchRuns}.
    */
   onDispatchedRun?(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: RunConsumerOptions,
   ): () => Promise<void>;
   /** control plane → tenant worker: publish a correlated {@link RunReply} on `<effectivePrefix>-run-reply`

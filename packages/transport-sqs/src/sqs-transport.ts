@@ -227,7 +227,7 @@ export class SqsTransport implements Transport {
    * `SendMessageBatch`. SQS is at-least-once and a standard queue does not deduplicate, so a run may
    * be received twice; the engine skips a run that is no longer due. Throws if any entry failed.
    */
-  async dispatchRuns(runs: RunDispatch[], opts?: RunQueueOptions): Promise<void> {
+  async dispatchRuns(runs: readonly RunDispatch[], opts?: RunQueueOptions): Promise<void> {
     if (runs.length === 0) return;
     const QueueUrl = await this.runsUrl(opts?.namespace);
     const fifo = QueueUrl.endsWith('.fifo');
@@ -238,7 +238,7 @@ export class SqsTransport implements Transport {
           QueueUrl,
           Entries: chunk.map((run, i) => ({
             Id: String(i),
-            MessageBody: JSON.stringify({ runId: run.runId }),
+            MessageBody: JSON.stringify(run),
             MessageAttributes: this.marker
               ? { [this.marker]: { DataType: 'String', StringValue: '1' } }
               : undefined,
@@ -268,7 +268,7 @@ export class SqsTransport implements Transport {
    * messages and resolves once the runs in flight settled.
    */
   onDispatchedRun(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: RunConsumerOptions,
   ): () => Promise<void> {
     const consumer: RunConsumer = {
@@ -309,7 +309,7 @@ export class SqsTransport implements Transport {
 
   private async consumeRuns(
     consumer: RunConsumer,
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     concurrency: number,
     namespace: string | undefined,
   ): Promise<void> {
@@ -352,13 +352,13 @@ export class SqsTransport implements Transport {
           }
           const receipt = msg.ReceiptHandle;
           if (!receipt) continue;
-          const { runId } = JSON.parse(msg.Body ?? '{}') as { runId?: string };
-          if (!runId) {
+          const run = JSON.parse(msg.Body ?? '{}') as Partial<RunDispatch>;
+          if (typeof run.runId !== 'string') {
             await this.del(url, receipt).catch(() => undefined);
             continue;
           }
           consumer.inflight.add(receipt);
-          const done = handler(runId)
+          const done = handler(run as RunDispatch)
             .catch(() => undefined)
             .then(() => this.del(url, receipt).catch(() => undefined))
             .finally(() => {

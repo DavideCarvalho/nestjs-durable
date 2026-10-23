@@ -9,7 +9,7 @@ import type {
 } from '../interfaces';
 
 interface Consumer {
-  handler: (runId: string) => Promise<void>;
+  handler: (run: RunDispatch) => Promise<void>;
   concurrency: number;
   active: number;
   stopped: boolean;
@@ -18,7 +18,8 @@ interface Consumer {
 
 interface Lane {
   waiting: RunDispatch[];
-  queued: Set<string>;
+  /** The waiting entry of each run, so a repeat merges into it. */
+  queued: Map<string, RunDispatch>;
   consumers: Consumer[];
   next: number;
 }
@@ -27,7 +28,8 @@ interface Lane {
  * An in-process run queue shared by several {@link Transport}s, for tests: each
  * {@link InMemoryRunQueue.transport} is one instance of a deployment, and a run queued by any of
  * them goes to whichever consumer has a free slot, round-robin. A run waiting in the queue is not
- * queued twice; higher priority goes first. The transports carry no remote steps.
+ * queued twice (a wake turns a waiting start into a wake); one being handled is queued again.
+ * Higher priority goes first. The transports carry no remote steps.
  */
 export class InMemoryRunQueue {
   private readonly lanes = new Map<string, Lane>();
@@ -54,25 +56,31 @@ export class InMemoryRunQueue {
     const key = namespace ?? '';
     let lane = this.lanes.get(key);
     if (!lane) {
-      lane = { waiting: [], queued: new Set(), consumers: [], next: 0 };
+      lane = { waiting: [], queued: new Map(), consumers: [], next: 0 };
       this.lanes.set(key, lane);
     }
     return lane;
   }
 
-  private add(runs: RunDispatch[], opts?: RunQueueOptions): void {
+  private add(runs: readonly RunDispatch[], opts?: RunQueueOptions): void {
     const lane = this.lane(opts?.namespace);
     for (const run of runs) {
-      if (lane.queued.has(run.runId)) continue;
-      lane.queued.add(run.runId);
-      lane.waiting.push(run);
+      const waiting = lane.queued.get(run.runId);
+      if (waiting) {
+        // A wake for a waiting start makes it a wake: a wake also runs a `pending` run.
+        if (run.reason === 'wake') waiting.reason = 'wake';
+        continue;
+      }
+      const entry = { ...run };
+      lane.queued.set(run.runId, entry);
+      lane.waiting.push(entry);
     }
     lane.waiting.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
     setImmediate(() => this.pump(lane));
   }
 
   private consume(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: RunConsumerOptions,
   ): () => Promise<void> {
     const lane = this.lane(opts.namespace);
@@ -103,7 +111,7 @@ export class InMemoryRunQueue {
       lane.queued.delete(run.runId);
       consumer.active += 1;
       void consumer
-        .handler(run.runId)
+        .handler(run)
         .catch(() => undefined)
         .then(() => {
           consumer.active -= 1;

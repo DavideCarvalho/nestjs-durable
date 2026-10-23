@@ -123,7 +123,7 @@ export class TransportPool {
    * Queue `runs` on the first transport that carries a run queue, failing over to the next on an
    * error, like {@link dispatch}. Throws if none accepted them.
    */
-  async dispatchRuns(runs: RunDispatch[], opts?: RunQueueOptions): Promise<void> {
+  async dispatchRuns(runs: readonly RunDispatch[], opts?: RunQueueOptions): Promise<void> {
     let lastErr: unknown;
     for (const { transport } of this.transports) {
       if (!transport.dispatchRuns || !transport.onDispatchedRun) continue;
@@ -142,7 +142,7 @@ export class TransportPool {
    * them after a failover). Returns one stop function per consumer.
    */
   onDispatchedRun(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: RunConsumerOptions,
   ): (() => Promise<void>)[] {
     const stops: (() => Promise<void>)[] = [];

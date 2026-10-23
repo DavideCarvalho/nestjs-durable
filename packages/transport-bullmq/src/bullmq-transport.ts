@@ -102,15 +102,14 @@ const DEFAULT_KEEPALIVE_MS = 10_000;
 /** Most run jobs one `addBulk` of {@link BullMQTransport.dispatchRuns} writes. */
 export const RUNS_BULK_CHUNK = 500;
 
-/** How long a re-dispatch mark outlives the dispatch that wrote it (see `dispatchRuns`). */
-const RUN_MARK_TTL_SECONDS = 86_400;
-
 /**
- * The job id of a run's queue entry: the run id, with `%` and `:` escaped, since BullMQ rejects a
- * custom job id containing `:` (its key separator) and run ids carry them (`evt:<id>:<workflow>`).
+ * The job id of a run's `start` for one pending state: `start-<runId>-<key>`, with `%` and `:`
+ * escaped, since BullMQ rejects a custom job id containing `:` (its key separator) and run ids
+ * carry them (`evt:<id>:<workflow>`). The same scheme as adonis-agora-durable's.
  */
-export function runJobId(runId: string): string {
-  return runId.replace(/%/g, '%25').replace(/:/g, '%3A');
+export function runStartJobId(runId: string, key: string): string {
+  const esc = (v: string) => v.replace(/%/g, '%25').replace(/:/g, '%3A');
+  return `start-${esc(runId)}-${esc(key)}`;
 }
 
 // Default `closeTimeoutMs` (see `BullMQTransportOptions`): how long `close()` waits on the graceful
@@ -263,7 +262,6 @@ export function buildWorkerDescriptor(opts: {
 interface ConsumerLike {
   concurrency: number;
   on(event: 'failed', listener: (job: Job | undefined, error: Error) => void): unknown;
-  on(event: 'completed', listener: (job: Job) => void): unknown;
   close(): Promise<void>;
 }
 
@@ -407,7 +405,6 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly deferredStarts: Array<() => void> = [];
   // Consumers of the run queue (`onDispatchedRun`), one per call, each closed by its stop function.
   private readonly runWorkers = new Set<ConsumerLike>();
-  private runMarkRedis?: Redis;
   // Control plane runs over Redis pub/sub (not a queue): every instance gets every message, which
   // is what live-tail + cancellation need. Subscribe needs its own connection (it blocks the client).
   private controlPub?: Redis;
@@ -571,7 +568,7 @@ export class BullMQTransport implements Transport, ControlPlane {
         ...(concurrency !== undefined ? { concurrency } : {}),
       });
     if (!this.consumersDeferred) return build(opts.concurrency);
-    const listeners: Array<['failed' | 'completed', (...args: never[]) => void]> = [];
+    const listeners: Array<(job: Job | undefined, error: Error) => void> = [];
     let real: Worker | undefined;
     let closed = false;
     let concurrency = opts.concurrency;
@@ -583,9 +580,9 @@ export class BullMQTransport implements Transport, ControlPlane {
         if (real) real.concurrency = limit;
         else concurrency = limit;
       },
-      on: (event: 'failed' | 'completed', listener: (...args: never[]) => void) => {
-        if (real) real.on(event, listener as never);
-        else listeners.push([event, listener]);
+      on: (_event, listener) => {
+        if (real) real.on('failed', listener);
+        else listeners.push(listener);
         return standIn;
       },
       close: async () => {
@@ -596,7 +593,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.deferredStarts.push(() => {
       if (closed) return;
       real = build(concurrency);
-      for (const [event, listener] of listeners) real.on(event, listener as never);
+      for (const listener of listeners) real.on('failed', listener);
     });
     return standIn;
   }
@@ -1405,87 +1402,47 @@ export class BullMQTransport implements Transport, ControlPlane {
   }
 
   /**
-   * Engine → engine: queue `pending` runs for whichever engine instance consumes the run queue
-   * first. The job id is the run id, so a run already waiting (or being taken) is not queued twice;
-   * `addBulk` writes up to {@link RUNS_BULK_CHUNK} jobs per round trip. A run's priority maps onto
-   * the job's, as for a step.
+   * Engine → engine: queue runs on `<prefix>-runs` (`<prefix>-runs-<namespace>` for a namespaced
+   * engine), {@link RUNS_BULK_CHUNK} per `addBulk`. A `start` with a key gets a job id from its run
+   * id and key ({@link runStartJobId}), so a start re-sent for the same pending state is not queued
+   * twice, while a run that went `pending` again (a new key) is a new job even while the earlier one
+   * is being handled. A `wake` gets none: one landing while an earlier one is handled must not be
+   * dropped. A run's priority maps onto the job's, as for a step.
    */
-  async dispatchRuns(runs: RunDispatch[], opts?: RunQueueOptions): Promise<void> {
+  async dispatchRuns(runs: readonly RunDispatch[], opts?: RunQueueOptions): Promise<void> {
     if (runs.length === 0) return;
-    const name = this.#runsName(opts?.namespace);
-    const queue = this.queue(name);
+    const queue = this.queue(this.#runsName(opts?.namespace));
     for (let at = 0; at < runs.length; at += RUNS_BULK_CHUNK) {
-      const chunk = runs.slice(at, at + RUNS_BULK_CHUNK);
       await queue.addBulk(
-        chunk.map((run) => ({
+        runs.slice(at, at + RUNS_BULK_CHUNK).map((run) => ({
           name: 'run',
-          data: {
-            runId: run.runId,
-            ...(run.priority !== undefined ? { priority: run.priority } : {}),
+          data: run,
+          opts: {
+            ...this.jobOptions(run.priority),
+            ...(run.reason !== 'wake' && run.key !== undefined
+              ? { jobId: runStartJobId(run.runId, run.key) }
+              : {}),
           },
-          opts: { ...this.jobOptions(run.priority), jobId: runJobId(run.runId) },
         })),
       );
-      // A run whose job is being handled right now was not added again (same job id). The mark,
-      // written after the add, says it was asked for meanwhile: the consumer queues it once more
-      // when the job completes. Taking the job clears the mark, so a run that was only waiting is
-      // not run twice.
-      const marks = this.runMarks().pipeline();
-      for (const run of chunk) {
-        marks.set(this.#runMarkKey(name, run.runId), '1', 'EX', RUN_MARK_TTL_SECONDS);
-      }
-      await marks.exec();
     }
   }
 
-  /** The Redis client for the run queue's re-dispatch marks. */
-  private runMarks(): Redis {
-    this.runMarkRedis ??= this.redis();
-    return this.runMarkRedis;
-  }
-
-  #runMarkKey(queueName: string, runId: string): string {
-    return `${queueName}-again:${runJobId(runId)}`;
-  }
-
   /**
-   * Engine ← engine: consume the run queue with a BullMQ `Worker` of `opts.concurrency`. The
+   * Engine ← engine: consume the run queue with a BullMQ `Worker` of `opts.concurrency`, parked
+   * like every point-to-point consumer while consumption is deferred (see `deferConsumers`). The
    * returned stop closes that worker: it takes no more jobs and resolves once the ones it holds
-   * settled. A job's handler never fails it; a job left by a crashed instance is redelivered by
-   * BullMQ's stalled check.
+   * settled. A job left by a crashed instance is redelivered by BullMQ's stalled check.
    */
   onDispatchedRun(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: RunConsumerOptions,
   ): () => Promise<void> {
-    const name = this.#runsName(opts.namespace);
-    // Parked like every point-to-point consumer while consumption is deferred (see `deferConsumers`).
     const worker = this.makeWorker(
-      name,
-      async (job) => {
-        const { runId } = job.data as { runId: string };
-        await this.runMarks().del(this.#runMarkKey(name, runId));
-        await handler(runId);
-      },
+      this.#runsName(opts.namespace),
+      (job) => handler(job.data as RunDispatch),
       { concurrency: Math.max(1, Math.floor(opts.concurrency)) },
     );
-    // The job is gone once completed: a run asked for while it was handled is queued again now.
-    worker.on('completed', (job: Job) => {
-      const { runId, priority } = job.data as { runId: string; priority?: number };
-      void this.runMarks()
-        .getdel(this.#runMarkKey(name, runId))
-        .then((mark) =>
-          mark
-            ? this.dispatchRuns([{ runId, ...(priority !== undefined ? { priority } : {}) }], {
-                namespace: opts.namespace,
-              })
-            : undefined,
-        )
-        .catch((err: unknown) => {
-          if (!this.closed)
-            console.error(`[nestjs-durable] could not queue run ${runId} again:`, err);
-        });
-    });
     this.runWorkers.add(worker);
     return async () => {
       await worker.close();
@@ -1625,6 +1582,5 @@ export class BullMQTransport implements Transport, ControlPlane {
     for (const sub of this.tenantEventSubs) sub.disconnect();
     this.tenantEventSubs.clear();
     this.workerHeartbeatRedis?.disconnect();
-    this.runMarkRedis?.disconnect();
   }
 }

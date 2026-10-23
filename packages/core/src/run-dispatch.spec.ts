@@ -45,9 +45,9 @@ function recorded(inner: Transport) {
     },
     onDispatchedRun: (handler, opts) => {
       consumers.push(opts);
-      return (inner.onDispatchedRun as NonNullable<Transport['onDispatchedRun']>)(async (runId) => {
-        handled.push(runId);
-        await handler(runId);
+      return (inner.onDispatchedRun as NonNullable<Transport['onDispatchedRun']>)(async (run) => {
+        handled.push(run.runId);
+        await handler(run);
       }, opts);
     },
   };
@@ -95,7 +95,11 @@ describe("a fan's children", () => {
     expect(children).toHaveLength(n);
     // Every child was taken off the queue, and queued once.
     expect(new Set(a.handled)).toEqual(new Set(['p', ...children]));
-    expect(a.queued()).toHaveLength(n + 1);
+    // Each child started once; the parent's start, and its one wake when the fan settled.
+    expect(a.batches.flat().filter((r) => r.reason === 'start')).toHaveLength(n + 1);
+    expect(a.batches.flat().filter((r) => r.reason === 'wake')).toEqual([
+      { runId: 'p', reason: 'wake' },
+    ]);
     expect(Math.max(...a.batches.map((b) => b.length))).toBeLessThanOrEqual(500);
     expect(a.batches.length).toBeLessThanOrEqual(12);
     expect(a.batches.filter((b) => b.length > 1).length).toBeGreaterThanOrEqual(3);
@@ -365,7 +369,7 @@ describe('every instance-triggered start or re-drive goes over the run queue', (
     a.batches.length = 0;
     await engines[0]?.signal('go:A', undefined);
     await done(store, 'a');
-    await until(() => a.queued().includes('b'));
+    await until(() => a.batches.flat().some((r) => r.runId === 'b' && r.reason === 'wake'));
     await until(async () => (await store.listSignalWaiters('go:B')).length === 1);
     await engines[1]?.signal('go:B', undefined);
     await done(store, 'b');
@@ -437,5 +441,99 @@ describe('every instance-triggered start or re-drive goes over the run queue', (
     expect(ids).toHaveLength(1);
     await done(store, ids[0] as string);
     expect(a.queued()).toEqual(ids);
+  });
+});
+
+describe('wakes go over the run queue', () => {
+  it("a child's completion wakes its parent on whichever instance takes the wake", async () => {
+    const { store, a, engines } = deployment();
+    for (const e of engines) {
+      e.register('kid', '1', async (ctx) => ctx.waitForSignal<number>('kid-go'));
+      e.register('wf', '1', async (ctx) => ctx.child<number>('kid', {}, 'kid-1'));
+      e.consumeRuns();
+    }
+    await engines[0]?.start('wf', {}, 'r');
+    await until(async () => (await store.getRun('kid-1'))?.status === 'suspended');
+    a.batches.length = 0;
+    await engines[0]?.signal('kid-go', 5);
+    await done(store, 'r');
+    expect((await store.getRun('r'))?.output).toBe(5);
+    const wakes = a.batches.flat().filter((r) => r.reason === 'wake');
+    expect(wakes.map((r) => r.runId).sort()).toEqual(['kid-1', 'r']);
+  });
+
+  it('signal resolves once the wake is queued, and the turn runs off the queue', async () => {
+    const { store, a, engines } = deployment();
+    for (const e of engines) {
+      e.register('wf', '1', async (ctx) => ctx.waitForSignal<string>('go'));
+      e.consumeRuns();
+    }
+    await engines[0]?.start('wf', {}, 'r');
+    await until(async () => (await store.getRun('r'))?.status === 'suspended');
+    expect(await engines[0]?.signal('go', 'x')).toEqual({ runId: 'r', status: 'suspended' });
+    await done(store, 'r');
+    expect(a.batches.flat()).toContainEqual({ runId: 'r', reason: 'wake' });
+  });
+
+  it('a wake dropped on a held lease is queued once the lease is free', async () => {
+    const store = new InMemoryStateStore();
+    const queue = new InMemoryRunQueue();
+    const a = recorded(queue.transport());
+    const engine = new WorkflowEngine({ store, transport: a.transport, reconcileMs: 0 });
+    engine.register('wf', '1', async (ctx) => ctx.waitForSignal<string>('go'));
+    engine.consumeRuns();
+    await engine.start('wf', {}, 'r');
+    await until(async () => (await store.getRun('r'))?.status === 'suspended');
+    // Another instance holds the run's lease (it went down mid-turn) when the signal's wake lands.
+    await store.tryLockRun('r', 'gone-pod', Date.now() + 150, Date.now());
+    a.batches.length = 0;
+    await engine.signal('go', 'x');
+    await done(store, 'r');
+    // The signal's wake, dropped on the held lease, and the re-check queued once it lapsed.
+    expect(a.batches.flat().filter((r) => r.runId === 'r' && r.reason === 'wake').length).toBe(2);
+  });
+
+  it('a due timer is claimed for one lease period while its wake waits in the queue', async () => {
+    let now = Date.now();
+    const store = new InMemoryStateStore();
+    const queue = new InMemoryRunQueue();
+    const a = recorded(queue.transport());
+    const engine = new WorkflowEngine({ store, transport: a.transport, clock: () => now });
+    engine.register('wf', '1', async (ctx) => {
+      await ctx.sleep(1000);
+      return 1;
+    });
+    await engine.start('wf', {}, 'r');
+    await until(async () => (await store.getRun('r'))?.status === 'suspended');
+    engine.consumeRuns();
+    now += 2000;
+    a.batches.length = 0;
+    await engine.resumeDueTimers(now);
+    await engine.resumeDueTimers(now);
+    // Claimed: the second poll found nothing due to queue again.
+    expect(a.batches.flat()).toEqual([{ runId: 'r', reason: 'wake' }]);
+    await done(store, 'r');
+  });
+
+  it('a wake the transport refused resumes the run here instead of waiting for its timer', async () => {
+    const store = new InMemoryStateStore();
+    const inner = new InMemoryRunQueue().transport();
+    let refuse = false;
+    const transport: Transport = {
+      ...inner,
+      dispatchRuns: async (runs, opts) => {
+        if (refuse && runs.some((r) => r.reason === 'wake')) throw new Error('broker down');
+        await inner.dispatchRuns?.(runs, opts);
+      },
+    };
+    const engine = new WorkflowEngine({ store, transport, reconcileMs: 0 });
+    engine.register('wf', '1', async (ctx) => ctx.waitForSignal<string>('go'));
+    engine.consumeRuns();
+    await engine.start('wf', {}, 'r');
+    await until(async () => (await store.getRun('r'))?.status === 'suspended');
+    refuse = true;
+    await engine.signal('go', 'x');
+    await done(store, 'r');
+    expect((await store.getRun('r'))?.output).toBe('x');
   });
 });

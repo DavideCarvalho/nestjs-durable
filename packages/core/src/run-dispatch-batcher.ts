@@ -11,12 +11,11 @@ export const RUN_DISPATCH_WINDOW_MS = 5;
  * {@link RUN_DISPATCH_WINDOW_MS} after its first run. A fan's children, started a few hundred at a
  * time, reach the broker as a handful of bulk writes instead of one round trip each.
  *
- * A failed send is reported to `onError` and not retried: the runs are already `pending` in the
- * store, where a `runPending` poll picks them up.
+ * A failed send is reported to `onError` and not retried: a start stays `pending` in the store for a
+ * `runPending` poll, and the caller decides what a lost wake costs.
  */
 export class RunDispatchBatcher {
-  private buffer: RunDispatch[] = [];
-  private readonly buffered = new Set<string>();
+  private buffer = new Map<string, RunDispatch>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private readonly sending = new Set<Promise<void>>();
 
@@ -27,14 +26,15 @@ export class RunDispatchBatcher {
 
   /** Nothing buffered and nothing being sent. */
   get idle(): boolean {
-    return this.buffer.length === 0 && this.sending.size === 0;
+    return this.buffer.size === 0 && this.sending.size === 0;
   }
 
+  /** Buffer `run`. A wake for a run already buffered replaces its start: a wake also runs a `pending` run. */
   add(run: RunDispatch): void {
-    if (this.buffered.has(run.runId)) return;
-    this.buffered.add(run.runId);
-    this.buffer.push(run);
-    if (this.buffer.length >= RUN_DISPATCH_BATCH) {
+    const prior = this.buffer.get(run.runId);
+    if (prior && run.reason !== 'wake') return;
+    this.buffer.set(run.runId, run);
+    if (this.buffer.size >= RUN_DISPATCH_BATCH) {
       this.flush();
       return;
     }
@@ -48,10 +48,9 @@ export class RunDispatchBatcher {
   flush(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
-    if (this.buffer.length === 0) return;
-    const runs = this.buffer;
-    this.buffer = [];
-    this.buffered.clear();
+    if (this.buffer.size === 0) return;
+    const runs = [...this.buffer.values()];
+    this.buffer = new Map();
     const sent = this.send(runs)
       .catch((err) => this.onError(runs, err))
       .finally(() => this.sending.delete(sent));
