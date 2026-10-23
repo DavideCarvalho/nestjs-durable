@@ -13,6 +13,9 @@ import {
   type RawWorkerDescriptor,
   type RemoteTask,
   type RoutingResolution,
+  type RunConsumerOptions,
+  type RunDispatch,
+  type RunQueueOptions,
   type RunReply,
   type RunRequest,
   type StartRunMessage,
@@ -96,6 +99,19 @@ const SUBSCRIBER_PING_TIMEOUT_MS = 5_000;
 // caller-supplied instance inherits whatever the caller configured, so the ping watchdog (which works
 // regardless of keepalive) is the layer that must catch a silent loss either way.
 const DEFAULT_KEEPALIVE_MS = 10_000;
+/** Most run jobs one `addBulk` of {@link BullMQTransport.dispatchRuns} writes. */
+export const RUNS_BULK_CHUNK = 500;
+
+/**
+ * The job id of a run's `start` for one pending state: `start-<runId>-<key>`, with `%` and `:`
+ * escaped, since BullMQ rejects a custom job id containing `:` (its key separator) and run ids
+ * carry them (`evt:<id>:<workflow>`). The same scheme as adonis-agora-durable's.
+ */
+export function runStartJobId(runId: string, key: string): string {
+  const esc = (v: string) => v.replace(/%/g, '%25').replace(/:/g, '%3A');
+  return `start-${esc(runId)}-${esc(key)}`;
+}
+
 // Default `closeTimeoutMs` (see `BullMQTransportOptions`): how long `close()` waits on the graceful
 // BullMQ closes before dropping the connections anyway. Generous enough that a healthy close (single
 // -digit ms in practice) is never cut short, small enough that a wedged one cannot hold a pod's
@@ -387,6 +403,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   // Deferred consumption (see `deferConsumers`): consumer starts parked until `startConsumers()`.
   private consumersDeferred = false;
   private readonly deferredStarts: Array<() => void> = [];
+  // Consumers of the run queue (`onDispatchedRun`), one per call, each closed by its stop function.
+  private readonly runWorkers = new Set<ConsumerLike>();
   // Control plane runs over Redis pub/sub (not a queue): every instance gets every message, which
   // is what live-tail + cancellation need. Subscribe needs its own connection (it blocks the client).
   private controlPub?: Redis;
@@ -468,6 +486,15 @@ export class BullMQTransport implements Transport, ControlPlane {
   /** `<effectivePrefix>-start-run` — the queue for tenant worker → control plane start-run requests. */
   #startRunName(): string {
     return `${this.#effectivePrefix()}-start-run`;
+  }
+
+  /**
+   * `<effectivePrefix>-runs`, or `<effectivePrefix>-runs-<namespace>` for an engine scoped to one
+   * namespace — the run queue every driving engine instance consumes ({@link dispatchRuns}).
+   */
+  #runsName(namespace: string | undefined): string {
+    const base = `${this.#effectivePrefix()}-runs`;
+    return namespace ? `${base}-${sanitizeQueueToken(namespace)}` : base;
   }
 
   /** `<effectivePrefix>-run-request` — the queue for tenant worker → control plane read/control
@@ -1374,6 +1401,55 @@ export class BullMQTransport implements Transport, ControlPlane {
     });
   }
 
+  /**
+   * Engine → engine: queue runs on `<prefix>-runs` (`<prefix>-runs-<namespace>` for a namespaced
+   * engine), {@link RUNS_BULK_CHUNK} per `addBulk`. A `start` with a key gets a job id from its run
+   * id and key ({@link runStartJobId}), so a start re-sent for the same pending state is not queued
+   * twice, while a run that went `pending` again (a new key) is a new job even while the earlier one
+   * is being handled. A `wake` gets none: one landing while an earlier one is handled must not be
+   * dropped. A run's priority maps onto the job's, as for a step.
+   */
+  async dispatchRuns(runs: readonly RunDispatch[], opts?: RunQueueOptions): Promise<void> {
+    if (runs.length === 0) return;
+    const queue = this.queue(this.#runsName(opts?.namespace));
+    for (let at = 0; at < runs.length; at += RUNS_BULK_CHUNK) {
+      await queue.addBulk(
+        runs.slice(at, at + RUNS_BULK_CHUNK).map((run) => ({
+          name: 'run',
+          data: run,
+          opts: {
+            ...this.jobOptions(run.priority),
+            ...(run.reason !== 'wake' && run.key !== undefined
+              ? { jobId: runStartJobId(run.runId, run.key) }
+              : {}),
+          },
+        })),
+      );
+    }
+  }
+
+  /**
+   * Engine ← engine: consume the run queue with a BullMQ `Worker` of `opts.concurrency`, parked
+   * like every point-to-point consumer while consumption is deferred (see `deferConsumers`). The
+   * returned stop closes that worker: it takes no more jobs and resolves once the ones it holds
+   * settled. A job left by a crashed instance is redelivered by BullMQ's stalled check.
+   */
+  onDispatchedRun(
+    handler: (run: RunDispatch) => Promise<void>,
+    opts: RunConsumerOptions,
+  ): () => Promise<void> {
+    const worker = this.makeWorker(
+      this.#runsName(opts.namespace),
+      (job) => handler(job.data as RunDispatch),
+      { concurrency: Math.max(1, Math.floor(opts.concurrency)) },
+    );
+    this.runWorkers.add(worker);
+    return async () => {
+      await worker.close();
+      this.runWorkers.delete(worker);
+    };
+  }
+
   /** Control plane: consume run requests. Starts the consumer on first call (idempotent — a second
    *  call is a no-op). */
   onRunRequest(handler: (msg: RunRequest) => Promise<void>): void {
@@ -1484,6 +1560,7 @@ export class BullMQTransport implements Transport, ControlPlane {
       this.stepEventsWorker?.close(),
       this.startRunWorker?.close(),
       this.runRequestWorker?.close(),
+      ...[...this.runWorkers].map((w) => w.close()),
     ];
     // `allSettled`, so one rejecting close does not mask the rest; the race bounds the phase.
     // A rejection here is not actionable during shutdown — the connections come down either way.

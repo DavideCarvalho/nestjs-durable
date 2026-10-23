@@ -124,6 +124,17 @@ several isolated deployments — e.g. one per developer — without crosstalk. L
 inserts a `-<namespace>` segment into every name. See [Tenancy](/docs/concepts/tenancy) for the
 operator/tenant model this enables.
 
+## Run queue
+
+The engine queues the runs it starts or wakes on `<prefix>-runs` (`<prefix>-runs-<namespace>` for an
+engine scoped to a namespace), and every driving instance consumes it, 256 at once. A start's job id
+is `start-<runId>-<key>` (`:` escaped as `%3A`), where the key names the `pending` state it is for:
+a start re-sent for that state is not queued twice, and a run that went `pending` again is a new
+job even while the earlier one is being handled. A wake has no job id, so none is dropped. A fan's
+children go in `addBulk` writes of up to 500, and a run's `priority` maps onto the job's as for a
+step. A job held by an instance that went down is redelivered by BullMQ's stalled check. The job ids
+are the same as adonis-agora-durable's.
+
 ## Crash recovery
 
 A worker that crashes or stalls mid-step never produces a `StepResult`, so without help the step's

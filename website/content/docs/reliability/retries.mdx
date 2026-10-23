@@ -184,8 +184,11 @@ forever unless something re-dispatches it:
 - For any transport, `engine.redispatchPending(runId)` (or the dashboard's **Re-dispatch** action)
   manually re-enqueues a run's stuck `pending` remote steps.
 - `remoteRedispatchMs` — an **opt-in** engine option — makes this self-healing: a dispatched remote
-  step carries a **lease** on its `pending` checkpoint (`wakeAt`), and the run suspends on it (never
-  later than the `reconcileMs` sweep would have woken it anyway). A result — or a step-scoped
+  step carries a **lease** on its `pending` checkpoint (`wakeAt`), and the run suspends on it, never
+  later than the `reconcileMs` sweep would have woken it anyway. That holds for the redispatch
+  deadline too: with a one-hour `remoteRedispatchMs`, the run still wakes every `reconcileMs`,
+  replays to the step, and re-parks while the deadline has not passed, so a result whose wake was
+  lost is picked up within `reconcileMs`. A result — or a step-scoped
   heartbeat, which **renews** the lease (throttled to one write per half-window, so a worker beating
   every couple of seconds is not an `UPDATE` storm) — must land before it lapses; a lapsed lease
   re-dispatches the same `stepId`, bounded by `remoteRedispatchMax` (default 10) before failing the

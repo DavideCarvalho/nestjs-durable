@@ -52,6 +52,7 @@ import type {
 } from './interfaces';
 import { codeAndDetails } from './on-error';
 import { breakpointToken } from './protocol';
+import { readRunsByIds } from './run-waiting';
 import { createStepLogger } from './step-logger';
 import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol';
 import { type WorkflowRef, workflowName } from './workflow-ref';
@@ -731,25 +732,37 @@ export function createWorkflowCtx(
 
     // failFast: bail the moment any already-completed item is a failed Completion.
     if (mode === 'failFast') {
-      for (let i = 0; i < inputs.length; i += 1) {
+      const failure = (i: number) => {
         const cp = existing[i];
         const c =
-          cp?.status === 'completed' ? (cp.output as { ok?: boolean; error?: string }) : null;
-        if (c && c.ok === false) {
-          // Cancel every sibling that hasn't completed yet — plain cancel, no saga undo. Best-effort:
-          // a sibling mid-step only observes the cancellation at its NEXT checkpoint (it isn't
-          // force-killed mid-synchronous-execution), so a fast-enough sibling can still slip through
-          // and complete before it notices. `cancelChild` is deferred (like `startChild`), and
-          // cancelling an already-terminal/cancelled run is a no-op, so replaying this branch after a
-          // resume (which re-executes this loop and re-issues the same cancels) is safe.
-          for (let j = 0; j < inputs.length; j += 1) {
-            if (j !== i && existing[j]?.status !== 'completed') host.cancelChild?.(id(j));
-          }
-          throw new GatherError(
-            [{ index: i, id: id(i), error: c.error ?? 'unknown' }],
-            inputs.length,
-          );
+          cp?.status === 'completed'
+            ? (cp.output as { ok?: boolean; error?: string; code?: string })
+            : null;
+        return c && c.ok === false ? c : null;
+      };
+      // The failure the fan reports. A sibling this fan cancelled reports itself cancelled once it
+      // settles, possibly at a lower index; the original failure must stay the one a replay throws.
+      const first = (cancelled: boolean) =>
+        inputs.findIndex((_, i) => {
+          const c = failure(i);
+          return c !== null && (c.code === 'cancelled') === cancelled;
+        });
+      const i = first(false) !== -1 ? first(false) : first(true);
+      const c = i === -1 ? null : failure(i);
+      if (c) {
+        // Cancel every sibling that hasn't completed yet — plain cancel, no saga undo. Best-effort:
+        // a sibling mid-step only observes the cancellation at its NEXT checkpoint (it isn't
+        // force-killed mid-synchronous-execution), so a fast-enough sibling can still slip through
+        // and complete before it notices. `cancelChild` is deferred (like `startChild`), and
+        // cancelling an already-terminal/cancelled run is a no-op, so replaying this branch after a
+        // resume (which re-executes this loop and re-issues the same cancels) is safe.
+        for (let j = 0; j < inputs.length; j += 1) {
+          if (j !== i && existing[j]?.status !== 'completed') host.cancelChild?.(id(j));
         }
+        throw new GatherError(
+          [{ index: i, id: id(i), error: c.error ?? 'unknown' }],
+          inputs.length,
+        );
       }
     }
 
@@ -844,12 +857,17 @@ export function createWorkflowCtx(
         for (const i of chunk) host.startChild(name, inputs[i], id(i));
       }
       // A placeholder written by a turn that crashed before the deferred start ran: start it now.
-      for (let at = 0; at < toEnsure.length; at += FAN_CHUNK) {
-        await Promise.all(
-          toEnsure.slice(at, at + FAN_CHUNK).map(async (i) => {
-            if (!(await store.getRun(id(i)))) host.startChild(name, inputs[i], id(i));
-          }),
+      // One batched read for the lot, not one per child: a replay of a wide fan has thousands.
+      if (toEnsure.length > 0) {
+        // A child whose read failed is not started blind; the next turn looks again.
+        const { runs: started, unread } = await readRunsByIds(
+          store,
+          toEnsure.map((i) => id(i)),
         );
+        const skip = new Set(unread);
+        for (const i of toEnsure) {
+          if (!started.has(id(i)) && !skip.has(id(i))) host.startChild(name, inputs[i], id(i));
+        }
       }
     }
     if (active.length > 0) {

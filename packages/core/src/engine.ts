@@ -1,6 +1,7 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission';
 import { currentWorkflowCtx, runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';
+import { BoundedRunner, LOCAL_RUN_CONCURRENCY } from './bounded-runner';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints';
 import {
   type Completion,
@@ -43,6 +44,7 @@ import {
   FOLDED_PREFIX,
   fanOfWaiter,
   foldedChildIds,
+  parentRunIdOf,
   parseStepFanGroup,
   stepFanGroup,
 } from './fan-join';
@@ -65,6 +67,7 @@ import type {
   GroupHealth,
   NamedTransport,
   RemoteTask,
+  RunDispatch,
   RunDispatcher,
   RunQuery,
   RunResult,
@@ -110,7 +113,8 @@ import {
 import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
-import { indexWaitersByRun, listSignalWaitersOfRuns } from './run-waiting';
+import { RUN_DISPATCH_BATCH, RunDispatchBatcher } from './run-dispatch-batcher';
+import { indexWaitersByRun, listSignalWaitersOfRuns, readRunsByIds } from './run-waiting';
 import { ScheduleClient } from './schedules';
 import {
   SINGLETON_ADMITTED_TAG,
@@ -344,6 +348,87 @@ const versionKey = (name: string, version: string): string => `${name}@${version
  */
 /** How many checkpoint writes / dispatches a step fan sends at once. */
 const STEP_FAN_CHUNK = 200;
+
+/** Tries, and the first backoff, for telling a parent that its child finished (see `deliverToParent`). */
+const PARENT_NOTIFY_ATTEMPTS = 4;
+const PARENT_NOTIFY_BACKOFF_MS = 250;
+
+/** How often, at most, and how many times a wake dropped on a held lease looks again (see `recheckAfterLease`). */
+const LEASE_RECHECK_MAX_MS = 2_000;
+const LEASE_RECHECK_SLACK_MS = 100;
+const LEASE_RECHECK_ATTEMPTS = 30;
+
+/** An implicit turn executing on this instance, and the one turn after it that later wakes share. */
+interface WakeTurn {
+  again?: Deferred<RunResult>;
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (err: unknown) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (err: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  // A wake nobody awaits must not surface as an unhandled rejection.
+  promise.catch(() => undefined);
+  return { promise, resolve, reject };
+}
+
+/**
+ * The {@link RunDispatch.key} of the `pending` state a run entered at `at`: the same for every
+ * dispatch of that state (a start re-sent by the poll), so a transport can drop the repeat.
+ */
+const pendingStateKey = (at: Date): string => String(new Date(at).getTime());
+
+/**
+ * The {@link RunDispatch.key} of a run put back to `pending` (a retry, a recovery): a new pending
+ * state, never the key of the run's earlier start, even within the same millisecond.
+ */
+const freshPendingKey = (): string => `${Date.now()}-${globalThis.crypto.randomUUID().slice(0, 8)}`;
+
+/** The checkpoint name prefix of an awaited child: `signal:child:<childId>`. */
+const CHILD_SIGNAL_PREFIX = 'signal:child:';
+
+/** A child a run waits on: its id, and the seq and fan group of the run's wait for it. */
+interface AwaitedChild {
+  childId: string;
+  seq: number;
+  parallelGroup?: string | undefined;
+}
+
+/** How many finished children `deliverFinishedChildren` settles at once. */
+const DELIVER_CHUNK = 50;
+
+/**
+ * The completion a finished child delivers to its parent (see `settleRun`), or undefined while it
+ * is not finished. Only `completed` and `failed` notify a parent.
+ */
+function childCompletion(child: WorkflowRun): Completion<unknown> | undefined {
+  if (child.status === 'completed') return { ok: true, value: child.output };
+  if (child.status === 'failed') return failedCompletion(child.error ?? { message: 'failed' });
+  if (child.status === 'dead') return failedCompletion(child.error ?? { message: 'dead' });
+  if (child.status === 'cancelled') return cancelledCompletion(child.error);
+  return undefined;
+}
+
+/** Code of the failure a cancelled child delivers to its parent (see {@link cancelledCompletion}). */
+const CHILD_CANCELLED = 'cancelled';
+
+/**
+ * The failure a cancelled child delivers to its parent: its own error (`cancelled`, or the
+ * execution timeout that cancelled it), coded `cancelled` unless it carries a code already.
+ */
+function cancelledCompletion(error: StepError | undefined): Completion<never> {
+  const base = error ?? { message: 'cancelled' };
+  return failedCompletion({ ...base, code: base.code ?? CHILD_CANCELLED });
+}
 
 /** The most results of one run settled by one batched write (see `completeRemoteResult`). */
 const RESULT_BATCH_MAX = 256;
@@ -642,8 +727,10 @@ export interface WorkflowEngineDeps {
    */
   trackStepStart?: boolean | undefined;
   /**
-   * Where a freshly-`start`ed run executes (see {@link RunDispatcher}). Defaults to in-process: the
-   * run executes on this instance asynchronously (a microtask), so `start` returns without blocking.
+   * Where a freshly-`start`ed run executes (see {@link RunDispatcher}). By default the run executes
+   * on this instance asynchronously, so `start` returns without blocking; once the engine consumes a
+   * transport's run queue ({@link WorkflowEngine.consumeRuns}) it queues the run there instead, for
+   * whichever driving instance takes it.
    * Pass a no-op dispatcher on a caller that must NOT run workflows (e.g. an API/dashboard pod), and
    * run `runPending` on a worker pod to pick those up; or a broker-backed one for a worker pool.
    */
@@ -806,6 +893,35 @@ export class WorkflowEngine {
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Set<Promise<RunResult>>();
   /**
+   * Work a settled turn leaves running in the background (a parent notification, a post-release
+   * re-drive), so a graceful shutdown waits for it too: dropping one on exit strands the run until
+   * its reconcile timer.
+   */
+  private readonly background = new Set<Promise<unknown>>();
+  /**
+   * Runs with an implicit wake executing on this instance, and whether another wake arrived for the
+   * run meanwhile (see {@link resumeImplicit}).
+   */
+  private readonly wakeTurns = new Map<string, WakeTurn>();
+  /** Re-checks scheduled for runs whose wake found another instance's lease (see {@link execute}). */
+  private readonly leaseRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * Every run turn and child start this instance takes on itself, under one budget of
+   * {@link LOCAL_RUN_CONCURRENCY}: the runs it dispatches to itself, a fan's deferred child starts,
+   * enqueued pickups and the runs it takes off the transport's run queue.
+   */
+  private readonly localWork: BoundedRunner;
+  /** The dispatcher the caller supplied, if any; without one the engine picks (see {@link dispatchRun}). */
+  private readonly customDispatcher: RunDispatcher | undefined;
+  /** Runs on their way to the transport's run queue (see {@link consumeRuns}). */
+  private readonly runBatcher: RunDispatchBatcher;
+  /** Set while this engine consumes a transport's run queue, and so dispatches its runs to it. */
+  private dispatchesOverTransport = false;
+  /** Stops for the run-queue consumers started by {@link consumeRuns}. */
+  private runConsumerStops: (() => Promise<void>)[] = [];
+  /** The consumers being stopped, so {@link drain} waits for their runs in flight. */
+  private runConsumersStopping: Promise<unknown> | undefined;
+  /**
    * The run lease of each execution in flight on THIS instance, by run id — renewed while it runs
    * and checked by every settle (the zombie fence, see {@link ExecutionLease}). Also what `drain()`
    * releases when its budget runs out.
@@ -886,14 +1002,31 @@ export class WorkflowEngine {
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
     // A failed pickup is swallowed here (the run stays `pending` for a `runPending` poll to retry);
     // run failures themselves are handled inside `execute` and surfaced as the run's `failed` state.
-    this.runDispatcher = deps.runDispatcher ?? {
-      dispatch: (runId) => queueMicrotask(() => void this.runOne(runId).catch(() => {})),
-    };
+    this.localWork = new BoundedRunner(LOCAL_RUN_CONCURRENCY);
+    this.customDispatcher = deps.runDispatcher;
+    this.runBatcher = new RunDispatchBatcher(
+      (runs) => this.pool.dispatchRuns(runs, { namespace: this.namespace }),
+      (runs, err) => {
+        // A start stays `pending` for the next poll. A wake is not left to the run's timer (minutes
+        // away): it resumes the run here, as it would without a run queue.
+        for (const run of runs) {
+          if (run.reason === 'wake' && !this.draining) {
+            this.inBackground(this.resumeImplicit(run.runId));
+          }
+        }
+        console.error(
+          `[nestjs-durable] could not queue ${runs.length} run(s) on the transport; starts stay pending for the next poll, wakes resume here:`,
+          err,
+        );
+      },
+    );
+    this.runDispatcher = { dispatch: (runId) => this.dispatchRun(runId) };
     this.singletons = new SingletonGate({
       store: this.store,
       clock: this.clock,
       dispatch: (runId) => {
-        this.runDispatcher.dispatch(runId);
+        if (this.queuesRunsOverTransport) void this.wake(runId);
+        else this.runDispatcher.dispatch(runId);
       },
       configFor: (run) =>
         (
@@ -1056,12 +1189,223 @@ export class WorkflowEngine {
 
   /**
    * Be notified when a run is enqueued on ANOTHER instance (via the control plane), so a worker can
-   * pick it up at once — e.g. `engine.onEnqueued((runId) => engine.runOne(runId))`. Returns an
+   * pick it up at once — e.g. `engine.onEnqueued((runId) => engine.runEnqueued(runId))`. Returns an
    * unsubscribe function. Only wire this on instances that should execute runs (workers).
    */
   onEnqueued(listener: (runId: string) => void): () => void {
     this.enqueuedListeners.add(listener);
     return () => this.enqueuedListeners.delete(listener);
+  }
+
+  /**
+   * Pick up a run another instance announced as enqueued: run it here if it is still `pending`.
+   * Bounded by {@link LOCAL_RUN_CONCURRENCY}, and a run another instance already took is skipped
+   * after one read, instead of being leased and replayed here once more.
+   */
+  runEnqueued(runId: string): void {
+    this.localWork.submit(`run:${runId}`, () => this.runIfPending(runId));
+  }
+
+  /**
+   * Consume the run queue of every transport that carries one ({@link Transport.dispatchRuns} and
+   * {@link Transport.onDispatchedRun}), and from then on dispatch the runs this engine starts there
+   * rather than executing them in-process: a run, a `ctx.all` fan's children included, executes on
+   * whichever consuming instance takes it, at most {@link LOCAL_RUN_CONCURRENCY} at once per
+   * instance. Call it on every instance that drives runs; the Nest module does on a driving operator.
+   *
+   * Returns a function that stops consuming and resolves once the runs in flight settled, after
+   * which runs are executed in-process again; {@link beginDrain} stops consuming too. Undefined
+   * when no transport carries a run queue: runs keep executing in-process.
+   */
+  consumeRuns(): (() => Promise<void>) | undefined {
+    if (!this.pool.dispatchesRuns) return undefined;
+    if (this.runConsumerStops.length === 0) {
+      this.runConsumerStops = this.pool.onDispatchedRun(
+        (run) => this.localWork.run(() => this.runFromQueue(run)),
+        {
+          concurrency: LOCAL_RUN_CONCURRENCY,
+          namespace: this.namespace,
+        },
+      );
+    }
+    this.dispatchesOverTransport = true;
+    return async () => {
+      this.dispatchesOverTransport = false;
+      await this.runBatcher.settle();
+      await this.stopRunConsumers();
+    };
+  }
+
+  /** Stop every run-queue consumer; resolves once their runs in flight settled. */
+  private stopRunConsumers(): Promise<unknown> {
+    if (this.runConsumerStops.length > 0) {
+      const stops = this.runConsumerStops;
+      this.runConsumerStops = [];
+      this.runConsumersStopping = Promise.allSettled(stops.map((stop) => stop()));
+    }
+    return this.runConsumersStopping ?? Promise.resolve();
+  }
+
+  /** Whether {@link dispatchRun} queues runs on the transport (see {@link consumeRuns}). */
+  private get queuesRunsOverTransport(): boolean {
+    return this.customDispatcher === undefined && this.dispatchesOverTransport;
+  }
+
+  /**
+   * Hand a `pending` run to whatever executes it: the caller's {@link WorkflowEngineDeps.runDispatcher};
+   * else the transport's run queue while this engine consumes it, batched; else this instance,
+   * bounded by {@link LOCAL_RUN_CONCURRENCY}. A run whose queueing fails stays `pending` for a
+   * `runPending` poll.
+   */
+  private dispatchRun(runId: string, priority?: number, key?: string): void | Promise<void> {
+    if (this.customDispatcher) return this.customDispatcher.dispatch(runId);
+    if (this.dispatchesOverTransport) {
+      this.runBatcher.add({
+        runId,
+        reason: 'start',
+        ...(priority !== undefined ? { priority } : {}),
+        ...(key !== undefined ? { key } : {}),
+      });
+      return;
+    }
+    this.localWork.submit(`run:${runId}`, () => this.runOne(runId));
+  }
+
+  /**
+   * Wake a suspended run that has something new to see (a delivered signal or child completion, a
+   * lease that came free, a freed slot): while this engine consumes the transport's run queue, on
+   * whichever instance takes the wake (the result then only says it was handed over); otherwise
+   * here, now.
+   */
+  private wake(runId: string): Promise<RunResult> {
+    if (this.queuesRunsOverTransport) {
+      this.runBatcher.add({ runId, reason: 'wake' });
+      return Promise.resolve({ runId, status: 'suspended' });
+    }
+    return this.resumeImplicit(runId);
+  }
+
+  /**
+   * Take a turn of a run taken off the transport's run queue. A `start` runs only while the run is
+   * still `pending` (or `cancelling`, a recovered cancel): any other state means another instance
+   * already took it. A `wake` leases and resumes the run unless it is finished. The run lease admits
+   * one executor either way. Never rejects.
+   */
+  private async runFromQueue(dispatch: RunDispatch): Promise<void> {
+    if (this.draining) return;
+    const { runId } = dispatch;
+    try {
+      const run = await this.store.getRun(runId);
+      if (!run) return;
+      if (run.status === 'pending' || run.status === 'cancelling') {
+        await this.runOne(runId);
+        return;
+      }
+      if (dispatch.reason !== 'wake' || TERMINAL_RUN_STATUSES.includes(run.status)) return;
+      const nowMs = this.clock();
+      if (run.wakeAt !== undefined && run.wakeAt <= nowMs) {
+        // A due timer's wake also pairs a stranded waiter, as the due-timer poll does.
+        const waiters = indexWaitersByRun(await listSignalWaitersOfRuns(this.store, [runId]));
+        const resumed = await this.resumeLeased([run], nowMs, (locked) =>
+          this.reconcileSignalWaiter(locked, waiters.get(locked.id)),
+        );
+        if (resumed.length === 0) this.recheckAfterLease(runId, run.lockedUntil);
+        return;
+      }
+      // Leased by the turn itself; a lease another instance holds is looked at again once free.
+      await this.resumeImplicit(runId).catch((err) => {
+        if (!(err instanceof NamespaceMismatch)) throw err;
+      });
+    } catch (error) {
+      console.error(`[nestjs-durable] could not run queued run ${runId}:`, error);
+    }
+  }
+
+  /**
+   * Hand due runs (timers, blocked runs due for a fleet re-check) to whichever instance takes them
+   * off the run queue. Each is claimed first, under its lease, by pushing its `wakeAt` one lease
+   * period out, so the next poll (here or elsewhere) does not queue it again while it waits; a wake
+   * that is lost brings it back due after that period. False when the transport refused the wakes,
+   * so the caller resumes them itself.
+   */
+  private async handOffDue(runs: WorkflowRun[], nowMs: number): Promise<boolean> {
+    const claimed: WorkflowRun[] = [];
+    for (const run of runs) {
+      if (this.draining) break;
+      if (!(await this.store.tryLockRun(run.id, this.instanceId, nowMs + this.leaseMs, nowMs))) {
+        continue;
+      }
+      try {
+        const patch = { wakeAt: nowMs + this.leaseMs };
+        if (this.store.updateRunIf) {
+          if (await this.store.updateRunIf(run.id, [run.status], patch)) claimed.push(run);
+        } else {
+          await this.store.updateRun(run.id, patch);
+          claimed.push(run);
+        }
+      } finally {
+        await this.store.releaseRunLock(run.id);
+      }
+    }
+    try {
+      for (let at = 0; at < claimed.length; at += RUN_DISPATCH_BATCH) {
+        await this.pool.dispatchRuns(
+          claimed.slice(at, at + RUN_DISPATCH_BATCH).map((run) => ({
+            runId: run.id,
+            reason: 'wake' as const,
+            ...(run.priority !== undefined ? { priority: run.priority } : {}),
+          })),
+          { namespace: this.namespace },
+        );
+      }
+      return true;
+    } catch (error) {
+      console.error('[nestjs-durable] could not queue due runs on the transport:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Queue `runs` on the transport for whichever consuming instance takes them, in batches. False
+   * when the transport refused them, so the caller executes them itself instead.
+   */
+  private async queueOnTransport(runs: WorkflowRun[]): Promise<boolean> {
+    try {
+      for (let at = 0; at < runs.length; at += RUN_DISPATCH_BATCH) {
+        await this.pool.dispatchRuns(
+          runs.slice(at, at + RUN_DISPATCH_BATCH).map((run) => ({
+            runId: run.id,
+            reason: 'start' as const,
+            key: pendingStateKey(run.updatedAt),
+            ...(run.priority !== undefined ? { priority: run.priority } : {}),
+          })),
+          { namespace: this.namespace },
+        );
+      }
+      return true;
+    } catch (error) {
+      console.error(
+        '[nestjs-durable] could not queue runs on the transport; running them here:',
+        error,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Execute a run announced by another instance, if it is still `pending`: a
+   * run another instance already took is skipped after one read instead of being leased and
+   * replayed here once more. Never rejects.
+   */
+  private async runIfPending(runId: string): Promise<void> {
+    if (this.draining) return;
+    try {
+      const run = await this.store.getRun(runId);
+      if (run?.status !== 'pending') return;
+      await this.runOne(runId);
+    } catch (error) {
+      console.error(`[nestjs-durable] could not run enqueued run ${runId}:`, error);
+    }
   }
 
   /** Fire cooperative-cancellation listeners for `runId` (a worker bridge aborts in-flight work). */
@@ -1582,10 +1926,12 @@ export class WorkflowEngine {
     }
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
-    await this.runDispatcher.dispatch(runId);
+    await this.dispatchRun(runId, run.priority, pendingStateKey(run.updatedAt));
     // Nudge worker instances to pick it up now instead of on their next poll (no-op without a control
-    // plane; self-receipt is filtered, so it only helps OTHER pods — e.g. an API pod's enqueue).
-    if (this.controlPlane) {
+    // plane; self-receipt is filtered, so it only helps OTHER pods — e.g. an API pod's enqueue). A run
+    // queued on the transport needs no nudge: the instance that takes it off the queue runs it, and
+    // announcing it too would have every instance read every run of a wide fan.
+    if (this.controlPlane && !this.queuesRunsOverTransport) {
       void this.controlPlane
         .publishControl({ kind: 'enqueued', runId, from: this.instanceId })
         .catch(() => undefined);
@@ -1623,7 +1969,45 @@ export class WorkflowEngine {
    * stale waiter or a late result left behind by a failed run silently re-executes its body.
    */
   private resumeImplicit(runId: string): Promise<RunResult> {
-    return this.resumeRun(runId, false);
+    // One implicit turn per run per instance. `execute` admits this instance into a lease it already
+    // holds, so wakes that land together (the last children of a fan settling at once, a result and
+    // a timer) would otherwise each run a whole turn of the same run side by side: hundreds of
+    // replays of a 40,000-member fan, each holding every checkpoint. Every wake that arrives while a
+    // turn is executing here shares ONE more turn after it, which reads the state the wakes wrote.
+    // A wake from inside that turn's own body is not made to wait for it, or the turn would wait on
+    // itself.
+    const turn = this.wakeTurns.get(runId);
+    if (turn) {
+      turn.again ??= deferred<RunResult>();
+      if (currentWorkflowCtx()?.runId === runId) {
+        return Promise.resolve({ runId, status: 'running' });
+      }
+      return turn.again.promise;
+    }
+    const mine: WakeTurn = {};
+    this.wakeTurns.set(runId, mine);
+    const finish = () => {
+      if (this.wakeTurns.get(runId) === mine) this.wakeTurns.delete(runId);
+      const again = mine.again;
+      if (!again) return;
+      if (this.draining) {
+        again.resolve({ runId, status: 'running' });
+        return;
+      }
+      const next = this.resumeImplicit(runId);
+      next.then(again.resolve, again.reject);
+      this.inBackground(next);
+    };
+    const result = this.resumeRun(runId, false);
+    void result.then(finish, finish);
+    return result;
+  }
+
+  /** Keep `work` in {@link background} until it settles; its failure is swallowed. */
+  private inBackground(work: Promise<unknown>): void {
+    const tracked = work.catch(() => undefined);
+    this.background.add(tracked);
+    void tracked.then(() => this.background.delete(tracked));
   }
 
   /**
@@ -2001,6 +2385,12 @@ export class WorkflowEngine {
    */
   beginDrain(spentMs = 0): void {
     this.draining = true;
+    // Stop taking runs off the transport's queue, so they wait there for another instance; the
+    // ones in flight settle, and drain() waits for them.
+    if (this.runConsumerStops.length > 0) {
+      this.runBatcher.flush();
+      void this.stopRunConsumers();
+    }
     // Non-finite values (NaN, Infinity) and negatives are ignored: one bad report must not turn
     // every later drain into a 1 ms wait.
     if (Number.isFinite(spentMs) && spentMs > 0) {
@@ -2024,7 +2414,19 @@ export class WorkflowEngine {
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     this.beginDrain();
-    if (this.inflight.size === 0) return;
+    this.localWork.clear();
+    for (const timer of this.leaseRetries.values()) clearTimeout(timer);
+    this.leaseRetries.clear();
+    const consumers = this.runConsumersStopping;
+    if (
+      this.inflight.size === 0 &&
+      this.background.size === 0 &&
+      !consumers &&
+      this.runBatcher.idle
+    ) {
+      return;
+    }
+    const queued = this.runBatcher.settle();
     // The deadline is `start + timeoutMs - spent`, re-read whenever `beginDrain(spentMs)` reports more
     // wait, so a drain that starts while the poller is still waiting is shortened once it reports.
     const start = Date.now();
@@ -2043,7 +2445,7 @@ export class WorkflowEngine {
     let settled = false;
     try {
       await Promise.race([
-        Promise.allSettled([...this.inflight]).then(() => {
+        Promise.allSettled([...this.inflight, ...this.background, queued, consumers]).then(() => {
           settled = true;
         }),
         timer,
@@ -2146,6 +2548,7 @@ export class WorkflowEngine {
         });
         // The parent is terminal FIRST (above), so a child that cascades back into it stops there.
         await this.cancelChildren(run.id).catch(() => undefined);
+        this.notifyParent(run.id, cancelledCompletion(error));
       }
     }
   }
@@ -2165,7 +2568,9 @@ export class WorkflowEngine {
       if (!outcome) continue;
       // Re-enqueue rather than resume inline: recovery must NOT block (boot, or a poll tick) on a
       // long workflow step. A dispatcher/worker re-runs it, replaying its checkpoints.
-      if (outcome.dispatch) await this.runDispatcher.dispatch(outcome.result.runId);
+      if (outcome.dispatch) {
+        await this.dispatchRun(outcome.result.runId, listed.priority, freshPendingKey());
+      }
       results.push(outcome.result);
     }
     return results;
@@ -2391,6 +2796,14 @@ export class WorkflowEngine {
     // gathered separately here rather than widening every store adapter's timer query.
     const blocked = await this.dueBlockedRuns(nowMs);
     if (due.length === 0 && blocked.length === 0) return [];
+    // While this engine consumes the transport's run queue, the due runs go there, for whichever
+    // instance takes them, instead of all resuming on the instance that polled.
+    if (this.queuesRunsOverTransport && !this.draining) {
+      const runs = [...due, ...blocked];
+      if (await this.handOffDue(runs, nowMs)) {
+        return runs.map((run) => ({ runId: run.id, status: run.status }));
+      }
+    }
     const waiterByRun = indexWaitersByRun(
       await listSignalWaitersOfRuns(
         this.store,
@@ -2429,7 +2842,7 @@ export class WorkflowEngine {
     const buffered = await this.store.takeBufferedSignal(waiter.token);
     if (!buffered) return undefined;
     await this.store.removeSignalWaiter(waiter);
-    const settled = await this.deliverSignal(waiter, buffered.payload);
+    const settled = await this.deliverSignal(waiter, buffered.payload, true);
     return settled ?? { runId: run.id, status: run.status };
   }
 
@@ -2456,7 +2869,7 @@ export class WorkflowEngine {
       if (!eventMatches(candidate.payload, match)) continue;
       if (!(await this.store.removeBufferedEvent(candidate.id))) continue; // raced away — try the next
       await this.store.removeSignalWaiter(waiter);
-      const settled = await this.deliverSignal(waiter, candidate.payload);
+      const settled = await this.deliverSignal(waiter, candidate.payload, true);
       return settled ?? { runId: run.id, status: run.status };
     }
     return undefined;
@@ -2626,7 +3039,7 @@ export class WorkflowEngine {
         : {}),
       updatedAt: new Date(),
     });
-    await this.runDispatcher.dispatch(runId);
+    await this.dispatchRun(runId, run.priority, freshPendingKey());
     return { runId, status: 'pending' };
   }
 
@@ -2703,7 +3116,15 @@ export class WorkflowEngine {
   async runPending(nowMs: number = this.clock()): Promise<RunResult[]> {
     // Oldest-first (FIFO), capped per call so a backlog drains over several polls without one sweep
     // fetching unboundedly. A run not picked up this tick is picked up the next.
-    return this.resumeLeased(await this.store.listPendingRuns(100, this.namespace), nowMs);
+    const pending = await this.store.listPendingRuns(100, this.namespace);
+    // While this engine consumes the transport's run queue, a pending run whose queue entry was lost
+    // goes back on the queue (a run still queued is not queued twice) rather than running here.
+    if (this.queuesRunsOverTransport && !this.draining && pending.length > 0) {
+      if (await this.queueOnTransport(pending)) {
+        return pending.map((run) => ({ runId: run.id, status: run.status }));
+      }
+    }
+    return this.resumeLeased(pending, nowMs);
   }
 
   /**
@@ -2949,7 +3370,11 @@ export class WorkflowEngine {
    * due-timer reconcile sweep ({@link reconcileSignalWaiter}) — all three resolve a waiter the exact
    * same way.
    */
-  private async deliverSignal(waiter: SignalWaiter, payload: unknown): Promise<RunResult | null> {
+  private async deliverSignal(
+    waiter: SignalWaiter,
+    payload: unknown,
+    resumeHere = false,
+  ): Promise<RunResult | null> {
     await this.store.saveCheckpoint(
       instantCheckpoint({
         runId: waiter.runId,
@@ -2967,10 +3392,13 @@ export class WorkflowEngine {
     if (await this.fanStillWaiting(waiter, payload)) {
       return { runId: waiter.runId, status: 'suspended' };
     }
-    return this.resumeImplicit(waiter.runId).catch((err) => {
-      if (err instanceof NamespaceMismatch) return null;
-      throw err;
-    });
+    // The caller holds the run's lease (the due-timer reconcile): resume under it, here.
+    return (resumeHere ? this.resumeImplicit(waiter.runId) : this.wake(waiter.runId)).catch(
+      (err) => {
+        if (err instanceof NamespaceMismatch) return null;
+        throw err;
+      },
+    );
   }
 
   /**
@@ -3063,6 +3491,116 @@ export class WorkflowEngine {
       }
       await this.resumeImplicit(runId);
       return;
+    }
+  }
+
+  /**
+   * Deliver the outcome of every awaited child that already finished but whose completion never
+   * reached this run, into `checkpoints` (this turn's snapshot) and the store.
+   *
+   * A child persists its terminal status first and tells its parent after ({@link notifyParent}). A
+   * crash, a scale-down or a store error between the two leaves the parent's `running` placeholder
+   * and `child:<id>` waiter behind for a child that is done, and nothing else would ever settle
+   * them: the parent's reconcile wake replays straight back to the same wait. So each turn looks up
+   * the children of its `running` placeholders (one batched read per 500) and settles the finished
+   * ones exactly as the child's own notification would have: the `signal:child:<id>` checkpoint
+   * with the child's completion, then the waiter removed. A notification arriving late writes the
+   * same checkpoint and finds no waiter. Best effort: a store error leaves the rest to the next turn.
+   */
+  private async deliverFinishedChildren(
+    runId: string,
+    checkpoints: StepCheckpoint[],
+  ): Promise<void> {
+    const awaited: AwaitedChild[] = [];
+    for (const cp of checkpoints) {
+      if (cp.kind !== 'signal' || cp.status !== 'running') continue;
+      if (!cp.name.startsWith(CHILD_SIGNAL_PREFIX)) continue;
+      awaited.push({
+        childId: cp.name.slice(CHILD_SIGNAL_PREFIX.length),
+        seq: cp.seq,
+        parallelGroup: cp.parallelGroup,
+      });
+    }
+    await this.settleFinishedChildren(runId, awaited, checkpoints);
+  }
+
+  /**
+   * {@link deliverFinishedChildren} for a remote workflow, whose awaited children (`startChild`
+   * commands) leave a `child:<id>` waiter but no placeholder checkpoint: the run's own waiters say
+   * which children it is waiting on. One indexed read per turn of a remote run.
+   */
+  private async deliverFinishedChildWaiters(
+    runId: string,
+    checkpoints: StepCheckpoint[],
+  ): Promise<void> {
+    let waiters: SignalWaiter[];
+    try {
+      waiters = await listSignalWaitersOfRuns(this.store, [runId]);
+    } catch {
+      return;
+    }
+    const settled = new Set(
+      checkpoints.filter((cp) => cp.status === 'completed').map((cp) => cp.seq),
+    );
+    const awaited = waiters
+      .filter((w) => w.token.startsWith('child:') && !settled.has(w.seq))
+      .map((w) => ({
+        childId: w.token.slice('child:'.length),
+        seq: w.seq,
+        parallelGroup: w.parallelGroup,
+      }));
+    await this.settleFinishedChildren(runId, awaited, checkpoints);
+  }
+
+  /**
+   * Settle every child in `awaited` that has finished: its `signal:child:<id>` checkpoint with the
+   * child's completion, then its waiter removed, exactly as the child's own notification does, and
+   * the checkpoint put into `checkpoints`. Children are read in batches of 500.
+   */
+  private async settleFinishedChildren(
+    runId: string,
+    awaited: AwaitedChild[],
+    checkpoints: StepCheckpoint[],
+  ): Promise<void> {
+    if (awaited.length === 0) return;
+    try {
+      // A child whose read failed is left to the next turn; the others settle now.
+      const { runs: children } = await readRunsByIds(
+        this.store,
+        awaited.map((a) => a.childId),
+      );
+      const finished = awaited.flatMap((a) => {
+        const child = children.get(a.childId);
+        const completion = child ? childCompletion(child) : undefined;
+        return completion ? [{ ...a, completion }] : [];
+      });
+      for (let at = 0; at < finished.length; at += DELIVER_CHUNK) {
+        await Promise.all(
+          finished.slice(at, at + DELIVER_CHUNK).map(async (a) => {
+            const settled = instantCheckpoint({
+              runId,
+              seq: a.seq,
+              name: `${CHILD_SIGNAL_PREFIX}${a.childId}`,
+              kind: 'signal',
+              output: a.completion,
+              parallelGroup: a.parallelGroup,
+            });
+            await this.store.saveCheckpoint(settled);
+            await this.store.removeSignalWaiter({
+              token: `child:${a.childId}`,
+              runId,
+              seq: a.seq,
+              ...(a.parallelGroup !== undefined ? { parallelGroup: a.parallelGroup } : {}),
+            });
+            const index = checkpoints.findIndex((cp) => cp.seq === a.seq);
+            if (index === -1) checkpoints.push(settled);
+            else checkpoints[index] = settled;
+          }),
+        );
+      }
+      checkpoints.sort((a, b) => a.seq - b.seq);
+    } catch {
+      // The next turn looks again.
     }
   }
 
@@ -3183,7 +3721,7 @@ export class WorkflowEngine {
    * knowing about the child feature.
    */
   private notifyParent(runId: string, completion: Completion<unknown>): void {
-    void this.signal(`child:${runId}`, completion).catch(() => undefined);
+    this.inBackground(this.deliverToParent(`child:${runId}`, completion));
     // A fix-and-replay run (`<origin>~retry~<hash>`) is standalone, but its SUCCESS is the
     // origin's outcome for all practical purposes: deliver it on the ORIGIN's token too, so a
     // parent that failed on that child and is retried later consumes this success (buffered or
@@ -3191,8 +3729,71 @@ export class WorkflowEngine {
     // fix attempt must not poison the origin's token.
     const at = runId.lastIndexOf('~retry~');
     if (at !== -1 && completion.ok) {
-      void this.signal(`child:${runId.slice(0, at)}`, completion).catch(() => undefined);
+      this.inBackground(this.deliverToParent(`child:${runId.slice(0, at)}`, completion));
     }
+  }
+
+  /**
+   * {@link signal} a child's completion to its parent, retrying a store error a few times. The child
+   * is already persisted terminal, so a failure here would leave the parent waiting on a child that
+   * finished; the parent's own turns reconcile that ({@link deliverFinishedChildren}), but only on
+   * its next wake. A waiter already taken is delivered to directly on a retry, so the completion is
+   * not buffered for a waiter that no longer exists.
+   */
+  private async deliverToParent(token: string, completion: Completion<unknown>): Promise<void> {
+    let waiter: SignalWaiter | null | undefined;
+    const cancelled = !completion.ok && completion.code === CHILD_CANCELLED;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        if (waiter === undefined) waiter = await this.store.takeSignalWaiter(token);
+        if (waiter) {
+          // A child cancelled because its parent was (the cancel cascades down) has a parent that
+          // is already terminal: nothing to tell it.
+          const parent = cancelled ? await this.store.getRun(waiter.runId) : undefined;
+          if (parent && TERMINAL_RUN_STATUSES.includes(parent.status)) return;
+          await this.deliverSignal(waiter, completion);
+          return;
+        }
+        // No waiter: the parent has not put it yet (the completion is buffered for its join), or
+        // it already settled this child on its own turn ({@link deliverFinishedChildren}), and a
+        // buffered copy would never be consumed. A cancelled child nobody waits on tells no one.
+        if (cancelled || (await this.parentHoldsCompletion(token, completion))) return;
+        await this.signal(token, completion);
+        return;
+      } catch (err) {
+        if (err instanceof NamespaceMismatch) return;
+        if (attempt >= PARENT_NOTIFY_ATTEMPTS || this.draining) return;
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, PARENT_NOTIFY_BACKOFF_MS * 4 ** (attempt - 1));
+          (timer as { unref?: () => void }).unref?.();
+        });
+      }
+    }
+  }
+
+  /**
+   * Whether the parent of the child behind `token` (`child:<id>`) already holds `completion` as that
+   * child's settled `signal:child:<id>` checkpoint: its own turn settled the child from the child's
+   * row, so this notification is a duplicate. A different completion (a fix-and-replay run's success
+   * for a child the parent saw fail) is not, and is buffered for the parent's retry. Only for a child
+   * whose id the engine minted (its parent is derivable from it).
+   */
+  private async parentHoldsCompletion(
+    token: string,
+    completion: Completion<unknown>,
+  ): Promise<boolean> {
+    const childId = token.slice('child:'.length);
+    const parentId = parentRunIdOf(childId);
+    if (!parentId) return false;
+    const name = `${CHILD_SIGNAL_PREFIX}${childId}`;
+    const checkpoints = this.store.listCheckpointsByNamePrefix
+      ? await this.store.listCheckpointsByNamePrefix(parentId, [name])
+      : await this.store.listCheckpoints(parentId);
+    const expected = JSON.stringify(completion);
+    return checkpoints.some(
+      (cp) =>
+        cp.name === name && cp.status === 'completed' && JSON.stringify(cp.output) === expected,
+    );
   }
 
   /**
@@ -3213,16 +3814,19 @@ export class WorkflowEngine {
     childId: string,
     opts?: StartOptions,
   ): void {
-    queueMicrotask(
-      () =>
-        void this.start(workflow, input, childId, opts).catch((err) => {
-          const message = err instanceof Error ? err.message : String(err);
-          this.notifyParent(childId, {
-            ok: false,
-            error: `child workflow "${workflow}" failed to start: ${message}`,
-          });
-        }),
-    );
+    // Bounded (see `LOCAL_RUN_CONCURRENCY`): a fan's starts queue here instead of all hitting the store
+    // at once. A start still queued at shutdown is dropped, not failed: the parent's placeholder
+    // remains, and its next turn starts every child that has no run yet.
+    this.localWork.submit(`start:${childId}`, async () => {
+      if (this.draining) return;
+      await this.start(workflow, input, childId, opts).catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.notifyParent(childId, {
+          ok: false,
+          error: `child workflow "${workflow}" failed to start: ${message}`,
+        });
+      });
+    });
   }
 
   /**
@@ -3286,6 +3890,7 @@ export class WorkflowEngine {
       error,
     });
     await this.cancelChildren(runId, opts);
+    this.notifyParent(runId, cancelledCompletion(error));
     // Notify local cancel listeners now (a worker on this pod), and broadcast so the instance/worker
     // actually running this run learns of it and can abort cooperatively (the store already records
     // `cancelled`, but a busy worker won't re-read it).
@@ -3847,6 +4452,7 @@ export class WorkflowEngine {
       if (
         !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
       ) {
+        this.recheckAfterLease(run.id, run.lockedUntil);
         return { runId: run.id, status: run.status };
       }
     }
@@ -3874,6 +4480,54 @@ export class WorkflowEngine {
     } finally {
       held.stop();
     }
+  }
+
+  /**
+   * A wake that found the run leased by another instance is dropped, and normally that is fine: the
+   * holder's turn either sees what the wake wrote, or re-checks once it releases the lease
+   * ({@link redriveSettledSteps}, {@link redriveSettledChildren}). Not if the holder goes down first
+   * (a scale-down mid-turn, an OOM): its lease lapses with the run `suspended` on a step that has
+   * finished, and nothing wakes it before its timer.
+   *
+   * So the dropped wake is kept here: once the lease is free (looked at every
+   * {@link LEASE_RECHECK_MAX_MS} at most, for a bounded number of times), a run still `suspended` is
+   * leased and resumed. A holder that already moved the run on makes this one spare replay that
+   * re-parks. Best effort; the run's timer remains the fallback if this instance goes down too.
+   */
+  private recheckAfterLease(runId: string, lockedUntil: number | undefined, attempt = 1): void {
+    if (this.draining || this.leaseRetries.has(runId)) return;
+    const remaining = Math.max(0, (lockedUntil ?? this.clock()) - this.clock());
+    const timer = setTimeout(() => {
+      this.leaseRetries.delete(runId);
+      this.inBackground(this.retryDroppedWake(runId, attempt));
+    }, Math.min(remaining, LEASE_RECHECK_MAX_MS) + LEASE_RECHECK_SLACK_MS);
+    (timer as { unref?: () => void }).unref?.();
+    this.leaseRetries.set(runId, timer);
+  }
+
+  private async retryDroppedWake(runId: string, attempt: number): Promise<void> {
+    if (this.draining) return;
+    const run = await this.store.getRun(runId);
+    if (run?.status !== 'suspended') return;
+    const nowMs = this.clock();
+    if (run.lockedUntil !== undefined && run.lockedUntil > nowMs) {
+      if (attempt < LEASE_RECHECK_ATTEMPTS)
+        this.recheckAfterLease(runId, run.lockedUntil, attempt + 1);
+      return;
+    }
+    if (this.queuesRunsOverTransport) {
+      await this.wake(runId);
+      return;
+    }
+    if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) return;
+    const fresh = await this.store.getRun(runId);
+    if (fresh?.status !== 'suspended') {
+      await this.store.releaseRunLock(runId);
+      return;
+    }
+    await this.resumeImplicit(runId).catch((err) => {
+      if (!(err instanceof NamespaceMismatch)) throw err;
+    });
   }
 
   /**
@@ -4256,6 +4910,7 @@ export class WorkflowEngine {
         namespace: run.namespace,
         error,
       });
+      this.notifyParent(run.id, cancelledCompletion(error));
       this.notifyCancelled(run.id);
       if (this.controlPlane) {
         void this.controlPlane
@@ -4292,6 +4947,8 @@ export class WorkflowEngine {
     if (wfPlan?.status === 'blocked') return this.parkBlocked(run, wfPlan);
 
     const checkpoints = await this.store.listCheckpoints(run.id);
+    await this.deliverFinishedChildren(run.id, checkpoints);
+    await this.deliverFinishedChildWaiters(run.id, checkpoints);
     const handoff = liveHandoff(run.id, checkpoints);
     if (handoff) {
       // A run that handed its failure to an onError handler only follows the handler from here on.
@@ -5003,6 +5660,7 @@ export class WorkflowEngine {
       namespace: run.namespace,
       error,
     });
+    this.notifyParent(run.id, cancelledCompletion(error));
     return { runId: run.id, status: 'cancelled', error };
   }
 
@@ -5078,6 +5736,7 @@ export class WorkflowEngine {
     // this resume wakes on, or one written later in this same execution) is absent from the map, and
     // the ctx falls back to the live store for any absent seq — so replay semantics are unchanged.
     const snapshot = await this.store.listCheckpoints(run.id);
+    await this.deliverFinishedChildren(run.id, snapshot);
     const replay = new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
     let suspendedOnFan: FanJoin | undefined;
@@ -5194,13 +5853,13 @@ export class WorkflowEngine {
       if (this.awaitedStepFans.get(run.id) === awaitedFans) this.awaitedStepFans.delete(run.id);
       await this.releaseLeaseBestEffort(run.id);
       if (suspendedOnFan) {
-        void this.redriveSettledChildren(run.id, suspendedOnFan).catch(() => undefined);
+        this.inBackground(this.redriveSettledChildren(run.id, suspendedOnFan));
       }
       if (suspendedOnSteps && awaitedSteps.size > 0) {
-        void this.redriveSettledSteps(run.id, awaitedSteps).catch(() => undefined);
+        this.inBackground(this.redriveSettledSteps(run.id, awaitedSteps));
       }
       if (suspendedOnSteps && awaitedFans.length > 0) {
-        void this.redriveSettledStepFans(run.id, awaitedFans).catch(() => undefined);
+        this.inBackground(this.redriveSettledStepFans(run.id, awaitedFans));
       }
     }
   }
@@ -5720,9 +6379,15 @@ export class WorkflowEngine {
             routing,
           );
         }
-        throw new WorkflowSuspended(wakeAt);
+        // The run parks on the deadline, but no later than `reconcileMs`: the result's wake is the
+        // run's only other way forward, and a wake dropped by a crash or a held lease would otherwise
+        // leave a finished step unnoticed until the redispatch deadline (an hour, say). An early wake
+        // replays back here and re-parks.
+        throw new WorkflowSuspended(this.stepLeaseWakeAt(wakeAt));
       }
-      if (this.clock() < existing.wakeAt) throw new WorkflowSuspended(existing.wakeAt);
+      if (this.clock() < existing.wakeAt) {
+        throw new WorkflowSuspended(this.stepLeaseWakeAt(existing.wakeAt));
+      }
       // Past the deadline with no result — the dispatch is presumed lost. Re-dispatch (bounded by
       // `remoteRedispatchMax` so a step that never settles fails the run instead of looping forever).
       if (existing.attempts >= this.remoteRedispatchMax) {
@@ -5780,7 +6445,7 @@ export class WorkflowEngine {
         kind: 'remote',
         redispatched: true,
       });
-      throw new WorkflowSuspended(nextDeadline);
+      throw new WorkflowSuspended(this.stepLeaseWakeAt(nextDeadline));
     }
 
     // Durable retry: a failed attempt re-dispatches up to `retries`, spacing attempts by `backoff` —
@@ -6217,12 +6882,23 @@ export class WorkflowEngine {
       live.map((i) => this.store.getCheckpoint(runId, (results[i] as StepResult).seq)),
     );
     const pending: { index: number; cp: StepCheckpoint }[] = [];
+    // Results whose step is already settled: a redelivery. Usually of a result whose resume already
+    // ran, but also of one whose resume never did (the instance that settled it went down before
+    // resuming, or the resume failed and the transport redelivered). The run is then suspended on
+    // a step that finished, so such a result still resumes a suspended run (see below).
+    const resettled: { index: number; cp: StepCheckpoint }[] = [];
     reads.forEach((read, k) => {
       const index = live[k] as number;
       if (read.status === 'rejected') outcomes[index] = { error: read.reason };
       else if (read.value?.status === 'pending') pending.push({ index, cp: read.value });
+      else if (read.value?.status === 'completed' || read.value?.status === 'failed') {
+        resettled.push({ index, cp: read.value });
+      }
     });
-    if (pending.length === 0) return outcomes;
+    if (pending.length === 0) {
+      if (resettled.length === 0) return outcomes;
+      return this.resumeForRedelivered(runId, resettled, outcomes);
+    }
     // A result settling a step frees its flow-control slot (no-op if it wasn't queued). Done before
     // the finished-run check below, so a cancellation can't leak the slot. Fire-and-forget: the slot
     // is best-effort (a global backend self-heals via lease) and stays off the critical path.
@@ -6275,6 +6951,34 @@ export class WorkflowEngine {
       if (!(await this.stepFanStillRunning(cp, result, barriers))) carrier = index;
     }
     if (carrier !== undefined) outcomes[carrier] = true;
+    return outcomes;
+  }
+
+  /**
+   * The outcomes for a batch of redelivered results (their steps already settled): one of them
+   * resumes the run if it is `suspended` and, for a step of a fan, the fan's barrier is open. A
+   * resume of a run that had in fact moved on replays to its current wait and re-parks.
+   */
+  private async resumeForRedelivered(
+    runId: string,
+    resettled: { index: number; cp: StepCheckpoint }[],
+    outcomes: ResultOutcome[],
+  ): Promise<ResultOutcome[]> {
+    const run = await this.store.getRun(runId);
+    if (run?.status !== 'suspended') return outcomes;
+    const barriers = new Map<number, Promise<boolean>>();
+    for (const { index, cp } of resettled) {
+      const asResult: StepResult = {
+        runId,
+        seq: cp.seq,
+        stepId: cp.stepId ?? stepId(runId, cp.seq),
+        status: cp.status === 'failed' ? 'failed' : 'completed',
+      };
+      if (!(await this.stepFanStillRunning(cp, asResult, barriers))) {
+        outcomes[index] = true;
+        break;
+      }
+    }
     return outcomes;
   }
 
@@ -6433,7 +7137,7 @@ export class WorkflowEngine {
     if (!waiters || waiters.size === 0) return;
     const runIds = [...waiters];
     waiters.clear();
-    for (const runId of runIds) void this.resumeImplicit(runId).catch(() => undefined);
+    for (const runId of runIds) void this.wake(runId).catch(() => undefined);
   }
 
   /** Release the flow-control slot a dispatched step held (if any), by its stepId. */

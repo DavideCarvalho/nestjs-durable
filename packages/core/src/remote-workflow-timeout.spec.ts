@@ -1,3 +1,4 @@
+import { vi } from 'vitest';
 import { WorkflowEngine } from './engine';
 import { RemoteWorkflowTimeout } from './errors';
 import type { WorkflowDecision, WorkflowExecutor, WorkflowRun } from './interfaces';
@@ -258,31 +259,34 @@ describe('WorkflowEngine — remoteAdvanceSilenceMs (heartbeat-rearmed advance d
       },
     });
 
-    await engine.start('beating', {}, 'b1');
-    // Wait until advance is in flight (the engine has armed the run's deadline).
-    await pollReal(store, 'b1', (r) => r?.status === 'running' && calls === 1, {
-      ticks: 20,
-      delayMs: 5,
-    });
+    // Timers are faked so the 15ms beats and the 40ms window are exact, whatever the machine's load.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      await engine.start('beating', {}, 'b1');
+      // Wait until advance is in flight (the engine has armed the run's deadline).
+      for (let i = 0; i < 200 && calls < 1; i += 1) await vi.advanceTimersByTimeAsync(0);
+      expect((await store.getRun('b1'))?.status).toBe('running');
+      expect(calls).toBe(1);
 
-    // Beat every 15ms for ~90ms — comfortably past the 40ms window. Each beat rearms it.
-    for (let i = 0; i < 6; i += 1) {
-      await transport.emitHeartbeat({ runId: 'b1', seq: 0, group: 'py-workflows' });
-      await sleep(15);
+      // Beat every 15ms for 90ms — comfortably past the 40ms window. Each beat rearms it.
+      for (let i = 0; i < 6; i += 1) {
+        await transport.emitHeartbeat({ runId: 'b1', seq: 0, group: 'py-workflows' });
+        await vi.advanceTimersByTimeAsync(15);
+      }
+      // Still the SAME in-flight turn: lease HELD (not released), no re-drive — beats kept it alive past 40ms.
+      const stillAlive = await store.getRun('b1');
+      expect(stillAlive?.status).toBe('running');
+      expect(stillAlive?.lockedUntil).not.toBeUndefined();
+      expect(calls).toBe(1);
+
+      // Stop beating: the now-unrearmed window lapses → RemoteWorkflowTimeout → lease released.
+      await vi.advanceTimersByTimeAsync(100);
+      const timedOut = await store.getRun('b1');
+      expect(timedOut?.status).toBe('running');
+      expect(timedOut?.lockedUntil).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
     }
-    // Still the SAME in-flight turn: lease HELD (not released), no re-drive — beats kept it alive past 40ms.
-    const stillAlive = await store.getRun('b1');
-    expect(stillAlive?.status).toBe('running');
-    expect(stillAlive?.lockedUntil).not.toBeUndefined();
-    expect(calls).toBe(1);
-
-    // Stop beating: the now-unrearmed window lapses → RemoteWorkflowTimeout → lease released.
-    const timedOut = await pollReal(
-      store,
-      'b1',
-      (r) => r?.lockedUntil === undefined && r?.status === 'running',
-    );
-    expect(timedOut?.lockedUntil).toBeUndefined();
 
     // And recovery still re-drives it to completion.
     await engine.recoverIncomplete();

@@ -101,6 +101,15 @@ non-empty results. Liveness here is the visibility timeout, not a queryable hear
 whose worker crashes before deleting it becomes visible again after `visibilityTimeoutSec`, and
 SQS's own redelivery is the recovery mechanism.
 
+## Run queue
+
+The engine queues the runs it starts on `<prefix>-runs` (`<prefix>-runs-<namespace>` for an engine
+scoped to a namespace), ten per `SendMessageBatch`, and every driving instance receives from it, at
+most 256 runs in flight, extending a message's visibility while its run is in flight. SQS is
+at-least-once and does not deduplicate a waiting run, so a run may be delivered twice; the engine
+skips one that is no longer due. A FIFO queue (`.fifo`) gets one message group per run. Point it at
+an existing queue with `runsQueueUrl`, or let `autoCreate` create it.
+
 ## Options
 
 | Option | Description |
@@ -110,6 +119,7 @@ SQS's own redelivery is the recovery mechanism.
 | `group` | The queue token this instance serves — required to register `handle()`s; must match the dispatched step's sanitized name (+ `@partition`, if set). |
 | `prefix` | Namespaces the fallback `<prefix>-tasks-*` / `<prefix>-results` names. Default `durable`. |
 | `autoCreate` | Create the by-name queues (`durable-tasks-<group>`, `durable-results`) if missing. Ignored for queues you supply via `taskQueueUrl` / `resultsQueueUrl` — those must already exist. |
+| `runsQueueUrl` | `(namespace) => url`: the run queue to use instead of resolving `<prefix>-runs` by name. See [Run queue](#run-queue). |
 | `taskQueueUrl` / `resultsQueueUrl` | Reuse existing queues instead of resolving by name (a literal URL or a resolver). A `taskQueueUrl` resolver is called once per group and cached. |
 | `marker` | SQS message attribute tagging durable messages, so a queue can be shared with a non-durable consumer. See [above](#sharing-a-queue-with-a-non-durable-consumer). Unset by default. |
 | `waitTimeSeconds` | Receive long-poll seconds (0–20). Default `20`. |

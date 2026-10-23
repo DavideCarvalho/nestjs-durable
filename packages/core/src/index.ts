@@ -49,5 +49,6 @@ export * from './workflow-handler';
 export * from './workflow-ref';
 export { InMemoryStateStore } from './testing/in-memory-state-store';
 export { InMemoryTransport } from './testing/in-memory-transport';
+export { InMemoryRunQueue } from './testing/in-memory-run-queue';
 
 export * from './singleton-admission';

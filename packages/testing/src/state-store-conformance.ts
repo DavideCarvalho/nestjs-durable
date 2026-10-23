@@ -1846,6 +1846,22 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.listCheckpoints('other')).toHaveLength(1);
     });
 
+    t('getRuns returns the existing runs among the given ids', async () => {
+      expect(store.getRuns).toBeTypeOf('function');
+      await store.createRun(run({ id: 'p.all.0.0', status: 'completed', output: { n: 1 } }));
+      await store.createRun(run({ id: 'p.all.0.1', status: 'suspended' }));
+      await store.createRun(run({ id: 'other' }));
+
+      const got =
+        (await store.getRuns?.(['p.all.0.0', 'p.all.0.1', 'p.all.0.2', 'p.all.0.0'])) ?? [];
+      expect(got.map((r) => r.id).sort()).toEqual(['p.all.0.0', 'p.all.0.1']);
+      const done = got.find((r) => r.id === 'p.all.0.0');
+      expect(done?.status).toBe('completed');
+      expect(done?.output).toEqual({ n: 1 });
+      expect(await store.getRuns?.([])).toEqual([]);
+      expect(await store.getRuns?.(['missing'])).toEqual([]);
+    });
+
     t("listSignalWaitersByRun returns only the given runs' waiters", async () => {
       expect(store.listSignalWaitersByRun).toBeTypeOf('function');
       await store.putSignalWaiter({

@@ -91,6 +91,32 @@ function liveDataSource(ctx: { skip: () => void }): DataSource {
 }
 
 describe('DbTransport (real Postgres) [testcontainers]', () => {
+  it('two instances creating the tables at once both come up', async (ctx) => {
+    const ds = liveDataSource(ctx);
+    const prefix = `durrace${Date.now()}`;
+    const make = () => new DbTransport({ executor: typeOrmExecutor(ds), prefix, pollMs: 50 });
+    const transports = Array.from({ length: 4 }, make);
+    const task = (i: number) => ({
+      runId: `race-${i}`,
+      seq: 0,
+      stepId: `race-${i}:0`,
+      name: CHARGE_CARD_STEP_NAME,
+      group: workerGroup,
+      input: {},
+      attempt: 1,
+    });
+    // Every instance's first write creates the schema, concurrently.
+    const first = await Promise.allSettled(transports.map((t, i) => t.dispatch(task(i))));
+    expect(first.filter((r) => r.status === 'rejected')).toEqual([]);
+    // And none of them is left with a failed schema creation cached.
+    await Promise.all(transports.map((t, i) => t.dispatch(task(i + 10))));
+    const rows = await ds.query(`SELECT count(*)::int AS n FROM "${prefix}_transport_tasks"`);
+    expect(rows[0].n).toBe(8);
+    await Promise.all(transports.map((t) => t.close()));
+    await ds.query(`DROP TABLE IF EXISTS "${prefix}_transport_runs"`);
+    await dropTables(prefix);
+  }, 30_000);
+
   it('dispatches a remote step through the DB and returns the checkpointed result', async (ctx) => {
     const ds = liveDataSource(ctx);
     const prefix = `durtest${Date.now()}`;

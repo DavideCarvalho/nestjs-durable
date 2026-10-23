@@ -1,7 +1,7 @@
 {
   "name": "@dudousxd/nestjs-durable-transport-db",
   "version": "0.2.2",
-  "description": "Database (SQL) Transport for nestjs-durable — DBOS-style: dispatch remote steps as rows in the durable DB, no broker",
+  "description": "Database (SQL) Transport for nestjs-durable \u2014 DBOS-style: dispatch remote steps as rows in the durable DB, no broker",
   "license": "MIT",
   "author": "Davide Carvalho",
   "repository": {
@@ -40,14 +40,15 @@
   },
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
+    "@testcontainers/mysql": "10.18.0",
     "@testcontainers/postgresql": "10.18.0",
     "mysql2": "3.11.5",
     "pg": "8.13.1",
     "reflect-metadata": "0.2.2",
+    "tsup": "8.3.5",
     "typeorm": "0.3.31",
     "typescript": "5.9.3",
-    "zod": "3.25.76",
-    "tsup": "8.3.5"
+    "zod": "3.25.76"
   },
   "module": "./dist/index.js",
   "exports": {

@@ -7,7 +7,12 @@ import {
   checkpointStatsOf,
 } from '@dudousxd/nestjs-durable-core';
 import { runStateStoreContract } from '@dudousxd/nestjs-durable-testing';
+import { vi } from 'vitest';
 import { PrismaStateStore } from './prisma-state-store';
+
+// Each case drives a file-backed SQLite database through one Prisma connection: real disk I/O whose
+// latency follows the machine's load, so the 5s default is too tight for the wide-batch cases.
+vi.setConfig({ testTimeout: 30_000 });
 
 // The SHARED cross-store behavioral contract, run here against real Prisma + SQLite. Reuses one
 // generated client + pushed DB (slow to spin up) and truncates between cases. NOTE on the DB matrix:

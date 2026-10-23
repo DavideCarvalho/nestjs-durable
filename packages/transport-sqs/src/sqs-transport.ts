@@ -6,16 +6,35 @@ import {
   ReceiveMessageCommand,
   SQSClient,
   type SQSClientConfig,
+  SendMessageBatchCommand,
   SendMessageCommand,
 } from '@aws-sdk/client-sqs';
 import {
   type Heartbeat,
   type RemoteTask,
+  type RunConsumerOptions,
+  type RunDispatch,
+  type RunQueueOptions,
   type StepHandler,
   type StepResult,
   type Transport,
   runStepHandler,
 } from '@dudousxd/nestjs-durable-core';
+
+/** SQS's limit on the entries of one `SendMessageBatch`. */
+const SQS_BATCH_MAX = 10;
+
+/** A run-queue consumer started by {@link SqsTransport.onDispatchedRun}. */
+interface RunConsumer {
+  stopped: boolean;
+  abort: AbortController;
+  /** Receipt handles of the messages whose runs are in flight. */
+  inflight: Set<string>;
+  slotFreed: (() => void) | undefined;
+  /** Resolved, once stopped, when the runs in flight settled. */
+  idle: (() => void)[];
+  loop: Promise<void>;
+}
 
 /** Resolve a group's tasks queue URL. Sync or async; resolved once per group and cached (a rejected
  *  resolution is not cached — the next call asks again). */
@@ -45,6 +64,14 @@ export interface SqsTransportOptions {
    * transport resolves `${prefix}-results` by name (and creates it if `autoCreate`).
    */
   resultsQueueUrl?: string | (() => string | Promise<string>);
+
+  /**
+   * The run queue URL for an engine namespace (undefined for an engine that drives every
+   * namespace): where the engine queues runs for whichever instance takes them first. When omitted,
+   * the transport resolves `${prefix}-runs` (or `${prefix}-runs-<namespace>`) by name, creating it
+   * if `autoCreate`. A FIFO queue (`.fifo`) gets one message group per run.
+   */
+  runsQueueUrl?: (namespace: string | undefined) => string | Promise<string>;
 
   /** Prefix for the fallback `${prefix}-tasks-*` / `${prefix}-results` names. Default `durable`. */
   prefix?: string;
@@ -113,6 +140,10 @@ export class SqsTransport implements Transport {
   private readonly visibilityTimeoutSec: number;
   private readonly taskQueueUrlResolver?: QueueUrlResolver | undefined;
   private readonly resultsQueueUrlOption?: string | (() => string | Promise<string>) | undefined;
+  private readonly runsQueueUrlResolver?:
+    | ((namespace: string | undefined) => string | Promise<string>)
+    | undefined;
+  private readonly runConsumers = new Set<RunConsumer>();
   private readonly onError: (err: unknown) => void;
 
   private readonly handlers = new Map<string, StepHandler>();
@@ -135,6 +166,7 @@ export class SqsTransport implements Transport {
     this.visibilityTimeoutSec = options.visibilityTimeoutSec ?? 60;
     this.taskQueueUrlResolver = options.taskQueueUrl;
     this.resultsQueueUrlOption = options.resultsQueueUrl;
+    this.runsQueueUrlResolver = options.runsQueueUrl;
     this.onError = options.onError ?? ((err) => console.error('[SqsTransport]', err));
   }
 
@@ -180,6 +212,206 @@ export class SqsTransport implements Transport {
     if (typeof opt === 'string') return opt;
     if (typeof opt === 'function') return opt();
     return this.resolveByName(`${this.prefix}-results`);
+  }
+
+  private async runsUrl(namespace: string | undefined): Promise<string> {
+    if (this.runsQueueUrlResolver) return this.runsQueueUrlResolver(namespace);
+    const name = namespace ? `${this.prefix}-runs-${namespace}` : `${this.prefix}-runs`;
+    return this.resolveByName(name.replace(/[^A-Za-z0-9_-]/g, '-'));
+  }
+
+  // ── run queue (engine ↔ engine) ─────────────────────────────────────────────────────────────
+
+  /**
+   * Queue `pending` runs for whichever engine instance receives them first, ten per
+   * `SendMessageBatch`. SQS is at-least-once and a standard queue does not deduplicate, so a run may
+   * be received twice; the engine skips a run that is no longer due. Throws if any entry failed.
+   */
+  async dispatchRuns(runs: readonly RunDispatch[], opts?: RunQueueOptions): Promise<void> {
+    if (runs.length === 0) return;
+    const QueueUrl = await this.runsUrl(opts?.namespace);
+    const fifo = QueueUrl.endsWith('.fifo');
+    for (let at = 0; at < runs.length; at += SQS_BATCH_MAX) {
+      const chunk = runs.slice(at, at + SQS_BATCH_MAX);
+      const out = await this.client.send(
+        new SendMessageBatchCommand({
+          QueueUrl,
+          Entries: chunk.map((run, i) => ({
+            Id: String(i),
+            MessageBody: JSON.stringify(run),
+            MessageAttributes: this.marker
+              ? { [this.marker]: { DataType: 'String', StringValue: '1' } }
+              : undefined,
+            // FIFO: one group per run (runs are independent; only one run's entries are ordered),
+            // and a fresh deduplication id, so a run queued again later is not dropped as a repeat.
+            ...(fifo
+              ? {
+                  MessageGroupId: run.runId.slice(0, 128),
+                  MessageDeduplicationId: globalThis.crypto.randomUUID(),
+                }
+              : {}),
+          })),
+        }),
+      );
+      if (out.Failed && out.Failed.length > 0) {
+        throw new Error(
+          `SQS refused ${out.Failed.length} run(s): ${out.Failed.map((f) => f.Message ?? f.Code).join('; ')}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Receive from the run queue, at most `opts.concurrency` runs in flight on this instance. A
+   * message is deleted once its handler settles, and its visibility is extended meanwhile, so it
+   * reappears only after the instance holding it went down. The returned stop takes no more
+   * messages and resolves once the runs in flight settled.
+   */
+  onDispatchedRun(
+    handler: (run: RunDispatch) => Promise<void>,
+    opts: RunConsumerOptions,
+  ): () => Promise<void> {
+    const consumer: RunConsumer = {
+      stopped: false,
+      abort: new AbortController(),
+      inflight: new Set(),
+      slotFreed: undefined,
+      idle: [],
+      loop: Promise.resolve(),
+    };
+    consumer.loop = this.consumeRuns(
+      consumer,
+      handler,
+      Math.max(1, Math.floor(opts.concurrency)),
+      opts.namespace,
+    ).catch((err) => {
+      this.onError(err);
+    });
+    this.runConsumers.add(consumer);
+    return () => this.stopRunConsumer(consumer);
+  }
+
+  /**
+   * Stop taking messages and wait for the runs in flight. A receive still long-polling is not
+   * aborted, since SQS would keep what it hands an aborted request invisible for the visibility
+   * timeout: whatever it returns is released for another instance. `close()` aborts it.
+   */
+  private async stopRunConsumer(consumer: RunConsumer, abort = false): Promise<void> {
+    consumer.stopped = true;
+    consumer.slotFreed?.();
+    if (abort) consumer.abort.abort();
+    if (consumer.inflight.size > 0) {
+      await new Promise<void>((resolve) => consumer.idle.push(resolve));
+    }
+    if (abort) await consumer.loop;
+    this.runConsumers.delete(consumer);
+  }
+
+  private async consumeRuns(
+    consumer: RunConsumer,
+    handler: (run: RunDispatch) => Promise<void>,
+    concurrency: number,
+    namespace: string | undefined,
+  ): Promise<void> {
+    let QueueUrl: string | undefined;
+    while (QueueUrl === undefined && this.running && !consumer.stopped) {
+      try {
+        QueueUrl = await this.runsUrl(namespace);
+      } catch (err) {
+        this.onError(err);
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+    if (QueueUrl === undefined) return;
+    const url = QueueUrl;
+    const extend = setInterval(
+      () => void this.extendRunVisibility(url, consumer),
+      Math.max(1_000, Math.floor((this.visibilityTimeoutSec * 1000) / 3)),
+    );
+    extend.unref?.();
+    const settled = new Set<Promise<unknown>>();
+    try {
+      while (this.running && !consumer.stopped) {
+        const free = concurrency - consumer.inflight.size;
+        if (free <= 0) {
+          await new Promise<void>((resolve) => {
+            consumer.slotFreed = resolve;
+          });
+          consumer.slotFreed = undefined;
+          continue;
+        }
+        const messages = await this.receiveRuns(url, Math.min(SQS_BATCH_MAX, free), consumer);
+        if (consumer.stopped) {
+          await Promise.allSettled(messages.map((m) => this.release(url, m.ReceiptHandle)));
+          break;
+        }
+        for (const msg of messages) {
+          if (this.shouldSkip(msg)) {
+            await this.release(url, msg.ReceiptHandle);
+            continue;
+          }
+          const receipt = msg.ReceiptHandle;
+          if (!receipt) continue;
+          const run = JSON.parse(msg.Body ?? '{}') as Partial<RunDispatch>;
+          if (typeof run.runId !== 'string') {
+            await this.del(url, receipt).catch(() => undefined);
+            continue;
+          }
+          consumer.inflight.add(receipt);
+          const done = handler(run as RunDispatch)
+            .catch(() => undefined)
+            .then(() => this.del(url, receipt).catch(() => undefined))
+            .finally(() => {
+              consumer.inflight.delete(receipt);
+              settled.delete(done);
+              consumer.slotFreed?.();
+              if (consumer.stopped && consumer.inflight.size === 0) {
+                for (const resolve of consumer.idle.splice(0)) resolve();
+              }
+            });
+          settled.add(done);
+        }
+      }
+      await Promise.allSettled([...settled]);
+    } finally {
+      clearInterval(extend);
+    }
+  }
+
+  private async receiveRuns(QueueUrl: string, max: number, consumer: RunConsumer) {
+    try {
+      const out = await this.client.send(
+        new ReceiveMessageCommand({
+          QueueUrl,
+          MaxNumberOfMessages: max,
+          WaitTimeSeconds: this.waitTimeSeconds,
+          VisibilityTimeout: this.visibilityTimeoutSec,
+          MessageAttributeNames: this.marker ? ['All'] : undefined,
+        }),
+        { abortSignal: consumer.abort.signal },
+      );
+      return out.Messages ?? [];
+    } catch (err) {
+      if (!this.running || consumer.stopped) return [];
+      this.onError(err);
+      await new Promise((r) => setTimeout(r, 1000));
+      return [];
+    }
+  }
+
+  /** Keep the messages of the runs in flight invisible, so a long turn is not received again. */
+  private async extendRunVisibility(QueueUrl: string, consumer: RunConsumer): Promise<void> {
+    await Promise.allSettled(
+      [...consumer.inflight].map((ReceiptHandle) =>
+        this.client.send(
+          new ChangeMessageVisibilityCommand({
+            QueueUrl,
+            ReceiptHandle,
+            VisibilityTimeout: this.visibilityTimeoutSec,
+          }),
+        ),
+      ),
+    );
   }
 
   // ── engine → worker ────────────────────────────────────────────────────────────────────────
@@ -405,7 +637,11 @@ export class SqsTransport implements Transport {
   async close(): Promise<void> {
     this.running = false;
     this.abort.abort();
-    await Promise.allSettled([this.taskLoop, this.resultLoop]);
+    await Promise.allSettled([
+      this.taskLoop,
+      this.resultLoop,
+      ...[...this.runConsumers].map((c) => this.stopRunConsumer(c, true)),
+    ]);
     if (this.ownsClient) this.client.destroy();
   }
 }

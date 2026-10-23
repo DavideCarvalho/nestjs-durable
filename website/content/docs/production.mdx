@@ -521,6 +521,68 @@ a finite number of at least 1 falls back to 500.
 DurableModule.forRoot({ store, transport, timerBatchSize: 1000 });
 ```
 
+**Runs spread over every driving instance.** On a transport with a run queue (BullMQ, SQS and
+the SQL transport), every driving instance consumes that queue, and the runs any instance starts
+or wakes go through it: a `ctx.all` / `ctx.allSettled` fan's children, `ctx.child`, `start`, event
+and schedule triggers, `signalWithStart` and entity runners, continue-as-new,
+`requeue`/`retryWithInput`, recovery of a crashed run, and the wakes of a suspended run (a signal,
+a child's completion reaching its parent, a due timer, a freed singleton or queue slot, a lease that
+came free). Whichever instance has a free slot takes the next run, so a 40,000-child fan executes across
+the deployment instead of on the instance running the parent. A fan's children reach the broker in
+bulk writes of up to 500, not one round trip each. Nothing to configure: the Nest module wires the
+consumer on every driving operator (not on `drive: false` or a thin worker), and workflow code is
+unchanged.
+
+The queue holds one entry per waiting run (SQS, which cannot deduplicate, may deliver one twice),
+and an instance skips an entry whose run another instance already took or that is no longer due.
+A run whose queueing fails stays `pending`, and the next poll queues it again, or runs it itself
+while the broker is down. At shutdown an instance stops taking runs and waits for the ones it holds
+within `shutdownTimeoutMs`; what is left in the queue goes to the other instances.
+
+A start re-sent for the same `pending` state is queued once; a run that went `pending` again, or
+a wake, landing while an instance handles the run's previous entry gets another turn after it. A
+due timer is claimed for one lease period while its wake waits, so the poll does not queue it again;
+a wake the transport refused resumes the run where it was raised instead of waiting for its timer.
+
+With a run queue, `engine.signal` (and `signalWithStart`, an entity operation) resolves once the
+wake is queued, with the run's status at that moment; use `waitForRun` for the outcome. Step results
+and workflow decisions still resume their run where they land: they come off the broker's shared
+results queues, so they already land on an arbitrary instance.
+
+**Each instance stays bounded.** One budget of 256 covers everything an instance takes on itself:
+the runs it takes off the queue, a fan's child starts, and on a transport without a run queue (the
+event-emitter transport, or a custom one) the runs it starts and those other instances announce as
+enqueued, which it skips after one read if someone else already took them. 256 is the total, not a
+per-kind limit. The rest wait, as queue entries or as run ids in memory, while the runs stay
+`pending` in the store for any instance's poll.
+
+One instance also never runs two turns of the same run side by side. Wakes that arrive while a turn
+of the run is executing on it (the last children of a fan settling together, a result and a timer)
+share one more turn after it, instead of each running its own replay of the fan with every
+checkpoint loaded.
+
+**Lost wakes heal on their own.** A crash, an OOM or a scale-down can land between two writes the
+engine makes in sequence. Each gap has a recovery path that needs nobody:
+
+- A child persists its end (`completed`, `failed`, `cancelled` or `dead`) and then tells its
+  parent: `ctx.all` fails on a child that did not complete, `ctx.allSettled` reports it as a
+  rejected entry (code `cancelled` for a cancelled child), and a `failFast` fan keeps reporting the
+  failure that failed it, not a sibling it cancelled. The notification retries a store error a few
+  times and a graceful shutdown waits for it. If the parent still never hears (the instance went
+  down in between), its next turn reads the children it waits on in batches of 500 and settles every
+  finished one exactly as the notification would have; a child whose read fails is left to the turn
+  after. That turn comes no later than the parent's `reconcileMs` wake (default 5 minutes), which
+  bounds how long a lost completion can delay its parent, on a deployment where some instance is
+  polling. A notification arriving after that turn leaves nothing behind.
+- A step result is written and then resumes its run. A redelivered result whose step already
+  settled still resumes the run if it is `suspended` (subject to a step fan's barrier), so the
+  transport's retry of a result whose resume failed now finishes the job. A result whose resume
+  found the run leased by another instance looks again once that lease is free, so a holder that
+  went down mid-turn costs one lease period, not the run's timer.
+- With `remoteRedispatchMs` set, a run waiting on a dispatched step parks no later than
+  `reconcileMs`, not on the redispatch deadline itself, so a lost wake costs minutes, not the hour a
+  long redispatch window allows.
+
 **The console summarizes wide fans.** The dashboard's run detail folds any fan wider than 50 into
 one summary row and pages its members on demand, so opening a 40,000-member fan no longer ships
 every checkpoint to the browser. On a store with `checkpointStats` and `queryCheckpoints` (every

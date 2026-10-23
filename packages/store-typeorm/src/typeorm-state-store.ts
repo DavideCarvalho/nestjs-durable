@@ -254,6 +254,12 @@ export class TypeOrmStateStore implements StateStore {
     return e ? fromRunEntity(e) : null;
   }
 
+  async getRuns(runIds: string[]): Promise<WorkflowRun[]> {
+    if (runIds.length === 0) return [];
+    const rows = await this.runs().find({ where: { id: In([...new Set(runIds)]) } });
+    return rows.map(fromRunEntity);
+  }
+
   async deleteRun(runId: string): Promise<void> {
     // Child rows first, then the run — checkpoints, signal waiters, attribute rows.
     await this.checkpoints().delete({ runId });

@@ -362,6 +362,14 @@ export interface StateStore {
     patch: Partial<WorkflowRun>,
   ): Promise<boolean>;
   getRun(runId: string): Promise<WorkflowRun | null>;
+  /**
+   * The runs with these ids, in any order; an id with no run is left out. One `IN (...)` read: the
+   * engine looks up a fan's children with it (which to start, which already finished) instead of
+   * one {@link getRun} per child. Callers pass ids in bounded batches.
+   *
+   * Optional: without it the engine reads each run with {@link getRun}.
+   */
+  getRuns?(runIds: string[]): Promise<WorkflowRun[]>;
 
   /**
    * Hard-delete a run and all of its rows — the run plus its checkpoints, signal waiters, and
@@ -1523,6 +1531,46 @@ export interface RunDispatcher {
   dispatch(runId: string): void | Promise<void>;
 }
 
+/**
+ * One run handed to a transport's run queue ({@link Transport.dispatchRuns}), for whichever driving
+ * instance takes it.
+ *
+ * - `start` (the default): a freshly created or re-queued `pending` run. The consumer runs it only
+ *   while it is still `pending`; any other state means another instance already took it.
+ * - `wake`: a suspended run with something new to see (a delivered signal or child completion, a
+ *   due timer, a freed singleton or queue slot, a lease that came free). The consumer leases and
+ *   resumes it unless it is finished.
+ */
+export interface RunDispatch {
+  runId: string;
+  /** The run's admission priority (higher = more urgent), for a queue that orders by priority. */
+  priority?: number | undefined;
+  reason?: 'start' | 'wake' | undefined;
+  /**
+   * Which `pending` state of the run a `start` is for: the same for every dispatch of one pending
+   * state (a start re-sent by the poll), different once the run went `pending` again (a retry, a
+   * recovery). A transport that deduplicates may drop a start whose `runId` and `key` match one it
+   * still holds; it must not drop one with a new key, even while the earlier one is being handled,
+   * nor a wake. Absent on a wake.
+   */
+  key?: string | undefined;
+}
+
+/**
+ * Which run queue {@link Transport.dispatchRuns} and {@link Transport.onDispatchedRun} use. Runs are
+ * queued per engine `namespace` (undefined for an engine that drives every namespace), so engines
+ * scoped to different namespaces on one broker never execute each other's runs.
+ */
+export interface RunQueueOptions {
+  namespace?: string | undefined;
+}
+
+/** Options for {@link Transport.onDispatchedRun}. */
+export interface RunConsumerOptions extends RunQueueOptions {
+  /** Most runs this consumer hands to its handler at once. */
+  concurrency: number;
+}
+
 export interface Transport {
   /** engine → worker */
   dispatch(task: RemoteTask): Promise<void>;
@@ -1609,6 +1657,24 @@ export interface Transport {
   dispatchRunRequest?(msg: RunRequest): Promise<void>;
   /** control plane ← tenant worker: consume {@link RunRequest}s. Pair with {@link dispatchRunRequest}. */
   onRunRequest?(handler: (msg: RunRequest) => Promise<void>): void;
+  /**
+   * engine → engine: queue `pending` runs for whichever driving instance takes them first, one entry
+   * per run id (a run already queued is not queued twice). The engine sends a wide fan's children in
+   * batches. Optional, together with {@link onDispatchedRun}: an engine that consumes the run queue
+   * dispatches the runs it starts here instead of executing them in-process. A rejection leaves the
+   * runs `pending` in the store for a `runPending` poll.
+   */
+  dispatchRuns?(runs: readonly RunDispatch[], opts?: RunQueueOptions): Promise<void>;
+  /**
+   * engine ← engine: consume the run queue, at most `opts.concurrency` runs at once on this
+   * instance, handing each {@link RunDispatch} to `handler` as dispatched (its `reason` included);
+   * `handler` resolves when its turn of the run settles. Returns a stop function that stops
+   * taking runs and resolves once the runs in flight have settled. Pair with {@link dispatchRuns}.
+   */
+  onDispatchedRun?(
+    handler: (run: RunDispatch) => Promise<void>,
+    opts: RunConsumerOptions,
+  ): () => Promise<void>;
   /** control plane → tenant worker: publish a correlated {@link RunReply} on `<effectivePrefix>-run-reply`
    *  (pub/sub; every tenant subscribes and filters by `requestId`). */
   publishRunReply?(reply: RunReply): Promise<void>;

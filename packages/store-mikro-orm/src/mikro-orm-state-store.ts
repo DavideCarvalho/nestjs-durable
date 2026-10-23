@@ -263,6 +263,12 @@ export class MikroOrmStateStore implements StateStore {
     return entity ? fromRunEntity(entity) : null;
   }
 
+  async getRuns(runIds: string[]): Promise<WorkflowRun[]> {
+    if (runIds.length === 0) return [];
+    const rows = await this.fork().find(WorkflowRunEntity, { id: { $in: [...new Set(runIds)] } });
+    return rows.map(fromRunEntity);
+  }
+
   async deleteRun(runId: string): Promise<void> {
     const em = this.fork();
     // Children first, then the run row — checkpoints, signal waiters, and the normalized

@@ -26,6 +26,15 @@ The three boundary-crossing transports all carry the same JSON `RemoteTask` / `S
 [Python worker](/docs/python) plugs into any of them. The in-process event-emitter is Node-only by
 nature — there's nothing across a boundary to reach.
 
+## Runs spread over the deployment
+
+The three boundary-crossing transports also carry a **run queue**: every driving instance consumes
+it, and the runs any instance starts or re-drives (a `ctx.all` fan's children included) go there,
+so whichever instance has a free slot executes the next one instead of the instance that started
+it. Nothing to turn on; see [Production](/docs/production) for which runs go through it. The
+event-emitter transport lives in one process and has no run queue: runs execute in-process, at most
+256 at once per instance.
+
 ## In-process (event-emitter)
 
 Backed by `@nestjs/event-emitter`. Handlers are `@Step` provider methods; the engine
