@@ -330,7 +330,11 @@ describe('runSchedules — settled windows', () => {
     const engine = new WorkflowEngine({ store, namespace: 'web' });
     engine.register('beat', '1', async () => 'tick');
 
-    await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000, namespace: 'gpu' }], 1000);
+    await runSchedules(
+      engine,
+      [{ key: 'b', workflow: 'beat', everyMs: 1000, namespace: 'gpu' }],
+      1000,
+    );
 
     expect((await store.getRun('sched:b:1'))?.namespace).toBe('gpu');
   });
@@ -341,9 +345,9 @@ describe('runSchedules — settled windows', () => {
     engine.register('beat', '1', async () => 'tick');
     engine.beginDrain();
 
-    expect(await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000 }], 1000)).toEqual(
-      [],
-    );
+    expect(
+      await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000 }], 1000),
+    ).toEqual([]);
     expect(await store.getRun('sched:b:1')).toBeNull();
   });
 });
