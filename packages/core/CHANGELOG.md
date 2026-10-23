@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.85.4
+
+### Patch Changes
+
+- [#420](https://github.com/DavideCarvalho/nestjs-durable/pull/420) [`71986d5`](https://github.com/DavideCarvalho/nestjs-durable/commit/71986d5df39662fe59a2dd20472f528cd0b9dbe6) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console ORIGIN facet: the row is now hidden unless at least one run has a named (package) origin, so a deployment where no run carries an origin no longer shows a useless `all N | unknown N`. Runs with no origin are labelled `app` (the app's own workflows) instead of `unknown`, with an updated tooltip, empty-state and run-header wording. The filter kind (`{ kind: 'unknown' }`) and the `?unattributed=true` param are unchanged.
+
 ## 0.85.3
 
 ### Patch Changes
