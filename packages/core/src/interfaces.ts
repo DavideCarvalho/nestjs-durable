@@ -1460,6 +1460,28 @@ export interface RunDispatcher {
   dispatch(runId: string): void | Promise<void>;
 }
 
+/** One run handed to {@link Transport.dispatchRuns}: a `pending` run any driving instance may execute. */
+export interface RunDispatch {
+  runId: string;
+  /** The run's admission priority (higher = more urgent), for a queue that orders by priority. */
+  priority?: number | undefined;
+}
+
+/**
+ * Which run queue {@link Transport.dispatchRuns} and {@link Transport.onDispatchedRun} use. Runs are
+ * queued per engine `namespace` (undefined for an engine that drives every namespace), so engines
+ * scoped to different namespaces on one broker never execute each other's runs.
+ */
+export interface RunQueueOptions {
+  namespace?: string | undefined;
+}
+
+/** Options for {@link Transport.onDispatchedRun}. */
+export interface RunConsumerOptions extends RunQueueOptions {
+  /** Most runs this consumer hands to its handler at once. */
+  concurrency: number;
+}
+
 export interface Transport {
   /** engine → worker */
   dispatch(task: RemoteTask): Promise<void>;
@@ -1546,6 +1568,23 @@ export interface Transport {
   dispatchRunRequest?(msg: RunRequest): Promise<void>;
   /** control plane ← tenant worker: consume {@link RunRequest}s. Pair with {@link dispatchRunRequest}. */
   onRunRequest?(handler: (msg: RunRequest) => Promise<void>): void;
+  /**
+   * engine → engine: queue `pending` runs for whichever driving instance takes them first, one entry
+   * per run id (a run already queued is not queued twice). The engine sends a wide fan's children in
+   * batches. Optional, together with {@link onDispatchedRun}: an engine that consumes the run queue
+   * dispatches the runs it starts here instead of executing them in-process. A rejection leaves the
+   * runs `pending` in the store for a `runPending` poll.
+   */
+  dispatchRuns?(runs: RunDispatch[], opts?: RunQueueOptions): Promise<void>;
+  /**
+   * engine ← engine: consume the run queue, at most `opts.concurrency` runs at once on this
+   * instance; `handler` resolves when its turn of the run settles. Returns a stop function that stops
+   * taking runs and resolves once the runs in flight have settled. Pair with {@link dispatchRuns}.
+   */
+  onDispatchedRun?(
+    handler: (runId: string) => Promise<void>,
+    opts: RunConsumerOptions,
+  ): () => Promise<void>;
   /** control plane → tenant worker: publish a correlated {@link RunReply} on `<effectivePrefix>-run-reply`
    *  (pub/sub; every tenant subscribes and filters by `requestId`). */
   publishRunReply?(reply: RunReply): Promise<void>;

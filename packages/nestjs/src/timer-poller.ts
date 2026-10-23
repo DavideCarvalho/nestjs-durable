@@ -38,15 +38,21 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     // non-driving (dashboard-only) operator, or a thin worker with no `store` at all, must not
     // resume timers — leave that to a driving instance.
     if (!isDrivingOperator(this.options)) return;
+    // A driving instance consumes the transport's run queue when the transport carries one, so the
+    // runs any instance starts (a `ctx.all` fan's children included), re-dispatches or finds due
+    // spread over every driving instance. `engine.beginDrain` (below, at shutdown) stops it, and
+    // the registrar's `drain` waits for the runs it holds within `shutdownTimeoutMs`. Optional for
+    // an older core.
+    this.engine.consumeRuns?.();
     // Low-latency dispatch: when a run is enqueued elsewhere (e.g. an API pod), pick it up at once
     // over the control plane instead of waiting for the next poll tick. Leasing dedups across workers.
     // The `.catch` is load-bearing, not decorative: this is fire-and-forget, so an unhandled
     // rejection here terminates the process under Node's default policy — and the run it could not
     // drive is still waiting for the next poll tick either way.
     //
-    // `runEnqueued` is bounded by `localRunConcurrency` and skips a run another
-    // instance already took; every instance receives every announcement, so a 40,000-child fan
-    // would otherwise lease and replay 40,000 runs here at once. Optional for an older core.
+    // `runEnqueued` is bounded and skips a run another instance already took; every instance
+    // receives every announcement, so a wide fan would otherwise lease and replay every child here
+    // at once. Optional for an older core.
     this.unsubscribeEnqueued = this.engine.onEnqueued((runId) => {
       if (typeof this.engine.runEnqueued === 'function') {
         this.engine.runEnqueued(runId);

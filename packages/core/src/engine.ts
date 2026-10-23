@@ -1,7 +1,7 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission';
 import { currentWorkflowCtx, runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';
-import { BoundedRunner, localRunLimit } from './bounded-runner';
+import { BoundedRunner, LOCAL_RUN_CONCURRENCY } from './bounded-runner';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints';
 import {
   type Completion,
@@ -111,6 +111,7 @@ import {
 import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
+import { RUN_DISPATCH_BATCH, RunDispatchBatcher } from './run-dispatch-batcher';
 import { getRunsByIds, indexWaitersByRun, listSignalWaitersOfRuns } from './run-waiting';
 import { ScheduleClient } from './schedules';
 import { SINGLETON_ADMITTED_TAG } from './singleton-admission';
@@ -622,24 +623,14 @@ export interface WorkflowEngineDeps {
    */
   trackStepStart?: boolean | undefined;
   /**
-   * Where a freshly-`start`ed run executes (see {@link RunDispatcher}). Defaults to in-process: the
-   * run executes on this instance asynchronously (a microtask), so `start` returns without blocking.
+   * Where a freshly-`start`ed run executes (see {@link RunDispatcher}). By default the run executes
+   * on this instance asynchronously, so `start` returns without blocking; once the engine consumes a
+   * transport's run queue ({@link WorkflowEngine.consumeRuns}) it queues the run there instead, for
+   * whichever driving instance takes it.
    * Pass a no-op dispatcher on a caller that must NOT run workflows (e.g. an API/dashboard pod), and
    * run `runPending` on a worker pod to pick those up; or a broker-backed one for a worker pool.
    */
   runDispatcher?: RunDispatcher | undefined;
-  /**
-   * How many runs this instance executes in-process at once when it dispatches them itself: the
-   * default {@link runDispatcher}, {@link WorkflowEngine.runEnqueued}, and the deferred starts of
-   * `ctx.child` / `ctx.all` children. Past it, run ids wait in memory in arrival order; the runs
-   * themselves are already `pending` in the store, so another instance's `runPending` poll can take
-   * them first. Default 256. `Infinity` removes the bound; a non-finite or sub-1 value uses the
-   * default.
-   *
-   * Without a bound, a `ctx.all` over 40,000 children starts and executes all 40,000 on the instance
-   * running the parent, each turn holding its replay state until the store answers.
-   */
-  localRunConcurrency?: number | undefined;
 }
 
 /** Thrown by {@link WorkflowEngine.resume} when the run belongs to a different namespace. */
@@ -769,8 +760,18 @@ export class WorkflowEngine {
   private readonly wakeTurns = new Map<string, WakeTurn>();
   /** Re-checks scheduled for runs whose wake found another instance's lease (see {@link execute}). */
   private readonly leaseRetries = new Map<string, ReturnType<typeof setTimeout>>();
-  /** First turns of runs this instance dispatched to itself (see {@link WorkflowEngineDeps.localRunConcurrency}). */
+  /** First turns of runs this instance dispatched to itself (see {@link LOCAL_RUN_CONCURRENCY}). */
   private readonly localRuns: BoundedRunner;
+  /** The dispatcher the caller supplied, if any; without one the engine picks (see {@link dispatchRun}). */
+  private readonly customDispatcher: RunDispatcher | undefined;
+  /** Runs on their way to the transport's run queue (see {@link consumeRuns}). */
+  private readonly runBatcher: RunDispatchBatcher;
+  /** Set while this engine consumes a transport's run queue, and so dispatches its runs to it. */
+  private dispatchesOverTransport = false;
+  /** Stops for the run-queue consumers started by {@link consumeRuns}. */
+  private runConsumerStops: (() => Promise<void>)[] = [];
+  /** The consumers being stopped, so {@link drain} waits for their runs in flight. */
+  private runConsumersStopping: Promise<unknown> | undefined;
   /** Deferred child starts (see {@link startChildDeferred}). */
   private readonly childStarts: BoundedRunner;
   private draining = false;
@@ -835,12 +836,18 @@ export class WorkflowEngine {
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
     // A failed pickup is swallowed here (the run stays `pending` for a `runPending` poll to retry);
     // run failures themselves are handled inside `execute` and surfaced as the run's `failed` state.
-    const localLimit = localRunLimit(deps.localRunConcurrency);
-    this.localRuns = new BoundedRunner(localLimit);
-    this.childStarts = new BoundedRunner(localLimit);
-    this.runDispatcher = deps.runDispatcher ?? {
-      dispatch: (runId) => this.localRuns.submit(runId, () => this.runOne(runId)),
-    };
+    this.localRuns = new BoundedRunner(LOCAL_RUN_CONCURRENCY);
+    this.childStarts = new BoundedRunner(LOCAL_RUN_CONCURRENCY);
+    this.customDispatcher = deps.runDispatcher;
+    this.runBatcher = new RunDispatchBatcher(
+      (runs) => this.pool.dispatchRuns(runs, { namespace: this.namespace }),
+      (runs, err) =>
+        console.error(
+          `[nestjs-durable] could not queue ${runs.length} run(s) on the transport; they stay pending for the next poll:`,
+          err,
+        ),
+    );
+    this.runDispatcher = { dispatch: (runId) => this.dispatchRun(runId) };
     this.singletons = new SingletonGate({
       store: this.store,
       clock: this.clock,
@@ -997,20 +1004,141 @@ export class WorkflowEngine {
 
   /**
    * Pick up a run another instance announced as enqueued: run it here if it is still `pending`.
-   * Bounded by {@link WorkflowEngineDeps.localRunConcurrency}, and a run another instance already
-   * took is skipped after one read, instead of being leased and replayed here once more.
+   * Bounded by {@link LOCAL_RUN_CONCURRENCY}, and a run another instance already took is skipped
+   * after one read, instead of being leased and replayed here once more.
    */
   runEnqueued(runId: string): void {
-    this.localRuns.submit(runId, async () => {
-      if (this.draining) return;
-      try {
-        const run = await this.store.getRun(runId);
-        if (run?.status !== 'pending') return;
+    this.localRuns.submit(runId, () => this.runIfPending(runId));
+  }
+
+  /**
+   * Consume the run queue of every transport that carries one ({@link Transport.dispatchRuns} and
+   * {@link Transport.onDispatchedRun}), and from then on dispatch the runs this engine starts there
+   * rather than executing them in-process: a run, a `ctx.all` fan's children included, executes on
+   * whichever consuming instance takes it, at most {@link LOCAL_RUN_CONCURRENCY} at once per
+   * instance. Call it on every instance that drives runs; the Nest module does on a driving operator.
+   *
+   * Returns a function that stops consuming and resolves once the runs in flight settled, after
+   * which runs are executed in-process again; {@link beginDrain} stops consuming too. Undefined
+   * when no transport carries a run queue: runs keep executing in-process.
+   */
+  consumeRuns(): (() => Promise<void>) | undefined {
+    if (!this.pool.dispatchesRuns) return undefined;
+    if (this.runConsumerStops.length === 0) {
+      this.runConsumerStops = this.pool.onDispatchedRun((runId) => this.runFromQueue(runId), {
+        concurrency: LOCAL_RUN_CONCURRENCY,
+        namespace: this.namespace,
+      });
+    }
+    this.dispatchesOverTransport = true;
+    return async () => {
+      this.dispatchesOverTransport = false;
+      await this.runBatcher.settle();
+      await this.stopRunConsumers();
+    };
+  }
+
+  /** Stop every run-queue consumer; resolves once their runs in flight settled. */
+  private stopRunConsumers(): Promise<unknown> {
+    if (this.runConsumerStops.length > 0) {
+      const stops = this.runConsumerStops;
+      this.runConsumerStops = [];
+      this.runConsumersStopping = Promise.allSettled(stops.map((stop) => stop()));
+    }
+    return this.runConsumersStopping ?? Promise.resolve();
+  }
+
+  /** Whether {@link dispatchRun} queues runs on the transport (see {@link consumeRuns}). */
+  private get queuesRunsOverTransport(): boolean {
+    return this.customDispatcher === undefined && this.dispatchesOverTransport;
+  }
+
+  /**
+   * Hand a `pending` run to whatever executes it: the caller's {@link WorkflowEngineDeps.runDispatcher};
+   * else the transport's run queue while this engine consumes it, batched; else this instance,
+   * bounded by {@link LOCAL_RUN_CONCURRENCY}. A run whose queueing fails stays `pending` for a
+   * `runPending` poll.
+   */
+  private dispatchRun(runId: string, priority?: number): void | Promise<void> {
+    if (this.customDispatcher) return this.customDispatcher.dispatch(runId);
+    if (this.dispatchesOverTransport) {
+      this.runBatcher.add({ runId, ...(priority !== undefined ? { priority } : {}) });
+      return;
+    }
+    this.localRuns.submit(runId, () => this.runOne(runId));
+  }
+
+  /**
+   * Take a turn of a run taken off the transport's run queue, if the store says it has one due: a
+   * `pending` run (a start, a re-dispatch, a requeue), a `cancelling` one being recovered, or a
+   * `suspended`/`blocked` one whose `wakeAt` is due (a timer the poll queued). Anything else was
+   * already taken by another instance, or its wake was not this entry's, and is skipped after one
+   * read. Never rejects.
+   */
+  private async runFromQueue(runId: string): Promise<void> {
+    if (this.draining) return;
+    try {
+      const run = await this.store.getRun(runId);
+      if (!run) return;
+      if (run.status === 'pending' || run.status === 'cancelling') {
         await this.runOne(runId);
-      } catch (error) {
-        console.error(`[nestjs-durable] could not run enqueued run ${runId}:`, error);
+        return;
       }
-    });
+      const nowMs = this.clock();
+      if (
+        (run.status === 'suspended' || run.status === 'blocked') &&
+        run.wakeAt !== undefined &&
+        run.wakeAt <= nowMs
+      ) {
+        const waiters = indexWaitersByRun(await listSignalWaitersOfRuns(this.store, [runId]));
+        await this.resumeLeased([run], nowMs, (locked) =>
+          this.reconcileSignalWaiter(locked, waiters.get(locked.id)),
+        );
+      }
+    } catch (error) {
+      console.error(`[nestjs-durable] could not run queued run ${runId}:`, error);
+    }
+  }
+
+  /**
+   * Queue `runs` on the transport for whichever consuming instance takes them, in batches. False
+   * when the transport refused them, so the caller executes them itself instead.
+   */
+  private async queueOnTransport(runs: WorkflowRun[]): Promise<boolean> {
+    try {
+      for (let at = 0; at < runs.length; at += RUN_DISPATCH_BATCH) {
+        await this.pool.dispatchRuns(
+          runs.slice(at, at + RUN_DISPATCH_BATCH).map((run) => ({
+            runId: run.id,
+            ...(run.priority !== undefined ? { priority: run.priority } : {}),
+          })),
+          { namespace: this.namespace },
+        );
+      }
+      return true;
+    } catch (error) {
+      console.error(
+        '[nestjs-durable] could not queue runs on the transport; running them here:',
+        error,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Execute a run announced by another instance, if it is still `pending`: a
+   * run another instance already took is skipped after one read instead of being leased and
+   * replayed here once more. Never rejects.
+   */
+  private async runIfPending(runId: string): Promise<void> {
+    if (this.draining) return;
+    try {
+      const run = await this.store.getRun(runId);
+      if (run?.status !== 'pending') return;
+      await this.runOne(runId);
+    } catch (error) {
+      console.error(`[nestjs-durable] could not run enqueued run ${runId}:`, error);
+    }
   }
 
   /** Fire cooperative-cancellation listeners for `runId` (a worker bridge aborts in-flight work). */
@@ -1459,10 +1587,12 @@ export class WorkflowEngine {
     }
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
-    await this.runDispatcher.dispatch(runId);
+    await this.dispatchRun(runId, run.priority);
     // Nudge worker instances to pick it up now instead of on their next poll (no-op without a control
-    // plane; self-receipt is filtered, so it only helps OTHER pods — e.g. an API pod's enqueue).
-    if (this.controlPlane) {
+    // plane; self-receipt is filtered, so it only helps OTHER pods — e.g. an API pod's enqueue). A run
+    // queued on the transport needs no nudge: the instance that takes it off the queue runs it, and
+    // announcing it too would have every instance read every run of a wide fan.
+    if (this.controlPlane && !this.queuesRunsOverTransport) {
       void this.controlPlane
         .publishControl({ kind: 'enqueued', runId, from: this.instanceId })
         .catch(() => undefined);
@@ -1781,6 +1911,12 @@ export class WorkflowEngine {
    */
   beginDrain(spentMs = 0): void {
     this.draining = true;
+    // Stop taking runs off the transport's queue, so they wait there for another instance; the
+    // ones in flight settle, and drain() waits for them.
+    if (this.runConsumerStops.length > 0) {
+      this.runBatcher.flush();
+      void this.stopRunConsumers();
+    }
     // Non-finite values (NaN, Infinity) and negatives are ignored: one bad report must not turn
     // every later drain into a 1 ms wait.
     if (Number.isFinite(spentMs) && spentMs > 0) {
@@ -1804,7 +1940,16 @@ export class WorkflowEngine {
     this.childStarts.clear();
     for (const timer of this.leaseRetries.values()) clearTimeout(timer);
     this.leaseRetries.clear();
-    if (this.inflight.size === 0 && this.background.size === 0) return;
+    const consumers = this.runConsumersStopping;
+    if (
+      this.inflight.size === 0 &&
+      this.background.size === 0 &&
+      !consumers &&
+      this.runBatcher.idle
+    ) {
+      return;
+    }
+    const queued = this.runBatcher.settle();
     // The deadline is `start + timeoutMs - spent`, re-read whenever `beginDrain(spentMs)` reports more
     // wait, so a drain that starts while the poller is still waiting is shortened once it reports.
     const start = Date.now();
@@ -1821,7 +1966,10 @@ export class WorkflowEngine {
     });
     this.drainRearms.add(rearm);
     try {
-      await Promise.race([Promise.allSettled([...this.inflight, ...this.background]), timer]);
+      await Promise.race([
+        Promise.allSettled([...this.inflight, ...this.background, queued, consumers]),
+        timer,
+      ]);
     } finally {
       this.drainRearms.delete(rearm);
       clearTimeout(timeout);
@@ -1968,7 +2116,7 @@ export class WorkflowEngine {
       if (run.status !== 'cancelling') {
         await this.store.updateRun(run.id, { status: 'pending', updatedAt: new Date() });
       }
-      await this.runDispatcher.dispatch(run.id);
+      await this.dispatchRun(run.id, run.priority);
       results.push({
         runId: run.id,
         status: run.status === 'cancelling' ? 'cancelling' : 'pending',
@@ -2042,6 +2190,14 @@ export class WorkflowEngine {
     // gathered separately here rather than widening every store adapter's timer query.
     const blocked = await this.dueBlockedRuns(nowMs);
     if (due.length === 0 && blocked.length === 0) return [];
+    // While this engine consumes the transport's run queue, the due runs go there, for whichever
+    // instance takes them, instead of all resuming on the instance that polled.
+    if (this.queuesRunsOverTransport && !this.draining) {
+      const runs = [...due, ...blocked];
+      if (await this.queueOnTransport(runs)) {
+        return runs.map((run) => ({ runId: run.id, status: run.status }));
+      }
+    }
     const waiterByRun = indexWaitersByRun(
       await listSignalWaitersOfRuns(
         this.store,
@@ -2277,7 +2433,7 @@ export class WorkflowEngine {
         : {}),
       updatedAt: new Date(),
     });
-    await this.runDispatcher.dispatch(runId);
+    await this.dispatchRun(runId, run.priority);
     return { runId, status: 'pending' };
   }
 
@@ -2354,7 +2510,15 @@ export class WorkflowEngine {
   async runPending(nowMs: number = this.clock()): Promise<RunResult[]> {
     // Oldest-first (FIFO), capped per call so a backlog drains over several polls without one sweep
     // fetching unboundedly. A run not picked up this tick is picked up the next.
-    return this.resumeLeased(await this.store.listPendingRuns(100, this.namespace), nowMs);
+    const pending = await this.store.listPendingRuns(100, this.namespace);
+    // While this engine consumes the transport's run queue, a pending run whose queue entry was lost
+    // goes back on the queue (a run still queued is not queued twice) rather than running here.
+    if (this.queuesRunsOverTransport && !this.draining && pending.length > 0) {
+      if (await this.queueOnTransport(pending)) {
+        return pending.map((run) => ({ runId: run.id, status: run.status }));
+      }
+    }
+    return this.resumeLeased(pending, nowMs);
   }
 
   /**
@@ -2988,7 +3152,7 @@ export class WorkflowEngine {
     childId: string,
     opts?: StartOptions,
   ): void {
-    // Bounded (see `localRunConcurrency`): a fan's starts queue here instead of all hitting the store
+    // Bounded (see `LOCAL_RUN_CONCURRENCY`): a fan's starts queue here instead of all hitting the store
     // at once. A start still queued at shutdown is dropped, not failed: the parent's placeholder
     // remains, and its next turn starts every child that has no run yet.
     this.childStarts.submit(childId, async () => {

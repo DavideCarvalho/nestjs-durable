@@ -14,12 +14,7 @@ import { DurableModule, type DurableModuleOptions } from './durable.module';
 
 type Extra = Pick<
   DurableModuleOptions,
-  | 'timerBatchSize'
-  | 'reconcileMs'
-  | 'eventBufferTtlMs'
-  | 'blockedPollMs'
-  | 'trackStepStart'
-  | 'localRunConcurrency'
+  'timerBatchSize' | 'reconcileMs' | 'eventBufferTtlMs' | 'blockedPollMs' | 'trackStepStart'
 >;
 
 const modules: { close(): Promise<void> }[] = [];
@@ -91,12 +86,5 @@ describe.each(['forRoot', 'forRootAsync'] as const)('DurableModule.%s engine opt
     expect(internals.eventBufferTtlMs).toBeUndefined();
     expect(internals.blockedPollMs).toBe(5_000);
     expect(internals.trackStepStart).toBe(true);
-  });
-
-  it('forwards localRunConcurrency to the in-process run bound, 256 when omitted', async () => {
-    const limitOf = (engine: unknown) =>
-      (engine as { localRuns: { limit: number } }).localRuns.limit;
-    expect(limitOf((await engineFor(mode, { localRunConcurrency: 7 })).engine)).toBe(7);
-    expect(limitOf((await engineFor(mode, {})).engine)).toBe(256);
   });
 });

@@ -276,24 +276,38 @@ a finite number of at least 1 falls back to 500.
 DurableModule.forRoot({ store, transport, timerBatchSize: 1000 });
 ```
 
-**The instance running a wide fan stays bounded.** A run started on a driving instance executes
-there, in-process, and so do the children of a `ctx.all` it runs. Each instance executes at most
-`localRunConcurrency` (default 256) of these at once, and the same bound applies to the runs other
-instances announce as enqueued, which an instance skips after one read if someone else already
-took them. The rest wait as run ids in memory while the runs stay `pending` in the store, where any
-instance's poll can pick them up. The children's starts are queued under the same bound. Without
-it, a 40,000-child fan started and executed all 40,000 children on the parent's instance at once,
-each turn holding its state until the store answered, and that instance ran out of memory while the
-others idled.
+**Runs spread over every driving instance.** On a transport with a run queue (BullMQ, SQS and
+the SQL transport), every driving instance consumes that queue, and the runs any instance starts
+go through it: a `ctx.all` fan's children, `ctx.child`, `start`, event and schedule triggers,
+`signalWithStart` and entity runners, continue-as-new, `requeue`/`retryWithInput`, recovery of a
+crashed run, the next run of a freed singleton slot, and the pending runs and due timers the poll
+finds. Whichever instance has a free slot takes the next run, so a 40,000-child fan executes across
+the deployment instead of on the instance running the parent. A fan's children reach the broker in
+bulk writes of up to 500, not one round trip each. Nothing to configure: the Nest module wires the
+consumer on every driving operator (not on `drive: false` or a thin worker), and workflow code is
+unchanged.
+
+The queue holds one entry per waiting run (SQS, which cannot deduplicate, may deliver one twice),
+and an instance skips an entry whose run another instance already took or that is no longer due.
+A run whose queueing fails stays `pending`, and the next poll queues it again, or runs it itself
+while the broker is down. At shutdown an instance stops taking runs and waits for the ones it holds
+within `shutdownTimeoutMs`; what is left in the queue goes to the other instances.
+
+Wakes of a run that is already executing somewhere (a step result, a signal, a child's completion
+reaching its parent) resume it where they land, under the run's lease, as before: the run queue
+carries starts and re-drives, not wakes.
+
+**Each instance stays bounded.** An instance executes at most 256 runs at once that it picks up
+itself: the runs it takes off the queue, and on a transport without a run queue (the event-emitter
+transport, or a custom one) the runs it starts and those other instances announce as enqueued,
+which it skips after one read if someone else already took them. The rest wait, as queue entries
+or as run ids in memory, while the runs stay `pending` in the store for any instance's poll. A fan's
+child starts are queued under the same bound.
 
 One instance also never runs two turns of the same run side by side. Wakes that arrive while a turn
 of the run is executing on it (the last children of a fan settling together, a result and a timer)
 share one more turn after it, instead of each running its own replay of the fan with every
 checkpoint loaded.
-
-```ts
-DurableModule.forRoot({ store, transport, localRunConcurrency: 128 });
-```
 
 **Lost wakes heal on their own.** A crash, an OOM or a scale-down can land between two writes the
 engine makes in sequence. Each gap has a recovery path that needs nobody:

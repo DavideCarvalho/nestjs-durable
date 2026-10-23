@@ -122,6 +122,14 @@ several isolated deployments — e.g. one per developer — without crosstalk. L
 inserts a `-<namespace>` segment into every name. See [Tenancy](/docs/concepts/tenancy) for the
 operator/tenant model this enables.
 
+## Run queue
+
+The engine queues the runs it starts on `<prefix>-runs` (`<prefix>-runs-<namespace>` for an engine
+scoped to a namespace), and every driving instance consumes it with a worker of 256 at once. The job
+id is the run id (with `:` escaped as `%3A`), so a run already waiting is not queued twice; a fan's
+children go in `addBulk` writes of up to 500, and a run's `priority` maps onto the job's as for a
+step. A job held by an instance that went down is redelivered by BullMQ's stalled check.
+
 ## Crash recovery
 
 A worker that crashes or stalls mid-step never produces a `StepResult`, so without help the step's

@@ -53,14 +53,10 @@ export class BoundedRunner {
   }
 }
 
-/** The bound for in-process work when none is configured. */
-export const DEFAULT_LOCAL_RUN_CONCURRENCY = 256;
-
-/** A configured bound, or the default for a missing, non-finite or sub-1 value (`Infinity` = none). */
-export function localRunLimit(value: number | undefined): number {
-  if (value === Number.POSITIVE_INFINITY) return value;
-  if (value === undefined || !Number.isFinite(value) || value < 1) {
-    return DEFAULT_LOCAL_RUN_CONCURRENCY;
-  }
-  return Math.floor(value);
-}
+/**
+ * Most runs one instance executes at once when it picks them up itself: its in-process run starts,
+ * the deferred starts of a fan's children, the runs announced to it as enqueued, and the runs it
+ * consumes from a transport's run queue. A wide fan waits as run ids past it, so the instance holds
+ * at most this many turns open regardless of the fan's width.
+ */
+export const LOCAL_RUN_CONCURRENCY = 256;

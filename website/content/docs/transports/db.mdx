@@ -48,15 +48,16 @@ older than `leaseMs` is treated as abandoned and reclaimed by the next poll (see
 | `pollMs` | Poll interval in ms when a queue is empty. Default `500`. |
 | `batchSize` | Max rows claimed per poll. Default `10`. |
 | `leaseMs` | How long a claimed row is owned before it's reclaimable (crash recovery), in ms. Default `30_000`. |
-| `autoCreate` | Create the two tables on first use if missing. Default `true` — the `CREATE TABLE` statements in [The contract](#the-contract) are for reference/manual provisioning, not a required setup step. |
+| `autoCreate` | Create the tables on first use if missing. Default `true` — the `CREATE TABLE` statements in [The contract](#the-contract) are for reference/manual provisioning, not a required setup step. |
 | `instanceId` | Identifies this instance in `claimed_by`, for debugging. Defaults to a random id. |
 
 ## The contract
 
 This is the **single source of truth** for the table shape and the claim protocol. The TypeScript
 `DbTransport` and the [Python `db_runner`](/docs/python#sql-database) both implement against *this*
-spec — so a Node engine and a Python worker share the same two tables without drift. Table names are
-`<prefix>_transport_tasks` and `<prefix>_transport_results` (default prefix `durable`).
+spec — so a Node engine and a Python worker share the same two step tables without drift. Table
+names are `<prefix>_transport_tasks` and `<prefix>_transport_results` (default prefix `durable`),
+plus `<prefix>_transport_runs`, the engines' own [run queue](#run-queue), which workers never touch.
 
 ### Tables
 
@@ -87,6 +88,16 @@ CREATE TABLE durable_transport_results (
   claimed_at bigint,
   created_at bigint        NOT NULL
 );
+
+CREATE TABLE durable_transport_runs (
+  run_id      varchar(191) PRIMARY KEY,  -- one row per queued run
+  ns          varchar(191) NOT NULL,     -- the engine namespace ('' for one that drives all)
+  priority    integer      NOT NULL,     -- higher first
+  claimed_by  varchar(191),
+  claim_token varchar(191),              -- this claim; the row is deleted by it
+  claimed_at  bigint,                    -- lease stamp, renewed while the run is in flight
+  created_at  bigint       NOT NULL
+);
 ```
 
 `started_at` is what makes [queue-wait](/docs/observability/dashboard) work over this transport: the
@@ -114,6 +125,16 @@ A worker claims a batch atomically, runs each task outside the lock, then record
 The engine side mirrors it on the results table: claim → deliver to the suspended `ctx.step` →
 `DELETE`. Delivery is at-least-once (a crash between insert-result and delete-task can re-run a
 handler), so **handlers should be idempotent**, keyed on `step_id`.
+
+### Run queue
+
+Engines queue the runs they start in `<prefix>_transport_runs`, and every driving instance polls it:
+it claims up to 50 rows at a time for its namespace with the same `FOR UPDATE SKIP LOCKED`
+transaction (highest `priority`, then oldest), at most 256 runs in flight per instance, renews the
+lease of the rows it holds and deletes a row by its `claim_token` once the run's turn settles.
+Queueing a run whose row exists is an upsert that clears the claim (`ON CONFLICT DO UPDATE` /
+`ON DUPLICATE KEY UPDATE`): a run waiting is not queued twice, and one queued again while an instance
+holds its row is taken once more instead of being deleted with it.
 
 ### Dialect notes
 

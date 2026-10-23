@@ -805,8 +805,8 @@ runs to time out their lease.
 instances over the control plane, without polling:
 
 ```ts
-// Wire a worker to pick up a run the instant another pod enqueues it. `runEnqueued` is bounded by
-// `localRunConcurrency` and skips a run another instance already took.
+// Wire a worker to pick up a run the instant another pod enqueues it. `runEnqueued` is bounded and
+// skips a run another instance already took.
 const stopEnqueued = engine.onEnqueued((runId) => engine.runEnqueued(runId));
 
 // Cooperative cancellation: abort in-flight work instead of finishing it just to

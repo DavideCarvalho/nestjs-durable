@@ -329,9 +329,9 @@ describe('the instance hosting a wide fan', () => {
     expect(parentTurns).toBeLessThanOrEqual(3);
   }, 60_000);
 
-  it('executes at most localRunConcurrency runs of its own at once', async () => {
+  it('executes at most 256 runs of its own at once, with no option to set', async () => {
     const store = new InMemoryStateStore();
-    const engine = new WorkflowEngine({ store, reconcileMs: 0, localRunConcurrency: 8 });
+    const engine = new WorkflowEngine({ store, reconcileMs: 0 });
     let active = 0;
     let peak = 0;
     engine.register('child', '1', async (ctx) =>
@@ -350,14 +350,15 @@ describe('the instance hosting a wide fan', () => {
         (
           await ctx.all<number>(
             'child',
-            Array.from({ length: 120 }, () => ({})),
+            Array.from({ length: 600 }, () => ({})),
           )
         ).length,
     );
     await engine.start('parent', {}, 'p');
-    await until(async () => (await store.getRun('p'))?.status === 'completed', 5000);
-    expect((await store.getRun('p'))?.output).toBe(120);
-    expect(peak).toBeLessThanOrEqual(8);
+    await until(async () => (await store.getRun('p'))?.status === 'completed', 10_000);
+    expect((await store.getRun('p'))?.output).toBe(600);
+    expect(peak).toBeLessThanOrEqual(256);
+    expect(peak).toBeGreaterThan(100);
   });
 
   it('runEnqueued skips a run another instance already took', async () => {

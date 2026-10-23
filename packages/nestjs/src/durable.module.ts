@@ -303,14 +303,6 @@ export interface DurableModuleOptions {
    */
   blockedPollMs?: number;
   /**
-   * How many runs a driving instance executes in-process at once when it picks them up itself: the
-   * runs it starts (a `ctx.all` fan's children included) and the runs other instances announce as
-   * enqueued. Past it, run ids wait in memory; the runs stay `pending` in the store, so another
-   * instance can take them. Defaults to 256; `Infinity` removes the bound. See
-   * `WorkflowEngineDeps.localRunConcurrency`. Operator only.
-   */
-  localRunConcurrency?: number;
-  /**
    * Persist a `running` checkpoint when a local step's body begins, so an in-flight step survives a
    * dashboard reload. Defaults to `true`; set `false` on hot paths with many short local steps to
    * halve their checkpoint writes. See `WorkflowEngineDeps.trackStepStart`. Operator only.
@@ -827,7 +819,6 @@ export class DurableModule {
               timerBatchSize: options.timerBatchSize,
               eventBufferTtlMs: options.eventBufferTtlMs,
               blockedPollMs: options.blockedPollMs,
-              localRunConcurrency: options.localRunConcurrency,
               trackStepStart: options.trackStepStart,
               instanceId: options.instanceId,
               namespace: options.namespace,

@@ -7,3 +7,4 @@ export * from './state-store-conformance';
 export * from './steps';
 export * from './transport-conformance';
 export * from './checkpoint-aggregation-contract';
+export * from './run-dispatch-contract';
