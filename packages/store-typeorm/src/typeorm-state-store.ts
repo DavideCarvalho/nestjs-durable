@@ -329,6 +329,17 @@ export class TypeOrmStateStore implements StateStore {
     return e ? fromCheckpointEntity(e) : null;
   }
 
+  async getCheckpoints(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const unique = [...new Set(seqs)];
+    const rows: StepCheckpointEntity[] = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      rows.push(
+        ...(await this.checkpoints().findBy({ runId, seq: In(unique.slice(at, at + 500)) })),
+      );
+    }
+    return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointEntity);
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     // upsert = INSERT ... ON CONFLICT DO UPDATE on the (runId, seq) key — drops the pre-SELECT that
     // `.save()` does on each write. JSON column transformers still apply for upsert.

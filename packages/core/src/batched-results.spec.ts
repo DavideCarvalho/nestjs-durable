@@ -7,8 +7,8 @@ import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 /**
  * A run's step results are settled in batches: the results that arrive while one batch is being
- * written are written together by the next, and the fan's barrier is asked once per batch. These
- * specs pin what that must not change: each step settles once, the parent wakes once per settled
+ * written are written together by the next, and the fan's barrier is asked by a batch with none of
+ * the fan's results queued behind it. These specs pin what that must not change: each step settles once, the parent wakes once per settled
  * wave, failures still wake it, and a result is acknowledged only after its write committed.
  */
 
@@ -322,6 +322,81 @@ describe('batched step results', () => {
     await until(async () => (await store.getRun('p'))?.status === 'completed');
     expect(calls.get('saveCheckpointIfPending')).toBe(40);
     expect(calls.get('countCheckpoints')).toBe(1);
+  });
+
+  /** A store whose batched write waits for `open()`, so a test can queue results behind a batch. */
+  class GatedStore extends InMemoryStateStore {
+    open?: () => void;
+    gate = new Promise<void>((resolve) => {
+      this.open = resolve;
+    });
+    failReads = new Set<number>();
+    async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+      await this.gate;
+      return super.saveCheckpointsIfPending(checkpoints);
+    }
+    async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
+      if (this.failReads.delete(seq)) throw new Error('connection lost');
+      return super.getCheckpoint(runId, seq);
+    }
+  }
+
+  it('a batch with a result of its fan queued behind it leaves the barrier to that result', async () => {
+    const { store, calls } = counting(new GatedStore());
+    const { transport, engine, register, turns } = setup(store);
+    register(async (ctx) => ctx.all(processLine, lines(20)));
+    await engine.start('fan', {}, 'p');
+    await until(() => transport.dispatched.length === 20);
+    await until(async () => (await store.getRun('p'))?.status === 'suspended');
+    calls.clear();
+    const tasks = transport.take();
+    const first = tasks[0] as RemoteTask;
+    const deliveries = tasks.map((t) => transport.deliver(ok(t)));
+    // Queued while the batch holding every step is written: a redelivery of a settled step.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const redelivered = transport.deliver(ok(first, 'late copy'));
+    store.open?.();
+    await Promise.all([...deliveries, redelivered]);
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+    expect((await store.getRun('p'))?.output).toEqual(lines(20).map(({ i }) => i * 10));
+    expect(calls.get('countCheckpoints')).toBe(1);
+    expect(turns()).toBe(2);
+  });
+
+  it('a result queued for a seq outside the fan does not hold back its barrier', async () => {
+    const store = new GatedStore();
+    const { transport, engine, register } = setup(store);
+    register(async (ctx) => ctx.all(processLine, lines(10)));
+    await engine.start('fan', {}, 'p');
+    await until(() => transport.dispatched.length === 10);
+    await until(async () => (await store.getRun('p'))?.status === 'suspended');
+    const deliveries = transport.take().map((t) => transport.deliver(ok(t)));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const stray = transport.deliver({ runId: 'p', seq: 999, stepId: 'p:999', status: 'completed' });
+    store.open?.();
+    await Promise.all([...deliveries, stray]);
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+  });
+
+  it('the queued result the barrier was left to fails, and its redelivery opens it', async () => {
+    const store = new GatedStore();
+    const { transport, engine, register } = setup(store);
+    register(async (ctx) => ctx.all(processLine, lines(10)));
+    await engine.start('fan', {}, 'p');
+    await until(() => transport.dispatched.length === 10);
+    await until(async () => (await store.getRun('p'))?.status === 'suspended');
+    const tasks = transport.take();
+    const first = tasks[0] as RemoteTask;
+    const deliveries = tasks.map((t) => transport.deliver(ok(t)));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    store.failReads.add(first.seq);
+    const redelivered = transport.deliver(ok(first));
+    store.open?.();
+    await Promise.all(deliveries);
+    await expect(redelivered).rejects.toThrow('connection lost');
+    expect((await store.getRun('p'))?.status).toBe('suspended');
+    await transport.deliver(ok(first));
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
   });
 
   it('two instances settling halves of a fan each settle every step once and complete it', async () => {

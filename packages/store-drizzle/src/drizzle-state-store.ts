@@ -300,6 +300,25 @@ export class DrizzleStateStore implements StateStore {
     return rows[0] ? fromCheckpointRow(rows[0]) : null;
   }
 
+  async getCheckpoints(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const unique = [...new Set(seqs)];
+    const rows: (typeof stepCheckpoints.$inferSelect)[] = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      rows.push(
+        ...(await this.db
+          .select()
+          .from(stepCheckpoints)
+          .where(
+            and(
+              eq(stepCheckpoints.runId, runId),
+              inArray(stepCheckpoints.seq, unique.slice(at, at + 500)),
+            ),
+          )),
+      );
+    }
+    return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointRow);
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     const row = toCheckpointRow(checkpoint);
     await this.db

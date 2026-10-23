@@ -90,6 +90,13 @@ const RESULT_JOB_OPTIONS = {
 
 // Default `pingIntervalMs` (see `BullMQTransportOptions`) for the shared subscriber watchdog.
 const DEFAULT_PING_INTERVAL_MS = 30_000;
+/**
+ * The fewest step results the results consumer works on at once. Handing one over is cheap: the
+ * engine writes one run's waiting results together and asks a fan's barrier once they are written,
+ * so the more of a wide fan's results are in flight here, the fewer writes settle them. With only a
+ * few in flight, a wide fan's results wait in Redis while its steps are already done.
+ */
+const RESULT_CONSUMER_CONCURRENCY = 512;
 /** The largest delay `setTimeout`/`setInterval` honour (a signed 32-bit int); above it Node uses 1ms. */
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 // How long a single watchdog PING may take before its subscriber connection is presumed dead.
@@ -358,11 +365,11 @@ export interface BullMQTransportOptions {
    */
   stepTimeoutMs?: number;
   /**
-   * How many step results this instance handles at once from the results queue. Each result
-   * settles its checkpoint and resumes its run inline, so with the default of 1 a pod drives one
-   * run turn at a time off results, and a wide fan's results queue up behind it. Raising it lets
-   * results of different runs proceed in parallel; the engine still handles one run's results in
-   * order on this instance, so a run never gets two concurrent turns from it. Default 1.
+   * The most step results this instance handles at once from the results queue, when above the
+   * built-in 512. Results of one run are settled together and of different runs in parallel; the
+   * engine still handles one run's results in order on this instance, so a run never gets two
+   * concurrent turns from it. Rarely worth setting: the built-in value already keeps a wide fan's
+   * results flowing.
    */
   resultConcurrency?: number;
 }
@@ -467,8 +474,10 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.stepTimeoutMs = options.stepTimeoutMs;
     const results = options.resultConcurrency;
-    this.resultConcurrency =
-      results !== undefined && Number.isFinite(results) && results >= 1 ? Math.floor(results) : 1;
+    this.resultConcurrency = Math.max(
+      RESULT_CONSUMER_CONCURRENCY,
+      results !== undefined && Number.isFinite(results) && results >= 1 ? Math.floor(results) : 1,
+    );
   }
 
   /**

@@ -121,11 +121,11 @@ DurableModule.forRootAsync({
 });
 ```
 
-`BullMQTransport` has two concurrency knobs. `concurrency` (default `1`; a number, `'adaptive'`, or
+`BullMQTransport`'s `concurrency` (default `1`; a number, `'adaptive'`, or
 `{ mode: 'adaptive', min, max, ... }`) is how many TASKS a worker runs at once from each step queue.
-`resultConcurrency` (default `1`) is how many step RESULTS the engine side handles at once. Raise it
-for wide fans; one run's results still resume it in order on an instance. A non-finite or sub-1
-`resultConcurrency` falls back to `1`.
+The engine side handles up to 512 step RESULTS at once per instance and settles one run's results in
+batches, so wide fans need no result tuning; `resultConcurrency` only raises that limit above 512.
+One run's results still resume it in order on an instance.
 
 ### Split API pods from worker pods
 

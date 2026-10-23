@@ -6813,6 +6813,28 @@ export class WorkflowEngine {
     return settled.map((s) => (s.status === 'fulfilled' ? s.value : { error: s.reason }));
   }
 
+  /**
+   * The checkpoints of one run at distinct `seqs`, each as its own outcome: one
+   * {@link StateStore.getCheckpoints} call when the store has it, else one read each. The batch
+   * call rejecting falls back to one read each, so a failing read fails only its own entry.
+   */
+  private async readCheckpoints(
+    runId: string,
+    seqs: number[],
+  ): Promise<PromiseSettledResult<StepCheckpoint | null>[]> {
+    if (seqs.length > 1 && this.store.getCheckpoints) {
+      try {
+        const bySeq = new Map(
+          (await this.store.getCheckpoints(runId, seqs)).map((cp) => [cp.seq, cp]),
+        );
+        return seqs.map((seq) => ({ status: 'fulfilled', value: bySeq.get(seq) ?? null }));
+      } catch {
+        // Fall through: read them one by one.
+      }
+    }
+    return Promise.allSettled(seqs.map((seq) => this.store.getCheckpoint(runId, seq)));
+  }
+
   /** Enqueue a remote step task to its worker group via the transport pool. Shared by the initial
    *  dispatch, the opt-in self-heal re-dispatch (see `remoteRedispatchMs`), and the explicit
    *  {@link redispatchPending}. Carries the current trace/context so a re-dispatch is traceable. */
@@ -6869,9 +6891,10 @@ export class WorkflowEngine {
    *
    * Results of one run are settled in batches: the first starts a batch, and the ones that arrive
    * while it is being written form the next. Under load a wide fan's results are written by one
-   * {@link StateStore.saveCheckpointsIfPending} call per batch, and the fan's barrier is asked once
-   * per batch, not once per result. A result resolves only once its own write has committed, so the
-   * transport acknowledges nothing that is not durable yet.
+   * {@link StateStore.saveCheckpointsIfPending} call per batch, and the fan's barrier is asked only
+   * by a batch with no more of the fan's results queued behind it. A result resolves only once its
+   * own write has committed, so the transport acknowledges nothing that is not durable yet. How
+   * large a batch gets is bounded by how many results the transport hands over at once.
    */
   private completeRemoteResult(result: StepResult): Promise<boolean> {
     return new Promise((resolve, reject) => {
@@ -6898,6 +6921,7 @@ export class WorkflowEngine {
         outcomes = await this.completeRemoteResults(
           runId,
           batch.map((q) => q.result),
+          (from, to) => queue.some(({ result }) => result.seq >= from && result.seq <= to),
         );
       } catch (err) {
         outcomes = batch.map(() => ({ error: err }));
@@ -6916,10 +6940,16 @@ export class WorkflowEngine {
    * Settle a batch of one run's step results. At most one of them resolves `true` (resume the run):
    * that resume replays every write of the batch, so a second would only replay it again. A result
    * whose read or write failed resolves its error, and the transport redelivers just that one.
+   *
+   * `queuedIn(from, to)` says whether a result for a seq in that range is already waiting for this
+   * run's next batch on this instance. A fan with one waiting is not asked its barrier: that result
+   * asks it once its own batch is written (as a settle, or as a redelivery of a settled step), so
+   * under a backlog the barrier is read once per drained queue rather than once per batch.
    */
   private async completeRemoteResults(
     runId: string,
     results: StepResult[],
+    queuedIn: (from: number, to: number) => boolean = () => false,
   ): Promise<ResultOutcome[]> {
     const outcomes: ResultOutcome[] = results.map(() => false);
     // A second copy of a result in the same batch is a duplicate delivery: dropped, like a late one.
@@ -6929,8 +6959,9 @@ export class WorkflowEngine {
       seen.add(r.seq);
       return [i];
     });
-    const reads = await Promise.allSettled(
-      live.map((i) => this.store.getCheckpoint(runId, (results[i] as StepResult).seq)),
+    const reads = await this.readCheckpoints(
+      runId,
+      live.map((i) => (results[i] as StepResult).seq),
     );
     const pending: { index: number; cp: StepCheckpoint }[] = [];
     // Results whose step is already settled: a redelivery. Usually of a result whose resume already
@@ -6948,7 +6979,7 @@ export class WorkflowEngine {
     });
     if (pending.length === 0) {
       if (resettled.length === 0) return outcomes;
-      return this.resumeForRedelivered(runId, resettled, outcomes);
+      return this.resumeForRedelivered(runId, resettled, outcomes, queuedIn);
     }
     // A result settling a step frees its flow-control slot (no-op if it wasn't queued). Done before
     // the finished-run check below, so a cancellation can't leak the slot. Fire-and-forget: the slot
@@ -6999,7 +7030,7 @@ export class WorkflowEngine {
     const barriers = new Map<number, Promise<boolean>>();
     let carrier: number | undefined;
     for (const { index, cp, result } of settled) {
-      if (!(await this.stepFanStillRunning(cp, result, barriers))) carrier = index;
+      if (!(await this.stepFanStillRunning(cp, result, barriers, queuedIn))) carrier = index;
     }
     if (carrier !== undefined) outcomes[carrier] = true;
     return outcomes;
@@ -7014,6 +7045,7 @@ export class WorkflowEngine {
     runId: string,
     resettled: { index: number; cp: StepCheckpoint }[],
     outcomes: ResultOutcome[],
+    queuedIn: (from: number, to: number) => boolean,
   ): Promise<ResultOutcome[]> {
     const run = await this.store.getRun(runId);
     if (run?.status !== 'suspended') return outcomes;
@@ -7025,7 +7057,7 @@ export class WorkflowEngine {
         stepId: cp.stepId ?? stepId(runId, cp.seq),
         status: cp.status === 'failed' ? 'failed' : 'completed',
       };
-      if (!(await this.stepFanStillRunning(cp, asResult, barriers))) {
+      if (!(await this.stepFanStillRunning(cp, asResult, barriers, queuedIn))) {
         outcomes[index] = true;
         break;
       }
@@ -7039,22 +7071,27 @@ export class WorkflowEngine {
    * retry needs the parent to schedule it). Without it every result would replay the whole parent,
    * which makes a fan of N steps cost O(N²) checkpoint reads. `barriers` holds the answer per fan
    * for the rest of a batch. A barrier that cannot be read counts as open: a spare resume replays and
-   * re-suspends, a lost one strands the run.
+   * re-suspends, a lost one strands the run. A fan with a result waiting in `queuedIn` is left to
+   * that result (see {@link completeRemoteResults}).
    */
   private async stepFanStillRunning(
     cp: StepCheckpoint,
     result: StepResult,
     barriers: Map<number, Promise<boolean>>,
+    queuedIn: (from: number, to: number) => boolean,
   ): Promise<boolean> {
     const fan = parseStepFanGroup(cp.parallelGroup);
     if (!fan) return false;
     if (result.status === 'failed') return false;
     let closed = barriers.get(fan.firstSeq);
     if (!closed) {
-      closed = this.stepFanPending(result.runId, fan.firstSeq, fan.firstSeq + fan.size - 1).then(
-        (pending) => pending > 0,
-        () => false,
-      );
+      const lastSeq = fan.firstSeq + fan.size - 1;
+      closed = queuedIn(fan.firstSeq, lastSeq)
+        ? Promise.resolve(true)
+        : this.stepFanPending(result.runId, fan.firstSeq, lastSeq).then(
+            (pending) => pending > 0,
+            () => false,
+          );
       barriers.set(fan.firstSeq, closed);
     }
     if (await closed) return true;
