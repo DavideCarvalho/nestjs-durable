@@ -9,7 +9,10 @@ import {
 } from './buffered-child-signals';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints';
 import {
+  CHILD_CANCELLED,
   type Completion,
+  cancelledCompletion,
+  childCompletion,
   completionError,
   failedCompletion,
   isFailedCompletion,
@@ -419,30 +422,6 @@ const BUFFERED_SWEEP_PAGES_PER_CALL = 4;
 const BUFFERED_SWEEP_REST_MS = 10 * 60_000;
 /** How many finished children `deliverFinishedChildren` settles at once. */
 const DELIVER_CHUNK = 50;
-
-/**
- * The completion a finished child delivers to its parent (see `settleRun`), or undefined while it
- * is not finished. Only `completed` and `failed` notify a parent.
- */
-function childCompletion(child: WorkflowRun): Completion<unknown> | undefined {
-  if (child.status === 'completed') return { ok: true, value: child.output };
-  if (child.status === 'failed') return failedCompletion(child.error ?? { message: 'failed' });
-  if (child.status === 'dead') return failedCompletion(child.error ?? { message: 'dead' });
-  if (child.status === 'cancelled') return cancelledCompletion(child.error);
-  return undefined;
-}
-
-/** Code of the failure a cancelled child delivers to its parent (see {@link cancelledCompletion}). */
-const CHILD_CANCELLED = 'cancelled';
-
-/**
- * The failure a cancelled child delivers to its parent: its own error (`cancelled`, or the
- * execution timeout that cancelled it), coded `cancelled` unless it carries a code already.
- */
-function cancelledCompletion(error: StepError | undefined): Completion<never> {
-  const base = error ?? { message: 'cancelled' };
-  return failedCompletion({ ...base, code: base.code ?? CHILD_CANCELLED });
-}
 
 /** The most results of one run settled by one batched write (see `completeRemoteResult`). */
 const RESULT_BATCH_MAX = 256;

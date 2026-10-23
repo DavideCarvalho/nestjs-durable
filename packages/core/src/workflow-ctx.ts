@@ -2,7 +2,7 @@ import { currentStepScope, runInStepScope } from './ambient-ctx';
 import { runInStepLogger } from './ambient-step';
 import { backoffDelay } from './backoff';
 import { instantCheckpoint } from './checkpoints';
-import { type Completion, completionError, unwrapCompletion } from './completion';
+import { type Completion, childCompletion, completionError, unwrapCompletion } from './completion';
 import { parseDuration } from './duration';
 import {
   ContinueAsNew,
@@ -49,6 +49,7 @@ import type {
   StepOptions,
   StepUndo,
   WorkflowCtx,
+  WorkflowRun,
 } from './interfaces';
 import { codeAndDetails } from './on-error';
 import { breakpointToken } from './protocol';
@@ -682,8 +683,16 @@ export function createWorkflowCtx(
         }),
       );
     }
-    if (!(await store.getRun(id)))
+    const childRun = await store.getRun(id);
+    if (!childRun) {
       host.startChild(workflowName(workflow), input, id, priority, version);
+    } else {
+      // Joining a child that already finished: settle it now from its row.
+      const done = (
+        await settleFinishedChildren([{ id, seq: current }], new Map([[id, childRun]]))
+      ).get(id);
+      if (done) return unwrapCompletion<T>(done, `child "${id}"`);
+    }
     throw new WorkflowSuspended(
       undefined,
       fanJoin([{ waiterPrefix: `child:${id}`, checkpointPrefix: `signal:child:${id}` }]),
@@ -719,186 +728,203 @@ export function createWorkflowCtx(
     const group = allGroup(firstSeq, inputs.length, mode);
     const waveOf = (i: number) => (waves ? Math.floor(i / waves.waveSize) : undefined);
     const id = (i: number) => allChildId(runId, firstSeq, i, waveOf(i));
-    const { checkpoints: existing, folded } = await readFan(positions, [
-      allWait(runId, firstSeq).checkpointPrefix,
-      allFoldedName(runId, firstSeq),
-    ]);
-    // The unbounded fan is a single wave.
-    const waveCount = waves ? Math.ceil(inputs.length / waves.waveSize) : 1;
-    const waveItems = (k: number): number[] => {
-      if (!waves) return inputs.map((_, i) => i);
-      const from = k * waves.waveSize;
-      return inputs.map((_, i) => i).slice(from, from + waves.waveSize);
-    };
-
-    // failFast: bail the moment any already-completed item is a failed Completion.
-    if (mode === 'failFast') {
-      const failure = (i: number) => {
-        const cp = existing[i];
-        const c =
-          cp?.status === 'completed'
-            ? (cp.output as { ok?: boolean; error?: string; code?: string })
-            : null;
-        return c && c.ok === false ? c : null;
+    // Re-evaluated after settling children that had already finished (see below).
+    for (;;) {
+      const { checkpoints: existing, folded } = await readFan(positions, [
+        allWait(runId, firstSeq).checkpointPrefix,
+        allFoldedName(runId, firstSeq),
+      ]);
+      // The unbounded fan is a single wave.
+      const waveCount = waves ? Math.ceil(inputs.length / waves.waveSize) : 1;
+      const waveItems = (k: number): number[] => {
+        if (!waves) return inputs.map((_, i) => i);
+        const from = k * waves.waveSize;
+        return inputs.map((_, i) => i).slice(from, from + waves.waveSize);
       };
-      // The failure the fan reports. A sibling this fan cancelled reports itself cancelled once it
-      // settles, possibly at a lower index; the original failure must stay the one a replay throws.
-      const first = (cancelled: boolean) =>
-        inputs.findIndex((_, i) => {
-          const c = failure(i);
-          return c !== null && (c.code === 'cancelled') === cancelled;
-        });
-      const i = first(false) !== -1 ? first(false) : first(true);
-      const c = i === -1 ? null : failure(i);
-      if (c) {
-        // Cancel every sibling that hasn't completed yet — plain cancel, no saga undo. Best-effort:
-        // a sibling mid-step only observes the cancellation at its NEXT checkpoint (it isn't
-        // force-killed mid-synchronous-execution), so a fast-enough sibling can still slip through
-        // and complete before it notices. `cancelChild` is deferred (like `startChild`), and
-        // cancelling an already-terminal/cancelled run is a no-op, so replaying this branch after a
-        // resume (which re-executes this loop and re-issues the same cancels) is safe.
-        for (let j = 0; j < inputs.length; j += 1) {
-          if (j !== i && existing[j]?.status !== 'completed') host.cancelChild?.(id(j));
-        }
-        throw new GatherError(
-          [{ index: i, id: id(i), error: c.error ?? 'unknown' }],
-          inputs.length,
-        );
-      }
-    }
 
-    // Fold every wave whose children all succeeded into one checkpoint, so the parent's later turns
-    // load one row for it instead of one per child. A wave with a failure keeps its per-child
-    // checkpoints: requeue resets exactly those to retry the failed children.
-    if (store.compactCheckpoints && inputs.length >= FOLD_MIN_FAN) {
-      for (let k = 0; k < waveCount; k += 1) {
-        const items = waveItems(k);
-        const first = items[0] as number;
-        const last = items[items.length - 1] as number;
-        if (folded[first]) continue;
-        const values: unknown[] = [];
-        for (const i of items) {
-          const c = existing[i]?.status === 'completed' ? existing[i]?.output : undefined;
-          if (!c || typeof c !== 'object' || (c as { ok?: boolean }).ok !== true) break;
-          values.push((c as { value?: unknown }).value);
-        }
-        if (values.length < items.length) continue;
-        const into = instantCheckpoint({
-          runId,
-          seq: positions[first] as number,
-          name: allFoldedName(runId, firstSeq, waves ? k : undefined),
-          kind: 'signal',
-          output: { from: first, values } satisfies FoldedChildren,
-          parallelGroup: group,
-        });
-        await store.compactCheckpoints(
-          runId,
-          positions[first] as number,
-          positions[last] as number,
-          into,
-        );
-        for (const i of items) replay?.delete(positions[i] as number);
-        replay?.set(into.seq, into);
-      }
-    }
-
-    // A wave has been sent once any of its children has a checkpoint. Send more waves until
-    // `maxWaves` are unsettled, in order.
-    const sent = (k: number) => waveItems(k).some((i) => existing[i]);
-    const settled = (k: number) => waveItems(k).every((i) => existing[i]?.status === 'completed');
-    const active: number[] = [];
-    let unsettled = 0;
-    for (let k = 0; k < waveCount; k += 1) {
-      if (settled(k)) continue;
-      if (sent(k) || unsettled < (waves?.maxWaves ?? 1)) {
-        active.push(k);
-        unsettled += 1;
-      }
-    }
-
-    if (active.length > 0) {
-      const toRegister: number[] = [];
-      const toEnsure: number[] = [];
-      for (const k of active) {
-        for (const i of waveItems(k)) {
+      // failFast: bail the moment any already-completed item is a failed Completion.
+      if (mode === 'failFast') {
+        const failure = (i: number) => {
           const cp = existing[i];
-          if (cp?.status === 'completed') continue;
-          // A placeholder proves its waiter was put (registerChildWaits writes the waiter first), so
-          // a replay never re-puts it. A child that settled after this execution's snapshot has
-          // already consumed its waiter; re-putting it would leave one nothing ever takes, and the
-          // join barrier would wait on it forever.
-          (cp ? toEnsure : toRegister).push(i);
+          const c =
+            cp?.status === 'completed'
+              ? (cp.output as { ok?: boolean; error?: string; code?: string })
+              : null;
+          return c && c.ok === false ? c : null;
+        };
+        // The failure the fan reports. A sibling this fan cancelled reports itself cancelled once it
+        // settles, possibly at a lower index; the original failure must stay the one a replay throws.
+        const first = (cancelled: boolean) =>
+          inputs.findIndex((_, i) => {
+            const c = failure(i);
+            return c !== null && (c.code === 'cancelled') === cancelled;
+          });
+        const i = first(false) !== -1 ? first(false) : first(true);
+        const c = i === -1 ? null : failure(i);
+        if (c) {
+          // Cancel every sibling that hasn't completed yet — plain cancel, no saga undo. Best-effort:
+          // a sibling mid-step only observes the cancellation at its NEXT checkpoint (it isn't
+          // force-killed mid-synchronous-execution), so a fast-enough sibling can still slip through
+          // and complete before it notices. `cancelChild` is deferred (like `startChild`), and
+          // cancelling an already-terminal/cancelled run is a no-op, so replaying this branch after a
+          // resume (which re-executes this loop and re-issues the same cancels) is safe.
+          for (let j = 0; j < inputs.length; j += 1) {
+            if (j !== i && existing[j]?.status !== 'completed') host.cancelChild?.(id(j));
+          }
+          throw new GatherError(
+            [{ index: i, id: id(i), error: c.error ?? 'unknown' }],
+            inputs.length,
+          );
         }
       }
-      for (let at = 0; at < toRegister.length; at += FAN_CHUNK) {
-        const chunk = toRegister.slice(at, at + FAN_CHUNK);
-        const entries = chunk.map((i) => ({
-          // Carry the fan `group` onto the waiter too: the child's terminal `signal:child:`
-          // checkpoint is (re)written by engine.signal when the child notifies the parent,
-          // OVERWRITING the running placeholder at the same seq — so without this the resolved
-          // checkpoint would lose the group and the dashboard would render the resolved fan as a
-          // sequential chain.
-          waiter: {
-            token: `child:${id(i)}`,
-            runId,
-            seq: positions[i] as number,
-            parallelGroup: group,
-          },
-          checkpoint: instantCheckpoint({
-            runId,
-            seq: positions[i] as number,
-            name: `signal:child:${id(i)}`,
-            kind: 'signal',
-            status: 'running',
-            parallelGroup: group,
-          }),
-        }));
-        await registerChildWaits(entries);
-        // `start` is idempotent by id, so a child a crashed turn already started is not doubled.
-        for (const i of chunk) host.startChild(name, inputs[i], id(i));
-      }
-      // A placeholder written by a turn that crashed before the deferred start ran: start it now.
-      // One batched read for the lot, not one per child: a replay of a wide fan has thousands.
-      if (toEnsure.length > 0) {
-        // A child whose read failed is not started blind; the next turn looks again.
-        const { runs: started, unread } = await readRunsByIds(
-          store,
-          toEnsure.map((i) => id(i)),
-        );
-        const skip = new Set(unread);
-        for (const i of toEnsure) {
-          if (!started.has(id(i)) && !skip.has(id(i))) host.startChild(name, inputs[i], id(i));
-        }
-      }
-    }
-    if (active.length > 0) {
-      throw new WorkflowSuspended(
-        undefined,
-        fanJoin(active.map((k) => allWait(runId, firstSeq, waves ? k : undefined))),
-      );
-    }
 
-    // All resolved: build outputs in INPUT order, aggregating any failures.
-    const outputs: unknown[] = [];
-    const results: Settled<unknown>[] = [];
-    const failures: GatherItemFailure[] = [];
-    for (let i = 0; i < inputs.length; i += 1) {
-      const c = existing[i]?.output as Completion<unknown> | null;
-      if (c && typeof c === 'object' && 'ok' in c && c.ok === false) {
-        const { message, ...rest } = completionError({ ...c, error: c.error ?? 'unknown' });
-        const failure = { id: id(i), error: message, ...rest };
-        failures.push({ index: i, ...failure });
-        results.push({ status: 'rejected', ...failure });
-        outputs.push(undefined);
-      } else {
-        const value = (c as { value?: unknown } | null)?.value;
-        results.push({ status: 'fulfilled', value });
-        outputs.push(value);
+      // Fold every wave whose children all succeeded into one checkpoint, so the parent's later turns
+      // load one row for it instead of one per child. A wave with a failure keeps its per-child
+      // checkpoints: requeue resets exactly those to retry the failed children.
+      if (store.compactCheckpoints && inputs.length >= FOLD_MIN_FAN) {
+        for (let k = 0; k < waveCount; k += 1) {
+          const items = waveItems(k);
+          const first = items[0] as number;
+          const last = items[items.length - 1] as number;
+          if (folded[first]) continue;
+          const values: unknown[] = [];
+          for (const i of items) {
+            const c = existing[i]?.status === 'completed' ? existing[i]?.output : undefined;
+            if (!c || typeof c !== 'object' || (c as { ok?: boolean }).ok !== true) break;
+            values.push((c as { value?: unknown }).value);
+          }
+          if (values.length < items.length) continue;
+          const into = instantCheckpoint({
+            runId,
+            seq: positions[first] as number,
+            name: allFoldedName(runId, firstSeq, waves ? k : undefined),
+            kind: 'signal',
+            output: { from: first, values } satisfies FoldedChildren,
+            parallelGroup: group,
+          });
+          await store.compactCheckpoints(
+            runId,
+            positions[first] as number,
+            positions[last] as number,
+            into,
+          );
+          for (const i of items) replay?.delete(positions[i] as number);
+          replay?.set(into.seq, into);
+        }
       }
+
+      // A wave has been sent once any of its children has a checkpoint. Send more waves until
+      // `maxWaves` are unsettled, in order.
+      const sent = (k: number) => waveItems(k).some((i) => existing[i]);
+      const settled = (k: number) => waveItems(k).every((i) => existing[i]?.status === 'completed');
+      const active: number[] = [];
+      let unsettled = 0;
+      for (let k = 0; k < waveCount; k += 1) {
+        if (settled(k)) continue;
+        if (sent(k) || unsettled < (waves?.maxWaves ?? 1)) {
+          active.push(k);
+          unsettled += 1;
+        }
+      }
+
+      let known: ReadonlyMap<string, WorkflowRun> | undefined;
+      if (active.length > 0) {
+        const toRegister: number[] = [];
+        const toEnsure: number[] = [];
+        for (const k of active) {
+          for (const i of waveItems(k)) {
+            const cp = existing[i];
+            if (cp?.status === 'completed') continue;
+            // A placeholder proves its waiter was put (registerChildWaits writes the waiter first), so
+            // a replay never re-puts it. A child that settled after this execution's snapshot has
+            // already consumed its waiter; re-putting it would leave one nothing ever takes, and the
+            // join barrier would wait on it forever.
+            (cp ? toEnsure : toRegister).push(i);
+          }
+        }
+        for (let at = 0; at < toRegister.length; at += FAN_CHUNK) {
+          const chunk = toRegister.slice(at, at + FAN_CHUNK);
+          const entries = chunk.map((i) => ({
+            // Carry the fan `group` onto the waiter too: the child's terminal `signal:child:`
+            // checkpoint is (re)written by engine.signal when the child notifies the parent,
+            // OVERWRITING the running placeholder at the same seq — so without this the resolved
+            // checkpoint would lose the group and the dashboard would render the resolved fan as a
+            // sequential chain.
+            waiter: {
+              token: `child:${id(i)}`,
+              runId,
+              seq: positions[i] as number,
+              parallelGroup: group,
+            },
+            checkpoint: instantCheckpoint({
+              runId,
+              seq: positions[i] as number,
+              name: `signal:child:${id(i)}`,
+              kind: 'signal',
+              status: 'running',
+              parallelGroup: group,
+            }),
+          }));
+          await registerChildWaits(entries);
+          // `start` is idempotent by id, so a child a crashed turn already started is not doubled.
+          for (const i of chunk) host.startChild(name, inputs[i], id(i));
+        }
+        // A placeholder written by a turn that crashed before the deferred start ran: start it now.
+        // One batched read for the lot, not one per child: a replay of a wide fan has thousands.
+        if (toEnsure.length > 0) {
+          // A child whose read failed is not started blind; the next turn looks again.
+          const { runs: started, unread } = await readRunsByIds(
+            store,
+            toEnsure.map((i) => id(i)),
+          );
+          const skip = new Set(unread);
+          for (const i of toEnsure) {
+            if (!started.has(id(i)) && !skip.has(id(i))) host.startChild(name, inputs[i], id(i));
+          }
+          known = started;
+        }
+        // Children that finished before this join (their notification found no waiter) are settled
+        // now, from their rows; then the fan is evaluated again, which may finish it, fail it fast, or
+        // send its next wave.
+        const now = await settleFinishedChildren(
+          [...toRegister, ...toEnsure].map((i) => ({
+            id: id(i),
+            seq: positions[i] as number,
+            parallelGroup: group,
+          })),
+          known,
+        );
+        if (now.size > 0) continue;
+      }
+      if (active.length > 0) {
+        throw new WorkflowSuspended(
+          undefined,
+          fanJoin(active.map((k) => allWait(runId, firstSeq, waves ? k : undefined))),
+        );
+      }
+
+      // All resolved: build outputs in INPUT order, aggregating any failures.
+      const outputs: unknown[] = [];
+      const results: Settled<unknown>[] = [];
+      const failures: GatherItemFailure[] = [];
+      for (let i = 0; i < inputs.length; i += 1) {
+        const c = existing[i]?.output as Completion<unknown> | null;
+        if (c && typeof c === 'object' && 'ok' in c && c.ok === false) {
+          const { message, ...rest } = completionError({ ...c, error: c.error ?? 'unknown' });
+          const failure = { id: id(i), error: message, ...rest };
+          failures.push({ index: i, ...failure });
+          results.push({ status: 'rejected', ...failure });
+          outputs.push(undefined);
+        } else {
+          const value = (c as { value?: unknown } | null)?.value;
+          results.push({ status: 'fulfilled', value });
+          outputs.push(value);
+        }
+      }
+      if (settle) return results;
+      if (failures.length > 0) throw new GatherError(failures, inputs.length);
+      return outputs;
     }
-    if (settle) return results;
-    if (failures.length > 0) throw new GatherError(failures, inputs.length);
-    return outputs;
   };
   const all = <T = unknown>(
     workflow: WorkflowRef | StepRef,
@@ -998,6 +1024,55 @@ export function createWorkflowCtx(
       );
     }
     for (const e of entries) replay?.set(e.checkpoint.seq, e.checkpoint);
+  };
+
+  /**
+   * Settle, in this turn, every child in `awaited` whose run is already terminal: its waiter was
+   * just put, but a child that finished before it found no waiter, and may have left no buffered
+   * completion either (none is kept once the parent could read the child's row instead). Waiting
+   * would leave the parent to the reconcile wake, or forever with reconcile off.
+   *
+   * The waiter decides who delivers: this turn settles a child only if it takes the child's waiter
+   * back itself. If the child's own notification took it first, that notification writes the
+   * checkpoint and resumes the run, so this turn leaves it alone. Returns the completions it wrote,
+   * by child id. `known` holds runs the caller already read.
+   */
+  const settleFinishedChildren = async (
+    awaited: Array<{ id: string; seq: number; parallelGroup?: string | undefined }>,
+    known?: ReadonlyMap<string, WorkflowRun>,
+  ): Promise<Map<string, Completion<unknown>>> => {
+    const settled = new Map<string, Completion<unknown>>();
+    if (awaited.length === 0) return settled;
+    const runs = new Map(known ?? []);
+    const toRead = awaited.filter((a) => !runs.has(a.id)).map((a) => a.id);
+    if (toRead.length > 0) {
+      for (const [id, run] of (await readRunsByIds(store, toRead)).runs) runs.set(id, run);
+    }
+    for (const a of awaited) {
+      const child = runs.get(a.id);
+      const completion = child ? childCompletion(child) : undefined;
+      if (!completion) continue;
+      const token = `child:${a.id}`;
+      const taken = await store.takeSignalWaiter(token);
+      if (!taken) continue;
+      if (taken.runId !== runId || taken.seq !== a.seq) {
+        // Another run's waiter on the same (caller-chosen) token: not ours to settle.
+        await store.putSignalWaiter(taken);
+        continue;
+      }
+      await writeCheckpoint(
+        instantCheckpoint({
+          runId,
+          seq: a.seq,
+          name: `signal:child:${a.id}`,
+          kind: 'signal',
+          output: completion,
+          ...(a.parallelGroup !== undefined ? { parallelGroup: a.parallelGroup } : {}),
+        }),
+      );
+      settled.set(a.id, completion);
+    }
+    return settled;
   };
 
   // Child workflow (fire-and-forget): dispatch it once and return its id WITHOUT suspending. The

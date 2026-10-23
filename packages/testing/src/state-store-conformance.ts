@@ -517,6 +517,38 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await ids()).toEqual(['attr-other', 'chatty-old']);
     });
 
+    t('a parent joining children that already finished settles them from their rows', async () => {
+      const engine = new WorkflowEngine({ store, reconcileMs: 0 });
+      engine.register('j-child', '1', async (_ctx, input) => ({ n: (input as { n: number }).n }));
+      engine.register('j-parent', '1', async (ctx) => {
+        const lone = await ctx.child('j-child', { n: 9 }, 'j-own-id');
+        const fan = await ctx.allSettled('j-child', [{ n: 0 }, { n: 1 }]);
+        return { lone, fan };
+      });
+      // Both finish before the parent exists: their notifications find no waiter.
+      await engine.start('j-child', { n: 9 }, 'j-own-id');
+      await engine.start('j-child', { n: 1 }, 'jp.all.1.1');
+      expect((await engine.waitForRun('j-own-id', { timeoutMs: 20_000 })).status).toBe('completed');
+      expect((await engine.waitForRun('jp.all.1.1', { timeoutMs: 20_000 })).status).toBe(
+        'completed',
+      );
+
+      await engine.start('j-parent', {}, 'jp');
+      const deadline = Date.now() + 20_000;
+      while ((await store.getRun('jp'))?.status !== 'completed') {
+        if (Date.now() > deadline) throw new Error('parent never completed');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect((await store.getRun('jp'))?.output).toEqual({
+        lone: { n: 9 },
+        fan: [
+          { status: 'fulfilled', value: { n: 0 } },
+          { status: 'fulfilled', value: { n: 1 } },
+        ],
+      });
+      await engine.drain(5_000);
+    });
+
     t(
       'engine.purgeRuns deletes a scope with its child subtrees and cancels live runs',
       async () => {
