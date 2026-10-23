@@ -851,7 +851,10 @@ export class BullMQTransport implements Transport, ControlPlane {
     };
     const isNewToken = !this.heartbeatTokens.has(routingToken);
     this.heartbeatTokens.add(routingToken);
-    if (isNewToken) beatOne(routingToken);
+    // A new token means a new step in the descriptor, so EVERY token's copy is rewritten now, not on
+    // the next interval: readers keep whichever copy their SCAN meets first, and a stale one would
+    // leave the new step's heartbeat undeclared and listed as a callable workflow.
+    if (isNewToken) for (const token of this.heartbeatTokens) beatOne(token);
     if (this.workerHeartbeatTimer) return;
     this.workerHeartbeatTimer = setInterval(() => {
       for (const token of this.heartbeatTokens) beatOne(token);

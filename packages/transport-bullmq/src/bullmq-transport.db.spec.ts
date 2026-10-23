@@ -18,12 +18,14 @@ import { BullMQTransport, toBrokerPriority } from './bullmq-transport';
  * remote-step round-trip, the failed-result path, and the control-plane / heartbeat pub/sub are
  * exercised against an actual Redis instead of self-skipping. Run with `pnpm test:db`.
  *
- * Skips cleanly (each case logs once and passes) when Docker is unavailable or `SKIP_TESTCONTAINERS`
- * is set — never fails the suite for a missing daemon. One container shared across the cases.
+ * Uses `DURABLE_TEST_REDIS_URL` (`redis://host:port`) when set; every case keys under its own prefix,
+ * so a shared server is fine. Otherwise skips cleanly (each case logs once and passes) when Docker is
+ * unavailable or `SKIP_TESTCONTAINERS` is set. One container shared across the cases.
  */
 
 const CONTAINER_TIMEOUT = 180_000;
-const skipped = !!process.env.SKIP_TESTCONTAINERS;
+const externalUrl = process.env.DURABLE_TEST_REDIS_URL;
+const skipped = !externalUrl && !!process.env.SKIP_TESTCONTAINERS;
 
 let redis: StartedRedisContainer | undefined;
 let redisError: unknown;
@@ -32,6 +34,11 @@ let connection: { host: string; port: number } | undefined;
 beforeAll(async () => {
   if (skipped) return;
   try {
+    if (externalUrl) {
+      const u = new URL(externalUrl);
+      connection = { host: u.hostname, port: Number(u.port || 6379) };
+      return;
+    }
     redis = await new RedisContainer('redis:7-alpine').start();
     connection = { host: redis.getHost(), port: redis.getFirstMappedPort() };
   } catch (err) {
@@ -228,6 +235,27 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
     // no expiry bookkeeping anywhere in the engine.
     await admin.del(`${prefix}-worker-descriptor:pipeline:py-1`);
     expect(await engine.announcedWorkflows()).toEqual([]);
+
+    await admin.quit();
+    await local.close();
+  }, 30_000);
+
+  it("rewrites every routing token's descriptor copy when a later handle() adds a step", async (ctx) => {
+    const connection = liveConnection(ctx);
+    const prefix = `durtest-${Date.now()}-d`;
+    const admin = new Redis(connection);
+    const local = new BullMQTransport({ connection, prefix, instanceId: 'ts-local' });
+    local.handle('payments.charge-card', async () => ({}));
+    local.handle('payments.refund', async () => ({}));
+
+    // Both copies are written on one connection, the second token's last: once it exists, every
+    // write issued before it has landed too.
+    const refundKey = `${prefix}-worker-descriptor:payments.refund:ts-local`;
+    await waitUntil(async () => (await admin.exists(refundKey)) === 1);
+    for (const token of ['payments.charge-card', 'payments.refund']) {
+      const raw = await admin.get(`${prefix}-worker-descriptor:${token}:ts-local`);
+      expect(JSON.parse(raw ?? '{}').steps).toEqual(['payments.charge-card', 'payments.refund']);
+    }
 
     await admin.quit();
     await local.close();

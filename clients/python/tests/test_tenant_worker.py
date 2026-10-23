@@ -380,3 +380,43 @@ class StartRunTenantDecoupledFromWireTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EveryTokenAdvertisesTheSameDescriptorTest(unittest.IsolatedAsyncioTestCase):
+    """Each routing token publishes its own copy of the descriptor, and a reader keeps whichever copy
+    its SCAN meets first. So every copy must list every name this worker registered: a copy written
+    before a later name was registered would leave that name's heartbeat undeclared, and the
+    control-plane would list a step queue as a callable workflow."""
+
+    async def test_every_token_gets_the_full_descriptor(self):
+        worker = Worker(auto_register=False)
+
+        @worker.workflow("pipeline")
+        def pipeline(_ctx):
+            return None
+
+        @worker.step("extraction:page")
+        def extract(_data):
+            return None
+
+        @worker.step("extraction:merge")
+        def merge(_data):
+            return None
+
+        published: dict = {}
+
+        async def record(connection, prefix, group, controller=None, descriptor=None):
+            published[group] = descriptor.to_wire()
+
+        with _RunnerNamePatches():
+            with patch("durable_worker.redis_runner._start_heartbeat", record):
+                await run_redis_worker(worker, connection="redis://localhost:6379")
+
+        self.assertEqual(
+            sorted(published), ["extraction-merge", "extraction-page", "pipeline"]
+        )
+        copies = list(published.values())
+        for copy in copies:
+            self.assertEqual(copy, copies[0])
+        self.assertEqual(copies[0]["steps"], ["extraction:merge", "extraction:page"])
+        self.assertEqual(copies[0]["workflows"], ["pipeline"])

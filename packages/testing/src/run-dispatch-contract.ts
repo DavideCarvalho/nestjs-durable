@@ -99,18 +99,31 @@ function instances(store: StateStore, transports: Transport[], clock?: () => num
   });
 }
 
-/** Register a fan of `fanSize` children on every instance; each child records who executed it. */
+/**
+ * Register a fan of `fanSize` children on every instance; each child records who executed it.
+ *
+ * With `spreadWithinMs`, a child holds its slot until every instance has started one (or the time is
+ * up). Both instances live in one process, so which consumer claims first is down to scheduling, and
+ * an instance that keeps finding rows can drain the whole fan while its sibling sleeps between polls.
+ * An instance runs at most 256 runs at once and the fan is bigger, so while its children wait the
+ * rest of the fan can only go to the other instance: the split no longer depends on timing.
+ */
 function registerFan(
   all: Instance[],
   fanSize: number,
   ran: Map<number, string[]>,
   settle: boolean,
+  spreadWithinMs?: number,
 ): void {
+  const executors = () => new Set([...ran.values()].map(([first]) => first));
   for (const { name, engine } of all) {
     engine.register('child', '1', async (ctx, input) => {
       const { i } = input as { i: number };
       return ctx.localStep('work', async () => {
         ran.set(i, [...(ran.get(i) ?? []), name]);
+        if (spreadWithinMs !== undefined) {
+          await until(() => executors().size >= all.length, spreadWithinMs).catch(() => undefined);
+        }
         await pause(15);
         return i * 2;
       });
@@ -280,7 +293,7 @@ export function runRunDispatchContract(
           const store = new InMemoryStateStore();
           const all = instances(store, pair);
           const ran = new Map<number, string[]>();
-          registerFan(all, fanSize, ran, settle);
+          registerFan(all, fanSize, ran, settle, timeoutMs / 2);
           try {
             for (const { engine } of all) engine.consumeRuns();
             await all[0]?.engine.start('parent', {}, 'p');
@@ -327,8 +340,11 @@ export function runRunDispatchContract(
           // The broker is back: the poll queues the pending runs again and a consumer takes them.
           a.failing.on = false;
           await engine.runPending();
-          await until(async () => (await store.getRun('lost'))?.status === 'completed', timeoutMs);
-          expect((await store.getRun('kept'))?.status).toBe('completed');
+          // Both were queued by the same poll, but a consumer may take them in either order.
+          await until(async () => {
+            const [lost, kept] = await Promise.all([store.getRun('lost'), store.getRun('kept')]);
+            return lost?.status === 'completed' && kept?.status === 'completed';
+          }, timeoutMs);
           // The broker stays down: the poll runs the run itself.
           a.failing.on = true;
           await engine.start('wf', {}, 'down');

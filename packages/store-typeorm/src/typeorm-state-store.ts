@@ -98,11 +98,17 @@ export interface TypeOrmStateStoreOptions {
    * satisfies it.
    */
   schemaLogger?: DurableSchemaLogger | undefined;
+  /**
+   * MySQL: the largest existing durable table `ensureSchema()` will rebuild for a column type
+   * change at boot; bigger ones are logged for you to run out of band. See
+   * `blockingAlterRowLimit` on `ensureTypeOrmDurableSchema`.
+   */
+  schemaBlockingAlterRowLimit?: number | undefined;
 }
 
 /**
  * TypeORM-backed `StateStore`. Works on any TypeORM driver — Postgres, MySQL, SQLite (tested);
- * timestamps use native datetime columns and `wakeAt` is stored as a datetime too.
+ * timestamps use native datetime columns (MySQL `datetime(6)`) and `wakeAt` is stored as a datetime too.
  */
 export class TypeOrmStateStore implements StateStore {
   constructor(
@@ -111,7 +117,10 @@ export class TypeOrmStateStore implements StateStore {
   ) {}
 
   async ensureSchema(): Promise<void> {
-    await ensureTypeOrmDurableSchema(this.dataSource, { logger: this.options.schemaLogger });
+    await ensureTypeOrmDurableSchema(this.dataSource, {
+      logger: this.options.schemaLogger,
+      blockingAlterRowLimit: this.options.schemaBlockingAlterRowLimit,
+    });
   }
 
   private runs() {

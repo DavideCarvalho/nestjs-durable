@@ -167,4 +167,87 @@ describe.skipIf(mysqlSkipped)('ensureTypeOrmDurableSchema repair warning [real M
     await ensureTypeOrmDurableSchema(dataSource, { logger: after });
     expect(after.messages).toEqual([]);
   });
+  async function freshMysql(): Promise<DataSource> {
+    const ds = new DataSource({ type: 'mysql', url: mysqlUrl, entities: [...ENTITIES] });
+    await ds.initialize();
+    for (const table of ENTITIES.map((e) => e.options.tableName))
+      await ds.query(`DROP TABLE IF EXISTS \`${table}\``);
+    return ds;
+  }
+
+  async function datetimePrecisions(ds: DataSource): Promise<Record<string, number>> {
+    const rows = (await ds.query(
+      "SELECT table_name AS t, column_name AS c, datetime_precision AS p FROM information_schema.columns WHERE table_schema = DATABASE() AND data_type = 'datetime' AND table_name LIKE 'durable\\_%'",
+    )) as Array<{ t: string; c: string; p: number }>;
+    return Object.fromEntries(rows.map((r) => [`${r.t}.${r.c}`, Number(r.p)]));
+  }
+
+  it('creates every timestamp column with sub-second precision', async () => {
+    dataSource = await freshMysql();
+    await ensureTypeOrmDurableSchema(dataSource, { logger: recordingLogger() });
+    const precisions = await datetimePrecisions(dataSource);
+    expect(Object.keys(precisions)).toHaveLength(11);
+    expect(Object.values(precisions).every((p) => p === 6)).toBe(true);
+  });
+
+  it('upgrades second-precision timestamp columns an older version created, keeping nullability', async () => {
+    dataSource = await freshMysql();
+    await ensureTypeOrmDurableSchema(dataSource, { logger: recordingLogger() });
+    await dataSource.query(
+      'ALTER TABLE `durable_workflow_runs` MODIFY `wake_at` datetime NULL, MODIFY `created_at` datetime NOT NULL',
+    );
+    await dataSource.query(
+      'ALTER TABLE `durable_buffered_events` MODIFY `published_at` datetime NOT NULL',
+    );
+
+    const logger = recordingLogger();
+    await ensureTypeOrmDurableSchema(dataSource, { logger });
+    expect(Object.values(await datetimePrecisions(dataSource)).every((p) => p === 6)).toBe(true);
+    expect(logger.messages).toHaveLength(1);
+    expect(logger.messages[0]).toContain(
+      'raised durable_workflow_runs.wake_at, durable_workflow_runs.created_at to datetime(6)',
+    );
+    expect(logger.messages[0]).toContain(
+      'raised durable_buffered_events.published_at to datetime(6)',
+    );
+    const nullability = (await dataSource.query(
+      "SELECT column_name AS c, is_nullable AS n FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'durable_workflow_runs' AND column_name IN ('wake_at', 'created_at') ORDER BY column_name",
+    )) as Array<{ c: string; n: string }>;
+    expect(nullability).toEqual([
+      { c: 'created_at', n: 'NO' },
+      { c: 'wake_at', n: 'YES' },
+    ]);
+
+    const after = recordingLogger();
+    await ensureTypeOrmDurableSchema(dataSource, { logger: after });
+    expect(after.messages).toEqual([]);
+  });
+
+  it('defers the upgrade on a table above the row limit, re-warning on every boot', async () => {
+    dataSource = await freshMysql();
+    await ensureTypeOrmDurableSchema(dataSource, { logger: recordingLogger() });
+    await dataSource.query(
+      'ALTER TABLE `durable_buffered_events` MODIFY `published_at` datetime NOT NULL',
+    );
+    for (const id of ['a', 'b', 'c'])
+      await dataSource.query(
+        "INSERT INTO `durable_buffered_events` (`id`, `name`, `payload`, `published_at`) VALUES (?, 'evt', '1', NOW())",
+        [id],
+      );
+    await dataSource.query('ANALYZE TABLE `durable_buffered_events`');
+
+    for (let boot = 0; boot < 2; boot++) {
+      const logger = recordingLogger();
+      await ensureTypeOrmDurableSchema(dataSource, { logger, blockingAlterRowLimit: 1 });
+      expect((await datetimePrecisions(dataSource))['durable_buffered_events.published_at']).toBe(
+        0,
+      );
+      expect(logger.messages).toHaveLength(1);
+      expect(logger.messages[0]).toContain('did NOT apply');
+      expect(logger.messages[0]).toContain('-- durable_buffered_events, ~3 rows');
+    }
+
+    await ensureTypeOrmDurableSchema(dataSource, { logger: recordingLogger() });
+    expect((await datetimePrecisions(dataSource))['durable_buffered_events.published_at']).toBe(6);
+  });
 });

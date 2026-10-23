@@ -102,11 +102,17 @@ export interface MikroOrmStateStoreOptions {
    * satisfies it.
    */
   schemaLogger?: DurableSchemaLogger | undefined;
+  /**
+   * MySQL: the largest existing durable table `ensureSchema()` will rebuild for a column type
+   * change at boot; bigger ones are logged for you to run out of band. See
+   * `blockingAlterRowLimit` on `ensureMikroOrmDurableSchema`.
+   */
+  schemaBlockingAlterRowLimit?: number | undefined;
 }
 
 /**
  * MikroORM-backed `StateStore`. Works on any MikroORM driver — Postgres, MySQL, SQLite (tested);
- * timestamps and `wakeAt` use native datetime columns. Each operation runs on a forked
+ * timestamps and `wakeAt` use native datetime columns with microsecond precision (MySQL `datetime(6)`). Each operation runs on a forked
  * EntityManager so it owns its unit of work.
  *
  * Pass `opts.scope.namespace` to confine all reads to a single tenant namespace. Omit for the
@@ -145,7 +151,10 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async ensureSchema(): Promise<void> {
-    await ensureMikroOrmDurableSchema(this.orm, { logger: this.opts.schemaLogger });
+    await ensureMikroOrmDurableSchema(this.orm, {
+      logger: this.opts.schemaLogger,
+      blockingAlterRowLimit: this.opts.schemaBlockingAlterRowLimit,
+    });
   }
 
   async tryAdmitSingleton(

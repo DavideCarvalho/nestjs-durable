@@ -14,12 +14,15 @@ import { SqsTransport } from './sqs-transport';
  * to the configured `endpoint`, so pointing the client at the mapped endpoint is enough — no custom
  * ElasticMQ `node-address` config needed.
  *
- * Skips cleanly when Docker is unavailable or `SKIP_TESTCONTAINERS` is set.
+ * Uses `DURABLE_TEST_SQS_ENDPOINT` (an ElasticMQ `http://host:port`) when set; every case names its
+ * queues under its own prefix, so a shared broker is fine. Otherwise skips cleanly when Docker is
+ * unavailable or `SKIP_TESTCONTAINERS` is set.
  */
 
 const CONTAINER_TIMEOUT = 180_000;
 const ELASTICMQ_PORT = 9324;
-const skipped = !!process.env.SKIP_TESTCONTAINERS;
+const externalEndpoint = process.env.DURABLE_TEST_SQS_ENDPOINT;
+const skipped = !externalEndpoint && !!process.env.SKIP_TESTCONTAINERS;
 
 let container: StartedTestContainer | undefined;
 let containerError: unknown;
@@ -34,13 +37,9 @@ let clientConfig:
 beforeAll(async () => {
   if (skipped) return;
   try {
-    container = await new GenericContainer('softwaremill/elasticmq-native:1.6.7')
-      .withExposedPorts(ELASTICMQ_PORT)
-      .withWaitStrategy(Wait.forLogMessage(/Started SQS rest server/i))
-      .start();
     clientConfig = {
       region: 'elasticmq',
-      endpoint: `http://${container.getHost()}:${container.getMappedPort(ELASTICMQ_PORT)}`,
+      endpoint: externalEndpoint ?? (await startElasticMq()),
       credentials: { accessKeyId: 'x', secretAccessKey: 'x' },
     };
     // Sanity probe so a startup error surfaces here rather than mid-test.
@@ -56,6 +55,15 @@ beforeAll(async () => {
 afterAll(async () => {
   await container?.stop();
 });
+
+/** Boot an ElasticMQ testcontainer and return its SQS endpoint. */
+async function startElasticMq(): Promise<string> {
+  container = await new GenericContainer('softwaremill/elasticmq-native:1.6.7')
+    .withExposedPorts(ELASTICMQ_PORT)
+    .withWaitStrategy(Wait.forLogMessage(/Started SQS rest server/i))
+    .start();
+  return `http://${container.getHost()}:${container.getMappedPort(ELASTICMQ_PORT)}`;
+}
 
 // Hyphenated (not dotted) name: `dispatch()` builds the SQS queue name straight from
 // `sanitizeQueueToken(step.name)` (colons only — a `.` is legal for BullMQ but real SQS/ElasticMQ

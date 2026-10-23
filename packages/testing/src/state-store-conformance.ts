@@ -121,8 +121,10 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         supportsTagFilter = ctx.supportsTagFilter ?? true;
         skipReason = undefined;
       } catch (err) {
-        if (isUnavailable(err)) {
-          // Backend unavailable (e.g. no Docker for a testcontainers spec): skip — don't fail.
+        // Backend unavailable (e.g. no Docker for a testcontainers spec): skip — don't fail. Unless
+        // the run demands its backends (CI), where a silent pass would hide a container that never
+        // started.
+        if (isUnavailable(err) && !process.env.DURABLE_TEST_REQUIRE_BACKENDS) {
           skipReason = err.message;
           if (!loggedSkip) {
             console.warn(`[state-store-contract] SKIPPING "${name}": ${skipReason}`);

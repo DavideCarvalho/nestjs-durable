@@ -8,7 +8,8 @@ import { SqsTransport } from './sqs-transport';
  * The shared run-dispatch contract against ElasticMQ (an SQS-compatible broker, testcontainers):
  * two SqsTransports on one fresh run queue per case stand for two instances of a deployment, on a
  * standard queue and on a FIFO one. SQS does not deduplicate a waiting run, so the contract checks
- * that a run received twice runs one turn instead. Run with `pnpm test:db`; skips when Docker is
+ * that a run received twice runs one turn instead. Run with `pnpm test:db`. Uses
+ * `DURABLE_TEST_SQS_ENDPOINT` (an ElasticMQ `http://host:port`) when set; skips when Docker is
  * unavailable or `SKIP_TESTCONTAINERS` is set.
  */
 
@@ -25,18 +26,15 @@ let clientConfig:
 let cases = 0;
 
 beforeAll(async () => {
-  if (process.env.SKIP_TESTCONTAINERS) {
+  const externalEndpoint = process.env.DURABLE_TEST_SQS_ENDPOINT;
+  if (!externalEndpoint && process.env.SKIP_TESTCONTAINERS) {
     unavailable = 'SKIP_TESTCONTAINERS is set';
     return;
   }
   try {
-    container = await new GenericContainer('softwaremill/elasticmq-native:1.6.7')
-      .withExposedPorts(ELASTICMQ_PORT)
-      .withWaitStrategy(Wait.forLogMessage(/Started SQS rest server/i))
-      .start();
     clientConfig = {
       region: 'elasticmq',
-      endpoint: `http://${container.getHost()}:${container.getMappedPort(ELASTICMQ_PORT)}`,
+      endpoint: externalEndpoint ?? (await startElasticMq()),
       credentials: { accessKeyId: 'x', secretAccessKey: 'x' },
     };
     const probe = new SQSClient(clientConfig);
@@ -50,6 +48,15 @@ beforeAll(async () => {
 afterAll(async () => {
   await container?.stop();
 });
+
+/** Boot an ElasticMQ testcontainer and return its SQS endpoint. */
+async function startElasticMq(): Promise<string> {
+  container = await new GenericContainer('softwaremill/elasticmq-native:1.6.7')
+    .withExposedPorts(ELASTICMQ_PORT)
+    .withWaitStrategy(Wait.forLogMessage(/Started SQS rest server/i))
+    .start();
+  return `http://${container.getHost()}:${container.getMappedPort(ELASTICMQ_PORT)}`;
+}
 
 for (const fifo of [false, true]) {
   runRunDispatchContract(

@@ -191,6 +191,47 @@ This is idempotent (already-aligned tables are skipped), non-fatal (a failed `CO
 warning, never crashes boot), and a no-op on Postgres/SQLite or when no `collate` is configured. It
 only runs as part of a full heal — the fingerprint gate above skips it too on a steady-state boot.
 
+### MySQL timestamp precision and large tables
+
+Every timestamp column is created with microsecond precision: `datetime(6)` on MySQL (`timestamptz`
+on Postgres already is). A bare MySQL `datetime` holds whole seconds and **rounds** the milliseconds
+away, which moves lease expiry, `wakeAt` and buffered-event order by up to half a second: a timer can
+fire early, and an engine can take a lease it acquired just after booting for one left by its
+previous process.
+
+Durable tables created by an older version on MySQL hold plain `datetime`, so the first boot on this
+version changes those columns to `datetime(6)`. MySQL cannot do that type change in place: it copies
+the table and **blocks writes to it until the copy finishes**. On a small table that takes moments;
+on a large `durable_step_checkpoints` it can take minutes, stall every run, and get the pod killed by
+its probes halfway through (rolling the change back, to restart on the next boot). So the heal only
+runs a column type change on an existing table whose estimated row count
+(`information_schema.tables.table_rows`) is at most `blockingAlterRowLimit` (default `100000`). On a
+bigger table it skips the change and logs it instead, one `ALTER` per table (all of a table's
+columns change in one statement, so the table is copied once):
+
+```
+[nestjs-durable] store-mikro-orm did NOT apply 2 durable-schema column type change(s) at boot.
+MySQL rebuilds a table to change a column type and blocks writes to it until the copy ends, and these tables hold more than blockingAlterRowLimit (100000) rows:
+  -- durable_step_checkpoints, ~2400000 rows
+  alter table `durable_step_checkpoints` modify `wake_at` datetime(6) null, modify `enqueued_at` datetime(6) null, modify `started_at` datetime(6) not null, modify `finished_at` datetime(6) not null;
+  -- durable_workflow_runs, ~145000 rows
+  alter table `durable_workflow_runs` modify `wake_at` datetime(6) null, modify `locked_until` datetime(6) null, modify `created_at` datetime(6) not null, modify `updated_at` datetime(6) not null;
+Run them in a maintenance window or with an online schema change tool (gh-ost, pt-online-schema-change), or raise blockingAlterRowLimit to let a boot run them. …
+```
+
+The store keeps working on the old columns meanwhile, and the warning repeats on every boot until the
+column matches (the fingerprint marker is not written while a statement is outstanding, so those
+boots run the full heal rather than the two-query fast path). Run the logged statement yourself (in a maintenance window, or with `gh-ost` /
+`pt-online-schema-change` to keep the table writable), or raise the limit to let a boot do it:
+
+```ts
+new MikroOrmStateStore(orm, { schemaBlockingAlterRowLimit: Number.POSITIVE_INFINITY });
+// or, from a migration / script:
+await ensureMikroOrmDurableSchema(orm, { blockingAlterRowLimit: Number.POSITIVE_INFINITY });
+```
+
+Postgres and SQLite need no change.
+
 ### Schema repair warning
 
 When the heal changes a durable schema that already existed (it creates a table that was missing
