@@ -198,4 +198,12 @@ describe('canonicalJson', () => {
     );
     expect(canonicalJson([1, 2])).not.toBe(canonicalJson([2, 1]));
   });
+
+  it('compares a Date as the ISO string a JSON column stores', () => {
+    const at = new Date('2026-10-23T12:00:00.000Z');
+    expect(canonicalJson({ ok: true, value: { at } })).toBe(
+      canonicalJson({ value: { at: '2026-10-23T12:00:00.000Z' }, ok: true }),
+    );
+    expect(canonicalJson({ a: undefined, b: 1 })).toBe(canonicalJson({ b: 1 }));
+  });
 });

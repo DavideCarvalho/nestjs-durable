@@ -25,14 +25,21 @@ const FAN_CHILD = /^(.+\.all\.\d+\.(?:w\d+\.)?)(\d+)$/;
  * so a completion read back from a checkpoint is not byte-identical to the one the child sent.
  */
 export function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  // Through JSON first, so a `Date` (or anything with `toJSON`) compares as the string a store
+  // column holds, not as an empty object.
+  const plain = JSON.stringify(value);
+  return plain === undefined ? 'null' : sortedJson(JSON.parse(plain));
+}
+
+function sortedJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(sortedJson).join(',')}]`;
   if (value !== null && typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`;
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    );
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${sortedJson(v)}`).join(',')}}`;
   }
-  return JSON.stringify(value) ?? 'null';
+  return JSON.stringify(value);
 }
 
 /** The checkpoint names under which `parentId` records the settled outcome of `childId`. */
