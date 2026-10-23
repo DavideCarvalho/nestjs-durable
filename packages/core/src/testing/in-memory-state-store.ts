@@ -224,6 +224,12 @@ export class InMemoryStateStore implements StateStore {
     this.checkpoints.set(this.key(checkpoint.runId, checkpoint.seq), { ...checkpoint });
   }
 
+  async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
+    for (const checkpoint of checkpoints) {
+      this.checkpoints.set(this.key(checkpoint.runId, checkpoint.seq), { ...checkpoint });
+    }
+  }
+
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
     const key = this.key(checkpoint.runId, checkpoint.seq);
     if (this.checkpoints.get(key)?.status !== 'pending') return false;

@@ -370,6 +370,18 @@ export class MikroOrmStateStore implements StateStore {
     await em.flush();
   }
 
+  async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
+    if (checkpoints.length === 0) return;
+    await this.fork().transactional(async (em) => {
+      for (let at = 0; at < checkpoints.length; at += 500) {
+        await em.upsertMany(
+          StepCheckpointEntity,
+          checkpoints.slice(at, at + 500).map(toCheckpointRow),
+        );
+      }
+    });
+  }
+
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
     const { runId: _runId, seq: _seq, ...data } = toCheckpointEntity(checkpoint);
     const affected = await this.fork().nativeUpdate(
@@ -422,12 +434,8 @@ export class MikroOrmStateStore implements StateStore {
         writes.set(k, checkpoint);
         if (checkpoint.status !== 'pending') pending.delete(k);
       }
-      const rows = [...writes.values()].map((checkpoint) => {
-        const row = toCheckpointEntity(checkpoint);
-        // A write without a deadline clears the one the pending row held.
-        if (checkpoint.wakeAt == null) (row as { wakeAt?: Date | null }).wakeAt = null;
-        return row;
-      });
+      // A write without a deadline clears the one the pending row held.
+      const rows = [...writes.values()].map(toCheckpointRow);
       for (let at = 0; at < rows.length; at += 500) {
         await em.upsertMany(StepCheckpointEntity, rows.slice(at, at + 500));
       }
@@ -1359,6 +1367,18 @@ function aggregateDateReader(em: EntityManager): (value: unknown) => Date {
     const zoned = text.includes('+') || text.lastIndexOf('-') > 10 || text.endsWith('Z');
     return platform.parseDate(zoned ? text : `${text}${tz}`) as Date;
   };
+}
+
+/**
+ * {@link toCheckpointEntity} with every nullable column set, for a multi-row upsert: it writes the
+ * columns of its first row to every row, so an absent value must be an explicit `null`.
+ */
+function toCheckpointRow(cp: StepCheckpoint): StepCheckpointEntity {
+  const row = toCheckpointEntity(cp) as unknown as Record<string, unknown>;
+  for (const key of ['workerGroup', 'parallelGroup', 'wakeAt', 'enqueuedAt']) {
+    if (row[key] === undefined) row[key] = null;
+  }
+  return row as unknown as StepCheckpointEntity;
 }
 
 function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {

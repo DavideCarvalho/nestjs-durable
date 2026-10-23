@@ -94,6 +94,8 @@ in-process ones.
 `resultConcurrency` raises the per-instance limit above 512; a lower value has no effect. A value
 that is not a finite number of at least 1 is ignored; a fractional value is rounded down.
 
+A step fan's tasks are enqueued with `addBulk`, 500 jobs a call.
+
 ### Result delivery
 
 A result job whose handler throws (a store error at peak load, say) is retried up to 5 times with

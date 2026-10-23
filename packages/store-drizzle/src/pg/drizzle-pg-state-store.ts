@@ -357,6 +357,21 @@ export class DrizzlePgStateStore implements StateStore {
     await upsertCheckpoint(this.db, checkpoint);
   }
 
+  async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
+    if (checkpoints.length === 0) return;
+    await this.db.transaction(async (tx) => {
+      for (let at = 0; at < checkpoints.length; at += CHECKPOINT_BATCH_ROWS) {
+        await tx
+          .insert(stepCheckpoints)
+          .values(checkpoints.slice(at, at + CHECKPOINT_BATCH_ROWS).map(toCheckpointRow))
+          .onConflictDoUpdate({
+            target: [stepCheckpoints.runId, stepCheckpoints.seq],
+            set: excludedSet(stepCheckpoints),
+          });
+      }
+    });
+  }
+
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
     // One conditional UPDATE: a writer racing a settling result blocks on the row lock, then
     // re-evaluates `status = 'pending'` against the committed row and matches nothing. A missing

@@ -347,18 +347,59 @@ export class TypeOrmStateStore implements StateStore {
     await this.checkpoints().upsert(entity, ['runId', 'seq']);
   }
 
+  async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
+    if (checkpoints.length === 0) return;
+    await this.dataSource.transaction(async (em) => {
+      const repo = em.getRepository(StepCheckpointEntity);
+      for (let at = 0; at < checkpoints.length; at += 500) {
+        await repo.upsert(
+          checkpoints
+            .slice(at, at + 500)
+            .map((cp) => toCheckpointEntity(cp) as QueryDeepPartialEntity<StepCheckpointEntity>),
+          ['runId', 'seq'],
+        );
+      }
+    });
+  }
+
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
     return updateIfPending(this.checkpoints(), checkpoint);
   }
 
   async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
     if (checkpoints.length === 0) return [];
-    // The conditional UPDATE of `saveCheckpointIfPending`, once per entry, in order, in one
-    // transaction: one commit for the batch, and a rejection writes nothing.
+    // In one transaction: lock the batch's rows that are still `pending`, decide each entry in order
+    // against them (an entry that settles a row makes a later entry for it lose), then write each
+    // row's last winning entry with one upsert per chunk. A rejection writes nothing.
+    const lock = !['sqlite', 'better-sqlite3', 'sqljs'].includes(this.dataSource.options.type);
     return this.dataSource.transaction(async (em) => {
       const repo = em.getRepository(StepCheckpointEntity);
-      const wrote: boolean[] = [];
-      for (const checkpoint of checkpoints) wrote.push(await updateIfPending(repo, checkpoint));
+      const pending = new Set<string>();
+      for (const [runId, seqs] of seqsByRun(checkpoints)) {
+        for (let at = 0; at < seqs.length; at += 500) {
+          const query = repo
+            .createQueryBuilder('c')
+            .select(['c.runId', 'c.seq'])
+            .where('c.runId = :runId', { runId })
+            .andWhere('c.seq IN (:...seqs)', { seqs: seqs.slice(at, at + 500) })
+            .andWhere('c.status = :status', { status: 'pending' });
+          if (lock) query.setLock('pessimistic_write');
+          for (const row of await query.getMany()) pending.add(checkpointKey(row.runId, row.seq));
+        }
+      }
+      const { wrote, writes } = decideIfPending(checkpoints, pending);
+      for (let at = 0; at < writes.length; at += 500) {
+        await repo.upsert(
+          writes.slice(at, at + 500).map(
+            (cp) =>
+              ({
+                ...toCheckpointEntity(cp),
+                wakeAt: cp.wakeAt != null ? new Date(cp.wakeAt) : null,
+              }) as QueryDeepPartialEntity<StepCheckpointEntity>,
+          ),
+          ['runId', 'seq'],
+        );
+      }
       return wrote;
     });
   }
@@ -1171,6 +1212,44 @@ function runUpdateSet(patch: Partial<WorkflowRun>): Record<string, unknown> {
   if ('createdAt' in patch) update.createdAt = patch.createdAt;
   if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;
   return update;
+}
+
+/** `checkpoints`' distinct seqs, by run. */
+function seqsByRun(checkpoints: StepCheckpoint[]): Map<string, number[]> {
+  const byRun = new Map<string, Set<number>>();
+  for (const { runId, seq } of checkpoints) {
+    const seqs = byRun.get(runId) ?? new Set<number>();
+    seqs.add(seq);
+    byRun.set(runId, seqs);
+  }
+  return new Map([...byRun].map(([runId, seqs]) => [runId, [...seqs]]));
+}
+
+const checkpointKey = (runId: string, seq: number): string => `${runId}\u0000${seq}`;
+
+/**
+ * `saveCheckpointsIfPending`'s answers for `checkpoints` against the rows that were `pending` before
+ * the batch (`pending`, by {@link checkpointKey}), in order: an entry wins while its row is still
+ * pending, and an entry that is not `pending` itself settles the row. `writes` holds each row's
+ * last winning entry.
+ */
+function decideIfPending(
+  checkpoints: StepCheckpoint[],
+  pending: Set<string>,
+): { wrote: boolean[]; writes: StepCheckpoint[] } {
+  const wrote: boolean[] = [];
+  const writes = new Map<string, StepCheckpoint>();
+  for (const checkpoint of checkpoints) {
+    const key = checkpointKey(checkpoint.runId, checkpoint.seq);
+    if (!pending.has(key)) {
+      wrote.push(false);
+      continue;
+    }
+    wrote.push(true);
+    writes.set(key, checkpoint);
+    if (checkpoint.status !== 'pending') pending.delete(key);
+  }
+  return { wrote, writes: [...writes.values()] };
 }
 
 async function updateIfPending(
