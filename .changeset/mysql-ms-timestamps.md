@@ -12,3 +12,5 @@ An existing MySQL deployment is upgraded by the boot-time schema heal. MySQL run
 The BullMQ transport now rewrites every routing token's descriptor copy when a later `handle()` adds a step. A reader keeps whichever copy its SCAN meets first, so a stale copy left the new step's heartbeat undeclared, and the workflow directory listed that step's queue as a callable workflow until the next heartbeat interval.
 
 The StateStore contract fails instead of passing silently when its backend is unavailable and `DURABLE_TEST_REQUIRE_BACKENDS` is set.
+
+The run-dispatch contract's "leaves a run whose queueing failed pending" case waits for both re-queued runs to complete, since a consumer may take them in either order.

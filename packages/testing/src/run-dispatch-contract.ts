@@ -327,8 +327,11 @@ export function runRunDispatchContract(
           // The broker is back: the poll queues the pending runs again and a consumer takes them.
           a.failing.on = false;
           await engine.runPending();
-          await until(async () => (await store.getRun('lost'))?.status === 'completed', timeoutMs);
-          expect((await store.getRun('kept'))?.status).toBe('completed');
+          // Both were queued by the same poll, but a consumer may take them in either order.
+          await until(async () => {
+            const [lost, kept] = await Promise.all([store.getRun('lost'), store.getRun('kept')]);
+            return lost?.status === 'completed' && kept?.status === 'completed';
+          }, timeoutMs);
           // The broker stays down: the poll runs the run itself.
           a.failing.on = true;
           await engine.start('wf', {}, 'down');
