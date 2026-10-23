@@ -349,8 +349,10 @@ at `Date.now()` (plus whatever `backfill` catches up).
 ## Testing a schedule
 
 In a test, call `runSchedules` against the engine of your `TestingModule` with a fixed clock, so you
-choose which window fires. Its fourth argument overrides the `random`/`sleep` pair `jitter` uses
-(`Math.random`/`setTimeout` by default), so a jittered schedule fires without waiting:
+choose which window fires. Its fourth argument overrides the `random` that draws each window's
+`jitter` delay (`Math.random` by default); `random: () => 0` makes a jittered schedule fire in the
+same call. Pass the same `engine` on every call: fired windows and deferred jittered windows are
+remembered per engine object.
 
 ```ts
 const engine = moduleRef.get(WorkflowEngine);
@@ -358,7 +360,6 @@ const at = Date.parse('2026-03-01T05:00:00Z'); // 02:00 in São Paulo
 
 const [runId] = await runSchedules(engine, [dailyReport], at, {
   random: () => 0,
-  sleep: async () => {},
 });
 
 expect(runId).toBe(scheduleRunIdAt(dailyReport, at));
