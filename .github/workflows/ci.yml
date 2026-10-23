@@ -22,12 +22,24 @@ jobs:
       - run: pnpm build
       - run: pnpm test
 
-  # The Drizzle Postgres store against a real Postgres: the shared StateStore contract on both
-  # node-postgres and postgres-js, plus the DDL <-> pgTable parity, lease/SKIP LOCKED concurrency,
-  # retention and DbTransport cases. Uses a service container via DURABLE_TEST_PG_URL rather than
-  # testcontainers, so it needs no Docker-in-Docker and stays a ~1 minute job.
-  store-drizzle-postgres:
+  # Every `*.db.spec.ts` suite (`pnpm test:db`) against real backends, in two shards so neither
+  # waits on the other. Service containers back the specs that take a URL (`DURABLE_TEST_*`): they
+  # isolate themselves on a shared server (a database, key prefix or queue prefix of their own). The
+  # StateStore contract specs truncate the durable tables between cases, so they keep booting their
+  # own testcontainers (the runner has Docker). `DURABLE_TEST_REQUIRE_BACKENDS` turns a case that
+  # would skip itself for a missing backend into a failure, so a container that never started can't
+  # pass as a green run.
+  real-backends:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: stores
+            packages: packages/store-mikro-orm packages/store-typeorm packages/store-prisma packages/store-drizzle
+          - shard: transports
+            packages: packages/transport-bullmq packages/transport-db packages/transport-sqs packages/admission-redis packages/nestjs
+    name: real backends (${{ matrix.shard }})
     services:
       postgres:
         image: postgres:16-alpine
@@ -42,6 +54,37 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: durable
+          MYSQL_DATABASE: durable
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pdurable"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      elasticmq:
+        image: softwaremill/elasticmq-native:1.6.7
+        ports:
+          - 9324:9324
+    env:
+      DURABLE_TEST_REQUIRE_BACKENDS: "1"
+      DURABLE_TEST_PG_URL: postgres://durable:durable@localhost:5432/durable
+      DURABLE_TEST_MYSQL_URL: mysql://root:durable@127.0.0.1:3306/durable
+      DURABLE_TEST_REDIS_URL: redis://localhost:6379
+      DURABLE_TEST_SQS_ENDPOINT: http://localhost:9324
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: pnpm/action-setup@v6.1.0
@@ -50,9 +93,10 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm test:db packages/store-drizzle
-        env:
-          DURABLE_TEST_PG_URL: postgres://durable:durable@localhost:5432/durable
+      # The ElasticMQ image ships no shell tool a health-cmd could use, so wait for it from here.
+      - name: Wait for ElasticMQ
+        run: timeout 60 bash -c 'until curl -sf "http://localhost:9324/?Action=ListQueues" >/dev/null; do sleep 1; done'
+      - run: pnpm test:db ${{ matrix.packages }}
 
   # clients/python (durable-worker) ships separately to PyPI via the durable-worker-v* tag, and
   # until now nothing ran its tests — the `build` job above is entirely the pnpm workspace. A

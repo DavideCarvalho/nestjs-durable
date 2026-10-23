@@ -25,6 +25,7 @@ export default defineConfig({
       '@dudousxd/nestjs-durable-transport-event-emitter': pkg('transport-event-emitter'),
       '@dudousxd/nestjs-durable': pkg('nestjs'),
       '@dudousxd/nestjs-durable-transport-db': pkg('transport-db'),
+      '@dudousxd/nestjs-durable-transport-bullmq': pkg('transport-bullmq'),
       '@dudousxd/durable-worker': pkg('worker'),
     },
   },
@@ -40,7 +41,7 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    setupFiles: ['./vitest.setup.ts'],
+    setupFiles: ['./vitest.setup.ts', './vitest.db.setup.ts'],
     include: ['packages/*/src/**/*.db.spec.ts'],
     exclude: ['**/node_modules/**', '**/dist/**'],
     testTimeout: 60_000,
