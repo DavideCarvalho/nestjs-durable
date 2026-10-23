@@ -425,8 +425,20 @@ const pendingStateKey = (at: Date): string => String(new Date(at).getTime());
  */
 const freshPendingKey = (): string => `${Date.now()}-${globalThis.crypto.randomUUID().slice(0, 8)}`;
 
-/** The buffered-signal token of the wake requests kept for a run (see `requestWakeAfterTurn`). */
+/**
+ * The buffered-event name of the wake requests kept for a run (see `requestWakeAfterTurn`). An
+ * engine before 0.86 kept them as buffered signals under the same token; those are still taken.
+ */
 const wakeRequestToken = (runId: string): string => `durable:wake-after-turn:${runId}`;
+
+/** The most wake requests of one run read at once. */
+const WAKE_REQUEST_SCAN = 100;
+
+/** A wake request kept for a run: its buffered event's id, or none for one kept as a buffered signal. */
+interface KeptWake {
+  id?: string;
+  payload: unknown;
+}
 
 /** The checkpoint name prefix of an awaited child: `signal:child:<childId>`. */
 const CHILD_SIGNAL_PREFIX = 'signal:child:';
@@ -986,6 +998,8 @@ export class WorkflowEngine {
    * highest seq read. Written by {@link callRemoteAll}, read once the turn ends.
    */
   private readonly turnSettledFans = new Map<string, Map<number, number>>();
+  /** The wake requests each executing turn on this instance serves (see {@link noteServedWakes}). */
+  private readonly turnServedWakes = new Map<string, Set<string>>();
   /**
    * Every run turn and child start this instance takes on itself, under one budget of
    * {@link LOCAL_RUN_CONCURRENCY}: the runs it dispatches to itself, a fan's deferred child starts,
@@ -4610,7 +4624,6 @@ export class WorkflowEngine {
             this.genericWakeRequested.add(run.id);
             this.inBackground(this.requestWakeAfterTurn(run.id, null));
           }
-          this.unconditionalRechecks.add(run.id);
         } else {
           const fans: FanWakeRequest = { fans: [...reason.fans] };
           this.inBackground(this.requestWakeAfterTurn(run.id, fans));
@@ -4623,6 +4636,9 @@ export class WorkflowEngine {
     this.turnSettledFans.set(run.id, settledFans);
     const held = this.holdExecutionLease(run.id);
     try {
+      const served = new Set<string>();
+      this.turnServedWakes.set(run.id, served);
+      if (registered?.remote) await this.noteServedWakes(run.id);
       // A remote (e.g. Python) workflow is advanced by dispatching workflow tasks, not by running an
       // in-process body — but everything around it (lease, recovery, timers, the resume that lands us
       // here on a step result) is identical, so it branches here under the same lease.
@@ -4644,70 +4660,138 @@ export class WorkflowEngine {
       // The lease is released by now: a wake another instance could not deliver during this turn
       // runs the next one.
       if (result.status === 'suspended') {
-        this.inBackground(this.honorWakeRequests(run.id, settledFans));
+        this.inBackground(this.honorWakeRequests(run.id, settledFans, served));
       } else if (TERMINAL_RUN_STATUSES.includes(result.status)) {
-        this.inBackground(this.takeWakeRequests(run.id));
+        this.inBackground(
+          this.listWakeRequests(run.id).then((kept) => this.dropWakeRequests(kept)),
+        );
       }
       return result;
     } finally {
       held.stop();
       if (this.turnSettledFans.get(run.id) === settledFans) this.turnSettledFans.delete(run.id);
+      this.turnServedWakes.delete(run.id);
     }
   }
 
   /**
    * Keep a wake that found `runId`'s lease held by a turn executing elsewhere, durably, so that turn
    * runs again once it ends instead of suspending on a snapshot that predates what the wake brought
-   * (a signal, a child's completion). The request is a buffered signal on a token no workflow waits
-   * on; the holder takes it after it releases the lease ({@link honorWakeRequests}).
+   * (a signal, a child's completion). The request is a buffered event under a name no workflow waits
+   * on. It stays until a turn that started after it has settled: the holder looks at it after it
+   * releases the lease ({@link honorWakeRequests}), and the turn that serves it drops it.
    *
    * Written first and looked at second, against a holder that releases first and looks second:
    * whichever look runs last sees the other side's write. So when the run is no longer executing by
-   * the time this re-reads it, the holder may have looked already, and this side takes the request
-   * and wakes the run itself once the lease is free.
+   * the time this re-reads it, the holder may have looked already, and this side wakes the run
+   * itself once the lease is free ({@link retryDroppedWake}). While the holder still runs, the run is
+   * made due when the holder's lease runs out, so a holder that goes down before it settles leaves
+   * the run to any instance's timer poll; a holder that settles sets the run's timer itself.
    */
   private async requestWakeAfterTurn(runId: string, request: FanWakeRequest | null): Promise<void> {
-    await this.store.bufferSignal(wakeRequestToken(runId), request);
+    const id = globalThis.crypto.randomUUID();
+    await this.store.bufferEvent({
+      name: wakeRequestToken(runId),
+      payload: request,
+      id,
+      publishedAt: this.clock(),
+    });
     const run = await this.store.getRun(runId);
-    // Still executing (a first turn runs `running`, a later one keeps the run leased): the holder
-    // looks once it has released the lease.
-    if (run?.status === 'running') return;
-    if (run?.lockedBy !== undefined && run.lockedBy !== this.instanceId) return;
-    // Gone (deleted or pruned meanwhile): no turn will take the request, so take it back.
-    if (!run) {
-      await this.takeWakeRequests(runId);
+    // Gone (deleted or pruned meanwhile) or finished: no turn will serve the request.
+    if (!run || TERMINAL_RUN_STATUSES.includes(run.status)) {
+      await this.store.removeBufferedEvent(id);
       return;
     }
-    if ((await this.takeWakeRequests(runId)).length === 0) return;
-    if (TERMINAL_RUN_STATUSES.includes(run.status)) return;
-    this.unconditionalRechecks.add(runId);
+    // A first turn runs `running`: the holder looks once it ends, and orphan recovery covers it.
+    if (run.status === 'running') return;
+    if (run.lockedBy !== undefined && run.lockedBy !== this.instanceId) {
+      await this.makeDueBy(runId, (run.lockedUntil ?? this.clock()) + LEASE_RECHECK_SLACK_MS);
+      return;
+    }
     this.recheckAfterLease(runId, run.lockedUntil);
   }
 
   /**
-   * After a turn that suspended released its lease: run again if a wake was kept for it, unless
-   * every kept wake was a fan wake this turn already saw: it read that fan with nothing in flight,
-   * at least as far as the batch that opened its barrier.
+   * After a turn that suspended released its lease: drop the wakes it served, and run again if a
+   * wake was kept for it meanwhile, unless every such wake was a fan wake this turn already saw: it
+   * read that fan with nothing in flight, at least as far as the batch that opened its barrier.
+   * The run is made due before it is woken, so if this instance goes down before that turn runs,
+   * the timer poll of another instance runs it once this instance's hold on it would have lapsed.
    */
-  private async honorWakeRequests(runId: string, settledFans: Map<number, number>): Promise<void> {
-    const requests = await this.takeWakeRequests(runId);
-    const seen = (request: unknown) =>
-      isFanWakeRequest(request) &&
-      request.fans.every(([first, seq]) => (settledFans.get(first) ?? -1) >= seq);
-    if (requests.every(seen)) return;
+  private async honorWakeRequests(
+    runId: string,
+    settledFans: Map<number, number>,
+    served: Set<string>,
+  ): Promise<void> {
+    const kept = await this.listWakeRequests(runId, true);
+    const seen = (request: KeptWake) =>
+      (request.id !== undefined && served.has(request.id)) ||
+      (isFanWakeRequest(request.payload) &&
+        request.payload.fans.every(([first, seq]) => (settledFans.get(first) ?? -1) >= seq));
+    const needed = kept.filter((request) => !seen(request));
+    await this.dropWakeRequests(kept.filter(seen));
+    if (needed.length === 0) return;
+    await this.makeDueBy(runId, this.clock() + this.leaseMs);
     await this.wake(runId).catch((err) => {
       if (!(err instanceof NamespaceMismatch)) throw err;
     });
   }
 
-  /** Take every wake request kept for `runId`, and return their payloads. */
-  private async takeWakeRequests(runId: string): Promise<unknown[]> {
-    const taken: unknown[] = [];
+  /**
+   * The wake requests kept for `runId`. With `legacy`, also those an older engine kept as buffered
+   * signals, which are taken as they are read.
+   */
+  private async listWakeRequests(runId: string, legacy = false): Promise<KeptWake[]> {
+    const token = wakeRequestToken(runId);
+    const kept: KeptWake[] = (await this.store.listBufferedEvents(token, WAKE_REQUEST_SCAN)).map(
+      (request) => ({ id: request.id, payload: request.payload }),
+    );
+    if (!legacy) return kept;
     for (;;) {
-      const request = await this.store.takeBufferedSignal(wakeRequestToken(runId));
-      if (!request) return taken;
-      taken.push(request.payload);
+      const signal = await this.store.takeBufferedSignal(token);
+      if (!signal) return kept;
+      kept.push({ payload: signal.payload });
     }
+  }
+
+  /** Delete `requests` (the ones kept as buffered events). */
+  private async dropWakeRequests(requests: KeptWake[]): Promise<void> {
+    await Promise.all(
+      requests.flatMap((request) =>
+        request.id === undefined ? [] : [this.store.removeBufferedEvent(request.id)],
+      ),
+    );
+  }
+
+  /**
+   * Record, for the turn executing `runId` here, the wakes kept for the run so far. Called before the
+   * turn reads the run's state, so the turn serves them: they are dropped once it has settled, and
+   * until then stay for whoever runs the run next.
+   */
+  private async noteServedWakes(runId: string): Promise<void> {
+    const served = this.turnServedWakes.get(runId);
+    if (!served) return;
+    for (const request of await this.store.listBufferedEvents(
+      wakeRequestToken(runId),
+      WAKE_REQUEST_SCAN,
+    )) {
+      served.add(request.id);
+    }
+  }
+
+  /** Bring a suspended run's timer forward to `at` (never later than the one it has). */
+  private async makeDueBy(runId: string, at: number): Promise<void> {
+    const run = await this.store.getRun(runId);
+    if (run?.status !== 'suspended') return;
+    if (run.wakeAt !== undefined && run.wakeAt <= at) return;
+    await (this.store.updateRunIf ?? this.updateRunIfFallback).call(
+      this.store,
+      runId,
+      ['suspended'],
+      {
+        wakeAt: at,
+      },
+    );
   }
 
   /**
@@ -4750,10 +4834,8 @@ export class WorkflowEngine {
     const unconditional = this.unconditionalRechecks.delete(runId);
     if (run?.status !== 'suspended') return;
     if (run.lockedUntil !== undefined && run.lockedUntil > nowMs) return;
-    // Only fan wakes were kept: the turn that held the lease took them when it ended, and resumed
-    // the run if it had not seen them. One still here means that turn never ended (its instance
-    // went down), so the run is resumed here.
-    if (!unconditional && (await this.takeWakeRequests(runId)).length === 0) return;
+    // A kept wake is dropped by the turn that serves it: none left means the run has had its turn.
+    if (!unconditional && (await this.listWakeRequests(runId)).length === 0) return;
     if (this.queuesRunsOverTransport) {
       await this.wake(runId);
       return;
@@ -5960,6 +6042,7 @@ export class WorkflowEngine {
         namespace: run.namespace,
       });
     }
+    await this.noteServedWakes(run.id);
     // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
     // A `cancelling` run skips the gate — it is tearing down, not competing for a slot, and suspending

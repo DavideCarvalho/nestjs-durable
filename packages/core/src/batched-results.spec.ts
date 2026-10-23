@@ -452,10 +452,16 @@ describe('batched step results', () => {
         }
         return super.countCheckpoints(runId, from, to, statuses);
       }
-      async bufferSignal(token: string, payload: unknown): Promise<void> {
-        await super.bufferSignal(token, payload);
-        // Time for the instance that kept the wake to look at the run.
-        if (token.startsWith('durable:wake-after-turn:')) setTimeout(() => this.looked?.(), 20);
+      // Time for the instance that kept the wake to look at the run.
+      async bufferEvent(input: {
+        name: string;
+        payload: unknown;
+        id: string;
+        publishedAt: number;
+      }): Promise<void> {
+        await super.bufferEvent(input);
+        if (input.name.startsWith('durable:wake-after-turn:'))
+          setTimeout(() => this.looked?.(), 20);
       }
       async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
         if (patch.status === 'suspended' && this.holdSuspend) {

@@ -419,22 +419,7 @@ export class PrismaStateStore implements StateStore {
 
   async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
     if (checkpoints.length === 0) return;
-    // Prisma has no multi-row upsert: replace the rows, one `deleteMany` and one `createMany` per
-    // chunk, in one transaction.
-    await this.db.$transaction(async (tx) => {
-      for (const [runId, seqs] of seqsByRun(checkpoints)) {
-        for (let at = 0; at < seqs.length; at += 500) {
-          await tx.durableStepCheckpoint.deleteMany({
-            where: { runId, seq: { in: seqs.slice(at, at + 500) } },
-          });
-        }
-      }
-      for (let at = 0; at < checkpoints.length; at += 500) {
-        await tx.durableStepCheckpoint.createMany({
-          data: checkpoints.slice(at, at + 500).map(toCheckpointData),
-        });
-      }
-    });
+    await this.db.$transaction((tx) => replaceCheckpoints(tx, checkpoints));
   }
 
   async transaction<T>(
@@ -886,28 +871,27 @@ export class PrismaStateStore implements StateStore {
 
   async registerChildWaits(entries: ChildWait[]): Promise<void> {
     if (entries.length === 0) return;
-    // Prisma has no multi-row upsert: one upsert per row, inside a single transaction.
+    // Prisma has no multi-row upsert: replace the waiters and the placeholders, one `deleteMany`
+    // and one `createMany` per chunk of each, inside a single transaction.
     await this.db.$transaction(async (tx) => {
-      for (const { waiter } of entries) {
-        const data = {
-          runId: waiter.runId,
-          seq: waiter.seq,
-          parallelGroup: waiter.parallelGroup ?? null,
-        };
-        await tx.durableSignalWaiter.upsert({
-          where: { token: waiter.token },
-          create: { token: waiter.token, ...data },
-          update: data,
+      for (let at = 0; at < entries.length; at += 500) {
+        const chunk = entries.slice(at, at + 500);
+        await tx.durableSignalWaiter.deleteMany({
+          where: { token: { in: chunk.map(({ waiter }) => waiter.token) } },
+        });
+        await tx.durableSignalWaiter.createMany({
+          data: chunk.map(({ waiter }) => ({
+            token: waiter.token,
+            runId: waiter.runId,
+            seq: waiter.seq,
+            parallelGroup: waiter.parallelGroup ?? null,
+          })),
         });
       }
-      for (const { checkpoint } of entries) {
-        const data = toCheckpointData(checkpoint);
-        await tx.durableStepCheckpoint.upsert({
-          where: { runId_seq: { runId: checkpoint.runId, seq: checkpoint.seq } },
-          create: data,
-          update: data,
-        });
-      }
+      await replaceCheckpoints(
+        tx,
+        entries.map(({ checkpoint }) => checkpoint),
+      );
     });
   }
 
@@ -1262,6 +1246,29 @@ function decideIfPending(
     if (checkpoint.status !== 'pending') pending.delete(key);
   }
   return { wrote, writes: [...writes.values()] };
+}
+
+/**
+ * Write `checkpoints` (distinct rows), inserting or overwriting each. Prisma has no multi-row
+ * upsert, so the rows are replaced: one `deleteMany` and one `createMany` per chunk. Call inside a
+ * transaction.
+ */
+async function replaceCheckpoints(
+  tx: DurablePrismaTx,
+  checkpoints: StepCheckpoint[],
+): Promise<void> {
+  for (const [runId, seqs] of seqsByRun(checkpoints)) {
+    for (let at = 0; at < seqs.length; at += 500) {
+      await tx.durableStepCheckpoint.deleteMany({
+        where: { runId, seq: { in: seqs.slice(at, at + 500) } },
+      });
+    }
+  }
+  for (let at = 0; at < checkpoints.length; at += 500) {
+    await tx.durableStepCheckpoint.createMany({
+      data: checkpoints.slice(at, at + 500).map(toCheckpointData),
+    });
+  }
 }
 
 function toCheckpointData(cp: StepCheckpoint) {
