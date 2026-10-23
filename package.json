@@ -34,7 +34,7 @@
     "@dudousxd/nestjs-durable-core": "workspace:*",
     "@dudousxd/nestjs-durable-transport-bullmq": "workspace:*",
     "@swc/core": "1.16.13",
-    "@types/node": "22.20.2",
+    "@types/node": "22.20.4",
     "reflect-metadata": "0.2.2",
     "turbo": "2.9.17",
     "typescript": "5.9.3",
