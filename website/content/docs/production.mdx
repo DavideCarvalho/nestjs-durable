@@ -790,7 +790,7 @@ schema's issues, so an alert or an [`onError` route](/docs/reliability/on-error)
 
 For a rule a schema can't express (a cross-field invariant, an async lookup) add `validateInput` — a plain
 `(input) => void | Promise<void>` that throws to reject. It runs at `start` after `input` parses, and
-sees the input as it was sent:
+receives the parsed value, so it can rely on the types the schema produced:
 
 ```ts
 @Workflow({

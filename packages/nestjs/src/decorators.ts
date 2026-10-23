@@ -137,7 +137,8 @@ export interface WorkflowOptions {
   inputSchema?: IoSchema;
   /**
    * A custom check at `start` (throw to reject) for a rule a schema can't express — a cross-field
-   * invariant, an async lookup. It sees the input as it was sent, and runs after `input` parses.
+   * invariant, an async lookup. It runs after `input` parses and receives the parsed value (the input
+   * as sent when there is no `input` schema).
    */
   validateInput?: (input: unknown) => void | Promise<void>;
   /**

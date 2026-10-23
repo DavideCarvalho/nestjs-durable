@@ -69,6 +69,19 @@ class CheckedIoWorkflow {
   }
 }
 
+@Workflow({
+  name: 'checked-parsed',
+  input: z.object({ placedAt: z.coerce.date() }),
+  validateInput: (input) => {
+    seen.push((input as { placedAt: unknown }).placedAt);
+  },
+})
+class CheckedParsedWorkflow {
+  async run() {
+    return 'ok';
+  }
+}
+
 @Workflow({ name: 'bad-output', output: z.object({ id: z.string() }) })
 class BadOutputWorkflow {
   async run() {
@@ -84,6 +97,7 @@ async function boot(store = new InMemoryStateStore()) {
       DtoIoWorkflow,
       LegacyIoWorkflow,
       CheckedIoWorkflow,
+      CheckedParsedWorkflow,
       BadOutputWorkflow,
     ],
   }).compile();
@@ -205,6 +219,16 @@ describe('@Workflow({ input, output })', () => {
     );
     expect(await store.getRun('r4')).toBeNull();
     expect(await store.getRun('r5')).toBeNull();
+  });
+
+  it('hands validateInput the parsed value, while the run stores the input as sent', async () => {
+    const { mod, store, svc } = await boot();
+    close = () => mod.close();
+
+    await svc.start('checked-parsed', { placedAt: '2026-01-02T03:04:05.000Z' }, 'r7');
+
+    expect(seen[0]).toBeInstanceOf(Date);
+    expect((await store.getRun('r7'))?.input).toEqual({ placedAt: '2026-01-02T03:04:05.000Z' });
   });
 
   it('fails a run whose output does not match the output schema with code invalid_output', async () => {

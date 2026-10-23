@@ -121,7 +121,7 @@ Marks a provider class as a durable workflow; its `run(ctx, input)` becomes the 
 | `input` | `IoSchema` (Standard Schema \| class-validator DTO class) | Input schema. Checked at `start` (invalid input creates no run); the run stores the input as sent, and `run()` receives the parsed value, re-parsed before every turn. See [Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap). |
 | `output` | `IoSchema` | Output schema. `run()`'s return value is parsed before the run completes; a mismatch fails it with `invalid_output`. |
 | `inputSchema` | `IoSchema` | Alias of `input`, for workflows declared before it existed. Setting both is an error. |
-| `validateInput` | `(input: unknown) => void \| Promise<void>` | Extra check at `start` (throw to reject), run after `input` parses, on the input as sent. |
+| `validateInput` | `(input: unknown) => void \| Promise<void>` | Extra check at `start` (throw to reject), run after `input` parses, on the parsed value. |
 | `onEvent` | `string[]` | Start a fresh run whenever any of these events is published. Merged with `@OnDurableEvent`. |
 | `debounce` | `string \| number` | Coalesce `onEvent` triggers: fire once quiet for this long, with the last payload. |
 | `batch` | `{ maxSize: number; within: string \| number }` | Coalesce `onEvent` triggers: fire on size or window, with all payloads. |
