@@ -23,7 +23,11 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 export interface VerifiedTenant {
   /** The tenant the token authenticates as. The responder trusts THIS, never the request body. */
   tenant: string;
-  /** Capabilities the token grants, if the issuer scopes them. */
+  /**
+   * Capabilities the token grants, if the issuer scopes them. Carried for custom verifiers and for
+   * wire parity with Agora; the built-in responder does NOT enforce them yet. A verified tenant can
+   * call every verb, scoped to its own namespace.
+   */
   capabilities?: string[] | undefined;
 }
 
@@ -94,7 +98,8 @@ export function signTenantToken(
  *
  * A LIST of secrets makes rotation a two-step deploy: verify with `[next, current]` everywhere first,
  * then re-mint tenant tokens with `next` at leisure. `capabilities`, if given, is a static grant
- * stamped onto every {@link VerifiedTenant} this verifier authenticates.
+ * stamped onto every {@link VerifiedTenant} this verifier authenticates (informational: the
+ * responder does not enforce it yet, see {@link VerifiedTenant.capabilities}).
  */
 export function hmacTenantVerifier(
   secret: string | string[],

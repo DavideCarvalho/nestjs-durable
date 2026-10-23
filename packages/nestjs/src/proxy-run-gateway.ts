@@ -43,8 +43,33 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/**
+ * An error reply from the control plane. `code` carries the reply's machine-readable reason when it
+ * sent one — `unauthorized` (the tenant token was rejected), `cross-tenant` (the run belongs to
+ * another tenant), ... — so a caller can tell an authentication failure from a real one, as with
+ * Agora's proxy.
+ */
+/**
+ * The codes the run-request responder replies with. `string & {}` keeps a code from a newer control
+ * plane assignable without losing autocomplete on the known ones.
+ */
+export type RunGatewayErrorCode =
+  | 'unauthorized'
+  | 'cross-tenant'
+  | typeof UNSUPPORTED_RUN_REQUEST
+  | (string & {});
+
+export class RunGatewayError extends Error {
+  readonly code: RunGatewayErrorCode | undefined;
+  constructor(message: string, code?: RunGatewayErrorCode) {
+    super(message);
+    this.name = 'RunGatewayError';
+    this.code = code;
+  }
+}
+
 /** The control plane answered a verb it does not know — an older release than this tenant's. */
-class UnsupportedRunRequestError extends Error {}
+class UnsupportedRunRequestError extends RunGatewayError {}
 
 /** An {@link UNSUPPORTED_RUN_REQUEST} error reply. Older responders answer an unknown verb with
  *  `ok: true` and no `data` instead, which `getFanMembers` checks for itself. */
@@ -94,18 +119,24 @@ export class ProxyRunGateway implements RunGateway {
     if (reply.result.ok) {
       pending.resolve(reply.result.data);
     } else if (reply.result.error.code === UNSUPPORTED_RUN_REQUEST) {
-      pending.reject(new UnsupportedRunRequestError(reply.result.error.message));
-    } else {
-      // Carry the reply's `code` (`unauthorized`, `cross-tenant`, ...) so a caller can tell an
-      // authentication failure from a real one, as Agora's proxy does.
-      const { message, code } = reply.result.error;
       pending.reject(
-        code !== undefined ? Object.assign(new Error(message), { code }) : new Error(message),
+        new UnsupportedRunRequestError(reply.result.error.message, UNSUPPORTED_RUN_REQUEST),
       );
+    } else {
+      pending.reject(new RunGatewayError(reply.result.error.message, reply.result.error.code));
     }
   }
 
   private request<T>(body: RunRequestKind): Promise<T> {
+    // A static token (or none) dispatches synchronously, exactly as before. A token PROVIDER is
+    // resolved first, and the `timeoutMs` clock starts only once it has: the deadline bounds the
+    // control plane's round trip, not the provider's latency. A provider that rejects fails the request.
+    const source = this.tenantToken;
+    if (typeof source !== 'function') return this.send<T>(source ?? this.tenant, body);
+    return resolveTenantToken(source).then((tenant) => this.send<T>(tenant, body));
+  }
+
+  private send<T>(tenant: string, body: RunRequestKind): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const requestId = globalThis.crypto.randomUUID();
       const timer = setTimeout(() => {
@@ -115,20 +146,7 @@ export class ProxyRunGateway implements RunGateway {
         );
       }, this.timeoutMs);
       this.pending.set(requestId, { resolve, reject, timer });
-      // A static token (or none) dispatches synchronously, exactly as before; only a token PROVIDER
-      // defers the dispatch until it resolves.
-      const source = this.tenantToken;
-      const dispatched =
-        typeof source === 'function'
-          ? resolveTenantToken(source).then((tenant) =>
-              this.transport.dispatchRunRequest?.({ requestId, tenant, body }),
-            )
-          : this.transport.dispatchRunRequest?.({
-              requestId,
-              tenant: source ?? this.tenant,
-              body,
-            });
-      dispatched?.catch((error: unknown) => {
+      this.transport.dispatchRunRequest?.({ requestId, tenant, body })?.catch((error: unknown) => {
         const stillPending = this.pending.get(requestId);
         if (!stillPending) return;
         clearTimeout(stillPending.timer);

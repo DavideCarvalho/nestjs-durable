@@ -17,7 +17,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DurableModule, type DurableModuleOptions } from './durable.module';
 // Imported from the package's public entry: the facade must expose the tenant-auth helpers.
 import { type TenantVerifier, hmacTenantVerifier, signTenantToken } from './index';
-import { ProxyRunGateway } from './proxy-run-gateway';
+import { ProxyRunGateway, RunGatewayError } from './proxy-run-gateway';
 import { RunRequestResponder, type RunRequestTransport } from './run-request-responder';
 import { StoreRunGateway } from './store-run-gateway';
 
@@ -223,10 +223,57 @@ describe('ProxyRunGateway tenant token', () => {
     expect((await tenant.listRuns({})).map((r) => r.id)).toEqual(['mine']);
 
     const forged = new ProxyRunGateway(tx, 'beta', 1000, undefined, signTenantToken('beta', 'x'));
-    await expect(forged.listRuns({})).rejects.toMatchObject({
+    const rejected = await forged.listRuns({}).catch((err: unknown) => err);
+    expect(rejected).toBeInstanceOf(RunGatewayError);
+    expect(rejected).toMatchObject({
       message: 'invalid or unauthorized tenant token',
       code: 'unauthorized',
     });
+  });
+
+  it('starts the request timeout only once the token provider has resolved', async () => {
+    vi.useFakeTimers();
+    try {
+      const tx = proxyTransport();
+      let release: (token: string) => void = () => {};
+      const slowToken = () =>
+        new Promise<string>((r) => {
+          release = r;
+        });
+      const gw = new ProxyRunGateway(tx, 'acme', 100, undefined, slowToken);
+      let settled: string | undefined;
+      void gw.listRuns({}).then(
+        () => {
+          settled = 'resolved';
+        },
+        (err: Error) => {
+          settled = err.message;
+        },
+      );
+      // The provider takes longer than the whole timeout: that time must not count.
+      await vi.advanceTimersByTimeAsync(500);
+      expect(settled).toBeUndefined();
+      expect(tx.requests).toHaveLength(0);
+      release('token-1');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(tx.requests.map((r) => r.tenant)).toEqual(['token-1']);
+      // The round trip gets its own full deadline from dispatch.
+      await vi.advanceTimersByTimeAsync(99);
+      expect(settled).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe('control plane did not respond to listRuns within 100ms');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a token provider that rejects fails the request', async () => {
+    const tx = proxyTransport();
+    const gw = new ProxyRunGateway(tx, 'acme', 1000, undefined, async () => {
+      throw new Error('token service down');
+    });
+    await expect(gw.listRuns({})).rejects.toThrow('token service down');
+    expect(tx.requests).toHaveLength(0);
   });
 });
 
