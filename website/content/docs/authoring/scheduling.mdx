@@ -217,10 +217,12 @@ Jitter only delays *when* an instance attempts the dispatch — it does not chan
 time bucket), so idempotency is unchanged: however many instances jitter the same window, it still
 starts exactly once.
 
-An instance waits the jitter once per window, only when the window has no run yet. Once it has seen
-the window's run exist — it started it, or another instance did — later ticks in that window skip the
-schedule without a store read or a wait, so a long `jitter` never holds up the rest of the poll (due
-timers, retries, timeouts).
+An instance never waits the jitter out inside a tick. A due window gets its own fire time, up to
+`jitter` after the instance first saw it, and a later tick starts it once that time arrives; a window
+deferred past the end of its interval still fires. Meanwhile other schedules and the rest of the poll
+(due timers, retries, timeouts) carry on, even when several jittered windows come due together, as
+after a restart. Once an instance has seen the window's run exist — it started it, or another instance
+did — later ticks in that window skip the schedule without a store read.
 
 ## Pinning the pool — `namespace`
 
