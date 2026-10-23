@@ -1,11 +1,11 @@
 import type { OriginFacet, OriginFilter } from '../client/run-origin';
-import { originFilterKey, sameOriginFilter } from '../client/run-origin';
+import { hasNamedOrigin, originFilterKey, sameOriginFilter } from '../client/run-origin';
 import { Button } from './ui/button';
 import { cn } from './ui/cn';
 
 /**
  * The "which library produced this run" facet: one chip per origin, with its count, plus `all` and
- * (when there are any) `unknown`.
+ * (when there are any) `app` — the app's own runs, which carry no package origin.
  *
  * Built like the header's STATUS chips rather than the sidebar's tag box, for two reasons that both
  * come from `WorkflowRun.origin` being a small, closed, machine-derived set: every value and its
@@ -18,7 +18,10 @@ import { cn } from './ui/cn';
  * unattributed bucket too (`origin IS NULL`), so selecting a chip narrows the query rather than
  * filtering what was already fetched.
  *
- * Renders nothing when there is nothing to choose between (no runs, so only `all`).
+ * Renders nothing unless at least one chip is a NAMED origin: on an app where no workflow declares
+ * one, every run is the app's own and `all N | app N` is no choice at all. The one exception is a
+ * non-default selection (e.g. restored from the URL) — the row stays so the operator can get back
+ * to `all`.
  */
 export function OriginFacets({
   facets,
@@ -29,7 +32,8 @@ export function OriginFacets({
   value: OriginFilter;
   onChange: (filter: OriginFilter) => void;
 }) {
-  if (facets.length <= 1) return null;
+  if (facets.length === 0) return null;
+  if (!hasNamedOrigin(facets) && value.kind === 'all') return null;
   return (
     // A plain container with a visible caption, exactly like the header's status chip row — the
     // caption is the label, so there is no `role="group"` for `useSemanticElements` to object to.
@@ -49,8 +53,8 @@ export function OriginFacets({
             onClick={() => onChange(facet.filter)}
             className={cn(
               'mono max-w-full gap-1 rounded-md',
-              // An unattributed run is not a package, so its chip is not styled like one — dim and
-              // italic says "absence" without hiding it or dressing it up as a real origin.
+              // The app's own runs are not a package, so their chip is not styled like one — dim and
+              // italic sets it apart without dressing it up as a real origin.
               facet.filter.kind === 'unknown' && 'italic text-zinc-500',
               selected && 'border-zinc-600 bg-zinc-900 text-zinc-100 hover:text-zinc-100',
             )}

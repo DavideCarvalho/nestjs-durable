@@ -88,12 +88,13 @@ export interface WorkflowRun {
    * from the creating engine. It is DERIVED, never caller input: `StartOptions` has no `origin`, so
    * nothing a caller passes to `start` can make a run claim another lib's name.
    *
-   * `undefined` means UNKNOWN — never "the app". It is what you get for a run created before this
+   * `undefined` means NO package origin — the console labels that bucket `app` (the app's own
+   * workflows, not declared by any library). It is what you get for a run created before this
    * field existed, for a registration path that carries no origin (`registerRemote`, convention
    * routing, a synthesized remote child, or a bare `engine.register` with no `origin` option), and
    * for a workflow whose declaring package could not be resolved with confidence. A wrong origin is
    * worse than an absent one: a filter that silently drops runs looks exactly like runs that never
-   * existed, so callers must render unknown as unknown and never fold it into a real package.
+   * existed, so callers must keep the no-origin bucket distinct and never fold it into a real package.
    */
   origin?: string | undefined;
   /**
@@ -998,11 +999,11 @@ export interface RunQuery {
    * Restrict to runs whose workflow was declared by this package (exact match against
    * {@link WorkflowRun.origin}), ANDed with the other predicates.
    *
-   * A run with NO origin (unknown — see the field) matches no `origin` VALUE at all, so a UI facet
+   * A run with NO origin (the console's `app` bucket — see the field) matches no `origin` VALUE at all, so a UI facet
    * built on this must keep an "all origins" option: filtering by any single package silently hides
    * every unattributed run, which reads to an operator as "those runs do not exist". `null` selects
-   * exactly that absent bucket (`origin IS NULL`), so a paginated console can offer an "unknown"
-   * facet without having to hold every run in the browser to find them.
+   * exactly that absent bucket (`origin IS NULL`), so a paginated console can offer an `app`
+   * (no-origin) facet without having to hold every run in the browser to find them.
    */
   origin?: string | null | undefined;
   /**

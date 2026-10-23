@@ -697,8 +697,8 @@ const RunRow = memo(function RunRow({
               {tenant}
             </Chip>
           )}
-          {/* Origin, when the run HAS one. An unattributed run shows no chip here rather than
-              a row of `unknown` noise — the facet above keeps its count on screen, the empty
+          {/* Origin, when the run HAS one. An app-own run shows no chip here rather than
+              a row of `app` noise — the facet above keeps its count on screen, the empty
               state names it, and the run's own detail header states it outright. */}
           {origin && (
             <Chip
@@ -860,8 +860,8 @@ function RunsList({
           <>
             <span className="text-[11px] text-zinc-500">
               {emptyNotice.unclassified} run{emptyNotice.unclassified === 1 ? '' : 's'} here{' '}
-              {emptyNotice.unclassified === 1 ? 'has' : 'have'} no recorded origin, so no package
-              filter can match {emptyNotice.unclassified === 1 ? 'it' : 'them'}.
+              {emptyNotice.unclassified === 1 ? 'is' : 'are'} the app's own (no package origin), so
+              no package filter can match {emptyNotice.unclassified === 1 ? 'it' : 'them'}.
             </span>
             <Button
               variant="chip"
@@ -870,7 +870,7 @@ function RunsList({
               title={UNKNOWN_ORIGIN_TITLE}
               onClick={() => onSelectOrigin({ kind: 'unknown' })}
             >
-              show unclassified
+              show app runs
             </Button>
           </>
         )}
@@ -1230,8 +1230,8 @@ const RunDetail = memo(function RunDetail({
   const detailState = deriveRunState(run, { runs: siblingRuns, health, timeline: body });
   // Show the tenant/partition only when it's a real named one (not the single-pool `default`).
   const tenant = run.namespace && run.namespace !== 'default' ? run.namespace : undefined;
-  // The declaring package, or `undefined` for UNKNOWN — which the header states outright rather
-  // than omitting, so "we don't know" never reads as "the app".
+  // The declaring package, or `undefined` for the app's own workflow — which the header states
+  // outright (as `origin app`) rather than omitting.
   const origin = knownOrigin(run.origin);
 
   return (
@@ -1283,8 +1283,8 @@ const RunDetail = memo(function RunDetail({
               </Chip>
             )}
             {/* WHICH LIBRARY declared this workflow — stated on every run, including the ones nobody
-                could attribute. Unlike the list row (dense, scannable), the detail view has room to
-                be explicit, and "unknown" is the honest answer here: not the host app, not blank. */}
+                declared without a package. Unlike the list row (dense, scannable), the detail view has
+                room to be explicit: a run with no package origin is the app's own, so it says `app`. */}
             {origin ? (
               <Chip variant="origin" className="mono py-0.5" title={`Declared by ${origin}`}>
                 {originLabel(origin)}

@@ -488,28 +488,30 @@ side (`RunQuery.namespaces`). The tenant chip on a run row adds itself to the se
 chips.
 
 **Origin** — which package declared the run's workflow — is a row of facet chips above the list:
-`all`, one chip per package (labelled without the npm scope, full name in the tooltip), and `unknown`
-when any run in the list has none, each with a count. It is **derived, never declared**: `@Workflow`
+`all`, one chip per package (labelled without the npm scope, full name in the tooltip), and `app`
+when any run in the list has none, each with a count. The row only appears once at least one run has a
+named package origin; when every run lacks one there is nothing to choose between, so it stays hidden. It is **derived, never declared**: `@Workflow`
 resolves the file it is applied in to the nearest enclosing `package.json`, so a library is attributed
 without opting into anything and nothing a caller passes to `start` can claim another library's name.
 The registrar warns once at boot naming whatever it could not attribute, because a *wrong* origin is
 worse than an absent one.
 
-Which makes **`undefined` a real value meaning UNKNOWN**, not a blank to be tidied away. Runs created
+Which makes **`undefined` a real value meaning "no package origin"**, not a blank to be tidied away.
+The console labels that bucket `app`: the app's own workflows, not declared by any library. Runs created
 before the field existed have none; so do `registerRemote`, convention routing, and any workflow whose
 declaring package couldn't be resolved with confidence. `RunQuery.origin` is plain equality, so those
 runs match **no** origin value at all — picking a package *hides* them rather than folding them into a
-bucket. Hence the shape of the facet: `all` is the default and never goes away, the `unknown` count
+bucket. Hence the shape of the facet: `all` is the default and never goes away, the `app` count
 stays on screen while a package is selected, and an origin filter that comes back empty says which of
 the two things happened ("nothing matched" vs "these N runs cannot be matched by any package filter")
-and offers a jump into the unclassified ones. A run's detail header states `origin unknown` outright
-for the same reason, instead of leaving the field blank and letting it read as "the app".
+and offers a jump into the app's own runs. A run's detail header states `origin app` outright for the
+same reason, instead of leaving the field blank.
 
-Both filters push down to the store, including the `unknown` one. `RunQuery.origin` accepts **`null`**
+Both filters push down to the store, including the `app` (no-origin) one. `RunQuery.origin` accepts **`null`**
 for exactly that bucket (`origin IS NULL`), which the console sends as `?unattributed=true` — its own
 param rather than a reserved `origin` value, because any reserved string is a package name someone can
 legitimately publish. The chips' counts come from [`GET runs/facets`](#counting-without-listing), not
-from the rows on screen, so the `unknown` count stays visible and exact while a package is selected —
+from the rows on screen, so the `app` count stays visible and exact while a package is selected —
 the property the facet exists for. **Retry all** / **cancel all** send the same predicate, so a bulk
 action is scoped to precisely the set the list was showing, unattributed runs included.
 
