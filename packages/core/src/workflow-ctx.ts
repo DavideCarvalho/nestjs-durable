@@ -665,13 +665,12 @@ export function createWorkflowCtx(
       );
       return unwrapCompletion<T>(buffered.payload, `child "${id}"`);
     }
-    if (!(await store.getRun(id)))
-      host.startChild(workflowName(workflow), input, id, priority, version);
     // Make the awaited child visible in the parent's timeline WHILE it runs: a `running` placeholder
     // at this seq with the same `signal:child:<id>` name the signal resolution later overwrites as
     // `completed`. So the dashboard shows the child node (and can inline-expand it) live, instead of
     // it appearing only when it finishes. Written once (skipped on replay, where `existing` is set);
-    // `running` is ignored by replay history, so it never short-circuits determinism.
+    // `running` is ignored by replay history, so it never short-circuits determinism. Written BEFORE
+    // the child starts: a child that finished first would have its completion overwritten by it.
     if (!existing) {
       await writeCheckpoint(
         instantCheckpoint({
@@ -683,6 +682,8 @@ export function createWorkflowCtx(
         }),
       );
     }
+    if (!(await store.getRun(id)))
+      host.startChild(workflowName(workflow), input, id, priority, version);
     throw new WorkflowSuspended(
       undefined,
       fanJoin([{ waiterPrefix: `child:${id}`, checkpointPrefix: `signal:child:${id}` }]),
