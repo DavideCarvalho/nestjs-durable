@@ -101,6 +101,40 @@ export function buildWidenStatements(
 }
 
 /**
+ * Where {@link ensureTypeOrmDurableSchema} reports a schema repair it actually applied. `console`
+ * (the default) satisfies it, and so does NestJS's `Logger`, so an app can route the warning into
+ * its own log stream.
+ */
+export interface DurableSchemaLogger {
+  warn(message: string): void;
+}
+
+export interface EnsureTypeOrmDurableSchemaOptions {
+  /** Sink for the schema-repair warning. Defaults to `console`. */
+  logger?: DurableSchemaLogger | undefined;
+}
+
+/**
+ * The warning logged when the boot-time schema check changed an EXISTING durable schema: created a
+ * table that was missing next to ones that exist, added a column, created an index, or widened a
+ * column. Never logged when the schema was already current, and never on a fresh install (no
+ * durable table existed yet, so creating them all is the expected first boot, not a drift).
+ *
+ * The discriminator matters more than the wording: a warning on every boot would be filtered as
+ * noise, and a silent repair hides a migration-managed schema that has drifted from the library.
+ */
+export function typeOrmSchemaRepairWarning(repairs: readonly string[]): string {
+  return [
+    `[nestjs-durable] store-typeorm repaired the durable schema at boot: ${repairs.join('; ')}.`,
+    'The database had drifted from the schema this library version expects (it was created by an',
+    'older version, or a migration left these out), so they were applied at runtime and nothing',
+    'recorded them in your migration history. To make them permanent, add a migration that calls',
+    '`ensureTypeOrmDurableSchema(queryRunner.connection)`. This warning appears only when a repair',
+    'was applied; a schema that is already current logs nothing.',
+  ].join(' ');
+}
+
+/**
  * Idempotently create the durable tables. Safe to run on every boot (auto-schema) and the
  * exact function to call from your own TypeORM migration when you disable auto-schema:
  *
@@ -112,9 +146,17 @@ export function buildWidenStatements(
  *
  * Dialect-aware (MySQL / MariaDB / Postgres / SQLite): identifiers are quoted per driver, keyed
  * string columns are `varchar` (MySQL can't key a `text` column), and the index is best-effort.
- * Only ever adds the three durable tables — it never touches your other tables.
+ * Only ever adds the durable tables — it never touches your other tables.
+ *
+ * When it changes an existing durable schema (a missing table, column or index, a MySQL JSON column
+ * still `text`), it logs ONE warning listing each change to `options.logger` (default `console`);
+ * see {@link typeOrmSchemaRepairWarning}. A current schema and a fresh install log nothing.
  */
-export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promise<void> {
+export async function ensureTypeOrmDurableSchema(
+  dataSource: DataSource,
+  options: EnsureTypeOrmDurableSchemaOptions = {},
+): Promise<void> {
+  const logger = options.logger ?? console;
   const q = (id: string) => dataSource.driver.escape(id);
   // Physical column names come from the entity metadata (canonical snake_case by default), so this
   // raw DDL always matches the registered `durableEntities` instead of hardcoding camelCase.
@@ -172,8 +214,10 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
         ? `${bufCol('id')} bigserial PRIMARY KEY`
         : `${bufCol('id')} bigint NOT NULL AUTO_INCREMENT PRIMARY KEY`;
 
-  const tables = [
-    `CREATE TABLE IF NOT EXISTS ${runs} (
+  const tables: Array<[string, string]> = [
+    [
+      'durable_workflow_runs',
+      `CREATE TABLE IF NOT EXISTS ${runs} (
       ${runsCol('id')} ${str} PRIMARY KEY,
       ${runsCol('workflow')} ${str} NOT NULL,
       ${runsCol('workflowVersion')} ${str} NOT NULL,
@@ -185,7 +229,10 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ${runsCol('priority')} ${int}, ${runsCol('namespace')} ${nsCol}, ${runsCol('origin')} ${str},
       ${runsCol('createdAt')} ${ts} NOT NULL, ${runsCol('updatedAt')} ${ts} NOT NULL
     )`,
-    `CREATE TABLE IF NOT EXISTS ${checkpoints} (
+    ],
+    [
+      'durable_step_checkpoints',
+      `CREATE TABLE IF NOT EXISTS ${checkpoints} (
       ${cpCol('runId')} ${str} NOT NULL, ${cpCol('seq')} ${int} NOT NULL,
       ${cpCol('name')} ${str} NOT NULL, ${cpCol('kind')} ${str} NOT NULL, ${cpCol('stepId')} ${str} NOT NULL,
       ${cpCol('status')} ${str} NOT NULL, ${cpCol('input')} ${txt}, ${cpCol('output')} ${txt}, ${cpCol('error')} ${txt}, ${cpCol('events')} ${txt},
@@ -194,29 +241,44 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ${cpCol('startedAt')} ${ts} NOT NULL, ${cpCol('finishedAt')} ${ts} NOT NULL,
       PRIMARY KEY (${cpCol('runId')}, ${cpCol('seq')})
     )`,
+    ],
     // Normalized search-attribute side-table: one row per (run, key) so attribute predicates push
     // DOWN into SQL via an EXISTS join (indexed below). `key` is keyed → must be varchar on MySQL.
-    `CREATE TABLE IF NOT EXISTS ${runAttributes} (
+    [
+      'durable_run_attributes',
+      `CREATE TABLE IF NOT EXISTS ${runAttributes} (
       ${attrCol('runId')} ${str} NOT NULL, ${attrCol('key')} ${str} NOT NULL,
       ${attrCol('strValue')} ${str}, ${attrCol('numValue')} ${num},
       PRIMARY KEY (${attrCol('runId')}, ${attrCol('key')})
     )`,
-    `CREATE TABLE IF NOT EXISTS ${waiters} (
+    ],
+    [
+      'durable_signal_waiters',
+      `CREATE TABLE IF NOT EXISTS ${waiters} (
       ${waiterCol('token')} ${str} PRIMARY KEY, ${waiterCol('runId')} ${str} NOT NULL, ${waiterCol('seq')} ${int} NOT NULL,
       ${waiterCol('parallelGroup')} ${str}
     )`,
-    `CREATE TABLE IF NOT EXISTS ${buffered} (
+    ],
+    [
+      'durable_buffered_signals',
+      `CREATE TABLE IF NOT EXISTS ${buffered} (
       ${bufferedId}, ${bufCol('token')} ${str} NOT NULL, ${bufCol('payload')} ${txt}
     )`,
+    ],
     // Caller-minted uuid PK (engine.publishEvent), not auto-increment — unlike durable_buffered_signals
     // above, removeBufferedEvent needs to target the EXACT id it was buffered with.
-    `CREATE TABLE IF NOT EXISTS ${bufferedEvents} (
+    [
+      'durable_buffered_events',
+      `CREATE TABLE IF NOT EXISTS ${bufferedEvents} (
       ${bevCol('id')} ${str} PRIMARY KEY, ${bevCol('name')} ${str} NOT NULL,
       ${bevCol('payload')} ${txt}, ${bevCol('publishedAt')} ${ts} NOT NULL
     )`,
+    ],
     // Persisted schedules. `next_fire_at` is epoch ms as a bigint (exact, so the compare-and-set on
     // it survives MySQL's DATETIME millisecond truncation); `spec`/`state` are engine-owned JSON.
-    `CREATE TABLE IF NOT EXISTS ${schedules} (
+    [
+      'durable_schedules',
+      `CREATE TABLE IF NOT EXISTS ${schedules} (
       ${schCol('id')} ${str} PRIMARY KEY, ${schCol('namespace')} ${nsCol},
       ${schCol('workflow')} ${str} NOT NULL,
       ${schCol('paused')} boolean NOT NULL DEFAULT ${isPg ? 'false' : '0'},
@@ -224,6 +286,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       ${schCol('spec')} ${txt} NOT NULL, ${schCol('state')} ${txt} NOT NULL,
       ${schCol('createdAt')} ${ts} NOT NULL, ${schCol('updatedAt')} ${ts} NOT NULL
     )`,
+    ],
   ];
 
   // Additive nullable columns gained across versions (e.g. `input`, `events`, `enqueuedAt`). On a
@@ -268,38 +331,67 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
     durable_signal_waiters: [['parallelGroup', str]],
   };
 
+  // What this boot actually changed, for the repair warning. Tables created here are recorded
+  // separately: their columns and indexes come with the CREATE, so they are not listed one by one.
+  const repairs: string[] = [];
+  const created = new Set<string>();
   const runner = dataSource.createQueryRunner();
   try {
-    for (const sql of tables) await runner.query(sql);
+    const before = await existingTables(runner, { isSqlite, isMysql });
+    for (const [table, sql] of tables) {
+      await runner.query(sql);
+      if (!before.has(table)) {
+        created.add(table);
+        repairs.push(`created table ${table}`);
+      }
+    }
     for (const [table, props] of Object.entries(additive)) {
       const have = await existingColumns(runner, table, { isSqlite, isMysql });
       for (const [property, colType] of props) {
         const column = resolve(table, property);
         if (!have.has(column)) {
           await runner.query(`ALTER TABLE ${q(table)} ADD COLUMN ${q(column)} ${colType}`);
+          repairs.push(`added column ${table}.${column}`);
         }
       }
     }
     // Widen pre-existing MySQL `text` JSON-blob columns to `longtext`. A table created before this
     // fix has these as `text` (64KB) and silently truncates large `events`/`output` payloads. MODIFY
-    // to `longtext` is idempotent (no-op if already longtext), so it's safe to run on every boot.
+    // to `longtext` only for the columns that are not `longtext` yet, so a current schema issues no
+    // ALTER (and a widen is reported only when one ran).
     // MySQL-only: Postgres/SQLite `text` is already unbounded, so there's nothing to widen.
-    for (const sql of buildWidenStatements(isMysql, q, resolve)) {
-      try {
-        await runner.query(sql);
-      } catch {
-        /* column already longtext, or table/column not present on this deploy */
+    if (isMysql) {
+      for (const [table, props] of Object.entries(JSON_BLOB_COLUMNS)) {
+        const types = await mysqlColumnTypes(runner, table);
+        for (const prop of props) {
+          const column = resolve(table, prop);
+          const current = types.get(column);
+          if (current === undefined || current === 'longtext') continue;
+          try {
+            await runner.query(
+              `ALTER TABLE ${q(table)} MODIFY COLUMN ${q(column)} ${jsonBlobColumnType(true)}`,
+            );
+            repairs.push(`widened ${table}.${column} from ${current} to longtext`);
+          } catch {
+            /* best-effort, as before: a failed widen leaves the column as it was */
+          }
+        }
       }
     }
     // MySQL has no `CREATE INDEX IF NOT EXISTS`; create each best-effort and ignore "already exists".
     //  - status/wakeAt: the timer poller (listDueTimers) and recovery (listIncompleteRuns) scans.
     //  - workflow/status: the dashboard's listRuns filters. (Checkpoints are keyed by the PK prefix
     //    `(runId, seq)`, so listCheckpoints/getEvent already hit an index — no extra one needed.)
-    const indexes: Array<[string, string]> = [
-      ['durable_runs_status_idx', `${runs} (${runsCol('status')}, ${runsCol('wakeAt')})`],
+    const indexes: Array<[name: string, target: string, table: string]> = [
+      [
+        'durable_runs_status_idx',
+        `${runs} (${runsCol('status')}, ${runsCol('wakeAt')})`,
+        'durable_workflow_runs',
+      ],
       [
         'durable_runs_workflow_status_idx',
         `${runs} (${runsCol('workflow')}, ${runsCol('status')})`,
+        'durable_workflow_runs',
       ],
       // namespace/status/createdAt: every poll tick of a namespaced worker filters on `namespace`
       // ANDed with `status` (and `listPendingRuns` orders by `createdAt`), so without this the two
@@ -309,6 +401,7 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       [
         'durable_runs_namespace_status_idx',
         `${runs} (${runsCol('namespace')}, ${runsCol('status')}, ${runsCol('createdAt')})`,
+        'durable_workflow_runs',
       ],
       // A run's checkpoints by fan, in seq order: the run detail's per-group aggregates and fan
       // pages. `parallel_group` is `varchar(191)` in this DDL (also when added by ALTER above), so
@@ -316,32 +409,49 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
       [
         'durable_step_checkpoints_group_idx',
         `${checkpoints} (${cpCol('runId')}, ${cpCol('parallelGroup')}, ${cpCol('seq')})`,
+        'durable_step_checkpoints',
       ],
       // A run's waiters: the `ctx.all` join barrier probes them once per settled child.
-      ['durable_signal_waiters_run_id_idx', `${waiters} (${waiterCol('runId')})`],
+      [
+        'durable_signal_waiters_run_id_idx',
+        `${waiters} (${waiterCol('runId')})`,
+        'durable_signal_waiters',
+      ],
       // buffered signals are taken FIFO per token (smallest id) — index the token for the scan.
-      ['durable_buffered_signals_token_idx', `${buffered} (${bufCol('token')})`],
+      [
+        'durable_buffered_signals_token_idx',
+        `${buffered} (${bufCol('token')})`,
+        'durable_buffered_signals',
+      ],
       // buffered events are scanned oldest-first per name — one composite index serves both.
       [
         'durable_buffered_events_name_published_at_idx',
         `${bufferedEvents} (${bevCol('name')}, ${bevCol('publishedAt')})`,
+        'durable_buffered_events',
       ],
       // Search-attribute pushdown: equality + range predicates probe by (key, value). Two composite
       // indexes — one per typed column — so a numeric range or a string equality is an index scan.
       // Persisted schedules: the poll's "due by T" scan (`paused = false AND next_fire_at <= T`).
-      ['durable_schedules_due_idx', `${schedules} (${schCol('paused')}, ${schCol('nextFireAt')})`],
+      [
+        'durable_schedules_due_idx',
+        `${schedules} (${schCol('paused')}, ${schCol('nextFireAt')})`,
+        'durable_schedules',
+      ],
       [
         'durable_run_attributes_num_idx',
         `${runAttributes} (${attrCol('key')}, ${attrCol('numValue')})`,
+        'durable_run_attributes',
       ],
       [
         'durable_run_attributes_str_idx',
         `${runAttributes} (${attrCol('key')}, ${attrCol('strValue')})`,
+        'durable_run_attributes',
       ],
     ];
-    for (const [name, target] of indexes) {
+    for (const [name, target, table] of indexes) {
       try {
         await runner.query(`CREATE INDEX ${q(name)} ON ${target}`);
+        if (!created.has(table)) repairs.push(`created index ${name} on ${table}`);
       } catch {
         /* index already exists */
       }
@@ -349,6 +459,48 @@ export async function ensureTypeOrmDurableSchema(dataSource: DataSource): Promis
   } finally {
     await runner.release();
   }
+  // A fresh install (no durable table existed before this boot) is the expected first run, not a
+  // drift: stay quiet. Anything else that changed means the database was behind.
+  const freshInstall = created.size === tables.length;
+  if (repairs.length > 0 && !freshInstall) logger.warn(typeOrmSchemaRepairWarning(repairs));
+}
+
+/** The durable tables that exist before the boot-time check runs (to tell a created table apart). */
+async function existingTables(
+  runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+  d: { isSqlite: boolean; isMysql: boolean },
+): Promise<Set<string>> {
+  const names = durableManagedTables();
+  if (d.isSqlite) {
+    const rows = (await runner.query(
+      "SELECT name FROM sqlite_master WHERE type = 'table'",
+    )) as Array<{ name: string }>;
+    return new Set(rows.map((r) => r.name).filter((name) => names.includes(name)));
+  }
+  const scope = d.isMysql ? 'TABLE_SCHEMA = DATABASE()' : 'table_schema = current_schema()';
+  const rows = (await runner.query(
+    `SELECT table_name AS name FROM information_schema.tables WHERE ${scope}`,
+  )) as Array<{ name?: string; TABLE_NAME?: string }>;
+  return new Set(
+    rows.map((r) => (r.name ?? r.TABLE_NAME) as string).filter((name) => names.includes(name)),
+  );
+}
+
+/** MySQL: `column → data_type` for `table` (empty when the table does not exist). */
+async function mysqlColumnTypes(
+  runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+  table: string,
+): Promise<Map<string, string>> {
+  const rows = (await runner.query(
+    'SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = ? AND TABLE_SCHEMA = DATABASE()',
+    [table],
+  )) as Array<{ name?: string; type?: string; COLUMN_NAME?: string; DATA_TYPE?: string }>;
+  return new Map(
+    rows.map((r) => [
+      (r.name ?? r.COLUMN_NAME) as string,
+      String(r.type ?? r.DATA_TYPE).toLowerCase(),
+    ]),
+  );
 }
 
 /** The columns that currently exist on `table`, so the schema can add only the missing ones

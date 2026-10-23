@@ -15,6 +15,20 @@ export const RESULT_EVENT = 'durable.result';
 export const HEARTBEAT_EVENT = 'durable.heartbeat';
 export const CONTROL_EVENT = 'durable.control';
 
+export interface EventEmitterTransportOptions {
+  /**
+   * Where a failing result/heartbeat handler is reported. Default `console.error`. A result whose
+   * handler threw (a store error while settling the checkpoint) is redelivered with backoff until
+   * {@link EventEmitterTransport.close} — the in-memory copy is the only one, as on a broker whose job
+   * stays queued until it is settled.
+   */
+  onError?: (err: unknown) => void;
+}
+
+/** Backoff for redelivering a result whose handler failed: 100ms doubling, capped at 5s. */
+const RESULT_RETRY_BASE_MS = 100;
+const RESULT_RETRY_MAX_MS = 5_000;
+
 /**
  * An in-process `Transport` backed by `@nestjs/event-emitter`'s `EventEmitter2`.
  *
@@ -24,10 +38,20 @@ export const CONTROL_EVENT = 'durable.control';
  */
 export class EventEmitterTransport implements Transport, ControlPlane {
   private readonly handlers = new Map<string, StepHandler>();
+  private readonly onError: (err: unknown) => void;
+  private closed = false;
+  private readonly retryTimers = new Set<ReturnType<typeof setTimeout>>();
 
-  constructor(private readonly emitter: EventEmitter2) {
+  constructor(
+    private readonly emitter: EventEmitter2,
+    options: EventEmitterTransportOptions = {},
+  ) {
+    this.onError =
+      options.onError ?? ((err) => console.error('[EventEmitterTransport] handler failed', err));
     this.emitter.on(TASK_EVENT, (taskInput: RemoteTask) => {
-      void this.process(taskInput);
+      // runStepHandler already turns a handler throw into a failed result; anything else that
+      // rejects here is reported, never left as an unhandled rejection.
+      void this.process(taskInput).catch((err) => this.onError(err));
     });
   }
 
@@ -42,14 +66,51 @@ export class EventEmitterTransport implements Transport, ControlPlane {
 
   onResult(handler: (result: StepResult) => Promise<void>): void {
     this.emitter.on(RESULT_EVENT, (result: StepResult) => {
-      void handler(result);
+      this.settle(handler, result, 0);
     });
+  }
+
+  /**
+   * Hand `result` to the engine; if settling fails, report it and try again with backoff. Called as
+   * `void handler(result)`, a rejection (the store briefly unreachable while the checkpoint is
+   * written) became an unhandled rejection — fatal under Node's default — and the result, whose only
+   * copy lived in this call, was lost. The engine settles a step only while it is still pending, so a
+   * retry after a partial write is safe. Retries stop once the transport is closed.
+   */
+  private settle(
+    handler: (result: StepResult) => Promise<void>,
+    result: StepResult,
+    attempt: number,
+  ): void {
+    Promise.resolve()
+      .then(() => handler(result))
+      .catch((err) => {
+        this.onError(err);
+        if (this.closed) return;
+        const delay = Math.min(RESULT_RETRY_BASE_MS * 2 ** attempt, RESULT_RETRY_MAX_MS);
+        const timer = setTimeout(() => {
+          this.retryTimers.delete(timer);
+          this.settle(handler, result, attempt + 1);
+        }, delay);
+        timer.unref?.();
+        this.retryTimers.add(timer);
+      });
   }
 
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
     this.emitter.on(HEARTBEAT_EVENT, (beat: Heartbeat) => {
-      void handler(beat);
+      // A lost beat only costs liveness for one interval; report it rather than crash the process.
+      Promise.resolve()
+        .then(() => handler(beat))
+        .catch((err) => this.onError(err));
     });
+  }
+
+  /** Stop redelivering failed results (the module calls it on shutdown). Idempotent. */
+  async close(): Promise<void> {
+    this.closed = true;
+    for (const timer of this.retryTimers) clearTimeout(timer);
+    this.retryTimers.clear();
   }
 
   async publishControl(msg: ControlMessage): Promise<void> {

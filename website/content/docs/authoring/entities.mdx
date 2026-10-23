@@ -102,8 +102,14 @@ export class CheckoutWorkflow {
 }
 ```
 
-Both dispatches are checkpointed at the point they're called, so replay never re-dispatches the op —
-each call happens exactly once from the workflow's side, regardless of how many times the run replays.
+Both sends are exactly once from the workflow's side, however many times the run replays. The op is
+stored durably in the entity's buffer, tagged with the caller's stable `<runId>:<seq>`, **before** the
+caller checkpoints the send. `callEntity` also records a pending intent first and marks it as sent with
+a conditional write, so a replay that runs while the entity is still working does not send the op
+again. If the caller's turn dies between storing the op and its checkpoint, the replay sends the same
+id again and the entity skips the copy. If the wake-up that follows is lost, nothing is stranded: the
+entity's run is created along with the first op, and an entity parked on its wait is paired with its
+buffered ops by the `reconcileMs` sweep.
 
 ## Driving an entity from outside a workflow
 
@@ -146,10 +152,13 @@ reading never disturbs the entity's run.
 - **Serialized per key.** Every op for a given `(name, key)` is delivered on the same signal token, and
   signals buffer FIFO per token — so ops for one key always run one at a time, in the order they were
   dispatched. Ops for *different* keys are fully independent and run concurrently.
-- **Exactly once.** Each op is delivered via `signalWithStart`, which starts the entity's run if it
-  doesn't exist yet (idempotent) and then signals it. Signal buffering means an op sent before the
-  entity's run is ready to receive it is never dropped — it's queued and consumed the instant the run
-  reaches its wait point.
+- **Exactly once.** An op sent from outside a workflow (`EntityService.signal`) goes through
+  `signalWithStart`, which starts the entity's run if it doesn't exist yet (idempotent) and then
+  signals it. An op sent from a workflow (`ctx.callEntity` / `ctx.signalEntity`) is buffered with the
+  caller's `<runId>:<seq>` id, and the entity skips a second copy of the same id, so a caller replay or
+  a crash between the send and its checkpoint never applies it twice. Signal buffering means an op
+  sent before the entity's run is ready to receive it is never dropped — it's queued and consumed the
+  instant the run reaches its wait point.
 - **Durable across restarts and replay.** The handler's mutation and the resulting state are captured
   in a single checkpoint per op, so a crash mid-op can't leave state saved without the "op complete"
   marker (or vice versa) — replay restores the checkpointed state rather than re-running the handler.

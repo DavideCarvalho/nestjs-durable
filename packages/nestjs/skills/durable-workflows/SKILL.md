@@ -96,8 +96,11 @@ const out = await ctx.step<ProcResult>('processing:proc', input);
 `@Step()` (bare) derives the routing name from the method as `` `${ClassName}.${method}` ``;
 `@Step('custom:name')` overrides it explicitly — needed for a cross-runtime contract where the other
 side has no `@Step` of its own. `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?,
-backoffMaxMs?, jitter?, timeoutMs? })` additionally opts into RUNTIME zod validation (`input`
-validates before the method runs, `output` validates its return value) and a def-level durable-retry
+backoffMaxMs?, jitter?, timeoutMs? })` additionally opts into RUNTIME validation (a Standard Schema such as zod, or a class-validator DTO
+class) (`input`
+validates before the method runs, `output` validates its return value; a mismatch throws a
+`SchemaValidationError` from core, a `FatalError` with code `invalid_input` / `invalid_output` and
+`details.issues`) and a def-level durable-retry
 policy — a bare `@Step()` skips both and dispatches with no retry/timeout.
 
 Every dispatched step is a first-class checkpoint: on crash/replay a `completed` one returns its
@@ -308,7 +311,8 @@ async invalid(ctx: WorkflowCtx, failure: OnErrorInput<Line>): Promise<LineResult
 ```
 
 `error.details` is the third argument of `FatalError(message, code, details)` (e.g. validation
-issues). Retrying the run runs its body again; a new failure goes to a new handler run.
+issues; a `SchemaValidationError` carries `{ issues }`, and `@OnError(SchemaValidationError)` catches
+`invalid_input`, `invalid_output` and `schema_validation`). Retrying the run runs its body again; a new failure goes to a new handler run.
 It matches on `code`, never `instanceof`, must return `run`'s output type, and never sees
 cancellation (a `cancelled` run never routes), `nested_workflow_call` ctx misuse, or `non_determinism`
 (`NonDeterminismError` carries `code: 'non_determinism'`). `@Workflow({ onError: [{ code, workflow }] })` routes to another workflow.

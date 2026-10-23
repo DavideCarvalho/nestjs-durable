@@ -11,6 +11,7 @@ import { EventEmitterTransport } from '@dudousxd/nestjs-durable-transport-event-
 import { Injectable } from '@nestjs/common';
 import { EventEmitter2, EventEmitterModule } from '@nestjs/event-emitter';
 import { Test } from '@nestjs/testing';
+import { IsInt, Min } from 'class-validator';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { DURABLE_STEP_METADATA, Step, Workflow, getDurableStepMeta } from './decorators';
@@ -194,11 +195,14 @@ class CheckoutByRefWorkflow {
   }
 }
 
+// Polled against a wall-clock deadline rather than a tick count: a DTO-validated step's first call
+// loads class-validator through a dynamic `import()`, which takes longer than a few event-loop turns.
 async function settle(store: InMemoryStateStore, runId: string) {
-  for (let i = 0; i < 50; i += 1) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
     const run = await store.getRun(runId);
     if (run?.status === 'completed' || run?.status === 'failed') return run;
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error(`run ${runId} did not settle`);
 }
@@ -231,7 +235,7 @@ describe('ctx.step(this.svc.method, input) — reference form end-to-end', () =>
 });
 
 // ---------------------------------------------------------------------------
-// End-to-end: `@Step({ input, output })` — runtime zod validation at the serve boundary.
+// End-to-end: `@Step({ input, output })` — runtime schema validation at the serve boundary.
 // ---------------------------------------------------------------------------
 
 @Injectable()
@@ -242,6 +246,28 @@ class ValidatedPaymentsService {
   })
   async chargeCard(input: { amount: number }) {
     return { chargeId: `ch_${input.amount}` };
+  }
+}
+
+class RefundInput {
+  @IsInt() @Min(1) amount!: number;
+}
+
+@Injectable()
+class RetriedRefundsService {
+  // A long backoff: were a schema failure retried, the run would park `suspended` waiting on it.
+  @Step({ input: RefundInput, retries: 3, backoffMs: 60_000 })
+  async refund(input: RefundInput) {
+    return input instanceof RefundInput ? `refunded ${input.amount}` : 'not a RefundInput';
+  }
+}
+
+@Workflow({ name: 'refund-validated', version: '1' })
+class RefundValidatedWorkflow {
+  constructor(private readonly refunds: RetriedRefundsService) {}
+
+  async run(ctx: WorkflowCtx, order: { amount: unknown }) {
+    return ctx.step(this.refunds.refund, order as RefundInput);
   }
 }
 
@@ -302,6 +328,53 @@ describe('@Step({ input, output }) — runtime validation at serve time', () => 
 
     expect(result?.status).toBe('completed');
     expect(result?.output).toBe('ch_42');
+    await moduleRef.close();
+  });
+
+  async function bootRefunds(store: InMemoryStateStore) {
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        EventEmitterModule.forRoot(),
+        DurableModule.forRootAsync({
+          inject: [EventEmitter2],
+          useFactory: (emitter: EventEmitter2) => ({
+            store,
+            transport: new EventEmitterTransport(emitter),
+          }),
+        }),
+      ],
+      providers: [RetriedRefundsService, RefundValidatedWorkflow],
+    }).compile();
+    await moduleRef.init();
+    return moduleRef;
+  }
+
+  it('fails a DTO-validated step with invalid_input at once — no retry, issues attached', async () => {
+    const store = new InMemoryStateStore();
+    const moduleRef = await bootRefunds(store);
+
+    await moduleRef.get(WorkflowService).start('refund-validated', { amount: 0 }, 'bad2');
+    const result = await settle(store, 'bad2');
+
+    expect(result?.status).toBe('failed');
+    expect(result?.error).toMatchObject({
+      code: 'invalid_input',
+      details: { issues: [{ path: ['amount'] }] },
+    });
+    expect(result?.error?.message).toMatch(
+      /invalid step ".*" input: amount must not be less than 1/,
+    );
+    await moduleRef.close();
+  });
+
+  it('hands the step method the parsed DTO instance', async () => {
+    const store = new InMemoryStateStore();
+    const moduleRef = await bootRefunds(store);
+
+    await moduleRef.get(WorkflowService).start('refund-validated', { amount: 5 }, 'good2');
+    const result = await settle(store, 'good2');
+
+    expect(result).toMatchObject({ status: 'completed', output: 'refunded 5' });
     await moduleRef.close();
   });
 });

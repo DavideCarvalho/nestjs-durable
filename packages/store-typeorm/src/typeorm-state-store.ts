@@ -4,6 +4,7 @@ import {
   type CheckpointQuery,
   type CheckpointStat,
   type ChildWait,
+  type OwnedLeaseReclaim,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -41,6 +42,7 @@ import {
   type EntityManager,
   In,
   IsNull,
+  LessThan,
   LessThanOrEqual,
   Like,
   type Repository,
@@ -56,7 +58,11 @@ import {
   StepCheckpointEntity,
   WorkflowRunEntity,
 } from './entities';
-import { durableColumnResolver, ensureTypeOrmDurableSchema } from './schema';
+import {
+  type DurableSchemaLogger,
+  durableColumnResolver,
+  ensureTypeOrmDurableSchema,
+} from './schema';
 
 /** {@link checkpointNameKind} as a SQL expression over the `cp` alias, for selecting and grouping. */
 const CHECKPOINT_NAME_KIND_SQL =
@@ -84,15 +90,28 @@ interface RawCheckpointStat {
 // so simultaneous async claims cannot issue overlapping BEGIN statements on that connection.
 const sqliteSingletonClaims = new WeakMap<DataSource, Promise<void>>();
 
+/** Options for a {@link TypeOrmStateStore}. */
+export interface TypeOrmStateStoreOptions {
+  /**
+   * Where `ensureSchema()` (the boot-time auto-schema) reports a schema repair it actually applied
+   * — a missing table, column or index it had to add. Defaults to `console`. NestJS's `Logger`
+   * satisfies it.
+   */
+  schemaLogger?: DurableSchemaLogger | undefined;
+}
+
 /**
  * TypeORM-backed `StateStore`. Works on any TypeORM driver — Postgres, MySQL, SQLite (tested);
  * timestamps use native datetime columns and `wakeAt` is stored as a datetime too.
  */
 export class TypeOrmStateStore implements StateStore {
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly options: TypeOrmStateStoreOptions = {},
+  ) {}
 
   async ensureSchema(): Promise<void> {
-    await ensureTypeOrmDurableSchema(this.dataSource);
+    await ensureTypeOrmDurableSchema(this.dataSource, { logger: this.options.schemaLogger });
   }
 
   private runs() {
@@ -166,6 +185,7 @@ export class TypeOrmStateStore implements StateStore {
               {
                 status: 'suspended',
                 wakeAt: new Date(patch.wakeAt),
+                tags: patch.tags,
                 updatedAt: patch.updatedAt,
               },
             );
@@ -192,29 +212,7 @@ export class TypeOrmStateStore implements StateStore {
     // Single UPDATE (no pre-SELECT + save round-trips): map only the patched fields. The query
     // builder still applies the entities' JSON column transformers to the `set` values (as in
     // listRuns/tryLockRun). Preserve the not-found throw any caller may rely on.
-    const update: Record<string, unknown> = {};
-    if ('workflow' in patch) update.workflow = patch.workflow;
-    if ('workflowVersion' in patch) update.workflowVersion = patch.workflowVersion;
-    if ('status' in patch) update.status = patch.status;
-    if ('input' in patch) update.input = patch.input ?? null;
-    if ('output' in patch) update.output = patch.output ?? null;
-    if ('error' in patch) update.error = patch.error ?? null;
-    if ('wakeAt' in patch) update.wakeAt = patch.wakeAt == null ? null : new Date(patch.wakeAt);
-    if ('lockedBy' in patch) update.lockedBy = patch.lockedBy ?? null;
-    if ('lockedUntil' in patch)
-      update.lockedUntil = patch.lockedUntil == null ? null : new Date(patch.lockedUntil);
-    if ('awaitingDecisionTaskId' in patch)
-      update.awaitingDecisionTaskId = patch.awaitingDecisionTaskId ?? null;
-    if ('recoveryAttempts' in patch) update.recoveryAttempts = patch.recoveryAttempts;
-    if ('tags' in patch) update.tags = patch.tags ?? null;
-    if ('searchAttributes' in patch) update.searchAttributes = patch.searchAttributes ?? null;
-    if ('priority' in patch) update.priority = patch.priority ?? null;
-    // A patch that clears the namespace still lands on `'default'`, never NULL — the column is the
-    // isolation predicate, and a NULL there would match no worker's namespace at all.
-    if ('namespace' in patch) update.namespace = patch.namespace ?? 'default';
-    if ('origin' in patch) update.origin = patch.origin ?? null;
-    if ('createdAt' in patch) update.createdAt = patch.createdAt;
-    if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;
+    const update = runUpdateSet(patch);
     const result = await this.runs()
       .createQueryBuilder()
       .update()
@@ -224,6 +222,31 @@ export class TypeOrmStateStore implements StateStore {
     if (!result.affected) throw new Error(`run ${runId} not found`);
     // Keep the side-table in step with the run's attributes whenever they're patched.
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
+  }
+
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    inputPatch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    if (expectedStatuses.length === 0) return false;
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) => this.getRun(id))
+        : inputPatch;
+    // The status predicate is part of the UPDATE itself: the database arbitrates the race, and the
+    // changed-row count is the answer (a missing row matches nothing).
+    const set = runUpdateSet(patch);
+    const where = { id: runId, status: In(expectedStatuses) };
+    // Nothing to write but (maybe) the attribute side-table: the compare is a read (TypeORM refuses
+    // an UPDATE with no values).
+    const matched = Object.keys(set).length
+      ? ((await this.runs().createQueryBuilder().update().set(set).where(where).execute())
+          .affected ?? 0)
+      : await this.runs().countBy(where);
+    if (!matched) return false;
+    if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
+    return true;
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
@@ -351,6 +374,44 @@ export class TypeOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const now = new Date(nowMs);
+    const rows = await this.runs().find({
+      where: [
+        {
+          status: In(['running', 'cancelling']),
+          lockedUntil: IsNull(),
+          ...(namespace !== undefined ? { namespace } : {}),
+        },
+        {
+          status: In(['running', 'cancelling']),
+          lockedUntil: LessThanOrEqual(now),
+          ...(namespace !== undefined ? { namespace } : {}),
+        },
+        // A live lease left by a previous process with the caller's own instance id.
+        ...(ownedBy
+          ? [
+              {
+                status: In(['running', 'cancelling']),
+                lockedBy: ownedBy.owner,
+                lockedUntil: LessThan(new Date(ownedBy.lockedBefore)),
+                ...(namespace !== undefined ? { namespace } : {}),
+              },
+            ]
+          : []),
+      ],
+      order: { createdAt: 'ASC' },
+      take: limit,
+    });
+    return rows.map(fromRunEntity);
+  }
+
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.runs().find({
       where: { status: 'pending', ...(namespace !== undefined ? { namespace } : {}) },
@@ -395,8 +456,11 @@ export class TypeOrmStateStore implements StateStore {
     return result.affected === 1;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
-    await this.runs().update({ id: runId }, { lockedBy: null, lockedUntil: () => 'NULL' });
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
+    await this.runs().update(owner === undefined ? { id: runId } : { id: runId, lockedBy: owner }, {
+      lockedBy: null,
+      lockedUntil: () => 'NULL',
+    });
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
@@ -945,7 +1009,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     // An absent namespace is persisted as `'default'` (what the core `WorkflowRun.namespace` docblock
     // promises), so the column is always a value a worker can match on — the opposite of `origin`
     // below, where NULL is the only honest answer.
-    namespace: run.namespace ?? 'default',
+    namespace: run.namespace || 'default', // '' is the default pool too
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
     createdAt: run.createdAt,
@@ -1061,6 +1125,34 @@ function fromScheduleEntity(e: ScheduleEntity): ScheduleRecord {
  * One conditional UPDATE: the `status = 'pending'` predicate is the compare, the affected-row count
  * the answer. A missing row matches nothing, so it is never created.
  */
+/** The UPDATE `set` for a run patch: only the patched fields, mapped to their columns. */
+function runUpdateSet(patch: Partial<WorkflowRun>): Record<string, unknown> {
+  const update: Record<string, unknown> = {};
+  if ('workflow' in patch) update.workflow = patch.workflow;
+  if ('workflowVersion' in patch) update.workflowVersion = patch.workflowVersion;
+  if ('status' in patch) update.status = patch.status;
+  if ('input' in patch) update.input = patch.input ?? null;
+  if ('output' in patch) update.output = patch.output ?? null;
+  if ('error' in patch) update.error = patch.error ?? null;
+  if ('wakeAt' in patch) update.wakeAt = patch.wakeAt == null ? null : new Date(patch.wakeAt);
+  if ('lockedBy' in patch) update.lockedBy = patch.lockedBy ?? null;
+  if ('lockedUntil' in patch)
+    update.lockedUntil = patch.lockedUntil == null ? null : new Date(patch.lockedUntil);
+  if ('awaitingDecisionTaskId' in patch)
+    update.awaitingDecisionTaskId = patch.awaitingDecisionTaskId ?? null;
+  if ('recoveryAttempts' in patch) update.recoveryAttempts = patch.recoveryAttempts;
+  if ('tags' in patch) update.tags = patch.tags ?? null;
+  if ('searchAttributes' in patch) update.searchAttributes = patch.searchAttributes ?? null;
+  if ('priority' in patch) update.priority = patch.priority ?? null;
+  // A patch that clears the namespace still lands on `'default'`, never NULL — the column is the
+  // isolation predicate, and a NULL there would match no worker's namespace at all.
+  if ('namespace' in patch) update.namespace = patch.namespace || 'default';
+  if ('origin' in patch) update.origin = patch.origin ?? null;
+  if ('createdAt' in patch) update.createdAt = patch.createdAt;
+  if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;
+  return update;
+}
+
 async function updateIfPending(
   repo: Repository<StepCheckpointEntity>,
   checkpoint: StepCheckpoint,

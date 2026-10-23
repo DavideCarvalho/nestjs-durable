@@ -4,6 +4,7 @@ import {
   type CheckpointQuery,
   type CheckpointStat,
   type ChildWait,
+  type OwnedLeaseReclaim,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -56,7 +57,7 @@ import {
   sql,
 } from 'drizzle-orm';
 import type { PgDatabase } from 'drizzle-orm/pg-core';
-import { ensureDrizzlePgDurableSchema } from './ddl';
+import { type DurableSchemaLogger, ensureDrizzlePgDurableSchema } from './ddl';
 import { rowsOf } from './executor';
 import {
   DEFAULT_NAMESPACE,
@@ -88,6 +89,12 @@ export interface DrizzlePgStateStoreOptions {
    * this for you via {@link DrizzlePgStateStore.withScope}.
    */
   scope?: { namespace?: string | undefined } | undefined;
+  /**
+   * Where `ensureSchema()` (the boot-time auto-schema) reports a schema repair it actually applied
+   * — a missing table or index it had to create. Defaults to `console`. NestJS's `Logger`
+   * satisfies it.
+   */
+  schemaLogger?: DurableSchemaLogger | undefined;
 }
 
 /** OR a set of conditions where an EMPTY set means "matches nothing" (every plural `RunQuery`
@@ -98,9 +105,14 @@ function anyOf(conditions: (SQL | undefined)[]): SQL {
 }
 
 /** `undefined` = no restriction (the operator view), never `namespace IS NULL`. The column is
- *  NOT NULL DEFAULT 'default', so plain equality is exact. */
+ *  NOT NULL DEFAULT 'default', so plain equality is exact — except that the default pool also
+ *  matches legacy `''` rows (an engine configured with `namespace: ''` before '' was normalised). */
 function namespaceFilter(namespace: string | undefined): SQL | undefined {
-  return namespace === undefined ? undefined : eq(workflowRuns.namespace, namespace);
+  if (namespace === undefined) return undefined;
+  if (namespace === DEFAULT_NAMESPACE || namespace === '') {
+    return inArray(workflowRuns.namespace, [DEFAULT_NAMESPACE, '']);
+  }
+  return eq(workflowRuns.namespace, namespace);
 }
 
 /** `tags @> '["tag"]'::jsonb` — exact element containment (so `etl` never matches `etl-foo`), and
@@ -146,7 +158,7 @@ export class DrizzlePgStateStore implements StateStore {
   /** Idempotent CREATE TABLE / INDEX IF NOT EXISTS under an advisory lock — called on boot when the
    *  module's `autoSchema` is on. Turn `autoSchema` off if drizzle-kit owns these tables. */
   async ensureSchema(): Promise<void> {
-    await ensureDrizzlePgDurableSchema(this.db);
+    await ensureDrizzlePgDurableSchema(this.db, { logger: this.options.schemaLogger });
   }
 
   /** The read-scope predicate on the runs table (undefined when the store is unscoped). */
@@ -206,6 +218,36 @@ export class DrizzlePgStateStore implements StateStore {
       if (Object.keys(row).length)
         await tx.update(workflowRuns).set(row).where(eq(workflowRuns.id, runId));
       if (reindex) await reindexAttributes(tx, runId, patch.searchAttributes);
+    });
+  }
+
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    inputPatch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    if (expectedStatuses.length === 0) return false;
+    // Writes are unscoped, like updateRun.
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) =>
+            this.withScope({}).getRun(id),
+          )
+        : inputPatch;
+    const row = toRunPatch(patch);
+    const reindex = 'searchAttributes' in patch;
+    const matches = and(eq(workflowRuns.id, runId), inArray(workflowRuns.status, expectedStatuses));
+    return this.db.transaction(async (tx) => {
+      // One conditional UPDATE: a writer racing another blocks on the row lock, then re-evaluates
+      // the status predicate against the committed row. With no mapped column to write, the compare
+      // is a locking read instead.
+      const applied = Object.keys(row).length
+        ? (await tx.update(workflowRuns).set(row).where(matches).returning({ id: workflowRuns.id }))
+            .length === 1
+        : (await tx.select({ id: workflowRuns.id }).from(workflowRuns).where(matches).for('update'))
+            .length === 1;
+      if (applied && reindex) await reindexAttributes(tx, runId, patch.searchAttributes);
+      return applied;
     });
   }
 
@@ -361,6 +403,39 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const rows = await this.db
+      .select()
+      .from(workflowRuns)
+      .where(
+        and(
+          inArray(workflowRuns.status, ['running', 'cancelling']),
+          or(
+            isNull(workflowRuns.lockedUntil),
+            lte(workflowRuns.lockedUntil, new Date(nowMs)),
+            // A live lease left by a previous process with the caller's own instance id.
+            ownedBy
+              ? and(
+                  eq(workflowRuns.lockedBy, ownedBy.owner),
+                  lt(workflowRuns.lockedUntil, new Date(ownedBy.lockedBefore)),
+                )
+              : undefined,
+          ),
+          namespaceFilter(namespace),
+          this.scope(),
+        ),
+      )
+      .orderBy(asc(workflowRuns.createdAt))
+      .limit(limit);
+    return rows.map(fromRunRow);
+  }
+
   /** FIFO pick-up, served by `durable_workflow_runs_namespace_status_idx`. The engine then leases
    *  each run with {@link tryLockRun}; the listing itself takes no locks (it runs outside a tx). */
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
@@ -412,11 +487,15 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.length === 1;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
     await this.db
       .update(workflowRuns)
       .set({ lockedBy: null, lockedUntil: null })
-      .where(eq(workflowRuns.id, runId));
+      .where(
+        owner === undefined
+          ? eq(workflowRuns.id, runId)
+          : and(eq(workflowRuns.id, runId), eq(workflowRuns.lockedBy, owner)),
+      );
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
@@ -1044,7 +1123,7 @@ function toRunRow(run: WorkflowRun): RunInsert {
     tags: run.tags ?? null,
     searchAttributes: run.searchAttributes ?? null,
     priority: run.priority ?? null,
-    namespace: run.namespace ?? DEFAULT_NAMESPACE,
+    namespace: run.namespace || DEFAULT_NAMESPACE, // '' is the default pool too
     origin: run.origin ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
@@ -1071,7 +1150,7 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunInsert> {
   if ('searchAttributes' in patch) row.searchAttributes = patch.searchAttributes ?? null;
   if ('priority' in patch) row.priority = patch.priority ?? null;
   // Never cleared to NULL: an undefined namespace means the default one.
-  if ('namespace' in patch) row.namespace = patch.namespace ?? DEFAULT_NAMESPACE;
+  if ('namespace' in patch) row.namespace = patch.namespace || DEFAULT_NAMESPACE;
   if ('origin' in patch) row.origin = patch.origin ?? null;
   if (patch.createdAt != null) row.createdAt = patch.createdAt;
   if (patch.updatedAt != null) row.updatedAt = patch.updatedAt;
@@ -1095,7 +1174,7 @@ function fromRunRow(row: RunRow): WorkflowRun {
     tags: row.tags ?? undefined,
     searchAttributes: row.searchAttributes ?? undefined,
     priority: row.priority ?? undefined,
-    namespace: row.namespace,
+    namespace: row.namespace || DEFAULT_NAMESPACE, // a legacy '' row reads back as the default pool
     origin: row.origin ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,

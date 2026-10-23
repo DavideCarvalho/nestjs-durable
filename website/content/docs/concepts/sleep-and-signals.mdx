@@ -36,6 +36,23 @@ passed the recorded `wakeAt` it returns immediately (the sleep is "done"); other
 on the *same* `wakeAt`. The wake time is fixed by the first run's checkpoint, not recomputed on
 replay — so a clock skew or a redeploy can't accidentally shift an already-scheduled timer.
 
+### Delayed start
+
+To start a run later instead of sleeping at the top of its body, pass `startAt` (epoch ms or a
+`Date`) to `start`:
+
+```ts
+await engine.start('send-reminder', { userId }, `reminder:${userId}`, {
+  startAt: Date.now() + 24 * 60 * 60 * 1000,
+});
+```
+
+The run is created `suspended` with its `wakeAt` set to `startAt`, the same durable timer a sleep
+parks on, and the timer poller starts it once it is due, on any instance. Until then `start`
+returns `suspended`, the run reads `suspended`, and it counts as in flight for singleton back-pressure
+and concurrency quotas. It skips the `run.started` event's `pending → running` hop. A `startAt`
+that is not in the future (by the engine's clock) starts the run at once.
+
 ## Signals
 
 `ctx.waitForSignal<TPayload>(token: string, opts?: { timeoutMs?: number }): Promise<TPayload>`

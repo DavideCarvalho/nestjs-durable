@@ -11,6 +11,7 @@ import {
   STATE_STORE,
   STATE_STORE_CANONICAL,
   type ScheduledWorkflow,
+  type StalledRunInfo,
   type StateStore,
   TRANSPORT,
   TRANSPORT_CANONICAL,
@@ -285,6 +286,19 @@ export interface DurableModuleOptions {
    */
   reconcileMs?: number;
   /**
+   * Idle time (ms) before a stranded in-flight run is reported to {@link onStalled} listeners.
+   * Defaults to 900000 (15 min), floored at 60000. See `WorkflowEngineDeps.stalledAfterMs`.
+   * Operator only.
+   */
+  stalledAfterMs?: number;
+  /**
+   * Pager hook for stranded runs, registered on the engine as `engine.onStalled(...)`: a run
+   * suspended with no wake timer, or parked on an old pending remote step nothing is leasing. The
+   * timer poller sweeps once a minute and reports each stranded episode once per instance.
+   * Equivalent to calling `engine.onStalled` from a provider; only a DRIVING operator sweeps.
+   */
+  onStalled?: (info: StalledRunInfo) => void;
+  /**
    * The most due timers one timer-poll pass loads and drives, most overdue first, so a wave of
    * thousands of due runs is worked through in batches. Defaults to 500; a non-finite or sub-1 value
    * falls back to the default. See `WorkflowEngineDeps.timerBatchSize`. Operator only.
@@ -328,6 +342,18 @@ export interface DurableModuleOptions {
    * a driving instance's poll picks it up. Ignored (irrelevant) for a thin worker (no `store`).
    */
   drive?: boolean;
+  /**
+   * Whether this process CONSUMES from the broker. Defaults to `true`. Set `false` in a process that
+   * boots the module without being a worker — a CLI command, a REPL, a migration or seed script — so
+   * it doesn't compete with the real fleet: every transport that supports it (`BullMQTransport`) has
+   * its point-to-point consumers (step tasks, results, decisions, step events, start-run, run-request)
+   * parked via `deferConsumers()`, and no co-located/thin worker consumer starts. The process still
+   * dispatches and starts runs; the jobs stay on the queues for the fleet. Pair it with
+   * `drive: false` so it doesn't poll/recover runs either. To consume later in the same process, call
+   * `startConsumers()` on your transport. A transport without `deferConsumers()` (the SQL/SQS/in-process
+   * transports) keeps consuming — a warning says so.
+   */
+  consumers?: boolean;
   /** Max ms to wait for in-flight runs on shutdown before exiting. Defaults to 10000. Operator only. */
   shutdownTimeoutMs?: number;
   /**
@@ -501,6 +527,18 @@ export interface DurableModuleAsyncOptions {
   // consumer supply a factory with concrete injected args, e.g. `(config: ConfigService) => …`.
   useFactory: (...args: never[]) => DurableModuleOptions | Promise<DurableModuleOptions>;
   inject?: InjectionToken[];
+}
+
+/** Park `transport`'s point-to-point consumers (`consumers: false`) when it supports it. */
+function deferTransportConsumers(transport: Transport): void {
+  const deferrable = transport as Transport & { deferConsumers?: () => void };
+  if (typeof deferrable.deferConsumers === 'function') {
+    deferrable.deferConsumers();
+    return;
+  }
+  console.warn(
+    `[nestjs-durable] consumers: false — ${transport.constructor?.name ?? 'this transport'} cannot defer its consumers and will keep consuming in this process`,
+  );
 }
 
 /** Throws the exact role-inference contract errors documented on {@link DurableModuleOptions}. */
@@ -804,6 +842,13 @@ export class DurableModule {
                 carrier && Object.keys(carrier).length > 0
                   ? runtime.deserialize(carrier, fn)
                   : fn());
+            // `consumers: false`: park every transport's point-to-point consumers BEFORE the engine
+            // subscribes to them (its constructor registers the results/decisions consumers).
+            if (options.consumers === false) {
+              for (const t of [transport, ...(options.transports ?? []).map((n) => n.transport)]) {
+                if (t) deferTransportConsumers(t);
+              }
+            }
             const engine = new WorkflowEngine({
               store,
               transport: transport ?? undefined,
@@ -816,6 +861,7 @@ export class DurableModule {
               remoteRedispatchMs: options.remoteRedispatchMs,
               remoteRedispatchMax: options.remoteRedispatchMax,
               reconcileMs: options.reconcileMs,
+              stalledAfterMs: options.stalledAfterMs,
               timerBatchSize: options.timerBatchSize,
               eventBufferTtlMs: options.eventBufferTtlMs,
               blockedPollMs: options.blockedPollMs,
@@ -836,6 +882,7 @@ export class DurableModule {
               runDispatcher: options.drive === false ? { dispatch: () => {} } : undefined,
             });
             for (const queue of options.queues ?? []) engine.registerQueue(queue);
+            if (options.onStalled) engine.onStalled(options.onStalled);
             // Dead-letter routing (per-workflow `@DeadLetter()` / `deadLetterWorkflow` + this global
             // default) is wired by the WorkflowRegistrar, which owns the `@Workflow` metadata.
             return engine;

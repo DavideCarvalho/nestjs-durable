@@ -1,5 +1,49 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.52.0
+
+### Minor Changes
+
+- [#406](https://github.com/DavideCarvalho/nestjs-durable/pull/406) [`4d9e840`](https://github.com/DavideCarvalho/nestjs-durable/commit/4d9e8406948130b55de0072e1276bbe06666ddd3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - **Behaviour change:** the console now fails closed in production when no authentication is configured.
+
+  Before, `DurableDashboardModule.forRoot()` / `forRootAsync()` with no `guards` and no `dashboardAuth` served the console (UI and JSON API, including retry/cancel) with no authentication in every environment. Now:
+
+  - With `NODE_ENV=production` (case-insensitive), an unconfigured console answers `403` on every UI and API request, and one error is logged at boot (context `DurableDashboard`) explaining how to configure it.
+  - In any other environment it is still served open, and one warning is logged at boot saying it will be denied in production.
+
+  The console counts as configured when any of these is set: a non-empty `guards`, `dashboardAuth` (or a `useDashboardAuth` that returns a config), `allowUnauthenticated: true`, or a token.
+
+  Two new options on `DurableDashboardOptions` and `DurableDashboardAsyncOptions`:
+
+  - `allowUnauthenticated?: boolean` serves the console with no auth from this module, in every environment, and logs a boot warning. Use it when a global guard, a reverse proxy or a private network already protects the mount.
+  - `token?: string` (defaults to `process.env.DURABLE_DASHBOARD_TOKEN`) requires every console request to carry the token as `Authorization: Bearer <token>`, `x-durable-token`, or `?token=` on GET/HEAD only, compared in constant time; otherwise `401`. It applies only when neither `guards` nor `dashboardAuth` is configured.
+
+  The gate is the new exported `DurableDashboardGateGuard`. It runs after the `dashboardAuth` session guard and before host `guards`, on the UI and API controllers only; the `/login`, `/session` and `/logout` routes are not gated.
+
+  Migration for production deployments that mount the console with no `guards` and no `dashboardAuth`, before upgrading:
+
+  1. Behind a global guard or authenticating proxy: add `allowUnauthenticated: true`.
+  2. Machine access only: set `DURABLE_DASHBOARD_TOKEN` (or the `token` option).
+  3. Browser operators: configure `dashboardAuth` or `guards`.
+
+  Apps that already pass `guards`, `dashboardAuth`, or a `forRootAsync` whose `useDashboardAuth` returns a config need no change.
+
+  The guard metadata stamped on `DurableUiController` / `DurableApiController` now includes `DurableDashboardGateGuard` when neither `guards` nor a static `dashboardAuth` is passed. Code that asserted those arrays exactly needs updating.
+
+## 0.51.1
+
+### Patch Changes
+
+- [#404](https://github.com/DavideCarvalho/nestjs-durable/pull/404) [`b687ab6`](https://github.com/DavideCarvalho/nestjs-durable/commit/b687ab6e6f432cde1c16bb1cebad24fd3cae5044) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Correctness fixes ported from the AdonisJS sibling's audit.
+
+  - `ctx.callEntity` and `ctx.signalEntity` are exactly once across replay. A replay of a `callEntity` still waiting for its reply used to send the operation again (two replays applied it three times), and a turn that died after a `signalEntity` dispatch applied it twice. The operation is now stored durably in the entity's buffer, tagged with the caller's `<runId>:<seq>`, before the caller checkpoints, and the entity's run is created with it. `callEntity` records a pending intent first and marks it as sent with a conditional write that never overwrites a reply that already landed. The entity skips a copy re-sent with the same id. The wake-up is a no-op message, so ops stay in arrival order, and a lost wake-up is recovered by the `reconcileMs` sweep.
+  - `ctx.webhook().wait()` consumes a callback that arrived before the wait. `engine.signal` buffered it, but the wait never read the buffer, so the run waited forever. The wait now checks the buffer, registers, then checks again, like `ctx.waitForSignal`.
+  - The dashboard's `POST webhooks/:token` buffers an early callback when the token's run exists and isn't terminal, and answers with the run's status. It answers `404` for a non-webhook token, an unknown or terminal run, or a wait that already resolved, and buffers nothing for those. Before, every unmatched POST left a buffered row behind and still answered `404`. A duplicate that races a callback resolving the same wait takes its buffered row back and answers `404`.
+  - A child moved to `dead` by recovery (`maxRecoveryAttempts`) now notifies its parent right away as a failed child (`ctx.child` throws, `ctx.all`/`allSettled` record it). Before, the parent waited for its reconcile wake.
+  - An empty-string namespace is the `default` pool. An engine configured with `namespace: ''` stamps and polls `'default'`, a run started with `{ namespace: '' }` is stamped `'default'`, and a run stamped `''` is no longer refused by a `'default'` engine's resume and decision guards. An unset namespace is still the operator. Every store writes `''` as `'default'`. The Drizzle stores (SQLite and Postgres) also read legacy `''` rows back as `'default'` and match them with every `'default'` filter. On the MikroORM, Prisma and TypeORM stores, rewrite legacy rows once with `UPDATE durable_workflow_runs SET namespace = 'default' WHERE namespace = ''`. Such rows exist only if an engine ran with `namespace: ''` before this release.
+  - bullmq: a negative, NaN, infinite or above-2^31-1 `pingIntervalMs` falls back to the default instead of PINGing about every millisecond. A rejecting heartbeat handler is logged instead of becoming an unhandled rejection. When one `onDecision` handler fails, every handler runs to completion and each failure is reported before the decision is redelivered; before, the redelivery ran the others again while they were still running.
+  - event-emitter transport: a rejection while processing a task goes to `onError` instead of becoming an unhandled rejection.
+
 ## 0.51.0
 
 ### Minor Changes

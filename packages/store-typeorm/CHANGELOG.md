@@ -1,5 +1,82 @@
 # @dudousxd/nestjs-durable-store-typeorm
 
+## 0.25.0
+
+### Minor Changes
+
+- [#406](https://github.com/DavideCarvalho/nestjs-durable/pull/406) [`4d9e840`](https://github.com/DavideCarvalho/nestjs-durable/commit/4d9e8406948130b55de0072e1276bbe06666ddd3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Lease takeover fencing, and `drain()` releases leases on timeout.
+
+  **Fencing.** The engine used to ignore the result of its lease renewals. A turn that stalled past `leaseMs` (a blocked event loop, a long GC pause, a store outage) kept running after another instance had taken the run over, and then wrote its outcome over the new owner's work. Now a renewal that reports the lease lost fences that execution: its completion, failure, suspension, continue-as-new, saga undo, blocked park or remote-turn decision is not written (the store's current state is reported instead), and it no longer releases the lease, which belongs to the new owner. It logs `[nestjs-durable] lost the lease of run … while executing it`. A renewal that throws is still not treated as a takeover, and a lease a turn gives away on purpose (a remote turn suspending on its dispatched decision) is not mistaken for one.
+
+  **Drain.** When `drain(timeoutMs)` (`shutdownTimeoutMs` in `DurableModule`) runs out of budget with runs still executing, it now releases their recovery leases, fencing those turns first, so another instance recovers them on its next pass instead of waiting up to `leaseMs`. It logs which runs it released.
+
+  **`StateStore.releaseRunLock(runId, owner?)`.** The new optional `owner` argument makes the release owner-scoped: only a lease `owner` still holds is cleared. The drain uses it so it never frees a lease another instance already took over. Every first-party store, the in-memory store and `CodecStateStore` implement it; a third-party store that ignores the argument keeps working (it releases unconditionally, as before). The state-store conformance suite in `@dudousxd/nestjs-durable-testing` gains a case for it.
+
+  Also adds `engine.listCheckpoints(runId)`, a pass-through to the store.
+
+- [#406](https://github.com/DavideCarvalho/nestjs-durable/pull/406) [`4d9e840`](https://github.com/DavideCarvalho/nestjs-durable/commit/4d9e8406948130b55de0072e1276bbe06666ddd3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The boot-time schema check now logs one warning when it actually repairs a durable schema.
+
+  `ensureSchema()` (auto-schema) on the MikroORM, TypeORM and Drizzle Postgres stores fixes a schema that is behind the library: a missing table, column or index, a MySQL JSON column still `text`, or a MySQL collation that drifted. It used to do this silently. Now, when it changes something, it logs one line listing each change, for example:
+
+  ```
+  [nestjs-durable] store-typeorm repaired the durable schema at boot: added column durable_workflow_runs.origin; created index durable_runs_namespace_status_idx on durable_workflow_runs. The database had drifted from the schema this library version expects …
+  ```
+
+  An already-current schema logs nothing. A fresh install (no durable table existed yet) logs nothing too, because creating every table on the first boot is expected, not drift.
+
+  The warning goes to `console.warn` by default. Pass `schemaLogger` (anything with `warn(message)`, such as Nest's `Logger`) to the store constructor, or `{ logger }` as the new optional second argument of `ensureMikroOrmDurableSchema` / `ensureTypeOrmDurableSchema` / `ensureDrizzlePgDurableSchema`. Existing calls compile and behave as before, apart from the warning.
+
+  TypeORM on MySQL: the `text` to `longtext` widen now runs only for columns that are not `longtext` yet, instead of an `ALTER … MODIFY` on every boot.
+
+  The Drizzle SQLite store and the Prisma store have no auto-schema, so they don't log this.
+
+## 0.24.0
+
+### Minor Changes
+
+- [#405](https://github.com/DavideCarvalho/nestjs-durable/pull/405) [`c6eaaa2`](https://github.com/DavideCarvalho/nestjs-durable/commit/c6eaaa2a1720481ac09e4dd94e8f1626c12431b4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Immediate self-reclaim after a crash, and singleton admission that is safe during a rolling upgrade.
+
+  **Self-reclaim.** Since 0.80, recovery only lists runs whose lease is free or expired. A pod with a stable `instanceId` that was killed without a graceful shutdown (OOM, SIGKILL) therefore waited up to `leaseMs` for its own leases after it restarted. Recovery now also reclaims, right away, the runs still leased by its own `instanceId` whose lease expires before this process's boot time plus `leaseMs`. Those leases were taken by the previous process. Any lease this process takes or renews expires later than that, and a run this process is executing (its in-process run gate is open) is skipped. A gate is held while such a run is recovered, so a resume landing meanwhile queues behind it. Other instances still wait for the lease to expire. `StateStore.listOrphanedRuns` takes an optional fourth argument, `ownedBy: { owner, lockedBefore }`, implemented by every bundled store, the in-memory store and `CodecStateStore`, and covered by the store contract. A custom store that ignores it keeps the 0.80 behaviour. This relies on a live `instanceId` being unique per process.
+
+  **Singleton rolling upgrade.** Replicas older than 0.73 admit singleton runs by a scan and write no `durable:singleton:admitted` tag, so a new replica could start a second run beside an old replica's holder. The holder count now also includes legacy holders: untagged `running`/`suspended`/`cancelling` runs of the key that lack the new reserved `durable:singleton:tracked` marker, or that sit inside the old scan's `limit` window. New replicas write that marker on a singleton run's first execution and on every denial (`singletonAdmissionDenialPatch` now returns `tags`). Admission and terminal settlement remove it, and it is stripped from user start tags (`SINGLETON_RESERVED_TAGS`). Legacy waiters keep their FIFO place, and the new admission takes over once a legacy holder settles. The singleton and production docs no longer tell you to drain singleton runs before upgrading.
+
+### Patch Changes
+
+- [#404](https://github.com/DavideCarvalho/nestjs-durable/pull/404) [`b687ab6`](https://github.com/DavideCarvalho/nestjs-durable/commit/b687ab6e6f432cde1c16bb1cebad24fd3cae5044) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Correctness fixes ported from the AdonisJS sibling's audit.
+
+  - `ctx.callEntity` and `ctx.signalEntity` are exactly once across replay. A replay of a `callEntity` still waiting for its reply used to send the operation again (two replays applied it three times), and a turn that died after a `signalEntity` dispatch applied it twice. The operation is now stored durably in the entity's buffer, tagged with the caller's `<runId>:<seq>`, before the caller checkpoints, and the entity's run is created with it. `callEntity` records a pending intent first and marks it as sent with a conditional write that never overwrites a reply that already landed. The entity skips a copy re-sent with the same id. The wake-up is a no-op message, so ops stay in arrival order, and a lost wake-up is recovered by the `reconcileMs` sweep.
+  - `ctx.webhook().wait()` consumes a callback that arrived before the wait. `engine.signal` buffered it, but the wait never read the buffer, so the run waited forever. The wait now checks the buffer, registers, then checks again, like `ctx.waitForSignal`.
+  - The dashboard's `POST webhooks/:token` buffers an early callback when the token's run exists and isn't terminal, and answers with the run's status. It answers `404` for a non-webhook token, an unknown or terminal run, or a wait that already resolved, and buffers nothing for those. Before, every unmatched POST left a buffered row behind and still answered `404`. A duplicate that races a callback resolving the same wait takes its buffered row back and answers `404`.
+  - A child moved to `dead` by recovery (`maxRecoveryAttempts`) now notifies its parent right away as a failed child (`ctx.child` throws, `ctx.all`/`allSettled` record it). Before, the parent waited for its reconcile wake.
+  - An empty-string namespace is the `default` pool. An engine configured with `namespace: ''` stamps and polls `'default'`, a run started with `{ namespace: '' }` is stamped `'default'`, and a run stamped `''` is no longer refused by a `'default'` engine's resume and decision guards. An unset namespace is still the operator. Every store writes `''` as `'default'`. The Drizzle stores (SQLite and Postgres) also read legacy `''` rows back as `'default'` and match them with every `'default'` filter. On the MikroORM, Prisma and TypeORM stores, rewrite legacy rows once with `UPDATE durable_workflow_runs SET namespace = 'default' WHERE namespace = ''`. Such rows exist only if an engine ran with `namespace: ''` before this release.
+  - bullmq: a negative, NaN, infinite or above-2^31-1 `pingIntervalMs` falls back to the default instead of PINGing about every millisecond. A rejecting heartbeat handler is logged instead of becoming an unhandled rejection. When one `onDecision` handler fails, every handler runs to completion and each failure is reported before the decision is redelivered; before, the redelivery ran the others again while they were still running.
+  - event-emitter transport: a rejection while processing a task goes to `onError` instead of becoming an unhandled rejection.
+
+## 0.23.1
+
+### Patch Changes
+
+- [#398](https://github.com/DavideCarvalho/nestjs-durable/pull/398) [`696b5b9`](https://github.com/DavideCarvalho/nestjs-durable/commit/696b5b9cb4202cf4fcda7a6cb5ba84072803beea) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Follow-ups to the in-process run gate, settle compare-and-set and orphan-only recovery:
+
+  - A run parked `blocked` releases its lease best effort, like every other settle path. A failing release no longer replaces the `blocked` outcome with the lease error (or surfaces as an unhandled rejection for a background turn).
+  - Recovery on a store without `listOrphanedRuns` reclaims at most 500 orphans per pass (oldest first), the same bound as the store query, instead of every orphan at once.
+  - `updateRunIf` with a patch that maps to no column is a pure compare on the Prisma and TypeORM stores, like the Drizzle and MikroORM ones: Prisma reported `false` on a match and TypeORM threw. The shared store contract gains a case for it.
+  - `WorkflowService.waitForRun` accepts `until: 'terminal'` (it already forwarded it to the engine; the type now says so), which is what awaiting a delayed (`startAt`) run needs.
+
+## 0.23.0
+
+### Minor Changes
+
+- [#395](https://github.com/DavideCarvalho/nestjs-durable/pull/395) [`069d58a`](https://github.com/DavideCarvalho/nestjs-durable/commit/069d58a4ee4d6deaab4ea913a06201c7244854c8) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Periodic recovery only touches orphaned runs. `recoverIncomplete` runs on every timer tick on every worker, and it listed every `running`/`cancelling` run and issued a lock-attempt UPDATE for each one, including every healthy run whose lease a live turn was renewing. It now asks the store for orphans only, through the new optional `StateStore.listOrphanedRuns(nowMs, limit, namespace?)`: incomplete runs whose lease is free or expired, oldest first, at most 500 per pass. On a healthy fleet that is about zero rows per tick. Every bundled store implements it as one indexed query, `CodecStateStore` forwards it, and the shared `runStateStoreContract` gains a case for it. A store without it still works: the engine lists the incomplete runs as before and skips the leased ones in memory, which still spares the per-run lock attempts.
+
+  With more than 500 orphans at once (a whole fleet restarting with many runs in flight), one pass reclaims 500 and the next tick takes the rest. If you drive `engine.recoverIncomplete()` yourself instead of through the timer poller, call it on an interval, not only once at boot.
+
+- [#395](https://github.com/DavideCarvalho/nestjs-durable/pull/395) [`b30fde6`](https://github.com/DavideCarvalho/nestjs-durable/commit/b30fde6eaff947b2298300157f6c22c6abd7fc93) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A turn's outcome no longer overwrites a run that was cancelled, completed or dead-lettered while the turn ran. A turn settles from a snapshot read before the body ran, and `settleRun` wrote `completed` and `failed` unconditionally (only the `suspended` write re-read the run first, and only looked for `cancelled`). So a plain `cancel()` landing while a step body was still executing was overwritten when the body finished: the run ended `completed` (or `failed`), `run.completed` was emitted and the parent was notified, for a run the operator had cancelled.
+
+  Settling is now a compare-and-set on the run's status through the new optional `StateStore.updateRunIf(runId, expectedStatuses, patch)`, which applies the patch only while the status is one of `expectedStatuses` and resolves whether it wrote. Completed and failed outcomes write over any status except `cancelled`, `completed` and `dead`; a suspend or `blocked` park also leaves a `cancelling` run alone, so a compensating cancel requested mid-turn is finished by its compensation turn instead of parking as `suspended`. A settle that loses the race reports the run's current state and emits nothing.
+
+  Every bundled store implements `updateRunIf` as one conditional `UPDATE … WHERE id = ? AND status IN (…)`: TypeORM, MikroORM, Prisma, Drizzle (SQLite/MySQL and Postgres) and the in-memory store. `CodecStateStore` forwards it, encoding the patch like `updateRun`. A custom store without it still works: the engine re-reads the run and then writes, which narrows the race but cannot close it. The shared `runStateStoreContract` gains `updateRunIf` cases that expect the method, so a custom store running the contract fails them until it adds it.
+
 ## 0.22.0
 
 ### Minor Changes

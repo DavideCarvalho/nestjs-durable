@@ -5,6 +5,7 @@ import {
   type CheckpointStat,
   type ChildWait,
   ENGINE_MINTED_TAG_PREFIXES,
+  type OwnedLeaseReclaim,
   RUN_VALUE_FACET_LIMIT,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -83,7 +84,7 @@ import {
   StepCheckpointEntity,
   WorkflowRunEntity,
 } from './entities';
-import { ensureMikroOrmDurableSchema } from './schema';
+import { type DurableSchemaLogger, ensureMikroOrmDurableSchema } from './schema';
 
 /** Options for scoping a `MikroOrmStateStore` to a single tenant namespace. */
 export interface MikroOrmStateStoreOptions {
@@ -95,6 +96,12 @@ export interface MikroOrmStateStoreOptions {
   scope?: {
     namespace?: string;
   };
+  /**
+   * Where `ensureSchema()` (the boot-time auto-schema) reports a schema repair it actually applied
+   * — a missing table, column or index it had to add. Defaults to `console`. NestJS's `Logger`
+   * satisfies it.
+   */
+  schemaLogger?: DurableSchemaLogger | undefined;
 }
 
 /**
@@ -110,9 +117,9 @@ export class MikroOrmStateStore implements StateStore {
 
   constructor(
     private readonly orm: MikroORM,
-    opts?: MikroOrmStateStoreOptions,
+    private readonly opts: MikroOrmStateStoreOptions = {},
   ) {
-    this.scopeNamespace = opts?.scope?.namespace;
+    this.scopeNamespace = opts.scope?.namespace;
   }
 
   /**
@@ -122,7 +129,7 @@ export class MikroOrmStateStore implements StateStore {
    * reconstruct it. Pass `{ namespace: undefined }` for the unscoped operator view.
    */
   withScope(scope: { namespace?: string }): MikroOrmStateStore {
-    return new MikroOrmStateStore(this.orm, { scope });
+    return new MikroOrmStateStore(this.orm, { ...this.opts, scope });
   }
 
   /**
@@ -138,7 +145,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async ensureSchema(): Promise<void> {
-    await ensureMikroOrmDurableSchema(this.orm);
+    await ensureMikroOrmDurableSchema(this.orm, { logger: this.opts.schemaLogger });
   }
 
   async tryAdmitSingleton(
@@ -168,6 +175,7 @@ export class MikroOrmStateStore implements StateStore {
             {
               status: 'suspended',
               wakeAt: new Date(patch.wakeAt),
+              tags: patch.tags,
               updatedAt: patch.updatedAt,
             },
           );
@@ -199,6 +207,41 @@ export class MikroOrmStateStore implements StateStore {
     await em.flush();
     // Keep the side-table in step with the run's attributes whenever they're patched.
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
+  }
+
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    inputPatch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    if (expectedStatuses.length === 0) return false;
+    // Writes are unscoped, like updateRun.
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) =>
+            this.withScope({}).getRun(id),
+          )
+        : inputPatch;
+    const data = runUpdateData(patch);
+    const em = this.fork();
+    let applied: boolean;
+    if (Object.keys(data).length) {
+      // One conditional UPDATE: the status predicate is the compare, the changed-row count the
+      // answer, and a missing row matches nothing.
+      applied =
+        (await em.nativeUpdate(
+          WorkflowRunEntity,
+          { id: runId, status: { $in: expectedStatuses } },
+          data,
+        )) > 0;
+    } else {
+      // Nothing to write but (maybe) the attribute side-table: the compare is a read.
+      applied =
+        (await em.count(WorkflowRunEntity, { id: runId, status: { $in: expectedStatuses } })) > 0;
+    }
+    if (applied && 'searchAttributes' in patch)
+      await this.reindexAttributes(runId, patch.searchAttributes);
+    return applied;
   }
 
   /** Rewrite a run's normalized attribute rows: delete the old set, insert the current one. Mirrors
@@ -360,6 +403,33 @@ export class MikroOrmStateStore implements StateStore {
     return rows.map(fromRunEntity);
   }
 
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const em = this.fork();
+    const rows = await em.find(
+      WorkflowRunEntity,
+      {
+        status: { $in: ['running', 'cancelling'] },
+        $or: [
+          { lockedUntil: null },
+          { lockedUntil: { $lte: new Date(nowMs) } },
+          // A live lease left by a previous process with the caller's own instance id.
+          ...(ownedBy
+            ? [{ lockedBy: ownedBy.owner, lockedUntil: { $lt: new Date(ownedBy.lockedBefore) } }]
+            : []),
+        ],
+        ...(namespace !== undefined ? { namespace } : {}),
+      },
+      { orderBy: { createdAt: 'ASC' }, limit: limit },
+    );
+    return rows.map(fromRunEntity);
+  }
+
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const em = this.fork();
     const rows = await em.find(
@@ -399,9 +469,13 @@ export class MikroOrmStateStore implements StateStore {
     return affected === 1;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
     const em = this.fork();
-    await em.nativeUpdate(WorkflowRunEntity, { id: runId }, { lockedBy: null, lockedUntil: null });
+    await em.nativeUpdate(
+      WorkflowRunEntity,
+      owner === undefined ? { id: runId } : { id: runId, lockedBy: owner },
+      { lockedBy: null, lockedUntil: null },
+    );
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
@@ -783,7 +857,7 @@ export class MikroOrmStateStore implements StateStore {
     expectedNextFireAt?: number | null,
   ): Promise<boolean> {
     const data: Record<string, unknown> = {};
-    if (patch.namespace !== undefined) data.namespace = patch.namespace;
+    if (patch.namespace !== undefined) data.namespace = patch.namespace || 'default';
     if (patch.workflow !== undefined) data.workflow = patch.workflow;
     if (patch.paused !== undefined) data.paused = patch.paused;
     if ('nextFireAt' in patch) data.nextFireAt = patch.nextFireAt ?? null;
@@ -1127,6 +1201,33 @@ export class MikroOrmStateStore implements StateStore {
   }
 }
 
+/** The `nativeUpdate` data for a run patch: only the patched fields; a cleared one is written NULL. */
+function runUpdateData(patch: Partial<WorkflowRun>): Record<string, unknown> {
+  const data: Record<string, unknown> = {};
+  if ('workflow' in patch) data.workflow = patch.workflow;
+  if ('workflowVersion' in patch) data.workflowVersion = patch.workflowVersion;
+  if ('status' in patch) data.status = patch.status;
+  if ('input' in patch) data.input = patch.input ?? null;
+  if ('output' in patch) data.output = patch.output ?? null;
+  if ('error' in patch) data.error = patch.error ?? null;
+  if ('wakeAt' in patch) data.wakeAt = patch.wakeAt == null ? null : new Date(patch.wakeAt);
+  if ('lockedBy' in patch) data.lockedBy = patch.lockedBy ?? null;
+  if ('lockedUntil' in patch)
+    data.lockedUntil = patch.lockedUntil == null ? null : new Date(patch.lockedUntil);
+  if ('awaitingDecisionTaskId' in patch)
+    data.awaitingDecisionTaskId = patch.awaitingDecisionTaskId ?? null;
+  if ('recoveryAttempts' in patch) data.recoveryAttempts = patch.recoveryAttempts ?? null;
+  if ('tags' in patch) data.tags = patch.tags ?? null;
+  if ('searchAttributes' in patch) data.searchAttributes = patch.searchAttributes ?? null;
+  if ('priority' in patch) data.priority = patch.priority ?? null;
+  // The column is the isolation predicate: a cleared namespace lands on 'default', never NULL.
+  if ('namespace' in patch) data.namespace = patch.namespace || 'default';
+  if ('origin' in patch) data.origin = patch.origin ?? null;
+  if (patch.createdAt != null) data.createdAt = patch.createdAt;
+  if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;
+  return data;
+}
+
 function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   const e = new WorkflowRunEntity();
   e.id = run.id;
@@ -1147,7 +1248,7 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   e.tags = run.tags ?? null;
   e.searchAttributes = run.searchAttributes ?? null;
   e.priority = run.priority ?? null;
-  e.namespace = run.namespace ?? 'default';
+  e.namespace = run.namespace || 'default'; // '' is the default pool too
   // NOT `?? 'default'` like the line above: an absent origin is genuinely UNKNOWN and must stay NULL
   // (see the column's docblock in ./entities). `null` — not left-undefined — so `Object.assign` in
   // updateRun writes SQL NULL rather than skipping the column.

@@ -30,6 +30,7 @@ export type {
   StartRunOptions,
 } from './redis-runner';
 export { runRedisWorker, startRun } from './redis-runner';
+export { normalizeRedisConnection, redisUrlToOptions } from './redis-url';
 export type { HandleTaskOptions, HandledTask } from './runner-core';
 export {
   DEFAULT_PREFIX,

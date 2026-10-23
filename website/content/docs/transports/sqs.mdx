@@ -11,6 +11,9 @@ icon: Cloud
 pnpm add @dudousxd/nestjs-durable-transport-sqs @aws-sdk/client-sqs
 ```
 
+How it compares to the other transports, and what SQS doesn't support: see
+[Choosing a transport](/docs/transports/choosing).
+
 ## How it works
 
 Say a checkout workflow calls the `payments.charge-card` step on an un-partitioned deployment. The
@@ -68,6 +71,13 @@ new SqsTransport({
 SQS is at-least-once — a task whose worker crashes before deleting it is redelivered after the
 visibility timeout — so keep handlers **idempotent**.
 
+A message that fails to process — a result handler that throws, a result send that fails, a body
+that isn't JSON — is reported through `onError` and **left on the queue**: SQS redelivers it after
+its visibility timeout, and the poll loop carries on with the next message. Give the queues a
+[redrive policy](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)
+(`maxReceiveCount` → a dead-letter queue) so a message that keeps failing is moved aside instead of
+retried forever.
+
 ## Client
 
 Pass an existing `SQSClient` via `client` (recommended — reuse the app's, already configured with
@@ -110,10 +120,11 @@ an existing queue with `runsQueueUrl`, or let `autoCreate` create it.
 | `prefix` | Namespaces the fallback `<prefix>-tasks-*` / `<prefix>-results` names. Default `durable`. |
 | `autoCreate` | Create the by-name queues (`durable-tasks-<group>`, `durable-results`) if missing. Ignored for queues you supply via `taskQueueUrl` / `resultsQueueUrl` — those must already exist. |
 | `runsQueueUrl` | `(namespace) => url`: the run queue to use instead of resolving `<prefix>-runs` by name. See [Run queue](#run-queue). |
-| `taskQueueUrl` / `resultsQueueUrl` | Reuse existing queues instead of resolving by name (a literal URL or a resolver). |
+| `taskQueueUrl` / `resultsQueueUrl` | Reuse existing queues instead of resolving by name (a literal URL or a resolver). A `taskQueueUrl` resolver is called once per group and cached. |
 | `marker` | SQS message attribute tagging durable messages, so a queue can be shared with a non-durable consumer. See [above](#sharing-a-queue-with-a-non-durable-consumer). Unset by default. |
 | `waitTimeSeconds` | Receive long-poll seconds (0–20). Default `20`. |
-| `visibilityTimeoutSec` | Visibility timeout for an in-flight task, in seconds — must exceed the step's runtime, or SQS redelivers it to another worker while it's still running. Default `60`. |
+| `visibilityTimeoutSec` | Visibility timeout for a received task, in seconds. Default `60`. Every message of a received batch (the one running and the ones waiting behind it) is re-extended every third of this, so a step may run longer; a crashed worker's messages reappear after at most this long. |
+| `onError` | Where a failing receive, result handler, result send or non-JSON body is reported. Default `console.error`. |
 
 The message body is the documented `RemoteTask` / `StepResult` JSON — identical to BullMQ — so a
 [Python worker](/docs/python#aws-sqs) on the same queues interoperates.

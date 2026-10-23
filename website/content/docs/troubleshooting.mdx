@@ -35,7 +35,7 @@ whose history no longer matches its code.
 - Deploy the workers that run your workflow code **together** with the operator/API — a partial
   rollout means some instances are replaying old-shaped runs against new code. Find and kill any
   stale local process still consuming a shared queue; see
-  ["Deploys: replay-safety discipline"](/docs/production#5-deploys-replay-safety-discipline) and the
+  ["Deploys: replay-safety discipline"](/docs/production#6-deploys-replay-safety-discipline) and the
   "stale local worker" pitfalls in [Tenancy](/docs/concepts/tenancy#pitfalls).
 
 ## `NestedWorkflowCallError`: a ctx call inside a step body
@@ -285,5 +285,6 @@ operator** instance — `store` set and `drive` not `false`. Concretely:
 
 **Fix:** make sure at least one operator instance is running with `drive` not `false` and either the
 default `timerPollMs` (1000ms) or a nonzero value, or that you're genuinely driving
-`resumeDueTimers()`/schedule checks from an external scheduler if you set it to `0`. See
+`resumeDueTimers()`/schedule checks from an external scheduler if you set it to `0` (see [firing
+schedules from your own trigger](/docs/authoring/scheduling#firing-schedules-from-your-own-trigger)). See
 [Scheduling](/docs/authoring/scheduling) and [Durability & replay](/docs/concepts/durability).

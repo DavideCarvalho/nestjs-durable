@@ -110,6 +110,21 @@ function remoteTask(over: Partial<RemoteTask> = {}): RemoteTask {
 }
 
 describe('runRedisWorker wiring (faked bullmq, no Redis)', () => {
+  it('turns a redis:// connection string into options BullMQ understands', async () => {
+    // BullMQ Object.assign()s a string onto its defaults character by character and connects to
+    // 127.0.0.1:6379 — the URL's host/port/db must reach it as options.
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerStep('charge', async () => 1);
+    await runRedisWorker({ runtime, connection: 'redis://cache.internal:6380/2', deps: fake.deps });
+    expect(fake.workerOptsFor('durable-tasks-charge')?.connection).toEqual({
+      host: 'cache.internal',
+      port: 6380,
+      db: 2,
+      maxRetriesPerRequest: null,
+    });
+  });
+
   it('subscribes one queue per registered name, NOT a single hand-declared group queue', async () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();

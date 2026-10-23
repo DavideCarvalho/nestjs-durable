@@ -8,6 +8,7 @@ export * from './entity';
 export * from './in-app-worker';
 export * from './proxy-run-gateway';
 export * from './role';
+export type { DtoClass, IoSchema } from './schema-parse';
 export * from './run-request-responder';
 export * from './step-interceptor';
 export * from './store-run-gateway';
@@ -47,6 +48,16 @@ export type {
   StepLogger,
   WorkflowCtx,
   WorkflowHandler,
+  RunSchedulesOptions,
+  ScheduledWorkflow,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
-export { readSearchAttributes, RunGateway, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+export {
+  prevCronFireMs,
+  readSearchAttributes,
+  RunGateway,
+  runSchedules,
+  scheduledRunId,
+  scheduleRunIdAt,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';

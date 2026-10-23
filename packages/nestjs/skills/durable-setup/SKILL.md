@@ -23,8 +23,9 @@ infrastructure (in-process transport, in-memory store) — swap the store/transp
 
 ## Setup
 
-Install the module plus its core peer, a transport, and zod (optional `@Step({ input, output })`
-runtime schemas use it):
+Install the module plus its core peer, a transport, and a schema library (optional —
+`@Step({ input, output })` / `@Workflow({ input, output })` runtime schemas take a Standard Schema
+such as zod, or a class-validator DTO class):
 
 ```bash
 pnpm add @dudousxd/nestjs-durable @dudousxd/nestjs-durable-core \
@@ -76,6 +77,10 @@ await app.listen(3000);
 
 `start` **enqueues** the run and returns immediately with `{ runId, status: 'pending' }` — a worker
 runs the body, so the HTTP handler never blocks. Pass the workflow **class** for a typed input.
+Pass `opts.startAt` (epoch ms or a `Date`) to delay the start: the run is created `suspended` with
+its `wakeAt` set (the same durable timer `ctx.sleep` parks on, resumed by the timer poller once
+due), and `start` returns `{ runId, status: 'suspended' }` instead. A time that is not in the
+future starts the run at once.
 
 ```ts
 import { WorkflowService } from '@dudousxd/nestjs-durable';
@@ -158,7 +163,7 @@ name automatically; there's no `groups`/`remoteByConvention` flag to opt into.
 ### 1. Expecting `start` to return the workflow's result
 
 ```ts
-// ✗ Wrong — `start` enqueues; `result` is { runId, status: 'pending' }, never the run output
+// ✗ Wrong — `start` enqueues; `result` is { runId, status: 'pending' } (or 'suspended' with startAt), never the run output
 const result = await this.workflows.start(CheckoutWorkflow, order);
 return result.output; // undefined
 
@@ -167,8 +172,12 @@ const { runId } = await this.workflows.start(CheckoutWorkflow, order);
 return this.workflows.waitForRun(runId); // resolves once the run settles
 ```
 
-`start` creates the run as `'pending'` and a worker runs the body asynchronously; only `waitForRun`
-resolves with the settled outcome. Source: packages/nestjs/src/workflow.service.ts.
+`start` creates the run as `'pending'` (or `'suspended'` when `opts.startAt` is in the future)
+and a worker runs the body asynchronously; only `waitForRun` resolves with the settled outcome.
+By default `waitForRun` settles on the first suspension too, so for a delayed start (or any run
+that sleeps or waits on a signal) await the real result with
+`waitForRun(runId, { until: 'terminal' })`. Source: packages/nestjs/src/workflow.service.ts,
+`WorkflowEngine.waitForRun` in packages/core/src/engine.ts.
 
 ### 2. Leaving `autoSchema` on in production
 

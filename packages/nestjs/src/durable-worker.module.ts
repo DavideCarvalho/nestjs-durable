@@ -141,6 +141,8 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
     const options = this.options;
     const runtime = this.runtime;
     if (runtime === null || !isPureThinWorker(options) || options.connection === undefined) return;
+    // `consumers: false`: a producer-only process (CLI, REPL, script) starts no consumer.
+    if (options.consumers === false) return;
     // ONE call: the runner subscribes one queue per name registered on `runtime` — populated by
     // `ThinWorkflowRegistrar`/`ThinStepRegistrar`'s `onModuleInit`, which Nest's lifecycle guarantees
     // run (across the whole app) before any `onApplicationBootstrap` hook.

@@ -70,6 +70,11 @@ tables) so the generated SQL includes `durable_workflow_runs`, `durable_step_che
 `durable_buffered_events` and `durable_schedules` (the last only used by
 [persisted schedules](/docs/authoring/persisted-schedules)).
 
+Because nothing changes the schema at boot, this store has no schema repair warning: a missing
+column or index shows up as a query error, not a log line. The
+[Postgres flavour](/docs/stores/drizzle-postgres#schema-repair-warning) has auto-schema and does log
+one.
+
 <Callout type="warn">
   **An upgrade that adds a durable column is a migration you have to run — and skipping it breaks
   *every* query against that table, not just the new field.** Drizzle SELECTs every column the schema

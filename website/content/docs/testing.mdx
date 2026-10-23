@@ -114,32 +114,53 @@ all read the store, so they work against any run the engine produced.
 A code change can rename, reorder, or remove a step at a position an in-flight run already recorded a
 checkpoint for. The engine catches that as a `NonDeterminismError` on replay — but you want to catch it
 in CI, before it reaches a real in-flight run on deploy. `assertReplayable(register, history)` replays a
-captured run's history against the CURRENT workflow code and rethrows if they diverged:
+captured run's history against the CURRENT workflow code and rethrows if they diverged.
+
+The loop is: capture a representative run once, commit it as a JSON fixture, and assert it on every
+CI run.
+
+**Capture it.** From a real deployment, use the [CLI](/docs/cli#export-a-replay-fixture), which reads
+your configured store:
+
+```bash
+durable export wrun_8Kb2 --out test/fixtures/pipeline.json
+```
+
+Or in code, from a `WorkflowEngine` or a bare `StateStore`:
 
 ```ts
-import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
-import { assertReplayable, type RunHistory } from '@dudousxd/nestjs-durable-testing';
+import { captureHistory, serializeRunHistory } from '@dudousxd/nestjs-durable-testing';
+import { writeFile } from 'node:fs/promises';
 
-// Capture a real run's history — do this once, then commit the result as a fixture.
-async function recordHistory(register: (e: WorkflowEngine) => void): Promise<RunHistory> {
-  const store = new InMemoryStateStore();
-  const engine = new WorkflowEngine({ store });
-  register(engine);
-  await engine.start('pipeline', {}, 'run1');
-  await engine.waitForRun('run1');
-  const run = await store.getRun('run1');
-  if (!run) throw new Error('no run');
-  return { run, checkpoints: await store.listCheckpoints('run1') };
-}
+const history = await captureHistory(engine, 'wrun_8Kb2'); // null for an unknown run
+if (history) await writeFile('test/fixtures/pipeline.json', serializeRunHistory(history));
+```
+
+**Assert it.** `parseRunHistory` revives the `Date` fields JSON flattened to strings:
+
+```ts
+import { readFileSync } from 'node:fs';
+import type { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import { assertReplayable, parseRunHistory } from '@dudousxd/nestjs-durable-testing';
 
 const registerPipeline = (engine: WorkflowEngine) =>
   engine.register('pipeline', '1', pipeline.run); // register exactly as the app does
 
 it('replays the recorded fixture against the current workflow code', async () => {
-  const fixture = await recordHistory(registerPipeline); // or: JSON committed from a real run
-  await assertReplayable(registerPipeline, fixture);      // throws NonDeterminismError on divergence
+  const fixture = parseRunHistory(readFileSync('test/fixtures/pipeline.json', 'utf8'));
+  await assertReplayable(registerPipeline, fixture); // throws NonDeterminismError on divergence
 });
 ```
+
+| Helper | What it does |
+| --- | --- |
+| `captureHistory(source, runId)` | `{ run, checkpoints }` from anything with `getRun` + `listCheckpoints` (an engine or a store); `null` for an unknown run |
+| `serializeRunHistory(history)` | pretty JSON with a format marker (`version: 1`) and a trailing newline, the same format `durable export` writes |
+| `parseRunHistory(json)` | back to a `RunHistory` with real `Date`s; throws on JSON that isn't a fixture, or on a fixture whose `version` isn't `RUN_HISTORY_FIXTURE_VERSION` (a fixture with no `version` is read as version 1) |
+| `assertReplayable(register, history)` | replays the history against the current code; throws `NonDeterminismError` on divergence |
+
+A fixture holds the run's payloads (input, outputs, step logs, errors), decoded if your store is
+wrapped in a `CodecStateStore`. Pick a run whose data you can commit, or scrub it first.
 
 ## Testing a custom store/transport/admission backend
 

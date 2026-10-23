@@ -1,5 +1,6 @@
 import {
   SINGLETON_ADMITTED_TAG,
+  SINGLETON_TRACKED_TAG,
   type ScheduleQuery,
   type ScheduleRecord,
   type StateStore,
@@ -199,8 +200,10 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     );
 
     t('competing store instances atomically claim an empty singleton slot', async () => {
+      // `running` and tracked: the engine stamps SINGLETON_TRACKED_TAG on a run's first execution,
+      // before it claims (an untracked untagged running run reads as a pre-0.73 holder, below).
       for (const id of ['a-first', 'b-second', 'c-third']) {
-        await store.createRun(run({ id, tags: ['singleton:k'] }));
+        await store.createRun(run({ id, tags: ['singleton:k', SINGLETON_TRACKED_TAG] }));
       }
       const results = await Promise.all([
         peerStore.tryAdmitSingleton?.('b-second', 'singleton:k', 'checkout', 1),
@@ -242,6 +245,89 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         run({ id: 'other-workflow', workflow: 'other', tags: ['singleton:k'] }),
       );
       expect(await claim('other-workflow', 'singleton:k', 'other')).toBe(true);
+    });
+
+    // A replica older than 0.73 admits by a scan (the `limit` oldest running/suspended/cancelling
+    // runs of the key) and writes no admission tag. During a rolling upgrade such a holder must
+    // still occupy its slot for the new replicas.
+    const created = (offset: number) => new Date(at.getTime() + offset * 1_000);
+
+    t('singleton admission counts an untagged pre-0.73 holder (rolling upgrade)', async () => {
+      const claim = (id: string, wakeAt?: number) =>
+        store.tryAdmitSingleton?.(id, 'singleton:k', 'checkout', 1, wakeAt);
+      // Written by an old replica: admitted by its scan, running, no admission tag. It is NEWER
+      // than the run below, which was still `pending` (invisible to the old scan) back then.
+      await store.createRun(run({ id: 'legacy', tags: ['singleton:k'], createdAt: created(1) }));
+      // The older run, now picked up by a new replica: tracked from its first execution.
+      await store.createRun(
+        run({ id: 'new', tags: ['singleton:k', SINGLETON_TRACKED_TAG], createdAt: created(0) }),
+      );
+      expect(await claim('new', 12_000)).toBe(false);
+      expect(await store.getRun('new')).toMatchObject({ status: 'suspended', wakeAt: 12_000 });
+      expect((await store.getRun('new'))?.tags).toContain(SINGLETON_TRACKED_TAG);
+      // A legacy holder parked on its own sleep still holds the slot.
+      await store.updateRun('legacy', { status: 'suspended', wakeAt: 20_000 });
+      expect(await claim('new')).toBe(false);
+      // Once it settles, the new admission takes over.
+      await store.updateRun('legacy', { status: 'completed' });
+      expect(await claim('new')).toBe(true);
+      expect((await store.getRun('new'))?.tags).toEqual(['singleton:k', SINGLETON_ADMITTED_TAG]);
+      await store.updateRun('new', { status: 'completed' });
+      expect((await store.getRun('new'))?.tags).toEqual(['singleton:k']);
+    });
+
+    t('legacy singleton waiters keep their FIFO place across the upgrade', async () => {
+      const claim = (id: string) => store.tryAdmitSingleton?.(id, 'singleton:k', 'checkout', 1);
+      await store.createRun(run({ id: 'holder', tags: ['singleton:k'], createdAt: created(0) }));
+      // Denied by an old replica: suspended on its retry timer, no tag.
+      await store.createRun(
+        run({
+          id: 'old-waiter',
+          status: 'suspended',
+          wakeAt: 5_000,
+          tags: ['singleton:k'],
+          createdAt: created(1),
+        }),
+      );
+      await store.createRun(
+        run({ id: 'new-run', tags: ['singleton:k', SINGLETON_TRACKED_TAG], createdAt: created(2) }),
+      );
+      expect(await claim('new-run')).toBe(false);
+      expect(await claim('old-waiter')).toBe(false);
+      // A legacy waiter re-checked by a new replica is tracked from then on; it keeps its place.
+      expect(
+        await store.tryAdmitSingleton?.('old-waiter', 'singleton:k', 'checkout', 1, 6_000),
+      ).toBe(false);
+      expect((await store.getRun('old-waiter'))?.tags).toContain(SINGLETON_TRACKED_TAG);
+      await store.updateRun('holder', { status: 'completed' });
+      expect(await claim('new-run')).toBe(false);
+      expect(await claim('old-waiter')).toBe(true);
+      expect(await claim('new-run')).toBe(false);
+      await store.updateRun('old-waiter', { status: 'completed' });
+      expect(await claim('new-run')).toBe(true);
+    });
+
+    t('concurrent claims never over-admit beside an untagged legacy holder', async () => {
+      await store.createRun(run({ id: 'legacy', tags: ['singleton:k'], createdAt: created(0) }));
+      const ids = ['c1', 'c2', 'c3', 'c4'];
+      for (const [i, id] of ids.entries()) {
+        await store.createRun(
+          run({ id, tags: ['singleton:k', SINGLETON_TRACKED_TAG], createdAt: created(i + 1) }),
+        );
+      }
+      const results = await Promise.all(
+        [...ids]
+          .reverse()
+          .map((id, i) =>
+            (i % 2 ? peerStore : store).tryAdmitSingleton?.(id, 'singleton:k', 'checkout', 2),
+          ),
+      );
+      // One slot is the legacy holder's; only the oldest new run takes the other.
+      expect(results).toEqual([false, false, false, true]);
+      const active = await store.listRuns({ workflow: 'checkout', statuses: ['running'] });
+      expect(
+        active.filter((r) => r.tags?.includes(SINGLETON_ADMITTED_TAG)).map((r) => r.id),
+      ).toEqual(['c1']);
     });
 
     // ---- create / get / update --------------------------------------------------------------
@@ -442,6 +528,10 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
 
         await engine.start('p-root', {}, 'pr');
         await engine.start('p-other', {}, 'po');
+        // Wait for the ROOT to park too, not only the child: the root's `spawn:pc` checkpoint (the
+        // edge purge follows to find `pc`) is written after the child is started, so the child can
+        // reach `suspended` first on a slow store, and a purge then would not see the edge yet.
+        expect((await engine.waitForRun('pr', { timeoutMs: 20_000 })).status).toBe('suspended');
         expect((await engine.waitForRun('pc', { timeoutMs: 20_000 })).status).toBe('suspended');
         expect((await engine.waitForRun('po', { timeoutMs: 20_000 })).status).toBe('completed');
 
@@ -551,6 +641,156 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     });
 
     registerCheckpointAggregationCases(t, () => store, run);
+
+    t(
+      'listOrphanedRuns returns incomplete runs with a free or expired lease, oldest first',
+      async () => {
+        // Optional on the interface (the engine falls back to listing every incomplete run and
+        // filtering in process), but a conformant store MUST provide it.
+        expect(store.listOrphanedRuns).toBeDefined();
+        if (!store.listOrphanedRuns) return;
+        // Whole seconds apart: MySQL's DATETIME drops milliseconds, which would tie the ordering.
+        const created = (offset: number) => new Date(at.getTime() + offset * 1_000);
+        await store.createRun(run({ id: 'held', createdAt: created(1) }));
+        expect(await store.tryLockRun('held', 'live', NOW + 30_000, NOW)).toBe(true);
+        await store.createRun(run({ id: 'expired', createdAt: created(3) }));
+        expect(await store.tryLockRun('expired', 'dead', NOW, NOW - 1)).toBe(true);
+        await store.createRun(run({ id: 'free', createdAt: created(2) }));
+        await store.createRun(
+          run({ id: 'compensating', status: 'cancelling', createdAt: created(4) }),
+        );
+        await store.createRun(run({ id: 'parked', status: 'suspended', createdAt: created(0) }));
+        await store.createRun(run({ id: 'done', status: 'completed', createdAt: created(0) }));
+        await store.createRun(run({ id: 'tenant', namespace: 'beta', createdAt: created(5) }));
+
+        expect((await store.listOrphanedRuns(NOW, 10)).map((r) => r.id)).toEqual([
+          'free',
+          'expired',
+          'compensating',
+          'tenant',
+        ]);
+        // Capped, oldest first.
+        expect((await store.listOrphanedRuns(NOW, 2)).map((r) => r.id)).toEqual([
+          'free',
+          'expired',
+        ]);
+        // Namespace-scoped.
+        expect((await store.listOrphanedRuns(NOW, 10, 'beta')).map((r) => r.id)).toEqual([
+          'tenant',
+        ]);
+        // Once the live lease lapses, that run is an orphan too.
+        expect((await store.listOrphanedRuns(NOW + 30_000, 10)).map((r) => r.id)).toContain('held');
+        expect(await store.listOrphanedRuns(NOW, 0)).toEqual([]);
+      },
+    );
+
+    t("listOrphanedRuns also returns the owner's live leases taken before its cutoff", async () => {
+      if (!store.listOrphanedRuns) return;
+      const created = (offset: number) => new Date(at.getTime() + offset * 1_000);
+      // Live leases (expiring after NOW) left by a previous process of instance `pod-a`.
+      await store.createRun(run({ id: 'own-old', createdAt: created(1) }));
+      expect(await store.tryLockRun('own-old', 'pod-a', NOW + 10_000, NOW)).toBe(true);
+      await store.createRun(run({ id: 'own-new', createdAt: created(2) }));
+      expect(await store.tryLockRun('own-new', 'pod-a', NOW + 30_000, NOW)).toBe(true);
+      await store.createRun(run({ id: 'foreign', createdAt: created(3) }));
+      expect(await store.tryLockRun('foreign', 'pod-b', NOW + 10_000, NOW)).toBe(true);
+      await store.createRun(run({ id: 'own-parked', status: 'suspended', createdAt: created(4) }));
+      expect(await store.tryLockRun('own-parked', 'pod-a', NOW + 10_000, NOW)).toBe(true);
+      await store.createRun(run({ id: 'free', createdAt: created(5) }));
+
+      const ownedBy = { owner: 'pod-a', lockedBefore: NOW + 30_000 };
+      expect((await store.listOrphanedRuns(NOW, 10)).map((r) => r.id)).toEqual(['free']);
+      expect((await store.listOrphanedRuns(NOW, 10, undefined, ownedBy)).map((r) => r.id)).toEqual([
+        'own-old',
+        'free',
+      ]);
+      expect((await store.listOrphanedRuns(NOW, 1, undefined, ownedBy)).map((r) => r.id)).toEqual([
+        'own-old',
+      ]);
+      expect((await store.listOrphanedRuns(NOW, 10, 'beta', ownedBy)).map((r) => r.id)).toEqual([]);
+    });
+
+    t('updateRunIf writes only over an expected status', async () => {
+      // Optional on the interface (the engine falls back to read-then-write, which keeps a race
+      // window), but a conformant store MUST provide it: assert presence, then exercise it.
+      expect(store.updateRunIf).toBeDefined();
+      if (!store.updateRunIf) return;
+      await store.createRun(run({ error: { message: 'earlier attempt' } }));
+
+      // A status outside the expected set: refused, nothing written.
+      expect(
+        await store.updateRunIf('r1', ['suspended', 'blocked'], {
+          status: 'completed',
+          output: { total: 1 },
+        }),
+      ).toBe(false);
+      let current = await store.getRun('r1');
+      expect(current?.status).toBe('running');
+      expect(current?.output).toBeUndefined();
+
+      // In the set: the whole patch lands, clears included.
+      expect(
+        await store.updateRunIf('r1', ['pending', 'running'], {
+          status: 'suspended',
+          wakeAt: 7_000,
+          error: undefined,
+          updatedAt: new Date(at.getTime() + 1_000),
+        }),
+      ).toBe(true);
+      current = await store.getRun('r1');
+      expect(current?.status).toBe('suspended');
+      expect(current?.wakeAt).toBe(7_000);
+      expect(current?.error).toBeUndefined();
+      expect(current?.updatedAt.getTime()).toBe(at.getTime() + 1_000);
+
+      // A run that went terminal meanwhile keeps its state.
+      await store.updateRun('r1', { status: 'cancelled', error: { message: 'cancelled' } });
+      expect(
+        await store.updateRunIf('r1', ['running', 'suspended'], {
+          status: 'completed',
+          output: { total: 2 },
+        }),
+      ).toBe(false);
+      current = await store.getRun('r1');
+      expect(current?.status).toBe('cancelled');
+      expect(current?.error).toEqual({ message: 'cancelled' });
+      expect(current?.output).toBeUndefined();
+
+      // No row: nothing to compare against, never throws, never creates one.
+      expect(await store.updateRunIf('missing', ['running'], { status: 'completed' })).toBe(false);
+      expect(await store.getRun('missing')).toBeNull();
+    });
+
+    t(
+      'updateRunIf with an empty patch is a pure compare: never throws, writes nothing',
+      async () => {
+        expect(store.updateRunIf).toBeDefined();
+        if (!store.updateRunIf) return;
+        await store.createRun(run({ output: { kept: true } }));
+        expect(await store.updateRunIf('r1', ['running'], {})).toBe(true);
+        expect(await store.updateRunIf('r1', ['suspended'], {})).toBe(false);
+        expect(await store.updateRunIf('missing', ['running'], {})).toBe(false);
+        const current = await store.getRun('r1');
+        expect(current?.status).toBe('running');
+        expect(current?.output).toEqual({ kept: true });
+      },
+    );
+
+    t(
+      'updateRunIf settling a run terminal drops its singleton admission like updateRun',
+      async () => {
+        expect(store.updateRunIf).toBeDefined();
+        if (!store.updateRunIf) return;
+        await store.createRun(run({ tags: ['singleton:k', SINGLETON_ADMITTED_TAG] }));
+        expect(
+          await store.updateRunIf('r1', ['running'], { status: 'completed', output: { ok: true } }),
+        ).toBe(true);
+        const settled = await store.getRun('r1');
+        expect(settled?.status).toBe('completed');
+        expect(settled?.output).toEqual({ ok: true });
+        expect(settled?.tags).toEqual(['singleton:k']);
+      },
+    );
 
     t('saveCheckpointIfPending writes over a pending row only', async () => {
       // Optional on the interface (the engine falls back to a blind save, which can clobber a settled
@@ -855,6 +1095,19 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       // Release lets anyone re-acquire immediately.
       await store.releaseRunLock('r1');
       expect(await store.tryLockRun('r1', 'C', 9_000, 2_600)).toBe(true);
+    });
+
+    t('releaseRunLock with an owner clears only a lease that owner still holds', async () => {
+      await store.createRun(run({ id: 'r1' }));
+      expect(await store.tryLockRun('r1', 'A', 2_000, 1_000)).toBe(true);
+      // A's lease lapsed and B took the run over: A's owner-scoped release must not free B's lease.
+      expect(await store.tryLockRun('r1', 'B', 4_000, 2_500)).toBe(true);
+      await store.releaseRunLock('r1', 'A');
+      expect(await store.tryLockRun('r1', 'C', 9_000, 3_000)).toBe(false);
+      expect((await store.getRun('r1'))?.lockedBy).toBe('B');
+      // The holder's own owner-scoped release does clear it.
+      await store.releaseRunLock('r1', 'B');
+      expect(await store.tryLockRun('r1', 'C', 9_000, 3_000)).toBe(true);
     });
 
     t('renewRunLock only succeeds for the current owner', async () => {
@@ -1832,6 +2085,41 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       );
       expect(await store.getRun('ghost-run')).toBeNull();
     });
+
+    t(
+      'times out every unfinished run of its workflow and namespace, except one compensating',
+      async () => {
+        // `sweepTimeouts` selects its candidates with ONE `listRuns({ workflow, statuses, namespace })`,
+        // so this is the store answering that combined filter, not just the engine deciding.
+        const engine = new WorkflowEngine({ store, namespace: 'alpha' });
+        engine.register('t-capped', '1', async () => undefined, { executionTimeout: '1h' });
+        const old = { workflow: 't-capped', namespace: 'alpha', createdAt: new Date(1000) };
+        await store.createRun(run({ ...old, id: 'tc-pending', status: 'pending' }));
+        await store.createRun(run({ ...old, id: 'tc-running', status: 'running' }));
+        await store.createRun(run({ ...old, id: 'tc-suspended', status: 'suspended' }));
+        await store.createRun(run({ ...old, id: 'tc-blocked', status: 'blocked' }));
+        await store.createRun(run({ ...old, id: 'tc-cancelling', status: 'cancelling' }));
+        await store.createRun(run({ ...old, id: 'tc-done', status: 'completed' }));
+        await store.createRun(
+          run({ ...old, id: 'tc-other-tenant', status: 'pending', namespace: 'beta' }),
+        );
+        await store.createRun(
+          run({ ...old, id: 'tc-other-workflow', status: 'pending', workflow: 't-uncapped' }),
+        );
+
+        await engine.sweepTimeouts(1000 + 3_700_000);
+
+        for (const id of ['tc-pending', 'tc-running', 'tc-suspended', 'tc-blocked']) {
+          const swept = await store.getRun(id);
+          expect(swept?.status, id).toBe('cancelled');
+          expect(swept?.error?.code, id).toBe('execution_timeout');
+        }
+        expect((await store.getRun('tc-cancelling'))?.status).toBe('cancelling');
+        expect((await store.getRun('tc-done'))?.status).toBe('completed');
+        expect((await store.getRun('tc-other-tenant'))?.status).toBe('pending');
+        expect((await store.getRun('tc-other-workflow'))?.status).toBe('pending');
+      },
+    );
 
     t('cancels a timed-out run’s live child subtree, not just the run itself', async () => {
       const engine = new WorkflowEngine({ store });

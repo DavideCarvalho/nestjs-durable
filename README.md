@@ -41,7 +41,8 @@ process (zero extra infrastructure) or by a separate/Python worker over a broker
 ```ts
 // 1. The step handler — a provider method, decoupled from the workflow. `@Step` derives the
 //    routing name from the method (or take an explicit name for a stable cross-runtime contract);
-//    optional zod schemas validate at the dispatch boundary.
+//    optional `input`/`output` schemas (zod or any Standard Schema, or a class-validator DTO)
+//    validate at the serve boundary.
 @Injectable()
 class PaymentsWorker {
   @Step({ name: 'payments.charge-card', retries: 3 })

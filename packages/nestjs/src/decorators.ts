@@ -12,8 +12,8 @@ import {
   type WorkflowRef,
 } from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
-import type { z } from 'zod';
 import { declaringFile, rememberDeclaringFile } from './origin';
+import type { IoSchema } from './schema-parse';
 
 export const WORKFLOW_METADATA = Symbol('nestjs-durable:workflow');
 
@@ -32,8 +32,11 @@ export interface WorkflowMeta {
   concurrency?: ConcurrencyConfig | undefined;
   /** Max wall-clock lifetime before a run is cancelled (e.g. `'2h'`). See `WorkflowOptions`. */
   executionTimeout?: string | number | undefined;
-  /** class-validator DTO validated at start. See `WorkflowOptions`. */
-  inputSchema?: (new (...args: any[]) => object) | undefined;
+  /** Input schema (Standard Schema or DTO class), parsed at start and before every turn. Holds
+   *  `input` or its `inputSchema` alias. See `WorkflowOptions`. */
+  input?: IoSchema | undefined;
+  /** Output schema, parsed before the run completes. See `WorkflowOptions`. */
+  output?: IoSchema | undefined;
   /** Custom input validator (throws on invalid). See `WorkflowOptions`. */
   validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
   /** Typed/validated `searchAttributes` shape. See `WorkflowOptions`. */
@@ -89,9 +92,11 @@ export interface WorkflowOptions {
    */
   concurrency?: ConcurrencyConfig;
   /**
-   * Max wall-clock lifetime for a run of this workflow (e.g. `'2h'`, `'7 days'`, or ms). A run that
-   * outlives it is moved to `cancelled` (`execution_timeout`) by the timer poller — a backstop for
-   * runs that get stuck or loop forever. Omit for no limit.
+   * Max wall-clock lifetime for a run of this workflow (e.g. `'2h'`, `'7 days'`, or ms), counted from
+   * the run's creation. A run that outlives it is moved to `cancelled` (`execution_timeout`) by the
+   * timer poller — whether it is `pending`, `blocked`, `running` or `suspended` — a backstop for runs
+   * that get stuck, loop forever or are never picked up. A run in `cancelling` finishes its saga undo
+   * instead. Omit for no limit.
    */
   executionTimeout?: string | number;
   /**
@@ -103,24 +108,45 @@ export interface WorkflowOptions {
    */
   requires?: string[];
   /**
-   * Validate the workflow input at `start` against a **class-validator DTO** (the same
-   * `plainToInstance` + `validate` NestJS runs in controllers) — invalid input is rejected before any
-   * run is created. Needs the optional peers `class-validator` + `class-transformer`.
-   * `@Workflow({ inputSchema: CheckoutInput })`.
+   * The run's input schema — a **Standard Schema** (zod 3.24+, valibot, arktype, …) or a
+   * **class-validator DTO class** (the same `plainToInstance` + `validate` NestJS's `ValidationPipe`
+   * runs; needs the optional peers `class-validator` + `class-transformer`). The same option
+   * `@Step({ input })` takes.
+   *
+   * Parsed at `start`, so invalid input is rejected before any run is created. The run stores the
+   * input **as it was sent**; `run(ctx, input)` receives the **parsed** value (coerced/transformed —
+   * a `Date` from `z.coerce.date()`, a DTO instance), re-parsed from the stored input before every
+   * turn, so a replay sees the same value the first execution did. The schema must therefore be
+   * deterministic (no `default(() => Date.now())`), and changing it is a breaking change to the
+   * workflow — bump `version`. A stored input that no longer parses fails the run with
+   * `code: 'invalid_input'`.
+   *
+   * `@Workflow({ name: 'checkout', input: CheckoutInput })` or `input: z.object({ … })`.
    */
-  inputSchema?: new (
-    ...args: any[]
-  ) => object;
+  input?: IoSchema;
   /**
-   * Custom input validator (throws on invalid) — an escape hatch for zod/yup/etc. instead of
-   * `inputSchema`. Takes precedence over `inputSchema` if both are set.
+   * The run's output schema (same forms as {@link input}). The value `run()` returns is parsed before
+   * the run completes, and the parsed value is what the run stores as its output. A mismatch fails the
+   * run with `code: 'invalid_output'`. The same option `@Step({ output })` takes.
+   */
+  output?: IoSchema;
+  /**
+   * Alias of {@link input}, kept for workflows declared before `input` existed. Setting both is an
+   * error.
+   */
+  inputSchema?: IoSchema;
+  /**
+   * A custom check at `start` (throw to reject) for a rule a schema can't express — a cross-field
+   * invariant, an async lookup. It runs after `input` parses and receives the parsed value (the input
+   * as sent when there is no `input` schema).
    */
   validateInput?: (input: unknown) => void | Promise<void>;
   /**
    * Validate this workflow's {@link WorkflowCtx.upsertSearchAttributes} writes against a **Standard
    * Schema** (https://standardschema.dev — zod 3.24+, valibot, arktype, …). `ctx.upsertSearchAttributes`
    * validates the MERGED result (existing attributes shallow-merged with the patch) on every call —
-   * an invalid merge throws, naming this workflow, the offending key(s), and the schema's issues. The
+   * an invalid merge throws a `SchemaValidationError` (code `schema_validation`) naming this workflow,
+   * with the schema's issues. The
    * schema's inferred output must be search-attribute-shaped (flat `string`/`number`/`boolean` values
    * only) — a schema whose output has a nested object/array is a compile-time error here. Omit for
    * the prior unvalidated behavior.
@@ -173,6 +199,11 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
   // package lazily, at registration (see `origin.ts`); a runtime that yields no usable frame simply
   // leaves the workflow unattributed, which the registrar reports at boot.
   const declaredIn = declaringFile(Workflow);
+  if (options.input !== undefined && options.inputSchema !== undefined) {
+    throw new Error(
+      `@Workflow ${options.name}: set either \`input\` or its alias \`inputSchema\`, not both`,
+    );
+  }
   return (target) => {
     rememberDeclaringFile(target, declaredIn);
     const meta: WorkflowMeta = {
@@ -184,7 +215,8 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       singleton: options.singleton,
       concurrency: options.concurrency,
       executionTimeout: options.executionTimeout,
-      inputSchema: options.inputSchema,
+      input: options.input ?? options.inputSchema,
+      output: options.output,
       validateInput: options.validateInput,
       searchAttributes: options.searchAttributes,
       onEvent: options.onEvent,
@@ -214,9 +246,9 @@ export interface DurableStepMeta {
   name: string;
   /** Opt-in runtime input schema, validated when the handler is served (see `scanSteps`). Absent on
    *  a bare `@Step()` — compile-time types from the method signature only, no runtime check. */
-  input?: z.ZodType | undefined;
+  input?: IoSchema | undefined;
   /** Opt-in runtime output schema, validated before the handler's result is handed back. */
-  output?: z.ZodType | undefined;
+  output?: IoSchema | undefined;
 }
 
 /**
@@ -226,10 +258,12 @@ export interface DurableStepMeta {
 export interface StepOptions {
   /** Explicit routing name, overriding the derived `Class.method`. */
   name?: string;
-  /** Runtime input schema, validated at the serve boundary (opt-in — a bare `@Step()` skips it). */
-  input?: z.ZodType;
+  /** Runtime input schema, validated at the serve boundary (opt-in — a bare `@Step()` skips it). A
+   *  Standard Schema (zod, valibot, …) or a class-validator DTO class — the same forms
+   *  `@Workflow({ input })` takes. The method receives the parsed value. */
+  input?: IoSchema;
   /** Runtime output schema, validated before the result is returned (opt-in). */
-  output?: z.ZodType;
+  output?: IoSchema;
   /**
    * Def-level durable-dispatch policy stamped under `DURABLE_STEP_CONFIG` and read by `ctx.step` at
    * the dispatch boundary (see `stepConfigOf`) — a per-call `ctx.step(ref, input, opts)` overrides
@@ -293,8 +327,8 @@ function stepConfigFrom(options: StepOptions): StepConfig | undefined {
  * - `@Step('custom:name')` — explicit name override (stable across refactors, or a cross-runtime
  *   contract with a non-JS worker that has no `@Step` of its own).
  * - `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?,
- *   timeoutMs? })` — optional name override, opt-in RUNTIME zod schemas, and a def-level
- *   durable-retry/liveness-timeout policy. `input` validates before the method runs; `output`
+ *   timeoutMs? })` — optional name override, opt-in RUNTIME schemas (a Standard Schema or a DTO
+ *   class), and a def-level durable-retry/liveness-timeout policy. `input` validates before the method runs; `output`
  *   validates its return value before it's handed back (see `scanSteps`). `retries`/`backoff`/
  *   `backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` are the policy `ctx.step` reads off this method
  *   reference (via `stepConfigOf`) to build the dispatched `StepDef`'s durable retry/backoff and

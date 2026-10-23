@@ -4,6 +4,7 @@ import {
   type CheckpointQuery,
   type CheckpointStat,
   type ChildWait,
+  type OwnedLeaseReclaim,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
   type RunFacetQuery,
@@ -231,6 +232,30 @@ export class PrismaStateStore implements StateStore {
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
   }
 
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    inputPatch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    if (expectedStatuses.length === 0) return false;
+    const patch =
+      inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
+        ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) => this.getRun(id))
+        : inputPatch;
+    // One conditional `updateMany` (`UPDATE … WHERE id = ? AND status IN (…)`): the status
+    // predicate is the compare, the row count the answer, and a missing row matches nothing.
+    const where = { id: runId, status: { in: expectedStatuses } };
+    const data = toRunPatch(patch);
+    // Nothing to write but (maybe) the attribute side-table: the compare is a read (an `updateMany`
+    // with no data would report zero rows even on a match).
+    const count = Object.keys(data).length
+      ? (await this.db.durableWorkflowRun.updateMany({ where, data })).count
+      : await this.db.durableWorkflowRun.count({ where });
+    if (count === 0) return false;
+    if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
+    return true;
+  }
+
   /** Rewrite a run's normalized attribute rows: delete the old set, insert the current one. Mirrors
    *  the in-memory store's reindex so the side-table always reflects the run's live searchAttributes. */
   private async reindexAttributes(
@@ -384,6 +409,32 @@ export class PrismaStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const rows = await this.db.durableWorkflowRun.findMany({
+      where: {
+        status: { in: ['running', 'cancelling'] },
+        OR: [
+          { lockedUntil: null },
+          { lockedUntil: { lte: new Date(nowMs) } },
+          // A live lease left by a previous process with the caller's own instance id.
+          ...(ownedBy
+            ? [{ lockedBy: ownedBy.owner, lockedUntil: { lt: new Date(ownedBy.lockedBefore) } }]
+            : []),
+        ],
+        ...namespaceWhere(namespace),
+      },
+      orderBy: { createdAt: 'asc' },
+      take: limit,
+    });
+    return rows.map(fromRunRow);
+  }
+
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const rows = await this.db.durableWorkflowRun.findMany({
       where: { status: 'pending', ...namespaceWhere(namespace) },
@@ -422,7 +473,7 @@ export class PrismaStateStore implements StateStore {
     return result.count === 1;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
     // Idempotent by design: releasing the lease on a run that no longer exists is a no-op, not an
     // error. The engine calls this best-effort in a `finally` AFTER the run has settled, so it can
     // race a concurrent purge/teardown — Prisma's `update({ where: { id } })` would throw P2025
@@ -431,7 +482,7 @@ export class PrismaStateStore implements StateStore {
     // WHERE to an empty result (no throw), mirroring the in-memory store's `if (run)` guard and the
     // set-where semantics of every sibling adapter (TypeORM/MikroORM/Drizzle).
     await this.db.durableWorkflowRun.updateMany({
-      where: { id: runId },
+      where: owner === undefined ? { id: runId } : { id: runId, lockedBy: owner },
       data: { lockedBy: null, lockedUntil: null },
     });
   }
@@ -962,7 +1013,7 @@ function toRunData(run: WorkflowRun) {
     // An absent namespace IS `'default'` — unlike `origin` below, this is a reconstruction and not a
     // guess: an engine started without a namespace stamps its runs and routes its workers as
     // `'default'`, so writing anything else (or NULL) would put the run in a partition no worker polls.
-    namespace: run.namespace ?? 'default',
+    namespace: run.namespace || 'default', // '' is the default pool too
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
     createdAt: run.createdAt,
@@ -997,7 +1048,7 @@ function toRunPatch(patch: Partial<WorkflowRun>) {
   // run's namespace means "back to the unscoped partition", which is what `'default'` names. A patch
   // that does not mention `namespace` leaves the stored one alone — a status update must never move a
   // run between tenants.
-  if ('namespace' in patch) data.namespace = patch.namespace ?? 'default';
+  if ('namespace' in patch) data.namespace = patch.namespace || 'default';
   if ('origin' in patch) data.origin = patch.origin ?? null;
   if (patch.createdAt != null) data.createdAt = patch.createdAt;
   if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;

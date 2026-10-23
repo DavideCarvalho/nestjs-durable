@@ -11,6 +11,8 @@ that run in another process or another language (e.g. a [Python worker](/docs/py
 pnpm add @dudousxd/nestjs-durable-transport-bullmq bullmq
 ```
 
+How it compares to the other transports: see [Choosing a transport](/docs/transports/choosing).
+
 ## How it works
 
 - `ctx.step` dispatches a task to a **per-name** queue: `<prefix>-tasks-<name>[@<partition>]`.
@@ -162,7 +164,32 @@ Residual gaps, both of which the engine's opt-in `remoteRedispatchMs` self-heal 
 
 See also [Recovering a lost remote step dispatch](/docs/observability/dashboard#recovering-a-lost-remote-step-dispatch).
 
+## Producer-only processes
+
+A BullMQ `Worker` starts fetching the moment it is created, and the task, results, decisions,
+step-events, start-run and run-request queues each hand a job to ONE consumer. A process that boots
+the module without being a worker — a CLI command, a REPL, a migration or seed script — would
+compete with the real fleet: it claims jobs it then dies holding, and takes results meant for the
+long-lived engines. Make it a pure producer:
+
+```ts
+DurableModule.forRoot({ store, transport, drive: false, consumers: false });
+```
+
+`consumers: false` calls `transport.deferConsumers()` before the engine subscribes, and starts no
+co-located or thin worker consumer. The process still dispatches and starts runs; the jobs wait on
+the queues for the fleet, and it is not advertised as a live worker. `transport.startConsumers()`
+starts the parked consumers later, if the process turns out to be a worker after all. Outside the
+module, construct the transport with `deferConsumers: true` (or call `deferConsumers()` before any
+`handle()` / `onResult()`). Pub/sub (heartbeats, control, run replies, tenant events) is broadcast
+and is not parked.
+
 ## Control plane & tenant protocol
+
+Every `onDecision` and `onResult` handler registered on one transport gets every decision and every
+result, over a single consumer each. Two engines sharing a transport is safe: an engine settles a
+result by claiming the step's still-pending checkpoint, so an engine that doesn't know the run does
+nothing, and over one store only one engine wins the claim.
 
 Beyond `Transport`, `BullMQTransport` also implements `ControlPlane` — cross-instance broadcast for
 lifecycle events and cancellation — and carries the tenant `start-run` / `run-request` / `run-reply`
@@ -173,7 +200,8 @@ lifecycle events and cancellation — and carries the tenant `start-run` / `run-
 
 | Option | Description |
 | --- | --- |
-| `connection` | ioredis connection options (or an `IORedis` instance). |
+| `connection` | ioredis connection options, an `IORedis` instance, or a `redis://` / `rediss://` URL (host, port, credentials, db and TLS are read from it; query parameters are refused). |
+| `deferConsumers` | Start with every point-to-point consumer parked until `startConsumers()`. See [Producer-only processes](#producer-only-processes). Defaults to `false`. |
 | `partition` | Optional isolation suffix appended to every one of this instance's per-name queues (`<name>@<partition>`). Omit for a single-tenant deployment. |
 | `prefix` | Namespaces the queues. Defaults to `durable`. |
 | `namespace` | Logical deployment namespace segmenting every queue/stream/key. See [Namespace](#namespace) above. |

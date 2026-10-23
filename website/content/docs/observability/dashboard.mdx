@@ -17,8 +17,9 @@ import { DurableDashboardModule } from '@dudousxd/nestjs-durable-dashboard';
 export class AppModule {}
 ```
 
-`DurableModule` is global, so the dashboard resolves the engine and store automatically. Front the
-base route with your own guard to protect it.
+`DurableModule` is global, so the dashboard resolves the engine and store automatically. Configure
+[console auth](#console-auth) before you ship: an unauthenticated console is **denied in
+production** (see [Authentication defaults](#authentication-defaults)).
 
 ### Where it mounts
 
@@ -57,15 +58,94 @@ gated, not the control plane. (Default is `drive: true`, so single-process apps 
 
 ## Console auth
 
-Three ways to gate the console (the SPA at `basePath` and its JSON API at `apiBasePath`), from
-least to most work — pick one, or compose two:
+Ways to gate the console (the SPA at `basePath` and its JSON API at `apiBasePath`), from least to
+most work — pick one, or compose `guards` with `dashboardAuth`:
 
-| | Open (default) | `guards` | `dashboardAuth` |
-| --- | --- | --- | --- |
-| Setup | none | you write (or already have) a guard | one config object, zero extra code |
-| Auth mechanism | whatever fronts the mount otherwise (reverse proxy, global guard) | whatever `CanActivate` you bring — typically your app's existing auth | a built-in signed session cookie, minted either by your own host auth (Mode A, `session`) or a server-rendered login page (Mode B, `login`) |
-| Fronts the page (SPA shell + assets)? | no | yes, when set (see below) | yes — a missing/invalid session redirects the page to a login screen (Mode B) or a "sign in through the host app" instruction page (Mode A only) |
-| Best for | internal/dev use, or a mount already behind SSO/proxy | hosts that already authenticate the rest of the app and want ONE gate to reuse | Mode A: hosts with their own SSO/OIDC that want the dashboard to ride it. Mode B: standalone hosts with no existing admin auth |
+| | `allowUnauthenticated: true` | `token` / `DURABLE_DASHBOARD_TOKEN` | `guards` | `dashboardAuth` |
+| --- | --- | --- | --- | --- |
+| Setup | one flag | one secret | you write (or already have) a guard | one config object, zero extra code |
+| Auth mechanism | whatever fronts the mount otherwise (reverse proxy, global guard) | a bearer token, compared in constant time | whatever `CanActivate` you bring — typically your app's existing auth | a built-in signed session cookie, minted either by your own host auth (Mode A, `session`) or a server-rendered login page (Mode B, `login`) |
+| Fronts the page (SPA shell + assets)? | no | yes, but the bundled SPA never sends the token itself | yes, when set (see below) | yes — a missing/invalid session redirects the page to a login screen (Mode B) or a "sign in through the host app" instruction page (Mode A only) |
+| Best for | a mount already behind SSO/proxy/global guard | scripts, or a reverse proxy that injects the header | hosts that already authenticate the rest of the app and want ONE gate to reuse | Mode A: hosts with their own SSO/OIDC that want the dashboard to ride it. Mode B: standalone hosts with no existing admin auth |
+
+Configure none of them and the console is served open outside production but **denied in
+production** — see [Authentication defaults](#authentication-defaults).
+
+### Authentication defaults
+
+The console counts as **configured** when any of these is true:
+
+- `guards` is a non-empty array;
+- `dashboardAuth` is set (for `forRootAsync`: `useDashboardAuth` returned a config, not `undefined`);
+- `allowUnauthenticated: true`;
+- a token is set, through the `token` option or the `DURABLE_DASHBOARD_TOKEN` env var.
+
+When it is **not** configured, `NODE_ENV` decides (compared case-insensitively):
+
+| `NODE_ENV` | Behavior |
+| --- | --- |
+| `production` | **Fails closed.** Every UI and API request answers `403` with a message naming the options above, and one error is logged at boot (Nest `Logger`, context `DurableDashboard`). |
+| anything else, or unset | Served open, as before. One warning is logged at boot saying the console is unauthenticated and **will** be denied under `NODE_ENV=production`. |
+
+The built-in gate (`DurableDashboardGateGuard`) sits on the UI and API controllers only, after the
+`dashboardAuth` session guard and before your own `guards`. The `dashboardAuth` routes (`/login`,
+`/session`, `/logout`) are never gated by it, so a sign-in flow keeps working.
+
+#### The token gate
+
+With a token and neither `guards` nor `dashboardAuth`, every console request must carry it, else
+`401`:
+
+- `Authorization: Bearer <token>`, or
+- an `x-durable-token: <token>` header, or
+- `?token=<token>` on **GET and HEAD only**. A URL ends up in access logs, `Referer` headers and
+  browser history, so a query token never authorizes a mutating route.
+
+The comparison is constant-time. The env var is read at boot, so a `ConfigModule` that loads `.env`
+before the app starts is enough:
+
+```ts
+// DURABLE_DASHBOARD_TOKEN=... in the environment, or:
+DurableDashboardModule.forRoot({ token: process.env.OPS_CONSOLE_TOKEN });
+```
+
+<Callout type="info" title="The token gate is for scripts and proxies, not browsers">
+The bundled SPA never attaches the token: its asset loads and its `fetch` calls carry only the
+browser's cookies. Use it for machine clients, or a reverse proxy that injects the header. For
+operators in a browser, use [`dashboardAuth`](#dashboardauth--the-built-in-session-cookie) or
+[`guards`](#guards--front-it-with-your-own-auth).
+</Callout>
+
+When `guards` or `dashboardAuth` is configured, the token is not checked: they are the gate. A token
+does beat `allowUnauthenticated`, so a configured secret is never silently ignored.
+
+#### `allowUnauthenticated`
+
+```ts
+DurableDashboardModule.forRoot({
+  allowUnauthenticated: true, // a global APP_GUARD / reverse proxy / private network protects /durable
+});
+```
+
+This serves the console with no authentication from this module, in every environment, and logs a
+warning at boot. Use it when something outside the module already protects the mount — a global
+`APP_GUARD`, SSO at the reverse proxy, a private network. It is spelled out on purpose, so a review
+can grep for it.
+
+#### Upgrading a production deployment
+
+Earlier versions served an unconfigured console open in every environment. If your production app
+mounts `DurableDashboardModule` with no `guards` and no `dashboardAuth`, it now answers `403` after
+the upgrade. Before you deploy, pick one:
+
+1. Already behind a global guard or an authenticating proxy? Add `allowUnauthenticated: true`.
+2. Machine access only? Set `DURABLE_DASHBOARD_TOKEN` (or `token`).
+3. Operators in a browser? Configure [`dashboardAuth`](#dashboardauth--the-built-in-session-cookie)
+   or [`guards`](#guards--front-it-with-your-own-auth).
+
+Apps that already pass `guards`, `dashboardAuth`, or a `forRootAsync` whose `useDashboardAuth`
+returns a config need no change. Outside production nothing changes except the boot warning, which
+tells you which deployments still need one of the steps above.
 
 ### `guards` — front it with your own auth
 
@@ -252,8 +332,10 @@ DurableDashboardModule.forRootAsync({
 });
 ```
 
-Returning `undefined` from `useDashboardAuth` leaves the console open, exactly like omitting
-`dashboardAuth` from `forRoot`.
+Returning `undefined` from `useDashboardAuth` is exactly like omitting `dashboardAuth` from
+`forRoot`: the [authentication defaults](#authentication-defaults) apply, so the console is denied in
+production unless `guards`, a token or `allowUnauthenticated` is configured. `forRootAsync` takes
+`token` and `allowUnauthenticated` as well.
 
 #### Sliding renewal and `revalidate`
 

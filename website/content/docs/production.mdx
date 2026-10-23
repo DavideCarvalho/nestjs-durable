@@ -1,6 +1,6 @@
 ---
 title: Running in production
-description: The operational checklist for taking nestjs-durable from a single dev process to a real deployment — durable store and transport, multi-replica crash recovery, the dead-letter cap, graceful shutdown, replay-safe deploys, flow control, tenancy isolation, retention, observability, and schema management.
+description: The operational checklist for taking nestjs-durable from a single dev process to a real deployment — durable store and transport, choosing a topology, lease-based crash recovery, the dead-letter cap, graceful shutdown, replay-safe deploys, producer-only pods, flow control, tenancy isolation, retention, encryption at rest, observability, and schema management.
 icon: Factory
 ---
 
@@ -21,7 +21,9 @@ Two defaults exist purely to make `getting-started` zero-setup: `InMemoryStateSt
 - **Transport.** `EventEmitterTransport` dispatches steps in-process — fine for one process, but a
   `@Step` handler never runs anywhere else, so there's no cross-process or cross-language worker.
   Swap in `BullMQTransport` (Redis) once steps need to run in a separate worker (or a
-  [Python worker](/docs/python)). See [BullMQ / Redis](/docs/transports/bullmq).
+  [Python worker](/docs/python)). See [BullMQ / Redis](/docs/transports/bullmq), and
+  [Choosing a transport](/docs/transports/choosing) for how BullMQ, SQS, the SQL `DbTransport` and the
+  event emitter compare.
 
 ```ts
 DurableModule.forRootAsync({
@@ -33,9 +35,118 @@ DurableModule.forRootAsync({
 });
 ```
 
-## 2. Multi-replica correctness
+## 2. Pick a topology
 
-Running more than one replica is safe by design, not by convention — but it's worth knowing *why*
+Which transport you need depends on **where step bodies run**, not on how many replicas you have. The
+durable state (runs, checkpoints, leases, signal waiters, timers, persisted schedules) always lives in
+the shared store. What a cross-process transport and a [control plane](/docs/transports#control-plane-separate-from-the-transport)
+add is delivery between processes.
+
+| Topology | Store | Transport | Control plane | Who drives timers, recovery and schedules |
+| --- | --- | --- | --- | --- |
+| (a) One process | a real adapter | `EventEmitterTransport` | in-process (auto-wired) | that process (`drive` defaults to `true`) |
+| (b) Several replicas, steps run in the pod that dispatched them | one shared store | `EventEmitterTransport` in each replica | none across pods (see what you lose) | every replica left on `drive: true` |
+| (c) Steps run in a separate worker fleet | one shared store | `BullMQTransport`, `SqsTransport` or `DbTransport` | BullMQ's built-in one, or an explicit `controlPlane` | the driving operator pods |
+
+### (a) Single process
+
+One NestJS app that serves HTTP, runs workflow bodies, and serves its `@Step` handlers over an
+in-process `EventEmitterTransport`. Checkpoints are in your database, so a crash mid-run resumes from
+the last completed step on the next boot.
+
+Nothing extra has to tick: `DurableModule`'s `TimerPoller` runs inside the app whenever the instance
+drives (the default). It runs the pending-run pickup, `recoverIncomplete`, due timers, execution
+timeouts, schedules and persisted schedules every `timerPollMs` (default 1 000 ms). Remember
+`app.enableShutdownHooks()` so the drain in [Graceful shutdown](#5-graceful-shutdown) runs.
+
+### (b) Several replicas, steps stay in-process
+
+If every replica runs the same module with the same `@Step` providers, you do **not** need a broker
+to scale horizontally. A `ctx.step` dispatched over `EventEmitterTransport` is handled in the pod
+that dispatched it, and correctness never depended on the transport, because every cross-replica
+decision goes through the shared store:
+
+- **One executor per run.** Every execution (a fresh start, a poll pickup, a signal, a step result,
+  recovery) first takes an atomic lease on the run row (`tryLockRun`) and renews it every
+  `leaseMs / 2`. A replica that fails to take the lease does not run the body.
+- **Signals.** `engine.signal(token, payload)` takes the waiter row from the store, writes the
+  `signal:<token>` checkpoint, and resumes the run under a lease on whichever replica received the
+  call. If no run is waiting yet, the payload is buffered in the store and consumed by the next
+  `waitForSignal(token)`. If the run is mid-turn on another replica, the checkpoint is already
+  durable, and the [`reconcileMs` fallback wake](#3-crash-recovery-is-a-lease) is the safety net that
+  re-drives it.
+- **Cancellation.** A plain `cancel(runId)` writes `cancelled` to the run row. A turn still executing
+  on another replica cannot overwrite it: settling a turn never replaces a terminal state reached
+  meanwhile, and a later resume sees the terminal status and stops. `cancel(runId, { compensate: true })`
+  persists the non-terminal `cancelling` status, and recovery re-drives a `cancelling` run to
+  `cancelled`, so the undo survives a crash.
+- **Timers, recovery, schedules.** These are store queries (due timers, orphaned leases, schedule
+  windows) that any driving replica can answer, with the lease again deciding who executes.
+  Pausing a [persisted schedule](/docs/authoring/persisted-schedules) (from the dashboard or
+  `engine.schedules.pause`) is a store write, so it applies fleet-wide. A static `schedules` entry is
+  paused in config with `paused: true`.
+
+`EventEmitterTransport` doubles as a control plane, but only inside one process. What you give up is
+everything that is **broadcast between processes** rather than written to the store:
+
+| Without a cross-pod control plane | Effect |
+| --- | --- |
+| Lifecycle events | The dashboard's live tail and `engine.subscribe` only see runs executing on the pod that serves them. `engine.waitForRun(runId)` (and `WorkflowService.waitForRun`) listens for events plus one initial store read, so it does not hear about a run that settles on **another** replica and waits until its `timeoutMs`. `MyWorkflow.execute()` outside a workflow uses `until: 'terminal'`, which also polls the store every 250 ms, so it still resolves across pods. |
+| Instant cancellation | The cancel is durable either way, but the replica executing the run is not told. Its in-flight turn keeps going until the turn ends and its settle is refused, and `engine.onCancel` listeners there never fire. |
+| `enqueued` nudge | A driving pod normally runs a run enqueued elsewhere as soon as the control plane says so. Without it, the run waits for the next `timerPollMs` tick. |
+
+Several driving replicas are safe (every phase leases before it executes), but each one polls the
+store every tick.
+
+<Callout type="warn" title="ctx.step over EventEmitterTransport in a fleet">
+A `ctx.step` dispatched over `EventEmitterTransport` lives only in the dispatching pod's memory. If
+that pod dies mid-step, nothing else holds the job: recovery parks the run `suspended` on its
+`pending` checkpoint, and by design the reconcile re-drive re-suspends a still-pending step rather
+than re-dispatching it. That is the lost-dispatch case in
+[Retries](/docs/reliability/retries#a-third-case-the-dispatch-itself-gets-lost). Set
+`remoteRedispatchMs` (above your longest step, with idempotent steps), use the dashboard's
+Re-dispatch action, or keep in-process work in `ctx.localStep`, which simply re-runs on replay.
+
+Also keep every event-emitter replica driving. A `drive: false` replica registers no `@Step`
+handlers, but a resume it triggers itself (an `engine.signal` it serves, say) still runs the turn
+there, and a step dispatched from that turn has no local handler: the emitter ignores it and the run
+waits.
+</Callout>
+
+### (c) Remote steps across processes
+
+Once step bodies must run somewhere other than the pod that dispatched them (a dedicated worker
+fleet, a GPU pool, a [Python worker](/docs/python)), pick a cross-process transport. `BullMQTransport`
+implements `ControlPlane` over Redis pub/sub and the module auto-wires it, so events and cancellation
+reach every pod. `SqsTransport` and `DbTransport` are point-to-point only: pass a separate
+`controlPlane` (any `ControlPlane`, including a `BullMQTransport` instance used only for that), or
+accept the losses listed under (b).
+
+```ts
+// BullMQ: the transport is also the control plane
+DurableModule.forRoot({
+  store,
+  transport: new BullMQTransport({ connection: { host: 'redis', port: 6379 } }),
+});
+
+// SQS or SQL: point-to-point transport plus a dedicated broadcast channel
+DurableModule.forRoot({ store, transport: sqs, controlPlane: redisControlPlane });
+```
+
+BullMQ is the one to pick for a [cross-ecosystem fleet](/docs/cluster/interop), remote workflows and
+store-less tenant pods. See [Choosing a transport](/docs/transports/choosing) for the full matrix, and
+[Roles & config](/docs/cluster/roles-and-config) for thin workers.
+
+**Keep workflow bodies off the API pods.** By default `start()` executes a fresh run on the pod that
+called it. An API pod that should only enqueue sets `drive: false`, which installs a no-op run
+dispatcher and leaves the run `pending` for a driving pod's next poll (or its `enqueued` nudge). On
+BullMQ, add `consumers: false` too, so the pod also stops consuming step results and decisions (see
+[Producer-only processes](#7-producer-only-processes)). Even then, a resume the pod triggers itself
+(an `engine.signal` call it handles) executes the body there under the lease.
+
+## 3. Crash recovery is a lease
+
+Running more than one replica is safe by design, not by convention, but it's worth knowing *why*
 before you rely on it:
 
 - **Crash recovery is a lease, not a boot-time sweep.** While a run executes, its worker renews a
@@ -43,14 +154,55 @@ before you rely on it:
   `engine.recoverIncomplete()` reclaims the orphaned run — on **any** instance, not only on the next
   boot. `leaseMs` defaults to 30 000 — set it above your
   longest single resume step, since the lease renews for the run's whole duration, not just its start.
+  Releasing the lease at the end of a turn is best effort: if the store refuses that write (say the
+  connection is stuck in an aborted transaction after the step that failed the run), the engine
+  logs a `[nestjs-durable] releasing the lease of run … failed` warning and keeps the turn's real
+  outcome. The lease then expires on its own and recovery takes over.
 - **`recoverIncomplete` needs a heartbeat to run periodically, not just at boot.** The NestJS
   `TimerPoller` calls it every tick (alongside `resumeDueTimers`/`sweepTimeouts`) — this is what turns
   a 30-second lease into a real self-healing loop instead of a recovery that only fires once per
-  deploy. Make sure **every** operator instance runs the module (and isn't started with
-  `drive: false`) so the poller is actually ticking somewhere.
+  deploy. Make sure **at least one** operator instance drives (runs the module without
+  `drive: false`) so the poller is actually ticking somewhere. Each pass asks the store only for
+  orphans (`listOrphanedRuns`: incomplete runs whose lease is free or expired, at most 500 per pass),
+  so a fleet with thousands of healthy running runs costs one indexed query per tick, not a read and
+  a lock attempt per run.
 - **Exactly one instance per run, by an atomic lease.** `StateStore.tryLockRun` is how the engine
   picks a single owner for a `running` run even with several replicas racing to recover it — there's
-  no split-brain double-resume.
+  no split-brain double-resume. Recovery decides on the run as it reads **after** taking the lease,
+  never on the listing, so a run that suspended or completed in between is left alone.
+- **A turn that lost its lease is fenced.** If a turn stalls past `leaseMs` (a blocked event loop, a
+  long GC pause, a store outage that ate its renewals), another instance can take the run over and
+  re-execute it. The stalled instance finds out on its next renewal, which reports the lease gone:
+  from then on that execution is a zombie, and the engine refuses its writes. Its completion,
+  failure, suspension, continue-as-new, saga undo or remote-turn decision is not written. It reports
+  the store's current state instead, and it does not release the lease (that lease belongs to the new
+  owner now). It logs `[nestjs-durable] lost the lease of run … while executing it`. Steps the zombie
+  already checkpointed stay checkpointed, so the new owner replays them instead of running them
+  again. A renewal that *throws* (a transient store error) is not treated as a takeover. The fence is
+  per execution: the next execution of that run on the same instance starts clean.
+- **A terminal state is final.** Settling a turn never overwrites a terminal state reached
+  meanwhile: a cancel or a dead-letter that lands while the body runs survives the turn completing,
+  failing or suspending.
+- **A dispatched step is not a crash.** A `running` run with an in-flight remote step (a `pending`
+  remote checkpoint) has its work on the transport, not in a dead process. Recovery parks it
+  `suspended` on the reconcile timer instead of counting a recovery attempt, so a healthy run waiting
+  on a slow worker never burns its `maxRecoveryAttempts` budget.
+- **A lost wake still wakes.** A run that suspends with no timer of its own (waiting on a signal, a
+  child, or a remote step without `timeoutMs`) gets a fallback `wakeAt` `reconcileMs` later
+  (`DurableModule` option, default 300 000 = 5 minutes, `0` disables it). The re-drive is an
+  idempotent replay: a dependency still pending re-suspends, a settled one advances.
+- **One bad run doesn't stop the sweep.** The due-timer and pending-run passes skip a run they cannot
+  resume (a version this pod doesn't have mid-rolling-deploy, say), log
+  `[nestjs-durable] could not resume run …; leaving it for another instance`, and carry on with the
+  batch. The poller also isolates each phase: a failing `recoverIncomplete` logs
+  `[nestjs-durable] timer poll: recoverIncomplete failed; continuing` and the timers, timeouts and
+  schedules of that tick still run, and a failed tick never crashes the pod.
+- **Exactly one execution per run inside a process, too.** The lease is keyed by `instanceId`, so it
+  only fences *other* instances. Within one engine, resumes of a run are serialized: a signal, a late
+  step result, a child wake or an explicit `resume()` that lands while the run is executing waits for
+  that execution to settle, then re-drives the run once (wakes that pile up meanwhile coalesce into
+  that one re-drive). This is also why `instanceId` must be unique per process: two processes sharing
+  one share the lease.
 
 By default each replica takes a **random** `instanceId` — the identity stamped on recovery leases and
 worker heartbeats. That's fine, but a stable, human-readable id makes leases and the
@@ -66,11 +218,25 @@ DurableModule.forRoot({
 });
 ```
 
+A stable `instanceId` also shortens recovery after a hard kill. A pod killed without a graceful
+shutdown (OOM, `SIGKILL`) leaves its runs `running` under leases nobody renews. When it comes back
+under the same `instanceId`, its first recovery pass reclaims those runs right away instead of
+waiting up to `leaseMs`. It only takes back leases that expire before its own boot time plus
+`leaseMs`, so they were taken by the previous process, and it skips any run this process is
+already executing. Other instances still wait for those leases to expire. Every bundled store
+supports this (through the optional `ownedBy` argument of `StateStore.listOrphanedRuns`). A custom
+store that ignores the argument falls back to waiting for the lease to expire.
+
+This depends on the rule above: **a live `instanceId` must be unique per process.** Two processes
+running under one id at the same time share leases, and a restarted one would take back runs the
+other is still executing. A pod identity that is reused only after the old pod is gone, like a
+StatefulSet ordinal or a k8s pod name, is fine. A fixed id shared by every replica is not.
+
 None of this needs configuration beyond picking `leaseMs` — it's the default behavior of a durable
 store + `DurableModule`. Full mechanism: [Durability & replay](/docs/concepts/durability#deploys-versioning--multiple-instances)
 and [Reliability](/docs/reliability).
 
-## 3. Cap the blast radius: dead-letter poison pills
+## 4. Cap the blast radius: dead-letter poison pills
 
 Self-healing recovery is great until a run is a genuine **poison pill** — a deserialization bug, a
 non-deterministic change, an infinite loop — that crashes the process every single time recovery
@@ -93,7 +259,12 @@ longer crash-looping the process. Route dead runs to a handler with `engine.onDe
 `@DeadLetter()` method, or the module's `deadLetterWorkflow` default. See
 [Dead-letter queue](/docs/reliability/dead-letter).
 
-## 4. Graceful shutdown
+The budget bounds one crash-loop episode. A retry of a `dead` or `failed` run (the dashboard's Retry
+action, `engine.requeue`) resets its `recoveryAttempts` to zero, so the next recovery pass doesn't kill
+the resurrected run again on the spot. Requeueing a run that is still in flight does not reset it, so
+the poison-pill bound still holds.
+
+## 5. Graceful shutdown
 
 On `SIGTERM` you want the process to stop picking up new runs and let in-flight ones finish — not
 kill them mid-step and rely on the lease timeout to recover them a `leaseMs` later.
@@ -141,11 +312,22 @@ What this means for a run that's still executing when the timeout is hit: `drain
 *waiting* — it doesn't cancel anything. The run keeps running until the process is actually killed;
 if that happens mid-step, the step's result is simply never checkpointed, its recovery lease expires
 on schedule, and another instance's `recoverIncomplete()` picks the run back up and replays it from
-its last completed checkpoint — the same crash-recovery path from #2, just triggered by a deploy
-instead of an unplanned crash. Set `shutdownTimeoutMs` above your typical in-flight run duration to
-make that the rare case rather than the common one.
+its last completed checkpoint — the same crash-recovery path from [#3](#3-crash-recovery-is-a-lease),
+just triggered by a deploy instead of an unplanned crash. Set `shutdownTimeoutMs` above your typical
+in-flight run duration to make that the rare case rather than the common one.
 
-## 5. Deploys: replay-safety discipline
+When the budget runs out, `drain` **releases the recovery leases** of the runs still executing, so
+another instance's next `recoverIncomplete()` picks them up at once instead of waiting up to `leaseMs`
+for the lease to lapse. It logs `[nestjs-durable] drain timed out with N run(s) still executing;
+released their leases …` with the run ids. Each of those turns is [fenced](#3-crash-recovery-is-a-lease)
+before its lease is released. Whatever it computes after that is never written over the new owner's
+work, and a step it still has in flight may run again on the new owner, exactly as after a crash.
+The release is owner-scoped (`StateStore.releaseRunLock(runId, owner)`): a lease another instance
+already took over is left alone. A store adapter that ignores the `owner` argument releases
+unconditionally, which is only less precise in that race. The drain runs on every operator, including a `drive: false` API pod, so runs
+that pod resumed itself (a signal it handled, say) are waited for as well.
+
+## 6. Deploys: replay-safety discipline
 
 A workflow body is replayed positionally — the same rule from
 [Durability & replay](/docs/concepts/durability#the-one-rule-workflows-are-deterministic) applies with
@@ -160,12 +342,31 @@ different point:
 - **Regression-test replay before you ship.** `assertReplayable(register, history)` (from
   `@dudousxd/nestjs-durable-testing`) replays a captured real run's history against your **current**
   workflow code and throws `NonDeterminismError` if they diverge — catch a shape-breaking change in
-  CI against a committed fixture, instead of an in-flight run in production. See [Testing](/docs/testing).
+  CI against a committed fixture, instead of an in-flight run in production. There is no export
+  command: a `RunHistory` is just the run row plus its checkpoints, so capture one from the
+  production store with a small script and commit the JSON. See
+  [Replay a captured run in CI](/docs/testing#replay-a-captured-run-in-ci).
+
+  ```ts
+  // scripts/capture-run.ts: run once against production, commit the output as a fixture
+  const run = await store.getRun(runId);
+  const checkpoints = await store.listCheckpoints(runId);
+  writeFileSync(`test/fixtures/${runId}.json`, JSON.stringify({ run, checkpoints }, null, 2));
+  ```
+
+  Payloads are captured as stored: wrap the store in the same `CodecStateStore` (see
+  [Encrypting payloads at rest](#11-encrypting-payloads-at-rest)) to read them decoded, and scrub
+  anything sensitive before committing.
 - **Version bumps for breaking shape changes.** A workflow's `@Workflow({ version })` pins every run
   that starts under it; a run always replays against the version it started on. When a change reorders,
   inserts, or removes steps, register the new version **alongside** the old one and keep both until
-  every run that started on the old version has reached a terminal state. See
-  [Versioning & determinism](/docs/authoring/versioning).
+  every run that started on the old version has reached a terminal state. For a surgical change, guard
+  the new code with `ctx.patched(id)` instead of a second body. A pod asked to resume a run whose
+  version it no longer registers throws
+  `workflow <name>@<version> is not registered — keep the prior version deployed so in-flight runs can drain (skew protection)`,
+  and the timer and pending sweeps skip that run, leaving it for a pod that still has the version.
+  See [Versioning & determinism](/docs/authoring/versioning) and
+  [Patching in place](/docs/authoring/versioning#patching-in-place--ctxpatchedid).
 
 **Deploy workers and the operator/API together when a workflow or its steps changed.** Once steps run
 in a separate process — a BullMQ worker, or a [Python worker](/docs/python) — that worker's code
@@ -177,7 +378,51 @@ rule and `assertReplayable` catch the code-level mistake; keeping workers and op
 deploy is what keeps a *correct* version bump from still tripping over a stale process that hasn't
 picked it up yet.
 
-## 6. Concurrency and backpressure
+**Singleton workflows tolerate a rolling upgrade.** Replicas older than 0.73 admit
+[singleton](/docs/reliability/singleton) runs by a scan and write no admission marker. Newer replicas
+also count an old replica's untagged holder as holding its slot, so they don't start a second run
+for the key beside it. Old and new replicas can serve singleton workflows side by side while you
+roll out. While old replicas are still running, the fleet is only as strict as their scan, so finish
+the rollout. See [Store support and upgrades](/docs/reliability/singleton#store-support-and-upgrades).
+
+## 7. Producer-only processes
+
+Broker queues are point-to-point: every process that consumes competes for each job. A process that
+boots `DurableModule` without being a worker (an API pod, a Nest REPL, a CLI command built with
+`NestFactory.createApplicationContext`, a migration or seed script) should say so, or it claims step
+jobs and results it then dies holding, or runs turns meant for the fleet.
+
+Two options, and a non-worker usually wants both:
+
+- **`drive: false`** stops the instance from driving: no timer poller (so no pending pickup, recovery,
+  timers, timeouts, schedules or retention), no `@Step` handler registration, no boot-time recovery,
+  and a no-op run dispatcher, so `start()` only persists the run as `pending`.
+- **`consumers: false`** parks the transport's point-to-point consumers. On `BullMQTransport` it calls
+  `deferConsumers()` before the engine subscribes, so step tasks, results, decisions, step events,
+  start-run and run-request jobs stay on the queues for the fleet, and no co-located or thin worker
+  consumer starts. Pub/sub (heartbeats, control, run replies, tenant events) is broadcast and keeps
+  flowing.
+
+```ts
+// API pods, REPL, scripts: enqueue and read, never consume or drive
+DurableModule.forRoot({
+  store,
+  transport,
+  drive: process.env.APP_TYPE !== 'API',
+  consumers: process.env.APP_TYPE !== 'API',
+});
+```
+
+Ship one config to every pod and flip both with an env var. Only `BullMQTransport` can defer its
+consumers. `SqsTransport`, `DbTransport` and the in-process transports keep consuming, and
+`consumers: false` logs
+`[nestjs-durable] consumers: false — <Transport> cannot defer its consumers and will keep consuming in this process`.
+Call `transport.startConsumers()` later if the process turns out to be a worker after all. The
+`durable` [CLI](/docs/cli) never boots the module (it loads only a store), so it needs neither option.
+See [Producer-only processes](/docs/transports/bullmq#producer-only-processes) and the producer-only row
+of [Choosing a transport](/docs/transports/choosing#operations).
+
+## 8. Concurrency and backpressure
 
 Two independent knobs, easy to conflate:
 
@@ -355,7 +600,7 @@ This is the workflow-turn counterpart to a dispatched step's `timeoutMs`. Leave 
 expires). See [Cross-ecosystem interop](/docs/cluster/interop) and the
 [Node worker](/docs/cluster/js-worker) for the worker side.
 
-## 7. Isolation between environments
+## 9. Isolation between environments
 
 If a dev cluster, a staging environment, and developers' local instances ever point at the **same**
 store/Redis, an un-namespaced instance is not an isolated observer — it's on the exact same queues and
@@ -377,7 +622,7 @@ namespace — that's the shared cluster's control plane, not something to set on
 process. See [Tenancy](/docs/concepts/tenancy) for the full operator/tenant model and its
 pitfalls.
 
-## 8. Retention
+## 10. Retention
 
 Without a policy, completed/failed/cancelled runs accumulate in `durable_workflow_runs` (and its
 child tables) forever, and the timer poller's per-tick status scans get linearly slower as that table
@@ -402,14 +647,45 @@ warning). Policies can be scoped to a namespace, tags, workflows or search attri
 [Retention](/docs/reliability/retention) for the full policy shape, the sweep interval/batch-size
 defaults, and how "keep" bounds combine.
 
-## 9. Observability
+## 11. Encrypting payloads at rest
+
+Run and step inputs and outputs are stored as JSON. To keep them out of the database in the clear,
+wrap the store in `CodecStateStore` (from `@dudousxd/nestjs-durable-core`) with your own synchronous
+`PayloadCodec`:
+
+```ts
+import { CodecStateStore } from '@dudousxd/nestjs-durable-core';
+
+const store = new CodecStateStore(new TypeOrmStateStore(dataSource), {
+  encode: (value) => aesEncrypt(value),
+  decode: (value) => aesDecrypt(value),
+});
+
+DurableModule.forRoot({ store, transport });
+```
+
+Know what it covers. It encodes run `input`/`output`, checkpoint `input`/`output`, a persisted
+schedule's `input`, and buffered signal and event payloads. It leaves searchable metadata alone (ids,
+status, workflow, tags, search attributes, timestamps). By default it also leaves the structured
+`error` and a step's recorded `events` alone, so error messages and step logs are stored as written.
+Pass `{ coverage: 'extended' }` as the third argument to encode step `events`, step `error` and run
+`error` too, but only on a fresh table or with a codec whose `decode` passes through values it didn't
+encode (older rows hold those fields as plaintext). It wraps the **store** only: tasks and results on
+the transport (Redis, SQS, the SQL task tables) still carry the plain payload, so protect the broker
+separately. See [Encrypting payloads](/docs/stores#coverage).
+
+## 12. Observability
 
 Three views of the same engine lifecycle events, for different jobs:
 
 - **The dashboard** (`@dudousxd/nestjs-durable-dashboard`) is the operating surface — run list, the
-  step graph, retry/cancel/continue actions. It mounts at `/durable` with no auth of its own: **front
-  the base route with your own guard**, or fold `basePath` into a prefix your existing auth/proxy
-  rules already cover. See [Control plane](/docs/observability/dashboard).
+  step graph, retry/cancel/continue actions. It is **open by default**: with neither `guards` nor
+  `dashboardAuth` set, anyone who can reach `/durable` can read every run's payloads and retry or
+  cancel it, and nothing warns you. Before it ships, pass `guards` (your own `CanActivate`, which must
+  accept a cookie, since the SPA shell loads by browser navigation), or `dashboardAuth` (the built-in
+  signed session cookie, minted by your host's auth or a built-in login page), or both. A mount behind
+  an authenticating proxy is the third option: fold `basePath` into a prefix your proxy rules already
+  cover. See [Console auth](/docs/observability/dashboard#console-auth).
 - **OpenTelemetry** (`@dudousxd/nestjs-durable-otel`) turns runs into traces — one root span per run,
   one child span per step — for the tracing stack you already run. `attachDurableOtel(engine)` is
   aimed at debugging production latency and correlation, not at operating a run. Note that the root
@@ -425,7 +701,29 @@ Three views of the same engine lifecycle events, for different jobs:
   failing workflows) driven partly from recent history and partly from **live** store reads, so the
   current-state gauges aren't bounded by Telescope's prune window. See [Telescope](/docs/observability/telescope).
 
-## 10. Schema management
+**Watch for stranded runs.** `suspended` is not an error, so a lost dispatch alerts nobody. There is
+no stalled-run hook to page on. What exists:
+
+- The dashboard flags a remote step still `pending` after 10 minutes as "awaiting worker result —
+  dispatched Nm ago (possibly lost)", and offers a Re-dispatch action
+  (`engine.redispatchPending(runId)` from code). See
+  [Recovering a lost remote step dispatch](/docs/observability/dashboard#recovering-a-lost-remote-step-dispatch).
+- Its waiting states show `no-worker` for a run whose next step has a backlog and zero live workers
+  (BullMQ only, which reports worker health). See [Waiting states](/docs/observability/dashboard#waiting-states).
+- `remoteRedispatchMs` turns the lost dispatch into a self-heal instead of an alert, and a per-step
+  `timeoutMs` bounds a step that should never take long.
+- `engine.onDead` fires for every run that crosses `maxRecoveryAttempts`. Wire it to your pager.
+
+If you need an alert on runs stuck for too long, run a scheduled query against the store yourself
+(`listRuns` filtered by status, then compare `updatedAt`).
+
+When something does go wrong, start from the symptom in [Troubleshooting](/docs/troubleshooting):
+[stuck in `suspended`](/docs/troubleshooting#a-run-is-stuck-in-suspended-forever),
+[stuck in `pending`](/docs/troubleshooting#a-run-is-stuck-in-pending),
+[a run went `dead`](/docs/troubleshooting#a-run-went-dead), and
+[steps seem to run twice](/docs/troubleshooting#steps-seem-to-run-twice).
+
+## 13. Schema management
 
 By default the module calls `store.ensureSchema()` on boot for the MikroORM/TypeORM adapters — zero
 setup in dev. For MikroORM specifically, this runs `ensureMikroOrmDurableSchema`, which is
@@ -461,45 +759,105 @@ same function, so turning it off changes *when* it runs, not *what* it does. See
 [MikroORM store](/docs/stores/mikro-orm#schema-auto-on-boot-or-your-own-migration) for the full
 mechanism, including the MySQL/MariaDB collation auto-convergence it also performs during a full heal.
 
-## 11. Guard the run: input validation & a lifetime cap
+The heal does not announce a successful repair, so there is no "schema was behind" warning to watch
+for. With `autoSchema: false`, rerun your migration after every library upgrade. What the MikroORM
+heal does log, and is worth alerting on in boot logs, are the steps it skipped:
+
+- `could not acquire the durable-schema advisory lock (proceeding without it)`: concurrent pods may
+  race the same DDL.
+- `skipped a non-structural durable-schema statement that failed; the column is left as-is`: a type
+  alignment hit data it can't cast. The store still works, but the column hasn't converged.
+- `could not align collation for <table>`: MySQL/MariaDB collation left as-is, which can surface
+  later as ["Illegal mix of collations"](/docs/troubleshooting#illegal-mix-of-collations-on-mysql).
+
+## 14. Guard the run: input validation & a lifetime cap
 
 Two `@Workflow` options catch a whole class of production incidents at the boundary rather than deep in
 a replay — a malformed `start` payload, and a run that never ends.
 
 **Validate `start` input.** A run created with garbage input fails on its first step (or worse, halfway
-through), long after the caller has moved on. `inputSchema` validates the payload against a
-[class-validator](https://github.com/typestack/class-validator) DTO **before** the run is created, so a
-bad request is rejected synchronously at `start`:
+through), long after the caller has moved on. `input` declares the run's input schema, and the payload
+is checked against it **before** the run is created, so a bad request is rejected at `start`. It takes
+the same two forms `@Step({ input })` does: a [Standard Schema](https://standardschema.dev) (zod 3.24+,
+valibot, arktype, …) or a [class-validator](https://github.com/typestack/class-validator) DTO class —
+the two validation styles NestJS itself supports (`StandardSchemaValidationPipe` and `ValidationPipe`).
 
 ```ts
-import { IsString, IsInt, Min } from 'class-validator';
+import { z } from 'zod';
 
-class CheckoutInput {
-  @IsString() orderId!: string;
-  @IsInt() @Min(1) amountCents!: number;
-}
+const CheckoutInput = z.object({
+  orderId: z.string(),
+  amountCents: z.number().int().min(1),
+  placedAt: z.coerce.date(),
+});
 
-@Workflow({ name: 'checkout', version: '1', inputSchema: CheckoutInput })
+@Workflow({ name: 'checkout', version: '1', input: CheckoutInput })
 export class CheckoutWorkflow {
-  async run(ctx: WorkflowCtx, input: CheckoutInput) {
-    /* input is guaranteed shape-valid here */
+  async run(ctx: WorkflowCtx, input: z.infer<typeof CheckoutInput>) {
+    input.placedAt.getTime(); // a real Date, on the first execution and on every replay
   }
 }
 ```
 
-`inputSchema` needs `class-validator`/`class-transformer` installed. For a rule that a DTO can't
-express (a cross-field invariant, an async lookup) use `validateInput` instead — a plain
-`(input) => void | Promise<void>` that throws to reject, and which takes precedence over `inputSchema`:
+```ts
+import { Type } from 'class-transformer';
+import { IsDate, IsInt, IsString, Min } from 'class-validator';
+
+class CheckoutInput {
+  @IsString() orderId!: string;
+  @IsInt() @Min(1) amountCents!: number;
+  @Type(() => Date) @IsDate() placedAt!: Date;
+}
+
+@Workflow({ name: 'checkout', version: '1', input: CheckoutInput })
+export class CheckoutWorkflow {
+  async run(ctx: WorkflowCtx, input: CheckoutInput) {
+    /* input is a CheckoutInput instance here */
+  }
+}
+```
+
+A DTO class needs `class-validator`/`class-transformer` installed. `inputSchema` is an alias of `input`,
+kept for workflows declared before `input` existed (setting both is an error).
+
+**The run stores what was sent; the body sees what was parsed.** The run's stored `input` is the
+payload exactly as the caller sent it. `run(ctx, input)` receives the schema's **parsed** value — coerced
+and transformed — and that value is re-parsed from the stored input before every turn, replays
+included. A value the stored JSON can't carry (a `Date`, a DTO instance with methods) therefore reaches
+the body the same way on every turn. Two rules follow:
+
+- **The schema must be deterministic.** No `default(() => Date.now())`, no random ids: a replay must
+  parse the same value the first execution did.
+- **Changing the schema is a breaking change to the workflow** — bump `version`, like any other change
+  to the body ([section 6](#6-deploys-replay-safety-discipline)). An in-flight run whose stored input no
+  longer parses fails with `code: 'invalid_input'`.
+
+**Validate the output.** `output` takes the same forms. The value `run()` returns is parsed before the
+run completes, and the parsed value is stored as the run's output; a mismatch fails the run with
+`code: 'invalid_output'`. Both come from a `SchemaValidationError`, a `FatalError` (never retried)
+whose `issues` and `details.issues` list `{ message, path }` for every issue, so an alert or an
+[`onError` route](/docs/reliability/on-error) can match them.
+
+For a rule a schema can't express (a cross-field invariant, an async lookup) add `validateInput` — a plain
+`(input) => void | Promise<void>` that throws to reject. It runs at `start` after `input` parses, and
+receives the parsed value, so it can rely on the types the schema produced:
 
 ```ts
 @Workflow({
   name: 'transfer',
-  validateInput: (input: TransferInput) => {
-    if (input.from === input.to) throw new Error('cannot transfer to the same account');
+  input: TransferInput,
+  validateInput: (input) => {
+    const { from, to } = input as { from: string; to: string };
+    if (from === to) throw new Error('cannot transfer to the same account');
   },
 })
 export class TransferWorkflow { /* … */ }
 ```
+
+One limit: validation at `start` needs the `@Workflow` class in the process that calls `start`. A
+control plane that only routes runs to a [worker](/docs/cluster/js-worker) by name can't check the input
+there, so a bad payload surfaces when the worker runs the body — as a failed run with
+`code: 'invalid_input'`, not as an error from `start`.
 
 **Cap the lifetime.** A workflow that waits on a signal or a child that never arrives will sit
 `suspended` forever, holding whatever it holds. `executionTimeout` bounds a run's total wall-clock life;
@@ -509,6 +867,23 @@ the timer poller cancels an overrunning run (status `cancelled`, reason `executi
 @Workflow({ name: 'approval', executionTimeout: '72h' }) // auto-cancel if not settled within 3 days
 export class ApprovalWorkflow { /* … */ }
 ```
+
+**What counts.** The clock starts at the run's `createdAt`, so time spent waiting in the queue counts.
+Every run that hasn't finished is covered — `pending` (no worker has picked it up), `blocked` (no live
+worker has the capabilities it [requires](/docs/cluster/handshake)), `running` and `suspended` — because
+a run that never starts is as stuck as one that hangs halfway. Two consequences worth knowing:
+
+- A run in `cancelling` is left alone: its saga undo is running, and it ends `cancelled` on its own.
+- A delayed start (`startAt`) waits `suspended`, so its wait counts too. A `startAt` further out than
+  the timeout is cancelled before it ever runs.
+
+The timeout comes from the newest registered version of the workflow and applies to that workflow's runs
+of every version, so adding, raising or removing it on a new version also changes it for in-flight runs
+of older ones. The sweep only covers runs in the engine's own [namespace](/docs/concepts/tenancy).
+
+A timeout is reported like any cancel: the run is `cancelled`, its `error.code` is `execution_timeout`,
+and the engine emits `run.failed` — the event every cancellation emits. Alert on the code, not on the
+event type.
 
 A timed-out run takes its **children** with it, the same way an explicit `cancel` does — the whole
 subtree, depth-first, skipping any child that already finished. Otherwise a child outlives the parent

@@ -1,6 +1,13 @@
 import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { InMemoryStateStore } from '@dudousxd/nestjs-durable-core';
-import { type RunHistory, assertReplayable } from './replay';
+import {
+  RUN_HISTORY_FIXTURE_VERSION,
+  type RunHistory,
+  assertReplayable,
+  captureHistory,
+  parseRunHistory,
+  serializeRunHistory,
+} from './replay';
 
 // Capture a real run's history the way a CI fixture would.
 async function recordHistory(register: (e: WorkflowEngine) => void): Promise<RunHistory> {
@@ -36,5 +43,73 @@ describe('assertReplayable', () => {
         await ctx.localStep('b', async () => 2);
       });
     await expect(assertReplayable(changed, history)).rejects.toThrow(/non-determinism/);
+  });
+});
+
+describe('replay fixtures (captureHistory / serializeRunHistory / parseRunHistory)', () => {
+  async function runV1(): Promise<{ engine: WorkflowEngine; store: InMemoryStateStore }> {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    v1(engine);
+    await engine.start('wf', {}, 'run1');
+    await engine.waitForRun('run1');
+    return { engine, store };
+  }
+
+  it('round-trips a captured run through JSON and replays it', async () => {
+    const { engine } = await runV1();
+    const history = await captureHistory(engine, 'run1');
+    if (!history) throw new Error('no history');
+    expect(history.checkpoints.length).toBeGreaterThan(0);
+    const json = serializeRunHistory(history);
+    expect(json.endsWith('\n')).toBe(true);
+    expect(JSON.parse(json).version).toBe(RUN_HISTORY_FIXTURE_VERSION);
+    const parsed = parseRunHistory(json);
+    expect(parsed.run.createdAt).toBeInstanceOf(Date);
+    expect(parsed.run.createdAt.getTime()).toBe(history.run.createdAt.getTime());
+    expect(parsed.checkpoints[0]?.finishedAt).toBeInstanceOf(Date);
+    await expect(assertReplayable(v1, parsed)).resolves.toBeUndefined();
+    const renamed = (e: WorkflowEngine) =>
+      e.register('wf', '1', async (ctx) => {
+        await ctx.localStep('renamed', async () => 1);
+        await ctx.waitForSignal('go');
+      });
+    await expect(assertReplayable(renamed, parsed)).rejects.toThrow(/non-determinism/);
+  });
+
+  it('captures from a bare store too, and returns null for an unknown run', async () => {
+    const { store } = await runV1();
+    expect((await captureHistory(store, 'run1'))?.run.id).toBe('run1');
+    expect(await captureHistory(store, 'nope')).toBeNull();
+  });
+
+  it('rejects JSON that is not a fixture', () => {
+    expect(() => parseRunHistory('{"hello":1}')).toThrow(/not a run history fixture/);
+  });
+
+  it('rejects a fixture written in another format version', async () => {
+    const { engine } = await runV1();
+    const history = await captureHistory(engine, 'run1');
+    if (!history) throw new Error('no history');
+    const future = JSON.stringify({ ...JSON.parse(serializeRunHistory(history)), version: 2 });
+    expect(() => parseRunHistory(future)).toThrow(/unsupported run history fixture version 2/);
+    const garbled = JSON.stringify({ ...JSON.parse(serializeRunHistory(history)), version: '1' });
+    expect(() => parseRunHistory(garbled)).toThrow(/unsupported run history fixture version/);
+  });
+
+  it('reads a pre-marker fixture (no version) as version 1', async () => {
+    const { engine } = await runV1();
+    const history = await captureHistory(engine, 'run1');
+    if (!history) throw new Error('no history');
+    const legacy = JSON.stringify(history);
+    await expect(assertReplayable(v1, parseRunHistory(legacy))).resolves.toBeUndefined();
+  });
+
+  it('parses what the CLI exports (one shared format version)', async () => {
+    const { store } = await runV1();
+    const { exportRun } = await import('../../cli/src/inspect');
+    const json = await exportRun(store, 'run1');
+    expect(JSON.parse(json as string).version).toBe(RUN_HISTORY_FIXTURE_VERSION);
+    await expect(assertReplayable(v1, parseRunHistory(json as string))).resolves.toBeUndefined();
   });
 });

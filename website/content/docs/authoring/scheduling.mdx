@@ -7,7 +7,7 @@ icon: CalendarClock
 A scheduled workflow is just a normal workflow that the engine **starts on a recurring cadence** for
 you — a nightly report, an hourly sync, a cleanup every five minutes. You describe the cadence with a
 `ScheduledWorkflow`, hand it to the module's `schedules` option, and the engine fires it each tick.
-The interesting part is the exactly-once guarantee: even with several worker instances racing on the
+The interesting part is the exactly-once guarantee: even with several instances racing on the
 same tick, each schedule window starts **exactly once**.
 
 These are **code-registered** schedules, fixed at deploy time. For schedules created and managed at
@@ -16,11 +16,13 @@ runtime (one per user, per tenant, per automation) see [Persisted schedules](/do
 ## Describing a schedule — `ScheduledWorkflow`
 
 ```ts
-interface ScheduledWorkflow {
+interface ScheduledWorkflow<W extends WorkflowRef = WorkflowRef> {
   /** Stable key identifying this schedule — part of the deterministic run id. */
   key: string;
-  workflow: string;
-  input?: unknown;
+  /** The workflow to start: a `@Workflow` class, or a registered name. */
+  workflow: W;
+  /** The input every run starts with — typed against `run` when `workflow` is a class. */
+  input?: WorkflowInputOf<W>;
   /** Start one run every `everyMs`. Mutually exclusive with `cron`. */
   everyMs?: number;
   /** A cron expression evaluated in `timezone`. Mutually exclusive with `everyMs`. */
@@ -40,6 +42,8 @@ interface ScheduledWorkflow {
    *  `maxCatchup` bounds how many prior windows are backfilled. Opt-in; absent = only the current
    *  window fires. */
   backfill?: { maxCatchup: number };
+  /** Stamp the runs with this namespace instead of the firing instance's own. */
+  namespace?: string;
 }
 ```
 
@@ -51,43 +55,83 @@ on windows missed during downtime — each covered below.
 
 ## Wiring it up — the `schedules` option
 
-Pass your schedules to `DurableModule`. The durable-timer poller fires them each tick on **worker**
-instances:
+Declare your schedules once, in their own file, and pass them to `DurableModule`. The durable-timer
+poller fires them on every **driving** instance (any instance without `drive: false`), once on boot and
+then every `timerPollMs` (default 1s):
+
+```ts title="src/schedules.ts"
+import type { ScheduledWorkflow } from '@dudousxd/nestjs-durable';
+import { CacheSyncWorkflow } from './cache/cache-sync.workflow';
+import { DailyReportWorkflow } from './reports/daily-report.workflow';
+
+// Run DailyReportWorkflow at 02:00 in São Paulo — DST-aware.
+export const dailyReport: ScheduledWorkflow<typeof DailyReportWorkflow> = {
+  key: 'daily-report',
+  workflow: DailyReportWorkflow,
+  input: { recipients: ['ops@example.com'] },
+  cron: '0 2 * * *',
+  timezone: 'America/Sao_Paulo',
+};
+
+// Run CacheSyncWorkflow every five minutes.
+export const cacheSync: ScheduledWorkflow = {
+  key: 'cache-sync',
+  workflow: CacheSyncWorkflow,
+  everyMs: 5 * 60 * 1000,
+};
+
+export const SCHEDULES = [dailyReport, cacheSync];
+```
+
+```ts title="src/app.module.ts"
+import { DurableModule } from '@dudousxd/nestjs-durable';
+import { SCHEDULES } from './schedules';
+
+@Module({
+  imports: [DurableModule.forRoot({ store, transport, schedules: SCHEDULES })],
+  providers: [DailyReportWorkflow, CacheSyncWorkflow],
+})
+export class AppModule {}
+```
+
+Keeping each schedule in an exported constant pays off later: the same object is what you pass to
+[look up a window's run](#looking-up-a-schedules-run) or to [fire the schedules yourself](#firing-schedules-from-your-own-trigger).
+
+Because `schedules` is module configuration, it can depend on the environment like any other option.
+With `forRootAsync`, for example, pause the nightly report everywhere but production:
 
 ```ts
-DurableModule.forRoot({
-  store,
-  transport,
-  schedules: [
-    // Run the `daily-report` workflow at 02:00 in São Paulo — DST-aware.
-    {
-      key: 'daily-report',
-      workflow: 'daily-report',
-      cron: '0 2 * * *',
-      timezone: 'America/Sao_Paulo',
-    },
-    // Run the `cache-sync` workflow every five minutes.
-    {
-      key: 'cache-sync',
-      workflow: 'cache-sync',
-      everyMs: 5 * 60 * 1000,
-    },
-  ],
+DurableModule.forRootAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({
+    store,
+    transport,
+    schedules: [
+      { ...dailyReport, paused: config.get('NODE_ENV') !== 'production' },
+      cacheSync,
+    ],
+  }),
 });
 ```
 
-Each schedule's `workflow` field is the `@Workflow` **name** it starts. There's no schedule option on
-`@Workflow` itself — schedules are deployment config (which cadence runs where), kept separate from the
-workflow definition, so the same workflow can be scheduled differently per environment or started
-ad-hoc. The `daily-report` schedule above starts this ordinary provider:
+Each schedule's `workflow` is the `@Workflow` class it starts, the same reference `ctx.child` and
+`engine.start` take. Annotating the schedule as `ScheduledWorkflow<typeof DailyReportWorkflow>` checks
+`input` against the class's `run`, so a schedule can't drift from the workflow it starts; the plain
+`ScheduledWorkflow` accepts any input. A class that isn't decorated with `@Workflow` stops the app from
+booting, instead of failing on its first fire. For a workflow that runs in another runtime (a Python
+worker, say), pass its registered **name** as a string instead.
+
+There's no schedule option on `@Workflow` itself — schedules are deployment config (which cadence runs
+where), kept separate from the workflow definition, so the same workflow can be scheduled differently
+per environment or started ad-hoc. The `daily-report` schedule above starts this ordinary provider:
 
 ```ts
 @Workflow({ name: 'daily-report', version: '1' })
 export class DailyReportWorkflow {
   constructor(private readonly reports: ReportService) {}
-  async run(ctx: WorkflowCtx) {
+  async run(ctx: WorkflowCtx, input: { recipients: string[] }) {
     const rows = await ctx.step(this.reports.gatherYesterday, undefined);
-    await ctx.step(this.reports.email, rows);
+    await ctx.step(this.reports.email, { rows, to: input.recipients });
     return { rows: rows.length };
   }
 }
@@ -105,7 +149,7 @@ on the cadence; from there it's just steps that checkpoint and resume like any o
 the same window resolves to the same run id, so re-firing the schedule within a window is a no-op.
 
 ```ts
-{ key: 'cache-sync', workflow: 'cache-sync', everyMs: 5 * 60 * 1000 } // every 5 minutes
+{ key: 'cache-sync', workflow: CacheSyncWorkflow, everyMs: 5 * 60 * 1000 } // every 5 minutes
 ```
 
 Use a fixed interval when "roughly every N" is what you want and you don't care about wall-clock
@@ -119,7 +163,7 @@ evaluated in the named timezone, it is **DST-aware** — `0 2 * * *` in `America
 02:00 local regardless of daylight-saving shifts, not at a fixed UTC offset.
 
 ```ts
-{ key: 'nightly-report', workflow: 'daily-report', cron: '0 2 * * *', timezone: 'America/Sao_Paulo' }
+{ key: 'nightly-report', workflow: DailyReportWorkflow, cron: '0 2 * * *', timezone: 'America/Sao_Paulo' }
 ```
 
 The window for a cron schedule is its most recent fire time at or before now — the deterministic
@@ -142,7 +186,7 @@ registered — the dashboard still lists it, and un-pausing it later just resume
 poller skips it entirely on every tick while paused:
 
 ```ts
-{ key: 'nightly-report', workflow: 'daily-report', cron: '0 2 * * *', paused: true }
+{ key: 'nightly-report', workflow: DailyReportWorkflow, cron: '0 2 * * *', paused: true }
 ```
 
 ## Skipping overlapping runs — `overlap`
@@ -153,7 +197,7 @@ previous window's run is still going — a slow run and a fresh one can end up i
 `running` or `suspended`:
 
 ```ts
-{ key: 'cache-sync', workflow: 'cache-sync', everyMs: 60_000, overlap: 'skip' }
+{ key: 'cache-sync', workflow: CacheSyncWorkflow, everyMs: 60_000, overlap: 'skip' }
 ```
 
 This is **fixed-interval only** (it checks the previous `everyMs` bucket) — cron windows aren't
@@ -166,12 +210,28 @@ randomly delays the dispatch by up to that many ms before firing, spreading the 
 instance hitting the store in the same instant:
 
 ```ts
-{ key: 'cache-sync', workflow: 'cache-sync', everyMs: 60_000, jitter: 5_000 } // fire within 5s of the tick
+{ key: 'cache-sync', workflow: CacheSyncWorkflow, everyMs: 60_000, jitter: 5_000 } // fire within 5s of the tick
 ```
 
 Jitter only delays *when* an instance attempts the dispatch — it does not change the run id (still the
 time bucket), so idempotency is unchanged: however many instances jitter the same window, it still
 starts exactly once.
+
+An instance waits the jitter once per window, only when the window has no run yet. Once it has seen
+the window's run exist — it started it, or another instance did — later ticks in that window skip the
+schedule without a store read or a wait, so a long `jitter` never holds up the rest of the poll (due
+timers, retries, timeouts).
+
+## Pinning the pool — `namespace`
+
+The instance that wins the race to fire a window decides which [namespace](/docs/concepts/tenancy#what-namespace-partitions) the run
+is stamped with: its own. When the workflow can only run in one pool — its steps need a capability
+only that pool's workers have — pin the namespace on the schedule, so the run lands there whichever
+instance fires it:
+
+```ts
+{ key: 'render-thumbnails', workflow: RenderThumbnailsWorkflow, everyMs: 60_000, namespace: 'gpu' }
+```
 
 ## Catching up on missed windows — `backfill`
 
@@ -180,7 +240,7 @@ by default, only the *current* window fires the next time the poller runs. Set `
 the windows that were missed instead:
 
 ```ts
-{ key: 'hourly-rollup', workflow: 'hourly-rollup', everyMs: 60 * 60 * 1000, backfill: { maxCatchup: 6 } }
+{ key: 'hourly-rollup', workflow: HourlyRollupWorkflow, everyMs: 60 * 60 * 1000, backfill: { maxCatchup: 6 } }
 ```
 
 `maxCatchup` bounds how many *prior* windows are backfilled, so a long outage can't flood the system
@@ -196,7 +256,7 @@ The four options compose — a schedule that skips pile-up, spreads load, and ca
 ```ts
 {
   key: 'hourly-rollup',
-  workflow: 'hourly-rollup',
+  workflow: HourlyRollupWorkflow,
   everyMs: 60 * 60 * 1000,
   overlap: 'skip', // don't pile up if a rollup runs long
   jitter: 10_000, // spread dispatch across instances ticking the same hour
@@ -209,45 +269,99 @@ The four options compose — a schedule that skips pile-up, spreads load, and ca
 The guarantee that makes scheduling safe in a multi-instance deployment is the **idempotent
 time-bucket run id**. Each window — a fixed-interval index, or a cron fire time — maps to a
 deterministic run id, and `engine.start` is idempotent by run id: starting the same id twice is a
-no-op. So when several worker instances tick at the same moment and all try to start the current
-window, they all compute the same run id and only the first actually creates the run. The poller fires
-schedules on worker instances only, so a dashboard-only / dispatch-only instance never starts them.
+no-op. So when several driving instances tick at the same moment and all try to start the current
+window, they all compute the same run id and only the first actually creates the run. Each instance
+also remembers the windows whose run it has seen exist, so a window that already fired costs no store
+read on the ticks after that. The poller fires
+schedules on driving instances only, so a dashboard-only instance (`drive: false`) never starts them.
 
 The mechanism is the same one used everywhere durability needs idempotency — see
 [Workflows & steps](/docs/concepts/workflows-and-steps) for how a deterministic run id underpins
 exactly-once starts in general. The result for scheduling: **each window starts exactly once**, no
 matter how many instances are racing the tick or how often the poller fires.
 
-## Driving schedules without the NestJS module
+## Looking up a schedule's run
 
-The NestJS module's `TimerPoller` calls the underlying `runSchedules(engine, schedules, nowMs, opts?)`
-for you, once on boot and then on `timerPollMs` (default 1s). If you're using the engine directly —
-or driving schedules from your own poller, cron process, or serverless trigger — call it yourself:
+Each window's run id is deterministic, so any provider can find the run a schedule started — no
+bookkeeping table needed. Inject `WorkflowEngine` and pass the schedule to `scheduleRunIdAt`, which
+computes the id of its window at a given time (`sched:<key>:<bucket>`):
 
-```ts
-import { runSchedules } from '@dudousxd/nestjs-durable-core';
+```ts title="src/reports/reports.controller.ts"
+import { Controller, Get } from '@nestjs/common';
+import { WorkflowEngine, scheduleRunIdAt } from '@dudousxd/nestjs-durable';
+import { dailyReport } from '../schedules';
 
-await runSchedules(engine, schedules, Date.now());
+@Controller('reports')
+export class ReportsController {
+  constructor(private readonly engine: WorkflowEngine) {}
+
+  /** Did the most recent 02:00 report run, and how did it end? */
+  @Get('daily/latest')
+  async latestDaily() {
+    const run = await this.engine.getRun(scheduleRunIdAt(dailyReport, Date.now()));
+    return run ? { status: run.status, output: run.output } : { status: 'not started' };
+  }
+}
 ```
 
-It fires each schedule's current window (applying `paused`/`overlap`/`jitter`/`backfill`) and returns
-the run ids it started. `opts` lets you override the `random`/`sleep` used for `jitter` — the engine
-uses real `Math.random`/`setTimeout` by default; tests inject deterministic ones instead.
+`getRun` returns `null` when the window hasn't fired yet — for instance between 02:00 and the next
+poller tick, or while the schedule is `paused`. Passing the same `dailyReport` object the module was
+given keeps the key, the cron expression and the timezone in one place. The two pieces the id is built
+from are exported too, for when all you have is the raw values: `scheduledRunId(key, everyMs, nowMs)`
+for a fixed interval, and `prevCronFireMs(expr, nowMs, timezone?)` for the cron fire time a window is
+keyed on.
 
-Two lower-level helpers back the run-id math, exported in case you need to look up or debug a
-schedule's run directly:
+## Firing schedules from your own trigger
 
-- `scheduledRunId(key, everyMs, nowMs)` — the deterministic run id for a fixed-interval schedule's
-  current window (`sched:<key>:<bucket>`).
-- `prevCronFireMs(expr, nowMs, timezone?)` — the epoch ms of the most recent cron fire at or before
-  `nowMs`, evaluated in `timezone` (default UTC) — the same "bucket" a cron schedule's run id is keyed
-  on.
+The module's poller is the usual way to fire schedules, but it only runs on driving instances. If your
+deployment fires scheduled work from outside — a Kubernetes `CronJob`, Cloud Scheduler, EventBridge, a
+serverless function — leave `schedules` off the module and call `runSchedules` from that trigger. It does
+what the poller does on each tick: fires every schedule's current window (applying
+`paused`/`overlap`/`jitter`/`backfill`) and returns the run ids it started.
 
-For example, to check whether tonight's `daily-report` fire has already run:
+The trigger only needs to **enqueue** the runs, so boot a standalone application context as a
+[producer-only process](/docs/production#7-producer-only-processes) (`drive: false`, `consumers: false`):
+it executes nothing itself, and a driving instance picks the new runs up on its next poll.
+
+```ts title="src/fire-schedules.ts"
+import { NestFactory } from '@nestjs/core';
+import { WorkflowEngine, runSchedules } from '@dudousxd/nestjs-durable';
+import { SchedulerModule } from './scheduler.module'; // imports DurableModule with drive: false, consumers: false
+import { SCHEDULES } from './schedules';
+
+async function main() {
+  const app = await NestFactory.createApplicationContext(SchedulerModule);
+  const started = await runSchedules(app.get(WorkflowEngine), SCHEDULES, Date.now());
+  console.log(`started ${started.length} scheduled run(s)`);
+  await app.close();
+}
+
+void main();
+```
+
+Every guarantee on this page still holds — the run id is the window's bucket, so a trigger that fires
+twice, or fires alongside a driving instance that also has `schedules`, still starts each window once.
+Run the trigger at least as often as your finest schedule, since a call only starts the windows current
+at `Date.now()` (plus whatever `backfill` catches up).
+
+## Testing a schedule
+
+In a test, call `runSchedules` against the engine of your `TestingModule` with a fixed clock, so you
+choose which window fires. Its fourth argument overrides the `random`/`sleep` pair `jitter` uses
+(`Math.random`/`setTimeout` by default), so a jittered schedule fires without waiting:
 
 ```ts
-import { prevCronFireMs } from '@dudousxd/nestjs-durable-core';
+const engine = moduleRef.get(WorkflowEngine);
+const at = Date.parse('2026-03-01T05:00:00Z'); // 02:00 in São Paulo
 
-const fireMs = prevCronFireMs('0 2 * * *', Date.now(), 'America/Sao_Paulo');
-const run = await engine.getRun(`sched:daily-report:${fireMs}`);
+const [runId] = await runSchedules(engine, [dailyReport], at, {
+  random: () => 0,
+  sleep: async () => {},
+});
+
+expect(runId).toBe(scheduleRunIdAt(dailyReport, at));
+expect((await engine.waitForRun(runId)).status).toBe('completed');
 ```
+
+Leave `schedules` off the module under test. The poller fires them once at boot even with
+`timerPollMs: 0` (which only stops the interval), on the real clock, before your test picks a window.

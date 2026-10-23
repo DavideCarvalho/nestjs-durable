@@ -304,6 +304,17 @@ export interface StepError {
 // StateStore — where runs and checkpoints live (Postgres / MySQL / SQLite via ORM adapters)
 // ---------------------------------------------------------------------------
 
+/**
+ * See {@link StateStore.listOrphanedRuns}: the live leases a rebooted engine instance may take back
+ * immediately, i.e. those its previous incarnation (same `instanceId`) held when it died.
+ */
+export interface OwnedLeaseReclaim {
+  /** The engine instance id the lease must be held by. */
+  owner: string;
+  /** Only leases expiring strictly before this epoch ms (the caller's boot time + `leaseMs`). */
+  lockedBefore: number;
+}
+
 export interface StateStore {
   /**
    * Provision the tables/collections this store needs, idempotently. Called on boot when the
@@ -331,6 +342,25 @@ export interface StateStore {
 
   createRun(run: WorkflowRun): Promise<void>;
   updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void>;
+  /**
+   * {@link updateRun}, but only if the run's CURRENT status is one of `expectedStatuses`: a
+   * compare-and-set on the status. Resolves whether the patch applied; never throws on a mismatch or
+   * a missing run (both resolve `false`). The engine settles a turn's outcome (completed, failed,
+   * suspended, blocked) through it, so a run that reached `cancelled`/`completed`/`dead` through
+   * another path while the turn executed (an operator's `cancel()`, a timeout sweep, a dead-letter)
+   * is never overwritten by the turn's stale outcome.
+   *
+   * For a SQL store the predicate must be part of the `UPDATE ... WHERE` itself; a read-then-write
+   * in application code reintroduces the race this exists to close.
+   *
+   * Optional: a store that omits it gets the engine's read-then-write fallback, which narrows the
+   * race to the gap between that read and the write but cannot close it.
+   */
+  updateRunIf?(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ): Promise<boolean>;
   getRun(runId: string): Promise<WorkflowRun | null>;
   /**
    * The runs with these ids, in any order; an id with no run is left out. One `IN (...)` read: the
@@ -404,6 +434,30 @@ export interface StateStore {
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
 
+  /**
+   * The ORPHANS a periodic recovery pass should reclaim: {@link listIncompleteRuns}'s runs
+   * (`running` or `cancelling`) whose lease is free (`lockedUntil` unset or `<= nowMs`), oldest
+   * (`createdAt`) first, at most `limit`. When `namespace` is given, restricted to that partition.
+   *
+   * Optional but recommended: without it the engine lists every incomplete run and filters the
+   * leases in process, which on a busy fleet reads every healthy running run once per tick per
+   * worker.
+   *
+   * When `ownedBy` is given, ALSO return the runs whose lease is still live but held by
+   * `ownedBy.owner` with `lockedUntil < ownedBy.lockedBefore` (strictly), under the same status,
+   * namespace, order and `limit`. The engine passes its own `instanceId` and its boot time plus
+   * `leaseMs`: a lease that expires before then was taken by a PREVIOUS process with the same stable
+   * `instanceId` (one killed without a graceful shutdown), never by this one, so it reclaims those
+   * at once instead of waiting out the lease. A store that ignores the argument keeps the plain
+   * behaviour: those runs are reclaimed once their lease expires.
+   */
+  listOrphanedRuns?(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]>;
+
   /** The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. */
   listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]>;
 
@@ -421,8 +475,15 @@ export interface StateStore {
    */
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean>;
 
-  /** Release a run's recovery lease so another instance can pick it up (e.g. once it suspends). */
-  releaseRunLock(runId: string): Promise<void>;
+  /**
+   * Release a run's recovery lease so another instance can pick it up (e.g. once it suspends).
+   *
+   * `owner`, when given, makes the release owner-scoped: clear the lease ONLY if `owner` still holds
+   * it, so an instance releasing a lease it may have lost (a drain that timed out) never frees the
+   * lease another instance took over. Without it the release is unconditional. A store that ignores
+   * the argument stays correct, only less precise in that race.
+   */
+  releaseRunLock(runId: string, owner?: string): Promise<void>;
 
   /**
    * Extend a run's lease to `leaseUntilMs`, but ONLY if `owner` still holds it — so a live worker
@@ -766,6 +827,16 @@ export interface ScheduleQuery {
 /** The terminal run statuses — a run in one of these is finished and will never change on its own.
  *  Only these are eligible for retention pruning (a {@link RetentionPolicy} targeting a non-terminal
  *  status would race the engine and delete live work). */
+/**
+ * Normalise a namespace to the worker pool it names: `''` is the default pool, exactly like
+ * `'default'` (the transport already maps both to the bare token), so it is stamped, polled and
+ * compared as `'default'`. `undefined` passes through untouched: an UNSET engine namespace is the
+ * operator (drives every namespace), and an unset run namespace belongs to everyone.
+ */
+export function poolNamespace(namespace: string | undefined): string | undefined {
+  return namespace === '' ? 'default' : namespace;
+}
+
 export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
   'completed',
   'failed',
@@ -2177,8 +2248,8 @@ export interface WorkflowCtx<A extends SearchAttributes = SearchAttributes> {
    *
    * When the workflow declares a `@Workflow({ searchAttributes })` schema, the MERGED result (this
    * run's existing `searchAttributes` shallow-merged with `attrs`) is validated against it before the
-   * write — an invalid merge throws, naming the workflow, the offending key(s), and the schema's
-   * issues. Validation runs once, on the same first-run-only position as the write itself (skipped
+   * write — an invalid merge throws a `SchemaValidationError` (code `schema_validation`, never
+   * retried) naming the workflow, with the schema's issues. Validation runs once, on the same first-run-only position as the write itself (skipped
    * entirely on replay, so it's never a source of nondeterminism); it must be synchronous — a schema
    * whose `validate` returns a `Promise` throws instead of being awaited. No schema declared ⇒
    * unchanged, unvalidated behavior.

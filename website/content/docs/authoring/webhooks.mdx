@@ -60,6 +60,11 @@ handle instead of a run parked forever. `wait()` parks the run on the same logic
 position the mint reserved — so it suspends with **zero compute** until the callback lands, and is
 replay-safe.
 
+A callback can arrive **before** `wait()`: the provider may answer while the run is still in the
+step that handed out the url, or in a `ctx.sleep` after it. That callback is buffered on the token and
+`wait()` consumes it as soon as the run gets there, so it isn't lost and the run doesn't wait for a
+second one.
+
 ## Full example — a payment that calls back
 
 ```ts
@@ -106,6 +111,11 @@ When the payment provider POSTs to the callback URL, the dashboard's `POST webho
 receives it and delivers the body as `engine.signal(token, body)`. That signal wakes the exact run
 suspended on that token, and `hook.wait()` resumes with `body` as its typed payload. The body you POST
 becomes the `PaymentResult` the workflow receives.
+
+The endpoint only accepts `wh:` tokens whose run exists and is not terminal. For those, a callback
+that arrives before `wait()` is buffered and the response is the run's current status. It answers
+`404` for an unknown token, a run that is gone or terminal, or a webhook whose wait already resolved
+(a duplicate callback), and stores nothing for them.
 
 ## Delivering the callback yourself
 

@@ -2,6 +2,7 @@ import {
   DURABLE_OPTIONS_CANONICAL,
   WorkflowEngine,
   runSchedules,
+  workflowName,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
@@ -33,6 +34,9 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
+    // A schedule whose `workflow` is a class that was never decorated would only fail on its first
+    // fire, logged and retried every tick. Resolve every class now so the app fails to boot instead.
+    for (const s of this.options.schedules ?? []) workflowName(s.workflow);
     // Drive suspended runs forward when this operator instance is DRIVING (defaults to true) — it
     // may execute locally or dispatch remotely (group-served / convention), either way it drives. A
     // non-driving (dashboard-only) operator, or a thin worker with no `store` at all, must not
@@ -138,6 +142,9 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
       await this.sweep('recoverIncomplete', () => this.engine.recoverIncomplete());
       await this.sweep('resumeDueTimers', () => this.engine.resumeDueTimers());
       await this.sweep('sweepTimeouts', () => this.engine.sweepTimeouts());
+      // The stalled-run pager: throttled to a pass a minute inside the engine, a no-op without an
+      // `onStalled` listener. Optional call: an older core (the peer range is wide) has no sweep.
+      await this.sweep('sweepStalled', async () => this.engine.sweepStalled?.());
       const schedules = this.options.schedules;
       if (schedules && schedules.length > 0) {
         await this.sweep('schedules', () => runSchedules(this.engine, schedules, Date.now()));

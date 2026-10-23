@@ -7,6 +7,7 @@ import {
   type RunFacetQuery,
   type RunFacetRow,
   type RunQuery,
+  type RunStatus,
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
@@ -18,7 +19,7 @@ import {
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
 } from '../interfaces';
-import type { AttributeFilter } from '../interfaces';
+import type { AttributeFilter, OwnedLeaseReclaim } from '../interfaces';
 import { checkpointStatsOf, queryCheckpointsOf } from '../run-detail-store';
 import { mergeRunFacetRows } from '../run-facets';
 import { RUN_VALUE_FACET_SCAN, runValueFacetsFromRuns } from '../run-value-facets';
@@ -28,9 +29,9 @@ import {
   normalizeAttributeRows,
 } from '../search-attributes';
 import {
-  SINGLETON_ADMITTED_TAG,
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
+  withoutSingletonMarkers,
 } from '../singleton-admission';
 
 /**
@@ -104,20 +105,37 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async createRun(run: WorkflowRun): Promise<void> {
-    // Normalize undefined namespace to 'default', matching the SQL stores' column DEFAULT 'default'
+    // Normalize an undefined (or empty-string, see poolNamespace) namespace to 'default', matching the SQL stores' column DEFAULT 'default'
     // (interfaces.ts: "the store persists it as 'default'"). This ensures legacy runs (created without
     // a namespace, e.g. in tests that bypass the engine) are reachable via a namespace='default' filter.
-    this.runs.set(run.id, { ...run, namespace: run.namespace ?? 'default' });
+    this.runs.set(run.id, { ...run, namespace: run.namespace || 'default' });
     this.reindexAttributes(run.id, run.searchAttributes);
   }
 
   async updateRun(runId: string, inputPatch: Partial<WorkflowRun>): Promise<void> {
+    this.applyRunPatch(runId, inputPatch);
+  }
+
+  updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    // No await between the compare and the write: the base `updateRun` writes synchronously, so
+    // JavaScript's synchronous turn is the critical section. Routed through `updateRun` so a test
+    // store that intercepts it still sees every run write.
+    const existing = this.runs.get(runId);
+    if (!existing || !expectedStatuses.includes(existing.status)) return Promise.resolve(false);
+    return this.updateRun(runId, patch).then(() => true);
+  }
+
+  private applyRunPatch(runId: string, inputPatch: Partial<WorkflowRun>): void {
     const patch =
       inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
         ? {
             ...inputPatch,
-            tags: ('tags' in inputPatch ? inputPatch.tags : this.runs.get(runId)?.tags)?.filter(
-              (tag) => tag !== SINGLETON_ADMITTED_TAG,
+            tags: withoutSingletonMarkers(
+              'tags' in inputPatch ? inputPatch.tags : this.runs.get(runId)?.tags,
             ),
           }
         : inputPatch;
@@ -213,6 +231,28 @@ export class InMemoryStateStore implements StateStore {
     });
   }
 
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    ownedBy?: OwnedLeaseReclaim,
+  ): Promise<WorkflowRun[]> {
+    return [...this.runs.values()]
+      .filter(
+        (r) =>
+          (r.status === 'running' || r.status === 'cancelling') &&
+          (r.lockedUntil == null ||
+            r.lockedUntil <= nowMs ||
+            (ownedBy !== undefined &&
+              r.lockedBy === ownedBy.owner &&
+              r.lockedUntil < ownedBy.lockedBefore)) &&
+          (namespace === undefined || r.namespace === namespace),
+      )
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .slice(0, Math.max(0, limit))
+      .map((r) => ({ ...r }));
+  }
+
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
     return [...this.runs.values()]
       .filter(
@@ -260,9 +300,9 @@ export class InMemoryStateStore implements StateStore {
     return true;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
     const run = this.runs.get(runId);
-    if (run) {
+    if (run && (owner === undefined || run.lockedBy === owner)) {
       run.lockedBy = undefined;
       run.lockedUntil = undefined;
     }

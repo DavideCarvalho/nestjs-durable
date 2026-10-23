@@ -20,6 +20,67 @@ export class FatalError extends Error {
   }
 }
 
+/** One schema issue in JSON-safe form: its message and the path segments, as strings. */
+export interface SchemaIssue {
+  message: string;
+  path: string[];
+}
+
+/**
+ * The code a {@link SchemaValidationError} carries: `invalid_input` for an input schema (a
+ * workflow's or a step's), `invalid_output` for an output schema, `schema_validation` for anything
+ * else (a typed `searchAttributes` write). The same codes `@adonis-agora/durable` uses.
+ */
+export type SchemaValidationCode = 'invalid_input' | 'invalid_output' | 'schema_validation';
+
+/**
+ * Thrown when a value fails a schema the app declared: `@Workflow({ input, output })`,
+ * `@Step({ input, output })`, or the workflow's typed `searchAttributes`. A {@link FatalError}, so it
+ * is NOT retried — retrying cannot fix a value that doesn't match its schema. Its `code` says which
+ * schema rejected the value ({@link SchemaValidationCode}). `issues` (also `details.issues`, so it
+ * survives the transport to the run's error and an onError handler's input) lists every issue with
+ * a JSON-safe `path`. Route one code with `onError: [{ code: 'invalid_input', workflow }]`, or all
+ * three with `onError: [{ code: SchemaValidationError, workflow }]`: its `static code`,
+ * `schema_validation`, also catches an `invalid_input` or `invalid_output` no route of its own
+ * matches. Same class, codes, message and `details` as `@adonis-agora/durable`.
+ */
+export class SchemaValidationError extends FatalError {
+  static readonly code = 'schema_validation';
+  readonly issues: SchemaIssue[];
+  /**
+   * @param label What was validated, e.g. `workflow "checkout" input`; the message is
+   *   `invalid <label>: <path>: <message>; …`.
+   * @param summary Overrides the `<path>: <message>; …` part, for issues whose messages already
+   *   name their field (class-validator's `orderId must be a string`).
+   */
+  constructor(
+    label: string,
+    issues: ReadonlyArray<{
+      readonly message: string;
+      readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> | undefined;
+    }>,
+    code: SchemaValidationCode = 'schema_validation',
+    summary?: string,
+  ) {
+    const normalized = issues.map((issue) => ({
+      message: issue.message,
+      path: (issue.path ?? []).map((segment) =>
+        String(typeof segment === 'object' && segment !== null ? segment.key : segment),
+      ),
+    }));
+    const text =
+      summary ??
+      normalized
+        .map((issue) =>
+          issue.path.length > 0 ? `${issue.path.join('.')}: ${issue.message}` : issue.message,
+        )
+        .join('; ');
+    super(`invalid ${label}: ${text}`, code, { issues: normalized });
+    this.name = 'SchemaValidationError';
+    this.issues = normalized;
+  }
+}
+
 /**
  * Thrown by `start` when a run would exceed its concurrency quota: `active` runs sharing the quota
  * `key` are already in flight (in the quota's counted statuses) and the `limit` is `limit`. Nothing

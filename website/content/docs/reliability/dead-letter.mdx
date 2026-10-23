@@ -42,6 +42,10 @@ DurableModule.forRoot({
 });
 ```
 
+If the dead run is a child, its parent is notified at once, as for a failed child: `ctx.child`
+throws, and `ctx.all` / `ctx.allSettled` record it as failed. The parent does not wait for its
+reconcile wake.
+
 Omit `maxRecoveryAttempts` for unlimited recovery (the default). A `dead` run is terminal but **not lost**:
 it stays fully inspectable in the dashboard — its history, its checkpoints, its error — and it can be
 retried from there once you've shipped a fix. The point is that one poison pill no longer keeps the process

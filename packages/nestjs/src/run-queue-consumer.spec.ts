@@ -2,11 +2,14 @@ import {
   InMemoryRunQueue,
   InMemoryStateStore,
   type RunConsumerOptions,
+  type ScheduledWorkflow,
   type Transport,
   WorkflowEngine,
+  scheduleRunIdAt,
 } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { describe, expect, it } from 'vitest';
+import { Workflow } from './decorators';
 import { RUN_REDIS_WORKER } from './durable-worker.module';
 import { DurableModule } from './durable.module';
 
@@ -15,6 +18,13 @@ import { DurableModule } from './durable.module';
  * driving instance; a dashboard-only operator (`drive: false`) and a thin worker never do. Shutdown
  * stops the consumer and waits for the runs it holds, within `shutdownTimeoutMs`.
  */
+
+@Workflow({ name: 'queued-report' })
+class QueuedReport {
+  async run(_ctx: unknown, input: { region: string }) {
+    return `report for ${input.region}`;
+  }
+}
 
 function queueTransport() {
   const consumers: RunConsumerOptions[] = [];
@@ -66,6 +76,34 @@ describe('DurableModule run-queue consumer', () => {
     expect(q.queued).toEqual(['r']);
     await moduleRef.close();
     expect(q.stopped).toHaveLength(1);
+  });
+
+  it('a schedule given as a workflow class fires through the run queue', async () => {
+    const q = queueTransport();
+    const store = new InMemoryStateStore();
+    const report: ScheduledWorkflow<typeof QueuedReport> = {
+      key: 'queued-report',
+      workflow: QueuedReport,
+      input: { region: 'eu' },
+      everyMs: 60_000,
+    };
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          store,
+          transport: q.transport,
+          timerPollMs: 0,
+          schedules: [report],
+        }),
+      ],
+      providers: [QueuedReport],
+    }).compile();
+    await moduleRef.init();
+    const runId = scheduleRunIdAt(report, Date.now());
+    await until(async () => (await store.getRun(runId))?.status === 'completed');
+    expect((await store.getRun(runId))?.output).toBe('report for eu');
+    expect(q.queued).toContain(runId);
+    await moduleRef.close();
   });
 
   it('a non-driving operator (drive: false) does not consume it', async () => {

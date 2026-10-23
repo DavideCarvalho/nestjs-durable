@@ -117,9 +117,11 @@ Marks a provider class as a durable workflow; its `run(ctx, input)` becomes the 
 | `tags` | `string[]` | Static labels stamped on every run, merged with per-run `start` tags. |
 | `singleton` | `SingletonConfig` (`{ key, limit?, maxQueueDepth? }`) | Durable FIFO mutex per key. See [Singleton workflows](/docs/reliability/singleton). |
 | `concurrency` | `ConcurrencyConfig` (`{ key, limit, countStatuses? }`) | Start-time quota per key (shared across workflows); an over-limit start throws `ConcurrencyLimitError`. See [Concurrency quotas](/docs/reliability/concurrency-quotas). |
-| `executionTimeout` | `string \| number` | Max wall-clock lifetime; an overrunning run is cancelled (`execution_timeout`) by the timer poller. |
-| `inputSchema` | `class` | Validate `start` input against a class-validator DTO (needs `class-validator`/`class-transformer`). |
-| `validateInput` | `(input: unknown) => void \| Promise<void>` | Custom validator; takes precedence over `inputSchema`. |
+| `executionTimeout` | `string \| number` | Max wall-clock lifetime, counted from `createdAt`; an overrunning run — `pending`, `blocked`, `running` or `suspended` — is cancelled (`execution_timeout`) by the timer poller. See [Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap). |
+| `input` | `IoSchema` (Standard Schema \| class-validator DTO class) | Input schema. Checked at `start` (invalid input creates no run); the run stores the input as sent, and `run()` receives the parsed value, re-parsed before every turn. See [Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap). |
+| `output` | `IoSchema` | Output schema. `run()`'s return value is parsed before the run completes; a mismatch fails it with `invalid_output`. |
+| `inputSchema` | `IoSchema` | Alias of `input`, for workflows declared before it existed. Setting both is an error. |
+| `validateInput` | `(input: unknown) => void \| Promise<void>` | Extra check at `start` (throw to reject), run after `input` parses, on the parsed value. |
 | `onEvent` | `string[]` | Start a fresh run whenever any of these events is published. Merged with `@OnDurableEvent`. |
 | `debounce` | `string \| number` | Coalesce `onEvent` triggers: fire once quiet for this long, with the last payload. |
 | `batch` | `{ maxSize: number; within: string \| number }` | Coalesce `onEvent` triggers: fire on size or window, with all payloads. |
@@ -132,7 +134,7 @@ Marks a provider method as a durable step handler, routed BY NAME (derived `Clas
 | --- | --- |
 | `@Step()` | Bare — name derived as `` `${ClassName}.${method}` ``. |
 | `@Step('custom:name')` | Explicit name override. |
-| `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs? })` | Object form — `input`/`output` are opt-in runtime zod schemas validated at the serve boundary; `retries`/`backoff`/`backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` are the def-level dispatch policy `ctx.step` reads (a per-call `opts` overrides field-by-field). See [Retries & backoff](/docs/reliability/retries). |
+| `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs? })` | Object form — `input`/`output` are opt-in runtime schemas (a Standard Schema such as zod, or a class-validator DTO class — the same forms `@Workflow` takes) validated at the serve boundary, and the method receives the parsed input; `retries`/`backoff`/`backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` are the def-level dispatch policy `ctx.step` reads (a per-call `opts` overrides field-by-field). See [Retries & backoff](/docs/reliability/retries). |
 
 | StepOptions field | Type | Notes |
 | --- | --- | --- |
@@ -255,7 +257,7 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 
 | Member | Signature | Notes |
 | --- | --- | --- |
-| `start` | `start(workflow: WorkflowRef, input: unknown, runId: string, opts?: StartOptions): Promise<RunResult>` | Create + enqueue a run. Idempotent by `runId` — a redelivered `runId` returns the existing run's state. `opts.version` starts that exact registered version instead of the newest (throws if it isn't registered — never falls back). |
+| `start` | `start(workflow: WorkflowRef, input: unknown, runId: string, opts?: StartOptions): Promise<RunResult>` | Create + enqueue a run. Idempotent by `runId` — a redelivered `runId` returns the existing run's state. `opts.version` starts that exact registered version instead of the newest (throws if it isn't registered — never falls back). `opts.startAt` (epoch ms or `Date`) delays the start: the run is parked `suspended` on its durable wake timer until then (see [Delayed start](/docs/concepts/sleep-and-signals#delayed-start)). |
 | `signal` | `signal(token: string, payload: unknown): Promise<RunResult \| null>` | Deliver a signal; buffers it if no run is waiting yet (reliable regardless of arrival order). |
 | `signalWithStart` | `signalWithStart(workflow: WorkflowRef, input: unknown, runId: string, signal: { token: string; payload?: unknown }, opts?: StartOptions): Promise<{ runId: string }>` | Ensure-then-signal, race-free. |
 | `update` | `update(runId: string, name: string, arg: unknown): Promise<UpdateResult>` | Deliver a validated update to a run waiting at `ctx.onUpdate(name)`. Runs the registered validator first; rejection never touches the run. |
@@ -278,7 +280,11 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 | `runEnqueued` | `runEnqueued(runId: string): void` | Run an announced run here if it is still `pending`, at most 256 at once per instance. The `onEnqueued` handler the Nest module installs. |
 | `consumeRuns` | `consumeRuns(): (() => Promise<void>) \| undefined` | Consume the transport's run queue and, from then on, queue the runs this engine starts there instead of running them in-process. The Nest module calls it on every driving operator; call it yourself only on an engine you build by hand. Returns a stop function, or `undefined` when no transport carries a run queue. |
 | `onCancel` | `onCancel(listener: (runId: string) => void): () => void` | Subscribe to cancellations on ANY instance — for cooperative in-flight abort. |
-| `drain` | `drain(timeoutMs?: number): Promise<void>` | Graceful shutdown: stop picking up new runs, wait for in-flight executions up to `timeoutMs` (default 10000). |
+| `onStalled` | `onStalled(listener: (info: StalledRunInfo) => void): () => void` | Pager hook for stranded runs, swept by the timer poller once a minute and reported once per stranded episode. See [Stalled runs](/docs/reliability/stalled-runs). |
+| `sweepStalled` | `sweepStalled(now?: number): Promise<StalledRunInfo[]>` | Detect stranded runs and notify `onStalled` listeners. Throttled to a pass a minute; a no-op without listeners or while draining. |
+| `listStalledRuns` | `listStalledRuns(opts?: { thresholdMs?, scan?, now? }): Promise<StalledRunInfo[]>` | The stranded runs right now, in this engine's namespace, without notifying anyone. The standalone `findStalledRuns(store, opts)` runs the same query on a bare store. |
+| `listCheckpoints` | `listCheckpoints(runId: string): Promise<StepCheckpoint[]>` | A run's checkpoint timeline (pass-through to the store), e.g. for `captureHistory`. |
+| `drain` | `drain(timeoutMs?: number): Promise<void>` | Graceful shutdown: stop picking up new runs, wait for in-flight executions up to `timeoutMs` (default 10000). On timeout, releases (owner-scoped) and fences the leases of the runs still executing so another instance recovers them at once. |
 | `workerHealth` | `workerHealth(extra?: string[]): Promise<GroupHealth[]>` | Per-group queue backlog + live worker heartbeats (only transports that support introspection, e.g. BullMQ). |
 | `recoverIncomplete` | `recoverIncomplete(nowMs?: number): Promise<RunResult[]>` | Resume every run left `running` by a crash/deploy. Call on boot. |
 | `resumeDueTimers` | `resumeDueTimers(nowMs?: number): Promise<RunResult[]>` | Resume suspended runs whose durable timer is due: at most `timerBatchSize` per pass (a `WorkflowEngine` constructor option, default 500), most overdue first, walked in shuffled order. Call periodically. |
@@ -291,9 +297,13 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 | `subscribe` | `subscribe(listener: EngineListener): () => void` | Subscribe to every `EngineEvent` (lifecycle events) the engine emits. |
 
 `engine.runSchedules` is **not** a method — `runSchedules(engine, schedules, nowMs, opts?)` is a
-standalone function exported from `@dudousxd/nestjs-durable-core` (`scheduler.ts`) that starts each
-`ScheduledWorkflow`'s current time-bucket run id (idempotent via `engine.start`). The NestJS module's
-`schedules` option wires it to the timer poller automatically — see [Scheduling](/docs/authoring/scheduling).
+standalone function (exported from `@dudousxd/nestjs-durable`, and from `-core`) that starts each
+`ScheduledWorkflow`'s current time-bucket run id (idempotent via `engine.start`) and returns the ids it
+started — a window that already has a run is skipped, and not returned. The NestJS module's
+`schedules` option wires it to the timer poller automatically; call it yourself to [fire schedules from
+your own trigger](/docs/authoring/scheduling#firing-schedules-from-your-own-trigger).
+`scheduleRunIdAt(schedule, nowMs)` returns the run id of a schedule's window at `nowMs`, for
+[looking a window's run up](/docs/authoring/scheduling#looking-up-a-schedules-run) with `getRun`.
 
 ## DurableModuleOptions
 
@@ -314,6 +324,8 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `maxRecoveryAttempts` | `number` | unlimited | Cap recovery attempts before a poison-pill run moves to `dead`. See [Dead-letter queue](/docs/reliability/dead-letter). |
 | `remoteAdvanceSilenceMs` | `number` | unbounded await | Liveness deadline for a remote (polyglot) workflow `advance`; each heartbeat rearms it. Operator only. |
 | `reconcileMs` | `number` | `300000` | Fallback re-drive for a run suspended on an event whose wake-up was lost; `0` disables it. Operator only. |
+| `stalledAfterMs` | `number` | `900000` | Idle time before a stranded run is reported to `onStalled` listeners (floored at 60000). Operator only. |
+| `onStalled` | `(info: StalledRunInfo) => void` | none | Registered as `engine.onStalled(...)`; the timer poller of a driving operator sweeps once a minute. See [Stalled runs](/docs/reliability/stalled-runs). |
 | `timerBatchSize` | `number` | `500` | Most due timers one timer-poll pass loads and drives, most overdue first. A non-finite or sub-1 value falls back to 500. Operator only. |
 | `eventBufferTtlMs` | `number` | keep until consumed | Retention for a buffered event no `waitForEvent` claims; pruned by the reconcile pass. Operator only. |
 | `blockedPollMs` | `number` | `5000` | How often a run parked `blocked` (no capable live worker) re-checks the fleet. Operator only. |
@@ -321,7 +333,7 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `deadLetterWorkflow` | `WorkflowRef` | none | Default DLQ target for workflows without their own. Operator only. |
 | `drive` | `boolean` | `true` | Whether this operator instance actively drives runs (poll/recover/resume/prune/consume). `false` = dashboard/dispatch-only. |
 | `shutdownTimeoutMs` | `number` | `10000` | Max ms to wait for in-flight runs on shutdown. Operator only. |
-| `schedules` | `ScheduledWorkflow[]` | none | Recurring workflows (fixed interval or cron), fired by the timer poller on driving instances. See [Scheduling](/docs/authoring/scheduling). |
+| `schedules` | `ScheduledWorkflow[]` | none | Recurring workflows (fixed interval or cron), fired by the timer poller on driving instances. Each `workflow` is a `@Workflow` class (resolved at boot; `ScheduledWorkflow<typeof X>` types `input`) or a registered name. See [Scheduling](/docs/authoring/scheduling). |
 | `persistedSchedules` | `boolean` | `false` | Fire the runtime-managed `engine.schedules` (stored in `durable_schedules`) on each timer-poll tick. See [Persisted schedules](/docs/authoring/persisted-schedules). |
 | `retention` | `DurableRetentionOptions` (`{ policies, sweepInterval?, batchSize? }`) | keep all history | Hard-prune terminal run history on an interval. See [Run retention & pruning](/docs/reliability/retention). |
 | `webhookUrl` | `(token: string) => string` | none (build your own) | Builds `DurableWebhook.url` for `ctx.webhook()`. Operator only. |
@@ -374,6 +386,7 @@ All exported from `@dudousxd/nestjs-durable-core`.
 | --- | --- |
 | `FatalError` | `new FatalError(message, code?, details?)` — thrown BY YOU inside a step/workflow for an unrecoverable business failure (e.g. a declined card) — the engine never retries it, in a local or a dispatched step, and fails the run immediately. `code` and `details` travel with the failure to the run's error, a parent's `allSettled` item or `ctx.child` catch, and an onError handler. |
 | `SignalTimeoutError` | `ctx.waitForSignal` / `ctx.waitForEvent` / `ctx.onUpdate`'s `timeoutMs` deadline passes before delivery. Catchable in the workflow to take a default branch. |
+| `SchemaValidationError` | A value failed a declared schema: `@Workflow({ input, output })`, `@Step({ input, output })`, or a `searchAttributes` schema (thrown by `ctx.upsertSearchAttributes`). A `FatalError`, never retried, whose `code` is `invalid_input`, `invalid_output` or (search attributes) `schema_validation`. `issues` and `details.issues` hold `{ message, path: string[] }[]`; the message is `invalid <what>: <path>: <message>; …`. Its `static code` is `schema_validation`, and an onError route for it also catches `invalid_input` and `invalid_output` no route of their own matches. Same class, codes and shape as in `@adonis-agora/durable`. |
 | `NonDeterminismError` | On resume, the step at a logical position has a different name/kind than its checkpoint — the workflow code changed under an in-flight run without a new `@Workflow` version. See [Versioning & determinism](/docs/authoring/versioning). |
 | `NestedWorkflowCallError` | A ctx primitive (`ctx.startChild`/`child`/`step`/`sleep`/`sideEffect`/…, or a `MyWorkflow.start()`/`.execute()` static via the ambient ctx) was called from INSIDE a step body (`ctx.localStep`/`transaction`/`sideEffect`/`now`). Thrown at the call site, as a `FatalError` (code `nested_workflow_call`). See [Troubleshooting](/docs/troubleshooting#nestedworkflowcallerror-a-ctx-call-inside-a-step-body). |
 | `ConcurrencyLimitError` | `start` whose concurrency quota key already has `limit` runs in flight (`key`, `limit`, `active`, `workflow`). Nothing was created — shed load / answer 429. See [Concurrency quotas](/docs/reliability/concurrency-quotas). |
