@@ -1,4 +1,5 @@
 import { FatalError } from './errors';
+import { CORE_ORIGIN } from './origin';
 import type { InternalWorkflowCtx } from './workflow-ctx';
 
 /** One operation on a durable entity: mutate `state` in place and/or return a result. */
@@ -18,6 +19,7 @@ export interface EntityHost {
     name: string,
     version: string,
     fn: (ctx: InternalWorkflowCtx, input: unknown) => Promise<unknown>,
+    opts?: { origin?: string | undefined },
   ): void;
   signalWithStart(
     workflow: string,
@@ -73,7 +75,9 @@ export class Entities {
     private readonly host: EntityHost,
     private readonly workflowHost?: EntityWorkflowHost,
   ) {
-    host.register(ENTITY_WORKFLOW, '1', (ctx, input) => this.run(ctx, input));
+    host.register(ENTITY_WORKFLOW, '1', (ctx, input) => this.run(ctx, input), {
+      origin: CORE_ORIGIN,
+    });
   }
 
   register<S>(name: string, config: EntityConfig<S>): void {
