@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.85.2
+
+### Patch Changes
+
+- [#419](https://github.com/DavideCarvalho/nestjs-durable/pull/419) [`e6ede8d`](https://github.com/DavideCarvalho/nestjs-durable/commit/e6ede8d64a8648e866c4b6e503aa550eb5b0e7c7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Schedule jitter follow-ups: `runSchedules` documents that it must be called with the same `engine` object every time (deferred windows are remembered per engine), and it drops a schedule's jitter memo once the schedule no longer has a jitter.
+
 ## 0.85.1
 
 ### Patch Changes
