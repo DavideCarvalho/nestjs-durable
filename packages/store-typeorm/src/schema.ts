@@ -21,6 +21,24 @@ export const JSON_BLOB_COLUMNS: Record<string, string[]> = {
   // at CREATE TABLE time on a fresh install, so there's no pre-existing narrower column to widen.
 };
 
+/**
+ * Fractional-second digits on every MySQL timestamp column. A bare `datetime` holds whole seconds
+ * and ROUNDS the milliseconds away, which moves leases, timers and event order by up to half a
+ * second. 6 matches Postgres's `timestamptz` and the MikroORM store's MySQL columns.
+ */
+export const MYSQL_DATETIME_TYPE = 'datetime(6)';
+
+/** The timestamp columns per table (entity PROPERTY names), raised to {@link MYSQL_DATETIME_TYPE}. */
+const DATETIME_COLUMNS: Record<string, string[]> = {
+  durable_workflow_runs: ['wakeAt', 'lockedUntil', 'createdAt', 'updatedAt'],
+  durable_step_checkpoints: ['wakeAt', 'enqueuedAt', 'startedAt', 'finishedAt'],
+  durable_buffered_events: ['publishedAt'],
+  durable_schedules: ['createdAt', 'updatedAt'],
+};
+
+/** Default {@link EnsureTypeOrmDurableSchemaOptions.blockingAlterRowLimit}: a copy of this many rows takes seconds. */
+export const DEFAULT_BLOCKING_ALTER_ROW_LIMIT = 100_000;
+
 /** Each durable table → its backing entity class, so a column resolver can look up the physical
  *  column for any (table, property) from the DataSource metadata (which reflects the configured
  *  `DurableColumnNaming`). Keeps the raw DDL/SQL in lock-step with the entity column mapping. */
@@ -112,6 +130,30 @@ export interface DurableSchemaLogger {
 export interface EnsureTypeOrmDurableSchemaOptions {
   /** Sink for the schema-repair warning. Defaults to `console`. */
   logger?: DurableSchemaLogger | undefined;
+  /**
+   * MySQL only: the largest estimated row count (`information_schema.tables.table_rows`) of an
+   * existing durable table on which the boot-time check will raise a timestamp column's precision.
+   * MySQL runs that type change as a full table copy that blocks writes until it finishes, so on a
+   * bigger table the statement is skipped and logged for you to run out of band (a maintenance
+   * window, `gh-ost`, `pt-online-schema-change`); every boot logs it again until the column matches.
+   * Defaults to {@link DEFAULT_BLOCKING_ALTER_ROW_LIMIT}. `Infinity` always applies.
+   */
+  blockingAlterRowLimit?: number | undefined;
+}
+
+/** The warning logged when a precision upgrade was skipped because the table is too big to rebuild at boot. */
+export function typeOrmDeferredAlterWarning(
+  deferred: ReadonlyArray<{ table: string; rows: number; statement: string }>,
+  limit: number,
+): string {
+  return [
+    '[nestjs-durable] store-typeorm did NOT apply these durable-schema column type changes at boot,',
+    `because MySQL rebuilds the table and blocks its writes while it does, and each table holds more than ${limit} rows:`,
+    deferred.map((d) => `${d.table} (~${d.rows} rows): ${d.statement};`).join(' '),
+    'Run them in a maintenance window or with an online schema change tool (gh-ost,',
+    'pt-online-schema-change), or raise `blockingAlterRowLimit`. Until then the store keeps working on',
+    'the old column types, and this warning repeats on every boot.',
+  ].join(' ');
 }
 
 /**
@@ -175,7 +217,7 @@ export async function ensureTypeOrmDurableSchema(
   // is already unbounded and SQLite `text` has no length limit.
   const txt = jsonBlobColumnType(isMysql);
   const int = isMysql ? 'int' : 'integer';
-  const ts = isPg ? 'timestamptz' : 'datetime';
+  const ts = isPg ? 'timestamptz' : isMysql ? MYSQL_DATETIME_TYPE : 'datetime';
   // The tenant partition every poll predicate filters on. NOT NULL with a literal default so that
   // adding it to a table that predates it back-fills each existing row with `'default'` — the
   // namespace those runs actually executed in — instead of leaving NULLs that would match no
@@ -334,6 +376,8 @@ export async function ensureTypeOrmDurableSchema(
   // What this boot actually changed, for the repair warning. Tables created here are recorded
   // separately: their columns and indexes come with the CREATE, so they are not listed one by one.
   const repairs: string[] = [];
+  const deferred: Array<{ table: string; rows: number; statement: string }> = [];
+  const rowLimit = options.blockingAlterRowLimit ?? DEFAULT_BLOCKING_ALTER_ROW_LIMIT;
   const created = new Set<string>();
   const runner = dataSource.createQueryRunner();
   try {
@@ -376,6 +420,37 @@ export async function ensureTypeOrmDurableSchema(
             /* best-effort, as before: a failed widen leaves the column as it was */
           }
         }
+      }
+    }
+    // Raise second-precision MySQL timestamp columns (what older versions created) to
+    // `datetime(6)`, one ALTER per table, keeping each column's nullability. A type change is a
+    // blocking table copy on MySQL, so a table above the row limit is deferred to the operator.
+    if (isMysql) {
+      for (const [table, props] of Object.entries(DATETIME_COLUMNS)) {
+        if (created.has(table)) continue;
+        const columns = await mysqlDatetimeColumns(runner, table);
+        const behind = props
+          .map((prop) => resolve(table, prop))
+          .filter((column) => {
+            const current = columns.get(column);
+            return current !== undefined && current.precision < 6;
+          });
+        if (behind.length === 0) continue;
+        const statement = `ALTER TABLE ${q(table)} ${behind
+          .map(
+            (column) =>
+              `MODIFY COLUMN ${q(column)} ${MYSQL_DATETIME_TYPE} ${columns.get(column)?.nullable ? 'NULL' : 'NOT NULL'}`,
+          )
+          .join(', ')}`;
+        const rows = await mysqlEstimatedRows(runner, table);
+        if (rows > rowLimit) {
+          deferred.push({ table, rows, statement });
+          continue;
+        }
+        await runner.query(statement);
+        repairs.push(
+          `raised ${behind.map((column) => `${table}.${column}`).join(', ')} to ${MYSQL_DATETIME_TYPE}`,
+        );
       }
     }
     // MySQL has no `CREATE INDEX IF NOT EXISTS`; create each best-effort and ignore "already exists".
@@ -463,6 +538,36 @@ export async function ensureTypeOrmDurableSchema(
   // drift: stay quiet. Anything else that changed means the database was behind.
   const freshInstall = created.size === tables.length;
   if (repairs.length > 0 && !freshInstall) logger.warn(typeOrmSchemaRepairWarning(repairs));
+  if (deferred.length > 0) logger.warn(typeOrmDeferredAlterWarning(deferred, rowLimit));
+}
+
+/** MySQL: the `datetime` columns of `table` with their fractional precision and nullability. */
+async function mysqlDatetimeColumns(
+  runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+  table: string,
+): Promise<Map<string, { precision: number; nullable: boolean }>> {
+  const rows = (await runner.query(
+    "SELECT column_name AS name, datetime_precision AS `precision`, is_nullable AS nullable FROM information_schema.columns WHERE table_name = ? AND TABLE_SCHEMA = DATABASE() AND data_type = 'datetime'",
+    [table],
+  )) as Array<{ name: string; precision: number | string | null; nullable: string }>;
+  return new Map(
+    rows.map((r) => [
+      r.name,
+      { precision: Number(r.precision ?? 0), nullable: String(r.nullable).toUpperCase() === 'YES' },
+    ]),
+  );
+}
+
+/** MySQL: InnoDB's row estimate for `table` (cheap: no scan). 0 when unknown. */
+async function mysqlEstimatedRows(
+  runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+  table: string,
+): Promise<number> {
+  const rows = (await runner.query(
+    'SELECT table_rows AS n FROM information_schema.tables WHERE table_name = ? AND TABLE_SCHEMA = DATABASE() LIMIT 1',
+    [table],
+  )) as Array<{ n: number | string | null }>;
+  return Number(rows[0]?.n ?? 0);
 }
 
 /** The durable tables that exist before the boot-time check runs (to tell a created table apart). */

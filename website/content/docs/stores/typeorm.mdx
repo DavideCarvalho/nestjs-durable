@@ -91,6 +91,42 @@ export class AddDurableTables implements MigrationInterface {
 DurableModule.forRoot({ store, transport, autoSchema: false });
 ```
 
+### MySQL timestamp precision and large tables
+
+Every timestamp column is created with microsecond precision: `datetime(6)` on MySQL (`timestamptz`
+on Postgres already is). A bare MySQL `datetime` holds whole seconds and **rounds** the milliseconds
+away, which moves lease expiry, `wakeAt` and buffered-event order by up to half a second: a timer can
+fire early, and an engine can take a lease it acquired just after booting for one left by its
+previous process.
+
+Durable tables created by an older version on MySQL hold plain `datetime`, so the first boot on this
+version changes those columns to `datetime(6)`. MySQL cannot do that type change in place: it copies
+the table and **blocks writes to it until the copy finishes**. On a small table that takes moments;
+on a large `durable_step_checkpoints` it can take minutes, stall every run, and get the pod killed by
+its probes halfway through (rolling the change back, to restart on the next boot). So the heal only
+runs a column type change on an existing table whose estimated row count
+(`information_schema.tables.table_rows`) is at most `blockingAlterRowLimit` (default `100000`). On a
+bigger table it skips the statement and logs it instead:
+
+```
+[nestjs-durable] store-typeorm did NOT apply these durable-schema column type changes at boot, because
+MySQL rebuilds the table and blocks its writes while it does … durable_step_checkpoints (~2400000
+rows): ALTER TABLE … MODIFY … datetime(6) …; Run them in a maintenance window or with an online
+schema change tool (gh-ost, pt-online-schema-change), or raise `blockingAlterRowLimit`. …
+```
+
+The store keeps working on the old columns meanwhile, and the warning repeats on every boot until the
+column matches. Run the logged statement yourself (in a maintenance window, or with `gh-ost` /
+`pt-online-schema-change` to keep the table writable), or raise the limit to let a boot do it:
+
+```ts
+new TypeOrmStateStore(dataSource, { schemaBlockingAlterRowLimit: Number.POSITIVE_INFINITY });
+// or, from a migration / script:
+await ensureTypeOrmDurableSchema(dataSource, { blockingAlterRowLimit: Number.POSITIVE_INFINITY });
+```
+
+Postgres and SQLite need no change.
+
 ### Schema repair warning
 
 When `ensureTypeOrmDurableSchema` changes a durable schema that already existed (it creates a table

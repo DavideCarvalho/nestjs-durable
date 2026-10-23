@@ -66,6 +66,36 @@ export interface DurableSchemaLogger {
 export interface EnsureMikroOrmDurableSchemaOptions {
   /** Sink for the schema-repair warning. Defaults to `console`. */
   logger?: DurableSchemaLogger | undefined;
+  /**
+   * MySQL only: the largest estimated row count (`information_schema.tables.table_rows`) of an
+   * existing durable table on which the boot-time heal will run a column TYPE change. MySQL runs a
+   * type change (e.g. `datetime` -> `datetime(6)`) as a full table copy that blocks writes until it
+   * finishes, so on a bigger table the statement is skipped and logged for you to run out of band
+   * (a maintenance window, `gh-ost`, `pt-online-schema-change`); every boot logs it again until the
+   * column matches. Defaults to {@link DEFAULT_BLOCKING_ALTER_ROW_LIMIT}. `Infinity` always applies.
+   */
+  blockingAlterRowLimit?: number | undefined;
+}
+
+/** Default {@link EnsureMikroOrmDurableSchemaOptions.blockingAlterRowLimit}: a copy of this many rows takes seconds. */
+export const DEFAULT_BLOCKING_ALTER_ROW_LIMIT = 100_000;
+
+/**
+ * The warning logged when the heal skipped a MySQL column type change because the table is too big
+ * to rebuild at boot (see {@link EnsureMikroOrmDurableSchemaOptions.blockingAlterRowLimit}).
+ */
+export function mikroOrmDeferredAlterWarning(
+  deferred: ReadonlyArray<{ table: string; rows: number; statement: string }>,
+  limit: number,
+): string {
+  return [
+    '[nestjs-durable] store-mikro-orm did NOT apply these durable-schema column type changes at boot,',
+    `because MySQL rebuilds the table and blocks its writes while it does, and each table holds more than ${limit} rows:`,
+    deferred.map((d) => `${d.table} (~${d.rows} rows): ${d.statement};`).join(' '),
+    'Run them in a maintenance window or with an online schema change tool (gh-ost,',
+    'pt-online-schema-change), or raise `blockingAlterRowLimit`. Until then the store keeps working on',
+    'the old column types, and this warning repeats on every boot.',
+  ].join(' ');
 }
 
 /**
@@ -392,9 +422,13 @@ export async function ensureMikroOrmDurableSchema(
     if ((await readStoredFingerprint(orm)) === expected) {
       return;
     }
-    const { repairs, freshInstall } = await healDurableSchema(orm);
-    await writeFingerprint(orm, dialect, expected);
+    const limit = options.blockingAlterRowLimit ?? DEFAULT_BLOCKING_ALTER_ROW_LIMIT;
+    const { repairs, freshInstall, deferred } = await healDurableSchema(orm, dialect, limit);
+    // A deferred statement leaves the schema behind the metadata: keep the marker stale so the next
+    // boot re-checks (and applies it, once the table is small enough or the operator ran it).
+    if (deferred.length === 0) await writeFingerprint(orm, dialect, expected);
     if (repairs.length > 0 && !freshInstall) logger.warn(mikroOrmSchemaRepairWarning(repairs));
+    if (deferred.length > 0) logger.warn(mikroOrmDeferredAlterWarning(deferred, limit));
   } finally {
     await releaseSchemaLock(orm, dialect);
   }
@@ -408,7 +442,13 @@ export async function ensureMikroOrmDurableSchema(
  */
 async function healDurableSchema(
   orm: MikroORM,
-): Promise<{ repairs: string[]; freshInstall: boolean }> {
+  dialect: SqlDialect,
+  blockingAlterRowLimit: number,
+): Promise<{
+  repairs: string[];
+  freshInstall: boolean;
+  deferred: Array<{ table: string; rows: number; statement: string }>;
+}> {
   const sql = await orm.schema.getUpdateSchemaSQL({ safe: true });
   const ours = sql
     .split(';')
@@ -425,10 +465,18 @@ async function healDurableSchema(
       .map((statement) => targetTable(statement) as string),
   );
   const repairs: string[] = [];
+  const deferred: Array<{ table: string; rows: number; statement: string }> = [];
   for (const statement of ours) {
+    const table = targetTable(statement) as string;
+    if (dialect === 'mysql' && !created.has(table) && isColumnTypeChange(statement)) {
+      const rows = await estimatedRowCount(orm, table);
+      if (rows > blockingAlterRowLimit) {
+        deferred.push({ table, rows, statement });
+        continue;
+      }
+    }
     try {
       await connection.execute(statement);
-      const table = targetTable(statement) as string;
       const isCreateTable = /^create\s+table\b/i.test(statement);
       if (isCreateTable || !created.has(table))
         repairs.push(...describeDurableStatement(statement));
@@ -455,7 +503,25 @@ async function healDurableSchema(
     if (!created.has(table)) repairs.push(`converted ${table} collation from ${from} to ${to}`);
   }
   const freshInstall = [...DURABLE_TABLE_NAMES].every((table) => created.has(table));
-  return { repairs, freshInstall };
+  return { repairs, freshInstall, deferred };
+}
+
+/** An `alter table` whose every action is a MySQL `modify` (a column type/nullability change). */
+function isColumnTypeChange(statement: string): boolean {
+  if (!/^alter\s+table\b/i.test(statement)) return false;
+  const actions = splitTopLevel(statement.replace(/^alter\s+table\s+[`"']?[\w$]+[`"']?\s*/i, ''));
+  return actions.length > 0 && actions.every((action) => /^modify\b/i.test(action));
+}
+
+/** InnoDB's row estimate for `table` (cheap: no scan). 0 when unknown. */
+async function estimatedRowCount(orm: MikroORM, table: string): Promise<number> {
+  const rows: Array<{ table_rows?: number | string | null }> = await orm.em
+    .getConnection()
+    .execute(
+      'select table_rows as table_rows from information_schema.tables where table_schema = database() and table_name = ? limit 1',
+      [table],
+    );
+  return Number(rows[0]?.table_rows ?? 0);
 }
 
 /** A MySQL identifier we are willing to interpolate into DDL (charset / collation names). */

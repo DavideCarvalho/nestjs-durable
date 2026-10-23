@@ -28,6 +28,14 @@ function snakeCase(property: string): string {
   return property.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 }
 
+/**
+ * Fractional-second digits on every timestamp column. MySQL's `datetime` defaults to 0 and ROUNDS
+ * the milliseconds away, which moves leases, timers and event order by up to half a second. 6 rather
+ * than 3 because it is Postgres's default `timestamptz` precision, so pinning it changes no
+ * Postgres column; SQLite ignores it.
+ */
+export const DATETIME_PRECISION = 6;
+
 function columnNamer(naming: DurableColumnNaming): (property: string) => string {
   if (naming === 'snake_case') return snakeCase;
   if (naming === 'preserve') return (property) => property;
@@ -210,9 +218,19 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       input: { type: 'json', nullable: true, fieldName: col('input') },
       output: { type: 'json', nullable: true, fieldName: col('output') },
       error: { type: 'json', nullable: true, fieldName: col('error') },
-      wakeAt: { type: 'Date', nullable: true, fieldName: col('wakeAt') },
+      wakeAt: {
+        type: 'Date',
+        length: DATETIME_PRECISION,
+        nullable: true,
+        fieldName: col('wakeAt'),
+      },
       lockedBy: { type: 'string', nullable: true, fieldName: col('lockedBy') },
-      lockedUntil: { type: 'Date', nullable: true, fieldName: col('lockedUntil') },
+      lockedUntil: {
+        type: 'Date',
+        length: DATETIME_PRECISION,
+        nullable: true,
+        fieldName: col('lockedUntil'),
+      },
       // REMOTE turn the engine suspended on awaiting a decision; matched by completeRemoteDecision so
       // only the currently-awaited turn's decision is applied. Nullable: cleared when a decision lands.
       awaitingDecisionTaskId: {
@@ -246,8 +264,8 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       // deployment ever makes origin-filtered listings hot, add the composite index in your own
       // migration rather than here.
       origin: { type: 'string', nullable: true, fieldName: col('origin') },
-      createdAt: { type: 'Date', fieldName: col('createdAt') },
-      updatedAt: { type: 'Date', fieldName: col('updatedAt') },
+      createdAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('createdAt') },
+      updatedAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('updatedAt') },
     },
   });
 
@@ -282,10 +300,20 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       // worker's recordStep), but it was never persisted here — so the fan always rendered as N
       // sequential singles. Nullable: only fan-out steps carry it.
       parallelGroup: { type: 'string', nullable: true, fieldName: col('parallelGroup') },
-      wakeAt: { type: 'Date', nullable: true, fieldName: col('wakeAt') },
-      enqueuedAt: { type: 'Date', nullable: true, fieldName: col('enqueuedAt') },
-      startedAt: { type: 'Date', fieldName: col('startedAt') },
-      finishedAt: { type: 'Date', fieldName: col('finishedAt') },
+      wakeAt: {
+        type: 'Date',
+        length: DATETIME_PRECISION,
+        nullable: true,
+        fieldName: col('wakeAt'),
+      },
+      enqueuedAt: {
+        type: 'Date',
+        length: DATETIME_PRECISION,
+        nullable: true,
+        fieldName: col('enqueuedAt'),
+      },
+      startedAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('startedAt') },
+      finishedAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('finishedAt') },
     },
   });
 
@@ -354,7 +382,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       id: { type: 'string', primary: true, fieldName: col('id') },
       name: { type: 'string', fieldName: col('name') },
       payload: { type: 'json', nullable: true, fieldName: col('payload') },
-      publishedAt: { type: 'Date', fieldName: col('publishedAt') },
+      publishedAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('publishedAt') },
     },
   });
 
@@ -373,8 +401,8 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       tags: { type: 'json', nullable: true, fieldName: col('tags') },
       spec: { type: 'json', fieldName: col('spec') },
       state: { type: 'json', fieldName: col('state') },
-      createdAt: { type: 'Date', fieldName: col('createdAt') },
-      updatedAt: { type: 'Date', fieldName: col('updatedAt') },
+      createdAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('createdAt') },
+      updatedAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('updatedAt') },
     },
   });
 

@@ -117,6 +117,21 @@ describe.skipIf(skipped)('ensureMikroOrmDurableSchema repair warning [real Postg
     await ensureMikroOrmDurableSchema(o, { logger: after });
     expect(after.messages).toEqual([]);
   });
+
+  it('leaves the timestamp columns an older version created alone (timestamptz is already microsecond)', async () => {
+    const o = await boot();
+    await ensureMikroOrmDurableSchema(o, { logger: recordingLogger() });
+    // Older versions declared no precision, so Postgres holds the typmod-less `timestamptz`.
+    await o.em
+      .getConnection()
+      .execute(
+        'alter table "durable_workflow_runs" alter column "wake_at" type timestamptz, alter column "created_at" type timestamptz',
+      );
+    await clearMarker();
+    const logger = recordingLogger();
+    await ensureMikroOrmDurableSchema(o, { logger });
+    expect(logger.messages).toEqual([]);
+  });
 });
 
 // --- MySQL: the `alter table … add` shapes and the collation conversion ---------------------------
@@ -190,5 +205,82 @@ describe.skipIf(mysqlSkipped)('ensureMikroOrmDurableSchema repair warning [real 
     expect(message).toContain(
       'converted durable_signal_waiters collation from utf8mb4_0900_ai_ci to utf8mb4_unicode_ci',
     );
+  });
+
+  it('upgrades second-precision datetime columns left by an older version to millisecond precision', async () => {
+    orm = await MySqlMikroORM.init({
+      clientUrl: mysqlUrl,
+      entities: [...ENTITIES],
+      allowGlobalContext: true,
+    });
+    const connection = orm.em.getConnection();
+    for (const table of ['durable_schema_meta', ...durableManagedTables()])
+      await connection.execute(`drop table if exists \`${table}\``);
+    await ensureMikroOrmDurableSchema(orm, { logger: recordingLogger() });
+    // The shape an older version created: plain `datetime`, which rounds to whole seconds.
+    await connection.execute(
+      'alter table `durable_workflow_runs` modify `wake_at` datetime null, modify `locked_until` datetime null, modify `created_at` datetime not null, modify `updated_at` datetime not null',
+    );
+    await connection.execute(
+      'alter table `durable_buffered_events` modify `published_at` datetime not null',
+    );
+    await connection.execute('delete from durable_schema_meta');
+
+    const logger = recordingLogger();
+    await ensureMikroOrmDurableSchema(orm, { logger });
+
+    const rows: Array<{ table_name: string; column_name: string; precision: number }> =
+      await connection.execute(
+        "select table_name as table_name, column_name as column_name, datetime_precision as `precision` from information_schema.columns where table_schema = database() and data_type = 'datetime' and table_name like 'durable\\_%'",
+      );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.filter((row) => Number(row.precision) < 3)).toEqual([]);
+    expect(logger.messages).toHaveLength(1);
+    expect(logger.messages[0]).toContain('durable_workflow_runs');
+    expect(logger.messages[0]).toContain('durable_buffered_events');
+
+    const store = new MikroOrmStateStore(orm);
+    await store.bufferEvent({ name: 'evt', payload: 1, id: 'e1', publishedAt: 1_234 });
+    expect((await store.listBufferedEvents('evt', 1))[0]?.publishedAt).toBe(1_234);
+  });
+
+  it('defers a column type change on a table above the row limit, and re-warns until it is applied', async () => {
+    orm = await MySqlMikroORM.init({
+      clientUrl: mysqlUrl,
+      entities: [...ENTITIES],
+      allowGlobalContext: true,
+    });
+    const connection = orm.em.getConnection();
+    for (const table of ['durable_schema_meta', ...durableManagedTables()])
+      await connection.execute(`drop table if exists \`${table}\``);
+    await ensureMikroOrmDurableSchema(orm, { logger: recordingLogger() });
+    await connection.execute(
+      'alter table `durable_buffered_events` modify `published_at` datetime not null',
+    );
+    const store = new MikroOrmStateStore(orm);
+    for (const id of ['a', 'b', 'c'])
+      await store.bufferEvent({ name: 'evt', payload: id, id, publishedAt: 1_000 });
+    await connection.execute('analyze table `durable_buffered_events`');
+    await connection.execute('delete from durable_schema_meta');
+
+    const precision = async (): Promise<number> => {
+      const rows: Array<{ p: number }> = await connection.execute(
+        "select datetime_precision as p from information_schema.columns where table_schema = database() and table_name = 'durable_buffered_events' and column_name = 'published_at'",
+      );
+      return Number(rows[0]?.p);
+    };
+
+    for (let boot = 0; boot < 2; boot++) {
+      const logger = recordingLogger();
+      await ensureMikroOrmDurableSchema(orm, { logger, blockingAlterRowLimit: 1 });
+      expect(await precision()).toBe(0);
+      expect(logger.messages).toHaveLength(1);
+      expect(logger.messages[0]).toContain('did NOT apply');
+      expect(logger.messages[0]).toContain('durable_buffered_events (~3 rows)');
+      expect(logger.messages[0]).toMatch(/modify `published_at` datetime\(6\)/i);
+    }
+
+    await ensureMikroOrmDurableSchema(orm, { logger: recordingLogger() });
+    expect(await precision()).toBe(6);
   });
 });
