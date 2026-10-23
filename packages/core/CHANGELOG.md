@@ -1,5 +1,14 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.85.5
+
+### Patch Changes
+
+- [#421](https://github.com/DavideCarvalho/nestjs-durable/pull/421) [`ee41acd`](https://github.com/DavideCarvalho/nestjs-durable/commit/ee41acd6756b37790dfe00af9a520aa2ead12ec6) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Stamp the engine's own built-in workflows with an origin. The `__entity` runner behind durable
+  entities and the `__evt_debounce` / `__evt_batch` `onEvent` accumulators now register with
+  `origin: '@dudousxd/nestjs-durable-core'` (exported as `CORE_ORIGIN`), so a console's ORIGIN facet
+  files that engine plumbing under the engine instead of leaving it unattributed next to the app's runs.
+
 ## 0.85.4
 
 ### Patch Changes
