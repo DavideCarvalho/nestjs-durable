@@ -76,6 +76,19 @@ Point a store-less **Adonis** `tenant` worker (`@adonis-agora/durable`, `node ac
 
 </Tabs>
 
+## Tenant tokens across runtimes
+
+[Signed tenant tokens](/docs/cluster/roles-and-config#layered-tenant-authentication) are shared with
+Agora byte for byte: the token rides in the `tenant` field as
+`<claim>.<base64url(HMAC-SHA256(secret, claim))>` (claim = tenant, optionally `.exp<epochMs>`), and a
+rejected request gets the same `unauthorized` error reply. An Agora tenant configured with
+`tenant: { token }` can talk to a NestJS control plane with `verifyTenant: hmacTenantVerifier(secret)`,
+and a NestJS tenant with `tenantToken` can talk to an Agora control plane with `verifyTenant`, as long
+as both sides share the secret. `signTenantToken` produces identical bytes in both libraries.
+
+A control plane without a verifier treats a token as an (unknown) tenant name and finds no runs, a
+safe failure, so enable verification on the control plane before handing tokens to tenants.
+
 ## Version safety across runtimes
 
 Because every worker advertises a [descriptor](/docs/cluster/handshake) and the control plane negotiates before dispatching, a polyglot fleet is **version-safe**: an incompatible protocol major is refused loudly, an optional capability a Python worker lacks routes that work only to workers that have it, and a run requiring a capability no live worker provides parks `blocked` until one appears — never a silent cross-language hang.

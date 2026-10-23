@@ -18,12 +18,14 @@ import type {
   RunValueFacetOptions,
   RunValueFacetRow,
   RunWaiting,
+  TenantTokenSource,
   Transport,
 } from '@dudousxd/nestjs-durable-core';
 import {
   SUMMARY_CHILD_LIMIT,
   childIdsOf,
   pageFan,
+  resolveTenantToken,
   summarizeTimeline,
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
@@ -72,6 +74,14 @@ export class ProxyRunGateway implements RunGateway {
     private readonly tenant: string,
     private readonly timeoutMs = 10_000,
     private readonly capabilityTtlMs = 60_000,
+    /**
+     * The tenant's signed token (see `signTenantToken`), presented VERBATIM in the `tenant` field of
+     * every {@link RunRequest} so an operator with `verifyTenant` can authenticate it and derive the
+     * tenant from it. A function is called before every request (rotation / short-lived tokens).
+     * Omit to send the raw `tenant` (prefix/network isolation only). The live-tail channel always
+     * stays keyed by `tenant`, never the token: the operator republishes by the run's namespace.
+     */
+    private readonly tenantToken?: TenantTokenSource,
   ) {
     this.transport.onRunReply?.((reply: RunReply) => this.handleReply(reply));
   }
@@ -86,7 +96,12 @@ export class ProxyRunGateway implements RunGateway {
     } else if (reply.result.error.code === UNSUPPORTED_RUN_REQUEST) {
       pending.reject(new UnsupportedRunRequestError(reply.result.error.message));
     } else {
-      pending.reject(new Error(reply.result.error.message));
+      // Carry the reply's `code` (`unauthorized`, `cross-tenant`, ...) so a caller can tell an
+      // authentication failure from a real one, as Agora's proxy does.
+      const { message, code } = reply.result.error;
+      pending.reject(
+        code !== undefined ? Object.assign(new Error(message), { code }) : new Error(message),
+      );
     }
   }
 
@@ -100,15 +115,26 @@ export class ProxyRunGateway implements RunGateway {
         );
       }, this.timeoutMs);
       this.pending.set(requestId, { resolve, reject, timer });
-      this.transport
-        .dispatchRunRequest?.({ requestId, tenant: this.tenant, body })
-        .catch((error: unknown) => {
-          const stillPending = this.pending.get(requestId);
-          if (!stillPending) return;
-          clearTimeout(stillPending.timer);
-          this.pending.delete(requestId);
-          stillPending.reject(error instanceof Error ? error : new Error(String(error)));
-        });
+      // A static token (or none) dispatches synchronously, exactly as before; only a token PROVIDER
+      // defers the dispatch until it resolves.
+      const source = this.tenantToken;
+      const dispatched =
+        typeof source === 'function'
+          ? resolveTenantToken(source).then((tenant) =>
+              this.transport.dispatchRunRequest?.({ requestId, tenant, body }),
+            )
+          : this.transport.dispatchRunRequest?.({
+              requestId,
+              tenant: source ?? this.tenant,
+              body,
+            });
+      dispatched?.catch((error: unknown) => {
+        const stillPending = this.pending.get(requestId);
+        if (!stillPending) return;
+        clearTimeout(stillPending.timer);
+        this.pending.delete(requestId);
+        stillPending.reject(error instanceof Error ? error : new Error(String(error)));
+      });
     });
   }
 

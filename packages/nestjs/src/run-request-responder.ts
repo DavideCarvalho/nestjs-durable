@@ -1,9 +1,11 @@
-import type {
-  RunGateway,
-  RunReply,
-  RunRequest,
-  RunRequestKind,
-  RunWaiting,
+import {
+  type RunGateway,
+  type RunReply,
+  type RunRequest,
+  type RunRequestKind,
+  type RunWaiting,
+  type TenantVerifier,
+  resolveWireTenant,
 } from '@dudousxd/nestjs-durable-core';
 
 /**
@@ -37,6 +39,23 @@ export interface RunRequestTransport {
   publishRunReply(reply: RunReply): Promise<void>;
 }
 
+/** Options for {@link RunRequestResponder}. */
+export interface RunRequestResponderOptions {
+  /**
+   * Verifies the signed token a tenant presents in the wire `tenant` field and DERIVES the real
+   * tenant from it (see `hmacTenantVerifier`). Present: an invalid, tampered or absent token is
+   * rejected with an `unauthorized` error reply and the wire claim is discarded in favour of the
+   * verified tenant. Absent: the wire `tenant` is trusted verbatim (prefix/network isolation only).
+   */
+  verifyTenant?: TenantVerifier | undefined;
+  /**
+   * Warn at construction when no {@link verifyTenant} is set. Default `true`. `DurableModule` passes
+   * `true` only for an explicit `topology: { role: 'control-plane' }`, so a plain operator app that
+   * never serves tenants boots silently.
+   */
+  warnWithoutVerifier?: boolean | undefined;
+}
+
 /**
  * Operator-side consumer of a tenant's {@link RunRequest}s: answers each one against a
  * `RunGateway`, enforcing the tenant boundary before touching the run. For every runId-bearing
@@ -45,12 +64,33 @@ export interface RunRequestTransport {
  * verb, so a tenant can never read or act on another tenant's run. `listRuns` is scoped by
  * overwriting the query's `namespace` with the requester's tenant, ignoring whatever the client
  * sent. This is the security boundary of the tenant run gateway — do not weaken it.
+ *
+ * With {@link RunRequestResponderOptions.verifyTenant}, every request is authenticated FIRST: the
+ * wire `tenant` is treated as a signed token, the real tenant is derived from it, and an invalid
+ * token short-circuits into an `unauthorized` error reply before any run is touched. A verifier
+ * that throws becomes an error reply too.
  */
 export class RunRequestResponder {
+  private readonly verifyTenant: TenantVerifier | undefined;
+
   constructor(
     private readonly transport: RunRequestTransport,
     private readonly gateway: RunGateway,
-  ) {}
+    options: RunRequestResponderOptions = {},
+  ) {
+    this.verifyTenant = options.verifyTenant;
+    if (!this.verifyTenant && options.warnWithoutVerifier !== false) {
+      // Loud on purpose: without a verifier the anti-IDOR checks below are bypassable by CLAIMING
+      // another tenant's name in the wire `tenant` field. Prefix/network isolation may be an
+      // acceptable posture, but it must be a chosen one.
+      console.warn(
+        '[nestjs-durable] run-request responder started WITHOUT a tenant verifier: the wire ' +
+          '`tenant` claim is trusted verbatim (prefix/network isolation only). Any broker client ' +
+          'can act as any tenant. Configure `verifyTenant` (e.g. hmacTenantVerifier(secret)) and ' +
+          'signed tenant tokens unless your broker is fully isolated per tenant.',
+      );
+    }
+  }
 
   /** Register the consumer on the transport. Each request is answered independently; a handler
    *  failure never throws back into the transport (errors are captured into an error reply). */
@@ -73,7 +113,19 @@ export class RunRequestResponder {
     });
   }
 
-  private async handle(msg: RunRequest): Promise<RunReply> {
+  private async handle(wire: RunRequest): Promise<RunReply> {
+    const tenant = await resolveWireTenant(wire.tenant, this.verifyTenant);
+    if (tenant === null) {
+      return {
+        requestId: wire.requestId,
+        result: {
+          ok: false,
+          error: { message: 'invalid or unauthorized tenant token', code: 'unauthorized' },
+        },
+      };
+    }
+    // From here on `msg.tenant` is the VERIFIED tenant (the wire claim itself when no verifier is set).
+    const msg: RunRequest = { ...wire, tenant };
     const { body } = msg;
     if (!KNOWN_KINDS.has(body.kind)) {
       return {
