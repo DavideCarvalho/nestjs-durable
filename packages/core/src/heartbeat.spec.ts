@@ -1,10 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type { Heartbeat, RemoteTask, StepResult, Transport } from './interfaces';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** A transport whose result/heartbeat delivery the test drives by hand. */
 class ControlTransport implements Transport {
@@ -43,28 +41,40 @@ describe('remote-step liveness (heartbeats)', () => {
   });
 
   it('a heartbeat rearms the window so a beating worker survives past timeoutMs', async () => {
-    const transport = new ControlTransport();
-    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
-    engine.register('wf2', '1', async (ctx) => ctx.step(JOB_STEP_NAME, {}, { timeoutMs: 60 }));
+    // Fake timers: the 60ms liveness window only moves when the test advances the clock, so a stall
+    // in the test process (GC, a busy CI runner) can't let the window lapse before the beat lands.
+    vi.useFakeTimers();
+    try {
+      const transport = new ControlTransport();
+      const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+      engine.register('wf2', '1', async (ctx) => ctx.step(JOB_STEP_NAME, {}, { timeoutMs: 60 }));
 
-    await engine.start('wf2', {}, 'r2');
-    const runPromise = engine.waitForRun('r2');
-    await sleep(0); // let the dispatch happen
-    const id = transport.dispatched[0]?.stepId as string;
+      await engine.start('wf2', {}, 'r2');
+      const runPromise = engine.waitForRun('r2');
+      // Flush without moving the clock until the step is dispatched (its window is then armed).
+      for (let i = 0; i < 100 && transport.dispatched.length === 0; i++) {
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      const id = transport.dispatched[0]?.stepId as string;
+      expect(id).toBeDefined();
 
-    await sleep(40);
-    await transport.heartbeatHandler?.({ runId: 'r2', seq: 0, stepId: id, group: 'g' }); // rearm
-    await sleep(30); // 70ms total — past 60ms, but only 30ms since the last beat
-    await transport.resultHandler?.({
-      runId: 'r2',
-      seq: 0,
-      stepId: id,
-      status: 'completed',
-      output: 'ok',
-    });
+      await vi.advanceTimersByTimeAsync(40);
+      await transport.heartbeatHandler?.({ runId: 'r2', seq: 0, stepId: id, group: 'g' }); // rearm
+      await vi.advanceTimersByTimeAsync(50); // 90ms total — past 60ms, but only 50ms since the beat
+      await transport.resultHandler?.({
+        runId: 'r2',
+        seq: 0,
+        stepId: id,
+        status: 'completed',
+        output: 'ok',
+      });
+      await vi.advanceTimersByTimeAsync(0);
 
-    const res = await runPromise;
-    expect(res.status).toBe('completed');
-    expect(res.output).toBe('ok');
+      const res = await runPromise;
+      expect(res.status).toBe('completed');
+      expect(res.output).toBe('ok');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
