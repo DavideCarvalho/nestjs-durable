@@ -11,17 +11,20 @@ import {
   type Transport,
   WorkflowEngine,
   type WorkflowRun,
-  hmacTenantVerifier,
-  signTenantToken,
 } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DurableModule, type DurableModuleOptions } from './durable.module';
+// Imported from the package's public entry: the facade must expose the tenant-auth helpers.
+import { type TenantVerifier, hmacTenantVerifier, signTenantToken } from './index';
 import { ProxyRunGateway } from './proxy-run-gateway';
 import { RunRequestResponder, type RunRequestTransport } from './run-request-responder';
 import { StoreRunGateway } from './store-run-gateway';
 
 const SECRET = 'responder-secret';
+const throwing: TenantVerifier = () => {
+  throw new Error('verifier down');
+};
 
 function run(id: string, namespace: string): WorkflowRun {
   return {
@@ -118,11 +121,7 @@ describe('RunRequestResponder with verifyTenant', () => {
 
   it('a verifier that throws becomes an error reply, never a missing one', async () => {
     const tx = transport();
-    new RunRequestResponder(tx, gateway(), {
-      verifyTenant: () => {
-        throw new Error('verifier down');
-      },
-    }).start();
+    new RunRequestResponder(tx, gateway(), { verifyTenant: throwing }).start();
     await tx.deliver({ requestId: 'q1', tenant: 'acme', body: { kind: 'listRuns', query: {} } });
     expect(tx.replies).toEqual([
       { requestId: 'q1', result: { ok: false, error: { message: 'verifier down' } } },
