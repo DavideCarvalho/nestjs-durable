@@ -1,7 +1,7 @@
 {
   "name": "@dudousxd/nestjs-durable-transport-db",
-  "version": "0.2.2",
-  "description": "Database (SQL) Transport for nestjs-durable \u2014 DBOS-style: dispatch remote steps as rows in the durable DB, no broker",
+  "version": "0.3.0",
+  "description": "Database (SQL) Transport for nestjs-durable — DBOS-style: dispatch remote steps as rows in the durable DB, no broker",
   "license": "MIT",
   "author": "Davide Carvalho",
   "repository": {
