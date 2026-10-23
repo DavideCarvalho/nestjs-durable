@@ -1,5 +1,6 @@
 import { SignalTimeoutError } from './errors';
 import type { WorkflowCtx } from './interfaces';
+import { CORE_ORIGIN } from './origin';
 
 /** How `onEvent` triggers are coalesced into fewer runs (see `@Workflow({ debounce | batch })`). */
 export type EventBatchConfig =
@@ -12,6 +13,7 @@ export interface AccumulatorHost {
     name: string,
     version: string,
     fn: (ctx: WorkflowCtx, input: unknown) => Promise<unknown>,
+    opts?: { origin?: string | undefined },
   ): void;
   signalWithStart(
     workflow: string,
@@ -31,8 +33,12 @@ const accToken = (target: string): string => `__evtacc__:${target}`;
  */
 export class EventAccumulators {
   constructor(private readonly host: AccumulatorHost) {
-    host.register('__evt_debounce', '1', (ctx, input) => this.debounce(ctx, input));
-    host.register('__evt_batch', '1', (ctx, input) => this.batch(ctx, input));
+    host.register('__evt_debounce', '1', (ctx, input) => this.debounce(ctx, input), {
+      origin: CORE_ORIGIN,
+    });
+    host.register('__evt_batch', '1', (ctx, input) => this.batch(ctx, input), {
+      origin: CORE_ORIGIN,
+    });
   }
 
   /** Route an `onEvent` payload into its target's debounce/batch accumulator. */

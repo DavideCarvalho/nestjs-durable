@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { type StartOptions, WorkflowEngine } from './engine';
+import { CORE_ORIGIN } from './origin';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 describe('run origin (which package declared the workflow)', () => {
@@ -90,5 +92,53 @@ describe('run origin (which package declared the workflow)', () => {
     expect(
       await store.listRuns({ origin: '@dudousxd/nestjs-agent', workflow: 'catalog' }),
     ).toHaveLength(0);
+  });
+
+  describe("the engine's own built-in workflows", () => {
+    it("CORE_ORIGIN is this package's npm name", () => {
+      const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+      expect(CORE_ORIGIN).toBe(pkg.name);
+    });
+
+    it('stamps an entity run with the core package, not the app', async () => {
+      const store = new InMemoryStateStore();
+      const engine = new WorkflowEngine({ store });
+      engine.registerEntity<{ n: number }>('counter', {
+        initialState: () => ({ n: 0 }),
+        handlers: {
+          inc: (s) => {
+            s.n += 1;
+          },
+        },
+      });
+
+      await engine.signalEntity('counter', 'k1', 'inc', undefined);
+
+      expect((await store.getRun('entity:counter:k1'))?.origin).toBe(
+        '@dudousxd/nestjs-durable-core',
+      );
+    });
+
+    it.each([
+      ['debounce', { mode: 'debounce', windowMs: 5000 }],
+      ['batch', { mode: 'batch', maxSize: 10, windowMs: 5000 }],
+    ] as const)(
+      'stamps the %s accumulator run with the core package',
+      async (_mode, eventBatch) => {
+        const store = new InMemoryStateStore();
+        const engine = new WorkflowEngine({ store, clock: () => 1000 });
+        engine.register('handler', '1', async () => null, {
+          origin: '@acme/app',
+          onEvent: ['activity'],
+          eventBatch,
+        });
+
+        await engine.publishEvent('activity', { v: 1 });
+
+        expect((await store.getRun('__evtacc__:handler'))?.origin).toBe(
+          '@dudousxd/nestjs-durable-core',
+        );
+      },
+    );
   });
 });
