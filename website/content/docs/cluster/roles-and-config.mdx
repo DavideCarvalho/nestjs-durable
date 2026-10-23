@@ -277,6 +277,10 @@ DurableModule.forRoot({
 });
 ```
 
+A token provider runs before the request is sent, and the request's timeout starts only once it has
+resolved: the deadline covers the control plane's round trip, not the provider. A provider that rejects
+fails the request.
+
 The token travels **in the existing `tenant` field** of every `RunRequest` and `StartRunMessage`, so
 the wire shape does not change. It is `<claim>.<base64url(HMAC-SHA256(secret, claim))>`, where the
 claim is the tenant name, optionally followed by `.exp<epochMs>` when minted with `ttlMs`. The live-tail
@@ -286,13 +290,16 @@ With a verifier configured, the control plane:
 
 - answers a run request whose token is missing, tampered, expired or signed with another secret with
   `{ ok: false, error: { message: 'invalid or unauthorized tenant token', code: 'unauthorized' } }`,
-  before any run is touched (`ProxyRunGateway` rejects with an `Error` whose `code` is `unauthorized`);
+  before any run is touched. `ProxyRunGateway` rejects with a `RunGatewayError` whose `code` is
+  `unauthorized` (`cross-tenant` for a run owned by another tenant), so `err.code` is typed;
 - drops such a start-run without creating a run (logged; the start channel has no reply);
 - scopes every accepted request to the tenant **derived from the token**, never the wire claim;
 - turns a verifier that throws into an error reply, so the tenant never waits out its timeout.
 
 Bring your own verifier for asymmetric or issued tokens: `verifyTenant` is any
-`({ token, tenant }) => { tenant, capabilities? } | null` (sync or async).
+`({ token, tenant }) => { tenant, capabilities? } | null` (sync or async). `capabilities` is carried
+on the verified identity but **not enforced yet**: a verified tenant can call every verb, scoped to its
+own namespace.
 
 Without `verifyTenant` the wire `tenant` is trusted **verbatim** — any process with broker access can
 list, cancel and start runs as any tenant (prefix/network isolation only). An explicit
