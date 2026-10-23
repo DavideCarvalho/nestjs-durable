@@ -16,11 +16,14 @@ const RECONCILE_MS = 300_000;
 const WAKES = 'durable:wake-after-turn:p';
 
 /**
- * An instance's store, cut off once the instance has gone down (`kill()`, or its first `tryLockRun`
- * after `arm()`): nothing it sends from then on answers, as the calls of a process that no longer
- * exists never land.
+ * An instance's store, cut off once the instance has gone down (`kill()`, or its first call of
+ * `trigger` after `arm()`): nothing it sends from then on answers, as the calls of a process that no
+ * longer exists never land.
  */
-function dying(inner: StateStore): {
+function dying(
+  inner: StateStore,
+  trigger = 'tryLockRun',
+): {
   store: StateStore;
   arm: () => void;
   kill: () => void;
@@ -33,7 +36,7 @@ function dying(inner: StateStore): {
       const value = Reflect.get(target, prop, receiver);
       if (typeof value !== 'function') return value;
       return (...args: unknown[]) => {
-        if (armed && prop === 'tryLockRun') dead = true;
+        if (armed && prop === trigger) dead = true;
         return dead ? new Promise(() => {}) : value.apply(target, args);
       };
     },
@@ -50,13 +53,26 @@ function dying(inner: StateStore): {
   };
 }
 
-describe('a wake kept for a turn', () => {
-  it("survives the instance that looked at it going down before running the turn, on another instance's timer poll", async () => {
+/** Where the instance holding the run's lease goes down. */
+const HOLDER_DIES = [
+  {
+    when: 'after deciding to run the turn a kept wake asks for, before running it',
+    // The lease of that turn.
+    trigger: 'tryLockRun',
+  },
+  {
+    when: 'right after writing its suspension, before looking at the kept wake',
+    // Releasing the lease, which comes before the look.
+    trigger: 'releaseRunLock',
+  },
+];
+
+describe.each(HOLDER_DIES)('a wake kept for a turn, the holder going down $when', ({ trigger }) => {
+  it("is resumed on another instance's timer poll once the holder's lease is past", async () => {
     let now = 1_000_000;
     const clock = () => now;
     const inner = new InMemoryStateStore();
-    // The holder goes down after it decided to run the turn the kept wake asks for, before running it.
-    const holder = dying(inner);
+    const holder = dying(inner, trigger);
     let turns = 0;
     let openTurn!: () => void;
     const held = new Promise<void>((resolve) => {
@@ -98,8 +114,12 @@ describe('a wake kept for a turn', () => {
     void a.resume('p');
     await until(() => turns === 2);
     await b.resume('p');
-    // The other instance keeps its wake, then goes down too.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // The other instance keeps its wake and sets the run's timer, then goes down too.
+    await until(async () => {
+      const run = await inner.getRun('p');
+      return run?.wakeAt !== undefined && run.wakeAt <= now + LEASE_MS + 1_000;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
     requester.kill();
     holder.arm();
     openTurn();

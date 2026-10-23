@@ -382,6 +382,22 @@ interface FanWakeRequest {
   fans: [number, number][];
 }
 
+/**
+ * Whether the turn that served `served` and read the fans in `settledFans` (first seq -> highest
+ * seq read with nothing in flight) has seen what `request` asks for.
+ */
+function wakeSeen(
+  request: { id?: string | undefined; payload: unknown },
+  settledFans: Map<number, number>,
+  served: Set<string>,
+): boolean {
+  if (request.id !== undefined && served.has(request.id)) return true;
+  return (
+    isFanWakeRequest(request.payload) &&
+    request.payload.fans.every(([first, seq]) => (settledFans.get(first) ?? -1) >= seq)
+  );
+}
+
 function isFanWakeRequest(payload: unknown): payload is FanWakeRequest {
   return (
     typeof payload === 'object' &&
@@ -4724,10 +4740,7 @@ export class WorkflowEngine {
     served: Set<string>,
   ): Promise<void> {
     const kept = await this.listWakeRequests(runId, true);
-    const seen = (request: KeptWake) =>
-      (request.id !== undefined && served.has(request.id)) ||
-      (isFanWakeRequest(request.payload) &&
-        request.payload.fans.every(([first, seq]) => (settledFans.get(first) ?? -1) >= seq));
+    const seen = (request: KeptWake) => wakeSeen(request, settledFans, served);
     const needed = kept.filter((request) => !seen(request));
     await this.dropWakeRequests(kept.filter(seen));
     if (needed.length === 0) return;
@@ -4777,6 +4790,21 @@ export class WorkflowEngine {
     )) {
       served.add(request.id);
     }
+  }
+
+  /**
+   * Right after a turn of `runId` wrote its suspension, while it still holds the lease: if a wake
+   * was kept for the run during the turn that the turn did not see, keep the run due when the lease
+   * runs out. The suspension overwrote the timer the instance keeping the wake set, and this instance
+   * may go down before it looks at the wake once it has released the lease.
+   */
+  private async keepDueForKeptWakes(runId: string): Promise<void> {
+    const served = this.turnServedWakes.get(runId);
+    if (!served) return;
+    const settledFans = this.turnSettledFans.get(runId) ?? new Map<number, number>();
+    const kept = await this.listWakeRequests(runId);
+    if (kept.every((request) => wakeSeen(request, settledFans, served))) return;
+    await this.makeDueBy(runId, this.clock() + this.leaseMs);
   }
 
   /** Bring a suspended run's timer forward to `at` (never later than the one it has). */
@@ -5186,6 +5214,7 @@ export class WorkflowEngine {
       },
     );
     if (!applied) return this.echoCurrentStatus(run.id);
+    await this.keepDueForKeptWakes(run.id);
     this.emit({
       type: 'run.suspended',
       runId: run.id,
