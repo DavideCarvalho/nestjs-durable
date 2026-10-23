@@ -80,6 +80,20 @@ export interface EnsureMikroOrmDurableSchemaOptions {
 /** Default {@link EnsureMikroOrmDurableSchemaOptions.blockingAlterRowLimit}: a copy of this many rows takes seconds. */
 export const DEFAULT_BLOCKING_ALTER_ROW_LIMIT = 100_000;
 
+/** The deferred-ALTER warning, one statement per line so it can be copied straight into a client. */
+function deferredAlterWarning(
+  store: string,
+  deferred: ReadonlyArray<{ table: string; rows: number; statement: string }>,
+  limit: number,
+): string {
+  return [
+    `[nestjs-durable] ${store} did NOT apply ${deferred.length} durable-schema column type change(s) at boot.`,
+    `MySQL rebuilds a table to change a column type and blocks writes to it until the copy ends, and these tables hold more than blockingAlterRowLimit (${limit}) rows:`,
+    ...deferred.map((d) => `  -- ${d.table}, ~${d.rows} rows\n  ${d.statement};`),
+    'Run them in a maintenance window or with an online schema change tool (gh-ost, pt-online-schema-change), or raise blockingAlterRowLimit to let a boot run them. Until then the store keeps working on the old column types, and this warning repeats on every boot.',
+  ].join('\n');
+}
+
 /**
  * The warning logged when the heal skipped a MySQL column type change because the table is too big
  * to rebuild at boot (see {@link EnsureMikroOrmDurableSchemaOptions.blockingAlterRowLimit}).
@@ -88,14 +102,7 @@ export function mikroOrmDeferredAlterWarning(
   deferred: ReadonlyArray<{ table: string; rows: number; statement: string }>,
   limit: number,
 ): string {
-  return [
-    '[nestjs-durable] store-mikro-orm did NOT apply these durable-schema column type changes at boot,',
-    `because MySQL rebuilds the table and blocks its writes while it does, and each table holds more than ${limit} rows:`,
-    deferred.map((d) => `${d.table} (~${d.rows} rows): ${d.statement};`).join(' '),
-    'Run them in a maintenance window or with an online schema change tool (gh-ost,',
-    'pt-online-schema-change), or raise `blockingAlterRowLimit`. Until then the store keeps working on',
-    'the old column types, and this warning repeats on every boot.',
-  ].join(' ');
+  return deferredAlterWarning('store-mikro-orm', deferred, limit);
 }
 
 /**
@@ -450,13 +457,15 @@ async function healDurableSchema(
   deferred: Array<{ table: string; rows: number; statement: string }>;
 }> {
   const sql = await orm.schema.getUpdateSchemaSQL({ safe: true });
-  const ours = sql
-    .split(';')
-    .map((statement) => statement.trim())
-    .filter((statement) => {
-      const table = targetTable(statement);
-      return table !== undefined && DURABLE_TABLE_NAMES.has(table);
-    });
+  const ours = mergeColumnTypeChanges(
+    sql
+      .split(';')
+      .map((statement) => statement.trim())
+      .filter((statement) => {
+        const table = targetTable(statement);
+        return table !== undefined && DURABLE_TABLE_NAMES.has(table);
+      }),
+  );
   const connection = orm.em.getConnection();
   // Tables this heal creates: their indexes come with them, so they are not listed one by one.
   const created = new Set(
@@ -504,6 +513,32 @@ async function healDurableSchema(
   }
   const freshInstall = [...DURABLE_TABLE_NAMES].every((table) => created.has(table));
   return { repairs, freshInstall, deferred };
+}
+
+/**
+ * Fold every MySQL `modify` statement on one table into a single `alter table`. The diff emits one
+ * statement per column, and MySQL rebuilds the whole table for each, so four timestamp columns
+ * would copy `durable_workflow_runs` four times. The merged statement takes the place of the first.
+ */
+function mergeColumnTypeChanges(statements: string[]): string[] {
+  const merged: string[] = [];
+  const at = new Map<string, number>();
+  for (const statement of statements) {
+    const table = targetTable(statement);
+    if (!table || !isColumnTypeChange(statement)) {
+      merged.push(statement);
+      continue;
+    }
+    const actions = statement.replace(/^alter\s+table\s+[`"']?[\w$]+[`"']?\s*/i, '');
+    const index = at.get(table);
+    if (index === undefined) {
+      at.set(table, merged.length);
+      merged.push(statement);
+    } else {
+      merged[index] = `${merged[index]}, ${actions}`;
+    }
+  }
+  return merged;
 }
 
 /** An `alter table` whose every action is a MySQL `modify` (a column type/nullability change). */

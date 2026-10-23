@@ -147,13 +147,11 @@ export function typeOrmDeferredAlterWarning(
   limit: number,
 ): string {
   return [
-    '[nestjs-durable] store-typeorm did NOT apply these durable-schema column type changes at boot,',
-    `because MySQL rebuilds the table and blocks its writes while it does, and each table holds more than ${limit} rows:`,
-    deferred.map((d) => `${d.table} (~${d.rows} rows): ${d.statement};`).join(' '),
-    'Run them in a maintenance window or with an online schema change tool (gh-ost,',
-    'pt-online-schema-change), or raise `blockingAlterRowLimit`. Until then the store keeps working on',
-    'the old column types, and this warning repeats on every boot.',
-  ].join(' ');
+    `[nestjs-durable] store-typeorm did NOT apply ${deferred.length} durable-schema column type change(s) at boot.`,
+    `MySQL rebuilds a table to change a column type and blocks writes to it until the copy ends, and these tables hold more than blockingAlterRowLimit (${limit}) rows:`,
+    ...deferred.map((d) => `  -- ${d.table}, ~${d.rows} rows\n  ${d.statement};`),
+    'Run them in a maintenance window or with an online schema change tool (gh-ost, pt-online-schema-change), or raise blockingAlterRowLimit to let a boot run them. Until then the store keeps working on the old column types, and this warning repeats on every boot.',
+  ].join('\n');
 }
 
 /**

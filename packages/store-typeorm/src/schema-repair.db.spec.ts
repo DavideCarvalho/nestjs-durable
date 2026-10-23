@@ -244,7 +244,7 @@ describe.skipIf(mysqlSkipped)('ensureTypeOrmDurableSchema repair warning [real M
       );
       expect(logger.messages).toHaveLength(1);
       expect(logger.messages[0]).toContain('did NOT apply');
-      expect(logger.messages[0]).toContain('durable_buffered_events (~3 rows)');
+      expect(logger.messages[0]).toContain('-- durable_buffered_events, ~3 rows');
     }
 
     await ensureTypeOrmDurableSchema(dataSource, { logger: recordingLogger() });

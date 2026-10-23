@@ -14,3 +14,5 @@ The BullMQ transport now rewrites every routing token's descriptor copy when a l
 The StateStore contract fails instead of passing silently when its backend is unavailable and `DURABLE_TEST_REQUIRE_BACKENDS` is set.
 
 The run-dispatch contract's "leaves a run whose queueing failed pending" case waits for both re-queued runs to complete, since a consumer may take them in either order. Its "splits a fan's children across the instances" case holds each child until both instances have started one, so the split no longer depends on which in-process consumer the scheduler favours.
+
+The MikroORM store changes all of a table's timestamp columns in one `ALTER` (its schema diff emits one per column, and MySQL copies the table for each), and both stores log a deferred change as one copy-pasteable statement per table, one per line.

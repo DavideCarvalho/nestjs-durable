@@ -276,11 +276,36 @@ describe.skipIf(mysqlSkipped)('ensureMikroOrmDurableSchema repair warning [real 
       expect(await precision()).toBe(0);
       expect(logger.messages).toHaveLength(1);
       expect(logger.messages[0]).toContain('did NOT apply');
-      expect(logger.messages[0]).toContain('durable_buffered_events (~3 rows)');
+      expect(logger.messages[0]).toContain('-- durable_buffered_events, ~3 rows');
       expect(logger.messages[0]).toMatch(/modify `published_at` datetime\(6\)/i);
     }
 
     await ensureMikroOrmDurableSchema(orm, { logger: recordingLogger() });
     expect(await precision()).toBe(6);
+  });
+
+  it('changes every timestamp column of a table in ONE statement, one per line in the warning', async () => {
+    orm = await MySqlMikroORM.init({
+      clientUrl: mysqlUrl,
+      entities: [...ENTITIES],
+      allowGlobalContext: true,
+    });
+    const connection = orm.em.getConnection();
+    for (const table of ['durable_schema_meta', ...durableManagedTables()])
+      await connection.execute(`drop table if exists \`${table}\``);
+    await ensureMikroOrmDurableSchema(orm, { logger: recordingLogger() });
+    await connection.execute(
+      'alter table `durable_workflow_runs` modify `wake_at` datetime null, modify `locked_until` datetime null, modify `created_at` datetime not null, modify `updated_at` datetime not null',
+    );
+    await connection.execute('delete from durable_schema_meta');
+
+    // A negative limit defers every type change, so the warning shows exactly what would run.
+    const logger = recordingLogger();
+    await ensureMikroOrmDurableSchema(orm, { logger, blockingAlterRowLimit: -1 });
+    const [message] = logger.messages;
+    const statements = (message ?? '').split('\n').filter((line) => /^\s*alter table/i.test(line));
+    expect(statements).toEqual([
+      '  alter table `durable_workflow_runs` modify `wake_at` datetime(6) null, modify `locked_until` datetime(6) null, modify `created_at` datetime(6) not null, modify `updated_at` datetime(6) not null;',
+    ]);
   });
 });

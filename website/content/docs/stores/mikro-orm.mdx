@@ -206,13 +206,17 @@ on a large `durable_step_checkpoints` it can take minutes, stall every run, and 
 its probes halfway through (rolling the change back, to restart on the next boot). So the heal only
 runs a column type change on an existing table whose estimated row count
 (`information_schema.tables.table_rows`) is at most `blockingAlterRowLimit` (default `100000`). On a
-bigger table it skips the statement and logs it instead:
+bigger table it skips the change and logs it instead, one `ALTER` per table (all of a table's
+columns change in one statement, so the table is copied once):
 
 ```
-[nestjs-durable] store-mikro-orm did NOT apply these durable-schema column type changes at boot, because
-MySQL rebuilds the table and blocks its writes while it does … durable_step_checkpoints (~2400000
-rows): ALTER TABLE … MODIFY … datetime(6) …; Run them in a maintenance window or with an online
-schema change tool (gh-ost, pt-online-schema-change), or raise `blockingAlterRowLimit`. …
+[nestjs-durable] store-mikro-orm did NOT apply 2 durable-schema column type change(s) at boot.
+MySQL rebuilds a table to change a column type and blocks writes to it until the copy ends, and these tables hold more than blockingAlterRowLimit (100000) rows:
+  -- durable_step_checkpoints, ~2400000 rows
+  alter table `durable_step_checkpoints` modify `wake_at` datetime(6) null, modify `enqueued_at` datetime(6) null, modify `started_at` datetime(6) not null, modify `finished_at` datetime(6) not null;
+  -- durable_workflow_runs, ~145000 rows
+  alter table `durable_workflow_runs` modify `wake_at` datetime(6) null, modify `locked_until` datetime(6) null, modify `created_at` datetime(6) not null, modify `updated_at` datetime(6) not null;
+Run them in a maintenance window or with an online schema change tool (gh-ost, pt-online-schema-change), or raise blockingAlterRowLimit to let a boot run them. …
 ```
 
 The store keeps working on the old columns meanwhile, and the warning repeats on every boot until the
