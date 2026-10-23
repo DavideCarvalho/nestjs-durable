@@ -36,7 +36,7 @@ import {
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
 } from '@dudousxd/nestjs-durable-core';
-import { raw } from '@mikro-orm/core';
+import { LockMode, raw } from '@mikro-orm/core';
 import type { EntityManager, MikroORM } from '@mikro-orm/core';
 
 /** Minimal structural surface of the SQL EntityManager's QueryBuilder (from `@mikro-orm/knex`),
@@ -353,6 +353,18 @@ export class MikroOrmStateStore implements StateStore {
     return entity ? fromCheckpointEntity(entity) : null;
   }
 
+  async getCheckpoints(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    if (seqs.length === 0) return [];
+    const em = this.fork();
+    const unique = [...new Set(seqs)];
+    const rows: StepCheckpointEntity[] = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      const seq = { $in: unique.slice(at, at + 500) };
+      rows.push(...(await em.find(StepCheckpointEntity, { runId, seq })));
+    }
+    return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointEntity);
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     const em = this.fork();
     await em.upsert(StepCheckpointEntity, toCheckpointEntity(checkpoint));
@@ -371,18 +383,54 @@ export class MikroOrmStateStore implements StateStore {
 
   async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
     if (checkpoints.length === 0) return [];
-    // The conditional UPDATE of `saveCheckpointIfPending`, once per entry, in order, in one
-    // transaction: one commit for the batch, and a rejection writes nothing.
+    // In one transaction: lock the batch's rows that are still `pending`, decide each entry in order
+    // against them (an entry that settles a row makes a later entry for it lose), then write each
+    // row's last winning entry in one upsert per chunk. One commit and a few statements for the
+    // batch instead of one UPDATE per entry; a rejection writes nothing.
     return this.fork().transactional(async (em) => {
+      const key = (runId: string, seq: number) => `${runId}\u0000${seq}`;
+      const seqsByRun = new Map<string, Set<number>>();
+      for (const { runId, seq } of checkpoints) {
+        const seqs = seqsByRun.get(runId) ?? new Set<number>();
+        seqs.add(seq);
+        seqsByRun.set(runId, seqs);
+      }
+      const pending = new Set<string>();
+      for (const [runId, seqSet] of seqsByRun) {
+        const seqs = [...seqSet];
+        for (let at = 0; at < seqs.length; at += 500) {
+          const rows = await em.find(
+            StepCheckpointEntity,
+            { runId, seq: { $in: seqs.slice(at, at + 500) }, status: 'pending' },
+            {
+              fields: ['runId', 'seq'],
+              lockMode: LockMode.PESSIMISTIC_WRITE,
+              disableIdentityMap: true,
+            },
+          );
+          for (const row of rows) pending.add(key(row.runId, row.seq));
+        }
+      }
       const wrote: boolean[] = [];
+      const writes = new Map<string, StepCheckpoint>();
       for (const checkpoint of checkpoints) {
-        const { runId: _runId, seq: _seq, ...data } = toCheckpointEntity(checkpoint);
-        const affected = await em.nativeUpdate(
-          StepCheckpointEntity,
-          { runId: checkpoint.runId, seq: checkpoint.seq, status: 'pending' },
-          { ...data, wakeAt: checkpoint.wakeAt != null ? new Date(checkpoint.wakeAt) : null },
-        );
-        wrote.push(affected > 0);
+        const k = key(checkpoint.runId, checkpoint.seq);
+        if (!pending.has(k)) {
+          wrote.push(false);
+          continue;
+        }
+        wrote.push(true);
+        writes.set(k, checkpoint);
+        if (checkpoint.status !== 'pending') pending.delete(k);
+      }
+      const rows = [...writes.values()].map((checkpoint) => {
+        const row = toCheckpointEntity(checkpoint);
+        // A write without a deadline clears the one the pending row held.
+        if (checkpoint.wakeAt == null) (row as { wakeAt?: Date | null }).wakeAt = null;
+        return row;
+      });
+      for (let at = 0; at < rows.length; at += 500) {
+        await em.upsertMany(StepCheckpointEntity, rows.slice(at, at + 500));
       }
       return wrote;
     });

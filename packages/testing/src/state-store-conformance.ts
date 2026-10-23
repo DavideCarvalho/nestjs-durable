@@ -927,6 +927,45 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect((await store.getCheckpoint('r1', 3))?.output).toEqual({ n: 3 });
     });
 
+    t("getCheckpoints reads many of a run's checkpoints at once, in seq order", async () => {
+      // Optional on the interface (the engine falls back to one getCheckpoint per seq), but a
+      // conformant store MUST provide it.
+      expect(store.getCheckpoints).toBeDefined();
+      if (!store.getCheckpoints) return;
+      await store.createRun(run());
+      await store.createRun(run({ id: 'r2' }));
+      expect(await store.getCheckpoints('r1', [])).toEqual([]);
+      for (const seq of [0, 1, 2, 5]) {
+        await store.saveCheckpoint(
+          checkpoint({
+            seq,
+            stepId: `r1:${seq}`,
+            output: { seq },
+            wakeAt: seq === 2 ? 7_000 : undefined,
+          }),
+        );
+      }
+      await store.saveCheckpoint(checkpoint({ runId: 'r2', seq: 3, stepId: 'r2:3' }));
+      // A seq with no checkpoint (3 belongs to r2 only) is left out; a repeated seq is read once.
+      const read = await store.getCheckpoints('r1', [5, 0, 3, 2, 0]);
+      expect(read.map((c) => [c.runId, c.seq, c.output])).toEqual([
+        ['r1', 0, { seq: 0 }],
+        ['r1', 2, { seq: 2 }],
+        ['r1', 5, { seq: 5 }],
+      ]);
+      expect(read[1]).toEqual(await store.getCheckpoint('r1', 2));
+      // Wider than one statement's parameter list.
+      const n = 1_200;
+      for (let seq = 10; seq < 10 + n; seq += 1) {
+        await store.saveCheckpoint(checkpoint({ seq, stepId: `r1:${seq}` }));
+      }
+      const wide = await store.getCheckpoints(
+        'r1',
+        Array.from({ length: n }, (_, i) => 10 + i),
+      );
+      expect(wide.map((c) => c.seq)).toEqual(Array.from({ length: n }, (_, i) => 10 + i));
+    });
+
     t('saveCheckpointsIfPending writes a wide batch', async () => {
       if (!store.saveCheckpointsIfPending) return;
       await store.createRun(run());

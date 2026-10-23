@@ -49,7 +49,7 @@ older than `leaseMs` is treated as abandoned and reclaimed by the next poll (see
 | `group` | The queue token this instance serves — required to register `handle()`s. |
 | `prefix` | Table-name prefix. Default `durable`. |
 | `pollMs` | Poll interval in ms when a queue is empty. Default `500`. |
-| `batchSize` | Max rows claimed per poll. Default `10`. The task loop claims only as many rows as it has free `concurrency` slots (capped by this). |
+| `batchSize` | Max task rows claimed per poll. Default `10`. The task loop claims only as many rows as it has free `concurrency` slots (capped by this). The results loop claims rounds of up to 256 rows, or this if larger. |
 | `concurrency` | How many tasks this instance runs at once. Default `1`. |
 | `leaseMs` | How long a claimed row is owned before it's reclaimable (crash recovery), in ms. Default `30_000`. Every claim the instance holds is renewed every `leaseMs / 3`, so a step may run longer than this. |
 | `onError` | Where a failing poll, a throwing result handler or a lost claim is reported. Default `console.error`. |
@@ -135,9 +135,11 @@ while it still owns it:
    already waiting for the same `step_id` (an earlier attempt's) is replaced and its claim cleared
    (`ON CONFLICT … DO UPDATE` / `ON DUPLICATE KEY UPDATE`), so a retry's result is never dropped.
 
-The engine side mirrors it on the results table: claim (with a token) → deliver to the suspended
-`ctx.step` → `DELETE … WHERE step_id = ? AND claimed_by = <token>`. A result handler that throws is
-reported through `onError` and the row is re-delivered after the lease. Delivery is at-least-once (a
+The engine side mirrors it on the results table: claim a round of up to 256 rows (with a token) →
+hand them all to the engine at once → `DELETE … WHERE claimed_by = <token> AND step_id IN (…)` for the
+ones it settled. The next round is claimed while one runs, up to 512 results in flight per instance,
+so a wide fan's results are settled in batches rather than one by one. A result handler that throws
+is reported through `onError` and the row is re-delivered after the lease. Delivery is at-least-once (a
 worker that crashes mid-handler, or blocks its event loop past `leaseMs`, can have its task re-run
 elsewhere), so **handlers should be idempotent**, keyed on `step_id`.
 

@@ -77,30 +77,22 @@ for the full set of tunables and how the Telescope Workers dashboard renders it.
 ### Result concurrency
 
 `concurrency` governs the **task** queues a worker consumes. The engine side consumes the shared
-`<prefix>-results` queue, and `resultConcurrency` sets how many results this instance handles at
-once. It defaults to `1`.
+`<prefix>-results` queue and works on up to 512 results at once per instance. Handing a result over
+is cheap: the engine settles one run's waiting results together, so the more of a wide fan's results
+are in flight, the fewer writes settle them. There is nothing to tune for wide fans.
 
-Each result settles its step's checkpoint and then resumes the run inline. With one result at a time,
-a pod drives one run turn at a time off results, so the results of a wide fan queue up behind it.
-Raise `resultConcurrency` on the instances that consume results:
+Results of the **same** run are settled in batches: the results of a run that arrive while one batch
+is being written go into the next (up to 256), which claims their checkpoints with one
+`saveCheckpointsIfPending` call. A step fan's join barrier is checked only by a batch with none of the
+fan's results queued behind it, so under a backlog it is read about once per instance rather than
+once per batch. A batch resumes the run at most once, and each result is acknowledged only after its
+batch commits. The turn a batch triggers waits for the previous turn of that run on this instance. A
+run never gets two concurrent turns from one instance, and different runs proceed in parallel. The
+engine applies the same ordering to any transport that delivers results concurrently, including the
+in-process ones.
 
-```ts
-const transport = new BullMQTransport({
-  connection: { host: 'localhost', port: 6379 },
-  resultConcurrency: 16, // results of different runs handled in parallel
-});
-```
-
-Results of the **same** run still resume it in order on an instance. They are settled in batches:
-the results of a run that arrive while one batch is being written go into the next, which claims
-their checkpoints with one `saveCheckpointsIfPending` call and checks a step fan's join barrier once.
-A batch resumes the run at most once, and each result is acknowledged only after its batch commits.
-The turn a batch triggers waits for the previous turn of that run on this instance. A run never gets
-two concurrent turns from one instance, and different runs proceed in parallel. The engine applies the same ordering to any
-transport that delivers results concurrently, including the in-process ones.
-
-A value that is not a finite number of at least 1 (`NaN`, `Infinity`, `0`) falls back to the default
-of `1`; a fractional value is rounded down.
+`resultConcurrency` raises the per-instance limit above 512; a lower value has no effect. A value
+that is not a finite number of at least 1 is ignored; a fractional value is rounded down.
 
 ### Result delivery
 
@@ -210,7 +202,7 @@ lifecycle events and cancellation — and carries the tenant `start-run` / `run-
 | `namespace` | Logical deployment namespace segmenting every queue/stream/key. See [Namespace](#namespace) above. |
 | `instanceId` | Stable id for this worker process, stamped into its heartbeats/liveness keys. Defaults to `ts-<hostname>-<pid>`. |
 | `concurrency` | Fixed number, `'adaptive'`, or `{ mode: 'adaptive', ... }`. See [Concurrency](#concurrency) above. Defaults to `1`. |
-| `resultConcurrency` | How many step results this instance handles at once from the results queue. One run's results still resume it in order. See [Result concurrency](#result-concurrency). Defaults to `1`. |
+| `resultConcurrency` | The most step results this instance handles at once from the results queue, when above the built-in 512. One run's results still resume it in order. See [Result concurrency](#result-concurrency). |
 
 The payload is the documented `RemoteTask` / `StepResult` JSON, so a non-Node worker on the same
 queues interoperates — that's exactly how the [Python worker](/docs/python) plugs in.

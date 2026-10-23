@@ -344,6 +344,19 @@ export class PrismaStateStore implements StateStore {
     return row ? fromCheckpointRow(row) : null;
   }
 
+  async getCheckpoints(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const unique = [...new Set(seqs)];
+    const rows = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      rows.push(
+        ...(await this.db.durableStepCheckpoint.findMany({
+          where: { runId, seq: { in: unique.slice(at, at + 500) } },
+        })),
+      );
+    }
+    return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointRow);
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     const data = toCheckpointData(checkpoint);
     await this.db.durableStepCheckpoint.upsert({

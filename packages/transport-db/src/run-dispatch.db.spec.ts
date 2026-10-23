@@ -1,5 +1,9 @@
 import 'reflect-metadata';
-import { runRunDispatchContract } from '@dudousxd/nestjs-durable-testing';
+import {
+  STEP_FAN_STEP,
+  runRunDispatchContract,
+  runStepFanResultsContract,
+} from '@dudousxd/nestjs-durable-testing';
 import { MySqlContainer, type StartedMySqlContainer } from '@testcontainers/mysql';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { DataSource, type DataSourceOptions } from 'typeorm';
@@ -8,9 +12,9 @@ import { DbTransport } from './db-transport';
 import { typeOrmExecutor } from './executors';
 
 /**
- * The shared run-dispatch contract against a real Postgres and a real MySQL (testcontainers): two
- * DbTransports on one fresh table prefix per case stand for two instances of a deployment, claiming
- * run rows with `FOR UPDATE SKIP LOCKED`. The two dialects queue a run with different upserts
+ * The shared run-dispatch and step-fan-results contracts against a real Postgres and a real MySQL
+ * (testcontainers): two DbTransports on one fresh table prefix per case stand for two instances of a
+ * deployment, claiming run and result rows with `FOR UPDATE SKIP LOCKED`. The two dialects queue a run with different upserts
  * (`ON CONFLICT DO UPDATE` / `ON DUPLICATE KEY UPDATE`). Run with `pnpm test:db`; skips when Docker
  * is unavailable or `SKIP_TESTCONTAINERS` is set.
  */
@@ -101,5 +105,42 @@ for (const dialect of ['postgres', 'mysql'] as const) {
         },
       };
     },
+  );
+}
+
+for (const dialect of ['postgres', 'mysql'] as const) {
+  runStepFanResultsContract(
+    `DbTransport (${dialect === 'postgres' ? 'Postgres' : 'MySQL'})`,
+    async () => {
+      const { ds, unavailable } = backends[dialect];
+      if (unavailable || !ds) return unavailable ?? `no ${dialect}`;
+      const executor = typeOrmExecutor(ds);
+      return {
+        open: async (handler) => {
+          cases += 1;
+          const prefix = `fr${cases}_${Date.now()}`;
+          const worker = new DbTransport({
+            executor,
+            prefix,
+            pollMs: 25,
+            group: STEP_FAN_STEP,
+            concurrency: 16,
+            batchSize: 16,
+            instanceId: `${prefix}-w`,
+          });
+          worker.handle(STEP_FAN_STEP, handler);
+          const make = (instanceId: string) =>
+            new DbTransport({ executor, prefix, pollMs: 25, instanceId });
+          const engines: [DbTransport, DbTransport] = [make(`${prefix}-a`), make(`${prefix}-b`)];
+          return {
+            engines,
+            close: async () => {
+              await Promise.all([worker, ...engines].map((t) => t.close()));
+            },
+          };
+        },
+      };
+    },
+    { fanSize: 1000 },
   );
 }

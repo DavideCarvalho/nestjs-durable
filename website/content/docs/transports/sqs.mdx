@@ -34,7 +34,9 @@ With the default `durable` prefix, that one call moves three messages across two
    its `payments.charge-card` handler, then sends the `StepResult` JSON to the shared results queue,
    **`durable-results`** (`<prefix>-results`) — every worker replies on the same one.
 3. **Resume** → the engine long-polls `durable-results`, matches the result to the suspended
-   `ctx.step` by `stepId`, checkpoints it, and the workflow continues.
+   `ctx.step` by `stepId`, checkpoints it, and the workflow continues. Eight receive loops per
+   instance each hand every message of a receive to the engine at once, so a wide fan's results are
+   settled in batches; a message is deleted only after its result is written.
 
 ```text
  engine ──RemoteTask──▶ durable-tasks-payments.charge-card ──poll──▶ worker

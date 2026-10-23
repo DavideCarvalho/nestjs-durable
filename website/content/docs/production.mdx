@@ -489,24 +489,20 @@ runs. These knobs matter, roughly in order:
    the whole fan at once. Each settled wave costs the parent one turn.
 3. **Raise the workers' `concurrency`** (or make it adaptive) so the steps actually run in
    parallel. Fleet parallelism is `concurrency × replicas`.
-4. **Raise `resultConcurrency`** on the instances that consume results. With the default of `1`,
-   each pod handles one result at a time, and every result runs its run's turn inline. Results of
-   one run still resume it in order on an instance. See
-   [Result concurrency](/docs/transports/bullmq#result-concurrency).
-
-   It also decides how results are batched. An instance settles one run's results in batches: the
-   results that arrive while one batch is being written go into the next, up to 256. A batch is
-   one `saveCheckpointsIfPending` call (one commit) and one barrier `COUNT`, and it resumes the run
-   at most once. So with `resultConcurrency: 64`, a step fan's results cost about one checkpoint
-   read and 1/64 of a commit each, against a read, a commit and a `COUNT` each at `1`. A result is
-   acknowledged only after its batch commits, and a batch the store rejects is retried row by row,
-   so one bad row fails only its own result.
+4. **Results need no tuning.** Each instance consuming results works on many of them at once (512
+   on BullMQ, up to 80 on SQS, up to 512 on `DbTransport`) and settles one run's results in
+   batches: the results that arrive while one batch is being written go into the next, up to 256.
+   A batch is one `saveCheckpointsIfPending` call (one commit), and it resumes the run at most once.
+   A step fan's barrier `COUNT` is read only by a batch with none of the fan's results queued behind
+   it, so under a backlog it is read about once per instance, not once per batch. A step fan's
+   results then cost about one checkpoint read and 1/256 of a commit each. A result is acknowledged
+   only after its batch commits, and a batch the store rejects is retried row by row, so one bad
+   row fails only its own result. See [Result concurrency](/docs/transports/bullmq#result-concurrency).
 
 ```ts
 const transport = new BullMQTransport({
   connection: { host: 'redis', port: 6379 },
   concurrency: { mode: 'adaptive', max: 64 }, // tasks this pod runs at once
-  resultConcurrency: 16,                       // results this pod handles at once
 });
 ```
 

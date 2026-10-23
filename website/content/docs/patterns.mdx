@@ -155,8 +155,7 @@ retry policy (or the per-call `retries` / `backoff` you pass). A flow-control `q
 that size, and `failFast` stops sending further waves without cancelling the steps already in
 flight. See [The same step over many inputs](/docs/concepts/workflows-and-steps#the-same-step-over-many-inputs--ctxallstep-inputs).
 
-For a wide fan, also raise the BullMQ transport's `resultConcurrency` on the instances that consume
-results, so the fan's results are not handled one at a time per pod. See
+For the other knobs that matter for a wide fan, see
 [Tuning for wide fans](/docs/production#tuning-for-wide-fans).
 
 ## 4. Cron digest

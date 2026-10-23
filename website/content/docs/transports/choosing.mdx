@@ -33,7 +33,7 @@ This page compares them side by side. Every cell reflects what the transport's s
 | --- | --- | --- | --- | --- | --- |
 | Steps run concurrently per process | ✅ `concurrency` (default 1) | ❌ one at a time¹ | ✅ `concurrency` (default 1)¹ | ⚠️ unbounded² | ⚠️ inline in `dispatch` |
 | Adaptive concurrency (`concurrency: 'adaptive'`) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Results handled concurrently (engine side) | ✅ `resultConcurrency` (default 1) | ❌ one at a time | ❌ one at a time | ⚠️ unbounded² | ⚠️ unbounded |
+| Results handled concurrently (engine side) | ✅ up to 512 per instance | ✅ up to 80 per instance | ✅ up to 512 per instance | ⚠️ unbounded² | ⚠️ unbounded |
 | Broker-level step priority | ✅ `priority` mapped to BullMQ job priority | ❌ ignored | ❌ ignored | ❌ | ❌ |
 | What one worker instance consumes | Any number of step names, one queue each | One `group` | One `group` | Every registered step name | Every registered step name |
 
@@ -138,8 +138,8 @@ because another subscriber might own it, so the run waits on it.
 <Callout type="info" title="Recommended for production: BullMQ">
 `BullMQTransport` is the most complete transport, and several features exist **only** on it:
 
-- **Throughput controls.** Per-process `concurrency` (fixed or `adaptive`), `resultConcurrency`, and
-  broker-level `priority`. SQS runs one step at a time per process, and SQL has a fixed `concurrency`.
+- **Throughput controls.** Per-process `concurrency` (fixed or `adaptive`) and broker-level
+  `priority`. SQS runs one step at a time per process, and SQL has a fixed `concurrency`.
 - **Crash handling for long steps.** BullMQ renews the job lock while a step runs, so a slow step isn't
   redelivered. A crashed worker's job is failed by a peer's stalled-check and bridged into a retryable
   `StepResult`, `stepTimeoutMs` caps a wedged handler, and a result whose engine-side handling throws

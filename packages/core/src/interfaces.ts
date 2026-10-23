@@ -415,6 +415,14 @@ export interface StateStore {
 
   getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null>;
   /**
+   * The run's checkpoints at `seqs`, in `seq` order; a seq with no checkpoint is left out, and an
+   * empty `seqs` reads nothing. The engine reads a batch of one run's step results' checkpoints
+   * through it, one call per batch.
+   *
+   * Optional: a store that omits it gets one {@link getCheckpoint} per seq.
+   */
+  getCheckpoints?(runId: string, seqs: number[]): Promise<StepCheckpoint[]>;
+  /**
    * Persist a checkpoint and advance the run atomically. Durable semantics depend on this
    * being a single transaction; stores without transactions cannot give the strong guarantee.
    */
