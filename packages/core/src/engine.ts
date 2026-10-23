@@ -1983,6 +1983,10 @@ export class WorkflowEngine {
       for (const rearm of this.drainRearms) rearm();
     }
   }
+  /** True once {@link beginDrain} (or {@link drain}) has been called. */
+  isDraining(): boolean {
+    return this.draining;
+  }
 
   /**
    * Graceful shutdown: stop picking up new runs (recovery/timer become no-ops) and wait for

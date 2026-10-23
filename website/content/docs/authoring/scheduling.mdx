@@ -42,6 +42,8 @@ interface ScheduledWorkflow<W extends WorkflowRef = WorkflowRef> {
    *  `maxCatchup` bounds how many prior windows are backfilled. Opt-in; absent = only the current
    *  window fires. */
   backfill?: { maxCatchup: number };
+  /** Stamp the runs with this namespace instead of the firing instance's own. */
+  namespace?: string;
 }
 ```
 
@@ -215,6 +217,22 @@ Jitter only delays *when* an instance attempts the dispatch — it does not chan
 time bucket), so idempotency is unchanged: however many instances jitter the same window, it still
 starts exactly once.
 
+An instance waits the jitter once per window, only when the window has no run yet. Once it has seen
+the window's run exist — it started it, or another instance did — later ticks in that window skip the
+schedule without a store read or a wait, so a long `jitter` never holds up the rest of the poll (due
+timers, retries, timeouts).
+
+## Pinning the pool — `namespace`
+
+The instance that wins the race to fire a window decides which [namespace](/docs/concepts/tenancy#what-namespace-partitions) the run
+is stamped with: its own. When the workflow can only run in one pool — its steps need a capability
+only that pool's workers have — pin the namespace on the schedule, so the run lands there whichever
+instance fires it:
+
+```ts
+{ key: 'render-thumbnails', workflow: RenderThumbnailsWorkflow, everyMs: 60_000, namespace: 'gpu' }
+```
+
 ## Catching up on missed windows — `backfill`
 
 If the process running the poller is down when a window would have fired, that window is missed —
@@ -252,7 +270,9 @@ The guarantee that makes scheduling safe in a multi-instance deployment is the *
 time-bucket run id**. Each window — a fixed-interval index, or a cron fire time — maps to a
 deterministic run id, and `engine.start` is idempotent by run id: starting the same id twice is a
 no-op. So when several driving instances tick at the same moment and all try to start the current
-window, they all compute the same run id and only the first actually creates the run. The poller fires
+window, they all compute the same run id and only the first actually creates the run. Each instance
+also remembers the windows whose run it has seen exist, so a window that already fired costs no store
+read on the ticks after that. The poller fires
 schedules on driving instances only, so a dashboard-only instance (`drive: false`) never starts them.
 
 The mechanism is the same one used everywhere durability needs idempotency — see
