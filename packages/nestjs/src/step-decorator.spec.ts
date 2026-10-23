@@ -359,7 +359,7 @@ describe('@Step({ input, output }) — runtime validation at serve time', () => 
     expect(result?.status).toBe('failed');
     expect(result?.error).toMatchObject({
       code: 'invalid_input',
-      details: [{ path: ['amount'] }],
+      details: { issues: [{ path: ['amount'] }] },
     });
     expect(result?.error?.message).toMatch(
       /invalid step ".*" input: amount must not be less than 1/,

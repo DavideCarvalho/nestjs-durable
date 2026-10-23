@@ -110,6 +110,19 @@ The code comes from `FatalError`'s second argument, from a `code` on whatever a 
 from the code a remote worker reported for the failed step. A failure from a step reaches the route once
 the step's retries are spent; a `FatalError` skips them.
 
+A schema failure is a `SchemaValidationError`, with the code `invalid_input` (an `input` schema, on the
+workflow or a step, or a stored input that no longer parses) or `invalid_output` (an `output` schema).
+`@OnError(SchemaValidationError)` reads its `static code`, `schema_validation`, and catches both when
+no route names them, as well as a rejected `searchAttributes` write:
+
+```ts
+@OnError('invalid_output') // just this one
+async reportBadResponse(ctx: WorkflowCtx, failure: OnErrorInput<Input>): Promise<Output> { /* … */ }
+
+@OnError(SchemaValidationError) // every other schema failure
+async quarantine(ctx: WorkflowCtx, failure: OnErrorInput<Input>): Promise<Output> { /* … */ }
+```
+
 Never routed: cancellation (a run past its `executionTimeout` is cancelled too), dead-lettering, and the
 failures that mean the deployment is broken (non-determinism, a ctx call nested in a step). Those keep
 their usual meaning. A step that times out fails like any other step, so its failure is routable.

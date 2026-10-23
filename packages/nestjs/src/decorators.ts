@@ -145,7 +145,8 @@ export interface WorkflowOptions {
    * Validate this workflow's {@link WorkflowCtx.upsertSearchAttributes} writes against a **Standard
    * Schema** (https://standardschema.dev — zod 3.24+, valibot, arktype, …). `ctx.upsertSearchAttributes`
    * validates the MERGED result (existing attributes shallow-merged with the patch) on every call —
-   * an invalid merge throws, naming this workflow, the offending key(s), and the schema's issues. The
+   * an invalid merge throws a `SchemaValidationError` (code `schema_validation`) naming this workflow,
+   * with the schema's issues. The
    * schema's inferred output must be search-attribute-shaped (flat `string`/`number`/`boolean` values
    * only) — a schema whose output has a nested object/array is a compile-time error here. Omit for
    * the prior unvalidated behavior.

@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import {
   InMemoryStateStore,
   InMemoryTransport,
+  SchemaValidationError,
   type WorkflowCtx,
 } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
@@ -143,11 +144,13 @@ describe('@Workflow({ input, output })', () => {
       .start('zod-io', { orderId: 7, placedAt: 'nope' }, 'bad')
       .catch((e) => e);
 
-    expect(error).toMatchObject({ code: 'invalid_input' });
+    expect(error).toBeInstanceOf(SchemaValidationError);
+    expect(error).toMatchObject({ code: 'invalid_input', retryable: false });
     expect(error.message).toMatch(/^invalid workflow "zod-io" input: orderId: /);
-    expect(error.details).toEqual(
+    expect(error.issues).toEqual(
       expect.arrayContaining([expect.objectContaining({ path: ['orderId'] })]),
     );
+    expect(error.details).toEqual({ issues: error.issues });
     expect(await store.getRun('bad')).toBeNull();
   });
 

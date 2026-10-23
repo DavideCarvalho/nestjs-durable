@@ -1,4 +1,8 @@
-import { FatalError, type StandardSchemaV1 } from '@dudousxd/nestjs-durable-core';
+import {
+  type SchemaValidationCode,
+  SchemaValidationError,
+  type StandardSchemaV1,
+} from '@dudousxd/nestjs-durable-core';
 import type { z } from 'zod';
 
 /** A class-validator DTO class — validated with the same `plainToInstance` + `validate` NestJS's
@@ -17,23 +21,18 @@ export type IoSchema = StandardSchemaV1 | DtoClass | z.ZodType;
 export type Parser = (value: unknown) => Promise<unknown>;
 
 /**
- * Build a {@link Parser} for `schema`. A failure throws a {@link FatalError} — retrying cannot fix a
- * value that does not match its schema — with `code` (`invalid_input` / `invalid_output`, so a
- * dashboard, an alert or an `onError` route can tell it apart) and the schema's issues as `details`.
+ * Build a {@link Parser} for `schema`. A failure throws a {@link SchemaValidationError} (a
+ * `FatalError`: retrying cannot fix a value that does not match its schema) with `code`
+ * (`invalid_input` / `invalid_output`, so a dashboard, an alert or an `onError` route can tell it
+ * apart) and the schema's issues in `issues` and `details.issues`.
  * `label` names what was being checked (`workflow "checkout" input`) in the message.
  */
 export function schemaParser(schema: IoSchema, kind: 'input' | 'output', label: string): Parser {
-  const code = kind === 'input' ? 'invalid_input' : 'invalid_output';
+  const code: SchemaValidationCode = kind === 'input' ? 'invalid_input' : 'invalid_output';
   if (isStandardSchema(schema)) {
     return async (value) => {
       const result = await schema['~standard'].validate(value);
-      if (result.issues) {
-        const issues = result.issues.map((i) => ({
-          message: i.message,
-          ...(i.path ? { path: i.path.map((p) => String(typeof p === 'object' ? p.key : p)) } : {}),
-        }));
-        throw new FatalError(`invalid ${label}: ${formatIssues(issues)}`, code, issues);
-      }
+      if (result.issues) throw new SchemaValidationError(label, result.issues, code);
       return result.value;
     };
   }
@@ -41,13 +40,7 @@ export function schemaParser(schema: IoSchema, kind: 'input' | 'output', label: 
     // zod < 3.24: no `~standard`, but `safeParse` reports the same issues.
     return async (value) => {
       const result = schema.safeParse(value);
-      if (!result.success) {
-        const issues = result.error.issues.map((i) => ({
-          message: i.message,
-          path: i.path.map(String),
-        }));
-        throw new FatalError(`invalid ${label}: ${formatIssues(issues)}`, code, issues);
-      }
+      if (!result.success) throw new SchemaValidationError(label, result.error.issues, code);
       return result.data;
     };
   }
@@ -64,7 +57,7 @@ export function schemaParser(schema: IoSchema, kind: 'input' | 'output', label: 
  * build. That defers the "peer missing" error to the first value parsed — the only moment the peers
  * are actually needed.
  */
-function classValidatorParser(cls: DtoClass, code: string, label: string): Parser {
+function classValidatorParser(cls: DtoClass, code: SchemaValidationCode, label: string): Parser {
   return async (value) => {
     let cv: any;
     let ct: any;
@@ -81,8 +74,7 @@ function classValidatorParser(cls: DtoClass, code: string, label: string): Parse
     // instances), so anything else is rejected here, on the same coded contract as a failed check.
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
       const got = value === null ? 'null' : Array.isArray(value) ? 'an array' : typeof value;
-      const message = `expected an object, got ${got}`;
-      throw new FatalError(`invalid ${label}: ${message}`, code, [{ message }]);
+      throw new SchemaValidationError(label, [{ message: `expected an object, got ${got}` }], code);
     }
     const instance = ct.plainToInstance(cls, value);
     const errors = await cv.validate(instance, { whitelist: true });
@@ -92,8 +84,8 @@ function classValidatorParser(cls: DtoClass, code: string, label: string): Parse
         path: [String(e.property)],
       }));
       // class-validator's messages already name the property (`orderId must be a string`).
-      const message = issues.map((i: { message: string }) => i.message).join('; ');
-      throw new FatalError(`invalid ${label}: ${message}`, code, issues);
+      const summary = issues.map((i: { message: string }) => i.message).join('; ');
+      throw new SchemaValidationError(label, issues, code, summary);
     }
     return instance;
   };
@@ -122,10 +114,4 @@ function isZodLike(schema: unknown): schema is ZodLike {
     schema !== null &&
     typeof (schema as { safeParse?: unknown }).safeParse === 'function'
   );
-}
-
-function formatIssues(issues: { message: string; path?: string[] }[]): string {
-  return issues
-    .map((i) => (i.path && i.path.length > 0 ? `${i.path.join('.')}: ${i.message}` : i.message))
-    .join('; ');
 }
