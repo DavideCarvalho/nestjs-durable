@@ -74,6 +74,12 @@ async function until(check: () => boolean | Promise<boolean>, timeoutMs: number)
 
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** The fan forms every fan case runs for. */
+const FANS = [
+  { fan: 'ctx.all fan', settle: false },
+  { fan: 'ctx.allSettled fan', settle: true },
+];
+
 interface Instance {
   name: string;
   engine: WorkflowEngine;
@@ -93,7 +99,12 @@ function instances(store: StateStore, transports: Transport[], clock?: () => num
 }
 
 /** Register a fan of `fanSize` children on every instance; each child records who executed it. */
-function registerFan(all: Instance[], fanSize: number, ran: Map<number, string[]>): void {
+function registerFan(
+  all: Instance[],
+  fanSize: number,
+  ran: Map<number, string[]>,
+  settle: boolean,
+): void {
   for (const { name, engine } of all) {
     engine.register('child', '1', async (ctx, input) => {
       const { i } = input as { i: number };
@@ -103,13 +114,17 @@ function registerFan(all: Instance[], fanSize: number, ran: Map<number, string[]
         return i * 2;
       });
     });
-    engine.register('parent', '1', async (ctx) =>
-      ctx.all<number>(
-        'child',
-        Array.from({ length: fanSize }, (_, i) => ({ i })),
-      ),
-    );
+    engine.register('parent', '1', async (ctx) => {
+      const inputs = Array.from({ length: fanSize }, (_, i) => ({ i }));
+      return settle ? ctx.allSettled<number>('child', inputs) : ctx.all<number>('child', inputs);
+    });
   }
+}
+
+/** What the fan returns when every child doubled its index, for `ctx.all` or `ctx.allSettled`. */
+function doubled(fanSize: number, settle: boolean): unknown[] {
+  const values = Array.from({ length: fanSize }, (_, i) => i * 2);
+  return settle ? values.map((value) => ({ status: 'fulfilled', value })) : values;
 }
 
 async function shutdown(all: Instance[], transports: Transport[]): Promise<void> {
@@ -143,68 +158,68 @@ export function runRunDispatchContract(
       return harness.pair();
     }
 
-    it(
-      "queues a fan's children on the transport in batches, and the fan completes",
-      async (ctx) => {
-        const pair = await pairOrSkip(() => ctx.skip());
-        if (!pair) return;
-        // Either instance may run the parent, and so queue the children: record both.
-        const a = recorded(pair[0]);
-        const b = recorded(pair[1]);
-        const store = new InMemoryStateStore();
-        const all = instances(store, [a.transport, b.transport]);
-        const ran = new Map<number, string[]>();
-        registerFan(all, fanSize, ran);
-        try {
-          for (const { engine } of all) expect(engine.consumeRuns()).toBeTypeOf('function');
-          await all[0]?.engine.start('parent', {}, 'p');
-          await until(async () => (await store.getRun('p'))?.status === 'completed', timeoutMs);
-          expect((await store.getRun('p'))?.output).toEqual(
-            Array.from({ length: fanSize }, (_, i) => i * 2),
-          );
-          const batches = [...a.batches, ...b.batches];
-          const queued = batches.flat().map((r) => r.runId);
-          const children = (await store.listRuns({ workflow: 'child' })).map((r) => r.id);
-          expect(children).toHaveLength(fanSize);
-          expect(new Set(queued)).toEqual(new Set(['p', ...children]));
-          // Batched: a handful of bulk writes, none over the batch bound, not one per child.
-          expect(Math.max(...batches.map((batch) => batch.length))).toBeLessThanOrEqual(500);
-          expect(batches.length).toBeLessThanOrEqual(Math.ceil(fanSize / 20));
-        } finally {
-          await shutdown(all, pair);
-        }
-      },
-      timeoutMs + 10_000,
-    );
-
-    it(
-      "splits a fan's children across the instances, each child executed once",
-      async (ctx) => {
-        const pair = await pairOrSkip(() => ctx.skip());
-        if (!pair) return;
-        const store = new InMemoryStateStore();
-        const all = instances(store, pair);
-        const ran = new Map<number, string[]>();
-        registerFan(all, fanSize, ran);
-        try {
-          for (const { engine } of all) engine.consumeRuns();
-          await all[0]?.engine.start('parent', {}, 'p');
-          await until(async () => (await store.getRun('p'))?.status === 'completed', timeoutMs);
-          expect(ran.size).toBe(fanSize);
-          for (const executors of ran.values()) expect(executors).toHaveLength(1);
-          const byInstance = new Map<string, number>();
-          for (const [executor] of ran.values()) {
-            byInstance.set(executor as string, (byInstance.get(executor as string) ?? 0) + 1);
+    for (const { fan, settle } of FANS) {
+      it(
+        `queues a ${fan}'s children on the transport in batches, and the fan completes`,
+        async (ctx) => {
+          const pair = await pairOrSkip(() => ctx.skip());
+          if (!pair) return;
+          // Either instance may run the parent, and so queue the children: record both.
+          const a = recorded(pair[0]);
+          const b = recorded(pair[1]);
+          const store = new InMemoryStateStore();
+          const all = instances(store, [a.transport, b.transport]);
+          const ran = new Map<number, string[]>();
+          registerFan(all, fanSize, ran, settle);
+          try {
+            for (const { engine } of all) expect(engine.consumeRuns()).toBeTypeOf('function');
+            await all[0]?.engine.start('parent', {}, 'p');
+            await until(async () => (await store.getRun('p'))?.status === 'completed', timeoutMs);
+            expect((await store.getRun('p'))?.output).toEqual(doubled(fanSize, settle));
+            const batches = [...a.batches, ...b.batches];
+            const queued = batches.flat().map((r) => r.runId);
+            const children = (await store.listRuns({ workflow: 'child' })).map((r) => r.id);
+            expect(children).toHaveLength(fanSize);
+            expect(new Set(queued)).toEqual(new Set(['p', ...children]));
+            // Batched: a handful of bulk writes, none over the batch bound, not one per child.
+            expect(Math.max(...batches.map((batch) => batch.length))).toBeLessThanOrEqual(500);
+            expect(batches.length).toBeLessThanOrEqual(Math.ceil(fanSize / 20));
+          } finally {
+            await shutdown(all, pair);
           }
-          // The instance that ran the parent did not run every child.
-          expect(byInstance.get('instance-0') ?? 0).toBeGreaterThan(0);
-          expect(byInstance.get('instance-1') ?? 0).toBeGreaterThan(0);
-        } finally {
-          await shutdown(all, pair);
-        }
-      },
-      timeoutMs + 10_000,
-    );
+        },
+        timeoutMs + 10_000,
+      );
+
+      it(
+        `splits a ${fan}'s children across the instances, each child executed once`,
+        async (ctx) => {
+          const pair = await pairOrSkip(() => ctx.skip());
+          if (!pair) return;
+          const store = new InMemoryStateStore();
+          const all = instances(store, pair);
+          const ran = new Map<number, string[]>();
+          registerFan(all, fanSize, ran, settle);
+          try {
+            for (const { engine } of all) engine.consumeRuns();
+            await all[0]?.engine.start('parent', {}, 'p');
+            await until(async () => (await store.getRun('p'))?.status === 'completed', timeoutMs);
+            expect(ran.size).toBe(fanSize);
+            for (const executors of ran.values()) expect(executors).toHaveLength(1);
+            const byInstance = new Map<string, number>();
+            for (const [executor] of ran.values()) {
+              byInstance.set(executor as string, (byInstance.get(executor as string) ?? 0) + 1);
+            }
+            // The instance that ran the parent did not run every child.
+            expect(byInstance.get('instance-0') ?? 0).toBeGreaterThan(0);
+            expect(byInstance.get('instance-1') ?? 0).toBeGreaterThan(0);
+          } finally {
+            await shutdown(all, pair);
+          }
+        },
+        timeoutMs + 10_000,
+      );
+    }
 
     it(
       'leaves a run whose queueing failed pending, and the poll takes it',
@@ -442,6 +457,45 @@ export function runRunDispatchContract(
           await stop?.();
           expect(handled).toEqual(['once']);
         } finally {
+          await Promise.allSettled(pair.map((t) => t.close?.()));
+        }
+      },
+      timeoutMs + 10_000,
+    );
+
+    it(
+      'hands a run out again when it was dispatched while its entry was being handled',
+      async (ctx) => {
+        const pair = await pairOrSkip(() => ctx.skip());
+        if (!pair) return;
+        const [producer, consumerTransport] = pair;
+        const handled: string[] = [];
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let taken = 0;
+        const stop = consumerTransport.onDispatchedRun?.(
+          async (runId) => {
+            taken += 1;
+            if (taken === 1) await gate;
+            handled.push(runId);
+          },
+          { concurrency: 2 },
+        );
+        try {
+          await producer.dispatchRuns?.([{ runId: 'busy' }]);
+          await until(() => taken === 1, timeoutMs);
+          // Dispatched again while its first entry is still being handled: a wake, a requeue or a
+          // due timer the poll found. The run must get another turn after this one.
+          await producer.dispatchRuns?.([{ runId: 'busy' }]);
+          await pause(200);
+          release();
+          await until(() => handled.length >= 2, timeoutMs);
+          expect(handled.slice(0, 2)).toEqual(['busy', 'busy']);
+        } finally {
+          release();
+          await stop?.();
           await Promise.allSettled(pair.map((t) => t.close?.()));
         }
       },

@@ -211,6 +211,52 @@ describe('a child completion lost between the child and its parent', () => {
   });
 });
 
+describe.each([
+  { name: 'ctx.all', settle: false },
+  { name: 'ctx.allSettled', settle: true },
+])('reconciling a $name fan on a store without getRuns', ({ settle }) => {
+  it('settles every child it could read, and leaves only the unreadable one for the next turn', async () => {
+    const { store: base, failing } = instrumented();
+    // A store with only `getRun`: the reconcile reads children 50 at a time.
+    const store = new Proxy(base, {
+      get(target, prop, receiver) {
+        if (prop === 'getRuns') return undefined;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    let now = Date.now();
+    const engine = new WorkflowEngine({ store, clock: () => now });
+    const n = 30;
+    engine.register('child', '1', async (_ctx, input) => (input as { i: number }).i);
+    engine.register('parent', '1', async (ctx) => {
+      const inputs = Array.from({ length: n }, (_, i) => ({ i }));
+      return settle ? ctx.allSettled<number>('child', inputs) : ctx.all<number>('child', inputs);
+    });
+    failing.set('takeSignalWaiter', ([token]) => String(token).startsWith('child:p.all.'));
+    await engine.start('parent', {}, 'p');
+    await until(async () => {
+      const runs = await base.listRuns({ workflow: 'child', status: 'completed' });
+      return runs.length === n;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // One child's row cannot be read right now.
+    failing.set('getRun', ([id]) => id === 'p.all.0.7');
+    now += 301_000;
+    await engine.resumeDueTimers(now);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect((await base.listSignalWaiters('child:p.all.')).map((w) => w.token)).toEqual([
+      'child:p.all.0.7',
+    ]);
+    // It can be read again: the next reconcile settles it and the fan completes.
+    failing.delete('getRun');
+    now += 301_000;
+    await engine.resumeDueTimers(now);
+    await until(async () => (await base.getRun('p'))?.status === 'completed');
+    const out = (await base.getRun('p'))?.output as unknown[];
+    expect(out).toHaveLength(n);
+  });
+});
+
 describe('a step result whose resume was lost', () => {
   function oneStepChild(opts: Partial<ConstructorParameters<typeof WorkflowEngine>[0]> = {}) {
     const store = new InMemoryStateStore();

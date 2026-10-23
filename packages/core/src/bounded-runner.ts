@@ -3,12 +3,14 @@
  * is not queued twice, so a burst of identical requests costs one entry. A task starts in a
  * microtask, like a bare `queueMicrotask`, as long as a slot is free.
  *
- * The engine runs in-process work through it (a started run's first turn, a deferred child start)
- * so a wide fan queues run ids instead of holding thousands of turns open at once.
+ * The engine runs all of its in-process work through one of these (a started run's turn, a
+ * deferred child start, an enqueued pickup, a run taken off the transport's queue), so a wide fan
+ * queues run ids instead of holding thousands of turns open at once.
  */
 export class BoundedRunner {
   private active = 0;
-  private readonly waiting = new Map<string, () => Promise<unknown>>();
+  private readonly waiting = new Map<string, Waiting>();
+  private seq = 0;
 
   constructor(private readonly limit: number) {}
 
@@ -17,21 +19,45 @@ export class BoundedRunner {
     return this.active + this.waiting.size;
   }
 
+  /** Tasks running now. */
+  get running(): number {
+    return this.active;
+  }
+
   submit(key: string, task: () => Promise<unknown>): void {
     if (this.active < this.limit) {
       this.active += 1;
-      queueMicrotask(() => this.run(task));
+      queueMicrotask(() => this.execute(task));
       return;
     }
-    if (!this.waiting.has(key)) this.waiting.set(key, task);
+    if (!this.waiting.has(key)) this.waiting.set(key, { task });
+  }
+
+  /**
+   * Run `task` under the bound and resolve once it settled, or once it was dropped by
+   * {@link clear} before it got a slot. Never deduplicated.
+   */
+  run(task: () => Promise<unknown>): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const done = () => resolve();
+      const wrapped = () => task().then(done, done);
+      if (this.active < this.limit) {
+        this.active += 1;
+        queueMicrotask(() => this.execute(wrapped));
+        return;
+      }
+      this.seq += 1;
+      this.waiting.set(`\u0000run:${this.seq}`, { task: wrapped, dropped: done });
+    });
   }
 
   /** Forget every task still waiting for a slot. */
   clear(): void {
+    for (const { dropped } of this.waiting.values()) dropped?.();
     this.waiting.clear();
   }
 
-  private run(task: () => Promise<unknown>): void {
+  private execute(task: () => Promise<unknown>): void {
     let settled: Promise<unknown>;
     try {
       settled = task();
@@ -46,11 +72,17 @@ export class BoundedRunner {
           this.active -= 1;
           return;
         }
-        const [key, task] = next.value;
+        const [key, waiting] = next.value;
         this.waiting.delete(key);
-        this.run(task);
+        this.execute(waiting.task);
       });
   }
+}
+
+interface Waiting {
+  task: () => Promise<unknown>;
+  /** Resolves the caller of {@link BoundedRunner.run} when the task is dropped unrun. */
+  dropped?: () => void;
 }
 
 /**

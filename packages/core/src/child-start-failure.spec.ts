@@ -2,16 +2,19 @@ import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
-async function poll(fn: () => Promise<boolean>, timeoutMs = 1000): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
+/**
+ * Wait for `fn`, counting event-loop turns rather than wall-clock time: the engine progresses one
+ * step per turn, so a loaded machine makes this slower, never wrong.
+ */
+async function poll(fn: () => Promise<boolean>, turns = 5000): Promise<void> {
+  for (let i = 0; i < turns; i += 1) {
     if (await fn()) return;
-    await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setImmediate(r));
   }
-  throw new Error('poll timed out');
+  throw new Error('poll gave up');
 }
 
-describe('child start failure surfaces on the parent', () => {
+describe('child start failure surfaces on the parent', { timeout: 30_000 }, () => {
   it('an awaited child of an unregistered workflow FAILS the parent instead of hanging suspended', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });

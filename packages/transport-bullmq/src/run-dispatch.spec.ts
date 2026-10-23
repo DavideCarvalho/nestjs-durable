@@ -16,7 +16,10 @@ const workers: {
   opts: { concurrency?: number };
   processor: (job: { data: unknown }) => Promise<unknown>;
   close: ReturnType<typeof vi.fn>;
+  listeners: Map<string, (job: { data: unknown }) => void>;
 }[] = [];
+// The re-dispatch marks, as Redis would hold them.
+const marks = new Map<string, string>();
 
 vi.mock('bullmq', () => ({
   Queue: vi.fn((name: string) => ({
@@ -33,8 +36,15 @@ vi.mock('bullmq', () => ({
       opts: { concurrency?: number },
     ) => {
       const close = vi.fn().mockResolvedValue(undefined);
-      workers.push({ name, opts, processor, close });
-      return { concurrency: opts.concurrency ?? 1, close, on: vi.fn() };
+      const listeners = new Map<string, (job: { data: unknown }) => void>();
+      workers.push({ name, opts, processor, close, listeners });
+      return {
+        concurrency: opts.concurrency ?? 1,
+        close,
+        on: (event: string, listener: (job: { data: unknown }) => void) => {
+          listeners.set(event, listener);
+        },
+      };
     },
   ),
 }));
@@ -45,6 +55,26 @@ vi.mock('ioredis', () => ({
     subscribe: vi.fn().mockResolvedValue(undefined),
     on: vi.fn(),
     disconnect: vi.fn(),
+    pipeline: () => {
+      const ops: [string, string][] = [];
+      const p = {
+        set: (key: string, value: string) => {
+          ops.push([key, value]);
+          return p;
+        },
+        exec: async () => {
+          for (const [k, v] of ops) marks.set(k, v);
+          return [];
+        },
+      };
+      return p;
+    },
+    del: async (key: string) => (marks.delete(key) ? 1 : 0),
+    getdel: async (key: string) => {
+      const v = marks.get(key) ?? null;
+      marks.delete(key);
+      return v;
+    },
   })),
 }));
 
@@ -110,6 +140,49 @@ describe('BullMQTransport run queue', () => {
     await transport.close();
     // A stopped consumer is not closed a second time by the transport.
     expect(workers[0]?.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues a run again when it was dispatched while its job was being handled', async () => {
+    workers.length = 0;
+    bulks.length = 0;
+    marks.clear();
+    const transport = new BullMQTransport({ connection });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    transport.onDispatchedRun(async () => gate, { concurrency: 1 });
+    await transport.dispatchRuns([{ runId: 'r', priority: 3 }]);
+    const worker = workers[0];
+    // The job is taken (clearing the mark), and while it is handled the run is dispatched again:
+    // BullMQ ignores the add (same job id), the mark records it.
+    const handling = worker?.processor({ data: { runId: 'r', priority: 3 } });
+    await new Promise((resolve) => setImmediate(resolve));
+    await transport.dispatchRuns([{ runId: 'r', priority: 3 }]);
+    release();
+    await handling;
+    bulks.length = 0;
+    worker?.listeners.get('completed')?.({ data: { runId: 'r', priority: 3 } });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(bulks.flatMap((b) => b.jobs.map((j) => j.data.runId))).toEqual(['r']);
+    expect(bulks[0]?.jobs[0]?.opts.priority).toBe(toBrokerPriority(3));
+    await transport.close();
+  });
+
+  it('does not queue a run again when it was only waiting when dispatched twice', async () => {
+    workers.length = 0;
+    bulks.length = 0;
+    marks.clear();
+    const transport = new BullMQTransport({ connection });
+    transport.onDispatchedRun(async () => undefined, { concurrency: 1 });
+    await transport.dispatchRuns([{ runId: 'w' }]);
+    await transport.dispatchRuns([{ runId: 'w' }]);
+    await workers[0]?.processor({ data: { runId: 'w' } });
+    bulks.length = 0;
+    workers[0]?.listeners.get('completed')?.({ data: { runId: 'w' } });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(bulks).toEqual([]);
+    await transport.close();
   });
 
   it('closes a consumer still running when the transport closes', async () => {

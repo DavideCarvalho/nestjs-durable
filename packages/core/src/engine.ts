@@ -44,6 +44,7 @@ import {
   FOLDED_PREFIX,
   fanOfWaiter,
   foldedChildIds,
+  parentRunIdOf,
   parseStepFanGroup,
   stepFanGroup,
 } from './fan-join';
@@ -112,7 +113,7 @@ import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { RUN_DISPATCH_BATCH, RunDispatchBatcher } from './run-dispatch-batcher';
-import { getRunsByIds, indexWaitersByRun, listSignalWaitersOfRuns } from './run-waiting';
+import { indexWaitersByRun, listSignalWaitersOfRuns, readRunsByIds } from './run-waiting';
 import { ScheduleClient } from './schedules';
 import {
   SINGLETON_ADMITTED_TAG,
@@ -398,7 +399,21 @@ const DELIVER_CHUNK = 50;
 function childCompletion(child: WorkflowRun): Completion<unknown> | undefined {
   if (child.status === 'completed') return { ok: true, value: child.output };
   if (child.status === 'failed') return failedCompletion(child.error ?? { message: 'failed' });
+  if (child.status === 'dead') return failedCompletion(child.error ?? { message: 'dead' });
+  if (child.status === 'cancelled') return cancelledCompletion(child.error);
   return undefined;
+}
+
+/** Code of the failure a cancelled child delivers to its parent (see {@link cancelledCompletion}). */
+const CHILD_CANCELLED = 'cancelled';
+
+/**
+ * The failure a cancelled child delivers to its parent: its own error (`cancelled`, or the
+ * execution timeout that cancelled it), coded `cancelled` unless it carries a code already.
+ */
+function cancelledCompletion(error: StepError | undefined): Completion<never> {
+  const base = error ?? { message: 'cancelled' };
+  return failedCompletion({ ...base, code: base.code ?? CHILD_CANCELLED });
 }
 
 /** The most results of one run settled by one batched write (see `completeRemoteResult`). */
@@ -869,8 +884,12 @@ export class WorkflowEngine {
   private readonly wakeTurns = new Map<string, WakeTurn>();
   /** Re-checks scheduled for runs whose wake found another instance's lease (see {@link execute}). */
   private readonly leaseRetries = new Map<string, ReturnType<typeof setTimeout>>();
-  /** First turns of runs this instance dispatched to itself (see {@link LOCAL_RUN_CONCURRENCY}). */
-  private readonly localRuns: BoundedRunner;
+  /**
+   * Every run turn and child start this instance takes on itself, under one budget of
+   * {@link LOCAL_RUN_CONCURRENCY}: the runs it dispatches to itself, a fan's deferred child starts,
+   * enqueued pickups and the runs it takes off the transport's run queue.
+   */
+  private readonly localWork: BoundedRunner;
   /** The dispatcher the caller supplied, if any; without one the engine picks (see {@link dispatchRun}). */
   private readonly customDispatcher: RunDispatcher | undefined;
   /** Runs on their way to the transport's run queue (see {@link consumeRuns}). */
@@ -881,8 +900,6 @@ export class WorkflowEngine {
   private runConsumerStops: (() => Promise<void>)[] = [];
   /** The consumers being stopped, so {@link drain} waits for their runs in flight. */
   private runConsumersStopping: Promise<unknown> | undefined;
-  /** Deferred child starts (see {@link startChildDeferred}). */
-  private readonly childStarts: BoundedRunner;
   /**
    * The run lease of each execution in flight on THIS instance, by run id — renewed while it runs
    * and checked by every settle (the zombie fence, see {@link ExecutionLease}). Also what `drain()`
@@ -964,8 +981,7 @@ export class WorkflowEngine {
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
     // A failed pickup is swallowed here (the run stays `pending` for a `runPending` poll to retry);
     // run failures themselves are handled inside `execute` and surfaced as the run's `failed` state.
-    this.localRuns = new BoundedRunner(LOCAL_RUN_CONCURRENCY);
-    this.childStarts = new BoundedRunner(LOCAL_RUN_CONCURRENCY);
+    this.localWork = new BoundedRunner(LOCAL_RUN_CONCURRENCY);
     this.customDispatcher = deps.runDispatcher;
     this.runBatcher = new RunDispatchBatcher(
       (runs) => this.pool.dispatchRuns(runs, { namespace: this.namespace }),
@@ -1140,7 +1156,7 @@ export class WorkflowEngine {
    * after one read, instead of being leased and replayed here once more.
    */
   runEnqueued(runId: string): void {
-    this.localRuns.submit(runId, () => this.runIfPending(runId));
+    this.localWork.submit(`run:${runId}`, () => this.runIfPending(runId));
   }
 
   /**
@@ -1157,10 +1173,13 @@ export class WorkflowEngine {
   consumeRuns(): (() => Promise<void>) | undefined {
     if (!this.pool.dispatchesRuns) return undefined;
     if (this.runConsumerStops.length === 0) {
-      this.runConsumerStops = this.pool.onDispatchedRun((runId) => this.runFromQueue(runId), {
-        concurrency: LOCAL_RUN_CONCURRENCY,
-        namespace: this.namespace,
-      });
+      this.runConsumerStops = this.pool.onDispatchedRun(
+        (runId) => this.localWork.run(() => this.runFromQueue(runId)),
+        {
+          concurrency: LOCAL_RUN_CONCURRENCY,
+          namespace: this.namespace,
+        },
+      );
     }
     this.dispatchesOverTransport = true;
     return async () => {
@@ -1197,7 +1216,7 @@ export class WorkflowEngine {
       this.runBatcher.add({ runId, ...(priority !== undefined ? { priority } : {}) });
       return;
     }
-    this.localRuns.submit(runId, () => this.runOne(runId));
+    this.localWork.submit(`run:${runId}`, () => this.runOne(runId));
   }
 
   /**
@@ -2279,8 +2298,7 @@ export class WorkflowEngine {
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     this.beginDrain();
-    this.localRuns.clear();
-    this.childStarts.clear();
+    this.localWork.clear();
     for (const timer of this.leaseRetries.values()) clearTimeout(timer);
     this.leaseRetries.clear();
     const consumers = this.runConsumersStopping;
@@ -2414,6 +2432,7 @@ export class WorkflowEngine {
         });
         // The parent is terminal FIRST (above), so a child that cascades back into it stops there.
         await this.cancelChildren(run.id).catch(() => undefined);
+        this.notifyParent(run.id, cancelledCompletion(error));
       }
     }
   }
@@ -3420,7 +3439,8 @@ export class WorkflowEngine {
   ): Promise<void> {
     if (awaited.length === 0) return;
     try {
-      const children = await getRunsByIds(
+      // A child whose read failed is left to the next turn; the others settle now.
+      const { runs: children } = await readRunsByIds(
         this.store,
         awaited.map((a) => a.childId),
       );
@@ -3597,11 +3617,23 @@ export class WorkflowEngine {
    */
   private async deliverToParent(token: string, completion: Completion<unknown>): Promise<void> {
     let waiter: SignalWaiter | null | undefined;
+    const cancelled = !completion.ok && completion.code === CHILD_CANCELLED;
     for (let attempt = 1; ; attempt += 1) {
       try {
         if (waiter === undefined) waiter = await this.store.takeSignalWaiter(token);
-        if (waiter) await this.deliverSignal(waiter, completion);
-        else await this.signal(token, completion);
+        if (waiter) {
+          // A child cancelled because its parent was (the cancel cascades down) has a parent that
+          // is already terminal: nothing to tell it.
+          const parent = cancelled ? await this.store.getRun(waiter.runId) : undefined;
+          if (parent && TERMINAL_RUN_STATUSES.includes(parent.status)) return;
+          await this.deliverSignal(waiter, completion);
+          return;
+        }
+        // No waiter: the parent has not put it yet (the completion is buffered for its join), or
+        // it already settled this child on its own turn ({@link deliverFinishedChildren}), and a
+        // buffered copy would never be consumed. A cancelled child nobody waits on tells no one.
+        if (cancelled || (await this.parentHoldsCompletion(token, completion))) return;
+        await this.signal(token, completion);
         return;
       } catch (err) {
         if (err instanceof NamespaceMismatch) return;
@@ -3612,6 +3644,31 @@ export class WorkflowEngine {
         });
       }
     }
+  }
+
+  /**
+   * Whether the parent of the child behind `token` (`child:<id>`) already holds `completion` as that
+   * child's settled `signal:child:<id>` checkpoint: its own turn settled the child from the child's
+   * row, so this notification is a duplicate. A different completion (a fix-and-replay run's success
+   * for a child the parent saw fail) is not, and is buffered for the parent's retry. Only for a child
+   * whose id the engine minted (its parent is derivable from it).
+   */
+  private async parentHoldsCompletion(
+    token: string,
+    completion: Completion<unknown>,
+  ): Promise<boolean> {
+    const childId = token.slice('child:'.length);
+    const parentId = parentRunIdOf(childId);
+    if (!parentId) return false;
+    const name = `${CHILD_SIGNAL_PREFIX}${childId}`;
+    const checkpoints = this.store.listCheckpointsByNamePrefix
+      ? await this.store.listCheckpointsByNamePrefix(parentId, [name])
+      : await this.store.listCheckpoints(parentId);
+    const expected = JSON.stringify(completion);
+    return checkpoints.some(
+      (cp) =>
+        cp.name === name && cp.status === 'completed' && JSON.stringify(cp.output) === expected,
+    );
   }
 
   /**
@@ -3635,7 +3692,7 @@ export class WorkflowEngine {
     // Bounded (see `LOCAL_RUN_CONCURRENCY`): a fan's starts queue here instead of all hitting the store
     // at once. A start still queued at shutdown is dropped, not failed: the parent's placeholder
     // remains, and its next turn starts every child that has no run yet.
-    this.childStarts.submit(childId, async () => {
+    this.localWork.submit(`start:${childId}`, async () => {
       if (this.draining) return;
       await this.start(workflow, input, childId, opts).catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
@@ -3708,6 +3765,7 @@ export class WorkflowEngine {
       error,
     });
     await this.cancelChildren(runId, opts);
+    this.notifyParent(runId, cancelledCompletion(error));
     // Notify local cancel listeners now (a worker on this pod), and broadcast so the instance/worker
     // actually running this run learns of it and can abort cooperatively (the store already records
     // `cancelled`, but a busy worker won't re-read it).
@@ -4723,6 +4781,7 @@ export class WorkflowEngine {
         namespace: run.namespace,
         error,
       });
+      this.notifyParent(run.id, cancelledCompletion(error));
       this.notifyCancelled(run.id);
       if (this.controlPlane) {
         void this.controlPlane
@@ -5472,6 +5531,7 @@ export class WorkflowEngine {
       namespace: run.namespace,
       error,
     });
+    this.notifyParent(run.id, cancelledCompletion(error));
     return { runId: run.id, status: 'cancelled', error };
   }
 

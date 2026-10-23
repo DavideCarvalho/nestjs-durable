@@ -99,22 +99,51 @@ const GET_RUN_FALLBACK_PARALLEL = 50;
 /**
  * The runs with these ids that exist: through the store's {@link StateStore.getRuns} in bounded
  * batches, or, for a store without it, one {@link StateStore.getRun} per id, a few at a time.
+ * Throws if any read failed; see {@link readRunsByIds} to keep what was read.
  */
 export async function getRunsByIds(
   store: StateStore,
   runIds: readonly string[],
 ): Promise<Map<string, WorkflowRun>> {
+  const { runs, unread, error } = await readRunsByIds(store, runIds);
+  if (unread.length > 0) throw error;
+  return runs;
+}
+
+/**
+ * {@link getRunsByIds}, keeping what could be read: `runs` holds the existing runs among the ids
+ * that were read, `unread` the ids whose read failed (with the first `error`). A failed read costs
+ * only its own ids: one failing {@link StateStore.getRun} does not discard the rest of its batch.
+ */
+export async function readRunsByIds(
+  store: StateStore,
+  runIds: readonly string[],
+): Promise<{ runs: Map<string, WorkflowRun>; unread: string[]; error?: unknown }> {
   const unique = [...new Set(runIds)];
-  const byId = new Map<string, WorkflowRun>();
+  const runs = new Map<string, WorkflowRun>();
+  const unread: string[] = [];
+  let error: unknown;
   const batch = store.getRuns ? RUN_ID_BATCH : GET_RUN_FALLBACK_PARALLEL;
   for (let at = 0; at < unique.length; at += batch) {
     const ids = unique.slice(at, at + batch);
-    const runs = store.getRuns
-      ? await store.getRuns(ids)
-      : (await Promise.all(ids.map((id) => store.getRun(id)))).filter(
-          (r): r is WorkflowRun => r !== null,
-        );
-    for (const run of runs) byId.set(run.id, run);
+    if (store.getRuns) {
+      try {
+        for (const run of await store.getRuns(ids)) runs.set(run.id, run);
+      } catch (err) {
+        error ??= err;
+        unread.push(...ids);
+      }
+      continue;
+    }
+    const reads = await Promise.allSettled(ids.map((id) => store.getRun(id)));
+    reads.forEach((read, k) => {
+      if (read.status === 'fulfilled') {
+        if (read.value) runs.set(read.value.id, read.value);
+        return;
+      }
+      error ??= read.reason;
+      unread.push(ids[k] as string);
+    });
   }
-  return byId;
+  return { runs, unread, ...(unread.length > 0 ? { error } : {}) };
 }

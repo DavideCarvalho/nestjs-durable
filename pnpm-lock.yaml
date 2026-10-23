@@ -607,6 +607,9 @@ importers:
       '@dudousxd/nestjs-durable-core':
         specifier: workspace:^
         version: link:../core
+      '@testcontainers/mysql':
+        specifier: 10.18.0
+        version: 10.18.0
       '@testcontainers/postgresql':
         specifier: 10.18.0
         version: 10.18.0
