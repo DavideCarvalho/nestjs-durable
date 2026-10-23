@@ -393,6 +393,9 @@ const pendingStateKey = (at: Date): string => String(new Date(at).getTime());
  */
 const freshPendingKey = (): string => `${Date.now()}-${globalThis.crypto.randomUUID().slice(0, 8)}`;
 
+/** The buffered-signal token of the wake requests kept for a run (see `requestWakeAfterTurn`). */
+const wakeRequestToken = (runId: string): string => `durable:wake-after-turn:${runId}`;
+
 /** The checkpoint name prefix of an awaited child: `signal:child:<childId>`. */
 const CHILD_SIGNAL_PREFIX = 'signal:child:';
 
@@ -4452,6 +4455,8 @@ export class WorkflowEngine {
       if (
         !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
       ) {
+        // One request per re-check cycle: the wakes that pile up behind one turn share it.
+        if (!this.leaseRetries.has(run.id)) this.inBackground(this.requestWakeAfterTurn(run.id));
         this.recheckAfterLease(run.id, run.lockedUntil);
         return { runId: run.id, status: run.status };
       }
@@ -4476,10 +4481,56 @@ export class WorkflowEngine {
       ) {
         void this.singletons.wakeNext(run).catch(() => undefined);
       }
+      // The lease is released by now: a wake another instance could not deliver during this turn
+      // runs the next one.
+      if (result.status === 'suspended') this.inBackground(this.honorWakeRequests(run.id));
+      else if (TERMINAL_RUN_STATUSES.includes(result.status)) {
+        this.inBackground(this.takeWakeRequests(run.id));
+      }
       return result;
     } finally {
       held.stop();
     }
+  }
+
+  /**
+   * Keep a wake that found `runId`'s lease held by a turn executing elsewhere, durably, so that turn
+   * runs again once it ends instead of suspending on a snapshot that predates what the wake brought
+   * (a signal, a child's completion). The request is a buffered signal on a token no workflow waits
+   * on; the holder takes it after it releases the lease ({@link honorWakeRequests}).
+   *
+   * Written first and looked at second, against a holder that releases first and looks second:
+   * whichever look runs last sees the other side's write. So when the run is no longer executing by
+   * the time this re-reads it, the holder may have looked already, and this side takes the request
+   * and wakes the run itself once the lease is free.
+   */
+  private async requestWakeAfterTurn(runId: string): Promise<void> {
+    await this.store.bufferSignal(wakeRequestToken(runId), null);
+    const run = await this.store.getRun(runId);
+    if (run?.status === 'running') return;
+    // Gone (deleted or pruned meanwhile): no turn will take the request, so take it back.
+    if (!run) {
+      await this.takeWakeRequests(runId);
+      return;
+    }
+    if (!(await this.takeWakeRequests(runId))) return;
+    if (TERMINAL_RUN_STATUSES.includes(run.status)) return;
+    this.recheckAfterLease(runId, run.lockedUntil);
+  }
+
+  /** After a turn that suspended released its lease: run again if a wake was kept for it. */
+  private async honorWakeRequests(runId: string): Promise<void> {
+    if (!(await this.takeWakeRequests(runId))) return;
+    await this.wake(runId).catch((err) => {
+      if (!(err instanceof NamespaceMismatch)) throw err;
+    });
+  }
+
+  /** Take every wake request kept for `runId`; true when there was one. */
+  private async takeWakeRequests(runId: string): Promise<boolean> {
+    let taken = false;
+    while (await this.store.takeBufferedSignal(wakeRequestToken(runId))) taken = true;
+    return taken;
   }
 
   /**

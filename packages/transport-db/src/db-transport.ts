@@ -36,6 +36,20 @@ interface ClaimedRun {
 
 /** Most rows one {@link DbTransport.dispatchRuns} insert writes. */
 const RUNS_INSERT_CHUNK = 500;
+/** Tries for a statement the database rolled back as a deadlock (see `retryOnDeadlock`). */
+const DEADLOCK_RETRIES = 5;
+
+/** Whether `err` is the database rolling a statement back to break a deadlock. */
+function isDeadlock(err: unknown): boolean {
+  const codes = [
+    (err as { code?: unknown }).code,
+    (err as { errno?: unknown }).errno,
+    (err as { driverError?: { code?: unknown; errno?: unknown } }).driverError?.code,
+    (err as { driverError?: { code?: unknown; errno?: unknown } }).driverError?.errno,
+  ];
+  return codes.some((c) => c === 'ER_LOCK_DEADLOCK' || c === 1213 || c === '40P01');
+}
+
 /** Most run rows one consumer poll claims. */
 const RUNS_CLAIM_MAX = 50;
 
@@ -334,7 +348,10 @@ export class DbTransport implements Transport {
     for (const run of runs) {
       if (!byRun.has(run.runId) || run.reason === 'wake') byRun.set(run.runId, run);
     }
-    const unique = [...byRun.values()];
+    // In run-id order: two dispatches touching overlapping rows lock them in the same order.
+    const unique = [...byRun.values()].sort((a, b) =>
+      a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0,
+    );
     const t = this.q(this.runsTable);
     const cols = ['run_id', 'ns', 'priority', 'wake', 'created_at'];
     const now = this.now();
@@ -351,15 +368,17 @@ export class DbTransport implements Transport {
       const sql = this.isPg
         ? `INSERT ${insert} ON CONFLICT (${this.q('run_id')}) DO UPDATE SET ${release}, ${wake} = GREATEST(${t}.${wake}, EXCLUDED.${wake})`
         : `INSERT ${insert} ON DUPLICATE KEY UPDATE ${release}, ${wake} = GREATEST(${wake}, VALUES(${wake}))`;
-      await this.exec.query(
-        sql,
-        chunk.flatMap((run, r) => [
-          run.runId,
-          opts?.namespace ?? '',
-          run.priority ?? 0,
-          run.reason === 'wake' ? 1 : 0,
-          now + r,
-        ]),
+      await this.retryOnDeadlock(() =>
+        this.exec.query(
+          sql,
+          chunk.flatMap((run, r) => [
+            run.runId,
+            opts?.namespace ?? '',
+            run.priority ?? 0,
+            run.reason === 'wake' ? 1 : 0,
+            now + r,
+          ]),
+        ),
       );
     }
   }
@@ -422,7 +441,9 @@ export class DbTransport implements Transport {
         let rows: ClaimedRun[] = [];
         try {
           await this.ensureSchema();
-          rows = await this.claimRuns(ns, Math.min(free, RUNS_CLAIM_MAX));
+          rows = await this.retryOnDeadlock(() =>
+            this.claimRuns(ns, Math.min(free, RUNS_CLAIM_MAX)),
+          );
         } catch (err) {
           if (this.running && !consumer.stopped) this.onError(err);
         }
@@ -431,12 +452,12 @@ export class DbTransport implements Transport {
           const done = handler(run)
             .catch(() => undefined)
             .then(() =>
-              this.exec
-                .query(
+              this.retryOnDeadlock(() =>
+                this.exec.query(
                   `DELETE FROM ${this.q(this.runsTable)} WHERE ${this.q('claim_token')} = ${this.ph(1)}`,
                   [token],
-                )
-                .catch(() => undefined),
+                ),
+              ).catch(() => undefined),
             )
             .finally(() => {
               consumer.inflight.delete(token);
@@ -450,6 +471,22 @@ export class DbTransport implements Transport {
       await Promise.allSettled([...settled]);
     } finally {
       clearInterval(renew);
+    }
+  }
+
+  /**
+   * Run `statement`, again on a deadlock: queueing a run (an upsert), taking one (`SKIP LOCKED`)
+   * and deleting a handled one touch the same rows from different instances, and the database then
+   * rolls one of them back rather than wait (InnoDB reports `ER_LOCK_DEADLOCK`, Postgres `40P01`).
+   */
+  private async retryOnDeadlock<T>(statement: () => Promise<T>): Promise<T> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await statement();
+      } catch (err) {
+        if (attempt >= DEADLOCK_RETRIES || !isDeadlock(err)) throw err;
+        await this.sleep(10 * attempt + Math.floor(Math.random() * 10));
+      }
     }
   }
 

@@ -5,6 +5,7 @@ import {
   type RunQueueOptions,
   type StateStore,
   type Transport,
+  type WorkflowCtx,
   WorkflowEngine,
 } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it } from 'vitest';
@@ -126,6 +127,86 @@ function doubled(fanSize: number, settle: boolean): unknown[] {
   const values = Array.from({ length: fanSize }, (_, i) => i * 2);
   return settle ? values.map((value) => ({ status: 'fulfilled', value })) : values;
 }
+
+/**
+ * A store holding one write of run `p` until released: its turn's suspension (the wake then lands
+ * while the turn still holds the lease), or the `running` placeholder of an awaited child.
+ */
+function holdingTurn(
+  inner: InMemoryStateStore,
+  hold: 'suspend' | 'placeholder',
+): {
+  store: StateStore;
+  state: { held: boolean; release: () => void };
+} {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const state = { held: false, release: () => release() };
+  const store = new Proxy(inner, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== 'function') return value;
+      const fn = value as (...args: unknown[]) => unknown;
+      const holds = (args: unknown[]): boolean => {
+        if (state.held) return false;
+        if (hold === 'suspend' && (prop === 'updateRun' || prop === 'updateRunIf')) {
+          const patch = (prop === 'updateRun' ? args[1] : args[2]) as { status?: string };
+          return args[0] === 'p' && patch.status === 'suspended';
+        }
+        if (hold === 'placeholder' && prop === 'saveCheckpoint') {
+          const cp = args[0] as { runId: string; status: string; name: string };
+          return cp.runId === 'p' && cp.status === 'running' && cp.name.startsWith('signal:child:');
+        }
+        return false;
+      };
+      return async (...args: unknown[]) => {
+        if (holds(args)) {
+          state.held = true;
+          await gate;
+        }
+        return fn.apply(target, args);
+      };
+    },
+  }) as StateStore;
+  return { store, state };
+}
+
+/** The ways a parent waits on something another instance finishes while its turn still runs. */
+const MID_TURN = [
+  {
+    what: "ctx.child's completion",
+    body: (ctx: WorkflowCtx) => ctx.child('child', {}),
+    output: 'done' as unknown,
+    signal: false,
+  },
+  {
+    what: "ctx.child's completion, raced against its timeline placeholder",
+    body: (ctx: WorkflowCtx) => ctx.child('child', {}),
+    output: 'done' as unknown,
+    signal: false,
+    hold: 'placeholder' as const,
+  },
+  {
+    what: "a ctx.all fan's completions",
+    body: (ctx: WorkflowCtx) => ctx.all('child', [{}, {}, {}]),
+    output: ['done', 'done', 'done'] as unknown,
+    signal: false,
+  },
+  {
+    what: "a ctx.allSettled fan's completions",
+    body: (ctx: WorkflowCtx) => ctx.allSettled('child', [{}, {}, {}]),
+    output: [1, 2, 3].map(() => ({ status: 'fulfilled', value: 'done' })) as unknown,
+    signal: false,
+  },
+  {
+    what: 'a signal',
+    body: (ctx: WorkflowCtx) => ctx.waitForSignal('go'),
+    output: 'sent' as unknown,
+    signal: true,
+  },
+];
 
 async function shutdown(all: Instance[], transports: Transport[]): Promise<void> {
   await Promise.allSettled(all.map(({ engine }) => engine.drain(2_000)));
@@ -699,5 +780,75 @@ export function runRunDispatchContract(
       },
       timeoutMs + 10_000,
     );
+
+    for (const { what, body, output, signal, hold = 'suspend' } of MID_TURN as {
+      what: string;
+      body: (ctx: WorkflowCtx) => Promise<unknown>;
+      output: unknown;
+      signal: boolean;
+      hold?: 'suspend' | 'placeholder';
+    }[]) {
+      it(
+        `${what}, landing while the parent's turn runs on the other instance, resumes it once that turn ends`,
+        async (ctx) => {
+          const pair = await pairOrSkip(() => ctx.skip());
+          if (!pair) return;
+          const inner = new InMemoryStateStore();
+          const { store, state } = holdingTurn(inner, hold);
+          const now = Date.now();
+          // The instance running the parent takes one run at a time: while its turn is held, the
+          // children and the wake go to the other instance.
+          const [first, second] = pair;
+          const busy: Transport = new Proxy(first, {
+            get(target, prop, receiver) {
+              if (prop === 'onDispatchedRun') {
+                return (
+                  handler: Parameters<NonNullable<Transport['onDispatchedRun']>>[0],
+                  opts: RunConsumerOptions,
+                ) => target.onDispatchedRun?.(handler, { ...opts, concurrency: 1 });
+              }
+              const value = Reflect.get(target, prop, receiver);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+          const engines = [busy, second].map(
+            (transport) => new WorkflowEngine({ store, transport, clock: () => now }),
+          );
+          for (const engine of engines) {
+            engine.register('child', '1', async () => 'done');
+            engine.register('parent', '1', async (wctx) => body(wctx));
+          }
+          const [holder, other] = engines as [WorkflowEngine, WorkflowEngine];
+          try {
+            holder.consumeRuns();
+            await holder.start('parent', {}, 'p');
+            await until(() => state.held, timeoutMs);
+            other.consumeRuns();
+            if (signal) await other.signal('go', 'sent');
+            else if (hold === 'suspend') {
+              const n = Array.isArray(output) ? output.length : 1;
+              await until(
+                async () =>
+                  (await inner.listRuns({ workflow: 'child', status: 'completed' })).length >= n,
+                timeoutMs,
+              );
+            }
+            // Longer than a lease re-check: the other instance has looked and found the turn running.
+            await pause(2_600);
+            state.release();
+            // Its reconcile wake is minutes away on a clock that never moves: only the wake resumes it.
+            await until(async () => (await inner.getRun('p'))?.status === 'completed', timeoutMs);
+            expect((await inner.getRun('p'))?.output).toEqual(output);
+          } finally {
+            state.release();
+            await shutdown(
+              engines.map((engine, i) => ({ name: `instance-${i}`, engine })),
+              pair,
+            );
+          }
+        },
+        timeoutMs + 20_000,
+      );
+    }
   });
 }
