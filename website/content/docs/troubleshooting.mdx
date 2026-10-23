@@ -285,5 +285,6 @@ operator** instance — `store` set and `drive` not `false`. Concretely:
 
 **Fix:** make sure at least one operator instance is running with `drive` not `false` and either the
 default `timerPollMs` (1000ms) or a nonzero value, or that you're genuinely driving
-`resumeDueTimers()`/schedule checks from an external scheduler if you set it to `0`. See
+`resumeDueTimers()`/schedule checks from an external scheduler if you set it to `0` (see [firing
+schedules from your own trigger](/docs/authoring/scheduling#firing-schedules-from-your-own-trigger)). See
 [Scheduling](/docs/authoring/scheduling) and [Durability & replay](/docs/concepts/durability).

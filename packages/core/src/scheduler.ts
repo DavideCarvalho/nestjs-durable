@@ -115,8 +115,13 @@ export function nextCronFireMs(expr: string, afterMs: number, timezone = 'UTC'):
     .getTime();
 }
 
-/** The deterministic, idempotent run id for a schedule at `nowMs` — its current fire window. */
-function scheduleRunIdAt(s: ScheduledWorkflow, nowMs: number): string {
+/**
+ * The deterministic, idempotent run id for a schedule at `nowMs` — its current fire window
+ * (`sched:<key>:<bucket>`, the bucket being a fixed-interval index or the cron fire time). Pass the
+ * same `ScheduledWorkflow` you registered to look a window's run up, e.g.
+ * `engine.getRun(scheduleRunIdAt(dailyReport, Date.now()))`, rather than rebuilding the id by hand.
+ */
+export function scheduleRunIdAt(s: ScheduledWorkflow, nowMs: number): string {
   if (s.cron != null) return `sched:${s.key}:${prevCronFireMs(s.cron, nowMs, s.timezone)}`;
   if (s.everyMs != null) return scheduledRunId(s.key, s.everyMs, nowMs);
   throw new Error(`schedule "${s.key}" needs either "everyMs" or "cron"`);

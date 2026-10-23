@@ -48,6 +48,16 @@ export type {
   StepLogger,
   WorkflowCtx,
   WorkflowHandler,
+  RunSchedulesOptions,
+  ScheduledWorkflow,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
-export { readSearchAttributes, RunGateway, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+export {
+  prevCronFireMs,
+  readSearchAttributes,
+  RunGateway,
+  runSchedules,
+  scheduledRunId,
+  scheduleRunIdAt,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
