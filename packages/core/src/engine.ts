@@ -121,6 +121,7 @@ import {
 } from './singleton-admission';
 import { SingletonGate } from './singleton-gate';
 import { DEFAULT_STALLED_AFTER_MS, type StalledRunInfo, findStalledRuns } from './stalled-runs';
+import { type TenantVerifier, resolveWireTenant } from './tenant-auth';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
 import {
@@ -493,6 +494,13 @@ export interface WorkflowEngineDeps {
    * plane: "ver tudo = ausência de namespace".
    */
   namespace?: string | undefined;
+  /**
+   * Verifies the signed tenant token a store-less tenant worker presents in the `tenant` field of a
+   * {@link StartRunMessage}, and DERIVES the run's namespace from it (see `hmacTenantVerifier`).
+   * A message whose token is rejected (or whose verifier throws) is dropped without creating a run.
+   * Absent: the wire `tenant` is trusted verbatim, as before.
+   */
+  verifyTenant?: TenantVerifier | undefined;
   /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */
   leaseMs?: number | undefined;
   /**
@@ -968,13 +976,30 @@ export class WorkflowEngine {
     // (control-plane) engine turns it into a durable run stamped with the tenant's namespace. Guarded
     // by the transport's `onStartRun` capability (like the other optional transport hooks) — a pool
     // whose transport can't carry the channel simply never registers, so a worker-only engine no-ops.
+    const verifyTenant = deps.verifyTenant;
     this.pool.onStartRun(async (message) => {
+      // The trust boundary of a tenant start: with a verifier, the wire `tenant` is a signed token and
+      // the namespace is DERIVED from it; a rejected (or throwing) verification creates nothing. The
+      // start channel has no reply, so a rejection is logged and the message acknowledged, never
+      // retried into a hot loop.
+      let tenant: string | null;
+      try {
+        tenant = await resolveWireTenant(message.tenant, verifyTenant);
+      } catch {
+        tenant = null;
+      }
+      if (tenant === null) {
+        console.warn(
+          `[nestjs-durable] dropped a start-run for "${message.workflow}": invalid or unauthorized tenant token`,
+        );
+        return;
+      }
       await this.start(
         message.workflow,
         message.input,
         message.runId ?? globalThis.crypto.randomUUID(),
         {
-          namespace: message.tenant,
+          namespace: tenant,
           tags: message.tags,
           searchAttributes: message.searchAttributes,
         },

@@ -249,6 +249,61 @@ the tenant from the token**, ignoring any `tenant` in the request body — defen
 
 </Steps>
 
+Both sides are optional and off by default. Turn the second layer on with `verifyTenant` on the
+control plane and `tenantToken` on each tenant pod:
+
+```ts
+import { hmacTenantVerifier, signTenantToken } from '@dudousxd/nestjs-durable';
+
+// Mint the token a tenant pod presents (once, e.g. in your provisioning script). The pod carries
+// only the token, never the secret. `ttlMs` makes it expire, so a captured token stops replaying:
+const token = signTenantToken('acme-corp', process.env.DURABLE_TENANT_SECRET!, { ttlMs: 86_400_000 });
+
+// Control plane: verify it. A secret LIST makes rotation a two-step deploy — verify with
+// [next, current] first, then re-mint tokens with `next` at leisure.
+DurableModule.forRoot({
+  topology: { role: 'control-plane' },
+  store,
+  transport,
+  verifyTenant: hmacTenantVerifier([process.env.DURABLE_TENANT_SECRET_NEXT!, process.env.DURABLE_TENANT_SECRET!]),
+});
+
+// Tenant pod: present it. A function is called before every request, so a short-lived token can be
+// re-minted or fetched from a secret store without a restart.
+DurableModule.forRoot({
+  topology: { role: 'tenant', tenant: 'acme-corp' },
+  connection: process.env.REDIS_URL,
+  tenantToken: process.env.DURABLE_TENANT_TOKEN!,   // or: () => fetchTenantToken()
+});
+```
+
+The token travels **in the existing `tenant` field** of every `RunRequest` and `StartRunMessage`, so
+the wire shape does not change. It is `<claim>.<base64url(HMAC-SHA256(secret, claim))>`, where the
+claim is the tenant name, optionally followed by `.exp<epochMs>` when minted with `ttlMs`. The live-tail
+channel stays keyed by the partition, never the token.
+
+With a verifier configured, the control plane:
+
+- answers a run request whose token is missing, tampered, expired or signed with another secret with
+  `{ ok: false, error: { message: 'invalid or unauthorized tenant token', code: 'unauthorized' } }`,
+  before any run is touched (`ProxyRunGateway` rejects with an `Error` whose `code` is `unauthorized`);
+- drops such a start-run without creating a run (logged; the start channel has no reply);
+- scopes every accepted request to the tenant **derived from the token**, never the wire claim;
+- turns a verifier that throws into an error reply, so the tenant never waits out its timeout.
+
+Bring your own verifier for asymmetric or issued tokens: `verifyTenant` is any
+`({ token, tenant }) => { tenant, capabilities? } | null` (sync or async).
+
+Without `verifyTenant` the wire `tenant` is trusted **verbatim** — any process with broker access can
+list, cancel and start runs as any tenant (prefix/network isolation only). An explicit
+`topology: { role: 'control-plane' }` without a verifier therefore logs a warning when its responder
+starts. A plain operator (no `topology`, role inferred from `store`) boots silently, because an app
+that never serves tenants has nothing to protect there.
+
+The scheme is byte-compatible with Agora (`@adonis-agora/durable`): a token minted by either side
+verifies on the other, and the `unauthorized` reply is identical. See
+[interop](/docs/cluster/interop#tenant-tokens-across-runtimes).
+
 The control plane is the **trust boundary** for these proxied requests: it forces `listRuns` to the
 requester's own tenant (no cross-tenant enumeration), validates `run.namespace === tenant` on every
 runId-bearing verb (anti-IDOR), and rejects unknown verbs and tampered tokens.

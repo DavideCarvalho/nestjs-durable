@@ -347,6 +347,8 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `concurrency` | `ConcurrencyOption` (`number \| 'adaptive' \| { mode: 'adaptive', ... }`) | `1` | Tasks a worker role's consumer runs concurrently per subscribed queue. Ignored for a plain operator. |
 | `concurrencyByHandler` | `Record<string, ConcurrencyOption>` | falls back to `concurrency` | Per-handler concurrency override — not yet wired through `runRedisWorker`. |
 | `runGatewayTimeoutMs` | `number` | `10000` | Timeout for a thin worker's `RunGateway` round-trip over `transport`. Ignored for an operator. |
+| `verifyTenant` | `TenantVerifier` | none = wire `tenant` trusted verbatim | **Operator.** Verifies the signed token a tenant presents in the wire `tenant` field of each run request and start-run, and derives the tenant from it. Invalid/absent tokens get an `unauthorized` reply (run requests) or create nothing (start-runs). Use `hmacTenantVerifier(secret \| secrets[])`. See [Layered tenant authentication](/docs/cluster/roles-and-config#layered-tenant-authentication). |
+| `tenantToken` | `string \| () => string \| Promise<string>` | none = raw `partition` is sent | **Tenant worker.** Signed token (from `signTenantToken`) presented in the `tenant` field of every proxied run request and `engine.start`. A function is called before every request. Live-tail stays keyed by the partition. |
 | `topology` | `{ role: 'control-plane' } \| { role: 'tenant'; tenant: string }` | none = existing inference | Explicit, VALIDATED role preset — see [Roles & config](/docs/cluster/roles-and-config#what-topology-validates). `'tenant'` maps `tenant` onto `partition` for you. |
 
 ## Run detail and fan types

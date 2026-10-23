@@ -42,6 +42,7 @@ export {
 export * from './search-attributes';
 export * from './search-attributes-schema';
 export type { StandardSchemaV1 } from './standard-schema';
+export * from './tenant-auth';
 export * from './tenant-group';
 export * from './tokens';
 export * from './workflow-handler';

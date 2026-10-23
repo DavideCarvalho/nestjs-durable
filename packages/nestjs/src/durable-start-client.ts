@@ -4,6 +4,7 @@ import {
   type StartOptions,
   type WorkflowClass,
   type WorkflowInputOf,
+  resolveTenantToken,
   workflowName,
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
@@ -48,7 +49,12 @@ export class DurableStartClient {
   ): Promise<RunResult> {
     const name = workflowName(workflow);
     await startRun(this.options.connection, {
-      tenant: this.tenant,
+      // The signed token (when configured) rides in the `tenant` field, as on every run request; an
+      // operator with `verifyTenant` derives the run's namespace from it.
+      tenant:
+        this.options.tenantToken !== undefined
+          ? await resolveTenantToken(this.options.tenantToken)
+          : this.tenant,
       workflow: name,
       input,
       runId,

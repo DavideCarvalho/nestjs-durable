@@ -50,14 +50,19 @@ export type {
   WorkflowHandler,
   RunSchedulesOptions,
   ScheduledWorkflow,
+  TenantTokenSource,
+  TenantVerifier,
+  VerifiedTenant,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 export {
+  hmacTenantVerifier,
   prevCronFireMs,
   readSearchAttributes,
   RunGateway,
   runSchedules,
   scheduledRunId,
   scheduleRunIdAt,
+  signTenantToken,
   WorkflowEngine,
 } from '@dudousxd/nestjs-durable-core';

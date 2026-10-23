@@ -15,6 +15,8 @@ import {
   type StateStore,
   TRANSPORT,
   TRANSPORT_CANONICAL,
+  type TenantTokenSource,
+  type TenantVerifier,
   type Transport,
   WorkflowEngine,
   type WorkflowRef,
@@ -477,6 +479,26 @@ export interface DurableModuleOptions {
    *  to 10_000ms inside `ProxyRunGateway`. Ignored for an operator (bound to `StoreRunGateway`). */
   runGatewayTimeoutMs?: number;
   /**
+   * **Operator.** Verifies the signed tenant token a store-less tenant worker presents in the wire
+   * `tenant` field of every run request and start-run message, and DERIVES the tenant from it,
+   * discarding the wire claim. An invalid, tampered or absent token is rejected: a run request gets
+   * an `unauthorized` error reply, a start-run creates nothing. Use `hmacTenantVerifier(secret)`
+   * (tokens minted by `signTenantToken`, wire-compatible with Agora) or supply your own.
+   *
+   * Optional. Absent: the wire `tenant` is trusted verbatim (prefix/network isolation only), exactly
+   * as before. An explicit `topology: { role: 'control-plane' }` without a verifier logs a warning
+   * at boot; a plain operator (`store` + `transport`, no `topology`) boots silently.
+   */
+  verifyTenant?: TenantVerifier;
+  /**
+   * **Tenant worker.** The signed token (see `signTenantToken`) this worker presents, verbatim, in
+   * the `tenant` field of every run request (`ProxyRunGateway`) and start-run (`engine.start`), so
+   * an operator with {@link verifyTenant} can authenticate it. A string, or a function called before
+   * every request (rotation, short-lived tokens). Optional: absent, the raw {@link partition} is
+   * sent, as before. Live-tail stays keyed by the partition, never the token.
+   */
+  tenantToken?: TenantTokenSource;
+  /**
    * An explicit preset that NAMES the deployment role instead of leaving it to `store`/`connection`
    * inference, and VALIDATES the axes that are otherwise only prose (see the interface doc's role
    * matrix, and {@link namespace} vs {@link partition}). Omit to keep the existing inference —
@@ -715,7 +737,15 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
         onRunRequest: onRunRequest.bind(this.transport),
         publishRunReply: publishRunReply.bind(this.transport),
       };
-      new RunRequestResponder(runRequestTransport, this.gateway).start();
+      new RunRequestResponder(runRequestTransport, this.gateway, {
+        verifyTenant: this.options.verifyTenant,
+        // Mirrors Agora's rule (`warnWithoutVerifier: role === 'control-plane'`): only a deployment
+        // that EXPLICITLY names itself the control plane is told it runs without tenant auth. A plain
+        // operator (role inferred from `store`) is Agora's `standalone`: anyone with broker access
+        // can already enqueue steps and results there, so the warning would be noise on every boot
+        // of an app that never serves tenants.
+        warnWithoutVerifier: this.options.topology?.role === 'control-plane',
+      }).start();
     }
 
     if (typeof publishTenantEvent === 'function') {
@@ -873,6 +903,7 @@ export class DurableModule {
               context,
               rehydrate: rehydrate || undefined,
               compensationRetries: options.compensationRetries,
+              verifyTenant: options.verifyTenant,
               // A non-driving (dashboard/API) operator must not run workflows: enqueue-only, leaving
               // each `pending` run in the store for a DRIVING instance's poll. A driving operator gets
               // the engine's default in-process dispatcher: for a body registered inline, it runs
@@ -923,6 +954,8 @@ export class DurableModule {
                   options.transport,
                   options.partition ?? 'default',
                   options.runGatewayTimeoutMs,
+                  undefined,
+                  options.tenantToken,
                 )
               : unavailableRunGateway();
           },
