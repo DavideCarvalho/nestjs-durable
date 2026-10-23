@@ -428,6 +428,15 @@ export interface StateStore {
    */
   saveCheckpoint(checkpoint: StepCheckpoint): Promise<void>;
   /**
+   * {@link saveCheckpoint} for many checkpoints in one call: each is written (inserted, or
+   * overwriting the row at its `(runId, seq)`), in a few statements and one transaction, so a
+   * rejection writes nothing. The entries name distinct rows. The engine writes a step fan's new
+   * `pending` checkpoints through it before dispatching them.
+   *
+   * Optional: a store that omits it gets one {@link saveCheckpoint} per checkpoint.
+   */
+  saveCheckpoints?(checkpoints: StepCheckpoint[]): Promise<void>;
+  /**
    * Overwrite the checkpoint at `(runId, seq)` with `checkpoint`, but only while the stored row is
    * still `pending`; resolves whether it wrote. The engine writes a dispatched step's row from two
    * places at once (a turn stamping its redispatch deadline, and the worker's result settling it),
@@ -1605,6 +1614,15 @@ export interface RunConsumerOptions extends RunQueueOptions {
 export interface Transport {
   /** engine → worker */
   dispatch(task: RemoteTask): Promise<void>;
+  /**
+   * {@link dispatch} for many tasks in a few broker calls. Rejects if any task may not have been
+   * dispatched (some may have been: the engine then dispatches the batch again one task at a time,
+   * and a task delivered twice runs twice, as any redelivery does). The engine sends a step fan's
+   * new steps through it.
+   *
+   * Optional: a transport that omits it gets one {@link dispatch} per task.
+   */
+  dispatchMany?(tasks: RemoteTask[]): Promise<void>;
   /** worker → engine: a step finished (ok or error). */
   onResult(handler: (result: StepResult) => Promise<void>): void;
   /** worker → engine: liveness signal for an in-flight long step. */

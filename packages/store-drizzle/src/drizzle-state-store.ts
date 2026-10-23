@@ -329,6 +329,27 @@ export class DrizzleStateStore implements StateStore {
       .onConflictDoUpdate({ target: [stepCheckpoints.runId, stepCheckpoints.seq], set: row });
   }
 
+  async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
+    if (checkpoints.length === 0) return;
+    // Keep the callback synchronous on better-sqlite3; libSQL returns promises from run. Chunks stay
+    // well under SQLite's bound-parameter limit (a checkpoint row binds ~20).
+    await this.db.transaction((tx) => {
+      const runFrom = (at: number): undefined | Promise<undefined> => {
+        if (at >= checkpoints.length) return undefined;
+        const done = tx
+          .insert(stepCheckpoints)
+          .values(checkpoints.slice(at, at + 100).map(toCheckpointRow))
+          .onConflictDoUpdate({
+            target: [stepCheckpoints.runId, stepCheckpoints.seq],
+            set: excludedSet(stepCheckpoints),
+          })
+          .run();
+        return done instanceof Promise ? done.then(() => runFrom(at + 100)) : runFrom(at + 100);
+      };
+      return runFrom(0);
+    });
+  }
+
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
     // One conditional UPDATE: the `status = 'pending'` predicate is the compare, the changed-row
     // count the answer, and a missing row matches nothing, so it is never created.
@@ -350,42 +371,59 @@ export class DrizzleStateStore implements StateStore {
 
   async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
     if (checkpoints.length === 0) return [];
-    const wrote: boolean[] = [];
-    // The conditional UPDATE of `saveCheckpointIfPending`, once per entry, in order, in one
-    // transaction. The callback stays synchronous on better-sqlite3; libSQL returns promises.
+    let wrote: boolean[] = [];
+    // In one transaction: read the batch's rows that are still `pending`, decide each entry in order
+    // against them (an entry that settles a row makes a later entry for it lose), then write each
+    // row's last winning entry with one upsert per chunk. SQLite runs one writing transaction at a
+    // time, so nothing settles a row between the read and the write. The callback stays synchronous
+    // on better-sqlite3; libSQL returns promises.
     await this.db.transaction((tx) => {
-      const update = (checkpoint: StepCheckpoint) => {
-        const { runId, seq, ...set } = toCheckpointRow(checkpoint);
-        return tx
-          .update(stepCheckpoints)
-          .set(set)
-          .where(
-            and(
-              eq(stepCheckpoints.runId, runId),
-              eq(stepCheckpoints.seq, seq),
-              eq(stepCheckpoints.status, 'pending'),
-            ),
-          )
-          .run();
-      };
-      const record = (result: unknown) => {
-        const { changes, rowsAffected } = result as { changes?: number; rowsAffected?: number };
-        wrote.push((changes ?? rowsAffected ?? 0) > 0);
-      };
-      const runFrom = (from: number): undefined | Promise<undefined> => {
-        for (let i = from; i < checkpoints.length; i += 1) {
-          const result = update(checkpoints[i] as StepCheckpoint);
-          if (result instanceof Promise) {
-            return result.then((r) => {
-              record(r);
-              return runFrom(i + 1);
-            });
-          }
-          record(result);
+      const pending = new Set<string>();
+      const steps: Array<() => unknown> = [];
+      for (const [runId, seqs] of seqsByRun(checkpoints)) {
+        for (let at = 0; at < seqs.length; at += 400) {
+          const chunk = seqs.slice(at, at + 400);
+          steps.push(() => {
+            const rows = tx
+              .select({ runId: stepCheckpoints.runId, seq: stepCheckpoints.seq })
+              .from(stepCheckpoints)
+              .where(
+                and(
+                  eq(stepCheckpoints.runId, runId),
+                  inArray(stepCheckpoints.seq, chunk),
+                  eq(stepCheckpoints.status, 'pending'),
+                ),
+              )
+              .all() as unknown;
+            const add = (found: { runId: string; seq: number }[]) => {
+              for (const row of found) pending.add(checkpointKey(row.runId, row.seq));
+            };
+            return rows instanceof Promise
+              ? rows.then(add)
+              : add(rows as { runId: string; seq: number }[]);
+          });
         }
-        return undefined;
-      };
-      return runFrom(0);
+      }
+      steps.push(() => {
+        const decided = decideIfPending(checkpoints, pending);
+        wrote = decided.wrote;
+        const writes: Array<() => unknown> = [];
+        for (let at = 0; at < decided.writes.length; at += 100) {
+          const chunk = decided.writes.slice(at, at + 100);
+          writes.push(() =>
+            tx
+              .insert(stepCheckpoints)
+              .values(chunk.map(toCheckpointRow))
+              .onConflictDoUpdate({
+                target: [stepCheckpoints.runId, stepCheckpoints.seq],
+                set: excludedSet(stepCheckpoints),
+              })
+              .run(),
+          );
+        }
+        return inSequence(writes);
+      });
+      return inSequence(steps);
     });
     return wrote;
   }
@@ -1332,6 +1370,53 @@ function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
  * The `ON CONFLICT DO UPDATE` set for a multi-row upsert: each column (or each of `only`) takes the
  * value the conflicting row proposed.
  */
+/** Run `steps` one after another, synchronously while each returns synchronously. */
+function inSequence(steps: Array<() => unknown>, from = 0): undefined | Promise<undefined> {
+  for (let i = from; i < steps.length; i += 1) {
+    const done = (steps[i] as () => unknown)();
+    if (done instanceof Promise) return done.then(() => inSequence(steps, i + 1));
+  }
+  return undefined;
+}
+
+/** `checkpoints`' distinct seqs, by run. */
+function seqsByRun(checkpoints: StepCheckpoint[]): Map<string, number[]> {
+  const byRun = new Map<string, Set<number>>();
+  for (const { runId, seq } of checkpoints) {
+    const seqs = byRun.get(runId) ?? new Set<number>();
+    seqs.add(seq);
+    byRun.set(runId, seqs);
+  }
+  return new Map([...byRun].map(([runId, seqs]) => [runId, [...seqs]]));
+}
+
+const checkpointKey = (runId: string, seq: number): string => `${runId}\u0000${seq}`;
+
+/**
+ * `saveCheckpointsIfPending`'s answers for `checkpoints` against the rows that were `pending` before
+ * the batch (`pending`, by {@link checkpointKey}), in order: an entry wins while its row is still
+ * pending, and an entry that is not `pending` itself settles the row. `writes` holds each row's
+ * last winning entry.
+ */
+function decideIfPending(
+  checkpoints: StepCheckpoint[],
+  pending: Set<string>,
+): { wrote: boolean[]; writes: StepCheckpoint[] } {
+  const wrote: boolean[] = [];
+  const writes = new Map<string, StepCheckpoint>();
+  for (const checkpoint of checkpoints) {
+    const key = checkpointKey(checkpoint.runId, checkpoint.seq);
+    if (!pending.has(key)) {
+      wrote.push(false);
+      continue;
+    }
+    wrote.push(true);
+    writes.set(key, checkpoint);
+    if (checkpoint.status !== 'pending') pending.delete(key);
+  }
+  return { wrote, writes: [...writes.values()] };
+}
+
 function excludedSet<T extends Table>(table: T, only?: string[]): Record<string, SQL> {
   return Object.fromEntries(
     Object.entries(getTableColumns(table))

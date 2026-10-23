@@ -18,13 +18,23 @@ export function makeMikroOrmStoreFactory(
   options: Options,
 ): () => Promise<StateStoreContext> {
   return async () => {
-    const orm = await init({ ...options, entities: [...ENTITIES], allowGlobalContext: true });
+    let statements = 0;
+    const orm = await init({
+      ...options,
+      entities: [...ENTITIES],
+      allowGlobalContext: true,
+      debug: ['query'],
+      logger: () => {
+        statements += 1;
+      },
+    });
     const store = new MikroOrmStateStore(orm);
     await store.ensureSchema();
     await truncateAll(orm);
     return {
       store,
       peerStore: new MikroOrmStateStore(orm),
+      statements: () => statements,
       cleanup: async () => {
         await truncateAll(orm);
         await orm.close(true);

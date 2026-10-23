@@ -37,6 +37,12 @@ export interface StateStoreContext {
    * a real engine) still asserts it, so this doesn't hide drift in the supported configurations.
    */
   supportsTagFilter?: boolean;
+  /**
+   * How many statements the store has sent to its database so far (from the driver's query log).
+   * When given, the contract checks that the batched checkpoint methods send a fixed number of them
+   * for a wide batch, not one per row.
+   */
+  statements?: () => number;
 }
 
 /** Builds a fresh, empty store for one test. Called once per `it` (in `beforeEach`). */
@@ -108,6 +114,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     let cleanup: (() => Promise<void>) | undefined;
     let supportsAsyncTransaction = true;
     let supportsTagFilter = true;
+    let statements: (() => number) | undefined;
     let skipReason: string | undefined;
     let loggedSkip = false;
 
@@ -119,6 +126,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         cleanup = ctx.cleanup;
         supportsAsyncTransaction = ctx.supportsAsyncTransaction ?? true;
         supportsTagFilter = ctx.supportsTagFilter ?? true;
+        statements = ctx.statements;
         skipReason = undefined;
       } catch (err) {
         // Backend unavailable (e.g. no Docker for a testcontainers spec): skip — don't fail. Unless
@@ -965,6 +973,81 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       );
       expect(wide.map((c) => c.seq)).toEqual(Array.from({ length: n }, (_, i) => 10 + i));
     });
+
+    t(
+      'saveCheckpoints writes many checkpoints at once, inserting or overwriting each',
+      async () => {
+        // Optional on the interface (the engine falls back to one saveCheckpoint per row), but a
+        // conformant store MUST provide it.
+        expect(store.saveCheckpoints).toBeDefined();
+        if (!store.saveCheckpoints) return;
+        await store.saveCheckpoints([]);
+        await store.createRun(run());
+        await store.saveCheckpoint(checkpoint({ seq: 1, stepId: 'r1:1', output: { old: true } }));
+        await store.saveCheckpoints([
+          checkpoint({
+            seq: 0,
+            stepId: 'r1:0',
+            status: 'pending',
+            output: undefined,
+            wakeAt: 4_000,
+          }),
+          checkpoint({ seq: 1, stepId: 'r1:1', output: { new: true }, parallelGroup: 'g' }),
+          checkpoint({ seq: 2, stepId: 'r1:2', input: { i: 2 }, workerGroup: 'w' }),
+        ]);
+        const rows = await store.listCheckpoints('r1');
+        expect(rows.map((c) => [c.seq, c.status, c.output])).toEqual([
+          [0, 'pending', undefined],
+          [1, 'completed', { new: true }],
+          [2, 'completed', { ok: true }],
+        ]);
+        expect(rows[0]?.wakeAt).toBe(4_000);
+        expect(rows[1]?.parallelGroup).toBe('g');
+        expect(rows[2]?.input).toEqual({ i: 2 });
+        expect(rows[2]?.workerGroup).toBe('w');
+      },
+    );
+
+    t(
+      'the batched checkpoint methods send a fixed number of statements for a wide batch',
+      async () => {
+        if (!statements || !store.saveCheckpoints || !store.saveCheckpointsIfPending) return;
+        if (!store.getCheckpoints) return;
+        await store.createRun(run());
+        const n = 600;
+        // A few statements per chunk of rows (a driver may split a multi-row insert to fit its
+        // parameter limit), never one per row.
+        const limit = n / 20;
+        const rows = Array.from({ length: n }, (_, seq) =>
+          checkpoint({ seq, stepId: `r1:${seq}`, status: 'pending', output: undefined }),
+        );
+        const sent = async (work: () => Promise<unknown>): Promise<number> => {
+          const before = (statements as () => number)();
+          await work();
+          return (statements as () => number)() - before;
+        };
+        expect(
+          await sent(() => store.saveCheckpoints?.(rows) as Promise<void>),
+        ).toBeLessThanOrEqual(limit);
+        const seqs = rows.map((r) => r.seq);
+        expect(
+          await sent(() => store.getCheckpoints?.('r1', seqs) as Promise<unknown>),
+        ).toBeLessThanOrEqual(limit);
+        const settled = rows.map((row) => ({
+          ...row,
+          status: 'completed' as const,
+          output: { seq: row.seq },
+        }));
+        let wrote: boolean[] = [];
+        expect(
+          await sent(async () => {
+            wrote = (await store.saveCheckpointsIfPending?.(settled)) ?? [];
+          }),
+        ).toBeLessThanOrEqual(limit);
+        expect(wrote.every((w) => w)).toBe(true);
+        expect(await store.countCheckpoints?.('r1', 0, n - 1, ['completed'])).toBe(n);
+      },
+    );
 
     t('saveCheckpointsIfPending writes a wide batch', async () => {
       if (!store.saveCheckpointsIfPending) return;

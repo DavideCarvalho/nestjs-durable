@@ -14,7 +14,23 @@ export function makeTypeOrmStoreFactory(
   options: DataSourceOptions,
 ): () => Promise<StateStoreContext> {
   return async () => {
-    const dataSource = new DataSource({ ...options, entities: [...ENTITIES] });
+    let statements = 0;
+    const count = () => {
+      statements += 1;
+    };
+    const dataSource = new DataSource({
+      ...options,
+      entities: [...ENTITIES],
+      logging: ['query'],
+      logger: {
+        logQuery: count,
+        logQueryError: () => undefined,
+        logQuerySlow: () => undefined,
+        logSchemaBuild: () => undefined,
+        logMigration: () => undefined,
+        log: () => undefined,
+      },
+    });
     await dataSource.initialize();
     const store = new TypeOrmStateStore(dataSource);
     await store.ensureSchema();
@@ -23,6 +39,7 @@ export function makeTypeOrmStoreFactory(
     return {
       store,
       peerStore: new TypeOrmStateStore(dataSource),
+      statements: () => statements,
       cleanup: async () => {
         await truncateAll(dataSource);
         await dataSource.destroy();

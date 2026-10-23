@@ -37,6 +37,11 @@ export interface StepFanResultsContractOptions {
    * hands the engine one result at a time settles a fan in one write and one barrier read each.
    */
   minBatch?: number;
+  /**
+   * Whether the transport sends many tasks at once (`dispatchMany`). Default true: the contract
+   * then checks that a fan's steps are dispatched through it, never one `dispatch` per step.
+   */
+  bulkDispatch?: boolean;
 }
 
 const doubleLine = (() => {}) as unknown as StepRef<{ i: number }, number>;
@@ -69,10 +74,19 @@ function counted(inner: StateStore, counts: Counts): StateStore {
   });
 }
 
-/** `transport`, handing each result to the engine only once `gate` resolved. */
-function behind(transport: Transport, gate: Promise<void>): Transport {
+/**
+ * `transport`, handing each result to the engine only once `gate` resolved, and counting its
+ * `dispatch` calls in `dispatched`.
+ */
+function behind(transport: Transport, gate: Promise<void>, dispatched: { one: number }): Transport {
   return new Proxy(transport, {
     get(target, prop, receiver) {
+      if (prop === 'dispatch') {
+        return (...args: Parameters<Transport['dispatch']>) => {
+          dispatched.one += 1;
+          return target.dispatch(...args);
+        };
+      }
       if (prop === 'onResult') {
         return (handler: (result: StepResult) => Promise<void>) =>
           target.onResult(async (result) => {
@@ -117,6 +131,7 @@ export function runStepFanResultsContract(
   const timeoutMs = options.timeoutMs ?? 60_000;
   const fanSize = options.fanSize ?? 2000;
   const minBatch = options.minBatch ?? 8;
+  const bulkDispatch = options.bulkDispatch ?? true;
 
   describe(`Step fan results contract: ${name}`, () => {
     for (const { form, settle, waves } of FORMS) {
@@ -146,7 +161,11 @@ export function runStepFanResultsContract(
             if (failing.has(i)) throw Object.assign(new Error(`bad ${i}`), { retryable: false });
             return i * 2;
           });
-          const transports = opened.map((t) => behind(t, backlog));
+          const dispatched = { one: 0 };
+          const transports = opened.map((t) => behind(t, backlog, dispatched));
+          if (bulkDispatch) {
+            for (const t of opened) expect(t.dispatchMany).toBeTypeOf('function');
+          }
           const inner = new InMemoryStateStore();
           const counts: Counts = { calls: new Map(), batches: [] };
           let turns = 0;
@@ -190,6 +209,7 @@ export function runStepFanResultsContract(
             expect([...settled.values()].every((n) => n === 1)).toBe(true);
             const barrierReads = counts.calls.get('countCheckpoints') ?? 0;
             expect(Math.max(...counts.batches)).toBeGreaterThanOrEqual(minBatch);
+            if (bulkDispatch) expect(dispatched.one).toBe(0);
             if (waves === 1) expect(barrierReads).toBeLessThanOrEqual(size / minBatch);
             // The dispatching turn and one per settled wave, plus a spare per wave when both
             // instances see its barrier open at once, plus one per batch holding a failure.

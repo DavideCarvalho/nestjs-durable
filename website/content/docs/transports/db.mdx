@@ -135,6 +135,8 @@ while it still owns it:
    already waiting for the same `step_id` (an earlier attempt's) is replaced and its claim cleared
    (`ON CONFLICT … DO UPDATE` / `ON DUPLICATE KEY UPDATE`), so a retry's result is never dropped.
 
+A step fan's tasks are inserted 200 rows per statement.
+
 The engine side mirrors it on the results table: claim a round of up to 256 rows (with a token) →
 hand them all to the engine at once → `DELETE … WHERE claimed_by = <token> AND step_id IN (…)` for the
 ones it settled. The next round is claimed while one runs, up to 512 results in flight per instance,

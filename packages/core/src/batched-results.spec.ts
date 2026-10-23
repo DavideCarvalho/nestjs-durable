@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
 import { GatherError } from './errors';
-import type { RemoteTask, StateStore, StepCheckpoint, StepResult, Transport } from './interfaces';
+import type {
+  RemoteTask,
+  StateStore,
+  StepCheckpoint,
+  StepResult,
+  Transport,
+  WorkflowRun,
+} from './interfaces';
 import { DURABLE_STEP_NAME, type StepRef } from './step-name-symbol';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
@@ -398,6 +405,99 @@ describe('batched step results', () => {
     await transport.deliver(ok(first));
     await until(async () => (await store.getRun('p'))?.status === 'completed');
   });
+
+  it('a turn that runs while a fan is out costs a fixed number of store calls, not one per step', async () => {
+    const { store, calls } = counting(new InMemoryStateStore());
+    const { transport, engine, register, turns } = setup(store);
+    register(async (ctx) => ctx.all(processLine, lines(2_000)));
+    await engine.start('fan', {}, 'p');
+    await until(() => transport.dispatched.length === 2_000);
+    await until(async () => (await store.getRun('p'))?.status === 'suspended');
+    calls.clear();
+    await engine.resume('p');
+    expect(turns()).toBe(2);
+    expect((await store.getRun('p'))?.status).toBe('suspended');
+    expect(calls.get('getCheckpoint') ?? 0).toBe(0);
+    const total = [...calls.values()].reduce((a, b) => a + b, 0);
+    expect(total).toBeLessThanOrEqual(12);
+  });
+
+  it('two instances that see a wave settle at once run one turn for it, not two', async () => {
+    // Both instances' barrier reads wait for each other, so both see the wave settled and both
+    // resume the run. The one that gets the lease parks the run only once the other has kept its
+    // wake and looked at the run, as it does when its turn outlasts a couple of store round-trips.
+    class RacingStore extends InMemoryStateStore {
+      counting = false;
+      private counted: (() => void)[] = [];
+      private looked?: () => void;
+      private holdSuspend?: Promise<void>;
+      async countCheckpoints(
+        runId: string,
+        from: number,
+        to: number,
+        statuses: StepCheckpoint['status'][],
+      ): Promise<number> {
+        if (this.counting) {
+          await new Promise<void>((resolve) => {
+            this.counted.push(resolve);
+            if (this.counted.length === 2) {
+              this.counting = false;
+              this.holdSuspend = new Promise<void>((looked) => {
+                this.looked = looked;
+                setTimeout(looked, 1_000);
+              });
+              for (const release of this.counted.splice(0)) release();
+            }
+          });
+        }
+        return super.countCheckpoints(runId, from, to, statuses);
+      }
+      async bufferSignal(token: string, payload: unknown): Promise<void> {
+        await super.bufferSignal(token, payload);
+        // Time for the instance that kept the wake to look at the run.
+        if (token.startsWith('durable:wake-after-turn:')) setTimeout(() => this.looked?.(), 20);
+      }
+      async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+        if (patch.status === 'suspended' && this.holdSuspend) {
+          const hold = this.holdSuspend;
+          this.holdSuspend = undefined;
+          await hold;
+        }
+        return super.updateRun(runId, patch);
+      }
+    }
+    const store = new RacingStore();
+    const onA = new HeldTransport();
+    const onB = new HeldTransport();
+    let turns = 0;
+    const engines = [onA, onB].map((transport) => {
+      const engine = new WorkflowEngine({ store, transport, reconcileMs: 0 });
+      engine.register('fan', '1', async (ctx) => {
+        turns += 1;
+        return ctx.all(processLine, lines(20), { concurrency: 10 });
+      });
+      return engine;
+    });
+    await (engines[0] as WorkflowEngine).start('fan', {}, 'p');
+    const dispatched = () => onA.dispatched.length + onB.dispatched.length;
+    const take = () => [...onA.take(), ...onB.take()];
+    await until(() => dispatched() === 10);
+    await until(async () => (await store.getRun('p'))?.status === 'suspended');
+    // The first wave: half its results to each instance, each in one batch.
+    store.counting = true;
+    const first = take();
+    await Promise.all(first.map((t, i) => (i % 2 ? onA : onB).deliver(ok(t))));
+    await until(() => dispatched() === 10);
+    await until(async () => (await store.getRun('p'))?.status === 'suspended');
+    // Past the re-check of the wake the second instance kept.
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(turns).toBe(2);
+    await Promise.all(take().map((t) => onA.deliver(ok(t))));
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+    expect((await store.getRun('p'))?.output).toEqual(lines(20).map(({ i }) => i * 10));
+    // The dispatching turn, then one per settled wave.
+    expect(turns).toBe(3);
+  }, 15_000);
 
   it('two instances settling halves of a fan each settle every step once and complete it', async () => {
     for (let round = 0; round < 5; round += 1) {

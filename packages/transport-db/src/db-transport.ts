@@ -50,6 +50,9 @@ function isDeadlock(err: unknown): boolean {
   return codes.some((c) => c === 'ER_LOCK_DEADLOCK' || c === 1213 || c === '40P01');
 }
 
+/** Most task rows one {@link DbTransport.dispatchMany} insert writes. */
+const TASKS_INSERT_CHUNK = 200;
+
 /** Most run rows one consumer poll claims. */
 const RUNS_CLAIM_MAX = 50;
 
@@ -295,12 +298,14 @@ export class DbTransport implements Transport {
 
   // ── engine → worker ────────────────────────────────────────────────────────────────────────
   async dispatch(task: RemoteTask): Promise<void> {
+    await this.dispatchMany([task]);
+  }
+
+  /** {@link dispatch} for many tasks: one multi-row insert per {@link TASKS_INSERT_CHUNK} tasks. */
+  async dispatchMany(tasks: RemoteTask[]): Promise<void> {
+    if (tasks.length === 0) return;
     await this.ensureSchema();
     const t = this.q(this.tasksTable);
-    // Idempotent: a redelivered dispatch for the same step_id is ignored (the row already exists).
-    const ignore = this.isPg
-      ? `INSERT INTO ${t} (...) ON CONFLICT (${this.q('step_id')}) DO NOTHING`
-      : `INSERT IGNORE INTO ${t} (...)`;
     const cols = [
       'step_id',
       'run_id',
@@ -312,21 +317,32 @@ export class DbTransport implements Transport {
       'status',
       'created_at',
     ];
-    const sql = ignore.replace(
-      '(...)',
-      `(${cols.map((c) => this.q(c)).join(', ')}) VALUES (${cols.map((_, i) => this.ph(i + 1)).join(', ')})`,
-    );
-    await this.exec.query(sql, [
-      task.stepId,
-      task.runId,
-      task.seq,
-      task.name,
-      task.group,
-      JSON.stringify(task.input ?? null),
-      task.attempt,
-      'pending',
-      this.now(),
-    ]);
+    for (let at = 0; at < tasks.length; at += TASKS_INSERT_CHUNK) {
+      const chunk = tasks.slice(at, at + TASKS_INSERT_CHUNK);
+      const values = chunk
+        .map((_, r) => `(${cols.map((__, c) => this.ph(r * cols.length + c + 1)).join(', ')})`)
+        .join(', ');
+      const into = `${t} (${cols.map((c) => this.q(c)).join(', ')}) VALUES ${values}`;
+      // Idempotent: a redelivered dispatch for the same step_id is ignored (the row already exists).
+      const sql = this.isPg
+        ? `INSERT INTO ${into} ON CONFLICT (${this.q('step_id')}) DO NOTHING`
+        : `INSERT IGNORE INTO ${into}`;
+      const now = this.now();
+      await this.exec.query(
+        sql,
+        chunk.flatMap((task) => [
+          task.stepId,
+          task.runId,
+          task.seq,
+          task.name,
+          task.group,
+          JSON.stringify(task.input ?? null),
+          task.attempt,
+          'pending',
+          now,
+        ]),
+      );
+    }
   }
 
   // ── worker → engine ────────────────────────────────────────────────────────────────────────

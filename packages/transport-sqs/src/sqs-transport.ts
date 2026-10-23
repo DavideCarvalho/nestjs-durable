@@ -125,6 +125,9 @@ const RESULT_VISIBILITY_SEC = 30;
  */
 const RESULT_RECEIVERS = 8;
 
+/** `SendMessageBatch` calls {@link SqsTransport.dispatchMany} has in flight at once. */
+const TASK_BATCHES_IN_FLIGHT = 10;
+
 /**
  * An SQS-backed `Transport` — dispatch remote steps over Amazon SQS (or ElasticMQ). Unlike the
  * BullMQ transport, it does **not** mint its own queue names: pass `taskQueueUrl` / `resultsQueueUrl`
@@ -434,6 +437,49 @@ export class SqsTransport implements Transport {
           : undefined,
       }),
     );
+  }
+
+  /**
+   * {@link dispatch} for many tasks: ten per `SendMessageBatch`, a few batches at a time. Throws if
+   * any entry failed (the engine then dispatches the batch again one task at a time).
+   */
+  async dispatchMany(tasks: RemoteTask[]): Promise<void> {
+    const byGroup = new Map<string, RemoteTask[]>();
+    for (const task of tasks) {
+      const grouped = byGroup.get(task.group);
+      if (grouped) grouped.push(task);
+      else byGroup.set(task.group, [task]);
+    }
+    for (const [group, grouped] of byGroup) {
+      const QueueUrl = await this.tasksUrl(group);
+      const batches: RemoteTask[][] = [];
+      for (let at = 0; at < grouped.length; at += SQS_BATCH_MAX) {
+        batches.push(grouped.slice(at, at + SQS_BATCH_MAX));
+      }
+      for (let at = 0; at < batches.length; at += TASK_BATCHES_IN_FLIGHT) {
+        await Promise.all(
+          batches.slice(at, at + TASK_BATCHES_IN_FLIGHT).map(async (batch) => {
+            const out = await this.client.send(
+              new SendMessageBatchCommand({
+                QueueUrl,
+                Entries: batch.map((task, i) => ({
+                  Id: String(i),
+                  MessageBody: JSON.stringify(task),
+                  MessageAttributes: this.marker
+                    ? { [this.marker]: { DataType: 'String', StringValue: '1' } }
+                    : undefined,
+                })),
+              }),
+            );
+            if (out.Failed && out.Failed.length > 0) {
+              throw new Error(
+                `SQS refused ${out.Failed.length} task(s): ${out.Failed.map((f) => f.Message ?? f.Code).join('; ')}`,
+              );
+            }
+          }),
+        );
+      }
+    }
   }
 
   // ── worker → engine ────────────────────────────────────────────────────────────────────────

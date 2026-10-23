@@ -108,6 +108,8 @@ const SUBSCRIBER_PING_TIMEOUT_MS = 5_000;
 const DEFAULT_KEEPALIVE_MS = 10_000;
 /** Most run jobs one `addBulk` of {@link BullMQTransport.dispatchRuns} writes. */
 export const RUNS_BULK_CHUNK = 500;
+/** `addBulk` calls {@link BullMQTransport.dispatchMany} has in flight at once. */
+const TASK_BULKS_IN_FLIGHT = 4;
 
 /**
  * The job id of a run's `start` for one pending state: `start-<runId>-<key>`, with `%` and `:`
@@ -671,7 +673,45 @@ export class BullMQTransport implements Transport, ControlPlane {
    *  partition)`), computed upstream by the engine — this targets that handler's dedicated queue. */
   async dispatch(task: RemoteTask): Promise<void> {
     this.#assertRoutableToken(task.group);
-    await this.queue(this.tasksName(task.group)).add('task', task, {
+    await this.queue(this.tasksName(task.group)).add('task', task, this.taskJobOptions(task));
+  }
+
+  /**
+   * {@link dispatch} for many tasks: `addBulk` calls of {@link RUNS_BULK_CHUNK} jobs per queue, a
+   * few of them in flight at once.
+   */
+  async dispatchMany(tasks: RemoteTask[]): Promise<void> {
+    const byGroup = new Map<string, RemoteTask[]>();
+    for (const task of tasks) {
+      this.#assertRoutableToken(task.group);
+      const grouped = byGroup.get(task.group);
+      if (grouped) grouped.push(task);
+      else byGroup.set(task.group, [task]);
+    }
+    for (const [group, grouped] of byGroup) {
+      const queue = this.queue(this.tasksName(group));
+      const chunks: RemoteTask[][] = [];
+      for (let at = 0; at < grouped.length; at += RUNS_BULK_CHUNK) {
+        chunks.push(grouped.slice(at, at + RUNS_BULK_CHUNK));
+      }
+      for (let at = 0; at < chunks.length; at += TASK_BULKS_IN_FLIGHT) {
+        await Promise.all(
+          chunks.slice(at, at + TASK_BULKS_IN_FLIGHT).map((chunk) =>
+            queue.addBulk(
+              chunk.map((task) => ({
+                name: 'task',
+                data: task,
+                opts: this.taskJobOptions(task),
+              })),
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  private taskJobOptions(task: RemoteTask) {
+    return {
       ...this.jobOptions(task.priority),
       // Retain a FAILED task job's payload (age-bounded) instead of deleting it. A worker that
       // crashes/stalls has its job failed by a PEER worker's stalled-check, and BullMQ's
@@ -680,7 +720,7 @@ export class BullMQTransport implements Transport, ControlPlane {
       // StepResult from. Keeping it briefly lets the bridge settle the run's `pending` checkpoint
       // (and doubles as failure forensics); BullMQ GCs it after the window.
       removeOnFail: { age: TASK_FAILED_RETENTION_SECONDS },
-    });
+    };
   }
 
   private decisionsName(): string {

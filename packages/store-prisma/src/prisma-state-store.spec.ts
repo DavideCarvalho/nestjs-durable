@@ -24,6 +24,7 @@ vi.setConfig({ testTimeout: 30_000 });
 // second PrismaClient against the same file would lock (P1008), so the contract and the per-store
 // tests below both use this one.
 let sharedPrisma: any;
+let prismaStatements = 0;
 let prismaReady: Promise<boolean> | undefined;
 
 async function prismaContractSetup(): Promise<boolean> {
@@ -37,6 +38,9 @@ async function prismaContractSetup(): Promise<boolean> {
         const { PrismaClient } = await import('../generated/client/index.js');
         // Query logging lets the per-store pushdown test below capture the executed SQL.
         sharedPrisma = new PrismaClient({ log: [{ emit: 'event', level: 'query' }] });
+        sharedPrisma.$on('query', () => {
+          prismaStatements += 1;
+        });
         await sharedPrisma.$connect();
         // SQLite reliability: under the engine's end-to-end write bursts (createRun → saveCheckpoint
         // → updateRun → resume), the default rollback-journal mode does an fsync-heavy journal
@@ -74,6 +78,7 @@ runStateStoreContract('Prisma (SQLite)', async () => {
     // `listRuns({ tag })` uses Prisma's `array_contains`, which Prisma supports on its real targets
     // (Postgres/MySQL) but NOT on SQLite, the adapter's test DB only. Skipped here; asserted elsewhere.
     supportsTagFilter: false,
+    statements: () => prismaStatements,
     cleanup: async () => undefined,
   };
 });
