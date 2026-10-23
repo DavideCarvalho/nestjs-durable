@@ -236,7 +236,10 @@ describe('ProxyRunGateway tenant token', () => {
     try {
       const tx = proxyTransport();
       let release: (token: string) => void = () => {};
-      const slowToken = () => new Promise<string>((r) => (release = r));
+      const slowToken = () =>
+        new Promise<string>((r) => {
+          release = r;
+        });
       const gw = new ProxyRunGateway(tx, 'acme', 100, undefined, slowToken);
       let settled: string | undefined;
       void gw.listRuns({}).then(
