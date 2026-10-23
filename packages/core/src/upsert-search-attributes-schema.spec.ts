@@ -69,8 +69,13 @@ describe('ctx.upsertSearchAttributes — @Workflow({ searchAttributes }) schema 
     const result = await startRun(engine, 'checkout', {}, 'r2');
 
     expect(result.status).toBe('failed');
-    expect(result.error?.message).toContain('checkout');
-    expect(result.error?.message).toContain('amount');
+    expect(result.error?.message).toMatch(
+      /^invalid workflow "checkout" ctx\.upsertSearchAttributes: amount: /,
+    );
+    expect(result.error).toMatchObject({
+      code: 'schema_validation',
+      details: { issues: [expect.objectContaining({ path: ['amount'] })] },
+    });
     expect((await store.getRun('r2'))?.searchAttributes).toBeUndefined();
   });
 

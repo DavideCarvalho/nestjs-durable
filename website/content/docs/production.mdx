@@ -785,8 +785,9 @@ the body the same way on every turn. Two rules follow:
 
 **Validate the output.** `output` takes the same forms. The value `run()` returns is parsed before the
 run completes, and the parsed value is stored as the run's output; a mismatch fails the run with
-`code: 'invalid_output'`. Both codes come from a `FatalError` (never retried) whose `details` carry the
-schema's issues, so an alert or an [`onError` route](/docs/reliability/on-error) can match them.
+`code: 'invalid_output'`. Both come from a `SchemaValidationError`, a `FatalError` (never retried)
+whose `issues` and `details.issues` list `{ message, path }` for every issue, so an alert or an
+[`onError` route](/docs/reliability/on-error) can match them.
 
 For a rule a schema can't express (a cross-field invariant, an async lookup) add `validateInput` — a plain
 `(input) => void | Promise<void>` that throws to reject. It runs at `start` after `input` parses, and

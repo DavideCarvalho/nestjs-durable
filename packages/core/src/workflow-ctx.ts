@@ -11,6 +11,7 @@ import {
   type GatherItemFailure,
   NestedWorkflowCallError,
   NonDeterminismError,
+  SchemaValidationError,
   SignalTimeoutError,
   WorkflowSuspended,
 } from './errors';
@@ -63,18 +64,6 @@ const FOLD_MIN_FAN = 100;
 
 function normalizeChildOptions(options?: string | ChildCallOptions): ChildCallOptions {
   return typeof options === 'string' ? { childId: options } : (options ?? {});
-}
-
-/** Render a Standard Schema issue `path` (a mix of raw keys and `{ key }` segments) as a dotted
- *  string, for a `searchAttributes` validation error — `['amount']` → `'amount'`, `[]`/`undefined` →
- *  `'(root)'` (the merged object itself failed, not one of its keys). */
-function formatIssuePath(
-  path: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> | undefined,
-): string {
-  if (!path || path.length === 0) return '(root)';
-  return path
-    .map((segment) => String(typeof segment === 'object' ? segment.key : segment))
-    .join('.');
 }
 
 /**
@@ -1270,15 +1259,9 @@ export function createWorkflowCtx(
         );
       }
       if (result.issues) {
-        const offendingKeys = [
-          ...new Set(result.issues.map((issue) => formatIssuePath(issue.path))),
-        ];
-        const details = result.issues
-          .map((issue) => `${formatIssuePath(issue.path)}: ${issue.message}`)
-          .join('; ');
-        throw new Error(
-          `workflow "${workflow}": ctx.upsertSearchAttributes rejected by its searchAttributes schema — ` +
-            `offending key(s) ${offendingKeys.join(', ')} — ${details}`,
+        throw new SchemaValidationError(
+          `workflow "${workflow}" ctx.upsertSearchAttributes`,
+          result.issues,
         );
       }
     }

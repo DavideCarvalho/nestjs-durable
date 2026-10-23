@@ -2201,8 +2201,8 @@ export interface WorkflowCtx<A extends SearchAttributes = SearchAttributes> {
    *
    * When the workflow declares a `@Workflow({ searchAttributes })` schema, the MERGED result (this
    * run's existing `searchAttributes` shallow-merged with `attrs`) is validated against it before the
-   * write — an invalid merge throws, naming the workflow, the offending key(s), and the schema's
-   * issues. Validation runs once, on the same first-run-only position as the write itself (skipped
+   * write — an invalid merge throws a `SchemaValidationError` (code `schema_validation`, never
+   * retried) naming the workflow, with the schema's issues. Validation runs once, on the same first-run-only position as the write itself (skipped
    * entirely on replay, so it's never a source of nondeterminism); it must be synchronous — a schema
    * whose `validate` returns a `Promise` throws instead of being awaited. No schema declared ⇒
    * unchanged, unvalidated behavior.
