@@ -1,5 +1,15 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.84.1
+
+### Patch Changes
+
+- [#416](https://github.com/DavideCarvalho/nestjs-durable/pull/416) [`f0332dc`](https://github.com/DavideCarvalho/nestjs-durable/commit/f0332dcc095bd5fd77507e872a6ddb6e4991d986) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Tenant tokens, follow-ups to `verifyTenant`:
+
+  - `ProxyRunGateway` rejects with an exported `RunGatewayError` whose `code` is typed (`unauthorized`, `cross-tenant`, ...). It used to be a plain `Error` with an untyped `code`.
+  - With a `tenantToken` provider, the request timeout now starts once the token has resolved, so a slow provider no longer eats into the control plane's deadline. A provider that rejects fails the request.
+  - Documented that `VerifiedTenant.capabilities` is carried but not enforced by the responder yet.
+
 ## 0.84.0
 
 ### Minor Changes
