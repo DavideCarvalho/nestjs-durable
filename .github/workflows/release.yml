@@ -20,9 +20,10 @@ on:
 concurrency: release-${{ github.ref }}
 
 jobs:
-  # Gate: the same jobs as ci.yml, run on the exact commit being released -- a published
-  # version is effectively unrecallable, so the PR's CI on an older base is not enough. The
-  # version/publish job below needs all of them.
+  # Gate: ci.yml's npm-side jobs (build, real-backends), run on the exact commit being released --
+  # a published version is effectively unrecallable, so the PR's CI on an older base is not
+  # enough. ci.yml's python-client job is left out on purpose: clients/python ships to PyPI via
+  # release-python.yml, not from here. The version/publish job below needs these jobs.
   build:
     runs-on: ubuntu-latest
     steps:
