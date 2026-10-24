@@ -19,7 +19,7 @@ import {
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
 } from '../interfaces';
-import type { AttributeFilter, OwnedLeaseReclaim } from '../interfaces';
+import type { AttributeFilter, BufferedSignalRow, OwnedLeaseReclaim } from '../interfaces';
 import { checkpointStatsOf, queryCheckpointsOf } from '../run-detail-store';
 import { mergeRunFacetRows } from '../run-facets';
 import { RUN_VALUE_FACET_SCAN, runValueFacetsFromRuns } from '../run-value-facets';
@@ -380,18 +380,42 @@ export class InMemoryStateStore implements StateStore {
     return work({ raw: this, saveCheckpoint: (cp) => this.saveCheckpoint(cp) });
   }
 
-  private readonly bufferedSignals = new Map<string, unknown[]>();
+  private readonly bufferedSignals = new Map<string, Array<{ id: number; payload: unknown }>>();
+  private bufferedSignalSeq = 0;
   async bufferSignal(token: string, payload: unknown): Promise<void> {
     const queue = this.bufferedSignals.get(token) ?? [];
-    queue.push(payload);
+    queue.push({ id: ++this.bufferedSignalSeq, payload });
     this.bufferedSignals.set(token, queue);
   }
   async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
     const queue = this.bufferedSignals.get(token);
     if (!queue || queue.length === 0) return null;
-    const payload = queue.shift();
+    const head = queue.shift() as { payload: unknown };
     if (queue.length === 0) this.bufferedSignals.delete(token);
-    return { payload };
+    return { payload: head.payload };
+  }
+  async listBufferedSignals(
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<BufferedSignalRow[]> {
+    const after = afterId === undefined ? 0 : Number(afterId);
+    const rows: BufferedSignalRow[] = [];
+    for (const [token, queue] of this.bufferedSignals) {
+      if (!token.startsWith(tokenPrefix)) continue;
+      for (const { id, payload } of queue) {
+        if (id > after) rows.push({ id: String(id), token, payload });
+      }
+    }
+    return rows.sort((a, b) => Number(a.id) - Number(b.id)).slice(0, limit);
+  }
+  async deleteBufferedSignals(ids: string[]): Promise<void> {
+    const doomed = new Set(ids.map(Number));
+    for (const [token, queue] of this.bufferedSignals) {
+      const kept = queue.filter((row) => !doomed.has(row.id));
+      if (kept.length === 0) this.bufferedSignals.delete(token);
+      else this.bufferedSignals.set(token, kept);
+    }
   }
 
   /** `id -> row`, so {@link removeBufferedEvent} can delete an exact row regardless of iteration

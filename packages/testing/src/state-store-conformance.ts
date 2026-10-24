@@ -517,6 +517,38 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await ids()).toEqual(['attr-other', 'chatty-old']);
     });
 
+    t('a parent joining children that already finished settles them from their rows', async () => {
+      const engine = new WorkflowEngine({ store, reconcileMs: 0 });
+      engine.register('j-child', '1', async (_ctx, input) => ({ n: (input as { n: number }).n }));
+      engine.register('j-parent', '1', async (ctx) => {
+        const lone = await ctx.child('j-child', { n: 9 }, 'j-own-id');
+        const fan = await ctx.allSettled('j-child', [{ n: 0 }, { n: 1 }]);
+        return { lone, fan };
+      });
+      // Both finish before the parent exists: their notifications find no waiter.
+      await engine.start('j-child', { n: 9 }, 'j-own-id');
+      await engine.start('j-child', { n: 1 }, 'jp.all.1.1');
+      expect((await engine.waitForRun('j-own-id', { timeoutMs: 20_000 })).status).toBe('completed');
+      expect((await engine.waitForRun('jp.all.1.1', { timeoutMs: 20_000 })).status).toBe(
+        'completed',
+      );
+
+      await engine.start('j-parent', {}, 'jp');
+      const deadline = Date.now() + 20_000;
+      while ((await store.getRun('jp'))?.status !== 'completed') {
+        if (Date.now() > deadline) throw new Error('parent never completed');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect((await store.getRun('jp'))?.output).toEqual({
+        lone: { n: 9 },
+        fan: [
+          { status: 'fulfilled', value: { n: 0 } },
+          { status: 'fulfilled', value: { n: 1 } },
+        ],
+      });
+      await engine.drain(5_000);
+    });
+
     t(
       'engine.purgeRuns deletes a scope with its child subtrees and cancels live runs',
       async () => {
@@ -1941,6 +1973,55 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         await store.removeSignalWaiter({ token: 'never-registered', runId: 'r1', seq: 0 });
       },
     );
+
+    t('lists buffered signals by token prefix in insertion order, a page at a time', async () => {
+      expect(store.listBufferedSignals).toBeTypeOf('function');
+      const list = (prefix: string, after: string | undefined, limit: number) =>
+        store.listBufferedSignals?.(prefix, after, limit) ?? Promise.resolve([]);
+      await store.bufferSignal('child:a', { ok: true, value: { n: 1 } });
+      await store.bufferSignal('order:1', { paid: true });
+      await store.bufferSignal('child:b', { ok: false, error: 'x' });
+      await store.bufferSignal('child:a', { ok: true, value: { n: 2 } });
+      // `_` and `%` in a prefix are literal, not LIKE wildcards.
+      await store.bufferSignal('wake_x:1', null);
+      await store.bufferSignal('wakeyx:1', null);
+
+      const all = await list('child:', undefined, 10);
+      expect(all.map((r) => [r.token, r.payload])).toEqual([
+        ['child:a', { ok: true, value: { n: 1 } }],
+        ['child:b', { ok: false, error: 'x' }],
+        ['child:a', { ok: true, value: { n: 2 } }],
+      ]);
+      expect(all.map((r) => typeof r.id)).toEqual(['string', 'string', 'string']);
+
+      const first = await list('child:', undefined, 2);
+      expect(first.map((r) => r.id)).toEqual(all.slice(0, 2).map((r) => r.id));
+      const rest = await list('child:', first.at(-1)?.id, 2);
+      expect(rest.map((r) => r.id)).toEqual([all[2]?.id]);
+      expect(await list('child:', all[2]?.id, 2)).toEqual([]);
+
+      expect((await list('wake_x:', undefined, 10)).map((r) => r.token)).toEqual(['wake_x:1']);
+    });
+
+    t('deletes buffered signals by id and leaves the rest in FIFO order', async () => {
+      expect(store.deleteBufferedSignals).toBeTypeOf('function');
+      await store.bufferSignal('child:a', { n: 1 });
+      await store.bufferSignal('child:a', { n: 2 });
+      await store.bufferSignal('child:a', { n: 3 });
+      await store.bufferSignal('child:b', { n: 4 });
+      const rows = (await store.listBufferedSignals?.('child:', undefined, 10)) ?? [];
+      await store.deleteBufferedSignals?.([
+        rows[1]?.id as string,
+        rows[3]?.id as string,
+        '999999999',
+      ]);
+      await store.deleteBufferedSignals?.([]);
+
+      expect(await store.takeBufferedSignal('child:a')).toEqual({ payload: { n: 1 } });
+      expect(await store.takeBufferedSignal('child:a')).toEqual({ payload: { n: 3 } });
+      expect(await store.takeBufferedSignal('child:a')).toBeNull();
+      expect(await store.takeBufferedSignal('child:b')).toBeNull();
+    });
 
     t('buffers signals and takes them FIFO per token', async () => {
       await store.bufferSignal('sig', { n: 1 });

@@ -2,9 +2,17 @@ import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission';
 import { currentWorkflowCtx, runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';
 import { BoundedRunner, LOCAL_RUN_CONCURRENCY } from './bounded-runner';
+import {
+  CHILD_TOKEN_PREFIX,
+  childCompletionNeedsBuffer,
+  unneededChildSignals,
+} from './buffered-child-signals';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints';
 import {
+  CHILD_CANCELLED,
   type Completion,
+  cancelledCompletion,
+  childCompletion,
   completionError,
   failedCompletion,
   isFailedCompletion,
@@ -406,32 +414,14 @@ interface AwaitedChild {
   parallelGroup?: string | undefined;
 }
 
+/** {@link WorkflowEngine.sweepBufferedSignals}: rows read per page. */
+const BUFFERED_SWEEP_PAGE = 500;
+/** {@link WorkflowEngine.sweepBufferedSignals}: pages per call, so one tick stays short. */
+const BUFFERED_SWEEP_PAGES_PER_CALL = 4;
+/** {@link WorkflowEngine.sweepBufferedSignals}: rest between two full passes over the table. */
+const BUFFERED_SWEEP_REST_MS = 10 * 60_000;
 /** How many finished children `deliverFinishedChildren` settles at once. */
 const DELIVER_CHUNK = 50;
-
-/**
- * The completion a finished child delivers to its parent (see `settleRun`), or undefined while it
- * is not finished. Only `completed` and `failed` notify a parent.
- */
-function childCompletion(child: WorkflowRun): Completion<unknown> | undefined {
-  if (child.status === 'completed') return { ok: true, value: child.output };
-  if (child.status === 'failed') return failedCompletion(child.error ?? { message: 'failed' });
-  if (child.status === 'dead') return failedCompletion(child.error ?? { message: 'dead' });
-  if (child.status === 'cancelled') return cancelledCompletion(child.error);
-  return undefined;
-}
-
-/** Code of the failure a cancelled child delivers to its parent (see {@link cancelledCompletion}). */
-const CHILD_CANCELLED = 'cancelled';
-
-/**
- * The failure a cancelled child delivers to its parent: its own error (`cancelled`, or the
- * execution timeout that cancelled it), coded `cancelled` unless it carries a code already.
- */
-function cancelledCompletion(error: StepError | undefined): Completion<never> {
-  const base = error ?? { message: 'cancelled' };
-  return failedCompletion({ ...base, code: base.code ?? CHILD_CANCELLED });
-}
 
 /** The most results of one run settled by one batched write (see `completeRemoteResult`). */
 const RESULT_BATCH_MAX = 256;
@@ -935,6 +925,10 @@ export class WorkflowEngine {
   /** Runs already paged about, by id → the `updatedAt` of the paged episode (see {@link sweepStalled}). */
   private readonly notifiedStalled = new Map<string, number>();
   private lastStalledSweepAt = Number.NEGATIVE_INFINITY;
+  /** {@link sweepBufferedSignals}: the id the pass in progress resumes after, `undefined` between passes. */
+  private bufferedSweepCursor: string | undefined;
+  private bufferedSweepActive = false;
+  private lastBufferedSweepEndedAt = Number.NEGATIVE_INFINITY;
   private readonly stalledAfterMs: number;
   private draining = false;
   /** Wait already spent on this shutdown before `drain()` (see `beginDrain`). */
@@ -1686,6 +1680,62 @@ export class WorkflowEngine {
   onDead(listener: (run: WorkflowRun) => void): () => void {
     this.deadListeners.add(listener);
     return () => this.deadListeners.delete(listener);
+  }
+
+  /**
+   * Delete buffered child completions no parent will ever consume (see
+   * `childCompletionNeedsBuffer`): those of root runs, of children whose parent already settled them
+   * or is gone, or terminal for good. Such rows were written by earlier versions, which buffered every
+   * completion that found no waiter, and nothing else ever removes them.
+   *
+   * Walks `durable_buffered_signals` by primary key, {@link BUFFERED_SWEEP_PAGE} rows at a time and
+   * at most {@link BUFFERED_SWEEP_PAGES_PER_CALL} pages per call, so a large backlog drains over a
+   * few timer ticks without a long query or a big delete. A pass that reaches the end of the table
+   * rests {@link BUFFERED_SWEEP_REST_MS} before the next one. Call it every tick (the NestJS timer
+   * poller does). Skipped while draining, on a namespaced engine (a buffered signal carries no
+   * namespace, and a scoped read would report another tenant's parent as gone), and on a store
+   * without `listBufferedSignals`/`deleteBufferedSignals`. Returns how many rows it deleted.
+   */
+  async sweepBufferedSignals(now: number = this.clock()): Promise<number> {
+    const { listBufferedSignals, deleteBufferedSignals } = this.store;
+    if (!listBufferedSignals || !deleteBufferedSignals) return 0;
+    if (this.draining || this.namespace !== undefined || this.bufferedSweepActive) return 0;
+    if (
+      this.bufferedSweepCursor === undefined &&
+      now - this.lastBufferedSweepEndedAt < BUFFERED_SWEEP_REST_MS
+    ) {
+      return 0;
+    }
+    this.bufferedSweepActive = true;
+    let deleted = 0;
+    try {
+      for (let page = 0; page < BUFFERED_SWEEP_PAGES_PER_CALL; page++) {
+        const rows = await listBufferedSignals.call(
+          this.store,
+          CHILD_TOKEN_PREFIX,
+          this.bufferedSweepCursor,
+          BUFFERED_SWEEP_PAGE,
+        );
+        const doomed = await unneededChildSignals(this.store, rows);
+        if (doomed.length > 0) {
+          await deleteBufferedSignals.call(
+            this.store,
+            doomed.map((row) => row.id),
+          );
+          deleted += doomed.length;
+        }
+        const last = rows.at(-1);
+        if (rows.length < BUFFERED_SWEEP_PAGE || !last) {
+          this.bufferedSweepCursor = undefined;
+          this.lastBufferedSweepEndedAt = now;
+          break;
+        }
+        this.bufferedSweepCursor = last.id;
+      }
+    } finally {
+      this.bufferedSweepActive = false;
+    }
+    return deleted;
   }
 
   /**
@@ -3757,10 +3807,12 @@ export class WorkflowEngine {
           await this.deliverSignal(waiter, completion);
           return;
         }
-        // No waiter: the parent has not put it yet (the completion is buffered for its join), or
-        // it already settled this child on its own turn ({@link deliverFinishedChildren}), and a
-        // buffered copy would never be consumed. A cancelled child nobody waits on tells no one.
-        if (cancelled || (await this.parentHoldsCompletion(token, completion))) return;
+        // No waiter: buffer the completion only for a parent that can still consume it (see
+        // childCompletionNeedsBuffer). A root run, a child whose parent settled it already or is
+        // gone, would leave a row nothing ever takes. A cancelled child nobody waits on tells no one.
+        if (cancelled) return;
+        const childId = token.slice(CHILD_TOKEN_PREFIX.length);
+        if (!(await childCompletionNeedsBuffer(this.store, childId, completion))) return;
         await this.signal(token, completion);
         return;
       } catch (err) {
@@ -3772,31 +3824,6 @@ export class WorkflowEngine {
         });
       }
     }
-  }
-
-  /**
-   * Whether the parent of the child behind `token` (`child:<id>`) already holds `completion` as that
-   * child's settled `signal:child:<id>` checkpoint: its own turn settled the child from the child's
-   * row, so this notification is a duplicate. A different completion (a fix-and-replay run's success
-   * for a child the parent saw fail) is not, and is buffered for the parent's retry. Only for a child
-   * whose id the engine minted (its parent is derivable from it).
-   */
-  private async parentHoldsCompletion(
-    token: string,
-    completion: Completion<unknown>,
-  ): Promise<boolean> {
-    const childId = token.slice('child:'.length);
-    const parentId = parentRunIdOf(childId);
-    if (!parentId) return false;
-    const name = `${CHILD_SIGNAL_PREFIX}${childId}`;
-    const checkpoints = this.store.listCheckpointsByNamePrefix
-      ? await this.store.listCheckpointsByNamePrefix(parentId, [name])
-      : await this.store.listCheckpoints(parentId);
-    const expected = JSON.stringify(completion);
-    return checkpoints.some(
-      (cp) =>
-        cp.name === name && cp.status === 'completed' && JSON.stringify(cp.output) === expected,
-    );
   }
 
   /**
@@ -3822,14 +3849,28 @@ export class WorkflowEngine {
     // remains, and its next turn starts every child that has no run yet.
     this.localWork.submit(`start:${childId}`, async () => {
       if (this.draining) return;
-      await this.start(workflow, input, childId, opts).catch((err) => {
+      const started = await this.start(workflow, input, childId, opts).catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
         this.notifyParent(childId, {
           ok: false,
           error: `child workflow "${workflow}" failed to start: ${message}`,
         });
+        return undefined;
       });
+      // `start` is idempotent: a child that already ran and finished under this id is not run again,
+      // and its completion found no waiter back then. Its parent's waiter exists now (it is put
+      // before the start), so deliver the completion again.
+      if (started) this.redeliverFinishedChild(childId, started);
     });
+  }
+
+  /** {@link startChildDeferred}: re-deliver the completion of a child `start` found finished. */
+  private redeliverFinishedChild(
+    childId: string,
+    run: Pick<WorkflowRun, 'status' | 'output' | 'error'>,
+  ): void {
+    const completion = childCompletion(run as WorkflowRun);
+    if (completion) this.inBackground(this.deliverToParent(`child:${childId}`, completion));
   }
 
   /**
@@ -5662,10 +5703,14 @@ export class WorkflowEngine {
           // dashboard renders the fan as one parallel group. Undefined for a lone (non-fan) child.
           parallelGroup: cmd.parallelGroup,
         });
-        if (!(await this.store.getRun(childId))) {
+        const existingChild = await this.store.getRun(childId);
+        if (!existingChild) {
           // Inherit the parent run's namespace (see ctxHostFor.startChild) so a remote workflow's
           // child stays on the parent's tenant/partition regardless of which engine executes it.
           this.startChildDeferred(cmd.workflow, cmd.input, childId, { namespace: run.namespace });
+        } else {
+          // Already finished before this waiter existed: its notification found none.
+          this.redeliverFinishedChild(childId, existingChild);
         }
       } else {
         throw new Error(

@@ -22,6 +22,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type BufferedSignalRow as StoreBufferedSignalRow,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
   attributePredicateOperands,
@@ -918,6 +919,33 @@ export class PrismaStateStore implements StateStore {
     if (!row) return null;
     await this.db.durableBufferedSignal.delete({ where: { id: row.id } });
     return { payload: row.payload ?? undefined };
+  }
+
+  async listBufferedSignals(
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<StoreBufferedSignalRow[]> {
+    // Ids as numbers: Prisma takes a number for a `BigInt` column too, and the SQLite test schema's
+    // id is an `Int`. An auto-increment stays far below 2^53.
+    const rows = await this.db.durableBufferedSignal.findMany({
+      where: {
+        token: { startsWith: tokenPrefix },
+        ...(afterId !== undefined ? { id: { gt: Number(afterId) } } : {}),
+      },
+      orderBy: { id: 'asc' },
+      take: limit,
+    });
+    // `startsWith` becomes a `LIKE`, which on SQLite still reads `_`/`%` as wildcards: keep only the
+    // real prefix matches.
+    return rows
+      .filter((r) => r.token.startsWith(tokenPrefix))
+      .map((r) => ({ id: String(r.id), token: r.token, payload: r.payload ?? undefined }));
+  }
+
+  async deleteBufferedSignals(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.db.durableBufferedSignal.deleteMany({ where: { id: { in: ids.map(Number) } } });
   }
 
   async bufferEvent(input: {

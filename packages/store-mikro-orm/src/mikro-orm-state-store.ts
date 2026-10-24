@@ -1,5 +1,6 @@
 import {
   type AttributeFilter,
+  type BufferedSignalRow,
   type CheckpointNameKind,
   type CheckpointQuery,
   type CheckpointStat,
@@ -1168,6 +1169,31 @@ export class MikroOrmStateStore implements StateStore {
     const payload = entity.payload ?? undefined;
     await em.remove(entity).flush();
     return { payload };
+  }
+
+  async listBufferedSignals(
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<BufferedSignalRow[]> {
+    const em = this.fork();
+    const rows = await em.find(
+      BufferedSignalEntity,
+      {
+        token: { $like: `${tokenPrefix}%` },
+        ...(afterId !== undefined ? { id: { $gt: Number(afterId) } } : {}),
+      },
+      { orderBy: { id: 'asc' }, limit },
+    );
+    // `LIKE` reads `_`/`%` as wildcards and may ignore case: keep only the real prefix matches.
+    return rows
+      .filter((r) => r.token.startsWith(tokenPrefix))
+      .map((r) => ({ id: String(r.id), token: r.token, payload: r.payload ?? undefined }));
+  }
+
+  async deleteBufferedSignals(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.fork().nativeDelete(BufferedSignalEntity, { id: { $in: ids.map(Number) } });
   }
 
   async bufferEvent(input: {

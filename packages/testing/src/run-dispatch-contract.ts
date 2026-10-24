@@ -746,6 +746,44 @@ export function runRunDispatchContract(
       timeoutMs + 10_000,
     );
 
+    for (const { fan, settle } of FANS) {
+      it(
+        `a ${fan} joined after some of its children finished settles them at once (reconcile off)`,
+        async (ctx) => {
+          const pair = await pairOrSkip(() => ctx.skip());
+          if (!pair) return;
+          const store = new InMemoryStateStore();
+          const all = instances(store, pair);
+          for (const { engine } of all) {
+            engine.register('line', '1', async (_ctx, input) => (input as { i: number }).i * 10);
+            engine.register('parent', '1', async (c) => {
+              const inputs = [0, 1, 2, 3].map((i) => ({ i }));
+              return settle ? c.allSettled('line', inputs) : c.all('line', inputs);
+            });
+          }
+          try {
+            for (const { engine } of all) engine.consumeRuns();
+            const [first] = all as [Instance, Instance];
+            // Children 1 and 3 run, under the fan's own deterministic ids, before the fan joins.
+            for (const i of [1, 3]) await first.engine.start('line', { i }, `p.all.0.${i}`);
+            await until(async () => {
+              const runs = await Promise.all([1, 3].map((i) => store.getRun(`p.all.0.${i}`)));
+              return runs.every((r) => r?.status === 'completed');
+            }, timeoutMs);
+            await first.engine.start('parent', {}, 'p');
+            await until(async () => (await store.getRun('p'))?.status === 'completed', timeoutMs);
+            const values = [0, 10, 20, 30];
+            expect((await store.getRun('p'))?.output).toEqual(
+              settle ? values.map((value) => ({ status: 'fulfilled', value })) : values,
+            );
+          } finally {
+            await shutdown(all, pair);
+          }
+        },
+        timeoutMs + 10_000,
+      );
+    }
+
     it(
       'drain waits for a run taken off the queue, and the draining instance takes no more',
       async (ctx) => {

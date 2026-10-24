@@ -1,5 +1,5 @@
 import { FatalError } from './errors';
-import type { StepError } from './interfaces';
+import type { StepError, WorkflowRun } from './interfaces';
 
 /**
  * The payload an external `ctx.task` / child run delivers back on its completion signal: either a
@@ -47,4 +47,28 @@ export function completionError(c: {
     ...(c.code !== undefined ? { code: c.code } : {}),
     ...(c.details !== undefined ? { details: c.details } : {}),
   };
+}
+
+/**
+ * The completion a finished child delivers to its parent (see `settleRun`), or undefined while it
+ * is not finished. Only `completed` and `failed` notify a parent.
+ */
+export function childCompletion(child: WorkflowRun): Completion<unknown> | undefined {
+  if (child.status === 'completed') return { ok: true, value: child.output };
+  if (child.status === 'failed') return failedCompletion(child.error ?? { message: 'failed' });
+  if (child.status === 'dead') return failedCompletion(child.error ?? { message: 'dead' });
+  if (child.status === 'cancelled') return cancelledCompletion(child.error);
+  return undefined;
+}
+
+/** Code of the failure a cancelled child delivers to its parent (see {@link cancelledCompletion}). */
+export const CHILD_CANCELLED = 'cancelled';
+
+/**
+ * The failure a cancelled child delivers to its parent: its own error (`cancelled`, or the
+ * execution timeout that cancelled it), coded `cancelled` unless it carries a code already.
+ */
+export function cancelledCompletion(error: StepError | undefined): Completion<never> {
+  const base = error ?? { message: 'cancelled' };
+  return failedCompletion({ ...base, code: base.code ?? CHILD_CANCELLED });
 }

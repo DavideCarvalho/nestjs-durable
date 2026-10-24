@@ -1,4 +1,5 @@
 import type {
+  BufferedSignalRow,
   CheckpointQuery,
   CheckpointStat,
   ChildWait,
@@ -155,6 +156,14 @@ export class CodecStateStore implements StateStore {
   ) => Promise<void>;
   /** Decodes each run like {@link getRun}. Bound only when the inner store has it. */
   readonly getRuns?: (runIds: string[]) => Promise<WorkflowRun[]>;
+  /** Decodes each payload like {@link takeBufferedSignal}. Bound only when the inner store has it. */
+  readonly listBufferedSignals?: (
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ) => Promise<BufferedSignalRow[]>;
+  /** Forwarded verbatim — deletes by row id. */
+  readonly deleteBufferedSignals?: (ids: string[]) => Promise<void>;
   /** Forwarded verbatim — a waiter carries no payload. */
   readonly listSignalWaitersByRun?: (runIds: string[]) => Promise<SignalWaiter[]>;
   /** Forwarded verbatim — a waiter carries no payload. */
@@ -231,6 +240,15 @@ export class CodecStateStore implements StateStore {
     if (getRuns)
       this.getRuns = async (runIds) =>
         (await getRuns.call(inner, runIds)).map((r) => this.decRun(r) as WorkflowRun);
+    const listBuffered = inner.listBufferedSignals;
+    if (listBuffered)
+      this.listBufferedSignals = async (tokenPrefix, afterId, limit) =>
+        (await listBuffered.call(inner, tokenPrefix, afterId, limit)).map((row) => ({
+          ...row,
+          payload: this.dec(row.payload),
+        }));
+    const deleteBuffered = inner.deleteBufferedSignals;
+    if (deleteBuffered) this.deleteBufferedSignals = (ids) => deleteBuffered.call(inner, ids);
     const byRun = inner.listSignalWaitersByRun;
     if (byRun) this.listSignalWaitersByRun = (runIds) => byRun.call(inner, runIds);
     const hasWaiter = inner.hasSignalWaiter;

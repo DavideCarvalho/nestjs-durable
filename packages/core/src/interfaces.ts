@@ -316,6 +316,14 @@ export interface OwnedLeaseReclaim {
   lockedBefore: number;
 }
 
+/** One buffered signal, as {@link StateStore.listBufferedSignals} returns it. */
+export interface BufferedSignalRow {
+  /** The store's row id (an auto-increment), as a string. Orders rows by insertion. */
+  id: string;
+  token: string;
+  payload: unknown;
+}
+
 export interface StateStore {
   /**
    * Provision the tables/collections this store needs, idempotently. Called on boot when the
@@ -563,6 +571,20 @@ export interface StateStore {
   bufferSignal(token: string, payload: unknown): Promise<void>;
   /** Take the oldest buffered signal for `token` (FIFO), or null if none is buffered. */
   takeBufferedSignal(token: string): Promise<{ payload: unknown } | null>;
+  /**
+   * A page of buffered signals whose token starts with `tokenPrefix`, in insertion (`id`) order,
+   * starting after `afterId` (exclusive; `undefined` = from the start), at most `limit` rows. The
+   * read behind the engine's sweep of buffered child completions nothing will consume
+   * ({@link WorkflowEngine.sweepBufferedSignals}); pages by primary key, so it stays cheap on a large
+   * table. Optional: without it (or {@link deleteBufferedSignals}) the sweep does nothing.
+   */
+  listBufferedSignals?(
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<BufferedSignalRow[]>;
+  /** Delete the buffered signals with these {@link BufferedSignalRow.id}s; unknown ids are ignored. */
+  deleteBufferedSignals?(ids: string[]): Promise<void>;
 
   /**
    * Buffer a published event that matched NO live waiter, so a LATER `ctx.waitForEvent(name, { match })`
