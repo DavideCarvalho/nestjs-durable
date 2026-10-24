@@ -39,10 +39,11 @@
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@dudousxd/nestjs-durable-testing": "workspace:^",
     "@prisma/client": "6.19.3",
+    "@testcontainers/mysql": "10.18.0",
     "@testcontainers/postgresql": "10.18.0",
     "prisma": "6.19.3",
-    "typescript": "5.9.3",
-    "tsup": "8.3.5"
+    "tsup": "8.3.5",
+    "typescript": "5.9.3"
   },
   "module": "./dist/index.js",
   "exports": {

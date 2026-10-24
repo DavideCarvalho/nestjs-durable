@@ -448,6 +448,9 @@ importers:
       '@dudousxd/nestjs-durable-testing':
         specifier: workspace:^
         version: link:../testing
+      '@dudousxd/nestjs-durable-transport-bullmq':
+        specifier: workspace:^
+        version: link:../transport-bullmq
       '@mikro-orm/core':
         specifier: 7.1.4
         version: 7.1.4
@@ -467,6 +470,9 @@ importers:
         specifier: 10.18.0
         version: 10.18.0
       '@testcontainers/postgresql':
+        specifier: 10.18.0
+        version: 10.18.0
+      '@testcontainers/redis':
         specifier: 10.18.0
         version: 10.18.0
       reflect-metadata:
@@ -490,6 +496,9 @@ importers:
       '@prisma/client':
         specifier: 6.19.3
         version: 6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3)
+      '@testcontainers/mysql':
+        specifier: 10.18.0
+        version: 10.18.0
       '@testcontainers/postgresql':
         specifier: 10.18.0
         version: 10.18.0

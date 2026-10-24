@@ -344,6 +344,19 @@ export class PrismaStateStore implements StateStore {
     return row ? fromCheckpointRow(row) : null;
   }
 
+  async getCheckpoints(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const unique = [...new Set(seqs)];
+    const rows = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      rows.push(
+        ...(await this.db.durableStepCheckpoint.findMany({
+          where: { runId, seq: { in: unique.slice(at, at + 500) } },
+        })),
+      );
+    }
+    return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointRow);
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     const data = toCheckpointData(checkpoint);
     await this.db.durableStepCheckpoint.upsert({
@@ -366,20 +379,47 @@ export class PrismaStateStore implements StateStore {
 
   async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
     if (checkpoints.length === 0) return [];
-    // The conditional `updateMany` of `saveCheckpointIfPending`, once per entry, in order, in one
-    // transaction: one commit for the batch, and a rejection writes nothing.
+    // Prisma has no multi-row conditional update, so in one transaction: read the batch's rows that
+    // are still `pending`, decide each entry in order against them (an entry that settles a row makes
+    // a later entry for it lose), then replace each winning row with its last winning entry: one
+    // `deleteMany` that only deletes rows still `pending`, and one `createMany`. A row settled by
+    // someone else between the read and the delete fails the batch (rolled back, so nothing is
+    // written), and the engine settles its entries one by one.
     return this.db.$transaction(async (tx) => {
-      const wrote: boolean[] = [];
-      for (const checkpoint of checkpoints) {
-        const { runId, seq, ...data } = toCheckpointData(checkpoint);
-        const { count } = await tx.durableStepCheckpoint.updateMany({
-          where: { runId, seq, status: 'pending' },
-          data,
+      const pending = new Set<string>();
+      for (const [runId, seqs] of seqsByRun(checkpoints)) {
+        for (let at = 0; at < seqs.length; at += 500) {
+          const rows = await tx.durableStepCheckpoint.findMany({
+            where: { runId, seq: { in: seqs.slice(at, at + 500) }, status: 'pending' },
+            select: { runId: true, seq: true },
+          });
+          for (const row of rows) pending.add(checkpointKey(row.runId, row.seq));
+        }
+      }
+      const { wrote, writes } = decideIfPending(checkpoints, pending);
+      for (const [runId, seqs] of seqsByRun(writes)) {
+        for (let at = 0; at < seqs.length; at += 500) {
+          const chunk = seqs.slice(at, at + 500);
+          const { count } = await tx.durableStepCheckpoint.deleteMany({
+            where: { runId, seq: { in: chunk }, status: 'pending' },
+          });
+          if (count !== chunk.length) {
+            throw new Error('a checkpoint of the batch was settled while the batch was written');
+          }
+        }
+      }
+      for (let at = 0; at < writes.length; at += 500) {
+        await tx.durableStepCheckpoint.createMany({
+          data: writes.slice(at, at + 500).map(toCheckpointData),
         });
-        wrote.push(count > 0);
       }
       return wrote;
     });
+  }
+
+  async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
+    if (checkpoints.length === 0) return;
+    await this.db.$transaction((tx) => replaceCheckpoints(tx, checkpoints));
   }
 
   async transaction<T>(
@@ -831,28 +871,27 @@ export class PrismaStateStore implements StateStore {
 
   async registerChildWaits(entries: ChildWait[]): Promise<void> {
     if (entries.length === 0) return;
-    // Prisma has no multi-row upsert: one upsert per row, inside a single transaction.
+    // Prisma has no multi-row upsert: replace the waiters and the placeholders, one `deleteMany`
+    // and one `createMany` per chunk of each, inside a single transaction.
     await this.db.$transaction(async (tx) => {
-      for (const { waiter } of entries) {
-        const data = {
-          runId: waiter.runId,
-          seq: waiter.seq,
-          parallelGroup: waiter.parallelGroup ?? null,
-        };
-        await tx.durableSignalWaiter.upsert({
-          where: { token: waiter.token },
-          create: { token: waiter.token, ...data },
-          update: data,
+      for (let at = 0; at < entries.length; at += 500) {
+        const chunk = entries.slice(at, at + 500);
+        await tx.durableSignalWaiter.deleteMany({
+          where: { token: { in: chunk.map(({ waiter }) => waiter.token) } },
+        });
+        await tx.durableSignalWaiter.createMany({
+          data: chunk.map(({ waiter }) => ({
+            token: waiter.token,
+            runId: waiter.runId,
+            seq: waiter.seq,
+            parallelGroup: waiter.parallelGroup ?? null,
+          })),
         });
       }
-      for (const { checkpoint } of entries) {
-        const data = toCheckpointData(checkpoint);
-        await tx.durableStepCheckpoint.upsert({
-          where: { runId_seq: { runId: checkpoint.runId, seq: checkpoint.seq } },
-          create: data,
-          update: data,
-        });
-      }
+      await replaceCheckpoints(
+        tx,
+        entries.map(({ checkpoint }) => checkpoint),
+      );
     });
   }
 
@@ -1169,6 +1208,67 @@ function toCheckpointStat(
     maxFinishedAt: r._max.finishedAt,
     sumAttempts: Number(r._sum.attempts ?? 0),
   };
+}
+
+/** `checkpoints`' distinct seqs, by run. */
+function seqsByRun(checkpoints: StepCheckpoint[]): Map<string, number[]> {
+  const byRun = new Map<string, Set<number>>();
+  for (const { runId, seq } of checkpoints) {
+    const seqs = byRun.get(runId) ?? new Set<number>();
+    seqs.add(seq);
+    byRun.set(runId, seqs);
+  }
+  return new Map([...byRun].map(([runId, seqs]) => [runId, [...seqs]]));
+}
+
+const checkpointKey = (runId: string, seq: number): string => `${runId}\u0000${seq}`;
+
+/**
+ * `saveCheckpointsIfPending`'s answers for `checkpoints` against the rows that were `pending` before
+ * the batch (`pending`, by {@link checkpointKey}), in order: an entry wins while its row is still
+ * pending, and an entry that is not `pending` itself settles the row. `writes` holds each row's
+ * last winning entry.
+ */
+function decideIfPending(
+  checkpoints: StepCheckpoint[],
+  pending: Set<string>,
+): { wrote: boolean[]; writes: StepCheckpoint[] } {
+  const wrote: boolean[] = [];
+  const writes = new Map<string, StepCheckpoint>();
+  for (const checkpoint of checkpoints) {
+    const key = checkpointKey(checkpoint.runId, checkpoint.seq);
+    if (!pending.has(key)) {
+      wrote.push(false);
+      continue;
+    }
+    wrote.push(true);
+    writes.set(key, checkpoint);
+    if (checkpoint.status !== 'pending') pending.delete(key);
+  }
+  return { wrote, writes: [...writes.values()] };
+}
+
+/**
+ * Write `checkpoints` (distinct rows), inserting or overwriting each. Prisma has no multi-row
+ * upsert, so the rows are replaced: one `deleteMany` and one `createMany` per chunk. Call inside a
+ * transaction.
+ */
+async function replaceCheckpoints(
+  tx: DurablePrismaTx,
+  checkpoints: StepCheckpoint[],
+): Promise<void> {
+  for (const [runId, seqs] of seqsByRun(checkpoints)) {
+    for (let at = 0; at < seqs.length; at += 500) {
+      await tx.durableStepCheckpoint.deleteMany({
+        where: { runId, seq: { in: seqs.slice(at, at + 500) } },
+      });
+    }
+  }
+  for (let at = 0; at < checkpoints.length; at += 500) {
+    await tx.durableStepCheckpoint.createMany({
+      data: checkpoints.slice(at, at + 500).map(toCheckpointData),
+    });
+  }
 }
 
 function toCheckpointData(cp: StepCheckpoint) {

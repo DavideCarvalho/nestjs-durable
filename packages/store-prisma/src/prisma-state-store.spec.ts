@@ -24,6 +24,7 @@ vi.setConfig({ testTimeout: 30_000 });
 // second PrismaClient against the same file would lock (P1008), so the contract and the per-store
 // tests below both use this one.
 let sharedPrisma: any;
+let prismaStatements = 0;
 let prismaReady: Promise<boolean> | undefined;
 
 async function prismaContractSetup(): Promise<boolean> {
@@ -37,6 +38,9 @@ async function prismaContractSetup(): Promise<boolean> {
         const { PrismaClient } = await import('../generated/client/index.js');
         // Query logging lets the per-store pushdown test below capture the executed SQL.
         sharedPrisma = new PrismaClient({ log: [{ emit: 'event', level: 'query' }] });
+        sharedPrisma.$on('query', () => {
+          prismaStatements += 1;
+        });
         await sharedPrisma.$connect();
         // SQLite reliability: under the engine's end-to-end write bursts (createRun → saveCheckpoint
         // → updateRun → resume), the default rollback-journal mode does an fsync-heavy journal
@@ -74,6 +78,7 @@ runStateStoreContract('Prisma (SQLite)', async () => {
     // `listRuns({ tag })` uses Prisma's `array_contains`, which Prisma supports on its real targets
     // (Postgres/MySQL) but NOT on SQLite, the adapter's test DB only. Skipped here; asserted elsewhere.
     supportsTagFilter: false,
+    statements: () => prismaStatements,
     cleanup: async () => undefined,
   };
 });
@@ -225,22 +230,33 @@ describe('PrismaStateStore', () => {
 
   it('runs the checkpoint compare-and-set and the fan count as one statement each', async (ctx) => {
     if (!available) ctx.skip();
-    await store.createRun(run());
-    await store.saveCheckpoint(checkpoint({ status: 'pending', output: undefined }));
+    // The client is shared with the contract cases above, whose background statements can land
+    // while this case runs: count only the statements bound to this case's own run id.
+    const runId = `stmt-${globalThis.crypto.randomUUID()}`;
+    await store.createRun(run({ id: runId }));
+    const pending = checkpoint({
+      runId,
+      stepId: `${runId}:0`,
+      status: 'pending',
+      output: undefined,
+    });
+    await store.saveCheckpoint(pending);
     const queries: string[] = [];
-    const onQuery = (e: { query: string }) => queries.push(e.query);
+    const onQuery = (e: { query: string; params: string }) => {
+      if (e.params.includes(runId)) queries.push(e.query);
+    };
     prisma.$on('query', onQuery);
     try {
       const sql = () => queries.filter((q) => /durable_step_checkpoints/i.test(q));
       queries.length = 0;
-      expect(await store.saveCheckpointIfPending(checkpoint())).toBe(true);
+      expect(await store.saveCheckpointIfPending({ ...pending, status: 'completed' })).toBe(true);
       // No read before the write: the status predicate rides on the UPDATE itself.
       expect(sql()).toHaveLength(1);
       expect(sql()[0]).toMatch(/^update/i);
       expect(sql()[0]).toMatch(/status/i);
 
       queries.length = 0;
-      expect(await store.countCheckpoints('r1', 0, 5, ['completed'])).toBe(1);
+      expect(await store.countCheckpoints(runId, 0, 5, ['completed'])).toBe(1);
       expect(sql()).toHaveLength(1);
       expect(sql()[0]).toMatch(/count\(/i);
     } finally {

@@ -189,8 +189,8 @@ try {
 }
 ```
 
-For a wide fan over `BullMQTransport`, raise `resultConcurrency` (default 1) on the instances that
-consume results; one run's results still resume it in order on an instance.
+A wide fan's results need no transport tuning: each instance takes many results at once and settles
+one run's results in batches, and one run's results still resume it in order on an instance.
 
 ### Sub-process events inside a step
 

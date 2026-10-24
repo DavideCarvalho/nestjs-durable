@@ -188,6 +188,10 @@ If the factory can't reach its backend at all (no Docker, no local Postgres), th
 `StateStoreUnavailableError` from it instead of letting the connection error fail the suite — the
 contract skips that case gracefully rather than reporting a false failure.
 
+Return a `statements: () => number` from the factory too (a counter fed by your driver's query log)
+and the contract also checks that `saveCheckpoints`, `getCheckpoints` and `saveCheckpointsIfPending`
+send a few statements for a 600-row batch, not one per row.
+
 **Transport** — `assertTransportConformance(transport, idPrefix?)` proves a durable remote step
 round-trips to a worker and back, for both success and a throwing handler:
 
@@ -199,6 +203,14 @@ it('conforms to the Transport contract', async () => {
   await assertTransportConformance(new MyTransport());
 });
 ```
+
+**Step fan results** — `runStepFanResultsContract(name, makeHarness, options?)` runs `ctx.all` and
+`ctx.allSettled` step fans, with and without `concurrency`, whose results back up on your broker,
+over two engine instances. It checks that every step settles once, the parent turns once per wave,
+the results are settled in batches (the consumer hands the engine many at once), and the fan's steps
+go out through `dispatchMany` (pass `bulkDispatch: false` for a transport without one). The harness
+opens fresh queues per case and returns two engine-side transports plus a worker serving
+`STEP_FAN_STEP`.
 
 **Admission backend** — `runAdmissionBackendContract(name, makeBackend)` takes an
 `AdmissionBackendFactory` (`(clock) => AdmissionBackend`) and asserts concurrency caps, rate limits,

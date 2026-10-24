@@ -50,8 +50,19 @@ function isDeadlock(err: unknown): boolean {
   return codes.some((c) => c === 'ER_LOCK_DEADLOCK' || c === 1213 || c === '40P01');
 }
 
+/** Most task rows one {@link DbTransport.dispatchMany} insert writes. */
+const TASKS_INSERT_CHUNK = 200;
+
 /** Most run rows one consumer poll claims. */
 const RUNS_CLAIM_MAX = 50;
+
+/**
+ * Most results this instance hands the engine at once, and the most one poll claims. Results are
+ * cheap to hand over: the engine writes one run's waiting results together, so the more of a wide
+ * fan's results are in flight here, the fewer writes and barrier reads settle them.
+ */
+const RESULTS_IN_FLIGHT = 512;
+const RESULTS_CLAIM_MAX = 256;
 
 /** A run-queue consumer started by {@link DbTransport.onDispatchedRun}. */
 interface RunConsumer {
@@ -97,7 +108,8 @@ export interface DbTransportOptions {
   leaseMs?: number;
   /**
    * Max rows claimed per poll. Default 10. The task loop claims only as many rows as it has free
-   * {@link concurrency} slots (capped by this); the results loop claims up to this many.
+   * {@link concurrency} slots (capped by this). The results loop claims results in larger rounds of
+   * its own (a few hundred, or this if larger), since the engine settles them together.
    */
   batchSize?: number;
   /**
@@ -160,6 +172,10 @@ export class DbTransport implements Transport {
   private resultLoop?: Promise<void>;
   /** Tasks running on this instance (at most `concurrency`). */
   private readonly runningTasks = new Set<Promise<void>>();
+  /** Claim rounds of results being handled on this instance — see {@link drainResults}. */
+  private readonly runningResults = new Set<Promise<void>>();
+  /** Results being handled across {@link runningResults} (at most {@link RESULTS_IN_FLIGHT}). */
+  private resultsInFlight = 0;
   /** Claim tokens this instance holds, by table — every one is renewed on `renewTimer`. */
   private readonly held = new Map<string, Set<string>>();
   private renewTimer?: ReturnType<typeof setInterval> | undefined;
@@ -282,12 +298,14 @@ export class DbTransport implements Transport {
 
   // ── engine → worker ────────────────────────────────────────────────────────────────────────
   async dispatch(task: RemoteTask): Promise<void> {
+    await this.dispatchMany([task]);
+  }
+
+  /** {@link dispatch} for many tasks: one multi-row insert per {@link TASKS_INSERT_CHUNK} tasks. */
+  async dispatchMany(tasks: RemoteTask[]): Promise<void> {
+    if (tasks.length === 0) return;
     await this.ensureSchema();
     const t = this.q(this.tasksTable);
-    // Idempotent: a redelivered dispatch for the same step_id is ignored (the row already exists).
-    const ignore = this.isPg
-      ? `INSERT INTO ${t} (...) ON CONFLICT (${this.q('step_id')}) DO NOTHING`
-      : `INSERT IGNORE INTO ${t} (...)`;
     const cols = [
       'step_id',
       'run_id',
@@ -299,21 +317,32 @@ export class DbTransport implements Transport {
       'status',
       'created_at',
     ];
-    const sql = ignore.replace(
-      '(...)',
-      `(${cols.map((c) => this.q(c)).join(', ')}) VALUES (${cols.map((_, i) => this.ph(i + 1)).join(', ')})`,
-    );
-    await this.exec.query(sql, [
-      task.stepId,
-      task.runId,
-      task.seq,
-      task.name,
-      task.group,
-      JSON.stringify(task.input ?? null),
-      task.attempt,
-      'pending',
-      this.now(),
-    ]);
+    for (let at = 0; at < tasks.length; at += TASKS_INSERT_CHUNK) {
+      const chunk = tasks.slice(at, at + TASKS_INSERT_CHUNK);
+      const values = chunk
+        .map((_, r) => `(${cols.map((__, c) => this.ph(r * cols.length + c + 1)).join(', ')})`)
+        .join(', ');
+      const into = `${t} (${cols.map((c) => this.q(c)).join(', ')}) VALUES ${values}`;
+      // Idempotent: a redelivered dispatch for the same step_id is ignored (the row already exists).
+      const sql = this.isPg
+        ? `INSERT INTO ${into} ON CONFLICT (${this.q('step_id')}) DO NOTHING`
+        : `INSERT IGNORE INTO ${into}`;
+      const now = this.now();
+      await this.exec.query(
+        sql,
+        chunk.flatMap((task) => [
+          task.stepId,
+          task.runId,
+          task.seq,
+          task.name,
+          task.group,
+          JSON.stringify(task.input ?? null),
+          task.attempt,
+          'pending',
+          now,
+        ]),
+      );
+    }
   }
 
   // ── worker → engine ────────────────────────────────────────────────────────────────────────
@@ -659,26 +688,48 @@ export class DbTransport implements Transport {
   }
 
   /**
-   * Claim a batch of results, deliver each to the engine, and delete it — only after its handler ran
-   * (at-least-once), and only while this round still holds the claim (a newer result for the same
-   * step that replaced the row resets the claim, so it is delivered next instead of deleted). The
-   * batch's claim is renewed until it is done. A throwing handler is reported and its row left for
-   * re-delivery after the lease; the rest of the batch continues.
+   * Claim a batch of results and hand them all to the engine at once, then delete the ones whose
+   * handler resolved — only after it did (at-least-once), and only while this round still holds the
+   * claim (a newer result for the same step that replaced the row resets the claim, so it is
+   * delivered next instead of deleted). The next round is claimed while this one runs, up to
+   * {@link RESULTS_IN_FLIGHT} results; the round's claim is renewed until it is done. A throwing
+   * handler is reported and its row left for re-delivery after the lease.
    */
   private async drainResults(handler: (result: StepResult) => Promise<void>): Promise<number> {
+    const free = RESULTS_IN_FLIGHT - this.resultsInFlight;
+    if (free <= 0) {
+      await Promise.race(this.runningResults);
+      return 1;
+    }
     const { rows, token } = await this.claim<ResultRow>(
       this.resultsTable,
-      this.batchSize,
+      Math.min(free, Math.max(this.batchSize, RESULTS_CLAIM_MAX)),
       '1 = 1',
       [],
     );
     if (rows.length === 0) return 0;
     this.hold(this.resultsTable, token);
-    try {
-      for (const row of rows) {
-        if (!this.running) break;
+    this.resultsInFlight += rows.length;
+    const round = this.handleResults(rows, token, handler).finally(() => {
+      this.resultsInFlight -= rows.length;
+      this.runningResults.delete(round);
+      this.release(this.resultsTable, token);
+    });
+    this.runningResults.add(round);
+    return rows.length;
+  }
+
+  /** Hand one claimed round of results to the engine, then delete the delivered ones in one statement. */
+  private async handleResults(
+    rows: ResultRow[],
+    token: string,
+    handler: (result: StepResult) => Promise<void>,
+  ): Promise<void> {
+    const delivered: string[] = [];
+    await Promise.all(
+      rows.map(async (row) => {
         try {
-          const result: StepResult = {
+          await handler({
             runId: row.run_id,
             seq: Number(row.seq),
             stepId: row.step_id,
@@ -686,20 +737,24 @@ export class DbTransport implements Transport {
             output: row.output == null ? undefined : JSON.parse(row.output),
             error: row.error == null ? undefined : JSON.parse(row.error),
             startedAt: row.started_at == null ? undefined : Number(row.started_at),
-          };
-          await handler(result);
-          await this.exec.query(
-            `DELETE FROM ${this.q(this.resultsTable)} WHERE ${this.q('step_id')} = ${this.ph(1)} AND ${this.q('claimed_by')} = ${this.ph(2)}`,
-            [row.step_id, token],
-          );
+          });
+          delivered.push(row.step_id);
         } catch (err) {
           this.onError(err);
         }
-      }
-    } finally {
-      this.release(this.resultsTable, token);
+      }),
+    );
+    if (delivered.length === 0) return;
+    try {
+      const ids = delivered.map((_, i) => this.ph(i + 2)).join(', ');
+      await this.exec.query(
+        `DELETE FROM ${this.q(this.resultsTable)} WHERE ${this.q('claimed_by')} = ${this.ph(1)} AND ${this.q('step_id')} IN (${ids})`,
+        [token, ...delivered],
+      );
+    } catch (err) {
+      // The rows stay and are re-delivered after the lease; the engine drops a settled step's copy.
+      this.onError(err);
     }
-    return rows.length;
   }
 
   /**
@@ -837,8 +892,8 @@ export class DbTransport implements Transport {
       this.resultLoop,
       ...[...this.runConsumers].map((c) => this.stopRunConsumer(c)),
     ]);
-    // Let running tasks settle (their claims keep being renewed until they do).
-    await Promise.allSettled([...this.runningTasks]);
+    // Let running tasks and results settle (their claims keep being renewed until they do).
+    await Promise.allSettled([...this.runningTasks, ...this.runningResults]);
     if (this.renewTimer) clearInterval(this.renewTimer);
     this.renewTimer = undefined;
     await this.renewal;

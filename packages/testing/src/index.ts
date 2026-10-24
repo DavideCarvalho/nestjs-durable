@@ -8,3 +8,4 @@ export * from './steps';
 export * from './transport-conformance';
 export * from './checkpoint-aggregation-contract';
 export * from './run-dispatch-contract';
+export * from './step-fan-results-contract';

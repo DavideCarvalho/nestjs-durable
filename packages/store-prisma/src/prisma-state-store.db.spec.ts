@@ -6,6 +6,7 @@ import {
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import { runStateStoreContract } from '@dudousxd/nestjs-durable-testing';
+import { MySqlContainer, type StartedMySqlContainer } from '@testcontainers/mysql';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { PrismaStateStore } from './prisma-state-store';
@@ -35,6 +36,7 @@ let pg: StartedPostgreSqlContainer | undefined;
 let setupError: unknown;
 // The Prisma client is generated at test time, so it is untyped here.
 let sharedPrisma: any;
+let prismaStatements = 0;
 
 function runPrisma(args: string[], env: Record<string, string>): void {
   execFileSync('npx', ['prisma', ...args], {
@@ -56,7 +58,13 @@ beforeAll(async () => {
       PRISMA_PG_URL: url,
     });
     const { PrismaClient } = await import('../generated/pg-client/index.js');
-    sharedPrisma = new PrismaClient({ datasources: { db: { url } } });
+    sharedPrisma = new PrismaClient({
+      datasources: { db: { url } },
+      log: [{ emit: 'event', level: 'query' }],
+    });
+    sharedPrisma.$on('query', () => {
+      prismaStatements += 1;
+    });
     await sharedPrisma.$connect();
   } catch (err) {
     setupError = err;
@@ -68,14 +76,14 @@ afterAll(async () => {
   await pg?.stop();
 });
 
-async function truncatePrisma(): Promise<void> {
-  await sharedPrisma.durableStepCheckpoint.deleteMany();
-  await sharedPrisma.durableSignalWaiter.deleteMany();
-  await sharedPrisma.durableBufferedSignal.deleteMany();
-  await sharedPrisma.durableBufferedEvent.deleteMany();
-  await sharedPrisma.durableSchedule.deleteMany();
-  await sharedPrisma.durableRunAttribute.deleteMany(); // before runs (FK)
-  await sharedPrisma.durableWorkflowRun.deleteMany();
+async function truncatePrisma(client: any = sharedPrisma): Promise<void> {
+  await client.durableStepCheckpoint.deleteMany();
+  await client.durableSignalWaiter.deleteMany();
+  await client.durableBufferedSignal.deleteMany();
+  await client.durableBufferedEvent.deleteMany();
+  await client.durableSchedule.deleteMany();
+  await client.durableRunAttribute.deleteMany(); // before runs (FK)
+  await client.durableWorkflowRun.deleteMany();
 }
 
 function available(): boolean {
@@ -96,6 +104,61 @@ runStateStoreContract('Prisma (Postgres)', async () => {
     peerStore: new PrismaStateStore(sharedPrisma),
     // Postgres supports `array_contains`, so the tag filter is exercised here (unlike SQLite).
     supportsTagFilter: true,
+    statements: () => prismaStatements,
+    cleanup: async () => undefined,
+  };
+});
+
+// --- MySQL: the same contract against a MySQL client generated from prisma/test.mysql.prisma ------
+
+let mysql: StartedMySqlContainer | undefined;
+let mysqlError: unknown;
+let mysqlPrisma: any;
+let mysqlStatements = 0;
+
+beforeAll(async () => {
+  if (skipped) return;
+  try {
+    mysql = await new MySqlContainer('mysql:8.0').start();
+    const url = `mysql://${mysql.getUsername()}:${mysql.getUserPassword()}@${mysql.getHost()}:${mysql.getPort()}/${mysql.getDatabase()}`;
+    const schema = 'prisma/test.mysql.prisma';
+    runPrisma(['generate', '--schema', schema], { PRISMA_MYSQL_URL: url });
+    runPrisma(['db', 'push', '--schema', schema, '--skip-generate', '--accept-data-loss'], {
+      PRISMA_MYSQL_URL: url,
+    });
+    const { PrismaClient } = await import('../generated/mysql-client/index.js');
+    mysqlPrisma = new PrismaClient({
+      datasources: { db: { url } },
+      log: [{ emit: 'event', level: 'query' }],
+    });
+    mysqlPrisma.$on('query', () => {
+      mysqlStatements += 1;
+    });
+    await mysqlPrisma.$connect();
+  } catch (err) {
+    mysqlError = err;
+  }
+}, CONTAINER_TIMEOUT);
+
+afterAll(async () => {
+  await mysqlPrisma?.$disconnect?.();
+  await mysql?.stop();
+});
+
+runStateStoreContract('Prisma (MySQL)', async () => {
+  if (skipped || mysqlError || !mysqlPrisma) {
+    throw new (await import('@dudousxd/nestjs-durable-testing')).StateStoreUnavailableError(
+      skipped
+        ? 'SKIP_TESTCONTAINERS set'
+        : `Prisma MySQL unavailable (is Docker running?): ${String(mysqlError)}`,
+    );
+  }
+  await truncatePrisma(mysqlPrisma);
+  return {
+    store: new PrismaStateStore(mysqlPrisma),
+    peerStore: new PrismaStateStore(mysqlPrisma),
+    supportsTagFilter: true,
+    statements: () => mysqlStatements,
     cleanup: async () => undefined,
   };
 });

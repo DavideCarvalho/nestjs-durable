@@ -1,12 +1,17 @@
-import { runRunDispatchContract } from '@dudousxd/nestjs-durable-testing';
+import {
+  STEP_FAN_STEP,
+  runRunDispatchContract,
+  runStepFanResultsContract,
+} from '@dudousxd/nestjs-durable-testing';
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
 import { afterAll, beforeAll } from 'vitest';
 import { BullMQTransport } from './bullmq-transport';
 
 /**
- * The shared run-dispatch contract against a real Redis (testcontainers): two BullMQTransports on
- * one fresh prefix per case stand for two instances of a deployment. Run with `pnpm test:db`; skips
- * when Docker is unavailable or `SKIP_TESTCONTAINERS` is set. Uses `DURABLE_TEST_REDIS_URL` when set.
+ * The shared run-dispatch and step-fan-results contracts against a real Redis (testcontainers): two
+ * BullMQTransports on one fresh prefix per case stand for two instances of a deployment. Run with
+ * `pnpm test:db`; skips when Docker is unavailable or `SKIP_TESTCONTAINERS` is set. Uses
+ * `DURABLE_TEST_REDIS_URL` when set.
  */
 
 let redis: StartedRedisContainer | undefined;
@@ -49,6 +54,30 @@ runRunDispatchContract('BullMQTransport (Redis)', async () => {
         new BullMQTransport({ connection: live, prefix }),
         new BullMQTransport({ connection: live, prefix }),
       ];
+    },
+  };
+});
+
+runStepFanResultsContract('BullMQTransport (Redis)', async () => {
+  if (unavailable || !connection) return unavailable ?? 'no Redis';
+  const live = connection;
+  return {
+    open: async (handler) => {
+      const connection = live;
+      cases += 1;
+      const prefix = `fr${cases}-${Date.now()}`;
+      const worker = new BullMQTransport({ connection, prefix, concurrency: 64 });
+      worker.handle(STEP_FAN_STEP, handler);
+      const engines: [BullMQTransport, BullMQTransport] = [
+        new BullMQTransport({ connection, prefix }),
+        new BullMQTransport({ connection, prefix }),
+      ];
+      return {
+        engines,
+        close: async () => {
+          await Promise.all([worker, ...engines].map((t) => t.close()));
+        },
+      };
     },
   };
 });
