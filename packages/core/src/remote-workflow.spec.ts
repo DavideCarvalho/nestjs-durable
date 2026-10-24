@@ -462,6 +462,39 @@ describe('WorkflowEngine — remote (polyglot) workflows', () => {
     expect(child?.status).toBe('completed');
   });
 
+  it('a remote parent awaiting a child that already finished resumes at once (reconcile off)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({
+      store,
+      transport: new InMemoryTransport(),
+      reconcileMs: 0,
+    });
+    engine.registerRemote('child', '1', {
+      group: 'py-workflows',
+      executor: {
+        async advance(run: WorkflowRun): Promise<WorkflowDecision> {
+          return {
+            taskId: 't',
+            runId: run.id,
+            status: 'completed',
+            commands: [],
+            output: { doubled: (run.input as number) * 2 },
+          };
+        },
+      },
+    });
+    engine.registerRemote('parent', '1', { group: 'py-workflows', executor: parentExecutor() });
+    // The child ran under the parent's deterministic child id before the parent awaited it, so its
+    // completion found no waiter.
+    await startRun(engine, 'child', 21, 'early.child.0');
+    expect((await settle(store, 'early.child.0')).status).toBe('completed');
+
+    await startRun(engine, 'parent', {}, 'early');
+    const run = await settle(store, 'early');
+    expect(run.status).toBe('completed');
+    expect(run.output).toEqual({ fromChild: { doubled: 42 } });
+  });
+
   it('propagates a failed child to the parent as a catchable error', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });

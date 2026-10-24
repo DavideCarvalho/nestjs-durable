@@ -3849,14 +3849,28 @@ export class WorkflowEngine {
     // remains, and its next turn starts every child that has no run yet.
     this.localWork.submit(`start:${childId}`, async () => {
       if (this.draining) return;
-      await this.start(workflow, input, childId, opts).catch((err) => {
+      const started = await this.start(workflow, input, childId, opts).catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
         this.notifyParent(childId, {
           ok: false,
           error: `child workflow "${workflow}" failed to start: ${message}`,
         });
+        return undefined;
       });
+      // `start` is idempotent: a child that already ran and finished under this id is not run again,
+      // and its completion found no waiter back then. Its parent's waiter exists now (it is put
+      // before the start), so deliver the completion again.
+      if (started) this.redeliverFinishedChild(childId, started);
     });
+  }
+
+  /** {@link startChildDeferred}: re-deliver the completion of a child `start` found finished. */
+  private redeliverFinishedChild(
+    childId: string,
+    run: Pick<WorkflowRun, 'status' | 'output' | 'error'>,
+  ): void {
+    const completion = childCompletion(run as WorkflowRun);
+    if (completion) this.inBackground(this.deliverToParent(`child:${childId}`, completion));
   }
 
   /**
@@ -5689,10 +5703,14 @@ export class WorkflowEngine {
           // dashboard renders the fan as one parallel group. Undefined for a lone (non-fan) child.
           parallelGroup: cmd.parallelGroup,
         });
-        if (!(await this.store.getRun(childId))) {
+        const existingChild = await this.store.getRun(childId);
+        if (!existingChild) {
           // Inherit the parent run's namespace (see ctxHostFor.startChild) so a remote workflow's
           // child stays on the parent's tenant/partition regardless of which engine executes it.
           this.startChildDeferred(cmd.workflow, cmd.input, childId, { namespace: run.namespace });
+        } else {
+          // Already finished before this waiter existed: its notification found none.
+          this.redeliverFinishedChild(childId, existingChild);
         }
       } else {
         throw new Error(

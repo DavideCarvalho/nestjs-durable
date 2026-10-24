@@ -883,11 +883,14 @@ export function createWorkflowCtx(
           }
           known = started;
         }
-        // Children that finished before this join (their notification found no waiter) are settled
-        // now, from their rows; then the fan is evaluated again, which may finish it, fail it fast, or
-        // send its next wave.
+        // Children of this fan that finished before this join (their notification found no waiter)
+        // are settled now, from the rows just read; then the fan is evaluated again, which may finish
+        // it, fail it fast, or send its next wave. Only the children with a placeholder already: the
+        // ones registered above are started by this turn, and a start that finds the child already
+        // finished re-delivers its completion to the waiter (`startChildDeferred`), so they need no
+        // extra read of every child of a wide fan here.
         const now = await settleFinishedChildren(
-          [...toRegister, ...toEnsure].map((i) => ({
+          toEnsure.map((i) => ({
             id: id(i),
             seq: positions[i] as number,
             parallelGroup: group,

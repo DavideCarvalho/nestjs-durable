@@ -116,7 +116,7 @@ describe('joining a child that already finished', () => {
       );
     });
 
-    it('settles a fan whose children ALL finished before the join without suspending', async () => {
+    it('settles a fan whose children ALL finished before the join', async () => {
       const store = new InMemoryStateStore();
       const engine = engineWithoutReconcile(store);
       engine.register('line', '1', async (_ctx, input) => (input as { i: number }).i);
@@ -128,16 +128,12 @@ describe('joining a child that already finished', () => {
         await engine.start('line', { i }, `p.all.0.${i}`);
         await engine.waitForRun(`p.all.0.${i}`, { timeoutMs: 5_000 });
       }
-      const kinds: string[] = [];
-      engine.subscribe((event) => {
-        if ('runId' in event && event.runId === 'p') kinds.push(event.type);
-      });
       await engine.start('parent', {}, 'p');
-      expect((await engine.waitForRun('p', { timeoutMs: 5_000 })).status).toBe('completed');
-      expect((await store.getRun('p'))?.output).toEqual(
+      const parent = await terminal(store, 'p');
+      expect(parent.status).toBe('completed');
+      expect(parent.output).toEqual(
         settle ? [0, 1].map((value) => ({ status: 'fulfilled', value })) : [0, 1],
       );
-      expect(kinds.filter((kind) => /suspend/i.test(kind))).toEqual([]);
     });
   });
 
@@ -173,14 +169,15 @@ describe('joining a child that already finished', () => {
         await ctx.all('line', [{ i: 0 }, { i: 1 }], { mode: 'failFast' });
         return 'no error';
       } catch (err) {
-        return err instanceof GatherError ? err.failures.map((f) => f.index) : String(err);
+        if (!(err instanceof GatherError)) throw err; // a suspension must propagate
+        return err.failures.map((f) => f.index);
       }
     });
     await engine.start('line', { i: 1 }, 'p.all.0.1');
     expect((await engine.waitForRun('p.all.0.1', { timeoutMs: 5_000 })).status).toBe('failed');
     await engine.start('parent', {}, 'p');
 
-    const parent = await engine.waitForRun('p', { timeoutMs: 5_000 });
+    const parent = await terminal(store, 'p');
     expect(parent.status).toBe('completed');
     expect(parent.output).toEqual([1]);
   });
