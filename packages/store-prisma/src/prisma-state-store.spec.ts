@@ -205,9 +205,6 @@ describe('PrismaStateStore', () => {
 
   it('pushes attribute predicates DOWN into SQL via EXISTS on the side-table', async (ctx) => {
     if (!available) ctx.skip();
-    // The client is shared with the contract cases above: let any of their background statements
-    // land before counting this case's own.
-    await new Promise((resolve) => setTimeout(resolve, 200));
     const queries: string[] = [];
     const onQuery = (e: { query: string }) => queries.push(e.query);
     prisma.$on('query', onQuery);
@@ -233,25 +230,33 @@ describe('PrismaStateStore', () => {
 
   it('runs the checkpoint compare-and-set and the fan count as one statement each', async (ctx) => {
     if (!available) ctx.skip();
-    await store.createRun(run());
-    await store.saveCheckpoint(checkpoint({ status: 'pending', output: undefined }));
-    // The client is shared with the contract cases above: let any of their background statements
-    // land before counting this case's own.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // The client is shared with the contract cases above, whose background statements can land
+    // while this case runs: count only the statements bound to this case's own run id.
+    const runId = `stmt-${globalThis.crypto.randomUUID()}`;
+    await store.createRun(run({ id: runId }));
+    const pending = checkpoint({
+      runId,
+      stepId: `${runId}:0`,
+      status: 'pending',
+      output: undefined,
+    });
+    await store.saveCheckpoint(pending);
     const queries: string[] = [];
-    const onQuery = (e: { query: string }) => queries.push(e.query);
+    const onQuery = (e: { query: string; params: string }) => {
+      if (e.params.includes(runId)) queries.push(e.query);
+    };
     prisma.$on('query', onQuery);
     try {
       const sql = () => queries.filter((q) => /durable_step_checkpoints/i.test(q));
       queries.length = 0;
-      expect(await store.saveCheckpointIfPending(checkpoint())).toBe(true);
+      expect(await store.saveCheckpointIfPending({ ...pending, status: 'completed' })).toBe(true);
       // No read before the write: the status predicate rides on the UPDATE itself.
       expect(sql()).toHaveLength(1);
       expect(sql()[0]).toMatch(/^update/i);
       expect(sql()[0]).toMatch(/status/i);
 
       queries.length = 0;
-      expect(await store.countCheckpoints('r1', 0, 5, ['completed'])).toBe(1);
+      expect(await store.countCheckpoints(runId, 0, 5, ['completed'])).toBe(1);
       expect(sql()).toHaveLength(1);
       expect(sql()[0]).toMatch(/count\(/i);
     } finally {
