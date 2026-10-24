@@ -205,6 +205,9 @@ describe('PrismaStateStore', () => {
 
   it('pushes attribute predicates DOWN into SQL via EXISTS on the side-table', async (ctx) => {
     if (!available) ctx.skip();
+    // The client is shared with the contract cases above: let any of their background statements
+    // land before counting this case's own.
+    await new Promise((resolve) => setTimeout(resolve, 200));
     const queries: string[] = [];
     const onQuery = (e: { query: string }) => queries.push(e.query);
     prisma.$on('query', onQuery);
@@ -232,6 +235,9 @@ describe('PrismaStateStore', () => {
     if (!available) ctx.skip();
     await store.createRun(run());
     await store.saveCheckpoint(checkpoint({ status: 'pending', output: undefined }));
+    // The client is shared with the contract cases above: let any of their background statements
+    // land before counting this case's own.
+    await new Promise((resolve) => setTimeout(resolve, 200));
     const queries: string[] = [];
     const onQuery = (e: { query: string }) => queries.push(e.query);
     prisma.$on('query', onQuery);
