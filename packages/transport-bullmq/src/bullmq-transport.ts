@@ -90,6 +90,13 @@ const RESULT_JOB_OPTIONS = {
 
 // Default `pingIntervalMs` (see `BullMQTransportOptions`) for the shared subscriber watchdog.
 const DEFAULT_PING_INTERVAL_MS = 30_000;
+/**
+ * The fewest step results the results consumer works on at once. Handing one over is cheap: the
+ * engine writes one run's waiting results together and asks a fan's barrier once they are written,
+ * so the more of a wide fan's results are in flight here, the fewer writes settle them. With only a
+ * few in flight, a wide fan's results wait in Redis while its steps are already done.
+ */
+const RESULT_CONSUMER_CONCURRENCY = 512;
 /** The largest delay `setTimeout`/`setInterval` honour (a signed 32-bit int); above it Node uses 1ms. */
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 // How long a single watchdog PING may take before its subscriber connection is presumed dead.
@@ -101,6 +108,8 @@ const SUBSCRIBER_PING_TIMEOUT_MS = 5_000;
 const DEFAULT_KEEPALIVE_MS = 10_000;
 /** Most run jobs one `addBulk` of {@link BullMQTransport.dispatchRuns} writes. */
 export const RUNS_BULK_CHUNK = 500;
+/** `addBulk` calls {@link BullMQTransport.dispatchMany} has in flight at once. */
+const TASK_BULKS_IN_FLIGHT = 4;
 
 /**
  * The job id of a run's `start` for one pending state: `start-<runId>-<key>`, with `%` and `:`
@@ -358,11 +367,11 @@ export interface BullMQTransportOptions {
    */
   stepTimeoutMs?: number;
   /**
-   * How many step results this instance handles at once from the results queue. Each result
-   * settles its checkpoint and resumes its run inline, so with the default of 1 a pod drives one
-   * run turn at a time off results, and a wide fan's results queue up behind it. Raising it lets
-   * results of different runs proceed in parallel; the engine still handles one run's results in
-   * order on this instance, so a run never gets two concurrent turns from it. Default 1.
+   * The most step results this instance handles at once from the results queue, when above the
+   * built-in 512. Results of one run are settled together and of different runs in parallel; the
+   * engine still handles one run's results in order on this instance, so a run never gets two
+   * concurrent turns from it. Rarely worth setting: the built-in value already keeps a wide fan's
+   * results flowing.
    */
   resultConcurrency?: number;
 }
@@ -467,8 +476,10 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.stepTimeoutMs = options.stepTimeoutMs;
     const results = options.resultConcurrency;
-    this.resultConcurrency =
-      results !== undefined && Number.isFinite(results) && results >= 1 ? Math.floor(results) : 1;
+    this.resultConcurrency = Math.max(
+      RESULT_CONSUMER_CONCURRENCY,
+      results !== undefined && Number.isFinite(results) && results >= 1 ? Math.floor(results) : 1,
+    );
   }
 
   /**
@@ -662,7 +673,45 @@ export class BullMQTransport implements Transport, ControlPlane {
    *  partition)`), computed upstream by the engine — this targets that handler's dedicated queue. */
   async dispatch(task: RemoteTask): Promise<void> {
     this.#assertRoutableToken(task.group);
-    await this.queue(this.tasksName(task.group)).add('task', task, {
+    await this.queue(this.tasksName(task.group)).add('task', task, this.taskJobOptions(task));
+  }
+
+  /**
+   * {@link dispatch} for many tasks: `addBulk` calls of {@link RUNS_BULK_CHUNK} jobs per queue, a
+   * few of them in flight at once.
+   */
+  async dispatchMany(tasks: RemoteTask[]): Promise<void> {
+    const byGroup = new Map<string, RemoteTask[]>();
+    for (const task of tasks) {
+      this.#assertRoutableToken(task.group);
+      const grouped = byGroup.get(task.group);
+      if (grouped) grouped.push(task);
+      else byGroup.set(task.group, [task]);
+    }
+    for (const [group, grouped] of byGroup) {
+      const queue = this.queue(this.tasksName(group));
+      const chunks: RemoteTask[][] = [];
+      for (let at = 0; at < grouped.length; at += RUNS_BULK_CHUNK) {
+        chunks.push(grouped.slice(at, at + RUNS_BULK_CHUNK));
+      }
+      for (let at = 0; at < chunks.length; at += TASK_BULKS_IN_FLIGHT) {
+        await Promise.all(
+          chunks.slice(at, at + TASK_BULKS_IN_FLIGHT).map((chunk) =>
+            queue.addBulk(
+              chunk.map((task) => ({
+                name: 'task',
+                data: task,
+                opts: this.taskJobOptions(task),
+              })),
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  private taskJobOptions(task: RemoteTask) {
+    return {
       ...this.jobOptions(task.priority),
       // Retain a FAILED task job's payload (age-bounded) instead of deleting it. A worker that
       // crashes/stalls has its job failed by a PEER worker's stalled-check, and BullMQ's
@@ -671,7 +720,7 @@ export class BullMQTransport implements Transport, ControlPlane {
       // StepResult from. Keeping it briefly lets the bridge settle the run's `pending` checkpoint
       // (and doubles as failure forensics); BullMQ GCs it after the window.
       removeOnFail: { age: TASK_FAILED_RETENTION_SECONDS },
-    });
+    };
   }
 
   private decisionsName(): string {

@@ -1,14 +1,18 @@
 import { CreateQueueCommand, ListQueuesCommand, SQSClient } from '@aws-sdk/client-sqs';
-import { runRunDispatchContract } from '@dudousxd/nestjs-durable-testing';
+import {
+  STEP_FAN_STEP,
+  runRunDispatchContract,
+  runStepFanResultsContract,
+} from '@dudousxd/nestjs-durable-testing';
 import { GenericContainer, type StartedTestContainer, Wait } from 'testcontainers';
 import { afterAll, beforeAll } from 'vitest';
 import { SqsTransport } from './sqs-transport';
 
 /**
- * The shared run-dispatch contract against ElasticMQ (an SQS-compatible broker, testcontainers):
- * two SqsTransports on one fresh run queue per case stand for two instances of a deployment, on a
- * standard queue and on a FIFO one. SQS does not deduplicate a waiting run, so the contract checks
- * that a run received twice runs one turn instead. Run with `pnpm test:db`. Uses
+ * The shared run-dispatch and step-fan-results contracts against ElasticMQ (an SQS-compatible
+ * broker, testcontainers): two SqsTransports on one fresh run queue per case stand for two instances
+ * of a deployment, on a standard queue and on a FIFO one. SQS does not deduplicate a waiting run, so
+ * the contract checks that a run received twice runs one turn instead. Run with `pnpm test:db`. Uses
  * `DURABLE_TEST_SQS_ENDPOINT` (an ElasticMQ `http://host:port`) when set; skips when Docker is
  * unavailable or `SKIP_TESTCONTAINERS` is set.
  */
@@ -96,3 +100,36 @@ for (const fifo of [false, true]) {
     { dedupesWaitingRuns: false },
   );
 }
+
+runStepFanResultsContract(
+  'SqsTransport (ElasticMQ)',
+  async () => {
+    if (unavailable || !clientConfig) return unavailable ?? 'no ElasticMQ';
+    const config = clientConfig;
+    return {
+      open: async (handler) => {
+        cases += 1;
+        const prefix = `fr${cases}-${Date.now()}`;
+        const make = (group?: string) =>
+          new SqsTransport({
+            clientConfig: config,
+            prefix,
+            autoCreate: true,
+            waitTimeSeconds: 1,
+            ...(group ? { group } : {}),
+          });
+        // A worker's task loop runs one step at a time: several of them keep the fan moving.
+        const workers = Array.from({ length: 8 }, () => make(STEP_FAN_STEP));
+        for (const worker of workers) worker.handle(STEP_FAN_STEP, handler);
+        const engines: [SqsTransport, SqsTransport] = [make(), make()];
+        return {
+          engines,
+          close: async () => {
+            await Promise.all([...workers, ...engines].map((t) => t.close()));
+          },
+        };
+      },
+    };
+  },
+  { fanSize: 600, timeoutMs: 120_000 },
+);

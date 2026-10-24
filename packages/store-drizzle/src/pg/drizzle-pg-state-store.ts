@@ -336,8 +336,42 @@ export class DrizzlePgStateStore implements StateStore {
     return rows[0] ? fromCheckpointRow(rows[0]) : null;
   }
 
+  async getCheckpoints(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const unique = [...new Set(seqs)];
+    const rows: (typeof stepCheckpoints.$inferSelect)[] = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      rows.push(
+        ...(await this.db
+          .select()
+          .from(stepCheckpoints)
+          .where(
+            and(
+              eq(stepCheckpoints.runId, runId),
+              inArray(stepCheckpoints.seq, unique.slice(at, at + 500)),
+            ),
+          )),
+      );
+    }
+    return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointRow);
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     await upsertCheckpoint(this.db, checkpoint);
+  }
+
+  async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
+    if (checkpoints.length === 0) return;
+    await this.db.transaction(async (tx) => {
+      for (let at = 0; at < checkpoints.length; at += CHECKPOINT_BATCH_ROWS) {
+        await tx
+          .insert(stepCheckpoints)
+          .values(checkpoints.slice(at, at + CHECKPOINT_BATCH_ROWS).map(toCheckpointRow))
+          .onConflictDoUpdate({
+            target: [stepCheckpoints.runId, stepCheckpoints.seq],
+            set: excludedSet(stepCheckpoints),
+          });
+      }
+    });
   }
 
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {

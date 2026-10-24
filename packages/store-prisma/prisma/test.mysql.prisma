@@ -1,0 +1,157 @@
+// Self-contained schema used ONLY to generate a MySQL client + push a MySQL DB for the
+// real-engine adapter tests (prisma-state-store.db.spec.ts, run via `pnpm test:db`). The models
+// mirror prisma/schema.prisma — the snippet users copy into their own schema — but target MySQL
+// so the contract runs against a real engine where `array_contains` (tag filter) and the numeric
+// side-table predicates behave as in production. The datasource URL is supplied at test time via the
+// `PRISMA_MYSQL_URL` env var (the testcontainers MySQL connection string).
+
+datasource db {
+  provider = "mysql"
+  url      = env("PRISMA_MYSQL_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/mysql-client"
+}
+
+model DurableWorkflowRun {
+  id              String   @id
+  workflow        String
+  workflowVersion String   @map("workflow_version")
+  status          String
+  input           Json?
+  output          Json?
+  error           Json?
+  wakeAt          BigInt?  @map("wake_at")
+  lockedBy        String?  @map("locked_by")
+  lockedUntil     DateTime? @map("locked_until")
+  awaitingDecisionTaskId String? @map("awaiting_decision_task_id")
+  recoveryAttempts Int?    @map("recovery_attempts")
+  tags            Json?
+  searchAttributes Json?   @map("search_attributes")
+  priority         Int?    @map("priority")
+  // The worker-pool partition that owns this run — the tenant boundary. A worker only picks up /
+  // recovers / resumes-timers-for / times-out runs in its own namespace, so this column sits on the
+  // predicate of every poll tick.
+  //
+  // NOT NULL WITH A DEFAULT, deliberately unlike `origin` below. A row written before this column
+  // existed was executed by an engine with no namespace, and such an engine stamps and routes as
+  // `'default'` — so `'default'` is that row's TRUE namespace, reconstructed rather than invented.
+  // Leaving old rows NULL is the option that breaks: a `'default'` worker polls
+  // `WHERE namespace = 'default'`, a NULL row never matches it, and the run is never picked up,
+  // recovered or timed out again. So the migration must back-fill (see below), and this adapter
+  // never coerces NULL to `'default'` on the way out — that would show a healthy namespace in the
+  // dashboard for a row no worker can see.
+  //
+  // Existing deployment (Prisma Migrate generates exactly this from the field):
+  //   ALTER TABLE durable_workflow_runs ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';
+  //   CREATE INDEX durable_workflow_runs_namespace_status_idx
+  //     ON durable_workflow_runs (namespace, status, created_at);
+  // The ADD COLUMN back-fills every existing row with `'default'` in one statement on
+  // Postgres/MySQL/SQLite alike. Use `VARCHAR(255)` for MySQL.
+  namespace       String   @default("default") @map("namespace")
+  // Which library/module registered the workflow this run belongs to (e.g.
+  // `@dudousxd/nestjs-catalog-pipeline`), derived at registration time — never caller input.
+  // Nullable with NO default: an origin cannot be reconstructed for a row written before this
+  // column existed, so it stays NULL and reads back as `undefined` = "unknown". A real-looking
+  // default would be indistinguishable from a genuine registration in the dashboard facet.
+  origin           String? @map("origin")
+  createdAt       DateTime @map("created_at")
+  updatedAt       DateTime @map("updated_at")
+
+  attributes      DurableRunAttribute[]
+
+  @@index([status, wakeAt])
+  @@index([workflow, status])
+  @@index([namespace, status, createdAt], map: "durable_workflow_runs_namespace_status_idx")
+  @@map("durable_workflow_runs")
+}
+
+model DurableRunAttribute {
+  runId    String  @map("run_id")
+  key      String
+  strValue String? @map("str_value")
+  numValue Float?  @map("num_value")
+
+  run      DurableWorkflowRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@id([runId, key])
+  @@index([key, numValue])
+  @@index([key, strValue])
+  @@map("durable_run_attributes")
+}
+
+model DurableStepCheckpoint {
+  runId       String   @map("run_id")
+  seq         Int
+  name        String
+  kind        String
+  stepId      String   @map("step_id")
+  status      String
+  input       Json?
+  output      Json?
+  error       Json?
+  events      Json?
+  attempts    Int
+  workerGroup String?  @map("worker_group")
+  parallelGroup String? @map("parallel_group")
+  wakeAt      BigInt?  @map("wake_at")
+  enqueuedAt  DateTime? @map("enqueued_at")
+  startedAt   DateTime @map("started_at")
+  finishedAt  DateTime @map("finished_at")
+
+  @@id([runId, seq])
+  // One fan of a run, in seq order: the run detail aggregates and pages a fan through it.
+  @@index([runId, parallelGroup, seq], map: "durable_step_checkpoints_group_idx")
+  @@map("durable_step_checkpoints")
+}
+
+model DurableSignalWaiter {
+  token         String  @id
+  runId         String  @map("run_id")
+  seq           Int
+  parallelGroup String? @map("parallel_group")
+
+  @@index([runId], map: "durable_signal_waiters_run_id_idx")
+  @@map("durable_signal_waiters")
+}
+
+model DurableBufferedSignal {
+  id      BigInt @id @default(autoincrement())
+  token   String
+  payload Json?
+
+  @@index([token])
+  @@map("durable_buffered_signals")
+}
+
+model DurableBufferedEvent {
+  id          String @id
+  name        String
+  payload     Json?
+  publishedAt BigInt @map("published_at")
+
+  @@index([name, publishedAt])
+  @@map("durable_buffered_events")
+}
+
+// Persisted schedules (`engine.schedules`) — only needed if you use them. `spec`/`state` are
+// engine-owned JSON documents; `nextFireAt` is epoch ms as a BigInt (exact, so the compare-and-set in
+// `updateSchedule` can't be defeated by a timestamp's precision).
+model DurableSchedule {
+  id         String   @id
+  namespace  String   @default("default")
+  workflow   String
+  paused     Boolean  @default(false)
+  nextFireAt BigInt?  @map("next_fire_at")
+  tags       Json?
+  spec       Json
+  state      Json
+  createdAt  DateTime @map("created_at")
+  updatedAt  DateTime @map("updated_at")
+
+  // The poll's "due by T" scan: `paused = false AND next_fire_at <= T ORDER BY next_fire_at`.
+  @@index([paused, nextFireAt], map: "durable_schedules_due_idx")
+  @@map("durable_schedules")
+}

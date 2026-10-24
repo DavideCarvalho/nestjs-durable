@@ -106,16 +106,30 @@ async function freshStore(
 
 for (const driver of ['node-postgres', 'postgres-js'] as const) {
   describe(`Drizzle Postgres (${driver}) [real engine]`, () => {
-    runStateStoreContract(
-      `Drizzle Postgres (${driver})`,
-      async (): Promise<StateStoreContext> => ({
-        store: await freshStore(driver),
+    runStateStoreContract(`Drizzle Postgres (${driver})`, async (): Promise<StateStoreContext> => {
+      let statements = 0;
+      const logger = {
+        logQuery: () => {
+          statements += 1;
+        },
+      };
+      liveDb(driver);
+      const db: DrizzlePgDatabase =
+        driver === 'node-postgres'
+          ? drizzleNodePg(pool as pg.Pool, { logger })
+          : drizzlePostgresJs(sqlJs as postgres.Sql, { logger });
+      const store = new DrizzlePgStateStore(db);
+      await store.ensureSchema();
+      await truncate();
+      return {
+        store,
         peerStore: new DrizzlePgStateStore(
           liveDb(driver === 'node-postgres' ? 'postgres-js' : 'node-postgres'),
         ),
+        statements: () => statements,
         cleanup: truncate,
-      }),
-    );
+      };
+    });
 
     it('round-trips jsonb scalars, arrays and nested payloads without double-encoding', async (ctx) => {
       if (!available()) return ctx.skip();

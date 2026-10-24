@@ -119,6 +119,16 @@ interface Received {
 const RESULT_VISIBILITY_SEC = 30;
 
 /**
+ * How many receive loops consume the results queue on one instance. Each hands every message of a
+ * receive to the engine at once, so up to this many times ten results are in flight here: the
+ * engine writes one run's waiting results together, so a wide fan settles in few writes.
+ */
+const RESULT_RECEIVERS = 8;
+
+/** `SendMessageBatch` calls {@link SqsTransport.dispatchMany} has in flight at once. */
+const TASK_BATCHES_IN_FLIGHT = 10;
+
+/**
  * An SQS-backed `Transport` — dispatch remote steps over Amazon SQS (or ElasticMQ). Unlike the
  * BullMQ transport, it does **not** mint its own queue names: pass `taskQueueUrl` / `resultsQueueUrl`
  * to ride the queues you already operate. The wire payload is the documented `RemoteTask` /
@@ -429,6 +439,49 @@ export class SqsTransport implements Transport {
     );
   }
 
+  /**
+   * {@link dispatch} for many tasks: ten per `SendMessageBatch`, a few batches at a time. Throws if
+   * any entry failed (the engine then dispatches the batch again one task at a time).
+   */
+  async dispatchMany(tasks: RemoteTask[]): Promise<void> {
+    const byGroup = new Map<string, RemoteTask[]>();
+    for (const task of tasks) {
+      const grouped = byGroup.get(task.group);
+      if (grouped) grouped.push(task);
+      else byGroup.set(task.group, [task]);
+    }
+    for (const [group, grouped] of byGroup) {
+      const QueueUrl = await this.tasksUrl(group);
+      const batches: RemoteTask[][] = [];
+      for (let at = 0; at < grouped.length; at += SQS_BATCH_MAX) {
+        batches.push(grouped.slice(at, at + SQS_BATCH_MAX));
+      }
+      for (let at = 0; at < batches.length; at += TASK_BATCHES_IN_FLIGHT) {
+        await Promise.all(
+          batches.slice(at, at + TASK_BATCHES_IN_FLIGHT).map(async (batch) => {
+            const out = await this.client.send(
+              new SendMessageBatchCommand({
+                QueueUrl,
+                Entries: batch.map((task, i) => ({
+                  Id: String(i),
+                  MessageBody: JSON.stringify(task),
+                  MessageAttributes: this.marker
+                    ? { [this.marker]: { DataType: 'String', StringValue: '1' } }
+                    : undefined,
+                })),
+              }),
+            );
+            if (out.Failed && out.Failed.length > 0) {
+              throw new Error(
+                `SQS refused ${out.Failed.length} task(s): ${out.Failed.map((f) => f.Message ?? f.Code).join('; ')}`,
+              );
+            }
+          }),
+        );
+      }
+    }
+  }
+
   // ── worker → engine ────────────────────────────────────────────────────────────────────────
 
   /** Register a step handler (worker side). Starts the group's task consumer on first call. */
@@ -439,7 +492,10 @@ export class SqsTransport implements Transport {
   }
 
   onResult(handler: (result: StepResult) => Promise<void>): void {
-    if (!this.resultLoop) this.resultLoop = this.pollResults(handler);
+    if (this.resultLoop) return;
+    this.resultLoop = Promise.all(
+      Array.from({ length: RESULT_RECEIVERS }, () => this.pollResults(handler)),
+    ).then(() => undefined);
   }
 
   onHeartbeat(_handler: (beat: Heartbeat) => Promise<void>): void {
@@ -449,16 +505,18 @@ export class SqsTransport implements Transport {
   // ── polling loops ──────────────────────────────────────────────────────────────────────────
 
   /**
-   * Receive a batch and hand each message to `each`, one at a time, never letting a failure escape:
-   * a throw is reported through `onError` and its message is left on the queue (SQS redelivers it
-   * after the visibility timeout; a redrive policy DLQs one that keeps failing). Every message of the
-   * batch is kept invisible until it is handled (see {@link holdVisible}), so the ones waiting behind a
-   * slow handler are never redelivered to another consumer meanwhile.
+   * Receive a batch and hand each message to `each` — one at a time, or all at once when
+   * `concurrent` — never letting a failure escape: a throw is reported through `onError` and its
+   * message is left on the queue (SQS redelivers it after the visibility timeout; a redrive policy
+   * DLQs one that keeps failing). Every message of the batch is kept invisible until it is handled
+   * (see {@link holdVisible}), so the ones waiting behind a slow handler are never redelivered to
+   * another consumer meanwhile.
    */
   private async pollLoop(
     queueUrl: () => Promise<string>,
     visibilitySec: number,
     each: (QueueUrl: string, msg: Received) => Promise<void>,
+    concurrent = false,
   ): Promise<void> {
     while (this.running) {
       let QueueUrl: string;
@@ -473,21 +531,28 @@ export class SqsTransport implements Transport {
       const messages = await this.receive(QueueUrl, visibilitySec);
       const pending = new Set<Received>(messages);
       const stopHolding = this.holdVisible(QueueUrl, pending, visibilitySec);
-      try {
-        for (const msg of messages) {
-          if (!this.running) break; // close(): what is left reappears after its visibility timeout
-          try {
-            if (this.shouldSkip(msg)) {
-              // Not ours (shared queue): release immediately so the legacy consumer can take it.
-              pending.delete(msg);
-              await this.release(QueueUrl, msg.ReceiptHandle);
-              continue;
-            }
-            await each(QueueUrl, msg);
-          } catch (err) {
-            this.onError(err);
-          } finally {
+      const handle = async (msg: Received): Promise<void> => {
+        try {
+          if (this.shouldSkip(msg)) {
+            // Not ours (shared queue): release immediately so the legacy consumer can take it.
             pending.delete(msg);
+            await this.release(QueueUrl, msg.ReceiptHandle);
+            return;
+          }
+          await each(QueueUrl, msg);
+        } catch (err) {
+          this.onError(err);
+        } finally {
+          pending.delete(msg);
+        }
+      };
+      try {
+        if (concurrent) {
+          if (this.running) await Promise.all(messages.map(handle));
+        } else {
+          for (const msg of messages) {
+            if (!this.running) break; // close(): what is left reappears after its visibility timeout
+            await handle(msg);
           }
         }
       } finally {
@@ -574,6 +639,7 @@ export class SqsTransport implements Transport {
         await handler(this.parse<StepResult>(msg));
         await this.del(QueueUrl, msg.ReceiptHandle);
       },
+      true,
     );
   }
 
