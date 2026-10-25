@@ -59,10 +59,14 @@ interface DurableQueryBuilder<T> {
   getFormattedQuery(): string;
   addSelect(field: unknown): DurableQueryBuilder<T>;
   groupBy(fields: string[]): DurableQueryBuilder<T>;
-  execute<R>(): Promise<R>;
+  // Upsert verbs — used only by `upsertCheckpointRows`.
+  insert(rows: Record<string, unknown>[]): DurableQueryBuilder<T>;
+  onConflict(fields: string[]): DurableQueryBuilder<T>;
+  merge(): DurableQueryBuilder<T>;
+  execute<R>(method?: 'all' | 'get' | 'run', mapResults?: boolean): Promise<R>;
 }
 type SqlEm = EntityManager & {
-  createQueryBuilder<T>(entity: unknown, alias: string): DurableQueryBuilder<T>;
+  createQueryBuilder<T>(entity: unknown, alias?: string): DurableQueryBuilder<T>;
 };
 
 /** Resolved side-table column names (per the active naming strategy) for the raw EXISTS pushdown. */
@@ -360,7 +364,7 @@ export class MikroOrmStateStore implements StateStore {
     const rows: StepCheckpointEntity[] = [];
     for (let at = 0; at < unique.length; at += 500) {
       const seq = { $in: unique.slice(at, at + 500) };
-      rows.push(...(await em.find(StepCheckpointEntity, { runId, seq })));
+      rows.push(...(await selectCheckpointRows(em, { runId, seq })));
     }
     return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointEntity);
   }
@@ -373,14 +377,9 @@ export class MikroOrmStateStore implements StateStore {
 
   async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
     if (checkpoints.length === 0) return;
-    await this.fork().transactional(async (em) => {
-      for (let at = 0; at < checkpoints.length; at += 500) {
-        await em.upsertMany(
-          StepCheckpointEntity,
-          checkpoints.slice(at, at + 500).map(toCheckpointRow),
-        );
-      }
-    });
+    await this.fork().transactional((em) =>
+      upsertCheckpointRows(em, checkpoints.map(toCheckpointRow)),
+    );
   }
 
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
@@ -436,10 +435,7 @@ export class MikroOrmStateStore implements StateStore {
         if (checkpoint.status !== 'pending') pending.delete(k);
       }
       // A write without a deadline clears the one the pending row held.
-      const rows = [...writes.values()].map(toCheckpointRow);
-      for (let at = 0; at < rows.length; at += 500) {
-        await em.upsertMany(StepCheckpointEntity, rows.slice(at, at + 500));
-      }
+      await upsertCheckpointRows(em, [...writes.values()].map(toCheckpointRow));
       return wrote;
     });
   }
@@ -967,8 +963,7 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
-    const em = this.fork();
-    const rows = await em.find(StepCheckpointEntity, { runId }, { orderBy: { seq: 'asc' } });
+    const rows = await selectCheckpointRows(this.fork(), { runId });
     return rows.map(fromCheckpointEntity);
   }
 
@@ -1399,6 +1394,53 @@ function aggregateDateReader(em: EntityManager): (value: unknown) => Date {
  * {@link toCheckpointEntity} with every nullable column set, for a multi-row upsert: it writes the
  * columns of its first row to every row, so an absent value must be an explicit `null`.
  */
+/**
+ * Checkpoint rows by `where`, in seq order, through the query builder: mapped to entity properties
+ * with the same type conversions as `em.find`, but not turned into managed entities, which for a
+ * 40k-step fan took five times as long as the query.
+ */
+async function selectCheckpointRows(
+  em: EntityManager,
+  where: Record<string, unknown>,
+): Promise<StepCheckpointEntity[]> {
+  const rows = await (em as SqlEm)
+    .createQueryBuilder<StepCheckpointEntity>(StepCheckpointEntity)
+    .where(where)
+    .orderBy({ seq: 'asc' })
+    .execute<Record<string, unknown>[]>('all', true);
+  // The mapping renames columns and parses dates; a custom type (JSON) is converted here, as
+  // hydrating an entity would, since some drivers (SQLite) hand it over as text.
+  const platform = em.getPlatform();
+  const custom = Object.values(em.getMetadata().get(StepCheckpointEntity).properties).filter(
+    (prop) => prop.customType,
+  );
+  for (const row of rows) {
+    for (const prop of custom) {
+      const value = row[prop.name];
+      if (value != null) row[prop.name] = prop.customType?.convertToJSValue(value, platform);
+    }
+  }
+  return rows as unknown as StepCheckpointEntity[];
+}
+
+/**
+ * Insert-or-overwrite checkpoint rows, 500 a statement, through the query builder: the rows are not
+ * turned into managed entities, which for a 40k-step fan cost more than the inserts themselves.
+ */
+async function upsertCheckpointRows(
+  em: EntityManager,
+  rows: StepCheckpointEntity[],
+): Promise<void> {
+  for (let at = 0; at < rows.length; at += 500) {
+    await (em as SqlEm)
+      .createQueryBuilder<StepCheckpointEntity>(StepCheckpointEntity)
+      .insert(rows.slice(at, at + 500).map((row) => ({ ...row })))
+      .onConflict(['runId', 'seq'])
+      .merge()
+      .execute();
+  }
+}
+
 function toCheckpointRow(cp: StepCheckpoint): StepCheckpointEntity {
   const row = toCheckpointEntity(cp) as unknown as Record<string, unknown>;
   for (const key of ['workerGroup', 'parallelGroup', 'wakeAt', 'enqueuedAt']) {

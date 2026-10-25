@@ -129,3 +129,38 @@ describe('the "settled here" maps', () => {
     expect([...maps.settledHere.keys()]).toEqual(['a', 'c']);
   });
 });
+
+describe("a step fan's checkpoints", () => {
+  it('the turn that joins the fan does not read its settled checkpoints twice', async () => {
+    const inner = new InMemoryStateStore();
+    const reads: string[] = [];
+    const store = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (typeof value !== 'function') return value;
+        return (...args: unknown[]) => {
+          if (prop === 'listCheckpoints') reads.push('list');
+          if (prop === 'getCheckpoints') reads.push(`get:${(args[1] as number[]).length}`);
+          return value.apply(target, args);
+        };
+      },
+    });
+    const engine = new WorkflowEngine({ store, transport: new EchoTransport(), reconcileMs: 0 });
+    let turns = 0;
+    engine.register('fan', '1', async (ctx) => {
+      turns += 1;
+      const out = await ctx.all(
+        processLine,
+        Array.from({ length: 500 }, (_, i) => ({ i })),
+      );
+      return out.reduce((a, b) => a + b, 0);
+    });
+    await engine.start('fan', {}, 'f2');
+    expect(await settled(inner, 'f2')).toBe('completed');
+    expect((await inner.getRun('f2'))?.output).toBe((499 * 500) / 2);
+    expect(turns).toBe(2);
+    // Turn 1: its snapshot, then the fan's own read (nothing was sent yet). Turn 2: its snapshot
+    // only, which already holds every step settled.
+    expect(reads.filter((r) => r === 'list')).toHaveLength(3);
+  });
+});

@@ -356,6 +356,8 @@ const versionKey = (name: string, version: string): string => `${name}@${version
  */
 /** How many checkpoint writes / dispatches a step fan sends at once. */
 const STEP_FAN_CHUNK = 200;
+/** Most seqs of a step fan one {@link StateStore.getCheckpoints} call re-reads. */
+const FAN_REREAD_CHUNK = 1000;
 
 /** Tries, and the first backoff, for telling a parent that its child finished (see `deliverToParent`). */
 const PARENT_NOTIFY_ATTEMPTS = 4;
@@ -6483,7 +6485,15 @@ export class WorkflowEngine {
           namespace: parentNamespace,
         }),
       callRemoteAll: (runId, positions, step, inputs, opts) =>
-        this.callRemoteAll(runId, positions, step, inputs, opts, { namespace: parentNamespace }),
+        this.callRemoteAll(
+          runId,
+          positions,
+          step,
+          inputs,
+          opts,
+          { namespace: parentNamespace },
+          replay,
+        ),
       // Defer so a fast child can't reentrantly resume a still-running parent. Stamp the child with
       // the PARENT run's namespace (not this engine's) so a child belongs to the tenant/partition of
       // the run it was spawned from — even when an operator (namespace: undefined, drives every
@@ -6941,6 +6951,7 @@ export class WorkflowEngine {
       settle?: boolean | undefined;
     },
     routing?: { namespace?: string | undefined },
+    replay?: Map<number, StepCheckpoint>,
   ): Promise<TOutput[] | Settled<TOutput>[]> {
     if (step.timeoutMs) {
       throw new Error(
@@ -6957,10 +6968,7 @@ export class WorkflowEngine {
     const first = positions[0] as number;
     const last = positions[positions.length - 1] as number;
     const group = stepFanGroup(first, positions.length, opts.mode);
-    const bySeq = new Map<number, StepCheckpoint>();
-    for (const cp of await this.store.listCheckpoints(runId)) {
-      if (cp.seq >= first && cp.seq <= last) bySeq.set(cp.seq, cp);
-    }
+    const bySeq = await this.fanCheckpoints(runId, positions, replay);
 
     const outputs: TOutput[] = new Array(inputs.length);
     const failures: GatherItemFailure[] = [];
@@ -7052,6 +7060,39 @@ export class WorkflowEngine {
     }
     if (failures.length > 0) throw new GatherError(failures, inputs.length);
     return outputs;
+  }
+
+  /**
+   * The checkpoints of a step fan's seqs, by seq. A settled one is taken from the turn's snapshot
+   * (`replay`), since nothing but a turn of the run changes it once settled; one the snapshot holds
+   * `pending`, or does not hold, is read again, as {@link callRemote} does for a single step: its
+   * result may have landed since. The fan's last turn so reads nothing it already read.
+   */
+  private async fanCheckpoints(
+    runId: string,
+    positions: number[],
+    replay: Map<number, StepCheckpoint> | undefined,
+  ): Promise<Map<number, StepCheckpoint>> {
+    const bySeq = new Map<number, StepCheckpoint>();
+    const reread: number[] = [];
+    for (const seq of positions) {
+      const cp = replay?.get(seq);
+      if (cp && (cp.status === 'completed' || cp.status === 'failed')) bySeq.set(seq, cp);
+      else reread.push(seq);
+    }
+    if (reread.length === 0) return bySeq;
+    if (reread.length === positions.length || !this.store.getCheckpoints) {
+      const wanted = new Set(reread);
+      for (const cp of await this.store.listCheckpoints(runId)) {
+        if (wanted.has(cp.seq)) bySeq.set(cp.seq, cp);
+      }
+      return bySeq;
+    }
+    for (let at = 0; at < reread.length; at += FAN_REREAD_CHUNK) {
+      const read = await this.store.getCheckpoints(runId, reread.slice(at, at + FAN_REREAD_CHUNK));
+      for (const cp of read) bySeq.set(cp.seq, cp);
+    }
+    return bySeq;
   }
 
   /**

@@ -137,7 +137,8 @@ How it decides (same on both SDKs), every `tickMs` (default 2s):
   it's seen. p50 may reach twice that baseline plus 5 ms before it counts as queuing, so the jitter of
   fast steps doesn't read as load. No queuing → **grow**, but *only while saturated* (in-flight near
   the limit), since raising a ceiling nobody hits does nothing: it doubles until the first time it
-  backs off, then grows by √limit a tick. Past the tolerance = queuing → **shrink** proportionally.
+  backs off (re-deciding after each limit's worth of settled steps, not only on the tick, so fast
+  steps reach their level in milliseconds), then grows by √limit a tick. Past the tolerance = queuing → **shrink** proportionally.
   Latency is bottleneck-agnostic — it catches a slow DB, CPU saturation, or lock contention without
   naming which.
 - **RAM ceiling (hard brake).** Reads RSS against the cgroup `memory.max` (falls back to host total).

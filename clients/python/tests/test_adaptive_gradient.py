@@ -78,5 +78,33 @@ class GrowthTest(unittest.TestCase):
         self.assertEqual(ctl.limit, 23)  # 19 + isqrt(19)
 
 
+class SlowStartTest(unittest.TestCase):
+    def test_grows_after_each_limit_of_settled_steps_without_waiting_for_a_tick(self):
+        ctl = controller(start=4)
+        settle(ctl, [2] * 10)
+        ctl.tick()  # one tick of memory headroom, which growing needs
+        self.assertEqual(ctl.limit, 4)  # nothing was in flight: no growth
+        tokens = saturate(ctl)
+        limits = []
+        for _ in range(28):
+            ctl.on_settle(2.0, True, "step", tokens.pop(0))
+            while len(tokens) < ctl.limit:
+                tokens.append(ctl.on_start("step"))
+            limits.append(ctl.limit)
+        self.assertEqual(sorted(set(limits)), [4, 8, 16, 32])
+        self.assertEqual(limits.index(8), 3)  # the 4th settled step
+
+    def test_never_shrinks_between_ticks(self):
+        ctl = controller(start=8)
+        settle(ctl, [1])
+        tokens = saturate(ctl)
+        for _ in range(30):
+            ctl.on_settle(500.0, True, "step", tokens.pop(0))  # far past the tolerance
+            tokens.append(ctl.on_start("step"))
+        self.assertEqual(ctl.limit, 8)
+        ctl.tick()
+        self.assertEqual(ctl._last_adjust["reason"], "shrink")
+
+
 if __name__ == "__main__":
     unittest.main()

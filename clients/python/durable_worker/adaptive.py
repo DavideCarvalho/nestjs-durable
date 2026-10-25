@@ -540,6 +540,8 @@ class AdaptiveController:
         self._headroom_ticks = 0
         # Set the first time the limit moves down. Until then growth doubles the limit (slow start).
         self._backed_off = False
+        # Steps settled since the limit was last decided (see :meth:`on_settle`).
+        self._settled_since_decide = 0
         # Gate latch (hysteresis) + counters surfaced on the heartbeat.
         self._deferring = False
         self._waiting = 0
@@ -623,6 +625,17 @@ class AdaptiveController:
             return
         self._window.append((time.monotonic(), float(duration_ms), bool(ok)))
         self._completions_this_tick += 1
+        # Slow start: until it first backs off, growth is re-decided after each limit's worth of
+        # steps instead of on the next tick, so a worker of fast steps doubles every few milliseconds
+        # rather than every ``tickMs``. Only growth: shrinking and the brakes stay on the tick. The
+        # settling task still counts as in flight, since the consumer refills its slot at once.
+        self._settled_since_decide += 1
+        if (
+            self.config.mode == "adaptive"
+            and not self._backed_off
+            and self._settled_since_decide >= self.limit
+        ):
+            self._decide(grow_only=True, settling=1)
 
     # -- admission control ------------------------------------------------------------------------
 
@@ -833,7 +846,10 @@ class AdaptiveController:
             return
         self._decide(usage_pct)
 
-    def _decide(self, rss_pct: Optional[float] = None) -> None:
+    def _decide(
+        self, rss_pct: Optional[float] = None, grow_only: bool = False, settling: int = 0
+    ) -> None:
+        self._settled_since_decide = 0
         config = self.config
         current = self.limit
         new_limit = current
@@ -861,14 +877,14 @@ class AdaptiveController:
             new_limit = max(config.min, current - 1)
             reason = "backpressure"
         else:
-            gradient = self._gradient()
+            gradient = self._gradient(refresh=not grow_only or self._rtt_long is None)
             if gradient is not None and gradient < 0.7:
                 new_limit = max(config.min, math.floor(current * gradient))
                 reason = "shrink"
             elif (
                 gradient is not None
                 and gradient >= 0.9
-                and self.in_flight >= current * 0.8
+                and self.in_flight + settling >= current * 0.8
                 and self._headroom_ticks >= config.grow_headroom_ticks
             ):
                 # Growing is the one move that can CAUSE an OOM, so it needs sustained headroom —
@@ -879,6 +895,8 @@ class AdaptiveController:
                 reason = "grow"
 
         new_limit = max(config.min, min(config.max, new_limit))
+        if grow_only and reason != "grow":
+            return
         if new_limit != current and reason is not None:
             if new_limit < current:
                 self._backed_off = True
@@ -897,9 +915,9 @@ class AdaptiveController:
 
     # -- metrics ---------------------------------------------------------------------------------
 
-    def _gradient(self) -> Optional[float]:
-        """``(tolerance × rttLong + noise) / rttShort`` clamped to (0, 1]. Updates the rttLong EWMA as a side effect, so it
-        is called exactly once per tick (from :meth:`_decide`)."""
+    def _gradient(self, refresh: bool = True) -> Optional[float]:
+        """``(tolerance × rttLong + noise) / rttShort`` clamped to (0, 1]. With ``refresh`` it updates
+        the rttLong EWMA as a side effect, which a tick does exactly once (from :meth:`_decide`)."""
         durations = [duration for (_, duration, _) in self._window]
         if not durations:
             return None
@@ -907,7 +925,7 @@ class AdaptiveController:
         current_min = durations[0]
         if self._rtt_long is None:
             self._rtt_long = current_min
-        else:
+        elif refresh:
             self._rtt_long = _RTT_LONG_ALPHA * self._rtt_long + (1.0 - _RTT_LONG_ALPHA) * current_min
         rtt_short = _median(durations)
         if rtt_short <= 0:
