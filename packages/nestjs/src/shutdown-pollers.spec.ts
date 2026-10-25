@@ -87,6 +87,7 @@ describe('TimerPoller shutdown', () => {
     const { engine } = blockingEngine({ beginDrain });
     const poller = new TimerPoller(engine, opts({ timerPollMs: 0 }));
     await poller.onApplicationBootstrap();
+    await new Promise((r) => setTimeout(r, 10)); // let the boot poll finish
     await poller.onModuleDestroy();
     expect(beginDrain).toHaveBeenCalledTimes(1);
     expect(beginDrain).toHaveBeenCalledWith();

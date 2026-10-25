@@ -50,6 +50,9 @@ async function bootWithStranded(
   }).compile();
   await moduleRef.init();
   modules.push(moduleRef);
+  // The boot pass runs in the background; the module's close waits for it.
+  await moduleRef.close();
+  modules.pop();
   return seen;
 }
 

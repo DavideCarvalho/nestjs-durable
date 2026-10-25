@@ -116,7 +116,9 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
       );
       return;
     }
-    await this.sweep();
+    // Started, not awaited: a first prune over a large history must not hold the host's boot (its
+    // HTTP server listens only after every `onApplicationBootstrap`). Shutdown waits for it.
+    void this.sweep();
     const intervalMs =
       retention.sweepInterval != null
         ? parseDuration(retention.sweepInterval)
@@ -146,9 +148,8 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
   /**
    * Prune one round.
    *
-   * Never rejects, for the same reason {@link TimerPoller.poll} does not: it is awaited inside
-   * `onApplicationBootstrap` (so a rejection propagates into the host's `bootstrap()` and kills the
-   * process) and fired as `void` on the interval (so a rejection is an unhandled one, also fatal).
+   * Never rejects, for the same reason {@link TimerPoller.poll} does not: it is fired as `void` on
+   * boot and on the interval, so a rejection would be an unhandled one, which is fatal.
    * Pruning history is the least urgent thing this package does — a `pruneTerminalRuns` that fails
    * on a locked table must cost this sweep and nothing more.
    */

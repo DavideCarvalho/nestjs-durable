@@ -50,8 +50,10 @@ describe('durable timers', () => {
     }).compile();
     await moduleRef.init();
 
-    const run = await store.getRun('r1');
-    expect(run?.status).toBe('completed');
-    expect(run?.output).toBe('awake');
+    await vi.waitFor(async () => {
+      const run = await store.getRun('r1');
+      expect(run?.status).toBe('completed');
+      expect(run?.output).toBe('awake');
+    });
   });
 });
