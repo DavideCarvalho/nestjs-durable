@@ -315,7 +315,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       isWorkflowTask(task) && heartbeatClient
         ? startRunHeartbeat(heartbeatClient, prefix, task.group, task.runId)
         : () => {};
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     controller.onStart();
     let ok = false;
     try {
@@ -331,7 +331,11 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
     } finally {
       // One pool, two task kinds. Only step completions feed the adaptive measurement window; a
       // workflow turn's duration would corrupt the latency gradient (it suspends, it doesn't block).
-      controller.onSettle(Date.now() - startedAt, ok, isWorkflowTask(task) ? 'workflow' : 'step');
+      controller.onSettle(
+        performance.now() - startedAt,
+        ok,
+        isWorkflowTask(task) ? 'workflow' : 'step',
+      );
       // Stop the run-scoped beat the moment the turn settles (success OR failure).
       stopBeat();
     }

@@ -7129,13 +7129,18 @@ export class WorkflowEngine {
     this.noteRecent(this.settledHere, key);
   }
 
-  /** Record `key` in a "happened here recently" map, pruning entries older than a lease. */
+  /**
+   * Record `key` in a "happened here recently" map and drop the entries older than a lease. A key is
+   * re-inserted at the end, so the map stays in the order its keys were noted and the stale ones are
+   * all at its front: pruning stops at the first fresh entry instead of walking the whole map.
+   */
   private noteRecent(map: Map<string, number>, key: string): void {
     const now = this.clock();
+    map.delete(key);
     map.set(key, now);
-    if (map.size < 1024) return;
     for (const [k, at] of map) {
-      if (now - at > this.leaseMs) map.delete(k);
+      if (now - at <= this.leaseMs) break;
+      map.delete(k);
     }
   }
 
@@ -7367,7 +7372,8 @@ export class WorkflowEngine {
       else if (claim !== false) outcomes[index] = { error: claim.error };
     });
     for (const { cp, result } of settled) {
-      this.noteSettledHere(`${runId}:${result.seq}`);
+      // A fan's steps are re-driven by the fan's barrier, which `stepFansFiredHere` covers.
+      if (!parseStepFanGroup(cp.parallelGroup)) this.noteSettledHere(`${runId}:${result.seq}`);
       const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
       this.emit({
         type: result.status === 'completed' ? 'step.completed' : 'step.failed',

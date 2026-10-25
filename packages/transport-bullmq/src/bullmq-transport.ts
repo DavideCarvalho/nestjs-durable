@@ -1102,7 +1102,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     // Track the task in the controller (inFlight + duration/ok window) so the heartbeat status and the
     // adaptive loop see it. A handler that throws (failed result) still counts as a settled completion.
     const controller = this.controller();
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     controller.onStart();
     let ok = false;
     try {
@@ -1134,7 +1134,7 @@ export class BullMQTransport implements Transport, ControlPlane {
       // The engine-side task worker runs STEP handlers only (`runStepHandler`), so every settlement
       // is a step — it feeds the adaptive measurement window. Workflow turns are replayed by the SDK
       // worker (`redis-runner`), never here.
-      controller.onSettle(Date.now() - startedAt, ok, 'step');
+      controller.onSettle(performance.now() - startedAt, ok, 'step');
     }
   }
 

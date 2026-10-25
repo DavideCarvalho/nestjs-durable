@@ -86,6 +86,14 @@ _WINDOW_SIZE = 100
 # queuing — which is exactly what keeps the gradient low (and triggers a shrink) while p50 climbs.
 _RTT_LONG_ALPHA = 0.9
 
+# How far p50 may rise over the no-queuing baseline before the gradient reads it as queuing: a
+# multiple of the baseline, plus a fixed amount of noise. The baseline is the fastest completion of
+# the window, which p50 always sits above, and a step of a millisecond or two that sometimes takes
+# five says nothing about load. Read as a plain ratio, both shrank a worker of fast steps to one at
+# a time while the pod sat idle. Same values as the TS controller.
+_LATENCY_TOLERANCE = 2.0
+_LATENCY_NOISE_MS = 5.0
+
 # cgroup "unlimited" sentinel: cgroup v1 reports a value near 2**63 when no limit is set; treat any
 # absurdly large ceiling (>= 1<<62) as "no limit" and fall through to host total.
 _CGROUP_UNLIMITED = 1 << 62
@@ -530,6 +538,8 @@ class AdaptiveController:
         self._idle_usage: Optional[int] = None
         # Consecutive ticks with real headroom; growth requires config.grow_headroom_ticks of them.
         self._headroom_ticks = 0
+        # Set the first time the limit moves down. Until then growth doubles the limit (slow start).
+        self._backed_off = False
         # Gate latch (hysteresis) + counters surfaced on the heartbeat.
         self._deferring = False
         self._waiting = 0
@@ -863,11 +873,15 @@ class AdaptiveController:
             ):
                 # Growing is the one move that can CAUSE an OOM, so it needs sustained headroom —
                 # several consecutive ticks under ramResumePct — not just a healthy latency gradient.
-                new_limit = min(config.max, current + 1)
+                # Doubles until the first time it backs off, then grows by √limit a tick.
+                step = max(1, math.isqrt(current)) if self._backed_off else current
+                new_limit = min(config.max, current + step)
                 reason = "grow"
 
         new_limit = max(config.min, min(config.max, new_limit))
         if new_limit != current and reason is not None:
+            if new_limit < current:
+                self._backed_off = True
             self._last_adjust = {
                 "at": int(time.time() * 1000),
                 "from": current,
@@ -884,7 +898,7 @@ class AdaptiveController:
     # -- metrics ---------------------------------------------------------------------------------
 
     def _gradient(self) -> Optional[float]:
-        """``rttLong / rttShort`` clamped to (0, 1]. Updates the rttLong EWMA as a side effect, so it
+        """``(tolerance × rttLong + noise) / rttShort`` clamped to (0, 1]. Updates the rttLong EWMA as a side effect, so it
         is called exactly once per tick (from :meth:`_decide`)."""
         durations = [duration for (_, duration, _) in self._window]
         if not durations:
@@ -898,7 +912,7 @@ class AdaptiveController:
         rtt_short = _median(durations)
         if rtt_short <= 0:
             return 1.0
-        return min(1.0, self._rtt_long / rtt_short)
+        return min(1.0, (_LATENCY_TOLERANCE * self._rtt_long + _LATENCY_NOISE_MS) / rtt_short)
 
     def _error_rate(self) -> float:
         if not self._window:

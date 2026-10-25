@@ -134,10 +134,12 @@ DurableModule.forRoot({ connection, concurrency: 'adaptive' });
 
 How it decides (same on both SDKs), every `tickMs` (default 2s):
 - **Latency gradient (the main signal).** Compares recent p50 against the best (no-queuing) latency
-  it's seen. Gradient near 1 = no queuing → **grow by 1**, but *only while saturated* (in-flight near
-  the limit), since raising a ceiling nobody hits does nothing. Gradient dropping = latency inflating
-  = queuing → **shrink** proportionally. Latency is bottleneck-agnostic — it catches a slow DB, CPU
-  saturation, or lock contention without naming which.
+  it's seen. p50 may reach twice that baseline plus 5 ms before it counts as queuing, so the jitter of
+  fast steps doesn't read as load. No queuing → **grow**, but *only while saturated* (in-flight near
+  the limit), since raising a ceiling nobody hits does nothing: it doubles until the first time it
+  backs off, then grows by √limit a tick. Past the tolerance = queuing → **shrink** proportionally.
+  Latency is bottleneck-agnostic — it catches a slow DB, CPU saturation, or lock contention without
+  naming which.
 - **RAM ceiling (hard brake).** Reads RSS against the cgroup `memory.max` (falls back to host total).
   Past `ramCeilingPct` (default 85%) it cuts the limit and refuses to grow — OOM is fatal and sudden,
   so it's a brake, not a gradient input.
