@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-core",
-  "version": "0.85.7",
+  "version": "0.85.8",
   "description": "Durable workflows for NestJS — core interfaces, engine and deterministic replay",
   "license": "MIT",
   "author": "Davide Carvalho",
