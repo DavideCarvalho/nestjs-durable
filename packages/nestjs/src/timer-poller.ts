@@ -19,6 +19,10 @@ import { settleWithin } from './settle-within';
  * recurring `schedules` (plus the persisted `engine.schedules` when `persistedSchedules` is on) —
  * once on boot, then on an interval. Set `timerPollMs` to `0` to disable
  * the interval (e.g. when an external scheduler drives `WorkflowEngine.resumeDueTimers`).
+ *
+ * The boot poll is started, not awaited: `onApplicationBootstrap` runs before the host's HTTP server
+ * listens, so a first poll held up by a large backlog would keep the pod from ever passing its
+ * readiness probe. Shutdown still waits for whichever poll is in flight.
  */
 @Injectable()
 export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
@@ -66,7 +70,7 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
         console.error(`[nestjs-durable] could not run enqueued run ${runId}:`, error);
       });
     });
-    await this.poll();
+    void this.poll();
     const intervalMs = this.options.timerPollMs ?? 1_000;
     if (intervalMs > 0) {
       this.timer = setInterval(() => void this.poll(), intervalMs);
@@ -110,12 +114,10 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   /**
    * One sweep of the engine's recovery work.
    *
-   * **This method never rejects, and that is a hard requirement rather than defensiveness.** It has
-   * exactly two callers and a rejection out of either one kills the process: on boot it is awaited
-   * inside `onApplicationBootstrap`, so the rejection propagates through `NestApplication.init()`
-   * into the host's `bootstrap()`; on the interval it is a fire-and-forget `void`, so it surfaces as
-   * an unhandled rejection. Both are fatal, and both re-occur on the next boot with the same state,
-   * so a single unrecoverable run crash-loops every worker in the deployment — taking down every
+   * **This method never rejects, and that is a hard requirement rather than defensiveness.** Both
+   * callers (the boot kick-off and the interval) fire it as `void`, so a rejection would surface as
+   * an unhandled rejection, which is fatal, and would re-occur on the next boot with the same state:
+   * a single unrecoverable run would crash-loop every worker in the deployment, taking down every
    * other workflow with it. A poll that goes wrong must cost this tick, not the pod.
    *
    * Each sweep is isolated separately because they are independent: a store that fails

@@ -2145,6 +2145,51 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.takeBufferedSignal('child:b')).toBeNull();
     });
 
+    t(
+      'a sweep of buffered child completions sends a few statements per page, not one per row',
+      async () => {
+        if (!statements || !store.listBufferedSignals || !store.deleteBufferedSignals) return;
+        if (!store.saveCheckpoints) return;
+        // A wide fan's parent, still open, that has settled every child whose completion is still
+        // buffered: the rows must go, decided without one checkpoint read per row.
+        const parent = 'wide';
+        await store.createRun(run({ id: parent, status: 'suspended' }));
+        const fan = 4_000;
+        for (let from = 0; from < fan; from += 500) {
+          await store.saveCheckpoints(
+            Array.from({ length: 500 }, (_, k) => {
+              const i = from + k;
+              return checkpoint({
+                runId: parent,
+                seq: i,
+                stepId: `${parent}:${i}`,
+                name: `signal:child:${parent}.all.0.${i}`,
+                kind: 'signal',
+                output: { ok: true, value: { i } },
+                parallelGroup: `all:0:n${fan}`,
+              });
+            }),
+          );
+        }
+        const rows = 500;
+        for (let k = 0; k < rows; k++) {
+          const i = 2_000 + k;
+          await store.bufferSignal(`child:${parent}.all.0.${i}`, { ok: true, value: { i } });
+        }
+        const engine = new WorkflowEngine({ store });
+
+        const before = statements();
+        const deleted = await engine.sweepBufferedSignals();
+        const sent = statements() - before;
+
+        expect(deleted).toBe(rows);
+        expect(await store.listBufferedSignals('child:', undefined, 10)).toEqual([]);
+        // The page, the parent's run row, its checkpoints by seq, the delete, the next (empty) page:
+        // a few statements each, against one per buffered row.
+        expect(sent).toBeLessThanOrEqual(10);
+      },
+    );
+
     t('buffers signals and takes them FIFO per token', async () => {
       await store.bufferSignal('sig', { n: 1 });
       await store.bufferSignal('sig', { n: 2 });

@@ -1,6 +1,6 @@
 import { InMemoryStateStore, InMemoryTransport } from '@dudousxd/nestjs-durable-core';
 import { Test } from '@nestjs/testing';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Workflow } from './decorators';
 import { DurableModule } from './durable.module';
 // The facade: everything the scheduling docs use comes from the one NestJS package.
@@ -42,9 +42,12 @@ describe('scheduled workflows', () => {
     }).compile();
     await moduleRef.init();
 
-    const runs = await store.listRuns({ workflow: 'beat' });
-    expect(runs.length).toBe(1);
-    expect(runs[0]?.output).toBe('tick');
+    // The boot poll runs in the background.
+    await vi.waitFor(async () => {
+      const runs = await store.listRuns({ workflow: 'beat' });
+      expect(runs.length).toBe(1);
+      expect(runs[0]?.output).toBe('tick');
+    });
   });
 
   it('takes the workflow class instead of its name', async () => {
@@ -68,8 +71,13 @@ describe('scheduled workflows', () => {
     }).compile();
     await moduleRef.init();
 
-    const run = await store.getRun(scheduleRunIdAt(report, Date.now()));
-    expect(run).toMatchObject({ workflow: 'report', output: 'report for eu' });
+    const runId = scheduleRunIdAt(report, Date.now());
+    await vi.waitFor(async () => {
+      expect(await store.getRun(runId)).toMatchObject({
+        workflow: 'report',
+        output: 'report for eu',
+      });
+    });
     await moduleRef.close();
   });
 
@@ -105,6 +113,7 @@ describe('scheduled workflows', () => {
       providers: [BeatWorkflow],
     }).compile();
     await moduleRef.init();
+    await new Promise((r) => setTimeout(r, 50)); // time for a boot poll, were there one
 
     expect((await store.listRuns({ workflow: 'beat' })).length).toBe(0);
   });
@@ -126,10 +135,13 @@ describe('scheduled workflows', () => {
     await moduleRef.init();
 
     const engine = moduleRef.get(WorkflowEngine);
-    const run = await engine.getRun(scheduleRunIdAt(beat, Date.now()));
+    const runId = scheduleRunIdAt(beat, Date.now());
 
-    expect(run?.workflow).toBe('beat');
-    expect(run?.output).toBe('tick');
+    await vi.waitFor(async () => {
+      const run = await engine.getRun(runId);
+      expect(run?.workflow).toBe('beat');
+      expect(run?.output).toBe('tick');
+    });
     await moduleRef.close();
   });
 

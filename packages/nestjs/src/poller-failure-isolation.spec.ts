@@ -5,9 +5,8 @@ import { RetentionPoller } from './retention-poller';
 import { TimerPoller } from './timer-poller';
 
 /**
- * Both pollers await a sweep inside `onApplicationBootstrap` and fire it as `void` on an interval.
- * A rejection out of either path is fatal — the first kills `NestApplication.init()`, the second is
- * an unhandled rejection — and since the state that caused it survives the restart, the pod
+ * Both pollers fire a sweep as `void` on boot and on an interval. A rejection out of either is an
+ * unhandled one, which is fatal, and since the state that caused it survives the restart, the pod
  * crash-loops. These tests pin the sweeps as non-throwing.
  */
 
@@ -69,9 +68,11 @@ describe('TimerPoller', () => {
 
     await poller.onApplicationBootstrap();
 
-    expect(engine.recoverIncomplete).toHaveBeenCalled();
-    expect(engine.resumeDueTimers).toHaveBeenCalled();
-    expect(engine.sweepTimeouts).toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(engine.recoverIncomplete).toHaveBeenCalled();
+      expect(engine.resumeDueTimers).toHaveBeenCalled();
+      expect(engine.sweepTimeouts).toHaveBeenCalled();
+    });
   });
 
   it('survives a schedule that throws', async () => {

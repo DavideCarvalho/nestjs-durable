@@ -35,9 +35,11 @@ describe('boot recovery', () => {
     }).compile();
     await moduleRef.init();
 
-    const run = await store.getRun('r1');
-    expect(run?.status).toBe('completed');
-    expect(run?.output).toBe('hello davi');
+    await vi.waitFor(async () => {
+      const run = await store.getRun('r1');
+      expect(run?.status).toBe('completed');
+      expect(run?.output).toBe('hello davi');
+    });
   });
 
   it('does NOT recover runs when drive is false (a dashboard-only instance)', async () => {

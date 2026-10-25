@@ -97,7 +97,7 @@ describe('RetentionPoller', () => {
 
     await poller.onApplicationBootstrap();
 
-    expect(prune).toHaveBeenCalledTimes(3);
+    await vi.waitFor(() => expect(prune).toHaveBeenCalledTimes(3));
     expect(prune.mock.calls[0]?.[2]).toBe(2); // batchSize forwarded as the limit
   });
 
