@@ -1,5 +1,5 @@
 import { isSpanContextValid, trace } from '@opentelemetry/api';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { runTraceContext, runTraceId } from './durable-run-trace';
 
 describe('runTraceId', () => {
@@ -32,5 +32,34 @@ describe('runTraceContext', () => {
     expect(spanContext.traceId).toBe(runTraceId('run-1'));
     // Not sampled would leave every derived span non-recording, so it would never reach an exporter.
     expect(spanContext.traceFlags).toBe(1);
+  });
+});
+
+describe('a run with many events', () => {
+  it('hashes its ids once, not once per event', async () => {
+    vi.resetModules();
+    const hashes = vi.fn();
+    vi.doMock('node:crypto', async (importOriginal) => {
+      const crypto = await importOriginal<typeof import('node:crypto')>();
+      return {
+        ...crypto,
+        createHash: (algorithm: string) => {
+          hashes(algorithm);
+          return crypto.createHash(algorithm);
+        },
+      };
+    });
+    const fresh = await import('./durable-run-trace');
+    const first = fresh.runTraceId('wide-run');
+    for (let event = 0; event < 1000; event += 1) {
+      expect(fresh.runTraceId('wide-run')).toBe(first);
+      fresh.runTraceContext('wide-run');
+    }
+    expect(hashes).toHaveBeenCalledTimes(2); // the trace id and the root span id
+    // Still the same pure function of the run id: an evicted run hashes back to the same ids.
+    for (let run = 0; run < 1000; run += 1) fresh.runTraceId(`other-${run}`);
+    expect(fresh.runTraceId('wide-run')).toBe(first);
+    expect(first).toBe(runTraceId('wide-run'));
+    vi.doUnmock('node:crypto');
   });
 });
