@@ -13,10 +13,15 @@ function percentile(sorted: number[], p: number): number {
   return sorted[Math.max(0, idx)] ?? 0;
 }
 
-type StorageEntry = { content?: unknown; createdAt?: Date };
+type StorageEntry = { content?: unknown; createdAt?: Date; familyHash?: string | null };
 
 type EntryStorage = {
-  get(q: { type?: string; familyHash?: string; limit?: number }): Promise<{ data: StorageEntry[] }>;
+  get(q: {
+    type?: string;
+    familyHash?: string;
+    limit?: number;
+    before?: Date;
+  }): Promise<{ data: StorageEntry[] }>;
 };
 
 const RUN_EVENTS_LIMIT = 5_000;

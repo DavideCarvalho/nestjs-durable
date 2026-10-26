@@ -618,10 +618,10 @@ describe('panels after a wide step fan', () => {
     )) as { value: number };
     // r0-r4 recorded before families (all completed), r5-r9 after (r8, r9 failed).
     expect(rate.value).toBe(0.8);
-    const perHour = (await durableThroughputProvider().resolve({}, ctxWithEntries([
-      ...legacy,
-      ...runs.slice(10),
-    ]))) as { value: number };
+    const perHour = (await durableThroughputProvider().resolve(
+      {},
+      ctxWithEntries([...legacy, ...runs.slice(10)]),
+    )) as { value: number };
     expect(perHour.value).toBeCloseTo(8 / 24);
   });
 
