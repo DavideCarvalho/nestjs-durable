@@ -13,8 +13,11 @@ Three responsibilities:
   ``WorkerStatus`` dict the heartbeat writer stamps on every beat. A FIXED worker still emits this.
 
 * **Adaptive control (adaptive mode only).** A control loop every ``tickMs`` recomputes a gradient
-  (``rttLong``/``rttShort``) and adjusts the limit (ram_ceiling / cpu_ceiling / backpressure /
-  shrink / grow / hold), only GROWING when saturated. Standard Vegas/Gradient2 practice.
+  (``(2 * rttLong + 5 ms) / rttShort``, so the recent p50 may reach twice the baseline plus noise
+  before it reads as queuing) and adjusts the limit (ram_ceiling / cpu_ceiling / backpressure / shrink / grow / hold),
+  only GROWING when saturated. Until the first back-off, growth doubles the limit and is also
+  re-decided after each limit's worth of settled steps; after that it grows by sqrt(limit) a tick.
+  Standard Vegas/Gradient2 practice.
 
 * **Memory admission control (adaptive mode, on by default).** :meth:`await_admission` is a gate the
   runner awaits BEFORE it starts a step, so a step that would not fit is DEFERRED instead of started

@@ -154,7 +154,15 @@ Ten providers back the panels above, reading from three different sources:
 
 - **Telescope's own captured entries** (recent-history, bounded by Telescope's prune window):
   `durable.timeseries` (success rate / failed count / top failures), `durable.duration` (p50/p95/p99
-  + histogram), `durable.runsOverTime`, `durable.successRate`, `durable.throughput`.
+  + histogram), `durable.runsOverTime`, `durable.successRate`, `durable.throughput`. The watcher
+  stamps each run lifecycle entry with a `familyHash` (`durable:run.started`, `durable:run.completed`,
+  `durable:run.failed`, `durable:run.suspended`), and these providers read up to the latest 5,000 entries
+  of each family through Telescope's indexed `family_hash` column (one indexed read per family, tens
+  of milliseconds on a multi-million-row table). Step entries carry no family, so a wide step fan,
+  which records two entries per step, never crowds runs out of the panels. Telescope's stores
+  already have the column and its index, so there is nothing to migrate; while no run entry has a
+  family yet (only entries recorded by an older watcher), the providers read the latest 5,000
+  `durable` entries instead.
 - **The live durable store** (exact and unbounded by the prune window):
   `durable.state` (a single status count, e.g. Backlog), `durable.recentFailures` (the Stuck runs
   table), `durable.stateBreakdown` (the Runs-by-state donut). The counts come from the store's

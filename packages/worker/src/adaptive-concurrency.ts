@@ -188,6 +188,8 @@ export interface AdaptiveControllerOptions {
  * (the SDK runner and the engine-side transport). It tracks in-flight work and a rolling window of
  * completions, and — in `adaptive` mode — re-evaluates the worker's concurrency every `tickMs` from a
  * latency gradient, an error/stall backpressure signal, a hard RAM brake and an optional CPU ceiling.
+ * Until it first backs off, growth doubles the limit and is also re-decided after each limit's worth
+ * of settled steps; after that it grows by √limit a tick.
  *
  * In `fixed` mode no control loop runs and the limit never moves, but the controller still tracks
  * `inFlight`/RSS/throughput/p95 (and samples CPU when a snapshot is taken) so the observability half

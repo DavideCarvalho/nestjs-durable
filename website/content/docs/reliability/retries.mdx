@@ -202,6 +202,12 @@ forever unless something re-dispatches it:
   forever. If you wire the engine through `DurableModule`, note that the option is only forwarded
   from `@dudousxd/nestjs-durable` 0.71 as well.
 
+  A step fan (`ctx.all` over steps) gets its leases at send: its `pending` checkpoints are written
+  with `wakeAt` already set, in the same batch write, and the sending turn parks the run on that
+  lease, so a wide fan costs no per-step lease write afterwards. A step's heartbeat that reaches the
+  instance which sent the fan is answered from that instance's memory (one entry per sent block of
+  seqs) until the lease is due for renewal, so it reads nothing from the store either.
+
   A re-drive is **observably different from a retry**: the `step.started` event carries
   `redispatched: true`, and the checkpoint's own event trail gets a `warn` `step.redispatched`
   (`step.lost` when the bound runs out). Alert on those to see a worker that is dying under you
