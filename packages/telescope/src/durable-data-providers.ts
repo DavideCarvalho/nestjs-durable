@@ -42,7 +42,32 @@ async function fetchRunEntries(
   );
   const entries = pages.flatMap((page) => page.data);
   if (entries.length === 0) return (await storage.get({ type: 'durable', limit })).data;
+  // With every family read in full, anything older than its oldest entry was recorded without a
+  // family; it is read the way it was written, below that point, so history keeps its older runs.
+  if (!withoutUnfamiliedRuns.has(storage) && pages.every((page) => page.data.length < limit)) {
+    let oldest = Number.POSITIVE_INFINITY;
+    for (const entry of entries) oldest = Math.min(oldest, entryTime(entry));
+    const wanted = new Set(events);
+    const older = await storage.get({ type: 'durable', before: new Date(oldest), limit });
+    let found = false;
+    for (const entry of older.data) {
+      if (entry.familyHash != null || !wanted.has(String(eventOf(entry)))) continue;
+      entries.push(entry);
+      found = true;
+    }
+    if (!found && older.data.length < limit) withoutUnfamiliedRuns.add(storage);
+  }
   return entries.sort((a, b) => entryTime(b) - entryTime(a));
+}
+
+/**
+ * Storages whose run events all carry a family: a read below the oldest one found none without it,
+ * and run events are written with their family, so none can appear there later.
+ */
+const withoutUnfamiliedRuns = new WeakSet<EntryStorage>();
+
+function eventOf(entry: StorageEntry): unknown {
+  return (entry.content as { event?: unknown } | null)?.event;
 }
 
 function entryTime(entry: StorageEntry): number {

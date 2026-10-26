@@ -42,10 +42,11 @@ function ctxWithEntries(entries: FakeEntry[], reads: unknown[] = []): ExtensionC
         : e.familyHash,
   }));
   const storage = {
-    get: async (q: { familyHash?: string; limit?: number }) => {
+    get: async (q: { familyHash?: string; limit?: number; before?: Date }) => {
       reads.push(q);
       const data = stored
         .filter((e) => q.familyHash === undefined || e.familyHash === q.familyHash)
+        .filter((e) => q.before === undefined || +(e.createdAt ?? 0) < +q.before)
         .sort((a, b) => +(b.createdAt ?? 0) - +(a.createdAt ?? 0))
         .slice(0, q.limit ?? Number.POSITIVE_INFINITY);
       return { data };
@@ -582,11 +583,46 @@ describe('panels after a wide step fan', () => {
   it('read run events by family, never the step-filled page', async () => {
     const reads: Array<{ familyHash?: string }> = [];
     await durableSuccessRateProvider().resolve({}, ctxWithEntries([...runs, ...steps], reads));
-    expect(reads.map((r) => r.familyHash)).toEqual([
+    expect(reads.slice(0, 3).map((r) => r.familyHash)).toEqual([
       'durable:run.started',
       'durable:run.completed',
       'durable:run.failed',
     ]);
+    // Only below the oldest run event with a family, for the runs recorded before families.
+    expect(reads.slice(3)).toEqual([
+      { type: 'durable', before: expect.any(Date), limit: expect.any(Number) },
+    ]);
+  });
+
+  it('stop reading below the families once nothing there lacks one', async () => {
+    const reads: Array<{ familyHash?: string }> = [];
+    const ctx = ctxWithEntries([...runs, ...steps.slice(0, 100)], reads);
+    await durableSuccessRateProvider().resolve({}, ctx);
+    await durableSuccessRateProvider().resolve({}, ctx);
+    expect(reads.filter((r) => r.familyHash === undefined)).toHaveLength(1);
+  });
+
+  it('keep the runs recorded without a family, older than the first one with one', async () => {
+    const legacy = runs.slice(0, 10).map((e) => ({
+      ...e,
+      familyHash: null,
+      createdAt: new Date(+(e.createdAt as Date) - 3_600_000),
+    }));
+    const legacySteps = steps.slice(0, 6_000).map((e) => ({
+      ...e,
+      createdAt: new Date(+(e.createdAt as Date) - 7_200_000),
+    }));
+    const rate = (await durableSuccessRateProvider().resolve(
+      {},
+      ctxWithEntries([...legacy, ...legacySteps, ...runs.slice(10), ...steps]),
+    )) as { value: number };
+    // r0-r4 recorded before families (all completed), r5-r9 after (r8, r9 failed).
+    expect(rate.value).toBe(0.8);
+    const perHour = (await durableThroughputProvider().resolve({}, ctxWithEntries([
+      ...legacy,
+      ...runs.slice(10),
+    ]))) as { value: number };
+    expect(perHour.value).toBeCloseTo(8 / 24);
   });
 
   it('fall back to the latest entries when only entries without a family exist', async () => {
