@@ -7,6 +7,7 @@ import {
 import type { Watcher, WatcherContext } from '@dudousxd/nestjs-telescope';
 import { SpanStatusCode, context, trace } from '@opentelemetry/api';
 import { durableExecutionScope } from './durable-execution-scope';
+import { runEventFamily } from './durable-run-family';
 import { runTraceContext, runTraceId } from './durable-run-trace';
 
 /**
@@ -67,9 +68,11 @@ export class DurableTelescopeWatcher implements Watcher {
     const tracer = trace.getTracer('@dudousxd/nestjs-durable-telescope');
 
     engine.subscribe((event) => {
+      const family = runEventFamily(event.type);
       const record = () =>
         ctx.record({
           type: this.type,
+          ...(family !== undefined ? { familyHash: family } : {}),
           // Stated explicitly rather than left to the ambient span, and the Recorder honours an
           // explicit `traceId` above everything else. A lifecycle event is very often emitted
           // OUTSIDE any execution scope — a remote step's result lands in a transport callback, a

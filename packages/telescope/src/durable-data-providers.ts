@@ -2,6 +2,7 @@ import { STATE_STORE_CANONICAL, WorkflowEngine } from '@dudousxd/nestjs-durable-
 import type { RunStatus, StateStore, WorkerStatus } from '@dudousxd/nestjs-durable-core';
 import type { DataProvider, ExtensionContext } from '@dudousxd/nestjs-telescope';
 import { TELESCOPE_STORAGE } from '@dudousxd/nestjs-telescope';
+import { runEventFamily } from './durable-run-family';
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -14,13 +15,38 @@ function percentile(sorted: number[], p: number): number {
 
 type StorageEntry = { content?: unknown; createdAt?: Date };
 
-/** Fetch the durable entry page from TELESCOPE_STORAGE. */
-async function fetchEntries(ctx: ExtensionContext): Promise<StorageEntry[]> {
-  const storage = ctx.moduleRef.get(TELESCOPE_STORAGE, { strict: false }) as {
-    get(q: { type?: string; limit?: number }): Promise<{ data: StorageEntry[] }>;
-  };
-  const page = await storage.get({ type: 'durable', limit: 5_000 });
-  return page.data;
+type EntryStorage = {
+  get(q: { type?: string; familyHash?: string; limit?: number }): Promise<{ data: StorageEntry[] }>;
+};
+
+const RUN_EVENTS_LIMIT = 5_000;
+
+/**
+ * The latest run-level lifecycle entries, up to `limit` of each of `events`, newest first.
+ *
+ * Read by family (see {@link runEventFamily}) rather than as "the latest durable entries": the step
+ * events of one wide fan would otherwise fill the whole page, and every panel reading it would show
+ * no runs at all. Entries recorded before run events carried a family are still read, the old way,
+ * when no family has any yet.
+ */
+async function fetchRunEntries(
+  ctx: ExtensionContext,
+  events: readonly string[] = ['run.started', 'run.completed', 'run.failed'],
+  limit = RUN_EVENTS_LIMIT,
+): Promise<StorageEntry[]> {
+  const storage = ctx.moduleRef.get(TELESCOPE_STORAGE, { strict: false }) as EntryStorage;
+  const pages = await Promise.all(
+    events.map((event) =>
+      storage.get({ type: 'durable', familyHash: runEventFamily(event) as string, limit }),
+    ),
+  );
+  const entries = pages.flatMap((page) => page.data);
+  if (entries.length === 0) return (await storage.get({ type: 'durable', limit })).data;
+  return entries.sort((a, b) => entryTime(b) - entryTime(a));
+}
+
+function entryTime(entry: StorageEntry): number {
+  return entry.createdAt ? +new Date(entry.createdAt) : 0;
 }
 
 /**
@@ -131,20 +157,14 @@ export function durableTimeseriesProvider(): DataProvider {
   return {
     name: 'durable.timeseries',
     async resolve(query, ctx: ExtensionContext) {
-      // TELESCOPE_STORAGE.get(query) → { data: Entry[]; nextCursor }. Entry = { content, createdAt, ... }.
-      const storage = ctx.moduleRef.get(TELESCOPE_STORAGE, { strict: false }) as {
-        get(q: { type?: string; limit?: number }): Promise<{
-          data: Array<{ content?: unknown; createdAt?: Date }>;
-        }>;
-      };
-      const limit = Math.min(5_000, Math.max(100, Number(query?.limit ?? 2_000)));
-      const page = await storage.get({ type: 'durable', limit });
+      const limit = Math.min(RUN_EVENTS_LIMIT, Math.max(100, Number(query?.limit ?? 2_000)));
+      const entries = await fetchRunEntries(ctx, ['run.completed', 'run.failed'], limit);
 
       let completed = 0;
       let failed = 0;
       const failByWorkflow = new Map<string, number>();
       // Dedup triplicated lifecycle events (one event recorded on every pod) before counting.
-      for (const e of dedupeRunEvents(page.data)) {
+      for (const e of dedupeRunEvents(entries)) {
         const c = (e.content ?? {}) as { event?: string; workflow?: string };
         if (c.event === 'run.completed') completed += 1;
         else if (c.event === 'run.failed') {
@@ -361,7 +381,7 @@ export function durableDurationProvider(): DataProvider {
     name: 'durable.duration',
     async resolve(query, ctx: ExtensionContext) {
       // Dedup triplicated lifecycle events so paired durations aren't double-counted.
-      const entries = dedupeRunEvents(await fetchEntries(ctx));
+      const entries = dedupeRunEvents(await fetchRunEntries(ctx));
 
       // Index run.started entries by runId for the pairing fallback.
       const startedAt = new Map<string, number>();
@@ -426,7 +446,7 @@ export function durableRunsOverTimeProvider(): DataProvider {
   return {
     name: 'durable.runsOverTime',
     async resolve(query, ctx: ExtensionContext) {
-      const entries = dedupeRunEvents(await fetchEntries(ctx));
+      const entries = dedupeRunEvents(await fetchRunEntries(ctx));
       const n = Number((query as Record<string, unknown>)?.buckets ?? 24);
       const now = Date.now();
 
@@ -475,7 +495,7 @@ export function durableSuccessRateProvider(): DataProvider {
   return {
     name: 'durable.successRate',
     async resolve(query, ctx: ExtensionContext) {
-      const entries = dedupeRunEvents(await fetchEntries(ctx));
+      const entries = dedupeRunEvents(await fetchRunEntries(ctx));
       const windowMs = Number((query as Record<string, unknown>)?.windowMs ?? 24 * 60 * 60 * 1000);
       const now = Date.now();
       const { current, previous } = splitWindows(entries, windowMs, now);
@@ -511,7 +531,7 @@ export function durableThroughputProvider(): DataProvider {
   return {
     name: 'durable.throughput',
     async resolve(query, ctx: ExtensionContext) {
-      const entries = dedupeRunEvents(await fetchEntries(ctx));
+      const entries = dedupeRunEvents(await fetchRunEntries(ctx));
       const windowMs = Number((query as Record<string, unknown>)?.windowMs ?? 24 * 60 * 60 * 1000);
       const now = Date.now();
       const { current, previous } = splitWindows(entries, windowMs, now);
