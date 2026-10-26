@@ -358,6 +358,22 @@ export class PrismaStateStore implements StateStore {
     return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointRow);
   }
 
+  async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const unique = [...new Set(seqs)];
+    const rows = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      rows.push(
+        ...(await this.db.durableStepCheckpoint.findMany({
+          where: { runId, seq: { in: unique.slice(at, at + 500) } },
+          select: CHECKPOINT_SELECT_WITHOUT_INPUT,
+        })),
+      );
+    }
+    return rows
+      .sort((a, b) => a.seq - b.seq)
+      .map((row) => fromCheckpointRow({ ...row, input: null }));
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     const data = toCheckpointData(checkpoint);
     await this.db.durableStepCheckpoint.upsert({
@@ -772,7 +788,7 @@ export class PrismaStateStore implements StateStore {
     const rows = await this.db.durableStepCheckpoint.findMany({
       where: { runId },
       orderBy: { seq: 'asc' },
-      select: REPLAY_CHECKPOINT_SELECT,
+      select: CHECKPOINT_SELECT_WITHOUT_INPUT,
     });
     // An open or failed step keeps its input; read by seq, so a row settled since is still filled.
     const open = rows.filter((row) => row.status !== 'completed').map((row) => row.seq);
@@ -1347,7 +1363,7 @@ async function replaceCheckpoints(
 }
 
 /** Every checkpoint column but `input`, as a Prisma `select`. */
-const REPLAY_CHECKPOINT_SELECT = {
+const CHECKPOINT_SELECT_WITHOUT_INPUT = {
   runId: true,
   seq: true,
   name: true,

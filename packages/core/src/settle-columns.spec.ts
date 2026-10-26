@@ -45,20 +45,36 @@ const CHECKPOINT_WRITES = new Set([
   'settleCheckpointsIfPending',
 ]);
 
-/** Counts the bytes every checkpoint write hands the store (its arguments, as JSON). */
-function measured<T extends StateStore>(inner: T): { store: T; written: () => number } {
+const CHECKPOINT_READS = new Set([
+  'getCheckpoint',
+  'getCheckpoints',
+  'getCheckpointsForSettle',
+  'listCheckpoints',
+  'listCheckpointsForReplay',
+]);
+
+/**
+ * Counts the bytes every checkpoint write hands the store (its arguments, as JSON) and every
+ * checkpoint read hands back.
+ */
+function measured<T extends StateStore>(
+  inner: T,
+): { store: T; written: () => number; read: () => number } {
   let bytes = 0;
+  let readBytes = 0;
   const store = new Proxy(inner, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
       if (typeof value !== 'function') return value;
-      return (...args: unknown[]) => {
+      return async (...args: unknown[]) => {
         if (CHECKPOINT_WRITES.has(String(prop))) bytes += JSON.stringify(args).length;
-        return value.apply(target, args);
+        const out = await value.apply(target, args);
+        if (CHECKPOINT_READS.has(String(prop))) readBytes += JSON.stringify(out ?? null).length;
+        return out;
       };
     },
   });
-  return { store, written: () => bytes };
+  return { store, written: () => bytes, read: () => readBytes };
 }
 
 function setup(store: StateStore) {
@@ -113,6 +129,32 @@ describe("a step's result settles its checkpoint without its input", () => {
     expect(cp?.output).toEqual({ answer: 'yes' });
     expect(cp?.input).toEqual(PROMPT);
     expect((await inner.getRun('r1'))?.output).toEqual({ answer: 'yes' });
+  });
+
+  it("reads none of the step's input to settle it, nor to replay it", async () => {
+    const inner = new InMemoryStateStore();
+    const { store, read } = measured(inner);
+    const { engine, transport } = setup(store);
+    await startRun(engine, 'wf', {}, 'r1');
+    const task = transport.dispatched[0] as RemoteTask;
+    const before = read();
+
+    await transport.deliver(answer(task));
+    await until(async () => (await inner.getRun('r1'))?.status === 'completed');
+
+    expect(read() - before).toBeLessThan(2_000);
+    expect((await inner.getCheckpoint('r1', task.seq))?.input).toEqual(PROMPT);
+  });
+
+  it('a store without the column-wise settle reads the rows it writes back in full', async () => {
+    const inner = new InMemoryStateStore();
+    Object.defineProperty(inner, 'settleCheckpointsIfPending', { value: undefined });
+    const { engine, transport } = setup(inner);
+    await startRun(engine, 'wf', {}, 'r1');
+    const task = transport.dispatched[0] as RemoteTask;
+    await transport.deliver(answer(task));
+    await until(async () => (await inner.getRun('r1'))?.status === 'completed');
+    expect((await inner.getCheckpoint('r1', task.seq))?.input).toEqual(PROMPT);
   });
 
   it('a failed result keeps the input and records the error and events', async () => {
@@ -256,6 +298,32 @@ describe('CodecStateStore.settleCheckpointsIfPending', () => {
     const decoded = await store.getCheckpoint('r1', 0);
     expect(decoded?.error).toEqual({ message: 'boom' });
     expect(decoded?.input).toEqual(PROMPT);
+  });
+
+  it('decodes the rows a settle reads, which carry no input', async () => {
+    const inner = new InMemoryStateStore();
+    const store = new CodecStateStore(inner, wrap);
+    const now = new Date();
+    await store.saveCheckpoint({
+      runId: 'r1',
+      seq: 0,
+      name: ASK,
+      kind: 'remote',
+      stepId: 'r1:0',
+      status: 'pending',
+      input: PROMPT,
+      events: [{ at: 1, level: 'info', message: 'started' }],
+      attempts: 1,
+      enqueuedAt: now,
+      startedAt: now,
+      finishedAt: now,
+    });
+    const [cp] = (await store.getCheckpointsForSettle?.('r1', [0])) ?? [];
+    expect(cp?.name).toBe(ASK);
+    expect(cp?.input).toBeUndefined();
+    expect(cp?.events).toEqual([{ at: 1, level: 'info', message: 'started' }]);
+    Object.defineProperty(inner, 'getCheckpointsForSettle', { value: undefined });
+    expect(new CodecStateStore(inner, wrap).getCheckpointsForSettle).toBeUndefined();
   });
 
   it('is absent when the inner store has none', () => {

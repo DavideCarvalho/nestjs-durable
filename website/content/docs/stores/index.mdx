@@ -34,7 +34,7 @@ Several `StateStore` methods exist only to keep wide fans and busy deployments c
 optional, and the engine falls back to something slower but correct when a store leaves one out.
 Run the [shared store contract](/docs/testing#testing-a-custom-storetransportadmission-backend)
 (`runStateStoreContract`) against your adapter. Its `listDueTimers` case checks the ordering and
-the `limit`. Its cases for `listOrphanedRuns`, `updateRunIf`, `countCheckpoints`, `getCheckpoints`, `saveCheckpoints`, `saveCheckpointIfPending`, `saveCheckpointsIfPending`, `settleCheckpointsIfPending`, `listCheckpointsForReplay`,
+the `limit`. Its cases for `listOrphanedRuns`, `updateRunIf`, `countCheckpoints`, `getCheckpoints`, `saveCheckpoints`, `saveCheckpointIfPending`, `saveCheckpointsIfPending`, `settleCheckpointsIfPending`, `getCheckpointsForSettle`, `listCheckpointsForReplay`,
 `registerChildWaits`, `listCheckpointsByNamePrefix`, `getRuns`, `checkpointStats` and `queryCheckpoints` expect the method to exist, because every bundled adapter has it: a
 custom store that leaves one out fails those cases even though the engine would fall back.
 
@@ -49,6 +49,7 @@ custom store that leaves one out fails those cases even though the engine would 
 | `saveCheckpointIfPending(checkpoint)` | optional | a compare-and-set: overwrite `(runId, seq)` only while the stored row is still `pending`, and resolve whether it wrote. Used to settle a step from its result (which also drops a duplicate delivery), to stamp a redispatch deadline, and to re-dispatch. | The engine uses `saveCheckpoint`, which keeps the race where a turn writes a settled step back to `pending` and the step runs twice. |
 | `saveCheckpointsIfPending(checkpoints)` | optional | `saveCheckpointIfPending` for many rows in one call, resolving one boolean per entry in input order. It must give the same answers as calling `saveCheckpointIfPending` on each entry in turn: a second entry for the same row is compared against the first one's write. Each row's compare-and-set stays atomic, and so does the call: if it rejects, it wrote nothing. The engine settles a batch of one run's step results with one call, so it should be a few statements per batch (the bundled stores lock the still-`pending` rows with one read and write the winners with one multi-row write), not one per row. | One `saveCheckpointIfPending` per result. |
 | `settleCheckpointsIfPending(settlements)` | optional | settles steps from their results: per entry and in input order, while the row at `(runId, seq)` is still `pending`, write only the columns a result changes (`status`, `output`, `error`, `events`, `startedAt`, `finishedAt`; an absent one is stored empty) and leave every other column, `input` among them, as it is stored. Resolves one boolean per entry. Claims like `saveCheckpointsIfPending`: a second entry for a row the first settled loses, and a rejection writes nothing. The engine settles a batch of one run's step results with one call (a single result too), so a step whose input is large, such as an LLM step carrying its whole prompt, does not have that input written a second time when its result lands. | `saveCheckpointsIfPending` (or `saveCheckpointIfPending` per result) with the whole rows, input included. |
+| `getCheckpointsForSettle(runId, seqs)` | optional | the rows `getCheckpoints` returns, each without its `input`, left out of the query itself. A step result's settle reads the step's row for its status, name, group and timings only, so an LLM step's prompt is not read back when its answer lands. The engine reads through it only when the store also has `settleCheckpointsIfPending`: the whole-row write it otherwise falls back to needs the input. | `getCheckpoints` (or `getCheckpoint` per result), input included. |
 | `listCheckpointsForReplay(runId)` | optional | the replay snapshot every turn of a run reads: the rows `listCheckpoints` returns, in the same order, except that a `completed` row comes without its `input`. Leave the column out of the query itself; dropping it after the read saves nothing. A row that is not completed (still `pending`, `running`, or `failed`) keeps its input, since a re-dispatch or a retry writes it again. Replay needs a completed step's output only, so a conversation whose every turn is an LLM step does not re-read every earlier prompt on each resume. The run detail, `engine.listCheckpoints`, retry and re-dispatch keep reading the full rows. | `listCheckpoints` on every turn, every input included. |
 | `hasSignalWaiter(runId, tokenPrefix)` | optional | a child fan's join barrier. | The parent replays once per settled child, which is O(N²) over the fan. |
 | `registerChildWaits(entries)` | optional | writes a child fan's waiters and `running` placeholders in one transaction, 500 at a time. | Waiters and placeholders are written one by one. |
@@ -76,7 +77,8 @@ SQL on the models' table and column names, 500 rows a statement, in one transact
 `UPDATE … FROM (VALUES …) WHERE status = 'pending' RETURNING` on Postgres and SQLite, and on MySQL a
 `SELECT … FOR UPDATE` of the still-`pending` rows followed by one `UPDATE … JOIN` of the values. A
 client without `$queryRawUnsafe`, or on another provider, settles with one conditional `updateMany`
-per entry. `listCheckpointsForReplay` is one `SELECT` of every column but `input`, then one of
+per entry. `getCheckpointsForSettle` is `getCheckpoints`' `SELECT` with every column but `input`, and
+`listCheckpointsForReplay` is one `SELECT` of every column but `input`, then one of
 `(seq, input)` for the rows that are not completed (by seq, 500 at a time), skipped when there are
 none.
 
@@ -96,7 +98,7 @@ you named something like `FAN:x` would be affected.
 store never hides a capability or invents one. It encodes the payload for `updateRunIf` (like
 `updateRun`), for `saveCheckpointIfPending`
 and for every entry of `saveCheckpointsIfPending` and `settleCheckpointsIfPending`, forwards `countCheckpoints` and `checkpointStats`
-verbatim (neither reads a payload), decodes the rows `queryCheckpoints` and `listCheckpointsForReplay` return, and decodes the runs
+verbatim (neither reads a payload), decodes the rows `queryCheckpoints`, `getCheckpointsForSettle` and `listCheckpointsForReplay` return, and decodes the runs
 `listDueTimers` and `listOrphanedRuns` return.
 
 ## Adapters

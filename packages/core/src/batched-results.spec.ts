@@ -358,6 +358,10 @@ describe('batched step results', () => {
       if (this.failReads.delete(seq)) throw new Error('connection lost');
       return super.getCheckpoint(runId, seq);
     }
+    async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+      if (seqs.some((seq) => this.failReads.delete(seq))) throw new Error('connection lost');
+      return super.getCheckpointsForSettle(runId, seqs);
+    }
   }
 
   it('a batch with a result of its fan queued behind it leaves the barrier to that result', async () => {

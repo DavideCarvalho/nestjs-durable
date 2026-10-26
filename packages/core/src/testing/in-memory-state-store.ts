@@ -221,6 +221,17 @@ export class InMemoryStateStore implements StateStore {
       });
   }
 
+  async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    return [...new Set(seqs)]
+      .sort((a, b) => a - b)
+      .flatMap((seq) => {
+        const cp = this.checkpoints.get(this.key(runId, seq));
+        if (!cp) return [];
+        const { input: _input, ...rest } = cp;
+        return [rest];
+      });
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     this.checkpoints.set(this.key(checkpoint.runId, checkpoint.seq), { ...checkpoint });
   }

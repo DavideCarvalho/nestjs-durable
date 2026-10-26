@@ -192,6 +192,7 @@ async function scenario(opts: {
   const resultCalls =
     (stats.calls.get('getCheckpoint') ?? 0) +
     (stats.calls.get('getCheckpoints') ?? 0) +
+    (stats.calls.get('getCheckpointsForSettle') ?? 0) +
     (stats.calls.get('settleCheckpointsIfPending') ?? 0) +
     (stats.calls.get('saveCheckpointsIfPending') ?? 0) +
     (stats.calls.get('saveCheckpointIfPending') ?? 0) +

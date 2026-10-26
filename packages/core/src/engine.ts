@@ -7331,6 +7331,23 @@ export class WorkflowEngine {
     runId: string,
     seqs: number[],
   ): Promise<PromiseSettledResult<StepCheckpoint | null>[]> {
+    // Without the column-wise settle, the settle writes the rows it read back whole.
+    const forSettle = this.store.settleCheckpointsIfPending
+      ? this.store.getCheckpointsForSettle?.bind(this.store)
+      : undefined;
+    if (forSettle) {
+      if (seqs.length > 1) {
+        try {
+          const bySeq = new Map((await forSettle(runId, seqs)).map((cp) => [cp.seq, cp]));
+          return seqs.map((seq) => ({ status: 'fulfilled', value: bySeq.get(seq) ?? null }));
+        } catch {
+          // Fall through: read them one by one.
+        }
+      }
+      return Promise.allSettled(
+        seqs.map(async (seq) => (await forSettle(runId, [seq]))[0] ?? null),
+      );
+    }
     if (seqs.length > 1 && this.store.getCheckpoints) {
       try {
         const bySeq = new Map(

@@ -343,6 +343,26 @@ export class TypeOrmStateStore implements StateStore {
     return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointEntity);
   }
 
+  async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const repo = this.checkpoints();
+    const select = this.checkpointColumnsWithoutInput();
+    const unique = [...new Set(seqs)];
+    const rows: StepCheckpointEntity[] = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      rows.push(
+        ...(await repo.find({ select, where: { runId, seq: In(unique.slice(at, at + 500)) } })),
+      );
+    }
+    return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointEntity);
+  }
+
+  /** Every checkpoint property but `input`, for a read that leaves the column out. */
+  private checkpointColumnsWithoutInput(): (keyof StepCheckpointEntity)[] {
+    return this.checkpoints()
+      .metadata.columns.map((column) => column.propertyName)
+      .filter((name) => name !== 'input') as (keyof StepCheckpointEntity)[];
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     // upsert = INSERT ... ON CONFLICT DO UPDATE on the (runId, seq) key — drops the pre-SELECT that
     // `.save()` does on each write. JSON column transformers still apply for upsert.
@@ -848,11 +868,8 @@ export class TypeOrmStateStore implements StateStore {
 
   async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
     const repo = this.checkpoints();
-    const select = repo.metadata.columns
-      .map((column) => column.propertyName)
-      .filter((name) => name !== 'input');
     const rows = await repo.find({
-      select: select as (keyof StepCheckpointEntity)[],
+      select: this.checkpointColumnsWithoutInput(),
       where: { runId },
       order: { seq: 'ASC' },
     });

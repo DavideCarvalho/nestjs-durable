@@ -370,6 +370,19 @@ export class MikroOrmStateStore implements StateStore {
     return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointEntity);
   }
 
+  async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    if (seqs.length === 0) return [];
+    const em = this.fork();
+    const fields = checkpointFieldsWithoutInput(em);
+    const unique = [...new Set(seqs)];
+    const rows: StepCheckpointEntity[] = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      const seq = { $in: unique.slice(at, at + 500) };
+      rows.push(...(await selectCheckpointRows(em, { runId, seq }, fields)));
+    }
+    return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointEntity);
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     const em = this.fork();
     await em.upsert(StepCheckpointEntity, toCheckpointEntity(checkpoint));
@@ -998,10 +1011,7 @@ export class MikroOrmStateStore implements StateStore {
 
   async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
     const em = this.fork();
-    const fields = Object.keys(em.getMetadata().get(StepCheckpointEntity).properties).filter(
-      (name) => name !== 'input',
-    );
-    const rows = await selectCheckpointRows(em, { runId }, fields);
+    const rows = await selectCheckpointRows(em, { runId }, checkpointFieldsWithoutInput(em));
     // An open or failed step keeps its input; read by seq, so a row settled since is still filled.
     const open = rows.filter((row) => row.status !== 'completed').map((row) => row.seq);
     if (open.length > 0) {
@@ -1451,6 +1461,13 @@ function aggregateDateReader(em: EntityManager): (value: unknown) => Date {
  * with the same type conversions as `em.find`, but not turned into managed entities, which for a
  * 40k-step fan took five times as long as the query.
  */
+/** Every checkpoint property but `input`, for a read that leaves the column out. */
+function checkpointFieldsWithoutInput(em: EntityManager): string[] {
+  return Object.keys(em.getMetadata().get(StepCheckpointEntity).properties).filter(
+    (name) => name !== 'input',
+  );
+}
+
 async function selectCheckpointRows(
   em: EntityManager,
   where: Record<string, unknown>,

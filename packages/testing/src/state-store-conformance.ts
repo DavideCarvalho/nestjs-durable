@@ -1233,6 +1233,62 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect((await store.getCheckpoint('r1', 1))?.input).toEqual({ prompt });
     });
 
+    t('getCheckpointsForSettle reads getCheckpoints rows without their input', async () => {
+      // Optional on the interface (the engine falls back to getCheckpoints), but a conformant store
+      // MUST provide it — assert presence, then exercise it.
+      expect(store.getCheckpointsForSettle).toBeDefined();
+      if (!store.getCheckpointsForSettle) return;
+      expect(await store.getCheckpointsForSettle('r1', [])).toEqual([]);
+      await store.createRun(run());
+      for (const seq of [0, 1, 2]) {
+        await store.saveCheckpoint(
+          checkpoint({
+            seq,
+            kind: 'remote',
+            stepId: `r1:${seq}`,
+            status: seq === 0 ? 'completed' : 'pending',
+            input: { prompt: `p${seq}` },
+            output: seq === 0 ? { answer: 0 } : undefined,
+            events: [{ at: seq, level: 'info', message: `m${seq}` }],
+            workerGroup: 'llm',
+            parallelGroup: 'all:0:3',
+            wakeAt: 5_000 + seq,
+          }),
+        );
+      }
+      const full = await store.getCheckpoints?.('r1', [2, 0, 9]);
+      const read = await store.getCheckpointsForSettle('r1', [2, 0, 9]);
+      expect(read.map((c) => c.seq)).toEqual([0, 2]);
+      expect(read.map((c) => c.input)).toEqual([undefined, undefined]);
+      const withoutInput = ({ input: _input, ...rest }: StepCheckpoint) => rest;
+      expect(read.map(withoutInput)).toEqual((full ?? []).map(withoutInput));
+      expect((await store.getCheckpoint('r1', 2))?.input).toEqual({ prompt: 'p2' });
+    });
+
+    t('getCheckpointsForSettle reads no input column', async () => {
+      if (!statementLog || !store.getCheckpointsForSettle) return;
+      await store.createRun(run());
+      for (const seq of [0, 1]) {
+        await store.saveCheckpoint(
+          checkpoint({
+            seq,
+            kind: 'remote',
+            stepId: `r1:${seq}`,
+            status: 'pending',
+            input: { prompt: 'x'.repeat(100_000) },
+            output: undefined,
+          }),
+        );
+      }
+      const before = statementLog().length;
+      const read = await store.getCheckpointsForSettle('r1', [0, 1]);
+      const sent = await loggedSince(statementLog, before);
+      expect(read).toHaveLength(2);
+      expect(sent.length).toBeGreaterThan(0);
+      // Neither the input column nor every column (`*`) is selected.
+      expect(sent.filter((statement) => /\binput\b|\*\s+from/i.test(statement))).toEqual([]);
+    });
+
     t('settleCheckpointsIfPending settles a wide batch', async () => {
       if (!store.settleCheckpointsIfPending) return;
       await store.createRun(run());

@@ -22,6 +22,7 @@ const lines = (n: number) => Array.from({ length: n }, (_, i) => ({ i }));
 const RESULT_PATH = [
   'getCheckpoint',
   'getCheckpoints',
+  'getCheckpointsForSettle',
   'getRun',
   'settleCheckpointsIfPending',
   'saveCheckpointsIfPending',
@@ -145,7 +146,10 @@ async function fan(opts: {
   noBulkSend?: boolean;
 }) {
   const inner = new InMemoryStateStore();
-  if (opts.noBatchedRead) Object.defineProperty(inner, 'getCheckpoints', { value: undefined });
+  if (opts.noBatchedRead) {
+    Object.defineProperty(inner, 'getCheckpoints', { value: undefined });
+    Object.defineProperty(inner, 'getCheckpointsForSettle', { value: undefined });
+  }
   if (opts.noBulkSend) Object.defineProperty(inner, 'saveCheckpoints', { value: undefined });
   Consumer.calls = { one: 0, many: 0 };
   const broker = new Broker();

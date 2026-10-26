@@ -193,7 +193,7 @@ and the contract also checks that `saveCheckpoints`, `getCheckpoints` and `saveC
 send a few statements for a 600-row batch, not one per row. Return a `statementLog: () => string[]`
 (each statement's SQL text followed by its parameters, from the same log) and it checks that
 `settleCheckpointsIfPending` sends none of the input of the steps it settles, and that
-`listCheckpointsForReplay` selects neither the `input` column nor `*` for a run whose steps completed.
+`getCheckpointsForSettle` and `listCheckpointsForReplay` select neither the `input` column nor `*` (the replay read, for a run whose steps completed).
 
 **Transport** — `assertTransportConformance(transport, idPrefix?)` proves a durable remote step
 round-trips to a worker and back, for both success and a throwing handler:
