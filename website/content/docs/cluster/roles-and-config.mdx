@@ -169,7 +169,9 @@ operator, which is bound to the store-backed gateway.
 The dashboard asks `getRunDetail(id, { summarizeFansOver: 50 })` and pages a fan with
 `getFanMembers` (see [Wide fans](/docs/observability/dashboard#wide-fans)). `StoreRunGateway`
 implements both, plus `getRun`. On a store-less pod, `ProxyRunGateway` forwards the detail options
-in its `getRunDetail` request and sends a `getFanMembers` request kind. The control plane's
+in its `getRunDetail` request and sends `getFanMembers` and `getRun` request kinds. `getRun` answers
+the run alone, so a caller that only needs a run's status (a cancel check, say) does not ship the
+whole timeline over the wire. The control plane's
 responder checks that the requesting tenant owns the run before it pages the fan, as it does
 before every run-scoped verb, so a tenant cannot page another tenant's fan. A control plane older
 than the tenant still serves both. See [Rolling upgrades](#rolling-upgrades).
@@ -205,11 +207,11 @@ releases, run detail keeps working in both directions:
 
 | Tenant | Control plane | What happens |
 | --- | --- | --- |
-| 0.47.2+ | 0.46.x or older | The old responder ignores the detail options and has no `getFanMembers`. `ProxyRunGateway` sees the full detail come back without `fans` and summarizes it on the tenant. A `getFanMembers` gets no data from an old responder, so the proxy reads the full detail and pages the fan out of it. Both fallbacks happen on that reply, with no timeout wait. |
+| 0.47.2+ | 0.46.x or older | The old responder ignores the detail options and has no `getFanMembers`. `ProxyRunGateway` sees the full detail come back without `fans` and summarizes it on the tenant. A `getFanMembers` gets no data from an old responder, so the proxy reads the full detail and pages the fan out of it. Both fallbacks happen on that reply, with no timeout wait. A `getRun` gets no data either, so the proxy takes the run out of the full detail. |
 | 0.47.0 or 0.47.1 | 0.46.x or older | These tenants have no fallback: run detail comes back unsummarized and fan pages answer 404. Upgrade the control plane first, or move the tenants straight to 0.47.2. |
 | 0.46.x or older | 0.47.0+ | An old proxy never sends detail options or `getFanMembers`. The new responder answers its requests exactly as before: a full detail, and the same ownership checks. |
 
-After a control plane answers that it does not know `getFanMembers`, the proxy pages fans locally
+After a control plane answers that it does not know `getFanMembers` (or `getRun`), the proxy pages fans locally
 for the next minute before it asks again. The control plane can be several pods behind one queue,
 mid-upgrade themselves, and a reply does not say which pod sent it. So the proxy treats the whole
 control plane as old until that minute is up. The result is the same either way. Only the cost

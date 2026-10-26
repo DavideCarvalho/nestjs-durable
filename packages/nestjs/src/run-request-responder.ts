@@ -18,6 +18,7 @@ export const UNSUPPORTED_RUN_REQUEST = 'unsupported-request';
 const KNOWN_KINDS: ReadonlySet<string> = new Set<RunRequestKind['kind']>([
   'getRunDetail',
   'getFanMembers',
+  'getRun',
   'listRuns',
   'runFacets',
   'runValueFacets',
@@ -223,6 +224,10 @@ export class RunRequestResponder {
       return { requestId: msg.requestId, result: { ok: true, data: detail } };
     }
 
+    if (body.kind === 'getRun') {
+      return { requestId: msg.requestId, result: { ok: true, data: run ?? null } };
+    }
+
     if (body.kind === 'getFanMembers') {
       const data = run
         ? ((await this.gateway.getFanMembers?.(body.runId, body.group, body.query)) ?? null)
@@ -249,6 +254,7 @@ export class RunRequestResponder {
       | { kind: 'runValueFacets' }
       | { kind: 'getRunDetail' }
       | { kind: 'getFanMembers' }
+      | { kind: 'getRun' }
       | { kind: 'workerHealth' }
       | { kind: 'waitingFor' }
     >,

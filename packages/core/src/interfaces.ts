@@ -1321,6 +1321,8 @@ export interface RunRequest {
 export type RunRequestKind =
   | { kind: 'getRunDetail'; runId: string; options?: RunDetailOptions | undefined }
   | { kind: 'getFanMembers'; runId: string; group: string; query: FanPageQuery }
+  // The run alone, for a caller that needs its status but not its timeline.
+  | { kind: 'getRun'; runId: string }
   | { kind: 'listRuns'; query: RunQuery }
   | { kind: 'runFacets'; query: RunFacetQuery }
   | {

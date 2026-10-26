@@ -177,6 +177,7 @@ function wire() {
   const requestHandlers: Array<(msg: RunRequest) => Promise<void>> = [];
   const replyHandlers: Array<(reply: RunReply) => void> = [];
   const sent: RunRequestKind[] = [];
+  let replied = 0;
   let next = 0;
   const json = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
   const tenantSide = {
@@ -194,13 +195,20 @@ function wire() {
       requestHandlers.push(handler);
     },
     publishRunReply: async (reply) => {
+      replied += JSON.stringify(reply).length;
       const encoded = json(reply);
       setImmediate(() => {
         for (const h of replyHandlers) h(encoded);
       });
     },
   };
-  return { tenantSide, controlPlaneSide, sent, kinds: () => sent.map((b) => b.kind) };
+  return {
+    tenantSide,
+    controlPlaneSide,
+    sent,
+    kinds: () => sent.map((b) => b.kind),
+    replyBytes: () => replied,
+  };
 }
 
 // --- one run with a 30-member fan ---------------------------------------------------------------
@@ -308,6 +316,72 @@ describe('run gateway version skew', () => {
       const page = await proxy.getFanMembers('r1', FAN, { offset: 0, limit: 5 });
       expect(page?.total).toBe(30);
       expect(w.kinds()).toEqual(['getRunDetail', 'getFanMembers']);
+    });
+  });
+
+  describe('getRun', () => {
+    it('reads the run alone from a current control plane, not its timeline', async () => {
+      const w = wire();
+      controlPlane(w, 'current');
+      const proxy = new ProxyRunGateway(w.tenantSide, 'acme');
+
+      const got = await proxy.getRun('r1');
+
+      expect(got).toEqual(wired(run()));
+      expect(w.kinds()).toEqual(['getRun']);
+      expect(w.replyBytes()).toBeLessThan(1_000);
+      await expect(proxy.getRun('missing')).resolves.toBeNull();
+    });
+
+    it('keeps the tenant boundary', async () => {
+      const w = wire();
+      controlPlane(w, 'current');
+      const proxy = new ProxyRunGateway(w.tenantSide, 'other-tenant');
+      await expect(proxy.getRun('r1')).rejects.toThrow(/another tenant/);
+    });
+
+    it('reads it out of the full detail from a 0.46.3 control plane', async () => {
+      const w = wire();
+      controlPlane(w, '0.46.3');
+      const proxy = new ProxyRunGateway(w.tenantSide, 'acme', 60_000);
+
+      const started = Date.now();
+      expect(await proxy.getRun('r1')).toEqual(wired(run()));
+      expect(Date.now() - started).toBeLessThan(1_000);
+      await expect(proxy.getRun('missing')).resolves.toBeNull();
+      // Remembered as unsupported: the second read goes straight to the detail.
+      expect(w.kinds()).toEqual(['getRun', 'getRunDetail', 'getRunDetail']);
+    });
+
+    it('reads it out of the full detail when the control plane says the verb is unsupported', async () => {
+      const w = wire();
+      const respond = new RunRequestResponder(w.controlPlaneSide, currentGateway());
+      const handle = (respond as unknown as { handle(m: RunRequest): Promise<RunReply> }).handle;
+      (respond as unknown as { handle(m: RunRequest): Promise<RunReply> }).handle = function (
+        this: RunRequestResponder,
+        msg,
+      ) {
+        if (msg.body.kind === 'getRun') {
+          return Promise.resolve({
+            requestId: msg.requestId,
+            result: { ok: false, error: { message: 'unknown', code: 'unsupported-request' } },
+          });
+        }
+        return handle.call(this, msg);
+      };
+      respond.start();
+      const proxy = new ProxyRunGateway(w.tenantSide, 'acme');
+
+      expect((await proxy.getRun('r1'))?.status).toBe('running');
+      expect(w.kinds()).toEqual(['getRun', 'getRunDetail']);
+    });
+
+    it('a 0.46.3 tenant proxy still reads details from a current control plane', async () => {
+      const w = wire();
+      controlPlane(w, 'current');
+      const legacy = new LegacyProxyRunGateway(w.tenantSide, 'acme');
+      const detail = await legacy.getRunDetail('r1');
+      expect(detail?.run.id).toBe('r1');
     });
   });
 
