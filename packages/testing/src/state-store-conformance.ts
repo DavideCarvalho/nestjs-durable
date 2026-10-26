@@ -104,6 +104,19 @@ const checkpoint = (over: Partial<StepCheckpoint> = {}): StepCheckpoint => ({
 });
 
 /**
+ * The statements logged after the first `before`, once the log stops growing: a driver may report a
+ * statement a moment after the call that sent it resolved.
+ */
+async function loggedSince(log: () => string[], before: number): Promise<string[]> {
+  let seen = -1;
+  for (let i = 0; i < 50 && log().length !== seen; i += 1) {
+    seen = log().length;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return log().slice(before);
+}
+
+/**
  * The SHARED behavioral contract every `StateStore` must satisfy — in-memory and each ORM adapter
  * alike. Registered as a vitest `describe`; pass a `name` and a {@link StateStoreFactory} that builds
  * a fresh, empty store. The same assertions run against SQLite/in-memory under `pnpm test` and
@@ -1055,6 +1068,23 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         ).toBeLessThanOrEqual(limit);
         expect(wrote.every((w) => w)).toBe(true);
         expect(await store.countCheckpoints?.('r1', 0, n - 1, ['completed'])).toBe(n);
+        if (!store.settleCheckpointsIfPending) return;
+        await store.saveCheckpoints?.(rows.map((row) => ({ ...row, seq: row.seq + n })));
+        const settlements = rows.map((row) => ({
+          runId: 'r1',
+          seq: row.seq + n,
+          status: 'completed' as const,
+          output: { seq: row.seq },
+          startedAt: row.startedAt,
+          finishedAt: row.finishedAt,
+        }));
+        expect(
+          await sent(async () => {
+            wrote = (await store.settleCheckpointsIfPending?.(settlements)) ?? [];
+          }),
+        ).toBeLessThanOrEqual(limit);
+        expect(wrote.every((w) => w)).toBe(true);
+        expect(await store.countCheckpoints?.('r1', n, 2 * n - 1, ['completed'])).toBe(n);
       },
     );
 
@@ -1196,7 +1226,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         );
       expect(await settle([0])).toEqual([true]);
       expect(await settle([1, 0])).toEqual([true, false]);
-      const sent = statementLog().slice(before);
+      const sent = await loggedSince(statementLog, before);
       expect(sent.length).toBeGreaterThan(0);
       expect(sent.some((statement) => statement.includes('xxxxxxxxxx'))).toBe(false);
       expect(sent.join('').length).toBeLessThan(20_000);
@@ -1306,7 +1336,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         }
         const before = statementLog().length;
         const replay = await store.listCheckpointsForReplay('r1');
-        const sent = statementLog().slice(before);
+        const sent = await loggedSince(statementLog, before);
         expect(replay.map((c) => c.output)).toEqual([{ answer: 0 }, { answer: 1 }]);
         expect(sent.length).toBeGreaterThan(0);
         // Neither the input column nor every column (`*`) is selected.

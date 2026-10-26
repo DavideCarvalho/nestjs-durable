@@ -71,8 +71,12 @@ replaces them with a `deleteMany` and a `createMany`. It is one commit per batch
 `settleCheckpointsIfPending` has the same shape, but writes only the six result columns: Drizzle
 Postgres's `UPDATE … FROM (VALUES …)` sets just those, and the upsert's conflict branch on MikroORM,
 TypeORM and Drizzle SQLite merges just those (its insert never happens, since the rows are locked).
-Prisma has no multi-row update, so it settles with one conditional `updateMany` per entry, in one
-transaction. `listCheckpointsForReplay` is one `SELECT` of every column but `input`, then one of
+Prisma's client has no multi-row update with a value per row, so its store settles a batch with raw
+SQL on the models' table and column names, 500 rows a statement, in one transaction:
+`UPDATE … FROM (VALUES …) WHERE status = 'pending' RETURNING` on Postgres and SQLite, and on MySQL a
+`SELECT … FOR UPDATE` of the still-`pending` rows followed by one `UPDATE … JOIN` of the values. A
+client without `$queryRawUnsafe`, or on another provider, settles with one conditional `updateMany`
+per entry. `listCheckpointsForReplay` is one `SELECT` of every column but `input`, then one of
 `(seq, input)` for the rows that are not completed (by seq, 500 at a time), skipped when there are
 none.
 
