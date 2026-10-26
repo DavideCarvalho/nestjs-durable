@@ -23,6 +23,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepSettlement,
   type StoreTransaction,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
@@ -408,6 +409,30 @@ export class DrizzlePgStateStore implements StateStore {
             ),
           );
           const byKey = new Map(chunk.map((i) => [rowKey(checkpoints[i] as StepCheckpoint), i]));
+          for (const row of updated) {
+            const i = byKey.get(rowKey({ runId: row.run_id, seq: Number(row.seq) }));
+            if (i !== undefined) wrote[i] = true;
+          }
+        }
+      }
+    });
+    return wrote;
+  }
+
+  async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+    const wrote = settlements.map(() => false);
+    if (settlements.length === 0) return wrote;
+    // As saveCheckpointsIfPending, with a statement that writes only what a result changes.
+    await this.db.transaction(async (tx) => {
+      for (const round of distinctRounds(settlements)) {
+        for (let at = 0; at < round.length; at += CHECKPOINT_BATCH_ROWS) {
+          const chunk = round.slice(at, at + CHECKPOINT_BATCH_ROWS);
+          const updated = rowsOf<{ run_id: string; seq: number }>(
+            await tx.execute(
+              settleIfPendingFrom(chunk.map((i) => settlements[i] as StepSettlement)),
+            ),
+          );
+          const byKey = new Map(chunk.map((i) => [rowKey(settlements[i] as StepSettlement), i]));
           for (const row of updated) {
             const i = byKey.get(rowKey({ runId: row.run_id, seq: Number(row.seq) }));
             if (i !== undefined) wrote[i] = true;
@@ -1093,7 +1118,7 @@ const CHECKPOINT_BATCH_ROWS = 500;
 const rowKey = (cp: { runId: string; seq: number }): string => `${cp.seq}:${cp.runId}`;
 
 /** Indexes of `checkpoints` split into rounds that each name a row at most once, in input order. */
-function distinctRounds(checkpoints: StepCheckpoint[]): number[][] {
+function distinctRounds(checkpoints: { runId: string; seq: number }[]): number[][] {
   const rounds: number[][] = [];
   const seen = new Map<string, number>();
   checkpoints.forEach((cp, i) => {
@@ -1128,6 +1153,22 @@ function updateIfPendingFrom(checkpoints: StepCheckpoint[]): SQL {
   FROM (VALUES ${sql.join(values, sql`, `)}) AS v(run_id, seq, name, kind, step_id, status, input,
     output, error, events, attempts, worker_group, parallel_group, wake_at, enqueued_at, started_at,
     finished_at)
+  WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'
+  RETURNING c.run_id, c.seq`;
+}
+
+/** {@link updateIfPendingFrom} for settlements: it sets only the columns a step's result writes. */
+function settleIfPendingFrom(settlements: StepSettlement[]): SQL {
+  const json = (v: unknown) => (v == null ? null : JSON.stringify(v));
+  const values = settlements.map(
+    (s) =>
+      sql`(${s.runId}::text, ${s.seq}::integer, ${s.status}::text, ${json(s.output)}::jsonb, ${json(s.error)}::jsonb, ${json(s.events)}::jsonb, ${s.startedAt.toISOString()}::timestamptz, ${s.finishedAt.toISOString()}::timestamptz)`,
+  );
+  return sql`UPDATE ${stepCheckpoints} AS c SET
+    status = v.status, output = v.output, error = v.error, events = v.events,
+    started_at = v.started_at, finished_at = v.finished_at
+  FROM (VALUES ${sql.join(values, sql`, `)}) AS v(run_id, seq, status, output, error, events,
+    started_at, finished_at)
   WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'
   RETURNING c.run_id, c.seq`;
 }

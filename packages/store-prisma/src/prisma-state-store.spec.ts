@@ -25,6 +25,7 @@ vi.setConfig({ testTimeout: 30_000 });
 // tests below both use this one.
 let sharedPrisma: any;
 let prismaStatements = 0;
+const prismaLog: string[] = [];
 let prismaReady: Promise<boolean> | undefined;
 
 async function prismaContractSetup(): Promise<boolean> {
@@ -38,8 +39,9 @@ async function prismaContractSetup(): Promise<boolean> {
         const { PrismaClient } = await import('../generated/client/index.js');
         // Query logging lets the per-store pushdown test below capture the executed SQL.
         sharedPrisma = new PrismaClient({ log: [{ emit: 'event', level: 'query' }] });
-        sharedPrisma.$on('query', () => {
+        sharedPrisma.$on('query', (e: { query: string; params: string }) => {
           prismaStatements += 1;
+          prismaLog.push(`${e.query} ${e.params}`);
         });
         await sharedPrisma.$connect();
         // SQLite reliability: under the engine's end-to-end write bursts (createRun → saveCheckpoint
@@ -79,6 +81,7 @@ runStateStoreContract('Prisma (SQLite)', async () => {
     // (Postgres/MySQL) but NOT on SQLite, the adapter's test DB only. Skipped here; asserted elsewhere.
     supportsTagFilter: false,
     statements: () => prismaStatements,
+    statementLog: () => prismaLog,
     cleanup: async () => undefined,
   };
 });

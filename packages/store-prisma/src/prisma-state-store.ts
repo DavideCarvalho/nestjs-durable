@@ -22,6 +22,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepSettlement,
   type BufferedSignalRow as StoreBufferedSignalRow,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
@@ -415,6 +416,33 @@ export class PrismaStateStore implements StateStore {
       }
       return wrote;
     });
+  }
+
+  async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+    if (settlements.length === 0) return [];
+    // One conditional `updateMany` per entry (`UPDATE … WHERE run_id = ? AND seq = ? AND status =
+    // 'pending'`) writing only what a result changes, in order and in one transaction: the row count
+    // is each entry's answer, and an entry that settled a row makes a later one for it lose.
+    const settle = async (db: Pick<DurablePrismaClient, 'durableStepCheckpoint'>) => {
+      const wrote: boolean[] = [];
+      for (const s of settlements) {
+        const { count } = await db.durableStepCheckpoint.updateMany({
+          where: { runId: s.runId, seq: s.seq, status: 'pending' },
+          data: {
+            status: s.status,
+            output: jsonOrNull(s.output),
+            error: jsonOrNull(s.error),
+            events: jsonOrNull(s.events),
+            startedAt: s.startedAt,
+            finishedAt: s.finishedAt,
+          },
+        });
+        wrote.push(count > 0);
+      }
+      return wrote;
+    };
+    if (settlements.length === 1) return settle(this.db);
+    return this.db.$transaction((tx) => settle(tx));
   }
 
   async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {

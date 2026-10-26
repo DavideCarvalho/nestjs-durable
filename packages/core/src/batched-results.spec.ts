@@ -6,6 +6,7 @@ import type {
   StateStore,
   StepCheckpoint,
   StepResult,
+  StepSettlement,
   Transport,
   WorkflowRun,
 } from './interfaces';
@@ -117,7 +118,8 @@ describe('batched step results', () => {
 
     expect((await store.getRun('p'))?.output).toEqual(lines(200).map(({ i }) => i * 10));
     expect(settled).toHaveLength(200);
-    expect(calls.get('saveCheckpointsIfPending')).toBe(1);
+    expect(calls.get('settleCheckpointsIfPending')).toBe(1);
+    expect(calls.get('saveCheckpointsIfPending') ?? 0).toBe(0);
     expect(calls.get('saveCheckpointIfPending') ?? 0).toBe(0);
     expect(calls.get('countCheckpoints')).toBe(1);
     // The dispatching turn, then exactly one more once the fan settled.
@@ -219,9 +221,9 @@ describe('batched step results', () => {
       gate = new Promise<void>((resolve) => {
         this.open = resolve;
       });
-      async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+      async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
         await this.gate;
-        return super.saveCheckpointsIfPending(checkpoints);
+        return super.settleCheckpointsIfPending(settlements);
       }
     }
     const store = new GatedStore();
@@ -250,13 +252,9 @@ describe('batched step results', () => {
     // one-by-one retry of its rows, so every result of the batch goes back to the broker.
     class FailingStore extends InMemoryStateStore {
       failures = 1;
-      async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+      async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
         if (this.failures > 0) throw new Error('connection lost');
-        return super.saveCheckpointsIfPending(checkpoints);
-      }
-      async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
-        if (this.failures > 0) throw new Error('connection lost');
-        return super.saveCheckpointIfPending(checkpoint);
+        return super.settleCheckpointsIfPending(settlements);
       }
     }
     const store = new FailingStore();
@@ -281,13 +279,9 @@ describe('batched step results', () => {
 
   it('one row the store rejects fails only its own result', async () => {
     class PoisonStore extends InMemoryStateStore {
-      async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
-        if (checkpoints.some((cp) => cp.output === 'poison')) throw new Error('value too long');
-        return super.saveCheckpointsIfPending(checkpoints);
-      }
-      async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
-        if (checkpoint.output === 'poison') throw new Error('value too long');
-        return super.saveCheckpointIfPending(checkpoint);
+      async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+        if (settlements.some((s) => s.output === 'poison')) throw new Error('value too long');
+        return super.settleCheckpointsIfPending(settlements);
       }
     }
     const store = new PoisonStore();
@@ -315,8 +309,26 @@ describe('batched step results', () => {
     await until(async () => (await store.getRun('p'))?.status === 'completed');
   });
 
-  it('a store without the batched write settles each result with its own compare-and-set', async () => {
+  it('a store without the settle writes a batch of results as whole rows in one call', async () => {
     const inner = new InMemoryStateStore();
+    Object.defineProperty(inner, 'settleCheckpointsIfPending', { value: undefined });
+    const { store, calls } = counting(inner);
+    const { transport, engine, register } = setup(store);
+    register(async (ctx) => ctx.all(processLine, lines(40)));
+    await engine.start('fan', {}, 'p');
+    await until(() => transport.dispatched.length === 40);
+    await until(async () => (await store.getRun('p'))?.status === 'suspended');
+    calls.clear();
+    await Promise.all(transport.take().map((t) => transport.deliver(ok(t))));
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+    expect((await store.getRun('p'))?.output).toEqual(lines(40).map(({ i }) => i * 10));
+    expect(calls.get('saveCheckpointsIfPending')).toBe(1);
+    expect((await store.getCheckpoint('p', 3))?.input).toEqual({ i: 3 });
+  });
+
+  it('a store without the batched writes settles each result with its own compare-and-set', async () => {
+    const inner = new InMemoryStateStore();
+    Object.defineProperty(inner, 'settleCheckpointsIfPending', { value: undefined });
     Object.defineProperty(inner, 'saveCheckpointsIfPending', { value: undefined });
     const { store, calls } = counting(inner);
     const { transport, engine, register } = setup(store);
@@ -338,9 +350,9 @@ describe('batched step results', () => {
       this.open = resolve;
     });
     failReads = new Set<number>();
-    async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+    async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
       await this.gate;
-      return super.saveCheckpointsIfPending(checkpoints);
+      return super.settleCheckpointsIfPending(settlements);
     }
     async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
       if (this.failReads.delete(seq)) throw new Error('connection lost');

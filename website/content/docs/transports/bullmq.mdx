@@ -83,7 +83,7 @@ are in flight, the fewer writes settle them. There is nothing to tune for wide f
 
 Results of the **same** run are settled in batches: the results of a run that arrive while one batch
 is being written go into the next (up to 256), which claims their checkpoints with one
-`saveCheckpointsIfPending` call. A step fan's join barrier is checked only by a batch with none of the
+`settleCheckpointsIfPending` call. A step fan's join barrier is checked only by a batch with none of the
 fan's results queued behind it, so under a backlog it is read about once per instance rather than
 once per batch. A batch resumes the run at most once, and each result is acknowledged only after its
 batch commits. The turn a batch triggers waits for the previous turn of that run on this instance. A

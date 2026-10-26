@@ -200,6 +200,18 @@ export interface StepCheckpoint {
   finishedAt: Date;
 }
 
+/** What a step's result changes on its checkpoint: see {@link StateStore.settleCheckpointsIfPending}. */
+export interface StepSettlement {
+  runId: string;
+  seq: number;
+  status: 'completed' | 'failed';
+  output?: unknown;
+  error?: StepError | undefined;
+  events?: StepEvent[] | undefined;
+  startedAt: Date;
+  finishedAt: Date;
+}
+
 /**
  * A structured event a step (or its worker) emits while running — a log line and/or a sub-step
  * outcome. The dashboard renders these under the step, so you can see what happened inside a step
@@ -456,6 +468,18 @@ export interface StateStore {
    * Optional: a store that omits it gets one {@link saveCheckpointIfPending} per entry.
    */
   saveCheckpointsIfPending?(checkpoints: StepCheckpoint[]): Promise<boolean[]>;
+  /**
+   * Settle steps from their results: per entry and in input order, while the row at `(runId, seq)`
+   * is still `pending`, write the entry's `status`, `output`, `error`, `events`, `startedAt` and
+   * `finishedAt` (an absent one is stored empty) and leave every other column as it is stored;
+   * resolves whether each entry wrote. Claims like {@link saveCheckpointsIfPending}: a later entry for
+   * a row an earlier one settled loses, and a rejection writes nothing. The engine settles a batch of
+   * one run's step results through it, so a step's `input` (an LLM prompt, say) is not written again
+   * when its result lands.
+   *
+   * Optional: a store that omits it gets {@link saveCheckpointsIfPending} with the whole rows.
+   */
+  settleCheckpointsIfPending?(settlements: StepSettlement[]): Promise<boolean[]>;
 
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
@@ -709,7 +733,6 @@ export interface StateStore {
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
-
   /**
    * The LATEST checkpoint for `runId` whose `name` equals `name` exactly (highest `seq` wins), or
    * `undefined` if none. A targeted read that avoids fetching + deserializing every checkpoint just to

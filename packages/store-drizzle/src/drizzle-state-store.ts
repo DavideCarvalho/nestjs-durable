@@ -23,6 +23,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepSettlement,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
   attributePredicateOperands,
@@ -417,6 +418,85 @@ export class DrizzleStateStore implements StateStore {
               .onConflictDoUpdate({
                 target: [stepCheckpoints.runId, stepCheckpoints.seq],
                 set: excludedSet(stepCheckpoints),
+              })
+              .run(),
+          );
+        }
+        return inSequence(writes);
+      });
+      return inSequence(steps);
+    });
+    return wrote;
+  }
+
+  async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+    if (settlements.length === 0) return [];
+    const wrote: boolean[] = [];
+    // Decided like saveCheckpointsIfPending, against the rows still `pending`. A settlement never
+    // leaves its row `pending`, so a row is won by its first entry only. The upsert's insert never
+    // happens (the rows exist, and no other writer runs in between): it carries the row's required
+    // columns and no `input`, and its conflict branch writes only what a result changes.
+    await this.db.transaction((tx) => {
+      type Pending = Pick<CheckpointRow, 'runId' | 'seq' | 'name' | 'kind' | 'stepId' | 'attempts'>;
+      const pending = new Map<string, Pending>();
+      const steps: Array<() => unknown> = [];
+      for (const [runId, seqs] of seqsByRun(settlements)) {
+        for (let at = 0; at < seqs.length; at += 400) {
+          const chunk = seqs.slice(at, at + 400);
+          steps.push(() => {
+            const rows = tx
+              .select({
+                runId: stepCheckpoints.runId,
+                seq: stepCheckpoints.seq,
+                name: stepCheckpoints.name,
+                kind: stepCheckpoints.kind,
+                stepId: stepCheckpoints.stepId,
+                attempts: stepCheckpoints.attempts,
+              })
+              .from(stepCheckpoints)
+              .where(
+                and(
+                  eq(stepCheckpoints.runId, runId),
+                  inArray(stepCheckpoints.seq, chunk),
+                  eq(stepCheckpoints.status, 'pending'),
+                ),
+              )
+              .all() as unknown;
+            const add = (found: Pending[]) => {
+              for (const row of found) pending.set(checkpointKey(row.runId, row.seq), row);
+            };
+            return rows instanceof Promise ? rows.then(add) : add(rows as Pending[]);
+          });
+        }
+      }
+      steps.push(() => {
+        const rows: (typeof stepCheckpoints.$inferInsert)[] = [];
+        for (const s of settlements) {
+          const key = checkpointKey(s.runId, s.seq);
+          const row = pending.get(key);
+          wrote.push(row !== undefined);
+          if (!row) continue;
+          pending.delete(key);
+          rows.push({
+            ...row,
+            status: s.status,
+            output: s.output ?? null,
+            error: s.error ?? null,
+            events: s.events ?? null,
+            startedAt: s.startedAt.getTime(),
+            finishedAt: s.finishedAt.getTime(),
+          });
+        }
+        const writes: Array<() => unknown> = [];
+        for (let at = 0; at < rows.length; at += 100) {
+          const chunk = rows.slice(at, at + 100);
+          writes.push(() =>
+            tx
+              .insert(stepCheckpoints)
+              .values(chunk)
+              .onConflictDoUpdate({
+                target: [stepCheckpoints.runId, stepCheckpoints.seq],
+                set: excludedSet(stepCheckpoints, [...SETTLED_FIELDS]),
               })
               .run(),
           );
@@ -1371,6 +1451,9 @@ function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
  * value the conflicting row proposed.
  */
 /** Run `steps` one after another, synchronously while each returns synchronously. */
+/** The checkpoint columns a step's result writes (see `settleCheckpointsIfPending`). */
+const SETTLED_FIELDS = ['status', 'output', 'error', 'events', 'startedAt', 'finishedAt'];
+
 function inSequence(steps: Array<() => unknown>, from = 0): undefined | Promise<undefined> {
   for (let i = from; i < steps.length; i += 1) {
     const done = (steps[i] as () => unknown)();
@@ -1380,7 +1463,7 @@ function inSequence(steps: Array<() => unknown>, from = 0): undefined | Promise<
 }
 
 /** `checkpoints`' distinct seqs, by run. */
-function seqsByRun(checkpoints: StepCheckpoint[]): Map<string, number[]> {
+function seqsByRun(checkpoints: { runId: string; seq: number }[]): Map<string, number[]> {
   const byRun = new Map<string, Set<number>>();
   for (const { runId, seq } of checkpoints) {
     const seqs = byRun.get(runId) ?? new Set<number>();

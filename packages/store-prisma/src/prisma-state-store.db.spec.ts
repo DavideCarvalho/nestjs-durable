@@ -37,6 +37,7 @@ let setupError: unknown;
 // The Prisma client is generated at test time, so it is untyped here.
 let sharedPrisma: any;
 let prismaStatements = 0;
+const prismaLog: string[] = [];
 
 function runPrisma(args: string[], env: Record<string, string>): void {
   execFileSync('npx', ['prisma', ...args], {
@@ -62,8 +63,9 @@ beforeAll(async () => {
       datasources: { db: { url } },
       log: [{ emit: 'event', level: 'query' }],
     });
-    sharedPrisma.$on('query', () => {
+    sharedPrisma.$on('query', (e: { query: string; params: string }) => {
       prismaStatements += 1;
+      prismaLog.push(`${e.query} ${e.params}`);
     });
     await sharedPrisma.$connect();
   } catch (err) {
@@ -105,6 +107,7 @@ runStateStoreContract('Prisma (Postgres)', async () => {
     // Postgres supports `array_contains`, so the tag filter is exercised here (unlike SQLite).
     supportsTagFilter: true,
     statements: () => prismaStatements,
+    statementLog: () => prismaLog,
     cleanup: async () => undefined,
   };
 });
@@ -115,6 +118,7 @@ let mysql: StartedMySqlContainer | undefined;
 let mysqlError: unknown;
 let mysqlPrisma: any;
 let mysqlStatements = 0;
+const mysqlLog: string[] = [];
 
 beforeAll(async () => {
   if (skipped) return;
@@ -131,8 +135,9 @@ beforeAll(async () => {
       datasources: { db: { url } },
       log: [{ emit: 'event', level: 'query' }],
     });
-    mysqlPrisma.$on('query', () => {
+    mysqlPrisma.$on('query', (e: { query: string; params: string }) => {
       mysqlStatements += 1;
+      mysqlLog.push(`${e.query} ${e.params}`);
     });
     await mysqlPrisma.$connect();
   } catch (err) {
@@ -159,6 +164,7 @@ runStateStoreContract('Prisma (MySQL)', async () => {
     peerStore: new PrismaStateStore(mysqlPrisma),
     supportsTagFilter: true,
     statements: () => mysqlStatements,
+    statementLog: () => mysqlLog,
     cleanup: async () => undefined,
   };
 });

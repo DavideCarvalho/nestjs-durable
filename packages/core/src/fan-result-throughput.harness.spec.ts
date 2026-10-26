@@ -60,7 +60,7 @@ function latentStore(
           stats.countRows += rows;
           cost += (rows * opts.countUsPerRow) / 1000;
         }
-        if (name === 'saveCheckpointsIfPending') {
+        if (name === 'settleCheckpointsIfPending' || name === 'saveCheckpointsIfPending') {
           const n = (args[0] as unknown[]).length;
           stats.batchSizes.push(n);
           cost += n * opts.writeMsPerRow;
@@ -192,6 +192,7 @@ async function scenario(opts: {
   const resultCalls =
     (stats.calls.get('getCheckpoint') ?? 0) +
     (stats.calls.get('getCheckpoints') ?? 0) +
+    (stats.calls.get('settleCheckpointsIfPending') ?? 0) +
     (stats.calls.get('saveCheckpointsIfPending') ?? 0) +
     (stats.calls.get('saveCheckpointIfPending') ?? 0) +
     (stats.calls.get('countCheckpoints') ?? 0) +

@@ -93,6 +93,7 @@ import type {
   StepInvocation,
   StepKind,
   StepResult,
+  StepSettlement,
   StepUndo,
   Transport,
   UpdateResult,
@@ -7275,6 +7276,35 @@ export class WorkflowEngine {
   }
 
   /**
+   * Settle steps of one run at distinct seqs from their results ({@link StepSettlement}s, `settled[i]`
+   * being the `pending` row `settlements[i]` settles): one
+   * {@link StateStore.settleCheckpointsIfPending} call when the store has it, which writes only what
+   * a result changes, else the whole rows through {@link savePendingCheckpoints}. Never rejects as a
+   * whole, the same way.
+   */
+  private async settlePendingCheckpoints(
+    settlements: StepSettlement[],
+    settled: StepCheckpoint[],
+  ): Promise<(boolean | { error: unknown })[]> {
+    const settle = this.store.settleCheckpointsIfPending?.bind(this.store);
+    if (!settle) {
+      return this.savePendingCheckpoints(
+        settlements.map((s, i) => ({ ...(settled[i] as StepCheckpoint), ...s })),
+      );
+    }
+    if (settlements.length > 1) {
+      try {
+        const wrote = await settle(settlements);
+        return settlements.map((_, i) => wrote[i] === true);
+      } catch {
+        // Fall through: one bad row must not fail the whole batch.
+      }
+    }
+    const one = await Promise.allSettled(settlements.map((s) => settle([s])));
+    return one.map((s) => (s.status === 'fulfilled' ? s.value[0] === true : { error: s.reason }));
+  }
+
+  /**
    * The checkpoints of one run at distinct `seqs`, each as its own outcome: one
    * {@link StateStore.getCheckpoints} call when the store has it, else one read each. The batch
    * call rejecting falls back to one read each, so a failing read fails only its own entry.
@@ -7451,10 +7481,11 @@ export class WorkflowEngine {
     const run = await this.store.getRun(runId);
     if (run && (run.status === 'cancelled' || run.status === 'completed')) return outcomes;
     const finishedAt = new Date();
-    const writes = pending.map(({ index, cp }) => {
+    const settlements = pending.map(({ index, cp }): StepSettlement => {
       const result = results[index] as StepResult;
       return {
-        ...cp,
+        runId,
+        seq: cp.seq,
         status: result.status,
         output: result.status === 'completed' ? result.output : cp.output,
         error: result.error,
@@ -7464,7 +7495,10 @@ export class WorkflowEngine {
       };
     });
     // Claimed, not blindly written: a duplicate delivery of a result settled its step first.
-    const claims = await this.savePendingCheckpoints(writes);
+    const claims = await this.settlePendingCheckpoints(
+      settlements,
+      pending.map(({ cp }) => cp),
+    );
     const settled: { index: number; cp: StepCheckpoint; result: StepResult }[] = [];
     claims.forEach((claim, k) => {
       const { index, cp } = pending[k] as { index: number; cp: StepCheckpoint };

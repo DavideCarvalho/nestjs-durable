@@ -23,6 +23,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepSettlement,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
   attributePredicateOperands,
@@ -373,22 +374,9 @@ export class TypeOrmStateStore implements StateStore {
     // In one transaction: lock the batch's rows that are still `pending`, decide each entry in order
     // against them (an entry that settles a row makes a later entry for it lose), then write each
     // row's last winning entry with one upsert per chunk. A rejection writes nothing.
-    const lock = !['sqlite', 'better-sqlite3', 'sqljs'].includes(this.dataSource.options.type);
     return this.dataSource.transaction(async (em) => {
       const repo = em.getRepository(StepCheckpointEntity);
-      const pending = new Set<string>();
-      for (const [runId, seqs] of seqsByRun(checkpoints)) {
-        for (let at = 0; at < seqs.length; at += 500) {
-          const query = repo
-            .createQueryBuilder('c')
-            .select(['c.runId', 'c.seq'])
-            .where('c.runId = :runId', { runId })
-            .andWhere('c.seq IN (:...seqs)', { seqs: seqs.slice(at, at + 500) })
-            .andWhere('c.status = :status', { status: 'pending' });
-          if (lock) query.setLock('pessimistic_write');
-          for (const row of await query.getMany()) pending.add(checkpointKey(row.runId, row.seq));
-        }
-      }
+      const pending = new Set((await this.lockPendingCheckpoints(repo, checkpoints, [])).keys());
       const { wrote, writes } = decideIfPending(checkpoints, pending);
       for (let at = 0; at < writes.length; at += 500) {
         await repo.upsert(
@@ -404,6 +392,86 @@ export class TypeOrmStateStore implements StateStore {
       }
       return wrote;
     });
+  }
+
+  async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+    if (settlements.length === 0) return [];
+    // Decided like saveCheckpointsIfPending, against the locked `pending` rows. A settlement never
+    // leaves its row `pending`, so a row is won by its first entry only. The upsert's insert never
+    // happens (the rows exist and are locked): it carries the row's required columns and no `input`,
+    // and its conflict branch writes only what a result changes.
+    return this.dataSource.transaction(async (em) => {
+      const repo = em.getRepository(StepCheckpointEntity);
+      const pending = await this.lockPendingCheckpoints(repo, settlements, [
+        'name',
+        'kind',
+        'stepId',
+        'attempts',
+      ]);
+      const wrote: boolean[] = [];
+      const rows: QueryDeepPartialEntity<StepCheckpointEntity>[] = [];
+      for (const s of settlements) {
+        const key = checkpointKey(s.runId, s.seq);
+        const row = pending.get(key);
+        wrote.push(row !== undefined);
+        if (!row) continue;
+        pending.delete(key);
+        rows.push({
+          runId: row.runId,
+          seq: row.seq,
+          name: row.name,
+          kind: row.kind,
+          stepId: row.stepId,
+          attempts: row.attempts,
+          status: s.status,
+          output: s.output ?? null,
+          error: s.error ?? null,
+          events: s.events ?? null,
+          startedAt: s.startedAt,
+          finishedAt: s.finishedAt,
+        } as QueryDeepPartialEntity<StepCheckpointEntity>);
+      }
+      const column = (property: string) =>
+        repo.metadata.findColumnWithPropertyName(property)?.databaseName ?? property;
+      for (let at = 0; at < rows.length; at += 500) {
+        await repo
+          .createQueryBuilder()
+          .insert()
+          .values(rows.slice(at, at + 500))
+          .orUpdate(SETTLED_FIELDS.map(column), ['runId', 'seq'].map(column))
+          .execute();
+      }
+      return wrote;
+    });
+  }
+
+  /**
+   * Lock the rows of `entries` that are still `pending` (`SELECT … FOR UPDATE` in chunks, except on
+   * SQLite, whose write transaction already excludes other writers), reading their key and `fields`,
+   * keyed by {@link checkpointKey}. Runs inside the caller's transaction.
+   */
+  private async lockPendingCheckpoints(
+    repo: Repository<StepCheckpointEntity>,
+    entries: { runId: string; seq: number }[],
+    fields: (keyof StepCheckpointEntity & string)[],
+  ): Promise<Map<string, StepCheckpointEntity>> {
+    const lock = !['sqlite', 'better-sqlite3', 'sqljs'].includes(this.dataSource.options.type);
+    const pending = new Map<string, StepCheckpointEntity>();
+    for (const [runId, seqs] of seqsByRun(entries)) {
+      for (let at = 0; at < seqs.length; at += 500) {
+        const query = repo
+          .createQueryBuilder('c')
+          .select(['c.runId', 'c.seq', ...fields.map((f) => `c.${f}`)])
+          .where('c.runId = :runId', { runId })
+          .andWhere('c.seq IN (:...seqs)', { seqs: seqs.slice(at, at + 500) })
+          .andWhere('c.status = :status', { status: 'pending' });
+        if (lock) query.setLock('pessimistic_write');
+        for (const row of await query.getMany()) {
+          pending.set(checkpointKey(row.runId, row.seq), row);
+        }
+      }
+    }
+    return pending;
   }
 
   async transaction<T>(
@@ -1241,7 +1309,10 @@ function runUpdateSet(patch: Partial<WorkflowRun>): Record<string, unknown> {
 }
 
 /** `checkpoints`' distinct seqs, by run. */
-function seqsByRun(checkpoints: StepCheckpoint[]): Map<string, number[]> {
+/** The checkpoint columns a step's result writes (see `settleCheckpointsIfPending`). */
+const SETTLED_FIELDS = ['status', 'output', 'error', 'events', 'startedAt', 'finishedAt'];
+
+function seqsByRun(checkpoints: { runId: string; seq: number }[]): Map<string, number[]> {
   const byRun = new Map<string, Set<number>>();
   for (const { runId, seq } of checkpoints) {
     const seqs = byRun.get(runId) ?? new Set<number>();

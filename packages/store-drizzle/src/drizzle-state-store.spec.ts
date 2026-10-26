@@ -17,15 +17,18 @@ runStateStoreContract('Drizzle (better-sqlite3, SQLite-only)', async () => {
   const sqlite = new Database(':memory:');
   sqlite.exec(DDL);
   let statements = 0;
+  const log: string[] = [];
   const logger = {
-    logQuery: () => {
+    logQuery: (query: string, params: unknown[]) => {
       statements += 1;
+      log.push(`${query} ${JSON.stringify(params)}`);
     },
   };
   const db = drizzle(sqlite, { schema: durableSchema, logger });
   return {
     store: new DrizzleStateStore(db),
     statements: () => statements,
+    statementLog: () => log,
     // better-sqlite3 is synchronous: its `transaction()` rejects an async callback, so the contract's
     // transaction case is skipped here (it runs for every other store). libSQL (async) would support it.
     supportsAsyncTransaction: false,

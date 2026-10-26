@@ -16,6 +16,7 @@ import {
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
+  type StepSettlement,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
 } from '../interfaces';
@@ -242,6 +243,16 @@ export class InMemoryStateStore implements StateStore {
       const key = this.key(checkpoint.runId, checkpoint.seq);
       if (this.checkpoints.get(key)?.status !== 'pending') return false;
       this.checkpoints.set(key, { ...checkpoint });
+      return true;
+    });
+  }
+
+  async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+    return settlements.map((settlement) => {
+      const key = this.key(settlement.runId, settlement.seq);
+      const cp = this.checkpoints.get(key);
+      if (cp?.status !== 'pending') return false;
+      this.checkpoints.set(key, { ...cp, ...settlement });
       return true;
     });
   }

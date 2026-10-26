@@ -114,7 +114,8 @@ DurableModule.forRootAsync({
 Each store operation runs on a forked `EntityManager`, so it owns its own unit of work and won't
 interfere with request-scoped EMs.
 
-Step checkpoints (`listCheckpoints`, `getCheckpoints`, `saveCheckpoints`, `saveCheckpointsIfPending`)
+Step checkpoints (`listCheckpoints`, `getCheckpoints`, `saveCheckpoints`, `saveCheckpointsIfPending`,
+`settleCheckpointsIfPending`)
 go through the query builder rather than managed entities: rows are mapped to entity properties with
 the same type conversions as `em.find`, but never hydrated into the identity map, and upserts are
 `insert().onConflict().merge()`, 500 rows a statement. A wide fan's checkpoints are tens of thousands

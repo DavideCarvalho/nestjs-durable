@@ -102,7 +102,9 @@ describe.runIf(enabled)('wide step fan on MikroORM/MySQL + BullMQ/Redis (harness
           return (...args: unknown[]) => {
             const name = String(prop);
             calls.set(name, (calls.get(name) ?? 0) + 1);
-            if (name === 'saveCheckpointsIfPending') batches.push((args[0] as unknown[]).length);
+            if (name === 'settleCheckpointsIfPending' || name === 'saveCheckpointsIfPending') {
+              batches.push((args[0] as unknown[]).length);
+            }
             if (name === 'saveCheckpointIfPending') batches.push(1);
             const at = Date.now();
             const out = value.apply(target, args);
