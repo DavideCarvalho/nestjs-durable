@@ -740,6 +740,25 @@ export class PrismaStateStore implements StateStore {
     return rows.map(fromCheckpointRow);
   }
 
+  async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
+    const rows = await this.db.durableStepCheckpoint.findMany({
+      where: { runId },
+      orderBy: { seq: 'asc' },
+      select: REPLAY_CHECKPOINT_SELECT,
+    });
+    // An open or failed step keeps its input; read by seq, so a row settled since is still filled.
+    const open = rows.filter((row) => row.status !== 'completed').map((row) => row.seq);
+    const inputs = new Map<number, unknown>();
+    for (let at = 0; at < open.length; at += 500) {
+      const found = await this.db.durableStepCheckpoint.findMany({
+        where: { runId, seq: { in: open.slice(at, at + 500) } },
+        select: { seq: true, input: true },
+      });
+      for (const row of found) inputs.set(row.seq, row.input);
+    }
+    return rows.map((row) => fromCheckpointRow({ ...row, input: inputs.get(row.seq) ?? null }));
+  }
+
   async getLatestCheckpointByName(
     runId: string,
     name: string,
@@ -1298,6 +1317,26 @@ async function replaceCheckpoints(
     });
   }
 }
+
+/** Every checkpoint column but `input`, as a Prisma `select`. */
+const REPLAY_CHECKPOINT_SELECT = {
+  runId: true,
+  seq: true,
+  name: true,
+  kind: true,
+  stepId: true,
+  status: true,
+  output: true,
+  error: true,
+  events: true,
+  attempts: true,
+  workerGroup: true,
+  parallelGroup: true,
+  wakeAt: true,
+  enqueuedAt: true,
+  startedAt: true,
+  finishedAt: true,
+} satisfies Record<Exclude<keyof CheckpointRow, 'input'>, true>;
 
 function toCheckpointData(cp: StepCheckpoint) {
   return {

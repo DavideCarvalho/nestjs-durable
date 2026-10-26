@@ -846,6 +846,29 @@ export class TypeOrmStateStore implements StateStore {
     return rows.map(fromCheckpointEntity);
   }
 
+  async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
+    const repo = this.checkpoints();
+    const select = repo.metadata.columns
+      .map((column) => column.propertyName)
+      .filter((name) => name !== 'input');
+    const rows = await repo.find({
+      select: select as (keyof StepCheckpointEntity)[],
+      where: { runId },
+      order: { seq: 'ASC' },
+    });
+    // An open or failed step keeps its input; read by seq, so a row settled since is still filled.
+    const open = rows.filter((row) => row.status !== 'completed').map((row) => row.seq);
+    const inputs = new Map<number, unknown>();
+    for (let at = 0; at < open.length; at += 500) {
+      const found = await repo.find({
+        select: ['seq', 'input'],
+        where: { runId, seq: In(open.slice(at, at + 500)) },
+      });
+      for (const row of found) inputs.set(row.seq, row.input);
+    }
+    return rows.map((row) => fromCheckpointEntity({ ...row, input: inputs.get(row.seq) ?? null }));
+  }
+
   async getLatestCheckpointByName(
     runId: string,
     name: string,

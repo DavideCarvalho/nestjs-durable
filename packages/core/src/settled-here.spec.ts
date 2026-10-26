@@ -140,6 +140,7 @@ describe("a step fan's checkpoints", () => {
         if (typeof value !== 'function') return value;
         return (...args: unknown[]) => {
           if (prop === 'listCheckpoints') reads.push('list');
+          if (prop === 'listCheckpointsForReplay') reads.push('replay');
           if (prop === 'getCheckpoints') reads.push(`get:${(args[1] as number[]).length}`);
           return value.apply(target, args);
         };
@@ -161,6 +162,10 @@ describe("a step fan's checkpoints", () => {
     expect(turns).toBe(2);
     // Turn 1: its snapshot, then the fan's own read (nothing was sent yet). Turn 2: its snapshot
     // only, which already holds every step settled.
-    expect(reads.filter((r) => r === 'list')).toHaveLength(3);
+    expect(reads.filter((r) => r === 'list' || r === 'replay')).toEqual([
+      'replay',
+      'list',
+      'replay',
+    ]);
   });
 });

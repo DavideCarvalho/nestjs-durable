@@ -996,6 +996,29 @@ export class MikroOrmStateStore implements StateStore {
     return rows.map(fromCheckpointEntity);
   }
 
+  async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
+    const em = this.fork();
+    const fields = Object.keys(em.getMetadata().get(StepCheckpointEntity).properties).filter(
+      (name) => name !== 'input',
+    );
+    const rows = await selectCheckpointRows(em, { runId }, fields);
+    // An open or failed step keeps its input; read by seq, so a row settled since is still filled.
+    const open = rows.filter((row) => row.status !== 'completed').map((row) => row.seq);
+    if (open.length > 0) {
+      const inputs = new Map<number, unknown>();
+      for (let at = 0; at < open.length; at += 500) {
+        const found = await selectCheckpointRows(
+          em,
+          { runId, seq: { $in: open.slice(at, at + 500) } },
+          ['seq', 'input'],
+        );
+        for (const row of found) inputs.set(row.seq, row.input);
+      }
+      for (const row of rows) if (inputs.has(row.seq)) row.input = inputs.get(row.seq);
+    }
+    return rows.map(fromCheckpointEntity);
+  }
+
   async getLatestCheckpointByName(
     runId: string,
     name: string,
@@ -1431,9 +1454,11 @@ function aggregateDateReader(em: EntityManager): (value: unknown) => Date {
 async function selectCheckpointRows(
   em: EntityManager,
   where: Record<string, unknown>,
+  fields?: string[],
 ): Promise<StepCheckpointEntity[]> {
-  const rows = await (em as SqlEm)
-    .createQueryBuilder<StepCheckpointEntity>(StepCheckpointEntity)
+  const query = (em as SqlEm).createQueryBuilder<StepCheckpointEntity>(StepCheckpointEntity);
+  if (fields) query.select(fields);
+  const rows = await query
     .where(where)
     .orderBy({ seq: 'asc' })
     .execute<Record<string, unknown>[]>('all', true);
@@ -1452,10 +1477,6 @@ async function selectCheckpointRows(
   return rows as unknown as StepCheckpointEntity[];
 }
 
-/**
- * Insert-or-overwrite checkpoint rows, 500 a statement, through the query builder: the rows are not
- * turned into managed entities, which for a 40k-step fan cost more than the inserts themselves.
- */
 /** The checkpoint columns a step's result writes (see `settleCheckpointsIfPending`). */
 const SETTLED_FIELDS = ['status', 'output', 'error', 'events', 'startedAt', 'finishedAt'] as const;
 
@@ -1495,6 +1516,10 @@ async function lockPendingCheckpoints(
   return pending;
 }
 
+/**
+ * Insert-or-overwrite checkpoint rows, 500 a statement, through the query builder: the rows are not
+ * turned into managed entities, which for a 40k-step fan cost more than the inserts themselves.
+ */
 async function upsertCheckpointRows(
   em: EntityManager,
   rows: StepCheckpointEntity[],

@@ -1237,6 +1237,84 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     });
 
     t(
+      'listCheckpointsForReplay lists every checkpoint, a completed one without its input',
+      async () => {
+        // Optional on the interface (the engine falls back to listCheckpoints), but a conformant store
+        // MUST provide it — assert presence, then exercise it.
+        expect(store.listCheckpointsForReplay).toBeDefined();
+        if (!store.listCheckpointsForReplay) return;
+        await store.createRun(run());
+        await store.createRun(run({ id: 'r2' }));
+        const remote = (seq: number, over: Partial<StepCheckpoint>) =>
+          checkpoint({
+            seq,
+            name: `ask-${seq}`,
+            kind: 'remote',
+            stepId: `r1:${seq}`,
+            input: { prompt: `p${seq}` },
+            workerGroup: 'llm',
+            ...over,
+          });
+        await store.saveCheckpoint(remote(0, { output: { answer: 0 } }));
+        await store.saveCheckpoint(
+          remote(1, { status: 'pending', output: undefined, wakeAt: 9_000 }),
+        );
+        await store.saveCheckpoint(
+          remote(2, { status: 'failed', output: undefined, error: { message: 'boom' } }),
+        );
+        await store.saveCheckpoint(checkpoint({ seq: 3, stepId: 'r1:3', status: 'running' }));
+        await store.saveCheckpoint(remote(4, { output: { answer: 4 }, parallelGroup: 'all:4:1' }));
+        await store.saveCheckpoint(
+          checkpoint({ runId: 'r2', stepId: 'r2:0', input: { other: true } }),
+        );
+
+        const full = await store.listCheckpoints('r1');
+        const replay = await store.listCheckpointsForReplay('r1');
+        expect(replay.map((c) => c.seq)).toEqual([0, 1, 2, 3, 4]);
+        expect(replay.map((c) => c.input)).toEqual([
+          undefined,
+          { prompt: 'p1' },
+          { prompt: 'p2' },
+          undefined,
+          undefined,
+        ]);
+        // Everything else is what listCheckpoints reads.
+        const withoutInput = ({ input: _input, ...rest }: StepCheckpoint) => rest;
+        expect(replay.map(withoutInput)).toEqual(full.map(withoutInput));
+        // The full read still has the completed steps' inputs.
+        expect(full[0]?.input).toEqual({ prompt: 'p0' });
+        expect((await store.getCheckpoint('r1', 4))?.input).toEqual({ prompt: 'p4' });
+        expect(await store.listCheckpointsForReplay('missing')).toEqual([]);
+      },
+    );
+
+    t(
+      'listCheckpointsForReplay reads no input column for a run whose steps completed',
+      async () => {
+        if (!statementLog || !store.listCheckpointsForReplay) return;
+        await store.createRun(run());
+        for (const seq of [0, 1]) {
+          await store.saveCheckpoint(
+            checkpoint({
+              seq,
+              kind: 'remote',
+              stepId: `r1:${seq}`,
+              input: { prompt: 'x'.repeat(100_000) },
+              output: { answer: seq },
+            }),
+          );
+        }
+        const before = statementLog().length;
+        const replay = await store.listCheckpointsForReplay('r1');
+        const sent = statementLog().slice(before);
+        expect(replay.map((c) => c.output)).toEqual([{ answer: 0 }, { answer: 1 }]);
+        expect(sent.length).toBeGreaterThan(0);
+        // Neither the input column nor every column (`*`) is selected.
+        expect(sent.filter((statement) => /\binput\b|\*\s+from/i.test(statement))).toEqual([]);
+      },
+    );
+
+    t(
       'upserts checkpoints, reads them by (runId, seq), and lists them ordered by seq',
       async () => {
         await store.createRun(run());

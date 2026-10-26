@@ -3655,8 +3655,7 @@ export class WorkflowEngine {
    */
   private async redriveSettledSteps(runId: string, seqs: Set<number>): Promise<void> {
     for (const seq of seqs) {
-      const cp = await this.store.getCheckpoint(runId, seq);
-      if (cp && (cp.status === 'completed' || cp.status === 'failed')) {
+      if (await this.stepSettled(runId, seq)) {
         // Settled on this instance: its own resume drives the run. Re-driving would replay the
         // body once more, and a workflow body with effects between steps is not free to replay.
         if (this.settledHere.has(`${runId}:${seq}`)) return;
@@ -3676,6 +3675,15 @@ export class WorkflowEngine {
         return;
       }
     }
+  }
+
+  /** Whether the step at `seq` is settled: a `COUNT` when the store has one, else its checkpoint. */
+  private async stepSettled(runId: string, seq: number): Promise<boolean> {
+    if (this.store.countCheckpoints) {
+      return (await this.store.countCheckpoints(runId, seq, seq, ['completed', 'failed'])) > 0;
+    }
+    const cp = await this.store.getCheckpoint(runId, seq);
+    return cp?.status === 'completed' || cp?.status === 'failed';
   }
 
   /**
@@ -5319,7 +5327,7 @@ export class WorkflowEngine {
     );
     if (wfPlan?.status === 'blocked') return this.parkBlocked(run, wfPlan);
 
-    const checkpoints = await this.store.listCheckpoints(run.id);
+    const checkpoints = await this.replayCheckpoints(run.id);
     await this.deliverFinishedChildren(run.id, checkpoints);
     await this.deliverFinishedChildWaiters(run.id, checkpoints);
     const handoff = liveHandoff(run.id, checkpoints);
@@ -6147,7 +6155,7 @@ export class WorkflowEngine {
     // Read once at execution start: a checkpoint written AFTER this snapshot (the signal/timer/child
     // this resume wakes on, or one written later in this same execution) is absent from the map, and
     // the ctx falls back to the live store for any absent seq — so replay semantics are unchanged.
-    const snapshot = await this.store.listCheckpoints(run.id);
+    const snapshot = await this.replayCheckpoints(run.id);
     await this.deliverFinishedChildren(run.id, snapshot);
     const replay = new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
@@ -7243,6 +7251,16 @@ export class WorkflowEngine {
       if (now - at <= this.leaseMs) break;
       map.delete(k);
     }
+  }
+
+  /**
+   * The run's checkpoints as a turn replays them: {@link StateStore.listCheckpointsForReplay} when
+   * the store has it (no input on a completed row), else {@link StateStore.listCheckpoints}.
+   */
+  private replayCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+    return this.store.listCheckpointsForReplay
+      ? this.store.listCheckpointsForReplay(runId)
+      : this.store.listCheckpoints(runId);
   }
 
   /** {@link StateStore.saveCheckpointIfPending}, or a plain save on a store without it. */

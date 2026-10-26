@@ -780,6 +780,31 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.map(fromCheckpointRow);
   }
 
+  async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
+    const { input: _input, ...columns } = getTableColumns(stepCheckpoints);
+    const rows = await this.db
+      .select(columns)
+      .from(stepCheckpoints)
+      .where(eq(stepCheckpoints.runId, runId))
+      .orderBy(asc(stepCheckpoints.seq));
+    // An open or failed step keeps its input; read by seq, so a row settled since is still filled.
+    const open = rows.filter((row) => row.status !== 'completed').map((row) => row.seq);
+    const inputs = new Map<number, unknown>();
+    for (let at = 0; at < open.length; at += 500) {
+      const found = await this.db
+        .select({ seq: stepCheckpoints.seq, input: stepCheckpoints.input })
+        .from(stepCheckpoints)
+        .where(
+          and(
+            eq(stepCheckpoints.runId, runId),
+            inArray(stepCheckpoints.seq, open.slice(at, at + 500)),
+          ),
+        );
+      for (const row of found) inputs.set(row.seq, row.input);
+    }
+    return rows.map((row) => fromCheckpointRow({ ...row, input: inputs.get(row.seq) ?? null }));
+  }
+
   async getLatestCheckpointByName(
     runId: string,
     name: string,

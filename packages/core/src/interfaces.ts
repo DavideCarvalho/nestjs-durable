@@ -734,6 +734,18 @@ export interface StateStore {
   ): Promise<RunValueFacetRow[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
   /**
+   * {@link listCheckpoints} as a turn replays it: the same rows in the same order, except that a
+   * `completed` row comes without its `input` (left out of the read, not dropped after it). Replay
+   * only needs a completed step's output; a still-open or failed step keeps its input, since a
+   * re-dispatch or a retry writes it again. The engine reads a run's replay snapshot through it on
+   * every turn, where re-reading every finished step's input would make each turn cost the size of
+   * the whole history.
+   *
+   * Optional: a store that omits it gets {@link listCheckpoints}.
+   */
+  listCheckpointsForReplay?(runId: string): Promise<StepCheckpoint[]>;
+
+  /**
    * The LATEST checkpoint for `runId` whose `name` equals `name` exactly (highest `seq` wins), or
    * `undefined` if none. A targeted read that avoids fetching + deserializing every checkpoint just to
    * keep one match — the store does the filter (`WHERE name = … ORDER BY seq DESC LIMIT 1`). Preserves

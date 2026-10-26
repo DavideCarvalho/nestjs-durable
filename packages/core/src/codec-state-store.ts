@@ -122,6 +122,9 @@ export class CodecStateStore implements StateStore {
   readonly settleCheckpointsIfPending?: (settlements: StepSettlement[]) => Promise<boolean[]>;
   /** Encodes each checkpoint written. Bound only when the inner store has it. */
   readonly saveCheckpoints?: (checkpoints: StepCheckpoint[]) => Promise<void>;
+  /** Decodes each checkpoint read like {@link listCheckpoints}. Bound only when the inner store has
+   *  it, so the engine's full-read fallback still kicks in through the wrapper. */
+  readonly listCheckpointsForReplay?: (runId: string) => Promise<StepCheckpoint[]>;
   /** Decodes each checkpoint read. Bound only when the inner store has it. */
   readonly getCheckpoints?: (runId: string, seqs: number[]) => Promise<StepCheckpoint[]>;
   /** Forwarded verbatim — a count reads no payload. Bound only when the inner store has it. */
@@ -232,6 +235,10 @@ export class CodecStateStore implements StateStore {
           inner,
           cps.map((cp) => this.encCp(cp)),
         );
+    const listForReplay = inner.listCheckpointsForReplay;
+    if (listForReplay)
+      this.listCheckpointsForReplay = async (runId) =>
+        (await listForReplay.call(inner, runId)).map((cp) => this.decCp(cp));
     const getMany = inner.getCheckpoints;
     if (getMany)
       this.getCheckpoints = async (runId, seqs) =>
