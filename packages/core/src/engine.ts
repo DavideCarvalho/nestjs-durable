@@ -1,5 +1,4 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission';
-import { markRemoteEvent } from './remote-event';
 import { currentWorkflowCtx, runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';
 import { BoundedRunner, LOCAL_RUN_CONCURRENCY } from './bounded-runner';
@@ -122,6 +121,7 @@ import {
 } from './on-error';
 import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
+import { markRemoteEvent } from './remote-event';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { RUN_DISPATCH_BATCH, RunDispatchBatcher } from './run-dispatch-batcher';
 import { indexWaitersByRun, listSignalWaitersOfRuns, readRunsByIds } from './run-waiting';
@@ -3699,7 +3699,7 @@ export class WorkflowEngine {
   ): Promise<void> {
     for (const fan of fans) {
       if (this.stepFansFiredHere.has(`${runId}:${fan.from}`)) continue;
-      if ((await this.stepFanPending(runId, fan.from, fan.to)) > 0) continue;
+      if (await this.stepFanHasPending(runId, fan.from, fan.to)) continue;
       const nowMs = this.clock();
       if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) {
         return;
@@ -7624,10 +7624,7 @@ export class WorkflowEngine {
       const lastSeq = fan.firstSeq + fan.size - 1;
       closed = queuedIn(fan.firstSeq, lastSeq)
         ? Promise.resolve(true)
-        : this.stepFanPending(result.runId, fan.firstSeq, lastSeq).then(
-            (pending) => pending > 0,
-            () => false,
-          );
+        : this.stepFanHasPending(result.runId, fan.firstSeq, lastSeq).catch(() => false);
       barriers.set(fan.firstSeq, closed);
     }
     if (await closed) return true;
@@ -7635,14 +7632,17 @@ export class WorkflowEngine {
     return false;
   }
 
-  /** How many steps of a step fan's seq range are still `pending`. */
-  private async stepFanPending(runId: string, from: number, to: number): Promise<number> {
-    if (this.store.countCheckpoints) {
-      return this.store.countCheckpoints(runId, from, to, ['pending']);
+  /** Whether any step of a step fan's seq range is still `pending`. */
+  private async stepFanHasPending(runId: string, from: number, to: number): Promise<boolean> {
+    if (this.store.hasCheckpoints) {
+      return this.store.hasCheckpoints(runId, from, to, ['pending']);
     }
-    return (await this.store.listCheckpoints(runId)).filter(
+    if (this.store.countCheckpoints) {
+      return (await this.store.countCheckpoints(runId, from, to, ['pending'])) > 0;
+    }
+    return (await this.store.listCheckpoints(runId)).some(
       (c) => c.seq >= from && c.seq <= to && c.status === 'pending',
-    ).length;
+    );
   }
 
   /**

@@ -28,6 +28,7 @@ const RESULT_PATH = [
   'saveCheckpointsIfPending',
   'saveCheckpointIfPending',
   'countCheckpoints',
+  'hasCheckpoints',
   'listCheckpoints',
 ];
 
@@ -192,7 +193,8 @@ async function fan(opts: {
     run: await inner.getRun('p'),
     turns,
     settledSeqs,
-    barrierReads: counts.calls.get('countCheckpoints') ?? 0,
+    barrierReads:
+      (counts.calls.get('countCheckpoints') ?? 0) + (counts.calls.get('hasCheckpoints') ?? 0),
     callsPerResult: resultCalls / opts.size,
     sends: {
       saveCheckpoint: counts.calls.get('saveCheckpoint') ?? 0,

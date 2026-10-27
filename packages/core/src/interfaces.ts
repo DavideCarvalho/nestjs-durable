@@ -787,6 +787,21 @@ export interface StateStore {
    * Optional: a store that omits it still works — the engine falls back to {@link listCheckpoints}
    * and counts in JS, which loads the whole run on every result of a fan.
    */
+  /**
+   * Whether any of the run's checkpoints with `fromSeq <= seq <= toSeq` has one of `statuses`: the
+   * question the join barrier of a step fan actually asks on each batch of results ("is any step of
+   * the fan still `pending`?"). A store reads it from the TOP of the range down and stops at the first
+   * match: a fan's steps are dispatched in seq order, so its highest seqs are the last to settle, and
+   * the answer comes from the first rows read instead of a count over the whole range.
+   *
+   * Optional: a store that omits it still works — the engine asks {@link countCheckpoints} instead.
+   */
+  hasCheckpoints?(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<boolean>;
   countCheckpoints?(
     runId: string,
     fromSeq: number,

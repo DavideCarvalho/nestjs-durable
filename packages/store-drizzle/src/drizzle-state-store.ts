@@ -939,6 +939,29 @@ export class DrizzleStateStore implements StateStore {
     return rows[0] ? fromCheckpointRow(rows[0]) : undefined;
   }
 
+  async hasCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<boolean> {
+    if (statuses.length === 0) return false;
+    const rows = await this.db
+      .select({ seq: stepCheckpoints.seq })
+      .from(stepCheckpoints)
+      .where(
+        and(
+          eq(stepCheckpoints.runId, runId),
+          gte(stepCheckpoints.seq, fromSeq),
+          lte(stepCheckpoints.seq, toSeq),
+          inArray(stepCheckpoints.status, statuses),
+        ),
+      )
+      .orderBy(desc(stepCheckpoints.seq))
+      .limit(1);
+    return rows.length > 0;
+  }
+
   async countCheckpoints(
     runId: string,
     fromSeq: number,
