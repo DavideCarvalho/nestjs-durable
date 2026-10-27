@@ -1,5 +1,70 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.85.9
+
+### Patch Changes
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`2dddfee`](https://github.com/DavideCarvalho/nestjs-durable/commit/2dddfeebcc97d2025576e62c5d403e3c61fc8e55) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - With `remoteRedispatchMs` set, a step fan's steps are written with their lease already stamped, and
+  the run parks on it. Each step's lease was otherwise stamped on the fan's next turn, one write per
+  step, and the run had no wake until then. A beat from a step's worker, on the instance that sent the
+  fan, no longer reads the step to find its lease.
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`02295ec`](https://github.com/DavideCarvalho/nestjs-durable/commit/02295ecadf2040360a2d85548360d29ae1968508) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A wide step fan no longer spends most of its CPU remembering which results settled here, and the
+  adaptive step concurrency no longer collapses to one on fast steps.
+
+  - The engine's "settled here" maps were pruned by walking every entry once a map held 1,024, and in
+    a fan every entry is younger than a lease, so each result walked them all: 12% of a 40k fan's CPU.
+    Pruning now stops at the first entry still fresh, and a fan's steps are not recorded one by one
+    (the fan's barrier covers them).
+  - The adaptive controller read latency jitter as queuing: its baseline is the fastest completion of
+    the window, and for 1–5 ms steps p50 sits several times above it with nothing queued, so it
+    shrank to one or two at a time. p50 may now reach twice the baseline plus 5 ms before it counts
+    as queuing. Growth doubles the limit until the first back-off, then adds √limit a tick (it added
+    one every 2 s); until that first back-off, growth is re-decided after each limit's worth of
+    settled steps instead of waiting for the 2 s tick. Step durations are timed with
+    `performance.now()` instead of whole milliseconds.
+    The Python worker's controller makes the same decisions (durable-worker 0.26.2).
+  - The turn that joins a step fan no longer reads the fan's checkpoints twice: settled ones come from
+    the turn's own snapshot, and only those it holds `pending` are read again.
+  - The MikroORM store reads and writes checkpoints through the query builder instead of managed
+    entities (`listCheckpoints`, `getCheckpoints`, `saveCheckpoints`, `saveCheckpointsIfPending`):
+    40k rows read in 0.14 s instead of 0.7 s, written in 1.5 s instead of 2.2 s.
+
+  A 40k-step fan on four local processes (MySQL, BullMQ): 42 s before, 16 s after; one process: 60 s
+  before, 28 s after.
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`8c52b4e`](https://github.com/DavideCarvalho/nestjs-durable/commit/8c52b4e6232954b6176b4294f378c1e6a41f2ccf) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `ProxyRunGateway` has `getRun`: a store-less pod reads a run without its timeline, through a new
+  `getRun` run request the control plane answers from its store, after the same tenant check as every
+  run-scoped verb. A caller that only needs a run's status no longer gets the whole run detail over the
+  wire (about 8 KB for a 33-step run, against 0.26 KB). A control plane that does not know the verb
+  answers with no data or an unsupported-request error, and the proxy then reads the run out of
+  `getRunDetail` and keeps doing so for a minute, the way `getFanMembers` falls back.
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`56c5f14`](https://github.com/DavideCarvalho/nestjs-durable/commit/56c5f14f11969048a57c96233c03e7e8bd67997e) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A turn no longer reads the input of every step its run completed. The replay snapshot is read
+  through the new optional `StateStore.listCheckpointsForReplay`, which returns `listCheckpoints`'
+  rows without the input of a completed step, left out of the query itself; a pending or failed step
+  keeps it, for its re-dispatch or retry. Every bundled store implements it and `CodecStateStore`
+  decodes what it returns; a custom store without it gets `listCheckpoints`. The check a turn makes
+  after suspending on a step, whether that step already settled, is now a `COUNT` where the store has
+  `countCheckpoints`, so it no longer reads the step's input either. In a conversation of 100 KB-input
+  steps, a resume at turn 20 read about 2.1 MB of checkpoints and now reads about 0.1 MB, whatever the
+  turn. The run detail, `engine.listCheckpoints`, retry and re-dispatch still read every input.
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`03c7b01`](https://github.com/DavideCarvalho/nestjs-durable/commit/03c7b012351fbab76eadb0fad7a28c936b11927d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A step result's settle no longer reads the step's input. It reads the step's row through the new
+  optional `StateStore.getCheckpointsForSettle`, which returns `getCheckpoints`' rows without their
+  input, left out of the query itself; the engine uses it only when the store also settles
+  column-wise. Every bundled store implements it and `CodecStateStore` decodes what it returns. A step
+  with a 100 KB input read about 100 KB back when its result landed; it now reads a few hundred bytes.
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`0fee814`](https://github.com/DavideCarvalho/nestjs-durable/commit/0fee814f16b888f6a18ada1d7988d7989fddd187) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A step's result settles its checkpoint without writing the step's input again. Through the new
+  optional `StateStore.settleCheckpointsIfPending`, the engine writes only what a result changes
+  (status, output, error, events and the two timings), with the same claim as
+  `saveCheckpointsIfPending`: a duplicate delivery still loses. Every bundled store implements it, and
+  `CodecStateStore` encodes what it writes. A step with a 100 KB input wrote about 100 KB of checkpoint
+  per result; it now writes a few hundred bytes. A custom store without the method keeps the
+  whole-row write. The store contract checks the new method, and checks that it sends none of the
+  step's input when the factory returns a `statementLog`.
+
 ## 0.85.8
 
 ### Patch Changes

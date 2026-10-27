@@ -1,5 +1,34 @@
 # @dudousxd/nestjs-durable-store-typeorm
 
+## 0.25.5
+
+### Patch Changes
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`56c5f14`](https://github.com/DavideCarvalho/nestjs-durable/commit/56c5f14f11969048a57c96233c03e7e8bd67997e) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A turn no longer reads the input of every step its run completed. The replay snapshot is read
+  through the new optional `StateStore.listCheckpointsForReplay`, which returns `listCheckpoints`'
+  rows without the input of a completed step, left out of the query itself; a pending or failed step
+  keeps it, for its re-dispatch or retry. Every bundled store implements it and `CodecStateStore`
+  decodes what it returns; a custom store without it gets `listCheckpoints`. The check a turn makes
+  after suspending on a step, whether that step already settled, is now a `COUNT` where the store has
+  `countCheckpoints`, so it no longer reads the step's input either. In a conversation of 100 KB-input
+  steps, a resume at turn 20 read about 2.1 MB of checkpoints and now reads about 0.1 MB, whatever the
+  turn. The run detail, `engine.listCheckpoints`, retry and re-dispatch still read every input.
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`03c7b01`](https://github.com/DavideCarvalho/nestjs-durable/commit/03c7b012351fbab76eadb0fad7a28c936b11927d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A step result's settle no longer reads the step's input. It reads the step's row through the new
+  optional `StateStore.getCheckpointsForSettle`, which returns `getCheckpoints`' rows without their
+  input, left out of the query itself; the engine uses it only when the store also settles
+  column-wise. Every bundled store implements it and `CodecStateStore` decodes what it returns. A step
+  with a 100 KB input read about 100 KB back when its result landed; it now reads a few hundred bytes.
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`0fee814`](https://github.com/DavideCarvalho/nestjs-durable/commit/0fee814f16b888f6a18ada1d7988d7989fddd187) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A step's result settles its checkpoint without writing the step's input again. Through the new
+  optional `StateStore.settleCheckpointsIfPending`, the engine writes only what a result changes
+  (status, output, error, events and the two timings), with the same claim as
+  `saveCheckpointsIfPending`: a duplicate delivery still loses. Every bundled store implements it, and
+  `CodecStateStore` encodes what it writes. A step with a 100 KB input wrote about 100 KB of checkpoint
+  per result; it now writes a few hundred bytes. A custom store without the method keeps the
+  whole-row write. The store contract checks the new method, and checks that it sends none of the
+  step's input when the factory returns a `statementLog`.
+
 ## 0.25.4
 
 ### Patch Changes

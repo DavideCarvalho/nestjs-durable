@@ -1,5 +1,22 @@
 # @dudousxd/nestjs-durable-telescope
 
+## 0.9.2
+
+### Patch Changes
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`05bf898`](https://github.com/DavideCarvalho/nestjs-durable/commit/05bf898b6bdca4d9a3a2dba9cbfcee7d4b4dae98) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A run's trace and root-span ids are hashed once per run instead of on every lifecycle event. A wide
+  step fan emits tens of thousands of events for the same run, and each one hashed the run id up to
+  four times (two sha256 digests per call). The ids of the last 512 runs are kept; they are still a
+  pure function of the run id, so a run whose ids were evicted hashes back to the same ones.
+
+- [#429](https://github.com/DavideCarvalho/nestjs-durable/pull/429) [`2e4a236`](https://github.com/DavideCarvalho/nestjs-durable/commit/2e4a236c57157070836ded7215e9226d5b056bec) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The Workflows panels (success rate, throughput, durations, runs over time) keep counting runs after a
+  wide step fan. They read the latest 5,000 `durable` entries and counted the `run.*` events among
+  them, but one 40k-step fan records 80k step entries, so for hours afterwards the page held only steps
+  and every panel showed no runs. Run lifecycle entries now carry a `familyHash` (`durable:run.started`,
+  `durable:run.completed`, …), an indexed column on every Telescope store, and the panels read those
+  families directly. Run entries recorded before this release are still read the old way, below the
+  oldest entry with a family, so the panels keep the runs from before the upgrade.
+
 ## 0.9.1
 
 ### Patch Changes
