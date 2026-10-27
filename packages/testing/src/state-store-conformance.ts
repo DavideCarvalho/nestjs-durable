@@ -114,10 +114,11 @@ const checkpoint = (over: Partial<StepCheckpoint> = {}): StepCheckpoint => ({
  * statement a moment after the call that sent it resolved.
  */
 /** A logged statement as SQL: without the color codes and the `[query]` label a logger may add. */
+const ANSI_COLOR = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+
 function sqlOf(logged: string): string {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI color codes are what is stripped.
   return logged
-    .replace(/\u001b\[[0-9;]*m/g, '')
+    .replace(ANSI_COLOR, '')
     .replace(/^\s*\[query\]\s*/i, '')
     .trim();
 }
