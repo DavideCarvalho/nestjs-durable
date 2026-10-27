@@ -220,7 +220,8 @@ export class PrismaStateStore implements StateStore {
   }
 
   async createRun(run: WorkflowRun): Promise<void> {
-    await this.db.durableWorkflowRun.create({ data: toRunData(run) });
+    // One INSERT: `create` also reads the row back to return it, in a transaction on MySQL.
+    await this.db.durableWorkflowRun.createMany({ data: [toRunData(run)] });
     await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
@@ -229,7 +230,15 @@ export class PrismaStateStore implements StateStore {
       inputPatch.status && TERMINAL_RUN_STATUSES.includes(inputPatch.status)
         ? await clearTerminalSingletonAdmission(runId, inputPatch, (id) => this.getRun(id))
         : inputPatch;
-    await this.db.durableWorkflowRun.update({ where: { id: runId }, data: toRunPatch(patch) });
+    // One UPDATE: `update` also reads the row back to return it, in a transaction on MySQL. A run
+    // that does not exist still throws, as `update` does.
+    const { count } = await this.db.durableWorkflowRun.updateMany({
+      where: { id: runId },
+      data: toRunPatch(patch),
+    });
+    if (count === 0 && !(await this.db.durableWorkflowRun.findUnique({ where: { id: runId } }))) {
+      throw new Error(`run ${runId} not found`);
+    }
     // Keep the side-table in step with the run's attributes whenever they're patched.
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
   }

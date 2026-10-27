@@ -50,6 +50,12 @@ export interface StateStoreContext {
    * sends none of the step's input.
    */
   statementLog?: () => string[];
+  /**
+   * The store's client opens a transaction around every write of its own (Prisma does, even for one
+   * `createMany` or `updateMany`). The contract then checks that a run's row is written without a
+   * read of it first, but not that no transaction is opened.
+   */
+  implicitTransactions?: boolean;
 }
 
 /** Builds a fresh, empty store for one test. Called once per `it` (in `beforeEach`). */
@@ -145,6 +151,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     let supportsTagFilter = true;
     let statements: (() => number) | undefined;
     let statementLog: (() => string[]) | undefined;
+    let implicitTransactions = false;
     let skipReason: string | undefined;
     let loggedSkip = false;
 
@@ -158,6 +165,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         supportsTagFilter = ctx.supportsTagFilter ?? true;
         statements = ctx.statements;
         statementLog = ctx.statementLog;
+        implicitTransactions = ctx.implicitTransactions ?? false;
         skipReason = undefined;
       } catch (err) {
         // Backend unavailable (e.g. no Docker for a testcontainers spec): skip — don't fail. Unless
@@ -1304,16 +1312,22 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect((await store.getCheckpoint('r1', 2))?.input).toEqual({ prompt: 'p2' });
     });
 
-    t('createRun of a run without search attributes opens no transaction', async () => {
-      if (!statementLog) return;
-      await store.createRun(run({ id: 'warm' }));
-      const before = statementLog().length;
-      await store.createRun(run());
-      const sent = await loggedSince(statementLog, before);
-      expect(sent.length).toBeGreaterThan(0);
-      expect(sent.map(sqlOf).filter((q) => /^(begin|start transaction)/i.test(q))).toEqual([]);
-      expect((await store.getRun('r1'))?.status).toBe(run().status);
-    });
+    t(
+      'createRun of a run without search attributes reads nothing and opens no transaction',
+      async () => {
+        if (!statementLog) return;
+        await store.createRun(run({ id: 'warm' }));
+        const before = statementLog().length;
+        await store.createRun(run());
+        const sent = await loggedSince(statementLog, before);
+        expect(sent.length).toBeGreaterThan(0);
+        expect(sent.map(sqlOf).filter((q) => /^select/i.test(q))).toEqual([]);
+        if (!implicitTransactions) {
+          expect(sent.map(sqlOf).filter((q) => /^(begin|start transaction)/i.test(q))).toEqual([]);
+        }
+        expect((await store.getRun('r1'))?.status).toBe(run().status);
+      },
+    );
 
     t('updateRun with a non-terminal patch is one UPDATE, with no read of the row', async () => {
       if (!statementLog) return;
@@ -1323,9 +1337,10 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       await store.updateRun('r1', { status: 'suspended', wakeAt: 5_000, updatedAt: new Date() });
       const sent = await loggedSince(statementLog, before);
       expect(sent.map(sqlOf).filter((q) => /^update/i.test(q))).toHaveLength(1);
-      expect(sent.map(sqlOf).filter((q) => /^(select|begin|start transaction)/i.test(q))).toEqual(
-        [],
-      );
+      expect(sent.map(sqlOf).filter((q) => /^select/i.test(q))).toEqual([]);
+      if (!implicitTransactions) {
+        expect(sent.map(sqlOf).filter((q) => /^(begin|start transaction)/i.test(q))).toEqual([]);
+      }
       const read = await store.getRun('r1');
       expect(read?.status).toBe('suspended');
       expect(read?.wakeAt).toBe(5_000);
