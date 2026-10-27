@@ -1,6 +1,7 @@
 import {
   FatalError,
   InMemoryStateStore,
+  InMemoryTransport,
   WorkflowEngine,
   clearDurableExecutionWrappers,
   hasDurableExecutionWrappers,
@@ -17,6 +18,29 @@ function fakeCtx(engine: WorkflowEngine, records: RecordInput[]): WatcherContext
     config: {} as WatcherContext['config'],
     moduleRef: { get: () => engine } as unknown as WatcherContext['moduleRef'],
   };
+}
+
+/** Two engines sharing a store and a broadcast transport: a pod that runs the work and one that only hears it. */
+function twoPods() {
+  const store = new InMemoryStateStore();
+  const transport = new InMemoryTransport();
+  const worker = new WorkflowEngine({
+    store,
+    transport,
+    controlPlane: transport,
+    instanceId: 'worker',
+  });
+  const other = new WorkflowEngine({
+    store,
+    transport,
+    controlPlane: transport,
+    instanceId: 'other',
+  });
+  worker.register('wf', '1', async (ctx) => {
+    await ctx.localStep('a', async () => 1);
+    return 'ok';
+  });
+  return { worker, other };
 }
 
 describe('DurableTelescopeWatcher', () => {
@@ -199,5 +223,24 @@ describe('DurableTelescopeWatcher', () => {
     );
     expect(completed).toBeDefined();
     expect((completed?.content as { durationMs?: number }).durationMs).toBe(1234);
+  });
+
+  it('records an event once, on the pod that produced it, though every pod hears it', async () => {
+    const { worker, other } = twoPods();
+    const onWorker: RecordInput[] = [];
+    const onOther: RecordInput[] = [];
+    new DurableTelescopeWatcher().register(fakeCtx(worker, onWorker));
+    new DurableTelescopeWatcher().register(fakeCtx(other, onOther));
+
+    await worker.start('wf', {}, 'run1');
+    await worker.waitForRun('run1');
+
+    expect(onWorker.map((r) => (r.content as { event: string }).event)).toEqual([
+      'run.started',
+      'step.started',
+      'step.completed',
+      'run.completed',
+    ]);
+    expect(onOther).toEqual([]);
   });
 });

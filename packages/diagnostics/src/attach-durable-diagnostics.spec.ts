@@ -1,5 +1,9 @@
 import { type DiagnosticEvent, getChannel, resetRegistry } from '@dudousxd/nestjs-diagnostics';
-import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  InMemoryTransport,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
 import { afterEach, describe, expect, it } from 'vitest';
 import { attachDurableDiagnostics } from './attach-durable-diagnostics';
 
@@ -99,5 +103,35 @@ describe('attachDurableDiagnostics', () => {
     });
     await engine.start('checkout', {}, 'run5');
     await expect(engine.waitForRun('run5')).resolves.toBeDefined();
+  });
+
+  it('emits an event on the pod that produced it, not on a pod that only heard it', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    const worker = new WorkflowEngine({
+      store,
+      transport,
+      controlPlane: transport,
+      instanceId: 'worker',
+    });
+    const other = new WorkflowEngine({
+      store,
+      transport,
+      controlPlane: transport,
+      instanceId: 'other',
+    });
+    worker.register('wf', '1', async () => 'ok');
+    const started = capture('run.started');
+    cleanups.push(started.off);
+
+    cleanups.push(attachDurableDiagnostics(other));
+    await worker.start('wf', {}, 'run1');
+    await worker.waitForRun('run1');
+    expect(started.seen).toEqual([]);
+
+    cleanups.push(attachDurableDiagnostics(worker));
+    await worker.start('wf', {}, 'run2');
+    await worker.waitForRun('run2');
+    expect(started.seen).toHaveLength(1);
   });
 });

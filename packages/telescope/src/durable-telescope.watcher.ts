@@ -10,6 +10,12 @@ import { durableExecutionScope } from './durable-execution-scope';
 import { runEventFamily } from './durable-run-family';
 import { runTraceContext, runTraceId } from './durable-run-trace';
 
+/** An event another instance produced and the control plane re-delivered here (see the core's
+ *  `isRemoteEvent`); read by symbol so an older core, which marks none, still works. */
+const REMOTE_EVENT = Symbol.for('@dudousxd/nestjs-durable:remote-event');
+const isRemote = (event: object): boolean =>
+  (event as { [REMOTE_EVENT]?: unknown })[REMOTE_EVENT] === true;
+
 /**
  * A Telescope watcher that turns durable-workflow lifecycle events into Telescope entries, so
  * runs and steps (including remote/Python steps) show up alongside the app's requests, queries
@@ -68,6 +74,8 @@ export class DurableTelescopeWatcher implements Watcher {
     const tracer = trace.getTracer('@dudousxd/nestjs-durable-telescope');
 
     engine.subscribe((event) => {
+      // Every pod hears every event; the one that produced it records it.
+      if (isRemote(event)) return;
       const family = runEventFamily(event.type);
       const record = () =>
         ctx.record({

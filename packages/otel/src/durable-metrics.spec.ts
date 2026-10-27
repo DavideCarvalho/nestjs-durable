@@ -1,6 +1,34 @@
-import { FatalError, InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  FatalError,
+  InMemoryStateStore,
+  InMemoryTransport,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it } from 'vitest';
 import { attachDurableMetrics } from './durable-metrics';
+
+/** Two engines sharing a store and a broadcast transport: a pod that runs the work and one that only hears it. */
+function twoPods() {
+  const store = new InMemoryStateStore();
+  const transport = new InMemoryTransport();
+  const worker = new WorkflowEngine({
+    store,
+    transport,
+    controlPlane: transport,
+    instanceId: 'worker',
+  });
+  const other = new WorkflowEngine({
+    store,
+    transport,
+    controlPlane: transport,
+    instanceId: 'other',
+  });
+  worker.register('wf', '1', async (ctx) => {
+    await ctx.localStep('a', async () => 1);
+    return 'ok';
+  });
+  return { worker, other };
+}
 
 describe('attachDurableMetrics', () => {
   it('counts runs/steps and records duration percentiles', async () => {
@@ -61,5 +89,18 @@ describe('attachDurableMetrics', () => {
     expect(snap.runs.routed).toBe(1);
     expect(snap.runs.failed).toBe(0);
     expect(snap.routedByCode).toEqual({ invalid_line: 1 });
+  });
+
+  it('counts a run on the pod that ran it, not on every pod that heard it', async () => {
+    const { worker, other } = twoPods();
+    const onWorker = attachDurableMetrics(worker);
+    const onOther = attachDurableMetrics(other);
+
+    await worker.start('wf', {}, 'run1');
+    await worker.waitForRun('run1');
+
+    expect(onWorker.snapshot().runs.started).toBe(1);
+    expect(onOther.snapshot().runs.started).toBe(0);
+    expect(onOther.snapshot().steps.completed).toBe(0);
   });
 });

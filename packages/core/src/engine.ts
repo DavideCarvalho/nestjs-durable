@@ -1,4 +1,5 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission';
+import { markRemoteEvent } from './remote-event';
 import { currentWorkflowCtx, runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';
 import { BoundedRunner, LOCAL_RUN_CONCURRENCY } from './bounded-runner';
@@ -1270,7 +1271,7 @@ export class WorkflowEngine {
       if (msg.from === this.instanceId) return;
       if (msg.kind === 'event') {
         // `at` may be a string after JSON transit (Redis) — normalize back to a Date.
-        this.deliver({ ...msg.event, at: new Date(msg.event.at) });
+        this.deliver(markRemoteEvent({ ...msg.event, at: new Date(msg.event.at) }));
       } else if (msg.kind === 'cancel') {
         this.notifyCancelled(msg.runId);
       } else if (msg.kind === 'enqueued') {

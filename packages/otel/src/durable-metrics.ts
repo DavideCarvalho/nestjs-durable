@@ -1,5 +1,11 @@
 import type { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 
+/** An event another instance produced and the control plane re-delivered here (see the core's
+ *  `isRemoteEvent`); read by symbol so an older core, which marks none, still works. */
+const REMOTE_EVENT = Symbol.for('@dudousxd/nestjs-durable:remote-event');
+const isRemote = (event: object): boolean =>
+  (event as { [REMOTE_EVENT]?: unknown })[REMOTE_EVENT] === true;
+
 export interface DurationStats {
   count: number;
   /** Median, 95th percentile, and max — in milliseconds. */
@@ -75,6 +81,7 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
   };
 
   const unsubscribe = engine.subscribe((e) => {
+    if (isRemote(e)) return;
     switch (e.type) {
       case 'run.started':
         runs.started += 1;
