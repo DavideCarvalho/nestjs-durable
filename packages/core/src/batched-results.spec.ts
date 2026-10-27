@@ -121,7 +121,9 @@ describe('batched step results', () => {
     expect(calls.get('settleCheckpointsIfPending')).toBe(1);
     expect(calls.get('saveCheckpointsIfPending') ?? 0).toBe(0);
     expect(calls.get('saveCheckpointIfPending') ?? 0).toBe(0);
-    expect(calls.get('countCheckpoints')).toBe(1);
+    // The barrier asks whether any step is still pending, never for a count over the fan.
+    expect(calls.get('hasCheckpoints')).toBe(1);
+    expect(calls.get('countCheckpoints') ?? 0).toBe(0);
     // The dispatching turn, then exactly one more once the fan settled.
     expect(turns()).toBe(2);
   });
@@ -340,7 +342,7 @@ describe('batched step results', () => {
     await Promise.all(transport.take().map((t) => transport.deliver(ok(t))));
     await until(async () => (await store.getRun('p'))?.status === 'completed');
     expect(calls.get('saveCheckpointIfPending')).toBe(40);
-    expect(calls.get('countCheckpoints')).toBe(1);
+    expect(calls.get('hasCheckpoints')).toBe(1);
   });
 
   /** A store whose batched write waits for `open()`, so a test can queue results behind a batch. */
@@ -382,7 +384,7 @@ describe('batched step results', () => {
     await Promise.all([...deliveries, redelivered]);
     await until(async () => (await store.getRun('p'))?.status === 'completed');
     expect((await store.getRun('p'))?.output).toEqual(lines(20).map(({ i }) => i * 10));
-    expect(calls.get('countCheckpoints')).toBe(1);
+    expect(calls.get('hasCheckpoints')).toBe(1);
     expect(turns()).toBe(2);
   });
 

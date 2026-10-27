@@ -894,6 +894,23 @@ export class TypeOrmStateStore implements StateStore {
     return e ? fromCheckpointEntity(e) : undefined;
   }
 
+  async hasCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<boolean> {
+    if (statuses.length === 0) return false;
+    const row = await this.checkpoints()
+      .createQueryBuilder('cp')
+      .select('cp.seq', 'seq')
+      .where({ runId, seq: Between(fromSeq, toSeq), status: In(statuses) })
+      .orderBy('cp.seq', 'DESC')
+      .limit(1)
+      .getRawOne<{ seq: number }>();
+    return row !== undefined;
+  }
+
   async countCheckpoints(
     runId: string,
     fromSeq: number,

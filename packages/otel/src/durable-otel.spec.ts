@@ -1,4 +1,9 @@
-import { FatalError, InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  FatalError,
+  InMemoryStateStore,
+  InMemoryTransport,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
 import {
   BasicTracerProvider,
   InMemorySpanExporter,
@@ -10,6 +15,29 @@ function tracerWithExporter() {
   const exporter = new InMemorySpanExporter();
   const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
   return { tracer: provider.getTracer('test'), exporter };
+}
+
+/** Two engines sharing a store and a broadcast transport: a pod that runs the work and one that only hears it. */
+function twoPods() {
+  const store = new InMemoryStateStore();
+  const transport = new InMemoryTransport();
+  const worker = new WorkflowEngine({
+    store,
+    transport,
+    controlPlane: transport,
+    instanceId: 'worker',
+  });
+  const other = new WorkflowEngine({
+    store,
+    transport,
+    controlPlane: transport,
+    instanceId: 'other',
+  });
+  worker.register('wf', '1', async (ctx) => {
+    await ctx.localStep('a', async () => 1);
+    return 'ok';
+  });
+  return { worker, other };
 }
 
 describe('attachDurableOtel', () => {
@@ -73,5 +101,24 @@ describe('attachDurableOtel', () => {
       'durable.on_error.handler': 'dlq',
       'durable.error.code': 'invalid_line',
     });
+  });
+
+  it("exports a run's spans from the pod that ran it only", async () => {
+    const { worker, other } = twoPods();
+    const fromWorker = tracerWithExporter();
+    const fromOther = tracerWithExporter();
+    attachDurableOtel(worker, { tracer: fromWorker.tracer });
+    attachDurableOtel(other, { tracer: fromOther.tracer });
+
+    await worker.start('wf', {}, 'run1');
+    await worker.waitForRun('run1');
+
+    expect(
+      fromWorker.exporter
+        .getFinishedSpans()
+        .map((s) => s.name)
+        .sort(),
+    ).toEqual(['step a', 'workflow wf']);
+    expect(fromOther.exporter.getFinishedSpans()).toEqual([]);
   });
 });

@@ -1,6 +1,12 @@
 import { emit } from '@dudousxd/nestjs-diagnostics';
 import { type EngineEvent, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 
+/** An event another instance produced and the control plane re-delivered here (see the core's
+ *  `isRemoteEvent`); read by symbol so an older core, which marks none, still works. */
+const REMOTE_EVENT = Symbol.for('@dudousxd/nestjs-durable:remote-event');
+const isRemote = (event: object): boolean =>
+  (event as { [REMOTE_EVENT]?: unknown })[REMOTE_EVENT] === true;
+
 /**
  * Re-emit every engine lifecycle event onto the Aviary diagnostics bus as `aviary:durable:<type>`
  * (e.g. `aviary:durable:run.failed`). The whole {@link EngineEvent} is the diagnostics payload.
@@ -14,6 +20,7 @@ import { type EngineEvent, WorkflowEngine } from '@dudousxd/nestjs-durable-core'
  */
 export function attachDurableDiagnostics(engine: WorkflowEngine): () => void {
   return engine.subscribe((event: EngineEvent) => {
+    if (isRemote(event)) return;
     emit('durable', event.type, event);
   });
 }

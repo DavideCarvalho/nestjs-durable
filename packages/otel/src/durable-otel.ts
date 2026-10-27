@@ -8,6 +8,12 @@ import {
   trace,
 } from '@opentelemetry/api';
 
+/** An event another instance produced and the control plane re-delivered here (see the core's
+ *  `isRemoteEvent`); read by symbol so an older core, which marks none, still works. */
+const REMOTE_EVENT = Symbol.for('@dudousxd/nestjs-durable:remote-event');
+const isRemote = (event: object): boolean =>
+  (event as { [REMOTE_EVENT]?: unknown })[REMOTE_EVENT] === true;
+
 export interface DurableOtelOptions {
   /** Tracer to use. Defaults to one from the global provider (or `provider` if given). */
   tracer?: Tracer;
@@ -43,6 +49,7 @@ export function attachDurableOtel(engine: WorkflowEngine, options: DurableOtelOp
   };
 
   return engine.subscribe((event) => {
+    if (isRemote(event)) return;
     switch (event.type) {
       case 'run.started': {
         const span = tracer.startSpan(`workflow ${event.workflow ?? '?'}`, {

@@ -32,6 +32,15 @@ match how you already operate.
   Node `diagnostics_channel` bus. This is the raw feed the surfaces above are built on; subscribe to it
   when you want to route durable events somewhere none of them cover.
 
+## Across pods
+
+With a [control plane](/docs/transports#control-plane-separate-from-the-transport), every instance hears
+every run's lifecycle events, so the dashboard's live tail works on a pod that runs none of the work.
+The surfaces that **record** events (OpenTelemetry, the metrics, the Telescope watcher and the
+diagnostics bridge) record only the events their own instance produced, so each event is recorded once
+across the deployment instead of once per pod. The core marks a re-delivered event, and
+`isRemoteEvent(event)` tells your own subscriber which ones arrived from another instance.
+
 <Callout type="info">
 These are additive, not alternatives — a production deployment typically runs the dashboard for humans
 and OTel or metrics for alerting, off the same event stream.

@@ -1042,6 +1042,21 @@ export class MikroOrmStateStore implements StateStore {
     return entity ? fromCheckpointEntity(entity) : undefined;
   }
 
+  async hasCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<boolean> {
+    if (statuses.length === 0) return false;
+    const row = await this.fork().findOne(
+      StepCheckpointEntity,
+      { runId, seq: { $gte: fromSeq, $lte: toSeq }, status: { $in: statuses } },
+      { fields: ['seq'], orderBy: { seq: 'desc' } },
+    );
+    return row !== null;
+  }
+
   async countCheckpoints(
     runId: string,
     fromSeq: number,

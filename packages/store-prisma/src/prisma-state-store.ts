@@ -814,6 +814,21 @@ export class PrismaStateStore implements StateStore {
     return row ? fromCheckpointRow(row) : undefined;
   }
 
+  async hasCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<boolean> {
+    if (statuses.length === 0) return false;
+    const row = await this.db.durableStepCheckpoint.findFirst({
+      where: { runId, seq: { gte: fromSeq, lte: toSeq }, status: { in: statuses } },
+      select: { seq: true },
+      orderBy: { seq: 'desc' },
+    });
+    return row !== null;
+  }
+
   async countCheckpoints(
     runId: string,
     fromSeq: number,

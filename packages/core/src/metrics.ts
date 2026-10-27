@@ -1,4 +1,5 @@
 import type { EngineEvent } from './interfaces';
+import { isRemoteEvent } from './remote-event';
 
 export interface MetricsSnapshot {
   /** `routed`: failures handed to an onError handler; `unrouted`: routes the engine could not apply. */
@@ -54,6 +55,7 @@ export function collectMetrics(engine: Subscribable): MetricsCollector {
   };
 
   const stop = engine.subscribe((e) => {
+    if (isRemoteEvent(e)) return;
     switch (e.type) {
       case 'run.started':
         m.runs.started += 1;

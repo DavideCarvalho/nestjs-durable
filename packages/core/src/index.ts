@@ -27,6 +27,7 @@ export * from './codec-state-store';
 export * from './concurrency';
 export * from './events';
 export * from './metrics';
+export * from './remote-event';
 export * from './on-error';
 export * from './origin';
 export * from './scheduler';

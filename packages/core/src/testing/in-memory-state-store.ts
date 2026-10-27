@@ -699,6 +699,15 @@ export class InMemoryStateStore implements StateStore {
     return latest ? { ...latest } : undefined;
   }
 
+  async hasCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<boolean> {
+    return (await this.countCheckpoints(runId, fromSeq, toSeq, statuses)) > 0;
+  }
+
   async countCheckpoints(
     runId: string,
     fromSeq: number,
