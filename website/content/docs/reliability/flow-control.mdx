@@ -208,8 +208,10 @@ if configured, CPU (`cpuCeilingPct`).
 
 - **Queuing signal.** The baseline is the window's fastest step completion (smoothed). The p50 of the
   last 100 step completions may reach twice that baseline plus 5 ms before it counts as queuing, so the
-  jitter of 1–5 ms steps does not shrink the limit. Past that, the limit shrinks in proportion to how far
-  p50 has risen. Durations are timed with `performance.now()`, at sub-millisecond resolution.
+  jitter of 1–5 ms steps does not shrink the limit. Past that, each tick takes a quarter off the limit
+  (at least one slot), however far p50 has risen: the window is a fraction of a second of a busy
+  worker's steps, so one slow moment can read as deep queuing, and queuing that persists still halves
+  the limit in under three ticks. Durations are timed with `performance.now()`, at sub-millisecond resolution.
 - **Growth.** The limit grows only while the worker is saturated (in-flight at 80% of the limit or
   more). Until the first time the controller backs off, each growth doubles the limit (slow start), and
   growth is re-decided after every limit's worth of settled steps as well as on the tick, so a worker of
@@ -218,7 +220,7 @@ if configured, CPU (`cpuCeilingPct`).
 - **Workflow turns** count as progress for stall detection but never enter the latency window: a turn
   suspends rather than blocks, so its duration says nothing about load.
 
-The Python `durable-worker` controller (0.26.2 and later) makes the same decisions. Every adjustment is recorded as a `WorkerAdjust` — `{ at, from, to,
+The Python `durable-worker` controller (0.26.3 and later) makes the same decisions. Every adjustment is recorded as a `WorkerAdjust` — `{ at, from, to,
 reason }` — so a dashboard can show *why* the limit moved, not just that it did. Tunables:
 
 - `min` / `max` — the floor and ceiling the controller won't cross. Defaults `1` / `32`.

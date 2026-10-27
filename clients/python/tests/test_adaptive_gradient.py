@@ -47,8 +47,45 @@ class GradientTest(unittest.TestCase):
         ctl = controller(start=16)
         settle(ctl, [1] + [30] * 99)  # (2 × 1 + 5) / 30 ≈ 0.23
         ctl.tick()
-        self.assertEqual(ctl.limit, 3)
+        self.assertEqual(ctl.limit, 12)
         self.assertEqual(ctl._last_adjust["reason"], "shrink")
+
+
+class ShrinkTest(unittest.TestCase):
+    def test_takes_at_most_a_quarter_off_on_one_queuing_tick(self):
+        ctl = controller(start=32)
+        settle(ctl, [1] + [500] * 99)  # gradient ≈ 0.014: a window of one slow moment
+        ctl.tick()
+        self.assertEqual(ctl.limit, 24)
+
+    def test_keeps_shrinking_a_quarter_a_tick_down_to_min(self):
+        ctl = controller(start=32, min=2)
+        settle(ctl, [1] + [500] * 99)
+        limits = []
+        for _ in range(12):
+            ctl.tick()
+            limits.append(ctl.limit)
+        self.assertEqual(limits, [24, 18, 14, 11, 8, 6, 5, 4, 3, 2, 2, 2])
+
+    def test_takes_at_least_one_slot_off_a_small_limit(self):
+        ctl = controller(start=2)
+        settle(ctl, [1] + [500] * 99)
+        ctl.tick()
+        self.assertEqual(ctl.limit, 1)
+
+    def test_is_back_at_its_level_two_ticks_after_a_one_tick_spike(self):
+        ctl = controller(start=32)
+        settle(ctl, [1] + [500] * 99)
+        ctl.tick()  # the spike: 32 → 24
+        limits = [ctl.limit]
+        for _ in range(2):
+            settle(ctl, [2] * 100)  # healthy again
+            tokens = saturate(ctl)
+            ctl.tick()
+            limits.append(ctl.limit)
+            for token in tokens:
+                ctl.on_settle(2.0, True, "step", token)
+        self.assertEqual(limits, [24, 28, 32])
 
 
 class GrowthTest(unittest.TestCase):

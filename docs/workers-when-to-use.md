@@ -138,7 +138,8 @@ How it decides (same on both SDKs), every `tickMs` (default 2s):
   fast steps doesn't read as load. No queuing → **grow**, but *only while saturated* (in-flight near
   the limit), since raising a ceiling nobody hits does nothing: it doubles until the first time it
   backs off (re-deciding after each limit's worth of settled steps, not only on the tick, so fast
-  steps reach their level in milliseconds), then grows by √limit a tick. Past the tolerance = queuing → **shrink** proportionally.
+  steps reach their level in milliseconds), then grows by √limit a tick. Past the tolerance = queuing → **shrink** by a quarter a tick (at least one slot), so one slow
+  moment costs a couple of ticks rather than collapsing the limit.
   Latency is bottleneck-agnostic — it catches a slow DB, CPU saturation, or lock contention without
   naming which.
 - **RAM ceiling (hard brake).** Reads RSS against the cgroup `memory.max` (falls back to host total).

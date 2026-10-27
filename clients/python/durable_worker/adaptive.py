@@ -15,7 +15,7 @@ Three responsibilities:
 * **Adaptive control (adaptive mode only).** A control loop every ``tickMs`` recomputes a gradient
   (``(2 * rttLong + 5 ms) / rttShort``, so the recent p50 may reach twice the baseline plus noise
   before it reads as queuing) and adjusts the limit (ram_ceiling / cpu_ceiling / backpressure / shrink / grow / hold),
-  only GROWING when saturated. Until the first back-off, growth doubles the limit and is also
+  only GROWING when saturated. A queuing tick takes a quarter off the limit (at least one). Until the first back-off, growth doubles the limit and is also
   re-decided after each limit's worth of settled steps; after that it grows by sqrt(limit) a tick.
   Standard Vegas/Gradient2 practice.
 
@@ -96,6 +96,18 @@ _RTT_LONG_ALPHA = 0.9
 # a time while the pod sat idle. Same values as the TS controller.
 _LATENCY_TOLERANCE = 2.0
 _LATENCY_NOISE_MS = 5.0
+
+# The most one queuing tick takes off the limit: a quarter. The window holds the last 100 steps, a
+# fraction of a second of a busy worker's work, so a single slow moment reads as deep queuing; cut in
+# proportion to it, a worker would drop to one or two slots and spend the next ten ticks growing back
+# by sqrt(limit) while the pod sat idle. Real queuing persists, and a quarter a tick still halves the
+# limit in under three ticks. Same value as the TS controller.
+_SHRINK_FACTOR = 0.75
+
+
+def _round_half_up(value: float) -> int:
+    """Round like JavaScript's ``Math.round``, so both controllers land on the same limit."""
+    return math.floor(value + 0.5)
 
 # cgroup "unlimited" sentinel: cgroup v1 reports a value near 2**63 when no limit is set; treat any
 # absurdly large ceiling (>= 1<<62) as "no limit" and fall through to host total.
@@ -882,7 +894,7 @@ class AdaptiveController:
         else:
             gradient = self._gradient(refresh=not grow_only or self._rtt_long is None)
             if gradient is not None and gradient < 0.7:
-                new_limit = max(config.min, math.floor(current * gradient))
+                new_limit = max(config.min, min(current - 1, _round_half_up(current * _SHRINK_FACTOR)))
                 reason = "shrink"
             elif (
                 gradient is not None
