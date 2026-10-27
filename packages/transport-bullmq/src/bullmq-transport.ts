@@ -88,6 +88,11 @@ const RESULT_JOB_OPTIONS = {
   removeOnFail: { age: TASK_FAILED_RETENTION_SECONDS },
 } as const;
 
+/** Most step results one job of the results-batch queue carries. */
+const RESULT_BATCH_MAX = 256;
+/** How long a worker trusts its last answer to "does an engine consume result batches?". */
+const RESULT_BATCH_CONSUMERS_TTL_MS = 5_000;
+
 // Default `pingIntervalMs` (see `BullMQTransportOptions`) for the shared subscriber watchdog.
 const DEFAULT_PING_INTERVAL_MS = 30_000;
 /**
@@ -401,6 +406,16 @@ export class BullMQTransport implements Transport, ControlPlane {
   // One BullMQ `Worker` per registered handler name (see `handle()`) — never a single shared queue.
   private readonly taskWorkers = new Map<string, ConsumerLike>();
   private resultsWorker?: ConsumerLike;
+  private resultBatchesWorker?: ConsumerLike;
+  // Step results waiting for the results-batch publish in flight to finish (see `publishResult`).
+  private readonly resultsToBatch: Array<{
+    result: StepResult;
+    resolve: () => void;
+    reject: (err: unknown) => void;
+  }> = [];
+  private publishingResultBatch = false;
+  private resultBatchConsumers?: { consumed: boolean; at: number };
+  private resultBatchConsumersRead: Promise<boolean> | undefined;
   // Every `onResult` handler — each gets every result (see `onResult`).
   private readonly resultHandlers = new Set<(result: StepResult) => Promise<void>>();
   private decisionsWorker?: ConsumerLike;
@@ -636,6 +651,15 @@ export class BullMQTransport implements Transport, ControlPlane {
   }
   private resultsName(): string {
     return `${this.#effectivePrefix()}-results`;
+  }
+
+  /**
+   * The queue of step-result batches: one job carries many results. A separate queue from
+   * {@link resultsName}, which only engines that read batches consume, so an engine that reads one
+   * result per job never receives a batch.
+   */
+  private resultBatchesName(): string {
+    return `${this.#effectivePrefix()}-results-batch`;
   }
 
   /** Workers require `maxRetriesPerRequest: null`; preserve a passed-in IORedis instance as-is. */
@@ -1098,6 +1122,75 @@ export class BullMQTransport implements Transport, ControlPlane {
     return resolveRouting(requires, compatible);
   }
 
+  /**
+   * Publish a step's result, resolving once it is on a queue. While an engine consumes result
+   * batches, results that finish while one batch is being published go out together in the next, so
+   * a busy worker publishes one job per batch instead of one per step, and an idle one publishes each
+   * result as soon as it finishes. A batch that fails to publish goes out one result per job. Otherwise
+   * each result is its own job on {@link resultsName}.
+   */
+  private async publishResult(result: StepResult): Promise<void> {
+    if (!(await this.resultBatchesConsumed())) {
+      await this.queue(this.resultsName()).add('result', result, RESULT_JOB_OPTIONS);
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      this.resultsToBatch.push({ result, resolve, reject });
+      if (!this.publishingResultBatch) void this.publishResultBatches();
+    });
+  }
+
+  private async publishResultBatches(): Promise<void> {
+    this.publishingResultBatch = true;
+    try {
+      while (this.resultsToBatch.length > 0) {
+        const batch = this.resultsToBatch.splice(0, RESULT_BATCH_MAX);
+        try {
+          await this.queue(this.resultBatchesName()).add(
+            'results',
+            { results: batch.map((entry) => entry.result) },
+            RESULT_JOB_OPTIONS,
+          );
+          for (const entry of batch) entry.resolve();
+        } catch {
+          // The results queue takes them one by one, so a batch's failure costs no result of it.
+          await Promise.all(
+            batch.map((entry) =>
+              this.queue(this.resultsName())
+                .add('result', entry.result, RESULT_JOB_OPTIONS)
+                .then(entry.resolve, entry.reject),
+            ),
+          );
+        }
+      }
+    } finally {
+      this.publishingResultBatch = false;
+    }
+  }
+
+  /**
+   * Whether an engine consumes the results-batch queue: this instance's own consumer, else a live
+   * BullMQ worker on it, re-read at most every {@link RESULT_BATCH_CONSUMERS_TTL_MS}. A failed read
+   * answers no, so results fall back to one job each.
+   */
+  private async resultBatchesConsumed(): Promise<boolean> {
+    if (this.resultBatchesWorker) return true;
+    const known = this.resultBatchConsumers;
+    if (known && Date.now() - known.at < RESULT_BATCH_CONSUMERS_TTL_MS) return known.consumed;
+    this.resultBatchConsumersRead ??= Promise.resolve()
+      .then(() => this.queue(this.resultBatchesName()).getWorkersCount())
+      .then(
+        (count) => count > 0,
+        () => false,
+      )
+      .then((consumed) => {
+        this.resultBatchConsumers = { consumed, at: Date.now() };
+        this.resultBatchConsumersRead = undefined;
+        return consumed;
+      });
+    return this.resultBatchConsumersRead;
+  }
+
   private async runTask(task: RemoteTask): Promise<void> {
     // Track the task in the controller (inFlight + duration/ok window) so the heartbeat status and the
     // adaptive loop see it. A handler that throws (failed result) still counts as a settled completion.
@@ -1111,7 +1204,7 @@ export class BullMQTransport implements Transport, ControlPlane {
         runStepHandler(task, this.handlers.get(task.name)),
       );
       ok = result.status === 'completed';
-      await this.queue(this.resultsName()).add('result', result, RESULT_JOB_OPTIONS);
+      await this.publishResult(result);
     } catch {
       // In-process safety net for a crash we DIDN'T die from. `runStepHandler` is pure — it never
       // throws (it returns a failed StepResult), so reaching here means the results-queue publish
@@ -1223,6 +1316,24 @@ export class BullMQTransport implements Transport, ControlPlane {
   onResult(handler: (result: StepResult) => Promise<void>): void {
     this.resultHandlers.add(handler);
     if (this.resultsWorker) return;
+    this.resultBatchesWorker = this.makeWorker(
+      this.resultBatchesName(),
+      async (job) => {
+        const { results } = job.data as { results: StepResult[] };
+        await Promise.all(
+          results.flatMap((result) => [...this.resultHandlers].map((h) => h(result))),
+        );
+      },
+      { concurrency: this.resultConcurrency },
+    );
+    this.resultBatchesWorker.on('failed', (job, error) => {
+      if (!job || job.attemptsMade < (job.opts.attempts ?? 1)) return;
+      const { results } = job.data as { results: StepResult[] };
+      console.error(
+        `[nestjs-durable] gave up on a batch of ${results.length} step results after ${job.attemptsMade} attempts:`,
+        error,
+      );
+    });
     this.resultsWorker = this.makeWorker(
       this.resultsName(),
       async (job) => {
@@ -1608,6 +1719,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     const workerCloses = [
       ...[...this.taskWorkers.values()].map((w) => w.close()),
       this.resultsWorker?.close(),
+      this.resultBatchesWorker?.close(),
       this.decisionsWorker?.close(),
       this.stepEventsWorker?.close(),
       this.startRunWorker?.close(),
