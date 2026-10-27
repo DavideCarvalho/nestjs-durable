@@ -1,5 +1,16 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.85.11
+
+### Patch Changes
+
+- [#432](https://github.com/DavideCarvalho/nestjs-durable/pull/432) [`268990e`](https://github.com/DavideCarvalho/nestjs-durable/commit/268990e6b3ac004b7b087fd961fab7e2b0592fb3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A wide step fan is written and dispatched in rounds of up to 2,000 steps: a round is dispatched as
+  soon as its checkpoints commit, while the next round is written. Workers start on a 40,000-step fan
+  after its first round instead of after every checkpoint of it has committed. No result can wake the
+  run before the whole fan is written (the run stays `running` under the sending turn's lease), and a
+  send cut short leaves the unwritten steps to the replay, which sends them once the written ones
+  settle.
+
 ## 0.85.10
 
 ### Patch Changes
