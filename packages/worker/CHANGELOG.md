@@ -1,5 +1,15 @@
 # @dudousxd/durable-worker
 
+## 0.11.4
+
+### Patch Changes
+
+- [#431](https://github.com/DavideCarvalho/nestjs-durable/pull/431) [`3733cce`](https://github.com/DavideCarvalho/nestjs-durable/commit/3733ccef07cf3bb908de9ed4d0b0a3d93735012d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A queuing tick takes at most a quarter off the adaptive concurrency limit (and at least one slot),
+  instead of cutting it to `limit × gradient`. The window is the last 100 steps, a fraction of a second
+  of a busy worker's work, so one slow moment read as deep queuing and dropped a worker to one or two
+  slots, which then took ten ticks to grow back by √limit. Queuing that persists still halves the limit
+  in under three ticks. The Python `durable-worker` 0.26.3 makes the same decision.
+
 ## 0.11.3
 
 ### Patch Changes
