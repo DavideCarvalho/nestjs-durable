@@ -206,9 +206,13 @@ on a `tickMs` interval (default 2000): it grows the limit when there's headroom,
 shows queuing or errors spike (`backpressure`), and hard-brakes on RAM (`ramCeilingPct`, default 85%) or,
 if configured, CPU (`cpuCeilingPct`).
 
-- **Queuing signal.** The baseline is the window's fastest step completion (smoothed). The p50 of the
-  last 100 step completions may reach twice that baseline plus 5 ms before it counts as queuing, so the
-  jitter of 1–5 ms steps does not shrink the limit. Past that, each tick takes a quarter off the limit
+- **Queuing signal.** The baseline is the median of the last 100 step completions, smoothed so it
+  follows a drop at once and a rise slowly: a latency that stays high because a shared Redis or
+  database is busy becomes the baseline within a few ticks, so it does not hold a worker of one or two
+  slots there, and only a rise does. The current p50 may reach twice the baseline plus 5 ms before it
+  counts as queuing, so the jitter of 1–5 ms steps does not shrink the limit. A tick with no settled
+  step leaves the limit where it is: the window still holds the last burst, which says nothing about
+  the load now, so an idle worker starts its next burst at the limit it ended the last one on. Past that, each tick takes a quarter off the limit
   (at least one slot), however far p50 has risen: the window is a fraction of a second of a busy
   worker's steps, so one slow moment can read as deep queuing, and queuing that persists still halves
   the limit in under three ticks. Durations are timed with `performance.now()`, at sub-millisecond resolution.
@@ -220,7 +224,7 @@ if configured, CPU (`cpuCeilingPct`).
 - **Workflow turns** count as progress for stall detection but never enter the latency window: a turn
   suspends rather than blocks, so its duration says nothing about load.
 
-The Python `durable-worker` controller (0.26.3 and later) makes the same decisions. Every adjustment is recorded as a `WorkerAdjust` — `{ at, from, to,
+The Python `durable-worker` controller (0.26.4 and later) makes the same decisions. Every adjustment is recorded as a `WorkerAdjust` — `{ at, from, to,
 reason }` — so a dashboard can show *why* the limit moved, not just that it did. Tunables:
 
 - `min` / `max` — the floor and ceiling the controller won't cross. Defaults `1` / `32`.
