@@ -70,8 +70,13 @@ export interface ControlPlane {
 }
 ```
 
-`ControlMessage` is either a lifecycle `event` (for SSE live-tail across pods) or a `cancel`
-(cooperative cancellation). Each message carries the originating engine's `instanceId` as `from`, so
+`ControlMessage` is a lifecycle `event` (for SSE live-tail across pods), a batch of step `events`,
+or a `cancel` (cooperative cancellation). A run's own events go out one per message. Step events,
+which a wide fan emits two per step, go out in order in one `events` message per batch: the ones
+emitted while a publish is in flight share the next message, so a fan of 40,000 steps publishes a few
+hundred messages instead of 80,000, each delivered to every pod. An instance that does not know the
+`events` kind ignores it and only misses other instances' step events, which no engine logic reads.
+Each message carries the originating engine's `instanceId` as `from`, so
 a broker that echoes a publish back to its own subscriber (Redis pub/sub) is deduped by the
 originator — an instance ignores its own messages and only re-delivers ones from other instances.
 

@@ -1909,6 +1909,10 @@ export interface ControlPlane {
  *  the originator. */
 export type ControlMessage = { from?: string } & (
   | { kind: 'event'; event: EngineEvent }
+  // Several step events of one instance in one message (see the engine's `emit`). An instance that
+  // does not know this kind ignores it: it only misses other instances' step events, which no engine
+  // logic reads.
+  | { kind: 'events'; events: EngineEvent[] }
   | { kind: 'cancel'; runId: string }
   // A run was just enqueued — nudge worker instances to pick it up now instead of on the next poll.
   | { kind: 'enqueued'; runId: string }
