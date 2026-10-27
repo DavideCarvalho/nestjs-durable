@@ -198,6 +198,13 @@ export class DrizzlePgStateStore implements StateStore {
   }
 
   async createRun(run: WorkflowRun): Promise<void> {
+    if (normalizeAttributeRows(run.id, run.searchAttributes).length === 0) {
+      // Nothing to index: the insert, then clear any attribute rows a deleted run of this id left,
+      // as two statements. The insert goes first, so a run that already exists keeps its rows.
+      await this.db.insert(workflowRuns).values(toRunRow(run));
+      await this.db.delete(runAttributes).where(eq(runAttributes.runId, run.id));
+      return;
+    }
     // One transaction: a run is never visible without its attribute rows (or vice versa).
     await this.db.transaction(async (tx) => {
       await tx.insert(workflowRuns).values(toRunRow(run));
@@ -216,6 +223,11 @@ export class DrizzlePgStateStore implements StateStore {
     const row = toRunPatch(patch);
     const reindex = 'searchAttributes' in patch;
     if (!Object.keys(row).length && !reindex) return;
+    // A patch that leaves the attributes alone is one UPDATE, which needs no transaction.
+    if (!reindex) {
+      await this.db.update(workflowRuns).set(row).where(eq(workflowRuns.id, runId));
+      return;
+    }
     await this.db.transaction(async (tx) => {
       // Drizzle throws on `.set({})`; skip the UPDATE when no mapped column changed.
       if (Object.keys(row).length)

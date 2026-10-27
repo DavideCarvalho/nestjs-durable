@@ -82,6 +82,7 @@ runStateStoreContract('Prisma (SQLite)', async () => {
     supportsTagFilter: false,
     statements: () => prismaStatements,
     statementLog: () => prismaLog,
+    implicitTransactions: true,
     cleanup: async () => undefined,
   };
 });

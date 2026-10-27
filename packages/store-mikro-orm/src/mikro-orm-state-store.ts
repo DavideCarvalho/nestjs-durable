@@ -202,9 +202,8 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async createRun(run: WorkflowRun): Promise<void> {
-    const em = this.fork();
-    em.create(WorkflowRunEntity, toRunEntity(run));
-    await em.flush();
+    // One INSERT: a flush would wrap it in a transaction of its own.
+    await this.fork().insert(WorkflowRunEntity, toRunEntity(run));
     await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
@@ -216,10 +215,17 @@ export class MikroOrmStateStore implements StateStore {
             this.withScope({}).getRun(id),
           )
         : inputPatch;
+    // One UPDATE of the patched columns, as updateRunIf writes them, instead of a read of the row and
+    // a flush in a transaction of its own.
+    const data = runUpdateData(patch);
     const em = this.fork();
-    const entity = await em.findOneOrFail(WorkflowRunEntity, { id: runId });
-    Object.assign(entity, toRunEntity({ ...fromRunEntity(entity), ...patch } as WorkflowRun));
-    await em.flush();
+    if (Object.keys(data).length) {
+      const affected = await em.nativeUpdate(WorkflowRunEntity, { id: runId }, data);
+      // MySQL counts only rows whose values changed, so a zero is checked against the row.
+      if (affected === 0) await em.findOneOrFail(WorkflowRunEntity, { id: runId });
+    } else {
+      await em.findOneOrFail(WorkflowRunEntity, { id: runId });
+    }
     // Keep the side-table in step with the run's attributes whenever they're patched.
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
   }

@@ -108,6 +108,7 @@ runStateStoreContract('Prisma (Postgres)', async () => {
     supportsTagFilter: true,
     statements: () => prismaStatements,
     statementLog: () => prismaLog,
+    implicitTransactions: true,
     cleanup: async () => undefined,
   };
 });
@@ -165,6 +166,7 @@ runStateStoreContract('Prisma (MySQL)', async () => {
     supportsTagFilter: true,
     statements: () => mysqlStatements,
     statementLog: () => mysqlLog,
+    implicitTransactions: true,
     cleanup: async () => undefined,
   };
 });

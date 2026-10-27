@@ -63,7 +63,13 @@ custom store that leaves one out fails those cases even though the engine would 
 
 Every bundled adapter (MikroORM, TypeORM, Prisma, Drizzle on SQLite/MySQL and on Postgres, and the
 in-memory store) implements `listDueTimers` with `limit` and ordering and every optional method in the
-table. `updateRunIf` is a single conditional `UPDATE … WHERE id = ? AND status IN (…)` in each, and
+table. A run's own row is written one statement at a time in each: `createRun` is one `INSERT` (then
+the attribute side-table), and `updateRun` with a patch that does not settle the run is one `UPDATE`
+of the patched columns, with no read of the row first and no transaction around it (Prisma's client
+still wraps each write in a transaction of its own; Drizzle Postgres keeps one when search attributes
+are written with the row). A run of one step
+writes its row this way about five times, and each statement holds a pooled connection for a round
+trip, so a burst of short runs is bounded by them. `updateRunIf` is a single conditional `UPDATE … WHERE id = ? AND status IN (…)` in each, and
 `saveCheckpointIfPending` a single conditional `UPDATE … WHERE status = 'pending'`, never a read
 followed by a write, `hasCheckpoints` one `SELECT seq … ORDER BY seq DESC LIMIT 1` over the run's seq range, and `countCheckpoints` one `COUNT(*)` over it.
 `saveCheckpointsIfPending` is one `UPDATE … FROM (VALUES …) WHERE status = 'pending' RETURNING` per
