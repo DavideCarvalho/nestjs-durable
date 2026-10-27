@@ -212,7 +212,9 @@ export class TypeOrmStateStore implements StateStore {
   }
 
   async createRun(run: WorkflowRun): Promise<void> {
-    await this.runs().save(toRunEntity(run));
+    // One INSERT: `save` reads the row first and writes it in a transaction, and would overwrite a run
+    // that already has this id.
+    await this.runs().insert(toRunEntity(run) as QueryDeepPartialEntity<WorkflowRunEntity>);
     await this.reindexAttributes(run.id, run.searchAttributes);
   }
 
