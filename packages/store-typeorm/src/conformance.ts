@@ -15,8 +15,10 @@ export function makeTypeOrmStoreFactory(
 ): () => Promise<StateStoreContext> {
   return async () => {
     let statements = 0;
-    const count = () => {
+    const log: string[] = [];
+    const count = (query: string, parameters?: unknown[]) => {
       statements += 1;
+      log.push(`${query} ${JSON.stringify(parameters ?? [])}`);
     };
     const dataSource = new DataSource({
       ...options,
@@ -40,6 +42,7 @@ export function makeTypeOrmStoreFactory(
       store,
       peerStore: new TypeOrmStateStore(dataSource),
       statements: () => statements,
+      statementLog: () => log,
       cleanup: async () => {
         await truncateAll(dataSource);
         await dataSource.destroy();

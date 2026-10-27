@@ -17,6 +17,7 @@ import type {
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepSettlement,
   WorkflowRun,
 } from './interfaces';
 
@@ -116,8 +117,16 @@ export class CodecStateStore implements StateStore {
   readonly saveCheckpointIfPending?: (checkpoint: StepCheckpoint) => Promise<boolean>;
   /** Encodes each checkpoint like {@link saveCheckpoint}. Bound only when the inner store has it. */
   readonly saveCheckpointsIfPending?: (checkpoints: StepCheckpoint[]) => Promise<boolean[]>;
+  /** Encodes each settlement's payloads like {@link saveCheckpoint}. Bound only when the inner store
+   *  has it, so the engine's whole-row fallback still kicks in through the wrapper. */
+  readonly settleCheckpointsIfPending?: (settlements: StepSettlement[]) => Promise<boolean[]>;
   /** Encodes each checkpoint written. Bound only when the inner store has it. */
   readonly saveCheckpoints?: (checkpoints: StepCheckpoint[]) => Promise<void>;
+  /** Decodes each checkpoint read like {@link listCheckpoints}. Bound only when the inner store has
+   *  it, so the engine's full-read fallback still kicks in through the wrapper. */
+  readonly listCheckpointsForReplay?: (runId: string) => Promise<StepCheckpoint[]>;
+  /** Decodes each checkpoint read. Bound only when the inner store has it. */
+  readonly getCheckpointsForSettle?: (runId: string, seqs: number[]) => Promise<StepCheckpoint[]>;
   /** Decodes each checkpoint read. Bound only when the inner store has it. */
   readonly getCheckpoints?: (runId: string, seqs: number[]) => Promise<StepCheckpoint[]>;
   /** Forwarded verbatim — a count reads no payload. Bound only when the inner store has it. */
@@ -214,6 +223,13 @@ export class CodecStateStore implements StateStore {
           inner,
           cps.map((cp) => this.encCp(cp)),
         );
+    const settleMany = inner.settleCheckpointsIfPending;
+    if (settleMany)
+      this.settleCheckpointsIfPending = (settlements) =>
+        settleMany.call(
+          inner,
+          settlements.map((s) => this.encSettlement(s)),
+        );
     const saveMany = inner.saveCheckpoints;
     if (saveMany)
       this.saveCheckpoints = (cps) =>
@@ -221,6 +237,14 @@ export class CodecStateStore implements StateStore {
           inner,
           cps.map((cp) => this.encCp(cp)),
         );
+    const listForReplay = inner.listCheckpointsForReplay;
+    if (listForReplay)
+      this.listCheckpointsForReplay = async (runId) =>
+        (await listForReplay.call(inner, runId)).map((cp) => this.decCp(cp));
+    const getForSettle = inner.getCheckpointsForSettle;
+    if (getForSettle)
+      this.getCheckpointsForSettle = async (runId, seqs) =>
+        (await getForSettle.call(inner, runId, seqs)).map((cp) => this.decCp(cp));
     const getMany = inner.getCheckpoints;
     if (getMany)
       this.getCheckpoints = async (runId, seqs) =>
@@ -320,6 +344,18 @@ export class CodecStateStore implements StateStore {
     if (this.extended) {
       if (cp.events !== undefined) next.events = this.enc(cp.events) as StepCheckpoint['events'];
       if (cp.error !== undefined) next.error = this.enc(cp.error) as StepCheckpoint['error'];
+    }
+    return next;
+  }
+  private encSettlement(settlement: StepSettlement): StepSettlement {
+    const next = { ...settlement, output: this.enc(settlement.output) };
+    if (this.extended) {
+      if (settlement.events !== undefined) {
+        next.events = this.enc(settlement.events) as StepSettlement['events'];
+      }
+      if (settlement.error !== undefined) {
+        next.error = this.enc(settlement.error) as StepSettlement['error'];
+      }
     }
     return next;
   }

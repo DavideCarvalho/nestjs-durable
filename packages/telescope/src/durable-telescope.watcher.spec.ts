@@ -42,6 +42,26 @@ describe('DurableTelescopeWatcher', () => {
     expect(records[0]?.tags).toContain('run:run1');
   });
 
+  it('gives run events a family the Workflows panels can read by, and step events none', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const records: RecordInput[] = [];
+    new DurableTelescopeWatcher().register(fakeCtx(engine, records));
+
+    engine.register('checkout', '1', async (ctx) => {
+      await ctx.localStep('charge', async () => 1);
+      return 'ok';
+    });
+    await engine.start('checkout', {}, 'run1');
+    await engine.waitForRun('run1');
+
+    expect(records.map((r) => r.familyHash)).toEqual([
+      'durable:run.started',
+      undefined,
+      undefined,
+      'durable:run.completed',
+    ]);
+  });
+
   it('stamps every entry with the run trace, so a whole run is one trace', async () => {
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
     const records: RecordInput[] = [];

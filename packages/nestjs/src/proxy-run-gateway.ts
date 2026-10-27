@@ -20,6 +20,7 @@ import type {
   RunWaiting,
   TenantTokenSource,
   Transport,
+  WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import {
   SUMMARY_CHILD_LIMIT,
@@ -201,6 +202,24 @@ export class ProxyRunGateway implements RunGateway {
     }
     const detail = await this.request<RunDetail | null>({ kind: 'getRunDetail', runId });
     return detail ? pageFan(detail.timeline, group, query) : null;
+  }
+
+  /**
+   * The run alone, without its timeline. Read from the full detail when the control plane is too old
+   * to know the verb: it then answers with no data, or with an unsupported-request error.
+   */
+  async getRun(runId: string): Promise<WorkflowRun | null> {
+    if (!this.knownUnsupported('getRun')) {
+      try {
+        const run = await this.request<WorkflowRun | null | undefined>({ kind: 'getRun', runId });
+        if (run !== undefined) return run;
+      } catch (err) {
+        if (!isUnsupported(err)) throw err;
+      }
+      this.unsupportedUntil.set('getRun', Date.now() + this.capabilityTtlMs);
+    }
+    const detail = await this.request<RunDetail | null>({ kind: 'getRunDetail', runId });
+    return detail?.run ?? null;
   }
 
   private knownUnsupported(kind: RunRequestKind['kind']): boolean {

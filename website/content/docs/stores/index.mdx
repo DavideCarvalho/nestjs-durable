@@ -34,7 +34,7 @@ Several `StateStore` methods exist only to keep wide fans and busy deployments c
 optional, and the engine falls back to something slower but correct when a store leaves one out.
 Run the [shared store contract](/docs/testing#testing-a-custom-storetransportadmission-backend)
 (`runStateStoreContract`) against your adapter. Its `listDueTimers` case checks the ordering and
-the `limit`. Its cases for `listOrphanedRuns`, `updateRunIf`, `countCheckpoints`, `getCheckpoints`, `saveCheckpoints`, `saveCheckpointIfPending`, `saveCheckpointsIfPending`,
+the `limit`. Its cases for `listOrphanedRuns`, `updateRunIf`, `countCheckpoints`, `getCheckpoints`, `saveCheckpoints`, `saveCheckpointIfPending`, `saveCheckpointsIfPending`, `settleCheckpointsIfPending`, `getCheckpointsForSettle`, `listCheckpointsForReplay`,
 `registerChildWaits`, `listCheckpointsByNamePrefix`, `getRuns`, `checkpointStats` and `queryCheckpoints` expect the method to exist, because every bundled adapter has it: a
 custom store that leaves one out fails those cases even though the engine would fall back.
 
@@ -44,10 +44,13 @@ custom store that leaves one out fails those cases even though the engine would 
 | `listOrphanedRuns(nowMs, limit, namespace?)` | optional | the periodic recovery pass. Return the `running` and `cancelling` runs whose lease is free (`lockedUntil` null or `<= nowMs`), oldest `createdAt` first, at most `limit` (the engine asks for 500), restricted to `namespace` when given. On a healthy fleet that is about zero rows per tick. | The engine lists every incomplete run with `listIncompleteRuns` on every tick, on every worker, and drops the leased ones in memory. |
 | `updateRunIf(runId, expectedStatuses, patch)` | optional | a compare-and-set on the run's status: apply `patch` only while the run's status is one of `expectedStatuses`, and resolve whether it wrote (a missing run resolves `false`, never throws). A turn settles its outcome (completed, failed, suspended, blocked) through it, so a run that reached `cancelled`, `completed` or `dead` through another path while the turn ran (an operator's `cancel()`, a timeout sweep, a dead-letter) keeps that state. The predicate must be in the `UPDATE … WHERE` itself. | The engine re-reads the run and then writes, which narrows the race to the gap between the two but cannot close it. |
 | `countCheckpoints(runId, fromSeq, toSeq, statuses)` | optional | a step fan's join barrier asks, once its queue of waiting results drains, how many checkpoints in the fan's seq range are still `pending`. Must be a `COUNT`, not a load. An empty `statuses` counts 0. | The engine loads the run's checkpoints and counts in memory, each time it asks. |
-| `getCheckpoints(runId, seqs)` | optional | the run's checkpoints at `seqs`, in `seq` order, leaving out a seq with none. The engine reads a batch of one run's step results' checkpoints with one call. | One `getCheckpoint` per result. |
+| `getCheckpoints(runId, seqs)` | optional | the run's checkpoints at `seqs`, in `seq` order, leaving out a seq with none. The engine reads a batch of one run's step results' checkpoints with one call, and the turn that joins a step fan re-reads, 1,000 seqs a call, only the fan steps its replay snapshot does not hold settled. | One `getCheckpoint` per result; the joining turn lists every checkpoint of the run. |
 | `saveCheckpoints(checkpoints)` | optional | `saveCheckpoint` for many rows in a few statements and one transaction (a rejection writes nothing). The engine writes a step fan's new `pending` checkpoints with one call before dispatching them. | One `saveCheckpoint` per step of the fan. |
 | `saveCheckpointIfPending(checkpoint)` | optional | a compare-and-set: overwrite `(runId, seq)` only while the stored row is still `pending`, and resolve whether it wrote. Used to settle a step from its result (which also drops a duplicate delivery), to stamp a redispatch deadline, and to re-dispatch. | The engine uses `saveCheckpoint`, which keeps the race where a turn writes a settled step back to `pending` and the step runs twice. |
 | `saveCheckpointsIfPending(checkpoints)` | optional | `saveCheckpointIfPending` for many rows in one call, resolving one boolean per entry in input order. It must give the same answers as calling `saveCheckpointIfPending` on each entry in turn: a second entry for the same row is compared against the first one's write. Each row's compare-and-set stays atomic, and so does the call: if it rejects, it wrote nothing. The engine settles a batch of one run's step results with one call, so it should be a few statements per batch (the bundled stores lock the still-`pending` rows with one read and write the winners with one multi-row write), not one per row. | One `saveCheckpointIfPending` per result. |
+| `settleCheckpointsIfPending(settlements)` | optional | settles steps from their results: per entry and in input order, while the row at `(runId, seq)` is still `pending`, write only the columns a result changes (`status`, `output`, `error`, `events`, `startedAt`, `finishedAt`; an absent one is stored empty) and leave every other column, `input` among them, as it is stored. Resolves one boolean per entry. Claims like `saveCheckpointsIfPending`: a second entry for a row the first settled loses, and a rejection writes nothing. The engine settles a batch of one run's step results with one call (a single result too), so a step whose input is large, such as an LLM step carrying its whole prompt, does not have that input written a second time when its result lands. | `saveCheckpointsIfPending` (or `saveCheckpointIfPending` per result) with the whole rows, input included. |
+| `getCheckpointsForSettle(runId, seqs)` | optional | the rows `getCheckpoints` returns, each without its `input`, left out of the query itself. A step result's settle reads the step's row for its status, name, group and timings only, so an LLM step's prompt is not read back when its answer lands. The engine reads through it only when the store also has `settleCheckpointsIfPending`: the whole-row write it otherwise falls back to needs the input. | `getCheckpoints` (or `getCheckpoint` per result), input included. |
+| `listCheckpointsForReplay(runId)` | optional | the replay snapshot every turn of a run reads: the rows `listCheckpoints` returns, in the same order, except that a `completed` row comes without its `input`. Leave the column out of the query itself; dropping it after the read saves nothing. A row that is not completed (still `pending`, `running`, or `failed`) keeps its input, since a re-dispatch or a retry writes it again. Replay needs a completed step's output only, so a conversation whose every turn is an LLM step does not re-read every earlier prompt on each resume. The run detail, `engine.listCheckpoints`, retry and re-dispatch keep reading the full rows. | `listCheckpoints` on every turn, every input included. |
 | `hasSignalWaiter(runId, tokenPrefix)` | optional | a child fan's join barrier. | The parent replays once per settled child, which is O(N²) over the fan. |
 | `registerChildWaits(entries)` | optional | writes a child fan's waiters and `running` placeholders in one transaction, 500 at a time. | Waiters and placeholders are written one by one. |
 | `compactCheckpoints(runId, fromSeq, toSeq, into)` | optional | folds a settled child fan (or wave) of 100+ into one `fan:` checkpoint. | Settled fans keep one checkpoint per child. |
@@ -63,8 +66,21 @@ table. `updateRunIf` is a single conditional `UPDATE … WHERE id = ? AND status
 `saveCheckpointIfPending` a single conditional `UPDATE … WHERE status = 'pending'`, never a read
 followed by a write, and `countCheckpoints` is one `COUNT(*)` over the run's seq range.
 `saveCheckpointsIfPending` is one `UPDATE … FROM (VALUES …) WHERE status = 'pending' RETURNING` per
-500 rows on Drizzle Postgres, and those same conditional `UPDATE`s, one per row, in one transaction
-on the other stores. It is one commit per batch either way.
+500 rows on Drizzle Postgres. On MikroORM, TypeORM and Drizzle SQLite it locks the still-`pending`
+rows with one read and writes the winners with one multi-row upsert per chunk, and on Prisma it
+replaces them with a `deleteMany` and a `createMany`. It is one commit per batch either way.
+`settleCheckpointsIfPending` has the same shape, but writes only the six result columns: Drizzle
+Postgres's `UPDATE … FROM (VALUES …)` sets just those, and the upsert's conflict branch on MikroORM,
+TypeORM and Drizzle SQLite merges just those (its insert never happens, since the rows are locked).
+Prisma's client has no multi-row update with a value per row, so its store settles a batch with raw
+SQL on the models' table and column names, 500 rows a statement, in one transaction:
+`UPDATE … FROM (VALUES …) WHERE status = 'pending' RETURNING` on Postgres and SQLite, and on MySQL a
+`SELECT … FOR UPDATE` of the still-`pending` rows followed by one `UPDATE … JOIN` of the values. A
+client without `$queryRawUnsafe`, or on another provider, settles with one conditional `updateMany`
+per entry. `getCheckpointsForSettle` is `getCheckpoints`' `SELECT` with every column but `input`, and
+`listCheckpointsForReplay` is one `SELECT` of every column but `input`, then one of
+`(seq, input)` for the rows that are not completed (by seq, 500 at a time), skipped when there are
+none.
 
 `checkpointStats` is one aggregate query. Each SQL store also declares a
 `durable_step_checkpoints_group_idx` index on `(run_id, parallel_group, seq)` for the per-fan reads.
@@ -81,8 +97,8 @@ you named something like `FAN:x` would be affected.
 `CodecStateStore` exposes an optional method only when the store it wraps has it, so wrapping a
 store never hides a capability or invents one. It encodes the payload for `updateRunIf` (like
 `updateRun`), for `saveCheckpointIfPending`
-and for every entry of `saveCheckpointsIfPending`, forwards `countCheckpoints` and `checkpointStats`
-verbatim (neither reads a payload), decodes the rows `queryCheckpoints` returns, and decodes the runs
+and for every entry of `saveCheckpointsIfPending` and `settleCheckpointsIfPending`, forwards `countCheckpoints` and `checkpointStats`
+verbatim (neither reads a payload), decodes the rows `queryCheckpoints`, `getCheckpointsForSettle` and `listCheckpointsForReplay` return, and decodes the runs
 `listDueTimers` and `listOrphanedRuns` return.
 
 ## Adapters

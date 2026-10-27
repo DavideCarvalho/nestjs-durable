@@ -492,7 +492,8 @@ runs. These knobs matter, roughly in order:
 4. **Results need no tuning.** Each instance consuming results works on many of them at once (512
    on BullMQ, up to 80 on SQS, up to 512 on `DbTransport`) and settles one run's results in
    batches: the results that arrive while one batch is being written go into the next, up to 256.
-   A batch is one `saveCheckpointsIfPending` call (one commit), and it resumes the run at most once.
+   A batch is one `settleCheckpointsIfPending` call (one commit), which writes only what a result
+   changes, never the step's input, and it resumes the run at most once.
    A step fan's barrier `COUNT` is read only by a batch with none of the fan's results queued behind
    it, so under a backlog it is read about once per instance, not once per batch. A step fan's
    results then cost about one checkpoint read and 1/256 of a commit each. A result is acknowledged

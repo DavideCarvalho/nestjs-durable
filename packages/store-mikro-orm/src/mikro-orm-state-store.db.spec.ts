@@ -121,8 +121,15 @@ async function duplicateNotificationLeavesNoBuffer(factory: Factory | undefined)
     });
     await engine.start('parent', {}, 'p');
     const deadline = Date.now() + 15_000;
-    while ((await store.getRun('p'))?.status !== 'suspended') {
-      if (Date.now() > deadline) throw new Error('parent never suspended');
+    // Suspended on the signal, past the child: the parent also suspends while the child runs, and a
+    // notification delivered then is not a duplicate yet.
+    const pastChild = async () =>
+      (await store.getRun('p'))?.status === 'suspended' &&
+      (await store.listCheckpoints('p')).some(
+        (cp) => cp.name.startsWith('signal:child:') && cp.status === 'completed',
+      );
+    while (!(await pastChild())) {
+      if (Date.now() > deadline) throw new Error('parent never suspended past its child');
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     await (

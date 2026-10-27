@@ -22,6 +22,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepSettlement,
   type BufferedSignalRow as StoreBufferedSignalRow,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
@@ -357,6 +358,22 @@ export class PrismaStateStore implements StateStore {
     return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointRow);
   }
 
+  async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const unique = [...new Set(seqs)];
+    const rows = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      rows.push(
+        ...(await this.db.durableStepCheckpoint.findMany({
+          where: { runId, seq: { in: unique.slice(at, at + 500) } },
+          select: CHECKPOINT_SELECT_WITHOUT_INPUT,
+        })),
+      );
+    }
+    return rows
+      .sort((a, b) => a.seq - b.seq)
+      .map((row) => fromCheckpointRow({ ...row, input: null }));
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     const data = toCheckpointData(checkpoint);
     await this.db.durableStepCheckpoint.upsert({
@@ -415,6 +432,61 @@ export class PrismaStateStore implements StateStore {
       }
       return wrote;
     });
+  }
+
+  async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+    const wrote = settlements.map(() => false);
+    if (settlements.length === 0) return wrote;
+    // A settlement never leaves its row `pending`, so only the first entry for a row can win.
+    const seen = new Set<string>();
+    const firsts: number[] = [];
+    settlements.forEach((s, i) => {
+      const key = checkpointKey(s.runId, s.seq);
+      if (seen.has(key)) return;
+      seen.add(key);
+      firsts.push(i);
+    });
+    const dialect = rawSettleDialect(this.db);
+    if (!dialect) {
+      // One conditional `updateMany` per entry, in one transaction: the row count is its answer.
+      const settle = async (db: Pick<DurablePrismaClient, 'durableStepCheckpoint'>) => {
+        for (const i of firsts) {
+          const s = settlements[i] as StepSettlement;
+          const { count } = await db.durableStepCheckpoint.updateMany({
+            where: { runId: s.runId, seq: s.seq, status: 'pending' },
+            data: {
+              status: s.status,
+              output: jsonOrNull(s.output),
+              error: jsonOrNull(s.error),
+              events: jsonOrNull(s.events),
+              startedAt: s.startedAt,
+              finishedAt: s.finishedAt,
+            },
+          });
+          wrote[i] = count > 0;
+        }
+      };
+      if (firsts.length === 1) await settle(this.db);
+      else await this.db.$transaction((tx) => settle(tx));
+      return wrote;
+    }
+    // Prisma has no multi-row update with a value per row, so a batch is settled with raw SQL on the
+    // models' fixed table and column names, 500 rows a statement, in one transaction.
+    await this.db.$transaction(async (tx) => {
+      const raw = tx as unknown as RawPrismaClient;
+      for (let at = 0; at < firsts.length; at += 500) {
+        const chunk = firsts.slice(at, at + 500);
+        const won = await dialect(
+          raw,
+          chunk.map((i) => settlements[i] as StepSettlement),
+        );
+        for (const i of chunk) {
+          const s = settlements[i] as StepSettlement;
+          wrote[i] = won.has(checkpointKey(s.runId, s.seq));
+        }
+      }
+    });
+    return wrote;
   }
 
   async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
@@ -710,6 +782,25 @@ export class PrismaStateStore implements StateStore {
       orderBy: { seq: 'asc' },
     });
     return rows.map(fromCheckpointRow);
+  }
+
+  async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
+    const rows = await this.db.durableStepCheckpoint.findMany({
+      where: { runId },
+      orderBy: { seq: 'asc' },
+      select: CHECKPOINT_SELECT_WITHOUT_INPUT,
+    });
+    // An open or failed step keeps its input; read by seq, so a row settled since is still filled.
+    const open = rows.filter((row) => row.status !== 'completed').map((row) => row.seq);
+    const inputs = new Map<number, unknown>();
+    for (let at = 0; at < open.length; at += 500) {
+      const found = await this.db.durableStepCheckpoint.findMany({
+        where: { runId, seq: { in: open.slice(at, at + 500) } },
+        select: { seq: true, input: true },
+      });
+      for (const row of found) inputs.set(row.seq, row.input);
+    }
+    return rows.map((row) => fromCheckpointRow({ ...row, input: inputs.get(row.seq) ?? null }));
   }
 
   async getLatestCheckpointByName(
@@ -1211,7 +1302,7 @@ function toCheckpointStat(
 }
 
 /** `checkpoints`' distinct seqs, by run. */
-function seqsByRun(checkpoints: StepCheckpoint[]): Map<string, number[]> {
+function seqsByRun(checkpoints: { runId: string; seq: number }[]): Map<string, number[]> {
   const byRun = new Map<string, Set<number>>();
   for (const { runId, seq } of checkpoints) {
     const seqs = byRun.get(runId) ?? new Set<number>();
@@ -1270,6 +1361,165 @@ async function replaceCheckpoints(
     });
   }
 }
+
+/** Every checkpoint column but `input`, as a Prisma `select`. */
+const CHECKPOINT_SELECT_WITHOUT_INPUT = {
+  runId: true,
+  seq: true,
+  name: true,
+  kind: true,
+  stepId: true,
+  status: true,
+  output: true,
+  error: true,
+  events: true,
+  attempts: true,
+  workerGroup: true,
+  parallelGroup: true,
+  wakeAt: true,
+  enqueuedAt: true,
+  startedAt: true,
+  finishedAt: true,
+} satisfies Record<Exclude<keyof CheckpointRow, 'input'>, true>;
+
+/** The raw-query half of a Prisma client (or of its interactive-transaction client). */
+interface RawPrismaClient {
+  $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
+  $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number>;
+}
+
+/** Settles distinct rows with raw SQL and resolves the keys ({@link checkpointKey}) it wrote. */
+type RawSettle = (db: RawPrismaClient, settlements: StepSettlement[]) => Promise<Set<string>>;
+
+const jsonText = (v: unknown): string | null => (v == null ? null : JSON.stringify(v));
+
+/**
+ * The raw settle for the client's database, or `undefined` (a client without raw queries, or a
+ * provider without one here), which settles row by row through `updateMany`.
+ */
+function rawSettleDialect(db: DurablePrismaClient): RawSettle | undefined {
+  const client = db as unknown as Partial<RawPrismaClient> & { _activeProvider?: string };
+  if (typeof client.$queryRawUnsafe !== 'function') return undefined;
+  if (client._activeProvider === 'postgresql') return settleRowsPostgres;
+  if (client._activeProvider === 'mysql') return settleRowsMysql;
+  if (client._activeProvider === 'sqlite') return settleRowsSqlite;
+  return undefined;
+}
+
+/**
+ * One `UPDATE … FROM (VALUES …) WHERE status = 'pending' RETURNING`: the predicate is each row's
+ * compare-and-set, and `RETURNING` names the rows written. Prisma's `DateTime` is a `timestamp(3)`
+ * holding UTC, hence the conversion from the exact instant.
+ */
+const settleRowsPostgres: RawSettle = async (db, settlements) => {
+  const values: unknown[] = [];
+  const rows = settlements.map((s) => {
+    const n = values.length;
+    values.push(
+      s.runId,
+      s.seq,
+      s.status,
+      jsonText(s.output),
+      jsonText(s.error),
+      jsonText(s.events),
+      s.startedAt.toISOString(),
+      s.finishedAt.toISOString(),
+    );
+    const p = (k: number) => `$${n + k}`;
+    return `(${p(1)}::text, ${p(2)}::integer, ${p(3)}::text, ${p(4)}::jsonb, ${p(5)}::jsonb, ${p(6)}::jsonb, (${p(7)}::timestamptz AT TIME ZONE 'UTC'), (${p(8)}::timestamptz AT TIME ZONE 'UTC'))`;
+  });
+  const written = await db.$queryRawUnsafe<{ run_id: string; seq: number }[]>(
+    `UPDATE "durable_step_checkpoints" AS c SET status = v.status, output = v.output,
+      error = v.error, events = v.events, started_at = v.started_at, finished_at = v.finished_at
+    FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at,
+      finished_at)
+    WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'
+    RETURNING c.run_id, c.seq`,
+    ...values,
+  );
+  return new Set(written.map((row) => checkpointKey(row.run_id, Number(row.seq))));
+};
+
+/**
+ * MySQL has no `RETURNING`: lock the rows still `pending` (`SELECT … FOR UPDATE`), then update
+ * those from a derived table of the values. Prisma's `DateTime` is a `DATETIME(3)` holding UTC.
+ */
+const settleRowsMysql: RawSettle = async (db, settlements) => {
+  const pending = new Set<string>();
+  for (const [runId, seqs] of seqsByRun(settlements)) {
+    const rows = await db.$queryRawUnsafe<{ run_id: string; seq: number }[]>(
+      `SELECT run_id, seq FROM durable_step_checkpoints WHERE run_id = ? AND seq IN (${seqs
+        .map(() => '?')
+        .join(', ')}) AND status = 'pending' FOR UPDATE`,
+      runId,
+      ...seqs,
+    );
+    for (const row of rows) pending.add(checkpointKey(row.run_id, Number(row.seq)));
+  }
+  const won = settlements.filter((s) => pending.has(checkpointKey(s.runId, s.seq)));
+  if (won.length === 0) return pending;
+  const at = (d: Date) => d.toISOString().replace('T', ' ').replace('Z', '');
+  const values: unknown[] = [];
+  const rows = won.map((s, i) => {
+    values.push(
+      s.runId,
+      s.seq,
+      s.status,
+      jsonText(s.output),
+      jsonText(s.error),
+      jsonText(s.events),
+      at(s.startedAt),
+      at(s.finishedAt),
+    );
+    return i === 0
+      ? 'SELECT ? AS run_id, ? AS seq, ? AS status, ? AS output, ? AS error, ? AS events, ? AS started_at, ? AS finished_at'
+      : 'SELECT ?, ?, ?, ?, ?, ?, ?, ?';
+  });
+  const updated = await db.$executeRawUnsafe(
+    `UPDATE durable_step_checkpoints AS c JOIN (${rows.join(' UNION ALL ')}) AS v
+      ON c.run_id = v.run_id AND c.seq = v.seq
+    SET c.status = v.status, c.output = CAST(v.output AS JSON), c.error = CAST(v.error AS JSON),
+      c.events = CAST(v.events AS JSON), c.started_at = v.started_at, c.finished_at = v.finished_at
+    WHERE c.status = 'pending'`,
+    ...values,
+  );
+  if (updated !== won.length) {
+    throw new Error('a checkpoint of the batch was settled while the batch was written');
+  }
+  return pending;
+};
+
+/**
+ * SQLite's `UPDATE … FROM … RETURNING` (3.35+), as on Postgres. Prisma keeps a `DateTime` as epoch
+ * milliseconds and a `Json` as text there.
+ */
+const settleRowsSqlite: RawSettle = async (db, settlements) => {
+  const values: unknown[] = [];
+  const rows = settlements.map((s) => {
+    values.push(
+      s.runId,
+      s.seq,
+      s.status,
+      jsonText(s.output),
+      jsonText(s.error),
+      jsonText(s.events),
+      s.startedAt.getTime(),
+      s.finishedAt.getTime(),
+    );
+    return '(?, ?, ?, ?, ?, ?, ?, ?)';
+  });
+  const written = await db.$queryRawUnsafe<{ run_id: string; seq: number | bigint }[]>(
+    `WITH v(run_id, seq, status, output, error, events, started_at, finished_at) AS (VALUES ${rows.join(', ')})
+    UPDATE durable_step_checkpoints SET status = v.status, output = v.output, error = v.error,
+      events = v.events, started_at = v.started_at, finished_at = v.finished_at
+    FROM v
+    WHERE durable_step_checkpoints.run_id = v.run_id AND durable_step_checkpoints.seq = v.seq
+      AND durable_step_checkpoints.status = 'pending'
+    RETURNING run_id, seq`,
+    ...values,
+  );
+  return new Set(written.map((row) => checkpointKey(row.run_id, Number(row.seq))));
+};
 
 function toCheckpointData(cp: StepCheckpoint) {
   return {

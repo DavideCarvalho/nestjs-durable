@@ -21,14 +21,41 @@ import { type Context, TraceFlags, context, trace } from '@opentelemetry/api';
  * whose "root" is the run itself, not a span this process ever recorded.
  */
 export function runTraceId(runId: string): string {
-  // 16 bytes of hex, as the W3C trace-context spec requires. sha256 is not used as a security
-  // primitive here — only as a well-distributed map from an arbitrary run id into that space.
-  return createHash('sha256').update(`durable:run:${runId}`).digest('hex').slice(0, 32);
+  return runIds(runId).traceId;
 }
 
 /** The synthetic parent span id for a run's trace — derived the same way, from a different prefix. */
 function runSpanId(runId: string): string {
-  return createHash('sha256').update(`durable:run-span:${runId}`).digest('hex').slice(0, 16);
+  return runIds(runId).spanId;
+}
+
+interface RunIds {
+  readonly traceId: string;
+  readonly spanId: string;
+}
+
+/**
+ * Every lifecycle event of a run asks for these, and a wide fan emits tens of thousands of events
+ * for the same few runs, so the last few hundred runs' ids are kept rather than re-hashed per event.
+ */
+const RECENT_RUNS = 512;
+const recentRunIds = new Map<string, RunIds>();
+
+function runIds(runId: string): RunIds {
+  const known = recentRunIds.get(runId);
+  if (known !== undefined) return known;
+  const ids: RunIds = {
+    // 16 bytes of hex, as the W3C trace-context spec requires. sha256 is not used as a security
+    // primitive here — only as a well-distributed map from an arbitrary run id into that space.
+    traceId: createHash('sha256').update(`durable:run:${runId}`).digest('hex').slice(0, 32),
+    spanId: createHash('sha256').update(`durable:run-span:${runId}`).digest('hex').slice(0, 16),
+  };
+  if (recentRunIds.size >= RECENT_RUNS) {
+    const oldest = recentRunIds.keys().next().value;
+    if (oldest !== undefined) recentRunIds.delete(oldest);
+  }
+  recentRunIds.set(runId, ids);
+  return ids;
 }
 
 /**

@@ -24,6 +24,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepSettlement,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
   attributePredicateOperands,
@@ -59,10 +60,14 @@ interface DurableQueryBuilder<T> {
   getFormattedQuery(): string;
   addSelect(field: unknown): DurableQueryBuilder<T>;
   groupBy(fields: string[]): DurableQueryBuilder<T>;
-  execute<R>(): Promise<R>;
+  // Upsert verbs — used only by the checkpoint upserts.
+  insert(rows: Record<string, unknown>[]): DurableQueryBuilder<T>;
+  onConflict(fields: string[]): DurableQueryBuilder<T>;
+  merge(fields?: string[]): DurableQueryBuilder<T>;
+  execute<R>(method?: 'all' | 'get' | 'run', mapResults?: boolean): Promise<R>;
 }
 type SqlEm = EntityManager & {
-  createQueryBuilder<T>(entity: unknown, alias: string): DurableQueryBuilder<T>;
+  createQueryBuilder<T>(entity: unknown, alias?: string): DurableQueryBuilder<T>;
 };
 
 /** Resolved side-table column names (per the active naming strategy) for the raw EXISTS pushdown. */
@@ -360,7 +365,20 @@ export class MikroOrmStateStore implements StateStore {
     const rows: StepCheckpointEntity[] = [];
     for (let at = 0; at < unique.length; at += 500) {
       const seq = { $in: unique.slice(at, at + 500) };
-      rows.push(...(await em.find(StepCheckpointEntity, { runId, seq })));
+      rows.push(...(await selectCheckpointRows(em, { runId, seq })));
+    }
+    return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointEntity);
+  }
+
+  async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    if (seqs.length === 0) return [];
+    const em = this.fork();
+    const fields = checkpointFieldsWithoutInput(em);
+    const unique = [...new Set(seqs)];
+    const rows: StepCheckpointEntity[] = [];
+    for (let at = 0; at < unique.length; at += 500) {
+      const seq = { $in: unique.slice(at, at + 500) };
+      rows.push(...(await selectCheckpointRows(em, { runId, seq }, fields)));
     }
     return rows.sort((a, b) => a.seq - b.seq).map(fromCheckpointEntity);
   }
@@ -373,14 +391,9 @@ export class MikroOrmStateStore implements StateStore {
 
   async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
     if (checkpoints.length === 0) return;
-    await this.fork().transactional(async (em) => {
-      for (let at = 0; at < checkpoints.length; at += 500) {
-        await em.upsertMany(
-          StepCheckpointEntity,
-          checkpoints.slice(at, at + 500).map(toCheckpointRow),
-        );
-      }
-    });
+    await this.fork().transactional((em) =>
+      upsertCheckpointRows(em, checkpoints.map(toCheckpointRow)),
+    );
   }
 
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
@@ -400,33 +413,11 @@ export class MikroOrmStateStore implements StateStore {
     // row's last winning entry in one upsert per chunk. One commit and a few statements for the
     // batch instead of one UPDATE per entry; a rejection writes nothing.
     return this.fork().transactional(async (em) => {
-      const key = (runId: string, seq: number) => `${runId}\u0000${seq}`;
-      const seqsByRun = new Map<string, Set<number>>();
-      for (const { runId, seq } of checkpoints) {
-        const seqs = seqsByRun.get(runId) ?? new Set<number>();
-        seqs.add(seq);
-        seqsByRun.set(runId, seqs);
-      }
-      const pending = new Set<string>();
-      for (const [runId, seqSet] of seqsByRun) {
-        const seqs = [...seqSet];
-        for (let at = 0; at < seqs.length; at += 500) {
-          const rows = await em.find(
-            StepCheckpointEntity,
-            { runId, seq: { $in: seqs.slice(at, at + 500) }, status: 'pending' },
-            {
-              fields: ['runId', 'seq'],
-              lockMode: LockMode.PESSIMISTIC_WRITE,
-              disableIdentityMap: true,
-            },
-          );
-          for (const row of rows) pending.add(key(row.runId, row.seq));
-        }
-      }
+      const pending = await lockPendingCheckpoints(em, checkpoints, ['runId', 'seq']);
       const wrote: boolean[] = [];
       const writes = new Map<string, StepCheckpoint>();
       for (const checkpoint of checkpoints) {
-        const k = key(checkpoint.runId, checkpoint.seq);
+        const k = checkpointKey(checkpoint.runId, checkpoint.seq);
         if (!pending.has(k)) {
           wrote.push(false);
           continue;
@@ -436,9 +427,56 @@ export class MikroOrmStateStore implements StateStore {
         if (checkpoint.status !== 'pending') pending.delete(k);
       }
       // A write without a deadline clears the one the pending row held.
-      const rows = [...writes.values()].map(toCheckpointRow);
+      await upsertCheckpointRows(em, [...writes.values()].map(toCheckpointRow));
+      return wrote;
+    });
+  }
+
+  async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+    if (settlements.length === 0) return [];
+    // Decided like saveCheckpointsIfPending, against the locked `pending` rows. A settlement never
+    // leaves its row `pending`, so a row is won by its first entry only. The upsert's insert never
+    // happens (the rows exist and are locked): it carries the row's required columns and no `input`,
+    // and its conflict branch writes only what a result changes.
+    return this.fork().transactional(async (em) => {
+      const pending = await lockPendingCheckpoints(em, settlements, [
+        'runId',
+        'seq',
+        'name',
+        'kind',
+        'stepId',
+        'attempts',
+      ]);
+      const wrote: boolean[] = [];
+      const rows: Record<string, unknown>[] = [];
+      for (const s of settlements) {
+        const k = checkpointKey(s.runId, s.seq);
+        const row = pending.get(k);
+        wrote.push(row !== undefined);
+        if (!row) continue;
+        pending.delete(k);
+        rows.push({
+          runId: row.runId,
+          seq: row.seq,
+          name: row.name,
+          kind: row.kind,
+          stepId: row.stepId,
+          attempts: row.attempts,
+          status: s.status,
+          output: s.output ?? null,
+          error: s.error ?? null,
+          events: s.events ?? null,
+          startedAt: s.startedAt,
+          finishedAt: s.finishedAt,
+        });
+      }
       for (let at = 0; at < rows.length; at += 500) {
-        await em.upsertMany(StepCheckpointEntity, rows.slice(at, at + 500));
+        await (em as SqlEm)
+          .createQueryBuilder<StepCheckpointEntity>(StepCheckpointEntity)
+          .insert(rows.slice(at, at + 500))
+          .onConflict(['runId', 'seq'])
+          .merge([...SETTLED_FIELDS])
+          .execute();
       }
       return wrote;
     });
@@ -967,8 +1005,27 @@ export class MikroOrmStateStore implements StateStore {
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+    const rows = await selectCheckpointRows(this.fork(), { runId });
+    return rows.map(fromCheckpointEntity);
+  }
+
+  async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
     const em = this.fork();
-    const rows = await em.find(StepCheckpointEntity, { runId }, { orderBy: { seq: 'asc' } });
+    const rows = await selectCheckpointRows(em, { runId }, checkpointFieldsWithoutInput(em));
+    // An open or failed step keeps its input; read by seq, so a row settled since is still filled.
+    const open = rows.filter((row) => row.status !== 'completed').map((row) => row.seq);
+    if (open.length > 0) {
+      const inputs = new Map<number, unknown>();
+      for (let at = 0; at < open.length; at += 500) {
+        const found = await selectCheckpointRows(
+          em,
+          { runId, seq: { $in: open.slice(at, at + 500) } },
+          ['seq', 'input'],
+        );
+        for (const row of found) inputs.set(row.seq, row.input);
+      }
+      for (const row of rows) if (inputs.has(row.seq)) row.input = inputs.get(row.seq);
+    }
     return rows.map(fromCheckpointEntity);
   }
 
@@ -1399,6 +1456,101 @@ function aggregateDateReader(em: EntityManager): (value: unknown) => Date {
  * {@link toCheckpointEntity} with every nullable column set, for a multi-row upsert: it writes the
  * columns of its first row to every row, so an absent value must be an explicit `null`.
  */
+/**
+ * Checkpoint rows by `where`, in seq order, through the query builder: mapped to entity properties
+ * with the same type conversions as `em.find`, but not turned into managed entities, which for a
+ * 40k-step fan took five times as long as the query.
+ */
+/** Every checkpoint property but `input`, for a read that leaves the column out. */
+function checkpointFieldsWithoutInput(em: EntityManager): string[] {
+  return Object.keys(em.getMetadata().get(StepCheckpointEntity).properties).filter(
+    (name) => name !== 'input',
+  );
+}
+
+async function selectCheckpointRows(
+  em: EntityManager,
+  where: Record<string, unknown>,
+  fields?: string[],
+): Promise<StepCheckpointEntity[]> {
+  const query = (em as SqlEm).createQueryBuilder<StepCheckpointEntity>(StepCheckpointEntity);
+  if (fields) query.select(fields);
+  const rows = await query
+    .where(where)
+    .orderBy({ seq: 'asc' })
+    .execute<Record<string, unknown>[]>('all', true);
+  // The mapping renames columns and parses dates; a custom type (JSON) is converted here, as
+  // hydrating an entity would, since some drivers (SQLite) hand it over as text.
+  const platform = em.getPlatform();
+  const custom = Object.values(em.getMetadata().get(StepCheckpointEntity).properties).filter(
+    (prop) => prop.customType,
+  );
+  for (const row of rows) {
+    for (const prop of custom) {
+      const value = row[prop.name];
+      if (value != null) row[prop.name] = prop.customType?.convertToJSValue(value, platform);
+    }
+  }
+  return rows as unknown as StepCheckpointEntity[];
+}
+
+/** The checkpoint columns a step's result writes (see `settleCheckpointsIfPending`). */
+const SETTLED_FIELDS = ['status', 'output', 'error', 'events', 'startedAt', 'finishedAt'] as const;
+
+const checkpointKey = (runId: string, seq: number) => `${runId}\u0000${seq}`;
+
+/**
+ * Lock the rows of `entries` that are still `pending` (`SELECT … FOR UPDATE`, in chunks), reading
+ * `fields` of each, keyed by {@link checkpointKey}.
+ */
+async function lockPendingCheckpoints(
+  em: EntityManager,
+  entries: { runId: string; seq: number }[],
+  fields: (keyof StepCheckpointEntity & string)[],
+): Promise<Map<string, StepCheckpointEntity>> {
+  const seqsByRun = new Map<string, Set<number>>();
+  for (const { runId, seq } of entries) {
+    const seqs = seqsByRun.get(runId) ?? new Set<number>();
+    seqs.add(seq);
+    seqsByRun.set(runId, seqs);
+  }
+  const pending = new Map<string, StepCheckpointEntity>();
+  for (const [runId, seqSet] of seqsByRun) {
+    const seqs = [...seqSet];
+    for (let at = 0; at < seqs.length; at += 500) {
+      const rows = await em.find(
+        StepCheckpointEntity,
+        { runId, seq: { $in: seqs.slice(at, at + 500) }, status: 'pending' },
+        {
+          fields: fields as never,
+          lockMode: LockMode.PESSIMISTIC_WRITE,
+          disableIdentityMap: true,
+        },
+      );
+      for (const row of rows) pending.set(checkpointKey(row.runId, row.seq), row);
+    }
+  }
+  return pending;
+}
+
+/**
+ * Insert-or-overwrite checkpoint rows, 500 a statement, through the query builder: the rows are not
+ * turned into managed entities, which for a 40k-step fan cost more than the inserts themselves.
+ */
+async function upsertCheckpointRows(
+  em: EntityManager,
+  rows: StepCheckpointEntity[],
+): Promise<void> {
+  for (let at = 0; at < rows.length; at += 500) {
+    await (em as SqlEm)
+      .createQueryBuilder<StepCheckpointEntity>(StepCheckpointEntity)
+      .insert(rows.slice(at, at + 500).map((row) => ({ ...row })))
+      .onConflict(['runId', 'seq'])
+      .merge()
+      .execute();
+  }
+}
+
 function toCheckpointRow(cp: StepCheckpoint): StepCheckpointEntity {
   const row = toCheckpointEntity(cp) as unknown as Record<string, unknown>;
   for (const key of ['workerGroup', 'parallelGroup', 'wakeAt', 'enqueuedAt']) {

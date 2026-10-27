@@ -5,6 +5,7 @@ import {
   type ScheduleRecord,
   type StateStore,
   type StepCheckpoint,
+  type StepSettlement,
   WorkflowEngine,
   type WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
@@ -43,6 +44,12 @@ export interface StateStoreContext {
    * for a wide batch, not one per row.
    */
   statements?: () => number;
+  /**
+   * Every statement the store has sent to its database so far, each as its SQL text followed by its
+   * parameters (from the driver's query log). When given, the contract checks that settling a step
+   * sends none of the step's input.
+   */
+  statementLog?: () => string[];
 }
 
 /** Builds a fresh, empty store for one test. Called once per `it` (in `beforeEach`). */
@@ -97,6 +104,19 @@ const checkpoint = (over: Partial<StepCheckpoint> = {}): StepCheckpoint => ({
 });
 
 /**
+ * The statements logged after the first `before`, once the log stops growing: a driver may report a
+ * statement a moment after the call that sent it resolved.
+ */
+async function loggedSince(log: () => string[], before: number): Promise<string[]> {
+  let seen = -1;
+  for (let i = 0; i < 50 && log().length !== seen; i += 1) {
+    seen = log().length;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return log().slice(before);
+}
+
+/**
  * The SHARED behavioral contract every `StateStore` must satisfy — in-memory and each ORM adapter
  * alike. Registered as a vitest `describe`; pass a `name` and a {@link StateStoreFactory} that builds
  * a fresh, empty store. The same assertions run against SQLite/in-memory under `pnpm test` and
@@ -115,6 +135,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     let supportsAsyncTransaction = true;
     let supportsTagFilter = true;
     let statements: (() => number) | undefined;
+    let statementLog: (() => string[]) | undefined;
     let skipReason: string | undefined;
     let loggedSkip = false;
 
@@ -127,6 +148,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         supportsAsyncTransaction = ctx.supportsAsyncTransaction ?? true;
         supportsTagFilter = ctx.supportsTagFilter ?? true;
         statements = ctx.statements;
+        statementLog = ctx.statementLog;
         skipReason = undefined;
       } catch (err) {
         // Backend unavailable (e.g. no Docker for a testcontainers spec): skip — don't fail. Unless
@@ -1046,6 +1068,23 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         ).toBeLessThanOrEqual(limit);
         expect(wrote.every((w) => w)).toBe(true);
         expect(await store.countCheckpoints?.('r1', 0, n - 1, ['completed'])).toBe(n);
+        if (!store.settleCheckpointsIfPending) return;
+        await store.saveCheckpoints?.(rows.map((row) => ({ ...row, seq: row.seq + n })));
+        const settlements = rows.map((row) => ({
+          runId: 'r1',
+          seq: row.seq + n,
+          status: 'completed' as const,
+          output: { seq: row.seq },
+          startedAt: row.startedAt,
+          finishedAt: row.finishedAt,
+        }));
+        expect(
+          await sent(async () => {
+            wrote = (await store.settleCheckpointsIfPending?.(settlements)) ?? [];
+          }),
+        ).toBeLessThanOrEqual(limit);
+        expect(wrote.every((w) => w)).toBe(true);
+        expect(await store.countCheckpoints?.('r1', n, 2 * n - 1, ['completed'])).toBe(n);
       },
     );
 
@@ -1065,6 +1104,301 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.countCheckpoints?.('r1', 0, n - 1, ['completed'])).toBe(n);
       expect((await store.getCheckpoint('r1', n - 1))?.output).toEqual({ seq: n - 1 });
     });
+
+    t('settleCheckpointsIfPending writes only what a result changes, row by row', async () => {
+      // Optional on the interface (the engine falls back to saveCheckpointsIfPending with the whole
+      // rows), but a conformant store MUST provide it — assert presence, then exercise it.
+      expect(store.settleCheckpointsIfPending).toBeDefined();
+      if (!store.settleCheckpointsIfPending) return;
+      expect(await store.settleCheckpointsIfPending([])).toEqual([]);
+      await store.createRun(run());
+      await store.createRun(run({ id: 'r2' }));
+      const pending = (runId: string, seq: number) =>
+        checkpoint({
+          runId,
+          seq,
+          name: 'ask',
+          kind: 'remote',
+          stepId: `${runId}:${seq}`,
+          status: 'pending',
+          input: { prompt: `p${seq}` },
+          output: undefined,
+          attempts: 2,
+          workerGroup: 'llm',
+          parallelGroup: 'all:0:2',
+          wakeAt: 5_000,
+        });
+      for (const seq of [0, 1, 2, 3]) await store.saveCheckpoint(pending('r1', seq));
+      await store.saveCheckpoint(pending('r2', 0));
+      await store.saveCheckpoint({
+        ...pending('r1', 1),
+        status: 'completed',
+        output: { first: 1 },
+      });
+      const later = new Date(at.getTime() + 60_000);
+      const done = (runId: string, seq: number, output: unknown): StepSettlement => ({
+        runId,
+        seq,
+        status: 'completed',
+        output,
+        startedAt: new Date(at.getTime() + 1_000),
+        finishedAt: later,
+      });
+
+      const wrote = await store.settleCheckpointsIfPending([
+        done('r1', 0, { n: 0 }),
+        // Already settled: refused.
+        done('r1', 1, { n: 1 }),
+        // A second settlement of the same row: the first one settled it, so refused.
+        done('r1', 0, { n: 'dup' }),
+        {
+          runId: 'r1',
+          seq: 2,
+          status: 'failed',
+          error: { message: 'boom' },
+          events: [{ at: 7, level: 'error', message: 'boom' }],
+          startedAt: at,
+          finishedAt: later,
+        },
+        // No such row: nothing is written.
+        done('r1', 9, { n: 9 }),
+        // Another run's row, same seq as one above.
+        done('r2', 0, { n: 'r2' }),
+      ]);
+      expect(wrote).toEqual([true, false, false, true, false, true]);
+
+      const r1 = await store.listCheckpoints('r1');
+      expect(r1.map((c) => [c.seq, c.status, c.output])).toEqual([
+        [0, 'completed', { n: 0 }],
+        [1, 'completed', { first: 1 }],
+        [2, 'failed', undefined],
+        [3, 'pending', undefined],
+      ]);
+      const [first, , failed] = r1;
+      // What a result does not change stays as stored.
+      expect(first?.input).toEqual({ prompt: 'p0' });
+      expect(first?.name).toBe('ask');
+      expect(first?.kind).toBe('remote');
+      expect(first?.stepId).toBe('r1:0');
+      expect(first?.attempts).toBe(2);
+      expect(first?.workerGroup).toBe('llm');
+      expect(first?.parallelGroup).toBe('all:0:2');
+      expect(first?.wakeAt).toBe(5_000);
+      expect(first?.enqueuedAt.getTime()).toBe(at.getTime());
+      expect(first?.startedAt.getTime()).toBe(at.getTime() + 1_000);
+      expect(first?.finishedAt.getTime()).toBe(later.getTime());
+      expect(first?.error).toBeUndefined();
+      expect(failed?.input).toEqual({ prompt: 'p2' });
+      expect(failed?.error).toEqual({ message: 'boom' });
+      expect(failed?.events).toEqual([{ at: 7, level: 'error', message: 'boom' }]);
+      expect(await store.getCheckpoint('r1', 9)).toBeNull();
+      expect((await store.getCheckpoint('r2', 0))?.output).toEqual({ n: 'r2' });
+      expect((await store.getCheckpoint('r2', 0))?.input).toEqual({ prompt: 'p0' });
+    });
+
+    t('settleCheckpointsIfPending sends none of the input of the steps it settles', async () => {
+      if (!statementLog || !store.settleCheckpointsIfPending) return;
+      await store.createRun(run());
+      const prompt = `prompt-${'x'.repeat(100_000)}`;
+      for (const seq of [0, 1]) {
+        await store.saveCheckpoint(
+          checkpoint({
+            seq,
+            kind: 'remote',
+            stepId: `r1:${seq}`,
+            status: 'pending',
+            input: { prompt },
+            output: undefined,
+          }),
+        );
+      }
+      const before = statementLog().length;
+      const settle = (seqs: number[]) =>
+        store.settleCheckpointsIfPending?.(
+          seqs.map((seq) => ({
+            runId: 'r1',
+            seq,
+            status: 'completed' as const,
+            output: { answer: seq },
+            startedAt: at,
+            finishedAt: at,
+          })),
+        );
+      expect(await settle([0])).toEqual([true]);
+      expect(await settle([1, 0])).toEqual([true, false]);
+      const sent = await loggedSince(statementLog, before);
+      expect(sent.length).toBeGreaterThan(0);
+      expect(sent.some((statement) => statement.includes('xxxxxxxxxx'))).toBe(false);
+      expect(sent.join('').length).toBeLessThan(20_000);
+      expect((await store.getCheckpoint('r1', 1))?.input).toEqual({ prompt });
+    });
+
+    t('getCheckpointsForSettle reads getCheckpoints rows without their input', async () => {
+      // Optional on the interface (the engine falls back to getCheckpoints), but a conformant store
+      // MUST provide it — assert presence, then exercise it.
+      expect(store.getCheckpointsForSettle).toBeDefined();
+      if (!store.getCheckpointsForSettle) return;
+      expect(await store.getCheckpointsForSettle('r1', [])).toEqual([]);
+      await store.createRun(run());
+      for (const seq of [0, 1, 2]) {
+        await store.saveCheckpoint(
+          checkpoint({
+            seq,
+            kind: 'remote',
+            stepId: `r1:${seq}`,
+            status: seq === 0 ? 'completed' : 'pending',
+            input: { prompt: `p${seq}` },
+            output: seq === 0 ? { answer: 0 } : undefined,
+            events: [{ at: seq, level: 'info', message: `m${seq}` }],
+            workerGroup: 'llm',
+            parallelGroup: 'all:0:3',
+            wakeAt: 5_000 + seq,
+          }),
+        );
+      }
+      const full = await store.getCheckpoints?.('r1', [2, 0, 9]);
+      const read = await store.getCheckpointsForSettle('r1', [2, 0, 9]);
+      expect(read.map((c) => c.seq)).toEqual([0, 2]);
+      expect(read.map((c) => c.input)).toEqual([undefined, undefined]);
+      const withoutInput = ({ input: _input, ...rest }: StepCheckpoint) => rest;
+      expect(read.map(withoutInput)).toEqual((full ?? []).map(withoutInput));
+      expect((await store.getCheckpoint('r1', 2))?.input).toEqual({ prompt: 'p2' });
+    });
+
+    t('getCheckpointsForSettle reads no input column', async () => {
+      if (!statementLog || !store.getCheckpointsForSettle) return;
+      await store.createRun(run());
+      for (const seq of [0, 1]) {
+        await store.saveCheckpoint(
+          checkpoint({
+            seq,
+            kind: 'remote',
+            stepId: `r1:${seq}`,
+            status: 'pending',
+            input: { prompt: 'x'.repeat(100_000) },
+            output: undefined,
+          }),
+        );
+      }
+      const before = statementLog().length;
+      const read = await store.getCheckpointsForSettle('r1', [0, 1]);
+      const sent = await loggedSince(statementLog, before);
+      expect(read).toHaveLength(2);
+      expect(sent.length).toBeGreaterThan(0);
+      // Neither the input column nor every column (`*`) is selected.
+      expect(sent.filter((statement) => /\binput\b|\*\s+from/i.test(statement))).toEqual([]);
+    });
+
+    t('settleCheckpointsIfPending settles a wide batch', async () => {
+      if (!store.settleCheckpointsIfPending) return;
+      await store.createRun(run());
+      const n = 600;
+      const rows = Array.from({ length: n }, (_, seq) =>
+        checkpoint({
+          seq,
+          stepId: `r1:${seq}`,
+          status: 'pending',
+          input: { seq },
+          output: undefined,
+        }),
+      );
+      if (store.saveCheckpoints) await store.saveCheckpoints(rows);
+      else for (const row of rows) await store.saveCheckpoint(row);
+      const wrote = await store.settleCheckpointsIfPending(
+        rows.map((row) => ({
+          runId: row.runId,
+          seq: row.seq,
+          status: 'completed' as const,
+          output: { seq: row.seq },
+          startedAt: at,
+          finishedAt: at,
+        })),
+      );
+      expect(wrote).toHaveLength(n);
+      expect(wrote.every((w) => w === true)).toBe(true);
+      expect(await store.countCheckpoints?.('r1', 0, n - 1, ['completed'])).toBe(n);
+      const last = await store.getCheckpoint('r1', n - 1);
+      expect(last?.output).toEqual({ seq: n - 1 });
+      expect(last?.input).toEqual({ seq: n - 1 });
+    });
+
+    t(
+      'listCheckpointsForReplay lists every checkpoint, a completed one without its input',
+      async () => {
+        // Optional on the interface (the engine falls back to listCheckpoints), but a conformant store
+        // MUST provide it — assert presence, then exercise it.
+        expect(store.listCheckpointsForReplay).toBeDefined();
+        if (!store.listCheckpointsForReplay) return;
+        await store.createRun(run());
+        await store.createRun(run({ id: 'r2' }));
+        const remote = (seq: number, over: Partial<StepCheckpoint>) =>
+          checkpoint({
+            seq,
+            name: `ask-${seq}`,
+            kind: 'remote',
+            stepId: `r1:${seq}`,
+            input: { prompt: `p${seq}` },
+            workerGroup: 'llm',
+            ...over,
+          });
+        await store.saveCheckpoint(remote(0, { output: { answer: 0 } }));
+        await store.saveCheckpoint(
+          remote(1, { status: 'pending', output: undefined, wakeAt: 9_000 }),
+        );
+        await store.saveCheckpoint(
+          remote(2, { status: 'failed', output: undefined, error: { message: 'boom' } }),
+        );
+        await store.saveCheckpoint(checkpoint({ seq: 3, stepId: 'r1:3', status: 'running' }));
+        await store.saveCheckpoint(remote(4, { output: { answer: 4 }, parallelGroup: 'all:4:1' }));
+        await store.saveCheckpoint(
+          checkpoint({ runId: 'r2', stepId: 'r2:0', input: { other: true } }),
+        );
+
+        const full = await store.listCheckpoints('r1');
+        const replay = await store.listCheckpointsForReplay('r1');
+        expect(replay.map((c) => c.seq)).toEqual([0, 1, 2, 3, 4]);
+        expect(replay.map((c) => c.input)).toEqual([
+          undefined,
+          { prompt: 'p1' },
+          { prompt: 'p2' },
+          undefined,
+          undefined,
+        ]);
+        // Everything else is what listCheckpoints reads.
+        const withoutInput = ({ input: _input, ...rest }: StepCheckpoint) => rest;
+        expect(replay.map(withoutInput)).toEqual(full.map(withoutInput));
+        // The full read still has the completed steps' inputs.
+        expect(full[0]?.input).toEqual({ prompt: 'p0' });
+        expect((await store.getCheckpoint('r1', 4))?.input).toEqual({ prompt: 'p4' });
+        expect(await store.listCheckpointsForReplay('missing')).toEqual([]);
+      },
+    );
+
+    t(
+      'listCheckpointsForReplay reads no input column for a run whose steps completed',
+      async () => {
+        if (!statementLog || !store.listCheckpointsForReplay) return;
+        await store.createRun(run());
+        for (const seq of [0, 1]) {
+          await store.saveCheckpoint(
+            checkpoint({
+              seq,
+              kind: 'remote',
+              stepId: `r1:${seq}`,
+              input: { prompt: 'x'.repeat(100_000) },
+              output: { answer: seq },
+            }),
+          );
+        }
+        const before = statementLog().length;
+        const replay = await store.listCheckpointsForReplay('r1');
+        const sent = await loggedSince(statementLog, before);
+        expect(replay.map((c) => c.output)).toEqual([{ answer: 0 }, { answer: 1 }]);
+        expect(sent.length).toBeGreaterThan(0);
+        // Neither the input column nor every column (`*`) is selected.
+        expect(sent.filter((statement) => /\binput\b|\*\s+from/i.test(statement))).toEqual([]);
+      },
+    );
 
     t(
       'upserts checkpoints, reads them by (runId, seq), and lists them ordered by seq',

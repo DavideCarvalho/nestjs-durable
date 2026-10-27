@@ -22,7 +22,9 @@ const lines = (n: number) => Array.from({ length: n }, (_, i) => ({ i }));
 const RESULT_PATH = [
   'getCheckpoint',
   'getCheckpoints',
+  'getCheckpointsForSettle',
   'getRun',
+  'settleCheckpointsIfPending',
   'saveCheckpointsIfPending',
   'saveCheckpointIfPending',
   'countCheckpoints',
@@ -111,7 +113,9 @@ function counted(inner: StateStore, counts: Counts): StateStore {
       return (...args: unknown[]) => {
         const name = String(prop);
         counts.calls.set(name, (counts.calls.get(name) ?? 0) + 1);
-        if (name === 'saveCheckpointsIfPending') counts.batches.push((args[0] as unknown[]).length);
+        if (name === 'settleCheckpointsIfPending' || name === 'saveCheckpointsIfPending') {
+          counts.batches.push((args[0] as unknown[]).length);
+        }
         if (name === 'saveCheckpointIfPending') counts.batches.push(1);
         // A round-trip: the call answers on a later turn of the event loop, as a database does.
         return new Promise((r) => setImmediate(r)).then(() => value.apply(target, args));
@@ -142,7 +146,10 @@ async function fan(opts: {
   noBulkSend?: boolean;
 }) {
   const inner = new InMemoryStateStore();
-  if (opts.noBatchedRead) Object.defineProperty(inner, 'getCheckpoints', { value: undefined });
+  if (opts.noBatchedRead) {
+    Object.defineProperty(inner, 'getCheckpoints', { value: undefined });
+    Object.defineProperty(inner, 'getCheckpointsForSettle', { value: undefined });
+  }
   if (opts.noBulkSend) Object.defineProperty(inner, 'saveCheckpoints', { value: undefined });
   Consumer.calls = { one: 0, many: 0 };
   const broker = new Broker();

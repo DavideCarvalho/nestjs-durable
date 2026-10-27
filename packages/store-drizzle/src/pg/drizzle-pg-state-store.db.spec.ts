@@ -108,9 +108,11 @@ for (const driver of ['node-postgres', 'postgres-js'] as const) {
   describe(`Drizzle Postgres (${driver}) [real engine]`, () => {
     runStateStoreContract(`Drizzle Postgres (${driver})`, async (): Promise<StateStoreContext> => {
       let statements = 0;
+      const log: string[] = [];
       const logger = {
-        logQuery: () => {
+        logQuery: (query: string, params: unknown[]) => {
           statements += 1;
+          log.push(`${query} ${JSON.stringify(params)}`);
         },
       };
       liveDb(driver);
@@ -127,6 +129,7 @@ for (const driver of ['node-postgres', 'postgres-js'] as const) {
           liveDb(driver === 'node-postgres' ? 'postgres-js' : 'node-postgres'),
         ),
         statements: () => statements,
+        statementLog: () => log,
         cleanup: truncate,
       };
     });

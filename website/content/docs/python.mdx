@@ -133,7 +133,8 @@ Use `redis://` for plaintext and `rediss://` for TLS. This is the same Redis the
 ## Concurrency and memory
 
 `concurrency` takes a fixed `int`, the string `"adaptive"`, or a dict of overrides. An adaptive worker
-tunes its own limit from a latency gradient and, since `durable-worker` 0.25, protects itself from
+tunes its own limit from a latency gradient (the same decisions as the Node controller — see
+[Flow control](/docs/reliability/flow-control#worker--transport-concurrency)) and, since `durable-worker` 0.25, protects itself from
 OOM with a **memory admission gate**: before each step starts, the worker asks whether there is room
 for one more right now and **waits** rather than starting a step it cannot fit.
 

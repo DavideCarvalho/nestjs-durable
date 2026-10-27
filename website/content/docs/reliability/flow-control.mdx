@@ -204,7 +204,21 @@ const transport = new BullMQTransport({
 The adaptive controller (`AdaptiveController` in `@dudousxd/durable-worker`) runs an AIMD gradient loop
 on a `tickMs` interval (default 2000): it grows the limit when there's headroom, shrinks it when latency
 shows queuing or errors spike (`backpressure`), and hard-brakes on RAM (`ramCeilingPct`, default 85%) or,
-if configured, CPU (`cpuCeilingPct`). Every adjustment is recorded as a `WorkerAdjust` — `{ at, from, to,
+if configured, CPU (`cpuCeilingPct`).
+
+- **Queuing signal.** The baseline is the window's fastest step completion (smoothed). The p50 of the
+  last 100 step completions may reach twice that baseline plus 5 ms before it counts as queuing, so the
+  jitter of 1–5 ms steps does not shrink the limit. Past that, the limit shrinks in proportion to how far
+  p50 has risen. Durations are timed with `performance.now()`, at sub-millisecond resolution.
+- **Growth.** The limit grows only while the worker is saturated (in-flight at 80% of the limit or
+  more). Until the first time the controller backs off, each growth doubles the limit (slow start), and
+  growth is re-decided after every limit's worth of settled steps as well as on the tick, so a worker of
+  fast steps reaches its level within a few dozen steps instead of a few ticks. After the first back-off
+  it grows by ⌊√limit⌋ per tick. Shrinking and the brakes are only decided on the tick.
+- **Workflow turns** count as progress for stall detection but never enter the latency window: a turn
+  suspends rather than blocks, so its duration says nothing about load.
+
+The Python `durable-worker` controller (0.26.2 and later) makes the same decisions. Every adjustment is recorded as a `WorkerAdjust` — `{ at, from, to,
 reason }` — so a dashboard can show *why* the limit moved, not just that it did. Tunables:
 
 - `min` / `max` — the floor and ceiling the controller won't cross. Defaults `1` / `32`.

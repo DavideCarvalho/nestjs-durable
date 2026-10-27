@@ -64,7 +64,9 @@ function counted(inner: StateStore, counts: Counts): StateStore {
       return (...args: unknown[]) => {
         const name = String(prop);
         counts.calls.set(name, (counts.calls.get(name) ?? 0) + 1);
-        if (name === 'saveCheckpointsIfPending') counts.batches.push((args[0] as unknown[]).length);
+        if (name === 'settleCheckpointsIfPending' || name === 'saveCheckpointsIfPending') {
+          counts.batches.push((args[0] as unknown[]).length);
+        }
         if (name === 'saveCheckpointIfPending') counts.batches.push(1);
         return new Promise((resolve) => setImmediate(resolve)).then(() =>
           value.apply(target, args),

@@ -114,6 +114,14 @@ DurableModule.forRootAsync({
 Each store operation runs on a forked `EntityManager`, so it owns its own unit of work and won't
 interfere with request-scoped EMs.
 
+Step checkpoints (`listCheckpoints`, `listCheckpointsForReplay`, `getCheckpoints`, `saveCheckpoints`,
+`saveCheckpointsIfPending`, `settleCheckpointsIfPending`)
+go through the query builder rather than managed entities: rows are mapped to entity properties with
+the same type conversions as `em.find`, but never hydrated into the identity map, and upserts are
+`insert().onConflict().merge()`, 500 rows a statement. A wide fan's checkpoints are tens of thousands
+of rows, and hydrating them cost several times the query; 40,000 rows read in about 0.14 s. Entity
+lifecycle hooks and `EventSubscriber`s on `StepCheckpointEntity` therefore don't fire for these calls.
+
 ## Tenant-scoped reads with `withScope`
 
 `MikroOrmStateStore` is the only bundled adapter that implements `withScope(scope)` — derive a store

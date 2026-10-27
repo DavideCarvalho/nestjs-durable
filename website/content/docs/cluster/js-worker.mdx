@@ -158,7 +158,8 @@ await runRedisWorker({
 
 Pass the bare string `'adaptive'` for all-defaults (`min: 1`, `max: 32`, RAM ceiling 85%, 2s tick).
 The `AdaptiveController` grows the limit while latency is flat and the worker is saturated, and shrinks
-it under a latency gradient, an error rate, a stall, or a RAM/CPU ceiling — a single AIMD loop. A live
+it under a latency gradient, an error rate, a stall, or a RAM/CPU ceiling — a single AIMD loop (how it
+decides: [Flow control](/docs/reliability/flow-control#worker--transport-concurrency)). A live
 status snapshot (in-flight, RSS, CPU, throughput, p95) rides the worker heartbeat in **both** modes, so the
 [dashboard](/docs/observability/dashboard) shows per-worker load even for a fixed worker. A fixed worker
 runs no control loop. Throughput covers the trailing minute and reads 0 on an idle worker.

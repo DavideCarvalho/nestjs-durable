@@ -93,6 +93,7 @@ import type {
   StepInvocation,
   StepKind,
   StepResult,
+  StepSettlement,
   StepUndo,
   Transport,
   UpdateResult,
@@ -356,6 +357,8 @@ const versionKey = (name: string, version: string): string => `${name}@${version
  */
 /** How many checkpoint writes / dispatches a step fan sends at once. */
 const STEP_FAN_CHUNK = 200;
+/** Most seqs of a step fan one {@link StateStore.getCheckpoints} call re-reads. */
+const FAN_REREAD_CHUNK = 1000;
 
 /** Tries, and the first backoff, for telling a parent that its child finished (see `deliverToParent`). */
 const PARENT_NOTIFY_ATTEMPTS = 4;
@@ -3652,8 +3655,7 @@ export class WorkflowEngine {
    */
   private async redriveSettledSteps(runId: string, seqs: Set<number>): Promise<void> {
     for (const seq of seqs) {
-      const cp = await this.store.getCheckpoint(runId, seq);
-      if (cp && (cp.status === 'completed' || cp.status === 'failed')) {
+      if (await this.stepSettled(runId, seq)) {
         // Settled on this instance: its own resume drives the run. Re-driving would replay the
         // body once more, and a workflow body with effects between steps is not free to replay.
         if (this.settledHere.has(`${runId}:${seq}`)) return;
@@ -3673,6 +3675,15 @@ export class WorkflowEngine {
         return;
       }
     }
+  }
+
+  /** Whether the step at `seq` is settled: a `COUNT` when the store has one, else its checkpoint. */
+  private async stepSettled(runId: string, seq: number): Promise<boolean> {
+    if (this.store.countCheckpoints) {
+      return (await this.store.countCheckpoints(runId, seq, seq, ['completed', 'failed'])) > 0;
+    }
+    const cp = await this.store.getCheckpoint(runId, seq);
+    return cp?.status === 'completed' || cp?.status === 'failed';
   }
 
   /**
@@ -5316,7 +5327,7 @@ export class WorkflowEngine {
     );
     if (wfPlan?.status === 'blocked') return this.parkBlocked(run, wfPlan);
 
-    const checkpoints = await this.store.listCheckpoints(run.id);
+    const checkpoints = await this.replayCheckpoints(run.id);
     await this.deliverFinishedChildren(run.id, checkpoints);
     await this.deliverFinishedChildWaiters(run.id, checkpoints);
     const handoff = liveHandoff(run.id, checkpoints);
@@ -5663,6 +5674,40 @@ export class WorkflowEngine {
   private readonly stepLeaseRearms = new Map<string, number>();
 
   /**
+   * {@link stepLeaseRearms} for the steps of a fan this instance sent, by run: one entry per sent
+   * block of consecutive seqs instead of one per step, since they share the lease stamped at send.
+   */
+  private readonly fanLeaseRearms = new Map<
+    string,
+    Array<{ from: number; to: number; lookAgainAt: number }>
+  >();
+
+  private noteFanLease(runId: string, seqs: number[], lease: number): void {
+    if (this.remoteRedispatchMs == null || seqs.length === 0) return;
+    let from = seqs[0] as number;
+    let to = from;
+    for (const seq of seqs) {
+      if (seq < from) from = seq;
+      if (seq > to) to = seq;
+    }
+    // A gap would cover steps sent earlier, under an older lease.
+    if (to - from + 1 !== seqs.length) return;
+    if (this.fanLeaseRearms.size > 1024) this.fanLeaseRearms.clear();
+    const blocks = this.fanLeaseRearms.get(runId) ?? [];
+    blocks.push({ from, to, lookAgainAt: lease - Math.ceil(this.remoteRedispatchMs / 2) });
+    this.fanLeaseRearms.set(runId, blocks);
+  }
+
+  private fanLeaseLookAgainAt(runId: string, seq: number, now: number): number | undefined {
+    const blocks = this.fanLeaseRearms.get(runId);
+    if (!blocks) return undefined;
+    const live = blocks.filter((b) => now < b.lookAgainAt);
+    if (live.length === 0) this.fanLeaseRearms.delete(runId);
+    else if (live.length < blocks.length) this.fanLeaseRearms.set(runId, live);
+    return live.find((b) => seq >= b.from && seq <= b.to)?.lookAgainAt;
+  }
+
+  /**
    * A step-scoped heartbeat for a durably-suspended remote step: push its LEASE forward so a worker
    * that is still working on it is never presumed dead and double-dispatched. The durable counterpart
    * of {@link callRemoteInMemory}'s in-memory `heartbeatResets` rearm (which only exists on the
@@ -5691,7 +5736,7 @@ export class WorkflowEngine {
     if (this.remoteRedispatchMs == null) return;
     const id = stepId(runId, seq);
     const now = this.clock();
-    const lookAgainAt = this.stepLeaseRearms.get(id);
+    const lookAgainAt = this.stepLeaseRearms.get(id) ?? this.fanLeaseLookAgainAt(runId, seq, now);
     if (lookAgainAt !== undefined && now < lookAgainAt) return;
     // EVERY store call below is swallowed, reads AND writes: this runs inside the transport's beat
     // handler, which delivers beats serially and does not catch — a throwing rearm would take the whole
@@ -6110,7 +6155,7 @@ export class WorkflowEngine {
     // Read once at execution start: a checkpoint written AFTER this snapshot (the signal/timer/child
     // this resume wakes on, or one written later in this same execution) is absent from the map, and
     // the ctx falls back to the live store for any absent seq — so replay semantics are unchanged.
-    const snapshot = await this.store.listCheckpoints(run.id);
+    const snapshot = await this.replayCheckpoints(run.id);
     await this.deliverFinishedChildren(run.id, snapshot);
     const replay = new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
@@ -6483,7 +6528,15 @@ export class WorkflowEngine {
           namespace: parentNamespace,
         }),
       callRemoteAll: (runId, positions, step, inputs, opts) =>
-        this.callRemoteAll(runId, positions, step, inputs, opts, { namespace: parentNamespace }),
+        this.callRemoteAll(
+          runId,
+          positions,
+          step,
+          inputs,
+          opts,
+          { namespace: parentNamespace },
+          replay,
+        ),
       // Defer so a fast child can't reentrantly resume a still-running parent. Stamp the child with
       // the PARENT run's namespace (not this engine's) so a child belongs to the tenant/partition of
       // the run it was spawned from — even when an operator (namespace: undefined, drives every
@@ -6941,6 +6994,7 @@ export class WorkflowEngine {
       settle?: boolean | undefined;
     },
     routing?: { namespace?: string | undefined },
+    replay?: Map<number, StepCheckpoint>,
   ): Promise<TOutput[] | Settled<TOutput>[]> {
     if (step.timeoutMs) {
       throw new Error(
@@ -6957,10 +7011,7 @@ export class WorkflowEngine {
     const first = positions[0] as number;
     const last = positions[positions.length - 1] as number;
     const group = stepFanGroup(first, positions.length, opts.mode);
-    const bySeq = new Map<number, StepCheckpoint>();
-    for (const cp of await this.store.listCheckpoints(runId)) {
-      if (cp.seq >= first && cp.seq <= last) bySeq.set(cp.seq, cp);
-    }
+    const bySeq = await this.fanCheckpoints(runId, positions, replay);
 
     const outputs: TOutput[] = new Array(inputs.length);
     const failures: GatherItemFailure[] = [];
@@ -7033,8 +7084,22 @@ export class WorkflowEngine {
         : opts.concurrency === undefined
           ? unsent
           : unsent.slice(0, opts.concurrency);
-    if (batch.length > 0)
-      await this.sendStepFan(runId, positions, step, inputs, batch, group, opts, routing);
+    if (batch.length > 0) {
+      const lease = await this.sendStepFan(
+        runId,
+        positions,
+        step,
+        inputs,
+        batch,
+        group,
+        opts,
+        routing,
+      );
+      if (lease !== undefined) {
+        const at = this.stepLeaseWakeAt(lease);
+        wakeAt = Math.min(wakeAt ?? at, at);
+      }
+    }
 
     if (inFlight + batch.length > 0) {
       this.awaitedStepFans.get(runId)?.push({ from: first, to: last });
@@ -7055,6 +7120,39 @@ export class WorkflowEngine {
   }
 
   /**
+   * The checkpoints of a step fan's seqs, by seq. A settled one is taken from the turn's snapshot
+   * (`replay`), since nothing but a turn of the run changes it once settled; one the snapshot holds
+   * `pending`, or does not hold, is read again, as {@link callRemote} does for a single step: its
+   * result may have landed since. The fan's last turn so reads nothing it already read.
+   */
+  private async fanCheckpoints(
+    runId: string,
+    positions: number[],
+    replay: Map<number, StepCheckpoint> | undefined,
+  ): Promise<Map<number, StepCheckpoint>> {
+    const bySeq = new Map<number, StepCheckpoint>();
+    const reread: number[] = [];
+    for (const seq of positions) {
+      const cp = replay?.get(seq);
+      if (cp && (cp.status === 'completed' || cp.status === 'failed')) bySeq.set(seq, cp);
+      else reread.push(seq);
+    }
+    if (reread.length === 0) return bySeq;
+    if (reread.length === positions.length || !this.store.getCheckpoints) {
+      const wanted = new Set(reread);
+      for (const cp of await this.store.listCheckpoints(runId)) {
+        if (wanted.has(cp.seq)) bySeq.set(cp.seq, cp);
+      }
+      return bySeq;
+    }
+    for (let at = 0; at < reread.length; at += FAN_REREAD_CHUNK) {
+      const read = await this.store.getCheckpoints(runId, reread.slice(at, at + FAN_REREAD_CHUNK));
+      for (const cp of read) bySeq.set(cp.seq, cp);
+    }
+    return bySeq;
+  }
+
+  /**
    * Write the `pending` checkpoints of a step fan's new steps, then dispatch them: one
    * {@link StateStore.saveCheckpoints} call and one {@link TransportPool.dispatchMany} for the
    * batch, where the store and transport have them.
@@ -7071,10 +7169,12 @@ export class WorkflowEngine {
       admission?: { priority?: number | undefined; fairnessKey?: string | undefined };
     },
     routing?: { namespace?: string | undefined },
-  ): Promise<void> {
+  ): Promise<number | undefined> {
     const workerGroup = stepGroup(step, routing?.namespace);
     await this.ensureRoutable(workerGroup, step.requires);
     const enqueuedAt = new Date();
+    const lease =
+      this.remoteRedispatchMs == null ? undefined : this.clock() + this.remoteRedispatchMs;
     const checkpoints = batch.map((i): StepCheckpoint => {
       const seq = positions[i] as number;
       return {
@@ -7091,6 +7191,7 @@ export class WorkflowEngine {
         enqueuedAt,
         startedAt: enqueuedAt,
         finishedAt: enqueuedAt,
+        ...(lease !== undefined ? { wakeAt: lease } : {}),
       };
     });
     if (this.store.saveCheckpoints) {
@@ -7122,6 +7223,14 @@ export class WorkflowEngine {
     for (const cp of checkpoints) {
       this.emit({ type: 'step.started', runId, seq: cp.seq, name: step.name, kind: 'remote' });
     }
+    if (lease !== undefined) {
+      this.noteFanLease(
+        runId,
+        checkpoints.map((cp) => cp.seq),
+        lease,
+      );
+    }
+    return lease;
   }
 
   /** Remember a step settled here, forgetting entries older than a lease so the map stays small. */
@@ -7129,14 +7238,29 @@ export class WorkflowEngine {
     this.noteRecent(this.settledHere, key);
   }
 
-  /** Record `key` in a "happened here recently" map, pruning entries older than a lease. */
+  /**
+   * Record `key` in a "happened here recently" map and drop the entries older than a lease. A key is
+   * re-inserted at the end, so the map stays in the order its keys were noted and the stale ones are
+   * all at its front: pruning stops at the first fresh entry instead of walking the whole map.
+   */
   private noteRecent(map: Map<string, number>, key: string): void {
     const now = this.clock();
+    map.delete(key);
     map.set(key, now);
-    if (map.size < 1024) return;
     for (const [k, at] of map) {
-      if (now - at > this.leaseMs) map.delete(k);
+      if (now - at <= this.leaseMs) break;
+      map.delete(k);
     }
+  }
+
+  /**
+   * The run's checkpoints as a turn replays them: {@link StateStore.listCheckpointsForReplay} when
+   * the store has it (no input on a completed row), else {@link StateStore.listCheckpoints}.
+   */
+  private replayCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+    return this.store.listCheckpointsForReplay
+      ? this.store.listCheckpointsForReplay(runId)
+      : this.store.listCheckpoints(runId);
   }
 
   /** {@link StateStore.saveCheckpointIfPending}, or a plain save on a store without it. */
@@ -7170,6 +7294,35 @@ export class WorkflowEngine {
   }
 
   /**
+   * Settle steps of one run at distinct seqs from their results ({@link StepSettlement}s, `settled[i]`
+   * being the `pending` row `settlements[i]` settles): one
+   * {@link StateStore.settleCheckpointsIfPending} call when the store has it, which writes only what
+   * a result changes, else the whole rows through {@link savePendingCheckpoints}. Never rejects as a
+   * whole, the same way.
+   */
+  private async settlePendingCheckpoints(
+    settlements: StepSettlement[],
+    settled: StepCheckpoint[],
+  ): Promise<(boolean | { error: unknown })[]> {
+    const settle = this.store.settleCheckpointsIfPending?.bind(this.store);
+    if (!settle) {
+      return this.savePendingCheckpoints(
+        settlements.map((s, i) => ({ ...(settled[i] as StepCheckpoint), ...s })),
+      );
+    }
+    if (settlements.length > 1) {
+      try {
+        const wrote = await settle(settlements);
+        return settlements.map((_, i) => wrote[i] === true);
+      } catch {
+        // Fall through: one bad row must not fail the whole batch.
+      }
+    }
+    const one = await Promise.allSettled(settlements.map((s) => settle([s])));
+    return one.map((s) => (s.status === 'fulfilled' ? s.value[0] === true : { error: s.reason }));
+  }
+
+  /**
    * The checkpoints of one run at distinct `seqs`, each as its own outcome: one
    * {@link StateStore.getCheckpoints} call when the store has it, else one read each. The batch
    * call rejecting falls back to one read each, so a failing read fails only its own entry.
@@ -7178,6 +7331,23 @@ export class WorkflowEngine {
     runId: string,
     seqs: number[],
   ): Promise<PromiseSettledResult<StepCheckpoint | null>[]> {
+    // Without the column-wise settle, the settle writes the rows it read back whole.
+    const forSettle = this.store.settleCheckpointsIfPending
+      ? this.store.getCheckpointsForSettle?.bind(this.store)
+      : undefined;
+    if (forSettle) {
+      if (seqs.length > 1) {
+        try {
+          const bySeq = new Map((await forSettle(runId, seqs)).map((cp) => [cp.seq, cp]));
+          return seqs.map((seq) => ({ status: 'fulfilled', value: bySeq.get(seq) ?? null }));
+        } catch {
+          // Fall through: read them one by one.
+        }
+      }
+      return Promise.allSettled(
+        seqs.map(async (seq) => (await forSettle(runId, [seq]))[0] ?? null),
+      );
+    }
     if (seqs.length > 1 && this.store.getCheckpoints) {
       try {
         const bySeq = new Map(
@@ -7346,10 +7516,11 @@ export class WorkflowEngine {
     const run = await this.store.getRun(runId);
     if (run && (run.status === 'cancelled' || run.status === 'completed')) return outcomes;
     const finishedAt = new Date();
-    const writes = pending.map(({ index, cp }) => {
+    const settlements = pending.map(({ index, cp }): StepSettlement => {
       const result = results[index] as StepResult;
       return {
-        ...cp,
+        runId,
+        seq: cp.seq,
         status: result.status,
         output: result.status === 'completed' ? result.output : cp.output,
         error: result.error,
@@ -7359,7 +7530,10 @@ export class WorkflowEngine {
       };
     });
     // Claimed, not blindly written: a duplicate delivery of a result settled its step first.
-    const claims = await this.savePendingCheckpoints(writes);
+    const claims = await this.settlePendingCheckpoints(
+      settlements,
+      pending.map(({ cp }) => cp),
+    );
     const settled: { index: number; cp: StepCheckpoint; result: StepResult }[] = [];
     claims.forEach((claim, k) => {
       const { index, cp } = pending[k] as { index: number; cp: StepCheckpoint };
@@ -7367,7 +7541,8 @@ export class WorkflowEngine {
       else if (claim !== false) outcomes[index] = { error: claim.error };
     });
     for (const { cp, result } of settled) {
-      this.noteSettledHere(`${runId}:${result.seq}`);
+      // A fan's steps are re-driven by the fan's barrier, which `stepFansFiredHere` covers.
+      if (!parseStepFanGroup(cp.parallelGroup)) this.noteSettledHere(`${runId}:${result.seq}`);
       const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
       this.emit({
         type: result.status === 'completed' ? 'step.completed' : 'step.failed',

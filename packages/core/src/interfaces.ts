@@ -200,6 +200,18 @@ export interface StepCheckpoint {
   finishedAt: Date;
 }
 
+/** What a step's result changes on its checkpoint: see {@link StateStore.settleCheckpointsIfPending}. */
+export interface StepSettlement {
+  runId: string;
+  seq: number;
+  status: 'completed' | 'failed';
+  output?: unknown;
+  error?: StepError | undefined;
+  events?: StepEvent[] | undefined;
+  startedAt: Date;
+  finishedAt: Date;
+}
+
 /**
  * A structured event a step (or its worker) emits while running — a log line and/or a sub-step
  * outcome. The dashboard renders these under the step, so you can see what happened inside a step
@@ -423,6 +435,17 @@ export interface StateStore {
    */
   getCheckpoints?(runId: string, seqs: number[]): Promise<StepCheckpoint[]>;
   /**
+   * {@link getCheckpoints} as a step result's settle reads them: the same rows, each without its
+   * `input` (left out of the read, not dropped after it). A settle needs the row's status, name,
+   * group and timings, never what the step was called with, and the step being settled is the one
+   * whose input is still fresh: an LLM step's prompt was otherwise read back on every result. The
+   * engine reads through it only when the store also has {@link settleCheckpointsIfPending}, since
+   * the whole-row write it falls back to needs the input.
+   *
+   * Optional: a store that omits it gets {@link getCheckpoints}.
+   */
+  getCheckpointsForSettle?(runId: string, seqs: number[]): Promise<StepCheckpoint[]>;
+  /**
    * Persist a checkpoint and advance the run atomically. Durable semantics depend on this
    * being a single transaction; stores without transactions cannot give the strong guarantee.
    */
@@ -456,6 +479,18 @@ export interface StateStore {
    * Optional: a store that omits it gets one {@link saveCheckpointIfPending} per entry.
    */
   saveCheckpointsIfPending?(checkpoints: StepCheckpoint[]): Promise<boolean[]>;
+  /**
+   * Settle steps from their results: per entry and in input order, while the row at `(runId, seq)`
+   * is still `pending`, write the entry's `status`, `output`, `error`, `events`, `startedAt` and
+   * `finishedAt` (an absent one is stored empty) and leave every other column as it is stored;
+   * resolves whether each entry wrote. Claims like {@link saveCheckpointsIfPending}: a later entry for
+   * a row an earlier one settled loses, and a rejection writes nothing. The engine settles a batch of
+   * one run's step results through it, so a step's `input` (an LLM prompt, say) is not written again
+   * when its result lands.
+   *
+   * Optional: a store that omits it gets {@link saveCheckpointsIfPending} with the whole rows.
+   */
+  settleCheckpointsIfPending?(settlements: StepSettlement[]): Promise<boolean[]>;
 
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
@@ -709,6 +744,17 @@ export interface StateStore {
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
+  /**
+   * {@link listCheckpoints} as a turn replays it: the same rows in the same order, except that a
+   * `completed` row comes without its `input` (left out of the read, not dropped after it). Replay
+   * only needs a completed step's output; a still-open or failed step keeps its input, since a
+   * re-dispatch or a retry writes it again. The engine reads a run's replay snapshot through it on
+   * every turn, where re-reading every finished step's input would make each turn cost the size of
+   * the whole history.
+   *
+   * Optional: a store that omits it gets {@link listCheckpoints}.
+   */
+  listCheckpointsForReplay?(runId: string): Promise<StepCheckpoint[]>;
 
   /**
    * The LATEST checkpoint for `runId` whose `name` equals `name` exactly (highest `seq` wins), or
@@ -1275,6 +1321,8 @@ export interface RunRequest {
 export type RunRequestKind =
   | { kind: 'getRunDetail'; runId: string; options?: RunDetailOptions | undefined }
   | { kind: 'getFanMembers'; runId: string; group: string; query: FanPageQuery }
+  // The run alone, for a caller that needs its status but not its timeline.
+  | { kind: 'getRun'; runId: string }
   | { kind: 'listRuns'; query: RunQuery }
   | { kind: 'runFacets'; query: RunFacetQuery }
   | {
