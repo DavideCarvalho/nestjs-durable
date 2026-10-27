@@ -133,9 +133,11 @@ DurableModule.forRoot({ connection, concurrency: 'adaptive' });
 ```
 
 How it decides (same on both SDKs), every `tickMs` (default 2s):
-- **Latency gradient (the main signal).** Compares recent p50 against the best (no-queuing) latency
-  it's seen. p50 may reach twice that baseline plus 5 ms before it counts as queuing, so the jitter of
-  fast steps doesn't read as load. No queuing → **grow**, but *only while saturated* (in-flight near
+- **Latency gradient (the main signal).** Compares recent p50 against a baseline that follows the
+  median latency down at once and up slowly, so a latency that holds (a busy shared Redis or
+  database) becomes the baseline and only a rise reads as load. p50 may reach twice that baseline plus
+  5 ms before it counts as queuing, so the jitter of fast steps doesn't read as load either. A tick
+  with no settled step moves nothing. No queuing → **grow**, but *only while saturated* (in-flight near
   the limit), since raising a ceiling nobody hits does nothing: it doubles until the first time it
   backs off (re-deciding after each limit's worth of settled steps, not only on the tick, so fast
   steps reach their level in milliseconds), then grows by √limit a tick. Past the tolerance = queuing → **shrink** by a quarter a tick (at least one slot), so one slow

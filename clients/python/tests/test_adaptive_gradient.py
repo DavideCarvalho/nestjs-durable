@@ -28,6 +28,12 @@ def saturate(ctl: AdaptiveController) -> list:
     return [ctl.on_start("step") for _ in range(ctl.limit)]
 
 
+def tick_over(ctl: AdaptiveController, duration_ms: float) -> None:
+    """A tick over a window of 100 fresh steps of ``duration_ms`` each."""
+    settle(ctl, [duration_ms] * 100)
+    ctl.tick()
+
+
 class GradientTest(unittest.TestCase):
     def test_fast_steps_with_jitter_do_not_shrink(self):
         ctl = controller(start=8)
@@ -45,8 +51,8 @@ class GradientTest(unittest.TestCase):
 
     def test_fast_steps_whose_latency_grows_past_the_noise_still_shrink(self):
         ctl = controller(start=16)
-        settle(ctl, [1] + [30] * 99)  # (2 × 1 + 5) / 30 ≈ 0.23
-        ctl.tick()
+        tick_over(ctl, 1)  # the no-queuing baseline: 1 ms
+        tick_over(ctl, 30)  # p50 30 ms against a baseline still near 1 ms
         self.assertEqual(ctl.limit, 12)
         self.assertEqual(ctl._last_adjust["reason"], "shrink")
 
@@ -54,29 +60,63 @@ class GradientTest(unittest.TestCase):
 class ShrinkTest(unittest.TestCase):
     def test_takes_at_most_a_quarter_off_on_one_queuing_tick(self):
         ctl = controller(start=32)
-        settle(ctl, [1] + [500] * 99)  # gradient ≈ 0.014: a window of one slow moment
-        ctl.tick()
+        tick_over(ctl, 1)
+        tick_over(ctl, 500)  # a window of one slow moment, 500 times the baseline
         self.assertEqual(ctl.limit, 24)
 
-    def test_keeps_shrinking_a_quarter_a_tick_down_to_min(self):
+    def test_keeps_shrinking_a_quarter_a_tick_while_the_latency_keeps_rising(self):
         ctl = controller(start=32, min=2)
-        settle(ctl, [1] + [500] * 99)
+        tick_over(ctl, 1)
+        limits = []
+        ms = 20.0
+        for _ in range(12):
+            tick_over(ctl, ms)  # each tick's p50 doubles: always past twice the baseline
+            limits.append(ctl.limit)
+            ms *= 2
+        self.assertEqual(limits, [24, 18, 14, 11, 8, 6, 5, 4, 3, 2, 2, 2])
+
+    def test_a_latency_that_rises_and_then_holds_becomes_the_baseline(self):
+        ctl = controller(start=32)
+        tick_over(ctl, 2)
         limits = []
         for _ in range(12):
-            ctl.tick()
+            tick_over(ctl, 40)
             limits.append(ctl.limit)
-        self.assertEqual(limits, [24, 18, 14, 11, 8, 6, 5, 4, 3, 2, 2, 2])
+        # Two cuts did not bring the latency down, so the queue is not this worker's.
+        self.assertEqual(limits[:3], [24, 18, 18])
+        self.assertEqual(set(limits[2:]), {18})
+
+    def test_a_worker_held_at_one_slot_by_a_busy_shared_resource_grows(self):
+        ctl = controller(start=1)
+        tick_over(ctl, 2)  # a quiet moment
+        for _ in range(15):
+            # 40 ms a step whatever the limit: the time is spent in a shared Redis or database, and
+            # now and then a step lands on a quiet moment of it.
+            settle(ctl, [2, 2] + [40] * 98)
+            tokens = saturate(ctl)  # every slot busy
+            ctl.tick()
+            for token in tokens:
+                ctl.on_settle(40.0, True, "step", token)
+        self.assertGreaterEqual(ctl.limit, 16)
+
+    def test_an_idle_worker_keeps_its_limit(self):
+        ctl = controller(start=32)
+        tick_over(ctl, 1)
+        tick_over(ctl, 500)  # the last burst ended slow: 32 → 24
+        for _ in range(10):
+            ctl.tick()  # then nothing runs
+        self.assertEqual(ctl.limit, 24)
 
     def test_takes_at_least_one_slot_off_a_small_limit(self):
         ctl = controller(start=2)
-        settle(ctl, [1] + [500] * 99)
-        ctl.tick()
+        tick_over(ctl, 1)
+        tick_over(ctl, 500)
         self.assertEqual(ctl.limit, 1)
 
     def test_is_back_at_its_level_two_ticks_after_a_one_tick_spike(self):
         ctl = controller(start=32)
-        settle(ctl, [1] + [500] * 99)
-        ctl.tick()  # the spike: 32 → 24
+        tick_over(ctl, 2)
+        tick_over(ctl, 500)  # the spike: 32 → 24
         limits = [ctl.limit]
         for _ in range(2):
             settle(ctl, [2] * 100)  # healthy again
@@ -133,12 +173,12 @@ class SlowStartTest(unittest.TestCase):
 
     def test_never_shrinks_between_ticks(self):
         ctl = controller(start=8)
-        settle(ctl, [1])
+        tick_over(ctl, 1)  # the baseline: 1 ms
         tokens = saturate(ctl)
-        for _ in range(30):
+        for _ in range(60):  # enough that the window's median is the slow steps'
             ctl.on_settle(500.0, True, "step", tokens.pop(0))  # far past the tolerance
             tokens.append(ctl.on_start("step"))
-        self.assertEqual(ctl.limit, 8)
+        self.assertGreaterEqual(ctl.limit, 8)  # it may grow early; it never shrinks before the tick
         ctl.tick()
         self.assertEqual(ctl._last_adjust["reason"], "shrink")
 

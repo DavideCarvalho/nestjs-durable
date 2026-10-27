@@ -84,16 +84,17 @@ from typing import Any, Callable, Deque, Dict, Optional, Tuple, Union
 # Rolling window of the most recent completions used for latency/throughput/error stats.
 _WINDOW_SIZE = 100
 
-# EWMA weight on the OLD rttLong when folding in the window minimum. High (slow) so the "no-queuing"
-# baseline reacts fast to a genuinely lower minimum but RESISTS rising when latency inflates under
-# queuing — which is exactly what keeps the gradient low (and triggers a shrink) while p50 climbs.
-_RTT_LONG_ALPHA = 0.9
+# The no-queuing baseline is the window's median latency, smoothed: it follows a drop at once and a
+# rise slowly. Latency that stays high because a shared Redis or database is busy becomes the
+# baseline within a few ticks, so a worker of 1 or 2 slots, which cannot be queuing on itself, is not
+# held there by it; a rise past the tolerance before the baseline has caught up still reads as
+# queuing. Weights on the NEW median. Same values as the TS controller.
+_RTT_LONG_ALPHA_DOWN = 0.5
+_RTT_LONG_ALPHA_UP = 0.1
 
 # How far p50 may rise over the no-queuing baseline before the gradient reads it as queuing: a
-# multiple of the baseline, plus a fixed amount of noise. The baseline is the fastest completion of
-# the window, which p50 always sits above, and a step of a millisecond or two that sometimes takes
-# five says nothing about load. Read as a plain ratio, both shrank a worker of fast steps to one at
-# a time while the pod sat idle. Same values as the TS controller.
+# multiple of the baseline, plus a fixed amount of noise, so a step of a millisecond or two that
+# sometimes takes five says nothing about load. Same values as the TS controller.
 _LATENCY_TOLERANCE = 2.0
 _LATENCY_NOISE_MS = 5.0
 
@@ -859,10 +860,17 @@ class AdaptiveController:
             self._stall_ticks = 0
         if self.config.mode != "adaptive":
             return
-        self._decide(usage_pct)
+        # A tick with no settled step adds nothing to the window: the latency it holds is the last
+        # burst's, which says nothing about the load now. Read again, it would cut the limit of a
+        # worker that went idle tick after tick, and the next burst would start from what was left.
+        self._decide(usage_pct, fresh=completions > 0)
 
     def _decide(
-        self, rss_pct: Optional[float] = None, grow_only: bool = False, settling: int = 0
+        self,
+        rss_pct: Optional[float] = None,
+        grow_only: bool = False,
+        settling: int = 0,
+        fresh: bool = True,
     ) -> None:
         self._settled_since_decide = 0
         config = self.config
@@ -891,7 +899,7 @@ class AdaptiveController:
         elif self._error_rate() > 0.2 or self._stall_ticks >= 2:
             new_limit = max(config.min, current - 1)
             reason = "backpressure"
-        else:
+        elif fresh:
             gradient = self._gradient(refresh=not grow_only or self._rtt_long is None)
             if gradient is not None and gradient < 0.7:
                 new_limit = max(config.min, min(current - 1, _round_half_up(current * _SHRINK_FACTOR)))
@@ -937,12 +945,12 @@ class AdaptiveController:
         if not durations:
             return None
         durations.sort()
-        current_min = durations[0]
-        if self._rtt_long is None:
-            self._rtt_long = current_min
-        elif refresh:
-            self._rtt_long = _RTT_LONG_ALPHA * self._rtt_long + (1.0 - _RTT_LONG_ALPHA) * current_min
         rtt_short = _median(durations)
+        if self._rtt_long is None:
+            self._rtt_long = rtt_short
+        elif refresh:
+            alpha = _RTT_LONG_ALPHA_DOWN if rtt_short < self._rtt_long else _RTT_LONG_ALPHA_UP
+            self._rtt_long = alpha * rtt_short + (1.0 - alpha) * self._rtt_long
         if rtt_short <= 0:
             return 1.0
         return min(1.0, (_LATENCY_TOLERANCE * self._rtt_long + _LATENCY_NOISE_MS) / rtt_short)
