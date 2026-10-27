@@ -360,6 +360,12 @@ const versionKey = (name: string, version: string): string => `${name}@${version
 const STEP_FAN_CHUNK = 200;
 /** Most seqs of a step fan one {@link StateStore.getCheckpoints} call re-reads. */
 const FAN_REREAD_CHUNK = 1000;
+/**
+ * Most steps of a fan one write-then-dispatch round of {@link WorkflowEngine.sendStepFan} carries.
+ * Workers start on a round's steps while the next round's checkpoints are written, instead of
+ * waiting for every checkpoint of a wide fan to commit.
+ */
+const STEP_FAN_SEND_ROUND = 2000;
 
 /** Tries, and the first backoff, for telling a parent that its child finished (see `deliverToParent`). */
 const PARENT_NOTIFY_ATTEMPTS = 4;
@@ -7153,10 +7159,28 @@ export class WorkflowEngine {
     return bySeq;
   }
 
+  /** Write a round of a step fan's checkpoints: one call where the store batches, else chunked. */
+  private async saveFanCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
+    if (this.store.saveCheckpoints) {
+      await this.store.saveCheckpoints(checkpoints);
+      return;
+    }
+    for (let at = 0; at < checkpoints.length; at += STEP_FAN_CHUNK) {
+      await Promise.all(
+        checkpoints.slice(at, at + STEP_FAN_CHUNK).map((cp) => this.store.saveCheckpoint(cp)),
+      );
+    }
+  }
+
   /**
-   * Write the `pending` checkpoints of a step fan's new steps, then dispatch them: one
-   * {@link StateStore.saveCheckpoints} call and one {@link TransportPool.dispatchMany} for the
-   * batch, where the store and transport have them.
+   * Write the `pending` checkpoints of a step fan's new steps and dispatch them, in rounds of
+   * {@link STEP_FAN_SEND_ROUND}: a round's steps are dispatched once its checkpoints commit, while the
+   * next round's are written. One {@link StateStore.saveCheckpoints} call and one
+   * {@link TransportPool.dispatchMany} per round, where the store and transport have them.
+   *
+   * No result can wake the run before every round is written: the run is `running` under this
+   * turn's lease until the turn suspends. A send cut short leaves the unwritten steps without a
+   * checkpoint, and the replay sends them once the written ones settle.
    */
   private async sendStepFan<TInput, TOutput>(
     runId: string,
@@ -7195,32 +7219,36 @@ export class WorkflowEngine {
         ...(lease !== undefined ? { wakeAt: lease } : {}),
       };
     });
-    if (this.store.saveCheckpoints) {
-      await this.store.saveCheckpoints(checkpoints);
-    } else {
-      for (let at = 0; at < checkpoints.length; at += STEP_FAN_CHUNK) {
-        await Promise.all(
-          checkpoints.slice(at, at + STEP_FAN_CHUNK).map((cp) => this.store.saveCheckpoint(cp)),
-        );
-      }
-    }
     const traceparent = this.traceparent?.();
     const context = this.context?.();
-    await this.pool.dispatchMany(
-      checkpoints.map((cp, k) => ({
-        runId,
-        seq: cp.seq,
-        name: step.name,
-        stepId: cp.stepId as string,
-        group: workerGroup,
-        input: inputs[batch[k] as number],
-        traceparent,
-        context,
-        priority: opts.admission?.priority,
-        attempt: 1,
-      })),
-      opts.transport,
-    );
+    const dispatches: Promise<void>[] = [];
+    try {
+      for (let from = 0; from < checkpoints.length; from += STEP_FAN_SEND_ROUND) {
+        const round = checkpoints.slice(from, from + STEP_FAN_SEND_ROUND);
+        await this.saveFanCheckpoints(round);
+        const dispatch = this.pool.dispatchMany(
+          round.map((cp, k) => ({
+            runId,
+            seq: cp.seq,
+            name: step.name,
+            stepId: cp.stepId as string,
+            group: workerGroup,
+            input: inputs[batch[from + k] as number],
+            traceparent,
+            context,
+            priority: opts.admission?.priority,
+            attempt: 1,
+          })),
+          opts.transport,
+        );
+        // Awaited below; a rejection is not left unhandled while the next round is written.
+        dispatch.catch(() => {});
+        dispatches.push(dispatch);
+      }
+    } finally {
+      await Promise.allSettled(dispatches);
+    }
+    await Promise.all(dispatches);
     for (const cp of checkpoints) {
       this.emit({ type: 'step.started', runId, seq: cp.seq, name: step.name, kind: 'remote' });
     }
