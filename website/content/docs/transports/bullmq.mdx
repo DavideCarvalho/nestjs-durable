@@ -98,6 +98,19 @@ A step fan's tasks are enqueued with `addBulk`, 500 jobs a call.
 
 ### Result delivery
 
+A worker publishes step results in batches while an engine consumes them: the results that finish
+while one batch is being published go out together in the next (up to 256), as one job on the
+`<prefix>-results-batch` queue. An idle worker publishes each result as soon as it finishes; a busy
+one publishes one job per batch instead of one per step, which halves the Redis commands a step costs
+(about 64 to 37 in a 40,000-step fan). A step's task job completes only once the batch carrying its
+result is on the queue, so a crash never loses a result. A batch that fails to publish goes out one
+result per job.
+
+A worker sends batches only once a live consumer is reading `<prefix>-results-batch` (it rereads that
+every 5 seconds through BullMQ's worker list, and any error reading it answers no). Otherwise each
+result is its own job on `<prefix>-results`, which every engine consumes, so a fleet mid-upgrade, an
+older engine, or the Python worker (which always publishes one result per job) loses nothing.
+
 A result job whose handler throws (a store error at peak load, say) is retried up to 5 times with
 exponential backoff starting at 500 ms. A result that still fails is kept in the results queue for
 24 hours instead of being removed, and the transport logs that it gave up on it, with the step and
