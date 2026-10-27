@@ -1,5 +1,15 @@
 # @dudousxd/nestjs-durable-store-typeorm
 
+## 0.25.6
+
+### Patch Changes
+
+- [#430](https://github.com/DavideCarvalho/nestjs-durable/pull/430) [`73ded3f`](https://github.com/DavideCarvalho/nestjs-durable/commit/73ded3fff4c52154ea3e9741b62677b84460c96c) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A step fan's join barrier asks whether any step is still pending instead of counting them. Every batch
+  of results asked for a `COUNT(*)` over the fan's whole seq range, about 41 ms on a 40,000-step fan in
+  MySQL, from every pod settling results. Stores get an optional `hasCheckpoints` that reads from the top
+  of the range down and stops at the first match (a fan's highest seqs settle last): 0.9 ms on the same
+  fan. Every bundled store implements it; a store without it is asked `countCheckpoints` as before.
+
 ## 0.25.5
 
 ### Patch Changes

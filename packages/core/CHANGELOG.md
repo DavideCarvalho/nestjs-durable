@@ -1,5 +1,24 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.85.10
+
+### Patch Changes
+
+- [#430](https://github.com/DavideCarvalho/nestjs-durable/pull/430) [`73ded3f`](https://github.com/DavideCarvalho/nestjs-durable/commit/73ded3fff4c52154ea3e9741b62677b84460c96c) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A step fan's join barrier asks whether any step is still pending instead of counting them. Every batch
+  of results asked for a `COUNT(*)` over the fan's whole seq range, about 41 ms on a 40,000-step fan in
+  MySQL, from every pod settling results. Stores get an optional `hasCheckpoints` that reads from the top
+  of the range down and stops at the first match (a fan's highest seqs settle last): 0.9 ms on the same
+  fan. Every bundled store implements it; a store without it is asked `countCheckpoints` as before.
+
+- [#430](https://github.com/DavideCarvalho/nestjs-durable/pull/430) [`cccf750`](https://github.com/DavideCarvalho/nestjs-durable/commit/cccf7505aa92b7bd2519aef844c56c231921cc60) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Lifecycle events are recorded once across a deployment, by the instance that produced them. With a
+  control plane every instance hears every event (that is what lets the dashboard live-tail a run from
+  any pod), and the Telescope watcher, the core metrics, the OpenTelemetry spans and metrics and the
+  diagnostics bridge each recorded every event they heard: once per pod. In a 12-pod deployment one
+  40,000-step fan wrote 612,000 Telescope entries instead of about 80,000, and that write load saturated
+  the database the run itself was using. The core now marks an event re-delivered from another instance
+  (`isRemoteEvent(event)`), and those surfaces skip it. They read the mark by symbol, so an older core
+  keeps working as before.
+
 ## 0.85.9
 
 ### Patch Changes
