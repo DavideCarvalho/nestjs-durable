@@ -18,7 +18,8 @@ async function twoPendingRuns(store: InMemoryStateStore) {
     status: 'pending',
     input: {},
     createdAt: new Date(1),
-    updatedAt: new Date(1),
+    // Just touched: a rolling deploy's skew, not a run left behind by a removed workflow.
+    updatedAt: new Date(),
   });
   await store.createRun({
     id: 'known-run',
@@ -27,7 +28,7 @@ async function twoPendingRuns(store: InMemoryStateStore) {
     status: 'pending',
     input: {},
     createdAt: new Date(2),
-    updatedAt: new Date(2),
+    updatedAt: new Date(),
   });
 }
 

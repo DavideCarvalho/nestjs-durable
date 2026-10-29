@@ -51,6 +51,27 @@ it stays fully inspectable in the dashboard — its history, its checkpoints, it
 retried from there once you've shipped a fix. The point is that one poison pill no longer keeps the process
 crashing for every other run.
 
+## An unregistered workflow
+
+A run also goes `dead` when its `workflow@version` is registered on no instance. During a rolling
+deploy, a pod that lacks the version skips the run on purpose (skew protection), and the pod still
+on the prior version picks it up within seconds. When a run is still unresumable well after that,
+its workflow was renamed or deleted, and nothing will ever run it. Once it has been due for
+`unregisteredWorkflowGraceMs` (counted from its `wakeAt` for a parked run, from its last update
+otherwise), the engine moves it to `dead` with a `workflow_not_registered` error instead of retrying
+and logging it every tick:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  unregisteredWorkflowGraceMs: 6 * 60 * 60 * 1000, // default 24h; 0 skips such runs forever
+});
+```
+
+Raise it if a pool can legitimately stay down longer than that while another app sharing the
+store, with no `namespace` of its own, polls its runs.
+
 ## Handling dead runs: `engine.onDead`
 
 Parking a dead run is the floor, not the ceiling. Subscribe with `engine.onDead` to be notified the moment a

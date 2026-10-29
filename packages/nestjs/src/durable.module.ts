@@ -252,6 +252,11 @@ export interface DurableModuleOptions {
    */
   maxRecoveryAttempts?: number;
   /**
+   * How long (ms) a run may stay unresumable because its workflow version is registered nowhere (a
+   * renamed or deleted workflow) before it is dead-lettered. Default 24h; `0` skips it forever.
+   */
+  unregisteredWorkflowGraceMs?: number;
+  /**
    * Opt-in liveness deadline (ms) for a remote (polyglot) workflow `advance`. If the worker neither
    * returns a decision nor sends a run-scoped heartbeat within this window, the engine presumes it dead
    * and lets recovery re-drive; each heartbeat rearms the window so a slow-but-alive worker is never
@@ -887,6 +892,7 @@ export class DurableModule {
               leaseMs: options.leaseMs,
               admission: options.admission,
               maxRecoveryAttempts: options.maxRecoveryAttempts,
+              unregisteredWorkflowGraceMs: options.unregisteredWorkflowGraceMs,
               remoteAdvanceSilenceMs: options.remoteAdvanceSilenceMs,
               remoteRedispatchMs: options.remoteRedispatchMs,
               remoteRedispatchMax: options.remoteRedispatchMax,

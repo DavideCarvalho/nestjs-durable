@@ -184,6 +184,11 @@ every time, i.e. a poison pill (a deserialization bug, an unguarded non-determin
 infinite loop in a step). Rather than crash-looping forever, the engine moved it to `dead` with a
 `max_recovery_attempts` error and stopped touching it.
 
+With a `workflow_not_registered` error instead, no instance had the run's `workflow@version`
+registered for longer than `unregisteredWorkflowGraceMs` (default 24h): the workflow was renamed or
+deleted while the run was in flight. Until then every poll tick skipped it with `is not registered —
+keep the prior version deployed`, which during a rolling deploy is normal and resolves in seconds.
+
 **Fix:** `dead` is terminal but **not lost** — it stays fully inspectable (history, checkpoints,
 error) and is retriable once you've shipped a fix. Diagnose the root cause from the run's history in
 the dashboard or `durable inspect <runId>`, fix it (often the same fix as a `NonDeterminismError`
