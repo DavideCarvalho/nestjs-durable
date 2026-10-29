@@ -1516,6 +1516,12 @@ export class WorkflowEngine {
       if (!(await this.store.tryLockRun(run.id, this.instanceId, nowMs + this.leaseMs, nowMs))) {
         continue;
       }
+      // Checked before the lease-long `wakeAt` below, which would keep the orphan from aging.
+      if (!(await this.canResolveWorkflow(run))) {
+        if ((await this.settleUnregistered(run, nowMs)) === undefined)
+          this.logUnregisteredSkip(run);
+        continue;
+      }
       try {
         const patch = { wakeAt: nowMs + this.leaseMs };
         if (this.store.updateRunIf) {
@@ -2977,6 +2983,14 @@ export class WorkflowEngine {
         return { result: { runId: run.id, status: 'suspended' }, dispatch: false };
       }
     }
+    // An orphan of a workflow registered nowhere must not be counted or re-pended: both write
+    // `updatedAt`, so it would never age past the grace (see settleUnregistered).
+    if (!(await this.canResolveWorkflow(run))) {
+      const settled = await this.settleUnregistered(run, nowMs);
+      if (settled) return { result: settled, dispatch: false };
+      if (settled === undefined) this.logUnregisteredSkip(run);
+      return undefined;
+    }
     // Count the attempt / dead-letter a poison pill past maxRecoveryAttempts.
     const settled = await this.countRecovery(run);
     if (settled) return { result: settled, dispatch: false };
@@ -3076,22 +3090,49 @@ export class WorkflowEngine {
   }
 
   /**
-   * A leased run nobody can resume because its `workflow@version` is not registered (see
-   * {@link WorkflowNotRegistered}). Within {@link unregisteredWorkflowGraceMs} of becoming due it is a
-   * rolling deploy's skew — leave it for the pod that still has the version. Past it, the workflow is
-   * gone from the whole fleet (a capable pod would have taken the run long ago): dead-letter it.
-   * Returns the terminal result, or `undefined` when it is left for later.
+   * Whether this instance can run `run`'s pinned `workflow@version`: registered here, inherited from a
+   * remote ancestor, or routed by convention to a live worker group (the lookup {@link resume} does).
    */
-  private async deadLetterUnregistered(
+  private async canResolveWorkflow(run: WorkflowRun): Promise<boolean> {
+    if (this.workflows.has(versionKey(run.workflow, run.workflowVersion))) return true;
+    return (
+      (await this.findInheritedRegistration(run)) !== undefined ||
+      (await this.resolveRemoteByConvention(run)) !== undefined
+    );
+  }
+
+  /**
+   * A run whose lease this instance holds but whose `workflow@version` nothing here can run (see
+   * {@link WorkflowNotRegistered}). Within {@link unregisteredWorkflowGraceMs} of becoming due it is a
+   * rolling deploy's skew: the lease is released at once so the pod that still has the version takes
+   * the run now, not after the lease expires. Past it, the workflow is gone from the whole fleet (a
+   * capable pod would have taken the run long ago): dead-letter it.
+   *
+   * The age is read off `updatedAt` / `wakeAt`, so every path that would touch either (a recovery
+   * count, a re-pend, a hand-off's lease-long `wakeAt`) must call this BEFORE writing — otherwise an
+   * orphan never ages.
+   *
+   * Returns the `dead` result, `null` when the run left its status meanwhile (a lease-free
+   * `cancel()`: settled, not ours to touch), or `undefined` when it was left for later.
+   */
+  private async settleUnregistered(
     listed: WorkflowRun,
     nowMs: number,
-  ): Promise<RunResult | undefined> {
-    if (this.unregisteredWorkflowGraceMs === 0) return undefined;
+  ): Promise<RunResult | null | undefined> {
     // Re-read under the lease: the listing is a snapshot.
     const run = await this.store.getRun(listed.id);
-    if (!run || !UNREGISTERED_DEAD_LETTER_FROM.includes(run.status)) return undefined;
+    if (!run || !UNREGISTERED_DEAD_LETTER_FROM.includes(run.status)) {
+      await this.store.releaseRunLock(listed.id);
+      return null;
+    }
     const dueSince = Math.max(run.updatedAt.getTime(), run.wakeAt ?? 0);
-    if (nowMs - dueSince < this.unregisteredWorkflowGraceMs) return undefined;
+    if (
+      this.unregisteredWorkflowGraceMs === 0 ||
+      nowMs - dueSince < this.unregisteredWorkflowGraceMs
+    ) {
+      await this.store.releaseRunLock(run.id);
+      return undefined;
+    }
     const error = {
       message: `workflow ${run.workflow}@${run.workflowVersion} is not registered on any live instance (unresumable for over ${this.unregisteredWorkflowGraceMs}ms) — moved to dead-letter`,
       code: 'workflow_not_registered',
@@ -3104,7 +3145,17 @@ export class WorkflowEngine {
       { status: 'dead', error, updatedAt: new Date() },
     );
     await this.store.releaseRunLock(run.id);
-    return applied ? this.announceDead(run, error) : undefined;
+    if (!applied) return null;
+    console.warn(`[nestjs-durable] run ${run.id}: ${error.message}`);
+    return this.announceDead(run, error);
+  }
+
+  /** Log a run skipped for an unregistered workflow — still there, still not progressing. */
+  private logUnregisteredSkip(run: WorkflowRun): void {
+    console.error(
+      `[nestjs-durable] could not resume run ${run.id} (${run.workflow}@${run.workflowVersion}); leaving it for another instance:`,
+      new WorkflowNotRegistered(run.workflow, run.workflowVersion),
+    );
   }
 
   /**
@@ -3229,8 +3280,13 @@ export class WorkflowEngine {
     if (!acquired) return null;
     // resume() checks the namespace and throws NamespaceMismatch when it doesn't match — no extra
     // await before the call, so the microtask ordering (critical for cancel-safety) is unchanged.
-    return this.resumeImplicit(runId).catch((err) => {
+    return this.resumeImplicit(runId).catch(async (err) => {
       if (err instanceof NamespaceMismatch) return null;
+      if (err instanceof WorkflowNotRegistered) {
+        const run = await this.store.getRun(runId);
+        const settled = run ? await this.settleUnregistered(run, nowMs) : null;
+        if (settled !== undefined) return settled;
+      }
       throw err;
     });
   }
@@ -3599,12 +3655,9 @@ export class WorkflowEngine {
         results.push(settled ?? (await this.resumeImplicit(run.id)));
       } catch (error) {
         if (error instanceof WorkflowNotRegistered) {
-          const dead = await this.deadLetterUnregistered(run, nowMs).catch(() => undefined);
-          if (dead) {
-            console.warn(`[nestjs-durable] run ${run.id}: ${dead.error?.message}`);
-            results.push(dead);
-            continue;
-          }
+          const settled = await this.settleUnregistered(run, nowMs).catch(() => undefined);
+          if (settled) results.push(settled);
+          if (settled !== undefined) continue;
         }
         // Loud, because a skip is not nothing: the run is still there and still not progressing, and
         // the reason (a version skew, a store that just went away) is the only thing that tells an

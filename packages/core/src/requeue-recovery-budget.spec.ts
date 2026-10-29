@@ -67,6 +67,8 @@ describe('requeue restores the recovery budget', () => {
       runDispatcher: { dispatch: () => {} },
       maxRecoveryAttempts: 10,
     });
+    // Registered: recovery leaves a run of a workflow it does not have to the pod that has it.
+    engine.register('wf', '1', async () => undefined);
     await store.createRun(run()); // dead, AT the cap
 
     await engine.requeue('r1');
@@ -121,6 +123,8 @@ describe('requeue restores the recovery budget', () => {
       runDispatcher: { dispatch: () => {} },
       maxRecoveryAttempts: 2,
     });
+    // Registered: recovery leaves a run of a workflow it does not have to the pod that has it.
+    engine.register('wf', '1', async () => undefined);
     await store.createRun(run({ recoveryAttempts: 2 }));
 
     await engine.requeue('r1'); // fresh budget…
