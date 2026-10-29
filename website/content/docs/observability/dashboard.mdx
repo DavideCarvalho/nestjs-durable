@@ -8,6 +8,14 @@ icon: LayoutDashboard
 plus its JSON API. It reads straight from the [state store](/docs/stores), so it works without an
 OpenTelemetry collector.
 
+```bash
+pnpm add @dudousxd/nestjs-durable-dashboard @dudousxd/nestjs-filter
+```
+
+`@dudousxd/nestjs-filter` (`>=1.33.0 <2.0.0`) is a peer dependency: the runs API filters through it,
+and it has to be the same copy your app uses, because filter state lives in that package's
+module-level `AsyncLocalStorage`. Install it even if your app does not use the filter library itself.
+
 ```ts
 import { DurableDashboardModule } from '@dudousxd/nestjs-durable-dashboard';
 
