@@ -1521,7 +1521,8 @@ export class WorkflowEngine {
         continue;
       }
       // Checked before the lease-long `wakeAt` below, which would keep the orphan from aging.
-      if (!(await this.canResolveWorkflow(run))) {
+      // A registered run never awaits here, so its hand-off timing is unchanged.
+      if (!this.isRegisteredHere(run) && !(await this.canResolveWorkflow(run))) {
         const result = await this.settleUnregistered(run, nowMs);
         if (result) settled?.set(run.id, result);
         else if (result === undefined) this.logUnregisteredSkip(run);
@@ -2990,7 +2991,7 @@ export class WorkflowEngine {
     }
     // An orphan of a workflow registered nowhere must not be counted or re-pended: both write
     // `updatedAt`, so it would never age past the grace (see settleUnregistered).
-    if (!(await this.canResolveWorkflow(run))) {
+    if (!this.isRegisteredHere(run) && !(await this.canResolveWorkflow(run))) {
       const settled = await this.settleUnregistered(run, nowMs);
       if (settled) return { result: settled, dispatch: false };
       if (settled === undefined) this.logUnregisteredSkip(run);
@@ -3094,12 +3095,18 @@ export class WorkflowEngine {
     return { runId: run.id, status: 'dead', error };
   }
 
+  /** The synchronous half of {@link canResolveWorkflow}: callers check it first, so a registered run
+   *  pays no await (same rule as {@link resume}). */
+  private isRegisteredHere(run: WorkflowRun): boolean {
+    return this.workflows.has(versionKey(run.workflow, run.workflowVersion));
+  }
+
   /**
    * Whether this instance can run `run`'s pinned `workflow@version`: registered here, inherited from a
    * remote ancestor, or routed by convention to a live worker group (the lookup {@link resume} does).
    */
   private async canResolveWorkflow(run: WorkflowRun): Promise<boolean> {
-    if (this.workflows.has(versionKey(run.workflow, run.workflowVersion))) return true;
+    if (this.isRegisteredHere(run)) return true;
     return (
       (await this.findInheritedRegistration(run)) !== undefined ||
       (await this.resolveRemoteByConvention(run)) !== undefined
