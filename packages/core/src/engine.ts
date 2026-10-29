@@ -1509,7 +1509,11 @@ export class WorkflowEngine {
    * that is lost brings it back due after that period. False when the transport refused the wakes,
    * so the caller resumes them itself.
    */
-  private async handOffDue(runs: WorkflowRun[], nowMs: number): Promise<boolean> {
+  private async handOffDue(
+    runs: WorkflowRun[],
+    nowMs: number,
+    settled?: Map<string, RunResult>,
+  ): Promise<boolean> {
     const claimed: WorkflowRun[] = [];
     for (const run of runs) {
       if (this.draining) break;
@@ -1518,8 +1522,9 @@ export class WorkflowEngine {
       }
       // Checked before the lease-long `wakeAt` below, which would keep the orphan from aging.
       if (!(await this.canResolveWorkflow(run))) {
-        if ((await this.settleUnregistered(run, nowMs)) === undefined)
-          this.logUnregisteredSkip(run);
+        const result = await this.settleUnregistered(run, nowMs);
+        if (result) settled?.set(run.id, result);
+        else if (result === undefined) this.logUnregisteredSkip(run);
         continue;
       }
       try {
@@ -3187,8 +3192,10 @@ export class WorkflowEngine {
     // instance takes them, instead of all resuming on the instance that polled.
     if (this.queuesRunsOverTransport && !this.draining) {
       const runs = [...due, ...blocked];
-      if (await this.handOffDue(runs, nowMs)) {
-        return runs.map((run) => ({ runId: run.id, status: run.status }));
+      // A run this pass dead-lettered reports its terminal result, not the listed status.
+      const settled = new Map<string, RunResult>();
+      if (await this.handOffDue(runs, nowMs, settled)) {
+        return runs.map((run) => settled.get(run.id) ?? { runId: run.id, status: run.status });
       }
     }
     const waiterByRun = indexWaitersByRun(

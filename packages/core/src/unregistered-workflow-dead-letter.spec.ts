@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type { WorkflowRun } from './interfaces';
+import { InMemoryRunQueue } from './testing/in-memory-run-queue';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 const HOUR = 60 * 60 * 1000;
@@ -147,6 +148,28 @@ describe('a run whose workflow is registered nowhere', () => {
 
     await engine.runOne('sched:index-writing:1');
 
+    expect((await store.getRun('sched:index-writing:1'))?.error?.code).toBe(
+      'workflow_not_registered',
+    );
+  });
+
+  it('reports the dead result from a due-timer pass that hands runs to the run queue', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({
+      store,
+      transport: new InMemoryRunQueue().transport(),
+      clock: () => NOW,
+    });
+    engine.register('IndexWriting', '1', async () => 'ok');
+    engine.consumeRuns();
+    await store.createRun(orphan({ status: 'suspended', wakeAt: NOW - 48 * HOUR }));
+
+    const results = await engine.resumeDueTimers(NOW);
+
+    expect(results).toEqual([
+      expect.objectContaining({ runId: 'sched:index-writing:1', status: 'dead' }),
+    ]);
     expect((await store.getRun('sched:index-writing:1'))?.error?.code).toBe(
       'workflow_not_registered',
     );
