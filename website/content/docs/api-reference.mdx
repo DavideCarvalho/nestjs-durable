@@ -275,7 +275,7 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 | `waitForRun` | `waitForRun(runId: string, opts?: { timeoutMs?: number }): Promise<RunResult>` | Same as `WorkflowService.waitForRun`. |
 | `completeTask` | `completeTask(runId: string, name: string, result: unknown): Promise<RunResult \| null>` | Report a `ctx.task(name, …)`'s async result back to its run. |
 | `failTask` | `failTask(runId: string, name: string, error: string): Promise<RunResult \| null>` | Report a `ctx.task` failure — the run resumes and throws a `FatalError` at the task. |
-| `onDead` | `onDead(listener: (run: WorkflowRun) => void): () => void` | Subscribe to dead-lettered runs (moved to `dead` past `maxRecoveryAttempts`). Returns an unsubscribe fn. |
+| `onDead` | `onDead(listener: (run: WorkflowRun) => void): () => void` | Subscribe to dead-lettered runs (moved to `dead` past `maxRecoveryAttempts` or `unregisteredWorkflowGraceMs`). Returns an unsubscribe fn. |
 | `onEnqueued` | `onEnqueued(listener: (runId: string) => void): () => void` | Subscribe to runs enqueued on ANOTHER instance (control-plane broadcast) — a worker can pick them up immediately instead of waiting for its next poll. |
 | `runEnqueued` | `runEnqueued(runId: string): void` | Run an announced run here if it is still `pending`, at most 256 at once per instance. The `onEnqueued` handler the Nest module installs. |
 | `consumeRuns` | `consumeRuns(): (() => Promise<void>) \| undefined` | Consume the transport's run queue and, from then on, queue the runs this engine starts there instead of running them in-process. The Nest module calls it on every driving operator; call it yourself only on an engine you build by hand. Returns a stop function, or `undefined` when no transport carries a run queue. |
@@ -322,6 +322,7 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `leaseMs` | `number` | `30000` | Multi-instance recovery-lease duration. Operator only. |
 | `instanceId` | `string` | random | Unique id for this instance (leases, worker heartbeats). |
 | `maxRecoveryAttempts` | `number` | unlimited | Cap recovery attempts before a poison-pill run moves to `dead`. See [Dead-letter queue](/docs/reliability/dead-letter). |
+| `unregisteredWorkflowGraceMs` | `number` | 24h | How long a run may stay due with its `workflow@version` registered nowhere before it moves to `dead` (`workflow_not_registered`). `0` disables. See [Dead-letter queue](/docs/reliability/dead-letter#an-unregistered-workflow). |
 | `remoteAdvanceSilenceMs` | `number` | unbounded await | Liveness deadline for a remote (polyglot) workflow `advance`; each heartbeat rearms it. Operator only. |
 | `reconcileMs` | `number` | `300000` | Fallback re-drive for a run suspended on an event whose wake-up was lost; `0` disables it. Operator only. |
 | `stalledAfterMs` | `number` | `900000` | Idle time before a stranded run is reported to `onStalled` listeners (floored at 60000). Operator only. |
@@ -431,7 +432,7 @@ Both are exported from `@dudousxd/nestjs-durable-core` and re-exported by `@dudo
 | `completed` | Finished successfully. Terminal. |
 | `failed` | Finished with an unrecovered error. Terminal. |
 | `cancelled` | Cancelled (with or without compensation). Terminal. |
-| `dead` | Dead-lettered: crash-recovery gave up after `maxRecoveryAttempts` (a poison pill). Terminal. |
+| `dead` | Dead-lettered: crash-recovery gave up after `maxRecoveryAttempts` (a poison pill), or the run's workflow version stayed registered nowhere past `unregisteredWorkflowGraceMs`. Terminal. |
 
 Only `completed` / `failed` / `cancelled` / `dead` are **terminal** — eligible for
 [retention pruning](/docs/reliability/retention) and never transition on their own again.

@@ -95,6 +95,8 @@ describe('recoverIncomplete with an in-flight pending remote step', () => {
       runDispatcher: { dispatch: () => {} },
       maxRecoveryAttempts: 3,
     });
+    // Registered: recovery leaves a run of a workflow it does not have to the pod that has it.
+    engine.register('ingest', '1', async () => undefined);
     await store.createRun(runningRun('r2'));
 
     // A real poison pill kills the process mid-turn, so each recovery re-drive puts the run back to
@@ -122,6 +124,8 @@ describe('recoverIncomplete with an in-flight pending remote step', () => {
       runDispatcher: { dispatch: () => {} },
       maxRecoveryAttempts: 2,
     });
+    // Registered: recovery leaves a run of a workflow it does not have to the pod that has it.
+    engine.register('ingest', '1', async () => undefined);
     await store.createRun(runningRun('r3'));
     await store.saveCheckpoint({ ...pendingRemoteStep('r3'), status: 'completed', output: {} });
 
