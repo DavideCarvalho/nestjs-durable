@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.53.0
+
+### Minor Changes
+
+- [#438](https://github.com/DavideCarvalho/nestjs-durable/pull/438) [`e01a27c`](https://github.com/DavideCarvalho/nestjs-durable/commit/e01a27c92c7eae891c976b831b0a5b7ff5b02224) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A run whose `workflow@version` is registered on no instance (the workflow was renamed or deleted with runs in flight) no longer loops forever. Once it has been due for `unregisteredWorkflowGraceMs` (default 24h, counted from its `wakeAt` for a parked run), it moves to `dead` with a `workflow_not_registered` error, fires `onDead` and reaches the dead-letter workflow. Before, every poll tick skipped it and logged `is not registered — keep the prior version deployed` again. A rolling deploy's skew, where the pod on the prior version picks the run up within seconds, is unaffected. Set `unregisteredWorkflowGraceMs: 0` to keep the old skip-forever behavior.
+
 ## 0.52.7
 
 ### Patch Changes
