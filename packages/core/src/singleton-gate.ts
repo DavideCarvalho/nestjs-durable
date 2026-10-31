@@ -5,6 +5,7 @@ import {
   SINGLETON_ACTIVE_STATUSES,
   SINGLETON_ADMITTED_TAG,
   SINGLETON_TRACKED_TAG,
+  withSingletonTracked,
 } from './singleton-admission';
 
 const SINGLETON_RETRY_MS = 1000;
@@ -14,9 +15,32 @@ const SINGLETON_RETRY_MS = 1000;
  * in `[-SINGLETON_RETRY_JITTER_MS, +SINGLETON_RETRY_JITTER_MS]`.
  */
 const SINGLETON_RETRY_JITTER_MS = 250;
+/** Claims a database may abort as a lock conflict before the run waits for its retry timer instead. */
+const ADMISSION_ATTEMPTS = 3;
+const ADMISSION_BACKOFF_MS = 40;
+
+/** Deadlock and serialization failure on Postgres and MySQL, and Prisma's name for either. */
+const LOCK_CONFLICT_CODES = new Set(['40P01', '40001', 'ER_LOCK_DEADLOCK', '1213', 'P2034']);
+
+/** Whether a store error, through any driver or ORM wrapper around it, is an aborted lock conflict. */
+export function isLockConflict(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  const pending = [error];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current !== 'object' || current === null || seen.has(current)) continue;
+    seen.add(current);
+    const e = current as Record<string, unknown>;
+    for (const code of [e.code, e.errno, e.sqlState, e.sqlstate]) {
+      if (LOCK_CONFLICT_CODES.has(String(code))) return true;
+    }
+    pending.push(e.cause, e.driverError, e.originalError, e.meta);
+  }
+  return false;
+}
 
 export interface SingletonGateDeps {
-  store: Pick<StateStore, 'listRuns' | 'updateRun' | 'tryAdmitSingleton'>;
+  store: Pick<StateStore, 'listRuns' | 'updateRun' | 'updateRunIf' | 'tryAdmitSingleton'>;
   clock: () => number;
   /** Hand a gated run to the run dispatcher (fire-and-forget, like the engine's other dispatches). */
   dispatch: (runId: string) => void;
@@ -77,13 +101,7 @@ export class SingletonGate {
         'Singleton workflows require StateStore.tryAdmitSingleton for atomic durable admission',
       );
     }
-    const admitted = await this.deps.store.tryAdmitSingleton(
-      run.id,
-      this.tag(cfg, run.input),
-      run.workflow,
-      cfg.limit ?? 1,
-      this.retryWakeAt(),
-    );
+    const admitted = await this.claim(run, cfg);
     if (admitted && !run.tags?.includes(SINGLETON_ADMITTED_TAG)) {
       run.tags = [
         ...(run.tags ?? []).filter((tag) => tag !== SINGLETON_TRACKED_TAG),
@@ -91,6 +109,51 @@ export class SingletonGate {
       ];
     }
     return admitted;
+  }
+
+  /**
+   * One claim, retried when the database aborts it as a lock conflict. A conflict that outlasts the
+   * retries parks the run on its retry timer: thrown, it would leave the run leased and idle until
+   * the lease lapsed.
+   */
+  private async claim(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
+    const admit = this.deps.store.tryAdmitSingleton as NonNullable<StateStore['tryAdmitSingleton']>;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await admit.call(
+          this.deps.store,
+          run.id,
+          this.tag(cfg, run.input),
+          run.workflow,
+          cfg.limit ?? 1,
+          this.retryWakeAt(),
+        );
+      } catch (error) {
+        if (!isLockConflict(error)) throw error;
+        if (attempt < ADMISSION_ATTEMPTS) {
+          const backoff = ADMISSION_BACKOFF_MS * attempt * (0.5 + Math.random());
+          await new Promise((resolve) => setTimeout(resolve, backoff));
+          continue;
+        }
+        // Only a run still competing: a cancelling or settled one must never be revived.
+        const patch = {
+          status: 'suspended' as const,
+          wakeAt: this.retryWakeAt(),
+          tags: withSingletonTracked(run.tags),
+          updatedAt: new Date(),
+        };
+        if (this.deps.store.updateRunIf) {
+          await this.deps.store.updateRunIf(
+            run.id,
+            ['pending', 'running', 'suspended', 'blocked'],
+            patch,
+          );
+        } else if (run.status !== 'cancelling') {
+          await this.deps.store.updateRun(run.id, patch);
+        }
+        return false;
+      }
+    }
   }
 
   /**

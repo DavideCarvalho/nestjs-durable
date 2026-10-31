@@ -35,7 +35,9 @@ import {
   parseDuration,
   runValueFacetsFromRuns,
   singletonAdmissionDenialPatch,
+  SINGLETON_LOCK_CHUNK,
   singletonAdmissionTags,
+  singletonClaimantIds,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Between,
@@ -182,11 +184,29 @@ export class TypeOrmStateStore implements StateStore {
       await previous;
     }
     try {
+      const where = { workflow, status: In(SINGLETON_ACTIVE_STATUSES) };
+      const claimants = sqlite
+        ? []
+        : singletonClaimantIds(
+            await this.dataSource
+              .getRepository(WorkflowRunEntity)
+              .find({ select: { id: true, tags: true }, where, order: { id: 'ASC' } }),
+            tag,
+          );
       return await this.dataSource.transaction(async (em) => {
         const repo = em.getRepository(WorkflowRunEntity);
-        const where = { workflow, status: In(SINGLETON_ACTIVE_STATUSES) };
-        // Acquire write locks BEFORE taking the admission snapshot (also serializes SQLite writers).
-        await repo.update(where, { workflow });
+        // Acquire locks BEFORE taking the admission snapshot: SQLite's single writer lock, or this
+        // key's rows in one global order, so claims queue instead of deadlocking.
+        if (sqlite) await repo.update(where, { workflow });
+        for (let at = 0; at < claimants.length; at += SINGLETON_LOCK_CHUNK) {
+          await repo
+            .createQueryBuilder('r')
+            .select(['r.id'])
+            .where('r.id IN (:...ids)', { ids: claimants.slice(at, at + SINGLETON_LOCK_CHUNK) })
+            .orderBy('r.id', 'ASC')
+            .setLock('pessimistic_write')
+            .getMany();
+        }
         const runs = (await repo.find({ where })).map(fromRunEntity);
         const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
         if (!tags) {

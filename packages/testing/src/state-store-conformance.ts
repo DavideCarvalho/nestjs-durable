@@ -380,6 +380,31 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       ).toEqual(['c1']);
     });
 
+    t('concurrent claims across many runs of one key all answer, one winning', async () => {
+      const ids = Array.from({ length: 24 }, (_, i) => `run-${String(i).padStart(2, '0')}`);
+      for (const [i, id] of ids.entries()) {
+        await store.createRun(run({ id, tags: ['singleton:k'], createdAt: new Date(1_000 + i) }));
+      }
+      for (let round = 0; round < 3; round += 1) {
+        const order = [...ids].sort(() => Math.random() - 0.5);
+        await Promise.all(
+          order.map((id, i) =>
+            (i % 2 ? peerStore : store).tryAdmitSingleton?.(
+              id,
+              'singleton:k',
+              'checkout',
+              1,
+              Date.now() + 1_000,
+            ),
+          ),
+        );
+      }
+      const active = await store.listRuns({ workflow: 'checkout', tag: 'singleton:k' });
+      expect(active.filter((r) => r.tags?.includes(SINGLETON_ADMITTED_TAG)).map((r) => r.id)).toEqual(
+        ['run-00'],
+      );
+    });
+
     // ---- create / get / update --------------------------------------------------------------
 
     t('creates a run and reads it back with its JSON input', async () => {

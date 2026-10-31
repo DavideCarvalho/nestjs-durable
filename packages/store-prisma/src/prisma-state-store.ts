@@ -35,7 +35,9 @@ import {
   parseDuration,
   runValueFacetsFromRuns,
   singletonAdmissionDenialPatch,
+  SINGLETON_LOCK_CHUNK,
   singletonAdmissionTags,
+  singletonClaimantIds,
 } from '@dudousxd/nestjs-durable-core';
 
 /* The Prisma client is generated per-schema, so the adapter can't import a concrete one. Instead
@@ -201,10 +203,32 @@ export class PrismaStateStore implements StateStore {
     limit: number,
     retryWakeAt?: number,
   ): Promise<boolean> {
+    const where = { workflow, status: { in: SINGLETON_ACTIVE_STATUSES } };
+    const lockRows = rowLockDialect(this.db);
+    const claimants = lockRows
+      ? singletonClaimantIds(
+          await this.db.durableWorkflowRun.findMany({
+            where,
+            select: { id: true, tags: true },
+            orderBy: { id: 'asc' },
+          }),
+          tag,
+        )
+      : [];
     return this.db.$transaction(async (tx) => {
-      const where = { workflow, status: { in: SINGLETON_ACTIVE_STATUSES } };
-      // A locking write first: concurrent claims cannot read the same free slot.
-      await tx.durableWorkflowRun.updateMany({ where, data: { workflow } });
+      // Lock first, so concurrent claims cannot read the same free slot: this key's rows in one
+      // global order, so claims queue instead of deadlocking, or, on a store with a single writer,
+      // a locking write that takes its lock.
+      if (lockRows) {
+        for (let at = 0; at < claimants.length; at += SINGLETON_LOCK_CHUNK) {
+          await lockRows(
+            tx as unknown as RawPrismaClient,
+            claimants.slice(at, at + SINGLETON_LOCK_CHUNK),
+          );
+        }
+      } else {
+        await tx.durableWorkflowRun.updateMany({ where, data: { workflow } });
+      }
       const rows = await tx.durableWorkflowRun.findMany({ where });
       const runs = rows.map(fromRunRow);
       const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
@@ -1421,6 +1445,33 @@ const jsonText = (v: unknown): string | null => (v == null ? null : JSON.stringi
  * The raw settle for the client's database, or `undefined` (a client without raw queries, or a
  * provider without one here), which settles row by row through `updateMany`.
  */
+/** `SELECT … ORDER BY id FOR UPDATE` on the run rows, where the provider has row locks. */
+function rowLockDialect(
+  db: DurablePrismaClient,
+): ((tx: RawPrismaClient, ids: string[]) => Promise<unknown>) | undefined {
+  const client = db as unknown as Partial<RawPrismaClient> & { _activeProvider?: string };
+  if (typeof client.$queryRawUnsafe !== 'function') return undefined;
+  if (client._activeProvider === 'postgresql') {
+    return (tx, ids) =>
+      tx.$queryRawUnsafe(
+        `SELECT id FROM "durable_workflow_runs" WHERE id IN (${ids
+          .map((_, i) => `$${i + 1}`)
+          .join(', ')}) ORDER BY id FOR UPDATE`,
+        ...ids,
+      );
+  }
+  if (client._activeProvider === 'mysql') {
+    return (tx, ids) =>
+      tx.$queryRawUnsafe(
+        `SELECT id FROM durable_workflow_runs WHERE id IN (${ids
+          .map(() => '?')
+          .join(', ')}) ORDER BY id FOR UPDATE`,
+        ...ids,
+      );
+  }
+  return undefined;
+}
+
 function rawSettleDialect(db: DurablePrismaClient): RawSettle | undefined {
   const client = db as unknown as Partial<RawPrismaClient> & { _activeProvider?: string };
   if (typeof client.$queryRawUnsafe !== 'function') return undefined;

@@ -83,6 +83,28 @@ export function legacySingletonHolders(
   );
 }
 
+/**
+ * The size of one locking statement of {@link singletonClaimantIds}. Keep a store's chunks in the
+ * order the database listed the ids: every claim then takes shared rows in one global order.
+ */
+export const SINGLETON_LOCK_CHUNK = 500;
+
+/**
+ * The runs a claim must lock: the active runs sharing its exact tag, in the order given. Admission
+ * reads no other run, so claims on different keys need not wait for each other. Read them BEFORE the
+ * admission transaction opens: on MySQL's REPEATABLE READ an earlier plain read would freeze the
+ * snapshot the admission decision reads. A run that a later claim adds is still safe: that claim
+ * started after this one's run existed, so its own lock set holds this run and the two serialize.
+ */
+export function singletonClaimantIds(
+  rows: readonly { id: string; tags?: unknown }[],
+  tag: string,
+): string[] {
+  return rows
+    .filter((row) => Array.isArray(row.tags) && row.tags.includes(tag))
+    .map((row) => row.id);
+}
+
 /** Call only inside a store's atomic admission transaction/critical section. */
 export function singletonAdmissionTags(
   runs: WorkflowRun[],

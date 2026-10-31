@@ -35,7 +35,9 @@ import {
   normalizeAttributeRows,
   parseDuration,
   singletonAdmissionDenialPatch,
+  SINGLETON_LOCK_CHUNK,
   singletonAdmissionTags,
+  singletonClaimantIds,
 } from '@dudousxd/nestjs-durable-core';
 import { LockMode, raw } from '@mikro-orm/core';
 import type { EntityManager, MikroORM } from '@mikro-orm/core';
@@ -170,14 +172,36 @@ export class MikroOrmStateStore implements StateStore {
     limit: number,
     retryWakeAt?: number,
   ): Promise<boolean> {
+    const where = {
+      workflow,
+      status: { $in: SINGLETON_ACTIVE_STATUSES },
+      ...(this.scopeNamespace !== undefined ? { namespace: this.scopeNamespace } : {}),
+    };
+    const reader = this.fork();
+    const sqlite = /sqlite|libsql/i.test(reader.getPlatform().constructor.name);
+    const claimants = sqlite
+      ? []
+      : singletonClaimantIds(
+          await reader.find(WorkflowRunEntity, where, {
+            fields: ['id', 'tags'],
+            orderBy: { id: 'ASC' },
+          }),
+          tag,
+        );
     return this.fork().transactional(async (em) => {
-      const where = {
-        workflow,
-        status: { $in: SINGLETON_ACTIVE_STATUSES },
-        ...(this.scopeNamespace !== undefined ? { namespace: this.scopeNamespace } : {}),
-      };
-      // nativeUpdate bypasses read filters, so namespace is explicit on the locking write too.
-      await em.nativeUpdate(WorkflowRunEntity, where, { workflow });
+      // Acquire locks BEFORE the admission read: SQLite's single writer lock (nativeUpdate bypasses
+      // read filters, so namespace is explicit), or this key's rows in one global order, so claims
+      // queue instead of deadlocking.
+      if (sqlite) await em.nativeUpdate(WorkflowRunEntity, where, { workflow });
+      for (let at = 0; at < claimants.length; at += SINGLETON_LOCK_CHUNK) {
+        await em.find(
+          WorkflowRunEntity,
+          { id: { $in: claimants.slice(at, at + SINGLETON_LOCK_CHUNK) } },
+          { fields: ['id'], orderBy: { id: 'ASC' }, lockMode: LockMode.PESSIMISTIC_WRITE },
+        );
+      }
+      // The lock reads loaded partial entities; the admission read must see whole, current rows.
+      em.clear();
       const rows = await em.find(WorkflowRunEntity, where);
       const runs = rows.map(fromRunEntity);
       const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);

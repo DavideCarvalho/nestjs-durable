@@ -180,9 +180,17 @@ export class DrizzlePgStateStore implements StateStore {
       const where = and(
         eq(workflowRuns.workflow, workflow),
         inArray(workflowRuns.status, SINGLETON_ACTIVE_STATUSES),
+        hasTag(tag),
         this.scope(),
       );
-      await tx.update(workflowRuns).set({ workflow }).where(where);
+      // Lock only this key's runs, in one global order, so claims queue instead of deadlocking and
+      // other keys never wait. The read below takes its snapshot once these locks are held.
+      await tx
+        .select({ id: workflowRuns.id })
+        .from(workflowRuns)
+        .where(where)
+        .orderBy(asc(workflowRuns.id))
+        .for('update');
       const rows = await tx.select().from(workflowRuns).where(where);
       const runs = rows.map(fromRunRow);
       const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
@@ -1276,6 +1284,13 @@ async function reindexAttributes(
 
 /** Children first, then the runs — checkpoints, waiters, attribute rows. Call inside a tx. */
 async function deleteRunsCascade(db: DrizzlePgDatabase, runIds: string[]): Promise<void> {
+  // The order singleton admission locks in, so a delete of active runs cannot cycle with a claim.
+  await db
+    .select({ id: workflowRuns.id })
+    .from(workflowRuns)
+    .where(inArray(workflowRuns.id, runIds))
+    .orderBy(asc(workflowRuns.id))
+    .for('update');
   await db.delete(stepCheckpoints).where(inArray(stepCheckpoints.runId, runIds));
   await db.delete(signalWaiters).where(inArray(signalWaiters.runId, runIds));
   await db.delete(runAttributes).where(inArray(runAttributes.runId, runIds));
