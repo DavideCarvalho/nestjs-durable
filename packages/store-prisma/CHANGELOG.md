@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-store-prisma
 
+## 0.24.7
+
+### Patch Changes
+
+- [#439](https://github.com/DavideCarvalho/nestjs-durable/pull/439) [`e90d931`](https://github.com/DavideCarvalho/nestjs-durable/commit/e90d931f513759008056a62b32e9fb691124db6f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Singleton admission no longer deadlocks. A claim row-locked every active run of the workflow in no particular order, so concurrent claims could lock in opposite orders; the database killed one (Postgres `40P01`) and its run stayed leased until the lease lapsed. A claim now locks only the active runs of its own key, ordered by id, on Postgres and MySQL, so claims queue and different keys never wait for each other. SQLite keeps its single-writer lock. The gate retries a claim the database aborts as a lock conflict, then parks the run on its retry timer instead of stranding it.
+
 ## 0.24.6
 
 ### Patch Changes
