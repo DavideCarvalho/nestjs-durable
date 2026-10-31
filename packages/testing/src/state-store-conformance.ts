@@ -381,6 +381,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     });
 
     t('concurrent claims across many runs of one key all answer, one winning', async () => {
+      if (!supportsTagFilter) return;
       const ids = Array.from({ length: 24 }, (_, i) => `run-${String(i).padStart(2, '0')}`);
       for (const [i, id] of ids.entries()) {
         await store.createRun(run({ id, tags: ['singleton:k'], createdAt: new Date(1_000 + i) }));
@@ -400,9 +401,9 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         );
       }
       const active = await store.listRuns({ workflow: 'checkout', tag: 'singleton:k' });
-      expect(active.filter((r) => r.tags?.includes(SINGLETON_ADMITTED_TAG)).map((r) => r.id)).toEqual(
-        ['run-00'],
-      );
+      expect(
+        active.filter((r) => r.tags?.includes(SINGLETON_ADMITTED_TAG)).map((r) => r.id),
+      ).toEqual(['run-00']);
     });
 
     // ---- create / get / update --------------------------------------------------------------

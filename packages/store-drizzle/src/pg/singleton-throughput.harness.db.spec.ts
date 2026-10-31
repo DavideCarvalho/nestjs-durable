@@ -43,92 +43,93 @@ afterAll(async () => {
 });
 
 describe.runIf(enabled)('singleton throughput (harness)', () => {
-  it(
-    'settles every run',
-    async () => {
-      for (let attempt = 0; attempt < repeat; attempt++) {
-        const pools = Array.from({ length: pods }, () => new pg.Pool({ connectionString: url, max: 10 }));
-        const stores = pools.map((pool) => new DrizzlePgStateStore(drizzle(pool)));
-        await stores[0]?.ensureSchema();
-        await pools[0]?.query('TRUNCATE durable_workflow_runs CASCADE');
-        let deadlocks = 0;
-        const engines = stores.map((store, i) => {
-          const admit = store.tryAdmitSingleton.bind(store);
-          store.tryAdmitSingleton = async (...args) => {
-            try {
-              return await admit(...args);
-            } catch (err) {
-              if ((err as { cause?: { code?: string } }).cause?.code === '40P01') deadlocks++;
-              throw err;
-            }
-          };
-          const transport = new InMemoryTransport();
-          transport.handle(STEP, async ({ i: n }: { i: number }) => n);
-          const engine = new WorkflowEngine({ store, transport, instanceId: `pod-${i}` });
-          engine.register(
-            'job',
-            '1',
-            async () => {
-              await new Promise((resolve) => setTimeout(resolve, 5));
-              return 'done';
-            },
-            { singleton: { key: (input: { key: string }) => input.key } },
-          );
-          engine.register('fan', '1', async (ctx) => {
-            await ctx.all(
-              line,
-              Array.from({ length: fan }, (_, n) => ({ i: n })),
-            );
-            return 'done';
-          });
-          return engine;
-        });
-        const started = Date.now();
-        let stop = false;
-        const pollers = engines.map(async (engine) => {
-          while (!stop) {
-            // The module's TimerPoller: the same sweeps, in order, every second.
-            await engine.runPending().catch(() => undefined);
-            await engine.recoverIncomplete().catch(() => undefined);
-            await engine.resumeDueTimers().catch(() => undefined);
-            await new Promise((resolve) => setTimeout(resolve, 1_000));
+  it('settles every run', async () => {
+    for (let attempt = 0; attempt < repeat; attempt++) {
+      const pools = Array.from(
+        { length: pods },
+        () => new pg.Pool({ connectionString: url, max: 10 }),
+      );
+      const stores = pools.map((pool) => new DrizzlePgStateStore(drizzle(pool)));
+      await stores[0]?.ensureSchema();
+      await pools[0]?.query('TRUNCATE durable_workflow_runs CASCADE');
+      let deadlocks = 0;
+      const engines = stores.map((store, i) => {
+        const admit = store.tryAdmitSingleton.bind(store);
+        store.tryAdmitSingleton = async (...args) => {
+          try {
+            return await admit(...args);
+          } catch (err) {
+            if ((err as { cause?: { code?: string } }).cause?.code === '40P01') deadlocks++;
+            throw err;
           }
-        });
-        const total = fan > 0 ? 1 : runs;
-        await Promise.all(
-          Array.from({ length: total }, (_, n) => {
-            const engine = engines[n % engines.length] as WorkflowEngine;
-            return fan > 0
-              ? engine.start('fan', {}, `f-${n}`)
-              : engine.start('job', { key: `k${n % keys}` }, `r-${n}`);
-          }),
-        );
-        const settled = async () => {
-          const { rows } = await (pools[0] as pg.Pool).query(
-            `SELECT count(*)::int AS n FROM durable_workflow_runs WHERE status = 'completed'`,
-          );
-          return rows[0].n as number;
         };
-        const deadline = Date.now() + Number(process.env.H_DEADLINE_MS ?? 280_000);
-        let done = await settled();
-        while (done < total && Date.now() < deadline) {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-          done = await settled();
-        }
-        const seconds = (Date.now() - started) / 1000;
-        if (done < total) {
-          const { rows } = await (pools[0] as pg.Pool).query(
-            `SELECT id, status, tags, locked_by, locked_until, wake_at FROM durable_workflow_runs WHERE status <> 'completed' LIMIT 5`,
+        const transport = new InMemoryTransport();
+        transport.handle(STEP, async ({ i: n }: { i: number }) => n);
+        const engine = new WorkflowEngine({ store, transport, instanceId: `pod-${i}` });
+        engine.register(
+          'job',
+          '1',
+          async () => {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            return 'done';
+          },
+          { singleton: { key: (input: { key: string }) => input.key } },
+        );
+        engine.register('fan', '1', async (ctx) => {
+          await ctx.all(
+            line,
+            Array.from({ length: fan }, (_, n) => ({ i: n })),
           );
-          console.log(`STUCK ${JSON.stringify(rows)}`);
+          return 'done';
+        });
+        return engine;
+      });
+      const started = Date.now();
+      let stop = false;
+      const pollers = engines.map(async (engine) => {
+        while (!stop) {
+          // The module's TimerPoller: the same sweeps, in order, every second.
+          await engine.runPending().catch(() => undefined);
+          await engine.recoverIncomplete().catch(() => undefined);
+          await engine.resumeDueTimers().catch(() => undefined);
+          await new Promise((resolve) => setTimeout(resolve, 1_000));
         }
-        stop = true;
-        await Promise.all(pollers);
-        console.log(`HARNESS ${JSON.stringify({ runs: total, keys, fan, pods, seconds, done, deadlocks })}`);
-        await Promise.allSettled(engines.map((engine) => engine.drain()));
-        await Promise.allSettled(pools.map((pool) => pool.end()));
+      });
+      const total = fan > 0 ? 1 : runs;
+      await Promise.all(
+        Array.from({ length: total }, (_, n) => {
+          const engine = engines[n % engines.length] as WorkflowEngine;
+          return fan > 0
+            ? engine.start('fan', {}, `f-${n}`)
+            : engine.start('job', { key: `k${n % keys}` }, `r-${n}`);
+        }),
+      );
+      const settled = async () => {
+        const { rows } = await (pools[0] as pg.Pool).query(
+          `SELECT count(*)::int AS n FROM durable_workflow_runs WHERE status = 'completed'`,
+        );
+        return rows[0].n as number;
+      };
+      const deadline = Date.now() + Number(process.env.H_DEADLINE_MS ?? 280_000);
+      let done = await settled();
+      while (done < total && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        done = await settled();
       }
-    },
-    590_000,
-  );
+      const seconds = (Date.now() - started) / 1000;
+      if (done < total) {
+        const { rows } = await (pools[0] as pg.Pool).query(
+          `SELECT id, status, tags, locked_by, locked_until, wake_at FROM durable_workflow_runs WHERE status <> 'completed' LIMIT 5`,
+        );
+        console.log(`STUCK ${JSON.stringify(rows)}`);
+      }
+      stop = true;
+      await Promise.all(pollers);
+      console.log(
+        `HARNESS ${JSON.stringify({ runs: total, keys, fan, pods, seconds, done, deadlocks })}`,
+      );
+      await Promise.allSettled(engines.map((engine) => engine.drain()));
+      await Promise.allSettled(pools.map((pool) => pool.end()));
+    }
+  }, 590_000);
 });

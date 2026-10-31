@@ -18,9 +18,10 @@ let store: DrizzlePgStateStore;
 
 beforeAll(async () => {
   if (skipped) return;
-  const url =
-    process.env.DURABLE_TEST_PG_URL ??
-    (await (container = await new PostgreSqlContainer('postgres:16-alpine').start()).getConnectionUri());
+  if (!process.env.DURABLE_TEST_PG_URL) {
+    container = await new PostgreSqlContainer('postgres:16-alpine').start();
+  }
+  const url = process.env.DURABLE_TEST_PG_URL ?? container?.getConnectionUri();
   pool = new pg.Pool({ connectionString: url, max: 20 });
   store = new DrizzlePgStateStore(drizzle(pool));
   await store.ensureSchema();

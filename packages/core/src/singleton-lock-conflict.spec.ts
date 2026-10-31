@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { WorkflowEngine } from './engine';
+import { type SingletonConfig, WorkflowEngine } from './engine';
+import type { WorkflowRun } from './interfaces';
 import { SINGLETON_TRACKED_TAG } from './singleton-admission';
 import { isLockConflict } from './singleton-gate';
 import { startRun } from './test-helpers';
@@ -23,6 +24,9 @@ function setup() {
   );
   return { store, engine, executed: () => executed };
 }
+
+type Gate = { admit(run: WorkflowRun | null, cfg: SingletonConfig): Promise<boolean> };
+const gateOf = (engine: WorkflowEngine) => (engine as unknown as { singletons: Gate }).singletons;
 
 const settled = async (store: InMemoryStateStore, id: string) => {
   for (let i = 0; i < 500; i += 1) {
@@ -67,7 +71,7 @@ describe('a singleton claim the database aborts as a lock conflict', () => {
     await startRun(engine, 'job', {}, 'done');
     await settled(store, 'done');
     await store.updateRun('done', { status: 'cancelling' });
-    const gate = (engine as unknown as { singletons: { admit: Function } }).singletons;
+    const gate = gateOf(engine);
     vi.spyOn(store, 'tryAdmitSingleton').mockRejectedValue(deadlock());
     const run = await store.getRun('done');
     expect(await gate.admit(run, { key: () => 'k' })).toBe(false);
@@ -98,7 +102,7 @@ describe('a singleton claim the database aborts as a lock conflict', () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
-    const gate = (engine as unknown as { singletons: { admit: Function } }).singletons;
+    const gate = gateOf(engine);
     vi.spyOn(store, 'tryAdmitSingleton').mockRejectedValue(new Error('boom'));
     await expect(gate.admit(await store.getRun('x'), { key: () => 'k' })).rejects.toThrow('boom');
     await engine.drain();

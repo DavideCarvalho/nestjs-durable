@@ -15,6 +15,7 @@ import {
   type RunValueFacetOptions,
   type RunValueFacetRow,
   SINGLETON_ACTIVE_STATUSES,
+  SINGLETON_LOCK_CHUNK,
   type ScheduleQuery,
   type ScheduleRecord,
   type SignalWaiter,
@@ -35,7 +36,6 @@ import {
   parseDuration,
   runValueFacetsFromRuns,
   singletonAdmissionDenialPatch,
-  SINGLETON_LOCK_CHUNK,
   singletonAdmissionTags,
   singletonClaimantIds,
 } from '@dudousxd/nestjs-durable-core';
