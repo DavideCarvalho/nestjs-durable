@@ -4827,7 +4827,8 @@ export class WorkflowEngine {
     // Not when fenced: the lease is another instance's now (see holdExecutionLease).
     if (!this.isFenced(run.id)) {
       this.handOffLease(run.id);
-      await this.store.releaseRunLock(run.id);
+      // By owner: a lease that lapsed unnoticed during the claim is another instance's now.
+      await this.store.releaseRunLock(run.id, this.instanceId);
     }
     if (!current) throw new Error(`run ${run.id} was deleted during singleton admission`);
     if (current.status === 'suspended') {

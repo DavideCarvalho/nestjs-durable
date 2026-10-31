@@ -14,6 +14,39 @@ const SINGLETON_RETRY_MS = 1000;
  * in `[-SINGLETON_RETRY_JITTER_MS, +SINGLETON_RETRY_JITTER_MS]`.
  */
 const SINGLETON_RETRY_JITTER_MS = 250;
+/** Claims a database may abort as a lock conflict before the run waits for its retry timer instead. */
+const ADMISSION_ATTEMPTS = 3;
+const ADMISSION_BACKOFF_MS = 40;
+
+/**
+ * Deadlock and serialization failure on Postgres and MySQL, and Prisma's name for either. Prisma's
+ * driver adapters report them as a `TransactionWriteConflict` kind or the driver's `originalCode`.
+ */
+const LOCK_CONFLICT_CODES = new Set([
+  '40P01',
+  '40001',
+  'ER_LOCK_DEADLOCK',
+  '1213',
+  'P2034',
+  'TransactionWriteConflict',
+]);
+
+/** Whether a store error, through any driver or ORM wrapper around it, is an aborted lock conflict. */
+export function isLockConflict(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  const pending = [error];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current !== 'object' || current === null || seen.has(current)) continue;
+    seen.add(current);
+    const e = current as Record<string, unknown>;
+    for (const code of [e.code, e.errno, e.sqlState, e.sqlstate, e.originalCode, e.kind]) {
+      if (LOCK_CONFLICT_CODES.has(String(code))) return true;
+    }
+    pending.push(e.cause, e.driverError, e.originalError, e.meta, e.driverAdapterError);
+  }
+  return false;
+}
 
 export interface SingletonGateDeps {
   store: Pick<StateStore, 'listRuns' | 'updateRun' | 'tryAdmitSingleton'>;
@@ -77,13 +110,7 @@ export class SingletonGate {
         'Singleton workflows require StateStore.tryAdmitSingleton for atomic durable admission',
       );
     }
-    const admitted = await this.deps.store.tryAdmitSingleton(
-      run.id,
-      this.tag(cfg, run.input),
-      run.workflow,
-      cfg.limit ?? 1,
-      this.retryWakeAt(),
-    );
+    const admitted = await this.claim(run, cfg);
     if (admitted && !run.tags?.includes(SINGLETON_ADMITTED_TAG)) {
       run.tags = [
         ...(run.tags ?? []).filter((tag) => tag !== SINGLETON_TRACKED_TAG),
@@ -91,6 +118,34 @@ export class SingletonGate {
       ];
     }
     return admitted;
+  }
+
+  /**
+   * One claim, retried when the database aborts it as a lock conflict. A conflict that outlasts the
+   * retries answers "not admitted", so the engine releases this turn's lease, instead of stranding
+   * the run until the lease lapses. It writes nothing to the run: this turn's lease may have lapsed
+   * during the claim, and another instance may now hold the run, its slot and newer tags. A later
+   * sweep re-drives the run: recovery once it is unleased, or its timer if it is parked.
+   */
+  private async claim(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
+    const admit = this.deps.store.tryAdmitSingleton as NonNullable<StateStore['tryAdmitSingleton']>;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await admit.call(
+          this.deps.store,
+          run.id,
+          this.tag(cfg, run.input),
+          run.workflow,
+          cfg.limit ?? 1,
+          this.retryWakeAt(),
+        );
+      } catch (error) {
+        if (!isLockConflict(error)) throw error;
+        if (attempt >= ADMISSION_ATTEMPTS) return false;
+        const backoff = ADMISSION_BACKOFF_MS * attempt * (0.5 + Math.random());
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+      }
+    }
   }
 
   /**

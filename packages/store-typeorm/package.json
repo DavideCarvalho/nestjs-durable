@@ -30,7 +30,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
-    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "@dudousxd/nestjs-durable-core": ">=0.86.1 <1.0.0",
     "typeorm": "^0.3.0"
   },
   "devDependencies": {

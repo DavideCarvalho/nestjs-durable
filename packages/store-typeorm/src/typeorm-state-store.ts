@@ -16,6 +16,7 @@ import {
   type RunValueFacetOptions,
   type RunValueFacetRow,
   SINGLETON_ACTIVE_STATUSES,
+  SINGLETON_LOCK_CHUNK,
   type ScheduleQuery,
   type ScheduleRecord,
   type SignalWaiter,
@@ -36,12 +37,14 @@ import {
   runValueFacetsFromRuns,
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
+  singletonClaimantIds,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Between,
   Brackets,
   type DataSource,
   type EntityManager,
+  type FindOptionsWhere,
   In,
   IsNull,
   LessThan,
@@ -182,11 +185,22 @@ export class TypeOrmStateStore implements StateStore {
       await previous;
     }
     try {
+      const where = { workflow, status: In(SINGLETON_ACTIVE_STATUSES) };
+      const claimants = sqlite ? [] : await this.singletonClaimants(where, tag);
       return await this.dataSource.transaction(async (em) => {
         const repo = em.getRepository(WorkflowRunEntity);
-        const where = { workflow, status: In(SINGLETON_ACTIVE_STATUSES) };
-        // Acquire write locks BEFORE taking the admission snapshot (also serializes SQLite writers).
-        await repo.update(where, { workflow });
+        // Acquire locks BEFORE taking the admission snapshot: SQLite's single writer lock, or this
+        // key's rows in one global order, so claims queue instead of deadlocking.
+        if (sqlite) await repo.update(where, { workflow });
+        for (let at = 0; at < claimants.length; at += SINGLETON_LOCK_CHUNK) {
+          await repo
+            .createQueryBuilder('r')
+            .select(['r.id'])
+            .where('r.id IN (:...ids)', { ids: claimants.slice(at, at + SINGLETON_LOCK_CHUNK) })
+            .orderBy('r.id', 'ASC')
+            .setLock('pessimistic_write')
+            .getMany();
+        }
         const runs = (await repo.find({ where })).map(fromRunEntity);
         const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
         if (!tags) {
@@ -208,6 +222,24 @@ export class TypeOrmStateStore implements StateStore {
       });
     } finally {
       release?.();
+    }
+  }
+
+  /** Read on the primary: a lagging replica would leave rows out of the lock set. */
+  private async singletonClaimants(
+    where: FindOptionsWhere<WorkflowRunEntity>,
+    tag: string,
+  ): Promise<string[]> {
+    const runner = this.dataSource.createQueryRunner('master');
+    try {
+      return singletonClaimantIds(
+        await runner.manager
+          .getRepository(WorkflowRunEntity)
+          .find({ select: { id: true, tags: true }, where, order: { id: 'ASC' } }),
+        tag,
+      );
+    } finally {
+      await runner.release();
     }
   }
 
