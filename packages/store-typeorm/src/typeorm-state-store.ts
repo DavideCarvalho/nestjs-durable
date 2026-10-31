@@ -44,6 +44,7 @@ import {
   Brackets,
   type DataSource,
   type EntityManager,
+  type FindOptionsWhere,
   In,
   IsNull,
   LessThan,
@@ -185,14 +186,7 @@ export class TypeOrmStateStore implements StateStore {
     }
     try {
       const where = { workflow, status: In(SINGLETON_ACTIVE_STATUSES) };
-      const claimants = sqlite
-        ? []
-        : singletonClaimantIds(
-            await this.dataSource
-              .getRepository(WorkflowRunEntity)
-              .find({ select: { id: true, tags: true }, where, order: { id: 'ASC' } }),
-            tag,
-          );
+      const claimants = sqlite ? [] : await this.singletonClaimants(where, tag);
       return await this.dataSource.transaction(async (em) => {
         const repo = em.getRepository(WorkflowRunEntity);
         // Acquire locks BEFORE taking the admission snapshot: SQLite's single writer lock, or this
@@ -228,6 +222,24 @@ export class TypeOrmStateStore implements StateStore {
       });
     } finally {
       release?.();
+    }
+  }
+
+  /** Read on the primary: a lagging replica would leave rows out of the lock set. */
+  private async singletonClaimants(
+    where: FindOptionsWhere<WorkflowRunEntity>,
+    tag: string,
+  ): Promise<string[]> {
+    const runner = this.dataSource.createQueryRunner('master');
+    try {
+      return singletonClaimantIds(
+        await runner.manager
+          .getRepository(WorkflowRunEntity)
+          .find({ select: { id: true, tags: true }, where, order: { id: 'ASC' } }),
+        tag,
+      );
+    } finally {
+      await runner.release();
     }
   }
 

@@ -207,7 +207,8 @@ export class PrismaStateStore implements StateStore {
     const lockRows = rowLockDialect(this.db);
     const claimants = lockRows
       ? singletonClaimantIds(
-          await this.db.durableWorkflowRun.findMany({
+          // The primary, under the read-replicas extension: a lagging replica would leave rows out.
+          await primaryOf(this.db).durableWorkflowRun.findMany({
             where,
             select: { id: true, tags: true },
             orderBy: { id: 'asc' },
@@ -1445,6 +1446,12 @@ const jsonText = (v: unknown): string | null => (v == null ? null : JSON.stringi
  * The raw settle for the client's database, or `undefined` (a client without raw queries, or a
  * provider without one here), which settles row by row through `updateMany`.
  */
+/** `$primary()` when `@prisma/extension-read-replicas` is on the client, else the client itself. */
+function primaryOf(db: DurablePrismaClient): DurablePrismaClient {
+  const client = db as unknown as { $primary?: () => DurablePrismaClient };
+  return typeof client.$primary === 'function' ? client.$primary() : db;
+}
+
 /** `SELECT … ORDER BY id FOR UPDATE` on the run rows, where the provider has row locks. */
 function rowLockDialect(
   db: DurablePrismaClient,

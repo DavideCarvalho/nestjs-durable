@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { type SingletonConfig, WorkflowEngine } from './engine';
 import type { WorkflowRun } from './interfaces';
-import { SINGLETON_TRACKED_TAG } from './singleton-admission';
+import { SINGLETON_ADMITTED_TAG } from './singleton-admission';
 import { isLockConflict } from './singleton-gate';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
@@ -24,6 +24,18 @@ function setup() {
   );
   return { store, engine, executed: () => executed };
 }
+
+const run = (id: string, tags: string[]): WorkflowRun => ({
+  id,
+  workflow: 'job',
+  workflowVersion: '1',
+  status: 'running',
+  input: {},
+  attempts: 0,
+  tags,
+  createdAt: new Date(1),
+  updatedAt: new Date(1),
+});
 
 type Gate = { admit(run: WorkflowRun | null, cfg: SingletonConfig): Promise<boolean> };
 const gateOf = (engine: WorkflowEngine) => (engine as unknown as { singletons: Gate }).singletons;
@@ -52,31 +64,62 @@ describe('a singleton claim the database aborts as a lock conflict', () => {
     await engine.drain();
   });
 
-  it('parks the run on its retry timer with its lease released once retries run out', async () => {
+  it('once retries run out, releases the lease and writes nothing, and a sweep re-drives it', async () => {
     const { store, engine, executed } = setup();
+    const admit = store.tryAdmitSingleton.bind(store);
     const spy = vi.spyOn(store, 'tryAdmitSingleton').mockRejectedValue(deadlock());
-    await startRun(engine, 'job', {}, 'r');
+    await engine.start('job', {}, 'r');
     const run = await settled(store, 'r');
     expect(spy).toHaveBeenCalledTimes(3);
-    expect(run.status).toBe('suspended');
-    expect(run.wakeAt).toBeTypeOf('number');
-    expect(run.lockedUntil ?? 0).toBe(0);
-    expect(run.tags).toContain(SINGLETON_TRACKED_TAG);
+    expect(run.status).toBe('running');
+    expect(run.lockedBy).toBeUndefined();
     expect(executed()).toBe(0);
+    spy.mockImplementation(admit);
+    await engine.recoverIncomplete();
+    expect((await settled(store, 'r')).status).toBe('completed');
     await engine.drain();
   });
 
-  it('never revives a cancelling run', async () => {
-    const { store, engine } = setup();
-    await startRun(engine, 'job', {}, 'done');
-    await settled(store, 'done');
-    await store.updateRun('done', { status: 'cancelling' });
-    const gate = gateOf(engine);
-    vi.spyOn(store, 'tryAdmitSingleton').mockRejectedValue(deadlock());
-    const run = await store.getRun('done');
-    expect(await gate.admit(run, { key: () => 'k' })).toBe(false);
-    expect((await store.getRun('done'))?.status).toBe('cancelling');
+  it('a parked run that hits them on resume is re-driven by its timer', async () => {
+    const { store, engine, executed } = setup();
+    await store.createRun(run('holder', ['singleton:k', SINGLETON_ADMITTED_TAG]));
+    await startRun(engine, 'job', {}, 'waiter');
+    const parked = await settled(store, 'waiter');
+    expect(parked.status).toBe('suspended');
+    await store.updateRun('holder', { status: 'completed' });
+    const admit = store.tryAdmitSingleton.bind(store);
+    const spy = vi.spyOn(store, 'tryAdmitSingleton').mockRejectedValue(deadlock());
+    const due = (parked.wakeAt ?? 0) + 1;
+    await engine.resumeDueTimers(due);
+    expect(spy).toHaveBeenCalledTimes(3);
+    spy.mockImplementation(admit);
+    await engine.resumeDueTimers(due);
+    await engine.recoverIncomplete(due);
+    expect((await settled(store, 'waiter')).status).toBe('completed');
+    expect(executed()).toBe(1);
     await engine.drain();
+  });
+
+  it('never touches a run another instance took over during the claim', async () => {
+    const { store, engine, executed } = setup();
+    const taken = ['singleton:k', SINGLETON_ADMITTED_TAG];
+    const spy = vi.spyOn(store, 'tryAdmitSingleton').mockImplementation(async (id) => {
+      // This turn's lease lapses mid-claim: another instance is admitted and holds the run.
+      await store.updateRun(id, {
+        tags: taken,
+        lockedBy: 'other',
+        lockedUntil: Date.now() + 60_000,
+      });
+      throw deadlock();
+    });
+    await engine.start('job', {}, 'r');
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(3));
+    await engine.drain();
+    const run = await store.getRun('r');
+    expect(run?.status).toBe('running');
+    expect(run?.tags).toEqual(taken);
+    expect(run?.lockedBy).toBe('other');
+    expect(executed()).toBe(0);
   });
 
   it('recognises each driver shape, and nothing else', () => {
@@ -85,6 +128,19 @@ describe('a singleton claim the database aborts as a lock conflict', () => {
     expect(isLockConflict({ errno: 1213 })).toBe(true);
     expect(isLockConflict({ code: 'P2010', meta: { code: '40P01' } })).toBe(true);
     expect(isLockConflict({ code: 'P2034' })).toBe(true);
+    // Prisma driver adapters, 6 and 7.
+    expect(
+      isLockConflict({
+        code: 'P2010',
+        meta: { driverAdapterError: { cause: { kind: 'TransactionWriteConflict' } } },
+      }),
+    ).toBe(true);
+    expect(
+      isLockConflict({
+        code: 'P2010',
+        meta: { driverAdapterError: { cause: { kind: 'postgres', originalCode: '40P01' } } },
+      }),
+    ).toBe(true);
     expect(isLockConflict(new Error('boom'))).toBe(false);
     expect(isLockConflict({ code: '23505' })).toBe(false);
   });

@@ -5,7 +5,6 @@ import {
   SINGLETON_ACTIVE_STATUSES,
   SINGLETON_ADMITTED_TAG,
   SINGLETON_TRACKED_TAG,
-  withSingletonTracked,
 } from './singleton-admission';
 
 const SINGLETON_RETRY_MS = 1000;
@@ -19,8 +18,18 @@ const SINGLETON_RETRY_JITTER_MS = 250;
 const ADMISSION_ATTEMPTS = 3;
 const ADMISSION_BACKOFF_MS = 40;
 
-/** Deadlock and serialization failure on Postgres and MySQL, and Prisma's name for either. */
-const LOCK_CONFLICT_CODES = new Set(['40P01', '40001', 'ER_LOCK_DEADLOCK', '1213', 'P2034']);
+/**
+ * Deadlock and serialization failure on Postgres and MySQL, and Prisma's name for either. Prisma's
+ * driver adapters report them as a `TransactionWriteConflict` kind or the driver's `originalCode`.
+ */
+const LOCK_CONFLICT_CODES = new Set([
+  '40P01',
+  '40001',
+  'ER_LOCK_DEADLOCK',
+  '1213',
+  'P2034',
+  'TransactionWriteConflict',
+]);
 
 /** Whether a store error, through any driver or ORM wrapper around it, is an aborted lock conflict. */
 export function isLockConflict(error: unknown): boolean {
@@ -31,16 +40,16 @@ export function isLockConflict(error: unknown): boolean {
     if (typeof current !== 'object' || current === null || seen.has(current)) continue;
     seen.add(current);
     const e = current as Record<string, unknown>;
-    for (const code of [e.code, e.errno, e.sqlState, e.sqlstate]) {
+    for (const code of [e.code, e.errno, e.sqlState, e.sqlstate, e.originalCode, e.kind]) {
       if (LOCK_CONFLICT_CODES.has(String(code))) return true;
     }
-    pending.push(e.cause, e.driverError, e.originalError, e.meta);
+    pending.push(e.cause, e.driverError, e.originalError, e.meta, e.driverAdapterError);
   }
   return false;
 }
 
 export interface SingletonGateDeps {
-  store: Pick<StateStore, 'listRuns' | 'updateRun' | 'updateRunIf' | 'tryAdmitSingleton'>;
+  store: Pick<StateStore, 'listRuns' | 'updateRun' | 'tryAdmitSingleton'>;
   clock: () => number;
   /** Hand a gated run to the run dispatcher (fire-and-forget, like the engine's other dispatches). */
   dispatch: (runId: string) => void;
@@ -113,8 +122,10 @@ export class SingletonGate {
 
   /**
    * One claim, retried when the database aborts it as a lock conflict. A conflict that outlasts the
-   * retries parks the run on its retry timer: thrown, it would leave the run leased and idle until
-   * the lease lapsed.
+   * retries answers "not admitted", so the engine releases this turn's lease, instead of stranding
+   * the run until the lease lapses. It writes nothing to the run: this turn's lease may have lapsed
+   * during the claim, and another instance may now hold the run, its slot and newer tags. A later
+   * sweep re-drives the run: recovery once it is unleased, or its timer if it is parked.
    */
   private async claim(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
     const admit = this.deps.store.tryAdmitSingleton as NonNullable<StateStore['tryAdmitSingleton']>;
@@ -130,28 +141,9 @@ export class SingletonGate {
         );
       } catch (error) {
         if (!isLockConflict(error)) throw error;
-        if (attempt < ADMISSION_ATTEMPTS) {
-          const backoff = ADMISSION_BACKOFF_MS * attempt * (0.5 + Math.random());
-          await new Promise((resolve) => setTimeout(resolve, backoff));
-          continue;
-        }
-        // Only a run still competing: a cancelling or settled one must never be revived.
-        const patch = {
-          status: 'suspended' as const,
-          wakeAt: this.retryWakeAt(),
-          tags: withSingletonTracked(run.tags),
-          updatedAt: new Date(),
-        };
-        if (this.deps.store.updateRunIf) {
-          await this.deps.store.updateRunIf(
-            run.id,
-            ['pending', 'running', 'suspended', 'blocked'],
-            patch,
-          );
-        } else if (run.status !== 'cancelling') {
-          await this.deps.store.updateRun(run.id, patch);
-        }
-        return false;
+        if (attempt >= ADMISSION_ATTEMPTS) return false;
+        const backoff = ADMISSION_BACKOFF_MS * attempt * (0.5 + Math.random());
+        await new Promise((resolve) => setTimeout(resolve, backoff));
       }
     }
   }

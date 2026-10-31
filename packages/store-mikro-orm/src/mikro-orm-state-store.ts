@@ -185,6 +185,8 @@ export class MikroOrmStateStore implements StateStore {
           await reader.find(WorkflowRunEntity, where, {
             fields: ['id', 'tags'],
             orderBy: { id: 'ASC' },
+            // The primary: a lagging replica would leave rows out of the lock set.
+            connectionType: 'write',
           }),
           tag,
         );
