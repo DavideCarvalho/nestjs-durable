@@ -43,7 +43,7 @@ importers:
         version: 1.5.9(@swc/core@1.16.13)(rollup@4.61.1)
       vitest:
         specifier: 2.1.9
-        version: 2.1.9(@types/node@22.20.2)(happy-dom@20.11.1)(lightningcss@1.32.0)
+        version: 2.1.9(@types/node@22.20.2)(happy-dom@20.14.6)(lightningcss@1.32.0)
       zod:
         specifier: 3.25.76
         version: 3.25.76
@@ -231,8 +231,8 @@ importers:
         specifier: 0.28.2
         version: 0.28.2
       happy-dom:
-        specifier: 20.11.1
-        version: 20.11.1
+        specifier: 20.14.6
+        version: 20.14.6
       postcss:
         specifier: 8.5.28
         version: 8.5.28
@@ -585,7 +585,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: 2.1.9
-        version: 2.1.9(@types/node@25.9.8)(happy-dom@20.11.1)(lightningcss@1.32.0)
+        version: 2.1.9(@types/node@25.9.8)(happy-dom@20.14.6)(lightningcss@1.32.0)
 
   packages/transport-bullmq:
     devDependencies:
@@ -705,7 +705,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: 2.1.9
-        version: 2.1.9(@types/node@25.9.8)(happy-dom@20.11.1)(lightningcss@1.32.0)
+        version: 2.1.9(@types/node@25.9.8)(happy-dom@20.14.6)(lightningcss@1.32.0)
 
   website:
     dependencies:
@@ -2925,6 +2925,7 @@ packages:
   '@smithy/core@3.33.3':
     resolution: {integrity: sha512-CsOeKq/9kA3y6VJHt+/+VTCtBaxJ4OTFpgrjIUhPpDIKxBci1k2bJaQASF2h/ELWrulGp+t97DZ0mevfAD8idg==}
     engines: {node: '>=18.0.0'}
+    deprecated: Deprecated due to a bug in custom logger data redaction. See https://github.com/aws/aws-sdk-js-v3/issues/8393.
 
   '@smithy/credential-provider-imds@4.5.2':
     resolution: {integrity: sha512-A9uSdn72ozbRUSit0eib0TW7nXuNPlaeM0zcGkJ+nE6tFcSDbnmtwoxbTCFBukVQcszDAyvsd7+rTduPTXpygg==}
@@ -4860,8 +4861,8 @@ packages:
   graceful-fs@4.2.11:
     resolution: {integrity: sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==}
 
-  happy-dom@20.11.1:
-    resolution: {integrity: sha512-XSt8tMzbW9ymE7687xztkO1ckR7qJNQ3LywY9vlYGhGi3zXrGBHuUo2Cl1ztZaICW+1eAGdkLbj6iwVqDT33kg==}
+  happy-dom@20.14.6:
+    resolution: {integrity: sha512-5DDsf4QmEIlRL6NkCv/fxSjYHHkZceL/IaYQdJc2h3G7DRTEai++VTjbfL0LB9geW2VrA3+vrjF3Efx+OTtX0Q==}
     engines: {node: '>=20.0.0'}
 
   has-flag@4.0.0:
@@ -9345,13 +9346,13 @@ snapshots:
 
   '@types/docker-modem@3.0.6':
     dependencies:
-      '@types/node': 22.20.2
+      '@types/node': 25.9.8
       '@types/ssh2': 1.15.5
 
   '@types/dockerode@3.3.47':
     dependencies:
       '@types/docker-modem': 3.0.6
-      '@types/node': 22.20.2
+      '@types/node': 25.9.8
       '@types/ssh2': 1.15.5
 
   '@types/estree-jsx@1.0.5':
@@ -9421,11 +9422,11 @@ snapshots:
 
   '@types/ssh2-streams@0.1.13':
     dependencies:
-      '@types/node': 22.20.2
+      '@types/node': 25.9.8
 
   '@types/ssh2@0.5.52':
     dependencies:
-      '@types/node': 22.20.2
+      '@types/node': 25.9.8
       '@types/ssh2-streams': 0.1.13
 
   '@types/ssh2@1.15.5':
@@ -9454,7 +9455,7 @@ snapshots:
 
   '@types/ws@8.18.1':
     dependencies:
-      '@types/node': 22.20.2
+      '@types/node': 25.9.8
 
   '@typescript-eslint/parser@8.61.0(eslint@9.39.5(jiti@2.7.0))(typescript@5.9.3)':
     dependencies:
@@ -9865,7 +9866,7 @@ snapshots:
 
   buffer-image-size@0.6.4:
     dependencies:
-      '@types/node': 22.20.2
+      '@types/node': 25.9.8
 
   buffer@5.7.1:
     dependencies:
@@ -11004,9 +11005,9 @@ snapshots:
 
   graceful-fs@4.2.11: {}
 
-  happy-dom@20.11.1:
+  happy-dom@20.14.6:
     dependencies:
-      '@types/node': 25.9.6
+      '@types/node': 25.9.8
       '@types/whatwg-mimetype': 3.0.2
       '@types/ws': 8.18.1
       buffer-image-size: 0.6.4
@@ -12432,7 +12433,7 @@ snapshots:
       '@protobufjs/path': 1.1.2
       '@protobufjs/pool': 1.1.0
       '@protobufjs/utf8': 1.1.1
-      '@types/node': 22.20.2
+      '@types/node': 25.9.8
       long: 5.3.2
 
   proxy-addr@2.0.7:
@@ -13602,7 +13603,7 @@ snapshots:
       fsevents: 2.3.3
       lightningcss: 1.32.0
 
-  vitest@2.1.9(@types/node@22.20.2)(happy-dom@20.11.1)(lightningcss@1.32.0):
+  vitest@2.1.9(@types/node@22.20.2)(happy-dom@20.14.6)(lightningcss@1.32.0):
     dependencies:
       '@vitest/expect': 2.1.9
       '@vitest/mocker': 2.1.9(vite@5.4.21(@types/node@22.20.2)(lightningcss@1.32.0))
@@ -13626,7 +13627,7 @@ snapshots:
       why-is-node-running: 2.3.0
     optionalDependencies:
       '@types/node': 22.20.2
-      happy-dom: 20.11.1
+      happy-dom: 20.14.6
     transitivePeerDependencies:
       - less
       - lightningcss
@@ -13638,7 +13639,7 @@ snapshots:
       - supports-color
       - terser
 
-  vitest@2.1.9(@types/node@25.9.8)(happy-dom@20.11.1)(lightningcss@1.32.0):
+  vitest@2.1.9(@types/node@25.9.8)(happy-dom@20.14.6)(lightningcss@1.32.0):
     dependencies:
       '@vitest/expect': 2.1.9
       '@vitest/mocker': 2.1.9(vite@5.4.21(@types/node@22.20.2)(lightningcss@1.32.0))
@@ -13662,7 +13663,7 @@ snapshots:
       why-is-node-running: 2.3.0
     optionalDependencies:
       '@types/node': 25.9.8
-      happy-dom: 20.11.1
+      happy-dom: 20.14.6
     transitivePeerDependencies:
       - less
       - lightningcss
