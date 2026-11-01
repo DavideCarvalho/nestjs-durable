@@ -22,7 +22,7 @@ jobs:
         run: |
           python -m pip install --upgrade build
           python -m build
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: dist
           path: clients/python/dist/
