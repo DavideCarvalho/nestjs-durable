@@ -1093,6 +1093,10 @@ export class WorkflowEngine {
    * releases when its budget runs out.
    */
   private readonly executionLeases = new Map<string, ExecutionLease>();
+  /** Runs a caller just locked to execute now, so their turn has nothing to prove and no await to add. */
+  private readonly lockedForTurn = new Set<string>();
+  /** Runs this instance holds for a moment and will release, not to execute (see {@link handOffDue}). */
+  private readonly claimsInFlight = new Map<string, number>();
   /** Pager hooks for stranded runs (see {@link onStalled}). */
   private readonly stalledListeners = new Set<(info: StalledRunInfo) => void>();
   /** Runs already paged about, by id → the `updatedAt` of the paged episode (see {@link sweepStalled}). */
@@ -1502,6 +1506,16 @@ export class WorkflowEngine {
     }
   }
 
+  private markClaim(runId: string): void {
+    this.claimsInFlight.set(runId, (this.claimsInFlight.get(runId) ?? 0) + 1);
+  }
+
+  private unmarkClaim(runId: string): void {
+    const left = (this.claimsInFlight.get(runId) ?? 1) - 1;
+    if (left > 0) this.claimsInFlight.set(runId, left);
+    else this.claimsInFlight.delete(runId);
+  }
+
   /**
    * Hand due runs (timers, blocked runs due for a fleet re-check) to whichever instance takes them
    * off the run queue. Each is claimed first, under its lease, by pushing its `wakeAt` one lease
@@ -1517,27 +1531,33 @@ export class WorkflowEngine {
     const claimed: WorkflowRun[] = [];
     for (const run of runs) {
       if (this.draining) break;
-      if (!(await this.store.tryLockRun(run.id, this.instanceId, nowMs + this.leaseMs, nowMs))) {
-        continue;
-      }
-      // Checked before the lease-long `wakeAt` below, which would keep the orphan from aging.
-      // A registered run never awaits here, so its hand-off timing is unchanged.
-      if (!this.isRegisteredHere(run) && !(await this.canResolveWorkflow(run))) {
-        const result = await this.settleUnregistered(run, nowMs);
-        if (result) settled?.set(run.id, result);
-        else if (result === undefined) this.logUnregisteredSkip(run);
-        continue;
-      }
+      // Marked before the lock, so no turn of this instance can take this claim for its own lease.
+      this.markClaim(run.id);
       try {
-        const patch = { wakeAt: nowMs + this.leaseMs };
-        if (this.store.updateRunIf) {
-          if (await this.store.updateRunIf(run.id, [run.status], patch)) claimed.push(run);
-        } else {
-          await this.store.updateRun(run.id, patch);
-          claimed.push(run);
+        if (!(await this.store.tryLockRun(run.id, this.instanceId, nowMs + this.leaseMs, nowMs))) {
+          continue;
+        }
+        // Checked before the lease-long `wakeAt` below, which would keep the orphan from aging.
+        // A registered run never awaits here, so its hand-off timing is unchanged.
+        if (!this.isRegisteredHere(run) && !(await this.canResolveWorkflow(run))) {
+          const result = await this.settleUnregistered(run, nowMs);
+          if (result) settled?.set(run.id, result);
+          else if (result === undefined) this.logUnregisteredSkip(run);
+          continue;
+        }
+        try {
+          const patch = { wakeAt: nowMs + this.leaseMs };
+          if (this.store.updateRunIf) {
+            if (await this.store.updateRunIf(run.id, [run.status], patch)) claimed.push(run);
+          } else {
+            await this.store.updateRun(run.id, patch);
+            claimed.push(run);
+          }
+        } finally {
+          await this.store.releaseRunLock(run.id, this.instanceId);
         }
       } finally {
-        await this.store.releaseRunLock(run.id);
+        this.unmarkClaim(run.id);
       }
     }
     try {
@@ -3292,6 +3312,7 @@ export class WorkflowEngine {
       nowMs,
     );
     if (!acquired) return null;
+    this.lockedForTurn.add(runId);
     // resume() checks the namespace and throws NamespaceMismatch when it doesn't match — no extra
     // await before the call, so the microtask ordering (critical for cancel-safety) is unchanged.
     return this.resumeImplicit(runId).catch(async (err) => {
@@ -3666,6 +3687,7 @@ export class WorkflowEngine {
       try {
         // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
         const settled = onLocked ? await onLocked(run) : undefined;
+        if (!settled) this.lockedForTurn.add(run.id);
         results.push(settled ?? (await this.resumeImplicit(run.id)));
       } catch (error) {
         if (error instanceof WorkflowNotRegistered) {
@@ -4863,7 +4885,17 @@ export class WorkflowEngine {
     // The wakes this turn answers: it reads the store after they were recorded.
     const reason = this.wakeReasons.get(run.id) ?? { generic: true, fans: new Map() };
     this.wakeReasons.delete(run.id);
-    if (run.lockedBy !== this.instanceId || (run.lockedUntil ?? 0) <= lockNow) {
+    // `run` may have been read while this instance held only a short claim that is now released, or is
+    // about to be. So the re-entry is proved against the store, by owner, never read off the snapshot, and
+    // a claim in flight is never re-entered: a turn holding nothing runs beside whoever locks next.
+    const lockedForTurn = this.lockedForTurn.delete(run.id);
+    const reentered =
+      run.lockedBy === this.instanceId &&
+      (run.lockedUntil ?? 0) > lockNow &&
+      !this.claimsInFlight.has(run.id) &&
+      (lockedForTurn ||
+        (await this.store.renewRunLock(run.id, this.instanceId, lockNow + this.leaseMs)));
+    if (!reentered) {
       if (
         !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
       ) {
