@@ -1097,6 +1097,8 @@ export class WorkflowEngine {
   private readonly lockedForTurn = new Set<string>();
   /** Runs this instance holds for a moment and will release, not to execute (see {@link handOffDue}). */
   private readonly claimsInFlight = new Map<string, number>();
+  /** How many such claims each run has had, so a proof can tell one came and went (see {@link proveOwnLease}). */
+  private readonly claimsMade = new Map<string, number>();
   /** Pager hooks for stranded runs (see {@link onStalled}). */
   private readonly stalledListeners = new Set<(info: StalledRunInfo) => void>();
   /** Runs already paged about, by id → the `updatedAt` of the paged episode (see {@link sweepStalled}). */
@@ -1508,6 +1510,21 @@ export class WorkflowEngine {
 
   private markClaim(runId: string): void {
     this.claimsInFlight.set(runId, (this.claimsInFlight.get(runId) ?? 0) + 1);
+    // Bounded by forgetting: a proof under way then reads a changed count, and locks the ordinary way.
+    if (this.claimsMade.size >= 4096) this.claimsMade.clear();
+    this.claimsMade.set(runId, (this.claimsMade.get(runId) ?? 0) + 1);
+  }
+
+  /**
+   * Whether this instance holds the run's lease for a turn, from the store and by owner. A renewal can land
+   * on a claim marked after it was sent, and that claim is about to be released, so any claim begun while
+   * the renewal was out, even one already over, leaves it unproved.
+   */
+  private async proveOwnLease(runId: string, nowMs: number): Promise<boolean> {
+    if (this.claimsInFlight.has(runId)) return false;
+    const before = this.claimsMade.get(runId);
+    const renewed = await this.store.renewRunLock(runId, this.instanceId, nowMs + this.leaseMs);
+    return renewed && !this.claimsInFlight.has(runId) && this.claimsMade.get(runId) === before;
   }
 
   private unmarkClaim(runId: string): void {
@@ -3315,15 +3332,17 @@ export class WorkflowEngine {
     this.lockedForTurn.add(runId);
     // resume() checks the namespace and throws NamespaceMismatch when it doesn't match — no extra
     // await before the call, so the microtask ordering (critical for cancel-safety) is unchanged.
-    return this.resumeImplicit(runId).catch(async (err) => {
-      if (err instanceof NamespaceMismatch) return null;
-      if (err instanceof WorkflowNotRegistered) {
-        const run = await this.store.getRun(runId);
-        const settled = run ? await this.settleUnregistered(run, nowMs) : null;
-        if (settled !== undefined) return settled;
-      }
-      throw err;
-    });
+    return this.resumeImplicit(runId)
+      .finally(() => this.lockedForTurn.delete(runId))
+      .catch(async (err) => {
+        if (err instanceof NamespaceMismatch) return null;
+        if (err instanceof WorkflowNotRegistered) {
+          const run = await this.store.getRun(runId);
+          const settled = run ? await this.settleUnregistered(run, nowMs) : null;
+          if (settled !== undefined) return settled;
+        }
+        throw err;
+      });
   }
 
   /**
@@ -3702,6 +3721,8 @@ export class WorkflowEngine {
           `[nestjs-durable] could not resume run ${run.id} (${run.workflow}@${run.workflowVersion}); leaving it for another instance:`,
           error,
         );
+      } finally {
+        this.lockedForTurn.delete(run.id);
       }
     }
     return results;
@@ -4892,9 +4913,7 @@ export class WorkflowEngine {
     const reentered =
       run.lockedBy === this.instanceId &&
       (run.lockedUntil ?? 0) > lockNow &&
-      !this.claimsInFlight.has(run.id) &&
-      (lockedForTurn ||
-        (await this.store.renewRunLock(run.id, this.instanceId, lockNow + this.leaseMs)));
+      (lockedForTurn || (await this.proveOwnLease(run.id, lockNow)));
     if (!reentered) {
       if (
         !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
