@@ -252,8 +252,15 @@ describe('PrismaStateStore', () => {
     prisma.$on('query', onQuery);
     try {
       const sql = () => queries.filter((q) => /durable_step_checkpoints/i.test(q));
+      // Prisma emits its query events apart from the result, so a statement can be counted late. Wait for
+      // the first, then long enough for a second one to show up if there were two.
+      const settled = async () => {
+        await vi.waitFor(() => expect(sql().length).toBeGreaterThan(0), { timeout: 5_000 });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      };
       queries.length = 0;
       expect(await store.saveCheckpointIfPending({ ...pending, status: 'completed' })).toBe(true);
+      await settled();
       // No read before the write: the status predicate rides on the UPDATE itself.
       expect(sql()).toHaveLength(1);
       expect(sql()[0]).toMatch(/^update/i);
@@ -261,6 +268,7 @@ describe('PrismaStateStore', () => {
 
       queries.length = 0;
       expect(await store.countCheckpoints(runId, 0, 5, ['completed'])).toBe(1);
+      await settled();
       expect(sql()).toHaveLength(1);
       expect(sql()[0]).toMatch(/count\(/i);
     } finally {
