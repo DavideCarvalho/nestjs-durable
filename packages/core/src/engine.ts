@@ -114,6 +114,7 @@ import type {
 import type { BufferedSignalRow, HistoryEvent, RunScope } from './interfaces';
 import { TERMINAL_RUN_STATUSES, isNonEmptyRunScope, poolNamespace } from './interfaces';
 import {
+  LIFECYCLE_COALESCED_TAG_PREFIX,
   LIFECYCLE_HEAL_WINDOW_MS,
   LIFECYCLE_ORPHAN_MS,
   LIFECYCLE_OWED_TAG_PREFIX,
@@ -132,6 +133,7 @@ import {
   type RepublishLifecycleResult,
   type RepublishLifecycleTarget,
   type WorkflowLifecycleLinks,
+  coalescedSubscribersOf,
   lifecycleEventName,
   lifecycleEventOf,
   lifecycleKindOf,
@@ -2856,7 +2858,8 @@ export class WorkflowEngine {
   /**
    * Publish a settled run's lifecycle event (`run.completed:<workflow>` / `run.failed:<workflow>`)
    * to the subscribers this engine has, and settle their part of the marker: drop each one's owed
-   * tag, record each subscriber it started as a `durable:triggered:<workflow>` tag, and drop
+   * tag, record each subscriber it started as a `durable:triggered:<workflow>` tag and each one it
+   * routed into a debounce/batch accumulator as a `durable:coalesced:<workflow>` tag, and drop
    * {@link LIFECYCLE_PENDING_TAG} once no owed tag is left. Subscribers registered only elsewhere
    * keep their owed tags for the instances that have them.
    *
@@ -2864,17 +2867,16 @@ export class WorkflowEngine {
    * them; `heal`, the ones a heal pass found missing (see {@link healLifecycleEvents}); else the owed
    * ones. A run marked with the pending tag alone is unresolved: with a good read of the fleet's
    * announcements it is owed to every subscriber (see {@link lifecycleSubscribers}) that has not
-   * started or failed, and published as such; without one, this engine starts its own subscribers
+   * started, coalesced or failed, and published as such; without one, this engine starts its own subscribers
    * that do not coalesce and the run stays unresolved.
    *
    * Runs under the run's lifecycle lease (see {@link withLifecycleLease}), reading the run again
    * inside it; `busy` when the lease could not be taken. Idempotent, since every subscriber run id is
    * deterministic and a debounce/batch accumulator counts the event once, so the live path, the
    * sweeps and a republish may all reach the same run. `run.triggered` and `run.trigger_failed` are
-   * emitted by the publish whose write recorded them: a subscriber it started whose triggered tag
-   * the run did not have, one it failed to start whose failed tag the run did not have, and a
-   * coalescing subscriber (which gets no triggered tag) whose owed or failed tag it removed, or that
-   * it found owed resolving the run.
+   * emitted by the publish whose write recorded them: a subscriber it reached whose triggered or
+   * coalesced tag the run did not have, and one it failed to start whose failed tag the run did not
+   * have.
    *
    * A subscriber whose `where` throws or whose start fails is reported as `run.trigger_failed`,
    * tagged {@link LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX} in the same update, and not retried; a
@@ -2912,13 +2914,15 @@ export class WorkflowEngine {
     const tags = run.tags ?? [];
     const owed = owedSubscribersOf(tags);
     const unresolved = tags.includes(LIFECYCLE_PENDING_TAG) && owed.length === 0;
-    const done = new Set([...triggeredSubscribersOf(tags), ...triggerFailedSubscribersOf(tags)]);
+    const done = new Set([
+      ...triggeredSubscribersOf(tags),
+      ...coalescedSubscribersOf(tags),
+      ...triggerFailedSubscribersOf(tags),
+    ]);
     const local = this.localSubscribersIn(name, run.namespace);
     const remote = await this.announcedRemoteSubscribers(name, run.namespace);
     const startable = new Set([...local, ...remote]);
     const owe = new Set(opts.owe ?? []);
-    // Subscribers this publish found owed itself, resolving an unresolved run.
-    const found = new Set<string>();
     let targets: string[];
     let resolved = false;
     if (opts.only !== undefined) {
@@ -2934,7 +2938,6 @@ export class WorkflowEngine {
         const full = this.lifecycleSubscribersIn(fleet, run.workflow, kind, run.namespace).filter(
           (s) => !done.has(s),
         );
-        for (const s of full) found.add(s);
         targets = full.filter((s) => startable.has(s));
         for (const s of full) if (!startable.has(s)) owe.add(s);
       } else {
@@ -2962,10 +2965,12 @@ export class WorkflowEngine {
       ...targets.map((s) => `${LIFECYCLE_OWED_TAG_PREFIX}${s}`),
       ...reached.map((r) => `${LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX}${r.workflow}`),
     ]);
+    const deliveredTag = (r: { workflow: string; runId?: string }) =>
+      r.runId !== undefined
+        ? `${LIFECYCLE_TRIGGERED_TAG_PREFIX}${r.workflow}`
+        : `${LIFECYCLE_COALESCED_TAG_PREFIX}${r.workflow}`;
     const added = [
-      ...reached
-        .filter((r) => r.runId !== undefined)
-        .map((r) => `${LIFECYCLE_TRIGGERED_TAG_PREFIX}${r.workflow}`),
+      ...reached.map(deliveredTag),
       ...failed.map((f) => `${LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX}${f.workflow}`),
       ...[...owe].map((s) => `${LIFECYCLE_OWED_TAG_PREFIX}${s}`),
     ];
@@ -2983,14 +2988,9 @@ export class WorkflowEngine {
       await this.store.updateRun(run.id, { tags: tagsAfter });
     }
     const had = new Set(before);
-    for (const { workflow, runId: triggeredRunId } of reached) {
-      const recorded =
-        triggeredRunId !== undefined
-          ? !had.has(`${LIFECYCLE_TRIGGERED_TAG_PREFIX}${workflow}`)
-          : had.has(`${LIFECYCLE_OWED_TAG_PREFIX}${workflow}`) ||
-            had.has(`${LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX}${workflow}`) ||
-            found.has(workflow);
-      if (!recorded) continue;
+    for (const r of reached) {
+      if (had.has(deliveredTag(r))) continue;
+      const { workflow, runId: triggeredRunId } = r;
       this.emit({
         type: 'run.triggered',
         runId: run.id,
@@ -3160,7 +3160,7 @@ export class WorkflowEngine {
   /**
    * Heal the runs settled in the last {@link LIFECYCLE_HEAL_WINDOW_MS} that missed a subscriber: one
    * the fleet announced only after the settling process last read the announcements, so it is in
-   * none of the run's owed, triggered or failed tags. Only subscriptions this engine first saw within
+   * none of the run's owed, triggered, coalesced or failed tags. Only subscriptions this engine first saw within
    * that window are checked (see {@link subscriptionFirstSeen}), since one the fleet already
    * announced when the run settled was in its owed set. Needs a good read of the fleet's
    * announcements.
@@ -3179,10 +3179,9 @@ export class WorkflowEngine {
       if (until <= nowMs) this.healedLifecycle.delete(key);
     }
     const windowStart = nowMs - LIFECYCLE_HEAL_WINDOW_MS;
-    const newSince = this.clock() - LIFECYCLE_HEAL_WINDOW_MS;
     const sources = new Map<string, Set<LifecycleKind>>();
     for (const [key, firstSeen] of this.subscriptionFirstSeen) {
-      if (firstSeen < newSince) continue;
+      if (firstSeen < windowStart) continue;
       const source = parseLifecycleEvent(key.slice(0, key.indexOf('\u0000')));
       if (!source || source.workflow.startsWith('__')) continue;
       const kinds = sources.get(source.workflow) ?? new Set<LifecycleKind>();
@@ -3212,13 +3211,14 @@ export class WorkflowEngine {
         const known = new Set([
           ...owed,
           ...triggeredSubscribersOf(tags),
+          ...coalescedSubscribersOf(tags),
           ...triggerFailedSubscribersOf(tags),
         ]);
         const missing = this.lifecycleSubscribersIn(fleet, workflow, kind, run.namespace).filter(
           (s) => {
             if (known.has(s) || this.healedLifecycle.has(`${run.id}\u0000${s}`)) return false;
             const firstSeen = this.subscriptionFirstSeen.get(`${event}\u0000${s}`);
-            return firstSeen !== undefined && firstSeen >= newSince;
+            return firstSeen !== undefined && firstSeen >= windowStart;
           },
         );
         if (missing.length === 0) continue;
@@ -3338,12 +3338,17 @@ export class WorkflowEngine {
     const owed = owedSubscribersOf(run.tags);
     const legacyPending = run.tags?.includes(LIFECYCLE_PENDING_TAG) && owed.length === 0;
     const triggerFailed = triggerFailedSubscribersOf(run.tags);
+    const coalesced = coalescedSubscribersOf(run.tags);
     const missing: string[] = [];
     for (const s of subscribers) {
-      // A debounced/batched subscriber starts no run of its own id, so it is sent the event again
-      // only while the run still owes it or its start failed.
+      // A debounced/batched subscriber starts no run of its own id: its coalesced tag records the
+      // delivery, so it is sent the event again only when its start failed, or, on a run with no
+      // such tag, while the run still owes it.
       if (local.has(s) && this.latest.get(s)?.eventBatch !== undefined) {
-        if (legacyPending || owed.includes(s) || triggerFailed.includes(s)) missing.push(s);
+        const again = coalesced.includes(s)
+          ? triggerFailed.includes(s)
+          : legacyPending || owed.includes(s) || triggerFailed.includes(s);
+        if (again) missing.push(s);
         continue;
       }
       if (!(await this.store.getRun(lifecycleRunId(run.id, kind, s)))) missing.push(s);

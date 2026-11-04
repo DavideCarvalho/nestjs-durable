@@ -1,12 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type { EngineEvent, RunQuery, WorkflowRun } from './interfaces';
 import {
+  LIFECYCLE_COALESCED_TAG_PREFIX,
   LIFECYCLE_HEAL_WINDOW_MS,
   LIFECYCLE_OWED_TAG_PREFIX,
   LIFECYCLE_PENDING_TAG,
   LIFECYCLE_REGISTRY_TAG,
   LIFECYCLE_REGISTRY_WORKFLOW,
+  LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX,
   lifecycleRegistryRunId,
   runCompletedEvent,
 } from './lifecycle-events';
@@ -23,6 +25,7 @@ async function poll(fn: () => Promise<boolean>, timeoutMs = 2000): Promise<void>
 
 const owed = (subscriber: string) => `${LIFECYCLE_OWED_TAG_PREFIX}${subscriber}`;
 const triggered = (subscriber: string) => `durable:triggered:${subscriber}`;
+const coalesced = (subscriber: string) => `${LIFECYCLE_COALESCED_TAG_PREFIX}${subscriber}`;
 
 /** A store whose lifecycle registry reads can be held back or made to fail. */
 class RegistryGatedStore extends InMemoryStateStore {
@@ -299,5 +302,115 @@ describe('concurrent lifecycle publishers', () => {
       ],
     });
     expect(await store.getRun('evt:i1:completed:x')).toBeNull();
+  });
+});
+
+describe('the heal window', () => {
+  it('reads the subscriptions and the runs against the nowMs it is given, not the engine clock', async () => {
+    const store = new InMemoryStateStore();
+    const start = Date.now();
+    let clockNow = start;
+    const b = new WorkflowEngine({ store, instanceId: 'b', clock: () => clockNow });
+    b.register('late', '1', async () => 'ok', { onEvent: [runCompletedEvent('ingest')] });
+    await b.sweepLifecycleEvents(start);
+    await store.createRun(settledRun('i1', start + 20_000));
+
+    // The engine clock runs well past the heal window; the sweep is handed a time inside it.
+    clockNow = start + 10 * 60_000;
+    expect(await b.sweepLifecycleEvents(start + 60_000)).toBe(1);
+    await poll(async () => (await store.getRun('evt:i1:completed:late')) !== null);
+    expect((await store.getRun('i1'))?.tags).toEqual([triggered('late')]);
+  });
+});
+
+describe('a coalesced delivery', () => {
+  type Routable = { accumulators: { route: (...args: unknown[]) => Promise<unknown> } };
+  const routes = (engine: WorkflowEngine) =>
+    vi.spyOn((engine as unknown as Routable).accumulators, 'route');
+  const debounced = (engine: WorkflowEngine) =>
+    engine.register('digest', '1', async () => 'ok', {
+      onEvent: [runCompletedEvent('ingest')],
+      eventBatch: { mode: 'debounce', windowMs: 60_000 },
+    });
+  const triggeredEvents = (events: EngineEvent[]) =>
+    events.filter((e) => e.type === 'run.triggered' && e.runId === 'i1');
+
+  it('is tagged when the live publish routes it, and reported once', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('ingest', '1', async () => 'ok');
+    debounced(engine);
+    const events: EngineEvent[] = [];
+    engine.subscribe((e) => events.push(e));
+
+    await engine.start('ingest', {}, 'i1');
+    await poll(async () => ((await store.getRun('i1'))?.tags ?? []).includes(coalesced('digest')));
+    expect((await store.getRun('i1'))?.tags).toEqual([coalesced('digest')]);
+    expect(triggeredEvents(events)).toHaveLength(1);
+  });
+
+  it('heals a coalescing subscriber once: routed once, one run.triggered, tagged', async () => {
+    const store = new InMemoryStateStore();
+    const now = Date.now();
+    await store.createRun(settledRun('i1', now - 40_000));
+    const b = new WorkflowEngine({ store, instanceId: 'b', clock: () => now });
+    debounced(b);
+    const route = routes(b);
+    const events: EngineEvent[] = [];
+    b.subscribe((e) => events.push(e));
+
+    expect(await b.sweepLifecycleEvents(now)).toBe(1);
+    expect(await b.sweepLifecycleEvents(now)).toBe(0);
+    expect(route).toHaveBeenCalledTimes(1);
+    expect((await store.getRun('i1'))?.tags).toEqual([coalesced('digest')]);
+    expect(triggeredEvents(events)).toEqual([
+      expect.objectContaining({ name: 'digest', triggeredRunId: undefined }),
+    ]);
+  });
+
+  it('is not healed again by an engine that just booted', async () => {
+    const store = new InMemoryStateStore();
+    const now = Date.now();
+    await store.createRun({ ...settledRun('i1', now - 40_000), tags: [coalesced('digest')] });
+    const booted = new WorkflowEngine({ store, instanceId: 'booted', clock: () => now });
+    debounced(booted);
+    const route = routes(booted);
+    const events: EngineEvent[] = [];
+    booted.subscribe((e) => events.push(e));
+
+    expect(await booted.sweepLifecycleEvents(now)).toBe(0);
+    expect(route).not.toHaveBeenCalled();
+    expect(triggeredEvents(events)).toHaveLength(0);
+  });
+
+  it('is republished only when its start also failed', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    debounced(engine);
+    const route = routes(engine);
+    const events: EngineEvent[] = [];
+    engine.subscribe((e) => events.push(e));
+    await store.createRun({ ...settledRun('i1', 0), tags: [coalesced('digest')] });
+    await store.createRun({
+      ...settledRun('i2', 0),
+      tags: [coalesced('digest'), `${LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX}digest`],
+    });
+
+    expect(await engine.republishLifecycle({ runId: 'i1' })).toEqual({
+      runs: 1,
+      started: 0,
+      failed: [],
+    });
+    expect(route).not.toHaveBeenCalled();
+
+    expect(await engine.republishLifecycle({ runId: 'i2' })).toEqual({
+      runs: 1,
+      started: 1,
+      failed: [],
+    });
+    expect(route).toHaveBeenCalledTimes(1);
+    expect((await store.getRun('i2'))?.tags).toEqual([coalesced('digest')]);
+    // The run already carried the coalesced tag, so the retry records nothing new.
+    expect(events.filter((e) => e.type === 'run.triggered')).toHaveLength(0);
   });
 });

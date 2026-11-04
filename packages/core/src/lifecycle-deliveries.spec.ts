@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { WorkflowRun } from './interfaces';
 import { lifecycleDeliveriesOf, traceIdOfTraceparent } from './lifecycle-deliveries';
 import {
+  LIFECYCLE_COALESCED_TAG_PREFIX,
   LIFECYCLE_ORPHAN_MS,
   LIFECYCLE_OWED_TAG_PREFIX,
   LIFECYCLE_PENDING_TAG,
@@ -68,6 +69,23 @@ describe('lifecycleDeliveriesOf', () => {
       { subscriber: 'broken', state: 'failed' },
       { subscriber: 'removed', state: 'failed' },
       { subscriber: 'retried', state: 'started', runId: 'evt:i1:completed:retried' },
+    ]);
+  });
+
+  it('states coalesced for a subscriber tagged coalesced, keeping the accumulator link', () => {
+    const settled = run('completed', [
+      `${LIFECYCLE_COALESCED_TAG_PREFIX}digest`,
+      `${LIFECYCLE_COALESCED_TAG_PREFIX}removed`,
+    ]);
+    expect(
+      lifecycleDeliveriesOf(settled, {
+        subscribers: ['digest'],
+        live: new Set(['digest']),
+        coalesced: new Map([['digest', '__evtacc__:digest']]),
+      }),
+    ).toEqual([
+      { subscriber: 'digest', state: 'coalesced', runId: '__evtacc__:digest' },
+      { subscriber: 'removed', state: 'coalesced' },
     ]);
   });
 

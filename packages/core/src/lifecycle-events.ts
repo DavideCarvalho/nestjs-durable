@@ -96,6 +96,21 @@ export function triggeredSubscribersOf(tags: readonly string[] | undefined): str
 }
 
 /**
+ * Prefix of the tags naming each subscriber a settled run's lifecycle event was routed into a
+ * debounce/batch accumulator for (`durable:coalesced:<workflow>`). Such a subscriber starts no run
+ * of the source's id, so this tag is what records the delivery: written in the same update that drops
+ * its owed tag, it keeps a heal or a republish from routing the event again.
+ */
+export const LIFECYCLE_COALESCED_TAG_PREFIX = 'durable:coalesced:';
+
+/** The subscribers a settled run's event was coalesced into, read from its coalesced tags. */
+export function coalescedSubscribersOf(tags: readonly string[] | undefined): string[] {
+  return (tags ?? [])
+    .filter((tag) => tag.startsWith(LIFECYCLE_COALESCED_TAG_PREFIX))
+    .map((tag) => tag.slice(LIFECYCLE_COALESCED_TAG_PREFIX.length));
+}
+
+/**
  * How long after a run settled the lifecycle sweep still checks it for subscribers it missed: one
  * the fleet announced only after the settling process last read the announcements. Such a
  * subscriber is started (or owed to the instances that have it) as if it had been owed from the
@@ -131,6 +146,7 @@ export function isLifecycleTag(tag: string): boolean {
     tag === LIFECYCLE_PENDING_TAG ||
     tag.startsWith(LIFECYCLE_OWED_TAG_PREFIX) ||
     tag.startsWith(LIFECYCLE_TRIGGERED_TAG_PREFIX) ||
+    tag.startsWith(LIFECYCLE_COALESCED_TAG_PREFIX) ||
     tag.startsWith(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX) ||
     tag.startsWith(LIFECYCLE_TRACE_TAG_PREFIX)
   );

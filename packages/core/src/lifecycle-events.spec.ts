@@ -3,9 +3,12 @@ import { WorkflowEngine } from './engine';
 import { FatalError } from './errors';
 import type { EngineEvent, WorkflowRun } from './interfaces';
 import {
+  LIFECYCLE_COALESCED_TAG_PREFIX,
   LIFECYCLE_PENDING_TAG,
   LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX,
   type WorkflowLifecycleEvent,
+  coalescedSubscribersOf,
+  isLifecycleTag,
   lifecycleEventOf,
   lifecycleRunId,
   lifecycleSourceOf,
@@ -527,5 +530,26 @@ describe('runDetailEtag with lifecycle links', () => {
     const triggered = { ...run, tags: ['durable:triggered:refresh'] };
     expect(runDetailEtag(triggered, [], 50)).not.toBe(runDetailEtag(run, [], 50));
     expect(triggeredRunsOf(triggered)).toEqual(['evt:i1:completed:refresh']);
+  });
+});
+
+describe('the coalesced tag', () => {
+  it('names the subscribers and stays out of the event payload', () => {
+    const tag = `${LIFECYCLE_COALESCED_TAG_PREFIX}digest`;
+    expect(tag).toBe('durable:coalesced:digest');
+    expect(isLifecycleTag(tag)).toBe(true);
+    expect(coalescedSubscribersOf(['etl', tag, 'durable:triggered:refresh'])).toEqual(['digest']);
+    const run: WorkflowRun = {
+      id: 'i1',
+      workflow: 'ingest',
+      workflowVersion: '1',
+      status: 'completed',
+      input: {},
+      output: 'ok',
+      tags: ['etl', tag],
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    };
+    expect(lifecycleEventOf(run).tags).toEqual(['etl']);
   });
 });

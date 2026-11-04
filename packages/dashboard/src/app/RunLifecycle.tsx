@@ -49,7 +49,7 @@ export function deliveryNote(delivery: LifecycleDelivery, now: number): string {
 
 /** What `not-started` means, for the row's tooltip. */
 const NOT_STARTED_TITLE =
-  'No run and nothing owed: its `where` declined the event, it coalesces on another instance, or it subscribed after the run settled.';
+  'No run and nothing owed: its `where` declined the event, or it subscribed after the run settled.';
 
 /** What `failed` means, for the row's tooltip when the failure message is not known. */
 const FAILED_TITLE =

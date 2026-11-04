@@ -203,7 +203,9 @@ decorator does not compile. Links: `triggeredRuns(runId)`, `lifecycleSourceOf(ru
 `parseLifecycleEvent(event)` (`{ workflow, kind }` for a `run.completed:*` / `run.failed:*` name).
 `LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX` (`durable:trigger_failed:`) tags a settled run once per
 subscriber whose start from its lifecycle event failed (read with `triggerFailedSubscribersOf(tags)`;
-a later successful start removes it). `isLifecycleTag` covers it, so it stays out of the event's
+a later successful start removes it). `LIFECYCLE_COALESCED_TAG_PREFIX` (`durable:coalesced:`) tags it
+once per subscriber whose debounce/batch accumulator the event was routed into (read with
+`coalescedSubscribersOf(tags)`). `isLifecycleTag` covers both, so they stay out of the event's
 `tags`. `LIFECYCLE_TRACE_TAG_PREFIX` (`durable:lifecycle:trace:`) is the tag holding a run's root span
 traceparent (written with its first suspend or its terminal write), read with
 `lifecycleTraceparentOf(tags)`. The subscription registry: `LIFECYCLE_REGISTRY_WORKFLOW`

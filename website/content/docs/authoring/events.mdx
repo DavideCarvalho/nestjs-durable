@@ -183,7 +183,7 @@ registered on some instances only (a rolling deploy, or a workflow that lives on
 - When the engine settling the run has no usable read yet (it just booted) or its last read failed,
   the terminal write tags the run `durable:lifecycle:pending` **alone**: the owed set is unresolved.
   The first publish with a good read (the live one, or the sweep on any instance) resolves it to
-  every subscriber of the run's namespace that has not started or failed from it, writes their owed
+  every subscriber of the run's namespace that has not started, coalesced or failed from it, writes their owed
   tags and goes on as below. Until then an instance starts only its own subscribers that do not
   debounce or batch, and the run stays unresolved.
 - The owed set is scoped to the settled run's namespace. A run of namespace `acme` is owed to the
@@ -194,7 +194,8 @@ registered on some instances only (a rolling deploy, or a workflow that lives on
   engine's apply to its namespace only. The registry run records which it is
   (`engineNamespace`, `null` for no namespace), since both kinds of engine keep it under `default`.
 - Right after, the engine starts the subscribers it has, drops their owed tags and records one
-  `durable:triggered:<subscriber>` tag per run it started. `durable:lifecycle:pending` goes with the
+  `durable:triggered:<subscriber>` tag per run it started, or one `durable:coalesced:<subscriber>`
+  tag per subscriber whose debounce/batch accumulator it routed the event into. `durable:lifecycle:pending` goes with the
   last owed tag.
 - Every publish of a run (live, sweep, heal, republish, orphan drop) holds the run's lease while it
   reads the run's tags, starts subscribers and writes the tags back, so publishers on several
@@ -214,7 +215,7 @@ registered on some instances only (a rolling deploy, or a workflow that lives on
   subscriber the fleet announced only after the settling engine last read the announcements (a
   subscriber coming up during a rolling deploy). For each subscription it first saw in that window, it
   reads the recently settled runs of the source workflow (`updatedAfter`, at most 100 per workflow)
-  and publishes to each subscriber a run has no owed, triggered or failed tag for, as if it had been
+  and publishes to each subscriber a run has no owed, triggered, coalesced or failed tag for, as if it had been
   owed: started where the sweeping instance has it, owed to the instances that do otherwise. A
   subscriber that comes up more than 2 minutes after a run settled is a backfill: republish the run
   (below).
@@ -278,7 +279,8 @@ A subscriber only another worker has is owed the event again (the run is re-mark
 on that worker starts it. A republish publishes only to subscribers of the run's lifecycle event in
 its namespace: a `subscriber` that is not one is reported in `failed`, and is never written as owed.
 `limit` must be a positive integer. A debounced or batched subscriber starts no run of its own id, so
-a republish sends it the event only while the run still owes it or its start failed.
+a republish sends it the event again only when its start failed: a run tagged
+`durable:coalesced:<subscriber>` already delivered it.
 
 Through the tenant proxy, a republish by a tenant is refused (`RunGatewayError` coded `bad-request`,
 HTTP 400 from the dashboard) when `limit` is not a positive integer or `subscriber` does not
@@ -310,7 +312,8 @@ not touch the other.
   In code, `engine.workflowLifecycle(name)`.
 
 A subscriber that debounces or batches its events has no run of its own per settled run, so it gets a
-`run.triggered` event but no `durable:triggered:*` link. Its accumulator counts each settled run's
+`run.triggered` event and a `durable:coalesced:<subscriber>` tag (`LIFECYCLE_COALESCED_TAG_PREFIX`,
+read with `coalescedSubscribersOf(tags)`) but no `durable:triggered:*` link. Its accumulator counts each settled run's
 event once (the event carries the source run's id, and the accumulator remembers the last 1000 ids
 across bursts), so a run published twice never counts twice in a debounce or a batch.
 
