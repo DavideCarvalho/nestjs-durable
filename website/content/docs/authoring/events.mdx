@@ -279,8 +279,9 @@ A subscriber only another worker has is owed the event again (the run is re-mark
 on that worker starts it. A republish publishes only to subscribers of the run's lifecycle event in
 its namespace: a `subscriber` that is not one is reported in `failed`, and is never written as owed.
 `limit` must be a positive integer. A debounced or batched subscriber starts no run of its own id, so
-a republish sends it the event again only when its start failed: a run tagged
-`durable:coalesced:<subscriber>` already delivered it.
+its `durable:coalesced:<subscriber>` tag stands for that run: a republish sends it the event when the
+run has no such tag (a coalescing subscriber added later is backfilled like any other), and again
+only when its start failed.
 
 Through the tenant proxy, a republish by a tenant is refused (`RunGatewayError` coded `bad-request`,
 HTTP 400 from the dashboard) when `limit` is not a positive integer or `subscriber` does not

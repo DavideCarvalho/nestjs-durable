@@ -3335,20 +3335,15 @@ export class WorkflowEngine {
       ...this.localSubscribersIn(event, run.namespace),
       ...(await this.announcedRemoteSubscribers(event, run.namespace)),
     ]);
-    const owed = owedSubscribersOf(run.tags);
-    const legacyPending = run.tags?.includes(LIFECYCLE_PENDING_TAG) && owed.length === 0;
     const triggerFailed = triggerFailedSubscribersOf(run.tags);
     const coalesced = coalescedSubscribersOf(run.tags);
     const missing: string[] = [];
     for (const s of subscribers) {
-      // A debounced/batched subscriber starts no run of its own id: its coalesced tag records the
-      // delivery, so it is sent the event again only when its start failed, or, on a run with no
-      // such tag, while the run still owes it.
+      // A debounced/batched subscriber starts no run of its own id, so its coalesced tag is what
+      // records the delivery, on whichever instance routed it.
+      if (coalesced.includes(s) && !triggerFailed.includes(s)) continue;
       if (local.has(s) && this.latest.get(s)?.eventBatch !== undefined) {
-        const again = coalesced.includes(s)
-          ? triggerFailed.includes(s)
-          : legacyPending || owed.includes(s) || triggerFailed.includes(s);
-        if (again) missing.push(s);
+        missing.push(s);
         continue;
       }
       if (!(await this.store.getRun(lifecycleRunId(run.id, kind, s)))) missing.push(s);

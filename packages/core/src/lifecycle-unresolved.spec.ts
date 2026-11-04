@@ -383,7 +383,7 @@ describe('a coalesced delivery', () => {
     expect(triggeredEvents(events)).toHaveLength(0);
   });
 
-  it('is republished only when its start also failed', async () => {
+  it('is republished to a run carrying its tag only when its start also failed', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     debounced(engine);

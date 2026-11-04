@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type { WorkerDescriptor } from './handshake/index';
-import type { Transport, WorkflowRun } from './interfaces';
+import type { EngineEvent, Transport, WorkflowRun } from './interfaces';
 import {
+  LIFECYCLE_COALESCED_TAG_PREFIX,
   LIFECYCLE_OWED_TAG_PREFIX,
   LIFECYCLE_PENDING_TAG,
   runCompletedEvent,
@@ -34,7 +35,7 @@ function settled(id: string, over: Partial<WorkflowRun> = {}): WorkflowRun {
 }
 
 describe('engine.republishLifecycle', () => {
-  it('sends a debounced subscriber the event only while the run still owes it', async () => {
+  it('sends a debounced subscriber the event unless the run carries its coalesced tag', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     engine.register('coalesce', '1', async () => 'ok', {
@@ -44,7 +45,7 @@ describe('engine.republishLifecycle', () => {
     await store.createRun(
       settled('owed', { tags: [LIFECYCLE_PENDING_TAG, `${LIFECYCLE_OWED_TAG_PREFIX}coalesce`] }),
     );
-    await store.createRun(settled('done'));
+    await store.createRun(settled('done', { tags: [`${LIFECYCLE_COALESCED_TAG_PREFIX}coalesce`] }));
 
     expect(await engine.republishLifecycle({ runId: 'owed' })).toEqual({
       runs: 1,
@@ -56,6 +57,58 @@ describe('engine.republishLifecycle', () => {
       started: 0,
       failed: [],
     });
+  });
+
+  it('backfills a coalescing subscriber registered after the run settled, once', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    await store.createRun(settled('i1'));
+    engine.register('digest', '1', async () => 'ok', {
+      onEvent: [runCompletedEvent('ingest')],
+      eventBatch: { mode: 'debounce', windowMs: 60_000 },
+    });
+    const route = vi.spyOn(
+      (engine as unknown as { accumulators: { route: (...args: unknown[]) => Promise<unknown> } })
+        .accumulators,
+      'route',
+    );
+    const events: EngineEvent[] = [];
+    engine.subscribe((e) => events.push(e));
+
+    expect(await engine.republishLifecycle({ runId: 'i1' })).toEqual({
+      runs: 1,
+      started: 1,
+      failed: [],
+    });
+    expect((await store.getRun('i1'))?.tags).toEqual([`${LIFECYCLE_COALESCED_TAG_PREFIX}digest`]);
+    expect(events.filter((e) => e.type === 'run.triggered')).toHaveLength(1);
+
+    expect(await engine.republishLifecycle({ runId: 'i1' })).toEqual({
+      runs: 1,
+      started: 0,
+      failed: [],
+    });
+    expect(route).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not owe a coalesced-tagged run again to a subscriber only another engine has', async () => {
+    const store = new InMemoryStateStore();
+    const b = new WorkflowEngine({ store, instanceId: 'b' });
+    b.register('digest', '1', async () => 'ok', {
+      onEvent: [runCompletedEvent('ingest')],
+      eventBatch: { mode: 'debounce', windowMs: 60_000 },
+    });
+    await b.heartbeatLifecycleRegistry();
+    const a = new WorkflowEngine({ store, instanceId: 'a' });
+    const tags = [`${LIFECYCLE_COALESCED_TAG_PREFIX}digest`];
+    await store.createRun(settled('i1', { tags }));
+
+    expect(await a.republishLifecycle({ runId: 'i1' })).toEqual({
+      runs: 1,
+      started: 0,
+      failed: [],
+    });
+    expect((await store.getRun('i1'))?.tags).toEqual(tags);
   });
 
   it('backfills a subscriber registered after the runs settled, and starts nothing the second time', async () => {
