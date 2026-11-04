@@ -5,6 +5,7 @@ import type {
   RunFacetRow,
   RunQuery,
   RunResult,
+  RunStatus,
   RunValueAxis,
   RunValueFacetOptions,
   RunValueFacetRow,
@@ -12,6 +13,13 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from './interfaces';
+import type { LifecycleDelivery, RunWaitLink } from './lifecycle-deliveries';
+import type {
+  LifecycleKind,
+  RepublishLifecycleResult,
+  RepublishLifecycleTarget,
+  WorkflowLifecycleLinks,
+} from './lifecycle-events';
 import type { FanPage, FanPageQuery, FanSummary } from './run-detail-summary';
 
 /** A run as returned by the gateway's list — the durable run plus an optional {@link RunWaiting}
@@ -27,6 +35,16 @@ export interface DurableTopology {
   role: 'control-plane' | 'tenant';
   /** The tenant's isolation partition name; set only when `role` is 'tenant'. */
   tenant?: string;
+}
+
+/** The run whose settling started a run, as its detail names it. */
+export interface LifecycleSource {
+  runId: string;
+  kind: 'completed' | 'failed';
+  status?: RunStatus | undefined;
+  namespace?: string | undefined;
+  /** The W3C trace id of the source run's span, when it recorded one. */
+  traceId?: string | undefined;
 }
 
 /** A run + its timeline + child ids — the detail view. Single source of truth: the dashboard server
@@ -45,6 +63,38 @@ export interface RunDetail {
   fans?: FanSummary[] | undefined;
   /** How many children the run has, when `children` lists only the first of them. */
   childCount?: number | undefined;
+  /**
+   * Runs started by this run settling: subscribers of its `run.completed:<workflow>` or
+   * `run.failed:<workflow>` event. Not children: they are not cancelled with it or awaited by it.
+   */
+  triggered?: string[] | undefined;
+  /**
+   * The run whose settling started this one, when a lifecycle event started it, with the source
+   * run's `status` and `namespace`, and the trace id of its span (`traceId`) when the source
+   * recorded one (see `LIFECYCLE_TRACE_TAG_PREFIX`).
+   */
+  triggeredBy?: LifecycleSource | undefined;
+  /**
+   * The workflows subscribed to this settled run's lifecycle event, registered on the answering
+   * instance or announced by the live fleet. Present only when there is at least one, which is
+   * when the run's lifecycle event can be republished.
+   */
+  lifecycleSubscribers?: string[] | undefined;
+  /**
+   * Who starts whom through lifecycle events, for this run's workflow (see
+   * `WorkflowEngine.workflowLifecycle`). Present only when the workflow starts or is started by some
+   * other workflow.
+   */
+  workflowLifecycle?: WorkflowLifecycleLinks | undefined;
+  /**
+   * Where a settled run's lifecycle event stands for each subscriber: started, owed, coalesced or
+   * not started. Absent when the run has not settled or has no subscribers.
+   */
+  lifecycleDeliveries?: LifecycleDelivery[] | undefined;
+  /** The runs a suspended run waits for through `ctx.waitForRun`. */
+  waitsFor?: RunWaitLink[] | undefined;
+  /** The runs waiting for this one through `ctx.waitForRun`. */
+  awaitedBy?: RunWaitLink[] | undefined;
   /**
    * A validator for this detail, when the gateway can compute one without reading the timeline:
    * it changes whenever the run or any of its checkpoints does. Absent when it cannot.
@@ -161,6 +211,31 @@ export abstract class RunGateway {
    *  plus how many steps were re-dispatched, or null if the run is unknown. */
   abstract redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) | null>;
   abstract retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null>;
+  /**
+   * Publish settled runs' lifecycle events again (see `WorkflowEngine.republishLifecycle`). Optional:
+   * only a gateway backed by the canonical store and an engine implements it.
+   */
+  republishLifecycle?(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult>;
+  /**
+   * Who starts whom through lifecycle events, for one workflow (see
+   * `WorkflowEngine.workflowLifecycle`), only the subscriptions of `opts.namespace` when given.
+   * Optional: a gateway backed by an engine, or a tenant proxy (scoped to its tenant by the
+   * operator), implements it.
+   */
+  workflowLifecycle?(
+    workflow: string,
+    opts?: { namespace?: string | undefined },
+  ): Promise<WorkflowLifecycleLinks>;
+  /**
+   * The subscribers a run of `workflow` in `namespace` settling as `kind` owes its lifecycle event to
+   * (see `WorkflowEngine.lifecycleSubscribers`). Optional: a gateway backed by an engine implements
+   * it; the run-request responder checks a tenant republish's `subscriber` against it.
+   */
+  lifecycleSubscribers?(
+    workflow: string,
+    kind: LifecycleKind,
+    namespace: string,
+  ): Promise<string[]>;
   /** Live lifecycle events for one run; returns an unsubscribe fn. Framework-agnostic (no rxjs). */
   abstract subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
 }

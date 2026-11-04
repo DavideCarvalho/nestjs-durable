@@ -126,6 +126,10 @@ export interface AnnouncedWorkflow {
   /** Every distinct set of `onError` routes announced, each in canonical order. Empty = nobody stated
    *  one. Two entries here means the live workers route this workflow's failures differently. */
   onError: { code?: string; workflow: string }[][];
+  /** Every event any live announcer says this workflow subscribes to (sorted, de-duplicated). Empty =
+   *  nobody stated one. A union, not a disagreement: during a rollout the engine owes a lifecycle
+   *  event to a subscriber as long as some live worker still has it. */
+  subscribes: string[];
   /** Runtimes of the live announcers (sorted, de-duplicated). EMPTY on an `'observed'` entry: a
    *  heartbeat does not say what runtime wrote it, and the instance id's shape is a convention, not
    *  a statement, so it is not read as one. */
@@ -243,6 +247,7 @@ export function aggregateAnnouncements(
       origins,
       requires,
       onError,
+      subscribes: [...new Set(announcements.flatMap((a) => a.subscribes ?? []))].sort(),
       runtimes: [...new Set(announcements.map((a) => a.runtime))].sort(),
       instances: [...new Set(announcements.map((a) => a.instanceId))].sort(),
       disagreements,
@@ -302,6 +307,7 @@ export function observedAnnouncements(
       origins: [],
       requires: [],
       onError: [],
+      subscribes: [],
       runtimes: [],
       instances: [...instances].sort(),
       disagreements: [],

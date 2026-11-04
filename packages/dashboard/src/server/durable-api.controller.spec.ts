@@ -14,7 +14,11 @@ import {
   ApplyFilterInterceptor,
   FilterRunner,
 } from '@dudousxd/nestjs-filter';
-import { BadRequestException, type ExecutionContext } from '@nestjs/common';
+import {
+  BadRequestException,
+  type ExecutionContext,
+  NotImplementedException,
+} from '@nestjs/common';
 import { INTERCEPTORS_METADATA } from '@nestjs/common/constants.js';
 import { firstValueFrom, from } from 'rxjs';
 import { describe, expect, it } from 'vitest';
@@ -632,5 +636,28 @@ describe('DurableApiController: list rows', () => {
     expect(detail.run.input).toEqual({ order: 'ord-1' });
     expect(detail.run.output).toEqual({ charged: false });
     expect(detail.run.error?.message).toBe('boom');
+  });
+});
+
+describe('lifecycle endpoints against a control plane older than the verb', () => {
+  it('answer 501 with the reason, not a 500', async () => {
+    const c = await makeConsole();
+    const notSupported = Object.assign(
+      new Error('republishLifecycle is not supported by this server'),
+      { code: 'unsupported-request' },
+    );
+    const service = (c.controller as unknown as { dashboard: DashboardService }).dashboard;
+    service.republishLifecycle = async () => Promise.reject(notSupported);
+    service.workflowLifecycle = async () => Promise.reject(notSupported);
+
+    await expect(c.controller.republishLifecycle('run-1')).rejects.toBeInstanceOf(
+      NotImplementedException,
+    );
+    await expect(c.controller.workflowLifecycle('checkout')).rejects.toThrow(
+      /not supported by this server/,
+    );
+    await expect(c.controller.workflowLifecycle('checkout')).rejects.toBeInstanceOf(
+      NotImplementedException,
+    );
   });
 });

@@ -4,6 +4,7 @@ import {
   type CheckpointQuery,
   type CheckpointStat,
   type ChildWait,
+  LIFECYCLE_REGISTRY_WORKFLOW,
   type OwnedLeaseReclaim,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
@@ -34,11 +35,18 @@ import {
   mergeRunValueFacetRows,
   normalizeAttributeRows,
   parseDuration,
+  retentionKeeps,
   runValueFacetsFromRuns,
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
   singletonClaimantIds,
 } from '@dudousxd/nestjs-durable-core';
+
+/**
+ * Workflows a retention policy never sees: lifecycle registry runs are neither pruned nor counted
+ * toward `maxCount`.
+ */
+const RETENTION_EXCLUDED = [LIFECYCLE_REGISTRY_WORKFLOW];
 
 /* The Prisma client is generated per-schema, so the adapter can't import a concrete one. Instead
    it depends on this structural surface — the three model delegates and the methods it uses. A
@@ -341,30 +349,35 @@ export class PrismaStateStore implements StateStore {
     if (statuses.length === 0 || limit <= 0) return 0;
     if (policy.maxAge == null && policy.maxCount == null) return 0;
     // A scoped policy only ever sees (and, for maxCount, counts) the runs its scope matches.
-    const scoped = this.runWhere({ ...(policy.scope ?? {}), statuses });
+    const scoped = this.runWhere({
+      ...(policy.scope ?? {}),
+      statuses,
+      excludeWorkflows: RETENTION_EXCLUDED,
+    });
     const ids = new Set<string>();
     if (policy.maxAge != null) {
       const cutoff = new Date(nowMs - parseDuration(policy.maxAge));
       const rows = await this.db.durableWorkflowRun.findMany({
         where: { AND: [scoped, { updatedAt: { lt: cutoff } }] },
-        select: { id: true },
+        select: { id: true, tags: true },
         orderBy: { updatedAt: 'asc' }, // oldest first
         take: limit,
       });
-      for (const r of rows) ids.add(r.id);
+      // A run whose lifecycle event is still owed is kept until it is published.
+      for (const r of rows) if (!retentionKeeps(r.tags)) ids.add(r.id);
     }
     if (policy.maxCount != null && ids.size < limit) {
       // Everything past the newest `maxCount` rows of the scoped status set (skipped by OFFSET).
       const rows = await this.db.durableWorkflowRun.findMany({
         where: scoped,
-        select: { id: true },
+        select: { id: true, tags: true },
         orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
         skip: policy.maxCount,
         take: limit,
       });
       for (const r of rows) {
         if (ids.size >= limit) break;
-        ids.add(r.id);
+        if (!retentionKeeps(r.tags)) ids.add(r.id);
       }
     }
     const doomed = [...ids].slice(0, limit);
@@ -656,6 +669,10 @@ export class PrismaStateStore implements StateStore {
     const and: Record<string, unknown>[] = [];
     if (query.workflow) where.workflow = query.workflow;
     if (query.workflows) and.push(anyOf(query.workflows.map((w) => ({ workflow: w }))));
+    if (query.excludeWorkflows?.length) and.push({ workflow: { notIn: query.excludeWorkflows } });
+    if (query.updatedAfter !== undefined) {
+      and.push({ updatedAt: { gte: new Date(query.updatedAfter) } });
+    }
     if (query.namespaces) and.push(anyOf(query.namespaces.map((n) => ({ namespace: n }))));
     // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
     // before the column existed, or registered through a path the derivation could not classify)

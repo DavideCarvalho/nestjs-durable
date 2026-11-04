@@ -67,6 +67,16 @@ before it can silently do the wrong thing:
   claim a status, so "most-recent N" is unambiguous (policies with different `scope`s may share statuses);
 - a malformed duration string (`'7days'`, `'1 month'`) throws at boot instead of quietly never pruning.
 
+A run still tagged `durable:lifecycle:pending` is never pruned, whatever the policy says: its
+[lifecycle event](/docs/authoring/events#delivery) has not been published yet, and deleting it would
+lose the event. The lifecycle sweep publishes it and drops the tag, and the next pass prunes it as
+usual. Such a run still counts toward `maxCount`.
+
+The same goes for the engine's [lifecycle subscription registry](/docs/authoring/events#delivery)
+runs (workflow `__lifecycle_registry`, tagged `durable:lifecycle:registry`): retention never prunes
+them and, unlike a run still owed its lifecycle event, they do not count toward `maxCount`. The
+engines delete the ones no instance has refreshed for 10 minutes.
+
 **Statuses you don't name in any policy are never pruned** — e.g. the example above prunes
 `completed`/`cancelled` at 14 days (capped at 200 rows) and `failed` at 90 days, but never touches `dead`
 runs at all, so a poison-pill run stays inspectable indefinitely unless you add a policy for it.

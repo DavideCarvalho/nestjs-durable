@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
+  type RepublishLifecycleResult,
+  type RepublishLifecycleTarget,
   type RunResult,
   type StartOptions,
   type WorkflowClass,
@@ -106,5 +108,23 @@ export class WorkflowService {
     opts?: { id?: string; buffer?: boolean },
   ): Promise<number> {
     return this.engine.publishEvent(name, payload, opts);
+  }
+
+  /**
+   * The runs started by `runId` settling, through `@OnWorkflowCompleted` / `@OnWorkflowFailed` (or
+   * an `onEvent` on `runCompletedEvent(...)`). Only subscribers registered on this engine are
+   * considered. For the reverse link, `lifecycleSourceOf(run)` reads it from the run itself.
+   */
+  triggeredRuns(runId: string): Promise<string[]> {
+    return this.engine.triggeredRuns(runId);
+  }
+
+  /**
+   * Publish settled runs' lifecycle events again: to a subscriber registered after they settled, or
+   * one restricted by `subscriber`. Subscribers already started for a run are not started again.
+   * See `WorkflowEngine.republishLifecycle`.
+   */
+  republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult> {
+    return this.engine.republishLifecycle(target);
   }
 }

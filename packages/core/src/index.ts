@@ -26,6 +26,14 @@ export { parentRunIdOf } from './fan-join';
 export * from './codec-state-store';
 export * from './concurrency';
 export * from './events';
+export * from './lifecycle-events';
+export * from './lifecycle-deliveries';
+export {
+  RUN_WAIT_TOKEN_PREFIX,
+  runWaitPrefix,
+  runWaitTargetOf,
+  runWaitToken,
+} from './run-wait';
 export * from './metrics';
 export * from './remote-event';
 export * from './on-error';

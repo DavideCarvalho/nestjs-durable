@@ -725,6 +725,16 @@ re-delivers it to its SSE subscribers. So you can live-tail a run on the API pod
 runs elsewhere. Without a control plane, the stream still works for runs executing on the same
 instance (single-process apps).
 
+The run view keeps the stream open for as long as the run is open, settled or not, and lists what it
+delivers in an **Events** panel: each event's type and UTC time, newest first, the last 200 kept in
+memory. Nothing is stored, so the panel starts empty on every load and shows only what arrives while
+the page is open. A `run.triggered` names its subscriber (linked to its workflow page) and links the
+run it started; a `run.trigger_failed` names its subscriber and its error; a child step's events link
+the child run; and the run's own `run.started` links back to the run whose lifecycle event started it
+and to its parent. The stream is the same tenant-scoped one, so the panel shows nothing another
+tenant could not already read. An in-flight run's detail refetches on each event (throttled to one per
+1.5s); a settled run's only on `run.triggered` and `run.trigger_failed`.
+
 ### Cancel + Undo (saga compensation)
 
 The run actions include both a plain **Cancel** and a **Cancel + Undo**. Plain cancel is immediate —
@@ -755,6 +765,95 @@ a `dlq:<runId>` id) carrying `{ deadRunId, workflow, input, error }`. The dashbo
 **relationship both ways**: the dead run links forward to its `dlq:<id>` handler, and the handler links
 back to the dead run it was started for — so you can jump between the failure and whatever your DLQ
 workflow did about it (alert, compensate, queue for review).
+
+### Runs started by another run finishing
+
+A run started by a [lifecycle event](/docs/authoring/events#reacting-to-another-workflow-finishing)
+(`@OnWorkflowCompleted` / `@OnWorkflowFailed`) is linked both ways in the run header: the settled run
+lists the runs it **triggered**, and each started run shows the run it was **started by**, how that
+run ended (`on completed` / `on failed`), its current status and, when the source run recorded its
+span's traceparent (with the [OTel bridge](/docs/observability/otel)), the source **trace id** with a
+copy button. They are not parent and child, so neither cancels nor waits for the other. The links come from the run rows themselves (the settled run's `durable:triggered:<workflow>`
+tags and the started run's `evt:<runId>:<kind>:<workflow>` id), so the dashboard shows them without
+registering the subscribing workflows. A settled run still tagged `durable:lifecycle:pending` has not
+published its event to every subscriber yet: its `durable:lifecycle:owed:<workflow>` tags name the
+ones left, and the timer poller's sweep on an instance that has each one picks it up.
+
+A settled run with subscribers lists them under **Lifecycle subscribers**, one row each with where its
+event stands (`RunDetail.lifecycleDeliveries`, a `LifecycleDelivery` per subscriber):
+
+- **started** — the subscriber's run, linked, with its current status;
+- **owed for** *N* — still owed since the run settled; **orphan in** *N* when no live instance
+  registers or announces the subscriber for the run's namespace, which is when the sweep drops it and
+  reports `run.trigger_failed`;
+- **coalesced** — handed to the subscriber's debounce/batch accumulator (the run carries
+  `durable:coalesced:<subscriber>`, `LIFECYCLE_COALESCED_TAG_PREFIX`), linked when its run id can
+  be derived (for a keyed subscriber, from the subscription's `where`, `input` and `key` applied to
+  the event);
+- **failed** — its start failed: its `where` threw, its input was rejected, its start threw, or the
+  sweep dropped it as an orphan. The run carries `durable:trigger_failed:<subscriber>`
+  (`LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX`), written in the same update that drops its owed tag. The
+  row's **Republish** button retries that subscriber alone, and a successful start removes the tag;
+- **not started** — none of the above: its `where` declined the event, or it subscribed after the
+  run settled. Republish starts it.
+
+The tag records only that the start failed. The message is not stored (tags are short and indexed,
+and search attributes are indexed into the attribute pickers and checked against the workflow's
+schema), so a **failed** row shows it only when the `run.trigger_failed` event arrived while the page
+was open (see the **Events** panel); otherwise its tooltip points there. The
+[Telescope](/docs/observability/telescope) "Failed triggers" table keeps the messages.
+
+To find owed runs, the **lifecycle pending** chip under the tag picker filters the run list on the
+`durable:lifecycle:pending` tag.
+
+### Runs waiting for another run
+
+A run suspended in [`ctx.waitForRun`](/docs/authoring/events#waiting-for-another-run-to-finish) shows **Waiting for run** *id* in its
+header, linked, with that run's current status, and the run waited for shows **Awaited by** with the
+waiting runs (`RunDetail.waitsFor` / `awaitedBy`, each a `RunWaitLink`). The run list names the wait
+too (`RunWaiting` `{ on: 'run', name: <id> }`, shown as `awaiting run <id>`), and a delivered wait's
+step in the timeline links to the run it waited for. The links cost the detail one read of the run's
+own waiters while it is suspended, one prefix read of the waiters on it, and one batched read of the
+linked runs; the summarized detail's ETag covers what they read, so a linked run changing status is
+not hidden behind a `304`. Through the tenant proxy, waiting runs of other namespaces are left out,
+and a linked run in another namespace keeps its id but not its status, namespace or trace id.
+
+A settled run whose workflow has subscribers (registered on the dashboard's instance, or announced by
+a live worker) gets a **Republish lifecycle event** action. After a confirmation it publishes the
+run's event again to the subscribers that have not started from it, and shows how many it started
+and which failed. It calls `POST <apiBasePath>/runs/:id/republish-lifecycle`, behind the same gate as
+retry and cancel. A subscriber only a worker has is re-marked as owed, so that worker's sweep starts
+it. On a tenant deployment it goes through the tenant proxy to the operator, which refuses another
+tenant's run; an operator too old for the verb answers "not supported by this server" (501).
+
+#### A workflow's page: who starts whom
+
+The workflow name in a run's header links to the workflow's page (`#/workflow/<name>`), and a run
+whose workflow starts or is started by another shows the same two lists under its header:
+
+- **Starts when it settles** — the subscribers of `run.completed:<workflow>` and
+  `run.failed:<workflow>`, each with its kind (`on completed` / `on failed`) and what the
+  subscription does: `where` (filters payloads), `input` (maps the payload), `debounce` / `batch`
+  (`by key` when keyed), and `announced` for a subscriber only live workers announce, such as a
+  Python workflow (which has no `where` or `input`).
+- **Started by** — the workflows whose settling starts this one.
+
+On the control plane, each entry of "Starts when it settles" also shows how many runs it was started
+for and how many starts failed (`12 started · 1 failed`), counted by the dashboard's server process
+since it started (`triggerCounts` on the response, from the metrics collector's
+`triggeredBySubscriber` and `triggerFailedBySubscriber`); a tenant deployment shows none.
+
+Each entry links to that workflow's page. The lists come from the dashboard instance's registry plus
+the subscriptions the fleet announces (the engines' lifecycle registry runs in the state store, and
+`subscribes` on worker descriptors), so a subscriber that runs only on another instance shows up too. The page reads `GET <apiBasePath>/workflows/:name/lifecycle`
+(`engine.workflowLifecycle(name)`, `RunGateway.workflowLifecycle`), and the run detail carries the
+same object as `workflowLifecycle` when it is not empty; older consoles ignore the field. A tenant
+deployment reads it from the operator through the tenant proxy, which lists only the subscribers of
+the tenant's namespace (501 when the operator is too old for the verb).
+
+The engines' lifecycle registry runs (workflow `__lifecycle_registry`) are bookkeeping, not runs
+anyone started: the run list, its status and origin counts and its filter pickers leave them out,
+unless you filter on that workflow by name.
 
 ### Recovering a lost remote step dispatch
 

@@ -1,6 +1,6 @@
 ---
 title: CLI
-description: Inspect, cancel and export workflow runs from the terminal — `durable inspect` (including the `--stale` stranded-run view), `durable cancel`, and `durable export` for CI replay fixtures.
+description: Inspect, cancel and export workflow runs from the terminal — `durable inspect` (including the `--stale` stranded-run view), `durable cancel`, `durable export` for CI replay fixtures, and `durable lifecycle:republish`.
 icon: SquareTerminal
 ---
 
@@ -126,6 +126,31 @@ finishes its current attempt before it next checks the run's status, so cancella
 the next checkpoint rather than interrupting execution mid-step. Cancelling a run that's already
 `completed`, `failed`, or `cancelled` is a no-op — the CLI tells you it's already terminal and
 leaves it alone.
+
+## Republish lifecycle events
+
+```bash
+durable lifecycle:republish --workflow ingestion --since 2026-11-01 --subscriber refresh-summaries
+durable lifecycle:republish --run wrun_8Kb2
+```
+
+Publishes settled runs' [lifecycle events](/docs/authoring/events#republishing) again, starting the
+subscribers that have not started from them: a subscriber added after the runs settled, or one that
+failed to start. `--run` takes one run; `--workflow` takes its settled runs, bounded by `--since` /
+`--until` (ISO dates, compared with when each run settled) and `--limit` (default 1000).
+`--subscriber` restricts it to one subscribing workflow. It prints how many runs it published, how
+many subscriber runs it started, and each failure.
+
+The subscribers' `where` and `input` run in the CLI's process, so this command needs an engine, not
+only a store: export it as `engine` from the same config, with the subscribing workflows registered.
+
+```ts title="durable.config.mjs"
+export const store = new MikroOrmStateStore(await buildOrm());
+export const engine = new WorkflowEngine({ store });
+engine.register('refresh-summaries', '1', refreshSummaries, {
+  onEvent: [runCompletedEvent('ingestion')],
+});
+```
 
 ## Usage and exit codes
 

@@ -377,6 +377,18 @@ export function runDetailEtag(run: WorkflowRun, stats: CheckpointStat[], over: n
   return `"rd-${hash(`${over}\u0003${JSON.stringify(run)}\u0003${statsFingerprint(stats)}`)}"`;
 }
 
+/**
+ * `etag` extended with a fingerprint of `extras`, the parts of a detail read from outside the run
+ * row and its checkpoints (another run's status, the fleet's subscriptions), so a change to them
+ * also changes the validator. `etag` itself when `extras` is undefined.
+ */
+export function extendEtag(etag: string, extras: unknown): string {
+  if (extras === undefined) return etag;
+  const weak = etag.startsWith('W/') ? 'W/' : '';
+  const bare = etag.slice(weak.length).replace(/^"|"$/g, '');
+  return `${weak}"${bare}.${hash(JSON.stringify(extras))}"`;
+}
+
 /** The ETag of one page of a fan: its group's buckets and the page asked for. */
 export function fanPageEtag(group: string, stats: CheckpointStat[], query: FanPageQuery): string {
   const { offset, limit } = fanPageBounds(query);

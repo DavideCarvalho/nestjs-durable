@@ -150,6 +150,10 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
       // Buffered child completions no parent will consume: a few pages per tick until a pass ends,
       // then a rest (throttled inside the engine). Optional call, like the stalled sweep.
       await this.sweep('sweepBufferedSignals', async () => this.engine.sweepBufferedSignals?.());
+      // Lifecycle events a settled run still owes to a subscriber this instance has (its process
+      // died before publishing, or did not have the subscriber), and `ctx.waitForRun` waits whose
+      // run settled without resuming them. Optional call, like the sweeps above.
+      await this.sweep('sweepLifecycleEvents', async () => this.engine.sweepLifecycleEvents?.());
       const schedules = this.options.schedules;
       if (schedules && schedules.length > 0) {
         await this.sweep('schedules', () => runSchedules(this.engine, schedules, Date.now()));

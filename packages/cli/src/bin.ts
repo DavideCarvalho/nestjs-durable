@@ -9,7 +9,8 @@ import {
   inspect,
   parseDurationMs,
 } from './inspect';
-import { loadStore } from './load-config';
+import { type RepublishOptions, republishLifecycle } from './lifecycle';
+import { loadEngine, loadStore } from './load-config';
 
 const USAGE = `durable — inspect and control nestjs-durable workflow runs
 
@@ -20,6 +21,9 @@ Usage:
   durable inspect --stale[=1h]    only runs that look stranded (default threshold 15m)
   durable cancel <runId>          soft-cancel a run (marks it cancelled in the store)
   durable export <runId>          print a run's replay fixture (JSON) for assertReplayable
+  durable lifecycle:republish --run <runId> | --workflow <name> [--since <iso>] [--until <iso>]
+                                  publish settled runs' lifecycle events again, starting the
+                                  subscribers that have not started (needs an exported \`engine\`)
 
 Options:
   --status <status>   running | suspended | completed | failed | cancelled
@@ -27,19 +31,30 @@ Options:
   --stale[=<dur>]     stranded runs idle at least <dur> (90s, 15m, 4h, 2d; default 15m)
   --namespace <ns>    restrict the listing to one namespace
   --out <file>        (export) write the fixture to a file instead of stdout
+  --run <runId>       (lifecycle:republish) one settled run
+  --workflow <name>   (lifecycle:republish) the settled runs of a workflow
+  --since/--until     (lifecycle:republish) bound when the runs settled (ISO dates)
+  --subscriber <name> (lifecycle:republish) only this subscribing workflow
   --config <path>     path to the durable config (default: ./durable.config.{mjs,js,cjs})
 
-The config exports a configured store, e.g. \`export const store = new MikroOrmStateStore(orm)\`.`;
+The config exports a configured store, e.g. \`export const store = new MikroOrmStateStore(orm)\`,
+and, for lifecycle:republish, the \`engine\` with the subscribing workflows registered.`;
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const command = argv[0];
-  if (command !== 'inspect' && command !== 'cancel' && command !== 'export') {
+  if (
+    command !== 'inspect' &&
+    command !== 'cancel' &&
+    command !== 'export' &&
+    command !== 'lifecycle:republish'
+  ) {
     console.log(USAGE);
     process.exit(command ? 1 : 0);
   }
 
   const opts: InspectOptions & { config?: string | undefined; out?: string | undefined } = {};
+  const republish: RepublishOptions = {};
   const positional: string[] = [];
   for (let i = 1; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -64,12 +79,27 @@ async function main(): Promise<void> {
     } else if (arg === '--out') {
       opts.out = value;
       i += 1;
+    } else if (
+      arg === '--run' ||
+      arg === '--workflow' ||
+      arg === '--since' ||
+      arg === '--until' ||
+      arg === '--subscriber'
+    ) {
+      republish[arg.slice(2) as 'run' | 'workflow' | 'since' | 'until' | 'subscriber'] = value;
+      i += 1;
     } else if (arg === '--config') {
       opts.config = value;
       i += 1;
     } else if (arg && !arg.startsWith('-')) {
       positional.push(arg);
     }
+  }
+
+  if (command === 'lifecycle:republish') {
+    if (opts.limit !== undefined) republish.limit = opts.limit;
+    console.log(await republishLifecycle(await loadEngine(opts.config), republish));
+    return;
   }
 
   const store = await loadStore(opts.config);

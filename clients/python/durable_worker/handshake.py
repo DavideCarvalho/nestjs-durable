@@ -75,6 +75,10 @@ class WorkflowRegistration:
     #: catch-all): ``[{"code": "invalid_line", "workflow": "line-dead-letter"}, {"workflow": "..."}]``.
     #: The one announced field the engine ACTS on, for a workflow it serves by convention.
     on_error: Optional[List[Dict[str, str]]] = None
+    #: The event names this workflow subscribes to, lifecycle events (``run.completed:<workflow>``,
+    #: ``run.failed:<workflow>``) included. The engine starts the workflow, by name, when one of them
+    #: is published, and owes a settled run's lifecycle event to it.
+    subscribes: Optional[List[str]] = None
 
     def to_wire(self) -> Dict[str, Any]:
         """Serialize to the wire JSON shape, omitting every un-stated field (so a name-only
@@ -90,6 +94,8 @@ class WorkflowRegistration:
             wire["origin"] = self.origin
         if self.on_error is not None:
             wire["onError"] = [dict(route) for route in self.on_error]
+        if self.subscribes is not None:
+            wire["subscribes"] = list(self.subscribes)
         return wire
 
     @classmethod
@@ -97,6 +103,7 @@ class WorkflowRegistration:
         """Parse one wire registration. An absent field stays ``None`` — never defaulted."""
         requires = raw.get("requires")
         on_error = raw.get("onError")
+        subscribes = raw.get("subscribes")
         return cls(
             name=raw["name"],
             version=raw.get("version"),
@@ -104,6 +111,7 @@ class WorkflowRegistration:
             requires=list(requires) if requires is not None else None,
             origin=raw.get("origin"),
             on_error=[dict(route) for route in on_error] if on_error is not None else None,
+            subscribes=list(subscribes) if subscribes is not None else None,
         )
 
 
@@ -221,6 +229,8 @@ def _canonicalize_registrations(regs: Sequence[WorkflowRegistration]) -> List[An
         # existed — byte-identical to the TS ``canonicalizeRegistrations``.
         if r.on_error is not None:
             entry["onError"] = canonical_routes(r.on_error)
+        if r.subscribes is not None:
+            entry["subscribes"] = sorted(set(r.subscribes))
         canonical.append(entry)
     by_json = {json.dumps(entry, separators=(",", ":"), ensure_ascii=False): entry for entry in canonical}
     return [by_json[k] for k in sorted(by_json)]

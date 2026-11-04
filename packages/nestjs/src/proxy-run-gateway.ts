@@ -4,6 +4,8 @@ import type {
   FanPage,
   FanPageQuery,
   GroupHealth,
+  RepublishLifecycleResult,
+  RepublishLifecycleTarget,
   RunDetail,
   RunDetailOptions,
   RunFacetQuery,
@@ -20,6 +22,7 @@ import type {
   RunWaiting,
   TenantTokenSource,
   Transport,
+  WorkflowLifecycleLinks,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import {
@@ -30,7 +33,7 @@ import {
   summarizeTimeline,
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
-import { UNSUPPORTED_RUN_REQUEST } from './run-request-responder';
+import { BAD_RUN_REQUEST, UNSUPPORTED_RUN_REQUEST } from './run-request-responder';
 
 /**
  * Method-shorthand signatures (not arrow-function-typed properties) are deliberate: TypeScript
@@ -47,7 +50,7 @@ interface PendingRequest {
 /**
  * An error reply from the control plane. `code` carries the reply's machine-readable reason when it
  * sent one — `unauthorized` (the tenant token was rejected), `cross-tenant` (the run belongs to
- * another tenant), ... — so a caller can tell an authentication failure from a real one, as with
+ * another tenant), `bad-request` (the request was malformed or not allowed), ... — so a caller can tell an authentication failure from a real one, as with
  * Agora's proxy.
  */
 /**
@@ -57,6 +60,7 @@ interface PendingRequest {
 export type RunGatewayErrorCode =
   | 'unauthorized'
   | 'cross-tenant'
+  | typeof BAD_RUN_REQUEST
   | typeof UNSUPPORTED_RUN_REQUEST
   | (string & {});
 
@@ -285,6 +289,43 @@ export class ProxyRunGateway implements RunGateway {
       kind: 'redispatch',
       runId,
     });
+  }
+
+  /**
+   * Republished on the control plane: a one-run target is checked against this tenant like
+   * `retry`, a by-workflow one is read over this tenant's namespace only. A control plane too old to
+   * know the verb fails it with an {@link UNSUPPORTED_RUN_REQUEST} error rather than a timeout.
+   */
+  republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult> {
+    return this.requestNewVerb<RepublishLifecycleResult>({ kind: 'republishLifecycle', target });
+  }
+
+  /** Answered by the control plane's engine; same version-skew error as {@link republishLifecycle}. */
+  workflowLifecycle(workflow: string): Promise<WorkflowLifecycleLinks> {
+    return this.requestNewVerb<WorkflowLifecycleLinks>({ kind: 'workflowLifecycle', workflow });
+  }
+
+  /**
+   * A verb with no fallback on an older control plane: its unsupported-request error, or the empty
+   * `ok: true` reply the oldest responders send for an unknown verb, becomes a
+   * {@link RunGatewayError} with code {@link UNSUPPORTED_RUN_REQUEST}.
+   */
+  private async requestNewVerb<T>(body: RunRequestKind): Promise<T> {
+    const notSupported = () =>
+      new RunGatewayError(
+        `${body.kind} is not supported by this server: the control plane is older than this tenant`,
+        UNSUPPORTED_RUN_REQUEST,
+      );
+    if (this.knownUnsupported(body.kind)) throw notSupported();
+    let data: T | undefined;
+    try {
+      data = await this.request<T | undefined>(body);
+    } catch (err) {
+      if (!isUnsupported(err)) throw err;
+    }
+    if (data !== undefined && data !== null) return data;
+    this.unsupportedUntil.set(body.kind, Date.now() + this.capabilityTtlMs);
+    throw notSupported();
   }
 
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void {

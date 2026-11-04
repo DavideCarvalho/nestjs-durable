@@ -4,7 +4,7 @@ import { durableClient } from '../client/durable-client';
 import type { StepCheckpoint, StepError, StepEvent, WorkflowRun } from '../client/durable-client';
 import { type SubProcess, groupSubProcesses } from '../client/group-subprocesses';
 import { RunSpans } from './SpansTimeline';
-import { childRunIdOf } from './child-link';
+import { childRunIdOf, runWaitTargetOfStep } from './child-link';
 import { BoltIcon, CheckIcon, CopyIcon, KIND_LABEL, XIcon, iconFor } from './icons';
 
 function fmtMs(ms: number): string {
@@ -209,7 +209,7 @@ function StepEvents({ events }: { events: StepEvent[] }) {
   );
 }
 
-function CopyButton({ value }: { value: string }) {
+export function CopyButton({ value }: { value: string }) {
   const [done, setDone] = useState(false);
   return (
     <button
@@ -339,6 +339,7 @@ export function StepDetailPanel({
   onOpenRun?: ((id: string) => void) | undefined;
 }) {
   const childRunId = childRunIdOf(step);
+  const waitedRunId = runWaitTargetOfStep(step);
   const [childOpen, setChildOpen] = useState(false);
   const failed = step.status === 'failed';
   // in-flight: a remote step awaiting its worker (`pending`) or a local step body executing (`running`)
@@ -411,6 +412,24 @@ export function StepDetailPanel({
             }
           />
           {step.workerGroup && <Field k="worker" v={`@${step.workerGroup}`} />}
+          {waitedRunId && (
+            <Field
+              k="waited for run"
+              v={
+                onOpenRun ? (
+                  <button
+                    type="button"
+                    onClick={() => onOpenRun(waitedRunId)}
+                    className="mono text-sky-300 underline-offset-2 hover:underline"
+                  >
+                    {waitedRunId}
+                  </button>
+                ) : (
+                  <span className="mono">{waitedRunId}</span>
+                )
+              }
+            />
+          )}
           <Field k="started" v={clock(step.startedAt)} />
           {/* A pending step's finishedAt is just its last write — showing it as "finished" reads
               like the step ended while the duration says running. */}

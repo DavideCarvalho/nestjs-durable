@@ -486,6 +486,9 @@ class Worker:
         requires: Optional["list[str]"] = None,
         origin: Optional[str] = None,
         on_error: Optional[List[Dict[str, str]]] = None,
+        on_workflow_completed: Any = None,
+        on_workflow_failed: Any = None,
+        on_event: Any = None,
     ) -> Callable[[Any], Any]:
         """Decorator registering ``fn`` as the workflow ``name`` on THIS worker (unified worker).
 
@@ -529,14 +532,37 @@ class Worker:
         (``<name>.onError.<method>``). A class with dependencies is declared with
         :func:`durable_worker.workflow` and handed to :meth:`register` as an instance. Either way the
         class can then be passed wherever a workflow name is (``ctx.all_settled(LineWorkflow, lines)``).
+
+        ``on_workflow_completed`` / ``on_workflow_failed`` start this workflow when a run of another
+        workflow (a name or a registered class, or a list of them) completes, or ends failed, cancelled
+        or dead; ``on_event`` starts it on any event published with ``engine.publishEvent``. The
+        worker announces them (``subscribes``) and the engine starts the run by name, with the event
+        payload as its input — for a lifecycle event the settled run's ``{"runId", "workflow",
+        "status", "input", "output" | "error", ...}``, under the deterministic id
+        ``evt:<runId>:<completed|failed>:<name>``. There is no ``where`` or ``input`` mapping: filter
+        in the workflow body::
+
+            @worker.workflow("notify", on_workflow_completed="ingest")
+            def notify(ctx, event):
+                if event["output"]["rows"] == 0:
+                    return None
+                ctx.step("email.send", {"runId": event["runId"]})
         """
 
-        def register(target: Any) -> Any:
-            from .workflow import _register_workflow, _workflow_meta
+        from .workflow import _register_workflow, _workflow_meta
 
-            return _register_workflow(
-                self, name, target, _workflow_meta(version, requires, origin, on_error)
-            )
+        meta = _workflow_meta(
+            version,
+            requires,
+            origin,
+            on_error,
+            on_workflow_completed,
+            on_workflow_failed,
+            on_event,
+        )
+
+        def register(target: Any) -> Any:
+            return _register_workflow(self, name, target, meta)
 
         return register
 

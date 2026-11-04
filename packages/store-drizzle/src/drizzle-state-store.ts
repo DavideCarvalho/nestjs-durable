@@ -5,6 +5,7 @@ import {
   type CheckpointQuery,
   type CheckpointStat,
   type ChildWait,
+  LIFECYCLE_REGISTRY_WORKFLOW,
   type OwnedLeaseReclaim,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
@@ -33,6 +34,7 @@ import {
   mergeRunValueFacetRows,
   normalizeAttributeRows,
   parseDuration,
+  retentionKeeps,
   runValueFacetsFromRuns,
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
@@ -69,6 +71,12 @@ import {
   stepCheckpoints,
   workflowRuns,
 } from './schema';
+
+/**
+ * Workflows a retention policy never sees: lifecycle registry runs are neither pruned nor counted
+ * toward `maxCount`.
+ */
+const RETENTION_EXCLUDED = [LIFECYCLE_REGISTRY_WORKFLOW];
 
 type RunRow = typeof workflowRuns.$inferSelect;
 type CheckpointRow = typeof stepCheckpoints.$inferSelect;
@@ -263,22 +271,27 @@ export class DrizzleStateStore implements StateStore {
     if (statuses.length === 0 || limit <= 0) return 0;
     if (policy.maxAge == null && policy.maxCount == null) return 0;
     // A scoped policy only ever sees (and, for maxCount, counts) the runs its scope matches.
-    const scoped = this.runFilters({ ...(policy.scope ?? {}), statuses });
+    const scoped = this.runFilters({
+      ...(policy.scope ?? {}),
+      statuses,
+      excludeWorkflows: RETENTION_EXCLUDED,
+    });
     const ids = new Set<string>();
     if (policy.maxAge != null) {
       const cutoff = nowMs - parseDuration(policy.maxAge);
       const rows = await this.db
-        .select({ id: workflowRuns.id })
+        .select({ id: workflowRuns.id, tags: workflowRuns.tags })
         .from(workflowRuns)
         .where(and(...scoped, lt(workflowRuns.updatedAt, cutoff)))
         .orderBy(asc(workflowRuns.updatedAt)) // oldest first
         .limit(limit);
-      for (const r of rows) ids.add(r.id);
+      // A run whose lifecycle event is still owed is kept until it is published.
+      for (const r of rows) if (!retentionKeeps(r.tags)) ids.add(r.id);
     }
     if (policy.maxCount != null && ids.size < limit) {
       // Everything past the newest `maxCount` rows of the scoped status set (skipped by OFFSET).
       const rows = await this.db
-        .select({ id: workflowRuns.id })
+        .select({ id: workflowRuns.id, tags: workflowRuns.tags })
         .from(workflowRuns)
         .where(and(...scoped))
         .orderBy(desc(workflowRuns.updatedAt), desc(workflowRuns.id))
@@ -286,7 +299,7 @@ export class DrizzleStateStore implements StateStore {
         .offset(policy.maxCount);
       for (const r of rows) {
         if (ids.size >= limit) break;
-        ids.add(r.id);
+        if (!retentionKeeps(r.tags)) ids.add(r.id);
       }
     }
     const doomed = [...ids].slice(0, limit);
@@ -672,6 +685,12 @@ export class DrizzleStateStore implements StateStore {
       // The plural form of each axis below: ORed within itself, ANDed with everything else, and an
       // empty set matches nothing — the same contract `statuses` already had.
       query.workflows ? anyOf(query.workflows.map((w) => eq(workflowRuns.workflow, w))) : undefined,
+      query.excludeWorkflows?.length
+        ? notInArray(workflowRuns.workflow, query.excludeWorkflows)
+        : undefined,
+      query.updatedAfter !== undefined
+        ? gte(workflowRuns.updatedAt, query.updatedAfter)
+        : undefined,
       // The tenant boundary, ANDed with everything else. This is not only a dashboard facet: it is
       // the fourth namespace-scoped worker path, because `engine.sweepTimeouts` cancels runs past
       // their `executionTimeout` via `listRuns({ workflow, status, namespace })` — unscoped here, a

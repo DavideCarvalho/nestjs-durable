@@ -68,6 +68,33 @@ A failure handed to an [onError handler](/docs/reliability/on-error) adds a `dur
 to the run's span (attributes `durable.on_error.handler`, `durable.error.code`, `durable.error.message`).
 Routes that could not be applied add `durable.run.unrouted` with `durable.on_error.reason`.
 
+## Lifecycle events
+
+A run started by a [lifecycle event](/docs/authoring/events#reacting-to-another-workflow-finishing)
+(`@OnWorkflowCompleted`, `@OnWorkflowFailed`, or a Python `on_workflow_completed`) gets a root span
+with a **span link** to the root span of the run whose settling started it, and two attributes:
+
+| Attribute | Value |
+| --- | --- |
+| `durable.lifecycle.source_run_id` | The settled run's id. |
+| `durable.lifecycle.kind` | `completed` or `failed`. |
+
+A link, not a parent: the two runs are separate traces, as they are separate runs. Jaeger, Tempo and
+Datadog show the link as a jump to the source trace.
+
+The link holds across processes. `attachDurableOtel` installs a run trace provider on the engine
+(`engine.setRunTraceparent`), and a run that some workflow subscribes to records its root span's W3C
+traceparent in a `durable:lifecycle:trace:<traceparent>` tag (`LIFECYCLE_TRACE_TAG_PREFIX`) in the
+first status write after the span opens: the first turn's suspend, or the terminal write (next to the
+lifecycle marker) for a run that settles in one turn. The subscriber's `run.started` event carries it
+as `sourceTraceparent`, read from that tag wherever the subscriber runs, and the bridge links to it.
+So a run that suspends, is resumed by another process and settles there still links its
+subscribers to its root span, although that process never saw it (see the callout above). No extra
+store write is made, and nothing is recorded for a run nobody subscribes to or when no bridge is
+attached. The tag is bookkeeping: it is not in the event payload's `tags`. A run whose first turn
+crashed before it suspended or settled has no recorded traceparent, so its subscriber's span carries
+the attributes without the link.
+
 ## Distributed tracing across workers
 
 A remote step runs in **another process** — often another language (the [Python SDK](/docs/python)).

@@ -5,6 +5,7 @@ import {
   type FanPageQuery,
   type GroupHealth,
   type MetricsCollector,
+  type RepublishLifecycleResult,
   type RunDetail,
   type RunDetailOptions,
   type RunFacetQuery,
@@ -23,6 +24,7 @@ import {
   TERMINAL_RUN_STATUSES,
   type UpdateResult,
   WorkflowEngine,
+  type WorkflowLifecycleLinks,
   collectMetrics,
   parseWebhookToken,
 } from '@dudousxd/nestjs-durable-core';
@@ -43,6 +45,15 @@ export type { RunDetail };
  * Operator-only ops (metrics/deliverWebhook/getEvent/update) still need direct `store`/`engine`
  * access; they stay `@Optional()` and throw a clear error when absent.
  */
+/**
+ * A workflow's lifecycle links as `GET workflows/:name/lifecycle` answers them, plus `triggerCounts`:
+ * per subscriber of `startsOnSettle`, how many runs it was started for (`triggered`) and how many
+ * times starting it failed (`failed`), counted by this process's metrics since it started.
+ */
+export interface WorkflowLifecyclePage extends WorkflowLifecycleLinks {
+  triggerCounts?: Record<string, { triggered: number; failed: number }> | undefined;
+}
+
 @Injectable()
 export class DashboardService {
   /** Prometheus counters accumulated from engine events since boot (per process); undefined on a
@@ -194,6 +205,51 @@ export class DashboardService {
 
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
     return this.gateway.cancel(runId, opts);
+  }
+
+  /**
+   * Publish a settled run's lifecycle event again, to its subscribers that have not started (or to
+   * `subscriber` alone). Undefined when the gateway cannot republish (a tenant proxy).
+   */
+  async republishLifecycle(
+    runId: string,
+    subscriber?: string,
+  ): Promise<RepublishLifecycleResult | undefined> {
+    return this.gateway.republishLifecycle?.({
+      runId,
+      ...(subscriber !== undefined ? { subscriber } : {}),
+    });
+  }
+
+  /**
+   * Who starts whom through lifecycle events, for `workflow`, plus `triggerCounts` when this process
+   * counts the engine's events (the control plane) and the workflow has subscribers. Undefined when
+   * the gateway cannot answer.
+   */
+  async workflowLifecycle(workflow: string): Promise<WorkflowLifecyclePage | undefined> {
+    const links = await this.gateway.workflowLifecycle?.(workflow);
+    if (!links) return links;
+    const counts = this.triggerCountsOf(links);
+    return counts ? { ...links, triggerCounts: counts } : links;
+  }
+
+  /**
+   * How many runs each subscriber of `links.workflow` was started for and how many times starting it
+   * failed, counted by this process's metrics since it started. Undefined without metrics (a tenant)
+   * or without subscribers.
+   */
+  private triggerCountsOf(
+    links: WorkflowLifecycleLinks,
+  ): Record<string, { triggered: number; failed: number }> | undefined {
+    const snapshot = this.metricsCollector?.snapshot();
+    if (!snapshot || links.startsOnSettle.length === 0) return undefined;
+    const triggered = snapshot.triggeredBySubscriber[links.workflow] ?? {};
+    const failed = snapshot.triggerFailedBySubscriber[links.workflow] ?? {};
+    const counts: Record<string, { triggered: number; failed: number }> = {};
+    for (const { workflow } of links.startsOnSettle) {
+      counts[workflow] = { triggered: triggered[workflow] ?? 0, failed: failed[workflow] ?? 0 };
+    }
+    return counts;
   }
 
   /**

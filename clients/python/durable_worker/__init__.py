@@ -30,6 +30,8 @@ from .workflow import (
     WorkflowError,
     WorkflowWorker,
     on_error,
+    run_completed_event,
+    run_failed_event,
     workflow,
     workflow_name,
 )
@@ -53,6 +55,8 @@ from .worker import (
 
 __all__ = [
     "on_error",
+    "run_completed_event",
+    "run_failed_event",
     "workflow",
     "workflow_name",
     "Worker",

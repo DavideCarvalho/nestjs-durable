@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { childChips, childDetailIds, childFallbackLabel, childRunIdOf } from './child-link';
+import {
+  childChips,
+  childDetailIds,
+  childFallbackLabel,
+  childRunIdOf,
+  triggerChips,
+} from './child-link';
 
 describe('childRunIdOf', () => {
   it('extracts the child run id from a ctx.startChild spawn checkpoint', () => {
@@ -65,5 +71,23 @@ describe('childChips', () => {
   it('counts past the listed ids with childCount, when the server capped the list', () => {
     const children = Array.from({ length: 200 }, (_, i) => `c${i}`);
     expect(childChips(children, 40000).more).toBe(39988);
+  });
+});
+
+describe('triggerChips', () => {
+  it('lists the run that started this one and the runs this one started', () => {
+    expect(
+      triggerChips({
+        triggeredBy: { runId: 'ingest-1', kind: 'completed' },
+        triggered: ['evt:me:completed:a', 'evt:me:completed:b'],
+      }),
+    ).toEqual({
+      startedBy: { runId: 'ingest-1', kind: 'completed' },
+      triggered: ['evt:me:completed:a', 'evt:me:completed:b'],
+    });
+  });
+
+  it('lists nothing for a run with no lifecycle links', () => {
+    expect(triggerChips({})).toEqual({ triggered: [] });
   });
 });

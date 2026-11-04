@@ -48,11 +48,14 @@ import type {
   StepLogger,
   StepOptions,
   StepUndo,
+  WaitForRunOptions,
   WorkflowCtx,
   WorkflowRun,
 } from './interfaces';
+import { lifecycleEventOf } from './lifecycle-events';
 import { codeAndDetails } from './on-error';
 import { breakpointToken } from './protocol';
+import { runWaitToken, settledRunOf } from './run-wait';
 import { readRunsByIds } from './run-waiting';
 import { createStepLogger } from './step-logger';
 import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol';
@@ -614,6 +617,66 @@ export function createWorkflowCtx(
     await store.putSignalWaiter({ token, runId, seq: waitSeq });
     const bufferedHit = await consumeBufferedEvent<T>(name, opts.match, token, waitSeq);
     if (bufferedHit) return bufferedHit.value;
+    throw new WorkflowSuspended(deadline);
+  };
+
+  // Resolve a `waitForRun` waiter from the target's row, when the target has already settled: the
+  // check right after registering, which closes the window where the target settled before the
+  // waiter existed. The waiter is taken first, so this and the engine's delivery on settle never
+  // both resume the run; losing that race leaves it to the engine.
+  const settleRunWaitFromTarget = async (
+    target: string,
+    token: string,
+    seq: number,
+  ): Promise<{ value: unknown } | null> => {
+    const state = await settledRunOf(store, target);
+    if (state.state === 'missing') {
+      await store.removeSignalWaiter({ token, runId, seq });
+      throw new FatalError(`run ${target} not found`, 'run_not_found');
+    }
+    if (state.state === 'running') return null;
+    if (!(await store.takeSignalWaiter(token))) return null;
+    const event = lifecycleEventOf(state.run);
+    await writeCheckpoint(
+      instantCheckpoint({ runId, seq, name: `signal:${token}`, kind: 'signal', output: event }),
+    );
+    return { value: event };
+  };
+
+  // Wait for any run to settle. Built on a signal waiter whose token embeds the target and this
+  // call's own `runId#seq` (see run-wait.ts), registered before the target is checked, so the target
+  // settling at any point is seen either here or by the engine's delivery on settle.
+  const waitForRun = async (
+    first: WorkflowRef,
+    second?: string | WaitForRunOptions,
+    third?: WaitForRunOptions,
+  ): Promise<unknown> => {
+    const target = typeof first === 'string' ? first : (second as string);
+    const opts = typeof first === 'string' ? (second as WaitForRunOptions | undefined) : third;
+    if (opts?.timeoutMs == null) {
+      const current = pos.next();
+      const token = runWaitToken(target, runId, current);
+      const existing = await readCheckpoint(current);
+      if (existing && existing.status === 'completed') return existing.output;
+      await store.putSignalWaiter({ token, runId, seq: current });
+      const settled = await settleRunWaitFromTarget(target, token, current);
+      if (settled) return settled.value;
+      throw new WorkflowSuspended();
+    }
+    const timeoutMs = parseDuration(opts.timeoutMs);
+    const deadlineSeq = pos.next();
+    const waitSeq = pos.next();
+    const token = runWaitToken(target, runId, waitSeq);
+    const deadline = await stampDeadline(deadlineSeq, `run:${target}`, timeoutMs);
+    const waited = await readCheckpoint(waitSeq);
+    if (waited && waited.status === 'completed') return waited.output;
+    if (host.clock() >= deadline) {
+      await store.removeSignalWaiter({ token, runId, seq: waitSeq }).catch(() => undefined);
+      throw new SignalTimeoutError(`run:${target}`, timeoutMs);
+    }
+    await store.putSignalWaiter({ token, runId, seq: waitSeq });
+    const settled = await settleRunWaitFromTarget(target, token, waitSeq);
+    if (settled) return settled.value;
     throw new WorkflowSuspended(deadline);
   };
 
@@ -1487,6 +1550,7 @@ export function createWorkflowCtx(
     continueAsNew,
     waitForSignal: guard('waitForSignal', waitForSignal),
     waitForEvent: guard('waitForEvent', waitForEvent),
+    waitForRun: guard('waitForRun', waitForRun) as WorkflowCtx['waitForRun'],
     task: guard('task', task),
     child: guard('child', child),
     all: guard('all', all),

@@ -1,10 +1,14 @@
 import {
+  type LifecycleKind,
+  type RepublishLifecycleTarget,
+  type RunDetail,
   type RunGateway,
   type RunReply,
   type RunRequest,
   type RunRequestKind,
   type RunWaiting,
   type TenantVerifier,
+  lifecycleKindOf,
   resolveWireTenant,
 } from '@dudousxd/nestjs-durable-core';
 
@@ -14,6 +18,12 @@ import {
  * responders reply `ok: true` with no `data` instead; `ProxyRunGateway` reads both.
  */
 export const UNSUPPORTED_RUN_REQUEST = 'unsupported-request';
+
+/** The error `code` a responder replies with for a request it rejects as malformed or not allowed. */
+export const BAD_RUN_REQUEST = 'bad-request';
+
+/** The most settled runs one tenant republish reads; a larger `limit` is lowered to it. */
+export const TENANT_REPUBLISH_MAX_LIMIT = 1000;
 
 const KNOWN_KINDS: ReadonlySet<string> = new Set<RunRequestKind['kind']>([
   'getRunDetail',
@@ -29,7 +39,17 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set<RunRequestKind['kind']>([
   'retryWithInput',
   'redispatch',
   'waitingFor',
+  'republishLifecycle',
+  'workflowLifecycle',
 ]);
+
+/** A wire `since`/`until` (an ISO string after JSON) back to a `Date`. */
+function wireDate(value: Date | string | undefined): Date | undefined {
+  if (value === undefined || value === null) return undefined;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error(`invalid date ${String(value)}`);
+  return date;
+}
 
 /** The narrow slice of `Transport` the responder needs — a tenant's read/control request in, a
  *  correlated reply out. Both are OPTIONAL on the full `Transport` interface (only broker
@@ -71,6 +91,34 @@ export interface RunRequestResponderOptions {
  * token short-circuits into an `unauthorized` error reply before any run is touched. A verifier
  * that throws becomes an error reply too.
  */
+/**
+ * `detail` with its links to other runs kept to `tenant`'s namespace: `awaitedBy` without the
+ * waiting runs of other namespaces, and what was read of a `triggeredBy`, `waitsFor` or started
+ * `lifecycleDeliveries` run (its status, namespace and trace id) only when that run is the tenant's.
+ */
+function scopeRunLinks(detail: RunDetail, tenant: string): RunDetail {
+  const own = (link: { namespace?: string | undefined }) => link.namespace === tenant;
+  const bare = <T extends { status?: unknown; namespace?: string | undefined }>(link: T): T => {
+    if (own(link)) return link;
+    const { status: _status, namespace: _namespace, ...rest } = link;
+    return rest as T;
+  };
+  const awaitedBy = detail.awaitedBy?.filter(own);
+  const { awaitedBy: _awaitedBy, ...rest } = detail;
+  const source = detail.triggeredBy;
+  return {
+    ...rest,
+    ...(source
+      ? { triggeredBy: own(source) ? source : { runId: source.runId, kind: source.kind } }
+      : {}),
+    ...(awaitedBy && awaitedBy.length > 0 ? { awaitedBy } : {}),
+    ...(detail.waitsFor ? { waitsFor: detail.waitsFor.map(bare) } : {}),
+    ...(detail.lifecycleDeliveries
+      ? { lifecycleDeliveries: detail.lifecycleDeliveries.map(bare) }
+      : {}),
+  };
+}
+
 export class RunRequestResponder {
   private readonly verifyTenant: TenantVerifier | undefined;
 
@@ -128,18 +176,7 @@ export class RunRequestResponder {
     // From here on `msg.tenant` is the VERIFIED tenant (the wire claim itself when no verifier is set).
     const msg: RunRequest = { ...wire, tenant };
     const { body } = msg;
-    if (!KNOWN_KINDS.has(body.kind)) {
-      return {
-        requestId: msg.requestId,
-        result: {
-          ok: false,
-          error: {
-            message: `the control plane does not support the ${String(body.kind)} run request`,
-            code: UNSUPPORTED_RUN_REQUEST,
-          },
-        },
-      };
-    }
+    if (!KNOWN_KINDS.has(body.kind)) return unsupported(msg.requestId, String(body.kind));
     if (body.kind === 'listRuns') {
       // Force the namespace to the requester's tenant — the client-supplied value is discarded,
       // never merely validated, so a tenant can't widen its own query into another's namespace.
@@ -176,6 +213,58 @@ export class RunRequestResponder {
       return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
+    if (body.kind === 'workflowLifecycle') {
+      if (!this.gateway.workflowLifecycle) return unsupported(msg.requestId, body.kind);
+      // Scoped to the requester: subscribers another tenant registers or announces stay unseen.
+      const data = await this.gateway.workflowLifecycle(body.workflow, { namespace: msg.tenant });
+      return { requestId: msg.requestId, result: { ok: true, data } };
+    }
+
+    if (body.kind === 'republishLifecycle' && !('runId' in body.target)) {
+      // Not runId-bearing: forced onto the requester's namespace, like `listRuns`, so a tenant can
+      // only republish its own runs whatever namespace it sent.
+      if (!this.gateway.republishLifecycle) return unsupported(msg.requestId, body.kind);
+      const { since, until, limit, ...rest } = body.target as Extract<
+        RepublishLifecycleTarget,
+        { workflow: string }
+      > & { since?: Date | string; until?: Date | string };
+      if (
+        limit !== undefined &&
+        (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1)
+      ) {
+        return badRequest(
+          msg.requestId,
+          `limit must be a positive integer, got ${JSON.stringify(limit)}`,
+        );
+      }
+      const refused = await this.refuseSubscriber(
+        rest.workflow,
+        rest.kind,
+        rest.subscriber,
+        msg.tenant,
+      );
+      if (refused) return badRequest(msg.requestId, refused);
+      const target: RepublishLifecycleTarget = {
+        ...rest,
+        namespace: msg.tenant,
+        limit: Math.min(limit ?? TENANT_REPUBLISH_MAX_LIMIT, TENANT_REPUBLISH_MAX_LIMIT),
+        ...(since !== undefined ? { since: wireDate(since) } : {}),
+        ...(until !== undefined ? { until: wireDate(until) } : {}),
+      };
+      try {
+        const data = await this.gateway.republishLifecycle(target);
+        return { requestId: msg.requestId, result: { ok: true, data } };
+      } catch (err) {
+        return {
+          requestId: msg.requestId,
+          result: {
+            ok: false,
+            error: { message: err instanceof Error ? err.message : String(err) },
+          },
+        };
+      }
+    }
+
     if (body.kind === 'waitingFor') {
       // Bulk, like `listRuns` — but unlike `listRuns` (which forces the query's namespace and so
       // scopes itself) the caller supplies arbitrary ids, which could probe another tenant's runs. The
@@ -198,18 +287,22 @@ export class RunRequestResponder {
       return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
+    if (body.kind === 'republishLifecycle' && !this.gateway.republishLifecycle) {
+      return unsupported(msg.requestId, body.kind);
+    }
+
     // Every remaining verb is runId-bearing. Load the run FIRST — before calling the verb — so a
     // cross-tenant request never reaches the gateway's mutating methods (cancel/retry/continue/redispatch).
     // Only `getRunDetail` needs the timeline; every other verb checks ownership on the run alone.
+    const runId = runIdOf(body);
     const detail =
       body.kind === 'getRunDetail' || !this.gateway.getRun
         ? await this.gateway.getRunDetail(
-            body.runId,
+            runId,
             body.kind === 'getRunDetail' ? body.options : undefined,
           )
         : undefined;
-    const run =
-      detail !== undefined ? (detail?.run ?? null) : await this.gateway.getRun?.(body.runId);
+    const run = detail !== undefined ? (detail?.run ?? null) : await this.gateway.getRun?.(runId);
     if (run && run.namespace !== msg.tenant) {
       return {
         requestId: msg.requestId,
@@ -221,7 +314,8 @@ export class RunRequestResponder {
     }
 
     if (body.kind === 'getRunDetail') {
-      return { requestId: msg.requestId, result: { ok: true, data: detail } };
+      const data = detail ? await this.scopeLifecycle(detail, msg.tenant) : detail;
+      return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
     if (body.kind === 'getRun') {
@@ -235,6 +329,14 @@ export class RunRequestResponder {
       return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
+    if (body.kind === 'republishLifecycle' && 'runId' in body.target && run) {
+      const kind = lifecycleKindOf(run.status);
+      const refused = kind
+        ? await this.refuseSubscriber(run.workflow, kind, body.target.subscriber, msg.tenant)
+        : undefined;
+      if (refused) return badRequest(msg.requestId, refused);
+    }
+
     try {
       const data = await this.callVerb(body);
       return { requestId: msg.requestId, result: { ok: true, data } };
@@ -244,6 +346,68 @@ export class RunRequestResponder {
         result: { ok: false, error: { message: err instanceof Error ? err.message : String(err) } },
       };
     }
+  }
+
+  /**
+   * `detail` scoped to `tenant` (see {@link scopeRunLinks}), with its lifecycle links
+   * (`workflowLifecycle`, `lifecycleSubscribers`) narrowed to the subscriptions of `tenant`'s
+   * namespace, as the `workflowLifecycle` verb answers them.
+   */
+  private async scopeLifecycle(input: RunDetail, tenant: string): Promise<RunDetail> {
+    const detail = scopeRunLinks(input, tenant);
+    if (detail.workflowLifecycle === undefined && detail.lifecycleSubscribers === undefined) {
+      return detail;
+    }
+    const { workflowLifecycle: _links, lifecycleSubscribers: _subscribers, ...rest } = detail;
+    const links = await this.gateway.workflowLifecycle?.(detail.run.workflow, {
+      namespace: tenant,
+    });
+    if (!links) return rest;
+    const kind = lifecycleKindOf(detail.run.status);
+    const subscribers = kind
+      ? [...new Set(links.startsOnSettle.filter((l) => l.kind === kind).map((l) => l.workflow))]
+      : [];
+    const linked = links.startsOnSettle.length > 0 || links.startedBy.length > 0;
+    return {
+      ...rest,
+      ...(subscribers.length > 0 ? { lifecycleSubscribers: subscribers } : {}),
+      ...(linked ? { workflowLifecycle: links } : {}),
+    };
+  }
+
+  /**
+   * Why a tenant republish naming `subscriber` is refused, or undefined when it may go ahead: the
+   * subscriber must be owed the event of `workflow` settling (as `kind`, when given) by a run of
+   * the tenant's namespace (the gateway's `lifecycleSubscribers`, else the tenant's
+   * `workflowLifecycle` links), so a tenant cannot have the event owed to an arbitrary name. Without
+   * `subscriber` there is nothing to check.
+   */
+  private async refuseSubscriber(
+    workflow: string,
+    kind: LifecycleKind | undefined,
+    subscriber: string | undefined,
+    tenant: string,
+  ): Promise<string | undefined> {
+    if (subscriber === undefined) return undefined;
+    const kinds: LifecycleKind[] = kind ? [kind] : ['completed', 'failed'];
+    let subscribes = false;
+    if (this.gateway.lifecycleSubscribers) {
+      for (const k of kinds) {
+        const subscribers = await this.gateway.lifecycleSubscribers(workflow, k, tenant);
+        subscribes ||= subscribers.includes(subscriber);
+      }
+    } else {
+      const links = await this.gateway.workflowLifecycle?.(workflow, { namespace: tenant });
+      subscribes =
+        links?.startsOnSettle.some(
+          (link) => link.workflow === subscriber && kinds.includes(link.kind),
+        ) ?? false;
+    }
+    if (subscribes) return undefined;
+    const events = kind
+      ? `run.${kind}:${workflow}`
+      : `run.completed:${workflow} or run.failed:${workflow}`;
+    return `subscriber ${subscriber} does not subscribe to ${events} in namespace ${tenant}`;
   }
 
   private callVerb(
@@ -257,9 +421,15 @@ export class RunRequestResponder {
       | { kind: 'getRun' }
       | { kind: 'workerHealth' }
       | { kind: 'waitingFor' }
+      | { kind: 'workflowLifecycle' }
     >,
   ): Promise<unknown> {
     switch (body.kind) {
+      case 'republishLifecycle':
+        return (
+          this.gateway.republishLifecycle?.(body.target) ??
+          Promise.reject(new Error('republishLifecycle is not supported'))
+        );
       case 'cancel':
         return this.gateway.cancel(body.runId, body.opts);
       case 'retry':
@@ -272,4 +442,39 @@ export class RunRequestResponder {
         return this.gateway.redispatchPending(body.runId);
     }
   }
+}
+
+/** The run a runId-bearing request acts on; a one-run republish names it in its target. */
+function runIdOf(
+  body: Exclude<
+    RunRequestKind,
+    | { kind: 'listRuns' }
+    | { kind: 'runFacets' }
+    | { kind: 'runValueFacets' }
+    | { kind: 'workerHealth' }
+    | { kind: 'waitingFor' }
+    | { kind: 'workflowLifecycle' }
+  >,
+): string {
+  if (body.kind !== 'republishLifecycle') return body.runId;
+  return 'runId' in body.target ? body.target.runId : '';
+}
+
+/** The reply to a request this responder rejects (see {@link BAD_RUN_REQUEST}). */
+function badRequest(requestId: string, message: string): RunReply {
+  return { requestId, result: { ok: false, error: { message, code: BAD_RUN_REQUEST } } };
+}
+
+/** The reply to a verb this responder knows but its gateway cannot answer. */
+function unsupported(requestId: string, kind: string): RunReply {
+  return {
+    requestId,
+    result: {
+      ok: false,
+      error: {
+        message: `the control plane does not support the ${kind} run request`,
+        code: UNSUPPORTED_RUN_REQUEST,
+      },
+    },
+  };
 }

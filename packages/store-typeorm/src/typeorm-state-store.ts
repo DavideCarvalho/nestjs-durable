@@ -5,6 +5,7 @@ import {
   type CheckpointQuery,
   type CheckpointStat,
   type ChildWait,
+  LIFECYCLE_REGISTRY_WORKFLOW,
   type OwnedLeaseReclaim,
   RUN_VALUE_FACET_SCAN,
   type RetentionPolicy,
@@ -34,6 +35,7 @@ import {
   mergeRunValueFacetRows,
   normalizeAttributeRows,
   parseDuration,
+  retentionKeeps,
   runValueFacetsFromRuns,
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
@@ -69,6 +71,12 @@ import {
   durableColumnResolver,
   ensureTypeOrmDurableSchema,
 } from './schema';
+
+/**
+ * Workflows a retention policy never sees: lifecycle registry runs are neither pruned nor counted
+ * toward `maxCount`.
+ */
+const RETENTION_EXCLUDED = [LIFECYCLE_REGISTRY_WORKFLOW];
 
 /** {@link checkpointNameKind} as a SQL expression over the `cp` alias, for selecting and grouping. */
 const CHECKPOINT_NAME_KIND_SQL =
@@ -338,20 +346,27 @@ export class TypeOrmStateStore implements StateStore {
     if (policy.maxAge == null && policy.maxCount == null) return 0;
     // A scoped policy only ever sees (and, for maxCount, counts) the runs its scope matches.
     const scoped = () =>
-      this.runQueryBuilder({ ...(policy.scope ?? {}), statuses }).select('r.id', 'id');
+      this.runQueryBuilder({
+        ...(policy.scope ?? {}),
+        statuses,
+        excludeWorkflows: RETENTION_EXCLUDED,
+      })
+        .select('r.id', 'id')
+        .addSelect('r.tags', 'tags');
     const ids = new Set<string>();
     if (policy.maxAge != null) {
       const cutoff = new Date(nowMs - parseDuration(policy.maxAge));
-      const rows: Array<{ id: string }> = await scoped()
+      const rows: Array<{ id: string; tags: unknown }> = await scoped()
         .andWhere('r.updatedAt < :cutoff', { cutoff })
         .orderBy('r.updatedAt', 'ASC') // oldest first
         .limit(limit)
         .getRawMany();
-      for (const r of rows) ids.add(r.id);
+      // A run whose lifecycle event is still owed is kept until it is published.
+      for (const r of rows) if (!retentionKeeps(r.tags)) ids.add(r.id);
     }
     if (policy.maxCount != null && ids.size < limit) {
       // Everything past the newest `maxCount` rows of the scoped status set (skipped by OFFSET).
-      const rows: Array<{ id: string }> = await scoped()
+      const rows: Array<{ id: string; tags: unknown }> = await scoped()
         .orderBy('r.updatedAt', 'DESC')
         .addOrderBy('r.id', 'DESC')
         .limit(limit)
@@ -359,7 +374,7 @@ export class TypeOrmStateStore implements StateStore {
         .getRawMany();
       for (const r of rows) {
         if (ids.size >= limit) break;
-        ids.add(r.id);
+        if (!retentionKeeps(r.tags)) ids.add(r.id);
       }
     }
     const doomed = [...ids].slice(0, limit);
@@ -680,6 +695,13 @@ export class TypeOrmStateStore implements StateStore {
         query.workflows.length ? 'r.workflow IN (:...workflows)' : '1 = 0',
         query.workflows.length ? { workflows: query.workflows } : {},
       );
+    if (query.excludeWorkflows?.length)
+      qb.andWhere('r.workflow NOT IN (:...excludeWorkflows)', {
+        excludeWorkflows: query.excludeWorkflows,
+      });
+    if (query.updatedAfter !== undefined) {
+      qb.andWhere('r.updatedAt >= :updatedAfter', { updatedAfter: new Date(query.updatedAfter) });
+    }
     // The tenant partition. This is not only a dashboard facet: the engine's execution-timeout sweep
     // finds its in-flight runs through `listRuns({ workflow, status, namespace })`, so without this
     // predicate a namespaced worker would cancel ANOTHER tenant's long-running runs. `undefined`

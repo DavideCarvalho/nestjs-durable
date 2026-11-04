@@ -24,7 +24,7 @@ the way you already do for the rest of your app.
 | Workflow model | replay + suspend, plain async code | replay, plain code | step memoization over HTTP | jobs + flows (no replay) |
 | Waits (sleep/signal) | zero-compute suspend | zero-compute | zero-compute | delayed jobs only |
 | Sagas (compensation) | built-in — `{ compensate }` on any step | manual try/catch pattern | manual | — |
-| Event triggers | `onEvent` + debounce/batch | schedules; signal-with-start by hand | core feature (debounce, batch) | — |
+| Event triggers | `onEvent` + debounce/batch, `@OnWorkflowCompleted` / `@OnWorkflowFailed` | schedules; signal-with-start by hand | core feature (debounce, batch) | — |
 | Per-key mutex | `singleton` (FIFO per key) | one run per workflow id | concurrency key = 1 | Pro only (groups) |
 | Durable entities | built-in (`@Entity`/`@On`) | — | — | — |
 | Cross-language | TS + Python workers, one workflow | per-language SDKs | HTTP (any language) | JS/TS only |

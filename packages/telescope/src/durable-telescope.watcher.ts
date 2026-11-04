@@ -1,14 +1,16 @@
 import {
   type EngineEvent,
   WorkflowEngine,
+  lifecycleSourceOf,
   parentRunIdOf,
+  traceIdOfTraceparent,
   useDurableExecution,
 } from '@dudousxd/nestjs-durable-core';
 import type { Watcher, WatcherContext } from '@dudousxd/nestjs-telescope';
 import { SpanStatusCode, context, trace } from '@opentelemetry/api';
 import { durableExecutionScope } from './durable-execution-scope';
 import { runEventFamily } from './durable-run-family';
-import { runTraceContext, runTraceId } from './durable-run-trace';
+import { runSpanContext, runTraceContext, runTraceId } from './durable-run-trace';
 
 /** An event another instance produced and the control plane re-delivered here (see the core's
  *  `isRemoteEvent`); read by symbol so an older core, which marks none, still works. */
@@ -77,6 +79,7 @@ export class DurableTelescopeWatcher implements Watcher {
       // Every pod hears every event; the one that produced it records it.
       if (isRemote(event)) return;
       const family = runEventFamily(event.type);
+      const source = lifecycleSourceOfEvent(event);
       const record = () =>
         ctx.record({
           type: this.type,
@@ -100,6 +103,14 @@ export class DurableTelescopeWatcher implements Watcher {
             error: event.error,
             durationMs: event.durationMs,
             reason: event.reason,
+            triggeredRunId: event.triggeredRunId,
+            ...(source
+              ? {
+                  lifecycleSourceRunId: source.runId,
+                  lifecycleKind: source.kind,
+                  lifecycleSourceTraceId: runTraceId(source.runId),
+                }
+              : {}),
           },
           tags: this.tags(event),
         });
@@ -134,6 +145,23 @@ export class DurableTelescopeWatcher implements Watcher {
         }
         context.with(trace.setSpan(base, step), record);
         step.end();
+      } else if (source) {
+        // The started run's first entry sits in a span linked to its source run's trace, so the
+        // two traces reference each other in Telescope and in any OTel backend.
+        const started = tracer.startSpan(
+          `run ${event.workflow ?? event.runId}`,
+          {
+            attributes: {
+              'durable.run_id': event.runId,
+              'durable.lifecycle.source_run_id': source.runId,
+              'durable.lifecycle.kind': source.kind,
+            },
+            links: [{ context: runSpanContext(source.runId) }],
+          },
+          base,
+        );
+        context.with(trace.setSpan(base, started), record);
+        started.end();
       } else {
         context.with(base, record);
       }
@@ -164,6 +192,27 @@ export class DurableTelescopeWatcher implements Watcher {
       tags.push(event.type === 'run.routed' ? 'routed' : 'unrouted');
       tags.push(`onError:${event.error?.code ?? '*'}`);
     }
+    // Tagged with both runs, so the link shows in the settled run's trail and the started run's.
+    if (event.type === 'run.triggered') {
+      tags.push('triggered');
+      if (event.triggeredRunId) tags.push(`run:${event.triggeredRunId}`);
+    }
+    if (event.type === 'run.trigger_failed')
+      tags.push('trigger_failed', `subscriber:${event.name}`);
+    const source = lifecycleSourceOfEvent(event);
+    if (source) {
+      tags.push('lifecycle', `source:${source.runId}`);
+      const traceId = traceIdOfTraceparent(event.sourceTraceparent);
+      if (traceId) tags.push(`sourceTrace:${traceId}`);
+    }
     return tags;
   }
+}
+
+/** The run whose settling started `event`'s run, for its `run.started`; undefined otherwise. */
+function lifecycleSourceOfEvent(
+  event: EngineEvent,
+): { runId: string; kind: 'completed' | 'failed' } | undefined {
+  if (event.type !== 'run.started' || !event.workflow) return undefined;
+  return lifecycleSourceOf({ id: event.runId, workflow: event.workflow });
 }

@@ -20,6 +20,9 @@ describe('durableTelescopeExtension', () => {
         .sort(),
     ).toEqual([
       'durable.duration',
+      'durable.failedTriggers',
+      'durable.lifecycleTriggers',
+      'durable.owedLifecycle',
       'durable.recentFailures',
       'durable.runsOverTime',
       'durable.state',

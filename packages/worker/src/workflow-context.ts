@@ -10,6 +10,7 @@ import type {
   StepLogger,
   StepOptions,
   StepRef,
+  WaitForRunOptions,
   WorkflowClass,
   WorkflowCommand,
   WorkflowCtx,
@@ -93,7 +94,7 @@ export interface WorkflowContextOptions {
  *   {@link WorkflowCommand} (`call`/`recordStep`/`sleep`/`waitSignal`/`startChild`) the engine applies
  *   durably.
  * - **Unsupported** — `transaction`, `callEntity`, `signalEntity`, `continueAsNew`, `sleepUntil`,
- *   `waitForEvent`, `task`, `startChild` (fire-and-forget), `breakpoint`, `webhook`, `setEvent`,
+ *   `waitForEvent`, `waitForRun`, `task`, `startChild` (fire-and-forget), `breakpoint`, `webhook`, `setEvent`,
  *   `onUpdate`, `patched`: they need engine/store/transport features the remote wire can't express,
  *   so each throws {@link UnsupportedOnThinWorker} (run such a workflow in-process on the engine).
  *
@@ -709,6 +710,15 @@ export class WorkflowContext implements WorkflowCtx {
     _opts?: { match?: Record<string, unknown>; timeoutMs?: number },
   ): Promise<TPayload> {
     return this.unsupported('waitForEvent');
+  }
+
+  /** UNSUPPORTED: waiting on another run's settle is delivered by the engine from the store. */
+  waitForRun(
+    _first: WorkflowRef,
+    _runId?: string | WaitForRunOptions,
+    _opts?: WaitForRunOptions,
+  ): Promise<never> {
+    return this.unsupported('waitForRun');
   }
 
   /** UNSUPPORTED: async-completion tasks (`engine.completeTask`/`failTask`) are engine-driven. */

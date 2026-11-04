@@ -266,10 +266,19 @@ function currentGateway(): StoreRunGateway {
   const store = {
     getRun: async (id: string) => (id === 'r1' ? run() : null),
     listCheckpoints: async (id: string) => (id === 'r1' ? timeline() : []),
+    listSignalWaiters: async () => [],
   } as unknown as StateStore;
   // The child-edge read lists children in its own order, not the timeline's.
   const engine = {
     getRunChildren: async () => ['child-b', 'child-a'],
+    triggeredRuns: async () => [],
+    lifecycleSubscribers: async () => [],
+    coalescedSubscribers: () => new Map(),
+    workflowLifecycle: async (workflow: string) => ({
+      workflow,
+      startsOnSettle: [],
+      startedBy: [],
+    }),
   } as unknown as WorkflowEngine;
   return new StoreRunGateway(store, engine);
 }

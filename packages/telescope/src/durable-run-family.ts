@@ -9,4 +9,11 @@ export function runEventFamily(eventType: string): string | undefined {
   return RUN_EVENT_TYPES.has(eventType) ? `durable:${eventType}` : undefined;
 }
 
-const RUN_EVENT_TYPES = new Set(['run.started', 'run.completed', 'run.failed', 'run.suspended']);
+const RUN_EVENT_TYPES = new Set([
+  'run.started',
+  'run.completed',
+  'run.failed',
+  'run.suspended',
+  'run.triggered',
+  'run.trigger_failed',
+]);

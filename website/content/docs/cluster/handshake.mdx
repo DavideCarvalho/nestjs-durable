@@ -86,8 +86,22 @@ interface WorkflowRegistration {
   group?: string     // the queue this worker consumes for it
   requires?: string[]
   origin?: string    // the package that declared the workflow
+  onError?: { code?: string; workflow: string }[]
+  subscribes?: string[]  // the onEvent events it subscribes to, lifecycle ones included
 }
 ```
+
+`subscribes` is what lets an engine owe a run's lifecycle event to a subscriber only another worker
+has: the engine settling a run of `ingest` reads every live worker's `subscribes`, and tags the run
+as owed to each workflow subscribed to `run.completed:ingest` (see
+[Delivery](/docs/authoring/events#delivery)). Node engines also announce their subscriptions in the
+state store's lifecycle registry, which works on every transport; the descriptors are how a
+Python worker announces its own. The aggregate lists them as `subscribes`, the union of
+what every announcer stated. An engine also **starts** an announced subscriber it has no
+registration for, by name on its live worker group: that is how a Python workflow declared with
+`on_workflow_completed` / `on_event` starts (see [Python](/docs/python#reacting-to-another-workflow-finishing)).
+The Python SDK writes `subscribes` the same way, and the golden fixture
+`fixtures/wire/descriptor-subscribes.json` pins its hash (`3d2e720196c1c893`) in both SDKs.
 
 The rule is **announce only what you can run**. A worker publishes a registration for a body it holds
 and a queue it consumes; it never publishes one for a workflow it merely knows how to *route to*.

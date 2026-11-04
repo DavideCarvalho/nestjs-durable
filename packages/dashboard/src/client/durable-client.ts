@@ -1,12 +1,17 @@
 import type {
   FanSummary as CoreFanSummary,
+  LifecycleDelivery as CoreLifecycleDelivery,
+  LifecycleSource as CoreLifecycleSource,
+  LifecycleSubscriptionLink as CoreLifecycleSubscriptionLink,
   RunListItem as CoreRunListItem,
   RunStatus as CoreRunStatus,
+  RunWaitLink as CoreRunWaitLink,
   RunWaiting as CoreRunWaiting,
   ScheduleDescription as CoreScheduleDescription,
   StepCheckpoint as CoreStepCheckpoint,
   StepEvent as CoreStepEvent,
   StepKind as CoreStepKind,
+  WorkflowLifecycleLinks as CoreWorkflowLifecycleLinks,
   StepError,
   WireDates,
 } from '@dudousxd/nestjs-durable-core';
@@ -103,6 +108,47 @@ export interface RunDetail {
   fans?: FanSummary[] | undefined;
   /** How many children the run has, when `children` lists only the first of them. */
   childCount?: number | undefined;
+  /** Runs this run's settling started (`@OnWorkflowCompleted` / `@OnWorkflowFailed` subscribers). */
+  triggered?: string[] | undefined;
+  /** The run whose settling started this one, its status, and its trace id when recorded. */
+  triggeredBy?: LifecycleSource | undefined;
+  /** The workflows subscribed to this settled run's lifecycle event, when there are any. */
+  lifecycleSubscribers?: string[] | undefined;
+  /** Who starts whom through lifecycle events, for this run's workflow, when anyone does. */
+  workflowLifecycle?: WorkflowLifecycleLinks | undefined;
+  /** For a settled run with lifecycle subscribers, where its event stands for each of them. */
+  lifecycleDeliveries?: LifecycleDelivery[] | undefined;
+  /** The runs a suspended run waits for through `ctx.waitForRun`. */
+  waitsFor?: RunWaitLink[] | undefined;
+  /** The runs waiting for this one through `ctx.waitForRun`. */
+  awaitedBy?: RunWaitLink[] | undefined;
+}
+
+/** One end of a `ctx.waitForRun` wait. */
+export type RunWaitLink = CoreRunWaitLink;
+/** The run whose settling started a run. */
+export type LifecycleSource = CoreLifecycleSource;
+/** Where a settled run's lifecycle event stands for one subscriber. */
+export type LifecycleDelivery = CoreLifecycleDelivery;
+
+/** One workflow that starts when another settles (see `durableClient.workflowLifecycle`). */
+export type LifecycleSubscriptionLink = CoreLifecycleSubscriptionLink;
+/** Who starts whom through lifecycle events, for one workflow. */
+export type WorkflowLifecycleLinks = CoreWorkflowLifecycleLinks;
+
+/**
+ * A workflow's lifecycle links, plus per-subscriber `triggerCounts` (started and failed, counted by
+ * the server process since it started) when the server keeps them.
+ */
+export interface WorkflowLifecyclePage extends WorkflowLifecycleLinks {
+  triggerCounts?: Record<string, { triggered: number; failed: number }> | undefined;
+}
+
+/** What republishing a run's lifecycle event did (see `durableClient.republishLifecycle`). */
+export interface RepublishLifecycleResult {
+  runs: number;
+  started: number;
+  failed: { runId: string; subscriber: string; error: string }[];
 }
 
 export type FanSummary = Omit<WireDates<CoreFanSummary>, 'failures'> & {
@@ -184,6 +230,8 @@ function groupIsStalled(group: string, health: readonly GroupHealth[]): boolean 
 /** Label a signal-checkpoint token (the raw waiter token) the way the server names `RunWaiting`, so a
  *  detail-view wait reads the same as its list row: `webhook <token>` / `child <id>` / `signal <name>`. */
 function tokenDetail(token: string): string {
+  const waitedRun = token.match(/^runwait:(.+)#[^#]*#\d+$/)?.[1];
+  if (waitedRun) return `run ${waitedRun}`;
   if (token.startsWith('wh:')) return `webhook ${token}`;
   if (token.startsWith('child:')) return `child ${token.slice('child:'.length)}`;
   return `signal ${token}`;
@@ -310,13 +358,25 @@ export interface EngineEvent {
     | 'step.started'
     | 'step.completed'
     | 'step.failed'
-    | 'step.progress';
+    | 'step.progress'
+    | 'run.blocked'
+    | 'run.routed'
+    | 'run.unrouted'
+    | 'run.triggered'
+    | 'run.trigger_failed';
   runId: string;
   workflow?: string;
+  namespace?: string;
   seq?: number;
   name?: string;
   kind?: StepKind;
   durationMs?: number;
+  /** The cause, on a failed step or run, a `run.routed` and a `run.trigger_failed`. */
+  error?: { message: string; code?: string };
+  /** Why a `run.unrouted` run's onError routes were not applied. */
+  reason?: string;
+  /** The run a `run.triggered` event started (absent when the subscriber coalesces its events). */
+  triggeredRunId?: string;
   /** On a `step.started`: this dispatch is a lost-dispatch RE-DRIVE, not a first attempt — the step's
    *  lease lapsed with no result and no heartbeat, so the engine re-enqueued it (core
    *  `remoteRedispatchMs`). Absent on a normal dispatch and on a failure retry, so a UI can tell
@@ -634,6 +694,20 @@ export const durableClient = {
   cancel(id: string, opts?: { compensate?: boolean }): Promise<WorkflowRun> {
     const qs = opts?.compensate ? '?compensate=true' : '';
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/cancel${qs}`, { method: 'POST' });
+  },
+  /** The workflows that start when `workflow` settles, and the ones whose settling starts it. */
+  workflowLifecycle(workflow: string): Promise<WorkflowLifecyclePage> {
+    return http<WorkflowLifecyclePage>(`/workflows/${encodeURIComponent(workflow)}/lifecycle`);
+  },
+  /** Publish a settled run's lifecycle event again, to the subscribers that have not started. */
+  /** Republish a settled run's lifecycle event: to every subscriber not started yet, or one. */
+  republishLifecycle(id: string, subscriber?: string): Promise<RepublishLifecycleResult> {
+    return http<RepublishLifecycleResult>(`/runs/${encodeURIComponent(id)}/republish-lifecycle`, {
+      method: 'POST',
+      ...(subscriber !== undefined
+        ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subscriber }) }
+        : {}),
+    });
   },
   continue(id: string): Promise<WorkflowRun> {
     return http<WorkflowRun>(`/runs/${encodeURIComponent(id)}/continue`, { method: 'POST' });

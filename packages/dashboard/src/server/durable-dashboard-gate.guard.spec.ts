@@ -34,6 +34,26 @@ const gateway = {
   async runFacets() {
     return [];
   },
+  async republishLifecycle(target: { runId: string }) {
+    if (target.runId === 'missing') throw new Error('run missing not found');
+    return { runs: 1, started: 1, failed: [] };
+  },
+  async workflowLifecycle(workflow: string) {
+    return {
+      workflow,
+      startsOnSettle: [
+        {
+          workflow: 'notify',
+          kind: 'completed',
+          local: false,
+          announced: true,
+          where: false,
+          input: false,
+        },
+      ],
+      startedBy: [],
+    };
+  },
 } as unknown as RunGateway;
 
 @Global()
@@ -255,6 +275,43 @@ describe('token gate', () => {
           .post('/durable/api/runs/r1/retry')
           .set('x-durable-token', TOKEN);
         expect(DENIED).not.toContain(viaHeader.status);
+      });
+
+      it('gates republishing a lifecycle event like retry and cancel', async () => {
+        const path = '/durable/api/runs/r1/republish-lifecycle';
+        expect((await request(server()).post(path)).status).toBe(401);
+        expect((await request(server()).post(`${path}?token=${TOKEN}`)).status).toBe(401);
+
+        const allowed = await request(server()).post(path).set('x-durable-token', TOKEN);
+        expect(allowed.status).toBe(201);
+        expect(allowed.body).toEqual({ runs: 1, started: 1, failed: [] });
+
+        const missing = await request(server())
+          .post('/durable/api/runs/missing/republish-lifecycle')
+          .set('x-durable-token', TOKEN);
+        expect(missing.status).toBe(404);
+      });
+
+      it("serves a workflow's lifecycle links behind the same gate as the run list", async () => {
+        const path = '/durable/api/workflows/ingest/lifecycle';
+        expect((await request(server()).get(path)).status).toBe(401);
+
+        const allowed = await request(server()).get(path).set('x-durable-token', TOKEN);
+        expect(allowed.status).toBe(200);
+        expect(allowed.body).toEqual({
+          workflow: 'ingest',
+          startsOnSettle: [
+            {
+              workflow: 'notify',
+              kind: 'completed',
+              local: false,
+              announced: true,
+              where: false,
+              input: false,
+            },
+          ],
+          startedBy: [],
+        });
       });
 
       it('rejects a wrong token (same length and different length)', async () => {

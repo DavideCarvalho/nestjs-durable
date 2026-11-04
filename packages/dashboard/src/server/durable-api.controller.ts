@@ -1,11 +1,13 @@
 import { ApplyFilter, ApplyFilterInterceptor, FilterRunner } from '@dudousxd/nestjs-filter';
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
   Header,
   Headers,
   NotFoundException,
+  NotImplementedException,
   Param,
   Post,
   Query,
@@ -141,6 +143,18 @@ export class DurableApiController {
     return this.dashboard.triggerSchedule(id).catch(notFound);
   }
 
+  /**
+   * Who starts whom through lifecycle events, for one workflow: the workflows that start when it
+   * settles, and the ones whose settling starts it. What the console's workflow page lists.
+   */
+  @Get('workflows/:name/lifecycle')
+  async workflowLifecycle(@Param('name') name: string) {
+    const links = await this.dashboard.workflowLifecycle(name).catch(notSupportedByServer);
+    if (!links)
+      throw new NotImplementedException('workflow lifecycle links need the control plane');
+    return links;
+  }
+
   /** This deployment's durable role (control plane vs tenant) + tenant name — for the header badge. */
   @Get('topology')
   topology() {
@@ -248,6 +262,30 @@ export class DurableApiController {
     return result;
   }
 
+  /**
+   * Publish a settled run's lifecycle event again, to the subscribers that have not started from it
+   * (or only `subscriber`). Same gate as retry/cancel.
+   */
+  @Post('runs/:id/republish-lifecycle')
+  async republishLifecycle(@Param('id') id: string, @Body() body?: { subscriber?: string }) {
+    let result: Awaited<ReturnType<DashboardService['republishLifecycle']>>;
+    try {
+      result = await this.dashboard.republishLifecycle(id, body?.subscriber || undefined);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/^run .* not found$/.test(message)) throw new NotFoundException(message);
+      if (/^run .* has not settled/.test(message)) throw new BadRequestException(message);
+      if ((error as { code?: unknown } | null)?.code === 'bad-request') {
+        throw new BadRequestException(message);
+      }
+      return notSupportedByServer(error);
+    }
+    if (!result) {
+      throw new NotImplementedException('republishing lifecycle events needs the control plane');
+    }
+    return result;
+  }
+
   @Post('runs/:id/continue')
   async continue(@Param('id') id: string) {
     const result = await this.dashboard.continue(id);
@@ -293,6 +331,17 @@ export class DurableApiController {
 function notFound(error: unknown): never {
   if (error instanceof Error && error.name === 'ScheduleNotFoundError') {
     throw new NotFoundException(error.message);
+  }
+  throw error;
+}
+
+/**
+ * A tenant proxy's control plane that is older than the verb (a `RunGatewayError` with code
+ * `unsupported-request`) as 501, every other error as it is.
+ */
+function notSupportedByServer(error: unknown): never {
+  if ((error as { code?: unknown } | null)?.code === 'unsupported-request') {
+    throw new NotImplementedException(error instanceof Error ? error.message : String(error));
   }
   throw error;
 }

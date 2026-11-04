@@ -1,6 +1,11 @@
 import type { z } from 'zod';
 import type { WorkerDescriptor } from './handshake/descriptor';
 import type { DispatchDiagnostics } from './handshake/dispatch-routing';
+import type {
+  LifecycleEventOf,
+  RepublishLifecycleTarget,
+  WorkflowLifecycleEvent,
+} from './lifecycle-events';
 import type { FanPageQuery } from './run-detail-summary';
 import type { RunDetailOptions } from './run-gateway';
 import type { StandardSchemaV1 } from './standard-schema';
@@ -138,9 +143,10 @@ export interface WorkflowRun {
  * The detail view (which has the timeline) still distinguishes sleep vs in-flight step precisely.
  */
 export interface RunWaiting {
-  on: 'signal' | 'webhook' | 'child' | 'breakpoint';
+  on: 'signal' | 'webhook' | 'child' | 'breakpoint' | 'run';
   /**
-   * The token/name the run is parked on — the signal name, webhook token, or awaited child id. For a
+   * The token/name the run is parked on — the signal name, webhook token, awaited child id, or the id
+   * of the run it waits on in `ctx.waitForRun`. For a
    * breakpoint this is always the literal `'breakpoint'`: the real label (if any) lives on the pending
    * `breakpoint`/`breakpoint:<label>` checkpoint, which the detail view's timeline already shows —
    * naming it here would need an extra per-run checkpoint read, defeating the bulk waiter scan.
@@ -1067,6 +1073,17 @@ export interface RunQuery {
    * Empty array = matches nothing.
    */
   workflows?: string[] | undefined;
+  /**
+   * Leave out the runs of these workflows (`workflow NOT IN (...)`), ANDed with everything else.
+   * Empty array = excludes nothing. The run gateway uses it to keep engine bookkeeping runs (the
+   * lifecycle registry) out of a console's lists and counts.
+   */
+  excludeWorkflows?: string[] | undefined;
+  /**
+   * Only runs last updated at or after this epoch ms (`updated_at >= updatedAfter`), ANDed with
+   * everything else. For a settled run that is when it settled, unless something wrote it since.
+   */
+  updatedAfter?: number | undefined;
   status?: RunStatus | undefined;
   /**
    * Match any of these statuses (a `status IN (...)` filter). ORed together, and ANDed with the other
@@ -1357,7 +1374,13 @@ export type RunRequestKind =
   | { kind: 'redispatch'; runId: string }
   // Bulk, not runId-bearing (like `listRuns`/`workerHealth`) — the operator answers it in one shot
   // and filters the result to runs the requester's tenant actually owns (see `RunRequestResponder`).
-  | { kind: 'waitingFor'; runIds: string[] };
+  | { kind: 'waitingFor'; runIds: string[] }
+  // Publish settled runs' lifecycle events again. The one-run form is checked like `retry`; the
+  // by-workflow form is answered over the requester's own namespace only. `since`/`until` cross the
+  // wire as ISO strings.
+  | { kind: 'republishLifecycle'; target: RepublishLifecycleTarget }
+  // Who starts whom through lifecycle events, for one workflow (no run, so no ownership check).
+  | { kind: 'workflowLifecycle'; workflow: string };
 
 /** The control plane's answer to a {@link RunRequest}, correlated by `requestId`. */
 export interface RunReply {
@@ -2099,6 +2122,12 @@ export type UndoOf<H> = H extends (input: infer I, ...rest: never[]) => infer R
   ? StepUndo<I, Awaited<R>>
   : never;
 
+/** Options for `ctx.waitForRun`. */
+export interface WaitForRunOptions {
+  /** Give up after this long (ms, or a duration like `'30m'`), throwing `SignalTimeoutError`. */
+  timeoutMs?: number | string | undefined;
+}
+
 /**
  * The context handed to a workflow function. Every interaction with the outside world goes
  * through it so the engine can checkpoint — the workflow body itself stays deterministic.
@@ -2203,6 +2232,25 @@ export interface WorkflowCtx<A extends SearchAttributes = SearchAttributes> {
     name: string,
     opts?: { match?: Record<string, unknown>; timeoutMs?: number },
   ): Promise<TPayload>;
+  /**
+   * Wait for **any** run, not only a child, to settle, and resume with its
+   * {@link WorkflowLifecycleEvent}: `status`, plus `output` on a completed run or `error` on one that
+   * failed, was cancelled or died. Resolves at once when the run already settled; a run that
+   * continued as new settles when the last run of its chain does. `timeoutMs` (ms, or a duration
+   * like `'1h'`) bounds the wait and throws `SignalTimeoutError`. A run id that does not exist fails
+   * with a non-retryable `run <id> not found`. No compute consumed while waiting.
+   *
+   * Pass the workflow class first to type the event by that workflow's input and output.
+   */
+  waitForRun<TOutput = unknown>(
+    runId: string,
+    opts?: WaitForRunOptions,
+  ): Promise<WorkflowLifecycleEvent<unknown, TOutput>>;
+  waitForRun<C extends WorkflowClass>(
+    workflow: C,
+    runId: string,
+    opts?: WaitForRunOptions,
+  ): Promise<LifecycleEventOf<C>>;
   /**
    * An external task with **async completion**: run `dispatch` once (checkpointed — e.g. send to a
    * queue, kick off a non-durable worker or a foreign service like a Python process), then suspend
@@ -2509,7 +2557,15 @@ export type EngineEventType =
   | 'run.routed'
   // A failed run had onError routes that could not be applied — its live workers announce different
   // ones (`reason` says so) — so it failed instead of being handed off.
-  | 'run.unrouted';
+  | 'run.unrouted'
+  // A settled run started a subscriber of its lifecycle event (`run.completed:<workflow>` /
+  // `run.failed:<workflow>`). `runId` is the settled run, `name` the subscriber workflow and
+  // `triggeredRunId` the run it started (absent when the subscriber debounces/batches its events).
+  | 'run.triggered'
+  // A settled run's lifecycle event could not start a subscriber: its `where` threw, or starting it
+  // failed (e.g. its validateInput rejected the input). `runId` is the settled run, `name` the
+  // subscriber workflow and `error` the cause. The event is not retried.
+  | 'run.trigger_failed';
 
 /**
  * A lifecycle event emitted by the engine. The observability surfaces (dashboard, OTel, the
@@ -2552,6 +2608,14 @@ export interface EngineEvent {
   diagnostics?: DispatchDiagnostics | undefined;
   /** Why a `run.unrouted` run's onError routes were not applied. */
   reason?: string | undefined;
+  /** The run a `run.triggered` event started. */
+  triggeredRunId?: string | undefined;
+  /**
+   * On the `run.started` of a run a lifecycle event started: the W3C traceparent of the source run's
+   * span, when it is known (see `WorkflowEngine.setRunTraceparent`). A tracer links the run's span
+   * to it.
+   */
+  sourceTraceparent?: string | undefined;
   at: Date;
 }
 

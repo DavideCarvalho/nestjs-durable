@@ -40,6 +40,13 @@ export interface WorkflowRegistration {
    * Absent = not stated, which routes nothing.
    */
   onError?: { code?: string; workflow: string }[];
+  /**
+   * The `onEvent` event names this workflow subscribes to, lifecycle events (`run.completed:<wf>`,
+   * `run.failed:<wf>`) included. An engine settling a run reads them so it owes the run's lifecycle
+   * event to a subscriber that only another worker has. Absent = not stated, which subscribes to
+   * nothing.
+   */
+  subscribes?: string[];
 }
 
 /**
@@ -214,6 +221,7 @@ function canonicalizeRegistrations(regs: readonly WorkflowRegistration[]): unkno
     origin: r.origin ?? null,
     // Conditional, so a registration that states no routes keeps the hash it had before routes existed.
     ...(r.onError !== undefined ? { onError: canonicalRoutes(r.onError) } : {}),
+    ...(r.subscribes !== undefined ? { subscribes: [...new Set(r.subscribes)].sort() } : {}),
   }));
   const byJson = new Map<string, unknown>();
   for (const entry of canonical) byJson.set(JSON.stringify(entry), entry);

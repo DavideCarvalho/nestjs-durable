@@ -4,6 +4,11 @@ import {
   type FanPage,
   type FanPageQuery,
   type GroupHealth,
+  LIFECYCLE_REGISTRY_WORKFLOW,
+  type LifecycleDelivery,
+  type LifecycleKind,
+  type RepublishLifecycleResult,
+  type RepublishLifecycleTarget,
   type RunDetail,
   type RunDetailOptions,
   type RunFacetQuery,
@@ -15,27 +20,73 @@ import {
   type RunValueAxis,
   type RunValueFacetOptions,
   type RunValueFacetRow,
+  type RunWaitLink,
   type RunWaiting,
   STATE_STORE_CANONICAL,
   SUMMARY_CHILD_LIMIT,
   type StateStore,
   WorkflowEngine,
+  type WorkflowLifecycleLinks,
   type WorkflowRun,
   aggregatesCheckpoints,
   childIdsOf,
   etagMatches,
+  extendEtag,
   fanPageEtag,
   indexWaitersByRun,
+  lifecycleDeliveriesOf,
+  lifecycleKindOf,
+  lifecycleSourceOf,
+  lifecycleTraceparentOf,
   listSignalWaitersOfRuns,
   mergeRunFacetRows,
   pageFan,
   pageFanFromStore,
+  readRunsByIds,
   resolveRunWaiting,
   runDetailEtag,
+  runWaitPrefix,
+  runWaitTargetOf,
   summarizeRunFromStore,
   summarizeTimeline,
+  traceIdOfTraceparent,
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable } from '@nestjs/common';
+
+/**
+ * What a run detail reads from outside the run row and its checkpoints, folded into its ETag: the
+ * subscribers and where each delivery stands, and the status of every run its links point at.
+ * Undefined when it has none of them.
+ */
+function detailExtras(
+  links: Pick<
+    RunDetail,
+    'lifecycleSubscribers' | 'lifecycleDeliveries' | 'waitsFor' | 'awaitedBy' | 'triggeredBy'
+  >,
+): unknown {
+  const { lifecycleSubscribers, lifecycleDeliveries, waitsFor, awaitedBy, triggeredBy } = links;
+  if (!lifecycleSubscribers && !lifecycleDeliveries && !waitsFor && !awaitedBy && !triggeredBy) {
+    return undefined;
+  }
+  return { lifecycleSubscribers, lifecycleDeliveries, waitsFor, awaitedBy, triggeredBy };
+}
+
+/**
+ * `query` without the lifecycle registry's runs, engine bookkeeping that is not a run anyone
+ * started, unless the query names that workflow itself.
+ */
+function withoutRegistry<Q extends RunFacetQuery>(query: Q): Q {
+  if (
+    query.workflow === LIFECYCLE_REGISTRY_WORKFLOW ||
+    query.workflows?.includes(LIFECYCLE_REGISTRY_WORKFLOW)
+  ) {
+    return query;
+  }
+  return {
+    ...query,
+    excludeWorkflows: [...(query.excludeWorkflows ?? []), LIFECYCLE_REGISTRY_WORKFLOW],
+  };
+}
 
 /**
  * Store-backed `RunGateway` — the operator-side implementation, bound to {@link RUN_GATEWAY} on
@@ -57,13 +108,14 @@ export class StoreRunGateway implements RunGateway {
   async getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
     const run = await this.store.getRun(runId);
     if (!run) return null;
+    const links = await this.lifecycleLinks(run);
     const over = options?.summarizeFansOver;
     if (over === undefined) {
       const [timeline, children] = await Promise.all([
         this.store.listCheckpoints(runId),
         this.engine.getRunChildren(runId), // canonical parent→children edge (shared with cancel cascade)
       ]);
-      return { run, timeline, children };
+      return { run, timeline, children, ...links };
     }
     // Summarized: the children come from the checkpoints, rather than from a read of every
     // child-edge checkpoint plus the waiters. A child whose waiter is written but whose placeholder
@@ -72,11 +124,16 @@ export class StoreRunGateway implements RunGateway {
       // The buckets are read before any row, so a write landing mid-read leaves the ETag older than
       // the body: the next poll misses and re-reads, rather than pinning a stale body.
       const stats = await this.store.checkpointStats(runId);
-      const etag = runDetailEtag(run, stats, over);
+      const etag = extendEtag(runDetailEtag(run, stats, over), detailExtras(links));
       if (etagMatches(options?.ifNoneMatch, etag)) {
         return { run, timeline: [], children: [], notModified: true, etag };
       }
-      return { run, ...(await summarizeRunFromStore(this.store, runId, over, stats)), etag };
+      return {
+        run,
+        ...(await summarizeRunFromStore(this.store, runId, over, stats)),
+        etag,
+        ...links,
+      };
     }
     const full = await this.store.listCheckpoints(runId);
     const { timeline, fans } = summarizeTimeline(full, over);
@@ -87,7 +144,111 @@ export class StoreRunGateway implements RunGateway {
       children: ids.slice(0, SUMMARY_CHILD_LIMIT),
       fans,
       childCount: ids.length,
+      ...links,
     };
+  }
+
+  /**
+   * What a run detail reads beyond the run row and its checkpoints: what this run's settling
+   * started, the subscribers its lifecycle event goes to (of its namespace) and where it stands for
+   * each, what started it, its workflow's lifecycle links, and the `ctx.waitForRun` waits on either
+   * side of it with the other run's status. A few reads per detail: the run's own waiters while it
+   * is suspended, the waiters on it (one prefix read), and one batched read of every linked run.
+   */
+  private async lifecycleLinks(
+    run: WorkflowRun,
+  ): Promise<
+    Pick<
+      RunDetail,
+      | 'triggered'
+      | 'triggeredBy'
+      | 'lifecycleSubscribers'
+      | 'workflowLifecycle'
+      | 'lifecycleDeliveries'
+      | 'waitsFor'
+      | 'awaitedBy'
+    >
+  > {
+    const triggered = await this.engine.triggeredRuns(run);
+    const source = lifecycleSourceOf(run);
+    const kind = lifecycleKindOf(run.status);
+    const subscribers = kind
+      ? await this.engine.lifecycleSubscribers(run.workflow, kind, run.namespace || 'default')
+      : [];
+    const workflowLifecycle = await this.engine.workflowLifecycle(run.workflow);
+    const linked =
+      workflowLifecycle.startsOnSettle.length > 0 || workflowLifecycle.startedBy.length > 0;
+    const deliveries = kind
+      ? lifecycleDeliveriesOf(run, {
+          subscribers,
+          live: new Set(subscribers),
+          coalesced: this.engine.coalescedSubscribers(run),
+        })
+      : [];
+    const [own, onIt] = await Promise.all([
+      run.status === 'suspended' ? listSignalWaitersOfRuns(this.store, [run.id]) : [],
+      run.workflow.startsWith('__') ? [] : this.store.listSignalWaiters(runWaitPrefix(run.id)),
+    ]);
+    const waitsFor: RunWaitLink[] = own.flatMap((w) => {
+      const target = runWaitTargetOf(w);
+      return target !== undefined ? [{ runId: target, seq: w.seq }] : [];
+    });
+    const awaitedBy: RunWaitLink[] = onIt
+      .filter((w) => runWaitTargetOf(w) === run.id)
+      .map((w) => ({ runId: w.runId, seq: w.seq }));
+    const started = deliveries.flatMap((d) =>
+      d.state === 'started' && d.runId !== undefined ? [d.runId] : [],
+    );
+    const { runs } = await readRunsByIds(this.store, [
+      ...(source ? [source.runId] : []),
+      ...started,
+      ...waitsFor.map((l) => l.runId),
+      ...awaitedBy.map((l) => l.runId),
+    ]);
+    const withRun = <T extends { runId?: string | undefined }>(link: T): T => {
+      const other = link.runId !== undefined ? runs.get(link.runId) : undefined;
+      return other ? { ...link, status: other.status, namespace: other.namespace } : link;
+    };
+    const sourceRun = source ? runs.get(source.runId) : undefined;
+    const traceId = traceIdOfTraceparent(lifecycleTraceparentOf(sourceRun?.tags));
+    return {
+      ...(triggered.length > 0 ? { triggered } : {}),
+      ...(source
+        ? {
+            triggeredBy: {
+              ...source,
+              ...(sourceRun ? { status: sourceRun.status, namespace: sourceRun.namespace } : {}),
+              ...(traceId ? { traceId } : {}),
+            },
+          }
+        : {}),
+      ...(subscribers.length > 0 ? { lifecycleSubscribers: subscribers } : {}),
+      ...(linked ? { workflowLifecycle } : {}),
+      ...(deliveries.length > 0
+        ? {
+            lifecycleDeliveries: deliveries.map(
+              (d): LifecycleDelivery => (d.state === 'started' ? withRun(d) : d),
+            ),
+          }
+        : {}),
+      ...(waitsFor.length > 0 ? { waitsFor: waitsFor.map(withRun) } : {}),
+      ...(awaitedBy.length > 0 ? { awaitedBy: awaitedBy.map(withRun) } : {}),
+    };
+  }
+
+  workflowLifecycle(
+    workflow: string,
+    opts?: { namespace?: string | undefined },
+  ): Promise<WorkflowLifecycleLinks> {
+    return this.engine.workflowLifecycle(workflow, opts);
+  }
+
+  lifecycleSubscribers(
+    workflow: string,
+    kind: LifecycleKind,
+    namespace: string,
+  ): Promise<string[]> {
+    return this.engine.lifecycleSubscribers(workflow, kind, namespace);
   }
 
   getRun(runId: string): Promise<WorkflowRun | null> {
@@ -108,7 +269,7 @@ export class StoreRunGateway implements RunGateway {
   }
 
   async listRuns(query: RunQuery): Promise<RunListItem[]> {
-    const runs = await this.store.listRuns(query);
+    const runs = await this.store.listRuns(withoutRegistry(query));
     // One read of the listed suspended runs' signal waiters resolves what each is parked on — signal
     // / webhook / child — with no per-run timeline fetch. A timer wait falls back to the run's own
     // `wakeAt`. Non-suspended (and remote-step-in-flight) runs carry no `waiting`.
@@ -131,8 +292,9 @@ export class StoreRunGateway implements RunGateway {
    * listing — correct, but the unbounded read this exists to avoid, so it is the last resort.
    */
   async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
-    if (this.store.runFacets) return this.store.runFacets(query);
-    const runs = await this.store.listRuns(query);
+    const scoped = withoutRegistry(query);
+    if (this.store.runFacets) return this.store.runFacets(scoped);
+    const runs = await this.store.listRuns(scoped);
     return mergeRunFacetRows(runs.map((r) => ({ status: r.status, origin: r.origin, count: 1 })));
   }
 
@@ -148,7 +310,7 @@ export class StoreRunGateway implements RunGateway {
     query: RunFacetQuery,
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]> {
-    return this.store.runValueFacets?.(axis, query, opts) ?? [];
+    return this.store.runValueFacets?.(axis, withoutRegistry(query), opts) ?? [];
   }
 
   /**
@@ -203,6 +365,10 @@ export class StoreRunGateway implements RunGateway {
 
   redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) | null> {
     return this.engine.redispatchPending(runId);
+  }
+
+  republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult> {
+    return this.engine.republishLifecycle(target);
   }
 
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void {
