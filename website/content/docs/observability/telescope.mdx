@@ -24,8 +24,15 @@ TelescopeModule.forRoot({
 The watcher resolves the engine from the (global) durable providers and records one entry per
 lifecycle event (`run.started`, `step.completed`, `run.completed`, `run.failed`, …), tagged
 `workflow:<name>`, `run:<id>`, `kind:<step-kind>`, `failed` on failures, and `routed` / `unrouted`
-plus `onError:<code>` on a failure handed to (or not applicable to) an onError handler — so you can filter
-and group durable activity in the Telescope UI. A child run started by `ctx.all`, `ctx.child` or
+plus `onError:<code>` on a failure handed to (or not applicable to) an onError handler, `triggered`
+plus `run:<started run id>` when a settled run starts a lifecycle subscriber, and `trigger_failed`
+plus `subscriber:<workflow>` when it could not start one, and on the `run.started` of a run a lifecycle
+event started, `lifecycle`, `source:<source run id>` and, when the source recorded its traceparent,
+`sourceTrace:<trace id>` — so you can filter and group durable activity in the Telescope UI. That
+entry also carries `lifecycleSourceRunId`, `lifecycleKind` and `lifecycleSourceTraceId` (the source
+run's Telescope trace, `#/traces/<id>`), and is recorded under a span `run <workflow>` with a span
+link to the source run's trace and the attributes `durable.lifecycle.source_run_id` and
+`durable.lifecycle.kind`, so the two traces reference each other. A child run started by `ctx.all`, `ctx.child` or
 `ctx.startChild` (without a caller-chosen id) is also tagged `parent:<parent run id>`, and carries
 `parentRunId` in its content: each child has its own trace, so filtering on `parent:<id>` is how
 you find every child of one run, a whole `ctx.all` fan included.
@@ -132,31 +139,41 @@ Both options are optional:
   system then shows an **empty** table instead of surfacing days-old failures as a live incident.
   Pass `0` to disable the window and show all failed/dead runs.
 
-The dashboard is laid out in four sections:
+The dashboard is laid out in five sections:
 
 - **Health** — **Success rate** (gauge), **Duration p95**, **Backlog** (pending-run count), and
   **Throughput** (completed runs/hour, with a trend spark).
 - **Needs attention** — **Top failing workflows** (bar of the workflows producing the most
   failures), **Stuck runs** (recent failed/dead runs as a table, deep-linked via `runHref`, bounded
-  by `recentFailuresWindowMs`), and **Worker health** (every worker group with its queue depth and
-  live-worker count, `STARVED` groups — backlog with zero live workers — sorted first).
+  by `recentFailuresWindowMs`), **Failed triggers** (recent `run.trigger_failed`: time, source
+  workflow, source run link, subscriber, error), **Owed lifecycle events** (settled runs still tagged
+  `durable:lifecycle:pending` past the 30s grace the live publish has, with the subscribers each still
+  owes), **Worker health** (every worker group with its queue depth and live-worker count, `STARVED`
+  groups — backlog with zero live workers — sorted first), and **Owed runs** (how many of those owed
+  runs there are).
 - **Workers** — one row per **live worker**, flattened from every group's heartbeats: concurrency
   mode (fixed/adaptive) and limit, in-flight saturation, RAM %/CPU %, throughput, p95 latency, and
   the adaptive controller's last limit change (`grow`/`shrink`/`ram_ceiling`/…). A worker from an
   older SDK with no reported status still lists, with `—` in the measured columns.
+- **Lifecycle** — **Lifecycle triggers over time** (stacked triggered/failed subscriber starts) and
+  **Triggered by subscriber** (the subscriber runs started per `<workflow> → <subscriber>`).
 - **Trends** — **Runs over time** (stacked done/failed), **Duration distribution** (a histogram with
   p50/p95/p99 markers), and **Runs by state** (a donut of running/pending/cancelling/completed/
   failed/dead counts).
 
 ### Data providers
 
-Ten providers back the panels above, reading from three different sources:
+Thirteen providers back the panels above, reading from three different sources:
 
 - **Telescope's own captured entries** (recent-history, bounded by Telescope's prune window):
   `durable.timeseries` (success rate / failed count / top failures), `durable.duration` (p50/p95/p99
-  + histogram), `durable.runsOverTime`, `durable.successRate`, `durable.throughput`. The watcher
+  + histogram), `durable.runsOverTime`, `durable.successRate`, `durable.throughput`,
+  `durable.failedTriggers` (the Failed triggers table) and `durable.lifecycleTriggers` (the Lifecycle
+  section: triggered/failed buckets, or `{ metric: 'bySubscriber' }` for the per-subscriber counts),
+  the last two counting each event once though every pod records it. The watcher
   stamps each run lifecycle entry with a `familyHash` (`durable:run.started`, `durable:run.completed`,
-  `durable:run.failed`, `durable:run.suspended`), and these providers read up to the latest 5,000 entries
+  `durable:run.failed`, `durable:run.suspended`, `durable:run.triggered`, `durable:run.trigger_failed`),
+  and these providers read up to the latest 5,000 entries
   of each family through Telescope's indexed `family_hash` column (one indexed read per family, tens
   of milliseconds on a multi-million-row table). Step entries carry no family, so a wide step fan,
   which records two entries per step, never crowds runs out of the panels. Telescope's stores
@@ -167,7 +184,8 @@ Ten providers back the panels above, reading from three different sources:
   in the panels. Once that older read finds no run entry without a family, a process stops making it.
 - **The live durable store** (exact and unbounded by the prune window):
   `durable.state` (a single status count, e.g. Backlog), `durable.recentFailures` (the Stuck runs
-  table), `durable.stateBreakdown` (the Runs-by-state donut). The counts come from the store's
+  table), `durable.stateBreakdown` (the Runs-by-state donut), `durable.owedLifecycle` (the Owed
+  lifecycle events table, one listing by tag; `{ metric: 'count' }` for the Owed runs stat). The counts come from the store's
   `countRuns`, a `COUNT` that stays exact and cheap when a wide fan puts tens of thousands of runs
   in one status; a store without it falls back to a listing capped at 10,000 runs.
 - **The live engine/worker layer** (`WorkflowEngine.workerHealth()` — empty when the transport can't

@@ -36,8 +36,58 @@ let pg: StartedPostgreSqlContainer | undefined;
 let setupError: unknown;
 // The Prisma client is generated at test time, so it is untyped here.
 let sharedPrisma: any;
-let prismaStatements = 0;
-const prismaLog: string[] = [];
+
+/**
+ * The statements a Prisma client sends, from its `query` events, and a `flush` that resolves once
+ * every statement sent before it is counted. Prisma emits a query event apart from the query's
+ * result, so a statement can be logged after the call that sent it resolved: a count read right
+ * after a test's setup can miss the setup's last statements, which then land in what the test
+ * counts as its own. `flush` sends a marker query and waits for its event; a client emits its
+ * query events in the order the queries ran, so every earlier statement is logged by then. The
+ * marker queries are left out of the log.
+ */
+function queryLog(client: any): {
+  statements: () => number;
+  statementLog: () => string[];
+  flushStatementLog: () => Promise<void>;
+} {
+  const log: string[] = [];
+  const waiting = new Map<string, () => void>();
+  let markers = 0;
+  client.$on('query', (e: { query: string; params: string }) => {
+    const marker = /durable_log_flush_\d+/.exec(e.query)?.[0];
+    if (marker !== undefined) {
+      waiting.get(marker)?.();
+      waiting.delete(marker);
+      return;
+    }
+    log.push(`${e.query} ${e.params}`);
+  });
+  return {
+    statements: () => log.length,
+    statementLog: () => log,
+    flushStatementLog: async () => {
+      markers += 1;
+      const marker = `durable_log_flush_${markers}`;
+      const logged = new Promise<void>((resolve) => waiting.set(marker, resolve));
+      await client.$queryRawUnsafe(`SELECT 1 AS ${marker}`);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`prisma never logged the query of ${marker}`)),
+          5_000,
+        );
+      });
+      try {
+        await Promise.race([logged, timeout]);
+      } finally {
+        clearTimeout(timer);
+        waiting.delete(marker);
+      }
+    },
+  };
+}
+let prismaQueries: ReturnType<typeof queryLog> | undefined;
 
 function runPrisma(args: string[], env: Record<string, string>): void {
   execFileSync('npx', ['prisma', ...args], {
@@ -63,10 +113,7 @@ beforeAll(async () => {
       datasources: { db: { url } },
       log: [{ emit: 'event', level: 'query' }],
     });
-    sharedPrisma.$on('query', (e: { query: string; params: string }) => {
-      prismaStatements += 1;
-      prismaLog.push(`${e.query} ${e.params}`);
-    });
+    prismaQueries = queryLog(sharedPrisma);
     await sharedPrisma.$connect();
   } catch (err) {
     setupError = err;
@@ -106,8 +153,7 @@ runStateStoreContract('Prisma (Postgres)', async () => {
     peerStore: new PrismaStateStore(sharedPrisma),
     // Postgres supports `array_contains`, so the tag filter is exercised here (unlike SQLite).
     supportsTagFilter: true,
-    statements: () => prismaStatements,
-    statementLog: () => prismaLog,
+    ...prismaQueries,
     implicitTransactions: true,
     cleanup: async () => undefined,
   };
@@ -118,8 +164,7 @@ runStateStoreContract('Prisma (Postgres)', async () => {
 let mysql: StartedMySqlContainer | undefined;
 let mysqlError: unknown;
 let mysqlPrisma: any;
-let mysqlStatements = 0;
-const mysqlLog: string[] = [];
+let mysqlQueries: ReturnType<typeof queryLog> | undefined;
 
 beforeAll(async () => {
   if (skipped) return;
@@ -136,10 +181,7 @@ beforeAll(async () => {
       datasources: { db: { url } },
       log: [{ emit: 'event', level: 'query' }],
     });
-    mysqlPrisma.$on('query', (e: { query: string; params: string }) => {
-      mysqlStatements += 1;
-      mysqlLog.push(`${e.query} ${e.params}`);
-    });
+    mysqlQueries = queryLog(mysqlPrisma);
     await mysqlPrisma.$connect();
   } catch (err) {
     mysqlError = err;
@@ -164,8 +206,7 @@ runStateStoreContract('Prisma (MySQL)', async () => {
     store: new PrismaStateStore(mysqlPrisma),
     peerStore: new PrismaStateStore(mysqlPrisma),
     supportsTagFilter: true,
-    statements: () => mysqlStatements,
-    statementLog: () => mysqlLog,
+    ...mysqlQueries,
     implicitTransactions: true,
     cleanup: async () => undefined,
   };

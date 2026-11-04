@@ -76,8 +76,13 @@ A tenant never touches the database. Three message kinds cross the boundary, all
   searchAttributes? }`. A tenant publishes this instead of touching a DB; the operator turns it into a
   durable run stamped with `tenant` as its namespace.
 - **`RunRequest` / `RunReply`** (correlated by `requestId`) — every read and control verb
-  (`getRunDetail`, `listRuns`, `cancel`, `retry`, `continue`, `retryWithInput`, …) proxied to the
-  operator and answered on the correlated reply.
+  (`getRunDetail`, `listRuns`, `cancel`, `retry`, `continue`, `retryWithInput`,
+  `republishLifecycle`, `workflowLifecycle`, …) proxied to the operator and answered on the
+  correlated reply. A verb the operator's release does not know is answered with an
+  `unsupported-request` error; for `republishLifecycle` and `workflowLifecycle` the tenant's
+  `ProxyRunGateway` turns that (or the empty reply of an older operator) into a `RunGatewayError`
+  with that code, "not supported by this server", rather than waiting out its timeout, and the
+  dashboard answers 501.
 - **`TenantEvent`** — lifecycle events re-published per tenant, so a tenant's dashboard tails its own
   runs live.
 
@@ -94,7 +99,20 @@ client — the operator is the boundary:
   client asks for is discarded, never merely validated — a tenant can't widen its query into
   another's.
 - Every **runId-bearing** verb loads the run first and rejects with a `cross-tenant` error if
-  `run.namespace` doesn't match the requester — *before* the mutating method runs.
+  `run.namespace` doesn't match the requester — *before* the mutating method runs. A one-run
+  `republishLifecycle({ runId })` is one of them.
+- **`republishLifecycle({ workflow, … })`** (by workflow) is read over the requester's namespace
+  only: the operator overwrites the target's `namespace` with the tenant, like `listRuns`.
+- **`workflowLifecycle`**, and the `workflowLifecycle` / `lifecycleSubscribers` of a run detail,
+  list only the subscribers of the requester's namespace: those announced by lifecycle registry runs
+  in that namespace and by worker descriptors serving it (their `namespace`, else the `@<tenant>`
+  suffix of their group), plus the operator's own registrations when it is that namespace's engine
+  (an operator with no namespace is `default`'s). Another tenant's subscribers stay unseen.
+- A tenant's settled run is **owed** only to the subscribers of its own namespace, plus those of
+  engines with no namespace, which publish every namespace's runs: an operator with no namespace
+  that settles `acme`'s run never marks it as owed to `beta`'s subscribers, so the run is not kept
+  marked (and unpruned) for a subscriber that will never start it. See
+  [lifecycle event delivery](/docs/authoring/events#delivery).
 
 So the guarantee holds even against a misbehaving client: the operator decides what a tenant is
 allowed to touch.

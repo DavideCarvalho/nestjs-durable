@@ -139,7 +139,11 @@ describe('WorkflowEngine — remote advance timeout → recovery re-drive (opt-i
     await startRun(engine, 'parent', {}, 'p1');
     // the child's first advance timed out; it is stuck running (lease released), parent still suspended.
     let childAfter = await store.getRun('p1.child.0');
-    for (let i = 0; i < 50 && childAfter?.status !== 'running'; i += 1) {
+    for (
+      let i = 0;
+      i < 50 && (childAfter?.status !== 'running' || childAfter.lockedUntil !== undefined);
+      i += 1
+    ) {
       await new Promise((r) => setImmediate(r));
       childAfter = await store.getRun('p1.child.0');
     }

@@ -43,7 +43,11 @@ steps:
 
 ```ts
 export interface DurableMetricsSnapshot {
-  /** `routed`: failures handed to an onError handler; `unrouted`: routes that could not be applied. */
+  /**
+   * `routed`: failures handed to an onError handler; `unrouted`: routes that could not be applied.
+   * `triggered`: subscriber runs a settled run's lifecycle event started; `triggerFailed`: the ones
+   * it could not start.
+   */
   runs: {
     started: number;
     completed: number;
@@ -51,9 +55,13 @@ export interface DurableMetricsSnapshot {
     suspended: number;
     routed: number;
     unrouted: number;
+    triggered: number;
+    triggerFailed: number;
   };
   /** Routed failures by error code (`*` without one). */
   routedByCode: Record<string, number>;
+  /** `durable.runs.triggered` by `workflow` (the settled run's), then `subscriber`. */
+  triggeredBySubscriber: Record<string, Record<string, number>>;
   steps: { completed: number; failed: number };
   /** Per-step wall-clock (from the `durationMs` on step events). */
   stepDurationMs: { count: number; p50: number; p95: number; max: number };
@@ -117,6 +125,8 @@ export interface MetricsSnapshot {
     unrouted: number;
   };
   routedByCode: Record<string, number>;
+  /** Subscriber runs a settled run's lifecycle event started, by workflow, then subscriber. */
+  triggeredBySubscriber: Record<string, Record<string, number>>;
   steps: { started: number; completed: number; failed: number };
   /** Per-workflow run counters, keyed by workflow name. */
   byWorkflow: Record<string, { started: number; completed: number; failed: number }>;
@@ -174,3 +184,10 @@ or a JSON snapshot for a custom dashboard rather than a text exposition format.
 A failure handed to an [onError handler](/docs/reliability/on-error) is counted as `routed`, not
 `failed`, and broken down by error code in `routedByCode` (Prometheus: `durable_runs_routed_total{code}`).
 An `unrouted` count above zero means a deploy left workers announcing different routes.
+
+A subscriber run started by a [lifecycle event](/docs/authoring/events#reacting-to-another-workflow-finishing)
+(`run.triggered`) is counted in `triggeredBySubscriber`, by the settled run's workflow and the
+subscriber (Prometheus: `durable_runs_triggered_total{workflow,subscriber}`), so a subscriber that
+stops starting shows up next to the ones that still do. A subscriber the event could not start
+(`run.trigger_failed`) is counted the same way in `triggerFailedBySubscriber` (Prometheus:
+`durable_runs_trigger_failed_total{workflow,subscriber}`).

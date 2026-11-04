@@ -7,7 +7,7 @@ import type { OnErrorInput, WorkflowCtx, WorkflowTask } from '@dudousxd/nestjs-d
 import { WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { OnError, Step, Workflow } from './decorators';
+import { OnDurableEvent, OnError, OnWorkflowCompleted, Step, Workflow } from './decorators';
 import { DurableStartClient } from './durable-start-client';
 import {
   DURABLE_WORKER_RUNNERS,
@@ -76,6 +76,16 @@ class RoutedWorkflow {
   @OnError('invalid_line')
   async invalid(_ctx: WorkflowCtx, failure: OnErrorInput<{ n: number }>): Promise<number> {
     return -failure.input.n;
+  }
+}
+
+/** A workflow that subscribes to a lifecycle event and to a plain event. */
+@Workflow({ name: 'listener', version: '1' })
+@OnWorkflowCompleted('routed')
+@OnDurableEvent('order.placed', { event: 'order.placed', where: () => true })
+class ListenerWorkflow {
+  async run(_ctx: WorkflowCtx, input: unknown) {
+    return input;
   }
 }
 
@@ -193,6 +203,25 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
     expect(registration?.name).toBe('announced');
     expect(registration?.version).toBe('3');
     expect(registration?.requires).toEqual(['saga']);
+
+    await moduleRef.close();
+  });
+
+  it('announces the events a workflow subscribes to, once each', async () => {
+    const runner = fakeRunner();
+    const moduleRef = await Test.createTestingModule({
+      imports: [DurableModule.forRoot({ connection: 'redis://x' })],
+      providers: [ListenerWorkflow, AnnouncedWorkflow],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.runRedisWorker)
+      .compile();
+    await moduleRef.init();
+
+    const runtime = moduleRef.get<DurableWorkerRuntime>(DURABLE_WORKER_RUNTIME);
+    const byName = new Map(runtime.workflowRegistrations().map((r) => [r.name, r]));
+    expect(byName.get('listener')?.subscribes).toEqual(['order.placed', 'run.completed:routed']);
+    expect(byName.get('announced')).not.toHaveProperty('subscribes');
 
     await moduleRef.close();
   });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type { RunQuery, WorkflowRun } from './interfaces';
+import { LIFECYCLE_REGISTRY_WORKFLOW } from './lifecycle-events';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
@@ -8,7 +9,8 @@ class CountingStore extends InMemoryStateStore {
   listRunsCalls = 0;
   admissionCalls = 0;
   override async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    this.listRunsCalls++;
+    // The engine's read of the lifecycle registry is not an admission scan.
+    if (query.workflow !== LIFECYCLE_REGISTRY_WORKFLOW) this.listRunsCalls++;
     return super.listRuns(query);
   }
   override async tryAdmitSingleton(

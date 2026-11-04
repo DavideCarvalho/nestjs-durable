@@ -453,6 +453,44 @@ The instance serves every run and every replay, so keep only what it was built w
 state.
 A function workflow keeps `@line.on_error(code)` for the same thing.
 
+### Reacting to another workflow finishing
+
+A Python workflow can start when a run of another workflow, in any runtime, settles. Name the
+workflow (or pass a registered workflow class, or a list of them):
+
+```python
+@worker.workflow("notify", on_workflow_completed="ingest")
+def notify(ctx: WorkflowContext, event):
+    if event["output"]["rows"] == 0:
+        return None  # filtering happens here: there is no `where`
+    ctx.step("email.send", {"ingestRunId": event["runId"], "rows": event["output"]["rows"]})
+
+@worker.workflow("page-oncall", on_workflow_failed=["ingest", "crawl"])
+def page_oncall(ctx: WorkflowContext, event):
+    ctx.step("pager.trigger", {"runId": event["runId"], "error": event["error"]})
+
+@worker.workflow("on-order", on_event="order.placed")  # any `engine.publishEvent` name
+def on_order(ctx: WorkflowContext, order): ...
+```
+
+`on_workflow_completed` subscribes to `run.completed:<workflow>`, `on_workflow_failed` to
+`run.failed:<workflow>` (failed, cancelled or dead), and `on_event` to any event names;
+`run_completed_event(name)` / `run_failed_event(name)` build the lifecycle names. The options work on
+`@worker.workflow`, `WorkflowWorker.workflow` and `@workflow(name, ...)` for classes. The worker
+announces them in its descriptor (`subscribes`), and the NestJS engine:
+
+- owes a settled run's event to the workflow even when the engine settling it has no such
+  subscriber, and starts it by name on the worker's queue, so the subscriber runs exactly once per
+  settled run (see [delivery](/docs/authoring/events#delivery));
+- passes the event payload as the input: for a lifecycle event the settled run's `runId`,
+  `workflow`, `workflowVersion`, `status`, `input`, `output` (completed) or `error` (otherwise),
+  `tags` and `searchAttributes`;
+- starts it under `evt:<runId>:completed:<name>` (or `:failed:`), so a second publish starts nothing.
+
+There is no `where` or `input` mapping for a Python subscriber, unlike `@OnWorkflowCompleted` in
+TypeScript: return early in the body for an event it should ignore. Debounce and batch are not
+available either.
+
 ### The `WorkflowContext` ops
 
 `ctx` mirrors the TypeScript `WorkflowCtx` — each op is keyed by a deterministic seq, so a completed

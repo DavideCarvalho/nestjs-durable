@@ -1,4 +1,7 @@
 import {
+  LIFECYCLE_PENDING_TAG,
+  LIFECYCLE_REGISTRY_TAG,
+  LIFECYCLE_REGISTRY_WORKFLOW,
   SINGLETON_ADMITTED_TAG,
   SINGLETON_TRACKED_TAG,
   type ScheduleQuery,
@@ -50,6 +53,13 @@ export interface StateStoreContext {
    * sends none of the step's input.
    */
   statementLog?: () => string[];
+  /**
+   * Resolves once {@link statements} and {@link statementLog} count every statement the store sent
+   * before the call. For a driver that reports a statement apart from its result (Prisma's query
+   * events), so a count read right after a call can miss it or a later count can pick it up. Without
+   * it, the contract waits for the log to stop growing.
+   */
+  flushStatementLog?: () => Promise<void>;
   /**
    * The store's client opens a transaction around every write of its own (Prisma does, even for one
    * `createMany` or `updateMany`). The contract then checks that a run's row is written without a
@@ -109,10 +119,6 @@ const checkpoint = (over: Partial<StepCheckpoint> = {}): StepCheckpoint => ({
   ...over,
 });
 
-/**
- * The statements logged after the first `before`, once the log stops growing: a driver may report a
- * statement a moment after the call that sent it resolved.
- */
 /** A logged statement as SQL: without the color codes and the `[query]` label a logger may add. */
 const ANSI_COLOR = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
 
@@ -123,12 +129,36 @@ function sqlOf(logged: string): string {
     .trim();
 }
 
-async function loggedSince(log: () => string[], before: number): Promise<string[]> {
+/**
+ * Wait until the statement log holds every statement sent so far: through `flush` when the store's
+ * context gives one, else until the log stops growing (a driver may report a statement a moment
+ * after the call that sent it resolved).
+ */
+async function settleLog(log: () => string[], flush?: () => Promise<void>): Promise<void> {
+  if (flush) return flush();
   let seen = -1;
   for (let i = 0; i < 50 && log().length !== seen; i += 1) {
     seen = log().length;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+/**
+ * How long the statement log is once it holds every statement sent so far, so a count taken after
+ * a test's setup leaves out that setup's statements however late the driver reports them.
+ */
+async function loggedLength(log: () => string[], flush?: () => Promise<void>): Promise<number> {
+  await settleLog(log, flush);
+  return log().length;
+}
+
+/** The statements logged after the first `before`, once the log holds every statement sent. */
+async function loggedSince(
+  log: () => string[],
+  before: number,
+  flush?: () => Promise<void>,
+): Promise<string[]> {
+  await settleLog(log, flush);
   return log().slice(before);
 }
 
@@ -152,6 +182,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     let supportsTagFilter = true;
     let statements: (() => number) | undefined;
     let statementLog: (() => string[]) | undefined;
+    let flushStatementLog: (() => Promise<void>) | undefined;
     let implicitTransactions = false;
     let skipReason: string | undefined;
     let loggedSkip = false;
@@ -166,6 +197,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         supportsTagFilter = ctx.supportsTagFilter ?? true;
         statements = ctx.statements;
         statementLog = ctx.statementLog;
+        flushStatementLog = ctx.flushStatementLog;
         implicitTransactions = ctx.implicitTransactions ?? false;
         skipReason = undefined;
       } catch (err) {
@@ -532,6 +564,61 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(await ids()).toEqual(['c1', 'c2']);
       },
     );
+
+    t('pruneTerminalRuns keeps a run whose lifecycle event is still owed', async () => {
+      await store.createRun(aged('owed', 10, { tags: ['etl', LIFECYCLE_PENDING_TAG] }));
+      await store.createRun(aged('published', 10, { tags: ['etl', 'durable:triggered:refresh'] }));
+      await store.createRun(aged('owed-over-cap', 2, { tags: [LIFECYCLE_PENDING_TAG] }));
+      await store.createRun(aged('old', 8));
+      await store.createRun(aged('newest', 1));
+
+      // By age: the two old runs without the marker go, the owed ones stay.
+      await store.pruneTerminalRuns?.({ statuses: ['completed'], maxAge: '7d' }, NOW, 100);
+      expect(await ids()).toEqual(['newest', 'owed', 'owed-over-cap']);
+
+      // By count: only the newest is kept, apart from the owed ones.
+      await store.createRun(aged('mid', 2));
+      await store.pruneTerminalRuns?.({ statuses: ['completed'], maxCount: 1 }, NOW, 100);
+      expect(await ids()).toEqual(['newest', 'owed', 'owed-over-cap']);
+    });
+
+    t('pruneTerminalRuns keeps lifecycle registry runs', async () => {
+      await store.createRun(
+        aged('__lifecycle_registry:a', 10, {
+          workflow: LIFECYCLE_REGISTRY_WORKFLOW,
+          tags: [LIFECYCLE_REGISTRY_TAG],
+        }),
+      );
+      await store.createRun(aged('old', 10));
+
+      await store.pruneTerminalRuns?.({ statuses: ['completed'], maxAge: '7d' }, NOW, 100);
+      expect(await ids()).toEqual(['__lifecycle_registry:a']);
+      await store.pruneTerminalRuns?.({ statuses: ['completed'], maxCount: 0 }, NOW, 100);
+      expect(await ids()).toEqual(['__lifecycle_registry:a']);
+    });
+
+    t('pruneTerminalRuns does not count lifecycle registry runs toward maxCount', async () => {
+      // Registry runs are the newest rows, so if they counted they would fill the kept window.
+      for (const instance of ['a', 'b']) {
+        await store.createRun(
+          aged(`__lifecycle_registry:${instance}`, 0, {
+            workflow: LIFECYCLE_REGISTRY_WORKFLOW,
+            tags: [LIFECYCLE_REGISTRY_TAG],
+          }),
+        );
+      }
+      await store.createRun(aged('owed', 1, { tags: [LIFECYCLE_PENDING_TAG] }));
+      for (let i = 2; i <= 4; i++) await store.createRun(aged(`c${i}`, i));
+
+      // The two newest app runs are kept: `owed` (still counted, never pruned) and c2.
+      await store.pruneTerminalRuns?.({ statuses: ['completed'], maxCount: 2 }, NOW, 100);
+      expect(await ids()).toEqual([
+        '__lifecycle_registry:a',
+        '__lifecycle_registry:b',
+        'c2',
+        'owed',
+      ]);
+    });
 
     t('a scoped retention policy only prunes (and counts) the runs its scope matches', async () => {
       await store.createRun(aged('acme-old', 10, { namespace: 'acme' }));
@@ -1118,8 +1205,10 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
           checkpoint({ seq, stepId: `r1:${seq}`, status: 'pending', output: undefined }),
         );
         const sent = async (work: () => Promise<unknown>): Promise<number> => {
+          await flushStatementLog?.();
           const before = (statements as () => number)();
           await work();
+          await flushStatementLog?.();
           return (statements as () => number)() - before;
         };
         expect(
@@ -1286,7 +1375,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
           }),
         );
       }
-      const before = statementLog().length;
+      const before = await loggedLength(statementLog, flushStatementLog);
       const settle = (seqs: number[]) =>
         store.settleCheckpointsIfPending?.(
           seqs.map((seq) => ({
@@ -1300,7 +1389,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         );
       expect(await settle([0])).toEqual([true]);
       expect(await settle([1, 0])).toEqual([true, false]);
-      const sent = await loggedSince(statementLog, before);
+      const sent = await loggedSince(statementLog, before, flushStatementLog);
       expect(sent.length).toBeGreaterThan(0);
       expect(sent.some((statement) => statement.includes('xxxxxxxxxx'))).toBe(false);
       expect(sent.join('').length).toBeLessThan(20_000);
@@ -1344,9 +1433,9 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       async () => {
         if (!statementLog) return;
         await store.createRun(run({ id: 'warm' }));
-        const before = statementLog().length;
+        const before = await loggedLength(statementLog, flushStatementLog);
         await store.createRun(run());
-        const sent = await loggedSince(statementLog, before);
+        const sent = await loggedSince(statementLog, before, flushStatementLog);
         expect(sent.length).toBeGreaterThan(0);
         expect(sent.map(sqlOf).filter((q) => /^select/i.test(q))).toEqual([]);
         if (!implicitTransactions) {
@@ -1360,9 +1449,9 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       if (!statementLog) return;
       await store.createRun(run());
       await store.updateRun('r1', { status: 'running', updatedAt: new Date() });
-      const before = statementLog().length;
+      const before = await loggedLength(statementLog, flushStatementLog);
       await store.updateRun('r1', { status: 'suspended', wakeAt: 5_000, updatedAt: new Date() });
-      const sent = await loggedSince(statementLog, before);
+      const sent = await loggedSince(statementLog, before, flushStatementLog);
       expect(sent.map(sqlOf).filter((q) => /^update/i.test(q))).toHaveLength(1);
       expect(sent.map(sqlOf).filter((q) => /^select/i.test(q))).toEqual([]);
       if (!implicitTransactions) {
@@ -1388,9 +1477,9 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
           }),
         );
       }
-      const before = statementLog().length;
+      const before = await loggedLength(statementLog, flushStatementLog);
       const read = await store.getCheckpointsForSettle('r1', [0, 1]);
-      const sent = await loggedSince(statementLog, before);
+      const sent = await loggedSince(statementLog, before, flushStatementLog);
       expect(read).toHaveLength(2);
       expect(sent.length).toBeGreaterThan(0);
       // Neither the input column nor every column (`*`) is selected.
@@ -1498,9 +1587,9 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
             }),
           );
         }
-        const before = statementLog().length;
+        const before = await loggedLength(statementLog, flushStatementLog);
         const replay = await store.listCheckpointsForReplay('r1');
-        const sent = await loggedSince(statementLog, before);
+        const sent = await loggedSince(statementLog, before, flushStatementLog);
         expect(replay.map((c) => c.output)).toEqual([{ answer: 0 }, { answer: 1 }]);
         expect(sent.length).toBeGreaterThan(0);
         // Neither the input column nor every column (`*`) is selected.
@@ -1875,6 +1964,84 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         'c',
       ]);
     });
+
+    t('leaves out the runs of excludeWorkflows, in lists and in counts', async () => {
+      await store.createRun(run({ id: 'a', status: 'failed', workflow: 'wa' }));
+      await store.createRun(run({ id: 'b', status: 'completed', workflow: 'wb' }));
+      await store.createRun(run({ id: 'c', status: 'completed', workflow: 'wc' }));
+
+      expect(
+        (await store.listRuns({ excludeWorkflows: ['wb', 'wc'] })).map((r) => r.id).sort(),
+      ).toEqual(['a']);
+      expect(
+        (await store.listRuns({ excludeWorkflows: ['wb'], statuses: ['completed'] })).map(
+          (r) => r.id,
+        ),
+      ).toEqual(['c']);
+      expect((await store.listRuns({ excludeWorkflows: [] })).map((r) => r.id).sort()).toEqual([
+        'a',
+        'b',
+        'c',
+      ]);
+      if (store.countRuns) expect(await store.countRuns({ excludeWorkflows: ['wa'] })).toBe(2);
+      if (store.runFacets) {
+        const rows = await store.runFacets({ excludeWorkflows: ['wb'] });
+        expect(rows.reduce((sum, row) => sum + row.count, 0)).toBe(2);
+      }
+      if (store.runValueFacets) {
+        const rows = await store.runValueFacets(
+          { field: 'workflow' },
+          { excludeWorkflows: ['wb'] },
+        );
+        expect(rows.map((row) => row.value).sort()).toEqual(['wa', 'wc']);
+      }
+    });
+
+    t(
+      'holds a lifecycle registry run: created, refreshed in place, listed by workflow',
+      async () => {
+        const id = '__lifecycle_registry:instance-1';
+        const subscriptions = [{ workflow: 'notify', events: ['run.completed:ingest'] }];
+        expect(await store.updateRunIf?.(id, ['completed'], { updatedAt: new Date(NOW) })).not.toBe(
+          true,
+        );
+        await store.createRun(
+          run({
+            id,
+            workflow: LIFECYCLE_REGISTRY_WORKFLOW,
+            status: 'completed',
+            input: { instanceId: 'instance-1', runtime: 'node', subscriptions },
+            tags: [LIFECYCLE_REGISTRY_TAG],
+            createdAt: new Date(NOW - 20_000),
+            updatedAt: new Date(NOW - 20_000),
+          }),
+        );
+        await store.createRun(run({ id: 'app', workflow: 'ingest', status: 'completed' }));
+
+        const more = [...subscriptions, { workflow: 'audit', events: ['run.failed:ingest'] }];
+        const input = { instanceId: 'instance-1', runtime: 'node', subscriptions: more };
+        if (store.updateRunIf) {
+          expect(
+            await store.updateRunIf(id, ['completed'], { input, updatedAt: new Date(NOW) }),
+          ).toBe(true);
+        } else {
+          await store.updateRun(id, { input, updatedAt: new Date(NOW) });
+        }
+
+        const listed = await store.listRuns({ workflow: LIFECYCLE_REGISTRY_WORKFLOW });
+        expect(listed.map((r) => r.id)).toEqual([id]);
+        expect(listed[0]?.input).toEqual(input);
+        expect(listed[0]?.updatedAt.getTime()).toBe(NOW);
+        expect(listed[0]?.status).toBe('completed');
+        expect(listed[0]?.tags).toEqual([LIFECYCLE_REGISTRY_TAG]);
+        expect(await store.listIncompleteRuns()).toEqual([]);
+        expect(
+          (await store.listRuns({ excludeWorkflows: [LIFECYCLE_REGISTRY_WORKFLOW] })).map(
+            (r) => r.id,
+          ),
+        ).toEqual(['app']);
+      },
+    );
 
     t('carries the absent-origin bucket INSIDE a set of origins', async () => {
       // "This package plus the runs nothing claims" — a view the single `origin` cannot express at
@@ -2620,8 +2787,10 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         }
         const engine = new WorkflowEngine({ store });
 
+        await flushStatementLog?.();
         const before = statements();
         const deleted = await engine.sweepBufferedSignals();
+        await flushStatementLog?.();
         const sent = statements() - before;
 
         expect(deleted).toBe(rows);

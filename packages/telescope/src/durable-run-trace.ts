@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { type Context, TraceFlags, context, trace } from '@opentelemetry/api';
+import { type Context, type SpanContext, TraceFlags, context, trace } from '@opentelemetry/api';
 
 /**
  * The trace a run's spans hang under, DERIVED FROM THE RUN ID rather than held as a live root span.
@@ -68,10 +68,16 @@ function runIds(runId: string): RunIds {
  * traceable in Telescope but invisible in any OTel backend, which is the confusing half-state.
  */
 export function runTraceContext(runId: string, parent: Context = context.active()): Context {
-  return trace.setSpanContext(parent, {
+  return trace.setSpanContext(parent, runSpanContext(runId));
+}
+
+/** The synthetic root span context of a run's trace: what {@link runTraceContext} activates, and
+ *  what a span links to when it references the run from another trace. */
+export function runSpanContext(runId: string): SpanContext {
+  return {
     traceId: runTraceId(runId),
     spanId: runSpanId(runId),
     traceFlags: TraceFlags.SAMPLED,
     isRemote: true,
-  });
+  };
 }

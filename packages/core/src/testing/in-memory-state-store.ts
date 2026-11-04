@@ -21,6 +21,7 @@ import {
   type WorkflowRun,
 } from '../interfaces';
 import type { AttributeFilter, BufferedSignalRow, OwnedLeaseReclaim } from '../interfaces';
+import { LIFECYCLE_REGISTRY_WORKFLOW, retentionKeeps } from '../lifecycle-events';
 import { checkpointStatsOf, queryCheckpointsOf } from '../run-detail-store';
 import { mergeRunFacetRows } from '../run-facets';
 import { RUN_VALUE_FACET_SCAN, runValueFacetsFromRuns } from '../run-value-facets';
@@ -34,6 +35,12 @@ import {
   singletonAdmissionTags,
   withoutSingletonMarkers,
 } from '../singleton-admission';
+
+/**
+ * Workflows a retention policy never sees: lifecycle registry runs are neither pruned nor counted
+ * toward `maxCount`.
+ */
+const RETENTION_EXCLUDED = [LIFECYCLE_REGISTRY_WORKFLOW];
 
 /**
  * A non-durable, in-process `StateStore` for tests and local development.
@@ -182,12 +189,16 @@ export class InMemoryStateStore implements StateStore {
     const statuses = policy.statuses.filter((s) => TERMINAL_RUN_STATUSES.includes(s));
     if (statuses.length === 0 || limit <= 0) return 0;
     if (policy.maxAge == null && policy.maxCount == null) return 0;
-    const inScope = this.matching({ ...(policy.scope ?? {}), statuses });
+    const inScope = this.matching({
+      ...(policy.scope ?? {}),
+      statuses,
+      excludeWorkflows: RETENTION_EXCLUDED,
+    });
     const ids = new Set<string>();
     if (policy.maxAge != null) {
       const cutoff = nowMs - parseDuration(policy.maxAge);
       const expired = inScope
-        .filter((r) => r.updatedAt.getTime() < cutoff)
+        .filter((r) => r.updatedAt.getTime() < cutoff && !retentionKeeps(r.tags))
         .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime()) // oldest first
         .slice(0, limit);
       for (const r of expired) ids.add(r.id);
@@ -199,6 +210,7 @@ export class InMemoryStateStore implements StateStore {
       );
       for (const r of byRecency.slice(policy.maxCount)) {
         if (ids.size >= limit) break;
+        if (retentionKeeps(r.tags)) continue;
         ids.add(r.id);
       }
     }
@@ -530,6 +542,9 @@ export class InMemoryStateStore implements StateStore {
     let runs = [...this.runs.values()];
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
     if (query.workflows) runs = runs.filter((r) => query.workflows?.includes(r.workflow));
+    if (query.excludeWorkflows?.length) {
+      runs = runs.filter((r) => !query.excludeWorkflows?.includes(r.workflow));
+    }
     if (query.status) runs = runs.filter((r) => r.status === query.status);
     if (query.statuses) runs = runs.filter((r) => query.statuses?.includes(r.status));
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));

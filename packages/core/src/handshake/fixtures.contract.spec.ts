@@ -112,6 +112,37 @@ describe('golden fixture: descriptor-on-error.json (announced onError routes)', 
   });
 });
 
+/** The pinned hash of the subscriptions fixture — verified equal in the Python SDK's test_handshake. */
+const GOLDEN_SUBSCRIBES_HASH = '3d2e720196c1c893';
+
+describe('golden fixture: descriptor-subscribes.json (announced event subscriptions)', () => {
+  const raw = readRaw('descriptor-subscribes.json');
+  const parsed = JSON.parse(raw) as WorkerDescriptor;
+
+  it('parses the events a worker announces each workflow subscribes to', () => {
+    expect(parsed.registrations?.map((r) => [r.name, r.subscribes])).toEqual([
+      ['notify', ['run.completed:ingest', 'run.failed:ingest']],
+      ['on-order', ['order.placed']],
+    ]);
+  });
+
+  it('round-trips byte-identically (serialize(parse(bytes)) === bytes)', () => {
+    expect(`${JSON.stringify(parsed, null, 2)}\n`).toBe(raw);
+  });
+
+  it('computes the pinned cross-language hash (3d2e720196c1c893)', () => {
+    expect(descriptorHash(parsed)).toBe(GOLDEN_SUBSCRIBES_HASH);
+  });
+
+  it('hashes the same whatever order the events are listed in', () => {
+    const [notify, ...rest] = parsed.registrations ?? [];
+    const reversed = { ...notify, subscribes: [...(notify?.subscribes ?? [])].reverse() };
+    expect(
+      descriptorHash({ ...parsed, registrations: [reversed as typeof notify, ...rest] as never }),
+    ).toBe(GOLDEN_SUBSCRIBES_HASH);
+  });
+});
+
 describe('golden fixture: heartbeat-status.json (two-tier ETag)', () => {
   const raw = readRaw('heartbeat-status.json');
   const parsed = JSON.parse(raw) as HeartbeatStatus;

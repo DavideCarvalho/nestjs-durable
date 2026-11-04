@@ -43,6 +43,7 @@ through it so the engine can checkpoint — the body itself stays deterministic 
 | --- | --- | --- |
 | `waitForSignal` | `waitForSignal<T>(token: string, opts?: { timeoutMs?: number }): Promise<T>` | Suspend until an external `engine.signal(token, payload)` arrives; `timeoutMs` bounds the wait and throws `SignalTimeoutError` on expiry. |
 | `waitForEvent` | `waitForEvent<T>(name: string, opts?: { match?: Record<string, unknown>; timeoutMs?: number }): Promise<T>` | Suspend for a named pub/sub event published via `engine.publishEvent`; `match` filters which publishes resolve this run. |
+| `waitForRun` | `waitForRun<TOutput>(runId: string, opts?: { timeoutMs?: number \| string }): Promise<WorkflowLifecycleEvent<unknown, TOutput>>`, or `waitForRun(WorkflowClass, runId, opts?): Promise<LifecycleEventOf<C>>` | Suspend until any run settles and resume with its status and output or error. Resolves at once for a settled run; `timeoutMs` throws `SignalTimeoutError`; an unknown id fails with a non-retryable `run <id> not found`. See [Waiting for another run to finish](/docs/authoring/events#waiting-for-another-run-to-finish). |
 | `setEvent` | `setEvent<T>(key: string, value: T): Promise<void>` | Publish a queryable value, readable externally via `engine.getEvent(runId, key)` while the run is in flight. See [Queries & updates](/docs/authoring/queries-and-updates). |
 | `onUpdate` | `onUpdate<TArg>(name: string, opts?: { timeoutMs?: number }): Promise<TArg>` | Expose a run-scoped update point; suspends until `engine.update(runId, name, arg)` delivers `arg`, gated by any registered validator. |
 
@@ -122,7 +123,7 @@ Marks a provider class as a durable workflow; its `run(ctx, input)` becomes the 
 | `output` | `IoSchema` | Output schema. `run()`'s return value is parsed before the run completes; a mismatch fails it with `invalid_output`. |
 | `inputSchema` | `IoSchema` | Alias of `input`, for workflows declared before it existed. Setting both is an error. |
 | `validateInput` | `(input: unknown) => void \| Promise<void>` | Extra check at `start` (throw to reject), run after `input` parses, on the parsed value. |
-| `onEvent` | `string[]` | Start a fresh run whenever any of these events is published. Merged with `@OnDurableEvent`. |
+| `onEvent` | `Array<string \| { event: string; where?: (payload) => boolean; input?: (payload) => unknown }>` | Start a fresh run whenever any of these events is published. `where` filters per payload, `input` builds the run's input from it. Merged with `@OnDurableEvent`, `@OnWorkflowCompleted` and `@OnWorkflowFailed`. |
 | `debounce` | `string \| number` | Coalesce `onEvent` triggers: fire once quiet for this long, with the last payload. |
 | `batch` | `{ maxSize: number; within: string \| number }` | Coalesce `onEvent` triggers: fire on size or window, with all payloads. |
 
@@ -176,8 +177,45 @@ See [Durable entities](/docs/authoring/entities).
 
 Class decorator subscribing a `@Workflow` to one or more events — equivalent to
 `@Workflow({ onEvent })`; multiple declarations and the option are merged. Named "durable" to avoid
-clashing with `@nestjs/event-emitter`'s `@OnEvent` (`OnEvent` remains a deprecated alias). See
+clashing with `@nestjs/event-emitter`'s `@OnEvent` (`OnEvent` remains a deprecated alias). Each
+event is a name or a `{ event, where, input }` entry. See
 [Event-driven workflows](/docs/authoring/events).
+
+### `@OnWorkflowCompleted(workflow, options?)` / `@OnWorkflowFailed(workflow, options?)`
+
+Class decorators that start the decorated `@Workflow` whenever a run of `workflow` (a class or a
+registered name) completes, or ends failed, cancelled or dead. They subscribe to the lifecycle
+events `run.completed:<workflow>` / `run.failed:<workflow>` (`runCompletedEvent` /
+`runFailedEvent`). Exactly once per settled run and subscriber. See
+[Reacting to another workflow finishing](/docs/authoring/events#reacting-to-another-workflow-finishing).
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `where` | `(event: LifecycleEventOf<C>) => boolean` | Start only for the settled runs it accepts. |
+| `input` | `(event: LifecycleEventOf<C>) => TRunInput` | The started run's input. Default: the `WorkflowLifecycleEvent` itself. |
+| `statuses` | `Array<'failed' \| 'cancelled' \| 'dead'>` | `@OnWorkflowFailed` only. The endings that start it; default all three. |
+| `debounce` | `{ windowMs: number \| string; key?: (input: TRunInput) => string }` | Start once events have been quiet for `windowMs`, per `key` when given. Sets the workflow's coalescing; not with `batch`, and a different `@Workflow({ debounce \| batch })` fails at registration. |
+| `batch` | `{ maxSize: number; windowMs: number \| string; key?: (input: TRunInput) => string }` | Start with `{ events: TRunInput[] }` once `maxSize` arrive or `windowMs` passes, per `key` when given. Same rules as `debounce`. |
+
+With a class ref, the decorated workflow's `run` must accept `TRunInput` (or the event), or the
+decorator does not compile. Links: `triggeredRuns(runId)`, `lifecycleSourceOf(run)`,
+`lifecycleRunId(sourceRunId, kind, subscriber)`, `triggeredRunsOf(run)`,
+`parseLifecycleEvent(event)` (`{ workflow, kind }` for a `run.completed:*` / `run.failed:*` name).
+`LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX` (`durable:trigger_failed:`) tags a settled run once per
+subscriber whose start from its lifecycle event failed (read with `triggerFailedSubscribersOf(tags)`;
+a later successful start removes it). `isLifecycleTag` covers it, so it stays out of the event's
+`tags`. `LIFECYCLE_TRACE_TAG_PREFIX` (`durable:lifecycle:trace:`) is the tag holding a run's root span
+traceparent (written with its first suspend or its terminal write), read with
+`lifecycleTraceparentOf(tags)`. The subscription registry: `LIFECYCLE_REGISTRY_WORKFLOW`
+(`__lifecycle_registry`), `lifecycleRegistryRunId(instanceId)`, `LifecycleRegistryEntry`
+(`{ instanceId, runtime: 'node', engineNamespace: string | null, subscriptions: { workflow, events }[] }`,
+a registry run's `input`; `engineNamespace` is `null` for an engine with no namespace),
+`lifecycleRegistrySubscriptions(input)`, `lifecycleRegistryNamespace(input, rowNamespace)` (the
+namespace whose runs owe to a registry run's subscriptions, `null` for every namespace; a row without
+`engineNamespace` stored under `default` reads as every namespace), `LIFECYCLE_REGISTRY_TAG` (`durable:lifecycle:registry`),
+`LIFECYCLE_REGISTRY_HEARTBEAT_MS` (10s), `LIFECYCLE_REGISTRY_TTL_MS` (35s),
+`LIFECYCLE_REGISTRY_STALE_MS` (10 min), and `retentionKeeps(tags)`, which a store's
+`pruneTerminalRuns` checks so it keeps owed and registry runs.
 
 ### `@StepInterceptor()`
 
@@ -249,6 +287,8 @@ to the `WorkflowEngine` it wraps.
 | `signal` | `signal(token: string, payload: unknown): Promise<RunResult \| null>` | Deliver an external signal to the run waiting on `token`. Resolves with the run's state after its turn; while the engine consumes a run queue, once the wake is queued (use `waitForRun` for the outcome). |
 | `signalWithStart` | `signalWithStart<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, runId: string, signal: { token: string; payload?: unknown }, opts?: StartOptions): Promise<{ runId: string }>` | Ensure the run exists, then signal it — race-free (buffered if the run isn't waiting yet). The durable-entity / accumulator pattern. |
 | `publishEvent` | `publishEvent(name: string, payload: unknown, opts?: { id?: string }): Promise<number>` | Resume every run parked on `ctx.waitForEvent(name, …)` and start every `@Workflow({ onEvent })` subscriber; returns the count touched. |
+| `triggeredRuns` | `triggeredRuns(runId: string): Promise<string[]>` | The runs this run's settling started through a lifecycle event, read from its `durable:triggered:*` tags. Empty while it has not settled. |
+| `republishLifecycle` | `republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult>` | Publish settled runs' lifecycle events again, without the marker. `target` is `{ runId, subscriber? }` or `{ workflow, kind?, since?, until?, subscriber?, limit?, namespace? }` (default limit 1000; `namespace` defaults to the engine's own, and one other than a namespaced engine's is rejected). Subscribers already started are not started again. Returns `{ runs, started, failed: { runId, subscriber, error }[] }`. |
 
 ## WorkflowEngine (selected public surface)
 
@@ -287,6 +327,13 @@ for dashboard/control-plane operations. This is a curated subset, not the full c
 | `drain` | `drain(timeoutMs?: number): Promise<void>` | Graceful shutdown: stop picking up new runs, wait for in-flight executions up to `timeoutMs` (default 10000). On timeout, releases (owner-scoped) and fences the leases of the runs still executing so another instance recovers them at once. |
 | `workerHealth` | `workerHealth(extra?: string[]): Promise<GroupHealth[]>` | Per-group queue backlog + live worker heartbeats (only transports that support introspection, e.g. BullMQ). |
 | `recoverIncomplete` | `recoverIncomplete(nowMs?: number): Promise<RunResult[]>` | Resume every run left `running` by a crash/deploy. Call on boot. |
+| `sweepLifecycleEvents` | `sweepLifecycleEvents(nowMs?: number, limit?: number): Promise<number>` | Publish the lifecycle event of settled runs still tagged `durable:lifecycle:pending` to the owed subscribers this instance has (the settling process died, or did not have them), leaving runs settled in the last 30s to the live publish. Drops owed subscribers nobody announces 24h after settle (`run.trigger_failed`), and delivers `ctx.waitForRun` waits whose run settled (`sweepRunWaits`). Pages through the marked runs (`limit` per page, default 100), skipping the ones it cannot act on, until it has acted on `limit` runs or examined 1000. Subscribers only live workers announce are started here too when the engine can reach them by name (a live worker group of that name). Refreshes this engine's lifecycle registry run first (`heartbeatLifecycleRegistry`). Called by the timer poller. Returns how many runs it published. |
+| `heartbeatLifecycleRegistry` | `heartbeatLifecycleRegistry(): Promise<void>` | At most once per 10s: write this engine's `onEvent` subscriptions as its `__lifecycle_registry:<instanceId>` run (completed, subscriptions in `input`, `updatedAt` the heartbeat; nothing for an engine with no subscriptions), and delete registry runs not refreshed for 10 minutes. Other engines count a registry run refreshed in the last 35s as announced subscriptions, whatever the transport. Called by `sweepLifecycleEvents`. |
+| `sweepRunWaits` | `sweepRunWaits(limit?: number): Promise<number>` | Resume `ctx.waitForRun` waiters whose run settled without resuming them: checks waited-on runs in waiter order, skipping unsettled ones, until it has resumed the waiters of `limit` runs (default 100) or checked 1000. Returns how many waiters it resumed. Called by `sweepLifecycleEvents`. |
+| `republishLifecycle` | `republishLifecycle(target): Promise<RepublishLifecycleResult>` | See the `WorkflowService` row above. Subscribers registered here start here; one only another worker announces is owed the event again, for that worker's sweep. |
+| `workflowLifecycle` | `workflowLifecycle(workflow: string, opts?: { namespace?: string }): Promise<WorkflowLifecycleLinks>` | With `namespace`, only that namespace's subscriptions (registry runs in it, worker descriptors serving it, this engine's own when it is that namespace's engine; no namespace counts as `default`). Who starts whom, for one workflow: `{ workflow, startsOnSettle, startedBy }`, each a `LifecycleSubscriptionLink[]` of `{ workflow, kind, local, announced, where, input, coalesce?: { mode, keyed } }`, from this engine's registry and the live fleet's announcements. What the dashboard's workflow page lists. |
+| `setRunTraceparent` | `setRunTraceparent(provider: ((runId: string) => string \| undefined) \| undefined): void` | Install (or remove) the function answering a run's span traceparent in this process. `attachDurableOtel` installs one. With it, the terminal write of a run some workflow subscribes to records a `durable:lifecycle:trace:<traceparent>` tag, and a lifecycle-started run's `run.started` event carries `sourceTraceparent`. |
+| `lifecycleSubscribers` | `lifecycleSubscribers(workflow: string, kind: 'completed' \| 'failed', namespace?: string): Promise<string[]>` | The workflows a run of `workflow` in `namespace` settling as `kind` owes its lifecycle event to (without `namespace`, any namespace's): registered here when this engine publishes that namespace's runs (an engine with no namespace publishes every namespace's), or announced for that namespace by the fleet: the fresh lifecycle registry runs in the state store of engines in that namespace or with none, and `subscribes` on live worker descriptors serving it where the transport reads them; read at most every 5s. |
 | `resumeDueTimers` | `resumeDueTimers(nowMs?: number): Promise<RunResult[]>` | Resume suspended runs whose durable timer is due: at most `timerBatchSize` per pass (a `WorkflowEngine` constructor option, default 500), most overdue first, walked in shuffled order. Call periodically. |
 | `runPending` | `runPending(nowMs?: number): Promise<RunResult[]>` | Pick up and execute every `pending` run (poll-based dispatch for a broker-less worker pod). |
 | `sweepTimeouts` | `sweepTimeouts(now?: number): Promise<void>` | Cancel in-flight runs that outlived their `@Workflow({ executionTimeout })`, cascading to their children exactly as `cancel` does. |
@@ -361,7 +408,9 @@ and the [dashboard](/docs/observability/dashboard#wide-fans).
 
 | Type / function | Shape | Notes |
 | --- | --- | --- |
-| `RunDetail` | `{ run, timeline, children, fans?, childCount?, etag?, notModified? }` | What `getRunDetail` returns. When summarized, `timeline` omits the members of each summarized fan, `fans` holds one `FanSummary` per fan, and `children` lists at most 200 ids with `childCount` as the total. `etag` is set when the gateway can version the detail without reading the timeline. `notModified: true` means `ifNoneMatch` matched it: only `run` was read, and `timeline` and `children` are empty. |
+| `RunDetail` | `{ run, timeline, children, fans?, childCount?, triggered?, triggeredBy?, lifecycleSubscribers?, workflowLifecycle?, lifecycleDeliveries?, waitsFor?, awaitedBy?, etag?, notModified? }` | What `getRunDetail` returns. `triggeredBy` is a `LifecycleSource` (`{ runId, kind, status?, namespace?, traceId? }`); `lifecycleDeliveries` a `LifecycleDelivery` per subscriber of a settled run (`{ subscriber, state: 'started' \| 'owed' \| 'coalesced' \| 'failed' \| 'not-started', runId?, status?, namespace?, owedSince?, orphanAt?, error? }`; `failed` is read from a `durable:trigger_failed:<subscriber>` tag, and `error` is left unset since the message is not stored, built by `lifecycleDeliveriesOf(run, { subscribers, live, coalesced })` with `engine.coalescedSubscribers(run)`); `waitsFor` / `awaitedBy` the `ctx.waitForRun` waits on either side (`RunWaitLink`: `{ runId, seq, status?, namespace? }`). When summarized, `timeline` omits the members of each summarized fan, `fans` holds one `FanSummary` per fan, and `children` lists at most 200 ids with `childCount` as the total. `etag` is set when the gateway can version the detail without reading the timeline. `notModified: true` means `ifNoneMatch` matched it: only `run` was read, and `timeline` and `children` are empty. |
+| `RunGateway.workflowLifecycle` | `workflowLifecycle?(workflow: string, opts?: { namespace?: string }): Promise<WorkflowLifecycleLinks>` | Optional on the port: the store-backed gateway and the tenant proxy implement it (same version-skew error as `republishLifecycle`). Over the proxy the operator scopes it, and a run detail's `workflowLifecycle` / `lifecycleSubscribers`, to the tenant's namespace. The dashboard's `GET workflows/:name/lifecycle` calls it (501 without it), and `RunDetail.workflowLifecycle` carries the same for the run's workflow. |
+| `RunGateway.republishLifecycle` | `republishLifecycle?(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult>` | Optional on the port: the store-backed gateway and the tenant proxy implement it. Over the proxy a `{ runId }` target is refused for another tenant's run (`cross-tenant`) and a `{ workflow }` one is read over the tenant's namespace only; an operator too old for the verb fails it with a `RunGatewayError` whose `code` is `unsupported-request` (the dashboard answers 501). The dashboard's `POST runs/:id/republish-lifecycle` calls it, behind the same gate as retry and cancel. `lifecycleSubscribers` on a settled run's detail lists who it would publish to. |
 | `RunDetailOptions` | `{ summarizeFansOver?: number; ifNoneMatch?: string }` | Summarize every fan with more than this many members, or declared wider than that. Unset returns the full detail. `ifNoneMatch` is an HTTP `If-None-Match` value. A gateway that cannot version the detail ignores it. |
 | `FanSummary` | `{ group, label, firstSeq, lastSeq, size, total?, notStarted?, failFast, counts, startedAt?, finishedAt?, failures }` | `label` is the members' step name, or `child runs`. `size` counts members started (a folded checkpoint counts as the children it stands for); `total` is the declared size from the group; `notStarted` is `total - size`. `counts` is per status, with a failed child counted as `failed`. `failures` holds the first 20 failed members. |
 | `FanPageQuery` | `{ offset?, limit?, failedOnly?, ifNoneMatch? }` | `offset` defaults to 0; `limit` to 100, clamped to 1–500. `ifNoneMatch` works as on `RunDetailOptions`. |
@@ -376,6 +425,7 @@ and the [dashboard](/docs/observability/dashboard#wide-fans).
 | `pageFanFromStore(store, runId, group, query, stats?)` | `→ Promise<FanPage>` | `pageFan`, read one page at a time from the store. |
 | `checkpointStatsOf(checkpoints, { group? })` / `queryCheckpointsOf(checkpoints, query)` | `→ CheckpointStat[]` / `→ StepCheckpoint[]` | The in-memory references a store's `checkpointStats` and `queryCheckpoints` must agree with. |
 | `runDetailEtag(run, stats, over)` / `fanPageEtag(group, stats, query)` | `→ string` | The ETags `StoreRunGateway` sends. |
+| `extendEtag(etag, extras)` | `→ string` | `etag` extended with a fingerprint of `extras` (what a detail reads from outside the run row and its checkpoints, such as a linked run's status); `etag` itself when `extras` is undefined. |
 | `etagMatches(ifNoneMatch, etag)` | `→ boolean` | Weak `If-None-Match` comparison, `*` included. |
 
 A fan's `parallelGroup` is `all:<firstSeq>:n<size>[:failFast]` for children (older runs may carry

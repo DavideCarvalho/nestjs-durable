@@ -169,11 +169,55 @@ def on_error(code: Any = None) -> Callable[[Callable[..., Any]], Callable[..., A
 _WORKFLOW_META = "__durable_workflow_meta__"
 
 
+def run_completed_event(workflow: Any) -> str:
+    """The event the engine publishes when a run of ``workflow`` (a name or a registered workflow
+    class) completes: ``run.completed:<workflow>``."""
+    return f"run.completed:{workflow_name(workflow)}"
+
+
+def run_failed_event(workflow: Any) -> str:
+    """The event the engine publishes when a run of ``workflow`` ends failed, cancelled or dead:
+    ``run.failed:<workflow>``."""
+    return f"run.failed:{workflow_name(workflow)}"
+
+
+def _workflow_refs(option: str, value: Any) -> List[Any]:
+    """``value`` as a list: one workflow reference, or a list or tuple of them."""
+    refs = list(value) if isinstance(value, (list, tuple)) else [value]
+    for ref in refs:
+        if not isinstance(ref, str) and not inspect.isclass(ref):
+            raise TypeError(f"{option}: expected a workflow name or class, got {ref!r}")
+    return refs
+
+
+def _subscribes(
+    on_workflow_completed: Any, on_workflow_failed: Any, on_event: Any
+) -> Optional[List[str]]:
+    """The event names a workflow subscribes to, sorted and de-duplicated, or ``None`` for none."""
+    events: List[str] = []
+    if on_workflow_completed is not None:
+        refs = _workflow_refs("on_workflow_completed", on_workflow_completed)
+        events.extend(run_completed_event(ref) for ref in refs)
+    if on_workflow_failed is not None:
+        refs = _workflow_refs("on_workflow_failed", on_workflow_failed)
+        events.extend(run_failed_event(ref) for ref in refs)
+    if on_event is not None:
+        names = [on_event] if isinstance(on_event, str) else list(on_event)
+        for name in names:
+            if not isinstance(name, str) or not name:
+                raise TypeError(f"on_event: expected event names, got {name!r}")
+        events.extend(names)
+    return sorted(set(events)) or None
+
+
 def _workflow_meta(
     version: Optional[str],
     requires: Optional[List[str]],
     origin: Optional[str],
     on_error: Optional[List[Dict[str, str]]],
+    on_workflow_completed: Any = None,
+    on_workflow_failed: Any = None,
+    on_event: Any = None,
 ) -> Dict[str, Any]:
     """The announcement a workflow registration carries; an option left out is not stated."""
     meta: Dict[str, Any] = {}
@@ -185,6 +229,9 @@ def _workflow_meta(
         meta["origin"] = origin
     if on_error is not None:
         meta["on_error"] = [dict(route) for route in on_error]
+    subscribes = _subscribes(on_workflow_completed, on_workflow_failed, on_event)
+    if subscribes is not None:
+        meta["subscribes"] = subscribes
     return meta
 
 
@@ -195,6 +242,9 @@ def workflow(
     requires: Optional[List[str]] = None,
     origin: Optional[str] = None,
     on_error: Optional[List[Dict[str, str]]] = None,
+    on_workflow_completed: Any = None,
+    on_workflow_failed: Any = None,
+    on_event: Any = None,
 ) -> Callable[[type], type]:
     """Declare a class as the workflow ``name``, with what a worker announces about it (the same
     options as ``Worker.workflow``). It registers nothing: hand an instance to ``worker.register`` —
@@ -212,9 +262,19 @@ def workflow(
 
     The class is a workflow reference from here on, for ``ctx.start_child`` / ``ctx.all_settled``."""
 
+    meta = _workflow_meta(
+        version,
+        requires,
+        origin,
+        on_error,
+        on_workflow_completed,
+        on_workflow_failed,
+        on_event,
+    )
+
     def declare(cls: type) -> type:
         setattr(cls, _WORKFLOW_NAME, name)
-        setattr(cls, _WORKFLOW_META, _workflow_meta(version, requires, origin, on_error))
+        setattr(cls, _WORKFLOW_META, dict(meta))
         return cls
 
     return declare
@@ -999,18 +1059,30 @@ class WorkflowWorker:
         requires: Optional[List[str]] = None,
         origin: Optional[str] = None,
         on_error: Optional[List[Dict[str, str]]] = None,
+        on_workflow_completed: Any = None,
+        on_workflow_failed: Any = None,
+        on_event: Any = None,
     ) -> Callable[[Any], Any]:
         """Decorator registering ``fn`` as the workflow ``name``. ``fn(ctx, input)`` (or ``fn(ctx)``).
 
-        ``version`` / ``requires`` / ``origin`` are announcement metadata only, and ``on_error`` the
-        routes the engine applies to a failed run — identical in meaning to
+        ``version`` / ``requires`` / ``origin`` are announcement metadata only, ``on_error`` the
+        routes the engine applies to a failed run, and ``on_workflow_completed`` /
+        ``on_workflow_failed`` / ``on_event`` the events that start it — identical in meaning to
         :meth:`durable_worker.worker.Worker.workflow`'s (design §7.9), and equally optional. It
         decorates a function or a class, exactly as :meth:`durable_worker.worker.Worker.workflow` does."""
 
+        meta = _workflow_meta(
+            version,
+            requires,
+            origin,
+            on_error,
+            on_workflow_completed,
+            on_workflow_failed,
+            on_event,
+        )
+
         def register(target: Any) -> Any:
-            return _register_workflow(
-                self, name, target, _workflow_meta(version, requires, origin, on_error)
-            )
+            return _register_workflow(self, name, target, meta)
 
         return register
 

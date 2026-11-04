@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { eventToken } from './events';
 import type { SignalWaiter, WorkflowRun } from './interfaces';
 import { breakpointToken } from './protocol';
+import { runWaitToken } from './run-wait';
 import { classifyWaiterToken, indexWaitersByRun, resolveRunWaiting } from './run-waiting';
 
 function run(over: Partial<WorkflowRun> = {}): WorkflowRun {
@@ -22,6 +23,15 @@ function waiter(over: Partial<SignalWaiter> & { token: string }): SignalWaiter {
 }
 
 describe('classifyWaiterToken', () => {
+  it('names a ctx.waitForRun wait by the run it waits on', () => {
+    const token = runWaitToken('ingest#7', 'w#1', 3);
+    expect(classifyWaiterToken(token, { runId: 'w#1', seq: 3 })).toEqual({
+      on: 'run',
+      name: 'ingest#7',
+    });
+    expect(classifyWaiterToken(runWaitToken('i1', 'w1', 0))).toEqual({ on: 'run', name: 'i1' });
+  });
+
   it('classifies a webhook token (wh:<runId>:<seq>)', () => {
     expect(classifyWaiterToken('wh:r1:0')).toEqual({ on: 'webhook', name: 'wh:r1:0' });
   });

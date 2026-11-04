@@ -2,6 +2,9 @@ import { defineTelescopeExtension } from '@dudousxd/nestjs-telescope';
 import { durableDashboard } from './durable-dashboard.spec-data';
 import {
   durableDurationProvider,
+  durableFailedTriggersProvider,
+  durableLifecycleTriggersProvider,
+  durableOwedLifecycleProvider,
   durableRecentFailuresProvider,
   durableRunsOverTimeProvider,
   durableStateBreakdownProvider,
@@ -34,6 +37,9 @@ export function durableTelescopeExtension(
       durableSuccessRateProvider(),
       durableThroughputProvider(),
       durableStateBreakdownProvider(),
+      durableFailedTriggersProvider(),
+      durableOwedLifecycleProvider(),
+      durableLifecycleTriggersProvider(),
     ],
   });
 }

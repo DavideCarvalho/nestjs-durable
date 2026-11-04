@@ -6,6 +6,7 @@ import {
   type CheckpointStat,
   type ChildWait,
   ENGINE_MINTED_TAG_PREFIXES,
+  LIFECYCLE_REGISTRY_WORKFLOW,
   type OwnedLeaseReclaim,
   RUN_VALUE_FACET_LIMIT,
   type RetentionPolicy,
@@ -35,6 +36,7 @@ import {
   mergeRunFacetRows,
   normalizeAttributeRows,
   parseDuration,
+  retentionKeeps,
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
   singletonClaimantIds,
@@ -93,6 +95,12 @@ import {
   WorkflowRunEntity,
 } from './entities';
 import { type DurableSchemaLogger, ensureMikroOrmDurableSchema } from './schema';
+
+/**
+ * Workflows a retention policy never sees: lifecycle registry runs are neither pruned nor counted
+ * toward `maxCount`.
+ */
+const RETENTION_EXCLUDED = [LIFECYCLE_REGISTRY_WORKFLOW];
 
 /** Options for scoping a `MikroOrmStateStore` to a single tenant namespace. */
 export interface MikroOrmStateStoreOptions {
@@ -348,10 +356,12 @@ export class MikroOrmStateStore implements StateStore {
     const idCol = meta.properties.id?.fieldNames?.[0] ?? 'id';
     // A scoped policy only ever sees (and, for maxCount, counts) the runs its scope matches — the same
     // predicates (tag LIKE, attribute EXISTS) listRuns applies, via the shared query builder.
-    const query = { ...(policy.scope ?? {}), statuses };
+    const query = { ...(policy.scope ?? {}), statuses, excludeWorkflows: RETENTION_EXCLUDED };
+    const tagsCol = meta.properties.tags?.fieldNames?.[0] ?? 'tags';
     const scoped = (extra?: Record<string, unknown>) =>
       this.runQueryBuilder(em, query, { ...this.runWhere(query), ...(extra ?? {}) }).select([
         `r.${idCol}`,
+        `r.${tagsCol}`,
       ]);
     // Collect ids that violate EITHER bound (most-restrictive keep): too old, or past the count cap.
     const ids = new Set<string>();
@@ -361,8 +371,11 @@ export class MikroOrmStateStore implements StateStore {
       const rows = await scoped({ updatedAt: { $lt: cutoff } })
         .orderBy({ 'r.updatedAt': 'asc' }) // oldest first
         .limit(limit)
-        .execute<Array<Record<string, string>>>();
-      for (const r of rows) ids.add(String(r[idCol] ?? r.id));
+        .execute<Array<Record<string, unknown>>>();
+      // A run whose lifecycle event is still owed is kept until it is published.
+      for (const r of rows) {
+        if (!retentionKeeps(r[tagsCol] ?? r.tags)) ids.add(String(r[idCol] ?? r.id));
+      }
     }
 
     if (policy.maxCount != null && ids.size < limit) {
@@ -371,10 +384,10 @@ export class MikroOrmStateStore implements StateStore {
         .orderBy({ 'r.updatedAt': 'desc', 'r.id': 'desc' })
         .limit(limit)
         .offset(policy.maxCount)
-        .execute<Array<Record<string, string>>>();
+        .execute<Array<Record<string, unknown>>>();
       for (const r of rows) {
         if (ids.size >= limit) break;
-        ids.add(String(r[idCol] ?? r.id));
+        if (!retentionKeeps(r[tagsCol] ?? r.tags)) ids.add(String(r[idCol] ?? r.id));
       }
     }
 
@@ -635,6 +648,7 @@ export class MikroOrmStateStore implements StateStore {
     const and: Record<string, unknown>[] = [];
     if (query.workflow) where.workflow = query.workflow;
     if (query.workflows) and.push({ workflow: { $in: query.workflows } });
+    if (query.excludeWorkflows?.length) and.push({ workflow: { $nin: query.excludeWorkflows } });
     if (query.namespace !== undefined) where.namespace = query.namespace;
     if (query.namespaces) and.push({ namespace: { $in: query.namespaces } });
     // Plain equality on the origin column, exactly like `namespace` above. A run whose origin is NULL

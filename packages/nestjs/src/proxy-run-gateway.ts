@@ -4,6 +4,8 @@ import type {
   FanPage,
   FanPageQuery,
   GroupHealth,
+  RepublishLifecycleResult,
+  RepublishLifecycleTarget,
   RunDetail,
   RunDetailOptions,
   RunFacetQuery,
@@ -20,6 +22,7 @@ import type {
   RunWaiting,
   TenantTokenSource,
   Transport,
+  WorkflowLifecycleLinks,
   WorkflowRun,
 } from '@dudousxd/nestjs-durable-core';
 import {
@@ -285,6 +288,43 @@ export class ProxyRunGateway implements RunGateway {
       kind: 'redispatch',
       runId,
     });
+  }
+
+  /**
+   * Republished on the control plane: a one-run target is checked against this tenant like
+   * `retry`, a by-workflow one is read over this tenant's namespace only. A control plane too old to
+   * know the verb fails it with an {@link UNSUPPORTED_RUN_REQUEST} error rather than a timeout.
+   */
+  republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult> {
+    return this.requestNewVerb<RepublishLifecycleResult>({ kind: 'republishLifecycle', target });
+  }
+
+  /** Answered by the control plane's engine; same version-skew error as {@link republishLifecycle}. */
+  workflowLifecycle(workflow: string): Promise<WorkflowLifecycleLinks> {
+    return this.requestNewVerb<WorkflowLifecycleLinks>({ kind: 'workflowLifecycle', workflow });
+  }
+
+  /**
+   * A verb with no fallback on an older control plane: its unsupported-request error, or the empty
+   * `ok: true` reply the oldest responders send for an unknown verb, becomes a
+   * {@link RunGatewayError} with code {@link UNSUPPORTED_RUN_REQUEST}.
+   */
+  private async requestNewVerb<T>(body: RunRequestKind): Promise<T> {
+    const notSupported = () =>
+      new RunGatewayError(
+        `${body.kind} is not supported by this server: the control plane is older than this tenant`,
+        UNSUPPORTED_RUN_REQUEST,
+      );
+    if (this.knownUnsupported(body.kind)) throw notSupported();
+    let data: T | undefined;
+    try {
+      data = await this.request<T | undefined>(body);
+    } catch (err) {
+      if (!isUnsupported(err)) throw err;
+    }
+    if (data !== undefined && data !== null) return data;
+    this.unsupportedUntil.set(body.kind, Date.now() + this.capabilityTtlMs);
+    throw notSupported();
   }
 
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void {

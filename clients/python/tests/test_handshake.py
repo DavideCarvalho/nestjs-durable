@@ -608,3 +608,120 @@ def test_the_announced_sdk_version_is_the_installed_one():
     assert _build_descriptor(worker, None, "default", lambda n: n).sdk["version"] == version(
         "durable-worker"
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# Announced event subscriptions — what starts a Python workflow on another workflow's lifecycle event.
+# --------------------------------------------------------------------------------------------------
+
+# Pinned in the TS conformance test too (packages/core/src/handshake/fixtures.contract.spec.ts).
+GOLDEN_SUBSCRIBES_HASH = "3d2e720196c1c893"
+
+
+def test_golden_subscribes_fixture_round_trips_and_hashes_identically():
+    raw = _read_raw("descriptor-subscribes.json")
+    parsed = WorkerDescriptor.from_wire(json.loads(raw))
+    assert [(r.name, r.subscribes) for r in parsed.registrations] == [
+        ("notify", ["run.completed:ingest", "run.failed:ingest"]),
+        ("on-order", ["order.placed"]),
+    ]
+    assert json.dumps(parsed.to_wire(), indent=2) + "\n" == raw
+    assert descriptor_hash(parsed) == GOLDEN_SUBSCRIBES_HASH
+
+
+def test_subscribes_hash_the_same_in_any_order_and_absent_changes_nothing():
+    forward = _make_descriptor(
+        registrations=[WorkflowRegistration(name="p", subscribes=["a", "b"])]
+    )
+    backward = _make_descriptor(
+        registrations=[WorkflowRegistration(name="p", subscribes=["b", "a", "a"])]
+    )
+    assert descriptor_hash(forward) == descriptor_hash(backward)
+    assert descriptor_hash(forward) != descriptor_hash(
+        _make_descriptor(registrations=[WorkflowRegistration(name="p")])
+    )
+    assert "subscribes" not in WorkflowRegistration(name="p").to_wire()
+
+
+def test_a_python_workflow_announces_the_lifecycle_events_it_subscribes_to():
+    from durable_worker import Worker, run_completed_event, run_failed_event
+    from durable_worker.redis_runner import _build_descriptor
+
+    worker = Worker(auto_register=False)
+
+    @worker.workflow("notify", on_workflow_completed="ingest", on_workflow_failed=["ingest", "crawl"])
+    def _notify(_ctx, _event):
+        return None
+
+    @worker.workflow("on-order", on_event="order.placed")
+    def _on_order(_ctx, _event):
+        return None
+
+    @worker.workflow("both", on_workflow_completed="ingest", on_event=["order.placed", "run.completed:ingest"])
+    def _both(_ctx, _event):
+        return None
+
+    @worker.workflow("plain")
+    def _plain(_ctx):
+        return None
+
+    wire = _build_descriptor(worker, None, "default", lambda name: name).to_wire()
+    assert wire["registrations"] == [
+        {"name": "both", "group": "both", "subscribes": ["order.placed", "run.completed:ingest"]},
+        {
+            "name": "notify",
+            "group": "notify",
+            "subscribes": ["run.completed:ingest", "run.failed:crawl", "run.failed:ingest"],
+        },
+        {"name": "on-order", "group": "on-order", "subscribes": ["order.placed"]},
+        {"name": "plain", "group": "plain"},
+    ]
+    assert run_completed_event("ingest") == "run.completed:ingest"
+    assert run_failed_event("ingest") == "run.failed:ingest"
+
+
+def test_lifecycle_subscriptions_take_a_workflow_class_and_work_on_every_decorator():
+    from durable_worker import Worker, WorkflowWorker, workflow
+    from durable_worker.redis_runner import _build_descriptor
+
+    @workflow("ingest")
+    class Ingest:
+        def run(self, ctx, data):
+            return data
+
+    @workflow("report", on_workflow_completed=Ingest)
+    class Report:
+        def run(self, ctx, event):
+            return event["runId"]
+
+    worker = Worker(auto_register=False)
+    worker.register(Ingest)
+    worker.register(Report)
+    by_name = {
+        r["name"]: r
+        for r in _build_descriptor(worker, None, "default", lambda n: n).to_wire()["registrations"]
+    }
+    assert by_name["report"]["subscribes"] == ["run.completed:ingest"]
+    assert "subscribes" not in by_name["ingest"]
+
+    split = WorkflowWorker(group="py", auto_register=False)
+
+    @split.workflow("audit", on_workflow_failed=Ingest)
+    def _audit(_ctx, _event):
+        return None
+
+    assert split._workflow_meta["audit"]["subscribes"] == ["run.failed:ingest"]
+
+
+def test_lifecycle_subscriptions_reject_what_is_not_a_workflow_or_event_name():
+    import pytest
+
+    from durable_worker import Worker
+
+    worker = Worker(auto_register=False)
+    with pytest.raises(TypeError, match="on_workflow_completed"):
+        worker.workflow("bad", on_workflow_completed=3)
+    with pytest.raises(TypeError, match="on_event"):
+        worker.workflow("bad", on_event=["ok", ""])
+    with pytest.raises(TypeError):
+        worker.workflow("bad", on_workflow_failed=object)

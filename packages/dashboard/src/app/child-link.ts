@@ -1,4 +1,4 @@
-import type { RunDetail } from '../client/durable-client';
+import type { LifecycleSource, RunDetail } from '../client/durable-client';
 
 /**
  * If a timeline step represents a **child workflow**, return the child's run id so the graph can link
@@ -15,6 +15,26 @@ export function childRunIdOf(step: { name: string }): string | undefined {
   if (step.name.startsWith(SPAWN)) return step.name.slice(SPAWN.length);
   if (step.name.startsWith(AWAITED)) return step.name.slice(AWAITED.length);
   return undefined;
+}
+
+/**
+ * If a timeline step is a `ctx.waitForRun`, the run it waits on: the delivered wait's
+ * `signal:runwait:<target>#<runId>#<seq>` checkpoint (read against the step's own run and seq, so a
+ * target containing `#` reads exactly), or the timed wait's `timeout:run:<target>` deadline.
+ */
+export function runWaitTargetOfStep(step: {
+  name: string;
+  runId: string;
+  seq: number;
+}): string | undefined {
+  const DELIVERED = 'signal:runwait:';
+  const DEADLINE = 'timeout:run:';
+  if (step.name.startsWith(DEADLINE)) return step.name.slice(DEADLINE.length) || undefined;
+  if (!step.name.startsWith(DELIVERED)) return undefined;
+  const rest = step.name.slice(DELIVERED.length);
+  const suffix = `#${step.runId}#`;
+  const at = rest.lastIndexOf(suffix);
+  return at > 0 ? rest.slice(0, at) : undefined;
 }
 
 /**
@@ -60,6 +80,20 @@ export function childChips(
 ): { shown: string[]; more: number } {
   const shown = children.slice(0, limit);
   return { shown, more: Math.max(0, (childCount ?? children.length) - shown.length) };
+}
+
+/**
+ * The lifecycle-trigger links a run header lists: the run whose settling started this one, and the
+ * runs this one's settling started. Neither is a child: they are not cancelled or awaited together.
+ */
+export function triggerChips(detail: {
+  triggered?: readonly string[] | undefined;
+  triggeredBy?: LifecycleSource | undefined;
+}): { startedBy?: LifecycleSource; triggered: string[] } {
+  return {
+    ...(detail.triggeredBy ? { startedBy: { ...detail.triggeredBy } } : {}),
+    triggered: [...(detail.triggered ?? [])],
+  };
 }
 
 /**

@@ -189,6 +189,7 @@ def _build_descriptor(
             requires=meta.get(name, {}).get("requires"),
             origin=meta.get(name, {}).get("origin"),
             on_error=meta.get(name, {}).get("on_error"),
+            subscribes=meta.get(name, {}).get("subscribes"),
         )
         for name in workflows
     ]

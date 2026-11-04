@@ -2,14 +2,22 @@ import {
   type ConcurrencyConfig,
   DURABLE_STEP_CONFIG,
   DURABLE_STEP_NAME,
+  type EventBatchConfig,
+  type LifecycleEventOf,
   type OnErrorInput,
+  type OnEventEntry,
   type SearchAttributesSchema,
   type SingletonConfig,
   type StepConfig,
   type StepError,
   WORKFLOW_NAME_KEY,
+  type WorkflowClass,
   type WorkflowCtx,
+  type WorkflowLifecycleEvent,
   type WorkflowRef,
+  parseDuration,
+  runCompletedEvent,
+  runFailedEvent,
 } from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
 import { declaringFile, rememberDeclaringFile } from './origin';
@@ -41,8 +49,8 @@ export interface WorkflowMeta {
   validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
   /** Typed/validated `searchAttributes` shape. See `WorkflowOptions`. */
   searchAttributes?: SearchAttributesSchema | undefined;
-  /** Event names that start a fresh run of this workflow. See `WorkflowOptions`. */
-  onEvent?: string[] | undefined;
+  /** Events that start a fresh run of this workflow. See `WorkflowOptions`. */
+  onEvent?: OnEventEntry[] | undefined;
   /** Debounce `onEvent` triggers — fire once it's quiet for this long. See `WorkflowOptions`. */
   debounce?: string | number | undefined;
   /** Batch `onEvent` triggers — fire on size or window. See `WorkflowOptions`. */
@@ -172,9 +180,10 @@ export interface WorkflowOptions {
    * Start a fresh run of this workflow whenever any of these events is published via
    * `publishEvent(name, payload)` — the payload becomes the run's input. e.g.
    * `onEvent: ['user.registered', 'user.invited']`. The same subscription can also be declared with
-   * the `@OnDurableEvent(...)` class decorator; the two are merged.
+   * the `@OnDurableEvent(...)` class decorator; the two are merged. An entry can also be
+   * `{ event, where }`, where `where(payload)` decides per event whether this workflow starts.
    */
-  onEvent?: string[];
+  onEvent?: OnEventEntry[];
   /**
    * Coalesce `onEvent` triggers by **debouncing** — start one run only once events have been quiet
    * for this long (resets on each event), with the LAST payload. e.g. `debounce: '30s'`.
@@ -484,19 +493,261 @@ export const ON_EVENT_METADATA = Symbol('nestjs-durable:on-event');
  * Named "durable" on purpose: `@nestjs/event-emitter` exports an `@OnEvent` decorator, and in an
  * app using both libs an auto-import picking the wrong one fails silently in either direction.
  */
-export function OnDurableEvent(...events: string[]): ClassDecorator {
-  return (target) => {
-    const existing = (Reflect.getMetadata(ON_EVENT_METADATA, target) as string[] | undefined) ?? [];
-    Reflect.defineMetadata(ON_EVENT_METADATA, [...existing, ...events], target);
+export function OnDurableEvent(...events: OnEventEntry[]): ClassDecorator {
+  return (target) => addEventSubscriptions(target, events);
+}
+
+/**
+ * Coalesce a subscriber's triggers by **debouncing**: start it once events have been quiet for
+ * `windowMs`, with the last one. `key` splits that per key: it receives the subscriber's input (what
+ * `input` builds), and each distinct key debounces on its own.
+ */
+export interface SubscriberDebounce<TRunInput> {
+  windowMs: number | string;
+  key?: ((input: TRunInput) => string) | undefined;
+}
+
+/**
+ * Coalesce a subscriber's triggers by **batching**: start it with `{ events }` once `maxSize` arrive
+ * or `windowMs` passes since the first. `key` batches each distinct key on its own.
+ */
+export interface SubscriberBatch<TRunInput> {
+  maxSize: number;
+  windowMs: number | string;
+  key?: ((input: TRunInput) => string) | undefined;
+}
+
+/** Options for {@link OnWorkflowCompleted} / {@link OnWorkflowFailed}. */
+export interface OnWorkflowSettledOptions<TEvent, TRunInput> {
+  /** Start only for the settled runs this returns true for, e.g. by `input` or `searchAttributes`. */
+  where?: ((event: TEvent) => boolean) | undefined;
+  /**
+   * The started run's input, built from the event. Without it the run receives the
+   * {@link WorkflowLifecycleEvent} itself. Lets an existing workflow subscribe with its own input
+   * shape, and keeps the settled run's whole input and output out of the new run's row.
+   */
+  input?: ((event: TEvent) => TRunInput) | undefined;
+  /**
+   * Debounce this workflow's triggers (see {@link SubscriberDebounce}). Sets the workflow's
+   * `onEvent` coalescing, so it applies to every event it subscribes to; a different `debounce` or
+   * `batch` already declared on it fails at registration. Not with `batch`.
+   */
+  debounce?: SubscriberDebounce<TRunInput> | undefined;
+  /**
+   * Batch this workflow's triggers (see {@link SubscriberBatch}); the run's input becomes
+   * `{ events: TRunInput[] }`. Same scope and conflicts as `debounce`. Not with `debounce`.
+   */
+  batch?: SubscriberBatch<TRunInput> | undefined;
+}
+
+/** Options for {@link OnWorkflowFailed}: also which endings start the subscriber. */
+export interface OnWorkflowFailedOptions<TEvent, TRunInput>
+  extends OnWorkflowSettledOptions<TEvent, TRunInput> {
+  /** The endings that start it. Defaults to all three: `failed`, `cancelled` and `dead`. */
+  statuses?: Array<'failed' | 'cancelled' | 'dead'> | undefined;
+}
+
+/** `O` with a required `batch` (and no `debounce`): the overload whose subscriber takes `{ events }`. */
+type Batched<O, TRunInput> = O & { batch: SubscriberBatch<TRunInput>; debounce?: undefined };
+/** `O` without `batch`: the overload whose subscriber takes `TRunInput` itself. */
+type Unbatched<O> = O & { batch?: undefined };
+
+/**
+ * A class decorator that only accepts a workflow whose `run(ctx, input)` takes `TRunInput`, so a
+ * subscriber with the wrong input shape fails to compile instead of failing at runtime.
+ */
+export type SubscriberDecorator<TRunInput> = <
+  T extends abstract new (
+    ...args: never[]
+  ) => { run: (ctx: never, input: TRunInput) => unknown },
+>(
+  target: T,
+) => void;
+
+/**
+ * Start a fresh run of the decorated workflow whenever a run of `workflow` **completes**. The new
+ * run's input is the {@link WorkflowLifecycleEvent} (run id, input, output, tags, search
+ * attributes), or what `input` builds from it. The settling workflow does not know about its
+ * subscribers. Exactly once per settled run: see `runCompletedEvent` in
+ * `@dudousxd/nestjs-durable-core`.
+ *
+ * With a class ref, the decorated workflow's `run` input is type-checked against the event (or
+ * against `input`'s return type, or `{ events }` of it with `batch`). Child runs publish too, so a
+ * workflow that `etl` starts as a child also starts its subscribers.
+ *
+ * ```ts
+ * @Workflow({ name: 'refresh-summaries' })
+ * @OnWorkflowCompleted(IngestionWorkflow, {
+ *   where: (e) => e.input.type === 'mvr',
+ *   input: (e) => ({ baseId: e.input.baseId }),
+ *   debounce: { windowMs: '30s', key: (input) => input.baseId },
+ * })
+ * class RefreshSummariesWorkflow {
+ *   async run(ctx: WorkflowCtx, input: { baseId: string }) {}
+ * }
+ * ```
+ */
+export function OnWorkflowCompleted<C extends WorkflowClass, TRunInput = LifecycleEventOf<C>>(
+  workflow: C,
+  options: Batched<OnWorkflowSettledOptions<LifecycleEventOf<C>, TRunInput>, TRunInput>,
+): SubscriberDecorator<{ events: TRunInput[] }>;
+export function OnWorkflowCompleted<C extends WorkflowClass, TRunInput = LifecycleEventOf<C>>(
+  workflow: C,
+  options?: Unbatched<OnWorkflowSettledOptions<LifecycleEventOf<C>, TRunInput>>,
+): SubscriberDecorator<TRunInput>;
+export function OnWorkflowCompleted(
+  workflow: string,
+  options?: OnWorkflowSettledOptions<WorkflowLifecycleEvent, unknown>,
+): ClassDecorator;
+export function OnWorkflowCompleted(
+  workflow: WorkflowRef,
+  options?: OnWorkflowSettledOptions<WorkflowLifecycleEvent, unknown>,
+): ClassDecorator {
+  return onWorkflowSettled(runCompletedEvent(workflow), options?.where, options);
+}
+
+/**
+ * Start a fresh run of the decorated workflow whenever a run of `workflow` ends **failed,
+ * cancelled or dead** (narrow it with `statuses`). Same contract as {@link OnWorkflowCompleted};
+ * the event carries `error` and `status` instead of `output`.
+ */
+export function OnWorkflowFailed<C extends WorkflowClass, TRunInput = LifecycleEventOf<C>>(
+  workflow: C,
+  options: Batched<OnWorkflowFailedOptions<LifecycleEventOf<C>, TRunInput>, TRunInput>,
+): SubscriberDecorator<{ events: TRunInput[] }>;
+export function OnWorkflowFailed<C extends WorkflowClass, TRunInput = LifecycleEventOf<C>>(
+  workflow: C,
+  options?: Unbatched<OnWorkflowFailedOptions<LifecycleEventOf<C>, TRunInput>>,
+): SubscriberDecorator<TRunInput>;
+export function OnWorkflowFailed(
+  workflow: string,
+  options?: OnWorkflowFailedOptions<WorkflowLifecycleEvent, unknown>,
+): ClassDecorator;
+export function OnWorkflowFailed(
+  workflow: WorkflowRef,
+  options?: OnWorkflowFailedOptions<WorkflowLifecycleEvent, unknown>,
+): ClassDecorator {
+  const statuses = options?.statuses;
+  const where = options?.where;
+  const accepts =
+    statuses || where
+      ? (event: WorkflowLifecycleEvent) =>
+          (!statuses || (statuses as string[]).includes(event.status)) && (!where || where(event))
+      : undefined;
+  return onWorkflowSettled(runFailedEvent(workflow), accepts, options);
+}
+
+/** Metadata key for the `onEvent` coalescing `@OnWorkflowCompleted` / `@OnWorkflowFailed` declare. */
+export const ON_EVENT_BATCH_METADATA = Symbol('nestjs-durable:on-event-batch');
+
+function onWorkflowSettled(
+  event: string,
+  where: ((event: WorkflowLifecycleEvent) => boolean) | undefined,
+  options: OnWorkflowSettledOptions<WorkflowLifecycleEvent, unknown> | undefined,
+): ClassDecorator {
+  const subscription = {
+    event,
+    where: where as ((payload: unknown) => boolean) | undefined,
+    input: options?.input as ((payload: unknown) => unknown) | undefined,
   };
+  const batch = subscriberEventBatch(event, options);
+  return (target) => {
+    addEventSubscriptions(target, [subscription]);
+    if (!batch) return;
+    const existing = Reflect.getMetadata(ON_EVENT_BATCH_METADATA, target) as
+      | EventBatchConfig
+      | undefined;
+    if (existing && !sameEventBatch(existing, batch)) {
+      throw new Error(
+        `${(target as { name?: string }).name ?? 'workflow'}: two lifecycle subscriptions declare different debounce/batch settings; a workflow coalesces all its triggers one way`,
+      );
+    }
+    Reflect.defineMetadata(ON_EVENT_BATCH_METADATA, batch, target);
+  };
+}
+
+/** The workflow-level coalescing a lifecycle subscription's `debounce` / `batch` option maps to. */
+function subscriberEventBatch(
+  event: string,
+  options: OnWorkflowSettledOptions<WorkflowLifecycleEvent, unknown> | undefined,
+): EventBatchConfig | undefined {
+  if (options?.debounce && options.batch) {
+    throw new Error(`${event}: a subscription takes debounce or batch, not both`);
+  }
+  if (options?.debounce) {
+    return {
+      mode: 'debounce',
+      windowMs: parseDuration(options.debounce.windowMs),
+      ...(options.debounce.key ? { key: options.debounce.key } : {}),
+    };
+  }
+  if (options?.batch) {
+    return {
+      mode: 'batch',
+      maxSize: options.batch.maxSize,
+      windowMs: parseDuration(options.batch.windowMs),
+      ...(options.batch.key ? { key: options.batch.key } : {}),
+    };
+  }
+  return undefined;
+}
+
+function sameEventBatch(a: EventBatchConfig, b: EventBatchConfig): boolean {
+  return (
+    a.mode === b.mode &&
+    a.windowMs === b.windowMs &&
+    a.key === b.key &&
+    (a.mode !== 'batch' || b.mode !== 'batch' || a.maxSize === b.maxSize)
+  );
+}
+
+/**
+ * How a workflow coalesces its `onEvent` triggers: `@Workflow({ debounce | batch })`, or what its
+ * `@OnWorkflowCompleted` / `@OnWorkflowFailed` declare. Throws when both are set and differ, so a
+ * workflow never silently coalesces one way while its decorator says another.
+ */
+export function eventBatchOf(meta: WorkflowMeta, target: object): EventBatchConfig | undefined {
+  const declared: EventBatchConfig | undefined = meta.debounce
+    ? { mode: 'debounce', windowMs: parseDuration(meta.debounce) }
+    : meta.batch
+      ? {
+          mode: 'batch',
+          maxSize: meta.batch.maxSize,
+          windowMs: parseDuration(meta.batch.within),
+        }
+      : undefined;
+  const fromSubscription = Reflect.getMetadata(ON_EVENT_BATCH_METADATA, target) as
+    | EventBatchConfig
+    | undefined;
+  if (declared && fromSubscription && !sameEventBatch(declared, fromSubscription)) {
+    throw new Error(
+      `workflow ${meta.name}: @Workflow declares ${declared.mode} but a lifecycle subscription declares a different ${fromSubscription.mode}; declare it in one place`,
+    );
+  }
+  return fromSubscription ?? declared;
+}
+
+function addEventSubscriptions(target: object, entries: OnEventEntry[]): void {
+  const existing =
+    (Reflect.getMetadata(ON_EVENT_METADATA, target) as OnEventEntry[] | undefined) ?? [];
+  Reflect.defineMetadata(ON_EVENT_METADATA, [...existing, ...entries], target);
 }
 
 /** @deprecated Renamed to `OnDurableEvent` — this alias clashes with `@nestjs/event-emitter`'s `@OnEvent` and will be removed in the next minor. */
 export const OnEvent = OnDurableEvent;
 
-/** All events a workflow class subscribes to — the union of `@Workflow({ onEvent })` and `@OnDurableEvent`. */
-export function getOnEvents(meta: WorkflowMeta, target: object): string[] {
+/**
+ * All events a workflow class subscribes to: `@Workflow({ onEvent })`, `@OnDurableEvent`,
+ * `@OnWorkflowCompleted` and `@OnWorkflowFailed`. Repeated bare names collapse to one.
+ */
+export function getOnEvents(meta: WorkflowMeta, target: object): OnEventEntry[] {
   const fromDecorator =
-    (Reflect.getMetadata(ON_EVENT_METADATA, target) as string[] | undefined) ?? [];
-  return [...new Set([...(meta.onEvent ?? []), ...fromDecorator])];
+    (Reflect.getMetadata(ON_EVENT_METADATA, target) as OnEventEntry[] | undefined) ?? [];
+  const names = new Set<string>();
+  return [...(meta.onEvent ?? []), ...fromDecorator].filter((entry) => {
+    if (typeof entry !== 'string') return true;
+    if (names.has(entry)) return false;
+    names.add(entry);
+    return true;
+  });
 }

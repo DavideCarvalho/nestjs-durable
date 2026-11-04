@@ -1,5 +1,6 @@
 import { EVENT_TOKEN_PREFIX, eventNameOf } from './events';
 import type { RunWaiting, SignalWaiter, StateStore, WorkflowRun } from './interfaces';
+import { RUN_WAIT_TOKEN_PREFIX, runWaitTargetOf } from './run-wait';
 
 // Waiter-token prefixes the engine stamps (see `workflow-ctx.ts`): a webhook mints `wh:<runId>:<seq>`,
 // an awaited child parks on `child:<id>`, a `ctx.breakpoint` mints `bp:<runId>:<seq>` (see
@@ -36,8 +37,20 @@ export function parseWebhookToken(token: string): { runId: string; seq: number }
  * like any other), so without this case it would fall through to the generic `signal` branch with the
  * raw `bp:<runId>:<seq>` token as its display name — a real bug. Named `'breakpoint'` here instead;
  * the token carries no separate label to recover cheaply (see {@link RunWaiting.name}).
+ *
+ * A `ctx.waitForRun` token (`runwait:<target>#<runId>#<seq>`) is named by its target run, read
+ * exactly against `waiter` when given, else from the token alone.
  */
-export function classifyWaiterToken(token: string): RunWaiting {
+export function classifyWaiterToken(
+  token: string,
+  waiter?: Pick<SignalWaiter, 'runId' | 'seq'>,
+): RunWaiting {
+  if (token.startsWith(RUN_WAIT_TOKEN_PREFIX)) {
+    const target = waiter
+      ? runWaitTargetOf({ token, ...waiter })
+      : token.slice(RUN_WAIT_TOKEN_PREFIX.length).match(/^(.*)#[^#]*#\d+$/)?.[1];
+    if (target) return { on: 'run', name: target };
+  }
   if (token.startsWith(WEBHOOK_PREFIX)) return { on: 'webhook', name: token };
   if (token.startsWith(BREAKPOINT_PREFIX)) return { on: 'breakpoint', name: 'breakpoint' };
   if (token.startsWith(CHILD_PREFIX))
@@ -59,7 +72,7 @@ export function resolveRunWaiting(
 ): RunWaiting | undefined {
   if (run.status !== 'suspended') return undefined;
   const waiter = waiterByRun.get(run.id);
-  return waiter ? classifyWaiterToken(waiter.token) : undefined;
+  return waiter ? classifyWaiterToken(waiter.token, waiter) : undefined;
 }
 
 const RUN_ID_BATCH = 500;

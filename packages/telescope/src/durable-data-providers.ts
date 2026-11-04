@@ -1,4 +1,9 @@
-import { STATE_STORE_CANONICAL, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  LIFECYCLE_PENDING_TAG,
+  STATE_STORE_CANONICAL,
+  WorkflowEngine,
+  owedSubscribersOf,
+} from '@dudousxd/nestjs-durable-core';
 import type { RunStatus, StateStore, WorkerStatus } from '@dudousxd/nestjs-durable-core';
 import type { DataProvider, ExtensionContext } from '@dudousxd/nestjs-telescope';
 import { TELESCOPE_STORAGE } from '@dudousxd/nestjs-telescope';
@@ -642,3 +647,158 @@ export function durableStateBreakdownProvider(): DataProvider {
 // StateStore only exposes `listCheckpoints(runId: string)` (per-run lookup), with no cross-run
 // query by step `attempts`. There is no API to enumerate all step checkpoints across runs without
 // first listing every run — which would be O(N*M) and impractical. Task 13 should omit that panel.
+
+// ─── Lifecycle events ─────────────────────────────────────────────────────────
+
+/** Compact UTC stamp ("YYYY-MM-DD HH:mm Z") for a table cell; the table prints values as-is. */
+function stamp(at: Date | string | undefined): string {
+  return at ? `${new Date(at).toISOString().replace('T', ' ').slice(0, 16)}Z` : '';
+}
+
+/**
+ * The recorded `run.trigger_failed` entries, newest first, one per (run, subscriber): every pod
+ * records the event, so the same failure is otherwise listed once per pod.
+ */
+async function triggerFailures(ctx: ExtensionContext, limit: number): Promise<StorageEntry[]> {
+  const seen = new Set<string>();
+  const out: StorageEntry[] = [];
+  for (const entry of await fetchRunEntries(ctx, ['run.trigger_failed'], limit)) {
+    const c = (entry.content ?? {}) as { event?: string; runId?: string; name?: string };
+    if (c.event !== 'run.trigger_failed') continue;
+    const key = `${c.runId}\u0000${c.name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * "Failed triggers": the latest lifecycle subscribers a settled run could not start
+ * (`run.trigger_failed`), from the recorded entries. `query.limit` rows (default 50), within
+ * `query.windowMs` (default 24h, `0` for all).
+ */
+export function durableFailedTriggersProvider(): DataProvider {
+  return {
+    name: 'durable.failedTriggers',
+    async resolve(query, ctx: ExtensionContext) {
+      const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
+      const windowMs = query?.windowMs === undefined ? 24 * 60 * 60 * 1000 : Number(query.windowMs);
+      const cutoff = windowMs > 0 ? Date.now() - windowMs : 0;
+      const rows = (await triggerFailures(ctx, RUN_EVENTS_LIMIT))
+        .filter((entry) => entryTime(entry) >= cutoff)
+        .slice(0, limit)
+        .map((entry) => {
+          const c = (entry.content ?? {}) as {
+            workflow?: string;
+            runId?: string;
+            name?: string;
+            error?: { message?: string };
+          };
+          return {
+            at: stamp(entry.createdAt),
+            workflow: c.workflow ?? '',
+            runId: c.runId ?? '',
+            subscriber: c.name ?? '',
+            error: c.error?.message ?? '',
+          };
+        });
+      return { rows };
+    },
+  };
+}
+
+/** How long after settling a run's lifecycle event is left to the live publish before it is owed. */
+const LIFECYCLE_GRACE_MS = 30_000;
+
+/**
+ * "Owed lifecycle events": settled runs still tagged `durable:lifecycle:pending` past the 30s grace
+ * the live publish has, read from the store, newest first, with the subscribers each is still owed
+ * to. `query.limit` rows (default 50); `query.metric: 'count'` returns how many there are (of the
+ * first 1000 marked) as a stat.
+ */
+export function durableOwedLifecycleProvider(): DataProvider {
+  return {
+    name: 'durable.owedLifecycle',
+    async resolve(query, ctx: ExtensionContext) {
+      const store = ctx.moduleRef.get(STATE_STORE_CANONICAL, { strict: false }) as StateStore;
+      const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
+      const cutoff = Date.now() - LIFECYCLE_GRACE_MS;
+      const runs = await store.listRuns({
+        tag: LIFECYCLE_PENDING_TAG,
+        statuses: ['completed', 'failed', 'cancelled', 'dead'],
+        limit: 1000,
+      });
+      const owed = runs.filter((run) => +new Date(run.updatedAt) <= cutoff);
+      if ((query?.metric as string) === 'count') return { value: owed.length };
+      const rows = owed
+        .sort((a, b) => +new Date(b.updatedAt) - +new Date(a.updatedAt))
+        .slice(0, limit)
+        .map((run) => ({
+          settledAt: stamp(run.updatedAt),
+          workflow: run.workflow,
+          runId: run.id,
+          owed: owedSubscribersOf(run.tags).join(', ') || 'every subscriber',
+        }));
+      return { rows };
+    },
+  };
+}
+
+/**
+ * Lifecycle triggers from the recorded `run.triggered` / `run.trigger_failed` entries, each counted
+ * once though every pod records it. By default `triggered`/`failed` counts in
+ * `query.buckets ?? 24` equal time buckets; with `query.metric: 'bySubscriber'`, the subscriber runs
+ * started per `<workflow> → <subscriber>`, most first (`query.limit`, default 10).
+ */
+export function durableLifecycleTriggersProvider(): DataProvider {
+  return {
+    name: 'durable.lifecycleTriggers',
+    async resolve(query, ctx: ExtensionContext) {
+      const seen = new Set<string>();
+      const entries = (await fetchRunEntries(ctx, ['run.triggered', 'run.trigger_failed'])).filter(
+        (entry) => {
+          const c = (entry.content ?? {}) as { event?: string; runId?: string; name?: string };
+          if (c.event !== 'run.triggered' && c.event !== 'run.trigger_failed') return false;
+          const key = `${c.event}\u0000${c.runId}\u0000${c.name}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        },
+      );
+      if ((query?.metric as string) === 'bySubscriber') {
+        const limit = Math.max(1, Number(query?.limit ?? 10));
+        const counts = new Map<string, number>();
+        for (const entry of entries) {
+          const c = (entry.content ?? {}) as { event?: string; workflow?: string; name?: string };
+          if (c.event !== 'run.triggered') continue;
+          const label = `${c.workflow ?? 'unknown'} → ${c.name ?? 'unknown'}`;
+          counts.set(label, (counts.get(label) ?? 0) + 1);
+        }
+        const items = [...counts]
+          .map(([label, value]) => ({ label, value }))
+          .sort((a, b) => b.value - a.value || a.label.localeCompare(b.label))
+          .slice(0, limit);
+        return { items };
+      }
+      const n = Math.max(1, Number((query as Record<string, unknown>)?.buckets ?? 24));
+      const now = Date.now();
+      let minT = now;
+      for (const entry of entries) if (entry.createdAt) minT = Math.min(minT, entryTime(entry));
+      const bucketSize = Math.max(now - minT, 1) / n;
+      const rows = Array.from({ length: n }, (_, i) => ({
+        label: new Date(minT + i * bucketSize).toISOString().slice(11, 16),
+        triggered: 0,
+        failed: 0,
+      }));
+      for (const entry of entries) {
+        const index = Math.floor((entryTime(entry) - minT) / bucketSize);
+        const row = rows[Math.min(n - 1, Math.max(0, index))];
+        if (!row) continue;
+        if ((entry.content as { event?: string }).event === 'run.triggered') row.triggered += 1;
+        else row.failed += 1;
+      }
+      return { rows };
+    },
+  };
+}

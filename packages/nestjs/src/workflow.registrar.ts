@@ -20,7 +20,13 @@ import {
   type OnModuleInit,
 } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
-import { type WorkflowMeta, getOnEvents, isDeadLetterHandler, onErrorCodesOf } from './decorators';
+import {
+  type WorkflowMeta,
+  eventBatchOf,
+  getOnEvents,
+  isDeadLetterHandler,
+  onErrorCodesOf,
+} from './decorators';
 import { scanWorkflows } from './discovery-helpers';
 import type { DurableModuleOptions } from './durable.module';
 import { entityConfigFor, getEntityMeta } from './entity';
@@ -118,17 +124,9 @@ export class WorkflowRegistrar
       // `input`/`output` schemas: checked at start, and parsed around the body on every turn.
       const io = workflowIo(meta);
       const body = io.wrap((ctx, input) => workflow.run(ctx, input));
-      const eventBatch = meta.debounce
-        ? ({ mode: 'debounce', windowMs: parseDuration(meta.debounce) } as const)
-        : meta.batch
-          ? ({
-              mode: 'batch',
-              maxSize: meta.batch.maxSize,
-              windowMs: parseDuration(meta.batch.within),
-            } as const)
-          : undefined;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const workflowCtor: object = (workflow as any).constructor as object;
+      const eventBatch = eventBatchOf(meta, workflowCtor);
       // Each `@OnError` method is a durable workflow of its own, inline like an `@DeadLetter` one.
       const onError = onErrorHandlersOf(meta, workflow as unknown as object, this.metadataScanner);
       for (const [name, fn] of onError.handlers) {
