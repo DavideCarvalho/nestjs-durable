@@ -81,7 +81,8 @@ export class ApprovalController {
   `workflows.signal(token, payload)`. One token, one waiting run.
 - `ctx.waitForEvent<T>(name, { match?, timeoutMs? })` waits on a named event with optional `match`
   filtering; `workflows.publishEvent(name, payload)` fans out to every run whose `match` the payload
-  satisfies (and starts any `@OnEvent` workflows). Returns how many runs it touched.
+  satisfies (and starts any `@OnEvent` workflows whose `where` accepts the payload, with
+  `input(payload)` as the run's input when the entry maps it). Returns how many runs it touched.
 
 ```ts
 const order = await ctx.waitForEvent<Order>('order.paid', { match: { orderId: id } });
@@ -91,7 +92,8 @@ const order = await ctx.waitForEvent<Order>('order.paid', { match: { orderId: id
 ### Event-triggered workflow starts
 
 `@Workflow({ onEvent })` or `@OnEvent(...)` start a **fresh run** whenever the event is published —
-the payload becomes the run's input. `debounce` / `batch` coalesce bursts.
+the payload becomes the run's input, or `input(payload)` when the entry maps it; an entry
+`{ event, where, input }` starts only when `where(payload)` accepts it. `debounce` / `batch` coalesce bursts.
 
 ```ts
 import { Workflow, OnEvent } from '@dudousxd/nestjs-durable';
