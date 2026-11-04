@@ -688,6 +688,9 @@ export class DrizzleStateStore implements StateStore {
       query.excludeWorkflows?.length
         ? notInArray(workflowRuns.workflow, query.excludeWorkflows)
         : undefined,
+      query.updatedAfter !== undefined
+        ? gte(workflowRuns.updatedAt, query.updatedAfter)
+        : undefined,
       // The tenant boundary, ANDed with everything else. This is not only a dashboard facet: it is
       // the fourth namespace-scoped worker path, because `engine.sweepTimeouts` cancels runs past
       // their `executionTimeout` via `listRuns({ workflow, status, namespace })` — unscoped here, a

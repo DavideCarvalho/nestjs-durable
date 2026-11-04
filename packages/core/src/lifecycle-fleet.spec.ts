@@ -211,7 +211,7 @@ describe('lifecycle events owed to subscribers the fleet announces', () => {
     ]);
   });
 
-  it('leaves a run marked only pending alone on an instance with no subscriber', async () => {
+  it('resolves a run marked only pending to nobody when the fleet announces no subscriber', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     await store.createRun({
@@ -226,6 +226,6 @@ describe('lifecycle events owed to subscribers the fleet announces', () => {
     });
 
     expect(await engine.sweepLifecycleEvents(LIFECYCLE_ORPHAN_MS * 2)).toBe(0);
-    expect((await store.getRun('legacy'))?.tags).toEqual([LIFECYCLE_PENDING_TAG]);
+    expect((await store.getRun('legacy'))?.tags).toEqual([]);
   });
 });

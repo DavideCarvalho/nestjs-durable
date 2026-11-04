@@ -670,6 +670,9 @@ export class PrismaStateStore implements StateStore {
     if (query.workflow) where.workflow = query.workflow;
     if (query.workflows) and.push(anyOf(query.workflows.map((w) => ({ workflow: w }))));
     if (query.excludeWorkflows?.length) and.push({ workflow: { notIn: query.excludeWorkflows } });
+    if (query.updatedAfter !== undefined) {
+      and.push({ updatedAt: { gte: new Date(query.updatedAfter) } });
+    }
     if (query.namespaces) and.push(anyOf(query.namespaces.map((n) => ({ namespace: n }))));
     // Which library registered the workflow. Plain equality, so a run whose origin is NULL (created
     // before the column existed, or registered through a path the derivation could not classify)

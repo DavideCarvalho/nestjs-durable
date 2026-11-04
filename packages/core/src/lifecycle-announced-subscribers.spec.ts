@@ -3,6 +3,7 @@ import { WorkflowEngine } from './engine';
 import type { WorkerDescriptor } from './handshake/index';
 import type { RemoteTask, Transport, WorkflowRun, WorkflowTask } from './interfaces';
 import {
+  LIFECYCLE_HEAL_WINDOW_MS,
   LIFECYCLE_ORPHAN_MS,
   LIFECYCLE_OWED_TAG_PREFIX,
   LIFECYCLE_PENDING_TAG,
@@ -333,7 +334,7 @@ describe('the lifecycle sweep is not starved by runs it cannot act on', () => {
       marked('crashed', [LIFECYCLE_PENDING_TAG, `${LIFECYCLE_OWED_TAG_PREFIX}mine`], 0),
     );
 
-    expect(await engine.sweepLifecycleEvents(60_000, 10)).toBe(1);
+    expect(await engine.sweepLifecycleEvents(LIFECYCLE_HEAL_WINDOW_MS + 60_000, 10)).toBe(1);
     await poll(
       async () => (await store.getRun('evt:crashed:completed:mine'))?.status === 'completed',
     );
@@ -353,8 +354,8 @@ describe('the lifecycle sweep is not starved by runs it cannot act on', () => {
       );
     }
 
-    expect(await engine.sweepLifecycleEvents(60_000, 2)).toBe(2);
-    expect(await engine.sweepLifecycleEvents(60_000, 10)).toBe(3);
+    expect(await engine.sweepLifecycleEvents(LIFECYCLE_HEAL_WINDOW_MS + 60_000, 2)).toBe(2);
+    expect(await engine.sweepLifecycleEvents(LIFECYCLE_HEAL_WINDOW_MS + 60_000, 10)).toBe(3);
   });
 
   it('drops orphans behind a page of runs it cannot act on', async () => {

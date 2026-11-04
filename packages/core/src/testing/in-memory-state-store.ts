@@ -545,6 +545,10 @@ export class InMemoryStateStore implements StateStore {
     if (query.excludeWorkflows?.length) {
       runs = runs.filter((r) => !query.excludeWorkflows?.includes(r.workflow));
     }
+    if (query.updatedAfter !== undefined) {
+      const after = query.updatedAfter;
+      runs = runs.filter((r) => r.updatedAt.getTime() >= after);
+    }
     if (query.status) runs = runs.filter((r) => r.status === query.status);
     if (query.statuses) runs = runs.filter((r) => query.statuses?.includes(r.status));
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));

@@ -135,6 +135,68 @@ describe('lifecycle verbs over the tenant proxy', () => {
     });
   });
 
+  it('rejects a limit that is not a positive integer, and lowers a large one to 1000', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('refresh', '1', async () => 'refreshed', {
+      onEvent: [runCompletedEvent('ingest')],
+    });
+    const targets: unknown[] = [];
+    class SpyGateway extends StoreRunGateway {
+      override republishLifecycle(target: Parameters<StoreRunGateway['republishLifecycle']>[0]) {
+        targets.push(target);
+        return super.republishLifecycle(target);
+      }
+    }
+    const w = wire();
+    new RunRequestResponder(w.controlPlaneSide, new SpyGateway(store, engine), {
+      warnWithoutVerifier: false,
+    }).start();
+    const proxy = new ProxyRunGateway(w.tenantSide, 'acme');
+
+    for (const limit of [0, -5, 2.5, Number.POSITIVE_INFINITY, '10' as unknown as number]) {
+      const error = await proxy
+        .republishLifecycle({ workflow: 'ingest', limit })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(RunGatewayError);
+      expect((error as RunGatewayError).code).toBe('bad-request');
+    }
+    expect(targets).toEqual([]);
+
+    await proxy.republishLifecycle({ workflow: 'ingest', limit: 1_000_000_000 });
+    await proxy.republishLifecycle({ workflow: 'ingest', limit: 7 });
+    await proxy.republishLifecycle({ workflow: 'ingest' });
+    expect(targets.map((t) => (t as { limit?: number }).limit)).toEqual([1000, 7, 1000]);
+  });
+
+  it('rejects a subscriber that does not subscribe in its namespace, stamping nothing', async () => {
+    const { store, w } = await controlPlane();
+    const proxy = new ProxyRunGateway(w.tenantSide, 'acme');
+
+    for (const call of [
+      () => proxy.republishLifecycle({ runId: 'a1', subscriber: 'anything' }),
+      () => proxy.republishLifecycle({ workflow: 'ingest', subscriber: 'anything' }),
+      () => proxy.republishLifecycle({ workflow: 'ingest', kind: 'failed', subscriber: 'refresh' }),
+    ]) {
+      const error = await call().catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(RunGatewayError);
+      expect((error as RunGatewayError).code).toBe('bad-request');
+      expect((error as RunGatewayError).message).toMatch(
+        /does not subscribe to run\.(completed|failed):ingest/,
+      );
+    }
+    for (const id of ['a1', 'a2']) expect((await store.getRun(id))?.tags ?? []).toEqual([]);
+    expect(await store.getRun(lifecycleRunId('a1', 'completed', 'refresh'))).toBeNull();
+
+    expect(
+      await proxy.republishLifecycle({
+        workflow: 'ingest',
+        kind: 'completed',
+        subscriber: 'refresh',
+      }),
+    ).toEqual({ runs: 2, started: 2, failed: [] });
+  });
+
   it("answers a workflow's lifecycle links, for the tenant's namespace", async () => {
     const { w } = await controlPlane();
     // The control plane registers `refresh` itself, in its own namespace (`default`).

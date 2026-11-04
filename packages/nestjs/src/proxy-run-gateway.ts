@@ -33,7 +33,7 @@ import {
   summarizeTimeline,
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
-import { UNSUPPORTED_RUN_REQUEST } from './run-request-responder';
+import { BAD_RUN_REQUEST, UNSUPPORTED_RUN_REQUEST } from './run-request-responder';
 
 /**
  * Method-shorthand signatures (not arrow-function-typed properties) are deliberate: TypeScript
@@ -50,7 +50,7 @@ interface PendingRequest {
 /**
  * An error reply from the control plane. `code` carries the reply's machine-readable reason when it
  * sent one — `unauthorized` (the tenant token was rejected), `cross-tenant` (the run belongs to
- * another tenant), ... — so a caller can tell an authentication failure from a real one, as with
+ * another tenant), `bad-request` (the request was malformed or not allowed), ... — so a caller can tell an authentication failure from a real one, as with
  * Agora's proxy.
  */
 /**
@@ -60,6 +60,7 @@ interface PendingRequest {
 export type RunGatewayErrorCode =
   | 'unauthorized'
   | 'cross-tenant'
+  | typeof BAD_RUN_REQUEST
   | typeof UNSUPPORTED_RUN_REQUEST
   | (string & {});
 

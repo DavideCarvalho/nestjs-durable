@@ -512,6 +512,8 @@ interface RunQuery {
   workflows?: string[];
   /** Leaves out the runs of these workflows; an empty set excludes nothing. */
   excludeWorkflows?: string[];
+  /** Only runs last updated at or after this epoch ms (for a settled run, when it settled). */
+  updatedAfter?: number;
   namespaces?: string[];
   origins?: (string | null)[];
   /** Exact match against a run's tags; `tags` matches a run carrying ANY of them. */

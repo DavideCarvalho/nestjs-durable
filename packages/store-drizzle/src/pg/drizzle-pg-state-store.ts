@@ -636,6 +636,9 @@ export class DrizzlePgStateStore implements StateStore {
       query.excludeWorkflows?.length
         ? notInArray(workflowRuns.workflow, query.excludeWorkflows)
         : undefined,
+      query.updatedAfter !== undefined
+        ? gte(workflowRuns.updatedAt, new Date(query.updatedAfter))
+        : undefined,
       // The tenant boundary. Also the engine's execution-timeout sweep path
       // (`listRuns({ workflow, status, namespace })`) — unscoped, it would cancel another tenant's runs.
       namespaceFilter(query.namespace),

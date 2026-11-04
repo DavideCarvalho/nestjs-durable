@@ -6,6 +6,7 @@ import {
   type GroupHealth,
   LIFECYCLE_REGISTRY_WORKFLOW,
   type LifecycleDelivery,
+  type LifecycleKind,
   type RepublishLifecycleResult,
   type RepublishLifecycleTarget,
   type RunDetail,
@@ -240,6 +241,14 @@ export class StoreRunGateway implements RunGateway {
     opts?: { namespace?: string | undefined },
   ): Promise<WorkflowLifecycleLinks> {
     return this.engine.workflowLifecycle(workflow, opts);
+  }
+
+  lifecycleSubscribers(
+    workflow: string,
+    kind: LifecycleKind,
+    namespace: string,
+  ): Promise<string[]> {
+    return this.engine.lifecycleSubscribers(workflow, kind, namespace);
   }
 
   getRun(runId: string): Promise<WorkflowRun | null> {

@@ -699,6 +699,9 @@ export class TypeOrmStateStore implements StateStore {
       qb.andWhere('r.workflow NOT IN (:...excludeWorkflows)', {
         excludeWorkflows: query.excludeWorkflows,
       });
+    if (query.updatedAfter !== undefined) {
+      qb.andWhere('r.updatedAt >= :updatedAfter', { updatedAfter: new Date(query.updatedAfter) });
+    }
     // The tenant partition. This is not only a dashboard facet: the engine's execution-timeout sweep
     // finds its in-flight runs through `listRuns({ workflow, status, namespace })`, so without this
     // predicate a namespaced worker would cancel ANOTHER tenant's long-running runs. `undefined`

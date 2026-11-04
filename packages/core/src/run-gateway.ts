@@ -15,6 +15,7 @@ import type {
 } from './interfaces';
 import type { LifecycleDelivery, RunWaitLink } from './lifecycle-deliveries';
 import type {
+  LifecycleKind,
   RepublishLifecycleResult,
   RepublishLifecycleTarget,
   WorkflowLifecycleLinks,
@@ -225,6 +226,16 @@ export abstract class RunGateway {
     workflow: string,
     opts?: { namespace?: string | undefined },
   ): Promise<WorkflowLifecycleLinks>;
+  /**
+   * The subscribers a run of `workflow` in `namespace` settling as `kind` owes its lifecycle event to
+   * (see `WorkflowEngine.lifecycleSubscribers`). Optional: a gateway backed by an engine implements
+   * it; the run-request responder checks a tenant republish's `subscriber` against it.
+   */
+  lifecycleSubscribers?(
+    workflow: string,
+    kind: LifecycleKind,
+    namespace: string,
+  ): Promise<string[]>;
   /** Live lifecycle events for one run; returns an unsubscribe fn. Framework-agnostic (no rxjs). */
   abstract subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
 }

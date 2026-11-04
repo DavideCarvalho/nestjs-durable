@@ -153,6 +153,52 @@ describe('engine.republishLifecycle', () => {
     });
   });
 
+  it('rejects a limit that is not a positive integer', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(engine.republishLifecycle({ workflow: 'ingest', limit })).rejects.toThrow(
+        /limit must be a positive integer/,
+      );
+    }
+  });
+
+  it('never owes the event to a subscriber that does not subscribe', async () => {
+    const store = new InMemoryStateStore();
+    const transport: Transport = {
+      async dispatch(): Promise<void> {},
+      onResult(): void {},
+      onHeartbeat(): void {},
+      async readAllWorkerDescriptors(): Promise<WorkerDescriptor[]> {
+        return [
+          {
+            instanceId: 'w1',
+            runtime: 'node',
+            sdk: { name: 'sdk', version: '1' },
+            protocol: { version: 1, range: [1, 1] },
+            capabilities: [],
+            workflows: ['remote'],
+            steps: [],
+            registrations: [{ name: 'remote', subscribes: [runCompletedEvent('ingest')] }],
+            startedAt: 0,
+          },
+        ];
+      },
+    };
+    const engine = new WorkflowEngine({ store, transport });
+    await store.createRun(settled('i1', { tags: ['etl'] }));
+    await store.createRun(settled('i2', { tags: ['etl'] }));
+
+    const result = await engine.republishLifecycle({ workflow: 'ingest', subscriber: 'made-up' });
+    expect(result.started).toBe(0);
+    expect(result.failed.map((f) => f.error)).toEqual([
+      'subscriber made-up does not subscribe to run.completed:ingest',
+      'subscriber made-up does not subscribe to run.completed:ingest',
+    ]);
+    expect((await store.getRun('i1'))?.tags).toEqual(['etl']);
+    expect((await store.getRun('i2'))?.tags).toEqual(['etl']);
+  });
+
   it('rejects a run that does not exist or has not settled', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });

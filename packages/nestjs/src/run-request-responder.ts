@@ -1,4 +1,5 @@
 import {
+  type LifecycleKind,
   type RepublishLifecycleTarget,
   type RunDetail,
   type RunGateway,
@@ -17,6 +18,12 @@ import {
  * responders reply `ok: true` with no `data` instead; `ProxyRunGateway` reads both.
  */
 export const UNSUPPORTED_RUN_REQUEST = 'unsupported-request';
+
+/** The error `code` a responder replies with for a request it rejects as malformed or not allowed. */
+export const BAD_RUN_REQUEST = 'bad-request';
+
+/** The most settled runs one tenant republish reads; a larger `limit` is lowered to it. */
+export const TENANT_REPUBLISH_MAX_LIMIT = 1000;
 
 const KNOWN_KINDS: ReadonlySet<string> = new Set<RunRequestKind['kind']>([
   'getRunDetail',
@@ -217,13 +224,30 @@ export class RunRequestResponder {
       // Not runId-bearing: forced onto the requester's namespace, like `listRuns`, so a tenant can
       // only republish its own runs whatever namespace it sent.
       if (!this.gateway.republishLifecycle) return unsupported(msg.requestId, body.kind);
-      const { since, until, ...rest } = body.target as Extract<
+      const { since, until, limit, ...rest } = body.target as Extract<
         RepublishLifecycleTarget,
         { workflow: string }
       > & { since?: Date | string; until?: Date | string };
+      if (
+        limit !== undefined &&
+        (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1)
+      ) {
+        return badRequest(
+          msg.requestId,
+          `limit must be a positive integer, got ${JSON.stringify(limit)}`,
+        );
+      }
+      const refused = await this.refuseSubscriber(
+        rest.workflow,
+        rest.kind,
+        rest.subscriber,
+        msg.tenant,
+      );
+      if (refused) return badRequest(msg.requestId, refused);
       const target: RepublishLifecycleTarget = {
         ...rest,
         namespace: msg.tenant,
+        limit: Math.min(limit ?? TENANT_REPUBLISH_MAX_LIMIT, TENANT_REPUBLISH_MAX_LIMIT),
         ...(since !== undefined ? { since: wireDate(since) } : {}),
         ...(until !== undefined ? { until: wireDate(until) } : {}),
       };
@@ -305,6 +329,14 @@ export class RunRequestResponder {
       return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
+    if (body.kind === 'republishLifecycle' && 'runId' in body.target && run) {
+      const kind = lifecycleKindOf(run.status);
+      const refused = kind
+        ? await this.refuseSubscriber(run.workflow, kind, body.target.subscriber, msg.tenant)
+        : undefined;
+      if (refused) return badRequest(msg.requestId, refused);
+    }
+
     try {
       const data = await this.callVerb(body);
       return { requestId: msg.requestId, result: { ok: true, data } };
@@ -341,6 +373,41 @@ export class RunRequestResponder {
       ...(subscribers.length > 0 ? { lifecycleSubscribers: subscribers } : {}),
       ...(linked ? { workflowLifecycle: links } : {}),
     };
+  }
+
+  /**
+   * Why a tenant republish naming `subscriber` is refused, or undefined when it may go ahead: the
+   * subscriber must be owed the event of `workflow` settling (as `kind`, when given) by a run of
+   * the tenant's namespace (the gateway's `lifecycleSubscribers`, else the tenant's
+   * `workflowLifecycle` links), so a tenant cannot have the event owed to an arbitrary name. Without
+   * `subscriber` there is nothing to check.
+   */
+  private async refuseSubscriber(
+    workflow: string,
+    kind: LifecycleKind | undefined,
+    subscriber: string | undefined,
+    tenant: string,
+  ): Promise<string | undefined> {
+    if (subscriber === undefined) return undefined;
+    const kinds: LifecycleKind[] = kind ? [kind] : ['completed', 'failed'];
+    let subscribes = false;
+    if (this.gateway.lifecycleSubscribers) {
+      for (const k of kinds) {
+        const subscribers = await this.gateway.lifecycleSubscribers(workflow, k, tenant);
+        subscribes ||= subscribers.includes(subscriber);
+      }
+    } else {
+      const links = await this.gateway.workflowLifecycle?.(workflow, { namespace: tenant });
+      subscribes =
+        links?.startsOnSettle.some(
+          (link) => link.workflow === subscriber && kinds.includes(link.kind),
+        ) ?? false;
+    }
+    if (subscribes) return undefined;
+    const events = kind
+      ? `run.${kind}:${workflow}`
+      : `run.completed:${workflow} or run.failed:${workflow}`;
+    return `subscriber ${subscriber} does not subscribe to ${events} in namespace ${tenant}`;
   }
 
   private callVerb(
@@ -391,6 +458,11 @@ function runIdOf(
 ): string {
   if (body.kind !== 'republishLifecycle') return body.runId;
   return 'runId' in body.target ? body.target.runId : '';
+}
+
+/** The reply to a request this responder rejects (see {@link BAD_RUN_REQUEST}). */
+function badRequest(requestId: string, message: string): RunReply {
+  return { requestId, result: { ok: false, error: { message, code: BAD_RUN_REQUEST } } };
 }
 
 /** The reply to a verb this responder knows but its gateway cannot answer. */

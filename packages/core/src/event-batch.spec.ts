@@ -130,3 +130,61 @@ describe('onEvent debounce / batch per key', () => {
     expect(accumulatorRunId('refresh', 'x/y:z #1')).toBe('__evtacc__:refresh:x%2Fy%3Az%20%231');
   });
 });
+
+describe('onEvent debounce / batch with routed event ids', () => {
+  type Routable = {
+    accumulators: {
+      route(target: string, config: unknown, payload: unknown, id?: string): Promise<unknown>;
+    };
+  };
+
+  it('batch: an event routed twice under one id counts once, within and across bursts', async () => {
+    const store = new InMemoryStateStore();
+    const now = 1000;
+    const engine = new WorkflowEngine({ store, clock: () => now });
+    const fired: unknown[] = [];
+    const config = { mode: 'batch', maxSize: 2, windowMs: 60_000 } as const;
+    engine.register('agg', '1', async (_ctx, input) => void fired.push(input), {
+      onEvent: ['hit'],
+      eventBatch: config,
+    });
+    const { accumulators } = engine as unknown as Routable;
+
+    await accumulators.route('agg', config, { n: 1 }, 'src-1');
+    await engine.waitForRun('__evtacc__:agg');
+    await accumulators.route('agg', config, { n: 1 }, 'src-1');
+    await accumulators.route('agg', config, { n: 2 }, 'src-2');
+    await until(() => fired.length > 0);
+    expect(fired).toEqual([{ events: [{ n: 1 }, { n: 2 }] }]);
+
+    // The re-armed accumulator still knows both ids.
+    await accumulators.route('agg', config, { n: 2 }, 'src-2');
+    await accumulators.route('agg', config, { n: 3 }, 'src-3');
+    await accumulators.route('agg', config, { n: 4 }, 'src-4');
+    await until(() => fired.length > 1);
+    expect(fired).toEqual([{ events: [{ n: 1 }, { n: 2 }] }, { events: [{ n: 3 }, { n: 4 }] }]);
+  });
+
+  it('debounce: a duplicate does not replace the last payload', async () => {
+    const store = new InMemoryStateStore();
+    let now = 1000;
+    const engine = new WorkflowEngine({ store, clock: () => now });
+    const fired: unknown[] = [];
+    const config = { mode: 'debounce', windowMs: 5000 } as const;
+    engine.register('handler', '1', async (_ctx, input) => void fired.push(input), {
+      onEvent: ['activity'],
+      eventBatch: config,
+    });
+    const { accumulators } = engine as unknown as Routable;
+
+    await accumulators.route('handler', config, { v: 1 }, 'a');
+    await engine.waitForRun('__evtacc__:handler');
+    await accumulators.route('handler', config, { v: 2 }, 'b');
+    await accumulators.route('handler', config, { v: 1 }, 'a');
+    await tick();
+    now += 6000;
+    await engine.resumeDueTimers(now);
+    await until(() => fired.length > 0);
+    expect(fired).toEqual([{ v: 2 }]);
+  });
+});

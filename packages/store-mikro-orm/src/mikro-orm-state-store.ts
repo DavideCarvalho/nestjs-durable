@@ -649,6 +649,9 @@ export class MikroOrmStateStore implements StateStore {
     if (query.workflow) where.workflow = query.workflow;
     if (query.workflows) and.push({ workflow: { $in: query.workflows } });
     if (query.excludeWorkflows?.length) and.push({ workflow: { $nin: query.excludeWorkflows } });
+    if (query.updatedAfter !== undefined) {
+      and.push({ updatedAt: { $gte: new Date(query.updatedAfter) } });
+    }
     if (query.namespace !== undefined) where.namespace = query.namespace;
     if (query.namespaces) and.push({ namespace: { $in: query.namespaces } });
     // Plain equality on the origin column, exactly like `namespace` above. A run whose origin is NULL

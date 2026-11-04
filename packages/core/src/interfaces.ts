@@ -1079,6 +1079,11 @@ export interface RunQuery {
    * lifecycle registry) out of a console's lists and counts.
    */
   excludeWorkflows?: string[] | undefined;
+  /**
+   * Only runs last updated at or after this epoch ms (`updated_at >= updatedAfter`), ANDed with
+   * everything else. For a settled run that is when it settled, unless something wrote it since.
+   */
+  updatedAfter?: number | undefined;
   status?: RunStatus | undefined;
   /**
    * Match any of these statuses (a `status IN (...)` filter). ORed together, and ANDed with the other

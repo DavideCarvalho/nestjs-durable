@@ -275,6 +275,9 @@ export class DurableApiController {
       const message = error instanceof Error ? error.message : String(error);
       if (/^run .* not found$/.test(message)) throw new NotFoundException(message);
       if (/^run .* has not settled/.test(message)) throw new BadRequestException(message);
+      if ((error as { code?: unknown } | null)?.code === 'bad-request') {
+        throw new BadRequestException(message);
+      }
       return notSupportedByServer(error);
     }
     if (!result) {

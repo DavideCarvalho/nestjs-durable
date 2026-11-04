@@ -252,6 +252,45 @@ describe('lifecycle subscriptions with debounce / batch', () => {
     });
   });
 
+  it('accepts the same key written separately on two decorators, and rejects a different one', () => {
+    @Workflow({ name: 'twice-keyed-sub', version: '1' })
+    @OnWorkflowCompleted(IngestWorkflow, {
+      input: (e) => ({ table: e.input.table }),
+      debounce: { windowMs: '30s', key: (input) => input.table },
+    })
+    @OnWorkflowFailed(IngestWorkflow, {
+      input: (e) => ({ table: e.input.table }),
+      debounce: { windowMs: '30s', key: (input) => input.table },
+    })
+    class TwiceKeyedSub {
+      async run(_ctx: WorkflowCtx, input: { table: string }) {
+        return input;
+      }
+    }
+    expect(eventBatchOf(metaOf(TwiceKeyedSub), TwiceKeyedSub)).toMatchObject({
+      mode: 'debounce',
+      windowMs: 30_000,
+    });
+
+    expect(() => {
+      @Workflow({ name: 'differently-keyed-sub', version: '1' })
+      @OnWorkflowCompleted(IngestWorkflow, {
+        input: (e) => ({ table: e.input.table }),
+        debounce: { windowMs: '30s', key: (input) => input.table },
+      })
+      @OnWorkflowFailed(IngestWorkflow, {
+        input: (e) => ({ table: e.input.table }),
+        debounce: { windowMs: '30s', key: (input) => `${input.table}` },
+      })
+      class DifferentlyKeyedSub {
+        async run(_ctx: WorkflowCtx, input: { table: string }) {
+          return input;
+        }
+      }
+      return DifferentlyKeyedSub;
+    }).toThrow(/two lifecycle subscriptions declare different debounce\/batch settings/);
+  });
+
   it('coalesces several settled runs with the same key into one subscriber run', async () => {
     const store = new InMemoryStateStore();
     const fired: unknown[] = [];
@@ -287,9 +326,10 @@ describe('lifecycle subscriptions with debounce / batch', () => {
     }
     expect(fired).toEqual([]);
 
-    await settle();
-    await engine.resumeDueTimers();
-    for (let i = 0; i < 50 && fired.length < 2; i += 1) await settle();
+    for (let i = 0; i < 50 && fired.length < 2; i += 1) {
+      await settle();
+      await engine.resumeDueTimers();
+    }
     expect(fired).toHaveLength(2);
     expect(fired).toEqual(expect.arrayContaining([{ table: 'mvr' }, { table: 'mel' }]));
   });

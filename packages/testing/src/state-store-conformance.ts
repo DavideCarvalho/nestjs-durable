@@ -1965,6 +1965,29 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       ]);
     });
 
+    t('keeps only the runs updated at or after updatedAfter', async () => {
+      const at = (ms: number) => new Date(1_700_000_000_000 + ms);
+      await store.createRun(
+        run({ id: 'old', status: 'completed', createdAt: at(0), updatedAt: at(0) }),
+      );
+      await store.createRun(
+        run({ id: 'edge', status: 'completed', createdAt: at(0), updatedAt: at(5_000) }),
+      );
+      await store.createRun(
+        run({ id: 'new', status: 'failed', createdAt: at(0), updatedAt: at(9_000) }),
+      );
+
+      const after = at(5_000).getTime();
+      expect((await store.listRuns({ updatedAfter: after })).map((r) => r.id).sort()).toEqual([
+        'edge',
+        'new',
+      ]);
+      expect(
+        (await store.listRuns({ updatedAfter: after, statuses: ['completed'] })).map((r) => r.id),
+      ).toEqual(['edge']);
+      if (store.countRuns) expect(await store.countRuns({ updatedAfter: after })).toBe(2);
+    });
+
     t('leaves out the runs of excludeWorkflows, in lists and in counts', async () => {
       await store.createRun(run({ id: 'a', status: 'failed', workflow: 'wa' }));
       await store.createRun(run({ id: 'b', status: 'completed', workflow: 'wb' }));

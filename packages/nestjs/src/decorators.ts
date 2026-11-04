@@ -692,11 +692,16 @@ function subscriberEventBatch(
   return undefined;
 }
 
+/**
+ * Whether two coalescing settings are the same: mode, window, size and key. Keys compare by source
+ * text (`key.toString()`), so the same arrow written on two decorators matches; keys written
+ * differently do not, even when they compute the same thing.
+ */
 function sameEventBatch(a: EventBatchConfig, b: EventBatchConfig): boolean {
   return (
     a.mode === b.mode &&
     a.windowMs === b.windowMs &&
-    a.key === b.key &&
+    a.key?.toString() === b.key?.toString() &&
     (a.mode !== 'batch' || b.mode !== 'batch' || a.maxSize === b.maxSize)
   );
 }

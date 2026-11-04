@@ -18,6 +18,12 @@ import {
  * announce. A process that dies before publishing, or that does not have a subscriber, leaves the
  * marker for the timer poller's lifecycle sweep on any instance that does; the subscriber's run id
  * is deterministic ({@link lifecycleRunId}), so publishing twice starts it once.
+ *
+ * When the settling process has no usable read of the fleet's announcements (none yet, or the last
+ * one failed), the terminal write tags the run {@link LIFECYCLE_PENDING_TAG} alone: the owed set is
+ * unresolved, and the first publish with a good read resolves it. A subscriber announced after the
+ * run settled is caught by the sweep's heal pass for {@link LIFECYCLE_HEAL_WINDOW_MS}; later than
+ * that, `engine.republishLifecycle` backfills it.
  */
 
 /** The event published when a run of `workflow` completes. */
@@ -33,6 +39,9 @@ export function runFailedEvent(workflow: WorkflowRef): string {
 /**
  * Tag written with a run's terminal status when some workflow subscribes to its lifecycle event,
  * and removed once the event is published. A settled run still carrying it was never published.
+ * Carried with no {@link LIFECYCLE_OWED_TAG_PREFIX} tag, it means the owed set is unresolved: the
+ * settling process could not read the fleet's announcements, so the run is owed to every subscriber
+ * the first publish with a good read finds (minus the ones already started or failed).
  */
 export const LIFECYCLE_PENDING_TAG = 'durable:lifecycle:pending';
 
@@ -78,6 +87,21 @@ export function triggerFailedSubscribersOf(tags: readonly string[] | undefined):
     .filter((tag) => tag.startsWith(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX))
     .map((tag) => tag.slice(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX.length));
 }
+
+/** The subscribers a settled run started, read from its {@link LIFECYCLE_TRIGGERED_TAG_PREFIX} tags. */
+export function triggeredSubscribersOf(tags: readonly string[] | undefined): string[] {
+  return (tags ?? [])
+    .filter((tag) => tag.startsWith(LIFECYCLE_TRIGGERED_TAG_PREFIX))
+    .map((tag) => tag.slice(LIFECYCLE_TRIGGERED_TAG_PREFIX.length));
+}
+
+/**
+ * How long after a run settled the lifecycle sweep still checks it for subscribers it missed: one
+ * the fleet announced only after the settling process last read the announcements. Such a
+ * subscriber is started (or owed to the instances that have it) as if it had been owed from the
+ * start. One announced later than this is backfill, for `engine.republishLifecycle`.
+ */
+export const LIFECYCLE_HEAL_WINDOW_MS = 2 * 60 * 1000;
 
 /** The subscribers a run's lifecycle event is still owed to, read from its owed tags. */
 export function owedSubscribersOf(tags: readonly string[] | undefined): string[] {
