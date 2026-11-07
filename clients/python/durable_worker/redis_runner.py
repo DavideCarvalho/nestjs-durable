@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Optional
 
 from .adaptive import AdaptiveController, resolve_concurrency
 from .cancellation import CancellationRegistry
+from .result_publisher import ResultPublisher
 from .worker import Worker
 from .workflow import is_workflow_task
 
@@ -573,6 +574,19 @@ async def _publish_failed_result(results: Any, result: Dict[str, Any]) -> None:
         pass
 
 
+def _result_routing_client(connection: str) -> Optional[Any]:
+    """A plain asyncio Redis client for result routing (reply-alive reads, ``CLIENT LIST``), or
+    ``None`` without ``redis`` installed — results then go one job each to the shared queue."""
+    try:
+        import redis.asyncio as aioredis
+    except ImportError:
+        return None
+    try:
+        return aioredis.from_url(connection)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _control_channel(prefix: str) -> str:
     # Mirrors BullMQTransport.controlChannel(): '<prefix>-control'.
     return f"{prefix}-control"
@@ -680,7 +694,14 @@ async def run_redis_worker(
         )
 
     results_name = _names(effective_prefix, "")[1]
-    results = BullQueue(results_name, {"connection": connection})
+    # Results go back the way the TypeScript transport sends them: routed to the dispatching engine
+    # instance (`replyTo`), batched while an engine reads batches, else one job each.
+    publisher = ResultPublisher(
+        effective_prefix,
+        lambda name: BullQueue(name, {"connection": connection}),
+        _result_routing_client(connection),
+    )
+    results = publisher.queue(results_name)
     registry = cancellation or CancellationRegistry()
     await _subscribe_control(connection, effective_prefix, registry)
     publish_progress = await _progress_publisher(connection, effective_prefix)
@@ -732,7 +753,7 @@ async def run_redis_worker(
         result = await worker.aprocess_task(
             job.data, is_cancelled=registry.is_cancelled, on_event=on_event
         )
-        await results.add("result", result, {"removeOnComplete": True, "removeOnFail": True})
+        await publisher.publish(result, job.data.get("replyTo"))
         return result
 
     async def process(job: Any, _token: str) -> Any:
@@ -881,6 +902,14 @@ async def _subscribe_control(
         try:
             async for message in pubsub.listen():
                 if message.get("type") != "message":
+                    continue
+                data = message.get("data")
+                # The channel also carries every lifecycle/step-event broadcast; only a cancel
+                # matters here, so skip the JSON parse for anything that can't be one.
+                if isinstance(data, (bytes, bytearray)):
+                    if b"cancel" not in data:
+                        continue
+                elif isinstance(data, str) and "cancel" not in data:
                     continue
                 try:
                     registry.on_control_message(json.loads(message["data"]))
