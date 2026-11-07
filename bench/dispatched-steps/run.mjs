@@ -226,6 +226,8 @@ async function throughput() {
     wfPerSec: (WF * 1000) / ms,
     sqlPerStep: sql / (WF * 5),
     cpuMsPerWf: cpu / WF,
+    // The engine process's CPU over the run, in % of one core.
+    cpuPct: (100 * cpu) / ms,
     stickyHits: env.engine.sticky?.hits ?? 0,
   };
 }
