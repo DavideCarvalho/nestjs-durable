@@ -25,6 +25,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepResultSettlement,
   type StepSettlement,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
@@ -37,6 +38,7 @@ import {
   parseDuration,
   retentionKeeps,
   runValueFacetsFromRuns,
+  settleResultsWithPlainCalls,
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
   singletonClaimantIds,
@@ -46,6 +48,7 @@ import {
   Brackets,
   type DataSource,
   type EntityManager,
+  type EntityMetadata,
   type FindOptionsWhere,
   In,
   IsNull,
@@ -56,6 +59,7 @@ import {
   type Repository,
   type SelectQueryBuilder,
 } from 'typeorm';
+import type { ColumnMetadata } from 'typeorm/metadata/ColumnMetadata';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import {
   BufferedEventEntity,
@@ -126,10 +130,43 @@ export interface TypeOrmStateStoreOptions {
  * timestamps use native datetime columns (MySQL `datetime(6)`) and `wakeAt` is stored as a datetime too.
  */
 export class TypeOrmStateStore implements StateStore {
+  // The round-trip-saving optional methods, bound per dialect where they save a statement (see
+  // `TypeOrmRoundTrips`); absent on SQLite, where the engine's read-then-write calls are used.
+  readonly settleResultsIfPending?: (
+    results: StepResultSettlement[],
+  ) => Promise<(StepCheckpoint | null)[]>;
+  readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  readonly tryLockRunAndGet?: (
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ) => Promise<WorkflowRun | null>;
+  readonly claimPendingRuns?: (
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ) => Promise<WorkflowRun[]>;
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly options: TypeOrmStateStoreOptions = {},
-  ) {}
+  ) {
+    const type = String(dataSource.options.type);
+    const dialect = type === 'postgres' ? 'postgres' : type === 'mysql' ? 'mysql' : undefined;
+    if (!dialect) return;
+    const fast = new TypeOrmRoundTrips(dataSource, dialect, this);
+    this.insertCheckpointIfAbsent = (cp) => fast.insertCheckpointIfAbsent(cp);
+    this.settleResultsIfPending = (results) => fast.settleResultsIfPending(results);
+    this.claimPendingRuns = (limit, owner, until, now, ns) =>
+      fast.claimPendingRuns(limit, owner, until, now, ns);
+    if (dialect === 'postgres') {
+      this.tryLockRunAndGet = (runId, owner, until, now) =>
+        fast.tryLockRunAndGet(runId, owner, until, now);
+    }
+  }
 
   async ensureSchema(): Promise<void> {
     await ensureTypeOrmDurableSchema(this.dataSource, {
@@ -1588,4 +1625,298 @@ function isUniqueViolation(err: unknown): boolean {
     e?.errno === 1062 ||
     code.startsWith('SQLITE_CONSTRAINT')
   );
+}
+
+/**
+ * The optional round-trip-saving `StateStore` methods, as raw SQL on the entities' own tables and
+ * columns (names from the metadata, so a custom column naming holds), with values bound and rows
+ * hydrated by TypeORM's driver exactly as its repositories do. Postgres gets each in one statement
+ * (`RETURNING`); MySQL, which has none, gets the ones that still save a statement there.
+ */
+class TypeOrmRoundTrips {
+  private readonly pg: boolean;
+  /** The checkpoint columns' actual Postgres types (what the schema created), read once. */
+  private cpTypes?: Promise<Map<string, string>>;
+
+  constructor(
+    private readonly ds: DataSource,
+    dialect: 'postgres' | 'mysql',
+    /** The store itself, whose batched plain calls settle a MySQL batch. */
+    private readonly store: StateStore,
+  ) {
+    this.pg = dialect === 'postgres';
+  }
+
+  private get runs(): EntityMetadata {
+    return this.ds.getMetadata(WorkflowRunEntity);
+  }
+
+  private get cps(): EntityMetadata {
+    return this.ds.getMetadata(StepCheckpointEntity);
+  }
+
+  /**
+   * The Postgres type to cast a `VALUES` parameter of checkpoint `property` to: the column's actual
+   * type in the database (a `timestamptz` the schema helper created, or a `timestamp` from
+   * `synchronize`), so the value converts exactly as the repository's own writes convert it.
+   */
+  private async cpType(property: string): Promise<string> {
+    this.cpTypes ??= this.ds
+      .query(
+        'SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema()',
+        [this.cps.tableName],
+      )
+      .then((rows: { name: string; type: string }[]) => new Map(rows.map((r) => [r.name, r.type])));
+    const column = this.col(this.cps, property);
+    return (await this.cpTypes).get(column.databaseName) ?? this.ds.driver.normalizeType(column);
+  }
+
+  private q(name: string): string {
+    return this.pg ? `"${name.replace(/"/g, '""')}"` : `\`${name.replace(/`/g, '``')}\``;
+  }
+
+  private p(i: number): string {
+    return this.pg ? `$${i}` : '?';
+  }
+
+  private col(meta: EntityMetadata, property: string): ColumnMetadata {
+    const column = meta.findColumnWithPropertyName(property);
+    if (!column) throw new Error(`no column for ${property}`);
+    return column;
+  }
+
+  private c(meta: EntityMetadata, property: string): string {
+    return this.q(this.col(meta, property).databaseName);
+  }
+
+  private table(meta: EntityMetadata): string {
+    return this.q(meta.tableName);
+  }
+
+  /** `value` as the driver binds it for `property` (transformers and type conversion included). */
+  private bind(meta: EntityMetadata, property: string, value: unknown): unknown {
+    if (value == null) return null;
+    return this.ds.driver.preparePersistentValue(value, this.col(meta, property));
+  }
+
+  /** A raw row as the repository would hydrate it; a column the row lacks reads `null`. */
+  private hydrate<T>(meta: EntityMetadata, raw: Record<string, unknown>): T {
+    const entity: Record<string, unknown> = {};
+    for (const column of meta.columns) {
+      const value = raw[column.databaseName];
+      entity[column.propertyName] =
+        value === undefined ? null : this.ds.driver.prepareHydratedValue(value, column);
+    }
+    return entity as T;
+  }
+
+  /** Rows of a statement: Postgres `UPDATE … RETURNING` comes back as `[rows, count]`. */
+  private rows(out: unknown): Record<string, unknown>[] {
+    if (Array.isArray(out) && Array.isArray(out[0])) return out[0] as Record<string, unknown>[];
+    return Array.isArray(out) ? (out as Record<string, unknown>[]) : [];
+  }
+
+  private cpColumns(withInput: boolean): ColumnMetadata[] {
+    return this.cps.columns.filter((c) => withInput || c.propertyName !== 'input');
+  }
+
+  async tryLockRunAndGet(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null> {
+    const r = this.runs;
+    const until = this.c(r, 'lockedUntil');
+    const out = await this.ds.query(
+      `UPDATE ${this.table(r)} SET ${this.c(r, 'lockedBy')} = $1, ${until} = $2 WHERE ${this.c(r, 'id')} = $3 AND (${until} IS NULL OR ${until} <= $4) RETURNING *`,
+      [
+        owner,
+        this.bind(r, 'lockedUntil', new Date(leaseUntilMs)),
+        runId,
+        this.bind(r, 'lockedUntil', new Date(nowMs)),
+      ],
+    );
+    const [row] = this.rows(out);
+    return row ? fromRunEntity(this.hydrate<WorkflowRunEntity>(r, row)) : null;
+  }
+
+  async insertCheckpointIfAbsent(checkpoint: StepCheckpoint): Promise<boolean> {
+    const entity = toCheckpointEntity(checkpoint) as unknown as Record<string, unknown>;
+    const columns = this.cps.columns;
+    const names = columns.map((c) => this.q(c.databaseName)).join(', ');
+    const values = columns.map((c) => this.bind(this.cps, c.propertyName, entity[c.propertyName]));
+    const marks = columns.map((_, i) => this.p(i + 1)).join(', ');
+    const insert = `INSERT INTO ${this.table(this.cps)} (${names}) VALUES (${marks})`;
+    if (this.pg) {
+      const key = `${this.c(this.cps, 'runId')}, ${this.c(this.cps, 'seq')}`;
+      const out = await this.ds.query(
+        `${insert} ON CONFLICT (${key}) DO NOTHING RETURNING ${this.c(this.cps, 'seq')}`,
+        values,
+      );
+      return this.rows(out).length === 1;
+    }
+    try {
+      await this.ds.query(insert, values);
+      return true;
+    } catch (err) {
+      const driver = (err as { driverError?: { errno?: number; code?: string } }).driverError;
+      if (driver?.errno === 1062 || driver?.code === 'ER_DUP_ENTRY') return false;
+      throw err;
+    }
+  }
+
+  async settleResultsIfPending(
+    results: StepResultSettlement[],
+  ): Promise<(StepCheckpoint | null)[]> {
+    const out: (StepCheckpoint | null)[] = results.map(() => null);
+    const seen = new Set<string>();
+    const sent = results.flatMap((r, i) => {
+      const key = checkpointKey(r.runId, r.seq);
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [i];
+    });
+    if (sent.length === 0) return out;
+    if (!this.pg) {
+      // MySQL: one result is one conditional UPDATE and a read of the row; a batch goes through
+      // the store's batched calls, a fixed number of statements however wide it is.
+      if (sent.length > 1) return settleResultsWithPlainCalls(this.store, results);
+      const only = sent[0] as number;
+      out[only] = await this.settleOneMysql(results[only] as StepResultSettlement);
+      return out;
+    }
+    const k = this.cps;
+    const r = this.runs;
+    const props = [
+      'runId',
+      'seq',
+      'status',
+      'output',
+      'error',
+      'events',
+      'startedAt',
+      'finishedAt',
+    ];
+    const types = new Map(
+      await Promise.all(props.map(async (prop) => [prop, await this.cpType(prop)] as const)),
+    );
+    const type = (property: string) => types.get(property) as string;
+    for (let at = 0; at < sent.length; at += 500) {
+      const chunk = sent.slice(at, at + 500);
+      const values: unknown[] = [];
+      const rows = chunk.map((i) => {
+        const s = results[i] as StepResultSettlement;
+        const n = values.length;
+        values.push(
+          s.runId,
+          s.seq,
+          s.status,
+          this.bind(k, 'output', s.status === 'completed' ? s.output : null),
+          this.bind(k, 'error', s.error),
+          this.bind(k, 'events', s.events),
+          this.bind(k, 'startedAt', s.startedAt),
+          this.bind(k, 'finishedAt', s.finishedAt),
+        );
+        const p = (j: number) => `$${n + j}`;
+        return `(${p(1)}::${type('runId')}, ${p(2)}::${type('seq')}, ${p(3)}::${type('status')}, ${p(4)}::${type('output')}, ${p(5)}::${type('error')}, ${p(6)}::${type('events')}, ${p(7)}::${type('startedAt')}, ${p(8)}::${type('finishedAt')})`;
+      });
+      const c = (prop: string) => this.c(k, prop);
+      const returning = this.cpColumns(false)
+        .map((col) => `c.${this.q(col.databaseName)}`)
+        .join(', ');
+      const settled = this.rows(
+        await this.ds.query(
+          `UPDATE ${this.table(k)} AS c SET ${c('status')} = v.status, ${c('output')} = CASE WHEN v.status = 'completed' THEN v.output ELSE c.${c('output')} END, ${c('error')} = v.error, ${c('events')} = COALESCE(v.events, c.${c('events')}), ${c('startedAt')} = COALESCE(v.started_at, c.${c('startedAt')}), ${c('finishedAt')} = v.finished_at FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.${c('runId')} = v.run_id AND c.${c('seq')} = v.seq AND c.${c('status')} = 'pending' AND NOT EXISTS (SELECT 1 FROM ${this.table(r)} AS r WHERE r.${this.c(r, 'id')} = c.${c('runId')} AND r.${this.c(r, 'status')} IN ('cancelled', 'completed')) RETURNING ${returning}`,
+          values,
+        ),
+      );
+      const byKey = new Map(
+        chunk.map((i) => {
+          const s = results[i] as StepResultSettlement;
+          return [checkpointKey(s.runId, s.seq), i];
+        }),
+      );
+      for (const raw of settled) {
+        const cp = fromCheckpointEntity(this.hydrate<StepCheckpointEntity>(k, raw));
+        const i = byKey.get(checkpointKey(cp.runId, cp.seq));
+        if (i !== undefined) out[i] = cp;
+      }
+    }
+    return out;
+  }
+
+  private async settleOneMysql(s: StepResultSettlement): Promise<StepCheckpoint | null> {
+    const k = this.cps;
+    const r = this.runs;
+    const c = (prop: string) => `c.${this.c(k, prop)}`;
+    const done = s.status === 'completed';
+    const result = (await this.ds.query(
+      `UPDATE ${this.table(k)} AS c SET ${c('status')} = ?, ${c('output')} = ${done ? '?' : c('output')}, ${c('error')} = ?, ${c('events')} = COALESCE(?, ${c('events')}), ${c('startedAt')} = COALESCE(?, ${c('startedAt')}), ${c('finishedAt')} = ? WHERE ${c('runId')} = ? AND ${c('seq')} = ? AND ${c('status')} = 'pending' AND NOT EXISTS (SELECT 1 FROM ${this.table(r)} AS r WHERE r.${this.c(r, 'id')} = ${c('runId')} AND r.${this.c(r, 'status')} IN ('cancelled', 'completed'))`,
+      [
+        s.status,
+        ...(done ? [this.bind(k, 'output', s.output)] : []),
+        this.bind(k, 'error', s.error),
+        this.bind(k, 'events', s.events),
+        this.bind(k, 'startedAt', s.startedAt),
+        this.bind(k, 'finishedAt', s.finishedAt),
+        s.runId,
+        s.seq,
+      ],
+    )) as { affectedRows?: number };
+    if (!result?.affectedRows) return null;
+    const list = this.cpColumns(false)
+      .map((col) => this.q(col.databaseName))
+      .join(', ');
+    const [row] = this.rows(
+      await this.ds.query(
+        `SELECT ${list} FROM ${this.table(k)} WHERE ${this.c(k, 'runId')} = ? AND ${this.c(k, 'seq')} = ?`,
+        [s.runId, s.seq],
+      ),
+    );
+    return row ? fromCheckpointEntity(this.hydrate<StepCheckpointEntity>(k, row)) : null;
+  }
+
+  async claimPendingRuns(
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const r = this.runs;
+    const c = (prop: string) => this.c(r, prop);
+    const until = this.bind(r, 'lockedUntil', new Date(leaseUntilMs));
+    const now = this.bind(r, 'lockedUntil', new Date(nowMs));
+    const sort = (runs: WorkflowRun[]) =>
+      runs.sort(
+        (a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id),
+      );
+    if (this.pg) {
+      const ns = namespace !== undefined ? ` AND ${c('namespace')} = $5` : '';
+      const out = await this.ds.query(
+        `UPDATE ${this.table(r)} AS r SET ${c('lockedBy')} = $1, ${c('lockedUntil')} = $2 FROM (SELECT ${c('id')} AS claimed_id FROM ${this.table(r)} WHERE ${c('status')} = 'pending' AND (${c('lockedUntil')} IS NULL OR ${c('lockedUntil')} <= $3)${ns} ORDER BY ${c('createdAt')}, ${c('id')} LIMIT $4 FOR UPDATE SKIP LOCKED) AS claimed WHERE r.${c('id')} = claimed.claimed_id RETURNING r.*`,
+        [owner, until, now, limit, ...(namespace !== undefined ? [namespace] : [])],
+      );
+      return sort(this.rows(out).map((raw) => fromRunEntity(this.hydrate(r, raw))));
+    }
+    // MySQL (8.0+): lock the oldest free pending rows, skipping rows another claimer holds, then
+    // lease them, in one transaction.
+    return this.ds.transaction(async (em) => {
+      const ns = namespace !== undefined ? ` AND ${c('namespace')} = ?` : '';
+      const picked = this.rows(
+        await em.query(
+          `SELECT * FROM ${this.table(r)} WHERE ${c('status')} = 'pending' AND (${c('lockedUntil')} IS NULL OR ${c('lockedUntil')} <= ?)${ns} ORDER BY ${c('createdAt')}, ${c('id')} LIMIT ? FOR UPDATE SKIP LOCKED`,
+          [now, ...(namespace !== undefined ? [namespace] : []), limit],
+        ),
+      ).map((raw) => fromRunEntity(this.hydrate(r, raw)));
+      if (picked.length === 0) return [];
+      await em.query(
+        `UPDATE ${this.table(r)} SET ${c('lockedBy')} = ?, ${c('lockedUntil')} = ? WHERE ${c('id')} IN (${picked.map(() => '?').join(', ')})`,
+        [owner, until, ...picked.map((run) => run.id)],
+      );
+      return sort(picked.map((run) => ({ ...run, lockedBy: owner, lockedUntil: leaseUntilMs })));
+    });
+  }
 }

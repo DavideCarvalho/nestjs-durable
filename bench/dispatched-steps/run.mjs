@@ -120,15 +120,104 @@ const TICK = [1, 2, 3, 4, 5].map((i) => stepRef(`bench.s${i}`));
 async function freshDb() {
   const admin = new pg.Client({ connectionString: DATABASE_URL });
   await admin.connect();
-  await origQuery.call(admin, 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+  await origQuery.call(
+    admin,
+    'DROP SCHEMA public CASCADE; CREATE SCHEMA public; CREATE EXTENSION IF NOT EXISTS pg_stat_statements;',
+  );
   await admin.end();
+}
+
+/**
+ * Statements Postgres executed (pg_stat_statements, BEGIN/COMMIT included), so stores whose driver
+ * this process can't see (Prisma's engine) are counted the same way as the others.
+ */
+async function serverStatements() {
+  const admin = new pg.Client({ connectionString: DATABASE_URL });
+  await admin.connect();
+  const { rows } = await origQuery.call(
+    admin,
+    "SELECT coalesce(sum(calls), 0)::bigint AS n FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) AND query NOT ILIKE '%pg_stat_statements%'",
+  );
+  await admin.end();
+  return Number(rows[0].n);
+}
+
+/** BENCH_STORE: drizzle (default) | typeorm | mikro | prisma, each with its own schema. */
+async function makeStore() {
+  const kind = process.env.BENCH_STORE ?? 'drizzle';
+  if (kind === 'drizzle') {
+    const pool = new pg.Pool({ connectionString: DATABASE_URL, max: POOL });
+    const store = new DrizzlePgStateStore(drizzle(pool));
+    await store.ensureSchema();
+    return { store, close: () => pool.end() };
+  }
+  if (kind === 'typeorm') {
+    const req = createRequire(`${root}packages/store-typeorm/package.json`);
+    const { DataSource } = req('typeorm');
+    const { ENTITIES, TypeOrmStateStore } = await import(
+      `${root}packages/store-typeorm/dist/index.js`
+    );
+    const ds = new DataSource({
+      type: 'postgres',
+      url: DATABASE_URL,
+      entities: [...ENTITIES],
+      extra: { max: POOL },
+    });
+    await ds.initialize();
+    const store = new TypeOrmStateStore(ds);
+    await store.ensureSchema();
+    return { store, close: () => ds.destroy() };
+  }
+  if (kind === 'mikro') {
+    const req = createRequire(`${root}packages/store-mikro-orm/package.json`);
+    const { MikroORM } = req('@mikro-orm/postgresql');
+    const { ENTITIES, MikroOrmStateStore } = await import(
+      `${root}packages/store-mikro-orm/dist/index.js`
+    );
+    const orm = await MikroORM.init({
+      clientUrl: DATABASE_URL,
+      entities: [...ENTITIES],
+      pool: { min: 0, max: POOL },
+    });
+    const store = new MikroOrmStateStore(orm);
+    await store.ensureSchema();
+    return { store, close: () => orm.close() };
+  }
+  if (kind === 'prisma') {
+    // The Postgres client the store's DB spec generates (generated/pg-client), and its schema pushed.
+    const dir = `${fileURLToPath(new URL('../../', import.meta.url))}packages/store-prisma`;
+    const { execFileSync } = await import('node:child_process');
+    execFileSync(
+      'npx',
+      [
+        'prisma',
+        'db',
+        'push',
+        '--schema',
+        'prisma/test.pg.prisma',
+        '--skip-generate',
+        '--accept-data-loss',
+      ],
+      {
+        cwd: dir,
+        env: { ...process.env, PRISMA_PG_URL: DATABASE_URL },
+        stdio: 'ignore',
+      },
+    );
+    const req = createRequire(`${dir}/package.json`);
+    const { PrismaClient } = req(`${dir}/generated/pg-client/index.js`);
+    const { PrismaStateStore } = await import(`${root}packages/store-prisma/dist/index.js`);
+    const prisma = new PrismaClient({ datasourceUrl: `${DATABASE_URL}?connection_limit=${POOL}` });
+    await prisma.$connect();
+    return { store: new PrismaStateStore(prisma), close: () => prisma.$disconnect() };
+  }
+  throw new Error(`unknown BENCH_STORE ${kind}`);
 }
 
 async function boot() {
   await freshDb();
-  const pool = new pg.Pool({ connectionString: DATABASE_URL, max: POOL });
-  const store = new DrizzlePgStateStore(drizzle(pool));
-  await store.ensureSchema();
+  const { store, close } = await makeStore();
+  const pool = { end: close };
   // BENCH_NO_ROUND_TRIP_METHODS=1: hide the optional round-trip-saving store methods, so the engine
   // takes its read-then-write paths (to measure the sticky continuation on its own).
   if (process.env.BENCH_NO_ROUND_TRIP_METHODS) {
@@ -169,14 +258,14 @@ async function seq(n) {
   tally.clear();
   const id = `long-${n}-${Date.now()}`;
   const p = env.whenDone(id);
-  const s0 = statements;
+  const s0 = await serverStatements();
   const c0 = process.cpuUsage();
   const t0 = performance.now();
   await env.engine.start('long', { n }, id);
   const ev = await p;
   const ms = performance.now() - t0;
   const cpu = cpuMs(process.cpuUsage(c0));
-  const sql = statements - s0;
+  const sql = (await serverStatements()) - s0;
   printTally(n);
   if (ev.type !== 'run.completed')
     throw new Error(`run ${id} ${ev.type} ${JSON.stringify(ev.error)}`);
@@ -201,7 +290,7 @@ async function throughput() {
   tally.clear();
   const ids = Array.from({ length: WF }, (_, i) => `five-${i}-${Date.now()}`);
   const waits = ids.map((id) => env.whenDone(id));
-  const s0 = statements;
+  const s0 = await serverStatements();
   const c0 = process.cpuUsage();
   const t0 = performance.now();
   let next = 0;
@@ -218,7 +307,7 @@ async function throughput() {
   const cpu = cpuMs(process.cpuUsage(c0));
   const failed = events.filter((e) => e.type !== 'run.completed').length;
   if (failed) throw new Error(`${failed} runs failed`);
-  const sql = statements - s0;
+  const sql = (await serverStatements()) - s0;
   printTally(WF * 5);
   await env.engine.drain?.(2000).catch(() => undefined);
   await env.pool.end();

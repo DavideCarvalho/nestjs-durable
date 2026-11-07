@@ -69,3 +69,4 @@ export { InMemoryRunQueue } from './testing/in-memory-run-queue';
 
 export * from './singleton-admission';
 export { nextRRuleFireMs, parseRRule, type ParsedRRule, prevRRuleFireMs } from './rrule';
+export { settleResultsWithPlainCalls } from './settle-results';

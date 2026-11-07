@@ -31,7 +31,9 @@ for (const scenario of scenarios.split(',')) {
       });
       const line = out.split('\n').find((l) => l.startsWith(`${scenario} `));
       const m = JSON.parse(line.slice(scenario.length + 1));
-      ((results[scenario] ??= {})[b.name] ??= []).push(m);
+      results[scenario] ??= {};
+      results[scenario][b.name] ??= [];
+      results[scenario][b.name].push(m);
     }
   }
   for (const b of builds) {

@@ -1489,14 +1489,36 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect((await store.getRun('busy'))?.lockedBy).toBe('other');
         expect(await store.claimPendingRuns(0, 'a', 9_000, 1_000)).toEqual([]);
 
-        // Two claimers at once split what is left between them.
+        // Two claimers at once never take the same run. One may come back short of what is left
+        // (a row the other's scan locked is skipped, not waited on); a later claim takes the rest.
         const [x, y] = await Promise.all([
           store.claimPendingRuns(3, 'x', 9_000, 1_000),
           peerStore.claimPendingRuns?.(3, 'y', 9_000, 1_000) ?? Promise.resolve([]),
         ]);
         const ids = [...x, ...y].map((r) => r.id);
         expect(new Set(ids).size).toBe(ids.length);
-        expect(ids.sort()).toEqual(['p2', 'p3', 'p4', 'p5']);
+        expect(ids.length).toBeGreaterThan(0);
+        const rest = await store.claimPendingRuns(10, 'z', 9_000, 1_000);
+        expect([...ids, ...rest.map((r) => r.id)].sort()).toEqual(['p2', 'p3', 'p4', 'p5']);
+      },
+    );
+
+    t(
+      'keeps updatedAt to the millisecond, through createRun, updateRun and updateRunIf',
+      async () => {
+        // The engine recognizes its own suspend by the exact `updatedAt` it wrote (the sticky
+        // continuation's stamp): a store that rounds it to the second never matches, and replays.
+        const created = new Date(at.getTime() + 123);
+        await store.createRun(run({ updatedAt: created }));
+        expect((await store.getRun('r1'))?.updatedAt.getTime()).toBe(created.getTime());
+        const patched = new Date(at.getTime() + 60_456);
+        await store.updateRun('r1', { status: 'suspended', updatedAt: patched });
+        expect((await store.getRun('r1'))?.updatedAt.getTime()).toBe(patched.getTime());
+        if (store.updateRunIf) {
+          const stamped = new Date(at.getTime() + 120_789);
+          expect(await store.updateRunIf('r1', ['suspended'], { updatedAt: stamped })).toBe(true);
+          expect((await store.getRun('r1'))?.updatedAt.getTime()).toBe(stamped.getTime());
+        }
       },
     );
 

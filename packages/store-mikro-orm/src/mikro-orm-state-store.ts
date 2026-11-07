@@ -26,6 +26,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepResultSettlement,
   type StepSettlement,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
@@ -37,6 +38,7 @@ import {
   normalizeAttributeRows,
   parseDuration,
   retentionKeeps,
+  settleResultsWithPlainCalls,
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
   singletonClaimantIds,
@@ -137,12 +139,57 @@ export interface MikroOrmStateStoreOptions {
  */
 export class MikroOrmStateStore implements StateStore {
   private readonly scopeNamespace: string | undefined;
+  // The round-trip-saving optional methods, bound on Postgres and MySQL (see
+  // `MikroOrmRoundTrips`); absent on SQLite, where the engine's read-then-write calls are used.
+  readonly settleResultsIfPending?: (
+    results: StepResultSettlement[],
+  ) => Promise<(StepCheckpoint | null)[]>;
+  readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  readonly tryLockRunAndGet?: (
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ) => Promise<WorkflowRun | null>;
+  readonly claimPendingRuns?: (
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ) => Promise<WorkflowRun[]>;
 
   constructor(
     private readonly orm: MikroORM,
     private readonly opts: MikroOrmStateStoreOptions = {},
   ) {
     this.scopeNamespace = opts.scope?.namespace;
+    let platform = '';
+    try {
+      platform = String(orm.em.getPlatform().constructor.name).toLowerCase();
+    } catch {
+      return; // a stand-in ORM (tests): keep the plain calls
+    }
+    const dialect = platform.includes('postgre')
+      ? 'postgres'
+      : platform.includes('mysql')
+        ? 'mysql'
+        : undefined;
+    if (!dialect) return;
+    const fast = new MikroOrmRoundTrips(
+      () => this.orm.em.fork(),
+      dialect,
+      this.scopeNamespace,
+      this,
+    );
+    this.insertCheckpointIfAbsent = (cp) => fast.insertCheckpointIfAbsent(cp);
+    this.settleResultsIfPending = (results) => fast.settleResultsIfPending(results);
+    this.claimPendingRuns = (limit, owner, until, now, ns) =>
+      fast.claimPendingRuns(limit, owner, until, now, ns);
+    if (dialect === 'postgres') {
+      this.tryLockRunAndGet = (runId, owner, until, now) =>
+        fast.tryLockRunAndGet(runId, owner, until, now);
+    }
   }
 
   /**
@@ -1782,4 +1829,311 @@ function fromScheduleEntity(e: ScheduleEntity): ScheduleRecord {
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
+}
+
+/**
+ * The optional round-trip-saving `StateStore` methods, as raw SQL on the entities' own tables and
+ * columns, with values bound by each property's own type converter and rows hydrated by `em.map`,
+ * as MikroORM's own reads and writes do. Postgres gets each in one statement (`RETURNING`); MySQL,
+ * which has none, gets the ones that still save a statement there.
+ */
+class MikroOrmRoundTrips {
+  private readonly pg: boolean;
+  private cpTypes?: Promise<Map<string, string>>;
+
+  constructor(
+    private readonly fork: () => EntityManager,
+    dialect: 'postgres' | 'mysql',
+    private readonly scope: string | undefined,
+    /** The store itself, whose batched plain calls settle a MySQL batch. */
+    private readonly store: StateStore,
+  ) {
+    this.pg = dialect === 'postgres';
+  }
+
+  private q(em: EntityManager, name: string): string {
+    return em.getPlatform().quoteIdentifier(name);
+  }
+
+  private meta(em: EntityManager, entity: unknown) {
+    return em.getMetadata().get(entity as never) as unknown as {
+      tableName: string;
+      properties: Record<
+        string,
+        {
+          fieldNames: string[];
+          customType?: {
+            convertToDatabaseValue(value: unknown, platform: unknown, ctx?: unknown): unknown;
+          };
+        }
+      >;
+    };
+  }
+
+  private field(em: EntityManager, entity: unknown, property: string): string {
+    const prop = this.meta(em, entity).properties[property];
+    const name = prop?.fieldNames[0];
+    if (!name) throw new Error(`no column for ${property}`);
+    return name;
+  }
+
+  private c(em: EntityManager, entity: unknown, property: string): string {
+    return this.q(em, this.field(em, entity, property));
+  }
+
+  private table(em: EntityManager, entity: unknown): string {
+    return this.q(em, this.meta(em, entity).tableName);
+  }
+
+  /** `value` as MikroORM binds it for `property` (its custom type's conversion, if any). */
+  private bind(em: EntityManager, entity: unknown, property: string, value: unknown): unknown {
+    if (value == null) return null;
+    const type = this.meta(em, entity).properties[property]?.customType;
+    return type ? type.convertToDatabaseValue(value, em.getPlatform(), { mode: 'query' }) : value;
+  }
+
+  private async run(
+    em: EntityManager,
+    sql: string,
+    params: unknown[],
+    method: 'all' | 'run' = 'all',
+  ): Promise<unknown> {
+    const connection = em.getConnection() as unknown as {
+      execute(sql: string, params: unknown[], method: string): Promise<unknown>;
+    };
+    return connection.execute(sql, params, method);
+  }
+
+  private rows(out: unknown): Record<string, unknown>[] {
+    if (Array.isArray(out)) return out as Record<string, unknown>[];
+    const rows = (out as { rows?: unknown } | undefined)?.rows;
+    return Array.isArray(rows) ? (rows as Record<string, unknown>[]) : [];
+  }
+
+  private affected(out: unknown): number {
+    return Number((out as { affectedRows?: number } | undefined)?.affectedRows ?? 0);
+  }
+
+  private runFromRow(em: EntityManager, raw: Record<string, unknown>): WorkflowRun {
+    return fromRunEntity(em.map(WorkflowRunEntity, raw) as WorkflowRunEntity);
+  }
+
+  private checkpointFromRow(em: EntityManager, raw: Record<string, unknown>): StepCheckpoint {
+    return fromCheckpointEntity(em.map(StepCheckpointEntity, raw) as StepCheckpointEntity);
+  }
+
+  /** The checkpoint columns but `input`, quoted, each prefixed with `prefix`. */
+  private settledColumns(em: EntityManager, prefix: string): string {
+    return Object.keys(this.meta(em, StepCheckpointEntity).properties)
+      .filter((p) => p !== 'input')
+      .map((p) => `${prefix}${this.c(em, StepCheckpointEntity, p)}`)
+      .join(', ');
+  }
+
+  async tryLockRunAndGet(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null> {
+    const em = this.fork();
+    const R = WorkflowRunEntity;
+    const until = this.c(em, R, 'lockedUntil');
+    const scope = this.scope !== undefined ? ` AND ${this.c(em, R, 'namespace')} = ?` : '';
+    const out = await this.run(
+      em,
+      `UPDATE ${this.table(em, R)} SET ${this.c(em, R, 'lockedBy')} = ?, ${until} = ? WHERE ${this.c(em, R, 'id')} = ? AND (${until} IS NULL OR ${until} <= ?)${scope} RETURNING *`,
+      [
+        owner,
+        this.bind(em, R, 'lockedUntil', new Date(leaseUntilMs)),
+        runId,
+        this.bind(em, R, 'lockedUntil', new Date(nowMs)),
+        ...(this.scope !== undefined ? [this.scope] : []),
+      ],
+    );
+    const [row] = this.rows(out);
+    return row ? this.runFromRow(em, row) : null;
+  }
+
+  async insertCheckpointIfAbsent(checkpoint: StepCheckpoint): Promise<boolean> {
+    // A plain insert: a row already there fails the primary key, which MikroORM reports as a
+    // unique-constraint violation on every dialect.
+    try {
+      await this.fork().insert(StepCheckpointEntity, toCheckpointEntity(checkpoint));
+      return true;
+    } catch (err) {
+      if (err instanceof UniqueConstraintViolationException) return false;
+      throw err;
+    }
+  }
+
+  private async cpType(em: EntityManager, property: string): Promise<string> {
+    const field = this.field(em, StepCheckpointEntity, property);
+    this.cpTypes ??= (
+      this.run(
+        em,
+        'SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = ? AND table_schema = current_schema()',
+        [this.meta(em, StepCheckpointEntity).tableName],
+      ) as Promise<unknown>
+    ).then((out) => new Map(this.rows(out).map((r) => [String(r.name), String(r.type)])));
+    return (await this.cpTypes).get(field) ?? 'text';
+  }
+
+  async settleResultsIfPending(
+    results: StepResultSettlement[],
+  ): Promise<(StepCheckpoint | null)[]> {
+    const out: (StepCheckpoint | null)[] = results.map(() => null);
+    const seen = new Set<string>();
+    const sent = results.flatMap((r, i) => {
+      const key = checkpointKey(r.runId, r.seq);
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [i];
+    });
+    if (sent.length === 0) return out;
+    const em = this.fork();
+    const K = StepCheckpointEntity;
+    const R = WorkflowRunEntity;
+    const c = (prop: string) => this.c(em, K, prop);
+    const finished = `NOT EXISTS (SELECT 1 FROM ${this.table(em, R)} r WHERE r.${this.c(em, R, 'id')} = c.${c('runId')} AND r.${this.c(em, R, 'status')} IN ('cancelled', 'completed'))`;
+    if (!this.pg && sent.length > 1) {
+      // MySQL batch: the store's batched calls, a fixed number of statements however wide it is.
+      return settleResultsWithPlainCalls(this.store, results);
+    }
+    if (!this.pg) {
+      // MySQL, one result: one conditional UPDATE and a read of the row.
+      for (const i of sent) {
+        const s = results[i] as StepResultSettlement;
+        const done = s.status === 'completed';
+        const wrote = this.affected(
+          await this.run(
+            em,
+            `UPDATE ${this.table(em, K)} c SET c.${c('status')} = ?, c.${c('output')} = ${done ? '?' : `c.${c('output')}`}, c.${c('error')} = ?, c.${c('events')} = COALESCE(?, c.${c('events')}), c.${c('startedAt')} = COALESCE(?, c.${c('startedAt')}), c.${c('finishedAt')} = ? WHERE c.${c('runId')} = ? AND c.${c('seq')} = ? AND c.${c('status')} = 'pending' AND ${finished}`,
+            [
+              s.status,
+              ...(done ? [this.bind(em, K, 'output', s.output)] : []),
+              this.bind(em, K, 'error', s.error),
+              this.bind(em, K, 'events', s.events),
+              this.bind(em, K, 'startedAt', s.startedAt),
+              this.bind(em, K, 'finishedAt', s.finishedAt),
+              s.runId,
+              s.seq,
+            ],
+            'run',
+          ),
+        );
+        if (!wrote) continue;
+        const [row] = this.rows(
+          await this.run(
+            em,
+            `SELECT ${this.settledColumns(em, '')} FROM ${this.table(em, K)} WHERE ${c('runId')} = ? AND ${c('seq')} = ?`,
+            [s.runId, s.seq],
+          ),
+        );
+        out[i] = row ? this.checkpointFromRow(em, row) : null;
+      }
+      return out;
+    }
+    const props = [
+      'runId',
+      'seq',
+      'status',
+      'output',
+      'error',
+      'events',
+      'startedAt',
+      'finishedAt',
+    ];
+    const types = new Map(
+      await Promise.all(props.map(async (p) => [p, await this.cpType(em, p)] as const)),
+    );
+    for (let at = 0; at < sent.length; at += 500) {
+      const chunk = sent.slice(at, at + 500);
+      const params: unknown[] = [];
+      const rows = chunk.map((i) => {
+        const s = results[i] as StepResultSettlement;
+        params.push(
+          s.runId,
+          s.seq,
+          s.status,
+          this.bind(em, K, 'output', s.status === 'completed' ? s.output : null),
+          this.bind(em, K, 'error', s.error),
+          this.bind(em, K, 'events', s.events),
+          this.bind(em, K, 'startedAt', s.startedAt),
+          this.bind(em, K, 'finishedAt', s.finishedAt),
+        );
+        return `(${props.map((p) => `?::${types.get(p)}`).join(', ')})`;
+      });
+      const settled = this.rows(
+        await this.run(
+          em,
+          `UPDATE ${this.table(em, K)} AS c SET ${c('status')} = v.status, ${c('output')} = CASE WHEN v.status = 'completed' THEN v.output ELSE c.${c('output')} END, ${c('error')} = v.error, ${c('events')} = COALESCE(v.events, c.${c('events')}), ${c('startedAt')} = COALESCE(v.started_at, c.${c('startedAt')}), ${c('finishedAt')} = v.finished_at FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.${c('runId')} = v.run_id AND c.${c('seq')} = v.seq AND c.${c('status')} = 'pending' AND ${finished} RETURNING ${this.settledColumns(em, 'c.')}`,
+          params,
+        ),
+      );
+      const byKey = new Map(
+        chunk.map((i) => {
+          const s = results[i] as StepResultSettlement;
+          return [checkpointKey(s.runId, s.seq), i];
+        }),
+      );
+      for (const raw of settled) {
+        const cp = this.checkpointFromRow(em, raw);
+        const i = byKey.get(checkpointKey(cp.runId, cp.seq));
+        if (i !== undefined) out[i] = cp;
+      }
+    }
+    return out;
+  }
+
+  async claimPendingRuns(
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const em = this.fork();
+    const R = WorkflowRunEntity;
+    const c = (prop: string) => this.c(em, R, prop);
+    const until = this.bind(em, R, 'lockedUntil', new Date(leaseUntilMs));
+    const now = this.bind(em, R, 'lockedUntil', new Date(nowMs));
+    const filters = [
+      ...(namespace !== undefined ? [namespace] : []),
+      ...(this.scope !== undefined ? [this.scope] : []),
+    ];
+    const where = `${c('status')} = 'pending' AND (${c('lockedUntil')} IS NULL OR ${c('lockedUntil')} <= ?)${filters.map(() => ` AND ${c('namespace')} = ?`).join('')}`;
+    const sort = (runs: WorkflowRun[]) =>
+      runs.sort(
+        (a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id),
+      );
+    if (this.pg) {
+      const out = await this.run(
+        em,
+        `UPDATE ${this.table(em, R)} AS r SET ${c('lockedBy')} = ?, ${c('lockedUntil')} = ? FROM (SELECT ${c('id')} AS claimed_id FROM ${this.table(em, R)} WHERE ${where} ORDER BY ${c('createdAt')}, ${c('id')} LIMIT ? FOR UPDATE SKIP LOCKED) AS claimed WHERE r.${c('id')} = claimed.claimed_id RETURNING r.*`,
+        [owner, until, now, ...filters, limit],
+      );
+      return sort(this.rows(out).map((raw) => this.runFromRow(em, raw)));
+    }
+    // MySQL (8.0+): lock the oldest free pending rows, skipping rows another claimer holds, then
+    // lease them, in one transaction.
+    return em.transactional(async (tx) => {
+      const picked = this.rows(
+        await this.run(
+          tx,
+          `SELECT * FROM ${this.table(tx, R)} WHERE ${where} ORDER BY ${c('createdAt')}, ${c('id')} LIMIT ? FOR UPDATE SKIP LOCKED`,
+          [now, ...filters, limit],
+        ),
+      ).map((raw) => this.runFromRow(tx, raw));
+      if (picked.length === 0) return [];
+      await this.run(
+        tx,
+        `UPDATE ${this.table(tx, R)} SET ${c('lockedBy')} = ?, ${c('lockedUntil')} = ? WHERE ${c('id')} IN (${picked.map(() => '?').join(', ')})`,
+        [owner, until, ...picked.map((run) => run.id)],
+        'run',
+      );
+      return sort(picked.map((run) => ({ ...run, lockedBy: owner, lockedUntil: leaseUntilMs })));
+    });
+  }
 }
