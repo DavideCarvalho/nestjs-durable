@@ -710,6 +710,90 @@ importers:
         specifier: 2.1.9
         version: 2.1.9(@types/node@25.9.8)(happy-dom@20.11.1)(lightningcss@1.32.0)
 
+  packages/workflows-gateway:
+    devDependencies:
+      '@dudousxd/nestjs-durable-core':
+        specifier: workspace:^
+        version: link:../core
+      '@dudousxd/nestjs-durable-dashboard':
+        specifier: workspace:*
+        version: link:../dashboard
+      '@dudousxd/nestjs-filter':
+        specifier: 1.33.0
+        version: 1.33.0(@dudousxd/nestjs-context@0.1.0(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(reflect-metadata@0.2.2))(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/common':
+        specifier: 12.0.1
+        version: 12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core':
+        specifier: 12.0.1
+        version: 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@12.0.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/platform-express':
+        specifier: 12.0.1
+        version: 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)
+      '@nestjs/testing':
+        specifier: 12.0.1
+        version: 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(@nestjs/platform-express@12.0.1)
+      '@nestjs/workflows':
+        specifier: 0.0.5
+        version: 0.0.5(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(drizzle-orm@0.45.3(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(@types/pg@8.11.10)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(postgres@3.4.9)(prisma@6.19.3(typescript@5.9.3)))(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@types/supertest':
+        specifier: 6.0.3
+        version: 6.0.3
+      reflect-metadata:
+        specifier: 0.2.2
+        version: 0.2.2
+      rxjs:
+        specifier: 7.8.2
+        version: 7.8.2
+      supertest:
+        specifier: 7.2.2
+        version: 7.2.2
+      tsup:
+        specifier: 8.3.5
+        version: 8.3.5(@swc/core@1.16.13)(jiti@2.7.0)(postcss@8.5.28)(typescript@5.9.3)(yaml@2.9.0)
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+
+  packages/workflows-remote:
+    devDependencies:
+      '@dudousxd/durable-worker':
+        specifier: workspace:*
+        version: link:../worker
+      '@dudousxd/nestjs-durable-core':
+        specifier: workspace:^
+        version: link:../core
+      '@dudousxd/nestjs-durable-transport-event-emitter':
+        specifier: workspace:*
+        version: link:../transport-event-emitter
+      '@nestjs/common':
+        specifier: 12.0.1
+        version: 12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core':
+        specifier: 12.0.1
+        version: 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@12.0.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/testing':
+        specifier: 12.0.1
+        version: 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(@nestjs/platform-express@12.0.1)
+      '@nestjs/workflows':
+        specifier: 0.0.5
+        version: 0.0.5(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(drizzle-orm@0.45.3(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(@types/pg@8.11.10)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(postgres@3.4.9)(prisma@6.19.3(typescript@5.9.3)))(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      eventemitter2:
+        specifier: 6.4.9
+        version: 6.4.9
+      reflect-metadata:
+        specifier: 0.2.2
+        version: 0.2.2
+      rxjs:
+        specifier: 7.8.2
+        version: 7.8.2
+      tsup:
+        specifier: 8.3.5
+        version: 8.3.5(@swc/core@1.16.13)(jiti@2.7.0)(postcss@8.5.28)(typescript@5.9.3)(yaml@2.9.0)
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+
   website:
     dependencies:
       '@orama/orama':
@@ -2228,6 +2312,24 @@ packages:
       '@nestjs/common': ^12.0.0
       '@nestjs/core': ^12.0.0
 
+  '@nestjs/store-kit@0.1.3':
+    resolution: {integrity: sha512-vNxc7wVIVVRI3xfbmADNqOCKDqBc01w839q7n/wlzKLoaZ33sJRqX+8D6P0hrZGlaGBQ1m5b1aGsBfV1tm73lw==}
+    engines: {node: '>=20.19.0'}
+    peerDependencies:
+      drizzle-orm: '>=0.29.0 || >=1.0.0-0'
+      kysely: '>=0.27.0'
+      mysql2: ^3.0.0
+      pg: ^8.0.0
+    peerDependenciesMeta:
+      drizzle-orm:
+        optional: true
+      kysely:
+        optional: true
+      mysql2:
+        optional: true
+      pg:
+        optional: true
+
   '@nestjs/testing@12.0.1':
     resolution: {integrity: sha512-prf3fsUaoKS6t04XcQt5aSTp68Po1GxUcbEBPv+3iqAef07hKQEO15r0jmmwA+rWZfONYT1UcV3YIylR++/tCg==}
     peerDependencies:
@@ -2239,6 +2341,20 @@ packages:
       '@nestjs/microservices':
         optional: true
       '@nestjs/platform-express':
+        optional: true
+
+  '@nestjs/workflows@0.0.5':
+    resolution: {integrity: sha512-UWqvnkDZ8oBoIsXApdRt3B0u20CV/C2unlL1UOw9wMFcViLSoF5O4czI+/syeJrLiCergZakhM56IieG4bQq9g==}
+    engines: {node: '>=20.19.0'}
+    hasBin: true
+    peerDependencies:
+      '@nestjs/common': ^11.0.0 || ^12.0.0
+      '@nestjs/core': ^11.0.0 || ^12.0.0
+      '@nestjs/cqrs': ^11.0.0 || ^12.0.0
+      reflect-metadata: ^0.1.13 || ^0.2.0
+      rxjs: ^7.1.0
+    peerDependenciesMeta:
+      '@nestjs/cqrs':
         optional: true
 
   '@next/env@16.2.7':
@@ -2947,7 +3063,9 @@ packages:
   '@smithy/core@3.33.3':
     resolution: {integrity: sha512-CsOeKq/9kA3y6VJHt+/+VTCtBaxJ4OTFpgrjIUhPpDIKxBci1k2bJaQASF2h/ELWrulGp+t97DZ0mevfAD8idg==}
     engines: {node: '>=18.0.0'}
-    deprecated: Deprecated due to a bug in custom logger data redaction. See https://github.com/aws/aws-sdk-js-v3/issues/8393.
+    deprecated: |-
+      Deprecated due to a bug in custom logger data redaction. Upgrade to the latest version. If you used a custom logger with this
+        version, review your logs and rotate any credentials or other secrets. See https://github.com/aws/aws-sdk-js-v3/issues/8393.
 
   '@smithy/credential-provider-imds@4.5.2':
     resolution: {integrity: sha512-A9uSdn72ozbRUSit0eib0TW7nXuNPlaeM0zcGkJ+nE6tFcSDbnmtwoxbTCFBukVQcszDAyvsd7+rTduPTXpygg==}
@@ -8437,6 +8555,13 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
+  '@nestjs/store-kit@0.1.3(drizzle-orm@0.45.3(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(@types/pg@8.11.10)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(postgres@3.4.9)(prisma@6.19.3(typescript@5.9.3)))(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)':
+    optionalDependencies:
+      drizzle-orm: 0.45.3(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(@types/pg@8.11.10)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(postgres@3.4.9)(prisma@6.19.3(typescript@5.9.3))
+      kysely: 0.29.2
+      mysql2: 3.22.4(@types/node@22.20.2)
+      pg: 8.21.0
+
   '@nestjs/testing@12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(@nestjs/platform-express@12.0.1)':
     dependencies:
       '@nestjs/common': 12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
@@ -8444,6 +8569,19 @@ snapshots:
       tslib: 2.8.1
     optionalDependencies:
       '@nestjs/platform-express': 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)
+
+  '@nestjs/workflows@0.0.5(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(drizzle-orm@0.45.3(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(@types/pg@8.11.10)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(postgres@3.4.9)(prisma@6.19.3(typescript@5.9.3)))(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(reflect-metadata@0.2.2)(rxjs@7.8.2)':
+    dependencies:
+      '@nestjs/common': 12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core': 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@12.0.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/store-kit': 0.1.3(drizzle-orm@0.45.3(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(@types/pg@8.11.10)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(postgres@3.4.9)(prisma@6.19.3(typescript@5.9.3)))(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)
+      reflect-metadata: 0.2.2
+      rxjs: 7.8.2
+    transitivePeerDependencies:
+      - drizzle-orm
+      - kysely
+      - mysql2
+      - pg
 
   '@next/env@16.2.7': {}
 
@@ -10338,6 +10476,20 @@ snapshots:
       pg: 8.13.1
       postgres: 3.4.9
       prisma: 6.19.3(typescript@5.9.3)
+
+  drizzle-orm@0.45.3(@opentelemetry/api@1.9.1)(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@types/better-sqlite3@7.6.13)(@types/pg@8.11.10)(better-sqlite3@12.10.0)(kysely@0.29.2)(mysql2@3.22.4(@types/node@22.20.2))(pg@8.21.0)(postgres@3.4.9)(prisma@6.19.3(typescript@5.9.3)):
+    optionalDependencies:
+      '@opentelemetry/api': 1.9.1
+      '@prisma/client': 6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3)
+      '@types/better-sqlite3': 7.6.13
+      '@types/pg': 8.11.10
+      better-sqlite3: 12.10.0
+      kysely: 0.29.2
+      mysql2: 3.22.4(@types/node@22.20.2)
+      pg: 8.21.0
+      postgres: 3.4.9
+      prisma: 6.19.3(typescript@5.9.3)
+    optional: true
 
   dunder-proto@1.0.1:
     dependencies:

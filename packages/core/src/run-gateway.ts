@@ -35,6 +35,38 @@ export interface DurableTopology {
   role: 'control-plane' | 'tenant';
   /** The tenant's isolation partition name; set only when `role` is 'tenant'. */
   tenant?: string;
+  /**
+   * The engine behind the gateway, when it is not nestjs-durable's own (e.g. `'@nestjs/workflows'`
+   * for `@dudousxd/nestjs-durable-workflows-gateway`). Shown in the console header. Absent: durable.
+   */
+  engine?: string;
+  /**
+   * Console features this gateway cannot serve, as `false`; the SPA hides their controls. A key
+   * left out (or no object at all, as from every durable gateway) means supported.
+   */
+  capabilities?: ConsoleCapabilities;
+}
+
+/** See {@link DurableTopology.capabilities}. `false` hides the control; absent means supported. */
+export interface ConsoleCapabilities {
+  /** Search-attribute filters (`attributes` in a run query). */
+  searchAttributes?: boolean;
+  /** The tenant/namespace picker. */
+  namespaces?: boolean;
+  /** Tag filters. */
+  tags?: boolean;
+  /** Origin chips (which package/app started a run). */
+  origins?: boolean;
+  /** Breakpoints (`Continue`). */
+  breakpoints?: boolean;
+  /** Re-dispatching lost remote steps. */
+  redispatch?: boolean;
+  /** Republishing lifecycle events. */
+  republishLifecycle?: boolean;
+  /** The schedules panel. */
+  schedules?: boolean;
+  /** The workers / partitions health panel. */
+  workers?: boolean;
 }
 
 /** The run whose settling started a run, as its detail names it. */

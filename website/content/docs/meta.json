@@ -16,6 +16,8 @@
     "patterns",
     "production",
     "troubleshooting",
+    "---@nestjs/workflows---",
+    "nestjs-workflows",
     "---Cross-language---",
     "python",
     "---Tooling---",

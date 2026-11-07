@@ -133,6 +133,8 @@ multiple worker pools sharing one store/broker.
 | `@dudousxd/nestjs-durable-cli` | `durable inspect` — runs & timelines in the terminal | ✅ |
 | `@dudousxd/nestjs-durable-testing` | Test harness, crash injection, replay assertions | ✅ |
 | `durable-worker` (PyPI) | Python SDK + wire protocol — implement steps **and** author workflows | ✅ |
+| `@dudousxd/nestjs-durable-workflows-gateway` | The durable dashboard over the official `@nestjs/workflows` engine | ✅ |
+| `@dudousxd/nestjs-durable-workflows-remote` | `remoteStep()` for `@nestjs/workflows`: steps on Node/Python durable workers | ✅ |
 
 ## License
 

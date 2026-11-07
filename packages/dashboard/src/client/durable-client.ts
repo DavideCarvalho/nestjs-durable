@@ -43,7 +43,27 @@ export type StepKind = CoreStepKind;
 export interface DurableTopology {
   role: 'control-plane' | 'tenant';
   tenant?: string;
+  /** The engine behind the console when it is not durable's own (e.g. `@nestjs/workflows`). */
+  engine?: string;
+  /** Features the server cannot serve, as `false`; the SPA hides their controls. */
+  capabilities?: ConsoleCapabilities;
 }
+
+/** Mirrors core's `ConsoleCapabilities`: `false` hides a control, absent means supported. */
+export type ConsoleCapabilities = Partial<
+  Record<
+    | 'searchAttributes'
+    | 'namespaces'
+    | 'tags'
+    | 'origins'
+    | 'breakpoints'
+    | 'redispatch'
+    | 'republishLifecycle'
+    | 'schedules'
+    | 'workers',
+    boolean
+  >
+>;
 
 /** What an event-parked suspended run is waiting on. Derived from core: adding a new `on` variant
  *  there (e.g. `breakpoint`) shows up here with no client-side edit needed. */
