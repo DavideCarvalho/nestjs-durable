@@ -946,8 +946,30 @@ park point is read from the store exactly as a replay reads it.
 
 A parked body costs about 26 KB of heap (measured with a small body; its closures, the ctx and its
 pending promises), so the default holds ~26 MB at most. Runs past the limit just replay; raise it on an
-instance that keeps more runs in flight at once, lower it where memory is tight. With several engine instances consuming one results queue, a result lands on the instance that
-holds the parked body only part of the time. The other instances replay, which is correct, just slower.
+instance that keeps more runs in flight at once, lower it where memory is tight.
+
+### Several engine instances: results go back to the parked body
+
+With several engine instances consuming one results queue, a step's result would land on the instance
+holding its parked body only part of the time, and the others would replay. So a dispatched `ctx.step`
+asks for its result back: the task carries the dispatching instance's id (`replyTo`), and on a
+transport that routes replies (BullMQ) the worker sends the result to that instance's own queue
+(`<prefix>-results-to-<instance>`). Step fans (`ctx.all`) keep the shared queue, so a wide fan still
+spreads over every engine.
+
+A result is never lost to a missing instance. Each engine keeps an alive key in Redis; while it is
+missing (a crash, a scale-down, a shutdown, which deletes it first), workers send results to the
+shared queue, and every engine and worker moves what is left on a dead instance's queue there,
+stalled jobs included. That result then replays on whichever engine takes it. Engines and workers
+from before this change ignore `replyTo`, so a rolling deploy mixes freely.
+
+| Option | Where | Default | What it does |
+|---|---|---|---|
+| `routeReplies` | `DurableModule` / `WorkflowEngine` | `true` | Ask for routed results (only while the sticky cache is on). |
+| `replyRouting` | `BullMQTransport` | `true` | Consume and send routed results; `false` keeps everything on the shared queue. |
+| `replyAliveTtlMs` | `BullMQTransport` | `15_000` | How long an engine's alive key outlives its last refresh. |
+| `replySweepMs` | `BullMQTransport` | `5_000` | How often dead instances' queues are looked for. |
+| `replyDrainIdleMs` | `BullMQTransport` | `90_000` | How long an emptied dead queue is still watched before it's forgotten. |
 
 ### Fewer round trips
 
@@ -957,7 +979,16 @@ settling a batch of step results and reading the settled rows back in one statem
 first dispatch's `pending` row without a read first (`insertCheckpointIfAbsent`), and claiming pending
 runs in batches with `FOR UPDATE SKIP LOCKED` (`claimPendingRuns`). Several driving replicas without a
 run queue split the backlog instead of racing for the same rows, and each runs its batch concurrently.
-A custom store that omits them keeps working; the engine falls back to the read-then-write calls.
+The Drizzle (Postgres), TypeORM, MikroORM and Prisma stores implement them on Postgres and MySQL (on
+MySQL, which has no `RETURNING`, the ones that still save a statement there); on SQLite they are
+left out. A custom store that omits them keeps working; the engine falls back to the read-then-write
+calls. A store for a database without `RETURNING` can build `settleResultsIfPending` for batches on
+its own batched calls with `settleResultsWithPlainCalls` from the core package.
+
+The sticky continuation recognizes the run row by the exact `updatedAt` its suspend wrote, so a store
+must keep that column to the millisecond. Every bundled store does on Postgres and MySQL (the
+TypeORM and MikroORM auto-schemas raise older second-precision MySQL columns at boot); one that rounds
+it just replays every turn.
 
 On node-postgres, the Drizzle store sends these statements as constant SQL text instead of rebuilding
 them with drizzle's query builder every time (other drivers keep the builder). Set
