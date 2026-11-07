@@ -136,6 +136,8 @@ _DEFAULT_GROW_HEADROOM_TICKS = 3
 # How many per-name cost observations to keep. A rolling max over the last few SOLO runs: enough to
 # stay conservative, short enough to forget a one-off overestimate instead of throttling forever.
 _STEP_COST_SAMPLES = 5
+# Without the admission gate, a step name's memory cost (heartbeat-only) is measured at most this often.
+_UNGATED_COST_SAMPLE_INTERVAL_S = 1.0
 
 # Where the memory numbers come from. Under Kubernetes with cgroup v2 the container gets its own
 # cgroup namespace, so these root paths ARE the container's own files.
@@ -550,6 +552,7 @@ class AdaptiveController:
         self._token_seq = 0
         # Per step NAME: the last few observed solo costs in bytes; the estimate is their max.
         self._step_costs: Dict[str, Deque[int]] = {}
+        self._cost_sampled_at: Dict[Optional[str], float] = {}
         # Usage last seen with NOTHING in flight — the baseline the gate adds reservations to.
         self._idle_usage: Optional[int] = None
         # Consecutive ticks with real headroom; growth requires config.grow_headroom_ticks of them.
@@ -600,7 +603,7 @@ class AdaptiveController:
         self._token_seq += 1
         token = self._token_seq
         record = _InFlight(name=name, solo=solo)
-        if solo and self.config.step_cost_tracking:
+        if solo and self.config.step_cost_tracking and self._measure_cost_now(name):
             record.usage_at_start = self._usage_bytes()
             record.peak_at_start = self._peak_bytes()
         self._inflight[token] = record
@@ -632,8 +635,9 @@ class AdaptiveController:
             record = self._inflight.pop(oldest)
         if record is not None and kind == "step":
             self._learn_step_cost(record)
-        if not self._inflight:
+        if not self._inflight and self._gating():
             # Back to idle: this is the cleanest baseline we'll get for the gate's reservations.
+            # (Without the gate nothing reads it per step; the control tick keeps it fresh.)
             usage = self._usage_bytes()
             if usage is not None:
                 self._idle_usage = usage
@@ -652,6 +656,23 @@ class AdaptiveController:
             and self._settled_since_decide >= self.limit
         ):
             self._decide(grow_only=True, settling=1)
+
+    def _gating(self) -> bool:
+        """Whether the memory admission gate runs (adaptive mode with ``ramAdmission``)."""
+        return self.config.mode == "adaptive" and self.config.ram_admission
+
+    def _measure_cost_now(self, name: Optional[str]) -> bool:
+        """Whether to measure this step's memory cost. The gate needs every solo step measured; without
+        it the cost only feeds the heartbeat's ``stepCostBytes``, so each name is measured at most once
+        a second instead of reading the memory files around every step."""
+        if self._gating():
+            return True
+        now = time.monotonic()
+        last = self._cost_sampled_at.get(name)
+        if last is not None and now - last < _UNGATED_COST_SAMPLE_INTERVAL_S:
+            return False
+        self._cost_sampled_at[name] = now
+        return True
 
     # -- admission control ------------------------------------------------------------------------
 
