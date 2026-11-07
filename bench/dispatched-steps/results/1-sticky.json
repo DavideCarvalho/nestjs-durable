@@ -1,0 +1,32 @@
+{
+  "seq10": {
+    "msPerStep": 11.15,
+    "firstDecile": 17,
+    "lastDecile": 10,
+    "sqlPerStep": 16.1,
+    "cpuMsPerStep": 6.93,
+    "stickyHits": 10
+  },
+  "seq200": {
+    "msPerStep": 7.58,
+    "firstDecile": 8.11,
+    "lastDecile": 7,
+    "sqlPerStep": 15.05,
+    "cpuMsPerStep": 3.1,
+    "stickyHits": 200
+  },
+  "seq1000": {
+    "msPerStep": 7.72,
+    "firstDecile": 7.29,
+    "lastDecile": 10.03,
+    "sqlPerStep": 15.01,
+    "cpuMsPerStep": 2.64,
+    "stickyHits": 1000
+  },
+  "throughput": {
+    "wfPerSec": 53.65,
+    "sqlPerStep": 18,
+    "cpuMsPerWf": 15.24,
+    "stickyHits": 5000
+  }
+}

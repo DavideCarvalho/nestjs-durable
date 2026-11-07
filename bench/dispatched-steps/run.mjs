@@ -17,7 +17,12 @@ import { writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-const root = fileURLToPath(new URL('../../', import.meta.url));
+// BENCH_ROOT: another checkout to measure (e.g. a worktree of the base commit, built), so two
+// builds can be compared run by run under the same machine load (see ab.mjs).
+const root = (process.env.BENCH_ROOT ?? fileURLToPath(new URL('../../', import.meta.url))).replace(
+  /\/?$/,
+  '/',
+);
 const require = createRequire(`${root}packages/store-drizzle/package.json`);
 const pg = require('pg');
 const { drizzle } = require('drizzle-orm/node-postgres');
@@ -122,6 +127,13 @@ async function boot() {
   const pool = new pg.Pool({ connectionString: DATABASE_URL, max: POOL });
   const store = new DrizzlePgStateStore(drizzle(pool));
   await store.ensureSchema();
+  // BENCH_NO_ROUND_TRIP_METHODS=1: hide the optional round-trip-saving store methods, so the engine
+  // takes its read-then-write paths (to measure the sticky continuation on its own).
+  if (process.env.BENCH_NO_ROUND_TRIP_METHODS) {
+    for (const m of ['settleResultsIfPending', 'tryLockRunAndGet', 'insertCheckpointIfAbsent']) {
+      Object.defineProperty(store, m, { value: undefined });
+    }
+  }
   const transport = new InlineTransport();
   transport.handlers.set('bench.now', async () => Date.now());
   for (let i = 1; i <= 5; i += 1) transport.handlers.set(`bench.s${i}`, async (k) => k + 1);
@@ -208,7 +220,12 @@ async function throughput() {
   printTally(WF * 5);
   await env.engine.drain?.(2000).catch(() => undefined);
   await env.pool.end();
-  return { wfPerSec: (WF * 1000) / ms, sqlPerStep: sql / (WF * 5), cpuMsPerWf: cpu / WF };
+  return {
+    wfPerSec: (WF * 1000) / ms,
+    sqlPerStep: sql / (WF * 5),
+    cpuMsPerWf: cpu / WF,
+    stickyHits: env.engine.sticky?.hits ?? 0,
+  };
 }
 
 const SCENARIOS = {
