@@ -103,15 +103,19 @@ export class OrderWorkflow {
 | `… { timeout }` (resolves `null`) | `… { timeoutMs }` (**throws** `SignalTimeoutError`) | ✅ + TODO |
 | `… { match }` | filter and wait again, or [`ctx.waitForEvent(name, { match })`](/docs/authoring/events) | TODO |
 | `client.signal('approve', payload, { key })` | `workflows.signal(`approve:${key}`, payload)` | ✅ |
-| `client.signal(…, { id })` (dedupe) | no dedupe id on durable signals: deduplicate upstream (the [outbox](/docs/reliability/transactional-start) inbox) | TODO |
-| `ctx.waitForAny(name, { … })` | no equivalent yet. Signal or timeout: `waitForSignal(token, { timeoutMs })` + catch `SignalTimeoutError`. A child with a deadline: `ctx.waitForRun(id, { timeoutMs })` | TODO |
+| `client.signal(…, { key, id })` (dedupe) | `workflows.signal(`approve:${key}`, payload, { id })`: a re-send with the same token and id is dropped while the id is remembered ([`signalIdTtl`](/docs/concepts/sleep-and-signals#deduplicating-signals-id), 7 days by default) | ✅ |
+| `ctx.waitForAny(name, { … })` | [`ctx.waitForAny(name, { … })`](/docs/concepts/sleep-and-signals#waiting-for-the-first-of-several-waitforany), same `{ key, value }` result | ✅ |
+| `ctx.signalWait(signal, { key })` | `ctx.signalWait(`signal:${key}`)` | ✅ |
+| `ctx.signalWait(…, { match })` | none: give the signals you want told apart their own token | TODO |
+| `ctx.timer('3d')` / `ctx.timer({ until })` | the same | ✅ |
+| a child handle as a condition | `ctx.childWait(id)` (durable's `startChild` resolves the id) | ✅ |
 
 ### Children
 
 | `@nestjs/workflows` | nestjs-durable | Codemod |
 | --- | --- | --- |
 | `ctx.executeChild(W, input, { id })` | `ctx.child(W, input, { childId })` | ✅ |
-| `ctx.startChild(W, input, { id })` → handle | `ctx.startChild(W, input, { childId })` → **the id**; join with `ctx.waitForRun(id)` | ✅ + TODO |
+| `ctx.startChild(W, input, { id })` → handle | `ctx.startChild(W, input, { childId })` → **the id**; join with `ctx.child(W, input, { childId: id })` or `ctx.waitForRun(id)`, race it with `ctx.childWait(id)` | ✅ (+ TODO unless only raced in `waitForAny`) |
 | `{ parentClose: 'cancel' \| 'terminate' \| 'abandon' }` | the same [`parentClose`](/docs/authoring/child-workflows#when-the-parent-ends-first--parentclose). The official default is `'cancel'`; durable's default leaves a finished parent's children running | ✅ |
 | `{ version: 2 }` / `{ priority }` | `{ version: '2' }` / `{ priority }` | ✅ |
 
@@ -215,11 +219,18 @@ tables until you no longer need their history; durable never reads them.
 
 What durable doesn't do the same way yet, and what to do instead:
 
-- **`ctx.waitForAny`**: no equivalent yet; see the table above for the usual shapes. A general race
-  needs a new primitive across the in-process context, the remote decision protocol and the Node and
-  Python worker contexts.
-- **Signal dedupe ids**: `signal(…, { id })` has no durable counterpart. Deduplicate before
-  signalling (the `@nestjs/outbox` inbox, or your message's id in your own table).
+- **Signals are point-to-point tokens.** The official engine stores a signal once and lets every
+  instance waiting on its name and key take it; a durable signal is taken by one wait. The codemod's
+  `<name>:<key>` tokens keep the usual one-instance-per-key shape working unchanged.
+- **Signal dedupe scope**: durable remembers an `id` per token (name + key) for `signalIdTtl`
+  (default 7 days), where the official engine remembers it per signal name for as long as the signal
+  row is kept (until `purge`). So the same name and id with another key is a second signal on
+  durable, not a `WorkflowIdConflictError`, and `signal()` resolves `null` for a duplicate instead of
+  `{ created: false }`.
+- **`waitForAny` details**: a failed child that wins throws `FatalError` (as `ctx.child` does), not
+  `ChildWorkflowFailedError`; `signalWait`'s `match` has no counterpart. Signals buffered before the
+  wait count, as for `waitForSignal` (the official engine only takes signals sent after the instance
+  started).
 - **`ctx.commit()`**, **`ctx.setStatus()` as a typed status column**, **workflow-level rate limits by
   key**: see the tables above.
 - **`parentClose` default**: the official engine cancels running children when a parent ends;

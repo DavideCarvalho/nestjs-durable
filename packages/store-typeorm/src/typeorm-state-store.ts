@@ -62,6 +62,7 @@ import {
   BufferedSignalEntity,
   RunAttributeEntity,
   ScheduleEntity,
+  SignalIdEntity,
   SignalWaiterEntity,
   StepCheckpointEntity,
   WorkflowRunEntity,
@@ -151,6 +152,9 @@ export class TypeOrmStateStore implements StateStore {
   }
   private bufferedEvents() {
     return this.dataSource.getRepository(BufferedEventEntity);
+  }
+  private signalIds() {
+    return this.dataSource.getRepository(SignalIdEntity);
   }
   private attributes() {
     return this.dataSource.getRepository(RunAttributeEntity);
@@ -1203,6 +1207,71 @@ export class TypeOrmStateStore implements StateStore {
     return { payload: e.payload ?? undefined };
   }
 
+  async takeOldestBufferedSignal(
+    tokens: string[],
+  ): Promise<{ token: string; payload: unknown } | null> {
+    if (tokens.length === 0) return null;
+    const unique = [...new Set(tokens)];
+    // Read the oldest row, then delete it by id: the delete's affected count decides who took it, so
+    // a taker that loses the row to a concurrent one reads the next oldest instead.
+    for (;;) {
+      const e = await this.buffered().findOne({
+        where: { token: In(unique) },
+        order: { id: 'ASC' },
+      });
+      if (!e) return null;
+      const deleted = await this.buffered().delete({ id: e.id });
+      if (deleted.affected === 1) return { token: e.token, payload: e.payload ?? undefined };
+    }
+  }
+
+  async claimSignalId(
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    // Insert first: the primary key decides between concurrent claims. On a duplicate, take the row
+    // over only if it expired — a PK-scoped conditional UPDATE, so concurrent takeovers serialize on
+    // the one row lock and exactly one sees it expired. (A DELETE-expired-then-INSERT deadlocks on
+    // MySQL: the range delete takes gap locks the concurrent inserts wait on.) A row deleted between
+    // the duplicate and the update (released, or swept as expired) is inserted again.
+    for (;;) {
+      try {
+        await this.signalIds().insert({ token, signalId: id, expiresAt });
+        return true;
+      } catch (err) {
+        if (!isUniqueViolation(err)) throw err;
+      }
+      const taken = await this.signalIds().update(
+        { token, signalId: id, expiresAt: LessThanOrEqual(nowMs) },
+        { expiresAt },
+      );
+      if (taken.affected === 1) return true;
+      if (await this.signalIds().exists({ where: { token, signalId: id } })) return false;
+    }
+  }
+
+  async releaseSignalId(token: string, id: string): Promise<void> {
+    await this.signalIds().delete({ token, signalId: id });
+  }
+
+  async deleteExpiredSignalIds(nowMs: number, limit: number): Promise<number> {
+    const rows = await this.signalIds().find({
+      select: { token: true, signalId: true },
+      where: { expiresAt: LessThanOrEqual(nowMs) },
+      take: limit,
+    });
+    if (rows.length === 0) return 0;
+    // The IN pairs can cross-match other rows, but only expired ones, which are doomed anyway.
+    const result = await this.signalIds().delete({
+      token: In([...new Set(rows.map((r) => r.token))]),
+      signalId: In([...new Set(rows.map((r) => r.signalId))]),
+      expiresAt: LessThanOrEqual(nowMs),
+    });
+    return result.affected ?? rows.length;
+  }
+
   async listBufferedSignals(
     tokenPrefix: string,
     afterId: string | undefined,
@@ -1487,4 +1556,17 @@ async function updateIfPending(
     .where({ runId, seq, status: 'pending' })
     .execute();
   return (result.affected ?? 0) > 0;
+}
+
+/** Whether `err` is the driver's duplicate-key error (Postgres, MySQL/MariaDB, SQLite). */
+function isUniqueViolation(err: unknown): boolean {
+  const driverError = (err as { driverError?: unknown } | null)?.driverError ?? err;
+  const e = driverError as { code?: unknown; errno?: unknown } | null;
+  const code = String(e?.code ?? '');
+  return (
+    code === '23505' ||
+    code === 'ER_DUP_ENTRY' ||
+    e?.errno === 1062 ||
+    code.startsWith('SQLITE_CONSTRAINT')
+  );
 }

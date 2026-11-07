@@ -27,13 +27,20 @@ export class OrderWorkflow {
       key: input.orderId,
       timeout: '2d',
     });
+    const audit = await ctx.startChild('audit', { orderId: input.orderId });
+    const delivery = await ctx.waitForAny('delivery', {
+      delivered: ctx.signalWait<{ at: string }>('delivered', { key: input.orderId }),
+      cancelled: ctx.signalWait('cancelled', { key: input.orderId }),
+      audit,
+      timeout: ctx.timer('3d'),
+    });
     ctx.setStatus({ stage: 'shipping' });
     const label = await ctx.executeChild(ShippingWorkflow, { orderId: input.orderId }, {
       id: `ship-${input.orderId}`,
       parentClose: 'abandon',
     });
     ctx.commit('shipped');
-    return { charge, approval, label, startedAt, by: ctx.workflowId };
+    return { charge, approval, delivery, label, startedAt, by: ctx.workflowId };
   }
 }
 
@@ -56,7 +63,7 @@ export class OrdersController {
   }
 
   async approve(orderId: string) {
-    await this.client.signal('approval', { approved: true }, { key: orderId });
+    await this.client.signal('approval', { approved: true }, { key: orderId, id: `approve-${orderId}` });
   }
 
   async outcome(orderId: string) {

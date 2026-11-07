@@ -2835,6 +2835,90 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.takeBufferedSignal('other')).toEqual({ payload: { n: 9 } });
     });
 
+    t('takes the oldest buffered signal among several tokens (waitForAny)', async () => {
+      const take = store.takeOldestBufferedSignal?.bind(store);
+      expect(take).toBeTypeOf('function');
+      if (!take) return;
+      expect(await take([])).toBeNull();
+      expect(await take(['a', 'b'])).toBeNull();
+      await store.bufferSignal('b', { n: 1 });
+      await store.bufferSignal('a', { n: 2 });
+      await store.bufferSignal('c', { n: 3 });
+      await store.bufferSignal('b', { n: 4 });
+      await store.bufferSignal('a_', { n: 5 });
+      expect(await take(['a', 'b'])).toEqual({ token: 'b', payload: { n: 1 } });
+      expect(await take(['a', 'b', 'a'])).toEqual({ token: 'a', payload: { n: 2 } });
+      expect(await take(['a', 'b'])).toEqual({ token: 'b', payload: { n: 4 } });
+      // Exact tokens: `a_` is not `a`, and `c` was never asked for.
+      expect(await take(['a', 'b'])).toBeNull();
+      expect(await store.takeBufferedSignal('c')).toEqual({ payload: { n: 3 } });
+      expect(await store.takeBufferedSignal('a_')).toEqual({ payload: { n: 5 } });
+    });
+
+    t('never hands one buffered signal to two concurrent takers among tokens', async () => {
+      const take = store.takeOldestBufferedSignal?.bind(store);
+      const peerTake = peerStore.takeOldestBufferedSignal?.bind(peerStore);
+      if (!take || !peerTake) return;
+      for (let i = 0; i < 6; i += 1) await store.bufferSignal(i % 2 ? 'x' : 'y', i);
+      const taken = await Promise.all(
+        Array.from({ length: 10 }, (_, i) => (i % 2 ? take : peerTake)(['x', 'y'])),
+      );
+      const payloads = taken.flatMap((t) => (t ? [t.payload as number] : []));
+      expect(payloads.sort()).toEqual([0, 1, 2, 3, 4, 5]);
+    });
+
+    t('records a signal id once per token until it expires (signal dedupe)', async () => {
+      const claim = store.claimSignalId?.bind(store);
+      expect(claim).toBeTypeOf('function');
+      expect(store.releaseSignalId).toBeTypeOf('function');
+      expect(store.deleteExpiredSignalIds).toBeTypeOf('function');
+      if (!claim) return;
+      expect(await claim('paid:o1', 'evt-1', NOW + DAY, NOW)).toBe(true);
+      expect(await claim('paid:o1', 'evt-1', NOW + 2 * DAY, NOW + 1000)).toBe(false);
+      // Per token: the same id on another token is another signal.
+      expect(await claim('paid:o2', 'evt-1', NOW + DAY, NOW)).toBe(true);
+      // Expired (expiresAt <= now) counts as absent and is replaced, with the new expiry.
+      expect(await claim('paid:o1', 'evt-1', NOW + 3 * DAY, NOW + DAY)).toBe(true);
+      expect(await claim('paid:o1', 'evt-1', NOW + 4 * DAY, NOW + 2 * DAY)).toBe(false);
+      // Released: claimable again at once.
+      await store.releaseSignalId?.('paid:o1', 'evt-1');
+      expect(await claim('paid:o1', 'evt-1', NOW + DAY, NOW)).toBe(true);
+      await store.releaseSignalId?.('never', 'claimed');
+    });
+
+    t('records a signal id for exactly one of several concurrent claims', async () => {
+      const claim = store.claimSignalId?.bind(store);
+      const peerClaim = peerStore.claimSignalId?.bind(peerStore);
+      if (!claim || !peerClaim) return;
+      const fresh = await Promise.all(
+        Array.from({ length: 8 }, (_, i) =>
+          (i % 2 ? claim : peerClaim)('t', 'race', NOW + DAY, NOW),
+        ),
+      );
+      expect(fresh.filter(Boolean)).toHaveLength(1);
+      // Concurrent takeovers of an expired record: still exactly one.
+      const later = NOW + 2 * DAY;
+      const again = await Promise.all(
+        Array.from({ length: 8 }, (_, i) =>
+          (i % 2 ? claim : peerClaim)('t', 'race', later + DAY, later),
+        ),
+      );
+      expect(again.filter(Boolean)).toHaveLength(1);
+    });
+
+    t('deletes expired signal ids in bounded batches', async () => {
+      const claim = store.claimSignalId?.bind(store);
+      const sweep = store.deleteExpiredSignalIds?.bind(store);
+      if (!claim || !sweep) return;
+      for (let i = 0; i < 5; i += 1) await claim('t', `old-${i}`, NOW + i, NOW - DAY);
+      await claim('t', 'fresh', NOW + DAY, NOW);
+      expect(await sweep(NOW + 4, 3)).toBe(3);
+      expect(await sweep(NOW + 4, 3)).toBe(2);
+      expect(await sweep(NOW + 4, 3)).toBe(0);
+      expect(await claim('t', 'fresh', NOW + DAY, NOW)).toBe(false);
+      expect(await claim('t', 'old-0', NOW + DAY, NOW + 5)).toBe(true);
+    });
+
     t('buffers events per name, oldest-first, and lists them without consuming', async () => {
       await store.bufferEvent({
         name: 'order.paid',

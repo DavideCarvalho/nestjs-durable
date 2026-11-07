@@ -107,6 +107,13 @@ export const DURABLE_CANONICAL_COLUMNS = {
     payload: 'payload',
     publishedAt: 'published_at',
   },
+  // Signal dedupe ids (`engine.signal(token, payload, { id })`): one row per (token, id) until it
+  // expires. `expires_at` is when the id stops deduplicating.
+  durable_signal_ids: {
+    token: 'token',
+    signalId: 'signal_id',
+    expiresAt: 'expires_at',
+  },
   // Persisted schedules (`engine.schedules`). `spec`/`state` are engine-owned JSON documents.
   durable_schedules: {
     id: 'id',

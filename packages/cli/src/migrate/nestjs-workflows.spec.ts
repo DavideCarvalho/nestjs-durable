@@ -34,14 +34,38 @@ describe('durable migrate nestjs-workflows', () => {
     expect(out).toContain('return (await ctx.now());');
   });
 
-  it('leaves a TODO on waitForAny and keeps the code', () => {
+  it('maps waitForAny 1:1: signalWait → token, timer kept, child handles → ctx.childWait(id)', () => {
     const out = migrateSource(
-      `${header}@Workflow('w')\nexport class W {\n  async run(ctx: WorkflowContext) {\n    const r = await ctx.waitForAny('x', { a: ctx.signalWait('a'), t: ctx.timer('1h') });\n    return r;\n  }\n}\n`,
+      `${header}@Workflow('w')\nexport class W {\n  async run(ctx: WorkflowContext, input: { id: string }) {\n    const kid = await ctx.startChild('kid', {});\n    const t = ctx.timer({ until: 5 });\n    const r = await ctx.waitForAny('x', { a: ctx.signalWait<number>('a', { key: input.id }), b: ctx.signalWait('b'), kid, t, late: ctx.timer('1h'), now: await ctx.startChild('other', {}) });\n    return r;\n  }\n}\n`,
     );
-    expect(out.text).toContain(`// ${TODO}: durable has no waitForAny yet`);
+    expect(out.todos).toBe(0);
     expect(out.text).toContain(
-      "await ctx.waitForAny('x', { a: ctx.signalWait('a'), t: ctx.timer('1h') });",
+      "await ctx.waitForAny('x', { a: ctx.signalWait<number>(`a:${input.id}`), b: ctx.signalWait('b'), kid: ctx.childWait(kid), t, late: ctx.timer('1h'), now: ctx.childWait(await ctx.startChild('other', {})) });",
     );
+    // The handle is only raced, so the handle → id change needs no TODO.
+    expect(out.text).not.toContain(TODO);
+  });
+
+  it('flags a waitForAny condition it cannot classify, and signalWait match', () => {
+    const out = migrateSource(
+      `${header}@Workflow('w')\nexport class W {\n  async run(ctx: WorkflowContext, c: unknown) {\n    return ctx.waitForAny('x', { c, m: ctx.signalWait('m', { match: (p) => !!p }) });\n  }\n}\n`,
+    ).text;
+    expect(out).toContain(
+      `// ${TODO}: could not tell whether \`c\` is a condition or a child handle`,
+    );
+    expect(out).toContain(`// ${TODO}: signalWait \`match\` has no durable equivalent`);
+    expect(out).toContain("return ctx.waitForAny('x', { c, m: ctx.signalWait('m') });");
+  });
+
+  it('maps WorkflowCondition / WorkflowAnyResult types to their durable names', () => {
+    const out = migrateSource(
+      `import { type WorkflowCondition, type WorkflowAnyResult } from '@nestjs/workflows';\nexport type A = WorkflowCondition<string>;\nexport type B = WorkflowAnyResult<{ a: A }>;\n`,
+    ).text;
+    expect(out).toContain(
+      "import { type WaitAnyResult, type WaitCondition } from '@dudousxd/nestjs-durable-core';",
+    );
+    expect(out).toContain('export type A = WaitCondition<string>;');
+    expect(out).toContain('export type B = WaitAnyResult<{ a: A }>;');
   });
 
   it('startChild keeps parentClose, maps id, and flags the handle → id change', () => {
@@ -55,12 +79,12 @@ describe('durable migrate nestjs-workflows', () => {
     expect(out).toContain(`// ${TODO}: durable's ctx.startChild resolves the child's run id`);
   });
 
-  it('client.signal with an id and client.start in a transaction leave TODOs', () => {
+  it('client.signal keeps its dedupe id; client.start in a transaction leaves a TODO', () => {
     const out = migrateSource(
       `${header}export class C {\n  constructor(private readonly c: WorkflowClient) {}\n  async a(tx: unknown) {\n    await this.c.signal('paid', { ok: true }, { key: 'o1', id: 'evt-1' });\n    await this.c.start('w', {}, { id: 'r1', transaction: tx });\n  }\n}\n`,
     ).text;
-    expect(out).toContain("await this.c.signal('paid:o1', { ok: true });");
-    expect(out).toContain(`// ${TODO}: signal dedupe \`id\``);
+    expect(out).toContain("await this.c.signal('paid:o1', { ok: true }, { id: 'evt-1' });");
+    expect(out).not.toContain('signal dedupe');
     expect(out).toContain("await this.c.start('w', {}, 'r1');");
     expect(out).toContain('DurableOutbox.start(tx, …) from @dudousxd/nestjs-durable/outbox');
     expect(out).toContain('constructor(private readonly c: WorkflowService) {}');

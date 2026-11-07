@@ -70,6 +70,7 @@ import {
   durableBufferedSignals as bufferedSignals,
   durableRunAttributes as runAttributes,
   durableSchedules as schedules,
+  durableSignalIds as signalIds,
   durableSignalWaiters as signalWaiters,
   durableStepCheckpoints as stepCheckpoints,
   durableWorkflowRuns as workflowRuns,
@@ -1148,6 +1149,66 @@ export class DrizzlePgStateStore implements StateStore {
       .returning({ payload: bufferedSignals.payload });
     const row = rows[0];
     return row ? { payload: row.payload ?? undefined } : null;
+  }
+
+  async takeOldestBufferedSignal(
+    tokens: string[],
+  ): Promise<{ token: string; payload: unknown } | null> {
+    if (tokens.length === 0) return null;
+    // Same claim as takeBufferedSignal, across tokens: SKIP LOCKED, deleted in the same statement.
+    const oldest = this.db
+      .select({ id: bufferedSignals.id })
+      .from(bufferedSignals)
+      .where(inArray(bufferedSignals.token, [...new Set(tokens)]))
+      .orderBy(asc(bufferedSignals.id))
+      .limit(1)
+      .for('update', { skipLocked: true });
+    const rows = await this.db
+      .delete(bufferedSignals)
+      .where(inArray(bufferedSignals.id, oldest))
+      .returning({ token: bufferedSignals.token, payload: bufferedSignals.payload });
+    const row = rows[0];
+    return row ? { token: row.token, payload: row.payload ?? undefined } : null;
+  }
+
+  async claimSignalId(
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    // Insert, or take over an expired row (ON CONFLICT ... DO UPDATE ... WHERE locks the row, so of
+    // two concurrent takeovers one updates and the other sees the fresh expiry and does nothing).
+    const rows = await this.db
+      .insert(signalIds)
+      .values({ token, signalId: id, expiresAt: new Date(expiresAt) })
+      .onConflictDoUpdate({
+        target: [signalIds.token, signalIds.signalId],
+        set: { expiresAt: new Date(expiresAt) },
+        setWhere: lte(signalIds.expiresAt, new Date(nowMs)),
+      })
+      .returning({ token: signalIds.token });
+    return rows.length > 0;
+  }
+
+  async releaseSignalId(token: string, id: string): Promise<void> {
+    await this.db
+      .delete(signalIds)
+      .where(and(eq(signalIds.token, token), eq(signalIds.signalId, id)));
+  }
+
+  async deleteExpiredSignalIds(nowMs: number, limit: number): Promise<number> {
+    const expired = this.db
+      .select({ token: signalIds.token, signalId: signalIds.signalId })
+      .from(signalIds)
+      .where(lte(signalIds.expiresAt, new Date(nowMs)))
+      .limit(limit)
+      .for('update', { skipLocked: true });
+    const rows = await this.db
+      .delete(signalIds)
+      .where(sql`(${signalIds.token}, ${signalIds.signalId}) in (${expired})`)
+      .returning({ token: signalIds.token });
+    return rows.length;
   }
 
   async listBufferedSignals(

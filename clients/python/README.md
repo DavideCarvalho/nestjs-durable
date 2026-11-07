@@ -59,6 +59,7 @@ decisions:
 | `ctx.side_effect(fn)` | The general deterministic-capture primitive (Temporal's `sideEffect`): run `fn` once, checkpoint its result, and replay the same value without re-running `fn`. Use for ids/random/env reads, e.g. `ctx.side_effect(lambda: str(uuid7()))`. |
 | `ctx.sleep(ms)` | Durable timer — the run suspends and the engine resumes it when the timer fires. |
 | `ctx.wait_signal(name)` | Block until a signal `name` is delivered to the run (via `engine.signal`); returns its payload. |
+| `ctx.wait_for_any(name, {key: cond})` | Block until the first of several conditions: `ctx.signal_wait(name)`, `ctx.timer(ms)` / `ctx.timer(until=epoch_ms)`, `ctx.child_wait(run_id)`. Returns `{"key", "value"}`; only the winning signal is consumed (see [waitForAny](/docs/concepts/sleep-and-signals#waiting-for-the-first-of-several-waitforany)). |
 | `ctx.start_child(workflow, input)` | Start a child run and await its output (a failed child raises `StepFailed`). `workflow` is a name or a registered workflow class. |
 | `ctx.gather_calls([{name, input}, …])` / `ctx.gather_children(workflow, inputs)` / `ctx.gather([…])` | Fan steps, child runs or local steps out in parallel and await all; raises `GatherFailed` if any failed (`mode="fail_fast"` to raise on the first). |
 | `ctx.gather_calls_settled(…)` / `ctx.all_settled(workflow, inputs)` / `ctx.gather_settled(…)` | The same fans, returning every outcome instead of raising: `{"status": "fulfilled", "value"}` or `{"status": "rejected", "id", "error", "code"?, "details"?}` per item, in input order. |

@@ -144,6 +144,14 @@ export class BufferedEventEntity {
   publishedAt!: Date;
 }
 
+/** A signal dedupe id (`engine.signal(token, payload, { id })`): deduplicates until `expiresAt`. */
+export class SignalIdEntity {
+  token!: string;
+  signalId!: string;
+  /** Epoch ms as a `bigint` (drivers hand it back as a string): exact, unlike a DATETIME. */
+  expiresAt!: string | number;
+}
+
 /** A persisted schedule (`engine.schedules`). `spec`/`state` are engine-owned JSON documents. */
 export class ScheduleEntity {
   id!: string;
@@ -374,6 +382,19 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     },
   });
 
+  const signalIds = new EntitySchema<SignalIdEntity>({
+    name: 'SignalIdEntity',
+    target: SignalIdEntity,
+    tableName: 'durable_signal_ids',
+    // Its `(token, signal_id)` key and `expires_at` index are raw DDL in `schema.ts`, like every
+    // other durable table's.
+    columns: {
+      token: { type: 'text', primary: true, name: col('token') },
+      signalId: { type: 'text', primary: true, name: col('signalId') },
+      expiresAt: { type: 'bigint', name: col('expiresAt') },
+    },
+  });
+
   const schedules = new EntitySchema<ScheduleEntity>({
     name: 'ScheduleEntity',
     target: ScheduleEntity,
@@ -412,6 +433,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     signalWaiters,
     bufferedSignals,
     bufferedEvents,
+    signalIds,
     schedules,
   ];
 }

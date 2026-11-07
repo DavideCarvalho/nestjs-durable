@@ -443,6 +443,48 @@ export class InMemoryStateStore implements StateStore {
     if (queue.length === 0) this.bufferedSignals.delete(token);
     return { payload: head.payload };
   }
+  async takeOldestBufferedSignal(
+    tokens: string[],
+  ): Promise<{ token: string; payload: unknown } | null> {
+    let oldest: { token: string; id: number } | undefined;
+    for (const token of new Set(tokens)) {
+      const head = this.bufferedSignals.get(token)?.[0];
+      if (head && (!oldest || head.id < oldest.id)) oldest = { token, id: head.id };
+    }
+    if (!oldest) return null;
+    const taken = await this.takeBufferedSignal(oldest.token);
+    return taken ? { token: oldest.token, payload: taken.payload } : null;
+  }
+
+  /** `token \u0000 id -> expiresAt` of the signal ids {@link claimSignalId} recorded. */
+  private readonly signalIds = new Map<string, number>();
+  async claimSignalId(
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    const key = `${token}\u0000${id}`;
+    const existing = this.signalIds.get(key);
+    if (existing !== undefined && existing > nowMs) return false;
+    this.signalIds.set(key, expiresAt);
+    return true;
+  }
+  async releaseSignalId(token: string, id: string): Promise<void> {
+    this.signalIds.delete(`${token}\u0000${id}`);
+  }
+  async deleteExpiredSignalIds(nowMs: number, limit: number): Promise<number> {
+    let deleted = 0;
+    for (const [key, expiresAt] of this.signalIds) {
+      if (deleted >= limit) break;
+      if (expiresAt <= nowMs) {
+        this.signalIds.delete(key);
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
   async listBufferedSignals(
     tokenPrefix: string,
     afterId: string | undefined,

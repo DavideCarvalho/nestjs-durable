@@ -22,6 +22,9 @@ import { makeTypeOrmStoreFactory } from './conformance';
 
 const CONTAINER_TIMEOUT = 180_000;
 const skipped = !!process.env.SKIP_TESTCONTAINERS;
+// An existing database instead of a testcontainer, like the schema-repair specs.
+const externalPgUrl = process.env.DURABLE_TEST_PG_URL;
+const externalMysqlUrl = process.env.DURABLE_TEST_MYSQL_URL;
 
 // --- Postgres ---------------------------------------------------------------------------------
 
@@ -30,6 +33,10 @@ let pgError: unknown;
 let pg: StartedPostgreSqlContainer | undefined;
 
 beforeAll(async () => {
+  if (externalPgUrl) {
+    pgOptions = { type: 'postgres', url: externalPgUrl };
+    return;
+  }
   if (skipped) return;
   try {
     pg = await new PostgreSqlContainer('postgres:16-alpine').start();
@@ -52,7 +59,7 @@ afterAll(async () => {
 
 describe('TypeORM (Postgres) [real engine]', () => {
   runStateStoreContract('TypeORM (Postgres)', async (): Promise<StateStoreContext> => {
-    if (skipped) throw new StateStoreUnavailableError('SKIP_TESTCONTAINERS set');
+    if (skipped && !externalPgUrl) throw new StateStoreUnavailableError('SKIP_TESTCONTAINERS set');
     if (pgError)
       throw new StateStoreUnavailableError(
         `Postgres testcontainer unavailable (is Docker running?): ${String(pgError)}`,
@@ -69,6 +76,10 @@ let mysqlError: unknown;
 let mysql: StartedMySqlContainer | undefined;
 
 beforeAll(async () => {
+  if (externalMysqlUrl) {
+    mysqlOptions = { type: 'mysql', url: externalMysqlUrl };
+    return;
+  }
   if (skipped) return;
   try {
     mysql = await new MySqlContainer('mysql:8.0').start();
@@ -91,7 +102,8 @@ afterAll(async () => {
 
 describe('TypeORM (MySQL) [real engine]', () => {
   runStateStoreContract('TypeORM (MySQL)', async (): Promise<StateStoreContext> => {
-    if (skipped) throw new StateStoreUnavailableError('SKIP_TESTCONTAINERS set');
+    if (skipped && !externalMysqlUrl)
+      throw new StateStoreUnavailableError('SKIP_TESTCONTAINERS set');
     if (mysqlError)
       throw new StateStoreUnavailableError(
         `MySQL testcontainer unavailable (is Docker running?): ${String(mysqlError)}`,

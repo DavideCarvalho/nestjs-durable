@@ -29,10 +29,10 @@ export default defineConfig({
 });
 ```
 
-`ENTITIES` is `[WorkflowRunEntity, StepCheckpointEntity, RunAttributeEntity, SignalWaiterEntity, BufferedSignalEntity, BufferedEventEntity]` —
-the six tables the engine owns (`durable_workflow_runs`, `durable_step_checkpoints`,
+`ENTITIES` is `[WorkflowRunEntity, StepCheckpointEntity, RunAttributeEntity, SignalWaiterEntity, BufferedSignalEntity, BufferedEventEntity, SignalIdEntity, ScheduleEntity]` —
+the tables the engine owns (`durable_workflow_runs`, `durable_step_checkpoints`,
 `durable_run_attributes`, `durable_signal_waiters`, `durable_buffered_signals`,
-`durable_buffered_events`). They never reference your entities.
+`durable_buffered_events`, `durable_signal_ids`, `durable_schedules`). They never reference your entities.
 
 ### Custom repositories
 
@@ -166,8 +166,8 @@ DurableModule.forRoot({ store, transport, autoSchema: false });
 ```
 
 It only ever adds `durable_workflow_runs`, `durable_step_checkpoints`, `durable_run_attributes`,
-`durable_signal_waiters`, `durable_buffered_signals` and `durable_buffered_events` — your tables are
-untouched.
+`durable_signal_waiters`, `durable_buffered_signals`, `durable_buffered_events`,
+`durable_signal_ids` and `durable_schedules` — your tables are untouched.
 
 ### The heal is fingerprint-gated
 

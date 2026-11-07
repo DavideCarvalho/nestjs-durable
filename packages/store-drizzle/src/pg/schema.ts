@@ -158,6 +158,21 @@ export const durableBufferedEvents = pgTable(
   (t) => [index('durable_buffered_events_name_published_at_idx').on(t.name, t.publishedAt)],
 );
 
+// Signal dedupe ids (`engine.signal(token, payload, { id })`): one row per (token, signal_id),
+// deduplicating until `expires_at`. Expired rows are ignored by `claimSignalId` and swept.
+export const durableSignalIds = pgTable(
+  'durable_signal_ids',
+  {
+    token: text('token').notNull(),
+    signalId: text('signal_id').notNull(),
+    expiresAt: tstz('expires_at').notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.token, t.signalId] }),
+    index('durable_signal_ids_expires_at_idx').on(t.expiresAt),
+  ],
+);
+
 // Persisted schedules (`engine.schedules`): the store filters on the columns; `spec`/`state` are
 // engine-owned JSON documents it keeps verbatim.
 export const durableSchedules = pgTable(
@@ -190,6 +205,7 @@ export const durablePgSchema = {
   durableSignalWaiters,
   durableBufferedSignals,
   durableBufferedEvents,
+  durableSignalIds,
   durableSchedules,
 };
 

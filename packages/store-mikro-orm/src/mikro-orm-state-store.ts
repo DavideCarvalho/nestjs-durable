@@ -41,7 +41,7 @@ import {
   singletonAdmissionTags,
   singletonClaimantIds,
 } from '@dudousxd/nestjs-durable-core';
-import { LockMode, raw } from '@mikro-orm/core';
+import { LockMode, UniqueConstraintViolationException, raw } from '@mikro-orm/core';
 import type { EntityManager, MikroORM } from '@mikro-orm/core';
 
 /** Minimal structural surface of the SQL EntityManager's QueryBuilder (from `@mikro-orm/knex`),
@@ -90,6 +90,7 @@ import {
   BufferedSignalEntity,
   RunAttributeEntity,
   ScheduleEntity,
+  SignalIdEntity,
   SignalWaiterEntity,
   StepCheckpointEntity,
   WorkflowRunEntity,
@@ -1346,6 +1347,74 @@ export class MikroOrmStateStore implements StateStore {
     const payload = entity.payload ?? undefined;
     await em.remove(entity).flush();
     return { payload };
+  }
+
+  async takeOldestBufferedSignal(
+    tokens: string[],
+  ): Promise<{ token: string; payload: unknown } | null> {
+    if (tokens.length === 0) return null;
+    const unique = [...new Set(tokens)];
+    // Read the oldest row, then delete it by id: the delete's affected count decides who took it, so
+    // a taker that loses the row to a concurrent one reads the next oldest instead.
+    for (;;) {
+      const em = this.fork();
+      const entity = await em.findOne(
+        BufferedSignalEntity,
+        { token: { $in: unique } },
+        { orderBy: { id: 'asc' } },
+      );
+      if (!entity) return null;
+      if ((await em.nativeDelete(BufferedSignalEntity, { id: entity.id })) === 1) {
+        return { token: entity.token, payload: entity.payload ?? undefined };
+      }
+    }
+  }
+
+  async claimSignalId(
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    // Insert first: the primary key decides between concurrent claims. On a duplicate, take the row
+    // over only if it expired — a PK-scoped conditional UPDATE, so concurrent takeovers serialize on
+    // the one row lock and exactly one sees it expired. (A DELETE-expired-then-INSERT deadlocks on
+    // MySQL: the range delete takes gap locks the concurrent inserts wait on.) A row deleted between
+    // the duplicate and the update (released, or swept as expired) is inserted again.
+    for (;;) {
+      const em = this.fork();
+      try {
+        await em.insert(SignalIdEntity, { token, signalId: id, expiresAt });
+        return true;
+      } catch (err) {
+        if (!(err instanceof UniqueConstraintViolationException)) throw err;
+      }
+      const taken = await em.nativeUpdate(
+        SignalIdEntity,
+        { token, signalId: id, expiresAt: { $lte: nowMs } },
+        { expiresAt },
+      );
+      if (taken === 1) return true;
+      if ((await em.count(SignalIdEntity, { token, signalId: id })) > 0) return false;
+    }
+  }
+
+  async releaseSignalId(token: string, id: string): Promise<void> {
+    await this.fork().nativeDelete(SignalIdEntity, { token, signalId: id });
+  }
+
+  async deleteExpiredSignalIds(nowMs: number, limit: number): Promise<number> {
+    const em = this.fork();
+    const rows = await em.find(
+      SignalIdEntity,
+      { expiresAt: { $lte: nowMs } },
+      { fields: ['token', 'signalId'], limit },
+    );
+    if (rows.length === 0) return 0;
+    return em.nativeDelete(SignalIdEntity, {
+      $or: rows.map((r) => ({ token: r.token, signalId: r.signalId })),
+      expiresAt: { $lte: nowMs },
+    });
   }
 
   async listBufferedSignals(

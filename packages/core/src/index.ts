@@ -57,6 +57,12 @@ export * from './tenant-group';
 export * from './tokens';
 export * from './workflow-handler';
 export * from './workflow-ref';
+export {
+  ANY_WAIT_GROUP,
+  anyCheckpointName,
+  isAnyCheckpoint,
+  isAnyMember,
+} from './wait-any';
 export { InMemoryStateStore } from './testing/in-memory-state-store';
 export { InMemoryTransport } from './testing/in-memory-transport';
 export { InMemoryRunQueue } from './testing/in-memory-run-queue';

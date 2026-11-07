@@ -78,8 +78,8 @@ export class MigrationClient {
   }
 
   /**
-   * Signal the instance `runId` waits on: durable gets the token `<signal>:<key>`, the official
-   * engine `signal(signal, payload, { key, id })`. Resolves the owner, or `null` for an unknown id
+   * Signal the instance `runId` waits on: durable gets the token `<signal>:<key>` (deduplicated by
+   * `id` per token), the official engine `signal(signal, payload, { key, id })`. Resolves the owner, or `null` for an unknown id
    * (nothing is sent: a signal for nobody would be buffered for a later wait).
    */
   async signal(
@@ -90,7 +90,11 @@ export class MigrationClient {
   ): Promise<MigrationEngine | null> {
     const owner = await this.owner(runId);
     if (owner === 'nestjs-durable') {
-      await this.engine.signal(opts.key ? `${signal}:${opts.key}` : signal, payload);
+      await this.engine.signal(
+        opts.key ? `${signal}:${opts.key}` : signal,
+        payload,
+        opts.id !== undefined ? { id: opts.id } : undefined,
+      );
     } else if (owner === '@nestjs/workflows') {
       await this.official.signal(signal, payload as never, {
         ...(opts.key !== undefined ? { key: opts.key } : {}),

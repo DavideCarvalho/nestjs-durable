@@ -762,6 +762,52 @@ class WorkflowContext:
         self.commands.append({"kind": "waitSignal", "seq": seq, "signal": name})
         raise _Suspend()
 
+    # -- wait_for_any -----------------------------------------------------------
+    def signal_wait(self, name: str) -> Dict[str, Any]:
+        """A signal condition for :meth:`wait_for_any`: a signal sent on ``name``. Its value is the
+        payload. Only a description — nothing is waited for until it is passed to ``wait_for_any``."""
+        return {"kind": "signal", "signal": name}
+
+    def timer(self, ms: Optional[int] = None, *, until: Optional[int] = None) -> Dict[str, Any]:
+        """A timer condition for :meth:`wait_for_any`: ``ms`` after the wait is first reached, or at
+        ``until`` (epoch ms). Its value is ``None``. The engine owns the clock and fixes the deadline
+        the first time it applies the wait."""
+        if (ms is None) == (until is None):
+            raise ValueError("timer() takes exactly one of ms or until")
+        if until is not None:
+            return {"kind": "timer", "until": int(until)}
+        return {"kind": "timer", "ms": int(ms)}  # type: ignore[arg-type]
+
+    def child_wait(self, child_id: str) -> Dict[str, Any]:
+        """A child condition for :meth:`wait_for_any`: run ``child_id`` settling. Its value is the
+        run's output; a run that failed makes ``wait_for_any`` raise :class:`StepFailed`."""
+        return {"kind": "child", "childId": child_id}
+
+    def wait_for_any(self, name: str, conditions: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """Durable wait for whichever of ``conditions`` happens first; returns ``{"key", "value"}``.
+
+        ``conditions`` maps a key to a condition from :meth:`signal_wait`, :meth:`timer` or
+        :meth:`child_wait`. Takes one seq and emits one ``waitAny`` command; the engine resolves it and
+        journals the winner under ``name``, so a replay returns the same one. Only the winning signal is
+        consumed: a signal that matched another condition stays buffered for a later wait on its name.
+        A losing timer never fires; a losing child keeps running.
+        """
+        if not conditions:
+            raise ValueError("wait_for_any needs at least one condition")
+        seq = self._next()
+        found, output = self._replay(seq, "any", name)
+        if found:
+            return output
+        self.commands.append(
+            {
+                "kind": "waitAny",
+                "seq": seq,
+                "name": name,
+                "conditions": [{**cond, "key": key} for key, cond in conditions.items()],
+            }
+        )
+        raise _Suspend()
+
     def start_child(self, workflow: Any, input: Any = None) -> Any:
         """Start a child run and await its output (its own durable lifecycle). ``workflow`` is a name or
         a registered workflow class."""

@@ -16,11 +16,18 @@ export class OrderWorkflow {
     await ctx.sleep('10m');
     // TODO(durable-migrate): on timeout durable THROWS SignalTimeoutError (from @dudousxd/nestjs-durable-core) where @nestjs/workflows resolved null: wrap this in try/catch
     const approval = await ctx.waitForSignal<{ approved: boolean }>(`approval:${input.orderId}`, { timeoutMs: 172800000 });
+    const audit = await ctx.startChild('audit', { orderId: input.orderId });
+    const delivery = await ctx.waitForAny('delivery', {
+      delivered: ctx.signalWait<{ at: string }>(`delivered:${input.orderId}`),
+      cancelled: ctx.signalWait(`cancelled:${input.orderId}`),
+      audit: ctx.childWait(audit),
+      timeout: ctx.timer('3d'),
+    });
     await ctx.setEvent('status', { stage: 'shipping' });
     const label = await ctx.child(ShippingWorkflow, { orderId: input.orderId }, { childId: `ship-${input.orderId}`, parentClose: 'abandon' });
     // TODO(durable-migrate): durable has no ctx.commit(): compensations of the steps before it still run on failure; restructure the saga (e.g. end it in a child workflow)
     ctx.commit('shipped');
-    return { charge, approval, label, startedAt, by: ctx.runId };
+    return { charge, approval, delivery, label, startedAt, by: ctx.runId };
   }
 }
 
@@ -44,7 +51,7 @@ export class OrdersController {
   }
 
   async approve(orderId: string) {
-    await this.client.signal(`approval:${orderId}`, { approved: true });
+    await this.client.signal(`approval:${orderId}`, { approved: true }, { id: `approve-${orderId}` });
   }
 
   async outcome(orderId: string) {

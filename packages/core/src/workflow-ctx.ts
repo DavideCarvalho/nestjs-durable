@@ -49,6 +49,10 @@ import type {
   StepLogger,
   StepOptions,
   StepUndo,
+  WaitAnyCondition,
+  WaitAnyResult,
+  WaitCondition,
+  WaitConditionSpec,
   WaitForRunOptions,
   WorkflowCtx,
   WorkflowRun,
@@ -60,6 +64,7 @@ import { runWaitToken, settledRunOf } from './run-wait';
 import { readRunsByIds } from './run-waiting';
 import { createStepLogger } from './step-logger';
 import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol';
+import { anyCheckpointName, anyOutcomeOf, enterWaitAny } from './wait-any';
 import { type WorkflowRef, workflowName } from './workflow-ref';
 
 /** Normalize the `ctx.child`/`ctx.startChild` 3rd arg: a bare string is shorthand for `{ childId }`. */
@@ -1513,6 +1518,42 @@ export function createWorkflowCtx(
       });
   }
 
+  // `waitForAny`: one position, resolved through the shared machinery in wait-any.ts (which the remote
+  // `waitAny` command and the engine's signal delivery use too). A completed position in the replay
+  // snapshot returns without a store read; anything else reads the store live, since the winner may
+  // have been written after this execution's snapshot.
+  const waitForAny = async <C extends Record<string, WaitCondition<unknown>>>(
+    name: string,
+    conditions: C,
+  ): Promise<WaitAnyResult<C>> => {
+    const current = pos.next();
+    const cached = replay?.get(current);
+    if (cached?.status === 'completed' && cached.name === anyCheckpointName(name)) {
+      return anyOutcomeOf(cached) as WaitAnyResult<C>;
+    }
+    const wire = Object.entries(conditions).map(
+      ([key, c]): WaitAnyCondition => ({ ...(c as WaitConditionSpec), key }),
+    );
+    const state = await enterWaitAny({ store, clock: host.clock }, runId, current, name, wire);
+    if (state.state === 'resolved') {
+      replay?.set(current, state.checkpoint);
+      return anyOutcomeOf(state.checkpoint) as WaitAnyResult<C>;
+    }
+    throw new WorkflowSuspended(state.wakeAt);
+  };
+  const signalWait = <T>(token: string): WaitCondition<T> => ({ kind: 'signal', signal: token });
+  const timer = (duration: string | number | { until: Date | number }): WaitCondition<null> =>
+    typeof duration === 'object'
+      ? {
+          kind: 'timer',
+          until: typeof duration.until === 'number' ? duration.until : duration.until.getTime(),
+        }
+      : { kind: 'timer', ms: parseDuration(duration) };
+  const childWait = (first: WorkflowRef, second?: string): WaitCondition<unknown> => ({
+    kind: 'child',
+    childId: typeof first === 'string' && second === undefined ? first : (second as string),
+  });
+
   // Fail fast when a primitive is called from INSIDE one of this ctx's step bodies (directly, or via
   // a `MyWorkflow.start()`/`.execute()` static resolving the ambient ctx). The step replays from its
   // checkpoint without re-running its body, so the nested call's journal position would never be
@@ -1559,6 +1600,10 @@ export function createWorkflowCtx(
     sleepUntil: guard('sleepUntil', sleepUntil),
     continueAsNew,
     waitForSignal: guard('waitForSignal', waitForSignal),
+    waitForAny: guard('waitForAny', waitForAny) as WorkflowCtx['waitForAny'],
+    signalWait,
+    timer,
+    childWait: childWait as WorkflowCtx['childWait'],
     waitForEvent: guard('waitForEvent', waitForEvent),
     waitForRun: guard('waitForRun', waitForRun) as WorkflowCtx['waitForRun'],
     task: guard('task', task),

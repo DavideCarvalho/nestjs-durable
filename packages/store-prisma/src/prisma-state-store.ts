@@ -144,6 +144,12 @@ interface Delegate<Row> {
   groupBy(args: Args): Promise<Record<string, unknown>[]>;
 }
 
+interface SignalIdRow {
+  token: string;
+  signalId: string;
+  expiresAt: bigint;
+}
+
 interface ScheduleRow {
   id: string;
   namespace: string;
@@ -166,6 +172,8 @@ export interface DurablePrismaTx {
   durableBufferedEvent: Delegate<BufferedEventRow>;
   /** Only needed for persisted schedules (`engine.schedules`) — add the `DurableSchedule` model. */
   durableSchedule?: Delegate<ScheduleRow>;
+  /** Only needed for signal dedupe (`signal(..., { id })`) — add the `DurableSignalId` model. */
+  durableSignalId?: Delegate<SignalIdRow>;
 }
 
 export interface DurablePrismaClient extends DurablePrismaTx {
@@ -1115,6 +1123,84 @@ export class PrismaStateStore implements StateStore {
     if (!row) return null;
     await this.db.durableBufferedSignal.delete({ where: { id: row.id } });
     return { payload: row.payload ?? undefined };
+  }
+
+  async takeOldestBufferedSignal(
+    tokens: string[],
+  ): Promise<{ token: string; payload: unknown } | null> {
+    if (tokens.length === 0) return null;
+    const unique = [...new Set(tokens)];
+    // Read the oldest row, then delete it by id: the delete's count decides who took it, so a taker
+    // that loses the row to a concurrent one reads the next oldest instead.
+    for (;;) {
+      const row = await this.db.durableBufferedSignal.findFirst({
+        where: { token: { in: unique } },
+        orderBy: { id: 'asc' },
+      });
+      if (!row) return null;
+      const { count } = await this.db.durableBufferedSignal.deleteMany({ where: { id: row.id } });
+      if (count === 1) return { token: row.token, payload: row.payload ?? undefined };
+    }
+  }
+
+  private signalIds(): Delegate<SignalIdRow> {
+    const delegate = this.db.durableSignalId;
+    if (!delegate) {
+      throw new Error(
+        'signal dedupe (`signal(..., { id })`) needs the DurableSignalId model — copy it from prisma/schema.prisma into your schema and re-run `prisma generate`',
+      );
+    }
+    return delegate;
+  }
+
+  async claimSignalId(
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    // Insert first: the primary key decides between concurrent claims (P2002 for the losers). On a
+    // duplicate, take the row over only if it expired — a PK-scoped conditional UPDATE, so concurrent
+    // takeovers serialize on the one row lock and exactly one sees it expired. (A DELETE-expired-then-
+    // INSERT deadlocks on MySQL: the range delete takes gap locks the concurrent inserts wait on.) A
+    // row deleted between the duplicate and the update (released, or swept) is inserted again.
+    const ids = this.signalIds();
+    for (;;) {
+      try {
+        await ids.create({ data: { token, signalId: id, expiresAt: BigInt(expiresAt) } });
+        return true;
+      } catch (err) {
+        if ((err as { code?: unknown } | null)?.code !== 'P2002') throw err;
+      }
+      const { count } = await ids.updateMany({
+        where: { token, signalId: id, expiresAt: { lte: BigInt(nowMs) } },
+        data: { expiresAt: BigInt(expiresAt) },
+      });
+      if (count === 1) return true;
+      if ((await ids.count({ where: { token, signalId: id } })) > 0) return false;
+    }
+  }
+
+  async releaseSignalId(token: string, id: string): Promise<void> {
+    await this.signalIds().deleteMany({ where: { token, signalId: id } });
+  }
+
+  async deleteExpiredSignalIds(nowMs: number, limit: number): Promise<number> {
+    const ids = this.signalIds();
+    const expired = { lte: BigInt(nowMs) };
+    const rows = await ids.findMany({
+      where: { expiresAt: expired },
+      select: { token: true, signalId: true },
+      take: limit,
+    });
+    if (rows.length === 0) return 0;
+    const { count } = await ids.deleteMany({
+      where: {
+        expiresAt: expired,
+        OR: rows.map((r) => ({ token: r.token, signalId: r.signalId })),
+      },
+    });
+    return count;
   }
 
   async listBufferedSignals(

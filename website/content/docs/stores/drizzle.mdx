@@ -67,8 +67,9 @@ npx drizzle-kit migrate
 Point your `drizzle.config.ts` at a schema file that re-exports `durableSchema` (or the individual
 tables) so the generated SQL includes `durable_workflow_runs`, `durable_step_checkpoints`,
 `durable_run_attributes`, `durable_signal_waiters`, `durable_buffered_signals`,
-`durable_buffered_events` and `durable_schedules` (the last only used by
-[persisted schedules](/docs/authoring/persisted-schedules)).
+`durable_buffered_events`, `durable_signal_ids` (only used by
+[signal dedupe ids](/docs/concepts/sleep-and-signals#deduplicating-signals-id)) and
+`durable_schedules` (only used by [persisted schedules](/docs/authoring/persisted-schedules)).
 
 Because nothing changes the schema at boot, this store has no schema repair warning: a missing
 column or index shows up as a query error, not a log line. The

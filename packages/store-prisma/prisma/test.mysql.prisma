@@ -136,6 +136,19 @@ model DurableBufferedEvent {
   @@map("durable_buffered_events")
 }
 
+// Signal dedupe ids (`engine.signal(token, payload, { id })`) — only needed if you send signals with
+// an `id`. One row per (token, signalId), deduplicating until `expiresAt` (epoch ms as a BigInt).
+// Expired rows are ignored by `claimSignalId` and deleted by `engine.sweepExpiredSignalIds()`.
+model DurableSignalId {
+  token     String
+  signalId  String @map("signal_id")
+  expiresAt BigInt @map("expires_at")
+
+  @@id([token, signalId])
+  @@index([expiresAt], map: "durable_signal_ids_expires_at_idx")
+  @@map("durable_signal_ids")
+}
+
 // Persisted schedules (`engine.schedules`) — only needed if you use them. `spec`/`state` are
 // engine-owned JSON documents; `nextFireAt` is epoch ms as a BigInt (exact, so the compare-and-set in
 // `updateSchedule` can't be defeated by a timestamp's precision).

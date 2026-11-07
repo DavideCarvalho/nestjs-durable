@@ -184,6 +184,21 @@ export class CodecStateStore implements StateStore {
   ) => Promise<BufferedSignalRow[]>;
   /** Forwarded verbatim — deletes by row id. */
   readonly deleteBufferedSignals?: (ids: string[]) => Promise<void>;
+  /** Decodes the payload like {@link takeBufferedSignal}. Bound only when the inner store has it. */
+  readonly takeOldestBufferedSignal?: (
+    tokens: string[],
+  ) => Promise<{ token: string; payload: unknown } | null>;
+  /** Forwarded verbatim — a signal id record carries no payload. */
+  readonly claimSignalId?: (
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ) => Promise<boolean>;
+  /** Forwarded verbatim. */
+  readonly releaseSignalId?: (token: string, id: string) => Promise<void>;
+  /** Forwarded verbatim. */
+  readonly deleteExpiredSignalIds?: (nowMs: number, limit: number) => Promise<number>;
   /** Forwarded verbatim — a waiter carries no payload. */
   readonly listSignalWaitersByRun?: (runIds: string[]) => Promise<SignalWaiter[]>;
   /** Forwarded verbatim — a waiter carries no payload. */
@@ -299,6 +314,21 @@ export class CodecStateStore implements StateStore {
         }));
     const deleteBuffered = inner.deleteBufferedSignals;
     if (deleteBuffered) this.deleteBufferedSignals = (ids) => deleteBuffered.call(inner, ids);
+    const takeOldest = inner.takeOldestBufferedSignal;
+    if (takeOldest)
+      this.takeOldestBufferedSignal = async (tokens) => {
+        const taken = await takeOldest.call(inner, tokens);
+        return taken ? { token: taken.token, payload: this.dec(taken.payload) } : null;
+      };
+    const { claimSignalId, releaseSignalId, deleteExpiredSignalIds } = inner;
+    if (claimSignalId)
+      this.claimSignalId = (token, id, expiresAt, nowMs) =>
+        claimSignalId.call(inner, token, id, expiresAt, nowMs);
+    if (releaseSignalId)
+      this.releaseSignalId = (token, id) => releaseSignalId.call(inner, token, id);
+    if (deleteExpiredSignalIds)
+      this.deleteExpiredSignalIds = (nowMs, limit) =>
+        deleteExpiredSignalIds.call(inner, nowMs, limit);
     const byRun = inner.listSignalWaitersByRun;
     if (byRun) this.listSignalWaitersByRun = (runIds) => byRun.call(inner, runIds);
     const hasWaiter = inner.hasSignalWaiter;

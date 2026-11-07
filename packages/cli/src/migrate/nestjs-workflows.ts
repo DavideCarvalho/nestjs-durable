@@ -16,9 +16,11 @@ import {
  * Mapped: imports, `@Workflow('name', { version })`, `ctx.step` (→ `ctx.localStep`, with
  * `retry: n` → `retries`, `timeout` → `timeoutMs`), `ctx.sleep(name, d | { until })`,
  * `ctx.waitForSignal(name, signal, { key, timeout })` (→ the token `<signal>:<key>`),
- * `ctx.executeChild` / `ctx.startChild` (with `id`, `parentClose`), `ctx.now/random/uuid`,
- * `ctx.fail`, `ctx.setStatus` (→ `ctx.setEvent('status', …)`), `ctx.workflowId`,
- * `WorkflowClient.start/signal/result` (→ `WorkflowService`), `WorkflowsModule.forRoot`.
+ * `ctx.waitForAny(name, { … })` with `ctx.signalWait(signal, { key })` (→ the token), `ctx.timer`
+ * and child handles (→ `ctx.childWait(id)`), `ctx.executeChild` / `ctx.startChild` (with `id`,
+ * `parentClose`), `ctx.now/random/uuid`, `ctx.fail`, `ctx.setStatus` (→ `ctx.setEvent('status', …)`),
+ * `ctx.workflowId`, `WorkflowClient.start/signal/result` (→ `WorkflowService`; `signal`'s dedupe
+ * `id` carries over), `WorkflowsModule.forRoot`.
  */
 
 const OFFICIAL = '@nestjs/workflows';
@@ -35,6 +37,8 @@ const IMPORT_MAP: Record<string, { from: string; name: string; type?: boolean }>
   WorkflowClient: { from: DURABLE, name: 'WorkflowService' },
   WorkflowsModule: { from: DURABLE, name: 'DurableModule' },
   NonRetryableStepError: { from: CORE, name: 'FatalError' },
+  WorkflowCondition: { from: CORE, name: 'WaitCondition', type: true },
+  WorkflowAnyResult: { from: CORE, name: 'WaitAnyResult', type: true },
 };
 
 export interface MigrationResult {
@@ -371,9 +375,9 @@ class Migration {
         }
         if (options && !props(options))
           this.todo(`${method} options could not be read; map them by hand`);
-        if (method === 'startChild') {
+        if (method === 'startChild' && !this.onlyRacedInWaitForAny(node)) {
           this.todo(
-            "durable's ctx.startChild resolves the child's run id, not a handle: await its result with ctx.waitForRun(id)",
+            "durable's ctx.startChild resolves the child's run id, not a handle: join it with ctx.child(workflow, input, { childId: id }) or ctx.waitForRun(id); in ctx.waitForAny it is ctx.childWait(id) (done for you)",
           );
         }
         const target = method === 'executeChild' ? 'child' : 'startChild';
@@ -389,11 +393,24 @@ class Migration {
         return lead + value(`${ctx}.sideEffect(() => Math.random())`);
       case 'uuid':
         return lead + value(`${ctx}.sideEffect(() => crypto.randomUUID())`);
+      case 'signalWait': {
+        const [signal, options] = args;
+        if (!signal) return undefined;
+        const opts = props(options);
+        if (options && !opts) {
+          this.todo('signalWait options could not be read; map them by hand');
+          return undefined;
+        }
+        const token = this.token(signal, opts?.get('key'));
+        if (!token) return undefined;
+        if (opts?.has('match'))
+          this.todo(
+            'signalWait `match` has no durable equivalent: give the matching signals their own token (key)',
+          );
+        return `${lead}${ctx}.signalWait${generic}(${token})`;
+      }
       case 'waitForAny':
-        this.todo(
-          'durable has no waitForAny yet: for "signal or timeout" use ctx.waitForSignal(token, { timeoutMs }) and catch SignalTimeoutError; for a child, ctx.child(...) / ctx.waitForRun(id, { timeoutMs })',
-        );
-        return undefined;
+        return this.waitForAny(ctx, args, generic, lead);
       case 'commit':
         this.todo(
           'durable has no ctx.commit(): compensations of the steps before it still run on failure; restructure the saga (e.g. end it in a child workflow)',
@@ -402,6 +419,125 @@ class Migration {
       default:
         return undefined;
     }
+  }
+
+  /**
+   * `ctx.waitForAny(name, { … })`: the same call, with every child handle among the conditions
+   * wrapped in `ctx.childWait(…)` (durable's `startChild` resolves a run id, not a handle).
+   * `ctx.signalWait` / `ctx.timer` conditions are rewritten where they stand.
+   */
+  private waitForAny(ctx: string, args: Node[], generic: string, lead: string): string | undefined {
+    const [name, conditions] = args;
+    if (!name || !conditions) return undefined;
+    if (!Node.isObjectLiteralExpression(conditions)) {
+      this.todo(
+        'waitForAny conditions are not an object literal: wrap each child handle in ctx.childWait(handle)',
+      );
+      return undefined;
+    }
+    const start = conditions.getStart();
+    let text = conditions.getText();
+    const edits: Array<{ from: number; to: number; text: string }> = [];
+    for (const p of conditions.getProperties()) {
+      const value = Node.isPropertyAssignment(p)
+        ? p.getInitializerOrThrow()
+        : Node.isShorthandPropertyAssignment(p)
+          ? p.getNameNode()
+          : undefined;
+      if (!value) {
+        this.todo(
+          'waitForAny conditions with a spread: wrap each child handle in ctx.childWait(handle)',
+        );
+        return undefined;
+      }
+      const kind = this.conditionKind(value);
+      if (kind === undefined) {
+        this.todo(
+          `could not tell whether \`${value.getText()}\` is a condition or a child handle: wrap a handle in ${ctx}.childWait(handle)`,
+        );
+      }
+      const rendered = kind === 'handle' ? `${ctx}.childWait(${this.r(value)})` : this.r(value);
+      if (Node.isShorthandPropertyAssignment(p)) {
+        if (kind === 'handle') {
+          edits.push({ from: p.getStart(), to: p.getEnd(), text: `${p.getName()}: ${rendered}` });
+        }
+      } else {
+        edits.push({ from: value.getStart(), to: value.getEnd(), text: rendered });
+      }
+    }
+    for (const edit of edits.sort((a, b) => b.from - a.from)) {
+      text = text.slice(0, edit.from - start) + edit.text + text.slice(edit.to - start);
+    }
+    return `${lead}${ctx}.waitForAny${generic}(${this.r(name)}, ${text})`;
+  }
+
+  /** Whether a `waitForAny` condition is a condition call, a child handle, or can't be told. */
+  private conditionKind(node: Node): 'condition' | 'handle' | undefined {
+    const expr = Node.isAwaitExpression(node) ? node.getExpression() : node;
+    if (Node.isCallExpression(expr)) {
+      const callee = expr.getExpression();
+      if (
+        Node.isPropertyAccessExpression(callee) &&
+        this.typedAs(callee.getExpression(), 'WorkflowContext')
+      ) {
+        const method = callee.getName();
+        if (method === 'signalWait' || method === 'timer') return 'condition';
+        if (method === 'startChild') return 'handle';
+      }
+      return undefined;
+    }
+    if (!Node.isIdentifier(expr)) return undefined;
+    // `{ child }`: the shorthand's own symbol is the property; the variable is its value symbol.
+    const owner = expr.getParent();
+    const symbol = Node.isShorthandPropertyAssignment(owner)
+      ? owner.getValueSymbol()
+      : expr.getSymbol();
+    for (const decl of symbol?.getDeclarations() ?? []) {
+      if (!Node.isVariableDeclaration(decl) && !Node.isParameterDeclaration(decl)) continue;
+      const typeNode = decl.getTypeNode();
+      if (typeNode && Node.isTypeReference(typeNode)) {
+        const type = this.officialName(typeNode.getTypeName());
+        if (type === 'ChildWorkflowHandle') return 'handle';
+        if (type === 'WorkflowCondition') return 'condition';
+      }
+      const init = Node.isVariableDeclaration(decl) ? decl.getInitializer() : undefined;
+      if (init) return this.conditionKind(init);
+    }
+    return undefined;
+  }
+
+  /**
+   * Whether the handle `ctx.startChild(…)` resolves is only ever used as a `waitForAny` condition
+   * (assigned to a variable whose every reference sits in a `waitForAny` conditions object), so the
+   * handle → id change needs nothing more than the `ctx.childWait` wrapping done there.
+   */
+  private onlyRacedInWaitForAny(call: CallExpression): boolean {
+    const awaited = call.getParent();
+    if (!Node.isAwaitExpression(awaited)) return false;
+    // A condition of its own: `{ c: await ctx.startChild(…) }`.
+    if (this.isWaitForAnyCondition(awaited)) return true;
+    const decl = awaited.getParent();
+    if (!Node.isVariableDeclaration(decl)) return false;
+    const refs = decl
+      .getNameNode()
+      .asKind(SyntaxKind.Identifier)
+      ?.findReferencesAsNodes()
+      .filter((ref) => ref !== decl.getNameNode());
+    if (!refs || refs.length === 0) return false;
+    return refs.every((ref) => this.isWaitForAnyCondition(ref));
+  }
+
+  /** Whether `node` is the value of a property of a `waitForAny` conditions object. */
+  private isWaitForAnyCondition(node: Node): boolean {
+    const owner = node.getParent();
+    const object = Node.isShorthandPropertyAssignment(owner)
+      ? owner.getParent()
+      : Node.isPropertyAssignment(owner) && owner.getInitializer() === node
+        ? owner.getParent()
+        : undefined;
+    const call = object?.getParent();
+    const callee = Node.isCallExpression(call) ? call.getExpression() : undefined;
+    return Node.isPropertyAccessExpression(callee) && callee.getName() === 'waitForAny';
   }
 
   /** `<signal>` or `<signal>:<key>` as a durable signal token expression. */
@@ -500,15 +636,12 @@ class Migration {
         const opts = props(options);
         const token = this.token(signal, opts?.get('key'));
         if (!token) return undefined;
-        if (opts?.has('id'))
-          this.todo(
-            'signal dedupe `id`: durable signals have no dedupe id; deduplicate upstream (e.g. the @nestjs/outbox inbox)',
-          );
         if (opts?.has('transaction'))
           this.todo(
             'transactional signal: use DurableOutbox.signal(tx, …) from @dudousxd/nestjs-durable/outbox',
           );
-        return `${lead}${client}.signal(${token}, ${payload ? this.r(payload) : 'undefined'})`;
+        const id = opts?.get('id');
+        return `${lead}${client}.signal(${token}, ${payload ? this.r(payload) : 'undefined'}${id ? `, { id: ${this.r(id)} }` : ''})`;
       }
       case 'result': {
         const [id] = args;

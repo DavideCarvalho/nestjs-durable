@@ -318,6 +318,12 @@ export interface DurableModuleOptions {
    */
   eventBufferTtlMs?: number;
   /**
+   * How long `signal(token, payload, { id })` remembers an id (ms, or a duration like `'7d'`); a
+   * re-send with the same token and id within it is dropped. Default 7 days. See
+   * `WorkflowEngineDeps.signalIdTtl`.
+   */
+  signalIdTtl?: string | number;
+  /**
    * How long (ms) a run parked `blocked` (no capable, protocol-compatible live worker) waits before
    * the blocked-recovery poll re-checks the fleet. Defaults to 5000. See
    * `WorkflowEngineDeps.blockedPollMs`. Operator only.
@@ -900,6 +906,7 @@ export class DurableModule {
               stalledAfterMs: options.stalledAfterMs,
               timerBatchSize: options.timerBatchSize,
               eventBufferTtlMs: options.eventBufferTtlMs,
+              signalIdTtl: options.signalIdTtl,
               blockedPollMs: options.blockedPollMs,
               trackStepStart: options.trackStepStart,
               instanceId: options.instanceId,

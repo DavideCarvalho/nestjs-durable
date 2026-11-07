@@ -90,6 +90,7 @@ import type {
   SearchAttributes,
   SearchAttributesSchema,
   Settled,
+  SignalOptions,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -194,6 +195,18 @@ import { DEFAULT_STALLED_AFTER_MS, type StalledRunInfo, findStalledRuns } from '
 import { type TenantVerifier, resolveWireTenant } from './tenant-auth';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
+import {
+  anyConditionToken,
+  anyConditionsOf,
+  anyHistoryEvent,
+  claimAnyCheckpoint,
+  dueTimer,
+  enterWaitAny,
+  isAnyCheckpoint,
+  isAnyMember,
+  removeAnyWaiters,
+  resolvedAnyCheckpoint,
+} from './wait-any';
 import {
   type Compensation,
   type CtxHost,
@@ -610,6 +623,12 @@ interface AwaitedChild {
   parallelGroup?: string | undefined;
 }
 
+/** Default {@link WorkflowEngineDeps.signalIdTtl}: 7 days. */
+const DEFAULT_SIGNAL_ID_TTL_MS = 7 * 86_400_000;
+
+/** {@link WorkflowEngine.sweepExpiredSignalIds}: records deleted per statement. */
+const SIGNAL_ID_SWEEP_BATCH = 500;
+
 /** {@link WorkflowEngine.sweepBufferedSignals}: rows read per page. */
 const BUFFERED_SWEEP_PAGE = 500;
 /** {@link WorkflowEngine.sweepBufferedSignals}: pages per call, so one tick stays short. */
@@ -897,6 +916,13 @@ export interface WorkflowEngineDeps {
    */
   eventBufferTtlMs?: number | undefined;
   /**
+   * How long `signal(token, payload, { id })` remembers an `id` (ms, or a duration like `'7d'`): a
+   * re-send with the same token and id within it is dropped. Records past it are ignored, and
+   * {@link WorkflowEngine.sweepExpiredSignalIds} deletes them. Keep it longer than any sender's
+   * redelivery window. Default 7 days; a call can pass its own `idTtl`.
+   */
+  signalIdTtl?: string | number | undefined;
+  /**
    * Opt-in self-heal window (ms) for a remote step with NO `timeoutMs` whose dispatched job was LOST —
    * the worker crashed mid-step leaving no result, or the transport dropped the job (a Redis
    * flush/eviction, or BullMQ moving a stalled job to `failed` and removing it). The `pending`
@@ -1065,6 +1091,7 @@ export class WorkflowEngine {
   private readonly reconcileMs: number | undefined;
   private readonly timerBatchSize: number;
   private readonly eventBufferTtlMs: number | undefined;
+  private readonly signalIdTtlMs: number;
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
   /** How long a `blocked` run waits before the recovery poll re-checks the live fleet (design §7.5). */
@@ -1285,6 +1312,8 @@ export class WorkflowEngine {
       batch !== undefined && Number.isFinite(batch) && batch >= 1 ? Math.floor(batch) : 500;
     // Opt-in: unset (or 0) keeps buffered events around forever, same as buffered signals.
     this.eventBufferTtlMs = deps.eventBufferTtlMs || undefined;
+    this.signalIdTtlMs =
+      deps.signalIdTtl != null ? parseDuration(deps.signalIdTtl) : DEFAULT_SIGNAL_ID_TTL_MS;
     // Opt-in: unset (or 0) leaves the by-design "re-suspend a lost dispatch, never re-dispatch" behavior.
     this.remoteRedispatchMs = deps.remoteRedispatchMs || undefined;
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
@@ -2107,6 +2136,24 @@ export class WorkflowEngine {
       }
     } finally {
       this.bufferedSweepActive = false;
+    }
+    return deleted;
+  }
+
+  /**
+   * Delete the signal-id records (`signal(..., { id })`) that expired by `now`, in batches of
+   * {@link SIGNAL_ID_SWEEP_BATCH}, at most `maxBatches` per call. Expired records already stop
+   * deduplicating; this reclaims their rows. The NestJS timer poller calls it every tick. Returns how
+   * many it deleted; 0 on a store without `deleteExpiredSignalIds`.
+   */
+  async sweepExpiredSignalIds(now: number = this.clock(), maxBatches = 4): Promise<number> {
+    const { deleteExpiredSignalIds } = this.store;
+    if (!deleteExpiredSignalIds || this.draining) return 0;
+    let deleted = 0;
+    for (let batch = 0; batch < maxBatches; batch++) {
+      const n = await deleteExpiredSignalIds.call(this.store, now, SIGNAL_ID_SWEEP_BATCH);
+      deleted += n;
+      if (n < SIGNAL_ID_SWEEP_BATCH) break;
     }
     return deleted;
   }
@@ -5201,7 +5248,9 @@ export class WorkflowEngine {
     waiter: SignalWaiter,
     payload: unknown,
     resumeHere = false,
+    committed?: () => void,
   ): Promise<RunResult | null> {
+    if (isAnyMember(waiter)) return this.deliverToWaitAny(waiter, payload, resumeHere, committed);
     await this.store.saveCheckpoint(
       instantCheckpoint({
         runId: waiter.runId,
@@ -5216,6 +5265,7 @@ export class WorkflowEngine {
         parallelGroup: waiter.parallelGroup,
       }),
     );
+    committed?.();
     if (await this.fanStillWaiting(waiter, payload)) {
       return { runId: waiter.runId, status: 'suspended' };
     }
@@ -5226,6 +5276,61 @@ export class WorkflowEngine {
         throw err;
       },
     );
+  }
+
+  /**
+   * Deliver to a waiter that is one condition of a `ctx.waitForAny` (see `wait-any.ts`): settle the
+   * wait with this condition through the checkpoint's compare-and-set, then wake the run. A signal
+   * that loses — the wait was settled by another condition first, or a timer of the wait came due
+   * before it arrived (the timer then wins) — is not consumed: it is sent again on its token, where
+   * it is buffered for the next wait (or reaches a waiter registered since).
+   */
+  private async deliverToWaitAny(
+    waiter: SignalWaiter,
+    payload: unknown,
+    resumeHere: boolean,
+    committed?: () => void,
+  ): Promise<RunResult | null> {
+    const cp = await this.store.getCheckpoint(waiter.runId, waiter.seq);
+    const conditions =
+      cp && cp.status === 'pending' && isAnyCheckpoint(cp) ? anyConditionsOf(cp) : [];
+    const condition = conditions.find((c) => anyConditionToken(c) === waiter.token);
+    // A run that ended (cancelled, timed out, deleted) while waiting left its waiters behind: it no
+    // longer waits, so the signal is not its to take.
+    const run = cp && condition ? await this.store.getRun(waiter.runId) : null;
+    if (!cp || !condition || !run || TERMINAL_RUN_STATUSES.includes(run.status)) {
+      if (cp && condition) await removeAnyWaiters(this.store, cp);
+      await this.redeliverLosingSignal(waiter.token, payload);
+      committed?.();
+      return null;
+    }
+    const due = dueTimer(conditions, this.clock());
+    const done = due
+      ? resolvedAnyCheckpoint(cp, due, null)
+      : resolvedAnyCheckpoint(cp, condition, payload);
+    const won = await claimAnyCheckpoint(this.store, done);
+    if (won) await removeAnyWaiters(this.store, done);
+    if (!won || due) await this.redeliverLosingSignal(waiter.token, payload);
+    committed?.();
+    if (!won) return null;
+    return (resumeHere ? this.resumeImplicit(waiter.runId) : this.wake(waiter.runId)).catch(
+      (err) => {
+        if (err instanceof NamespaceMismatch) return null;
+        throw err;
+      },
+    );
+  }
+
+  /**
+   * Put back a signal a `waitForAny` condition took but did not win with. A child's completion is
+   * kept only where a parent can still consume it, as {@link deliverToParent} decides.
+   */
+  private async redeliverLosingSignal(token: string, payload: unknown): Promise<void> {
+    if (token.startsWith(CHILD_TOKEN_PREFIX)) {
+      const childId = token.slice(CHILD_TOKEN_PREFIX.length);
+      if (!(await childCompletionNeedsBuffer(this.store, childId, payload))) return;
+    }
+    await this.deliverOrBuffer(token, payload);
   }
 
   /**
@@ -5378,7 +5483,8 @@ export class WorkflowEngine {
       checkpoints.filter((cp) => cp.status === 'completed').map((cp) => cp.seq),
     );
     const awaited = waiters
-      .filter((w) => w.token.startsWith('child:') && !settled.has(w.seq))
+      // A `waitForAny` child condition settles through the wait's own checkpoint, never this one.
+      .filter((w) => w.token.startsWith('child:') && !settled.has(w.seq) && !isAnyMember(w))
       .map((w) => ({
         childId: w.token.slice('child:'.length),
         seq: w.seq,
@@ -5479,12 +5585,44 @@ export class WorkflowEngine {
    * Either way, the destructive `take*` ops (on the waiter row, on the buffer) arbitrate: whichever
    * side actually removes the row is the one that delivers, so a signal is never delivered twice.
    */
-  async signal(token: string, payload: unknown): Promise<RunResult | null> {
+  async signal(token: string, payload: unknown, opts?: SignalOptions): Promise<RunResult | null> {
+    const id = opts?.id;
+    if (id === undefined) return this.deliverOrBuffer(token, payload);
+    if (!this.store.claimSignalId) {
+      throw new Error(
+        'engine.signal(..., { id }) needs a store that deduplicates signals (claimSignalId); the bundled stores do',
+      );
+    }
+    const now = this.clock();
+    const ttl = opts?.idTtl !== undefined ? parseDuration(opts.idTtl) : this.signalIdTtlMs;
+    if (!(await this.store.claimSignalId(token, id, now + ttl, now))) return null;
+    let committed = false;
+    try {
+      return await this.deliverOrBuffer(token, payload, () => {
+        committed = true;
+      });
+    } catch (err) {
+      // Nothing was delivered or buffered: forget the id, so the sender's retry isn't a duplicate.
+      if (!committed) await this.store.releaseSignalId?.(token, id).catch(() => undefined);
+      throw err;
+    }
+  }
+
+  /**
+   * {@link signal} without deduplication: deliver to the waiter on `token`, or buffer. `committed`
+   * is called once the signal is durably delivered or buffered.
+   */
+  private async deliverOrBuffer(
+    token: string,
+    payload: unknown,
+    committed?: () => void,
+  ): Promise<RunResult | null> {
     const waiter = await this.store.takeSignalWaiter(token);
-    if (waiter) return this.deliverSignal(waiter, payload);
+    if (waiter) return this.deliverSignal(waiter, payload, false, committed);
     // No one was waiting yet — buffer it so the next `waitForSignal(token)` consumes it instead of
     // dropping it (reliable signals; the basis of `signalWithStart`).
     await this.store.bufferSignal(token, payload);
+    committed?.();
     // Re-check: a waiter may have registered in the window between the miss above and this buffer
     // write (see the interleaving proof above).
     const lateWaiter = await this.store.takeSignalWaiter(token);
@@ -5954,9 +6092,12 @@ export class WorkflowEngine {
    */
   /** The children `parentRunId` is awaiting right now, read off its own live `child:` waiters. */
   private async awaitedChildIds(parentRunId: string): Promise<string[]> {
-    return (await listSignalWaitersOfRuns(this.store, [parentRunId]))
-      .filter((w) => w.token.startsWith('child:'))
-      .map((w) => w.token.slice('child:'.length));
+    return (
+      (await listSignalWaitersOfRuns(this.store, [parentRunId]))
+        // A `waitForAny` child condition may name any run, not only one this run started.
+        .filter((w) => w.token.startsWith('child:') && !isAnyMember(w))
+        .map((w) => w.token.slice('child:'.length))
+    );
   }
 
   async getRunChildren(parentRunId: string): Promise<string[]> {
@@ -7464,6 +7605,10 @@ export class WorkflowEngine {
         // a Completion payload. Surface it as a `child` event with the value/error unwrapped.
         // onError handoffs sit past every op a body can reach; no replay is told about them.
         if (cp.seq >= HANDOFF_SEQ_BASE) continue;
+        if (isAnyCheckpoint(cp)) {
+          events.push(anyHistoryEvent(cp));
+          continue;
+        }
         if (cp.kind === 'signal' && cp.name.startsWith('signal:child:')) {
           const completion = cp.output as Completion<unknown> | undefined;
           events.push({
@@ -7678,6 +7823,23 @@ export class WorkflowEngine {
             await this.store.removeSignalWaiter({ token: cmd.signal, runId: run.id, seq: cmd.seq });
             await deliverBuffered(lateBuffered.payload);
           }
+        }
+      } else if (cmd.kind === 'waitAny') {
+        // `ctx.waitForAny` on a remote worker: resolved exactly as the in-process ctx resolves it (see
+        // wait-any.ts). A wait a condition already settles is re-driven on a macrotask once this turn
+        // has suspended and freed the run lock, like a buffered `waitSignal`; otherwise the run parks
+        // until a condition's signal wakes it or its earliest timer comes due.
+        const state = await enterWaitAny(
+          { store: this.store, clock: this.clock },
+          run.id,
+          cmd.seq,
+          cmd.name,
+          cmd.conditions,
+        );
+        if (state.state === 'resolved') {
+          setTimeout(() => void this.resumeImplicit(run.id).catch(() => undefined), 0);
+        } else if (state.wakeAt != null) {
+          wakeAt = wakeAt == null ? state.wakeAt : Math.min(wakeAt, state.wakeAt);
         }
       } else if (cmd.kind === 'startChild') {
         // Start a child run and await it (the worker's ctx.start_child suspends until the child's

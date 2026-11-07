@@ -60,6 +60,8 @@ CREATE TABLE durable_step_checkpoints (
 CREATE TABLE durable_signal_waiters (token TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL, parallel_group TEXT);
 CREATE TABLE durable_buffered_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL, payload TEXT);
 CREATE TABLE durable_buffered_events (id TEXT PRIMARY KEY, name TEXT NOT NULL, payload TEXT, published_at INTEGER NOT NULL);
+CREATE TABLE durable_signal_ids (token TEXT NOT NULL, signal_id TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (token, signal_id));
+CREATE INDEX durable_signal_ids_expires_at_idx ON durable_signal_ids (expires_at);
 `;
 
 /** The migration a consumer runs to adopt this change — the exact statements the schema prescribes.

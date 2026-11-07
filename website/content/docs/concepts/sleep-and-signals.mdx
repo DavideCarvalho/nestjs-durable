@@ -161,8 +161,74 @@ A note on `Promise.race`: don't reach for `Promise.race([ctx.sleep(...), ctx.wai
 to build a "whichever happens first" race by hand. Every suspending primitive resumes by *throwing*
 `WorkflowSuspended` to unwind the whole run back to the engine — it isn't a promise that stays
 pending until the real-world event happens, so racing two of them doesn't compose the way it would
-with ordinary I/O promises. Use `waitForSignal`'s own `{ timeoutMs }` for a signal-vs-timeout race —
-it's the one built and checkpointed for this.
+with ordinary I/O promises. Use `waitForSignal`'s own `{ timeoutMs }` for a signal-vs-timeout race,
+and [`ctx.waitForAny`](#waiting-for-the-first-of-several-waitforany) for anything wider.
+
+## Waiting for the first of several (`waitForAny`)
+
+`ctx.waitForAny(name, conditions)` waits for whichever condition happens first and resolves with
+the winner's `key` and `value`. Conditions are built with:
+
+- `ctx.signalWait<T>(token)`: a signal on `token`; its value is the payload.
+- `ctx.timer('3d')` or `ctx.timer({ until: date })`: a deadline, counted from when the wait is first
+  reached; its value is `null`.
+- `ctx.childWait<T>(runId)` (or `ctx.childWait(Workflow, runId)`): a run settling, typically a child
+  from `ctx.startChild`; its value is the run's output, and a run that failed, was cancelled or died
+  makes `waitForAny` throw a `FatalError`, as `ctx.child` does.
+
+```ts
+const outcome = await ctx.waitForAny('delivery', {
+  delivered: ctx.signalWait<CarrierEvent>(`shipment.delivered:${order.id}`),
+  cancelled: ctx.signalWait<{ reason: string }>(`order.cancelled:${order.id}`),
+  timeout: ctx.timer('3d'),
+});
+if (outcome.key === 'timeout') throw new FatalError(`order ${order.id} was not delivered`);
+if (outcome.key === 'delivered') await ctx.step(thank, outcome.value); // value: CarrierEvent
+```
+
+Checking `key` narrows `value`. The outcome is journaled at **one** position under `name`, so every
+replay gets the same winner, and renaming the wait for a run in flight is a non-determinism error.
+
+What happens to the others:
+
+- **Only the winning signal is consumed.** A signal that lands on a losing condition, while or after
+  the wait is settled, stays buffered on its token for the next wait on it. The engine settles the
+  wait with a compare-and-set on its checkpoint; a signal that loses that race is sent again on its
+  token instead of being dropped.
+- **A losing timer never fires**: the run's next wake comes from whatever it waits on next.
+- **A losing child keeps running.** Join it later with `ctx.child(Workflow, input, { childId })` (or
+  race it again).
+
+When several conditions are ready at once (signals buffered before the wait, a child that already
+finished), the signal **sent first** wins, whichever condition it matches, then a finished child,
+then the earliest due timer. A signal that arrives **after a timer's deadline** loses to the timer
+even if no worker ran at the deadline, and stays buffered.
+
+`waitForAny` works the same in the Node thin worker (`@dudousxd/durable-worker`) and the Python SDK
+(`ctx.wait_for_any(name, { "a": ctx.signal_wait(token), "t": ctx.timer(ms), "c": ctx.child_wait(id) })`):
+the worker emits one `waitAny` command and the engine resolves it, timers included.
+
+## Deduplicating signals (`id`)
+
+A sender that can run twice (a webhook the provider retries, a message redelivered by a queue, a
+retried job) can pass an id:
+
+```ts
+await this.workflows.signal(`shipment.delivered:${event.orderId}`, event, { id: event.deliveryId });
+```
+
+A signal re-sent on the **same token** with the **same id** is dropped: `signal()` resolves `null`
+and nothing is delivered or buffered, so the first payload wins. The same id on another token is
+another signal. The engine remembers an id for `signalIdTtl` (a `DurableModule` / engine option, 7
+days by default; `{ id, idTtl }` overrides it per call), so keep that longer than any sender's
+redelivery window. Expired ids are ignored and the timer poller deletes them a few hundred per tick.
+If storing the signal fails after the id was recorded, the id is released so the sender's retry gets
+through.
+
+The ids live in `durable_signal_ids` (`token`, `signal_id`, `expires_at`; primary key
+`(token, signal_id)`). The TypeORM, MikroORM and Drizzle Postgres stores create it at boot with
+auto-schema; with Drizzle on SQLite or Prisma, add the table to your schema (the `signalIds` table /
+the `DurableSignalId` model) and migrate.
 
 ## Signals vs updates vs webhooks
 
