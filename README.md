@@ -134,6 +134,16 @@ multiple worker pools sharing one store/broker.
 | `@dudousxd/nestjs-durable-testing` | Test harness, crash injection, replay assertions | ✅ |
 | `durable-worker` (PyPI) | Python SDK + wire protocol — implement steps **and** author workflows | ✅ |
 
+### With the first-party NestJS packages
+
+Each is optional; install it only if you want what it adds.
+
+| Official package | What durable does with it |
+| --- | --- |
+| [`@nestjs/outbox`](https://docs.nestjs.com/reliability/outbox) | `@dudousxd/nestjs-durable/outbox`: `DurableOutbox.start(tx, …)` / `.signal(tx, …)` start or signal a run in your DB transaction |
+| [`@nestjs/idempotency`](https://docs.nestjs.com/reliability/idempotency) | `DurableDashboardModule.forRoot({ decorators: [Idempotent()] })` makes the console's `POST`s and the `ctx.webhook()` receiver replay-safe |
+| [`@nestjs/locks`](https://docs.nestjs.com/reliability/locks) | Detected: with `LocksModule` and a shared store, retention, the stalled-run pager and buffered-signal cleanup run on one pod |
+
 ## License
 
 MIT

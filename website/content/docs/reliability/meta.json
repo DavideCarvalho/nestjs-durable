@@ -3,6 +3,7 @@
   "icon": "ShieldCheck",
   "pages": [
     "index",
+    "transactional-start",
     "retries",
     "sagas",
     "flow-control",

@@ -10,10 +10,12 @@ import {
   Injectable,
   type OnApplicationBootstrap,
   type OnModuleDestroy,
+  Optional,
 } from '@nestjs/common';
 import type { DurableModuleOptions, DurableRetentionOptions } from './durable.module';
 import { isDrivingOperator } from './role';
 import { settleWithin } from './settle-within';
+import { SweepLeases } from './sweep-leases';
 
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
 const DEFAULT_BATCH_SIZE = 1_000;
@@ -91,6 +93,8 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
   constructor(
     @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
+    // One pod prunes when the app has `LocksModule` from `@nestjs/locks` (detected, see SweepLeases).
+    @Optional() private readonly leases: SweepLeases = new SweepLeases(),
   ) {}
 
   /** Non-null once past the `isDrivingOperator` guard (which requires `options.store` to be set). */
@@ -170,19 +174,27 @@ export class RetentionPoller implements OnApplicationBootstrap, OnModuleDestroy 
     if (!retention || typeof prune !== 'function') return;
     this.sweeping = true;
     try {
-      const batchSize = retention.batchSize ?? DEFAULT_BATCH_SIZE;
-      const now = Date.now();
-      for (const policy of retention.policies) {
-        for (let batch = 0; batch < MAX_BATCHES_PER_POLICY; batch++) {
-          if (this.stopping) return;
-          const deleted = await prune.call(store, policy, now, batchSize);
-          if (deleted < batchSize) break; // backlog drained for this policy
-        }
-      }
+      await this.leases.run('retention', () => this.prune(retention, store, prune));
     } catch (error) {
       console.error('[nestjs-durable] retention sweep failed; retrying next interval:', error);
     } finally {
       this.sweeping = false;
+    }
+  }
+
+  private async prune(
+    retention: DurableRetentionOptions,
+    store: StateStore,
+    prune: NonNullable<StateStore['pruneTerminalRuns']>,
+  ): Promise<void> {
+    const batchSize = retention.batchSize ?? DEFAULT_BATCH_SIZE;
+    const now = Date.now();
+    for (const policy of retention.policies) {
+      for (let batch = 0; batch < MAX_BATCHES_PER_POLICY; batch++) {
+        if (this.stopping) return;
+        const deleted = await prune.call(store, policy, now, batchSize);
+        if (deleted < batchSize) break; // backlog drained for this policy
+      }
     }
   }
 }

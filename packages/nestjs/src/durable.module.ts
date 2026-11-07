@@ -43,6 +43,7 @@ import { RetentionPoller } from './retention-poller';
 import { isDrivingOperator } from './role';
 import { RunRequestResponder, type RunRequestTransport } from './run-request-responder';
 import { StoreRunGateway } from './store-run-gateway';
+import { SweepLeases } from './sweep-leases';
 import { TenantEventRepublisher } from './tenant-event-republisher';
 import { TimerPoller } from './timer-poller';
 import { CONTEXT_ACCESSOR } from './tokens';
@@ -935,6 +936,7 @@ export class DurableModule {
         EntityService,
         WorkflowRegistrar,
         DurableStepRegistrar,
+        SweepLeases,
         TimerPoller,
         RetentionPoller,
         // Tenant run gateway: bound EXACTLY once — the store-backed `StoreRunGateway` for an operator,

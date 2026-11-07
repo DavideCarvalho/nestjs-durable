@@ -220,6 +220,8 @@ describe('optional peers are absent-safe in the built package', () => {
     expect(optionalPeers).toEqual([
       '@dudousxd/durable-worker',
       '@dudousxd/nestjs-context',
+      '@nestjs/locks',
+      '@nestjs/outbox',
       'class-transformer',
       'class-validator',
       'zod',
@@ -269,5 +271,72 @@ describe('lazily loaded optional peers work when they are installed', () => {
     expect(runWithout(['class-validator'], validateInputWithoutPeer, 'mjs')).toContain(
       'rejected: workflow "order" input uses a class-validator DTO, which needs the optional peers',
     );
+  });
+});
+
+/** Boot an operator with retention under `LocksModule`: the sweeps must report the locks mode. */
+const sweepsUnderLocks = (head: string) => `
+${head}
+const { Test } = imports.testing;
+const mod = await Test.createTestingModule({
+  imports: [
+    imports.durable.DurableModule.forRoot({
+      store: new imports.core.InMemoryStateStore(),
+      transport: new imports.core.InMemoryTransport(),
+      timerPollMs: 0,
+    }),
+    imports.locks.LocksModule.forRoot(),
+  ],
+}).compile();
+const logs = [];
+mod.useLogger({ log: (m) => logs.push(String(m)), error() {}, warn() {}, debug() {}, verbose() {} });
+await mod.init();
+await mod.close();
+console.log(logs.find((m) => m.includes('fleet-wide sweeps')));
+`;
+
+describe('@nestjs/locks and @nestjs/outbox, when installed', () => {
+  it('detects Locks from the ESM entry', () => {
+    const head = `import 'reflect-metadata';
+const imports = {
+  testing: await import('@nestjs/testing'),
+  core: await import('@dudousxd/nestjs-durable-core'),
+  durable: await import('${pkg.name}'),
+  locks: await import('@nestjs/locks'),
+};`;
+    expect(runWithout([], sweepsUnderLocks(head), 'mjs')).toContain('through @nestjs/locks');
+  });
+
+  it('detects Locks from the CJS entry', () => {
+    const head = `require('reflect-metadata');
+const imports = {
+  testing: require('@nestjs/testing'),
+  core: require('@dudousxd/nestjs-durable-core'),
+  durable: require('${pkg.name}'),
+  locks: require('@nestjs/locks'),
+};`;
+    const script = `(async () => {${sweepsUnderLocks(head)}})();`;
+    expect(runWithout([], script, 'cjs')).toContain('through @nestjs/locks');
+  });
+
+  it('loads the ./outbox subpath from ESM and CJS', () => {
+    expect(
+      runWithout(
+        [],
+        `const m = await import('${pkg.name}/outbox');\nconsole.log(typeof m.DurableOutboxModule.forRoot);`,
+        'mjs',
+      ),
+    ).toContain('function');
+    expect(
+      runWithout(
+        [],
+        `const m = require('${pkg.name}/outbox');\nconsole.log(typeof m.DurableOutboxModule.forRoot);`,
+        'cjs',
+      ),
+    ).toContain('function');
+  });
+
+  it('the main entry never loads @nestjs/outbox', () => {
+    expect(runWithout(['@nestjs/outbox'], bootOperator, 'mjs')).toContain('booted');
   });
 });
