@@ -480,6 +480,24 @@ export class MikroOrmStateStore implements StateStore {
 
   async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
     if (settlements.length === 0) return [];
+    if (settlements.length === 1) {
+      // One result (a dispatched step's, the common case): one conditional UPDATE is the
+      // compare-and-set, its changed-row count the answer. No transaction, no locking read.
+      const s = settlements[0] as StepSettlement;
+      const changed = await this.fork().nativeUpdate(
+        StepCheckpointEntity,
+        { runId: s.runId, seq: s.seq, status: 'pending' },
+        {
+          status: s.status,
+          output: s.output ?? null,
+          error: s.error ?? null,
+          events: s.events ?? null,
+          startedAt: s.startedAt,
+          finishedAt: s.finishedAt,
+        } as never,
+      );
+      return [changed === 1];
+    }
     // Decided like saveCheckpointsIfPending, against the locked `pending` rows. A settlement never
     // leaves its row `pending`, so a row is won by its first entry only. The upsert's insert never
     // happens (the rows exist and are locked): it carries the row's required columns and no `input`,

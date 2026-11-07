@@ -475,6 +475,25 @@ export class TypeOrmStateStore implements StateStore {
 
   async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
     if (settlements.length === 0) return [];
+    if (settlements.length === 1) {
+      // One result (a dispatched step's, the common case): one conditional UPDATE is the
+      // compare-and-set, its changed-row count the answer. No transaction, no locking read.
+      const s = settlements[0] as StepSettlement;
+      const result = await this.checkpoints()
+        .createQueryBuilder()
+        .update()
+        .set({
+          status: s.status,
+          output: s.output ?? null,
+          error: s.error ?? null,
+          events: s.events ?? null,
+          startedAt: s.startedAt,
+          finishedAt: s.finishedAt,
+        } as QueryDeepPartialEntity<StepCheckpointEntity>)
+        .where({ runId: s.runId, seq: s.seq, status: 'pending' })
+        .execute();
+      return [result.affected === 1];
+    }
     // Decided like saveCheckpointsIfPending, against the locked `pending` rows. A settlement never
     // leaves its row `pending`, so a row is won by its first entry only. The upsert's insert never
     // happens (the rows exist and are locked): it carries the row's required columns and no `input`,

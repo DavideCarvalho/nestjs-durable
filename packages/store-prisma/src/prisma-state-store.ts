@@ -501,7 +501,9 @@ export class PrismaStateStore implements StateStore {
       seen.add(key);
       firsts.push(i);
     });
-    const dialect = rawSettleDialect(this.db);
+    // One result (a dispatched step's, the common case) is one conditional `updateMany`: a single
+    // statement, so neither a transaction nor the raw batch statement is worth it.
+    const dialect = firsts.length === 1 ? undefined : rawSettleDialect(this.db);
     if (!dialect) {
       // One conditional `updateMany` per entry, in one transaction: the row count is its answer.
       const settle = async (db: Pick<DurablePrismaClient, 'durableStepCheckpoint'>) => {
