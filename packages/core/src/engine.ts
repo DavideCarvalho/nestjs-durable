@@ -1030,6 +1030,14 @@ export interface WorkflowEngineDeps {
   stickyRuns?: number | undefined;
   /** How long a parked body may sit idle in the sticky cache before it is dropped. Default 5 min. */
   stickyIdleMs?: number | undefined;
+  /**
+   * Ask the transports that can ({@link Transport.consumeRepliesFor}, e.g. BullMQ) to send the result
+   * of a dispatched `ctx.step` back to this instance, which holds the body parked on it, rather
+   * than to whichever engine instance takes it off the shared results. With several engine
+   * instances, that is what keeps the sticky continuation hitting. A result whose instance is gone
+   * goes to the shared results and replays elsewhere. Default `true` while the sticky cache is on.
+   */
+  routeReplies?: boolean | undefined;
 }
 
 /** Options for {@link WorkflowEngine.listStalledRuns}. */
@@ -1115,6 +1123,10 @@ export class WorkflowEngine {
   private readonly claimedRuns = new Map<string, WorkflowRun>();
   /** The continuation each turn executing here runs in, by run id, while the turn runs. */
   private readonly turnContinuations = new Map<string, StickyContinuation>();
+  /** Whether to ask transports to route step results back here (see {@link WorkflowEngineDeps.routeReplies}). */
+  private readonly routeReplies: boolean;
+  /** Whether a transport routes this instance's step results back to it. */
+  private repliesRouted = false;
   /** The run row stamp (`updatedAt`, epoch ms) a turn here wrote when it settled `suspended`. */
   private readonly suspendStamps = new Map<string, number>();
   private readonly timerBatchSize: number;
@@ -1333,6 +1345,7 @@ export class WorkflowEngine {
       Math.max(0, deps.stickyRuns ?? DEFAULT_STICKY_RUNS),
       deps.stickyIdleMs ?? DEFAULT_STICKY_IDLE_MS,
     );
+    this.routeReplies = deps.routeReplies ?? true;
     const stalledAfter = deps.stalledAfterMs;
     this.stalledAfterMs =
       stalledAfter !== undefined && Number.isFinite(stalledAfter)
@@ -1471,6 +1484,11 @@ export class WorkflowEngine {
         await this.completeRemoteDecision(decision);
       },
     );
+    // Step results come back to the instance holding the body parked on the step, where the
+    // transport can route them (see WorkflowEngineDeps.routeReplies).
+    if (this.routeReplies && this.sticky.enabled) {
+      this.repliesRouted = this.pool.routeReplies(this.instanceId);
+    }
     // Control-plane start-run: a DB-less tenant worker publishes a StartRunMessage and this
     // (control-plane) engine turns it into a durable run stamped with the tenant's namespace. Guarded
     // by the transport's `onStartRun` capability (like the other optional transport hooks) — a pool
@@ -4211,6 +4229,7 @@ export class WorkflowEngine {
     this.draining = true;
     // Parked bodies are only an optimization: the runs replay wherever they resume next.
     this.sticky.clear();
+    this.pool.stopReplies();
     // Stop taking runs off the transport's queue, so they wait there for another instance; the
     // ones in flight settle, and drain() waits for them.
     if (this.runConsumerStops.length > 0) {
@@ -8934,6 +8953,8 @@ export class WorkflowEngine {
         priority: admission?.priority,
         attempt: reAttempt,
         transport,
+        // A fan's steps are joined by its barrier, not a parked body: their results stay shared.
+        replyHere: routing?.parallelGroup === undefined,
       });
       this.emit({
         type: 'step.started',
@@ -9025,6 +9046,7 @@ export class WorkflowEngine {
       priority: admission?.priority,
       attempt,
       transport,
+      replyHere: routing?.parallelGroup === undefined,
     });
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     this.awaitedRemoteSteps.get(runId)?.add(seq);
@@ -9083,6 +9105,7 @@ export class WorkflowEngine {
       priority: admission?.priority,
       attempt: 1,
       transport,
+      replyHere: routing?.parallelGroup === undefined,
     });
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     this.awaitedRemoteSteps.get(runId)?.add(seq);
@@ -9594,6 +9617,8 @@ export class WorkflowEngine {
    *  dispatch, the opt-in self-heal re-dispatch (see `remoteRedispatchMs`), and the explicit
    *  {@link redispatchPending}. Carries the current trace/context so a re-dispatch is traceable. */
   private dispatchRemoteTask(task: {
+    /** Ask for the result back here (a single `ctx.step` the body may be parked on). */
+    replyHere?: boolean | undefined;
     runId: string;
     seq: number;
     name: string;
@@ -9616,6 +9641,9 @@ export class WorkflowEngine {
         context: this.context?.(),
         priority: task.priority,
         attempt: task.attempt,
+        ...(task.replyHere && this.repliesRouted && !this.draining
+          ? { replyTo: this.instanceId }
+          : {}),
       },
       task.transport,
     );

@@ -425,3 +425,50 @@ describe('claiming pending runs', () => {
     expect(peak).toBeGreaterThan(3);
   });
 });
+
+describe('routed replies', () => {
+  class ReplyingTransport extends HeldTransport {
+    repliesFor: string | undefined;
+    consumeRepliesFor(id: string): void {
+      this.repliesFor = id;
+    }
+  }
+
+  it('ask for a ctx.step result back on the dispatching instance, never a fan step', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new ReplyingTransport();
+    const engine = new WorkflowEngine({ store, transport, reconcileMs: 0, instanceId: 'me' });
+    engine.register('wf', '1', async (ctx) => {
+      await ctx.step('s.one', 1);
+      const many = Object.assign(() => {}, { [Symbol.for('durable.step.name')]: 's.many' });
+      return ctx.all(many as never, [1, 2]);
+    });
+    expect(transport.repliesFor).toBe('me');
+    await engine.start('wf', {}, 'r1');
+    await until(() => transport.dispatched.length === 1);
+    const [one] = transport.take();
+    expect(one?.replyTo).toBe('me');
+    await until(async () => (await status(store, 'r1')) === 'suspended');
+    await transport.deliver(ok(one as RemoteTask, 1));
+    await until(() => transport.dispatched.length === 2);
+    for (const task of transport.take()) expect(task.replyTo).toBeUndefined();
+  });
+
+  it('are not asked for without the sticky cache, nor on a transport that cannot route them', async () => {
+    const plain = new HeldTransport();
+    const off = new ReplyingTransport();
+    const store = new InMemoryStateStore();
+    const a = new WorkflowEngine({ store, transport: plain, reconcileMs: 0 });
+    const b = new WorkflowEngine({ store, transport: off, reconcileMs: 0, stickyRuns: 0 });
+    expect(off.repliesFor).toBeUndefined();
+    for (const [engine, transport, id] of [
+      [a, plain, 'p'],
+      [b, off, 'q'],
+    ] as const) {
+      engine.register('wf', '1', async (ctx) => ctx.step('s.one', 1));
+      await engine.start('wf', {}, id);
+      await until(() => transport.dispatched.length === 1);
+      expect(transport.take()[0]?.replyTo).toBeUndefined();
+    }
+  });
+});

@@ -1602,6 +1602,14 @@ export interface RemoteTask {
    */
   priority?: number | undefined;
   attempt: number;
+  /**
+   * The engine instance that dispatched the task and wants its result back, when the transport
+   * routes replies ({@link Transport.consumeRepliesFor}): that instance keeps the workflow body
+   * parked on the step, so its result continues the body there instead of replaying it elsewhere.
+   * A worker sends the result to that instance while it is alive, else to the shared results, like
+   * a task without it. Absent when replies are not routed (a step fan's tasks never carry it).
+   */
+  replyTo?: string | undefined;
 }
 
 export interface StepResult {
@@ -1891,6 +1899,14 @@ export interface Transport {
   dispatchMany?(tasks: RemoteTask[]): Promise<void>;
   /** worker → engine: a step finished (ok or error). */
   onResult(handler: (result: StepResult) => Promise<void>): void;
+  /**
+   * Also consume the results workers address to engine instance `replyTo` (tasks dispatched with
+   * {@link RemoteTask.replyTo}), handing them to the {@link onResult} handlers. A transport that
+   * implements it must never lose such a result: while `replyTo` is gone (crashed, scaled down,
+   * drained), its results go, or are moved, to the shared results. Optional: a transport without it
+   * gets tasks without `replyTo`, and every result comes back on the shared results.
+   */
+  consumeRepliesFor?(replyTo: string): void;
   /** worker → engine: liveness signal for an in-flight long step. */
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void;
   /** Release the transport's resources (broker workers, queues, connections) for a clean shutdown.

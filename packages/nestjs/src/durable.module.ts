@@ -345,6 +345,12 @@ export interface DurableModuleOptions {
   /** How long a parked body may stay idle in that cache. Default 5 min. Operator only. */
   stickyIdleMs?: number;
   /**
+   * Send each dispatched `ctx.step` result back to the engine instance that dispatched it (and holds
+   * the parked body), on transports that can route replies (BullMQ). Default `true`. See
+   * `WorkflowEngineDeps.routeReplies`. Operator only.
+   */
+  routeReplies?: boolean;
+  /**
    * The **default** workflow to route dead-lettered runs to, for workflows that don't declare their
    * own. When a run is moved to `dead` (exceeded `maxRecoveryAttempts`), the started handler gets a
    * `DeadLetter` payload `{ deadRunId, workflow, input, error }` (idempotent by a `dlq:<runId>` id) —
@@ -920,6 +926,7 @@ export class DurableModule {
               trackStepStart: options.trackStepStart,
               stickyRuns: options.stickyRuns,
               stickyIdleMs: options.stickyIdleMs,
+              routeReplies: options.routeReplies,
               instanceId: options.instanceId,
               namespace: options.namespace,
               webhookUrl: options.webhookUrl,
