@@ -11,6 +11,7 @@ import {
 } from './inspect';
 import { type RepublishOptions, republishLifecycle } from './lifecycle';
 import { loadEngine, loadStore } from './load-config';
+import { migrateFiles } from './migrate/nestjs-workflows';
 
 const USAGE = `durable — inspect and control nestjs-durable workflow runs
 
@@ -24,6 +25,9 @@ Usage:
   durable lifecycle:republish --run <runId> | --workflow <name> [--since <iso>] [--until <iso>]
                                   publish settled runs' lifecycle events again, starting the
                                   subscribers that have not started (needs an exported \`engine\`)
+  durable migrate nestjs-workflows <glob…> [--dry-run]
+                                  rewrite code written for @nestjs/workflows to nestjs-durable
+                                  where it maps 1:1; leaves // TODO(durable-migrate) comments
 
 Options:
   --status <status>   running | suspended | completed | failed | cancelled
@@ -43,6 +47,9 @@ and, for lifecycle:republish, the \`engine\` with the subscribing workflows regi
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const command = argv[0];
+  if (command === 'migrate') {
+    process.exit(migrate(argv.slice(1)));
+  }
   if (
     command !== 'inspect' &&
     command !== 'cancel' &&
@@ -136,6 +143,29 @@ async function main(): Promise<void> {
 
   opts.runId = positional[0];
   console.log(await inspect(store, opts));
+}
+
+/** `durable migrate nestjs-workflows <glob…> [--dry-run]`. Returns the exit code. */
+function migrate(args: string[]): number {
+  const [source, ...rest] = args;
+  const globs = rest.filter((a) => !a.startsWith('--'));
+  const dryRun = rest.includes('--dry-run');
+  if (source !== 'nestjs-workflows' || globs.length === 0) {
+    console.error("Usage: durable migrate nestjs-workflows '<glob>' [more globs…] [--dry-run]");
+    return 1;
+  }
+  const { files } = migrateFiles(globs, { dryRun });
+  const changed = files.filter((f) => f.changed);
+  for (const f of changed) {
+    console.log(
+      `${dryRun ? 'would rewrite' : 'rewrote'} ${f.path}${f.todos ? ` (${f.todos} TODO)` : ''}`,
+    );
+  }
+  const todos = changed.reduce((n, f) => n + f.todos, 0);
+  console.log(
+    `${changed.length} of ${files.length} file(s) ${dryRun ? 'would change' : 'changed'}; ${todos} TODO(durable-migrate) left to finish by hand.`,
+  );
+  return 0;
 }
 
 main().catch((err) => {

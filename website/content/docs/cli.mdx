@@ -152,6 +152,18 @@ engine.register('refresh-summaries', '1', refreshSummaries, {
 });
 ```
 
+## Migrate code from `@nestjs/workflows`
+
+```bash
+durable migrate nestjs-workflows 'src/**/*.ts' --dry-run
+durable migrate nestjs-workflows 'src/**/*.ts'
+```
+
+Rewrites the files that import `@nestjs/workflows` to nestjs-durable where the mapping is 1:1, and
+leaves `// TODO(durable-migrate): …` above what it can't map. It needs no config or store. See
+[Migrating from @nestjs/workflows](/docs/migrate-from-nestjs-workflows) for the mapping and the
+cutover.
+
 ## Usage and exit codes
 
 Running `durable` with no subcommand, or an unrecognized one, prints the usage text instead of

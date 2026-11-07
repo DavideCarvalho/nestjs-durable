@@ -1,0 +1,226 @@
+---
+title: Migrating from @nestjs/workflows
+description: "Move an app from the official @nestjs/workflows engine to nestjs-durable: the API-by-API mapping, a codemod for the 1:1 cases, and a cutover that finishes every in-flight instance on the engine that started it."
+icon: ArrowRightLeft
+---
+
+[`@nestjs/workflows`](https://docs.nestjs.com/reliability/workflows) and nestjs-durable are both
+replay-based engines with a `run(ctx, input)` body, so most code moves line for line. What changes
+is around it: durable runs steps on remote Node or Python workers over a transport, has a
+dashboard, and stores its runs in its own tables. If you want those without moving your workflows,
+stay on the official engine and add [the dashboard and remote steps](/docs/nestjs-workflows)
+instead.
+
+Moving has three parts:
+
+1. **Code**: the mapping below, most of it applied by `durable migrate nestjs-workflows`.
+2. **Gaps**: what durable doesn't do the same way (listed at the end).
+3. **Cutover**: instances can't move between engines (their journals differ), so both run until
+   the official engine has finished what it started.
+
+## The codemod
+
+```bash
+npx durable migrate nestjs-workflows 'src/**/*.ts' --dry-run   # list what would change
+npx durable migrate nestjs-workflows 'src/**/*.ts'
+```
+
+It rewrites the files that import `@nestjs/workflows` where the mapping is 1:1, and puts a
+`// TODO(durable-migrate): …` comment above every statement it can't map. That code is left as it
+was, so the compiler flags it too. It prints how many TODOs each file has. A file it already
+migrated has no official import left, so running it again changes nothing.
+
+Before:
+
+```ts
+import { Workflow, WorkflowClient, type WorkflowContext } from '@nestjs/workflows';
+
+@Workflow('order', { version: 2 })
+export class OrderWorkflow {
+  async run(ctx: WorkflowContext, input: { orderId: string; amount: number }) {
+    const charge = await ctx.step('charge', () => this.payments.charge(input), { retry: 5, timeout: '30s' });
+    await ctx.sleep('cool-off', '10m');
+    const approval = await ctx.waitForSignal('approve', 'approval', { key: input.orderId });
+    return ctx.executeChild(ShippingWorkflow, input, { id: `ship-${input.orderId}`, parentClose: 'abandon' });
+  }
+}
+```
+
+After:
+
+```ts
+import { type WorkflowCtx, Workflow, WorkflowService } from '@dudousxd/nestjs-durable';
+
+@Workflow({ name: 'order', version: '2' })
+export class OrderWorkflow {
+  async run(ctx: WorkflowCtx, input: { orderId: string; amount: number }) {
+    const charge = await ctx.localStep('charge', async () => this.payments.charge(input), { retries: 5, timeoutMs: 30000 });
+    await ctx.sleep('10m');
+    const approval = await ctx.waitForSignal(`approval:${input.orderId}`);
+    return ctx.child(ShippingWorkflow, input, { childId: `ship-${input.orderId}`, parentClose: 'abandon' });
+  }
+}
+```
+
+## API mapping
+
+### Workflows
+
+| `@nestjs/workflows` | nestjs-durable | Codemod |
+| --- | --- | --- |
+| `@Workflow('name', { version: 2 })` | `@Workflow({ name: 'name', version: '2' })` (versions are strings) | ✅ |
+| `@Workflow(name, { timeout })` | `@Workflow({ executionTimeout })` | TODO |
+| `@Workflow(name, { concurrency })` | `@Workflow({ concurrency })` / `singleton` ([quotas](/docs/reliability/concurrency-quotas), [singleton](/docs/reliability/singleton)) | TODO |
+| `@Workflow(name, { rateLimit })` | [flow control](/docs/reliability/flow-control) | TODO |
+| `@Workflow(name, { schedules })` | `DurableModule.forRoot({ schedules })` or [persisted schedules](/docs/authoring/persisted-schedules) | TODO |
+| `run(ctx: WorkflowContext, input)` | `run(ctx: WorkflowCtx, input)` | ✅ |
+| `ctx.workflowId` | `ctx.runId` | ✅ |
+
+### Steps
+
+| `@nestjs/workflows` | nestjs-durable | Codemod |
+| --- | --- | --- |
+| `ctx.step(name, fn)` | `ctx.localStep(name, async fn)`, or a `@Step` method (`ctx.step(this.method, input)`) | ✅ |
+| `{ retry: n }` / `{ retry: false }` | `{ retries: n }` / `{ retries: 1 }` (both count every attempt) | ✅ |
+| `{ retry: { attempts, backoff } }` | `{ retries, backoff, backoffMs, backoffMaxMs, jitter }` | TODO |
+| `{ timeout: '30s' }` | `{ timeoutMs: 30000 }` | ✅ |
+| `{ heartbeatTimeout }` / `heartbeat(progress)` | heartbeats belong to remote steps (`timeoutMs` + the worker's heartbeat) | TODO |
+| `{ compensate: (result, ctx) => … }` | `{ compensate: async () => … }` (no arguments: capture the result) | ✅ / TODO with args |
+| fn's `{ idempotencyKey, attempt, signal }` | fn receives a `StepLogger`; derive a key from `ctx.runId` + the step name | TODO |
+| `ctx.commit(name)` | none: compensations of earlier steps still run on failure | TODO |
+| `ctx.now()` / `random()` / `uuid()` | `await ctx.now()` / `await ctx.sideEffect(() => Math.random())` / `await ctx.sideEffect(() => crypto.randomUUID())` | ✅ |
+| `ctx.setStatus(x)` | `await ctx.setEvent('status', x)`, read live with `GET runs/:id/events/status` | ✅ |
+| `ctx.fail(message)` | `throw new FatalError(message)` | ✅ |
+| `NonRetryableStepError` | `FatalError` (`@dudousxd/nestjs-durable-core`) | ✅ |
+
+### Timers and signals
+
+| `@nestjs/workflows` | nestjs-durable | Codemod |
+| --- | --- | --- |
+| `ctx.sleep(name, '10m')` | `ctx.sleep('10m')` | ✅ |
+| `ctx.sleep(name, { until })` | `ctx.sleepUntil(until)` | ✅ |
+| `ctx.waitForSignal(name, 'approve', { key })` | `ctx.waitForSignal(`approve:${key}`)`: a signal is a string token, and the codemod spells name + key as `<name>:<key>` | ✅ |
+| `… { timeout }` (resolves `null`) | `… { timeoutMs }` (**throws** `SignalTimeoutError`) | ✅ + TODO |
+| `… { match }` | filter and wait again, or [`ctx.waitForEvent(name, { match })`](/docs/authoring/events) | TODO |
+| `client.signal('approve', payload, { key })` | `workflows.signal(`approve:${key}`, payload)` | ✅ |
+| `client.signal(…, { id })` (dedupe) | no dedupe id on durable signals: deduplicate upstream (the [outbox](/docs/reliability/transactional-start) inbox) | TODO |
+| `ctx.waitForAny(name, { … })` | no equivalent yet. Signal or timeout: `waitForSignal(token, { timeoutMs })` + catch `SignalTimeoutError`. A child with a deadline: `ctx.waitForRun(id, { timeoutMs })` | TODO |
+
+### Children
+
+| `@nestjs/workflows` | nestjs-durable | Codemod |
+| --- | --- | --- |
+| `ctx.executeChild(W, input, { id })` | `ctx.child(W, input, { childId })` | ✅ |
+| `ctx.startChild(W, input, { id })` → handle | `ctx.startChild(W, input, { childId })` → **the id**; join with `ctx.waitForRun(id)` | ✅ + TODO |
+| `{ parentClose: 'cancel' \| 'terminate' \| 'abandon' }` | the same [`parentClose`](/docs/authoring/child-workflows#when-the-parent-ends-first--parentclose). The official default is `'cancel'`; durable's default leaves a finished parent's children running | ✅ |
+| `{ version: 2 }` / `{ priority }` | `{ version: '2' }` / `{ priority }` | ✅ |
+
+### Schedules
+
+| `@nestjs/workflows` | nestjs-durable |
+| --- | --- |
+| `cron` / `every` / `rrule` + `tz` | `cron` / `every` / [`rrule`](/docs/authoring/persisted-schedules#recurrence-rules--rrule) + `timezone` |
+| `WorkflowSchedules.upsert/pause/resume/trigger` | `engine.schedules.upsert/pause/resume/trigger` |
+| `missed` / `overlap` | `catchup` / `overlap` |
+
+### Client
+
+| `WorkflowClient` | nestjs-durable | Codemod |
+| --- | --- | --- |
+| `start(W, input, { id })` | `WorkflowService.start(W, input, id)` | ✅ |
+| `start(…, { transaction })` | [`DurableOutbox.start(tx, …)`](/docs/reliability/transactional-start) | TODO |
+| `result(id)` | `WorkflowService.waitForRun(id, { until: 'terminal' })`, which resolves `{ status, output, error }` | ✅ + TODO |
+| `getStatus(id)` | `RunGateway.getRunDetail(id)` (run + timeline + children) | TODO |
+| `list(filter)` | `RunGateway.listRuns(query)` | TODO |
+| `cancel(id)` / `terminate(id)` | `WorkflowEngine.cancel(id, { compensate: true })` / `cancel(id)` | TODO |
+| `retry(id)` | `RunGateway.retry(id)` / `WorkflowEngine.resume(id)` | TODO |
+| `delete(id)` / `purge({ olderThan })` | `WorkflowEngine.deleteRun(id)` / [retention](/docs/reliability/retention) | TODO |
+| `startAndWait(…)` | `start(…)` then `waitForRun(…)` | TODO |
+
+### Module, events, testing, stores
+
+| `@nestjs/workflows` | nestjs-durable |
+| --- | --- |
+| `WorkflowsModule.forRoot({ worker, retry, journal, codec })` | `DurableModule.forRoot({ store, transport, … })` ([roles](/docs/cluster/roles-and-config), [encryption](/docs/production#11-encrypting-payloads-at-rest)) |
+| `WorkflowEvents.events$`, channels `nestjs:workflows:*` | `WorkflowEngine.subscribe(event => …)`, [OpenTelemetry](/docs/observability/otel), [Telescope](/docs/observability/telescope) |
+| `ManualWorkflowClock` + `worker: false` + `drain()` | `@dudousxd/nestjs-durable-testing` (`createTestEngine`, `MutableClock`, `assertRunStatus`, …) — see [testing](/docs/testing) |
+| `PostgresWorkflowStore` / `MySqlWorkflowStore`, `nest-workflows migrate` | a durable store adapter (MikroORM, TypeORM, Prisma, Drizzle) with its own schema; see [stores](/docs/stores) |
+
+## Cutover runbook
+
+The official tables and durable's are separate, so a run never changes engines. Deploy both side by
+side, start everything new on durable, and let the official worker finish its own instances.
+
+**1. Deploy with both engines.** Keep `WorkflowsModule` (with its worker) and the official workflow
+classes, add `DurableModule` with the migrated classes, and the migration router:
+
+```ts
+import { DurableMigrationModule } from '@dudousxd/nestjs-durable/migrate-from-nestjs-workflows';
+
+@Module({
+  imports: [
+    WorkflowsModule.forRoot(),                    // the old engine: finishes what it started
+    DurableModule.forRoot({ store, transport }),  // the new one
+    DurableMigrationModule.forRoot(),             // MigrationClient
+    DurableDashboardModule.forRoot({
+      decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view')],
+      imports: [DurableMigrationModule.console()], // one console, both engines
+    }),
+  ],
+  providers: [/* official workflow classes */, /* migrated durable classes */],
+})
+export class AppModule {}
+```
+
+The subpath needs `@nestjs/workflows` and `@dudousxd/nestjs-durable-workflows-gateway` installed.
+Both are optional peers of `@dudousxd/nestjs-durable`, loaded only by this subpath.
+
+**2. Route every call through `MigrationClient`.** Replace `WorkflowClient` in your services:
+
+```ts
+constructor(private readonly workflows: MigrationClient) {}
+
+await this.workflows.start(OrderWorkflow, input, `order-${id}`);       // always durable
+await this.workflows.signal(`order-${id}`, 'approve', payload, { key: id });
+await this.workflows.cancel(`order-${id}`, { compensate: true });
+const status = await this.workflows.getStatus(`order-${id}`);         // { engine, status, output, error }
+const done = await this.workflows.result(`order-${id}`, { timeoutMs }); // never throws for a failed run
+```
+
+`signal`, `cancel`, `getStatus` and `result` look the id up in durable first, then in the official
+engine, and act where it lives. A signal goes to the engine that owns the instance, so it is never
+left buffered in the other one. On durable it uses the codemod's token convention (`<name>:<key>`);
+on the official engine it is `client.signal(name, payload, { key, id })`. The console shows both
+engines' runs in one list, and retry and cancel reach the owner.
+
+**3. Stop starting on the official engine.** Once every `client.start` goes through
+`MigrationClient`, which starts on durable only, the official engine only drains. Turn off the
+official schedules (`WorkflowSchedules.pause`) and recreate them as durable schedules.
+
+**4. Wait for the drain.**
+
+```ts
+await migrationClient.remainingOnOfficial(); // 0 when nothing is pending, running, suspended or compensating
+```
+
+That count is the same as `WorkflowClient.list({ status: ['pending', 'running', 'suspended',
+'compensating'] })`. Instances waiting on a signal or a long sleep keep it above zero until they
+finish; cancel or terminate the ones you don't want to wait for.
+
+**5. Remove `@nestjs/workflows`.** Drop `WorkflowsModule`, the official classes,
+`DurableMigrationModule` and `MigrationClient`; inject `WorkflowService` instead. Keep the official
+tables until you no longer need their history; durable never reads them.
+
+## Gaps
+
+What durable doesn't do the same way yet, and what to do instead:
+
+- **`ctx.waitForAny`**: no equivalent yet; see the table above for the usual shapes. A general race
+  needs a new primitive across the in-process context, the remote decision protocol and the Node and
+  Python worker contexts.
+- **Signal dedupe ids**: `signal(…, { id })` has no durable counterpart. Deduplicate before
+  signalling (the `@nestjs/outbox` inbox, or your message's id in your own table).
+- **`ctx.commit()`**, **`ctx.setStatus()` as a typed status column**, **workflow-level rate limits by
+  key**: see the tables above.
+- **`parentClose` default**: the official engine cancels running children when a parent ends;
+  durable leaves them running unless you pass `parentClose`.

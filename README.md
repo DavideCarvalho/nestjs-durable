@@ -130,7 +130,7 @@ multiple worker pools sharing one store/broker.
 | `@dudousxd/nestjs-durable-dashboard` | Embedded control-plane SPA (runs + timeline + retry/cancel) | ✅ |
 | `@dudousxd/nestjs-durable-otel` | OpenTelemetry — trace per run, span per step | ✅ |
 | `@dudousxd/nestjs-durable-telescope` | `@dudousxd/nestjs-telescope` watcher | ✅ |
-| `@dudousxd/nestjs-durable-cli` | `durable inspect` — runs & timelines in the terminal | ✅ |
+| `@dudousxd/nestjs-durable-cli` | `durable inspect` — runs & timelines in the terminal; `durable migrate nestjs-workflows` codemod | ✅ |
 | `@dudousxd/nestjs-durable-testing` | Test harness, crash injection, replay assertions | ✅ |
 | `durable-worker` (PyPI) | Python SDK + wire protocol — implement steps **and** author workflows | ✅ |
 | `@dudousxd/nestjs-durable-workflows-gateway` | The durable dashboard over the official `@nestjs/workflows` engine | ✅ |

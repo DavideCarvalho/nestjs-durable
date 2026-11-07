@@ -1,0 +1,72 @@
+import { Injectable, Module } from '@nestjs/common';
+import { FatalError } from '@dudousxd/nestjs-durable-core';
+import { type WorkflowCtx, DurableModule, Workflow, WorkflowService } from '@dudousxd/nestjs-durable';
+
+@Workflow({ name: 'order', version: '2' })
+@Injectable()
+export class OrderWorkflow {
+  constructor(private readonly payments: Payments) {}
+
+  async run(ctx: WorkflowCtx, input: { orderId: string; amount: number }) {
+    const startedAt = (await ctx.now());
+    const charge = await ctx.localStep('charge', async () => this.payments.charge(input.orderId, input.amount), { retries: 5, timeoutMs: 30000 });
+    if (!charge.ok) {
+      throw new FatalError('card declined');
+    }
+    await ctx.sleep('10m');
+    // TODO(durable-migrate): on timeout durable THROWS SignalTimeoutError (from @dudousxd/nestjs-durable-core) where @nestjs/workflows resolved null: wrap this in try/catch
+    const approval = await ctx.waitForSignal<{ approved: boolean }>(`approval:${input.orderId}`, { timeoutMs: 172800000 });
+    await ctx.setEvent('status', { stage: 'shipping' });
+    const label = await ctx.child(ShippingWorkflow, { orderId: input.orderId }, { childId: `ship-${input.orderId}`, parentClose: 'abandon' });
+    // TODO(durable-migrate): durable has no ctx.commit(): compensations of the steps before it still run on failure; restructure the saga (e.g. end it in a child workflow)
+    ctx.commit('shipped');
+    return { charge, approval, label, startedAt, by: ctx.runId };
+  }
+}
+
+@Workflow({ name: 'shipping' })
+@Injectable()
+export class ShippingWorkflow {
+  async run(ctx: WorkflowCtx, input: { orderId: string }) {
+    const id = (await ctx.sideEffect(() => crypto.randomUUID()));
+    // TODO(durable-migrate): durable's step function receives a StepLogger, not { idempotencyKey, attempt, signal, heartbeat }: derive an idempotency key from ctx.runId + the step name
+    await ctx.localStep('label', async ({ idempotencyKey }) => makeLabel(idempotencyKey, input.orderId));
+    return id;
+  }
+}
+
+@Injectable()
+export class OrdersController {
+  constructor(private readonly client: WorkflowService) {}
+
+  async place(orderId: string) {
+    await this.client.start(OrderWorkflow, { orderId, amount: 10 }, `order-${orderId}`);
+  }
+
+  async approve(orderId: string) {
+    await this.client.signal(`approval:${orderId}`, { approved: true });
+  }
+
+  async outcome(orderId: string) {
+    // TODO(durable-migrate): waitForRun resolves { status, output, error } (not the output), and does not throw WorkflowFailedError: check status
+    return this.client.waitForRun(`order-${orderId}`, { until: 'terminal' });
+  }
+
+  async stop(orderId: string) {
+    // TODO(durable-migrate): WorkflowClient.cancel → see the migration guide (WorkflowEngine / RunGateway: getRun, listRuns, cancel(id, { compensate }), retry, deleteRun, retention)
+    return this.client.cancel(`order-${orderId}`);
+  }
+}
+
+// TODO(durable-migrate): give DurableModule a state store and a transport (e.g. a store adapter + EventEmitterTransport); the official worker/journal/codec options have durable counterparts in the migration guide
+@Module({
+  imports: [DurableModule.forRoot({ store, transport })],
+  providers: [OrderWorkflow, ShippingWorkflow],
+})
+export class OrdersModule {}
+
+declare class Payments {
+  charge(orderId: string, amount: number): Promise<{ ok: boolean }>;
+}
+declare function makeLabel(key: string, orderId: string): Promise<string>;
+export class CardDeclined extends FatalError {}

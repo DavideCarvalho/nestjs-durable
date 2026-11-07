@@ -11,6 +11,7 @@ import type {
   WorkflowRun,
 } from './interfaces';
 import { TERMINAL_RUN_STATUSES } from './interfaces';
+import { nextRRuleFireMs, parseRRule, prevRRuleFireMs } from './rrule';
 import { nextCronFireMs, prevCronFireMs } from './scheduler';
 import { type WorkflowRef, workflowName } from './workflow-ref';
 
@@ -31,7 +32,13 @@ export interface ScheduleOptions {
   cron?: string | undefined;
   /** Fixed interval (`'15m'`, or ms), windows aligned to the epoch. Exclusive with `cron`. */
   every?: string | number | undefined;
-  /** IANA timezone the cron is evaluated in (e.g. `America/Sao_Paulo`). Default UTC. */
+  /**
+   * An RFC 5545 recurrence rule (`'FREQ=WEEKLY;BYDAY=MO;BYHOUR=8'`, optionally with a
+   * `DTSTART:…` line), evaluated in `timezone`. Exactly one of `cron`, `every` and `rrule`. See
+   * {@link parseRRule} for the supported parts. No peer needed.
+   */
+  rrule?: string | undefined;
+  /** IANA timezone the cron / rrule is evaluated in (e.g. `America/Sao_Paulo`). Default UTC. */
   timezone?: string | undefined;
   /**
    * Delay each fire by up to this much (`'30s'` or ms) — a stable per-(schedule, window) offset, so
@@ -77,6 +84,7 @@ export interface ScheduleDescription {
   namespace: string;
   cron?: string | undefined;
   everyMs?: number | undefined;
+  rrule?: string | undefined;
   timezone?: string | undefined;
   jitterMs?: number | undefined;
   overlap: 'allow' | 'skip';
@@ -125,6 +133,7 @@ interface SpecDoc {
   input?: unknown;
   cron?: string;
   everyMs?: number;
+  rrule?: string;
   timezone?: string;
   jitterMs?: number;
   overlap: 'allow' | 'skip';
@@ -435,9 +444,11 @@ export class ScheduleClient {
 }
 
 function toSpec(opts: ScheduleOptions): SpecDoc {
-  if ((opts.cron == null) === (opts.every == null)) {
-    throw new Error(`schedule "${opts.id}" needs exactly one of "cron" or "every"`);
+  const kinds = [opts.cron, opts.every, opts.rrule].filter((k) => k != null).length;
+  if (kinds !== 1) {
+    throw new Error(`schedule "${opts.id}" needs exactly one of "cron", "every" or "rrule"`);
   }
+  if (opts.rrule != null) parseRRule(opts.rrule, opts.timezone); // refuse a bad rule at create
   const everyMs = opts.every != null ? parseDuration(opts.every) : undefined;
   if (everyMs !== undefined && !(everyMs > 0)) {
     throw new Error(`schedule "${opts.id}": "every" must be a positive duration`);
@@ -448,6 +459,7 @@ function toSpec(opts: ScheduleOptions): SpecDoc {
     input: opts.input,
     cron: opts.cron,
     everyMs,
+    rrule: opts.rrule,
     timezone: opts.timezone,
     jitterMs: jitterMs && jitterMs > 0 ? jitterMs : undefined,
     overlap: opts.overlap ?? 'allow',
@@ -466,6 +478,14 @@ function specOf(record: ScheduleRecord): SpecDoc {
 /** The latest window at or before `atMs`. */
 function latestWindowAtOrBefore(spec: SpecDoc, atMs: number): number {
   if (spec.cron != null) return prevCronFireMs(spec.cron, atMs, spec.timezone);
+  if (spec.rrule != null) {
+    const prev = prevRRuleFireMs(parseRRule(spec.rrule, spec.timezone), atMs);
+    if (prev === null)
+      throw new Error(
+        `rrule "${spec.rrule}" has no occurrence at or before ${new Date(atMs).toISOString()}`,
+      );
+    return prev;
+  }
   const every = spec.everyMs as number;
   return Math.floor(atMs / every) * every;
 }
@@ -473,6 +493,7 @@ function latestWindowAtOrBefore(spec: SpecDoc, atMs: number): number {
 /** The first window strictly after `afterMs`. */
 function nextWindowAfter(spec: SpecDoc, afterMs: number): number | null {
   if (spec.cron != null) return nextCronFireMs(spec.cron, afterMs, spec.timezone);
+  if (spec.rrule != null) return nextRRuleFireMs(parseRRule(spec.rrule, spec.timezone), afterMs);
   const every = spec.everyMs as number;
   return (Math.floor(afterMs / every) + 1) * every;
 }
@@ -510,6 +531,7 @@ function describe(record: ScheduleRecord): ScheduleDescription {
     namespace: record.namespace,
     cron: spec.cron,
     everyMs: spec.everyMs,
+    rrule: spec.rrule,
     timezone: spec.timezone,
     jitterMs: spec.jitterMs,
     overlap: spec.overlap ?? 'allow',

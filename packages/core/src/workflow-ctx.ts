@@ -34,6 +34,7 @@ import type {
   ChildCallOptions,
   ChildWait,
   DurableWebhook,
+  ParentClosePolicy,
   SearchAttributes,
   SearchAttributesSchema,
   Settled,
@@ -186,7 +187,14 @@ export interface CtxHost {
     id: string,
     priority?: number,
     version?: string,
+    parentClose?: ParentClosePolicy,
   ): void;
+  /**
+   * Record that `childId` of `parentRunId` carries a {@link ChildCallOptions.parentClose} policy, so
+   * the host applies it when the parent completes or fails. Called on EVERY turn (replays included):
+   * the turn that ends the parent is the one that needs it. Optional: a host without it ignores it.
+   */
+  noteParentClose?(parentRunId: string, childId: string, policy: ParentClosePolicy): void;
   /**
    * Best-effort cancel of a child run — deferred for the SAME reason as `startChild` (so ctx code
    * can't reentrantly mutate engine state while the parent's own step is still executing
@@ -699,9 +707,10 @@ export function createWorkflowCtx(
     input: unknown,
     options?: string | ChildCallOptions,
   ): Promise<T> => {
-    const { childId, priority, version } = normalizeChildOptions(options);
+    const { childId, priority, version, parentClose } = normalizeChildOptions(options);
     const current = pos.next();
     const id = childId ?? `${runId}.child.${current}`;
+    if (parentClose) host.noteParentClose?.(runId, id, parentClose);
     const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') {
       return unwrapCompletion<T>(existing.output, `child "${id}"`);
@@ -748,7 +757,7 @@ export function createWorkflowCtx(
     }
     const childRun = await store.getRun(id);
     if (!childRun) {
-      host.startChild(workflowName(workflow), input, id, priority, version);
+      host.startChild(workflowName(workflow), input, id, priority, version, parentClose);
     } else {
       // Joining a child that already finished: settle it now from its row.
       const done = (
@@ -1150,13 +1159,14 @@ export function createWorkflowCtx(
     input: unknown,
     options?: string | ChildCallOptions,
   ): Promise<string> => {
-    const { childId, priority, version } = normalizeChildOptions(options);
+    const { childId, priority, version, parentClose } = normalizeChildOptions(options);
     const current = pos.next();
     const id = childId ?? `${runId}.child.${current}`;
+    if (parentClose) host.noteParentClose?.(runId, id, parentClose);
     const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') return existing.output as string;
     if (!(await store.getRun(id)))
-      host.startChild(workflowName(workflow), input, id, priority, version);
+      host.startChild(workflowName(workflow), input, id, priority, version, parentClose);
     await writeCheckpoint(
       instantCheckpoint({ runId, seq: current, name: `spawn:${id}`, kind: 'local', output: id }),
     );

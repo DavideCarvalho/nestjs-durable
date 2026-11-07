@@ -1,0 +1,81 @@
+import { Injectable, Module } from '@nestjs/common';
+import {
+  NonRetryableStepError,
+  Workflow,
+  WorkflowClient,
+  type WorkflowContext,
+  WorkflowsModule,
+} from '@nestjs/workflows';
+
+@Workflow('order', { version: 2 })
+@Injectable()
+export class OrderWorkflow {
+  constructor(private readonly payments: Payments) {}
+
+  async run(ctx: WorkflowContext, input: { orderId: string; amount: number }) {
+    const startedAt = ctx.now();
+    const charge = await ctx.step(
+      'charge',
+      () => this.payments.charge(input.orderId, input.amount),
+      { retry: 5, timeout: '30s' },
+    );
+    if (!charge.ok) {
+      ctx.fail('card declined');
+    }
+    await ctx.sleep('cool-off', '10m');
+    const approval = await ctx.waitForSignal<{ approved: boolean }>('approve', 'approval', {
+      key: input.orderId,
+      timeout: '2d',
+    });
+    ctx.setStatus({ stage: 'shipping' });
+    const label = await ctx.executeChild(ShippingWorkflow, { orderId: input.orderId }, {
+      id: `ship-${input.orderId}`,
+      parentClose: 'abandon',
+    });
+    ctx.commit('shipped');
+    return { charge, approval, label, startedAt, by: ctx.workflowId };
+  }
+}
+
+@Workflow('shipping')
+@Injectable()
+export class ShippingWorkflow {
+  async run(ctx: WorkflowContext, input: { orderId: string }) {
+    const id = ctx.uuid();
+    await ctx.step('label', async ({ idempotencyKey }) => makeLabel(idempotencyKey, input.orderId));
+    return id;
+  }
+}
+
+@Injectable()
+export class OrdersController {
+  constructor(private readonly client: WorkflowClient) {}
+
+  async place(orderId: string) {
+    await this.client.start(OrderWorkflow, { orderId, amount: 10 }, { id: `order-${orderId}` });
+  }
+
+  async approve(orderId: string) {
+    await this.client.signal('approval', { approved: true }, { key: orderId });
+  }
+
+  async outcome(orderId: string) {
+    return this.client.result(`order-${orderId}`);
+  }
+
+  async stop(orderId: string) {
+    return this.client.cancel(`order-${orderId}`);
+  }
+}
+
+@Module({
+  imports: [WorkflowsModule.forRoot()],
+  providers: [OrderWorkflow, ShippingWorkflow],
+})
+export class OrdersModule {}
+
+declare class Payments {
+  charge(orderId: string, amount: number): Promise<{ ok: boolean }>;
+}
+declare function makeLabel(key: string, orderId: string): Promise<string>;
+export class CardDeclined extends NonRetryableStepError {}

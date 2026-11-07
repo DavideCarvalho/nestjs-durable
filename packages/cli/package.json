@@ -37,5 +37,8 @@
   "devDependencies": {
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "ts-morph": "28.0.0"
   }
 }

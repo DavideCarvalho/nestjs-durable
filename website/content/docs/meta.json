@@ -18,6 +18,7 @@
     "troubleshooting",
     "---@nestjs/workflows---",
     "nestjs-workflows",
+    "migrate-from-nestjs-workflows",
     "---Cross-language---",
     "python",
     "---Tooling---",

@@ -4,16 +4,28 @@
 // ESM+CJS emit. See scripts/tsup-decorator.mjs.
 import { decoratorDualConfig } from '../../scripts/tsup-decorator.mjs';
 
-export default decoratorDualConfig([
-  '@dudousxd/durable-worker',
-  '@dudousxd/nestjs-durable-core',
-  '@dudousxd/nestjs-context',
-  '@nestjs/common',
-  '@nestjs/core',
-  '@nestjs/event-emitter',
-  'class-transformer',
-  'class-validator',
-  'reflect-metadata',
-  'rxjs',
-  'zod',
-]);
+export default decoratorDualConfig(
+  [
+    '@dudousxd/durable-worker',
+    '@dudousxd/nestjs-durable-core',
+    '@dudousxd/nestjs-context',
+    '@nestjs/common',
+    '@nestjs/core',
+    '@nestjs/event-emitter',
+    'class-transformer',
+    'class-validator',
+    'reflect-metadata',
+    'rxjs',
+    'zod',
+    '@nestjs/workflows',
+    '@dudousxd/nestjs-durable-workflows-gateway',
+  ],
+  // `./migrate-from-nestjs-workflows` is its own entry, so `@nestjs/workflows` and the workflows
+  // gateway (optional peers) load only for importers of that subpath.
+  {
+    entry: {
+      index: 'src/index.ts',
+      'migrate-from-nestjs-workflows': 'src/migrate-from-nestjs-workflows/index.ts',
+    },
+  },
+);

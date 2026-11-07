@@ -1975,7 +1975,26 @@ export interface ChildCallOptions {
    * (TS class) child, which runs in the engine and never hits a broker queue.
    */
   priority?: number | undefined;
+  /**
+   * What happens to this child if it is still running when its parent ends:
+   *
+   * - `'cancel'`: cancelled with its saga undo (`cancel(child, { compensate: true })`);
+   * - `'terminate'`: cancelled without compensating (`cancel(child)`);
+   * - `'abandon'`: left running, also when the parent is CANCELLED (the cancel cascade skips it).
+   *
+   * Applied when the parent completes or fails in a workflow turn. A cancelled or timed-out parent
+   * keeps cascading its cancel to its children as before, except `'abandon'` ones. Omitted: today's
+   * behaviour (a finished parent leaves its children alone; a cancelled one cascades). In-process
+   * (TS class) parents only: a workflow replayed by a remote worker ignores it.
+   */
+  parentClose?: ParentClosePolicy | undefined;
 }
+
+/** See {@link ChildCallOptions.parentClose}. */
+export type ParentClosePolicy = 'cancel' | 'terminate' | 'abandon';
+
+/** The tag a child started with a `parentClose` policy carries: `parent-close:<policy>`. */
+export const PARENT_CLOSE_TAG_PREFIX = 'parent-close:';
 
 export interface StepOptions {
   /** Max attempts before the step (and run) fails. */

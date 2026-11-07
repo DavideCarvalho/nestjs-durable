@@ -80,6 +80,7 @@ import type {
   EngineListener,
   GroupHealth,
   NamedTransport,
+  ParentClosePolicy,
   RemoteTask,
   RunDispatch,
   RunDispatcher,
@@ -112,7 +113,12 @@ import type {
   WorkflowStepEvent,
 } from './interfaces';
 import type { BufferedSignalRow, HistoryEvent, RunScope } from './interfaces';
-import { TERMINAL_RUN_STATUSES, isNonEmptyRunScope, poolNamespace } from './interfaces';
+import {
+  PARENT_CLOSE_TAG_PREFIX,
+  TERMINAL_RUN_STATUSES,
+  isNonEmptyRunScope,
+  poolNamespace,
+} from './interfaces';
 import {
   LIFECYCLE_COALESCED_TAG_PREFIX,
   LIFECYCLE_HEAL_WINDOW_MS,
@@ -1218,6 +1224,8 @@ export class WorkflowEngine {
   private readonly claimsMade = new Map<string, number>();
   /** Pager hooks for stranded runs (see {@link onStalled}). */
   private readonly stalledListeners = new Set<(info: StalledRunInfo) => void>();
+  /** `parentClose` policies recorded by the turn in flight, per parent run (see {@link settleParentClose}). */
+  private readonly parentCloseIntents = new Map<string, Map<string, ParentClosePolicy>>();
   /** Runs already paged about, by id → the `updatedAt` of the paged episode (see {@link sweepStalled}). */
   private readonly notifiedStalled = new Map<string, number>();
   private lastStalledSweepAt = Number.NEGATIVE_INFINITY;
@@ -2183,6 +2191,7 @@ export class WorkflowEngine {
    */
   private emit(event: Omit<EngineEvent, 'at'>, opts?: { lifecycle?: boolean }): void {
     const full: EngineEvent = { ...event, at: new Date() };
+    this.settleParentClose(full);
     this.deliver(full);
     if (opts?.lifecycle !== false) {
       this.publishLifecycle(full);
@@ -5897,7 +5906,36 @@ export class WorkflowEngine {
     opts?: { compensate?: boolean },
   ): Promise<void> {
     for (const id of await this.getRunChildren(parentRunId)) {
+      // A child started with `parentClose: 'abandon'` outlives its parent, a cancelled one included.
+      const child = await this.store.getRun(id).catch(() => null);
+      if (child?.tags?.includes(`${PARENT_CLOSE_TAG_PREFIX}abandon`)) continue;
       await this.cancel(id, opts).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Apply the `parentClose` policies a parent's turn recorded (see {@link ChildCallOptions.parentClose})
+   * when that parent completes or fails; forget them when it suspends (its next turn, here or on
+   * another instance, records them again). Local events only: this is the instance that ran the turn.
+   */
+  private settleParentClose(event: EngineEvent): void {
+    if (
+      event.type !== 'run.completed' &&
+      event.type !== 'run.failed' &&
+      event.type !== 'run.suspended'
+    ) {
+      return;
+    }
+    const intents = this.parentCloseIntents.get(event.runId);
+    if (!intents) return;
+    this.parentCloseIntents.delete(event.runId);
+    if (event.type === 'run.suspended') return;
+    for (const [childId, policy] of intents) {
+      if (policy === 'abandon') continue;
+      // Deferred like every child mutation from a turn; `cancel` is a no-op on a finished child.
+      queueMicrotask(
+        () => void this.cancel(childId, { compensate: policy === 'cancel' }).catch(() => undefined),
+      );
     }
   }
 
@@ -8182,14 +8220,24 @@ export class WorkflowEngine {
       // namespace) is the one executing the parent. Otherwise an operator recovery-resuming a
       // `davi-local` pipeline would stamp its `processing` child `default` and it would leak off the
       // tenant's worker pool onto the shared/dev workers.
-      startChild: (workflow, input, id, priority, version) => {
+      startChild: (workflow, input, id, priority, version, parentClose) => {
         this.startChildDeferred(workflow, input, id, {
           priority,
           namespace: parentNamespace,
           // Absent unless the body pinned one (`ctx.child(ref, input, { version })`) — an omitted
           // pin must stay omitted, so the child keeps resolving `latest` exactly as before.
           version,
+          // The policy travels with the child, so a cancel cascade run by ANY instance can read it.
+          ...(parentClose ? { tags: [`${PARENT_CLOSE_TAG_PREFIX}${parentClose}`] } : {}),
         });
+      },
+      noteParentClose: (parentRunId, childId, policy) => {
+        let intents = this.parentCloseIntents.get(parentRunId);
+        if (!intents) {
+          intents = new Map();
+          this.parentCloseIntents.set(parentRunId, intents);
+        }
+        intents.set(childId, policy);
       },
       // Deferred for the same reentrancy reason as `startChild` above. `cancel()` is already
       // idempotent on a terminal/cancelled run (returns its existing status without side effects), so

@@ -31,8 +31,10 @@
     "@dudousxd/durable-worker": ">=0.1.0 <1.0.0",
     "@dudousxd/nestjs-context": ">=0.1.0 <1.0.0",
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "@dudousxd/nestjs-durable-workflows-gateway": ">=0.1.0 <1.0.0",
     "@nestjs/common": "^10.0.0 || ^11.0.0 || ^12.0.0",
     "@nestjs/core": "^10.0.0 || ^11.0.0 || ^12.0.0",
+    "@nestjs/workflows": ">=0.0.5 <0.1.0",
     "class-transformer": "^0.5.0",
     "class-validator": "^0.14.0",
     "reflect-metadata": "^0.2.0",
@@ -43,6 +45,12 @@
       "optional": true
     },
     "@dudousxd/nestjs-context": {
+      "optional": true
+    },
+    "@dudousxd/nestjs-durable-workflows-gateway": {
+      "optional": true
+    },
+    "@nestjs/workflows": {
       "optional": true
     },
     "class-transformer": {
@@ -57,27 +65,31 @@
   },
   "devDependencies": {
     "@dudousxd/durable-worker": "workspace:*",
+    "@dudousxd/nestjs-diagnostics": "0.5.0",
     "@dudousxd/nestjs-durable-core": "workspace:^",
     "@dudousxd/nestjs-durable-dashboard": "workspace:*",
     "@dudousxd/nestjs-durable-testing": "workspace:^",
     "@dudousxd/nestjs-durable-transport-bullmq": "workspace:*",
     "@dudousxd/nestjs-durable-transport-event-emitter": "workspace:^",
-    "@testcontainers/redis": "10.18.0",
+    "@dudousxd/nestjs-durable-workflows-gateway": "workspace:*",
     "@nestjs/common": "12.0.1",
     "@nestjs/core": "12.0.1",
     "@nestjs/event-emitter": "12.0.0",
     "@nestjs/platform-express": "12.0.1",
     "@nestjs/testing": "12.0.1",
+    "@nestjs/workflows": "0.0.5",
+    "@tanstack/intent": "0.4.0",
+    "@testcontainers/redis": "10.18.0",
+    "@types/supertest": "6.0.3",
     "class-transformer": "0.5.1",
     "class-validator": "0.14.2",
     "eventemitter2": "6.4.9",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",
-    "typescript": "5.9.3",
-    "zod": "3.25.76",
+    "supertest": "7.2.2",
     "tsup": "8.3.5",
-    "@dudousxd/nestjs-diagnostics": "0.5.0",
-    "@tanstack/intent": "0.4.0"
+    "typescript": "5.9.3",
+    "zod": "3.25.76"
   },
   "module": "./dist/index.js",
   "exports": {
@@ -89,6 +101,16 @@
       "require": {
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
+      }
+    },
+    "./migrate-from-nestjs-workflows": {
+      "import": {
+        "types": "./dist/migrate-from-nestjs-workflows.d.ts",
+        "default": "./dist/migrate-from-nestjs-workflows.js"
+      },
+      "require": {
+        "types": "./dist/migrate-from-nestjs-workflows.d.cts",
+        "default": "./dist/migrate-from-nestjs-workflows.cjs"
       }
     }
   }

@@ -19,6 +19,7 @@ export default defineConfig({
       '@dudousxd/nestjs-durable': pkg('nestjs'),
       '@dudousxd/nestjs-durable-telescope': pkg('telescope'),
       '@dudousxd/durable-worker': pkg('worker'),
+      '@dudousxd/nestjs-durable-workflows-gateway': pkg('workflows-gateway'),
     },
   },
   plugins: [

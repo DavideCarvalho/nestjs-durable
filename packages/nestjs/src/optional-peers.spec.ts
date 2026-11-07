@@ -220,6 +220,8 @@ describe('optional peers are absent-safe in the built package', () => {
     expect(optionalPeers).toEqual([
       '@dudousxd/durable-worker',
       '@dudousxd/nestjs-context',
+      '@dudousxd/nestjs-durable-workflows-gateway',
+      '@nestjs/workflows',
       'class-transformer',
       'class-validator',
       'zod',
@@ -269,5 +271,25 @@ describe('lazily loaded optional peers work when they are installed', () => {
     expect(runWithout(['class-validator'], validateInputWithoutPeer, 'mjs')).toContain(
       'rejected: workflow "order" input uses a class-validator DTO, which needs the optional peers',
     );
+  });
+});
+
+describe('the ./migrate-from-nestjs-workflows subpath', () => {
+  it('loads from ESM and CJS when @nestjs/workflows and the workflows gateway are installed', () => {
+    const name = `${pkg.name}/migrate-from-nestjs-workflows`;
+    expect(
+      runWithout(
+        [],
+        `const m = await import('${name}');\nconsole.log(typeof m.MigrationClient);`,
+        'mjs',
+      ),
+    ).toContain('function');
+    expect(
+      runWithout(
+        [],
+        `const m = require('${name}');\nconsole.log(typeof m.MigrationClient);`,
+        'cjs',
+      ),
+    ).toContain('function');
   });
 });
