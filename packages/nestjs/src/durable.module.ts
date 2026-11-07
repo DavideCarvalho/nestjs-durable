@@ -336,6 +336,15 @@ export interface DurableModuleOptions {
    */
   trackStepStart?: boolean;
   /**
+   * How many workflow bodies parked on dispatched `ctx.step` calls this instance keeps in memory
+   * between turns, so a step's result continues the body instead of replaying it over the run's
+   * whole history. Default 1000 (~26 KB of heap each); `0` turns it off. See `WorkflowEngineDeps.stickyRuns` and the
+   * "Performance" section of the production guide. Operator only.
+   */
+  stickyRuns?: number;
+  /** How long a parked body may stay idle in that cache. Default 5 min. Operator only. */
+  stickyIdleMs?: number;
+  /**
    * The **default** workflow to route dead-lettered runs to, for workflows that don't declare their
    * own. When a run is moved to `dead` (exceeded `maxRecoveryAttempts`), the started handler gets a
    * `DeadLetter` payload `{ deadRunId, workflow, input, error }` (idempotent by a `dlq:<runId>` id) —
@@ -909,6 +918,8 @@ export class DurableModule {
               signalIdTtl: options.signalIdTtl,
               blockedPollMs: options.blockedPollMs,
               trackStepStart: options.trackStepStart,
+              stickyRuns: options.stickyRuns,
+              stickyIdleMs: options.stickyIdleMs,
               instanceId: options.instanceId,
               namespace: options.namespace,
               webhookUrl: options.webhookUrl,

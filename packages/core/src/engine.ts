@@ -325,7 +325,7 @@ const BREAKPOINT = 'breakpoint';
 /** Pending runs one {@link WorkflowEngine.runPending} poll takes at most. */
 const PENDING_POLL_BATCH = 100;
 /** Default size of the sticky continuation cache (see {@link WorkflowEngineDeps.stickyRuns}). */
-const DEFAULT_STICKY_RUNS = 2000;
+const DEFAULT_STICKY_RUNS = 1000;
 /** Default idle limit of a parked body in the sticky cache. */
 const DEFAULT_STICKY_IDLE_MS = 300_000;
 const isBreakpoint = (cp: { status: string; name: string }): boolean =>
@@ -1023,7 +1023,8 @@ export interface WorkflowEngineDeps {
    * continuation cache, see `sticky-continuation.ts`). A run whose body parked here on dispatched
    * `ctx.step` calls continues from where it stopped when its next turn runs on this instance,
    * instead of replaying from the top over its whole history: the turn re-reads only the steps it
-   * parked on. Least recently used out first; an evicted run just replays. Default 2000. `0` turns
+   * parked on. Least recently used out first; an evicted run just replays. Default 1000 (about 26 KB
+   * of heap per parked body, measured with a small body: ~26 MB at most). `0` turns
    * the cache off (every turn replays).
    */
   stickyRuns?: number | undefined;
