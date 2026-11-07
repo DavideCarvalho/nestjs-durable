@@ -24,6 +24,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepResultSettlement,
   type StepSettlement,
   type StoreTransaction,
   TERMINAL_RUN_STATUSES,
@@ -269,6 +270,15 @@ export class DrizzlePgStateStore implements StateStore {
     const row = toRunPatch(patch);
     const reindex = 'searchAttributes' in patch;
     const matches = and(eq(workflowRuns.id, runId), inArray(workflowRuns.status, expectedStatuses));
+    // A patch that leaves the attributes alone is one conditional UPDATE: no transaction needed.
+    if (!reindex && Object.keys(row).length) {
+      const applied = await this.db
+        .update(workflowRuns)
+        .set(row)
+        .where(matches)
+        .returning({ id: workflowRuns.id });
+      return applied.length === 1;
+    }
     return this.db.transaction(async (tx) => {
       // One conditional UPDATE: a writer racing another blocks on the row lock, then re-evaluates
       // the status predicate against the committed row. With no mapped column to write, the compare
@@ -453,7 +463,9 @@ export class DrizzlePgStateStore implements StateStore {
   async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
     const wrote = checkpoints.map(() => false);
     if (checkpoints.length === 0) return wrote;
-    await this.db.transaction(async (tx) => {
+    // One statement is atomic on its own; several (repeated rows, or more than a chunk) share a
+    // transaction so a rejection writes nothing.
+    await this.inTransactionIf(oneStatement(checkpoints), async (tx) => {
       // One statement can only update a row once, so a repeated row goes in a later round, which
       // then compares against the earlier entry's write.
       for (const round of distinctRounds(checkpoints)) {
@@ -479,7 +491,7 @@ export class DrizzlePgStateStore implements StateStore {
     const wrote = settlements.map(() => false);
     if (settlements.length === 0) return wrote;
     // As saveCheckpointsIfPending, with a statement that writes only what a result changes.
-    await this.db.transaction(async (tx) => {
+    await this.inTransactionIf(oneStatement(settlements), async (tx) => {
       for (const round of distinctRounds(settlements)) {
         for (let at = 0; at < round.length; at += CHECKPOINT_BATCH_ROWS) {
           const chunk = round.slice(at, at + CHECKPOINT_BATCH_ROWS);
@@ -497,6 +509,74 @@ export class DrizzlePgStateStore implements StateStore {
       }
     });
     return wrote;
+  }
+
+  async settleResultsIfPending(
+    results: StepResultSettlement[],
+  ): Promise<(StepCheckpoint | null)[]> {
+    const out: (StepCheckpoint | null)[] = results.map(() => null);
+    // A later entry for a row an earlier one settles loses: only the first of each row is sent.
+    const seen = new Set<string>();
+    const sent = results.flatMap((r, i) => {
+      const key = rowKey(r);
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [i];
+    });
+    if (sent.length === 0) return out;
+    await this.inTransactionIf(sent.length <= CHECKPOINT_BATCH_ROWS, async (tx) => {
+      for (let at = 0; at < sent.length; at += CHECKPOINT_BATCH_ROWS) {
+        const chunk = sent.slice(at, at + CHECKPOINT_BATCH_ROWS);
+        const rows = rowsOf<Record<string, unknown>>(
+          await tx.execute(settleResultsFrom(chunk.map((i) => results[i] as StepResultSettlement))),
+        );
+        const byKey = new Map(chunk.map((i) => [rowKey(results[i] as StepResultSettlement), i]));
+        for (const raw of rows) {
+          const cp = fromCheckpointRow(settledRowFromDriver(raw));
+          const i = byKey.get(rowKey(cp));
+          if (i !== undefined) out[i] = cp;
+        }
+      }
+    });
+    return out;
+  }
+
+  async insertCheckpointIfAbsent(checkpoint: StepCheckpoint): Promise<boolean> {
+    const rows = await this.db
+      .insert(stepCheckpoints)
+      .values(toCheckpointRow(checkpoint))
+      .onConflictDoNothing({ target: [stepCheckpoints.runId, stepCheckpoints.seq] })
+      .returning({ seq: stepCheckpoints.seq });
+    return rows.length === 1;
+  }
+
+  async tryLockRunAndGet(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null> {
+    // tryLockRun's conditional UPDATE, returning the row it locked.
+    const rows = await this.db
+      .update(workflowRuns)
+      .set({ lockedBy: owner, lockedUntil: new Date(leaseUntilMs) })
+      .where(
+        and(
+          eq(workflowRuns.id, runId),
+          or(isNull(workflowRuns.lockedUntil), lte(workflowRuns.lockedUntil, new Date(nowMs))),
+          this.scope(),
+        ),
+      )
+      .returning();
+    return rows[0] ? fromRunRow(rows[0]) : null;
+  }
+
+  /** Run `work` on the db as is when it is one statement (atomic by itself), else in a transaction. */
+  private inTransactionIf<T>(
+    single: boolean,
+    work: (tx: DrizzlePgDatabase) => Promise<T>,
+  ): Promise<T> {
+    return single ? work(this.db) : this.db.transaction((tx) => work(tx));
   }
 
   async transaction<T>(work: (tx: StoreTransaction) => Promise<T>): Promise<T> {
@@ -1341,6 +1421,65 @@ function settleIfPendingFrom(settlements: StepSettlement[]): SQL {
     started_at, finished_at)
   WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'
   RETURNING c.run_id, c.seq`;
+}
+
+/** Whether a batch of distinct-or-not rows goes out as a single statement (one round, one chunk). */
+function oneStatement(rows: { runId: string; seq: number }[]): boolean {
+  if (rows.length > CHECKPOINT_BATCH_ROWS) return false;
+  const keys = new Set(rows.map(rowKey));
+  return keys.size === rows.length;
+}
+
+/** The checkpoint columns a settle reads back: every one but `input`. */
+const SETTLED_COLUMNS = (() => {
+  const { input: _input, ...columns } = getTableColumns(stepCheckpoints);
+  return columns;
+})();
+
+/**
+ * A row a raw statement returned (column names as stored, values as the driver decoded them) as
+ * drizzle would map it, through each column's own decoder, so json and timestamps come back the
+ * same on every driver.
+ */
+function settledRowFromDriver(raw: Record<string, unknown>): CheckpointRow {
+  const row: Record<string, unknown> = { input: null };
+  for (const [key, column] of Object.entries(SETTLED_COLUMNS)) {
+    const value = raw[column.name];
+    row[key] = value == null ? null : column.mapFromDriverValue(value);
+  }
+  return row as CheckpointRow;
+}
+
+/**
+ * `settleResultsIfPending` for distinct rows in one statement: each result settles its row only
+ * while it is `pending` and its run is not finished, keeping what the result does not carry (a failed result's output, absent
+ * events or start time), and `RETURNING` reads back every settled row but its input.
+ */
+function settleResultsFrom(results: StepResultSettlement[]): SQL {
+  const json = (v: unknown) => (v == null ? null : JSON.stringify(v));
+  const values = results.map(
+    (r) =>
+      sql`(${r.runId}::text, ${r.seq}::integer, ${r.status}::text, ${json(r.status === 'completed' ? r.output : null)}::jsonb, ${json(r.error)}::jsonb, ${json(r.events)}::jsonb, ${r.startedAt ? r.startedAt.toISOString() : null}::timestamptz, ${r.finishedAt.toISOString()}::timestamptz)`,
+  );
+  const returning = sql.join(
+    Object.values(SETTLED_COLUMNS).map((column) => sql`c.${sql.identifier(column.name)}`),
+    sql`, `,
+  );
+  return sql`UPDATE ${stepCheckpoints} AS c SET
+    status = v.status,
+    output = CASE WHEN v.status = 'completed' THEN v.output ELSE c.output END,
+    error = v.error,
+    events = COALESCE(v.events, c.events),
+    started_at = COALESCE(v.started_at, c.started_at),
+    finished_at = v.finished_at
+  FROM (VALUES ${sql.join(values, sql`, `)}) AS v(run_id, seq, status, output, error, events,
+    started_at, finished_at)
+  WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'
+    AND NOT EXISTS (
+      SELECT 1 FROM ${workflowRuns} AS r
+      WHERE r.id = c.run_id AND r.status IN ('cancelled', 'completed')
+    )
+  RETURNING ${returning}`;
 }
 
 async function upsertCheckpoint(db: DrizzlePgDatabase, cp: StepCheckpoint): Promise<void> {

@@ -51,7 +51,7 @@ import {
   isEventToken,
   toEventSubscription,
 } from './events';
-import { runDurableExecution } from './execution-hooks';
+import { hasDurableExecutionWrappers, runDurableExecution } from './execution-hooks';
 import {
   FOLDED_PREFIX,
   fanOfWaiter,
@@ -101,6 +101,7 @@ import type {
   StepInvocation,
   StepKind,
   StepResult,
+  StepResultSettlement,
   StepSettlement,
   StepUndo,
   Transport,
@@ -192,6 +193,7 @@ import {
 } from './singleton-admission';
 import { SingletonGate } from './singleton-gate';
 import { DEFAULT_STALLED_AFTER_MS, type StalledRunInfo, findStalledRuns } from './stalled-runs';
+import { StickyCache, StickyContinuation } from './sticky-continuation';
 import { type TenantVerifier, resolveWireTenant } from './tenant-auth';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
@@ -320,6 +322,10 @@ function mergeTags(staticTags?: string[], runTags?: string[]): string[] | undefi
 /** A breakpoint checkpoint's `name` is `breakpoint` (or `breakpoint:<label>`). This name — not the
  *  reused `signal` kind — is the explicit marker the dashboard and `continue()` detect it by. */
 const BREAKPOINT = 'breakpoint';
+/** Default size of the sticky continuation cache (see {@link WorkflowEngineDeps.stickyRuns}). */
+const DEFAULT_STICKY_RUNS = 2000;
+/** Default idle limit of a parked body in the sticky cache. */
+const DEFAULT_STICKY_IDLE_MS = 300_000;
 const isBreakpoint = (cp: { status: string; name: string }): boolean =>
   cp.status === 'pending' && cp.name.startsWith(BREAKPOINT);
 
@@ -1010,6 +1016,17 @@ export interface WorkflowEngineDeps {
    * run `runPending` on a worker pod to pick those up; or a broker-backed one for a worker pool.
    */
   runDispatcher?: RunDispatcher | undefined;
+  /**
+   * How many parked workflow bodies this instance keeps in memory between turns (the sticky
+   * continuation cache, see `sticky-continuation.ts`). A run whose body parked here on dispatched
+   * `ctx.step` calls continues from where it stopped when its next turn runs on this instance,
+   * instead of replaying from the top over its whole history: the turn re-reads only the steps it
+   * parked on. Least recently used out first; an evicted run just replays. Default 2000. `0` turns
+   * the cache off (every turn replays).
+   */
+  stickyRuns?: number | undefined;
+  /** How long a parked body may sit idle in the sticky cache before it is dropped. Default 5 min. */
+  stickyIdleMs?: number | undefined;
 }
 
 /** Options for {@link WorkflowEngine.listStalledRuns}. */
@@ -1089,6 +1106,12 @@ export class WorkflowEngine {
   private readonly unregisteredWorkflowGraceMs: number;
   private readonly remoteAdvanceSilenceMs?: number | undefined;
   private readonly reconcileMs: number | undefined;
+  /** Parked workflow bodies kept between turns (see {@link WorkflowEngineDeps.stickyRuns}). */
+  private readonly sticky: StickyCache;
+  /** The continuation each turn executing here runs in, by run id, while the turn runs. */
+  private readonly turnContinuations = new Map<string, StickyContinuation>();
+  /** The run row stamp (`updatedAt`, epoch ms) a turn here wrote when it settled `suspended`. */
+  private readonly suspendStamps = new Map<string, number>();
   private readonly timerBatchSize: number;
   private readonly eventBufferTtlMs: number | undefined;
   private readonly signalIdTtlMs: number;
@@ -1301,6 +1324,10 @@ export class WorkflowEngine {
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
     this.reconcileMs = deps.reconcileMs === undefined ? 300_000 : deps.reconcileMs || undefined;
+    this.sticky = new StickyCache(
+      Math.max(0, deps.stickyRuns ?? DEFAULT_STICKY_RUNS),
+      deps.stickyIdleMs ?? DEFAULT_STICKY_IDLE_MS,
+    );
     const stalledAfter = deps.stalledAfterMs;
     this.stalledAfterMs =
       stalledAfter !== undefined && Number.isFinite(stalledAfter)
@@ -3903,8 +3930,32 @@ export class WorkflowEngine {
   }
 
   private async resumeRunNow(runId: string, allowFailed: boolean): Promise<RunResult> {
-    const run = await this.store.getRun(runId);
+    // Take the lease and read the run in one round trip when the store can: `execute` then finds
+    // the lease held for this turn. Not while an execution of the run is in flight here (it holds
+    // the lease; `execute` proves re-entry itself), and a failed take reads the run as before.
+    const lockAndGet = this.executionLeases.has(runId) ? undefined : this.store.tryLockRunAndGet;
+    let locked = false;
+    let run: WorkflowRun | null = null;
+    if (lockAndGet) {
+      const nowMs = this.clock();
+      run = await lockAndGet.call(this.store, runId, this.instanceId, nowMs + this.leaseMs, nowMs);
+      locked = run !== null;
+    }
+    run ??= await this.store.getRun(runId);
     if (!run) throw new Error(`run ${runId} not found`);
+    if (!locked) return this.resumeLoadedRun(run, allowFailed);
+    this.lockedForTurn.add(runId);
+    try {
+      return await this.resumeLoadedRun(run, allowFailed);
+    } finally {
+      // Still marked: the turn never started (a finished run, another namespace, a registration
+      // that failed), so the lease taken above goes back.
+      if (this.lockedForTurn.delete(runId)) await this.releaseLeaseBestEffort(runId);
+    }
+  }
+
+  private async resumeLoadedRun(run: WorkflowRun, allowFailed: boolean): Promise<RunResult> {
+    const runId = run.id;
     // A definitively-finished run must not be re-executed (e.g. a worker result landing after the
     // run was cancelled, or a duplicate resume) — that would replay the body and clobber the
     // terminal state. `failed` is terminal too unless this is an explicit retry (see `resume`).
@@ -4147,6 +4198,8 @@ export class WorkflowEngine {
    */
   beginDrain(spentMs = 0): void {
     this.draining = true;
+    // Parked bodies are only an optimization: the runs replay wherever they resume next.
+    this.sticky.clear();
     // Stop taking runs off the transport's queue, so they wait there for another instance; the
     // ones in flight settle, and drain() waits for them.
     if (this.runConsumerStops.length > 0) {
@@ -6398,19 +6451,24 @@ export class WorkflowEngine {
    * replica is about to admit or deny is never mistaken for a holder admitted by a replica older
    * than 0.73 (see `legacySingletonHolders`).
    */
-  private async markStarted(run: WorkflowRun, singleton: boolean): Promise<void> {
+  private async markStarted(run: WorkflowRun, singleton: boolean): Promise<boolean> {
     // Read the fleet's subscriptions while the run executes, so its terminal write (which uses the
     // last read for the lifecycle marker, without waiting) finds a fresh one.
     void this.announcedSubscriptions();
     const tags = singleton ? withSingletonTracked(run.tags) : run.tags;
     const retag = tags !== run.tags;
-    await this.store.updateRun(run.id, {
-      status: 'running',
-      ...(retag ? { tags } : {}),
-      updatedAt: new Date(),
-    });
+    // A compare-and-set on `pending`: the run was read before this turn took it, and a cancel (or
+    // a delete) landing in between must not be overwritten with `running`, which would resurrect it.
+    const started = await (this.store.updateRunIf ?? this.updateRunIfFallback).call(
+      this.store,
+      run.id,
+      ['pending'],
+      { status: 'running', ...(retag ? { tags } : {}), updatedAt: new Date() },
+    );
+    if (!started) return false;
     run.status = 'running';
     if (retag) run.tags = tags;
+    return true;
   }
 
   private async singletonWaitResult(run: WorkflowRun): Promise<RunResult> {
@@ -7035,6 +7093,10 @@ export class WorkflowEngine {
     // compare-and-set IS the guard; it also catches `completed`/`dead` reached mid-turn, and a
     // compensating cancel (`cancelling`) requested mid-turn, which the queued compensation turn (or
     // recovery, on another instance) finishes instead of the run parking as `suspended`.
+    // Strictly later than the row this turn read: a parked body is recognized by the exact stamp its
+    // suspend wrote (see takeContinuation), so no later settle, by any instance with any clock, may
+    // write that same stamp again, even within the same millisecond.
+    const stamp = new Date(Math.max(updatedAt.getTime(), (run.updatedAt?.getTime() ?? 0) + 1));
     const applied = await (this.store.updateRunIf ?? this.updateRunIfFallback).call(
       this.store,
       run.id,
@@ -7042,10 +7104,12 @@ export class WorkflowEngine {
       await this.withRunTrace(run, {
         status: 'suspended',
         wakeAt: this.reconcileWakeAt(outcome.wakeAt),
-        updatedAt,
+        updatedAt: stamp,
       }),
     );
     if (!applied) return this.echoCurrentStatus(run.id);
+    run.updatedAt = stamp;
+    this.suspendStamps.set(run.id, stamp.getTime());
     await this.keepDueForKeptWakes(run.id);
     this.emit({
       type: 'run.suspended',
@@ -7107,7 +7171,11 @@ export class WorkflowEngine {
     }
     const remote = registered.remote as NonNullable<RegisteredWorkflow['remote']>;
     if (run.status === 'pending') {
-      await this.markStarted(run, registered?.singleton !== undefined);
+      if (!(await this.markStarted(run, registered?.singleton !== undefined))) {
+        // No longer `pending` (cancelled or deleted since it was read): nothing to run.
+        await this.releaseLeaseBestEffort(run.id);
+        return await this.echoCurrentStatus(run.id);
+      }
       this.emit({
         type: 'run.started',
         runId: run.id,
@@ -7963,7 +8031,11 @@ export class WorkflowEngine {
     // First execution of an enqueued run: mark it running and announce the start, BEFORE the singleton
     // gate. A resumed run is already past `pending`, so this fires exactly once.
     if (run.status === 'pending') {
-      await this.markStarted(run, registered?.singleton !== undefined);
+      if (!(await this.markStarted(run, registered?.singleton !== undefined))) {
+        // No longer `pending` (cancelled or deleted since it was read): nothing to run.
+        await this.releaseLeaseBestEffort(run.id);
+        return await this.echoCurrentStatus(run.id);
+      }
       this.emit({
         type: 'run.started',
         runId: run.id,
@@ -7984,30 +8056,48 @@ export class WorkflowEngine {
     ) {
       return this.singletonWaitResult(run);
     }
+    // A body this instance parked on dispatched steps in an earlier turn continues from there (see
+    // `sticky-continuation.ts`), when nothing but this instance's own turn has settled the run since.
+    const stickyOk = this.stickyEligible(run);
+    let cont = stickyOk ? this.takeContinuation(run, fn) : undefined;
+    const warm = cont !== undefined;
+    // The parked steps' checkpoints, read before the body resumes: a failing read fails the turn
+    // like a failing history read does, never the run.
+    const parkedFresh = cont ? await this.readParked(run.id, cont) : undefined;
     // Saga compensations registered by completed steps; run in reverse if the run later fails.
-    const compensations: Compensation[] = [];
+    const compensations: Compensation[] = cont ? cont.compensations : [];
     // Load this run's checkpoints ONCE and key them by seq, so replaying the completed prefix reads
     // from memory instead of one `getCheckpoint` SELECT per primitive (the O(N²) replay-reads fix).
     // Read once at execution start: a checkpoint written AFTER this snapshot (the signal/timer/child
     // this resume wakes on, or one written later in this same execution) is absent from the map, and
     // the ctx falls back to the live store for any absent seq — so replay semantics are unchanged.
-    const snapshot = await this.replayCheckpoints(run.id);
-    await this.deliverFinishedChildren(run.id, snapshot);
-    const replay = new Map<number, StepCheckpoint>();
+    // A warm continuation already replayed its prefix: it reads only what lies past its park point.
+    const snapshot = cont ? [] : await this.replayCheckpoints(run.id);
+    if (!cont) await this.deliverFinishedChildren(run.id, snapshot);
+    const replay = cont ? cont.replay : new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
+    if (!cont && stickyOk) {
+      cont = new StickyContinuation(run.id, fn, run.workflowVersion, compensations, replay, (c) =>
+        this.sticky.evict(c.runId),
+      );
+    }
+    if (cont) this.turnContinuations.set(run.id, cont);
+    let parkedTurn = false;
     let suspendedOnFan: FanJoin | undefined;
     let suspendedOnSteps = false;
     const awaitedSteps = new Set<number>();
     this.awaitedRemoteSteps.set(run.id, awaitedSteps);
     const awaitedFans: { from: number; to: number }[] = [];
     this.awaitedStepFans.set(run.id, awaitedFans);
-    const ctx = createWorkflowCtx(
-      this.ctxHostFor(replay, run.namespace),
-      run.id,
-      compensations,
-      run.workflow,
-      registered?.searchAttributesSchema,
-    );
+    const ctx = warm
+      ? undefined
+      : createWorkflowCtx(
+          this.ctxHostFor(replay, run.namespace, cont),
+          run.id,
+          compensations,
+          run.workflow,
+          registered?.searchAttributesSchema,
+        );
     // Every settle below is `return await`ed, never a bare `return this.settleRun(...)`: inside
     // `try … finally` a bare return runs the `finally` — which RELEASES THE LEASE — as soon as the
     // return expression is evaluated, while the settle's own writes are still in flight. The run then
@@ -8022,7 +8112,28 @@ export class WorkflowEngine {
       }
       // The ambient-context wrap is what lets class-first statics (`MyWorkflow.execute()`) find
       // this ctx from anywhere on the body's async path — first run and every replay alike.
-      const output = await runInWorkflowCtx(ctx, () => fn(ctx, run.input));
+      let output: unknown;
+      if (cont) {
+        if (parkedFresh) {
+          cont.attached = true;
+          await cont.resumeParked(parkedFresh);
+        } else {
+          const body = ctx as WorkflowCtx;
+          cont.begin(() => runInWorkflowCtx(body, () => fn(body, run.input)));
+        }
+        const outcome = await cont.next();
+        if (outcome.kind === 'parked') {
+          // Parked on dispatched steps with nothing else in flight: suspend exactly as a thrown
+          // suspension would, and keep the body for the run's next turn here.
+          parkedTurn = true;
+          throw new WorkflowSuspended(outcome.wakeAt);
+        }
+        if (outcome.kind === 'threw') throw outcome.error;
+        output = outcome.value;
+      } else {
+        const body = ctx as WorkflowCtx;
+        output = await runInWorkflowCtx(body, () => fn(body, run.input));
+      }
       // A compensating cancel may have been requested while this turn ran (or re-derived from a
       // `cancelling` status on recovery): undo + settle cancelled rather than completing, so the cancel
       // is never lost when the body returns without first hitting a suspension point.
@@ -8081,6 +8192,11 @@ export class WorkflowEngine {
         const suspended = await this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
         suspendedOnFan = err.fan;
         suspendedOnSteps = suspended.status === 'suspended';
+        const stamp = this.suspendStamps.get(run.id);
+        this.suspendStamps.delete(run.id);
+        if (parkedTurn && cont && suspendedOnSteps && stamp !== undefined) {
+          this.keepContinuation(cont, stamp);
+        }
         return suspended;
       }
       // A cancel in flight that surfaced as a thrown error still settles cancelled (not failed) — the
@@ -8110,6 +8226,8 @@ export class WorkflowEngine {
         this.awaitedRemoteSteps.delete(run.id);
       }
       if (this.awaitedStepFans.get(run.id) === awaitedFans) this.awaitedStepFans.delete(run.id);
+      if (cont && this.turnContinuations.get(run.id) === cont)
+        this.turnContinuations.delete(run.id);
       await this.releaseLeaseBestEffort(run.id);
       if (suspendedOnFan) {
         this.inBackground(this.redriveSettledChildren(run.id, suspendedOnFan));
@@ -8350,10 +8468,15 @@ export class WorkflowEngine {
   /** The seam handed to {@link createWorkflowCtx}: the authoring API reaches durability + lifecycle
    *  (checkpointing, dispatch, child start) through this, so the ctx primitives live in their own
    *  module and the engine stays the orchestrator. */
-  private ctxHostFor(replay?: Map<number, StepCheckpoint>, parentNamespace?: string): CtxHost {
+  private ctxHostFor(
+    replay?: Map<number, StepCheckpoint>,
+    parentNamespace?: string,
+    sticky?: StickyContinuation,
+  ): CtxHost {
     return {
       store: this.store,
       replay,
+      sticky,
       clock: this.clock,
       webhookUrl: this.webhookUrl,
       startStep: (s) => this.startStep(s),
@@ -8362,10 +8485,31 @@ export class WorkflowEngine {
       // Route the dispatch by the RUN's tenant (same reason as `startChild` below): the executing
       // engine may be an operator driving every namespace, so the token must come from the run, not
       // from this engine. See {@link stepGroup}.
-      callRemote: (runId, seq, step, input, queue, transport, admission) =>
-        this.callRemote(runId, seq, step, input, queue, transport, replay, admission, {
+      callRemote: (runId, seq, step, input, queue, transport, admission) => {
+        const routing = { namespace: parentNamespace };
+        const call = this.callRemote(runId, seq, step, input, queue, transport, replay, admission, {
           namespace: parentNamespace,
-        }),
+        });
+        if (!sticky) return call;
+        // In a sticky continuation a call that would suspend parks instead: a later turn
+        // re-evaluates it (the same logic, against its freshly read checkpoint).
+        return call.catch((err) => {
+          if (!(err instanceof WorkflowSuspended) || !sticky.attached) throw err;
+          return sticky.park(seq, err.wakeAt, (fresh) =>
+            this.callRemote(
+              runId,
+              seq,
+              step,
+              input,
+              queue,
+              transport,
+              fresh ? new Map([[seq, fresh]]) : undefined,
+              admission,
+              { ...routing, fresh: true },
+            ),
+          ) as Promise<never>;
+        });
+      },
       callRemoteAll: (runId, positions, step, inputs, opts) =>
         this.callRemoteAll(
           runId,
@@ -8602,9 +8746,28 @@ export class WorkflowEngine {
     transport?: string,
     replay?: Map<number, StepCheckpoint>,
     admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
-    routing?: { namespace?: string | undefined; parallelGroup?: string | undefined },
+    routing?: {
+      namespace?: string | undefined;
+      parallelGroup?: string | undefined;
+      /** `replay` holds this step's checkpoint as just read from the store: no re-read needed. */
+      fresh?: boolean | undefined;
+    },
   ): Promise<TOutput> {
     const group = stepGroup(step, routing?.namespace);
+    // A position the turn's history does not hold is normally a first dispatch: write its `pending`
+    // row only if none is there, instead of reading the position first. A row that is there (a turn
+    // this one did not see wrote it) is then read and handled below like any other.
+    if (
+      replay !== undefined &&
+      !replay.has(seq) &&
+      this.store.insertCheckpointIfAbsent &&
+      !step.timeoutMs &&
+      this.pool.size > 0 &&
+      !(queue && this.admission.handles(queue)) &&
+      (await this.dispatchIfAbsent(runId, seq, step, input, group, transport, admission, routing))
+    ) {
+      throw new WorkflowSuspended();
+    }
     // Read the prefix from the per-execution snapshot (avoids the O(N²) replay SELECTs); a seq absent
     // from the snapshot — not yet dispatched, or written after the snapshot — falls back to the store.
     let existing = replay?.get(seq) ?? (await this.store.getCheckpoint(runId, seq));
@@ -8614,7 +8777,7 @@ export class WorkflowEngine {
     // the lost-dispatch lease, or a re-dispatch) — written from a stale row, that overwrites the landed
     // `completed` result with `pending` and parks the run on a lease an hour out. So a pending step is
     // re-read from the store before anything acts on it (one read, only at a suspension point).
-    if (existing?.status === 'pending' && replay?.has(seq)) {
+    if (existing?.status === 'pending' && replay?.has(seq) && !routing?.fresh) {
       existing = (await this.store.getCheckpoint(runId, seq)) ?? existing;
     }
     if (existing && existing.name !== step.name) {
@@ -8808,6 +8971,64 @@ export class WorkflowEngine {
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     this.awaitedRemoteSteps.get(runId)?.add(seq);
     throw new WorkflowSuspended();
+  }
+
+  /**
+   * {@link callRemote}'s first dispatch of a step, written with
+   * {@link StateStore.insertCheckpointIfAbsent}: resolves whether it wrote the `pending` row and
+   * dispatched. `false` when the position already has a row, or when no live worker can take the
+   * step (the read-first path then decides, so a step that is in fact done is never blocked).
+   */
+  private async dispatchIfAbsent<TInput>(
+    runId: string,
+    seq: number,
+    step: StepDef<TInput, unknown>,
+    input: TInput,
+    group: string,
+    transport: string | undefined,
+    admission: { priority?: number | undefined; fairnessKey?: string | undefined } | undefined,
+    routing: { parallelGroup?: string | undefined } | undefined,
+  ): Promise<boolean> {
+    try {
+      await this.ensureRoutable(group, step.requires);
+    } catch (err) {
+      if (err instanceof WorkflowBlocked) return false;
+      throw err;
+    }
+    const id = stepId(runId, seq);
+    const enqueuedAt = new Date();
+    const wrote = await (
+      this.store.insertCheckpointIfAbsent as NonNullable<StateStore['insertCheckpointIfAbsent']>
+    ).call(this.store, {
+      runId,
+      seq,
+      name: step.name,
+      kind: 'remote',
+      stepId: id,
+      status: 'pending',
+      input,
+      attempts: 1,
+      workerGroup: group,
+      ...(routing?.parallelGroup !== undefined ? { parallelGroup: routing.parallelGroup } : {}),
+      enqueuedAt,
+      startedAt: enqueuedAt, // placeholders until the worker result lands
+      finishedAt: enqueuedAt,
+    });
+    if (!wrote) return false;
+    await this.dispatchRemoteTask({
+      runId,
+      seq,
+      name: step.name,
+      stepId: id,
+      group,
+      input,
+      priority: admission?.priority,
+      attempt: 1,
+      transport,
+    });
+    this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
+    this.awaitedRemoteSteps.get(runId)?.add(seq);
+    return true;
   }
 
   /**
@@ -9125,6 +9346,85 @@ export class WorkflowEngine {
   }
 
   /**
+   * Whether this turn of `run` may run in a sticky continuation (see `sticky-continuation.ts`). Not
+   * while the engine drains, for a cancel being compensated, nor when execution wrappers are
+   * registered: a resumed body runs in the async scope of the turn that started it, and a wrapper
+   * (a span, a log batch) expects one scope per turn.
+   */
+  private stickyEligible(run: WorkflowRun): boolean {
+    return (
+      this.sticky.enabled &&
+      !this.draining &&
+      run.status !== 'cancelling' &&
+      !this.cancelRequested.has(run.id) &&
+      !hasDurableExecutionWrappers()
+    );
+  }
+
+  /**
+   * The continuation this instance parked for `run`, if it is still the run's latest turn: the run
+   * is `suspended` with the very stamp this instance's suspend wrote, on the same body and version.
+   * Any other settle in between (another instance's turn, a retry, a cancel) changed the stamp, and
+   * the run replays instead. Taking it removes it from the cache.
+   */
+  private takeContinuation(run: WorkflowRun, fn: WorkflowFn): StickyContinuation | undefined {
+    const cont = this.sticky.take(run.id);
+    if (!cont) return undefined;
+    const valid =
+      cont.fn === fn &&
+      cont.workflowVersion === run.workflowVersion &&
+      run.status === 'suspended' &&
+      cont.stamp !== undefined &&
+      run.updatedAt?.getTime() === cont.stamp;
+    if (!valid) {
+      this.sticky.misses += 1;
+      return undefined;
+    }
+    this.sticky.hits += 1;
+    return cont;
+  }
+
+  /** Keep `cont` (parked, detached) for the run's next turn here, stamped with its suspend write. */
+  private keepContinuation(cont: StickyContinuation, stamp: number): void {
+    if (cont.unusable) return;
+    cont.stamp = stamp;
+    // Everything up to the park point is consumed; later positions read the store.
+    cont.replay.clear();
+    this.sticky.put(cont);
+  }
+
+  /**
+   * The checkpoints of the steps `cont` is parked on, as a replay would see them: in one read when
+   * the store batches, and without the input of a step that completed (what
+   * {@link StateStore.getCheckpointsForSettle} leaves out). A step still open or failed is read
+   * whole, since a re-dispatch or a retry sends its input again.
+   */
+  private async readParked(
+    runId: string,
+    cont: StickyContinuation,
+  ): Promise<Map<number, StepCheckpoint | null>> {
+    const fresh = new Map<number, StepCheckpoint | null>();
+    for (const seq of cont.parked.keys()) fresh.set(seq, cont.hints.get(seq) ?? null);
+    cont.hints.clear();
+    const seqs = [...fresh].flatMap(([seq, cp]) => (cp ? [] : [seq]));
+    if (seqs.length === 0) return fresh;
+    const lean = this.store.getCheckpointsForSettle ?? this.store.getCheckpoints;
+    if (lean) {
+      for (const cp of await lean.call(this.store, runId, seqs)) fresh.set(cp.seq, cp);
+    } else {
+      for (const seq of seqs) fresh.set(seq, await this.store.getCheckpoint(runId, seq));
+    }
+    if (lean === this.store.getCheckpointsForSettle) {
+      for (const seq of seqs) {
+        const cp = fresh.get(seq);
+        if (cp && cp.status !== 'completed')
+          fresh.set(seq, await this.store.getCheckpoint(runId, seq));
+      }
+    }
+    return fresh;
+  }
+
+  /**
    * The run's checkpoints as a turn replays them: {@link StateStore.listCheckpointsForReplay} when
    * the store has it (no input on a completed row), else {@link StateStore.listCheckpoints}.
    */
@@ -9356,6 +9656,9 @@ export class WorkflowEngine {
       seen.add(r.seq);
       return [i];
     });
+    if (this.store.settleResultsIfPending) {
+      return this.settleResultsReturning(runId, results, live, outcomes, queuedIn);
+    }
     const reads = await this.readCheckpoints(
       runId,
       live.map((i) => (results[i] as StepResult).seq),
@@ -9426,6 +9729,116 @@ export class WorkflowEngine {
         queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
         durationMs: finishedAt.getTime() - startedAt.getTime(),
       });
+    }
+    // Asked after every write of the batch committed, so the batch holding a fan's last step sees
+    // the barrier open.
+    const barriers = new Map<number, Promise<boolean>>();
+    const wake = new FanWakeCollector();
+    for (const { cp } of settled) wake.note(cp);
+    for (const { index, cp, result } of settled) {
+      if (!(await this.stepFanStillRunning(cp, result, barriers, queuedIn))) {
+        wake.add(index, cp, result.status);
+      }
+    }
+    return wake.applyTo(outcomes);
+  }
+
+  /**
+   * {@link completeRemoteResults} on a store with {@link StateStore.settleResultsIfPending}: the
+   * results settle their `pending` rows and read them back in one call, instead of a read of the rows
+   * followed by the write. Only an entry that wrote nothing (a redelivery, or a step gone) is read
+   * afterwards. A settled `completed` row is also handed to the run's parked body, if this instance
+   * holds one, so its next turn does not read it again.
+   */
+  private async settleResultsReturning(
+    runId: string,
+    results: StepResult[],
+    live: number[],
+    outcomes: ResultOutcome[],
+    queuedIn: (from: number, to: number) => boolean,
+  ): Promise<ResultOutcome[]> {
+    const settle = (
+      this.store.settleResultsIfPending as NonNullable<StateStore['settleResultsIfPending']>
+    ).bind(this.store);
+    // A late result for a run that was cancelled/finished meanwhile settles nothing: the store
+    // checks the run in the same statement (see settleResultsIfPending).
+    const finishedAt = new Date();
+    const entries = live.map((i): StepResultSettlement => {
+      const result = results[i] as StepResult;
+      return {
+        runId,
+        seq: result.seq,
+        status: result.status,
+        output: result.status === 'completed' ? result.output : undefined,
+        error: result.error,
+        events: result.events,
+        startedAt: result.startedAt ? new Date(result.startedAt) : undefined,
+        finishedAt,
+      };
+    });
+    // Never rejects as a whole: the batch call rejecting wrote nothing, so the entries are then
+    // settled one by one and a failing one fails only its own result.
+    let rows: (StepCheckpoint | null | { error: unknown })[];
+    try {
+      rows = await settle(entries);
+    } catch (err) {
+      if (entries.length === 1) {
+        rows = [{ error: err }];
+      } else {
+        const one = await Promise.allSettled(entries.map((e) => settle([e])));
+        rows = one.map((o) =>
+          o.status === 'fulfilled' ? (o.value[0] ?? null) : { error: o.reason },
+        );
+      }
+    }
+    const settled: { index: number; cp: StepCheckpoint; result: StepResult }[] = [];
+    const unsettled: number[] = [];
+    rows.forEach((row, k) => {
+      const index = live[k] as number;
+      if (row === null) unsettled.push(index);
+      else if ('error' in row && !('seq' in row)) outcomes[index] = { error: row.error };
+      else settled.push({ index, cp: row as StepCheckpoint, result: results[index] as StepResult });
+    });
+    // The run's parked body: in the cache, or in a turn that is parking it right now.
+    const parked = this.sticky.peek(runId) ?? this.turnContinuations.get(runId);
+    for (const { cp, result } of settled) {
+      void this.releaseQueueSlot(cp.stepId).catch(() => undefined);
+      if (cp.status === 'completed') parked?.hint(cp);
+      if (!parseStepFanGroup(cp.parallelGroup)) this.noteSettledHere(`${runId}:${result.seq}`);
+      this.emit({
+        type: result.status === 'completed' ? 'step.completed' : 'step.failed',
+        runId,
+        seq: result.seq,
+        name: cp.name,
+        kind: cp.kind,
+        output: result.output,
+        error: result.error,
+        queueMs: cp.startedAt.getTime() - cp.enqueuedAt.getTime(),
+        durationMs: finishedAt.getTime() - cp.startedAt.getTime(),
+      });
+    }
+    if (settled.length === 0) {
+      // Nothing settled: redeliveries of settled steps (which may still owe the run its resume),
+      // or steps that are gone.
+      if (unsettled.length === 0) return outcomes;
+      const reads = await this.readCheckpoints(
+        runId,
+        unsettled.map((i) => (results[i] as StepResult).seq),
+      );
+      const resettled: { index: number; cp: StepCheckpoint }[] = [];
+      reads.forEach((read, k) => {
+        const index = unsettled[k] as number;
+        if (read.status === 'rejected') outcomes[index] = { error: read.reason };
+        else if (read.value?.status === 'completed' || read.value?.status === 'failed') {
+          resettled.push({ index, cp: read.value });
+        } else if (read.value?.status === 'pending') {
+          // Still pending yet not settled: its run finished. The step frees its flow-control slot
+          // (a no-op if it wasn't queued) and resumes nothing.
+          void this.releaseQueueSlot(read.value.stepId).catch(() => undefined);
+        }
+      });
+      if (resettled.length === 0) return outcomes;
+      return this.resumeForRedelivered(runId, resettled, outcomes, queuedIn);
     }
     // Asked after every write of the batch committed, so the batch holding a fan's last step sees
     // the barrier open.

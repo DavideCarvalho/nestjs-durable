@@ -220,6 +220,8 @@ describe("a replay's stale view of a remote step never overwrites its landed res
       clock: () => now,
       reconcileMs: 0,
       remoteRedispatchMs: 60 * 60_000,
+      // The race is staged on the replay's history snapshot, which only a replaying turn takes.
+      stickyRuns: 0,
     });
     engine.register('wf', '1', async (ctx) => {
       const r = await ctx.step<{ pong: boolean }>(PING, {});

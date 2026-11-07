@@ -16,6 +16,7 @@ import {
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
+  type StepResultSettlement,
   type StepSettlement,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
@@ -278,6 +279,94 @@ export class InMemoryStateStore implements StateStore {
       this.checkpoints.set(key, { ...cp, ...settlement });
       return true;
     });
+  }
+
+  // The three round-trip-saving methods below are built on the plain ones, so a test store that
+  // overrides `tryLockRun`, `getRun`, `getCheckpoint` or a settle to stage a race keeps staging it.
+  // They are OFF unless asked for (`roundTripMethods`, or `DURABLE_TEST_ROUND_TRIP_METHODS=1` for a
+  // whole suite): many specs pin the store calls the engine makes without them.
+  readonly settleResultsIfPending?: (
+    results: StepResultSettlement[],
+  ) => Promise<(StepCheckpoint | null)[]>;
+  readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  readonly tryLockRunAndGet?: (
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ) => Promise<WorkflowRun | null>;
+
+  constructor(opts: { roundTripMethods?: boolean } = {}) {
+    const on =
+      opts.roundTripMethods ??
+      (typeof process !== 'undefined' && process.env.DURABLE_TEST_ROUND_TRIP_METHODS === '1');
+    if (on) {
+      this.settleResultsIfPending = (results) => this.settleResultsFallback(results);
+      this.insertCheckpointIfAbsent = (cp) => this.insertIfAbsentFallback(cp);
+      this.tryLockRunAndGet = (runId, owner, until, now) =>
+        this.lockAndGetFallback(runId, owner, until, now);
+    }
+  }
+
+  private async settleResultsFallback(
+    results: StepResultSettlement[],
+  ): Promise<(StepCheckpoint | null)[]> {
+    const out: (StepCheckpoint | null)[] = results.map(() => null);
+    // One read per run, then one settle for the batch: the calls the engine makes without this.
+    const before = new Map<string, StepCheckpoint>();
+    const seqsByRun = new Map<string, number[]>();
+    for (const r of results) seqsByRun.set(r.runId, [...(seqsByRun.get(r.runId) ?? []), r.seq]);
+    for (const [runId, seqs] of seqsByRun) {
+      for (const cp of await this.getCheckpointsForSettle(runId, seqs)) {
+        before.set(this.key(runId, cp.seq), cp);
+      }
+    }
+    const claimed = new Set<string>();
+    const settlements: StepSettlement[] = [];
+    const at: number[] = [];
+    for (const [i, r] of results.entries()) {
+      const key = this.key(r.runId, r.seq);
+      const cp = before.get(key);
+      if (cp?.status !== 'pending' || claimed.has(key)) continue;
+      const status = (await this.getRun(r.runId))?.status;
+      if (status === 'cancelled' || status === 'completed') continue;
+      claimed.add(key);
+      settlements.push({
+        runId: r.runId,
+        seq: r.seq,
+        status: r.status,
+        output: r.status === 'completed' ? r.output : cp.output,
+        error: r.error,
+        events: r.events ?? cp.events,
+        startedAt: r.startedAt ?? cp.startedAt,
+        finishedAt: r.finishedAt,
+      });
+      at.push(i);
+    }
+    if (settlements.length === 0) return out;
+    const wrote = await this.settleCheckpointsIfPending(settlements);
+    settlements.forEach((settlement, k) => {
+      if (!wrote[k]) return;
+      const cp = before.get(this.key(settlement.runId, settlement.seq)) as StepCheckpoint;
+      out[at[k] as number] = { ...cp, ...settlement };
+    });
+    return out;
+  }
+
+  private async insertIfAbsentFallback(checkpoint: StepCheckpoint): Promise<boolean> {
+    if (await this.getCheckpoint(checkpoint.runId, checkpoint.seq)) return false;
+    await this.saveCheckpoint(checkpoint);
+    return true;
+  }
+
+  private async lockAndGetFallback(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null> {
+    if (!(await this.tryLockRun(runId, owner, leaseUntilMs, nowMs))) return null;
+    return this.getRun(runId);
   }
 
   async listOrphanedRuns(

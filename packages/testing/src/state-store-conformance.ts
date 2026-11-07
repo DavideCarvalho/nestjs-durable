@@ -1359,6 +1359,126 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect((await store.getCheckpoint('r2', 0))?.input).toEqual({ prompt: 'p0' });
     });
 
+    t(
+      'settleResultsIfPending settles pending rows and reads them back without their input',
+      async () => {
+        // Optional (the engine falls back to a read and settleCheckpointsIfPending): exercised when present.
+        if (!store.settleResultsIfPending) return;
+        expect(await store.settleResultsIfPending([])).toEqual([]);
+        await store.createRun(run());
+        await store.createRun(run({ id: 'r2' }));
+        await store.createRun(run({ id: 'gone', status: 'cancelled' }));
+        const pending = (runId: string, seq: number) =>
+          checkpoint({
+            runId,
+            seq,
+            name: 'ask',
+            kind: 'remote',
+            stepId: `${runId}:${seq}`,
+            status: 'pending',
+            input: { prompt: `p${seq}` },
+            output: { partial: seq },
+            events: [{ at: 1, level: 'info', message: 'queued' }],
+            attempts: 2,
+            workerGroup: 'llm',
+            parallelGroup: 'all:0:2',
+            wakeAt: 5_000,
+          });
+        for (const seq of [0, 1, 2, 3]) await store.saveCheckpoint(pending('r1', seq));
+        await store.saveCheckpoint(pending('r2', 0));
+        await store.saveCheckpoint(pending('gone', 0));
+        await store.saveCheckpoint({
+          ...pending('r1', 1),
+          status: 'completed',
+          output: { first: 1 },
+        });
+        const later = new Date(at.getTime() + 60_000);
+        const settled = await store.settleResultsIfPending([
+          {
+            runId: 'r1',
+            seq: 0,
+            status: 'completed',
+            output: { n: 0 },
+            startedAt: new Date(at.getTime() + 1_000),
+            finishedAt: later,
+          },
+          // Already settled: nothing written.
+          { runId: 'r1', seq: 1, status: 'completed', output: { n: 1 }, finishedAt: later },
+          // A second result for the row the first one settles: loses.
+          { runId: 'r1', seq: 0, status: 'completed', output: { n: 'dup' }, finishedAt: later },
+          // A failure keeps the stored output, events and start; records the error.
+          { runId: 'r1', seq: 2, status: 'failed', error: { message: 'boom' }, finishedAt: later },
+          // No such row.
+          { runId: 'r1', seq: 9, status: 'completed', output: { n: 9 }, finishedAt: later },
+          // Another run's row at the same seq.
+          { runId: 'r2', seq: 0, status: 'completed', output: { n: 'r2' }, finishedAt: later },
+          // A finished run's step settles nothing.
+          { runId: 'gone', seq: 0, status: 'completed', output: { n: 'late' }, finishedAt: later },
+        ]);
+        expect(settled.map((cp) => (cp ? [cp.runId, cp.seq, cp.status] : null))).toEqual([
+          ['r1', 0, 'completed'],
+          null,
+          null,
+          ['r1', 2, 'failed'],
+          null,
+          ['r2', 0, 'completed'],
+          null,
+        ]);
+        const [first, , , failed] = settled;
+        expect(first?.output).toEqual({ n: 0 });
+        expect(first?.input).toBeUndefined();
+        expect(first?.name).toBe('ask');
+        expect(first?.stepId).toBe('r1:0');
+        expect(first?.attempts).toBe(2);
+        expect(first?.parallelGroup).toBe('all:0:2');
+        expect(first?.events).toEqual([{ at: 1, level: 'info', message: 'queued' }]);
+        expect(first?.startedAt.getTime()).toBe(at.getTime() + 1_000);
+        expect(first?.finishedAt.getTime()).toBe(later.getTime());
+        expect(first?.enqueuedAt.getTime()).toBe(at.getTime());
+        expect(failed?.output).toEqual({ partial: 2 });
+        expect(failed?.error).toEqual({ message: 'boom' });
+        expect(failed?.startedAt.getTime()).toBe(at.getTime());
+        // What was read back is what is stored, input included.
+        const stored = await store.getCheckpoint('r1', 0);
+        expect(stored?.output).toEqual({ n: 0 });
+        expect(stored?.input).toEqual({ prompt: 'p0' });
+        expect((await store.getCheckpoint('r1', 1))?.output).toEqual({ first: 1 });
+        expect((await store.getCheckpoint('r1', 3))?.status).toBe('pending');
+        expect((await store.getCheckpoint('gone', 0))?.status).toBe('pending');
+        expect(await store.getCheckpoint('r1', 9)).toBeNull();
+      },
+    );
+
+    t('insertCheckpointIfAbsent writes a position only once', async () => {
+      if (!store.insertCheckpointIfAbsent) return;
+      await store.createRun(run());
+      const first = checkpoint({ seq: 4, status: 'pending', input: { a: 1 }, output: undefined });
+      expect(await store.insertCheckpointIfAbsent(first)).toBe(true);
+      expect(
+        await store.insertCheckpointIfAbsent({ ...first, status: 'completed', output: { b: 2 } }),
+      ).toBe(false);
+      const stored = await store.getCheckpoint('r1', 4);
+      expect(stored?.status).toBe('pending');
+      expect(stored?.input).toEqual({ a: 1 });
+      expect(stored?.output).toBeUndefined();
+    });
+
+    t('tryLockRunAndGet takes a free or expired lease and reads the run', async () => {
+      if (!store.tryLockRunAndGet) return;
+      await store.createRun(run({ status: 'suspended' }));
+      const locked = await store.tryLockRunAndGet('r1', 'a', 2_000, 1_000);
+      expect(locked?.id).toBe('r1');
+      expect(locked?.status).toBe('suspended');
+      expect(locked?.lockedBy).toBe('a');
+      expect(locked?.lockedUntil).toBe(2_000);
+      // Held: another owner gets nothing, and the lease is unchanged.
+      expect(await store.tryLockRunAndGet('r1', 'b', 3_000, 1_500)).toBeNull();
+      expect((await store.getRun('r1'))?.lockedBy).toBe('a');
+      // Expired: taken over.
+      expect((await store.tryLockRunAndGet('r1', 'b', 4_000, 2_000))?.lockedBy).toBe('b');
+      expect(await store.tryLockRunAndGet('missing', 'a', 2_000, 1_000)).toBeNull();
+    });
+
     t('settleCheckpointsIfPending sends none of the input of the steps it settles', async () => {
       if (!statementLog || !store.settleCheckpointsIfPending) return;
       await store.createRun(run());

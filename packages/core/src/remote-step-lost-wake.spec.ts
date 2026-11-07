@@ -93,7 +93,9 @@ describe('REGRESSION: a step result settled by another instance during the dispa
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
     transport.handle(STEP, async (input: { index: number }) => ({ index: input.index }));
-    const engine = new WorkflowEngine({ store, transport, reconcileMs: 0 });
+    // Counts replays of the body, so the body must replay: no sticky continuation (the case below
+    // covers the sticky one).
+    const engine = new WorkflowEngine({ store, transport, reconcileMs: 0, stickyRuns: 0 });
     let bodyRuns = 0;
     engine.register('line', '1', async (ctx) => {
       bodyRuns += 1;
@@ -106,5 +108,24 @@ describe('REGRESSION: a step result settled by another instance during the dispa
 
     // One turn dispatches and suspends, one replays the result and completes.
     expect(bodyRuns).toBe(2);
+  });
+
+  it('with a sticky continuation, runs the body once: the result continues the parked body', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    transport.handle(STEP, async (input: { index: number }) => ({ index: input.index }));
+    const engine = new WorkflowEngine({ store, transport, reconcileMs: 0 });
+    let bodyRuns = 0;
+    engine.register('line', '1', async (ctx) => {
+      bodyRuns += 1;
+      return ctx.step<{ index: number }>(STEP, { index: 7 });
+    });
+
+    await startRun(engine, 'line', {}, 'run1');
+    await until(async () => (await store.getRun('run1'))?.status === 'completed');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(bodyRuns).toBe(1);
+    expect((await store.getRun('run1'))?.output).toEqual({ index: 7 });
   });
 });

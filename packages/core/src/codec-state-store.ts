@@ -17,6 +17,7 @@ import type {
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepResultSettlement,
   StepSettlement,
   WorkflowRun,
 } from './interfaces';
@@ -120,6 +121,20 @@ export class CodecStateStore implements StateStore {
   /** Encodes each settlement's payloads like {@link saveCheckpoint}. Bound only when the inner store
    *  has it, so the engine's whole-row fallback still kicks in through the wrapper. */
   readonly settleCheckpointsIfPending?: (settlements: StepSettlement[]) => Promise<boolean[]>;
+  /** Encodes each result's payloads, decodes each row read back. Bound only when the inner store
+   *  has it. */
+  readonly settleResultsIfPending?: (
+    results: StepResultSettlement[],
+  ) => Promise<(StepCheckpoint | null)[]>;
+  /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it. */
+  readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  /** Decodes the run read. Bound only when the inner store has it. */
+  readonly tryLockRunAndGet?: (
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ) => Promise<WorkflowRun | null>;
   /** Encodes each checkpoint written. Bound only when the inner store has it. */
   readonly saveCheckpoints?: (checkpoints: StepCheckpoint[]) => Promise<void>;
   /** Decodes each checkpoint read like {@link listCheckpoints}. Bound only when the inner store has
@@ -252,6 +267,22 @@ export class CodecStateStore implements StateStore {
           inner,
           settlements.map((s) => this.encSettlement(s)),
         );
+    const settleResults = inner.settleResultsIfPending;
+    if (settleResults)
+      this.settleResultsIfPending = async (results) =>
+        (
+          await settleResults.call(
+            inner,
+            results.map((r) => this.encSettlement(r)),
+          )
+        ).map((cp) => this.decCp(cp));
+    const insertIfAbsent = inner.insertCheckpointIfAbsent;
+    if (insertIfAbsent)
+      this.insertCheckpointIfAbsent = (cp) => insertIfAbsent.call(inner, this.encCp(cp));
+    const lockAndGet = inner.tryLockRunAndGet;
+    if (lockAndGet)
+      this.tryLockRunAndGet = async (runId, owner, leaseUntilMs, nowMs) =>
+        this.decRun(await lockAndGet.call(inner, runId, owner, leaseUntilMs, nowMs));
     const saveMany = inner.saveCheckpoints;
     if (saveMany)
       this.saveCheckpoints = (cps) =>
@@ -388,7 +419,7 @@ export class CodecStateStore implements StateStore {
     }
     return next;
   }
-  private encSettlement(settlement: StepSettlement): StepSettlement {
+  private encSettlement<S extends StepSettlement | StepResultSettlement>(settlement: S): S {
     const next = { ...settlement, output: this.enc(settlement.output) };
     if (this.extended) {
       if (settlement.events !== undefined) {

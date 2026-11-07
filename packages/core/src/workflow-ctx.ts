@@ -64,6 +64,7 @@ import { runWaitToken, settledRunOf } from './run-wait';
 import { readRunsByIds } from './run-waiting';
 import { createStepLogger } from './step-logger';
 import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol';
+import type { StickyContinuation } from './sticky-continuation';
 import { anyCheckpointName, anyOutcomeOf, enterWaitAny } from './wait-any';
 import { type WorkflowRef, workflowName } from './workflow-ref';
 
@@ -153,6 +154,12 @@ export interface CtxHost {
    * into the map so any later same-execution read sees them. Undefined ⇒ always hit the store.
    */
   readonly replay?: Map<number, StepCheckpoint> | undefined;
+  /**
+   * The sticky continuation this ctx's body runs in, if any (see `sticky-continuation.ts`): every
+   * primitive reports to it when it starts and settles, and a primitive started while the body is
+   * detached (between turns) is refused before it does anything.
+   */
+  readonly sticky?: StickyContinuation | undefined;
   clock(): number;
   webhookUrl?: ((token: string) => string) | undefined;
   /** Mark a local step's body as started — emits `step.started` and (optionally) a `running` checkpoint. */
@@ -1570,7 +1577,10 @@ export function createWorkflowCtx(
     const scope = currentStepScope();
     return scope !== undefined && scope.owner === scopeOwner ? scope.step : undefined;
   };
-  const guard = <F extends (...args: never[]) => Promise<unknown>>(primitive: string, fn: F): F =>
+  const unguarded = <F extends (...args: never[]) => Promise<unknown>>(
+    primitive: string,
+    fn: F,
+  ): F =>
     ((...args: Parameters<F>) => {
       const stepName = nestedStep();
       if (stepName === undefined) return fn(...args);
@@ -1579,6 +1589,33 @@ export function createWorkflowCtx(
         throw new NestedWorkflowCallError(runId, primitive, stepName);
       })();
     }) as F;
+  // In a sticky continuation, every primitive is counted while in flight, so the turn can tell when
+  // the body is quiescent; one called while the body is detached is refused before it runs.
+  const sticky = host.sticky;
+  const guard = <F extends (...args: never[]) => Promise<unknown>>(primitive: string, fn: F): F => {
+    const inner = unguarded(primitive, fn);
+    if (!sticky) return inner;
+    return ((...args: Parameters<F>) => {
+      if (!sticky.enter()) return Promise.reject(new WorkflowSuspended());
+      let started: Promise<unknown>;
+      try {
+        started = inner(...args);
+      } catch (err) {
+        sticky.exit(err);
+        throw err;
+      }
+      return started.then(
+        (value) => {
+          sticky.exit();
+          return value;
+        },
+        (err) => {
+          sticky.exit(err);
+          throw err;
+        },
+      );
+    }) as F;
+  };
   // `webhook` is synchronous (it returns a handle): same rule, checked against the replay snapshot.
   const guardedWebhook = <T>(): DurableWebhook<T> => {
     const stepName = nestedStep();

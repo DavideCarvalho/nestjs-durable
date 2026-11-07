@@ -8,3 +8,9 @@ runStateStoreContract('InMemoryStateStore', async () => ({
   store: new InMemoryStateStore(),
   cleanup: async () => undefined,
 }));
+
+// With the optional round-trip methods (settle-and-read, insert-if-absent, lock-and-read) on.
+runStateStoreContract('InMemoryStateStore (round-trip methods)', async () => ({
+  store: new InMemoryStateStore({ roundTripMethods: true }),
+  cleanup: async () => undefined,
+}));

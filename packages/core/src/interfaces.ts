@@ -220,6 +220,22 @@ export interface StepSettlement {
 }
 
 /**
+ * A step's result as {@link StateStore.settleResultsIfPending} writes it onto the step's `pending`
+ * checkpoint. Unlike a {@link StepSettlement}, what the result does not carry keeps the stored value:
+ * `output` is written only for a `completed` result, `events` and `startedAt` only when present.
+ */
+export interface StepResultSettlement {
+  runId: string;
+  seq: number;
+  status: 'completed' | 'failed';
+  output?: unknown;
+  error?: StepError | undefined;
+  events?: StepEvent[] | undefined;
+  startedAt?: Date | undefined;
+  finishedAt: Date;
+}
+
+/**
  * A structured event a step (or its worker) emits while running — a log line and/or a sub-step
  * outcome. The dashboard renders these under the step, so you can see what happened inside a step
  * that the workflow treats as one unit (e.g. which of N parallel sub-processes ok/failed/skipped).
@@ -498,6 +514,29 @@ export interface StateStore {
    * Optional: a store that omits it gets {@link saveCheckpointsIfPending} with the whole rows.
    */
   settleCheckpointsIfPending?(settlements: StepSettlement[]): Promise<boolean[]>;
+  /**
+   * Settle steps from their results and read them back, in one round trip where the store can: per
+   * entry and in input order, while the row at `(runId, seq)` is still `pending` and its run is not
+   * `cancelled` or `completed` (a late result for a finished run settles nothing), write the result
+   * (see {@link StepResultSettlement} for what keeps its stored value) and resolve the row as it now
+   * reads, without its `input` (as {@link getCheckpointsForSettle} reads it); `null` for an entry
+   * that wrote nothing (the row is absent or already settled, or the run finished). Claims like
+   * {@link settleCheckpointsIfPending}: a later entry for a row an earlier one settled loses, and a
+   * rejection writes nothing. The engine settles a batch of one run's step results through it
+   * without reading the rows first.
+   *
+   * Optional: a store that omits it gets {@link getCheckpointsForSettle} followed by
+   * {@link settleCheckpointsIfPending}.
+   */
+  settleResultsIfPending?(results: StepResultSettlement[]): Promise<(StepCheckpoint | null)[]>;
+  /**
+   * Write `checkpoint` only if the run has no checkpoint at its `seq` yet; resolves whether it wrote.
+   * The engine writes a step it dispatches for the first time through it, instead of reading the
+   * position first: a row already there (written by a turn it did not see) is then read and acted on.
+   *
+   * Optional: a store that omits it gets a {@link getCheckpoint} before the {@link saveCheckpoint}.
+   */
+  insertCheckpointIfAbsent?(checkpoint: StepCheckpoint): Promise<boolean>;
 
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
@@ -542,6 +581,20 @@ export interface StateStore {
    * acquired — so concurrent engine instances never recover the same run twice.
    */
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean>;
+  /**
+   * {@link tryLockRun}, resolving the run as it reads once locked (`null` when the lease was not
+   * acquired, or the run does not exist): the engine takes a run's lease and reads it in one round
+   * trip where the store can. The read honors the store's read scope like {@link getRun}; a run
+   * outside it is not locked.
+   *
+   * Optional: a store that omits it gets a {@link getRun} and a {@link tryLockRun}.
+   */
+  tryLockRunAndGet?(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null>;
 
   /**
    * Release a run's recovery lease so another instance can pick it up (e.g. once it suspends).

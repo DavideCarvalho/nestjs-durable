@@ -33,7 +33,8 @@ describe('step results of one run on one instance', () => {
   it('resume the run one at a time, so it never has two concurrent turns', async () => {
     const store = new InMemoryStateStore();
     const transport = new CapturingTransport();
-    const engine = new WorkflowEngine({ store, transport, reconcileMs: 0 });
+    // Observes overlapping turns through overlapping replays of the body: no sticky continuation.
+    const engine = new WorkflowEngine({ store, transport, reconcileMs: 0, stickyRuns: 0 });
     let active = 0;
     let maxActive = 0;
     engine.register('pair', '1', async (ctx) => {
