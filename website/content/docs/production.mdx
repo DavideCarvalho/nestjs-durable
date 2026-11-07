@@ -693,13 +693,14 @@ separately. See [Encrypting payloads](/docs/stores#coverage).
 Three views of the same engine lifecycle events, for different jobs:
 
 - **The dashboard** (`@dudousxd/nestjs-durable-dashboard`) is the operating surface — run list, the
-  step graph, retry/cancel/continue actions. It is **open by default**: with neither `guards` nor
-  `dashboardAuth` set, anyone who can reach `/durable` can read every run's payloads and retry or
-  cancel it, and nothing warns you. Before it ships, pass `guards` (your own `CanActivate`, which must
-  accept a cookie, since the SPA shell loads by browser navigation), or `dashboardAuth` (the built-in
-  signed session cookie, minted by your host's auth or a built-in login page), or both. A mount behind
-  an authenticating proxy is the third option: fold `basePath` into a prefix your proxy rules already
-  cover. See [Protecting the console](/docs/observability/dashboard#protecting-the-console).
+  step graph, retry/cancel/continue actions. Anyone who reaches it can read every run's payloads
+  and retry or cancel it, so protect it with `@nestjs/authentication` / `@nestjs/authorization`,
+  one of two ways: `decorators` on the mounted console
+  (`forRoot({ decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view')] })`), or
+  `routes: false` and your own controllers extending `DurableUiControllerBase` /
+  `DurableApiControllerBase`. With `NODE_ENV=production`, a mounted console with no `decorators`
+  **fails the boot**, naming both ways. See
+  [Protecting the console](/docs/observability/dashboard#protecting-the-console).
 - **OpenTelemetry** (`@dudousxd/nestjs-durable-otel`) turns runs into traces — one root span per run,
   one child span per step — for the tracing stack you already run. `attachDurableOtel(engine)` is
   aimed at debugging production latency and correlation, not at operating a run. Note that the root

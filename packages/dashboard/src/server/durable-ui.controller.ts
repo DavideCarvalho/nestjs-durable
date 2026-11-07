@@ -9,10 +9,7 @@ import {
   NotFoundException,
   Param,
   StreamableFile,
-  UseFilters,
 } from '@nestjs/common';
-import { DashboardLoginRedirectFilter } from './auth/login-redirect.exception.js';
-import { DashboardSessionRequiredFilter } from './auth/session-required.exception.js';
 
 /** DI token carrying the UI mount base (e.g. `/durable`). */
 export const DASHBOARD_BASE_PATH = Symbol('DASHBOARD_BASE_PATH');
@@ -47,16 +44,7 @@ const CONTENT_TYPES: Record<string, string> = {
  * DurableUiControllerBase {}`, protected with the host's own decorators. It carries no guards and
  * no `@nestjs/authorization` mark, so a subclass is protected only by what the host puts on it (and,
  * under `AuthorizationModule`'s global guard, is denied until it declares a `@Can()`).
- *
- * `@UseFilters(DashboardLoginRedirectFilter, DashboardSessionRequiredFilter)` is permanent (present
- * regardless of whether `dashboardAuth` is configured): each only ever activates for its own
- * exception type, which `DurableUiSessionGuard` only throws when it is ALSO stamped on this
- * controller (see `DurableDashboardModule.forRoot`) — so leaving them decorated here is inert, not
- * a behavior change, when `dashboardAuth` is absent. The guard picks between the two exceptions
- * based on which mode is configured (Mode B => redirect to the login page; Mode A only => render
- * the session-required instruction page in place, since there is no login page to redirect to).
  */
-@UseFilters(DashboardLoginRedirectFilter, DashboardSessionRequiredFilter)
 @Controller()
 export class DurableUiControllerBase {
   private readonly dir = spaDir();
@@ -103,9 +91,10 @@ export class DurableUiControllerBase {
 }
 
 /**
- * The SPA controller `DurableDashboardModule.forRoot(...)` mounts at `basePath`. The module stamps
- * its guards and the `@nestjs/authorization` open mark on THIS class, never on
- * {@link DurableUiControllerBase}, so a host's own subclass of the base inherits none of them.
+ * The SPA controller `DurableDashboardModule.forRoot(...)` mounts at `basePath`. The module puts
+ * the `@nestjs/authorization` open mark on THIS class (and `decorators` on a per-registration
+ * subclass of it), never on {@link DurableUiControllerBase}, so a host's own subclass of the base
+ * inherits none of them.
  */
 @Controller()
 export class DurableUiController extends DurableUiControllerBase {}

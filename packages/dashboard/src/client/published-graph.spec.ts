@@ -8,8 +8,8 @@ import { describe, expect, it } from 'vitest';
  * Every package a PUBLISHED entry can reach must be declared here, as a dependency or a peer.
  *
  * The question that decides where a package belongs is not "does this console ship a bundled SPA"
- * — it is "is the package reachable from a published entry". This package publishes three: the
- * NestJS server module, the headless `./client`, and the `./react` launcher tier. `src/app/**` is
+ * — it is "is the package reachable from a published entry". This package publishes two: the
+ * NestJS server module and the headless `./client`. `src/app/**` is
  * the SPA; vite bundles it into `dist/spa` and no published entry points at it, which is why the
  * shadcn layer (Base UI, cva, clsx, tailwind-merge) sits in `devDependencies`. This test is what
  * makes that claim checkable instead of asserted.
@@ -24,7 +24,7 @@ import { describe, expect, it } from 'vitest';
 
 const distDir = fileURLToPath(new URL('../../dist', import.meta.url));
 const pkgPath = fileURLToPath(new URL('../../package.json', import.meta.url));
-const built = existsSync(`${distDir}/react/index.js`);
+const built = existsSync(`${distDir}/client/durable-client.js`);
 
 interface PackageManifest {
   dependencies?: Record<string, string>;
@@ -74,7 +74,7 @@ async function reachablePackages(entry: string): Promise<Set<string>> {
 }
 
 describe.skipIf(!built)('published module graph', () => {
-  it.each([['react/index.js'], ['client/durable-client.js'], ['server/index.js']])(
+  it.each([['client/durable-client.js'], ['server/index.js']])(
     'every package %s reaches is declared',
     async (entry) => {
       const declared = declaredPackages();
@@ -85,15 +85,9 @@ describe.skipIf(!built)('published module graph', () => {
     },
   );
 
-  it('the ./react launcher tier still reaches nothing but react', async () => {
-    // Its whole promise: a host that wants only the "open the console" button installs only react.
-    // Vendoring a component layer under `src/app/ui` is a fresh chance to break that.
-    expect([...(await reachablePackages('react/index.js'))].sort()).toEqual(['react']);
-  });
-
   it('no published entry reaches the SPA-only component layer', async () => {
     const spaOnly = ['@base-ui/react', 'class-variance-authority', 'clsx', 'tailwind-merge'];
-    for (const entry of ['react/index.js', 'client/durable-client.js', 'server/index.js']) {
+    for (const entry of ['client/durable-client.js', 'server/index.js']) {
       const reachable = await reachablePackages(entry);
       expect(spaOnly.filter((name) => reachable.has(name))).toEqual([]);
     }

@@ -354,8 +354,9 @@ function notSupportedByServer(error: unknown): never {
 
 /**
  * The JSON API controller `DurableDashboardModule.forRoot(...)` mounts at `apiBasePath`. The module
- * stamps its guards and the `@nestjs/authorization` open mark on THIS class, never on
- * {@link DurableApiControllerBase}, so a host's own subclass of the base inherits none of them.
+ * puts the `@nestjs/authorization` open mark on THIS class (and `decorators` on a per-registration
+ * subclass of it), never on {@link DurableApiControllerBase}, so a host's own subclass of the base
+ * inherits none of them.
  */
 @Controller()
 export class DurableApiController extends DurableApiControllerBase {}

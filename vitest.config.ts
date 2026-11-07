@@ -45,8 +45,7 @@ export default defineConfig({
     globalSetup: ['./vitest.globalsetup.ts'],
     setupFiles: ['./vitest.setup.ts'],
     include: [
-      // `.tsx` too: the dashboard's React tier (`packages/dashboard/src/react`) ships published
-      // components, and a `.ts`-only glob silently collected none of their specs.
+      // `.tsx` too: a `.ts`-only glob silently collects no React component spec.
       'packages/*/src/**/*.{test,spec}.{ts,tsx}',
       'examples/*/src/**/*.{test,spec}.{ts,tsx}',
     ],
