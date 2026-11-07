@@ -16,6 +16,7 @@ import {
   resolveDashboardAuth,
 } from './auth/dashboard-auth-config.js';
 import { DashboardLoginRedirectFilter } from './auth/login-redirect.exception.js';
+import { controllerFor, markOpenToAuthorization } from './controller-decorators.js';
 import { DashboardService } from './dashboard.service.js';
 import { DurableApiController } from './durable-api.controller.js';
 import { DurableAuthController } from './durable-auth.controller.js';
@@ -42,6 +43,12 @@ import { RunFilter } from './run.filter.js';
  * stays byte-identical to it. Mirrors `@dudousxd/nestjs-agent-dashboard`'s `agent-dashboard.module.ts`.
  */
 const GUARDS_METADATA = '__guards__';
+
+// Every controller this module mounts is open to `@nestjs/authorization`'s global guard, which
+// denies by default: the dashboard's own options decide who reaches it (see `decorators`).
+markOpenToAuthorization(DurableApiController);
+markOpenToAuthorization(DurableUiController);
+markOpenToAuthorization(DurableAuthController);
 
 export interface DurableDashboardOptions {
   /**
@@ -153,6 +160,25 @@ export interface DurableDashboardOptions {
    * the token to its own asset and API requests. Browser operators want `dashboardAuth` or `guards`.
    */
   token?: string;
+  /**
+   * Class decorators applied to EVERY controller this module mounts (the SPA, its JSON API and,
+   * when `dashboardAuth` is set, the login/logout controller), the way `@nestjs/mcp`'s own
+   * `decorators` option works. Use it to hand the console to the official NestJS tooling, e.g.
+   * `[UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view')]` with `@nestjs/authentication`
+   * and `@nestjs/authorization`.
+   *
+   * Each registration gets fresh subclasses of the controllers, so decorators never leak into
+   * another registration or onto the exported classes. A `UseGuards(...)` here runs AFTER the
+   * dashboard's own guards (`dashboardAuth`'s session check, the fail-closed gate, `guards`).
+   * Decorators do not count as authentication for the fail-closed gate: if they ARE your
+   * protection, say so with `allowUnauthenticated: true` (or use `guards`).
+   *
+   * Default: none. The controllers are still marked `Can.Anyone()` for `@nestjs/authorization`,
+   * whose global guard otherwise refuses every route that declares no `@Can()`, so adopting it does
+   * not lock the console. A `@Can()` passed here is still enforced. With `dashboardAuth`'s login
+   * page (Mode B), a `@Can()` here also covers `/login`, so its ability must admit guests there.
+   */
+  decorators?: ClassDecorator[];
 }
 
 /**
@@ -180,6 +206,11 @@ export interface DurableDashboardAsyncOptions {
   allowUnauthenticated?: boolean;
   /** See {@link DurableDashboardOptions.token}. */
   token?: string;
+  /**
+   * See {@link DurableDashboardOptions.decorators}. Static, like the paths and `guards`: decorators
+   * shape the routes before any factory runs.
+   */
+  decorators?: ClassDecorator[];
 }
 
 /** Leading slash, no trailing slash. */
@@ -229,6 +260,8 @@ export class DurableApiModule {
     gate: DashboardGateOptions;
     /** Whether `DurableDashboardGateGuard` is stamped (false when guards/dashboardAuth are static). */
     stampGate: boolean;
+    /** See {@link DurableDashboardOptions.decorators}. */
+    decorators?: ClassDecorator[];
   }): DynamicModule {
     stampGuards(
       options.guards,
@@ -241,7 +274,7 @@ export class DurableApiModule {
     return {
       module: DurableApiModule,
       imports: [...(options.imports ?? [])],
-      controllers: [DurableApiController],
+      controllers: [controllerFor(DurableApiController, options.decorators, GUARDS_METADATA)],
       providers: [
         DashboardService,
         // `@dudousxd/nestjs-filter` is wired PRIVATELY here rather than through
@@ -326,6 +359,7 @@ export class DurableDashboardModule {
       imports?: DynamicModule['imports'];
       allowUnauthenticated?: boolean;
       token?: string;
+      decorators?: ClassDecorator[];
     },
     authProvider: Provider,
     authMayBeConfigured: boolean,
@@ -368,6 +402,7 @@ export class DurableDashboardModule {
           authMayBeConfigured,
           gate,
           stampGate,
+          ...(options.decorators ? { decorators: options.decorators } : {}),
         }),
         RouterModule.register([
           { path: basePath, module: DurableDashboardModule }, // the UI + auth controllers below
@@ -375,11 +410,13 @@ export class DurableDashboardModule {
         ]),
       ],
       controllers: [
-        DurableUiController,
+        controllerFor(DurableUiController, options.decorators, GUARDS_METADATA),
         // The auth controller (login page + logout) only exists when dashboardAuth might be
         // configured — mounting it unconditionally would add a new `/login` route even for hosts
         // that never set `dashboardAuth`, breaking "absent -> today's behavior byte-for-byte".
-        ...(authMayBeConfigured ? [DurableAuthController] : []),
+        ...(authMayBeConfigured
+          ? [controllerFor(DurableAuthController, options.decorators, GUARDS_METADATA)]
+          : []),
       ],
       providers: [
         { provide: DASHBOARD_BASE_PATH, useValue: basePath },
