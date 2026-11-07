@@ -699,7 +699,7 @@ Three views of the same engine lifecycle events, for different jobs:
   accept a cookie, since the SPA shell loads by browser navigation), or `dashboardAuth` (the built-in
   signed session cookie, minted by your host's auth or a built-in login page), or both. A mount behind
   an authenticating proxy is the third option: fold `basePath` into a prefix your proxy rules already
-  cover. See [Console auth](/docs/observability/dashboard#console-auth).
+  cover. See [Protecting the console](/docs/observability/dashboard#protecting-the-console).
 - **OpenTelemetry** (`@dudousxd/nestjs-durable-otel`) turns runs into traces — one root span per run,
   one child span per step — for the tracing stack you already run. `attachDurableOtel(engine)` is
   aimed at debugging production latency and correlation, not at operating a run. Note that the root

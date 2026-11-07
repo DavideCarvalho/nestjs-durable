@@ -45,7 +45,9 @@ import { RunFilter } from './run.filter.js';
 const GUARDS_METADATA = '__guards__';
 
 // Every controller this module mounts is open to `@nestjs/authorization`'s global guard, which
-// denies by default: the dashboard's own options decide who reaches it (see `decorators`).
+// denies by default: the dashboard's own options decide who reaches it (see `decorators`). The
+// `*Base` classes a host extends for `routes: false` are NOT marked, so the official guard's
+// deny-by-default applies to a self-mounted console until it declares a `@Can()`.
 markOpenToAuthorization(DurableApiController);
 markOpenToAuthorization(DurableUiController);
 markOpenToAuthorization(DurableAuthController);
@@ -144,10 +146,11 @@ export interface DurableDashboardOptions {
    * something outside the module already protects it: a global guard, a reverse proxy / SSO in
    * front of the mount, a private network. Logs a boot warning.
    *
-   * Without it, an unconfigured console (no `guards`, no `dashboardAuth`, no token) is DENIED when
+   * Without it, an unconfigured console (no `guards`, no `decorators`, no `dashboardAuth`, no token)
+   * is DENIED when
    * `NODE_ENV=production` (every UI and API request answers `403`, and one boot error explains how
    * to configure it). Outside production it is still served open, with a boot warning. Ignored when
-   * `guards`, `dashboardAuth` or a token is configured.
+   * `guards`, `decorators`, `dashboardAuth` or a token is configured.
    */
   allowUnauthenticated?: boolean;
   /**
@@ -169,9 +172,12 @@ export interface DurableDashboardOptions {
    *
    * Each registration gets fresh subclasses of the controllers, so decorators never leak into
    * another registration or onto the exported classes. A `UseGuards(...)` here runs AFTER the
-   * dashboard's own guards (`dashboardAuth`'s session check, the fail-closed gate, `guards`).
-   * Decorators do not count as authentication for the fail-closed gate: if they ARE your
-   * protection, say so with `allowUnauthenticated: true` (or use `guards`).
+   * dashboard's own guards (`dashboardAuth`'s session check, `guards`).
+   *
+   * A non-empty `decorators` counts as the deployment stating its protection, exactly like a
+   * non-empty `guards`: the fail-closed production gate steps aside. The module cannot tell a
+   * `Can(...)` from a decorator that protects nothing, so passing one is your statement that the
+   * console is protected.
    *
    * Default: none. The controllers are still marked `Can.Anyone()` for `@nestjs/authorization`,
    * whose global guard otherwise refuses every route that declares no `@Can()`, so adopting it does
@@ -179,6 +185,35 @@ export interface DurableDashboardOptions {
    * page (Mode B), a `@Can()` here also covers `/login`, so its ability must admit guests there.
    */
   decorators?: ClassDecorator[];
+  /**
+   * `false` mounts NO controllers: the SPA, its JSON API and the login routes are not registered,
+   * while every provider still is (the run read/action service, the run filter, the SPA's base
+   * paths). Serve the console from controllers of your own instead, protected with ordinary Nest
+   * decorators, by extending {@link DurableUiControllerBase} and {@link DurableApiControllerBase}:
+   *
+   * ```ts
+   * @Controller('ops/durable') @UseGuards(AuthenticationGuard) @Can(ConsolePolicy, 'view')
+   * class ConsoleUi extends DurableUiControllerBase {}
+   * @Controller('ops/durable/api') @UseGuards(AuthenticationGuard) @Can(ConsolePolicy, 'view')
+   * class ConsoleApi extends DurableApiControllerBase {}
+   * // in the module that declares them:
+   * imports: [DurableDashboardModule.forRoot({ routes: false, basePath: '/ops/durable', apiBasePath: '/ops/durable/api' })]
+   * ```
+   *
+   * `basePath`/`apiBasePath` still matter here: they are where you mounted the two controllers, and
+   * the SPA is told to load its assets from `basePath` and fetch from `apiBasePath`.
+   *
+   * The fail-closed gate does not apply: this module mounts nothing for it to refuse, and the routes
+   * are yours, protected by what you put on them like any other route you write. The `*Base`
+   * classes carry no guards and no `Can.Anyone()` mark, so under `@nestjs/authorization`'s global
+   * guard a subclass without a `@Can()` is denied. The options that only protect mounted routes
+   * (`guards`, `decorators`, `dashboardAuth`, `token`, `allowUnauthenticated`) throw at boot when
+   * combined with `routes: false` rather than being silently ignored.
+   *
+   * Default `true`. Named `routes` rather than `path: false` because `basePath`/`apiBasePath` are
+   * strings that keep their meaning (where the console lives) whether or not this module mounts it.
+   */
+  routes?: boolean;
 }
 
 /**
@@ -211,6 +246,27 @@ export interface DurableDashboardAsyncOptions {
    * shape the routes before any factory runs.
    */
   decorators?: ClassDecorator[];
+}
+
+/**
+ * `routes: false` mounts nothing, so an option that only protects mounted routes would protect
+ * nothing. Refuse it at boot instead of ignoring it: a deployment that wrote `guards: [...]` must not
+ * believe its self-mounted console is guarded by them.
+ */
+function assertNothingToProtect(options: DurableDashboardOptions): void {
+  const stray = (
+    ['guards', 'decorators', 'dashboardAuth', 'token', 'allowUnauthenticated'] as const
+  ).filter((key) => options[key] !== undefined);
+  if (stray.length === 0) return;
+  const named = stray.map((key) => `\`${key}\``).join(', ');
+  throw new Error(
+    [
+      `DurableDashboardModule.forRoot({ routes: false }) mounts no controllers, so ${named}`,
+      'would protect nothing. Put your protection on the controllers you mount (extend',
+      'DurableUiControllerBase / DurableApiControllerBase and decorate them with @UseGuards /',
+      '@Can), and drop these options.',
+    ].join(' '),
+  );
 }
 
 /** Leading slash, no trailing slash. */
@@ -260,21 +316,28 @@ export class DurableApiModule {
     gate: DashboardGateOptions;
     /** Whether `DurableDashboardGateGuard` is stamped (false when guards/dashboardAuth are static). */
     stampGate: boolean;
+    /** `false`: register the providers only, no controller and no gate (see `routes`). */
+    routes?: boolean;
     /** See {@link DurableDashboardOptions.decorators}. */
     decorators?: ClassDecorator[];
   }): DynamicModule {
-    stampGuards(
-      options.guards,
-      [
-        options.authMayBeConfigured ? DurableApiSessionGuard : undefined,
-        options.stampGate ? DurableDashboardGateGuard : undefined,
-      ],
-      DurableApiController,
-    );
+    const routes = options.routes !== false;
+    if (routes) {
+      stampGuards(
+        options.guards,
+        [
+          options.authMayBeConfigured ? DurableApiSessionGuard : undefined,
+          options.stampGate ? DurableDashboardGateGuard : undefined,
+        ],
+        DurableApiController,
+      );
+    }
     return {
       module: DurableApiModule,
       imports: [...(options.imports ?? [])],
-      controllers: [controllerFor(DurableApiController, options.decorators, GUARDS_METADATA)],
+      controllers: routes
+        ? [controllerFor(DurableApiController, options.decorators, GUARDS_METADATA)]
+        : [],
       providers: [
         DashboardService,
         // `@dudousxd/nestjs-filter` is wired PRIVATELY here rather than through
@@ -303,14 +366,22 @@ export class DurableApiModule {
         { provide: RUN_QUERY_ADAPTER, useExisting: RunQueryAdapter },
         RunFilter,
         options.authProvider,
-        DurableApiSessionGuard,
-        // Resolved ONCE here (this module is imported by the UI module, which reuses it via the
-        // export below), so the boot report is logged once per mount.
-        dashboardGateProvider(options.gate),
-        DurableDashboardGateGuard,
-        ...(options.guards ?? []),
+        ...(routes
+          ? [
+              DurableApiSessionGuard,
+              // Resolved ONCE here (this module is imported by the UI module, which reuses it via
+              // the export below), so the boot report is logged once per mount.
+              dashboardGateProvider(options.gate),
+              DurableDashboardGateGuard,
+              ...(options.guards ?? []),
+            ]
+          : []),
       ],
-      exports: [DashboardService, DASHBOARD_GATE],
+      // Self-mounted (`routes: false`): the host's own subclass of `DurableApiControllerBase` is
+      // hosted in the HOST's module, so what its constructor injects must be exported. `FilterRunner`
+      // is only exported then: exporting it from a mounted console would shadow a host's own
+      // `FilterModule` runner in whatever module imports the dashboard.
+      exports: routes ? [DashboardService, DASHBOARD_GATE] : [DashboardService, FilterRunner],
     };
   }
 }
@@ -322,12 +393,15 @@ export class DurableApiModule {
  * so it resolves the engine and store. Front the routes with the first-class `guards` option
  * (plus `imports` for the guards' own dependencies) — see {@link DurableDashboardOptions.guards} —
  * or with the built-in `dashboardAuth` cookie login, or both.
- * With none of those (and no `token` / `allowUnauthenticated`), the console fails closed when
- * `NODE_ENV=production` — see {@link DurableDashboardOptions.allowUnauthenticated}.
+ * With none of those (and no `decorators` / `token` / `allowUnauthenticated`), the console fails
+ * closed when `NODE_ENV=production` — see {@link DurableDashboardOptions.allowUnauthenticated}.
+ * `routes: false` mounts nothing and leaves serving the console to the host's own controllers — see
+ * {@link DurableDashboardOptions.routes}.
  */
 @Module({})
 export class DurableDashboardModule {
   static forRoot(options: DurableDashboardOptions = {}): DynamicModule {
+    if (options.routes === false) assertNothingToProtect(options);
     const authProvider: Provider = {
       provide: DASHBOARD_AUTH,
       useValue: resolveDashboardAuth(options.dashboardAuth),
@@ -360,6 +434,7 @@ export class DurableDashboardModule {
       allowUnauthenticated?: boolean;
       token?: string;
       decorators?: ClassDecorator[];
+      routes?: boolean;
     },
     authProvider: Provider,
     authMayBeConfigured: boolean,
@@ -367,27 +442,56 @@ export class DurableDashboardModule {
   ): DynamicModule {
     const basePath = normalize(options.basePath ?? '/durable');
     const apiBasePath = normalize(options.apiBasePath ?? `${basePath}/api`);
+    const routes = options.routes !== false;
     const hasGuards = (options.guards?.length ?? 0) > 0;
+    const hasDecorators = (options.decorators?.length ?? 0) > 0;
     const gate: DashboardGateOptions = {
       hasGuards,
+      hasDecorators,
       ...(options.allowUnauthenticated !== undefined
         ? { allowUnauthenticated: options.allowUnauthenticated }
         : {}),
       ...(options.token !== undefined ? { token: options.token } : {}),
     };
-    // The gate is only stamped when the module can't already prove the console is protected:
-    // non-empty `guards` or a static `dashboardAuth` ARE the protection, so stamping a pass-through
-    // guard would be noise. Everything else (no auth, or `forRootAsync`'s runtime-resolved auth)
-    // gets the gate, which decides at boot.
-    const stampGate = !hasGuards && !authStaticallyConfigured;
-    stampGuards(
-      options.guards,
-      [
-        authMayBeConfigured ? DurableUiSessionGuard : undefined,
-        stampGate ? DurableDashboardGateGuard : undefined,
-      ],
-      DurableUiController,
-    );
+    // The gate is only stamped when the deployment hasn't stated how the console is protected:
+    // non-empty `guards`, non-empty `decorators` or a static `dashboardAuth` ARE that statement, so
+    // stamping a pass-through guard would be noise. Everything else (no auth, or `forRootAsync`'s
+    // runtime-resolved auth) gets the gate, which decides at boot.
+    const stampGate = !hasGuards && !hasDecorators && !authStaticallyConfigured;
+    if (routes) {
+      stampGuards(
+        options.guards,
+        [
+          authMayBeConfigured ? DurableUiSessionGuard : undefined,
+          stampGate ? DurableDashboardGateGuard : undefined,
+        ],
+        DurableUiController,
+      );
+    }
+    const pathProviders: Provider[] = [
+      { provide: DASHBOARD_BASE_PATH, useValue: basePath },
+      { provide: DASHBOARD_API_PATH, useValue: apiBasePath },
+    ];
+    if (!routes) {
+      const api = DurableApiModule.register({
+        ...(options.imports ? { imports: options.imports } : {}),
+        authProvider,
+        authMayBeConfigured: false,
+        gate,
+        stampGate: false,
+        routes: false,
+      });
+      return {
+        module: DurableDashboardModule,
+        imports: [...(options.imports ?? []), api],
+        controllers: [],
+        providers: [...pathProviders, authProvider],
+        // What a host's subclasses of `DurableUiControllerBase` / `DurableApiControllerBase` inject
+        // (the SPA's paths; the read/action service and the filter runner via the API module), plus
+        // `DASHBOARD_AUTH` (always `null` here) for the UI base's inert session-required filter.
+        exports: [DurableApiModule, DASHBOARD_BASE_PATH, DASHBOARD_API_PATH, DASHBOARD_AUTH],
+      };
+    }
     return {
       module: DurableDashboardModule,
       imports: [
@@ -419,8 +523,7 @@ export class DurableDashboardModule {
           : []),
       ],
       providers: [
-        { provide: DASHBOARD_BASE_PATH, useValue: basePath },
-        { provide: DASHBOARD_API_PATH, useValue: apiBasePath },
+        ...pathProviders,
         authProvider,
         DurableUiSessionGuard,
         // `DASHBOARD_GATE` itself comes from the imported DurableApiModule (resolved once there).

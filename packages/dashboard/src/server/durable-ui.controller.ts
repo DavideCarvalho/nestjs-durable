@@ -39,8 +39,14 @@ const CONTENT_TYPES: Record<string, string> = {
 
 /**
  * Serves the bundled control-plane SPA at the configured base (+ hashed assets at `<base>/assets`).
- * The path comes from `RouterModule` (set by `DurableDashboardModule.forRoot({ basePath })`), so the
- * controller routes are relative.
+ * The controller routes are relative: the mounted {@link DurableUiController} gets its path from
+ * `RouterModule` (set by `DurableDashboardModule.forRoot({ basePath })`).
+ *
+ * This base is what a host EXTENDS to serve the console from a controller of its own (with
+ * `forRoot({ routes: false, basePath })`): `@Controller('<basePath>') class MyConsole extends
+ * DurableUiControllerBase {}`, protected with the host's own decorators. It carries no guards and
+ * no `@nestjs/authorization` mark, so a subclass is protected only by what the host puts on it (and,
+ * under `AuthorizationModule`'s global guard, is denied until it declares a `@Can()`).
  *
  * `@UseFilters(DashboardLoginRedirectFilter, DashboardSessionRequiredFilter)` is permanent (present
  * regardless of whether `dashboardAuth` is configured): each only ever activates for its own
@@ -52,7 +58,7 @@ const CONTENT_TYPES: Record<string, string> = {
  */
 @UseFilters(DashboardLoginRedirectFilter, DashboardSessionRequiredFilter)
 @Controller()
-export class DurableUiController {
+export class DurableUiControllerBase {
   private readonly dir = spaDir();
 
   constructor(
@@ -95,3 +101,11 @@ export class DurableUiController {
     return new StreamableFile(readFileSync(assetPath), { type });
   }
 }
+
+/**
+ * The SPA controller `DurableDashboardModule.forRoot(...)` mounts at `basePath`. The module stamps
+ * its guards and the `@nestjs/authorization` open mark on THIS class, never on
+ * {@link DurableUiControllerBase}, so a host's own subclass of the base inherits none of them.
+ */
+@Controller()
+export class DurableUiController extends DurableUiControllerBase {}

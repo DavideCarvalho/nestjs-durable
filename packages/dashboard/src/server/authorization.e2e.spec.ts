@@ -2,22 +2,25 @@ import 'reflect-metadata';
 import { AuthorizationModule, Can, Policy } from '@nestjs/authorization';
 import {
   type CanActivate,
+  Controller,
   type DynamicModule,
   Global,
   Injectable,
   Module,
+  type Type,
   UseGuards,
 } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants.js';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CAN_ANYONE_METADATA } from './controller-decorators.js';
-import { DurableApiController } from './durable-api.controller.js';
+import { DashboardService } from './dashboard.service.js';
+import { DurableApiController, DurableApiControllerBase } from './durable-api.controller.js';
 import { DurableAuthController } from './durable-auth.controller.js';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
-import { DurableUiController } from './durable-ui.controller.js';
+import { DurableUiController, DurableUiControllerBase } from './durable-ui.controller.js';
 import { RUN_GATEWAY } from './tokens.js';
 
 /**
@@ -38,7 +41,9 @@ class ConsolePolicy {
 
 @Injectable()
 class MarkerGuard implements CanActivate {
+  static calls = 0;
   canActivate(): boolean {
+    MarkerGuard.calls += 1;
     return true;
   }
 }
@@ -61,10 +66,14 @@ class HostGatewayModule {}
 
 let app: NestExpressApplication | undefined;
 
-async function boot(dashboard: DynamicModule): Promise<NestExpressApplication> {
+async function boot(
+  dashboard: DynamicModule,
+  controllers: Type[] = [],
+): Promise<NestExpressApplication> {
   @Module({
     imports: [HostGatewayModule, AuthorizationModule.forRoot(), dashboard],
-    providers: [ConsolePolicy],
+    controllers,
+    providers: [ConsolePolicy, MarkerGuard],
   })
   class HostRootModule {}
 
@@ -218,12 +227,159 @@ describe('the console behind AuthorizationModule.forRoot() (global guard, deny b
   });
 
   it('keeps the dashboard guards first, then a `UseGuards()` from `decorators`', () => {
-    const dynamic = DurableDashboardModule.forRoot({ decorators: [UseGuards(MarkerGuard)] });
+    const dynamic = DurableDashboardModule.forRoot({
+      dashboardAuth: { secret: 'test-secret', session: () => null },
+      decorators: [UseGuards(MarkerGuard)],
+    });
     const [ui] = dynamic.controllers ?? [];
     expect(ui).not.toBe(DurableUiController);
     expect(ui?.name).toBe('DurableUiController');
     const guards = Reflect.getMetadata(GUARDS_METADATA, ui as object) as unknown[];
     expect(guards.at(-1)).toBe(MarkerGuard);
-    expect(guards.length).toBeGreaterThan(1); // the fail-closed gate, ahead of it
+    expect(guards.length).toBeGreaterThan(1); // the dashboardAuth session guard, ahead of it
+  });
+});
+
+describe('the fail-closed production gate and `decorators`', () => {
+  let savedNodeEnv: string | undefined;
+  beforeEach(() => {
+    savedNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+  });
+  afterEach(() => {
+    if (savedNodeEnv === undefined) Reflect.deleteProperty(process.env, 'NODE_ENV');
+    else process.env.NODE_ENV = savedNodeEnv;
+  });
+
+  it('counts a non-empty `decorators` as the stated protection: no allowUnauthenticated needed', async () => {
+    const server = (
+      await boot(
+        DurableDashboardModule.forRoot({
+          decorators: [UseGuards(MarkerGuard), Can(ConsolePolicy, 'view')],
+        }),
+      )
+    ).getHttpServer();
+
+    expect((await request(server).get('/durable/api/runs')).status).toBe(401); // guest
+    expect((await request(server).get('/durable/api/runs').set('x-role', 'viewer')).status).toBe(
+      403,
+    );
+    const allowed = await request(server).get('/durable/api/runs').set('x-role', 'admin');
+    expect(allowed.status).toBe(200); // not the gate's production 403
+    expect(allowed.body).toEqual([]);
+  });
+
+  it('still denies an unconfigured console, and an empty `decorators` is not protection', async () => {
+    for (const options of [{}, { decorators: [] }]) {
+      const server = (await boot(DurableDashboardModule.forRoot(options))).getHttpServer();
+      const denied = await request(server).get('/durable/api/runs').set('x-role', 'admin');
+      expect(denied.status).toBe(403);
+      expect(denied.body.message).toContain('NODE_ENV=production');
+      await app?.close();
+      app = undefined;
+    }
+  });
+});
+
+// The developer's own controllers, serving the console with the official tools: the dashboard
+// mounts nothing (`routes: false`), these extend its pristine bases at the paths it was told about.
+@Controller('ops/durable')
+@UseGuards(MarkerGuard)
+@Can(ConsolePolicy, 'view')
+class OpsConsoleUi extends DurableUiControllerBase {}
+
+@Controller('ops/durable/api')
+@UseGuards(MarkerGuard)
+@Can(ConsolePolicy, 'view')
+class OpsConsoleApi extends DurableApiControllerBase {}
+
+// A self-mounted API that forgot its `@Can()`.
+@Controller('forgot/api')
+class ForgotCanApi extends DurableApiControllerBase {}
+
+const selfMounted = () =>
+  DurableDashboardModule.forRoot({
+    routes: false,
+    basePath: '/ops/durable',
+    apiBasePath: '/ops/durable/api',
+  });
+
+describe('`routes: false`: the console mounted by the developer', () => {
+  let savedNodeEnv: string | undefined;
+  beforeEach(() => {
+    savedNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    MarkerGuard.calls = 0;
+  });
+  afterEach(() => {
+    if (savedNodeEnv === undefined) Reflect.deleteProperty(process.env, 'NODE_ENV');
+    else process.env.NODE_ENV = savedNodeEnv;
+  });
+
+  it('mounts no controllers, while the services still resolve', async () => {
+    const dynamic = selfMounted();
+    expect(dynamic.controllers).toEqual([]);
+    const booted = await boot(dynamic);
+    const server = booted.getHttpServer();
+    expect((await request(server).get('/durable/api/runs')).status).toBe(404);
+    expect((await request(server).get('/durable')).status).toBe(404);
+    expect((await request(server).get('/durable/login')).status).toBe(404);
+    const service = booted.get(DashboardService, { strict: false });
+    expect(await service.listRuns({})).toEqual([]);
+  });
+
+  it('serves the routes from `@Can()`-protected subclasses: guest 401, denied 403, allowed 200', async () => {
+    const server = (await boot(selfMounted(), [OpsConsoleUi, OpsConsoleApi])).getHttpServer();
+
+    expect((await request(server).get('/ops/durable/api/runs')).status).toBe(401);
+    expect((await request(server).get('/ops/durable/assets/x.js')).status).toBe(401);
+    expect(
+      (await request(server).get('/ops/durable/api/runs').set('x-role', 'viewer')).status,
+    ).toBe(403);
+    expect(
+      (await request(server).get('/ops/durable/assets/x.js').set('x-role', 'viewer')).status,
+    ).toBe(403);
+
+    // Allowed: the inherited handlers run (with the inherited filter interceptor, DI and the
+    // production NODE_ENV, which does not gate a self-mounted console).
+    const runs = await request(server).get('/ops/durable/api/runs').set('x-role', 'admin');
+    expect(runs.status).toBe(200);
+    expect(runs.body).toEqual([]);
+    const facets = await request(server).get('/ops/durable/api/runs/facets').set('x-role', 'admin');
+    expect(facets.status).toBe(200);
+    // The UI handler is reached (an unknown asset 404s in the handler, not in a guard).
+    expect(
+      (await request(server).get('/ops/durable/assets/x.js').set('x-role', 'admin')).status,
+    ).toBe(404);
+    // The subclass's own `@UseGuards()` ran.
+    expect(MarkerGuard.calls).toBeGreaterThan(0);
+  });
+
+  it('a self-mounted route with no `@Can()` falls under the global guard and is denied', async () => {
+    const server = (await boot(selfMounted(), [ForgotCanApi])).getHttpServer();
+    expect((await request(server).get('/forgot/api/runs').set('x-role', 'admin')).status).toBe(403);
+  });
+
+  it('the bases carry no guards and no open mark, whatever was mounted before', () => {
+    DurableDashboardModule.forRoot({ guards: [MarkerGuard] });
+    for (const base of [DurableUiControllerBase, DurableApiControllerBase]) {
+      expect(Reflect.getMetadata(CAN_ANYONE_METADATA, base)).toBeUndefined();
+      expect(Reflect.getMetadata(GUARDS_METADATA, base)).toBeUndefined();
+    }
+    expect(Reflect.getMetadata(GUARDS_METADATA, OpsConsoleApi)).toEqual([MarkerGuard]);
+  });
+
+  it('refuses the options that only protect mounted routes', () => {
+    for (const stray of [
+      { guards: [MarkerGuard] },
+      { decorators: [Can(ConsolePolicy, 'view')] },
+      { dashboardAuth: { secret: 's', session: () => null } },
+      { token: 't' },
+      { allowUnauthenticated: true },
+    ]) {
+      expect(() => DurableDashboardModule.forRoot({ routes: false, ...stray })).toThrow(
+        /routes: false.*would protect nothing/,
+      );
+    }
   });
 });

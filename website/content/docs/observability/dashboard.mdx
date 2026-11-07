@@ -26,7 +26,7 @@ export class AppModule {}
 ```
 
 `DurableModule` is global, so the dashboard resolves the engine and store automatically. Configure
-[console auth](#console-auth) before you ship: an unauthenticated console is **denied in
+[console protection](#protecting-the-console) before you ship: an unauthenticated console is **denied in
 production** (see [Authentication defaults](#authentication-defaults)).
 
 ### Where it mounts
@@ -64,10 +64,146 @@ due timers. Leave that to the driving pods. So a **retry clicked in the UI on an
 works**: the API dispatches the step, a driving pod picks it up and runs it. Only the processing is
 gated, not the control plane. (Default is `drive: true`, so single-process apps need nothing.)
 
-## Console auth
+## Protecting the console
 
-Ways to gate the console (the SPA at `basePath` and its JSON API at `apiBasePath`), from least to
-most work — pick one, or compose `guards` with `dashboardAuth`:
+The console (the SPA at `basePath` and its JSON API at `apiBasePath`) can retry, cancel and replay
+runs, so it needs protecting before you ship. In order of preference:
+
+1. **[Mount it yourself](#mount-it-yourself--routes-false)** with `routes: false`, and protect your
+   own controllers with the official tools (`@nestjs/authentication`, `@nestjs/authorization`,
+   `@UseGuards`), like any other route you write. This is how most first-party NestJS packages work:
+   they export the handling and you write the controller.
+2. **[`decorators`](#decorators--protect-the-mounted-controllers)**: let the module mount the console
+   and hand it the decorators you would have written, the way `@nestjs/mcp`'s `decorators` option
+   works.
+3. **[Compatibility options](#compatibility-options)**: `guards`, the built-in `dashboardAuth`
+   session cookie and login page, a `token`, or `allowUnauthenticated`. They keep working and are
+   documented below, but new apps should prefer 1 or 2.
+
+Configure nothing and the console is served open outside production but **denied in production**:
+see [Authentication defaults](#authentication-defaults).
+
+### Mount it yourself — `routes: false`
+
+`routes: false` registers every provider (the run read/action service, the run filter, the SPA's
+paths) but mounts **no controllers**. Serve the console from your own controllers by extending the
+two exported bases, `DurableUiControllerBase` (the SPA shell and its assets) and
+`DurableApiControllerBase` (the JSON API the SPA fetches). The subclasses inherit every route,
+filter, interceptor and constructor dependency; you choose the path and the protection:
+
+```ts
+import { AuthenticationGuard } from '@nestjs/authentication';
+import { Can, Policy } from '@nestjs/authorization';
+import { Controller, Module, UseGuards } from '@nestjs/common';
+import {
+  DurableApiControllerBase,
+  DurableDashboardModule,
+  DurableUiControllerBase,
+} from '@dudousxd/nestjs-durable-dashboard';
+
+@Policy()
+export class ConsolePolicy {
+  view(user: User | null) {
+    return user?.roles.includes('ops') ?? false;
+  }
+}
+
+@Controller('ops/durable')
+@UseGuards(AuthenticationGuard)
+@Can(ConsolePolicy, 'view')
+export class ConsoleUiController extends DurableUiControllerBase {}
+
+@Controller('ops/durable/api')
+@UseGuards(AuthenticationGuard)
+@Can(ConsolePolicy, 'view')
+export class ConsoleApiController extends DurableApiControllerBase {}
+
+@Module({
+  imports: [
+    DurableDashboardModule.forRoot({
+      routes: false,
+      // Where YOU mounted them: the SPA loads its assets from `basePath` and fetches `apiBasePath`.
+      basePath: '/ops/durable',
+      apiBasePath: '/ops/durable/api',
+    }),
+  ],
+  controllers: [ConsoleUiController, ConsoleApiController],
+  providers: [ConsolePolicy],
+})
+export class OpsConsoleModule {}
+```
+
+With `AuthorizationModule.forRoot()`'s global guard, a guest gets `401`, a user the policy refuses
+`403`, and an `ops` user the console.
+
+How it behaves:
+
+- **The fail-closed gate does not apply.** The module mounts nothing for it to refuse. The routes
+  are yours, protected by what you put on them, in production as anywhere else.
+- **The bases are bare.** They carry no guards and no `Can.Anyone()` mark (only the controllers the
+  module mounts get those), so a subclass without a `@Can()` is **denied** by
+  `@nestjs/authorization`'s deny-by-default global guard instead of being silently open.
+- **Mounting options are refused.** `guards`, `decorators`, `dashboardAuth`, `token` and
+  `allowUnauthenticated` only protect routes the module mounts, so combining any of them with
+  `routes: false` throws at boot instead of being ignored.
+- **A module of their own.** In this mode the module exports what the bases inject
+  (`DashboardService`, its private `FilterRunner`, the two path tokens). Declare the console
+  controllers in their own module, as above, not next to controllers that use your app's own
+  `@dudousxd/nestjs-filter` setup.
+- `forRootAsync` has no `routes` option: it exists to build `dashboardAuth` from DI, which does not
+  apply to a console you mount yourself.
+
+Why `routes` and not `path: false`: `basePath` and `apiBasePath` are strings that keep their
+meaning (where the console lives) whether or not the module mounts it, so mounting gets its own
+switch.
+
+### `decorators` — protect the mounted controllers
+
+`decorators` takes class decorators and applies them to **every** controller the module mounts: the
+SPA, its JSON API, and the `dashboardAuth` login/logout controller when there is one. It works the
+same way as `@nestjs/mcp`'s `decorators` option. `forRootAsync` takes it as a static, top-level
+option too, because decorators shape the routes before any factory runs:
+
+```ts
+import { AuthenticationGuard } from '@nestjs/authentication';
+import { Can } from '@nestjs/authorization';
+import { UseGuards } from '@nestjs/common';
+
+DurableDashboardModule.forRoot({
+  decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view')],
+});
+```
+
+A guest is then answered `401` and a signed-in user the policy refuses `403`, by the official guard.
+
+**Default (no `decorators`).** `AuthorizationModule.forRoot()` registers a global guard that refuses
+every route declaring no `@Can()`. So that adopting it does not lock the console, every controller
+the module mounts is marked `Can.Anyone()` (the `authorization:can-anyone` metadata). This package
+does not depend on `@nestjs/authorization` to do it. The mark only opens routes that declare no
+requirement: a `Can()` passed through `decorators` is still enforced. Without `decorators`, the
+dashboard's own options (`guards`, `dashboardAuth`, the token, the gate) keep deciding who gets in.
+
+Things to know:
+
+- **Decorators count as the console's protection.** A non-empty `decorators` states how the
+  console is protected, exactly like a non-empty `guards`, so the
+  [fail-closed default](#authentication-defaults) steps aside and production serves it. The module
+  cannot tell a `Can(...)` from a decorator that protects nothing: passing one is your statement.
+  An empty array does not count.
+- **No leaks between registrations.** Each `forRoot`/`forRootAsync` call that passes `decorators`
+  mounts fresh subclasses of the controllers (with the same class names), so its decorators never
+  stick to another registration, to another app in the same process, or to the exported
+  `DurableApiController`/`DurableUiController`/`DurableAuthController`. A consequence:
+  `app.get(DurableApiController)` does not find the mounted instance when `decorators` is set.
+- **Order.** The global `AuthorizationGuard` runs before any controller guard. A `UseGuards(...)`
+  passed here runs after the dashboard's own guards (`dashboardAuth`'s session check, `guards`).
+- **Mode B login page.** A `Can()` here also covers `/login`, `/session` and `/logout`, so with
+  `dashboardAuth`'s login page its ability must admit guests on those routes.
+
+### Compatibility options
+
+These came before the two approaches above and are kept for existing apps. From least to most work,
+pick one, or compose `guards` with `dashboardAuth`:
 
 | | `allowUnauthenticated: true` | `token` / `DURABLE_DASHBOARD_TOKEN` | `guards` | `dashboardAuth` |
 | --- | --- | --- | --- | --- |
@@ -76,18 +212,12 @@ most work — pick one, or compose `guards` with `dashboardAuth`:
 | Fronts the page (SPA shell + assets)? | no | yes, but the bundled SPA never sends the token itself | yes, when set (see below) | yes — a missing/invalid session redirects the page to a login screen (Mode B) or a "sign in through the host app" instruction page (Mode A only) |
 | Best for | a mount already behind SSO/proxy/global guard | scripts, or a reverse proxy that injects the header | hosts that already authenticate the rest of the app and want ONE gate to reuse | Mode A: hosts with their own SSO/OIDC that want the dashboard to ride it. Mode B: standalone hosts with no existing admin auth |
 
-Configure none of them and the console is served open outside production but **denied in
-production** — see [Authentication defaults](#authentication-defaults).
-
-Using the first-party `@nestjs/authorization`? Its global guard does not lock the console out, and
-[`decorators`](#decorators--nestjsauthorization-and-other-class-decorators) puts it behind your own
-policy.
-
 ### Authentication defaults
 
 The console counts as **configured** when any of these is true:
 
 - `guards` is a non-empty array;
+- `decorators` is a non-empty array;
 - `dashboardAuth` is set (for `forRootAsync`: `useDashboardAuth` returned a config, not `undefined`);
 - `allowUnauthenticated: true`;
 - a token is set, through the `token` option or the `DURABLE_DASHBOARD_TOKEN` env var.
@@ -100,7 +230,8 @@ When it is **not** configured, `NODE_ENV` decides (compared case-insensitively):
 | anything else, or unset | Served open, as before. One warning is logged at boot saying the console is unauthenticated and **will** be denied under `NODE_ENV=production`. |
 
 The built-in gate (`DurableDashboardGateGuard`) sits on the UI and API controllers only, after the
-`dashboardAuth` session guard and before your own `guards`. The `dashboardAuth` routes (`/login`,
+`dashboardAuth` session guard and before your own `guards`. It never applies to a console you
+[mount yourself](#mount-it-yourself--routes-false). The `dashboardAuth` routes (`/login`,
 `/session`, `/logout`) are never gated by it, so a sign-in flow keeps working.
 
 #### The token gate
@@ -150,7 +281,9 @@ Earlier versions served an unconfigured console open in every environment. If yo
 mounts `DurableDashboardModule` with no `guards` and no `dashboardAuth`, it now answers `403` after
 the upgrade. Before you deploy, pick one:
 
-1. Already behind a global guard or an authenticating proxy? Add `allowUnauthenticated: true`.
+1. Already behind a global guard or an authenticating proxy? Add `allowUnauthenticated: true`, or
+   better, [mount the console yourself](#mount-it-yourself--routes-false) or pass
+   [`decorators`](#decorators--protect-the-mounted-controllers).
 2. Machine access only? Set `DURABLE_DASHBOARD_TOKEN` (or `token`).
 3. Operators in a browser? Configure [`dashboardAuth`](#dashboardauth--the-built-in-session-cookie)
    or [`guards`](#guards--front-it-with-your-own-auth).
@@ -202,59 +335,6 @@ export class ConsoleAuthGuard implements CanActivate {
   }
 }
 ```
-
-### `decorators` — `@nestjs/authorization` and other class decorators
-
-`decorators` takes class decorators and applies them to **every** controller the module mounts: the
-SPA, its JSON API, and the `dashboardAuth` login/logout controller when there is one. It works the
-same way as `@nestjs/mcp`'s `decorators` option. `forRootAsync` takes it as a static, top-level
-option too, because decorators shape the routes before any factory runs. Use it to put the
-console behind the first-party [`@nestjs/authentication`](https://docs.nestjs.com/security/authentication)
-and [`@nestjs/authorization`](https://docs.nestjs.com/security/authorization):
-
-```ts
-import { AuthenticationGuard } from '@nestjs/authentication';
-import { Can, Policy } from '@nestjs/authorization';
-import { UseGuards } from '@nestjs/common';
-
-@Policy()
-export class ConsolePolicy {
-  view(user: User | null) {
-    return user?.roles.includes('ops') ?? false;
-  }
-}
-
-DurableDashboardModule.forRoot({
-  decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view')],
-  // These decorators ARE the console's protection, so tell the fail-closed gate (below):
-  allowUnauthenticated: true,
-});
-```
-
-A guest is then answered `401` and a signed-in user the policy refuses `403`, by the official guard.
-
-**Default (no `decorators`).** `AuthorizationModule.forRoot()` registers a global guard that refuses
-every route declaring no `@Can()`. So that adopting it does not lock the console, every dashboard
-controller is marked `Can.Anyone()` (the `authorization:can-anyone` metadata). This package does
-not depend on `@nestjs/authorization` to do it. The mark only opens routes that declare no
-requirement: a `Can()` passed through `decorators` is still enforced. Without `decorators`, the
-dashboard's own options (`guards`, `dashboardAuth`, the token, the gate) keep deciding who gets in.
-
-Things to know:
-
-- **No leaks between registrations.** Each `forRoot`/`forRootAsync` call that passes `decorators`
-  mounts fresh subclasses of the controllers (with the same class names), so its decorators never
-  stick to another registration, to another app in the same process, or to the exported
-  `DurableApiController`/`DurableUiController`/`DurableAuthController`. A consequence:
-  `app.get(DurableApiController)` does not find the mounted instance when `decorators` is set.
-- **Order.** The global `AuthorizationGuard` runs before any controller guard. A `UseGuards(...)`
-  passed here runs after the dashboard's own guards (`dashboardAuth`'s session check, the gate,
-  `guards`).
-- **Decorators do not count as authentication** for the
-  [fail-closed default](#authentication-defaults): the module cannot tell what a decorator does. When
-  they are your protection, add `allowUnauthenticated: true`, or put the guard in `guards` instead.
-- **Mode B login page.** A `Can()` here also covers `/login`, `/session` and `/logout`, so with
-  `dashboardAuth`'s login page its ability must admit guests on those routes.
 
 ### `dashboardAuth` — the built-in session cookie
 
@@ -546,7 +626,7 @@ Its default is **every namespace**, and that is a decision rather than an omissi
 dashboard, `getRun`) are deliberately not namespace-scoped, so defaulting the console to one tenant
 would have silently removed runs that every existing operator had been looking at. This is a filter an
 operator chooses, not a scope imposed on them — and it is not an authorization boundary either
-([Console auth](#console-auth) is mount-level and role-agnostic).
+([Console protection](#protecting-the-console) is mount-level and role-agnostic).
 An empty selection is treated as *absent*, not as an exact match on a tenant named `""`, so clearing
 it returns the all-tenants view rather than an empty one. Selecting several compares them side by
 side (`RunQuery.namespaces`). The tenant chip on a run row adds itself to the selection, like the tag

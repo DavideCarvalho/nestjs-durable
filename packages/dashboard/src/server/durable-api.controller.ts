@@ -27,7 +27,13 @@ import type { RunQueryDraft } from './run-query-draft.js';
 import { RunFilter } from './run.filter.js';
 
 /**
- * JSON API consumed by the control-plane SPA. Mounted at `apiBasePath` (set by RouterModule).
+ * JSON API consumed by the control-plane SPA. The mounted {@link DurableApiController} sits at
+ * `apiBasePath` (set by RouterModule).
+ *
+ * This base is what a host EXTENDS to serve the API from a controller of its own (with
+ * `forRoot({ routes: false, apiBasePath })`): `@Controller('<apiBasePath>') class MyConsoleApi
+ * extends DurableApiControllerBase {}`. It carries no guards and no `@nestjs/authorization` mark,
+ * so a subclass is protected only by what the host puts on it.
  *
  * The filter interceptor (what resolves `@ApplyFilter` into a query) is bound HERE rather than as
  * the app-wide `APP_INTERCEPTOR` that `FilterModule.forRoot()` registers: a library must not add a
@@ -37,7 +43,7 @@ import { RunFilter } from './run.filter.js';
 @Controller()
 @UseInterceptors(ApplyFilterInterceptor)
 @UseFilters(NotModifiedFilter)
-export class DurableApiController {
+export class DurableApiControllerBase {
   constructor(
     private readonly dashboard: DashboardService,
     private readonly runner: FilterRunner,
@@ -345,3 +351,11 @@ function notSupportedByServer(error: unknown): never {
   }
   throw error;
 }
+
+/**
+ * The JSON API controller `DurableDashboardModule.forRoot(...)` mounts at `apiBasePath`. The module
+ * stamps its guards and the `@nestjs/authorization` open mark on THIS class, never on
+ * {@link DurableApiControllerBase}, so a host's own subclass of the base inherits none of them.
+ */
+@Controller()
+export class DurableApiController extends DurableApiControllerBase {}

@@ -25,6 +25,8 @@ export const DASHBOARD_GATE = Symbol('DASHBOARD_GATE');
 export interface DashboardGateOptions {
   /** Host `guards` were passed (non-empty). */
   hasGuards: boolean;
+  /** Controller `decorators` were passed (non-empty): the deployment stated its protection. */
+  hasDecorators?: boolean;
   /** `allowUnauthenticated` as passed. */
   allowUnauthenticated?: boolean;
   /** `token` as passed (else `DURABLE_DASHBOARD_TOKEN` is read at boot). */
@@ -34,7 +36,8 @@ export interface DashboardGateOptions {
 /**
  * How the gate treats every console request:
  *
- * - `delegated`: `guards` or `dashboardAuth` protect the console; the gate passes everything.
+ * - `delegated`: `guards`, `decorators` or `dashboardAuth` protect the console; the gate passes
+ *   everything.
  * - `open`: `allowUnauthenticated: true`; the gate passes everything (warned at boot).
  * - `token`: a request must carry the token (`Authorization: Bearer`, `x-durable-token`, or
  *   `?token=` on GET/HEAD).
@@ -53,7 +56,9 @@ export interface DashboardGate {
 const LOG_CONTEXT = 'DurableDashboard';
 
 const HOW_TO_CONFIGURE = [
-  'Configure one of: `guards: [YourAuthGuard]`, `dashboardAuth: { secret, session | login }`',
+  'Configure one of: `decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, ...)]`,',
+  '`routes: false` with controllers of your own, `guards: [YourAuthGuard]`,',
+  '`dashboardAuth: { secret, session | login }`',
   '(or `useDashboardAuth` in forRootAsync), a bearer token via the `token` option or the',
   `${DURABLE_DASHBOARD_TOKEN_ENV} env var, or \`allowUnauthenticated: true\` when the console is`,
   'already protected outside this module (a global guard, a reverse proxy, a private network).',
@@ -64,7 +69,7 @@ function isProduction(): boolean {
 }
 
 /**
- * Decide the gate mode. Precedence: `guards`/`dashboardAuth` (they are the gate) > a token > the
+ * Decide the gate mode. Precedence: `guards`/`decorators`/`dashboardAuth` (they are the gate) > a token > the
  * `allowUnauthenticated` opt-out > the environment default. A token beats `allowUnauthenticated`
  * because a configured secret is never silently ignored.
  */
@@ -72,7 +77,9 @@ export function resolveDashboardGate(
   options: DashboardGateOptions,
   auth: ResolvedDashboardAuth | null,
 ): DashboardGate {
-  if (options.hasGuards || auth !== null) return { mode: 'delegated' };
+  if (options.hasGuards || options.hasDecorators === true || auth !== null) {
+    return { mode: 'delegated' };
+  }
   const token = options.token ?? process.env[DURABLE_DASHBOARD_TOKEN_ENV];
   if (typeof token === 'string' && token !== '') return { mode: 'token', token };
   if (options.allowUnauthenticated === true) return { mode: 'open' };
@@ -104,7 +111,7 @@ export function reportDashboardGate(
     case 'unconfigured':
       logger.warn(
         [
-          'The durable console is UNAUTHENTICATED: no guards, dashboardAuth, token or',
+          'The durable console is UNAUTHENTICATED: no guards, decorators, dashboardAuth, token or',
           'allowUnauthenticated were configured. It is served open because NODE_ENV is not',
           '"production", but it WILL deny every request when NODE_ENV=production.',
           HOW_TO_CONFIGURE,
