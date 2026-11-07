@@ -751,6 +751,45 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async claimPendingRuns(
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    // One statement: pick the oldest free pending rows, skipping any another claimer holds locked
+    // right now, and lease them. Several pollers at once each get a different slice.
+    const filters = and(
+      eq(workflowRuns.status, 'pending'),
+      or(isNull(workflowRuns.lockedUntil), lte(workflowRuns.lockedUntil, new Date(nowMs))),
+      namespaceFilter(namespace),
+      this.scope(),
+    );
+    const returning = sql.join(
+      RUNS.columns.map(([, column]) => sql`r.${sql.identifier(column.name)}`),
+      sql`, `,
+    );
+    const rows = rowsOf<Record<string, unknown>>(
+      await this.db.execute(sql`UPDATE ${workflowRuns} AS r
+        SET ${sql.identifier(getTableColumns(workflowRuns).lockedBy.name)} = ${owner},
+          ${sql.identifier(getTableColumns(workflowRuns).lockedUntil.name)} = ${new Date(leaseUntilMs).toISOString()}::timestamptz
+        FROM (
+          SELECT ${workflowRuns.id} AS claimed_id FROM ${workflowRuns}
+          WHERE ${filters}
+          ORDER BY ${workflowRuns.createdAt}, ${workflowRuns.id}
+          LIMIT ${limit}
+          FOR UPDATE SKIP LOCKED
+        ) AS c
+        WHERE r.${sql.identifier(getTableColumns(workflowRuns).id.name)} = c.claimed_id
+        RETURNING ${returning}`),
+    );
+    return rows
+      .map((raw) => fromRunRow(RUNS.decode(raw)))
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+  }
+
   async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
     const query = this.db
       .select()

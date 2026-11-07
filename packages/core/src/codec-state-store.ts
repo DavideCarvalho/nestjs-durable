@@ -128,6 +128,14 @@ export class CodecStateStore implements StateStore {
   ) => Promise<(StepCheckpoint | null)[]>;
   /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it. */
   readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  /** Decodes each run claimed. Bound only when the inner store has it. */
+  readonly claimPendingRuns?: (
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ) => Promise<WorkflowRun[]>;
   /** Decodes the run read. Bound only when the inner store has it. */
   readonly tryLockRunAndGet?: (
     runId: string,
@@ -279,6 +287,12 @@ export class CodecStateStore implements StateStore {
     const insertIfAbsent = inner.insertCheckpointIfAbsent;
     if (insertIfAbsent)
       this.insertCheckpointIfAbsent = (cp) => insertIfAbsent.call(inner, this.encCp(cp));
+    const claim = inner.claimPendingRuns;
+    if (claim)
+      this.claimPendingRuns = async (limit, owner, leaseUntilMs, nowMs, namespace) =>
+        (await claim.call(inner, limit, owner, leaseUntilMs, nowMs, namespace)).map(
+          (r) => this.decRun(r) as WorkflowRun,
+        );
     const lockAndGet = inner.tryLockRunAndGet;
     if (lockAndGet)
       this.tryLockRunAndGet = async (runId, owner, leaseUntilMs, nowMs) =>

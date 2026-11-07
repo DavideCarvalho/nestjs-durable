@@ -15,14 +15,16 @@ import { writeFileSync } from 'node:fs';
 // size, default 20), BENCH_REPEAT (runs per scenario, median reported, default 3), plus any engine
 // option as JSON in BENCH_ENGINE_OPTS (e.g. '{"stickyRuns":0}').
 import { createRequire } from 'node:module';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // BENCH_ROOT: another checkout to measure (e.g. a worktree of the base commit, built), so two
 // builds can be compared run by run under the same machine load (see ab.mjs).
-const root = (process.env.BENCH_ROOT ?? fileURLToPath(new URL('../../', import.meta.url))).replace(
-  /\/?$/,
-  '/',
-);
+const root = (
+  process.env.BENCH_ROOT
+    ? resolve(process.env.BENCH_ROOT)
+    : fileURLToPath(new URL('../../', import.meta.url))
+).replace(/\/?$/, '/');
 const require = createRequire(`${root}packages/store-drizzle/package.json`);
 const pg = require('pg');
 const { drizzle } = require('drizzle-orm/node-postgres');

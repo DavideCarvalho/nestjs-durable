@@ -569,6 +569,23 @@ export interface StateStore {
   listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]>;
 
   /**
+   * Claim up to `limit` of the oldest `pending` runs that no instance holds (no lease, or one that
+   * expired by `nowMs`): lease each to `owner` until `leaseUntilMs` and resolve them as locked, in
+   * one statement where the store can. Rows another claimer is locking right now are skipped, not
+   * waited on (`FOR UPDATE SKIP LOCKED`), so instances polling at once split the backlog instead of
+   * racing for the same rows. `namespace` and the read scope filter like {@link listPendingRuns}.
+   *
+   * Optional: a store that omits it gets {@link listPendingRuns} and a {@link tryLockRun} per run.
+   */
+  claimPendingRuns?(
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ): Promise<WorkflowRun[]>;
+
+  /**
    * Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume — the most
    * overdue first, at most `limit` of them when it is given. Every driving instance polls this each
    * tick, so a recovery wave of thousands of due runs must come back in batches, not all at once.

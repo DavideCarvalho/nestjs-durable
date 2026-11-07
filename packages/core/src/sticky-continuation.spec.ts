@@ -393,3 +393,35 @@ describe('the first turn of a run', () => {
     expect(entries).toBe(0);
   });
 });
+
+describe('claiming pending runs', () => {
+  it('several instances polling one backlog run every run exactly once, a batch at a time', async () => {
+    const store = new InMemoryStateStore({ roundTripMethods: true });
+    // Engines that never execute what they start: the runs wait `pending` for a poll.
+    const idle = { dispatch: () => undefined };
+    const engines = [0, 1, 2].map(
+      () => new WorkflowEngine({ store, reconcileMs: 0, runDispatcher: idle }),
+    );
+    const ran = new Map<string, number>();
+    let active = 0;
+    let peak = 0;
+    for (const engine of engines) {
+      engine.register('job', '1', async (ctx) => {
+        ran.set(ctx.runId, (ran.get(ctx.runId) ?? 0) + 1);
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        active -= 1;
+        return 'ok';
+      });
+    }
+    for (let i = 0; i < 60; i += 1) await engines[0]?.start('job', {}, `j${i}`);
+    await Promise.all(engines.map((engine) => engine.runPending()));
+    for (let i = 0; i < 60; i += 1) {
+      expect((await store.getRun(`j${i}`))?.status).toBe('completed');
+      expect(ran.get(`j${i}`)).toBe(1);
+    }
+    // Each poll ran its batch concurrently, not one run after another.
+    expect(peak).toBeGreaterThan(3);
+  });
+});

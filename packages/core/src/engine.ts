@@ -322,6 +322,8 @@ function mergeTags(staticTags?: string[], runTags?: string[]): string[] | undefi
 /** A breakpoint checkpoint's `name` is `breakpoint` (or `breakpoint:<label>`). This name — not the
  *  reused `signal` kind — is the explicit marker the dashboard and `continue()` detect it by. */
 const BREAKPOINT = 'breakpoint';
+/** Pending runs one {@link WorkflowEngine.runPending} poll takes at most. */
+const PENDING_POLL_BATCH = 100;
 /** Default size of the sticky continuation cache (see {@link WorkflowEngineDeps.stickyRuns}). */
 const DEFAULT_STICKY_RUNS = 2000;
 /** Default idle limit of a parked body in the sticky cache. */
@@ -1108,6 +1110,8 @@ export class WorkflowEngine {
   private readonly reconcileMs: number | undefined;
   /** Parked workflow bodies kept between turns (see {@link WorkflowEngineDeps.stickyRuns}). */
   private readonly sticky: StickyCache;
+  /** Pending runs claimed by {@link runPending} for the turn about to run them, as read by the claim. */
+  private readonly claimedRuns = new Map<string, WorkflowRun>();
   /** The continuation each turn executing here runs in, by run id, while the turn runs. */
   private readonly turnContinuations = new Map<string, StickyContinuation>();
   /** The run row stamp (`updatedAt`, epoch ms) a turn here wrote when it settled `suspended`. */
@@ -3933,6 +3937,12 @@ export class WorkflowEngine {
     // Take the lease and read the run in one round trip when the store can: `execute` then finds
     // the lease held for this turn. Not while an execution of the run is in flight here (it holds
     // the lease; `execute` proves re-entry itself), and a failed take reads the run as before.
+    // A run just claimed for this turn (runPending) is held and was read by the claim.
+    const claimed = this.claimedRuns.get(runId);
+    if (claimed) {
+      this.claimedRuns.delete(runId);
+      return this.resumeLoadedRun(claimed, allowFailed);
+    }
     const lockAndGet = this.executionLeases.has(runId) ? undefined : this.store.tryLockRunAndGet;
     let locked = false;
     let run: WorkflowRun | null = null;
@@ -5039,7 +5049,21 @@ export class WorkflowEngine {
   async runPending(nowMs: number = this.clock()): Promise<RunResult[]> {
     // Oldest-first (FIFO), capped per call so a backlog drains over several polls without one sweep
     // fetching unboundedly. A run not picked up this tick is picked up the next.
-    const pending = await this.store.listPendingRuns(100, this.namespace);
+    // Without a run queue, claim a batch in one statement (rows another instance is claiming are
+    // skipped, not raced for) and run it concurrently.
+    if (this.store.claimPendingRuns && !this.queuesRunsOverTransport && !this.draining) {
+      const room = Math.min(PENDING_POLL_BATCH, LOCAL_RUN_CONCURRENCY - this.inflight.size);
+      if (room <= 0) return [];
+      const claimed = await this.store.claimPendingRuns(
+        room,
+        this.instanceId,
+        nowMs + this.leaseMs,
+        nowMs,
+        this.namespace,
+      );
+      return this.runClaimed(claimed);
+    }
+    const pending = await this.store.listPendingRuns(PENDING_POLL_BATCH, this.namespace);
     // While this engine consumes the transport's run queue, a pending run whose queue entry was lost
     // goes back on the queue (a run still queued is not queued twice) rather than running here.
     if (this.queuesRunsOverTransport && !this.draining && pending.length > 0) {
@@ -5157,6 +5181,39 @@ export class WorkflowEngine {
    * for a pod that does have the workflow — which is exactly what the skew-protection error asks
    * for. Same posture as `publishEvent`'s per-subscriber isolation.
    */
+  /**
+   * Run `claimed` (pending runs this instance just leased, read as locked): every turn starts at
+   * once, and each re-enters the lease taken for it without reading the run again.
+   */
+  private async runClaimed(claimed: WorkflowRun[]): Promise<RunResult[]> {
+    const turns = claimed.map(async (run): Promise<RunResult | undefined> => {
+      if (this.draining) {
+        // Drain began after the claim: give the lease back; the run stays for another instance.
+        await this.releaseLeaseBestEffort(run.id);
+        return undefined;
+      }
+      this.lockedForTurn.add(run.id);
+      this.claimedRuns.set(run.id, run);
+      try {
+        return await this.resumeImplicit(run.id);
+      } catch (error) {
+        if (error instanceof WorkflowNotRegistered) {
+          const settled = await this.settleUnregistered(run, this.clock()).catch(() => undefined);
+          if (settled) return settled;
+        }
+        console.error(
+          `[nestjs-durable] could not resume run ${run.id} (${run.workflow}@${run.workflowVersion}); leaving it for another instance:`,
+          error,
+        );
+        return undefined;
+      } finally {
+        this.lockedForTurn.delete(run.id);
+        this.claimedRuns.delete(run.id);
+      }
+    });
+    return (await Promise.all(turns)).filter((r): r is RunResult => r !== undefined);
+  }
+
   private async resumeLeased(
     runs: WorkflowRun[],
     nowMs: number = this.clock(),

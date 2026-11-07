@@ -1463,6 +1463,43 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(stored?.output).toBeUndefined();
     });
 
+    t(
+      'claimPendingRuns leases the oldest free pending runs, and concurrent claims never overlap',
+      async () => {
+        if (!store.claimPendingRuns) return;
+        const created = (i: number) => new Date(at.getTime() + i * 1_000);
+        for (let i = 0; i < 6; i += 1) {
+          await store.createRun(run({ id: `p${i}`, status: 'pending', createdAt: created(i) }));
+        }
+        await store.createRun(run({ id: 'busy', status: 'pending', createdAt: created(-2) }));
+        await store.updateRun('busy', { lockedBy: 'other', lockedUntil: 5_000 });
+        await store.createRun(run({ id: 'stale', status: 'pending', createdAt: created(-1) }));
+        await store.updateRun('stale', { lockedBy: 'gone', lockedUntil: 500 });
+        await store.createRun(run({ id: 'done', status: 'completed', createdAt: created(-3) }));
+
+        const first = await store.claimPendingRuns(3, 'a', 9_000, 1_000);
+        // Oldest first; a held lease is skipped, an expired one taken over.
+        expect(first.map((r) => r.id)).toEqual(['stale', 'p0', 'p1']);
+        for (const r of first) {
+          expect(r.status).toBe('pending');
+          expect(r.lockedBy).toBe('a');
+          expect(r.lockedUntil).toBe(9_000);
+        }
+        expect((await store.getRun('p0'))?.lockedBy).toBe('a');
+        expect((await store.getRun('busy'))?.lockedBy).toBe('other');
+        expect(await store.claimPendingRuns(0, 'a', 9_000, 1_000)).toEqual([]);
+
+        // Two claimers at once split what is left between them.
+        const [x, y] = await Promise.all([
+          store.claimPendingRuns(3, 'x', 9_000, 1_000),
+          peerStore.claimPendingRuns?.(3, 'y', 9_000, 1_000) ?? Promise.resolve([]),
+        ]);
+        const ids = [...x, ...y].map((r) => r.id);
+        expect(new Set(ids).size).toBe(ids.length);
+        expect(ids.sort()).toEqual(['p2', 'p3', 'p4', 'p5']);
+      },
+    );
+
     t('tryLockRunAndGet takes a free or expired lease and reads the run', async () => {
       if (!store.tryLockRunAndGet) return;
       await store.createRun(run({ status: 'suspended' }));
