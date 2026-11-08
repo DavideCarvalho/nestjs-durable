@@ -109,7 +109,8 @@ result per job.
 A worker sends batches only once a live consumer is reading `<prefix>-results-batch` (it rereads that
 every 5 seconds through BullMQ's worker list, and any error reading it answers no). Otherwise each
 result is its own job on `<prefix>-results`, which every engine consumes, so a fleet mid-upgrade, an
-older engine, or the Python worker (which always publishes one result per job) loses nothing.
+or an older engine loses nothing. The Python worker does the same from `durable-worker` 0.27; older
+releases publish one result per job on `<prefix>-results`, which every engine still reads.
 
 A result job whose handler throws (a store error at peak load, say) is retried up to 5 times with
 exponential backoff starting at 500 ms. A result that still fails is kept in the results queue for

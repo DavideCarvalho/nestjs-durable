@@ -37,6 +37,8 @@ It is advertised in **two tiers** to stay cheap at steady state and rich on chan
 - **Heartbeat** (every ~10s, `EX 35`): a compact `{ ts, status, descriptorHash }`.
 - **Full descriptor**: published on startup and whenever it changes, to `${P}-worker-descriptor:<token>:<instance>`. The control plane re-reads the full descriptor only when the `descriptorHash` changes.
 
+The control plane reads the descriptors for a queue token before each dispatch, and on BullMQ that read is a `SCAN` of the Redis keyspace. So it reuses what it read for `workerDescriptorCacheMs` (default 2000 ms; `0` reads on every dispatch), and concurrent reads of one token share one request. Before it parks a run `blocked` it always reads again, so a worker that registered within those 2 s is never missed.
+
 ## Negotiation — three outcomes
 
 The control plane self-advertises its own descriptor, and both sides compute a **negotiated session**: the highest common protocol major plus the capability intersection. Each worker lands in one of three states:
