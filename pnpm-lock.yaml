@@ -277,8 +277,8 @@ importers:
   packages/diagnostics:
     devDependencies:
       '@dudousxd/nestjs-diagnostics':
-        specifier: 0.3.0
-        version: 0.3.0
+        specifier: 0.8.0
+        version: 0.8.0(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(reflect-metadata@0.2.2)
       '@dudousxd/nestjs-durable':
         specifier: workspace:^
         version: link:../nestjs
@@ -323,7 +323,7 @@ importers:
   packages/nestjs:
     dependencies:
       '@dudousxd/nestjs-context':
-        specifier: '>=0.1.0 <1.0.0'
+        specifier: '>=0.1.0 <2.0.0'
         version: 0.1.0(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(reflect-metadata@0.2.2)
     devDependencies:
       '@dudousxd/durable-worker':
@@ -1219,16 +1219,27 @@ packages:
       '@nestjs/core': '>=10.0.0'
       reflect-metadata: '>=0.1.13'
 
-  '@dudousxd/nestjs-diagnostics@0.3.0':
-    resolution: {integrity: sha512-KntsdxhcllCqfLd95lEFDHJ9xDTeoQflSmZtOreJO5WKLD80pupoBgCxUov5X8MbrF1CybIbbEtwzNAJgXd5SQ==}
-    engines: {node: '>=20'}
-
   '@dudousxd/nestjs-diagnostics@0.5.0':
     resolution: {integrity: sha512-qQqAtaOSHKbpi0InJYpf145lkE3AJgKbV2G1dmPeJK5XkztQac00RyfOA2b3TjA7jUbA07L6WlzygxEtToWDDA==}
     engines: {node: '>=20'}
     peerDependencies:
       '@nestjs/common': ^10 || ^11
       '@nestjs/core': ^10 || ^11
+      reflect-metadata: ^0.2
+    peerDependenciesMeta:
+      '@nestjs/common':
+        optional: true
+      '@nestjs/core':
+        optional: true
+      reflect-metadata:
+        optional: true
+
+  '@dudousxd/nestjs-diagnostics@0.8.0':
+    resolution: {integrity: sha512-3frnGK2zyLHGc32OSu2iJu36a3L8ZMBFSwMKJyMz7AToUTfeBmU/NF135GzHdu1bMCzL5f4b7rmzvj7FmNfIZg==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@nestjs/common': ^10 || ^11 || ^12
+      '@nestjs/core': ^10 || ^11 || ^12
       reflect-metadata: ^0.2
     peerDependenciesMeta:
       '@nestjs/common':
@@ -7856,9 +7867,13 @@ snapshots:
       '@nestjs/core': 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@12.0.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)
       reflect-metadata: 0.2.2
 
-  '@dudousxd/nestjs-diagnostics@0.3.0': {}
-
   '@dudousxd/nestjs-diagnostics@0.5.0(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(reflect-metadata@0.2.2)':
+    optionalDependencies:
+      '@nestjs/common': 12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core': 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@12.0.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      reflect-metadata: 0.2.2
+
+  '@dudousxd/nestjs-diagnostics@0.8.0(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.0.1)(reflect-metadata@0.2.2)':
     optionalDependencies:
       '@nestjs/common': 12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2)
       '@nestjs/core': 12.0.1(@nestjs/common@12.0.1(class-transformer@0.5.1)(class-validator@0.14.2)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@12.0.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)
