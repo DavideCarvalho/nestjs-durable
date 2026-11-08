@@ -617,7 +617,7 @@ const WAKE_REQUEST_SCAN = 100;
 
 /** A wake request kept for a run: its buffered event's id, or none for one kept as a buffered signal. */
 interface KeptWake {
-  id?: string;
+  id: string;
   payload: unknown;
 }
 
@@ -6660,7 +6660,7 @@ export class WorkflowEngine {
         this.inBackground(this.honorWakeRequests(run.id, settledFans, served));
       } else if (TERMINAL_RUN_STATUSES.includes(result.status)) {
         this.inBackground(
-          this.listWakeRequests(run.id, true).then((kept) => this.dropWakeRequests(kept)),
+          this.listWakeRequests(run.id).then((kept) => this.dropWakeRequests(kept)),
         );
       }
       return result;
@@ -6720,7 +6720,7 @@ export class WorkflowEngine {
     settledFans: Map<number, number>,
     served: Set<string>,
   ): Promise<void> {
-    const kept = await this.listWakeRequests(runId, true);
+    const kept = await this.listWakeRequests(runId);
     const seen = (request: KeptWake) => wakeSeen(request, settledFans, served);
     const needed = kept.filter((request) => !seen(request));
     await this.dropWakeRequests(kept.filter(seen));
@@ -6731,29 +6731,16 @@ export class WorkflowEngine {
     });
   }
 
-  /**
-   * The wake requests kept for `runId`. With `legacy`, also those an older engine kept as buffered
-   * signals, which are taken as they are read.
-   */
-  private async listWakeRequests(runId: string, legacy = false): Promise<KeptWake[]> {
-    const token = wakeRequestToken(runId);
-    const kept: KeptWake[] = (await this.store.listBufferedEvents(token, WAKE_REQUEST_SCAN)).map(
-      (request) => ({ id: request.id, payload: request.payload }),
-    );
-    if (!legacy) return kept;
-    for (;;) {
-      const signal = await this.store.takeBufferedSignal(token);
-      if (!signal) return kept;
-      kept.push({ payload: signal.payload });
-    }
+  /** The wake requests kept for `runId`. */
+  private async listWakeRequests(runId: string): Promise<KeptWake[]> {
+    const kept = await this.store.listBufferedEvents(wakeRequestToken(runId), WAKE_REQUEST_SCAN);
+    return kept.map((request) => ({ id: request.id, payload: request.payload }));
   }
 
-  /** Delete `requests` (the ones kept as buffered events). */
+  /** Delete `requests`. */
   private async dropWakeRequests(requests: KeptWake[]): Promise<void> {
     await Promise.all(
-      requests.flatMap((request) =>
-        request.id === undefined ? [] : [this.store.removeBufferedEvent(request.id)],
-      ),
+      requests.map((request) => this.store.removeBufferedEvent(request.id)),
     );
   }
 
