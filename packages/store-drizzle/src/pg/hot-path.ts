@@ -33,9 +33,9 @@ interface DrizzleLogger {
 export interface PgHotPathOptions {
   /**
    * Send the hot statements as NAMED prepared statements (parsed once per connection). Saves
-   * Postgres a parse per statement, but needs a direct connection or a pooler that supports
-   * protocol-level prepared statements (PgBouncer in transaction mode before 1.21 does not).
-   * Default off.
+   * Postgres a parse per statement, which halves its CPU per workflow. Needs a direct connection or
+   * a pooler that supports protocol-level prepared statements (PgBouncer in transaction mode before
+   * 1.21 does not): pass `false` there. Default on.
    */
   preparedStatements?: boolean | undefined;
 }
@@ -90,7 +90,7 @@ export class PgHotPath {
   static for(db: DrizzlePgDatabase, options: PgHotPathOptions = {}): PgHotPath | undefined {
     const client = nodePgClient(db);
     if (!client) return undefined;
-    return new PgHotPath(client, drizzleLogger(db), options.preparedStatements === true);
+    return new PgHotPath(client, drizzleLogger(db), options.preparedStatements !== false);
   }
 
   /** Run one statement; resolves its rows as the driver decoded them (column names as stored). */

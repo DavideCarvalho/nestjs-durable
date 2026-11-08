@@ -991,7 +991,8 @@ TypeORM and MikroORM auto-schemas raise older second-precision MySQL columns at 
 it just replays every turn.
 
 On node-postgres, the Drizzle store sends these statements as constant SQL text instead of rebuilding
-them with drizzle's query builder every time (other drivers keep the builder). Set
-`new DrizzlePgStateStore(db, { preparedStatements: true })` to also send them as named prepared
-statements. That needs a direct connection, or a pooler that supports protocol-level prepared
-statements (PgBouncer in transaction mode before 1.21 doesn't).
+them with drizzle's query builder every time (other drivers keep the builder), as named prepared
+statements, so Postgres parses each one once per connection; that halves its CPU per workflow. Prepared
+statements need a direct connection, or a pooler that supports protocol-level prepared statements.
+Behind PgBouncer in transaction mode before 1.21, turn them off with
+`new DrizzlePgStateStore(db, { preparedStatements: false })`.

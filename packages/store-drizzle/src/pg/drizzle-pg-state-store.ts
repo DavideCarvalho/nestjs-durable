@@ -113,7 +113,8 @@ export interface DrizzlePgStateStoreOptions {
   /**
    * On node-postgres, send the statements every workflow turn and step result run as NAMED prepared
    * statements, parsed once per connection (see `PgHotPathOptions`). Needs a direct connection or
-   * a pooler with protocol-level prepared statements. Default off.
+   * a pooler with protocol-level prepared statements; pass `false` behind PgBouncer in transaction
+   * mode before 1.21. Default on.
    */
   preparedStatements?: PgHotPathOptions['preparedStatements'];
 }
