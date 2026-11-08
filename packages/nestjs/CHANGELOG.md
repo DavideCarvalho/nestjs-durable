@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.55.2
+
+### Patch Changes
+
+- [#447](https://github.com/DavideCarvalho/nestjs-durable/pull/447) [`b352bc4`](https://github.com/DavideCarvalho/nestjs-durable/commit/b352bc45c677e114e429634599df653ea84e7dc1) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `DurableModule.forRoot({ workerDescriptorCacheMs })` passes the engine's descriptor-read cache window through (default 2000 ms; `0` reads on every dispatch). It was only settable on `WorkflowEngine`.
+
 ## 0.55.1
 
 ### Patch Changes
