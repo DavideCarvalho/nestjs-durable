@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.55.1
+
+### Patch Changes
+
+- [#448](https://github.com/DavideCarvalho/nestjs-durable/pull/448) [`3b6a8f2`](https://github.com/DavideCarvalho/nestjs-durable/commit/3b6a8f22674ebbe7da09f9543b1a3fcf3982c4a9) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Accept `@dudousxd/nestjs-filter-client` `>=1.33.0 <2.0.0` instead of exactly `1.33.0`, so an app on a newer filter-client keeps one copy.
+
 ## 0.55.0
 
 ### Minor Changes
