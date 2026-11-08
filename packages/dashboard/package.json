@@ -47,7 +47,7 @@
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.app.json --noEmit"
   },
   "dependencies": {
-    "@dudousxd/nestjs-filter-client": "1.33.0"
+    "@dudousxd/nestjs-filter-client": ">=1.33.0 <2.0.0"
   },
   "peerDependencies": {
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
