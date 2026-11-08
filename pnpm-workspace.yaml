@@ -20,3 +20,8 @@ minimumReleaseAgeExclude:
   # THIRD-party (potentially compromised) deps — our own scope is exempt. Patterns match
   # package NAMES (globs), not name@version.
   - '@dudousxd/*'
+  - '@nestjs/authorization@0.1.3'
+  - '@nestjs/idempotency@0.0.4'
+  - '@nestjs/locks@0.0.6'
+  - '@nestjs/outbox@0.1.4'
+  - '@nestjs/workflows@0.0.5'

@@ -1,5 +1,44 @@
 import { type ArgumentsHost, Catch, type ExceptionFilter, HttpException } from '@nestjs/common';
-import { setRawHeader, writeNotModifiedRaw } from './auth/response.js';
+
+interface RawResponse {
+  statusCode: number;
+  setHeader(name: string, value: string): unknown;
+  end(): unknown;
+}
+
+function isRawResponse(value: unknown): value is RawResponse {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.setHeader === 'function' && typeof candidate.end === 'function';
+}
+
+/**
+ * The writable Node `ServerResponse` behind a platform response: Express' response IS it, Fastify's
+ * reply wraps it on `.raw`. One write path serves both without a platform-specific dependency.
+ */
+function rawResponse(response: unknown): RawResponse | null {
+  if (isRawResponse(response)) return response;
+  const raw = (response as { raw?: unknown } | null)?.raw;
+  return isRawResponse(raw) ? raw : null;
+}
+
+/** Set one header on the raw response (Express or Fastify). */
+function setRawHeader(response: unknown, name: string, value: string): void {
+  rawResponse(response)?.setHeader(name, value);
+}
+
+/**
+ * Write a bodiless `304 Not Modified` carrying its validator, and END the response. Its only caller
+ * is an exception filter, the terminal step of the request, so there is no second writer to race.
+ */
+function writeNotModifiedRaw(response: unknown, etag: string): void {
+  const raw = rawResponse(response);
+  if (!raw) return;
+  raw.statusCode = 304;
+  raw.setHeader('etag', etag);
+  raw.setHeader('cache-control', 'private, no-cache');
+  raw.end();
+}
 
 /**
  * How a detail endpoint answers a poll whose `If-None-Match` still names the current version.

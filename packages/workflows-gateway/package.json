@@ -1,0 +1,65 @@
+{
+  "name": "@dudousxd/nestjs-durable-workflows-gateway",
+  "version": "0.0.0",
+  "description": "The nestjs-durable dashboard over the official @nestjs/workflows engine — runs, journal timeline, children, retry/cancel and live updates",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "directory": "packages/workflows-gateway"
+  },
+  "homepage": "https://davidecarvalho.github.io/aviary/docs/durable",
+  "bugs": {
+    "url": "https://github.com/DavideCarvalho/nestjs-durable/issues"
+  },
+  "keywords": ["nestjs", "durable", "workflows", "dashboard"],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
+    "@nestjs/common": "^12.0.0",
+    "@nestjs/core": "^12.0.0",
+    "@nestjs/workflows": ">=0.0.5 <0.1.0",
+    "reflect-metadata": "^0.2.0",
+    "rxjs": "^7.1.0"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-durable-core": "workspace:^",
+    "@dudousxd/nestjs-durable-dashboard": "workspace:*",
+    "@dudousxd/nestjs-filter": "1.33.0",
+    "@nestjs/common": "12.0.1",
+    "@nestjs/core": "12.0.1",
+    "@nestjs/platform-express": "12.0.1",
+    "@nestjs/testing": "12.0.1",
+    "@nestjs/workflows": "0.0.5",
+    "@types/supertest": "6.0.3",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "supertest": "7.2.2",
+    "tsup": "8.3.5",
+    "typescript": "5.9.3"
+  }
+}

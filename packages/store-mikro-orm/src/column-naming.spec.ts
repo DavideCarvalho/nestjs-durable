@@ -36,6 +36,7 @@ const TABLE_TO_CLASS: Record<string, string> = {
   durable_signal_waiters: 'SignalWaiterEntity',
   durable_buffered_signals: 'BufferedSignalEntity',
   durable_buffered_events: 'BufferedEventEntity',
+  durable_signal_ids: 'SignalIdEntity',
   durable_schedules: 'ScheduleEntity',
 };
 

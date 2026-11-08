@@ -297,6 +297,22 @@ export interface BullMQTransportOptions {
    * (sanitized) handler name, with no suffix.
    */
   partition?: string;
+  /**
+   * Route a dispatched `ctx.step`'s result back to the engine instance that dispatched it (the task's
+   * `replyTo`), on a queue of its own, while that instance is alive: it holds the workflow body parked
+   * on the step, so with several engines the result continues the body instead of replaying it on
+   * whichever engine takes it off the shared results. An instance announces it is alive with a Redis
+   * key it refreshes; once the key lapses (a crash, a scale-down, a shutdown), workers send its
+   * results to the shared queue again and every transport moves what is left on its queue there, so
+   * no result is lost. Default `true`. `false` neither consumes nor sends routed replies.
+   */
+  replyRouting?: boolean;
+  /** How long an engine's alive key outlives its last refresh (refreshed every third of it). Default 15 s. */
+  replyAliveTtlMs?: number;
+  /** How often a transport looks for dead engines' reply queues to move to the shared results. Default 5 s. */
+  replySweepMs?: number;
+  /** How long a dead engine's emptied reply queue is still watched before it is forgotten. Default 90 s. */
+  replyDrainIdleMs?: number;
   /** Key prefix namespacing the durable queues. Defaults to `durable`. */
   prefix?: string;
   /**
@@ -476,6 +492,32 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly closeTimeoutMs: number;
   private readonly stepTimeoutMs: number | undefined;
   private readonly resultConcurrency: number;
+  // --- Reply routing (see `replyRouting`) ---
+  private readonly replyRouting: boolean;
+  private readonly replyAliveTtlMs: number;
+  private readonly replySweepMs: number;
+  private readonly replyDrainIdleMs: number;
+  /** The engine instance this transport consumes routed replies for. */
+  private replyId?: string;
+  private replyWorker?: ConsumerLike;
+  private replyRedisClient?: Redis;
+  private replyBeatTimer?: ReturnType<typeof setInterval>;
+  private replySweepTimer?: ReturnType<typeof setInterval>;
+  private replySweeping = false;
+  private readonly replyAliveCache = new Map<string, { alive: boolean; at: number }>();
+  /** Routed results waiting for the batch in flight to their instance's queue, by queue. */
+  private readonly replyOutboxes = new Map<
+    string,
+    {
+      entries: { result: StepResult; resolve: (sent: boolean) => void }[];
+      publishing: boolean;
+    }
+  >();
+  /** Dead engines' reply queues this transport is moving to the shared results. */
+  private readonly replyDrains = new Map<
+    string,
+    { worker: ConsumerLike; idleSince?: number | undefined }
+  >();
 
   constructor(options: BullMQTransportOptions) {
     // A `redis://` string becomes options: BullMQ and the `{ ...connection }` spreads below would
@@ -490,6 +532,10 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.stepTimeoutMs = options.stepTimeoutMs;
+    this.replyRouting = options.replyRouting !== false;
+    this.replyAliveTtlMs = options.replyAliveTtlMs ?? 15_000;
+    this.replySweepMs = options.replySweepMs ?? 5_000;
+    this.replyDrainIdleMs = options.replyDrainIdleMs ?? 90_000;
     const results = options.resultConcurrency;
     this.resultConcurrency = Math.max(
       RESULT_CONSUMER_CONCURRENCY,
@@ -1007,10 +1053,13 @@ export class BullMQTransport implements Transport, ControlPlane {
     const descriptors: WorkerDescriptor[] = [];
     let cursor = '0';
     do {
-      const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 100);
+      // MATCH filters after the scan, so the whole keyspace is walked either way: big pages keep that
+      // to a few round trips, and one MGET per page reads the matches.
+      const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 1000);
       cursor = next;
-      for (const key of keys) {
-        const raw = await client.get(key);
+      if (keys.length === 0) continue;
+      const values = await client.mget(...keys);
+      for (const raw of values) {
         if (raw == null) continue;
         try {
           descriptors.push(JSON.parse(raw) as WorkerDescriptor);
@@ -1129,7 +1178,8 @@ export class BullMQTransport implements Transport, ControlPlane {
    * result as soon as it finishes. A batch that fails to publish goes out one result per job. Otherwise
    * each result is its own job on {@link resultsName}.
    */
-  private async publishResult(result: StepResult): Promise<void> {
+  private async publishResult(result: StepResult, replyTo?: string): Promise<void> {
+    if (replyTo !== undefined && (await this.publishReply(result, replyTo))) return;
     if (!(await this.resultBatchesConsumed())) {
       await this.queue(this.resultsName()).add('result', result, RESULT_JOB_OPTIONS);
       return;
@@ -1204,7 +1254,7 @@ export class BullMQTransport implements Transport, ControlPlane {
         runStepHandler(task, this.handlers.get(task.name)),
       );
       ok = result.status === 'completed';
-      await this.publishResult(result);
+      await this.publishResult(result, task.replyTo);
     } catch {
       // In-process safety net for a crash we DIDN'T die from. `runStepHandler` is pure — it never
       // throws (it returns a failed StepResult), so reaching here means the results-queue publish
@@ -1334,14 +1384,9 @@ export class BullMQTransport implements Transport, ControlPlane {
         error,
       );
     });
-    this.resultsWorker = this.makeWorker(
-      this.resultsName(),
-      async (job) => {
-        const result = job.data as StepResult;
-        await Promise.all([...this.resultHandlers].map((h) => h(result)));
-      },
-      { concurrency: this.resultConcurrency },
-    );
+    this.resultsWorker = this.makeWorker(this.resultsName(), (job) => this.handleResultJob(job), {
+      concurrency: this.resultConcurrency,
+    });
     this.resultsWorker.on('failed', (job, error) => {
       if (!job || job.attemptsMade < (job.opts.attempts ?? 1)) return;
       const result = job.data as StepResult;
@@ -1350,6 +1395,218 @@ export class BullMQTransport implements Transport, ControlPlane {
         error,
       );
     });
+  }
+
+  /** Hand a results-queue job (one `result`, or a `results` batch) to every result handler. */
+  private async handleResultJob(job: Job): Promise<void> {
+    const results =
+      job.name === 'results'
+        ? (job.data as { results: StepResult[] }).results
+        : [job.data as StepResult];
+    await Promise.all(results.flatMap((result) => [...this.resultHandlers].map((h) => h(result))));
+  }
+
+  // --- Reply routing ------------------------------------------------------------------------------
+  // A task carrying `replyTo` asks for its result back on `<prefix>-results-to-<replyTo>`, a queue
+  // only that engine instance consumes, while its alive key (`<prefix>:reply-alive:<id>`, refreshed
+  // every third of `replyAliveTtlMs`) exists. Every instance that ever consumed or sent a routed reply
+  // is remembered in `<prefix>:reply-instances`; any transport that routes replies sweeps that set,
+  // and moves the queue of an instance whose key lapsed onto the shared results, stalled jobs
+  // included (BullMQ's stalled check hands a dead consumer's job back to the next worker).
+
+  private replyQueueName(id: string): string {
+    return `${this.#effectivePrefix()}-results-to-${id.replace(/[^A-Za-z0-9_.@-]/g, '-')}`;
+  }
+
+  private replyAliveKey(id: string): string {
+    return `${this.#effectivePrefix()}:reply-alive:${id}`;
+  }
+
+  private replyInstancesKey(): string {
+    return `${this.#effectivePrefix()}:reply-instances`;
+  }
+
+  private replyRedis(): Redis {
+    this.replyRedisClient ??= this.redis();
+    return this.replyRedisClient;
+  }
+
+  /**
+   * Engine side: consume the results routed to engine instance `replyTo`, keep its alive key fresh,
+   * and sweep dead instances' reply queues. Once per transport; a no-op with `replyRouting: false`.
+   */
+  consumeRepliesFor(replyTo: string): void {
+    if (!this.replyRouting || this.replyId !== undefined) return;
+    this.replyId = replyTo;
+    this.whenConsuming(() => {
+      if (this.closed) return;
+      const redis = this.replyRedis();
+      const beat = () =>
+        redis
+          .multi()
+          .set(this.replyAliveKey(replyTo), '1', 'PX', this.replyAliveTtlMs)
+          .sadd(this.replyInstancesKey(), replyTo)
+          .exec()
+          .catch(() => undefined);
+      void beat();
+      this.replyBeatTimer = setInterval(beat, Math.max(50, Math.floor(this.replyAliveTtlMs / 3)));
+      this.replyBeatTimer.unref?.();
+      this.replyWorker = this.makeWorker(
+        this.replyQueueName(replyTo),
+        (job) => this.handleResultJob(job),
+        { concurrency: this.resultConcurrency },
+      );
+      this.replyWorker.on('failed', (job, error) => {
+        if (!job || job.attemptsMade < (job.opts.attempts ?? 1)) return;
+        console.error(
+          `[nestjs-durable] gave up on a routed step result after ${job.attemptsMade} attempts:`,
+          error,
+        );
+      });
+      this.startReplySweeper();
+    });
+  }
+
+  /** Whether engine instance `id` is alive to take its routed replies (read at most every second). */
+  private async replyAlive(id: string): Promise<boolean> {
+    if (id === this.replyId && this.replyWorker) return true;
+    const known = this.replyAliveCache.get(id);
+    if (known && Date.now() - known.at < 1_000) return known.alive;
+    const alive = (await this.replyRedis().exists(this.replyAliveKey(id))) === 1;
+    this.replyAliveCache.set(id, { alive, at: Date.now() });
+    return alive;
+  }
+
+  /**
+   * Worker side: send `result` to engine instance `replyTo` when it is alive. Resolves `false` to
+   * send it to the shared results instead (routing off, the instance gone, or Redis refusing).
+   */
+  private async publishReply(result: StepResult, replyTo: string): Promise<boolean> {
+    if (!this.replyRouting) return false;
+    try {
+      if (!(await this.replyAlive(replyTo))) return false;
+    } catch {
+      return false;
+    }
+    // Batched like the shared results: the results that finish while one batch to this instance is
+    // being published go out together in the next. A batch that fails goes out one result per job,
+    // and a result that cannot be published to the instance at all goes to the shared results.
+    const queue = this.replyQueueName(replyTo);
+    let outbox = this.replyOutboxes.get(queue);
+    if (!outbox) {
+      outbox = { entries: [], publishing: false };
+      this.replyOutboxes.set(queue, outbox);
+    }
+    const sent = await new Promise<boolean>((resolve) => {
+      outbox.entries.push({ result, resolve });
+      if (!outbox.publishing) void this.publishReplyBatches(queue, outbox);
+    });
+    if (!sent) return false;
+    // A sender also watches for dead engines, so routed results never wait on an engine coming back.
+    this.startReplySweeper();
+    return true;
+  }
+
+  private async publishReplyBatches(
+    queue: string,
+    outbox: {
+      entries: { result: StepResult; resolve: (sent: boolean) => void }[];
+      publishing: boolean;
+    },
+  ): Promise<void> {
+    outbox.publishing = true;
+    try {
+      while (outbox.entries.length > 0) {
+        const batch = outbox.entries.splice(0, RESULT_BATCH_MAX);
+        try {
+          await (batch.length === 1
+            ? this.queue(queue).add('result', batch[0]?.result, RESULT_JOB_OPTIONS)
+            : this.queue(queue).add(
+                'results',
+                { results: batch.map((entry) => entry.result) },
+                RESULT_JOB_OPTIONS,
+              ));
+          for (const entry of batch) entry.resolve(true);
+        } catch {
+          for (const entry of batch) entry.resolve(false);
+        }
+      }
+    } finally {
+      outbox.publishing = false;
+    }
+  }
+
+  private startReplySweeper(): void {
+    if (this.replySweepTimer || this.closed || this.consumersDeferred) return;
+    this.replySweepTimer = setInterval(() => {
+      if (this.replySweeping) return;
+      this.replySweeping = true;
+      void this.sweepReplyQueues()
+        .catch(() => undefined)
+        .finally(() => {
+          this.replySweeping = false;
+        });
+    }, this.replySweepMs);
+    this.replySweepTimer.unref?.();
+  }
+
+  /**
+   * Move the reply queue of every engine instance whose alive key lapsed onto the shared results:
+   * a drain worker forwards each job (waiting, delayed, or stalled under the dead consumer) there.
+   * Once a dead instance's queue has stayed empty for `replyDrainIdleMs` (past BullMQ's stalled
+   * check, and past any sender's cached view of the instance), it is forgotten.
+   */
+  async sweepReplyQueues(): Promise<void> {
+    if (this.closed) return;
+    const redis = this.replyRedis();
+    const ids = await redis.smembers(this.replyInstancesKey());
+    for (const id of ids) {
+      if (id === this.replyId || this.closed) continue;
+      const alive = (await redis.exists(this.replyAliveKey(id))) === 1;
+      const drain = this.replyDrains.get(id);
+      if (alive) {
+        if (drain) {
+          this.replyDrains.delete(id);
+          await drain.worker.close().catch(() => undefined);
+        }
+        continue;
+      }
+      if (!drain) {
+        const worker = this.makeWorker(this.replyQueueName(id), async (job) => {
+          const results =
+            job.name === 'results'
+              ? (job.data as { results: StepResult[] }).results
+              : [job.data as StepResult];
+          await Promise.all(
+            results.map((result) =>
+              this.queue(this.resultsName()).add('result', result, RESULT_JOB_OPTIONS),
+            ),
+          );
+        });
+        this.replyDrains.set(id, { worker });
+        continue;
+      }
+      const counts = await this.queue(this.replyQueueName(id)).getJobCounts(
+        'waiting',
+        'wait',
+        'active',
+        'delayed',
+        'prioritized',
+      );
+      const left = Object.values(counts).reduce((sum, n) => sum + n, 0);
+      if (left > 0) {
+        drain.idleSince = undefined;
+        continue;
+      }
+      drain.idleSince ??= Date.now();
+      if (Date.now() - drain.idleSince < this.replyDrainIdleMs) continue;
+      this.replyDrains.delete(id);
+      await drain.worker.close().catch(() => undefined);
+      // Forgotten only while still dead: an instance that came back re-adds itself on its next beat.
+      if ((await redis.exists(this.replyAliveKey(id))) === 0) {
+        await redis.srem(this.replyInstancesKey(), id);
+      }
+    }
   }
 
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
@@ -1708,6 +1965,16 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.deferredStarts.splice(0);
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
     if (this.pingWatchdogTimer) clearInterval(this.pingWatchdogTimer);
+    if (this.replyBeatTimer) clearInterval(this.replyBeatTimer);
+    if (this.replySweepTimer) clearInterval(this.replySweepTimer);
+    // Stop taking routed replies first: with the alive key gone, workers send to the shared results
+    // and other instances move what is left on this instance's queue there.
+    if (this.replyId !== undefined && this.replyRedisClient) {
+      await withTimeout(
+        this.replyRedisClient.del(this.replyAliveKey(this.replyId)).catch(() => undefined),
+        this.closeTimeoutMs,
+      );
+    }
     this.subscribers.clear();
     this.workerController?.stop();
     // ORDER MATTERS. `Worker.close()` waits for the job in flight, and that job publishes its result
@@ -1720,6 +1987,8 @@ export class BullMQTransport implements Transport, ControlPlane {
       ...[...this.taskWorkers.values()].map((w) => w.close()),
       this.resultsWorker?.close(),
       this.resultBatchesWorker?.close(),
+      this.replyWorker?.close(),
+      ...[...this.replyDrains.values()].map((d) => d.worker.close()),
       this.decisionsWorker?.close(),
       this.stepEventsWorker?.close(),
       this.startRunWorker?.close(),
@@ -1736,6 +2005,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     // shrinks to what is left.
     const queueCloses = [...this.queues.values()].map((q) => q.close());
     await withTimeout(Promise.allSettled(queueCloses), Math.max(0, deadline - Date.now()));
+    this.replyRedisClient?.disconnect();
     this.controlPub?.disconnect();
     this.controlSub?.disconnect();
     this.heartbeatPub?.disconnect();

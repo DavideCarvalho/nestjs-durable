@@ -220,6 +220,22 @@ export interface StepSettlement {
 }
 
 /**
+ * A step's result as {@link StateStore.settleResultsIfPending} writes it onto the step's `pending`
+ * checkpoint. Unlike a {@link StepSettlement}, what the result does not carry keeps the stored value:
+ * `output` is written only for a `completed` result, `events` and `startedAt` only when present.
+ */
+export interface StepResultSettlement {
+  runId: string;
+  seq: number;
+  status: 'completed' | 'failed';
+  output?: unknown;
+  error?: StepError | undefined;
+  events?: StepEvent[] | undefined;
+  startedAt?: Date | undefined;
+  finishedAt: Date;
+}
+
+/**
  * A structured event a step (or its worker) emits while running — a log line and/or a sub-step
  * outcome. The dashboard renders these under the step, so you can see what happened inside a step
  * that the workflow treats as one unit (e.g. which of N parallel sub-processes ok/failed/skipped).
@@ -498,6 +514,29 @@ export interface StateStore {
    * Optional: a store that omits it gets {@link saveCheckpointsIfPending} with the whole rows.
    */
   settleCheckpointsIfPending?(settlements: StepSettlement[]): Promise<boolean[]>;
+  /**
+   * Settle steps from their results and read them back, in one round trip where the store can: per
+   * entry and in input order, while the row at `(runId, seq)` is still `pending` and its run is not
+   * `cancelled` or `completed` (a late result for a finished run settles nothing), write the result
+   * (see {@link StepResultSettlement} for what keeps its stored value) and resolve the row as it now
+   * reads, without its `input` (as {@link getCheckpointsForSettle} reads it); `null` for an entry
+   * that wrote nothing (the row is absent or already settled, or the run finished). Claims like
+   * {@link settleCheckpointsIfPending}: a later entry for a row an earlier one settled loses, and a
+   * rejection writes nothing. The engine settles a batch of one run's step results through it
+   * without reading the rows first.
+   *
+   * Optional: a store that omits it gets {@link getCheckpointsForSettle} followed by
+   * {@link settleCheckpointsIfPending}.
+   */
+  settleResultsIfPending?(results: StepResultSettlement[]): Promise<(StepCheckpoint | null)[]>;
+  /**
+   * Write `checkpoint` only if the run has no checkpoint at its `seq` yet; resolves whether it wrote.
+   * The engine writes a step it dispatches for the first time through it, instead of reading the
+   * position first: a row already there (written by a turn it did not see) is then read and acted on.
+   *
+   * Optional: a store that omits it gets a {@link getCheckpoint} before the {@link saveCheckpoint}.
+   */
+  insertCheckpointIfAbsent?(checkpoint: StepCheckpoint): Promise<boolean>;
 
   /** Used by recovery on boot to find runs to resume (crashed, left `running`). */
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
@@ -530,6 +569,23 @@ export interface StateStore {
   listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]>;
 
   /**
+   * Claim up to `limit` of the oldest `pending` runs that no instance holds (no lease, or one that
+   * expired by `nowMs`): lease each to `owner` until `leaseUntilMs` and resolve them as locked, in
+   * one statement where the store can. Rows another claimer is locking right now are skipped, not
+   * waited on (`FOR UPDATE SKIP LOCKED`), so instances polling at once split the backlog instead of
+   * racing for the same rows. `namespace` and the read scope filter like {@link listPendingRuns}.
+   *
+   * Optional: a store that omits it gets {@link listPendingRuns} and a {@link tryLockRun} per run.
+   */
+  claimPendingRuns?(
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ): Promise<WorkflowRun[]>;
+
+  /**
    * Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume — the most
    * overdue first, at most `limit` of them when it is given. Every driving instance polls this each
    * tick, so a recovery wave of thousands of due runs must come back in batches, not all at once.
@@ -542,6 +598,20 @@ export interface StateStore {
    * acquired — so concurrent engine instances never recover the same run twice.
    */
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean>;
+  /**
+   * {@link tryLockRun}, resolving the run as it reads once locked (`null` when the lease was not
+   * acquired, or the run does not exist): the engine takes a run's lease and reads it in one round
+   * trip where the store can. The read honors the store's read scope like {@link getRun}; a run
+   * outside it is not locked.
+   *
+   * Optional: a store that omits it gets a {@link getRun} and a {@link tryLockRun}.
+   */
+  tryLockRunAndGet?(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null>;
 
   /**
    * Release a run's recovery lease so another instance can pick it up (e.g. once it suspends).
@@ -630,6 +700,38 @@ export interface StateStore {
   bufferSignal(token: string, payload: unknown): Promise<void>;
   /** Take the oldest buffered signal for `token` (FIFO), or null if none is buffered. */
   takeBufferedSignal(token: string): Promise<{ payload: unknown } | null>;
+  /**
+   * Take the oldest buffered signal (lowest id) whose token is one of `tokens`, with that token, or
+   * null if none is buffered. Atomic like {@link takeBufferedSignal}: two concurrent callers never
+   * take the same row. `ctx.waitForAny` resolves with it, so when several of its signals are already
+   * buffered the one sent first wins, whichever condition it matches.
+   *
+   * Optional: without it `waitForAny` takes {@link takeBufferedSignal} token by token in the order
+   * the conditions are declared.
+   */
+  takeOldestBufferedSignal?(tokens: string[]): Promise<{ token: string; payload: unknown } | null>;
+
+  /**
+   * Record that the signal `id` was sent on `token`, unless it already was: resolves `true` when this
+   * call recorded it (the signal is new) and `false` when an unexpired record for the same `token`
+   * and `id` exists (a re-send). The record lasts until `expiresAt` (epoch ms); a record whose
+   * `expiresAt <= nowMs` counts as absent and is replaced. Atomic: of two concurrent calls with the
+   * same `token` and `id`, exactly one resolves `true`. Backs `engine.signal(token, payload, { id })`.
+   *
+   * Optional: a store without it can't deduplicate signals, and `signal(..., { id })` throws.
+   */
+  claimSignalId?(token: string, id: string, expiresAt: number, nowMs: number): Promise<boolean>;
+  /**
+   * Delete the record {@link claimSignalId} made for `token` and `id`, if any. The engine calls it
+   * when delivering the signal failed after the claim, so the sender's retry is not taken for a
+   * duplicate.
+   */
+  releaseSignalId?(token: string, id: string): Promise<void>;
+  /**
+   * Delete up to `limit` signal-id records that expired at or before `nowMs`; resolves how many it
+   * deleted. Expired records are already ignored by {@link claimSignalId}; this only reclaims space.
+   */
+  deleteExpiredSignalIds?(nowMs: number, limit: number): Promise<number>;
   /**
    * A page of buffered signals whose token starts with `tokenPrefix`, in insertion (`id`) order,
    * starting after `afterId` (exclusive; `undefined` = from the start), at most `limit` rows. The
@@ -1307,9 +1409,81 @@ export interface SignalWaiter {
    * group; without threading it through the waiter, the child-await checkpoint comes out untagged and the
    * dashboard renders the fan as a sequential chain instead of one parallel group. Undefined for an
    * ordinary (non-fan) signal/child await.
+   *
+   * `'$any'` (`ANY_WAIT_GROUP`) marks the waiter as one condition of a `ctx.waitForAny`: a signal
+   * that takes it settles the wait only if no other condition did first, and is buffered again
+   * otherwise (see `wait-any.ts`).
    */
   parallelGroup?: string | undefined;
 }
+
+/** Options for `engine.signal(token, payload, opts)`. */
+export interface SignalOptions {
+  /**
+   * Deduplication id, unique per token — the id of the message, job or webhook delivery that causes
+   * the signal. A signal sent again on the same token with the same id while the first is remembered
+   * (see `idTtl`) is dropped: `signal()` resolves `null` and nothing is delivered or buffered, so a
+   * sender that runs twice (a redelivered message, a retried job) signals once and the first payload
+   * wins. The same id on another token is another signal. Needs a store with `claimSignalId` (every
+   * bundled store).
+   *
+   * If storing the signal fails, `signal()` rejects and the id is forgotten, so a retry gets through.
+   * A duplicate sent on the same engine while the first send is still in flight waits for it, and
+   * sends in its place if it fails. Across instances a concurrent duplicate is dropped at once, so
+   * the sender whose call rejected must retry.
+   */
+  id?: string | undefined;
+  /**
+   * How long this signal's `id` is remembered (ms, or a duration like `'30d'`). Default: the engine's
+   * `signalIdTtl` (7 days).
+   */
+  idTtl?: string | number | undefined;
+}
+
+declare const waitConditionValue: unique symbol;
+
+/**
+ * What a condition of {@link WorkflowCtx.waitForAny} waits for. Plain data: the same object travels
+ * in a remote workflow's `waitAny` command.
+ *
+ * - `signal`: a signal sent on token `signal` (`engine.signal(token, payload)`); its value is the payload.
+ * - `timer`: `ms` after the wait is first reached, or at `until` (epoch ms); its value is `null`.
+ * - `child`: the run `childId` settling; its value is the run's output (a failed run throws).
+ */
+export type WaitConditionSpec =
+  | { kind: 'signal'; signal: string }
+  | { kind: 'timer'; ms?: number | undefined; until?: number | undefined }
+  | { kind: 'child'; childId: string };
+
+/**
+ * A condition for {@link WorkflowCtx.waitForAny}, made by `ctx.signalWait()`, `ctx.timer()` or
+ * `ctx.childWait()`. `T` is the value it resolves with (type-only). Only a description: nothing is
+ * waited for, and nothing journaled, until it is passed to `waitForAny`.
+ */
+export type WaitCondition<T = unknown> = WaitConditionSpec & {
+  /** Type-only: the `value` `waitForAny()` returns when this condition wins. Never set. */
+  readonly [waitConditionValue]?: T;
+};
+
+/** One condition of a remote `waitAny` command: the spec plus its key in the conditions object. */
+export type WaitAnyCondition = WaitConditionSpec & { key: string };
+
+/** What a `waitForAny` resolved with, untyped: the winning condition's key and its value. */
+export interface WaitAnyOutcome {
+  key: string;
+  value: unknown;
+}
+
+/**
+ * What `ctx.waitForAny(name, conditions)` resolves with: the key of the condition that won and its
+ * value, typed per key (check `key` to narrow `value`).
+ */
+export type WaitAnyResult<C extends Record<string, WaitCondition<unknown>>> = {
+  [K in keyof C & string]: {
+    key: K;
+    value: C[K] extends WaitCondition<infer T> ? T : never;
+  };
+}[keyof C & string];
 
 // ---------------------------------------------------------------------------
 // Transport — how a remote task travels to a worker and the result returns
@@ -1433,6 +1607,14 @@ export interface RemoteTask {
    */
   priority?: number | undefined;
   attempt: number;
+  /**
+   * The engine instance that dispatched the task and wants its result back, when the transport
+   * routes replies ({@link Transport.consumeRepliesFor}): that instance keeps the workflow body
+   * parked on the step, so its result continues the body there instead of replaying it elsewhere.
+   * A worker sends the result to that instance while it is alive, else to the shared results, like
+   * a task without it. Absent when replies are not routed (a step fan's tasks never carry it).
+   */
+  replyTo?: string | undefined;
 }
 
 export interface StepResult {
@@ -1501,9 +1683,14 @@ export interface WorkflowTask {
 /** One resolved durable op in a run's history — a superset of a completed {@link StepCheckpoint}. */
 export interface HistoryEvent {
   seq: number;
-  kind: 'step' | 'call' | 'timer' | 'signal' | 'child';
+  kind: 'step' | 'call' | 'timer' | 'signal' | 'child' | 'any';
+  /** The op's name. For `any`, the `waitForAny` name. */
   name?: string | undefined;
-  /** Resolved value: a step/call output, a child run's output, a signal payload. */
+  /**
+   * Resolved value: a step/call output, a child run's output, a signal payload. For `any`, the
+   * `{ key, value }` the wait resolved with (a winning child's output unwrapped; a failed child
+   * sets `error` and leaves `{ key }`).
+   */
   output?: unknown;
   /** Set when the op resolved to a failure (e.g. a failed remote step the workflow may catch). */
   error?: StepError | undefined;
@@ -1546,6 +1733,11 @@ export type WorkflowCommand =
   | { kind: 'sleep'; seq: number; ms: number }
   /** `ctx.wait_signal(name)` — block until a signal `name` is delivered to the run. */
   | { kind: 'waitSignal'; seq: number; signal: string }
+  /** `ctx.waitForAny(name, conditions)` — block until the first of `conditions` happens. The engine
+   *  resolves it exactly as the in-process ctx does (see `wait-any.ts`), journals `{ key, value }` at
+   *  `seq` and replays it as an `any` {@link HistoryEvent}. A timer's `ms` counts from when the engine
+   *  first applies the command. */
+  | { kind: 'waitAny'; seq: number; name: string; conditions: WaitAnyCondition[] }
   /** `ctx.start_child(workflow, input)` — start a child run with its own lifecycle. A worker's
    *  `ctx.all([...])` fan-out tags every dispatched child with the same `parallelGroup` so the
    *  dashboard can render the fan as one group (parity with the gathered `recordStep` tag). */
@@ -1712,6 +1904,14 @@ export interface Transport {
   dispatchMany?(tasks: RemoteTask[]): Promise<void>;
   /** worker → engine: a step finished (ok or error). */
   onResult(handler: (result: StepResult) => Promise<void>): void;
+  /**
+   * Also consume the results workers address to engine instance `replyTo` (tasks dispatched with
+   * {@link RemoteTask.replyTo}), handing them to the {@link onResult} handlers. A transport that
+   * implements it must never lose such a result: while `replyTo` is gone (crashed, scaled down,
+   * drained), its results go, or are moved, to the shared results. Optional: a transport without it
+   * gets tasks without `replyTo`, and every result comes back on the shared results.
+   */
+  consumeRepliesFor?(replyTo: string): void;
   /** worker → engine: liveness signal for an in-flight long step. */
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void;
   /** Release the transport's resources (broker workers, queues, connections) for a clean shutdown.
@@ -1975,7 +2175,26 @@ export interface ChildCallOptions {
    * (TS class) child, which runs in the engine and never hits a broker queue.
    */
   priority?: number | undefined;
+  /**
+   * What happens to this child if it is still running when its parent ends:
+   *
+   * - `'cancel'`: cancelled with its saga undo (`cancel(child, { compensate: true })`);
+   * - `'terminate'`: cancelled without compensating (`cancel(child)`);
+   * - `'abandon'`: left running, also when the parent is CANCELLED (the cancel cascade skips it).
+   *
+   * Applied when the parent completes or fails in a workflow turn. A cancelled or timed-out parent
+   * keeps cascading its cancel to its children as before, except `'abandon'` ones. Omitted: today's
+   * behaviour (a finished parent leaves its children alone; a cancelled one cascades). In-process
+   * (TS class) parents only: a workflow replayed by a remote worker ignores it.
+   */
+  parentClose?: ParentClosePolicy | undefined;
 }
+
+/** See {@link ChildCallOptions.parentClose}. */
+export type ParentClosePolicy = 'cancel' | 'terminate' | 'abandon';
+
+/** The tag a child started with a `parentClose` policy carries: `parent-close:<policy>`. */
+export const PARENT_CLOSE_TAG_PREFIX = 'parent-close:';
 
 export interface StepOptions {
   /** Max attempts before the step (and run) fails. */
@@ -2221,6 +2440,50 @@ export interface WorkflowCtx<A extends SearchAttributes = SearchAttributes> {
    * a `SignalTimeoutError` (catch it in the workflow to branch).
    */
   waitForSignal<TPayload>(token: string, opts?: { timeoutMs?: number }): Promise<TPayload>;
+  /**
+   * Durable wait for whichever of several conditions happens first: a signal
+   * ({@link signalWait}), a timer ({@link timer}) or a run settling ({@link childWait}). Resolves with
+   * the winner's key and its value — a signal's payload, `null` for a timer, a child's output (a
+   * child that failed throws, as {@link child} does) — journaled under `name` at ONE position, so a
+   * replay returns the same winner.
+   *
+   * Only the winning signal is consumed: a signal that matched another condition stays buffered for
+   * a later wait on its token. A losing timer never fires; a losing child keeps running, and a later
+   * `ctx.child(..., childId)` still joins it. When several conditions are ready at once the signal
+   * sent first wins (lowest buffered id), then a child that already finished, then the earliest due
+   * timer. A signal that arrives after a timer's deadline loses to it, even if no worker ran at the
+   * deadline. Timers count from when the wait is first reached.
+   *
+   * ```ts
+   * const outcome = await ctx.waitForAny('delivery-or-cancel', {
+   *   delivered: ctx.signalWait<CarrierEvent>(`shipment.delivered:${order.id}`),
+   *   cancelled: ctx.signalWait<{ reason: string }>(`order.cancelled:${order.id}`),
+   *   timeout: ctx.timer('3d'),
+   * });
+   * if (outcome.key === 'delivered') await ctx.step(thank, outcome.value);
+   * ```
+   */
+  waitForAny<C extends Record<string, WaitCondition<unknown>>>(
+    name: string,
+    conditions: C,
+  ): Promise<WaitAnyResult<C>>;
+  /** A signal condition for {@link waitForAny}: a signal sent on `token`. Its value is the payload. */
+  signalWait<TPayload = unknown>(token: string): WaitCondition<TPayload>;
+  /**
+   * A timer condition for {@link waitForAny}: `duration` (ms, or `'30m'`, `'3d'`…) after the wait is
+   * first reached, or at `{ until }` (a `Date` or epoch ms). Its value is `null`.
+   */
+  timer(duration: string | number | { until: Date | number }): WaitCondition<null>;
+  /**
+   * A child condition for {@link waitForAny}: run `childId` settling (a child from
+   * {@link startChild}, or any run id). Its value is the run's output; a run that failed, was
+   * cancelled or died makes `waitForAny` throw. Pass the workflow class first to type the output.
+   */
+  childWait<C extends WorkflowClass>(
+    workflow: C,
+    childId: string,
+  ): WaitCondition<WorkflowOutputOf<C>>;
+  childWait<TOutput = unknown>(childId: string): WaitCondition<TOutput>;
   /**
    * Wait for a named **event** published via `engine.publishEvent(name, payload)`, then resume with
    * the payload. Unlike a signal (point-to-point by token), events are name-based pub/sub: pass an

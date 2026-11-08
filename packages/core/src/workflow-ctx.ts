@@ -34,6 +34,7 @@ import type {
   ChildCallOptions,
   ChildWait,
   DurableWebhook,
+  ParentClosePolicy,
   SearchAttributes,
   SearchAttributesSchema,
   Settled,
@@ -48,6 +49,10 @@ import type {
   StepLogger,
   StepOptions,
   StepUndo,
+  WaitAnyCondition,
+  WaitAnyResult,
+  WaitCondition,
+  WaitConditionSpec,
   WaitForRunOptions,
   WorkflowCtx,
   WorkflowRun,
@@ -59,6 +64,8 @@ import { runWaitToken, settledRunOf } from './run-wait';
 import { readRunsByIds } from './run-waiting';
 import { createStepLogger } from './step-logger';
 import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol';
+import type { StickyContinuation } from './sticky-continuation';
+import { anyCheckpointName, anyOutcomeOf, enterWaitAny } from './wait-any';
 import { type WorkflowRef, workflowName } from './workflow-ref';
 
 /** Normalize the `ctx.child`/`ctx.startChild` 3rd arg: a bare string is shorthand for `{ childId }`. */
@@ -147,6 +154,12 @@ export interface CtxHost {
    * into the map so any later same-execution read sees them. Undefined ⇒ always hit the store.
    */
   readonly replay?: Map<number, StepCheckpoint> | undefined;
+  /**
+   * The sticky continuation this ctx's body runs in, if any (see `sticky-continuation.ts`): every
+   * primitive reports to it when it starts and settles, and a primitive started while the body is
+   * detached (between turns) is refused before it does anything.
+   */
+  readonly sticky?: StickyContinuation | undefined;
   clock(): number;
   webhookUrl?: ((token: string) => string) | undefined;
   /** Mark a local step's body as started — emits `step.started` and (optionally) a `running` checkpoint. */
@@ -186,7 +199,14 @@ export interface CtxHost {
     id: string,
     priority?: number,
     version?: string,
+    parentClose?: ParentClosePolicy,
   ): void;
+  /**
+   * Record that `childId` of `parentRunId` carries a {@link ChildCallOptions.parentClose} policy, so
+   * the host applies it when the parent completes or fails. Called on EVERY turn (replays included):
+   * the turn that ends the parent is the one that needs it. Optional: a host without it ignores it.
+   */
+  noteParentClose?(parentRunId: string, childId: string, policy: ParentClosePolicy): void;
   /**
    * Best-effort cancel of a child run — deferred for the SAME reason as `startChild` (so ctx code
    * can't reentrantly mutate engine state while the parent's own step is still executing
@@ -699,9 +719,10 @@ export function createWorkflowCtx(
     input: unknown,
     options?: string | ChildCallOptions,
   ): Promise<T> => {
-    const { childId, priority, version } = normalizeChildOptions(options);
+    const { childId, priority, version, parentClose } = normalizeChildOptions(options);
     const current = pos.next();
     const id = childId ?? `${runId}.child.${current}`;
+    if (parentClose) host.noteParentClose?.(runId, id, parentClose);
     const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') {
       return unwrapCompletion<T>(existing.output, `child "${id}"`);
@@ -748,7 +769,7 @@ export function createWorkflowCtx(
     }
     const childRun = await store.getRun(id);
     if (!childRun) {
-      host.startChild(workflowName(workflow), input, id, priority, version);
+      host.startChild(workflowName(workflow), input, id, priority, version, parentClose);
     } else {
       // Joining a child that already finished: settle it now from its row.
       const done = (
@@ -1150,13 +1171,14 @@ export function createWorkflowCtx(
     input: unknown,
     options?: string | ChildCallOptions,
   ): Promise<string> => {
-    const { childId, priority, version } = normalizeChildOptions(options);
+    const { childId, priority, version, parentClose } = normalizeChildOptions(options);
     const current = pos.next();
     const id = childId ?? `${runId}.child.${current}`;
+    if (parentClose) host.noteParentClose?.(runId, id, parentClose);
     const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') return existing.output as string;
     if (!(await store.getRun(id)))
-      host.startChild(workflowName(workflow), input, id, priority, version);
+      host.startChild(workflowName(workflow), input, id, priority, version, parentClose);
     await writeCheckpoint(
       instantCheckpoint({ runId, seq: current, name: `spawn:${id}`, kind: 'local', output: id }),
     );
@@ -1503,6 +1525,42 @@ export function createWorkflowCtx(
       });
   }
 
+  // `waitForAny`: one position, resolved through the shared machinery in wait-any.ts (which the remote
+  // `waitAny` command and the engine's signal delivery use too). A completed position in the replay
+  // snapshot returns without a store read; anything else reads the store live, since the winner may
+  // have been written after this execution's snapshot.
+  const waitForAny = async <C extends Record<string, WaitCondition<unknown>>>(
+    name: string,
+    conditions: C,
+  ): Promise<WaitAnyResult<C>> => {
+    const current = pos.next();
+    const cached = replay?.get(current);
+    if (cached?.status === 'completed' && cached.name === anyCheckpointName(name)) {
+      return anyOutcomeOf(cached) as WaitAnyResult<C>;
+    }
+    const wire = Object.entries(conditions).map(
+      ([key, c]): WaitAnyCondition => ({ ...(c as WaitConditionSpec), key }),
+    );
+    const state = await enterWaitAny({ store, clock: host.clock }, runId, current, name, wire);
+    if (state.state === 'resolved') {
+      replay?.set(current, state.checkpoint);
+      return anyOutcomeOf(state.checkpoint) as WaitAnyResult<C>;
+    }
+    throw new WorkflowSuspended(state.wakeAt);
+  };
+  const signalWait = <T>(token: string): WaitCondition<T> => ({ kind: 'signal', signal: token });
+  const timer = (duration: string | number | { until: Date | number }): WaitCondition<null> =>
+    typeof duration === 'object'
+      ? {
+          kind: 'timer',
+          until: typeof duration.until === 'number' ? duration.until : duration.until.getTime(),
+        }
+      : { kind: 'timer', ms: parseDuration(duration) };
+  const childWait = (first: WorkflowRef, second?: string): WaitCondition<unknown> => ({
+    kind: 'child',
+    childId: typeof first === 'string' && second === undefined ? first : (second as string),
+  });
+
   // Fail fast when a primitive is called from INSIDE one of this ctx's step bodies (directly, or via
   // a `MyWorkflow.start()`/`.execute()` static resolving the ambient ctx). The step replays from its
   // checkpoint without re-running its body, so the nested call's journal position would never be
@@ -1519,7 +1577,10 @@ export function createWorkflowCtx(
     const scope = currentStepScope();
     return scope !== undefined && scope.owner === scopeOwner ? scope.step : undefined;
   };
-  const guard = <F extends (...args: never[]) => Promise<unknown>>(primitive: string, fn: F): F =>
+  const unguarded = <F extends (...args: never[]) => Promise<unknown>>(
+    primitive: string,
+    fn: F,
+  ): F =>
     ((...args: Parameters<F>) => {
       const stepName = nestedStep();
       if (stepName === undefined) return fn(...args);
@@ -1528,6 +1589,33 @@ export function createWorkflowCtx(
         throw new NestedWorkflowCallError(runId, primitive, stepName);
       })();
     }) as F;
+  // In a sticky continuation, every primitive is counted while in flight, so the turn can tell when
+  // the body is quiescent; one called while the body is detached is refused before it runs.
+  const sticky = host.sticky;
+  const guard = <F extends (...args: never[]) => Promise<unknown>>(primitive: string, fn: F): F => {
+    const inner = unguarded(primitive, fn);
+    if (!sticky) return inner;
+    return ((...args: Parameters<F>) => {
+      if (!sticky.enter()) return Promise.reject(new WorkflowSuspended());
+      let started: Promise<unknown>;
+      try {
+        started = inner(...args);
+      } catch (err) {
+        sticky.exit(err);
+        throw err;
+      }
+      return started.then(
+        (value) => {
+          sticky.exit();
+          return value;
+        },
+        (err) => {
+          sticky.exit(err);
+          throw err;
+        },
+      );
+    }) as F;
+  };
   // `webhook` is synchronous (it returns a handle): same rule, checked against the replay snapshot.
   const guardedWebhook = <T>(): DurableWebhook<T> => {
     const stepName = nestedStep();
@@ -1549,6 +1637,10 @@ export function createWorkflowCtx(
     sleepUntil: guard('sleepUntil', sleepUntil),
     continueAsNew,
     waitForSignal: guard('waitForSignal', waitForSignal),
+    waitForAny: guard('waitForAny', waitForAny) as WorkflowCtx['waitForAny'],
+    signalWait,
+    timer,
+    childWait: childWait as WorkflowCtx['childWait'],
     waitForEvent: guard('waitForEvent', waitForEvent),
     waitForRun: guard('waitForRun', waitForRun) as WorkflowCtx['waitForRun'],
     task: guard('task', task),

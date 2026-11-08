@@ -61,6 +61,7 @@ import {
   workflowFromHash,
   workflowHash,
 } from './WorkflowLifecycle';
+import { supports, useCapabilities, useTopology } from './capabilities';
 import { childChips, triggerChips } from './child-link';
 import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
 import { shouldLoadMore } from './load-more';
@@ -170,19 +171,17 @@ function Header({
     </Button>
   );
   // Topology is fixed for a deployment's lifetime, so fetch once and never refetch.
-  const { data: topology } = useQuery({
-    queryKey: ['topology'],
-    queryFn: () => durableClient.topology(),
-    staleTime: Number.POSITIVE_INFINITY,
-  });
+  const topology = useTopology();
   const isTenant = topology?.role === 'tenant';
   const roleLabel = !topology
     ? ''
-    : isTenant
-      ? topology.tenant
-        ? `tenant · ${topology.tenant}`
-        : 'tenant'
-      : 'control plane';
+    : topology.engine
+      ? topology.engine
+      : isTenant
+        ? topology.tenant
+          ? `tenant · ${topology.tenant}`
+          : 'tenant'
+        : 'control plane';
   return (
     <header className="z-10 flex items-center gap-4 border-b border-line px-5 py-3">
       <div className="flex items-center gap-2.5">
@@ -209,8 +208,8 @@ function Header({
         {chip('all', 'all', total)}
         {STATUSES.map((s) => chip(s, s, counts[s] ?? 0))}
       </div>
-      <WorkersHealth />
-      {!isTenant && <SchedulesPanel />}
+      {supports(topology, 'workers') && <WorkersHealth />}
+      {!isTenant && supports(topology, 'schedules') && <SchedulesPanel />}
       <div className="flex items-center gap-2 text-xs text-zinc-500">
         <span className="dot s-completed pulse" aria-hidden />
         live
@@ -1105,6 +1104,7 @@ const RunDetail = memo(function RunDetail({
     onSuccess: invalidate,
   });
   const cont = useMutation({ mutationFn: () => durableClient.continue(id), onSuccess: invalidate });
+  const can = useCapabilities();
   // Manual recovery for a lost step dispatch (crashed worker / dropped job): re-dispatch every
   // remote step stuck `pending`. Reconcile-wake can't recover this on its own.
   const redispatch = useMutation({
@@ -1454,7 +1454,7 @@ const RunDetail = memo(function RunDetail({
           >
             {'{ }'}
           </Button>
-          {atBreakpoint && (
+          {atBreakpoint && can('breakpoints') && (
             <Button variant="warn" disabled={cont.isPending} onClick={() => cont.mutate()}>
               <PlayIcon width={12} height={12} />
               Continue
@@ -1468,7 +1468,7 @@ const RunDetail = memo(function RunDetail({
             <RetryIcon width={12} height={12} />
             Retry
           </Button>
-          {canRedispatch && (
+          {canRedispatch && can('redispatch') && (
             <Button
               variant="info"
               disabled={redispatch.isPending}
@@ -1479,7 +1479,7 @@ const RunDetail = memo(function RunDetail({
               Re-dispatch
             </Button>
           )}
-          {lifecycleSubscribers.length > 0 && (
+          {lifecycleSubscribers.length > 0 && can('republishLifecycle') && (
             <Button
               variant="info"
               disabled={republish.isPending}
@@ -1768,6 +1768,7 @@ function useSingletonSiblings(needed: boolean): WorkflowRun[] {
 const PAGE_SIZE = 100;
 
 export function App() {
+  const can = useCapabilities();
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
   // Arrays, not strings: each of these controls takes SEVERAL values, ORed within the axis and
   // ANDed across them — comparing two tenants, or two tags, is one query rather than two views.
@@ -1998,9 +1999,9 @@ export function App() {
                 title="Tags carried by a run (WorkflowRun.tags). Several match ANY of them."
               />
               <div className="mt-1.5 flex flex-wrap gap-1">
-                <LifecyclePendingFilter tags={tagFilter} onChange={setTagFilter} />
+                {can('tags') && <LifecyclePendingFilter tags={tagFilter} onChange={setTagFilter} />}
               </div>
-              <div className="mt-1.5">
+              <div className={can('namespaces') ? 'mt-1.5' : 'hidden'}>
                 <ValuePicker
                   field="namespace"
                   scope={namespaceScope}
@@ -2012,9 +2013,13 @@ export function App() {
                   title="Tenant / worker-pool partition (WorkflowRun.namespace). None selected shows every tenant."
                 />
               </div>
-              <AttributeFilters value={attrFilter} onChange={setAttrFilter} scope={attrScope} />
+              {can('searchAttributes') && (
+                <AttributeFilters value={attrFilter} onChange={setAttrFilter} scope={attrScope} />
+              )}
             </div>
-            <OriginFacets facets={originChips} value={originFilter} onChange={setOriginFilter} />
+            {can('origins') && (
+              <OriginFacets facets={originChips} value={originFilter} onChange={setOriginFilter} />
+            )}
             {anyFilter && matchedTotal > 0 && (
               <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
                 <span className="mono text-[10px] text-zinc-500">

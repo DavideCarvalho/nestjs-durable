@@ -144,7 +144,7 @@ describe('durableClient: the run-list query string', () => {
   });
 });
 
-describe('durableClient: 401 handling (session gone mid-console)', () => {
+describe('durableClient: 401 handling (credentials gone mid-console)', () => {
   beforeEach(() => {
     (globalThis as { window?: FakeWindow }).window = {
       __DURABLE_BASE__: '/durable',
@@ -158,33 +158,7 @@ describe('durableClient: 401 handling (session gone mid-console)', () => {
     vi.unstubAllGlobals();
   });
 
-  it('sends the operator to the login page (with returnTo) when the server offers Mode B', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue(jsonResponse({ auth: { modes: ['login'] } }, 401)),
-    );
-
-    await expect(durableClient.runs()).rejects.toThrow();
-
-    const win = (globalThis as unknown as { window: FakeWindow }).window;
-    expect(win.location.href).toBe(
-      '/durable/login?returnTo=%2Fdurable%2Fruns%2Fabc%3Ftab%3Dtimeline',
-    );
-  });
-
-  it('sends the operator to the UI mount (renders the Mode-A session-required page) when only session mode is offered', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue(jsonResponse({ auth: { modes: ['session'] } }, 401)),
-    );
-
-    await expect(durableClient.runs()).rejects.toThrow();
-
-    const win = (globalThis as unknown as { window: FakeWindow }).window;
-    expect(win.location.href).toBe('/durable');
-  });
-
-  it('falls back to the UI mount when an older server sends a bare 401 with no auth info', async () => {
+  it('reloads the UI mount so the host protection answers the navigation', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({}, 401)));
 
     await expect(durableClient.runs()).rejects.toThrow();
@@ -194,10 +168,7 @@ describe('durableClient: 401 handling (session gone mid-console)', () => {
   });
 
   it('does not surface the raw "401 Unauthorized" status text as the rejection message', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue(jsonResponse({ auth: { modes: ['login'] } }, 401)),
-    );
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({}, 401)));
 
     await expect(durableClient.runs()).rejects.not.toMatchObject({
       message: '401 Unauthorized',

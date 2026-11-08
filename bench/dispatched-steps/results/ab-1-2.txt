@@ -1,0 +1,12 @@
+seq10 base {"msPerStep":19.28,"firstDecile":23,"lastDecile":13,"sqlPerStep":20.3,"cpuMsPerStep":13.39,"stickyHits":0}
+seq10 sticky {"msPerStep":14.15,"firstDecile":21,"lastDecile":10,"sqlPerStep":11.2,"cpuMsPerStep":9.83,"stickyHits":10}
+seq10 both {"msPerStep":14.33,"firstDecile":20,"lastDecile":8,"sqlPerStep":11.2,"cpuMsPerStep":9.61,"stickyHits":10}
+seq200 base {"msPerStep":10.72,"firstDecile":12.74,"lastDecile":9.95,"sqlPerStep":19.07,"cpuMsPerStep":6.15,"stickyHits":0}
+seq200 sticky {"msPerStep":7.91,"firstDecile":8.11,"lastDecile":7.89,"sqlPerStep":10.06,"cpuMsPerStep":3.63,"stickyHits":200}
+seq200 both {"msPerStep":8.44,"firstDecile":9.37,"lastDecile":7.42,"sqlPerStep":10.06,"cpuMsPerStep":3.79,"stickyHits":200}
+seq1000 base {"msPerStep":11.81,"firstDecile":9.95,"lastDecile":14.86,"sqlPerStep":19.01,"cpuMsPerStep":6.38,"stickyHits":0}
+seq1000 sticky {"msPerStep":8.01,"firstDecile":9.41,"lastDecile":8.28,"sqlPerStep":10.01,"cpuMsPerStep":2.8,"stickyHits":1000}
+seq1000 both {"msPerStep":10.95,"firstDecile":8.99,"lastDecile":11.38,"sqlPerStep":10.01,"cpuMsPerStep":3.11,"stickyHits":1000}
+throughput base {"wfPerSec":46.23,"sqlPerStep":22.39,"cpuMsPerWf":17.43,"stickyHits":0}
+throughput sticky {"wfPerSec":60.1,"sqlPerStep":13.19,"cpuMsPerWf":12.49,"stickyHits":5000}
+throughput both {"wfPerSec":97.67,"sqlPerStep":13.19,"cpuMsPerWf":11.51,"stickyHits":5000}

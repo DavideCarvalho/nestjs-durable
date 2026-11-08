@@ -661,6 +661,36 @@ warning). Policies can be scoped to a namespace, tags, workflows or search attri
 [Retention](/docs/reliability/retention) for the full policy shape, the sweep interval/batch-size
 defaults, and how "keep" bounds combine.
 
+### Fleet-wide sweeps on one pod
+
+Three sweeps act on the whole fleet's data rather than claiming a run: retention pruning, the
+[stalled-run pager](/docs/reliability/stalled-runs), and the cleanup of buffered child completions no
+parent will consume. By default every driving pod runs them, which repeats the work, and makes the
+pager page once per pod.
+
+Import [`LocksModule`](https://docs.nestjs.com/reliability/locks) from `@nestjs/locks` with a
+**shared** lock store, and durable's sweepers run on one pod:
+
+```ts
+@Module({
+  imports: [
+    DurableModule.forRoot({ store, transport, retention, onStalled }),
+    LocksModule.forRoot(), // plus your shared LockStore provider (Redis, Postgres): see the official docs
+  ],
+})
+export class AppModule {}
+```
+
+There is nothing to configure on durable's side. At init it looks for `Locks` and logs which mode is
+on. Each sweep takes its own lease, `durable:retention`, `durable:stalled-pager` or
+`durable:buffered-signals` (with `:<namespace>` appended on a namespaced engine), and keeps it: the
+official lock renews itself every `ttl / 3`. The other pods skip that sweep until the holder stops
+renewing (a crash, or shutdown, where `Locks` hands the lease back), and the next tick elsewhere
+takes over. Without `LocksModule`, or with `@nestjs/locks` not installed, nothing changes.
+
+Work that claims runs (pending runs, crash recovery, timers, timeouts, schedules, lifecycle events)
+stays on every pod: each run is already arbitrated by a lease or a compare-and-set.
+
 ## 11. Encrypting payloads at rest
 
 Run and step inputs and outputs are stored as JSON. To keep them out of the database in the clear,
@@ -693,13 +723,14 @@ separately. See [Encrypting payloads](/docs/stores#coverage).
 Three views of the same engine lifecycle events, for different jobs:
 
 - **The dashboard** (`@dudousxd/nestjs-durable-dashboard`) is the operating surface — run list, the
-  step graph, retry/cancel/continue actions. It is **open by default**: with neither `guards` nor
-  `dashboardAuth` set, anyone who can reach `/durable` can read every run's payloads and retry or
-  cancel it, and nothing warns you. Before it ships, pass `guards` (your own `CanActivate`, which must
-  accept a cookie, since the SPA shell loads by browser navigation), or `dashboardAuth` (the built-in
-  signed session cookie, minted by your host's auth or a built-in login page), or both. A mount behind
-  an authenticating proxy is the third option: fold `basePath` into a prefix your proxy rules already
-  cover. See [Console auth](/docs/observability/dashboard#console-auth).
+  step graph, retry/cancel/continue actions. Anyone who reaches it can read every run's payloads
+  and retry or cancel it, so protect it with `@nestjs/authentication` / `@nestjs/authorization`,
+  one of two ways: `decorators` on the mounted console
+  (`forRoot({ decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view')] })`), or
+  `routes: false` and your own controllers extending `DurableUiControllerBase` /
+  `DurableApiControllerBase`. With `NODE_ENV=production`, a mounted console with no `decorators`
+  **fails the boot**, naming both ways. See
+  [Protecting the console](/docs/observability/dashboard#protecting-the-console).
 - **OpenTelemetry** (`@dudousxd/nestjs-durable-otel`) turns runs into traces — one root span per run,
   one child span per step — for the tracing stack you already run. `attachDurableOtel(engine)` is
   aimed at debugging production latency and correlation, not at operating a run. Note that the root
@@ -908,3 +939,90 @@ The cap is enforced by `engine.sweepTimeouts`, which the NestJS `TimerPoller` ca
 driving operator instance must be running (not `drive: false`) for it to fire, exactly like durable
 timers and retention. See [Scheduling](/docs/authoring/scheduling) for the poller, and
 [Event-driven workflows](/docs/authoring/events) for `validateInput` on an event-triggered start.
+
+## 15. Performance
+
+### Dispatched steps don't replay: the sticky continuation
+
+A dispatched `ctx.step` suspends the run until the step's result lands. Without anything else, the
+next turn would replay the workflow body from the top over the run's whole history, so a step would
+cost more the longer the run gets. Instead, the instance that ran the turn keeps the **parked body in
+memory**: the step call doesn't unwind, it waits. The turn still settles the run `suspended` and
+releases its lease exactly as before. When the result's turn runs on the same instance, it re-reads
+only the steps the body is parked on and lets the body continue from there. Per-step cost stays flat
+however long the run is, and the body runs once.
+
+It is an optimization only. The engine falls back to a normal replay whenever it can't be sure the
+parked body is the run's latest state:
+
+- the result's turn runs on **another instance** (or after a restart), which replays as usual;
+- **another turn settled the run** since the body parked (the run row's `updatedAt` stamp differs), or
+  the run was cancelled or retried;
+- the body was **evicted** (see the knobs below), or sat idle past `stickyIdleMs`;
+- the turn also suspended some other way (a `sleep`, a signal, a child, a step fan): only bodies parked
+  purely on dispatched `ctx.step` calls are kept;
+- the body called a `ctx` primitive **while detached**, between turns, e.g. after awaiting a raw timer
+  or fetch outside the ctx. The call is refused before it does anything, and the run replays;
+- an [execution wrapper](/docs/observability/telescope) (Telescope registers one) is registered: a resumed body runs in the async
+  scope of the turn that started it, and a wrapper expects one scope per turn.
+
+Non-determinism is still caught: a parked call re-checks its checkpoint, and every position past the
+park point is read from the store exactly as a replay reads it.
+
+| Option (`DurableModule` / `WorkflowEngine`) | Default | What it does |
+|---|---|---|
+| `stickyRuns` | `1000` | Parked bodies kept per instance; least recently used out first. `0` turns the cache off. |
+| `stickyIdleMs` | `300_000` | How long a parked body may wait for its next turn before it's dropped. |
+
+A parked body costs about 26 KB of heap (measured with a small body; its closures, the ctx and its
+pending promises), so the default holds ~26 MB at most. Runs past the limit just replay; raise it on an
+instance that keeps more runs in flight at once, lower it where memory is tight.
+
+### Several engine instances: results go back to the parked body
+
+With several engine instances consuming one results queue, a step's result would land on the instance
+holding its parked body only part of the time, and the others would replay. So a dispatched `ctx.step`
+asks for its result back: the task carries the dispatching instance's id (`replyTo`), and on a
+transport that routes replies (BullMQ) the worker sends the result to that instance's own queue
+(`<prefix>-results-to-<instance>`). Step fans (`ctx.all`) keep the shared queue, so a wide fan still
+spreads over every engine.
+
+A result is never lost to a missing instance. Each engine keeps an alive key in Redis; while it is
+missing (a crash, a scale-down, a shutdown, which deletes it first), workers send results to the
+shared queue, and every engine and worker moves what is left on a dead instance's queue there,
+stalled jobs included. That result then replays on whichever engine takes it. Engines and workers
+from before this change ignore `replyTo`, so a rolling deploy mixes freely.
+
+| Option | Where | Default | What it does |
+|---|---|---|---|
+| `routeReplies` | `DurableModule` / `WorkflowEngine` | `true` | Ask for routed results (only while the sticky cache is on). |
+| `replyRouting` | `BullMQTransport` | `true` | Consume and send routed results; `false` keeps everything on the shared queue. |
+| `replyAliveTtlMs` | `BullMQTransport` | `15_000` | How long an engine's alive key outlives its last refresh. |
+| `replySweepMs` | `BullMQTransport` | `5_000` | How often dead instances' queues are looked for. |
+| `replyDrainIdleMs` | `BullMQTransport` | `90_000` | How long an emptied dead queue is still watched before it's forgotten. |
+
+### Fewer round trips
+
+The bundled SQL stores implement optional `StateStore` methods that save round trips on the hot path:
+settling a batch of step results and reading the settled rows back in one statement
+(`settleResultsIfPending`), taking a run's lease and reading it at once (`tryLockRunAndGet`), writing a
+first dispatch's `pending` row without a read first (`insertCheckpointIfAbsent`), and claiming pending
+runs in batches with `FOR UPDATE SKIP LOCKED` (`claimPendingRuns`). Several driving replicas without a
+run queue split the backlog instead of racing for the same rows, and each runs its batch concurrently.
+The Drizzle (Postgres), TypeORM, MikroORM and Prisma stores implement them on Postgres and MySQL (on
+MySQL, which has no `RETURNING`, the ones that still save a statement there); on SQLite they are
+left out. A custom store that omits them keeps working; the engine falls back to the read-then-write
+calls. A store for a database without `RETURNING` can build `settleResultsIfPending` for batches on
+its own batched calls with `settleResultsWithPlainCalls` from the core package.
+
+The sticky continuation recognizes the run row by the exact `updatedAt` its suspend wrote, so a store
+must keep that column to the millisecond. Every bundled store does on Postgres and MySQL (the
+TypeORM and MikroORM auto-schemas raise older second-precision MySQL columns at boot); one that rounds
+it just replays every turn.
+
+On node-postgres, the Drizzle store sends these statements as constant SQL text instead of rebuilding
+them with drizzle's query builder every time (other drivers keep the builder), as named prepared
+statements, so Postgres parses each one once per connection; that halves its CPU per workflow. Prepared
+statements need a direct connection, or a pooler that supports protocol-level prepared statements.
+Behind PgBouncer in transaction mode before 1.21, turn them off with
+`new DrizzlePgStateStore(db, { preparedStatements: false })`.

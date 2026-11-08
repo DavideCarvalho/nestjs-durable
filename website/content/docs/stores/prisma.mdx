@@ -107,6 +107,10 @@ Using [persisted schedules](/docs/authoring/persisted-schedules)? Also copy the 
 model (table `durable_schedules`) from the package's `prisma/schema.prisma`. Without it every other
 store method works; `engine.schedules` throws a clear error pointing at the missing model.
 
+Sending signals with a [dedupe `id`](/docs/concepts/sleep-and-signals#deduplicating-signals-id)? Copy
+the `DurableSignalId` model (table `durable_signal_ids`) too and run `prisma migrate dev`. Without it,
+`signal(…, { id })` throws the same kind of error; signals without an id are unaffected.
+
 ## 2. Generate and wire the store
 
 ```bash

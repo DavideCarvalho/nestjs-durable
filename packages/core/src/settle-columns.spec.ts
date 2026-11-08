@@ -77,12 +77,13 @@ function measured<T extends StateStore>(
   return { store, written: () => bytes, read: () => readBytes };
 }
 
-function setup(store: StateStore) {
+function setup(store: StateStore, opts: { stickyRuns?: number } = {}) {
   const transport = new HeldTransport();
   const engine = new WorkflowEngine({
     store,
     transports: [{ id: 't', transport }],
     reconcileMs: 0,
+    ...opts,
   });
   const events: WorkflowEvent[] = [];
   engine.subscribe((e) => events.push(e));
@@ -181,7 +182,8 @@ describe("a step's result settles its checkpoint without its input", () => {
 
   it('a duplicate delivery loses the claim: the step settles and the run resumes once', async () => {
     const inner = new InMemoryStateStore();
-    const { engine, transport, events, turns } = setup(inner);
+    // Counts body replays, so the body must replay: no sticky continuation.
+    const { engine, transport, events, turns } = setup(inner, { stickyRuns: 0 });
     await startRun(engine, 'wf', {}, 'r1');
     const task = transport.dispatched[0] as RemoteTask;
 

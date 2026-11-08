@@ -4,6 +4,7 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { DrizzlePgStateStore } from './drizzle-pg-state-store';
+import { dedicatedPgDatabaseUrl } from './test-database';
 
 /**
  * Singleton admission under real concurrency: competing claims must never lock a workflow's active
@@ -21,7 +22,10 @@ beforeAll(async () => {
   if (!process.env.DURABLE_TEST_PG_URL) {
     container = await new PostgreSqlContainer('postgres:16-alpine').start();
   }
-  const url = process.env.DURABLE_TEST_PG_URL ?? container?.getConnectionUri();
+  // A database of its own: the other stores' specs define the same tables differently.
+  const url = process.env.DURABLE_TEST_PG_URL
+    ? await dedicatedPgDatabaseUrl(process.env.DURABLE_TEST_PG_URL, 'drizzle_singleton')
+    : container?.getConnectionUri();
   pool = new pg.Pool({ connectionString: url, max: 20 });
   store = new DrizzlePgStateStore(drizzle(pool));
   await store.ensureSchema();

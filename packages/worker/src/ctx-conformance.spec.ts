@@ -58,6 +58,8 @@ function commandToHistory(cmd: WorkflowCommand): HistoryEvent {
       return { seq: cmd.seq, kind: 'signal' };
     case 'startChild':
       return { seq: cmd.seq, kind: 'child', name: cmd.workflow };
+    case 'waitAny':
+      return { seq: cmd.seq, kind: 'any', name: cmd.name };
   }
 }
 

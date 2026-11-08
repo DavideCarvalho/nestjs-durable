@@ -67,6 +67,7 @@ import {
   bufferedSignals,
   durableSchedules,
   runAttributes,
+  signalIds,
   signalWaiters,
   stepCheckpoints,
   workflowRuns,
@@ -1287,6 +1288,60 @@ export class DrizzleStateStore implements StateStore {
     if (!row) return null;
     await this.db.delete(bufferedSignals).where(eq(bufferedSignals.id, row.id));
     return { payload: row.payload ?? undefined };
+  }
+
+  async takeOldestBufferedSignal(
+    tokens: string[],
+  ): Promise<{ token: string; payload: unknown } | null> {
+    if (tokens.length === 0) return null;
+    // One statement, so two takers can't both read the same row before either deletes it.
+    const oldest = this.db
+      .select({ id: bufferedSignals.id })
+      .from(bufferedSignals)
+      .where(inArray(bufferedSignals.token, [...new Set(tokens)]))
+      .orderBy(asc(bufferedSignals.id))
+      .limit(1);
+    const rows = await this.db
+      .delete(bufferedSignals)
+      .where(inArray(bufferedSignals.id, oldest))
+      .returning({ token: bufferedSignals.token, payload: bufferedSignals.payload });
+    const row = rows[0];
+    return row ? { token: row.token, payload: row.payload ?? undefined } : null;
+  }
+
+  async claimSignalId(
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    // Insert, or take over an expired row; a live row makes the upsert a no-op that returns nothing.
+    const rows = await this.db
+      .insert(signalIds)
+      .values({ token, signalId: id, expiresAt })
+      .onConflictDoUpdate({
+        target: [signalIds.token, signalIds.signalId],
+        set: { expiresAt },
+        setWhere: lte(signalIds.expiresAt, nowMs),
+      })
+      .returning({ token: signalIds.token });
+    return rows.length > 0;
+  }
+
+  async releaseSignalId(token: string, id: string): Promise<void> {
+    await this.db
+      .delete(signalIds)
+      .where(and(eq(signalIds.token, token), eq(signalIds.signalId, id)));
+  }
+
+  async deleteExpiredSignalIds(nowMs: number, limit: number): Promise<number> {
+    const rows = await this.db
+      .delete(signalIds)
+      .where(
+        sql`(${signalIds.token}, ${signalIds.signalId}) in (select ${signalIds.token}, ${signalIds.signalId} from ${signalIds} where ${signalIds.expiresAt} <= ${nowMs} limit ${limit})`,
+      )
+      .returning({ token: signalIds.token });
+    return rows.length;
   }
 
   async listBufferedSignals(

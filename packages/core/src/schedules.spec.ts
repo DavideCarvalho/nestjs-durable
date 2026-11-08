@@ -207,4 +207,44 @@ describe('engine.schedules', () => {
     expect((await store.getRun(fired as string))?.tags).toContain('concurrency:tenant:q');
     expect((await engine.schedules.get('q'))?.lastError).toBeUndefined();
   });
+
+  it('fires an rrule schedule on its occurrences, in its time zone', async () => {
+    const { engine } = setup();
+    // T0 is Monday 2026-03-02 00:00Z; São Paulo is UTC-3, so 08:00 local is 11:00Z.
+    const created = await engine.schedules.create({
+      id: 'standup',
+      workflow: 'job',
+      rrule: 'FREQ=WEEKLY;BYDAY=MO,WE;BYHOUR=8',
+      timezone: 'America/Sao_Paulo',
+    });
+    expect(created.rrule).toBe('FREQ=WEEKLY;BYDAY=MO,WE;BYHOUR=8');
+    const monday = Date.parse('2026-03-02T11:00:00Z');
+    const wednesday = Date.parse('2026-03-04T11:00:00Z');
+    expect(created.nextFireAt?.getTime()).toBe(monday);
+    expect(await engine.schedules.tick(monday + 1_000)).toEqual([`sched:standup:${monday}`]);
+    expect((await engine.schedules.get('standup'))?.nextFireAt?.getTime()).toBe(wednesday);
+  });
+
+  it('an rrule that has ended stops the schedule (no next fire)', async () => {
+    const { engine } = setup();
+    const created = await engine.schedules.create({
+      id: 'once',
+      workflow: 'job',
+      rrule: 'DTSTART:20260302T060000Z\nFREQ=DAILY;COUNT=1',
+    });
+    const first = Date.parse('2026-03-02T06:00:00Z');
+    expect(created.nextFireAt?.getTime()).toBe(first);
+    expect(await engine.schedules.tick(first + 1_000)).toEqual([`sched:once:${first}`]);
+    expect((await engine.schedules.get('once'))?.nextFireAt).toBeNull();
+  });
+
+  it('refuses a bad rrule, and more than one of cron / every / rrule', async () => {
+    const { engine } = setup();
+    await expect(
+      engine.schedules.create({ id: 'bad', workflow: 'job', rrule: 'FREQ=MONTHLY;BYSETPOS=1' }),
+    ).rejects.toThrow(/BYSETPOS is not supported/);
+    await expect(
+      engine.schedules.create({ id: 'two', workflow: 'job', rrule: 'FREQ=DAILY', every: '1h' }),
+    ).rejects.toThrow(/exactly one of "cron", "every" or "rrule"/);
+  });
 });

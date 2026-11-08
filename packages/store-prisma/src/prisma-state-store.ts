@@ -24,6 +24,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepResultSettlement,
   type StepSettlement,
   type BufferedSignalRow as StoreBufferedSignalRow,
   TERMINAL_RUN_STATUSES,
@@ -37,6 +38,7 @@ import {
   parseDuration,
   retentionKeeps,
   runValueFacetsFromRuns,
+  settleResultsWithPlainCalls,
   singletonAdmissionDenialPatch,
   singletonAdmissionTags,
   singletonClaimantIds,
@@ -144,6 +146,12 @@ interface Delegate<Row> {
   groupBy(args: Args): Promise<Record<string, unknown>[]>;
 }
 
+interface SignalIdRow {
+  token: string;
+  signalId: string;
+  expiresAt: bigint;
+}
+
 interface ScheduleRow {
   id: string;
   namespace: string;
@@ -166,6 +174,8 @@ export interface DurablePrismaTx {
   durableBufferedEvent: Delegate<BufferedEventRow>;
   /** Only needed for persisted schedules (`engine.schedules`) — add the `DurableSchedule` model. */
   durableSchedule?: Delegate<ScheduleRow>;
+  /** Only needed for signal dedupe (`signal(..., { id })`) — add the `DurableSignalId` model. */
+  durableSignalId?: Delegate<SignalIdRow>;
 }
 
 export interface DurablePrismaClient extends DurablePrismaTx {
@@ -202,7 +212,50 @@ function namespaceWhere(namespace?: string): { namespace?: string } {
  * (`getRun`, checkpoints) are deliberately NOT scoped, per {@link StateStore}.
  */
 export class PrismaStateStore implements StateStore {
-  constructor(private readonly db: DurablePrismaClient) {}
+  // The round-trip-saving optional methods, bound on Postgres and MySQL (see `PrismaRoundTrips`);
+  // absent on SQLite, where the engine's read-then-write calls are used.
+  readonly settleResultsIfPending?: (
+    results: StepResultSettlement[],
+  ) => Promise<(StepCheckpoint | null)[]>;
+  readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  readonly tryLockRunAndGet?: (
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ) => Promise<WorkflowRun | null>;
+  readonly claimPendingRuns?: (
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ) => Promise<WorkflowRun[]>;
+
+  /** Raw single-statement writes on Postgres/MySQL (Prisma wraps `updateMany` in a transaction). */
+  private readonly fast?: PrismaRoundTrips;
+
+  constructor(private readonly db: DurablePrismaClient) {
+    const provider = (db as unknown as { _activeProvider?: string })._activeProvider;
+    const raw = typeof (db as unknown as RawPrismaClient).$queryRawUnsafe === 'function';
+    const dialect =
+      raw && provider === 'postgresql'
+        ? 'postgres'
+        : raw && provider === 'mysql'
+          ? 'mysql'
+          : undefined;
+    if (!dialect) return;
+    const fast = new PrismaRoundTrips(db, dialect, this);
+    this.fast = fast;
+    this.insertCheckpointIfAbsent = (cp) => fast.insertCheckpointIfAbsent(cp);
+    this.settleResultsIfPending = (results) => fast.settleResultsIfPending(results);
+    this.claimPendingRuns = (limit, owner, until, now, ns) =>
+      fast.claimPendingRuns(limit, owner, until, now, ns);
+    if (dialect === 'postgres') {
+      this.tryLockRunAndGet = (runId, owner, until, now) =>
+        fast.tryLockRunAndGet(runId, owner, until, now);
+    }
+  }
 
   async tryAdmitSingleton(
     runId: string,
@@ -292,9 +345,15 @@ export class PrismaStateStore implements StateStore {
     const data = toRunPatch(patch);
     // Nothing to write but (maybe) the attribute side-table: the compare is a read (an `updateMany`
     // with no data would report zero rows even on a match).
-    const count = Object.keys(data).length
-      ? (await this.db.durableWorkflowRun.updateMany({ where, data })).count
-      : await this.db.durableWorkflowRun.count({ where });
+    // One raw UPDATE where it can be (Prisma's `updateMany` opens a transaction around it).
+    const raw = Object.keys(data).length
+      ? this.fast?.updateRunWhere(runId, expectedStatuses, patch)
+      : undefined;
+    const count = raw
+      ? await raw
+      : Object.keys(data).length
+        ? (await this.db.durableWorkflowRun.updateMany({ where, data })).count
+        : await this.db.durableWorkflowRun.count({ where });
     if (count === 0) return false;
     if ('searchAttributes' in patch) await this.reindexAttributes(runId, patch.searchAttributes);
     return true;
@@ -493,7 +552,9 @@ export class PrismaStateStore implements StateStore {
       seen.add(key);
       firsts.push(i);
     });
-    const dialect = rawSettleDialect(this.db);
+    // One result (a dispatched step's, the common case) is one conditional `updateMany`: a single
+    // statement, so neither a transaction nor the raw batch statement is worth it.
+    const dialect = firsts.length === 1 ? undefined : rawSettleDialect(this.db);
     if (!dialect) {
       // One conditional `updateMany` per entry, in one transaction: the row count is its answer.
       const settle = async (db: Pick<DurablePrismaClient, 'durableStepCheckpoint'>) => {
@@ -641,6 +702,10 @@ export class PrismaStateStore implements StateStore {
     // the engine's terminal path, surface as an unhandled rejection. `updateMany` matches a 0-row
     // WHERE to an empty result (no throw), mirroring the in-memory store's `if (run)` guard and the
     // set-where semantics of every sibling adapter (TypeORM/MikroORM/Drizzle).
+    if (this.fast) {
+      await this.fast.releaseRunLock(runId, owner);
+      return;
+    }
     await this.db.durableWorkflowRun.updateMany({
       where: owner === undefined ? { id: runId } : { id: runId, lockedBy: owner },
       data: { lockedBy: null, lockedUntil: null },
@@ -1115,6 +1180,84 @@ export class PrismaStateStore implements StateStore {
     if (!row) return null;
     await this.db.durableBufferedSignal.delete({ where: { id: row.id } });
     return { payload: row.payload ?? undefined };
+  }
+
+  async takeOldestBufferedSignal(
+    tokens: string[],
+  ): Promise<{ token: string; payload: unknown } | null> {
+    if (tokens.length === 0) return null;
+    const unique = [...new Set(tokens)];
+    // Read the oldest row, then delete it by id: the delete's count decides who took it, so a taker
+    // that loses the row to a concurrent one reads the next oldest instead.
+    for (;;) {
+      const row = await this.db.durableBufferedSignal.findFirst({
+        where: { token: { in: unique } },
+        orderBy: { id: 'asc' },
+      });
+      if (!row) return null;
+      const { count } = await this.db.durableBufferedSignal.deleteMany({ where: { id: row.id } });
+      if (count === 1) return { token: row.token, payload: row.payload ?? undefined };
+    }
+  }
+
+  private signalIds(): Delegate<SignalIdRow> {
+    const delegate = this.db.durableSignalId;
+    if (!delegate) {
+      throw new Error(
+        'signal dedupe (`signal(..., { id })`) needs the DurableSignalId model — copy it from prisma/schema.prisma into your schema and re-run `prisma generate`',
+      );
+    }
+    return delegate;
+  }
+
+  async claimSignalId(
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    // Insert first: the primary key decides between concurrent claims (P2002 for the losers). On a
+    // duplicate, take the row over only if it expired — a PK-scoped conditional UPDATE, so concurrent
+    // takeovers serialize on the one row lock and exactly one sees it expired. (A DELETE-expired-then-
+    // INSERT deadlocks on MySQL: the range delete takes gap locks the concurrent inserts wait on.) A
+    // row deleted between the duplicate and the update (released, or swept) is inserted again.
+    const ids = this.signalIds();
+    for (;;) {
+      try {
+        await ids.create({ data: { token, signalId: id, expiresAt: BigInt(expiresAt) } });
+        return true;
+      } catch (err) {
+        if ((err as { code?: unknown } | null)?.code !== 'P2002') throw err;
+      }
+      const { count } = await ids.updateMany({
+        where: { token, signalId: id, expiresAt: { lte: BigInt(nowMs) } },
+        data: { expiresAt: BigInt(expiresAt) },
+      });
+      if (count === 1) return true;
+      if ((await ids.count({ where: { token, signalId: id } })) > 0) return false;
+    }
+  }
+
+  async releaseSignalId(token: string, id: string): Promise<void> {
+    await this.signalIds().deleteMany({ where: { token, signalId: id } });
+  }
+
+  async deleteExpiredSignalIds(nowMs: number, limit: number): Promise<number> {
+    const ids = this.signalIds();
+    const expired = { lte: BigInt(nowMs) };
+    const rows = await ids.findMany({
+      where: { expiresAt: expired },
+      select: { token: true, signalId: true },
+      take: limit,
+    });
+    if (rows.length === 0) return 0;
+    const { count } = await ids.deleteMany({
+      where: {
+        expiresAt: expired,
+        OR: rows.map((r) => ({ token: r.token, signalId: r.signalId })),
+      },
+    });
+    return count;
   }
 
   async listBufferedSignals(
@@ -1693,4 +1836,323 @@ function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+/** A raw row (columns as stored, snake_case) under the model's field names. */
+function fromRawRow<T>(raw: Record<string, unknown>): T {
+  const row: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    row[key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase())] = value;
+  }
+  return row as T;
+}
+
+/** How a raw statement binds a column's value (see `PrismaRoundTrips.param`). */
+type ColumnKind = 'text' | 'int' | 'bigint' | 'json' | 'date';
+
+/** The checkpoint columns a settle reads back: every one but `input`. */
+const SETTLED_CHECKPOINT_COLUMNS =
+  'run_id, seq, name, kind, step_id, status, output, error, events, attempts, worker_group, parallel_group, wake_at, enqueued_at, started_at, finished_at';
+
+/**
+ * The optional round-trip-saving `StateStore` methods. On Postgres, raw SQL on the models' fixed
+ * tables and columns, each in one statement (`RETURNING`); timestamps converted as the raw batch
+ * settle converts them (the models' `DateTime` is a `timestamp(3)` holding UTC). On MySQL, which has
+ * no `RETURNING`, the ones that still save a statement there.
+ */
+class PrismaRoundTrips {
+  private readonly pg: boolean;
+
+  constructor(
+    private readonly db: DurablePrismaClient,
+    dialect: 'postgres' | 'mysql',
+    /** The store itself, whose batched plain calls settle a MySQL batch. */
+    private readonly store: StateStore,
+  ) {
+    this.pg = dialect === 'postgres';
+  }
+
+  private get raw(): RawPrismaClient {
+    return this.db as unknown as RawPrismaClient;
+  }
+
+  async tryLockRunAndGet(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null> {
+    const rows = await this.raw.$queryRawUnsafe<Record<string, unknown>[]>(
+      `UPDATE "durable_workflow_runs" SET locked_by = $1, locked_until = ($2::timestamptz AT TIME ZONE 'UTC') WHERE id = $3 AND (locked_until IS NULL OR locked_until <= ($4::timestamptz AT TIME ZONE 'UTC')) RETURNING *`,
+      owner,
+      new Date(leaseUntilMs).toISOString(),
+      runId,
+      new Date(nowMs).toISOString(),
+    );
+    const [row] = rows;
+    return row ? fromRunRow(fromRawRow<RunRow>(row)) : null;
+  }
+
+  /** A parameter placeholder for `kind` at position `n` (1-based), in this dialect. */
+  private param(kind: ColumnKind, n: number): string {
+    if (this.pg) {
+      const p = `$${n}`;
+      if (kind === 'json') return `${p}::jsonb`;
+      if (kind === 'date') return `(${p}::timestamptz AT TIME ZONE 'UTC')`;
+      if (kind === 'bigint') return `${p}::bigint`;
+      if (kind === 'int') return `${p}::integer`;
+      return p;
+    }
+    return kind === 'json' ? 'CAST(? AS JSON)' : '?';
+  }
+
+  /** A value of `kind` as the raw statement binds it (dates as UTC, JSON as text). */
+  private value(kind: ColumnKind, v: unknown): unknown {
+    if (v == null) return null;
+    if (kind === 'json') return JSON.stringify(v);
+    if (kind === 'date') {
+      const iso = (v instanceof Date ? v : new Date(v as number)).toISOString();
+      return this.pg ? iso : iso.replace('T', ' ').replace('Z', '');
+    }
+    return v;
+  }
+
+  private q(name: string): string {
+    return this.pg ? `"${name}"` : `\`${name}\``;
+  }
+
+  async insertCheckpointIfAbsent(checkpoint: StepCheckpoint): Promise<boolean> {
+    // One INSERT: Prisma's `createMany` would wrap it in a transaction.
+    const columns: [string, ColumnKind, unknown][] = [
+      ['run_id', 'text', checkpoint.runId],
+      ['seq', 'int', checkpoint.seq],
+      ['name', 'text', checkpoint.name],
+      ['kind', 'text', checkpoint.kind],
+      ['step_id', 'text', checkpoint.stepId],
+      ['status', 'text', checkpoint.status],
+      ['input', 'json', checkpoint.input],
+      ['output', 'json', checkpoint.output],
+      ['error', 'json', checkpoint.error],
+      ['events', 'json', checkpoint.events],
+      ['attempts', 'int', checkpoint.attempts],
+      ['worker_group', 'text', checkpoint.workerGroup],
+      ['parallel_group', 'text', checkpoint.parallelGroup],
+      ['wake_at', 'bigint', checkpoint.wakeAt],
+      ['enqueued_at', 'date', checkpoint.enqueuedAt ?? checkpoint.startedAt],
+      ['started_at', 'date', checkpoint.startedAt],
+      ['finished_at', 'date', checkpoint.finishedAt],
+    ];
+    const names = columns.map(([name]) => this.q(name)).join(', ');
+    const marks = columns.map(([, kind], i) => this.param(kind, i + 1)).join(', ');
+    const values = columns.map(([, kind, v]) => this.value(kind, v));
+    const insert = `INSERT INTO ${this.q('durable_step_checkpoints')} (${names}) VALUES (${marks})`;
+    if (this.pg) {
+      const rows = await this.raw.$queryRawUnsafe<unknown[]>(
+        `${insert} ON CONFLICT (run_id, seq) DO NOTHING RETURNING seq`,
+        ...values,
+      );
+      return rows.length === 1;
+    }
+    try {
+      await this.raw.$executeRawUnsafe(insert, ...values);
+      return true;
+    } catch (err) {
+      const code = String((err as { meta?: { code?: unknown } }).meta?.code ?? '');
+      if (code === '1062' || /Duplicate entry/i.test(String((err as Error).message))) return false;
+      throw err;
+    }
+  }
+
+  /** The run columns a raw patch may write, with their kinds; any other goes through `updateMany`. */
+  private static readonly RUN_COLUMNS: Record<string, [string, ColumnKind]> = {
+    workflow: ['workflow', 'text'],
+    workflowVersion: ['workflow_version', 'text'],
+    status: ['status', 'text'],
+    input: ['input', 'json'],
+    output: ['output', 'json'],
+    error: ['error', 'json'],
+    wakeAt: ['wake_at', 'bigint'],
+    lockedBy: ['locked_by', 'text'],
+    lockedUntil: ['locked_until', 'date'],
+    awaitingDecisionTaskId: ['awaiting_decision_task_id', 'text'],
+    recoveryAttempts: ['recovery_attempts', 'int'],
+    tags: ['tags', 'json'],
+    priority: ['priority', 'int'],
+    origin: ['origin', 'text'],
+    updatedAt: ['updated_at', 'date'],
+  };
+
+  /**
+   * `updateRunIf`'s compare-and-set as one raw UPDATE (Prisma's `updateMany` opens a transaction
+   * around it), resolving the rows it changed; `undefined` for a patch left to `updateMany` (search
+   * attributes, which reindex a side table, namespace, createdAt).
+   */
+  updateRunWhere(
+    runId: string,
+    expected: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ): Promise<number> | undefined {
+    const keys = Object.keys(patch).filter(
+      // A non-null date field left undefined is left alone, as toRunPatch does.
+      (k) => !(k === 'updatedAt' && patch.updatedAt == null),
+    );
+    if (keys.length === 0 || keys.some((k) => !PrismaRoundTrips.RUN_COLUMNS[k])) return undefined;
+    const values: unknown[] = [];
+    const set = keys.map((k) => {
+      const [column, kind] = PrismaRoundTrips.RUN_COLUMNS[k] as [string, ColumnKind];
+      values.push(this.value(kind, (patch as Record<string, unknown>)[k]));
+      return `${this.q(column)} = ${this.param(kind, values.length)}`;
+    });
+    values.push(runId);
+    const id = this.param('text', values.length);
+    const statuses = expected.map((status) => {
+      values.push(status);
+      return this.param('text', values.length);
+    });
+    return this.raw.$executeRawUnsafe(
+      `UPDATE ${this.q('durable_workflow_runs')} SET ${set.join(', ')} WHERE id = ${id} AND status IN (${statuses.join(', ')})`,
+      ...values,
+    );
+  }
+
+  /** `releaseRunLock` as one raw UPDATE (no transaction around it). */
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
+    const where = owner === undefined ? '' : ` AND locked_by = ${this.param('text', 2)}`;
+    await this.raw.$executeRawUnsafe(
+      `UPDATE ${this.q('durable_workflow_runs')} SET locked_by = NULL, locked_until = NULL WHERE id = ${this.param('text', 1)}${where}`,
+      runId,
+      ...(owner === undefined ? [] : [owner]),
+    );
+  }
+
+  async settleResultsIfPending(
+    results: StepResultSettlement[],
+  ): Promise<(StepCheckpoint | null)[]> {
+    const out: (StepCheckpoint | null)[] = results.map(() => null);
+    const seen = new Set<string>();
+    const sent = results.flatMap((r, i) => {
+      const key = checkpointKey(r.runId, r.seq);
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [i];
+    });
+    if (sent.length === 0) return out;
+    const finished = `NOT EXISTS (SELECT 1 FROM durable_workflow_runs r WHERE r.id = c.run_id AND r.status IN ('cancelled', 'completed'))`;
+    if (!this.pg) {
+      if (sent.length > 1) return settleResultsWithPlainCalls(this.store, results);
+      // MySQL, one result: one conditional UPDATE and a read of the row.
+      const i = sent[0] as number;
+      const s = results[i] as StepResultSettlement;
+      const done = s.status === 'completed';
+      const at = (d: Date) => d.toISOString().replace('T', ' ').replace('Z', '');
+      const wrote = await this.raw.$executeRawUnsafe(
+        `UPDATE durable_step_checkpoints c SET c.status = ?, c.output = ${done ? 'CAST(? AS JSON)' : 'c.output'}, c.error = CAST(? AS JSON), c.events = COALESCE(CAST(? AS JSON), c.events), c.started_at = COALESCE(?, c.started_at), c.finished_at = ? WHERE c.run_id = ? AND c.seq = ? AND c.status = 'pending' AND ${finished}`,
+        s.status,
+        ...(done ? [jsonText(s.output)] : []),
+        jsonText(s.error),
+        jsonText(s.events),
+        s.startedAt ? at(s.startedAt) : null,
+        at(s.finishedAt),
+        s.runId,
+        s.seq,
+      );
+      if (wrote !== 1) return out;
+      const [row] = await this.raw.$queryRawUnsafe<Record<string, unknown>[]>(
+        `SELECT ${SETTLED_CHECKPOINT_COLUMNS} FROM durable_step_checkpoints WHERE run_id = ? AND seq = ?`,
+        s.runId,
+        s.seq,
+      );
+      out[i] = row ? fromCheckpointRow(fromRawRow<CheckpointRow>({ ...row, input: null })) : null;
+      return out;
+    }
+    for (let at = 0; at < sent.length; at += 500) {
+      const chunk = sent.slice(at, at + 500);
+      const values: unknown[] = [];
+      const rows = chunk.map((i) => {
+        const s = results[i] as StepResultSettlement;
+        const n = values.length;
+        values.push(
+          s.runId,
+          s.seq,
+          s.status,
+          jsonText(s.status === 'completed' ? s.output : null),
+          jsonText(s.error),
+          jsonText(s.events),
+          s.startedAt ? s.startedAt.toISOString() : null,
+          s.finishedAt.toISOString(),
+        );
+        const p = (k: number) => `$${n + k}`;
+        return `(${p(1)}::text, ${p(2)}::integer, ${p(3)}::text, ${p(4)}::jsonb, ${p(5)}::jsonb, ${p(6)}::jsonb, (${p(7)}::timestamptz AT TIME ZONE 'UTC'), (${p(8)}::timestamptz AT TIME ZONE 'UTC'))`;
+      });
+      const settled = await this.raw.$queryRawUnsafe<Record<string, unknown>[]>(
+        `UPDATE "durable_step_checkpoints" AS c SET status = v.status, output = CASE WHEN v.status = 'completed' THEN v.output ELSE c.output END, error = v.error, events = COALESCE(v.events, c.events), started_at = COALESCE(v.started_at, c.started_at), finished_at = v.finished_at FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending' AND ${finished} RETURNING ${SETTLED_CHECKPOINT_COLUMNS.split(
+          ', ',
+        )
+          .map((col) => `c.${col}`)
+          .join(', ')}`,
+        ...values,
+      );
+      const byKey = new Map(
+        chunk.map((i) => {
+          const s = results[i] as StepResultSettlement;
+          return [checkpointKey(s.runId, s.seq), i];
+        }),
+      );
+      for (const raw of settled) {
+        const cp = fromCheckpointRow(fromRawRow<CheckpointRow>({ ...raw, input: null }));
+        const i = byKey.get(checkpointKey(cp.runId, cp.seq));
+        if (i !== undefined) out[i] = cp;
+      }
+    }
+    return out;
+  }
+
+  async claimPendingRuns(
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const sort = (runs: WorkflowRun[]) =>
+      runs.sort(
+        (a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id),
+      );
+    if (this.pg) {
+      const ns = namespace !== undefined ? ' AND namespace = $5' : '';
+      const rows = await this.raw.$queryRawUnsafe<Record<string, unknown>[]>(
+        `WITH claimed AS MATERIALIZED (SELECT id AS claimed_id FROM "durable_workflow_runs" WHERE status = 'pending' AND (locked_until IS NULL OR locked_until <= ($3::timestamptz AT TIME ZONE 'UTC'))${ns} ORDER BY created_at, id LIMIT $4 FOR UPDATE SKIP LOCKED) UPDATE "durable_workflow_runs" AS r SET locked_by = $1, locked_until = ($2::timestamptz AT TIME ZONE 'UTC') FROM claimed WHERE r.id = claimed.claimed_id RETURNING r.*`,
+        owner,
+        new Date(leaseUntilMs).toISOString(),
+        new Date(nowMs).toISOString(),
+        limit,
+        ...(namespace !== undefined ? [namespace] : []),
+      );
+      return sort(rows.map((raw) => fromRunRow(fromRawRow<RunRow>(raw))));
+    }
+    // MySQL (8.0+): lock the oldest free pending rows, skipping rows another claimer holds, then
+    // lease them, in one transaction.
+    return this.db.$transaction(async (tx) => {
+      const raw = tx as unknown as RawPrismaClient;
+      const at = (ms: number) => new Date(ms).toISOString().replace('T', ' ').replace('Z', '');
+      const ns = namespace !== undefined ? ' AND namespace = ?' : '';
+      const picked = (
+        await raw.$queryRawUnsafe<Record<string, unknown>[]>(
+          `SELECT * FROM durable_workflow_runs WHERE status = 'pending' AND (locked_until IS NULL OR locked_until <= ?)${ns} ORDER BY created_at, id LIMIT ? FOR UPDATE SKIP LOCKED`,
+          at(nowMs),
+          ...(namespace !== undefined ? [namespace] : []),
+          limit,
+        )
+      ).map((row) => fromRunRow(fromRawRow<RunRow>(row)));
+      if (picked.length === 0) return [];
+      await raw.$executeRawUnsafe(
+        `UPDATE durable_workflow_runs SET locked_by = ?, locked_until = ? WHERE id IN (${picked.map(() => '?').join(', ')})`,
+        owner,
+        at(leaseUntilMs),
+        ...picked.map((run) => run.id),
+      );
+      return sort(picked.map((run) => ({ ...run, lockedBy: owner, lockedUntil: leaseUntilMs })));
+    });
+  }
 }

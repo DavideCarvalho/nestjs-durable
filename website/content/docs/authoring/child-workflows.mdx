@@ -80,6 +80,26 @@ The dispatch is checkpointed (replay-safe — it won't re-fire on resume) and id
 
 <CodeFlow scene="start-child" />
 
+### When the parent ends first — `parentClose`
+
+By default a parent that completes or fails leaves its children running, and a cancelled parent
+cascades its cancel to them. `parentClose` decides per child:
+
+```ts
+await ctx.startChild(ReindexSearchWorkflow, { postId: post.id }, { parentClose: 'terminate' });
+```
+
+| `parentClose` | When the parent completes or fails | When the parent is cancelled |
+| --- | --- | --- |
+| *(omitted)* | child keeps running | cancelled (the cascade) |
+| `'cancel'` | cancelled **with** its saga undo (`cancel(child, { compensate: true })`) | cancelled (the cascade) |
+| `'terminate'` | cancelled without compensating | cancelled (the cascade) |
+| `'abandon'` | keeps running | **keeps running**: the cascade skips it |
+
+It works on `ctx.child` too, for a parent cancelled or failed while it waits. The policy is stamped
+on the child as the tag `parent-close:<policy>`. It applies to in-process (TS class) parents; a
+workflow replayed by a remote worker ignores it.
+
 ## `ctx.all` — fan out N children of the same workflow, wait for all
 
 The common scatter-gather shape — process a batch by running the **same workflow** once per item, then

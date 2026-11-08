@@ -3,6 +3,7 @@ import {
   type RepublishLifecycleResult,
   type RepublishLifecycleTarget,
   type RunResult,
+  type SignalOptions,
   type StartOptions,
   type WorkflowClass,
   WorkflowEngine,
@@ -58,9 +59,13 @@ export class WorkflowService {
     return this.engine.waitForRun(runId, opts);
   }
 
-  /** Deliver an external signal (e.g. from a webhook) to the run waiting on `token`. */
-  signal(token: string, payload: unknown): Promise<RunResult | null> {
-    return this.engine.signal(token, payload);
+  /**
+   * Deliver an external signal (e.g. from a webhook) to the run waiting on `token`, or buffer it for
+   * the next wait on it. With `{ id }`, a re-send with the same token and id is dropped (resolves
+   * `null`): see {@link SignalOptions}.
+   */
+  signal(token: string, payload: unknown, opts?: SignalOptions): Promise<RunResult | null> {
+    return this.engine.signal(token, payload, opts);
   }
 
   /**

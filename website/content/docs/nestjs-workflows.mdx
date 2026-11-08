@@ -1,0 +1,140 @@
+---
+title: With @nestjs/workflows
+description: "Already on the official @nestjs/workflows engine? Keep it, and add what it doesn't ship: durable's dashboard over its instances, and remote steps that run on a Node or Python durable worker without holding the instance's lease."
+icon: Workflow
+---
+
+[`@nestjs/workflows`](https://docs.nestjs.com/reliability/workflows) is NestJS's own durable
+workflow engine: an embedded worker claims instances by lease and replays `run()` in-process. It
+has no console and no way to run a step in another process or language. Two packages add exactly
+that, on top of the official engine. Everything else (writing workflows, `WorkflowClient`,
+schedules, stores, testing) is the official API: see its docs.
+
+| Package | Adds |
+| --- | --- |
+| `@dudousxd/nestjs-durable-workflows-gateway` | durable's dashboard over the official instances |
+| `@dudousxd/nestjs-durable-workflows-remote` | `remoteStep()`: a step run by a durable worker over a durable transport |
+
+Both need `@nestjs/workflows` `>=0.0.5 <0.1`, Nest 12 and Node 22.
+
+## The dashboard
+
+```bash
+npm i @dudousxd/nestjs-durable-dashboard @dudousxd/nestjs-durable-workflows-gateway
+```
+
+```ts
+import { DurableDashboardModule } from '@dudousxd/nestjs-durable-dashboard';
+import { DurableWorkflowsGatewayModule } from '@dudousxd/nestjs-durable-workflows-gateway';
+import { WorkflowsModule } from '@nestjs/workflows';
+
+@Module({
+  imports: [
+    WorkflowsModule.forRoot(),
+    DurableWorkflowsGatewayModule.forRoot(),
+    DurableDashboardModule.forRoot({
+      decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view')],
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+No `DurableModule`: the gateway binds the dashboard's `RunGateway` to `WorkflowClient` (reads and
+control) and `WorkflowEvents` (live updates). [Protecting the console](/docs/observability/dashboard#protecting-the-console)
+works as for any durable console.
+
+What you get, mapped onto the official model:
+
+| Console | `@nestjs/workflows` |
+| --- | --- |
+| Run list, newest first, status chips | `client.list()` (see the cap below) |
+| Status `cancelling` | `compensating` |
+| Status `dead` | `compensation_failed` (needs a person; **Retry** reopens it) |
+| Run detail timeline | the journal from `getStatus(id, { journal: true })`: steps, sleeps, signal waits (`signal:<name>`), `waitForAny` (`any:<name>`), children, compensations, operator retries. `now`/`random`/`uuid` helper entries are left out |
+| Children | `getStatus(id, { children: true })` |
+| "Waiting on" | the instance's `waits`: `signal (key …)` |
+| **Retry** | `client.retry(id)` |
+| **Cancel + Undo** | `client.cancel(id)` (compensations run) |
+| **Cancel** | `client.terminate(id)` (they don't) |
+| **Fix & replay** | `client.start(workflow, correctedInput, { version })`: a fresh instance |
+| Live updates | `WorkflowEvents` |
+
+What the official engine has no notion of is declared unsupported, and the console hides it:
+search-attribute, tag, namespace and origin filters, breakpoints (**Continue**), lost-dispatch
+**Re-dispatch**, lifecycle events, the schedules panel and worker health. A gateway announces this
+through `capabilities` on `GET topology`, so the SPA needs no special build.
+
+Limits:
+
+- **List cap.** The official store pages oldest first and has no counts. The list and the status
+  counts read up to 1000 matching instances (`WORKFLOWS_LIST_CAP`) and sort and count those.
+- **Live updates are per process.** `WorkflowEvents` (and the `nestjs:workflows:*` diagnostics
+  channels) only carry what this process's worker runs. Instances run by another pod show their
+  new state when the console refetches.
+- The webhook receiver, `ctx.onUpdate` deliveries, `GET metrics` and the schedule routes are
+  durable-engine features and answer with an error here.
+
+## Remote steps
+
+```bash
+npm i @dudousxd/nestjs-durable-workflows-remote @dudousxd/nestjs-durable-transport-bullmq
+```
+
+```ts
+import { DurableRemoteStepsModule, remoteStep } from '@dudousxd/nestjs-durable-workflows-remote';
+
+@Module({
+  imports: [
+    WorkflowsModule.forRoot(),
+    DurableRemoteStepsModule.forRoot({ transport: new BullMQTransport({ connection }) }),
+  ],
+})
+export class AppModule {}
+
+@Workflow('score-document')
+@Injectable()
+export class ScoreDocument {
+  async run(ctx: WorkflowContext, input: { docId: string }) {
+    const scored = await remoteStep<{ score: number }>(ctx, 'ml.score', {
+      group: 'ml',
+      input: { docId: input.docId },
+      timeout: '10m',
+      retry: { attempts: 3, delay: 5_000 },
+    });
+    return ctx.step('save', () => this.docs.saveScore(input.docId, scored.score));
+  }
+}
+```
+
+The step runs on whatever durable worker serves the handler, the Node
+[`@dudousxd/durable-worker`](/docs/cluster) or the [Python worker](/docs/python), over any
+durable [transport](/docs/transports). The task and result are durable's `RemoteTask` /
+`StepResult` wire format, so existing workers need no change.
+
+How it maps onto the official engine:
+
+1. `ctx.step('<name>:dispatch#<n>')` sends the task. It is journaled, so a replay never dispatches it again.
+2. `ctx.waitForAny('<name>:result#<n>', { result: ctx.signalWait('durable:remote-result', { key: taskId }), timeout: ctx.timer(timeout) })`.
+   The instance **parks**: it holds no lease and no worker slot while the remote worker runs.
+3. The module consumes the transport's results and calls
+   `client.signal('durable:remote-result', result, { key: taskId, id: taskId })`. The signal `id`
+   deduplicates, so a result delivered twice completes the step once.
+4. A failure the worker marks `retryable: false` stops at once. Otherwise each retry is a new
+   attempt (`#2`, `#3`, …) after a journaled `ctx.sleep` backoff, with a new task id. The default is
+   3 attempts, 1 s doubling; `retry: false` makes one attempt. When it gives up, a failed step
+   `<name>:failed` throws `RemoteStepFailedError`: catch it, or let it fail the instance
+   (compensations run).
+
+`remoteStep()` uses the module's instance; inject `RemoteSteps` and call `remoteSteps.run(ctx, …)`
+for the same thing through DI.
+
+Limits:
+
+- **No heartbeats.** The official `waitForAny` timer can't be extended, so `timeout` is the budget
+  for a whole attempt, queue time included. Size it for the slowest healthy run.
+- A result that arrives after its attempt timed out is stored as a signal nobody takes. The
+  official `client.purge()` removes it with the finished instances.
+- Test coverage: the in-process event-emitter transport with the Node `StepWorker`, and the Python
+  `durable_worker.Worker.process_task` across a process boundary (a stdio bridge stands in for the
+  broker; the BullMQ runner calls the same function).

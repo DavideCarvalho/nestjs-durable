@@ -504,6 +504,7 @@ flight raises `NondeterminismError` rather than silently diverging.
 | `ctx.side_effect(fn)` | Run `fn` once, checkpoint its result, replay the same value without re-running. For ids/random/env, e.g. `ctx.side_effect(lambda: str(uuid7()))`. |
 | `ctx.sleep(ms)` | Durable timer — the run suspends and the engine resumes it when it fires. |
 | `ctx.wait_signal(name)` | Block until a signal `name` is delivered (via `engine.signal`); returns its payload. |
+| `ctx.wait_for_any(name, {key: cond})` | Block until the first of several conditions: `ctx.signal_wait(name)`, `ctx.timer(ms)` / `ctx.timer(until=epoch_ms)`, `ctx.child_wait(run_id)`. Returns `{"key", "value"}`; only the winning signal is consumed (see [waitForAny](/docs/concepts/sleep-and-signals#waiting-for-the-first-of-several-waitforany)). |
 | `ctx.start_child(workflow, input)` | Start a child run and await its output (a failed child raises `StepFailed`). |
 | `ctx.gather_calls([{name, input}, …])` | Dispatch several steps **in parallel within one run** (flat, no child runs) and await all. |
 | `ctx.gather_children([…])` | Start several **child runs** in parallel and await all. |

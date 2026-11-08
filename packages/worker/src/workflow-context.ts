@@ -10,6 +10,10 @@ import type {
   StepLogger,
   StepOptions,
   StepRef,
+  WaitAnyCondition,
+  WaitAnyResult,
+  WaitCondition,
+  WaitConditionSpec,
   WaitForRunOptions,
   WorkflowClass,
   WorkflowCommand,
@@ -89,7 +93,7 @@ export interface WorkflowContextOptions {
  * `WorkflowCtx` runs UNCHANGED on the thin worker. The API splits in two:
  *
  * - **Supported** (wire-expressible) — {@link step} (always dispatched — no local placement),
- *   {@link sleep}, {@link waitForSignal}, {@link child}, {@link all}, {@link now}/{@link sideEffect}
+ *   {@link sleep}, {@link waitForSignal}, {@link waitForAny}, {@link child}, {@link all}, {@link now}/{@link sideEffect}
  *   (deterministic capture, backed by the internal {@link localStep} primitive): each maps to a
  *   {@link WorkflowCommand} (`call`/`recordStep`/`sleep`/`waitSignal`/`startChild`) the engine applies
  *   durably.
@@ -414,6 +418,58 @@ export class WorkflowContext implements WorkflowCtx {
     if (sig !== undefined) return sig.payload as TPayload;
     this.commands.push({ kind: 'waitSignal', seq, signal: token });
     throw new Suspend();
+  }
+
+  /**
+   * Durable wait for whichever of `conditions` happens first — the thin-worker twin of the engine's
+   * `ctx.waitForAny`. Takes ONE seq and emits a `waitAny` command; the ENGINE resolves it (timers
+   * included: it owns the clock, and a timer's `ms` counts from when it first applies the command),
+   * journals `{ key, value }` and replays it as an `any` history event. A child condition that won
+   * with a failure replays as that event's `error`, re-raised here as {@link StepFailed}.
+   */
+  async waitForAny<C extends Record<string, WaitCondition<unknown>>>(
+    name: string,
+    conditions: C,
+  ): Promise<WaitAnyResult<C>> {
+    const seq = this.next('waitForAny');
+    const { found, output } = this.replay(seq, 'any', name);
+    if (found) return output as WaitAnyResult<C>;
+    this.commands.push({
+      kind: 'waitAny',
+      seq,
+      name,
+      conditions: Object.entries(conditions).map(
+        ([key, c]): WaitAnyCondition => ({ ...(c as WaitConditionSpec), key }),
+      ),
+    });
+    throw new Suspend();
+  }
+
+  /** A signal condition for {@link waitForAny}. Matches `WorkflowCtx.signalWait`. */
+  signalWait<TPayload = unknown>(token: string): WaitCondition<TPayload> {
+    return { kind: 'signal', signal: token };
+  }
+
+  /** A timer condition for {@link waitForAny}. Matches `WorkflowCtx.timer`. */
+  timer(duration: string | number | { until: Date | number }): WaitCondition<null> {
+    if (typeof duration === 'object') {
+      const { until } = duration;
+      return { kind: 'timer', until: typeof until === 'number' ? until : until.getTime() };
+    }
+    return { kind: 'timer', ms: parseDuration(duration) };
+  }
+
+  /** A child condition for {@link waitForAny}: run `childId` settling. Matches `WorkflowCtx.childWait`. */
+  childWait<C extends WorkflowClass>(
+    workflow: C,
+    childId: string,
+  ): WaitCondition<WorkflowOutputOf<C>>;
+  childWait<TOutput = unknown>(childId: string): WaitCondition<TOutput>;
+  childWait(first: WorkflowRef, second?: string): WaitCondition<unknown> {
+    return {
+      kind: 'child',
+      childId: typeof first === 'string' && second === undefined ? first : (second as string),
+    };
   }
 
   /**

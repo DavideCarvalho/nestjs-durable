@@ -21,6 +21,10 @@ describe('WorkflowEngine — cancelled runs are not resurrected', () => {
       await ctx.waitForSignal('go');
     });
     await engine.start('wf', {}, 'run1');
+    // `start` returns before the first turn has run: let it park on the signal first.
+    for (let i = 0; i < 500 && (await store.getRun('run1'))?.status !== 'suspended'; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
     await engine.cancel('run1');
     const before = ran;
 

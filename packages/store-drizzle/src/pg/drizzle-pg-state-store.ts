@@ -24,6 +24,7 @@ import {
   type StepCheckpoint,
   type StepError,
   type StepEvent,
+  type StepResultSettlement,
   type StepSettlement,
   type StoreTransaction,
   TERMINAL_RUN_STATUSES,
@@ -49,6 +50,7 @@ import {
   eq,
   exists,
   getTableColumns,
+  getTableName,
   gt,
   gte,
   inArray,
@@ -64,12 +66,14 @@ import {
 import type { PgDatabase } from 'drizzle-orm/pg-core';
 import { type DurableSchemaLogger, ensureDrizzlePgDurableSchema } from './ddl';
 import { rowsOf } from './executor';
+import { PgHotPath, type PgHotPathOptions, TableCodec, placeholders, quote } from './hot-path';
 import {
   DEFAULT_NAMESPACE,
   durableBufferedEvents as bufferedEvents,
   durableBufferedSignals as bufferedSignals,
   durableRunAttributes as runAttributes,
   durableSchedules as schedules,
+  durableSignalIds as signalIds,
   durableSignalWaiters as signalWaiters,
   durableStepCheckpoints as stepCheckpoints,
   durableWorkflowRuns as workflowRuns,
@@ -106,6 +110,13 @@ export interface DrizzlePgStateStoreOptions {
    * satisfies it.
    */
   schemaLogger?: DurableSchemaLogger | undefined;
+  /**
+   * On node-postgres, send the statements every workflow turn and step result run as NAMED prepared
+   * statements, parsed once per connection (see `PgHotPathOptions`). Needs a direct connection or
+   * a pooler with protocol-level prepared statements; pass `false` behind PgBouncer in transaction
+   * mode before 1.21. Default on.
+   */
+  preparedStatements?: PgHotPathOptions['preparedStatements'];
 }
 
 /** OR a set of conditions where an EMPTY set means "matches nothing" (every plural `RunQuery`
@@ -152,12 +163,52 @@ const ms = (d: Date | null): number | undefined => (d == null ? undefined : d.ge
  */
 export class DrizzlePgStateStore implements StateStore {
   private readonly scopeNamespace: string | undefined;
+  /** Constant-SQL path for the per-step statements, on node-postgres (see `hot-path.ts`). */
+  private readonly hot: PgHotPath | undefined;
+  /** The run read-scope predicate as SQL text from `$2` on, and its values (hot path). */
+  private readonly hotScope: { text: string; values: unknown[] };
+  /** Hot-path UPDATE texts by patch shape. */
+  private readonly hotUpdates = new Map<string, string>();
 
   constructor(
     private readonly db: DrizzlePgDatabase,
     private readonly options: DrizzlePgStateStoreOptions = {},
   ) {
     this.scopeNamespace = options.scope?.namespace;
+    this.hot = PgHotPath.for(db, { preparedStatements: options.preparedStatements });
+    const ns = this.scopeNamespace;
+    this.hotScope =
+      ns === undefined
+        ? { text: '', values: [] }
+        : ns === DEFAULT_NAMESPACE || ns === ''
+          ? { text: ' AND "namespace" IN ($2, $3)', values: [DEFAULT_NAMESPACE, ''] }
+          : { text: ' AND "namespace" = $2', values: [ns] };
+  }
+
+  /**
+   * A hot-path `UPDATE` of the runs table setting `row`'s columns on run `$n`, optionally only while
+   * its status is one of `expected` (then `RETURNING "id"`). Text cached per shape.
+   */
+  private hotRunUpdate(
+    runId: string,
+    row: Partial<RunInsert>,
+    expected?: RunStatus[],
+  ): { text: string; values: unknown[] } {
+    const keys = Object.keys(row);
+    const shape = `${keys.join(',')}|${expected?.length ?? -1}`;
+    let text = this.hotUpdates.get(shape);
+    if (text === undefined) {
+      const set = keys.map((key, i) => `${RUNS.name(key)} = $${i + 1}`).join(', ');
+      const id = keys.length + 1;
+      text = `UPDATE ${T_RUNS} SET ${set} WHERE "id" = $${id}`;
+      if (expected) {
+        text += ` AND "status" IN (${placeholders(id + 1, expected.length)}) RETURNING "id"`;
+      }
+      this.hotUpdates.set(shape, text);
+    }
+    const values = keys.map((key) => RUNS.encode(key, (row as Record<string, unknown>)[key]));
+    values.push(runId, ...(expected ?? []));
+    return { text, values };
   }
 
   /** A store confined to `scope.namespace`, sharing this store's db (no new connection). Used by the
@@ -217,6 +268,11 @@ export class DrizzlePgStateStore implements StateStore {
     if (normalizeAttributeRows(run.id, run.searchAttributes).length === 0) {
       // Nothing to index: the insert, then clear any attribute rows a deleted run of this id left,
       // as two statements. The insert goes first, so a run that already exists keeps its rows.
+      if (this.hot) {
+        await this.hot.query(INSERT_RUN, RUNS.encodeRow(toRunRow(run) as Partial<RunRow>));
+        await this.hot.query(DELETE_ATTRIBUTES, [run.id]);
+        return;
+      }
       await this.db.insert(workflowRuns).values(toRunRow(run));
       await this.db.delete(runAttributes).where(eq(runAttributes.runId, run.id));
       return;
@@ -241,6 +297,11 @@ export class DrizzlePgStateStore implements StateStore {
     if (!Object.keys(row).length && !reindex) return;
     // A patch that leaves the attributes alone is one UPDATE, which needs no transaction.
     if (!reindex) {
+      if (this.hot) {
+        const { text, values } = this.hotRunUpdate(runId, row);
+        await this.hot.query(text, values);
+        return;
+      }
       await this.db.update(workflowRuns).set(row).where(eq(workflowRuns.id, runId));
       return;
     }
@@ -268,6 +329,19 @@ export class DrizzlePgStateStore implements StateStore {
     const row = toRunPatch(patch);
     const reindex = 'searchAttributes' in patch;
     const matches = and(eq(workflowRuns.id, runId), inArray(workflowRuns.status, expectedStatuses));
+    // A patch that leaves the attributes alone is one conditional UPDATE: no transaction needed.
+    if (!reindex && Object.keys(row).length) {
+      if (this.hot) {
+        const { text, values } = this.hotRunUpdate(runId, row, expectedStatuses);
+        return (await this.hot.query(text, values)).length === 1;
+      }
+      const applied = await this.db
+        .update(workflowRuns)
+        .set(row)
+        .where(matches)
+        .returning({ id: workflowRuns.id });
+      return applied.length === 1;
+    }
     return this.db.transaction(async (tx) => {
       // One conditional UPDATE: a writer racing another blocks on the row lock, then re-evaluates
       // the status predicate against the committed row. With no mapped column to write, the compare
@@ -283,6 +357,13 @@ export class DrizzlePgStateStore implements StateStore {
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
+    if (this.hot) {
+      const rows = await this.hot.query(`${SELECT_RUN}${this.hotScope.text} LIMIT 1`, [
+        runId,
+        ...this.hotScope.values,
+      ]);
+      return rows[0] ? fromRunRow(RUNS.decode(rows[0])) : null;
+    }
     const rows = await this.db
       .select()
       .from(workflowRuns)
@@ -362,6 +443,10 @@ export class DrizzlePgStateStore implements StateStore {
   }
 
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
+    if (this.hot) {
+      const rows = await this.hot.query(SELECT_CHECKPOINT, [runId, seq]);
+      return rows[0] ? fromCheckpointRow(CPS.decode(rows[0])) : null;
+    }
     const rows = await this.db
       .select()
       .from(stepCheckpoints)
@@ -391,6 +476,11 @@ export class DrizzlePgStateStore implements StateStore {
 
   async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
     const unique = [...new Set(seqs)];
+    if (this.hot) {
+      if (unique.length === 0) return [];
+      const rows = await this.hot.query(SELECT_CHECKPOINTS_FOR_SETTLE, [runId, unique]);
+      return rows.map((raw) => fromCheckpointRow(CPS_NO_INPUT.decode(raw)));
+    }
     const { input: _input, ...columns } = getTableColumns(stepCheckpoints);
     const rows: Omit<typeof stepCheckpoints.$inferSelect, 'input'>[] = [];
     for (let at = 0; at < unique.length; at += 500) {
@@ -412,6 +502,10 @@ export class DrizzlePgStateStore implements StateStore {
   }
 
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
+    if (this.hot) {
+      await this.hot.query(UPSERT_CHECKPOINT, CPS.encodeRow(toCheckpointRow(checkpoint)));
+      return;
+    }
     await upsertCheckpoint(this.db, checkpoint);
   }
 
@@ -452,7 +546,9 @@ export class DrizzlePgStateStore implements StateStore {
   async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
     const wrote = checkpoints.map(() => false);
     if (checkpoints.length === 0) return wrote;
-    await this.db.transaction(async (tx) => {
+    // One statement is atomic on its own; several (repeated rows, or more than a chunk) share a
+    // transaction so a rejection writes nothing.
+    await this.inTransactionIf(oneStatement(checkpoints), async (tx) => {
       // One statement can only update a row once, so a repeated row goes in a later round, which
       // then compares against the earlier entry's write.
       for (const round of distinctRounds(checkpoints)) {
@@ -478,7 +574,7 @@ export class DrizzlePgStateStore implements StateStore {
     const wrote = settlements.map(() => false);
     if (settlements.length === 0) return wrote;
     // As saveCheckpointsIfPending, with a statement that writes only what a result changes.
-    await this.db.transaction(async (tx) => {
+    await this.inTransactionIf(oneStatement(settlements), async (tx) => {
       for (const round of distinctRounds(settlements)) {
         for (let at = 0; at < round.length; at += CHECKPOINT_BATCH_ROWS) {
           const chunk = round.slice(at, at + CHECKPOINT_BATCH_ROWS);
@@ -496,6 +592,98 @@ export class DrizzlePgStateStore implements StateStore {
       }
     });
     return wrote;
+  }
+
+  async settleResultsIfPending(
+    results: StepResultSettlement[],
+  ): Promise<(StepCheckpoint | null)[]> {
+    const out: (StepCheckpoint | null)[] = results.map(() => null);
+    // A later entry for a row an earlier one settles loses: only the first of each row is sent.
+    const seen = new Set<string>();
+    const sent = results.flatMap((r, i) => {
+      const key = rowKey(r);
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [i];
+    });
+    if (sent.length === 0) return out;
+    if (this.hot && sent.length <= HOT_SETTLE_MAX_ROWS) {
+      const rows = await this.hot.query(
+        settleResultsText(sent.length),
+        sent.flatMap((i) => settleResultValues(results[i] as StepResultSettlement)),
+      );
+      const byKey = new Map(sent.map((i) => [rowKey(results[i] as StepResultSettlement), i]));
+      for (const raw of rows) {
+        const cp = fromCheckpointRow(CPS_NO_INPUT.decode(raw));
+        const i = byKey.get(rowKey(cp));
+        if (i !== undefined) out[i] = cp;
+      }
+      return out;
+    }
+    await this.inTransactionIf(sent.length <= CHECKPOINT_BATCH_ROWS, async (tx) => {
+      for (let at = 0; at < sent.length; at += CHECKPOINT_BATCH_ROWS) {
+        const chunk = sent.slice(at, at + CHECKPOINT_BATCH_ROWS);
+        const rows = rowsOf<Record<string, unknown>>(
+          await tx.execute(settleResultsFrom(chunk.map((i) => results[i] as StepResultSettlement))),
+        );
+        const byKey = new Map(chunk.map((i) => [rowKey(results[i] as StepResultSettlement), i]));
+        for (const raw of rows) {
+          const cp = fromCheckpointRow(settledRowFromDriver(raw));
+          const i = byKey.get(rowKey(cp));
+          if (i !== undefined) out[i] = cp;
+        }
+      }
+    });
+    return out;
+  }
+
+  async insertCheckpointIfAbsent(checkpoint: StepCheckpoint): Promise<boolean> {
+    if (this.hot) {
+      const values = CPS.encodeRow(toCheckpointRow(checkpoint));
+      return (await this.hot.query(INSERT_CHECKPOINT_IF_ABSENT, values)).length === 1;
+    }
+    const rows = await this.db
+      .insert(stepCheckpoints)
+      .values(toCheckpointRow(checkpoint))
+      .onConflictDoNothing({ target: [stepCheckpoints.runId, stepCheckpoints.seq] })
+      .returning({ seq: stepCheckpoints.seq });
+    return rows.length === 1;
+  }
+
+  async tryLockRunAndGet(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null> {
+    // tryLockRun's conditional UPDATE, returning the row it locked.
+    if (this.hot) {
+      const rows = await this.hot.query(
+        `${LOCK_RUN}${this.hotScope.text.replace(/\$(\d+)/g, (_, n) => `$${Number(n) + 3}`)} RETURNING ${RUNS.list}`,
+        [runId, owner, lockTime(leaseUntilMs), lockTime(nowMs), ...this.hotScope.values],
+      );
+      return rows[0] ? fromRunRow(RUNS.decode(rows[0])) : null;
+    }
+    const rows = await this.db
+      .update(workflowRuns)
+      .set({ lockedBy: owner, lockedUntil: new Date(leaseUntilMs) })
+      .where(
+        and(
+          eq(workflowRuns.id, runId),
+          or(isNull(workflowRuns.lockedUntil), lte(workflowRuns.lockedUntil, new Date(nowMs))),
+          this.scope(),
+        ),
+      )
+      .returning();
+    return rows[0] ? fromRunRow(rows[0]) : null;
+  }
+
+  /** Run `work` on the db as is when it is one statement (atomic by itself), else in a transaction. */
+  private inTransactionIf<T>(
+    single: boolean,
+    work: (tx: DrizzlePgDatabase) => Promise<T>,
+  ): Promise<T> {
+    return single ? work(this.db) : this.db.transaction((tx) => work(tx));
   }
 
   async transaction<T>(work: (tx: StoreTransaction) => Promise<T>): Promise<T> {
@@ -564,6 +752,49 @@ export class DrizzlePgStateStore implements StateStore {
     return rows.map(fromRunRow);
   }
 
+  async claimPendingRuns(
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    // One statement: pick the oldest free pending rows, skipping any another claimer holds locked
+    // right now, and lease them. Several pollers at once each get a different slice.
+    const filters = and(
+      eq(workflowRuns.status, 'pending'),
+      or(isNull(workflowRuns.lockedUntil), lte(workflowRuns.lockedUntil, new Date(nowMs))),
+      namespaceFilter(namespace),
+      this.scope(),
+    );
+    const returning = sql.join(
+      RUNS.columns.map(([, column]) => sql`r.${sql.identifier(column.name)}`),
+      sql`, `,
+    );
+    const rows = rowsOf<Record<string, unknown>>(
+      // A CTE, MATERIALIZED, picks the rows once. As a subquery in UPDATE ... FROM, Postgres may
+      // rescan it, and each rescan skips the rows this statement already updated and takes the
+      // next ones, so a claim of `limit` rows could lease every free pending run.
+      await this.db.execute(sql`WITH c AS MATERIALIZED (
+          SELECT ${workflowRuns.id} AS claimed_id FROM ${workflowRuns}
+          WHERE ${filters}
+          ORDER BY ${workflowRuns.createdAt}, ${workflowRuns.id}
+          LIMIT ${limit}
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE ${workflowRuns} AS r
+        SET ${sql.identifier(getTableColumns(workflowRuns).lockedBy.name)} = ${owner},
+          ${sql.identifier(getTableColumns(workflowRuns).lockedUntil.name)} = ${new Date(leaseUntilMs).toISOString()}::timestamptz
+        FROM c
+        WHERE r.${sql.identifier(getTableColumns(workflowRuns).id.name)} = c.claimed_id
+        RETURNING ${returning}`),
+    );
+    return rows
+      .map((raw) => fromRunRow(RUNS.decode(raw)))
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+  }
+
   async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
     const query = this.db
       .select()
@@ -590,6 +821,15 @@ export class DrizzlePgStateStore implements StateStore {
   ): Promise<boolean> {
     // One conditional UPDATE: under READ COMMITTED a concurrent contender blocks on the row lock,
     // then re-evaluates the WHERE against the winner's committed row and matches nothing.
+    if (this.hot) {
+      const rows = await this.hot.query(`${LOCK_RUN} RETURNING "id"`, [
+        runId,
+        owner,
+        lockTime(leaseUntilMs),
+        lockTime(nowMs),
+      ]);
+      return rows.length === 1;
+    }
     const rows = await this.db
       .update(workflowRuns)
       .set({ lockedBy: owner, lockedUntil: new Date(leaseUntilMs) })
@@ -604,6 +844,12 @@ export class DrizzlePgStateStore implements StateStore {
   }
 
   async releaseRunLock(runId: string, owner?: string): Promise<void> {
+    if (this.hot) {
+      await (owner === undefined
+        ? this.hot.query(RELEASE_LOCK, [runId])
+        : this.hot.query(`${RELEASE_LOCK} AND "locked_by" = $2`, [runId, owner]));
+      return;
+    }
     await this.db
       .update(workflowRuns)
       .set({ lockedBy: null, lockedUntil: null })
@@ -615,6 +861,10 @@ export class DrizzlePgStateStore implements StateStore {
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
+    if (this.hot) {
+      const rows = await this.hot.query(RENEW_LOCK, [runId, owner, lockTime(leaseUntilMs)]);
+      return rows.length === 1;
+    }
     const rows = await this.db
       .update(workflowRuns)
       .set({ lockedUntil: new Date(leaseUntilMs) })
@@ -842,6 +1092,19 @@ export class DrizzlePgStateStore implements StateStore {
   }
 
   async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
+    if (this.hot) {
+      const rows = (await this.hot.query(SELECT_REPLAY, [runId])).map((raw) =>
+        CPS_NO_INPUT.decode(raw),
+      );
+      const open = rows.filter((row) => row.status !== 'completed').map((row) => row.seq);
+      const inputs = new Map<number, unknown>();
+      if (open.length > 0) {
+        for (const raw of await this.hot.query(SELECT_INPUTS, [runId, open])) {
+          inputs.set(Number(raw.seq), CPS.decode(raw).input);
+        }
+      }
+      return rows.map((row) => fromCheckpointRow({ ...row, input: inputs.get(row.seq) ?? null }));
+    }
     const { input: _input, ...columns } = getTableColumns(stepCheckpoints);
     const rows = await this.db
       .select(columns)
@@ -886,6 +1149,10 @@ export class DrizzlePgStateStore implements StateStore {
     statuses: StepCheckpoint['status'][],
   ): Promise<boolean> {
     if (statuses.length === 0) return false;
+    if (this.hot) {
+      const rows = await this.hot.query(HAS_CHECKPOINTS, [runId, fromSeq, toSeq, statuses]);
+      return rows.length > 0;
+    }
     const rows = await this.db
       .select({ seq: stepCheckpoints.seq })
       .from(stepCheckpoints)
@@ -909,6 +1176,10 @@ export class DrizzlePgStateStore implements StateStore {
     statuses: StepCheckpoint['status'][],
   ): Promise<number> {
     if (statuses.length === 0) return 0;
+    if (this.hot) {
+      const rows = await this.hot.query(COUNT_CHECKPOINTS, [runId, fromSeq, toSeq, statuses]);
+      return Number(rows[0]?.n ?? 0);
+    }
     const rows = await this.db
       .select({ count: sql<number>`count(*)`.mapWith(Number) })
       .from(stepCheckpoints)
@@ -1135,6 +1406,12 @@ export class DrizzlePgStateStore implements StateStore {
   async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
     // Claim the oldest buffered signal for `token` with SKIP LOCKED and delete it in the same
     // statement: concurrent takers each get a different row (FIFO), none blocks, none double-reads.
+    if (this.hot) {
+      const [row] = await this.hot.query(TAKE_BUFFERED_SIGNAL, [token]);
+      if (!row) return null;
+      const payload = row.payload == null ? null : SIGNAL_PAYLOAD.mapFromDriverValue(row.payload);
+      return { payload: payload ?? undefined };
+    }
     const oldest = this.db
       .select({ id: bufferedSignals.id })
       .from(bufferedSignals)
@@ -1148,6 +1425,66 @@ export class DrizzlePgStateStore implements StateStore {
       .returning({ payload: bufferedSignals.payload });
     const row = rows[0];
     return row ? { payload: row.payload ?? undefined } : null;
+  }
+
+  async takeOldestBufferedSignal(
+    tokens: string[],
+  ): Promise<{ token: string; payload: unknown } | null> {
+    if (tokens.length === 0) return null;
+    // Same claim as takeBufferedSignal, across tokens: SKIP LOCKED, deleted in the same statement.
+    const oldest = this.db
+      .select({ id: bufferedSignals.id })
+      .from(bufferedSignals)
+      .where(inArray(bufferedSignals.token, [...new Set(tokens)]))
+      .orderBy(asc(bufferedSignals.id))
+      .limit(1)
+      .for('update', { skipLocked: true });
+    const rows = await this.db
+      .delete(bufferedSignals)
+      .where(inArray(bufferedSignals.id, oldest))
+      .returning({ token: bufferedSignals.token, payload: bufferedSignals.payload });
+    const row = rows[0];
+    return row ? { token: row.token, payload: row.payload ?? undefined } : null;
+  }
+
+  async claimSignalId(
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    // Insert, or take over an expired row (ON CONFLICT ... DO UPDATE ... WHERE locks the row, so of
+    // two concurrent takeovers one updates and the other sees the fresh expiry and does nothing).
+    const rows = await this.db
+      .insert(signalIds)
+      .values({ token, signalId: id, expiresAt: new Date(expiresAt) })
+      .onConflictDoUpdate({
+        target: [signalIds.token, signalIds.signalId],
+        set: { expiresAt: new Date(expiresAt) },
+        setWhere: lte(signalIds.expiresAt, new Date(nowMs)),
+      })
+      .returning({ token: signalIds.token });
+    return rows.length > 0;
+  }
+
+  async releaseSignalId(token: string, id: string): Promise<void> {
+    await this.db
+      .delete(signalIds)
+      .where(and(eq(signalIds.token, token), eq(signalIds.signalId, id)));
+  }
+
+  async deleteExpiredSignalIds(nowMs: number, limit: number): Promise<number> {
+    const expired = this.db
+      .select({ token: signalIds.token, signalId: signalIds.signalId })
+      .from(signalIds)
+      .where(lte(signalIds.expiresAt, new Date(nowMs)))
+      .limit(limit)
+      .for('update', { skipLocked: true });
+    const rows = await this.db
+      .delete(signalIds)
+      .where(sql`(${signalIds.token}, ${signalIds.signalId}) in (${expired})`)
+      .returning({ token: signalIds.token });
+    return rows.length;
   }
 
   async listBufferedSignals(
@@ -1194,6 +1531,12 @@ export class DrizzlePgStateStore implements StateStore {
     name: string,
     limit: number,
   ): Promise<Array<{ id: string; payload: unknown; publishedAt: number }>> {
+    if (this.hot) {
+      return (await this.hot.query(LIST_BUFFERED_EVENTS, [name, limit])).map((raw) => {
+        const r = EVENTS.decode(raw);
+        return { id: r.id, payload: r.payload ?? undefined, publishedAt: r.publishedAt.getTime() };
+      });
+    }
     const rows = await this.db
       .select()
       .from(bufferedEvents)
@@ -1208,6 +1551,7 @@ export class DrizzlePgStateStore implements StateStore {
   }
 
   async removeBufferedEvent(id: string): Promise<boolean> {
+    if (this.hot) return (await this.hot.query(REMOVE_BUFFERED_EVENT, [id])).length === 1;
     const rows = await this.db
       .delete(bufferedEvents)
       .where(eq(bufferedEvents.id, id))
@@ -1223,6 +1567,75 @@ function escapeLike(value: string): string {
 
 /** Rows per `UPDATE … FROM (VALUES …)`: 17 parameters each, well under Postgres's 65535. */
 const CHECKPOINT_BATCH_ROWS = 500;
+
+// --- The hot path's statements (node-postgres; see hot-path.ts) --------------------------------
+const RUNS = new TableCodec<RunRow>(workflowRuns);
+const CPS = new TableCodec<CheckpointRow>(stepCheckpoints);
+const CPS_NO_INPUT = new TableCodec<CheckpointRow>(stepCheckpoints, ['input']);
+const EVENTS = new TableCodec<typeof bufferedEvents.$inferSelect>(bufferedEvents);
+const SIGNAL_PAYLOAD = getTableColumns(bufferedSignals).payload;
+const T_RUNS = quote(getTableName(workflowRuns));
+const T_CPS = quote(getTableName(stepCheckpoints));
+const T_EVENTS = quote(getTableName(bufferedEvents));
+const T_SIGNALS = quote(getTableName(bufferedSignals));
+const T_ATTRIBUTES = quote(getTableName(runAttributes));
+const SELECT_RUN = `SELECT ${RUNS.list} FROM ${T_RUNS} WHERE "id" = $1`;
+const INSERT_RUN = `INSERT INTO ${T_RUNS} (${RUNS.list}) VALUES (${placeholders(1, RUNS.columns.length)})`;
+const DELETE_ATTRIBUTES = `DELETE FROM ${T_ATTRIBUTES} WHERE "run_id" = $1`;
+/** `$1` run, then (after any scope parameters) owner, lease end, now: see tryLockRunAndGet. */
+const LOCK_RUN = `UPDATE ${T_RUNS} SET "locked_by" = $2, "locked_until" = $3 WHERE "id" = $1 AND ("locked_until" IS NULL OR "locked_until" <= $4)`;
+const RELEASE_LOCK = `UPDATE ${T_RUNS} SET "locked_by" = NULL, "locked_until" = NULL WHERE "id" = $1`;
+const RENEW_LOCK = `UPDATE ${T_RUNS} SET "locked_until" = $3 WHERE "id" = $1 AND "locked_by" = $2 RETURNING "id"`;
+const SELECT_CHECKPOINT = `SELECT ${CPS.list} FROM ${T_CPS} WHERE "run_id" = $1 AND "seq" = $2 LIMIT 1`;
+const SELECT_CHECKPOINTS_FOR_SETTLE = `SELECT ${CPS_NO_INPUT.list} FROM ${T_CPS} WHERE "run_id" = $1 AND "seq" = ANY($2::integer[]) ORDER BY "seq"`;
+const SELECT_REPLAY = `SELECT ${CPS_NO_INPUT.list} FROM ${T_CPS} WHERE "run_id" = $1 ORDER BY "seq"`;
+const SELECT_INPUTS = `SELECT "seq", "input" FROM ${T_CPS} WHERE "run_id" = $1 AND "seq" = ANY($2::integer[])`;
+const CHECKPOINT_VALUES = `(${CPS.list}) VALUES (${placeholders(1, CPS.columns.length)})`;
+const UPSERT_CHECKPOINT = `INSERT INTO ${T_CPS} ${CHECKPOINT_VALUES} ON CONFLICT ("run_id", "seq") DO UPDATE SET ${CPS.columns
+  .map(([, c]) => `${quote(c.name)} = EXCLUDED.${quote(c.name)}`)
+  .join(', ')}`;
+const INSERT_CHECKPOINT_IF_ABSENT = `INSERT INTO ${T_CPS} ${CHECKPOINT_VALUES} ON CONFLICT ("run_id", "seq") DO NOTHING RETURNING "seq"`;
+const CHECKPOINT_RANGE = `FROM ${T_CPS} WHERE "run_id" = $1 AND "seq" >= $2 AND "seq" <= $3 AND "status" = ANY($4::text[])`;
+const HAS_CHECKPOINTS = `SELECT "seq" ${CHECKPOINT_RANGE} ORDER BY "seq" DESC LIMIT 1`;
+const COUNT_CHECKPOINTS = `SELECT count(*)::integer AS "n" ${CHECKPOINT_RANGE}`;
+const LIST_BUFFERED_EVENTS = `SELECT ${EVENTS.list} FROM ${T_EVENTS} WHERE "name" = $1 ORDER BY "published_at", "id" LIMIT $2`;
+const REMOVE_BUFFERED_EVENT = `DELETE FROM ${T_EVENTS} WHERE "id" = $1 RETURNING "id"`;
+// MATERIALIZED for the same reason as the run claim: a rescanned subquery could delete more than one.
+const TAKE_BUFFERED_SIGNAL = `WITH taken AS MATERIALIZED (SELECT "id" FROM ${T_SIGNALS} WHERE "token" = $1 ORDER BY "id" LIMIT 1 FOR UPDATE SKIP LOCKED) DELETE FROM ${T_SIGNALS} WHERE "id" IN (SELECT "id" FROM taken) RETURNING "payload"`;
+/** Results settled per hot-path statement; a wider batch takes the builder's chunked path. */
+const HOT_SETTLE_MAX_ROWS = 64;
+const settleTexts = new Map<number, string>();
+
+/** A lease timestamp as the builder binds it. */
+const lockTime = (ms: number): unknown => RUNS.encode('lockedUntil', new Date(ms));
+
+/** {@link settleResultsFrom} as constant text for `n` rows (8 parameters each), cached per `n`. */
+function settleResultsText(n: number): string {
+  let text = settleTexts.get(n);
+  if (text !== undefined) return text;
+  const rows = Array.from({ length: n }, (_, r) => {
+    const p = (k: number) => `$${r * 8 + k}`;
+    return `(${p(1)}::text, ${p(2)}::integer, ${p(3)}::text, ${p(4)}::jsonb, ${p(5)}::jsonb, ${p(6)}::jsonb, ${p(7)}::timestamptz, ${p(8)}::timestamptz)`;
+  });
+  text = `UPDATE ${T_CPS} AS c SET status = v.status, output = CASE WHEN v.status = 'completed' THEN v.output ELSE c.output END, error = v.error, events = COALESCE(v.events, c.events), started_at = COALESCE(v.started_at, c.started_at), finished_at = v.finished_at FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending' AND NOT EXISTS (SELECT 1 FROM ${T_RUNS} AS r WHERE r.id = c.run_id AND r.status IN ('cancelled', 'completed')) RETURNING ${CPS_NO_INPUT.columns.map(([, c]) => `c.${quote(c.name)}`).join(', ')}`;
+  settleTexts.set(n, text);
+  return text;
+}
+
+/** One result's parameters for {@link settleResultsText}. */
+function settleResultValues(r: StepResultSettlement): unknown[] {
+  const json = (v: unknown) => (v == null ? null : JSON.stringify(v));
+  return [
+    r.runId,
+    r.seq,
+    r.status,
+    json(r.status === 'completed' ? r.output : null),
+    json(r.error),
+    json(r.events),
+    r.startedAt ? r.startedAt.toISOString() : null,
+    r.finishedAt.toISOString(),
+  ];
+}
 
 const rowKey = (cp: { runId: string; seq: number }): string => `${cp.seq}:${cp.runId}`;
 
@@ -1280,6 +1693,65 @@ function settleIfPendingFrom(settlements: StepSettlement[]): SQL {
     started_at, finished_at)
   WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'
   RETURNING c.run_id, c.seq`;
+}
+
+/** Whether a batch of distinct-or-not rows goes out as a single statement (one round, one chunk). */
+function oneStatement(rows: { runId: string; seq: number }[]): boolean {
+  if (rows.length > CHECKPOINT_BATCH_ROWS) return false;
+  const keys = new Set(rows.map(rowKey));
+  return keys.size === rows.length;
+}
+
+/** The checkpoint columns a settle reads back: every one but `input`. */
+const SETTLED_COLUMNS = (() => {
+  const { input: _input, ...columns } = getTableColumns(stepCheckpoints);
+  return columns;
+})();
+
+/**
+ * A row a raw statement returned (column names as stored, values as the driver decoded them) as
+ * drizzle would map it, through each column's own decoder, so json and timestamps come back the
+ * same on every driver.
+ */
+function settledRowFromDriver(raw: Record<string, unknown>): CheckpointRow {
+  const row: Record<string, unknown> = { input: null };
+  for (const [key, column] of Object.entries(SETTLED_COLUMNS)) {
+    const value = raw[column.name];
+    row[key] = value == null ? null : column.mapFromDriverValue(value);
+  }
+  return row as CheckpointRow;
+}
+
+/**
+ * `settleResultsIfPending` for distinct rows in one statement: each result settles its row only
+ * while it is `pending` and its run is not finished, keeping what the result does not carry (a failed result's output, absent
+ * events or start time), and `RETURNING` reads back every settled row but its input.
+ */
+function settleResultsFrom(results: StepResultSettlement[]): SQL {
+  const json = (v: unknown) => (v == null ? null : JSON.stringify(v));
+  const values = results.map(
+    (r) =>
+      sql`(${r.runId}::text, ${r.seq}::integer, ${r.status}::text, ${json(r.status === 'completed' ? r.output : null)}::jsonb, ${json(r.error)}::jsonb, ${json(r.events)}::jsonb, ${r.startedAt ? r.startedAt.toISOString() : null}::timestamptz, ${r.finishedAt.toISOString()}::timestamptz)`,
+  );
+  const returning = sql.join(
+    Object.values(SETTLED_COLUMNS).map((column) => sql`c.${sql.identifier(column.name)}`),
+    sql`, `,
+  );
+  return sql`UPDATE ${stepCheckpoints} AS c SET
+    status = v.status,
+    output = CASE WHEN v.status = 'completed' THEN v.output ELSE c.output END,
+    error = v.error,
+    events = COALESCE(v.events, c.events),
+    started_at = COALESCE(v.started_at, c.started_at),
+    finished_at = v.finished_at
+  FROM (VALUES ${sql.join(values, sql`, `)}) AS v(run_id, seq, status, output, error, events,
+    started_at, finished_at)
+  WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'
+    AND NOT EXISTS (
+      SELECT 1 FROM ${workflowRuns} AS r
+      WHERE r.id = c.run_id AND r.status IN ('cancelled', 'completed')
+    )
+  RETURNING ${returning}`;
 }
 
 async function upsertCheckpoint(db: DrizzlePgDatabase, cp: StepCheckpoint): Promise<void> {

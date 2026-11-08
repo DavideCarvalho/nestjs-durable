@@ -43,6 +43,7 @@ import { RetentionPoller } from './retention-poller';
 import { isDrivingOperator } from './role';
 import { RunRequestResponder, type RunRequestTransport } from './run-request-responder';
 import { StoreRunGateway } from './store-run-gateway';
+import { SweepLeases } from './sweep-leases';
 import { TenantEventRepublisher } from './tenant-event-republisher';
 import { TimerPoller } from './timer-poller';
 import { CONTEXT_ACCESSOR } from './tokens';
@@ -318,6 +319,12 @@ export interface DurableModuleOptions {
    */
   eventBufferTtlMs?: number;
   /**
+   * How long `signal(token, payload, { id })` remembers an id (ms, or a duration like `'7d'`); a
+   * re-send with the same token and id within it is dropped. Default 7 days. See
+   * `WorkflowEngineDeps.signalIdTtl`.
+   */
+  signalIdTtl?: string | number;
+  /**
    * How long (ms) a run parked `blocked` (no capable, protocol-compatible live worker) waits before
    * the blocked-recovery poll re-checks the fleet. Defaults to 5000. See
    * `WorkflowEngineDeps.blockedPollMs`. Operator only.
@@ -329,6 +336,21 @@ export interface DurableModuleOptions {
    * halve their checkpoint writes. See `WorkflowEngineDeps.trackStepStart`. Operator only.
    */
   trackStepStart?: boolean;
+  /**
+   * How many workflow bodies parked on dispatched `ctx.step` calls this instance keeps in memory
+   * between turns, so a step's result continues the body instead of replaying it over the run's
+   * whole history. Default 1000 (~26 KB of heap each); `0` turns it off. See `WorkflowEngineDeps.stickyRuns` and the
+   * "Performance" section of the production guide. Operator only.
+   */
+  stickyRuns?: number;
+  /** How long a parked body may stay idle in that cache. Default 5 min. Operator only. */
+  stickyIdleMs?: number;
+  /**
+   * Send each dispatched `ctx.step` result back to the engine instance that dispatched it (and holds
+   * the parked body), on transports that can route replies (BullMQ). Default `true`. See
+   * `WorkflowEngineDeps.routeReplies`. Operator only.
+   */
+  routeReplies?: boolean;
   /**
    * The **default** workflow to route dead-lettered runs to, for workflows that don't declare their
    * own. When a run is moved to `dead` (exceeded `maxRecoveryAttempts`), the started handler gets a
@@ -900,8 +922,12 @@ export class DurableModule {
               stalledAfterMs: options.stalledAfterMs,
               timerBatchSize: options.timerBatchSize,
               eventBufferTtlMs: options.eventBufferTtlMs,
+              signalIdTtl: options.signalIdTtl,
               blockedPollMs: options.blockedPollMs,
               trackStepStart: options.trackStepStart,
+              stickyRuns: options.stickyRuns,
+              stickyIdleMs: options.stickyIdleMs,
+              routeReplies: options.routeReplies,
               instanceId: options.instanceId,
               namespace: options.namespace,
               webhookUrl: options.webhookUrl,
@@ -935,6 +961,7 @@ export class DurableModule {
         EntityService,
         WorkflowRegistrar,
         DurableStepRegistrar,
+        SweepLeases,
         TimerPoller,
         RetentionPoller,
         // Tenant run gateway: bound EXACTLY once — the store-backed `StoreRunGateway` for an operator,

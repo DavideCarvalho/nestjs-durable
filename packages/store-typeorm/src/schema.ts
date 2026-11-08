@@ -4,6 +4,7 @@ import {
   BufferedSignalEntity,
   RunAttributeEntity,
   ScheduleEntity,
+  SignalIdEntity,
   SignalWaiterEntity,
   StepCheckpointEntity,
   WorkflowRunEntity,
@@ -49,6 +50,7 @@ const TABLE_TO_ENTITY = {
   durable_signal_waiters: SignalWaiterEntity,
   durable_buffered_signals: BufferedSignalEntity,
   durable_buffered_events: BufferedEventEntity,
+  durable_signal_ids: SignalIdEntity,
   durable_schedules: ScheduleEntity,
 } as const;
 
@@ -240,6 +242,8 @@ export async function ensureTypeOrmDurableSchema(
   const bevCol = (property: string) => q(resolve('durable_buffered_events', property));
   const schedules = q('durable_schedules');
   const schCol = (property: string) => q(resolve('durable_schedules', property));
+  const signalIds = q('durable_signal_ids');
+  const sidCol = (property: string) => q(resolve('durable_signal_ids', property));
   // Numeric side-table column for attribute range scans. `double precision` on Postgres, `double` on
   // MySQL, `real` on SQLite (all hold JS numbers without precision loss for the typical attribute).
   const num = isPg ? 'double precision' : isMysql ? 'double' : 'real';
@@ -312,6 +316,16 @@ export async function ensureTypeOrmDurableSchema(
       `CREATE TABLE IF NOT EXISTS ${bufferedEvents} (
       ${bevCol('id')} ${str} PRIMARY KEY, ${bevCol('name')} ${str} NOT NULL,
       ${bevCol('payload')} ${txt}, ${bevCol('publishedAt')} ${ts} NOT NULL
+    )`,
+    ],
+    // Signal dedupe ids (`signal(..., { id })`): one row per (token, id) until `expires_at` (epoch
+    // ms as a bigint — exact, unlike a MySQL DATETIME).
+    [
+      'durable_signal_ids',
+      `CREATE TABLE IF NOT EXISTS ${signalIds} (
+      ${sidCol('token')} ${str} NOT NULL, ${sidCol('signalId')} ${str} NOT NULL,
+      ${sidCol('expiresAt')} bigint NOT NULL,
+      PRIMARY KEY (${sidCol('token')}, ${sidCol('signalId')})
     )`,
     ],
     // Persisted schedules. `next_fire_at` is epoch ms as a bigint (exact, so the compare-and-set on
@@ -501,6 +515,12 @@ export async function ensureTypeOrmDurableSchema(
         'durable_buffered_events_name_published_at_idx',
         `${bufferedEvents} (${bevCol('name')}, ${bevCol('publishedAt')})`,
         'durable_buffered_events',
+      ],
+      // The expired-signal-id sweep (`expires_at <= now`).
+      [
+        'durable_signal_ids_expires_at_idx',
+        `${signalIds} (${sidCol('expiresAt')})`,
+        'durable_signal_ids',
       ],
       // Search-attribute pushdown: equality + range predicates probe by (key, value). Two composite
       // indexes — one per typed column — so a numeric range or a string equality is an index scan.

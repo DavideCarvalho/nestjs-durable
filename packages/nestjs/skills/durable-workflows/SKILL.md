@@ -160,8 +160,14 @@ const results = await ctx.allSettled(this.lines.validateLine, lines, { concurren
 const rejected = results.filter((r) => r.status === 'rejected');
 ```
 
-Prefer it to `Promise.all` past a handful of steps: every result of a `Promise.all` replays the
-workflow, which makes a fan of N steps cost O(N²) checkpoint reads. Prefer it to a child-workflow
+Prefer it to `Promise.all` past a handful of steps: without a warm sticky continuation every
+result of a `Promise.all` replays the workflow, which makes a fan of N steps cost O(N²)
+checkpoint reads. By default the sticky cache (`stickyRuns`, 1000 bodies) keeps a body parked on
+dispatched `ctx.step` calls in memory, so its next turn on the same instance continues instead of
+replaying and per-step cost stays flat; it falls back to replay when the turn runs on another
+instance, another turn settled the run since, a cancel or retry, an eviction, a `ctx` call made
+while detached, a non-step suspension (sleep/signal/child/fan), or a registered execution wrapper. `ctx.all`
+still wakes once per settled wave instead of once per result. Prefer it to a child-workflow
 `ctx.all` when each item is just a step: a child costs a whole run (row, turn, lease, signal).
 
 How the step fan behaves (`AllStepsOptions`):

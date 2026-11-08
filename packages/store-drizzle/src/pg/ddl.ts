@@ -86,6 +86,12 @@ export const DURABLE_PG_DDL: readonly string[] = [
   "payload" jsonb,
   "published_at" timestamp with time zone NOT NULL
 )`,
+  `CREATE TABLE IF NOT EXISTS "durable_signal_ids" (
+  "token" text NOT NULL,
+  "signal_id" text NOT NULL,
+  "expires_at" timestamp with time zone NOT NULL,
+  CONSTRAINT "durable_signal_ids_token_signal_id_pk" PRIMARY KEY("token","signal_id")
+)`,
   `CREATE TABLE IF NOT EXISTS "durable_schedules" (
   "id" text PRIMARY KEY NOT NULL,
   "namespace" text DEFAULT 'default' NOT NULL,
@@ -110,6 +116,7 @@ export const DURABLE_PG_DDL: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS "durable_buffered_signals_token_idx" ON "durable_buffered_signals" USING btree ("token","id")`,
   `CREATE INDEX IF NOT EXISTS "durable_buffered_events_name_published_at_idx" ON "durable_buffered_events" USING btree ("name","published_at")`,
   `CREATE INDEX IF NOT EXISTS "durable_schedules_due_idx" ON "durable_schedules" USING btree ("paused","next_fire_at")`,
+  `CREATE INDEX IF NOT EXISTS "durable_signal_ids_expires_at_idx" ON "durable_signal_ids" USING btree ("expires_at")`,
 ];
 
 /** Key for the transaction-scoped advisory lock that serializes concurrent heals (several pods

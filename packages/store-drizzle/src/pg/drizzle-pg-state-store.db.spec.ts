@@ -22,6 +22,7 @@ import { DURABLE_PG_DDL } from './ddl';
 import { type DrizzlePgDatabase, DrizzlePgStateStore } from './drizzle-pg-state-store';
 import { drizzlePgExecutor } from './executor';
 import { durablePgManagedTables, durablePgSchema } from './schema';
+import { dedicatedPgDatabaseUrl } from './test-database';
 
 /**
  * Real-Postgres matrix for the Drizzle Postgres store: the SHARED cross-store contract on BOTH common
@@ -51,7 +52,8 @@ let postgresJsDb: DrizzlePgDatabase | undefined;
 beforeAll(async () => {
   if (skipped) return;
   try {
-    if (externalUrl) url = externalUrl;
+    // A database of its own: the other stores' specs define the same tables differently.
+    if (externalUrl) url = await dedicatedPgDatabaseUrl(externalUrl, 'drizzle');
     else {
       container = await new PostgreSqlContainer('postgres:16-alpine').start();
       url = container.getConnectionUri();

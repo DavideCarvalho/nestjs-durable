@@ -1,0 +1,28 @@
+{
+  "seq10": {
+    "msPerStep": 14.12,
+    "firstDecile": 21,
+    "lastDecile": 12,
+    "sqlPerStep": 20.3,
+    "cpuMsPerStep": 8.07
+  },
+  "seq200": {
+    "msPerStep": 9.9,
+    "firstDecile": 12.58,
+    "lastDecile": 10.95,
+    "sqlPerStep": 19.07,
+    "cpuMsPerStep": 4.12
+  },
+  "seq1000": {
+    "msPerStep": 12.81,
+    "firstDecile": 8.21,
+    "lastDecile": 17.26,
+    "sqlPerStep": 19.02,
+    "cpuMsPerStep": 5.47
+  },
+  "throughput": {
+    "wfPerSec": 69.01,
+    "sqlPerStep": 22.4,
+    "cpuMsPerWf": 14.24
+  }
+}

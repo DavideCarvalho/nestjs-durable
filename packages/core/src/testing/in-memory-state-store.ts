@@ -16,6 +16,7 @@ import {
   type SignalWaiter,
   type StateStore,
   type StepCheckpoint,
+  type StepResultSettlement,
   type StepSettlement,
   TERMINAL_RUN_STATUSES,
   type WorkflowRun,
@@ -280,6 +281,110 @@ export class InMemoryStateStore implements StateStore {
     });
   }
 
+  // The three round-trip-saving methods below are built on the plain ones, so a test store that
+  // overrides `tryLockRun`, `getRun`, `getCheckpoint` or a settle to stage a race keeps staging it.
+  // They are OFF unless asked for (`roundTripMethods`, or `DURABLE_TEST_ROUND_TRIP_METHODS=1` for a
+  // whole suite): many specs pin the store calls the engine makes without them.
+  readonly settleResultsIfPending?: (
+    results: StepResultSettlement[],
+  ) => Promise<(StepCheckpoint | null)[]>;
+  readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  readonly tryLockRunAndGet?: (
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ) => Promise<WorkflowRun | null>;
+  readonly claimPendingRuns?: (
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ) => Promise<WorkflowRun[]>;
+
+  constructor(opts: { roundTripMethods?: boolean } = {}) {
+    const on =
+      opts.roundTripMethods ??
+      (typeof process !== 'undefined' && process.env.DURABLE_TEST_ROUND_TRIP_METHODS === '1');
+    if (on) {
+      this.settleResultsIfPending = (results) => this.settleResultsFallback(results);
+      this.insertCheckpointIfAbsent = (cp) => this.insertIfAbsentFallback(cp);
+      this.tryLockRunAndGet = (runId, owner, until, now) =>
+        this.lockAndGetFallback(runId, owner, until, now);
+      this.claimPendingRuns = async (limit, owner, until, now, namespace) => {
+        const claimed: WorkflowRun[] = [];
+        for (const run of await this.listPendingRuns(Number.MAX_SAFE_INTEGER, namespace)) {
+          if (claimed.length >= limit) break;
+          const locked = await this.lockAndGetFallback(run.id, owner, until, now);
+          if (locked) claimed.push(locked);
+        }
+        return claimed;
+      };
+    }
+  }
+
+  private async settleResultsFallback(
+    results: StepResultSettlement[],
+  ): Promise<(StepCheckpoint | null)[]> {
+    const out: (StepCheckpoint | null)[] = results.map(() => null);
+    // One read per run, then one settle for the batch: the calls the engine makes without this.
+    const before = new Map<string, StepCheckpoint>();
+    const seqsByRun = new Map<string, number[]>();
+    for (const r of results) seqsByRun.set(r.runId, [...(seqsByRun.get(r.runId) ?? []), r.seq]);
+    for (const [runId, seqs] of seqsByRun) {
+      for (const cp of await this.getCheckpointsForSettle(runId, seqs)) {
+        before.set(this.key(runId, cp.seq), cp);
+      }
+    }
+    const claimed = new Set<string>();
+    const settlements: StepSettlement[] = [];
+    const at: number[] = [];
+    for (const [i, r] of results.entries()) {
+      const key = this.key(r.runId, r.seq);
+      const cp = before.get(key);
+      if (cp?.status !== 'pending' || claimed.has(key)) continue;
+      const status = (await this.getRun(r.runId))?.status;
+      if (status === 'cancelled' || status === 'completed') continue;
+      claimed.add(key);
+      settlements.push({
+        runId: r.runId,
+        seq: r.seq,
+        status: r.status,
+        output: r.status === 'completed' ? r.output : cp.output,
+        error: r.error,
+        events: r.events ?? cp.events,
+        startedAt: r.startedAt ?? cp.startedAt,
+        finishedAt: r.finishedAt,
+      });
+      at.push(i);
+    }
+    if (settlements.length === 0) return out;
+    const wrote = await this.settleCheckpointsIfPending(settlements);
+    settlements.forEach((settlement, k) => {
+      if (!wrote[k]) return;
+      const cp = before.get(this.key(settlement.runId, settlement.seq)) as StepCheckpoint;
+      out[at[k] as number] = { ...cp, ...settlement };
+    });
+    return out;
+  }
+
+  private async insertIfAbsentFallback(checkpoint: StepCheckpoint): Promise<boolean> {
+    if (await this.getCheckpoint(checkpoint.runId, checkpoint.seq)) return false;
+    await this.saveCheckpoint(checkpoint);
+    return true;
+  }
+
+  private async lockAndGetFallback(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null> {
+    if (!(await this.tryLockRun(runId, owner, leaseUntilMs, nowMs))) return null;
+    return this.getRun(runId);
+  }
+
   async listOrphanedRuns(
     nowMs: number,
     limit: number,
@@ -443,6 +548,48 @@ export class InMemoryStateStore implements StateStore {
     if (queue.length === 0) this.bufferedSignals.delete(token);
     return { payload: head.payload };
   }
+  async takeOldestBufferedSignal(
+    tokens: string[],
+  ): Promise<{ token: string; payload: unknown } | null> {
+    let oldest: { token: string; id: number } | undefined;
+    for (const token of new Set(tokens)) {
+      const head = this.bufferedSignals.get(token)?.[0];
+      if (head && (!oldest || head.id < oldest.id)) oldest = { token, id: head.id };
+    }
+    if (!oldest) return null;
+    const taken = await this.takeBufferedSignal(oldest.token);
+    return taken ? { token: oldest.token, payload: taken.payload } : null;
+  }
+
+  /** `token \u0000 id -> expiresAt` of the signal ids {@link claimSignalId} recorded. */
+  private readonly signalIds = new Map<string, number>();
+  async claimSignalId(
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    const key = `${token}\u0000${id}`;
+    const existing = this.signalIds.get(key);
+    if (existing !== undefined && existing > nowMs) return false;
+    this.signalIds.set(key, expiresAt);
+    return true;
+  }
+  async releaseSignalId(token: string, id: string): Promise<void> {
+    this.signalIds.delete(`${token}\u0000${id}`);
+  }
+  async deleteExpiredSignalIds(nowMs: number, limit: number): Promise<number> {
+    let deleted = 0;
+    for (const [key, expiresAt] of this.signalIds) {
+      if (deleted >= limit) break;
+      if (expiresAt <= nowMs) {
+        this.signalIds.delete(key);
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
   async listBufferedSignals(
     tokenPrefix: string,
     afterId: string | undefined,

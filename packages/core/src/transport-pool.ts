@@ -24,7 +24,30 @@ const DISPATCH_CHUNK = 200;
  * so it lives apart from the engine.
  */
 export class TransportPool {
+  /** Ids of the transports that route replies to {@link replyTo} (see {@link routeReplies}). */
+  private readonly replying = new Set<string>();
+  private replyTo: string | undefined;
+
   constructor(private readonly transports: NamedTransport[]) {}
+
+  /**
+   * Have every transport that can ({@link Transport.consumeRepliesFor}) send this engine instance
+   * the results of the tasks it dispatches with `replyTo`. Returns whether any transport can.
+   */
+  routeReplies(instanceId: string): boolean {
+    this.replyTo = instanceId;
+    for (const { id, transport } of this.transports) {
+      if (!transport.consumeRepliesFor) continue;
+      transport.consumeRepliesFor(instanceId);
+      this.replying.add(id);
+    }
+    return this.replying.size > 0;
+  }
+
+  /** Stop stamping `replyTo` on tasks (a draining engine): their results go to the shared results. */
+  stopReplies(): void {
+    this.replyTo = undefined;
+  }
 
   get size(): number {
     return this.transports.length;
@@ -79,7 +102,10 @@ export class TransportPool {
     let lastErr: unknown;
     for (const { id, transport } of this.ordered(preferId)) {
       try {
-        await transport.dispatch({ ...task, transport: id });
+        // A reply goes back only on a transport that routes it; elsewhere it is dropped from the task.
+        const { replyTo, ...rest } = task;
+        const reply = replyTo !== undefined && this.replying.has(id) ? { replyTo } : {};
+        await transport.dispatch({ ...rest, ...reply, transport: id });
         return;
       } catch (err) {
         lastErr = err;

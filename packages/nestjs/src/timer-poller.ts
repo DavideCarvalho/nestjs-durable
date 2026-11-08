@@ -9,10 +9,12 @@ import {
   Injectable,
   type OnApplicationBootstrap,
   type OnModuleDestroy,
+  Optional,
 } from '@nestjs/common';
 import type { DurableModuleOptions } from './durable.module';
 import { isDrivingOperator } from './role';
 import { settleWithin } from './settle-within';
+import { SweepLeases } from './sweep-leases';
 
 /**
  * Resumes suspended runs whose durable timer (`ctx.sleep`) is due, and fires any configured
@@ -35,6 +37,8 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   constructor(
     private readonly engine: WorkflowEngine,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
+    // Fleet-wide sweeps run under a `@nestjs/locks` lease when the app has `LocksModule` (detected).
+    @Optional() private readonly leases: SweepLeases = new SweepLeases(),
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -146,10 +150,20 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
       await this.sweep('sweepTimeouts', () => this.engine.sweepTimeouts());
       // The stalled-run pager: throttled to a pass a minute inside the engine, a no-op without an
       // `onStalled` listener. Optional call: an older core (the peer range is wide) has no sweep.
-      await this.sweep('sweepStalled', async () => this.engine.sweepStalled?.());
+      // One pod pages when `@nestjs/locks` is present (see SweepLeases); every pod otherwise.
+      await this.sweep('sweepStalled', () =>
+        this.leases.run('stalled-pager', async () => this.engine.sweepStalled?.()),
+      );
       // Buffered child completions no parent will consume: a few pages per tick until a pass ends,
       // then a rest (throttled inside the engine). Optional call, like the stalled sweep.
-      await this.sweep('sweepBufferedSignals', async () => this.engine.sweepBufferedSignals?.());
+      await this.sweep('sweepBufferedSignals', () =>
+        this.leases.run('buffered-signals', async () => this.engine.sweepBufferedSignals?.()),
+      );
+      // Signal dedupe ids past their TTL (`signal(..., { id })`): a few bounded deletes per tick, one
+      // pod at a time like the buffered-signals sweep.
+      await this.sweep('sweepExpiredSignalIds', () =>
+        this.leases.run('signal-ids', async () => this.engine.sweepExpiredSignalIds?.()),
+      );
       // Lifecycle events a settled run still owes to a subscriber this instance has (its process
       // died before publishing, or did not have the subscriber), and `ctx.waitForRun` waits whose
       // run settled without resuming them. Optional call, like the sweeps above.

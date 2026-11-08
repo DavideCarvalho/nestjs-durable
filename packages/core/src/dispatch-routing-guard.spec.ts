@@ -330,3 +330,40 @@ describe('routing guard — in-memory (timeoutMs) step path (design §7.5)', () 
     expect((await store.getRun('r1'))?.wakeAt).toBeGreaterThan(firstWake ?? 0);
   });
 });
+
+describe('routing guard — descriptor reads are reused briefly', () => {
+  class CountingTransport extends FakeTransport {
+    reads = 0;
+    override async readWorkerDescriptors(group: string): Promise<WorkerDescriptor[]> {
+      this.reads += 1;
+      return super.readWorkerDescriptors(group);
+    }
+  }
+
+  it('reads a token once for dispatches inside the window', async () => {
+    const transport = new CountingTransport();
+    transport.descriptors = [worker('w1', ['search-attr-v2'])];
+    const { store, engine } = makeEngine(transport);
+    for (const id of ['a', 'b', 'c']) {
+      await engine.start('checkout', {}, id);
+      await engine.runOne(id);
+    }
+    expect(transport.dispatched).toHaveLength(3);
+    expect(transport.reads).toBe(1);
+    expect((await store.getRun('c'))?.status).toBe('suspended');
+  });
+
+  it('re-reads before parking a run, so a worker that just joined is seen', async () => {
+    const transport = new CountingTransport();
+    transport.descriptors = [worker('w1', ['saga'])];
+    const { store, engine } = makeEngine(transport);
+    await engine.start('checkout', {}, 'first');
+    await engine.runOne('first');
+    expect((await store.getRun('first'))?.status).toBe('blocked');
+    // A capable worker joins; the cached (incapable) read must not park the next run.
+    transport.descriptors = [worker('w2', ['search-attr-v2'])];
+    await engine.start('checkout', {}, 'second');
+    await engine.runOne('second');
+    expect((await store.getRun('second'))?.status).toBe('suspended');
+  });
+});

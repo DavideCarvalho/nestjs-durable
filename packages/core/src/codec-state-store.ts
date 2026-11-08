@@ -17,6 +17,7 @@ import type {
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepResultSettlement,
   StepSettlement,
   WorkflowRun,
 } from './interfaces';
@@ -120,6 +121,28 @@ export class CodecStateStore implements StateStore {
   /** Encodes each settlement's payloads like {@link saveCheckpoint}. Bound only when the inner store
    *  has it, so the engine's whole-row fallback still kicks in through the wrapper. */
   readonly settleCheckpointsIfPending?: (settlements: StepSettlement[]) => Promise<boolean[]>;
+  /** Encodes each result's payloads, decodes each row read back. Bound only when the inner store
+   *  has it. */
+  readonly settleResultsIfPending?: (
+    results: StepResultSettlement[],
+  ) => Promise<(StepCheckpoint | null)[]>;
+  /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it. */
+  readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  /** Decodes each run claimed. Bound only when the inner store has it. */
+  readonly claimPendingRuns?: (
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ) => Promise<WorkflowRun[]>;
+  /** Decodes the run read. Bound only when the inner store has it. */
+  readonly tryLockRunAndGet?: (
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ) => Promise<WorkflowRun | null>;
   /** Encodes each checkpoint written. Bound only when the inner store has it. */
   readonly saveCheckpoints?: (checkpoints: StepCheckpoint[]) => Promise<void>;
   /** Decodes each checkpoint read like {@link listCheckpoints}. Bound only when the inner store has
@@ -184,6 +207,21 @@ export class CodecStateStore implements StateStore {
   ) => Promise<BufferedSignalRow[]>;
   /** Forwarded verbatim — deletes by row id. */
   readonly deleteBufferedSignals?: (ids: string[]) => Promise<void>;
+  /** Decodes the payload like {@link takeBufferedSignal}. Bound only when the inner store has it. */
+  readonly takeOldestBufferedSignal?: (
+    tokens: string[],
+  ) => Promise<{ token: string; payload: unknown } | null>;
+  /** Forwarded verbatim — a signal id record carries no payload. */
+  readonly claimSignalId?: (
+    token: string,
+    id: string,
+    expiresAt: number,
+    nowMs: number,
+  ) => Promise<boolean>;
+  /** Forwarded verbatim. */
+  readonly releaseSignalId?: (token: string, id: string) => Promise<void>;
+  /** Forwarded verbatim. */
+  readonly deleteExpiredSignalIds?: (nowMs: number, limit: number) => Promise<number>;
   /** Forwarded verbatim — a waiter carries no payload. */
   readonly listSignalWaitersByRun?: (runIds: string[]) => Promise<SignalWaiter[]>;
   /** Forwarded verbatim — a waiter carries no payload. */
@@ -237,6 +275,28 @@ export class CodecStateStore implements StateStore {
           inner,
           settlements.map((s) => this.encSettlement(s)),
         );
+    const settleResults = inner.settleResultsIfPending;
+    if (settleResults)
+      this.settleResultsIfPending = async (results) =>
+        (
+          await settleResults.call(
+            inner,
+            results.map((r) => this.encSettlement(r)),
+          )
+        ).map((cp) => this.decCp(cp));
+    const insertIfAbsent = inner.insertCheckpointIfAbsent;
+    if (insertIfAbsent)
+      this.insertCheckpointIfAbsent = (cp) => insertIfAbsent.call(inner, this.encCp(cp));
+    const claim = inner.claimPendingRuns;
+    if (claim)
+      this.claimPendingRuns = async (limit, owner, leaseUntilMs, nowMs, namespace) =>
+        (await claim.call(inner, limit, owner, leaseUntilMs, nowMs, namespace)).map(
+          (r) => this.decRun(r) as WorkflowRun,
+        );
+    const lockAndGet = inner.tryLockRunAndGet;
+    if (lockAndGet)
+      this.tryLockRunAndGet = async (runId, owner, leaseUntilMs, nowMs) =>
+        this.decRun(await lockAndGet.call(inner, runId, owner, leaseUntilMs, nowMs));
     const saveMany = inner.saveCheckpoints;
     if (saveMany)
       this.saveCheckpoints = (cps) =>
@@ -299,6 +359,21 @@ export class CodecStateStore implements StateStore {
         }));
     const deleteBuffered = inner.deleteBufferedSignals;
     if (deleteBuffered) this.deleteBufferedSignals = (ids) => deleteBuffered.call(inner, ids);
+    const takeOldest = inner.takeOldestBufferedSignal;
+    if (takeOldest)
+      this.takeOldestBufferedSignal = async (tokens) => {
+        const taken = await takeOldest.call(inner, tokens);
+        return taken ? { token: taken.token, payload: this.dec(taken.payload) } : null;
+      };
+    const { claimSignalId, releaseSignalId, deleteExpiredSignalIds } = inner;
+    if (claimSignalId)
+      this.claimSignalId = (token, id, expiresAt, nowMs) =>
+        claimSignalId.call(inner, token, id, expiresAt, nowMs);
+    if (releaseSignalId)
+      this.releaseSignalId = (token, id) => releaseSignalId.call(inner, token, id);
+    if (deleteExpiredSignalIds)
+      this.deleteExpiredSignalIds = (nowMs, limit) =>
+        deleteExpiredSignalIds.call(inner, nowMs, limit);
     const byRun = inner.listSignalWaitersByRun;
     if (byRun) this.listSignalWaitersByRun = (runIds) => byRun.call(inner, runIds);
     const hasWaiter = inner.hasSignalWaiter;
@@ -358,7 +433,7 @@ export class CodecStateStore implements StateStore {
     }
     return next;
   }
-  private encSettlement(settlement: StepSettlement): StepSettlement {
+  private encSettlement<S extends StepSettlement | StepResultSettlement>(settlement: S): S {
     const next = { ...settlement, output: this.enc(settlement.output) };
     if (this.extended) {
       if (settlement.events !== undefined) {

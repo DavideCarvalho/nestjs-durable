@@ -163,6 +163,36 @@ export const bufferedEvents = sqliteTable('durable_buffered_events', {
 });
 
 /**
+ * Signal dedupe ids (`engine.signal(token, payload, { id })`): one row per `(token, signal_id)`,
+ * deduplicating until `expires_at` (epoch ms). Expired rows are ignored by `claimSignalId` and
+ * deleted by `engine.sweepExpiredSignalIds()`.
+ *
+ * MIGRATION (you own this adapter's migrations): `drizzle-kit generate` picks the table up from
+ * `durableSchema`; by hand:
+ *
+ * ```sql
+ * CREATE TABLE durable_signal_ids (token TEXT NOT NULL, signal_id TEXT NOT NULL,
+ *   expires_at INTEGER NOT NULL, PRIMARY KEY (token, signal_id));
+ * CREATE INDEX durable_signal_ids_expires_at_idx ON durable_signal_ids (expires_at);
+ * ```
+ *
+ * Only needed if you send signals with an `id`.
+ */
+export const signalIds = sqliteTable(
+  'durable_signal_ids',
+  {
+    token: text('token').notNull(),
+    signalId: text('signal_id').notNull(),
+    expiresAt: integer('expires_at').notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.token, t.signalId] }),
+    // The sweep's "expired by T" scan.
+    index('durable_signal_ids_expires_at_idx').on(t.expiresAt),
+  ],
+);
+
+/**
  * Persisted schedules (`engine.schedules`). `spec`/`state` are JSON documents the engine owns; the
  * store only filters on the columns. `next_fire_at` is epoch ms, NULL when it never fires again.
  *
@@ -195,6 +225,7 @@ export const durableSchema = {
   signalWaiters,
   bufferedSignals,
   bufferedEvents,
+  signalIds,
   durableSchedules,
 };
 

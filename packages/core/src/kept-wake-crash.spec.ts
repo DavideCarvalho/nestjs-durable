@@ -36,7 +36,8 @@ function dying(
       const value = Reflect.get(target, prop, receiver);
       if (typeof value !== 'function') return value;
       return (...args: unknown[]) => {
-        if (armed && prop === trigger) dead = true;
+        // `tryLockRunAndGet` is the same lease take, on a store that reads the run with it.
+        if (armed && (prop === trigger || prop === `${trigger}AndGet`)) dead = true;
         return dead ? new Promise(() => {}) : value.apply(target, args);
       };
     },

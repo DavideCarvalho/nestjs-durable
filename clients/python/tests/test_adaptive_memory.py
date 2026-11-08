@@ -842,3 +842,34 @@ class DeferredStepIsNotAFailedStepTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UngatedCostSamplingTest(unittest.TestCase):
+    """Without the admission gate (fixed concurrency), a step's memory cost only feeds the heartbeat, so
+    the controller must not read the memory files around every step."""
+
+    def make(self, mem: FakeMemory) -> AdaptiveController:
+        return AdaptiveController(
+            resolve_concurrency(1), rss_reader=mem, rss_limit_reader=lambda: LIMIT, peak_reader=lambda: None
+        )
+
+    def test_fixed_mode_measures_each_name_at_most_once_a_second(self):
+        mem = FakeMemory(100)
+        ctl = self.make(mem)
+        clock = [1000.0]
+        with patch("durable_worker.adaptive.time.monotonic", lambda: clock[0]):
+            for _ in range(50):
+                ctl.on_settle(1.0, True, "step", ctl.on_start("bench.s1"))
+            self.assertLessEqual(mem.reads, 2)
+            self.assertIn("bench.s1", ctl.snapshot()["memory"].get("stepCostBytes", {}))
+            clock[0] += 1.5
+            before = mem.reads
+            ctl.on_settle(1.0, True, "step", ctl.on_start("bench.s1"))
+            self.assertGreater(mem.reads, before)
+
+    def test_the_gate_still_measures_every_solo_step(self):
+        mem = FakeMemory(100)
+        ctl = controller(mem)
+        for _ in range(5):
+            ctl.on_settle(1.0, True, "step", ctl.on_start("bench.s1"))
+        self.assertGreaterEqual(mem.reads, 10)

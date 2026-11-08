@@ -30,6 +30,9 @@ import { PrismaStateStore } from './prisma-state-store';
 
 const CONTAINER_TIMEOUT = 240_000;
 const skipped = !!process.env.SKIP_TESTCONTAINERS;
+// An existing (empty, dedicated) database instead of a testcontainer: `db push` owns its tables.
+const externalPgUrl = process.env.DURABLE_TEST_PG_URL;
+const externalMysqlUrl = process.env.DURABLE_TEST_MYSQL_URL;
 const pkgRoot = resolve(__dirname, '..');
 
 let pg: StartedPostgreSqlContainer | undefined;
@@ -89,6 +92,19 @@ function queryLog(client: any): {
 }
 let prismaQueries: ReturnType<typeof queryLog> | undefined;
 
+/**
+ * A database of this spec's own on a shared server: `<base>_prisma`. Every store's db spec gets the
+ * same `DURABLE_TEST_*_URL`, and each defines the `durable_*` tables its own way (this schema's
+ * `wake_at` is a BIGINT, TypeORM's a DATETIME), so one database shared between specs running at once
+ * lets `db push --accept-data-loss` and another store's schema sync clobber each other mid-run.
+ * `prisma db push` creates the database when it is missing.
+ */
+function dedicatedDatabaseUrl(baseUrl: string): string {
+  const target = new URL(baseUrl);
+  target.pathname = `/${decodeURIComponent(target.pathname.slice(1)) || 'durable'}_prisma`;
+  return target.toString();
+}
+
 function runPrisma(args: string[], env: Record<string, string>): void {
   execFileSync('npx', ['prisma', ...args], {
     cwd: pkgRoot,
@@ -98,10 +114,12 @@ function runPrisma(args: string[], env: Record<string, string>): void {
 }
 
 beforeAll(async () => {
-  if (skipped) return;
+  if (skipped && !externalPgUrl) return;
   try {
-    pg = await new PostgreSqlContainer('postgres:16-alpine').start();
-    const url = pg.getConnectionUri();
+    if (!externalPgUrl) pg = await new PostgreSqlContainer('postgres:16-alpine').start();
+    const url = externalPgUrl
+      ? dedicatedDatabaseUrl(externalPgUrl)
+      : (pg as StartedPostgreSqlContainer).getConnectionUri();
     const schema = 'prisma/test.pg.prisma';
     // Generate the Postgres client into generated/pg-client, then create the tables.
     runPrisma(['generate', '--schema', schema], { PRISMA_PG_URL: url });
@@ -130,19 +148,20 @@ async function truncatePrisma(client: any = sharedPrisma): Promise<void> {
   await client.durableSignalWaiter.deleteMany();
   await client.durableBufferedSignal.deleteMany();
   await client.durableBufferedEvent.deleteMany();
+  await client.durableSignalId.deleteMany();
   await client.durableSchedule.deleteMany();
   await client.durableRunAttribute.deleteMany(); // before runs (FK)
   await client.durableWorkflowRun.deleteMany();
 }
 
 function available(): boolean {
-  return !skipped && !setupError && !!sharedPrisma;
+  return (!skipped || !!externalPgUrl) && !setupError && !!sharedPrisma;
 }
 
 runStateStoreContract('Prisma (Postgres)', async () => {
   if (!available()) {
     throw new (await import('@dudousxd/nestjs-durable-testing')).StateStoreUnavailableError(
-      skipped
+      skipped && !externalPgUrl
         ? 'SKIP_TESTCONTAINERS set'
         : `Prisma Postgres unavailable (is Docker running?): ${String(setupError)}`,
     );
@@ -167,10 +186,13 @@ let mysqlPrisma: any;
 let mysqlQueries: ReturnType<typeof queryLog> | undefined;
 
 beforeAll(async () => {
-  if (skipped) return;
+  if (skipped && !externalMysqlUrl) return;
   try {
-    mysql = await new MySqlContainer('mysql:8.0').start();
-    const url = `mysql://${mysql.getUsername()}:${mysql.getUserPassword()}@${mysql.getHost()}:${mysql.getPort()}/${mysql.getDatabase()}`;
+    let url = externalMysqlUrl && dedicatedDatabaseUrl(externalMysqlUrl);
+    if (!url) {
+      mysql = await new MySqlContainer('mysql:8.0').start();
+      url = `mysql://${mysql.getUsername()}:${mysql.getUserPassword()}@${mysql.getHost()}:${mysql.getPort()}/${mysql.getDatabase()}`;
+    }
     const schema = 'prisma/test.mysql.prisma';
     runPrisma(['generate', '--schema', schema], { PRISMA_MYSQL_URL: url });
     runPrisma(['db', 'push', '--schema', schema, '--skip-generate', '--accept-data-loss'], {
@@ -194,9 +216,9 @@ afterAll(async () => {
 });
 
 runStateStoreContract('Prisma (MySQL)', async () => {
-  if (skipped || mysqlError || !mysqlPrisma) {
+  if ((skipped && !externalMysqlUrl) || mysqlError || !mysqlPrisma) {
     throw new (await import('@dudousxd/nestjs-durable-testing')).StateStoreUnavailableError(
-      skipped
+      skipped && !externalMysqlUrl
         ? 'SKIP_TESTCONTAINERS set'
         : `Prisma MySQL unavailable (is Docker running?): ${String(mysqlError)}`,
     );

@@ -1,0 +1,4 @@
+prisma seq200 before {"msPerStep":11.87,"firstDecile":15.21,"lastDecile":11.37,"sqlPerStep":23.13,"cpuMsPerStep":6.75,"stickyHits":200}
+prisma seq200 after {"msPerStep":8,"firstDecile":9.89,"lastDecile":7.05,"sqlPerStep":10.11,"cpuMsPerStep":3.51,"stickyHits":200}
+prisma throughput before {"wfPerSec":78.06,"sqlPerStep":27.99,"cpuMsPerWf":40.03,"cpuPct":301.36,"stickyHits":5000}
+prisma throughput after {"wfPerSec":145.5,"sqlPerStep":13.99,"cpuMsPerWf":18.16,"cpuPct":249.83,"stickyHits":5000}

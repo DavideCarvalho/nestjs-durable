@@ -9,10 +9,7 @@ import {
   NotFoundException,
   Param,
   StreamableFile,
-  UseFilters,
 } from '@nestjs/common';
-import { DashboardLoginRedirectFilter } from './auth/login-redirect.exception.js';
-import { DashboardSessionRequiredFilter } from './auth/session-required.exception.js';
 
 /** DI token carrying the UI mount base (e.g. `/durable`). */
 export const DASHBOARD_BASE_PATH = Symbol('DASHBOARD_BASE_PATH');
@@ -39,20 +36,17 @@ const CONTENT_TYPES: Record<string, string> = {
 
 /**
  * Serves the bundled control-plane SPA at the configured base (+ hashed assets at `<base>/assets`).
- * The path comes from `RouterModule` (set by `DurableDashboardModule.forRoot({ basePath })`), so the
- * controller routes are relative.
+ * The controller routes are relative: the mounted {@link DurableUiController} gets its path from
+ * `RouterModule` (set by `DurableDashboardModule.forRoot({ basePath })`).
  *
- * `@UseFilters(DashboardLoginRedirectFilter, DashboardSessionRequiredFilter)` is permanent (present
- * regardless of whether `dashboardAuth` is configured): each only ever activates for its own
- * exception type, which `DurableUiSessionGuard` only throws when it is ALSO stamped on this
- * controller (see `DurableDashboardModule.forRoot`) — so leaving them decorated here is inert, not
- * a behavior change, when `dashboardAuth` is absent. The guard picks between the two exceptions
- * based on which mode is configured (Mode B => redirect to the login page; Mode A only => render
- * the session-required instruction page in place, since there is no login page to redirect to).
+ * This base is what a host EXTENDS to serve the console from a controller of its own (with
+ * `forRoot({ routes: false, basePath })`): `@Controller('<basePath>') class MyConsole extends
+ * DurableUiControllerBase {}`, protected with the host's own decorators. It carries no guards and
+ * no `@nestjs/authorization` mark, so a subclass is protected only by what the host puts on it (and,
+ * under `AuthorizationModule`'s global guard, is denied until it declares a `@Can()`).
  */
-@UseFilters(DashboardLoginRedirectFilter, DashboardSessionRequiredFilter)
 @Controller()
-export class DurableUiController {
+export class DurableUiControllerBase {
   private readonly dir = spaDir();
 
   constructor(
@@ -95,3 +89,12 @@ export class DurableUiController {
     return new StreamableFile(readFileSync(assetPath), { type });
   }
 }
+
+/**
+ * The SPA controller `DurableDashboardModule.forRoot(...)` mounts at `basePath`. The module puts
+ * the `@nestjs/authorization` open mark on THIS class (and `decorators` on a per-registration
+ * subclass of it), never on {@link DurableUiControllerBase}, so a host's own subclass of the base
+ * inherits none of them.
+ */
+@Controller()
+export class DurableUiController extends DurableUiControllerBase {}

@@ -61,8 +61,8 @@ await engine.schedules.delete(`brief:${user.id}`);     // its past runs are left
 
 | Option | Values | Meaning |
 | --- | --- | --- |
-| `cron` / `every` | cron expression / duration | Exactly one. Intervals are aligned to the epoch. Cron needs the `cron-parser` peer. |
-| `timezone` | IANA zone, default `UTC` | Zone the cron is evaluated in. |
+| `cron` / `every` / `rrule` | cron expression / duration / RFC 5545 rule | Exactly one. Intervals are aligned to the epoch. Cron needs the `cron-parser` peer; `rrule` needs nothing. |
+| `timezone` | IANA zone, default `UTC` | Zone the cron or rrule is evaluated in. |
 | `jitter` | duration | A stable per-(schedule, window) delay in `[0, jitter)` so schedules sharing a cron don't all start in the same second. The run id stays the nominal window. |
 | `overlap` | `'allow'` (default) / `'skip'` | `'skip'` skips a window while the previous run of this schedule is still in flight. |
 | `catchup` | `'latest'` (default) / `'skip'` | Windows missed while nothing polled: fire the most recent one once, or drop them. Never more than one catch-up run. |
@@ -72,6 +72,37 @@ await engine.schedules.delete(`brief:${user.id}`);     // its past runs are left
 A start that fails (unregistered workflow, input validation, a concurrency limit…) is recorded as the
 schedule's `lastError` and the schedule moves on to its next window. A definition that stops evaluating
 (e.g. a timezone removed from the tz database) pauses the schedule with the reason in `lastError`.
+
+### Recurrence rules — `rrule`
+
+For calendars a cron line can't say ("the last Friday of the month", "every other Tuesday from a
+given date"), pass an [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545#section-3.3.10) rule:
+
+```ts
+await engine.schedules.create({
+  id: `payroll:${company.id}`,
+  workflow: PayrollWorkflow,
+  rrule: 'FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17',
+  timezone: company.timezone,
+});
+
+await engine.schedules.create({
+  id: 'sprint-review',
+  workflow: SprintReviewWorkflow,
+  // A DTSTART line anchors INTERVAL and COUNT (local time in `timezone`, or UTC with a trailing Z).
+  rrule: 'DTSTART:20261103T100000\nRRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU',
+  timezone: 'Europe/Lisbon',
+});
+```
+
+Supported parts: `FREQ` (`YEARLY` … `MINUTELY`), `INTERVAL`, `COUNT`, `UNTIL`, `BYMONTH`,
+`BYMONTHDAY` (negative from the month's end), `BYDAY` (with an ordinal like `1MO` or `-1FR` under
+`MONTHLY` / `YEARLY`), `BYHOUR`, `BYMINUTE`, `BYSECOND`, `WKST`. `BYSETPOS`, `BYWEEKNO`, `BYYEARDAY`
+and `SECONDLY` are refused by name when the schedule is created. Without `DTSTART`, the rule is
+anchored at 1970-01-01T00:00 in the zone: a missing `BYHOUR` / `BYMINUTE` / `BYSECOND` means 0, and
+`INTERVAL` / `COUNT` count from there. A local time that doesn't exist (the hour skipped when clocks
+go forward) is skipped that day; an ambiguous one fires once. A rule that ends (`COUNT`, `UNTIL`)
+leaves the schedule with no next fire. The rule lives in the schedule's stored spec: no migration.
 
 ## Multi-worker safety
 

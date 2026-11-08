@@ -5,6 +5,7 @@ import {
   BufferedSignalRepository,
   RunAttributeRepository,
   ScheduleRepository,
+  SignalIdRepository,
   SignalWaiterRepository,
   StepCheckpointRepository,
   WorkflowRunRepository,
@@ -134,6 +135,16 @@ export class BufferedEventEntity {
   name!: string;
   payload?: unknown;
   publishedAt!: Date;
+}
+
+/** A signal dedupe id (`engine.signal(token, payload, { id })`): deduplicates until `expiresAt`. */
+export class SignalIdEntity {
+  [EntityRepositoryType]?: SignalIdRepository;
+
+  token!: string;
+  signalId!: string;
+  /** Epoch ms as a `bigint` column — exact, unlike a DATETIME. Drivers may hand it back as a string. */
+  expiresAt!: number | string | bigint;
 }
 
 /** A persisted schedule (`engine.schedules`). `spec`/`state` are engine-owned JSON documents. */
@@ -386,6 +397,19 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     },
   });
 
+  const signalIds = new EntitySchema<SignalIdEntity>({
+    class: SignalIdEntity,
+    tableName: 'durable_signal_ids',
+    repository: () => SignalIdRepository,
+    // The expired-id sweep (`expires_at <= now`).
+    indexes: [{ name: 'durable_signal_ids_expires_at_idx', properties: ['expiresAt'] }],
+    properties: {
+      token: { type: 'string', primary: true, fieldName: col('token') },
+      signalId: { type: 'string', primary: true, fieldName: col('signalId') },
+      expiresAt: { type: 'bigint', fieldName: col('expiresAt') },
+    },
+  });
+
   const schedules = new EntitySchema<ScheduleEntity>({
     class: ScheduleEntity,
     tableName: 'durable_schedules',
@@ -413,6 +437,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     signalWaiters,
     bufferedSignals,
     bufferedEvents,
+    signalIds,
     schedules,
   ];
 }
