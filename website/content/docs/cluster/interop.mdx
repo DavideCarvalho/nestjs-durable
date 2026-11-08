@@ -21,7 +21,9 @@ Interop rides the [BullMQ transport](/docs/transports/bullmq). The control-plane
 |---------|---------|-----------|
 | Task dispatch (step + workflow) | `${P}-tasks-${token}` | BullMQ queue |
 | Step result | `${P}-results` | queue |
-| Step results, batched (Node workers, while an engine reads them) | `${P}-results-batch` | queue, job data `{ results: StepResult[] }` |
+| Step results, batched (Node and Python workers, while an engine reads them) | `${P}-results-batch` | queue, job data `{ results: StepResult[] }` |
+| Step result for one engine (a task stamped `replyTo`, while that engine is alive) | `${P}-results-to-${instance}` | queue, one `StepResult` or `{ results: StepResult[] }` |
+| Engine alive (for routed results) | `${P}:reply-alive:${instance}` | Redis key, TTL `replyAliveTtlMs` |
 | Workflow decision | `${P}-decisions` | queue |
 | Control broadcast | `${P}-control` | Redis pub/sub |
 | Worker liveness | `${P}-worker-heartbeat:${token}:${instance}` | Redis key, `EX 35` |

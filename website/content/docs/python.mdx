@@ -95,6 +95,12 @@ A few properties that follow from this being queue-based:
   hands each task to one of them. Scale a slow step by adding workers, not by touching the workflow.
 - **The engine owns correlation.** Every result carries the `stepId` it answers; the engine matches
   it to the suspended `ctx.step` and resumes the run. The worker never needs the run's state.
+- **Results go where the engine reads them fastest.** From `durable-worker` 0.27 the runner sends a
+  result the same three ways the TypeScript worker does: to `<prefix>-results-to-<instance>` when
+  the task carries `replyTo` and that engine's alive key exists (the engine holding the parked body
+  continues it instead of replaying), batched on `<prefix>-results-batch` while an engine consumes
+  that queue, and otherwise one job per result on `<prefix>-results`. A failed routed or batched
+  publish falls back to the shared queue. See [Result delivery](/docs/transports/bullmq#result-delivery).
 - **A killed worker reports the job it was holding.** A process killed mid-step (an OOM kill) produces
   no result, and the engine's `pending` checkpoint would have nothing left to settle it. The runner
   registers a `failed` listener on each of its BullMQ workers, so when a peer's stalled-check

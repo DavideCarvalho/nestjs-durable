@@ -331,6 +331,12 @@ export interface DurableModuleOptions {
    */
   blockedPollMs?: number;
   /**
+   * How long (ms) the routing guard reuses the worker descriptors it read for a queue token. On
+   * BullMQ each read scans the Redis keyspace. Default 2000; `0` reads on every dispatch. See
+   * `WorkflowEngineDeps.workerDescriptorCacheMs`. Operator only.
+   */
+  workerDescriptorCacheMs?: number;
+  /**
    * Persist a `running` checkpoint when a local step's body begins, so an in-flight step survives a
    * dashboard reload. Defaults to `true`; set `false` on hot paths with many short local steps to
    * halve their checkpoint writes. See `WorkflowEngineDeps.trackStepStart`. Operator only.
@@ -924,6 +930,7 @@ export class DurableModule {
               eventBufferTtlMs: options.eventBufferTtlMs,
               signalIdTtl: options.signalIdTtl,
               blockedPollMs: options.blockedPollMs,
+              workerDescriptorCacheMs: options.workerDescriptorCacheMs,
               trackStepStart: options.trackStepStart,
               stickyRuns: options.stickyRuns,
               stickyIdleMs: options.stickyIdleMs,
