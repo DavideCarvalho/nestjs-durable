@@ -24,13 +24,16 @@ jobs:
 
   # Every `*.db.spec.ts` suite (`pnpm test:db`) against real backends, in two shards so neither
   # waits on the other. Service containers back the specs that take a URL (`DURABLE_TEST_*`): they
-  # isolate themselves on a shared server (a database, key prefix or queue prefix of their own). The
-  # StateStore contract specs truncate the durable tables between cases, so they keep booting their
-  # own testcontainers (the runner has Docker). `DURABLE_TEST_REQUIRE_BACKENDS` turns a case that
+  # isolate themselves on a shared server (a database, key prefix or queue prefix of their own; each
+  # store's contract spec uses `<db>_<store>`, since the stores define the same tables differently).
+  # Specs that take no URL boot their own testcontainers (the runner has Docker). `DURABLE_TEST_REQUIRE_BACKENDS` turns a case that
   # would skip itself for a missing backend into a failure, so a container that never started can't
   # pass as a green run.
   real-backends:
     runs-on: ubuntu-latest
+    # A shard takes minutes; a spec left waiting on a run that never finishes (open handles keep
+    # vitest alive) must fail the job instead of holding the runner for hours.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

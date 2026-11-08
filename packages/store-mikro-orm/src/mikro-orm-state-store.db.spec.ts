@@ -10,6 +10,7 @@ import { MySqlContainer, type StartedMySqlContainer } from '@testcontainers/mysq
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { makeMikroOrmStoreFactory } from './conformance';
+import { ENTITIES } from './entities';
 
 /**
  * Real-engine matrix for the MikroORM adapter: the SHARED cross-store contract against Postgres and
@@ -27,6 +28,50 @@ const externalMysqlUrl = process.env.DURABLE_TEST_MYSQL_URL;
 
 type Factory = ReturnType<typeof makeMikroOrmStoreFactory>;
 
+/**
+ * A database of this spec's own on a shared server: `<base>_mikro_orm`, created when missing. Every
+ * store's db spec gets the same `DURABLE_TEST_*_URL`, and each defines the `durable_*` tables its own
+ * way (Prisma's `wake_at` is a BIGINT, MikroORM's a timestamp), so one database shared between specs
+ * running at once lets one spec's schema clobber another's mid-run. Idempotent, and safe when two
+ * specs race to create it.
+ */
+async function dedicatedDatabaseUrl(
+  dialect: 'postgres' | 'mysql',
+  baseUrl: string,
+): Promise<string> {
+  const target = new URL(baseUrl);
+  const name = `${decodeURIComponent(target.pathname.slice(1)) || dialect}_mikro_orm`;
+  if (dialect === 'mysql') {
+    const admin = await MySqlMikroORM.init({ clientUrl: baseUrl, entities: [...ENTITIES] });
+    try {
+      await admin.em.getConnection().execute(`create database if not exists \`${name}\``);
+    } finally {
+      await admin.close(true);
+    }
+  } else {
+    const admin = await PostgresMikroORM.init({ clientUrl: baseUrl, entities: [...ENTITIES] });
+    try {
+      const connection = admin.em.getConnection();
+      const rows = await connection.execute('select 1 from pg_database where datname = ?', [name]);
+      if (rows.length === 0) {
+        await connection
+          .execute(`create database "${name}"`)
+          .catch((err: Error & { code?: string }) => {
+            // 42P04 duplicate_database; 23505 when a concurrent CREATE wins the catalog insert.
+            const raced =
+              ['42P04', '23505'].includes(err.code ?? '') ||
+              /already exists|duplicate key/.test(err.message);
+            if (!raced) throw err;
+          });
+      }
+    } finally {
+      await admin.close(true);
+    }
+  }
+  target.pathname = `/${name}`;
+  return target.toString();
+}
+
 // --- Postgres ---------------------------------------------------------------------------------
 
 let pg: StartedPostgreSqlContainer | undefined;
@@ -36,7 +81,7 @@ let pgFactory: Factory | undefined;
 beforeAll(async () => {
   if (externalPgUrl) {
     pgFactory = makeMikroOrmStoreFactory((options) => PostgresMikroORM.init(options), {
-      clientUrl: externalPgUrl,
+      clientUrl: await dedicatedDatabaseUrl('postgres', externalPgUrl),
     });
     return;
   }
@@ -80,7 +125,7 @@ let mysqlFactory: Factory | undefined;
 beforeAll(async () => {
   if (externalMysqlUrl) {
     mysqlFactory = makeMikroOrmStoreFactory((options) => MySqlMikroORM.init(options), {
-      clientUrl: externalMysqlUrl,
+      clientUrl: await dedicatedDatabaseUrl('mysql', externalMysqlUrl),
     });
     return;
   }

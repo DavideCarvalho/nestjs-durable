@@ -5,7 +5,7 @@ import {
 } from '@dudousxd/nestjs-durable-testing';
 import { MySqlContainer, type StartedMySqlContainer } from '@testcontainers/mysql';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
-import type { DataSourceOptions } from 'typeorm';
+import { DataSource, type DataSourceOptions } from 'typeorm';
 import { afterAll, beforeAll, describe } from 'vitest';
 import { makeTypeOrmStoreFactory } from './conformance';
 
@@ -26,6 +26,36 @@ const skipped = !!process.env.SKIP_TESTCONTAINERS;
 const externalPgUrl = process.env.DURABLE_TEST_PG_URL;
 const externalMysqlUrl = process.env.DURABLE_TEST_MYSQL_URL;
 
+/**
+ * A database of this spec's own on a shared server: `<base>_typeorm`, created when missing. Every
+ * store's db spec gets the same `DURABLE_TEST_*_URL`, and each defines the `durable_*` tables its own
+ * way (Prisma's `wake_at` is a BIGINT, TypeORM's a DATETIME), so one database shared between specs
+ * running at once lets one spec's schema clobber another's mid-run. Idempotent, and safe when two
+ * specs race to create it.
+ */
+async function dedicatedDatabaseUrl(type: 'postgres' | 'mysql', baseUrl: string): Promise<string> {
+  const target = new URL(baseUrl);
+  const name = `${decodeURIComponent(target.pathname.slice(1)) || type}_typeorm`;
+  const admin = new DataSource({ type, url: baseUrl });
+  await admin.initialize();
+  try {
+    if (type === 'mysql') await admin.query(`CREATE DATABASE IF NOT EXISTS \`${name}\``);
+    else {
+      const rows = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [name]);
+      if (rows.length === 0) {
+        await admin.query(`CREATE DATABASE "${name}"`).catch((err: { code?: string }) => {
+          // 42P04 duplicate_database; 23505 when a concurrent CREATE wins the catalog insert.
+          if (err.code !== '42P04' && err.code !== '23505') throw err;
+        });
+      }
+    }
+  } finally {
+    await admin.destroy();
+  }
+  target.pathname = `/${name}`;
+  return target.toString();
+}
+
 // --- Postgres ---------------------------------------------------------------------------------
 
 let pgOptions: DataSourceOptions | undefined;
@@ -34,7 +64,7 @@ let pg: StartedPostgreSqlContainer | undefined;
 
 beforeAll(async () => {
   if (externalPgUrl) {
-    pgOptions = { type: 'postgres', url: externalPgUrl };
+    pgOptions = { type: 'postgres', url: await dedicatedDatabaseUrl('postgres', externalPgUrl) };
     return;
   }
   if (skipped) return;
@@ -77,7 +107,7 @@ let mysql: StartedMySqlContainer | undefined;
 
 beforeAll(async () => {
   if (externalMysqlUrl) {
-    mysqlOptions = { type: 'mysql', url: externalMysqlUrl };
+    mysqlOptions = { type: 'mysql', url: await dedicatedDatabaseUrl('mysql', externalMysqlUrl) };
     return;
   }
   if (skipped) return;

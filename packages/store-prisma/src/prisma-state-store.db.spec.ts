@@ -92,6 +92,19 @@ function queryLog(client: any): {
 }
 let prismaQueries: ReturnType<typeof queryLog> | undefined;
 
+/**
+ * A database of this spec's own on a shared server: `<base>_prisma`. Every store's db spec gets the
+ * same `DURABLE_TEST_*_URL`, and each defines the `durable_*` tables its own way (this schema's
+ * `wake_at` is a BIGINT, TypeORM's a DATETIME), so one database shared between specs running at once
+ * lets `db push --accept-data-loss` and another store's schema sync clobber each other mid-run.
+ * `prisma db push` creates the database when it is missing.
+ */
+function dedicatedDatabaseUrl(baseUrl: string): string {
+  const target = new URL(baseUrl);
+  target.pathname = `/${decodeURIComponent(target.pathname.slice(1)) || 'durable'}_prisma`;
+  return target.toString();
+}
+
 function runPrisma(args: string[], env: Record<string, string>): void {
   execFileSync('npx', ['prisma', ...args], {
     cwd: pkgRoot,
@@ -104,7 +117,9 @@ beforeAll(async () => {
   if (skipped && !externalPgUrl) return;
   try {
     if (!externalPgUrl) pg = await new PostgreSqlContainer('postgres:16-alpine').start();
-    const url = externalPgUrl ?? (pg as StartedPostgreSqlContainer).getConnectionUri();
+    const url = externalPgUrl
+      ? dedicatedDatabaseUrl(externalPgUrl)
+      : (pg as StartedPostgreSqlContainer).getConnectionUri();
     const schema = 'prisma/test.pg.prisma';
     // Generate the Postgres client into generated/pg-client, then create the tables.
     runPrisma(['generate', '--schema', schema], { PRISMA_PG_URL: url });
@@ -173,7 +188,7 @@ let mysqlQueries: ReturnType<typeof queryLog> | undefined;
 beforeAll(async () => {
   if (skipped && !externalMysqlUrl) return;
   try {
-    let url = externalMysqlUrl;
+    let url = externalMysqlUrl && dedicatedDatabaseUrl(externalMysqlUrl);
     if (!url) {
       mysql = await new MySqlContainer('mysql:8.0').start();
       url = `mysql://${mysql.getUsername()}:${mysql.getUserPassword()}@${mysql.getHost()}:${mysql.getPort()}/${mysql.getDatabase()}`;
