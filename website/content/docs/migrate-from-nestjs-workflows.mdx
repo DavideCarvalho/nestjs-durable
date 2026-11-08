@@ -99,13 +99,13 @@ export class OrderWorkflow {
 | --- | --- | --- |
 | `ctx.sleep(name, '10m')` | `ctx.sleep('10m')` | ✅ |
 | `ctx.sleep(name, { until })` | `ctx.sleepUntil(until)` | ✅ |
-| `ctx.waitForSignal(name, 'approve', { key })` | `ctx.waitForSignal(`approve:${key}`)`: a signal is a string token, and the codemod spells name + key as `<name>:<key>` | ✅ |
+| `ctx.waitForSignal(name, 'approve', { key })` | `` ctx.waitForSignal(`approve:${key}`) ``: a signal is a string token, and the codemod spells name + key as `<name>:<key>` | ✅ |
 | `… { timeout }` (resolves `null`) | `… { timeoutMs }` (**throws** `SignalTimeoutError`) | ✅ + TODO |
 | `… { match }` | filter and wait again, or [`ctx.waitForEvent(name, { match })`](/docs/authoring/events) | TODO |
-| `client.signal('approve', payload, { key })` | `workflows.signal(`approve:${key}`, payload)` | ✅ |
-| `client.signal(…, { key, id })` (dedupe) | `workflows.signal(`approve:${key}`, payload, { id })`: a re-send with the same token and id is dropped while the id is remembered ([`signalIdTtl`](/docs/concepts/sleep-and-signals#deduplicating-signals-id), 7 days by default) | ✅ |
+| `client.signal('approve', payload, { key })` | `` workflows.signal(`approve:${key}`, payload) `` | ✅ |
+| `client.signal(…, { key, id })` (dedupe) | `` workflows.signal(`approve:${key}`, payload, { id }) ``: a re-send with the same token and id is dropped while the id is remembered ([`signalIdTtl`](/docs/concepts/sleep-and-signals#deduplicating-signals-id), 7 days by default) | ✅ |
 | `ctx.waitForAny(name, { … })` | [`ctx.waitForAny(name, { … })`](/docs/concepts/sleep-and-signals#waiting-for-the-first-of-several-waitforany), same `{ key, value }` result | ✅ |
-| `ctx.signalWait(signal, { key })` | `ctx.signalWait(`signal:${key}`)` | ✅ |
+| `ctx.signalWait(signal, { key })` | `` ctx.signalWait(`signal:${key}`) `` | ✅ |
 | `ctx.signalWait(…, { match })` | none: give the signals you want told apart their own token | TODO |
 | `ctx.timer('3d')` / `ctx.timer({ until })` | the same | ✅ |
 | a child handle as a condition | `ctx.childWait(id)` (durable's `startChild` resolves the id) | ✅ |
