@@ -19,13 +19,17 @@ export default decoratorDualConfig(
     'zod',
     '@nestjs/workflows',
     '@dudousxd/nestjs-durable-workflows-gateway',
+    '@nestjs/outbox',
   ],
-  // `./migrate-from-nestjs-workflows` is its own entry, so `@nestjs/workflows` and the workflows
-  // gateway (optional peers) load only for importers of that subpath.
+  // `./migrate-from-nestjs-workflows` and `./outbox` are their own entries, so their optional peers
+  // (`@nestjs/workflows` + the workflows gateway, `@nestjs/outbox`) load only for importers of that
+  // subpath. `./outbox` imports nothing from the main entry (only core and the peer), so no class
+  // is bundled twice.
   {
     entry: {
       index: 'src/index.ts',
       'migrate-from-nestjs-workflows': 'src/migrate-from-nestjs-workflows/index.ts',
+      outbox: 'src/outbox/index.ts',
     },
   },
 );

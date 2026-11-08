@@ -209,6 +209,43 @@ Protection is **mount-level and role-agnostic**: nothing in the console changes 
 and it has no notion of the control-plane vs tenant topology (the `GET topology` route behind the
 header badge, described below).
 
+### Idempotent retries — `@nestjs/idempotency`
+
+A client that retries a `POST` (a flaky network, a proxy replaying a request, a third party
+re-sending a webhook) would retry, cancel or resume a run twice. The official
+[`@nestjs/idempotency`](https://docs.nestjs.com/reliability/idempotency) solves that, and it fits
+the console with no durable option: its `Idempotent()` decorator, put on a **class**, covers every
+state-changing handler and skips `GET`/`HEAD`/`OPTIONS`. Pass it through `decorators`:
+
+```ts
+import { IdempotencyModule, Idempotent } from '@nestjs/idempotency';
+
+@Module({
+  imports: [
+    IdempotencyModule.forRoot(), // the store, ttl, header, scope: see the official docs
+    DurableDashboardModule.forRoot({
+      decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view'), Idempotent()],
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+Every `POST` the console mounts (retry, retry-with-input, cancel, bulk, continue, redispatch,
+republish-lifecycle, schedule pause/resume/trigger, `ctx.onUpdate` deliveries, and the
+[`ctx.webhook()`](/docs/authoring/webhooks) receiver at `webhooks/:token`) then runs once per
+`Idempotency-Key`, and a replay gets the stored response. A request without the header runs as
+before, unless you set `required: true`. With `routes: false`, put `@Idempotent()` on your own
+subclass of `DurableApiControllerBase` instead.
+
+- **It is not protection.** `Idempotent()` in `decorators` still counts toward
+  [the production rule](#the-production-rule), because the module cannot tell decorators apart.
+  Keep your guards next to it.
+- **Scope.** Without `scope`, keys share one namespace; with signed-in operators, scope them per
+  user (`Idempotent({ scope: (req) => req.user?.id })`). For the webhook receiver, the provider's
+  event id is a natural key, and `scope: false` fits it.
+- Durable does not depend on `@nestjs/idempotency`; install it in your app.
+
 ### Migrating from the removed options
 
 `guards`, `dashboardAuth` (with its login page, session cookie, `forRootAsync`/`useDashboardAuth`,

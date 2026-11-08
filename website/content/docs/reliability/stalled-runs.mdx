@@ -66,8 +66,9 @@ export class StalledRunAlerts implements OnModuleInit {
 - **Once per episode, per instance.** A run already reported is skipped until it makes progress
   (its `updatedAt` changes) and strands again, so a wedged run does not page you every minute. That
   memory is in-process: with several driving replicas each one reports the episode once, and a
-  restart forgets what it reported. Register the listener on one process, or deduplicate in the pager
-  by `run.id` + `run.updatedAt`.
+  restart forgets what it reported. Import `LocksModule` from `@nestjs/locks` with a shared store and
+  the sweep runs on one pod (see [Fleet-wide sweeps on one pod](/docs/production#fleet-wide-sweeps-on-one-pod)),
+  or deduplicate in the pager by `run.id` + `run.updatedAt`.
 - **Bounded and namespaced.** A pass inspects up to 1000 in-flight runs (newest first, in pages of
   200), reads the checkpoints of the idle ones, and stays in the engine's own `namespace`. An operator
   with no namespace sweeps every namespace.

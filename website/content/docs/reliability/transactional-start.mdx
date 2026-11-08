@@ -1,0 +1,122 @@
+---
+title: Transactional start
+description: "Start or signal a run in the same database transaction as your business writes, through the official @nestjs/outbox: commit → the run starts, rollback → nothing, redelivery → still one run. Ships as the @dudousxd/nestjs-durable/outbox subpath."
+icon: ArrowRightLeft
+---
+
+"Insert the order, then start its checkout workflow" is two writes to two places. If the process
+dies between them, the order exists and its workflow never starts. `WorkflowService.start` cannot
+join your transaction: the engine writes to its own store.
+
+The fix is a transactional outbox, and NestJS ships one: [`@nestjs/outbox`](https://docs.nestjs.com/reliability/outbox).
+It writes a message through **your** transaction and relays it after commit, with leases, retries,
+dead letters and an inbox that deduplicates redeliveries. Durable doesn't reimplement any of that.
+It adds the one missing piece: a message type that starts or signals a run, and the handler that
+delivers it to the engine.
+
+## Setup
+
+```bash
+npm i @nestjs/outbox
+```
+
+`@nestjs/outbox` is an **optional** peer of `@dudousxd/nestjs-durable`. Only the
+`@dudousxd/nestjs-durable/outbox` subpath loads it; the main entry never does.
+
+```ts
+import { DurableModule } from '@dudousxd/nestjs-durable';
+import { DurableOutboxModule } from '@dudousxd/nestjs-durable/outbox';
+import { OutboxModule, OutboxStorage } from '@nestjs/outbox';
+import { fromDrizzle, PostgresOutboxStore } from '@nestjs/outbox/postgres';
+
+@Module({
+  imports: [
+    DurableModule.forRoot({ store, transport }),
+    // The official module: store, relay, retries, dead letters. See its docs for every option.
+    OutboxModule.forRoot(),
+    DurableOutboxModule.forRoot(), // { topic?: 'nestjs-durable', consumer?: 'nestjs-durable' }
+  ],
+  providers: [
+    {
+      provide: PostgresOutboxStore,
+      inject: [getDrizzleToken(), OutboxStorage],
+      useFactory: (db: Database, storage: OutboxStorage) =>
+        new PostgresOutboxStore({ executor: fromDrizzle(db) }, storage),
+    },
+  ],
+})
+export class AppModule {}
+```
+
+The store, the relay (`relay.enabled`, `pollInterval`, …), `retry` and `route` are all configured on
+`OutboxModule`, exactly as the [official docs](https://docs.nestjs.com/reliability/outbox) describe.
+
+## Start a run in your transaction
+
+```ts
+import { DurableOutbox } from '@dudousxd/nestjs-durable/outbox';
+
+@Injectable()
+export class Orders {
+  constructor(private readonly db: Database, private readonly durable: DurableOutbox<Transaction>) {}
+
+  async place(order: NewOrder) {
+    await this.db.transaction(async (tx) => {
+      await tx.insert(orders).values(order);
+      await this.durable.start(tx, CheckoutWorkflow, { orderId: order.id }, {
+        runId: `checkout:${order.id}`,
+        // …and any StartOptions: tags, searchAttributes, priority, namespace, startAt, version
+      });
+    });
+    this.durable.notify(); // optional: relay now instead of at the next poll
+  }
+}
+```
+
+- **Commit**: the relay delivers the message and the engine starts the run.
+- **Rollback**: the message is gone with the order; no run.
+- **Redelivery** (a crash after the start but before the relay recorded it, a lost lease, a requeued
+  dead letter): the engine's `start` is idempotent by run id, so the second delivery finds the run
+  and does nothing. Pass a `runId` derived from your data. If you omit it, a random id is chosen
+  **when the message is written** and stored in it, so every redelivery still targets the same run.
+  `start()` resolves `{ runId }` either way.
+
+A workflow class is written by its registered **name**, so the message is plain JSON and any instance
+running the relay can deliver it. The payload (input, options) must be JSON-serializable: the outbox
+snapshots it with `JSON.stringify` inside your transaction and fails there if it can't. `startAt`
+travels as epoch milliseconds.
+
+## Signal a run in your transaction
+
+```ts
+await this.db.transaction(async (tx) => {
+  await tx.update(payments).set({ status: 'captured' }).where(eq(payments.id, id));
+  await this.durable.signal(tx, `paid:${orderId}`, { amount });
+});
+```
+
+After commit the payload goes to the run parked on `ctx.waitForSignal('paid:<orderId>')`, or is
+buffered for it, exactly like `WorkflowService.signal`. Signals to one token share an outbox
+ordering key (the token, unless you pass `key`), so they arrive in the order you wrote them.
+
+## Delivery guarantees
+
+The handler is an ordinary `@OnOutboxMessage(topic, { consumer })` handler with the official inbox
+on, so a message the consumer already processed is skipped.
+
+| | Exactly once? |
+| --- | --- |
+| `start` | **Yes, for the run.** A redelivery after any crash is a no-op start of the same run id. |
+| `signal` | **At least once.** A crash between the engine accepting the signal and the inbox recording the message redelivers it. Make the waiting side tolerate a duplicate (a single-use token's duplicate is buffered and never consumed), or signal through `start` + `signalWithStart`-style idempotent state. |
+
+Failures the engine reports as fatal (an input that fails the workflow's schema, for example) are
+thrown as `NonRetryableMessageError` and dead-letter at once. Anything else, an unregistered
+workflow name included, is retried on the outbox's schedule and then dead-lettered, where
+`OutboxDeadLetters` lists and requeues it.
+
+## A broker in between
+
+When the relay publishes to a broker (`ClientProxyTransport`) instead of the in-process handlers,
+receive the envelope in the service that runs the engine and call `applyDurableOutboxMessage(engine,
+payload)` behind `OutboxInbox.process(consumer, message.id, …)`, as the official docs describe for
+remote consumers.

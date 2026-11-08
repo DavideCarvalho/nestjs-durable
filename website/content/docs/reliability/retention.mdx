@@ -148,6 +148,10 @@ actually need to debug or audit a given outcome, not around "just in case."
 
 ## Operational guidance
 
+Every driving pod runs the retention sweep. Import `LocksModule` from `@nestjs/locks` with a shared
+store and it runs on one pod instead (see
+[Fleet-wide sweeps on one pod](/docs/production#fleet-wide-sweeps-on-one-pod)).
+
 Because `maxAge`/`maxCount` are set **per status set**, you don't have to apply the same retention to
 every outcome. A reasonable starting point:
 

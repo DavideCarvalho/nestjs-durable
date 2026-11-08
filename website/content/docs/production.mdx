@@ -661,6 +661,36 @@ warning). Policies can be scoped to a namespace, tags, workflows or search attri
 [Retention](/docs/reliability/retention) for the full policy shape, the sweep interval/batch-size
 defaults, and how "keep" bounds combine.
 
+### Fleet-wide sweeps on one pod
+
+Three sweeps act on the whole fleet's data rather than claiming a run: retention pruning, the
+[stalled-run pager](/docs/reliability/stalled-runs), and the cleanup of buffered child completions no
+parent will consume. By default every driving pod runs them, which repeats the work, and makes the
+pager page once per pod.
+
+Import [`LocksModule`](https://docs.nestjs.com/reliability/locks) from `@nestjs/locks` with a
+**shared** lock store, and durable's sweepers run on one pod:
+
+```ts
+@Module({
+  imports: [
+    DurableModule.forRoot({ store, transport, retention, onStalled }),
+    LocksModule.forRoot(), // plus your shared LockStore provider (Redis, Postgres): see the official docs
+  ],
+})
+export class AppModule {}
+```
+
+There is nothing to configure on durable's side. At init it looks for `Locks` and logs which mode is
+on. Each sweep takes its own lease, `durable:retention`, `durable:stalled-pager` or
+`durable:buffered-signals` (with `:<namespace>` appended on a namespaced engine), and keeps it: the
+official lock renews itself every `ttl / 3`. The other pods skip that sweep until the holder stops
+renewing (a crash, or shutdown, where `Locks` hands the lease back), and the next tick elsewhere
+takes over. Without `LocksModule`, or with `@nestjs/locks` not installed, nothing changes.
+
+Work that claims runs (pending runs, crash recovery, timers, timeouts, schedules, lifecycle events)
+stays on every pod: each run is already arbitrated by a lease or a compare-and-set.
+
 ## 11. Encrypting payloads at rest
 
 Run and step inputs and outputs are stored as JSON. To keep them out of the database in the clear,
