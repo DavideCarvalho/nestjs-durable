@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-telescope
 
+## 0.10.1
+
+### Patch Changes
+
+- [#445](https://github.com/DavideCarvalho/nestjs-durable/pull/445) [`582efc7`](https://github.com/DavideCarvalho/nestjs-durable/commit/582efc7b154807f23d53e55f18bd766ce0c28fc1) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Widen peer ranges so apps on the current releases install without peer conflicts: `@dudousxd/nestjs-durable` accepts `@dudousxd/nestjs-context` 1.x (`>=0.1.0 <2.0.0`), `@dudousxd/nestjs-durable-telescope` accepts `@dudousxd/nestjs-telescope` 2.x (`>=1.0.0 <3.0.0`), and `@dudousxd/nestjs-durable-diagnostics` accepts `@dudousxd/nestjs-diagnostics` 0.3 to 0.8 and later 0.x (`>=0.3.0 <1.0.0`, previously `^0.3.0`). No code changes: the APIs these packages use are unchanged in context 1.1.0, telescope 2.0 and diagnostics 0.8.0.
+
 ## 0.10.0
 
 ### Minor Changes
