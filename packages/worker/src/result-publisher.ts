@@ -82,7 +82,8 @@ export class ResultPublisher {
   }
 
   async publish(result: StepResult, replyTo?: string): Promise<void> {
-    if (typeof replyTo === 'string' && replyTo && (await this.publishReply(result, replyTo))) return;
+    if (typeof replyTo === 'string' && replyTo && (await this.publishReply(result, replyTo)))
+      return;
     if ((await this.batchesConsumed()) && (await this.enqueue(this.batchesName, result))) return;
     await this.queue(this.resultsName).add('result', result, RESULT_JOB_OPTIONS);
   }

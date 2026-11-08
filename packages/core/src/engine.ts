@@ -6739,9 +6739,7 @@ export class WorkflowEngine {
 
   /** Delete `requests`. */
   private async dropWakeRequests(requests: KeptWake[]): Promise<void> {
-    await Promise.all(
-      requests.map((request) => this.store.removeBufferedEvent(request.id)),
-    );
+    await Promise.all(requests.map((request) => this.store.removeBufferedEvent(request.id)));
   }
 
   /**
@@ -7275,7 +7273,8 @@ export class WorkflowEngine {
     const wfToken = tenantGroup(sanitizeQueueToken(remote.group), undefined);
     let wfPlan = await this.planRoute(wfToken, registered.requires);
     // As in ensureRoutable: re-read before parking, never park on reused descriptors.
-    if (wfPlan?.status === 'blocked') wfPlan = await this.planRoute(wfToken, registered.requires, true);
+    if (wfPlan?.status === 'blocked')
+      wfPlan = await this.planRoute(wfToken, registered.requires, true);
     if (wfPlan?.status === 'blocked') return this.parkBlocked(run, wfPlan);
 
     const checkpoints = await this.replayCheckpoints(run.id);

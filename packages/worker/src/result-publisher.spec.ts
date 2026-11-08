@@ -11,7 +11,12 @@ import {
 type Sent = { queue: string; name: string; data: unknown };
 
 function setup(
-  opts: { alive?: string[]; batchConsumers?: number; failQueues?: string[]; redisDown?: boolean } = {},
+  opts: {
+    alive?: string[];
+    batchConsumers?: number;
+    failQueues?: string[];
+    redisDown?: boolean;
+  } = {},
 ) {
   const sent: Sent[] = [];
   let exists = 0;
@@ -29,7 +34,8 @@ function setup(
       sent.push({ queue, name, data });
     },
     async close() {},
-    getWorkersCount: async () => (queue.endsWith('-results-batch') ? (opts.batchConsumers ?? 0) : 0),
+    getWorkersCount: async () =>
+      queue.endsWith('-results-batch') ? (opts.batchConsumers ?? 0) : 0,
   });
   const alive = new Set(opts.alive ?? []);
   const redis = {
@@ -40,7 +46,12 @@ function setup(
     },
   };
   let now = 0;
-  const pub = new ResultPublisher('durable', makeQueue, () => redis, () => now);
+  const pub = new ResultPublisher(
+    'durable',
+    makeQueue,
+    () => redis,
+    () => now,
+  );
   return {
     pub,
     sent,
@@ -115,7 +126,9 @@ describe('ResultPublisher', () => {
     t.release();
     await Promise.all(sends);
     for (const s of t.sent) {
-      expect((s.data as { results: unknown[] }).results.length).toBeLessThanOrEqual(RESULT_BATCH_MAX);
+      expect((s.data as { results: unknown[] }).results.length).toBeLessThanOrEqual(
+        RESULT_BATCH_MAX,
+      );
     }
     const f = setup({ batchConsumers: 1, failQueues: ['durable-results-batch'] });
     await Promise.all([f.pub.publish(result(1)), f.pub.publish(result(2))]);
