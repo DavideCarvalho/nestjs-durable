@@ -12,6 +12,7 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency';
 import { normalizeRedisConnection } from './redis-url';
+import { ResultPublisher } from './result-publisher';
 import {
   DEFAULT_PREFIX,
   type DurableWorkerRuntime,
@@ -20,7 +21,6 @@ import {
   effectivePrefixOf,
   heartbeatChannel,
   isWorkflowTask,
-  resultsName,
   startRunName,
   stepEventsName,
   tasksName,
@@ -147,6 +147,8 @@ export interface RunnerDeps {
   ) => {
     add(name: string, data: unknown, opts?: Record<string, unknown>): Promise<unknown>;
     close(): Promise<void>;
+    /** BullMQ's live-consumer count; the result publisher uses it to detect batch consumers. */
+    getWorkersCount?(): Promise<number>;
   };
   /** Optional: the pub/sub + heartbeat client ctor. Omit and control/heartbeat are simply off. */
   Redis?: new (
@@ -154,6 +156,8 @@ export interface RunnerDeps {
   ) => {
     duplicate(): RedisSubClient;
     set(key: string, value: string, mode: string, ttl: number): Promise<unknown>;
+    /** Reply routing reads an engine's alive key; without it results go to the shared queue. */
+    exists?(key: string): Promise<number>;
     publish(channel: string, payload: string): Promise<unknown>;
     subscribe(channel: string): Promise<unknown>;
     on(event: 'message', listener: (channel: string, payload: string) => void): unknown;
@@ -278,7 +282,17 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
 
   const queueOpts = { connection };
   const decisions = new deps.Queue(decisionsName(prefix), queueOpts);
-  const results = new deps.Queue(resultsName(prefix), queueOpts);
+  // Results go back the way BullMQTransport sends them: routed to the engine instance holding the
+  // parked body (`replyTo`), batched while an engine reads batches, else one job each.
+  const publisher = new ResultPublisher(
+    prefix,
+    (name) => new deps.Queue(name, queueOpts),
+    () => {
+      const client = heartbeatClient;
+      const exists = client?.exists;
+      return exists ? { exists: (key: string) => exists.call(client, key) } : undefined;
+    },
+  );
   const stepEvents = new deps.Queue(stepEventsName(prefix), queueOpts);
   const jobOpts = { removeOnComplete: true, removeOnFail: true };
 
@@ -325,7 +339,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       if (out.kind === 'decision') {
         await decisions.add('decision', out.decision, jobOpts);
       } else {
-        await results.add('result', out.result, jobOpts);
+        await publisher.publish(out.result, (task as { replyTo?: string }).replyTo);
       }
       ok = true;
     } finally {
@@ -375,6 +389,9 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
         );
       });
       controlSub.on('message', (_channel, payload) => {
+        // The channel also carries every lifecycle/step-event broadcast; only a cancel matters
+        // here, so skip the JSON parse for anything that can't be one.
+        if (!payload.includes('cancel')) return;
         try {
           const msg = JSON.parse(payload) as { kind?: string; runId?: string };
           if (msg.kind === 'cancel' && typeof msg.runId === 'string') cancelled.add(msg.runId);
@@ -435,7 +452,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       controller.stop();
       await Promise.all(workersRef.current.map((w) => w.close()));
-      await Promise.all([decisions.close(), results.close(), stepEvents.close()]);
+      await Promise.all([decisions.close(), publisher.close(), stepEvents.close()]);
       controlSub?.disconnect();
       heartbeatClient?.disconnect();
     },

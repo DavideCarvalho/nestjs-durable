@@ -1,3 +1,4 @@
+import { DurableWorkerRuntime, runRedisWorker } from '@dudousxd/durable-worker';
 import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
 import type { StepResult } from '@dudousxd/nestjs-durable-core';
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
@@ -101,6 +102,31 @@ describe('routed step results (BullMQ)', () => {
     await until(() => completed(env.store, ids));
     for (const id of ids) expect((await env.store.getRun(id))?.output).toBe(5);
     // Each body ran once: every result reached the engine holding it.
+    expect(env.entries()).toBe(6);
+    expect(env.sticky(a.engine).hits + env.sticky(b.engine).hits).toBe(30);
+  });
+
+  it('go back to the dispatching engine from a @dudousxd/durable-worker step worker too', async () => {
+    const prefix = `rr-${Math.random().toString(36).slice(2)}`;
+    const env = setup(prefix);
+    const a = env.engine('engine-a');
+    const b = env.engine('engine-b');
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerStep('reply.add', async (input: unknown) => (input as number) + 1);
+    const running = await runRedisWorker({
+      runtime,
+      connection: `redis://${base?.host}:${base?.port}`,
+      prefix,
+    });
+    closers.push(() => running.close());
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      const id = `n${i}`;
+      ids.push(id);
+      await (i % 2 ? b : a).engine.start('seq', { n: 5 }, id);
+    }
+    await until(() => completed(env.store, ids));
+    for (const id of ids) expect((await env.store.getRun(id))?.output).toBe(5);
     expect(env.entries()).toBe(6);
     expect(env.sticky(a.engine).hits + env.sticky(b.engine).hits).toBe(30);
   });
