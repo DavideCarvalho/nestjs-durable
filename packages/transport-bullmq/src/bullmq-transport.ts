@@ -1053,10 +1053,13 @@ export class BullMQTransport implements Transport, ControlPlane {
     const descriptors: WorkerDescriptor[] = [];
     let cursor = '0';
     do {
-      const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 100);
+      // MATCH filters after the scan, so the whole keyspace is walked either way: big pages keep that
+      // to a few round trips, and one MGET per page reads the matches.
+      const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 1000);
       cursor = next;
-      for (const key of keys) {
-        const raw = await client.get(key);
+      if (keys.length === 0) continue;
+      const values = await client.mget(...keys);
+      for (const raw of values) {
         if (raw == null) continue;
         try {
           descriptors.push(JSON.parse(raw) as WorkerDescriptor);

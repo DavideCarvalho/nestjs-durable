@@ -960,6 +960,14 @@ export interface WorkflowEngineDeps {
    */
   blockedPollMs?: number | undefined;
   /**
+   * How long (ms) the routing guard reuses the worker descriptors it read for a queue token before
+   * reading them again. Every dispatch consults them, and on BullMQ each read is a `SCAN` of the
+   * Redis keyspace; workers rewrite their descriptor every 10 s with a 35 s TTL, so a couple of
+   * seconds of reuse changes nothing the guard can observe. Concurrent reads of one token share a
+   * single request. Default 2000; `0` reads on every dispatch.
+   */
+  workerDescriptorCacheMs?: number | undefined;
+  /**
    * Build the public callback URL for a `ctx.webhook()` token (e.g.
    * ``(t) => `https://api.example.com/durable/webhooks/${t}` ``). Populates
    * {@link DurableWebhook.url}. Omit if you build URLs yourself from the token.
@@ -1136,6 +1144,11 @@ export class WorkflowEngine {
   private readonly remoteRedispatchMax: number;
   /** How long a `blocked` run waits before the recovery poll re-checks the live fleet (design §7.5). */
   private readonly blockedPollMs: number;
+  private readonly workerDescriptorCacheMs: number;
+  private readonly descriptorCache = new Map<
+    string,
+    { at: number; read: Promise<WorkerDescriptor[]> }
+  >();
   /** This engine's control-plane handshake descriptor — negotiated against each worker (design §7.3). */
   private readonly cpDescriptor: WorkerDescriptor;
   private readonly webhookUrl?: ((token: string) => string) | undefined;
@@ -1363,6 +1376,7 @@ export class WorkflowEngine {
     this.remoteRedispatchMs = deps.remoteRedispatchMs || undefined;
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
     this.blockedPollMs = deps.blockedPollMs ?? 5000;
+    this.workerDescriptorCacheMs = deps.workerDescriptorCacheMs ?? 2000;
     // The control-plane descriptor this engine negotiates against each worker's advertised descriptor
     // (design §7.3): it speaks the current protocol band and is scoped to this engine's namespace so a
     // pool-mismatched worker isn't considered. Capabilities empty — the CP routes, it doesn't execute.
@@ -7271,10 +7285,10 @@ export class WorkflowEngine {
     // routing token mirrors the executor's own `tenantGroup(sanitizeQueueToken(group), …)` dispatch
     // target — see RemoteWorkflowExecutor. Settled inline here (this path releases its own lease), unlike
     // the step guard which parks via the run-execution catch.
-    const wfPlan = await this.planRoute(
-      tenantGroup(sanitizeQueueToken(remote.group), undefined),
-      registered.requires,
-    );
+    const wfToken = tenantGroup(sanitizeQueueToken(remote.group), undefined);
+    let wfPlan = await this.planRoute(wfToken, registered.requires);
+    // As in ensureRoutable: re-read before parking, never park on reused descriptors.
+    if (wfPlan?.status === 'blocked') wfPlan = await this.planRoute(wfToken, registered.requires, true);
     if (wfPlan?.status === 'blocked') return this.parkBlocked(run, wfPlan);
 
     const checkpoints = await this.replayCheckpoints(run.id);
@@ -8742,10 +8756,27 @@ export class WorkflowEngine {
   private async planRoute(
     token: string,
     requires: string[] | undefined,
+    fresh = false,
   ): Promise<DispatchPlan | undefined> {
-    const descriptors = await this.pool.readWorkerDescriptors(token);
+    const descriptors = await this.liveWorkerDescriptors(token, fresh);
     if (descriptors.length === 0) return undefined; // legacy / no-descriptor path — skip the guard
     return planDispatch(requires ?? [], descriptors, this.cpDescriptor, token);
+  }
+
+  /** The live descriptors for `token`, reused for {@link workerDescriptorCacheMs}; one read in flight. */
+  private liveWorkerDescriptors(token: string, fresh = false): Promise<WorkerDescriptor[]> {
+    if (this.workerDescriptorCacheMs <= 0) return this.pool.readWorkerDescriptors(token);
+    const now = Date.now();
+    const cached = this.descriptorCache.get(token);
+    if (!fresh && cached && now - cached.at < this.workerDescriptorCacheMs) return cached.read;
+    const read = this.pool.readWorkerDescriptors(token);
+    const entry = { at: now, read };
+    this.descriptorCache.set(token, entry);
+    // A failed read is not reused: the next dispatch asks again.
+    read.catch(() => {
+      if (this.descriptorCache.get(token) === entry) this.descriptorCache.delete(token);
+    });
+    return read;
   }
 
   /** Throw {@link WorkflowBlocked} when no live worker can run a dispatch to `token` — so the caller's
@@ -8753,7 +8784,9 @@ export class WorkflowEngine {
    *  checkpoint + dispatching into a queue nobody consumes (design §7.5). A no-op when the guard does
    *  not engage (no descriptors) or a capable+compatible worker exists. */
   private async ensureRoutable(token: string, requires: string[] | undefined): Promise<void> {
-    const plan = await this.planRoute(token, requires);
+    let plan = await this.planRoute(token, requires);
+    // Never park a run on reused descriptors: a capable worker may have joined since they were read.
+    if (plan?.status === 'blocked') plan = await this.planRoute(token, requires, true);
     if (plan?.status === 'blocked') throw new WorkflowBlocked(plan);
   }
 
