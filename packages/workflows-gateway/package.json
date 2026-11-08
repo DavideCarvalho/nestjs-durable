@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-workflows-gateway",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "The nestjs-durable dashboard over the official @nestjs/workflows engine — runs, journal timeline, children, retry/cancel and live updates",
   "license": "MIT",
   "author": "Davide Carvalho",
@@ -13,7 +13,12 @@
   "bugs": {
     "url": "https://github.com/DavideCarvalho/nestjs-durable/issues"
   },
-  "keywords": ["nestjs", "durable", "workflows", "dashboard"],
+  "keywords": [
+    "nestjs",
+    "durable",
+    "workflows",
+    "dashboard"
+  ],
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -30,7 +35,9 @@
       }
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=22"
   },

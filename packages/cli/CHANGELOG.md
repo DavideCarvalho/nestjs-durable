@@ -1,5 +1,25 @@
 # @dudousxd/nestjs-durable-cli
 
+## 0.5.0
+
+### Minor Changes
+
+- [#444](https://github.com/DavideCarvalho/nestjs-durable/pull/444) [`71415b7`](https://github.com/DavideCarvalho/nestjs-durable/commit/71415b7d0f150f9bbd7cec6bc6599b26c1092e52) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A migration path from the official `@nestjs/workflows` to nestjs-durable.
+
+  - **Core, `parentClose`** on `ctx.child` / `ctx.startChild` (`'cancel'` | `'terminate'` | `'abandon'`): what happens to a live child when its in-process parent completes or fails; `'abandon'` children are also skipped by the cancel cascade. The child carries the tag `parent-close:<policy>`. Omitted, behaviour is unchanged.
+  - **Core, `rrule` schedules**: `engine.schedules.create({ rrule: 'FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17', timezone })`, an RFC 5545 subset (optional `DTSTART` line) evaluated in the zone with no dependency; unsupported parts are refused by name. Stored in the schedule's JSON spec: no migration. `parseRRule` / `nextRRuleFireMs` / `prevRRuleFireMs` are exported.
+  - **`@dudousxd/nestjs-durable/migrate-from-nestjs-workflows`** (new subpath; `@nestjs/workflows` and `@dudousxd/nestjs-durable-workflows-gateway` are optional peers loaded only there): `MigrationClient` (new starts on durable; `signal` / `cancel` / `getStatus` / `result` act on the engine that owns the id; `remainingOnOfficial()` for the drain), `DurableMigrationModule.forRoot()`, and `DurableMigrationModule.console()` + `CombinedRunGateway` for one console over both engines.
+  - **CLI**: `durable migrate nestjs-workflows <glob…> [--dry-run]`, a ts-morph codemod for the 1:1 cases that leaves `// TODO(durable-migrate)` comments on the rest.
+
+- [#444](https://github.com/DavideCarvalho/nestjs-durable/pull/444) [`fabb68c`](https://github.com/DavideCarvalho/nestjs-durable/commit/fabb68c4e070d54f1dc0f58af24a18dd6a9fe14d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `ctx.waitForAny` and signal dedupe ids, the last two gaps with `@nestjs/workflows`.
+
+  - **`ctx.waitForAny(name, { a: ctx.signalWait(token), t: ctx.timer('3d' | { until }), c: ctx.childWait(runId) })`** resolves with the first condition's `{ key, value }`, typed per key and journaled at one position. Only the winning signal is consumed: a signal on a losing condition stays buffered for the next wait on its token (the wait is settled by a compare-and-set on its checkpoint; a signal that loses it is buffered again). A losing timer never fires; a losing child keeps running. Ties go to the signal sent first, then a finished child, then the earliest timer; a signal sent after a timer's deadline loses to it.
+  - **Remote protocol**: a `waitAny` `WorkflowCommand` (`{ seq, name, conditions: [{ key, kind: 'signal' | 'timer' | 'child', … }] }`) the engine resolves like the in-process ctx, replayed as an `any` `HistoryEvent` (`output: { key, value }`; a failed child is the event's `error`). The Node thin worker gains `waitForAny` / `signalWait` / `timer` / `childWait`; the Python SDK (`durable-worker`, released separately) gains `ctx.wait_for_any` / `signal_wait` / `timer` / `child_wait`.
+  - **`engine.signal(token, payload, { id, idTtl? })`** (and `WorkflowService.signal`): a re-send with the same token and id is dropped (resolves `null`) while the id is remembered, `signalIdTtl` (engine / `DurableModule` option, default 7 days). The timer poller deletes expired ids (`engine.sweepExpiredSignalIds()`). If storing the signal fails, the id is released so a retry gets through.
+  - **StateStore SPI** (all optional): `takeOldestBufferedSignal(tokens)`, `claimSignalId(token, id, expiresAt, now)`, `releaseSignalId(token, id)`, `deleteExpiredSignalIds(now, limit)`, implemented by the in-memory store, the codec wrapper and every bundled adapter, and covered by the state-store conformance suite.
+  - **New table `durable_signal_ids`** (`token`, `signal_id`, `expires_at`; primary key `(token, signal_id)`, index on `expires_at`). TypeORM, MikroORM and Drizzle Postgres create it at boot with auto-schema; Drizzle SQLite users get it from `drizzle-kit generate` (`signalIds` in `durableSchema`); Prisma users copy the `DurableSignalId` model and migrate. Only needed for signals sent with an `id`.
+  - **Codemod**: `durable migrate nestjs-workflows` now maps `ctx.waitForAny` (signalWait → token, timers kept, child handles → `ctx.childWait`), `WorkflowCondition` / `WorkflowAnyResult`, and `client.signal(…, { key, id })` → `signal(token, payload, { id })` instead of leaving TODOs.
+
 ## 0.4.0
 
 ### Minor Changes

@@ -1,5 +1,20 @@
 # @dudousxd/nestjs-durable-transport-bullmq
 
+## 0.24.0
+
+### Minor Changes
+
+- [#444](https://github.com/DavideCarvalho/nestjs-durable/pull/444) [`bf93fb8`](https://github.com/DavideCarvalho/nestjs-durable/commit/bf93fb8922c6714d9eebe98401b2ab508b403965) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Step results go back to the engine holding the parked body, and the TypeORM, MikroORM and Prisma stores save the same round trips as the Drizzle one.
+
+  - **Routed replies**: a dispatched `ctx.step` task carries `replyTo` (the dispatching engine instance), and a transport that implements the new optional `Transport.consumeRepliesFor` sends its result back there, so with several engines the sticky continuation keeps hitting instead of replaying elsewhere. Step fans keep the shared results. Engine / `DurableModule` option `routeReplies` (default `true` while the sticky cache is on).
+  - **BullMQ** implements it: an engine consumes `<prefix>-results-to-<instance>` and keeps an alive key in Redis; workers send a result there (batched) only while the key exists, else to the shared queue, and every transport moves a dead instance's queue (stalled jobs included) to the shared results, so no result is lost. Options `replyRouting` (default `true`), `replyAliveTtlMs`, `replySweepMs`, `replyDrainIdleMs`. Older engines and workers ignore the field.
+  - **TypeORM, MikroORM, Prisma** implement `settleResultsIfPending`, `tryLockRunAndGet` (Postgres), `insertCheckpointIfAbsent` and `claimPendingRuns` on Postgres and MySQL; Prisma also sends the suspend, the lease release and the first-dispatch insert as single statements instead of `updateMany`/`createMany`'s implicit transactions. New core helper `settleResultsWithPlainCalls` for stores without `RETURNING`.
+  - **Testing**: the state-store contract pins `updatedAt` to the millisecond, and lets concurrent `claimPendingRuns` leave rows for a later claim (never the same row twice).
+
+### Patch Changes
+
+- [#444](https://github.com/DavideCarvalho/nestjs-durable/pull/444) [`97ae4b0`](https://github.com/DavideCarvalho/nestjs-durable/commit/97ae4b0e683ae775d21f08fa93f7e2264b650c3b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The routing guard reuses the worker descriptors it read for a queue token for `workerDescriptorCacheMs` (default 2000; `0` reads on every dispatch), with one read in flight per token. On BullMQ every dispatch used to `SCAN` the whole Redis keyspace (68 SCANs per 5-step workflow in the bench, a quarter of Redis time). It still re-reads before parking a run `blocked`, so a worker that just joined is always seen. `BullMQTransport.readWorkerDescriptors` scans in pages of 1000 and reads each page's matches with one `MGET`.
+
 ## 0.23.4
 
 ### Patch Changes
