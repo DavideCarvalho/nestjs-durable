@@ -1896,7 +1896,7 @@ class TypeOrmRoundTrips {
     if (this.pg) {
       const ns = namespace !== undefined ? ` AND ${c('namespace')} = $5` : '';
       const out = await this.ds.query(
-        `UPDATE ${this.table(r)} AS r SET ${c('lockedBy')} = $1, ${c('lockedUntil')} = $2 FROM (SELECT ${c('id')} AS claimed_id FROM ${this.table(r)} WHERE ${c('status')} = 'pending' AND (${c('lockedUntil')} IS NULL OR ${c('lockedUntil')} <= $3)${ns} ORDER BY ${c('createdAt')}, ${c('id')} LIMIT $4 FOR UPDATE SKIP LOCKED) AS claimed WHERE r.${c('id')} = claimed.claimed_id RETURNING r.*`,
+        `WITH claimed AS MATERIALIZED (SELECT ${c('id')} AS claimed_id FROM ${this.table(r)} WHERE ${c('status')} = 'pending' AND (${c('lockedUntil')} IS NULL OR ${c('lockedUntil')} <= $3)${ns} ORDER BY ${c('createdAt')}, ${c('id')} LIMIT $4 FOR UPDATE SKIP LOCKED) UPDATE ${this.table(r)} AS r SET ${c('lockedBy')} = $1, ${c('lockedUntil')} = $2 FROM claimed WHERE r.${c('id')} = claimed.claimed_id RETURNING r.*`,
         [owner, until, now, limit, ...(namespace !== undefined ? [namespace] : [])],
       );
       return sort(this.rows(out).map((raw) => fromRunEntity(this.hydrate(r, raw))));

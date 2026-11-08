@@ -2122,7 +2122,7 @@ class PrismaRoundTrips {
     if (this.pg) {
       const ns = namespace !== undefined ? ' AND namespace = $5' : '';
       const rows = await this.raw.$queryRawUnsafe<Record<string, unknown>[]>(
-        `UPDATE "durable_workflow_runs" AS r SET locked_by = $1, locked_until = ($2::timestamptz AT TIME ZONE 'UTC') FROM (SELECT id AS claimed_id FROM "durable_workflow_runs" WHERE status = 'pending' AND (locked_until IS NULL OR locked_until <= ($3::timestamptz AT TIME ZONE 'UTC'))${ns} ORDER BY created_at, id LIMIT $4 FOR UPDATE SKIP LOCKED) AS claimed WHERE r.id = claimed.claimed_id RETURNING r.*`,
+        `WITH claimed AS MATERIALIZED (SELECT id AS claimed_id FROM "durable_workflow_runs" WHERE status = 'pending' AND (locked_until IS NULL OR locked_until <= ($3::timestamptz AT TIME ZONE 'UTC'))${ns} ORDER BY created_at, id LIMIT $4 FOR UPDATE SKIP LOCKED) UPDATE "durable_workflow_runs" AS r SET locked_by = $1, locked_until = ($2::timestamptz AT TIME ZONE 'UTC') FROM claimed WHERE r.id = claimed.claimed_id RETURNING r.*`,
         owner,
         new Date(leaseUntilMs).toISOString(),
         new Date(nowMs).toISOString(),

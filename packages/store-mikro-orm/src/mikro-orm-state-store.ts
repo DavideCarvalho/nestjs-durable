@@ -1899,9 +1899,12 @@ class MikroOrmRoundTrips {
     method: 'all' | 'run' = 'all',
   ): Promise<unknown> {
     const connection = em.getConnection() as unknown as {
-      execute(sql: string, params: unknown[], method: string): Promise<unknown>;
+      execute(sql: string, params: unknown[], method: string, ctx?: unknown): Promise<unknown>;
     };
-    return connection.execute(sql, params, method);
+    // Inside `em.transactional` the statement must run on the transaction's connection: without
+    // the context it goes to another pooled connection in autocommit, so a `FOR UPDATE` lock is
+    // released at once and two claimers can take the same rows.
+    return connection.execute(sql, params, method, em.getTransactionContext());
   }
 
   private rows(out: unknown): Record<string, unknown>[] {
@@ -2111,8 +2114,9 @@ class MikroOrmRoundTrips {
     if (this.pg) {
       const out = await this.run(
         em,
-        `UPDATE ${this.table(em, R)} AS r SET ${c('lockedBy')} = ?, ${c('lockedUntil')} = ? FROM (SELECT ${c('id')} AS claimed_id FROM ${this.table(em, R)} WHERE ${where} ORDER BY ${c('createdAt')}, ${c('id')} LIMIT ? FOR UPDATE SKIP LOCKED) AS claimed WHERE r.${c('id')} = claimed.claimed_id RETURNING r.*`,
-        [owner, until, now, ...filters, limit],
+        `WITH claimed AS MATERIALIZED (SELECT ${c('id')} AS claimed_id FROM ${this.table(em, R)} WHERE ${where} ORDER BY ${c('createdAt')}, ${c('id')} LIMIT ? FOR UPDATE SKIP LOCKED) UPDATE ${this.table(em, R)} AS r SET ${c('lockedBy')} = ?, ${c('lockedUntil')} = ? FROM claimed WHERE r.${c('id')} = claimed.claimed_id RETURNING r.*`,
+        // `?` placeholders bind in order: the CTE's (now, namespace filters, limit) come first.
+        [now, ...filters, limit, owner, until],
       );
       return sort(this.rows(out).map((raw) => this.runFromRow(em, raw)));
     }

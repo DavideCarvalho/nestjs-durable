@@ -773,16 +773,20 @@ export class DrizzlePgStateStore implements StateStore {
       sql`, `,
     );
     const rows = rowsOf<Record<string, unknown>>(
-      await this.db.execute(sql`UPDATE ${workflowRuns} AS r
-        SET ${sql.identifier(getTableColumns(workflowRuns).lockedBy.name)} = ${owner},
-          ${sql.identifier(getTableColumns(workflowRuns).lockedUntil.name)} = ${new Date(leaseUntilMs).toISOString()}::timestamptz
-        FROM (
+      // A CTE, MATERIALIZED, picks the rows once. As a subquery in UPDATE ... FROM, Postgres may
+      // rescan it, and each rescan skips the rows this statement already updated and takes the
+      // next ones, so a claim of `limit` rows could lease every free pending run.
+      await this.db.execute(sql`WITH c AS MATERIALIZED (
           SELECT ${workflowRuns.id} AS claimed_id FROM ${workflowRuns}
           WHERE ${filters}
           ORDER BY ${workflowRuns.createdAt}, ${workflowRuns.id}
           LIMIT ${limit}
           FOR UPDATE SKIP LOCKED
-        ) AS c
+        )
+        UPDATE ${workflowRuns} AS r
+        SET ${sql.identifier(getTableColumns(workflowRuns).lockedBy.name)} = ${owner},
+          ${sql.identifier(getTableColumns(workflowRuns).lockedUntil.name)} = ${new Date(leaseUntilMs).toISOString()}::timestamptz
+        FROM c
         WHERE r.${sql.identifier(getTableColumns(workflowRuns).id.name)} = c.claimed_id
         RETURNING ${returning}`),
     );
@@ -1596,7 +1600,8 @@ const HAS_CHECKPOINTS = `SELECT "seq" ${CHECKPOINT_RANGE} ORDER BY "seq" DESC LI
 const COUNT_CHECKPOINTS = `SELECT count(*)::integer AS "n" ${CHECKPOINT_RANGE}`;
 const LIST_BUFFERED_EVENTS = `SELECT ${EVENTS.list} FROM ${T_EVENTS} WHERE "name" = $1 ORDER BY "published_at", "id" LIMIT $2`;
 const REMOVE_BUFFERED_EVENT = `DELETE FROM ${T_EVENTS} WHERE "id" = $1 RETURNING "id"`;
-const TAKE_BUFFERED_SIGNAL = `DELETE FROM ${T_SIGNALS} WHERE "id" IN (SELECT "id" FROM ${T_SIGNALS} WHERE "token" = $1 ORDER BY "id" LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING "payload"`;
+// MATERIALIZED for the same reason as the run claim: a rescanned subquery could delete more than one.
+const TAKE_BUFFERED_SIGNAL = `WITH taken AS MATERIALIZED (SELECT "id" FROM ${T_SIGNALS} WHERE "token" = $1 ORDER BY "id" LIMIT 1 FOR UPDATE SKIP LOCKED) DELETE FROM ${T_SIGNALS} WHERE "id" IN (SELECT "id" FROM taken) RETURNING "payload"`;
 /** Results settled per hot-path statement; a wider batch takes the builder's chunked path. */
 const HOT_SETTLE_MAX_ROWS = 64;
 const settleTexts = new Map<number, string>();
