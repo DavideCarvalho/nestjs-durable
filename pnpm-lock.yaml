@@ -171,7 +171,7 @@ importers:
   packages/dashboard:
     dependencies:
       '@dudousxd/nestjs-filter-client':
-        specifier: 1.33.0
+        specifier: '>=1.33.0 <2.0.0'
         version: 1.33.0
       rxjs:
         specifier: ^7.0.0
