@@ -178,6 +178,30 @@ describe('remoteStep on @nestjs/workflows', () => {
     expect(instance?.journal?.find((e) => e.name === 'declined:failed')?.status).toBe('failed');
   });
 
+  it('remoteStep() refuses to guess between two applications; RemoteSteps.run stays bound', async () => {
+    const first = await boot();
+    const closeFirst = close;
+    await boot();
+    const closeSecond = close;
+    close = async () => {
+      await closeSecond?.();
+      await closeFirst?.();
+    };
+    await first.client.start(CheckoutWorkflow, { handler: 'charge' }, { id: 'c-two' });
+    await first.settle();
+    const instance = await first.client.getStatus('c-two');
+    expect((instance?.output as { error: string }).error).toContain('more than one');
+    expect(calls.charge).toBeUndefined();
+    await closeSecond?.();
+    close = closeFirst;
+    await first.client.start(CheckoutWorkflow, { handler: 'charge' }, { id: 'c-one' });
+    await first.settle();
+    expect((await first.client.getStatus('c-one'))?.output).toEqual({
+      ok: true,
+      out: { charged: 42 },
+    });
+  });
+
   it('times out an attempt nobody answers, and fails after the last one', async () => {
     const { client, clock, settle } = await boot();
     await client.start(CheckoutWorkflow, { handler: 'slow', retry: 2 }, { id: 'c-slow' });

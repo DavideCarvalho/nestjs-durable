@@ -1140,6 +1140,8 @@ export class WorkflowEngine {
   private readonly timerBatchSize: number;
   private readonly eventBufferTtlMs: number | undefined;
   private readonly signalIdTtlMs: number;
+  /** The deduplicated {@link signal} sends in flight here, by `token \u0000 id`. */
+  private readonly signalIdSends = new Map<string, Promise<RunResult | null>>();
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
   /** How long a `blocked` run waits before the recovery poll re-checks the live fleet (design §7.5). */
@@ -5737,9 +5739,37 @@ export class WorkflowEngine {
         'engine.signal(..., { id }) needs a store that deduplicates signals (claimSignalId); the bundled stores do',
       );
     }
+    // A duplicate sent while this instance still delivers the same id waits for that send: if it
+    // fails (and releases the id), the duplicate claims the id and delivers instead of being dropped.
+    const key = `${token}\u0000${id}`;
+    for (let prior = this.signalIdSends.get(key); prior; prior = this.signalIdSends.get(key)) {
+      const sent = await prior.then(
+        () => true,
+        () => false,
+      );
+      if (sent) return null;
+    }
+    const send = this.signalOnce(token, payload, id, opts?.idTtl);
+    this.signalIdSends.set(key, send);
+    try {
+      return await send;
+    } finally {
+      if (this.signalIdSends.get(key) === send) this.signalIdSends.delete(key);
+    }
+  }
+
+  /** One deduplicated {@link signal}: claim `id`, then deliver or buffer; a failure forgets the id. */
+  private async signalOnce(
+    token: string,
+    payload: unknown,
+    id: string,
+    idTtl: SignalOptions['idTtl'],
+  ): Promise<RunResult | null> {
+    const claimSignalId = this.store.claimSignalId;
+    if (!claimSignalId) return null;
     const now = this.clock();
-    const ttl = opts?.idTtl !== undefined ? parseDuration(opts.idTtl) : this.signalIdTtlMs;
-    if (!(await this.store.claimSignalId(token, id, now + ttl, now))) return null;
+    const ttl = idTtl !== undefined ? parseDuration(idTtl) : this.signalIdTtlMs;
+    if (!(await claimSignalId.call(this.store, token, id, now + ttl, now))) return null;
     let committed = false;
     try {
       return await this.deliverOrBuffer(token, payload, () => {
@@ -7471,6 +7501,8 @@ export class WorkflowEngine {
     }
     const wakeAt = await this.applyCommands(run, decision.commands, true);
     const suspended = await this.settleRun(run, { kind: 'suspended', wakeAt });
+    // A remote decision never parks a body here, so the stamp the suspend recorded has no reader.
+    this.suspendStamps.delete(run.id);
     // This turn may have been computed from a history older than the store's, in which case it just
     // parked on ops that are already settled — see {@link redriveIfTurnSawStaleHistory}.
     await this.redriveIfTurnSawStaleHistory(run.id, decision.commands);
@@ -8305,6 +8337,9 @@ export class WorkflowEngine {
       if (this.awaitedStepFans.get(run.id) === awaitedFans) this.awaitedStepFans.delete(run.id);
       if (cont && this.turnContinuations.get(run.id) === cont)
         this.turnContinuations.delete(run.id);
+      // Only the WorkflowSuspended branch above reads the stamp a suspend recorded; any other way out
+      // of this turn (a compensation suspend, a thrown settle) must not leave it behind.
+      this.suspendStamps.delete(run.id);
       await this.releaseLeaseBestEffort(run.id);
       if (suspendedOnFan) {
         this.inBackground(this.redriveSettledChildren(run.id, suspendedOnFan));

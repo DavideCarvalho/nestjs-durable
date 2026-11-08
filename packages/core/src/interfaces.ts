@@ -1426,6 +1426,11 @@ export interface SignalOptions {
    * sender that runs twice (a redelivered message, a retried job) signals once and the first payload
    * wins. The same id on another token is another signal. Needs a store with `claimSignalId` (every
    * bundled store).
+   *
+   * If storing the signal fails, `signal()` rejects and the id is forgotten, so a retry gets through.
+   * A duplicate sent on the same engine while the first send is still in flight waits for it, and
+   * sends in its place if it fails. Across instances a concurrent duplicate is dropped at once, so
+   * the sender whose call rejected must retry.
    */
   id?: string | undefined;
   /**

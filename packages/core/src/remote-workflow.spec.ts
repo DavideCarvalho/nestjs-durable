@@ -431,6 +431,10 @@ describe('WorkflowEngine — remote (polyglot) workflows', () => {
     const run = await settle(store, 'sig1');
     expect(run.status).toBe('completed');
     expect(run.output).toEqual({ approved: { by: 'davi' } });
+    // No sticky body is parked for a remote workflow, so its suspends leave no stamp behind.
+    expect((engine as unknown as { suspendStamps: Map<string, number> }).suspendStamps.size).toBe(
+      0,
+    );
   });
 
   it('starts a child run from a remote workflow and resumes the parent with the child output', async () => {

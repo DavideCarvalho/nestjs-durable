@@ -93,7 +93,7 @@ export class SweepLeases implements OnModuleInit {
     this.locks = await this.detect();
     this.logger.log(
       this.locks
-        ? 'fleet-wide sweeps (retention, stalled-run pager, buffered-signal cleanup) run on one pod at a time, through @nestjs/locks'
+        ? 'fleet-wide sweeps (retention, stalled-run pager, buffered-signal cleanup, expired signal-id cleanup) run on one pod at a time, through @nestjs/locks'
         : 'fleet-wide sweeps run on every driving pod (import LocksModule from @nestjs/locks to run them on one)',
     );
   }

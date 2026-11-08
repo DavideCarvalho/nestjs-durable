@@ -76,7 +76,12 @@ export class CombinedRunGateway extends RunGateway {
     );
   }
 
-  /** Both lists, newest first, then the page. */
+  /**
+   * Both lists, newest first, then the page. The legacy side holds only the rows its gateway can
+   * read: the official gateway reads at most `WORKFLOWS_LIST_CAP` (1000) matching instances per list,
+   * so legacy rows past that cap are missing here as they are from the legacy console, and deep pages
+   * show durable rows only.
+   */
   async listRuns(query: RunQuery): Promise<RunListItem[]> {
     const offset = query.offset ?? 0;
     const limit = query.limit ?? 100;

@@ -62,7 +62,7 @@ export interface DurableOutboxStartOptions extends StartOptions {
 export interface DurableOutboxSignalOptions {
   /** Outbox ordering key; defaults to the token, so signals to one token arrive in order. */
   key?: string | null;
-  /** The outbox message id (dedupe key of the inbox). Default: a fresh UUIDv7. */
+  /** The outbox message id (dedupe key of the inbox). Default: the fresh UUIDv7 `Outbox.add` assigns. */
   id?: string;
 }
 

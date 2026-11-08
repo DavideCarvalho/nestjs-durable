@@ -112,6 +112,20 @@ class ResultPublisher:
             self._queues[name] = q
         return q
 
+    async def close(self) -> None:
+        """Close the queues this publisher opened and its routing Redis client. Best effort: call
+        it once the workers publishing through it have stopped."""
+        queues, self._queues = list(self._queues.values()), {}
+        redis, self._redis = self._redis, None
+        for closeable in [*queues, redis]:
+            closer = getattr(closeable, "aclose", None) or getattr(closeable, "close", None)
+            if closer is None:
+                continue
+            try:
+                await closer()
+            except Exception:  # noqa: BLE001 — teardown is best-effort
+                pass
+
     async def publish(self, result: Dict[str, Any], reply_to: Optional[str] = None) -> None:
         if isinstance(reply_to, str) and reply_to and await self._publish_reply(result, reply_to):
             return

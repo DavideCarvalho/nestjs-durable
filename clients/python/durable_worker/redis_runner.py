@@ -624,10 +624,14 @@ class _MultiWorkerHandle:
     shutdown — this wraps the list so that contract stays unchanged."""
 
     def __init__(
-        self, bull_workers: "list[Any]", controller: Optional[AdaptiveController] = None
+        self,
+        bull_workers: "list[Any]",
+        controller: Optional[AdaptiveController] = None,
+        publisher: Optional[ResultPublisher] = None,
     ) -> None:
         self._bull_workers = bull_workers
         self._controller = controller
+        self._publisher = publisher
 
     async def close(self) -> None:
         # Release the memory gate FIRST: a step waiting there hasn't returned from `process`, so
@@ -637,6 +641,9 @@ class _MultiWorkerHandle:
             self._controller.begin_drain()
             self._controller.stop()
         await asyncio.gather(*(bw.close() for bw in self._bull_workers), return_exceptions=True)
+        # Last: the workers just closed published their final results through it.
+        if self._publisher is not None:
+            await self._publisher.close()
 
 
 async def run_redis_worker(
@@ -831,7 +838,7 @@ async def run_redis_worker(
             bull_worker.opts["concurrency"] = new_limit
 
     controller.start(apply_cb=apply_concurrency)
-    return _MultiWorkerHandle(bull_workers, controller)
+    return _MultiWorkerHandle(bull_workers, controller, publisher)
 
 
 async def _progress_publisher(

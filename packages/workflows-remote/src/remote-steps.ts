@@ -64,7 +64,8 @@ function retryOf(retry: RemoteStepOptions['retry']): Required<RemoteStepRetry> {
   return { ...base, ...retry, attempts: Math.max(1, Math.floor(retry?.attempts ?? base.attempts)) };
 }
 
-let current: RemoteSteps | undefined;
+/** The {@link RemoteSteps} of every application running in this process. */
+const live = new Set<RemoteSteps>();
 
 /**
  * Runs a step on a remote nestjs-durable worker (the Node `@dudousxd/durable-worker` or the Python
@@ -80,18 +81,29 @@ let current: RemoteSteps | undefined;
  * A remote failure the worker marks `retryable: false`, or the last attempt's failure or timeout,
  * fails the step (a `RemoteStepFailedError`, journaled as `<name>:failed`): catch it like any
  * `ctx.step` failure, or let it fail the instance (compensations run).
+ *
+ * This function finds the module through process-wide state, so it needs exactly one application
+ * with {@link DurableRemoteStepsModule} in the process; with more (two apps in one test, say) it
+ * throws. Inject {@link RemoteSteps} and call its `run` instead, which is bound to its application.
  */
 export function remoteStep<O = unknown, I = unknown>(
   ctx: WorkflowContext,
   name: string,
   options: RemoteStepOptions<I>,
 ): Promise<O> {
-  if (!current) {
+  const [only, ...others] = live;
+  if (!only) {
     throw new Error(
       'remoteStep(): DurableRemoteStepsModule.forRoot({ transport }) is not imported in this application',
     );
   }
-  return current.run<O, I>(ctx, name, options);
+  if (others.length > 0) {
+    // Picking one would send this application's steps over another application's transport.
+    throw new Error(
+      'remoteStep(): more than one DurableRemoteStepsModule is running in this process; inject RemoteSteps and call remoteSteps.run(ctx, name, options) instead',
+    );
+  }
+  return only.run<O, I>(ctx, name, options);
 }
 
 const OPTIONS = Symbol('DURABLE_REMOTE_STEPS_OPTIONS');
@@ -116,11 +128,11 @@ export class RemoteSteps implements OnModuleInit, OnModuleDestroy {
 
   onModuleInit(): void {
     this.transport.onResult((result) => this.deliver(result));
-    current = this;
+    live.add(this);
   }
 
   onModuleDestroy(): void {
-    if (current === this) current = undefined;
+    live.delete(this);
   }
 
   /**

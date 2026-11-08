@@ -373,6 +373,29 @@ describe('engine.signal(..., { id })', () => {
     expect(await store.takeBufferedSignal('t')).toEqual({ payload: 1 });
   });
 
+  it('a duplicate sent while the first send fails delivers instead of being dropped', async () => {
+    const { engine, store } = setup();
+    const buffer = store.bufferSignal.bind(store);
+    let failOnce = true;
+    store.bufferSignal = async (token, payload) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('db down');
+      }
+      return buffer(token, payload);
+    };
+    const [first, second] = await Promise.allSettled([
+      engine.signal('t', 1, { id: 'm' }),
+      engine.signal('t', 1, { id: 'm' }),
+    ]);
+    expect(first.status).toBe('rejected');
+    expect(second).toEqual({ status: 'fulfilled', value: null });
+    expect(await store.takeBufferedSignal('t')).toEqual({ payload: 1 });
+    // ...and once stored, a later duplicate is still dropped.
+    await engine.signal('t', 1, { id: 'm' });
+    expect(await store.takeBufferedSignal('t')).toBeNull();
+  });
+
   it('throws on a store that cannot deduplicate', async () => {
     const store = new InMemoryStateStore();
     (store as { claimSignalId?: unknown }).claimSignalId = undefined;

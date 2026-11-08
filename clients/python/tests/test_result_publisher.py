@@ -85,6 +85,42 @@ class NamesTest(unittest.TestCase):
         self.assertEqual(count_queue_workers(listing, "q"), 2)
 
 
+class CloseTest(unittest.IsolatedAsyncioTestCase):
+    async def test_closes_the_routing_client_and_queues(self):
+        closed = []
+
+        class ClosingRedis(FakeRedis):
+            async def aclose(self):
+                closed.append("redis")
+
+        class ClosingQueue(FakeQueue):
+            async def close(self):
+                closed.append(self.name)
+
+        pub = ResultPublisher("durable", lambda n: ClosingQueue(n, []), ClosingRedis())
+        await pub.publish(result(1))
+        await pub.close()
+        self.assertEqual(sorted(closed), ["durable-results", "redis"])
+        await pub.close()  # idempotent
+        self.assertEqual(len(closed), 2)
+
+    async def test_the_worker_handle_closes_the_publisher_after_its_workers(self):
+        from durable_worker.redis_runner import _MultiWorkerHandle
+
+        order = []
+
+        class Bull:
+            async def close(self):
+                order.append("worker")
+
+        class Publisher:
+            async def close(self):
+                order.append("publisher")
+
+        await _MultiWorkerHandle([Bull()], None, Publisher()).close()
+        self.assertEqual(order, ["worker", "publisher"])
+
+
 class PublishTest(unittest.IsolatedAsyncioTestCase):
     async def test_without_redis_one_job_per_result_on_shared_queue(self):
         pub, log, _ = make(redis=None)
