@@ -1438,6 +1438,27 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(failed?.output).toEqual({ partial: 2 });
         expect(failed?.error).toEqual({ message: 'boom' });
         expect(failed?.startedAt.getTime()).toBe(at.getTime());
+
+        // JSON values that are arrays bind as one JSON document, not as a SQL value list.
+        await store.saveCheckpoint(pending('r1', 4));
+        const events = [
+          { at: 2, level: 'info' as const, message: 'started' },
+          { at: 3, level: 'info' as const, message: 'done' },
+        ];
+        const [arrays] = await store.settleResultsIfPending([
+          {
+            runId: 'r1',
+            seq: 4,
+            status: 'completed',
+            output: [{ row: 1 }, { row: 2 }],
+            events,
+            finishedAt: later,
+          },
+        ]);
+        expect(arrays?.status).toBe('completed');
+        expect(arrays?.output).toEqual([{ row: 1 }, { row: 2 }]);
+        expect(arrays?.events).toEqual(events);
+        expect((await store.getCheckpoint('r1', 4))?.events).toEqual(events);
         // What was read back is what is stored, input included.
         const stored = await store.getCheckpoint('r1', 0);
         expect(stored?.output).toEqual({ n: 0 });

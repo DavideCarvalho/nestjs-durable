@@ -1885,11 +1885,16 @@ class MikroOrmRoundTrips {
     return this.q(em, this.meta(em, entity).tableName);
   }
 
-  /** `value` as MikroORM binds it for `property` (its custom type's conversion, if any). */
+  /**
+   * `value` as a raw-SQL parameter for `property` (its custom type's conversion, if any).
+   *
+   * No `mode: 'query'`: in that mode MySQL's JSON conversion returns the value unserialized, for the
+   * query builder to handle, and a raw parameter that is an array is then expanded into a value list.
+   */
   private bind(em: EntityManager, entity: unknown, property: string, value: unknown): unknown {
     if (value == null) return null;
     const type = this.meta(em, entity).properties[property]?.customType;
-    return type ? type.convertToDatabaseValue(value, em.getPlatform(), { mode: 'query' }) : value;
+    return type ? type.convertToDatabaseValue(value, em.getPlatform()) : value;
   }
 
   private async run(
