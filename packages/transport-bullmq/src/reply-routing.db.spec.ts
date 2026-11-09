@@ -3,6 +3,7 @@ import { InMemoryStateStore, WorkflowEngine } from '@dudousxd/nestjs-durable-cor
 import type { StepResult } from '@dudousxd/nestjs-durable-core';
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
 import { Queue } from 'bullmq';
+import { Redis } from 'ioredis';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { BullMQTransport } from './bullmq-transport';
 
@@ -237,6 +238,45 @@ describe('routed step results (BullMQ)', () => {
       expect(cps.map((c) => [c.status, c.attempts])).toEqual(
         Array.from({ length: 4 }, () => ['completed', 1]),
       );
+    }
+  });
+
+  it('close right after a sweep opened drains leaves no unhandled rejection', async () => {
+    // Dead engines in the registry: every sweep opens a drain worker for each of them. Closing the
+    // transport while those drains are still connecting used to reject "Connection is closed." with
+    // nothing to catch it, and a close that overtook a sweep let it open drains after the close.
+    const prefix = `reply-close-${Date.now()}`;
+    const admin = new Redis({ ...base, maxRetriesPerRequest: null } as never);
+    await admin.sadd(
+      `${prefix}:reply-instances`,
+      ...Array.from({ length: 8 }, (_, i) => `dead-${i}`),
+    );
+    await admin.quit();
+    const rejections: unknown[] = [];
+    const record = (reason: unknown) => rejections.push(reason);
+    process.on('unhandledRejection', record);
+    try {
+      for (let round = 0; round < 6; round += 1) {
+        const t = new BullMQTransport({
+          connection: { ...base, maxRetriesPerRequest: null } as never,
+          prefix,
+          instanceId: `live-${round}`,
+          ...FAST,
+        } as never);
+        const sweep = t.sweepReplyQueues();
+        // Even rounds close right after the sweep opened its drains, odd rounds close mid-sweep.
+        if (round % 2 === 0) await sweep;
+        await t.close();
+        const drains = (t as unknown as { replyDrains: Map<string, unknown> }).replyDrains;
+        const afterClose = drains.size;
+        await sweep.catch(() => undefined);
+        // The sweep a close overtook opens nothing more.
+        expect(drains.size).toBe(afterClose);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', record);
     }
   });
 });

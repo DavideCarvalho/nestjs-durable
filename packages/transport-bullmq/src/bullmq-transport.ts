@@ -142,6 +142,30 @@ const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
  * `ms <= 0` skips the wait entirely rather than scheduling a 0ms timer, so `closeTimeoutMs: 0` means
  * "don't wait at all" instead of "wait one tick".
  */
+/** How long `closeConsumer` lets a worker finish connecting before closing it anyway. */
+const CONSUMER_READY_WAIT_MS = 1_000;
+
+/**
+ * Close a consumer, first letting one that is still connecting finish (bounded). BullMQ's
+ * `Worker.close()` removes the worker's listeners while its connection may still be starting
+ * (`CLIENT SETNAME` / `INFO` in flight); that start-up then fails with "Connection is closed." and
+ * is re-emitted as `'error'` with no listener left, an unhandled rejection that crashes a process
+ * under Node's default `--unhandled-rejections=throw`. A worker opened moments before a shutdown
+ * (a reply drain, a consumer started just before SIGTERM) hits exactly that.
+ */
+async function closeConsumer(consumer: ConsumerLike): Promise<void> {
+  const ready = (consumer as { waitUntilReady?: () => Promise<unknown> }).waitUntilReady;
+  if (typeof ready === 'function') {
+    await withTimeout(
+      Promise.resolve()
+        .then(() => ready.call(consumer))
+        .catch(() => undefined),
+      CONSUMER_READY_WAIT_MS,
+    );
+  }
+  await consumer.close();
+}
+
 async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
   if (ms <= 0) return;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -504,6 +528,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   private replyBeatTimer?: ReturnType<typeof setInterval>;
   private replySweepTimer?: ReturnType<typeof setInterval>;
   private replySweeping = false;
+  /** The sweep in flight, so `close()` waits for it before closing the drains it may open. */
+  private replySweep?: Promise<void> | undefined;
   private readonly replyAliveCache = new Map<string, { alive: boolean; at: number }>();
   /** Routed results waiting for the batch in flight to their instance's queue, by queue. */
   private readonly replyOutboxes = new Map<
@@ -1557,17 +1583,30 @@ export class BullMQTransport implements Transport, ControlPlane {
    * check, and past any sender's cached view of the instance), it is forgotten.
    */
   async sweepReplyQueues(): Promise<void> {
+    const sweep = this.sweepReplyQueuesOnce();
+    this.replySweep = sweep;
+    try {
+      await sweep;
+    } finally {
+      if (this.replySweep === sweep) this.replySweep = undefined;
+    }
+  }
+
+  private async sweepReplyQueuesOnce(): Promise<void> {
     if (this.closed) return;
     const redis = this.replyRedis();
     const ids = await redis.smembers(this.replyInstancesKey());
     for (const id of ids) {
-      if (id === this.replyId || this.closed) continue;
+      if (id === this.replyId) continue;
+      if (this.closed) return;
       const alive = (await redis.exists(this.replyAliveKey(id))) === 1;
+      // Re-checked after every await: a sweep that a close() overtook must not open drains.
+      if (this.closed) return;
       const drain = this.replyDrains.get(id);
       if (alive) {
         if (drain) {
           this.replyDrains.delete(id);
-          await drain.worker.close().catch(() => undefined);
+          await closeConsumer(drain.worker).catch(() => undefined);
         }
         continue;
       }
@@ -1601,7 +1640,7 @@ export class BullMQTransport implements Transport, ControlPlane {
       drain.idleSince ??= Date.now();
       if (Date.now() - drain.idleSince < this.replyDrainIdleMs) continue;
       this.replyDrains.delete(id);
-      await drain.worker.close().catch(() => undefined);
+      await closeConsumer(drain.worker).catch(() => undefined);
       // Forgotten only while still dead: an instance that came back re-adds itself on its next beat.
       if ((await redis.exists(this.replyAliveKey(id))) === 0) {
         await redis.srem(this.replyInstancesKey(), id);
@@ -1967,12 +2006,16 @@ export class BullMQTransport implements Transport, ControlPlane {
     if (this.pingWatchdogTimer) clearInterval(this.pingWatchdogTimer);
     if (this.replyBeatTimer) clearInterval(this.replyBeatTimer);
     if (this.replySweepTimer) clearInterval(this.replySweepTimer);
+    const deadline = Date.now() + this.closeTimeoutMs;
+    // A sweep in flight may be about to open a drain worker: let it see `closed` and stop, so every
+    // drain it opened is in `replyDrains` when the workers are collected below.
+    if (this.replySweep) await withTimeout(this.replySweep, this.closeTimeoutMs);
     // Stop taking routed replies first: with the alive key gone, workers send to the shared results
     // and other instances move what is left on this instance's queue there.
     if (this.replyId !== undefined && this.replyRedisClient) {
       await withTimeout(
         this.replyRedisClient.del(this.replyAliveKey(this.replyId)).catch(() => undefined),
-        this.closeTimeoutMs,
+        Math.max(0, deadline - Date.now()),
       );
     }
     this.subscribers.clear();
@@ -1982,24 +2025,24 @@ export class BullMQTransport implements Transport, ControlPlane {
     // queue that owns its connection `quit()` under the publish, which then failed with "Connection is
     // closed." and lost a step result on an ordinary SIGTERM. So: workers first, then queues, under
     // ONE deadline (`closeTimeoutMs` bounds the whole close, not each phase).
-    const deadline = Date.now() + this.closeTimeoutMs;
-    const workerCloses = [
-      ...[...this.taskWorkers.values()].map((w) => w.close()),
-      this.resultsWorker?.close(),
-      this.resultBatchesWorker?.close(),
-      this.replyWorker?.close(),
-      ...[...this.replyDrains.values()].map((d) => d.worker.close()),
-      this.decisionsWorker?.close(),
-      this.stepEventsWorker?.close(),
-      this.startRunWorker?.close(),
-      this.runRequestWorker?.close(),
-      ...[...this.runWorkers].map((w) => w.close()),
+    const workers: (ConsumerLike | undefined)[] = [
+      ...this.taskWorkers.values(),
+      this.resultsWorker,
+      this.resultBatchesWorker,
+      this.replyWorker,
+      ...[...this.replyDrains.values()].map((d) => d.worker),
+      this.decisionsWorker,
+      this.stepEventsWorker,
+      this.startRunWorker,
+      this.runRequestWorker,
+      ...this.runWorkers,
     ];
+    const workerCloses = workers.map((w) => (w ? closeConsumer(w) : undefined));
     // `allSettled`, so one rejecting close does not mask the rest; the race bounds the phase.
     // A rejection here is not actionable during shutdown — the connections come down either way.
     await withTimeout(
       Promise.allSettled(workerCloses.filter((p) => p !== undefined)),
-      this.closeTimeoutMs,
+      Math.max(0, deadline - Date.now()),
     );
     // Queues are asked to close even when a worker wedged (the budget may be spent); only the wait
     // shrinks to what is left.
