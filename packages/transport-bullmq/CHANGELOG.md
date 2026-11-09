@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-transport-bullmq
 
+## 0.24.1
+
+### Patch Changes
+
+- [#449](https://github.com/DavideCarvalho/nestjs-durable/pull/449) [`1839f5d`](https://github.com/DavideCarvalho/nestjs-durable/commit/1839f5d7d549b2e1a14332b6fd4f79b879d90768) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Closing a transport no longer leaves unhandled "Connection is closed." rejections behind. With reply routing on, the sweep opens a drain worker for each dead engine's reply queue; a `close()` landing a few ms after a sweep closed those workers while they were still connecting, and BullMQ 5 re-emits that failed start-up as an `'error'` with no listener left (an unhandled rejection: a crash under Node's default, a failed run under vitest). `close()` now waits for a sweep in flight, a sweep stops opening drains once `close()` has begun, and every worker gets up to 1 s to finish connecting before it is closed.
+
 ## 0.24.0
 
 ### Minor Changes
