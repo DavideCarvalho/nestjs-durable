@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-testing
 
+## 0.25.1
+
+### Patch Changes
+
+- [#450](https://github.com/DavideCarvalho/nestjs-durable/pull/450) [`270c15d`](https://github.com/DavideCarvalho/nestjs-durable/commit/270c15d5ef91527cbd5393c14b9dddd6713dd83a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fix step results never settling on MySQL when a JSON value is an array. `settleResultsIfPending` bound `events` (and any array `output` or `error`) unserialized, so the driver expanded it into a SQL value list and MySQL rejected the update; the run stayed `suspended` forever. JSON values are now serialized before they are bound, and the state-store contract settles a result with array `events` and `output`.
+
 ## 0.25.0
 
 ### Minor Changes
