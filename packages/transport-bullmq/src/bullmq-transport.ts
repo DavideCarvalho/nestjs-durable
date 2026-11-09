@@ -153,14 +153,17 @@ const CONSUMER_READY_WAIT_MS = 1_000;
  * under Node's default `--unhandled-rejections=throw`. A worker opened moments before a shutdown
  * (a reply drain, a consumer started just before SIGTERM) hits exactly that.
  */
-async function closeConsumer(consumer: ConsumerLike): Promise<void> {
+async function closeConsumer(
+  consumer: ConsumerLike,
+  readyWaitMs = CONSUMER_READY_WAIT_MS,
+): Promise<void> {
   const ready = (consumer as { waitUntilReady?: () => Promise<unknown> }).waitUntilReady;
-  if (typeof ready === 'function') {
+  if (typeof ready === 'function' && readyWaitMs > 0) {
     await withTimeout(
       Promise.resolve()
         .then(() => ready.call(consumer))
         .catch(() => undefined),
-      CONSUMER_READY_WAIT_MS,
+      readyWaitMs,
     );
   }
   await consumer.close();
@@ -2009,7 +2012,12 @@ export class BullMQTransport implements Transport, ControlPlane {
     const deadline = Date.now() + this.closeTimeoutMs;
     // A sweep in flight may be about to open a drain worker: let it see `closed` and stop, so every
     // drain it opened is in `replyDrains` when the workers are collected below.
-    if (this.replySweep) await withTimeout(this.replySweep, this.closeTimeoutMs);
+    if (this.replySweep) {
+      await withTimeout(
+        this.replySweep.catch(() => undefined),
+        this.closeTimeoutMs,
+      );
+    }
     // Stop taking routed replies first: with the alive key gone, workers send to the shared results
     // and other instances move what is left on this instance's queue there.
     if (this.replyId !== undefined && this.replyRedisClient) {
@@ -2037,7 +2045,9 @@ export class BullMQTransport implements Transport, ControlPlane {
       this.runRequestWorker,
       ...this.runWorkers,
     ];
-    const workerCloses = workers.map((w) => (w ? closeConsumer(w) : undefined));
+    // The connect wait counts against the same deadline: with no budget left, close at once.
+    const readyWaitMs = Math.min(CONSUMER_READY_WAIT_MS, Math.max(0, deadline - Date.now()));
+    const workerCloses = workers.map((w) => (w ? closeConsumer(w, readyWaitMs) : undefined));
     // `allSettled`, so one rejecting close does not mask the rest; the race bounds the phase.
     // A rejection here is not actionable during shutdown — the connections come down either way.
     await withTimeout(

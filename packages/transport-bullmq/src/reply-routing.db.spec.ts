@@ -245,7 +245,7 @@ describe('routed step results (BullMQ)', () => {
     // Dead engines in the registry: every sweep opens a drain worker for each of them. Closing the
     // transport while those drains are still connecting used to reject "Connection is closed." with
     // nothing to catch it, and a close that overtook a sweep let it open drains after the close.
-    const prefix = `reply-close-${Date.now()}`;
+    const prefix = `reply-close-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const admin = new Redis({ ...base, maxRetriesPerRequest: null } as never);
     await admin.sadd(
       `${prefix}:reply-instances`,
