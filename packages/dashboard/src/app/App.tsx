@@ -737,6 +737,17 @@ const RunRow = memo(function RunRow({
               {originLabel(origin)}
             </Chip>
           )}
+          {run.tenantId && (
+            <Chip
+              variant="organization"
+              className="shrink-0 px-1 text-[9px]"
+              title={`Organization (customer tenant): ${run.tenantLabel ?? run.tenantId}${
+                run.tenantKind ? ` · ${run.tenantKind}` : ''
+              } · ${run.tenantId}`}
+            >
+              {run.tenantLabel ?? run.tenantId}
+            </Chip>
+          )}
           {run.id.startsWith('dlq:') && (
             <Chip
               variant="danger"
@@ -1345,6 +1356,17 @@ const RunDetail = memo(function RunDetail({
                 title="Tenant / worker-pool partition this run belongs to"
               >
                 {tenant}
+              </Chip>
+            )}
+            {run.tenantId && (
+              <Chip
+                variant="organization"
+                className="py-0.5"
+                title={`Organization (customer tenant) this run belongs to${
+                  run.tenantKind ? ` · ${run.tenantKind}` : ''
+                } · ${run.tenantId}`}
+              >
+                {run.tenantLabel ?? run.tenantId}
               </Chip>
             )}
             {/* WHICH LIBRARY declared this workflow — stated on every run, including the ones nobody

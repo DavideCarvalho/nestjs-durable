@@ -15,6 +15,8 @@ export const badgeVariants = cva(
         outline: 'border-line bg-zinc-800/40 text-zinc-400',
         /** Tenant / worker-pool partition. */
         tenant: 'border-sky-500/30 bg-sky-500/10 text-sky-300',
+        /** The customer (organization) the run belongs to — data tenancy, not the worker pool. */
+        organization: 'border-violet-500/30 bg-violet-500/10 text-violet-300',
         /** The package that declared the run's workflow (`WorkflowRun.origin`) — a CODE-provenance
          *  axis, so it gets its own hue rather than sharing the tenant's sky. */
         origin: 'border-teal-500/30 bg-teal-500/10 text-teal-300',

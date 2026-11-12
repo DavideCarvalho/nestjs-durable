@@ -40,6 +40,12 @@ export interface EngineTenancy {
   filter(): TenantFilter;
   /** Run `fn` with `tenant` restored as the ambient context tenant. */
   run<T>(tenant: RunTenant, fn: () => T): T;
+  /**
+   * Run `fn` as durable's own work (a workflow turn, a recovery, a worker's step), where no request
+   * asks for a tenant: a host whose tenancy requires one (`required: true`) must not reject a
+   * missing tenant inside it. Optional: without it, `fn` runs as is.
+   */
+  system?<T>(fn: () => T): T;
 }
 
 /** A row that may carry a tenant (a run, a schedule). */

@@ -162,6 +162,26 @@ describe('tenancy on: stamping', () => {
 });
 
 describe('tenancy on: the tenant is restored on every turn', () => {
+  it("runs every turn, with or without a tenant, inside the host's system scope", async () => {
+    const work = new AsyncLocalStorage<true>();
+    const inWork: Array<[string | null, boolean]> = [];
+    const tenancy: EngineTenancy = {
+      ...fakeTenancy(),
+      system: (fn) => work.run(true, fn),
+    };
+    const { engine } = setup({ tenancy });
+    engine.register('wf', '1', async () => {
+      inWork.push([seenTenant(), work.getStore() === true]);
+      return 'ok';
+    });
+    await asTenant('acme', () => startRun(engine, 'wf', {}, 'with'));
+    await tenantless(() => startRun(engine, 'wf', {}, 'without'));
+    expect(inWork).toEqual([
+      ['acme', true],
+      [null, true],
+    ]);
+  });
+
   it('survives a timer resume driven outside any request', async () => {
     const { engine, store, at } = setup({ tenancy: fakeTenancy() });
     const turns: (string | null)[] = [];
@@ -346,6 +366,21 @@ describe('tenancy on: children, continueAsNew and schedules inherit the tenant',
 });
 
 describe('tenancy on: app-facing reads and control apply the matching rule', () => {
+  it('a host that requires a tenant rejects the read, it does not throw synchronously', async () => {
+    const required = new Error('tenant required');
+    const { engine } = setup({
+      tenancy: {
+        ...fakeTenancy(),
+        filter: () => {
+          throw required;
+        },
+      },
+    });
+    const read = engine.getRun('r1');
+    expect(read).toBeInstanceOf(Promise);
+    await expect(read).rejects.toBe(required);
+  });
+
   async function seeded(nullRows?: 'shared') {
     const env = setup({ tenancy: fakeTenancy({ nullRows }) });
     env.engine.register('wf', '1', async (ctx) => ctx.waitForSignal(`go:${ctx.runId}`));

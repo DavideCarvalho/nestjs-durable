@@ -483,6 +483,29 @@ tenantToken: process.env.DURABLE_TENANT_TOKEN!,
 `hmacTenantVerifier(secret, capabilities)` grants the same `capabilities` to every tenant; the token
 carries none of its own.
 
+## Claiming a customer tenant
+
+With [data tenancy](/docs/concepts/data-tenancy) on, a tenant process's `start` also sends the
+customer tenant of the request (the organization the run belongs to) as `tenantId` / `tenantKind` on
+the start message. That's only a claim. The control plane keeps it when the process's verified token
+lists one of these in `capabilities`:
+
+- `tenancy:*`: the process may start runs for any customer;
+- `tenancy:<tenantId>`: only for that customer.
+
+Without one, or without `verifyTenant` at all, the run starts with no customer tenant. With the HMAC
+verifier, grant it as the second argument:
+
+```ts
+DurableModule.forRoot({
+  topology: 'control-plane',
+  // ...
+  verifyTenant: hmacTenantVerifier(process.env.DURABLE_TENANT_SECRET!, ['tenancy:*']),
+});
+```
+
+With your own verifier, return the capabilities your token carries (`{ tenant, capabilities }`).
+
 ## Wire compatibility
 
 Whatever produced it, the token travels as a plain string in the `tenant` field of each request, the

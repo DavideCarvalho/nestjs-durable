@@ -9,7 +9,9 @@ import {
   workflowName,
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
+import type { ContextAccessor } from './context-accessor';
 import type { DurableModuleOptions } from './durable.module';
+import { currentTenant } from './tenancy';
 import { resolveTenantTokenSource } from './tenant-contracts';
 import { startRun } from './worker-sdk';
 
@@ -33,6 +35,8 @@ export class DurableStartClient {
   constructor(
     private readonly options: DurableModuleOptions,
     private readonly deps?: StartRunDeps,
+    /** The context accessor, for the customer tenant a start claims (else the global slot). */
+    private readonly accessor?: ContextAccessor,
   ) {
     this.tenant = options.partition ?? 'default';
     this.tenantToken = resolveTenantTokenSource(options.tenantToken);
@@ -52,6 +56,15 @@ export class DurableStartClient {
     opts?: StartOptions,
   ): Promise<RunResult> {
     const name = workflowName(workflow);
+    // The customer tenant this run claims: an explicit `tenantId` (`null` = none), else the
+    // request's tenant when tenancy is on. The control plane keeps it only with a `tenancy:`
+    // capability on this process's token.
+    const tenant =
+      opts?.tenantId !== undefined
+        ? opts.tenantId === null
+          ? undefined
+          : { id: opts.tenantId, kind: opts.tenantKind }
+        : currentTenant(this.options.tenancy, this.accessor);
     await startRun(this.options.connection, {
       // The signed token (when configured) rides in the `tenant` field, as on every run request; an
       // operator with `verifyTenant` derives the run's namespace from it.
@@ -65,6 +78,12 @@ export class DurableStartClient {
       ...(this.options.prefix !== undefined ? { prefix: this.options.prefix } : {}),
       ...(opts?.tags !== undefined ? { tags: opts.tags } : {}),
       ...(opts?.searchAttributes !== undefined ? { searchAttributes: opts.searchAttributes } : {}),
+      ...(tenant
+        ? {
+            tenantId: tenant.id,
+            ...(tenant.kind !== undefined ? { tenantKind: tenant.kind } : {}),
+          }
+        : {}),
       ...(this.deps !== undefined ? { deps: this.deps } : {}),
     });
     return { runId, status: 'pending' };

@@ -495,6 +495,14 @@ export interface StartRunOptions {
   tags?: string[] | undefined;
   /** Typed, queryable run data merged into the run at creation. */
   searchAttributes?: SearchAttributes | undefined;
+  /**
+   * The customer (data tenant) the run belongs to, sent as a claim ({@link StartRunMessage.tenantId}):
+   * the control plane keeps it only when this process's verified token grants `tenancy:*` or
+   * `tenancy:<tenantId>`.
+   */
+  tenantId?: string | undefined;
+  /** The kind of {@link tenantId}. */
+  tenantKind?: string | undefined;
   /** Queue key prefix. Defaults to `'durable'` (matches `BullMQTransport` default). */
   prefix?: string | undefined;
   /**
@@ -538,6 +546,10 @@ export async function startRun(connection: RedisConnection, opts: StartRunOption
   if (opts.runId !== undefined) msg.runId = opts.runId;
   if (opts.tags !== undefined) msg.tags = opts.tags;
   if (opts.searchAttributes !== undefined) msg.searchAttributes = opts.searchAttributes;
+  if (opts.tenantId !== undefined) {
+    msg.tenantId = opts.tenantId;
+    if (opts.tenantKind !== undefined) msg.tenantKind = opts.tenantKind;
+  }
   try {
     await queue.add('startRun', msg, { removeOnComplete: true, removeOnFail: true });
   } finally {

@@ -49,9 +49,11 @@ import {
   type DurableTenancyOption,
   type TenantRuntime,
   buildEngineTenancy,
+  canRestoreTenant,
   isTenantRuntime,
   readTenancy,
   stepTenantWrapper,
+  tenantFilterNow,
 } from './tenancy';
 import {
   type TenantTokenOption,
@@ -903,9 +905,13 @@ class DurableTenancyBridge implements OnApplicationBootstrap, OnModuleDestroy {
     const accessor = resolveAccessor(this.moduleRef);
     if (!readTenancy(this.options.tenancy, accessor).enabled) return;
     const runtime = await resolveContextRuntime();
-    if (!isTenantRuntime(runtime)) return;
+    if (!canRestoreTenant(runtime)) return;
     this.unregister = useDurableExecution(
-      stepTenantWrapper(this.options.tenancy, accessor, runtime),
+      stepTenantWrapper(
+        this.options.tenancy,
+        accessor,
+        isTenantRuntime(runtime) ? runtime : undefined,
+      ),
     );
   }
 
@@ -994,10 +1000,14 @@ export class DurableModule {
             auth: ResolvedTenantAuth,
           ) => {
             if (options.store === undefined) {
-              return new DurableStartClient({
-                ...options,
-                ...(auth.tenantToken !== undefined ? { tenantToken: auth.tenantToken } : {}),
-              } as DurableModuleOptions);
+              return new DurableStartClient(
+                {
+                  ...options,
+                  ...(auth.tenantToken !== undefined ? { tenantToken: auth.tenantToken } : {}),
+                } as DurableModuleOptions,
+                undefined,
+                resolveAccessor(moduleRef),
+              );
             }
             if (!store) {
               throw new Error(
@@ -1112,6 +1122,7 @@ export class DurableModule {
             store: StateStore | null,
             engine: WorkflowEngine,
             auth: ResolvedTenantAuth,
+            moduleRef: ModuleRef,
           ): RunGateway => {
             if (options.store !== undefined) {
               if (!store) {
@@ -1128,10 +1139,19 @@ export class DurableModule {
                   options.runGatewayTimeoutMs,
                   undefined,
                   auth.tenantToken,
+                  options.tenancy === false
+                    ? undefined
+                    : () => tenantFilterNow(options.tenancy, resolveAccessor(moduleRef)),
                 )
               : unavailableRunGateway();
           },
-          inject: [DURABLE_OPTIONS_CANONICAL, STATE_STORE_CANONICAL, WorkflowEngine, TENANT_AUTH],
+          inject: [
+            DURABLE_OPTIONS_CANONICAL,
+            STATE_STORE_CANONICAL,
+            WorkflowEngine,
+            TENANT_AUTH,
+            ModuleRef,
+          ],
         },
         RunGatewayBootstrap,
         DurableTenancyBridge,

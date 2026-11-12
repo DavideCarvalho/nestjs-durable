@@ -35,10 +35,23 @@ export interface ContextAccessor {
    * an app's own accessor, may not have it; durable then treats tenancy as off.
    */
   tenant?(): TenantRef | undefined;
-  /** The context's `tenancy` switch: `{ enabled, kinds? }`. Optional, as above. */
-  tenancy?(): { enabled: boolean; kinds?: string[] };
-  /** How a lib must scope data right now. Optional, as above. */
-  tenantFilter?(options?: { kinds?: string[] }): TenantFilter;
+  /** The context's `tenancy` switch: `{ enabled, kinds?, required? }`. Optional, as above. */
+  tenancy?(): { enabled: boolean; kinds?: string[]; required?: boolean };
+  /**
+   * How a lib must scope data right now. `kinds` picks the level of a nested tenant, `family` a
+   * secondary tenant, `required` overrides the context's (context ≥ 2.1). Optional, as above.
+   */
+  tenantFilter?(options?: { kinds?: string[]; family?: string; required?: boolean }): TenantFilter;
+  /** Display labels keyed by tenant id (context ≥ 2.1). Optional, as above. */
+  tenantLabels?(tenants: TenantLevel[]): Promise<Record<string, string>>;
+}
+
+/** One level of a tenant chain (context ≥ 2.1). */
+export interface TenantLevel {
+  id: string;
+  kind: string;
+  slug?: string;
+  role?: string;
 }
 
 /** A tenant as the context reports it. Structural mirror of nestjs-context's `TenantRef`. */
@@ -48,6 +61,10 @@ export interface TenantRef {
   source: string;
   slug?: string;
   role?: string;
+  /** The active chain, root first, this tenant last (context ≥ 2.1). */
+  chain?: TenantLevel[];
+  /** The secondary tenant family this ref belongs to (context ≥ 2.1). */
+  family?: string;
 }
 
 /** How a lib must scope data right now. Structural mirror of nestjs-context's `TenantFilter`. */
@@ -55,4 +72,4 @@ export type TenantFilter =
   | { mode: 'system' }
   | { mode: 'all' }
   | { mode: 'tenantless' }
-  | { mode: 'tenant'; tenant: TenantRef };
+  | { mode: 'tenant'; tenant: TenantRef; chain?: TenantLevel[] };

@@ -10,7 +10,10 @@ import type { RunListItem } from '@dudousxd/nestjs-durable-core';
  * endpoint (`GET runs/:id`) still returns the whole run, which is where those three are actually
  * rendered.
  */
-export type RunListRow = Omit<RunListItem, 'input' | 'output' | 'error'>;
+export type RunListRow = Omit<RunListItem, 'input' | 'output' | 'error'> & {
+  /** The display label of the run's customer tenant (see `withTenantLabels`), when it has one. */
+  tenantLabel?: string;
+};
 
 /** Project a gateway run down to {@link RunListRow}. Deletes rather than re-lists the kept fields, so
  *  a field added to `WorkflowRun` reaches the console automatically instead of being silently

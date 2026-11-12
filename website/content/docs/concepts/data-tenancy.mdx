@@ -43,9 +43,39 @@ DurableModule.forRoot({
 |-------|--------------|
 | `'inherit'` (default) | Follows `ContextModule`'s `tenancy.enabled`. |
 | `false` | Keeps durable out of tenancy, even when the context turns it on. |
-| `{ enabled?, kinds?, nullRows? }` | `enabled: true/false` overrides the context switch. `kinds` is durable's own allow-list of tenant kinds. `nullRows: 'shared'` lets a tenant also see runs that have no tenant (default `'tenantless'`: it does not). |
+| `{ enabled?, kinds?, family?, required?, nullRows? }` | `enabled: true/false` overrides the context switch. `kinds` is the tenant level durable stamps and filters by (see [Nested tenants](#nested-tenants)). `family` reads a secondary tenant instead of the primary one. `required` makes a missing tenant an error (see [Require a tenant](#require-a-tenant)). `nullRows: 'shared'` lets a tenant also see runs that have no tenant (default `'tenantless'`: it does not). |
 
 Without nestjs-context (or with a version before 1.2), tenancy is off.
+
+## Nested tenants
+
+With nestjs-context 2.1 or later, a request's tenant can be a chain, root first: a clinic and the unit
+inside it.
+
+```ts
+Context.setTenant({ id: 'unit_7', kind: 'unit', chain: [clinicRef, unitRef] });
+```
+
+`kinds` picks the level durable works at. With `kinds: ['clinic']`, a run started from any unit of
+the clinic is stamped with the clinic, and every unit of that clinic sees it. Without `kinds`, the
+most specific level (here the unit) is used.
+
+```ts
+DurableModule.forRoot({ store, transport, tenancy: { kinds: ['clinic'] } });
+```
+
+A request can also carry a secondary tenant of another family, such as a patient's `account` next to
+the clinic. `family: 'account'` makes durable stamp and filter by that one instead.
+
+## Require a tenant
+
+With `required: true` (or `ContextModule`'s own `tenancy.required`), an app-facing call made in a
+request that has no tenant fails with the context's `TenantRequiredError` (403) instead of running as
+tenantless. That covers `start` and every read and control call in the table below.
+
+Durable's own work never fails for a missing tenant: workflow turns, resumes, crash recovery,
+schedule fires, and step handlers on workers all run without the check. Neither does code outside a
+request (scripts, pollers), which sees every run as before.
 
 ## What a run gets
 
@@ -75,7 +105,8 @@ The tenant then follows the work:
 The tenant is stored on the run, so durable restores it around **every** turn: the first one, a
 resume after a `ctx.sleep` timer, a delivered signal, crash recovery, and a turn driven by a worker.
 Inside a workflow body or a local step, `Context.tenant()` is the run's tenant, and so are the tenant
-reads of other Aviary libs called from there. Local steps always get it from the run, whatever your
+reads of other Aviary libs called from there. With nestjs-context 2.1 or later, durable restores it
+through the context's tenancy slot (in the configured `family`, when you set one). Local steps always get it from the run, whatever your
 `context` carrier holds.
 
 A **lifecycle subscriber** (`onEvent: [runCompletedEvent(...)]`, without `eventBatch`) starts in the
@@ -176,7 +207,30 @@ as before.
 The dashboard reads through the same rule: a request with a tenant sees only that tenant's runs,
 counts and schedules, and a run of another tenant answers 404 and streams no live events. Admin users who must see every tenant
 need `Context.allTenants` around the dashboard's requests, for example in an interceptor you add with
-the dashboard's `decorators` option.
+the dashboard's `decorators` option. With `required` on, a dashboard request with no tenant fails the
+same way, so give operators `Context.allTenants` there too.
+
+Each run with a tenant shows an organization chip in the list and in the run header. The chip's text
+is the label your context gives the tenant (`ContextModule`'s `tenancy.label` resolver), else its
+slug, else its id:
+
+```ts
+ContextModule.forRoot({
+  tenancy: {
+    enabled: true,
+    label: async (tenant) => (await orgs.findById(tenant.id))?.name ?? tenant.id,
+  },
+});
+```
+
+## Tenant processes
+
+A [`topology: 'tenant'`](/docs/cluster/roles-and-config) process has no store, so it can't stamp a
+run itself. Its `start` sends the request's tenant (or an explicit `tenantId`) to the control plane as
+a claim. The control plane keeps the claim only when that process's verified token grants it, see
+[Claiming a customer tenant](/docs/cluster/authenticate-tenants#claiming-a-customer-tenant); otherwise
+the run has no tenant. The process's own dashboard and run gateway also narrow to the request's
+tenant: lists and counts only show its runs, and a run of another tenant reads and acts as missing.
 
 ## Database columns
 
