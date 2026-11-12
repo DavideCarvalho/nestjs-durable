@@ -94,6 +94,32 @@ mapping is pinned explicitly on the entity schema rather than left to MikroORM's
 since depending on the host strategy is what silently diverges the adapters — a run written by
 MikroORM has to stay readable by TypeORM, Prisma or Drizzle against the same table.
 
+### Database schema
+
+By default the tables live in the connection's current schema (Postgres) or database (MySQL). To keep
+them in one of their own, build the entities and the store with the same `schema`:
+
+```ts
+MikroOrmModule.forRoot({
+  // ...
+  entities: [...durableEntities({ schema: 'durable' })],
+});
+
+new MikroOrmStateStore(orm, { schema: 'durable' });
+```
+
+Every statement then names it: `"durable"."durable_workflow_runs"` on Postgres, and on MySQL the
+`durable` database. Auto-schema creates the schema (or database) when it is missing, along with its
+`durable_schema_meta` marker table; the role needs `CREATE` for that. If the store's `schema` doesn't
+match the entities', the store fails at construction and says which to change. SQLite has no schemas:
+there, `schema` fails at boot. The name must be a plain identifier of at most 63 characters.
+
+<Callout type="warn">
+  Don't put the tables in another schema with `search_path` (or a connection's `?schema=`). Behind
+  PgBouncer in transaction mode a `SET search_path` leaks to other clients' connections. The
+  `schema` option writes the schema into every statement instead.
+</Callout>
+
 ## 2. Wire the store into the module
 
 `MikroOrmStateStore` takes the `MikroORM` instance. Inject it and build the store in the factory:

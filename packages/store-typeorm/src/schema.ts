@@ -8,6 +8,7 @@ import {
   SignalWaiterEntity,
   StepCheckpointEntity,
   WorkflowRunEntity,
+  durableSchemaName,
 } from './entities';
 
 /** The JSON-blob columns per table (keyed by table name) that hold free-form payloads and so must
@@ -95,6 +96,35 @@ export function durableColumnResolver(
   };
 }
 
+/**
+ * The schema (Postgres) or database (MySQL) the durable tables live in, read from the registered
+ * entities (`durableEntities({ schema })`), or `undefined` when they are unqualified. A `configured`
+ * schema (the store's own `schema` option) must match what the entities were built with, and SQLite
+ * takes none.
+ */
+export function durableTableSchema(
+  dataSource: DataSource,
+  configured?: string | undefined,
+): string | undefined {
+  const wanted = durableSchemaName(configured);
+  const args = dataSource.getMetadata(WorkflowRunEntity).tableMetadataArgs;
+  const registered = args.database ?? args.schema;
+  const type = String(dataSource.options.type);
+  const isSqlite = type === 'sqlite' || type === 'better-sqlite3' || type === 'expo';
+  const schema = wanted ?? registered;
+  if (schema !== undefined && isSqlite) {
+    throw new Error(
+      `[nestjs-durable] store-typeorm: the schema option (${JSON.stringify(schema)}) is not supported on SQLite, which has no schemas. Remove it from the store options and from durableEntities().`,
+    );
+  }
+  if (wanted !== undefined && wanted !== registered) {
+    throw new Error(
+      `[nestjs-durable] store-typeorm: the store's schema is ${JSON.stringify(wanted)}, but the durable entities were registered ${registered === undefined ? 'without one' : `with ${JSON.stringify(registered)}`}. Register durableEntities({ schema: ${JSON.stringify(wanted)} }) in your DataSource.`,
+    );
+  }
+  return schema;
+}
+
 /** The SQL type for free-form JSON-blob columns. MySQL `text` caps at 64KB and silently truncates,
  *  so use `longtext` (4GB) there; Postgres/SQLite `text` is already unbounded. */
 export function jsonBlobColumnType(isMysql: boolean): 'longtext' | 'text' {
@@ -132,6 +162,12 @@ export interface DurableSchemaLogger {
 export interface EnsureTypeOrmDurableSchemaOptions {
   /** Sink for the schema-repair warning. Defaults to `console`. */
   logger?: DurableSchemaLogger | undefined;
+  /**
+   * The schema (Postgres) or database (MySQL) of the durable tables. Defaults to the one the
+   * registered `durableEntities({ schema })` carry; when set, it must match them. Created when
+   * missing.
+   */
+  schema?: string | undefined;
   /**
    * MySQL only: the largest estimated row count (`information_schema.tables.table_rows`) of an
    * existing durable table on which the boot-time check will raise a timestamp column's precision.
@@ -200,6 +236,9 @@ export async function ensureTypeOrmDurableSchema(
 ): Promise<void> {
   const logger = options.logger ?? console;
   const q = (id: string) => dataSource.driver.escape(id);
+  const schema = durableTableSchema(dataSource, options.schema);
+  // A durable table's name, qualified with the schema when one is set.
+  const qt = (table: string) => (schema === undefined ? q(table) : `${q(schema)}.${q(table)}`);
   // Physical column names come from the entity metadata (canonical snake_case by default), so this
   // raw DDL always matches the registered `durableEntities` instead of hardcoding camelCase.
   const resolve = durableColumnResolver(dataSource);
@@ -227,12 +266,12 @@ export async function ensureTypeOrmDurableSchema(
   // maintenance window rather than at boot.
   const nsCol = `${str} NOT NULL DEFAULT 'default'`;
 
-  const runs = q('durable_workflow_runs');
-  const checkpoints = q('durable_step_checkpoints');
-  const runAttributes = q('durable_run_attributes');
-  const waiters = q('durable_signal_waiters');
-  const buffered = q('durable_buffered_signals');
-  const bufferedEvents = q('durable_buffered_events');
+  const runs = qt('durable_workflow_runs');
+  const checkpoints = qt('durable_step_checkpoints');
+  const runAttributes = qt('durable_run_attributes');
+  const waiters = qt('durable_signal_waiters');
+  const buffered = qt('durable_buffered_signals');
+  const bufferedEvents = qt('durable_buffered_events');
   // Per-table quoted-column helpers: resolve an entity property to its physical column then quote it.
   const runsCol = (property: string) => q(resolve('durable_workflow_runs', property));
   const cpCol = (property: string) => q(resolve('durable_step_checkpoints', property));
@@ -240,9 +279,9 @@ export async function ensureTypeOrmDurableSchema(
   const waiterCol = (property: string) => q(resolve('durable_signal_waiters', property));
   const bufCol = (property: string) => q(resolve('durable_buffered_signals', property));
   const bevCol = (property: string) => q(resolve('durable_buffered_events', property));
-  const schedules = q('durable_schedules');
+  const schedules = qt('durable_schedules');
   const schCol = (property: string) => q(resolve('durable_schedules', property));
-  const signalIds = q('durable_signal_ids');
+  const signalIds = qt('durable_signal_ids');
   const sidCol = (property: string) => q(resolve('durable_signal_ids', property));
   // Numeric side-table column for attribute range scans. `double precision` on Postgres, `double` on
   // MySQL, `real` on SQLite (all hold JS numbers without precision loss for the typical attribute).
@@ -402,7 +441,8 @@ export async function ensureTypeOrmDurableSchema(
   const created = new Set<string>();
   const runner = dataSource.createQueryRunner();
   try {
-    const before = await existingTables(runner, { isSqlite, isMysql });
+    if (schema !== undefined) await createSchemaIfMissing(runner, schema, { isMysql, q });
+    const before = await existingTables(runner, { isSqlite, isMysql, schema });
     for (const [table, sql] of tables) {
       await runner.query(sql);
       if (!before.has(table)) {
@@ -411,11 +451,11 @@ export async function ensureTypeOrmDurableSchema(
       }
     }
     for (const [table, props] of Object.entries(additive)) {
-      const have = await existingColumns(runner, table, { isSqlite, isMysql });
+      const have = await existingColumns(runner, table, { isSqlite, isMysql, schema });
       for (const [property, colType] of props) {
         const column = resolve(table, property);
         if (!have.has(column)) {
-          await runner.query(`ALTER TABLE ${q(table)} ADD COLUMN ${q(column)} ${colType}`);
+          await runner.query(`ALTER TABLE ${qt(table)} ADD COLUMN ${q(column)} ${colType}`);
           repairs.push(`added column ${table}.${column}`);
         }
       }
@@ -427,14 +467,14 @@ export async function ensureTypeOrmDurableSchema(
     // MySQL-only: Postgres/SQLite `text` is already unbounded, so there's nothing to widen.
     if (isMysql) {
       for (const [table, props] of Object.entries(JSON_BLOB_COLUMNS)) {
-        const types = await mysqlColumnTypes(runner, table);
+        const types = await mysqlColumnTypes(runner, table, schema);
         for (const prop of props) {
           const column = resolve(table, prop);
           const current = types.get(column);
           if (current === undefined || current === 'longtext') continue;
           try {
             await runner.query(
-              `ALTER TABLE ${q(table)} MODIFY COLUMN ${q(column)} ${jsonBlobColumnType(true)}`,
+              `ALTER TABLE ${qt(table)} MODIFY COLUMN ${q(column)} ${jsonBlobColumnType(true)}`,
             );
             repairs.push(`widened ${table}.${column} from ${current} to longtext`);
           } catch {
@@ -449,7 +489,7 @@ export async function ensureTypeOrmDurableSchema(
     if (isMysql) {
       for (const [table, props] of Object.entries(DATETIME_COLUMNS)) {
         if (created.has(table)) continue;
-        const columns = await mysqlDatetimeColumns(runner, table);
+        const columns = await mysqlDatetimeColumns(runner, table, schema);
         const behind = props
           .map((prop) => resolve(table, prop))
           .filter((column) => {
@@ -457,13 +497,13 @@ export async function ensureTypeOrmDurableSchema(
             return current !== undefined && current.precision < 6;
           });
         if (behind.length === 0) continue;
-        const statement = `ALTER TABLE ${q(table)} ${behind
+        const statement = `ALTER TABLE ${qt(table)} ${behind
           .map(
             (column) =>
               `MODIFY COLUMN ${q(column)} ${MYSQL_DATETIME_TYPE} ${columns.get(column)?.nullable ? 'NULL' : 'NOT NULL'}`,
           )
           .join(', ')}`;
-        const rows = await mysqlEstimatedRows(runner, table);
+        const rows = await mysqlEstimatedRows(runner, table, schema);
         if (rows > rowLimit) {
           deferred.push({ table, rows, statement });
           continue;
@@ -579,10 +619,11 @@ export async function ensureTypeOrmDurableSchema(
 async function mysqlDatetimeColumns(
   runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
   table: string,
+  schema: string | undefined,
 ): Promise<Map<string, { precision: number; nullable: boolean }>> {
   const rows = (await runner.query(
-    "SELECT column_name AS name, datetime_precision AS `precision`, is_nullable AS nullable FROM information_schema.columns WHERE table_name = ? AND TABLE_SCHEMA = DATABASE() AND data_type = 'datetime'",
-    [table],
+    `SELECT column_name AS name, datetime_precision AS \`precision\`, is_nullable AS nullable FROM information_schema.columns WHERE table_name = ? AND ${mysqlScope(schema)} AND data_type = 'datetime'`,
+    mysqlParams([table], schema),
   )) as Array<{ name: string; precision: number | string | null; nullable: string }>;
   return new Map(
     rows.map((r) => [
@@ -596,10 +637,11 @@ async function mysqlDatetimeColumns(
 async function mysqlEstimatedRows(
   runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
   table: string,
+  schema: string | undefined,
 ): Promise<number> {
   const rows = (await runner.query(
-    'SELECT table_rows AS n FROM information_schema.tables WHERE table_name = ? AND TABLE_SCHEMA = DATABASE() LIMIT 1',
-    [table],
+    `SELECT table_rows AS n FROM information_schema.tables WHERE table_name = ? AND ${mysqlScope(schema)} LIMIT 1`,
+    mysqlParams([table], schema),
   )) as Array<{ n: number | string | null }>;
   return Number(rows[0]?.n ?? 0);
 }
@@ -607,7 +649,7 @@ async function mysqlEstimatedRows(
 /** The durable tables that exist before the boot-time check runs (to tell a created table apart). */
 async function existingTables(
   runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
-  d: { isSqlite: boolean; isMysql: boolean },
+  d: { isSqlite: boolean; isMysql: boolean; schema: string | undefined },
 ): Promise<Set<string>> {
   const names = durableManagedTables();
   if (d.isSqlite) {
@@ -616,9 +658,10 @@ async function existingTables(
     )) as Array<{ name: string }>;
     return new Set(rows.map((r) => r.name).filter((name) => names.includes(name)));
   }
-  const scope = d.isMysql ? 'TABLE_SCHEMA = DATABASE()' : 'table_schema = current_schema()';
+  const scope = d.isMysql ? mysqlScope(d.schema) : pgScope(d.schema, 1);
   const rows = (await runner.query(
     `SELECT table_name AS name FROM information_schema.tables WHERE ${scope}`,
+    d.schema === undefined ? undefined : [d.schema],
   )) as Array<{ name?: string; TABLE_NAME?: string }>;
   return new Set(
     rows.map((r) => (r.name ?? r.TABLE_NAME) as string).filter((name) => names.includes(name)),
@@ -629,10 +672,11 @@ async function existingTables(
 async function mysqlColumnTypes(
   runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
   table: string,
+  schema: string | undefined,
 ): Promise<Map<string, string>> {
   const rows = (await runner.query(
-    'SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = ? AND TABLE_SCHEMA = DATABASE()',
-    [table],
+    `SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = ? AND ${mysqlScope(schema)}`,
+    mysqlParams([table], schema),
   )) as Array<{ name?: string; type?: string; COLUMN_NAME?: string; DATA_TYPE?: string }>;
   return new Map(
     rows.map((r) => [
@@ -647,7 +691,7 @@ async function mysqlColumnTypes(
 async function existingColumns(
   runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
   table: string,
-  d: { isSqlite: boolean; isMysql: boolean },
+  d: { isSqlite: boolean; isMysql: boolean; schema: string | undefined },
 ): Promise<Set<string>> {
   if (d.isSqlite) {
     const rows = (await runner.query(`PRAGMA table_info("${table}")`)) as Array<{ name: string }>;
@@ -656,11 +700,53 @@ async function existingColumns(
   // Postgres + MySQL both expose information_schema; scope to the connection's own schema/db.
   // Bind-param placeholder differs: Postgres uses `$1`, MySQL uses `?` (TypeORM only rewrites `?`
   // inside the query builder, not for these raw `runner.query` calls), so pick per dialect.
-  const scope = d.isMysql ? 'TABLE_SCHEMA = DATABASE()' : 'table_schema = current_schema()';
+  const scope = d.isMysql ? mysqlScope(d.schema) : pgScope(d.schema, 2);
   const placeholder = d.isMysql ? '?' : '$1';
   const rows = (await runner.query(
     `SELECT column_name AS name FROM information_schema.columns WHERE table_name = ${placeholder} AND ${scope}`,
-    [table],
+    d.schema === undefined ? [table] : [table, d.schema],
   )) as Array<{ name?: string; COLUMN_NAME?: string }>;
   return new Set(rows.map((r) => (r.name ?? r.COLUMN_NAME) as string));
+}
+
+/** MySQL catalog filter: the configured database, or the connection's own. */
+function mysqlScope(schema: string | undefined): string {
+  return schema === undefined ? 'TABLE_SCHEMA = DATABASE()' : 'TABLE_SCHEMA = ?';
+}
+
+function mysqlParams(params: unknown[], schema: string | undefined): unknown[] {
+  return schema === undefined ? params : [...params, schema];
+}
+
+/** Postgres catalog filter: the configured schema (bound as `$n`), or the connection's current one. */
+function pgScope(schema: string | undefined, n: number): string {
+  return schema === undefined ? 'table_schema = current_schema()' : `table_schema = $${n}`;
+}
+
+/**
+ * Create the durable schema (Postgres) or database (MySQL) when it does not exist yet. Checked first,
+ * because `CREATE SCHEMA IF NOT EXISTS` needs the CREATE privilege even when the schema exists.
+ */
+async function createSchemaIfMissing(
+  runner: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+  schema: string,
+  d: { isMysql: boolean; q: (id: string) => string },
+): Promise<void> {
+  const rows = (await runner.query(
+    d.isMysql
+      ? 'SELECT 1 AS found FROM information_schema.schemata WHERE schema_name = ?'
+      : 'SELECT 1 AS found FROM pg_namespace WHERE nspname = $1',
+    [schema],
+  )) as unknown[];
+  if (rows.length > 0) return;
+  try {
+    await runner.query(
+      `${d.isMysql ? 'CREATE DATABASE' : 'CREATE SCHEMA'} IF NOT EXISTS ${d.q(schema)}`,
+    );
+  } catch (err) {
+    throw new Error(
+      `[nestjs-durable] store-typeorm could not create the ${d.isMysql ? 'database' : 'schema'} "${schema}" for the durable tables. Create it ahead of time, or grant this role ${d.isMysql ? 'CREATE' : 'CREATE on the database (GRANT CREATE ON DATABASE <db> TO <role>)'}. Cause: ${(err as Error).message}`,
+      { cause: err },
+    );
+  }
 }

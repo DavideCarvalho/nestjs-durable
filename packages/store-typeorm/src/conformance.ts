@@ -1,6 +1,6 @@
 import type { StateStoreContext } from '@dudousxd/nestjs-durable-testing';
 import { DataSource, type DataSourceOptions } from 'typeorm';
-import { ENTITIES } from './entities';
+import { ENTITIES, durableEntities } from './entities';
 import { TypeOrmStateStore } from './typeorm-state-store';
 
 /**
@@ -12,7 +12,9 @@ import { TypeOrmStateStore } from './typeorm-state-store';
  */
 export function makeTypeOrmStoreFactory(
   options: DataSourceOptions,
+  durable: { schema?: string } = {},
 ): () => Promise<StateStoreContext> {
+  const entities = durable.schema === undefined ? ENTITIES : durableEntities(durable);
   return async () => {
     let statements = 0;
     const log: string[] = [];
@@ -22,7 +24,7 @@ export function makeTypeOrmStoreFactory(
     };
     const dataSource = new DataSource({
       ...options,
-      entities: [...ENTITIES],
+      entities: [...entities],
       logging: ['query'],
       logger: {
         logQuery: count,
@@ -34,17 +36,17 @@ export function makeTypeOrmStoreFactory(
       },
     });
     await dataSource.initialize();
-    const store = new TypeOrmStateStore(dataSource);
+    const store = new TypeOrmStateStore(dataSource, { schema: durable.schema });
     await store.ensureSchema();
     // Clean slate even on a shared DB (a container reused across factory calls).
-    await truncateAll(dataSource);
+    await truncateAll(dataSource, durable.schema);
     return {
       store,
-      peerStore: new TypeOrmStateStore(dataSource),
+      peerStore: new TypeOrmStateStore(dataSource, { schema: durable.schema }),
       statements: () => statements,
       statementLog: () => log,
       cleanup: async () => {
-        await truncateAll(dataSource);
+        await truncateAll(dataSource, durable.schema);
         await dataSource.destroy();
       },
     };
@@ -62,9 +64,10 @@ const TABLES = [
   'durable_workflow_runs',
 ];
 
-async function truncateAll(dataSource: DataSource): Promise<void> {
+async function truncateAll(dataSource: DataSource, schema?: string): Promise<void> {
   const q = (id: string) => dataSource.driver.escape(id);
   for (const t of TABLES) {
-    await dataSource.query(`DELETE FROM ${q(t)}`).catch(() => undefined);
+    const table = schema === undefined ? q(t) : `${q(schema)}.${q(t)}`;
+    await dataSource.query(`DELETE FROM ${table}`).catch(() => undefined);
   }
 }

@@ -169,14 +169,23 @@ export class ScheduleEntity {
   updatedAt!: Date;
 }
 
+/** Postgres identifiers are at most 63 bytes; the name is written into every statement, quoted. */
+const SCHEMA_NAME = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+
 /**
- * Build the durable MikroORM entity schemas with column names pinned per `naming` (default
- * `'snake_case'`). Register the result in your MikroORM config / `MikroOrmModule.forFeature`.
- *
- * ```ts
- * entities: durableEntities({ naming: 'snake_case' })
- * ```
+ * Validate a durable `schema` option: an identifier of at most 63 characters. Returns it, or
+ * `undefined` when none is set.
  */
+export function durableSchemaName(schema: string | undefined): string | undefined {
+  if (schema === undefined) return undefined;
+  if (!SCHEMA_NAME.test(schema) || schema.length > 63) {
+    throw new Error(
+      `[nestjs-durable] invalid schema ${JSON.stringify(schema)}: use letters, digits, _ or $ (not first), at most 63 characters.`,
+    );
+  }
+  return schema;
+}
+
 /**
  * MikroORM global filter condition for the `namespace` read boundary. Returns `{}` (no restriction)
  * when `namespace` is undefined — the operator (control plane) sees all tenants. Returns a
@@ -187,12 +196,30 @@ function namespaceFilterCond(args?: { namespace?: string }): { namespace?: strin
   return { namespace: args.namespace };
 }
 
-export function durableEntities(options: { naming?: DurableColumnNaming } = {}): EntitySchema[] {
+/**
+ * Build the durable MikroORM entity schemas with column names pinned per `naming` (default
+ * `'snake_case'`). Register the result in your MikroORM config / `MikroOrmModule.forFeature`.
+ *
+ * ```ts
+ * entities: durableEntities({ naming: 'snake_case' })
+ * ```
+ *
+ * `schema` puts every durable table in that database schema (Postgres) or database (MySQL):
+ * `durableEntities({ schema: 'durable' })`. Not supported on SQLite.
+ */
+export function durableEntities(
+  options: { naming?: DurableColumnNaming; schema?: string } = {},
+): EntitySchema[] {
   const col = columnNamer(options.naming ?? 'snake_case');
+  // The database schema (Postgres) or database (MySQL) every durable table lives in, named in every
+  // statement. Absent, the tables stay unqualified exactly as before.
+  const schema = durableSchemaName(options.schema);
+  const where = schema === undefined ? {} : { schema };
 
   const workflowRuns = new EntitySchema<WorkflowRunEntity>({
     class: WorkflowRunEntity,
     tableName: 'durable_workflow_runs',
+    ...where,
     // Wired per schema rather than once on the class: `durableEntities` can be called again with a
     // different `naming`, and each call builds a distinct EntitySchema over the same class.
     repository: () => WorkflowRunRepository,
@@ -294,6 +321,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const stepCheckpoints = new EntitySchema<StepCheckpointEntity>({
     class: StepCheckpointEntity,
     tableName: 'durable_step_checkpoints',
+    ...where,
     repository: () => StepCheckpointRepository,
     // `(runId, parallelGroup, seq)` serves the run detail's per-group reads — `checkpointStats` with a
     // group and `queryCheckpoints` paging one fan in `seq` order — without scanning the whole run.
@@ -342,6 +370,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const runAttributes = new EntitySchema<RunAttributeEntity>({
     class: RunAttributeEntity,
     tableName: 'durable_run_attributes',
+    ...where,
     repository: () => RunAttributeRepository,
     // The search-attribute EXISTS join (see the class docstring) pushes equality/range predicates down
     // onto `(key, numValue)` / `(key, strValue)`; mirror the Prisma adapter so those scans stay indexed.
@@ -361,6 +390,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const signalWaiters = new EntitySchema<SignalWaiterEntity>({
     class: SignalWaiterEntity,
     tableName: 'durable_signal_waiters',
+    ...where,
     repository: () => SignalWaiterRepository,
     // A run's waiters: the `ctx.all` join barrier probes them once per settled child.
     indexes: [{ name: 'durable_signal_waiters_run_id_idx', properties: ['runId'] }],
@@ -378,6 +408,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const bufferedSignals = new EntitySchema<BufferedSignalEntity>({
     class: BufferedSignalEntity,
     tableName: 'durable_buffered_signals',
+    ...where,
     repository: () => BufferedSignalRepository,
     properties: {
       id: { type: 'integer', primary: true, autoincrement: true, fieldName: col('id') },
@@ -389,6 +420,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const bufferedEvents = new EntitySchema<BufferedEventEntity>({
     class: BufferedEventEntity,
     tableName: 'durable_buffered_events',
+    ...where,
     repository: () => BufferedEventRepository,
     // `(name, publishedAt)` serves both `listBufferedEvents`'s name-scoped scan and its oldest-first
     // ordering in one index.
@@ -411,6 +443,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const signalIds = new EntitySchema<SignalIdEntity>({
     class: SignalIdEntity,
     tableName: 'durable_signal_ids',
+    ...where,
     repository: () => SignalIdRepository,
     // The expired-id sweep (`expires_at <= now`).
     indexes: [{ name: 'durable_signal_ids_expires_at_idx', properties: ['expiresAt'] }],
@@ -424,6 +457,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
   const schedules = new EntitySchema<ScheduleEntity>({
     class: ScheduleEntity,
     tableName: 'durable_schedules',
+    ...where,
     repository: () => ScheduleRepository,
     // The poll's "due by T" scan: `paused = false AND next_fire_at <= T ORDER BY next_fire_at`.
     indexes: [

@@ -139,8 +139,25 @@ function namespaceFilter(namespace?: string) {
  * epoch-ms integers (SQLite's 64-bit integers hold them fine). For Postgres or MySQL, use the
  * MikroORM, TypeORM or Prisma adapter.
  */
+export interface DrizzleStateStoreOptions {
+  /**
+   * Not supported: SQLite has no schemas. Setting it throws at construction, so a config meant for
+   * Postgres never runs against SQLite with its tables somewhere else.
+   */
+  schema?: string | undefined;
+}
+
 export class DrizzleStateStore implements StateStore {
-  constructor(private readonly db: DrizzleSqlite) {}
+  constructor(
+    private readonly db: DrizzleSqlite,
+    options: DrizzleStateStoreOptions = {},
+  ) {
+    if (options.schema !== undefined) {
+      throw new Error(
+        `[nestjs-durable] store-drizzle: the schema option (${JSON.stringify(options.schema)}) is not supported on SQLite, which has no schemas. Remove it, or use DrizzlePgStateStore from '@dudousxd/nestjs-durable-store-drizzle/pg'.`,
+      );
+    }
+  }
 
   async tryAdmitSingleton(
     runId: string,

@@ -201,6 +201,49 @@ export interface DurablePrismaClient extends DurablePrismaTx {
  * {@link WorkflowRun.namespace} promises for the four worker paths (pick up, recover, resume timers,
  * time out).
  */
+/** Options for a {@link PrismaStateStore}. */
+export interface PrismaStateStoreOptions {
+  /**
+   * The schema (Postgres) or database (MySQL) the durable tables live in. Put the same name on the
+   * durable models (`@@schema("durable")`, with `schemas = [...]` on your datasource) so the Prisma
+   * client qualifies its own queries; this option qualifies the store's raw SQL. Never set
+   * `search_path` (or the URL's `?schema=`) for this. Postgres only: Prisma has no `@@schema` on
+   * MySQL, and SQLite has no schemas, so either fails at construction. Default: unqualified.
+   */
+  schema?: string | undefined;
+}
+
+/** Postgres identifiers are at most 63 bytes; the name is written into every statement, quoted. */
+const SCHEMA_NAME = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+
+/**
+ * Validate a durable `schema` option: an identifier of at most 63 characters. Returns it, or
+ * `undefined` when none is set.
+ */
+export function durableSchemaName(schema: string | undefined): string | undefined {
+  if (schema === undefined) return undefined;
+  if (!SCHEMA_NAME.test(schema) || schema.length > 63) {
+    throw new Error(
+      `[nestjs-durable] invalid schema ${JSON.stringify(schema)}: use letters, digits, _ or $ (not first), at most 63 characters.`,
+    );
+  }
+  return schema;
+}
+
+/**
+ * A durable table as raw SQL names it. `unqualified` is the exact text used without a schema (quoted
+ * or bare, as each statement always wrote it); with one, both parts are quoted for the dialect.
+ */
+function rawTable(
+  unqualified: string,
+  schema: string | undefined,
+  dialect: 'postgres' | 'mysql',
+): string {
+  if (schema === undefined) return unqualified;
+  const name = unqualified.replace(/^["`]|["`]$/g, '');
+  return dialect === 'postgres' ? `"${schema}"."${name}"` : `\`${schema}\`.\`${name}\``;
+}
+
 function namespaceWhere(namespace?: string): { namespace?: string } {
   if (namespace === undefined) return {};
   return { namespace };
@@ -240,8 +283,25 @@ export class PrismaStateStore implements StateStore {
   /** Raw single-statement writes on Postgres/MySQL (Prisma wraps `updateMany` in a transaction). */
   private readonly fast?: PrismaRoundTrips;
 
-  constructor(private readonly db: DurablePrismaClient) {
+  private readonly schema: string | undefined;
+
+  constructor(
+    private readonly db: DurablePrismaClient,
+    options: PrismaStateStoreOptions = {},
+  ) {
     const provider = (db as unknown as { _activeProvider?: string })._activeProvider;
+    this.schema = durableSchemaName(options.schema);
+    if (this.schema !== undefined && provider === 'sqlite') {
+      throw new Error(
+        `[nestjs-durable] store-prisma: the schema option (${JSON.stringify(this.schema)}) is not supported on SQLite, which has no schemas. Remove it.`,
+      );
+    }
+    if (this.schema !== undefined && provider === 'mysql') {
+      // The client could not qualify its own queries: Prisma's `@@schema` is not available on MySQL.
+      throw new Error(
+        `[nestjs-durable] store-prisma: the schema option (${JSON.stringify(this.schema)}) is not supported on MySQL, where Prisma has no multi-schema support (\`@@schema\`). Point the client's connection at that database instead, or use the MikroORM or TypeORM store.`,
+      );
+    }
     const raw = typeof (db as unknown as RawPrismaClient).$queryRawUnsafe === 'function';
     const dialect =
       raw && provider === 'postgresql'
@@ -250,7 +310,7 @@ export class PrismaStateStore implements StateStore {
           ? 'mysql'
           : undefined;
     if (!dialect) return;
-    const fast = new PrismaRoundTrips(db, dialect, this);
+    const fast = new PrismaRoundTrips(db, dialect, this, this.schema);
     this.fast = fast;
     this.insertCheckpointIfAbsent = (cp) => fast.insertCheckpointIfAbsent(cp);
     this.settleResultsIfPending = (results) => fast.settleResultsIfPending(results);
@@ -270,7 +330,7 @@ export class PrismaStateStore implements StateStore {
     retryWakeAt?: number,
   ): Promise<boolean> {
     const where = { workflow, status: { in: SINGLETON_ACTIVE_STATUSES } };
-    const lockRows = rowLockDialect(this.db);
+    const lockRows = rowLockDialect(this.db, this.schema);
     const claimants = lockRows
       ? singletonClaimantIds(
           // The primary, under the read-replicas extension: a lagging replica would leave rows out.
@@ -592,6 +652,7 @@ export class PrismaStateStore implements StateStore {
         const won = await dialect(
           raw,
           chunk.map((i) => settlements[i] as StepSettlement),
+          this.schema,
         );
         for (const i of chunk) {
           const s = settlements[i] as StepSettlement;
@@ -1619,7 +1680,11 @@ interface RawPrismaClient {
 }
 
 /** Settles distinct rows with raw SQL and resolves the keys ({@link checkpointKey}) it wrote. */
-type RawSettle = (db: RawPrismaClient, settlements: StepSettlement[]) => Promise<Set<string>>;
+type RawSettle = (
+  db: RawPrismaClient,
+  settlements: StepSettlement[],
+  schema: string | undefined,
+) => Promise<Set<string>>;
 
 const jsonText = (v: unknown): string | null => (v == null ? null : JSON.stringify(v));
 
@@ -1636,13 +1701,14 @@ function primaryOf(db: DurablePrismaClient): DurablePrismaClient {
 /** `SELECT … ORDER BY id FOR UPDATE` on the run rows, where the provider has row locks. */
 function rowLockDialect(
   db: DurablePrismaClient,
+  schema: string | undefined,
 ): ((tx: RawPrismaClient, ids: string[]) => Promise<unknown>) | undefined {
   const client = db as unknown as Partial<RawPrismaClient> & { _activeProvider?: string };
   if (typeof client.$queryRawUnsafe !== 'function') return undefined;
   if (client._activeProvider === 'postgresql') {
     return (tx, ids) =>
       tx.$queryRawUnsafe(
-        `SELECT id FROM "durable_workflow_runs" WHERE id IN (${ids
+        `SELECT id FROM ${rawTable('"durable_workflow_runs"', schema, 'postgres')} WHERE id IN (${ids
           .map((_, i) => `$${i + 1}`)
           .join(', ')}) ORDER BY id FOR UPDATE`,
         ...ids,
@@ -1651,7 +1717,7 @@ function rowLockDialect(
   if (client._activeProvider === 'mysql') {
     return (tx, ids) =>
       tx.$queryRawUnsafe(
-        `SELECT id FROM durable_workflow_runs WHERE id IN (${ids
+        `SELECT id FROM ${rawTable('durable_workflow_runs', schema, 'mysql')} WHERE id IN (${ids
           .map(() => '?')
           .join(', ')}) ORDER BY id FOR UPDATE`,
         ...ids,
@@ -1674,7 +1740,7 @@ function rawSettleDialect(db: DurablePrismaClient): RawSettle | undefined {
  * compare-and-set, and `RETURNING` names the rows written. Prisma's `DateTime` is a `timestamp(3)`
  * holding UTC, hence the conversion from the exact instant.
  */
-const settleRowsPostgres: RawSettle = async (db, settlements) => {
+const settleRowsPostgres: RawSettle = async (db, settlements, schema) => {
   const values: unknown[] = [];
   const rows = settlements.map((s) => {
     const n = values.length;
@@ -1692,7 +1758,7 @@ const settleRowsPostgres: RawSettle = async (db, settlements) => {
     return `(${p(1)}::text, ${p(2)}::integer, ${p(3)}::text, ${p(4)}::jsonb, ${p(5)}::jsonb, ${p(6)}::jsonb, (${p(7)}::timestamptz AT TIME ZONE 'UTC'), (${p(8)}::timestamptz AT TIME ZONE 'UTC'))`;
   });
   const written = await db.$queryRawUnsafe<{ run_id: string; seq: number }[]>(
-    `UPDATE "durable_step_checkpoints" AS c SET status = v.status, output = v.output,
+    `UPDATE ${rawTable('"durable_step_checkpoints"', schema, 'postgres')} AS c SET status = v.status, output = v.output,
       error = v.error, events = v.events, started_at = v.started_at, finished_at = v.finished_at
     FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at,
       finished_at)
@@ -1707,11 +1773,11 @@ const settleRowsPostgres: RawSettle = async (db, settlements) => {
  * MySQL has no `RETURNING`: lock the rows still `pending` (`SELECT … FOR UPDATE`), then update
  * those from a derived table of the values. Prisma's `DateTime` is a `DATETIME(3)` holding UTC.
  */
-const settleRowsMysql: RawSettle = async (db, settlements) => {
+const settleRowsMysql: RawSettle = async (db, settlements, schema) => {
   const pending = new Set<string>();
   for (const [runId, seqs] of seqsByRun(settlements)) {
     const rows = await db.$queryRawUnsafe<{ run_id: string; seq: number }[]>(
-      `SELECT run_id, seq FROM durable_step_checkpoints WHERE run_id = ? AND seq IN (${seqs
+      `SELECT run_id, seq FROM ${rawTable('durable_step_checkpoints', schema, 'mysql')} WHERE run_id = ? AND seq IN (${seqs
         .map(() => '?')
         .join(', ')}) AND status = 'pending' FOR UPDATE`,
       runId,
@@ -1739,7 +1805,7 @@ const settleRowsMysql: RawSettle = async (db, settlements) => {
       : 'SELECT ?, ?, ?, ?, ?, ?, ?, ?';
   });
   const updated = await db.$executeRawUnsafe(
-    `UPDATE durable_step_checkpoints AS c JOIN (${rows.join(' UNION ALL ')}) AS v
+    `UPDATE ${rawTable('durable_step_checkpoints', schema, 'mysql')} AS c JOIN (${rows.join(' UNION ALL ')}) AS v
       ON c.run_id = v.run_id AND c.seq = v.seq
     SET c.status = v.status, c.output = CAST(v.output AS JSON), c.error = CAST(v.error AS JSON),
       c.events = CAST(v.events AS JSON), c.started_at = v.started_at, c.finished_at = v.finished_at
@@ -1893,8 +1959,15 @@ class PrismaRoundTrips {
     dialect: 'postgres' | 'mysql',
     /** The store itself, whose batched plain calls settle a MySQL batch. */
     private readonly store: StateStore,
+    /** The durable tables' schema (`PrismaStateStoreOptions.schema`). */
+    private readonly schema: string | undefined,
   ) {
     this.pg = dialect === 'postgres';
+  }
+
+  /** A durable table as this statement wrote it unqualified, with the schema when one is set. */
+  private t(unqualified: string): string {
+    return rawTable(unqualified, this.schema, this.pg ? 'postgres' : 'mysql');
   }
 
   private get raw(): RawPrismaClient {
@@ -1908,7 +1981,7 @@ class PrismaRoundTrips {
     nowMs: number,
   ): Promise<WorkflowRun | null> {
     const rows = await this.raw.$queryRawUnsafe<Record<string, unknown>[]>(
-      `UPDATE "durable_workflow_runs" SET locked_by = $1, locked_until = ($2::timestamptz AT TIME ZONE 'UTC') WHERE id = $3 AND (locked_until IS NULL OR locked_until <= ($4::timestamptz AT TIME ZONE 'UTC')) RETURNING *`,
+      `UPDATE ${this.t('"durable_workflow_runs"')} SET locked_by = $1, locked_until = ($2::timestamptz AT TIME ZONE 'UTC') WHERE id = $3 AND (locked_until IS NULL OR locked_until <= ($4::timestamptz AT TIME ZONE 'UTC')) RETURNING *`,
       owner,
       new Date(leaseUntilMs).toISOString(),
       runId,
@@ -1970,7 +2043,7 @@ class PrismaRoundTrips {
     const names = columns.map(([name]) => this.q(name)).join(', ');
     const marks = columns.map(([, kind], i) => this.param(kind, i + 1)).join(', ');
     const values = columns.map(([, kind, v]) => this.value(kind, v));
-    const insert = `INSERT INTO ${this.q('durable_step_checkpoints')} (${names}) VALUES (${marks})`;
+    const insert = `INSERT INTO ${this.t(this.q('durable_step_checkpoints'))} (${names}) VALUES (${marks})`;
     if (this.pg) {
       const rows = await this.raw.$queryRawUnsafe<unknown[]>(
         `${insert} ON CONFLICT (run_id, seq) DO NOTHING RETURNING seq`,
@@ -2037,7 +2110,7 @@ class PrismaRoundTrips {
       return this.param('text', values.length);
     });
     return this.raw.$executeRawUnsafe(
-      `UPDATE ${this.q('durable_workflow_runs')} SET ${set.join(', ')} WHERE id = ${id} AND status IN (${statuses.join(', ')})`,
+      `UPDATE ${this.t(this.q('durable_workflow_runs'))} SET ${set.join(', ')} WHERE id = ${id} AND status IN (${statuses.join(', ')})`,
       ...values,
     );
   }
@@ -2046,7 +2119,7 @@ class PrismaRoundTrips {
   async releaseRunLock(runId: string, owner?: string): Promise<void> {
     const where = owner === undefined ? '' : ` AND locked_by = ${this.param('text', 2)}`;
     await this.raw.$executeRawUnsafe(
-      `UPDATE ${this.q('durable_workflow_runs')} SET locked_by = NULL, locked_until = NULL WHERE id = ${this.param('text', 1)}${where}`,
+      `UPDATE ${this.t(this.q('durable_workflow_runs'))} SET locked_by = NULL, locked_until = NULL WHERE id = ${this.param('text', 1)}${where}`,
       runId,
       ...(owner === undefined ? [] : [owner]),
     );
@@ -2064,7 +2137,7 @@ class PrismaRoundTrips {
       return [i];
     });
     if (sent.length === 0) return out;
-    const finished = `NOT EXISTS (SELECT 1 FROM durable_workflow_runs r WHERE r.id = c.run_id AND r.status IN ('cancelled', 'completed'))`;
+    const finished = `NOT EXISTS (SELECT 1 FROM ${this.t('durable_workflow_runs')} r WHERE r.id = c.run_id AND r.status IN ('cancelled', 'completed'))`;
     if (!this.pg) {
       if (sent.length > 1) return settleResultsWithPlainCalls(this.store, results);
       // MySQL, one result: one conditional UPDATE and a read of the row.
@@ -2073,7 +2146,7 @@ class PrismaRoundTrips {
       const done = s.status === 'completed';
       const at = (d: Date) => d.toISOString().replace('T', ' ').replace('Z', '');
       const wrote = await this.raw.$executeRawUnsafe(
-        `UPDATE durable_step_checkpoints c SET c.status = ?, c.output = ${done ? 'CAST(? AS JSON)' : 'c.output'}, c.error = CAST(? AS JSON), c.events = COALESCE(CAST(? AS JSON), c.events), c.started_at = COALESCE(?, c.started_at), c.finished_at = ? WHERE c.run_id = ? AND c.seq = ? AND c.status = 'pending' AND ${finished}`,
+        `UPDATE ${this.t('durable_step_checkpoints')} c SET c.status = ?, c.output = ${done ? 'CAST(? AS JSON)' : 'c.output'}, c.error = CAST(? AS JSON), c.events = COALESCE(CAST(? AS JSON), c.events), c.started_at = COALESCE(?, c.started_at), c.finished_at = ? WHERE c.run_id = ? AND c.seq = ? AND c.status = 'pending' AND ${finished}`,
         s.status,
         ...(done ? [jsonText(s.output)] : []),
         jsonText(s.error),
@@ -2085,7 +2158,7 @@ class PrismaRoundTrips {
       );
       if (wrote !== 1) return out;
       const [row] = await this.raw.$queryRawUnsafe<Record<string, unknown>[]>(
-        `SELECT ${SETTLED_CHECKPOINT_COLUMNS} FROM durable_step_checkpoints WHERE run_id = ? AND seq = ?`,
+        `SELECT ${SETTLED_CHECKPOINT_COLUMNS} FROM ${this.t('durable_step_checkpoints')} WHERE run_id = ? AND seq = ?`,
         s.runId,
         s.seq,
       );
@@ -2112,7 +2185,7 @@ class PrismaRoundTrips {
         return `(${p(1)}::text, ${p(2)}::integer, ${p(3)}::text, ${p(4)}::jsonb, ${p(5)}::jsonb, ${p(6)}::jsonb, (${p(7)}::timestamptz AT TIME ZONE 'UTC'), (${p(8)}::timestamptz AT TIME ZONE 'UTC'))`;
       });
       const settled = await this.raw.$queryRawUnsafe<Record<string, unknown>[]>(
-        `UPDATE "durable_step_checkpoints" AS c SET status = v.status, output = CASE WHEN v.status = 'completed' THEN v.output ELSE c.output END, error = v.error, events = COALESCE(v.events, c.events), started_at = COALESCE(v.started_at, c.started_at), finished_at = v.finished_at FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending' AND ${finished} RETURNING ${SETTLED_CHECKPOINT_COLUMNS.split(
+        `UPDATE ${this.t('"durable_step_checkpoints"')} AS c SET status = v.status, output = CASE WHEN v.status = 'completed' THEN v.output ELSE c.output END, error = v.error, events = COALESCE(v.events, c.events), started_at = COALESCE(v.started_at, c.started_at), finished_at = v.finished_at FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending' AND ${finished} RETURNING ${SETTLED_CHECKPOINT_COLUMNS.split(
           ', ',
         )
           .map((col) => `c.${col}`)
@@ -2149,7 +2222,7 @@ class PrismaRoundTrips {
     if (this.pg) {
       const ns = namespace !== undefined ? ' AND namespace = $5' : '';
       const rows = await this.raw.$queryRawUnsafe<Record<string, unknown>[]>(
-        `WITH claimed AS MATERIALIZED (SELECT id AS claimed_id FROM "durable_workflow_runs" WHERE status = 'pending' AND (locked_until IS NULL OR locked_until <= ($3::timestamptz AT TIME ZONE 'UTC'))${ns} ORDER BY created_at, id LIMIT $4 FOR UPDATE SKIP LOCKED) UPDATE "durable_workflow_runs" AS r SET locked_by = $1, locked_until = ($2::timestamptz AT TIME ZONE 'UTC') FROM claimed WHERE r.id = claimed.claimed_id RETURNING r.*`,
+        `WITH claimed AS MATERIALIZED (SELECT id AS claimed_id FROM ${this.t('"durable_workflow_runs"')} WHERE status = 'pending' AND (locked_until IS NULL OR locked_until <= ($3::timestamptz AT TIME ZONE 'UTC'))${ns} ORDER BY created_at, id LIMIT $4 FOR UPDATE SKIP LOCKED) UPDATE ${this.t('"durable_workflow_runs"')} AS r SET locked_by = $1, locked_until = ($2::timestamptz AT TIME ZONE 'UTC') FROM claimed WHERE r.id = claimed.claimed_id RETURNING r.*`,
         owner,
         new Date(leaseUntilMs).toISOString(),
         new Date(nowMs).toISOString(),
@@ -2166,7 +2239,7 @@ class PrismaRoundTrips {
       const ns = namespace !== undefined ? ' AND namespace = ?' : '';
       const picked = (
         await raw.$queryRawUnsafe<Record<string, unknown>[]>(
-          `SELECT * FROM durable_workflow_runs WHERE status = 'pending' AND (locked_until IS NULL OR locked_until <= ?)${ns} ORDER BY created_at, id LIMIT ? FOR UPDATE SKIP LOCKED`,
+          `SELECT * FROM ${this.t('durable_workflow_runs')} WHERE status = 'pending' AND (locked_until IS NULL OR locked_until <= ?)${ns} ORDER BY created_at, id LIMIT ? FOR UPDATE SKIP LOCKED`,
           at(nowMs),
           ...(namespace !== undefined ? [namespace] : []),
           limit,
@@ -2174,7 +2247,7 @@ class PrismaRoundTrips {
       ).map((row) => fromRunRow(fromRawRow<RunRow>(row)));
       if (picked.length === 0) return [];
       await raw.$executeRawUnsafe(
-        `UPDATE durable_workflow_runs SET locked_by = ?, locked_until = ? WHERE id IN (${picked.map(() => '?').join(', ')})`,
+        `UPDATE ${this.t('durable_workflow_runs')} SET locked_by = ?, locked_until = ? WHERE id IN (${picked.map(() => '?').join(', ')})`,
         owner,
         at(leaseUntilMs),
         ...picked.map((run) => run.id),

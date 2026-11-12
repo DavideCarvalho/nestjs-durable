@@ -57,6 +57,21 @@ class ContractSqlTest(unittest.TestCase):
         self.assertIn("INSERT IGNORE", my)
         self.assertIn("`started_at`", my)
 
+    def test_schema_qualifies_every_table(self):
+        pg = _Contract("durable", _Dialect("postgres"), 10, schema="jobs")
+        for sql in [pg.select_claim(), pg.claim_update(1), pg.insert_result(), pg.delete_task(), *pg.create_tables()]:
+            self.assertRegex(sql, r'"jobs"\."durable_transport_(tasks|results)"')
+        self.assertEqual(pg.create_schema(), 'CREATE SCHEMA IF NOT EXISTS "jobs"')
+        my = _Contract("durable", _Dialect("mysql"), 10, schema="jobs")
+        self.assertIn("`jobs`.`durable_transport_tasks`", my.select_claim())
+        self.assertEqual(my.create_schema(), "CREATE DATABASE IF NOT EXISTS `jobs`")
+        unqualified = _Contract("durable", _Dialect("postgres"), 10)
+        self.assertIn('FROM "durable_transport_tasks"', unqualified.select_claim())
+
+    def test_schema_must_be_an_identifier(self):
+        with self.assertRaises(ValueError):
+            _Contract("durable", _Dialect("postgres"), 10, schema='bad"name')
+
     def test_claim_update_placeholders_offset_past_lease_params(self):
         c = _Contract("durable", _Dialect("postgres"), 10)
         # claimed_by=$1, claimed_at=$2, then the ids start at $3

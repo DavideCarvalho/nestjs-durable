@@ -79,6 +79,8 @@ type SqlEm = EntityManager & {
 /** Resolved side-table column names (per the active naming strategy) for the raw EXISTS pushdown. */
 interface AttributeColumns {
   table: string;
+  /** The side table's schema, when the entities were built with one. */
+  schema: string | undefined;
   /** Side-table FK column (the run id on `durable_run_attributes`). */
   runId: string;
   /** Run table PK column (the `id` on `durable_workflow_runs`) used for the outer correlation. */
@@ -97,7 +99,25 @@ import {
   StepCheckpointEntity,
   WorkflowRunEntity,
 } from './entities';
-import { type DurableSchemaLogger, ensureMikroOrmDurableSchema } from './schema';
+import {
+  type DurableSchemaLogger,
+  durableTableSchema,
+  ensureMikroOrmDurableSchema,
+} from './schema';
+
+/** The schema an entity's table lives in (`durableEntities({ schema })`), if any. */
+function metaSchema(meta: { schema?: string | undefined }): string | undefined {
+  return meta.schema && meta.schema !== '*' ? meta.schema : undefined;
+}
+
+/** A table reference, qualified with its schema when it has one. */
+function tableRef(
+  quote: (id: string) => string,
+  table: string,
+  schema: string | undefined,
+): string {
+  return schema === undefined ? quote(table) : `${quote(schema)}.${quote(table)}`;
+}
 
 /**
  * Workflows a retention policy never sees: lifecycle registry runs are neither pruned nor counted
@@ -127,6 +147,13 @@ export interface MikroOrmStateStoreOptions {
    * `blockingAlterRowLimit` on `ensureMikroOrmDurableSchema`.
    */
   schemaBlockingAlterRowLimit?: number | undefined;
+  /**
+   * The schema (Postgres) or database (MySQL) the durable tables live in. Register the entities with
+   * the same one (`durableEntities({ schema })`); a mismatch fails at `ensureSchema()`. Every
+   * statement names it, so it works behind PgBouncer in transaction mode; never set `search_path`
+   * for this. Default: whatever the registered entities carry (unqualified unless built with one).
+   */
+  schema?: string | undefined;
 }
 
 /**
@@ -170,6 +197,8 @@ export class MikroOrmStateStore implements StateStore {
     } catch {
       return; // a stand-in ORM (tests): keep the plain calls
     }
+    // A schema on SQLite, or one the registered entities do not carry, fails here.
+    durableTableSchema(orm, opts.schema);
     const dialect = platform.includes('postgre')
       ? 'postgres'
       : platform.includes('mysql')
@@ -218,6 +247,7 @@ export class MikroOrmStateStore implements StateStore {
     await ensureMikroOrmDurableSchema(this.orm, {
       logger: this.opts.schemaLogger,
       blockingAlterRowLimit: this.opts.schemaBlockingAlterRowLimit,
+      schema: this.opts.schema,
     });
   }
 
@@ -937,7 +967,7 @@ export class MikroOrmStateStore implements StateStore {
     const idCol = meta.properties.id?.fieldNames?.[0] ?? 'id';
     const a = quote('a');
     const join =
-      `${quote(cols.table)} as ${a} join (${runs}) as ${quote('r')} ` +
+      `${tableRef(quote, cols.table, cols.schema)} as ${a} join (${runs}) as ${quote('r')} ` +
       `on ${a}.${quote(cols.runId)} = ${quote('r')}.${quote(idCol)}`;
     if (axis.field === 'attributeKey') {
       return { source: join, valueExpr: `${a}.${quote(cols.key)}` };
@@ -1007,7 +1037,7 @@ export class MikroOrmStateStore implements StateStore {
       return `${quote('a')}.${quote(col)} ${comparator} ${literal}`;
     });
     if (comparisons.length === 0) return '1 = 0';
-    const a = quote(cols.table);
+    const a = tableRef(quote, cols.table, cols.schema);
     const sub = quote('a');
     const outerId = `${quote(alias)}.${quote(cols.runPk)}`; // run PK column on the outer alias
     const match = comparisons.length === 1 ? comparisons[0] : `(${comparisons.join(' OR ')})`;
@@ -1025,6 +1055,7 @@ export class MikroOrmStateStore implements StateStore {
     const runPk = runMeta.properties.id?.fieldNames?.[0] ?? 'id';
     return {
       table: meta.tableName,
+      schema: metaSchema(meta),
       runId: field('runId'),
       runPk,
       key: field('key'),
@@ -1239,7 +1270,7 @@ export class MikroOrmStateStore implements StateStore {
       `max(${c('startedAt')}) as ${quote('max_started_at')}, ` +
       `max(${c('finishedAt')}) as ${quote('max_finished_at')}, ` +
       `sum(${c('attempts')}) as ${quote('sum_attempts')} ` +
-      `from ${quote(meta.tableName)} where ${where} ` +
+      `from ${tableRef(quote, meta.tableName, metaSchema(meta))} where ${where} ` +
       `group by ${c('parallelGroup')}, ${c('status')}, ${nameKind}`;
     const rows = (await em.getConnection().execute(sql, params)) as unknown as Record<
       string,
@@ -1893,6 +1924,7 @@ class MikroOrmRoundTrips {
   private meta(em: EntityManager, entity: unknown) {
     return em.getMetadata().get(entity as never) as unknown as {
       tableName: string;
+      schema?: string | undefined;
       properties: Record<
         string,
         {
@@ -1917,7 +1949,8 @@ class MikroOrmRoundTrips {
   }
 
   private table(em: EntityManager, entity: unknown): string {
-    return this.q(em, this.meta(em, entity).tableName);
+    const meta = this.meta(em, entity);
+    return tableRef((id) => this.q(em, id), meta.tableName, metaSchema(meta));
   }
 
   /**
@@ -2015,8 +2048,15 @@ class MikroOrmRoundTrips {
     this.cpTypes ??= (
       this.run(
         em,
-        'SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = ? AND table_schema = current_schema()',
-        [this.meta(em, StepCheckpointEntity).tableName],
+        metaSchema(this.meta(em, StepCheckpointEntity)) === undefined
+          ? 'SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = ? AND table_schema = current_schema()'
+          : 'SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = ? AND table_schema = ?',
+        [
+          this.meta(em, StepCheckpointEntity).tableName,
+          ...(metaSchema(this.meta(em, StepCheckpointEntity)) === undefined
+            ? []
+            : [metaSchema(this.meta(em, StepCheckpointEntity))]),
+        ],
       ) as Promise<unknown>
     ).then((out) => new Map(this.rows(out).map((r) => [String(r.name), String(r.type)])));
     return (await this.cpTypes).get(field) ?? 'text';

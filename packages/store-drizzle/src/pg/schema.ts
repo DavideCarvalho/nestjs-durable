@@ -6,6 +6,7 @@ import {
   index,
   integer,
   jsonb,
+  pgSchema,
   pgTable,
   primaryKey,
   text,
@@ -31,185 +32,205 @@ export const DEFAULT_NAMESPACE = 'default';
 
 const tstz = (name: string) => timestamp(name, { withTimezone: true, mode: 'date' });
 
-export const durableWorkflowRuns = pgTable(
-  'durable_workflow_runs',
-  {
-    id: text('id').primaryKey(),
-    workflow: text('workflow').notNull(),
-    workflowVersion: text('workflow_version').notNull(),
-    status: text('status').notNull(),
-    input: jsonb('input'),
-    output: jsonb('output'),
-    error: jsonb('error'),
-    wakeAt: tstz('wake_at'),
-    lockedBy: text('locked_by'),
-    lockedUntil: tstz('locked_until'),
-    // REMOTE turn the engine suspended on awaiting a decision; matched by completeRemoteDecision so
-    // only the currently-awaited turn's decision is applied. Nullable: cleared when a decision lands.
-    awaitingDecisionTaskId: text('awaiting_decision_task_id'),
-    recoveryAttempts: integer('recovery_attempts'),
-    tags: jsonb('tags').$type<string[]>(),
-    searchAttributes: jsonb('search_attributes').$type<Record<string, string | number | boolean>>(),
-    priority: integer('priority'),
-    // The worker-pool partition (tenant) — THE isolation boundary every poll predicate filters on.
-    // NOT NULL DEFAULT 'default' so a row can never fall outside every worker's namespace.
-    namespace: text('namespace').notNull().default(DEFAULT_NAMESPACE),
-    // Which package declared the workflow. Nullable, no default: NULL = unknown, never guessed.
-    origin: text('origin'),
-    // The customer (tenancy) the run belongs to — not the worker-pool `namespace`. NULL = none.
-    tenantId: text('tenant_id'),
-    tenantKind: text('tenant_kind'),
-    createdAt: tstz('created_at').notNull(),
-    updatedAt: tstz('updated_at').notNull(),
-  },
-  (t) => [
-    // App-facing reads with tenancy on: `tenant_id = $1 ORDER BY created_at DESC`.
-    index('durable_workflow_runs_tenant_idx').on(t.tenantId, t.createdAt),
-    // Timer poller (`listDueTimers`) + recovery (`listIncompleteRuns`). Same name as the TypeORM DDL.
-    index('durable_runs_status_idx').on(t.status, t.wakeAt),
-    // Dashboard `listRuns({ workflow, status })` and the singleton gate's per-workflow scans.
-    index('durable_runs_workflow_status_idx').on(t.workflow, t.status),
-    // Every namespaced poll tick: `namespace = $1 AND status = $2 ORDER BY created_at` (FIFO pick-up).
-    // Name matches the MikroORM adapter + the SQLite drizzle schema so a store swap keeps the index.
-    index('durable_workflow_runs_namespace_status_idx').on(t.namespace, t.status, t.createdAt),
-    // `listRuns({ tag })` compiles to `tags @> '["tag"]'`, which a `jsonb_path_ops` GIN index serves —
-    // this is what keeps the singleton gate (`tag: singleton:<key>`, e.g. a per-tenant concurrency
-    // key) an index probe instead of a scan of every run the workflow ever had.
-    index('durable_runs_tags_gin_idx').using('gin', t.tags.op('jsonb_path_ops')),
-    // Retention (`pruneTerminalRuns`) orders a status set by `updated_at`.
-    index('durable_runs_status_updated_idx').on(t.status, t.updatedAt),
-  ],
-);
+/** Build the durable tables with `table` (`pgTable`, or a `pgSchema(name).table`). */
+function buildDurablePgTables(table: typeof pgTable) {
+  const durableWorkflowRuns = table(
+    'durable_workflow_runs',
+    {
+      id: text('id').primaryKey(),
+      workflow: text('workflow').notNull(),
+      workflowVersion: text('workflow_version').notNull(),
+      status: text('status').notNull(),
+      input: jsonb('input'),
+      output: jsonb('output'),
+      error: jsonb('error'),
+      wakeAt: tstz('wake_at'),
+      lockedBy: text('locked_by'),
+      lockedUntil: tstz('locked_until'),
+      // REMOTE turn the engine suspended on awaiting a decision; matched by completeRemoteDecision so
+      // only the currently-awaited turn's decision is applied. Nullable: cleared when a decision lands.
+      awaitingDecisionTaskId: text('awaiting_decision_task_id'),
+      recoveryAttempts: integer('recovery_attempts'),
+      tags: jsonb('tags').$type<string[]>(),
+      searchAttributes:
+        jsonb('search_attributes').$type<Record<string, string | number | boolean>>(),
+      priority: integer('priority'),
+      // The worker-pool partition (tenant) — THE isolation boundary every poll predicate filters on.
+      // NOT NULL DEFAULT 'default' so a row can never fall outside every worker's namespace.
+      namespace: text('namespace').notNull().default(DEFAULT_NAMESPACE),
+      // Which package declared the workflow. Nullable, no default: NULL = unknown, never guessed.
+      origin: text('origin'),
+      // The customer (tenancy) the run belongs to — not the worker-pool `namespace`. NULL = none.
+      tenantId: text('tenant_id'),
+      tenantKind: text('tenant_kind'),
+      createdAt: tstz('created_at').notNull(),
+      updatedAt: tstz('updated_at').notNull(),
+    },
+    (t) => [
+      // App-facing reads with tenancy on: `tenant_id = $1 ORDER BY created_at DESC`.
+      index('durable_workflow_runs_tenant_idx').on(t.tenantId, t.createdAt),
+      // Timer poller (`listDueTimers`) + recovery (`listIncompleteRuns`). Same name as the TypeORM DDL.
+      index('durable_runs_status_idx').on(t.status, t.wakeAt),
+      // Dashboard `listRuns({ workflow, status })` and the singleton gate's per-workflow scans.
+      index('durable_runs_workflow_status_idx').on(t.workflow, t.status),
+      // Every namespaced poll tick: `namespace = $1 AND status = $2 ORDER BY created_at` (FIFO pick-up).
+      // Name matches the MikroORM adapter + the SQLite drizzle schema so a store swap keeps the index.
+      index('durable_workflow_runs_namespace_status_idx').on(t.namespace, t.status, t.createdAt),
+      // `listRuns({ tag })` compiles to `tags @> '["tag"]'`, which a `jsonb_path_ops` GIN index serves —
+      // this is what keeps the singleton gate (`tag: singleton:<key>`, e.g. a per-tenant concurrency
+      // key) an index probe instead of a scan of every run the workflow ever had.
+      index('durable_runs_tags_gin_idx').using('gin', t.tags.op('jsonb_path_ops')),
+      // Retention (`pruneTerminalRuns`) orders a status set by `updated_at`.
+      index('durable_runs_status_updated_idx').on(t.status, t.updatedAt),
+    ],
+  );
 
-export const durableStepCheckpoints = pgTable(
-  'durable_step_checkpoints',
-  {
-    runId: text('run_id').notNull(),
-    seq: integer('seq').notNull(),
-    name: text('name').notNull(),
-    kind: text('kind').notNull(),
-    stepId: text('step_id').notNull(),
-    status: text('status').notNull(),
-    input: jsonb('input'),
-    output: jsonb('output'),
-    error: jsonb('error'),
-    events: jsonb('events'),
-    attempts: integer('attempts').notNull(),
-    workerGroup: text('worker_group'),
-    parallelGroup: text('parallel_group'),
-    wakeAt: tstz('wake_at'),
-    enqueuedAt: tstz('enqueued_at'),
-    startedAt: tstz('started_at').notNull(),
-    finishedAt: tstz('finished_at').notNull(),
-  },
-  // (run_id, seq) is the primary key, so listCheckpoints / getEvent already hit an index.
-  (t) => [
-    primaryKey({ columns: [t.runId, t.seq] }),
-    // A run detail reads one fan at a time: checkpointStats / queryCheckpoints by group, seq-paged.
-    index('durable_step_checkpoints_group_idx').on(t.runId, t.parallelGroup, t.seq),
-  ],
-);
+  const durableStepCheckpoints = table(
+    'durable_step_checkpoints',
+    {
+      runId: text('run_id').notNull(),
+      seq: integer('seq').notNull(),
+      name: text('name').notNull(),
+      kind: text('kind').notNull(),
+      stepId: text('step_id').notNull(),
+      status: text('status').notNull(),
+      input: jsonb('input'),
+      output: jsonb('output'),
+      error: jsonb('error'),
+      events: jsonb('events'),
+      attempts: integer('attempts').notNull(),
+      workerGroup: text('worker_group'),
+      parallelGroup: text('parallel_group'),
+      wakeAt: tstz('wake_at'),
+      enqueuedAt: tstz('enqueued_at'),
+      startedAt: tstz('started_at').notNull(),
+      finishedAt: tstz('finished_at').notNull(),
+    },
+    // (run_id, seq) is the primary key, so listCheckpoints / getEvent already hit an index.
+    (t) => [
+      primaryKey({ columns: [t.runId, t.seq] }),
+      // A run detail reads one fan at a time: checkpointStats / queryCheckpoints by group, seq-paged.
+      index('durable_step_checkpoints_group_idx').on(t.runId, t.parallelGroup, t.seq),
+    ],
+  );
 
-// Normalized search-attribute side-table: one row per (run, key), so attribute predicates push DOWN
-// into SQL as an EXISTS probe on the (key, value) indexes below instead of scan + in-process filter.
-export const durableRunAttributes = pgTable(
-  'durable_run_attributes',
-  {
-    runId: text('run_id').notNull(),
-    key: text('key').notNull(),
-    strValue: text('str_value'),
-    numValue: doublePrecision('num_value'),
-  },
-  (t) => [
-    primaryKey({ columns: [t.runId, t.key] }),
-    index('durable_run_attributes_num_idx').on(t.key, t.numValue),
-    index('durable_run_attributes_str_idx').on(t.key, t.strValue),
-  ],
-);
+  // Normalized search-attribute side-table: one row per (run, key), so attribute predicates push DOWN
+  // into SQL as an EXISTS probe on the (key, value) indexes below instead of scan + in-process filter.
+  const durableRunAttributes = table(
+    'durable_run_attributes',
+    {
+      runId: text('run_id').notNull(),
+      key: text('key').notNull(),
+      strValue: text('str_value'),
+      numValue: doublePrecision('num_value'),
+    },
+    (t) => [
+      primaryKey({ columns: [t.runId, t.key] }),
+      index('durable_run_attributes_num_idx').on(t.key, t.numValue),
+      index('durable_run_attributes_str_idx').on(t.key, t.strValue),
+    ],
+  );
 
-export const durableSignalWaiters = pgTable(
-  'durable_signal_waiters',
-  {
-    token: text('token').primaryKey(),
-    runId: text('run_id').notNull(),
-    seq: integer('seq').notNull(),
-    parallelGroup: text('parallel_group'),
-  },
-  // deleteRun / pruneTerminalRuns delete a run's waiters by run_id.
-  (t) => [index('durable_signal_waiters_run_id_idx').on(t.runId)],
-);
+  const durableSignalWaiters = table(
+    'durable_signal_waiters',
+    {
+      token: text('token').primaryKey(),
+      runId: text('run_id').notNull(),
+      seq: integer('seq').notNull(),
+      parallelGroup: text('parallel_group'),
+    },
+    // deleteRun / pruneTerminalRuns delete a run's waiters by run_id.
+    (t) => [index('durable_signal_waiters_run_id_idx').on(t.runId)],
+  );
 
-export const durableBufferedSignals = pgTable(
-  'durable_buffered_signals',
-  {
-    id: bigserial('id', { mode: 'number' }).primaryKey(),
-    token: text('token').notNull(),
-    payload: jsonb('payload'),
-  },
-  // Taken FIFO per token (smallest id first).
-  (t) => [index('durable_buffered_signals_token_idx').on(t.token, t.id)],
-);
+  const durableBufferedSignals = table(
+    'durable_buffered_signals',
+    {
+      id: bigserial('id', { mode: 'number' }).primaryKey(),
+      token: text('token').notNull(),
+      payload: jsonb('payload'),
+    },
+    // Taken FIFO per token (smallest id first).
+    (t) => [index('durable_buffered_signals_token_idx').on(t.token, t.id)],
+  );
 
-// A published event that matched no live waiter. Keyed by a caller-minted id (engine.publishEvent)
-// so removeBufferedEvent can target that exact row.
-export const durableBufferedEvents = pgTable(
-  'durable_buffered_events',
-  {
-    id: text('id').primaryKey(),
-    name: text('name').notNull(),
-    payload: jsonb('payload'),
-    publishedAt: tstz('published_at').notNull(),
-  },
-  (t) => [index('durable_buffered_events_name_published_at_idx').on(t.name, t.publishedAt)],
-);
+  // A published event that matched no live waiter. Keyed by a caller-minted id (engine.publishEvent)
+  // so removeBufferedEvent can target that exact row.
+  const durableBufferedEvents = table(
+    'durable_buffered_events',
+    {
+      id: text('id').primaryKey(),
+      name: text('name').notNull(),
+      payload: jsonb('payload'),
+      publishedAt: tstz('published_at').notNull(),
+    },
+    (t) => [index('durable_buffered_events_name_published_at_idx').on(t.name, t.publishedAt)],
+  );
 
-// Signal dedupe ids (`engine.signal(token, payload, { id })`): one row per (token, signal_id),
-// deduplicating until `expires_at`. Expired rows are ignored by `claimSignalId` and swept.
-export const durableSignalIds = pgTable(
-  'durable_signal_ids',
-  {
-    token: text('token').notNull(),
-    signalId: text('signal_id').notNull(),
-    expiresAt: tstz('expires_at').notNull(),
-  },
-  (t) => [
-    primaryKey({ columns: [t.token, t.signalId] }),
-    index('durable_signal_ids_expires_at_idx').on(t.expiresAt),
-  ],
-);
+  // Signal dedupe ids (`engine.signal(token, payload, { id })`): one row per (token, signal_id),
+  // deduplicating until `expires_at`. Expired rows are ignored by `claimSignalId` and swept.
+  const durableSignalIds = table(
+    'durable_signal_ids',
+    {
+      token: text('token').notNull(),
+      signalId: text('signal_id').notNull(),
+      expiresAt: tstz('expires_at').notNull(),
+    },
+    (t) => [
+      primaryKey({ columns: [t.token, t.signalId] }),
+      index('durable_signal_ids_expires_at_idx').on(t.expiresAt),
+    ],
+  );
 
-// Persisted schedules (`engine.schedules`): the store filters on the columns; `spec`/`state` are
-// engine-owned JSON documents it keeps verbatim.
-export const durableSchedules = pgTable(
-  'durable_schedules',
-  {
-    id: text('id').primaryKey(),
-    namespace: text('namespace').notNull().default(DEFAULT_NAMESPACE),
-    workflow: text('workflow').notNull(),
-    paused: boolean('paused').notNull().default(false),
-    nextFireAt: tstz('next_fire_at'),
-    tags: jsonb('tags').$type<string[]>(),
-    spec: jsonb('spec').$type<Record<string, unknown>>().notNull(),
-    state: jsonb('state').$type<Record<string, unknown>>().notNull(),
-    // The customer the schedule (and every run it starts) belongs to. NULL = none.
-    tenantId: text('tenant_id'),
-    tenantKind: text('tenant_kind'),
-    createdAt: tstz('created_at').notNull(),
-    updatedAt: tstz('updated_at').notNull(),
-  },
-  // The poll's "due by T" scan: `paused = false AND next_fire_at <= T ORDER BY next_fire_at`.
-  (t) => [
-    index('durable_schedules_due_idx').on(t.paused, t.nextFireAt),
-    index('durable_schedules_tenant_idx').on(t.tenantId),
-  ],
-);
+  // Persisted schedules (`engine.schedules`): the store filters on the columns; `spec`/`state` are
+  // engine-owned JSON documents it keeps verbatim.
+  const durableSchedules = table(
+    'durable_schedules',
+    {
+      id: text('id').primaryKey(),
+      namespace: text('namespace').notNull().default(DEFAULT_NAMESPACE),
+      workflow: text('workflow').notNull(),
+      paused: boolean('paused').notNull().default(false),
+      nextFireAt: tstz('next_fire_at'),
+      tags: jsonb('tags').$type<string[]>(),
+      spec: jsonb('spec').$type<Record<string, unknown>>().notNull(),
+      state: jsonb('state').$type<Record<string, unknown>>().notNull(),
+      // The customer the schedule (and every run it starts) belongs to. NULL = none.
+      tenantId: text('tenant_id'),
+      tenantKind: text('tenant_kind'),
+      createdAt: tstz('created_at').notNull(),
+      updatedAt: tstz('updated_at').notNull(),
+    },
+    // The poll's "due by T" scan: `paused = false AND next_fire_at <= T ORDER BY next_fire_at`.
+    (t) => [
+      index('durable_schedules_due_idx').on(t.paused, t.nextFireAt),
+      index('durable_schedules_tenant_idx').on(t.tenantId),
+    ],
+  );
+
+  return {
+    durableWorkflowRuns,
+    durableStepCheckpoints,
+    durableRunAttributes,
+    durableSignalWaiters,
+    durableBufferedSignals,
+    durableBufferedEvents,
+    durableSignalIds,
+    durableSchedules,
+  };
+}
 
 /**
  * Every durable table, keyed by the name to export it under. Spread into your drizzle-kit schema file
  * (`export const { durableWorkflowRuns, ... } = durablePgSchema;` or `export * from` the `/pg` entry)
  * so `drizzle-kit generate` emits the durable DDL alongside your own tables.
  */
-export const durablePgSchema = {
+export const durablePgSchema = buildDurablePgTables(pgTable);
+
+/** The durable tables, as {@link durablePgTables} returns them. */
+export type DurablePgTables = typeof durablePgSchema;
+
+export const {
   durableWorkflowRuns,
   durableStepCheckpoints,
   durableRunAttributes,
@@ -218,7 +239,48 @@ export const durablePgSchema = {
   durableBufferedEvents,
   durableSignalIds,
   durableSchedules,
-};
+} = durablePgSchema;
+
+/** Postgres identifiers are at most 63 bytes; the name is written into every statement, quoted. */
+const SCHEMA_NAME = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+
+/**
+ * Validate a durable `schema` option: an identifier of at most 63 characters. Returns it, or
+ * `undefined` when none is set.
+ */
+export function durableSchemaName(schema: string | undefined): string | undefined {
+  if (schema === undefined) return undefined;
+  if (!SCHEMA_NAME.test(schema) || schema.length > 63) {
+    throw new Error(
+      `[nestjs-durable] invalid schema ${JSON.stringify(schema)}: use letters, digits, _ or $ (not first), at most 63 characters.`,
+    );
+  }
+  return schema;
+}
+
+const tablesBySchema = new Map<string, DurablePgTables>();
+
+/**
+ * The durable tables in the Postgres schema `schema` (`pgSchema(schema).table(...)`), or the
+ * unqualified {@link durablePgSchema} when `schema` is `undefined`. The same object comes back for
+ * the same name. Spread the result into your drizzle-kit schema file, next to an exported
+ * `pgSchema(schema)`, so `drizzle-kit generate` creates the schema and the tables in it:
+ *
+ * ```ts
+ * export const durable = pgSchema('durable');
+ * export const { durableWorkflowRuns, durableStepCheckpoints, ... } = durablePgTables('durable');
+ * ```
+ */
+export function durablePgTables(schema?: string): DurablePgTables {
+  const name = durableSchemaName(schema);
+  if (name === undefined) return durablePgSchema;
+  let tables = tablesBySchema.get(name);
+  if (!tables) {
+    tables = buildDurablePgTables(pgSchema(name).table as unknown as typeof pgTable);
+    tablesBySchema.set(name, tables);
+  }
+  return tables;
+}
 
 /**
  * The durable table names, derived from {@link durablePgSchema} (one list, never drifts). Feed to a

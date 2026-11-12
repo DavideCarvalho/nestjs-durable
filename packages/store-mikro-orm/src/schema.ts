@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { MikroORM } from '@mikro-orm/core';
+import { WorkflowRunEntity, durableSchemaName } from './entities';
 
 /**
  * The tables this store owns. Kept in sync with the `tableName`s in `./entities`. Used to scope
@@ -68,6 +69,12 @@ export interface EnsureMikroOrmDurableSchemaOptions {
   /** Sink for the schema-repair warning. Defaults to `console`. */
   logger?: DurableSchemaLogger | undefined;
   /**
+   * The schema (Postgres) or database (MySQL) of the durable tables. Defaults to the one the
+   * registered `durableEntities({ schema })` carry; when set, it must match them. Created when
+   * missing.
+   */
+  schema?: string | undefined;
+  /**
    * MySQL only: the largest estimated row count (`information_schema.tables.table_rows`) of an
    * existing durable table on which the boot-time heal will run a column TYPE change. MySQL runs a
    * type change (e.g. `datetime` -> `datetime(6)`) as a full table copy that blocks writes until it
@@ -126,6 +133,9 @@ export function mikroOrmSchemaRepairWarning(repairs: readonly string[]): string 
   ].join(' ');
 }
 
+/** `alter table <table> ` (the table optionally schema-qualified), to strip from an alter's actions. */
+const ALTER_TABLE_PREFIX = /^alter\s+table\s+(?:[`"']?[\w$]+[`"']?\.)?[`"']?[\w$]+[`"']?\s*/i;
+
 /** Strip identifier quotes (`"x"`, `` `x` ``, `'x'`) from a DDL token. */
 function unquote(identifier: string): string {
   return identifier.replace(/^[`"']|[`"']$/g, '');
@@ -147,9 +157,7 @@ function describeDurableStatement(statement: string): string[] {
     const out: string[] = [];
     let other = false;
     // Split the alter's comma-separated actions at top level (a column type may carry `(10,2)`).
-    for (const action of splitTopLevel(
-      statement.replace(/^alter\s+table\s+[`"']?[\w$]+[`"']?\s*/i, ''),
-    )) {
+    for (const action of splitTopLevel(statement.replace(ALTER_TABLE_PREFIX, ''))) {
       const index = action.match(
         /^add\s+(?:unique\s+|fulltext\s+)?(?:index|key)\s+([`"']?[\w$]+[`"']?)/i,
       );
@@ -168,6 +176,17 @@ function describeDurableStatement(statement: string): string[] {
     return out;
   }
   return [`ran ${statement.replace(/\s+/g, ' ').slice(0, 160)}`];
+}
+
+/**
+ * Whether a durable-table statement targets the durable schema: a statement on a same-named table in
+ * another schema (the app's own `durable_*` copy, another install) is never ours to run.
+ */
+function inDurableSchema(statement: string, where: DurableLocation): boolean {
+  const match = statement.match(
+    /^(?:create\s+(?:unique\s+)?index\s+.+?\s+on\s+|(?:create|alter)\s+table\s+(?:if\s+not\s+exists\s+)?)(?:[`"']?([\w$]+)[`"']?\.)?[`"']?[\w$]+[`"']?/i,
+  );
+  return match?.[1] === where.schema;
 }
 
 /** Split on commas that are not inside parentheses or quotes. */
@@ -216,8 +235,9 @@ function compareStrings(a: string, b: string): number {
  * second form those index statements would be dropped by the durable-table filter and never applied.
  */
 function targetTable(statement: string): string | undefined {
+  // The table may be schema-qualified (`"durable"."durable_workflow_runs"`): skip the schema part.
   const match = statement.match(
-    /^(?:create\s+(?:unique\s+)?index\s+.+?\s+on\s+|(?:create|alter)\s+table\s+(?:if\s+not\s+exists\s+)?)[`"']?([\w$]+)[`"']?/i,
+    /^(?:create\s+(?:unique\s+)?index\s+.+?\s+on\s+|(?:create|alter)\s+table\s+(?:if\s+not\s+exists\s+)?)(?:[`"']?[\w$]+[`"']?\.)?[`"']?([\w$]+)[`"']?/i,
   );
   return match?.[1]?.toLowerCase();
 }
@@ -306,16 +326,99 @@ function canonicalize(value: JsonValue): string {
   return JSON.stringify(value);
 }
 
+/**
+ * Where the durable tables live: the schema (Postgres) or database (MySQL) the registered entities
+ * carry (`durableEntities({ schema })`), the quoting of the dialect, and the qualified marker table.
+ * `schema` is `undefined` for unqualified tables (every name exactly as before).
+ */
+interface DurableLocation {
+  schema: string | undefined;
+  quote: (id: string) => string;
+  marker: string;
+}
+
+/**
+ * The schema (Postgres) or database (MySQL) the durable tables live in, read from the registered
+ * entities, or `undefined` when they are unqualified. A `configured` schema (the store's `schema`
+ * option) must match the entities, and SQLite takes none.
+ */
+export function durableTableSchema(
+  orm: MikroORM,
+  configured?: string | undefined,
+): string | undefined {
+  const wanted = durableSchemaName(configured);
+  const runs = [...orm.getMetadata().getAll().values()].find(
+    (meta) => meta.class === WorkflowRunEntity || meta.tableName === 'durable_workflow_runs',
+  );
+  const metaSchema = runs?.schema;
+  const registered = metaSchema && metaSchema !== '*' ? metaSchema : undefined;
+  const schema = wanted ?? registered;
+  if (schema !== undefined && detectSqlDialect(orm) === 'sqlite') {
+    throw new Error(
+      `[nestjs-durable] store-mikro-orm: the schema option (${JSON.stringify(schema)}) is not supported on SQLite, which has no schemas. Remove it from the store options and from durableEntities().`,
+    );
+  }
+  if (wanted !== undefined && wanted !== registered) {
+    throw new Error(
+      `[nestjs-durable] store-mikro-orm: the store's schema is ${JSON.stringify(wanted)}, but the durable entities were registered ${registered === undefined ? 'without one' : `with ${JSON.stringify(registered)}`}. Register durableEntities({ schema: ${JSON.stringify(wanted)} }) in your MikroORM config.`,
+    );
+  }
+  return schema;
+}
+
+function durableLocation(orm: MikroORM, configured: string | undefined): DurableLocation {
+  const schema = durableTableSchema(orm, configured);
+  const platform = orm.em.getPlatform();
+  const quote = (id: string) => platform.quoteIdentifier(id);
+  return {
+    schema,
+    quote,
+    marker: schema === undefined ? MARKER_TABLE : `${quote(schema)}.${quote(MARKER_TABLE)}`,
+  };
+}
+
+/**
+ * Create the durable schema (Postgres) or database (MySQL) when it does not exist yet. Checked first,
+ * because `CREATE SCHEMA IF NOT EXISTS` needs the CREATE privilege even when the schema exists.
+ */
+async function createSchemaIfMissing(
+  orm: MikroORM,
+  dialect: SqlDialect,
+  where: DurableLocation,
+): Promise<void> {
+  if (where.schema === undefined) return;
+  const connection = orm.em.getConnection();
+  const rows = (await connection.execute(
+    dialect === 'mysql'
+      ? 'select 1 as found from information_schema.schemata where schema_name = ?'
+      : 'select 1 as found from pg_namespace where nspname = ?',
+    [where.schema],
+  )) as unknown[];
+  if (rows.length > 0) return;
+  const kind = dialect === 'mysql' ? 'database' : 'schema';
+  try {
+    await connection.execute(`create ${kind} if not exists ${where.quote(where.schema)}`);
+  } catch (err) {
+    throw new Error(
+      `[nestjs-durable] store-mikro-orm could not create the ${kind} "${where.schema}" for the durable tables. Create it ahead of time, or grant this role ${dialect === 'mysql' ? 'CREATE' : 'CREATE on the database (GRANT CREATE ON DATABASE <db> TO <role>)'}. Cause: ${(err as Error).message}`,
+      { cause: err },
+    );
+  }
+}
+
 /** `CREATE TABLE IF NOT EXISTS` for the marker — portable across MySQL/Postgres/SQLite, no introspection. */
-function createMarkerTableSql(): string {
-  return `create table if not exists ${MARKER_TABLE} (id varchar(32) not null primary key, fingerprint varchar(64) not null, applied_at bigint not null)`;
+function createMarkerTableSql(marker: string): string {
+  return `create table if not exists ${marker} (id varchar(32) not null primary key, fingerprint varchar(64) not null, applied_at bigint not null)`;
 }
 
 /** Read the single marker row's fingerprint (one PK lookup), or undefined when the row is absent. */
-async function readStoredFingerprint(orm: MikroORM): Promise<string | undefined> {
+async function readStoredFingerprint(
+  orm: MikroORM,
+  where: DurableLocation,
+): Promise<string | undefined> {
   const rows: Array<{ fingerprint?: string | null }> = await orm.em
     .getConnection()
-    .execute(`select fingerprint from ${MARKER_TABLE} where id = ?`, [MARKER_ROW_ID]);
+    .execute(`select fingerprint from ${where.marker} where id = ?`, [MARKER_ROW_ID]);
   return rows[0]?.fingerprint ?? undefined;
 }
 
@@ -324,11 +427,12 @@ async function writeFingerprint(
   orm: MikroORM,
   dialect: SqlDialect,
   fingerprint: string,
+  where: DurableLocation,
 ): Promise<void> {
   const upsert =
     dialect === 'mysql'
-      ? `insert into ${MARKER_TABLE} (id, fingerprint, applied_at) values (?, ?, ?) on duplicate key update fingerprint = values(fingerprint), applied_at = values(applied_at)`
-      : `insert into ${MARKER_TABLE} (id, fingerprint, applied_at) values (?, ?, ?) on conflict (id) do update set fingerprint = excluded.fingerprint, applied_at = excluded.applied_at`;
+      ? `insert into ${where.marker} (id, fingerprint, applied_at) values (?, ?, ?) on duplicate key update fingerprint = values(fingerprint), applied_at = values(applied_at)`
+      : `insert into ${where.marker} (id, fingerprint, applied_at) values (?, ?, ?) on conflict (id) do update set fingerprint = excluded.fingerprint, applied_at = excluded.applied_at`;
   await orm.em.getConnection().execute(upsert, [MARKER_ROW_ID, fingerprint, Date.now()]);
 }
 
@@ -338,14 +442,22 @@ async function writeFingerprint(
  * unsupported, timed out, permission denied — is warned and swallowed so the heal still proceeds; the
  * heal itself is idempotent (additive DDL + a re-check of the fingerprint after acquiring).
  */
-async function acquireSchemaLock(orm: MikroORM, dialect: SqlDialect): Promise<void> {
+/** The heal's lock name: two installs in two schemas of one database heal independently. */
+function schemaLockName(where: DurableLocation): string {
+  return where.schema === undefined ? SCHEMA_LOCK_NAME : `${SCHEMA_LOCK_NAME}:${where.schema}`;
+}
+
+async function acquireSchemaLock(
+  orm: MikroORM,
+  dialect: SqlDialect,
+  where: DurableLocation,
+): Promise<void> {
+  const name = schemaLockName(where);
   try {
     if (dialect === 'mysql') {
-      await orm.em.getConnection().execute(`select get_lock('${SCHEMA_LOCK_NAME}', 10)`);
+      await orm.em.getConnection().execute(`select get_lock('${name}', 10)`);
     } else if (dialect === 'postgres') {
-      await orm.em
-        .getConnection()
-        .execute(`select pg_advisory_lock(hashtext('${SCHEMA_LOCK_NAME}'))`);
+      await orm.em.getConnection().execute(`select pg_advisory_lock(hashtext('${name}'))`);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -356,14 +468,17 @@ async function acquireSchemaLock(orm: MikroORM, dialect: SqlDialect): Promise<vo
 }
 
 /** Release the advisory lock acquired by {@link acquireSchemaLock} (best-effort, never throws). */
-async function releaseSchemaLock(orm: MikroORM, dialect: SqlDialect): Promise<void> {
+async function releaseSchemaLock(
+  orm: MikroORM,
+  dialect: SqlDialect,
+  where: DurableLocation,
+): Promise<void> {
+  const name = schemaLockName(where);
   try {
     if (dialect === 'mysql') {
-      await orm.em.getConnection().execute(`select release_lock('${SCHEMA_LOCK_NAME}')`);
+      await orm.em.getConnection().execute(`select release_lock('${name}')`);
     } else if (dialect === 'postgres') {
-      await orm.em
-        .getConnection()
-        .execute(`select pg_advisory_unlock(hashtext('${SCHEMA_LOCK_NAME}'))`);
+      await orm.em.getConnection().execute(`select pg_advisory_unlock(hashtext('${name}'))`);
     }
   } catch {
     // Releasing a lock we may never have held (acquire was best-effort) must not crash boot.
@@ -410,14 +525,17 @@ export async function ensureMikroOrmDurableSchema(
 ): Promise<void> {
   const logger = options.logger ?? console;
   const dialect = detectSqlDialect(orm);
+  const where = durableLocation(orm, options.schema);
 
-  // 1. Bootstrap the marker table. Idempotent, no introspection — works on a brand-new empty DB,
-  //    which is what makes the fresh-DB / CI path zero-config.
-  await orm.em.getConnection().execute(createMarkerTableSql());
+  // 1. Bootstrap the marker table (in the durable schema, created first when one is set). Idempotent,
+  //    no introspection — works on a brand-new empty DB, which is what makes the fresh-DB / CI path
+  //    zero-config.
+  await createSchemaIfMissing(orm, dialect, where);
+  await orm.em.getConnection().execute(createMarkerTableSql(where.marker));
 
   // 2. Compare the in-memory expected fingerprint against the stored one (a single PK read).
   const expected = computeExpectedFingerprint(orm, DURABLE_TABLE_NAMES);
-  const stored = await readStoredFingerprint(orm);
+  const stored = await readStoredFingerprint(orm, where);
 
   // 3. Steady-state hot path: nothing changed → skip getUpdateSchemaSQL AND alignDurableCollation.
   if (stored === expected) {
@@ -425,20 +543,20 @@ export async function ensureMikroOrmDurableSchema(
   }
 
   // 4. Heal under a best-effort cross-pod lock; re-check after acquiring in case a peer healed first.
-  await acquireSchemaLock(orm, dialect);
+  await acquireSchemaLock(orm, dialect, where);
   try {
-    if ((await readStoredFingerprint(orm)) === expected) {
+    if ((await readStoredFingerprint(orm, where)) === expected) {
       return;
     }
     const limit = options.blockingAlterRowLimit ?? DEFAULT_BLOCKING_ALTER_ROW_LIMIT;
-    const { repairs, freshInstall, deferred } = await healDurableSchema(orm, dialect, limit);
+    const { repairs, freshInstall, deferred } = await healDurableSchema(orm, dialect, limit, where);
     // A deferred statement leaves the schema behind the metadata: keep the marker stale so the next
     // boot re-checks (and applies it, once the table is small enough or the operator ran it).
-    if (deferred.length === 0) await writeFingerprint(orm, dialect, expected);
+    if (deferred.length === 0) await writeFingerprint(orm, dialect, expected, where);
     if (repairs.length > 0 && !freshInstall) logger.warn(mikroOrmSchemaRepairWarning(repairs));
     if (deferred.length > 0) logger.warn(mikroOrmDeferredAlterWarning(deferred, limit));
   } finally {
-    await releaseSchemaLock(orm, dialect);
+    await releaseSchemaLock(orm, dialect, where);
   }
 }
 
@@ -452,20 +570,28 @@ async function healDurableSchema(
   orm: MikroORM,
   dialect: SqlDialect,
   blockingAlterRowLimit: number,
+  where: DurableLocation,
 ): Promise<{
   repairs: string[];
   freshInstall: boolean;
   deferred: Array<{ table: string; rows: number; statement: string }>;
 }> {
   const sql = await orm.schema.getUpdateSchemaSQL({ safe: true });
+  const diff = sql
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter((statement) => {
+      const table = targetTable(statement);
+      return (
+        table !== undefined && DURABLE_TABLE_NAMES.has(table) && inDurableSchema(statement, where)
+      );
+    });
+  // MikroORM introspects only the connection's own database on MySQL, so for tables in another
+  // database its diff always says "create everything": narrow it against that database's catalog.
   const ours = mergeColumnTypeChanges(
-    sql
-      .split(';')
-      .map((statement) => statement.trim())
-      .filter((statement) => {
-        const table = targetTable(statement);
-        return table !== undefined && DURABLE_TABLE_NAMES.has(table);
-      }),
+    dialect === 'mysql' && where.schema !== undefined
+      ? await narrowMysqlSchemaDiff(orm, where.schema, diff)
+      : diff,
   );
   const connection = orm.em.getConnection();
   // Tables this heal creates: their indexes come with them, so they are not listed one by one.
@@ -479,7 +605,7 @@ async function healDurableSchema(
   for (const statement of ours) {
     const table = targetTable(statement) as string;
     if (dialect === 'mysql' && !created.has(table) && isColumnTypeChange(statement)) {
-      const rows = await estimatedRowCount(orm, table);
+      const rows = await estimatedRowCount(orm, table, where);
       if (rows > blockingAlterRowLimit) {
         deferred.push({ table, rows, statement });
         continue;
@@ -508,12 +634,65 @@ async function healDurableSchema(
   }
 
   // Converge collation last, once the tables exist (whether just created above or pre-existing).
-  const converted = await alignDurableCollation(orm);
+  const converted = await alignDurableCollation(orm, where);
   for (const { table, from, to } of converted) {
     if (!created.has(table)) repairs.push(`converted ${table} collation from ${from} to ${to}`);
   }
   const freshInstall = [...DURABLE_TABLE_NAMES].every((table) => created.has(table));
   return { repairs, freshInstall, deferred };
+}
+
+/**
+ * MySQL with a `schema` (a database other than the connection's): MikroORM's diff cannot see the
+ * tables there, so it holds a `create table` and an `add index` for every durable table. Keep what
+ * the database actually lacks: a missing table's statements as they are, an `add column` for each
+ * column of an existing table that is missing (its definition taken from the `create table`), and
+ * each missing index.
+ */
+async function narrowMysqlSchemaDiff(
+  orm: MikroORM,
+  schema: string,
+  diff: string[],
+): Promise<string[]> {
+  const connection = orm.em.getConnection();
+  const columns = (await connection.execute(
+    'select table_name as table_name, column_name as column_name from information_schema.columns where table_schema = ?',
+    [schema],
+  )) as Array<{ table_name: string; column_name: string }>;
+  const indexes = (await connection.execute(
+    'select distinct table_name as table_name, index_name as index_name from information_schema.statistics where table_schema = ?',
+    [schema],
+  )) as Array<{ table_name: string; index_name: string }>;
+  const tables = new Set(columns.map((c) => c.table_name.toLowerCase()));
+  const hasColumn = new Set(columns.map((c) => `${c.table_name}.${c.column_name}`.toLowerCase()));
+  const hasIndex = new Set(indexes.map((i) => `${i.table_name}.${i.index_name}`.toLowerCase()));
+  const out: string[] = [];
+  for (const statement of diff) {
+    const table = targetTable(statement) as string;
+    if (!tables.has(table)) {
+      out.push(statement);
+      continue;
+    }
+    if (/^create\s+table\b/i.test(statement)) {
+      const open = statement.indexOf('(');
+      const close = statement.lastIndexOf(')');
+      const prefix = statement
+        .slice(0, open)
+        .replace(/^create\s+table\s+/i, '')
+        .trim();
+      for (const definition of splitTopLevel(statement.slice(open + 1, close))) {
+        const column = definition.match(/^[`"]([^`"]+)[`"]\s/);
+        if (column?.[1] && !hasColumn.has(`${table}.${column[1]}`.toLowerCase()))
+          out.push(`alter table ${prefix} add column ${definition}`);
+      }
+      continue;
+    }
+    const index = statement.match(
+      /\badd\s+(?:unique\s+|fulltext\s+)?(?:index|key)\s+[`"]([^`"]+)[`"]/i,
+    );
+    if (index?.[1] && !hasIndex.has(`${table}.${index[1]}`.toLowerCase())) out.push(statement);
+  }
+  return out;
 }
 
 /**
@@ -530,7 +709,7 @@ function mergeColumnTypeChanges(statements: string[]): string[] {
       merged.push(statement);
       continue;
     }
-    const actions = statement.replace(/^alter\s+table\s+[`"']?[\w$]+[`"']?\s*/i, '');
+    const actions = statement.replace(ALTER_TABLE_PREFIX, '');
     const index = at.get(table);
     if (index === undefined) {
       at.set(table, merged.length);
@@ -545,17 +724,21 @@ function mergeColumnTypeChanges(statements: string[]): string[] {
 /** An `alter table` whose every action is a MySQL `modify` (a column type/nullability change). */
 function isColumnTypeChange(statement: string): boolean {
   if (!/^alter\s+table\b/i.test(statement)) return false;
-  const actions = splitTopLevel(statement.replace(/^alter\s+table\s+[`"']?[\w$]+[`"']?\s*/i, ''));
+  const actions = splitTopLevel(statement.replace(ALTER_TABLE_PREFIX, ''));
   return actions.length > 0 && actions.every((action) => /^modify\b/i.test(action));
 }
 
 /** InnoDB's row estimate for `table` (cheap: no scan). 0 when unknown. */
-async function estimatedRowCount(orm: MikroORM, table: string): Promise<number> {
+async function estimatedRowCount(
+  orm: MikroORM,
+  table: string,
+  where: DurableLocation,
+): Promise<number> {
   const rows: Array<{ table_rows?: number | string | null }> = await orm.em
     .getConnection()
     .execute(
-      'select table_rows as table_rows from information_schema.tables where table_schema = database() and table_name = ? limit 1',
-      [table],
+      `select table_rows as table_rows from information_schema.tables where table_schema = ${where.schema === undefined ? 'database()' : '?'} and table_name = ? limit 1`,
+      where.schema === undefined ? [table] : [where.schema, table],
     );
   return Number(rows[0]?.table_rows ?? 0);
 }
@@ -580,6 +763,7 @@ function isSafeSqlIdentifier(value: string): boolean {
  */
 async function alignDurableCollation(
   orm: MikroORM,
+  where: DurableLocation,
 ): Promise<Array<{ table: string; from: string; to: string }>> {
   const converted: Array<{ table: string; from: string; to: string }> = [];
   const platform = String(orm.em.getPlatform().constructor.name).toLowerCase();
@@ -599,8 +783,8 @@ async function alignDurableCollation(
   for (const table of DURABLE_TABLE_NAMES) {
     try {
       const rows = (await connection.execute(
-        'select table_collation as collation from information_schema.tables where table_schema = database() and table_name = ? limit 1',
-        [table],
+        `select table_collation as collation from information_schema.tables where table_schema = ${where.schema === undefined ? 'database()' : '?'} and table_name = ? limit 1`,
+        where.schema === undefined ? [table] : [where.schema, table],
       )) as Array<{ collation?: string | null }>;
       const current = rows[0]?.collation;
       // Table absent (nothing to align) or already at the target collation — skip.
@@ -608,7 +792,7 @@ async function alignDurableCollation(
         continue;
       }
       await connection.execute(
-        `alter table \`${table}\` convert to character set ${charset} collate ${collate}`,
+        `alter table ${where.schema === undefined ? `\`${table}\`` : `${where.quote(where.schema)}.${where.quote(table)}`} convert to character set ${charset} collate ${collate}`,
       );
       converted.push({ table, from: current, to: collate });
     } catch (err) {
