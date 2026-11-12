@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-telescope
 
+## 0.10.2
+
+### Patch Changes
+
+- [#454](https://github.com/DavideCarvalho/nestjs-durable/pull/454) [`e6bf57a`](https://github.com/DavideCarvalho/nestjs-durable/commit/e6bf57add076586f7ef10aa967c874025019ade5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Accept `@dudousxd/nestjs-telescope` 3.x as a peer (tested against 3.0.0).
+
 ## 0.10.1
 
 ### Patch Changes
