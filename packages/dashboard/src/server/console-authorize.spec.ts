@@ -24,7 +24,7 @@ import {
   type ConsoleAuthorizer,
   UseConsoleAuthorize,
   authorizeByToken,
-  normalizeConsoleDecision,
+  normalizeConsoleResult,
   resolveConsoleAuthorize,
 } from './console-authorize.js';
 import { DurableApiControllerBase } from './durable-api.controller.js';
@@ -124,10 +124,10 @@ describe('resolveConsoleAuthorize: result shapes', () => {
 });
 
 describe('denials are fresh objects', () => {
-  it('normalizeConsoleDecision never returns a shared object', () => {
+  it('normalizeConsoleResult never returns a shared object', () => {
     for (const result of [true, false, { allowed: false, reason: 'unauthenticated' }] as const) {
-      const first = normalizeConsoleDecision(result);
-      expect(normalizeConsoleDecision(result)).not.toBe(first);
+      const first = normalizeConsoleResult(result);
+      expect(normalizeConsoleResult(result)).not.toBe(first);
     }
   });
 

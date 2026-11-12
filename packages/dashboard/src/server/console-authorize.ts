@@ -104,7 +104,7 @@ function isLazyModule(value: unknown): value is { default: ConsoleAuthorizerClas
 }
 
 /** Turns any {@link ConsoleAuthorizeResult} into a {@link ConsoleDecision}. */
-export function normalizeConsoleDecision(result: unknown): ConsoleDecision {
+export function normalizeConsoleResult(result: unknown): ConsoleDecision {
   if (result === true) return allow();
   if (typeof result !== 'object' || result === null) return forbidden();
   const shape = result as { allowed?: unknown; reason?: unknown; redirectTo?: unknown };
@@ -181,7 +181,7 @@ function gateDecider(name: string, moduleRef: ModuleRef): ConsoleDecide {
   }
   return async (context) => {
     const gate = moduleRef.get<ConsoleGate>(CONSOLE_GATE, { strict: false });
-    return normalizeConsoleDecision(await gate.allows(name, context));
+    return normalizeConsoleResult(await gate.allows(name, context));
   };
 }
 
@@ -206,7 +206,7 @@ function classDecider(moduleRef: ModuleRef): (Class: ConsoleAuthorizerClass) => 
     return pending;
   };
   return (Class) => async (context) =>
-    normalizeConsoleDecision(await (await instanceOf(Class)).authorize(context));
+    normalizeConsoleResult(await (await instanceOf(Class)).authorize(context));
 }
 
 /**
@@ -243,7 +243,7 @@ export async function resolveConsoleAuthorize(
     decide = async (context) => {
       if (lazy) return lazy(context);
       const result = await fn(context);
-      if (!isLazyModule(result)) return normalizeConsoleDecision(result);
+      if (!isLazyModule(result)) return normalizeConsoleResult(result);
       // A lazy import: remember the class, so the import runs once per registration.
       lazy = fromClass(result.default);
       return lazy(context);
@@ -309,7 +309,7 @@ export const ConsolePage = (): ClassDecorator => (target) => {
  * The denial the guard throws. An `HttpException` with the JSON body, so it still answers correctly
  * where {@link ConsoleAuthorizeFilter} is not applied; the filter adds the page answers.
  */
-export class ConsoleAccessDeniedException extends HttpException {
+export class ConsoleAccessDenied extends HttpException {
   constructor(
     readonly decision: Extract<ConsoleDecision, { allowed: false }>,
     readonly page: boolean,
@@ -334,7 +334,7 @@ export class ConsoleAuthorizeGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const decision = await this.decide(context);
     if (decision.allowed) return true;
-    throw new ConsoleAccessDeniedException(decision, isPageNavigation(context));
+    throw new ConsoleAccessDenied(decision, isPageNavigation(context));
   }
 }
 
@@ -354,11 +354,11 @@ const consolePage = (title: string, message: string): string =>
 const DENIED_PAGE = consolePage('Access denied', 'You do not have access to this console.');
 const SIGN_IN_PAGE = consolePage('Sign in required', 'Sign in to open this console.');
 
-@Catch(ConsoleAccessDeniedException)
+@Catch(ConsoleAccessDenied)
 export class ConsoleAuthorizeFilter implements ExceptionFilter {
   constructor(private readonly adapterHost: HttpAdapterHost) {}
 
-  catch(exception: ConsoleAccessDeniedException, host: ArgumentsHost): void {
+  catch(exception: ConsoleAccessDenied, host: ArgumentsHost): void {
     const adapter = this.adapterHost.httpAdapter;
     const response = host.switchToHttp().getResponse();
     const { decision, page } = exception;
