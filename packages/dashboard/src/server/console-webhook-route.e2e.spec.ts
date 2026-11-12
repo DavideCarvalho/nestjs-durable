@@ -63,12 +63,11 @@ async function boot(dashboard: DynamicModule, controllers: Type[] = []) {
   @Module({
     providers: [
       { provide: RunGateway, useValue: gateway },
-      { provide: RunGateway, useValue: gateway },
       { provide: STATE_STORE_CANONICAL, useValue: store },
       { provide: WorkflowEngine, useValue: engine },
       CountingGuard,
     ],
-    exports: [RunGateway, RunGateway, STATE_STORE_CANONICAL, WorkflowEngine, CountingGuard],
+    exports: [RunGateway, STATE_STORE_CANONICAL, WorkflowEngine, CountingGuard],
   })
   class HostDurableModule {}
 
