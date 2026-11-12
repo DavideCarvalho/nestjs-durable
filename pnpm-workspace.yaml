@@ -26,6 +26,7 @@ minimumReleaseAgeExclude:
   - '@nestjs/outbox@0.1.4'
   - '@nestjs/workflows@0.0.5'
 overrides:
-  # @dudousxd/nestjs-telescope 3.x pins better-sqlite3 11.10.0, which neither ships a prebuild for
-  # nor compiles on Node 26. Drop this once the devDependency is on a telescope release with 12.x.
+  # Every @dudousxd/nestjs-telescope release up to 3.3.0 (this repo installs 1.29.1 and 3.0.0) pins
+  # better-sqlite3 11.10.0, which neither ships a prebuild for nor compiles on Node 26. Drop this once
+  # the devDependency is on a telescope release with better-sqlite3 12.
   '@dudousxd/nestjs-telescope>better-sqlite3': 12.11.1
