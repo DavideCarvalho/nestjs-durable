@@ -5,7 +5,7 @@ import { defineConfig } from 'tsup';
 // The ESM and CJS configs build in parallel, and tsup's DTS step deletes every `.d.*` in `outDir`
 // when `clean` is set, so a cleaning config can remove the other's `index.d.cts` after it was
 // written. Clean once, here, before either build starts.
-rmSync('dist', { recursive: true, force: true });
+rmSync(new URL('./dist/', import.meta.url), { recursive: true, force: true });
 
 export default defineConfig([
   {
