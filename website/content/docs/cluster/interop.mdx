@@ -41,7 +41,7 @@ where `P` is the effective prefix and the routing `token` is `<name>@<tenant>` w
 
    ```ts
    DurableModule.forRoot({
-     topology: { role: 'control-plane' },
+     topology: 'control-plane',
      store,
      transport: new BullMQTransport({ connection: { host: '127.0.0.1', port: 6379 } }),
    })

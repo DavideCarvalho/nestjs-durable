@@ -9,10 +9,10 @@ import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 import { Steps, Step } from 'fumadocs-ui/components/steps';
 
 Which [shape](/docs/cluster) a process takes is inferred from the options you give it. The
-**`topology` preset** on `DurableModule.forRoot` lets you name the role instead, and validates the
-two axes that otherwise read as synonyms — `namespace` (the operator's poll scope) versus `partition`
-(a worker's queue suffix). `topology` is entirely additive: omit it and inference behaves exactly as
-before.
+**`topology`** option on `DurableModule.forRoot` names the role instead: `'standalone'` (the default),
+`'control-plane'` or `'tenant'`, the same words Agora uses. It validates the two axes that otherwise
+read as synonyms, `namespace` (the operator's poll scope) and `partition` (a worker's queue suffix),
+and TypeScript rejects a `store` on a tenant. Omit it and inference behaves as `'standalone'`.
 
 ## The configs
 
@@ -20,8 +20,8 @@ before.
 
 <Tab value="Single process">
 
-Omit `topology` and you get the default: an operator that owns the store and runs every `@Workflow`
-on the inline fast path.
+Omit `topology` (or set `topology: 'standalone'`) and you get the default: an operator that owns the
+store and runs every `@Workflow` on the inline fast path.
 
 ```ts
 DurableModule.forRoot({
@@ -42,7 +42,7 @@ retention, and answers thin-pod requests.
 
 ```ts
 DurableModule.forRoot({
-  topology: { role: 'control-plane' },   // optional `tenant` scopes it to its own namespace
+  topology: 'control-plane',   // an optional `partition` scopes it to its own namespace
   store,
   transport,                             // BullMQ for a cross-process/polyglot fleet
   retention: { policies: [{ statuses: ['completed', 'cancelled'], maxAge: '14d' }] },
@@ -52,9 +52,9 @@ DurableModule.forRoot({
 <Callout type="warn">
 The preset does not switch execution off. Bodies run wherever their `@Workflow`/`@Step` providers are
 registered — declare them here and this process starts consumers for them. Whether that actually
-takes work from your workers depends on the partition: without `tenant` this node is on the bare
-queue tokens and never sees a tenant's dispatches, while **with** `tenant` it deliberately subscribes
-the same `<name>@<tenant>` tokens it dispatches to. See
+takes work from your workers depends on the partition: without `partition` this node is on the bare
+queue tokens and never sees a tenant's dispatches, while **with** `partition` it deliberately
+subscribes the same `<name>@<partition>` tokens it dispatches to. See
 [dispatch vs execution](/docs/cluster#dispatch-and-execution-are-separate).
 </Callout>
 
@@ -69,8 +69,9 @@ consumer on bootstrap, with no separate CLI.
 
 ```ts
 DurableModule.forRoot({
-  topology: { role: 'tenant', tenant: 'acme-corp' },  // maps to the partition it serves
-  connection: process.env.REDIS_URL,                  // Redis — no `store`
+  topology: 'tenant',
+  partition: 'acme-corp',               // the partition it serves and acts as
+  connection: process.env.REDIS_URL,    // Redis, no `store`
 })
 ```
 
@@ -112,14 +113,32 @@ Each check is named after the axis it protects, and runs at `forRoot`/`forRootAs
 
 | `topology` | Requires | Forbids | Notes |
 | --- | --- | --- | --- |
-| `{ role: 'control-plane', tenant? }` | `store` **and** (`transport` or `transports`) | `partition` | `tenant` is optional and maps onto `namespace`. Omit it on a deployed operator (it then drives every tenant); set it to scope a self-contained local stack to its own runs while sharing a broker with a deployed cluster. Setting `namespace` too is allowed only when it equals `tenant`; a mismatch throws. |
-| `{ role: 'tenant', tenant }` | `connection` | `store`, `namespace` | `tenant` is required and maps onto `partition`. Setting `partition` too is allowed only when it equals `tenant`; a mismatch throws. |
+| `'standalone'` (default) | `store` or `connection`; a `store` needs `transport` | nothing | The role is inferred from `store`/`connection`, as in the tabs above. |
+| `'control-plane'` | `store` **and** (`transport` or `transports`) | `tenantToken` (type only) | `partition` is optional and becomes the control plane's `namespace`. Omit it on a deployed control plane (it then drives every tenant); set it to scope a self-contained local stack to its own runs while sharing a broker with a deployed cluster. Setting `namespace` too is allowed only when it equals `partition`; a mismatch throws. |
+| `'tenant'` | `partition` **and** `connection` | `store`, `namespace`, `verifyTenant` | `store` is a compile error. `partition` is the tenant this process serves and acts as. |
 
-The preset exists for the case plain inference can't catch: an app that sets both `namespace` (meant
+The check exists for the case plain inference can't catch: an app that sets both `namespace` (meant
 for the operator) and `partition` (meant for a worker) on one instance because the two options read
 as near-synonyms. `topology` forces you to pick one role and rejects the other role's axis outright,
 with an error message that explains why. What each axis actually partitions is
 [Tenancy](/docs/concepts/tenancy).
+
+### Migrating from the object form
+
+`topology` used to be an object. It is now a string, and the nested `tenant` moved to `partition`:
+
+```ts
+// Before
+DurableModule.forRoot({ topology: { role: 'control-plane', tenant: 'davi-local' }, store, transport });
+DurableModule.forRoot({ topology: { role: 'tenant', tenant: 'acme-corp' }, connection });
+
+// After
+DurableModule.forRoot({ topology: 'control-plane', partition: 'davi-local', store, transport });
+DurableModule.forRoot({ topology: 'tenant', partition: 'acme-corp', connection });
+```
+
+The object form throws at boot with this hint. Nothing on the wire changed, so a migrated process
+keeps talking to processes that have not been upgraded yet, and to Agora and Python processes.
 
 ## The shared surface: `RunGateway`
 
@@ -264,7 +283,7 @@ const token = signTenantToken('acme-corp', process.env.DURABLE_TENANT_SECRET!, {
 // Control plane: verify it. A secret LIST makes rotation a two-step deploy — verify with
 // [next, current] first, then re-mint tokens with `next` at leisure.
 DurableModule.forRoot({
-  topology: { role: 'control-plane' },
+  topology: 'control-plane',
   store,
   transport,
   verifyTenant: hmacTenantVerifier([process.env.DURABLE_TENANT_SECRET_NEXT!, process.env.DURABLE_TENANT_SECRET!]),
@@ -273,7 +292,8 @@ DurableModule.forRoot({
 // Tenant pod: present it. A function is called before every request, so a short-lived token can be
 // re-minted or fetched from a secret store without a restart.
 DurableModule.forRoot({
-  topology: { role: 'tenant', tenant: 'acme-corp' },
+  topology: 'tenant',
+  partition: 'acme-corp',
   connection: process.env.REDIS_URL,
   tenantToken: process.env.DURABLE_TENANT_TOKEN!,   // or: () => fetchTenantToken()
 });
@@ -305,8 +325,8 @@ own namespace.
 
 Without `verifyTenant` the wire `tenant` is trusted **verbatim** — any process with broker access can
 list, cancel and start runs as any tenant (prefix/network isolation only). An explicit
-`topology: { role: 'control-plane' }` without a verifier therefore logs a warning when its responder
-starts. A plain operator (no `topology`, role inferred from `store`) boots silently, because an app
+`topology: 'control-plane'` without a verifier therefore logs a warning when its responder
+starts. A standalone operator (no `topology`, role inferred from `store`) boots silently, because an app
 that never serves tenants has nothing to protect there.
 
 The scheme is byte-compatible with Agora (`@adonis-agora/durable`): a token minted by either side

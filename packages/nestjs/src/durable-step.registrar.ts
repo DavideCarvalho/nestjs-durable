@@ -61,7 +61,7 @@ export class DurableStepRegistrar implements OnModuleInit {
     const transport = this.transport;
 
     // Forward the step logger as a second arg; methods that only declare `(input)` ignore it.
-    // The partition is the node's own tenant axis (`topology: { role: 'control-plane', tenant }`
+    // The partition is the node's own tenant axis (`topology: 'control-plane'` with a `partition`
     // resolves it, see `resolveTopology`): this engine DISPATCHES a tenant run's steps to
     // `<name>@<tenant>`, so its in-process handlers must SERVE that same token. Undefined on a global
     // operator — the bare token, byte-identical to before.

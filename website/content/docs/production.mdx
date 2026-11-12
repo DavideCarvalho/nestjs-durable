@@ -460,7 +460,8 @@ For a **worker role** (a store-less thin worker, or a co-located `store` + `conn
 
 ```ts
 DurableModule.forRoot({
-  topology: { role: 'tenant', tenant: 'acme-corp' },
+  topology: 'tenant',
+  partition: 'acme-corp',
   connection: process.env.REDIS_URL,
   concurrency: { mode: 'adaptive', min: 2, max: 32, ramCeilingPct: 85 },
   concurrencyByHandler: {

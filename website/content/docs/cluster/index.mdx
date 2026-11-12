@@ -49,17 +49,17 @@ A process executes a body when, and only when, those two tokens match. There is 
 
 That gives the two control-plane shapes different answers:
 
-- **A global control plane** (`{ role: 'control-plane' }`, no `tenant`) subscribes the bare tokens. A
+- **A global control plane** (`topology: 'control-plane'`, no `partition`) subscribes the bare tokens. A
   tenant's run dispatches to `<name>@acme`, so it never sees that task — the tenant's workers do. It
   is, for tenant work, exactly the pure coordinator you asked for. What it *does* execute is
   default-namespace work, which is usually the point: something has to.
-- **A tenant-scoped control plane** (`{ role: 'control-plane', tenant: 'acme' }`) is deliberately
-  different: the preset maps `tenant` onto `partition` too, so the node subscribes the very tokens it
+- **A scoped control plane** (`topology: 'control-plane', partition: 'acme'`) is deliberately
+  different: `partition` becomes its namespace too, so the node subscribes the very tokens it
   dispatches to. Otherwise it would dispatch into queues nothing in that process is listening on. Here
   it *does* compete with any other `acme` worker for the same tasks — by design.
 
 <Callout type="warn">
-So `topology: { role: 'control-plane' }` is not a switch that turns execution off. If a process
+So `topology: 'control-plane'` is not a switch that turns execution off. If a process
 declares `@Step` providers on a transport that can serve them (BullMQ, event-emitter), it starts
 consumers for them — and whether that matters depends on whether its partition lines up with what it
 dispatches. To keep bodies off the box entirely, keep the handlers out of its module.

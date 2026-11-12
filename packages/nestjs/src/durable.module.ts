@@ -185,28 +185,24 @@ export interface DurableRetentionOptions {
 }
 
 /**
- * Options for `DurableModule.forRoot`/`forRootAsync`. The **role is inferred** from which of `store`/
- * `connection` are set:
+ * The options every {@link DurableModuleOptions} variant shares. With no `topology` (or
+ * `topology: 'standalone'`) the **role is inferred** from which of `store`/`connection` are set:
  *
- * - `{ store, transport }` — **operator**: a real `WorkflowEngine` + `StoreRunGateway` + drivers/
+ * - `{ store, transport }`: **operator**, a real `WorkflowEngine` + `StoreRunGateway` + drivers/
  *   timer/retention/registrars, executing registered bodies INLINE. Driven by {@link drive} (default
  *   `true`).
- * - `{ connection }` (no `store`) — **thin worker**: `WorkflowEngine` resolves to a store-less
+ * - `{ connection }` (no `store`): **thin worker**, `WorkflowEngine` resolves to a store-less
  *   `DurableStartClient`; `RUN_GATEWAY` is a `ProxyRunGateway` when `transport` is also given, else
- *   every method rejects with a clear error. No store/timer/retention/entity — just discovered
+ *   every method rejects with a clear error. No store/timer/retention/entity, just discovered
  *   `@Workflow`/`@Step` handlers served over ONE `runRedisWorker` consumer.
- * - `{ store, transport, connection }` — an **operator that also runs a co-located worker**: every
+ * - `{ store, transport, connection }`: an **operator that also runs a co-located worker**: every
  *   `@Workflow` is registered GROUP-SERVED (dispatched over the transport, PER WORKFLOW NAME, instead
  *   of inline) and a co-located consumer (one `runRedisWorker` call) replays the same bodies.
  *
  * `forRoot` throws when neither `store` nor `connection` is set, and when `store` is set without a
  * `transport`.
- *
- * Set {@link DurableModuleOptions.topology} to name the role explicitly instead of relying on this
- * inference — it additionally VALIDATES the axes above (`namespace` vs `partition`) that this prose
- * is otherwise the only source of truth for. Omitting it changes nothing.
  */
-export interface DurableModuleOptions {
+export interface DurableModuleSharedOptions {
   /** State store — set this to play the **operator** role (see the interface doc for the full role
    *  matrix). Omit for a store-less **thin worker** (`connection` only). */
   store?: StateStore;
@@ -519,8 +515,8 @@ export interface DurableModuleOptions {
    * (tokens minted by `signTenantToken`, wire-compatible with Agora) or supply your own.
    *
    * Optional. Absent: the wire `tenant` is trusted verbatim (prefix/network isolation only), exactly
-   * as before. An explicit `topology: { role: 'control-plane' }` without a verifier logs a warning
-   * at boot; a plain operator (`store` + `transport`, no `topology`) boots silently.
+   * as before. `topology: 'control-plane'` without a verifier logs a warning at boot; a standalone
+   * operator boots silently.
    */
   verifyTenant?: TenantVerifier;
   /**
@@ -531,51 +527,88 @@ export interface DurableModuleOptions {
    * sent, as before. Live-tail stays keyed by the partition, never the token.
    */
   tenantToken?: TenantTokenSource;
-  /**
-   * An explicit preset that NAMES the deployment role instead of leaving it to `store`/`connection`
-   * inference, and VALIDATES the axes that are otherwise only prose (see the interface doc's role
-   * matrix, and {@link namespace} vs {@link partition}). Omit to keep the existing inference —
-   * `topology` is entirely additive and changes nothing when unset.
-   *
-   * **`namespace` vs `partition` — the two axes this preset locks down:**
-   * - `namespace` is the OPERATOR's poll-scoping axis: which runs a control-plane instance
-   *   drives/recovers/resumes (`runPending`/`recoverIncomplete`/`resumeDueTimers`/`sweepTimeouts`).
-   *   Unset makes the instance see (drive) EVERY namespace.
-   *   `{ role: 'control-plane' }` is the only preset that allows it.
-   * - `partition` is the WORKER's queue-routing suffix: which queue a thin/co-located worker's
-   *   consumer subscribes to (`<name>@<partition>`), matching the queue an operator's convention
-   *   dispatch routes a run's `namespace` to. `{ role: 'tenant' }` sets this FOR you from `tenant` —
-   *   you never set `partition` directly under `topology`.
-   *
-   * **One `tenant` word, two axes — the preset maps it to the right one per role:** on a
-   * `control-plane` an optional `tenant` scopes the OPERATOR to its own runs (maps to `namespace` —
-   * a self-contained local stack sharing a broker with a deployed cluster names itself so neither
-   * drives the other's runs; leave it unset on a deployed operator to drive every tenant). On a
-   * `tenant` role it is required and maps to `partition` (the worker's queue suffix).
-   *
-   * ```ts
-   * // Control plane: owns the store, dispatches over the transport, prunes old runs. The optional
-   * // `tenant` (e.g. from an env var) scopes this operator to its own runs — undefined on a
-   * // deployed operator (drives everything), set on a local stack sharing the broker.
-   * DurableModule.forRoot({
-   *   topology: { role: 'control-plane', tenant: process.env.DURABLE_TENANT },
-   *   store,
-   *   transport,
-   *   retention: { policies: [{ statuses: ['completed', 'cancelled'], maxAge: '14d' }] },
-   * });
-   *
-   * // Tenant: store-less worker scoped to its own partition — `tenant` maps to `partition` for you.
-   * DurableModule.forRoot({
-   *   topology: { role: 'tenant', tenant: 'acme-corp' },
-   *   connection: process.env.REDIS_URL,
-   * });
-   * ```
-   *
-   * Validated at `forRoot`/`forRootAsync` resolution time — see {@link DurableModule} for the exact
-   * error messages, which double as the axis primer above.
-   */
-  topology?: { role: 'control-plane'; tenant?: string } | { role: 'tenant'; tenant: string };
 }
+
+/** The process roles a {@link DurableModuleOptions.topology} names. Same vocabulary as Agora. */
+export type DurableTopologyName = 'standalone' | 'control-plane' | 'tenant';
+
+/**
+ * The default topology: today's role inference from `store`/`connection` (see
+ * {@link DurableModuleSharedOptions}). `partition` is the queue suffix a worker role serves.
+ */
+export interface StandaloneDurableOptions extends DurableModuleSharedOptions {
+  topology?: 'standalone';
+}
+
+/**
+ * A coordinator: owns the store, dispatches over the transport, recovers, fires timers, prunes
+ * retention and answers tenant requests. Requires `store` and `transport` (or `transports`).
+ */
+export interface ControlPlaneDurableOptions
+  extends Omit<DurableModuleSharedOptions, 'store' | 'tenantToken'> {
+  topology: 'control-plane';
+  store: StateStore;
+  /**
+   * The namespace this control plane serves. Omit it on a deployed control plane, which then drives
+   * every tenant's runs. Set it to scope a self-contained stack (a developer's machine sharing a
+   * broker with a deployed cluster) to its own runs: it becomes this node's `namespace` and the
+   * `<name>@<partition>` queues its co-located consumers subscribe to.
+   */
+  partition?: string;
+  /** A control plane verifies tenant tokens; it does not present one. */
+  tenantToken?: never;
+}
+
+/**
+ * A store-less worker for one partition: it pulls `<name>@<partition>` tasks from the broker over
+ * `connection` and, with a `transport`, proxies reads and control actions to the control plane.
+ */
+export interface TenantDurableOptions
+  extends Omit<
+    DurableModuleSharedOptions,
+    'store' | 'namespace' | 'partition' | 'connection' | 'verifyTenant'
+  > {
+  topology: 'tenant';
+  /** A tenant is store-less: everything goes over the wire to the control plane. */
+  store?: never;
+  /** `namespace` scopes an operator's poll loop; a tenant has none. Use `partition`. */
+  namespace?: never;
+  /** The partition this process serves and acts as. Required. */
+  partition: string;
+  /** The broker connection the tenant's consumer pulls its partition's tasks from. Required. */
+  connection: string | Record<string, unknown>;
+  /** A tenant presents a token (`tenantToken`); the control plane verifies it. */
+  verifyTenant?: never;
+}
+
+/**
+ * Options for `DurableModule.forRoot`/`forRootAsync`, discriminated on `topology`:
+ *
+ * ```ts
+ * // Control plane: owns the store, dispatches over the transport, prunes old runs.
+ * DurableModule.forRoot({
+ *   topology: 'control-plane',
+ *   store,
+ *   transport,
+ *   retention: { policies: [{ statuses: ['completed', 'cancelled'], maxAge: '14d' }] },
+ * });
+ *
+ * // Tenant: a store-less worker serving its own partition.
+ * DurableModule.forRoot({
+ *   topology: 'tenant',
+ *   partition: 'acme-corp',
+ *   connection: process.env.REDIS_URL,
+ * });
+ * ```
+ *
+ * Omit `topology` (or pass `'standalone'`) to keep the role inference described on
+ * {@link DurableModuleSharedOptions}. TypeScript rejects a `store` on a tenant; the rest is
+ * validated at `forRoot`/`forRootAsync` resolution time.
+ */
+export type DurableModuleOptions =
+  | StandaloneDurableOptions
+  | ControlPlaneDurableOptions
+  | TenantDurableOptions;
 
 export interface DurableModuleAsyncOptions {
   // `never[]` (not `object[]`) is intentional: a contravariant bottom-type rest param is what lets a
@@ -610,81 +643,83 @@ function assertValidRole(options: DurableModuleOptions): void {
   }
 }
 
+const TOPOLOGIES: readonly DurableTopologyName[] = ['standalone', 'control-plane', 'tenant'];
+
 /**
- * Validates the {@link DurableModuleOptions.topology} preset (a no-op when it's unset — existing
- * inference is untouched). Each thrown message NAMES the role, the offending option, and a one-line
- * explanation of the axis it protects — these messages are the feature: they teach `namespace` (the
- * operator's poll-scoping axis) apart from `partition`/`tenant` (the worker's queue-routing axis),
- * which today are only reconciled in consumer-app comments.
+ * Validates {@link DurableModuleOptions.topology}. `standalone` (or none) keeps the role inference
+ * of {@link assertValidRole}; the two named roles check their own axes, and each message names the
+ * option at fault and the axis it protects: `namespace` scopes an operator's poll loop, `partition`
+ * is the queue suffix a worker serves.
  */
 function assertValidTopology(options: DurableModuleOptions): void {
-  const topology = options.topology;
-  if (topology === undefined) return;
+  const topology: unknown = options.topology;
+  if (topology === undefined || topology === 'standalone') {
+    assertValidRole(options);
+    return;
+  }
+  if (typeof topology !== 'string' || !TOPOLOGIES.includes(topology as DurableTopologyName)) {
+    const hint =
+      typeof topology === 'object' && topology !== null
+        ? "\nThe object form is gone: `topology: { role: 'tenant', tenant: 'acme' }` is now " +
+          "`topology: 'tenant', partition: 'acme'`."
+        : '';
+    throw new Error(
+      `topology must be 'standalone', 'control-plane' or 'tenant' (got ${JSON.stringify(topology)}).${hint}`,
+    );
+  }
 
-  if (topology.role === 'control-plane') {
+  if (topology === 'control-plane') {
     if (
       options.store === undefined ||
       (options.transport === undefined && options.transports === undefined)
     ) {
       throw new Error(
-        "topology: { role: 'control-plane' } needs `store` AND (`transport` or `transports`).\n" +
+        "topology: 'control-plane' needs `store` AND (`transport` or `transports`).\n" +
           'A control-plane node is the durable operator: it owns the state store and dispatches ' +
-          'runs to workers over a transport — without both, there is nothing for it to operate.',
+          'runs to workers over a transport. Without both, there is nothing for it to operate.',
       );
     }
-    if (options.partition !== undefined) {
+    const { partition, namespace } = options;
+    if (partition !== undefined && namespace !== undefined && namespace !== partition) {
       throw new Error(
-        "topology: { role: 'control-plane' } forbids `partition`.\n" +
-          'partition is the WORKER queue-routing suffix — on a control-plane node, runs are ' +
-          "dispatched to tenant partitions via each run's namespace, not via this option. Set " +
-          "`partition` (or `topology: { role: 'tenant', tenant }`) on the WORKER node instead.",
-      );
-    }
-    if (
-      topology.tenant !== undefined &&
-      options.namespace !== undefined &&
-      options.namespace !== topology.tenant
-    ) {
-      throw new Error(
-        `topology: { role: 'control-plane', tenant: '${topology.tenant}' } conflicts with \`namespace: '${options.namespace}'\`.\ntenant maps 1:1 onto namespace (the operator's poll-scoping axis) — set only \`tenant\`, or set \`namespace\` to the same value.`,
+        `topology: 'control-plane' with \`partition: '${partition}'\` conflicts with \`namespace: '${namespace}'\`.\nOn a control plane, partition becomes its namespace (the runs it drives). Set only \`partition\`, or set \`namespace\` to the same value.`,
       );
     }
     return;
   }
 
+  const partition: unknown = options.partition;
+  if (typeof partition !== 'string' || partition.length === 0) {
+    throw new Error(
+      "topology: 'tenant' needs `partition`.\nIt names the tenant this process serves: its " +
+        'consumers pull `<name>@<partition>` tasks and its requests act as that tenant.',
+    );
+  }
   if (options.connection === undefined) {
     throw new Error(
-      `topology: { role: 'tenant', tenant: '${topology.tenant}' } needs \`connection\`.\nA tenant is a store-less worker: it connects to the broker directly to pull its own partition of tasks instead of polling a store it does not have.`,
+      `topology: 'tenant' (partition '${partition}') needs \`connection\`.\nA tenant is a store-less worker: it connects to the broker directly to pull its own partition of tasks instead of polling a store it does not have.`,
     );
   }
   if (options.store !== undefined) {
     throw new Error(
-      "topology: { role: 'tenant' } forbids `store`.\n" +
-        'A tenant is store-less BY DEFINITION — a `store` present means you actually wanted ' +
-        "`topology: { role: 'control-plane' }` (the store-owning role).",
+      "topology: 'tenant' forbids `store`.\n" +
+        'A tenant is store-less BY DEFINITION. A `store` present means you actually wanted ' +
+        "`topology: 'control-plane'` (the store-owning role).",
     );
   }
   if (options.namespace !== undefined) {
     throw new Error(
-      "topology: { role: 'tenant' } forbids `namespace`.\n" +
+      "topology: 'tenant' forbids `namespace`.\n" +
         "namespace is the OPERATOR's poll-scoping axis (which runs a control-plane instance " +
-        'drives/recovers/resumes) — a tenant worker has no poll loop for it to scope. Use this ' +
-        "preset's `tenant` field for the worker's own routing axis instead.",
-    );
-  }
-  if (options.partition !== undefined && options.partition !== topology.tenant) {
-    throw new Error(
-      `topology: { role: 'tenant', tenant: '${topology.tenant}' } conflicts with \`partition: '${options.partition}'\`.\ntenant maps 1:1 onto partition (the worker queue-routing suffix) — set only \`tenant\`, or set \`partition\` to the same value.`,
+        'drives/recovers/resumes); a tenant worker has no poll loop for it to scope. Use ' +
+        '`partition` for the tenant this process serves.',
     );
   }
 }
 
 /**
- * Applies the {@link DurableModuleOptions.topology} preset's `tenant` mapping — per role: onto
- * `partition` (worker queue-routing) for `{ role: 'tenant' }`, onto `namespace` (operator
- * poll-scoping) for `{ role: 'control-plane' }`. Validated already by {@link assertValidTopology}
- * (an equal explicit value is a no-op; a mismatched one throws before this runs). A no-op for an
- * unset `topology` (existing behavior, zero change).
+ * Applies the topology's `partition` mapping and the serving-partition default. Validated already by
+ * {@link assertValidTopology}.
  */
 function resolveTopology(options: DurableModuleOptions): DurableModuleOptions {
   return servingPartition(resolveTopologyPreset(options));
@@ -695,39 +730,22 @@ function resolveTopology(options: DurableModuleOptions): DurableModuleOptions {
  * are one axis on the wire: the engine dispatches a run's steps to `<name>@<run.namespace>` (core's
  * `stepGroup`), so a node that stamps its runs with a namespace must SERVE the matching token or it
  * enqueues into queues nobody consumes. This is what keeps the documented local-dev recipe
- * (`docs/namespaces.md` — a namespaced engine on a private Redis) working with no extra wiring.
+ * (`docs/namespaces.md`, a namespaced engine on a private Redis) working with no extra wiring.
  *
  * An explicit `partition` always wins, so a node deliberately serving a different pool stays put.
  */
 function servingPartition(options: DurableModuleOptions): DurableModuleOptions {
   if (options.partition !== undefined || options.namespace === undefined) return options;
-  return { ...options, partition: options.namespace };
+  return { ...options, partition: options.namespace } as DurableModuleOptions;
 }
 
 function resolveTopologyPreset(options: DurableModuleOptions): DurableModuleOptions {
-  const topology = options.topology;
-  if (topology === undefined) return options;
-  if (topology.role === 'control-plane') {
-    // An optional tenant scopes the operator to its own runs — maps onto `namespace` (undefined =
-    // global operator, drives every tenant; validated against an explicit mismatched `namespace`).
-    // The namespace stays a STORE-side axis: the engine stamps runs with it and routes their work
-    // via `@<tenant>` GROUP suffixes on the transport's own prefix (the cross-SDK convention every
-    // tenant worker speaks natively) — it never re-scopes the transport keyspace.
-    if (topology.tenant === undefined) return options;
-    return {
-      ...options,
-      // An explicit `namespace` is already validated equal to `tenant` (assertValidTopology), so
-      // keeping it is a no-op rather than a conflict.
-      namespace: options.namespace ?? topology.tenant,
-      // The tenant is ALSO this node's worker-routing suffix: its engine now dispatches a run's steps
-      // to `<name>@<tenant>` (core's `stepGroup`), so its own co-located worker must SUBSCRIBE those
-      // same tokens. Without this the node would dispatch into queues it is not itself listening on.
-      // `partition` is user-forbidden on this role (assertValidTopology), so we own it here.
-      partition: topology.tenant,
-    };
-  }
-  if (options.partition !== undefined) return options;
-  return { ...options, partition: topology.tenant };
+  if (options.topology !== 'control-plane' || options.partition === undefined) return options;
+  // A control plane's partition is its namespace: the engine stamps its runs with it and routes their
+  // steps to `<name>@<partition>` (core's `stepGroup`), so its own co-located consumers keep
+  // `partition` and subscribe those same tokens. It stays a STORE-side axis and never re-scopes the
+  // transport keyspace. An explicit equal `namespace` was validated by assertValidTopology.
+  return { ...options, namespace: options.namespace ?? options.partition };
 }
 
 /**
@@ -772,12 +790,12 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
       };
       new RunRequestResponder(runRequestTransport, this.gateway, {
         verifyTenant: this.options.verifyTenant,
-        // Mirrors Agora's rule (`warnWithoutVerifier: role === 'control-plane'`): only a deployment
-        // that EXPLICITLY names itself the control plane is told it runs without tenant auth. A plain
-        // operator (role inferred from `store`) is Agora's `standalone`: anyone with broker access
+        // Mirrors Agora's rule (`warnWithoutVerifier: topology === 'control-plane'`): only a deployment
+        // that EXPLICITLY names itself the control plane is told it runs without tenant auth. On a
+        // `standalone` operator (role inferred from `store`) anyone with broker access
         // can already enqueue steps and results there, so the warning would be noise on every boot
         // of an app that never serves tenants.
-        warnWithoutVerifier: this.options.topology?.role === 'control-plane',
+        warnWithoutVerifier: this.options.topology === 'control-plane',
       }).start();
     }
 
@@ -820,19 +838,9 @@ export class DurableModule {
     });
   }
 
-  /**
-   * Validates role/axis constraints, in resolution order. When {@link DurableModuleOptions.topology}
-   * is set, it OWNS validation — {@link assertValidTopology}'s own store/transport/connection checks
-   * are strictly stronger than {@link assertValidRole}'s, so the topology-specific, axis-teaching
-   * message is what a `topology`-opted-in consumer sees (not the older generic one). Falls back to
-   * {@link assertValidRole} unchanged when `topology` is absent — zero behavior change.
-   */
+  /** Validates the topology and its role/axis constraints; see {@link assertValidTopology}. */
   private static assertValid(options: DurableModuleOptions): void {
-    if (options.topology !== undefined) {
-      assertValidTopology(options);
-      return;
-    }
-    assertValidRole(options);
+    assertValidTopology(options);
   }
 
   private static build(optionsProvider: Provider): DynamicModule {
