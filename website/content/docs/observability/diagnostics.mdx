@@ -108,6 +108,75 @@ costs nothing, and a subscriber that throws never propagates back into the engin
 events you act on.
 </Callout>
 
+## Running listeners as durable runs
+
+`@dudousxd/nestjs-diagnostics` (0.9 or later) can hand every `@OnDiagnostic` listener call to a
+delivery transport instead of running it inline. With `transports.durable()`, each listener call for
+an event becomes a durable run. It's retried when the listener throws, survives a restart, and shows up
+in the console.
+
+```ts title="app.module.ts"
+import { DiagnosticsModule, transports } from '@dudousxd/nestjs-diagnostics/nestjs';
+import { DurableModule } from '@dudousxd/nestjs-durable';
+
+@Module({
+  imports: [
+    DurableModule.forRoot({ store, transport }),
+    DiagnosticsModule.forRoot({
+      default: 'durable',
+      transports: {
+        durable: transports.durable({ retries: 5, backoff: 'exp', backoffMs: 1_000 }),
+      },
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+Diagnostics loads `@dudousxd/nestjs-durable-diagnostics/delivery` when `durable` is the selected
+transport, so the package must be installed and `DurableModule` imported. Otherwise the app fails to
+boot with a message that says which one is missing.
+
+What you get:
+
+- **One run per listener and event.** The run id is `diag:<event id>:<listener id>`, where the
+  listener id is `<ClassName>#<method>`. Handing over the same event twice starts nothing new.
+- **Retries.** The listener runs inside a step named `handle`. `retries` is the number of attempts
+  (default `3`). `backoff` is `'fixed'` or `'exp'` (default `'exp'`), starting at `backoffMs`
+  (default `1000`) and capped at `backoffMaxMs` (default `30000`). Set `jitter: true` to spread retries
+  out. When the attempts run out, the run fails. A listener that the running process doesn't have
+  fails at once, with no retries.
+- **In the console.** The runs are of the `durable.diagnostics.listener` workflow, tagged
+  `diagnostics`, `lib:<lib>`, `event:<event>` and `listener:<listener id>`, so you can filter by any of them.
+
+### API and worker processes
+
+Set `role` on `DiagnosticsModule` when the app runs as separate API and worker processes:
+
+| `role` | What the process does |
+| --- | --- |
+| `'all'` (default) | Starts runs for the events it emits, and runs deliveries. |
+| `'api'` | Starts runs for the events it emits. It never runs a listener. |
+| `'worker'` | Starts runs for the events it emits, and runs deliveries. |
+
+Every process shares the durable store, so a run started on the API process is picked up by a worker.
+
+```ts title="api.module.ts"
+DiagnosticsModule.forRoot({
+  default: 'durable',
+  role: 'api',
+  transports: { durable: transports.durable() },
+});
+```
+
+<Callout title="Thin clients">
+A process that runs durable as a thin client (`DurableModule.forRoot({ connection })`, no `store`) can
+only start runs, so give it `role: 'api'`. Deliveries then run on processes that have a store.
+</Callout>
+
+The lifecycle events of these delivery runs are not forwarded to the `durable` channels. Otherwise, a
+listener on `durable` events would start a new delivery for each delivery it caused.
+
 ## Attaching manually
 
 If you construct a `WorkflowEngine` yourself (a script, a test harness, a non-Nest process) use the

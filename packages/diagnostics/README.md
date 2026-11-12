@@ -61,6 +61,25 @@ export class WorkflowAlerts {
 }
 ```
 
+## Run listeners as durable runs
+
+With `@dudousxd/nestjs-diagnostics` 0.9 or later, `transports.durable()` runs each `@OnDiagnostic`
+listener call as a durable run (id `diag:<event id>:<listener id>`), retried when it throws and
+visible in the console:
+
+```ts
+import { DiagnosticsModule, transports } from '@dudousxd/nestjs-diagnostics/nestjs';
+
+DiagnosticsModule.forRoot({
+  default: 'durable',
+  role: 'api', // 'all' (default) | 'api' (only starts runs) | 'worker'
+  transports: { durable: transports.durable({ retries: 5 }) },
+});
+```
+
+Diagnostics loads this package's `./delivery` subpath when `durable` is selected; `DurableModule`
+must be imported. See "Diagnostics channel" in the [durable docs](https://davidecarvalho.github.io/aviary/docs/durable).
+
 ## Use (manual / non-Nest)
 
 ```ts
