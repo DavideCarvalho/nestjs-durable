@@ -117,6 +117,10 @@ that arrives before `wait()` is buffered and the response is the run's current s
 `404` for an unknown token, a run that is gone or terminal, or a webhook whose wait already resolved
 (a duplicate callback), and stores nothing for them.
 
+The console's `authorize` does not gate this endpoint: the provider cannot sign in to your console,
+and the token in the URL is the secret. It does pass through the dashboard's `decorators`, like every
+route the dashboard mounts. See [Webhook callbacks](/docs/observability/dashboard#webhook-callbacks).
+
 ## Delivering the callback yourself
 
 The dashboard endpoint is just a thin wrapper. If you don't mount the dashboard, deliver the callback

@@ -41,7 +41,6 @@ export interface TenantCredentialsContract {
 }
 
 /** A class implementing a contract; its constructor parameters are resolved by Nest DI. */
-// biome-ignore lint/suspicious/noExplicitAny: a class with injected constructor params is not assignable to `unknown[]`.
 export type ContractClass<T> = new (...args: any[]) => T;
 
 /** A lazy import of a module whose default export is a contract class or object. */

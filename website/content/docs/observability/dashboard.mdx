@@ -71,8 +71,8 @@ gated, not the control plane. (Default is `drive: true`, so single-process apps 
 
 ## Protecting the console
 
-The console (the SPA at `basePath`, its JSON API at `apiBasePath`, the run stream and the webhook
-route) can retry, cancel and replay runs. Who may use it is decided by one option, `authorize`:
+The console (the SPA at `basePath`, its JSON API at `apiBasePath` and the run stream) can retry,
+cancel and replay runs. Who may use it is decided by one option, `authorize`:
 
 ```ts
 DurableDashboardModule.forRoot({
@@ -152,7 +152,7 @@ DurableDashboardModule.forRoot({
 });
 ```
 
-A token suits callers you script (the JSON API, the webhook route). The SPA in a browser sends no
+A token suits callers you script (the JSON API). The SPA in a browser sends no
 `Authorization` header, so a console protected by a token alone answers `401` to its own UI. For
 browser use, sign in with your app's authentication (in `decorators`) and use a function, a class,
 a policy or a gate name.
@@ -160,8 +160,8 @@ a policy or a gate name.
 ### Without `authorize`
 
 - Outside production (`NODE_ENV` is not `production`) the console is open.
-- With `NODE_ENV=production`, every request (UI, API, run stream, webhook route) is answered `403`
-  `{ "error": "forbidden" }`.
+- With `NODE_ENV=production`, every console request (UI, API, run stream) is answered `403`
+  `{ "error": "forbidden" }`. The [webhook callback](#webhook-callbacks) still works.
 - Either way, one warning is logged at boot:
 
 ```
@@ -851,9 +851,13 @@ dispatched Nm ago (possibly lost)". From there:
 A `ctx.webhook()` hands a third party a callback URL (built by your `webhookUrl` option). When they
 POST it, the dashboard's `POST webhooks/:token` endpoint turns that body into the signal the waiting
 run resumes on. The token embeds `runId:seq`, so treat it as a secret, and front it with signature
-verification in your own middleware. The route is part of the console, so `authorize` gates it too:
-let the third party's request through in your `authorize` (for example by its signature header or
-the request path), or it is refused like any other console call.
+verification in your own middleware.
+
+The route is not part of the console: `authorize` does not apply to it, because the third party
+cannot sign in and the token is the secret. A production app with no `authorize` still receives
+callbacks while its console answers `403`. The guards in `decorators` do apply, as on every route
+the module mounts, so do not put a guard there that a third party cannot pass, or mount the callback
+yourself (see [Delivering the callback yourself](/docs/authoring/webhooks#delivering-the-callback-yourself)).
 
 ### Live queries and updates
 
