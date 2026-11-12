@@ -4,6 +4,15 @@ export * from './decorators';
 export { DurableStartClient } from './durable-start-client';
 export * from './durable-worker.module';
 export * from './durable.module';
+export type {
+  ContractClass,
+  LazyContract,
+  TenantCredentialsContract,
+  TenantTokenOption,
+  TenantVerifierContract,
+  TenantVerifierInput,
+  TenantVerifierOption,
+} from './tenant-contracts';
 export * from './entity';
 export * from './in-app-worker';
 export * from './proxy-run-gateway';

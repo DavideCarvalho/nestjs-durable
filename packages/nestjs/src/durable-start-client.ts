@@ -2,6 +2,7 @@ import type { StartRunDeps } from '@dudousxd/durable-worker';
 import {
   type RunResult,
   type StartOptions,
+  type TenantTokenSource,
   type WorkflowClass,
   type WorkflowInputOf,
   resolveTenantToken,
@@ -9,6 +10,7 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import type { DurableModuleOptions } from './durable.module';
+import { resolveTenantTokenSource } from './tenant-contracts';
 import { startRun } from './worker-sdk';
 
 /**
@@ -26,12 +28,14 @@ import { startRun } from './worker-sdk';
 @Injectable()
 export class DurableStartClient {
   private readonly tenant: string;
+  private readonly tenantToken: TenantTokenSource | undefined;
 
   constructor(
     private readonly options: DurableModuleOptions,
     private readonly deps?: StartRunDeps,
   ) {
     this.tenant = options.partition ?? 'default';
+    this.tenantToken = resolveTenantTokenSource(options.tenantToken);
   }
 
   start<C extends WorkflowClass>(
@@ -52,9 +56,7 @@ export class DurableStartClient {
       // The signed token (when configured) rides in the `tenant` field, as on every run request; an
       // operator with `verifyTenant` derives the run's namespace from it.
       tenant:
-        this.options.tenantToken !== undefined
-          ? await resolveTenantToken(this.options.tenantToken)
-          : this.tenant,
+        this.tenantToken !== undefined ? await resolveTenantToken(this.tenantToken) : this.tenant,
       workflow: name,
       input,
       runId,

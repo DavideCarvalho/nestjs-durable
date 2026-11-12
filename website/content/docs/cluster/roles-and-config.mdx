@@ -318,10 +318,12 @@ With a verifier configured, the control plane:
 - scopes every accepted request to the tenant **derived from the token**, never the wire claim;
 - turns a verifier that throws into an error reply, so the tenant never waits out its timeout.
 
-Bring your own verifier for asymmetric or issued tokens: `verifyTenant` is any
-`({ token, tenant }) => { tenant, capabilities? } | null` (sync or async). `capabilities` is carried
-on the verified identity but **not enforced yet**: a verified tenant can call every verb, scoped to its
-own namespace.
+Bring your own verifier for asymmetric or issued tokens (your own JWTs, an OIDC provider):
+`verifyTenant` takes a function `({ token, tenant }) => { tenant, capabilities? } | null` (sync or
+async), or a class or object implementing `TenantVerifierContract`, and `tenantToken` takes a class or
+object implementing `TenantCredentialsContract`. [Authenticate tenants](/docs/cluster/authenticate-tenants)
+has full working classes. `capabilities` is carried on the verified identity but **not enforced yet**:
+a verified tenant can call every verb, scoped to its own namespace.
 
 Without `verifyTenant` the wire `tenant` is trusted **verbatim** — any process with broker access can
 list, cancel and start runs as any tenant (prefix/network isolation only). An explicit

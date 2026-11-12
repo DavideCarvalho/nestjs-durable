@@ -44,6 +44,12 @@ import { isDrivingOperator } from './role';
 import { RunRequestResponder, type RunRequestTransport } from './run-request-responder';
 import { StoreRunGateway } from './store-run-gateway';
 import { SweepLeases } from './sweep-leases';
+import {
+  type TenantTokenOption,
+  type TenantVerifierOption,
+  resolveTenantTokenSource,
+  resolveTenantVerifier,
+} from './tenant-contracts';
 import { TenantEventRepublisher } from './tenant-event-republisher';
 import { TimerPoller } from './timer-poller';
 import { CONTEXT_ACCESSOR } from './tokens';
@@ -511,22 +517,27 @@ export interface DurableModuleSharedOptions {
    * **Operator.** Verifies the signed tenant token a store-less tenant worker presents in the wire
    * `tenant` field of every run request and start-run message, and DERIVES the tenant from it,
    * discarding the wire claim. An invalid, tampered or absent token is rejected: a run request gets
-   * an `unauthorized` error reply, a start-run creates nothing. Use `hmacTenantVerifier(secret)`
-   * (tokens minted by `signTenantToken`, wire-compatible with Agora) or supply your own.
+   * an `unauthorized` error reply, a start-run creates nothing; a verifier that throws fails the
+   * request with its error. Use `hmacTenantVerifier(secret)` (tokens minted by `signTenantToken`,
+   * wire-compatible with Agora) or supply your own: a function, an object or class implementing
+   * `TenantVerifierContract` (a class is built once through Nest DI), or a lazy import of one
+   * (`() => import('./tenant-verifier.js')`, imported once).
    *
    * Optional. Absent: the wire `tenant` is trusted verbatim (prefix/network isolation only), exactly
    * as before. `topology: 'control-plane'` without a verifier logs a warning at boot; a standalone
    * operator boots silently.
    */
-  verifyTenant?: TenantVerifier;
+  verifyTenant?: TenantVerifierOption;
   /**
    * **Tenant worker.** The signed token (see `signTenantToken`) this worker presents, verbatim, in
    * the `tenant` field of every run request (`ProxyRunGateway`) and start-run (`engine.start`), so
-   * an operator with {@link verifyTenant} can authenticate it. A string, or a function called before
-   * every request (rotation, short-lived tokens). Optional: absent, the raw {@link partition} is
-   * sent, as before. Live-tail stays keyed by the partition, never the token.
+   * an operator with {@link verifyTenant} can authenticate it. A string, a function called before
+   * every request (rotation, short-lived tokens), an object or class implementing
+   * `TenantCredentialsContract` (a class is built once through Nest DI), or a lazy import of one.
+   * Every form but the string is called per request and owns its caching. Optional: absent, the raw
+   * {@link partition} is sent, as before. Live-tail stays keyed by the partition, never the token.
    */
-  tenantToken?: TenantTokenSource;
+  tenantToken?: TenantTokenOption;
 }
 
 /** The process roles a {@link DurableModuleOptions.topology} names. Same vocabulary as Agora. */
@@ -748,6 +759,13 @@ function resolveTopologyPreset(options: DurableModuleOptions): DurableModuleOpti
   return { ...options, namespace: options.namespace ?? options.partition };
 }
 
+/** The `verifyTenant` / `tenantToken` options, resolved to the plain functions the wire layer calls. */
+interface ResolvedTenantAuth {
+  verifyTenant: TenantVerifier | undefined;
+  tenantToken: TenantTokenSource | undefined;
+}
+const TENANT_AUTH = Symbol('nestjs-durable:tenant-auth');
+
 /**
  * Boot-time wiring for the tenant run gateway's OPERATOR side, gated by {@link isDrivingOperator} (an
  * operator instance drives by default; `drive: false` — or a thin worker with no `store` at all —
@@ -771,6 +789,7 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
     private readonly gateway: RunGateway,
     @Inject(STATE_STORE_CANONICAL) private readonly store: StateStore | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
+    @Inject(TENANT_AUTH) private readonly auth: ResolvedTenantAuth,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -789,7 +808,7 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
         publishRunReply: publishRunReply.bind(this.transport),
       };
       new RunRequestResponder(runRequestTransport, this.gateway, {
-        verifyTenant: this.options.verifyTenant,
+        verifyTenant: this.auth.verifyTenant,
         // Mirrors Agora's rule (`warnWithoutVerifier: topology === 'control-plane'`): only a deployment
         // that EXPLICITLY names itself the control plane is told it runs without tenant auth. On a
         // `standalone` operator (role inferred from `store`) anyone with broker access
@@ -866,6 +885,17 @@ export class DurableModule {
             options.transport ?? options.transports?.[0]?.transport ?? null,
           inject: [DURABLE_OPTIONS_CANONICAL],
         },
+        {
+          provide: TENANT_AUTH,
+          useFactory: (
+            options: DurableModuleOptions,
+            moduleRef: ModuleRef,
+          ): ResolvedTenantAuth => ({
+            verifyTenant: resolveTenantVerifier(options.verifyTenant, moduleRef),
+            tenantToken: resolveTenantTokenSource(options.tenantToken, moduleRef),
+          }),
+          inject: [DURABLE_OPTIONS_CANONICAL, ModuleRef],
+        },
         // Legacy back-compat aliases (deprecated tokens still resolve to the same instances):
         { provide: STATE_STORE, useExisting: STATE_STORE_CANONICAL },
         { provide: TRANSPORT, useExisting: TRANSPORT_CANONICAL },
@@ -882,9 +912,13 @@ export class DurableModule {
             // The accessor from `@dudousxd/nestjs-context` is resolved at construction via ModuleRef
             // (shared CONTEXT_ACCESSOR symbol — no hard import). Absent → unchanged behavior.
             moduleRef: ModuleRef,
+            auth: ResolvedTenantAuth,
           ) => {
             if (options.store === undefined) {
-              return new DurableStartClient(options);
+              return new DurableStartClient({
+                ...options,
+                ...(auth.tenantToken !== undefined ? { tenantToken: auth.tenantToken } : {}),
+              } as DurableModuleOptions);
             }
             if (!store) {
               throw new Error(
@@ -950,7 +984,7 @@ export class DurableModule {
               context,
               rehydrate: rehydrate || undefined,
               compensationRetries: options.compensationRetries,
-              verifyTenant: options.verifyTenant,
+              verifyTenant: auth.verifyTenant,
               // A non-driving (dashboard/API) operator must not run workflows: enqueue-only, leaving
               // each `pending` run in the store for a DRIVING instance's poll. A driving operator gets
               // the engine's default in-process dispatcher: for a body registered inline, it runs
@@ -970,6 +1004,7 @@ export class DurableModule {
             STATE_STORE_CANONICAL,
             TRANSPORT_CANONICAL,
             ModuleRef,
+            TENANT_AUTH,
           ],
         },
         WorkflowService,
@@ -988,6 +1023,7 @@ export class DurableModule {
             options: DurableModuleOptions,
             store: StateStore | null,
             engine: WorkflowEngine,
+            auth: ResolvedTenantAuth,
           ): RunGateway => {
             if (options.store !== undefined) {
               if (!store) {
@@ -1003,11 +1039,11 @@ export class DurableModule {
                   options.partition ?? 'default',
                   options.runGatewayTimeoutMs,
                   undefined,
-                  options.tenantToken,
+                  auth.tenantToken,
                 )
               : unavailableRunGateway();
           },
-          inject: [DURABLE_OPTIONS_CANONICAL, STATE_STORE_CANONICAL, WorkflowEngine],
+          inject: [DURABLE_OPTIONS_CANONICAL, STATE_STORE_CANONICAL, WorkflowEngine, TENANT_AUTH],
         },
         RunGatewayBootstrap,
         // Co-located in-app worker (uniform dispatch): inert unless BOTH `store` and `connection` are
