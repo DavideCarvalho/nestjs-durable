@@ -1176,6 +1176,8 @@ export class WorkflowEngine {
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
   private readonly latest = new Map<string, RegisteredWorkflow>();
+  /** Workflows this instance starts but never runs, by name. See {@link registerStartOnly}. */
+  private readonly startOnly = new Map<string, RegisteredWorkflow>();
   /** Event name → subscribing workflow name → that workflow's subscriptions to it. See `onEvent`. */
   private readonly eventTriggers = new Map<string, Map<string, EventSubscription[]>>();
   /** Durable-entity subsystem (registers the `__entity` runner; see `registerEntity`). */
@@ -1779,7 +1781,8 @@ export class WorkflowEngine {
         if (!this.isRegisteredHere(run) && !(await this.canResolveWorkflow(run))) {
           const result = await this.settleUnregistered(run, nowMs);
           if (result) settled?.set(run.id, result);
-          else if (result === undefined) this.logUnregisteredSkip(run);
+          else if (result === undefined && !this.isStartOnlyHere(run))
+            this.logUnregisteredSkip(run);
           continue;
         }
         try {
@@ -1960,6 +1963,45 @@ export class WorkflowEngine {
       subscribers.set(name, [...(subscribers.get(name) ?? []), subscription]);
       this.eventTriggers.set(subscription.event, subscribers);
     }
+  }
+
+  /**
+   * Let {@link start} create runs of `name@version` on this instance without registering a body here:
+   * the run is stored and left for an instance that {@link register}ed the workflow, and this one
+   * never executes it. For a process that only emits work (an API pod) while workers run it.
+   *
+   * Runs this instance picks up anyway (a driving poll, the run queue) are released for another
+   * instance without a log line, and dead-lettered after `unregisteredWorkflowGraceMs` like any run
+   * whose workflow nobody registered. A {@link register} of the same name on this instance wins.
+   */
+  registerStartOnly(
+    name: string,
+    version: string,
+    opts?: {
+      tags?: string[] | undefined;
+      /** The declaring package, stamped onto every run started here. See {@link register}'s `origin`. */
+      origin?: string | undefined;
+      validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+    },
+  ): void {
+    this.startOnly.set(name, {
+      name,
+      version,
+      fn: () => {
+        throw new Error(`workflow ${name} is start-only on this instance — it has no body here`);
+      },
+      tags: opts?.tags,
+      validateInput: opts?.validateInput,
+      origin: opts?.origin,
+    });
+  }
+
+  /** Whether `run` is of a workflow this instance only starts (see {@link registerStartOnly}). */
+  private isStartOnlyHere(run: WorkflowRun): boolean {
+    return (
+      !this.isRegisteredHere(run) &&
+      this.startOnly.get(run.workflow)?.version === run.workflowVersion
+    );
   }
 
   /**
@@ -3625,8 +3667,12 @@ export class WorkflowEngine {
     // {@link StartOptions.version}). Unpinned — every caller that has ever existed — takes `latest`
     // and the fallback chain, byte-for-byte as before.
     const pinned = opts?.version;
+    const startOnly = this.startOnly.get(name);
     let registered =
-      pinned === undefined ? this.latest.get(name) : this.workflows.get(versionKey(name, pinned));
+      pinned === undefined
+        ? (this.latest.get(name) ?? startOnly)
+        : (this.workflows.get(versionKey(name, pinned)) ??
+          (startOnly?.version === pinned ? startOnly : undefined));
     if (!registered && pinned === undefined) {
       // An unregistered run inherits remote routing from its spawning ancestor (see
       // {@link findInheritedRegistration}): the child of a remote workflow can be started without a
@@ -3745,7 +3791,12 @@ export class WorkflowEngine {
     }
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
-    await this.dispatchRun(runId, run.priority, pendingStateKey(run.updatedAt));
+    // A start-only run is never handed to this instance's own executor: it has no body here, so the
+    // run waits for a registered instance (the nudge below, or its pending poll).
+    const runsLocally = this.customDispatcher === undefined && !this.dispatchesOverTransport;
+    if (!(runsLocally && registered === startOnly)) {
+      await this.dispatchRun(runId, run.priority, pendingStateKey(run.updatedAt));
+    }
     // Nudge worker instances to pick it up now instead of on their next poll (no-op without a control
     // plane; self-receipt is filtered, so it only helps OTHER pods — e.g. an API pod's enqueue). A run
     // queued on the transport needs no nudge: the instance that takes it off the queue runs it, and
@@ -4551,7 +4602,7 @@ export class WorkflowEngine {
     if (!this.isRegisteredHere(run) && !(await this.canResolveWorkflow(run))) {
       const settled = await this.settleUnregistered(run, nowMs);
       if (settled) return { result: settled, dispatch: false };
-      if (settled === undefined) this.logUnregisteredSkip(run);
+      if (settled === undefined && !this.isStartOnlyHere(run)) this.logUnregisteredSkip(run);
       return undefined;
     }
     // Count the attempt / dead-letter a poison pill past maxRecoveryAttempts.
@@ -4863,6 +4914,7 @@ export class WorkflowEngine {
           const run = await this.store.getRun(runId);
           const settled = run ? await this.settleUnregistered(run, nowMs) : null;
           if (settled !== undefined) return settled;
+          if (run && this.isStartOnlyHere(run)) return null;
         }
         throw err;
       });
@@ -5236,6 +5288,7 @@ export class WorkflowEngine {
         if (error instanceof WorkflowNotRegistered) {
           const settled = await this.settleUnregistered(run, this.clock()).catch(() => undefined);
           if (settled) return settled;
+          if (this.isStartOnlyHere(run)) return undefined;
         }
         console.error(
           `[nestjs-durable] could not resume run ${run.id} (${run.workflow}@${run.workflowVersion}); leaving it for another instance:`,
@@ -5282,7 +5335,7 @@ export class WorkflowEngine {
         if (error instanceof WorkflowNotRegistered) {
           const settled = await this.settleUnregistered(run, nowMs).catch(() => undefined);
           if (settled) results.push(settled);
-          if (settled !== undefined) continue;
+          if (settled !== undefined || this.isStartOnlyHere(run)) continue;
         }
         // Loud, because a skip is not nothing: the run is still there and still not progressing, and
         // the reason (a version skew, a store that just went away) is the only thing that tells an
