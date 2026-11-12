@@ -73,6 +73,7 @@ import {
   stepCheckpoints,
   workflowRuns,
 } from './schema';
+import { withTenantColumnsHint } from './tenant-columns';
 
 /**
  * Workflows a retention policy never sees: lifecycle registry runs are neither pruned nor counted
@@ -583,12 +584,15 @@ export class DrizzleStateStore implements StateStore {
   /** Recovery on boot. Namespace-scoped: a worker re-drives only its own tenant's crashed runs.
    *  `and(...)` drops an `undefined` predicate, so an unscoped caller recovers every namespace. */
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
-    const rows = await this.db
-      .select()
-      .from(workflowRuns)
-      .where(
-        and(inArray(workflowRuns.status, ['running', 'cancelling']), namespaceFilter(namespace)),
-      );
+    const rows = await withTenantColumnsHint(
+      'sqlite',
+      this.db
+        .select()
+        .from(workflowRuns)
+        .where(
+          and(inArray(workflowRuns.status, ['running', 'cancelling']), namespaceFilter(namespace)),
+        ),
+    );
     return rows.map(fromRunRow);
   }
 
@@ -599,40 +603,46 @@ export class DrizzleStateStore implements StateStore {
     ownedBy?: OwnedLeaseReclaim,
   ): Promise<WorkflowRun[]> {
     if (limit <= 0) return [];
-    const rows = await this.db
-      .select()
-      .from(workflowRuns)
-      .where(
-        and(
-          inArray(workflowRuns.status, ['running', 'cancelling']),
-          or(
-            isNull(workflowRuns.lockedUntil),
-            lte(workflowRuns.lockedUntil, nowMs),
-            // A live lease left by a previous process with the caller's own instance id.
-            ownedBy
-              ? and(
-                  eq(workflowRuns.lockedBy, ownedBy.owner),
-                  lt(workflowRuns.lockedUntil, ownedBy.lockedBefore),
-                )
-              : undefined,
+    const rows = await withTenantColumnsHint(
+      'sqlite',
+      this.db
+        .select()
+        .from(workflowRuns)
+        .where(
+          and(
+            inArray(workflowRuns.status, ['running', 'cancelling']),
+            or(
+              isNull(workflowRuns.lockedUntil),
+              lte(workflowRuns.lockedUntil, nowMs),
+              // A live lease left by a previous process with the caller's own instance id.
+              ownedBy
+                ? and(
+                    eq(workflowRuns.lockedBy, ownedBy.owner),
+                    lt(workflowRuns.lockedUntil, ownedBy.lockedBefore),
+                  )
+                : undefined,
+            ),
+            namespaceFilter(namespace),
           ),
-          namespaceFilter(namespace),
-        ),
-      )
-      .orderBy(asc(workflowRuns.createdAt))
-      .limit(limit);
+        )
+        .orderBy(asc(workflowRuns.createdAt))
+        .limit(limit),
+    );
     return rows.map(fromRunRow);
   }
 
   /** Dispatch pick-up. Namespace-scoped — without it a worker serving one tenant drains another
    *  tenant's queue, and the `limit` makes it worse: foreign runs consume the FIFO budget. */
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
-    const rows = await this.db
-      .select()
-      .from(workflowRuns)
-      .where(and(eq(workflowRuns.status, 'pending'), namespaceFilter(namespace)))
-      .orderBy(asc(workflowRuns.createdAt)) // FIFO dispatch
-      .limit(limit);
+    const rows = await withTenantColumnsHint(
+      'sqlite',
+      this.db
+        .select()
+        .from(workflowRuns)
+        .where(and(eq(workflowRuns.status, 'pending'), namespaceFilter(namespace)))
+        .orderBy(asc(workflowRuns.createdAt)) // FIFO dispatch
+        .limit(limit),
+    );
     return rows.map(fromRunRow);
   }
 
@@ -650,7 +660,10 @@ export class DrizzleStateStore implements StateStore {
         ),
       )
       .orderBy(asc(workflowRuns.wakeAt));
-    const rows = limit !== undefined ? await query.limit(limit) : await query;
+    const rows = await withTenantColumnsHint(
+      'sqlite',
+      limit !== undefined ? query.limit(limit) : query,
+    );
     return rows.map(fromRunRow);
   }
 
@@ -900,31 +913,39 @@ export class DrizzleStateStore implements StateStore {
   }
 
   async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
-    const rows = await this.db
-      .select()
-      .from(durableSchedules)
-      .where(
-        and(
-          query.namespace !== undefined
-            ? eq(durableSchedules.namespace, query.namespace)
-            : undefined,
-          query.workflow !== undefined ? eq(durableSchedules.workflow, query.workflow) : undefined,
-          query.paused !== undefined ? eq(durableSchedules.paused, query.paused) : undefined,
-          query.tag !== undefined ? like(durableSchedules.tags, `%"${query.tag}"%`) : undefined,
-          ...tenantFilters(durableSchedules.tenantId, query),
-          query.dueBy !== undefined
-            ? and(eq(durableSchedules.paused, false), lte(durableSchedules.nextFireAt, query.dueBy))
-            : undefined,
-        ),
-      )
-      // Soonest-due first, never-firing (NULL) last, id as the stable tie-break.
-      .orderBy(
-        sql`${durableSchedules.nextFireAt} IS NULL`,
-        asc(durableSchedules.nextFireAt),
-        asc(durableSchedules.id),
-      )
-      .limit(query.limit ?? -1)
-      .offset(query.offset ?? 0);
+    const rows = await withTenantColumnsHint(
+      'sqlite',
+      this.db
+        .select()
+        .from(durableSchedules)
+        .where(
+          and(
+            query.namespace !== undefined
+              ? eq(durableSchedules.namespace, query.namespace)
+              : undefined,
+            query.workflow !== undefined
+              ? eq(durableSchedules.workflow, query.workflow)
+              : undefined,
+            query.paused !== undefined ? eq(durableSchedules.paused, query.paused) : undefined,
+            query.tag !== undefined ? like(durableSchedules.tags, `%"${query.tag}"%`) : undefined,
+            ...tenantFilters(durableSchedules.tenantId, query),
+            query.dueBy !== undefined
+              ? and(
+                  eq(durableSchedules.paused, false),
+                  lte(durableSchedules.nextFireAt, query.dueBy),
+                )
+              : undefined,
+          ),
+        )
+        // Soonest-due first, never-firing (NULL) last, id as the stable tie-break.
+        .orderBy(
+          sql`${durableSchedules.nextFireAt} IS NULL`,
+          asc(durableSchedules.nextFireAt),
+          asc(durableSchedules.id),
+        )
+        .limit(query.limit ?? -1)
+        .offset(query.offset ?? 0),
+    );
     return rows.map(fromScheduleRow);
   }
 

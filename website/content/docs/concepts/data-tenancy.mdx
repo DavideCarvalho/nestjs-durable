@@ -75,11 +75,29 @@ The tenant then follows the work:
 The tenant is stored on the run, so durable restores it around **every** turn: the first one, a
 resume after a `ctx.sleep` timer, a delivered signal, crash recovery, and a turn driven by a worker.
 Inside a workflow body or a local step, `Context.tenant()` is the run's tenant, and so are the tenant
-reads of other Aviary libs called from there.
+reads of other Aviary libs called from there. Local steps always get it from the run, whatever your
+`context` carrier holds.
+
+A **lifecycle subscriber** (`onEvent: [runCompletedEvent(...)]`, without `eventBatch`) starts in the
+tenant of the run that settled, even when the event is published later by the background retry pass.
 
 Dispatched step tasks carry the tenant in their context carrier (`tenant` and `tenantId`). A
 `DurableModule` in the process that runs the handler, operator or worker, on any transport, restores
 it around the handler body.
+
+<Callout type="warn">
+  Remote step handlers get the tenant **only through the context carrier**. The default carrier
+  includes it. If you pass your own `context` reader, or a custom `serialize` / `deserialize` to
+  `@dudousxd/nestjs-context`, make it include `tenant` (`{ id, kind }`) or `tenantId`; otherwise a
+  remote step handler runs with no tenant.
+
+  ```ts
+  DurableModule.forRoot({
+    // ...
+    context: () => ({ traceId: Context.traceId(), tenant: Context.tenant() }),
+  });
+  ```
+</Callout>
 
 ## Reads and control calls
 
@@ -166,10 +184,17 @@ Runs and schedules gain two nullable columns, `tenant_id` and `tenant_kind`, plu
 `durable_workflow_runs (tenant_id, created_at)` and on `durable_schedules (tenant_id)`. Existing rows
 keep NULL: they have no tenant.
 
-- **MikroORM, TypeORM, Drizzle Postgres (auto-schema):** added on boot.
+Every store reads these columns on every run and schedule query, **even with tenancy off**, so add
+them before you deploy the upgrade:
+
+- **MikroORM, TypeORM, Drizzle Postgres with `autoSchema` on (the default):** added on boot.
+- **Drizzle Postgres with `autoSchema: false`, and every Drizzle SQLite / libSQL database:** generate a
+  migration with `drizzle-kit generate` and apply it (statements in
+  [Drizzle Postgres](/docs/stores/drizzle-postgres) and [Drizzle](/docs/stores/drizzle)). Without
+  it the app fails at boot with a `MissingTenantColumnsError` that lists them.
+- **MikroORM or TypeORM with `autoSchema: false`:** add the columns and indexes in your own migration.
 - **Prisma:** the fields are in the package's `prisma/schema.prisma`; copy them and run
   `prisma migrate dev`.
-- **Drizzle SQLite / libSQL:** run the migration yourself (see [Drizzle](/docs/stores/drizzle)).
 
 Workers that execute **workflow turns** over the wire (remote workflows) don't receive the tenant:
 the turn runs on the worker without it. Step handlers do receive it through the task carrier.

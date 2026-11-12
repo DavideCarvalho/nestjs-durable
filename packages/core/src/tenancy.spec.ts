@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
 import { accumulatorRunId } from './event-accumulators';
 import type { RemoteTask, WorkflowRun } from './interfaces';
-import { runCompletedEvent } from './lifecycle-events';
+import { LIFECYCLE_PENDING_TAG, runCompletedEvent } from './lifecycle-events';
 import {
   type EngineTenancy,
   type RunTenant,
@@ -253,6 +253,35 @@ describe('tenancy on: the tenant is restored on every turn', () => {
     await poll(async () => (await store.getRun('r1'))?.status === 'completed');
     expect(tasks.length).toBeGreaterThan(0);
     for (const task of tasks) expect(task.context?.tenantId).toBe('acme');
+  });
+
+  it("local steps see the run's tenant even when the app's carrier drops it", async () => {
+    const store = new InMemoryStateStore();
+    let now = 1_000;
+    const engine = new WorkflowEngine({
+      store,
+      clock: () => now,
+      tenancy: fakeTenancy(),
+      // An app carrier that keeps only `traceId`: its deserializer replaces the ambient context
+      // around every local step with one that has no tenant.
+      context: () => ({ traceId: 't-1' }),
+      rehydrate: (_carrier, fn) => als.run({}, fn),
+    });
+    const steps: (string | null)[] = [];
+    engine.register('wf', '1', async (ctx) => {
+      await ctx.localStep('start', async () => steps.push(seenTenant()));
+      await ctx.sleep('10s');
+      await ctx.localStep('timer', async () => steps.push(seenTenant()));
+      await ctx.waitForSignal('go');
+      await ctx.localStep('signal', async () => steps.push(seenTenant()));
+      return 'ok';
+    });
+    await asTenant('acme', () => startRun(engine, 'wf', {}, 'r1'));
+    now = 20_000;
+    await engine.resumeDueTimers(20_000); // a poller: no context
+    await engine.signal('go', 1); // no request either
+    await poll(async () => (await store.getRun('r1'))?.status === 'completed');
+    expect(steps).toEqual(['acme', 'acme', 'acme']);
   });
 });
 
@@ -667,6 +696,47 @@ describe('eventBatch: one batch run per tenant', () => {
       async () =>
         (await store.getRun(accumulatorRunId('agg', undefined, 'globex')))?.tenantId === 'globex',
     );
+  });
+});
+
+describe('tenancy on: lifecycle subscribers', () => {
+  it("a subscriber run started by the background retry pass gets the settled run's tenant", async () => {
+    const { engine, store } = setup({ tenancy: fakeTenancy() });
+    const seen: (string | null)[] = [];
+    engine.register('refresh', '1', async () => void seen.push(seenTenant()), {
+      onEvent: [runCompletedEvent('ingest')],
+    });
+    // A run that settled for acme, whose process died before it published its lifecycle event.
+    await store.createRun({
+      id: 'i1',
+      workflow: 'ingest',
+      workflowVersion: '1',
+      status: 'completed',
+      input: {},
+      tags: [LIFECYCLE_PENDING_TAG],
+      tenantId: 'acme',
+      tenantKind: 'organization',
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    } as WorkflowRun);
+
+    expect(await engine.sweepLifecycleEvents(60_000)).toBe(1); // the poller: no context
+    const id = 'evt:i1:completed:refresh';
+    await poll(async () => (await store.getRun(id))?.status === 'completed');
+    expect(await store.getRun(id)).toMatchObject({ tenantId: 'acme', tenantKind: 'organization' });
+    expect(seen).toEqual(['acme']);
+  });
+
+  it('a subscriber of a run with no tenant starts with none, whoever publishes', async () => {
+    const { engine, store } = setup({ tenancy: fakeTenancy() });
+    engine.register('ingest', '1', async () => 'ok');
+    engine.register('refresh', '1', async () => 'ok', {
+      onEvent: [runCompletedEvent('ingest')],
+    });
+    await engine.start('ingest', {}, 'i1', { tenantId: null });
+    const id = 'evt:i1:completed:refresh';
+    await poll(async () => (await store.getRun(id))?.status === 'completed');
+    expect((await store.getRun(id))?.tenantId ?? null).toBe(null);
   });
 });
 

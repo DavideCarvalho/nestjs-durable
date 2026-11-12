@@ -81,6 +81,18 @@ class Wf {
   }
 }
 
+let localSeen: (string | undefined)[] = [];
+
+@Workflow({ name: 'local-wf', version: '1' })
+class LocalWf {
+  async run(ctx: WorkflowCtx) {
+    await ctx.localStep('start', async () => localSeen.push(Context.tenant()?.id));
+    await ctx.waitForSignal(`go:${ctx.runId}`);
+    await ctx.localStep('resume', async () => localSeen.push(Context.tenant()?.id));
+    return 'ok';
+  }
+}
+
 /** Captures each dispatched task and completes it. */
 function recordingTransport(dispatched: RemoteTask[]): Transport {
   let onResult: ((r: StepResult) => Promise<void>) | undefined;
@@ -104,7 +116,7 @@ async function build(options: Partial<DurableModuleOptions> = {}) {
     imports: [
       DurableModule.forRoot({ store, transport: recordingTransport(dispatched), ...options }),
     ],
-    providers: [Wf, { provide: CONTEXT_ACCESSOR, useValue: contextAccessor() }],
+    providers: [Wf, LocalWf, { provide: CONTEXT_ACCESSOR, useValue: contextAccessor() }],
   }).compile();
   await moduleRef.init();
   return {
@@ -128,6 +140,7 @@ async function settled(store: InMemoryStateStore, runId: string, status: string)
 afterEach(() => {
   enabled = true;
   seen = [];
+  localSeen = [];
   clearDurableExecutionWrappers();
 });
 
@@ -277,6 +290,17 @@ describe('DurableModule with tenancy on', () => {
     offAcme();
     offGlobex();
     offLate();
+    await close();
+  });
+
+  it("local steps get the run row's tenant when the app's context carrier keeps only traceId", async () => {
+    // The app's own carrier: `Context.deserialize` rebuilds a context from it with no tenant.
+    const { store, service, engine, close } = await build({ context: () => ({ traceId: 't-1' }) });
+    await asTenant('acme', () => service.start('local-wf', {}, 'l1'));
+    await settled(store, 'l1', 'suspended');
+    await engine.signal('go:l1', 1); // from no request
+    await settled(store, 'l1', 'completed');
+    expect(localSeen).toEqual(['acme', 'acme']);
     await close();
   });
 

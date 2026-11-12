@@ -97,7 +97,10 @@ one.
 ALTER TABLE durable_workflow_runs ADD COLUMN origin TEXT;
 ```
 
-The [data tenancy](/docs/concepts/data-tenancy) columns take this shape too, on runs and schedules:
+The [data tenancy](/docs/concepts/data-tenancy) columns take this shape too, on runs and schedules.
+**Every upgrade to this version needs them, even with tenancy off**: the store reads them on every
+run and schedule query, and without them the app fails at boot with a `MissingTenantColumnsError`
+that lists these statements. Generate the migration with `drizzle-kit generate`; it must contain:
 
 ```sql
 ALTER TABLE durable_workflow_runs ADD COLUMN tenant_id TEXT;

@@ -1020,6 +1020,8 @@ export class DurableModule {
             // The runtime `Context` is a module-level singleton (not the accessor token), resolved
             // ONCE here via a guarded dynamic import (optional peer — failure leaves the default
             // passthrough). Best-effort: an empty/undefined carrier just runs the handler normally.
+            // The engine re-applies the run row's tenant INSIDE this bridge, so an app deserializer
+            // that drops the tenant cannot take it away from a local step.
             const runtime = runtimeNeeded ? await resolveContextRuntime() : undefined;
             const rehydrate =
               runtime &&

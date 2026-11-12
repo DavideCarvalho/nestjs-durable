@@ -2194,8 +2194,16 @@ export class WorkflowEngine {
    * time from {@link context} — the SAME reader stamped on dispatched remote tasks — so a local step
    * sees the live tenant / user / trace ids ambiently (via the {@link rehydrate} bridge). Default
    * `rehydrate` is a passthrough, so this is byte-identical to a bare body call when unwired.
+   *
+   * The run row's tenant is re-applied INSIDE the rehydrated context: an app carrier (a custom
+   * `serialize`/`deserialize`) may not carry the tenant, and its deserializer would otherwise replace
+   * the tenant the turn was started with. Local steps always see the row's tenant.
    */
-  private interceptStep<T>(invocation: StepInvocation, body: () => Promise<T>): Promise<T> {
+  private interceptStep<T>(
+    invocation: StepInvocation,
+    body: () => Promise<T>,
+    tenant?: Pick<WorkflowRun, 'tenantId' | 'tenantKind'>,
+  ): Promise<T> {
     const carrier = this.context?.();
     const run = (): Promise<T> => {
       if (this.interceptors.length === 0) return body();
@@ -2205,7 +2213,7 @@ export class WorkflowEngine {
       );
       return chain() as Promise<T>;
     };
-    return this.rehydrate(carrier, run);
+    return this.rehydrate(carrier, () => (tenant ? this.inRunTenant(tenant, run) : run()));
   }
 
   /**
@@ -2423,7 +2431,9 @@ export class WorkflowEngine {
    * debounce/batch accumulator, which counts an id once. Returns the subscribers reached, with the
    * run each started (none when the payload went into its debounce/batch accumulator), and the ones
    * that could not be started, with why. `batchTenant` is the tenant whose debounce/batch accumulator
-   * the payload goes into (see {@link EventAccumulators.route}).
+   * the payload goes into (see {@link EventAccumulators.route}). `runTenant`, when set, is the tenant
+   * every directly started subscriber run gets (a lifecycle event: the settled run's), instead of the
+   * context's at publish time (which may be none, e.g. the background retry pass).
    */
   private async startSubscribers(
     name: string,
@@ -2433,6 +2443,7 @@ export class WorkflowEngine {
     remote: readonly string[] = [],
     routeIdOf?: (workflow: string) => string,
     batchTenant?: RunTenant | null,
+    runTenant?: Pick<StartOptions, 'tenantId' | 'tenantKind'>,
   ): Promise<{
     reached: { workflow: string; runId?: string }[];
     failed: { workflow: string; error: unknown }[];
@@ -2459,7 +2470,7 @@ export class WorkflowEngine {
           reached.push({ workflow });
         } else {
           const runId = runIdOf(workflow);
-          await this.start(workflow, input, runId);
+          await this.start(workflow, input, runId, runTenant);
           reached.push({ workflow, runId });
         }
       } catch (error) {
@@ -2471,7 +2482,7 @@ export class WorkflowEngine {
       if (local?.has(workflow) || (only && !only.has(workflow))) continue;
       try {
         const runId = runIdOf(workflow);
-        await this.start(workflow, payload, runId);
+        await this.start(workflow, payload, runId, runTenant);
         reached.push({ workflow, runId });
       } catch (error) {
         failed.push({ workflow, error });
@@ -3181,6 +3192,9 @@ export class WorkflowEngine {
             remote,
             runIdOf,
             this.lifecycleBatchTenant(run),
+            // The downstream run belongs to the settled run's customer, whoever publishes it (the
+            // turn that settled it, or the background retry pass outside any request).
+            inheritTenant(run),
           )
         : { reached: [], failed: [] };
     const current = (await this.store.getRun(run.id)) ?? run;
@@ -9044,7 +9058,7 @@ export class WorkflowEngine {
             }),
         );
       },
-      interceptStep: (invocation, body) => this.interceptStep(invocation, body),
+      interceptStep: (invocation, body) => this.interceptStep(invocation, body, parentTenant),
     };
   }
 
