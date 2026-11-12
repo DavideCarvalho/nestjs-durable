@@ -69,9 +69,11 @@ const MODULE = 'DurableDashboardModule';
 /** The one boot warning for a console with no `authorize`. Same wording in every Aviary console. */
 export const CONSOLE_AUTHORIZE_MISSING_WARNING = `[${PACKAGE}] console has no \`authorize\` configured: it is open outside production and denies every request in production. Set \`authorize\` in ${MODULE}.forRoot().`;
 
-const ALLOW: ConsoleDecision = { allowed: true };
-const FORBIDDEN: ConsoleDecision = { allowed: false, reason: 'forbidden' };
-const UNAUTHENTICATED: ConsoleDecision = { allowed: false, reason: 'unauthenticated' };
+// Factories, not shared constants: every decision is a fresh object, so a caller mutating one can
+// never change the answer for the next request.
+const allow = (): ConsoleDecision => ({ allowed: true });
+const forbidden = (): ConsoleDecision => ({ allowed: false, reason: 'forbidden' });
+const unauthenticated = (): ConsoleDecision => ({ allowed: false, reason: 'unauthenticated' });
 
 function isProduction(): boolean {
   return (process.env.NODE_ENV ?? '').trim().toLowerCase() === 'production';
@@ -102,15 +104,15 @@ function isLazyModule(value: unknown): value is { default: ConsoleAuthorizerClas
 }
 
 /** Turns any {@link ConsoleAuthorizeResult} into a {@link ConsoleDecision}. */
-export function normalizeConsoleResult(result: unknown): ConsoleDecision {
-  if (result === true) return ALLOW;
-  if (typeof result !== 'object' || result === null) return FORBIDDEN;
+export function normalizeConsoleDecision(result: unknown): ConsoleDecision {
+  if (result === true) return allow();
+  if (typeof result !== 'object' || result === null) return forbidden();
   const shape = result as { allowed?: unknown; reason?: unknown; redirectTo?: unknown };
   if (typeof shape.redirectTo === 'string' && shape.allowed !== true) {
     return { allowed: false, reason: 'unauthenticated', redirectTo: shape.redirectTo };
   }
-  if (shape.allowed === true) return ALLOW;
-  return shape.reason === 'unauthenticated' ? UNAUTHENTICATED : FORBIDDEN;
+  if (shape.allowed === true) return allow();
+  return shape.reason === 'unauthenticated' ? unauthenticated() : forbidden();
 }
 
 /** `null`, `undefined` and `false` mean "nobody signed in", like `@nestjs/authorization`'s guard. */
@@ -127,7 +129,7 @@ async function policyDecider(
     pkg = await import('@nestjs/authorization');
   } catch {
     throw new Error(
-      `${MODULE}: \`authorize: { policy, ability }\` needs @nestjs/authorization installed and AuthorizationModule imported; or pass a function, a class, or a gate name.`,
+      `${MODULE}: \`authorize: { policy, ability }\` needs @nestjs/authorization installed, with AuthorizationModule.forRoot() imported in the app; or pass a function, a class, or a gate name.`,
     );
   }
   const { AuthorizationService, AUTHORIZATION_MODULE_OPTIONS, defaultGetUser } = pkg;
@@ -135,19 +137,25 @@ async function policyDecider(
     moduleRef.get(AuthorizationService, { strict: false });
   } catch {
     throw new Error(
-      `${MODULE}: \`authorize: { policy, ability }\` needs @nestjs/authorization's AuthorizationModule imported in the app.`,
+      `${MODULE}: \`authorize: { policy, ability }\` needs AuthorizationModule.forRoot() from @nestjs/authorization imported in the app.`,
     );
   }
-  let getUser: (context: ExecutionContext) => unknown = defaultGetUser;
+  let configuredGetUser: ((context: ExecutionContext) => unknown) | undefined;
   try {
     const options = moduleRef.get<{ getUser?: (context: ExecutionContext) => unknown }>(
       AUTHORIZATION_MODULE_OPTIONS,
       { strict: false },
     );
-    if (typeof options?.getUser === 'function') getUser = options.getUser;
+    if (typeof options?.getUser === 'function') configuredGetUser = options.getUser;
   } catch {
     // No options registered: the package default reads `request.user`.
   }
+  // Only `undefined` means "not found here, look further" (the package default). `null` and
+  // `false` are an answer: a guest.
+  const getUser = async (context: ExecutionContext): Promise<unknown> => {
+    const user = configuredGetUser ? await configuredGetUser(context) : undefined;
+    return user === undefined ? defaultGetUser(context) : user;
+  };
   return async (context) => {
     const authorization = moduleRef.get(AuthorizationService, { strict: false });
     const user = await getUser(context);
@@ -157,9 +165,9 @@ async function policyDecider(
       user: unknown,
     ) => Promise<boolean>;
     if (await can.call(authorization, check.policy, check.ability, hasUser(user) ? user : null)) {
-      return ALLOW;
+      return allow();
     }
-    return hasUser(user) ? FORBIDDEN : UNAUTHENTICATED;
+    return hasUser(user) ? forbidden() : unauthenticated();
   };
 }
 
@@ -173,7 +181,7 @@ function gateDecider(name: string, moduleRef: ModuleRef): ConsoleDecide {
   }
   return async (context) => {
     const gate = moduleRef.get<ConsoleGate>(CONSOLE_GATE, { strict: false });
-    return normalizeConsoleResult(await gate.allows(name, context));
+    return normalizeConsoleDecision(await gate.allows(name, context));
   };
 }
 
@@ -198,7 +206,7 @@ function classDecider(moduleRef: ModuleRef): (Class: ConsoleAuthorizerClass) => 
     return pending;
   };
   return (Class) => async (context) =>
-    normalizeConsoleResult(await (await instanceOf(Class)).authorize(context));
+    normalizeConsoleDecision(await (await instanceOf(Class)).authorize(context));
 }
 
 /**
@@ -217,8 +225,8 @@ export async function resolveConsoleAuthorize(
   const logger = options.logger ?? new Logger(MODULE);
   if (authorize === undefined) {
     if (options.warnIfMissing !== false) logger.warn(CONSOLE_AUTHORIZE_MISSING_WARNING);
-    const decision = isProduction() ? FORBIDDEN : ALLOW;
-    return async () => decision;
+    const production = isProduction();
+    return async () => (production ? forbidden() : allow());
   }
 
   let decide: ConsoleDecide;
@@ -235,7 +243,7 @@ export async function resolveConsoleAuthorize(
     decide = async (context) => {
       if (lazy) return lazy(context);
       const result = await fn(context);
-      if (!isLazyModule(result)) return normalizeConsoleResult(result);
+      if (!isLazyModule(result)) return normalizeConsoleDecision(result);
       // A lazy import: remember the class, so the import runs once per registration.
       lazy = fromClass(result.default);
       return lazy(context);
@@ -253,7 +261,7 @@ export async function resolveConsoleAuthorize(
       logger.warn(
         `console \`authorize\` threw, denying the request: ${error instanceof Error ? error.message : String(error)}`,
       );
-      return FORBIDDEN;
+      return forbidden();
     }
   };
 }
@@ -301,7 +309,7 @@ export const ConsolePage = (): ClassDecorator => (target) => {
  * The denial the guard throws. An `HttpException` with the JSON body, so it still answers correctly
  * where {@link ConsoleAuthorizeFilter} is not applied; the filter adds the page answers.
  */
-export class ConsoleAccessDenied extends HttpException {
+export class ConsoleAccessDeniedException extends HttpException {
   constructor(
     readonly decision: Extract<ConsoleDecision, { allowed: false }>,
     readonly page: boolean,
@@ -326,7 +334,7 @@ export class ConsoleAuthorizeGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const decision = await this.decide(context);
     if (decision.allowed) return true;
-    throw new ConsoleAccessDenied(decision, isPageNavigation(context));
+    throw new ConsoleAccessDeniedException(decision, isPageNavigation(context));
   }
 }
 
@@ -340,13 +348,17 @@ function isPageNavigation(context: ExecutionContext): boolean {
   return request?.method === 'GET' && typeof accept === 'string' && accept.includes('text/html');
 }
 
-const DENIED_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access denied</title></head><body style="font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0"><main style="text-align:center"><h1>Access denied</h1><p>You do not have access to this console.</p></main></body></html>`;
+/** The minimal page answered to a denied page navigation: same markup for 401 and 403. */
+const consolePage = (title: string, message: string): string =>
+  `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head><body style="font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0"><main style="text-align:center"><h1>${title}</h1><p>${message}</p></main></body></html>`;
+const DENIED_PAGE = consolePage('Access denied', 'You do not have access to this console.');
+const SIGN_IN_PAGE = consolePage('Sign in required', 'Sign in to open this console.');
 
-@Catch(ConsoleAccessDenied)
+@Catch(ConsoleAccessDeniedException)
 export class ConsoleAuthorizeFilter implements ExceptionFilter {
   constructor(private readonly adapterHost: HttpAdapterHost) {}
 
-  catch(exception: ConsoleAccessDenied, host: ArgumentsHost): void {
+  catch(exception: ConsoleAccessDeniedException, host: ArgumentsHost): void {
     const adapter = this.adapterHost.httpAdapter;
     const response = host.switchToHttp().getResponse();
     const { decision, page } = exception;
@@ -354,9 +366,14 @@ export class ConsoleAuthorizeFilter implements ExceptionFilter {
       adapter.redirect(response, 302, decision.redirectTo);
       return;
     }
-    if (page && decision.reason === 'forbidden') {
+    if (page) {
+      const forbiddenPage = decision.reason === 'forbidden';
       adapter.setHeader(response, 'Content-Type', 'text/html; charset=utf-8');
-      adapter.reply(response, DENIED_PAGE, 403);
+      adapter.reply(
+        response,
+        forbiddenPage ? DENIED_PAGE : SIGN_IN_PAGE,
+        forbiddenPage ? 403 : 401,
+      );
       return;
     }
     adapter.reply(response, exception.getResponse(), exception.getStatus());

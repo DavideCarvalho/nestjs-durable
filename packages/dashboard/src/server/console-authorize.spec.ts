@@ -24,6 +24,7 @@ import {
   type ConsoleAuthorizer,
   UseConsoleAuthorize,
   authorizeByToken,
+  normalizeConsoleDecision,
   resolveConsoleAuthorize,
 } from './console-authorize.js';
 import { DurableApiControllerBase } from './durable-api.controller.js';
@@ -122,6 +123,34 @@ describe('resolveConsoleAuthorize: result shapes', () => {
   });
 });
 
+describe('denials are fresh objects', () => {
+  it('normalizeConsoleDecision never returns a shared object', () => {
+    for (const result of [true, false, { allowed: false, reason: 'unauthenticated' }] as const) {
+      const first = normalizeConsoleDecision(result);
+      expect(normalizeConsoleDecision(result)).not.toBe(first);
+    }
+  });
+
+  it('mutating one decision does not change the next one', async () => {
+    const { moduleRef } = await moduleRefWith();
+    const decide = await resolveConsoleAuthorize(() => false, moduleRef, silent);
+    const first = await decide(ctx);
+    Object.assign(first, { allowed: true });
+    expect(await decide(ctx)).toEqual({ allowed: false, reason: 'forbidden' });
+
+    const throws = await resolveConsoleAuthorize(
+      () => {
+        throw new Error('x');
+      },
+      moduleRef,
+      { logger: { warn: () => undefined } as unknown as Logger },
+    );
+    const denied = await throws(ctx);
+    Object.assign(denied, { allowed: true });
+    expect(await throws(ctx)).toEqual({ allowed: false, reason: 'forbidden' });
+  });
+});
+
 describe('resolveConsoleAuthorize: the five forms', () => {
   beforeEach(() => {
     ConsoleAccess.constructed = 0;
@@ -207,11 +236,33 @@ describe('resolveConsoleAuthorize: the five forms', () => {
     expect(await decide(context)).toEqual({ allowed: true });
   });
 
+  it('{ policy, ability }: getUser null or false is a guest, undefined falls back to request.user', async () => {
+    let answer: unknown;
+    const { moduleRef } = await moduleRefWith(
+      [AuthorizationModule.forRoot({ globalGuard: false, getUser: () => answer })],
+      [ConsolePolicy],
+    );
+    const decide = await resolveConsoleAuthorize(
+      { policy: ConsolePolicy, ability: 'view' },
+      moduleRef,
+      silent,
+    );
+    const admin = contextFor({ user: { role: 'admin' } });
+    for (const guest of [null, false]) {
+      answer = guest;
+      expect(await decide(admin)).toEqual({ allowed: false, reason: 'unauthenticated' });
+    }
+    answer = undefined;
+    expect(await decide(admin)).toEqual({ allowed: true });
+  });
+
   it('{ policy, ability } without AuthorizationModule fails at resolve time (boot)', async () => {
-    const { moduleRef } = await moduleRefWith();
+    const { moduleRef } = await moduleRefWith([], [ConsolePolicy]);
     await expect(
       resolveConsoleAuthorize({ policy: ConsolePolicy, ability: 'view' }, moduleRef, silent),
-    ).rejects.toThrow(/AuthorizationModule/);
+    ).rejects.toThrow(
+      '`authorize: { policy, ability }` needs AuthorizationModule.forRoot() from @nestjs/authorization imported in the app',
+    );
   });
 
   it('gate name: asks the console-gate provider', async () => {
@@ -398,7 +449,7 @@ describe('the console guard over HTTP', () => {
     expect(page.text).toContain('Access denied');
   });
 
-  it('unauthenticated without redirectTo is a 401 JSON everywhere', async () => {
+  it('unauthenticated without redirectTo: a 401 sign-in page for pages, 401 JSON for the API', async () => {
     const server = await boot(
       DurableDashboardModule.forRoot({
         // Declare the context parameter: a zero-parameter arrow gets no contextual return type
@@ -406,14 +457,28 @@ describe('the console guard over HTTP', () => {
         authorize: (_ctx) => ({ allowed: false, reason: 'unauthenticated' }),
       }),
     );
+    const page = await request(server).get('/durable').set('Accept', 'text/html');
+    expect(page.status).toBe(401);
+    expect(page.headers['content-type']).toMatch(/text\/html/);
+    expect(page.text).toContain('Sign in required');
+
     for (const [path, accept] of [
-      ['/durable', 'text/html'],
+      ['/durable', 'application/json'],
       ['/durable/api/runs', 'application/json'],
+      ['/durable/api/runs', 'text/html'],
     ] as const) {
       const res = await request(server).get(path).set('Accept', accept);
       expect(res.status).toBe(401);
       expect(res.body).toEqual({ error: 'unauthenticated' });
     }
+  });
+
+  it('a policy form without AuthorizationModule fails the boot with a tailored message', async () => {
+    await expect(
+      boot(
+        DurableDashboardModule.forRoot({ authorize: { policy: ConsolePolicy, ability: 'view' } }),
+      ),
+    ).rejects.toThrow('needs AuthorizationModule.forRoot() from @nestjs/authorization');
   });
 
   it('covers the run stream (SSE), actions and the webhook route', async () => {
@@ -494,13 +559,16 @@ describe('the default over HTTP (`authorize` omitted)', () => {
     );
   });
 
-  it('`routes: false` logs no warning', async () => {
+  it('`routes: false` logs the warning once too, and the exported guard answers 403', async () => {
     process.env.NODE_ENV = 'production';
     const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    await boot(DurableDashboardModule.forRoot({ routes: false }));
+    const server = await boot(DurableDashboardModule.forRoot({ routes: false }), [OpsApi]);
     expect(warn.mock.calls.filter(([m]) => m === CONSOLE_AUTHORIZE_MISSING_WARNING)).toHaveLength(
-      0,
+      1,
     );
+    const res = await request(server).get('/ops/durable/api/runs');
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: 'forbidden' });
   });
 });
 
@@ -511,6 +579,22 @@ class OpsUi extends DurableUiControllerBase {}
 @Controller('ops/durable/api')
 @UseConsoleAuthorize()
 class OpsApi extends DurableApiControllerBase {}
+
+/** Stands in for the app's authentication: sets `request.user` from a header. */
+@Injectable()
+class HeaderAuthGuard {
+  canActivate(c: ExecutionContext): boolean {
+    const req = c.switchToHttp().getRequest();
+    if (req.headers['x-session']) req.user = { role: req.headers['x-session'] };
+    return true;
+  }
+}
+
+// Listed ABOVE the app's auth guard: class decorators apply bottom-up, so the auth guard runs first.
+@Controller('auth/durable/api')
+@UseConsoleAuthorize()
+@UseGuards(HeaderAuthGuard)
+class AuthedApi extends DurableApiControllerBase {}
 
 describe('`routes: false` with @UseConsoleAuthorize()', () => {
   afterEach(async () => {
@@ -537,5 +621,19 @@ describe('`routes: false` with @UseConsoleAuthorize()', () => {
     const page = await request(server).get('/ops/durable').set('Accept', 'text/html');
     expect(page.status).toBe(302);
     expect(page.headers.location).toBe('/login');
+  });
+
+  it('listed above the app auth guard, `authorize` sees the user that guard set', async () => {
+    const server = await boot(
+      DurableDashboardModule.forRoot({ routes: false, authorize: byRole }),
+      [AuthedApi],
+    );
+    expect(
+      (await request(server).get('/auth/durable/api/runs').set('x-session', 'admin')).status,
+    ).toBe(200);
+    expect(
+      (await request(server).get('/auth/durable/api/runs').set('x-session', 'viewer')).status,
+    ).toBe(403);
+    expect((await request(server).get('/auth/durable/api/runs')).status).toBe(401);
   });
 });

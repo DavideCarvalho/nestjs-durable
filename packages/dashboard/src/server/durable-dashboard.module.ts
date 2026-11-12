@@ -100,8 +100,9 @@ export interface DurableDashboardOptions {
    * `basePath`/`apiBasePath` still matter here: they are where you mounted the two controllers, and
    * the SPA is told to load its assets from `basePath` and fetch from `apiBasePath`.
    *
-   * No boot warning is logged for a missing `authorize` here: the routes are yours, protected by
-   * what you put on them like any other route you write. The `*Base` classes carry no
+   * `authorize` omitted works as for mounted routes: `@UseConsoleAuthorize()` lets every request
+   * through outside production and answers `403` in production, and the boot warning is logged.
+   * The `*Base` classes carry no
    * guards and no `Can.Anyone()` mark, so under `@nestjs/authorization`'s global guard a subclass
    * without a `@Can()` is denied. `decorators` throws when combined with `routes: false` rather than
    * being silently ignored.
@@ -162,11 +163,9 @@ export class DurableApiModule {
         // @nestjs/authorization, fails here rather than on the first request.
         {
           provide: CONSOLE_AUTHORIZE_DECIDE,
+          // Also with `routes: false`: `@UseConsoleAuthorize()` still applies the production 403.
           useFactory: (moduleRef: ModuleRef) =>
-            resolveConsoleAuthorize(options.authorize, moduleRef, {
-              // A self-mounted console's routes are protected by what the host puts on them.
-              warnIfMissing: routes,
-            }),
+            resolveConsoleAuthorize(options.authorize, moduleRef),
           inject: [ModuleRef],
         },
         // `@dudousxd/nestjs-filter` is wired PRIVATELY here rather than through
