@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-workflows-remote",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Remote steps for the official @nestjs/workflows engine: run a step on a nestjs-durable worker (Node or Python) over durable’s transports, without holding the instance’s lease",
   "license": "MIT",
   "author": "Davide Carvalho",

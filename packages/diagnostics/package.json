@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-diagnostics",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Aviary diagnostics bus integration for nestjs-durable — every run/step event on aviary:durable:*",
   "license": "MIT",
   "author": "Davide Carvalho",

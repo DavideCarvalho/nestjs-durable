@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-durable-workflows-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The nestjs-durable dashboard over the official @nestjs/workflows engine — runs, journal timeline, children, retry/cancel and live updates",
   "license": "MIT",
   "author": "Davide Carvalho",
