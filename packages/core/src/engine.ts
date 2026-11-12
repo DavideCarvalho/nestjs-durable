@@ -556,6 +556,8 @@ const PARENT_NOTIFY_BACKOFF_MS = 250;
 const LEASE_RECHECK_MAX_MS = 2_000;
 const LEASE_RECHECK_SLACK_MS = 100;
 const LEASE_RECHECK_ATTEMPTS = 30;
+/** How often, at most, an explicit retry of a `failed` run polls a lease it found held (see `takeLeaseForRetry`). */
+const RETRY_LEASE_POLL_MS = 100;
 
 /**
  * Why a run is being woken: a step fan's barrier opened (`fans`: the fan's first seq -> the highest
@@ -6994,20 +6996,86 @@ export class WorkflowEngine {
       if (
         !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
       ) {
-        if (reason.generic) {
-          // One generic request per re-check cycle: the wakes that pile up behind one turn share it.
-          if (!this.genericWakeRequested.has(run.id)) {
-            this.genericWakeRequested.add(run.id);
-            this.inBackground(this.requestWakeAfterTurn(run.id, null));
-          }
-        } else {
-          const fans: FanWakeRequest = { fans: [...reason.fans] };
-          this.inBackground(this.requestWakeAfterTurn(run.id, fans));
+        // Only an explicit retry reaches here with a `failed` run (see resumeLoadedRun). A kept wake
+        // treats `failed` as final and would drop it, so the retry waits for the lease instead.
+        if (run.status === 'failed') {
+          const taken = await this.takeLeaseForRetry(run.id);
+          if ('result' in taken) return taken.result;
+          return this.executeLeased(taken.run, fn, registered);
         }
-        this.recheckAfterLease(run.id, run.lockedUntil);
-        return { runId: run.id, status: run.status };
+        return this.keepWakeForHeldLease(run, reason);
       }
     }
+    return this.executeLeased(run, fn, registered);
+  }
+
+  /**
+   * A wake that found `run`'s lease held by another execution: keep it for that execution to honor
+   * once it releases the lease, and answer with the run's status as read.
+   */
+  private keepWakeForHeldLease(run: WorkflowRun, reason: WakeReason): RunResult {
+    if (reason.generic) {
+      // One generic request per re-check cycle: the wakes that pile up behind one turn share it.
+      if (!this.genericWakeRequested.has(run.id)) {
+        this.genericWakeRequested.add(run.id);
+        this.inBackground(this.requestWakeAfterTurn(run.id, null));
+      }
+    } else {
+      const fans: FanWakeRequest = { fans: [...reason.fans] };
+      this.inBackground(this.requestWakeAfterTurn(run.id, fans));
+    }
+    this.recheckAfterLease(run.id, run.lockedUntil);
+    return { runId: run.id, status: run.status };
+  }
+
+  /**
+   * Take `runId`'s lease for an explicit retry of a `failed` run that found it held: the turn that
+   * failed the run has not released it yet, or another instance holds it for a moment. Polls the
+   * lease with the usual fenced take ({@link StateStore.tryLockRun}, which also takes over a lease
+   * that expired; the old holder's renewal then fences it) until it is free. Returns the run, read
+   * under the lease, while it is still `failed`; or the run's state when something else moved it on
+   * meanwhile (nothing to retry). Throws when the lease stays held by a live execution for longer
+   * than one lease period, or the engine starts draining: the retry is refused, never dropped.
+   */
+  private async takeLeaseForRetry(
+    runId: string,
+  ): Promise<{ run: WorkflowRun } | { result: RunResult }> {
+    const giveUpAt = Date.now() + this.leaseMs + LEASE_RECHECK_MAX_MS;
+    for (;;) {
+      const current = await this.store.getRun(runId);
+      if (!current) throw new Error(`run ${runId} not found`);
+      if (current.status !== 'failed') return { result: this.resultOf(current) };
+      const nowMs = this.clock();
+      if (await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs)) {
+        const fresh = await this.store.getRun(runId);
+        if (fresh?.status === 'failed') return { run: fresh };
+        await this.releaseLeaseBestEffort(runId);
+        return { result: fresh ? this.resultOf(fresh) : await this.echoCurrentStatus(runId) };
+      }
+      if (this.draining || Date.now() >= giveUpAt) {
+        throw new Error(
+          `run ${runId} could not be retried: its lease is held by ${current.lockedBy ?? 'another execution'}${
+            this.draining ? ' and this engine is draining' : ''
+          }; resume it again once that execution settles`,
+        );
+      }
+      const leaseLeft = (current.lockedUntil ?? nowMs) - nowMs;
+      const wait = Math.min(RETRY_LEASE_POLL_MS, Math.max(10, leaseLeft + LEASE_RECHECK_SLACK_MS));
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  }
+
+  /** `run` as a {@link RunResult}. */
+  private resultOf(run: WorkflowRun): RunResult {
+    return { runId: run.id, status: run.status, output: run.output, error: run.error };
+  }
+
+  /** The body of {@link execute} once this instance holds `run`'s lease. */
+  private async executeLeased(
+    run: WorkflowRun,
+    fn: WorkflowFn,
+    registered: RegisteredWorkflow | undefined,
+  ): Promise<RunResult> {
     const settledFans = new Map<number, number>();
     this.turnSettledFans.set(run.id, settledFans);
     const held = this.holdExecutionLease(run.id);
