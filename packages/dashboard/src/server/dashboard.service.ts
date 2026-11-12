@@ -28,7 +28,7 @@ import {
   collectMetrics,
   parseWebhookToken,
 } from '@dudousxd/nestjs-durable-core';
-import { Inject, Injectable, Optional } from '@nestjs/common';
+import { Inject, Injectable, NotImplementedException, Optional } from '@nestjs/common';
 import { Observable } from 'rxjs';
 
 // Single source of truth: core owns `RunDetail` (`run-gateway.ts`) — re-exported here (not
@@ -78,7 +78,9 @@ export class DashboardService {
    */
   private controlPlane(): { store: StateStore; engine: WorkflowEngine } {
     if (!this.store || !this.engine) {
-      throw new Error(
+      // A 501, not a 500: a tenant is a supported deployment that simply doesn't serve this
+      // operation (a third-party webhook POSTed to a tenant must go to the control plane).
+      throw new NotImplementedException(
         'This durable dashboard operation requires the control plane (not available on a tenant deployment).',
       );
     }

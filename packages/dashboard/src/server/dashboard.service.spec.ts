@@ -93,6 +93,14 @@ function fakeGateway(overrides: FakeGatewayOverrides): RunGateway {
 }
 
 describe('DashboardService', () => {
+  it('a control-plane-only operation on a tenant is a 501, not a 500 (e.g. a webhook POSTed to a tenant)', async () => {
+    const service = new DashboardService(fakeGateway({})); // tenant shape: no store/engine
+    await expect(service.deliverWebhook('wh:r1:0', {})).rejects.toMatchObject({
+      status: 501,
+      message: expect.stringContaining('requires the control plane'),
+    });
+  });
+
   it('routes run-ops through the gateway (tenant shape: no store/engine)', async () => {
     const calls: string[] = [];
     const gateway = fakeGateway({ record: (call) => calls.push(call) });
