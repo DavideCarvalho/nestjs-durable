@@ -11,11 +11,13 @@ import {
   StreamableFile,
 } from '@nestjs/common';
 import { ConsolePage } from './console-authorize.js';
+import { DURABLE_CONSOLE_ID, consoleSwitcherConfig } from './console-switcher.js';
+import { DASHBOARD_API_PATH, DASHBOARD_BASE_PATH } from './tokens.js';
 
-/** DI token carrying the UI mount base (e.g. `/durable`). */
-export const DASHBOARD_BASE_PATH = Symbol('DASHBOARD_BASE_PATH');
-/** DI token carrying the JSON API base the SPA fetches from (e.g. `/api/durable`). */
-export const DASHBOARD_API_PATH = Symbol('DASHBOARD_API_PATH');
+export { DASHBOARD_API_PATH, DASHBOARD_BASE_PATH };
+
+/** The id of the page's JSON config block. */
+export const DURABLE_DASHBOARD_CONFIG_ID = 'durable-dashboard-config';
 
 /** The base the SPA bundle was built with (Vite `base`); rewritten to the configured base at serve time. */
 const BUILD_BASE = '/durable';
@@ -73,8 +75,21 @@ export class DurableUiControllerBase {
       `="${this.basePath}/`,
     );
     // __DURABLE_BASE__ = where assets load; __DURABLE_API__ = where the SPA fetches the JSON API.
-    const inject = `<script>window.__DURABLE_BASE__='${this.basePath}';window.__DURABLE_API__='${this.apiBasePath}';</script>`;
+    const inject = `<script>window.__DURABLE_BASE__='${this.basePath}';window.__DURABLE_API__='${this.apiBasePath}';</script>${this.configBlock()}`;
     return html.includes('</head>') ? html.replace('</head>', `${inject}</head>`) : inject + html;
+  }
+
+  /**
+   * The page's JSON config block (`durable-dashboard-config`, CSP-safe: data, not script). It
+   * carries `switcher` only when another Aviary console is registered.
+   */
+  private configBlock(): string {
+    const switcher = consoleSwitcherConfig(DURABLE_CONSOLE_ID, `${this.apiBasePath}/consoles`);
+    const json = JSON.stringify({
+      apiBase: this.apiBasePath,
+      ...(switcher !== undefined ? { switcher } : {}),
+    }).replaceAll('<', '\\u003c');
+    return `<script type="application/json" id="${DURABLE_DASHBOARD_CONFIG_ID}">${json}</script>`;
   }
 
   @Get('assets/:file')

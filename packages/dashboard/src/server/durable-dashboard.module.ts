@@ -8,8 +8,10 @@ import {
   UseConsoleAuthorize,
   resolveConsoleAuthorize,
 } from './console-authorize.js';
+import { DurableConsoleRegistration, DurableConsolesController } from './console-switcher.js';
 import { controllerFor, markOpenToAuthorization } from './controller-decorators.js';
 import { DashboardService } from './dashboard.service.js';
+import { DurableDevToolsRegistration } from './dev-tools.js';
 import { DurableApiController } from './durable-api.controller.js';
 import {
   DASHBOARD_API_PATH,
@@ -18,6 +20,7 @@ import {
 } from './durable-ui.controller.js';
 import { RUN_QUERY_ADAPTER, RunQueryAdapter } from './run-query.adapter.js';
 import { RunFilter } from './run.filter.js';
+import { DASHBOARD_DEV_TOOLS } from './tokens.js';
 
 // Every controller this module mounts is open to `@nestjs/authorization`'s global guard, which
 // denies by default: access is decided by `authorize` (the console's own guard), and a `@Can()`
@@ -26,6 +29,7 @@ import { RunFilter } from './run.filter.js';
 // declares a `@Can()` (or `@Can.Anyone()`).
 markOpenToAuthorization(DurableApiController);
 markOpenToAuthorization(DurableUiController);
+markOpenToAuthorization(DurableConsolesController);
 
 export interface DurableDashboardOptions {
   /**
@@ -113,6 +117,12 @@ export interface DurableDashboardOptions {
    * strings that keep their meaning (where the console lives) whether or not this module mounts it.
    */
   routes?: boolean;
+  /**
+   * Register the console's reads and run/schedule actions as developer tools on the agent MCP
+   * server's dev endpoint (`/mcp/aviary`), gated by this console's `authorize`. Default: on when
+   * the console's routes are mounted, off with `routes: false`.
+   */
+  devTools?: boolean;
 }
 
 /** `routes: false` mounts nothing, so `decorators` would decorate nothing. Refuse it at boot. */
@@ -153,14 +163,23 @@ export class DurableApiModule {
     decorators?: ClassDecorator[];
     /** See {@link DurableDashboardOptions.authorize}. */
     authorize?: ConsoleAuthorize;
+    /** See {@link DurableDashboardOptions.devTools}. Default: on when the routes are mounted. */
+    devTools?: boolean;
   }): DynamicModule {
     const routes = options.routes !== false;
     return {
       module: DurableApiModule,
       imports: [...(options.imports ?? [])],
-      controllers: routes ? [consoleController(DurableApiController, options.decorators)] : [],
+      controllers: routes
+        ? [
+            consoleController(DurableApiController, options.decorators),
+            consoleController(DurableConsolesController, options.decorators),
+          ]
+        : [],
       providers: [
         DashboardService,
+        { provide: DASHBOARD_DEV_TOOLS, useValue: options.devTools ?? routes },
+        DurableDevToolsRegistration,
         // Resolved at boot: a gate name without nestjs-authz, or a policy without
         // @nestjs/authorization, fails here rather than on the first request.
         {
@@ -231,6 +250,7 @@ export class DurableDashboardModule {
       const api = DurableApiModule.register({
         ...(options.imports ? { imports: options.imports } : {}),
         ...(options.authorize !== undefined ? { authorize: options.authorize } : {}),
+        ...(options.devTools !== undefined ? { devTools: options.devTools } : {}),
         routes: false,
       });
       return {
@@ -255,6 +275,7 @@ export class DurableDashboardModule {
           ...(options.imports ? { imports: options.imports } : {}),
           ...(options.decorators ? { decorators: options.decorators } : {}),
           ...(options.authorize !== undefined ? { authorize: options.authorize } : {}),
+          ...(options.devTools !== undefined ? { devTools: options.devTools } : {}),
         }),
         RouterModule.register([
           { path: basePath, module: DurableDashboardModule }, // the UI controller below
@@ -262,7 +283,8 @@ export class DurableDashboardModule {
         ]),
       ],
       controllers: [consoleController(DurableUiController, options.decorators)],
-      providers: pathProviders,
+      // The console switcher lists this console only where it serves its own page.
+      providers: [...pathProviders, DurableConsoleRegistration],
       // Re-export the API module so its DashboardService reaches importers (e.g. flip's own controllers).
       exports: [DurableApiModule],
     };

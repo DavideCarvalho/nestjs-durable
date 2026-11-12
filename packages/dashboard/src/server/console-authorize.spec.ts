@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import { createHash } from 'node:crypto';
 import { AuthorizationModule, Policy } from '@nestjs/authorization';
 import {
   Controller,
@@ -23,6 +24,7 @@ import {
   type ConsoleAuthorizeResult,
   type ConsoleAuthorizer,
   UseConsoleAuthorize,
+  anyAuthorize,
   authorizeByToken,
   normalizeConsoleResult,
   resolveConsoleAuthorize,
@@ -324,6 +326,7 @@ describe('resolveConsoleAuthorize: omitted', () => {
     process.env.NODE_ENV = 'development';
     expect(await (await resolveConsoleAuthorize(undefined, moduleRef, { logger }))(ctx)).toEqual({
       allowed: true,
+      caller: 'dev-open',
     });
     process.env.NODE_ENV = 'production';
     expect(await (await resolveConsoleAuthorize(undefined, moduleRef, { logger }))(ctx)).toEqual({
@@ -337,13 +340,17 @@ describe('resolveConsoleAuthorize: omitted', () => {
   });
 });
 
+const CALLER = `token:${createHash('sha256').update('s3cret').digest('hex').slice(0, 12)}`;
+
 describe('authorizeByToken', () => {
   const decide = authorizeByToken({ token: 's3cret' }) as (
     c: ExecutionContext,
   ) => ConsoleAuthorizeResult;
 
-  it('allows the matching bearer token', () => {
-    expect(decide(contextFor({ headers: { authorization: 'Bearer s3cret' } }))).toBe(true);
+  it('allows the matching bearer token, naming the caller by a hash of the token', () => {
+    const decision = decide(contextFor({ headers: { authorization: 'Bearer s3cret' } }));
+    expect(decision).toEqual({ allowed: true, caller: CALLER });
+    expect(JSON.stringify(decision)).not.toContain('s3cret');
   });
 
   it('a wrong token, another scheme or no header is unauthenticated', () => {
@@ -359,6 +366,66 @@ describe('authorizeByToken', () => {
   it('throws on an empty or missing token (config time)', () => {
     expect(() => authorizeByToken({ token: '' })).toThrow(/empty/);
     expect(() => authorizeByToken({ token: undefined })).toThrow(/empty/);
+  });
+});
+
+describe('anyAuthorize', () => {
+  async function decideWith(...forms: ConsoleAuthorize[]) {
+    const { moduleRef } = await moduleRefWith();
+    return resolveConsoleAuthorize(anyAuthorize(...forms), moduleRef, silent);
+  }
+
+  it('allows when any form allows: a token OR a DI class', async () => {
+    const decide = await decideWith(authorizeByToken({ token: 's3cret' }), ConsoleAccess);
+    expect(await decide(contextFor({ headers: { authorization: 'Bearer s3cret' } }))).toEqual({
+      allowed: true,
+      caller: CALLER,
+    });
+    expect(await decide(contextFor({ headers: { 'x-ok': '1' } }))).toEqual({ allowed: true });
+    expect(await decide(contextFor({ headers: { 'x-ok': '0' } }))).toEqual({
+      allowed: false,
+      reason: 'unauthenticated',
+    });
+  });
+
+  it('keeps the caller of the form that allowed, not of a token that did not match', async () => {
+    const decide = await decideWith(authorizeByToken({ token: 's3cret' }), () => ({
+      allowed: true,
+      caller: 'user:9',
+    }));
+    expect(await decide(contextFor({ headers: { authorization: 'Bearer nope' } }))).toEqual({
+      allowed: true,
+      caller: 'user:9',
+    });
+  });
+
+  it('is unauthenticated when any form said so, keeping the first redirectTo', async () => {
+    const decide = await decideWith(
+      () => false,
+      () => ({ redirectTo: '/login' }),
+      () => ({ allowed: false, reason: 'unauthenticated' }) as const,
+    );
+    expect(await decide(ctx)).toEqual({
+      allowed: false,
+      reason: 'unauthenticated',
+      redirectTo: '/login',
+    });
+  });
+
+  it('is forbidden when every form forbids, and stops at the first allow', async () => {
+    const last = vi.fn(() => true);
+    const forbidden = await decideWith(
+      () => false,
+      () => ({ allowed: false, reason: 'forbidden' }) as const,
+    );
+    expect(await forbidden(ctx)).toEqual({ allowed: false, reason: 'forbidden' });
+    const first = await decideWith(() => true, last);
+    expect(await first(ctx)).toEqual({ allowed: true });
+    expect(last).not.toHaveBeenCalled();
+  });
+
+  it('needs at least one form', () => {
+    expect(() => anyAuthorize()).toThrow(/at least one/);
   });
 });
 

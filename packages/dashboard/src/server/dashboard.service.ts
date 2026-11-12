@@ -320,6 +320,30 @@ export class DashboardService {
     return { runId: run.id, status: fresh?.status ?? run.status };
   }
 
+  /**
+   * What this deployment can serve: `controlPlane` (signals, run events, updates, metrics) and
+   * `schedules` (persisted schedules). Both are false on a store-less tenant.
+   */
+  capabilities(): { controlPlane: boolean; schedules: boolean } {
+    const controlPlane = this.store !== undefined && this.engine !== undefined;
+    return { controlPlane, schedules: controlPlane && this.engine?.schedules?.supported === true };
+  }
+
+  /** Whether `runId` names a run the caller may see (tenancy applies). */
+  async runExists(runId: string): Promise<boolean> {
+    if (this.gateway.getRun) return (await this.gateway.getRun(runId)) !== null;
+    return (await this.gateway.getRunDetail(runId, { summarizeFansOver: 0 })) !== null;
+  }
+
+  /**
+   * Deliver `payload` to the run waiting on `token` (`engine.signal`). Null when no run the caller
+   * may see waits on it yet: the engine then buffers the payload for the run that waits next.
+   * Control-plane-only.
+   */
+  signal(token: string, payload: unknown): Promise<RunResult | null> {
+    return this.controlPlane().engine.signal(token, payload);
+  }
+
   /** Side-effect-free read of a value a run published via `ctx.setEvent` (a live query). Control-plane-only. */
   async getEvent(runId: string, key: string): Promise<unknown> {
     return this.controlPlane().engine.getEvent(runId, key);
