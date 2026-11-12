@@ -1585,7 +1585,9 @@ export class WorkflowEngine {
           // token grants `tenancy:*` or `tenancy:<id>`, else the run gets no customer tenant.
           ...(message.tenantId !== undefined
             ? grantsClientTenant(verified, message.tenantId)
-              ? { tenantId: message.tenantId, tenantKind: message.tenantKind }
+              ? message.tenantKind !== undefined
+                ? { tenantId: message.tenantId, tenantKind: message.tenantKind }
+                : { tenantId: message.tenantId }
               : { tenantId: null }
             : {}),
         },

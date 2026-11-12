@@ -116,6 +116,15 @@ describe('WorkflowEngine — a customer tenant claimed on a start-run (A4)', () 
     }
   });
 
+  it('keeps a claim with no kind without inventing one', async () => {
+    const { store, transport } = setup(SECRET, ['tenancy:*']);
+    const { tenantKind: _kind, ...withoutKind } = claim('org_1');
+    await transport.deliver(withoutKind);
+    const [run] = await store.listRuns({});
+    expect(run?.tenantId).toBe('org_1');
+    expect(run && 'tenantKind' in run).toBe(false);
+  });
+
   it('never trusts a claim from an unverified process', async () => {
     const { store, transport } = setup();
     await transport.deliver({ ...claim('org_1'), tenant: 'acme' });

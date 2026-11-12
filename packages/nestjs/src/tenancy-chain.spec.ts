@@ -274,6 +274,24 @@ describe('a tenant process (A4 and narrowing)', () => {
       expect(tx.requests.some((r) => r.body.kind === 'cancel')).toBe(false);
       expect(await gw.cancel('mine')).toMatchObject({ status: 'cancelled' });
     });
+    // A tenant-required request with no tenant rejects every call, never throws synchronously.
+    required = true;
+    await als.run({}, async () => {
+      for (const call of [
+        () => gw.listRuns({}),
+        () => gw.runFacets({}),
+        () => gw.runValueFacets({ field: 'workflow' }, {}),
+        () => gw.cancel('mine'),
+        () => gw.getRun('mine'),
+      ]) {
+        let result: Promise<unknown> | undefined;
+        expect(() => {
+          result = call();
+        }).not.toThrow();
+        await expect(result).rejects.toBeInstanceOf(TenantRequiredError);
+      }
+    });
+    required = false;
     // Outside a request (a script, the operator's own work): nothing is narrowed.
     await gw.listRuns({ workflow: 'w' });
     expect(tx.requests.at(-1)?.body.query).toEqual({ workflow: 'w' });

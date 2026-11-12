@@ -132,10 +132,21 @@ export class ProxyRunGateway implements RunGateway {
     return filter && filter.mode !== 'system' && filter.mode !== 'all' ? filter : undefined;
   }
 
-  /** Narrow a list/count query to the runs the request may see. */
-  private scoped<Q extends RunQuery | RunFacetQuery>(query: Q): Q {
-    const filter = this.restrictive();
-    return filter ? scopeTenantQuery(query, filter) : query;
+  /**
+   * Send `query`, narrowed to the runs the request may see. A tenant-required request with no
+   * tenant rejects (never throws synchronously).
+   */
+  private scoped<Q extends RunQuery | RunFacetQuery, T>(
+    query: Q,
+    send: (q: Q) => Promise<T>,
+  ): Promise<T> {
+    let filter: TenantFilter | undefined;
+    try {
+      filter = this.restrictive();
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    return send(filter ? scopeTenantQuery(query, filter) : query);
   }
 
   /** `run` when the request may see it, else null (an invisible run reads like a missing one). */
@@ -150,7 +161,14 @@ export class ProxyRunGateway implements RunGateway {
   /** Run a control call unless the request may not act on `runId` (then `null`, like a missing run).
    *  Sent at once when nothing narrows the request. */
   private guarded<T>(runId: string, call: () => Promise<T | null>): Promise<T | null> {
-    if (!this.restrictive()) return call();
+    let filter: TenantFilter | undefined;
+    try {
+      filter = this.restrictive();
+    } catch (err) {
+      // A tenant-required request with no tenant: reject, like every other read.
+      return Promise.reject(err);
+    }
+    if (!filter) return call();
     return this.hidden(runId).then((hidden) => (hidden ? null : call()));
   }
 
@@ -289,12 +307,12 @@ export class ProxyRunGateway implements RunGateway {
   /** The control plane's `StoreRunGateway` resolves each run's `waiting` descriptor; the reply carries
    *  it through as plain JSON, so a tenant's list rows name the wait too. */
   listRuns(query: RunQuery): Promise<RunListItem[]> {
-    return this.request<RunListItem[]>({ kind: 'listRuns', query: this.scoped(query) });
+    return this.scoped(query, (q) => this.request<RunListItem[]>({ kind: 'listRuns', query: q }));
   }
 
   /** Counted on the operator, over the same tenant-scoped predicates its `listRuns` reply obeys. */
   runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
-    return this.request<RunFacetRow[]>({ kind: 'runFacets', query: this.scoped(query) });
+    return this.scoped(query, (q) => this.request<RunFacetRow[]>({ kind: 'runFacets', query: q }));
   }
 
   /** Enumerated on the operator, over the same tenant-scoped predicates its `listRuns` reply obeys —
@@ -304,12 +322,9 @@ export class ProxyRunGateway implements RunGateway {
     query: RunFacetQuery,
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]> {
-    return this.request<RunValueFacetRow[]>({
-      kind: 'runValueFacets',
-      axis,
-      query: this.scoped(query),
-      opts,
-    });
+    return this.scoped(query, (q) =>
+      this.request<RunValueFacetRow[]>({ kind: 'runValueFacets', axis, query: q, opts }),
+    );
   }
 
   /** Round-trips to the operator, which scopes the result to this tenant's own `@<tenant>` groups. */
