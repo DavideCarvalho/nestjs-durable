@@ -15,12 +15,21 @@ None of these has an alias.
 
 | Removed | Use instead |
 |---|---|
-| `RUN_GATEWAY` (`@dudousxd/nestjs-durable`, `-dashboard`) | The `RunGateway` class, which is its own DI token: `constructor(private readonly gateway: RunGateway)`, or `moduleRef.get(RunGateway)` |
-| `STATE_STORE`, `TRANSPORT`, `DURABLE_OPTIONS` (`-core`), the `Symbol.for('nestjs-durable:…')` tokens | `STATE_STORE_CANONICAL`, `TRANSPORT_CANONICAL`, `DURABLE_OPTIONS_CANONICAL` (`Symbol.for('@dudousxd/nestjs-durable:state-store' \| 'transport' \| 'options')`) |
+| `RUN_GATEWAY` (`-dashboard`) | The `RunGateway` class, which is its own DI token: `constructor(private readonly gateway: RunGateway)`, or `moduleRef.get(RunGateway)` |
 | `@DurableStep(...)` | `@Step(...)`, which writes the same metadata |
 | `@OnEvent(...)` | `@OnDurableEvent(...)` |
 | `@Workflow({ inputSchema })` | `@Workflow({ input })`, which takes the same Standard Schema or DTO class |
 | `RunSchedulesOptions.sleep` (`-core`), which was no longer called | Nothing. Drop the option |
+| `InternalWorkflowCtx` (`-core`) | `WorkflowCtx` |
+
+## Deprecated, still exported
+
+Published releases of other `@dudousxd/*` packages import these, so they stay. New code should use the replacement.
+
+| Deprecated | Use instead |
+|---|---|
+| `RUN_GATEWAY` (`@dudousxd/nestjs-durable`), which is the `RunGateway` class | The `RunGateway` class: `constructor(private readonly gateway: RunGateway)` |
+| `STATE_STORE`, `TRANSPORT`, `DURABLE_OPTIONS` (`-core`), bound to the same instances | `STATE_STORE_CANONICAL`, `TRANSPORT_CANONICAL`, `DURABLE_OPTIONS_CANONICAL` |
 
 ```ts
 // Before

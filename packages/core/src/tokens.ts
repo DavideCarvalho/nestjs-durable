@@ -22,3 +22,19 @@
 export const STATE_STORE_CANONICAL = Symbol.for('@dudousxd/nestjs-durable:state-store');
 export const TRANSPORT_CANONICAL = Symbol.for('@dudousxd/nestjs-durable:transport');
 export const DURABLE_OPTIONS_CANONICAL = Symbol.for('@dudousxd/nestjs-durable:options');
+
+/**
+ * @deprecated Use {@link STATE_STORE_CANONICAL}. Kept because published `@dudousxd/nestjs-durable`
+ * releases import it from core; `DurableModule` binds it to the same instance as the canonical token.
+ */
+export const STATE_STORE = Symbol.for('nestjs-durable:STATE_STORE');
+/**
+ * @deprecated Use {@link TRANSPORT_CANONICAL}. Kept because published `@dudousxd/nestjs-durable`
+ * releases import it from core; `DurableModule` binds it to the same instance as the canonical token.
+ */
+export const TRANSPORT = Symbol.for('nestjs-durable:TRANSPORT');
+/**
+ * @deprecated Use {@link DURABLE_OPTIONS_CANONICAL}. Kept because published `@dudousxd/nestjs-durable`
+ * releases import it from core; `DurableModule` binds it to the same instance as the canonical token.
+ */
+export const DURABLE_OPTIONS = Symbol.for('nestjs-durable:DURABLE_OPTIONS');

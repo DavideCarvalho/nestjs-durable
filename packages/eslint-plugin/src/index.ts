@@ -4,8 +4,12 @@ export const rules = {
   'no-nondeterminism': noNondeterminism,
 };
 
+// Read at load time, so `meta.version` (part of ESLint's cache key) always matches the release.
+// `../package.json` resolves to the package root from both `src/` and the built `dist/`.
+const { name, version } = require('../package.json') as { name: string; version: string };
+
 const plugin = {
-  meta: { name: '@dudousxd/nestjs-durable-eslint-plugin', version: '0.1.0' },
+  meta: { name, version },
   rules,
   configs: {} as Record<string, unknown>,
 };

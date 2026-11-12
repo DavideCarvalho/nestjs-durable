@@ -27,8 +27,10 @@ Require Node.js 24 or newer: `engines.node` is now `>=24` (was `>=20`, `>=22`, o
 
 Removed, with no alias (see the docs' Upgrading page):
 
-- `@dudousxd/nestjs-durable-core`: the legacy `STATE_STORE`, `TRANSPORT` and `DURABLE_OPTIONS` tokens (`Symbol.for('nestjs-durable:…')`). Use `STATE_STORE_CANONICAL`, `TRANSPORT_CANONICAL` and `DURABLE_OPTIONS_CANONICAL`, which `DurableModule` already bound. Also `RunSchedulesOptions.sleep`, which was no longer called.
-- `@dudousxd/nestjs-durable`: `RUN_GATEWAY` (inject the `RunGateway` class, its own DI token), `@DurableStep` (use `@Step`), `@OnEvent` (use `@OnDurableEvent`), and `@Workflow({ inputSchema })` (use `input`).
+- `@dudousxd/nestjs-durable-core`: `RunSchedulesOptions.sleep`, which was no longer called, and the `InternalWorkflowCtx` type (use `WorkflowCtx`).
+- `@dudousxd/nestjs-durable`: `@DurableStep` (use `@Step`), `@OnEvent` (use `@OnDurableEvent`), and `@Workflow({ inputSchema })` (use `input`).
 - `@dudousxd/nestjs-durable-dashboard`: `RUN_GATEWAY`.
+
+Still exported, deprecated, because published releases of sibling packages import them: `RUN_GATEWAY` from `@dudousxd/nestjs-durable` (it is the `RunGateway` class), and `STATE_STORE`, `TRANSPORT` and `DURABLE_OPTIONS` from `@dudousxd/nestjs-durable-core` (`DurableModule` binds them to the same instances as the `*_CANONICAL` tokens). New code should inject `RunGateway` and the `*_CANONICAL` tokens.
 
 Fixed: the dual ESM/CJS packages could publish without `index.d.cts`. Their ESM and CJS tsup builds run in parallel, and the cleaning one's declaration step deleted the other's output. `dist` is now cleaned once, before both builds. `@dudousxd/nestjs-durable-eslint-plugin` exports `meta` as a named export too, so an ESM `import durable from …` of the CommonJS plugin carries it.

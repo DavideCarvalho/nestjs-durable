@@ -2,15 +2,18 @@ import type { ConcurrencyOption } from '@dudousxd/durable-worker';
 import {
   type AdmissionBackend,
   type ControlPlane,
+  DURABLE_OPTIONS,
   DURABLE_OPTIONS_CANONICAL,
   type NamedTransport,
   type QueueConfig,
   type RetentionPolicy,
   RunGateway,
+  STATE_STORE,
   STATE_STORE_CANONICAL,
   type ScheduledWorkflow,
   type StalledRunInfo,
   type StateStore,
+  TRANSPORT,
   TRANSPORT_CANONICAL,
   type TenantTokenSource,
   type TenantVerifier,
@@ -972,6 +975,10 @@ export class DurableModule {
           }),
           inject: [DURABLE_OPTIONS_CANONICAL, ModuleRef],
         },
+        // Deprecated tokens that published releases still import resolve to the same instances:
+        { provide: STATE_STORE, useExisting: STATE_STORE_CANONICAL },
+        { provide: TRANSPORT, useExisting: TRANSPORT_CANONICAL },
+        { provide: DURABLE_OPTIONS, useExisting: DURABLE_OPTIONS_CANONICAL },
         {
           // Shared token, bound EXACTLY once: a real engine for the operator role, or a store-less
           // `DurableStartClient` facade for a thin worker (no `store`) — either way, `WorkflowService`
@@ -1139,7 +1146,9 @@ export class DurableModule {
         WorkflowService,
         EntityService,
         WorkflowEngine,
+        STATE_STORE,
         STATE_STORE_CANONICAL,
+        TRANSPORT,
         TRANSPORT_CANONICAL,
         DURABLE_OPTIONS_CANONICAL,
         RunGateway,
