@@ -41,7 +41,7 @@ jobs:
           - shard: stores
             packages: packages/store-mikro-orm packages/store-typeorm packages/store-prisma packages/store-drizzle
           - shard: transports
-            packages: packages/transport-bullmq packages/transport-db packages/transport-sqs packages/admission-redis packages/nestjs
+            packages: packages/transport-bullmq packages/transport-db packages/transport-sqs packages/admission-redis packages/nestjs packages/diagnostics
     name: real backends (${{ matrix.shard }})
     services:
       postgres:

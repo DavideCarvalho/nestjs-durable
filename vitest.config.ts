@@ -10,6 +10,10 @@ export default defineConfig({
   // stale `dist/`. Production builds still go through `tsc` per package.
   resolve: {
     alias: {
+      // Before the bare package name: an alias key also matches `<key>/...`.
+      '@dudousxd/nestjs-durable-diagnostics/delivery': fileURLToPath(
+        new URL('./packages/diagnostics/src/delivery/index.ts', import.meta.url),
+      ),
       '@dudousxd/nestjs-durable-core': pkg('core'),
       '@dudousxd/nestjs-durable-testing': pkg('testing'),
       '@dudousxd/nestjs-durable-transport-event-emitter': pkg('transport-event-emitter'),
@@ -41,6 +45,14 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    server: {
+      deps: {
+        // `transports.durable()` imports `@dudousxd/nestjs-durable-diagnostics/delivery` lazily from
+        // inside diagnostics. Inlined, that import goes through the aliases above (the TS source)
+        // instead of Node resolving the package's unbuilt `dist/`.
+        inline: ['@dudousxd/nestjs-diagnostics'],
+      },
+    },
     // Generate the store-prisma SQLite test client once (pre-workers) so it never goes stale against
     // the current schema. See vitest.globalsetup.ts.
     globalSetup: ['./vitest.globalsetup.ts'],

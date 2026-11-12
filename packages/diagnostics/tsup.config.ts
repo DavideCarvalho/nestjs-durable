@@ -5,7 +5,7 @@ import { defineConfig } from 'tsup';
 // `exports` map in package.json points each consumer condition at the matching pair.
 export default defineConfig([
   {
-    entry: ['src/index.ts'],
+    entry: { index: 'src/index.ts', 'delivery/index': 'src/delivery/index.ts' },
     format: ['esm'],
     dts: true,
     clean: true,
@@ -14,7 +14,7 @@ export default defineConfig([
     outDir: 'dist',
   },
   {
-    entry: ['src/index.ts'],
+    entry: { index: 'src/index.ts', 'delivery/index': 'src/delivery/index.ts' },
     format: ['cjs'],
     dts: true,
     clean: false,
