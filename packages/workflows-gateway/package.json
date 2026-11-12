@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/workflows-gateway"
   },
   "homepage": "https://davidecarvalho.github.io/aviary/docs/durable",
@@ -39,7 +39,7 @@
     "dist"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   },
   "scripts": {
     "build": "tsup",

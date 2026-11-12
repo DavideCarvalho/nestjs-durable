@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { DURABLE_OPTIONS, STATE_STORE, TRANSPORT } from './tokens';
+import {
+  DURABLE_OPTIONS,
+  DURABLE_OPTIONS_CANONICAL,
+  STATE_STORE,
+  STATE_STORE_CANONICAL,
+  TRANSPORT,
+  TRANSPORT_CANONICAL,
+} from './tokens';
 
 /**
  * The DI tokens MUST live in the global symbol registry (`Symbol.for`), not be plain `Symbol()`.
@@ -14,6 +21,9 @@ import { DURABLE_OPTIONS, STATE_STORE, TRANSPORT } from './tokens';
  */
 describe('DI tokens', () => {
   it('are registered in the global symbol registry', () => {
+    expect(Symbol.keyFor(STATE_STORE_CANONICAL)).toBe('@dudousxd/nestjs-durable:state-store');
+    expect(Symbol.keyFor(TRANSPORT_CANONICAL)).toBe('@dudousxd/nestjs-durable:transport');
+    expect(Symbol.keyFor(DURABLE_OPTIONS_CANONICAL)).toBe('@dudousxd/nestjs-durable:options');
     expect(Symbol.keyFor(STATE_STORE)).toBe('nestjs-durable:STATE_STORE');
     expect(Symbol.keyFor(TRANSPORT)).toBe('nestjs-durable:TRANSPORT');
     expect(Symbol.keyFor(DURABLE_OPTIONS)).toBe('nestjs-durable:DURABLE_OPTIONS');
@@ -21,8 +31,8 @@ describe('DI tokens', () => {
 
   it('resolve to the same instance a second copy of core would mint', () => {
     // Simulates the token a second, independently-evaluated copy of `core` produces.
-    expect(Symbol.for('nestjs-durable:STATE_STORE')).toBe(STATE_STORE);
-    expect(Symbol.for('nestjs-durable:TRANSPORT')).toBe(TRANSPORT);
-    expect(Symbol.for('nestjs-durable:DURABLE_OPTIONS')).toBe(DURABLE_OPTIONS);
+    expect(Symbol.for('@dudousxd/nestjs-durable:state-store')).toBe(STATE_STORE_CANONICAL);
+    expect(Symbol.for('@dudousxd/nestjs-durable:transport')).toBe(TRANSPORT_CANONICAL);
+    expect(Symbol.for('@dudousxd/nestjs-durable:options')).toBe(DURABLE_OPTIONS_CANONICAL);
   });
 });

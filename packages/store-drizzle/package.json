@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/store-drizzle"
   },
   "homepage": "https://davidecarvalho.github.io/aviary/docs/durable",
@@ -49,7 +49,7 @@
     "@testcontainers/postgresql": "10.18.0",
     "@types/better-sqlite3": "7.6.13",
     "@types/pg": "8.11.10",
-    "better-sqlite3": "12.10.0",
+    "better-sqlite3": "12.11.1",
     "drizzle-orm": "0.45.3",
     "pg": "8.13.1",
     "postgres": "3.4.9",
@@ -78,5 +78,8 @@
         "default": "./dist/pg/index.cjs"
       }
     }
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

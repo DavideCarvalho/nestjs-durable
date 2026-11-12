@@ -22,7 +22,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { UseConsoleAuthorize } from './console-authorize.js';
 import { DurableApiControllerBase } from './durable-api.controller.js';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
-import { RUN_GATEWAY } from './tokens.js';
 
 /** The `ctx.webhook()` callback is not a console route: `authorize` never gates it. */
 
@@ -63,13 +62,12 @@ async function boot(dashboard: DynamicModule, controllers: Type[] = []) {
   @Global()
   @Module({
     providers: [
-      { provide: RUN_GATEWAY, useValue: gateway },
       { provide: RunGateway, useValue: gateway },
       { provide: STATE_STORE_CANONICAL, useValue: store },
       { provide: WorkflowEngine, useValue: engine },
       CountingGuard,
     ],
-    exports: [RUN_GATEWAY, RunGateway, STATE_STORE_CANONICAL, WorkflowEngine, CountingGuard],
+    exports: [RunGateway, STATE_STORE_CANONICAL, WorkflowEngine, CountingGuard],
   })
   class HostDurableModule {}
 

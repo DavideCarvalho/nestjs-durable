@@ -37,8 +37,7 @@ engine.remote("processing", { group: "processing" });
 A step with **no explicit partition inherits its workflow's partition** (an isolation suffix, not a
 routing key), which is what collapses everything onto one worker by default. An operator with no local
 body for a workflow dispatches to a live worker of the same name automatically — convention dispatch
-is the default, not a flag you set. (`@Step` is the NestJS step decorator; `@DurableStep` is a
-deprecated alias.)
+is the default, not a flag you set. (`@Step` is the NestJS step decorator.)
 
 > **Splitting is opt-in (advanced).** Give a step a *different* `partition` than its workflow and run a
 > separate worker there to scale step execution independently of orchestration (e.g. a

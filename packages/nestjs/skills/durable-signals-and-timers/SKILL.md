@@ -3,7 +3,7 @@ name: durable-signals-and-timers
 description: >
   Pause and resume @dudousxd/nestjs-durable workflows — ctx.waitForSignal(token) resumed by
   WorkflowService.signal(token, payload), ctx.waitForEvent(name, { match }) resumed by
-  publishEvent(name, payload), @OnEvent / @Workflow({ onEvent }) event-triggered starts,
+  publishEvent(name, payload), @OnDurableEvent / @Workflow({ onEvent }) event-triggered starts,
   durable ctx.sleep(duration) / ctx.sleepUntil(date), ctx.webhook() for third-party callbacks, and
   signalWithStart for the durable-entity/accumulator pattern. Covers the timeoutMs determinism caveat.
 license: MIT
@@ -81,7 +81,7 @@ export class ApprovalController {
   `workflows.signal(token, payload)`. One token, one waiting run.
 - `ctx.waitForEvent<T>(name, { match?, timeoutMs? })` waits on a named event with optional `match`
   filtering; `workflows.publishEvent(name, payload)` fans out to every run whose `match` the payload
-  satisfies (and starts any `@OnEvent` workflows whose `where` accepts the payload, with
+  satisfies (and starts any `@OnDurableEvent` workflows whose `where` accepts the payload, with
   `input(payload)` as the run's input when the entry maps it). Returns how many runs it touched.
 
 ```ts
@@ -91,14 +91,14 @@ const order = await ctx.waitForEvent<Order>('order.paid', { match: { orderId: id
 
 ### Event-triggered workflow starts
 
-`@Workflow({ onEvent })` or `@OnEvent(...)` start a **fresh run** whenever the event is published —
+`@Workflow({ onEvent })` or `@OnDurableEvent(...)` start a **fresh run** whenever the event is published —
 the payload becomes the run's input, or `input(payload)` when the entry maps it; an entry
 `{ event, where, input }` starts only when `where(payload)` accepts it. `debounce` / `batch` coalesce bursts.
 
 ```ts
-import { Workflow, OnEvent } from '@dudousxd/nestjs-durable';
+import { OnDurableEvent, Workflow } from '@dudousxd/nestjs-durable';
 
-@OnEvent('user.registered', 'user.invited')
+@OnDurableEvent('user.registered', 'user.invited')
 @Workflow({ name: 'welcome', version: '1', debounce: '30s' })
 export class WelcomeWorkflow {
   async run(ctx: WorkflowCtx, user: { id: string }) { /* ... */ }

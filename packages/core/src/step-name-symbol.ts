@@ -7,7 +7,7 @@
  * (pnpm peer-dependency multiplexing, or a dual ESM/CJS load) still reads the SAME key. A plain
  * `Symbol()` would mint a distinct token per copy, so a decorator running against one core instance
  * could stamp a name core's `ctx.step` (a different instance) can never read back. Mirrors the
- * `STATE_STORE` token fix in `./tokens.ts`.
+ * DI token fix in `./tokens.ts`.
  */
 export const DURABLE_STEP_NAME = Symbol.for('durable.step.name');
 

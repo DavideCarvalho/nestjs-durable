@@ -3,6 +3,7 @@ import {
   InMemoryStateStore,
   InMemoryTransport,
   type RemoteTask,
+  RunGateway,
   type StepResult,
   type Transport,
   type WorkflowDecision,
@@ -19,7 +20,6 @@ import { DurableModule, type DurableModuleOptions } from './durable.module';
 import { IN_APP_RUN_REDIS_WORKER } from './in-app-worker';
 import { ProxyRunGateway } from './proxy-run-gateway';
 import { StoreRunGateway } from './store-run-gateway';
-import { RUN_GATEWAY } from './tokens';
 
 @Workflow({ name: 'greet', version: '1' })
 class GreetWorkflow {
@@ -67,7 +67,7 @@ describe('DurableModule.forRoot — role inference', () => {
     expect(engine).toBeInstanceOf(WorkflowEngine);
     expect(engine).not.toBeInstanceOf(DurableStartClient);
 
-    const gateway = moduleRef.get(RUN_GATEWAY, { strict: false });
+    const gateway = moduleRef.get(RunGateway, { strict: false });
     expect(gateway).toBeInstanceOf(StoreRunGateway);
 
     expect(runner.calls).toHaveLength(0);
@@ -92,7 +92,7 @@ describe('DurableModule.forRoot — role inference', () => {
     expect(engine).toBeInstanceOf(DurableStartClient);
     await expect(engine.cancel('r1')).rejects.toThrow(/not available on a tenant worker/);
 
-    const gateway = moduleRef.get(RUN_GATEWAY, { strict: false });
+    const gateway = moduleRef.get(RunGateway, { strict: false });
     expect(gateway).toBeInstanceOf(ProxyRunGateway);
 
     expect(runner.calls).toHaveLength(1);
@@ -174,7 +174,7 @@ describe('DurableModule.forRoot — topology', () => {
       timerPollMs: 0,
     });
     expect(moduleRef.get(WorkflowEngine)).not.toBeInstanceOf(DurableStartClient);
-    expect(moduleRef.get(RUN_GATEWAY, { strict: false })).toBeInstanceOf(StoreRunGateway);
+    expect(moduleRef.get(RunGateway, { strict: false })).toBeInstanceOf(StoreRunGateway);
     await moduleRef.close();
 
     expect(() => DurableModule.forRoot({ topology: 'standalone' })).toThrow(
@@ -192,7 +192,7 @@ describe('DurableModule.forRoot — topology', () => {
     const engine = moduleRef.get(WorkflowEngine);
     expect(engine).toBeInstanceOf(WorkflowEngine);
     expect(engine).not.toBeInstanceOf(DurableStartClient);
-    const gateway = moduleRef.get(RUN_GATEWAY, { strict: false });
+    const gateway = moduleRef.get(RunGateway, { strict: false });
     expect(gateway).toBeInstanceOf(StoreRunGateway);
     expect(gateway.topology()).toEqual({ role: 'control-plane' });
     await moduleRef.close();
@@ -275,7 +275,7 @@ describe('DurableModule.forRoot — topology', () => {
       [],
     );
     expect(moduleRef.get(WorkflowEngine)).toBeInstanceOf(DurableStartClient);
-    const gateway = moduleRef.get(RUN_GATEWAY, { strict: false });
+    const gateway = moduleRef.get(RunGateway, { strict: false });
     expect(gateway).toBeInstanceOf(ProxyRunGateway);
     expect(gateway.topology()).toEqual({ role: 'tenant', tenant: 'tenantA' });
     expect(runner.calls).toHaveLength(1);

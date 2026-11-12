@@ -1,0 +1,42 @@
+---
+title: Upgrading
+description: What to change in your project for the Node.js 24 release of the nestjs-durable packages, and the APIs it removed.
+---
+
+## Node.js 24
+
+Every `@dudousxd/nestjs-durable*` package, and `@dudousxd/durable-worker`, now requires **Node.js 24 or newer**
+(`engines.node` is `>=24`). Upgrade the Node.js version your app and workers run and build on, then upgrade the
+packages. Under `engine-strict`, installing on Node 20 or 22 fails. The Python worker is unaffected.
+
+## Removed APIs
+
+None of these has an alias.
+
+| Removed | Use instead |
+|---|---|
+| `RUN_GATEWAY` (`-dashboard`) | The `RunGateway` class, which is its own DI token: `constructor(private readonly gateway: RunGateway)`, or `moduleRef.get(RunGateway)` |
+| `@DurableStep(...)` | `@Step(...)`, which writes the same metadata |
+| `@OnEvent(...)` | `@OnDurableEvent(...)` |
+| `@Workflow({ inputSchema })` | `@Workflow({ input })`, which takes the same Standard Schema or DTO class |
+| `RunSchedulesOptions.sleep` (`-core`), which was no longer called | Nothing. Drop the option |
+| `InternalWorkflowCtx` (`-core`) | `WorkflowCtx` |
+
+## Deprecated, still exported
+
+Published releases of other `@dudousxd/*` packages import these, so they stay. New code should use the replacement.
+
+| Deprecated | Use instead |
+|---|---|
+| `RUN_GATEWAY` (`@dudousxd/nestjs-durable`), which is the `RunGateway` class | The `RunGateway` class: `constructor(private readonly gateway: RunGateway)` |
+| `STATE_STORE`, `TRANSPORT`, `DURABLE_OPTIONS` (`-core`), bound to the same instances | `STATE_STORE_CANONICAL`, `TRANSPORT_CANONICAL`, `DURABLE_OPTIONS_CANONICAL` |
+
+```ts
+// Before
+@Inject(RUN_GATEWAY) private readonly gateway: RunGateway
+@Inject(STATE_STORE) private readonly store: StateStore
+
+// After
+private readonly gateway: RunGateway
+@Inject(STATE_STORE_CANONICAL) private readonly store: StateStore
+```

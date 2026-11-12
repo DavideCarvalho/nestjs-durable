@@ -6,7 +6,7 @@
 // while tsup still drives the dual ESM+CJS emit and the .d.ts/.d.cts declarations.
 //
 // `.d.ts` is produced by tsup's own DTS step (the TS compiler), unaffected by the JS transform.
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { transform } from '@swc/core';
 import { defineConfig } from 'tsup';
 
@@ -69,8 +69,12 @@ export function decoratorDualConfig(external = [], opts = {}) {
         },
       }
     : {};
+  // The ESM and CJS configs build in parallel, and tsup's DTS step deletes every `.d.*` in `outDir`
+  // when `clean` is set, so a cleaning config can remove the other's `index.d.cts` after it was
+  // written. Clean once, here, before either build starts.
+  rmSync(outDir, { recursive: true, force: true });
   return defineConfig([
-    { ...common, format: ['esm'], dts: true, clean: true },
+    { ...common, format: ['esm'], dts: true, clean: false },
     { ...common, format: ['cjs'], dts: true, clean: false, ...cjsShim },
   ]);
 }

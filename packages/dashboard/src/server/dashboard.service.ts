@@ -38,7 +38,7 @@ export type { RunDetail };
 
 /**
  * Read-model and actions backing the control-plane UI. Run-facing ops (list/detail/retry/cancel/
- * continue/retryWithInput/stream/bulk/workerHealth) route through the injected {@link RUN_GATEWAY}
+ * continue/retryWithInput/stream/bulk/workerHealth) route through the injected {@link RunGateway}
  * port, which the lib binds on both topologies (a store-backed impl on the control plane, a proxy
  * over the transport on a store-less tenant) — so those ops work regardless of whether `store`/
  * `engine` are present (`workerHealth` is scoped to the tenant's own groups over the proxy).

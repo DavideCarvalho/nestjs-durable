@@ -5,6 +5,8 @@ on:
   pull_request:
 
 jobs:
+  # Lint, typecheck, build and package checks run once, on the Node the release is built with
+  # (`.nvmrc`).
   build:
     runs-on: ubuntu-latest
     steps:
@@ -19,6 +21,26 @@ jobs:
       # (vitest.globalsetup.ts) before tests run; lint/typecheck/build don't need it.
       - run: pnpm lint
       - run: pnpm typecheck
+      - run: pnpm build
+      # publint and attw on every packed package: what a consumer installs resolves, types included.
+      - run: pnpm check:package
+
+  # Tests run on every Node major the packages support.
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [24.22.2, 26.13.0]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm test
 
@@ -37,12 +59,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        node: [24.22.2, 26.13.0]
+        shard: [stores, transports]
         include:
           - shard: stores
             packages: packages/store-mikro-orm packages/store-typeorm packages/store-prisma packages/store-drizzle
           - shard: transports
             packages: packages/transport-bullmq packages/transport-db packages/transport-sqs packages/admission-redis packages/nestjs packages/diagnostics
-    name: real backends (${{ matrix.shard }})
+    name: real backends (${{ matrix.shard }}, node ${{ matrix.node }})
     services:
       postgres:
         image: postgres:16-alpine
@@ -93,7 +117,7 @@ jobs:
       - uses: pnpm/action-setup@v6.1.0
       - uses: actions/setup-node@v7.0.0
         with:
-          node-version-file: .nvmrc
+          node-version: ${{ matrix.node }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # The ElasticMQ image ships no shell tool a health-cmd could use, so wait for it from here.

@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/eslint-plugin"
   },
   "homepage": "https://davidecarvalho.github.io/aviary/docs/durable",
@@ -41,5 +41,8 @@
     "@typescript-eslint/utils": "8.70.0",
     "eslint": "9.39.5",
     "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

@@ -210,7 +210,7 @@ function tenantGatewayUnavailable<T>(method: string): Promise<T> {
 }
 
 /**
- * The no-transport fallback bound to `RUN_GATEWAY` for a thin worker (`connection` set, `store`
+ * The no-transport fallback bound to `RunGateway` for a thin worker (`connection` set, `store`
  * unset) that didn't also pass a `transport` — mirrors `DurableStartClient`'s tenant-error idiom
  * (`tenantUnsupported`): every method rejects with a clear, named error instead of a cryptic
  * `this.gateway.X is not a function`. `subscribe` is synchronous on the `RunGateway` port, so it

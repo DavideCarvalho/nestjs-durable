@@ -1,3 +1,4 @@
+import { RunGateway } from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
 import { AuthorizationModule, Can, Policy } from '@nestjs/authorization';
 import {
@@ -21,7 +22,6 @@ import { DashboardService } from './dashboard.service.js';
 import { DurableApiController, DurableApiControllerBase } from './durable-api.controller.js';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
 import { DurableUiController, DurableUiControllerBase } from './durable-ui.controller.js';
-import { RUN_GATEWAY } from './tokens.js';
 
 /**
  * The console under the REAL `@nestjs/authorization`, whose `AuthorizationModule.forRoot()`
@@ -61,7 +61,7 @@ const gateway = {
 };
 
 @Global()
-@Module({ providers: [{ provide: RUN_GATEWAY, useValue: gateway }], exports: [RUN_GATEWAY] })
+@Module({ providers: [{ provide: RunGateway, useValue: gateway }], exports: [RunGateway] })
 class HostGatewayModule {}
 
 let app: NestExpressApplication | undefined;

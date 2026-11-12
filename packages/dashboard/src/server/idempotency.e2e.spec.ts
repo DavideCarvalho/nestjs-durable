@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import {
   InMemoryStateStore,
+  RunGateway,
   STATE_STORE_CANONICAL,
   WorkflowEngine,
 } from '@dudousxd/nestjs-durable-core';
@@ -11,7 +12,6 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
-import { RUN_GATEWAY } from './tokens.js';
 
 /**
  * The recipe the docs give: `@nestjs/idempotency`'s `Idempotent()` passed through the console's
@@ -57,11 +57,11 @@ async function boot() {
   @Global()
   @Module({
     providers: [
-      { provide: RUN_GATEWAY, useValue: gateway },
+      { provide: RunGateway, useValue: gateway },
       { provide: STATE_STORE_CANONICAL, useValue: store },
       { provide: WorkflowEngine, useValue: engine },
     ],
-    exports: [RUN_GATEWAY, STATE_STORE_CANONICAL, WorkflowEngine],
+    exports: [RunGateway, STATE_STORE_CANONICAL, WorkflowEngine],
   })
   class HostDurableModule {}
 

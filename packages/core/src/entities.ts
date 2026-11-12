@@ -1,6 +1,6 @@
 import { FatalError } from './errors';
+import type { WorkflowCtx } from './interfaces';
 import { CORE_ORIGIN } from './origin';
-import type { InternalWorkflowCtx } from './workflow-ctx';
 
 /** One operation on a durable entity: mutate `state` in place and/or return a result. */
 export type EntityHandler<S = unknown> = (state: S, arg: unknown) => unknown | Promise<unknown>;
@@ -18,7 +18,7 @@ export interface EntityHost {
   register(
     name: string,
     version: string,
-    fn: (ctx: InternalWorkflowCtx, input: unknown) => Promise<unknown>,
+    fn: (ctx: WorkflowCtx, input: unknown) => Promise<unknown>,
     opts?: { origin?: string | undefined },
   ): void;
   signalWithStart(
@@ -151,7 +151,7 @@ export class Entities {
   }
 
   /** The built-in runner: one long-lived run per key, processing ops serially over state. */
-  private async run(ctx: InternalWorkflowCtx, input: unknown): Promise<unknown> {
+  private async run(ctx: WorkflowCtx, input: unknown): Promise<unknown> {
     const { name, key } = input as { name: string; key: string };
     const config = this.configs.get(name);
     if (!config) throw new FatalError(`entity "${name}" is not registered`);

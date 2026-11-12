@@ -33,7 +33,7 @@ export class BillingWebhookController {
 1. **Resumes** every in-flight run currently parked on `ctx.waitForEvent(name, { match })` whose
    `match` the payload satisfies — fan-out, unlike a signal's point-to-point token.
 2. **Starts** a fresh run of every workflow registered with `onEvent: [name]` (via
-   `@Workflow({ onEvent })` or `@OnEvent`), passing `payload` as that run's input.
+   `@Workflow({ onEvent })` or `@OnDurableEvent`), passing `payload` as that run's input.
 
 Publishing is **idempotent per subscriber**: pass `opts.id` to dedupe redeliveries of the same
 logical event. Each started run gets the id `evt:<id>:<workflow>`, so redelivering the same `id`
@@ -75,7 +75,7 @@ export class AuditSignupWorkflow {
 <Callout type="info">
 The decorator is named `OnDurableEvent` — not `OnEvent` — because `@nestjs/event-emitter` exports an
 `@OnEvent` of its own, and in an app using both libraries an auto-import picking the wrong one fails
-silently in either direction. `OnEvent` still works as a deprecated alias for one more minor.
+silently in either direction.
 </Callout>
 
 The next time anyone calls `publishEvent('user.registered', { email })`, both workflows above start

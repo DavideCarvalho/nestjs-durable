@@ -41,7 +41,7 @@ describe('guard DI resolution in the API controller host module', () => {
       Global: GlobalDecorator,
     } = await import('@nestjs/common');
     const { NestFactory } = await import('@nestjs/core');
-    const { RUN_GATEWAY } = await import('./tokens.js');
+    const { RunGateway } = await import('@dudousxd/nestjs-durable-core');
 
     @InjectableDecorator()
     class AuthService {
@@ -65,8 +65,8 @@ describe('guard DI resolution in the API controller host module', () => {
     // so DashboardService (inside DurableApiModule) resolves it across the module boundary.
     @GlobalDecorator()
     @ModuleDecorator({
-      providers: [{ provide: RUN_GATEWAY, useValue: {} }],
-      exports: [RUN_GATEWAY],
+      providers: [{ provide: RunGateway, useValue: {} }],
+      exports: [RunGateway],
     })
     class HostGatewayModule {}
 
@@ -103,7 +103,7 @@ describe('the console composes with a host that has its OWN filter adapter', () 
     const { Module: ModuleDecorator, Global: GlobalDecorator } = await import('@nestjs/common');
     const { NestFactory } = await import('@nestjs/core');
     const { FilterModule, FilterRunner } = await import('@dudousxd/nestjs-filter');
-    const { RUN_GATEWAY } = await import('./tokens.js');
+    const { RunGateway } = await import('@dudousxd/nestjs-durable-core');
 
     // A host adapter that would answer WRONGLY for a run query — if the console ever reached for
     // the global adapter, these calls would be non-empty and the run list would come from an ORM
@@ -131,7 +131,7 @@ describe('the console composes with a host that has its OWN filter adapter', () 
     @ModuleDecorator({
       providers: [
         {
-          provide: RUN_GATEWAY,
+          provide: RunGateway,
           useValue: {
             async runValueFacets(axis: unknown) {
               valueFacetCalls.push(axis);
@@ -140,7 +140,7 @@ describe('the console composes with a host that has its OWN filter adapter', () 
           },
         },
       ],
-      exports: [RUN_GATEWAY],
+      exports: [RunGateway],
     })
     class HostGatewayModule {}
 
@@ -174,13 +174,13 @@ describe('the console composes with a host that has its OWN filter adapter', () 
     // host that never registers `FilterModule` gets a working run list rather than a boot error.
     const { Module: ModuleDecorator, Global: GlobalDecorator } = await import('@nestjs/common');
     const { NestFactory } = await import('@nestjs/core');
-    const { RUN_GATEWAY } = await import('./tokens.js');
+    const { RunGateway } = await import('@dudousxd/nestjs-durable-core');
 
     @GlobalDecorator()
     @ModuleDecorator({
       providers: [
         {
-          provide: RUN_GATEWAY,
+          provide: RunGateway,
           useValue: {
             async runValueFacets() {
               return [{ value: 'acme', count: 1 }];
@@ -188,7 +188,7 @@ describe('the console composes with a host that has its OWN filter adapter', () 
           },
         },
       ],
-      exports: [RUN_GATEWAY],
+      exports: [RunGateway],
     })
     class HostGatewayModule {}
 

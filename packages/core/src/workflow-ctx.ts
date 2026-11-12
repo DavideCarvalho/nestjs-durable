@@ -262,13 +262,6 @@ class Position {
 }
 
 /**
- * Back-compat alias of {@link WorkflowCtx}. `localStep` — the checkpointed in-process step primitive
- * used for saga compensation — is now part of the public {@link WorkflowCtx}, so this type adds
- * nothing; it is kept only so internal consumers (the durable-entity runner) keep compiling.
- */
-export type InternalWorkflowCtx = WorkflowCtx;
-
-/**
  * Build the {@link WorkflowCtx} handed to a workflow body. Every primitive is a closure over the
  * position counter (the per-run logical position) and the saga `compensations` stack, so `task`/
  * `child` compose `step`/`waitForSignal` directly. All durability goes through {@link CtxHost}, so
@@ -280,7 +273,7 @@ export function createWorkflowCtx(
   compensations: Compensation[],
   workflow = '',
   searchAttributesSchema?: SearchAttributesSchema,
-): InternalWorkflowCtx {
+): WorkflowCtx {
   const { store, replay } = host;
   const pos = new Position();
   // This ctx's identity in the ambient step scope (see `runInStepScope`): lets a primitive tell "I am

@@ -861,8 +861,7 @@ export class CheckoutWorkflow {
 }
 ```
 
-A DTO class needs `class-validator`/`class-transformer` installed. `inputSchema` is an alias of `input`,
-kept for workflows declared before `input` existed (setting both is an error).
+A DTO class needs `class-validator`/`class-transformer` installed.
 
 **The run stores what was sent; the body sees what was parsed.** The run's stored `input` is the
 payload exactly as the caller sent it. `run(ctx, input)` receives the schema's **parsed** value — coerced

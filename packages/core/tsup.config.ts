@@ -1,3 +1,4 @@
+import { rmSync } from 'node:fs';
 import { defineConfig } from 'tsup';
 
 // Dual ESM + CJS publish (matches the ecosystem standard — see nestjs-codegen / nestjs-inertia).
@@ -8,12 +9,17 @@ import { defineConfig } from 'tsup';
 // through SWC to preserve `design:paramtypes`/`design:type`; see scripts/tsup-decorator.mjs.
 const external = ['cron-parser', 'reflect-metadata', 'zod'];
 
+// The ESM and CJS configs build in parallel, and tsup's DTS step deletes every `.d.*` in `outDir`
+// when `clean` is set, so a cleaning config can remove the other's `index.d.cts` after it was
+// written. Clean once, here, before either build starts.
+rmSync(new URL('./dist/', import.meta.url), { recursive: true, force: true });
+
 export default defineConfig([
   {
     entry: ['src/index.ts'],
     format: ['esm'],
     dts: true,
-    clean: true,
+    clean: false,
     splitting: false,
     sourcemap: true,
     outDir: 'dist',

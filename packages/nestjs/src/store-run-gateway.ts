@@ -89,7 +89,7 @@ function withoutRegistry<Q extends RunFacetQuery>(query: Q): Q {
 }
 
 /**
- * Store-backed `RunGateway` — the operator-side implementation, bound to {@link RUN_GATEWAY} on
+ * Store-backed `RunGateway` — the operator-side implementation, bound to {@link RunGateway} on
  * worker/drive instances. Reuses `DashboardService`'s six read/control method bodies verbatim
  * (`dashboard.service.ts:76-172`), so a consumer that only needs the bounded `RunGateway` surface
  * (the `RunRequestResponder`, a thin controller) doesn't have to depend on the dashboard package.

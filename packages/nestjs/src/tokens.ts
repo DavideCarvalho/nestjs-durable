@@ -14,13 +14,9 @@ import { RunGateway } from '@dudousxd/nestjs-durable-core';
 export const CONTEXT_ACCESSOR = Symbol.for('@dudousxd/nestjs-context:accessor');
 
 /**
- * @deprecated Inject the `RunGateway` abstract class directly (it is its own DI token now):
- * `constructor(private readonly gateway: RunGateway)`, provider `{ provide: RunGateway, useClass }`.
- * This symbol is kept as a back-compat alias — it points at the `RunGateway` class, so existing
- * `@Inject(RUN_GATEWAY)` sites resolve the very same token — and will be removed in a future major.
- *
- * `RunGateway` is owned by `@dudousxd/nestjs-durable-core` (a required peer dep of both this package
- * and the dashboard), so the abstract class is a single shared token across packages without the
- * previous `Symbol.for` value-sharing hack.
+ * @deprecated Inject the `RunGateway` class, which is its own DI token:
+ * `constructor(private readonly gateway: RunGateway)`. Kept because published
+ * `@dudousxd/nestjs-agent` and `@dudousxd/nestjs-agent-opencode` releases import it; it is the
+ * `RunGateway` class itself, so `@Inject(RUN_GATEWAY)` resolves the same provider.
  */
 export const RUN_GATEWAY = RunGateway;

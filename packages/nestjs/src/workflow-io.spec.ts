@@ -45,17 +45,6 @@ class DtoIoWorkflow {
   }
 }
 
-class LegacyDto {
-  @IsInt() total!: number;
-}
-
-@Workflow({ name: 'legacy-io', inputSchema: LegacyDto })
-class LegacyIoWorkflow {
-  async run() {
-    return 'ok';
-  }
-}
-
 @Workflow({
   name: 'checked-io',
   input: z.object({ from: z.string(), to: z.string() }),
@@ -96,7 +85,6 @@ async function boot(store = new InMemoryStateStore()) {
     providers: [
       ZodIoWorkflow,
       DtoIoWorkflow,
-      LegacyIoWorkflow,
       CheckedIoWorkflow,
       CheckedParsedWorkflow,
       BadOutputWorkflow,
@@ -198,18 +186,6 @@ describe('@Workflow({ input, output })', () => {
     expect(await store.getRun('bad')).toBeNull();
   });
 
-  it('keeps inputSchema working as an alias of input', async () => {
-    const { mod, store, svc } = await boot();
-    close = () => mod.close();
-
-    await expect(svc.start('legacy-io', { total: 'oops' }, 'bad')).rejects.toMatchObject({
-      code: 'invalid_input',
-    });
-    expect(await store.getRun('bad')).toBeNull();
-    await svc.start('legacy-io', { total: 5 }, 'good');
-    expect((await svc.waitForRun('good')).status).toBe('completed');
-  });
-
   it('runs validateInput after the schema parses', async () => {
     const { mod, store, svc } = await boot();
     close = () => mod.close();
@@ -243,12 +219,6 @@ describe('@Workflow({ input, output })', () => {
 
     expect(result.status).toBe('failed');
     expect(result.error).toMatchObject({ code: 'invalid_output' });
-  });
-
-  it('refuses input and inputSchema together', () => {
-    expect(() =>
-      Workflow({ name: 'both', input: zodInput, inputSchema: LegacyDto })(class {}),
-    ).toThrow('set either `input` or its alias `inputSchema`, not both');
   });
 
   it('parses around the body a worker runtime registers too', async () => {

@@ -144,9 +144,9 @@ jobs:
           cache: pnpm
           registry-url: "https://registry.npmjs.org"
 
-      # npm only learned OIDC in 11.5.1, and .nvmrc pins Node 22, which ships 10.9.x. Without
-      # this the publish fails as `E404 - PUT https://registry.npmjs.org/<pkg>`: npm answers 404
-      # rather than 403 for an unauthorized package, so it reads as "no such package" rather
+      # npm only learned OIDC in 11.5.1, and the npm bundled with the Node in .nvmrc may be older.
+      # Without this the publish fails as `E404 - PUT https://registry.npmjs.org/<pkg>`: npm answers
+      # 404 rather than 403 for an unauthorized package, so it reads as "no such package" rather
       # than "not authenticated". Upgraded here rather than by moving .nvmrc, so the toolchain
       # the packages are built and tested against does not change.
       - name: Upgrade npm for OIDC trusted publishing

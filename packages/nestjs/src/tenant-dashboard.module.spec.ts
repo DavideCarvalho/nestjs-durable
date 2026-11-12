@@ -65,7 +65,7 @@ describe('a tenant DurableModule (connection only) mounting DurableDashboardModu
       .useValue(runner.runRedisWorker)
       .compile();
 
-    // Resolving DashboardService proves: (a) RUN_GATEWAY resolves globally on a tenant (the
+    // Resolving DashboardService proves: (a) RunGateway resolves globally on a tenant (the
     // DurableModule that binds it is `global`), and (b) the constructor did NOT boot-break on
     // `collectMetrics(startClient)` — the store-less start client bound under WorkflowEngine has no
     // `subscribe`, so the guard has to gate the metrics-collector init on store presence.

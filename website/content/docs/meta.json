@@ -26,6 +26,7 @@
     "testing",
     "cli",
     "---Reference---",
-    "api-reference"
+    "api-reference",
+    "upgrading"
   ]
 }
