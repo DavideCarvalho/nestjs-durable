@@ -137,7 +137,21 @@ publisher may see consumes that copy. Subscribers started by the event (`onEvent
 publisher's tenant. To broadcast to every tenant, publish from `Context.allTenants(...)` or from code
 outside a request.
 
-With tenancy off, named events reach every waiting run, as before.
+A subscriber with `eventBatch` (debounce or batch) collects events into one batch run per workflow,
+or per key. With tenancy on, it gets one batch run per tenant too, so two tenants' events never land
+in the same batch, and each batch run, and the run it fires, carries its tenant:
+
+| Publisher | Batch run |
+|-----------|-----------|
+| A request with a tenant | that tenant's own (per key, with `key`) |
+| A request with no tenant, `Context.allTenants(...)` or no request | the shared one, with no tenant |
+| A run's lifecycle event (`run.completed:…` / `run.failed:…`) | the settled run's tenant, or the shared one when it has none |
+
+The batch run id is deterministic per workflow, key and tenant. A tenant's id has its own
+`__evtacc__@<tenant>:` prefix, so neither a key nor a workflow name can reach another tenant's batch.
+
+With tenancy off, named events reach every waiting run, and every publish shares the one batch run,
+as before.
 
 ## Dashboard
 

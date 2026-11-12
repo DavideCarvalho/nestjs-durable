@@ -1606,7 +1606,16 @@ export class WorkflowEngine {
         }
       }
     });
-    this.accumulators = new EventAccumulators(this);
+    this.accumulators = new EventAccumulators({
+      register: (name, version, fn, opts) => this.register(name, version, fn, opts),
+      // The engine picks the accumulator's tenant itself, so its signal is the engine's own
+      // delivery: not subject to the publisher's tenancy filter.
+      signalWithStart: async (workflow, input, runId, signal, opts) => {
+        await this.start(workflow, input, runId, opts);
+        await this.signalUnchecked(signal.token, signal.payload);
+        return { runId };
+      },
+    });
     this.entities = new Entities(this, {
       bufferSignal: (token, payload) => this.store.bufferSignal(token, payload),
       wakeWaiter: (token, payload) => this.wakeSignalWaiter(token, payload),
@@ -2413,7 +2422,8 @@ export class WorkflowEngine {
    * an announcement carries no `where` or `input`. `routeIdOf` names the event for a subscriber's
    * debounce/batch accumulator, which counts an id once. Returns the subscribers reached, with the
    * run each started (none when the payload went into its debounce/batch accumulator), and the ones
-   * that could not be started, with why.
+   * that could not be started, with why. `batchTenant` is the tenant whose debounce/batch accumulator
+   * the payload goes into (see {@link EventAccumulators.route}).
    */
   private async startSubscribers(
     name: string,
@@ -2422,6 +2432,7 @@ export class WorkflowEngine {
     only?: ReadonlySet<string>,
     remote: readonly string[] = [],
     routeIdOf?: (workflow: string) => string,
+    batchTenant?: RunTenant | null,
   ): Promise<{
     reached: { workflow: string; runId?: string }[];
     failed: { workflow: string; error: unknown }[];
@@ -2443,7 +2454,8 @@ export class WorkflowEngine {
         if (batch) {
           // Coalesce: route the event into the workflow's accumulator (one long-lived run per
           // workflow, or per key, that debounces/batches and then starts it with the payload(s)).
-          await this.accumulators.route(workflow, batch, input, routeIdOf?.(workflow));
+          // With tenancy, one per tenant too.
+          await this.accumulators.route(workflow, batch, input, routeIdOf?.(workflow), batchTenant);
           reached.push({ workflow });
         } else {
           const runId = runIdOf(workflow);
@@ -2827,11 +2839,12 @@ export class WorkflowEngine {
     const triggers = this.eventTriggers.get(lifecycleEventName(run.workflow, kind));
     if (!triggers || !this.servesNamespace(run.namespace)) return out;
     let payload: unknown;
+    const tenant = this.lifecycleBatchTenant(run)?.id;
     for (const [workflow, subscriptions] of triggers) {
       const batch = this.latest.get(workflow)?.eventBatch;
       if (!batch) continue;
       if (!batch.key && subscriptions.every((sub) => !sub.where)) {
-        out.set(workflow, accumulatorRunId(workflow));
+        out.set(workflow, accumulatorRunId(workflow, undefined, tenant));
         continue;
       }
       try {
@@ -2841,7 +2854,7 @@ export class WorkflowEngine {
         const input = accepted.input ? accepted.input(payload) : payload;
         out.set(
           workflow,
-          accumulatorRunId(workflow, batch.key ? String(batch.key(input)) : undefined),
+          accumulatorRunId(workflow, batch.key ? String(batch.key(input)) : undefined, tenant),
         );
       } catch {
         out.set(workflow, undefined);
@@ -3167,6 +3180,7 @@ export class WorkflowEngine {
             new Set(targets),
             remote,
             runIdOf,
+            this.lifecycleBatchTenant(run),
           )
         : { reached: [], failed: [] };
     const current = (await this.store.getRun(run.id)) ?? run;
@@ -3880,6 +3894,30 @@ export class WorkflowEngine {
    */
   contextTenant(): RunTenant | undefined {
     return this.tenancy?.current();
+  }
+
+  /**
+   * The tenant whose debounce/batch accumulator a named event published now goes into: the
+   * publisher's tenant, or `null` (the shared accumulator, no tenant) for a tenantless, `system` or
+   * `all` publisher. Undefined when tenancy is off (the accumulator starts as it always did).
+   */
+  private publishBatchTenant(): RunTenant | null | undefined {
+    if (!this.tenancy) return undefined;
+    const filter = this.tenantFilter();
+    if (filter.mode !== 'tenant') return null;
+    const current = this.tenancy.current();
+    return current?.id === filter.tenantId ? current : { id: filter.tenantId };
+  }
+
+  /**
+   * The tenant whose debounce/batch accumulator `run`'s lifecycle event goes into: the run's own
+   * (its publisher), or `null` for a run with no tenant. Undefined when tenancy is off.
+   */
+  private lifecycleBatchTenant(
+    run: Pick<WorkflowRun, 'tenantId' | 'tenantKind'>,
+  ): RunTenant | null | undefined {
+    if (!this.tenancy) return undefined;
+    return rowTenant(run) ?? null;
   }
 
   /** The matching filter for an app-facing call made now: `system` (sees all) when tenancy is off. */
@@ -5573,6 +5611,8 @@ export class WorkflowEngine {
         (workflow) => `evt:${eventId}:${workflow}`,
         undefined,
         remote,
+        undefined,
+        this.publishBatchTenant(),
       );
       touched += reached.length;
       for (const { workflow, error } of failed) {

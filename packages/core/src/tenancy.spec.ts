@@ -1,7 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
+import { accumulatorRunId } from './event-accumulators';
 import type { RemoteTask, WorkflowRun } from './interfaces';
+import { runCompletedEvent } from './lifecycle-events';
 import {
   type EngineTenancy,
   type RunTenant,
@@ -537,5 +539,155 @@ describe('tenancy off: named events', () => {
     expect((await store.listBufferedEvents('price', 10)).map((e) => e.payload)).toEqual([2]);
     await asTenant('globex', () => startRun(engine, 'listener', {}, 'g2'));
     expect((await store.getRun('g2'))?.output).toBe(2);
+  });
+});
+
+describe('eventBatch: one batch run per tenant', () => {
+  /** A batched subscriber that records each batch it fires with and the tenant its run sees. */
+  function batching(
+    opts: { tenancy?: boolean; key?: boolean; on?: string; nullRows?: 'shared' } = {},
+  ) {
+    const env = setup(
+      opts.tenancy === false
+        ? {}
+        : { tenancy: fakeTenancy(opts.nullRows ? { nullRows: opts.nullRows } : {}) },
+    );
+    const fired: { tenant: string | null; events: unknown[] }[] = [];
+    env.engine.register(
+      'agg',
+      '1',
+      async (_ctx, input) => {
+        fired.push({ tenant: seenTenant(), events: (input as { events: unknown[] }).events });
+      },
+      {
+        onEvent: [opts.on ?? 'hit'],
+        eventBatch: {
+          mode: 'batch',
+          maxSize: 2,
+          windowMs: 60_000,
+          ...(opts.key ? { key: (input: unknown) => (input as { k: string }).k } : {}),
+        },
+      },
+    );
+    const batchRuns = async () =>
+      (await env.store.listRuns({ workflow: '__evt_batch' })).map((r) => [r.id, r.tenantId]);
+    return { ...env, fired, batchRuns };
+  }
+  const sorted = (fired: { tenant: string | null; events: unknown[] }[]) =>
+    [...fired].sort((a, b) => String(a.tenant).localeCompare(String(b.tenant)));
+
+  it("never mixes two tenants' events, and each batch run carries its tenant", async () => {
+    const { engine, store, fired, batchRuns } = batching();
+    await asTenant('acme', () => engine.publishEvent('hit', { n: 1 }));
+    await asTenant('globex', () => engine.publishEvent('hit', { n: 2 }));
+    await asTenant('acme', () => engine.publishEvent('hit', { n: 3 }));
+    await asTenant('globex', () => engine.publishEvent('hit', { n: 4 }));
+    await poll(async () => fired.length === 2);
+    expect(sorted(fired)).toEqual([
+      { tenant: 'acme', events: [{ n: 1 }, { n: 3 }] },
+      { tenant: 'globex', events: [{ n: 2 }, { n: 4 }] },
+    ]);
+    const acme = await store.getRun(accumulatorRunId('agg', undefined, 'acme'));
+    const globex = await store.getRun(accumulatorRunId('agg', undefined, 'globex'));
+    expect([acme?.tenantId, acme?.tenantKind]).toEqual(['acme', 'organization']);
+    expect(globex?.tenantId).toBe('globex');
+    expect(await store.getRun(accumulatorRunId('agg'))).toBeNull();
+    for (const [, tenantId] of await batchRuns()) expect(['acme', 'globex']).toContain(tenantId);
+    // The fired target runs carry the tenant too.
+    const targets = await store.listRuns({ workflow: 'agg' });
+    expect(targets.map((r) => r.tenantId).sort()).toEqual(['acme', 'globex']);
+  });
+
+  it('keeps per-key batches per tenant too: the same key never shares a run across tenants', async () => {
+    const { engine, fired } = batching({ key: true });
+    await asTenant('acme', () => engine.publishEvent('hit', { k: 'x', n: 1 }));
+    await asTenant('globex', () => engine.publishEvent('hit', { k: 'x', n: 2 }));
+    await asTenant('globex', () => engine.publishEvent('hit', { k: 'x', n: 3 }));
+    await asTenant('acme', () => engine.publishEvent('hit', { k: 'x', n: 4 }));
+    await poll(async () => fired.length === 2);
+    expect(sorted(fired)).toEqual([
+      {
+        tenant: 'acme',
+        events: [
+          { k: 'x', n: 1 },
+          { k: 'x', n: 4 },
+        ],
+      },
+      {
+        tenant: 'globex',
+        events: [
+          { k: 'x', n: 2 },
+          { k: 'x', n: 3 },
+        ],
+      },
+    ]);
+  });
+
+  it("nullRows: 'shared' still gives each tenant its own batch run", async () => {
+    const { engine, fired } = batching({ nullRows: 'shared' });
+    await asTenant('acme', () => engine.publishEvent('hit', { n: 1 }));
+    await asTenant('globex', () => engine.publishEvent('hit', { n: 2 }));
+    await asTenant('acme', () => engine.publishEvent('hit', { n: 3 }));
+    await poll(async () => fired.length === 1);
+    expect(fired).toEqual([{ tenant: 'acme', events: [{ n: 1 }, { n: 3 }] }]);
+  });
+
+  it('system, all-tenants and tenantless publishes share the batch run with no tenant', async () => {
+    const { engine, store, fired } = batching();
+    await engine.publishEvent('hit', { n: 1 });
+    await allTenants(() => engine.publishEvent('hit', { n: 2 }));
+    await tenantless(() => engine.publishEvent('hit', { n: 3 }));
+    await engine.publishEvent('hit', { n: 4 });
+    await poll(async () => fired.length === 2);
+    expect(fired).toEqual([
+      { tenant: null, events: [{ n: 1 }, { n: 2 }] },
+      { tenant: null, events: [{ n: 3 }, { n: 4 }] },
+    ]);
+    const shared = await store.getRun(accumulatorRunId('agg'));
+    expect(shared?.tenantId ?? null).toBe(null);
+  });
+
+  it("a run's lifecycle event goes into the batch run of the run's tenant", async () => {
+    const { engine, store, fired } = batching({ on: runCompletedEvent('ingest') });
+    engine.register('ingest', '1', async () => 'done');
+    await asTenant('acme', () => startRun(engine, 'ingest', {}, 'i1'));
+    await asTenant('globex', () => startRun(engine, 'ingest', {}, 'i2'));
+    await engine.start('ingest', {}, 'i3', { tenantId: 'acme' }); // a system start, for acme
+    await poll(async () => fired.length === 1);
+    expect(fired[0]?.tenant).toBe('acme');
+    expect(fired[0]?.events.map((e) => (e as { runId: string }).runId).sort()).toEqual([
+      'i1',
+      'i3',
+    ]);
+    const i2 = (await store.getRun('i2')) as WorkflowRun;
+    expect(engine.coalescedSubscribers(i2).get('agg')).toBe(
+      accumulatorRunId('agg', undefined, 'globex'),
+    );
+    await poll(
+      async () =>
+        (await store.getRun(accumulatorRunId('agg', undefined, 'globex')))?.tenantId === 'globex',
+    );
+  });
+});
+
+describe('tenancy off: eventBatch', () => {
+  it('keeps one batch run per workflow with no tenant, whoever publishes', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    const fired: unknown[] = [];
+    engine.register('agg', '1', async (_ctx, input) => void fired.push(input), {
+      onEvent: ['hit'],
+      eventBatch: { mode: 'batch', maxSize: 2, windowMs: 60_000 },
+    });
+    await asTenant('acme', () => engine.publishEvent('hit', { n: 1 }));
+    await asTenant('globex', () => engine.publishEvent('hit', { n: 2 }));
+    await poll(async () => fired.length === 1);
+    expect(fired).toEqual([{ events: [{ n: 1 }, { n: 2 }] }]);
+    const runs = await store.listRuns({ workflow: '__evt_batch' });
+    // The batch run and its continue-as-new re-arm.
+    expect(runs.map((r) => r.id).sort()).toEqual(['__evtacc__:agg', '__evtacc__:agg~1']);
+    expect(runs.every((r) => !('tenantId' in r))).toBe(true);
+    expect(accumulatorRunId('agg')).toBe('__evtacc__:agg');
+    expect(accumulatorRunId('agg', 'k')).toBe('__evtacc__:agg:k');
   });
 });
