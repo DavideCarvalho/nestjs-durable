@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.58.1
+
+### Patch Changes
+
+- [#457](https://github.com/DavideCarvalho/nestjs-durable/pull/457) [`80d6fb2`](https://github.com/DavideCarvalho/nestjs-durable/commit/80d6fb241dafb73dd26c0873d4387fbfac683457) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Accept `@dudousxd/nestjs-filter` and `@dudousxd/nestjs-filter-client` 2.x as peers (tested against 2.0.1).
+
 ## 0.58.0
 
 ### Minor Changes
