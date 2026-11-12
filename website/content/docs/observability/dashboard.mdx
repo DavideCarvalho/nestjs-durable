@@ -1007,6 +1007,7 @@ await durableClient.retry(detail.run.id);
 | `GET` | `/durable/api/runs/:id/events/:key` | read a live query value (`ctx.setEvent`) |
 | `POST` | `/durable/api/runs/:id/updates/:name` | deliver an update (`ctx.onUpdate`); body is the arg |
 | `GET` | `/durable/api/consoles` | the other Aviary consoles this viewer may open (see [Switching between consoles](#switching-between-consoles)) |
+| `GET` | `/durable/api/consoles/search?q=` | global search across this console and the others the viewer may open (see [Searching all consoles](#searching-all-consoles)) |
 
 ## MCP tools
 
@@ -1060,3 +1061,32 @@ its own `authorize` allows the viewer. That `authorize` then also runs once each
 loads. With no other console, or none the viewer may open, the brand stays as it is. There is
 nothing to configure. The Workflows console is listed in the other consoles' menus while its routes
 are mounted.
+
+### Searching all consoles
+
+With another console mounted, <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>K</kbd> (or **Search all consoles**
+in the menu) opens one search box over every console the viewer may open. Here it finds a run by its
+exact id and workflows whose name contains the text; the other consoles add their own hits (Telescope
+entries, agent threads, media files). Each console gets 300 ms and shows at most 5 hits. A console
+that doesn't answer in time is left out, and the box says the results may be incomplete.
+
+The endpoint is `GET <api>/consoles/search?q=`. It sits behind this console's own `authorize` like
+the rest of the API, and asks another console only after that console's `authorize` allowed the
+viewer.
+
+### Skipping audit logs for switcher checks
+
+To list the other consoles, and before searching them, the switcher runs their `authorize` on the
+current request. That's a check, not a visit. While it runs, the request carries
+`aviaryProbe: true`, so an `authorize` that writes an audit trail can skip it:
+
+```ts
+DurableDashboardModule.forRoot({
+  authorize: async (ctx) => {
+    const req = ctx.switchToHttp().getRequest();
+    const allowed = req.user?.isAdmin === true;
+    if (!req.aviaryProbe) await audit.log('durable-console', req.user, allowed);
+    return allowed;
+  },
+});
+```

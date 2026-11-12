@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from 'react';
+import { ConsoleSearch, isSearchShortcut } from './ConsoleSearch';
 import { ConsoleIcon, type ConsoleIconKey, iconKey } from './console-switcher-icons';
 
 /** The `switcher` field of the page's JSON config block. */
@@ -92,6 +93,7 @@ export function ConsoleSwitcher({
 }) {
   const [consoles, setConsoles] = useState<SwitcherConsole[]>([]);
   const [open, setOpen] = useState(false);
+  const [searching, setSearching] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const button = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
@@ -128,12 +130,42 @@ export function ConsoleSwitcher({
     if (list.length > 0) list[(index + list.length) % list.length]?.focus();
   };
 
+  // Ctrl/Cmd-K opens the global search wherever focus is.
+  useEffect(() => {
+    if (!config) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (!isSearchShortcut(event)) return;
+      event.preventDefault();
+      setOpen(false);
+      setSearching(true);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [config]);
+
   // Opening the menu focuses its first item.
   useEffect(() => {
     if (open) menu.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
   }, [open]);
 
-  if (!config || consoles.length === 0) return <>{brand}</>;
+  const palette =
+    config && searching ? (
+      <ConsoleSearch
+        endpoint={`${config.endpoint}/search`}
+        onClose={() => {
+          setSearching(false);
+          button.current?.focus();
+        }}
+      />
+    ) : null;
+
+  if (!config || consoles.length === 0)
+    return (
+      <>
+        {brand}
+        {palette}
+      </>
+    );
 
   const onMenuKey = (event: ReactKeyboardEvent) => {
     const at = items().indexOf(document.activeElement as HTMLElement);
@@ -217,6 +249,32 @@ export function ConsoleSwitcher({
               <path d="m5 12 5 5 9-10" />
             </svg>
           </div>
+          <button
+            type="button"
+            role="menuitem"
+            tabIndex={-1}
+            className={`${item} w-full hover:bg-panel`}
+            onClick={() => {
+              setOpen(false);
+              setSearching(true);
+            }}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              width={16}
+              height={16}
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              className="text-muted-foreground"
+              aria-hidden="true"
+            >
+              <circle cx="11" cy="11" r="7" />
+              <path d="m20 20-3.5-3.5" />
+            </svg>
+            <span className="truncate">Search all consoles</span>
+            <kbd className="ml-auto text-[10px] text-muted-foreground">Ctrl K</kbd>
+          </button>
           {consoles.map((c) => (
             <a
               key={c.id}
@@ -231,6 +289,7 @@ export function ConsoleSwitcher({
           ))}
         </div>
       )}
+      {palette}
     </div>
   );
 }

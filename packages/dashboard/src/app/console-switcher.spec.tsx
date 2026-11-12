@@ -104,12 +104,18 @@ describe('ConsoleSwitcher', () => {
     fireEvent.click(button);
     expect(button.getAttribute('aria-expanded')).toBe('true');
     const items = screen.getAllByRole('menuitem');
-    expect(items.map((el) => el.textContent)).toEqual(['Workflows', 'Agents', 'Odd']);
+    // The current console, the global search, then the others.
+    expect(items.map((el) => el.textContent)).toEqual([
+      'Workflows',
+      'Search all consolesCtrl K',
+      'Agents',
+      'Odd',
+    ]);
     expect(items[0]?.tagName).toBe('DIV');
     expect(items[0]?.getAttribute('aria-current')).toBe('page');
-    expect(items[1]?.getAttribute('href')).toBe('/ai-gateway');
+    expect(items[2]?.getAttribute('href')).toBe('/ai-gateway');
     // An unknown icon falls back to the generic glyph.
-    expect(items[2]?.querySelector('svg')?.getAttribute('data-icon')).toBe('generic');
+    expect(items[3]?.querySelector('svg')?.getAttribute('data-icon')).toBe('generic');
     expect(container.querySelector('a[href="//evil.test"]')).toBeNull();
     expect(container.querySelector('a[href^="javascript"]')).toBeNull();
   });
@@ -129,11 +135,11 @@ describe('ConsoleSwitcher', () => {
     fireEvent.keyDown(menu, { key: 'ArrowDown' });
     expect(document.activeElement).toBe(items[1]);
     fireEvent.keyDown(menu, { key: 'End' });
-    expect(document.activeElement).toBe(items[2]);
+    expect(document.activeElement).toBe(items[3]);
     fireEvent.keyDown(menu, { key: 'ArrowDown' });
     expect(document.activeElement).toBe(items[0]);
     fireEvent.keyDown(menu, { key: 'ArrowUp' });
-    expect(document.activeElement).toBe(items[2]);
+    expect(document.activeElement).toBe(items[3]);
     fireEvent.keyDown(menu, { key: 'Home' });
     expect(document.activeElement).toBe(items[0]);
     fireEvent.keyDown(menu, { key: 'Escape' });
