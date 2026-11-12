@@ -1,5 +1,21 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.90.0
+
+### Minor Changes
+
+- [#455](https://github.com/DavideCarvalho/nestjs-durable/pull/455) [`65eac0e`](https://github.com/DavideCarvalho/nestjs-durable/commit/65eac0ebd5531095b1fba3c8b9975b73dbcc1299) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Data tenancy: scope runs by the customer they belong to (`@dudousxd/nestjs-context` ≥ 1.2's tenant). Off unless the context turns tenancy on; `DurableModule.forRoot({ tenancy })` takes `'inherit'` (default), `false`, or `{ enabled, kinds, nullRows }`.
+
+  - Runs and persisted schedules gain nullable `tenant_id` / `tenant_kind` columns (plus an index) in every store adapter, read by every run and schedule query **even with tenancy off**. MikroORM, TypeORM and Drizzle Postgres add them on boot when `autoSchema` is on; Prisma users copy the new fields from `prisma/schema.prisma` and migrate.
+  - **Every Drizzle user (Postgres and SQLite/libSQL) with `autoSchema: false` must add the columns before upgrading**: generate a migration with `drizzle-kit generate` (the statements are in the Drizzle store docs). SQLite/libSQL has no auto-schema, so that is every SQLite/libSQL user. An unmigrated Drizzle database now fails at boot with a `MissingTenantColumnsError` that lists the exact `ALTER TABLE … ADD COLUMN …` and `CREATE INDEX …` statements, instead of a bare `column "tenant_id" does not exist`. MikroORM and TypeORM users with `autoSchema: false` add the same columns in their own migration.
+  - `StartOptions.tenantId` / `tenantKind`: an explicit value wins, else the request's tenant when tenancy is on, else none. Children, `continueAsNew`, retry-with-input and schedule fires inherit the tenant.
+  - The engine restores the run's tenant around every turn (timer, signal, recovery and worker-driven resumes), and a `DurableModule` restores a dispatched step task's tenant around its handler on any transport. The context carrier now also carries `tenant` (with its kind).
+  - App-facing reads and control calls (`getRun`, `signal`, `cancel`, `requeue`, `retryWithInput`, `engine.schedules`, …) and the dashboard's run gateway apply the matching rule: another tenant's run reads as not found. `RunQuery` and `ScheduleQuery` gain `tenantId` / `tenantIds`; `engine.scopeRunQuery(query)` narrows a query for your own listings.
+  - `waitForRun`, `getRunChildren`, `triggeredRuns` and the dashboard's live run event stream apply it too: `waitForRun` on another tenant's run rejects with `run <id> not found` (a run that does not exist yet is still waited for).
+  - Named events are per tenant: a tenant's `publishEvent` resumes only the waiters it may see, and its buffered copy is consumed only by those runs. A publish from `Context.allTenants` or outside a request stays global; with tenancy off nothing changes.
+  - `eventBatch` subscribers (debounce or batch) keep one batch run per tenant: a tenant's events go into that tenant's own batch run (id prefix `__evtacc__@<tenant>:`), stamped with it, and a run's lifecycle events into the batch run of the run's tenant. Publishes with no tenant, from `Context.allTenants` or outside a request keep the shared batch run with no tenant; with tenancy off batch run ids and rows are unchanged.
+  - The durable wire protocol is unchanged.
+
 ## 0.89.0
 
 ### Minor Changes
