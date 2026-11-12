@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.57.0
+
+### Minor Changes
+
+- [#452](https://github.com/DavideCarvalho/nestjs-durable/pull/452) [`d2804f2`](https://github.com/DavideCarvalho/nestjs-durable/commit/d2804f263ebebbf9970bcde41da1fcdf7c175a5d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The `ctx.webhook()` callback route (`POST <apiBasePath>/webhooks/:token`) is no longer gated by the console's `authorize`: a third party cannot sign in, and the token in the URL is the secret. A production app with no `authorize` now receives webhook callbacks while its console answers `403`. The guards in `decorators` still apply to the route, and a self-mounted API controller with `@UseConsoleAuthorize()` leaves its inherited webhook route open the same way. On a tenant deployment, operations only the control plane serves (webhook delivery among them) answer `501` with a clear message instead of a `500`: point third-party webhooks at the control plane.
+
 ## 0.56.0
 
 ### Minor Changes

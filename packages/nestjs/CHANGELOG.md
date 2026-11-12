@@ -1,5 +1,59 @@
 # @dudousxd/nestjs-durable
 
+## 0.56.0
+
+### Minor Changes
+
+- [#452](https://github.com/DavideCarvalho/nestjs-durable/pull/452) [`d2804f2`](https://github.com/DavideCarvalho/nestjs-durable/commit/d2804f263ebebbf9970bcde41da1fcdf7c175a5d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `verifyTenant` and `tenantToken` accept classes. Implement `TenantVerifierContract` (`verify({ token, tenant })`) on the control plane and `TenantCredentialsContract` (`token()`) on the tenant, and pass the class, an object, or a lazy import of a module whose default export is one:
+
+  ```ts
+  DurableModule.forRoot({
+    topology: "control-plane",
+    store,
+    transport,
+    verifyTenant: JwtTenantVerifier,
+  });
+  DurableModule.forRoot({
+    topology: "tenant",
+    partition: "acme",
+    connection,
+    transport,
+    tenantToken: () => import("./tenant-credentials.js"),
+  });
+  ```
+
+  A class is built once through Nest DI (the registered provider when there is one, else `ModuleRef.create`); a lazy import runs once. Functions and strings work as before, and `hmacTenantVerifier` / `signTenantToken` are unchanged. A token source that returns an empty string now fails that request, and a static `tenantToken: ''` fails at boot. `verifyTenant` on a `'tenant'` process and `tenantToken` on a `'control-plane'` throw at boot. The new "Authenticate tenants" guide has working classes for your own `@nestjs/jwt` tokens, any OIDC provider, and HMAC.
+
+- [#452](https://github.com/DavideCarvalho/nestjs-durable/pull/452) [`d2804f2`](https://github.com/DavideCarvalho/nestjs-durable/commit/d2804f263ebebbf9970bcde41da1fcdf7c175a5d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - **Breaking:** `topology` is now the string Agora uses, `'standalone' | 'control-plane' | 'tenant'`, and the nested `tenant` field moved to `partition`.
+
+  ```ts
+  // Before
+  DurableModule.forRoot({
+    topology: { role: "control-plane", tenant: "davi-local" },
+    store,
+    transport,
+  });
+  DurableModule.forRoot({
+    topology: { role: "tenant", tenant: "acme-corp" },
+    connection,
+  });
+
+  // After
+  DurableModule.forRoot({
+    topology: "control-plane",
+    partition: "davi-local",
+    store,
+    transport,
+  });
+  DurableModule.forRoot({
+    topology: "tenant",
+    partition: "acme-corp",
+    connection,
+  });
+  ```
+
+  `'standalone'` (the default) keeps the role inference from `store`/`connection`. The options are a union discriminated on `topology`: with `'tenant'`, `store`, `namespace` and `verifyTenant` are type errors and `partition` is required. On a control plane, `partition` becomes its namespace, as `tenant` did. The object form throws at boot with the new form in the message. The wire is unchanged.
+
 ## 0.55.2
 
 ### Patch Changes
