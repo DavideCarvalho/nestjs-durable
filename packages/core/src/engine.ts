@@ -1176,8 +1176,7 @@ export class WorkflowEngine {
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
   private readonly latest = new Map<string, RegisteredWorkflow>();
-  /** Workflows this instance starts but never runs, by name. See {@link registerStartOnly}. */
-  /** Start-only workflows, keyed `name@version` (like {@link workflows}), so every version stays startable. */
+  /** Workflows this instance starts but never runs, keyed `name@version` (like {@link workflows}), so every version stays startable. See {@link registerStartOnly}. */
   private readonly startOnly = new Map<string, RegisteredWorkflow>();
   /** The latest start-only registration per name, for unpinned starts (like {@link latest}). */
   private readonly startOnlyLatest = new Map<string, RegisteredWorkflow>();
@@ -1998,7 +1997,8 @@ export class WorkflowEngine {
       origin: opts?.origin,
     };
     this.startOnly.set(versionKey(name, version), entry);
-    this.startOnlyLatest.set(name, entry);
+    const current = this.startOnlyLatest.get(name);
+    if (!current || isNewerVersion(version, current.version)) this.startOnlyLatest.set(name, entry);
   }
 
   /** Whether `run` is of a workflow this instance only starts (see {@link registerStartOnly}). */

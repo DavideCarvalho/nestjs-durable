@@ -86,6 +86,15 @@ describe('registerStartOnly', () => {
     expect((await store.getRun('latest'))?.workflowVersion).toBe('2');
   });
 
+  it('unpinned starts use the highest version, whatever the registration order', async () => {
+    const store = new InMemoryStateStore();
+    const api = new WorkflowEngine({ store });
+    api.registerStartOnly('job', '2');
+    api.registerStartOnly('job', '1');
+    await api.start('job', {}, 'r');
+    expect((await store.getRun('r'))?.workflowVersion).toBe('2');
+  });
+
   it('validates the input before creating the run', async () => {
     const store = new InMemoryStateStore();
     const api = new WorkflowEngine({ store });
