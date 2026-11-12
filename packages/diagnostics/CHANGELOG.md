@@ -1,5 +1,13 @@
 # @dudousxd/nestjs-durable-diagnostics
 
+## 0.2.0
+
+### Minor Changes
+
+- [#453](https://github.com/DavideCarvalho/nestjs-durable/pull/453) [`c5e29dc`](https://github.com/DavideCarvalho/nestjs-durable/commit/c5e29dc890c92b7f2d5273054e886c3848909745) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - New `@dudousxd/nestjs-durable-diagnostics/delivery` subpath: the durable transport behind `transports.durable()` in `@dudousxd/nestjs-diagnostics` 0.9. Every `(listener, event)` becomes a durable run with the id `diag:<event id>:<listener id>`, so a repeated delivery is a no-op. The run calls the listener in a retried step and shows up in the console under the `diagnostics` tag. Processes with diagnostics `role: 'api'` only start these runs; the other processes run them.
+
+  The bus bridge no longer forwards the lifecycle events of those delivery runs, so a listener on `durable` events doesn't trigger itself.
+
 ## 0.1.3
 
 ### Patch Changes

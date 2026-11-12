@@ -1,5 +1,16 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.89.0
+
+### Minor Changes
+
+- [#453](https://github.com/DavideCarvalho/nestjs-durable/pull/453) [`c5e29dc`](https://github.com/DavideCarvalho/nestjs-durable/commit/c5e29dc890c92b7f2d5273054e886c3848909745) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `engine.registerStartOnly(name, version, opts?)` lets a process start runs of a workflow it never runs, such as an API pod whose workers register the body. The run is stored and left for an instance that registered the workflow; a start-only instance that picks it up anyway hands it back without logging.
+
+  ```ts
+  apiEngine.registerStartOnly("send-invoice", "1");
+  await apiEngine.start("send-invoice", { id }, `invoice:${id}`); // a worker runs it
+  ```
+
 ## 0.88.0
 
 ### Minor Changes
