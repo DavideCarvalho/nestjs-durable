@@ -73,6 +73,19 @@ describe('registerStartOnly', () => {
     await expect(api.start('job', {}, 'b', { version: '1' })).rejects.toThrow(/not registered/);
   });
 
+  it('keeps every registered version startable (pinned), latest for unpinned', async () => {
+    const store = new InMemoryStateStore();
+    const api = new WorkflowEngine({ store });
+    api.registerStartOnly('job', '1');
+    api.registerStartOnly('job', '2');
+    await api.start('job', {}, 'v1', { version: '1' });
+    await api.start('job', {}, 'v2', { version: '2' });
+    await api.start('job', {}, 'latest');
+    expect((await store.getRun('v1'))?.workflowVersion).toBe('1');
+    expect((await store.getRun('v2'))?.workflowVersion).toBe('2');
+    expect((await store.getRun('latest'))?.workflowVersion).toBe('2');
+  });
+
   it('validates the input before creating the run', async () => {
     const store = new InMemoryStateStore();
     const api = new WorkflowEngine({ store });

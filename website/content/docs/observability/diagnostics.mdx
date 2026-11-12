@@ -141,6 +141,8 @@ What you get:
 
 - **One run per listener and event.** The run id is `diag:<event id>:<listener id>`, where the
   listener id is `<ClassName>#<method>`. Handing over the same event twice starts nothing new.
+  The `diag:` run id prefix is reserved for these runs: don't start your own runs with an id that
+  begins with it, or their lifecycle events are kept off the diagnostics bus.
 - **Retries.** The listener runs inside a step named `handle`. `retries` is the number of attempts
   (default `3`). `backoff` is `'fixed'` or `'exp'` (default `'exp'`), starting at `backoffMs`
   (default `1000`) and capped at `backoffMaxMs` (default `30000`). Set `jitter: true` to spread retries

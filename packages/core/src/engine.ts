@@ -1177,7 +1177,10 @@ export class WorkflowEngine {
   /** The newest registered version per workflow name — used to `start` new runs. */
   private readonly latest = new Map<string, RegisteredWorkflow>();
   /** Workflows this instance starts but never runs, by name. See {@link registerStartOnly}. */
+  /** Start-only workflows, keyed `name@version` (like {@link workflows}), so every version stays startable. */
   private readonly startOnly = new Map<string, RegisteredWorkflow>();
+  /** The latest start-only registration per name, for unpinned starts (like {@link latest}). */
+  private readonly startOnlyLatest = new Map<string, RegisteredWorkflow>();
   /** Event name → subscribing workflow name → that workflow's subscriptions to it. See `onEvent`. */
   private readonly eventTriggers = new Map<string, Map<string, EventSubscription[]>>();
   /** Durable-entity subsystem (registers the `__entity` runner; see `registerEntity`). */
@@ -1984,7 +1987,7 @@ export class WorkflowEngine {
       validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
     },
   ): void {
-    this.startOnly.set(name, {
+    const entry: RegisteredWorkflow = {
       name,
       version,
       fn: () => {
@@ -1993,14 +1996,16 @@ export class WorkflowEngine {
       tags: opts?.tags,
       validateInput: opts?.validateInput,
       origin: opts?.origin,
-    });
+    };
+    this.startOnly.set(versionKey(name, version), entry);
+    this.startOnlyLatest.set(name, entry);
   }
 
   /** Whether `run` is of a workflow this instance only starts (see {@link registerStartOnly}). */
   private isStartOnlyHere(run: WorkflowRun): boolean {
     return (
       !this.isRegisteredHere(run) &&
-      this.startOnly.get(run.workflow)?.version === run.workflowVersion
+      this.startOnly.has(versionKey(run.workflow, run.workflowVersion))
     );
   }
 
@@ -3667,12 +3672,14 @@ export class WorkflowEngine {
     // {@link StartOptions.version}). Unpinned — every caller that has ever existed — takes `latest`
     // and the fallback chain, byte-for-byte as before.
     const pinned = opts?.version;
-    const startOnly = this.startOnly.get(name);
+    const startOnly =
+      pinned === undefined
+        ? this.startOnlyLatest.get(name)
+        : this.startOnly.get(versionKey(name, pinned));
     let registered =
       pinned === undefined
         ? (this.latest.get(name) ?? startOnly)
-        : (this.workflows.get(versionKey(name, pinned)) ??
-          (startOnly?.version === pinned ? startOnly : undefined));
+        : (this.workflows.get(versionKey(name, pinned)) ?? startOnly);
     if (!registered && pinned === undefined) {
       // An unregistered run inherits remote routing from its spawning ancestor (see
       // {@link findInheritedRegistration}): the child of a remote workflow can be started without a
