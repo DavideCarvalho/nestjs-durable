@@ -10,6 +10,7 @@ import {
   Param,
   StreamableFile,
 } from '@nestjs/common';
+import { ConsolePage } from './console-authorize.js';
 
 /** DI token carrying the UI mount base (e.g. `/durable`). */
 export const DASHBOARD_BASE_PATH = Symbol('DASHBOARD_BASE_PATH');
@@ -46,6 +47,7 @@ const CONTENT_TYPES: Record<string, string> = {
  * under `AuthorizationModule`'s global guard, is denied until it declares a `@Can()`).
  */
 @Controller()
+@ConsolePage()
 export class DurableUiControllerBase {
   private readonly dir = spaDir();
 

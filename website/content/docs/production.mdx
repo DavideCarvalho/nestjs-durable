@@ -724,12 +724,10 @@ Three views of the same engine lifecycle events, for different jobs:
 
 - **The dashboard** (`@dudousxd/nestjs-durable-dashboard`) is the operating surface — run list, the
   step graph, retry/cancel/continue actions. Anyone who reaches it can read every run's payloads
-  and retry or cancel it, so protect it with `@nestjs/authentication` / `@nestjs/authorization`,
-  one of two ways: `decorators` on the mounted console
-  (`forRoot({ decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view')] })`), or
-  `routes: false` and your own controllers extending `DurableUiControllerBase` /
-  `DurableApiControllerBase`. With `NODE_ENV=production`, a mounted console with no `decorators`
-  **fails the boot**, naming both ways. See
+  and retry or cancel it, so set `authorize`
+  (`forRoot({ authorize: { policy: ConsolePolicy, ability: 'view' } })`, a function, a class, or
+  `authorizeByToken(...)`). With `NODE_ENV=production`, a console with no `authorize` answers
+  **`403` to every request**, and a warning is logged at boot. See
   [Protecting the console](/docs/observability/dashboard#protecting-the-console).
 - **OpenTelemetry** (`@dudousxd/nestjs-durable-otel`) turns runs into traces — one root span per run,
   one child span per step — for the tracing stack you already run. `attachDurableOtel(engine)` is

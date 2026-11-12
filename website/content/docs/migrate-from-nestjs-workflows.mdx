@@ -167,7 +167,8 @@ import { DurableMigrationModule } from '@dudousxd/nestjs-durable/migrate-from-ne
     DurableModule.forRoot({ store, transport }),  // the new one
     DurableMigrationModule.forRoot(),             // MigrationClient
     DurableDashboardModule.forRoot({
-      decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view')],
+      decorators: [UseGuards(AuthenticationGuard)],
+      authorize: { policy: ConsolePolicy, ability: 'view' },
       imports: [DurableMigrationModule.console()], // one console, both engines
     }),
   ],

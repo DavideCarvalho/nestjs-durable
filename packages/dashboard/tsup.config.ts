@@ -18,7 +18,15 @@
 import { decoratorDualConfig } from '../../scripts/tsup-decorator.mjs';
 
 export default decoratorDualConfig(
-  ['@dudousxd/nestjs-durable-core', '@nestjs/common', '@nestjs/core', 'rxjs', 'reflect-metadata'],
+  [
+    '@dudousxd/nestjs-durable-core',
+    '@nestjs/common',
+    '@nestjs/core',
+    // Optional peer, loaded with a dynamic import only for `authorize: { policy, ability }`.
+    '@nestjs/authorization',
+    'rxjs',
+    'reflect-metadata',
+  ],
   {
     entry: ['src/server/index.ts'],
     outDir: 'dist/server',
