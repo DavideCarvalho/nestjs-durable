@@ -236,7 +236,7 @@ describe('resolveConsoleAuthorize: the five forms', () => {
     expect(await decide(context)).toEqual({ allowed: true });
   });
 
-  it('{ policy, ability }: getUser null or false is a guest, undefined falls back to request.user', async () => {
+  it('{ policy, ability }: a configured getUser answering undefined, null or false is a guest (as @Can() sees it)', async () => {
     let answer: unknown;
     const { moduleRef } = await moduleRefWith(
       [AuthorizationModule.forRoot({ globalGuard: false, getUser: () => answer })],
@@ -248,12 +248,11 @@ describe('resolveConsoleAuthorize: the five forms', () => {
       silent,
     );
     const admin = contextFor({ user: { role: 'admin' } });
-    for (const guest of [null, false]) {
+    // `request.user` is an admin, but the configured getUser is the only source, as in `@Can()`.
+    for (const guest of [undefined, null, false]) {
       answer = guest;
       expect(await decide(admin)).toEqual({ allowed: false, reason: 'unauthenticated' });
     }
-    answer = undefined;
-    expect(await decide(admin)).toEqual({ allowed: true });
   });
 
   it('{ policy, ability } without AuthorizationModule fails at resolve time (boot)', async () => {

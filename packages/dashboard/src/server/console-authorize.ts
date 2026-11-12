@@ -140,22 +140,19 @@ async function policyDecider(
       `${MODULE}: \`authorize: { policy, ability }\` needs AuthorizationModule.forRoot() from @nestjs/authorization imported in the app.`,
     );
   }
-  let configuredGetUser: ((context: ExecutionContext) => unknown) | undefined;
+  // The user the official `@Can()` sees: the module's `getUser` when one is configured, else the
+  // package default (`request.user`). Exactly one of them answers; `undefined`, `null` and `false`
+  // all mean a guest, as in `AuthorizationGuard`.
+  let getUser = defaultGetUser as (context: ExecutionContext) => unknown;
   try {
     const options = moduleRef.get<{ getUser?: (context: ExecutionContext) => unknown }>(
       AUTHORIZATION_MODULE_OPTIONS,
       { strict: false },
     );
-    if (typeof options?.getUser === 'function') configuredGetUser = options.getUser;
+    if (typeof options?.getUser === 'function') getUser = options.getUser;
   } catch {
     // No options registered: the package default reads `request.user`.
   }
-  // Only `undefined` means "not found here, look further" (the package default). `null` and
-  // `false` are an answer: a guest.
-  const getUser = async (context: ExecutionContext): Promise<unknown> => {
-    const user = configuredGetUser ? await configuredGetUser(context) : undefined;
-    return user === undefined ? defaultGetUser(context) : user;
-  };
   return async (context) => {
     const authorization = moduleRef.get(AuthorizationService, { strict: false });
     const user = await getUser(context);
