@@ -40,6 +40,7 @@ import {
 import { type HealthSummary, stalledWorkflows, summarizeHealth } from '../client/summarize-health';
 import { throttle } from '../client/throttle';
 import { AttributeFilters } from './AttributeFilters';
+import { ConsoleSwitcher, readSwitcherConfig } from './ConsoleSwitcher';
 import { OriginFacets } from './OriginFacets';
 import { RunEvents } from './RunEvents';
 import { RunInfoPanel } from './RunInfoPanel';
@@ -74,6 +75,9 @@ import { Dialog } from './ui/dialog';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
+
+/** The switcher config the server put in the page (absent when this console is alone). */
+const switcherConfig = readSwitcherConfig('durable-dashboard-config');
 
 /** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
  *  flowing into the next), in currentColor so it inherits the `--accent` token. Replaces the bare `◆`. */
@@ -184,26 +188,32 @@ function Header({
         : 'control plane';
   return (
     <header className="z-10 flex items-center gap-4 border-b border-line px-5 py-3">
-      <div className="flex items-center gap-2.5">
-        <div className="grid h-7 w-7 place-items-center rounded-md border border-brand/30 bg-brand/10">
-          <LogoMark className="h-4 w-4 text-brand" />
-        </div>
-        <div className="leading-none">
-          <div className="text-sm font-semibold tracking-tight">durable</div>
-          <div
-            className={`mono text-[10px] uppercase tracking-[0.2em] ${
-              isTenant ? 'text-amber-400/80' : 'text-zinc-600'
-            }`}
-            title={
-              isTenant
-                ? `Tenant deployment — partition ${topology?.tenant ?? '(unnamed)'}`
-                : 'Control-plane deployment'
-            }
-          >
-            {roleLabel}
+      <ConsoleSwitcher
+        config={switcherConfig}
+        current={{ title: 'Workflows', icon: 'workflow' }}
+        brand={
+          <div className="flex items-center gap-2.5">
+            <div className="grid h-7 w-7 place-items-center rounded-md border border-brand/30 bg-brand/10">
+              <LogoMark className="h-4 w-4 text-brand" />
+            </div>
+            <div className="leading-none">
+              <div className="text-sm font-semibold tracking-tight">durable</div>
+              <div
+                className={`mono text-[10px] uppercase tracking-[0.2em] ${
+                  isTenant ? 'text-amber-400/80' : 'text-zinc-600'
+                }`}
+                title={
+                  isTenant
+                    ? `Tenant deployment — partition ${topology?.tenant ?? '(unnamed)'}`
+                    : 'Control-plane deployment'
+                }
+              >
+                {roleLabel}
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
+        }
+      />
       <div className="ml-2 flex flex-wrap items-center gap-1">
         {chip('all', 'all', total)}
         {STATUSES.map((s) => chip(s, s, counts[s] ?? 0))}

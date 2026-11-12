@@ -157,6 +157,24 @@ A token suits callers you script (the JSON API). The SPA in a browser sends no
 browser use, sign in with your app's authentication (in `decorators`) and use a function, a class,
 a policy or a gate name.
 
+An allow can also name who it let in: `{ allowed: true, caller: 'user:42' }`. The [MCP tools](#mcp-tools)
+log that name as the caller of each call. Never put a secret in it. `authorizeByToken` names its caller
+`token:<hash>`.
+
+### A token or a session: `anyAuthorize`
+
+`anyAuthorize(...forms)` allows a request when any of its forms allows it. If none does, the result
+is `unauthenticated` when any form said so, and `forbidden` otherwise. Each form is any of the five
+`authorize` forms.
+
+```ts
+import { anyAuthorize, authorizeByToken } from '@dudousxd/nestjs-durable-dashboard';
+
+DurableDashboardModule.forRoot({
+  authorize: anyAuthorize(authorizeByToken({ token: process.env.CONSOLE_TOKEN }), AdminAuthorizer),
+});
+```
+
 ### Without `authorize`
 
 - Outside production (`NODE_ENV` is not `production`) the console is open.
@@ -988,3 +1006,57 @@ await durableClient.retry(detail.run.id);
 | `POST` | `/durable/api/webhooks/:token` | deliver a `ctx.webhook()` callback (body resumes the run) |
 | `GET` | `/durable/api/runs/:id/events/:key` | read a live query value (`ctx.setEvent`) |
 | `POST` | `/durable/api/runs/:id/updates/:name` | deliver an update (`ctx.onUpdate`); body is the arg |
+| `GET` | `/durable/api/consoles` | the other Aviary consoles this viewer may open (see [Switching between consoles](#switching-between-consoles)) |
+
+## MCP tools
+
+When the app imports the agent's MCP server (`AgentMcpServerModule` from
+`@dudousxd/nestjs-agent-mcp-server`), the console is also served as developer tools on its dev
+endpoint, `/mcp/aviary`. Each call is gated by this console's `authorize` and goes through
+`DashboardService`, the same service the console's API uses, so tenancy applies as it does in the
+console.
+
+| Tool | Kind | Input |
+|---|---|---|
+| `durable_list_runs` | read | `status?`, `workflow?`, `tag?`, `namespace?`, `origin?`, `attr?` (`key:op:value`), `cursor?`, `limit?` |
+| `durable_get_run` | read | `id`, `full?`, `field?` (one top-level field only, e.g. `steps`) |
+| `durable_list_fan_members` | read | `id`, `group`, `failed?`, `cursor?`, `limit?` |
+| `durable_count_runs_by` | read | `field` (`status`, `workflow`, `origin`, `namespace`, `tag`, `attributeKey`, `attributeValue` with `key`), `workflow?`, `tag?`, `namespace?`, `attr?`, `cursor?`, `limit?` |
+| `durable_get_health` | read | — (run counts by status, backlog, dead and blocked runs, starved queues, live workers) |
+| `durable_list_workers` | read | — |
+| `durable_list_schedules` | read | `workflow?`, `tag?`, `namespace?`, `paused?`, `cursor?`, `limit?` |
+| `durable_get_run_event` | read | `id`, `key` |
+| `durable_retry_run` | action | `id`, or `ids` (1 to 100) |
+| `durable_cancel_run` | action, destructive | `id`, or `ids` (1 to 100); `compensate?` |
+| `durable_continue_run` | action | `id` |
+| `durable_signal_run` | action | `token`, `payload?` (JSON text) |
+| `durable_trigger_schedule` | action | `key` (the schedule id) |
+| `durable_pause_schedule` | action | `key`, `paused?` (`false` resumes it) |
+
+Lists return `{ items, next }`; pass `next` back as `cursor`. A cursor no page returned is an error.
+An unknown run, fan or schedule is an error that says "not found". `durable_list_runs` leaves out a
+run's input and output and keeps the first line of its error; `durable_get_run` returns them.
+
+With `ids`, retry and cancel act on the runs in order and stop at the first that fails, answering
+`{ applied, failed: { id, error }, skipped }`. `durable_signal_run` answers `{ delivered: false }`
+when no run you can see waits on the token yet; the engine then holds the payload for the run that
+waits on it next.
+
+The signal, run event and schedule tools need the control plane: on a tenant deployment they are
+not offered. The actions are offered only when the MCP server lists actions.
+
+The tools are registered while the console's routes are mounted. `devTools: true` keeps them with
+`routes: false`, and `devTools: false` turns them off:
+
+```ts
+DurableDashboardModule.forRoot({ authorize: AdminAuthorizer, devTools: false });
+```
+
+## Switching between consoles
+
+When the app mounts other Aviary consoles too (Telescope, Agents, Media), the console's brand
+becomes a menu that lists the ones the viewer may open, and links to them. Each is listed only when
+its own `authorize` allows the viewer. That `authorize` then also runs once each time the page
+loads. With no other console, or none the viewer may open, the brand stays as it is. There is
+nothing to configure. The Workflows console is listed in the other consoles' menus while its routes
+are mounted.
