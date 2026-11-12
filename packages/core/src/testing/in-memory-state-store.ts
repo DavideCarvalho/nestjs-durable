@@ -36,6 +36,7 @@ import {
   singletonAdmissionTags,
   withoutSingletonMarkers,
 } from '../singleton-admission';
+import { matchesTenantPredicates } from '../tenancy';
 
 /**
  * Workflows a retention policy never sees: lifecycle registry runs are neither pruned nor counted
@@ -715,6 +716,10 @@ export class InMemoryStateStore implements StateStore {
     if (query.origins) {
       runs = runs.filter((r) => query.origins?.includes(r.origin ?? null));
     }
+    // Tenant: `null` = runs with no tenant, a member like any other in `tenantIds`.
+    if (query.tenantId !== undefined || query.tenantIds !== undefined) {
+      runs = runs.filter((r) => matchesTenantPredicates(r, query));
+    }
     if (query.attributes?.length) {
       // Pushdown: intersect per-predicate candidate sets from the key-indexed side-table, so we only
       // ever materialize the runs that already satisfy EVERY attribute filter (no full per-run scan).
@@ -800,6 +805,7 @@ export class InMemoryStateStore implements StateStore {
       .filter((s) => query.workflow === undefined || s.workflow === query.workflow)
       .filter((s) => query.tag === undefined || (s.tags ?? []).includes(query.tag))
       .filter((s) => query.paused === undefined || s.paused === query.paused)
+      .filter((s) => matchesTenantPredicates(s, query))
       .filter(
         (s) =>
           query.dueBy === undefined ||

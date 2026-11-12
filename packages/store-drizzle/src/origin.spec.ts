@@ -44,7 +44,8 @@ CREATE TABLE durable_run_attributes (
 );
 `;
 /** The migration a consumer runs to adopt this change. */
-const ADD_ORIGIN = 'ALTER TABLE durable_workflow_runs ADD COLUMN origin TEXT;';
+const ADD_ORIGIN =
+  'ALTER TABLE durable_workflow_runs ADD COLUMN origin TEXT; ALTER TABLE durable_workflow_runs ADD COLUMN tenant_id TEXT; ALTER TABLE durable_workflow_runs ADD COLUMN tenant_kind TEXT;';
 
 function makeStore(ddl = `${RUNS_DDL_BEFORE_ORIGIN}${ADD_ORIGIN}`) {
   const sqlite = new Database(':memory:');

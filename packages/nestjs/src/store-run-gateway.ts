@@ -105,8 +105,26 @@ export class StoreRunGateway implements RunGateway {
     return { role: 'control-plane' };
   }
 
-  async getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+  /**
+   * Narrow `query` to the caller's tenant (the tenancy matching rule; see `DurableModule`'s
+   * `tenancy`). A no-op with tenancy off, or for a caller outside any request (`system`).
+   */
+  private scoped<Q extends RunQuery | RunFacetQuery>(query: Q): Q {
+    return typeof this.engine?.scopeRunQuery === 'function'
+      ? (this.engine.scopeRunQuery(query as RunQuery) as Q)
+      : query;
+  }
+
+  /** The run, or null when it is missing OR belongs to a tenant the caller may not see (404). */
+  private async visibleRun(runId: string): Promise<WorkflowRun | null> {
     const run = await this.store.getRun(runId);
+    if (!run) return null;
+    const { tenantIds } = this.scoped({} as RunQuery);
+    return !tenantIds || tenantIds.includes(run.tenantId ?? null) ? run : null;
+  }
+
+  async getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    const run = await this.visibleRun(runId);
     if (!run) return null;
     const links = await this.lifecycleLinks(run);
     const over = options?.summarizeFansOver;
@@ -252,11 +270,11 @@ export class StoreRunGateway implements RunGateway {
   }
 
   getRun(runId: string): Promise<WorkflowRun | null> {
-    return this.store.getRun(runId);
+    return this.visibleRun(runId);
   }
 
   async getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
-    if (!(await this.store.getRun(runId))) return null;
+    if (!(await this.visibleRun(runId))) return null;
     if (aggregatesCheckpoints(this.store)) {
       const stats = await this.store.checkpointStats(runId, { group });
       const etag = fanPageEtag(group, stats, query);
@@ -269,7 +287,7 @@ export class StoreRunGateway implements RunGateway {
   }
 
   async listRuns(query: RunQuery): Promise<RunListItem[]> {
-    const runs = await this.store.listRuns(withoutRegistry(query));
+    const runs = await this.store.listRuns(this.scoped(withoutRegistry(query)));
     // One read of the listed suspended runs' signal waiters resolves what each is parked on — signal
     // / webhook / child — with no per-run timeline fetch. A timer wait falls back to the run's own
     // `wakeAt`. Non-suspended (and remote-step-in-flight) runs carry no `waiting`.
@@ -292,7 +310,7 @@ export class StoreRunGateway implements RunGateway {
    * listing — correct, but the unbounded read this exists to avoid, so it is the last resort.
    */
   async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
-    const scoped = withoutRegistry(query);
+    const scoped = this.scoped(withoutRegistry(query));
     if (this.store.runFacets) return this.store.runFacets(scoped);
     const runs = await this.store.listRuns(scoped);
     return mergeRunFacetRows(runs.map((r) => ({ status: r.status, origin: r.origin, count: 1 })));
@@ -310,7 +328,7 @@ export class StoreRunGateway implements RunGateway {
     query: RunFacetQuery,
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]> {
-    return this.store.runValueFacets?.(axis, withoutRegistry(query), opts) ?? [];
+    return this.store.runValueFacets?.(axis, this.scoped(withoutRegistry(query)), opts) ?? [];
   }
 
   /**
@@ -327,7 +345,7 @@ export class StoreRunGateway implements RunGateway {
     if (runIds.length === 0) return {};
     const idSet = new Set(runIds);
     const [suspended, waiters] = await Promise.all([
-      this.store.listRuns({ statuses: ['suspended'] }),
+      this.store.listRuns(this.scoped({ statuses: ['suspended'] })),
       listSignalWaitersOfRuns(this.store, runIds),
     ]);
     const waiterByRun = indexWaitersByRun(waiters);
@@ -371,9 +389,50 @@ export class StoreRunGateway implements RunGateway {
     return this.engine.republishLifecycle(target);
   }
 
+  /**
+   * Stream `runId`'s events. With tenancy, a run the caller may not see streams nothing; events of a
+   * run that does not exist yet are held until its row shows whose it is.
+   */
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void {
-    return this.engine.subscribe((event) => {
-      if (event.runId === runId) onEvent(event);
+    // Read the caller's tenant now: the events arrive outside its async context.
+    const { tenantIds } = this.scoped({} as RunQuery);
+    if (!tenantIds) {
+      return this.engine.subscribe((event) => {
+        if (event.runId === runId) onEvent(event);
+      });
+    }
+    let visible: boolean | undefined; // undefined until the run's row has been read
+    let held: EngineEvent[] = [];
+    let checking = false;
+    const check = (): void => {
+      if (checking || visible !== undefined) return;
+      checking = true;
+      void this.store
+        .getRun(runId)
+        .then(
+          (run) => {
+            if (run) visible = tenantIds.includes(run.tenantId ?? null);
+          },
+          () => undefined,
+        )
+        .finally(() => {
+          checking = false;
+          if (visible === undefined) return;
+          const pending = held;
+          held = [];
+          if (visible) for (const event of pending) onEvent(event);
+        });
+    };
+    const off = this.engine.subscribe((event) => {
+      if (event.runId !== runId || visible === false) return;
+      if (visible) return onEvent(event);
+      held.push(event);
+      check();
     });
+    check();
+    return () => {
+      held = [];
+      off();
+    };
   }
 }

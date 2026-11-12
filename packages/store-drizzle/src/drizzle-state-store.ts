@@ -40,6 +40,7 @@ import {
   singletonAdmissionTags,
 } from '@dudousxd/nestjs-durable-core';
 import {
+  type Column,
   type SQL,
   type Table,
   and,
@@ -72,6 +73,7 @@ import {
   stepCheckpoints,
   workflowRuns,
 } from './schema';
+import { withTenantColumnsHint } from './tenant-columns';
 
 /**
  * Workflows a retention policy never sees: lifecycle registry runs are neither pruned nor counted
@@ -105,6 +107,18 @@ type DrizzleSqlite = BaseSQLiteDatabase<'sync' | 'async', unknown>;
 function anyOf(conditions: (SQL | undefined)[]): SQL {
   const present = conditions.filter((c): c is SQL => c !== undefined);
   return present.length ? (or(...present) as SQL) : sql`1 = 0`;
+}
+
+/** `tenantId` / `tenantIds` predicates on a `tenant_id` column; `null` = no tenant (`IS NULL`). */
+function tenantFilters(
+  column: Column,
+  query: { tenantId?: string | null | undefined; tenantIds?: Array<string | null> | undefined },
+): (SQL | undefined)[] {
+  const one = (id: string | null) => (id === null ? isNull(column) : eq(column, id));
+  return [
+    query.tenantId !== undefined ? one(query.tenantId) : undefined,
+    query.tenantIds ? anyOf(query.tenantIds.map(one)) : undefined,
+  ];
 }
 
 function namespaceFilter(namespace?: string) {
@@ -570,12 +584,15 @@ export class DrizzleStateStore implements StateStore {
   /** Recovery on boot. Namespace-scoped: a worker re-drives only its own tenant's crashed runs.
    *  `and(...)` drops an `undefined` predicate, so an unscoped caller recovers every namespace. */
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
-    const rows = await this.db
-      .select()
-      .from(workflowRuns)
-      .where(
-        and(inArray(workflowRuns.status, ['running', 'cancelling']), namespaceFilter(namespace)),
-      );
+    const rows = await withTenantColumnsHint(
+      'sqlite',
+      this.db
+        .select()
+        .from(workflowRuns)
+        .where(
+          and(inArray(workflowRuns.status, ['running', 'cancelling']), namespaceFilter(namespace)),
+        ),
+    );
     return rows.map(fromRunRow);
   }
 
@@ -586,40 +603,46 @@ export class DrizzleStateStore implements StateStore {
     ownedBy?: OwnedLeaseReclaim,
   ): Promise<WorkflowRun[]> {
     if (limit <= 0) return [];
-    const rows = await this.db
-      .select()
-      .from(workflowRuns)
-      .where(
-        and(
-          inArray(workflowRuns.status, ['running', 'cancelling']),
-          or(
-            isNull(workflowRuns.lockedUntil),
-            lte(workflowRuns.lockedUntil, nowMs),
-            // A live lease left by a previous process with the caller's own instance id.
-            ownedBy
-              ? and(
-                  eq(workflowRuns.lockedBy, ownedBy.owner),
-                  lt(workflowRuns.lockedUntil, ownedBy.lockedBefore),
-                )
-              : undefined,
+    const rows = await withTenantColumnsHint(
+      'sqlite',
+      this.db
+        .select()
+        .from(workflowRuns)
+        .where(
+          and(
+            inArray(workflowRuns.status, ['running', 'cancelling']),
+            or(
+              isNull(workflowRuns.lockedUntil),
+              lte(workflowRuns.lockedUntil, nowMs),
+              // A live lease left by a previous process with the caller's own instance id.
+              ownedBy
+                ? and(
+                    eq(workflowRuns.lockedBy, ownedBy.owner),
+                    lt(workflowRuns.lockedUntil, ownedBy.lockedBefore),
+                  )
+                : undefined,
+            ),
+            namespaceFilter(namespace),
           ),
-          namespaceFilter(namespace),
-        ),
-      )
-      .orderBy(asc(workflowRuns.createdAt))
-      .limit(limit);
+        )
+        .orderBy(asc(workflowRuns.createdAt))
+        .limit(limit),
+    );
     return rows.map(fromRunRow);
   }
 
   /** Dispatch pick-up. Namespace-scoped — without it a worker serving one tenant drains another
    *  tenant's queue, and the `limit` makes it worse: foreign runs consume the FIFO budget. */
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
-    const rows = await this.db
-      .select()
-      .from(workflowRuns)
-      .where(and(eq(workflowRuns.status, 'pending'), namespaceFilter(namespace)))
-      .orderBy(asc(workflowRuns.createdAt)) // FIFO dispatch
-      .limit(limit);
+    const rows = await withTenantColumnsHint(
+      'sqlite',
+      this.db
+        .select()
+        .from(workflowRuns)
+        .where(and(eq(workflowRuns.status, 'pending'), namespaceFilter(namespace)))
+        .orderBy(asc(workflowRuns.createdAt)) // FIFO dispatch
+        .limit(limit),
+    );
     return rows.map(fromRunRow);
   }
 
@@ -637,7 +660,10 @@ export class DrizzleStateStore implements StateStore {
         ),
       )
       .orderBy(asc(workflowRuns.wakeAt));
-    const rows = limit !== undefined ? await query.limit(limit) : await query;
+    const rows = await withTenantColumnsHint(
+      'sqlite',
+      limit !== undefined ? query.limit(limit) : query,
+    );
     return rows.map(fromRunRow);
   }
 
@@ -720,6 +746,8 @@ export class DrizzleStateStore implements StateStore {
             ),
           )
         : undefined,
+      // The customer (tenancy matching rule): `null` = runs with no tenant.
+      ...tenantFilters(workflowRuns.tenantId, query),
       query.status ? eq(workflowRuns.status, query.status) : undefined,
       // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store).
       query.statuses
@@ -885,30 +913,39 @@ export class DrizzleStateStore implements StateStore {
   }
 
   async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
-    const rows = await this.db
-      .select()
-      .from(durableSchedules)
-      .where(
-        and(
-          query.namespace !== undefined
-            ? eq(durableSchedules.namespace, query.namespace)
-            : undefined,
-          query.workflow !== undefined ? eq(durableSchedules.workflow, query.workflow) : undefined,
-          query.paused !== undefined ? eq(durableSchedules.paused, query.paused) : undefined,
-          query.tag !== undefined ? like(durableSchedules.tags, `%"${query.tag}"%`) : undefined,
-          query.dueBy !== undefined
-            ? and(eq(durableSchedules.paused, false), lte(durableSchedules.nextFireAt, query.dueBy))
-            : undefined,
-        ),
-      )
-      // Soonest-due first, never-firing (NULL) last, id as the stable tie-break.
-      .orderBy(
-        sql`${durableSchedules.nextFireAt} IS NULL`,
-        asc(durableSchedules.nextFireAt),
-        asc(durableSchedules.id),
-      )
-      .limit(query.limit ?? -1)
-      .offset(query.offset ?? 0);
+    const rows = await withTenantColumnsHint(
+      'sqlite',
+      this.db
+        .select()
+        .from(durableSchedules)
+        .where(
+          and(
+            query.namespace !== undefined
+              ? eq(durableSchedules.namespace, query.namespace)
+              : undefined,
+            query.workflow !== undefined
+              ? eq(durableSchedules.workflow, query.workflow)
+              : undefined,
+            query.paused !== undefined ? eq(durableSchedules.paused, query.paused) : undefined,
+            query.tag !== undefined ? like(durableSchedules.tags, `%"${query.tag}"%`) : undefined,
+            ...tenantFilters(durableSchedules.tenantId, query),
+            query.dueBy !== undefined
+              ? and(
+                  eq(durableSchedules.paused, false),
+                  lte(durableSchedules.nextFireAt, query.dueBy),
+                )
+              : undefined,
+          ),
+        )
+        // Soonest-due first, never-firing (NULL) last, id as the stable tie-break.
+        .orderBy(
+          sql`${durableSchedules.nextFireAt} IS NULL`,
+          asc(durableSchedules.nextFireAt),
+          asc(durableSchedules.id),
+        )
+        .limit(query.limit ?? -1)
+        .offset(query.offset ?? 0),
+    );
     return rows.map(fromScheduleRow);
   }
 
@@ -1432,6 +1469,8 @@ function toRunRow(run: WorkflowRun): RunRow {
     namespace: run.namespace || DEFAULT_NAMESPACE, // '' is the default pool too
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
+    tenantId: run.tenantId ?? null,
+    tenantKind: run.tenantKind ?? null,
     createdAt: run.createdAt.getTime(),
     updatedAt: run.updatedAt.getTime(),
   };
@@ -1464,6 +1503,8 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunRow> {
   // does not mention it leaves the run in the tenant it was created in.
   if ('namespace' in patch) row.namespace = patch.namespace || DEFAULT_NAMESPACE;
   if ('origin' in patch) row.origin = patch.origin ?? null;
+  if ('tenantId' in patch) row.tenantId = patch.tenantId ?? null;
+  if ('tenantKind' in patch) row.tenantKind = patch.tenantKind ?? null;
   if (patch.createdAt != null) row.createdAt = patch.createdAt.getTime();
   if (patch.updatedAt != null) row.updatedAt = patch.updatedAt.getTime();
   return row;
@@ -1493,6 +1534,9 @@ function fromRunRow(row: RunRow): WorkflowRun {
     namespace: row.namespace || DEFAULT_NAMESPACE,
     // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
     origin: row.origin ?? undefined,
+    // NULL = no tenant; left off the object entirely so a tenancy-off run reads back unchanged.
+    ...(row.tenantId != null ? { tenantId: row.tenantId } : {}),
+    ...(row.tenantKind != null ? { tenantKind: row.tenantKind } : {}),
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };
@@ -1554,6 +1598,8 @@ function toScheduleRow(r: ScheduleRecord): ScheduleRow {
     tags: r.tags ?? null,
     spec: r.spec,
     state: r.state,
+    tenantId: r.tenantId ?? null,
+    tenantKind: r.tenantKind ?? null,
     createdAt: r.createdAt.getTime(),
     updatedAt: r.updatedAt.getTime(),
   };
@@ -1570,6 +1616,8 @@ function toSchedulePatch(
   if ('tags' in patch) set.tags = patch.tags ?? null;
   if ('spec' in patch && patch.spec !== undefined) set.spec = patch.spec;
   if ('state' in patch && patch.state !== undefined) set.state = patch.state;
+  if ('tenantId' in patch) set.tenantId = patch.tenantId ?? null;
+  if ('tenantKind' in patch) set.tenantKind = patch.tenantKind ?? null;
   if ('updatedAt' in patch && patch.updatedAt !== undefined)
     set.updatedAt = patch.updatedAt.getTime();
   return set;
@@ -1585,6 +1633,8 @@ function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
     ...(row.tags ? { tags: row.tags } : {}),
     spec: row.spec ?? {},
     state: row.state ?? {},
+    ...(row.tenantId != null ? { tenantId: row.tenantId } : {}),
+    ...(row.tenantKind != null ? { tenantKind: row.tenantKind } : {}),
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };

@@ -6,6 +6,11 @@ icon: Building2
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
+<Callout type="info">
+This page is about worker pools (`namespace`, `partition`, tenant workers). To scope runs by the
+**customer** they belong to (the request's organization), see [Data tenancy](/docs/concepts/data-tenancy).
+</Callout>
+
 Tenancy is one axis: **whose runs are these, and which pool executes them.** It is independent of how
 many processes you run — see [Topologies](/docs/cluster) for that. This page is what the tenant axis
 means once you have reached for it.

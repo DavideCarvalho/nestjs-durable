@@ -1,6 +1,7 @@
 import { SignalTimeoutError } from './errors';
 import type { WorkflowCtx } from './interfaces';
 import { CORE_ORIGIN } from './origin';
+import type { RunTenant } from './tenancy';
 
 /**
  * How `onEvent` triggers are coalesced into fewer runs (see `@Workflow({ debounce | batch })`).
@@ -17,6 +18,12 @@ export type EventBatchConfig =
       key?: ((input: unknown) => string) | undefined;
     };
 
+/** The tenant an accumulator run is started with (tenancy on): `null` = no tenant. */
+export interface AccumulatorStartOptions {
+  tenantId: string | null;
+  tenantKind?: string | undefined;
+}
+
 /** The slice of the engine the accumulators need (so they stay a standalone module). */
 export interface AccumulatorHost {
   register(
@@ -30,21 +37,29 @@ export interface AccumulatorHost {
     input: unknown,
     runId: string,
     signal: { token: string; payload?: unknown },
+    opts?: AccumulatorStartOptions,
   ): Promise<{ runId: string }>;
+}
+
+/** `value` percent-encoded so it holds no `:`, `~` or other separator a run id gives meaning to. */
+function escapeIdPart(value: string): string {
+  return encodeURIComponent(value).replace(
+    /[~!'()*.]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
 }
 
 /**
  * The accumulator run id, which is also its signal token. Without a key it is the target's alone;
  * with one, the key is percent-encoded (`~` and the other characters `encodeURIComponent` keeps
- * included), so any string makes a safe id that cannot read as a continue-as-new suffix.
+ * included), so any string makes a safe id that cannot read as a continue-as-new suffix. With a
+ * `tenant` (tenancy: a tenant's events), the id is that tenant's own, under a separate prefix with
+ * the tenant id encoded the same way, so no key or target can name another tenant's accumulator.
  */
-export function accumulatorRunId(target: string, key?: string): string {
-  if (key === undefined) return `__evtacc__:${target}`;
-  const escaped = encodeURIComponent(key).replace(
-    /[~!'()*.]/g,
-    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
-  );
-  return `__evtacc__:${target}:${escaped}`;
+export function accumulatorRunId(target: string, key?: string, tenant?: string): string {
+  const base = tenant === undefined ? '__evtacc__' : `__evtacc__@${escapeIdPart(tenant)}`;
+  if (key === undefined) return `${base}:${target}`;
+  return `${base}:${target}:${escapeIdPart(key)}`;
 }
 
 /**
@@ -56,6 +71,8 @@ interface AccumulatorInput {
   windowMs: number;
   maxSize?: number;
   key?: string;
+  /** The tenant whose events this accumulator collects (tenancy), absent for the shared one. */
+  tenant?: string;
   seen?: string[];
 }
 
@@ -111,8 +128,8 @@ class SeenEvents {
   }
 }
 
-const accToken = (input: Pick<AccumulatorInput, 'target' | 'key'>): string =>
-  accumulatorRunId(input.target, input.key);
+const accToken = (input: Pick<AccumulatorInput, 'target' | 'key' | 'tenant'>): string =>
+  accumulatorRunId(input.target, input.key, input.tenant);
 
 /**
  * Built-in workflows that coalesce `onEvent` triggers. Each is a long-lived per-target accumulator
@@ -134,24 +151,39 @@ export class EventAccumulators {
    * Route an `onEvent` payload into its target's debounce/batch accumulator: the target's one, or
    * with a `key`, the one for `String(config.key(payload))`. A `key` that throws rejects the route.
    * With `id`, the accumulator counts the event once however many times it is routed.
+   *
+   * `tenant` is the tenant the event belongs to when tenancy is on: a tenant gets its own
+   * accumulator, stamped with it (so its target runs are too); `null` routes into the shared one,
+   * stamped with no tenant. Undefined (tenancy off) starts the accumulator as before.
    */
   route(
     target: string,
     config: EventBatchConfig,
     payload: unknown,
     id?: string,
+    tenant?: RunTenant | null,
   ): Promise<{ runId: string }> {
     const input: AccumulatorInput = {
       target,
       windowMs: config.windowMs,
       ...(config.mode === 'batch' ? { maxSize: config.maxSize } : {}),
       ...(config.key ? { key: String(config.key(payload)) } : {}),
+      ...(tenant ? { tenant: tenant.id } : {}),
     };
     const workflow = config.mode === 'debounce' ? '__evt_debounce' : '__evt_batch';
     const token = accToken(input);
     const signal: unknown =
       id === undefined ? payload : ({ __evtacc: 1, id, payload } as RoutedEvent);
-    return this.host.signalWithStart(workflow, input, token, { token, payload: signal });
+    const opts: AccumulatorStartOptions | undefined =
+      tenant === undefined
+        ? undefined
+        : tenant === null
+          ? { tenantId: null }
+          : {
+              tenantId: tenant.id,
+              ...(tenant.kind !== undefined ? { tenantKind: tenant.kind } : {}),
+            };
+    return this.host.signalWithStart(workflow, input, token, { token, payload: signal }, opts);
   }
 
   /** Fire the target with the LAST payload once events have been quiet for `windowMs`. */

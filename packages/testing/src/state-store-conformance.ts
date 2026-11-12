@@ -2110,6 +2110,53 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    t(
+      'round-trips a run tenant and filters by tenantId / tenantIds (null = no tenant)',
+      async () => {
+        // Tenancy (the customer a run belongs to). A run with no tenant reads back with NO tenant keys,
+        // so a tenancy-off deployment's runs are unchanged; the matching rule narrows reads through
+        // `tenantIds`, where `null` is the no-tenant bucket (`IN (NULL)` is never true in SQL).
+        await store.createRun(run({ id: 'a', tenantId: 'acme', tenantKind: 'organization' }));
+        await store.createRun(run({ id: 'b', tenantId: 'globex' }));
+        await store.createRun(run({ id: 'c' }));
+
+        const a = await store.getRun('a');
+        expect(a?.tenantId).toBe('acme');
+        expect(a?.tenantKind).toBe('organization');
+        expect((await store.getRun('b'))?.tenantKind ?? undefined).toBeUndefined();
+        const c = await store.getRun('c');
+        expect(c?.tenantId ?? undefined).toBeUndefined();
+        expect(c?.tenantKind ?? undefined).toBeUndefined();
+
+        const ids = async (q: Parameters<typeof store.listRuns>[0]) =>
+          (await store.listRuns(q)).map((r) => r.id).sort();
+        expect(await ids({ tenantId: 'acme' })).toEqual(['a']);
+        expect(await ids({ tenantId: null })).toEqual(['c']);
+        expect(await ids({ tenantIds: ['acme'] })).toEqual(['a']);
+        expect(await ids({ tenantIds: ['acme', null] })).toEqual(['a', 'c']);
+        expect(await ids({ tenantIds: [null] })).toEqual(['c']);
+        expect(await ids({ tenantIds: [] })).toEqual([]);
+        expect(await ids({})).toEqual(['a', 'b', 'c']);
+        // ANDed with a concurrent single tenantId and the other predicates.
+        expect(await ids({ tenantIds: ['acme', null], tenantId: 'acme' })).toEqual(['a']);
+        expect(await ids({ tenantIds: ['acme', 'globex'], workflow: 'nope' })).toEqual([]);
+
+        // A patch can set and clear it.
+        await store.updateRun('c', { tenantId: 'acme', tenantKind: 'organization' });
+        expect(await ids({ tenantId: 'acme' })).toEqual(['a', 'c']);
+        await store.updateRun('c', { tenantId: null, tenantKind: null });
+        expect(await ids({ tenantId: null })).toEqual(['c']);
+        // A patch that does not name it leaves it alone.
+        await store.updateRun('a', { status: 'completed' });
+        expect((await store.getRun('a'))?.tenantId).toBe('acme');
+
+        if (store.runFacets) {
+          const facets = await store.runFacets({ tenantIds: ['acme'] });
+          expect(facets.reduce((n, f) => n + f.count, 0)).toBe(1);
+        }
+      },
+    );
+
     t('counts runs by (status, origin) without returning them', async () => {
       // The aggregate behind a console's chips. It exists so the run LIST can be paged: the page
       // bounds what is rendered, this bounds nothing — so a store that quietly applied the same limit
@@ -2578,6 +2625,28 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.deleteSchedule?.('s1')).toBe(true);
       expect(await store.deleteSchedule?.('s1')).toBe(false);
       expect(await store.getSchedule?.('s1')).toBeNull();
+    });
+
+    t('round-trips a schedule tenant and filters listSchedules by it', async () => {
+      if (!store.saveSchedule || !store.listSchedules) return;
+      await store.saveSchedule(
+        schedule({ id: 's1', tenantId: 'acme', tenantKind: 'organization' }),
+      );
+      await store.saveSchedule(schedule({ id: 's2' }));
+      const s1 = await store.getSchedule?.('s1');
+      expect(s1?.tenantId).toBe('acme');
+      expect(s1?.tenantKind).toBe('organization');
+      expect((await store.getSchedule?.('s2'))?.tenantId ?? undefined).toBeUndefined();
+      const ids = async (q: Parameters<NonNullable<typeof store.listSchedules>>[0]) =>
+        ((await store.listSchedules?.(q)) ?? []).map((r) => r.id).sort();
+      expect(await ids({ tenantId: 'acme' })).toEqual(['s1']);
+      expect(await ids({ tenantIds: [null] })).toEqual(['s2']);
+      expect(await ids({ tenantIds: ['acme', null] })).toEqual(['s1', 's2']);
+      expect(await ids({ tenantIds: [] })).toEqual([]);
+      // ANDed with the due scan (which has its own clauses).
+      expect(await ids({ tenantId: 'acme', dueBy: NOW + 120_000 })).toEqual(['s1']);
+      expect(await store.updateSchedule?.('s2', { tenantId: 'globex' })).toBe(true);
+      expect(await ids({ tenantId: 'globex' })).toEqual(['s2']);
     });
 
     t('updateSchedule patches, and compare-and-sets on nextFireAt', async () => {

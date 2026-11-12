@@ -271,6 +271,7 @@ export async function ensureTypeOrmDurableSchema(
       ${runsCol('awaitingDecisionTaskId')} ${str},
       ${runsCol('recoveryAttempts')} ${int}, ${runsCol('tags')} ${txt}, ${runsCol('searchAttributes')} ${txt},
       ${runsCol('priority')} ${int}, ${runsCol('namespace')} ${nsCol}, ${runsCol('origin')} ${str},
+      ${runsCol('tenantId')} ${str}, ${runsCol('tenantKind')} ${str},
       ${runsCol('createdAt')} ${ts} NOT NULL, ${runsCol('updatedAt')} ${ts} NOT NULL
     )`,
     ],
@@ -338,6 +339,7 @@ export async function ensureTypeOrmDurableSchema(
       ${schCol('paused')} boolean NOT NULL DEFAULT ${isPg ? 'false' : '0'},
       ${schCol('nextFireAt')} bigint, ${schCol('tags')} ${txt},
       ${schCol('spec')} ${txt} NOT NULL, ${schCol('state')} ${txt} NOT NULL,
+      ${schCol('tenantId')} ${str}, ${schCol('tenantKind')} ${str},
       ${schCol('createdAt')} ${ts} NOT NULL, ${schCol('updatedAt')} ${ts} NOT NULL
     )`,
     ],
@@ -370,6 +372,9 @@ export async function ensureTypeOrmDurableSchema(
       // back-fill — the origin is derived from the registration that created the run, which is long
       // gone by the time this ALTER runs.
       ['origin', str],
+      // The customer (tenancy). Nullable, never back-filled: a run written before it has no tenant.
+      ['tenantId', str],
+      ['tenantKind', str],
     ],
     durable_step_checkpoints: [
       ['input', txt],
@@ -383,6 +388,10 @@ export async function ensureTypeOrmDurableSchema(
     // Back-fill the child-await fan group onto signal-waiter tables that predate it (a remote
     // `gather_children` fan-out threads its group here so the resolved `signal:child:` checkpoint carries it).
     durable_signal_waiters: [['parallelGroup', str]],
+    durable_schedules: [
+      ['tenantId', str],
+      ['tenantKind', str],
+    ],
   };
 
   // What this boot actually changed, for the repair warning. Tables created here are recorded
@@ -530,6 +539,13 @@ export async function ensureTypeOrmDurableSchema(
         `${schedules} (${schCol('paused')}, ${schCol('nextFireAt')})`,
         'durable_schedules',
       ],
+      // Tenancy: app-facing reads filter by the customer and page newest first.
+      [
+        'durable_workflow_runs_tenant_idx',
+        `${runs} (${runsCol('tenantId')}, ${runsCol('createdAt')})`,
+        'durable_workflow_runs',
+      ],
+      ['durable_schedules_tenant_idx', `${schedules} (${schCol('tenantId')})`, 'durable_schedules'],
       [
         'durable_run_attributes_num_idx',
         `${runAttributes} (${attrCol('key')}, ${attrCol('numValue')})`,

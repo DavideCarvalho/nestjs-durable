@@ -97,6 +97,25 @@ new DrizzlePgStateStore(db, { schemaLogger: new Logger('DurableSchema') });
 await ensureDrizzlePgDurableSchema(db, { logger });
 ```
 
+### Upgrading to tenancy columns with `autoSchema: false`
+
+This version adds nullable `tenant_id` / `tenant_kind` columns (plus an index) to
+`durable_workflow_runs` and `durable_schedules`. The store reads them on every run and schedule
+query, **even with [data tenancy](/docs/concepts/data-tenancy) off**. With `autoSchema` on, the boot
+adds them. With `autoSchema: false`, add them **before** you deploy the upgrade: run
+`drizzle-kit generate` against the re-exported tables and apply the migration. It must contain:
+
+```sql
+ALTER TABLE "durable_workflow_runs" ADD COLUMN IF NOT EXISTS "tenant_id" text;
+ALTER TABLE "durable_workflow_runs" ADD COLUMN IF NOT EXISTS "tenant_kind" text;
+ALTER TABLE "durable_schedules" ADD COLUMN IF NOT EXISTS "tenant_id" text;
+ALTER TABLE "durable_schedules" ADD COLUMN IF NOT EXISTS "tenant_kind" text;
+CREATE INDEX IF NOT EXISTS "durable_workflow_runs_tenant_idx" ON "durable_workflow_runs" USING btree ("tenant_id","created_at");
+CREATE INDEX IF NOT EXISTS "durable_schedules_tenant_idx" ON "durable_schedules" USING btree ("tenant_id");
+```
+
+Without them the app fails at boot with a `MissingTenantColumnsError` that lists these statements.
+
 ## Schema
 
 Canonical table + column names (the same `durable_*` / snake_case contract as every other adapter),

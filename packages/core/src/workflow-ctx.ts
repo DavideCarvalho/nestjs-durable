@@ -15,7 +15,13 @@ import {
   SignalTimeoutError,
   WorkflowSuspended,
 } from './errors';
-import { EVENT_BUFFER_SCAN_LIMIT, eventMatches, eventToken } from './events';
+import {
+  EVENT_BUFFER_SCAN_LIMIT,
+  bufferedEventReaches,
+  eventMatches,
+  eventToken,
+  readBufferedEvent,
+} from './events';
 import {
   FOLDED_PREFIX,
   type FoldedChildren,
@@ -487,8 +493,16 @@ export function createWorkflowCtx(
     seq: number,
   ): Promise<{ value: T } | null> => {
     const candidates = await store.listBufferedEvents(name, EVENT_BUFFER_SCAN_LIMIT);
+    // This run's tenant, read once and only when a candidate was published under a tenant.
+    let runTenantId: Promise<string | null> | undefined;
     for (const candidate of candidates) {
-      if (!eventMatches(candidate.payload, match ?? {})) continue;
+      const { payload, tenantIds } = readBufferedEvent(candidate.payload);
+      if (!eventMatches(payload, match ?? {})) continue;
+      if (tenantIds !== undefined) {
+        // Tenancy: an event published under a tenant reaches only the runs that tenant may see.
+        runTenantId ??= store.getRun(runId).then((run) => run?.tenantId ?? null);
+        if (!bufferedEventReaches(tenantIds, await runTenantId)) continue;
+      }
       if (!(await store.removeBufferedEvent(candidate.id))) continue; // raced away — try the next
       // Resolved it ourselves — remove OUR OWN waiter row via the exact match (not
       // `takeSignalWaiter(token)`; harmless here since an event token is unique per call, but exact
@@ -500,10 +514,10 @@ export function createWorkflowCtx(
           seq,
           name: `signal:${token}`,
           kind: 'signal',
-          output: candidate.payload,
+          output: payload,
         }),
       );
-      return { value: candidate.payload as T };
+      return { value: payload as T };
     }
     return null;
   };

@@ -44,7 +44,7 @@ CREATE TABLE durable_workflow_runs (
   input TEXT, output TEXT, error TEXT, wake_at INTEGER, locked_by TEXT, locked_until INTEGER,
   awaiting_decision_task_id TEXT,
   recovery_attempts INTEGER, tags TEXT, search_attributes TEXT, priority INTEGER,
-  namespace TEXT NOT NULL DEFAULT 'default', origin TEXT,
+  namespace TEXT NOT NULL DEFAULT 'default', origin TEXT, tenant_id TEXT, tenant_kind TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE INDEX durable_workflow_runs_namespace_status_idx
@@ -69,7 +69,7 @@ CREATE INDEX durable_signal_ids_expires_at_idx ON durable_signal_ids (expires_at
 CREATE TABLE durable_schedules (
   id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'default', workflow TEXT NOT NULL,
   paused INTEGER NOT NULL DEFAULT 0, next_fire_at INTEGER, tags TEXT, spec TEXT NOT NULL, state TEXT NOT NULL,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  tenant_id TEXT, tenant_kind TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE INDEX durable_schedules_due_idx ON durable_schedules (paused, next_fire_at);
 `;

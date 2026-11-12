@@ -28,6 +28,11 @@ export interface DurableExecution {
   readonly seq: number | undefined;
   /** 1-based dispatch attempt, when the task carries one. */
   readonly attempt: number | undefined;
+  /**
+   * The opaque context carrier the dispatched task carries (`RemoteTask.context`: tenant, user,
+   * trace ids), for `unit: 'step'`. Lets a host wrapper restore it around the handler body.
+   */
+  readonly context?: Record<string, unknown> | undefined;
 }
 
 /**

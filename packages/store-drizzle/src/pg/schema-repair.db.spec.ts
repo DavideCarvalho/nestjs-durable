@@ -2,6 +2,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import { drizzle } from 'drizzle-orm/node-postgres';
 import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { MissingTenantColumnsError } from '../tenant-columns';
 import { ensureDrizzlePgDurableSchema } from './ddl';
 import { DrizzlePgStateStore } from './drizzle-pg-state-store';
 import { durablePgManagedTables } from './schema';
@@ -105,5 +106,46 @@ describe.skipIf(skipped)('ensureDrizzlePgDurableSchema repair warning [real Post
     expect(logger.messages).toEqual([
       expect.stringContaining('created index durable_schedules_due_idx on durable_schedules'),
     ]);
+  });
+});
+
+describe.skipIf(skipped)('a Postgres database without the tenancy columns (autoSchema off)', () => {
+  beforeEach(async () => {
+    for (const table of durablePgManagedTables())
+      await pool?.query(`DROP TABLE IF EXISTS "${table}"`);
+  });
+
+  it('fails boot recovery with the exact migration, and autoSchema repairs it', async () => {
+    const db = drizzle(pool as pg.Pool);
+    await ensureDrizzlePgDurableSchema(db, { logger: recordingLogger() });
+    for (const table of ['durable_workflow_runs', 'durable_schedules']) {
+      await pool?.query(
+        `ALTER TABLE "${table}" DROP COLUMN "tenant_id", DROP COLUMN "tenant_kind"`,
+      );
+    }
+    const store = new DrizzlePgStateStore(db);
+
+    const err = await store.listOrphanedRuns(Date.now(), 10).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MissingTenantColumnsError);
+    const message = (err as Error).message;
+    expect(message).toContain(
+      'ALTER TABLE "durable_workflow_runs" ADD COLUMN IF NOT EXISTS "tenant_id" text;',
+    );
+    expect(message).toContain(
+      'CREATE INDEX IF NOT EXISTS "durable_schedules_tenant_idx" ON "durable_schedules" USING btree ("tenant_id");',
+    );
+    expect(message).toContain('autoSchema');
+    await expect(store.listSchedules({ dueBy: Date.now() })).rejects.toBeInstanceOf(
+      MissingTenantColumnsError,
+    );
+    await expect(
+      store.claimPendingRuns(5, 'me', Date.now() + 1000, Date.now()),
+    ).rejects.toBeInstanceOf(MissingTenantColumnsError);
+
+    // The statements in the message are what fixes it.
+    for (const line of message.split('\n').filter((l) => /^\s+(ALTER|CREATE)/.test(l))) {
+      await pool?.query(line.trim());
+    }
+    expect(await store.listOrphanedRuns(Date.now(), 10)).toEqual([]);
   });
 });

@@ -42,6 +42,7 @@ import {
   singletonAdmissionTags,
 } from '@dudousxd/nestjs-durable-core';
 import {
+  type Column,
   type SQL,
   type Table,
   and,
@@ -64,6 +65,7 @@ import {
   sql,
 } from 'drizzle-orm';
 import type { PgDatabase } from 'drizzle-orm/pg-core';
+import { withTenantColumnsHint } from '../tenant-columns';
 import { type DurableSchemaLogger, ensureDrizzlePgDurableSchema } from './ddl';
 import { rowsOf } from './executor';
 import { PgHotPath, type PgHotPathOptions, TableCodec, placeholders, quote } from './hot-path';
@@ -124,6 +126,18 @@ export interface DrizzlePgStateStoreOptions {
 function anyOf(conditions: (SQL | undefined)[]): SQL {
   const present = conditions.filter((c): c is SQL => c !== undefined);
   return present.length ? (or(...present) as SQL) : sql`1 = 0`;
+}
+
+/** `tenantId` / `tenantIds` predicates on a `tenant_id` column; `null` = no tenant (`IS NULL`). */
+function tenantFilters(
+  column: Column,
+  query: { tenantId?: string | null | undefined; tenantIds?: Array<string | null> | undefined },
+): (SQL | undefined)[] {
+  const one = (id: string | null) => (id === null ? isNull(column) : eq(column, id));
+  return [
+    query.tenantId !== undefined ? one(query.tenantId) : undefined,
+    query.tenantIds ? anyOf(query.tenantIds.map(one)) : undefined,
+  ];
 }
 
 /** `undefined` = no restriction (the operator view), never `namespace IS NULL`. The column is
@@ -694,16 +708,19 @@ export class DrizzlePgStateStore implements StateStore {
 
   /** Crash recovery. Namespace-scoped: a worker re-drives only its own tenant's runs. */
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
-    const rows = await this.db
-      .select()
-      .from(workflowRuns)
-      .where(
-        and(
-          inArray(workflowRuns.status, ['running', 'cancelling']),
-          namespaceFilter(namespace),
-          this.scope(),
+    const rows = await withTenantColumnsHint(
+      'pg',
+      this.db
+        .select()
+        .from(workflowRuns)
+        .where(
+          and(
+            inArray(workflowRuns.status, ['running', 'cancelling']),
+            namespaceFilter(namespace),
+            this.scope(),
+          ),
         ),
-      );
+    );
     return rows.map(fromRunRow);
   }
 
@@ -714,7 +731,8 @@ export class DrizzlePgStateStore implements StateStore {
     ownedBy?: OwnedLeaseReclaim,
   ): Promise<WorkflowRun[]> {
     if (limit <= 0) return [];
-    const rows = await this.db
+    // The first query a booting engine runs (crash recovery): an unmigrated database fails here.
+    const query = this.db
       .select()
       .from(workflowRuns)
       .where(
@@ -737,18 +755,22 @@ export class DrizzlePgStateStore implements StateStore {
       )
       .orderBy(asc(workflowRuns.createdAt))
       .limit(limit);
+    const rows = await withTenantColumnsHint('pg', query);
     return rows.map(fromRunRow);
   }
 
   /** FIFO pick-up, served by `durable_workflow_runs_namespace_status_idx`. The engine then leases
    *  each run with {@link tryLockRun}; the listing itself takes no locks (it runs outside a tx). */
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
-    const rows = await this.db
-      .select()
-      .from(workflowRuns)
-      .where(and(eq(workflowRuns.status, 'pending'), namespaceFilter(namespace), this.scope()))
-      .orderBy(asc(workflowRuns.createdAt))
-      .limit(limit);
+    const rows = await withTenantColumnsHint(
+      'pg',
+      this.db
+        .select()
+        .from(workflowRuns)
+        .where(and(eq(workflowRuns.status, 'pending'), namespaceFilter(namespace), this.scope()))
+        .orderBy(asc(workflowRuns.createdAt))
+        .limit(limit),
+    );
     return rows.map(fromRunRow);
   }
 
@@ -776,7 +798,9 @@ export class DrizzlePgStateStore implements StateStore {
       // A CTE, MATERIALIZED, picks the rows once. As a subquery in UPDATE ... FROM, Postgres may
       // rescan it, and each rescan skips the rows this statement already updated and takes the
       // next ones, so a claim of `limit` rows could lease every free pending run.
-      await this.db.execute(sql`WITH c AS MATERIALIZED (
+      await withTenantColumnsHint(
+        'pg',
+        this.db.execute(sql`WITH c AS MATERIALIZED (
           SELECT ${workflowRuns.id} AS claimed_id FROM ${workflowRuns}
           WHERE ${filters}
           ORDER BY ${workflowRuns.createdAt}, ${workflowRuns.id}
@@ -789,6 +813,7 @@ export class DrizzlePgStateStore implements StateStore {
         FROM c
         WHERE r.${sql.identifier(getTableColumns(workflowRuns).id.name)} = c.claimed_id
         RETURNING ${returning}`),
+      ),
     );
     return rows
       .map((raw) => fromRunRow(RUNS.decode(raw)))
@@ -809,7 +834,10 @@ export class DrizzlePgStateStore implements StateStore {
         ),
       )
       .orderBy(asc(workflowRuns.wakeAt));
-    const rows = limit !== undefined ? await query.limit(limit) : await query;
+    const rows = await withTenantColumnsHint(
+      'pg',
+      limit !== undefined ? query.limit(limit) : query,
+    );
     return rows.map(fromRunRow);
   }
 
@@ -910,6 +938,8 @@ export class DrizzlePgStateStore implements StateStore {
             ),
           )
         : undefined,
+      // The customer (tenancy matching rule): `null` = runs with no tenant.
+      ...tenantFilters(workflowRuns.tenantId, query),
       query.status ? eq(workflowRuns.status, query.status) : undefined,
       query.statuses
         ? query.statuses.length
@@ -1069,6 +1099,7 @@ export class DrizzlePgStateStore implements StateStore {
           query.tag !== undefined
             ? sql`${schedules.tags} @> ${JSON.stringify([query.tag])}::jsonb`
             : undefined,
+          ...tenantFilters(schedules.tenantId, query),
           query.dueBy !== undefined
             ? and(eq(schedules.paused, false), lte(schedules.nextFireAt, new Date(query.dueBy)))
             : undefined,
@@ -1079,7 +1110,7 @@ export class DrizzlePgStateStore implements StateStore {
       .$dynamic();
     if (query.limit != null) base.limit(query.limit);
     if (query.offset != null) base.offset(query.offset);
-    return (await base).map(fromScheduleRow);
+    return (await withTenantColumnsHint('pg', base)).map(fromScheduleRow);
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
@@ -1816,6 +1847,8 @@ function toRunRow(run: WorkflowRun): RunInsert {
     priority: run.priority ?? null,
     namespace: run.namespace || DEFAULT_NAMESPACE, // '' is the default pool too
     origin: run.origin ?? null,
+    tenantId: run.tenantId ?? null,
+    tenantKind: run.tenantKind ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -1843,6 +1876,8 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunInsert> {
   // Never cleared to NULL: an undefined namespace means the default one.
   if ('namespace' in patch) row.namespace = patch.namespace || DEFAULT_NAMESPACE;
   if ('origin' in patch) row.origin = patch.origin ?? null;
+  if ('tenantId' in patch) row.tenantId = patch.tenantId ?? null;
+  if ('tenantKind' in patch) row.tenantKind = patch.tenantKind ?? null;
   if (patch.createdAt != null) row.createdAt = patch.createdAt;
   if (patch.updatedAt != null) row.updatedAt = patch.updatedAt;
   return row;
@@ -1867,6 +1902,9 @@ function fromRunRow(row: RunRow): WorkflowRun {
     priority: row.priority ?? undefined,
     namespace: row.namespace || DEFAULT_NAMESPACE, // a legacy '' row reads back as the default pool
     origin: row.origin ?? undefined,
+    // NULL = no tenant; left off entirely so a tenancy-off run reads back unchanged.
+    ...(row.tenantId != null ? { tenantId: row.tenantId } : {}),
+    ...(row.tenantKind != null ? { tenantKind: row.tenantKind } : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -1929,6 +1967,8 @@ function toScheduleRow(r: ScheduleRecord): ScheduleRow {
     tags: r.tags ?? null,
     spec: r.spec,
     state: r.state,
+    tenantId: r.tenantId ?? null,
+    tenantKind: r.tenantKind ?? null,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
   };
@@ -1946,6 +1986,8 @@ function toSchedulePatch(
   if ('tags' in patch) set.tags = patch.tags ?? null;
   if (patch.spec !== undefined) set.spec = patch.spec;
   if (patch.state !== undefined) set.state = patch.state;
+  if ('tenantId' in patch) set.tenantId = patch.tenantId ?? null;
+  if ('tenantKind' in patch) set.tenantKind = patch.tenantKind ?? null;
   if (patch.updatedAt !== undefined) set.updatedAt = patch.updatedAt;
   return set;
 }
@@ -1960,6 +2002,8 @@ function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
     ...(row.tags ? { tags: row.tags } : {}),
     spec: row.spec ?? {},
     state: row.state ?? {},
+    ...(row.tenantId != null ? { tenantId: row.tenantId } : {}),
+    ...(row.tenantKind != null ? { tenantKind: row.tenantKind } : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

@@ -98,6 +98,25 @@ describe('DurableOutbox (@nestjs/outbox)', () => {
     expect(run?.input).toEqual({ orderId: 'o1' });
   });
 
+  it("records the request's tenant, so a relay with no request starts the run in it", async () => {
+    const t = await boot();
+    close = () => t.mod.close();
+    // Data tenancy on, inside a request of tenant `acme` (what the context would report).
+    const current = vi
+      .spyOn(t.engine, 'contextTenant')
+      .mockReturnValue({ id: 'acme', kind: 'organization' });
+    await t.store.transaction((tx) =>
+      t.outbox.start(tx, CheckoutWorkflow, { orderId: 'o9' }, { runId: 'checkout:o9' }),
+    );
+    current.mockReturnValue(undefined); // the relay runs outside the request
+    await t.relay.runOnce();
+    await t.svc.waitForRun('checkout:o9');
+    expect(await t.runs.getRun('checkout:o9')).toMatchObject({
+      tenantId: 'acme',
+      tenantKind: 'organization',
+    });
+  });
+
   it('starts nothing when the transaction rolls back', async () => {
     const t = await boot();
     close = () => t.mod.close();

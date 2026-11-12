@@ -57,6 +57,10 @@ export const DURABLE_CANONICAL_COLUMNS = {
     // now that all four adapters carry the column — see the note above, which used to
     // name this as the standing example of a capability gap the map cannot express.
     namespace: 'namespace',
+    // The CUSTOMER (tenancy) a run belongs to — distinct from `namespace`. Two words each, so a
+    // `preserve` adapter and a `snake_case` one disagree, and each must say which it is.
+    tenantId: 'tenant_id',
+    tenantKind: 'tenant_kind',
     createdAt: 'created_at',
     updatedAt: 'updated_at',
   },
@@ -124,6 +128,8 @@ export const DURABLE_CANONICAL_COLUMNS = {
     tags: 'tags',
     spec: 'spec',
     state: 'state',
+    tenantId: 'tenant_id',
+    tenantKind: 'tenant_kind',
     createdAt: 'created_at',
     updatedAt: 'updated_at',
   },

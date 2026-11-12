@@ -1,0 +1,200 @@
+---
+title: Data tenancy
+description: Scope runs by the customer they belong to (the request's organization), from @dudousxd/nestjs-context. Off until you turn it on.
+icon: Users
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Data tenancy answers **which customer a run belongs to**: an organization, a clinic, a user's personal
+workspace. Once it is on, a run started in a request belongs to that request's tenant, every turn of
+the run sees that tenant, and a request only sees and controls its own tenant's runs.
+
+It is a different axis from [namespaces and tenant workers](/docs/concepts/tenancy), which decide
+**which worker pool executes** a run. A run has both: a `namespace` (its pool) and a `tenantId` (its
+customer). Turning data tenancy on never changes routing.
+
+Tenancy is **off by default**. Nothing changes for an app that does not turn it on.
+
+## Turn it on
+
+Data tenancy comes from [`@dudousxd/nestjs-context`](https://github.com/DavideCarvalho/nestjs-context)
+1.2 or later. Turn it on there, and set the tenant of each request from your auth layer:
+
+```ts
+ContextModule.forRoot({ tenancy: { enabled: true, kinds: ['organization'] } });
+
+// in your auth guard, after you resolved the organization on the server
+Context.setTenant({ id: claims.org_id, kind: 'organization' });
+```
+
+`DurableModule` follows that switch. Its `tenancy` option takes the same shape as every other Aviary
+lib:
+
+```ts
+DurableModule.forRoot({
+  store,
+  transport,
+  tenancy: 'inherit', // the default: on when ContextModule's tenancy is on
+});
+```
+
+| Value | What it does |
+|-------|--------------|
+| `'inherit'` (default) | Follows `ContextModule`'s `tenancy.enabled`. |
+| `false` | Keeps durable out of tenancy, even when the context turns it on. |
+| `{ enabled?, kinds?, nullRows? }` | `enabled: true/false` overrides the context switch. `kinds` is durable's own allow-list of tenant kinds. `nullRows: 'shared'` lets a tenant also see runs that have no tenant (default `'tenantless'`: it does not). |
+
+Without nestjs-context (or with a version before 1.2), tenancy is off.
+
+## What a run gets
+
+`start` stamps the run's tenant from, in order:
+
+1. an explicit `StartOptions.tenantId` (`null` starts it with no tenant);
+2. the request's tenant, when tenancy is on;
+3. none.
+
+```ts
+await workflows.start(Checkout, input); // the request's tenant
+await workflows.start(Checkout, input, undefined, { tenantId: 'org_42', tenantKind: 'organization' });
+```
+
+The tenant then follows the work:
+
+- **Child workflows** belong to their parent's tenant.
+- **`continueAsNew`** keeps the tenant.
+- **Retry with a new input** keeps the original run's tenant.
+- **Persisted schedules** (`engine.schedules.create`) keep the tenant they were created under (or an
+  explicit `tenantId` option), and every fire starts its run in that tenant.
+- **`DurableOutbox.start`** records the request's tenant in the message, so the relay starts the run
+  in it after commit.
+
+## Every turn runs in the run's tenant
+
+The tenant is stored on the run, so durable restores it around **every** turn: the first one, a
+resume after a `ctx.sleep` timer, a delivered signal, crash recovery, and a turn driven by a worker.
+Inside a workflow body or a local step, `Context.tenant()` is the run's tenant, and so are the tenant
+reads of other Aviary libs called from there. Local steps always get it from the run, whatever your
+`context` carrier holds.
+
+A **lifecycle subscriber** (`onEvent: [runCompletedEvent(...)]`, without `eventBatch`) starts in the
+tenant of the run that settled, even when the event is published later by the background retry pass.
+
+Dispatched step tasks carry the tenant in their context carrier (`tenant` and `tenantId`). A
+`DurableModule` in the process that runs the handler, operator or worker, on any transport, restores
+it around the handler body.
+
+<Callout type="warn">
+  Remote step handlers get the tenant **only through the context carrier**. The default carrier
+  includes it. If you pass your own `context` reader, or a custom `serialize` / `deserialize` to
+  `@dudousxd/nestjs-context`, make it include `tenant` (`{ id, kind }`) or `tenantId`; otherwise a
+  remote step handler runs with no tenant.
+
+  ```ts
+  DurableModule.forRoot({
+    // ...
+    context: () => ({ traceId: Context.traceId(), tenant: Context.tenant() }),
+  });
+  ```
+</Callout>
+
+## Reads and control calls
+
+With tenancy on, the engine's app-facing calls apply one rule:
+
+| Caller | Runs of its tenant | Runs of other tenants | Runs with no tenant |
+|--------|--------------------|-----------------------|---------------------|
+| A request with a tenant | visible | not found | not found (visible with `nullRows: 'shared'`) |
+| A request with no tenant | — | not found | visible |
+| `Context.allTenants(...)` | visible | visible | visible |
+| No request (pollers, scripts) | visible | visible | visible |
+
+This covers `getRun`, `waitForRun`, `listCheckpoints`, `getRunChildren`, `triggeredRuns`, `getEvent`,
+`signal`, `cancel`, `cancelWhere`, `requeue`, `retryWithInput`, `redispatchPending`, `resume`,
+`continue`, `update`, `completeTask`/`failTask`, `deleteRun`, `purgeRuns` and `engine.schedules`. A
+run the caller may not see behaves exactly like a missing one (`null`, `[]`, `0`, "not found"), never
+like a forbidden one, so ids of other tenants do not leak.
+
+`waitForRun` on a run of another tenant rejects with `run <id> not found`. On an id that has no run
+yet it keeps waiting, as before, so `start` then `waitForRun` still works.
+
+Run ids and schedule ids are unique across tenants. A `start` with an id another tenant already used
+returns that run's id and status but never its output or error, and creating a schedule with an id
+another tenant already used throws `ScheduleAlreadyExistsError`. Use ids nobody can guess (the
+default random ids are) when tenants must not learn which ids exist.
+
+To list runs from your own code, narrow the query the same way:
+
+```ts
+const runs = await store.listRuns(engine.scopeRunQuery({ workflow: 'checkout' }));
+```
+
+`RunQuery` (and `ScheduleQuery`) also take `tenantId` and `tenantIds` directly; `null` selects runs
+with no tenant.
+
+<Callout type="info">
+  Callbacks from outside your app have no tenant. A `ctx.webhook()` URL keeps working (its token is the
+  credential, for any caller, so keep run ids unguessable). For `completeTask`/`failTask` or a `signal` sent from an endpoint that serves an
+  external system, run the call inside `Context.allTenants(...)` or `Context.withTenant(...)`.
+</Callout>
+
+## Named events
+
+With tenancy on, named events are **per tenant**. `publishEvent` resumes only the
+`ctx.waitForEvent` waiters whose run the publisher may see, under the same rule as the table above:
+
+| Publisher | Resumes waiting runs of |
+|-----------|-------------------------|
+| A request with a tenant | its tenant (plus runs with no tenant with `nullRows: 'shared'`) |
+| A request with no tenant | runs with no tenant |
+| `Context.allTenants(...)` or no request | every run |
+
+An event nobody received is buffered for the next matching `waitForEvent`, and only a run the
+publisher may see consumes that copy. Subscribers started by the event (`onEvent`) start in the
+publisher's tenant. To broadcast to every tenant, publish from `Context.allTenants(...)` or from code
+outside a request.
+
+A subscriber with `eventBatch` (debounce or batch) collects events into one batch run per workflow,
+or per key. With tenancy on, it gets one batch run per tenant too, so two tenants' events never land
+in the same batch, and each batch run, and the run it fires, carries its tenant:
+
+| Publisher | Batch run |
+|-----------|-----------|
+| A request with a tenant | that tenant's own (per key, with `key`) |
+| A request with no tenant, `Context.allTenants(...)` or no request | the shared one, with no tenant |
+| A run's lifecycle event (`run.completed:…` / `run.failed:…`) | the settled run's tenant, or the shared one when it has none |
+
+The batch run id is deterministic per workflow, key and tenant. A tenant's id has its own
+`__evtacc__@<tenant>:` prefix, so neither a key nor a workflow name can reach another tenant's batch.
+
+With tenancy off, named events reach every waiting run, and every publish shares the one batch run,
+as before.
+
+## Dashboard
+
+The dashboard reads through the same rule: a request with a tenant sees only that tenant's runs,
+counts and schedules, and a run of another tenant answers 404 and streams no live events. Admin users who must see every tenant
+need `Context.allTenants` around the dashboard's requests, for example in an interceptor you add with
+the dashboard's `decorators` option.
+
+## Database columns
+
+Runs and schedules gain two nullable columns, `tenant_id` and `tenant_kind`, plus an index on
+`durable_workflow_runs (tenant_id, created_at)` and on `durable_schedules (tenant_id)`. Existing rows
+keep NULL: they have no tenant.
+
+Every store reads these columns on every run and schedule query, **even with tenancy off**, so add
+them before you deploy the upgrade:
+
+- **MikroORM, TypeORM, Drizzle Postgres with `autoSchema` on (the default):** added on boot.
+- **Drizzle Postgres with `autoSchema: false`, and every Drizzle SQLite / libSQL database:** generate a
+  migration with `drizzle-kit generate` and apply it (statements in
+  [Drizzle Postgres](/docs/stores/drizzle-postgres) and [Drizzle](/docs/stores/drizzle)). Without
+  it the app fails at boot with a `MissingTenantColumnsError` that lists them.
+- **MikroORM or TypeORM with `autoSchema: false`:** add the columns and indexes in your own migration.
+- **Prisma:** the fields are in the package's `prisma/schema.prisma`; copy them and run
+  `prisma migrate dev`.
+
+Workers that execute **workflow turns** over the wire (remote workflows) don't receive the tenant:
+the turn runs on the worker without it. Step handlers do receive it through the task carrier.

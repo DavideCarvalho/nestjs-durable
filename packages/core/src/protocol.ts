@@ -57,6 +57,7 @@ export async function runStepHandler(
         name: task.name,
         seq: task.seq,
         attempt: task.attempt,
+        context: task.context,
       },
       // Outside any ambient workflow ctx: an in-process transport runs the handler on the parent
       // body's async path, but a handler is not the body (see `runOutsideWorkflowCtx`).
