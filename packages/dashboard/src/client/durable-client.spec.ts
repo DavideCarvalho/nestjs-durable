@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { durableClient } from './durable-client.js';
+import { ConsoleAccessError, durableClient, onConsoleAccessDenied } from './durable-client.js';
 
 /**
  * The filter clauses a request carries, read back out of its query string.
@@ -144,7 +144,7 @@ describe('durableClient: the run-list query string', () => {
   });
 });
 
-describe('durableClient: 401 handling (credentials gone mid-console)', () => {
+describe('durableClient: access denied by the console `authorize`', () => {
   beforeEach(() => {
     (globalThis as { window?: FakeWindow }).window = {
       __DURABLE_BASE__: '/durable',
@@ -158,22 +158,46 @@ describe('durableClient: 401 handling (credentials gone mid-console)', () => {
     vi.unstubAllGlobals();
   });
 
-  it('reloads the UI mount so the host protection answers the navigation', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({}, 401)));
+  const win = () => (globalThis as unknown as { window: FakeWindow }).window;
 
-    await expect(durableClient.runs()).rejects.toThrow();
+  it('follows the redirectTo of a 401', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue(jsonResponse({ error: 'unauthenticated', redirectTo: '/login' }, 401)),
+    );
+    const denied = vi.fn();
+    const off = onConsoleAccessDenied(denied);
 
-    const win = (globalThis as unknown as { window: FakeWindow }).window;
-    expect(win.location.href).toBe('/durable');
+    await expect(durableClient.runs()).rejects.toBeInstanceOf(ConsoleAccessError);
+
+    expect(win().location.href).toBe('/login');
+    expect(denied).not.toHaveBeenCalled();
+    off();
   });
 
-  it('does not surface the raw "401 Unauthorized" status text as the rejection message', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({}, 401)));
+  it.each([401, 403] as const)(
+    'reports a %i without redirectTo, and does not navigate',
+    async (status) => {
+      vi.stubGlobal(
+        'fetch',
+        vi
+          .fn()
+          .mockResolvedValue(
+            jsonResponse({ error: status === 401 ? 'unauthenticated' : 'forbidden' }, status),
+          ),
+      );
+      const denied = vi.fn();
+      const off = onConsoleAccessDenied(denied);
 
-    await expect(durableClient.runs()).rejects.not.toMatchObject({
-      message: '401 Unauthorized',
-    });
-  });
+      await expect(durableClient.runs()).rejects.toMatchObject({ status });
+
+      expect(denied).toHaveBeenCalledWith({ status });
+      expect(win().location.href).toBe('');
+      off();
+    },
+  );
 });
 
 describe('durableClient: paging and the unattributed bucket', () => {

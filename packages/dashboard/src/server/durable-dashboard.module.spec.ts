@@ -1,9 +1,17 @@
 import 'reflect-metadata';
-import type { CanActivate, ExecutionContext } from '@nestjs/common';
+import type { CanActivate, DynamicModule, ExecutionContext } from '@nestjs/common';
 import { UseGuards } from '@nestjs/common';
 import { describe, expect, it } from 'vitest';
 import { DurableApiController } from './durable-api.controller.js';
-import { DurableDashboardModule } from './durable-dashboard.module.js';
+import { DurableApiModule, DurableDashboardModule } from './durable-dashboard.module.js';
+
+/** The API controller one registration mounts (a per-registration subclass of the exported one). */
+function mountedApi(dashboard: DynamicModule): typeof DurableApiController {
+  const api = dashboard.imports?.find(
+    (entry) => (entry as DynamicModule | undefined)?.module === DurableApiModule,
+  ) as DynamicModule;
+  return api.controllers?.[0] as typeof DurableApiController;
+}
 
 describe('DurableDashboardModule.forRoot imports', () => {
   it('passes an `imports` passthrough into the dynamic module for guard-dependency resolution', () => {
@@ -136,12 +144,9 @@ describe('the console composes with a host that has its OWN filter adapter', () 
     })
     class HostGatewayModule {}
 
+    const dashboard = DurableDashboardModule.forRoot();
     @ModuleDecorator({
-      imports: [
-        HostGatewayModule,
-        FilterModule.forRoot({ adapter: hostAdapter }),
-        DurableDashboardModule.forRoot(),
-      ],
+      imports: [HostGatewayModule, FilterModule.forRoot({ adapter: hostAdapter }), dashboard],
     })
     class HostRootModule {}
 
@@ -150,7 +155,7 @@ describe('the console composes with a host that has its OWN filter adapter', () 
       abortOnError: false,
     });
 
-    const controller = app.get(DurableApiController, { strict: false });
+    const controller = app.get(mountedApi(dashboard), { strict: false });
     const values = await controller.values({ groupByCount: { field: 'tag' } });
 
     // The console's query reached the run gateway through its OWN adapter…
@@ -187,7 +192,8 @@ describe('the console composes with a host that has its OWN filter adapter', () 
     })
     class HostGatewayModule {}
 
-    @ModuleDecorator({ imports: [HostGatewayModule, DurableDashboardModule.forRoot()] })
+    const dashboard = DurableDashboardModule.forRoot();
+    @ModuleDecorator({ imports: [HostGatewayModule, dashboard] })
     class HostRootModule {}
 
     const app = await NestFactory.createApplicationContext(HostRootModule, {
@@ -195,7 +201,7 @@ describe('the console composes with a host that has its OWN filter adapter', () 
       abortOnError: false,
     });
 
-    const controller = app.get(DurableApiController, { strict: false });
+    const controller = app.get(mountedApi(dashboard), { strict: false });
     expect(await controller.values({ groupByCount: { field: 'namespace' } })).toEqual([
       { value: 'acme', count: 1 },
     ]);

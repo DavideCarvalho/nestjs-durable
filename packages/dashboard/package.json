@@ -52,10 +52,16 @@
   "peerDependencies": {
     "@dudousxd/nestjs-durable-core": ">=0.1.0 <1.0.0",
     "@dudousxd/nestjs-filter": ">=1.33.0 <2.0.0",
+    "@nestjs/authorization": ">=0.1.0 <1.0.0",
     "@nestjs/common": "^10.0.0 || ^11.0.0 || ^12.0.0",
     "@nestjs/core": "^10.0.0 || ^11.0.0 || ^12.0.0",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@nestjs/authorization": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@base-ui/react": "1.8.0",

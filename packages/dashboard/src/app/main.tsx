@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { AccessGate } from './AccessGate';
 import { App } from './App';
 import '@xyflow/react/dist/style.css';
 import './index.css';
@@ -12,7 +13,9 @@ const queryClient = new QueryClient({
 createRoot(document.getElementById('root') as HTMLElement).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <AccessGate>
+        <App />
+      </AccessGate>
     </QueryClientProvider>
   </StrictMode>,
 );

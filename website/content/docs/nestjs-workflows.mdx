@@ -33,7 +33,8 @@ import { WorkflowsModule } from '@nestjs/workflows';
     WorkflowsModule.forRoot(),
     DurableWorkflowsGatewayModule.forRoot(),
     DurableDashboardModule.forRoot({
-      decorators: [UseGuards(AuthenticationGuard), Can(ConsolePolicy, 'view')],
+      decorators: [UseGuards(AuthenticationGuard)],
+      authorize: { policy: ConsolePolicy, ability: 'view' },
     }),
   ],
 })

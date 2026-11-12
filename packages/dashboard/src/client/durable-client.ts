@@ -461,8 +461,7 @@ declare global {
   }
 }
 
-/** The SPA's own UI mount (e.g. `/durable`), independent of the (possibly host-overridden) API
- *  base: the page to reload when the API answers `401`. */
+/** The SPA's own UI mount (e.g. `/durable`), independent of the (possibly host-overridden) API base. */
 function uiBase(): string {
   return (typeof window !== 'undefined' && window.__DURABLE_BASE__) || '/durable';
 }
@@ -472,25 +471,46 @@ function apiBase(): string {
   return `${uiBase()}/api`;
 }
 
+/** Why the API refused the console: `401` nobody signed in, `403` signed in without access. */
+export interface ConsoleAccessDenial {
+  status: 401 | 403;
+}
+
+const accessListeners = new Set<(denial: ConsoleAccessDenial) => void>();
+
+/** Called when the API answers `401`/`403` (and the answer is not a redirect). Returns unsubscribe. */
+export function onConsoleAccessDenied(listener: (denial: ConsoleAccessDenial) => void): () => void {
+  accessListeners.add(listener);
+  return () => accessListeners.delete(listener);
+}
+
+/** The rejection of a call the console's `authorize` refused. */
+export class ConsoleAccessError extends Error {
+  constructor(readonly status: 401 | 403) {
+    super(status === 401 ? 'Not signed in to the console.' : 'No access to the console.');
+    this.name = 'ConsoleAccessError';
+  }
+}
+
 /**
- * A `401` from the API means the operator's credentials are gone (a session that expired, a token
- * that was revoked). The dashboard owns no sign-in surface: the host protects the console with its
- * own guards, so reload the UI mount and let that protection answer the navigation (redirect to the
- * host's sign-in, render its own 401 page, ...).
+ * A `401`/`403` from the API is the console's `authorize` refusing the operator. A `401` that names
+ * a `redirectTo` (the app's sign-in page) is followed; anything else is reported to the listeners,
+ * which show an access-denied state instead of the console.
  */
-function reloadConsole(): void {
-  if (typeof window === 'undefined') return;
-  window.location.href = uiBase();
+async function denyAccess(res: Response): Promise<never> {
+  const status = res.status as 401 | 403;
+  const body = (await res.json().catch(() => undefined)) as { redirectTo?: unknown } | undefined;
+  if (status === 401 && typeof body?.redirectTo === 'string' && typeof window !== 'undefined') {
+    window.location.href = body.redirectTo;
+  } else {
+    for (const listener of accessListeners) listener({ status });
+  }
+  throw new ConsoleAccessError(status);
 }
 
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(apiBase() + path, init);
-  if (res.status === 401) {
-    reloadConsole();
-    // The navigation above is async; reject so the caller's `.then`/`await` chain doesn't
-    // continue as if this call had succeeded while the browser is on its way elsewhere.
-    throw new Error('Not authenticated; reloading the console.');
-  }
+  if (res.status === 401 || res.status === 403) return denyAccess(res);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as T;
 }
