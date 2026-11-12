@@ -152,6 +152,11 @@ DurableDashboardModule.forRoot({
 });
 ```
 
+A token suits callers you script (the JSON API, the webhook route). The SPA in a browser sends no
+`Authorization` header, so a console protected by a token alone answers `401` to its own UI. For
+browser use, sign in with your app's authentication (in `decorators`) and use a function, a class,
+a policy or a gate name.
+
 ### Without `authorize`
 
 - Outside production (`NODE_ENV` is not `production`) the console is open.
