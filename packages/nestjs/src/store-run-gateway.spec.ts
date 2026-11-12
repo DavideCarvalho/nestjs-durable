@@ -26,7 +26,7 @@ describe('StoreRunGateway', () => {
     const { engine, store, gateway } = setup();
     let attempts = 0;
     // No `: WorkflowCtx` annotation — `register`'s callback is contextually typed as the richer,
-    // unexported `InternalWorkflowCtx` (WorkflowCtx + `localStep`), so `ctx.localStep(name, fn, opts)`
+    // `WorkflowCtx` (with `localStep`), so `ctx.localStep(name, fn, opts)`
     // (the retries/compensate-capable LOCAL step primitive, replacing the old public inline
     // `ctx.step(name, fn, opts)`) is available here without needing to import that type by name.
     engine.register('flaky', '1', async (ctx) => {

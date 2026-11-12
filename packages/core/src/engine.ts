@@ -230,7 +230,6 @@ import {
 import {
   type Compensation,
   type CtxHost,
-  type InternalWorkflowCtx,
   type StepRecord,
   createWorkflowCtx,
 } from './workflow-ctx';
@@ -241,11 +240,8 @@ import {
   workflowName,
 } from './workflow-ref';
 
-// The engine ALWAYS runs a body with the InternalWorkflowCtx `createWorkflowCtx` produces (it carries
-// the internal `localStep` the entity runner + capture helpers need). Public authors type their body
-// with the narrower `WorkflowCtx`; contravariance keeps those assignable to this param, so the internal
-// type never leaks into the public authoring surface while `EntityHost.register` still lines up.
-type WorkflowFn = (ctx: InternalWorkflowCtx, input: unknown) => Promise<unknown>;
+// The engine runs every body with the `WorkflowCtx` that `createWorkflowCtx` produces.
+type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
 /**
  * Options for {@link WorkflowEngine.start}.
@@ -1019,7 +1015,7 @@ export interface WorkflowEngineDeps {
    */
   context?: (() => Record<string, unknown> | undefined) | undefined;
   /**
-   * Re-hydrate the originating context around a LOCAL step body, so a `@DurableStep` reader sees the
+   * Re-hydrate the originating context around a LOCAL step body, so a `@Step` reader sees the
    * tenant / user / correlation ids that were live when the run was started — even on a path the
    * engine drives outside the originating request scope (a resume after crash/scale-down, a timer).
    * Given the carrier produced by {@link context} (may be empty/undefined) and the step body `fn`, it
@@ -6638,7 +6634,7 @@ export class WorkflowEngine {
   }
 
   /** The worker groups this engine dispatches to: every registered remote workflow's group, plus any
-   *  `extra` the caller declares. Local-step groups (a group consumed by in-process `@DurableStep`
+   *  `extra` the caller declares. Local-step groups (a group consumed by in-process `@Step`
    *  workers, e.g. `pipeline`) aren't derivable from registrations — pass them via `extra` so a group
    *  with backlog and ZERO workers is still reported (the alert case has no heartbeat to discover). */
   knownGroups(extra: string[] = []): string[] {

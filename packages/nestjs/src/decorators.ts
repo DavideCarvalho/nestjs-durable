@@ -40,8 +40,8 @@ export interface WorkflowMeta {
   concurrency?: ConcurrencyConfig | undefined;
   /** Max wall-clock lifetime before a run is cancelled (e.g. `'2h'`). See `WorkflowOptions`. */
   executionTimeout?: string | number | undefined;
-  /** Input schema (Standard Schema or DTO class), parsed at start and before every turn. Holds
-   *  `input` or its `inputSchema` alias. See `WorkflowOptions`. */
+  /** Input schema (Standard Schema or DTO class), parsed at start and before every turn. See
+   *  `WorkflowOptions`. */
   input?: IoSchema | undefined;
   /** Output schema, parsed before the run completes. See `WorkflowOptions`. */
   output?: IoSchema | undefined;
@@ -139,11 +139,6 @@ export interface WorkflowOptions {
    */
   output?: IoSchema;
   /**
-   * Alias of {@link input}, kept for workflows declared before `input` existed. Setting both is an
-   * error.
-   */
-  inputSchema?: IoSchema;
-  /**
    * A custom check at `start` (throw to reject) for a rule a schema can't express — a cross-field
    * invariant, an async lookup. It runs after `input` parses and receives the parsed value (the input
    * as sent when there is no `input` schema).
@@ -208,11 +203,6 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
   // package lazily, at registration (see `origin.ts`); a runtime that yields no usable frame simply
   // leaves the workflow unattributed, which the registrar reports at boot.
   const declaredIn = declaringFile(Workflow);
-  if (options.input !== undefined && options.inputSchema !== undefined) {
-    throw new Error(
-      `@Workflow ${options.name}: set either \`input\` or its alias \`inputSchema\`, not both`,
-    );
-  }
   return (target) => {
     rememberDeclaringFile(target, declaredIn);
     const meta: WorkflowMeta = {
@@ -224,7 +214,7 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       singleton: options.singleton,
       concurrency: options.concurrency,
       executionTimeout: options.executionTimeout,
-      input: options.input ?? options.inputSchema,
+      input: options.input,
       output: options.output,
       validateInput: options.validateInput,
       searchAttributes: options.searchAttributes,
@@ -371,12 +361,6 @@ export function Step(nameOrOptions?: string | StepOptions): MethodDecorator {
     return descriptor;
   };
 }
-
-/**
- * @deprecated Use `@Step` instead. `@DurableStep` is a back-compat alias of {@link Step} and
- * writes the same `DURABLE_STEP_METADATA`, so discovery/registrars treat them identically.
- */
-export const DurableStep = Step;
 
 // biome-ignore lint/complexity/noBannedTypes: reflect-metadata reads from the method function
 export function getDurableStepMeta(method: Function): DurableStepMeta | undefined {
@@ -737,9 +721,6 @@ function addEventSubscriptions(target: object, entries: OnEventEntry[]): void {
     (Reflect.getMetadata(ON_EVENT_METADATA, target) as OnEventEntry[] | undefined) ?? [];
   Reflect.defineMetadata(ON_EVENT_METADATA, [...existing, ...entries], target);
 }
-
-/** @deprecated Renamed to `OnDurableEvent` — this alias clashes with `@nestjs/event-emitter`'s `@OnEvent` and will be removed in the next minor. */
-export const OnEvent = OnDurableEvent;
 
 /**
  * All events a workflow class subscribes to: `@Workflow({ onEvent })`, `@OnDurableEvent`,

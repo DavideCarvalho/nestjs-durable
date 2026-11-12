@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/store-typeorm"
   },
   "homepage": "https://davidecarvalho.github.io/aviary/docs/durable",
@@ -38,7 +38,7 @@
     "@dudousxd/nestjs-durable-testing": "workspace:^",
     "@testcontainers/mysql": "10.18.0",
     "@testcontainers/postgresql": "10.18.0",
-    "better-sqlite3": "12.10.0",
+    "better-sqlite3": "12.11.1",
     "mysql2": "3.11.5",
     "pg": "8.13.1",
     "reflect-metadata": "0.2.2",
@@ -58,5 +58,8 @@
         "default": "./dist/index.cjs"
       }
     }
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

@@ -13,7 +13,6 @@ import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { runQueryString } from '../client/run-query-string.js';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
-import { RUN_GATEWAY } from './tokens.js';
 
 /**
  * The console over a REAL HTTP server, with the URL its own client builds.
@@ -55,7 +54,7 @@ describe('the console over HTTP', () => {
     valueFacets.length = 0;
 
     @Global()
-    @Module({ providers: [{ provide: RUN_GATEWAY, useValue: gateway }], exports: [RUN_GATEWAY] })
+    @Module({ providers: [{ provide: RunGateway, useValue: gateway }], exports: [RunGateway] })
     class HostGatewayModule {}
 
     @Module({ imports: [HostGatewayModule, DurableDashboardModule.forRoot()] })

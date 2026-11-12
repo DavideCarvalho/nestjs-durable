@@ -1,3 +1,4 @@
+import { RunGateway } from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,7 +18,6 @@ import {
 } from './console-switcher.js';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
 import { DurableUiController } from './durable-ui.controller.js';
-import { RUN_GATEWAY } from './tokens.js';
 
 const TOKEN = 'console-token-123';
 const holder = globalThis as Record<symbol, unknown>;
@@ -223,7 +223,7 @@ const gateway = {
 };
 
 @Global()
-@Module({ providers: [{ provide: RUN_GATEWAY, useValue: gateway }], exports: [RUN_GATEWAY] })
+@Module({ providers: [{ provide: RunGateway, useValue: gateway }], exports: [RunGateway] })
 class HostGatewayModule {}
 
 let close: (() => Promise<void>) | undefined;

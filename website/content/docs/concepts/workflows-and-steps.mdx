@@ -165,11 +165,6 @@ export class PaymentsService {
 The policy on `@Step` is what `ctx.step` reads off the method reference; a per-call
 `ctx.step(ref, input, { retries })` overrides it field-by-field.
 
-<Callout title="@DurableStep is deprecated">
-`@DurableStep` still works as a back-compat alias of `@Step` (identical metadata), but new code should
-use `@Step`.
-</Callout>
-
 ### In-flight visibility
 
 When a step's handler begins, the engine emits a `step.started` lifecycle event and (by default)

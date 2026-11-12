@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-durable.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-durable.git",
     "directory": "packages/core"
   },
   "homepage": "https://davidecarvalho.github.io/aviary/docs/durable",
@@ -58,5 +58,8 @@
     "typescript": "5.9.3",
     "zod": "3.25.76",
     "@dudousxd/nestjs-diagnostics": "0.5.0"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

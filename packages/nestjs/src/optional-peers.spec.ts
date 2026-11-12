@@ -138,7 +138,7 @@ try {
 `;
 
 /**
- * Start a workflow whose `@Workflow({ inputSchema })` DTO needs `class-validator` +
+ * Start a workflow whose `@Workflow({ input })` DTO needs `class-validator` +
  * `class-transformer`. Decorators are applied by hand because the probe is plain JS.
  */
 const validateInput = (imports: string) => `
@@ -153,7 +153,7 @@ class OrderWorkflow {
   }
 }
 Injectable()(OrderWorkflow);
-Workflow({ name: 'order', version: '1', inputSchema: OrderInput })(OrderWorkflow);
+Workflow({ name: 'order', version: '1', input: OrderInput })(OrderWorkflow);
 
 const mod = await Test.createTestingModule({
   imports: [
@@ -257,19 +257,19 @@ describe('optional peers are absent-safe in the built package', () => {
  * arrival for every ESM consumer, so each lazily-loaded peer needs a probe that uses it for real.
  */
 describe('lazily loaded optional peers work when they are installed', () => {
-  it('validates @Workflow({ inputSchema }) from the ESM entry', () => {
+  it('validates @Workflow({ input }) from the ESM entry', () => {
     expect(runWithout([], validateInputEsm, 'mjs')).toContain(
       'rejected: invalid workflow "order" input: orderId must be a string',
     );
   });
 
-  it('validates @Workflow({ inputSchema }) from the CJS entry', () => {
+  it('validates @Workflow({ input }) from the CJS entry', () => {
     expect(runWithout([], validateInputCjs, 'cjs')).toContain(
       'rejected: invalid workflow "order" input: orderId must be a string',
     );
   });
 
-  it('names the missing peers when inputSchema is used without class-validator', () => {
+  it('names the missing peers when a DTO `input` is used without class-validator', () => {
     expect(runWithout(['class-validator'], validateInputWithoutPeer, 'mjs')).toContain(
       'rejected: workflow "order" input uses a class-validator DTO, which needs the optional peers',
     );

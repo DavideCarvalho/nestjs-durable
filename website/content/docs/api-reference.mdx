@@ -123,7 +123,6 @@ Marks a provider class as a durable workflow; its `run(ctx, input)` becomes the 
 | `executionTimeout` | `string \| number` | Max wall-clock lifetime, counted from `createdAt`; an overrunning run — `pending`, `blocked`, `running` or `suspended` — is cancelled (`execution_timeout`) by the timer poller. See [Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap). |
 | `input` | `IoSchema` (Standard Schema \| class-validator DTO class) | Input schema. Checked at `start` (invalid input creates no run); the run stores the input as sent, and `run()` receives the parsed value, re-parsed before every turn. See [Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap). |
 | `output` | `IoSchema` | Output schema. `run()`'s return value is parsed before the run completes; a mismatch fails it with `invalid_output`. |
-| `inputSchema` | `IoSchema` | Alias of `input`, for workflows declared before it existed. Setting both is an error. |
 | `validateInput` | `(input: unknown) => void \| Promise<void>` | Extra check at `start` (throw to reject), run after `input` parses, on the parsed value. |
 | `onEvent` | `Array<string \| { event: string; where?: (payload) => boolean; input?: (payload) => unknown }>` | Start a fresh run whenever any of these events is published. `where` filters per payload, `input` builds the run's input from it. Merged with `@OnDurableEvent`, `@OnWorkflowCompleted` and `@OnWorkflowFailed`. |
 | `debounce` | `string \| number` | Coalesce `onEvent` triggers: fire once quiet for this long, with the last payload. |
@@ -179,7 +178,7 @@ See [Durable entities](/docs/authoring/entities).
 
 Class decorator subscribing a `@Workflow` to one or more events — equivalent to
 `@Workflow({ onEvent })`; multiple declarations and the option are merged. Named "durable" to avoid
-clashing with `@nestjs/event-emitter`'s `@OnEvent` (`OnEvent` remains a deprecated alias). Each
+clashing with `@nestjs/event-emitter`'s `@OnEvent`. Each
 event is a name or a `{ event, where, input }` entry. See
 [Event-driven workflows](/docs/authoring/events).
 

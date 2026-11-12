@@ -27,8 +27,7 @@ export * from './workflow.service';
 
 // Facade re-exports: the everyday `@dudousxd/nestjs-durable-core` surface a consumer touches
 // alongside this package's own decorators/module/tokens, so e.g. the `Workflow` decorator (here)
-// and `WorkflowEngine`/`WorkflowCtx` (core), or `RUN_GATEWAY` (here) and the `RunGateway` class
-// (core), no longer require importing both packages to pick up the paired symbol. Additive only —
+// and `WorkflowEngine`/`WorkflowCtx` (core) no longer require importing both packages to pick up the paired symbol. Additive only —
 // re-exports only what already exists on core's public index; core's own new exports (e.g. typed
 // search-attribute helpers) are surfaced there, not duplicated here.
 //

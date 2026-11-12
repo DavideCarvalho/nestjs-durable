@@ -1,3 +1,4 @@
+import { RunGateway } from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
 import {
   type DynamicModule,
@@ -12,7 +13,6 @@ import { authorizeByToken } from './console-authorize.js';
 import type { DashboardService } from './dashboard.service.js';
 import { DEV_TOOLS_SLOT, type DurableDevTool, durableDevTools } from './dev-tools.js';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
-import { RUN_GATEWAY } from './tokens.js';
 
 const holder = globalThis as Record<symbol, unknown>;
 
@@ -521,7 +521,7 @@ const gateway = {
 };
 
 @Global()
-@Module({ providers: [{ provide: RUN_GATEWAY, useValue: gateway }], exports: [RUN_GATEWAY] })
+@Module({ providers: [{ provide: RunGateway, useValue: gateway }], exports: [RunGateway] })
 class HostGatewayModule {}
 
 interface Slot {

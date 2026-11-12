@@ -17,7 +17,6 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
-import { RUN_GATEWAY } from './tokens.js';
 
 const at = new Date('2026-06-11T00:00:00.000Z');
 
@@ -90,7 +89,7 @@ describe('run detail ETags over HTTP', () => {
     for (let seq = 0; seq < 80; seq++) await store.saveCheckpoint(step(seq));
 
     @Global()
-    @Module({ providers: [{ provide: RUN_GATEWAY, useValue: gateway }], exports: [RUN_GATEWAY] })
+    @Module({ providers: [{ provide: RunGateway, useValue: gateway }], exports: [RunGateway] })
     class HostGatewayModule {}
 
     @Module({ imports: [HostGatewayModule, DurableDashboardModule.forRoot()] })

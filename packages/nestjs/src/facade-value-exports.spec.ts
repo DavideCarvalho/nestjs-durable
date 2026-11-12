@@ -32,11 +32,4 @@ describe('facade re-exports keep core classes as VALUES', () => {
     ).toBeDefined();
     expect(exported).toBe((core as Record<string, unknown>)[name]);
   });
-
-  it('RUN_GATEWAY and RunGateway are the same DI token', () => {
-    // The alias is deprecated but still the token the module binds; the two must not drift, or
-    // `@Inject(RUN_GATEWAY)` and `ctx.get(RunGateway)` resolve different providers.
-    expect(facade.RUN_GATEWAY).toBe(facade.RunGateway);
-    expect(facade.RUN_GATEWAY).toBe(core.RunGateway);
-  });
 });

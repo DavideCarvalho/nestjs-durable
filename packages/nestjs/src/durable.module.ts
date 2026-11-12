@@ -2,18 +2,15 @@ import type { ConcurrencyOption } from '@dudousxd/durable-worker';
 import {
   type AdmissionBackend,
   type ControlPlane,
-  DURABLE_OPTIONS,
   DURABLE_OPTIONS_CANONICAL,
   type NamedTransport,
   type QueueConfig,
   type RetentionPolicy,
   RunGateway,
-  STATE_STORE,
   STATE_STORE_CANONICAL,
   type ScheduledWorkflow,
   type StalledRunInfo,
   type StateStore,
-  TRANSPORT,
   TRANSPORT_CANONICAL,
   type TenantTokenSource,
   type TenantVerifier,
@@ -221,7 +218,7 @@ export interface DurableRetentionOptions {
  *   timer/retention/registrars, executing registered bodies INLINE. Driven by {@link drive} (default
  *   `true`).
  * - `{ connection }` (no `store`): **thin worker**, `WorkflowEngine` resolves to a store-less
- *   `DurableStartClient`; `RUN_GATEWAY` is a `ProxyRunGateway` when `transport` is also given, else
+ *   `DurableStartClient`; `RunGateway` is a `ProxyRunGateway` when `transport` is also given, else
  *   every method rejects with a clear error. No store/timer/retention/entity, just discovered
  *   `@Workflow`/`@Step` handlers served over ONE `runRedisWorker` consumer.
  * - `{ store, transport, connection }`: an **operator that also runs a co-located worker**: every
@@ -820,7 +817,7 @@ const TENANT_AUTH = Symbol('nestjs-durable:tenant-auth');
  * does not). Two independent capabilities, each wired only when the transport carries it:
  *
  * 1. **`RunRequestResponder`** — answers a tenant's {@link RunRequest} against the bound
- *    {@link RUN_GATEWAY}, tenant-scoped. Wired when the transport implements both
+ *    {@link RunGateway}, tenant-scoped. Wired when the transport implements both
  *    `onRunRequest`/`publishRunReply` (only broker transports carry the protocol).
  * 2. **Tenant-event re-publisher** ({@link TenantEventRepublisher}) — mirrors every engine
  *    lifecycle event onto its run's per-tenant channel via `publishTenantEvent`, so a store-less
@@ -975,10 +972,6 @@ export class DurableModule {
           }),
           inject: [DURABLE_OPTIONS_CANONICAL, ModuleRef],
         },
-        // Legacy back-compat aliases (deprecated tokens still resolve to the same instances):
-        { provide: STATE_STORE, useExisting: STATE_STORE_CANONICAL },
-        { provide: TRANSPORT, useExisting: TRANSPORT_CANONICAL },
-        { provide: DURABLE_OPTIONS, useExisting: DURABLE_OPTIONS_CANONICAL },
         {
           // Shared token, bound EXACTLY once: a real engine for the operator role, or a store-less
           // `DurableStartClient` facade for a thin worker (no `store`) — either way, `WorkflowService`
@@ -1146,9 +1139,7 @@ export class DurableModule {
         WorkflowService,
         EntityService,
         WorkflowEngine,
-        STATE_STORE,
         STATE_STORE_CANONICAL,
-        TRANSPORT,
         TRANSPORT_CANONICAL,
         DURABLE_OPTIONS_CANONICAL,
         RunGateway,

@@ -284,7 +284,7 @@ export class WorkflowContext implements WorkflowCtx {
    * {@link gather}: run `fn` once and record its result, so side effects / non-determinism happen
    * exactly once and replay returns the captured value. The body receives a {@link StepLogger}.
    * `options` (retries/backoff/compensate) are engine-side concerns the thin worker doesn't apply —
-   * accepted for parity with core's `InternalWorkflowCtx.localStep`, ignored on the wire.
+   * accepted for parity with core's `WorkflowCtx.localStep`, ignored on the wire.
    *
    * Not part of the public {@link WorkflowCtx} surface (the public single step is always dispatched —
    * see {@link step}), but present at runtime for the SAME reason core's `createWorkflowCtx` result

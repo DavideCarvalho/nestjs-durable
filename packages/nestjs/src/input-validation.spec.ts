@@ -12,14 +12,14 @@ class CheckoutInput {
   @IsInt() total!: number;
 }
 
-@Workflow({ name: 'checkout', version: '1', inputSchema: CheckoutInput })
+@Workflow({ name: 'checkout', version: '1', input: CheckoutInput })
 class CheckoutWorkflow {
   async run() {
     return 'ok';
   }
 }
 
-describe('@Workflow inputSchema (class-validator)', () => {
+describe('@Workflow input (class-validator DTO)', () => {
   it('rejects invalid input at start, before creating the run', async () => {
     const store = new InMemoryStateStore();
     const mod = await Test.createTestingModule({

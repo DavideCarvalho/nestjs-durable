@@ -17,5 +17,9 @@ plugin.configs.recommended = {
   rules: { '@dudousxd/nestjs-durable/no-nondeterminism': 'error' },
 };
 
+// Named exports of every plugin field: Node hands an ESM `import durable from …` of this CommonJS
+// module its `module.exports` (these named exports), not `exports.default`, so `meta` has to be
+// here too for ESLint to identify (and cache) the plugin.
+export const meta = plugin.meta;
 export const configs = plugin.configs;
 export default plugin;

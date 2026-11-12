@@ -1,3 +1,4 @@
+import { RunGateway } from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
 import { createHash } from 'node:crypto';
 import { AuthorizationModule, Policy } from '@nestjs/authorization';
@@ -32,7 +33,6 @@ import {
 import { DurableApiControllerBase } from './durable-api.controller.js';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
 import { DurableUiControllerBase } from './durable-ui.controller.js';
-import { RUN_GATEWAY } from './tokens.js';
 
 interface TestUser {
   role: string;
@@ -449,7 +449,7 @@ const gateway = {
 };
 
 @Global()
-@Module({ providers: [{ provide: RUN_GATEWAY, useValue: gateway }], exports: [RUN_GATEWAY] })
+@Module({ providers: [{ provide: RunGateway, useValue: gateway }], exports: [RunGateway] })
 class HostGatewayModule {}
 
 let app: NestExpressApplication | undefined;
