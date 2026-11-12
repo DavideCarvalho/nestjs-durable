@@ -690,6 +690,13 @@ function assertValidTopology(options: DurableModuleOptions): void {
           'runs to workers over a transport. Without both, there is nothing for it to operate.',
       );
     }
+    if ((options as { tenantToken?: unknown }).tenantToken !== undefined) {
+      throw new Error(
+        "topology: 'control-plane' forbids `tenantToken`.\n" +
+          'A control plane verifies tenant tokens (`verifyTenant`); it does not present one. ' +
+          "`tenantToken` belongs on the `topology: 'tenant'` process.",
+      );
+    }
     const { partition, namespace } = options;
     if (partition !== undefined && namespace !== undefined && namespace !== partition) {
       throw new Error(
@@ -716,6 +723,13 @@ function assertValidTopology(options: DurableModuleOptions): void {
       "topology: 'tenant' forbids `store`.\n" +
         'A tenant is store-less BY DEFINITION. A `store` present means you actually wanted ' +
         "`topology: 'control-plane'` (the store-owning role).",
+    );
+  }
+  if ((options as { verifyTenant?: unknown }).verifyTenant !== undefined) {
+    throw new Error(
+      "topology: 'tenant' forbids `verifyTenant`.\n" +
+        'A tenant presents a token (`tenantToken`); the control plane verifies it. ' +
+        "`verifyTenant` belongs on the `topology: 'control-plane'` process.",
     );
   }
   if (options.namespace !== undefined) {

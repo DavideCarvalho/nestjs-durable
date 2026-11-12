@@ -82,16 +82,46 @@ describe('resolveTenantVerifier', () => {
         return ACME;
       }
     }
-    const load = vi.fn(async () => ({ default: Verifier }));
+    // The import resolves only after every first call is in flight.
+    let release: () => void = () => {};
+    const imported = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const load = vi.fn(async () => {
+      await imported;
+      return { default: Verifier };
+    });
     const verify = resolveTenantVerifier(load);
-    const results = await Promise.all([1, 2, 3].map(() => verify?.({ token: 't' })));
-    expect(results).toEqual([ACME, ACME, ACME]);
+    const pending = Promise.all([1, 2, 3].map(() => verify?.({ token: 't' })));
+    release();
+    expect(await pending).toEqual([ACME, ACME, ACME]);
     await verify?.({ token: 't' });
     expect(built).toBe(1);
-    // The concurrent first calls each asked for the module; after that, never again.
-    const calls = load.mock.calls.length;
-    await verify?.({ token: 't' });
-    expect(load.mock.calls.length).toBe(calls);
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it('a lazy import that fails is imported again by the next call', async () => {
+    const load = vi
+      .fn<() => Promise<{ default: TenantVerifierContract }>>()
+      .mockRejectedValueOnce(new Error('chunk failed'))
+      .mockResolvedValue({ default: { verify: () => ACME } });
+    const verify = resolveTenantVerifier(load);
+    await expect(verify?.({ token: 't' })).rejects.toThrow('chunk failed');
+    expect(await verify?.({ token: 't' })).toEqual(ACME);
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('a plain function racing its first call is still called once per request, with its input', async () => {
+    const verifyFn = vi.fn(async ({ token }: TenantVerifierInput) =>
+      token === 'ok' ? ACME : null,
+    );
+    const verify = resolveTenantVerifier(verifyFn);
+    expect(await Promise.all(['ok', 'no', 'ok'].map((token) => verify?.({ token })))).toEqual([
+      ACME,
+      null,
+      ACME,
+    ]);
+    expect(verifyFn).toHaveBeenCalledTimes(3);
   });
 
   it('accepts a lazy module whose default export is an object', async () => {
@@ -147,6 +177,26 @@ describe('resolveTenantTokenSource', () => {
   it('passes a string through, and undefined stays undefined', () => {
     expect(resolveTenantTokenSource(undefined)).toBeUndefined();
     expect(resolveTenantTokenSource('static-token')).toBe('static-token');
+  });
+
+  it('rejects an empty static token when it is resolved', () => {
+    expect(() => resolveTenantTokenSource('')).toThrow(/`tenantToken` is an empty string/);
+  });
+
+  it('concurrent first calls share one lazy import', async () => {
+    let release: () => void = () => {};
+    const imported = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const load = vi.fn(async () => {
+      await imported;
+      return { default: { token: () => 'lazy' } };
+    });
+    const source = resolveTenantTokenSource(load) as () => Promise<string>;
+    const pending = Promise.all([source(), source(), source()]);
+    release();
+    expect(await pending).toEqual(['lazy', 'lazy', 'lazy']);
+    expect(load).toHaveBeenCalledTimes(1);
   });
 
   it('calls a function before every request', async () => {

@@ -324,6 +324,28 @@ describe('DurableModule.forRoot — topology', () => {
     ).toThrow(/forbids `namespace`/);
   });
 
+  it("'tenant' with `verifyTenant` throws: the control plane verifies", () => {
+    expect(() =>
+      DurableModule.forRoot({
+        topology: 'tenant',
+        partition: 'tenantA',
+        connection: 'redis://x',
+        verifyTenant: () => null,
+      } as unknown as DurableModuleOptions),
+    ).toThrow(/forbids `verifyTenant`/);
+  });
+
+  it("'control-plane' with `tenantToken` throws: the tenant presents it", () => {
+    expect(() =>
+      DurableModule.forRoot({
+        topology: 'control-plane',
+        store: new InMemoryStateStore(),
+        transport: new InMemoryTransport(),
+        tenantToken: 'token',
+      } as unknown as DurableModuleOptions),
+    ).toThrow(/forbids `tenantToken`/);
+  });
+
   it('an unknown topology, or the removed object form, throws and shows the new form', () => {
     expect(() =>
       DurableModule.forRoot({

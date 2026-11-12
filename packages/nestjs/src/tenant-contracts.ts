@@ -150,22 +150,45 @@ function contractInstance<T>(
   return () => instance;
 }
 
+/** What a function-form option turned out to be on a call: a contract instance, or a plain result. */
+type Probed<T> = { contract: T } | { result: unknown };
+
 /**
- * One instance getter per lazily imported export, so calls racing on the first import still share
- * one instance.
+ * Calls a function-form option, which is either the plain function or a lazy import; which one is
+ * only known once it has run. The first call probes, and calls racing it wait for that probe, so a
+ * lazy import runs exactly once and its default export is built once. A failed probe (the import
+ * threw) is retried by the next call. Once known to be plain, the function is called on every call.
  */
-function lazyInstances<T>(
+function functionOrLazy<T>(
+  fn: (...args: any[]) => unknown,
   method: string,
   moduleRef: ModuleRef | undefined,
-): (target: unknown) => () => Promise<T> {
-  const getters = new Map<unknown, () => Promise<T>>();
-  return (target) => {
-    let getter = getters.get(target);
-    if (!getter) {
-      getter = contractInstance<T>(target, method, moduleRef);
-      getters.set(target, getter);
+): (...args: unknown[]) => Promise<Probed<T>> {
+  let lazy: (() => Promise<T>) | undefined;
+  let plain = false;
+  let probing: Promise<unknown> | undefined;
+  return async (...args) => {
+    for (;;) {
+      if (lazy) return { contract: await lazy() };
+      if (plain) return { result: await fn(...args) };
+      if (!probing) {
+        const probe = (async () => fn(...args))();
+        probing = probe;
+        try {
+          const result = await probe;
+          const target = lazyDefault(result, method);
+          if (target === undefined) {
+            plain = true;
+            return { result };
+          }
+          lazy = contractInstance<T>(target, method, moduleRef);
+          return { contract: await lazy() };
+        } finally {
+          if (probing === probe) probing = undefined;
+        }
+      }
+      await probing.catch(() => undefined);
     }
-    return getter;
   };
 }
 
@@ -178,26 +201,25 @@ export function resolveTenantVerifier(
   moduleRef?: ModuleRef,
 ): TenantVerifier | undefined {
   if (option === undefined || isResolved(option)) return option as TenantVerifier | undefined;
-  let instance: (() => Promise<TenantVerifierContract>) | undefined;
-  if (isClass(option, 'verify') || hasMethod<TenantVerifierContract>(option, 'verify')) {
-    instance = contractInstance(option, 'verify', moduleRef);
-  } else if (typeof option !== 'function') {
+  const instance =
+    isClass(option, 'verify') || hasMethod<TenantVerifierContract>(option, 'verify')
+      ? contractInstance<TenantVerifierContract>(option, 'verify', moduleRef)
+      : undefined;
+  if (!instance && typeof option !== 'function') {
     throw new Error(
       '`verifyTenant` must be a function, an object or class with verify(), or a lazy import of one.',
     );
   }
-  const fn = option as (input: TenantVerifierInput) => unknown;
-  const fromModule = lazyInstances<TenantVerifierContract>('verify', moduleRef);
-  let lazy: (() => Promise<TenantVerifierContract>) | undefined;
+  const call = functionOrLazy<TenantVerifierContract>(
+    option as (input: TenantVerifierInput) => unknown,
+    'verify',
+    moduleRef,
+  );
   return markResolved(async (input: TenantVerifierInput): Promise<VerifiedTenant | null> => {
-    const getter = instance ?? lazy;
-    if (getter) return (await getter()).verify(input);
-    const result = await fn(input);
-    const target = lazyDefault(result, 'verify');
-    if (target === undefined) return result as VerifiedTenant | null;
-    // A lazy import: remember the module's export, so the import runs once per registration.
-    lazy = fromModule(target);
-    return (await lazy()).verify(input);
+    if (instance) return (await instance()).verify(input);
+    const probed = await call(input);
+    if ('contract' in probed) return probed.contract.verify(input);
+    return probed.result as VerifiedTenant | null;
   });
 }
 
@@ -216,27 +238,33 @@ export function resolveTenantTokenSource(
   option: TenantTokenOption | undefined,
   moduleRef?: ModuleRef,
 ): TenantTokenSource | undefined {
-  if (option === undefined || typeof option === 'string' || isResolved(option)) {
-    return option as TenantTokenSource | undefined;
+  if (typeof option === 'string') {
+    if (option.length === 0) {
+      throw new Error(
+        '`tenantToken` is an empty string. Set the token this tenant presents, or remove `tenantToken` to send the partition.',
+      );
+    }
+    return option;
   }
-  let instance: (() => Promise<TenantCredentialsContract>) | undefined;
-  if (isClass(option, 'token') || hasMethod<TenantCredentialsContract>(option, 'token')) {
-    instance = contractInstance(option, 'token', moduleRef);
-  } else if (typeof option !== 'function') {
+  if (option === undefined || isResolved(option)) return option as TenantTokenSource | undefined;
+  const instance =
+    isClass(option, 'token') || hasMethod<TenantCredentialsContract>(option, 'token')
+      ? contractInstance<TenantCredentialsContract>(option, 'token', moduleRef)
+      : undefined;
+  if (!instance && typeof option !== 'function') {
     throw new Error(
       '`tenantToken` must be a string, a function, an object or class with token(), or a lazy import of one.',
     );
   }
-  const fn = option as () => unknown;
-  const fromModule = lazyInstances<TenantCredentialsContract>('token', moduleRef);
-  let lazy: (() => Promise<TenantCredentialsContract>) | undefined;
+  const call = functionOrLazy<TenantCredentialsContract>(
+    option as () => unknown,
+    'token',
+    moduleRef,
+  );
   return markResolved(async (): Promise<string> => {
-    const getter = instance ?? lazy;
-    if (getter) return requireToken(await (await getter()).token());
-    const result = await fn();
-    const target = lazyDefault(result, 'token');
-    if (target === undefined) return requireToken(result);
-    lazy = fromModule(target);
-    return requireToken(await (await lazy()).token());
+    if (instance) return requireToken(await (await instance()).token());
+    const probed = await call();
+    if ('contract' in probed) return requireToken(await probed.contract.token());
+    return requireToken(probed.result);
   });
 }

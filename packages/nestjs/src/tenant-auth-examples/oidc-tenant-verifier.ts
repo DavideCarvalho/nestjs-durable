@@ -48,9 +48,20 @@ export class OidcTenantVerifier implements TenantVerifierContract {
           : undefined,
       };
     } catch (error) {
-      // A bad token is a rejection. A key set that cannot be fetched is an error the tenant sees.
-      if (error instanceof errors.JOSEError && !(error instanceof errors.JWKSTimeout)) return null;
+      // A bad token is a rejection. A key set that cannot be fetched (network error, timeout, non-200
+      // or unparseable response, malformed key set) is an error the tenant sees.
+      if (error instanceof errors.JOSEError && !KEY_SET_FAILURES.has(error.code)) return null;
       throw error;
     }
   }
 }
+
+/**
+ * The `jose` error codes for a key set that could not be fetched or used: `ERR_JOSE_GENERIC` is a
+ * non-200 or unparseable JWKS response. Network errors are not `JOSEError`s, so they throw as well.
+ */
+const KEY_SET_FAILURES = new Set<string>([
+  errors.JOSEError.code,
+  errors.JWKSTimeout.code,
+  errors.JWKSInvalid.code,
+]);

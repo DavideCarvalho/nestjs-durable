@@ -164,6 +164,16 @@ describe('guide: any OIDC provider (jose + client_credentials)', () => {
         res.end(JSON.stringify({ keys: [jwk] }));
         return;
       }
+      if (req.url === '/jwks-broken') {
+        res.setHeader('content-type', 'application/json');
+        res.end('<html>maintenance</html>');
+        return;
+      }
+      if (req.url === '/jwks-malformed') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ keys: 'nope' }));
+        return;
+      }
       if (req.url === '/token' && req.method === 'POST') {
         tokenRequests++;
         const basic = Buffer.from('acme-client:acme-secret').toString('base64');
@@ -267,6 +277,28 @@ describe('guide: any OIDC provider (jose + client_credentials)', () => {
     ).toBeNull();
     expect(await verify.verify({ token: await sign({ sub: 'no-partition' }) })).toBeNull();
     expect(await verify.verify({})).toBeNull();
+  });
+
+  it('a down IdP throws instead of rejecting the token', async () => {
+    const token = await sign({ partition: 'acme' });
+    // Nothing listens there: a network error.
+    const closed = createServer();
+    await new Promise<void>((resolve) => closed.listen(0, '127.0.0.1', resolve));
+    const closedPort = (closed.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => closed.close(() => resolve()));
+    const offline = new OidcTenantVerifier({
+      issuer,
+      audience,
+      jwksUri: `http://127.0.0.1:${closedPort}/jwks`,
+    });
+    await expect(offline.verify({ token })).rejects.toThrow();
+    // The JWKS endpoint answers, but with an error page or a body that is not a key set.
+    for (const path of ['/missing', '/jwks-broken', '/jwks-malformed']) {
+      const verify = new OidcTenantVerifier({ issuer, audience, jwksUri: `${base}${path}` });
+      await expect(verify.verify({ token })).rejects.toThrow();
+    }
+    // A reachable IdP still rejects a bad token with null.
+    expect(await verifier().verify({ token: 'not-a-jwt' })).toBeNull();
   });
 
   it('shares one token request between concurrent calls, and refreshes before expiry', async () => {
