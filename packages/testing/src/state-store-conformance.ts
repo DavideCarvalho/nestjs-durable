@@ -3288,6 +3288,40 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    t(
+      'retries a failed run whose lease is still held, once the holder releases it or it expires',
+      async () => {
+        const engine = new WorkflowEngine({ store });
+        const failing = new Set(['held', 'expiring']);
+        engine.register('wf', '1', async (ctx) => {
+          const a = await ctx.localStep('a', async () => 10);
+          return ctx.localStep('b', async () => {
+            if (failing.delete(ctx.runId)) throw new Error('boom');
+            return a + 5;
+          });
+        });
+        for (const id of ['held', 'expiring']) {
+          await engine.start('wf', {}, id);
+          expect((await engine.waitForRun(id)).status).toBe('failed');
+        }
+
+        // The failing turn's release has not landed yet: another owner still holds the lease, and
+        // releases it while the retry waits.
+        expect(await store.tryLockRun('held', 'holder', Date.now() + 60_000, Date.now())).toBe(
+          true,
+        );
+        const held = engine.resume('held');
+        setTimeout(() => void store.releaseRunLock('held', 'holder'), 150);
+        expect(await held).toMatchObject({ status: 'completed', output: 15 });
+
+        // A holder that went down: its lease expires and the retry takes it over (fenced).
+        expect(await store.tryLockRun('expiring', 'gone', Date.now() + 200, Date.now())).toBe(true);
+        expect(await engine.resume('expiring')).toMatchObject({ status: 'completed', output: 15 });
+        expect((await store.getRun('expiring'))?.status).toBe('completed');
+        await engine.drain();
+      },
+    );
+
     t('starts the version the caller pinned, and refuses one that is not registered', async () => {
       const engine = new WorkflowEngine({ store });
       const ran: string[] = [];
