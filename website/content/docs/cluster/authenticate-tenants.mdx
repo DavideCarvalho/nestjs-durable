@@ -1,0 +1,492 @@
+---
+title: Authenticate tenants
+description: Prove which tenant a store-less process is. Write a verifier for the control plane and a credentials source for the tenant, with your own JWTs, any OIDC provider, or a shared HMAC secret.
+icon: KeyRound
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+A `tenant` process sends a token with every request it makes to the control plane. The control plane
+checks the token and decides which tenant the process is; whatever the request claims about itself
+is ignored. Two options of `DurableModule.forRoot` carry this:
+
+- `verifyTenant`, on the control plane: turns a token into `{ tenant, capabilities }`, or rejects it.
+- `tenantToken`, on the tenant: the token to send.
+
+Durable does not care where the token comes from. Pick the setup that matches what your app already
+runs:
+
+| You have | Control plane | Tenant |
+| --- | --- | --- |
+| [`@nestjs/jwt`](#with-your-own-jwts-nestjsjwt) | A `JwtTenantVerifier` class that uses your `JwtService` | A token you minted |
+| [Any OIDC provider](#with-any-oidc-provider) (Keycloak, Auth0, Entra ID...) | Verify JWTs against the provider's keys | `client_credentials`, refreshed before expiry |
+| [Nothing](#with-a-shared-secret-hmac) | `hmacTenantVerifier(secret)` | `signTenantToken(partition, secret)` |
+
+<Callout type="warn">
+Without `verifyTenant`, the control plane trusts the tenant a request names. Any process that can
+reach the broker can then read, signal, cancel and start runs as any tenant. Run without a verifier
+only when each tenant's broker access is already isolated.
+</Callout>
+
+## The contracts
+
+Both options accept a function, or a class you write in its own file, the way a Passport strategy is
+a class you register with Nest. The classes implement one of two interfaces exported by
+`@dudousxd/nestjs-durable`.
+
+### `TenantVerifierContract`
+
+```ts title="tenant-auth/my-tenant-verifier.ts"
+import { Injectable } from '@nestjs/common';
+import type {
+  TenantVerifierContract,
+  TenantVerifierInput,
+  VerifiedTenant,
+} from '@dudousxd/nestjs-durable';
+
+@Injectable()
+export class MyTenantVerifier implements TenantVerifierContract {
+  async verify({ token }: TenantVerifierInput): Promise<VerifiedTenant | null> {
+    // ...
+  }
+}
+```
+
+#### `verify(input)`
+
+Called on the control plane for every request a tenant process sends.
+
+- `input.token` is the token the process sent.
+- `input.tenant` is what the request claims. Never use it to decide the tenant.
+- Return `{ tenant, capabilities? }` to accept. `tenant` is the partition the process acts as: its
+  runs are created in, and confined to, that namespace.
+- Return `null` to reject. The tenant's call fails with a `RunGatewayError` whose `code` is
+  `unauthorized`; a start-run creates nothing.
+- Throw when you cannot decide (your database or the identity provider is down). The tenant's call
+  fails with the error message, and the next request calls `verify` again.
+
+The control plane calls `verify` for every message, so cache results that cost a database or network
+round trip.
+
+### `TenantCredentialsContract`
+
+```ts title="tenant-auth/my-tenant-credentials.ts"
+import { Injectable } from '@nestjs/common';
+import type { TenantCredentialsContract } from '@dudousxd/nestjs-durable';
+
+@Injectable()
+export class MyTenantCredentials implements TenantCredentialsContract {
+  async token(): Promise<string> {
+    // ...
+  }
+}
+```
+
+#### `token()`
+
+Called on the tenant before every request it sends: each run-gateway call and each `engine.start`.
+
+- Return the token. It is sent unchanged.
+- Cache it and fetch a new one before it expires: `token()` runs once per request.
+- Throw (or return an empty string) when no token is available. That request fails with the error,
+  and the next request calls `token()` again. A static `tenantToken: ''` fails at boot.
+
+### Registering them
+
+`verifyTenant` takes four forms:
+
+```ts title="app.module.ts (control plane)"
+// 1. A function
+verifyTenant: hmacTenantVerifier(process.env.DURABLE_TENANT_SECRET!),
+
+// 2. A class. Built once through Nest DI, so constructor injection works
+verifyTenant: MyTenantVerifier,
+
+// 3. A lazy import of a module whose default export is the class (imported once)
+verifyTenant: () => import('./tenant-auth/my-tenant-verifier.js'),
+
+// 4. An object with a verify() method
+verifyTenant: new OidcTenantVerifier({ /* ... */ }),
+```
+
+`tenantToken` takes a string, a function, or the same class, lazy import and object forms with a
+`token()` method:
+
+```ts title="app.module.ts (tenant)"
+tenantToken: process.env.DURABLE_TENANT_TOKEN!,
+tenantToken: async () => vault.read('durable/token'),
+tenantToken: MyTenantCredentials,
+tenantToken: () => import('./tenant-auth/my-tenant-credentials.js'),
+tenantToken: new ClientCredentials({ /* ... */ }),
+```
+
+A class is built once. When your app registers it as a provider, that instance is used; otherwise
+Nest creates one with `ModuleRef.create`, which resolves its constructor dependencies from global
+modules. If the class needs a provider from a non-global module, add the class to that module's
+`providers`.
+
+## With your own JWTs (`@nestjs/jwt`)
+
+Use this when the control plane already signs JWTs with
+[`@nestjs/jwt`](https://docs.nestjs.com/security/authentication#jwt-token). Each tenant gets a token
+whose `partition` claim names the tenant and whose `capabilities` claim lists what it may do. No
+identity provider and no extra secret.
+
+### Mint a token
+
+```ts title="scripts/mint-tenant-token.ts"
+const token = await app.get(JwtService).signAsync(
+  { partition: 'acme-corp', capabilities: ['gpu'] },
+  { audience: 'durable-tenant', expiresIn: '90d' },
+);
+```
+
+The `audience` keeps tenant tokens apart from your users' tokens, which the same key also signs.
+
+### The control plane
+
+```ts title="tenant-auth/jwt-tenant-verifier.ts"
+import { createHash } from 'node:crypto';
+import { Injectable } from '@nestjs/common';
+import { JsonWebTokenError, JwtService } from '@nestjs/jwt';
+import type {
+  TenantVerifierContract,
+  TenantVerifierInput,
+  VerifiedTenant,
+} from '@dudousxd/nestjs-durable';
+
+/** The claims a tenant token carries. */
+export interface TenantTokenClaims {
+  /** The partition the tenant process acts as. */
+  partition: string;
+  /** What the tenant may do. Optional. */
+  capabilities?: string[];
+  exp?: number;
+}
+
+/** Must match the `audience` the tokens are signed with. */
+export const TENANT_TOKEN_AUDIENCE = 'durable-tenant';
+
+/**
+ * Verifies tenant tokens signed by this app's own `JwtModule`. The control plane sees every message a
+ * tenant sends, so each result, accepted or rejected, is reused for `CACHE_TTL_MS` (never past the
+ * token's own expiry) instead of verifying the signature every time.
+ */
+@Injectable()
+export class JwtTenantVerifier implements TenantVerifierContract {
+  private static readonly CACHE_TTL_MS = 30_000;
+  private static readonly MAX_ENTRIES = 10_000;
+  private readonly cache = new Map<string, { result: VerifiedTenant | null; until: number }>();
+
+  constructor(private readonly jwt: JwtService) {}
+
+  async verify({ token }: TenantVerifierInput): Promise<VerifiedTenant | null> {
+    if (!token) return null;
+    // Keyed by a hash, so the cache never holds a usable token.
+    const key = createHash('sha256').update(token).digest('base64url');
+    const hit = this.cache.get(key);
+    if (hit && hit.until > Date.now()) return hit.result;
+
+    let claims: TenantTokenClaims | undefined;
+    try {
+      claims = await this.jwt.verifyAsync<TenantTokenClaims>(token, {
+        audience: TENANT_TOKEN_AUDIENCE,
+      });
+    } catch (error) {
+      // A bad, expired or foreign token is a rejection. Anything else is an error the tenant sees.
+      if (!(error instanceof JsonWebTokenError)) throw error;
+    }
+    const result =
+      claims && typeof claims.partition === 'string' && claims.partition !== ''
+        ? {
+            tenant: claims.partition,
+            capabilities: Array.isArray(claims.capabilities) ? claims.capabilities : undefined,
+          }
+        : null;
+
+    let until = Date.now() + JwtTenantVerifier.CACHE_TTL_MS;
+    if (claims?.exp) until = Math.min(until, claims.exp * 1000);
+    this.cache.delete(key);
+    this.cache.set(key, { result, until });
+    if (this.cache.size > JwtTenantVerifier.MAX_ENTRIES) {
+      const oldest = this.cache.keys().next().value;
+      if (oldest !== undefined) this.cache.delete(oldest);
+    }
+    return result;
+  }
+}
+
+export default JwtTenantVerifier;
+```
+
+`JwtService` comes from your `JwtModule`. Register it with `global: true`, or add `JwtTenantVerifier`
+to the `providers` of the module that imports `JwtModule`.
+
+```ts title="app.module.ts (control plane)"
+@Module({
+  imports: [
+    JwtModule.register({ global: true, secret: process.env.JWT_SECRET }),
+    DurableModule.forRoot({
+      topology: 'control-plane',
+      store,
+      transport,
+      verifyTenant: JwtTenantVerifier,
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+### The tenant
+
+```ts title="app.module.ts (tenant)"
+DurableModule.forRoot({
+  topology: 'tenant',
+  partition: 'acme-corp',
+  connection: process.env.REDIS_URL,
+  transport,
+  tenantToken: process.env.DURABLE_TENANT_TOKEN!,
+});
+```
+
+## With any OIDC provider
+
+Each tenant process is an OAuth client of your identity provider. It gets a short-lived JWT access
+token with the `client_credentials` grant and sends it; the control plane checks the token's signature
+against the provider's published keys, without calling the provider for each message. These two
+classes use [`jose`](https://github.com/panva/jose) (`npm i jose`).
+
+Configure each client on the provider to issue JWT access tokens that carry:
+
+- `aud`: the control plane's resource identifier, e.g. `urn:aviary:durable`, requested with `resource`
+  (RFC 8707);
+- `partition`: the tenant the client acts as;
+- `capabilities` (optional): a string array.
+
+The provider's discovery document (`{issuer}/.well-known/openid-configuration`) lists the `jwks_uri`
+and `token_endpoint` used below.
+
+### The control plane
+
+```ts title="tenant-auth/oidc-tenant-verifier.ts"
+import { createRemoteJWKSet, errors, jwtVerify } from 'jose';
+import type {
+  TenantVerifierContract,
+  TenantVerifierInput,
+  VerifiedTenant,
+} from '@dudousxd/nestjs-durable';
+
+export interface OidcTenantVerifierOptions {
+  /** The IdP's issuer; must equal the token's `iss`. */
+  issuer: string;
+  /** The control plane's resource identifier; must be in the token's `aud`. */
+  audience: string;
+  /** The IdP's key set (`jwks_uri` in `{issuer}/.well-known/openid-configuration`). */
+  jwksUri: string;
+  /** Claim naming the partition. Default `partition`. */
+  partitionClaim?: string;
+  /** Claim listing the capabilities. Default `capabilities`. */
+  capabilitiesClaim?: string;
+}
+
+/**
+ * Verifies JWT access tokens (RFC 9068) issued by any OIDC provider, locally: `jose` fetches the
+ * signing keys once, caches them, and fetches them again when a token names a key it has not seen
+ * (key rotation). Only asymmetric algorithms are accepted, never `none` or `HS*`.
+ */
+export class OidcTenantVerifier implements TenantVerifierContract {
+  private readonly jwks: ReturnType<typeof createRemoteJWKSet>;
+
+  constructor(private readonly options: OidcTenantVerifierOptions) {
+    this.jwks = createRemoteJWKSet(new URL(options.jwksUri));
+  }
+
+  async verify({ token }: TenantVerifierInput): Promise<VerifiedTenant | null> {
+    if (!token) return null;
+    try {
+      const { payload } = await jwtVerify(token, this.jwks, {
+        issuer: this.options.issuer,
+        audience: this.options.audience,
+        algorithms: ['RS256', 'PS256', 'ES256', 'EdDSA'],
+        requiredClaims: ['exp'],
+        clockTolerance: 30,
+      });
+      const tenant = payload[this.options.partitionClaim ?? 'partition'];
+      if (typeof tenant !== 'string' || tenant === '') return null;
+      const capabilities = payload[this.options.capabilitiesClaim ?? 'capabilities'];
+      return {
+        tenant,
+        capabilities: Array.isArray(capabilities)
+          ? capabilities.filter((c): c is string => typeof c === 'string')
+          : undefined,
+      };
+    } catch (error) {
+      // A bad token is a rejection. A key set that cannot be fetched (network error, timeout, non-200
+      // or unparseable response, malformed key set) is an error the tenant sees.
+      if (error instanceof errors.JOSEError && !KEY_SET_FAILURES.has(error.code)) return null;
+      throw error;
+    }
+  }
+}
+
+/**
+ * The `jose` error codes for a key set that could not be fetched or used: `ERR_JOSE_GENERIC` is a
+ * non-200 or unparseable JWKS response. Network errors are not `JOSEError`s, so they throw as well.
+ */
+const KEY_SET_FAILURES = new Set<string>([
+  errors.JOSEError.code,
+  errors.JWKSTimeout.code,
+  errors.JWKSInvalid.code,
+]);
+```
+
+```ts title="app.module.ts (control plane)"
+DurableModule.forRoot({
+  topology: 'control-plane',
+  store,
+  transport,
+  verifyTenant: new OidcTenantVerifier({
+    issuer: process.env.OIDC_ISSUER!,
+    audience: 'urn:aviary:durable',
+    jwksUri: process.env.OIDC_JWKS_URI!,
+  }),
+});
+```
+
+To read the options from `ConfigService`, use `DurableModule.forRootAsync` and build the verifier in
+the factory.
+
+### The tenant
+
+```ts title="tenant-auth/client-credentials.ts"
+import type { TenantCredentialsContract } from '@dudousxd/nestjs-durable';
+
+export interface ClientCredentialsOptions {
+  /** The IdP's token endpoint (`token_endpoint` in its discovery document). */
+  tokenEndpoint: string;
+  clientId: string;
+  clientSecret: string;
+  /** The control plane's resource identifier, sent as `resource` (RFC 8707). */
+  resource: string;
+  scope?: string;
+  /** Fetch a new token this many seconds before the current one expires. Default 60. */
+  refreshSkewSec?: number;
+}
+
+/**
+ * Gets the tenant's access token with the OAuth `client_credentials` grant and keeps it fresh. Calls
+ * made while a request to the IdP is in flight share it. When the IdP fails, the current token is
+ * kept while it is still valid and the IdP is not asked again for 5 seconds.
+ */
+export class ClientCredentials implements TenantCredentialsContract {
+  private current: { token: string; refreshAt: number; expiresAt: number } | undefined;
+  private inflight: Promise<string> | undefined;
+  private retryAt = 0;
+
+  constructor(private readonly options: ClientCredentialsOptions) {}
+
+  async token(): Promise<string> {
+    const now = Date.now();
+    const current = this.current;
+    if (current && now < current.refreshAt) return current.token;
+    const stillValid = current && now < current.expiresAt ? current.token : undefined;
+    if (stillValid && now < this.retryAt) return stillValid;
+
+    this.inflight ??= this.fetchToken().finally(() => {
+      this.inflight = undefined;
+    });
+    try {
+      return await this.inflight;
+    } catch (error) {
+      this.retryAt = Date.now() + 5_000;
+      if (stillValid) return stillValid;
+      throw error;
+    }
+  }
+
+  private async fetchToken(): Promise<string> {
+    const { clientId, clientSecret, resource, scope } = this.options;
+    const body = new URLSearchParams({ grant_type: 'client_credentials', resource });
+    if (scope) body.set('scope', scope);
+    const basic = Buffer.from(
+      `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`,
+    ).toString('base64');
+    const response = await fetch(this.options.tokenEndpoint, {
+      method: 'POST',
+      headers: {
+        authorization: `Basic ${basic}`,
+        'content-type': 'application/x-www-form-urlencoded',
+        accept: 'application/json',
+      },
+      body,
+      signal: AbortSignal.timeout(10_000),
+    });
+    // Never put the response body in the error: it is not ours to log.
+    if (!response.ok) throw new Error(`token endpoint answered HTTP ${response.status}`);
+    const json = (await response.json()) as { access_token?: unknown; expires_in?: unknown };
+    if (typeof json.access_token !== 'string')
+      throw new Error('token response has no access_token');
+
+    const lifetimeMs = (typeof json.expires_in === 'number' ? json.expires_in : 300) * 1000;
+    const skewMs = (this.options.refreshSkewSec ?? 60) * 1000;
+    const now = Date.now();
+    this.current = {
+      token: json.access_token,
+      expiresAt: now + lifetimeMs,
+      // A token shorter-lived than the skew is refreshed at half its life instead.
+      refreshAt: now + (skewMs < lifetimeMs ? lifetimeMs - skewMs : lifetimeMs / 2),
+    };
+    this.retryAt = 0;
+    return json.access_token;
+  }
+}
+```
+
+```ts title="app.module.ts (tenant)"
+DurableModule.forRoot({
+  topology: 'tenant',
+  partition: 'acme-corp',
+  connection: process.env.REDIS_URL,
+  transport,
+  tenantToken: new ClientCredentials({
+    tokenEndpoint: process.env.OIDC_TOKEN_ENDPOINT!,
+    clientId: process.env.DURABLE_TENANT_CLIENT_ID!,
+    clientSecret: process.env.DURABLE_TENANT_CLIENT_SECRET!,
+    resource: 'urn:aviary:durable',
+  }),
+});
+```
+
+## With a shared secret (HMAC)
+
+With no user store and no identity provider, sign each tenant's partition with a secret only the
+control plane and you know:
+
+```ts
+import { hmacTenantVerifier, signTenantToken } from '@dudousxd/nestjs-durable';
+
+// Mint the token a tenant presents (once, e.g. in a provisioning script); ttlMs makes it expire:
+const token = signTenantToken('acme-corp', process.env.DURABLE_TENANT_SECRET!, {
+  ttlMs: 24 * 60 * 60 * 1000,
+});
+
+// Control plane. A list of secrets lets you rotate: verify with [next, current], re-mint, drop current.
+verifyTenant: hmacTenantVerifier([
+  process.env.DURABLE_TENANT_SECRET_NEXT!,
+  process.env.DURABLE_TENANT_SECRET!,
+]),
+
+// Tenant:
+tenantToken: process.env.DURABLE_TENANT_TOKEN!,
+```
+
+`hmacTenantVerifier(secret, capabilities)` grants the same `capabilities` to every tenant; the token
+carries none of its own.
+
+## Wire compatibility
+
+Whatever produced it, the token travels as a plain string in the `tenant` field of each request, the
+same field Agora (`@adonis-agora/durable`) uses, so a verifier works for NestJS and Agora tenants
+alike. HMAC tokens are byte-compatible between the two. A control plane without
+`verifyTenant` reads the whole string as the tenant name and finds no runs for it, so a misrouted
+tenant is refused rather than let in. See [interop](/docs/cluster/interop#tenant-tokens-across-runtimes).

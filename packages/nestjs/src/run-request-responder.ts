@@ -71,7 +71,7 @@ export interface RunRequestResponderOptions {
   verifyTenant?: TenantVerifier | undefined;
   /**
    * Warn at construction when no {@link verifyTenant} is set. Default `true`. `DurableModule` passes
-   * `true` only for an explicit `topology: { role: 'control-plane' }`, so a plain operator app that
+   * `true` only for `topology: 'control-plane'`, so a standalone operator app that
    * never serves tenants boots silently.
    */
   warnWithoutVerifier?: boolean | undefined;

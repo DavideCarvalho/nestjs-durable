@@ -309,14 +309,14 @@ describe('DurableModule missing-verifier warning (mirrors Agora: only an explici
     expect(await boot({})).toEqual([]);
   });
 
-  it("an explicit topology: { role: 'control-plane' } without a verifier warns", async () => {
-    expect(await boot({ topology: { role: 'control-plane' } })).toHaveLength(1);
+  it("topology: 'control-plane' without a verifier warns", async () => {
+    expect(await boot({ topology: 'control-plane' })).toHaveLength(1);
   });
 
   it('an explicit control plane with verifyTenant boots silently', async () => {
     expect(
       await boot({
-        topology: { role: 'control-plane' },
+        topology: 'control-plane',
         verifyTenant: hmacTenantVerifier(SECRET),
       }),
     ).toEqual([]);

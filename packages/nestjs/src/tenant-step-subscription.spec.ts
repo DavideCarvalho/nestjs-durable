@@ -48,12 +48,13 @@ class HandleRecordingTransport implements Transport {
  * node enqueues work onto a queue nobody in it consumes, and every run hangs.
  */
 describe('in-process @Step handlers serve the control plane tenant partition', () => {
-  it("{ role: 'control-plane', tenant } registers its @Step on the tenant partition", async () => {
+  it("'control-plane' with a partition registers its @Step on the tenant partition", async () => {
     const transport = new HandleRecordingTransport();
     const moduleRef = await Test.createTestingModule({
       imports: [
         DurableModule.forRoot({
-          topology: { role: 'control-plane', tenant: 'davi-local' },
+          topology: 'control-plane',
+          partition: 'davi-local',
           store: new InMemoryStateStore(),
           transport,
           timerPollMs: 0,
@@ -76,7 +77,7 @@ describe('in-process @Step handlers serve the control plane tenant partition', (
     const moduleRef = await Test.createTestingModule({
       imports: [
         DurableModule.forRoot({
-          topology: { role: 'control-plane' },
+          topology: 'control-plane',
           store: new InMemoryStateStore(),
           transport,
           timerPollMs: 0,

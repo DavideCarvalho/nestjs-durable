@@ -331,11 +331,21 @@ export class ConsoleAccessDenied extends HttpException {
   }
 }
 
+/**
+ * Marks a console route that is not part of the console: `authorize` does not apply to it. Used on
+ * the `ctx.webhook()` callback, which third parties call with the token as the secret.
+ */
+export const CONSOLE_PUBLIC_METADATA = `${PACKAGE}:console-public`;
+export const ConsolePublic = (): MethodDecorator => (_target, _key, descriptor) => {
+  Reflect.defineMetadata(CONSOLE_PUBLIC_METADATA, true, descriptor.value as object);
+};
+
 @Injectable()
 export class ConsoleAuthorizeGuard implements CanActivate {
   constructor(@Inject(CONSOLE_AUTHORIZE_DECIDE) private readonly decide: ConsoleDecide) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
+    if (Reflect.getMetadata(CONSOLE_PUBLIC_METADATA, context.getHandler()) === true) return true;
     const decision = await this.decide(context);
     if (decision.allowed) return true;
     throw new ConsoleAccessDenied(decision, isPageNavigation(context));

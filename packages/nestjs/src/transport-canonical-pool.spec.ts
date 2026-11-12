@@ -18,7 +18,7 @@ describe('TRANSPORT_CANONICAL with a transports pool', () => {
         DurableModule.forRoot({
           store: new InMemoryStateStore(),
           transports: [{ id: 'default', transport: primary }],
-          topology: { role: 'control-plane' },
+          topology: 'control-plane',
         }),
       ],
     }).compile();

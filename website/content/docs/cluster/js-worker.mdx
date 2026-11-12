@@ -21,7 +21,7 @@ pnpm add @dudousxd/durable-worker bullmq ioredis
 
 <Callout title="Module or SDK?">
 If your worker is already a NestJS app, you usually don't touch this package directly —
-`DurableModule.forRoot({ topology: { role: 'tenant', tenant }, connection })` discovers your
+`DurableModule.forRoot({ topology: 'tenant', partition, connection })` discovers your
 `@Workflow`/`@Step` and starts the runner for you (see [Roles & config](/docs/cluster/roles-and-config)).
 Use `@dudousxd/durable-worker` when you want the raw runtime with no module, or a second worker loop
 inside an existing process.

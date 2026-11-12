@@ -9,12 +9,13 @@ import {
   WorkflowEngine,
   type WorkflowTask,
 } from '@dudousxd/nestjs-durable-core';
+import type { Type } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { describe, expect, it } from 'vitest';
 import { Workflow } from './decorators';
 import { DurableStartClient } from './durable-start-client';
 import { RUN_REDIS_WORKER } from './durable-worker.module';
-import { DurableModule } from './durable.module';
+import { DurableModule, type DurableModuleOptions } from './durable.module';
 import { IN_APP_RUN_REDIS_WORKER } from './in-app-worker';
 import { ProxyRunGateway } from './proxy-run-gateway';
 import { StoreRunGateway } from './store-run-gateway';
@@ -150,216 +151,225 @@ describe('DurableModule.forRoot — role inference', () => {
   });
 });
 
-describe('DurableModule.forRoot — topology preset', () => {
-  it("{ topology: { role: 'control-plane' }, store, transport } resolves the operator role: real WorkflowEngine + StoreRunGateway", async () => {
+describe('DurableModule.forRoot — topology', () => {
+  async function boot(options: DurableModuleOptions, providers: Type[] = [GreetWorkflow]) {
     const runner = fakeRunRedisWorker();
-    const store = new InMemoryStateStore();
-    const transport = new InMemoryTransport();
     const moduleRef = await Test.createTestingModule({
-      imports: [
-        DurableModule.forRoot({
-          topology: { role: 'control-plane' },
-          store,
-          transport,
-          timerPollMs: 0,
-        }),
-      ],
-      providers: [GreetWorkflow],
+      imports: [DurableModule.forRoot(options)],
+      providers,
     })
       .overrideProvider(RUN_REDIS_WORKER)
       .useValue(runner.fn)
       .compile();
     await moduleRef.init();
+    return { moduleRef, runner };
+  }
 
-    const engine = moduleRef.get(WorkflowEngine);
-    expect(engine).toBeInstanceOf(WorkflowEngine);
-    expect(engine).not.toBeInstanceOf(DurableStartClient);
-
-    const gateway = moduleRef.get(RUN_GATEWAY, { strict: false });
-    expect(gateway).toBeInstanceOf(StoreRunGateway);
-    expect(gateway.topology()).toEqual({ role: 'control-plane' });
-
-    await moduleRef.close();
-  });
-
-  it("{ topology: { role: 'control-plane' } } missing `transport` throws the topology-specific error, not the generic role error", () => {
+  it("'standalone' is the inference of no topology at all", async () => {
     const store = new InMemoryStateStore();
-    expect(() => DurableModule.forRoot({ topology: { role: 'control-plane' }, store })).toThrow(
-      /needs `store` AND \(`transport` or `transports`\)/,
+    const { moduleRef } = await boot({
+      topology: 'standalone',
+      store,
+      transport: new InMemoryTransport(),
+      timerPollMs: 0,
+    });
+    expect(moduleRef.get(WorkflowEngine)).not.toBeInstanceOf(DurableStartClient);
+    expect(moduleRef.get(RUN_GATEWAY, { strict: false })).toBeInstanceOf(StoreRunGateway);
+    await moduleRef.close();
+
+    expect(() => DurableModule.forRoot({ topology: 'standalone' })).toThrow(
+      'a durable module needs either a `store` (operator) or a `connection` (worker)',
     );
   });
 
-  it("{ topology: { role: 'control-plane' } } with `partition` throws: partition is a worker axis", () => {
+  it("'control-plane' with store and transport resolves the operator role: real WorkflowEngine + StoreRunGateway", async () => {
+    const { moduleRef } = await boot({
+      topology: 'control-plane',
+      store: new InMemoryStateStore(),
+      transport: new InMemoryTransport(),
+      timerPollMs: 0,
+    });
+    const engine = moduleRef.get(WorkflowEngine);
+    expect(engine).toBeInstanceOf(WorkflowEngine);
+    expect(engine).not.toBeInstanceOf(DurableStartClient);
+    const gateway = moduleRef.get(RUN_GATEWAY, { strict: false });
+    expect(gateway).toBeInstanceOf(StoreRunGateway);
+    expect(gateway.topology()).toEqual({ role: 'control-plane' });
+    await moduleRef.close();
+  });
+
+  it("'control-plane' missing `transport` throws the topology-specific error", () => {
+    expect(() =>
+      DurableModule.forRoot({ topology: 'control-plane', store: new InMemoryStateStore() }),
+    ).toThrow(/needs `store` AND \(`transport` or `transports`\)/);
+  });
+
+  it("'control-plane' with a `partition` scopes the operator to its own runs (it becomes the namespace)", async () => {
+    const store = new InMemoryStateStore();
+    const { moduleRef } = await boot({
+      topology: 'control-plane',
+      partition: 'davi-local',
+      store,
+      transport: new InMemoryTransport(),
+      timerPollMs: 0,
+    });
+    const { runId } = await moduleRef
+      .get(WorkflowEngine)
+      .start(GreetWorkflow, undefined, 'run-cp-tenant');
+    expect((await store.getRun(runId))?.namespace).toBe('davi-local');
+    await moduleRef.close();
+  });
+
+  it("'control-plane' with `partition: undefined` is a global operator", async () => {
+    const store = new InMemoryStateStore();
+    const { moduleRef } = await boot({
+      topology: 'control-plane',
+      partition: undefined,
+      store,
+      transport: new InMemoryTransport(),
+      timerPollMs: 0,
+    });
+    const { runId } = await moduleRef
+      .get(WorkflowEngine)
+      .start(GreetWorkflow, undefined, 'run-cp-global');
+    expect((await store.getRun(runId))?.namespace).toBe('default');
+    await moduleRef.close();
+  });
+
+  it("'control-plane' with a MISMATCHED explicit `namespace` throws; a matching one is a no-op", async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
     expect(() =>
       DurableModule.forRoot({
-        topology: { role: 'control-plane' },
-        store,
-        transport,
-        partition: 'tenantA',
-      }),
-    ).toThrow(/forbids `partition`/);
-  });
-
-  it("{ topology: { role: 'control-plane', tenant } } maps tenant onto `namespace` (operator scoped to its own runs)", async () => {
-    const runner = fakeRunRedisWorker();
-    const store = new InMemoryStateStore();
-    const transport = new InMemoryTransport();
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        DurableModule.forRoot({
-          topology: { role: 'control-plane', tenant: 'davi-local' },
-          store,
-          transport,
-          timerPollMs: 0,
-        }),
-      ],
-      providers: [GreetWorkflow],
-    })
-      .overrideProvider(RUN_REDIS_WORKER)
-      .useValue(runner.fn)
-      .compile();
-    await moduleRef.init();
-
-    // Behavioral: the operator's namespace stamps every run it creates.
-    const engine = moduleRef.get(WorkflowEngine);
-    const { runId } = await engine.start(GreetWorkflow, undefined, 'run-cp-tenant');
-    const run = await store.getRun(runId);
-    expect(run?.namespace).toBe('davi-local');
-
-    await moduleRef.close();
-  });
-
-  it("{ topology: { role: 'control-plane', tenant: undefined } } leaves `namespace` unset (global operator)", async () => {
-    const runner = fakeRunRedisWorker();
-    const store = new InMemoryStateStore();
-    const transport = new InMemoryTransport();
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        DurableModule.forRoot({
-          topology: { role: 'control-plane', tenant: undefined },
-          store,
-          transport,
-          timerPollMs: 0,
-        }),
-      ],
-      providers: [GreetWorkflow],
-    })
-      .overrideProvider(RUN_REDIS_WORKER)
-      .useValue(runner.fn)
-      .compile();
-    await moduleRef.init();
-
-    // Behavioral: no tenant → runs get the default namespace, exactly as with no topology at all.
-    const engine = moduleRef.get(WorkflowEngine);
-    const { runId } = await engine.start(GreetWorkflow, undefined, 'run-cp-global');
-    const run = await store.getRun(runId);
-    expect(run?.namespace).toBe('default');
-
-    await moduleRef.close();
-  });
-
-  it("{ topology: { role: 'control-plane', tenant } } with a MISMATCHED explicit `namespace` throws the conflict error", () => {
-    const store = new InMemoryStateStore();
-    const transport = new InMemoryTransport();
-    expect(() =>
-      DurableModule.forRoot({
-        topology: { role: 'control-plane', tenant: 'davi-local' },
+        topology: 'control-plane',
+        partition: 'davi-local',
         store,
         transport,
         namespace: 'someone-else',
       }),
     ).toThrow(/conflicts with `namespace: 'someone-else'`/);
-  });
 
-  it("{ topology: { role: 'control-plane', tenant } } with a MATCHING explicit `namespace` is a no-op", async () => {
-    const runner = fakeRunRedisWorker();
-    const store = new InMemoryStateStore();
-    const transport = new InMemoryTransport();
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        DurableModule.forRoot({
-          topology: { role: 'control-plane', tenant: 'davi-local' },
-          store,
-          transport,
-          namespace: 'davi-local',
-          timerPollMs: 0,
-        }),
-      ],
-      providers: [GreetWorkflow],
-    })
-      .overrideProvider(RUN_REDIS_WORKER)
-      .useValue(runner.fn)
-      .compile();
-    await moduleRef.init();
-
-    const engine = moduleRef.get(WorkflowEngine);
-    const { runId } = await engine.start(GreetWorkflow, undefined, 'run-cp-match');
-    const run = await store.getRun(runId);
-    expect(run?.namespace).toBe('davi-local');
-
+    const { moduleRef } = await boot({
+      topology: 'control-plane',
+      partition: 'davi-local',
+      store,
+      transport,
+      namespace: 'davi-local',
+      timerPollMs: 0,
+    });
+    const { runId } = await moduleRef
+      .get(WorkflowEngine)
+      .start(GreetWorkflow, undefined, 'run-cp-match');
+    expect((await store.getRun(runId))?.namespace).toBe('davi-local');
     await moduleRef.close();
   });
 
-  it("{ topology: { role: 'tenant', tenant } } resolves the worker role: partition === tenant, ProxyRunGateway reports the tenant", async () => {
-    const runner = fakeRunRedisWorker();
-    const transport = new InMemoryTransport();
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        DurableModule.forRoot({
-          topology: { role: 'tenant', tenant: 'tenantA' },
-          connection: 'redis://x',
-          transport,
-        }),
-      ],
-    })
-      .overrideProvider(RUN_REDIS_WORKER)
-      .useValue(runner.fn)
-      .compile();
-    await moduleRef.init();
-
-    const engine = moduleRef.get(WorkflowEngine);
-    expect(engine).toBeInstanceOf(DurableStartClient);
-
+  it("'tenant' resolves the worker role: it serves its partition and ProxyRunGateway reports it", async () => {
+    const { moduleRef, runner } = await boot(
+      {
+        topology: 'tenant',
+        partition: 'tenantA',
+        connection: 'redis://x',
+        transport: new InMemoryTransport(),
+      },
+      [],
+    );
+    expect(moduleRef.get(WorkflowEngine)).toBeInstanceOf(DurableStartClient);
     const gateway = moduleRef.get(RUN_GATEWAY, { strict: false });
     expect(gateway).toBeInstanceOf(ProxyRunGateway);
     expect(gateway.topology()).toEqual({ role: 'tenant', tenant: 'tenantA' });
-
     expect(runner.calls).toHaveLength(1);
     expect(runner.calls[0]).toMatchObject({ partition: 'tenantA' });
-
     await moduleRef.close();
   });
 
-  it("{ topology: { role: 'tenant' } } with `store` throws: a tenant is store-less by definition", () => {
-    const store = new InMemoryStateStore();
-    const transport = new InMemoryTransport();
+  it("'tenant' without `partition` throws", () => {
     expect(() =>
       DurableModule.forRoot({
-        topology: { role: 'tenant', tenant: 'tenantA' },
-        store,
-        transport,
+        topology: 'tenant',
         connection: 'redis://x',
-      }),
+      } as unknown as DurableModuleOptions),
+    ).toThrow(/topology: 'tenant' needs `partition`/);
+  });
+
+  it("'tenant' without `connection` throws", () => {
+    expect(() =>
+      DurableModule.forRoot({
+        topology: 'tenant',
+        partition: 'tenantA',
+      } as unknown as DurableModuleOptions),
+    ).toThrow(/needs `connection`/);
+  });
+
+  it("'tenant' with `store` throws: a tenant is store-less by definition", () => {
+    expect(() =>
+      DurableModule.forRoot({
+        topology: 'tenant',
+        partition: 'tenantA',
+        connection: 'redis://x',
+        store: new InMemoryStateStore(),
+        transport: new InMemoryTransport(),
+      } as unknown as DurableModuleOptions),
     ).toThrow(/forbids `store`/);
   });
 
-  it("{ topology: { role: 'tenant' } } with a mismatched `partition` throws; a matching `partition` is a no-op", () => {
+  it("'tenant' with `namespace` throws: namespace is the operator's axis", () => {
     expect(() =>
       DurableModule.forRoot({
-        topology: { role: 'tenant', tenant: 'tenantA' },
-        connection: 'redis://x',
-        partition: 'tenantB',
-      }),
-    ).toThrow(/conflicts with `partition: 'tenantB'`/);
-
-    expect(() =>
-      DurableModule.forRoot({
-        topology: { role: 'tenant', tenant: 'tenantA' },
-        connection: 'redis://x',
+        topology: 'tenant',
         partition: 'tenantA',
-      }),
-    ).not.toThrow();
+        connection: 'redis://x',
+        namespace: 'tenantA',
+      } as unknown as DurableModuleOptions),
+    ).toThrow(/forbids `namespace`/);
+  });
+
+  it("'tenant' with `verifyTenant` throws: the control plane verifies", () => {
+    expect(() =>
+      DurableModule.forRoot({
+        topology: 'tenant',
+        partition: 'tenantA',
+        connection: 'redis://x',
+        verifyTenant: () => null,
+      } as unknown as DurableModuleOptions),
+    ).toThrow(/forbids `verifyTenant`/);
+  });
+
+  it("'control-plane' with `tenantToken` throws: the tenant presents it", () => {
+    expect(() =>
+      DurableModule.forRoot({
+        topology: 'control-plane',
+        store: new InMemoryStateStore(),
+        transport: new InMemoryTransport(),
+        tenantToken: 'token',
+      } as unknown as DurableModuleOptions),
+    ).toThrow(/forbids `tenantToken`/);
+  });
+
+  it('an unknown topology, or the removed object form, throws and shows the new form', () => {
+    expect(() =>
+      DurableModule.forRoot({
+        topology: { role: 'tenant', tenant: 'acme' },
+        connection: 'redis://x',
+      } as unknown as DurableModuleOptions),
+    ).toThrow(/is now `topology: 'tenant', partition: 'acme'`/);
+    expect(() =>
+      DurableModule.forRoot({
+        topology: 'worker',
+        connection: 'redis://x',
+      } as unknown as DurableModuleOptions),
+    ).toThrow(/topology must be 'standalone', 'control-plane' or 'tenant'/);
+  });
+
+  it('forRootAsync validates the topology the factory returns', async () => {
+    const moduleBuilder = Test.createTestingModule({
+      imports: [
+        DurableModule.forRootAsync({
+          useFactory: () =>
+            ({ topology: 'tenant', connection: 'redis://x' }) as unknown as DurableModuleOptions,
+        }),
+      ],
+    });
+    await expect(moduleBuilder.compile()).rejects.toThrow(/needs `partition`/);
   });
 });

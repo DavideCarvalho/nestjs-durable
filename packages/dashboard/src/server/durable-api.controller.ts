@@ -16,6 +16,7 @@ import {
   UseFilters,
   UseInterceptors,
 } from '@nestjs/common';
+import { ConsolePublic } from './console-authorize.js';
 import { DashboardService } from './dashboard.service.js';
 
 /** Fans with more members than this come back summarized in a run's detail. */
@@ -309,10 +310,11 @@ export class DurableApiControllerBase {
 
   /**
    * Public callback endpoint for `ctx.webhook()`: a third party POSTs here (the url handed to it),
-   * and the body resumes the waiting run. NOTE: this is reachable by external systems — protect it
-   * by treating the token as a secret (it embeds runId:seq) and/or fronting it with signature
-   * verification in your own middleware.
+   * and the body resumes the waiting run. Not a console route: the console's `authorize` does not
+   * apply, the token is the secret. The app's `decorators` still do. Treat the token as a secret
+   * and/or front it with signature verification in your own middleware.
    */
+  @ConsolePublic()
   @Post('webhooks/:token')
   async webhook(@Param('token') token: string, @Body() body: unknown) {
     const result = await this.dashboard.deliverWebhook(token, body);

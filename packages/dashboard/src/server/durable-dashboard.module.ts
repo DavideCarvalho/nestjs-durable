@@ -29,7 +29,9 @@ markOpenToAuthorization(DurableUiController);
 
 export interface DurableDashboardOptions {
   /**
-   * Who may use the console (the SPA, its JSON API, the run stream and the webhook route). One of:
+   * Who may use the console (the SPA, its JSON API and the run stream). Not the `ctx.webhook()`
+   * callback (`POST <apiBasePath>/webhooks/:token`), which third parties call with the token as the
+   * secret; {@link decorators} still apply to it. One of:
    *
    * - a function `(context) => boolean | { allowed } | { redirectTo }` (may be async);
    * - an `@Injectable()` class implementing {@link ConsoleAuthorizer} (constructor injection works;

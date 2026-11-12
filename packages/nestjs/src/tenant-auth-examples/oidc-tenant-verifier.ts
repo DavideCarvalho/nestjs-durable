@@ -1,0 +1,67 @@
+// The "Authenticate tenants" guide's OIDC control-plane example, kept compiling and tested
+// (`tenant-auth-guide.spec.ts`). The guide imports from '@dudousxd/nestjs-durable'.
+import { createRemoteJWKSet, errors, jwtVerify } from 'jose';
+import type { TenantVerifierContract, TenantVerifierInput, VerifiedTenant } from '../index';
+
+export interface OidcTenantVerifierOptions {
+  /** The IdP's issuer; must equal the token's `iss`. */
+  issuer: string;
+  /** The control plane's resource identifier; must be in the token's `aud`. */
+  audience: string;
+  /** The IdP's key set (`jwks_uri` in `{issuer}/.well-known/openid-configuration`). */
+  jwksUri: string;
+  /** Claim naming the partition. Default `partition`. */
+  partitionClaim?: string;
+  /** Claim listing the capabilities. Default `capabilities`. */
+  capabilitiesClaim?: string;
+}
+
+/**
+ * Verifies JWT access tokens (RFC 9068) issued by any OIDC provider, locally: `jose` fetches the
+ * signing keys once, caches them, and fetches them again when a token names a key it has not seen
+ * (key rotation). Only asymmetric algorithms are accepted, never `none` or `HS*`.
+ */
+export class OidcTenantVerifier implements TenantVerifierContract {
+  private readonly jwks: ReturnType<typeof createRemoteJWKSet>;
+
+  constructor(private readonly options: OidcTenantVerifierOptions) {
+    this.jwks = createRemoteJWKSet(new URL(options.jwksUri));
+  }
+
+  async verify({ token }: TenantVerifierInput): Promise<VerifiedTenant | null> {
+    if (!token) return null;
+    try {
+      const { payload } = await jwtVerify(token, this.jwks, {
+        issuer: this.options.issuer,
+        audience: this.options.audience,
+        algorithms: ['RS256', 'PS256', 'ES256', 'EdDSA'],
+        requiredClaims: ['exp'],
+        clockTolerance: 30,
+      });
+      const tenant = payload[this.options.partitionClaim ?? 'partition'];
+      if (typeof tenant !== 'string' || tenant === '') return null;
+      const capabilities = payload[this.options.capabilitiesClaim ?? 'capabilities'];
+      return {
+        tenant,
+        capabilities: Array.isArray(capabilities)
+          ? capabilities.filter((c): c is string => typeof c === 'string')
+          : undefined,
+      };
+    } catch (error) {
+      // A bad token is a rejection. A key set that cannot be fetched (network error, timeout, non-200
+      // or unparseable response, malformed key set) is an error the tenant sees.
+      if (error instanceof errors.JOSEError && !KEY_SET_FAILURES.has(error.code)) return null;
+      throw error;
+    }
+  }
+}
+
+/**
+ * The `jose` error codes for a key set that could not be fetched or used: `ERR_JOSE_GENERIC` is a
+ * non-200 or unparseable JWKS response. Network errors are not `JOSEError`s, so they throw as well.
+ */
+const KEY_SET_FAILURES = new Set<string>([
+  errors.JOSEError.code,
+  errors.JWKSTimeout.code,
+  errors.JWKSInvalid.code,
+]);

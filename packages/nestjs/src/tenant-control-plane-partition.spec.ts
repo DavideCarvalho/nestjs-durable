@@ -46,14 +46,15 @@ function fakeRunRedisWorker() {
  * same suffixed tokens — otherwise the node dispatches into queues it is itself not listening on.
  */
 describe("control-plane with a tenant: the co-located worker serves the tenant's partition", () => {
-  it("{ role: 'control-plane', tenant } + connection subscribes `@<tenant>`, not the bare token", async () => {
+  it("'control-plane' with a partition + connection subscribes `@<tenant>`, not the bare token", async () => {
     const runner = fakeRunRedisWorker();
     const store = new InMemoryStateStore();
     const transport = new WorkflowTaskTransport();
     const moduleRef = await Test.createTestingModule({
       imports: [
         DurableModule.forRoot({
-          topology: { role: 'control-plane', tenant: 'davi-local' },
+          topology: 'control-plane',
+          partition: 'davi-local',
           store,
           transport,
           connection: 'redis://x',
@@ -80,7 +81,7 @@ describe("control-plane with a tenant: the co-located worker serves the tenant's
     const moduleRef = await Test.createTestingModule({
       imports: [
         DurableModule.forRoot({
-          topology: { role: 'control-plane' },
+          topology: 'control-plane',
           store,
           transport,
           connection: 'redis://x',

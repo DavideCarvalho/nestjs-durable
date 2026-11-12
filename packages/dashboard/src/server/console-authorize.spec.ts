@@ -480,11 +480,13 @@ describe('the console guard over HTTP', () => {
     ).rejects.toThrow('needs AuthorizationModule.forRoot() from @nestjs/authorization');
   });
 
-  it('covers the run stream (SSE), actions and the webhook route', async () => {
+  it('covers the run stream (SSE) and actions, but not the webhook route', async () => {
     const server = await boot(DurableDashboardModule.forRoot({ authorize: () => false }));
     expect((await request(server).get('/durable/api/runs/r1/stream')).status).toBe(403);
     expect((await request(server).post('/durable/api/runs/r1/retry')).status).toBe(403);
-    expect((await request(server).post('/durable/api/webhooks/t1').send({})).status).toBe(403);
+    // The token is the webhook's secret, so the console gate lets it through (it then fails here
+    // for another reason: this test app has no control plane).
+    expect((await request(server).post('/durable/api/webhooks/t1').send({})).status).not.toBe(403);
   });
 
   it('authorizeByToken: header only, `?token=` ignored', async () => {
