@@ -795,6 +795,8 @@ export class TypeOrmStateStore implements StateStore {
         named.length ? { origins: named } : {},
       );
     }
+    // The customer (tenancy matching rule): `null` = runs with no tenant.
+    applyTenantWhere(qb, 'r', query);
     if (query.status) qb.andWhere('r.status = :status', { status: query.status });
     if (query.statuses)
       qb.andWhere(
@@ -947,6 +949,8 @@ export class TypeOrmStateStore implements StateStore {
     if ('tags' in patch) set.tags = (patch.tags ?? null) as never;
     if (patch.spec !== undefined) set.spec = patch.spec as never;
     if (patch.state !== undefined) set.state = patch.state as never;
+    if ('tenantId' in patch) set.tenantId = patch.tenantId ?? null;
+    if ('tenantKind' in patch) set.tenantKind = patch.tenantKind ?? null;
     if (patch.updatedAt !== undefined) set.updatedAt = patch.updatedAt;
     if (!Object.keys(set).length) return (await this.getSchedule(id)) !== null;
     const qb = this.schedules().createQueryBuilder().update().set(set).where({ id });
@@ -969,6 +973,7 @@ export class TypeOrmStateStore implements StateStore {
       qb.andWhere('s.workflow = :workflow', { workflow: query.workflow });
     if (query.paused !== undefined) qb.andWhere('s.paused = :paused', { paused: query.paused });
     if (query.tag !== undefined) qb.andWhere('s.tags LIKE :tag', { tag: `%"${query.tag}"%` });
+    applyTenantWhere(qb, 's', query);
     if (query.dueBy !== undefined)
       qb.andWhere('s.paused = :notPaused AND s.nextFireAt <= :dueBy', {
         notPaused: false,
@@ -1411,6 +1416,8 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
     namespace: run.namespace || 'default', // '' is the default pool too
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
+    tenantId: run.tenantId ?? null,
+    tenantKind: run.tenantKind ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -1439,6 +1446,9 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     namespace: e.namespace,
     // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
     origin: e.origin ?? undefined,
+    // NULL = no tenant; left off entirely so a tenancy-off run reads back unchanged.
+    ...(e.tenantId != null ? { tenantId: e.tenantId } : {}),
+    ...(e.tenantKind != null ? { tenantKind: e.tenantKind } : {}),
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
@@ -1489,6 +1499,30 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
   };
 }
 
+/**
+ * `tenantId` / `tenantIds` on `alias.tenantId`; `null` = no tenant. `IN (NULL)` is never true, so the
+ * no-tenant bucket is its own ORed `IS NULL` branch, as for `origins`. An empty set matches nothing.
+ */
+function applyTenantWhere(
+  qb: { andWhere(where: string, params?: Record<string, unknown>): unknown },
+  alias: string,
+  query: { tenantId?: string | null | undefined; tenantIds?: Array<string | null> | undefined },
+): void {
+  if (query.tenantId === null) qb.andWhere(`${alias}.tenantId IS NULL`);
+  else if (query.tenantId !== undefined)
+    qb.andWhere(`${alias}.tenantId = :tenantId`, { tenantId: query.tenantId });
+  if (query.tenantIds) {
+    const named = query.tenantIds.filter((t): t is string => t !== null);
+    const branches: string[] = [];
+    if (named.length) branches.push(`${alias}.tenantId IN (:...tenantIds)`);
+    if (query.tenantIds.some((t) => t === null)) branches.push(`${alias}.tenantId IS NULL`);
+    qb.andWhere(
+      branches.length ? `(${branches.join(' OR ')})` : '1 = 0',
+      named.length ? { tenantIds: named } : {},
+    );
+  }
+}
+
 function toScheduleEntity(r: ScheduleRecord): ScheduleEntity {
   const e = new ScheduleEntity();
   e.id = r.id;
@@ -1499,6 +1533,8 @@ function toScheduleEntity(r: ScheduleRecord): ScheduleEntity {
   e.tags = r.tags ?? null;
   e.spec = r.spec;
   e.state = r.state;
+  e.tenantId = r.tenantId ?? null;
+  e.tenantKind = r.tenantKind ?? null;
   e.createdAt = r.createdAt;
   e.updatedAt = r.updatedAt;
   return e;
@@ -1515,6 +1551,8 @@ function fromScheduleEntity(e: ScheduleEntity): ScheduleRecord {
     ...(e.tags ? { tags: e.tags } : {}),
     spec: e.spec ?? {},
     state: e.state ?? {},
+    ...(e.tenantId != null ? { tenantId: e.tenantId } : {}),
+    ...(e.tenantKind != null ? { tenantKind: e.tenantKind } : {}),
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
@@ -1547,6 +1585,8 @@ function runUpdateSet(patch: Partial<WorkflowRun>): Record<string, unknown> {
   // isolation predicate, and a NULL there would match no worker's namespace at all.
   if ('namespace' in patch) update.namespace = patch.namespace || 'default';
   if ('origin' in patch) update.origin = patch.origin ?? null;
+  if ('tenantId' in patch) update.tenantId = patch.tenantId ?? null;
+  if ('tenantKind' in patch) update.tenantKind = patch.tenantKind ?? null;
   if ('createdAt' in patch) update.createdAt = patch.createdAt;
   if ('updatedAt' in patch) update.updatedAt = patch.updatedAt;
   return update;

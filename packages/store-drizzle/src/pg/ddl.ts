@@ -39,6 +39,8 @@ export const DURABLE_PG_DDL: readonly string[] = [
   "priority" integer,
   "namespace" text DEFAULT 'default' NOT NULL,
   "origin" text,
+  "tenant_id" text,
+  "tenant_kind" text,
   "created_at" timestamp with time zone NOT NULL,
   "updated_at" timestamp with time zone NOT NULL
 )`,
@@ -101,9 +103,16 @@ export const DURABLE_PG_DDL: readonly string[] = [
   "tags" jsonb,
   "spec" jsonb NOT NULL,
   "state" jsonb NOT NULL,
+  "tenant_id" text,
+  "tenant_kind" text,
   "created_at" timestamp with time zone NOT NULL,
   "updated_at" timestamp with time zone NOT NULL
 )`,
+  // Tenancy columns (the customer a run / schedule belongs to): added in place on an existing database.
+  `ALTER TABLE "durable_workflow_runs" ADD COLUMN IF NOT EXISTS "tenant_id" text`,
+  `ALTER TABLE "durable_workflow_runs" ADD COLUMN IF NOT EXISTS "tenant_kind" text`,
+  `ALTER TABLE "durable_schedules" ADD COLUMN IF NOT EXISTS "tenant_id" text`,
+  `ALTER TABLE "durable_schedules" ADD COLUMN IF NOT EXISTS "tenant_kind" text`,
   `CREATE INDEX IF NOT EXISTS "durable_runs_status_idx" ON "durable_workflow_runs" USING btree ("status","wake_at")`,
   `CREATE INDEX IF NOT EXISTS "durable_runs_workflow_status_idx" ON "durable_workflow_runs" USING btree ("workflow","status")`,
   `CREATE INDEX IF NOT EXISTS "durable_workflow_runs_namespace_status_idx" ON "durable_workflow_runs" USING btree ("namespace","status","created_at")`,
@@ -116,6 +125,8 @@ export const DURABLE_PG_DDL: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS "durable_buffered_signals_token_idx" ON "durable_buffered_signals" USING btree ("token","id")`,
   `CREATE INDEX IF NOT EXISTS "durable_buffered_events_name_published_at_idx" ON "durable_buffered_events" USING btree ("name","published_at")`,
   `CREATE INDEX IF NOT EXISTS "durable_schedules_due_idx" ON "durable_schedules" USING btree ("paused","next_fire_at")`,
+  `CREATE INDEX IF NOT EXISTS "durable_workflow_runs_tenant_idx" ON "durable_workflow_runs" USING btree ("tenant_id","created_at")`,
+  `CREATE INDEX IF NOT EXISTS "durable_schedules_tenant_idx" ON "durable_schedules" USING btree ("tenant_id")`,
   `CREATE INDEX IF NOT EXISTS "durable_signal_ids_expires_at_idx" ON "durable_signal_ids" USING btree ("expires_at")`,
 ];
 

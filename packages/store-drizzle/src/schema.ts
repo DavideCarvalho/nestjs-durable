@@ -66,10 +66,24 @@ export const workflowRuns = sqliteTable(
     // declared here, so until that runs, EVERY run query fails with "no such column: origin" — the same
     // step `priority` needed before it.
     origin: text('origin'),
+    // The CUSTOMER (organization, clinic…) the run belongs to — tenancy, not the worker-pool
+    // `namespace`. Nullable: NULL = no tenant, which is every run while tenancy is off.
+    //
+    // MIGRATION (you own this adapter's migrations; until it runs, every run query fails with
+    // "no such column: tenant_id"):
+    //
+    //     ALTER TABLE durable_workflow_runs ADD COLUMN tenant_id TEXT;
+    //     ALTER TABLE durable_workflow_runs ADD COLUMN tenant_kind TEXT;
+    //     CREATE INDEX IF NOT EXISTS durable_workflow_runs_tenant_idx
+    //       ON durable_workflow_runs (tenant_id, created_at);
+    tenantId: text('tenant_id'),
+    tenantKind: text('tenant_kind'),
     createdAt: integer('created_at').notNull(),
     updatedAt: integer('updated_at').notNull(),
   },
   (t) => [
+    // App-facing reads with tenancy on filter by tenant and page newest first.
+    index('durable_workflow_runs_tenant_idx').on(t.tenantId, t.createdAt),
     // `namespace` sits on EVERY poll tick's predicate — the pending (FIFO by `created_at`),
     // incomplete and due-timer scans all filter by it and then by `status` — unlike `origin`, which
     // only the dashboard's listing touches. Mirrors the MikroORM adapter's
@@ -211,11 +225,20 @@ export const durableSchedules = sqliteTable(
     tags: text('tags', { mode: 'json' }).$type<string[]>(),
     spec: text('spec', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
     state: text('state', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
+    // The customer the schedule (and every run it starts) belongs to. MIGRATION:
+    //     ALTER TABLE durable_schedules ADD COLUMN tenant_id TEXT;
+    //     ALTER TABLE durable_schedules ADD COLUMN tenant_kind TEXT;
+    //     CREATE INDEX IF NOT EXISTS durable_schedules_tenant_idx ON durable_schedules (tenant_id);
+    tenantId: text('tenant_id'),
+    tenantKind: text('tenant_kind'),
     createdAt: integer('created_at').notNull(),
     updatedAt: integer('updated_at').notNull(),
   },
   // The poll's "due by T" scan: `paused = 0 AND next_fire_at <= T ORDER BY next_fire_at`.
-  (t) => [index('durable_schedules_due_idx').on(t.paused, t.nextFireAt)],
+  (t) => [
+    index('durable_schedules_due_idx').on(t.paused, t.nextFireAt),
+    index('durable_schedules_tenant_idx').on(t.tenantId),
+  ],
 );
 
 export const durableSchema = {

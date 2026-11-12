@@ -20,6 +20,7 @@ import {
   type Transport,
   WorkflowEngine,
   type WorkflowRef,
+  useDurableExecution,
 } from '@dudousxd/nestjs-durable-core';
 import {
   type DynamicModule,
@@ -44,6 +45,14 @@ import { isDrivingOperator } from './role';
 import { RunRequestResponder, type RunRequestTransport } from './run-request-responder';
 import { StoreRunGateway } from './store-run-gateway';
 import { SweepLeases } from './sweep-leases';
+import {
+  type DurableTenancyOption,
+  type TenantRuntime,
+  buildEngineTenancy,
+  isTenantRuntime,
+  readTenancy,
+  stepTenantWrapper,
+} from './tenancy';
 import {
   type TenantTokenOption,
   type TenantVerifierOption,
@@ -81,9 +90,21 @@ function carrierFromAccessor(accessor: ContextAccessor): Record<string, unknown>
   if (traceId !== undefined) carrier.traceId = traceId;
   const tenantId = accessor.tenantId();
   if (tenantId !== undefined) carrier.tenantId = tenantId;
+  // The full tenant (with its kind), so a worker restores `{ id, kind }` and not `kind: 'unknown'`.
+  // A `legacy` one (only a plain `tenantId` was set) adds nothing the `tenantId` above doesn't carry.
+  const tenant = accessor.tenant?.();
+  if (tenant !== undefined && tenant.source !== 'legacy') carrier.tenant = tenant;
   const userRef = accessor.userRef();
   if (userRef !== undefined) carrier.userRef = userRef;
   return carrier;
+}
+
+/** True when nestjs-context publishes its accessor on the global slot (even with no DI binding). */
+function contextSlotPresent(): boolean {
+  const slot = (globalThis as unknown as Record<symbol, { current?: unknown } | undefined>)[
+    Symbol.for('@dudousxd/nestjs-diagnostics:accessor')
+  ];
+  return !!slot?.current;
 }
 
 /**
@@ -95,6 +116,8 @@ function carrierFromAccessor(accessor: ContextAccessor): Record<string, unknown>
 interface ContextRuntime {
   /** Re-hydrate a context from an opaque carrier and run `fn` inside its ALS scope. */
   deserialize<T>(carrier: Record<string, unknown>, fn: () => T): T;
+  /** Run `fn` with a tenant (nestjs-context ≥ 1.2). Absent on an older context: tenancy stays off. */
+  withTenant?: TenantRuntime['withTenant'];
 }
 
 function isContextRuntime(x: unknown): x is ContextRuntime {
@@ -459,6 +482,17 @@ export interface DurableModuleSharedOptions {
    * authorization boundary. Operator only.
    */
   context?: () => Record<string, unknown> | undefined;
+  /**
+   * Tenancy: scope runs by the CUSTOMER they belong to (`@dudousxd/nestjs-context`'s tenant), not by
+   * the worker-pool {@link namespace}. With it on, `start` stamps the request's tenant on the run
+   * (an explicit `StartOptions.tenantId` wins), children, `continueAsNew` and schedules inherit it,
+   * every turn runs with it restored as the context tenant, and app-facing reads and control calls
+   * (`getRun`, `signal`, `cancel`, retry, the dashboard) only see the caller's tenant's runs.
+   *
+   * `'inherit'` (default) follows `ContextModule.forRoot({ tenancy: { enabled } })`, which is off by
+   * default; `false` keeps durable out of tenancy. Without nestjs-context ≥ 1.2, tenancy is off.
+   */
+  tenancy?: DurableTenancyOption;
   /** Attempts for each saga compensation when a run fails. Default 1 (no retry). Idempotent undos.
    *  Operator only. */
   compensationRetries?: number;
@@ -849,6 +883,37 @@ class RunGatewayBootstrap implements OnApplicationBootstrap, OnModuleDestroy {
   }
 }
 
+/**
+ * Restores the tenant a dispatched step task carries around its handler, in whichever process and on
+ * whichever transport runs it (an operator's in-process consumer or a thin worker). Registered only
+ * when durable's tenancy is on at boot, so an app without tenancy keeps an empty execution-hook
+ * registry (zero cost).
+ */
+@Injectable()
+class DurableTenancyBridge implements OnApplicationBootstrap, OnModuleDestroy {
+  private unregister?: () => void;
+
+  constructor(
+    @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
+    private readonly moduleRef: ModuleRef,
+  ) {}
+
+  async onApplicationBootstrap(): Promise<void> {
+    if (this.options.tenancy === false) return;
+    const accessor = resolveAccessor(this.moduleRef);
+    if (!readTenancy(this.options.tenancy, accessor).enabled) return;
+    const runtime = await resolveContextRuntime();
+    if (!isTenantRuntime(runtime)) return;
+    this.unregister = useDurableExecution(
+      stepTenantWrapper(this.options.tenancy, accessor, runtime),
+    );
+  }
+
+  onModuleDestroy(): void {
+    this.unregister?.();
+  }
+}
+
 @Module({})
 export class DurableModule {
   static forRoot(options: DurableModuleOptions): DynamicModule {
@@ -948,13 +1013,14 @@ export class DurableModule {
             const accessor = resolveAccessor(moduleRef);
             const context =
               options.context ?? (accessor ? () => carrierFromAccessor(accessor) : undefined);
+            const runtimeNeeded = accessor !== undefined || contextSlotPresent();
             // Consume side: when nestjs-context is present (an accessor is bound), re-hydrate the
             // originating context AROUND each local step body, so a `@Step` reader sees the
             // tenant/user/trace ids ambiently via nestjs-context's ALS — no consumer wrapping needed.
             // The runtime `Context` is a module-level singleton (not the accessor token), resolved
             // ONCE here via a guarded dynamic import (optional peer — failure leaves the default
             // passthrough). Best-effort: an empty/undefined carrier just runs the handler normally.
-            const runtime = accessor ? await resolveContextRuntime() : undefined;
+            const runtime = runtimeNeeded ? await resolveContextRuntime() : undefined;
             const rehydrate =
               runtime &&
               (<T>(carrier: Record<string, unknown> | undefined, fn: () => T): T =>
@@ -996,7 +1062,13 @@ export class DurableModule {
               webhookUrl: options.webhookUrl,
               traceparent: options.traceparent,
               context,
-              rehydrate: rehydrate || undefined,
+              rehydrate: (accessor && rehydrate) || undefined,
+              // The run's tenant, restored around every turn (see `tenancy` above).
+              tenancy: buildEngineTenancy(
+                options.tenancy,
+                accessor,
+                isTenantRuntime(runtime) ? runtime : undefined,
+              ),
               compensationRetries: options.compensationRetries,
               verifyTenant: auth.verifyTenant,
               // A non-driving (dashboard/API) operator must not run workflows: enqueue-only, leaving
@@ -1060,6 +1132,7 @@ export class DurableModule {
           inject: [DURABLE_OPTIONS_CANONICAL, STATE_STORE_CANONICAL, WorkflowEngine, TENANT_AUTH],
         },
         RunGatewayBootstrap,
+        DurableTenancyBridge,
         // Co-located in-app worker (uniform dispatch): inert unless BOTH `store` and `connection` are
         // set — see `in-app-worker.ts`.
         ...inAppWorkerProviders(),

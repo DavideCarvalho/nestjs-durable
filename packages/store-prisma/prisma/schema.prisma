@@ -43,6 +43,14 @@ model DurableWorkflowRun {
   // column existed, so it stays NULL and reads back as `undefined` = "unknown". A real-looking
   // default would be indistinguishable from a genuine registration in the dashboard facet.
   origin           String? @map("origin")
+  // The CUSTOMER (tenancy) this run belongs to — not the worker-pool `namespace`. Nullable, no
+  // default: NULL = no tenant, which is every run while tenancy is off. Existing deployment:
+  //   ALTER TABLE durable_workflow_runs ADD COLUMN tenant_id TEXT;
+  //   ALTER TABLE durable_workflow_runs ADD COLUMN tenant_kind TEXT;
+  //   CREATE INDEX durable_workflow_runs_tenant_idx ON durable_workflow_runs (tenant_id, created_at);
+  // (Prisma Migrate generates exactly this from the fields; use VARCHAR(191) on MySQL.)
+  tenantId         String? @map("tenant_id")
+  tenantKind       String? @map("tenant_kind")
   createdAt       DateTime @map("created_at")
   updatedAt       DateTime @map("updated_at")
 
@@ -61,6 +69,8 @@ model DurableWorkflowRun {
   // swap from dropping and rebuilding it. The two indexes above already agree by accident — Prisma's
   // derived names happen to be the ones MikroORM declares.
   @@index([namespace, status, createdAt], map: "durable_workflow_runs_namespace_status_idx")
+  // App-facing reads with tenancy on: `tenant_id = ? ORDER BY created_at DESC`.
+  @@index([tenantId, createdAt], map: "durable_workflow_runs_tenant_idx")
   @@map("durable_workflow_runs")
 }
 
@@ -167,10 +177,14 @@ model DurableSchedule {
   tags       Json?
   spec       Json
   state      Json
+  // The customer the schedule (and every run it starts) belongs to. NULL = none.
+  tenantId   String?  @map("tenant_id")
+  tenantKind String?  @map("tenant_kind")
   createdAt  DateTime @map("created_at")
   updatedAt  DateTime @map("updated_at")
 
   // The poll's "due by T" scan: `paused = false AND next_fire_at <= T ORDER BY next_fire_at`.
   @@index([paused, nextFireAt], map: "durable_schedules_due_idx")
+  @@index([tenantId], map: "durable_schedules_tenant_idx")
   @@map("durable_schedules")
 }

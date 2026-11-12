@@ -67,6 +67,8 @@ export class WorkflowRunEntity {
   priority?: number | null;
   namespace!: string;
   origin?: string | null;
+  tenantId?: string | null;
+  tenantKind?: string | null;
   createdAt!: Date;
   updatedAt!: Date;
 }
@@ -161,6 +163,8 @@ export class ScheduleEntity {
   tags?: string[] | null;
   spec!: Record<string, unknown>;
   state!: Record<string, unknown>;
+  tenantId?: string | null;
+  tenantKind?: string | null;
   createdAt!: Date;
   updatedAt!: Date;
 }
@@ -220,6 +224,8 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
         name: 'durable_workflow_runs_namespace_status_idx',
         properties: ['namespace', 'status', 'createdAt'],
       },
+      // App-facing reads with tenancy on: `tenant_id = ? ORDER BY created_at DESC`.
+      { name: 'durable_workflow_runs_tenant_idx', properties: ['tenantId', 'createdAt'] },
     ],
     properties: {
       id: { type: 'string', primary: true, fieldName: col('id') },
@@ -275,6 +281,11 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       // deployment ever makes origin-filtered listings hot, add the composite index in your own
       // migration rather than here.
       origin: { type: 'string', nullable: true, fieldName: col('origin') },
+      // The CUSTOMER (tenancy) the run belongs to — not the worker-pool `namespace`. Nullable, no
+      // default: NULL = no tenant, which is every run while tenancy is off. Added in place by the
+      // boot-time schema heal.
+      tenantId: { type: 'string', nullable: true, fieldName: col('tenantId') },
+      tenantKind: { type: 'string', nullable: true, fieldName: col('tenantKind') },
       createdAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('createdAt') },
       updatedAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('updatedAt') },
     },
@@ -415,7 +426,10 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     tableName: 'durable_schedules',
     repository: () => ScheduleRepository,
     // The poll's "due by T" scan: `paused = false AND next_fire_at <= T ORDER BY next_fire_at`.
-    indexes: [{ name: 'durable_schedules_due_idx', properties: ['paused', 'nextFireAt'] }],
+    indexes: [
+      { name: 'durable_schedules_due_idx', properties: ['paused', 'nextFireAt'] },
+      { name: 'durable_schedules_tenant_idx', properties: ['tenantId'] },
+    ],
     properties: {
       id: { type: 'string', primary: true, fieldName: col('id') },
       namespace: { type: 'string', default: 'default', fieldName: col('namespace') },
@@ -425,6 +439,9 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       tags: { type: 'json', nullable: true, fieldName: col('tags') },
       spec: { type: 'json', fieldName: col('spec') },
       state: { type: 'json', fieldName: col('state') },
+      // The customer the schedule (and every run it starts) belongs to. NULL = none.
+      tenantId: { type: 'string', nullable: true, fieldName: col('tenantId') },
+      tenantKind: { type: 'string', nullable: true, fieldName: col('tenantKind') },
       createdAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('createdAt') },
       updatedAt: { type: 'Date', length: DATETIME_PRECISION, fieldName: col('updatedAt') },
     },

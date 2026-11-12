@@ -34,12 +34,15 @@ model DurableWorkflowRun {
   tags            Json?
   searchAttributes Json?    @map("search_attributes")
   priority        Int?
+  tenantId        String?  @map("tenant_id")
+  tenantKind      String?  @map("tenant_kind")
   createdAt       DateTime @map("created_at")
   updatedAt       DateTime @map("updated_at")
   attributes      DurableRunAttribute[]
 
   @@index([status, wakeAt])
   @@index([workflow, status])
+  @@index([tenantId, createdAt], map: "durable_workflow_runs_tenant_idx")
   @@map("durable_workflow_runs")
 }
 

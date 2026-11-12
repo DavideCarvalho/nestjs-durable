@@ -10,7 +10,8 @@
  * Kept byte-aligned with nestjs-context's `ContextAccessor` (and the identical
  * mirror in `@dudousxd/nestjs-authz`): `traceId()` / `tenantId()` are REQUIRED
  * (the real accessor always provides them) and `get()` is included, so the
- * structural match stays exact when DurableModule auto-feeds the carrier.
+ * structural match stays exact when DurableModule auto-feeds the carrier. The tenancy
+ * members (`tenant`/`tenancy`/`tenantFilter`, nestjs-context ≥ 1.2) are optional.
  */
 export interface UserRef {
   type: string;
@@ -29,4 +30,29 @@ export interface ContextAccessor {
   userRef(): UserRef | undefined;
   /** The raw context store for the current request, or `undefined`. */
   get(): ContextStore | undefined;
+  /**
+   * The active tenant (the customer the request's data belongs to). Optional: an older context, or
+   * an app's own accessor, may not have it; durable then treats tenancy as off.
+   */
+  tenant?(): TenantRef | undefined;
+  /** The context's `tenancy` switch: `{ enabled, kinds? }`. Optional, as above. */
+  tenancy?(): { enabled: boolean; kinds?: string[] };
+  /** How a lib must scope data right now. Optional, as above. */
+  tenantFilter?(options?: { kinds?: string[] }): TenantFilter;
 }
+
+/** A tenant as the context reports it. Structural mirror of nestjs-context's `TenantRef`. */
+export interface TenantRef {
+  id: string;
+  kind: string;
+  source: string;
+  slug?: string;
+  role?: string;
+}
+
+/** How a lib must scope data right now. Structural mirror of nestjs-context's `TenantFilter`. */
+export type TenantFilter =
+  | { mode: 'system' }
+  | { mode: 'all' }
+  | { mode: 'tenantless' }
+  | { mode: 'tenant'; tenant: TenantRef };

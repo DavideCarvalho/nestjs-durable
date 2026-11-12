@@ -13,6 +13,13 @@ import type {
 import { TERMINAL_RUN_STATUSES } from './interfaces';
 import { nextRRuleFireMs, parseRRule, prevRRuleFireMs } from './rrule';
 import { nextCronFireMs, prevCronFireMs } from './scheduler';
+import {
+  type RunTenant,
+  type TenantFilter,
+  inheritTenant,
+  scopeTenantQuery,
+  tenantVisible,
+} from './tenancy';
 import { type WorkflowRef, workflowName } from './workflow-ref';
 
 /**
@@ -74,6 +81,14 @@ export interface ScheduleOptions {
    * the schedule moves on to its next window.
    */
   concurrency?: ConcurrencyQuota | undefined;
+  /**
+   * The customer the schedule belongs to; every run it starts inherits it. An explicit value wins
+   * (`null` = none); omit it and the schedule takes the context tenant when tenancy is on. On
+   * `upsert`, omit to keep the schedule's current tenant.
+   */
+  tenantId?: string | null | undefined;
+  /** The kind of {@link tenantId}. Only read with an explicit `tenantId`. */
+  tenantKind?: string | undefined;
 }
 
 /** A schedule as `engine.schedules.get/list` describe it. */
@@ -104,6 +119,9 @@ export interface ScheduleDescription {
   fires: number;
   /** The last start failure (e.g. a concurrency limit), cleared by the next successful start. */
   lastError?: string | undefined;
+  /** The customer the schedule and its runs belong to, when it has one. */
+  tenantId?: string | undefined;
+  tenantKind?: string | undefined;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -160,6 +178,10 @@ export interface ScheduleHost {
   getRun(runId: string): Promise<WorkflowRun | null>;
   /** True once the engine has begun shutting down; `tick` fires nothing more after that. */
   isDraining?(): boolean;
+  /** The context tenant to stamp on a schedule created now (tenancy on), else undefined. */
+  tenant?(): RunTenant | undefined;
+  /** The tenancy matching filter for an app-facing call made now. Absent = sees everything. */
+  tenantFilter?(): TenantFilter;
 }
 
 /** Engine-level knobs for the client. */
@@ -237,6 +259,16 @@ export class ScheduleClient {
     };
   }
 
+  private filter(): TenantFilter {
+    return this.host.tenantFilter?.() ?? { mode: 'system' };
+  }
+
+  /** The schedule `id` if it exists and the caller may see it (tenancy), else null. */
+  private async visible(id: string): Promise<ScheduleRecord | null> {
+    const record = await this.requireStore().getSchedule(id);
+    return record && tenantVisible(record, this.filter()) ? record : null;
+  }
+
   /** Create a schedule. Throws {@link ScheduleAlreadyExistsError} if the id is taken. */
   async create(opts: ScheduleOptions): Promise<ScheduleDescription> {
     const store = this.requireStore();
@@ -251,22 +283,30 @@ export class ScheduleClient {
    */
   async upsert(opts: ScheduleOptions): Promise<ScheduleDescription> {
     const store = this.requireStore();
-    return this.write(opts, await store.getSchedule(opts.id));
+    const existing = await store.getSchedule(opts.id);
+    // Another tenant's schedule is never replaced: its id is taken, and the caller can't see it.
+    if (existing && !tenantVisible(existing, this.filter())) {
+      throw new ScheduleAlreadyExistsError(opts.id);
+    }
+    return this.write(opts, existing);
   }
 
-  /** The schedule `id`, or null. */
+  /** The schedule `id`, or null (also null for another tenant's schedule). */
   async get(id: string): Promise<ScheduleDescription | null> {
-    const record = await this.requireStore().getSchedule(id);
+    const record = await this.visible(id);
     return record ? describe(record) : null;
   }
 
-  /** Schedules matching `query`, soonest-due first. */
+  /** Schedules matching `query` (and visible to the caller's tenant), soonest-due first. */
   async list(query: ScheduleListQuery = {}): Promise<ScheduleDescription[]> {
-    return (await this.requireStore().listSchedules(query)).map(describe);
+    return (await this.requireStore().listSchedules(scopeTenantQuery(query, this.filter()))).map(
+      describe,
+    );
   }
 
   /** Delete the schedule. Runs it already started are left alone. Returns whether it existed. */
-  delete(id: string): Promise<boolean> {
+  async delete(id: string): Promise<boolean> {
+    if (!(await this.visible(id))) return false;
     return this.requireStore().deleteSchedule(id);
   }
 
@@ -408,9 +448,31 @@ export class ScheduleClient {
   }
 
   private async mustGet(id: string): Promise<ScheduleRecord> {
-    const record = await this.requireStore().getSchedule(id);
+    const record = await this.visible(id);
     if (!record) throw new ScheduleNotFoundError(id);
     return record;
+  }
+
+  /** Explicit `opts.tenantId` → the existing schedule's tenant (upsert) → the context tenant → none. */
+  private scheduleTenant(
+    opts: ScheduleOptions,
+    existing: ScheduleRecord | null,
+  ): Pick<ScheduleRecord, 'tenantId' | 'tenantKind'> {
+    let tenant: RunTenant | undefined;
+    if (opts.tenantId !== undefined) {
+      tenant = opts.tenantId === null ? undefined : { id: opts.tenantId, kind: opts.tenantKind };
+    } else if (existing) {
+      tenant =
+        existing.tenantId == null
+          ? undefined
+          : { id: existing.tenantId, kind: existing.tenantKind ?? undefined };
+    } else {
+      tenant = this.host.tenant?.();
+    }
+    if (!tenant) return {};
+    return tenant.kind !== undefined
+      ? { tenantId: tenant.id, tenantKind: tenant.kind }
+      : { tenantId: tenant.id };
   }
 
   private async write(
@@ -435,6 +497,7 @@ export class ScheduleClient {
         ...((existing?.state as StateDoc | undefined) ?? {}),
         window,
       }) as Record<string, unknown>,
+      ...this.scheduleTenant(opts, existing),
       createdAt: existing?.createdAt ?? new Date(now),
       updatedAt: new Date(now),
     };
@@ -518,6 +581,9 @@ function startOptions(record: ScheduleRecord): StartOptions {
     searchAttributes: spec.searchAttributes,
     priority: spec.priority,
     concurrency: spec.concurrency,
+    // Every fire belongs to the schedule's customer (or explicitly to none), never to whichever
+    // poller or request happened to fire it.
+    ...inheritTenant(record),
   }) as StartOptions;
 }
 
@@ -547,6 +613,8 @@ function describe(record: ScheduleRecord): ScheduleDescription {
     lastRunId: state.lastRunId,
     fires: state.fires ?? 0,
     lastError: state.lastError,
+    tenantId: record.tenantId ?? undefined,
+    tenantKind: record.tenantKind ?? undefined,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   }) as ScheduleDescription;

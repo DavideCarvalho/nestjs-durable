@@ -42,6 +42,7 @@ import {
   singletonAdmissionTags,
 } from '@dudousxd/nestjs-durable-core';
 import {
+  type Column,
   type SQL,
   type Table,
   and,
@@ -124,6 +125,18 @@ export interface DrizzlePgStateStoreOptions {
 function anyOf(conditions: (SQL | undefined)[]): SQL {
   const present = conditions.filter((c): c is SQL => c !== undefined);
   return present.length ? (or(...present) as SQL) : sql`1 = 0`;
+}
+
+/** `tenantId` / `tenantIds` predicates on a `tenant_id` column; `null` = no tenant (`IS NULL`). */
+function tenantFilters(
+  column: Column,
+  query: { tenantId?: string | null | undefined; tenantIds?: Array<string | null> | undefined },
+): (SQL | undefined)[] {
+  const one = (id: string | null) => (id === null ? isNull(column) : eq(column, id));
+  return [
+    query.tenantId !== undefined ? one(query.tenantId) : undefined,
+    query.tenantIds ? anyOf(query.tenantIds.map(one)) : undefined,
+  ];
 }
 
 /** `undefined` = no restriction (the operator view), never `namespace IS NULL`. The column is
@@ -910,6 +923,8 @@ export class DrizzlePgStateStore implements StateStore {
             ),
           )
         : undefined,
+      // The customer (tenancy matching rule): `null` = runs with no tenant.
+      ...tenantFilters(workflowRuns.tenantId, query),
       query.status ? eq(workflowRuns.status, query.status) : undefined,
       query.statuses
         ? query.statuses.length
@@ -1069,6 +1084,7 @@ export class DrizzlePgStateStore implements StateStore {
           query.tag !== undefined
             ? sql`${schedules.tags} @> ${JSON.stringify([query.tag])}::jsonb`
             : undefined,
+          ...tenantFilters(schedules.tenantId, query),
           query.dueBy !== undefined
             ? and(eq(schedules.paused, false), lte(schedules.nextFireAt, new Date(query.dueBy)))
             : undefined,
@@ -1816,6 +1832,8 @@ function toRunRow(run: WorkflowRun): RunInsert {
     priority: run.priority ?? null,
     namespace: run.namespace || DEFAULT_NAMESPACE, // '' is the default pool too
     origin: run.origin ?? null,
+    tenantId: run.tenantId ?? null,
+    tenantKind: run.tenantKind ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -1843,6 +1861,8 @@ function toRunPatch(patch: Partial<WorkflowRun>): Partial<RunInsert> {
   // Never cleared to NULL: an undefined namespace means the default one.
   if ('namespace' in patch) row.namespace = patch.namespace || DEFAULT_NAMESPACE;
   if ('origin' in patch) row.origin = patch.origin ?? null;
+  if ('tenantId' in patch) row.tenantId = patch.tenantId ?? null;
+  if ('tenantKind' in patch) row.tenantKind = patch.tenantKind ?? null;
   if (patch.createdAt != null) row.createdAt = patch.createdAt;
   if (patch.updatedAt != null) row.updatedAt = patch.updatedAt;
   return row;
@@ -1867,6 +1887,9 @@ function fromRunRow(row: RunRow): WorkflowRun {
     priority: row.priority ?? undefined,
     namespace: row.namespace || DEFAULT_NAMESPACE, // a legacy '' row reads back as the default pool
     origin: row.origin ?? undefined,
+    // NULL = no tenant; left off entirely so a tenancy-off run reads back unchanged.
+    ...(row.tenantId != null ? { tenantId: row.tenantId } : {}),
+    ...(row.tenantKind != null ? { tenantKind: row.tenantKind } : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -1929,6 +1952,8 @@ function toScheduleRow(r: ScheduleRecord): ScheduleRow {
     tags: r.tags ?? null,
     spec: r.spec,
     state: r.state,
+    tenantId: r.tenantId ?? null,
+    tenantKind: r.tenantKind ?? null,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
   };
@@ -1946,6 +1971,8 @@ function toSchedulePatch(
   if ('tags' in patch) set.tags = patch.tags ?? null;
   if (patch.spec !== undefined) set.spec = patch.spec;
   if (patch.state !== undefined) set.state = patch.state;
+  if ('tenantId' in patch) set.tenantId = patch.tenantId ?? null;
+  if ('tenantKind' in patch) set.tenantKind = patch.tenantKind ?? null;
   if (patch.updatedAt !== undefined) set.updatedAt = patch.updatedAt;
   return set;
 }
@@ -1960,6 +1987,8 @@ function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
     ...(row.tags ? { tags: row.tags } : {}),
     spec: row.spec ?? {},
     state: row.state ?? {},
+    ...(row.tenantId != null ? { tenantId: row.tenantId } : {}),
+    ...(row.tenantKind != null ? { tenantKind: row.tenantKind } : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

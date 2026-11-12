@@ -120,6 +120,15 @@ export interface WorkflowRun {
    * in-memory promise that only the dispatching instance held. Absent on non-remote / not-awaiting runs.
    */
   awaitingDecisionTaskId?: string | undefined;
+  /**
+   * The CUSTOMER this run belongs to (an organization, a clinic…), stamped at `start` from an
+   * explicit `StartOptions.tenantId`, else from the context tenant when tenancy is on, else none.
+   * Children, `continueAsNew` and schedule fires inherit it, and every turn runs with it restored as
+   * the context tenant. Not the worker-pool {@link namespace}. `null`/absent = no tenant.
+   */
+  tenantId?: string | null | undefined;
+  /** The kind of {@link tenantId} (`organization`, `user`, …), when the source said. */
+  tenantKind?: string | null | undefined;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -1017,6 +1026,10 @@ export interface ScheduleRecord {
   spec: Record<string, unknown>;
   /** The schedule's bookkeeping (last fire, last run id, last error…) — opaque to the store. */
   state: Record<string, unknown>;
+  /** The customer the schedule (and every run it starts) belongs to; `null`/absent = none. */
+  tenantId?: string | null | undefined;
+  /** The kind of {@link tenantId}. */
+  tenantKind?: string | null | undefined;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -1030,6 +1043,10 @@ export interface ScheduleQuery {
   paused?: boolean | undefined;
   /** Only DUE schedules: unpaused, `nextFireAt <= dueBy`. */
   dueBy?: number | undefined;
+  /** Only schedules of this tenant (`null` = schedules with no tenant). */
+  tenantId?: string | null | undefined;
+  /** Only schedules of ANY of these tenants (`null` = no tenant). Empty = matches nothing. */
+  tenantIds?: Array<string | null> | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
 }
@@ -1091,7 +1108,15 @@ export interface RetentionPolicy {
  */
 export type RunScope = Pick<
   RunQuery,
-  'workflow' | 'workflows' | 'tag' | 'tags' | 'namespace' | 'namespaces' | 'attributes'
+  | 'workflow'
+  | 'workflows'
+  | 'tag'
+  | 'tags'
+  | 'namespace'
+  | 'namespaces'
+  | 'attributes'
+  | 'tenantId'
+  | 'tenantIds'
 >;
 
 /** True when `scope` sets at least one predicate — a bulk delete refuses an empty (match-all) scope. */
@@ -1104,6 +1129,8 @@ export function isNonEmptyRunScope(scope: RunScope | undefined): boolean {
     scope.tags !== undefined ||
     scope.namespace !== undefined ||
     scope.namespaces !== undefined ||
+    scope.tenantId !== undefined ||
+    scope.tenantIds !== undefined ||
     (scope.attributes !== undefined && scope.attributes.length > 0)
   );
 }
@@ -1233,6 +1260,17 @@ export interface RunQuery {
    * single `origin`; empty = matches nothing.
    */
   origins?: Array<string | null> | undefined;
+  /**
+   * Restrict to runs of this tenant (exact match against {@link WorkflowRun.tenantId}); `null`
+   * selects runs with no tenant (`tenant_id IS NULL`). ANDed with the other predicates.
+   */
+  tenantId?: string | null | undefined;
+  /**
+   * Restrict to runs of ANY of these tenants; `null` is a member like any other (no tenant). ANDed
+   * with a concurrent single `tenantId`; empty = matches nothing. The tenancy matching rule narrows
+   * app-facing queries through this field.
+   */
+  tenantIds?: Array<string | null> | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
 }

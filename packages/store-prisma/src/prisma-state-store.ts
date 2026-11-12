@@ -75,6 +75,9 @@ interface RunRow {
   /** NOT NULL in the schema (defaulted to `'default'`), so every row carries a real namespace. */
   namespace: string;
   origin: string | null;
+  /** The customer (tenancy); NULL = none. */
+  tenantId: string | null;
+  tenantKind: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -161,6 +164,8 @@ interface ScheduleRow {
   tags: unknown;
   spec: unknown;
   state: unknown;
+  tenantId: string | null;
+  tenantKind: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -750,6 +755,9 @@ export class PrismaStateStore implements StateStore {
     // `null` is a member like any other in a set of origins — Prisma spells `origin IS NULL` as the
     // same equality — so one branch per value covers both the named ones and the unattributed bucket.
     if (query.origins) and.push(anyOf(query.origins.map((o) => ({ origin: o }))));
+    // The customer (tenancy matching rule): `null` = runs with no tenant, the same equality.
+    if (query.tenantId !== undefined) and.push({ tenantId: query.tenantId });
+    if (query.tenantIds) and.push(anyOf(query.tenantIds.map((t) => ({ tenantId: t }))));
     // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store). Combined with the
     // single-value `status` via AND when both are present, so the narrower set wins.
     if (query.status && query.statuses) {
@@ -859,6 +867,8 @@ export class PrismaStateStore implements StateStore {
     if ('tags' in patch) data.tags = jsonOrNull(patch.tags);
     if (patch.spec !== undefined) data.spec = patch.spec;
     if (patch.state !== undefined) data.state = patch.state;
+    if ('tenantId' in patch) data.tenantId = patch.tenantId ?? null;
+    if ('tenantKind' in patch) data.tenantKind = patch.tenantKind ?? null;
     if (patch.updatedAt !== undefined) data.updatedAt = patch.updatedAt;
     if (!Object.keys(data).length) return (await this.getSchedule(id)) !== null;
     const where: Record<string, unknown> = { id };
@@ -879,9 +889,13 @@ export class PrismaStateStore implements StateStore {
     if (query.workflow !== undefined) where.workflow = query.workflow;
     if (query.paused !== undefined) where.paused = query.paused;
     if (query.tag !== undefined) where.tags = { array_contains: query.tag };
+    const and: Record<string, unknown>[] = [];
+    if (query.tenantId !== undefined) and.push({ tenantId: query.tenantId });
+    if (query.tenantIds) and.push(anyOf(query.tenantIds.map((t) => ({ tenantId: t }))));
     if (query.dueBy !== undefined) {
-      where.AND = [{ paused: false }, { nextFireAt: { lte: BigInt(query.dueBy) } }];
+      and.push({ paused: false }, { nextFireAt: { lte: BigInt(query.dueBy) } });
     }
+    if (and.length) where.AND = and;
     const rows = await this.schedules().findMany({
       where,
       // Soonest-due first, never-firing (NULL) last, id as the stable tie-break.
@@ -1383,6 +1397,8 @@ function toRunData(run: WorkflowRun) {
     namespace: run.namespace || 'default', // '' is the default pool too
     // Absent origin stays SQL NULL — "unknown", never coerced into a real-looking library name.
     origin: run.origin ?? null,
+    tenantId: run.tenantId ?? null,
+    tenantKind: run.tenantKind ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -1417,6 +1433,8 @@ function toRunPatch(patch: Partial<WorkflowRun>) {
   // run between tenants.
   if ('namespace' in patch) data.namespace = patch.namespace || 'default';
   if ('origin' in patch) data.origin = patch.origin ?? null;
+  if ('tenantId' in patch) data.tenantId = patch.tenantId ?? null;
+  if ('tenantKind' in patch) data.tenantKind = patch.tenantKind ?? null;
   if (patch.createdAt != null) data.createdAt = patch.createdAt;
   if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;
   return data;
@@ -1448,6 +1466,9 @@ function fromRunRow(row: RunRow): WorkflowRun {
     namespace: row.namespace,
     // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
     origin: row.origin ?? undefined,
+    // NULL = no tenant; left off entirely so a tenancy-off run reads back unchanged.
+    ...(row.tenantId != null ? { tenantId: row.tenantId } : {}),
+    ...(row.tenantKind != null ? { tenantKind: row.tenantKind } : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -1817,6 +1838,8 @@ function toScheduleData(r: ScheduleRecord) {
     tags: jsonOrNull(r.tags),
     spec: r.spec,
     state: r.state,
+    tenantId: r.tenantId ?? null,
+    tenantKind: r.tenantKind ?? null,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
   };
@@ -1833,6 +1856,8 @@ function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
     ...(tags?.length ? { tags } : {}),
     spec: (row.spec ?? {}) as Record<string, unknown>,
     state: (row.state ?? {}) as Record<string, unknown>,
+    ...(row.tenantId != null ? { tenantId: row.tenantId } : {}),
+    ...(row.tenantKind != null ? { tenantKind: row.tenantKind } : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -1979,6 +2004,8 @@ class PrismaRoundTrips {
     tags: ['tags', 'json'],
     priority: ['priority', 'int'],
     origin: ['origin', 'text'],
+    tenantId: ['tenant_id', 'text'],
+    tenantKind: ['tenant_kind', 'text'],
     updatedAt: ['updated_at', 'date'],
   };
 

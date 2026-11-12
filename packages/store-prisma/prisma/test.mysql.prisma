@@ -57,6 +57,8 @@ model DurableWorkflowRun {
   // column existed, so it stays NULL and reads back as `undefined` = "unknown". A real-looking
   // default would be indistinguishable from a genuine registration in the dashboard facet.
   origin           String? @map("origin")
+  tenantId         String? @map("tenant_id")
+  tenantKind       String? @map("tenant_kind")
   createdAt       DateTime @map("created_at")
   updatedAt       DateTime @map("updated_at")
 
@@ -65,6 +67,8 @@ model DurableWorkflowRun {
   @@index([status, wakeAt])
   @@index([workflow, status])
   @@index([namespace, status, createdAt], map: "durable_workflow_runs_namespace_status_idx")
+  // App-facing reads with tenancy on: `tenant_id = ? ORDER BY created_at DESC`.
+  @@index([tenantId, createdAt], map: "durable_workflow_runs_tenant_idx")
   @@map("durable_workflow_runs")
 }
 
@@ -161,10 +165,14 @@ model DurableSchedule {
   tags       Json?
   spec       Json
   state      Json
+  // The customer the schedule (and every run it starts) belongs to. NULL = none.
+  tenantId   String?  @map("tenant_id")
+  tenantKind String?  @map("tenant_kind")
   createdAt  DateTime @map("created_at")
   updatedAt  DateTime @map("updated_at")
 
   // The poll's "due by T" scan: `paused = false AND next_fire_at <= T ORDER BY next_fire_at`.
   @@index([paused, nextFireAt], map: "durable_schedules_due_idx")
+  @@index([tenantId], map: "durable_schedules_tenant_idx")
   @@map("durable_schedules")
 }

@@ -97,6 +97,18 @@ one.
 ALTER TABLE durable_workflow_runs ADD COLUMN origin TEXT;
 ```
 
+The [data tenancy](/docs/concepts/data-tenancy) columns take this shape too, on runs and schedules:
+
+```sql
+ALTER TABLE durable_workflow_runs ADD COLUMN tenant_id TEXT;
+ALTER TABLE durable_workflow_runs ADD COLUMN tenant_kind TEXT;
+CREATE INDEX IF NOT EXISTS durable_workflow_runs_tenant_idx
+  ON durable_workflow_runs (tenant_id, created_at);
+ALTER TABLE durable_schedules ADD COLUMN tenant_id TEXT;
+ALTER TABLE durable_schedules ADD COLUMN tenant_kind TEXT;
+CREATE INDEX IF NOT EXISTS durable_schedules_tenant_idx ON durable_schedules (tenant_id);
+```
+
 Deliberate, not an oversight: an existing row's `origin` (which library registered its workflow)
 cannot be reconstructed after the fact, so it stays NULL and reads back as `undefined`, meaning
 *unknown*, rather than as a plausible-looking package name in the dashboard's facet.

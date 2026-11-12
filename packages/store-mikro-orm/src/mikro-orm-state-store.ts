@@ -736,6 +736,8 @@ export class MikroOrmStateStore implements StateStore {
       if (query.origins.some((o) => o === null)) branches.push({ origin: null });
       and.push(branches.length ? { $or: branches } : { origin: { $in: [] } });
     }
+    // The customer (tenancy matching rule): `null` = runs with no tenant.
+    and.push(...tenantWhere(query));
     // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store). When both the
     // single `status` and `statuses` are set, AND them so the narrower set wins.
     if (query.status && query.statuses) {
@@ -1083,6 +1085,8 @@ export class MikroOrmStateStore implements StateStore {
     if ('tags' in patch) data.tags = patch.tags ?? null;
     if (patch.spec !== undefined) data.spec = patch.spec;
     if (patch.state !== undefined) data.state = patch.state;
+    if ('tenantId' in patch) data.tenantId = patch.tenantId ?? null;
+    if ('tenantKind' in patch) data.tenantKind = patch.tenantKind ?? null;
     if (patch.updatedAt !== undefined) data.updatedAt = patch.updatedAt;
     if (!Object.keys(data).length) return (await this.getSchedule(id)) !== null;
     const where: Record<string, unknown> = { id };
@@ -1101,9 +1105,11 @@ export class MikroOrmStateStore implements StateStore {
     if (query.namespace !== undefined) where.namespace = query.namespace;
     if (query.workflow !== undefined) where.workflow = query.workflow;
     if (query.paused !== undefined) where.paused = query.paused;
+    const scheduleAnd: Record<string, unknown>[] = tenantWhere(query);
     if (query.dueBy !== undefined) {
-      where.$and = [{ paused: false }, { nextFireAt: { $lte: query.dueBy } }];
+      scheduleAnd.push({ paused: false }, { nextFireAt: { $lte: query.dueBy } });
     }
+    if (scheduleAnd.length) where.$and = scheduleAnd;
     const quote = this.idQuote(em);
     const meta = em.getMetadata().get(ScheduleEntity);
     const tagsCol = meta.properties.tags?.fieldNames?.[0] ?? 'tags';
@@ -1569,6 +1575,8 @@ function runUpdateData(patch: Partial<WorkflowRun>): Record<string, unknown> {
   // The column is the isolation predicate: a cleared namespace lands on 'default', never NULL.
   if ('namespace' in patch) data.namespace = patch.namespace || 'default';
   if ('origin' in patch) data.origin = patch.origin ?? null;
+  if ('tenantId' in patch) data.tenantId = patch.tenantId ?? null;
+  if ('tenantKind' in patch) data.tenantKind = patch.tenantKind ?? null;
   if (patch.createdAt != null) data.createdAt = patch.createdAt;
   if (patch.updatedAt != null) data.updatedAt = patch.updatedAt;
   return data;
@@ -1599,6 +1607,8 @@ function toRunEntity(run: WorkflowRun): WorkflowRunEntity {
   // (see the column's docblock in ./entities). `null` — not left-undefined — so `Object.assign` in
   // updateRun writes SQL NULL rather than skipping the column.
   e.origin = run.origin ?? null;
+  e.tenantId = run.tenantId ?? null;
+  e.tenantKind = run.tenantKind ?? null;
   e.createdAt = run.createdAt;
   e.updatedAt = run.updatedAt;
   return e;
@@ -1624,6 +1634,9 @@ function fromRunEntity(e: WorkflowRunEntity): WorkflowRun {
     namespace: e.namespace,
     // NULL (a row written before the column existed) surfaces as `undefined` = unknown origin.
     origin: e.origin ?? undefined,
+    // NULL = no tenant; left off entirely so a tenancy-off run reads back unchanged.
+    ...(e.tenantId != null ? { tenantId: e.tenantId } : {}),
+    ...(e.tenantKind != null ? { tenantKind: e.tenantKind } : {}),
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
@@ -1801,6 +1814,24 @@ function fromCheckpointEntity(e: StepCheckpointEntity): StepCheckpoint {
   };
 }
 
+/** `tenantId` / `tenantIds` as MikroORM `where` clauses; `null` = no tenant (`IS NULL`). SQL `IN`
+ *  cannot carry NULL, so the no-tenant bucket is its own ORed branch, as for `origins`. */
+function tenantWhere(query: {
+  tenantId?: string | null | undefined;
+  tenantIds?: Array<string | null> | undefined;
+}): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  if (query.tenantId !== undefined) out.push({ tenantId: query.tenantId });
+  if (query.tenantIds) {
+    const named = query.tenantIds.filter((t): t is string => t !== null);
+    const branches: Record<string, unknown>[] = [];
+    if (named.length) branches.push({ tenantId: { $in: named } });
+    if (query.tenantIds.some((t) => t === null)) branches.push({ tenantId: null });
+    out.push(branches.length ? { $or: branches } : { tenantId: { $in: [] } });
+  }
+  return out;
+}
+
 function toScheduleEntity(r: ScheduleRecord): ScheduleEntity {
   const e = new ScheduleEntity();
   e.id = r.id;
@@ -1811,6 +1842,8 @@ function toScheduleEntity(r: ScheduleRecord): ScheduleEntity {
   e.tags = r.tags ?? null;
   e.spec = r.spec;
   e.state = r.state;
+  e.tenantId = r.tenantId ?? null;
+  e.tenantKind = r.tenantKind ?? null;
   e.createdAt = r.createdAt;
   e.updatedAt = r.updatedAt;
   return e;
@@ -1826,6 +1859,8 @@ function fromScheduleEntity(e: ScheduleEntity): ScheduleRecord {
     ...(e.tags?.length ? { tags: e.tags } : {}),
     spec: e.spec ?? {},
     state: e.state ?? {},
+    ...(e.tenantId != null ? { tenantId: e.tenantId } : {}),
+    ...(e.tenantKind != null ? { tenantKind: e.tenantKind } : {}),
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };

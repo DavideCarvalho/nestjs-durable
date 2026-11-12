@@ -8,7 +8,7 @@ import {
   type WorkflowRef,
   workflowName,
 } from '@dudousxd/nestjs-durable-core';
-import { type DynamicModule, Inject, Injectable, Module } from '@nestjs/common';
+import { type DynamicModule, Inject, Injectable, Module, Optional } from '@nestjs/common';
 import {
   NonRetryableMessageError,
   OnOutboxMessage,
@@ -90,6 +90,7 @@ export class DurableOutbox<Tx = unknown> {
   constructor(
     private readonly outbox: Outbox<Tx>,
     @Inject(OPTIONS) private readonly options: ResolvedOptions,
+    @Optional() private readonly engine?: WorkflowEngine,
   ) {}
 
   /**
@@ -116,8 +117,14 @@ export class DurableOutbox<Tx = unknown> {
     opts: DurableOutboxStartOptions = {},
   ): Promise<{ runId: string }> {
     const { runId = randomUUID(), key, startAt, ...rest } = opts;
+    // The relay starts the run after commit, often from a poller with no request: record the
+    // request's tenant now (data tenancy), unless the caller chose one.
+    const tenant = rest.tenantId === undefined ? this.engine?.contextTenant?.() : undefined;
     const wireOpts: WireStartOptions = {
       ...rest,
+      ...(tenant
+        ? { tenantId: tenant.id, ...(tenant.kind !== undefined ? { tenantKind: tenant.kind } : {}) }
+        : {}),
       ...(startAt !== undefined
         ? { startAt: startAt instanceof Date ? startAt.getTime() : startAt }
         : {}),

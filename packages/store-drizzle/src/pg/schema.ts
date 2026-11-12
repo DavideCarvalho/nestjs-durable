@@ -56,10 +56,15 @@ export const durableWorkflowRuns = pgTable(
     namespace: text('namespace').notNull().default(DEFAULT_NAMESPACE),
     // Which package declared the workflow. Nullable, no default: NULL = unknown, never guessed.
     origin: text('origin'),
+    // The customer (tenancy) the run belongs to — not the worker-pool `namespace`. NULL = none.
+    tenantId: text('tenant_id'),
+    tenantKind: text('tenant_kind'),
     createdAt: tstz('created_at').notNull(),
     updatedAt: tstz('updated_at').notNull(),
   },
   (t) => [
+    // App-facing reads with tenancy on: `tenant_id = $1 ORDER BY created_at DESC`.
+    index('durable_workflow_runs_tenant_idx').on(t.tenantId, t.createdAt),
     // Timer poller (`listDueTimers`) + recovery (`listIncompleteRuns`). Same name as the TypeORM DDL.
     index('durable_runs_status_idx').on(t.status, t.wakeAt),
     // Dashboard `listRuns({ workflow, status })` and the singleton gate's per-workflow scans.
@@ -186,11 +191,17 @@ export const durableSchedules = pgTable(
     tags: jsonb('tags').$type<string[]>(),
     spec: jsonb('spec').$type<Record<string, unknown>>().notNull(),
     state: jsonb('state').$type<Record<string, unknown>>().notNull(),
+    // The customer the schedule (and every run it starts) belongs to. NULL = none.
+    tenantId: text('tenant_id'),
+    tenantKind: text('tenant_kind'),
     createdAt: tstz('created_at').notNull(),
     updatedAt: tstz('updated_at').notNull(),
   },
   // The poll's "due by T" scan: `paused = false AND next_fire_at <= T ORDER BY next_fire_at`.
-  (t) => [index('durable_schedules_due_idx').on(t.paused, t.nextFireAt)],
+  (t) => [
+    index('durable_schedules_due_idx').on(t.paused, t.nextFireAt),
+    index('durable_schedules_tenant_idx').on(t.tenantId),
+  ],
 );
 
 /**

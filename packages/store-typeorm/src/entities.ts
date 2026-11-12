@@ -84,6 +84,8 @@ export class WorkflowRunEntity {
   priority?: number | null;
   namespace!: string;
   origin?: string | null;
+  tenantId?: string | null;
+  tenantKind?: string | null;
   createdAt!: Date;
   updatedAt!: Date;
 }
@@ -164,6 +166,8 @@ export class ScheduleEntity {
   tags?: string[] | null;
   spec!: Record<string, unknown>;
   state!: Record<string, unknown>;
+  tenantId?: string | null;
+  tenantKind?: string | null;
   createdAt!: Date;
   updatedAt!: Date;
 }
@@ -253,6 +257,10 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
       // dashboard's facet. `ensureTypeOrmDurableSchema` back-fills the COLUMN onto pre-existing
       // tables (see the `additive` map in ./schema), never its value.
       origin: { type: 'text', nullable: true, name: col('origin') },
+      // The CUSTOMER (tenancy) the run belongs to — not the worker-pool `namespace`. Nullable, no
+      // default: NULL = no tenant. `ensureTypeOrmDurableSchema` adds the columns in place.
+      tenantId: { type: 'text', nullable: true, name: col('tenantId') },
+      tenantKind: { type: 'text', nullable: true, name: col('tenantKind') },
       createdAt: { type: Date, name: col('createdAt') },
       updatedAt: { type: Date, name: col('updatedAt') },
     },
@@ -421,6 +429,9 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
         name: col('state'),
         transformer: jsonColumnTransformer('schedules.state'),
       },
+      // The customer the schedule (and every run it starts) belongs to. NULL = none.
+      tenantId: { type: 'text', nullable: true, name: col('tenantId') },
+      tenantKind: { type: 'text', nullable: true, name: col('tenantKind') },
       createdAt: { type: Date, name: col('createdAt') },
       updatedAt: { type: Date, name: col('updatedAt') },
     },
