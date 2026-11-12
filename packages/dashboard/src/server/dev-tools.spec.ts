@@ -247,6 +247,10 @@ describe('durable_get_run', () => {
     await expect(get.run({ id: 'r1', field: 'nope' })).rejects.toThrow(
       'run r1 has no field "nope"; fields: run, steps',
     );
+    // Inherited members are not fields.
+    for (const inherited of ['toString', 'constructor', '__proto__']) {
+      await expect(get.run({ id: 'r1', field: inherited })).rejects.toThrow('has no field');
+    }
   });
 
   it('is an error for an unknown id', async () => {

@@ -392,7 +392,7 @@ export function durableDevTools(service: DashboardService): DurableDevTool[] {
         const { etag: _etag, notModified: _notModified, ...body } = detail;
         const field = str(input.field);
         if (field === undefined) return body;
-        if (!(field in body)) {
+        if (!Object.hasOwn(body, field)) {
           throw new Error(
             `run ${id} has no field "${field}"; fields: ${Object.keys(body).join(', ')}`,
           );
